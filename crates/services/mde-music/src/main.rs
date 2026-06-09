@@ -33,6 +33,20 @@ fn main() -> iced::Result {
     .run_with(|| (State::new(), Task::none()))
 }
 
+/// Convert an mde-theme Carbon token (`Rgba`, u8 channels) to this crate's
+/// `iced::Color` at alpha `a`. mde-music's iced version skews from the one
+/// `mde_theme::into_iced_color()` targets, so the conversion is by hand — the
+/// single sanctioned spot for raw channel math, keeping every call site on a
+/// token rather than a literal (§4).
+fn carbon(rgba: mde_theme::Rgba, a: f32) -> iced::Color {
+    iced::Color {
+        r: f32::from(rgba.r) / 255.0,
+        g: f32::from(rgba.g) / 255.0,
+        b: f32::from(rgba.b) / 255.0,
+        a,
+    }
+}
+
 /// Build the media player's `iced::Theme` from the canonical
 /// `mde_theme::Palette` (E5.3) — the Q2 indigo accent, Apple-charcoal
 /// background, and the centralized semantic tokens, single-sourced so
@@ -42,16 +56,10 @@ fn main() -> iced::Result {
 #[must_use]
 fn mde_music_iced_theme() -> iced::Theme {
     use mde_theme::Palette;
-    // Convert an mde_theme `Rgba` (u8) to this crate's `iced::Color`
-    // via a struct literal — avoids both the cross-crate `iced::Color`
-    // skew of `into_iced_color()` and a raw `from_rgb*`/hex token.
+    // Opaque conversion of an mde_theme token — delegates to the module-level
+    // `carbon` helper (the one place channel math lives).
     fn c(rgba: mde_theme::Rgba) -> iced::Color {
-        iced::Color {
-            r: f32::from(rgba.r) / 255.0,
-            g: f32::from(rgba.g) / 255.0,
-            b: f32::from(rgba.b) / 255.0,
-            a: 1.0,
-        }
+        carbon(rgba, 1.0)
     }
     let p = Palette::dark();
     // NB: this crate's iced `theme::Palette` predates the `warning`
@@ -1118,6 +1126,10 @@ impl State {
     /// current track marked). Large art + scrub-progress + volume slider +
     /// Lyrics/Peers tabs are the AIR-15.b.2 follow-on.
     fn maxi_view(&self) -> Element<'_, Message> {
+        // §4: muted/accent come from the Carbon palette, not raw literals.
+        let p = mde_theme::Palette::dark();
+        let muted = carbon(p.text_muted, 1.0);
+        let accent = carbon(p.accent, 1.0);
         let title = if self.now_title.is_empty() {
             self.now_state.song_id.clone()
         } else {
@@ -1195,12 +1207,7 @@ impl State {
         let lyrics: Element<'_, Message> = if self.maxi_lyrics.is_empty() {
             text("No lyrics for this track")
                 .size(13)
-                .color(iced::Color {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 0.6,
-                })
+                .color(muted)
                 .into()
         } else {
             let mut col = column![].spacing(2);
@@ -1210,15 +1217,7 @@ impl State {
             col.into()
         };
         let peers: Element<'_, Message> = if self.maxi_peers.is_empty() {
-            text("No peers on the mesh")
-                .size(13)
-                .color(iced::Color {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 0.6,
-                })
-                .into()
+            text("No peers on the mesh").size(13).color(muted).into()
         } else {
             let mut col = column![].spacing(6);
             for p in &self.maxi_peers {
@@ -1226,12 +1225,7 @@ impl State {
                 col = col.push(
                     row![
                         text(p.host.clone()).size(14).width(Length::Fixed(150.0)),
-                        text(status).size(12).color(iced::Color {
-                            r: 1.0,
-                            g: 1.0,
-                            b: 1.0,
-                            a: 0.6
-                        }),
+                        text(status).size(12).color(muted),
                         button(text("Take over").size(12))
                             .on_press(Message::TakeOver(p.host.clone())),
                     ]
@@ -1241,21 +1235,7 @@ impl State {
             col.into()
         };
         let tab = |label: &'static str, t: MaxiTab| {
-            let color = if self.maxi_tab == t {
-                iced::Color {
-                    r: 0.36,
-                    g: 0.42,
-                    b: 0.96,
-                    a: 1.0,
-                }
-            } else {
-                iced::Color {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 0.6,
-                }
-            };
+            let color = if self.maxi_tab == t { accent } else { muted };
             button(text(label).size(13).color(color)).on_press(Message::MaxiTabSelected(t))
         };
         let tab_bar = row![
