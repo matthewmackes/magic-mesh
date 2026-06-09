@@ -3,10 +3,10 @@
 //! The protocol crate deliberately owns no filesystem and no RSA keygen, so the
 //! host provides both here. [`PairingStore`]:
 //!
-//! - generates (once) and persists this host's RSA-2048 identity key as
-//!   `identity.pkcs8` (PKCS#8 DER, mode 0600), generating it with the `rsa`
-//!   crate — which the protocol crate can't — and signing with the protocol's
-//!   ring-backed [`PairingKeyPair`];
+//! - generates (once) and persists this host's RSA-4096 identity key as
+//!   `identity.pkcs8` (PKCS#8 DER, mode 0600) via [`crate::keygen`] — which the
+//!   protocol crate can't (ring ships no RSA keygen) — and signs with the
+//!   protocol's ring-backed [`PairingKeyPair`];
 //! - persists the trusted-peer records as `devices.toml` (atomic write);
 //! - implements the protocol's [`mde_kdc_proto::crypto::KeyStore`], delegating
 //!   ephemeral AES session keys to an in-memory [`RingKeyStore`] (only the
@@ -82,9 +82,9 @@ impl PairingStore {
     }
 
     /// Open (or first-time create) the store under `dir`. Generates
-    /// `identity.pkcs8` with the `rsa` crate if absent, else loads it through
-    /// [`PairingKeyPair::from_pkcs8`]; reads `devices.toml`, tolerating a
-    /// missing or garbage file by starting empty.
+    /// `identity.pkcs8` (RSA-4096, via [`crate::keygen::generate_pkcs8`]) if
+    /// absent, else loads it through [`PairingKeyPair::from_pkcs8`]; reads
+    /// `devices.toml`, tolerating a missing or garbage file by starting empty.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, HostError> {
         use std::os::unix::fs::PermissionsExt;
         let dir = dir.into();
@@ -98,7 +98,11 @@ impl PairingStore {
         let pkcs8 = if key_path.exists() {
             std::fs::read(&key_path)?
         } else {
-            let der = generate_pkcs8()?;
+            // §3 max-crypto: the long-lived identity key is RSA-4096, single-sourced
+            // through `keygen` (the same generator `issue_identity_cert` binds the
+            // cert to) so the key and cert are one identity at the pinned size.
+            let der =
+                crate::keygen::generate_pkcs8().map_err(|e| HostError::Keygen(e.to_string()))?;
             write_private(&key_path, &der)?;
             der
         };
@@ -229,19 +233,6 @@ impl KeyStore for PairingStore {
     fn forget(&self, handle: KeyHandle) {
         self.sessions.forget(handle);
     }
-}
-
-/// Generate a fresh RSA-2048 keypair and return its PKCS#8 DER. The protocol
-/// crate ships no keygen (ring 0.17 has none), so the host uses the `rsa` crate.
-fn generate_pkcs8() -> Result<Vec<u8>, HostError> {
-    use rsa::pkcs8::EncodePrivateKey;
-    let mut rng = rand::thread_rng();
-    let key =
-        rsa::RsaPrivateKey::new(&mut rng, 2048).map_err(|e| HostError::Keygen(e.to_string()))?;
-    let der = key
-        .to_pkcs8_der()
-        .map_err(|e| HostError::Keygen(e.to_string()))?;
-    Ok(der.as_bytes().to_vec())
 }
 
 /// Derive the PKCS#1 `RSAPublicKey` DER (what `verify_signature` wants) from a
