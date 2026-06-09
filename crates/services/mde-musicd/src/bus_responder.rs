@@ -11,7 +11,7 @@
 //!
 //! The verb dispatch ([`dispatch_queue_action`]) is a pure function over
 //! the [`Queue`], fully unit-testable; [`serve`] is the thin poll loop
-//! (modeled on `mackesd::workers::marks_state`) that drives it off the
+//! (the standard mackesd Bus-responder shape) that drives it off the
 //! Bus persistence store.
 
 use std::collections::HashMap;

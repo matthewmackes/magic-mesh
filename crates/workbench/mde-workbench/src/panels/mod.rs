@@ -61,4 +61,3 @@ pub mod vm_wizard;
 pub mod vpn;
 pub mod wallpaper;
 pub mod wifi;
-pub mod window_manager;

@@ -38,7 +38,6 @@ use crate::panels::{
     session as session_panel, snapshots as snapshots_panel, sound as sound_panel,
     sync_status as sync_status_panel, system_update as system_update_panel, themes as themes_panel,
     vpn as vpn_panel, wallpaper as wallpaper_panel, wifi as wifi_panel,
-    window_manager as window_manager_panel,
 };
 use crate::patternfly::{breadcrumb, page_subtitle, page_title};
 use crate::sidebar::SidebarState;
@@ -153,8 +152,6 @@ pub enum Message {
     DateTime(datetime_panel::Message),
     /// CB-1.9.b — System default-apps panel sub-message.
     DefaultApps(default_apps_panel::Message),
-    /// CB-1.9.c — System window-manager panel sub-message.
-    WindowManager(window_manager_panel::Message),
     /// CB-1.9.d — Maintain snapshots panel sub-message.
     Snapshots(snapshots_panel::Message),
     /// CB-1.7 partial — Maintain logs panel sub-message.
@@ -253,7 +250,6 @@ pub struct App {
     run_history: run_history_panel::RunHistoryPanel,
     datetime: datetime_panel::DateTimePanel,
     default_apps: default_apps_panel::DefaultAppsPanel,
-    window_manager: window_manager_panel::WindowManagerPanel,
     snapshots: snapshots_panel::SnapshotsPanel,
     logs: logs_panel::LogsPanel,
     resources: resources_panel::ResourcesPanel,
@@ -357,7 +353,6 @@ impl App {
             run_history: run_history_panel::RunHistoryPanel::new(),
             datetime: datetime_panel::DateTimePanel::new(),
             default_apps: default_apps_panel::DefaultAppsPanel::new(),
-            window_manager: window_manager_panel::WindowManagerPanel::new(),
             snapshots: snapshots_panel::SnapshotsPanel::new(),
             logs: logs_panel::LogsPanel::new(),
             resources: resources_panel::ResourcesPanel::new(),
@@ -496,12 +491,6 @@ impl App {
     #[must_use]
     pub fn default_apps(&self) -> &default_apps_panel::DefaultAppsPanel {
         &self.default_apps
-    }
-
-    /// Read-only view of the window-manager panel state.
-    #[must_use]
-    pub fn window_manager(&self) -> &window_manager_panel::WindowManagerPanel {
-        &self.window_manager
     }
 
     /// Read-only view of the snapshots panel state.
@@ -780,7 +769,6 @@ impl App {
             Message::RunHistory(msg) => self.run_history.update(msg),
             Message::DateTime(msg) => self.datetime.update(msg),
             Message::DefaultApps(msg) => self.default_apps.update(msg),
-            Message::WindowManager(msg) => self.window_manager.update(msg),
             Message::Snapshots(msg) => self.snapshots.update(msg),
             Message::Logs(msg) => self.logs.update(msg),
             Message::Resources(msg) => self.resources.update(msg),
@@ -862,9 +850,6 @@ impl App {
             (Group::Fleet, "run_history") => run_history_panel::RunHistoryPanel::load(),
             (Group::System, "datetime") => datetime_panel::DateTimePanel::load(),
             (Group::Apps, "default_apps") => default_apps_panel::DefaultAppsPanel::load(),
-            (Group::LookAndFeel, "window_manager") => {
-                window_manager_panel::WindowManagerPanel::load()
-            }
             (Group::Maintain, "snapshots") => snapshots_panel::SnapshotsPanel::load(),
             (Group::System, "logs") => logs_panel::LogsPanel::load(),
             (Group::System, "resources") => resources_panel::ResourcesPanel::load(),
@@ -1129,10 +1114,6 @@ impl App {
                 group: Group::Apps,
                 panel: "default_apps",
             } => self.default_apps.view(),
-            View::Panel {
-                group: Group::LookAndFeel,
-                panel: "window_manager",
-            } => self.window_manager.view(),
             View::Panel {
                 group: Group::Maintain,
                 panel: "snapshots",

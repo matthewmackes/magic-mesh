@@ -39,23 +39,10 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // ── Server (rank 1) — adds fleet + mesh storage.
     ("ansible-pull", 1),
     ("app-sync", 1),
-    // ── Workstation (rank 2) — adds voice + media + the whole sway/desktop
-    //    worker stack.
+    // ── Workstation (rank 2) — adds voice + media + kdc + remmina.
     ("voice_config", 2),
     ("clipd_supervisor", 2),
     ("kdc_host", 2),
-    ("workspace_namer", 2),
-    ("auto_mark", 2),
-    ("marks_state", 2),
-    ("workspace_router", 2),
-    ("tag_layout", 2),
-    ("tag_autostart", 2),
-    ("tag_mode_writer", 2),
-    ("border_tinter", 2),
-    ("urgency_router", 2),
-    ("sway_config_watcher", 2),
-    ("session_persist", 2),
-    ("window_rules", 2),
     ("remmina-sync", 2),
 ];
 
@@ -108,14 +95,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_table_is_the_full_29_worker_census() {
+    fn the_table_is_the_full_17_worker_census() {
         // Guards against a worker added to run_serve without a deliberate tier
         // (it would silently default to Lighthouse). 31 originally; -1 redundant
         // python `clipboard` (RETIRE-PY.3, mde-clipd is sole), -1 broken python
         // `mdns` relay (RETIRE-PY.1), +1 native `mdns_relay` (MESH-MDNS-RELAY,
         // the real Rust cross-segment relay), -1 dead python `fs_sync` GVFS
         // worker (RETIRE-PY.4, mesh storage is LizardFS/E3).
-        assert_eq!(WORKER_TIERS.len(), 29);
+        // -12 sway/desktop workers (E11 'Cosmic owns the desktop' — the
+        // labwc/sway worker stack deleted).
+        assert_eq!(WORKER_TIERS.len(), 17);
     }
 
     #[test]
@@ -128,7 +117,7 @@ mod tests {
             "Server rank-1 = the two fleet workers; the LizardFS meshfs_worker \
              spawns unconditionally (binary-self-gated), not via this rank table"
         );
-        assert_eq!(count(2), 16, "Workstation adds voice/media/desktop");
+        assert_eq!(count(2), 4, "Workstation adds voice/media/kdc/remmina");
     }
 
     #[test]
@@ -143,13 +132,7 @@ mod tests {
         ] {
             assert!(runs(w, r), "Lighthouse must run {w}");
         }
-        for w in [
-            "ansible-pull",
-            "app-sync",
-            "voice_config",
-            "kdc_host",
-            "workspace_namer",
-        ] {
+        for w in ["ansible-pull", "app-sync", "voice_config", "kdc_host"] {
             assert!(!runs(w, r), "Lighthouse must NOT run {w}");
         }
     }
@@ -160,12 +143,7 @@ mod tests {
         for w in ["ansible-pull", "app-sync", "nebula_supervisor", "heartbeat"] {
             assert!(runs(w, r), "Server must run {w}");
         }
-        for w in [
-            "voice_config",
-            "clipd_supervisor",
-            "kdc_host",
-            "window_rules",
-        ] {
+        for w in ["voice_config", "clipd_supervisor", "kdc_host"] {
             assert!(!runs(w, r), "Server must NOT run {w}");
         }
     }
@@ -191,7 +169,7 @@ mod tests {
         let ws = workers_for_rank(Role::Workstation.rank());
         assert_eq!(lh.len(), 11);
         assert_eq!(srv.len(), 13);
-        assert_eq!(ws.len(), 29);
+        assert_eq!(ws.len(), 17);
         // Strict superset: every lower-tier worker is in the higher tier.
         assert!(lh.iter().all(|w| srv.contains(w)));
         assert!(srv.iter().all(|w| ws.contains(w)));

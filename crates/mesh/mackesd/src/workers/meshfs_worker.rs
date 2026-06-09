@@ -616,8 +616,8 @@ impl Worker for MeshFsWorker {
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
         self.tick_once();
 
-        // MESHFS-10.1: open Bus persist for action polling (same pattern as
-        // `marks_state`). Persist is !Sync; wrapped in Mutex per that worker.
+        // MESHFS-10.1: open Bus persist for action polling. Persist is !Sync,
+        // so it's wrapped in a Mutex (the standard Bus-responder pattern).
         let persist_opt = default_meshfs_bus_root()
             .and_then(|root| Persist::open(root).ok())
             .map(std::sync::Mutex::new);

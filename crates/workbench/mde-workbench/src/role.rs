@@ -339,14 +339,14 @@ mod tests {
     #[test]
     fn look_and_feel_role_card_includes_the_e6_6_acceptance_panels() {
         // E6.6 acceptance #1: the Look & Feel role card surfaces
-        // action-links to Themes, Wallpaper, Fonts, and Window Manager
-        // (window_manager moved here from System). sync_status stays as
-        // a bonus link.
+        // action-links to Themes, Wallpaper, and Fonts. (E11 retired the
+        // Window Manager panel — Cosmic owns window management — so it is
+        // no longer surfaced here.) sync_status stays as a bonus link.
         let slugs: Vec<&str> = role_action_panels(Group::LookAndFeel)
             .iter()
             .map(Panel::slug)
             .collect();
-        for want in ["themes", "wallpaper", "fonts", "window_manager"] {
+        for want in ["themes", "wallpaper", "fonts"] {
             assert!(
                 slugs.contains(&want),
                 "Look & Feel card missing {want}: {slugs:?}"
@@ -477,21 +477,6 @@ mod tests {
                 "system_update",
                 "notifications"
             ]
-        );
-    }
-
-    #[test]
-    fn window_manager_left_system_for_look_and_feel() {
-        // E6.6/E6.8 — window_manager moved out of System (E6.8's
-        // acceptance excludes it) into Look & Feel; it must not appear
-        // under both, or the sidebar would list it twice.
-        let system: Vec<&str> = role_action_panels(Group::System)
-            .iter()
-            .map(Panel::slug)
-            .collect();
-        assert!(
-            !system.contains(&"window_manager"),
-            "window_manager must leave System (E6.6): {system:?}"
         );
     }
 }

@@ -256,11 +256,6 @@ pub fn nav_model() -> Vec<NavEntry> {
                 Panel::new("themes", "Themes"),
                 Panel::new("fonts", "Fonts"),
                 Panel::new("wallpaper", "Wallpaper"),
-                // E6.6 — Window Manager (rc.xml libinput / behavior) is an
-                // appearance/behavior surface, so it lives under Look & Feel
-                // (moved here from System, which E6.8's acceptance excludes
-                // it from). Its backend is unchanged.
-                Panel::new("window_manager", "Window Manager"),
                 // v4.0.1 (2026-05-23) — panel.toml sync-status
                 // surface. Reads mackesd healthz JSON + the local
                 // panel.toml mtime to surface "synced to revision

@@ -236,15 +236,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 
-# sway IPC client for the workspace_namer worker. Subscribes to
-# `EventType::Window` + runs `rename workspace` commands as the focused
-# window's app_id changes. (NB: this — and the other sway-cluster tag
-# workers — is a sway-IPC holdover under labwc; tracked for the labwc/
-# ext-protocol port alongside E0.17's sway-surface family.)
-swayipc-async = { version = "3.0.0", optional = true }
-# Portal-41 — `StreamExt::next()` on the swayipc event stream. The
-# transitive dep tree (tokio + swayipc-async) already carries
-# `futures-util`; this declaration is the explicit consumer entry.
+# `futures-util` — `StreamExt`/`TryStreamExt` adapters used by the async
+# worker bodies (event-stream `.next()`, `try_join`, etc.).
 futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
@@ -291,7 +284,6 @@ async-services = [
     "dep:rustls",
     "dep:tokio-rustls",
     "dep:rustls-native-certs",
-    "dep:swayipc-async",
     "dep:futures-util",
     "dep:mde-bus",
 ]
