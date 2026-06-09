@@ -2,7 +2,7 @@
 //!
 //! The substrate locked in `docs/design/v2.7-peer-data-convergence.md`:
 //! each peer writes its own `<mesh-home>/peers/<hostname>.json` (own-row
-//! authority — sole writer per file); GlusterFS replicates the dir to
+//! authority — sole writer per file); LizardFS replicates the dir to
 //! every peer; any tool [`read_peers`] unions the dir. No broker / D-Bus
 //! / mackesd dependency for reads.
 //!
