@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 100" role="img" aria-label="MDE wordmark">
+  <title>MDE wordmark</title>
+  <desc>Placeholder typography — replace with finished artwork. See assets/brand/README.md. Fill uses currentColor; the consumer (sidebar header, About panel) decides the color via iced theming.</desc>
+  <text x="200" y="74"
+        font-family="Geologica, Inter, system-ui, sans-serif"
+        font-size="72"
+        font-weight="700"
+        letter-spacing="-2"
+        text-anchor="middle"
+        fill="currentColor">MDE</text>
+</svg>

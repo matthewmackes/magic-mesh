@@ -1,0 +1,10 @@
+---
+source: crates/mackesd/tests/library_contracts.rs
+expression: node
+---
+{
+  "id": "peer:anvil",
+  "region": "us-east",
+  "healthy": true,
+  "is_host": true
+}

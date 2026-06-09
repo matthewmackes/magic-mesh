@@ -1,0 +1,35 @@
+[package]
+name        = "mde-theme"
+description = "MDE design system — palette, typography, spacing, radii, shadows, density, theme. Tokens locked via the 50-Q + FU + NFU survey (2026-05-21). See docs/design/visual-identity.md."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_theme"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Enable Iced (0.13/0.14) interop — `Rgba::into_iced_color()`,
+# `FontSize::into_iced_pixels()`, etc. Without this feature the
+# crate has no runtime dependencies and is fully testable in
+# isolation.
+iced = ["dep:iced_core"]
+# Enable serde Serialize/Deserialize on Theme / Density / A11y /
+# Preferences for TOML persistence to ~/.config/mde/preferences.toml.
+serde = ["dep:serde", "dep:toml"]
+
+[dependencies]
+iced_core = { version = "0.14", optional = true }
+serde     = { version = "1", features = ["derive"], optional = true }
+toml      = { version = "0.8", default-features = false, features = ["parse", "display"], optional = true }
+
+[dev-dependencies]
+# Reserved for future gallery (UX-13) — no dev deps today.
+
+[lints]
+workspace = true

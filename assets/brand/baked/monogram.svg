@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="MDE monogram">
+  <title>MDE monogram</title>
+  <desc>Placeholder geometry — replace with finished artwork. See assets/brand/README.md for AI generation prompts and the vectorization workflow. Fill uses currentColor so iced/CSS can tint the mark.</desc>
+  <g fill="currentColor">
+    <rect x="22"  y="22"  width="95"  height="95"  rx="14" ry="14"/>
+    <rect x="139" y="22"  width="95"  height="95"  rx="14" ry="14"/>
+    <rect x="22"  y="139" width="95"  height="95"  rx="14" ry="14"/>
+    <rect x="139" y="139" width="95"  height="95"  rx="14" ry="14"/>
+  </g>
+</svg>

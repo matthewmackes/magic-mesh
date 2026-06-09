@@ -1,0 +1,64 @@
+//! Per-panel views — one module per group leaf. CB-1.x ports
+//! land these incrementally; each module ships a state struct,
+//! a `Message` variant set, an `update` reducer that returns
+//! the parent app's `Message`, and a `view` builder over
+//! [`Element<'_, crate::Message>`].
+
+pub mod about;
+pub mod apps_install;
+pub mod apps_installed;
+pub mod apps_remove;
+pub mod apps_sources;
+pub mod compute;
+pub mod connect;
+pub mod datetime;
+pub mod default_apps;
+pub mod displays;
+pub mod drift;
+pub mod firewall;
+pub mod fleet_revisions;
+pub mod fleet_settings;
+pub mod fonts;
+pub mod health_check;
+pub mod help_index;
+pub mod home;
+pub mod hub;
+pub mod inventory;
+pub mod json_helpers;
+pub mod keyboard;
+pub mod logs;
+pub mod mesh_bus;
+pub mod mesh_control;
+pub mod mesh_federation;
+pub mod mesh_history;
+pub mod mesh_join;
+pub mod mesh_pending;
+pub mod mesh_services;
+pub mod mesh_storage;
+pub mod mesh_topology;
+pub mod mouse;
+pub mod music;
+pub mod network_hosts;
+pub mod notifications;
+pub mod panel_apps;
+pub mod playbooks;
+pub mod power;
+pub mod printers;
+pub mod remote_desktop;
+pub mod removable;
+pub mod repair;
+pub mod resources;
+pub mod run_history;
+pub mod service_publishing;
+pub mod session;
+pub mod snapshots;
+pub mod sound;
+pub mod sparkline;
+pub mod sync_status;
+pub mod system_update;
+pub mod themes;
+pub mod vm_wizard;
+pub mod vpn;
+pub mod wallpaper;
+pub mod wifi;
+pub mod window_manager;

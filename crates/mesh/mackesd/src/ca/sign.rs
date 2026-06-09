@@ -1,0 +1,410 @@
+//! NF-2.3 (v2.5) — sign one peer cert under the active CA.
+//!
+//! Per the open-mesh directive (2026-05-23): every peer
+//! cert lands in the same `groups=["role:host"]` or
+//! `["role:peer"]` basket. No per-node ACL groups, no
+//! per-service scopes. The single shared passcode at
+//! enrollment is the sole gate.
+
+use std::path::{Path, PathBuf};
+
+use rusqlite::Connection;
+
+use super::{seal, CaError, NebulaCertBackend};
+
+/// Default CIDR prefix length when callers don't override.
+/// Locked to /16 per the design doc's `10.42.0.0/16`.
+pub const DEFAULT_CIDR_PREFIX: u8 = 16;
+
+/// Default mesh CIDR; allocator walks it sequentially.
+pub const DEFAULT_MESH_CIDR_BASE: &str = "10.42.0.0";
+
+/// Maximum number of distinct active (non-revoked) peer certs the
+/// CA will sign at the current epoch without an explicit override.
+///
+/// Locked at **8** by Q3 + Q22 of the 100-Q tightening survey
+/// (2026-05-25) + Q3 of the 25-Q tuning survey (2026-05-26):
+/// MackesDE for Workgroups is sized for ≤ 8 peers; gluster replica
+/// cost, Bus broker mesh, and attendance election all assume this
+/// cap. TUNE-11 (2026-05-26) makes the cap a runtime check on the
+/// CSR sign path rather than a paper-only design assumption.
+///
+/// Operators with a legitimate need to exceed the cap must invoke
+/// `mackesd ca sign-csr --override-cap` per
+/// `docs/design/cap-overrides.md`. Each override is audit-logged.
+pub const MAX_PEER_CAP: u32 = 8;
+
+/// Outcome of one signing call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedPeer {
+    /// Stable peer id (matches `nodes.node_id`).
+    pub node_id: String,
+    /// Allocated overlay IP (e.g. "10.42.0.7").
+    pub overlay_ip: String,
+    /// Signed cert PEM body (also persisted to
+    /// `nebula_peer_certs.cert_pem`).
+    pub cert_pem: String,
+    /// Path the cert was written to on disk.
+    pub cert_path: PathBuf,
+    /// Path the matching private key was written to.
+    pub key_path: PathBuf,
+}
+
+/// Sign a peer certificate under the active CA. Side effects:
+///
+///   1. Allocates the next free `10.42.x.y` from the mesh
+///      CIDR (skipping IPs already in `nebula_peer_certs`).
+///   2. Calls `backend.sign_peer(...)`.
+///   3. Re-seals the produced private key at mode 0600.
+///   4. Inserts a row into `nebula_peer_certs` at the active
+///      epoch.
+///
+/// # Errors
+///
+/// - [`CaError::Sql`] if no active CA exists or any database
+///   op fails.
+/// - [`CaError::CidrExhausted`] when every IP in the /16
+///   pool is already allocated.
+/// - [`CaError::BinaryMissing`] / [`CaError::Subprocess`] on
+///   `nebula-cert` failures.
+/// - [`CaError::Io`] on file IO failures.
+#[allow(clippy::too_many_arguments)]
+pub fn sign_peer_cert<B: NebulaCertBackend + ?Sized>(
+    backend: &B,
+    conn: &Connection,
+    mesh_id: &str,
+    node_id: &str,
+    role: PeerRole,
+    ca_crt_path: &Path,
+    ca_key_path: &Path,
+    crt_out: &Path,
+    key_out: &Path,
+    cert_lifetime_days: u32,
+) -> Result<SignedPeer, CaError> {
+    let active_epoch = active_epoch(conn, mesh_id)?
+        .ok_or_else(|| CaError::Sql(format!("no active CA for mesh {mesh_id}")))?;
+
+    let allocated_ip = allocate_overlay_ip(conn, active_epoch)?;
+
+    let groups: &[&str] = match role {
+        PeerRole::Host => &["role:host"],
+        PeerRole::Peer => &["role:peer"],
+    };
+
+    backend.sign_peer(
+        ca_crt_path,
+        ca_key_path,
+        node_id,
+        &allocated_ip,
+        DEFAULT_CIDR_PREFIX,
+        groups,
+        crt_out,
+        key_out,
+    )?;
+
+    // Seal the produced private key.
+    let key_bytes = std::fs::read(key_out)
+        .map_err(|e| CaError::Io(format!("read peer key {}: {e}", key_out.display())))?;
+    seal::write_sealed(key_out, &key_bytes)?;
+
+    let cert_pem = std::fs::read_to_string(crt_out)
+        .map_err(|e| CaError::Io(format!("read peer cert {}: {e}", crt_out.display())))?;
+
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+        + (cert_lifetime_days as i64) * 86_400;
+
+    conn.execute(
+        "INSERT INTO nebula_peer_certs \
+         (node_id, epoch, cert_pem, overlay_ip, expires_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![node_id, active_epoch, cert_pem, allocated_ip, expires_at],
+    )
+    .map_err(|e| CaError::Sql(e.to_string()))?;
+
+    tracing::info!(
+        node_id, overlay_ip = %allocated_ip, epoch = active_epoch,
+        "nebula peer cert signed"
+    );
+
+    Ok(SignedPeer {
+        node_id: node_id.to_string(),
+        overlay_ip: allocated_ip,
+        cert_pem,
+        cert_path: crt_out.to_path_buf(),
+        key_path: key_out.to_path_buf(),
+    })
+}
+
+/// Per-cert role group. The open-mesh directive flattens
+/// this to two values: Host (lighthouse-eligible) + Peer
+/// (everything else). No per-service scopes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRole {
+    /// Lighthouse / leader-eligible node.
+    Host,
+    /// Regular mesh peer.
+    Peer,
+}
+
+/// Pull the active CA epoch from the database.
+pub fn active_epoch(conn: &Connection, mesh_id: &str) -> Result<Option<i64>, CaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT epoch FROM nebula_ca \
+             WHERE mesh_id = ?1 AND retired_at IS NULL \
+             ORDER BY epoch DESC LIMIT 1",
+        )
+        .map_err(|e| CaError::Sql(e.to_string()))?;
+    let row: Option<i64> = stmt.query_row([mesh_id], |r| r.get(0)).ok();
+    Ok(row)
+}
+
+/// Allocate the next free overlay IP at `epoch`. Walks
+/// `10.42.0.1`..`10.42.255.254` sequentially, skipping IPs
+/// already allocated in `nebula_peer_certs` for the given
+/// epoch. Skips `.0` (network address) + `.255` (broadcast)
+/// on each /24 — keeps the allocation human-readable.
+pub fn allocate_overlay_ip(conn: &Connection, epoch: i64) -> Result<String, CaError> {
+    let taken = load_taken_ips(conn, epoch)?;
+    for octet_b in 0u8..=255 {
+        for octet_c in 1u8..=254 {
+            let ip = format!("10.42.{octet_b}.{octet_c}");
+            if !taken.contains(&ip) {
+                return Ok(ip);
+            }
+        }
+    }
+    Err(CaError::CidrExhausted("10.42.0.0/16".to_string()))
+}
+
+/// Count of distinct active (non-revoked) peer certs at `epoch`.
+///
+/// Used by TUNE-11 to gate the [`MAX_PEER_CAP`] check on
+/// [`crate::nebula_enroll::sign_pending_csr`]. Distinct on
+/// `node_id` so the same peer rotating its cert at the same
+/// epoch counts once, not twice.
+///
+/// # Errors
+/// [`CaError::Sql`] on database failure.
+pub fn count_active_peers(conn: &Connection, mesh_id: &str) -> Result<u32, CaError> {
+    let epoch = match active_epoch(conn, mesh_id)? {
+        Some(e) => e,
+        None => return Ok(0),
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT COUNT(DISTINCT node_id) FROM nebula_peer_certs \
+             WHERE epoch = ?1 AND revoked_at IS NULL",
+        )
+        .map_err(|e| CaError::Sql(e.to_string()))?;
+    let count: i64 = stmt
+        .query_row([epoch], |r| r.get(0))
+        .map_err(|e| CaError::Sql(e.to_string()))?;
+    Ok(u32::try_from(count.max(0)).unwrap_or(u32::MAX))
+}
+
+fn load_taken_ips(
+    conn: &Connection,
+    epoch: i64,
+) -> Result<std::collections::HashSet<String>, CaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT overlay_ip FROM nebula_peer_certs \
+             WHERE epoch = ?1 AND revoked_at IS NULL",
+        )
+        .map_err(|e| CaError::Sql(e.to_string()))?;
+    let rows = stmt
+        .query_map([epoch], |r| r.get::<_, String>(0))
+        .map_err(|e| CaError::Sql(e.to_string()))?;
+    let mut out = std::collections::HashSet::new();
+    for row in rows {
+        let s = row.map_err(|e| CaError::Sql(e.to_string()))?;
+        out.insert(s);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ca::{mint, MockBackend};
+
+    fn fresh_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("memory db");
+        crate::store::migrate(&conn).expect("migrate");
+        conn
+    }
+
+    fn mint_one(conn: &Connection) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let crt = tmp.path().join("ca.crt");
+        let key = tmp.path().join("ca.key");
+        mint::mint_ca(&MockBackend, conn, "m1", Some(&crt), Some(&key)).expect("mint");
+        tmp
+    }
+
+    #[test]
+    fn count_active_peers_returns_zero_for_unminted_mesh() {
+        let conn = fresh_conn();
+        // No CA + no rows → zero.
+        assert_eq!(count_active_peers(&conn, "m1").unwrap(), 0);
+    }
+
+    #[test]
+    fn count_active_peers_counts_active_node_ids_at_active_epoch() {
+        // Four peers at epoch 0; one revoked → counts as 3.
+        // The UNIQUE(node_id, epoch) constraint means each
+        // active node_id appears exactly once per epoch, so
+        // COUNT(DISTINCT node_id) is the right shape regardless.
+        let conn = fresh_conn();
+        let _tmp = mint_one(&conn);
+        conn.execute(
+            "INSERT INTO nebula_peer_certs \
+             (node_id, epoch, cert_pem, overlay_ip, expires_at) \
+             VALUES ('peer:a', 0, 'pem', '10.42.0.1', 9999999), \
+                    ('peer:b', 0, 'pem', '10.42.0.2', 9999999), \
+                    ('peer:c', 0, 'pem', '10.42.0.3', 9999999), \
+                    ('peer:d', 0, 'pem', '10.42.0.4', 9999999)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE nebula_peer_certs SET revoked_at = 1234567890 \
+             WHERE node_id = 'peer:d'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(count_active_peers(&conn, "m1").unwrap(), 3);
+    }
+
+    #[test]
+    fn allocator_starts_at_10_42_0_1() {
+        let conn = fresh_conn();
+        let _tmp = mint_one(&conn);
+        let ip = allocate_overlay_ip(&conn, 0).unwrap();
+        assert_eq!(ip, "10.42.0.1");
+    }
+
+    #[test]
+    fn allocator_skips_taken_ips() {
+        let conn = fresh_conn();
+        let _tmp = mint_one(&conn);
+        conn.execute(
+            "INSERT INTO nebula_peer_certs \
+             (node_id, epoch, cert_pem, overlay_ip, expires_at) \
+             VALUES ('peer:a', 0, 'pem', '10.42.0.1', 9999999)",
+            [],
+        )
+        .unwrap();
+        let next = allocate_overlay_ip(&conn, 0).unwrap();
+        assert_eq!(next, "10.42.0.2");
+    }
+
+    #[test]
+    fn sign_writes_pem_inserts_row_and_returns_overlay_ip() {
+        let conn = fresh_conn();
+        let tmp = mint_one(&conn);
+        let ca_crt = tmp.path().join("ca.crt");
+        let ca_key = tmp.path().join("ca.key");
+        let crt = tmp.path().join("peer.crt");
+        let key = tmp.path().join("peer.key");
+        let signed = sign_peer_cert(
+            &MockBackend,
+            &conn,
+            "m1",
+            "peer:anvil",
+            PeerRole::Peer,
+            &ca_crt,
+            &ca_key,
+            &crt,
+            &key,
+            365,
+        )
+        .expect("sign");
+        assert_eq!(signed.overlay_ip, "10.42.0.1");
+        assert!(signed.cert_pem.contains("ip=10.42.0.1/16"));
+        assert!(signed.cert_pem.contains("groups=role:peer"));
+        // Row landed.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nebula_peer_certs WHERE node_id='peer:anvil'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn host_role_emits_role_host_group() {
+        let conn = fresh_conn();
+        let tmp = mint_one(&conn);
+        let ca_crt = tmp.path().join("ca.crt");
+        let ca_key = tmp.path().join("ca.key");
+        let crt = tmp.path().join("host.crt");
+        let key = tmp.path().join("host.key");
+        let signed = sign_peer_cert(
+            &MockBackend,
+            &conn,
+            "m1",
+            "peer:lighthouse",
+            PeerRole::Host,
+            &ca_crt,
+            &ca_key,
+            &crt,
+            &key,
+            365,
+        )
+        .expect("sign host");
+        assert!(signed.cert_pem.contains("groups=role:host"));
+    }
+
+    #[test]
+    fn sign_rejects_when_no_active_ca() {
+        let conn = fresh_conn();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let err = sign_peer_cert(
+            &MockBackend,
+            &conn,
+            "never-minted",
+            "peer:x",
+            PeerRole::Peer,
+            &tmp.path().join("ca.crt"),
+            &tmp.path().join("ca.key"),
+            &tmp.path().join("peer.crt"),
+            &tmp.path().join("peer.key"),
+            365,
+        )
+        .unwrap_err();
+        assert!(matches!(err, CaError::Sql(_)));
+    }
+
+    #[test]
+    fn peer_key_sealed_at_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let conn = fresh_conn();
+        let tmp = mint_one(&conn);
+        let signed = sign_peer_cert(
+            &MockBackend,
+            &conn,
+            "m1",
+            "peer:a",
+            PeerRole::Peer,
+            &tmp.path().join("ca.crt"),
+            &tmp.path().join("ca.key"),
+            &tmp.path().join("peer.crt"),
+            &tmp.path().join("peer.key"),
+            365,
+        )
+        .expect("sign");
+        let mode = std::fs::metadata(&signed.key_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+}

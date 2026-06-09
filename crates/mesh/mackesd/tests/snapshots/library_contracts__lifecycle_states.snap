@@ -1,0 +1,14 @@
+---
+source: crates/mackesd/tests/library_contracts.rs
+expression: states
+---
+[
+  "draft",
+  "validated",
+  "approved",
+  "deploying",
+  "applied",
+  "verified",
+  "failed_validation",
+  "rolled_back"
+]

@@ -1,0 +1,212 @@
+//! Peer-data convergence records (PEERVER-1).
+//!
+//! The substrate locked in `docs/design/v2.7-peer-data-convergence.md`:
+//! each peer writes its own `<mesh-home>/peers/<hostname>.json` (own-row
+//! authority — sole writer per file); GlusterFS replicates the dir to
+//! every peer; any tool [`read_peers`] unions the dir. No broker / D-Bus
+//! / mackesd dependency for reads.
+//!
+//! This module is the shared home so both `mackesd` (writer, on the
+//! heartbeat tick — PEERVER-2) and `mde-installer` (reader — PEERVER-3)
+//! use one code path without `mde-installer` linking the heavy
+//! `mackesd_core`.
+
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+/// One peer's self-reported state. The file `<hostname>.json` IS the
+/// row; the peer that owns `hostname` is its sole writer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerRecord {
+    /// System hostname — the file stem + the row key.
+    pub hostname: String,
+    /// Installed `mde-core` RPM version (`None` if not yet detected).
+    #[serde(default)]
+    pub mde_version: Option<String>,
+    /// Wall-clock epoch milliseconds of the last write (liveness).
+    pub last_seen_ms: u64,
+    /// `healthy` | `degraded` | `unreachable` | `unknown` (mirrors `nodes.health`).
+    #[serde(default = "default_health")]
+    pub health: String,
+}
+
+fn default_health() -> String {
+    "unknown".to_string()
+}
+
+impl PeerRecord {
+    /// Build a record stamped with the current time.
+    #[must_use]
+    pub fn now(
+        hostname: impl Into<String>,
+        mde_version: Option<String>,
+        health: impl Into<String>,
+    ) -> Self {
+        Self {
+            hostname: hostname.into(),
+            mde_version,
+            last_seen_ms: now_ms(),
+            health: health.into(),
+        }
+    }
+
+    /// Age in milliseconds against the current wall clock (saturating).
+    #[must_use]
+    pub fn age_ms(&self) -> u64 {
+        now_ms().saturating_sub(self.last_seen_ms)
+    }
+
+    /// Whether this record is older than `threshold_ms` (stale/offline).
+    #[must_use]
+    pub fn is_stale(&self, threshold_ms: u64) -> bool {
+        self.age_ms() > threshold_ms
+    }
+}
+
+/// The `peers/` directory under a mesh-home mount.
+#[must_use]
+pub fn peers_dir(mesh_home: &Path) -> PathBuf {
+    mesh_home.join("peers")
+}
+
+/// Resolve the mesh-home mount: `$MDE_MESH_HOME` if set, else
+/// `~/.mde-mesh` (the coordination mount per AI_GOVERNANCE §3.1).
+#[must_use]
+pub fn default_mesh_home() -> PathBuf {
+    if let Ok(p) = std::env::var("MDE_MESH_HOME") {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(home).join(".mde-mesh")
+}
+
+/// Write `rec` to `<dir>/<hostname>.json` atomically (temp + rename),
+/// creating `dir` if needed.
+///
+/// # Errors
+/// IO or serialization failures.
+pub fn write_peer_record(dir: &Path, rec: &PeerRecord) -> io::Result<PathBuf> {
+    fs::create_dir_all(dir)?;
+    let final_path = dir.join(format!("{}.json", rec.hostname));
+    let tmp_path = dir.join(format!(".{}.json.tmp", rec.hostname));
+    let json = serde_json::to_string_pretty(rec)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    fs::write(&tmp_path, json)?;
+    fs::rename(&tmp_path, &final_path)?;
+    Ok(final_path)
+}
+
+/// Union every `*.json` in `dir` into a `PeerRecord` list (one per
+/// file). Malformed or unreadable files are skipped (not fatal) — a
+/// half-written file from a concurrent writer must not break a reader.
+/// A missing dir yields an empty list. Sorted by hostname.
+#[must_use]
+pub fn read_peers(dir: &Path) -> Vec<PeerRecord> {
+    let mut out = Vec::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        // Skip the atomic-write temp files (".<host>.json.tmp" — though
+        // those don't end in .json, belt-and-suspenders on dotfiles).
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with('.'))
+        {
+            continue;
+        }
+        if let Ok(data) = fs::read_to_string(&path) {
+            if let Ok(rec) = serde_json::from_str::<PeerRecord>(&data) {
+                out.push(rec);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.hostname.cmp(&b.hostname));
+    out
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn write_then_read_roundtrips() {
+        let dir = tempdir().unwrap();
+        let rec = PeerRecord::now("anvil", Some("5.0.0".into()), "healthy");
+        let p = write_peer_record(dir.path(), &rec).unwrap();
+        assert!(p.ends_with("anvil.json"));
+        let back = read_peers(dir.path());
+        assert_eq!(back, vec![rec]);
+    }
+
+    #[test]
+    fn read_unions_multiple_files_sorted() {
+        let dir = tempdir().unwrap();
+        write_peer_record(
+            dir.path(),
+            &PeerRecord::now("forge", Some("5.0.0".into()), "healthy"),
+        )
+        .unwrap();
+        write_peer_record(
+            dir.path(),
+            &PeerRecord::now("anvil", Some("5.0.0".into()), "healthy"),
+        )
+        .unwrap();
+        let peers = read_peers(dir.path());
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].hostname, "anvil");
+        assert_eq!(peers[1].hostname, "forge");
+    }
+
+    #[test]
+    fn malformed_file_is_skipped_not_fatal() {
+        let dir = tempdir().unwrap();
+        write_peer_record(dir.path(), &PeerRecord::now("anvil", None, "healthy")).unwrap();
+        fs::write(dir.path().join("broken.json"), "{ not json").unwrap();
+        let peers = read_peers(dir.path());
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].hostname, "anvil");
+    }
+
+    #[test]
+    fn missing_dir_is_empty() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("nope");
+        assert!(read_peers(&missing).is_empty());
+    }
+
+    #[test]
+    fn stale_classification() {
+        let mut rec = PeerRecord::now("anvil", None, "healthy");
+        rec.last_seen_ms = 1; // ancient
+        assert!(rec.is_stale(60_000));
+        let fresh = PeerRecord::now("forge", None, "healthy");
+        assert!(!fresh.is_stale(60_000));
+    }
+
+    #[test]
+    fn peers_dir_under_mesh_home() {
+        assert_eq!(
+            peers_dir(Path::new("/home/u/.mde-mesh")),
+            Path::new("/home/u/.mde-mesh/peers")
+        );
+    }
+}

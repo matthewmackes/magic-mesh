@@ -1,0 +1,43 @@
+[package]
+name        = "mde-voice-hud"
+description = "Iced + wlr-layer-shell PJSIP softphone HUD — VOIP-27..VOIP-30 per docs/design/v6.0-pjsip-presence-and-hud.md."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[[bin]]
+name = "mde-voice-hud"
+path = "src/main.rs"
+
+[dependencies]
+# Same Iced + iced_layershell pair as crates/mde-popover so the
+# workspace dep tree stays on a single resolution.
+iced            = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "tokio", "advanced", "wayland"] }
+iced_layershell = "0.18"
+
+# Fixture + activity-feed parsing.
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml       = "0.8"
+
+# CLI + tracing — same shape mde-popover uses.
+clap               = { version = "4.5", features = ["derive"] }
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# XDG home + cache paths.
+dirs = "5"
+rsip = "0.4"
+tokio = { version = "1", default-features = false, features = ["rt"] }
+cpal = "0.17"
+
+# VOIP-28 / E7.5 — publish the persistent SIP agent's registration + listener
+# state to the Bus (`state/voice/status`) so the birthright commissioning
+# dashboard (and any other reader) can attest the softphone is up cross-process.
+mde-bus = { path = "../../platform/mde-bus" }
+
+[lints]
+workspace = true

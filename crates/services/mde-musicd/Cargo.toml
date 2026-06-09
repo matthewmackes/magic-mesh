@@ -1,0 +1,60 @@
+[package]
+name        = "mde-musicd"
+description = "AIR-* (v6.1) — native Airsonic music daemon for MDE. AIR-4 slice: the Subsonic/Airsonic REST client (auth-token + endpoint URL building + response parsing) + the mesh-shared credential loader + a `ping` CLI that exercises them end-to-end. Later AIR tasks layer the D-Bus/MPRIS surface (AIR-2/6), PipeWire playback (AIR-5), mesh cache + handoff (AIR-7/8) on top."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[[bin]]
+name = "mde-musicd"
+path = "src/main.rs"
+
+[lib]
+name = "mde_musicd"
+path = "src/lib.rs"
+
+[dependencies]
+# Match mde-bus's HTTP client (json, no bundled TLS — mesh-local
+# Airsonic is reached over the Nebula overlay, which is the encryption
+# boundary; HTTPS-server support is the AIR-4.b follow-on). `blocking`
+# powers the AIR-5 decode thread's stream fetch.
+reqwest    = { version = "0.12", default-features = false, features = ["json", "blocking"] }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Subsonic API auth token = md5(password + salt), hex-encoded (Q—).
+md5        = "0.7"
+# Random per-session salt source (already a workspace dep).
+ulid       = "1"
+tokio      = { version = "1", features = ["rt-multi-thread", "macros"] }
+clap       = { version = "4.5", features = ["derive"] }
+# AIR-2 daemon control surface: Bus-native (action/music/* + reply/<ulid>)
+# per the Q96 Bus-canonical lock (no new D-Bus interface).
+mde-bus    = { path = "../../platform/mde-bus" }
+# AIR-5 playback engine: pure-Rust decode (Symphonia — FLAC/MP3/Vorbis/
+# AAC/WAV) + native output (cpal → ALSA/PipeWire). Opus decode is AIR-5.b
+# (Symphonia 0.5 ships no opus codec; routed through libopus there).
+symphonia  = { version = "0.5", default-features = false, features = ["flac", "mp3", "vorbis", "aac", "isomp4", "ogg", "pcm", "wav"] }
+cpal       = "0.17"
+# AIR-5.b Opus decode. Symphonia 0.5 ships no Opus codec, but its Ogg
+# demuxer still yields Opus packets; those are decoded through libopus.
+# Links the system libopus (opus-devel 1.6) via pkg-config.
+opus       = "0.3"
+# AIR-6 MPRIS surface. `org.mpris.MediaPlayer2` is an FDO-standard
+# remote-control interface — the allowed D-Bus interop carve-out per
+# EPIC-RETIRE-DBUS (MDE-internal control stays on the Bus; the FDO +
+# `org.mpris` standards keep D-Bus). It is what playerctl, the XF86Audio*
+# media keys (sway → playerctl → MPRIS), and the lock-screen now-playing
+# widget read. Same zbus 5 + tokio build as the rest of the workspace.
+zbus       = { version = "5", default-features = false, features = ["tokio"] }
+# AIR-16 — the get-cover-art Bus verb base64-encodes the fetched image
+# bytes into its JSON reply (the GUI decodes + runs dominant-colour).
+base64     = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

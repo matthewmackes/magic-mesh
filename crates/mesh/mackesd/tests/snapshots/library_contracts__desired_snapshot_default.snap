@@ -1,0 +1,11 @@
+---
+source: crates/mackesd/tests/library_contracts.rs
+assertion_line: 90
+expression: snap
+---
+{
+  "nodes": [],
+  "allow_east_west": [],
+  "settings_keys": [],
+  "voice_policies": []
+}

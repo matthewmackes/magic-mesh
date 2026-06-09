@@ -1,0 +1,20 @@
+[package]
+name        = "mackes-config"
+description = "Serde TOML schema for ~/.config/mackes-panel/panel.toml."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+mackes-mesh-types = { path = "../mackes-mesh-types" }
+serde             = { version = "1", features = ["derive"] }
+toml              = { version = "0.8", default-features = false, features = ["parse", "display"] }
+
+[lints]
+workspace = true

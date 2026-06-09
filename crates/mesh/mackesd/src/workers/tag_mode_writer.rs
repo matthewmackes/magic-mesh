@@ -1,0 +1,340 @@
+//! Portal-47 (v6.0, R12-Q7) — write per-tag sway mode blocks at
+//! mded startup so that Hub's "Enter mode" action has sway config
+//! backing.
+//!
+//! At startup this worker:
+//!
+//! 1. Loads `TagStore::load_default()`.
+//! 2. Generates `~/.config/sway/config.d/mde-tag-modes.conf` —
+//!    one `mode "<tag-name>" { ... }` block per user tag, with
+//!    sequential `bindsym <i> workspace number <ws>` entries for
+//!    each `TagMember::Workspace` the tag owns (up to 9) + an
+//!    unconditional `bindsym Escape mode "default"`.
+//! 3. Skips `swaymsg reload` if the file content is unchanged
+//!    from the previous run (avoids disrupting the session).
+//! 4. Otherwise writes (atomic temp→rename) + calls
+//!    `swaymsg reload` to pick up the new mode blocks.
+//! 5. Returns `Ok(())` — this is a one-shot worker; the
+//!    supervisor uses `RestartPolicy::OnFailure` so it will not
+//!    restart on a clean exit.
+//!
+//! The `~/.config/sway/config.d/` directory is included by the
+//! platform sway config via `include ~/.config/sway/config.d/*.conf`
+//! (see `data/sway/config` §Mackes-managed includes).
+
+#![cfg(feature = "async-services")]
+
+use std::fs;
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use mackes_mesh_types::{TagMember, TagStore};
+
+use super::{ShutdownToken, Worker};
+
+const CONF_FILENAME: &str = "mde-tag-modes.conf";
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(3);
+
+/// One-shot worker that writes per-tag sway mode blocks and
+/// reloads sway if the config changed.
+pub struct TagModeWriterWorker;
+
+impl TagModeWriterWorker {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for TagModeWriterWorker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl Worker for TagModeWriterWorker {
+    fn name(&self) -> &'static str {
+        "tag_mode_writer"
+    }
+
+    async fn run(&mut self, shutdown: ShutdownToken) -> anyhow::Result<()> {
+        if shutdown.is_shutdown() {
+            return Ok(());
+        }
+
+        let conf_path = match default_conf_path() {
+            Some(p) => p,
+            None => {
+                tracing::warn!("tag_mode_writer: cannot determine XDG config dir; skipping");
+                return Ok(());
+            }
+        };
+
+        let store = match TagStore::load_default() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, "tag_mode_writer: tag-store load failed; skipping");
+                return Ok(());
+            }
+        };
+
+        let new_content = generate_tag_modes_conf(&store);
+
+        // Skip reload if the content is identical to the previous run.
+        let existing = fs::read_to_string(&conf_path).unwrap_or_default();
+        if existing == new_content {
+            tracing::debug!("tag_mode_writer: config unchanged; skipping reload");
+            return Ok(());
+        }
+
+        // Write atomically via temp + rename.
+        if let Err(e) = write_conf_atomic(&conf_path, &new_content) {
+            tracing::warn!(error = %e, path = %conf_path.display(), "tag_mode_writer: write failed");
+            return Ok(());
+        }
+        tracing::info!(path = %conf_path.display(), "tag_mode_writer: wrote tag-modes config");
+
+        if shutdown.is_shutdown() {
+            return Ok(());
+        }
+
+        // Reload sway so the new mode blocks take effect.
+        match tokio::process::Command::new("swaymsg")
+            .arg("reload")
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => {
+                tracing::info!("tag_mode_writer: swaymsg reload succeeded");
+            }
+            Ok(out) => {
+                tracing::warn!(
+                    code = ?out.status.code(),
+                    stderr = %String::from_utf8_lossy(&out.stderr),
+                    "tag_mode_writer: swaymsg reload non-zero exit"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "tag_mode_writer: swaymsg reload spawn failed");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// ── Pure helpers (testable without a sway connection) ────────────────────
+
+/// Default path for the generated config file:
+/// `<XDG_CONFIG_HOME>/sway/config.d/mde-tag-modes.conf`.
+#[must_use]
+pub fn default_conf_path() -> Option<PathBuf> {
+    let config_home = dirs::config_dir()?;
+    Some(
+        config_home
+            .join("sway")
+            .join("config.d")
+            .join(CONF_FILENAME),
+    )
+}
+
+/// Generate the content of `mde-tag-modes.conf` for all tags in
+/// `store`. Each tag with an assigned name produces one sway mode
+/// block. Tags with no `TagMember::Workspace` members still get a
+/// mode block (Escape only) so "Enter mode" never silently no-ops.
+#[must_use]
+pub fn generate_tag_modes_conf(store: &TagStore) -> String {
+    let mut out = String::from(
+        "# MDE tag modes — generated by mded at login (Portal-47).\n\
+         # DO NOT EDIT — changes are overwritten on next mded start.\n\n",
+    );
+    for tag in &store.tags {
+        if tag.name.is_empty() {
+            continue;
+        }
+        // Collect owned workspace numbers, sorted ascending.
+        let mut ws_nums: Vec<i32> = tag
+            .members
+            .iter()
+            .filter_map(|m| {
+                if let TagMember::Workspace { num } = m {
+                    Some(*num)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        ws_nums.sort_unstable();
+        ws_nums.dedup();
+
+        // Escape double-quotes so the mode name is safe in sway config.
+        let safe_name = tag.name.replace('"', "\\\"");
+        out.push_str(&format!("mode \"{safe_name}\" {{\n"));
+
+        // Sequential bindings 1..=min(9, len) → workspace numbers.
+        for (idx, ws_num) in ws_nums.iter().take(9).enumerate() {
+            out.push_str(&format!(
+                "    bindsym {} workspace number {}\n",
+                idx + 1,
+                ws_num
+            ));
+        }
+
+        // Escape always returns to default.
+        out.push_str("    bindsym Escape mode \"default\"\n");
+        out.push_str("}\n\n");
+    }
+    out
+}
+
+/// Write `content` to `path` atomically via a sibling `.tmp` file.
+/// Creates parent directories if they do not exist.
+pub fn write_conf_atomic(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("conf.tmp");
+    let mut f = fs::File::create(&tmp)?;
+    f.write_all(content.as_bytes())?;
+    f.sync_all()?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mackes_mesh_types::{Tag, TagFlavor, TagMember, TagStore};
+
+    fn make_store(tags: Vec<Tag>) -> TagStore {
+        TagStore {
+            tags,
+            schema_version: 1,
+        }
+    }
+
+    fn make_tag(name: &str, ws_nums: &[i32]) -> Tag {
+        Tag {
+            name: name.to_string(),
+            flavor: TagFlavor::Manual,
+            members: ws_nums
+                .iter()
+                .map(|&n| TagMember::Workspace { num: n })
+                .collect(),
+            group_color: None,
+            preferred_output: None,
+            default_layout: None,
+            autostart: Vec::new(),
+        }
+    }
+
+    /// Empty store → header comment only, no mode blocks.
+    #[test]
+    fn empty_store_produces_header_only() {
+        let store = make_store(vec![]);
+        let out = generate_tag_modes_conf(&store);
+        assert!(out.starts_with("# MDE tag modes"));
+        assert!(!out.contains("mode \""));
+    }
+
+    /// A tag with no workspace members gets an Escape-only mode block.
+    #[test]
+    fn tag_with_no_workspaces_gets_escape_only_block() {
+        let tag = make_tag("Media", &[]);
+        let store = make_store(vec![tag]);
+        let out = generate_tag_modes_conf(&store);
+        assert!(out.contains("mode \"Media\" {"));
+        assert!(out.contains("bindsym Escape mode \"default\""));
+        assert!(!out.contains("workspace number"));
+    }
+
+    /// A tag with 3 owned workspaces gets sequential bindings 1, 2, 3.
+    #[test]
+    fn tag_with_workspaces_gets_sequential_bindings() {
+        let tag = make_tag("Dev", &[1, 3, 5]);
+        let store = make_store(vec![tag]);
+        let out = generate_tag_modes_conf(&store);
+        assert!(out.contains("mode \"Dev\" {"));
+        assert!(out.contains("bindsym 1 workspace number 1"));
+        assert!(out.contains("bindsym 2 workspace number 3"));
+        assert!(out.contains("bindsym 3 workspace number 5"));
+        assert!(out.contains("bindsym Escape mode \"default\""));
+    }
+
+    /// Workspace numbers are sorted ascending regardless of insertion order.
+    #[test]
+    fn workspace_numbers_are_sorted_ascending() {
+        let tag = make_tag("Art", &[9, 2, 5]);
+        let store = make_store(vec![tag]);
+        let out = generate_tag_modes_conf(&store);
+        // Sorted: 2, 5, 9 → binding index 1, 2, 3.
+        assert!(out.contains("bindsym 1 workspace number 2"));
+        assert!(out.contains("bindsym 2 workspace number 5"));
+        assert!(out.contains("bindsym 3 workspace number 9"));
+    }
+
+    /// Workspace count is capped at 9 bindings (sway single-key limit).
+    #[test]
+    fn workspace_bindings_capped_at_nine() {
+        let ws: Vec<i32> = (1..=12).collect();
+        let tag = make_tag("BigTag", &ws);
+        let store = make_store(vec![tag]);
+        let out = generate_tag_modes_conf(&store);
+        // Exactly 9 bindsym lines (plus the Escape line).
+        let count = out
+            .lines()
+            .filter(|l| l.contains("workspace number"))
+            .count();
+        assert_eq!(count, 9);
+        // Binding 10 must not appear.
+        assert!(!out.contains("bindsym 10 "));
+    }
+
+    /// Tag names containing double-quotes are escaped safely.
+    #[test]
+    fn tag_name_with_quotes_is_escaped() {
+        let tag = make_tag("Dev \"main\"", &[]);
+        let store = make_store(vec![tag]);
+        let out = generate_tag_modes_conf(&store);
+        assert!(out.contains(r#"mode "Dev \"main\"" {"#));
+    }
+
+    /// Tags with empty names are silently skipped.
+    #[test]
+    fn empty_tag_name_skipped() {
+        let mut tag = make_tag("", &[1]);
+        tag.name = String::new();
+        let store = make_store(vec![tag]);
+        let out = generate_tag_modes_conf(&store);
+        assert!(!out.contains("mode \"\""));
+    }
+
+    /// Atomic write: temp file is gone after write, content matches.
+    #[test]
+    fn write_conf_atomic_leaves_no_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sway").join("config.d").join(CONF_FILENAME);
+        let content = "# test\nmode \"Dev\" {\n    bindsym Escape mode \"default\"\n}\n";
+        write_conf_atomic(&path, content).unwrap();
+        let read_back = fs::read_to_string(&path).unwrap();
+        assert_eq!(read_back, content);
+        let tmp = path.with_extension("conf.tmp");
+        assert!(!tmp.exists(), "temp file must not linger after rename");
+    }
+
+    /// Multiple tags each produce their own mode block.
+    #[test]
+    fn multiple_tags_produce_multiple_blocks() {
+        let store = make_store(vec![make_tag("Dev", &[1, 2]), make_tag("Media", &[5])]);
+        let out = generate_tag_modes_conf(&store);
+        assert!(out.contains("mode \"Dev\" {"));
+        assert!(out.contains("mode \"Media\" {"));
+        // Each has its own Escape binding.
+        let escape_count = out.matches("bindsym Escape mode \"default\"").count();
+        assert_eq!(escape_count, 2);
+    }
+}

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 200" role="img" aria-label="MDE wordmark for greeter">
+  <title>MDE wordmark — greeter variant</title>
+  <desc>Placeholder typography — replace with finished artwork. Greeter foreground variant. Fixed white fill (not currentColor) because the greeter context always renders over a dark hero image and we want the wordmark to read consistently.</desc>
+  <text x="400" y="148"
+        font-family="Geologica, Inter, system-ui, sans-serif"
+        font-size="160"
+        font-weight="800"
+        letter-spacing="-6"
+        text-anchor="middle"
+        fill="#ffffff">MDE</text>
+</svg>

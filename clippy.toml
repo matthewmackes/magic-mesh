@@ -1,0 +1,8 @@
+# Clippy configuration for the Mackes Workstation workspace.
+#
+# E8.3 — `unwrap_used` is promoted to `deny` in `[workspace.lints.clippy]`
+# (Cargo.toml) so no panicking `.unwrap()` ships in a runtime path. Test code
+# legitimately unwraps fixtures/known-good vectors, so exempt it here rather
+# than littering `#[allow]` across every test module.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

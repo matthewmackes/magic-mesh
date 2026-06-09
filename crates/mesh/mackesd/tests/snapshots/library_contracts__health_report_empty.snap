@@ -1,0 +1,15 @@
+---
+source: crates/mackesd/tests/library_contracts.rs
+expression: report
+---
+{
+  "schema": 1,
+  "is_leader": false,
+  "applied_revision": null,
+  "node_count": 0,
+  "healthy_nodes": 0,
+  "degraded_nodes": 0,
+  "unreachable_nodes": 0,
+  "audit_chain_intact": true,
+  "version": "[version]"
+}

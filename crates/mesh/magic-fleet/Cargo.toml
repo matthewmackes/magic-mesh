@@ -1,0 +1,20 @@
+[package]
+name        = "magic-fleet"
+version     = "0.0.0"
+edition     = "2021"
+publish     = false
+description = "E11.7 — Magic Mesh \"Automation Mesh\" node engine: apply a desired-state Ansible playbook to the local node via ansible-runner and report convergence (ok/changed/failures/unreachable). The peer-to-peer routing + fleet baseline layer build on this local-apply primitive."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "magic-fleet"
+path = "src/main.rs"
+
+[dependencies]
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Pure-Rust YAML; already in the workspace lockfile. (Maintained-fork swap to
+# serde_yml is a noted follow-up; serde_yaml keeps the dep graph fetch-free.)
+serde_yaml = "0.9"

@@ -1,0 +1,29 @@
+# rust-toolchain.toml — pins the Rust toolchain for Mackes Desktop
+# Environment.
+#
+# v2.5 Iced 0.14 bump path (2026-05-23) — downgraded from 1.95.0
+# to 1.94.0. The UX-PRE Iced 0.14 + iced_layershell 0.18.1 probe on
+# 2026-05-23 failed against Rust 1.95 because softbuffer 0.4.8's
+# `make_dispatch!` macro generates a non-exhaustive enum match that
+# 1.95's stricter pattern-match check rejects. 1.94 is the last
+# toolchain that still compiles softbuffer cleanly; pinning here so
+# `rustup` consumers + future RPM mock builds use the compatible
+# rustc.
+#
+# Note: this file is consumed by `rustup` (which isn't installed on
+# stock Fedora 44 dev hosts). To actually exercise 1.94 on a dev
+# box, install rustup first:
+#
+#   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+#   rustup show   # picks up this pin
+#
+# RPM builds via Mock continue to use whatever Fedora ships in the
+# `rust` package; bump this pin back to the Fedora-shipped channel
+# whenever softbuffer 0.5 (or an in-tree fork via the UX-PRE
+# alternative path) lands.
+
+[toolchain]
+channel = "1.94.0"
+components = ["rustfmt", "clippy"]
+targets   = ["x86_64-unknown-linux-gnu"]
+profile   = "minimal"

@@ -1,0 +1,25 @@
+---
+source: crates/mackesd/tests/library_contracts.rs
+expression: kinds
+---
+[
+  {
+    "kind": "allow_east_west",
+    "id": "r1",
+    "from_region": "us-east",
+    "to_region": "us-west"
+  },
+  {
+    "kind": "deny_east_west",
+    "id": "r2",
+    "from_region": "us-east",
+    "to_region": "eu-west"
+  },
+  {
+    "kind": "bandwidth_cap",
+    "id": "r3",
+    "from_region": "us-east",
+    "to_region": "us-west",
+    "mbps": 100
+  }
+]

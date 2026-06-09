@@ -1,0 +1,20 @@
+[package]
+name        = "mde-role"
+description = "Mackes Workstation pinned deployment role (Lighthouse ⊂ Server ⊂ Workstation) + the upgrade-only /var/lib/mde/role.toml loader (E1.1)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_role"
+path = "src/lib.rs"
+
+# Zero runtime dependencies: the role.toml is a single `role = "<name>"`
+# field, so the loader hand-reads/writes it (std only) rather than pulling a
+# TOML parser the workspace doesn't otherwise carry.
+
+[lints]
+workspace = true

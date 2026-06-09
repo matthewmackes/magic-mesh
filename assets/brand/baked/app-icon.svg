@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Mackes Desktop Environment icon">
+  <title>Mackes Desktop Environment</title>
+  <desc>UX-17 v2.2 initial cut: source geometry preserved from map-icon.svg (MAP2-audio); palette swapped to MDE charcoal background + indigo accent per Q2/Q3. Distinct from monogram.svg in that this carries the brand palette baked-in (no currentColor) — this is the shipped app icon, not a tintable mark.</desc>
+  <rect x="0"   y="0"   width="256" height="256" rx="56" ry="56" fill="#1d1d1f"/>
+  <rect x="22"  y="22"  width="95"  height="95"  rx="14" ry="14" fill="#5b6af5"/>
+  <rect x="139" y="22"  width="95"  height="95"  rx="14" ry="14" fill="#5b6af5"/>
+  <rect x="22"  y="139" width="95"  height="95"  rx="14" ry="14" fill="#5b6af5"/>
+  <rect x="139" y="139" width="95"  height="95"  rx="14" ry="14" fill="#5b6af5"/>
+</svg>

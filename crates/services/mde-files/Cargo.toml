@@ -1,0 +1,83 @@
+[package]
+name        = "mde-files"
+description = "Mackes Desktop Environment (MDE) Files — mesh-first \"Artifact Manager\" file manager, forked from pop-os/cosmic-files."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[[bin]]
+name = "mde-files"
+path = "src/main.rs"
+
+[dependencies]
+iced       = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "svg", "tokio", "advanced", "wayland"] }
+# CR-4 (2026-05-25) — Object Card consumer. Pulls `object_card` from
+# the shared widget crate that CR-3.b introduced; the data form +
+# spec constants come from mde-theme (no toolkit dep there).
+mde-theme  = { path = "../../shared/mde-theme", features = ["iced"] }
+mde-iced-components = { path = "../../shared/mde-iced-components" }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+# v2.0.0 Phase 2.x — Backend trait + DemoBackend audit-log
+# timestamps (chrono UTC millis).
+chrono     = "0.4"
+# E11.6 native parity — archive list/extract (.tar + .tar.gz). Both are
+# already in the workspace lockfile (the `mde` shell uses them), so this is
+# a fetch-free add. `tar` does its own path-traversal guarding on unpack.
+tar        = "0.4"
+flate2     = "1"
+# E11.6 native parity — freedesktop thumbnail generation. `image` is already
+# pulled transitively (iced 0.14 -> image 0.25 -> png 0.18); `md5` (URI cache
+# naming) is in the lockfile too. Fetch-free.
+image      = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
+png        = "0.18"
+md5        = "0.7"
+# mackesd-IPC opt-in deps. Behind the `dbus` feature so the headless
+# crate (DemoBackend only) keeps a minimal dep graph. zbus was dropped
+# at E0.3.2 when the last D-Bus client (Fleet.Files) moved to the Bus.
+tokio      = { version = "1", features = ["rt-multi-thread", "macros", "sync"], optional = true }
+# E0.3.1.a (2026-06-03) — the mesh backend reads Nebula status over the
+# mesh Bus (action/nebula/*); E0.3.2 (2026-06-04) — the Fleet.Files
+# client (bus_backend.rs) reads the peer roster over action/fleet-files/*.
+# Optional + folded into `dbus` so the headless DemoBackend graph stays
+# minimal.
+mde-bus    = { path = "../../platform/mde-bus", optional = true }
+
+[features]
+# `wayland` (default): enables smithay-client-toolkit portal calls
+# once that dep lands. `x11`: stubs those calls; plain std::fs reads.
+# `dbus` (legacy name — the transport is the mesh Bus now, not D-Bus;
+# rename deferred to the E0.3.7 sweep) is in default since v4.0.1 so the
+# production binary talks to mackesd's Fleet.Files + Nebula surfaces over
+# the Bus (action/*) for real mesh content — without it the Artifact
+# Manager would only ever show local files + an empty peers list.
+default = ["wayland", "dbus"]
+wayland = []
+x11     = []
+dbus    = ["dep:tokio", "dep:mde-bus"]
+
+[lints.rust]
+unsafe_code     = "forbid"
+unused_must_use = "deny"
+# Allow `missing_docs` on the scaffold — every module gets a one-line
+# header doc but inner items (per-view widgets, demo-data fields) are
+# self-documenting from the design spec.
+missing_docs    = "allow"
+
+[lints.clippy]
+# The crate models the prototype data verbatim. The prototype's
+# struct layouts deliberately use short field names like `addr` and
+# trip several pedantic lints; we silence them as a unit since the
+# names are the contract, not a hygiene problem.
+pedantic                  = { level = "allow", priority = -1 }
+nursery                   = { level = "allow", priority = -1 }
+module_name_repetitions   = "allow"
+must_use_candidate        = "allow"
+missing_errors_doc        = "allow"
+missing_panics_doc        = "allow"
+unwrap_used               = "warn"
+panic                     = "warn"
+todo                      = "warn"

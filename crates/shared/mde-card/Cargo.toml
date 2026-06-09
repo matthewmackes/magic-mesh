@@ -1,0 +1,41 @@
+[package]
+name        = "mde-card"
+description = "MDE universal cards subsystem (Portal-31) — schema + render modes + stable mesh-merged IDs + migration registry."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[dependencies]
+# JSON-first persistence: every card lives on disk as JSON so the
+# mesh GlusterFS layer can replicate it without a binary protocol.
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Stable mesh-merged IDs hash (kind, normalized_title) so the same
+# logical card on two peers collapses to one row. sha2 is already
+# in the workspace lockfile so we reuse it rather than pulling in
+# a separate blake3 dep.
+sha2 = "0.10"
+
+# Tracing — same JSON-line format the rest of the workspace uses.
+tracing = "0.1"
+
+
+[lints.rust]
+unsafe_code     = "forbid"
+unused_must_use = "deny"
+missing_docs    = "allow"
+
+[lints.clippy]
+pedantic                = { level = "allow", priority = -1 }
+nursery                 = { level = "allow", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate      = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+unwrap_used             = "warn"
+panic                   = "warn"
+todo                    = "warn"

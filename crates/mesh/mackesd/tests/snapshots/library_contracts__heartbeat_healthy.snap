@@ -1,0 +1,11 @@
+---
+source: crates/mackesd/tests/library_contracts.rs
+expression: hb
+---
+{
+  "node_id": "peer:anvil",
+  "at_ms": 1700000000,
+  "agent_version": "1.1.0",
+  "applied_revision": "r-2026-05-19-0042",
+  "health": "healthy"
+}

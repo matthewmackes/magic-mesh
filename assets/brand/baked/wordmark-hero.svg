@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 200" role="img" aria-label="MDE wordmark (hero)">
+  <title>MDE wordmark — hero treatment</title>
+  <desc>Placeholder typography — replace with finished artwork. Hero variant for About panel and greeter; expected to be visible at 600px+ wide so it should carry more refined letterform detail than wordmark.svg.</desc>
+  <text x="400" y="148"
+        font-family="Geologica, Inter, system-ui, sans-serif"
+        font-size="160"
+        font-weight="800"
+        letter-spacing="-6"
+        text-anchor="middle"
+        fill="currentColor">MDE</text>
+</svg>

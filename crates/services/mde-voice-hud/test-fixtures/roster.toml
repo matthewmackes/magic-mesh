@@ -1,0 +1,78 @@
+# mde-voice-hud peer roster fixture
+#
+# Used when the live Bus topic `mesh/roster` is not reachable (e.g.,
+# `cargo run -p mde-voice-hud` outside a fully-booted mded session).
+# Matches the 8-peer fixture from the design bundle for parity with
+# the Claude Design reference.
+#
+# Per VOIP-27 acceptance: Peers tab renders these rows when the Bus
+# subscription returns no data. The fixture path is determined at
+# launch:
+#   1. $MDE_VOICE_HUD_ROSTER (override for dev/testing)
+#   2. <gluster_mesh_home>/voip/peers.toml (live VOIP-26 path)
+#   3. ~/.config/mde/voip/peers.toml (local fallback per VOIP-26)
+#   4. The embedded copy in this crate (compile-time fallback)
+
+[[peers]]
+ext      = "1001"
+name     = "alice-laptop"
+role     = "GUI"
+presence = "available"
+lan      = true
+hint     = "Alice's ThinkPad"
+
+[[peers]]
+ext      = "1002"
+name     = "bob-tower"
+role     = "GUI"
+presence = "on-call"
+lan      = true
+hint     = "Bob's home tower"
+
+[[peers]]
+ext      = "1003"
+name     = "studio-imac"
+role     = "GUI"
+presence = "available"
+lan      = false
+hint     = "Studio iMac"
+
+[[peers]]
+ext      = "1004"
+name     = "nas-pi"
+role     = "Host"
+presence = "available"
+lan      = true
+hint     = "Host peer / DERP relay"
+
+[[peers]]
+ext      = "1005"
+name     = "shop-fileserver"
+role     = "Node"
+presence = "available"
+lan      = false
+hint     = "Headless fileserver"
+
+[[peers]]
+ext      = "1006"
+name     = "carol-mbp"
+role     = "GUI"
+presence = "away"
+lan      = false
+hint     = "Carol's MacBook"
+
+[[peers]]
+ext      = "1007"
+name     = "edge-router"
+role     = "Node"
+presence = "offline"
+lan      = false
+hint     = "Edge router peer"
+
+[[peers]]
+ext      = "1008"
+name     = "dan-laptop"
+role     = "GUI"
+presence = "dnd"
+lan      = true
+hint     = "Dan — heads-down"

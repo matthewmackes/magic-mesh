@@ -1,0 +1,16 @@
+[package]
+name        = "mackes-transport"
+version     = "0.0.0"
+edition     = "2021"
+publish     = false
+description = "KDC2-1 — Transport trait + capability model + TransportKind / HealthState / Capabilities. Pulled out into its own crate so the mesh router can depend on the trait without dragging in any transport implementation. Implementations live in their own crates (mde-kdc, mackes-https-tunnel, mackesd's direct-UDP module)."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde       = { version = "1", features = ["derive"] }
+async-trait = { version = "0.1" }
+
+[dev-dependencies]
+serde_json = "1"

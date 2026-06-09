@@ -1,0 +1,12 @@
+# Workspace cargo configuration.
+
+[env]
+# E0.2 (2026-06-03): the audio chain pulls opus 0.3.1 -> audiopus_sys 0.2.2, which
+# vendors an Opus tree whose CMakeLists requires `cmake_minimum_required(<3.5)`.
+# CMake 4 (Fedora 44 ships 4.3.0) removed compatibility with policies < 3.5, so the
+# vendored build fails to configure. Telling CMake to assume policy version 3.5 for
+# projects that don't set one is the ecosystem-standard mitigation and lets the
+# vendored Opus configure. Applies to local + CI builds (cargo reads this config).
+# Follow-up: update opus/audiopus_sys off the ancient vendored CMake (see the E0.2
+# note in docs/PROJECT_WORKLIST.md) so this workaround can be dropped.
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

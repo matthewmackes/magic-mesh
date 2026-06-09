@@ -1,0 +1,47 @@
+[package]
+name        = "mde-music"
+description = "AIR-* (v6.1) — the native Airsonic music GUI for MDE (Iced). AIR-10/11 slice: the 7-card library hub + the breadcrumb navigation shell + the Airsonic connection banner. The live grids behind each card + playback transport land with the mde-musicd D-Bus data path (AIR-10.b / AIR-2)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[[bin]]
+name = "mde-music"
+path = "src/main.rs"
+
+[lib]
+name = "mde_music"
+path = "src/lib.rs"
+
+[dependencies]
+iced       = { version = "0.13", default-features = false, features = ["wgpu", "tiny-skia", "tokio", "advanced", "image"] }
+# The credential loader (shared with the daemon) — the hub banner reads
+# the configured server.
+mde-musicd = { path = "../mde-musicd" }
+# AIR-10.b — the GUI talks to the mde-musicd daemon over the Bus
+# (action/music/<verb> → reply) per the Q96 Bus-canonical lock.
+mde-bus    = { path = "../../platform/mde-bus" }
+# E5.3 — single-source colors from the canonical design palette (the Q2
+# indigo accent + semantic tokens) instead of hardcoded hex; the `iced`
+# feature enables `Rgba::into_iced_color()` for the app theme.
+mde-theme  = { path = "../../shared/mde-theme", features = ["iced"] }
+# AIR-10.b — parse the daemon's JSON Bus replies into display rows.
+serde_json = "1"
+# AIR-11.b — derive (de)serialize for the persisted MusicPrefs (sort).
+serde      = { version = "1", features = ["derive"] }
+# AIR-10.b — the Bus round-trip runs in spawn_blocking (Persist/rusqlite
+# isn't Send, so it can't cross Iced's multi-thread Task executor).
+# AIR-14 — `time` powers the 250 ms search debounce (tokio::time::sleep,
+# which runs on Iced's tokio executor).
+tokio      = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
+# AIR-16 — decode the cover art (base64 over the Bus → JPEG/PNG bytes) and
+# downscale it to run the dominant-colour pass; no codecs beyond the
+# defaults the workspace already builds.
+base64     = "0.22"
+image      = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,47 @@
+[package]
+name         = "mde-kdc-host"
+version      = "0.0.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+publish      = false
+description  = "Host layer for the MDE KDE Connect stack: event stream, pairing store, and (later) the LAN transport, atop mde-kdc-proto."
+
+[lints]
+workspace = true
+
+[dependencies]
+mde-kdc-proto = { path = "../mde-kdc-proto" }
+serde         = { version = "1", features = ["derive"] }
+serde_json    = "1"
+toml          = "0.8"
+thiserror     = "1"
+# Object-safe async traits (Transport / Connection) on stable rust 1.85.
+async-trait   = "0.1"
+# The event stream is an mpsc channel; the LAN discovery loop adds a UDP socket
+# (`net`), re-announce/prune timers (`time`), and `select!` (`macros`). The TLS
+# transport (3b.2) adds `io-util` (split + AsyncRead/WriteExt for framed I/O over
+# the TLS stream) and `rt` (`tokio::spawn` for the per-connection read loops — the
+# ambient Surface runtime drives them; the host still never owns the runtime).
+tokio         = { version = "1", features = ["sync", "net", "time", "macros", "io-util", "rt"] }
+# The protocol crate intentionally ships NO RSA keygen (ring 0.17 lacks it), so
+# the host owns key generation with the pure-Rust `rsa` crate and feeds the
+# PKCS#8 bytes back into mde_kdc_proto::crypto::PairingKeyPair::from_pkcs8.
+rsa           = "0.9"
+rand          = "0.8"
+# Increment 3b — identity certs + the TLS pairing transport. rcgen issues the
+# self-signed X.509 identity cert from our RSA PKCS#8; pkcs8 re-PEMs the key for
+# rcgen. rustls 0.23 (ring provider, matching the proto's ring usage) + tokio-rustls
+# drive the TLS link; sha2 computes the SHA-256 cert fingerprint that KDE Connect
+# pins at first pair.
+pkcs8         = { version = "0.10", features = ["pem"] }
+rcgen         = "0.13"
+rustls        = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls  = { version = "0.26", default-features = false, features = ["ring"] }
+sha2          = "0.10"
+
+[dev-dependencies]
+tokio         = { version = "1", features = ["sync", "net", "time", "macros", "rt"] }
+tempfile      = "3"

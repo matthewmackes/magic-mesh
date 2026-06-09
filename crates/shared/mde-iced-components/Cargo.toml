@@ -1,0 +1,22 @@
+[package]
+name        = "mde-iced-components"
+description = "Shared Iced widget builders for MDE — the canonical Object Card renderer + future shared widget primitives. Lives outside mde-theme so the latter's no-toolkit-dep lock stays intact, and outside mde-workbench so peer crates (mde-files, mde-popover, mde-music, etc.) can consume the same renderer without taking a heavyweight workbench dep. See CR-3.b in docs/PROJECT_WORKLIST.md for the extraction history."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_iced_components"
+path = "src/lib.rs"
+
+[dependencies]
+# Match the workbench's iced feature set so call sites here +
+# call sites there get the same widget surface area.
+iced       = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "svg", "tokio", "advanced", "canvas", "wayland"] }
+mde-theme  = { path = "../mde-theme", features = ["iced"] }
+
+[lints]
+workspace = true

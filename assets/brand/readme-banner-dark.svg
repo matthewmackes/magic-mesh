@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 120" role="img" aria-label="MDE — Mackes Desktop Environment for Workgroups">
+  <title>MDE — Mackes Desktop Environment</title>
+  <desc>README banner, dark theme (white wordmark). Paired with
+    readme-banner-light.svg via GitHub's #gh-light-mode-only / #gh-dark-mode-only
+    image swap. See assets/brand/README.md.</desc>
+  <g transform="translate(6 8) scale(0.86)" fill="none"
+     stroke="#6aa3f0" stroke-width="1.2" stroke-linejoin="round">
+    <polygon points="48,4 36,10 30,26 30,46 26,72 24,96 30,110 40,114 44,108 48,110 52,108 56,114 66,110 70,94 66,70 64,48 66,40 80,44 66,34 62,16"
+             fill="#1746a0" fill-opacity="0.35" stroke="#5b8def"/>
+    <polygon points="48,30 40,40 38,64 40,90 48,102 56,90 58,64 56,40"
+             fill="#e8f1ff" fill-opacity="0.92" stroke="#9ec5f7"/>
+    <path d="M48,4 L48,30 M36,10 L48,30 M62,16 L48,30 M30,26 L40,40
+             M64,48 L56,40 M30,46 L38,64 M64,48 L58,64 M26,72 L38,64
+             M66,70 L58,64 M24,96 L40,90 M70,94 L56,90 M40,114 L48,102
+             M66,110 L48,102 M62,16 L66,40 M66,34 L80,44"
+          stroke="#7fb0f2" stroke-width="1"/>
+    <circle cx="48" cy="30" r="3.2" fill="#9ec5f7" stroke="none"/>
+    <circle cx="30" cy="26" r="2.4" fill="#7fb0f2" stroke="none"/>
+    <circle cx="64" cy="48" r="2.4" fill="#7fb0f2" stroke="none"/>
+    <circle cx="80" cy="44" r="2.2" fill="#9ec5f7" stroke="none"/>
+    <path d="M40,114 L74,104 L92,114 M74,104 L60,118 M92,114 L100,100"
+          stroke="#7fb0f2" stroke-width="1"/>
+    <circle cx="74" cy="104" r="3"   fill="#9ec5f7" stroke="none"/>
+    <circle cx="92" cy="114" r="2.4" fill="#5b8def" stroke="none"/>
+    <circle cx="60" cy="118" r="2"   fill="#5b8def" stroke="none"/>
+  </g>
+  <g font-family="'Roboto', 'Inter', system-ui, sans-serif">
+    <text x="120" y="62" font-size="58" font-weight="800" letter-spacing="-1" fill="#ffffff">MDE</text>
+    <rect x="122" y="74" width="352" height="2" fill="#ffffff" opacity="0.3"/>
+    <text x="122" y="98" font-size="24" font-weight="500" letter-spacing="0.2" fill="#e8eaed">Mackes Desktop Environment</text>
+    <text x="122" y="116" font-size="15" font-weight="400" letter-spacing="0.5" fill="#9aa0a6">for Workgroups</text>
+  </g>
+</svg>

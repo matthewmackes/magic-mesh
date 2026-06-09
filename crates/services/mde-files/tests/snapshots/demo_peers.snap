@@ -1,0 +1,5 @@
+demo_peers
+  matthew · workstation | status=Online | files=4912 | shared=211
+  home server · NAS | status=Online | files=18403 | shared=1842
+  matt-phone | status=Idle | files=612 | shared=4
+  CI · build runner | status=Offline | files=0 | shared=0

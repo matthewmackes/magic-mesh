@@ -1,0 +1,256 @@
+//! Native mount enumeration — the "This PC / volumes" parity op (E11.6, Q34–Q39).
+//!
+//! Parses `/proc/mounts` into the mounted-filesystem list the file manager shows
+//! under "This PC" (real disks, network shares, FUSE mounts incl. the mesh
+//! LizardFS), filtering out the kernel's pseudo-filesystems (`proc`, `sysfs`,
+//! `cgroup`, …). Pure `std`; the parser takes the file content as a string so it
+//! is fully unit-tested off fixtures with no `/proc` dependency.
+
+use std::path::PathBuf;
+
+/// One row of `/proc/mounts`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountPoint {
+    /// Backing device or remote source (`/dev/sda1`, `//nas/share`, `lizardfs#…`).
+    pub source: String,
+    /// Where it is mounted.
+    pub target: PathBuf,
+    /// Filesystem type (`ext4`, `cifs`, `fuse.sshfs`, …).
+    pub fstype: String,
+    /// The raw mount options field (`rw,relatime,…`).
+    pub options: String,
+}
+
+/// Filesystem types that are kernel/virtual plumbing, never user volumes.
+const PSEUDO_FSTYPES: &[&str] = &[
+    "proc",
+    "sysfs",
+    "devtmpfs",
+    "tmpfs",
+    "devpts",
+    "mqueue",
+    "hugetlbfs",
+    "debugfs",
+    "tracefs",
+    "securityfs",
+    "pstore",
+    "bpf",
+    "configfs",
+    "fusectl",
+    "efivarfs",
+    "autofs",
+    "binfmt_misc",
+    "ramfs",
+    "selinuxfs",
+    "nsfs",
+    "rpc_pipefs",
+    "cgroup",
+    "cgroup2",
+];
+
+impl MountPoint {
+    /// Whether this mount is a "volume" worth showing under This PC — a real disk,
+    /// a network share, or a FUSE mount (the mesh LizardFS, sshfs Cloud-Files, …),
+    /// as opposed to kernel pseudo-plumbing.
+    #[must_use]
+    pub fn is_user_volume(&self) -> bool {
+        // Real FUSE mounts (fuse.sshfs, fuse.lizardfs, fuseblk) are always user
+        // volumes — but `fusectl`, the FUSE *control* pseudo-fs, is not, so match
+        // the `fuse.` prefix / `fuseblk` exactly rather than every "fuse*".
+        if self.fstype.starts_with("fuse.") || self.fstype == "fuseblk" {
+            return true;
+        }
+        !PSEUDO_FSTYPES.contains(&self.fstype.as_str())
+    }
+
+    /// Whether the mount is remote (network or mesh) rather than a local block
+    /// device — drives the icon + the "available offline?" hint.
+    #[must_use]
+    pub fn is_network(&self) -> bool {
+        matches!(
+            self.fstype.as_str(),
+            "nfs" | "nfs4" | "cifs" | "smb3" | "smbfs" | "9p"
+        ) || self.fstype.starts_with("fuse.")
+    }
+}
+
+/// Parse the content of `/proc/mounts` (or `/etc/mtab`) into rows, decoding the
+/// octal `\NNN` escapes the kernel uses for spaces/tabs/newlines in fields.
+/// Malformed lines (fewer than 4 fields) are skipped.
+#[must_use]
+pub fn parse_proc_mounts(content: &str) -> Vec<MountPoint> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split(' ');
+            let source = unescape_octal(f.next()?);
+            let target = unescape_octal(f.next()?);
+            let fstype = unescape_octal(f.next()?);
+            let options = unescape_octal(f.next()?);
+            if fstype.is_empty() {
+                return None;
+            }
+            Some(MountPoint {
+                source,
+                target: PathBuf::from(target),
+                fstype,
+                options,
+            })
+        })
+        .collect()
+}
+
+/// All current mounts, read from `/proc/mounts`. Empty when `/proc` is
+/// unreadable (e.g. a minimal container), never an error — a file manager just
+/// shows no extra volumes.
+#[must_use]
+pub fn all() -> Vec<MountPoint> {
+    std::fs::read_to_string("/proc/mounts").map_or_else(|_| Vec::new(), |c| parse_proc_mounts(&c))
+}
+
+/// The user-facing volumes only ([`MountPoint::is_user_volume`]).
+#[must_use]
+pub fn user_volumes() -> Vec<MountPoint> {
+    all()
+        .into_iter()
+        .filter(MountPoint::is_user_volume)
+        .collect()
+}
+
+/// Decode the kernel's `\NNN` octal escapes (space=`\040`, tab=`\011`,
+/// newline=`\012`, backslash=`\134`) back into their characters.
+fn unescape_octal(field: &str) -> String {
+    if !field.contains('\\') {
+        return field.to_string();
+    }
+    let bytes = field.as_bytes();
+    let mut out = String::with_capacity(field.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 4 <= bytes.len() {
+            let oct = &field[i + 1..i + 4];
+            if let Ok(b) = u8::from_str_radix(oct, 8) {
+                out.push(b as char);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Render the user volumes as the `mde-files --mounts` report (one
+/// `target\tfstype\tsource[\t(network)]` per line).
+#[must_use]
+pub fn report(mounts: &[MountPoint]) -> String {
+    let mut out = String::new();
+    for m in mounts {
+        out.push_str(&format!(
+            "{}\t{}\t{}{}\n",
+            m.target.display(),
+            m.fstype,
+            m.source,
+            if m.is_network() { "\t(network)" } else { "" }
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A realistic /proc/mounts slice: pseudo fs, a real disk, a tmpfs, a CIFS
+    // share, an sshfs FUSE mount, and a mesh LizardFS FUSE mount — plus a mount
+    // whose path contains an escaped space.
+    const FIXTURE: &str = "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n\
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n\
+/dev/nvme0n1p2 / ext4 rw,relatime 0 0\n\
+tmpfs /run tmpfs rw,nosuid,nodev 0 0\n\
+/dev/nvme0n1p1 /boot/efi vfat rw,relatime 0 0\n\
+//nas/media /mnt/media cifs rw,relatime 0 0\n\
+user@host:/srv /home/mm/remote fuse.sshfs rw,nosuid,nodev,relatime 0 0\n\
+lizardfs#master:9421 /mnt/mesh\\040store fuse.lizardfs rw,relatime 0 0\n\
+fusectl /sys/fs/fuse/connections fusectl rw,nosuid,nodev,noexec,relatime 0 0\n";
+
+    #[test]
+    fn parses_every_well_formed_line() {
+        let m = parse_proc_mounts(FIXTURE);
+        assert_eq!(m.len(), 9);
+        assert_eq!(m[2].source, "/dev/nvme0n1p2");
+        assert_eq!(m[2].target, PathBuf::from("/"));
+        assert_eq!(m[2].fstype, "ext4");
+    }
+
+    #[test]
+    fn user_volume_filter_drops_pseudo_keeps_real() {
+        let vols: Vec<_> = parse_proc_mounts(FIXTURE)
+            .into_iter()
+            .filter(MountPoint::is_user_volume)
+            .collect();
+        let targets: Vec<String> = vols
+            .iter()
+            .map(|m| m.target.display().to_string())
+            .collect();
+        // kept: the ext4 root, the vfat ESP, the CIFS share, both FUSE mounts.
+        assert!(targets.contains(&"/".to_string()));
+        assert!(targets.contains(&"/boot/efi".to_string()));
+        assert!(targets.contains(&"/mnt/media".to_string()));
+        assert!(targets.contains(&"/home/mm/remote".to_string()));
+        // dropped: proc, sysfs, the tmpfs on /run, and the fusectl control fs
+        // (it starts with "fuse" but is not a real FUSE *mount*).
+        assert!(!targets.contains(&"/proc".to_string()));
+        assert!(!targets.contains(&"/sys".to_string()));
+        assert!(!targets.contains(&"/run".to_string()));
+        assert!(!targets.contains(&"/sys/fs/fuse/connections".to_string()));
+    }
+
+    #[test]
+    fn octal_escape_in_a_path_is_decoded() {
+        let mesh = parse_proc_mounts(FIXTURE)
+            .into_iter()
+            .find(|m| m.fstype == "fuse.lizardfs")
+            .unwrap();
+        assert_eq!(mesh.target, PathBuf::from("/mnt/mesh store"));
+        assert!(mesh.is_user_volume());
+        assert!(mesh.is_network(), "a fuse.* mesh mount is remote");
+    }
+
+    #[test]
+    fn network_classification() {
+        let m = parse_proc_mounts(FIXTURE);
+        let by_target = |t: &str| m.iter().find(|x| x.target == PathBuf::from(t)).unwrap();
+        assert!(by_target("/mnt/media").is_network(), "cifs is network");
+        assert!(
+            by_target("/home/mm/remote").is_network(),
+            "sshfs is network"
+        );
+        assert!(!by_target("/").is_network(), "a local ext4 disk is not");
+    }
+
+    #[test]
+    fn malformed_lines_are_skipped() {
+        let m = parse_proc_mounts("garbage\n/dev/sda1 /data\n/dev/sdb1 /more ext4 rw 0 0\n");
+        // only the last line has >=4 fields
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].fstype, "ext4");
+    }
+
+    #[test]
+    fn report_marks_network_volumes() {
+        let vols: Vec<_> = parse_proc_mounts(FIXTURE)
+            .into_iter()
+            .filter(MountPoint::is_user_volume)
+            .collect();
+        let r = report(&vols);
+        assert!(r.contains("/mnt/media\tcifs"));
+        assert!(r
+            .lines()
+            .any(|l| l.contains("cifs") && l.contains("(network)")));
+        assert!(r
+            .lines()
+            .any(|l| l.starts_with("/\text4") && !l.contains("(network)")));
+    }
+}

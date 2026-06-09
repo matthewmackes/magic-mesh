@@ -1,0 +1,305 @@
+# Phase 12 — Enterprise Mesh Backend & GUI control plane.
+#
+# Ships TWO targets from one crate:
+#
+#   * Library `mackesd_core` — the authoritative read API. Linked
+#     directly into `mackes-panel` so the GUI gets in-process access
+#     to mesh state with zero IPC overhead. No networked API by Phase
+#     12.A.3 lock.
+#
+#   * Binary  `mackesd`      — the reconcile loop + CLI. Runs on every
+#     peer as a systemd unit; one is leader per the QNM-Shared lockfile
+#     (12.A.5). Owns writes to the SQLite store.
+#
+# Both consume the same internal modules (store, policy, topology,
+# telemetry, reconcile, deploy, audit) — they're not separate crates,
+# just separate entry points.
+
+[package]
+name         = "mackesd"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+description  = "Enterprise mesh control plane for Mackes XFCE Workstation"
+
+[lib]
+name = "mackesd_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mackesd"
+path = "src/bin/mackesd.rs"
+
+[dependencies]
+mackes-mesh-types = { path = "../mackes-mesh-types" }
+# NF-1 (v2.5) — covert TCP/443 transport. mackesd consumes the
+# activation state machine + framing + rustls listener/dialer
+# from the new crate; `https_fallback.rs` re-exports the
+# activation types as type aliases so the eventual NF-4.5
+# deletion is a one-liner rather than a workspace-wide
+# refactor.
+mackes-nebula-https-tunnel = { path = "../mackes-nebula-https-tunnel" }
+
+# Phase 13 → v2.1+ KDC2 supersession: the legacy mackes-kdc
+# crate + kdc_bridge worker have been retired in favour of the
+# native mde-kdc + mde-kdc-proto in-process integration
+# (KDC2-6.5 / KDC2-6.6). No mackes-kdc dependency remains.
+
+
+# KDC2-1 (v2.1, locked 2026-05-22) — Transport trait + capability
+# model. Consumed by `crates/mackesd/src/topology/mod.rs` to bridge
+# `TransportKind` → `EdgeKind`, and by the future mesh_router
+# worker (KDC2-3). Implementations live elsewhere (mde-kdc,
+# mackes-https-tunnel, mackesd::transport::direct_udp).
+mackes-transport = { path = "../mackes-transport" }
+
+# KDC2-3.10 — the canonical host integration crate consumed by the
+# kdc_host worker under async-services (E2.2, 2026-06-05: converged
+# off the retired legacy `mde-kdc`; one host across the monorepo).
+# Provides `pairing::{PairingStore,DeviceRecord}` + the LAN transport;
+# pulls in mde-kdc-proto + rsa + pkcs8 transitively, so it's behind
+# the same feature gate that already gates tokio + zbus.
+mde-kdc-host = { path = "../../kdc/mde-kdc-host", optional = true }
+
+# The canonical pure protocol crate (E2.2 — replaced the renamed
+# `mde-kdc-proto-legacy`): `wire::Packet` for the kdc_host worker's
+# outbound queue + `dispatch::PluginAuthority` implemented by
+# `transport::policy::LoadedPolicy`. No feature gate — these are pure
+# types, no I/O or async runtime needed in the base build.
+mde-kdc-proto = { path = "../../kdc/mde-kdc-proto" }
+
+# EPIC-MESH-PROBE (MESH-PROBE-2) — the probe inventory IS mde-card
+# Cards (Q7): the nmap parser emits Host cards with Service children
+# via `mde_card::probe`. Pure lib (serde + sha2), no feature gate.
+mde-card = { path = "../../shared/mde-card" }
+# SWAY-4 (v6.0 Q89/Q94) — marks_state worker uses Persist + rpc::reply_topic
+# to serve action/marks/* Bus action topics. Optional (async-services gate).
+mde-bus = { path = "../../platform/mde-bus", optional = true }
+# E1.2 — role-gated worker subsets: run_serve gates each worker spawn by the
+# pinned deployment role (mde_role::load → rank). Non-optional + zero-dep, so
+# the gating logic is available regardless of feature set.
+mde-role = { path = "../../platform/mde-role" }
+
+# VV-1 / VV-1.5 (v4.1.0) — pure-function config generator for
+# the kamailio-mde + rtpengine-mde stack. Consumed by the
+# `mackesd voice render-config` CLI which both unit files invoke
+# as ExecStartPre. No feature gate — the generator is pure and
+# adds no runtime cost.
+mde-voice-config = { path = "../../services/mde-voice-config" }
+
+# Storage: SQLite via rusqlite (sync, no async runtime needed for the
+# reconcile loop's cadence). WAL mode + 5 s busy timeout per 12.A.2.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# CLI parsing: clap derive macro for declarative subcommand routing.
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# JSON for revisions + events + QNM-Shared heartbeat files. Serde
+# everything; explicit (de)serializers per type.
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+
+# EPIC-MESH-PROBE (MESH-PROBE-2) — read-only DOM parser for nmap's
+# `-oX` output. Already vendored in the workspace lockfile; the
+# nested host/ports/port/service attribute tree wants a real XML
+# parser rather than the substring approach gluster_worker uses for
+# its flat `--xml`.
+roxmltree   = "0.20"
+
+# KDC2-1.11 — TOML parser for /etc/mde/connect/policy.toml +
+# operator override at ~/.config/mde/connect/policy.toml.
+# default-features = false because we don't need TOML's
+# date / preserve_order features here.
+toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
+
+# Time: chrono for ISO-8601 timestamps stored in SQLite TEXT columns.
+chrono = { version = "0.4", features = ["serde"] }
+
+# Crypto: SHA-256 for the audit-log hash chain + 16-char URL-safe
+# passcode generation.
+sha2 = "0.10"
+rand = "0.8"
+
+# NF-18.1 (v2.5) — passphrase-encrypted CA bundle export/import.
+# Argon2id KDF + ChaCha20-Poly1305 AEAD. Best-choice picks per
+# the iteration skill standing authorizations (2026-05-24):
+# RustCrypto crates are widely audited, no_std-friendly, and
+# don't pull in a system libsodium dep. Bundle format is
+# versioned so future swaps (e.g. to AES-GCM) ship as a new
+# variant without breaking old backups.
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+# Base64 for the on-disk bundle envelope (ASCII-armored so
+# operators can sneakernet via copy/paste).
+base64 = "0.22"
+
+# Phase 12.10.4 — zero-on-drop for bearer tokens + passcodes.
+zeroize = { version = "1.7", features = ["zeroize_derive"] }
+
+# Phase 12.3.2 — per-node Ed25519 identity (signed enrollment + audit
+# row signing).
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+# Filesystem locking for the leader-election lockfile (12.A.5).
+fs2 = "0.4"
+
+# NF-2.4 seal — safe running-uid lookup (rustix avoids the
+# `unsafe { libc::getuid() }` path that the workspace's
+# `unsafe_code = "forbid"` lint rejects).
+rustix = { version = "0.38", features = ["process"] }
+
+# NF-2 CA module — error-derive macro used across the
+# ca::{mint,sign,seal,bundle} modules. tokio-rustls already
+# pulls thiserror transitively; declaring it here makes the
+# direct usage explicit.
+thiserror = "1"
+
+# Error context. We surface failures as structured errors, never
+# unwrap. anyhow is the canonical Rust ergonomic-error crate.
+anyhow = "1"
+
+# Structured logging. tracing macros emit JSON spans; the binary
+# initializes a subscriber that writes to stderr in dev and the
+# journal in prod.
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Directory resolution that honors $XDG_*_HOME with sensible fallbacks.
+dirs = "5"
+
+# Phase 12.5 — SIGTERM/SIGINT handling for `mackesd reconcile`. Used
+# only by the binary; the library never installs signal handlers.
+# Pinned to the same major as the published 0.3.x line so the build
+# stays reproducible across the workspace.
+signal-hook = { version = "0.4", features = ["iterator"] }
+
+# Phase 12.11.2 — testcontainers-based E2E integration suite. Gated
+# behind the `docker-tests` feature so `cargo test` stays Docker-free
+# on a fresh checkout. Pinned to 0.25 because the workspace's rust-
+# version (1.85) is below the 1.88 minimum of 0.27+. Used only by
+# `tests/integration_testcontainers.rs`. Cargo disallows optional
+# dev-dependencies, so it lives in [dependencies] under a feature
+# gate; the library/binary code never touches it.
+testcontainers = { version = "0.25", features = ["blocking"], optional = true }
+
+# --- v2.0.0 Phase A — async surface for in-process worker pool + DBus ---
+#
+# These three deps are gated behind the `async-services` feature so the
+# existing sync code (rusqlite store, reconcile loop on std::thread,
+# leader lockfile via fs2) builds untouched on a fresh checkout. The
+# binary at src/bin/mackesd.rs enables the feature when it spawns the
+# tokio runtime + supervisor + zbus servers; library consumers (the
+# mackes-panel link target) can ignore it.
+
+# Async runtime — full features (rt-multi-thread + macros + signal +
+# fs + net + io-util + sync + time) for the new worker pool. Locked
+# 2026-05-19.
+tokio = { version = "1", features = ["full"], optional = true }
+
+# Erlang-style worker supervisor: restart back-off, periodic health
+# checks via tick(), runtime add/remove through SupervisorHandle.
+# v0.4 chosen per the 2026 stack survey 2026-05-19.
+task-supervisor = { version = "0.4", optional = true }
+
+# DBus session-bus services for org.mackes.{Shell,Settings,
+# Notifications,Session,Fleet}. tokio feature so the zbus runtime
+# cooperates with the worker pool; default-features disabled to skip
+# the async-io thread launches. blocking-api stays off — the library
+# never blocks.
+zbus = { version = "5", default-features = false, features = ["tokio"], optional = true }
+
+# v2.0.0 Phase A — async-trait for object-safe `Worker` boxing in the
+# in-process supervisor (`crate::workers::Worker`). Native async-fn-
+# in-trait is stable on 1.75+ but isn't object-safe for `Box<dyn>`
+# storage, which the supervisor needs. Locked 2026-05-19.
+async-trait = { version = "0.1", optional = true }
+
+# MESH-MDNS-RELAY (2026-06-05) — native cross-segment mDNS service relay.
+# `mdns-sd` is async-runtime-agnostic (spawns its own daemon thread) so it
+# cohabits with the worker without a dedicated executor; it does BOTH the
+# local browse and the LAN republish (registering peers' services), replacing
+# the v1.x avahi-browse + avahi-publish-service. (Re-added: RETIRE-PY.1 dropped
+# it when the dead python mdns worker retired; this is the real consumer.)
+mdns-sd = { version = "0.11", optional = true }
+
+# Phase 12.18 D.2 — Https443 transport. rustls 0.23 + tokio-rustls
+# 0.26 match the workspace's existing TLS stack (mde-kdc uses
+# the same versions). rustls-native-certs loads the system root
+# CA store so the fallback host's LE-signed cert chain validates
+# against the operator's distro trust bundle (Fedora ships
+# `ca-certificates`, the system store rustls-native-certs reads).
+# Locked 2026-05-23 — Q10 "indistinguishable from real HTTPS".
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+
+# sway IPC client for the workspace_namer worker. Subscribes to
+# `EventType::Window` + runs `rename workspace` commands as the focused
+# window's app_id changes. (NB: this — and the other sway-cluster tag
+# workers — is a sway-IPC holdover under labwc; tracked for the labwc/
+# ext-protocol port alongside E0.17's sway-surface family.)
+swayipc-async = { version = "3.0.0", optional = true }
+# Portal-41 — `StreamExt::next()` on the swayipc event stream. The
+# transitive dep tree (tokio + swayipc-async) already carries
+# `futures-util`; this declaration is the explicit consumer entry.
+futures-util = { version = "0.3", optional = true }
+
+[dev-dependencies]
+# Deterministic snapshot diffs for library-contract tests (12.11.5).
+insta    = { version = "1", features = ["json", "redactions"] }
+tempfile = "3"
+# Phase 12.18 D.2 — self-signed certs for the Https443 loopback
+# integration test. Same version mde-kdc uses for the KDC TLS
+# bench harness.
+rcgen    = "0.13"
+
+[features]
+# Magic Mesh (E11.12 split): mackesd here is the daemon, and the only consumer
+# is the `mackesd` binary itself — there is no sync-read-only library consumer
+# left (the desktop `mde-session` that used to enable this via feature
+# unification was deleted in the cutover). So `async-services` (the worker pool +
+# Bus surface the daemon needs) is on by default; the bin no longer relies on
+# another crate to turn it on.
+default = ["async-services"]
+
+# Phase 12.11.2 — opt-in E2E suite that needs a running Docker daemon.
+# Run with `cargo test -p mackesd --features docker-tests`. Tests
+# self-skip when the daemon isn't reachable so they're safe to enable
+# in CI without forcing every developer to install Docker.
+docker-tests = ["dep:testcontainers"]
+
+# XOrg fork — compile mackesd with X11 session plumbing (i3 / xrandr).
+# Used by the `mde-xorg` RPM sub-package build.
+x11 = []
+
+# v2.0.0 Phase A — opt-in async worker pool + DBus surface. Enabled by
+# `cargo build --features async-services` and by `mackesd serve` in
+# the binary. The library's `workers/`, `ipc/`, and `settings/`
+# modules compile only with this feature; downstream library
+# consumers that just want the existing sync read-API can leave it
+# off. Locked 2026-05-19.
+async-services = [
+    "dep:tokio",
+    "dep:task-supervisor",
+    "dep:zbus",
+    "dep:async-trait",
+    "dep:mdns-sd",
+    "dep:mde-kdc-host",
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:rustls-native-certs",
+    "dep:swayipc-async",
+    "dep:futures-util",
+    "dep:mde-bus",
+]
+
+[package.metadata.docs.rs]
+# Skip the docker-tests feature on docs.rs — it pulls a network
+# dependency tree that adds build time without exposing public API.
+no-default-features = true
+
+[lints]
+workspace = true

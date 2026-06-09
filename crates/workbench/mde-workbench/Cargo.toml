@@ -1,0 +1,125 @@
+[package]
+name        = "mde-workbench"
+description = "Mackes Desktop Environment (MDE) Workbench — Iced rewrite of the v1.x GTK3 Python Workbench (CB-1.1 scaffold)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_workbench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mde-workbench"
+path = "src/main.rs"
+
+[dependencies]
+# v2.0.0 Phase E + CB-1 lock: Iced 0.13 is the Wayland-only UI
+# toolkit shared with mde-files / mde-logout-dialog (same feature
+# set so the workspace dep tree stays one resolution).
+# v4.0.1 BUG-13.c: `svg` so panel_chrome + header can render Material
+# Symbols glyphs via iced::widget::svg when Icon::svg_bytes() is Some.
+iced       = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "svg", "tokio", "advanced", "canvas", "wayland"] }
+# CB-1.13 will land the dev.mackes.MDE.Shell.Workbench.Focus
+# interface; CB-1.1's single-instance handshake already needs the
+# dep so the bus-name constants + RequestNameReply mapping live
+# under one roof. Tokio feature pairs with iced's tokio executor.
+zbus       = { version = "5", default-features = false, features = ["tokio"] }
+# Same async runtime iced + zbus consume.
+tokio      = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process"] }
+# CB-1.6 — Backend trait needs object-safe async fns
+# (`Arc<dyn Backend>` cloned into `Task::perform` futures).
+async-trait = "0.1"
+# v4.0.1 AF-2.3.a — FileBackend persists settings to TOML on
+# disk so workbench changes survive restart without mackesd.
+toml        = "0.8"
+# CB-1.7 follow-up — streams dnf stdout lines into the system_update
+# panel via iced::Task::stream + an async_stream! macro.
+async-stream = "0.3"
+futures      = "0.3"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+# BUS-7.6 — DND tab reads/writes subs.yaml + dnd.yaml; same version
+# mde-bus uses so the workspace resolves to one copy in the lock.
+serde_yaml = "0.9"
+# CB-1.13 — `mde-workbench --focus <slug>` CLI hand-off arg.
+# 4.5 matches mde-logout-dialog so the workspace shares one
+# resolution.
+clap       = { version = "4.5", features = ["derive"] }
+# Structured logging — journald reads JSON spans from stderr when
+# the systemd user unit's StandardError=journal.
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# v2.0.0 Phase 0.2 transitional aliases. The workbench config
+# tree (panel layout, per-panel preferences) lives under
+# `~/.config/mde/workbench/` once CB-1 closes; mde-config is the
+# typed read/write surface.
+mackes-config = { path = "../../mesh/mackes-config" }
+# MESH-PROBE-9.a — the Network Hosts panel deserializes the probe
+# inventory (`Vec<mde_card::Card>`) + reuses `mde_card::probe`'s
+# Card→facts extractors, so the workbench depends on mde-card directly.
+mde-card = { path = "../../shared/mde-card" }
+# CB-1.5 (Fleet group) consumes the same mesh-types value objects
+# the panel + mackesd share, so the workbench depends on them
+# directly rather than re-importing through mackesd-core.
+mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
+# UX-3 (2026-05-21) — design-token consumer. `features = ["iced"]`
+# enables the `Rgba::into_iced_color()` helper so the workbench
+# can derive its `iced::Theme::Custom` palette from
+# `mde_theme::Palette` without hardcoding hex literals.
+mde-theme = { path = "../../shared/mde-theme", features = ["iced"] }
+# CR-3.b (2026-05-25) — shared Iced widget builders. `object_card`
+# moved here from panel_chrome.rs so peer crates (mde-files,
+# mde-popover, mde-music) can render the canonical Material Object
+# Card without taking a dep on the entire workbench crate.
+mde-iced-components = { path = "../../shared/mde-iced-components" }
+# E6.9 — the Help → About surface renders the single-source project
+# disclaimer/mission (embedded from the repo-root DISCLAIMER.md at build
+# time), shared with the shell About, installer, and daemon banner.
+mde-disclaimer = { path = "../../shared/mde-disclaimer" }
+# AIR-20 (2026-05-30) — the Devices → Music settings panel reuses the
+# music daemon's creds + cache + airsonic-client modules so the panel
+# and `mde-musicd` agree byte-for-byte on storage paths + auth.
+mde-musicd = { path = "../../services/mde-musicd" }
+# DBUS-3 (2026-05-30) — the workbench `focus(slug)` hand-off migrates
+# from the `dev.mackes.MDE.Shell.Workbench` D-Bus method to Bus
+# `action/shell/workbench-focus` (Q96/EPIC-RETIRE-DBUS). The D-Bus
+# NAME is still owned for single-instance detection (finding #3
+# documented exception); only the method moves to the Bus.
+mde-bus = { path = "../../platform/mde-bus" }
+
+[features]
+# `wayland` (default): Iced renders via Wayland/wgpu.
+# `x11`: winit picks up DISPLAY at runtime; no Iced dep changes
+# needed since Iced 0.13 compiles both backends on Linux.
+default = ["wayland"]
+wayland = []
+x11     = []
+
+[dev-dependencies]
+# Single-instance handshake tests build minimal in-memory bus
+# fixtures (no real D-Bus connection); RequestNameReply lives in
+# zbus's `fdo` module already covered by the runtime dep.
+# FWMON-5 panel tests write temp JSONL files.
+tempfile = "3"
+
+[lints.rust]
+unsafe_code     = "forbid"
+unused_must_use = "deny"
+# Inner items (sidebar entries, view layout) are self-documenting
+# from CB-1.1 / CB-1.2 locks — match mde-files' policy.
+missing_docs    = "allow"
+
+[lints.clippy]
+pedantic                = { level = "allow", priority = -1 }
+nursery                 = { level = "allow", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate      = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+unwrap_used             = "warn"
+panic                   = "warn"
+todo                    = "warn"

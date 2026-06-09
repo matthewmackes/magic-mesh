@@ -1,0 +1,29 @@
+[package]
+name        = "mde-kdc-proto"
+version     = "0.0.0"
+edition     = "2021"
+publish     = false
+description = "KDC2-2 — greenfield Rust KDE Connect protocol library. Pure pure-library: zero D-Bus, zero filesystem, zero networking. Implementations of those layers live in mde-kdc (host integration, KDC2-3). Wire-compatible with the upstream KDE Connect protocol so stock Android/iOS clients pair without modification. Capability-negotiation header on every handshake unlocks MDE-only features for two-MDE-peer pairs with graceful fallback."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# KDC2-2.4 crypto (user-locked 2026-05-22: ring 0.17, picked
+# over pure-Rust rsa/aes-gcm for the BoringSSL audit history and
+# the existing usage in the mesh stack). Used by `crypto::RingKeyStore`
+# + the RSA-2048 pairing handshake + the AES-256-GCM session
+# encryption.
+ring = "0.17"
+
+# Zero-on-drop for session key bytes — paired with `Drop` impl
+# on the in-memory `RingKeyStore::keys` so an mde-kdc daemon
+# crash doesn't leave session-key material in the core dump.
+zeroize = { version = "1.7", features = ["zeroize_derive"] }
+
+[dev-dependencies]
+# (none yet — libFuzzer corpus integration lands when
+# `cargo-fuzz` is added to the workspace dev tier.)

@@ -1,0 +1,16 @@
+[package]
+name        = "mde-disclaimer"
+description = "Single-source Mackes Workstation Warning/Disclaimer/Mission text, embedded from the repo-root DISCLAIMER.md at build time. Toolkit-free so every surface — shell About, installer, daemon banner — shares one canonical copy without a GUI dependency."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_disclaimer"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
