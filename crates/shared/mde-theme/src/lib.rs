@@ -40,6 +40,7 @@
 pub mod accessibility;
 pub mod animation;
 pub mod brand;
+pub mod carbon;
 pub mod color;
 pub mod components;
 pub mod density;

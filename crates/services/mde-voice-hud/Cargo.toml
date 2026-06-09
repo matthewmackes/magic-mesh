@@ -18,6 +18,12 @@ path = "src/main.rs"
 iced            = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "tokio", "advanced", "wayland"] }
 iced_layershell = "0.18"
 
+# §4 — the HUD's Carbon hex is single-sourced from the mde-theme ramp, not
+# re-typed here. Default features only (no `iced`): we take the `Rgba` ramp
+# constants and convert to this crate's `iced::Color` locally, sidestepping the
+# cross-crate iced-version skew of `Rgba::into_iced_color()`.
+mde-theme = { path = "../../shared/mde-theme" }
+
 # Fixture + activity-feed parsing.
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"

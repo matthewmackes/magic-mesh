@@ -4,29 +4,34 @@
 //! IBM Carbon Gray-100 dark tokens + Blue accent, like the rest of the
 //! platform (the original Material-3 / Mackes-orange sub-palette predated the
 //! Carbon-only collapse and was a §1 violation). The Material-3 *role* names
-//! (`SURF`, `ON_SURF`, `PRIMARY`…) are kept for call-site stability; the values
-//! are Carbon now.
+//! (`SURF`, `ON_SURF`, `PRIMARY`…) are kept for call-site stability.
 //!
-//! Per the design-tokens lint snapshot allowlist, hex literals outside
-//! `data/css/tokens.css` get caught — this module is one of the canonical token
-//! sites for the voice-HUD surface and is the only place that carries them.
+//! §4 — the hex is **not** carried here: every value is a named step from the
+//! single-sourced [`mde_theme::carbon`] ramp, converted to this crate's
+//! `iced::Color` locally (the HUD's iced version skews from the one
+//! `Rgba::into_iced_color()` targets). This module maps Carbon ramp steps to
+//! HUD roles; it holds no raw color literals.
 
 use iced::Color;
+use mde_theme::carbon;
+use mde_theme::Rgba;
 
-/// Helper: convert an 8-bit RGB hex into an Iced `Color`.
-const fn rgb(r: u8, g: u8, b: u8) -> Color {
+/// Convert an `mde_theme` ramp token to this crate's `iced::Color`, carrying the
+/// token's own alpha. The hex lives once, in [`mde_theme::carbon`].
+const fn tok(c: Rgba) -> Color {
     Color {
-        r: r as f32 / 255.0,
-        g: g as f32 / 255.0,
-        b: b as f32 / 255.0,
-        a: 1.0,
+        r: c.r as f32 / 255.0,
+        g: c.g as f32 / 255.0,
+        b: c.b as f32 / 255.0,
+        a: c.a,
     }
 }
-const fn rgba(r: u8, g: u8, b: u8, a: f32) -> Color {
+/// Same, overriding the alpha — for translucent scrims / hover tints.
+const fn tok_a(c: Rgba, a: f32) -> Color {
     Color {
-        r: r as f32 / 255.0,
-        g: g as f32 / 255.0,
-        b: b as f32 / 255.0,
+        r: c.r as f32 / 255.0,
+        g: c.g as f32 / 255.0,
+        b: c.b as f32 / 255.0,
         a,
     }
 }
@@ -34,52 +39,65 @@ const fn rgba(r: u8, g: u8, b: u8, a: f32) -> Color {
 // ---------- Surface palette (IBM Carbon Gray-100 dark ramp) ----------
 
 /// Base surface — Carbon Gray 100.
-pub const SURF: Color = rgb(0x16, 0x16, 0x16);
+pub const SURF: Color = tok(carbon::GRAY_100);
 /// Dim variant for the inner SIP-log + activity panels — Gray 100.
-pub const SURF_DIM: Color = rgb(0x16, 0x16, 0x16);
+pub const SURF_DIM: Color = tok(carbon::GRAY_100);
 /// Low-elevation container (topbar / call bar) — Gray 90.
-pub const SURF_C_LOW: Color = rgb(0x26, 0x26, 0x26);
+pub const SURF_C_LOW: Color = tok(carbon::GRAY_90);
 /// Mid-elevation container (keypad keys / hop pills) — Gray 80.
-pub const SURF_C: Color = rgb(0x39, 0x39, 0x39);
+pub const SURF_C: Color = tok(carbon::GRAY_80);
 /// High-elevation hover state — Gray 70.
-pub const SURF_C_HI: Color = rgb(0x52, 0x52, 0x52);
+pub const SURF_C_HI: Color = tok(carbon::GRAY_70);
 /// Hierarchical accent surface (selected tab / avatar bg) — Gray 60.
-pub const SURF_C_HIER: Color = rgb(0x6f, 0x6f, 0x6f);
+pub const SURF_C_HIER: Color = tok(carbon::GRAY_60);
 /// Outline / divider line — Gray 70.
-pub const OUTLINE: Color = rgb(0x52, 0x52, 0x52);
+pub const OUTLINE: Color = tok(carbon::GRAY_70);
 /// Outline variant (lighter divider) — Gray 80.
-pub const OUTLINE_VAR: Color = rgb(0x39, 0x39, 0x39);
+pub const OUTLINE_VAR: Color = tok(carbon::GRAY_80);
 
 // ---------- Foreground palette (Carbon text ramp) ----------
 
-pub const ON_SURF: Color = rgb(0xf4, 0xf4, 0xf4); // Gray 10
-pub const ON_SURF_VAR: Color = rgb(0xc6, 0xc6, 0xc6); // Gray 30
-pub const ON_SURF_MUTED: Color = rgb(0x8d, 0x8d, 0x8d); // Gray 50
+/// Primary text — Gray 10.
+pub const ON_SURF: Color = tok(carbon::GRAY_10);
+/// Secondary text — Gray 30.
+pub const ON_SURF_VAR: Color = tok(carbon::GRAY_30);
+/// Muted / helper text — Gray 50.
+pub const ON_SURF_MUTED: Color = tok(carbon::GRAY_50);
 
 // ---------- Status colors (Carbon support, dark) ----------
 
-pub const SUCCESS: Color = rgb(0x42, 0xbe, 0x65); // Green 40
-pub const WARNING: Color = rgb(0xf1, 0xc2, 0x1b); // Yellow 30
-pub const ERROR: Color = rgb(0xfa, 0x4d, 0x56); // Red 50
-pub const INFO: Color = rgb(0x78, 0xa9, 0xff); // Blue 40
+/// Success — on-dark Green 40.
+pub const SUCCESS: Color = tok(carbon::GREEN_40);
+/// Warning — Yellow 30.
+pub const WARNING: Color = tok(carbon::YELLOW_30);
+/// Error — on-dark Red 50.
+pub const ERROR: Color = tok(carbon::RED_50);
+/// Info — Blue 40.
+pub const INFO: Color = tok(carbon::BLUE_40);
 
 // ---------- Primary (Carbon Blue accent) ----------
 
-pub const PRIMARY: Color = rgb(0x45, 0x89, 0xff); // Blue 50 (on-dark accent)
-pub const ON_PRIMARY: Color = rgb(0xff, 0xff, 0xff); // text on the Blue fill
-pub const PRIMARY_C: Color = rgb(0x00, 0x43, 0xce); // Blue 70 (container)
-pub const ON_PRIMARY_C: Color = rgb(0xd0, 0xe2, 0xff); // Blue 20 (on-container)
-pub const PRIMARY_FIXED: Color = rgb(0x78, 0xa9, 0xff); // Blue 40 (on-call pip)
+/// On-dark interactive accent — Blue 50.
+pub const PRIMARY: Color = tok(carbon::BLUE_50);
+/// Text on the Blue fill — White.
+pub const ON_PRIMARY: Color = tok(carbon::WHITE);
+/// Interactive container — Blue 70.
+pub const PRIMARY_C: Color = tok(carbon::BLUE_70);
+/// On-container text — Blue 20.
+pub const ON_PRIMARY_C: Color = tok(carbon::BLUE_20);
+/// On-call pip — Blue 40.
+pub const PRIMARY_FIXED: Color = tok(carbon::BLUE_40);
 
 // ---------- Accept / decline FAB ----------
 
 /// Background for the Call FAB — Carbon Green 60.
-pub const ACCEPT_C: Color = rgb(0x19, 0x80, 0x38);
+pub const ACCEPT_C: Color = tok(carbon::GREEN_60);
 /// Foreground glyph color on the Call FAB — Green 30.
-pub const ACCEPT_FG: Color = rgb(0x6f, 0xdc, 0x8c);
+pub const ACCEPT_FG: Color = tok(carbon::GREEN_30);
 /// Background for the Hangup FAB — Carbon Red 60.
-pub const ERROR_C: Color = rgb(0xda, 0x1e, 0x28);
-pub const ON_ERROR_C: Color = rgb(0xff, 0xff, 0xff);
+pub const ERROR_C: Color = tok(carbon::RED_60);
+/// Text/glyph on the Hangup FAB — White.
+pub const ON_ERROR_C: Color = tok(carbon::WHITE);
 
 // ---------- Presence pip colors ----------
 
@@ -91,8 +109,8 @@ pub const PRESENCE_OFFLINE: Color = OUTLINE;
 
 // ---------- Translucent overlays ----------
 
-pub const SCRIM_55: Color = rgba(0x00, 0x00, 0x00, 0.55);
-pub const HOVER_TINT_8: Color = rgba(0xff, 0xff, 0xff, 0.04);
+pub const SCRIM_55: Color = tok_a(carbon::BLACK, 0.55);
+pub const HOVER_TINT_8: Color = tok_a(carbon::WHITE, 0.04);
 
 // ---------- HUD dimensions ----------
 

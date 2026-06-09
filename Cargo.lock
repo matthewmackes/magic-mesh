@@ -4234,6 +4234,7 @@ dependencies = [
  "iced 0.14.0",
  "iced_layershell",
  "mde-bus",
+ "mde-theme",
  "rsip",
  "serde",
  "serde_json",
