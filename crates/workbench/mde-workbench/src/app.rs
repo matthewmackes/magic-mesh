@@ -116,14 +116,14 @@ pub enum Message {
     /// v4.0.1 WB-2.c — Help index opened a topic; the path is
     /// dispatched to `xdg-open`.
     HelpTopicOpened(std::path::PathBuf),
-    /// E6.2 — open a Win10 Settings page (the shell's `mde settings`
-    /// app) at the given deep-link slug (`""` = the Settings home).
-    /// Fired by the Dashboard role's See-also links.
+    /// E6.2 — open a Settings page at the given deep-link slug
+    /// (`""` = the Settings home). Fired by the Dashboard role's
+    /// See-also links.
     OpenSettings(&'static str),
-    /// E0.15 — deep-link the shell's `mde settings <category> --page
-    /// <page>` (the canonical labwc-native config surface). Fired by the
-    /// Devices launcher panels (mouse/keyboard/displays) that delegate
-    /// to Settings instead of duplicating the libinput controls.
+    /// E0.15 — deep-link a Settings `<category> --page <page>` config
+    /// surface. Fired by the Devices launcher panels (mouse/keyboard/
+    /// displays) that delegate to Settings instead of duplicating the
+    /// libinput controls.
     OpenSettingsPage(&'static str, &'static str),
     /// Launch a standalone MDE app by binary name, detached. Fired by
     /// Overview capability rows whose config surface is its own app
@@ -757,9 +757,10 @@ impl App {
                 Task::none()
             }
             Message::OpenSettingsPage(category, page) => {
-                // E0.15 — bridge to `mde settings <category> --page <page>`,
-                // the canonical labwc-native config surface. Detached spawn,
-                // mirrors OpenSettings above.
+                // E0.15 — bridge to the legacy `mde settings <category> --page
+                // <page>` config surface (Cosmic now owns the desktop; this exec
+                // targets the retired dispatcher path). Detached spawn, mirrors
+                // OpenSettings above.
                 let _ = std::process::Command::new("mde")
                     .arg("settings")
                     .arg(category)

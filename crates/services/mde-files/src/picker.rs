@@ -7,8 +7,8 @@
 //! manager browses with (`LocalFsBackend::list_dir`) and the same warm-dark
 //! theme, so the platform has ONE file engine rather than a separate dialog.
 //! It prints the chosen absolute path to stdout and exits 0, or exits non-zero
-//! on Cancel — the exact contract the shell's `filedialog` subcommand spawns
-//! against (it now execs this; see `crates/shell/mde/src/filedialog.rs`).
+//! on Cancel — the exact stdout/exit contract a portal/file-dialog caller
+//! spawns this binary against.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

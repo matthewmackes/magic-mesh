@@ -1,12 +1,12 @@
-//! Mouse & Touchpad — a thin launcher into the canonical shell Settings
-//! page (`mde settings devices --page mouse`), which writes labwc rc.xml
-//! `<libinput>` and reconfigures the running compositor (E12.6).
+//! Mouse & Touchpad — a thin launcher into the canonical Cosmic input
+//! settings (pointer speed / tap-to-click / scroll), which the desktop
+//! applies directly.
 //!
 //! E0.15 (2026-06-07): the workbench no longer keeps a duplicate libinput
 //! surface. The prior in-panel controls persisted `mouse.*` keys to mackesd
-//! Settings and relied on a sway-IPC `input` live-apply — a path that no-ops
-//! under labwc (the shell's rc.xml writer is the single source of truth). The
-//! panel now delegates to that one canonical surface instead of duplicating it.
+//! Settings and relied on a sway-IPC `input` live-apply — a path retired with
+//! the labwc/sway-era desktop. The panel now delegates to that one canonical
+//! surface instead of duplicating it.
 
 use std::sync::Arc;
 
@@ -33,7 +33,7 @@ impl MousePanel {
         Self
     }
 
-    /// No async state to load — the canonical values live in `mde settings`.
+    /// No async state to load — the canonical values live in Cosmic's input settings.
     pub fn load(_backend: Arc<dyn Backend>) -> Task<crate::Message> {
         Task::none()
     }

@@ -2,7 +2,8 @@
 //!
 //! `Lighthouse ⊂ Server ⊂ Workstation`, each a strict capability superset
 //! (CLAUDE.md §1: Lighthouse relay ⊂ Server headless ⊂ Workstation desktop).
-//! The role is chosen once — `mde setup --profile=<role>` — and written to
+//! The role is chosen once at install time (the role chooser / `mde-role`)
+//! and written to
 //! [`default_role_path`] (`/var/lib/mde/role.toml`). Thereafter it can only be
 //! **upgraded** to an equal-or-higher rank; a downgrade is refused and the file
 //! is left byte-for-byte unchanged, so a box never silently loses the rank it
@@ -30,7 +31,7 @@ pub enum Role {
     /// Headless mesh peer — Lighthouse + a storage brick + fleet/monitoring
     /// workers. No desktop. Rank 1.
     Server,
-    /// Full workstation — Server + the labwc / iced desktop surfaces. Rank 2.
+    /// Full workstation — Server + the Cosmic desktop. Rank 2.
     Workstation,
 }
 
@@ -111,7 +112,7 @@ pub fn default_role_path() -> PathBuf {
 /// variant as fail-closed (lowest privilege / refuse) — never a default.
 #[derive(Debug)]
 pub enum LoadError {
-    /// No `role.toml` at the path — the box has not been `mde setup`-pinned.
+    /// No `role.toml` at the path — the box has not been role-pinned at install.
     NotPinned,
     /// The file exists but couldn't be read.
     Io(std::io::Error),
@@ -124,7 +125,7 @@ impl fmt::Display for LoadError {
         match self {
             Self::NotPinned => write!(
                 f,
-                "no deployment role pinned (run `mde setup --profile=...`)"
+                "no deployment role pinned (set one at install via the role chooser)"
             ),
             Self::Io(e) => write!(f, "reading role.toml: {e}"),
             Self::Malformed(m) => write!(f, "malformed role.toml: {m}"),
@@ -318,7 +319,7 @@ fn write_atomic(path: &Path, role: Role) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let body = format!(
-        "# Mackes Workstation deployment role — pinned by `mde setup --profile`.\n\
+        "# Magic Mesh deployment role — pinned at install by the role chooser.\n\
          # Upgrade-only: a lower rank is refused (E1.1).\n\
          # Rank: lighthouse 0  <  server 1  <  workstation 2.\n\
          role = \"{}\"\n",

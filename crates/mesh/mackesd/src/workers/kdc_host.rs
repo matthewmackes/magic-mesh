@@ -63,7 +63,7 @@ const CONNECT_VERBS: [&str; 8] = [
 ];
 
 /// Bus topic the worker answers with the live device roster (E2.3 — the same
-/// topic the shell clients — `mde phone`, the panel — already query via
+/// topic the Connect clients (the Workbench panel) already query via
 /// `connect::devices()`). Distinct from the `<verb>` action topics.
 const DEVICES_TOPIC: &str = "action/connect/devices";
 

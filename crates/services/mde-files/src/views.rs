@@ -186,8 +186,8 @@ pub fn sidebar<'a>(
     ));
 
     // AF-mesh.2 — Mesh Home entry. Routes to the XDG-dir card
-    // grid; per the v5.0.0 GlusterFS lock the shared XDG dirs
-    // are first-class mesh resources, not local.
+    // grid; the shared XDG dirs are first-class mesh resources
+    // on the LizardFS mesh store, not local.
     mesh_col = mesh_col.push(side_row(
         icons::FOLDER,
         "Mesh Home",
@@ -1146,8 +1146,8 @@ pub fn network<'a>(
 
 // ─── Mesh Home (AF-mesh.2) ────────────────────────────────────────────────
 
-/// Landing card grid for the five shared XDG dirs. Per the
-/// v5.0.0 GlusterFS lock these dirs are full-mesh-replicated
+/// Landing card grid for the five shared XDG dirs. These dirs
+/// live on the LizardFS mesh store, replicated across the fleet
 /// over Nebula, so they're first-class mesh resources — not
 /// local files. The page is the operator's primary entry into
 /// the shared file plane.
@@ -1190,9 +1190,9 @@ pub fn mesh_home<'a>(snap: &'a BackendSnapshot) -> Element<'a, Message> {
 
 /// File listing inside one of the shared XDG dirs. Reads
 /// from `local:<slug>` via the backend (which today is the
-/// `LocalFsBackend` path) — once GlusterFS is FUSE-mounted at
-/// the XDG dirs the listing is the same disk read but the
-/// content reflects mesh-replicated state.
+/// `LocalFsBackend` path) — once the LizardFS mount backs the
+/// XDG dirs the listing is the same disk read but the content
+/// reflects mesh-replicated state.
 ///
 /// AF-mesh.3 — subdirectory navigation. When `path` is non-
 /// empty the page shows a parent-link affordance ("↑ <prev>")

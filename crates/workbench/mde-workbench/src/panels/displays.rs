@@ -1,13 +1,12 @@
-//! Displays — a thin launcher into the canonical shell display surface.
-//! The shell's System ▸ Display Settings page is `mde display`, the dedicated
-//! output-configuration surface (resolution / scale / arrangement / night
-//! light) that the desktop already ships; this launcher deep-links it via
-//! `mde settings system --page display`.
+//! Displays — a thin launcher into the canonical display-settings surface.
+//! Resolution / scale / arrangement / night light are configured in the
+//! Cosmic display settings; this panel shows a single call-to-action button
+//! that opens that surface rather than duplicating the controls.
 //!
 //! E0.15 (2026-06-07): the workbench no longer keeps a duplicate display
 //! surface. The prior in-panel controls enumerated outputs via sway IPC
-//! (`-t get_outputs`) and persisted `display.*` keys — a path that no-ops under
-//! labwc (sway IPC is absent). The panel now delegates to the one canonical
+//! (`-t get_outputs`) and persisted `display.*` keys — a path retired with the
+//! labwc/sway-era desktop. The panel now delegates to the one canonical
 //! surface instead of duplicating it.
 
 use std::sync::Arc;
@@ -35,7 +34,8 @@ impl DisplaysPanel {
         Self
     }
 
-    /// No async state to load — the canonical surface is `mde display`.
+    /// No async state to load — the canonical surface is the Cosmic
+    /// display settings the button opens.
     pub fn load(_backend: Arc<dyn Backend>) -> Task<crate::Message> {
         Task::none()
     }

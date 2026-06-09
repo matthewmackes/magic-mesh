@@ -26,8 +26,8 @@ use crate::migration::SCHEMA_VERSION;
 /// 11. `created_ts`        — Unix epoch seconds at first creation.
 /// 12. `updated_ts`        — Unix epoch seconds at last edit.
 ///
-/// Cards serialize via `serde_json` so the GlusterFS replication
-/// layer (GF-*) ships them around the mesh as plain `.json` files.
+/// Cards serialize via `serde_json` so the LizardFS mesh store
+/// ships them around the mesh as plain `.json` files.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Card {
     /// Stable mesh-merged identifier (see [`crate::stable_id_for`]).

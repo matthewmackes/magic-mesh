@@ -22,8 +22,8 @@ pub struct LibraryItem {
 }
 
 /// The `action/music/<verb>` topic a hub card fetches from. `None` for
-/// categories not yet backed by a daemon verb (Playlists / Recents /
-/// Genres / Podcasts / Radio — AIR-4.b endpoints).
+/// categories not yet backed by a daemon verb (only Radio —
+/// AIR-4.b endpoint).
 #[must_use]
 pub fn verb_for(card: HubCard) -> Option<&'static str> {
     match card {

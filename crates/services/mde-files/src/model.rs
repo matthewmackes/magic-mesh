@@ -244,8 +244,8 @@ pub enum Mime {
 ///
 /// v4.x AF-mesh.2 (2026-05-24) — adds `MeshHome` + `MeshHomeChild`
 /// for the shared XDG dirs (Documents, Pictures, Music, Videos,
-/// Downloads). Per the v5.0.0 GlusterFS lock these dirs ARE the
-/// mesh — they're full-mesh-replicated over Nebula — so they
+/// Downloads). These dirs live on the LizardFS mesh store —
+/// replicated across the fleet over Nebula — so they
 /// belong in the mesh section of the UI, not the Local one.
 /// `Downloads` stays as a top-level shortcut for the common case.
 #[derive(Debug, Clone, PartialEq, Eq)]

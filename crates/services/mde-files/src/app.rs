@@ -30,7 +30,7 @@ pub enum Message {
     /// E10 — navigate the Local browser to the parent directory.
     LocalUp,
     /// E10 — jump the Local browser to an absolute path (sidebar quick-access:
-    /// Home / XDG dirs / the GVfs network-mount dir for `mde mount`-ed shares).
+    /// Home / XDG dirs / the GVfs network-mount dir for mounted SMB shares).
     LocalGoto(String),
     /// E10 — Network view: the SMB host box changed.
     NetHostChanged(String),
@@ -354,7 +354,8 @@ impl MdeFiles {
     /// 1480×940 window, and dispatches updates from `Message`.
     pub fn run() -> iced::Result {
         // E10 — `mde-files [PATH]` opens the Local browser at PATH (a directory),
-        // so the shell's `mde files <dir>` / inode-directory handler land there.
+        // so a "open folder" / inode-directory handler that execs this binary
+        // lands there.
         let initial_dir = std::env::args()
             .nth(1)
             .filter(|p| std::path::Path::new(p).is_dir());

@@ -3248,7 +3248,7 @@ fn run_serve(
         // E1.2 — resolve the deployment-role rank once; every worker spawn below
         // is gated by `mackesd_core::worker_role::runs(name, role_rank)` so a
         // Lighthouse/Server starts only its tier's workers (plan §12). Unpinned
-        // (dev / pre-`mde setup`) → Workstation rank (full set; desktop workers
+        // (dev / pre-role-pin) → Workstation rank (full set; desktop workers
         // idle gracefully without a display); malformed role.toml → Lighthouse
         // (fail closed). The resulting set is observable via `mackesd
         // role-workers` and the live worker-status listing.

@@ -42,7 +42,7 @@ fn main() -> ExitCode {
     }
     if args.iter().any(|a| a == "--pick") {
         // The chooser prints the chosen path to stdout + exits 0 (non-zero on
-        // Cancel) — the contract `mde filedialog` execs against.
+        // Cancel) — the contract a portal/file-dialog caller execs against.
         return match mde_files::picker::run(&args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(_) => ExitCode::FAILURE,

@@ -9,8 +9,9 @@
 //! Iced port ships a reframed action set against the
 //! v2.0.0 MDE stack:
 //!
-//!   * Reload compositor (ask labwc to re-read its config without
-//!     a full session restart)
+//!   * Reload compositor (Cosmic now owns the desktop; this action
+//!     targets the legacy labwc reload — ask labwc to re-read its
+//!     config without a full session restart)
 //!   * Restart mackesd (kicks the user systemd unit if a worker
 //!     wedged)
 //!   * Re-install the MDE .desktop launcher (copies the

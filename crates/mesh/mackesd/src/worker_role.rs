@@ -70,7 +70,7 @@ pub fn min_rank(worker: &str) -> u8 {
 }
 
 /// Resolve the deployment rank that gates worker spawns: the pinned role's
-/// rank, or **Workstation (2) when unpinned** (a dev tree / pre-`mde setup` box
+/// rank, or **Workstation (2) when unpinned** (a dev tree / pre-role-pin box
 /// runs the full set — the desktop workers idle gracefully without a Wayland
 /// session), or **Lighthouse (0) when `role.toml` is malformed** (fail closed —
 /// run only the relay control plane, never assume a Workstation default).

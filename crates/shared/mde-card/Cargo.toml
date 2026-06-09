@@ -10,7 +10,7 @@ repository.workspace   = true
 
 [dependencies]
 # JSON-first persistence: every card lives on disk as JSON so the
-# mesh GlusterFS layer can replicate it without a binary protocol.
+# mesh LizardFS layer can replicate it without a binary protocol.
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 

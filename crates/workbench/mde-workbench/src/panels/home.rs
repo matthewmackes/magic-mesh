@@ -534,8 +534,8 @@ fn role_link<'a>(
     nav_chip(label, palette, crate::Message::SelectGroup(group))
 }
 
-/// A Dashboard "See also" link that opens a Win10 Settings page (the
-/// shell's `mde settings` app) at `slug` (`""` = the Settings home).
+/// A Dashboard "See also" link that opens a Settings page at `slug`
+/// (`""` = the Settings home).
 fn settings_link<'a>(
     label: &'static str,
     slug: &'static str,
