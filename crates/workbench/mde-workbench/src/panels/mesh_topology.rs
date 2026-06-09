@@ -66,11 +66,15 @@ impl PeerStatus {
     // CR-6.b — re-introduced (dropped by CR-6 Table-only refactor).
     // Graph canvas uses this directly; Table uses icon() instead.
     pub fn color(self) -> Color {
+        let palette = Palette::dark();
         match self {
-            Self::Online => Color::from_rgb(0.20, 0.80, 0.40),
-            Self::Idle => Color::from_rgb(0.95, 0.70, 0.20),
-            Self::Offline => Color::from_rgb(0.92, 0.32, 0.30),
-            Self::Unknown => Color::from_rgba(0.60, 0.60, 0.60, 0.80),
+            Self::Online => palette.success.into_iced_color(),
+            Self::Idle => palette.warning.into_iced_color(),
+            Self::Offline => palette.danger.into_iced_color(),
+            Self::Unknown => iced::Color {
+                a: 0.80,
+                ..palette.text_muted.into_iced_color()
+            },
         }
     }
 }
@@ -662,7 +666,7 @@ fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a,
     {
         (
             Icon::StatusError,
-            Color::from_rgb(0.92, 0.32, 0.30),
+            palette.danger.into_iced_color(),
             "Couldn't load peers".to_string(),
             err.to_string(),
         )

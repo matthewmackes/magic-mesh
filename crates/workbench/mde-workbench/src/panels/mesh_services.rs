@@ -280,15 +280,15 @@ impl MeshServicesPanel {
 
 fn unit_row<'a>(u: &'a UnitStatus, palette: Palette) -> Element<'a, crate::Message> {
     let (status_icon, status_color, status_label) = match u.active_state.as_str() {
-        "active" => (Icon::StatusOk, Color::from_rgb(0.20, 0.80, 0.40), "ACTIVE"),
+        "active" => (Icon::StatusOk, palette.success.into_iced_color(), "ACTIVE"),
         "activating" | "reloading" => (
             Icon::StatusWarning,
-            Color::from_rgb(0.95, 0.70, 0.20),
+            palette.warning.into_iced_color(),
             "ACTIVATING",
         ),
         "failed" => (
             Icon::StatusError,
-            Color::from_rgb(0.92, 0.32, 0.30),
+            palette.danger.into_iced_color(),
             "FAILED",
         ),
         "not-found" => (

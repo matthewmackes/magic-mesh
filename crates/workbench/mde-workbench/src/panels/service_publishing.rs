@@ -217,7 +217,7 @@ fn service_row_view<'a>(r: &ServiceRow, palette: Palette) -> Element<'a, crate::
     let (pill_label, pill_color) = if r.is_publishable {
         ("Published", palette.accent.into_iced_color())
     } else {
-        ("Not enrolled", Color::from_rgb(0.95, 0.70, 0.20))
+        ("Not enrolled", palette.warning.into_iced_color())
     };
     let pill = container(text(pill_label).size(10).color(Color::WHITE))
         .padding(Padding::from([2u16, 8u16]))

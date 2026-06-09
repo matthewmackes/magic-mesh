@@ -202,9 +202,9 @@ impl HealthCheckPanel {
 fn probe_row<'a>(p: &'a ProbeResult, palette: Palette) -> Element<'a, crate::Message> {
     let resolved = mde_icon(p.status.icon(), IconSize::Inline);
     let icon_color = match p.status {
-        ProbeStatus::Ok => Color::from_rgb(0.20, 0.80, 0.40),
-        ProbeStatus::Warn => Color::from_rgb(0.95, 0.70, 0.20),
-        ProbeStatus::Fail => Color::from_rgb(0.92, 0.32, 0.30),
+        ProbeStatus::Ok => palette.success.into_iced_color(),
+        ProbeStatus::Warn => palette.warning.into_iced_color(),
+        ProbeStatus::Fail => palette.danger.into_iced_color(),
         ProbeStatus::Unknown => palette.text_muted.into_iced_color(),
     };
     let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {

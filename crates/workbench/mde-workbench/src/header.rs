@@ -215,7 +215,10 @@ fn control_button<'a, Message: Clone + 'a>(
 
     let style = move |_theme: &iced::Theme, status: ButtonStatus| {
         let bg: Color = match status {
-            ButtonStatus::Hovered if accent_close => Color::from_rgba(0.90, 0.32, 0.30, 0.85),
+            ButtonStatus::Hovered if accent_close => Color {
+                a: 0.85,
+                ..palette.danger.into_iced_color()
+            },
             ButtonStatus::Hovered => palette.hover_tint().into_iced_color(),
             ButtonStatus::Pressed => palette.active_tint().into_iced_color(),
             _ => Color::TRANSPARENT,

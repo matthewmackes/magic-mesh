@@ -181,6 +181,7 @@ fn applet_row<'a>(
 
     let toggle_label = if on { "ON" } else { "OFF" };
     let accent = palette.accent.into_iced_color();
+    let muted = palette.text_muted.into_iced_color();
     let id_owned = id.to_string();
     let toggle_btn = button(text(toggle_label).size(11).color(if on {
         Color::WHITE
@@ -213,11 +214,7 @@ fn applet_row<'a>(
         iced::widget::button::Style {
             snap: false,
             background: Some(Background::Color(bg)),
-            text_color: if on {
-                Color::WHITE
-            } else {
-                Color::from_rgb(0.6, 0.6, 0.6)
-            },
+            text_color: if on { Color::WHITE } else { muted },
             border: Border {
                 color: if on {
                     Color::TRANSPARENT

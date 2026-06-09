@@ -160,11 +160,11 @@ impl SyncStatusPanel {
 
 fn file_status_card<'a>(snap: &'a SyncSnapshot, palette: Palette) -> Element<'a, crate::Message> {
     let (status_icon, status_color, status_label) = if snap.file_exists {
-        (Icon::StatusOk, Color::from_rgb(0.20, 0.80, 0.40), "PRESENT")
+        (Icon::StatusOk, palette.success.into_iced_color(), "PRESENT")
     } else {
         (
             Icon::StatusWarning,
-            Color::from_rgb(0.95, 0.70, 0.20),
+            palette.warning.into_iced_color(),
             "ABSENT",
         )
     };
@@ -262,13 +262,13 @@ fn healthz_status_card<'a>(
                 .unwrap_or_default();
             (
                 Icon::StatusOk,
-                Color::from_rgb(0.20, 0.80, 0.40),
+                palette.success.into_iced_color(),
                 format!("synced to revision {rev} on {}{drift}", snap.healthz_node),
             )
         } else if !snap.healthz_raw.is_empty() {
             (
                 Icon::StatusWarning,
-                Color::from_rgb(0.95, 0.70, 0.20),
+                palette.warning.into_iced_color(),
                 "mackesd healthz returned data but no revision/drift fields populated yet".into(),
             )
         } else {

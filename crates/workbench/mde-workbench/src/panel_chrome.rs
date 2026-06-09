@@ -155,16 +155,25 @@ pub fn status_badge<'a, Message: 'a>(
             palette.text.into_iced_color(),
         ),
         BadgeSeverity::Success => (
-            Color::from_rgba(0.247, 0.725, 0.314, 0.20),
-            Color::from_rgb(0.247, 0.725, 0.314),
+            Color {
+                a: 0.20,
+                ..palette.success.into_iced_color()
+            },
+            palette.success.into_iced_color(),
         ),
         BadgeSeverity::Warning => (
-            Color::from_rgba(0.961, 0.620, 0.043, 0.20),
-            Color::from_rgb(0.961, 0.620, 0.043),
+            Color {
+                a: 0.20,
+                ..palette.warning.into_iced_color()
+            },
+            palette.warning.into_iced_color(),
         ),
         BadgeSeverity::Danger => (
-            Color::from_rgba(0.898, 0.325, 0.294, 0.20),
-            Color::from_rgb(0.898, 0.325, 0.294),
+            Color {
+                a: 0.20,
+                ..palette.danger.into_iced_color()
+            },
+            palette.danger.into_iced_color(),
         ),
         BadgeSeverity::Info => (
             palette.hover_tint().into_iced_color(),

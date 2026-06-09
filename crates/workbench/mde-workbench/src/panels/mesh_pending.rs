@@ -294,7 +294,7 @@ fn peer_row<'a>(p: &'a PendingPeer, palette: Palette) -> Element<'a, crate::Mess
 
 fn empty_state_card<'a>(palette: Palette) -> Element<'a, crate::Message> {
     let resolved = mde_icon(Icon::StatusOk, IconSize::PanelHeader);
-    let icon_color = Color::from_rgb(0.20, 0.80, 0.40);
+    let icon_color = palette.success.into_iced_color();
     let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
         use iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(svg_bytes))
@@ -340,7 +340,7 @@ fn action_btn<'a>(
     ghost: bool,
 ) -> iced::widget::Button<'a, crate::Message> {
     let accent = palette.accent.into_iced_color();
-    let danger = Color::from_rgb(0.92, 0.32, 0.30);
+    let danger = palette.danger.into_iced_color();
     button(
         text(label)
             .size(11)

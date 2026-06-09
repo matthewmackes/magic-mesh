@@ -40,10 +40,11 @@ impl DriftSeverity {
         }
     }
     fn color(self) -> Color {
+        let palette = Palette::dark();
         match self {
-            Self::Info => Color::from_rgb(0.45, 0.62, 0.78),
-            Self::Warn => Color::from_rgb(0.95, 0.70, 0.20),
-            Self::Error => Color::from_rgb(0.92, 0.32, 0.30),
+            Self::Info => palette.accent.into_iced_color(),
+            Self::Warn => palette.warning.into_iced_color(),
+            Self::Error => palette.danger.into_iced_color(),
         }
     }
     fn label(self) -> &'static str {
@@ -263,14 +264,14 @@ fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a,
         if let Some(err) = error {
             (
                 Icon::StatusError,
-                Color::from_rgb(0.92, 0.32, 0.30),
+                palette.danger.into_iced_color(),
                 "Couldn't load drift events".to_string(),
                 err.to_string(),
             )
         } else {
             (
                 Icon::StatusOk,
-                Color::from_rgb(0.20, 0.80, 0.40),
+                palette.success.into_iced_color(),
                 "No drift detected".to_string(),
                 "mackesd's reconciler has not surfaced any divergence between the locked TOML \
                  config and the live state. When mackesd is running, new events will appear here."

@@ -100,11 +100,12 @@ impl CapabilityStatus {
     }
     #[must_use]
     pub fn color(&self) -> Color {
+        let palette = Palette::dark();
         match self {
-            Self::Active => Color::from_rgb(0.20, 0.80, 0.40),
-            Self::SetupNeeded => Color::from_rgb(0.95, 0.70, 0.20),
-            Self::Unknown => Color::from_rgb(0.55, 0.55, 0.55),
-            Self::Failed { .. } => Color::from_rgb(0.92, 0.32, 0.30),
+            Self::Active => palette.success.into_iced_color(),
+            Self::SetupNeeded => palette.warning.into_iced_color(),
+            Self::Unknown => palette.text_muted.into_iced_color(),
+            Self::Failed { .. } => palette.danger.into_iced_color(),
         }
     }
     #[must_use]
@@ -1484,7 +1485,7 @@ fn refresh_button<'a>(palette: Palette) -> Element<'a, crate::Message> {
 }
 
 fn mackesd_banner<'a>(palette: Palette) -> Element<'a, crate::Message> {
-    let yellow = Color::from_rgb(0.95, 0.70, 0.20);
+    let yellow = palette.warning.into_iced_color();
     let bg = palette.raised.into_iced_color();
     container(
         row![

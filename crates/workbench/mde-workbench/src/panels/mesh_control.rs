@@ -325,7 +325,7 @@ fn leader_card_view<'a>(
     let (status_icon, status_color, status_label, summary) = match &snap.lease {
         Some(lease) if snap.self_is_leader => (
             Icon::StatusOk,
-            Color::from_rgb(0.20, 0.80, 0.40),
+            palette.success.into_iced_color(),
             "LEADER",
             format!("you ({}) own the cluster lease", lease.node_id),
         ),
@@ -337,7 +337,7 @@ fn leader_card_view<'a>(
         ),
         None => (
             Icon::StatusWarning,
-            Color::from_rgb(0.95, 0.70, 0.20),
+            palette.warning.into_iced_color(),
             "NO LEADER",
             "no .mackesd-leader.lock found — QNM-Shared not mounted, or no node has taken leadership".into(),
         ),
