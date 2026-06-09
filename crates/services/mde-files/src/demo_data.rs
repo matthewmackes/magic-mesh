@@ -48,7 +48,6 @@ pub fn peers() -> Vec<Peer> {
             files: 4912,
             shared: 211,
             last: "now".into(),
-            derp: "fra".into(),
         },
         Peer {
             id: "birch".into(),
@@ -61,7 +60,6 @@ pub fn peers() -> Vec<Peer> {
             files: 18_403,
             shared: 1842,
             last: "12 s".into(),
-            derp: "ord".into(),
         },
         Peer {
             id: "oak".into(),
@@ -74,7 +72,6 @@ pub fn peers() -> Vec<Peer> {
             files: 612,
             shared: 4,
             last: "3 min".into(),
-            derp: "fra".into(),
         },
         Peer {
             id: "cedar".into(),
@@ -87,7 +84,6 @@ pub fn peers() -> Vec<Peer> {
             files: 0,
             shared: 0,
             last: "2 h ago".into(),
-            derp: "—".into(),
         },
     ]
 }

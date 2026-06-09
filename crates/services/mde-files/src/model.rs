@@ -34,7 +34,6 @@ pub struct Peer {
     /// Human-readable "last seen" stamp (e.g. `"now"`, `"3 min"`,
     /// `"2 h ago"`).
     pub last: String,
-    pub derp: String,
 }
 
 /// The local node ("this node"). Distinguished from peers because

@@ -311,7 +311,7 @@ pub fn peer_card(peer: Peer) -> Element<'static, Message> {
                     LatencyBucket::Ok => t::ACCENT,
                     LatencyBucket::Slow => t::FG_FAINT,
                 };
-                Element::from(text(format!("{ms} ms · {}", peer.derp)).size(10).color(c))
+                Element::from(text(format!("{ms} ms")).size(10).color(c))
             }
             None => Element::from(
                 text(format!("last seen {}", peer.last))

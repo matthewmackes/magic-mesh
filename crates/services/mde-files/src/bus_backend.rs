@@ -313,7 +313,6 @@ impl WirePeer {
             files: 0,
             shared: 0,
             last: String::new(),
-            derp: String::new(),
         }
     }
 }

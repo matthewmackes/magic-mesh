@@ -775,7 +775,6 @@ pub fn mesh_peer_to_peer(mp: MeshPeer) -> Peer {
         files: 0,
         shared: 0,
         last: String::new(),
-        derp: String::new(),
     }
 }
 

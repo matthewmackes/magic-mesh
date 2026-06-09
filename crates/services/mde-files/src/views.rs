@@ -847,7 +847,7 @@ pub fn peer_folder<'a>(
 ) -> Element<'a, Message> {
     let kind_icon = icons::svg_for_peer_kind(peer.kind);
     let lat_or_last = match peer.latency {
-        Some(ms) => format!("{ms} ms via {}", peer.derp),
+        Some(ms) => format!("{ms} ms"),
         None => format!("last seen {}", peer.last),
     };
 
