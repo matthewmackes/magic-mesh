@@ -385,7 +385,30 @@ sound — it's a **prototype with a credible, well-scoped route to enterprise-gr
 
 ---
 
+## 10. Corrective decisions (locked 2026-06-09)
+
+Ten decision-forks locking *how* the gaps get fixed (→ the ENT tasks + governance §8):
+
+| # | Issue | Decision |
+|---|-------|----------|
+| C1 | enrollment bearer unenforced (ENT-1) | **single-use issued-bearer allow-list** at signing |
+| C2 | revocation doesn't evict (ENT-3) | **nebula `pki.blocklist` + reload** on revoke |
+| C3 | unpinned → Workstation (ENT-2) | **refuse to start** until a role is pinned (fail closed) |
+| C4 | no lifecycle commands (ENT-7/8/9/10) | a **`meshctl` operator facade** (ENT-15) |
+| C5 | no crash-restart + supervisor stub (ENT-6) | **systemd unit + hardened in-process supervisor** |
+| C6 | decommission ≠ revoke (ENT-5) | **both** self-service `leave` + operator decommission |
+| C7 | flat trust | **keep open-mesh, document the blast radius** (governance §8) |
+| C8 | backup passphrase in env (ENT-11) | **systemd-creds** passphrase (keep single QNM copy) |
+| C9 | "not for production" | **production workgroup-grade (≤8 peers)** (governance §8) |
+| C10 | security events untracked (ENT-14) | **hash-chained `events`** + wire KDC `.also_log` |
+
+The minimum path to honestly claim the standard: **PKG** (deployable) + **ENT-1/2/3** (secure
+enroll/role/revoke) + **ENT-5/6/7/8/9** (leave + resilience + operator UX) + **OBS CI** + **ENT-12**
+(docs + positioning). The trust model and ≤8-peer envelope are now fixed in `AI_GOVERNANCE.md §8`.
+
+---
+
 *Verification complete: installation, provisioning, all three node roles, configuration, testing,
 observability, security, reliability, UX, and documentation reviewed; scorecard, gaps, acceptance
-criteria, worklist, verification commands, and verdict produced. No step was skipped; nothing was
-marked Pass without evidence.*
+criteria, worklist, verification commands, verdict, and corrective decisions produced. No step was
+skipped; nothing was marked Pass without evidence.*

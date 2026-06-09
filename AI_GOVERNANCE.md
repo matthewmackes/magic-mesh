@@ -83,6 +83,24 @@ A change is done only when it is **runtime-reachable and observably works** — 
 refs, no mockups/`demo_data` passing as features. Builds clean, tests green, clippy
 + fmt clean; visual changes confirmed against the Carbon reference, not eyeballed.
 
+## §8 — Positioning & trust envelope (2026-06-09, enterprise-readiness verification)
+
+- **Production workgroup-grade, not hyperscale.** The supported envelope is a **single workgroup of
+  ≤ 8 peers** (the `ca/sign.rs` cap). Within that envelope the bar is **reliable + operable +
+  documented** — once the ENTERPRISE + PKG epics land, the platform is held to production-grade for
+  that scale, and `DISCLAIMER.md` is repositioned accordingly (no longer "not for production"). Going
+  beyond ≤ 8 peers / HA-multi-lighthouse / multi-tenant is **out of scope** for this identity.
+- **Open-mesh is a deliberate trade-off, honestly documented.** Trust stays **flat** (any enrolled
+  cert reaches every peer + every service; no per-service ACL) — the §0 "Simple" lever. This is
+  accepted *only* because the envelope is a small trusted workgroup; the blast radius MUST be
+  documented for operators (ENT-12). Least-privilege/per-service ACLs are explicitly deferred.
+- **Security controls must be enforced, not just documented.** The §3 crypto locks are necessary but
+  not sufficient: a control that prose claims (e.g. the enrollment bearer) MUST be enforced in code
+  and covered by a test. Specifically: enrollment validates a **single-use issued bearer**;
+  revocation **evicts the data plane** (nebula `pki.blocklist` + reload), not just the DB; an
+  **unpinned node fails closed** (refuses to start) rather than defaulting to Workstation; security
+  events are **hash-chain audited**. (Corrective decisions C1–C3, C10.)
+
 ---
 
 *Heritage: the pre-pivot identity lives in the archived
