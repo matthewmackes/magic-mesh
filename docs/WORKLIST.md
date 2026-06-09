@@ -27,18 +27,18 @@ Ordered by priority — security lock first, then largest structural debt, then 
 
 ## P3 — Substrate lock §1 (tests)
 
-- [ ] **E1 · retarget `mackesd/tests/integration_testcontainers.rs` to Nebula** (or REMOVE) — 6 non-`#[ignore]`d tests spin up real `headscale/headscale` + `tailscale/tailscale` containers. §1 pins the fabric to Nebula; the system-under-test is the retired substrate.
+- [→] **E1 · retarget integration tests to Nebula** — **SPECCED** by the survey (Q87–90) → see **OBS-1**: retarget `integration_testcontainers.rs` to real `nebula-lighthouse` + peer containers (testcontainers), daemon-absent skip = hard fail.
 
 ## P4 — Unreachable pub surface (§7)
 
-- [ ] **H3 · `mde-card` dead pub surface** — REMOVE or wire: `migration` mod (`migrate`/`MigrationError`/`SCHEMA_VERSION`), `render_mode::RenderMode`, `schema::TemplateSpec` — zero workspace refs.
-- [ ] **H4 · `mde-iced-components` dead pub surface** (~half the lib) — REMOVE or wire into the GUIs: `skeleton_shimmer`, `elevation_container`, `toast_chip`, `icon_fill_morph`, and the entire `motion` module (`SelectionSlider`, `fade_in_alpha`, `fade_out_alpha`, `slide_in_offset`, `theme_crossfade`, `stagger_delay_ms`, `shimmer_alpha`). All test-only callers.
+- [→] **H3 · `mde-card` dead pub surface** — **SPECCED** (Q38–40) → **GUI-4**: REMOVE all three (migration, RenderMode, TemplateSpec).
+- [→] **H4 · `mde-iced-components` dead pub surface** — **SPECCED** (Q41–45) → **GUI-5**: REMOVE all five (motion, skeleton_shimmer, toast_chip, elevation_container, icon_fill_morph).
 
 ## P5 — Mockup / dead nav / stub surfaces (§7)
 
-- [ ] **B1 · `mesh_ssh` ("Mesh SSH")** — build the panel **or** drop it from `nav_model()` (`model.rs:290`). No panel module / no `panel_body` arm → always lands on `panel_under_construction()`.
-- [ ] **H6 · `mde-music` Radio card** — back it with a `list-radio` daemon verb **or** REMOVE `HubCard::Radio` (`hub.rs`). Today it renders a card that can never populate.
-- [ ] **C1 · Fleet Phase-G control plane** — `mackesd/src/ipc/fleet.rs:54–67` replies "not implemented until v2.0.0 Phase G" for `push/list/diff/rollback-revision`. Implement the no-fixed-center revision logic (§1). Honest stub today; §7-incomplete.
+- [→] **B1 · `mesh_ssh` ("Mesh SSH")** — **SPECCED** (Q53–62) → **SVC-1**: fold a per-peer SSH status+launcher INTO the Remote Desktop panel ("Remote Access" = SSH+RDP+VNC); drop the standalone `mesh_ssh` nav entry.
+- [→] **H6 · `mde-music` Radio card** — **SPECCED** (Q63–64) → **SVC-3**: BUILD `list-radio` (Airsonic `getInternetRadioStations` + verb + enqueue stream URL).
+- [→] **C1 · Fleet Phase-G control plane** — **SPECCED** (Q1–18) → the **FLEET-PHASE-G** epic (FPG-1..8): the no-fixed-center revision plane.
 
 ## P6 — Doc drift (FINISH — fix docs)
 
@@ -50,9 +50,90 @@ Ordered by priority — security lock first, then largest structural debt, then 
 ## P7 — Vestigial model / soft seams
 
 - [✓] **G1 · vestigial `derp` field** — done (`d8d79f7`); dropped the field + render fragment. mde-files 271/0.
-- [ ] **H8 · `mde-kdc-proto/src/discovery.rs` `SyntheticAnnounce`/`inject_synthetic`** (soft) — land the KDC2-4 mesh-shunt worker that consumes it, or drop the pub seam if KDC2-4 isn't imminent.
+- [→] **H8 · `SyntheticAnnounce`/`inject_synthetic` seam** — **SPECCED** (Q26–27) → **SEC-5**: BUILD the KDC2-4 mesh-shunt worker that consumes it (accept-any relayer; pinning is the gate).
 
 ---
 
-*Packaging (RPM / COPR / ISO) is unbuilt — tracked separately, not a defect (sweep §5 note).*
-*Sweep-1 found A1–G1 (mackesd + workbench); sweep-2 added H1–H8 (music/voice/bus/fleet/kdc/transport/shared). 18 findings total.*
+# Platform epics (from the 100-question survey, 2026-06-09)
+
+> Full rationale + the per-question locks live in `docs/design/platform-survey-answers.md`.
+> 51 tasks across 6 epics. Each is `[ ]` Open; acceptance is runtime-observable per §7.
+> The RPM is held until every feature is §7-complete; releasing is operator-gated (`/release`).
+
+## FLEET-PHASE-G — the no-fixed-center fleet control plane (resolves C1)
+
+Architecture: one unified `BaselineSpec` (YAML, monotonic `u64` version) written to LizardFS, which
+is both transport (replication) and the authoritative log; leaderless authoring, last-writer-wins,
+host-local Ansible apply.
+
+- [ ] **FPG-1: unify the revision model** — one `BaselineSpec` (OS state + folded-in settings, Q9), YAML wire format (Q2), `u64` version id (Q1); retire the rowid + date-string schemes to display fields.
+- [ ] **FPG-2: LizardFS revision log + store** — revisions written to LizardFS as the authoritative append-only log (Q3/Q8); replication is the transport; `mackesd` watches the path.
+- [ ] **FPG-3: leaderless election** — any node mints+gossips; highest `version` wins (Q4/Q5); the leader lock only guards the local SQLite mirror write.
+- [ ] **FPG-4: the Bus verbs** — implement `push`/`list`/`diff`/`rollback` (replace the `ipc/fleet.rs` stubs): rollback = mint a higher-version copy (Q6), flat top-level diff (Q7), `list` returns the full held set tagged with the winner (Q16).
+- [ ] **FPG-5: apply-ack + signals** — nodes gossip an apply-ack advancing the author's FSM to Verified (Q14); emit `event/fleet/signals` {revision_id, peer, status} + a Workbench subscription (Q15).
+- [ ] **FPG-6: cold-node convergence** — a joining/partitioned node applies the newest revision immediately, back-fills history lazily (Q18).
+- [ ] **FPG-7: LizardFS mount ownership** — bind-mount the five XDG dirs (never `~/Local/`, Q13), default goal 2 (Q12), master pinned to Lighthouse nodes (Q11).
+- [ ] **FPG-8: host-local Ansible apply** — `magic-fleet` reconciles the unified baseline host-local (Q10); revision auth rests on the Nebula transport, `author` advisory (Q17).
+
+## SECURITY — CA lifecycle, enrollment, KDC (resolves H8)
+
+- [ ] **SEC-1: non-expiring peer certs** — drop mid-epoch expiry; turnover via rotation/revocation (Q19).
+- [ ] **SEC-2: passphrase-gated CA rotation** — `mackesd ca rotate` requires an operator passphrase, never auto-on-promotion (Q20).
+- [ ] **SEC-3: QR/file 256-bit enrollment token** — replace the typed 16-char passcode with a delivered 256-bit token; keep auto-sign/TOFU (Q21/22).
+- [ ] **SEC-4: outbound first-pair flow** — an operator-initiated KDC pairing flow that completes the handshake and writes the fingerprint pin (Q24/25); keep RSA-4096 (Q23).
+- [ ] **SEC-5: KDC2-4 mesh-shunt worker** — consume `SyntheticAnnounce`/`inject_synthetic`, relay neighbors' `phones.json` mesh-wide; accept any relayer (Q26/27). *(resolves H8; SVC-6.)*
+- [ ] **SEC-6: gossiped signed revocations** — a signed retract record gossips peer-to-peer (like fleet revisions) alongside the per-node ban files (Q28/29).
+- [ ] **SEC-7: mandatory CA backup on lighthouse** — refuse-start / loud-warn without `MDE_BACKUP_PASSPHRASE`; one combined CA+topology bundle (Q31/32).
+- [ ] **SEC-8: encrypt KDC session keys at rest** — persist session keys encrypted so links survive a daemon restart (Q34); keep AES-256-GCM (Q33).
+
+## GUI — Carbon look + component cleanup (resolves H3, H4, H2-followup)
+
+- [ ] **GUI-1: add Gray 90 theme** — `Theme::Gray90` + `Palette::gray_90()`, the full 3-theme set §4 names (Q35).
+- [ ] **GUI-2: live theme switching** — thread the resolved `Palette` through `App` state so a theme change repaints live (Q36).
+- [ ] **GUI-3: Carbon Themes-panel rewrite** — offer exactly Gray 10/90/100 via the mde-theme pref store; drop the retired presets + gsettings shell-out (Q37).
+- [ ] **GUI-4: remove dead `mde-card` surfaces** — delete `migration`, `RenderMode`, `TemplateSpec`+`CardKind::Template` (Q38–40). *(resolves H3.)*
+- [ ] **GUI-5: remove dead `mde-iced-components` widgets** — delete `motion`, `skeleton_shimmer`, `toast_chip`, `elevation_container`, `icon_fill_morph` (Q41–45). *(resolves H4.)*
+- [ ] **GUI-6: build `mde-cosmic-applet`** — a libcosmic applet subscribing to `mde-bus`: health pip + quick actions (join/leave, DnD, transfers) + deep links into Workbench (Q46/47).
+- [ ] **GUI-7: maximize-Cosmic-native cutover** — notifications via Cosmic's daemon, mde-files chrome reskinned to libcosmic, panel hosted by Cosmic (Q43/51).
+- [ ] **GUI-8: density boot-apply** — read `theme.density` at boot and apply app-wide (Q50).
+- [ ] **GUI-9: reduced-motion from Cosmic** — source the reduce-motion flag from Cosmic's a11y setting (Q49).
+- [ ] **GUI-10: refactor `palette.rs` onto the carbon ramp** — `dark()/light()` reference `carbon::*` so the ramp is the sole hex source (Q52). *(closes the H2 follow-up.)*
+
+## SERVICES — Remote Access, music, voice, files, KDC (resolves B1, H6)
+
+- [ ] **SVC-1: Remote Access panel** — fold a per-peer SSH status+launcher into `remote_desktop` (SSH+RDP+VNC); drop the `mesh_ssh` nav entry; launch via `.remmina`, reuse remmina probes, hostname targets, show local+remote sshd state, no ACL (Q53–62). *(resolves B1.)*
+- [ ] **SVC-2: SSH pubkey-gossip worker** — a `mackesd` worker gossips each peer's mesh ed25519 pubkey into every peer's `authorized_keys` (Q60).
+- [ ] **SVC-3: build `list-radio`** — Airsonic `getInternetRadioStations` client + `list-radio` verb + `verb_for(Radio)`; play = enqueue the stream URL as a pseudo-track (Q63/64). *(resolves H6.)*
+- [ ] **SVC-4: voice HUD promotion** — Cosmic autostart for `--agent` + Workbench presence; Bus-native presence (every peer publishes `state/voice/status`) (Q65/66).
+- [ ] **SVC-5: document the 3 file bridges** — keep mesh / SMB / KDC co-equal in mde-files (Q67); no code change, just the lock.
+- [ ] **SVC-6: KDC full phone hub** — land KDC2-4 (= SEC-5), keep all plugins, phone actions on the device card only (Q68/69).
+- [ ] **SVC-7: Workstation-only service gating** — gate music/voice/files/KDC to Workstation rank; Servers/Lighthouses run plumbing only (Q70).
+
+## PKG — one RPM, role chooser, COPR, ISO (the unbuilt §5)
+
+- [ ] **PKG-1: monolithic RPM** — cargo-generate-rpm metadata → one `magic-mesh` RPM carrying all 8 bins (Q71/72/76).
+- [ ] **PKG-2: `packaging/` dir** — a top-level non-crate dir for the spec/metadata, units, `.ks`, `.repo` (Q85).
+- [ ] **PKG-3: self-gating `mackesd.service`** — one service that gates its in-process workers via `resolve_rank()`; the RPM enables nothing role-specific (Q75/86) + app surface units.
+- [ ] **PKG-4: `mackesd role pin` subcommand** — the CLI front-end for `mde_role::pin` (Q74).
+- [ ] **PKG-5: install-time role chooser** — a Cosmic first-run GUI chooser (Q73) + a kickstart `%post` inline path (Q81) + an "init-new-mesh vs join-existing" prompt (Q84).
+- [ ] **PKG-6: DISCLAIMER gate** — build refuses to package without it (build.rs/release) AND a mandatory install-time accept screen (Q82).
+- [ ] **PKG-7: upgrade-only enforcement** — refuse downgrade at both the RPM scriptlet and `mde_role::pin`; upgrade is unit-only re-pin + reload (Q77/78).
+- [ ] **PKG-8: signed COPR** — COPR built-in per-project GPG; ship the pubkey + a `magic-mesh-release.rpm` (Q79).
+- [ ] **PKG-9: Magic-on-Cosmic ISO** — a Fedora-Cosmic kickstart built with livemedia-creator (Q80).
+- [ ] **PKG-10: post-install enrollment** — `mackesd enroll --token` documented as the post-install step (Q83).
+
+## TEST-OBS — testing/CI + observability (resolves E1)
+
+- [ ] **OBS-1: retarget integration tests to Nebula** — real `nebula-lighthouse` + 2 peer containers via testcontainers; assert overlay reachability + handshake; daemon-absent skip = hard fail (Q87–89). *(resolves E1.)*
+- [ ] **OBS-2: multi-process convergence harness** — N real `mackesd` binaries over one QNM root assert newest-wins + single leader (Q91).
+- [ ] **OBS-3: GitHub Actions CI** — hosted runners; the §7 gates (build/test/clippy/fmt + boundary/Carbon/Nebula lints) + a hard 80% line-coverage floor (Q90/93).
+- [ ] **OBS-4: screenshot-artifact visual regression** — a scripted `/preview` capture posting screenshots as CI artifacts for human review (Q92).
+- [ ] **OBS-5: mesh-replicated structured logging** — each peer writes a structured log into QNM-Shared; any peer can read any peer's recent trace (Q94).
+- [ ] **OBS-6: Mesh Health Workbench panel** — union the per-peer reachability + alert signals (no central metrics aggregation; Netdata stays local, Q95/96).
+- [ ] **OBS-7: upgrade-transition alerts** — `alert_relay` emits each upgrade-state transition as a desktop alert (Q97).
+- [ ] **OBS-8: alerts via the cosmic-applet** — deliver through the mde-bus → cosmic-applet FDO Notifications path instead of `notify-send` (Q100).
+
+---
+
+*Audit (sweeps 1–2): 18 findings, A1–H8. **8 shipped** (H1 §3, D1/H5/H2 §4, F1–F3/H7 §5-doc, G1 §1, A1/A2 deletion). The 7 open findings are now **specified** by the survey and resolve into the epics above.*
+*Survey (2026-06-09): 100/100 answered → 6 epics, 51 tasks. Packaging (PKG-*) is held until every feature is §7-complete; releasing is operator-gated.*
