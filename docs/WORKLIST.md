@@ -133,7 +133,31 @@ host-local Ansible apply.
 - [ ] **OBS-7: upgrade-transition alerts** — `alert_relay` emits each upgrade-state transition as a desktop alert (Q97).
 - [ ] **OBS-8: alerts via the cosmic-applet** — deliver through the mde-bus → cosmic-applet FDO Notifications path instead of `notify-send` (Q100).
 
+## ENTERPRISE — operability + security-enforcement gaps (from the enterprise-readiness verification)
+
+> Source: `docs/design/enterprise-readiness.md` (verdict: **prototype with enterprise direction**).
+> These are the enterprise-specific gaps the survey epics did NOT capture. **ENT-1/2/3 are CRITICAL.**
+> Overlaps: installation/packaging/role-chooser = the **PKG** epic; CI/observability = **OBS**;
+> control plane = **FLEET-PHASE-G**. The minimum bar for honestly claiming "enterprise-grade" is
+> PKG + ENT-1, 2, 3, 5, 6, 7, 8, 9, 12 + OBS CI.
+
+- [ ] **ENT-1: enforce the enrollment bearer (CRITICAL — security)** — `sign_pending_csr` (`nebula_enroll.rs:571`) + `nebula_csr_watcher` sign any well-formed CSR and **never check the bearer/passcode** against an issued list, though the docs claim they do. Maintain an issued-but-unredeemed allow-list (single-use bearers); refuse a CSR whose bearer isn't pending-issued. **Acceptance:** an enroll with a wrong/replayed/absent bearer is refused (test); a valid single-use bearer signs once then can't be reused.
+- [ ] **ENT-2: pin `role.toml` at provision (CRITICAL)** — `mde_role::pin_at` is lib-only; nothing writes `/var/lib/mde/role.toml`, so every box runs unpinned→Workstation. Add `mackesd role pin <role>` (= PKG-4) and have the installer/chooser call it. **Acceptance:** a Server install gates to rank-1 workers (`mackesd role-workers` matches); downgrade refused.
+- [ ] **ENT-3: revocation evicts the data plane (CRITICAL — security)** — `ca revoke` only marks the DB + ban list + a bus event; the Nebula data plane keeps trusting the cert until expiry. Push a Nebula `pki.blocklist` (or equivalent) to running nebula + reload on revoke. **Acceptance:** a revoked node can no longer reach any peer within N seconds (integration test).
+- [ ] **ENT-4: `mackesd mesh init`** — one-command Lighthouse bootstrap: mint CA + self-sign the lighthouse peer cert + overlay IP + pin role Lighthouse + start nebula + print a join token. **Acceptance:** on a clean box, one command yields a working CA-signing lighthouse + a token a peer enrolls with.
+- [ ] **ENT-5: unify `mackesd leave` / decommission** — today `decommission` (DB soft-delete) and `ca revoke` (trust) are uncoordinated and neither tears down local state. One verb that revokes + bans + wipes local `/etc/nebula/`, keys, and role. **Acceptance:** after `leave`, the node holds no valid cert and is gone from the roster; re-enroll is a clean fresh join.
+- [ ] **ENT-6: `mackesd.service` + supervisor hardening** — no systemd unit means nothing restarts mackesd on crash; the worker supervisor is a 250 ms fixed-retry stub (`workers/mod.rs:430`, no max-restarts/circuit-breaker). Ship the unit (Restart=on-failure) (= PKG-3) + bounded exponential back-off + circuit-breaker + max-restarts. **Acceptance:** `kill -9 mackesd` → restarted ≤ N s; a hot-looping worker trips the breaker instead of spinning at 250 ms forever.
+- [ ] **ENT-7: `mackesd doctor`** — a unified self-test (identity present, role pinned, nebula up, peers reachable, storage mounted, services healthy) with clear pass/fail per check. **Acceptance:** `mackesd doctor` on a healthy node exits 0 with all-green; a broken node names the failed check.
+- [ ] **ENT-8: `mackesd fleet status`** — a whole-fleet view any node can produce (peers + versions + leader + health), not just per-peer. **Acceptance:** on any node, prints every peer Online/Offline with version + the elected leader.
+- [ ] **ENT-9: `mackesd logs` + fix the GUI Logs panel** — no `logs` verb; the workbench Logs panel reads dead desktop paths (`mackes-shell`/sway). Add `mackesd logs [--since]` over journald/tracing and point the panel at mackesd's output. **Acceptance:** `mackesd logs --since 1h` returns current structured logs; the GUI panel shows them.
+- [ ] **ENT-10: `mackesd test connectivity`** — a peer-to-peer connectivity self-test (overlay reachability per peer), distinct from the scattered LAN probes. **Acceptance:** prints reachable/unreachable per peer over the overlay.
+- [ ] **ENT-11: DR backup hardening** — move `MDE_BACKUP_PASSPHRASE` off the systemd env into systemd-creds; add a multi-copy / off-mesh backup option (the sealed CA bundle is currently single-copy on QNM-Shared, replicated to every node). **Acceptance:** passphrase not visible via `systemctl show`; a documented restore works from an off-mesh copy.
+- [ ] **ENT-12: operator + end-user documentation** — install guide, per-node-type setup guide, troubleshooting guide, and a DR runbook (the code points at a missing `docs/help/mesh-recovery.md`). Fix the stale `DISCLAIMER.md` ("Mackes Workstation" → Magic Mesh; revisit "not for production"). **Acceptance:** a new admin provisions all 3 node types + recovers a dead lighthouse using only the docs.
+- [ ] **ENT-13: replace the `mesh_latency` ping placeholder** — `mesh_latency.rs:10` shells `ping` as an admitted placeholder pending the transport handshake. Use the real transport RTT probe. **Acceptance:** latency reflects the overlay path, not ICMP.
+- [ ] **ENT-14: security-event audit** — enroll/sign/revoke/rotate go to `tracing` only; append them to the hash-chained `events` table and wire the KDC `.also_log` no-op (`dispatch.rs:116`). **Acceptance:** `mackesd events list` shows enroll/sign/revoke records; `audit-verify` covers them.
+
 ---
 
 *Audit (sweeps 1–2): 18 findings, A1–H8. **8 shipped** (H1 §3, D1/H5/H2 §4, F1–F3/H7 §5-doc, G1 §1, A1/A2 deletion). The 7 open findings are now **specified** by the survey and resolve into the epics above.*
 *Survey (2026-06-09): 100/100 answered → 6 epics, 51 tasks. Packaging (PKG-*) is held until every feature is §7-complete; releasing is operator-gated.*
+*Enterprise-readiness verification (2026-06-09): verdict **prototype with enterprise direction**; +14 ENTERPRISE tasks (ENT-1/2/3 CRITICAL). Full report: `docs/design/enterprise-readiness.md`.*
