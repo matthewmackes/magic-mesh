@@ -7,92 +7,112 @@
 
 use std::fmt;
 
-/// One of the top-level sidebar groups per `.claude/CLAUDE.md`
-/// §4 Index ("Sidebar shell" row) and the CB-1.2 lock ("9 groups
-/// (Dashboard / Apps / Devices / Fleet / Look & Feel / Maintain /
-/// Network / System / Help)"), extended by **Compute** (E6.10 —
-/// local + fleet VMs / pods, placed next to Fleet as a sibling
-/// infra-ops domain). Order is load-bearing — it drives the
-/// Ctrl+digit keyboard hotkey dispatch (CB-1.2 keyboard nav lock).
+/// One of the top-level sidebar groups. **PLANES-1 (the five-plane
+/// re-IA, `docs/design/planes.md`)** rebuilds the nav top-to-bottom as
+/// the operator's tree: a **Peers** Front Door, then the five planes
+/// (**This Node · Controller · Network · Fleet · Provisioning**), then
+/// the personal **Desktop** cluster (Dashboard / Apps / Devices /
+/// Compute / Look & Feel / Maintain / System / Help) grouped last (W4–
+/// W16). Network + Fleet survive the old IA as planes in their own
+/// right; ThisNode / Controller / Provisioning / Peers are new.
+/// Order is load-bearing — it drives the Ctrl+digit hotkey dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Group {
+    // ── Front Door ──
+    Peers,
+    // ── The five planes ──
+    ThisNode,
+    Controller,
+    Network,
+    Fleet,
+    Provisioning,
+    // ── Desktop cluster (personal panels, grouped last) ──
     Dashboard,
     Apps,
     Devices,
-    Fleet,
     Compute,
     LookAndFeel,
     Maintain,
-    Network,
     System,
     Help,
 }
 
 impl Group {
     /// Stable kebab-case slug used in deep-link URLs
-    /// (`mde --focus <group>.<panel>`).
+    /// (`mde --focus <group>.<panel>`). PLANES-1 is a clean break
+    /// (W11): the plane slugs are new ids, no back-compat aliases.
     #[must_use]
     pub const fn slug(self) -> &'static str {
         match self {
+            Self::Peers => "peers",
+            Self::ThisNode => "node",
+            Self::Controller => "controller",
+            Self::Network => "network",
+            Self::Fleet => "fleet",
+            Self::Provisioning => "provisioning",
             Self::Dashboard => "dashboard",
             Self::Apps => "apps",
             Self::Devices => "devices",
-            Self::Fleet => "fleet",
             Self::Compute => "compute",
             Self::LookAndFeel => "look_and_feel",
             Self::Maintain => "maintain",
-            Self::Network => "network",
             Self::System => "system",
             Self::Help => "help",
         }
     }
 
-    /// Sentence-case label shown in the sidebar.
+    /// Sentence-case label shown in the sidebar (short plane labels
+    /// per W4: "This Node · Controller · Network · Fleet · Provisioning").
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
+            Self::Peers => "Peers",
+            Self::ThisNode => "This Node",
+            Self::Controller => "Controller",
+            Self::Network => "Network",
+            Self::Fleet => "Fleet",
+            Self::Provisioning => "Provisioning",
             Self::Dashboard => "Overview",
             Self::Apps => "Apps",
             Self::Devices => "Devices",
-            Self::Fleet => "Fleet",
             Self::Compute => "Compute",
             Self::LookAndFeel => "Look & Feel",
             Self::Maintain => "Maintain",
-            Self::Network => "Network",
             Self::System => "System",
             Self::Help => "Help",
         }
     }
 
-    /// Stable display order (drives the Ctrl+1..9 hotkey dispatch).
+    /// Stable display order (drives the Ctrl+1..9 hotkey dispatch —
+    /// the first nine sidebar groups, Front Door + planes first).
     #[must_use]
-    pub const fn all() -> [Self; 10] {
+    pub const fn all() -> [Self; 14] {
         [
+            Self::Peers,
+            Self::ThisNode,
+            Self::Controller,
+            Self::Network,
+            Self::Fleet,
+            Self::Provisioning,
             Self::Dashboard,
             Self::Apps,
             Self::Devices,
-            Self::Fleet,
             Self::Compute,
             Self::LookAndFeel,
             Self::Maintain,
-            Self::Network,
             Self::System,
             Self::Help,
         ]
     }
 
-    /// The groups EXPOSED in the sidebar + the Ctrl+digit hotkeys —
-    /// `all()` minus `Network` (E4.15). The Network panels migrated to
-    /// Settings ▸ Network, so the Workbench no longer exposes the group
-    /// as a sidebar/hotkey destination; the panels themselves stay in
-    /// `all()`/`nav_model()` and remain reachable via
-    /// `mde-workbench --focus network.<panel>` (the Settings deep-links).
+    /// The groups EXPOSED in the sidebar + the Ctrl+digit hotkeys.
+    /// PLANES-1 (W4) promotes **Network** back to a first-class plane
+    /// in the sidebar — the old E4.15 hide (Network folded into
+    /// Settings) is superseded by the five-plane IA, so the full tree
+    /// is shown day-one (W16). Equal to [`Self::all`] now.
     #[must_use]
     pub fn sidebar_groups() -> Vec<Self> {
-        Self::all()
-            .into_iter()
-            .filter(|g| *g != Self::Network)
-            .collect()
+        Self::all().into_iter().collect()
     }
 
     /// Parse a kebab-case slug back into the matching group.
@@ -150,10 +170,11 @@ pub enum View {
 
 impl Default for View {
     fn default() -> Self {
-        // PD-4 / D2 — the Peers directory is the platform Front Door:
-        // a plain launch lands on it (deep-links still override).
+        // PD-4 / D2 / PLANES-1 — the Peers directory is the platform
+        // Front Door: a plain launch lands on it (deep-links still
+        // override). It now lives in its own `Peers` plane group.
         Self::Panel {
-            group: Group::Network,
+            group: Group::Peers,
             panel: "peers",
         }
     }
@@ -190,6 +211,113 @@ impl View {
 #[must_use]
 pub fn nav_model() -> Vec<NavEntry> {
     vec![
+        // ── Front Door ──────────────────────────────────────────────
+        // PLANES-1 (W7) — the Peers directory, one component two doors
+        // (also surfaced as Controller/Inventory below). Mesh Map rides
+        // along as the live graph view.
+        NavEntry {
+            group: Group::Peers,
+            panels: vec![
+                Panel::new("peers", "Peers"),
+                Panel::new("mesh_topology", "Mesh Map"),
+            ],
+        },
+        // ── Plane 1: This Node (the local box, W9/W17–W28) ──────────
+        NavEntry {
+            group: Group::ThisNode,
+            panels: vec![
+                // PLANES-4 — enrollment identity + cert lifecycle.
+                Panel::new("registration", "Registration"),
+                // PLANES-5 — replicated PeerProbe hardware view (W19).
+                Panel::new("hardware", "Inventory"),
+                // PLANES-6 — ENT-7 doctor + service controls + alarms.
+                Panel::new("health_check", "Health"),
+                // Mesh Services folds into This Node/Health (W4).
+                Panel::new("mesh_services", "Mesh Services"),
+                // PLANES-7 — applied vs newest revision + reconcile.
+                Panel::new("config_apply", "Config"),
+                // PLANES-8 — journald mesh-unit view + Netdata strip.
+                Panel::new("mesh_logs", "Logs & Metrics"),
+            ],
+        },
+        // ── Plane 2: Controller (a plane, not a place — W3/W29–W52) ──
+        NavEntry {
+            group: Group::Controller,
+            panels: vec![
+                // Peers = Controller/Inventory, the second door (W7).
+                Panel::new("peers", "Inventory"),
+                // Mesh Control gets its own Controller entry (W52).
+                Panel::new("mesh_control", "Mesh Control"),
+                // PLANES-10 — job templates + run history (absorbs
+                // Playbooks, W40).
+                Panel::new("jobs", "Jobs"),
+                Panel::new("playbooks", "Playbooks"),
+                Panel::new("run_history", "Run History"),
+                // PLANES-11 — Drift folds into Remediation (W13/W41).
+                Panel::new("drift", "Remediation"),
+                // PLANES-12 — hash-chained audit timeline + verify.
+                Panel::new("audit", "Audit"),
+                // PLANES-13 — declarative TOML policy (W46–W51, NEW).
+                Panel::new("policy", "Policy"),
+                // PLANES-14 — fleet-wide structured-log search (OBS-5).
+                Panel::new("fleet_logs", "Fleet Logs"),
+                // Fleet Revisions folds into Controller/Config (W4).
+                Panel::new("revisions", "Config"),
+                Panel::new("settings", "Settings"),
+            ],
+        },
+        // ── Plane 3: Network (full plane now, W65–W80) ──────────────
+        NavEntry {
+            group: Group::Network,
+            panels: vec![
+                // PLANES-15 — nmstate desired-vs-actual (W65–W68, NEW).
+                Panel::new("interfaces", "Interfaces"),
+                Panel::new("wifi", "Wi-Fi"),
+                // PLANES-16 — VPN topology + client profiles (W72/W73).
+                Panel::new("vpn", "VPN"),
+                // PLANES-17 — firewalld zones (W69–W71).
+                Panel::new("firewall", "Firewall"),
+                // PLANES-18 — mesh DNS roster → resolved (W74/W75, NEW).
+                Panel::new("dns", "Mesh DNS"),
+                // PLANES-19 — routing display + validation (W76/W79, NEW).
+                Panel::new("routing", "Routing"),
+                Panel::new("remote_desktop", "Remote Access"),
+                Panel::new("network_hosts", "Network Hosts"),
+                Panel::new("mesh_storage", "Mesh Storage"),
+                Panel::new("mesh_bus", "Mackes Bus"),
+                Panel::new("mesh_federation", "Mesh Federation"),
+                Panel::new("service_publishing", "Service Publishing"),
+                Panel::new("mesh_pending", "Mesh Pending"),
+                Panel::new("mesh_history", "Mesh History"),
+                Panel::new("mesh_join", "Mesh Join"),
+            ],
+        },
+        // ── Plane 4: Fleet (rollup lens, not config — W81–W87) ──────
+        NavEntry {
+            group: Group::Fleet,
+            panels: vec![
+                // PLANES-20 — role-grouped fleet rollup dashboard.
+                Panel::new("fleet_rollup", "Fleet Rollup"),
+                Panel::new("inventory", "Fleet Inventory"),
+                // Capability tags: hop/execution/headless (W82, NEW).
+                Panel::new("tags", "Capability Tags"),
+            ],
+        },
+        // ── Plane 5: Provisioning (after PKG core, W53–W64) ─────────
+        NavEntry {
+            group: Group::Provisioning,
+            panels: vec![
+                // PLANES-23 — node role pins + capability tags (W58).
+                Panel::new("node_roles", "Node Roles"),
+                // PLANES-21 — install profiles (W56/W57/W60, NEW).
+                Panel::new("profiles", "Install Profiles"),
+                // PLANES-22 — images: ISO/VM/container/USB (W53, NEW).
+                Panel::new("images", "Images"),
+                // PLANES-24 — GitHub-RPM mirrors on LizardFS (W61, NEW).
+                Panel::new("mirrors", "Mirrors"),
+            ],
+        },
+        // ── Desktop cluster (personal panels, grouped last) ─────────
         NavEntry {
             group: Group::Dashboard,
             panels: vec![Panel::new("home", "Home")],
@@ -238,29 +366,6 @@ pub fn nav_model() -> Vec<NavEntry> {
             ],
         },
         NavEntry {
-            group: Group::Fleet,
-            panels: vec![
-                // PLANES-4 — enrollment identity + cert lifecycle.
-                Panel::new("registration", "Registration"),
-                // PLANES-20 — role-grouped fleet rollup dashboard.
-                Panel::new("fleet_rollup", "Fleet Rollup"),
-                // PLANES-23 — node role pins + capability tags.
-                Panel::new("node_roles", "Node Roles"),
-                Panel::new("inventory", "Inventory"),
-                // PLANES-5 — replicated PeerProbe hardware view
-                // (PCI/USB/kernel/power/descriptors), no new collectors.
-                Panel::new("hardware", "Hardware"),
-                // PLANES-10 — job templates + run history (absorbs Playbooks).
-                Panel::new("jobs", "Jobs"),
-                // PLANES-7 — applied vs newest revision + reconcile-now.
-                Panel::new("config_apply", "Config Apply"),
-                Panel::new("playbooks", "Playbooks"),
-                Panel::new("run_history", "Run History"),
-                Panel::new("settings", "Settings"),
-                Panel::new("revisions", "Revisions"),
-            ],
-        },
-        NavEntry {
             group: Group::Compute,
             // E6.10 — the Compute group root renders the bespoke instance
             // list (local + fleet VMs / pods); "Instances" is its sidebar
@@ -283,60 +388,15 @@ pub fn nav_model() -> Vec<NavEntry> {
         },
         NavEntry {
             group: Group::Maintain,
+            // PLANES-1 — the mesh-facing Maintain panels re-homed into
+            // the planes (health_check→This Node, drift/audit/fleet_logs
+            // →Controller, mesh_logs→This Node); what stays is personal
+            // workstation upkeep.
             panels: vec![
                 Panel::new("hub", "Hub"),
                 Panel::new("snapshots", "Snapshots"),
                 Panel::new("debloat", "Debloat"),
-                Panel::new("health_check", "Health Check"),
                 Panel::new("repair", "Repair"),
-                Panel::new("drift", "Drift"),
-                // PLANES-12 — hash-chained audit timeline + verify-chain.
-                Panel::new("audit", "Audit"),
-                // PLANES-8 — journald mesh-unit view + Netdata deep-link.
-                Panel::new("mesh_logs", "Mesh Logs"),
-                // PLANES-14 — fleet-wide structured-log search (OBS-5).
-                Panel::new("fleet_logs", "Fleet Logs"),
-            ],
-        },
-        NavEntry {
-            group: Group::Network,
-            panels: vec![
-                Panel::new("wifi", "Wi-Fi"),
-                Panel::new("mesh_control", "Mesh Control"),
-                Panel::new("mesh_pending", "Mesh Pending"),
-                Panel::new("mesh_history", "Mesh History"),
-                Panel::new("mesh_join", "Mesh Join"),
-                Panel::new("peers", "Peers"),
-                Panel::new("mesh_topology", "Mesh Map"),
-                Panel::new("mesh_services", "Mesh Services"),
-                // MESHFS-13.1 (v5.0.0) — Mesh Storage panel (per-peer
-                // chunkserver status). Already wired in app.rs's panel
-                // router + reached by the Overview's File Sharing row;
-                // listed here so `--focus network.mesh_storage` resolves
-                // and the curated label renders.
-                Panel::new("mesh_storage", "Mesh Storage"),
-                Panel::new("network_hosts", "Network Hosts"),
-                Panel::new("mesh_bus", "Mackes Bus"),
-                Panel::new("mesh_federation", "Mesh Federation"),
-                // NF-13.8 (v2.5) — service-publishing surface
-                // pairs naturally with Mesh Services. Best-choice
-                // deviation from the worklist note that put this
-                // under Fleet: Fleet is for cluster-wide ops,
-                // Network is where every mesh_* panel lives, and
-                // the operator looks for "what this peer publishes"
-                // alongside "what daemons are running".
-                Panel::new("service_publishing", "Service Publishing"),
-                Panel::new("vpn", "VPN"),
-                Panel::new("firewall", "Firewall"),
-                Panel::new("remote_desktop", "Remote Access"),
-                // KDC2-5.8 (v2.1, 2026-05-22): "KDE Connect"
-                // standalone panel retired. KDC integration
-                // surfaces through `mde-peer-card` under the
-                // Mesh sidebar group + conditional phone
-                // sections (KDC2-5.4..5.7). The v13.0 wrapper
-                // approach was superseded by KDC2 native; the
-                // sidebar entry would have led to a broken
-                // panel.
             ],
         },
         NavEntry {
@@ -428,10 +488,25 @@ mod tests {
     #[test]
     fn nav_model_has_all_groups_in_locked_order() {
         let nav = nav_model();
-        // 10 groups since E6.10 added Compute next to Fleet.
-        assert_eq!(nav.len(), 10);
+        // PLANES-1 — 14 groups: Peers Front Door + 5 planes + the
+        // 8-group Desktop cluster.
+        assert_eq!(nav.len(), 14);
         let order: Vec<Group> = nav.iter().map(|e| e.group).collect();
         assert_eq!(order, Group::all().to_vec());
+    }
+
+    #[test]
+    fn planes_are_present_with_short_labels() {
+        // PLANES-1 (W4) — the five plane sections exist with the
+        // locked short labels, Peers Front Door first.
+        assert_eq!(Group::all()[0], Group::Peers);
+        assert_eq!(Group::ThisNode.label(), "This Node");
+        assert_eq!(Group::Controller.label(), "Controller");
+        assert_eq!(Group::Provisioning.label(), "Provisioning");
+        // Peers = Controller/Inventory dual-door (W7): the directory
+        // slug resolves under both groups.
+        assert!(view_from_focus_slug("peers.peers").is_some());
+        assert!(view_from_focus_slug("controller.peers").is_some());
     }
 
     #[test]
@@ -486,11 +561,12 @@ mod tests {
 
     #[test]
     fn view_default_is_the_peers_front_door() {
-        // PD-4 / D2 — a plain launch lands on the Peers directory.
+        // PD-4 / D2 / PLANES-1 — a plain launch lands on the Peers
+        // directory, now in its own Front Door plane.
         assert_eq!(
             View::default(),
             View::Panel {
-                group: Group::Network,
+                group: Group::Peers,
                 panel: "peers"
             }
         );

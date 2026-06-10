@@ -43,6 +43,7 @@ impl HubPanel {
                 "Snapshots",
                 "Capture / restore the live config",
                 Icon::Snapshot,
+                Group::Maintain,
                 "snapshots",
                 palette
             ),
@@ -51,14 +52,17 @@ impl HubPanel {
                 "Debloat",
                 "Remove apps you don't use",
                 Icon::Delete,
+                Group::Maintain,
                 "debloat",
                 palette
             ),
             Space::new().width(Length::Fixed(12.0)),
+            // PLANES-1 — Health re-homed to the This Node plane.
             tile(
                 "Health Check",
                 "Probe daemons and services",
                 Icon::StatusOk,
+                Group::ThisNode,
                 "health_check",
                 palette
             ),
@@ -68,14 +72,17 @@ impl HubPanel {
                 "Repair",
                 "Reset broken settings",
                 Icon::Repair,
+                Group::Maintain,
                 "repair",
                 palette
             ),
             Space::new().width(Length::Fixed(12.0)),
+            // PLANES-1 — Drift folds into Controller/Remediation.
             tile(
                 "Drift",
                 "Find config divergence",
                 Icon::History,
+                Group::Controller,
                 "drift",
                 palette
             ),
@@ -84,6 +91,7 @@ impl HubPanel {
                 "Logs",
                 "Recent daemon + worker output",
                 Icon::Logs,
+                Group::System,
                 "logs",
                 palette
             ),
@@ -111,6 +119,7 @@ fn tile<'a>(
     name: &'a str,
     description: &'a str,
     icon: Icon,
+    group: Group,
     panel_slug: &'static str,
     palette: Palette,
 ) -> Element<'a, crate::Message> {
@@ -174,7 +183,7 @@ fn tile<'a>(
             }
         })
         .on_press(crate::Message::SelectPanel {
-            group: Group::Maintain,
+            group,
             panel: panel_slug,
         })
         .into()

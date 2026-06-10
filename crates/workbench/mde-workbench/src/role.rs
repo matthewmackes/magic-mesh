@@ -24,8 +24,14 @@ use crate::model::{nav_model, Group, Panel};
 use crate::Message;
 
 /// The card-header glyph for a role — 1:1 with the sidebar group icon.
+/// PLANES-1: the four new plane groups reuse existing Material glyphs
+/// (no new SVG assets) — kept distinct per the `role_icons_*` test.
 const fn role_icon(group: Group) -> Icon {
     match group {
+        Group::Peers => Icon::Peer,
+        Group::ThisNode => Icon::Workbench,
+        Group::Controller => Icon::Playbook,
+        Group::Provisioning => Icon::Update,
         Group::Dashboard => Icon::Dashboard,
         Group::Apps => Icon::Apps,
         Group::Devices => Icon::Devices,
@@ -43,6 +49,18 @@ const fn role_icon(group: Group) -> Icon {
 /// console voice). Shown under the role title on the card.
 const fn role_description(group: Group) -> &'static str {
     match group {
+        Group::Peers => {
+            "The Front Door — every mesh peer, its presence, and the per-peer ops (call, ping, remote access, drift, sync)."
+        }
+        Group::ThisNode => {
+            "This box — registration and cert lifecycle, hardware inventory, health, services, config, and logs."
+        }
+        Group::Controller => {
+            "The fleet control plane — jobs and playbooks, remediation, audit, policy, fleet logs, and config revisions."
+        }
+        Group::Provisioning => {
+            "Build and enrol nodes — install profiles, images (ISO/VM/container/USB), node roles, and package mirrors."
+        }
         Group::Dashboard => {
             "At-a-glance system and fleet status, with quick links into every management role."
         }
@@ -78,14 +96,18 @@ const fn role_description(group: Group) -> &'static str {
 /// live [`Message::SelectGroup`] jump; never includes `group` itself.
 const fn see_also(group: Group) -> &'static [Group] {
     match group {
+        Group::Peers => &[Group::ThisNode, Group::Controller, Group::Network],
+        Group::ThisNode => &[Group::Controller, Group::Network, Group::Fleet],
+        Group::Controller => &[Group::Fleet, Group::Provisioning, Group::ThisNode],
+        Group::Provisioning => &[Group::Controller, Group::Fleet, Group::Network],
         Group::Dashboard => &[Group::Maintain, Group::System, Group::Fleet],
         Group::Apps => &[Group::System, Group::Maintain],
         Group::Devices => &[Group::LookAndFeel, Group::System],
-        Group::Fleet => &[Group::Compute, Group::Network, Group::Maintain],
+        Group::Fleet => &[Group::Controller, Group::Network, Group::Provisioning],
         Group::Compute => &[Group::Fleet, Group::System],
         Group::LookAndFeel => &[Group::Devices, Group::System],
-        Group::Maintain => &[Group::System, Group::Fleet],
-        Group::Network => &[Group::Fleet, Group::System],
+        Group::Maintain => &[Group::System, Group::ThisNode],
+        Group::Network => &[Group::Peers, Group::Controller, Group::Fleet],
         Group::System => &[Group::Maintain, Group::Apps],
         Group::Help => &[Group::Dashboard],
     }
@@ -314,33 +336,37 @@ mod tests {
     }
 
     #[test]
-    fn fleet_role_card_links_match_the_e6_5_acceptance() {
-        // E6.5 acceptance #1: the Fleet role card surfaces action-links
-        // to Inventory / Playbooks / Run-History / Settings / Revisions,
-        // plus the PLANES-5 Hardware (replicated PeerProbe) view. Locks
-        // the Fleet role's task set (each panel is wired in
-        // app.rs::panel_body, so each link opens its backend, not the
-        // not-ready empty-state).
+    fn fleet_plane_is_a_rollup_lens_after_planes_1() {
+        // PLANES-1 (W81) — Fleet is a rollup lens, not a config surface:
+        // its operational panels re-homed into This Node / Controller /
+        // Provisioning, leaving the rollup dashboard, the fleet inventory,
+        // and the capability-tags surface.
         let slugs: Vec<&str> = role_action_panels(Group::Fleet)
             .iter()
             .map(Panel::slug)
             .collect();
-        assert_eq!(
-            slugs,
-            vec![
-                "registration",
-                "fleet_rollup",
-                "node_roles",
-                "inventory",
-                "hardware",
-                "jobs",
-                "config_apply",
-                "playbooks",
-                "run_history",
-                "settings",
-                "revisions"
-            ]
-        );
+        assert_eq!(slugs, vec!["fleet_rollup", "inventory", "tags"]);
+    }
+
+    #[test]
+    fn this_node_and_controller_planes_absorb_the_mesh_panels() {
+        // PLANES-1 (W4) — the operational panels re-home into the planes.
+        let node: Vec<&str> = role_action_panels(Group::ThisNode)
+            .iter()
+            .map(Panel::slug)
+            .collect();
+        for want in ["registration", "hardware", "health_check", "config_apply"] {
+            assert!(node.contains(&want), "This Node missing {want}: {node:?}");
+        }
+        let ctrl: Vec<&str> = role_action_panels(Group::Controller)
+            .iter()
+            .map(Panel::slug)
+            .collect();
+        // Folds: Mesh Control (own entry), Jobs (absorbs Playbooks),
+        // Remediation (drift), Config (revisions), Fleet Logs.
+        for want in ["mesh_control", "jobs", "drift", "revisions", "fleet_logs"] {
+            assert!(ctrl.contains(&want), "Controller missing {want}: {ctrl:?}");
+        }
     }
 
     #[test]
@@ -443,30 +469,15 @@ mod tests {
     }
 
     #[test]
-    fn maintain_role_card_matches_the_e6_7_acceptance() {
-        // E6.7 acceptance #1: the Maintain role card surfaces action-links
-        // to Hub / Snapshots / Debloat / Health / Repair / Drift, plus the
-        // PLANES-12 Audit (hash-chain timeline + verify) view. The Maintain
-        // group root renders the generic role card (the "Hub" sub-panel was
-        // the bespoke dashboard).
+    fn maintain_role_card_is_personal_upkeep_after_planes_1() {
+        // PLANES-1 — the mesh-facing Maintain panels (health_check, drift,
+        // audit, mesh_logs, fleet_logs) re-home into the planes; Maintain
+        // keeps personal workstation upkeep only.
         let slugs: Vec<&str> = role_action_panels(Group::Maintain)
             .iter()
             .map(Panel::slug)
             .collect();
-        assert_eq!(
-            slugs,
-            vec![
-                "hub",
-                "snapshots",
-                "debloat",
-                "health_check",
-                "repair",
-                "drift",
-                "audit",
-                "mesh_logs",
-                "fleet_logs"
-            ]
-        );
+        assert_eq!(slugs, vec!["hub", "snapshots", "debloat", "repair"]);
     }
 
     #[test]

@@ -101,9 +101,11 @@ pub fn action_bus_topic(action: QuickAction) -> Option<&'static str> {
 #[must_use]
 pub fn action_deep_link(action: QuickAction) -> Option<&'static str> {
     match action {
-        QuickAction::OpenPeers => Some("network.peers"),
+        // PLANES-1 — Peers is its own Front Door plane; Registration
+        // re-homed to the This Node plane (slug "node").
+        QuickAction::OpenPeers => Some("peers"),
         QuickAction::OpenTransfers => Some("files.transfers"),
-        QuickAction::OpenRegistration => Some("network.registration"),
+        QuickAction::OpenRegistration => Some("node.registration"),
         QuickAction::ToggleDnd => None,
     }
 }
@@ -177,7 +179,7 @@ mod tests {
     #[test]
     fn deep_links_launch_the_workbench_at_the_right_slug() {
         let argv = launch_argv(QuickAction::OpenPeers).unwrap();
-        assert_eq!(argv, ["mde-workbench", "--focus", "network.peers"]);
+        assert_eq!(argv, ["mde-workbench", "--focus", "peers"]);
         assert!(launch_argv(QuickAction::ToggleDnd).is_none());
     }
 }

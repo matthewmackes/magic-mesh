@@ -428,7 +428,7 @@ impl HomePanel {
                 "Drift events",
                 self.snapshot.drift_count,
                 Icon::Repair,
-                Group::Maintain,
+                Group::Controller,
                 "drift",
                 palette,
             ),
@@ -1138,7 +1138,7 @@ fn build_mesh_row(p: &ProbeOutcome) -> CapabilityRow {
         icon: Icon::Network,
         status: p.status.clone(),
         sub_status: p.sub_status.clone(),
-        jump: Some((Group::Network, "mesh_control")),
+        jump: Some((Group::Controller, "mesh_control")),
         launch: None,
     }
 }
@@ -1151,7 +1151,7 @@ fn build_peers_row(p: &ProbeOutcome) -> CapabilityRow {
         icon: Icon::Peer,
         status: p.status.clone(),
         sub_status: p.sub_status.clone(),
-        jump: Some((Group::Network, "mesh_topology")),
+        jump: Some((Group::Peers, "mesh_topology")),
         launch: None,
     }
 }
@@ -1216,7 +1216,7 @@ fn build_services_row(p: &ProbeOutcome) -> CapabilityRow {
         icon: Icon::Apps,
         status: p.status.clone(),
         sub_status: p.sub_status.clone(),
-        jump: Some((Group::Network, "mesh_services")),
+        jump: Some((Group::ThisNode, "mesh_services")),
         launch: None,
     }
 }
@@ -1258,7 +1258,7 @@ fn build_fleet_row(p: &ProbeOutcome) -> CapabilityRow {
         icon: Icon::Fleet,
         status: p.status.clone(),
         sub_status: p.sub_status.clone(),
-        jump: Some((Group::Fleet, "playbooks")),
+        jump: Some((Group::Controller, "playbooks")),
         launch: None,
     }
 }
@@ -2031,13 +2031,14 @@ mod tests {
     fn live_rows_jump_to_documented_panels() {
         let rows = build_all_rows_with_unknown_status();
         let lookup = |id: CapabilityId| rows.iter().find(|r| r.id == id).and_then(|r| r.jump);
+        // PLANES-1 — capability jumps follow the panels into their planes.
         assert_eq!(
             lookup(CapabilityId::Mesh),
-            Some((Group::Network, "mesh_control"))
+            Some((Group::Controller, "mesh_control"))
         );
         assert_eq!(
             lookup(CapabilityId::Peers),
-            Some((Group::Network, "mesh_topology"))
+            Some((Group::Peers, "mesh_topology"))
         );
         assert_eq!(
             lookup(CapabilityId::Files),
@@ -2061,11 +2062,11 @@ mod tests {
         );
         assert_eq!(
             lookup(CapabilityId::Services),
-            Some((Group::Network, "mesh_services"))
+            Some((Group::ThisNode, "mesh_services"))
         );
         assert_eq!(
             lookup(CapabilityId::Fleet),
-            Some((Group::Fleet, "playbooks"))
+            Some((Group::Controller, "playbooks"))
         );
         assert_eq!(
             lookup(CapabilityId::Notifications),

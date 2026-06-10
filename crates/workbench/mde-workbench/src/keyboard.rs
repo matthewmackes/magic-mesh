@@ -113,11 +113,11 @@ pub fn interpret_key(key: Key, mods: Modifiers, current_pane: Pane) -> KeyAction
         (Key::Escape, _) => KeyAction::CloseDetail,
         (Key::Digit(n), m) if m.ctrl && (1..=9).contains(&n) => {
             // Group-hotkey table: Ctrl+1 → first sidebar group, Ctrl+9 →
-            // ninth. Order comes from [`Group::sidebar_groups`] (E4.15:
-            // Network migrated to Settings, so it's no longer a sidebar/
-            // hotkey target; the panels stay reachable via `--focus`).
-            // E6.10 added Compute as the 5th sidebar group, so the table
-            // now spans Ctrl+1..9 (was 1..8).
+            // ninth. Order comes from [`Group::sidebar_groups`]. PLANES-1
+            // makes the first nine the Front Door + the five planes +
+            // the first Desktop-cluster groups (Peers, This Node,
+            // Controller, Network, Fleet, Provisioning, Overview, Apps,
+            // Devices); the tail (Compute…Help) is reachable by click.
             let idx = (n - 1) as usize;
             let group = Group::sidebar_groups()[idx];
             KeyAction::JumpToGroup(group)
@@ -171,19 +171,19 @@ mod tests {
 
     #[test]
     fn ctrl_digit_jumps_to_matching_sidebar_group() {
-        // E4.15 — Network is no longer a sidebar/hotkey group. E6.10 added
-        // Compute as the 5th sidebar group, so the table is the 9
-        // `sidebar_groups()` and everything after Fleet shifts down one.
+        // PLANES-1 — Ctrl+1..9 map to the first nine sidebar groups:
+        // the Peers Front Door, the five planes, then the first three
+        // Desktop-cluster groups.
         let cases = [
-            (1, Group::Dashboard),
-            (2, Group::Apps),
-            (3, Group::Devices),
-            (4, Group::Fleet),
-            (5, Group::Compute),
-            (6, Group::LookAndFeel),
-            (7, Group::Maintain),
-            (8, Group::System),
-            (9, Group::Help),
+            (1, Group::Peers),
+            (2, Group::ThisNode),
+            (3, Group::Controller),
+            (4, Group::Network),
+            (5, Group::Fleet),
+            (6, Group::Provisioning),
+            (7, Group::Dashboard),
+            (8, Group::Apps),
+            (9, Group::Devices),
         ];
         for (n, expected) in cases {
             assert_eq!(

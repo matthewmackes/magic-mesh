@@ -721,14 +721,21 @@ impl App {
         if self.view.group() == Group::Compute {
             subs.push(compute_panel::ComputePanel::sample_subscription());
         }
-        // PD-8 (L14) — Netdata sampling only while the Peers
-        // directory is the active view (the Compute pattern).
+        // PD-8 (L14) / PLANES-1 — Netdata sampling only while the Peers
+        // directory is the active view (the Compute pattern). The Front
+        // Door is reachable as the Peers plane root/panel or the
+        // Controller/Inventory door.
         if matches!(
             self.view,
-            View::Panel {
-                group: Group::Network,
-                panel: "peers"
-            }
+            View::Group(Group::Peers)
+                | View::Panel {
+                    group: Group::Peers,
+                    panel: "peers"
+                }
+                | View::Panel {
+                    group: Group::Controller,
+                    panel: "peers"
+                }
         ) {
             subs.push(peers_panel::metrics_subscription());
         }
@@ -933,15 +940,17 @@ impl App {
             // KDC2-3.9 signals; the panel.load() returns
             // Task::none today.
             (Group::Devices, "connect") => connect_panel::ConnectPanel::load(),
+            // PLANES-1 — Fleet keeps the rollup lens + fleet inventory;
+            // the operational panels re-home into the planes.
             (Group::Fleet, "inventory") => inventory_panel::InventoryPanel::load(),
-            (Group::Fleet, "hardware") => hardware_panel::HardwarePanel::load(),
-            (Group::Fleet, "jobs") => jobs_panel::JobsPanel::load(),
-            (Group::Fleet, "config_apply") => config_apply_panel::ConfigApplyPanel::load(),
-            (Group::Fleet, "registration") => registration_panel::RegistrationPanel::load(),
             (Group::Fleet, "fleet_rollup") => fleet_rollup_panel::FleetRollupPanel::load(),
-            (Group::Fleet, "node_roles") => node_roles_panel::NodeRolesPanel::load(),
-            (Group::Fleet, "playbooks") => playbooks_panel::PlaybooksPanel::load(),
-            (Group::Fleet, "run_history") => run_history_panel::RunHistoryPanel::load(),
+            (Group::ThisNode, "hardware") => hardware_panel::HardwarePanel::load(),
+            (Group::ThisNode, "config_apply") => config_apply_panel::ConfigApplyPanel::load(),
+            (Group::ThisNode, "registration") => registration_panel::RegistrationPanel::load(),
+            (Group::Controller, "jobs") => jobs_panel::JobsPanel::load(),
+            (Group::Provisioning, "node_roles") => node_roles_panel::NodeRolesPanel::load(),
+            (Group::Controller, "playbooks") => playbooks_panel::PlaybooksPanel::load(),
+            (Group::Controller, "run_history") => run_history_panel::RunHistoryPanel::load(),
             (Group::System, "datetime") => datetime_panel::DateTimePanel::load(),
             (Group::Apps, "default_apps") => default_apps_panel::DefaultAppsPanel::load(),
             (Group::Maintain, "snapshots") => snapshots_panel::SnapshotsPanel::load(),
@@ -950,14 +959,14 @@ impl App {
             (Group::System, "system_update") => system_update_panel::SystemUpdatePanel::load(),
             // v4.0.1 WB-2.f — auto-run probes on first nav so
             // the panel lands populated rather than empty.
-            (Group::Maintain, "health_check") => health_check_panel::HealthCheckPanel::load(),
-            // v4.0.1 WB-2.g — mackesd events list --json scan.
-            (Group::Maintain, "drift") => drift_panel::DriftPanel::load(),
-            (Group::Maintain, "audit") => audit_panel::AuditPanel::load(),
-            (Group::Maintain, "mesh_logs") => mesh_logs_panel::MeshLogsPanel::load(),
-            (Group::Maintain, "fleet_logs") => fleet_logs_panel::FleetLogsPanel::load(),
-            // v4.0.1 WB-2.h — leader lock + healthz probe.
-            (Group::Network, "mesh_control") => mesh_control_panel::MeshControlPanel::load(),
+            (Group::ThisNode, "health_check") => health_check_panel::HealthCheckPanel::load(),
+            // PLANES-11 — Drift folds into Controller/Remediation.
+            (Group::Controller, "drift") => drift_panel::DriftPanel::load(),
+            (Group::Controller, "audit") => audit_panel::AuditPanel::load(),
+            (Group::ThisNode, "mesh_logs") => mesh_logs_panel::MeshLogsPanel::load(),
+            (Group::Controller, "fleet_logs") => fleet_logs_panel::FleetLogsPanel::load(),
+            // PLANES-1 (W52) — Mesh Control gets its own Controller entry.
+            (Group::Controller, "mesh_control") => mesh_control_panel::MeshControlPanel::load(),
             // v4.0.1 WB-2.i — scan probe.json cache for pending peers.
             (Group::Network, "mesh_pending") => mesh_pending_panel::MeshPendingPanel::load(),
             // v4.0.1 WB-2.d — load applet visibility from panel.toml.
@@ -970,9 +979,10 @@ impl App {
             // MESH-PROBE-9.a — Network Hosts reads the merged probe
             // inventory off mesh-storage on first nav (read-only).
             (Group::Network, "network_hosts") => network_hosts_panel::NetworkHostsPanel::load(),
-            (Group::Network, "mesh_topology") => mesh_topology_panel::MeshTopologyPanel::load(),
-            // v4.0.1 WB-2.j — same pattern for mesh services.
-            (Group::Network, "mesh_services") => mesh_services_panel::MeshServicesPanel::load(),
+            // PLANES-1 — Mesh Map rides the Peers Front Door plane.
+            (Group::Peers, "mesh_topology") => mesh_topology_panel::MeshTopologyPanel::load(),
+            // PLANES-1 (W4) — Mesh Services folds into This Node/Health.
+            (Group::ThisNode, "mesh_services") => mesh_services_panel::MeshServicesPanel::load(),
             // NF-13.8 (v2.5) — shell-out to
             // mackes.mesh_nebula.published_services_summary
             // for the 7 canonical services + per-row overlay
@@ -983,17 +993,22 @@ impl App {
             // v4.0.1 WB-2.l — load cached peer-macs.json on
             // first nav so the known-hosts table is populated.
             (Group::Network, "remote_desktop") => remote_desktop_panel::RemoteDesktopPanel::load(),
-            (Group::Network, "peers") => peers_panel::PeersPanel::load(),
+            // PLANES-1 (W7) — the Peers directory: Front Door plane +
+            // the Controller/Inventory door both load it.
+            (Group::Peers, "peers") | (Group::Controller, "peers") => {
+                peers_panel::PeersPanel::load()
+            }
             (Group::Apps, "installed") => apps_installed_panel::AppsInstalledPanel::load(),
             (Group::Apps, "sources") => apps_sources_panel::AppsSourcesPanel::load(),
             (Group::Network, "firewall") => firewall_panel::FirewallPanel::load(),
             (Group::Network, "wifi") => wifi_panel::WifiPanel::load(),
             (Group::Network, "mesh_history") => mesh_history_panel::MeshHistoryPanel::load(),
             (Group::Network, "vpn") => vpn_panel::VpnPanel::load(),
-            (Group::Fleet, "revisions") => fleet_revisions_panel::FleetRevisionsPanel::load(),
+            // PLANES-1 (W4) — Fleet Revisions folds into Controller/Config.
+            (Group::Controller, "revisions") => fleet_revisions_panel::FleetRevisionsPanel::load(),
             // Fleet settings has no Load — it's a push-only
             // surface, so navigation doesn't fan a refresh.
-            (Group::Fleet, "settings") => Task::none(),
+            (Group::Controller, "settings") => Task::none(),
             // TUNE-15.b — Federation pairing panel: load active pairs on nav.
             (Group::Network, "mesh_federation") => {
                 mesh_federation_panel::MeshFederationPanel::load()
@@ -1010,6 +1025,9 @@ impl App {
     fn on_group_navigated(&self, group: Group) -> Task<Message> {
         match group {
             Group::Compute => compute_panel::ComputePanel::load(),
+            // PLANES-1 — the Peers Front Door plane lands on the live
+            // directory (like Compute), not a role card.
+            Group::Peers => peers_panel::PeersPanel::load(),
             _ => Task::none(),
         }
     }
@@ -1192,42 +1210,46 @@ impl App {
                 group: Group::Devices,
                 panel: "connect",
             } => self.connect.view(),
+            // PLANES-1 — Fleet keeps the rollup lens + fleet inventory.
             View::Panel {
                 group: Group::Fleet,
                 panel: "inventory",
             } => self.inventory.view(),
             View::Panel {
                 group: Group::Fleet,
+                panel: "fleet_rollup",
+            } => self.fleet_rollup.view(),
+            // This Node plane — registration / inventory / config.
+            View::Panel {
+                group: Group::ThisNode,
                 panel: "hardware",
             } => self.hardware.view(),
             View::Panel {
-                group: Group::Fleet,
-                panel: "jobs",
-            } => self.jobs.view(),
-            View::Panel {
-                group: Group::Fleet,
+                group: Group::ThisNode,
                 panel: "config_apply",
             } => self.config_apply.view(),
             View::Panel {
-                group: Group::Fleet,
+                group: Group::ThisNode,
                 panel: "registration",
             } => self.registration.view(),
+            // Controller plane — jobs / playbooks / run history.
             View::Panel {
-                group: Group::Fleet,
-                panel: "fleet_rollup",
-            } => self.fleet_rollup.view(),
+                group: Group::Controller,
+                panel: "jobs",
+            } => self.jobs.view(),
             View::Panel {
-                group: Group::Fleet,
-                panel: "node_roles",
-            } => self.node_roles.view(),
-            View::Panel {
-                group: Group::Fleet,
+                group: Group::Controller,
                 panel: "playbooks",
             } => self.playbooks.view(),
             View::Panel {
-                group: Group::Fleet,
+                group: Group::Controller,
                 panel: "run_history",
             } => self.run_history.view(),
+            // Provisioning plane — node role pins + tags (W58).
+            View::Panel {
+                group: Group::Provisioning,
+                panel: "node_roles",
+            } => self.node_roles.view(),
             View::Panel {
                 group: Group::System,
                 panel: "datetime",
@@ -1301,27 +1323,29 @@ impl App {
             // Check renders the local-probe table (disk space,
             // memory, failed units, DNS, dnf backlog, snapshot
             // count, parity overlay).
+            // PLANES-1 — Health re-homes to This Node (W20).
             View::Panel {
-                group: Group::Maintain,
+                group: Group::ThisNode,
                 panel: "health_check",
             } => self.health_check.view(),
+            // PLANES-12 — Audit re-homes to Controller.
             View::Panel {
-                group: Group::Maintain,
+                group: Group::Controller,
                 panel: "audit",
             } => self.audit.view(),
+            // PLANES-8 — Logs & Metrics re-home to This Node.
             View::Panel {
-                group: Group::Maintain,
+                group: Group::ThisNode,
                 panel: "mesh_logs",
             } => self.mesh_logs.view(),
+            // PLANES-14 — Fleet Logs re-home to Controller.
             View::Panel {
-                group: Group::Maintain,
+                group: Group::Controller,
                 panel: "fleet_logs",
             } => self.fleet_logs.view(),
-            // v4.0.1 WB-2.g (2026-05-23) — Maintain → Drift
-            // renders mackesd events list --json output filtered
-            // for drift-flavoured rows.
+            // PLANES-11 — Drift folds into Controller/Remediation.
             View::Panel {
-                group: Group::Maintain,
+                group: Group::Controller,
                 panel: "drift",
             } => self.drift.view(),
             // BUS-7.2 — Mackes Bus 5-tab operator surface.
@@ -1336,8 +1360,9 @@ impl App {
             } => self.mesh_federation.view(),
             // v4.0.1 WB-2.h (2026-05-23) — Network → Mesh
             // Control renders the leader-lease state + healthz.
+            // PLANES-1 (W52) — Mesh Control gets its own Controller entry.
             View::Panel {
-                group: Group::Network,
+                group: Group::Controller,
                 panel: "mesh_control",
             } => self.mesh_control.view(),
             // v4.0.1 WB-2.i (2026-05-23) — Network → Mesh
@@ -1362,8 +1387,9 @@ impl App {
                 group: Group::Network,
                 panel: "network_hosts",
             } => self.network_hosts.view(),
+            // PLANES-1 — Mesh Map rides the Peers Front Door plane.
             View::Panel {
-                group: Group::Network,
+                group: Group::Peers,
                 panel: "mesh_topology",
             } => self.mesh_topology.view(),
             // v4.0.1 WB-2.j (2026-05-23) — Network → Mesh
@@ -1372,8 +1398,9 @@ impl App {
             // (2026-05-24) swapped the set to nebula /
             // nebula-lighthouse / mackes-nebula-https-tunnel /
             // mackesd.
+            // PLANES-1 (W4) — Mesh Services folds into This Node/Health.
             View::Panel {
-                group: Group::Network,
+                group: Group::ThisNode,
                 panel: "mesh_services",
             } => self.mesh_services.view(),
             // NF-13.8 (v2.5) — Network → Service Publishing
@@ -1391,9 +1418,16 @@ impl App {
                 group: Group::Network,
                 panel: "remote_desktop",
             } => self.remote_desktop.view(),
-            // PD-3 — the Peers directory (the Front Door).
-            View::Panel {
-                group: Group::Network,
+            // PD-3 / PLANES-1 (W7) — the Peers directory (the Front
+            // Door), one component two doors: the Peers plane root +
+            // its panel, and the Controller/Inventory door.
+            View::Group(Group::Peers)
+            | View::Panel {
+                group: Group::Peers,
+                panel: "peers",
+            }
+            | View::Panel {
+                group: Group::Controller,
                 panel: "peers",
             } => self.peers.view(),
             View::Panel {
@@ -1416,12 +1450,14 @@ impl App {
                 group: Group::Network,
                 panel: "mesh_history",
             } => self.mesh_history.view(),
+            // PLANES-1 (W4) — fleet settings + Config (Revisions) re-home
+            // to the Controller plane.
             View::Panel {
-                group: Group::Fleet,
+                group: Group::Controller,
                 panel: "settings",
             } => self.fleet_settings.view(),
             View::Panel {
-                group: Group::Fleet,
+                group: Group::Controller,
                 panel: "revisions",
             } => self.fleet_revisions.view(),
             // E6.10 — the Compute group root (and its "Instances"
@@ -1499,11 +1535,11 @@ mod tests {
     #[test]
     fn new_app_lands_on_the_peers_front_door() {
         let app = App::new();
-        // PD-4 / D2 — the Front Door.
+        // PD-4 / D2 / PLANES-1 — the Front Door, now its own plane.
         assert_eq!(
             app.current_view(),
             View::Panel {
-                group: Group::Network,
+                group: Group::Peers,
                 panel: "peers"
             }
         );
