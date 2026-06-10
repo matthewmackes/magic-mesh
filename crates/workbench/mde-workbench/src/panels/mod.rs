@@ -53,6 +53,7 @@ pub mod peers_map;
 pub mod playbooks;
 pub mod power;
 pub mod printers;
+pub mod registration;
 pub mod remote_desktop;
 pub mod removable;
 pub mod repair;

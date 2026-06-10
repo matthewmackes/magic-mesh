@@ -240,6 +240,8 @@ pub fn nav_model() -> Vec<NavEntry> {
         NavEntry {
             group: Group::Fleet,
             panels: vec![
+                // PLANES-4 — enrollment identity + cert lifecycle.
+                Panel::new("registration", "Registration"),
                 Panel::new("inventory", "Inventory"),
                 // PLANES-5 — replicated PeerProbe hardware view
                 // (PCI/USB/kernel/power/descriptors), no new collectors.

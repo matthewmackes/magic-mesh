@@ -328,6 +328,7 @@ mod tests {
         assert_eq!(
             slugs,
             vec![
+                "registration",
                 "inventory",
                 "hardware",
                 "jobs",

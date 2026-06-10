@@ -32,12 +32,13 @@ use crate::panels::{
     mesh_topology as mesh_topology_panel, mouse as mouse_panel, music as music_panel,
     network_hosts as network_hosts_panel, notifications as notifications_panel,
     panel_apps as panel_apps_panel, peers as peers_panel, playbooks as playbooks_panel,
-    power as power_panel, printers as printers_panel, remote_desktop as remote_desktop_panel,
-    removable as removable_panel, repair as repair_panel, resources as resources_panel,
-    run_history as run_history_panel, service_publishing as service_publishing_panel,
-    session as session_panel, snapshots as snapshots_panel, sound as sound_panel,
-    sync_status as sync_status_panel, system_update as system_update_panel, themes as themes_panel,
-    vpn as vpn_panel, wallpaper as wallpaper_panel, wifi as wifi_panel,
+    power as power_panel, printers as printers_panel, registration as registration_panel,
+    remote_desktop as remote_desktop_panel, removable as removable_panel, repair as repair_panel,
+    resources as resources_panel, run_history as run_history_panel,
+    service_publishing as service_publishing_panel, session as session_panel,
+    snapshots as snapshots_panel, sound as sound_panel, sync_status as sync_status_panel,
+    system_update as system_update_panel, themes as themes_panel, vpn as vpn_panel,
+    wallpaper as wallpaper_panel, wifi as wifi_panel,
 };
 use crate::patternfly::{breadcrumb, page_subtitle, page_title};
 use crate::sidebar::SidebarState;
@@ -154,6 +155,8 @@ pub enum Message {
     MeshLogs(mesh_logs_panel::Message),
     /// PLANES-7 — Config-apply panel (applied vs newest revision) sub-message.
     ConfigApply(config_apply_panel::Message),
+    /// PLANES-4 — Registration panel (identity + cert lifecycle) sub-message.
+    Registration(registration_panel::Message),
     /// CB-1.5.b — Fleet playbooks panel sub-message.
     Playbooks(playbooks_panel::Message),
     /// CB-1.5.c — Fleet run-history panel sub-message.
@@ -264,6 +267,7 @@ pub struct App {
     audit: audit_panel::AuditPanel,
     mesh_logs: mesh_logs_panel::MeshLogsPanel,
     config_apply: config_apply_panel::ConfigApplyPanel,
+    registration: registration_panel::RegistrationPanel,
     playbooks: playbooks_panel::PlaybooksPanel,
     run_history: run_history_panel::RunHistoryPanel,
     datetime: datetime_panel::DateTimePanel,
@@ -373,6 +377,7 @@ impl App {
             audit: audit_panel::AuditPanel::new(),
             mesh_logs: mesh_logs_panel::MeshLogsPanel::new(),
             config_apply: config_apply_panel::ConfigApplyPanel::new(),
+            registration: registration_panel::RegistrationPanel::new(),
             playbooks: playbooks_panel::PlaybooksPanel::new(),
             run_history: run_history_panel::RunHistoryPanel::new(),
             datetime: datetime_panel::DateTimePanel::new(),
@@ -813,6 +818,7 @@ impl App {
             Message::Audit(msg) => self.audit.update(msg),
             Message::MeshLogs(msg) => self.mesh_logs.update(msg),
             Message::ConfigApply(msg) => self.config_apply.update(msg),
+            Message::Registration(msg) => self.registration.update(msg),
             Message::Playbooks(msg) => self.playbooks.update(msg),
             Message::RunHistory(msg) => self.run_history.update(msg),
             Message::DateTime(msg) => self.datetime.update(msg),
@@ -898,6 +904,7 @@ impl App {
             (Group::Fleet, "hardware") => hardware_panel::HardwarePanel::load(),
             (Group::Fleet, "jobs") => jobs_panel::JobsPanel::load(),
             (Group::Fleet, "config_apply") => config_apply_panel::ConfigApplyPanel::load(),
+            (Group::Fleet, "registration") => registration_panel::RegistrationPanel::load(),
             (Group::Fleet, "playbooks") => playbooks_panel::PlaybooksPanel::load(),
             (Group::Fleet, "run_history") => run_history_panel::RunHistoryPanel::load(),
             (Group::System, "datetime") => datetime_panel::DateTimePanel::load(),
@@ -1165,6 +1172,10 @@ impl App {
                 group: Group::Fleet,
                 panel: "config_apply",
             } => self.config_apply.view(),
+            View::Panel {
+                group: Group::Fleet,
+                panel: "registration",
+            } => self.registration.view(),
             View::Panel {
                 group: Group::Fleet,
                 panel: "playbooks",
