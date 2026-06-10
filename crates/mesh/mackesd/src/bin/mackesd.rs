@@ -3148,7 +3148,7 @@ fn run_serve(
 ) -> anyhow::Result<()> {
     use mackesd_core::workers::{
         firewall_preset::FirewallPresetWorker, heartbeat::HeartbeatWorker,
-        mdns_relay::MdnsRelayWorker, mesh_router::MeshRouterWorker,
+        mdns_relay::MdnsRelayWorker, mesh_router::MeshRouterWorker, ssh_pubkey_gossip,
         sshd_overlay_bind::SshdOverlayBindWorker, voice_config::VoiceConfigWorker, RestartPolicy,
         Spawn, Supervisor,
     };
@@ -3364,6 +3364,20 @@ fn run_serve(
             RestartPolicy::OnFailure,
         ));
         worker_names.lock().expect("worker_names mutex").push("sshd_overlay_bind".into());
+        // SVC-2 (Q60) — SSH pubkey gossip: publish this box's user
+        // ed25519 pubkey into <root>/ssh-keys/ and merge every peer's
+        // published key into ~/.ssh/authorized_keys (managed block,
+        // write-on-change). LizardFS replication is the transport.
+        if mackesd_core::worker_role::runs("ssh_pubkey_gossip", role_rank) {
+            sup.spawn(Spawn::new(
+                ssh_pubkey_gossip::SshPubkeyGossipWorker::new(
+                    workgroup_root.clone(),
+                    node_id.clone(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names.lock().expect("worker_names mutex").push("ssh_pubkey_gossip".into());
+        }
         // NF-21.3 — firewall_preset worker. Applies the Nebula
         // firewalld preset (UDP/4242 inbound on all peers; TCP/443
         // inbound additionally on lighthouses) on first tick + on

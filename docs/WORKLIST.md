@@ -111,7 +111,7 @@ host-local Ansible apply.
 ## SERVICES — Remote Access, music, voice, files, KDC (resolves B1, H6)
 
 - [✓] **SVC-1: Remote Access panel** — done — SSH folded into remote_desktop (cosmic-term `ssh $USER@host` per L7, port-22 probe per row, local sshd state in header); mesh_ssh nav entry dropped, slug aliased; B1 closed; fold a per-peer SSH status+launcher into `remote_desktop` (SSH+RDP+VNC); drop the `mesh_ssh` nav entry; launch via `.remmina`, reuse remmina probes, hostname targets, show local+remote sshd state, no ACL (Q53–62). *(resolves B1.)*
-- [ ] **SVC-2: SSH pubkey-gossip worker** — a `mackesd` worker gossips each peer's mesh ed25519 pubkey into every peer's `authorized_keys` (Q60).
+- [✓] **SVC-2: SSH pubkey-gossip worker** — done — ssh_pubkey_gossip worker (rank 0): publishes ~/.ssh/id_ed25519.pub to <root>/ssh-keys/, merges all peers into an authorized_keys managed block; a `mackesd` worker gossips each peer's mesh ed25519 pubkey into every peer's `authorized_keys` (Q60).
 - [✓] **SVC-3: build `list-radio`** — done — getInternetRadioStations client + verb + verb_for(Radio) + URL-passthrough stream ids; click plays the station; Airsonic `getInternetRadioStations` client + `list-radio` verb + `verb_for(Radio)`; play = enqueue the stream URL as a pseudo-track (Q63/64). *(resolves H6.)*
 - [ ] **SVC-4: voice HUD promotion** — Cosmic autostart for `--agent` + Workbench presence; Bus-native presence (every peer publishes `state/voice/status`) (Q65/66).
 - [✓] **SVC-5: document the 3 file bridges** — done — co-equal lock documented in the mde-files crate doc; keep mesh / SMB / KDC co-equal in mde-files (Q67); no code change, just the lock.

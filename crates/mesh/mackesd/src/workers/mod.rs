@@ -256,6 +256,10 @@ pub mod remmina_sync;
 // Replaces mesh_nebula.py::write_sshd_overlay_bind so the
 // Python module can fully retire (DEAD-2.14 plan).
 pub mod sshd_overlay_bind;
+// SVC-2 (Q60) — gossips each peer's user ed25519 SSH pubkey through the
+// replicated workgroup root into every peer's authorized_keys managed
+// block, making peer-to-peer SSH passwordless mesh-wide.
+pub mod ssh_pubkey_gossip;
 // NF-21.3 — owns the firewalld preset that opens Nebula's
 // UDP/4242 (all peers) + TCP/443 (lighthouses) inbound. Replaces
 // mesh_nebula.py::apply_nebula_firewall_preset so the Python
