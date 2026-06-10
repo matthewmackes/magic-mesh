@@ -1,7 +1,21 @@
-//! MDE Files — mesh-first "Artifact Manager" for the Mackes Desktop Environment.
+//! MDE Files — mesh-first "Artifact Manager" for Magic Mesh.
 //!
 //! Implementation contract: `docs/design/v2.0.0-mde-files/design-spec.md`.
 //! Prototype: `docs/design/v2.0.0-mde-files/upstream-bundle/Artifact-Manager.html`.
+//!
+//! ## The three file bridges (SVC-5 / Q67 lock)
+//!
+//! mde-files reaches remote files over exactly three **co-equal**
+//! bridges — none is "the real one", none is deprecated, and new
+//! file-transfer features must consider all three:
+//!
+//! 1. **Mesh** — peer files over the Bus (`action/fleet-files/*`,
+//!    [`bus_backend`]) + the LizardFS-replicated QNM dirs ([`mounts`]).
+//!    The default path between enrolled peers.
+//! 2. **SMB** — classic LAN shares ([`mounts`] / gio), for the NAS and
+//!    non-mesh machines on the same network.
+//! 3. **KDC** — phone/tablet files via the KDE-Connect-protocol host
+//!    (`action/connect/*`), for paired mobile devices.
 
 pub mod a11y_labels;
 pub mod app;

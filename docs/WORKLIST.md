@@ -114,7 +114,7 @@ host-local Ansible apply.
 - [ ] **SVC-2: SSH pubkey-gossip worker** — a `mackesd` worker gossips each peer's mesh ed25519 pubkey into every peer's `authorized_keys` (Q60).
 - [✓] **SVC-3: build `list-radio`** — done — getInternetRadioStations client + verb + verb_for(Radio) + URL-passthrough stream ids; click plays the station; Airsonic `getInternetRadioStations` client + `list-radio` verb + `verb_for(Radio)`; play = enqueue the stream URL as a pseudo-track (Q63/64). *(resolves H6.)*
 - [ ] **SVC-4: voice HUD promotion** — Cosmic autostart for `--agent` + Workbench presence; Bus-native presence (every peer publishes `state/voice/status`) (Q65/66).
-- [ ] **SVC-5: document the 3 file bridges** — keep mesh / SMB / KDC co-equal in mde-files (Q67); no code change, just the lock.
+- [✓] **SVC-5: document the 3 file bridges** — done — co-equal lock documented in the mde-files crate doc; keep mesh / SMB / KDC co-equal in mde-files (Q67); no code change, just the lock.
 - [ ] **SVC-6: KDC full phone hub** — land KDC2-4 (= SEC-5), keep all plugins, phone actions on the device card only (Q68/69).
 - [ ] **SVC-7: Workstation-only service gating** — gate music/voice/files/KDC to Workstation rank; Servers/Lighthouses run plumbing only (Q70).
 
