@@ -39,6 +39,7 @@ pub mod backup;
 // EPIC-SEC-BANLIST (Q53) — compromised-node ban list checked at
 // the CSR sign gate (nebula_enroll::sign_pending_csr).
 pub mod ban_list;
+pub mod blocklist;
 // INST-7 prerequisite — peer cert revocation CLI (`mackesd ca
 // revoke <node-id>`). Replaces the originally-planned D-Bus method;
 // consumed by `mde-install`'s wipe sequence via subprocess.

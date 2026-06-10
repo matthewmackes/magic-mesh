@@ -53,6 +53,16 @@ pub fn revoke_peer(
         .unwrap_or_default()
         .as_millis() as i64;
 
+    // ENT-3 (C2) — capture the active certs' PEMs BEFORE marking, so
+    // the data-plane blocklist can carry their fingerprints.
+    let pems: Vec<String> = conn
+        .prepare("SELECT cert_pem FROM nebula_peer_certs WHERE node_id = ?1 AND revoked_at IS NULL")
+        .and_then(|mut st| {
+            st.query_map([node_id], |r| r.get::<_, String>(0))
+                .map(|rows| rows.filter_map(Result::ok).collect())
+        })
+        .unwrap_or_default();
+
     let rows = conn
         .execute(
             "UPDATE nebula_peer_certs SET revoked_at = ?1 \
@@ -63,6 +73,36 @@ pub fn revoke_peer(
 
     crate::ca::ban_list::add_banned(workgroup_root, self_node_id, node_id)
         .map_err(|e| anyhow::anyhow!("revoke: ban-list write failed: {e}"))?;
+
+    // ENT-3 (C2) — evict the DATA PLANE, not just the books: record
+    // the revoked certs' Nebula fingerprints on the replicated
+    // blocklist; every peer's supervisor folds them into
+    // `pki.blocklist` + reloads nebula. Failure here is LOUD — a
+    // revoke that doesn't evict is a standing security hole.
+    let fingerprints: Vec<String> = pems
+        .iter()
+        .filter_map(|pem| crate::ca::blocklist::fingerprint_cert_pem(pem))
+        .collect();
+    if fingerprints.len() < pems.len() {
+        tracing::error!(
+            target: "mackesd::ca",
+            node_id = %node_id,
+            certs = pems.len(),
+            fingerprinted = fingerprints.len(),
+            "ENT-3: could not fingerprint every revoked cert (nebula-cert missing?) — \
+             the data plane may keep trusting this node until cert expiry",
+        );
+    }
+    if !fingerprints.is_empty() {
+        if let Err(e) = crate::ca::blocklist::record_revoked(workgroup_root, node_id, &fingerprints)
+        {
+            tracing::error!(
+                target: "mackesd::ca",
+                node_id = %node_id, error = %e,
+                "ENT-3: blocklist write failed — data-plane eviction NOT recorded",
+            );
+        }
+    }
 
     publish_revoke_event(node_id);
 

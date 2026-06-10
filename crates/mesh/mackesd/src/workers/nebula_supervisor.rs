@@ -64,6 +64,10 @@ pub struct NebulaSupervisor {
     tick_interval: Duration,
     /// Cached bundle mtime so a change triggers a re-write.
     last_bundle_mtime: Option<SystemTime>,
+    /// ENT-3 — the replicated root carrying ca/blocklist.
+    workgroup_root: PathBuf,
+    /// ENT-3 — last-applied blocklist union (change triggers reload).
+    last_blocklist: Vec<String>,
     /// Last-known leader state — flipping this triggers the
     /// promote / demote transition.
     last_is_leader: bool,
@@ -81,6 +85,9 @@ impl NebulaSupervisor {
         mesh_id: String,
         bundle_path: PathBuf,
     ) -> Self {
+        // ENT-3 — the blocklist union lives on the replicated root;
+        // derive it once (override via with_workgroup_root in tests).
+        let workgroup_root = crate::default_qnm_shared_root();
         Self {
             store,
             node_id,
@@ -92,7 +99,16 @@ impl NebulaSupervisor {
             tick_interval: DEFAULT_TICK_INTERVAL,
             last_bundle_mtime: None,
             last_is_leader: false,
+            workgroup_root,
+            last_blocklist: Vec::new(),
         }
+    }
+
+    /// ENT-3 test seam — point the blocklist union at a scratch root.
+    #[must_use]
+    pub fn with_workgroup_root(mut self, root: PathBuf) -> Self {
+        self.workgroup_root = root;
+        self
     }
 
     /// Override the marker path — used by tests that can't
@@ -143,14 +159,18 @@ impl NebulaSupervisor {
             self.last_is_leader = is_leader_now;
         }
 
-        // 2. Watch the bundle file for changes.
+        // 2. Watch the bundle file + the revocation blocklist for
+        //    changes (ENT-3: a revoke anywhere must evict here).
+        let blocklist_now = crate::ca::blocklist::all_fingerprints(&self.workgroup_root);
+        let blocklist_changed = blocklist_now != self.last_blocklist;
         if let Ok(meta) = std::fs::metadata(&self.bundle_path) {
             if let Ok(mtime) = meta.modified() {
-                if self.last_bundle_mtime.map_or(true, |t| t != mtime) {
+                if self.last_bundle_mtime.map_or(true, |t| t != mtime) || blocklist_changed {
                     if let Err(e) = self.refresh_config().await {
                         tracing::warn!(error = %e, "nebula-supervisor: config refresh failed");
                     }
                     self.last_bundle_mtime = Some(mtime);
+                    self.last_blocklist = blocklist_now;
                 }
             }
         }
@@ -212,7 +232,9 @@ impl NebulaSupervisor {
         } else {
             ConfigRole::Peer
         };
-        materialize_config(&self.config_dir, &bundle, role)?;
+        // ENT-3 — the replicated revocation union rides every render.
+        let blocklist = crate::ca::blocklist::all_fingerprints(&self.workgroup_root);
+        materialize_config(&self.config_dir, &bundle, role, &blocklist)?;
         // GF-1.3.a — publish the overlay IP so downstream
         // services (notably mackes-glusterd-nebula-bind in
         // GF-1.3.b) can rewrite their bind config without
@@ -277,6 +299,7 @@ pub fn materialize_config(
     config_dir: &Path,
     bundle: &crate::ca::bundle::NebulaBundle,
     role: ConfigRole,
+    blocklist: &[String],
 ) -> Result<(), String> {
     std::fs::create_dir_all(config_dir)
         .map_err(|e| format!("mkdir {}: {e}", config_dir.display()))?;
@@ -287,7 +310,7 @@ pub fn materialize_config(
         bundle.peer_cert_pem.as_bytes(),
     )?;
     write_atomic(&config_dir.join("host.key"), bundle.peer_key_pem.as_bytes())?;
-    let yaml = render_config_yaml(bundle, role);
+    let yaml = render_config_yaml_with_blocklist(bundle, role, blocklist);
     write_atomic(&config_dir.join("config.yaml"), yaml.as_bytes())?;
     if role == ConfigRole::Host {
         let lh_yaml = render_lighthouse_config_yaml(bundle);
@@ -316,7 +339,18 @@ pub const VM_SUBNET_CIDR: &str = "10.42.128.0/17";
 /// Pulled out for testing without filesystem IO.
 #[must_use]
 pub fn render_config_yaml(bundle: &crate::ca::bundle::NebulaBundle, role: ConfigRole) -> String {
-    render_config_yaml_inner(bundle, role, true)
+    render_config_yaml_inner(bundle, role, true, &[])
+}
+
+/// ENT-3 — as [`render_config_yaml`] with the revocation blocklist
+/// folded into `pki.blocklist`.
+#[must_use]
+pub fn render_config_yaml_with_blocklist(
+    bundle: &crate::ca::bundle::NebulaBundle,
+    role: ConfigRole,
+    blocklist: &[String],
+) -> String {
+    render_config_yaml_inner(bundle, role, true, blocklist)
 }
 
 /// VIRT-6 (v5.0.0) — render a **guest VM's** Nebula config. Identical
@@ -334,13 +368,14 @@ pub fn render_config_yaml(bundle: &crate::ca::bundle::NebulaBundle, role: Config
 /// (from the cert_authority reply).
 #[must_use]
 pub fn render_guest_config_yaml(bundle: &crate::ca::bundle::NebulaBundle) -> String {
-    render_config_yaml_inner(bundle, ConfigRole::Peer, false)
+    render_config_yaml_inner(bundle, ConfigRole::Peer, false, &[])
 }
 
 fn render_config_yaml_inner(
     bundle: &crate::ca::bundle::NebulaBundle,
     role: ConfigRole,
     include_vm_route: bool,
+    blocklist: &[String],
 ) -> String {
     let mut out = String::new();
     out.push_str("# Generated by mackesd nebula-supervisor (NF-3.4)\n");
@@ -349,7 +384,19 @@ fn render_config_yaml_inner(
     out.push_str("pki:\n");
     out.push_str("  ca: /etc/nebula/ca.crt\n");
     out.push_str("  cert: /etc/nebula/host.crt\n");
-    out.push_str("  key: /etc/nebula/host.key\n\n");
+    out.push_str("  key: /etc/nebula/host.key\n");
+    // ENT-3 (C2) — revoked-cert fingerprints: nebula refuses tunnels
+    // with these certs immediately, fleet-wide, instead of trusting
+    // them until expiry.
+    if blocklist.is_empty() {
+        out.push('\n');
+    } else {
+        out.push_str("  blocklist:\n");
+        for fp in blocklist {
+            out.push_str(&format!("    - \"{fp}\"\n"));
+        }
+        out.push('\n');
+    }
     out.push_str("static_host_map:\n");
     for lh in &bundle.lighthouses {
         out.push_str(&format!(
@@ -534,7 +581,7 @@ mod tests {
     #[test]
     fn materialize_writes_four_files_for_peer() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        materialize_config(tmp.path(), &sample_bundle(), ConfigRole::Peer).expect("write");
+        materialize_config(tmp.path(), &sample_bundle(), ConfigRole::Peer, &[]).expect("write");
         assert!(tmp.path().join("ca.crt").exists());
         assert!(tmp.path().join("host.crt").exists());
         assert!(tmp.path().join("host.key").exists());
@@ -545,7 +592,7 @@ mod tests {
     #[test]
     fn materialize_writes_lighthouse_config_for_host() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        materialize_config(tmp.path(), &sample_bundle(), ConfigRole::Host).expect("write");
+        materialize_config(tmp.path(), &sample_bundle(), ConfigRole::Host, &[]).expect("write");
         assert!(tmp.path().join("lighthouse-config.yaml").exists());
     }
 
