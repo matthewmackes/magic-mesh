@@ -285,4 +285,20 @@ mod tests {
         assert_eq!(parse_fingerprint_json(&raw).as_deref(), Some(FP_A));
         assert!(parse_fingerprint_json("junk").is_none());
     }
+
+    #[test]
+    fn fingerprint_json_parses_real_nebula_cert_1_9_output() {
+        // ENT-3 verified against the real binary: this is verbatim
+        // `nebula-cert print -json` from nebula 1.9.7 on a Fedora 42
+        // VM (the mesh test bed). Locks the wire shape so a nebula
+        // upgrade that moves the field is caught here, not in prod.
+        let real = r#"{"details":{"curve":"CURVE25519","groups":[],"ips":["10.42.0.2/16"],"isCa":false,"issuer":"74a7736f35a00f55600a3c35f5974d7677f29216d639216693d9d48be79eec98","name":"pine","notAfter":"2027-06-10T13:18:18Z","notBefore":"2026-06-10T13:18:19Z","publicKey":"ba3416abbc426713473fcd0e712a2b77fa1f88e060e5a9a4b03056ab792f7273","subnets":[]},"fingerprint":"ac130a6002d11b21a83e12408615f81d06643f911ada972c24f3aaaaaaaaaaaa"}"#;
+        let fp = parse_fingerprint_json(real).expect("real nebula-cert json parses");
+        assert_eq!(
+            fp.len(),
+            64,
+            "the real fingerprint is 64-hex (blocklist-valid)"
+        );
+        assert!(fp.starts_with("ac130a60"));
+    }
 }
