@@ -68,6 +68,12 @@ pub enum Message {
         host: String,
         ok: bool,
     },
+    /// PD-9 — "Apply now": nudge a behind peer to reconcile.
+    NudgeClicked(String),
+    NudgeFinished {
+        host: String,
+        ok: bool,
+    },
 }
 
 /// Parse the PD-1 directory JSON into rows (pure, testable).
@@ -267,6 +273,38 @@ impl PeersPanel {
                     },
                 )
             }
+            Message::NudgeClicked(host) => {
+                self.op_result = format!("nudging {host} to reconcile…");
+                let h = host.clone();
+                Task::perform(
+                    async move {
+                        let body = format!(r#"{{"peer":"{h}"}}"#);
+                        let ok = tokio::task::spawn_blocking(move || {
+                            crate::dbus::action_request_with_body(
+                                "action/fleet/nudge",
+                                Some(&body),
+                                Duration::from_secs(2),
+                            )
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                        .map(|v| v["ok"] == true)
+                        .unwrap_or(false);
+                        (h, ok)
+                    },
+                    |(host, ok)| crate::Message::Peers(Message::NudgeFinished { host, ok }),
+                )
+            }
+            Message::NudgeFinished { host, ok } => {
+                self.op_result = if ok {
+                    format!("{host}: nudged — it reconciles within ~10 s")
+                } else {
+                    format!("{host}: nudge failed (mackesd unreachable?)")
+                };
+                Task::none()
+            }
             Message::OpFinished { label, host, ok } => {
                 self.op_result = if ok {
                     format!("{label} {host}: launched")
@@ -444,6 +482,19 @@ impl PeersPanel {
                         .color(palette.text_muted.into_iced_color())
                         .into()
                 };
+                // PD-9 — Apply now appears only for a behind peer (Q16).
+                let nudge: Element<'_, crate::Message> = if r.currency == "behind" {
+                    crate::controls::variant_button(
+                        "Apply now",
+                        crate::controls::ButtonVariant::Primary,
+                        Some(crate::Message::Peers(Message::NudgeClicked(
+                            r.hostname.clone(),
+                        ))),
+                        palette,
+                    )
+                } else {
+                    Space::new().height(Length::Fixed(0.0)).into()
+                };
                 let facts = column![
                     fact("Presence", &r.presence, palette),
                     fact("Health", &r.health, palette),
@@ -466,6 +517,7 @@ impl PeersPanel {
                         palette
                     ),
                     fact("Revision", &r.currency, palette),
+                    nudge,
                 ]
                 .spacing(4);
                 let mut services = column![text("Services provided")
@@ -655,6 +707,21 @@ mod tests {
         assert!(!op_enabled(pine, pine.ssh, "pine"), "no SSH-to-self");
         let oak = &rows[1]; // offline
         assert!(!op_enabled(oak, true, "elsewhere"), "offline disables ops");
+    }
+
+    #[test]
+    fn nudge_results_land_in_the_strip() {
+        let mut p = PeersPanel::new();
+        let _ = p.update(Message::NudgeFinished {
+            host: "oak".into(),
+            ok: true,
+        });
+        assert!(p.op_result.contains("nudged"));
+        let _ = p.update(Message::NudgeFinished {
+            host: "oak".into(),
+            ok: false,
+        });
+        assert!(p.op_result.contains("failed"));
     }
 
     #[test]

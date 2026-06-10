@@ -217,7 +217,7 @@ host-local Ansible apply.
     - [ ] selecting an online peer renders moving sparklines within 2 s; offline peers degrade honestly
     - [ ] Metrics opens `http://<overlay-ip>:19999` in the browser
     - [ ] Netdata is reachable over the overlay but not the underlay (bind/firewall check)
-- [ ] **PD-9: PEERS — update nudge (show + converge)**
+- [✓] **PD-9: PEERS — update nudge (show + converge)** — done — nudge files on the replicated volume (consumed exactly once); NEW fleet_reconcile worker (rank 0) drives `magic-fleet reconcile` on a 15-min cadence + within ~10 s of a nudge (the missing FPG-8 engine-mount); action/fleet/nudge verb; Apply-now renders only when currency==behind (Q16)
   **As** an operator seeing a peer "behind N" on revision currency,
   **I want** an Apply-now button publishing a targeted reconcile nudge that hurries that peer's convergence to the existing baseline (never per-peer divergence),
   **so that** a lagging box is one click from converged (Q15/Q16; depends on FPG-4/FPG-5 — until then the field reads "unknown" honestly, no fake data).

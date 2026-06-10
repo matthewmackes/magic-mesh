@@ -3191,7 +3191,7 @@ fn run_serve(
     db_path: PathBuf,
 ) -> anyhow::Result<()> {
     use mackesd_core::workers::{
-        firewall_preset::FirewallPresetWorker, heartbeat::HeartbeatWorker,
+        firewall_preset::FirewallPresetWorker, fleet_reconcile, heartbeat::HeartbeatWorker,
         mdns_relay::MdnsRelayWorker, mesh_router::MeshRouterWorker, ssh_pubkey_gossip,
         sshd_overlay_bind::SshdOverlayBindWorker, voice_config::VoiceConfigWorker, RestartPolicy,
         Spawn, Supervisor,
@@ -3412,6 +3412,18 @@ fn run_serve(
         // ed25519 pubkey into <root>/ssh-keys/ and merge every peer's
         // published key into ~/.ssh/authorized_keys (managed block,
         // write-on-change). LizardFS replication is the transport.
+        // PD-9 / FPG — the reconcile driver: magic-fleet reconcile on a
+        // 15-min cadence + immediately on this host's nudge file.
+        if mackesd_core::worker_role::runs("fleet_reconcile", role_rank) {
+            sup.spawn(Spawn::new(
+                fleet_reconcile::FleetReconcileWorker::new(
+                    workgroup_root.clone(),
+                    node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names.lock().expect("worker_names mutex").push("fleet_reconcile".into());
+        }
         if mackesd_core::worker_role::runs("ssh_pubkey_gossip", role_rank) {
             sup.spawn(Spawn::new(
                 ssh_pubkey_gossip::SshPubkeyGossipWorker::new(

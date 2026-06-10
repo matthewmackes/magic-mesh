@@ -166,6 +166,45 @@ pub fn read_acks(workgroup_root: &Path, version: u64) -> Vec<ApplyAck> {
     out
 }
 
+// ── PD-9: reconcile nudges ──────────────────────────────────────────
+//
+// "Apply now" writes `<root>/fleet/nudges/<hostname>`; replication
+// carries it to the target, whose reconcile worker consumes the file
+// and converges immediately instead of waiting out its cadence. The
+// nudge only hurries convergence to the existing elected head — it
+// can never fork per-peer state (Q16).
+
+/// The nudges directory.
+#[must_use]
+pub fn nudges_dir(workgroup_root: &Path) -> PathBuf {
+    workgroup_root.join("fleet").join("nudges")
+}
+
+/// Write a nudge for `hostname` (idempotent — re-nudging while one
+/// is pending is a no-op).
+///
+/// # Errors
+/// IO failures.
+pub fn write_nudge(workgroup_root: &Path, hostname: &str) -> io::Result<PathBuf> {
+    let dir = nudges_dir(workgroup_root);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(hostname);
+    std::fs::write(
+        &path,
+        b"reconcile
+",
+    )?;
+    Ok(path)
+}
+
+/// Consume this host's pending nudge — `true` exactly once per nudge
+/// (the file is removed).
+#[must_use]
+pub fn take_nudge(workgroup_root: &Path, hostname: &str) -> bool {
+    let path = nudges_dir(workgroup_root).join(hostname);
+    std::fs::remove_file(path).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +309,16 @@ mod tests {
         let again = read_acks(tmp.path(), 3);
         assert_eq!(again.len(), 2);
         assert_eq!(again[0].status, "applied");
+    }
+
+    #[test]
+    fn nudges_are_consumed_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!take_nudge(tmp.path(), "pine"), "no nudge yet");
+        write_nudge(tmp.path(), "pine").unwrap();
+        write_nudge(tmp.path(), "pine").unwrap(); // idempotent re-nudge
+        assert!(take_nudge(tmp.path(), "pine"), "consumed");
+        assert!(!take_nudge(tmp.path(), "pine"), "exactly once");
     }
 
     #[test]

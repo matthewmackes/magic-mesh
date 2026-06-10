@@ -112,11 +112,12 @@ fn err(msg: impl std::fmt::Display) -> String {
 }
 
 /// Action verbs served on `action/fleet/<verb>` (E0.3.3).
-pub const ACTION_VERBS: [&str; 4] = [
+pub const ACTION_VERBS: [&str; 5] = [
     "push-revision",
     "list-revisions",
     "diff-revisions",
     "rollback",
+    "nudge",
 ];
 
 /// Responder poll interval.
@@ -220,6 +221,19 @@ pub fn build_reply(svc: &FleetService, verb: &str, body: Option<&str>) -> String
                 Err(e) => err(format!("rollback: {e}")),
             }
         }
+        "nudge" => {
+            // PD-9 — "Apply now": write the target's nudge file on the
+            // replicated volume; its reconcile worker consumes it and
+            // converges to the elected head immediately (Q16 — hurries
+            // convergence, never forks state).
+            let Some(peer) = req.get("peer").and_then(|v| v.as_str()) else {
+                return err("nudge: missing `peer`");
+            };
+            match magic_fleet::store::write_nudge(&svc.workgroup_root, peer) {
+                Ok(_) => json!({ "ok": true, "nudged": peer }).to_string(),
+                Err(e) => err(format!("nudge: {e}")),
+            }
+        }
         other => err(format!("unknown fleet verb: {other}")),
     }
 }
@@ -316,7 +330,8 @@ mod tests {
                 "push-revision",
                 "list-revisions",
                 "diff-revisions",
-                "rollback"
+                "rollback",
+                "nudge"
             ]
         );
         assert_eq!(
@@ -418,6 +433,16 @@ mod tests {
             serde_json::from_str(&build_reply(&svc, "list-revisions", None)).unwrap();
         assert_eq!(list["revisions"][0]["acks"]["applied"], 1);
         assert_eq!(list["revisions"][0]["acks"]["failed"], 0);
+    }
+
+    #[test]
+    fn nudge_writes_the_targets_nudge_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = svc_in(tmp.path());
+        let r: serde_json::Value =
+            serde_json::from_str(&build_reply(&svc, "nudge", Some(r#"{"peer":"oak"}"#))).unwrap();
+        assert_eq!(r["ok"], true);
+        assert!(magic_fleet::store::take_nudge(tmp.path(), "oak"));
     }
 
     #[test]
