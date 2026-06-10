@@ -316,10 +316,11 @@ mod tests {
     #[test]
     fn fleet_role_card_links_match_the_e6_5_acceptance() {
         // E6.5 acceptance #1: the Fleet role card surfaces action-links
-        // to Inventory / Playbooks / Run-History / Settings / Revisions.
-        // Locks the Fleet role's task set to the acceptance (each panel
-        // is wired in app.rs::panel_body, so each link opens its
-        // backend, not the not-ready empty-state).
+        // to Inventory / Playbooks / Run-History / Settings / Revisions,
+        // plus the PLANES-5 Hardware (replicated PeerProbe) view. Locks
+        // the Fleet role's task set (each panel is wired in
+        // app.rs::panel_body, so each link opens its backend, not the
+        // not-ready empty-state).
         let slugs: Vec<&str> = role_action_panels(Group::Fleet)
             .iter()
             .map(Panel::slug)
@@ -328,6 +329,7 @@ mod tests {
             slugs,
             vec![
                 "inventory",
+                "hardware",
                 "playbooks",
                 "run_history",
                 "settings",

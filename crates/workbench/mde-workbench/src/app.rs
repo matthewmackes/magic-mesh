@@ -22,9 +22,10 @@ use crate::panels::{
     connect as connect_panel, datetime as datetime_panel, default_apps as default_apps_panel,
     displays as displays_panel, drift as drift_panel, firewall as firewall_panel,
     fleet_revisions as fleet_revisions_panel, fleet_settings as fleet_settings_panel,
-    fonts as fonts_panel, health_check as health_check_panel, help_index as help_index_panel,
-    home as home_panel, hub as hub_panel, inventory as inventory_panel, keyboard as keyboard_panel,
-    logs as logs_panel, mesh_bus as mesh_bus_panel, mesh_control as mesh_control_panel,
+    fonts as fonts_panel, hardware as hardware_panel, health_check as health_check_panel,
+    help_index as help_index_panel, home as home_panel, hub as hub_panel,
+    inventory as inventory_panel, keyboard as keyboard_panel, logs as logs_panel,
+    mesh_bus as mesh_bus_panel, mesh_control as mesh_control_panel,
     mesh_federation as mesh_federation_panel, mesh_history as mesh_history_panel,
     mesh_join as mesh_join_panel, mesh_pending as mesh_pending_panel,
     mesh_services as mesh_services_panel, mesh_storage as mesh_storage_panel,
@@ -143,6 +144,8 @@ pub enum Message {
     PrintersRefresh,
     /// CB-1.5.a — Fleet inventory panel sub-message.
     Inventory(inventory_panel::Message),
+    /// PLANES-5 — hardware inventory (replicated PeerProbe) sub-message.
+    Hardware(hardware_panel::Message),
     /// CB-1.5.b — Fleet playbooks panel sub-message.
     Playbooks(playbooks_panel::Message),
     /// CB-1.5.c — Fleet run-history panel sub-message.
@@ -248,6 +251,7 @@ pub struct App {
     /// v4.0.1 WB-2.c — Help group root topics list.
     help: help_index_panel::HelpIndexPanel,
     inventory: inventory_panel::InventoryPanel,
+    hardware: hardware_panel::HardwarePanel,
     playbooks: playbooks_panel::PlaybooksPanel,
     run_history: run_history_panel::RunHistoryPanel,
     datetime: datetime_panel::DateTimePanel,
@@ -352,6 +356,7 @@ impl App {
             hub: hub_panel::HubPanel::new(),
             help: help_index_panel::HelpIndexPanel::new(),
             inventory: inventory_panel::InventoryPanel::new(),
+            hardware: hardware_panel::HardwarePanel::new(),
             playbooks: playbooks_panel::PlaybooksPanel::new(),
             run_history: run_history_panel::RunHistoryPanel::new(),
             datetime: datetime_panel::DateTimePanel::new(),
@@ -787,6 +792,7 @@ impl App {
             Message::Music(msg) => self.music.update(msg),
             Message::PrintersRefresh => printers_panel::PrintersPanel::load(),
             Message::Inventory(msg) => self.inventory.update(msg),
+            Message::Hardware(msg) => self.hardware.update(msg),
             Message::Playbooks(msg) => self.playbooks.update(msg),
             Message::RunHistory(msg) => self.run_history.update(msg),
             Message::DateTime(msg) => self.datetime.update(msg),
@@ -869,6 +875,7 @@ impl App {
             // Task::none today.
             (Group::Devices, "connect") => connect_panel::ConnectPanel::load(),
             (Group::Fleet, "inventory") => inventory_panel::InventoryPanel::load(),
+            (Group::Fleet, "hardware") => hardware_panel::HardwarePanel::load(),
             (Group::Fleet, "playbooks") => playbooks_panel::PlaybooksPanel::load(),
             (Group::Fleet, "run_history") => run_history_panel::RunHistoryPanel::load(),
             (Group::System, "datetime") => datetime_panel::DateTimePanel::load(),
@@ -1122,6 +1129,10 @@ impl App {
                 group: Group::Fleet,
                 panel: "inventory",
             } => self.inventory.view(),
+            View::Panel {
+                group: Group::Fleet,
+                panel: "hardware",
+            } => self.hardware.view(),
             View::Panel {
                 group: Group::Fleet,
                 panel: "playbooks",

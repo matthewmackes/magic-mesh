@@ -19,6 +19,7 @@ pub mod firewall;
 pub mod fleet_revisions;
 pub mod fleet_settings;
 pub mod fonts;
+pub mod hardware;
 pub mod health_check;
 pub mod help_index;
 pub mod home;

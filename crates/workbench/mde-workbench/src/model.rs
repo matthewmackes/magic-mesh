@@ -241,6 +241,9 @@ pub fn nav_model() -> Vec<NavEntry> {
             group: Group::Fleet,
             panels: vec![
                 Panel::new("inventory", "Inventory"),
+                // PLANES-5 — replicated PeerProbe hardware view
+                // (PCI/USB/kernel/power/descriptors), no new collectors.
+                Panel::new("hardware", "Hardware"),
                 Panel::new("playbooks", "Playbooks"),
                 Panel::new("run_history", "Run History"),
                 Panel::new("settings", "Settings"),
