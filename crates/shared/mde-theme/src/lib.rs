@@ -45,6 +45,7 @@ pub mod color;
 pub mod components;
 pub mod density;
 pub mod elevation;
+pub mod hero;
 pub mod icons;
 pub mod motion;
 pub mod palette;
