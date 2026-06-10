@@ -118,6 +118,7 @@ pub mod lifecycle;
 pub mod mesh_init;
 pub mod node_key;
 pub mod policy_engine;
+pub mod remediation;
 #[cfg(feature = "async-services")]
 pub mod stun;
 pub mod telemetry;
