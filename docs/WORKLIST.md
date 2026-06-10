@@ -137,8 +137,8 @@ host-local Ansible apply.
 - [ ] **OBS-2: multi-process convergence harness** — N real `mackesd` binaries over one QNM root assert newest-wins + single leader (Q91).
 - [ ] **OBS-3: GitHub Actions CI** — hosted runners; the §7 gates (build/test/clippy/fmt + boundary/Carbon/Nebula lints) + a hard 80% line-coverage floor (Q90/93).
 - [ ] **OBS-4: screenshot-artifact visual regression** — a scripted `/preview` capture posting screenshots as CI artifacts for human review (Q92).
-- [ ] **OBS-5: mesh-replicated structured logging** — each peer writes a structured log into QNM-Shared; any peer can read any peer's recent trace (Q94).
-- [ ] **OBS-6: Mesh Health Workbench panel** — union the per-peer reachability + alert signals (no central metrics aggregation; Netdata stays local, Q95/96).
+- [→] **OBS-5: mesh-replicated structured logging** — **RE-HOMED → PLANES-14** (W96, planes re-IA); spec text lives in the PLANES task + `docs/design/planes.md`.
+- [→] **OBS-6: Mesh Health Workbench panel** — **RE-HOMED → PLANES-20** (W96, planes re-IA); spec text lives in the PLANES task + `docs/design/planes.md`.
 - [ ] **OBS-7: upgrade-transition alerts** — `alert_relay` emits each upgrade-state transition as a desktop alert (Q97).
 - [ ] **OBS-8: alerts via the cosmic-applet** — deliver through the mde-bus → cosmic-applet FDO Notifications path instead of `notify-send` (Q100).
 
@@ -259,6 +259,59 @@ host-local Ansible apply.
 
 > Cross-refs: ENT-13 closes inside PD-6 · SVC-1's Remote Access panel consumes PD-5's launcher · OBS-6's health signals source from PD-2's Netdata-alarm summary · Call gating depends on SVC-4 (voice presence) · PD-9 depends on FPG-4/5 · PD-13 rides OBS-7/8 · L9 lifecycle verb is descriptor-gated (see design-doc level-2 risks).
 
+## PLANES — the five-plane Workbench console (design: `docs/design/planes.md`, 2026-06-09)
+
+> 100-Q survey (W1–W100) + hero round (H1–H10) + D-W1 (mesh tooling first, Red Hat second).
+> Governance: new §9. **Order (W93): IA → This Node → Controller → Network → Fleet → Provisioning.**
+> **Gates: starts after the PEERS epic (W100); FPG is a hard prerequisite for Controller/Network (W94);
+> Provisioning waits on PKG core (W64).** Engines = mackesd workers @ Server rank (W90/W91); per-plane
+> Bus prefixes (W89); all state = LizardFS + typed verbs, GUIs are renderers, CLI parity (W88/W27).
+
+### IA + foundations
+
+- [ ] **PLANES-1: the nav re-IA** — five plane sections (short labels: This Node · Controller · Network · Fleet · Provisioning), Peers Front Door above, Desktop group below (W5/W6/W10); full tree day-one with guided empty states naming their worklist item (W16); clean-break deep-link ids (W11); folds: Mesh Services→Node/Health, Drift→Controller/Remediation, Fleet Revisions→Controller/Config, Playbooks→Controller/Jobs, Mesh Control→Controller own entry (W12/W13/W8/W40/W52); Peers = Controller/Inventory dual-door (W7).
+- [ ] **PLANES-2: hero images** — line-art originals (H2/H5) for Ansible/LizardFS/Nebula/Fedora/Netdata/Podman/libvirt/Cosmic/systemd/Remmina/PipeWire/rustls/VPN (H1); mde-theme compiled `Hero` enum + `hero_stroke` token w/ palette tests (H6/H7); header band right, 96–128px (H3/H4); NAME + live version caption (H8); hover stack card (H9); always renders, honest "not installed" (H10).
+- [ ] **PLANES-3: capability-tags substrate** — hop/execution/headless in PeerRecord + `mackesd tag` verb; any enrolled surface edits, audit-logged (W82/W83); **tags GATE**: job acceptance needs execution, relay/exit config needs hop, headless flips GUI-unit systemd presets (W84/W85). Lands before any gate flips.
+
+### This Node (W9: always the local box; W27: every panel = a mackesd verb)
+
+- [ ] **PLANES-4: Registration panel** — full cert lifecycle (enroll/re-enroll/leave) + invite-token minting in-panel (W17/W18); fingerprint hex + word-pair (W25); tags view (W26). Absorbs **ENT-4** (`mesh init` lighthouse bootstrap) + **ENT-5** (unified `leave`) as the CLI/daemon side.
+- [ ] **PLANES-5: Inventory panel** — the replicated PeerProbe rendered (PCI/USB/kernel/power/descriptors), no new collectors (W19).
+- [ ] **PLANES-6: Health panel** — ENT-7 doctor checks live + re-run, folded service start/stop controls, local Netdata alarm list (W20); mackesd self-restart via systemd with honest reconnect (W24). Absorbs **ENT-7**.
+- [ ] **PLANES-7: Config-apply panel** — applied vs newest revision, last Ansible log, Reconcile-now (W22); RPM version + repo source + update-now via typed job (W28).
+- [ ] **PLANES-8: Logs/metrics panel** — journald mesh-unit view with `--since` (the ENT-9 verb rendered) + Netdata strip/deep-link (W23). Absorbs **ENT-9**.
+
+### Controller (FPG prerequisite, W94)
+
+- [ ] **PLANES-9: the jobs engine** — job = playbook ref + vars + targets (W29); signed bundles, target runs locally, **no push-SSH, no raw shell** (W21/W32); LizardFS `jobs/{templates,runs}` (W33); fleet-parallel serial-per-node (W34); leader-fired schedules (W35); Run-once (W37); failure-only alerts (W39).
+- [ ] **PLANES-10: Job templates panel** — form + read-only YAML (W38), schedule field (W30), tag/role/peer targeting (W31), history runs→targets→output (W36). Playbooks panel absorbed (W40).
+- [ ] **PLANES-11: Remediation panel** — drift-type→template map w/ event var bindings, drift list + matched plan + fire (W41); per-plan auto flag default-off, auto fires loud (W42). Drift panel folds in (W13).
+- [ ] **PLANES-12: Audit** — hash-chained events: security + jobs/remediation + config/policy + lifecycle ops (W43); timeline viewer + verify-chain (W44); **72 h rolling retention** (W45, operator lock). Absorbs **ENT-14**.
+- [ ] **PLANES-13: Policy engine** — TOML declarative assertions over replicated data (W46/W47); eval on-change + hourly leader sweep (W48); **violation = drift event** (W49); core pack ships enabled (W50); report default / enforce = opt-in auto-plan (W51).
+- [ ] **PLANES-14: Fleet logs search** — Controller-side search over the OBS-5 mesh-replicated structured logs (W15). Absorbs **OBS-5**.
+
+### Network
+
+- [ ] **PLANES-15: netstate engine + panel** — full nmstate via NetworkManager (W65/W66), state in the BaselineSpec (W67), desired-vs-actual diff UI (W68); **all-at-once apply + post-apply self-test auto-revert** (must re-reach lighthouse + one peer or checkpoint reverts; ships in the SAME task as apply — W77/W78).
+- [ ] **PLANES-16: firewall policy** — firewalld zones in the baseline; **overlay = trusted zone**, underlay per-role tight (W69/W70); revocation stays Nebula-blocklist-only (W71).
+- [ ] **PLANES-17: VPN/tunnels + gateways** — Nebula topology (lighthouses/relays/punchy/unsafe_routes) as fleet state; external VPN client profiles (never transport, §1); **hop nodes: subnet advertise + full exit nodes** (W72/W73); exit path covered by validation before the toggle ships.
+- [ ] **PLANES-18: mesh DNS** — mackesd → systemd-resolved per-link, `<host>.mesh`, no server (W74/W75); routing display-only otherwise (W76).
+- [ ] **PLANES-19: validation suite** — overlay reachability fleet test (W79), post-apply + nightly leader job + Run-now, failures → drift (W80). Absorbs **ENT-10**.
+
+### Fleet
+
+- [ ] **PLANES-20: Fleet rollup dashboard** — groups by role + tag, cards = members online / worst health / drift (W86), live map centerpiece, drill-down selects into Peers (W81/W87); `mackesd fleet status` CLI parity. Absorbs **OBS-6** + **ENT-8**.
+
+### Provisioning (after PKG core, W64)
+
+- [ ] **PLANES-21: install profiles** — role + tags + ks fragments + join-token slot, TOML form-edited (W56); **boot-menu profile choice** on one image (W57); **auto-join firstboot** via single-use bearer (W60); USB/ISO only, PXE deferred (W59).
+- [ ] **PLANES-22: images** — ISO+ks, VM golden, container images, USB writer (W53); builds = jobs on execution-tagged nodes (W54, builder tag deferred per W82); versioned dirs + TOML manifests on LizardFS (W55).
+- [ ] **PLANES-23: Node roles panel** — fleet view of role pins + the tag editor (W58, the W26 edit surface), linked to install profiles.
+- [ ] **PLANES-24: mirrors** — magic-mesh COPR mirror dir on LizardFS (W61); **every node serves itself via `file://` baseurl** + upstream fallback (W62); sync = scheduled one-puller job (W63).
+
+> Out of scope (W99): multi-mesh federation · cloud nodes · non-Fedora agents · multi-tenancy.
+> CI: standard gates + OBS-2 convergence tests for fleet-state engines (W97).
+
 ## ENTERPRISE — operability + security-enforcement gaps (from the enterprise-readiness verification)
 
 > Source: `docs/design/enterprise-readiness.md` (verdict: **prototype with enterprise direction**).
@@ -279,17 +332,17 @@ host-local Ansible apply.
 - [ ] **ENT-1: enforce the enrollment bearer (CRITICAL — security)** — `sign_pending_csr` (`nebula_enroll.rs:571`) + `nebula_csr_watcher` sign any well-formed CSR and **never check the bearer/passcode** against an issued list, though the docs claim they do. Maintain an issued-but-unredeemed allow-list (single-use bearers); refuse a CSR whose bearer isn't pending-issued. **Acceptance:** an enroll with a wrong/replayed/absent bearer is refused (test); a valid single-use bearer signs once then can't be reused.
 - [ ] **ENT-2: pin `role.toml` at provision + fail-closed when unpinned (CRITICAL)** — `mde_role::pin_at` is lib-only; nothing writes `/var/lib/mde/role.toml`, so every box runs unpinned→Workstation. Add `mackesd role pin <role>` (= PKG-4), have the installer/chooser call it, and **change `resolve_rank()` so an unpinned box REFUSES to start its worker pool** (C3, fail closed) instead of defaulting to Workstation. **Acceptance:** a Server install gates to rank-1 workers; an unpinned box refuses to start with a clear "pin a role" error; downgrade refused.
 - [ ] **ENT-3: revocation evicts the data plane (CRITICAL — security)** — `ca revoke` only marks the DB + ban list + a bus event; the Nebula data plane keeps trusting the cert until expiry. Push a Nebula `pki.blocklist` (or equivalent) to running nebula + reload on revoke. **Acceptance:** a revoked node can no longer reach any peer within N seconds (integration test).
-- [ ] **ENT-4: `mackesd mesh init`** — one-command Lighthouse bootstrap: mint CA + self-sign the lighthouse peer cert + overlay IP + pin role Lighthouse + start nebula + print a join token. **Acceptance:** on a clean box, one command yields a working CA-signing lighthouse + a token a peer enrolls with.
-- [ ] **ENT-5: unify `mackesd leave` / decommission** — today `decommission` (DB soft-delete) and `ca revoke` (trust) are uncoordinated and neither tears down local state. One verb that revokes + bans + wipes local `/etc/nebula/`, keys, and role. **Acceptance:** after `leave`, the node holds no valid cert and is gone from the roster; re-enroll is a clean fresh join.
+- [→] **ENT-4: `mackesd mesh init`** — **RE-HOMED → PLANES-4** (W96, planes re-IA); spec text lives in the PLANES task + `docs/design/planes.md`.
+- [→] **ENT-5: unify `mackesd leave` / decommission** — **RE-HOMED → PLANES-4** (W96, planes re-IA); spec text lives in the PLANES task + `docs/design/planes.md`.
 - [ ] **ENT-6: `mackesd.service` + supervisor hardening** — no systemd unit means nothing restarts mackesd on crash; the worker supervisor is a 250 ms fixed-retry stub (`workers/mod.rs:430`, no max-restarts/circuit-breaker). Ship the unit (Restart=on-failure) (= PKG-3) + bounded exponential back-off + circuit-breaker + max-restarts. **Acceptance:** `kill -9 mackesd` → restarted ≤ N s; a hot-looping worker trips the breaker instead of spinning at 250 ms forever.
-- [ ] **ENT-7: `mackesd doctor`** — a unified self-test (identity present, role pinned, nebula up, peers reachable, storage mounted, services healthy) with clear pass/fail per check. **Acceptance:** `mackesd doctor` on a healthy node exits 0 with all-green; a broken node names the failed check.
-- [ ] **ENT-8: `mackesd fleet status`** — a whole-fleet view any node can produce (peers + versions + leader + health), not just per-peer. **Acceptance:** on any node, prints every peer Online/Offline with version + the elected leader.
-- [ ] **ENT-9: `mackesd logs` + fix the GUI Logs panel** — no `logs` verb; the workbench Logs panel reads dead desktop paths (`mackes-shell`/sway). Add `mackesd logs [--since]` over journald/tracing and point the panel at mackesd's output. **Acceptance:** `mackesd logs --since 1h` returns current structured logs; the GUI panel shows them.
-- [ ] **ENT-10: `mackesd test connectivity`** — a peer-to-peer connectivity self-test (overlay reachability per peer), distinct from the scattered LAN probes. **Acceptance:** prints reachable/unreachable per peer over the overlay.
+- [→] **ENT-7: `mackesd doctor`** — **RE-HOMED → PLANES-6** (W96, planes re-IA); spec text lives in the PLANES task + `docs/design/planes.md`.
+- [→] **ENT-8: `mackesd fleet status`** — **RE-HOMED → PLANES-20** (W96, planes re-IA); spec text lives in the PLANES task + `docs/design/planes.md`.
+- [→] **ENT-9: `mackesd logs` + fix the GUI Logs panel** — **RE-HOMED → PLANES-8** (W96, planes re-IA); spec text lives in the PLANES task + `docs/design/planes.md`.
+- [→] **ENT-10: `mackesd test connectivity`** — **RE-HOMED → PLANES-19** (W96, planes re-IA); spec text lives in the PLANES task + `docs/design/planes.md`.
 - [ ] **ENT-11: backup passphrase hardening (C8)** — move `MDE_BACKUP_PASSPHRASE` off the systemd env into systemd-creds (TPM/host-bound); keep the single QNM-Shared copy carried by LizardFS replication (no off-mesh export required per C8). **Acceptance:** the passphrase is not visible via `systemctl show` / `/proc`; backup + `state-restore` still work end-to-end.
 - [ ] **ENT-12: operator + end-user documentation + positioning (C7, C9)** — install guide, per-node-type setup guide, troubleshooting guide, and a DR runbook (the code points at a missing `docs/help/mesh-recovery.md`). **Document the open-mesh blast radius** as an accepted ≤8-peer trade-off (C7). Rewrite `DISCLAIMER.md`: "Mackes Workstation" → Magic Mesh, and reposition from "not for production" to **production workgroup-grade (≤8 peers)** with a stated supported envelope (C9). **Acceptance:** a new admin provisions all 3 node types + recovers a dead lighthouse using only the docs; the disclaimer + a SUPPORT.md state the production envelope.
 - [ ] **ENT-13: replace the `mesh_latency` ping placeholder** — `mesh_latency.rs:10` shells `ping` as an admitted placeholder pending the transport handshake. Use the real transport RTT probe. **Acceptance:** latency reflects the overlay path, not ICMP.
-- [ ] **ENT-14: security-event audit (C10)** — enroll/sign/revoke/rotate go to `tracing` only; append them to the hash-chained `events` table and wire the KDC `.also_log` no-op (`dispatch.rs:116`). **Acceptance:** `mackesd events list` shows enroll/sign/revoke records; `audit-verify` covers them.
+- [→] **ENT-14: security-event audit (C10)** — **RE-HOMED → PLANES-12** (W96, planes re-IA); spec text lives in the PLANES task + `docs/design/planes.md`.
 - [ ] **ENT-15: `meshctl` operator facade (C4)** — a thin friendly binary over mackesd/magic-fleet exposing the lifecycle gestures as one learnable tool: `install`, `status`, `doctor` (ENT-7), `mesh init` (ENT-4), `provision`/`join` (= enroll), `fleet status` (ENT-8), `test connectivity` (ENT-10), `logs` (ENT-9), `repair` (= heal/reconcile), `leave`/`decommission` (ENT-5). The named subcommands ENT-4/5/7/8/9/10 land here (or as mackesd verbs `meshctl` wraps). **Acceptance:** every §8 verification command in the enterprise-readiness doc runs as shown; `meshctl --help` lists them.
 
 ---

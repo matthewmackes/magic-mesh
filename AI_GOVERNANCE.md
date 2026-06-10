@@ -101,6 +101,33 @@ refs, no mockups/`demo_data` passing as features. Builds clean, tests green, cli
   **unpinned node fails closed** (refuses to start) rather than defaulting to Workstation; security
   events are **hash-chain audited**. (Corrective decisions C1–C3, C10.)
 
+## §9 — The five planes (2026-06-09, PLANES survey W1–W100)
+
+The Workbench's mesh IA is **five planes**: **This Node** (host agent) · **Controller**
+(jobs, remediation, audit, policy) · **Network** · **Fleet** (rollups) ·
+**Provisioning** — with the **Peers directory as the Front Door** above them and
+desktop-personal panels grouped below. Locks (full table: `docs/design/planes.md`):
+
+- **No RBAC — access to the mesh IS the control plane.** A valid mesh cert is the
+  authorization; the desktop is the operator (extends §8's flat-trust envelope). (W1)
+- **3 roles + capability tags.** §5's roles stay the install-time identity;
+  **hop / execution / headless** are orthogonal, **gating** tags — untagged duty is
+  refused. (W2/W82/W84)
+- **The Controller is a plane, not a place.** No-fixed-center holds: control state
+  lives on LizardFS, any node hosts the surfaces, the elected leader only
+  coordinates (schedules, sweeps). (W3)
+- **Remote execution is typed verbs + signed job bundles only — no raw shell
+  channel, ever.** Jobs are Ansible playbooks the *target* runs locally; no
+  push-SSH. (W21/W32)
+- **One state doctrine:** every plane's durable state = TOML/YAML dirs on LizardFS +
+  typed `mackesd` Bus verbs; GUIs are renderers; every surface has CLI parity. (W88/W27)
+- **Mesh tooling first, Red Hat best practices second** (standing directive D-W1):
+  FPG/Bus/LizardFS/Nebula before new components; Ansible/nmstate/firewalld/
+  kickstart/createrepo where the mesh has no native tool. Greenfield — no legacy
+  carried.
+- **Hero images:** sections backed by an external project carry a Carbon-compliant
+  line-art hero (original homages, `mde-theme`-compiled, `hero_stroke` token). (H1–H10)
+
 ---
 
 *Heritage: the pre-pivot identity lives in the archived
