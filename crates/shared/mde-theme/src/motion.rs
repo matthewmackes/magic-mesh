@@ -55,10 +55,15 @@ impl Easing {
 /// micro-interactions (button press, toggle), **moderate** for standard state
 /// changes + expansions, **slow** for large / expressive movement. (E9.5.)
 pub const DURATION_FAST_01: Duration = Duration::from_millis(70);
+/// Carbon `$duration-fast-02` — 110 ms (micro-interactions).
 pub const DURATION_FAST_02: Duration = Duration::from_millis(110);
+/// Carbon `$duration-moderate-01` — 150 ms (standard state changes).
 pub const DURATION_MODERATE_01: Duration = Duration::from_millis(150);
+/// Carbon `$duration-moderate-02` — 240 ms (expansions / reveals).
 pub const DURATION_MODERATE_02: Duration = Duration::from_millis(240);
+/// Carbon `$duration-slow-01` — 400 ms (large movement).
 pub const DURATION_SLOW_01: Duration = Duration::from_millis(400);
+/// Carbon `$duration-slow-02` — 700 ms (expressive movement).
 pub const DURATION_SLOW_02: Duration = Duration::from_millis(700);
 
 /// IBM Carbon v11 motion **easing** curves as cubic-bézier control points
@@ -66,7 +71,9 @@ pub const DURATION_SLOW_02: Duration = Duration::from_millis(700);
 /// state changes that start + end on screen, `entrance` for elements appearing,
 /// `exit` for elements leaving. (E9.5.)
 pub const EASING_STANDARD: (f32, f32, f32, f32) = (0.2, 0.0, 0.38, 0.9);
+/// Carbon productive `entrance` curve — elements appearing on screen.
 pub const EASING_ENTRANCE: (f32, f32, f32, f32) = (0.0, 0.0, 0.38, 0.9);
+/// Carbon productive `exit` curve — elements leaving the screen.
 pub const EASING_EXIT: (f32, f32, f32, f32) = (0.2, 0.0, 1.0, 0.9);
 
 /// A single motion spec — duration + easing + optional

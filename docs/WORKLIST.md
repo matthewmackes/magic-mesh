@@ -100,13 +100,13 @@ host-local Ansible apply.
 - [ ] **GUI-1: add Gray 90 theme** — `Theme::Gray90` + `Palette::gray_90()`, the full 3-theme set §4 names (Q35).
 - [ ] **GUI-2: live theme switching** — thread the resolved `Palette` through `App` state so a theme change repaints live (Q36).
 - [ ] **GUI-3: Carbon Themes-panel rewrite** — offer exactly Gray 10/90/100 via the mde-theme pref store; drop the retired presets + gsettings shell-out (Q37).
-- [ ] **GUI-4: remove dead `mde-card` surfaces** — delete `migration`, `RenderMode`, `TemplateSpec`+`CardKind::Template` (Q38–40). *(resolves H3.)*
-- [ ] **GUI-5: remove dead `mde-iced-components` widgets** — delete `motion`, `skeleton_shimmer`, `toast_chip`, `elevation_container`, `icon_fill_morph` (Q41–45). *(resolves H4.)*
+- [✓] **GUI-4: remove dead `mde-card` surfaces** — done — migration mod + RenderMode + TemplateSpec + CardKind::Template (sway-era) deleted; SCHEMA_VERSION relocated to schema.rs (live wire field); delete `migration`, `RenderMode`, `TemplateSpec`+`CardKind::Template` (Q38–40). *(resolves H3.)*
+- [✓] **GUI-5: remove dead `mde-iced-components` widgets** — done — 457 lines cut; motion slimmed to a private 2-fn module (context_menu_surface deps); crate warning-free; delete `motion`, `skeleton_shimmer`, `toast_chip`, `elevation_container`, `icon_fill_morph` (Q41–45). *(resolves H4.)*
 - [ ] **GUI-6: build `mde-cosmic-applet`** — a libcosmic applet subscribing to `mde-bus`: health pip + quick actions (join/leave, DnD, transfers) + deep links into Workbench (Q46/47).
 - [ ] **GUI-7: maximize-Cosmic-native cutover** — notifications via Cosmic's daemon, mde-files chrome reskinned to libcosmic, panel hosted by Cosmic (Q43/51).
 - [ ] **GUI-8: density boot-apply** — read `theme.density` at boot and apply app-wide (Q50).
 - [ ] **GUI-9: reduced-motion from Cosmic** — source the reduce-motion flag from Cosmic's a11y setting (Q49).
-- [ ] **GUI-10: refactor `palette.rs` onto the carbon ramp** — `dark()/light()` reference `carbon::*` so the ramp is the sole hex source (Q52). *(closes the H2 follow-up.)*
+- [>] **GUI-10: refactor `palette.rs` onto the carbon ramp** — `dark()/light()` reference `carbon::*` so the ramp is the sole hex source (Q52). *(closes the H2 follow-up.)*
 
 ## SERVICES — Remote Access, music, voice, files, KDC (resolves B1, H6)
 

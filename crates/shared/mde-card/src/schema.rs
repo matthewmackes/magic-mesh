@@ -7,14 +7,16 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::migration::SCHEMA_VERSION;
+/// Current card schema version, stamped at write time. (Moved here from
+/// the deleted `migration` module — GUI-4; the registry that consumed it
+/// was never reached, but the field is live wire format.)
+pub const SCHEMA_VERSION: u32 = 1;
 
 /// One Object in the universal card subsystem.
 ///
 /// Fields (count = 12):
 /// 1. `id`                 — stable mesh-merged identifier.
-/// 2. `schema_version`     — `SCHEMA_VERSION` at write time; consumers
-///    invoke [`crate::migrate`] when older.
+/// 2. `schema_version`     — [`SCHEMA_VERSION`] at write time.
 /// 3. `kind`               — discriminator (app / file / peer / …).
 /// 4. `title`              — primary user-visible label.
 /// 5. `subtitle`           — secondary label (optional).
@@ -34,7 +36,7 @@ pub struct Card {
     pub id: String,
 
     /// Schema version this card was written under. Default = current
-    /// crate version. Consumers run [`crate::migrate`] before reading.
+    /// crate version.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
 
@@ -61,7 +63,7 @@ pub struct Card {
     pub tags: Vec<String>,
 
     /// Free-form metadata bucket. Preserves any unknown fields written
-    /// by a newer mesh peer — the migration layer drains known fields
+    /// by a newer mesh peer — consumers drain known fields
     /// into typed places and leaves the rest here (R10-Q37).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, serde_json::Value>,
@@ -87,7 +89,7 @@ fn default_schema_version() -> u32 {
 ///
 /// Open-set with [`CardKind::Other`] so a newer peer can introduce a
 /// new kind without breaking older readers — the deserializer falls
-/// back into `Other(String)` and the migration layer either upgrades
+/// back into `Other(String)` so a newer kind round-trips losslessly; a consumer either upgrades
 /// or preserves the value (R10-Q37).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -120,32 +122,10 @@ pub enum CardKind {
     /// its nmap-identified product/version). Rendered as a child Card
     /// under its host. Probe facts live in `metadata`.
     Service,
-    /// Saved workspace template — an ordered set of app commands that
-    /// rebuild a workspace layout in one swaymsg call (SWAY-5 /
-    /// Portal-51). The launch payload lives in [`TemplateSpec`]; the
-    /// full template-store (ULID JSON, Hub "Save as template…" modal,
-    /// cascade-card render) is Portal-51's scope.
-    Template,
     /// Forward-compat — an unknown kind from a newer peer. Round-trips
     /// through serde so we never lose it.
     #[serde(untagged)]
     Other(String),
-}
-
-/// Launch payload for a [`CardKind::Template`] card — the minimal schema
-/// the swaymsg batch emitter serializes from (SWAY-5).
-///
-/// A template targets one sway workspace number and launches an ordered
-/// list of app commands into it. The full template-store (ULID-named
-/// JSON under `~/.local/share/mde/templates/`, the Hub "Save as
-/// template…" modal, the cascade-card render) is Portal-51; this struct
-/// is the apply-time contract the emitter consumes.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct TemplateSpec {
-    /// Sway workspace number the template's apps launch into.
-    pub workspace: i32,
-    /// Ordered app launch commands (each becomes a sway `exec`).
-    pub apps: Vec<String>,
 }
 
 impl CardKind {
@@ -165,7 +145,6 @@ impl CardKind {
             Self::Note => "note",
             Self::Host => "host",
             Self::Service => "service",
-            Self::Template => "template",
             Self::Other(s) => s.as_str(),
         }
     }
