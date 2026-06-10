@@ -140,6 +140,14 @@ enum Cmd {
     /// worker subset per plan §12). With no ROLE, prints all three tiers. This
     /// is the static counterpart to the live `worker_names` listing `serve`
     /// builds, so an operator/installer can preview a role before pinning it.
+    /// ENT-2 / PKG-4 — pin this box's deployment role (upgrade-only;
+    /// a downgrade is refused). The installer/role-chooser calls this;
+    /// operators can upgrade a box in place.
+    RolePin {
+        /// `lighthouse` | `server` | `workstation`.
+        role: String,
+    },
+
     RoleWorkers {
         /// lighthouse | server | workstation (default: all three tiers).
         role: Option<String>,
@@ -1298,6 +1306,18 @@ fn main() -> anyhow::Result<()> {
             } else {
                 publish_link_rtt(&sample);
                 eprintln!("voip-rtt: published to {}", rtt_topic(&peer));
+            }
+        }
+        Cmd::RolePin { role } => {
+            let parsed: mde_role::Role = role.parse().map_err(|_| {
+                anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
+            })?;
+            match mde_role::pin(parsed) {
+                Ok(outcome) => {
+                    println!("role pinned: {outcome:?}");
+                    return Ok(());
+                }
+                Err(e) => anyhow::bail!("role pin refused: {e}"),
             }
         }
         Cmd::RoleWorkers { role } => {
@@ -3333,7 +3353,14 @@ fn run_serve(
         // idle gracefully without a display); malformed role.toml → Lighthouse
         // (fail closed). The resulting set is observable via `mackesd
         // role-workers` and the live worker-status listing.
-        let role_rank = mackesd_core::worker_role::resolve_rank();
+        // ENT-2 (C3) — fail closed: an unpinned box refuses to start.
+        let role_rank = match mackesd_core::worker_role::resolve_rank_strict() {
+            Ok(rank) => rank,
+            Err(msg) => {
+                eprintln!("mackesd serve: {msg}");
+                anyhow::bail!("worker pool refused to start: no pinned role (ENT-2)");
+            }
+        };
         tracing::info!(
             role_rank,
             "E1.2: spawning the role-permitted worker subset"

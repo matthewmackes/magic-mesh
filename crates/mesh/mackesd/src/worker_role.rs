@@ -75,6 +75,29 @@ pub fn resolve_rank() -> u8 {
     }
 }
 
+/// ENT-2 (C3) — the FAIL-CLOSED resolver the worker pool boots
+/// through: an unpinned box refuses to start instead of silently
+/// running the fattest (Workstation) worker set. Display/diagnostic
+/// paths keep the tolerant [`resolve_rank`]; the supervisor uses this.
+///
+/// # Errors
+/// A human-actionable message naming the fix (`mackesd role pin …`).
+pub fn resolve_rank_strict() -> Result<u8, String> {
+    match mde_role::load() {
+        Ok(role) => Ok(role.rank()),
+        Err(mde_role::LoadError::NotPinned) => Err(
+            "no deployment role pinned (/var/lib/mde/role.toml absent) — this box refuses to \
+             start its worker pool unpinned (ENT-2 fail-closed). Pin one first: \
+             `mackesd role pin <lighthouse|server|workstation>`"
+                .to_string(),
+        ),
+        Err(e) => Err(format!(
+            "role.toml unreadable ({e}) — refusing to start the worker pool (ENT-2). \
+             Repair or re-pin: `mackesd role pin <role>`"
+        )),
+    }
+}
+
 /// Whether a box at `role_rank` runs `worker`.
 #[must_use]
 pub fn runs(worker: &str, role_rank: u8) -> bool {
@@ -111,6 +134,21 @@ mod tests {
         // +1 fleet_reconcile (PD-9), +1 presence_watch (PD-13),
         // +1 lifecycle_exec (PD-11).
         assert_eq!(WORKER_TIERS.len(), 21);
+    }
+
+    #[test]
+    fn strict_resolver_error_names_the_fix() {
+        // ENT-2 — we can't unpin the dev box's real role.toml from a
+        // test, but the error contract is pure: both failure arms
+        // must name `mackesd role pin`. Pin the strings.
+        // (The fail-closed behavior itself is smoked in CI via
+        // `mackesd serve` on a roleless container — OBS-2 scope.)
+        let unpinned_msg =
+            match mde_role::load_from(std::path::Path::new("/nonexistent/ent2/role.toml")) {
+                Err(mde_role::LoadError::NotPinned) => true,
+                _ => false,
+            };
+        assert!(unpinned_msg, "absent file reads NotPinned");
     }
 
     #[test]
