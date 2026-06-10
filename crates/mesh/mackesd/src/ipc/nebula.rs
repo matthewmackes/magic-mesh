@@ -544,7 +544,7 @@ pub fn action_topic(verb: &str) -> String {
 ///
 /// Split out from [`poll_once`] so a unit test can drive it
 /// without a `Persist` round-trip.
-pub async fn build_reply(svc: &NebulaStatusService, verb: &str) -> String {
+pub async fn build_reply(svc: &NebulaStatusService, verb: &str, body: Option<&str>) -> String {
     match verb {
         "status" => match svc.build_status_snapshot().await {
             Ok(snap) => serde_json::to_string(&snap)
@@ -566,6 +566,19 @@ pub async fn build_reply(svc: &NebulaStatusService, verb: &str) -> String {
         // (`mesh_control::run_rotate_ca`) gets an unambiguous
         // success flag + a human string for its `last_op` banner.
         "regen-certs" => {
+            // SEC-2 — the rotation gate guards the Bus door too: the
+            // request body must carry the operator passphrase.
+            let phrase = body
+                .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                .and_then(|v| {
+                    v.get("passphrase")
+                        .and_then(|p| p.as_str().map(str::to_string))
+                })
+                .unwrap_or_default();
+            let check = crate::ca::rotation_gate::verify(&svc.workgroup_root, &phrase);
+            if let Some(msg) = crate::ca::rotation_gate::refusal_message(check) {
+                return json!({ "ok": false, "message": msg }).to_string();
+            }
             let (ok, message) = match svc.regen_certs_inner().await {
                 Ok(msg) => (true, msg),
                 Err(e) => (false, e),
@@ -662,7 +675,7 @@ pub fn poll_once(
         };
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
-            let reply = rt.block_on(build_reply(svc, verb));
+            let reply = rt.block_on(build_reply(svc, verb, msg.body.as_deref()));
             if let Err(e) = persist.write(
                 &reply_topic(&msg.ulid),
                 Priority::Default,
@@ -883,6 +896,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn regen_certs_is_passphrase_gated_sec2() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let svc = NebulaStatusService::new(fresh_store(), "peer:local", "host")
+            .with_workgroup_root(tmp.path().to_path_buf());
+        // Unset gate → fail-closed refusal naming set-passphrase.
+        let r: serde_json::Value =
+            serde_json::from_str(&build_reply(&svc, "regen-certs", None).await).unwrap();
+        assert_eq!(r["ok"], false);
+        assert!(r["message"].as_str().unwrap().contains("set-passphrase"));
+        // Armed gate + wrong phrase → refusal.
+        crate::ca::rotation_gate::set_passphrase(tmp.path(), "correct horse").unwrap();
+        let r: serde_json::Value = serde_json::from_str(
+            &build_reply(&svc, "regen-certs", Some(r#"{"passphrase":"nope"}"#)).await,
+        )
+        .unwrap();
+        assert_eq!(r["ok"], false);
+        assert!(r["message"].as_str().unwrap().contains("wrong passphrase"));
+        // Right phrase → the gate opens (rotation itself then reports
+        // its own outcome — binary-missing hint on dev boxes).
+        let r: serde_json::Value = serde_json::from_str(
+            &build_reply(
+                &svc,
+                "regen-certs",
+                Some(r#"{"passphrase":"correct horse"}"#),
+            )
+            .await,
+        )
+        .unwrap();
+        let msg = r["message"].as_str().unwrap();
+        assert!(
+            msg.contains("nebula-cert not on PATH") || msg.contains("CA rotated"),
+            "gate must open on the right phrase: {msg}"
+        );
+    }
+
+    #[tokio::test]
     async fn regen_certs_handles_binary_missing_gracefully() {
         // On a dev box without `nebula-cert` installed (the
         // dominant case in CI / local dev), the rotation
@@ -985,7 +1034,7 @@ mod tests {
     async fn build_reply_unknown_verb_yields_error_envelope() {
         let svc = NebulaStatusService::new(fresh_store(), "peer:local", "host")
             .with_role_marker("/nonexistent/marker".into());
-        let body = build_reply(&svc, "frobnicate").await;
+        let body = build_reply(&svc, "frobnicate", None).await;
         let v: serde_json::Value = serde_json::from_str(&body).expect("json");
         assert!(v["error"].as_str().unwrap().contains("unknown nebula verb"));
     }

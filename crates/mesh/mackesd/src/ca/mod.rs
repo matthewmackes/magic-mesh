@@ -40,6 +40,7 @@ pub mod backup;
 // the CSR sign gate (nebula_enroll::sign_pending_csr).
 pub mod ban_list;
 pub mod blocklist;
+pub mod rotation_gate;
 // INST-7 prerequisite — peer cert revocation CLI (`mackesd ca
 // revoke <node-id>`). Replaces the originally-planned D-Bus method;
 // consumed by `mde-install`'s wipe sequence via subprocess.

@@ -861,11 +861,16 @@ enum CaCmd {
         /// Mesh id (defaults to `mesh-<hostname>`).
         #[arg(long, value_name = "MESH_ID")]
         mesh_id: Option<String>,
-        /// Cert lifetime in days for the re-signed peer
-        /// certs (default 365).
-        #[arg(long, default_value_t = 365)]
-        cert_lifetime_days: u32,
+        /// SEC-2 — read the operator passphrase from stdin instead
+        /// of $MDE_CA_PASSPHRASE.
+        #[arg(long)]
+        passphrase_stdin: bool,
     },
+
+    /// SEC-2 — set (or change) the CA-rotation passphrase. Reads the
+    /// new phrase from $MDE_CA_PASSPHRASE (changing additionally
+    /// requires the current one in $MDE_CA_PASSPHRASE_CURRENT).
+    SetPassphrase,
 
     /// Print one row per CA epoch — mesh_id, epoch,
     /// created_at, retired_at (or "active" when NULL).
@@ -2243,10 +2248,46 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+                CaCmd::SetPassphrase => {
+                    let root = mackesd_core::default_qnm_shared_root();
+                    let new = std::env::var("MDE_CA_PASSPHRASE").map_err(|_| {
+                        anyhow::anyhow!("set-passphrase: export MDE_CA_PASSPHRASE first")
+                    })?;
+                    if new.len() < 8 {
+                        anyhow::bail!("set-passphrase: at least 8 characters (SEC-2)");
+                    }
+                    use mackesd_core::ca::rotation_gate::{verify, GateCheck};
+                    if verify(&root, "") != GateCheck::NotSet {
+                        let current =
+                            std::env::var("MDE_CA_PASSPHRASE_CURRENT").unwrap_or_default();
+                        if verify(&root, &current) != GateCheck::Ok {
+                            anyhow::bail!(
+                                "set-passphrase: a gate exists — export the current phrase \
+                                 in MDE_CA_PASSPHRASE_CURRENT to change it"
+                            );
+                        }
+                    }
+                    mackesd_core::ca::rotation_gate::set_passphrase(&root, &new)?;
+                    println!("CA-rotation passphrase set (SEC-2 gate armed).");
+                    return Ok(());
+                }
                 CaCmd::Rotate {
                     mesh_id,
-                    cert_lifetime_days,
+                    passphrase_stdin,
                 } => {
+                    // SEC-2 — the gate, before any rotation work.
+                    let root = mackesd_core::default_qnm_shared_root();
+                    let phrase = if passphrase_stdin {
+                        let mut line = String::new();
+                        std::io::stdin().read_line(&mut line)?;
+                        line.trim_end_matches('\n').to_string()
+                    } else {
+                        std::env::var("MDE_CA_PASSPHRASE").unwrap_or_default()
+                    };
+                    let check = mackesd_core::ca::rotation_gate::verify(&root, &phrase);
+                    if let Some(msg) = mackesd_core::ca::rotation_gate::refusal_message(check) {
+                        anyhow::bail!("{msg}");
+                    }
                     let mesh = mesh_id.unwrap_or(default_mesh);
                     match mackesd_core::ca::epoch::bump_epoch(
                         &mackesd_core::ca::SubprocessBackend,
