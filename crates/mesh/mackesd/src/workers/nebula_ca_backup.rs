@@ -170,12 +170,36 @@ impl Worker for NebulaCaBackup {
 }
 
 impl NebulaCaBackup {
+    /// ENT-11 (C8) — read the backup passphrase, preferring
+    /// systemd-creds over the process environment.
+    ///
+    /// systemd hands `LoadCredentialEncrypted=` secrets in a tmpfs
+    /// dir named by `$CREDENTIALS_DIRECTORY`, one file per credential
+    /// — **not** visible in `systemctl show` or `/proc/<pid>/environ`.
+    /// We read `<creds>/backup-passphrase` first; the `MDE_BACKUP_
+    /// PASSPHRASE` env var stays a documented fallback for dev /
+    /// pre-creds boxes. Returns the trimmed phrase, or empty.
+    #[must_use]
+    pub fn read_passphrase(&self) -> String {
+        if let Some(dir) = std::env::var_os("CREDENTIALS_DIRECTORY") {
+            let path = std::path::Path::new(&dir).join("backup-passphrase");
+            if let Ok(p) = std::fs::read_to_string(&path) {
+                let p = p.trim().to_string();
+                if !p.is_empty() {
+                    return p;
+                }
+            }
+        }
+        std::env::var(&self.passphrase_env)
+            .map(|p| p.trim().to_string())
+            .unwrap_or_default()
+    }
+
     /// One backup pass. Pulled out for direct testing.
     pub async fn tick_once(&self) {
-        // Gate on env-var presence — operators opt in by
-        // exporting the passphrase.
-        let passphrase = match std::env::var(&self.passphrase_env) {
-            Ok(p) if !p.is_empty() => p,
+        // ENT-11 — systemd-creds first, env fallback (C8).
+        let passphrase = match self.read_passphrase() {
+            p if !p.is_empty() => p,
             _ => {
                 // SEC-7 (Q31/32) — on a box that actually HOLDS the
                 // CA (lighthouse duty), an unset backup passphrase is
@@ -186,10 +210,10 @@ impl NebulaCaBackup {
                 // Boxes without a CA key stay quiet (peer-role).
                 if self.ca_key_path.exists() {
                     tracing::error!(
-                        env_var = %self.passphrase_env,
-                        "SEC-7: this box holds the mesh CA but has no backup \
-                         passphrase — the CA is UNBACKED-UP. Export {} in the \
-                         mackesd unit and restart.",
+                        "SEC-7/ENT-11: this box holds the mesh CA but has no backup \
+                         passphrase — the CA is UNBACKED-UP. Provision the \
+                         systemd credential (LoadCredentialEncrypted=backup-passphrase) \
+                         or set {} for dev, then restart.",
                         self.passphrase_env,
                     );
                     emit_unbacked_ca_alert(&self.passphrase_env);
@@ -329,6 +353,41 @@ impl std::fmt::Display for BackupTickError {
             Self::Seal(s) => write!(f, "seal: {s}"),
             Self::Io(s) => write!(f, "io: {s}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod ent11_tests {
+    use super::*;
+
+    fn worker(env_var: &str) -> NebulaCaBackup {
+        NebulaCaBackup::new(
+            std::path::PathBuf::from("/tmp/ent11-root"),
+            "peer:test".into(),
+            "test-mesh".into(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(
+                rusqlite::Connection::open_in_memory().unwrap(),
+            )),
+        )
+        .with_passphrase_env(env_var.to_string())
+    }
+
+    #[test]
+    fn credentials_directory_beats_the_env_var() {
+        // ENT-11 — the systemd-creds file is preferred; the env var
+        // (visible in systemctl show / /proc) is only a fallback.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("backup-passphrase"), "from-creds\n").unwrap();
+        let env_name = "ENT11_TEST_PASS_A";
+        std::env::set_var("CREDENTIALS_DIRECTORY", tmp.path());
+        std::env::set_var(env_name, "from-env");
+        let w = worker(env_name);
+        assert_eq!(w.read_passphrase(), "from-creds");
+        std::env::remove_var("CREDENTIALS_DIRECTORY");
+        // With no creds dir, the env var is the fallback.
+        assert_eq!(w.read_passphrase(), "from-env");
+        std::env::remove_var(env_name);
+        assert_eq!(w.read_passphrase(), "");
     }
 }
 

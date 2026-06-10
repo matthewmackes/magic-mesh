@@ -14,6 +14,14 @@ Restart=on-failure
 RestartSec=3
 # ENT-6 acceptance: kill -9 -> restarted within seconds.
 TimeoutStopSec=20
+# ENT-11 (C8) — the CA-backup passphrase is delivered as a
+# systemd-encrypted credential (TPM/host-bound where available), NOT
+# an Environment= var: it is invisible to `systemctl show` and
+# /proc/<pid>/environ. mackesd reads it from
+# $CREDENTIALS_DIRECTORY/backup-passphrase. Provision once with:
+#   systemd-creds encrypt --name=backup-passphrase - \
+#     /etc/mackesd/backup-passphrase.cred  < phrase.txt
+LoadCredentialEncrypted=backup-passphrase:/etc/mackesd/backup-passphrase.cred
 # Hardening (the daemon manages /var/lib/mackesd + the mesh mount).
 NoNewPrivileges=true
 
