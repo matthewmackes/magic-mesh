@@ -80,6 +80,55 @@ are clean; the new findings are below.
 - **Reachability:** `mde-bus` (cli/correlate/dnd/retention/audit all wired + a real binary), `mackes-nebula-https-tunnel` (wired into `nebula_https_listener`), `magic-fleet` (real CLI engine), and all `mde-music`/`mde-musicd`/`mde-voice-hud` modules are reached. MPRIS is fully built (its "not yet built" note is narrowly about engine-driven auto-advance; Seek/SetPosition/Quit no-ops are dbus-trait-forced).
 - `mde-kdc-proto/src/dispatch.rs:116` `.also_log` — a *private* documented-inert hook, not a pub feature surface. Acceptable.
 
+## Sweep 3 (2026-06-09, later) — post-execution re-sweep
+
+A third pass after the sweep-1/2 execution work (H1/A1/A2/D1/H5/H2/F1–F3/G1/H7 landed). The big
+structural findings are confirmed resolved; what's new is **one half-wired feature, a dead-code
+cluster in `mde-voice-hud` (46 compiler warnings — partly H2 residue), one fresh doc-drift site the
+earlier sweeps missed, and two spec-mandated MD5 uses** that sweep-2's "no MD5-for-security" line
+under-counted. One sweep-1 "checked clean" line was re-verified and **stands** (demo_data); one
+agent-pass claim against it was a false positive.
+
+| # | Location | Category | Evidence | Conf. | Verdict |
+|---|----------|----------|----------|:---:|:---:|
+| **I1** | `mde-voice-hud/src/recents.rs:65` (`load()`, `RECENTS_LIMIT:23`) | Half-wired feature §7 | `record_incoming()` IS called on every incoming call (`main.rs:213`) — call history is **written to disk** — but `load()` has **zero production callers** (only its own `#[test]`). History recorded that no surface ever displays. **Operator decision (2026-06-09): REMOVE** — recent calls are documented via the system notification (the `notify-send` at `main.rs:210` already covers it), not a stored list. Delete `recents.rs` + the recording call. | High | **REMOVE** |
+| **I2** | `mde-voice-hud/src/sip.rs:402` (`register_once`), `:412` (`try_register`), `:368` (`parse_granted_expires`) | Dead duplicate §7 | Superseded standalone-socket REGISTER path. The **live** path is the agent-shared-socket REGISTER (`sip.rs:1028`, kicked from `main.rs:742`, VOIP-28). Zero production callers for the old trio (compiler-confirmed). | High | **REMOVE** |
+| **I3** | `mde-voice-hud/src/theme.rs` (~27 consts + `tok_a:30`) | Dead code §7 (H2 residue) | Post-H2 (`35e7566`) leftovers: `SURF_DIM`, `PRIMARY_C`, `ACCEPT_C`, `ERROR_C`, `PRESENCE_*`, `HUD_W/H`, `R_XS…R_FULL`, `SCRIM_55`, etc. — all `dead_code`-warned. The crate carries **46 warnings** total. | High | **REMOVE** |
+| **I4** | `mde-voice-hud/src/roster.rs:79` (`RosterSource::label()`) | Dead pub fn §7 | Zero callers workspace-wide (`rg` + compiler warning agree). | High | **REMOVE** |
+| **I5** | `mackes-mesh-types/src/lib.rs:67,72` | Doc drift §1 | Peer-variant docs claim "Headscale-known machine" / "Mesh IP (Tailscale-assigned 100.x.x.x)". Fabric is **Nebula** (own CA, 10.42.x.x). Stated as *current*, not heritage — the F-band missed this file. | High | **FINISH** (fix docs) |
+| **I6** | `mde-musicd/src/airsonic.rs:40` | §3 crypto — spec-mandated MD5 | `md5::compute(password+salt)` builds the **Subsonic API auth token** — the upstream API spec's scheme, not our choice, but it *is* auth, so sweep-2's "no MD5/SHA1-for-security" was incomplete. | Med | **FINISH** (document a §3 interop exception; require TLS to the Airsonic server) |
+| **I7** | `mde-files/src/thumbnails.rs:73` | §3 crypto — non-security MD5 | `md5::compute(uri)` names the thumbnail cache file — **mandated by the freedesktop thumbnail spec** (interop, not crypto). | Low | **FINISH** (document the §3 exception alongside I6) |
+| **I8** | `mde-music/src/main.rs:247` (`Message::TransportDone(Result<…>)`) | Dead field | The inner `Result` is never read (compiler-confirmed). | Med | **REMOVE** (unit variant) |
+| **I9** | `mde-workbench/src/app.rs:215–217` (`Noop` doc) | Doc drift §7 (minor) | Comment says `Noop` is a "placeholder for buttons whose behaviour lands in later CB-1.x substeps" — but every live use is a *functional* fallback message (`app.rs:645` focus-drain default, `mesh_bus.rs:1071/1108/1276`). The code is fine; the comment describes a stub that no longer exists. | Med | **FINISH** (fix comment) |
+
+### Sweep-3 re-verified clean (no finding)
+
+- **`demo_data` / `DemoBackend`:** re-confirmed — every construction is `#[cfg(test)]`; sweep-1's clean
+  verdict stands. (An agent pass claimed a "production fallback when mackesd unreachable" — false
+  positive from the module doc's smoke-gate phrasing.)
+- **Album-art `from_rgb8`** (`mde-music/main.rs:1065`): still the legit dynamic-color exception from
+  sweep 2 — variables from cover extraction, not a literal. Not re-flagged.
+- **§2 D-Bus:** `org.mackes.*` names in `mackesd/ipc/mod.rs` are dead constants / doc tables, never
+  served (`request_name` → zero hits); only `org.freedesktop.Notifications` interop is live.
+- **§4 token tests:** `mde-theme` `carbon.rs:69–103` + `palette.rs:124–181` assert published Carbon
+  values — the §4 change-with-reference gate is in place.
+- **Boundary lint** clean; **DISCLAIMER.md** present (3.5 KB); **no `todo!()`/`unimplemented!()`**;
+  no live Gluster/Tailscale/OpenSSL deps.
+- **Soft notes (honest, documented simplifications — not flagged):** `mde-files/mime.rs:7` (common-
+  formats MIME table, full magic-db a follow-up), `mde-files/desktop.rs:9` (extension heuristics),
+  Connected-Devices D-Bus signal wiring deferred on KDC2-3.9 (tracked under the SEC epic).
+- **`mde-files/widgets.rs:755`** hairline-blue literal: already tracked in the WORKLIST P2 note for
+  the next mde-files pass — not double-counted.
+
+### Sweep-3 counts
+
+| Category | Findings | Verdict skew |
+|----------|:---:|---|
+| Half-wired feature (I1) | 1 | FINISH or REMOVE |
+| Dead code / dead pub surface (I2–I4, I8) | 4 *(~31 symbols)* | REMOVE |
+| Doc drift (I5, I9) | 2 | FINISH |
+| §3 spec-mandated MD5 (I6, I7) | 2 | FINISH (document exception) |
+
 ## Packaging reachability (§5) — not-yet-implemented
 
 No RPM spec / `generate-rpm` metadata exists in the repo yet (the one-RPM install-time role chooser,

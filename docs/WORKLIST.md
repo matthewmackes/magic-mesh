@@ -52,6 +52,15 @@ Ordered by priority — security lock first, then largest structural debt, then 
 - [✓] **G1 · vestigial `derp` field** — done (`d8d79f7`); dropped the field + render fragment. mde-files 271/0.
 - [→] **H8 · `SyntheticAnnounce`/`inject_synthetic` seam** — **SPECCED** (Q26–27) → **SEC-5**: BUILD the KDC2-4 mesh-shunt worker that consumes it (accept-any relayer; pinning is the gate).
 
+## P8 — Sweep-3 findings (2026-06-09, post-execution re-sweep)
+
+- [ ] **I1 · voice-hud recents → REMOVE (operator decision 2026-06-09)** — recent calls are documented as a **system notification, not a stored recents list**. The notification already exists (`main.rs:210–212` fires `notify-send "Incoming call"` on every incoming call), so: delete `recents.rs` wholesale (`record_incoming`/`load`/`RECENTS_LIMIT` + the on-disk history) and the `main.rs:213` call. While there: the notify-send app-name is the stale "Mackes Workstation Voice" and its comment cites the retired "mde's notifyd → Action Center" path — rename to Magic Mesh Voice / Cosmic's notification daemon. Acceptance: incoming call → desktop notification; no call history written anywhere.
+- [ ] **I2–I4 · voice-hud dead-code cluster (46 warnings)** — REMOVE: the superseded standalone-socket REGISTER trio (`sip.rs:368/402/412` — live path is the agent-socket REGISTER at `sip.rs:1028`), ~27 H2-residue `theme.rs` constants + `tok_a`, and `RosterSource::label()` (`roster.rs:79`). Acceptance: `cargo check -p mde-voice-hud` warning-free (minus I1's pieces if kept).
+- [ ] **I5 · mackes-mesh-types Tailscale doc-drift** — `lib.rs:67,72` claim "Headscale-known machine" / "Tailscale-assigned 100.x.x.x" as current; fabric is Nebula (10.42.x.x, own CA). FINISH (fix docs).
+- [ ] **I6+I7 · document the §3 MD5 interop exceptions** — `airsonic.rs:40` (Subsonic API auth-token scheme; require TLS to the server) + `thumbnails.rs:73` (freedesktop thumbnail-spec cache key, non-crypto). FINISH: add a short documented-exception note to `AI_GOVERNANCE.md` §3 so future sweeps don't re-litigate.
+- [ ] **I8 · `mde-music` `TransportDone(Result<…>)` dead field** — inner `Result` never read; REMOVE (unit variant).
+- [ ] **I9 · workbench `Noop` stale comment** — `app.rs:215–217` says "placeholder for buttons" but all live uses are functional fallbacks; FINISH (fix comment).
+
 ---
 
 # Platform epics (from the 100-question survey, 2026-06-09)
@@ -132,6 +141,91 @@ host-local Ansible apply.
 - [ ] **OBS-6: Mesh Health Workbench panel** — union the per-peer reachability + alert signals (no central metrics aggregation; Netdata stays local, Q95/96).
 - [ ] **OBS-7: upgrade-transition alerts** — `alert_relay` emits each upgrade-state transition as a desktop alert (Q97).
 - [ ] **OBS-8: alerts via the cosmic-applet** — deliver through the mde-bus → cosmic-applet FDO Notifications path instead of `notify-send` (Q100).
+
+## PEERS — Directory of Mesh Peers, the platform Front Door (design: `docs/design/peer-directory.md`, 2026-06-09)
+
+> 26-Q survey + 3 operator directives. The Peers directory is the **Front Door**: Workbench
+> lands on it; it shows everything the running mesh offers (peers, services: remote access /
+> Podman / KVM / media / voice) + an advanced health/design view (presence, sync, drift,
+> Netdata health, live path map → wallpaper). Evolves `mesh_topology`; retires the CR-6.c modal.
+
+- [ ] **PD-1: PEERS — the `action/mesh/directory` Bus verb + `mackesd peers` CLI**
+  **As** any directory consumer (GUI or CLI),
+  **I want** one mackesd Bus verb returning the joined per-peer record (hostname, overlay IP, role, machine-presence tier, voice presence, mde_version, revision currency, drift count + last event, Netdata-derived health, service descriptors),
+  **so that** every surface reads the same answer with zero GUI shell-outs (Q9/Q23).
+  **Acceptance:**
+    - [ ] `mde-bus call action/mesh/directory` returns all known peers incl. self, with every field above
+    - [ ] `mackesd peers` prints the same record set as a table
+    - [ ] presence tiers derive from `last_seen_ms` (Online ≤2 min, Idle ≤10 min, Offline) (Q11)
+- [ ] **PD-2: PEERS — peer-published service descriptors (remote access + Podman + KVM + media)**
+  **As** a peer's mackesd,
+  **I want** to locally probe sshd/xrdp/vnc listeners, `podman ps`, libvirt guests (+ run state), media daemons (mde-musicd…), and my Netdata alarm summary, publishing the result into my replicated PeerRecord/PeerProbe,
+  **so that** the directory knows what every peer offers without any remote probing (Q19/Q26c/D1).
+  **Acceptance:**
+    - [ ] starting/stopping sshd (or a container/VM) on a peer changes its descriptor set within one heartbeat cycle
+    - [ ] an active Netdata alarm flips that peer's health to degraded in the directory record
+    - [ ] no network probe leaves the publishing host
+- [ ] **PD-3: PEERS — the master-detail Peers panel (mesh_topology evolves)**
+  **As** an operator,
+  **I want** the topology panel reborn as "Peers": list left (self pinned "(this machine)" → Online → Offline grayed → Devices group from `action/connect/devices`), detail pane right (identity header + role badge, two presence fields, version + sync currency, drift count + last event → pre-filtered Drift panel link, Services Provided section, inline result strip), Bus-subscription refresh + 30 s poll floor,
+  **so that** the whole fleet and everything it offers is one surface (Q1–7, Q10–12, Q15, Q20–22, D1).
+  **Acceptance:**
+    - [ ] every known peer renders in the correct group; offline peers show ops disabled
+    - [ ] Podman containers, KVM guests (with state), and media services list per peer
+    - [ ] the CR-6.c graph modal is deleted; graph-node click selects the peer in the directory
+- [ ] **PD-4: PEERS — Front Door: Workbench lands on Peers**
+  **As** a user launching the Workbench,
+  **I want** Peers as the default landing panel and first nav entry,
+  **so that** the platform's front door shows what the mesh offers and its health (D2).
+  **Acceptance:**
+    - [ ] `mde-workbench` with no `--focus` opens Peers; nav lists Peers first; Overview remains reachable
+- [ ] **PD-5: PEERS — per-peer ops wiring (Call / SSH / RDP / VNC) via a shared launcher engine**
+  **As** an operator on a selected peer,
+  **I want** Call → `action/voice/dial {peer}` (HUD pops), SSH → cosmic-term `ssh <user>@<overlay-ip>`, RDP/VNC → remmina via a launcher module extracted from `remote_desktop.rs` and shared with the Remote Access panel; buttons gated by descriptors + presence (Call additionally by voice presence),
+  **so that** every reach-this-peer gesture is one click from the directory (Q8/Q17/Q18/Q19).
+  **Acceptance:**
+    - [ ] each op connects to the actual peer when offered; buttons absent/disabled when not
+    - [ ] Remote Access panel still works, now through the same launcher module (no duplicated launch code)
+    - [ ] launch failures land in the inline result strip (Carbon danger), not a silent no-op
+- [ ] **PD-6: PEERS — transport path probe (shared with ENT-13)**
+  **As** the directory and the live map,
+  **I want** a transport-layer probe verb returning RTT, direct-vs-lighthouse-relay, chosen underlay endpoint, and NAT class per peer — the same implementation that replaces the `mesh_latency.rs` ping placeholder,
+  **so that** one probe feeds the RTT figure, the trace card, and the map edges (Q13/Q14, ENT-13).
+  **Acceptance:**
+    - [ ] probing a relayed peer reports the relay path; a direct peer reports direct + endpoint
+    - [ ] `mesh_latency` no longer shells ICMP `ping` (ENT-13 closes here)
+- [ ] **PD-7: PEERS — the visual augmented traceroute + live map (graph view reborn)**
+  **As** an operator,
+  **I want** the GraphProgram canvas grown into the live mesh map — presence-styled nodes, edges weighted by probe RTT and styled direct/relay/unreachable, edge activity driven by per-host Netdata network telemetry; clicking an edge opens the augmented trace card (the merged Ping+Traceroute: path, RTT, NAT class, endpoints tried),
+  **so that** the health and design of the mesh is visible at a glance (Q13/Q14/Q24/Q26b).
+  **Acceptance:**
+    - [ ] map edges visibly distinguish direct / relay / unreachable with live RTT labels
+    - [ ] edge click renders the trace card with the overlay path report
+    - [ ] edge activity changes when real traffic flows between two peers (Netdata-sourced)
+- [ ] **PD-8: PEERS — Netdata in the detail pane (sparklines + deep-link)**
+  **As** an operator inspecting a peer,
+  **I want** live CPU/load/net/disk sparklines pulled from that peer's own Netdata REST API (:19999 over the overlay, bound to the overlay interface only) plus a Metrics button opening its full dashboard,
+  **so that** per-peer telemetry is one selection away with no central aggregation (Q26a/Q26d, Q95/96 held).
+  **Acceptance:**
+    - [ ] selecting an online peer renders moving sparklines within 2 s; offline peers degrade honestly
+    - [ ] Metrics opens `http://<overlay-ip>:19999` in the browser
+    - [ ] Netdata is reachable over the overlay but not the underlay (bind/firewall check)
+- [ ] **PD-9: PEERS — update nudge (show + converge)**
+  **As** an operator seeing a peer "behind N" on revision currency,
+  **I want** an Apply-now button publishing a targeted reconcile nudge that hurries that peer's convergence to the existing baseline (never per-peer divergence),
+  **so that** a lagging box is one click from converged (Q15/Q16; depends on FPG-4/FPG-5 — until then the field reads "unknown" honestly, no fake data).
+  **Acceptance:**
+    - [ ] a behind peer converges after the nudge; the badge flips to synced on the next ack
+    - [ ] the button is absent when synced/unknown
+- [ ] **PD-10: PEERS — the live-map Cosmic wallpaper**
+  **As** a user,
+  **I want** the live mesh map rendered as the Cosmic desktop background (a second output target of the same canvas scene), toggleable from the Wallpaper panel,
+  **so that** the mesh's living state is ambient on the desktop (Q25, in-epic). **Risk-first: prototype the layer-shell/cosmic-bg surface before building on it.**
+  **Acceptance:**
+    - [ ] enabling it shows the live map as the desktop background under Cosmic with peers/edges updating
+    - [ ] disabling restores the prior static wallpaper
+
+> Cross-refs: ENT-13 closes inside PD-6 · SVC-1's Remote Access panel consumes PD-5's launcher · OBS-6's health signals source from PD-2's Netdata-alarm summary · Call gating depends on SVC-4 (voice presence) · PD-9 depends on FPG-4/5.
 
 ## ENTERPRISE — operability + security-enforcement gaps (from the enterprise-readiness verification)
 
