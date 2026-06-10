@@ -28,6 +28,7 @@ pub mod health_check;
 pub mod help_index;
 pub mod home;
 pub mod hub;
+pub mod interfaces;
 pub mod inventory;
 pub mod jobs;
 pub mod json_helpers;
