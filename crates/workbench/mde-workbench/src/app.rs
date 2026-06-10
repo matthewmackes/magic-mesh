@@ -19,9 +19,9 @@ use crate::model::{resolve_panel_label, view_from_focus_slug, Group, View};
 use crate::panels::{
     apps_install as apps_install_panel, apps_installed as apps_installed_panel,
     apps_remove as apps_remove_panel, apps_sources as apps_sources_panel, audit as audit_panel,
-    compute as compute_panel, connect as connect_panel, datetime as datetime_panel,
-    default_apps as default_apps_panel, displays as displays_panel, drift as drift_panel,
-    firewall as firewall_panel, fleet_revisions as fleet_revisions_panel,
+    compute as compute_panel, config_apply as config_apply_panel, connect as connect_panel,
+    datetime as datetime_panel, default_apps as default_apps_panel, displays as displays_panel,
+    drift as drift_panel, firewall as firewall_panel, fleet_revisions as fleet_revisions_panel,
     fleet_settings as fleet_settings_panel, fonts as fonts_panel, hardware as hardware_panel,
     health_check as health_check_panel, help_index as help_index_panel, home as home_panel,
     hub as hub_panel, inventory as inventory_panel, jobs as jobs_panel, keyboard as keyboard_panel,
@@ -152,6 +152,8 @@ pub enum Message {
     Audit(audit_panel::Message),
     /// PLANES-8 — Mesh Logs panel (journald mesh-unit view) sub-message.
     MeshLogs(mesh_logs_panel::Message),
+    /// PLANES-7 — Config-apply panel (applied vs newest revision) sub-message.
+    ConfigApply(config_apply_panel::Message),
     /// CB-1.5.b — Fleet playbooks panel sub-message.
     Playbooks(playbooks_panel::Message),
     /// CB-1.5.c — Fleet run-history panel sub-message.
@@ -261,6 +263,7 @@ pub struct App {
     jobs: jobs_panel::JobsPanel,
     audit: audit_panel::AuditPanel,
     mesh_logs: mesh_logs_panel::MeshLogsPanel,
+    config_apply: config_apply_panel::ConfigApplyPanel,
     playbooks: playbooks_panel::PlaybooksPanel,
     run_history: run_history_panel::RunHistoryPanel,
     datetime: datetime_panel::DateTimePanel,
@@ -369,6 +372,7 @@ impl App {
             jobs: jobs_panel::JobsPanel::new(),
             audit: audit_panel::AuditPanel::new(),
             mesh_logs: mesh_logs_panel::MeshLogsPanel::new(),
+            config_apply: config_apply_panel::ConfigApplyPanel::new(),
             playbooks: playbooks_panel::PlaybooksPanel::new(),
             run_history: run_history_panel::RunHistoryPanel::new(),
             datetime: datetime_panel::DateTimePanel::new(),
@@ -808,6 +812,7 @@ impl App {
             Message::Jobs(msg) => self.jobs.update(msg),
             Message::Audit(msg) => self.audit.update(msg),
             Message::MeshLogs(msg) => self.mesh_logs.update(msg),
+            Message::ConfigApply(msg) => self.config_apply.update(msg),
             Message::Playbooks(msg) => self.playbooks.update(msg),
             Message::RunHistory(msg) => self.run_history.update(msg),
             Message::DateTime(msg) => self.datetime.update(msg),
@@ -892,6 +897,7 @@ impl App {
             (Group::Fleet, "inventory") => inventory_panel::InventoryPanel::load(),
             (Group::Fleet, "hardware") => hardware_panel::HardwarePanel::load(),
             (Group::Fleet, "jobs") => jobs_panel::JobsPanel::load(),
+            (Group::Fleet, "config_apply") => config_apply_panel::ConfigApplyPanel::load(),
             (Group::Fleet, "playbooks") => playbooks_panel::PlaybooksPanel::load(),
             (Group::Fleet, "run_history") => run_history_panel::RunHistoryPanel::load(),
             (Group::System, "datetime") => datetime_panel::DateTimePanel::load(),
@@ -1155,6 +1161,10 @@ impl App {
                 group: Group::Fleet,
                 panel: "jobs",
             } => self.jobs.view(),
+            View::Panel {
+                group: Group::Fleet,
+                panel: "config_apply",
+            } => self.config_apply.view(),
             View::Panel {
                 group: Group::Fleet,
                 panel: "playbooks",

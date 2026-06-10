@@ -331,6 +331,7 @@ mod tests {
                 "inventory",
                 "hardware",
                 "jobs",
+                "config_apply",
                 "playbooks",
                 "run_history",
                 "settings",

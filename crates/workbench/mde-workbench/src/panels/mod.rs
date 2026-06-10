@@ -11,6 +11,7 @@ pub mod apps_remove;
 pub mod apps_sources;
 pub mod audit;
 pub mod compute;
+pub mod config_apply;
 pub mod connect;
 pub mod datetime;
 pub mod default_apps;

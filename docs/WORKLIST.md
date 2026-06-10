@@ -278,7 +278,7 @@ host-local Ansible apply.
 - [ ] **PLANES-4: Registration panel** — full cert lifecycle (enroll/re-enroll/leave) + invite-token minting in-panel (W17/W18); fingerprint hex + word-pair (W25); tags view (W26). Absorbs **ENT-4** (`mesh init` lighthouse bootstrap) + **ENT-5** (unified `leave`) as the CLI/daemon side.
 - [✓] **PLANES-5: Inventory panel** — the replicated PeerProbe rendered (PCI/USB/kernel/power/descriptors), no new collectors (W19).
 - [>] **PLANES-6: Health panel** — ENT-7 doctor checks live + re-run, folded service start/stop controls, local Netdata alarm list (W20); mackesd self-restart via systemd with honest reconnect (W24). Absorbs **ENT-7**.
-- [ ] **PLANES-7: Config-apply panel** — applied vs newest revision, last Ansible log, Reconcile-now (W22); RPM version + repo source + update-now via typed job (W28).
+- [>] **PLANES-7: Config-apply panel** — applied vs newest revision, last Ansible log, Reconcile-now (W22); RPM version + repo source + update-now via typed job (W28).
 - [✓] **PLANES-8: Logs/metrics panel** — journald mesh-unit view with `--since` (the ENT-9 verb rendered) + Netdata strip/deep-link (W23). Absorbs **ENT-9**.
 
 ### Controller (FPG prerequisite, W94)

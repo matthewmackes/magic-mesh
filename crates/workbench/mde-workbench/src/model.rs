@@ -246,6 +246,8 @@ pub fn nav_model() -> Vec<NavEntry> {
                 Panel::new("hardware", "Hardware"),
                 // PLANES-10 — job templates + run history (absorbs Playbooks).
                 Panel::new("jobs", "Jobs"),
+                // PLANES-7 — applied vs newest revision + reconcile-now.
+                Panel::new("config_apply", "Config Apply"),
                 Panel::new("playbooks", "Playbooks"),
                 Panel::new("run_history", "Run History"),
                 Panel::new("settings", "Settings"),
