@@ -336,6 +336,10 @@ assets = [
     # Brand: the MCNF hicolor icon set + the DISCLAIMER the gate checks.
     { source = "assets/icons/hicolor/**/*",        dest = "/usr/share/icons/hicolor/",     mode = "644" },
     { source = "DISCLAIMER.md",                    dest = "/usr/share/magic-mesh/DISCLAIMER.md", mode = "644" },
+    { source = "SUPPORT.md",                       dest = "/usr/share/magic-mesh/SUPPORT.md", mode = "644" },
+    # ENT-12 — operator help docs; the Workbench Help panel + `mackesd
+    # state-restore` reference these at /usr/share/mde/help/.
+    { source = "docs/help/*.md",                   dest = "/usr/share/mde/help/", mode = "644" },
 ]
 # Runtime deps the platform shells to (D-W1 / §1-§5 substrate).
 [package.metadata.generate-rpm.requires]
