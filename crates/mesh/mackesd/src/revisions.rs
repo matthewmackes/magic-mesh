@@ -1,10 +1,13 @@
-//! Versioned revisions + diff (Phase 12.2.2).
+//! Fleet revision DISPLAY model — legacy `r-YYYY-MM-DD-NNNN` ids.
 //!
-//! Every desired-config write creates a new immutable revision row.
-//! The CLI surface (`mackesd revisions list / diff / rollback`)
-//! consumes the routines in this module. Today the in-memory model
-//! is in place; SQL persistence wires through `store.rs` once the
-//! reconcile loop lands.
+//! **FPG-1 (2026-06-09): retired to display-only.** The canonical
+//! fleet revision identity is `magic_fleet::Revision::version` — a
+//! monotonic `u64` minted via `magic_fleet::store::next_version` and
+//! logged append-only on the LizardFS workgroup root (FPG-2,
+//! `magic_fleet::store`). The date-string scheme here (and the SQLite
+//! rowid scheme in `fleet.rs`) survive only as human-facing display
+//! fields / per-node read-mirror keys; nothing elects or orders by
+//! them. New code reads + writes the `magic_fleet` model.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

@@ -75,8 +75,8 @@ Architecture: one unified `BaselineSpec` (YAML, monotonic `u64` version) written
 is both transport (replication) and the authoritative log; leaderless authoring, last-writer-wins,
 host-local Ansible apply.
 
-- [ ] **FPG-1: unify the revision model** — one `BaselineSpec` (OS state + folded-in settings, Q9), YAML wire format (Q2), `u64` version id (Q1); retire the rowid + date-string schemes to display fields.
-- [ ] **FPG-2: LizardFS revision log + store** — revisions written to LizardFS as the authoritative append-only log (Q3/Q8); replication is the transport; `mackesd` watches the path.
+- [✓] **FPG-1: unify the revision model** — done — BaselineSpec gains the Q9 settings domain (JSON-encoded values, mackesd-applied, playbook-skipped); canonical id = magic_fleet::Revision::version (u64); mackesd's r-date scheme + rowids documented display-only; one `BaselineSpec` (OS state + folded-in settings, Q9), YAML wire format (Q2), `u64` version id (Q1); retire the rowid + date-string schemes to display fields.
+- [✓] **FPG-2: LizardFS revision log + store** — done — magic_fleet::store: <root>/fleet/revisions/<v:020>.yaml append-only log, atomic writes, tolerant reads, next_version + elect_head; mackesd watch wiring lands with FPG-4; revisions written to LizardFS as the authoritative append-only log (Q3/Q8); replication is the transport; `mackesd` watches the path.
 - [ ] **FPG-3: leaderless election** — any node mints+gossips; highest `version` wins (Q4/Q5); the leader lock only guards the local SQLite mirror write.
 - [ ] **FPG-4: the Bus verbs** — implement `push`/`list`/`diff`/`rollback` (replace the `ipc/fleet.rs` stubs): rollback = mint a higher-version copy (Q6), flat top-level diff (Q7), `list` returns the full held set tagged with the winner (Q16).
 - [ ] **FPG-5: apply-ack + signals** — nodes gossip an apply-ack advancing the author's FSM to Verified (Q14); emit `event/fleet/signals` {revision_id, peer, status} + a Workbench subscription (Q15).

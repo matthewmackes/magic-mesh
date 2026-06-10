@@ -368,6 +368,14 @@ pub struct BaselineSpec {
     pub sysctl: Vec<SysctlReq>,
     /// Firewall (`firewalld`) rules to enable/disable (needs `ansible.posix`).
     pub firewall: Vec<FirewallReq>,
+    /// Desktop/mesh settings folded into the baseline (FPG-1 / Q9):
+    /// dot-notated `mackesd` setting keys (`theme.accent`,
+    /// `power.idle_min`, …) mapped to their **JSON-encoded** values —
+    /// the same encoding the settings table's `value_json` column
+    /// carries. NOT rendered into the Ansible playbook ([`to_playbook`]
+    /// skips it): `mackesd`'s reconcile loop applies settings natively;
+    /// Ansible owns only the OS-level domains above.
+    pub settings: std::collections::BTreeMap<String, String>,
 }
 
 impl BaselineSpec {
@@ -438,6 +446,10 @@ impl BaselineSpec {
                 })
                 .cloned()
                 .collect(),
+            // Settings carry no local-exception concept (FPG-1/Q9):
+            // they're mackesd-applied, not Ansible-applied; a node
+            // opts out per-key via its own settings scope instead.
+            settings: self.settings.clone(),
         }
     }
 }
@@ -853,6 +865,8 @@ fn latest_stats(root: &Path) -> Option<ApplyReport> {
         .filter_map(|e| std::fs::read_to_string(e.path()).ok())
         .find_map(|s| parse_stats(&s))
 }
+
+pub mod store;
 
 #[cfg(test)]
 mod tests {
