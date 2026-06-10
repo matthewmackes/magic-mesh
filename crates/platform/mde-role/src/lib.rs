@@ -103,8 +103,16 @@ impl FromStr for Role {
 }
 
 /// Canonical on-disk location of the pinned role.
+///
+/// Honors `MDE_ROLE_PATH` when set — so a test, a containerized
+/// `mackesd serve`, or a non-root tool can redirect the role file off the
+/// privileged `/var/lib/mde/` default without threading a path through
+/// every `load()`/`pin()` caller. Unset → the canonical system path.
 #[must_use]
 pub fn default_role_path() -> PathBuf {
+    if let Some(p) = std::env::var_os("MDE_ROLE_PATH") {
+        return PathBuf::from(p);
+    }
     PathBuf::from("/var/lib/mde/role.toml")
 }
 

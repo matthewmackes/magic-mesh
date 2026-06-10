@@ -140,6 +140,12 @@ mod tests {
     #[test]
     fn mesh_init_yields_a_signing_lighthouse_and_a_redeemable_token() {
         let tmp = tempfile::tempdir().unwrap();
+        // Hermetic role pin: redirect role.toml into the tempdir so the
+        // test never touches (or depends on) the privileged
+        // /var/lib/mde/role.toml — it ran green on a dev box that already
+        // had a pinned role but failed on a fresh CI runner that couldn't
+        // write the system path.
+        std::env::set_var("MDE_ROLE_PATH", tmp.path().join("role.toml"));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::store::migrate(&conn).unwrap();
         let ca_crt = tmp.path().join("ca.crt");
