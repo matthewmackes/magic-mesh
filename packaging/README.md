@@ -16,3 +16,9 @@ into the filesystem; the hicolor icon set lives in `../assets/icons/`.
   `ExecCondition=mackesd role-gate --min-rank 2` skips it cleanly on
   Servers/Lighthouses (SVC-7/Q70 — desktop services are Workstation
   surfaces; the voice-agent autostart carries the same gate inline)
+
+- `kickstart/`    → the Magic-on-Cosmic ISO kickstart (PKG-9) with the
+  install-time role-chooser `%post` (PKG-5); built with livemedia-creator.
+- `repo/`         → the signed-COPR `.repo` (PKG-8), shipped by the
+  `magic-mesh-release` RPM (gpgcheck on, COPR project key).
+- `ENROLLMENT.md` → the post-install enroll/mesh-init steps (PKG-10).

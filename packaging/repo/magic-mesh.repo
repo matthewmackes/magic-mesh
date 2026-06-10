@@ -1,0 +1,13 @@
+# PKG-8 — the signed Magic Mesh COPR. Shipped by the
+# `magic-mesh-release` RPM; COPR builds per-project GPG-sign every
+# package, so gpgcheck stays on and the key is the COPR project key.
+[copr:copr.fedorainfracloud.org:matthewmackes:magic-mesh]
+name=Copr repo for magic-mesh owned by matthewmackes
+baseurl=https://download.copr.fedorainfracloud.org/results/matthewmackes/magic-mesh/fedora-$releasever-$basearch/
+type=rpm-md
+skip_if_unavailable=True
+gpgcheck=1
+gpgkey=https://download.copr.fedorainfracloud.org/results/matthewmackes/magic-mesh/pubkey.gpg
+repo_gpgcheck=0
+enabled=1
+enabled_metadata=1
