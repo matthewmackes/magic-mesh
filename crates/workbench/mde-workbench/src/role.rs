@@ -330,6 +330,7 @@ mod tests {
             vec![
                 "registration",
                 "fleet_rollup",
+                "node_roles",
                 "inventory",
                 "hardware",
                 "jobs",

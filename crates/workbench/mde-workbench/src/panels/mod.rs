@@ -45,6 +45,7 @@ pub mod mesh_topology;
 pub mod mouse;
 pub mod music;
 pub mod network_hosts;
+pub mod node_roles;
 pub mod notifications;
 pub mod panel_apps;
 /// PD-3 — the Peers directory (the Front Door).

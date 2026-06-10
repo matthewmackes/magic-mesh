@@ -306,7 +306,7 @@ host-local Ansible apply.
 
 - [ ] **PLANES-21: install profiles** — role + tags + ks fragments + join-token slot, TOML form-edited (W56); **boot-menu profile choice** on one image (W57); **auto-join firstboot** via single-use bearer (W60); USB/ISO only, PXE deferred (W59).
 - [ ] **PLANES-22: images** — ISO+ks, VM golden, container images, USB writer (W53); builds = jobs on execution-tagged nodes (W54, builder tag deferred per W82); versioned dirs + TOML manifests on LizardFS (W55).
-- [ ] **PLANES-23: Node roles panel** — fleet view of role pins + the tag editor (W58, the W26 edit surface), linked to install profiles.
+- [>] **PLANES-23: Node roles panel** — fleet view of role pins + the tag editor (W58, the W26 edit surface), linked to install profiles.
 - [ ] **PLANES-24: mirrors** — magic-mesh COPR mirror dir on LizardFS (W61); **every node serves itself via `file://` baseurl** + upstream fallback (W62); sync = scheduled one-puller job (W63).
 
 > Out of scope (W99): multi-mesh federation · cloud nodes · non-Fedora agents · multi-tenancy.

@@ -244,6 +244,8 @@ pub fn nav_model() -> Vec<NavEntry> {
                 Panel::new("registration", "Registration"),
                 // PLANES-20 — role-grouped fleet rollup dashboard.
                 Panel::new("fleet_rollup", "Fleet Rollup"),
+                // PLANES-23 — node role pins + capability tags.
+                Panel::new("node_roles", "Node Roles"),
                 Panel::new("inventory", "Inventory"),
                 // PLANES-5 — replicated PeerProbe hardware view
                 // (PCI/USB/kernel/power/descriptors), no new collectors.

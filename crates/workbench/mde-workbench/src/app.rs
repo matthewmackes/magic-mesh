@@ -31,15 +31,15 @@ use crate::panels::{
     mesh_join as mesh_join_panel, mesh_logs as mesh_logs_panel, mesh_pending as mesh_pending_panel,
     mesh_services as mesh_services_panel, mesh_storage as mesh_storage_panel,
     mesh_topology as mesh_topology_panel, mouse as mouse_panel, music as music_panel,
-    network_hosts as network_hosts_panel, notifications as notifications_panel,
-    panel_apps as panel_apps_panel, peers as peers_panel, playbooks as playbooks_panel,
-    power as power_panel, printers as printers_panel, registration as registration_panel,
-    remote_desktop as remote_desktop_panel, removable as removable_panel, repair as repair_panel,
-    resources as resources_panel, run_history as run_history_panel,
-    service_publishing as service_publishing_panel, session as session_panel,
-    snapshots as snapshots_panel, sound as sound_panel, sync_status as sync_status_panel,
-    system_update as system_update_panel, themes as themes_panel, vpn as vpn_panel,
-    wallpaper as wallpaper_panel, wifi as wifi_panel,
+    network_hosts as network_hosts_panel, node_roles as node_roles_panel,
+    notifications as notifications_panel, panel_apps as panel_apps_panel, peers as peers_panel,
+    playbooks as playbooks_panel, power as power_panel, printers as printers_panel,
+    registration as registration_panel, remote_desktop as remote_desktop_panel,
+    removable as removable_panel, repair as repair_panel, resources as resources_panel,
+    run_history as run_history_panel, service_publishing as service_publishing_panel,
+    session as session_panel, snapshots as snapshots_panel, sound as sound_panel,
+    sync_status as sync_status_panel, system_update as system_update_panel, themes as themes_panel,
+    vpn as vpn_panel, wallpaper as wallpaper_panel, wifi as wifi_panel,
 };
 use crate::patternfly::{breadcrumb, page_subtitle, page_title};
 use crate::sidebar::SidebarState;
@@ -160,6 +160,8 @@ pub enum Message {
     Registration(registration_panel::Message),
     /// PLANES-20 — Fleet rollup dashboard sub-message.
     FleetRollup(fleet_rollup_panel::Message),
+    /// PLANES-23 — Node roles + tags panel sub-message.
+    NodeRoles(node_roles_panel::Message),
     /// CB-1.5.b — Fleet playbooks panel sub-message.
     Playbooks(playbooks_panel::Message),
     /// CB-1.5.c — Fleet run-history panel sub-message.
@@ -272,6 +274,7 @@ pub struct App {
     config_apply: config_apply_panel::ConfigApplyPanel,
     registration: registration_panel::RegistrationPanel,
     fleet_rollup: fleet_rollup_panel::FleetRollupPanel,
+    node_roles: node_roles_panel::NodeRolesPanel,
     playbooks: playbooks_panel::PlaybooksPanel,
     run_history: run_history_panel::RunHistoryPanel,
     datetime: datetime_panel::DateTimePanel,
@@ -383,6 +386,7 @@ impl App {
             config_apply: config_apply_panel::ConfigApplyPanel::new(),
             registration: registration_panel::RegistrationPanel::new(),
             fleet_rollup: fleet_rollup_panel::FleetRollupPanel::new(),
+            node_roles: node_roles_panel::NodeRolesPanel::new(),
             playbooks: playbooks_panel::PlaybooksPanel::new(),
             run_history: run_history_panel::RunHistoryPanel::new(),
             datetime: datetime_panel::DateTimePanel::new(),
@@ -825,6 +829,7 @@ impl App {
             Message::ConfigApply(msg) => self.config_apply.update(msg),
             Message::Registration(msg) => self.registration.update(msg),
             Message::FleetRollup(msg) => self.fleet_rollup.update(msg),
+            Message::NodeRoles(msg) => self.node_roles.update(msg),
             Message::Playbooks(msg) => self.playbooks.update(msg),
             Message::RunHistory(msg) => self.run_history.update(msg),
             Message::DateTime(msg) => self.datetime.update(msg),
@@ -912,6 +917,7 @@ impl App {
             (Group::Fleet, "config_apply") => config_apply_panel::ConfigApplyPanel::load(),
             (Group::Fleet, "registration") => registration_panel::RegistrationPanel::load(),
             (Group::Fleet, "fleet_rollup") => fleet_rollup_panel::FleetRollupPanel::load(),
+            (Group::Fleet, "node_roles") => node_roles_panel::NodeRolesPanel::load(),
             (Group::Fleet, "playbooks") => playbooks_panel::PlaybooksPanel::load(),
             (Group::Fleet, "run_history") => run_history_panel::RunHistoryPanel::load(),
             (Group::System, "datetime") => datetime_panel::DateTimePanel::load(),
@@ -1187,6 +1193,10 @@ impl App {
                 group: Group::Fleet,
                 panel: "fleet_rollup",
             } => self.fleet_rollup.view(),
+            View::Panel {
+                group: Group::Fleet,
+                panel: "node_roles",
+            } => self.node_roles.view(),
             View::Panel {
                 group: Group::Fleet,
                 panel: "playbooks",
