@@ -11,4 +11,8 @@ into the filesystem; the hicolor icon set lives in `../assets/icons/`.
   Cosmic honors XDG autostart)
 - `systemd/`      → `/usr/lib/systemd/system/` (ENT-6: `mackesd.service`,
   Restart=on-failure — kill -9 recovers in seconds; in-daemon worker
-  restarts are the supervisor's bounded-backoff + circuit-breaker job)
+  restarts are the supervisor's bounded-backoff + circuit-breaker job).
+  `mde-musicd.service` is a user unit (`default.target`) whose
+  `ExecCondition=mackesd role-gate --min-rank 2` skips it cleanly on
+  Servers/Lighthouses (SVC-7/Q70 — desktop services are Workstation
+  surfaces; the voice-agent autostart carries the same gate inline)

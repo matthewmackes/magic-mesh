@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
 Name=Magic Mesh Voice Agent
-Comment=Persistent SIP agent — registers, listens for inbound calls, publishes state/voice/status (SVC-4)
-Exec=mde-voice-hud --agent
+Comment=Persistent SIP agent (SVC-4); Workstation-rank gated — Servers/Lighthouses run plumbing only (SVC-7/Q70)
+Exec=sh -c "mackesd role-gate --min-rank 2 && exec mde-voice-hud --agent"
 Icon=magic-mesh
 Terminal=false
 NoDisplay=true

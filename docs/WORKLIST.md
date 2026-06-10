@@ -116,7 +116,7 @@ host-local Ansible apply.
 - [✓] **SVC-4: voice HUD promotion** — done (code+assets) — --agent mode + state/voice/status publishing already live; XDG autostart artifact + app desktop entries shipped in packaging/ (PKG-3 installs them); Workbench presence via home probe; Cosmic autostart for `--agent` + Workbench presence; Bus-native presence (every peer publishes `state/voice/status`) (Q65/66).
 - [✓] **SVC-5: document the 3 file bridges** — done — co-equal lock documented in the mde-files crate doc; keep mesh / SMB / KDC co-equal in mde-files (Q67); no code change, just the lock.
 - [ ] **SVC-6: KDC full phone hub** — land KDC2-4 (= SEC-5), keep all plugins, phone actions on the device card only (Q68/69).
-- [ ] **SVC-7: Workstation-only service gating** — gate music/voice/files/KDC to Workstation rank; Servers/Lighthouses run plumbing only (Q70).
+- [✓] **SVC-7: Workstation-only service gating** — done — mackesd workers were already rank-2 gated (WORKER_TIERS); the user surfaces now gate too: voice-agent autostart wraps `mackesd role-gate --min-rank 2` (desktop-file-validate clean, gate smoked exit-0 on this workstation), new mde-musicd user unit with ExecCondition role-gate; Servers/Lighthouses skip both cleanly — gate music/voice/files/KDC to Workstation rank; Servers/Lighthouses run plumbing only (Q70).
 
 ## PKG — one RPM, role chooser, COPR, ISO (the unbuilt §5)
 
