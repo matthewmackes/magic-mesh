@@ -151,11 +151,27 @@ impl FirewallPresetWorker {
         match apply_preset(self.firewall_cmd, &ports) {
             Ok(()) => {
                 self.last_applied_lighthouse = Some(is_lighthouse);
+                // PLANES-16 — bind the overlay to the trusted zone and the
+                // underlay to the tight public zone (W69/W70). Best-effort:
+                // a zone failure must not undo the (succeeded) port preset,
+                // so it's logged, not propagated.
+                let plan = zone_plan(
+                    is_lighthouse,
+                    OVERLAY_IFACE,
+                    default_underlay_iface().as_deref(),
+                );
+                if let Err(e) = apply_zones(self.firewall_cmd, &plan) {
+                    tracing::warn!(
+                        target: "mackesd::firewall_preset",
+                        error = %e,
+                        "nebula port preset applied, but zone plan deferred (PLANES-16)"
+                    );
+                }
                 tracing::info!(
                     target: "mackesd::firewall_preset",
                     is_lighthouse,
                     ports = ?ports,
-                    "applied nebula firewall preset"
+                    "applied nebula firewall preset + zones"
                 );
                 TickOutcome::Applied
             }
@@ -212,6 +228,158 @@ pub fn desired_ports(is_lighthouse: bool) -> Vec<(u16, &'static str)> {
         out.extend(NEBULA_PORTS_LIGHTHOUSE_EXTRA.iter().copied());
     }
     out
+}
+
+// ───────────────────────── PLANES-16: firewalld zones ─────────────────
+//
+// W69/W70/W71. The overlay is a trust boundary, not just a set of open
+// ports: every peer on the Nebula overlay is inside the ≤8-peer trust
+// envelope (§8), so the overlay interface lands in firewalld's **trusted**
+// zone (W69) — all overlay traffic is accepted, and §3 crypto + the
+// Nebula cert is what gates who's *on* the overlay. The underlay
+// (physical NIC) gets the **tight** `public` zone with only the per-role
+// ports Nebula needs to bootstrap a tunnel (W70). Revocation is NOT a
+// firewall concern (W71): a revoked peer is evicted by the Nebula
+// blocklist (`mesh_firewall` / the CA blocklist), never by a zone rule.
+
+/// The Nebula overlay interface — always bound to the `trusted` zone.
+pub const OVERLAY_IFACE: &str = "nebula1";
+/// firewalld's built-in all-accept zone for the overlay (W69).
+pub const OVERLAY_ZONE: &str = "trusted";
+/// firewalld's built-in tight zone for the underlay NIC (W70).
+pub const UNDERLAY_ZONE: &str = "public";
+
+/// A firewalld zone plan (PLANES-16): interface→zone bindings plus the
+/// inbound ports each zone permits. The overlay zone needs no per-port
+/// rule (it accepts everything); the underlay zone carries the role-tight
+/// Nebula bootstrap ports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZonePlan {
+    /// `(interface, zone)` bindings to enforce with `--change-interface`.
+    pub bindings: Vec<(String, String)>,
+    /// `(zone, port, proto)` inbound allowances.
+    pub ports: Vec<(String, u16, &'static str)>,
+}
+
+/// Build the role's zone plan. `underlay_iface` is `None` when the
+/// physical NIC couldn't be determined (we still bind the overlay to
+/// trusted — that's the load-bearing W69 invariant and needs no underlay).
+#[must_use]
+pub fn zone_plan(
+    is_lighthouse: bool,
+    overlay_iface: &str,
+    underlay_iface: Option<&str>,
+) -> ZonePlan {
+    let mut bindings = vec![(overlay_iface.to_string(), OVERLAY_ZONE.to_string())];
+    let mut ports = Vec::new();
+    if let Some(under) = underlay_iface {
+        bindings.push((under.to_string(), UNDERLAY_ZONE.to_string()));
+        // The same role-tight Nebula bootstrap ports the port preset opens,
+        // but scoped to the tight underlay zone (W70).
+        for (port, proto) in desired_ports(is_lighthouse) {
+            ports.push((UNDERLAY_ZONE.to_string(), port, proto));
+        }
+    }
+    ZonePlan { bindings, ports }
+}
+
+/// Render a [`ZonePlan`] into idempotent `firewall-cmd` argument batches
+/// (each inner vec is one `firewall-cmd` invocation, sans the binary). A
+/// trailing `--reload` is the caller's job.
+#[must_use]
+pub fn zone_cmd_batches(plan: &ZonePlan) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    for (iface, zone) in &plan.bindings {
+        out.push(vec![
+            "--permanent".to_string(),
+            "--zone".to_string(),
+            zone.clone(),
+            "--change-interface".to_string(),
+            iface.clone(),
+        ]);
+    }
+    for (zone, port, proto) in &plan.ports {
+        out.push(vec![
+            "--permanent".to_string(),
+            "--zone".to_string(),
+            zone.clone(),
+            "--add-port".to_string(),
+            format!("{port}/{proto}"),
+        ]);
+    }
+    out
+}
+
+/// Best-effort discovery of the default-route (underlay) interface via
+/// `ip route show default` → the `dev <iface>` token. `None` when `ip`
+/// is absent or there's no default route (we then bind only the overlay).
+#[must_use]
+pub fn default_underlay_iface() -> Option<String> {
+    let out = std::process::Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_default_iface(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Pure: pull the `dev <iface>` from `ip route show default` output, never
+/// returning the overlay interface (we never tighten the overlay NIC).
+#[must_use]
+pub fn parse_default_iface(route_output: &str) -> Option<String> {
+    route_output
+        .lines()
+        .filter(|line| line.split_whitespace().next() == Some("default"))
+        .find_map(|line| {
+            let mut toks = line.split_whitespace();
+            while let Some(t) = toks.next() {
+                if t == "dev" {
+                    if let Some(dev) = toks.next() {
+                        if dev != OVERLAY_IFACE {
+                            return Some(dev.to_string());
+                        }
+                    }
+                }
+            }
+            None
+        })
+}
+
+/// Apply a zone plan via `firewall-cmd`, tolerating firewalld's
+/// "already in this state" non-zero exits (`ZONE_ALREADY_SET`,
+/// `ALREADY_ENABLED`). Reloads once at the end if any batch ran.
+fn apply_zones(firewall_cmd: &str, plan: &ZonePlan) -> Result<(), String> {
+    if which(firewall_cmd).is_none() {
+        return Err(format!("{firewall_cmd} not on PATH; zone plan deferred"));
+    }
+    for batch in zone_cmd_batches(plan) {
+        let out = std::process::Command::new(firewall_cmd)
+            .args(&batch)
+            .output()
+            .map_err(|e| format!("spawn {firewall_cmd} {batch:?}: {e}"))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !stderr.contains("ALREADY_ENABLED") && !stderr.contains("ZONE_ALREADY_SET") {
+                return Err(format!(
+                    "{firewall_cmd} {batch:?} failed: {}",
+                    stderr.trim()
+                ));
+            }
+        }
+    }
+    let out = std::process::Command::new(firewall_cmd)
+        .arg("--reload")
+        .output()
+        .map_err(|e| format!("spawn {firewall_cmd} --reload: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "{firewall_cmd} --reload failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 /// Shell out to `firewall-cmd --permanent --add-port <port>/<proto>`
@@ -295,6 +463,67 @@ mod tests {
     fn desired_ports_lighthouse_adds_tcp_443() {
         let ports = desired_ports(true);
         assert_eq!(ports, vec![(4242_u16, "udp"), (443_u16, "tcp")]);
+    }
+
+    #[test]
+    fn zone_plan_always_binds_overlay_to_trusted() {
+        // Even with no underlay discoverable, the W69 invariant holds:
+        // nebula1 → trusted, and nothing tightens the overlay.
+        let plan = zone_plan(false, OVERLAY_IFACE, None);
+        assert_eq!(plan.bindings, vec![("nebula1".into(), "trusted".into())]);
+        assert!(plan.ports.is_empty(), "no underlay → no underlay ports");
+    }
+
+    #[test]
+    fn zone_plan_tightens_underlay_per_role() {
+        // Non-lighthouse: overlay→trusted, eth0→public with UDP/4242 only.
+        let node = zone_plan(false, OVERLAY_IFACE, Some("eth0"));
+        assert_eq!(node.bindings[0], ("nebula1".into(), "trusted".into()));
+        assert_eq!(node.bindings[1], ("eth0".into(), "public".into()));
+        assert_eq!(node.ports, vec![("public".into(), 4242, "udp")]);
+        // Lighthouse adds TCP/443 to the tight underlay zone (W70).
+        let lh = zone_plan(true, OVERLAY_IFACE, Some("eth0"));
+        assert_eq!(
+            lh.ports,
+            vec![
+                ("public".into(), 4242, "udp"),
+                ("public".into(), 443, "tcp")
+            ]
+        );
+    }
+
+    #[test]
+    fn zone_cmd_batches_render_change_interface_and_ports() {
+        let plan = zone_plan(true, OVERLAY_IFACE, Some("eth0"));
+        let batches = zone_cmd_batches(&plan);
+        // overlay bind, underlay bind, then the two underlay ports.
+        assert!(batches.contains(&vec![
+            "--permanent".into(),
+            "--zone".into(),
+            "trusted".into(),
+            "--change-interface".into(),
+            "nebula1".into(),
+        ]));
+        assert!(batches.contains(&vec![
+            "--permanent".into(),
+            "--zone".into(),
+            "public".into(),
+            "--add-port".into(),
+            "443/tcp".into(),
+        ]));
+    }
+
+    #[test]
+    fn parse_default_iface_reads_dev_and_skips_overlay() {
+        // The real `ip route show default` shape.
+        let out = "default via 192.168.1.1 dev eth0 proto dhcp metric 100\n";
+        assert_eq!(parse_default_iface(out), Some("eth0".to_string()));
+        // A default route over the overlay itself is never chosen as the
+        // underlay to tighten (we'd otherwise lock the mesh out).
+        let over = "default via 10.42.0.1 dev nebula1 metric 50\n";
+        assert_eq!(parse_default_iface(over), None);
+        // No default route → nothing.
+        assert_eq!(parse_default_iface("10.0.0.0/24 dev eth0\n"), None);
     }
 
     #[test]
