@@ -1491,6 +1491,25 @@ impl App {
 /// renderer uses the standard UX-6 EmptyState (Material Symbols
 /// tools icon + curated panel label + Back-to-group CTA wired
 /// through `Message::SelectGroup`).
+/// PLANES-1 (W16) — the owning worklist item for a plane panel whose
+/// bespoke reducer hasn't shipped yet, so the guided empty state can
+/// name it honestly. Returns `None` for panels that already have a
+/// reducer (they never reach the catch-all) or that carry no tracked
+/// follow-up.
+fn panel_worklist_item(group: Group, panel: &str) -> Option<&'static str> {
+    match (group, panel) {
+        (Group::Controller, "policy") => Some("PLANES-13 (Policy engine UI)"),
+        (Group::Network, "interfaces") => Some("PLANES-15 (netstate panel)"),
+        (Group::Network, "dns") => Some("PLANES-18 (mesh DNS)"),
+        (Group::Network, "routing") => Some("PLANES-19 (validation suite)"),
+        (Group::Fleet, "tags") => Some("W82 (capability tags)"),
+        (Group::Provisioning, "profiles") => Some("PLANES-21 (install profiles)"),
+        (Group::Provisioning, "images") => Some("PLANES-22 (images)"),
+        (Group::Provisioning, "mirrors") => Some("PLANES-24 (mirrors)"),
+        _ => None,
+    }
+}
+
 fn panel_under_construction(view: View) -> Element<'static, Message> {
     let palette = crate::live_theme::palette();
     let group = view.group();
@@ -1504,10 +1523,17 @@ fn panel_under_construction(view: View) -> Element<'static, Message> {
         ),
         View::Panel { group: g, panel } => {
             let panel_label = resolve_panel_label(g, panel).unwrap_or(panel);
+            // PLANES-1 (W16) — name the owning worklist item so the
+            // full-tree empty states read as honest "building this",
+            // not vaporware.
+            let tracked = match panel_worklist_item(g, panel) {
+                Some(item) => format!(" Tracked as worklist item {item}."),
+                None => String::new(),
+            };
             (
                 format!("{panel_label} isn't ready yet"),
                 format!(
-                    "The {panel_label} panel is part of the next workbench rollout. Other panels in {group} stay available from the sidebar.",
+                    "The {panel_label} panel is part of the next workbench rollout.{tracked} Other panels in {group} stay available from the sidebar.",
                     group = g.label(),
                 ),
             )
@@ -1544,6 +1570,28 @@ mod tests {
             }
         );
         assert_eq!(app.focused_pane(), Pane::Sidebar);
+    }
+
+    #[test]
+    fn new_plane_panels_name_their_worklist_item() {
+        // PLANES-1 (W16) — every full-tree empty-state plane panel names
+        // the worklist item building it, so the console never reads as
+        // vaporware.
+        for (g, p) in [
+            (Group::Controller, "policy"),
+            (Group::Network, "interfaces"),
+            (Group::Network, "dns"),
+            (Group::Network, "routing"),
+            (Group::Fleet, "tags"),
+            (Group::Provisioning, "profiles"),
+            (Group::Provisioning, "images"),
+            (Group::Provisioning, "mirrors"),
+        ] {
+            assert!(
+                panel_worklist_item(g, p).is_some(),
+                "{g:?}/{p} empty-state must name its worklist item (W16)"
+            );
+        }
     }
 
     #[test]
