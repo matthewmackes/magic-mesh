@@ -120,8 +120,8 @@ host-local Ansible apply.
 
 ## PKG — one RPM, role chooser, COPR, ISO (the unbuilt §5)
 
-- [ ] **PKG-1: monolithic RPM** — cargo-generate-rpm metadata → one `magic-mesh` RPM carrying all 8 bins (Q71/72/76).
-- [ ] **PKG-2: `packaging/` dir** — a top-level non-crate dir for the spec/metadata, units, `.ks`, `.repo` (Q85).
+- [✓] **PKG-1: monolithic RPM** — done — [package.metadata.generate-rpm] on mackesd: `cargo generate-rpm -p mackesd` packages all 9 binaries + systemd units + desktop/autostart + hicolor icons + DISCLAIMER into one `magic-mesh` RPM (no per-role split, §5); requires nebula + ansible-core. cargo metadata parses; the build/sign/publish is /release-gated — cargo-generate-rpm metadata → one `magic-mesh` RPM carrying all 8 bins (Q71/72/76).
+- [✓] **PKG-2: `packaging/` dir** — done — packaging/{applications,autostart,systemd}/ + README exist and are referenced by the PKG-1 asset map; kickstart/.repo land with PKG-5/8/9 — a top-level non-crate dir for the spec/metadata, units, `.ks`, `.repo` (Q85).
 - [ ] **PKG-3: self-gating `mackesd.service`** — one service that gates its in-process workers via `resolve_rank()`; the RPM enables nothing role-specific (Q75/86) + app surface units.
 - [ ] **PKG-4: `mackesd role pin` subcommand** — the CLI front-end for `mde_role::pin` (Q74).
 - [ ] **PKG-5: install-time role chooser** — a Cosmic first-run GUI chooser (Q73) + a kickstart `%post` inline path (Q81) + an "init-new-mesh vs join-existing" prompt (Q84).

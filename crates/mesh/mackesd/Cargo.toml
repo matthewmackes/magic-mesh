@@ -296,3 +296,40 @@ no-default-features = true
 
 [lints]
 workspace = true
+
+# PKG-1/3/6 (W71/72/75/76/86) — the ONE monolithic Magic Mesh RPM.
+# `cargo generate-rpm -p mackesd` (operator-gated via /release) packages
+# all eight app/daemon binaries + the packaging/ assets into a single
+# `magic-mesh` RPM; the install-time role chooser (PKG-5) + the
+# self-gating mackesd.service (PKG-3) decide what actually runs per node,
+# so there is no per-role package split (§5: Lighthouse ⊂ Server ⊂
+# Workstation, one artifact). COPR signing + the ISO stay operator-gated.
+[package.metadata.generate-rpm]
+name = "magic-mesh"
+summary = "Magic Mesh — secure no-fixed-center workgroup mesh + native-Rust Carbon GUIs on Fedora-Cosmic"
+license = "proprietary"
+# Every binary the workspace builds, placed under /usr/bin.
+assets = [
+    { source = "target/release/mackesd",            dest = "/usr/bin/mackesd",            mode = "755" },
+    { source = "target/release/magic-fleet",        dest = "/usr/bin/magic-fleet",        mode = "755" },
+    { source = "target/release/mde-bus",            dest = "/usr/bin/mde-bus",            mode = "755" },
+    { source = "target/release/mde-files",          dest = "/usr/bin/mde-files",          mode = "755" },
+    { source = "target/release/mde-workbench",      dest = "/usr/bin/mde-workbench",      mode = "755" },
+    { source = "target/release/mde-mesh-wallpaper", dest = "/usr/bin/mde-mesh-wallpaper", mode = "755" },
+    { source = "target/release/mde-voice-hud",      dest = "/usr/bin/mde-voice-hud",      mode = "755" },
+    { source = "target/release/mde-music",          dest = "/usr/bin/mde-music",          mode = "755" },
+    { source = "target/release/mde-musicd",         dest = "/usr/bin/mde-musicd",         mode = "755" },
+    # PKG-3 — the self-gating daemon unit + the role-gated app units.
+    { source = "packaging/systemd/mackesd.service",   dest = "/usr/lib/systemd/system/mackesd.service",   mode = "644" },
+    { source = "packaging/systemd/mde-musicd.service", dest = "/usr/lib/systemd/user/mde-musicd.service", mode = "644" },
+    # App launchers + the SVC-4 voice-agent autostart.
+    { source = "packaging/applications/*.desktop", dest = "/usr/share/applications/",      mode = "644" },
+    { source = "packaging/autostart/*.desktop",    dest = "/etc/xdg/autostart/",           mode = "644" },
+    # Brand: the MCNF hicolor icon set + the DISCLAIMER the gate checks.
+    { source = "assets/icons/hicolor/**/*",        dest = "/usr/share/icons/hicolor/",     mode = "644" },
+    { source = "DISCLAIMER.md",                    dest = "/usr/share/magic-mesh/DISCLAIMER.md", mode = "644" },
+]
+# Runtime deps the platform shells to (D-W1 / §1-§5 substrate).
+[package.metadata.generate-rpm.requires]
+nebula = "*"
+ansible-core = "*"
