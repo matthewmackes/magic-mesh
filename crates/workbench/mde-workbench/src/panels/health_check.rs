@@ -282,7 +282,104 @@ pub fn run_all_probes() -> Vec<ProbeResult> {
         probe_pending_updates(),
         probe_snapshot_count(),
         probe_parity_overlay(),
+        // PLANES-6 / ENT-7 — the `meshctl doctor` checks, folded into the
+        // Health panel: the mesh prerequisites, the daemon, and the
+        // overlay link. Same signal as the CLI doctor, surfaced live with
+        // the panel's re-run.
+        probe_mesh_binaries(),
+        probe_mackesd_service(),
+        probe_overlay_link(),
     ]
+}
+
+/// PLANES-6 / ENT-7 — required mesh binaries on PATH (nebula + nebula-cert).
+fn probe_mesh_binaries() -> ProbeResult {
+    let on_path = |bin: &str| {
+        std::env::var_os("PATH")
+            .map(|paths| std::env::split_paths(&paths).any(|p| p.join(bin).is_file()))
+            .unwrap_or(false)
+    };
+    let missing: Vec<&str> = ["nebula", "nebula-cert"]
+        .into_iter()
+        .filter(|b| !on_path(b))
+        .collect();
+    if missing.is_empty() {
+        ProbeResult {
+            name: "Mesh binaries".into(),
+            status: ProbeStatus::Ok,
+            detail: "nebula + nebula-cert on PATH".into(),
+            remediation: None,
+        }
+    } else {
+        ProbeResult {
+            name: "Mesh binaries".into(),
+            status: ProbeStatus::Fail,
+            detail: format!("missing: {}", missing.join(", ")),
+            remediation: Some("install the nebula package (sudo dnf install nebula)".into()),
+        }
+    }
+}
+
+/// PLANES-6 / ENT-7 — the `mackesd` daemon is active (W24 self-restart
+/// surface: a degraded daemon shows here with the restart remediation).
+fn probe_mackesd_service() -> ProbeResult {
+    let state = std::process::Command::new("systemctl")
+        .args(["is-active", "mackesd"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    match state.as_str() {
+        "active" => ProbeResult {
+            name: "Mesh daemon (mackesd)".into(),
+            status: ProbeStatus::Ok,
+            detail: "active".into(),
+            remediation: None,
+        },
+        "" => ProbeResult {
+            name: "Mesh daemon (mackesd)".into(),
+            status: ProbeStatus::Unknown,
+            detail: "systemctl unavailable".into(),
+            remediation: None,
+        },
+        other => ProbeResult {
+            name: "Mesh daemon (mackesd)".into(),
+            status: ProbeStatus::Fail,
+            detail: other.to_string(),
+            remediation: Some("sudo systemctl restart mackesd".into()),
+        },
+    }
+}
+
+/// PLANES-6 / ENT-7 — the Nebula overlay link is up with an address.
+fn probe_overlay_link() -> ProbeResult {
+    let ip = std::process::Command::new("ip")
+        .args(["-4", "addr", "show", "nebula1"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout).lines().find_map(|l| {
+                l.trim()
+                    .strip_prefix("inet ")
+                    .and_then(|rest| rest.split('/').next())
+                    .map(str::to_string)
+            })
+        });
+    match ip {
+        Some(ip) => ProbeResult {
+            name: "Overlay link (nebula1)".into(),
+            status: ProbeStatus::Ok,
+            detail: format!("up, {ip}"),
+            remediation: None,
+        },
+        None => ProbeResult {
+            name: "Overlay link (nebula1)".into(),
+            status: ProbeStatus::Warn,
+            detail: "no overlay IP on nebula1".into(),
+            remediation: Some("enroll the node and confirm nebula is running".into()),
+        },
+    }
 }
 
 fn probe_disk_space() -> ProbeResult {
@@ -593,9 +690,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn run_all_probes_returns_seven_results() {
+    fn run_all_probes_returns_all_results() {
+        // 7 local probes + 3 PLANES-6/ENT-7 doctor probes (binaries,
+        // daemon, overlay).
         let probes = run_all_probes();
-        assert_eq!(probes.len(), 7);
+        assert_eq!(probes.len(), 10);
+    }
+
+    #[test]
+    fn doctor_probes_are_present_and_named() {
+        let probes = run_all_probes();
+        let names: Vec<&str> = probes.iter().map(|p| p.name.as_str()).collect();
+        for n in [
+            "Mesh binaries",
+            "Mesh daemon (mackesd)",
+            "Overlay link (nebula1)",
+        ] {
+            assert!(names.contains(&n), "missing ENT-7 doctor probe: {n}");
+        }
     }
 
     #[test]
