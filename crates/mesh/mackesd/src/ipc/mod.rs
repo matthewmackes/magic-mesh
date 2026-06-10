@@ -28,6 +28,7 @@
 #![allow(missing_docs)]
 
 pub mod bus_bridge;
+pub mod directory;
 pub mod files;
 pub mod fleet;
 // NF-Bundle-0 (v2.5) — dev.mackes.MDE.Nebula.Status surface.

@@ -493,6 +493,16 @@ enum Cmd {
         cmd: RevisionsCmd,
     },
 
+    /// PD-1 (Q23/W27) — the joined peer directory: every known peer
+    /// with presence tier, health, version, overlay ip/role, and
+    /// revision currency — the same record `action/mesh/directory`
+    /// serves the GUIs. Table by default; `--json` for the raw rows.
+    Peers {
+        /// Emit the raw directory JSON instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// CB-1.5.a — fleet node roster. `mded nodes list --json` emits
     /// every row from the `nodes` table as a JSON array; the Iced
     /// inventory panel (in `crates/mde-workbench/src/panels/
@@ -2734,6 +2744,40 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Cmd::Peers { json } => {
+            // PD-1 — the joined directory, CLI face.
+            let root = mackesd_core::default_qnm_shared_root();
+            let svc =
+                mackesd_core::ipc::directory::DirectoryService::new(&root, Some(db_path.clone()));
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
+            let dir = svc.build_directory(now);
+            if json {
+                println!("{dir}");
+            } else {
+                let head = dir["head"]
+                    .as_u64()
+                    .map_or("-".to_string(), |v| v.to_string());
+                println!("fleet head: {head}");
+                println!(
+                    "{:<16} {:<8} {:<10} {:<12} {:<15} {:<8}",
+                    "PEER", "PRESENCE", "HEALTH", "VERSION", "OVERLAY IP", "REVISION"
+                );
+                for p in dir["peers"].as_array().into_iter().flatten() {
+                    println!(
+                        "{:<16} {:<8} {:<10} {:<12} {:<15} {:<8}",
+                        p["hostname"].as_str().unwrap_or("-"),
+                        p["presence"].as_str().unwrap_or("-"),
+                        p["health"].as_str().unwrap_or("-"),
+                        p["mde_version"].as_str().unwrap_or("-"),
+                        p["overlay_ip"].as_str().unwrap_or("-"),
+                        p["revision"]["currency"].as_str().unwrap_or("-"),
+                    );
+                }
+            }
+            return Ok(());
+        }
         Cmd::Nodes { cmd } => {
             // CB-1.5.a — fleet node roster surface. The Iced
             // inventory panel consumes the JSON shape directly.
@@ -4185,6 +4229,45 @@ fn run_serve(
                 tracing::warn!(
                     error = %e,
                     "Fleet Bus responder: bus persist open failed; responder skipped"
+                );
+            }
+        }
+        // PD-1 — the peer-directory responder: action/mesh/directory
+        // answers with the joined per-peer record (presence tier,
+        // health, version, overlay ip/role, revision currency). Same
+        // dedicated-OS-thread shape as the fleet responder.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let dir_svc = mackesd_core::ipc::directory::DirectoryService::new(
+                    &workgroup_root,
+                    Some(db_path.clone()),
+                );
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("directory-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::directory::serve_bus(&persist, &dir_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_h| {
+                        tracing::info!("Directory Bus responder spawned (action/mesh/directory, PD-1)");
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Directory Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("directory_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Directory Bus responder: bus persist open failed; responder skipped"
                 );
             }
         }

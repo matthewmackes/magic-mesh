@@ -152,7 +152,7 @@ host-local Ansible apply.
 > **Sequencing (L25):** PD-1/2 → PD-3/4/5 (+11/12/13) → PD-6/7 → PD-8/9 → PD-10; layer-shell
 > spike runs early in parallel. Every slice independently shippable + §7-complete.
 
-- [ ] **PD-1: PEERS — the `action/mesh/directory` Bus verb + `mackesd peers` CLI**
+- [✓] **PD-1: PEERS — the `action/mesh/directory` Bus verb + `mackesd peers` CLI** — done — DirectoryService joins PeerRecords + presence tiers (Q11) + roster ip/role + FPG revision currency (Q15); responder + table/--json CLI (L24) smoked end-to-end; voice/descriptors join at PD-2 (honest absence)
   **As** any directory consumer (GUI or CLI),
   **I want** one mackesd Bus verb returning the joined per-peer record (hostname, overlay IP, role, machine-presence tier, voice presence, mde_version, revision currency, drift count + last event, Netdata-derived health, service descriptors),
   **so that** every surface reads the same answer with zero GUI shell-outs (Q9/Q23).
