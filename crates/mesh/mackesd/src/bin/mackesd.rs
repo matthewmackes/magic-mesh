@@ -501,6 +501,22 @@ enum Cmd {
         cmd: RevisionsCmd,
     },
 
+    /// ENT-4 — bootstrap THIS box as the mesh's founding lighthouse:
+    /// pin the role (if unpinned), mint the CA, self-sign + write the
+    /// bundle, and print the first peer's single-use join token.
+    MeshInit {
+        /// Mesh id (e.g. `home-mesh`).
+        #[arg(long)]
+        mesh_id: String,
+        /// This lighthouse's externally-dialable address. Peers'
+        /// static_host_map points here.
+        #[arg(long)]
+        external_addr: String,
+        /// Role to pin when unpinned (lighthouse|server|workstation).
+        #[arg(long, default_value = "lighthouse")]
+        role: String,
+    },
+
     /// ENT-1 — mint a single-use 256-bit enrollment bearer on this
     /// lighthouse and print the join token a new box runs
     /// `mackesd enroll --token <…>` with. The ledger records only the
@@ -2780,6 +2796,60 @@ fn main() -> anyhow::Result<()> {
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 }
             }
+        }
+        Cmd::MeshInit {
+            mesh_id,
+            external_addr,
+            role,
+        } => {
+            let parsed: mde_role::Role = role.parse().map_err(|_| {
+                anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
+            })?;
+            let conn = mackesd_core::store::open(&db_path)
+                .with_context(|| format!("opening store at {}", db_path.display()))?;
+            mackesd_core::store::migrate(&conn).context("migrating store")?;
+            let root = mackesd_core::default_qnm_shared_root();
+            let node_id = format!(
+                "peer:{}",
+                std::process::Command::new("hostname")
+                    .output()
+                    .ok()
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "founder".to_string())
+            );
+            let report = mackesd_core::mesh_init::mesh_init(
+                &mackesd_core::ca::SubprocessBackend,
+                &conn,
+                &root,
+                &node_id,
+                &mesh_id,
+                &external_addr,
+                std::path::Path::new("/var/lib/mackesd/nebula-ca/ca.crt"),
+                std::path::Path::new("/var/lib/mackesd/nebula-ca/ca.key"),
+                std::path::Path::new("/var/lib/mackesd/nebula-ca/scratch"),
+                parsed,
+            )?;
+            // Best-effort unit starts — the supervisor (next serve)
+            // also materializes + starts; containerized test envs
+            // without systemd still get a complete on-disk state.
+            let _ = std::process::Command::new("systemctl")
+                .args(["start", "nebula.service"])
+                .status();
+            println!(
+                "mesh `{}` initialized — lighthouse {} ({})",
+                report.mesh_id, node_id, report.overlay_ip
+            );
+            if let Some(r) = &report.pinned_role {
+                println!("role pinned: {r}");
+            }
+            println!("bundle: {}", report.bundle_path.display());
+            println!(
+                "\nfirst peer joins with:\n  mackesd enroll --token '{}'",
+                report.join_token
+            );
+            return Ok(());
         }
         Cmd::EnrollToken {
             mesh_id,

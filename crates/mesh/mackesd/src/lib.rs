@@ -108,6 +108,7 @@ pub mod surrounding_hosts;
 pub mod bearer_ledger;
 pub mod descriptors;
 pub mod lifecycle;
+pub mod mesh_init;
 #[cfg(feature = "async-services")]
 pub mod stun;
 pub mod telemetry;
