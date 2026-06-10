@@ -41,6 +41,9 @@ pub struct PeerRow {
     pub vnc: bool,
     /// PD-12 — the peer's published LAN MACs (Wake-on-LAN targets).
     pub lan_macs: Vec<String>,
+    /// PD-11 — structured (name, state) for the lifecycle buttons.
+    pub containers: Vec<(String, String)>,
+    pub vms: Vec<(String, String)>,
 }
 
 /// Panel state.
@@ -57,6 +60,9 @@ pub struct PeersPanel {
     /// PD-8 — live Netdata series for the selected peer (L14).
     pub metrics: Option<PeerMetrics>,
     pub metrics_err: Option<String>,
+    /// PD-11/L16 — the armed stop/restart awaiting its second click:
+    /// (host, kind, name, op).
+    pub pending_confirm: Option<(String, String, String, String)>,
 }
 
 /// PD-8 — the four L14 series, oldest→newest over the last ~60 s.
@@ -106,6 +112,26 @@ pub enum Message {
         host: String,
         result: Result<PeerMetrics, String>,
     },
+    /// PD-11 — a lifecycle button: start is one-click; stop/restart
+    /// arm [`PeersPanel::pending_confirm`] first (L16).
+    Lifecycle {
+        host: String,
+        kind: String,
+        name: String,
+        op: String,
+    },
+    /// PD-11 — the verb replied; begin polling for the result.
+    LifecycleSent {
+        host: String,
+        id: Option<String>,
+    },
+    /// PD-11 — one result poll resolved.
+    LifecyclePolled {
+        host: String,
+        id: String,
+        attempts_left: u8,
+        outcome: Option<Result<(), String>>,
+    },
 }
 
 /// Parse the PD-1 directory JSON into rows (pure, testable).
@@ -136,6 +162,8 @@ pub fn parse_directory(raw: &str) -> Result<Vec<PeerRow>, String> {
                     let mut services = Vec::new();
                     let (mut ssh, mut rdp, mut vnc) = (false, false, false);
                     let mut lan_macs: Vec<String> = Vec::new();
+                    let mut containers: Vec<(String, String)> = Vec::new();
+                    let mut vms: Vec<(String, String)> = Vec::new();
                     if let Some(d) = p.get("descriptors").filter(|d| !d.is_null()) {
                         let ra = &d["remote_access"];
                         for (label, key, flag) in [
@@ -149,6 +177,10 @@ pub fn parse_directory(raw: &str) -> Result<Vec<PeerRow>, String> {
                             }
                         }
                         for c in d["containers"].as_array().into_iter().flatten() {
+                            containers.push((
+                                c["name"].as_str().unwrap_or("?").to_string(),
+                                c["state"].as_str().unwrap_or("?").to_string(),
+                            ));
                             services.push(format!(
                                 "podman: {} ({}) {}",
                                 c["name"].as_str().unwrap_or("?"),
@@ -157,6 +189,10 @@ pub fn parse_directory(raw: &str) -> Result<Vec<PeerRow>, String> {
                             ));
                         }
                         for vm in d["vms"].as_array().into_iter().flatten() {
+                            vms.push((
+                                vm["name"].as_str().unwrap_or("?").to_string(),
+                                vm["state"].as_str().unwrap_or("?").to_string(),
+                            ));
                             let specs = match (vm["vcpus"].as_u64(), vm["memory_mb"].as_u64()) {
                                 (Some(c), Some(m)) => format!(" · {c} vCPU / {m} MiB"),
                                 _ => String::new(),
@@ -196,6 +232,8 @@ pub fn parse_directory(raw: &str) -> Result<Vec<PeerRow>, String> {
                         rdp,
                         vnc,
                         lan_macs,
+                        containers,
+                        vms,
                     })
                 })
                 .collect()
@@ -246,6 +284,51 @@ pub fn group_of(row: &PeerRow, self_hostname: &str) -> &'static str {
 #[must_use]
 pub fn metrics_subscription() -> iced::Subscription<crate::Message> {
     iced::time::every(Duration::from_secs(2)).map(|_| crate::Message::Peers(Message::MetricsTick))
+}
+
+/// PD-11 — poll the executor's result file via the verb, with a 2 s
+/// gap between attempts.
+fn poll_lifecycle_result(host: String, id: String, attempts_left: u8) -> Task<crate::Message> {
+    Task::perform(
+        async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let body = format!(r#"{{"peer":"{host}","id":"{id}"}}"#);
+            let outcome = tokio::task::spawn_blocking(move || {
+                crate::dbus::action_request_with_body(
+                    "action/services/lifecycle-result",
+                    Some(&body),
+                    Duration::from_secs(2),
+                )
+            })
+            .await
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|v| {
+                if v["found"] == true {
+                    Some(if v["result"]["ok"] == true {
+                        Ok(())
+                    } else {
+                        Err(v["result"]["error"]
+                            .as_str()
+                            .unwrap_or("unknown error")
+                            .to_string())
+                    })
+                } else {
+                    None
+                }
+            });
+            (host, id, attempts_left.saturating_sub(1), outcome)
+        },
+        |(host, id, attempts_left, outcome)| {
+            crate::Message::Peers(Message::LifecyclePolled {
+                host,
+                id,
+                attempts_left,
+                outcome,
+            })
+        },
+    )
 }
 
 /// Fetch one Netdata chart's last-60s series over the overlay
@@ -526,6 +609,76 @@ impl PeersPanel {
                 }
                 Task::none()
             }
+            Message::Lifecycle {
+                host,
+                kind,
+                name,
+                op,
+            } => {
+                let key = (host.clone(), kind.clone(), name.clone(), op.clone());
+                // L16 — stop/restart need the armed second click.
+                if op != "start" && self.pending_confirm.as_ref() != Some(&key) {
+                    self.pending_confirm = Some(key);
+                    self.op_result = format!("click again to confirm {op} of {name} on {host}");
+                    return Task::none();
+                }
+                self.pending_confirm = None;
+                self.op_result = format!("{op} {name} on {host}…");
+                Task::perform(
+                    async move {
+                        let body = format!(
+                            r#"{{"peer":"{host}","kind":"{kind}","name":"{name}","op":"{op}"}}"#
+                        );
+                        let id = tokio::task::spawn_blocking(move || {
+                            crate::dbus::action_request_with_body(
+                                "action/services/lifecycle",
+                                Some(&body),
+                                Duration::from_secs(2),
+                            )
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                        .filter(|v| v["ok"] == true)
+                        .and_then(|v| v["id"].as_str().map(str::to_string));
+                        (host, id)
+                    },
+                    |(host, id)| crate::Message::Peers(Message::LifecycleSent { host, id }),
+                )
+            }
+            Message::LifecycleSent { host, id } => match id {
+                None => {
+                    self.op_result = format!("{host}: lifecycle request failed to send");
+                    Task::none()
+                }
+                Some(id) => {
+                    self.op_result = format!("{host}: request sent — waiting for the executor…");
+                    poll_lifecycle_result(host, id, 5)
+                }
+            },
+            Message::LifecyclePolled {
+                host,
+                id,
+                attempts_left,
+                outcome,
+            } => match outcome {
+                Some(Ok(())) => {
+                    self.op_result = format!("{host}: done — inventory updates within a heartbeat");
+                    Self::load()
+                }
+                Some(Err(e)) => {
+                    self.op_result = format!("{host}: executor refused/failed — {e}");
+                    Task::none()
+                }
+                None if attempts_left == 0 => {
+                    self.op_result = format!(
+                        "{host}: no result yet (peer slow or offline) — inventory will catch up"
+                    );
+                    Task::none()
+                }
+                None => poll_lifecycle_result(host, id, attempts_left),
+            },
             Message::OpFinished { label, host, ok } => {
                 self.op_result = if ok {
                     format!("{label} {host}: launched")
@@ -827,6 +980,68 @@ impl PeersPanel {
                     .size(13)
                     .color(palette.text.into_iced_color())]
                 .spacing(4);
+                // PD-11 — lifecycle rows: start one-click; stop/
+                // restart armed-confirm (L16). Self excluded (local
+                // service control lives in Mesh Services).
+                if r.hostname != self.self_hostname {
+                    for (kind, list) in [("container", &r.containers), ("vm", &r.vms)] {
+                        for (name, state) in list {
+                            let running = state == "running";
+                            let mut ops_row = row![text(format!("{kind}: {name} ({state})"))
+                                .size(12)
+                                .color(palette.text_muted.into_iced_color())]
+                            .spacing(8)
+                            .align_y(iced::alignment::Vertical::Center);
+                            let mk = |op: &str| {
+                                crate::Message::Peers(Message::Lifecycle {
+                                    host: r.hostname.clone(),
+                                    kind: kind.to_string(),
+                                    name: name.clone(),
+                                    op: op.to_string(),
+                                })
+                            };
+                            if running {
+                                let armed = |op: &str| {
+                                    self.pending_confirm
+                                        == Some((
+                                            r.hostname.clone(),
+                                            kind.to_string(),
+                                            name.clone(),
+                                            op.to_string(),
+                                        ))
+                                };
+                                ops_row = ops_row.push(crate::controls::variant_button(
+                                    if armed("stop") {
+                                        "Confirm stop"
+                                    } else {
+                                        "Stop"
+                                    },
+                                    crate::controls::ButtonVariant::Secondary,
+                                    Some(mk("stop")),
+                                    palette,
+                                ));
+                                ops_row = ops_row.push(crate::controls::variant_button(
+                                    if armed("restart") {
+                                        "Confirm restart"
+                                    } else {
+                                        "Restart"
+                                    },
+                                    crate::controls::ButtonVariant::Secondary,
+                                    Some(mk("restart")),
+                                    palette,
+                                ));
+                            } else {
+                                ops_row = ops_row.push(crate::controls::variant_button(
+                                    "Start",
+                                    crate::controls::ButtonVariant::Secondary,
+                                    Some(mk("start")),
+                                    palette,
+                                ));
+                            }
+                            services = services.push(ops_row);
+                        }
+                    }
+                }
                 if r.services.is_empty() {
                     services = services.push(
                         text("Nothing published (peer pre-PD-2, or nothing offered).")
@@ -1051,6 +1266,59 @@ mod tests {
             }),
         });
         assert!(p.metrics.is_some());
+    }
+
+    #[test]
+    fn stop_arms_then_fires_on_second_click_l16() {
+        let mut p = PeersPanel::new();
+        let msg = Message::Lifecycle {
+            host: "oak".into(),
+            kind: "vm".into(),
+            name: "win11".into(),
+            op: "stop".into(),
+        };
+        let _ = p.update(msg.clone());
+        assert!(p.pending_confirm.is_some(), "first click arms");
+        assert!(p.op_result.contains("confirm"));
+        let _ = p.update(msg);
+        assert!(p.pending_confirm.is_none(), "second click fires + disarms");
+        assert!(p.op_result.contains("stop win11"));
+    }
+
+    #[test]
+    fn start_is_one_click_and_different_op_rearms() {
+        let mut p = PeersPanel::new();
+        let _ = p.update(Message::Lifecycle {
+            host: "oak".into(),
+            kind: "container".into(),
+            name: "nginx".into(),
+            op: "start".into(),
+        });
+        assert!(p.pending_confirm.is_none(), "start never arms");
+        // Arming stop then clicking restart re-arms for restart.
+        for op in ["stop", "restart"] {
+            let _ = p.update(Message::Lifecycle {
+                host: "oak".into(),
+                kind: "container".into(),
+                name: "nginx".into(),
+                op: op.into(),
+            });
+        }
+        assert_eq!(
+            p.pending_confirm.as_ref().map(|c| c.3.as_str()),
+            Some("restart"),
+            "switching ops re-arms instead of firing"
+        );
+    }
+
+    #[test]
+    fn structured_lifecycle_entries_parse() {
+        let rows = parse_directory(REPLY).unwrap();
+        assert_eq!(
+            rows[0].containers,
+            [("nginx".to_string(), "running".to_string())]
+        );
+        assert_eq!(rows[0].vms, [("win11".to_string(), "running".to_string())]);
     }
 
     #[test]

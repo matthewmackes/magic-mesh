@@ -233,7 +233,7 @@ host-local Ansible apply.
     - [ ] clicks on the wallpaper reach the desktop beneath; on battery the animation pauses
     - [ ] disabling restores the prior static wallpaper
 
-- [>] **PD-11: PEERS — remote service lifecycle** — DAEMON SIDE LANDED (lifecycle request/result files on the replicated volume; lifecycle_exec worker validates against its own live inventory — the L9 no-passthrough rail — and runs podman/virsh; action/services/lifecycle verb replies the pollable request id); REMAINING: the detail-pane start/stop buttons with the L16 confirm-on-stop
+- [✓] **PD-11: PEERS — remote service lifecycle** — done — daemon: replicated request/result files, lifecycle_exec validates against its own live inventory (L9 rail), runs podman/virsh, honest stderr; GUI: per-container/VM Start (one-click) + Stop/Restart with the L16 armed-confirm second click, result polling (5×2s) into the strip, refresh-on-success; self excluded
   **As** an operator on a peer's Services Provided section,
   **I want** start/stop/restart buttons per container and VM, routed over a new `action/services/lifecycle {peer, kind, name, op}` Bus verb that the target peer's mackesd executes locally — with a confirm dialog on the stop/restart direction ("Stop win11 on oak?"), start one-click (L9/L16),
   **so that** the directory operates the fleet's services, not just lists them.

@@ -40,6 +40,10 @@ pub const WAKE_TOPIC: &str = "action/mesh/wake";
 /// against its own inventory (the L9 rail) + runs it.
 pub const LIFECYCLE_TOPIC: &str = "action/services/lifecycle";
 
+/// PD-11 — result retrieval: `{peer, id}` → the consumed result file
+/// (`found: false` while the executor hasn't answered yet).
+pub const LIFECYCLE_RESULT_TOPIC: &str = "action/services/lifecycle-result";
+
 /// Responder poll interval (matches the fleet responder).
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
@@ -181,11 +185,50 @@ pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &DirectoryService, sho
     let mut cursor: Option<String> = None;
     let mut wake_cursor: Option<String> = None;
     let mut lifecycle_cursor: Option<String> = None;
+    let mut result_cursor: Option<String> = None;
     while !should_stop() {
         poll_once(persist, svc, &mut cursor);
         poll_wake_once(persist, &mut wake_cursor);
         poll_lifecycle_once(persist, svc, &mut lifecycle_cursor);
+        poll_lifecycle_result_once(persist, svc, &mut result_cursor);
         std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// PD-11 — answer result polls.
+pub fn poll_lifecycle_result_once(
+    persist: &Persist,
+    svc: &DirectoryService,
+    cursor: &mut Option<String>,
+) {
+    let msgs = match persist.list_since(LIFECYCLE_RESULT_TOPIC, cursor.as_deref()) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    for msg in msgs {
+        *cursor = Some(msg.ulid.clone());
+        let req: serde_json::Value = serde_json::from_str(msg.body.as_deref().unwrap_or("{}"))
+            .unwrap_or(serde_json::Value::Null);
+        let reply = match (
+            req.get("peer").and_then(|v| v.as_str()),
+            req.get("id").and_then(|v| v.as_str()),
+        ) {
+            (Some(peer), Some(id)) => {
+                match crate::lifecycle::take_result(&svc.workgroup_root, peer, id) {
+                    Some(r) => json!({ "ok": true, "found": true,
+                                       "result": { "ok": r.ok, "error": r.error } }),
+                    None => json!({ "ok": true, "found": false }),
+                }
+            }
+            _ => json!({ "ok": false, "error": "lifecycle-result: need peer + id" }),
+        }
+        .to_string();
+        let _ = persist.write(
+            &reply_topic(&msg.ulid),
+            Priority::Default,
+            None,
+            Some(&reply),
+        );
     }
 }
 
