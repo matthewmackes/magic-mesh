@@ -1,6 +1,14 @@
-//! v4.0.1 WB-2.l — Network → Remote Desktop panel.
+//! Network → Remote Access panel (SVC-1: SSH + RDP + VNC).
 //!
-//! Per-peer RDP / VNC launch surface. Reads the operator's
+//! Per-peer SSH / RDP / VNC launch surface (the v4.0.1 WB-2.l
+//! Remote Desktop panel grown to absorb the retired `mesh_ssh`
+//! nav stub, B1). SSH opens cosmic-term running `ssh $USER@host`
+//! (the PEERS L7 lock); RDP/VNC shell to remmina. Each known
+//! host is TCP-probed on port 22 so the SSH button reflects the
+//! remote sshd state; the local sshd state shows in the header
+//! (Q56/Q58 — local + remote visibility, no ACL).
+//!
+//! Reads the operator's
 //! known-host list from `~/.config/mde/peer-macs.json` (cached
 //! by `mackes/mesh_wol.py::cache_peer_macs`), surfaces each as
 //! a row with "Connect (RDP)" / "Connect (VNC)" buttons, and
@@ -24,6 +32,7 @@ use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
+    Ssh,
     Rdp,
     Vnc,
 }
@@ -31,18 +40,21 @@ pub enum Protocol {
 impl Protocol {
     fn scheme(self) -> &'static str {
         match self {
+            Self::Ssh => "ssh",
             Self::Rdp => "rdp",
             Self::Vnc => "vnc",
         }
     }
     fn default_port(self) -> u16 {
         match self {
+            Self::Ssh => 22,
             Self::Rdp => 3389,
             Self::Vnc => 5900,
         }
     }
     fn label(self) -> &'static str {
         match self {
+            Self::Ssh => "SSH",
             Self::Rdp => "RDP",
             Self::Vnc => "VNC",
         }
@@ -53,6 +65,8 @@ impl Protocol {
 pub struct KnownHost {
     pub ip: String,
     pub mac: String,
+    /// Remote sshd state — `None` until the port-22 probe lands.
+    pub sshd: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -61,6 +75,9 @@ pub struct RemoteDesktopPanel {
     pub manual_input: String,
     pub status: String,
     pub busy: bool,
+    /// This box's sshd state (`systemctl is-active sshd`); `None`
+    /// until probed.
+    pub local_sshd: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +95,13 @@ pub enum Message {
         protocol: Protocol,
         success: bool,
     },
+    /// The port-22 probe for one known host resolved (SVC-1).
+    SshProbed {
+        host: String,
+        up: bool,
+    },
+    /// `systemctl is-active sshd` on this box resolved (SVC-1).
+    LocalSshdProbed(bool),
 }
 
 impl RemoteDesktopPanel {
@@ -105,6 +129,31 @@ impl RemoteDesktopPanel {
                         if self.hosts.len() == 1 { "" } else { "s" }
                     )
                 };
+                // SVC-1 — fan out the sshd visibility probes: one local
+                // systemd query + one port-22 TCP probe per known host.
+                let mut probes = vec![Task::perform(probe_local_sshd(), |up| {
+                    crate::Message::RemoteDesktop(Message::LocalSshdProbed(up))
+                })];
+                for h in &self.hosts {
+                    let ip = h.ip.clone();
+                    probes.push(Task::perform(
+                        async move {
+                            let up = probe_ssh_port(&ip).await;
+                            (ip, up)
+                        },
+                        |(host, up)| crate::Message::RemoteDesktop(Message::SshProbed { host, up }),
+                    ));
+                }
+                Task::batch(probes)
+            }
+            Message::SshProbed { host, up } => {
+                if let Some(h) = self.hosts.iter_mut().find(|h| h.ip == host) {
+                    h.sshd = Some(up);
+                }
+                Task::none()
+            }
+            Message::LocalSshdProbed(up) => {
+                self.local_sshd = Some(up);
                 Task::none()
             }
             Message::ReloadClicked => {
@@ -179,10 +228,15 @@ impl RemoteDesktopPanel {
         let palette = crate::live_theme::palette();
         let sizes = FontSize::defaults();
 
-        let title = text("Remote Desktop")
+        let local_sshd_line = match self.local_sshd {
+            Some(true) => "local sshd: active",
+            Some(false) => "local sshd: inactive",
+            None => "local sshd: checking…",
+        };
+        let title = text("Remote Access")
             .size(TypeRole::Display.size_in(sizes))
             .color(palette.text.into_iced_color());
-        let subtitle = text(self.status.clone())
+        let subtitle = text(format!("{} · {}", self.status, local_sshd_line))
             .size(TypeRole::Body.size_in(sizes))
             .color(palette.text_muted.into_iced_color());
 
@@ -190,6 +244,9 @@ impl RemoteDesktopPanel {
             text_input("hostname or IP (e.g. 172.20.146.245)", &self.manual_input)
                 .on_input(|s| crate::Message::RemoteDesktop(Message::ManualInputChanged(s)))
                 .padding(Padding::from([6u16, 10u16])),
+            connect_btn("Connect SSH", palette, false).on_press(crate::Message::RemoteDesktop(
+                Message::ConnectManualClicked(Protocol::Ssh)
+            ),),
             connect_btn("Connect RDP", palette, false).on_press(crate::Message::RemoteDesktop(
                 Message::ConnectManualClicked(Protocol::Rdp)
             ),),
@@ -328,6 +385,30 @@ fn host_row<'a>(h: &'a KnownHost, palette: Palette) -> Element<'a, crate::Messag
         .color(palette.text_muted.into_iced_color());
 
     let ip = h.ip.clone();
+    // SVC-1 — SSH button gates on the probed remote sshd state:
+    // enabled while unknown (optimistic) or up; disabled when the
+    // probe said nothing listens on 22.
+    let ssh_btn = {
+        let b = connect_btn(
+            match h.sshd {
+                Some(true) => "SSH ✓",
+                Some(false) => "SSH ✗",
+                None => "SSH",
+            },
+            palette,
+            false,
+        );
+        if h.sshd == Some(false) {
+            b
+        } else {
+            b.on_press(crate::Message::RemoteDesktop(
+                Message::ConnectKnownClicked {
+                    host: ip.clone(),
+                    protocol: Protocol::Ssh,
+                },
+            ))
+        }
+    };
     let rdp_btn = connect_btn("RDP", palette, false).on_press(crate::Message::RemoteDesktop(
         Message::ConnectKnownClicked {
             host: ip.clone(),
@@ -345,6 +426,7 @@ fn host_row<'a>(h: &'a KnownHost, palette: Palette) -> Element<'a, crate::Messag
         icon_widget,
         column![ip_text, mac_text].spacing(2),
         Space::new().width(Length::Fill),
+        ssh_btn,
         rdp_btn,
         vnc_btn,
     ]
@@ -456,7 +538,11 @@ pub fn parse_peer_macs(raw: &str) -> Option<Vec<KnownHost>> {
     let map: BTreeMap<String, String> = serde_json::from_str(raw).ok()?;
     Some(
         map.into_iter()
-            .map(|(ip, mac)| KnownHost { ip, mac })
+            .map(|(ip, mac)| KnownHost {
+                ip,
+                mac,
+                sshd: None,
+            })
             .collect(),
     )
 }
@@ -467,6 +553,23 @@ pub fn parse_peer_macs(raw: &str) -> Option<Vec<KnownHost>> {
 /// "did the binary launch."
 pub async fn launch_remmina(host: &str, protocol: Protocol) -> bool {
     use tokio::process::Command;
+    if protocol == Protocol::Ssh {
+        // SVC-1 / PEERS L7 — SSH opens the platform terminal running
+        // `ssh $USER@host` (Cosmic owns the desktop; cosmic-term is
+        // its terminal). $USER default per L7 — zero config.
+        let user = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        let target = format!("{user}@{host}");
+        let status = Command::new("cosmic-term")
+            .args(["--", "ssh", &target])
+            .spawn();
+        return match status {
+            Ok(mut child) => {
+                let _ = child.try_wait();
+                true
+            }
+            Err(_) => false,
+        };
+    }
     let url = format!(
         "{}://{}:{}",
         protocol.scheme(),
@@ -484,6 +587,34 @@ pub async fn launch_remmina(host: &str, protocol: Protocol) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// SVC-1 — TCP probe of port 22 on `host` (800 ms budget). `true`
+/// means something is listening — the remote sshd visibility the
+/// panel renders per row.
+pub async fn probe_ssh_port(host: &str) -> bool {
+    use tokio::net::TcpStream;
+    use tokio::time::{timeout, Duration};
+    matches!(
+        timeout(
+            Duration::from_millis(800),
+            TcpStream::connect((host, 22u16)),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
+/// SVC-1 — this box's sshd state via systemd.
+pub async fn probe_local_sshd() -> bool {
+    use tokio::process::Command;
+    matches!(
+        Command::new("systemctl")
+            .args(["is-active", "--quiet", "sshd"])
+            .status()
+            .await,
+        Ok(st) if st.success()
+    )
 }
 
 #[cfg(test)]
@@ -540,13 +671,44 @@ mod tests {
             KnownHost {
                 ip: "10.0.0.1".into(),
                 mac: "aa:bb:cc:dd:ee:01".into(),
+                sshd: Some(true),
             },
             KnownHost {
                 ip: "10.0.0.2".into(),
                 mac: "aa:bb:cc:dd:ee:02".into(),
+                sshd: Some(false),
             },
         ];
         let _ = p.view();
+    }
+
+    #[test]
+    fn ssh_probe_result_lands_on_the_right_host() {
+        let mut p = RemoteDesktopPanel::new();
+        p.hosts = vec![KnownHost {
+            ip: "10.0.0.9".into(),
+            mac: "aa:bb:cc:dd:ee:09".into(),
+            sshd: None,
+        }];
+        let _ = p.update(Message::SshProbed {
+            host: "10.0.0.9".into(),
+            up: true,
+        });
+        assert_eq!(p.hosts[0].sshd, Some(true));
+    }
+
+    #[test]
+    fn local_sshd_probe_lands_in_state() {
+        let mut p = RemoteDesktopPanel::new();
+        let _ = p.update(Message::LocalSshdProbed(false));
+        assert_eq!(p.local_sshd, Some(false));
+    }
+
+    #[test]
+    fn ssh_protocol_has_port_22_and_scheme() {
+        assert_eq!(Protocol::Ssh.default_port(), 22);
+        assert_eq!(Protocol::Ssh.scheme(), "ssh");
+        assert_eq!(Protocol::Ssh.label(), "SSH");
     }
 
     #[test]

@@ -12,9 +12,7 @@ use std::path::PathBuf;
 use iced::widget::button::Status as ButtonStatus;
 use iced::widget::{button, column, row, text, text_editor, text_input, Space};
 use iced::{alignment, Background, Border, Color, Element, Length, Task};
-use mde_theme::{
-    CardState, EmptyState, FontSize, Icon, ObjectCard, Palette, Radii, TypeRole,
-};
+use mde_theme::{CardState, EmptyState, FontSize, Icon, ObjectCard, Palette, Radii, TypeRole};
 
 use crate::panel_chrome::{empty_state, object_card, panel_container};
 

@@ -389,7 +389,7 @@ impl App {
     }
 
     /// Build an [`App`] pre-focused on a deep-link slug
-    /// (e.g. `mde --focus network.mesh_ssh`). Falls back to
+    /// (e.g. `--focus network.remote_desktop`). Falls back to
     /// the default Dashboard view when the slug is unknown.
     #[must_use]
     pub fn with_focus(focus_slug: &str) -> Self {
@@ -1377,13 +1377,13 @@ mod tests {
         let mut app = App::new();
         let _ = app.update(Message::SelectPanel {
             group: Group::Network,
-            panel: "mesh_ssh",
+            panel: "remote_desktop",
         });
         assert_eq!(
             app.current_view(),
             View::Panel {
                 group: Group::Network,
-                panel: "mesh_ssh"
+                panel: "remote_desktop"
             }
         );
     }
@@ -1435,12 +1435,14 @@ mod tests {
 
     #[test]
     fn with_focus_lands_on_named_panel_and_focuses_main() {
+        // network.mesh_ssh is the retired B1 slug — it aliases to the
+        // Remote Access panel that absorbed it (SVC-1).
         let app = App::with_focus("network.mesh_ssh");
         assert_eq!(
             app.current_view(),
             View::Panel {
                 group: Group::Network,
-                panel: "mesh_ssh"
+                panel: "remote_desktop"
             }
         );
         assert_eq!(app.focused_pane(), Pane::Main);
@@ -1587,7 +1589,7 @@ mod tests {
             app.current_view(),
             View::Panel {
                 group: Group::Network,
-                panel: "mesh_ssh"
+                panel: "remote_desktop"
             }
         );
         assert_eq!(app.focused_pane(), Pane::Main);

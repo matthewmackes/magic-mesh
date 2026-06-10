@@ -282,7 +282,6 @@ pub fn nav_model() -> Vec<NavEntry> {
                 Panel::new("mesh_pending", "Mesh Pending"),
                 Panel::new("mesh_history", "Mesh History"),
                 Panel::new("mesh_join", "Mesh Join"),
-                Panel::new("mesh_ssh", "Mesh SSH"),
                 Panel::new("mesh_topology", "Mesh Topology"),
                 Panel::new("mesh_services", "Mesh Services"),
                 // MESHFS-13.1 (v5.0.0) — Mesh Storage panel (per-peer
@@ -304,7 +303,7 @@ pub fn nav_model() -> Vec<NavEntry> {
                 Panel::new("service_publishing", "Service Publishing"),
                 Panel::new("vpn", "VPN"),
                 Panel::new("firewall", "Firewall"),
-                Panel::new("remote_desktop", "Remote Desktop"),
+                Panel::new("remote_desktop", "Remote Access"),
                 // KDC2-5.8 (v2.1, 2026-05-22): "KDE Connect"
                 // standalone panel retired. KDC integration
                 // surfaces through `mde-peer-card` under the
@@ -366,9 +365,16 @@ pub fn resolve_panel_label(group: Group, panel_slug: &str) -> Option<&'static st
 
 /// Resolve a deep-link slug into the matching [`View`]. Accepts
 /// `<group>` or `<group>.<panel>` forms (e.g. `network` or
-/// `network.mesh_ssh`). Unknown slugs return `None`.
+/// `network.remote_desktop`). Unknown slugs return `None`.
+/// `network.mesh_ssh` (the retired B1 entry) aliases to the
+/// Remote Access panel that absorbed it (SVC-1).
 #[must_use]
 pub fn view_from_focus_slug(slug: &str) -> Option<View> {
+    let slug = if slug == "network.mesh_ssh" {
+        "network.remote_desktop"
+    } else {
+        slug
+    };
     let (group_slug, panel_slug) = slug
         .split_once('.')
         .map_or((slug, None), |(g, p)| (g, Some(p)));
@@ -464,7 +470,7 @@ mod tests {
         assert_eq!(
             View::Panel {
                 group: Group::Network,
-                panel: "mesh_ssh"
+                panel: "remote_desktop"
             }
             .group(),
             Group::Network
@@ -495,10 +501,18 @@ mod tests {
     #[test]
     fn focus_slug_resolves_group_and_panel() {
         assert_eq!(
+            view_from_focus_slug("network.remote_desktop"),
+            Some(View::Panel {
+                group: Group::Network,
+                panel: "remote_desktop"
+            })
+        );
+        // The retired mesh_ssh slug aliases to Remote Access (SVC-1/B1).
+        assert_eq!(
             view_from_focus_slug("network.mesh_ssh"),
             Some(View::Panel {
                 group: Group::Network,
-                panel: "mesh_ssh"
+                panel: "remote_desktop"
             })
         );
     }

@@ -116,13 +116,13 @@ mod tests {
     fn breadcrumb_for_panel_has_three_crumbs_with_full_slug() {
         let crumbs = breadcrumb(View::Panel {
             group: Group::Network,
-            panel: "mesh_ssh",
+            panel: "remote_desktop",
         });
         assert_eq!(crumbs.len(), 3);
         assert_eq!(crumbs[0].slug, "");
         assert_eq!(crumbs[1].slug, "network");
-        assert_eq!(crumbs[2].slug, "network.mesh_ssh");
-        assert_eq!(crumbs[2].label, "Mesh SSH");
+        assert_eq!(crumbs[2].slug, "network.remote_desktop");
+        assert_eq!(crumbs[2].label, "Remote Access");
     }
 
     #[test]
@@ -164,16 +164,15 @@ mod tests {
 
     #[test]
     fn page_subtitle_counts_panels_for_group_view() {
-        // 16 panels in Network: wifi, mesh_control, mesh_pending,
-        // mesh_history, mesh_join, mesh_ssh, mesh_topology,
-        // mesh_services, mesh_bus (9 mesh/net panels post-KDC2-5.8
-        // retirement) + service_publishing (NF-13.8, v2.5) + vpn
-        // + firewall + remote_desktop + mesh_federation (TUNE-15.b)
-        // + network_hosts (MESH-PROBE-9.a, v10.0.0 — probe inventory)
-        // + mesh_storage (MESHFS-13.1, v5.0.0 — surfaced for the Overview
-        // File Sharing row's deep-link).
-        // See `crates/mde-workbench/src/model.rs:239` for the lock.
-        assert_eq!(page_subtitle(View::Group(Group::Network)), "16 panels");
+        // 15 panels in Network: wifi, mesh_control, mesh_pending,
+        // mesh_history, mesh_join, mesh_topology, mesh_services,
+        // mesh_bus (8 mesh/net panels — mesh_ssh retired into
+        // Remote Access, SVC-1/B1) + service_publishing (NF-13.8)
+        // + vpn + firewall + remote_desktop (Remote Access)
+        // + mesh_federation (TUNE-15.b) + network_hosts
+        // (MESH-PROBE-9.a) + mesh_storage (MESHFS-13.1).
+        // See `crates/mde-workbench/src/model.rs` for the lock.
+        assert_eq!(page_subtitle(View::Group(Group::Network)), "15 panels");
     }
 
     #[test]
