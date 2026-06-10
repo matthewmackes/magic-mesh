@@ -3460,9 +3460,10 @@ fn run_serve(
 ) -> anyhow::Result<()> {
     use mackesd_core::workers::{
         firewall_preset::FirewallPresetWorker, fleet_reconcile, heartbeat::HeartbeatWorker,
-        job_exec, lifecycle_exec, mdns_relay::MdnsRelayWorker, mesh_router::MeshRouterWorker,
-        presence_watch, ssh_pubkey_gossip, sshd_overlay_bind::SshdOverlayBindWorker,
-        voice_config::VoiceConfigWorker, RestartPolicy, Spawn, Supervisor,
+        job_exec, lifecycle_exec, mdns_relay::MdnsRelayWorker, mesh_dns,
+        mesh_router::MeshRouterWorker, presence_watch, ssh_pubkey_gossip,
+        sshd_overlay_bind::SshdOverlayBindWorker, voice_config::VoiceConfigWorker, RestartPolicy,
+        Spawn, Supervisor,
     };
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -3725,6 +3726,15 @@ fn run_serve(
                 RestartPolicy::OnFailure,
             ));
             worker_names.lock().expect("worker_names mutex").push("fleet_reconcile".into());
+        }
+        // PLANES-18 — mesh DNS: feed <host>.mesh into resolved +
+        // /etc/hosts on every node (rank 0 plumbing).
+        if mackesd_core::worker_role::runs("mesh_dns", role_rank) {
+            sup.spawn(Spawn::new(
+                mesh_dns::MeshDnsWorker::new(workgroup_root.clone(), Some(db_path.clone())),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names.lock().expect("worker_names mutex").push("mesh_dns".into());
         }
         // PLANES-9 — the local job executor (execution-tag gated, W84).
         if mackesd_core::worker_role::runs("job_exec", role_rank) {
