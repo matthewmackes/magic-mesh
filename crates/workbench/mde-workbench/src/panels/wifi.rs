@@ -14,7 +14,6 @@
 
 use iced::widget::{column, container, row, scrollable, text};
 use iced::{Element, Length, Task};
-use mde_theme::Palette;
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -165,7 +164,7 @@ impl WifiPanel {
             "Refresh",
             ButtonVariant::Ghost,
             (!self.busy).then(|| crate::Message::Wifi(Message::RefreshClicked)),
-            Palette::dark(),
+            crate::live_theme::palette(),
         );
 
         let conn_view = self.connections.iter().fold(column![], |col, c| {
@@ -189,7 +188,7 @@ impl WifiPanel {
                 ButtonVariant::Secondary,
                 (!self.busy && !n.in_use)
                     .then(|| crate::Message::Wifi(Message::ConnectClicked(ssid))),
-                Palette::dark(),
+                crate::live_theme::palette(),
             );
             col.push(
                 row![

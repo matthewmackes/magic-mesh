@@ -8,7 +8,7 @@
 
 use iced::widget::{column, container, scrollable, text, Space};
 use iced::{Element, Length, Padding};
-use mde_theme::{FontSize, Palette, TypeRole};
+use mde_theme::{FontSize, TypeRole};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AboutPanel;
@@ -28,7 +28,7 @@ impl AboutPanel {
     }
 
     pub fn view<'a>() -> Element<'a, crate::Message> {
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         let sizes = FontSize::defaults();
         let title = text("About Mackes Workstation")
             .size(TypeRole::Display.size_in(sizes))

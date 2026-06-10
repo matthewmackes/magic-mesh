@@ -15,7 +15,6 @@
 
 use iced::widget::{column, container, row, scrollable, text, text_input};
 use iced::{Element, Length, Task};
-use mde_theme::Palette;
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -222,7 +221,7 @@ impl AppsSourcesPanel {
         let filter_input = text_input("Filter…", &self.filter)
             .on_input(|v| crate::Message::AppsSources(Message::FilterChanged(v)));
         // UX-7.a — refresh routed through the shared button variant.
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         let refresh_btn = variant_button(
             "Refresh",
             ButtonVariant::Ghost,

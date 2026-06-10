@@ -85,7 +85,7 @@ pub enum HeaderAction {
 pub fn view<'a, Message: Clone + 'a>(
     on_action: impl Fn(HeaderAction) -> Message + 'a,
 ) -> Element<'a, Message> {
-    let palette = Palette::dark();
+    let palette = crate::live_theme::palette();
     let sizes = FontSize::defaults();
     let weights = FontWeight::defaults();
 

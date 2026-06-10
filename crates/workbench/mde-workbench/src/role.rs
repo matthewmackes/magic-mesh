@@ -107,7 +107,7 @@ pub fn role_action_panels(group: Group) -> Vec<Panel> {
 /// Render the role-card landing for a group-root view.
 #[must_use]
 pub fn role_landing<'a>(group: Group) -> Element<'a, Message> {
-    let palette = Palette::dark();
+    let palette = crate::live_theme::palette();
 
     // ── header: icon + title + description ──────────────────────────
     let icon_widget = header_icon(role_icon(group), palette);

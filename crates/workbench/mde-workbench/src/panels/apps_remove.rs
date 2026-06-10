@@ -16,7 +16,6 @@ use std::collections::HashSet;
 
 use iced::widget::{checkbox, column, container, row, scrollable, text};
 use iced::{Element, Length, Padding, Task};
-use mde_theme::Palette;
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -163,7 +162,7 @@ impl AppsRemovePanel {
     pub fn view(&self) -> Element<'_, crate::Message> {
         let busy = self.busy;
         // UX-7.a — bulk select toggles → Ghost (low emphasis).
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         let select_all = variant_button(
             "Select all",
             ButtonVariant::Ghost,

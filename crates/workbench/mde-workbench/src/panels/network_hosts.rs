@@ -107,7 +107,7 @@ impl NetworkHostsPanel {
     }
 
     pub fn view(&self) -> Element<'_, crate::Message> {
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         let sizes = FontSize::defaults();
 
         let title = text("Network Hosts")
@@ -471,7 +471,7 @@ mod tests {
         assert_eq!(trust_label(""), "unscored");
         assert_eq!(trust_label("trusted"), "trusted");
         // Unscored uses the muted token, not green/red.
-        let p = Palette::dark();
+        let p = crate::live_theme::palette();
         assert_eq!(trust_color("", p), p.text_muted.into_iced_color());
         assert_ne!(trust_color("trusted", p), p.text_muted.into_iced_color());
     }

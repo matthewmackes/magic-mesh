@@ -47,6 +47,7 @@ impl Palette {
     pub const fn for_theme(theme: Theme) -> Self {
         match theme {
             Theme::Dark => Self::dark(),
+            Theme::Gray90 => Self::gray_90(),
             Theme::Light => Self::light(),
         }
     }
@@ -76,6 +77,34 @@ impl Palette {
             // Text secondary / helper — Gray 50.
             text_muted: carbon::GRAY_50,
             // Support roles — Carbon Green 50 / Red 60 / Yellow 30.
+            success: carbon::GREEN_50,
+            danger: carbon::RED_60,
+            warning: carbon::YELLOW_30,
+        }
+    }
+
+    /// Gray-90 dark palette — **IBM Carbon Gray 90** (GUI-1 / Q35):
+    /// the published g90 theme — every surface one ramp step lighter
+    /// than [`Self::dark`], same Blue 60 accent + support trio.
+    pub const fn gray_90() -> Self {
+        Self {
+            // Carbon g90 background — Gray 90.
+            background: carbon::GRAY_90,
+            // Layer-01 on g90 — Gray 80.
+            surface: carbon::GRAY_80,
+            // Layer-02 on g90 — Gray 70.
+            raised: carbon::GRAY_70,
+            // Overlay tier on g90 — Gray 60.
+            overlay: carbon::GRAY_60,
+            // Interactive accent — Carbon Blue 60 (same across themes).
+            accent: carbon::BLUE_60,
+            // Border-subtle on g90 — Gray 70.
+            border: carbon::GRAY_70,
+            // Text primary on dark — Gray 10.
+            text: carbon::GRAY_10,
+            // Text secondary on g90 — Gray 30.
+            text_muted: carbon::GRAY_30,
+            // Support roles — same trio as the Gray 100 theme.
             success: carbon::GREEN_50,
             danger: carbon::RED_60,
             warning: carbon::YELLOW_30,
@@ -125,6 +154,20 @@ impl Palette {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gray_90_palette_is_published_carbon_g90() {
+        // GUI-1 / Q35 — pin the g90 surfaces one ramp step lighter
+        // than Gray 100, same accent.
+        let p = Palette::gray_90();
+        assert_eq!(
+            (p.background.r, p.background.g, p.background.b),
+            (0x26, 0x26, 0x26)
+        );
+        assert_eq!((p.surface.r, p.surface.g, p.surface.b), (0x39, 0x39, 0x39));
+        assert_eq!((p.text.r, p.text.g, p.text.b), (0xf4, 0xf4, 0xf4));
+        assert_eq!((p.accent.r, p.accent.g, p.accent.b), (0x0f, 0x62, 0xfe));
+    }
 
     #[test]
     fn accent_is_carbon_blue_60() {

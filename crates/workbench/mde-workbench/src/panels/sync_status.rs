@@ -84,7 +84,7 @@ impl SyncStatusPanel {
     }
 
     pub fn view(&self) -> Element<'_, crate::Message> {
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         let sizes = FontSize::defaults();
 
         let title = text("Panel Sync Status")

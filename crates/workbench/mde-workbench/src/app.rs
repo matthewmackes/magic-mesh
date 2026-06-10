@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use iced::widget::{column, container, row, text};
 use iced::{window, Element, Length, Size, Subscription, Task, Theme};
-use mde_theme::Palette;
 
 use crate::backend::{Backend, RemoteBackend};
 use crate::dbus::PendingFocus;
@@ -56,7 +55,7 @@ pub const WIN_H: f32 = 760.0;
 /// every surface shares the one source.
 #[must_use]
 pub fn mde_workbench_iced_theme() -> Theme {
-    let p = Palette::dark();
+    let p = crate::live_theme::palette();
     let palette = iced::theme::Palette {
         background: p.background.into_iced_color(),
         text: p.text.into_iced_color(),
@@ -702,7 +701,7 @@ impl App {
                 let task = self.apply_focus_request(&slug);
                 task
             }
-            Message::Themes(msg) => self.themes.update(msg, self.backend()),
+            Message::Themes(msg) => self.themes.update(msg),
             Message::Fonts(msg) => self.fonts.update(msg, self.backend()),
             Message::Session(msg) => self.session.update(msg, self.backend()),
             Message::Notifications(msg) => self.notifications.update(msg, self.backend()),
@@ -824,7 +823,7 @@ impl App {
     /// shipped yet) just no-op.
     fn on_panel_navigated(&self, group: Group, panel: &'static str) -> Task<Message> {
         match (group, panel) {
-            (Group::LookAndFeel, "themes") => themes_panel::ThemesPanel::load(self.backend()),
+            (Group::LookAndFeel, "themes") => themes_panel::ThemesPanel::load(),
             (Group::LookAndFeel, "fonts") => fonts_panel::FontsPanel::load(self.backend()),
             (Group::LookAndFeel, "wallpaper") => {
                 wallpaper_panel::WallpaperPanel::load(self.backend())
@@ -1318,7 +1317,7 @@ impl App {
 /// tools icon + curated panel label + Back-to-group CTA wired
 /// through `Message::SelectGroup`).
 fn panel_under_construction(view: View) -> Element<'static, Message> {
-    let palette = mde_theme::Palette::dark();
+    let palette = crate::live_theme::palette();
     let group = view.group();
     let (heading, body): (String, String) = match view {
         View::Group(g) => (
@@ -1483,39 +1482,19 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn themes_panel_save_round_trips_through_backend() {
-        let backend = std::sync::Arc::new(DemoBackend::new());
-        let mut app = App::with_backend(backend.clone());
-        let _ = app.update(Message::Themes(themes_panel::Message::NameChanged(
-            "Arc-Dark".into(),
+    #[test]
+    fn themes_panel_picks_route_through_app_reducer() {
+        // GUI-3 — the rewritten panel holds the pending Carbon-gray
+        // selection; picks route through the App reducer.
+        let mut app = App::new();
+        let _ = app.update(Message::Themes(themes_panel::Message::ThemePicked(
+            "gray90".into(),
         )));
-        let _ = app.update(Message::Themes(themes_panel::Message::IconSetChanged(
-            "Papirus-Dark".into(),
+        let _ = app.update(Message::Themes(themes_panel::Message::DensityPicked(
+            "compact".into(),
         )));
-        let _ = app.update(Message::Themes(themes_panel::Message::AccentChanged(
-            "blue".into(),
-        )));
-        let _ = app.update(Message::Themes(themes_panel::Message::ModeChanged(
-            "dark".into(),
-        )));
-        // Open-code the save dispatch — iced's executor isn't
-        // available in unit tests so we drive the backend
-        // side directly to assert the round-trip.
-        backend
-            .set(themes_panel::KEY_NAME, "\"Arc-Dark\"")
-            .await
-            .unwrap();
-        backend
-            .set(themes_panel::KEY_MODE, "\"dark\"")
-            .await
-            .unwrap();
-        assert_eq!(
-            backend.get(themes_panel::KEY_MODE).await.unwrap(),
-            "\"dark\""
-        );
-        assert_eq!(app.themes().name, "Arc-Dark");
-        assert_eq!(app.themes().mode, "dark");
+        assert_eq!(app.themes().theme, "gray90");
+        assert_eq!(app.themes().density, "compact");
     }
 
     #[test]
@@ -1659,7 +1638,7 @@ mod tests {
     }
 
     // UX-3 — theme() returns a custom Iced theme derived from
-    // mde_theme::Palette::dark(). E9 (2026-06-07) moved that palette to
+    // crate::live_theme::palette(). E9 (2026-06-07) moved that palette to
     // Carbon-only; the next two tests guard the resulting Carbon values.
 
     #[test]

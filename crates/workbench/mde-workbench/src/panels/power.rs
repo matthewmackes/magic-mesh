@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use iced::widget::{checkbox, column, pick_list, row, text, text_input};
 use iced::{Element, Length, Task};
-use mde_theme::Palette;
 
 use crate::controls::{variant_button, ButtonVariant};
 
@@ -206,7 +205,7 @@ impl PowerPanel {
             apply_label,
             ButtonVariant::Primary,
             (!self.busy).then(|| crate::Message::Power(Message::SaveClicked)),
-            Palette::dark(),
+            crate::live_theme::palette(),
         );
         let profile_pick: pick_list::PickList<'_, &'static str, _, _, crate::Message> =
             pick_list(PROFILES, current(&PROFILES, &self.profile), |v| {

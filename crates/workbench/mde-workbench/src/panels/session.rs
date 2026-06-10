@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use iced::widget::{checkbox, column, row, text};
 use iced::{Element, Length, Task};
-use mde_theme::Palette;
 
 use crate::controls::{variant_button, ButtonVariant};
 
@@ -143,7 +142,7 @@ impl SessionPanel {
             apply_label,
             ButtonVariant::Primary,
             (!self.busy).then(|| crate::Message::Session(Message::SaveClicked)),
-            Palette::dark(),
+            crate::live_theme::palette(),
         );
 
         column![

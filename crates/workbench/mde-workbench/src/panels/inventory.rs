@@ -10,7 +10,7 @@
 
 use iced::widget::{column, container, row, scrollable, text};
 use iced::{Element, Length, Padding, Task};
-use mde_theme::{Density, EmptyState, Icon, Palette};
+use mde_theme::{Density, EmptyState, Icon};
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -130,7 +130,7 @@ impl InventoryPanel {
             "Refresh",
             ButtonVariant::Ghost,
             (!self.busy).then(|| crate::Message::Inventory(Message::RefreshClicked)),
-            Palette::dark(),
+            crate::live_theme::palette(),
         );
 
         if self.rows.is_empty() {
@@ -144,7 +144,7 @@ impl InventoryPanel {
             )
             .with_icon(Icon::Fleet);
             return panel_container(
-                empty_state(state, Palette::dark(), || {
+                empty_state(state, crate::live_theme::palette(), || {
                     crate::Message::Inventory(Message::RefreshClicked)
                 }),
                 Density::Comfortable,
@@ -168,7 +168,7 @@ impl InventoryPanel {
                     "Detail",
                     ButtonVariant::Ghost,
                     Some(crate::Message::Inventory(Message::FocusRow(id))),
-                    Palette::dark(),
+                    crate::live_theme::palette(),
                 )
             };
             // UX-6 — health renders as a pill-shaped status
@@ -184,7 +184,7 @@ impl InventoryPanel {
                     container(status_badge(
                         health_glyph(&row_data.health),
                         severity,
-                        Palette::dark(),
+                        crate::live_theme::palette(),
                     ))
                     .width(Length::Fixed(100.0)),
                     text(row_data.region.as_deref().unwrap_or("-")).width(Length::Fixed(120.0)),
@@ -215,7 +215,7 @@ impl InventoryPanel {
             "← Back to roster",
             ButtonVariant::Ghost,
             Some(crate::Message::Inventory(Message::Back)),
-            Palette::dark(),
+            crate::live_theme::palette(),
         );
         column![
             row![back_btn, text(format!("Peer detail — {node_id}")).size(18),].spacing(12),

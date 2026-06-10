@@ -25,7 +25,7 @@ impl HubPanel {
     }
 
     pub fn view(&self) -> Element<'_, crate::Message> {
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         let sizes = FontSize::defaults();
         let title = text("Maintain")
             .size(TypeRole::Display.size_in(sizes))

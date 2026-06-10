@@ -11,13 +11,17 @@ use crate::shadows::Shadow;
 use crate::spacing::Space;
 use crate::typography::{FontSize, FontWeight, LetterSpacing};
 
-/// Theme selection. Dark by default; light ships in v2.2.
+/// Theme selection — exactly the three Carbon gray themes §4
+/// names (GUI-1): **Gray 100** (`Dark`, the default), **Gray 90**
+/// (`Gray90`), and **Gray 10** (`Light`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Theme {
-    /// Dark theme — charcoal background (Q3).
+    /// Carbon **Gray 100** dark theme — the default (§4).
     Dark,
-    /// Light theme — soft-white background. Co-ships with dark
-    /// in v2.2 per Q5 + FU-2.
+    /// Carbon **Gray 90** dark theme — one surface step lighter
+    /// than Gray 100 (GUI-1 / Q35).
+    Gray90,
+    /// Carbon **Gray 10** light theme.
     Light,
 }
 
@@ -32,6 +36,7 @@ impl Theme {
     pub fn id(self) -> &'static str {
         match self {
             Theme::Dark => "dark",
+            Theme::Gray90 => "gray90",
             Theme::Light => "light",
         }
     }
@@ -40,8 +45,9 @@ impl Theme {
     /// unknown input.
     pub fn from_id(s: &str) -> Option<Self> {
         match s {
-            "dark" => Some(Theme::Dark),
-            "light" => Some(Theme::Light),
+            "dark" | "gray100" => Some(Theme::Dark),
+            "gray90" => Some(Theme::Gray90),
+            "light" | "gray10" => Some(Theme::Light),
             _ => None,
         }
     }
@@ -101,7 +107,7 @@ mod tests {
 
     #[test]
     fn theme_id_round_trips() {
-        for t in [Theme::Dark, Theme::Light] {
+        for t in [Theme::Dark, Theme::Gray90, Theme::Light] {
             assert_eq!(Some(t), Theme::from_id(t.id()));
         }
     }

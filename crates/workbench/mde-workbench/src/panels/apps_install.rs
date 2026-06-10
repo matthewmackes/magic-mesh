@@ -12,7 +12,6 @@
 
 use iced::widget::{column, container, row, scrollable, text, text_input};
 use iced::{Element, Length, Padding, Task};
-use mde_theme::Palette;
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -136,7 +135,7 @@ impl AppsInstallPanel {
             install_label,
             ButtonVariant::Primary,
             (!self.busy).then(|| crate::Message::AppsInstall(Message::InstallClicked)),
-            Palette::dark(),
+            crate::live_theme::palette(),
         );
 
         let quick_rows = RECOMMENDED.iter().fold(column![], |col, (pkg, desc)| {
@@ -148,7 +147,7 @@ impl AppsInstallPanel {
                 ButtonVariant::Secondary,
                 (!self.busy)
                     .then(|| crate::Message::AppsInstall(Message::QuickInstallClicked(name))),
-                Palette::dark(),
+                crate::live_theme::palette(),
             );
             col.push(
                 row![

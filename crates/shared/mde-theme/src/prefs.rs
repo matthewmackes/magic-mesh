@@ -71,6 +71,23 @@ impl Preferences {
         prefs
     }
 
+    /// Persist to the standard XDG path (creating `~/.config/mde/`),
+    /// so a Workbench theme change survives restart (GUI-3).
+    /// Available behind the `serde` feature.
+    #[cfg(feature = "serde")]
+    pub fn save(&self) -> std::io::Result<()> {
+        let path = Self::xdg_path().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no XDG_CONFIG_HOME/HOME")
+        })?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let toml = self
+            .to_toml_string()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        std::fs::write(path, toml)
+    }
+
     /// Standard XDG path for the preferences file —
     /// `${XDG_CONFIG_HOME:-$HOME/.config}/mde/preferences.toml`.
     /// Returns `None` if neither `XDG_CONFIG_HOME` nor `HOME`

@@ -102,7 +102,7 @@ pub fn view<'a>(
     on_group_click: impl Fn(Group) -> crate::Message + 'a,
     on_panel_click: impl Fn(Group, &'static str) -> crate::Message + 'a,
 ) -> Element<'a, crate::Message> {
-    let palette = Palette::dark();
+    let palette = crate::live_theme::palette();
     let space = MdeSpace::for_density(Density::Comfortable);
     let active = view.group();
     let sidebar_focused = focused_pane == Pane::Sidebar;

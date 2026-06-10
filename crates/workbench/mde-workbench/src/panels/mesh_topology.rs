@@ -66,7 +66,7 @@ impl PeerStatus {
     // CR-6.b — re-introduced (dropped by CR-6 Table-only refactor).
     // Graph canvas uses this directly; Table uses icon() instead.
     pub fn color(self) -> Color {
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         match self {
             Self::Online => palette.success.into_iced_color(),
             Self::Idle => palette.warning.into_iced_color(),
@@ -164,7 +164,7 @@ impl MeshTopologyPanel {
     }
 
     pub fn view(&self) -> Element<'_, crate::Message> {
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         let sizes = FontSize::defaults();
 
         let title = text("Mesh Topology")

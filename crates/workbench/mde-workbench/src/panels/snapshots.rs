@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use iced::widget::{column, row, scrollable, text};
 use iced::{Element, Length, Task};
-use mde_theme::{Density, EmptyState, Icon, Palette};
+use mde_theme::{Density, EmptyState, Icon};
 
 use crate::controls::{styled_text_input, variant_button, ButtonVariant};
 use crate::panel_chrome::{card, dialog, empty_state, panel_container};
@@ -178,7 +178,7 @@ impl SnapshotsPanel {
         // UX-7 — buttons and inputs route through the shared
         // control primitives so hover/focus/active/disabled
         // states are consistent across panels.
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         let create_press = if self.busy {
             None
         } else {
@@ -213,7 +213,7 @@ impl SnapshotsPanel {
             )
             .with_icon(Icon::Snapshot);
             return panel_container(
-                empty_state(state, Palette::dark(), || {
+                empty_state(state, crate::live_theme::palette(), || {
                     crate::Message::Snapshots(Message::CreateClicked)
                 }),
                 Density::Comfortable,
@@ -251,7 +251,11 @@ impl SnapshotsPanel {
             ]
             .spacing(12)
             .into();
-            col.push(card(card_body, Palette::dark(), Density::Comfortable))
+            col.push(card(
+                card_body,
+                crate::live_theme::palette(),
+                Density::Comfortable,
+            ))
         });
 
         column![
@@ -270,7 +274,7 @@ impl SnapshotsPanel {
         // helpers (Primary for the destructive confirm, Ghost
         // for cancel) so hover/focus states stay consistent
         // with the rest of the app.
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         let confirm_btn = variant_button(
             "Apply restore",
             ButtonVariant::Primary,
@@ -300,7 +304,7 @@ impl SnapshotsPanel {
         .spacing(12)
         .into();
         panel_container(
-            dialog(body, Palette::dark(), Density::Comfortable),
+            dialog(body, crate::live_theme::palette(), Density::Comfortable),
             Density::Comfortable,
         )
     }

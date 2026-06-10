@@ -11,7 +11,6 @@ use std::process::Stdio;
 
 use iced::widget::{column, row, text, text_input};
 use iced::{Element, Length, Task};
-use mde_theme::Palette;
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -112,7 +111,7 @@ impl FleetSettingsPanel {
             push_label,
             ButtonVariant::Primary,
             (!self.busy).then(|| crate::Message::FleetSettings(Message::PushClicked)),
-            Palette::dark(),
+            crate::live_theme::palette(),
         );
 
         column![

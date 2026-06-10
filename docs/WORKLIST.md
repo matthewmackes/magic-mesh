@@ -97,9 +97,9 @@ host-local Ansible apply.
 
 ## GUI — Carbon look + component cleanup (resolves H3, H4, H2-followup)
 
-- [ ] **GUI-1: add Gray 90 theme** — `Theme::Gray90` + `Palette::gray_90()`, the full 3-theme set §4 names (Q35).
-- [ ] **GUI-2: live theme switching** — thread the resolved `Palette` through `App` state so a theme change repaints live (Q36).
-- [ ] **GUI-3: Carbon Themes-panel rewrite** — offer exactly Gray 10/90/100 via the mde-theme pref store; drop the retired presets + gsettings shell-out (Q37).
+- [✓] **GUI-1: add Gray 90 theme** — done — Theme::Gray90 + Palette::gray_90() (published g90 mapping, pin-tested); `Theme::Gray90` + `Palette::gray_90()`, the full 3-theme set §4 names (Q35).
+- [✓] **GUI-2: live theme switching** — done — live_theme module (RwLock<Tokens>); 93 Palette::dark() sites now read the live palette; swap repaints without restart; thread the resolved `Palette` through `App` state so a theme change repaints live (Q36).
+- [✓] **GUI-3: Carbon Themes-panel rewrite** — done — exactly Gray 10/90/100 + density via mde_theme::Preferences (load/save); GTK fields, ChromeOS/Ableton presets, gsettings path all deleted; offer exactly Gray 10/90/100 via the mde-theme pref store; drop the retired presets + gsettings shell-out (Q37).
 - [✓] **GUI-4: remove dead `mde-card` surfaces** — done — migration mod + RenderMode + TemplateSpec + CardKind::Template (sway-era) deleted; SCHEMA_VERSION relocated to schema.rs (live wire field); delete `migration`, `RenderMode`, `TemplateSpec`+`CardKind::Template` (Q38–40). *(resolves H3.)*
 - [✓] **GUI-5: remove dead `mde-iced-components` widgets** — done — 457 lines cut; motion slimmed to a private 2-fn module (context_menu_surface deps); crate warning-free; delete `motion`, `skeleton_shimmer`, `toast_chip`, `elevation_container`, `icon_fill_morph` (Q41–45). *(resolves H4.)*
 - [ ] **GUI-6: build `mde-cosmic-applet`** — a libcosmic applet subscribing to `mde-bus`: health pip + quick actions (join/leave, DnD, transfers) + deep links into Workbench (Q46/47).

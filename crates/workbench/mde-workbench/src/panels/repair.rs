@@ -38,7 +38,6 @@
 
 use iced::widget::{column, container, row, scrollable, text};
 use iced::{Element, Length, Padding, Task};
-use mde_theme::Palette;
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -147,7 +146,7 @@ impl RepairPanel {
         // UX-7.a — three repair actions routed through Secondary
         // (none of them is THE primary action; user picks based
         // on the problem).
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         let reload_btn = variant_button(
             "Reload compositor",
             ButtonVariant::Secondary,

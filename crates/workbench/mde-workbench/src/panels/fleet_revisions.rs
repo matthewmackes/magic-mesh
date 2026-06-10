@@ -8,7 +8,7 @@
 
 use iced::widget::{column, container, row, scrollable, text};
 use iced::{Element, Length, Task};
-use mde_theme::{Density, EmptyState, Icon, Palette};
+use mde_theme::{Density, EmptyState, Icon};
 use serde::Deserialize;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -133,7 +133,7 @@ impl FleetRevisionsPanel {
             refresh_label,
             ButtonVariant::Ghost,
             (!self.busy).then(|| crate::Message::FleetRevisions(Message::RefreshClicked)),
-            Palette::dark(),
+            crate::live_theme::palette(),
         );
 
         let rows: Vec<Element<'_, crate::Message>> = self
@@ -154,7 +154,7 @@ impl FleetRevisionsPanel {
             )
             .with_icon(Icon::History);
             return panel_container(
-                empty_state(state, Palette::dark(), || {
+                empty_state(state, crate::live_theme::palette(), || {
                     crate::Message::FleetRevisions(Message::RefreshClicked)
                 }),
                 Density::Comfortable,
@@ -207,7 +207,7 @@ fn revision_row<'a>(rev: &'a Revision, busy: bool) -> Element<'a, crate::Message
         (!busy).then(|| {
             crate::Message::FleetRevisions(Message::RollbackClicked(rev.revision_id.clone()))
         }),
-        Palette::dark(),
+        crate::live_theme::palette(),
     );
     row![text(label).size(13).width(Length::Fill), rollback_btn]
         .spacing(12)

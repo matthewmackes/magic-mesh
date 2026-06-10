@@ -372,7 +372,7 @@ impl ConnectPanel {
     /// list → a stack of per-peer cards with their conditional
     /// sections (Phone / Messaging / Share / CommonChrome).
     pub fn view(&self) -> Element<'_, crate::Message> {
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         if self.peers.is_empty() {
             return self.empty_state_view(palette);
         }

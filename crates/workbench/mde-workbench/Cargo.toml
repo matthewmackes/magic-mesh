@@ -70,7 +70,7 @@ mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
 # enables the `Rgba::into_iced_color()` helper so the workbench
 # can derive its `iced::Theme::Custom` palette from
 # `mde_theme::Palette` without hardcoding hex literals.
-mde-theme = { path = "../../shared/mde-theme", features = ["iced"] }
+mde-theme = { path = "../../shared/mde-theme", features = ["iced", "serde"] }
 # CR-3.b (2026-05-25) — shared Iced widget builders. `object_card`
 # moved here from panel_chrome.rs so peer crates (mde-files,
 # mde-popover, mde-music) can render the canonical Material Object

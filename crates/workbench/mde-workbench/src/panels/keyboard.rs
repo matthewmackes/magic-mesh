@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use iced::widget::{column, text};
 use iced::{Element, Length, Task};
-use mde_theme::Palette;
 
 use crate::backend::Backend;
 use crate::controls::{variant_button, ButtonVariant};
@@ -52,7 +51,7 @@ impl KeyboardPanel {
                 "Open Keyboard settings",
                 ButtonVariant::Primary,
                 Some(crate::Message::OpenSettingsPage("devices", "typing")),
-                Palette::dark(),
+                crate::live_theme::palette(),
             ),
         ]
         .spacing(12)

@@ -11,7 +11,6 @@
 use std::path::PathBuf;
 
 use iced::widget::{column, container, row, scrollable, text};
-use mde_theme::Palette;
 
 use crate::controls::{variant_button, ButtonVariant};
 use iced::{Element, Length, Padding, Task};
@@ -78,7 +77,7 @@ impl LogsPanel {
             "Refresh",
             ButtonVariant::Ghost,
             Some(crate::Message::Logs(Message::RefreshClicked)),
-            Palette::dark(),
+            crate::live_theme::palette(),
         );
 
         column![

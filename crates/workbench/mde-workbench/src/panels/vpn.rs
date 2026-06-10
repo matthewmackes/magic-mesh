@@ -11,7 +11,6 @@
 
 use iced::widget::{column, container, row, scrollable, text};
 use iced::{Element, Length, Task};
-use mde_theme::Palette;
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -145,7 +144,7 @@ impl VpnPanel {
             "Refresh",
             ButtonVariant::Ghost,
             (!self.busy).then(|| crate::Message::Vpn(Message::RefreshClicked)),
-            Palette::dark(),
+            crate::live_theme::palette(),
         );
 
         if self.vpns.is_empty() {
@@ -180,7 +179,7 @@ impl VpnPanel {
                         activate: next_activate,
                     })
                 }),
-                Palette::dark(),
+                crate::live_theme::palette(),
             );
             let state = if v.active { "active" } else { "inactive" };
             col.push(

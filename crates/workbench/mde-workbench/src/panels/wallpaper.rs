@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use iced::widget::{column, pick_list, row, text, text_input};
 use iced::{Element, Length, Task};
-use mde_theme::Palette;
 
 use crate::controls::{variant_button, ButtonVariant};
 
@@ -119,7 +118,7 @@ impl WallpaperPanel {
             apply_label,
             ButtonVariant::Primary,
             (!self.busy).then(|| crate::Message::Wallpaper(Message::SaveClicked)),
-            Palette::dark(),
+            crate::live_theme::palette(),
         );
         let mode_pick: pick_list::PickList<'_, &'static str, _, _, crate::Message> =
             pick_list(MODES, current_mode(&self.mode), |selected| {

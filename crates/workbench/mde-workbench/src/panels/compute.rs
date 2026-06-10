@@ -366,7 +366,7 @@ impl ComputePanel {
     }
 
     pub fn view(&self) -> Element<'_, crate::Message> {
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         // Carbon type scale + 8px spacing grid via mde-theme tokens (the
         // workbench's design-token source — it's on iced 0.14, so it can't
         // consume mde-ui's iced-0.13 metrics module; mde-theme is the
@@ -1340,8 +1340,10 @@ mod tests {
             kind: InstanceKind::Container,
             state: "running".into(),
         };
-        let _: Element<'_, crate::Message> = instance_row(&running_vm, None, Palette::dark());
-        let _: Element<'_, crate::Message> = instance_row(&container, None, Palette::dark());
+        let _: Element<'_, crate::Message> =
+            instance_row(&running_vm, None, crate::live_theme::palette());
+        let _: Element<'_, crate::Message> =
+            instance_row(&container, None, crate::live_theme::palette());
     }
 
     #[test]
@@ -1397,6 +1399,7 @@ mod tests {
             kind: InstanceKind::Vm,
             state: "shut off".into(),
         };
-        let _: Element<'_, crate::Message> = instance_row(&stopped_vm, None, Palette::dark());
+        let _: Element<'_, crate::Message> =
+            instance_row(&stopped_vm, None, crate::live_theme::palette());
     }
 }

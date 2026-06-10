@@ -14,7 +14,6 @@
 
 use iced::widget::{checkbox, column, container, pick_list, row, scrollable, text};
 use iced::{Element, Length, Task};
-use mde_theme::Palette;
 
 use crate::controls::{variant_button, ButtonVariant};
 use tokio::process::Command;
@@ -237,7 +236,7 @@ impl FirewallPanel {
             "Refresh",
             ButtonVariant::Ghost,
             (!self.busy).then(|| crate::Message::Firewall(Message::RefreshClicked)),
-            Palette::dark(),
+            crate::live_theme::palette(),
         );
 
         let zone_pick: pick_list::PickList<'_, String, _, _, crate::Message> = pick_list(

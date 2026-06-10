@@ -24,7 +24,7 @@ use std::path::PathBuf;
 
 use iced::widget::{column, container, row, scrollable, text};
 use iced::{Element, Length, Task};
-use mde_theme::{Density, EmptyState, Icon, Palette};
+use mde_theme::{Density, EmptyState, Icon};
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -122,7 +122,7 @@ impl PlaybooksPanel {
             "Refresh",
             ButtonVariant::Ghost,
             Some(crate::Message::Playbooks(Message::RefreshClicked)),
-            Palette::dark(),
+            crate::live_theme::palette(),
         );
 
         if self.playbooks.is_empty() {
@@ -136,7 +136,7 @@ impl PlaybooksPanel {
             )
             .with_icon(Icon::Playbook);
             return panel_container(
-                empty_state(state, Palette::dark(), || {
+                empty_state(state, crate::live_theme::palette(), || {
                     crate::Message::Playbooks(Message::RefreshClicked)
                 }),
                 Density::Comfortable,
@@ -157,7 +157,7 @@ impl PlaybooksPanel {
                 run_label,
                 ButtonVariant::Secondary,
                 (!running).then(|| crate::Message::Playbooks(Message::RunClicked(name))),
-                Palette::dark(),
+                crate::live_theme::palette(),
             );
             col.push(
                 row![

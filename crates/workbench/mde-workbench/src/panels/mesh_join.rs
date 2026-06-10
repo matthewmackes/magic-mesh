@@ -12,7 +12,6 @@
 
 use iced::widget::{column, container, row, scrollable, text, text_input};
 use iced::{Element, Length, Padding, Task};
-use mde_theme::Palette;
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -107,7 +106,7 @@ impl MeshJoinPanel {
             enroll_label,
             ButtonVariant::Primary,
             (!self.busy).then(|| crate::Message::MeshJoin(Message::EnrollClicked)),
-            Palette::dark(),
+            crate::live_theme::palette(),
         );
 
         column![

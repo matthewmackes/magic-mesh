@@ -11,7 +11,6 @@
 
 use iced::widget::{column, progress_bar, row, text};
 use iced::{Element, Length, Task};
-use mde_theme::Palette;
 
 use crate::controls::{variant_button, ButtonVariant};
 
@@ -86,7 +85,7 @@ impl ResourcesPanel {
             "Refresh",
             ButtonVariant::Ghost,
             Some(crate::Message::Resources(Message::RefreshClicked)),
-            Palette::dark(),
+            crate::live_theme::palette(),
         );
 
         column![

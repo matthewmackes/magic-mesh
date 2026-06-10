@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use iced::widget::{column, container, row, scrollable, text};
 use iced::{Element, Length, Padding, Task};
-use mde_theme::{Density, EmptyState, Icon, Palette};
+use mde_theme::{Density, EmptyState, Icon};
 
 use crate::controls::{variant_button, ButtonVariant};
 use crate::panel_chrome::{empty_state, panel_container};
@@ -116,7 +116,7 @@ impl RunHistoryPanel {
             "Refresh",
             ButtonVariant::Ghost,
             Some(crate::Message::RunHistory(Message::RefreshClicked)),
-            Palette::dark(),
+            crate::live_theme::palette(),
         );
 
         if self.rows.is_empty() {
@@ -131,7 +131,7 @@ impl RunHistoryPanel {
             )
             .with_icon(Icon::History);
             return panel_container(
-                empty_state(state, Palette::dark(), || {
+                empty_state(state, crate::live_theme::palette(), || {
                     crate::Message::RunHistory(Message::RefreshClicked)
                 }),
                 Density::Comfortable,
@@ -156,7 +156,7 @@ impl RunHistoryPanel {
                     "Detail",
                     ButtonVariant::Ghost,
                     Some(crate::Message::RunHistory(Message::FocusRow(path))),
-                    Palette::dark(),
+                    crate::live_theme::palette(),
                 )
             };
             col.push(
@@ -194,7 +194,7 @@ impl RunHistoryPanel {
             "← Back to history",
             ButtonVariant::Ghost,
             Some(crate::Message::RunHistory(Message::Back)),
-            Palette::dark(),
+            crate::live_theme::palette(),
         );
         column![
             row![

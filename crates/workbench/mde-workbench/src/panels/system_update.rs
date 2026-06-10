@@ -15,7 +15,6 @@ use async_stream::stream;
 use futures::stream::{Stream, StreamExt};
 use iced::widget::{column, container, row, scrollable, text};
 use iced::{Element, Length, Padding, Task};
-use mde_theme::Palette;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
@@ -133,7 +132,7 @@ impl SystemUpdatePanel {
     pub fn view(&self) -> Element<'_, crate::Message> {
         // UX-7.a — Check (Ghost) + Install (Primary) routed
         // through the shared button variants.
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         let check_btn = variant_button(
             "Check for updates",
             ButtonVariant::Ghost,

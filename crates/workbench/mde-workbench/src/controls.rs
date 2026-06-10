@@ -516,7 +516,7 @@ mod tests {
 
     #[test]
     fn all_variants_construct() {
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         let _ = variant_button::<()>("p", ButtonVariant::Primary, None, palette);
         let _ = variant_button::<()>("s", ButtonVariant::Secondary, None, palette);
         let _ = variant_button::<()>("g", ButtonVariant::Ghost, None, palette);
@@ -524,7 +524,7 @@ mod tests {
 
     #[test]
     fn skeleton_spinner_toggle_input_construct() {
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         let _ = skeleton::<()>(100.0, 20.0, palette);
         let _ = spinner::<()>(palette);
         let _ = toggle::<bool>(true, |v| v, palette);
@@ -533,7 +533,7 @@ mod tests {
 
     #[test]
     fn checkbox_radio_scrollbar_style_construct() {
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         let _ = checkbox_style(palette);
         let _ = radio_style(palette);
         let _ = scrollbar_style(palette);

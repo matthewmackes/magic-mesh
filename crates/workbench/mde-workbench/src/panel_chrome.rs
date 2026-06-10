@@ -575,7 +575,7 @@ mod tests {
         // surfaces a non-exhaustive-match error here at build
         // time. Iterate every variant so the test fails to
         // compile if one is dropped.
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         let _ = status_badge::<()>("n", BadgeSeverity::Neutral, palette);
         let _ = status_badge::<()>("s", BadgeSeverity::Success, palette);
         let _ = status_badge::<()>("w", BadgeSeverity::Warning, palette);
@@ -591,7 +591,7 @@ mod tests {
         // we can't introspect the resulting Element's style
         // fields from outside iced. The motion::dialog module's
         // tests guard the underlying token values directly.
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         let body: Element<'_, ()> = iced::widget::text("body").into();
         let _ = dialog::<()>(body, palette, Density::Comfortable);
         let _: Element<'_, ()> = dialog_backdrop();
@@ -609,7 +609,7 @@ mod tests {
 
     #[test]
     fn object_card_reexport_resolves() {
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         let card = mde_theme::ObjectCard::small(mde_theme::Icon::Fleet, "smoke");
         let _: Element<'_, ()> = object_card(card, palette);
     }

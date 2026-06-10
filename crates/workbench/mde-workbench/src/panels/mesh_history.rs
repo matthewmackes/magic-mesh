@@ -10,7 +10,7 @@
 
 use iced::widget::{column, container, row, scrollable, text};
 use iced::{Element, Length, Padding, Task};
-use mde_theme::{Density, EmptyState, Icon, Palette};
+use mde_theme::{Density, EmptyState, Icon};
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -145,7 +145,7 @@ impl MeshHistoryPanel {
             "Refresh",
             ButtonVariant::Ghost,
             (!self.busy).then(|| crate::Message::MeshHistory(Message::RefreshClicked)),
-            Palette::dark(),
+            crate::live_theme::palette(),
         );
 
         if self.rows.is_empty() {
@@ -162,7 +162,7 @@ impl MeshHistoryPanel {
             )
             .with_icon(Icon::History);
             return panel_container(
-                empty_state(state, Palette::dark(), || {
+                empty_state(state, crate::live_theme::palette(), || {
                     crate::Message::MeshHistory(Message::RefreshClicked)
                 }),
                 Density::Comfortable,
@@ -176,7 +176,7 @@ impl MeshHistoryPanel {
                 "Detail",
                 ButtonVariant::Ghost,
                 Some(crate::Message::MeshHistory(Message::FocusRow(id))),
-                Palette::dark(),
+                crate::live_theme::palette(),
             );
             let payload_preview: String = r.payload.chars().take(80).collect();
             col.push(
@@ -206,7 +206,7 @@ impl MeshHistoryPanel {
             "← Back",
             ButtonVariant::Ghost,
             Some(crate::Message::MeshHistory(Message::Back)),
-            Palette::dark(),
+            crate::live_theme::palette(),
         );
         column![
             row![

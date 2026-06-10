@@ -40,7 +40,7 @@ impl DriftSeverity {
         }
     }
     fn color(self) -> Color {
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         match self {
             Self::Info => palette.accent.into_iced_color(),
             Self::Warn => palette.warning.into_iced_color(),
@@ -115,7 +115,7 @@ impl DriftPanel {
     }
 
     pub fn view(&self) -> Element<'_, crate::Message> {
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         let sizes = FontSize::defaults();
 
         let title = text("Drift")

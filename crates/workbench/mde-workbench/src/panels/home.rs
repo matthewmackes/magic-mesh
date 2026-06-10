@@ -100,7 +100,7 @@ impl CapabilityStatus {
     }
     #[must_use]
     pub fn color(&self) -> Color {
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         match self {
             Self::Active => palette.success.into_iced_color(),
             Self::SetupNeeded => palette.warning.into_iced_color(),
@@ -380,7 +380,7 @@ impl HomePanel {
 
     /// Render the Overview.
     pub fn view(&self) -> Element<'_, crate::Message> {
-        let palette = Palette::dark();
+        let palette = crate::live_theme::palette();
         let sizes = FontSize::defaults();
 
         let title = text("Overview")

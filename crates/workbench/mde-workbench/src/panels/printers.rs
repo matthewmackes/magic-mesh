@@ -17,7 +17,6 @@
 
 use iced::widget::{column, pick_list, row, text};
 use iced::{Element, Length, Task};
-use mde_theme::Palette;
 
 use crate::controls::{variant_button, ButtonVariant};
 use tokio::process::Command;
@@ -171,7 +170,7 @@ impl PrintersPanel {
             "Refresh",
             ButtonVariant::Ghost,
             (!self.busy).then(|| crate::Message::PrintersRefresh),
-            Palette::dark(),
+            crate::live_theme::palette(),
         );
 
         let queues = self.queues.clone();

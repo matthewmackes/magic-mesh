@@ -18,7 +18,6 @@ use iced::{Element, Length, Padding, Task};
 use mde_musicd::airsonic::Client;
 use mde_musicd::cache;
 use mde_musicd::creds::{self, Creds};
-use mde_theme::Palette;
 
 use crate::controls::{styled_text_input, variant_button, ButtonVariant};
 
@@ -189,7 +188,7 @@ impl MusicPanel {
     }
 
     pub fn view(&self) -> Element<'_, crate::Message> {
-        let pal = Palette::dark();
+        let pal = crate::live_theme::palette();
         let m = |msg: Message| crate::Message::Music(msg);
 
         let password = text_input("password", &self.password)
