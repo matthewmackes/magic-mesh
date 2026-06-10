@@ -63,7 +63,6 @@ pub fn bump_epoch<B: NebulaCertBackend>(
     mesh_id: &str,
     crt_path: Option<&Path>,
     key_path: Option<&Path>,
-    cert_lifetime_days: u32,
 ) -> Result<RotationOutcome, CaError> {
     bump_epoch_into(
         backend,
@@ -71,7 +70,6 @@ pub fn bump_epoch<B: NebulaCertBackend>(
         mesh_id,
         crt_path,
         key_path,
-        cert_lifetime_days,
         Path::new(DEFAULT_PEER_CERT_DIR),
     )
 }
@@ -90,7 +88,6 @@ pub fn bump_epoch_into<B: NebulaCertBackend>(
     mesh_id: &str,
     crt_path: Option<&Path>,
     key_path: Option<&Path>,
-    cert_lifetime_days: u32,
     peer_cert_dir: &Path,
 ) -> Result<RotationOutcome, CaError> {
     let crt = crt_path.unwrap_or_else(|| Path::new(super::DEFAULT_CA_CERT_PATH));
@@ -159,16 +156,7 @@ pub fn bump_epoch_into<B: NebulaCertBackend>(
         // epoch) so re-issuing the same IP at a new epoch is
         // valid.)
         match sign::sign_peer_cert(
-            backend,
-            conn,
-            mesh_id,
-            node_id,
-            role,
-            crt,
-            key,
-            &crt_out,
-            &key_out,
-            cert_lifetime_days,
+            backend, conn, mesh_id, node_id, role, crt, key, &crt_out, &key_out,
         ) {
             Ok(signed) => {
                 re_signed += 1;
@@ -323,7 +311,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let crt = tmp.path().join("ca.crt");
         let key = tmp.path().join("ca.key");
-        let outcome = bump_epoch(&MockBackend, &mut conn, "m1", Some(&crt), Some(&key), 365)
+        let outcome = bump_epoch(&MockBackend, &mut conn, "m1", Some(&crt), Some(&key))
             .expect("rotate empty");
         assert_eq!(outcome.retired_epoch, None);
         assert_eq!(outcome.new_epoch, 0);
@@ -340,7 +328,7 @@ mod tests {
         mint::mint_ca(&MockBackend, &conn, "m1", Some(&crt), Some(&key)).expect("initial mint");
         // Rotate.
         let outcome =
-            bump_epoch(&MockBackend, &mut conn, "m1", Some(&crt), Some(&key), 365).expect("rotate");
+            bump_epoch(&MockBackend, &mut conn, "m1", Some(&crt), Some(&key)).expect("rotate");
         assert_eq!(outcome.retired_epoch, Some(0));
         assert_eq!(outcome.new_epoch, 1);
     }
@@ -352,7 +340,7 @@ mod tests {
         let crt = tmp.path().join("ca.crt");
         let key = tmp.path().join("ca.key");
         mint::mint_ca(&MockBackend, &conn, "m1", Some(&crt), Some(&key)).expect("mint");
-        bump_epoch(&MockBackend, &mut conn, "m1", Some(&crt), Some(&key), 365).expect("rotate");
+        bump_epoch(&MockBackend, &mut conn, "m1", Some(&crt), Some(&key)).expect("rotate");
         // Prior row's retired_at should be non-null.
         let retired_at: Option<i64> = conn
             .query_row(
@@ -402,7 +390,6 @@ mod tests {
             "m1",
             Some(&crt),
             Some(&key),
-            365,
             tmp.path(),
         )
         .expect("rotate");

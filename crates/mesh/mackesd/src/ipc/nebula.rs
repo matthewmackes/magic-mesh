@@ -408,7 +408,7 @@ impl NebulaStatusService {
         use crate::ca::{CaError, SubprocessBackend};
         let mesh_id = self.mesh_id.clone();
         let mut conn = self.store.lock().await;
-        match epoch::bump_epoch(&SubprocessBackend, &mut *conn, &mesh_id, None, None, 365) {
+        match epoch::bump_epoch(&SubprocessBackend, &mut *conn, &mesh_id, None, None) {
             Ok(o) => Ok(format!(
                 "CA rotated to epoch {} (retired {}); {} peer certs re-signed.",
                 o.new_epoch,

@@ -59,7 +59,6 @@ pub struct NebulaCsrWatcher {
     local_node_id: String,
     /// Cert lifetime in days for each issued peer cert. 365 by
     /// default.
-    cert_lifetime_days: u32,
     /// Override the tick cadence (default [`TICK_INTERVAL`]). Used
     /// by tests to keep the loop short.
     tick: Duration,
@@ -97,7 +96,6 @@ impl NebulaCsrWatcher {
             paths: SignCsrPaths::production_defaults(),
             lighthouse_addr,
             local_node_id,
-            cert_lifetime_days: 365,
             tick: TICK_INTERVAL,
             backend: Arc::new(crate::ca::SubprocessBackend),
             signal_slot: None,
@@ -132,11 +130,6 @@ impl NebulaCsrWatcher {
 
     /// Override the cert lifetime in days.
     #[must_use]
-    pub fn with_cert_lifetime_days(mut self, days: u32) -> Self {
-        self.cert_lifetime_days = days;
-        self
-    }
-
     /// Override the cert backend — used by tests to inject
     /// `MockBackend` so the worker can run without nebula-cert
     /// on PATH.
@@ -222,7 +215,6 @@ impl NebulaCsrWatcher {
                 &self.mesh_id,
                 &self.paths,
                 lighthouses,
-                self.cert_lifetime_days,
                 false,
             ) {
                 Ok(outcome) => {

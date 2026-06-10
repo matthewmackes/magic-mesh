@@ -2254,7 +2254,6 @@ fn main() -> anyhow::Result<()> {
                         &mesh,
                         None,
                         None,
-                        cert_lifetime_days,
                     ) {
                         Ok(o) => {
                             println!(
@@ -2463,7 +2462,6 @@ fn main() -> anyhow::Result<()> {
                         &mesh,
                         &paths,
                         lighthouses,
-                        cert_lifetime_days,
                         override_cap,
                     ) {
                         Ok(outcome) => {

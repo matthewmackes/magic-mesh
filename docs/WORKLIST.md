@@ -86,7 +86,7 @@ host-local Ansible apply.
 
 ## SECURITY — CA lifecycle, enrollment, KDC (resolves H8)
 
-- [ ] **SEC-1: non-expiring peer certs** — drop mid-epoch expiry; turnover via rotation/revocation (Q19).
+- [✓] **SEC-1: non-expiring peer certs** — done — the backend never passed -duration (nebula already signs to CA lifetime); the fictional 365-day bookkeeping expiry is gone: cert_lifetime_days removed through sign/enroll/watcher/epoch/CLI, expires_at=0 is the epoch-lifetime sentinel; turnover = rotation (bump_epoch) / revocation (ENT-3). Display polish ('epoch-lifetime' label for 0) rides the PLANES Registration panel — drop mid-epoch expiry; turnover via rotation/revocation (Q19).
 - [ ] **SEC-2: passphrase-gated CA rotation** — `mackesd ca rotate` requires an operator passphrase, never auto-on-promotion (Q20).
 - [ ] **SEC-3: QR/file 256-bit enrollment token** — replace the typed 16-char passcode with a delivered 256-bit token; keep auto-sign/TOFU (Q21/22).
 - [ ] **SEC-4: outbound first-pair flow** — an operator-initiated KDC pairing flow that completes the handshake and writes the fingerprint pin (Q24/25); keep RSA-4096 (Q23).

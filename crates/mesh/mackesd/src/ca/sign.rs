@@ -79,7 +79,6 @@ pub fn sign_peer_cert<B: NebulaCertBackend + ?Sized>(
     ca_key_path: &Path,
     crt_out: &Path,
     key_out: &Path,
-    cert_lifetime_days: u32,
 ) -> Result<SignedPeer, CaError> {
     let active_epoch = active_epoch(conn, mesh_id)?
         .ok_or_else(|| CaError::Sql(format!("no active CA for mesh {mesh_id}")))?;
@@ -110,11 +109,12 @@ pub fn sign_peer_cert<B: NebulaCertBackend + ?Sized>(
     let cert_pem = std::fs::read_to_string(crt_out)
         .map_err(|e| CaError::Io(format!("read peer cert {}: {e}", crt_out.display())))?;
 
-    let expires_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-        + (cert_lifetime_days as i64) * 86_400;
+    // SEC-1 (Q19) — peer certs do not expire mid-epoch: the backend
+    // passes no -duration, so nebula signs to the CA's own lifetime,
+    // and the books now say the same. `0` is the epoch-lifetime
+    // sentinel (turnover is rotation/revocation, never a quiet expiry
+    // — ENT-3 makes revocation real).
+    let expires_at: i64 = 0;
 
     conn.execute(
         "INSERT INTO nebula_peer_certs \
@@ -321,7 +321,6 @@ mod tests {
             &ca_key,
             &crt,
             &key,
-            365,
         )
         .expect("sign");
         assert_eq!(signed.overlay_ip, "10.42.0.1");
@@ -356,7 +355,6 @@ mod tests {
             &ca_key,
             &crt,
             &key,
-            365,
         )
         .expect("sign host");
         assert!(signed.cert_pem.contains("groups=role:host"));
@@ -376,7 +374,6 @@ mod tests {
             &tmp.path().join("ca.key"),
             &tmp.path().join("peer.crt"),
             &tmp.path().join("peer.key"),
-            365,
         )
         .unwrap_err();
         assert!(matches!(err, CaError::Sql(_)));
@@ -397,7 +394,6 @@ mod tests {
             &tmp.path().join("ca.key"),
             &tmp.path().join("peer.crt"),
             &tmp.path().join("peer.key"),
-            365,
         )
         .expect("sign");
         let mode = std::fs::metadata(&signed.key_path)

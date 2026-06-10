@@ -590,7 +590,6 @@ pub fn sign_pending_csr<B: crate::ca::NebulaCertBackend + ?Sized>(
     mesh_id: &str,
     paths: &SignCsrPaths,
     lighthouses: Vec<crate::ca::bundle::LighthouseEntry>,
-    cert_lifetime_days: u32,
     allow_override: bool,
 ) -> Result<SignOutcome, SignCsrError> {
     let csr_path = pending_enroll_path(workgroup_root, peer_id);
@@ -687,7 +686,6 @@ pub fn sign_pending_csr<B: crate::ca::NebulaCertBackend + ?Sized>(
         &paths.ca_key,
         &crt_out,
         &key_out,
-        cert_lifetime_days,
     )
     .map_err(|e| SignCsrError::SignFailed {
         reason: e.to_string(),
@@ -1049,7 +1047,6 @@ mod tests {
             "test-mesh",
             &paths,
             Vec::new(),
-            365,
             false,
         );
         match r {
@@ -1084,7 +1081,6 @@ mod tests {
             "test-mesh",
             &paths,
             lighthouses.clone(),
-            365,
             false,
         )
         .expect("sign");
@@ -1135,7 +1131,6 @@ mod tests {
             "test-mesh",
             &paths,
             vec![],
-            365,
             true, // the capacity override must NOT bypass auth
         );
         assert!(
@@ -1165,7 +1160,6 @@ mod tests {
             "test-mesh",
             &paths,
             vec![],
-            365,
             false,
         )
         .expect("first sign with the issued bearer");
@@ -1183,7 +1177,6 @@ mod tests {
             "test-mesh",
             &paths,
             vec![],
-            365,
             false,
         );
         assert!(
@@ -1217,7 +1210,6 @@ mod tests {
             "test-mesh",
             &paths,
             Vec::new(),
-            365,
             // Even with override_cap = true, a ban is absolute.
             true,
         );
@@ -1260,7 +1252,6 @@ mod tests {
             "test-mesh",
             &paths,
             Vec::new(),
-            365,
             false,
         )
         .expect("innocent peer should sign");
@@ -1289,7 +1280,6 @@ mod tests {
             "test-mesh",
             &paths,
             Vec::new(),
-            365,
             false,
         );
         assert!(matches!(r, Err(SignCsrError::CsrCorrupt { .. })));
@@ -1320,7 +1310,6 @@ mod tests {
             "test-mesh",
             &paths,
             Vec::new(),
-            365,
             false,
         );
         match r {
@@ -1362,7 +1351,6 @@ mod tests {
             "test-mesh",
             &paths,
             Vec::new(),
-            365,
             false,
         );
         match r {
@@ -1402,7 +1390,6 @@ mod tests {
             "test-mesh",
             &paths,
             Vec::new(),
-            365,
             true,
         )
         .expect("override path succeeds");

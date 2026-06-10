@@ -85,7 +85,6 @@ pub fn mesh_init<B: NebulaCertBackend>(
         ca_key,
         &crt_out,
         &key_out,
-        365,
     )
     .map_err(|e| anyhow::anyhow!("mesh-init step 3 (self-sign): {e}"))?;
     let epoch = crate::ca::sign::active_epoch(conn, mesh_id)
