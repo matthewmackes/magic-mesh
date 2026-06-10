@@ -18,6 +18,7 @@ pub mod default_apps;
 pub mod displays;
 pub mod drift;
 pub mod firewall;
+pub mod fleet_logs;
 pub mod fleet_revisions;
 pub mod fleet_rollup;
 pub mod fleet_settings;

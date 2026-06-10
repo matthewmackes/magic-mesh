@@ -294,6 +294,8 @@ pub fn nav_model() -> Vec<NavEntry> {
                 Panel::new("audit", "Audit"),
                 // PLANES-8 — journald mesh-unit view + Netdata deep-link.
                 Panel::new("mesh_logs", "Mesh Logs"),
+                // PLANES-14 — fleet-wide structured-log search (OBS-5).
+                Panel::new("fleet_logs", "Fleet Logs"),
             ],
         },
         NavEntry {

@@ -463,7 +463,8 @@ mod tests {
                 "repair",
                 "drift",
                 "audit",
-                "mesh_logs"
+                "mesh_logs",
+                "fleet_logs"
             ]
         );
     }

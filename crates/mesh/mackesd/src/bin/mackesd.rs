@@ -367,6 +367,22 @@ enum Cmd {
         cred_path: Option<PathBuf>,
     },
 
+    /// OBS-5 (W15) — append a structured log record to this node's
+    /// replicated log (`<workgroup>/logs/<host>.jsonl`), where the
+    /// PLANES-14 Fleet-logs-search panel reads it. Scripts + workers emit
+    /// fleet-visible structured logs through this.
+    LogEmit {
+        /// `error` | `warn` | `info` | `debug` | `trace`.
+        #[arg(long, default_value = "info")]
+        level: String,
+        /// Emitting subsystem/target.
+        #[arg(long, default_value = "")]
+        target: String,
+        /// The log message.
+        #[arg(long)]
+        message: String,
+    },
+
     /// PLANES-20 / ENT-8 — fleet rollup: the roster grouped by role with
     /// each group's member count + worst health. `--json` for the
     /// Fleet-rollup panel; otherwise a short table.
@@ -1977,6 +1993,27 @@ fn main() -> anyhow::Result<()> {
                      or save to libsecret manually)"
                 );
             }
+        }
+        Cmd::LogEmit {
+            level,
+            target,
+            message,
+        } => {
+            let root = mackesd_core::default_qnm_shared_root();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
+            let record = magic_fleet::structured_log::LogRecord {
+                ts_ms: now_ms,
+                host: local_hostname(),
+                level,
+                target,
+                message,
+                fields: std::collections::BTreeMap::new(),
+            };
+            magic_fleet::structured_log::append(&root, &record)
+                .map_err(|e| anyhow::anyhow!("log-emit append: {e}"))?;
+            return Ok(());
         }
         Cmd::FleetStatus { json } => {
             let conn = mackesd_core::store::open(&db_path)

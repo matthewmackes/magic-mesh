@@ -879,6 +879,9 @@ fn latest_stats(root: &Path) -> Option<ApplyReport> {
 pub mod jobs;
 pub mod netstate;
 pub mod store;
+// OBS-5 (W15) — mesh-replicated structured logging + cross-host search;
+// the engine PLANES-14's Fleet-logs-search panel queries.
+pub mod structured_log;
 pub mod validation;
 
 #[cfg(test)]
