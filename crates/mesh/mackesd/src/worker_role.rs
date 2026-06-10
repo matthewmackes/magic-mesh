@@ -41,6 +41,7 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     ("presence_watch", 0),
     ("lifecycle_exec", 0),
     ("reconcile", 0),
+    ("netstate_apply", 0),
     // ── Server (rank 1) — adds fleet + mesh storage.
     ("ansible-pull", 1),
     ("app-sync", 1),
@@ -135,8 +136,8 @@ mod tests {
         // labwc/sway worker stack deleted). +1 ssh_pubkey_gossip (SVC-2),
         // +1 fleet_reconcile (PD-9), +1 presence_watch (PD-13),
         // +1 lifecycle_exec (PD-11), +1 job_exec (PLANES-9),
-        // +1 mesh_dns (PLANES-18).
-        assert_eq!(WORKER_TIERS.len(), 23);
+        // +1 mesh_dns (PLANES-18), +1 netstate_apply (PLANES-15).
+        assert_eq!(WORKER_TIERS.len(), 24);
     }
 
     #[test]
@@ -159,8 +160,8 @@ mod tests {
         let count = |rank: u8| WORKER_TIERS.iter().filter(|(_, r)| *r == rank).count();
         assert_eq!(
             count(0),
-            16,
-            "Lighthouse control plane (+gossip/reconcile/presence/lifecycle/mesh_dns)"
+            17,
+            "Lighthouse control plane (+gossip/reconcile/presence/lifecycle/mesh_dns/netstate_apply)"
         );
         assert_eq!(
             count(1),
@@ -218,9 +219,9 @@ mod tests {
         let lh = workers_for_rank(Role::Lighthouse.rank());
         let srv = workers_for_rank(Role::Server.rank());
         let ws = workers_for_rank(Role::Workstation.rank());
-        assert_eq!(lh.len(), 16);
-        assert_eq!(srv.len(), 19);
-        assert_eq!(ws.len(), 23);
+        assert_eq!(lh.len(), 17);
+        assert_eq!(srv.len(), 20);
+        assert_eq!(ws.len(), 24);
         // Strict superset: every lower-tier worker is in the higher tier.
         assert!(lh.iter().all(|w| srv.contains(w)));
         assert!(srv.iter().all(|w| ws.contains(w)));

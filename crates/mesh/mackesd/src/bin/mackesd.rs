@@ -3461,7 +3461,7 @@ fn run_serve(
     use mackesd_core::workers::{
         firewall_preset::FirewallPresetWorker, fleet_reconcile, heartbeat::HeartbeatWorker,
         job_exec, lifecycle_exec, mdns_relay::MdnsRelayWorker, mesh_dns,
-        mesh_router::MeshRouterWorker, presence_watch, ssh_pubkey_gossip,
+        mesh_router::MeshRouterWorker, netstate_apply, presence_watch, ssh_pubkey_gossip,
         sshd_overlay_bind::SshdOverlayBindWorker, voice_config::VoiceConfigWorker, RestartPolicy,
         Spawn, Supervisor,
     };
@@ -3735,6 +3735,20 @@ fn run_serve(
                 RestartPolicy::OnFailure,
             ));
             worker_names.lock().expect("worker_names mutex").push("mesh_dns".into());
+        }
+        // PLANES-15 — netstate engine mount: converge the baseline's
+        // network desired-state under a rollback checkpoint + overlay
+        // self-test (W77/W78), on every node.
+        if mackesd_core::worker_role::runs("netstate_apply", role_rank) {
+            sup.spawn(Spawn::new(
+                netstate_apply::NetstateApplyWorker::new(
+                    workgroup_root.clone(),
+                    Some(db_path.clone()),
+                    node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names.lock().expect("worker_names mutex").push("netstate_apply".into());
         }
         // PLANES-9 — the local job executor (execution-tag gated, W84).
         if mackesd_core::worker_role::runs("job_exec", role_rank) {

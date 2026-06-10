@@ -368,6 +368,13 @@ pub struct BaselineSpec {
     pub sysctl: Vec<SysctlReq>,
     /// Firewall (`firewalld`) rules to enable/disable (needs `ansible.posix`).
     pub firewall: Vec<FirewallReq>,
+    /// Network desired-state (PLANES-15 / W67): the nmstate subset the
+    /// node converges via the checkpoint-guarded netstate engine, NOT via
+    /// Ansible — [`to_playbook`] skips it the same way it skips `settings`.
+    /// A node applying this needs `nmstatectl` (NetworkManager). Default
+    /// empty: a baseline manages networking only when it declares it.
+    #[serde(skip_serializing_if = "netstate::NetState::is_empty")]
+    pub netstate: netstate::NetState,
     /// Desktop/mesh settings folded into the baseline (FPG-1 / Q9):
     /// dot-notated `mackesd` setting keys (`theme.accent`,
     /// `power.idle_min`, …) mapped to their **JSON-encoded** values —
@@ -446,6 +453,9 @@ impl BaselineSpec {
                 })
                 .cloned()
                 .collect(),
+            // Network state, like settings, has no per-resource local
+            // exception: it's applied by the netstate engine, not Ansible.
+            netstate: self.netstate.clone(),
             // Settings carry no local-exception concept (FPG-1/Q9):
             // they're mackesd-applied, not Ansible-applied; a node
             // opts out per-key via its own settings scope instead.
@@ -867,6 +877,7 @@ fn latest_stats(root: &Path) -> Option<ApplyReport> {
 }
 
 pub mod jobs;
+pub mod netstate;
 pub mod store;
 
 #[cfg(test)]
