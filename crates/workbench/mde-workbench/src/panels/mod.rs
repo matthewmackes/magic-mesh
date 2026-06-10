@@ -73,6 +73,7 @@ pub mod sound;
 pub mod sparkline;
 pub mod sync_status;
 pub mod system_update;
+pub mod tags;
 pub mod themes;
 pub mod vm_wizard;
 pub mod vpn;

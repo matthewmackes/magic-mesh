@@ -40,8 +40,8 @@ use crate::panels::{
     resources as resources_panel, routing as routing_panel, run_history as run_history_panel,
     service_publishing as service_publishing_panel, session as session_panel,
     snapshots as snapshots_panel, sound as sound_panel, sync_status as sync_status_panel,
-    system_update as system_update_panel, themes as themes_panel, vpn as vpn_panel,
-    wallpaper as wallpaper_panel, wifi as wifi_panel,
+    system_update as system_update_panel, tags as tags_panel, themes as themes_panel,
+    vpn as vpn_panel, wallpaper as wallpaper_panel, wifi as wifi_panel,
 };
 use crate::patternfly::{breadcrumb, page_subtitle, page_title};
 use crate::sidebar::SidebarState;
@@ -200,6 +200,7 @@ pub enum Message {
     Interfaces(interfaces_panel::Message),
     Dns(dns_panel::Message),
     Routing(routing_panel::Message),
+    Tags(tags_panel::Message),
     /// BUS-7.2 — Network → Mackes Bus panel sub-message.
     MeshBus(mesh_bus_panel::Message),
     /// TUNE-15.b — Network → Mesh Federation panel sub-message.
@@ -304,6 +305,7 @@ pub struct App {
     interfaces: interfaces_panel::InterfacesPanel,
     dns: dns_panel::DnsPanel,
     routing: routing_panel::RoutingPanel,
+    tags: tags_panel::TagsPanel,
     mesh_bus: mesh_bus_panel::MeshBusPanel,
     mesh_federation: mesh_federation_panel::MeshFederationPanel,
     mesh_control: mesh_control_panel::MeshControlPanel,
@@ -421,6 +423,7 @@ impl App {
             interfaces: interfaces_panel::InterfacesPanel::new(),
             dns: dns_panel::DnsPanel::new(),
             routing: routing_panel::RoutingPanel::new(),
+            tags: tags_panel::TagsPanel::new(),
             mesh_bus: mesh_bus_panel::MeshBusPanel::new(),
             mesh_federation: mesh_federation_panel::MeshFederationPanel::new(),
             mesh_control: mesh_control_panel::MeshControlPanel::new(),
@@ -893,6 +896,7 @@ impl App {
             Message::Interfaces(msg) => self.interfaces.update(msg),
             Message::Dns(msg) => self.dns.update(msg),
             Message::Routing(msg) => self.routing.update(msg),
+            Message::Tags(msg) => self.tags.update(msg),
             Message::MeshBus(msg) => self.mesh_bus.update(msg),
             Message::MeshFederation(msg) => self.mesh_federation.update(msg),
             Message::MeshControl(msg) => self.mesh_control.update(msg),
@@ -988,6 +992,8 @@ impl App {
             (Group::Network, "dns") => dns_panel::DnsPanel::load(),
             // PLANES-19 — the overlay-reachability validation verdict.
             (Group::Network, "routing") => routing_panel::RoutingPanel::load(),
+            // PLANES-3/W82 — the fleet capability-tag census.
+            (Group::Fleet, "tags") => tags_panel::TagsPanel::load(),
             (Group::Controller, "audit") => audit_panel::AuditPanel::load(),
             (Group::ThisNode, "mesh_logs") => mesh_logs_panel::MeshLogsPanel::load(),
             (Group::Controller, "fleet_logs") => fleet_logs_panel::FleetLogsPanel::load(),
@@ -1394,6 +1400,11 @@ impl App {
                 group: Group::Network,
                 panel: "routing",
             } => self.routing.view(),
+            // PLANES-3/W82 — the fleet capability-tag census.
+            View::Panel {
+                group: Group::Fleet,
+                panel: "tags",
+            } => self.tags.view(),
             // BUS-7.2 — Mackes Bus 5-tab operator surface.
             View::Panel {
                 group: Group::Network,
@@ -1544,7 +1555,6 @@ impl App {
 /// follow-up.
 fn panel_worklist_item(group: Group, panel: &str) -> Option<&'static str> {
     match (group, panel) {
-        (Group::Fleet, "tags") => Some("W82 (capability tags)"),
         (Group::Provisioning, "profiles") => Some("PLANES-21 (install profiles)"),
         (Group::Provisioning, "images") => Some("PLANES-22 (images)"),
         (Group::Provisioning, "mirrors") => Some("PLANES-24 (mirrors)"),
@@ -1620,7 +1630,6 @@ mod tests {
         // the worklist item building it, so the console never reads as
         // vaporware.
         for (g, p) in [
-            (Group::Fleet, "tags"),
             (Group::Provisioning, "profiles"),
             (Group::Provisioning, "images"),
             (Group::Provisioning, "mirrors"),
