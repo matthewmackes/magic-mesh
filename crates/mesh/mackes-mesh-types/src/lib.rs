@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cap_tags;
 pub mod connect;
 // NF-11.1 (v2.5) — Nebula facts surface for the peer card.
 pub mod nebula;

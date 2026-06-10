@@ -148,6 +148,20 @@ enum Cmd {
         role: String,
     },
 
+    /// PLANES-3 (W82/83) — view or set a node's capability tags
+    /// (hop|execution|headless). Any enrolled box may set any
+    /// target's tags; the change is audit-logged. With no `--set`,
+    /// prints the target's current tags.
+    Tag {
+        /// Target hostname (defaults to this box).
+        #[arg(long)]
+        host: Option<String>,
+        /// Comma-separated tag set to write (replaces the existing
+        /// set). Omit to just show.
+        #[arg(long)]
+        set: Option<String>,
+    },
+
     RoleWorkers {
         /// lighthouse | server | workstation (default: all three tiers).
         role: Option<String>,
@@ -1338,6 +1352,54 @@ fn main() -> anyhow::Result<()> {
                 publish_link_rtt(&sample);
                 eprintln!("voip-rtt: published to {}", rtt_topic(&peer));
             }
+        }
+        Cmd::Tag { host, set } => {
+            let root = mackesd_core::default_qnm_shared_root();
+            let target = host.unwrap_or_else(|| {
+                std::process::Command::new("hostname")
+                    .output()
+                    .ok()
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "unknown".to_string())
+            });
+            use mackes_mesh_types::cap_tags::{read_tags, write_tags, CapabilityTag, NodeTags};
+            if let Some(spec) = set {
+                let mut tags = NodeTags::default();
+                for tok in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                    match CapabilityTag::parse(tok) {
+                        Some(t) => {
+                            tags.tags.insert(t);
+                        }
+                        None => anyhow::bail!(
+                            "unknown capability tag `{tok}` — expected hop|execution|headless"
+                        ),
+                    }
+                }
+                write_tags(&root, &target, &tags)?;
+                // W83 — audit the change (security-relevant fleet edit).
+                tracing::info!(
+                    target: "mackesd::audit",
+                    event = "cap_tags.set",
+                    host = %target,
+                    tags = %spec,
+                    "PLANES-3: capability tags updated"
+                );
+                println!("tags for {target}: {}", spec);
+            } else {
+                let tags = read_tags(&root, &target);
+                let names: Vec<&str> = tags.tags.iter().map(|t| t.as_str()).collect();
+                println!(
+                    "tags for {target}: {}",
+                    if names.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        names.join(", ")
+                    }
+                );
+            }
+            return Ok(());
         }
         Cmd::RolePin { role } => {
             let parsed: mde_role::Role = role.parse().map_err(|_| {
