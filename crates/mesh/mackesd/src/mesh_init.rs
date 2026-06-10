@@ -65,7 +65,18 @@ pub fn mesh_init<B: NebulaCertBackend>(
         Err(e) => anyhow::bail!("mesh-init step 1 (role read): {e}"),
     };
 
-    // 2. Mint the CA (idempotent on an active epoch).
+    // 2. Mint the CA (idempotent on an active epoch). Ensure the CA
+    //    output dir exists first — `nebula-cert` won't create it, and on
+    //    a manual deploy (no `meshctl install` to pre-create
+    //    `/var/lib/mackesd/nebula-ca/`) the mint otherwise fails with
+    //    "open …/ca.key: no such file or directory". Found standing up
+    //    the local VM bed 2026-06-10.
+    for p in [ca_crt, ca_key] {
+        if let Some(dir) = p.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| anyhow::anyhow!("mesh-init step 2 (CA dir {}): {e}", dir.display()))?;
+        }
+    }
     crate::ca::mint::mint_ca(backend, conn, mesh_id, Some(ca_crt), Some(ca_key))
         .map_err(|e| anyhow::anyhow!("mesh-init step 2 (CA mint): {e}"))?;
 
@@ -181,5 +192,33 @@ mod tests {
         assert!(crate::ca::sign::active_epoch(&conn, "smoke-mesh")
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn mesh_init_creates_a_missing_ca_dir() {
+        // Regression for the VM-bed finding (2026-06-10): on a manual
+        // deploy without `meshctl install`, the CA dir doesn't exist and
+        // nebula-cert can't write ca.key. mesh-init must mkdir -p it.
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("MDE_ROLE_PATH", tmp.path().join("role.toml"));
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::migrate(&conn).unwrap();
+        // A CA dir that does NOT exist yet (two levels deep).
+        let ca_dir = tmp.path().join("var/lib/mackesd/nebula-ca");
+        assert!(!ca_dir.exists());
+        mesh_init(
+            &MockBackend,
+            &conn,
+            tmp.path(),
+            "peer:founder",
+            "dir-mesh",
+            "203.0.113.7:4242",
+            &ca_dir.join("ca.crt"),
+            &ca_dir.join("ca.key"),
+            &tmp.path().join("scratch"),
+            mde_role::Role::Lighthouse,
+        )
+        .expect("mesh init creates the CA dir");
+        assert!(ca_dir.exists(), "mesh-init should mkdir -p the CA dir");
     }
 }

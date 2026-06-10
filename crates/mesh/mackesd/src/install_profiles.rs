@@ -116,7 +116,8 @@ mod tests {
 
     #[test]
     fn core_pack_has_one_profile_per_role() {
-        let roles: BTreeSet<&str> = core_pack().iter().map(|p| p.role.as_str()).collect();
+        let pack = core_pack();
+        let roles: BTreeSet<&str> = pack.iter().map(|p| p.role.as_str()).collect();
         assert_eq!(
             roles,
             BTreeSet::from(["lighthouse", "server", "workstation"])
