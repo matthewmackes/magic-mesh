@@ -106,7 +106,7 @@ host-local Ansible apply.
 - [ ] **GUI-7: maximize-Cosmic-native cutover** — notifications via Cosmic's daemon, mde-files chrome reskinned to libcosmic, panel hosted by Cosmic (Q43/51).
 - [ ] **GUI-8: density boot-apply** — read `theme.density` at boot and apply app-wide (Q50).
 - [ ] **GUI-9: reduced-motion from Cosmic** — source the reduce-motion flag from Cosmic's a11y setting (Q49).
-- [>] **GUI-10: refactor `palette.rs` onto the carbon ramp** — `dark()/light()` reference `carbon::*` so the ramp is the sole hex source (Q52). *(closes the H2 follow-up.)*
+- [✓] **GUI-10: refactor `palette.rs` onto the carbon ramp** — done — zero raw hex in palette.rs; GRAY_10_HOVER added to the ramp (test-pinned); `dark()/light()` reference `carbon::*` so the ramp is the sole hex source (Q52). *(closes the H2 follow-up.)*
 
 ## SERVICES — Remote Access, music, voice, files, KDC (resolves B1, H6)
 

@@ -3,6 +3,7 @@
 //! Q7 (adaptive borders). See `docs/design/visual-identity.md`
 //! § 2 for the rationale and the full table.
 
+use crate::carbon;
 use crate::color::Rgba;
 use crate::theme::Theme;
 
@@ -59,25 +60,25 @@ impl Palette {
     pub const fn dark() -> Self {
         Self {
             // Carbon background — Gray 100.
-            background: Rgba::rgb(0x16, 0x16, 0x16),
+            background: carbon::GRAY_100,
             // Layer-01 (cards, panels, sidebars) — Gray 90.
-            surface: Rgba::rgb(0x26, 0x26, 0x26),
+            surface: carbon::GRAY_90,
             // Layer-02 (modals, popovers, raised surfaces) — Gray 80.
-            raised: Rgba::rgb(0x39, 0x39, 0x39),
+            raised: carbon::GRAY_80,
             // Overlay tier (tooltips, dropdowns, heavier divider) — Gray 70.
-            overlay: Rgba::rgb(0x52, 0x52, 0x52),
+            overlay: carbon::GRAY_70,
             // Interactive accent — Carbon Blue 60.
-            accent: Rgba::rgb(0x0f, 0x62, 0xfe),
+            accent: carbon::BLUE_60,
             // Border-subtle on Gray 100 — Gray 80.
-            border: Rgba::rgb(0x39, 0x39, 0x39),
+            border: carbon::GRAY_80,
             // Text primary on dark — Gray 10.
-            text: Rgba::rgb(0xf4, 0xf4, 0xf4),
+            text: carbon::GRAY_10,
             // Text secondary / helper — Gray 50.
-            text_muted: Rgba::rgb(0x8d, 0x8d, 0x8d),
+            text_muted: carbon::GRAY_50,
             // Support roles — Carbon Green 50 / Red 60 / Yellow 30.
-            success: Rgba::rgb(0x24, 0xa1, 0x48),
-            danger: Rgba::rgb(0xda, 0x1e, 0x28),
-            warning: Rgba::rgb(0xf1, 0xc2, 0x1b),
+            success: carbon::GREEN_50,
+            danger: carbon::RED_60,
+            warning: carbon::YELLOW_30,
         }
     }
 
@@ -87,25 +88,25 @@ impl Palette {
     pub const fn light() -> Self {
         Self {
             // Carbon background — Gray 10.
-            background: Rgba::rgb(0xf4, 0xf4, 0xf4),
+            background: carbon::GRAY_10,
             // Layer-01 — White.
-            surface: Rgba::rgb(0xff, 0xff, 0xff),
+            surface: carbon::WHITE,
             // Layer-02 — White (Carbon layers white-on-Gray-10).
-            raised: Rgba::rgb(0xff, 0xff, 0xff),
+            raised: carbon::WHITE,
             // Overlay / layer-hover — Gray 10 hover.
-            overlay: Rgba::rgb(0xe8, 0xe8, 0xe8),
+            overlay: carbon::GRAY_10_HOVER,
             // Interactive accent — Carbon Blue 60 (same as dark).
-            accent: Rgba::rgb(0x0f, 0x62, 0xfe),
+            accent: carbon::BLUE_60,
             // Border-subtle-01 (light) — Gray 20.
-            border: Rgba::rgb(0xe0, 0xe0, 0xe0),
+            border: carbon::GRAY_20,
             // Text primary on light — Gray 100.
-            text: Rgba::rgb(0x16, 0x16, 0x16),
+            text: carbon::GRAY_100,
             // Text secondary — Gray 70.
-            text_muted: Rgba::rgb(0x52, 0x52, 0x52),
+            text_muted: carbon::GRAY_70,
             // Support roles — Carbon Green 50 / Red 60 / Yellow 30.
-            success: Rgba::rgb(0x24, 0xa1, 0x48),
-            danger: Rgba::rgb(0xda, 0x1e, 0x28),
-            warning: Rgba::rgb(0xf1, 0xc2, 0x1b),
+            success: carbon::GREEN_50,
+            danger: carbon::RED_60,
+            warning: carbon::YELLOW_30,
         }
     }
 

@@ -15,6 +15,9 @@ use crate::color::Rgba;
 // ---- Gray ramp ----
 /// Gray 10 — primary text on dark / lightest surface on light.
 pub const GRAY_10: Rgba = Rgba::rgb(0xf4, 0xf4, 0xf4);
+/// Carbon `gray-10-hover` — the hover/overlay companion to Gray 10
+/// (carbondesignsystem.com states #e8e8e8).
+pub const GRAY_10_HOVER: Rgba = Rgba::rgb(0xe8, 0xe8, 0xe8);
 /// Gray 20.
 pub const GRAY_20: Rgba = Rgba::rgb(0xe0, 0xe0, 0xe0);
 /// Gray 30 — secondary text on dark.
@@ -76,6 +79,7 @@ mod tests {
     fn ramp_matches_published_carbon() {
         for (step, (r, g, b)) in [
             (GRAY_10, (0xf4, 0xf4, 0xf4)),
+            (GRAY_10_HOVER, (0xe8, 0xe8, 0xe8)),
             (GRAY_30, (0xc6, 0xc6, 0xc6)),
             (GRAY_50, (0x8d, 0x8d, 0x8d)),
             (GRAY_60, (0x6f, 0x6f, 0x6f)),
