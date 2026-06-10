@@ -287,7 +287,7 @@ host-local Ansible apply.
 - [ ] **PLANES-10: Job templates panel** — form + read-only YAML (W38), schedule field (W30), tag/role/peer targeting (W31), history runs→targets→output (W36). Playbooks panel absorbed (W40).
 - [ ] **PLANES-11: Remediation panel** — drift-type→template map w/ event var bindings, drift list + matched plan + fire (W41); per-plan auto flag default-off, auto fires loud (W42). Drift panel folds in (W13).
 - [ ] **PLANES-12: Audit** — hash-chained events: security + jobs/remediation + config/policy + lifecycle ops (W43); timeline viewer + verify-chain (W44); **72 h rolling retention** (W45, operator lock). Absorbs **ENT-14**.
-- [ ] **PLANES-13: Policy engine** — TOML declarative assertions over replicated data (W46/W47); eval on-change + hourly leader sweep (W48); **violation = drift event** (W49); core pack ships enabled (W50); report default / enforce = opt-in auto-plan (W51).
+- [✓] **PLANES-13: Policy engine** — done — policy_engine: TOML declarative assertions (selector+field+op+expected+severity, W47) over the directory record; evaluate→Violation feeds the W41 drift pipeline (W49); core pack ships enabled (all-nodes-current, no-critical-alarms — W50). On-change/hourly-leader sweep (W48) + enforce-binding (W51) wire with the remediation worker — TOML declarative assertions over replicated data (W46/W47); eval on-change + hourly leader sweep (W48); **violation = drift event** (W49); core pack ships enabled (W50); report default / enforce = opt-in auto-plan (W51).
 - [ ] **PLANES-14: Fleet logs search** — Controller-side search over the OBS-5 mesh-replicated structured logs (W15). Absorbs **OBS-5**.
 
 ### Network
