@@ -49,12 +49,22 @@ jobs:
       - name: Build (workspace)
         run: cargo build --workspace --locked
 
-      - name: Test (workspace)
-        run: cargo test --workspace --locked
+      # Everything except mackesd runs PARALLEL (fast — e.g. mde-kdc-host's
+      # deliberate sleeps/RSA-4096 keygen tests overlap).
+      - name: Test (workspace, excl. mackesd)
+        run: cargo test --workspace --exclude mackesd --locked
 
-      # mackesd's daemon-worker tests only compile under async-services.
-      - name: Test (mackesd async-services)
-        run: cargo test -p mackesd --features async-services --locked
+      # mackesd is run SINGLE-THREADED. Several of its tests mutate
+      # process-global env (`std::env::set_var` for MDE_ROLE_PATH /
+      # XDG_CACHE_HOME / CREDENTIALS_DIRECTORY) while sibling tests read the
+      # environment; under the default parallel harness that set_var/getenv
+      # interleaving corrupts glibc's `environ` and the mackesd suite hangs
+      # indefinitely. Serially it is correct (verified: 1397 pass,
+      # --test-threads=1). `--features async-services` makes this the
+      # superset (also compiles + runs the daemon-worker tests). Follow-up
+      # (tracked): remove the test set_var hazard so this can go parallel.
+      - name: Test (mackesd, serial — env-race safe)
+        run: cargo test -p mackesd --features async-services --locked -- --test-threads=1
 
       # Carbon tokens are the one place a palette/metric change is allowed.
       - name: Carbon token tests (§4)
