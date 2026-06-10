@@ -4244,6 +4244,7 @@ dependencies = [
  "clap",
  "futures",
  "iced 0.14.0",
+ "iced_layershell",
  "mackes-config",
  "mackes-mesh-types",
  "mde-bus",

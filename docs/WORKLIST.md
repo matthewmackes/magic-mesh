@@ -224,7 +224,7 @@ host-local Ansible apply.
   **Acceptance:**
     - [ ] a behind peer converges after the nudge; the badge flips to synced on the next ack
     - [ ] the button is absent when synced/unknown
-- [ ] **PD-10: PEERS — the live-map Cosmic wallpaper**
+- [>] **PD-10: PEERS — the live-map Cosmic wallpaper** — SPIKE SUCCEEDED + BINARY LANDED (mde-mesh-wallpaper: layer-shell Background surface on the proven voice-hud iced/layershell pair; shares the PD-7 MapProgram; pure render L21 — KeyboardInteractivity::None; adaptive L22 — 30s data tick, 5min on battery, repaint only on change; headless smoke boots to the expected NoCompositor); REMAINING: the L23 Wallpaper-panel toggle + on-session /preview visual verify (hardware-gated)
   **As** a user,
   **I want** the live mesh map rendered as the Cosmic desktop background (a second output target of the same canvas scene) — pure render, clicks pass through (L21); adaptive power: ~30 fps under traffic, 1 fps idle, paused on battery and when fullscreen-covered (L22); configured as a "Live mesh map" choice in the Wallpaper panel beside static images (L23),
   **so that** the mesh's living state is ambient on the desktop (Q25, L21–L23). **Risk-first: prototype the layer-shell/cosmic-bg surface before building on it.**

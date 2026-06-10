@@ -23,6 +23,8 @@ path = "src/main.rs"
 # v4.0.1 BUG-13.c: `svg` so panel_chrome + header can render Material
 # Symbols glyphs via iced::widget::svg when Icon::svg_bytes() is Some.
 iced       = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "svg", "tokio", "advanced", "canvas", "wayland"] }
+# PD-10 - the live-map wallpaper binary renders on a layer-shell Background surface.
+iced_layershell = "0.18"
 # CB-1.13 will land the dev.mackes.MDE.Shell.Workbench.Focus
 # interface; CB-1.1's single-instance handshake already needs the
 # dep so the bus-name constants + RequestNameReply mapping live
