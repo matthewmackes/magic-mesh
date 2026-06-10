@@ -7,11 +7,12 @@
 //! Links conceptually to install profiles (a role pin + tags is what a
 //! profile bakes).
 //!
-//! Build-now-defer-visual: the load + join are pure and unit-tested; the
-//! interactive **tag editor** (write side, `mackesd tag --set`) + the
-//! on-Cosmic `/preview` are the deferred tail.
+//! The interactive **tag editor** (W26 write side) lands here: each
+//! node's v1 tags (hop / execution / headless, W82) render as toggle
+//! buttons that shell `mackesd tag --host <h> --set <new-set>` (any
+//! enrolled surface may set any target's tags, W83) and reload.
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
 
 use iced::widget::{column, row, scrollable, text};
 use iced::{Element, Length, Task};
@@ -41,30 +42,66 @@ pub struct NodeRoleRow {
     pub tags: Vec<String>,
 }
 
-/// `MDE_WORKGROUP_ROOT`-or-`/mnt/mesh-storage` (matches the sibling panels).
+/// The v1 capability-tag vocabulary the editor toggles (W82).
+pub const V1_TAGS: [&str; 3] = ["hop", "execution", "headless"];
+
+/// The tag set after toggling `tag` on a node currently carrying
+/// `current` — the comma-joined value handed to `mackesd tag --set`
+/// (which REPLACES the set). Pure for testing.
 #[must_use]
-pub fn workgroup_root() -> PathBuf {
-    std::env::var_os("MDE_WORKGROUP_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/mnt/mesh-storage"))
+pub fn next_tag_set(current: &[String], tag: &str) -> String {
+    let mut set: std::collections::BTreeSet<&str> = current.iter().map(String::as_str).collect();
+    if !set.remove(tag) {
+        set.insert(tag);
+    }
+    set.into_iter().collect::<Vec<_>>().join(",")
+}
+
+/// Invert the `mackesd tags --json` census (`[{tag, nodes:[…]}]`) into a
+/// `host → [tags]` map, so the read uses the SAME server-resolved root
+/// the `mackesd tag --set` write goes to (was: a direct cap-tags read at
+/// a hardcoded `/mnt/mesh-storage`, which drifts from the write root on a
+/// box where they differ).
+#[must_use]
+fn census_to_host_tags(tags_census_json: &str) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let Ok(census) = serde_json::from_str::<Vec<serde_json::Value>>(tags_census_json) else {
+        return out;
+    };
+    for entry in census {
+        let Some(tag) = entry.get("tag").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        for node in entry
+            .get("nodes")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let Some(h) = node.as_str() {
+                out.entry(h.to_string()).or_default().push(tag.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// Parse `mackesd nodes list --json` + join each node with its tags from
-/// the cap-tags store under `root`. Pure over (json, root) for testing.
+/// the `mackesd tags --json` census. Pure over (nodes, census) for tests.
 #[must_use]
-pub fn build_rows(nodes_json: &str, root: &std::path::Path) -> Vec<NodeRoleRow> {
+pub fn build_rows(nodes_json: &str, tags_census_json: &str) -> Vec<NodeRoleRow> {
     let nodes: Vec<NodeJson> = serde_json::from_str(nodes_json).unwrap_or_default();
+    let host_tags = census_to_host_tags(tags_census_json);
     let mut rows: Vec<NodeRoleRow> = nodes
         .into_iter()
         .map(|n| {
-            // tags are keyed by hostname (the cap-tags store filename stem).
-            let tags = mackes_mesh_types::cap_tags::read_tags(root, &n.name);
-            let tag_names: Vec<String> = tags.tags.iter().map(|t| t.as_str().to_string()).collect();
+            let mut tags = host_tags.get(&n.name).cloned().unwrap_or_default();
+            tags.sort();
             NodeRoleRow {
                 node_id: n.node_id,
                 name: n.name,
                 role: n.role,
-                tags: tag_names,
+                tags,
             }
         })
         .collect();
@@ -86,6 +123,13 @@ pub enum Message {
     Loaded(Vec<NodeRoleRow>),
     Error(String),
     RefreshClicked,
+    /// Toggle `tag` on node `name` (W26 write side).
+    ToggleTag {
+        name: String,
+        tag: String,
+    },
+    /// Result of a `mackesd tag --set` write.
+    TagApplied(Result<String, String>),
 }
 
 impl NodeRolesPanel {
@@ -97,10 +141,17 @@ impl NodeRolesPanel {
     pub fn load() -> Task<crate::Message> {
         Task::perform(
             async move {
-                match run_mackesd(&["nodes".into(), "list".into(), "--json".into()]).await {
-                    Ok(out) => Message::Loaded(build_rows(&out, &workgroup_root())),
-                    Err(e) => Message::Error(e),
-                }
+                let nodes =
+                    match run_mackesd(&["nodes".into(), "list".into(), "--json".into()]).await {
+                        Ok(out) => out,
+                        Err(e) => return Message::Error(e),
+                    };
+                // The tag census reads the same root `mackesd tag --set`
+                // writes to; a census failure just means "no tags".
+                let census = run_mackesd(&["tags".into(), "--json".into()])
+                    .await
+                    .unwrap_or_default();
+                Message::Loaded(build_rows(&nodes, &census))
             },
             crate::Message::NodeRoles,
         )
@@ -127,6 +178,36 @@ impl NodeRolesPanel {
                 self.busy = true;
                 self.status = "Refreshing…".into();
                 Self::load()
+            }
+            Message::ToggleTag { name, tag } => {
+                if self.busy {
+                    return Task::none();
+                }
+                // Compute the new replacement set from this node's row.
+                let Some(row) = self.rows.iter().find(|r| r.name == name) else {
+                    return Task::none();
+                };
+                let new_set = next_tag_set(&row.tags, &tag);
+                self.busy = true;
+                self.status = format!("Setting {name} tags…");
+                Task::perform(
+                    async move {
+                        run_mackesd(&["tag".into(), "--host".into(), name, "--set".into(), new_set])
+                            .await
+                    },
+                    |r| crate::Message::NodeRoles(Message::TagApplied(r)),
+                )
+            }
+            Message::TagApplied(Ok(_)) => {
+                // Reload so the row reflects the persisted tag set.
+                self.busy = true;
+                self.status = "Refreshing…".into();
+                Self::load()
+            }
+            Message::TagApplied(Err(e)) => {
+                self.busy = false;
+                self.status = format!("Tag write failed: {e}");
+                Task::none()
             }
         }
     }
@@ -160,18 +241,33 @@ impl NodeRolesPanel {
             );
         }
         for r in &self.rows {
-            let tags = if r.tags.is_empty() {
-                "(none)".to_string()
-            } else {
-                r.tags.join(", ")
-            };
+            // Each v1 tag is a toggle: Primary (filled) when the node
+            // carries it, Secondary (outline) when not. Disabled while a
+            // write/refresh is in flight.
+            let mut tag_toggles = row![].spacing(6);
+            for tag in V1_TAGS {
+                let has = r.tags.iter().any(|t| t == tag);
+                let variant = if has {
+                    ButtonVariant::Primary
+                } else {
+                    ButtonVariant::Secondary
+                };
+                let msg = (!self.busy).then(|| {
+                    crate::Message::NodeRoles(Message::ToggleTag {
+                        name: r.name.clone(),
+                        tag: tag.to_string(),
+                    })
+                });
+                tag_toggles = tag_toggles.push(variant_button(tag, variant, msg, palette));
+            }
             list = list.push(
                 row![
                     text(r.name.clone()).width(Length::Fixed(220.0)).size(13),
                     text(r.role.clone()).width(Length::Fixed(120.0)).size(13),
-                    text(tags).size(13),
+                    tag_toggles,
                 ]
-                .spacing(12),
+                .spacing(12)
+                .align_y(iced::Alignment::Center),
             );
         }
 
@@ -193,35 +289,62 @@ impl NodeRolesPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mackes_mesh_types::cap_tags::{write_tags, CapabilityTag, NodeTags};
 
     #[test]
-    fn build_rows_joins_roster_with_tags_sorted() {
-        let tmp = tempfile::tempdir().unwrap();
-        // pine carries the execution tag; oak has none.
-        let mut tags = NodeTags::default();
-        tags.tags.insert(CapabilityTag::Execution);
-        write_tags(tmp.path(), "pine", &tags).unwrap();
-
+    fn build_rows_joins_roster_with_census_sorted() {
+        // pine carries execution + hop; oak has none.
+        let census = r#"[
+            {"tag":"hop","nodes":["pine"]},
+            {"tag":"execution","nodes":["pine"]},
+            {"tag":"headless","nodes":[]}
+        ]"#;
         let json = r#"[
             {"node_id":"peer:pine","name":"pine","role":"workstation"},
             {"node_id":"peer:oak","name":"oak","role":"server"}
         ]"#;
-        let rows = build_rows(json, tmp.path());
+        let rows = build_rows(json, census);
         assert_eq!(rows.len(), 2);
         // sorted by name: oak, pine
         assert_eq!(rows[0].name, "oak");
         assert!(rows[0].tags.is_empty());
         assert_eq!(rows[1].name, "pine");
         assert_eq!(rows[1].role, "workstation");
-        assert_eq!(rows[1].tags, vec!["execution"]);
+        // tags sorted alphabetically.
+        assert_eq!(rows[1].tags, vec!["execution", "hop"]);
+    }
+
+    #[test]
+    fn next_tag_set_adds_and_removes() {
+        // Add execution to a node with none.
+        assert_eq!(next_tag_set(&[], "execution"), "execution");
+        // Toggle off a carried tag.
+        assert_eq!(next_tag_set(&["execution".into()], "execution"), "");
+        // Add a second tag — sorted, comma-joined (BTreeSet order).
+        assert_eq!(next_tag_set(&["hop".into()], "execution"), "execution,hop");
+        // Remove one of two, keeping the other.
+        assert_eq!(
+            next_tag_set(&["execution".into(), "headless".into()], "execution"),
+            "headless"
+        );
+    }
+
+    #[test]
+    fn tag_write_failure_surfaces_in_status() {
+        let mut p = NodeRolesPanel::new();
+        p.busy = true;
+        let _ = p.update(Message::TagApplied(Err("nope".into())));
+        assert!(!p.busy);
+        assert!(p.status.contains("nope"));
     }
 
     #[test]
     fn build_rows_tolerates_garbage_json() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(build_rows("not json", tmp.path()).is_empty());
-        assert!(build_rows("", tmp.path()).is_empty());
+        assert!(build_rows("not json", "[]").is_empty());
+        assert!(build_rows("", "also not json").is_empty());
+        // Valid roster, garbage census → nodes with no tags.
+        let rows = build_rows(r#"[{"node_id":"p","name":"p","role":"host"}]"#, "garbage");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].tags.is_empty());
     }
 
     #[test]
