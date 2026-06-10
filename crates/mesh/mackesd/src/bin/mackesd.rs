@@ -3192,7 +3192,7 @@ fn run_serve(
 ) -> anyhow::Result<()> {
     use mackesd_core::workers::{
         firewall_preset::FirewallPresetWorker, fleet_reconcile, heartbeat::HeartbeatWorker,
-        mdns_relay::MdnsRelayWorker, mesh_router::MeshRouterWorker, presence_watch,
+        lifecycle_exec, mdns_relay::MdnsRelayWorker, mesh_router::MeshRouterWorker, presence_watch,
         ssh_pubkey_gossip, sshd_overlay_bind::SshdOverlayBindWorker,
         voice_config::VoiceConfigWorker, RestartPolicy, Spawn, Supervisor,
     };
@@ -3412,6 +3412,18 @@ fn run_serve(
         // ed25519 pubkey into <root>/ssh-keys/ and merge every peer's
         // published key into ~/.ssh/authorized_keys (managed block,
         // write-on-change). LizardFS replication is the transport.
+        // PD-11 — the lifecycle executor: descriptor-gated container/VM
+        // start/stop requests from peers, via replicated request files.
+        if mackesd_core::worker_role::runs("lifecycle_exec", role_rank) {
+            sup.spawn(Spawn::new(
+                lifecycle_exec::LifecycleExecWorker::new(
+                    workgroup_root.clone(),
+                    node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names.lock().expect("worker_names mutex").push("lifecycle_exec".into());
+        }
         // PD-13 — presence-transition alerts: offline/online crossings
         // become desktop notifications via the alert_relay pipeline.
         if mackesd_core::worker_role::runs("presence_watch", role_rank) {

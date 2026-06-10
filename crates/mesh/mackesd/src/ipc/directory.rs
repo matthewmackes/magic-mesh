@@ -35,6 +35,11 @@ pub const ACTION_TOPIC: &str = "action/mesh/directory";
 /// packet from THIS box (the segment-sharing relay is a follow-up).
 pub const WAKE_TOPIC: &str = "action/mesh/wake";
 
+/// PD-11 — the lifecycle verb: `{peer, kind, name, op}` → a request
+/// file on the replicated volume; the target's executor validates
+/// against its own inventory (the L9 rail) + runs it.
+pub const LIFECYCLE_TOPIC: &str = "action/services/lifecycle";
+
 /// Responder poll interval (matches the fleet responder).
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
@@ -175,10 +180,56 @@ fn now_ms() -> u64 {
 pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &DirectoryService, should_stop: F) {
     let mut cursor: Option<String> = None;
     let mut wake_cursor: Option<String> = None;
+    let mut lifecycle_cursor: Option<String> = None;
     while !should_stop() {
         poll_once(persist, svc, &mut cursor);
         poll_wake_once(persist, &mut wake_cursor);
+        poll_lifecycle_once(persist, svc, &mut lifecycle_cursor);
         std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// PD-11 — accept lifecycle requests + write the replicated request
+/// file. The reply carries the request id the GUI polls results by.
+pub fn poll_lifecycle_once(persist: &Persist, svc: &DirectoryService, cursor: &mut Option<String>) {
+    let msgs = match persist.list_since(LIFECYCLE_TOPIC, cursor.as_deref()) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    for msg in msgs {
+        *cursor = Some(msg.ulid.clone());
+        let reply = lifecycle_reply(svc, msg.body.as_deref(), &msg.ulid);
+        let _ = persist.write(
+            &reply_topic(&msg.ulid),
+            Priority::Default,
+            None,
+            Some(&reply),
+        );
+    }
+}
+
+/// Build the lifecycle-verb reply (the request file write is the
+/// side effect; the message ulid doubles as the request id).
+#[must_use]
+pub fn lifecycle_reply(svc: &DirectoryService, body: Option<&str>, id: &str) -> String {
+    let req: serde_json::Value =
+        serde_json::from_str(body.unwrap_or("{}")).unwrap_or(serde_json::Value::Null);
+    let get = |k: &str| req.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let (Some(peer), Some(kind), Some(name), Some(op)) =
+        (get("peer"), get("kind"), get("name"), get("op"))
+    else {
+        return json!({ "ok": false, "error": "lifecycle: need peer/kind/name/op" }).to_string();
+    };
+    let request = crate::lifecycle::LifecycleRequest {
+        id: id.to_string(),
+        kind,
+        name,
+        op,
+        from: "local-workbench".into(),
+    };
+    match crate::lifecycle::write_request(&svc.workgroup_root, &peer, &request) {
+        Ok(_) => json!({ "ok": true, "id": id, "peer": peer }).to_string(),
+        Err(e) => json!({ "ok": false, "error": format!("lifecycle: {e}") }).to_string(),
     }
 }
 
@@ -332,6 +383,29 @@ mod tests {
         let ok: serde_json::Value =
             serde_json::from_str(&wake_reply(Some(r#"{"mac":"aa:bb:cc:dd:ee:ff"}"#))).unwrap();
         assert_eq!(ok["ok"], true);
+    }
+
+    #[test]
+    fn lifecycle_verb_writes_the_request_file_and_refuses_bad_vocab() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = DirectoryService::new(tmp.path(), None);
+        let ok: serde_json::Value = serde_json::from_str(&lifecycle_reply(
+            &svc,
+            Some(r#"{"peer":"oak","kind":"container","name":"nginx","op":"start"}"#),
+            "ulid-1",
+        ))
+        .unwrap();
+        assert_eq!(ok["ok"], true);
+        let pending = crate::lifecycle::take_requests(tmp.path(), "oak");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "ulid-1");
+        let bad: serde_json::Value = serde_json::from_str(&lifecycle_reply(
+            &svc,
+            Some(r#"{"peer":"oak","kind":"container","name":"x","op":"explode"}"#),
+            "ulid-2",
+        ))
+        .unwrap();
+        assert_eq!(bad["ok"], false);
     }
 
     #[test]
