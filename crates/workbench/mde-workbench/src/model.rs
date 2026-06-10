@@ -244,6 +244,8 @@ pub fn nav_model() -> Vec<NavEntry> {
                 // PLANES-5 — replicated PeerProbe hardware view
                 // (PCI/USB/kernel/power/descriptors), no new collectors.
                 Panel::new("hardware", "Hardware"),
+                // PLANES-10 — job templates + run history (absorbs Playbooks).
+                Panel::new("jobs", "Jobs"),
                 Panel::new("playbooks", "Playbooks"),
                 Panel::new("run_history", "Run History"),
                 Panel::new("settings", "Settings"),

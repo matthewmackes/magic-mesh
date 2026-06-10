@@ -330,6 +330,7 @@ mod tests {
             vec![
                 "inventory",
                 "hardware",
+                "jobs",
                 "playbooks",
                 "run_history",
                 "settings",
