@@ -31,6 +31,16 @@ done
 RT="$(mktemp -d)"
 chmod 700 "$RT"
 export XDG_RUNTIME_DIR="$RT"
+# Isolate the mde-bus data dir (mde_bus::default_data_dir = dirs::data_dir()
+# /mde/bus, which follows XDG_DATA_HOME). WITHOUT this, the workbench's 200 ms
+# focus poll drains stale `action/shell/workbench-focus` messages from the
+# operator's REAL bus and navigates away from the requested --focus panel
+# within a frame — the deep-link "bounce" that made every capture render the
+# last-focused panel (e.g. fleet.fleet_rollup) regardless of the slug asked
+# for. A fresh, empty bus dir per capture keeps --focus put.
+export XDG_DATA_HOME="$RT/data"
+export XDG_CONFIG_HOME="$RT/config"
+mkdir -p "$XDG_DATA_HOME" "$XDG_CONFIG_HOME"
 export WLR_BACKENDS=headless
 export WLR_LIBINPUT_NO_DEVICES=1
 export WLR_RENDERER=pixman          # software render — no GPU on a headless box
