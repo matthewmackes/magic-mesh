@@ -33,6 +33,12 @@ path = "src/lib.rs"
 name = "mackesd"
 path = "src/bin/mackesd.rs"
 
+# ENT-15 — the operator facade. A thin friendly binary over mackesd's
+# lifecycle subcommands + the replicated stores (no async-services needed).
+[[bin]]
+name = "meshctl"
+path = "src/bin/meshctl.rs"
+
 [dependencies]
 mackes-mesh-types = { path = "../mackes-mesh-types" }
 magic-fleet = { path = "../magic-fleet" }
@@ -299,7 +305,8 @@ workspace = true
 
 # PKG-1/3/6 (W71/72/75/76/86) — the ONE monolithic Magic Mesh RPM.
 # `cargo generate-rpm -p mackesd` (operator-gated via /release) packages
-# all eight app/daemon binaries + the packaging/ assets into a single
+# all app/daemon binaries (incl. the ENT-15 meshctl facade) + the
+# packaging/ assets into a single
 # `magic-mesh` RPM; the install-time role chooser (PKG-5) + the
 # self-gating mackesd.service (PKG-3) decide what actually runs per node,
 # so there is no per-role package split (§5: Lighthouse ⊂ Server ⊂
@@ -311,6 +318,7 @@ license = "proprietary"
 # Every binary the workspace builds, placed under /usr/bin.
 assets = [
     { source = "target/release/mackesd",            dest = "/usr/bin/mackesd",            mode = "755" },
+    { source = "target/release/meshctl",            dest = "/usr/bin/meshctl",            mode = "755" },
     { source = "target/release/magic-fleet",        dest = "/usr/bin/magic-fleet",        mode = "755" },
     { source = "target/release/mde-bus",            dest = "/usr/bin/mde-bus",            mode = "755" },
     { source = "target/release/mde-files",          dest = "/usr/bin/mde-files",          mode = "755" },
