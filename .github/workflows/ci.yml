@@ -27,6 +27,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The full-workspace debug build (iced + audio + all deps) + test
+      # binaries + the rust-cache overflow the free runner's ~14 GB disk
+      # (the cache-save post-step failed "No space left on device"). Reclaim
+      # the preinstalled SDKs we don't use (~25 GB) up front.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
+
       # The audio chain links ALSA; the iced GUIs link GTK; the vendored Opus
       # build needs CMake. pkg-config resolves them.
       - name: System dev libraries
@@ -96,6 +107,15 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+
+      # llvm-cov's instrumented full-workspace build is even larger than the
+      # plain one — reclaim the preinstalled SDKs we don't use (~25 GB).
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
 
       - name: System dev libraries
         run: |
