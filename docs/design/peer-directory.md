@@ -1,6 +1,7 @@
 # PEERS — Directory of Mesh Peers
 
-**Date:** 2026-06-09 · **Survey:** 26 questions (3 rounds) + 3 operator directives ·
+**Date:** 2026-06-09 · **Survey:** 26 questions (3 rounds) + 3 operator directives,
+**+ a 25-question level-2 survey** (same day — implementation depth) ·
 **Status:** locked, lifted into `docs/WORKLIST.md` (### PEERS)
 
 **The Front Door to the platform** (operator directive D2): when the mesh is fully
@@ -55,6 +56,36 @@ nowhere; presence/version/sync lived in `PeerRecord` but had no per-peer surface
 **Q26 vs the old Q95/96 lock:** Netdata stays local and there is still **no central
 aggregation** — the directory does peer-to-peer pulls of each peer's own Netdata
 (REST :19999 over the overlay). The old lock is amended, not broken.
+
+## Level-2 locks (second 25-Q survey, 2026-06-09)
+
+| # | Question | Lock |
+|---|----------|------|
+| L1 | Identity display | **Hostname + tag chips** — device-tags render as colored chips (manifest `border_color`) in row + detail header |
+| L2 | List controls | **Filter box only** — type-to-filter on hostname / tag / service name |
+| L3 | Degraded Front Door | **Guided empty states** — unenrolled → "Join a mesh"; mackesd down → "Start the mesh service" (one-click); no peers → "Invite a peer" (token) |
+| L4 | Wake-on-LAN | **Yes** — offline peers get a Wake action; nearest online peer's mackesd sends the magic packet (Bus verb); reuses the peer-MAC cache |
+| L5 | Drop alerts | **Yes, via alert_relay** — presence transitions emit through the alert pipeline → cosmic-applet notifications |
+| L6 | Device ops (KDC) | **All four** — presence + battery · ring/locate · send file · jump to KDC hub card |
+| L7 | SSH identity | **`$USER`** — zero config; ssh's own errors surface in the terminal |
+| L8 | Op gating | **None** — desktop = operator (§8 ≤8-peer trust envelope) |
+| L9 | Service actions | **FULL lifecycle in this epic** — start/stop/restart for Podman containers and KVM guests from the directory (overrides the v1 display-only plan) |
+| L10 | Podman depth | **name + image + state + published ports** per container |
+| L11 | KVM depth | **specs + addresses** — name, state, vCPU/mem, guest IPs via qemu-agent (guests become almost-peers) |
+| L12 | Media discovery | **Port-scan everything** — each peer self-scans the media-port list (8096 Jellyfin, 4533 Navidrome/Airsonic, 6600 MPD, DLNA, mde-musicd…) and publishes what answers |
+| L13 | Descriptor cadence | **Heartbeat-coupled (~30 s)** — descriptors ride the presence heartbeat, one cycle one write |
+| L14 | Sparklines | **CPU / load / net / disk, 60 s window**, ~2 s refresh while selected; dashboard deep-link owns history |
+| L15 | Health mapping | **3-tier** — healthy · degraded (any WARNING) · critical (any CRITICAL), worst alarm named in detail |
+| L16 | Lifecycle guard | **Confirm dialog on stop/restart** ("Stop win11 on oak?"); start is one-click; no auth prompt |
+| L17 | Map layout | **Force-directed** — RTT-proportional edge pull; mesh shape becomes information |
+| L18 | Edge activity | **Width + particles** — log-scaled thickness + animated flow dots in transfer direction |
+| L19 | Trace depth | **+ underlay traceroute** — expandable classic hop list under the overlay path report |
+| L20 | RTT history | **Session sparkline** per edge, in-memory since panel open, charted in the trace card |
+| L21 | WP interactivity | **Pure render** — clicks pass through; interaction lives in the Workbench |
+| L22 | WP power | **Adaptive** — ~30 fps active / 1 fps idle ticks / paused on battery and when covered |
+| L23 | WP config | **Wallpaper panel** — "Live mesh map" choice beside static images |
+| L24 | CLI format | **Table default + `--json`** |
+| L25 | Sequencing | **Data → panel → map → wallpaper**, layer-shell spike early in parallel; every slice independently shippable + §7-complete |
 
 ## Architecture
 
@@ -131,6 +162,22 @@ aggregation** — the directory does peer-to-peer pulls of each peer's own Netda
 - Per-peer divergent updates (broadcast FPG model holds; the nudge only hurries
   convergence).
 - Central metrics aggregation (Q95/96 holds — peer-to-peer pulls only).
-- Actions on Podman/KVM/media entries (start/stop containers or guests) — v1 is
-  inventory display; operations on those services are a future epic.
-- KDC device operations beyond presence/ping-class (phones keep their KDC surface).
+- ~~Actions on Podman/KVM/media entries~~ — **pulled INTO scope by L9** (full
+  lifecycle, confirm-on-stop per L16). Media services stay display + open-client.
+- ~~KDC device ops beyond presence~~ — **expanded by L6** (ring, send file, hub link);
+  anything further stays in the KDC hub.
+- Persisted RTT/metrics history (session-only per L20; the Netdata dashboard owns
+  long history).
+- Wallpaper interactivity (pure render per L21; revisit only after PD-10 ships).
+
+## Additional risks (level-2)
+
+- **L9 lifecycle blast radius:** an ungated (L8) one-click stop of a remote VM is the
+  sharpest tool in the directory; the L16 confirm is the only rail. Acceptable inside
+  the §8 envelope — but the lifecycle Bus verb must refuse targets not in the
+  descriptor set (no arbitrary `virsh`/`podman` argument passthrough).
+- **L12 port-scan:** self-scan only (localhost), never across the mesh, or it becomes
+  the remote probing Q19 banned. The scan list is a pinned constant, not user input.
+- **L17/L18 canvas cost:** force-directed + particles is the most expensive render in
+  the platform; the L22 adaptive budget applies to the *panel* map too, not just the
+  wallpaper.

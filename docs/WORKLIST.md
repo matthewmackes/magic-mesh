@@ -144,10 +144,13 @@ host-local Ansible apply.
 
 ## PEERS — Directory of Mesh Peers, the platform Front Door (design: `docs/design/peer-directory.md`, 2026-06-09)
 
-> 26-Q survey + 3 operator directives. The Peers directory is the **Front Door**: Workbench
-> lands on it; it shows everything the running mesh offers (peers, services: remote access /
-> Podman / KVM / media / voice) + an advanced health/design view (presence, sync, drift,
-> Netdata health, live path map → wallpaper). Evolves `mesh_topology`; retires the CR-6.c modal.
+> 26-Q survey + 3 operator directives **+ 25-Q level-2 survey (L1–L25)**. The Peers directory
+> is the **Front Door**: Workbench lands on it; it shows everything the running mesh offers
+> (peers, services: remote access / Podman / KVM / media / voice) + an advanced health/design
+> view (presence, sync, drift, Netdata health, live path map → wallpaper). Evolves
+> `mesh_topology`; retires the CR-6.c modal.
+> **Sequencing (L25):** PD-1/2 → PD-3/4/5 (+11/12/13) → PD-6/7 → PD-8/9 → PD-10; layer-shell
+> spike runs early in parallel. Every slice independently shippable + §7-complete.
 
 - [ ] **PD-1: PEERS — the `action/mesh/directory` Bus verb + `mackesd peers` CLI**
   **As** any directory consumer (GUI or CLI),
@@ -155,23 +158,26 @@ host-local Ansible apply.
   **so that** every surface reads the same answer with zero GUI shell-outs (Q9/Q23).
   **Acceptance:**
     - [ ] `mde-bus call action/mesh/directory` returns all known peers incl. self, with every field above
-    - [ ] `mackesd peers` prints the same record set as a table
+    - [ ] `mackesd peers` prints the same record set as an aligned table; `--json` emits raw records (L24)
     - [ ] presence tiers derive from `last_seen_ms` (Online ≤2 min, Idle ≤10 min, Offline) (Q11)
 - [ ] **PD-2: PEERS — peer-published service descriptors (remote access + Podman + KVM + media)**
   **As** a peer's mackesd,
-  **I want** to locally probe sshd/xrdp/vnc listeners, `podman ps`, libvirt guests (+ run state), media daemons (mde-musicd…), and my Netdata alarm summary, publishing the result into my replicated PeerRecord/PeerProbe,
+  **I want** to locally probe sshd/xrdp/vnc listeners, Podman containers (name+image+state+published ports, L10), libvirt guests (name+state+vCPU/mem+qemu-agent IPs, L11), media services via a localhost port-scan of a pinned list (Jellyfin 8096, Navidrome/Airsonic 4533, MPD 6600, DLNA, mde-musicd — L12), and my Netdata alarm summary (3-tier: healthy/degraded/critical, worst alarm named, L15), publishing the result on the ~30 s presence heartbeat (L13) into my replicated PeerRecord/PeerProbe,
   **so that** the directory knows what every peer offers without any remote probing (Q19/Q26c/D1).
   **Acceptance:**
     - [ ] starting/stopping sshd (or a container/VM) on a peer changes its descriptor set within one heartbeat cycle
-    - [ ] an active Netdata alarm flips that peer's health to degraded in the directory record
+    - [ ] a WARNING alarm flips health to degraded; a CRITICAL to critical, with the alarm named (L15)
+    - [ ] the port-scan touches localhost only; the scan list is a pinned constant, never user input
     - [ ] no network probe leaves the publishing host
 - [ ] **PD-3: PEERS — the master-detail Peers panel (mesh_topology evolves)**
   **As** an operator,
-  **I want** the topology panel reborn as "Peers": list left (self pinned "(this machine)" → Online → Offline grayed → Devices group from `action/connect/devices`), detail pane right (identity header + role badge, two presence fields, version + sync currency, drift count + last event → pre-filtered Drift panel link, Services Provided section, inline result strip), Bus-subscription refresh + 30 s poll floor,
-  **so that** the whole fleet and everything it offers is one surface (Q1–7, Q10–12, Q15, Q20–22, D1).
+  **I want** the topology panel reborn as "Peers": list left (self pinned "(this machine)" → Online → Offline grayed → Devices group from `action/connect/devices`) with hostname + colored tag chips (L1) and a type-to-filter box matching hostname/tag/service (L2); detail pane right (identity header + role badge, two presence fields, version + sync currency, drift count + last event → pre-filtered Drift panel link, Services Provided section, inline result strip); Bus-subscription refresh + 30 s poll floor; guided empty states when the mesh isn't fully running (unenrolled → "Join a mesh", mackesd down → one-click "Start the mesh service", no peers → "Invite a peer", L3); device rows carry presence+battery, Ring, Send-file, and a jump to the KDC hub card (L6),
+  **so that** the whole fleet and everything it offers is one surface (Q1–7, Q10–12, Q15, Q20–22, D1, L1–L3, L6).
   **Acceptance:**
     - [ ] every known peer renders in the correct group; offline peers show ops disabled
-    - [ ] Podman containers, KVM guests (with state), and media services list per peer
+    - [ ] Podman containers, KVM guests (with state/specs/IPs), and media services list per peer
+    - [ ] typing in the filter narrows by hostname, tag, or offered service
+    - [ ] each degraded mesh state shows its guided CTA and the CTA works
     - [ ] the CR-6.c graph modal is deleted; graph-node click selects the peer in the directory
 - [ ] **PD-4: PEERS — Front Door: Workbench lands on Peers**
   **As** a user launching the Workbench,
@@ -181,7 +187,7 @@ host-local Ansible apply.
     - [ ] `mde-workbench` with no `--focus` opens Peers; nav lists Peers first; Overview remains reachable
 - [ ] **PD-5: PEERS — per-peer ops wiring (Call / SSH / RDP / VNC) via a shared launcher engine**
   **As** an operator on a selected peer,
-  **I want** Call → `action/voice/dial {peer}` (HUD pops), SSH → cosmic-term `ssh <user>@<overlay-ip>`, RDP/VNC → remmina via a launcher module extracted from `remote_desktop.rs` and shared with the Remote Access panel; buttons gated by descriptors + presence (Call additionally by voice presence),
+  **I want** Call → `action/voice/dial {peer}` (HUD pops), SSH → cosmic-term `ssh $USER@<overlay-ip>` (L7), RDP/VNC → remmina via a launcher module extracted from `remote_desktop.rs` and shared with the Remote Access panel; buttons gated by descriptors + presence (Call additionally by voice presence); no permission gate — desktop = operator (L8),
   **so that** every reach-this-peer gesture is one click from the directory (Q8/Q17/Q18/Q19).
   **Acceptance:**
     - [ ] each op connects to the actual peer when offered; buttons absent/disabled when not
@@ -196,15 +202,16 @@ host-local Ansible apply.
     - [ ] `mesh_latency` no longer shells ICMP `ping` (ENT-13 closes here)
 - [ ] **PD-7: PEERS — the visual augmented traceroute + live map (graph view reborn)**
   **As** an operator,
-  **I want** the GraphProgram canvas grown into the live mesh map — presence-styled nodes, edges weighted by probe RTT and styled direct/relay/unreachable, edge activity driven by per-host Netdata network telemetry; clicking an edge opens the augmented trace card (the merged Ping+Traceroute: path, RTT, NAT class, endpoints tried),
-  **so that** the health and design of the mesh is visible at a glance (Q13/Q14/Q24/Q26b).
+  **I want** the GraphProgram canvas grown into the live mesh map — **force-directed layout** (RTT-proportional edge pull, L17), presence-styled nodes, edges styled direct/relay/unreachable with **log-scaled width + animated flow particles** from per-host Netdata throughput (L18); clicking an edge opens the augmented trace card: overlay path report + RTT + NAT class + endpoints tried + **both hosts' session RTT sparkline** (L20) + an **expandable underlay traceroute** (L19),
+  **so that** the health and design of the mesh is visible at a glance (Q13/Q14/Q24/Q26b, L17–L20).
   **Acceptance:**
-    - [ ] map edges visibly distinguish direct / relay / unreachable with live RTT labels
-    - [ ] edge click renders the trace card with the overlay path report
-    - [ ] edge activity changes when real traffic flows between two peers (Netdata-sourced)
+    - [ ] map edges visibly distinguish direct / relay / unreachable with live RTT labels; near peers cluster, relayed peers drift outward
+    - [ ] edge click renders the trace card with the overlay path report, RTT sparkline, and expandable underlay hops
+    - [ ] particles flow along an edge while real traffic moves between the two peers (Netdata-sourced)
+    - [ ] the canvas honors the adaptive render budget (L22) — idle mesh ≈ idle CPU
 - [ ] **PD-8: PEERS — Netdata in the detail pane (sparklines + deep-link)**
   **As** an operator inspecting a peer,
-  **I want** live CPU/load/net/disk sparklines pulled from that peer's own Netdata REST API (:19999 over the overlay, bound to the overlay interface only) plus a Metrics button opening its full dashboard,
+  **I want** live CPU/load/net/disk sparklines (60 s window, ~2 s refresh while selected, L14) pulled from that peer's own Netdata REST API (:19999 over the overlay, bound to the overlay interface only) plus a Metrics button opening its full dashboard,
   **so that** per-peer telemetry is one selection away with no central aggregation (Q26a/Q26d, Q95/96 held).
   **Acceptance:**
     - [ ] selecting an online peer renders moving sparklines within 2 s; offline peers degrade honestly
@@ -219,13 +226,38 @@ host-local Ansible apply.
     - [ ] the button is absent when synced/unknown
 - [ ] **PD-10: PEERS — the live-map Cosmic wallpaper**
   **As** a user,
-  **I want** the live mesh map rendered as the Cosmic desktop background (a second output target of the same canvas scene), toggleable from the Wallpaper panel,
-  **so that** the mesh's living state is ambient on the desktop (Q25, in-epic). **Risk-first: prototype the layer-shell/cosmic-bg surface before building on it.**
+  **I want** the live mesh map rendered as the Cosmic desktop background (a second output target of the same canvas scene) — pure render, clicks pass through (L21); adaptive power: ~30 fps under traffic, 1 fps idle, paused on battery and when fullscreen-covered (L22); configured as a "Live mesh map" choice in the Wallpaper panel beside static images (L23),
+  **so that** the mesh's living state is ambient on the desktop (Q25, L21–L23). **Risk-first: prototype the layer-shell/cosmic-bg surface before building on it.**
   **Acceptance:**
     - [ ] enabling it shows the live map as the desktop background under Cosmic with peers/edges updating
+    - [ ] clicks on the wallpaper reach the desktop beneath; on battery the animation pauses
     - [ ] disabling restores the prior static wallpaper
 
-> Cross-refs: ENT-13 closes inside PD-6 · SVC-1's Remote Access panel consumes PD-5's launcher · OBS-6's health signals source from PD-2's Netdata-alarm summary · Call gating depends on SVC-4 (voice presence) · PD-9 depends on FPG-4/5.
+- [ ] **PD-11: PEERS — remote service lifecycle (Podman + KVM start/stop/restart)**
+  **As** an operator on a peer's Services Provided section,
+  **I want** start/stop/restart buttons per container and VM, routed over a new `action/services/lifecycle {peer, kind, name, op}` Bus verb that the target peer's mackesd executes locally — with a confirm dialog on the stop/restart direction ("Stop win11 on oak?"), start one-click (L9/L16),
+  **so that** the directory operates the fleet's services, not just lists them.
+  **Acceptance:**
+    - [ ] starting a stopped container/VM on another peer brings it up; descriptor flips within one heartbeat
+    - [ ] stop/restart requires the inline confirm; start does not
+    - [ ] the verb refuses any target not present in the peer's published descriptor set (no arbitrary podman/virsh passthrough)
+    - [ ] failures land in the inline result strip with the executor's error text
+- [ ] **PD-12: PEERS — Wake-on-LAN for offline peers**
+  **As** an operator looking at an offline peer,
+  **I want** a Wake action that asks the nearest online peer sharing the target's LAN segment to send the magic packet (Bus verb; MAC from the existing peer-MAC cache) (L4),
+  **so that** Offline is actionable, not just gray.
+  **Acceptance:**
+    - [ ] waking a WoL-enabled offline peer brings it Online in the directory within its boot time
+    - [ ] the button is absent when no online peer shares the target's segment or no MAC is cached
+- [ ] **PD-13: PEERS — presence-transition alerts**
+  **As** a user anywhere on the desktop,
+  **I want** peer Online↔Offline transitions emitted through alert_relay → the cosmic-applet FDO notification path (L5, rides OBS-7/OBS-8 plumbing),
+  **so that** mesh-shape changes reach me without watching the directory.
+  **Acceptance:**
+    - [ ] killing a peer produces a desktop notification on the others within one presence tier window
+    - [ ] its return notifies likewise
+
+> Cross-refs: ENT-13 closes inside PD-6 · SVC-1's Remote Access panel consumes PD-5's launcher · OBS-6's health signals source from PD-2's Netdata-alarm summary · Call gating depends on SVC-4 (voice presence) · PD-9 depends on FPG-4/5 · PD-13 rides OBS-7/8 · L9 lifecycle verb is descriptor-gated (see design-doc level-2 risks).
 
 ## ENTERPRISE — operability + security-enforcement gaps (from the enterprise-readiness verification)
 
