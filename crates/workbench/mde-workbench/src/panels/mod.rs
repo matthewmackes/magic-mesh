@@ -43,6 +43,8 @@ pub mod notifications;
 pub mod panel_apps;
 /// PD-3 — the Peers directory (the Front Door).
 pub mod peers;
+/// PD-7 — the live mesh map (the Peers panel's Map view).
+pub mod peers_map;
 pub mod playbooks;
 pub mod power;
 pub mod printers;

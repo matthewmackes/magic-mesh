@@ -63,6 +63,10 @@ pub struct PeersPanel {
     /// PD-11/L16 — the armed stop/restart awaiting its second click:
     /// (host, kind, name, op).
     pub pending_confirm: Option<(String, String, String, String)>,
+    /// PD-7 — List (master-detail) or Map (the live canvas).
+    pub map_view: bool,
+    /// PD-7 — host→RTT from the mesh-latency cache.
+    pub rtt: std::collections::HashMap<String, Option<f64>>,
 }
 
 /// PD-8 — the four L14 series, oldest→newest over the last ~60 s.
@@ -103,6 +107,8 @@ pub enum Message {
         host: String,
         ok: bool,
     },
+    /// PD-7 — flip between the List and Map views.
+    ToggleMap,
     /// PD-8 — the 2 s metrics tick (app-level, view-gated).
     MetricsTick,
     /// PD-8 — open the peer's full Netdata dashboard in the browser.
@@ -467,6 +473,15 @@ impl PeersPanel {
                 self.selected = Some(host);
                 self.metrics = None;
                 self.metrics_err = None;
+                // A map-node click lands you on the peer's detail (W87).
+                self.map_view = false;
+                Task::none()
+            }
+            Message::ToggleMap => {
+                self.map_view = !self.map_view;
+                if self.map_view {
+                    self.rtt = super::peers_map::read_latency_cache();
+                }
                 Task::none()
             }
             Message::RefreshClicked => Self::load(),
@@ -1067,7 +1082,45 @@ impl PeersPanel {
             .height(Length::Fill)
             .padding(Padding::from([0u16, 16u16]));
 
-        let body = row![left, right].spacing(16).height(Length::Fill);
+        // PD-7 — the Map view replaces the master-detail body; a node
+        // click selects the peer and returns to the detail view.
+        let toggle = crate::controls::variant_button(
+            if self.map_view {
+                "List view"
+            } else {
+                "Map view"
+            },
+            crate::controls::ButtonVariant::Secondary,
+            Some(crate::Message::Peers(Message::ToggleMap)),
+            palette,
+        );
+        if self.map_view {
+            let nodes: Vec<super::peers_map::MapNode> = self
+                .rows
+                .iter()
+                .map(|r| super::peers_map::MapNode {
+                    hostname: r.hostname.clone(),
+                    presence: r.presence.clone(),
+                    rtt_ms: self.rtt.get(&r.hostname).copied().flatten(),
+                    is_self: r.hostname == self.self_hostname,
+                })
+                .collect();
+            let positions = super::peers_map::layout(&nodes);
+            let canvas: Element<'_, crate::Message> =
+                iced::widget::canvas(super::peers_map::MapProgram {
+                    nodes,
+                    positions,
+                    palette,
+                })
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+            let body = column![toggle, canvas].spacing(8).height(Length::Fill);
+            return shell(title, body.into(), palette);
+        }
+        let body = column![toggle, row![left, right].spacing(16).height(Length::Fill)]
+            .spacing(8)
+            .height(Length::Fill);
         shell(title, body.into(), palette)
     }
 }

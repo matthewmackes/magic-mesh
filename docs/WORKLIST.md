@@ -200,7 +200,7 @@ host-local Ansible apply.
   **Acceptance:**
     - [ ] probing a relayed peer reports the relay path; a direct peer reports direct + endpoint
     - [ ] `mesh_latency` no longer shells ICMP `ping` (ENT-13 closes here)
-- [ ] **PD-7: PEERS — the visual augmented traceroute + live map (graph view reborn)**
+- [>] **PD-7: PEERS — live map (graph view reborn)** — CORE LANDED (peers_map: deterministic force layout — RTT-proportional spring lengths, self-anchored, FNV-seeded, no churn; presence-styled nodes; RTT-labeled edges, danger-red unreachable; node click → detail (W87); Map/List toggle; latency from the PD-6 probe cache); REMAINING: the augmented trace card (edge click: overlay path + underlay traceroute + session RTT sparkline, L19/L20 — needs the nebula admin-socket introspection noted at PD-6), flow particles (L18, rides PD-10's engine), old mesh_topology retirement
   **As** an operator,
   **I want** the GraphProgram canvas grown into the live mesh map — **force-directed layout** (RTT-proportional edge pull, L17), presence-styled nodes, edges styled direct/relay/unreachable with **log-scaled width + animated flow particles** from per-host Netdata throughput (L18); clicking an edge opens the augmented trace card: overlay path report + RTT + NAT class + endpoints tried + **both hosts' session RTT sparkline** (L20) + an **expandable underlay traceroute** (L19),
   **so that** the health and design of the mesh is visible at a glance (Q13/Q14/Q24/Q26b, L17–L20).
