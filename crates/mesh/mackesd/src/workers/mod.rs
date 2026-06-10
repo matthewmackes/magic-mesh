@@ -326,6 +326,49 @@ pub trait Worker: Send + 'static {
 /// Restart policy for a worker. Phase A only honors `Never` and
 /// `OnFailure` — Phase B integrates the `task-supervisor` crate to
 /// implement back-off + max-restarts + circuit-breaker semantics.
+// ── ENT-6: supervisor restart policy constants ──────────────────────
+
+/// Restart back-off floor (the old fixed delay).
+pub const INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+/// Restart back-off ceiling.
+pub const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+/// Failures within [`BREAKER_WINDOW`] that trip the circuit breaker.
+pub const BREAKER_TRIP: u32 = 8;
+/// The rapid-failure observation window.
+pub const BREAKER_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// ENT-6 — one restart decision (pure; the spawn loop applies it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartDecision {
+    /// Sleep this long, then restart.
+    Backoff(std::time::Duration),
+    /// The breaker tripped — stop restarting.
+    Trip,
+}
+
+/// Advance the per-worker restart state after a failure. Returns the
+/// new `(window_elapsed_reset, rapid_failures, delay)` state + the
+/// decision. Pure — fully unit-testable without tokio time.
+#[must_use]
+pub fn advance_restart_state(
+    window_elapsed: std::time::Duration,
+    rapid_failures: u32,
+    delay: std::time::Duration,
+) -> (bool, u32, std::time::Duration, RestartDecision) {
+    let (reset, mut failures, mut delay) = if window_elapsed > BREAKER_WINDOW {
+        (true, 0, INITIAL_BACKOFF)
+    } else {
+        (false, rapid_failures, delay)
+    };
+    failures += 1;
+    if failures >= BREAKER_TRIP {
+        return (reset, failures, delay, RestartDecision::Trip);
+    }
+    let decision = RestartDecision::Backoff(delay);
+    delay = (delay * 2).min(BACKOFF_CAP);
+    (reset, failures, delay, decision)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartPolicy {
     /// Don't restart — once the worker returns (Ok or Err), the
@@ -407,6 +450,10 @@ impl Supervisor {
         let name = worker.name();
         let shutdown = token;
         self.join.spawn(async move {
+            // ENT-6 — restart-policy state for this worker.
+            let mut delay = INITIAL_BACKOFF;
+            let mut rapid_failures: u32 = 0;
+            let mut window_start = std::time::Instant::now();
             // `break outcome` carries the worker's final result out
             // of the loop, so we don't need a pre-initialized
             // `last_result` slot (which would dead-code in the
@@ -432,14 +479,36 @@ impl Supervisor {
                     info!(worker = %name, "shutdown requested; not restarting");
                     break outcome;
                 }
-                // Phase A: fixed 250 ms back-off so a hot-looping
-                // bug doesn't pin a core. Phase B replaces this
-                // with task-supervisor's exponential back-off.
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                // No `shutdown.wait().await` here — that would block
-                // restarts indefinitely. The 250 ms sleep is the
-                // restart delay; the worker's next `run()` should
-                // observe `shutdown.is_shutdown()` itself.
+                // ENT-6 — bounded exponential back-off + circuit
+                // breaker (replaces the Phase-A fixed 250 ms retry):
+                // a worker that keeps dying restarts at 250 ms, 500 ms,
+                // 1 s … capped at BACKOFF_CAP; one that dies
+                // BREAKER_TRIP times within BREAKER_WINDOW trips the
+                // breaker — the supervisor STOPS restarting it and
+                // logs at ERROR (visible in doctor/journal) instead of
+                // spinning forever. A healthy run longer than
+                // BREAKER_WINDOW resets both counters.
+                let now = std::time::Instant::now();
+                let (reset, failures, next_delay, decision) =
+                    advance_restart_state(now.duration_since(window_start), rapid_failures, delay);
+                if reset {
+                    window_start = now;
+                }
+                rapid_failures = failures;
+                delay = next_delay;
+                match decision {
+                    RestartDecision::Trip => {
+                        error!(
+                            worker = %name,
+                            failures = rapid_failures,
+                            window_s = BREAKER_WINDOW.as_secs(),
+                            "ENT-6: circuit breaker tripped — worker will NOT be restarted \
+                             (restart mackesd to re-arm after fixing the cause)",
+                        );
+                        break outcome;
+                    }
+                    RestartDecision::Backoff(d) => tokio::time::sleep(d).await,
+                }
             };
             (name, last_result)
         });
@@ -601,5 +670,65 @@ mod tests {
                 RestartPolicy::Never | RestartPolicy::OnFailure | RestartPolicy::Always => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ent6_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn backoff_doubles_to_the_cap() {
+        let mut delay = INITIAL_BACKOFF;
+        let mut seen = Vec::new();
+        for _ in 0..12 {
+            let (_, _, next, decision) = advance_restart_state(Duration::ZERO, 0, delay);
+            seen.push(decision);
+            delay = next;
+        }
+        assert_eq!(
+            seen[0],
+            RestartDecision::Backoff(Duration::from_millis(250))
+        );
+        assert_eq!(
+            seen[1],
+            RestartDecision::Backoff(Duration::from_millis(500))
+        );
+        assert!(delay <= BACKOFF_CAP, "ceiling holds: {delay:?}");
+    }
+
+    #[test]
+    fn rapid_failures_trip_the_breaker_within_the_window() {
+        // ENT-6 acceptance: a hot-looping worker stops being
+        // restarted instead of spinning forever.
+        let mut failures = 0;
+        let mut delay = INITIAL_BACKOFF;
+        let mut tripped = false;
+        for _ in 0..BREAKER_TRIP {
+            let (_, f, d, decision) =
+                advance_restart_state(Duration::from_secs(1), failures, delay);
+            failures = f;
+            delay = d;
+            if decision == RestartDecision::Trip {
+                tripped = true;
+                break;
+            }
+        }
+        assert!(tripped, "the {BREAKER_TRIP}th rapid failure must trip");
+    }
+
+    #[test]
+    fn a_healthy_stretch_resets_the_window() {
+        // 7 rapid failures, then a long-lived run: counters reset,
+        // the next failure backs off at the floor instead of tripping.
+        let (reset, failures, _, decision) = advance_restart_state(
+            BREAKER_WINDOW + Duration::from_secs(1),
+            BREAKER_TRIP - 1,
+            BACKOFF_CAP,
+        );
+        assert!(reset);
+        assert_eq!(failures, 1);
+        assert_eq!(decision, RestartDecision::Backoff(INITIAL_BACKOFF));
     }
 }

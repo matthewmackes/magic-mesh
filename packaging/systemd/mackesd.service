@@ -1,0 +1,21 @@
+[Unit]
+Description=Magic Mesh control-plane daemon (mackesd)
+Documentation=https://github.com/matthewmackes/magic-mesh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/mackesd serve
+# ENT-2: serve fails closed without a pinned role — that's a
+# configuration error, not a crash loop; on-failure still retries
+# so a fixed role brings the daemon up without manual intervention.
+Restart=on-failure
+RestartSec=3
+# ENT-6 acceptance: kill -9 -> restarted within seconds.
+TimeoutStopSec=20
+# Hardening (the daemon manages /var/lib/mackesd + the mesh mount).
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -9,3 +9,6 @@ into the filesystem; the hicolor icon set lives in `../assets/icons/`.
   resolves via the hicolor set)
 - `autostart/`    → `/etc/xdg/autostart/` (the SVC-4 voice agent autostart —
   Cosmic honors XDG autostart)
+- `systemd/`      → `/usr/lib/systemd/system/` (ENT-6: `mackesd.service`,
+  Restart=on-failure — kill -9 recovers in seconds; in-daemon worker
+  restarts are the supervisor's bounded-backoff + circuit-breaker job)

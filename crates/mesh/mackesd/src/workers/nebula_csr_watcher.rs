@@ -348,6 +348,8 @@ mod tests {
     fn place_csr(workgroup_root: &Path, peer_id: &str) {
         let identity = crate::enrollment::build_identity();
         let token = parse_join_token("mesh:test-mesh@10.0.0.5:4242#bearer").unwrap();
+        // ENT-1 — the watcher signs only issued bearers now.
+        crate::bearer_ledger::record_issued(workgroup_root, &token.bearer).expect("seed bearer");
         let pending = build_pending(&identity, peer_id, "anvil", token);
         publish_enrollment_request(workgroup_root, peer_id, &pending).expect("publish");
     }
