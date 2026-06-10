@@ -1,12 +1,12 @@
 # PKG-9 — the Magic-on-Cosmic ISO kickstart (built with
 # livemedia-creator). A Fedora-Cosmic spin that installs the
-# magic-mesh RPM from the signed COPR (PKG-8) and runs the
+# magic-mesh RPM from the GitHub-hosted dnf repo (PKG-8) and runs the
 # install-time role chooser (PKG-5) on first boot.
 #
 #   livemedia-creator --ks magic-on-cosmic.ks --no-virt \
 #     --resultdir /var/lmc --project "Magic Mesh" --make-iso
 #
-# COPR signing + the actual ISO build are operator-gated (/release).
+# RPM GPG signing + the actual ISO build are operator-gated (/release).
 
 text
 lang en_US.UTF-8
@@ -21,7 +21,7 @@ clearpart --all --initlabel
 autopart --type=plain --nohome
 services --enabled=libvirtd,mackesd
 
-repo --name=magic-mesh --baseurl=https://download.copr.fedorainfracloud.org/results/matthewmackes/magic-mesh/fedora-$releasever-$basearch/
+repo --name=magic-mesh --baseurl=https://matthewmackes.github.io/magic-mesh/fedora-$releasever-$basearch/
 
 %packages
 @^fedora-cosmic-desktop-environment

@@ -9,12 +9,18 @@ Two supported paths:
 
 - **Magic-on-Cosmic ISO** — boot it, and the installer's `%post` role chooser
   pins the node's role during install. Best for a fresh machine.
-- **COPR repo** on an existing Fedora (Cosmic) host:
+- **GitHub RPM** on an existing Fedora (Cosmic) host — one-shot, the latest
+  release asset:
 
   ```bash
-  sudo dnf copr enable magicmesh/magic-mesh
-  sudo dnf install magic-mesh
+  sudo dnf install \
+    https://github.com/matthewmackes/magic-mesh/releases/latest/download/magic-mesh.rpm
   ```
+
+  Or enable the GitHub-hosted dnf repo (for updates) by installing the
+  `magic-mesh-release` RPM, then `sudo dnf install magic-mesh` — it drops the
+  `[magic-mesh]` repo (GitHub Pages baseurl, GPG-checked against the project
+  key). There is no COPR.
 
 The RPM installs every binary (`mackesd`, `meshctl`, `magic-fleet`, `mde-bus`,
 `mde-workbench`, `mde-files`, …) under `/usr/bin`, the systemd units, the Carbon

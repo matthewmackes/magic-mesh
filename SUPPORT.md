@@ -10,7 +10,7 @@ go for help.
 |-----------|-----------|-------|
 | Peers | **1–8 in one mesh** | The §8 trust-envelope lock. Split larger fleets into separate workgroups. |
 | Roles | Lighthouse, Server, Workstation | One signed RPM; chosen at install (`meshctl install --role <r>`). |
-| OS | Fedora (Cosmic spin) | The Magic-on-Cosmic ISO + COPR repo are the supported install paths. |
+| OS | Fedora (Cosmic spin) | The Magic-on-Cosmic ISO + the GitHub-hosted RPM (Releases asset / GitHub Pages dnf repo) are the supported install paths. |
 | Transport | Nebula overlay only | No unencrypted fallback; underlay stays firewalled. |
 | Storage | LizardFS replicated volume | Backups remain the operator's responsibility. |
 | Desktop | Cosmic | The GUI is strictly IBM Carbon (Gray 10/90/100). |

@@ -72,7 +72,7 @@ scheme; mitigate by using TLS to the server). Anything else MD5/SHA1 is a findin
   `mde-files` as the default file manager.
 - **Deployment roles** (Lighthouse ⊂ Server ⊂ Workstation, each a strict superset)
   gate which `mackesd` workers + surfaces run. "Workstation" = a Cosmic desktop.
-- Shipped as one RPM + install-time role chooser, a signed COPR, and a
+- Shipped as one RPM + install-time role chooser, a GitHub-hosted dnf repo (GitHub Releases asset + GitHub Pages, project-GPG-signed), and a
   Magic-on-Cosmic ISO.
 
 ## §6 — The boundary

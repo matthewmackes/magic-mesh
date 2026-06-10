@@ -19,6 +19,6 @@ into the filesystem; the hicolor icon set lives in `../assets/icons/`.
 
 - `kickstart/`    → the Magic-on-Cosmic ISO kickstart (PKG-9) with the
   install-time role-chooser `%post` (PKG-5); built with livemedia-creator.
-- `repo/`         → the signed-COPR `.repo` (PKG-8), shipped by the
-  `magic-mesh-release` RPM (gpgcheck on, COPR project key).
+- `repo/`         → the GitHub-hosted `.repo` (PKG-8), shipped by the
+  `magic-mesh-release` RPM (gpgcheck on, project GPG key; GitHub Pages baseurl).
 - `ENROLLMENT.md` → the post-install enroll/mesh-init steps (PKG-10).

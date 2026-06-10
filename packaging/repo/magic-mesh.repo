@@ -1,13 +1,21 @@
-# PKG-8 — the signed Magic Mesh COPR. Shipped by the
-# `magic-mesh-release` RPM; COPR builds per-project GPG-sign every
-# package, so gpgcheck stays on and the key is the COPR project key.
-[copr:copr.fedorainfracloud.org:matthewmackes:magic-mesh]
-name=Copr repo for magic-mesh owned by matthewmackes
-baseurl=https://download.copr.fedorainfracloud.org/results/matthewmackes/magic-mesh/fedora-$releasever-$basearch/
+# PKG-8 — the Magic Mesh dnf repo, hosted on GitHub (replaces COPR).
+#
+# Published from the project's GitHub repository: `createrepo_c` metadata
+# + the signed RPMs land on the `gh-pages` branch (served at
+# matthewmackes.github.io/magic-mesh/), and each release also attaches the
+# RPM as a GitHub Releases asset for a one-shot `dnf install <url>`. There
+# is no COPR; packages are GPG-signed at /release time with the project
+# key (operator-gated), and the public key is published alongside the repo
+# so gpgcheck stays on.
+#
+# Shipped by the `magic-mesh-release` RPM.
+[magic-mesh]
+name=Magic Mesh (GitHub)
+baseurl=https://matthewmackes.github.io/magic-mesh/fedora-$releasever-$basearch/
 type=rpm-md
 skip_if_unavailable=True
 gpgcheck=1
-gpgkey=https://download.copr.fedorainfracloud.org/results/matthewmackes/magic-mesh/pubkey.gpg
+gpgkey=https://matthewmackes.github.io/magic-mesh/RPM-GPG-KEY-magic-mesh
 repo_gpgcheck=0
 enabled=1
 enabled_metadata=1

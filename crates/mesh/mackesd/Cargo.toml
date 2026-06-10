@@ -310,7 +310,7 @@ workspace = true
 # `magic-mesh` RPM; the install-time role chooser (PKG-5) + the
 # self-gating mackesd.service (PKG-3) decide what actually runs per node,
 # so there is no per-role package split (§5: Lighthouse ⊂ Server ⊂
-# Workstation, one artifact). COPR signing + the ISO stay operator-gated.
+# Workstation, one artifact). RPM GPG signing + the ISO stay operator-gated.
 [package.metadata.generate-rpm]
 name = "magic-mesh"
 summary = "Magic Mesh — secure no-fixed-center workgroup mesh + native-Rust Carbon GUIs on Fedora-Cosmic"
