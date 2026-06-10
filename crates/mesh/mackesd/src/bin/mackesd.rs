@@ -369,7 +369,13 @@ enum Cmd {
 
     /// Walk the `events` table forward and verify every row's hash
     /// (Phase 12.10.3). Exits 0 on Intact / Empty, 1 on Break.
-    AuditVerify,
+    AuditVerify {
+        /// PLANES-12 — emit the event timeline (72 h rolling window) +
+        /// the verify outcome as JSON for the Audit panel, instead of the
+        /// human summary.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Rotate the shared mesh passcode (Phase 12.10.2). Prints a
     /// freshly-generated passcode. With `--store`, encrypts it to
@@ -1953,23 +1959,67 @@ fn main() -> anyhow::Result<()> {
                 );
             }
         }
-        Cmd::AuditVerify => {
+        Cmd::AuditVerify { json } => {
             // Reads every row from the `events` table (ordered by
             // `seq` ASC) and walks the SHA-256 hash chain.
             let conn = mackesd_core::store::open(&db_path)
                 .with_context(|| format!("opening store at {}", db_path.display()))?;
             let rows =
                 mackesd_core::store::load_audit_rows(&conn).context("loading events from store")?;
-            match mackesd_core::audit::verify(&rows) {
-                mackesd_core::audit::VerifyOutcome::Empty => {
-                    println!("audit chain empty (no events yet)");
-                }
-                mackesd_core::audit::VerifyOutcome::Intact { verified, .. } => {
-                    println!("verified {verified} events  ·  chain intact");
-                }
-                mackesd_core::audit::VerifyOutcome::Break { at_event, .. } => {
-                    eprintln!("audit chain BREAK at event {at_event}");
+            let outcome = mackesd_core::audit::verify(&rows);
+            if json {
+                // PLANES-12 — the Audit panel's data: the verify verdict
+                // plus the 72 h rolling window of events (W44/W45).
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as i64);
+                let window_ms: i64 = 72 * 3600 * 1000;
+                let timeline: Vec<serde_json::Value> = rows
+                    .iter()
+                    .filter(|r| now_ms.saturating_sub(r.timestamp_ms) <= window_ms)
+                    .map(|r| {
+                        serde_json::json!({
+                            "event_id": r.event_id,
+                            "timestamp_ms": r.timestamp_ms,
+                            "payload": String::from_utf8_lossy(&r.payload),
+                            "hash": r.hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        })
+                    })
+                    .collect();
+                let (status, detail) = match &outcome {
+                    mackesd_core::audit::VerifyOutcome::Empty => ("empty", String::new()),
+                    mackesd_core::audit::VerifyOutcome::Intact { verified, .. } => {
+                        ("intact", format!("{verified} events"))
+                    }
+                    mackesd_core::audit::VerifyOutcome::Break { at_event, .. } => {
+                        ("break", format!("at event {at_event}"))
+                    }
+                };
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "verify": status,
+                        "detail": detail,
+                        "total_events": rows.len(),
+                        "retained_72h": timeline.len(),
+                        "timeline": timeline,
+                    })
+                );
+                if status == "break" {
                     std::process::exit(1);
+                }
+            } else {
+                match outcome {
+                    mackesd_core::audit::VerifyOutcome::Empty => {
+                        println!("audit chain empty (no events yet)");
+                    }
+                    mackesd_core::audit::VerifyOutcome::Intact { verified, .. } => {
+                        println!("verified {verified} events  ·  chain intact");
+                    }
+                    mackesd_core::audit::VerifyOutcome::Break { at_event, .. } => {
+                        eprintln!("audit chain BREAK at event {at_event}");
+                        std::process::exit(1);
+                    }
                 }
             }
         }
