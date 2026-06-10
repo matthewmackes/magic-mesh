@@ -139,8 +139,8 @@ host-local Ansible apply.
 - [ ] **OBS-4: screenshot-artifact visual regression** — a scripted `/preview` capture posting screenshots as CI artifacts for human review (Q92).
 - [→] **OBS-5: mesh-replicated structured logging** — **RE-HOMED → PLANES-14** (W96, planes re-IA); spec text lives in the PLANES task + `docs/design/planes.md`.
 - [→] **OBS-6: Mesh Health Workbench panel** — **RE-HOMED → PLANES-20** (W96, planes re-IA); spec text lives in the PLANES task + `docs/design/planes.md`.
-- [ ] **OBS-7: upgrade-transition alerts** — `alert_relay` emits each upgrade-state transition as a desktop alert (Q97).
-- [ ] **OBS-8: alerts via the cosmic-applet** — deliver through the mde-bus → cosmic-applet FDO Notifications path instead of `notify-send` (Q100).
+- [✓] **OBS-7: upgrade-transition alerts** — `alert_relay` emits each upgrade-state transition as a desktop alert (Q97).
+- [✓] **OBS-8: alerts via the cosmic-applet** — deliver through the mde-bus → cosmic-applet FDO Notifications path instead of `notify-send` (Q100).
 
 ## PEERS — Directory of Mesh Peers, the platform Front Door (design: `docs/design/peer-directory.md`, 2026-06-09)
 

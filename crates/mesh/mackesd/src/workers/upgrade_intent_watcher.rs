@@ -85,6 +85,16 @@ fn ack_hosts(intent: &Value, field: &str) -> BTreeSet<String> {
 
 /// Barrier issue time in epoch seconds: prefer an explicit `issued_at`
 /// (seconds), else derive from the INST-10 `initiated_at_ms`.
+/// The intent's `target_version` (the INST-10 minimal field), or `""`.
+#[must_use]
+fn target_version(intent: &Value) -> String {
+    intent
+        .get("target_version")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
 #[must_use]
 fn issued_at_s(intent: &Value) -> u64 {
     if let Some(s) = intent.get("issued_at").and_then(Value::as_u64) {
@@ -225,6 +235,36 @@ pub fn intents_to_clean(
         .collect()
 }
 
+/// OBS-7 — build the MON-3 `AlertEvent` JSON for one upgrade-state
+/// transition. Pure so the shape + the deterministic id are unit-tested.
+/// The id keys on (version, state, host) so re-emitting the same
+/// transition is idempotent (alert_relay de-dupes by id).
+#[must_use]
+pub fn upgrade_alert_event(
+    host: &str,
+    version: &str,
+    state: &str,
+    severity: &str,
+    summary: &str,
+    now_s: u64,
+) -> Value {
+    let safe = |s: &str| s.replace(['/', '.', ' ', ':'], "-");
+    json!({
+        "id": format!("upgrade-{}-{}-{}", safe(version), safe(state), safe(host)),
+        "ts": now_s,
+        "severity": severity,
+        "category": "upgrade.transition",
+        "alert": format!("upgrade_{state}"),
+        "host": host,
+        "summary": summary,
+        "value": version,
+        "threshold": "",
+        "chart_url": "",
+        "fired_by": "upgrade_intent_watcher",
+        "seen_by": [],
+    })
+}
+
 // ───────────────────────── worker body ─────────────────────────
 
 /// The upgrade-barrier worker. One per peer; spawned in `run_serve`.
@@ -236,6 +276,10 @@ pub struct UpgradeIntentWatcher {
     leader_lock: PathBuf,
     dnf_binary: String,
     install_binary: String,
+    /// OBS-7 — where upgrade-state-transition alerts are dropped for
+    /// `alert_relay` to surface (the MON-3 alerts dir). `None` skips the
+    /// emit (a test that doesn't assert on alerts).
+    alerts_dir: Option<PathBuf>,
 }
 
 impl UpgradeIntentWatcher {
@@ -252,11 +296,37 @@ impl UpgradeIntentWatcher {
             leader_lock: workgroup_root.join(".mackesd-leader.lock"),
             dnf_binary: "dnf".to_string(),
             install_binary: "mde-install".to_string(),
+            alerts_dir: crate::workers::alert_relay::default_alerts_dir(),
         }
+    }
+
+    /// OBS-7 test seam — point the alert emit at a scratch dir.
+    #[must_use]
+    pub fn with_alerts_dir(mut self, dir: PathBuf) -> Self {
+        self.alerts_dir = Some(dir);
+        self
     }
 
     fn intent_dir(&self) -> PathBuf {
         self.mesh_home.join("upgrade-intent")
+    }
+
+    /// OBS-7 — drop an upgrade-state-transition alert into the alerts dir
+    /// (best-effort; `alert_relay` surfaces it via the Bus FDO path). The
+    /// id is deterministic per (version, state, host) so a re-emitted
+    /// transition de-dupes rather than re-toasting.
+    fn emit_upgrade_alert(&self, version: &str, state: &str, severity: &str, summary: &str) {
+        let Some(dir) = &self.alerts_dir else {
+            return;
+        };
+        let event = upgrade_alert_event(&self.hostname, version, state, severity, summary, now_s());
+        let _ = std::fs::create_dir_all(dir);
+        let id = event["id"].as_str().unwrap_or("upgrade").to_string();
+        let path = dir.join(format!("{id}.json"));
+        let tmp = dir.join(format!(".{id}.json.tmp"));
+        if std::fs::write(&tmp, serde_json::to_vec_pretty(&event).unwrap_or_default()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 
     /// Peer roster from the GFS peers dir (PEERVER convergence files).
@@ -302,10 +372,22 @@ impl UpgradeIntentWatcher {
                     Ok(version) => {
                         let host = self.hostname.clone();
                         let _ = locked_update(&path, |v| mark_ready(v, &host, &version, now_s));
+                        self.emit_upgrade_alert(
+                            &version,
+                            "ready",
+                            "info",
+                            &format!("staged {version}; awaiting the fleet upgrade barrier"),
+                        );
                     }
                     Err(err) => {
                         let host = self.hostname.clone();
                         let _ = locked_update(&path, |v| mark_ready_failed(v, &host, &err, now_s));
+                        self.emit_upgrade_alert(
+                            &target_version(&intent),
+                            "failed",
+                            "crit",
+                            &format!("dnf upgrade failed: {err}"),
+                        );
                     }
                 }
                 continue; // re-evaluate the barrier on the next tick.
@@ -319,6 +401,12 @@ impl UpgradeIntentWatcher {
                 if self.run_mde_install().is_ok() {
                     let host = self.hostname.clone();
                     let _ = locked_update(&path, |v| mark_complete(v, &host, now_s));
+                    self.emit_upgrade_alert(
+                        &target_version(&fresh),
+                        "complete",
+                        "info",
+                        "upgrade applied; node is on the new version",
+                    );
                 }
             }
         }
@@ -494,6 +582,42 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert!(got[0].ends_with("2.7.0.json"));
         assert!(got[1].ends_with("2.7.1.json"));
+    }
+
+    #[test]
+    fn upgrade_alert_event_has_a_deterministic_dedupe_id() {
+        let a = upgrade_alert_event("anvil", "2.7.1", "ready", "info", "staged", 100);
+        // The id is stable per (version, state, host) so a re-emit dedupes.
+        assert_eq!(a["id"], "upgrade-2-7-1-ready-anvil");
+        assert_eq!(a["severity"], "info");
+        assert_eq!(a["alert"], "upgrade_ready");
+        assert_eq!(a["category"], "upgrade.transition");
+        assert_eq!(a["host"], "anvil");
+        // Same transition → same id (idempotent surfacing).
+        let again = upgrade_alert_event("anvil", "2.7.1", "ready", "info", "x", 999);
+        assert_eq!(a["id"], again["id"]);
+        // A different state → a different id.
+        let done = upgrade_alert_event("anvil", "2.7.1", "complete", "info", "y", 100);
+        assert_ne!(a["id"], done["id"]);
+    }
+
+    #[test]
+    fn emit_upgrade_alert_writes_a_relayable_event_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = UpgradeIntentWatcher::new(tmp.path().to_path_buf(), "peer:anvil".into())
+            .with_alerts_dir(tmp.path().to_path_buf());
+        w.emit_upgrade_alert("2.7.1", "ready", "info", "staged");
+        // alert_relay can parse what we wrote.
+        let files: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .collect();
+        assert_eq!(files.len(), 1, "one alert event written");
+        let body = std::fs::read_to_string(files[0].path()).unwrap();
+        let parsed: crate::workers::alert_relay::AlertEventPartial =
+            serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.alert, "upgrade_ready");
     }
 
     #[test]

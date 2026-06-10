@@ -1,10 +1,14 @@
 //! MON-4 (v2.6) — alert relay worker.
 //!
 //! Watches `~/.local/share/mde/alerts/` for `*.json` event
-//! files written by `mde-alert-emit` (MON-3) + forwards each
-//! one as an FDO desktop notification via `notify-send`. The
-//! notification surfaces the alert's severity + summary +
-//! a deep-link to the chart URL when present.
+//! files written by `mde-alert-emit` (MON-3) + the
+//! upgrade-state transitions (OBS-7), and forwards each as an
+//! FDO desktop notification. Primary delivery (OBS-8) is a
+//! publish on the `fdo/*` Bus topic so the **cosmic-applet**
+//! renders it through the FDO Notifications path; a direct
+//! `notify-send` is the headless fallback. The notification
+//! surfaces the alert's severity + summary + a deep-link to
+//! the chart URL when present.
 //!
 //! Polling vs inotify: this worker polls every
 //! `DEFAULT_TICK_INTERVAL` (2s) rather than using inotify
@@ -73,8 +77,15 @@ pub struct AlertRelayWorker {
     tick: Duration,
     /// `notify-send` binary path. Default `notify-send` (looked
     /// up on PATH). Tests inject `/bin/true` to neutralize the
-    /// shell-out without a session bus.
+    /// shell-out without a session bus. Used only as the headless
+    /// fallback now that the primary path is the Bus (OBS-8).
     notify_send: String,
+    /// OBS-8 — `mde-bus` binary. The primary delivery: publish the
+    /// alert on the `fdo/*` topic so the cosmic-applet renders it via
+    /// the FDO Notifications path. Default `mde-bus`; tests inject
+    /// `/bin/true`. Empty string disables the Bus path (force the
+    /// notify-send fallback in a test).
+    bus_binary: String,
     /// IDs we've already surfaced. Persists for the worker's
     /// lifetime; on restart the relay re-surfaces every alert
     /// in the dir (operator can `rm ~/.local/share/mde/alerts/`
@@ -96,6 +107,7 @@ impl AlertRelayWorker {
             alerts_dir,
             tick: DEFAULT_TICK_INTERVAL,
             notify_send: "notify-send".to_owned(),
+            bus_binary: "mde-bus".to_owned(),
             seen_alert_ids: std::sync::Mutex::new(BTreeSet::new()),
         }
     }
@@ -120,6 +132,14 @@ impl AlertRelayWorker {
     #[must_use]
     pub fn with_notify_send_binary(mut self, name: impl Into<String>) -> Self {
         self.notify_send = name.into();
+        self
+    }
+
+    /// OBS-8 — override the `mde-bus` binary (tests inject `/bin/true`;
+    /// `""` disables the Bus path so the notify-send fallback is exercised).
+    #[must_use]
+    pub fn with_bus_binary(mut self, name: impl Into<String>) -> Self {
+        self.bus_binary = name.into();
         self
     }
 
@@ -171,6 +191,43 @@ impl AlertRelayWorker {
     }
 
     fn fire_notification(&self, event: &AlertEventPartial) {
+        // OBS-8 — primary path: publish on the `fdo/*` Bus topic so the
+        // cosmic-applet renders it through the FDO Notifications path
+        // (the same bridge `ipc::notifications` uses). Only when the Bus
+        // path is unavailable (no `mde-bus`, e.g. a pre-RPM dev box) do
+        // we fall back to a direct `notify-send`.
+        if !self.bus_binary.is_empty() {
+            let argv = bus_publish_argv(&self.bus_binary, event);
+            match std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .output()
+            {
+                Ok(o) if o.status.success() => {
+                    tracing::info!(
+                        target: "mackesd::alert_relay",
+                        alert = %event.alert,
+                        severity = %event.severity,
+                        host = %event.host,
+                        "published alert on the Bus FDO topic (OBS-8)",
+                    );
+                    return;
+                }
+                Ok(o) => {
+                    tracing::debug!(
+                        target: "mackesd::alert_relay",
+                        status = ?o.status,
+                        "mde-bus publish exited non-zero; falling back to notify-send",
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "mackesd::alert_relay",
+                        error = %e,
+                        "mde-bus not invocable; falling back to notify-send",
+                    );
+                }
+            }
+        }
         let argv = notify_send_argv(&self.notify_send, event);
         match std::process::Command::new(&argv[0])
             .args(&argv[1..])
@@ -182,7 +239,7 @@ impl AlertRelayWorker {
                     alert = %event.alert,
                     severity = %event.severity,
                     host = %event.host,
-                    "fired FDO notification",
+                    "fired FDO notification (notify-send fallback)",
                 );
             }
             Ok(o) => {
@@ -236,6 +293,44 @@ pub fn notify_send_argv(binary: &str, event: &AlertEventPartial) -> Vec<String> 
     };
     argv.push(title);
     argv.push(body);
+    argv
+}
+
+/// OBS-8 — build the `mde-bus publish` argv that delivers an alert
+/// through the cosmic-applet FDO Notifications path. Publishes on the
+/// `fdo/Magic Mesh Alerts` topic (the bridge `ipc::bus_bridge` renders),
+/// mapping severity → the Bus priority and `[host] alert` → the title.
+/// `--no-broker` lets the publish persist + reach even pre-enrollment.
+/// Pure so the argv shape is unit-tested without shelling.
+#[must_use]
+pub fn bus_publish_argv(binary: &str, event: &AlertEventPartial) -> Vec<String> {
+    let priority = match event.severity.to_ascii_uppercase().as_str() {
+        "CRITICAL" | "ERROR" => "urgent",
+        "WARNING" | "WARN" => "default",
+        _ => "min",
+    };
+    let title = format!("[{}] {}", event.host, event.alert);
+    let body = if event.summary.is_empty() {
+        format!("({} alert without summary)", event.severity)
+    } else {
+        event.summary.clone()
+    };
+    let mut argv = vec![
+        binary.to_owned(),
+        "publish".to_owned(),
+        "fdo/Magic Mesh Alerts".to_owned(),
+        "--priority".to_owned(),
+        priority.to_owned(),
+        "--title".to_owned(),
+        title,
+        "--body-flag".to_owned(),
+        body,
+        "--no-broker".to_owned(),
+    ];
+    if !event.chart_url.is_empty() {
+        argv.push("--hint".to_owned());
+        argv.push(format!("string:chart-url:{}", event.chart_url));
+    }
     argv
 }
 
@@ -302,7 +397,8 @@ mod tests {
         let missing = tmp.path().join("does-not-exist");
         let w = AlertRelayWorker::new()
             .with_alerts_dir(missing)
-            .with_notify_send_binary("/bin/true");
+            .with_notify_send_binary("/bin/true")
+            .with_bus_binary("/bin/true");
         assert_eq!(w.tick_once(), 0);
     }
 
@@ -313,7 +409,8 @@ mod tests {
         write_event(tmp.path(), "01H8XYZABC0000000000000002", "CRITICAL");
         let w = AlertRelayWorker::new()
             .with_alerts_dir(tmp.path().to_path_buf())
-            .with_notify_send_binary("/bin/true");
+            .with_notify_send_binary("/bin/true")
+            .with_bus_binary("/bin/true");
         assert_eq!(w.tick_once(), 2);
     }
 
@@ -323,7 +420,8 @@ mod tests {
         write_event(tmp.path(), "01H8XYZABC0000000000000001", "WARNING");
         let w = AlertRelayWorker::new()
             .with_alerts_dir(tmp.path().to_path_buf())
-            .with_notify_send_binary("/bin/true");
+            .with_notify_send_binary("/bin/true")
+            .with_bus_binary("/bin/true");
         // First tick fires once.
         assert_eq!(w.tick_once(), 1);
         // Second tick is a no-op (event ID already in seen_alert_ids).
@@ -340,7 +438,8 @@ mod tests {
         write_event(tmp.path(), "01H8XYZABC0000000000000001", "WARNING");
         let w = AlertRelayWorker::new()
             .with_alerts_dir(tmp.path().to_path_buf())
-            .with_notify_send_binary("/bin/true");
+            .with_notify_send_binary("/bin/true")
+            .with_bus_binary("/bin/true");
         // Bad file is skipped (logged at warn); good file fires.
         assert_eq!(w.tick_once(), 1);
     }
@@ -351,8 +450,42 @@ mod tests {
         std::fs::write(tmp.path().join("01H.json.tmp"), b"{}").unwrap();
         let w = AlertRelayWorker::new()
             .with_alerts_dir(tmp.path().to_path_buf())
-            .with_notify_send_binary("/bin/true");
+            .with_notify_send_binary("/bin/true")
+            .with_bus_binary("/bin/true");
         assert_eq!(w.tick_once(), 0);
+    }
+
+    #[test]
+    fn bus_publish_argv_targets_the_fdo_topic_with_priority() {
+        let mk = |sev: &str, url: &str| AlertEventPartial {
+            id: "x".into(),
+            severity: sev.into(),
+            alert: "disk_full".into(),
+            host: "anvil".into(),
+            summary: "/ at 95%".into(),
+            chart_url: url.into(),
+        };
+        let crit = bus_publish_argv("mde-bus", &mk("CRITICAL", ""));
+        // Publishes on the FDO topic the cosmic-applet renders (OBS-8).
+        assert_eq!(crit[0], "mde-bus");
+        assert_eq!(crit[1], "publish");
+        assert_eq!(crit[2], "fdo/Magic Mesh Alerts");
+        assert!(crit
+            .windows(2)
+            .any(|w| w[0] == "--priority" && w[1] == "urgent"));
+        assert!(crit.iter().any(|s| s == "[anvil] disk_full"));
+        assert!(crit.iter().any(|s| s == "--no-broker"));
+        // Severity → priority mapping + the chart-url hint.
+        let warn = bus_publish_argv("mde-bus", &mk("WARNING", "http://c/1"));
+        assert!(warn
+            .windows(2)
+            .any(|w| w[0] == "--priority" && w[1] == "default"));
+        assert!(warn.iter().any(|s| s == "string:chart-url:http://c/1"));
+        let info = bus_publish_argv("mde-bus", &mk("INFO", ""));
+        assert!(info
+            .windows(2)
+            .any(|w| w[0] == "--priority" && w[1] == "min"));
+        assert!(!info.iter().any(|s| s.starts_with("string:chart-url")));
     }
 
     #[test]
@@ -437,6 +570,7 @@ mod tests {
     async fn worker_exits_on_shutdown_token() {
         let mut w = AlertRelayWorker::new()
             .with_notify_send_binary("/bin/true")
+            .with_bus_binary("/bin/true")
             .with_tick(Duration::from_millis(50));
         let (tx, rx) = tokio::sync::watch::channel(false);
         let token = ShutdownToken::from_receiver(rx);
