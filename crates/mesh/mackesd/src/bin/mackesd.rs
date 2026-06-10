@@ -493,6 +493,23 @@ enum Cmd {
         cmd: RevisionsCmd,
     },
 
+    /// ENT-1 — mint a single-use 256-bit enrollment bearer on this
+    /// lighthouse and print the join token a new box runs
+    /// `mackesd enroll --token <…>` with. The ledger records only the
+    /// bearer's hash; the raw value is shown once, here.
+    EnrollToken {
+        /// Mesh id to embed in the token (e.g. `home-mesh`).
+        #[arg(long)]
+        mesh_id: String,
+        /// Lighthouse address the joining box dials. Defaults to the
+        /// published overlay-ip + :4242.
+        #[arg(long)]
+        lighthouse: Option<String>,
+        /// Operator note recorded beside the issued hash.
+        #[arg(long, default_value = "")]
+        note: String,
+    },
+
     /// PD-1 (Q23/W27) — the joined peer directory: every known peer
     /// with presence tier, health, version, overlay ip/role, and
     /// revision currency — the same record `action/mesh/directory`
@@ -2743,6 +2760,26 @@ fn main() -> anyhow::Result<()> {
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 }
             }
+        }
+        Cmd::EnrollToken {
+            mesh_id,
+            lighthouse,
+            note,
+        } => {
+            let root = mackesd_core::default_qnm_shared_root();
+            let bearer = mackesd_core::bearer_ledger::issue(&root, &note)
+                .map_err(|e| anyhow::anyhow!("minting bearer: {e}"))?;
+            let lh = lighthouse.unwrap_or_else(|| {
+                let ip = std::fs::read_to_string("/var/lib/mackesd/nebula/overlay-ip")
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|_| "<lighthouse-ip>".to_string());
+                format!("{ip}:4242")
+            });
+            println!("mesh:{mesh_id}@{lh}#{bearer}");
+            eprintln!(
+                "single-use token minted (ENT-1) — run on the joining box:\n  mackesd enroll --token 'mesh:{mesh_id}@{lh}#{bearer}'"
+            );
+            return Ok(());
         }
         Cmd::Peers { json } => {
             // PD-1 — the joined directory, CLI face.

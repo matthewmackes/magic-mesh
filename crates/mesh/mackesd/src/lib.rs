@@ -105,6 +105,7 @@ pub mod store;
 pub mod surrounding_hosts;
 // v2.0.0 Phase 12.17 — STUN client for ICE candidate gathering. Gated
 // behind `async-services` because it uses tokio UDP + tokio time.
+pub mod bearer_ledger;
 pub mod descriptors;
 pub mod lifecycle;
 #[cfg(feature = "async-services")]

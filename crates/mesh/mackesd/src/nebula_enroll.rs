@@ -451,6 +451,13 @@ pub enum SignCsrError {
         /// Underlying parser error.
         reason: String,
     },
+    /// ENT-1 (C1) — the presented bearer is not in the
+    /// issued-but-unredeemed ledger: wrong, replayed, or never
+    /// minted. Refused before any signing work.
+    BearerNotIssued {
+        /// The refusing node id (for the audit line).
+        node_id: String,
+    },
     /// Cert signing itself failed (nebula-cert missing, no
     /// active CA, permission denied on a path).
     SignFailed {
@@ -502,6 +509,13 @@ impl std::fmt::Display for SignCsrError {
                 f,
                 "pending-enroll CSR didn't parse: {reason}. \
                  Confirm both peers are on the same MDE release.",
+            ),
+            Self::BearerNotIssued { node_id } => write!(
+                f,
+                "enrollment of {node_id} refused: its bearer is not \
+                 issued-and-unredeemed. Mint a fresh single-use token \
+                 on this lighthouse with `mackesd enroll-token` and \
+                 re-run the join with it (ENT-1).",
             ),
             Self::SignFailed { reason } => write!(
                 f,
@@ -607,6 +621,24 @@ pub fn sign_pending_csr<B: crate::ca::NebulaCertBackend + ?Sized>(
             node_id: csr.node_id.clone(),
         });
     }
+    // ENT-1 (C1) — the enforcement the docs always claimed: the
+    // bearer must be issued-and-unredeemed in the ledger. Wrong,
+    // replayed, or absent → refused before the cap check + before
+    // any signing work. `allow_override` deliberately does NOT
+    // bypass this (the override is a capacity lever, never an
+    // authentication one).
+    if !crate::bearer_ledger::is_pending(workgroup_root, &csr.token.bearer) {
+        tracing::warn!(
+            target: "mackesd::bearer_ledger",
+            event = "enroll.bearer.refused",
+            peer_id = %csr.node_id,
+            mesh_id = %mesh_id,
+            "ENT-1: refusing enrollment — bearer not issued/already redeemed",
+        );
+        return Err(SignCsrError::BearerNotIssued {
+            node_id: csr.node_id.clone(),
+        });
+    }
     // TUNE-11 — 8-peer cap (Q3 + Q22) enforcement. Counts
     // distinct active node_ids at the active epoch. The
     // UNIQUE(node_id, epoch) constraint on `nebula_peer_certs`
@@ -702,6 +734,8 @@ pub fn sign_pending_csr<B: crate::ca::NebulaCertBackend + ?Sized>(
             reason: e.to_string(),
         }
     })?;
+    // ENT-1 — single-use: the sign that honored the bearer spends it.
+    let _ = crate::bearer_ledger::redeem(workgroup_root, &csr.token.bearer);
     Ok(SignOutcome {
         peer_id: csr.node_id,
         overlay_ip: signed.overlay_ip,
@@ -976,10 +1010,22 @@ mod tests {
         (ca_crt, ca_key)
     }
 
-    /// Write a pending-enroll CSR under workgroup_root/peer_id/mackesd/.
+    /// Write a pending-enroll CSR under workgroup_root/peer_id/mackesd/
+    /// with its bearer seeded as issued (ENT-1 — the happy path).
     fn place_csr(workgroup_root: &Path, peer_id: &str) -> PendingEnrollment {
         let identity = build_identity();
         let token = parse_join_token("mesh:test-mesh@10.0.0.5:4242#bearer").unwrap();
+        crate::bearer_ledger::record_issued(workgroup_root, &token.bearer).expect("seed bearer");
+        let pending = build_pending(&identity, peer_id, "anvil", token);
+        publish_enrollment_request(workgroup_root, peer_id, &pending).expect("publish");
+        pending
+    }
+
+    /// Like [`place_csr`] but the bearer is deliberately NOT issued —
+    /// the ENT-1 refusal path.
+    fn place_csr_unissued(workgroup_root: &Path, peer_id: &str) -> PendingEnrollment {
+        let identity = build_identity();
+        let token = parse_join_token("mesh:test-mesh@10.0.0.5:4242#forged").unwrap();
         let pending = build_pending(&identity, peer_id, "anvil", token);
         publish_enrollment_request(workgroup_root, peer_id, &pending).expect("publish");
         pending
@@ -1066,6 +1112,84 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row_count, 1);
+    }
+
+    #[test]
+    fn sign_csr_refuses_unissued_bearer_ent1() {
+        // ENT-1 acceptance: wrong / forged / absent bearer → refused
+        // before any signing work, even with allow_override.
+        let tmp = tempdir().expect("tempdir");
+        let conn = fresh_store();
+        let (ca_crt, ca_key) = make_test_ca(tmp.path(), &conn);
+        let _ = place_csr_unissued(tmp.path(), "peer:forger");
+        let paths = SignCsrPaths {
+            ca_crt,
+            ca_key,
+            scratch_dir: tmp.path().join("scratch"),
+        };
+        let r = sign_pending_csr(
+            &MockBackend,
+            &conn,
+            tmp.path(),
+            "peer:forger",
+            "test-mesh",
+            &paths,
+            vec![],
+            365,
+            true, // the capacity override must NOT bypass auth
+        );
+        assert!(
+            matches!(r, Err(SignCsrError::BearerNotIssued { ref node_id }) if node_id == "peer:forger"),
+            "got {r:?}"
+        );
+    }
+
+    #[test]
+    fn sign_csr_bearer_is_single_use_ent1() {
+        // ENT-1 acceptance: a valid bearer signs once; the replay of
+        // the same bearer (a second CSR re-using it) is refused.
+        let tmp = tempdir().expect("tempdir");
+        let conn = fresh_store();
+        let (ca_crt, ca_key) = make_test_ca(tmp.path(), &conn);
+        let _ = place_csr(tmp.path(), "peer:anvil"); // seeds "bearer"
+        let paths = SignCsrPaths {
+            ca_crt,
+            ca_key,
+            scratch_dir: tmp.path().join("scratch"),
+        };
+        sign_pending_csr(
+            &MockBackend,
+            &conn,
+            tmp.path(),
+            "peer:anvil",
+            "test-mesh",
+            &paths,
+            vec![],
+            365,
+            false,
+        )
+        .expect("first sign with the issued bearer");
+        // A second box presents the SAME bearer (replay) — place the
+        // CSR without re-seeding the ledger.
+        let identity = build_identity();
+        let token = parse_join_token("mesh:test-mesh@10.0.0.5:4242#bearer").unwrap();
+        let pending = build_pending(&identity, "peer:replayer", "replayer", token);
+        publish_enrollment_request(tmp.path(), "peer:replayer", &pending).expect("publish");
+        let r = sign_pending_csr(
+            &MockBackend,
+            &conn,
+            tmp.path(),
+            "peer:replayer",
+            "test-mesh",
+            &paths,
+            vec![],
+            365,
+            false,
+        );
+        assert!(
+            matches!(r, Err(SignCsrError::BearerNotIssued { .. })),
+            "replayed bearer must be refused, got {r:?}"
+        );
     }
 
     #[test]
