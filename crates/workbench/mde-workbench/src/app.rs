@@ -25,7 +25,7 @@ use crate::panels::{
     fleet_logs as fleet_logs_panel, fleet_revisions as fleet_revisions_panel,
     fleet_rollup as fleet_rollup_panel, fleet_settings as fleet_settings_panel,
     fonts as fonts_panel, hardware as hardware_panel, health_check as health_check_panel,
-    help_index as help_index_panel, home as home_panel, hub as hub_panel,
+    help_index as help_index_panel, home as home_panel, hub as hub_panel, images as images_panel,
     interfaces as interfaces_panel, inventory as inventory_panel, jobs as jobs_panel,
     keyboard as keyboard_panel, logs as logs_panel, mesh_bus as mesh_bus_panel,
     mesh_control as mesh_control_panel, mesh_federation as mesh_federation_panel,
@@ -204,6 +204,7 @@ pub enum Message {
     Tags(tags_panel::Message),
     Profiles(profiles_panel::Message),
     Mirrors(mirrors_panel::Message),
+    Images(images_panel::Message),
     /// BUS-7.2 — Network → Mackes Bus panel sub-message.
     MeshBus(mesh_bus_panel::Message),
     /// TUNE-15.b — Network → Mesh Federation panel sub-message.
@@ -311,6 +312,7 @@ pub struct App {
     tags: tags_panel::TagsPanel,
     profiles: profiles_panel::ProfilesPanel,
     mirrors: mirrors_panel::MirrorsPanel,
+    images: images_panel::ImagesPanel,
     mesh_bus: mesh_bus_panel::MeshBusPanel,
     mesh_federation: mesh_federation_panel::MeshFederationPanel,
     mesh_control: mesh_control_panel::MeshControlPanel,
@@ -431,6 +433,7 @@ impl App {
             tags: tags_panel::TagsPanel::new(),
             profiles: profiles_panel::ProfilesPanel::new(),
             mirrors: mirrors_panel::MirrorsPanel::new(),
+            images: images_panel::ImagesPanel::new(),
             mesh_bus: mesh_bus_panel::MeshBusPanel::new(),
             mesh_federation: mesh_federation_panel::MeshFederationPanel::new(),
             mesh_control: mesh_control_panel::MeshControlPanel::new(),
@@ -906,6 +909,7 @@ impl App {
             Message::Tags(msg) => self.tags.update(msg),
             Message::Profiles(msg) => self.profiles.update(msg),
             Message::Mirrors(msg) => self.mirrors.update(msg),
+            Message::Images(msg) => self.images.update(msg),
             Message::MeshBus(msg) => self.mesh_bus.update(msg),
             Message::MeshFederation(msg) => self.mesh_federation.update(msg),
             Message::MeshControl(msg) => self.mesh_control.update(msg),
@@ -1007,6 +1011,8 @@ impl App {
             (Group::Provisioning, "profiles") => profiles_panel::ProfilesPanel::load(),
             // PLANES-24 — the package-mirror catalog.
             (Group::Provisioning, "mirrors") => mirrors_panel::MirrorsPanel::load(),
+            // PLANES-22 — the image catalog.
+            (Group::Provisioning, "images") => images_panel::ImagesPanel::load(),
             (Group::Controller, "audit") => audit_panel::AuditPanel::load(),
             (Group::ThisNode, "mesh_logs") => mesh_logs_panel::MeshLogsPanel::load(),
             (Group::Controller, "fleet_logs") => fleet_logs_panel::FleetLogsPanel::load(),
@@ -1428,6 +1434,11 @@ impl App {
                 group: Group::Provisioning,
                 panel: "mirrors",
             } => self.mirrors.view(),
+            // PLANES-22 — the image catalog.
+            View::Panel {
+                group: Group::Provisioning,
+                panel: "images",
+            } => self.images.view(),
             // BUS-7.2 — Mackes Bus 5-tab operator surface.
             View::Panel {
                 group: Group::Network,
@@ -1576,11 +1587,12 @@ impl App {
 /// name it honestly. Returns `None` for panels that already have a
 /// reducer (they never reach the catch-all) or that carry no tracked
 /// follow-up.
-fn panel_worklist_item(group: Group, panel: &str) -> Option<&'static str> {
-    match (group, panel) {
-        (Group::Provisioning, "images") => Some("PLANES-22 (images)"),
-        _ => None,
-    }
+fn panel_worklist_item(_group: Group, _panel: &str) -> Option<&'static str> {
+    // PLANES-1 (W16) — every plane panel now has a real reducer, so no
+    // plane slug reaches the catch-all with a tracked follow-up. The hook
+    // stays for any future panel that ships its nav entry ahead of its
+    // reducer.
+    None
 }
 
 fn panel_under_construction(view: View) -> Element<'static, Message> {
@@ -1646,14 +1658,24 @@ mod tests {
     }
 
     #[test]
-    fn new_plane_panels_name_their_worklist_item() {
-        // PLANES-1 (W16) — every full-tree empty-state plane panel names
-        // the worklist item building it, so the console never reads as
-        // vaporware.
-        for (g, p) in [(Group::Provisioning, "images")] {
+    fn every_plane_panel_has_a_real_reducer_now() {
+        // PLANES-1 (W16) follow-through — the full-tree empty-state plane
+        // panels (policy, interfaces, dns, routing, tags, profiles,
+        // images, mirrors) all shipped real reducers, so the
+        // worklist-item hook no longer fires for any of them.
+        for (g, p) in [
+            (Group::Controller, "policy"),
+            (Group::Network, "interfaces"),
+            (Group::Network, "dns"),
+            (Group::Network, "routing"),
+            (Group::Fleet, "tags"),
+            (Group::Provisioning, "profiles"),
+            (Group::Provisioning, "images"),
+            (Group::Provisioning, "mirrors"),
+        ] {
             assert!(
-                panel_worklist_item(g, p).is_some(),
-                "{g:?}/{p} empty-state must name its worklist item (W16)"
+                panel_worklist_item(g, p).is_none(),
+                "{g:?}/{p} should have a real reducer now (no worklist hook)"
             );
         }
     }

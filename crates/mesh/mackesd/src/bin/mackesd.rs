@@ -721,6 +721,16 @@ enum Cmd {
         json: bool,
     },
 
+    /// PLANES-22 — the image catalog. `mded images --json` emits the
+    /// four buildable kinds (ISO / VM / container / USB, W53) each with
+    /// the versioned builds present on LizardFS (W55). The Provisioning
+    /// ▸ Images panel consumes the JSON.
+    Images {
+        /// Emit the JSON array instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// CB-1.5.a — fleet node roster. `mded nodes list --json` emits
     /// every row from the `nodes` table as a JSON array; the Iced
     /// inventory panel (in `crates/mde-workbench/src/panels/
@@ -3938,6 +3948,54 @@ fn main() -> anyhow::Result<()> {
                         "               serves: {}  ({synced})",
                         m.file_baseurl(&root)
                     );
+                }
+            }
+            return Ok(());
+        }
+        Cmd::Images { json } => {
+            // PLANES-22 — the four buildable kinds, each with its
+            // versioned builds present on LizardFS (W53/W55).
+            use mackesd_core::image_catalog::{self, ImageKind};
+            let root = mackesd_core::default_qnm_shared_root();
+            let manifests = image_catalog::load_manifests(&root);
+            let rows: Vec<serde_json::Value> = ImageKind::all()
+                .iter()
+                .map(|kind| {
+                    let builds: Vec<serde_json::Value> = manifests
+                        .iter()
+                        .filter(|m| m.kind == kind.as_str())
+                        .map(|m| {
+                            serde_json::json!({
+                                "name": m.name,
+                                "version": m.version,
+                                "built_at_ms": m.built_at_ms,
+                                "size_bytes": m.size_bytes,
+                                "profile": m.profile,
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "kind": kind.as_str(),
+                        "label": kind.label(),
+                        "description": kind.description(),
+                        "builds": builds,
+                    })
+                })
+                .collect();
+            if json {
+                println!("{}", serde_json::to_string(&rows)?);
+            } else {
+                for kind in ImageKind::all() {
+                    let n = manifests.iter().filter(|m| m.kind == kind.as_str()).count();
+                    println!(
+                        "{:<18} {} build(s) — {}",
+                        kind.label(),
+                        n,
+                        kind.description()
+                    );
+                    for m in manifests.iter().filter(|m| m.kind == kind.as_str()) {
+                        println!("    {} v{}", m.name, m.version);
+                    }
                 }
             }
             return Ok(());
