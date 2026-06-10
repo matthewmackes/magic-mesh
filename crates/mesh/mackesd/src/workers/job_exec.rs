@@ -64,8 +64,9 @@ impl JobExecWorker {
             return Vec::new();
         }
         let mut executed = Vec::new();
-        // Serial per node (W34): handle one pending run per pass.
-        for run in self.pending_runs() {
+        // Serial per node (W34): handle exactly one pending run per pass so
+        // a fleet-wide run can't stampede a box mid-apply.
+        if let Some(run) = self.pending_runs().into_iter().next() {
             let result = self.execute(&run);
             let _ = write_target_result(&self.workgroup_root, &run.run_id, &result);
             executed.push(run.run_id.clone());
@@ -73,7 +74,6 @@ impl JobExecWorker {
                 run = %run.run_id, status = %result.status,
                 "job_exec: ran pending job locally (PLANES-9)"
             );
-            break; // one at a time
         }
         executed
     }

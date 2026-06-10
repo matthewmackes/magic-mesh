@@ -273,6 +273,9 @@ pub mod mesh_dns;
 // PLANES-15 — converges the baseline's netstate desired-state under a
 // rollback checkpoint with a post-apply overlay-reachability self-test.
 pub mod netstate_apply;
+// PLANES-19 — the overlay-reachability validation suite: participate in
+// runs, leader mints nightly/run-now + writes the pass/fail verdict.
+pub mod validation_suite;
 // PD-11 — executes descriptor-gated container/VM lifecycle requests.
 pub mod lifecycle_exec;
 // NF-21.3 — owns the firewalld preset that opens Nebula's

@@ -879,6 +879,7 @@ fn latest_stats(root: &Path) -> Option<ApplyReport> {
 pub mod jobs;
 pub mod netstate;
 pub mod store;
+pub mod validation;
 
 #[cfg(test)]
 mod tests {

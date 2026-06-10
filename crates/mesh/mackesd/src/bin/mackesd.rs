@@ -3462,8 +3462,8 @@ fn run_serve(
         firewall_preset::FirewallPresetWorker, fleet_reconcile, heartbeat::HeartbeatWorker,
         job_exec, lifecycle_exec, mdns_relay::MdnsRelayWorker, mesh_dns,
         mesh_router::MeshRouterWorker, netstate_apply, presence_watch, ssh_pubkey_gossip,
-        sshd_overlay_bind::SshdOverlayBindWorker, voice_config::VoiceConfigWorker, RestartPolicy,
-        Spawn, Supervisor,
+        sshd_overlay_bind::SshdOverlayBindWorker, validation_suite,
+        voice_config::VoiceConfigWorker, RestartPolicy, Spawn, Supervisor,
     };
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -3749,6 +3749,22 @@ fn run_serve(
                 RestartPolicy::OnFailure,
             ));
             worker_names.lock().expect("worker_names mutex").push("netstate_apply".into());
+        }
+        // PLANES-19 — overlay-reachability validation suite: every node
+        // participates; the leader mints nightly/run-now + writes verdicts.
+        if mackesd_core::worker_role::runs("validation_suite", role_rank) {
+            sup.spawn(Spawn::new(
+                validation_suite::ValidationSuiteWorker::new(
+                    workgroup_root.clone(),
+                    Some(db_path.clone()),
+                    node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string(),
+                    std::path::PathBuf::from(
+                        mackesd_core::workers::netdata_aggregator::DEFAULT_ROLE_HOST_MARKER,
+                    ),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names.lock().expect("worker_names mutex").push("validation_suite".into());
         }
         // PLANES-9 — the local job executor (execution-tag gated, W84).
         if mackesd_core::worker_role::runs("job_exec", role_rank) {

@@ -296,7 +296,7 @@ host-local Ansible apply.
 - [ ] **PLANES-16: firewall policy** — firewalld zones in the baseline; **overlay = trusted zone**, underlay per-role tight (W69/W70); revocation stays Nebula-blocklist-only (W71).
 - [ ] **PLANES-17: VPN/tunnels + gateways** — Nebula topology (lighthouses/relays/punchy/unsafe_routes) as fleet state; external VPN client profiles (never transport, §1); **hop nodes: subnet advertise + full exit nodes** (W72/W73); exit path covered by validation before the toggle ships.
 - [✓] **PLANES-18: mesh DNS** — done — mesh_dns worker (rank 0): flat <host>.mesh records from the roster overlay IPs, fed to systemd-resolved per-link on nebula1 (FDO resolve1 interop, §2-legal) with an always-applied managed /etc/hosts block fallback so names resolve without resolvectl; no server, no center (W74/75); empty-IP entries skipped, idempotent merge. Routing stays display-only (W76) — mackesd → systemd-resolved per-link, `<host>.mesh`, no server (W74/W75); routing display-only otherwise (W76).
-- [ ] **PLANES-19: validation suite** — overlay reachability fleet test (W79), post-apply + nightly leader job + Run-now, failures → drift (W80). Absorbs **ENT-10**.
+- [✓] **PLANES-19: validation suite** — overlay reachability fleet test (W79), post-apply + nightly leader job + Run-now, failures → drift (W80). Absorbs **ENT-10**.
 
 ### Fleet
 
