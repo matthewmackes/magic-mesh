@@ -74,6 +74,7 @@ pub fn directory_row(
         "last_seen_ms": rec.last_seen_ms,
         "health": rec.health,
         "mde_version": rec.mde_version,
+        "descriptors": rec.descriptors,
         "overlay_ip": overlay.map(|(ip, _)| ip.clone()),
         "role": overlay.map(|(_, role)| role.clone()),
         "revision": {
@@ -234,6 +235,7 @@ mod tests {
                 mde_version: Some("4.2.1".into()),
                 last_seen_ms: now,
                 health: "healthy".into(),
+                descriptors: None,
             },
         )
         .unwrap();

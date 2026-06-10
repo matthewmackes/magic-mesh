@@ -160,7 +160,7 @@ host-local Ansible apply.
     - [ ] `mde-bus call action/mesh/directory` returns all known peers incl. self, with every field above
     - [ ] `mackesd peers` prints the same record set as an aligned table; `--json` emits raw records (L24)
     - [ ] presence tiers derive from `last_seen_ms` (Online ≤2 min, Idle ≤10 min, Offline) (Q11)
-- [ ] **PD-2: PEERS — peer-published service descriptors (remote access + Podman + KVM + media)**
+- [✓] **PD-2: PEERS — peer-published service descriptors (remote access + Podman + KVM + media)** — done — descriptors.rs probes localhost-only (ssh/rdp/vnc listeners, podman ps json, virsh list/dominfo/domifaddr, pinned media ports, Netdata alarms→3-tier health) and rides the heartbeat record write; directory passes them through
   **As** a peer's mackesd,
   **I want** to locally probe sshd/xrdp/vnc listeners, Podman containers (name+image+state+published ports, L10), libvirt guests (name+state+vCPU/mem+qemu-agent IPs, L11), media services via a localhost port-scan of a pinned list (Jellyfin 8096, Navidrome/Airsonic 4533, MPD 6600, DLNA, mde-musicd — L12), and my Netdata alarm summary (3-tier: healthy/degraded/critical, worst alarm named, L15), publishing the result on the ~30 s presence heartbeat (L13) into my replicated PeerRecord/PeerProbe,
   **so that** the directory knows what every peer offers without any remote probing (Q19/Q26c/D1).

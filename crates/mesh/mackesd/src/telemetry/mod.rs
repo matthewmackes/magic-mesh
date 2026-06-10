@@ -167,11 +167,22 @@ pub fn spawn_heartbeat_worker(
             // our own <hostname>.json).
             let due = last_peer_write.map_or(true, |t| t.elapsed() >= peer_write_min);
             if due {
-                let rec = mackes_mesh_types::peers::PeerRecord::now(
+                // PD-2 — probe + publish the service descriptors on the
+                // record-write cycle (L13: one cycle, one write); health
+                // derives from the Netdata alarm tier (L15) instead of a
+                // hardcoded "healthy".
+                let descriptors = crate::descriptors::probe_local();
+                let health = if descriptors.alarms.tier.is_empty() {
+                    "healthy".to_string()
+                } else {
+                    descriptors.alarms.tier.clone()
+                };
+                let mut rec = mackes_mesh_types::peers::PeerRecord::now(
                     peer_hostname.clone(),
                     mde_version.clone(),
-                    "healthy",
+                    health,
                 );
+                rec.descriptors = Some(descriptors);
                 match mackes_mesh_types::peers::write_peer_record(&peers_dir, &rec) {
                     Ok(_) => last_peer_write = Some(std::time::Instant::now()),
                     Err(e) => eprintln!("peer-record: write failed: {e}"),

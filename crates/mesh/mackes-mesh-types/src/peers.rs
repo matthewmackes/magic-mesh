@@ -29,9 +29,85 @@ pub struct PeerRecord {
     pub mde_version: Option<String>,
     /// Wall-clock epoch milliseconds of the last write (liveness).
     pub last_seen_ms: u64,
-    /// `healthy` | `degraded` | `unreachable` | `unknown` (mirrors `nodes.health`).
+    /// `healthy` | `degraded` | `critical` | `unreachable` | `unknown`
+    /// — Netdata-alarm-derived since PD-2 (L15 3-tier mapping).
     #[serde(default = "default_health")]
     pub health: String,
+    /// PD-2 — what this peer offers the mesh (remote access, Podman
+    /// containers, libvirt guests, media services) + its Netdata alarm
+    /// summary. `None` from pre-PD-2 writers; readers tolerate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descriptors: Option<ServiceDescriptors>,
+}
+
+/// PD-2 (L10–L15) — a peer's locally-probed service inventory,
+/// published on the heartbeat (one cycle, one write — L13). Every
+/// probe is localhost-only; nothing leaves the publishing host (Q19).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServiceDescriptors {
+    /// Remote-access listeners on this box.
+    pub remote_access: RemoteAccess,
+    /// Podman containers (L10: name + image + state + published ports).
+    pub containers: Vec<ContainerInfo>,
+    /// libvirt guests (L11: name + state + specs + agent addresses).
+    pub vms: Vec<VmInfo>,
+    /// Media services answering on the pinned localhost port list (L12).
+    pub media: Vec<MediaService>,
+    /// Netdata alarm summary (L15 3-tier).
+    pub alarms: AlarmSummary,
+}
+
+/// Which remote-access services listen locally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RemoteAccess {
+    pub ssh: bool,
+    pub rdp: bool,
+    pub vnc: bool,
+}
+
+/// One Podman container (L10).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContainerInfo {
+    pub name: String,
+    pub image: String,
+    /// `running` | `exited` | …
+    pub state: String,
+    /// Published ports, `host->container/proto` strings.
+    pub ports: Vec<String>,
+}
+
+/// One libvirt guest (L11).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VmInfo {
+    pub name: String,
+    /// `running` | `shut off` | `paused` | …
+    pub state: String,
+    pub vcpus: Option<u32>,
+    pub memory_mb: Option<u64>,
+    /// Guest IPs via the qemu agent (empty when no agent).
+    pub addresses: Vec<String>,
+}
+
+/// One media service answering on a pinned localhost port (L12).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MediaService {
+    pub name: String,
+    pub port: u16,
+}
+
+/// Netdata alarm summary (L15): `healthy` (no active alarms) ·
+/// `degraded` (any WARNING) · `critical` (any CRITICAL), with the
+/// worst alarm named.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AlarmSummary {
+    pub tier: String,
+    pub worst: Option<String>,
 }
 
 fn default_health() -> String {
@@ -51,6 +127,7 @@ impl PeerRecord {
             mde_version,
             last_seen_ms: now_ms(),
             health: health.into(),
+            descriptors: None,
         }
     }
 
