@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Magic Mesh Files
+Comment=Mesh-first file manager
+Exec=mde-files
+Icon=magic-mesh
+Terminal=false
+Categories=System;FileTools;FileManager;
+MimeType=inode/directory;

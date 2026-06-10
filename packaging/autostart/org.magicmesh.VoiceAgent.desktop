@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Magic Mesh Voice Agent
+Comment=Persistent SIP agent — registers, listens for inbound calls, publishes state/voice/status (SVC-4)
+Exec=mde-voice-hud --agent
+Icon=magic-mesh
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

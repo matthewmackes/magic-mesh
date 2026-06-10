@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Magic Mesh Voice
+Comment=Mesh voice calls (SIP) — HUD overlay
+Exec=mde-voice-hud
+Icon=magic-mesh
+Terminal=false
+Categories=Network;Telephony;
