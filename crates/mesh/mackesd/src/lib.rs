@@ -110,6 +110,7 @@ pub mod descriptors;
 pub mod leave;
 pub mod lifecycle;
 pub mod mesh_init;
+pub mod node_key;
 #[cfg(feature = "async-services")]
 pub mod stun;
 pub mod telemetry;

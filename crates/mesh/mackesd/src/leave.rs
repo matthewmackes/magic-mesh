@@ -56,8 +56,22 @@ pub fn leave(
     let own_cert = nebula_config_dir.join("host.crt");
     if let Ok(pem) = std::fs::read_to_string(&own_cert) {
         if let Some(fp) = crate::ca::blocklist::fingerprint_cert_pem(&pem) {
-            report.data_plane_evicted =
-                crate::ca::blocklist::record_revoked(workgroup_root, node_id, &[fp]).is_ok();
+            // SEC-6 — sign our own retract when the key store allows.
+            report.data_plane_evicted = match crate::node_key::load_or_create(std::path::Path::new(
+                crate::node_key::DEFAULT_KEY_PATH,
+            )) {
+                Ok(key) => crate::ca::blocklist::record_revoked_signed(
+                    workgroup_root,
+                    node_id,
+                    &[fp],
+                    node_id,
+                    &key,
+                )
+                .is_ok(),
+                Err(_) => {
+                    crate::ca::blocklist::record_revoked(workgroup_root, node_id, &[fp]).is_ok()
+                }
+            };
         }
         if !report.data_plane_evicted {
             tracing::warn!(

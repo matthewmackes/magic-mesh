@@ -94,8 +94,25 @@ pub fn revoke_peer(
         );
     }
     if !fingerprints.is_empty() {
-        if let Err(e) = crate::ca::blocklist::record_revoked(workgroup_root, node_id, &fingerprints)
-        {
+        // SEC-6 — sign the retract with this node's persisted key so
+        // peers can attribute + tamper-check it; unsigned fallback only
+        // when the key store itself is broken (still loudly warned).
+        let write_result = match crate::node_key::load_or_create(std::path::Path::new(
+            crate::node_key::DEFAULT_KEY_PATH,
+        )) {
+            Ok(key) => crate::ca::blocklist::record_revoked_signed(
+                workgroup_root,
+                node_id,
+                &fingerprints,
+                self_node_id,
+                &key,
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, "SEC-6: node signing key unavailable — writing unsigned retract");
+                crate::ca::blocklist::record_revoked(workgroup_root, node_id, &fingerprints)
+            }
+        };
+        if let Err(e) = write_result {
             tracing::error!(
                 target: "mackesd::ca",
                 node_id = %node_id, error = %e,
