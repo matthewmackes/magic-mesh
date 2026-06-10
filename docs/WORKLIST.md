@@ -283,7 +283,7 @@ host-local Ansible apply.
 
 ### Controller (FPG prerequisite, W94)
 
-- [ ] **PLANES-9: the jobs engine** — job = playbook ref + vars + targets (W29); signed bundles, target runs locally, **no push-SSH, no raw shell** (W21/W32); LizardFS `jobs/{templates,runs}` (W33); fleet-parallel serial-per-node (W34); leader-fired schedules (W35); Run-once (W37); failure-only alerts (W39).
+- [✓] **PLANES-9: the jobs engine** — done — magic_fleet::jobs (template/run store on the replicated volume, tag/role/peer target resolution W31); job_exec worker (rank 1, execution-tag-gated W84, serial-per-node W34, target runs its own playbook via the FPG apply primitive — no push-SSH W32); action/jobs/* responder (list-templates/launch/runs/run-results, PLANES-10). Schedules (W35) + the Job-templates panel (PLANES-10 UI) follow — job = playbook ref + vars + targets (W29); signed bundles, target runs locally, **no push-SSH, no raw shell** (W21/W32); LizardFS `jobs/{templates,runs}` (W33); fleet-parallel serial-per-node (W34); leader-fired schedules (W35); Run-once (W37); failure-only alerts (W39).
 - [ ] **PLANES-10: Job templates panel** — form + read-only YAML (W38), schedule field (W30), tag/role/peer targeting (W31), history runs→targets→output (W36). Playbooks panel absorbed (W40).
 - [ ] **PLANES-11: Remediation panel** — drift-type→template map w/ event var bindings, drift list + matched plan + fire (W41); per-plan auto flag default-off, auto fires loud (W42). Drift panel folds in (W13).
 - [ ] **PLANES-12: Audit** — hash-chained events: security + jobs/remediation + config/policy + lifecycle ops (W43); timeline viewer + verify-chain (W44); **72 h rolling retention** (W45, operator lock). Absorbs **ENT-14**.

@@ -866,6 +866,7 @@ fn latest_stats(root: &Path) -> Option<ApplyReport> {
         .find_map(|s| parse_stats(&s))
 }
 
+pub mod jobs;
 pub mod store;
 
 #[cfg(test)]

@@ -43,6 +43,7 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // ── Server (rank 1) — adds fleet + mesh storage.
     ("ansible-pull", 1),
     ("app-sync", 1),
+    ("job_exec", 1),
     // ── Workstation (rank 2) — adds voice + media + kdc + remmina.
     ("voice_config", 2),
     ("clipd_supervisor", 2),
@@ -132,8 +133,8 @@ mod tests {
         // -12 sway/desktop workers (E11 'Cosmic owns the desktop' — the
         // labwc/sway worker stack deleted). +1 ssh_pubkey_gossip (SVC-2),
         // +1 fleet_reconcile (PD-9), +1 presence_watch (PD-13),
-        // +1 lifecycle_exec (PD-11).
-        assert_eq!(WORKER_TIERS.len(), 21);
+        // +1 lifecycle_exec (PD-11), +1 job_exec (PLANES-9).
+        assert_eq!(WORKER_TIERS.len(), 22);
     }
 
     #[test]
@@ -161,9 +162,9 @@ mod tests {
         );
         assert_eq!(
             count(1),
-            2,
-            "Server rank-1 = the two fleet workers; the LizardFS meshfs_worker \
-             spawns unconditionally (binary-self-gated), not via this rank table"
+            3,
+            "Server rank-1 = fleet workers + job_exec (PLANES-9); the LizardFS \
+             meshfs_worker spawns unconditionally (binary-self-gated)"
         );
         assert_eq!(count(2), 4, "Workstation adds voice/media/kdc/remmina");
     }
@@ -216,8 +217,8 @@ mod tests {
         let srv = workers_for_rank(Role::Server.rank());
         let ws = workers_for_rank(Role::Workstation.rank());
         assert_eq!(lh.len(), 15);
-        assert_eq!(srv.len(), 17);
-        assert_eq!(ws.len(), 21);
+        assert_eq!(srv.len(), 18);
+        assert_eq!(ws.len(), 22);
         // Strict superset: every lower-tier worker is in the higher tier.
         assert!(lh.iter().all(|w| srv.contains(w)));
         assert!(srv.iter().all(|w| ws.contains(w)));

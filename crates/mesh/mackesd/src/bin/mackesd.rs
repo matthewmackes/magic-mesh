@@ -3460,8 +3460,8 @@ fn run_serve(
 ) -> anyhow::Result<()> {
     use mackesd_core::workers::{
         firewall_preset::FirewallPresetWorker, fleet_reconcile, heartbeat::HeartbeatWorker,
-        lifecycle_exec, mdns_relay::MdnsRelayWorker, mesh_router::MeshRouterWorker, presence_watch,
-        ssh_pubkey_gossip, sshd_overlay_bind::SshdOverlayBindWorker,
+        job_exec, lifecycle_exec, mdns_relay::MdnsRelayWorker, mesh_router::MeshRouterWorker,
+        presence_watch, ssh_pubkey_gossip, sshd_overlay_bind::SshdOverlayBindWorker,
         voice_config::VoiceConfigWorker, RestartPolicy, Spawn, Supervisor,
     };
     use std::collections::HashMap;
@@ -3725,6 +3725,17 @@ fn run_serve(
                 RestartPolicy::OnFailure,
             ));
             worker_names.lock().expect("worker_names mutex").push("fleet_reconcile".into());
+        }
+        // PLANES-9 — the local job executor (execution-tag gated, W84).
+        if mackesd_core::worker_role::runs("job_exec", role_rank) {
+            sup.spawn(Spawn::new(
+                job_exec::JobExecWorker::new(
+                    workgroup_root.clone(),
+                    node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names.lock().expect("worker_names mutex").push("job_exec".into());
         }
         if mackesd_core::worker_role::runs("ssh_pubkey_gossip", role_rank) {
             sup.spawn(Spawn::new(
@@ -4583,6 +4594,42 @@ fn run_serve(
                     error = %e,
                     "Directory Bus responder: bus persist open failed; responder skipped"
                 );
+            }
+        }
+        // PLANES-9/10 — the jobs control surface (action/jobs/*):
+        // list-templates / launch / runs / run-results. Same
+        // dedicated-OS-thread shape; the job_exec worker does the
+        // actual local runs.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let jobs_svc = mackesd_core::ipc::jobs::JobsService::new(
+                    &workgroup_root,
+                    Some(db_path.clone()),
+                );
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("jobs-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::jobs::serve_bus(&persist, &jobs_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_h| {
+                        tracing::info!("Jobs Bus responder spawned (action/jobs/*, PLANES-9)");
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Jobs Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("jobs_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Jobs Bus responder: bus persist open failed; skipped");
             }
         }
         // E0.3.4 — Settings store on the mesh Bus at
