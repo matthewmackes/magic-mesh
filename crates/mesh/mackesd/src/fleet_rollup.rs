@@ -92,7 +92,10 @@ mod tests {
         assert_eq!(worst_health(["healthy", "healthy"]), "healthy");
         assert_eq!(worst_health(["healthy", "unknown"]), "unknown");
         assert_eq!(worst_health(["unknown", "degraded"]), "degraded");
-        assert_eq!(worst_health(["degraded", "unreachable", "healthy"]), "unreachable");
+        assert_eq!(
+            worst_health(["degraded", "unreachable", "healthy"]),
+            "unreachable"
+        );
         assert_eq!(worst_health(std::iter::empty()), "healthy");
         // Unrecognised states fall back to unknown severity.
         assert_eq!(worst_health(["weird", "healthy"]), "unknown");
