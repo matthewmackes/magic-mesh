@@ -27,7 +27,7 @@ use crate::panels::{
     hub as hub_panel, inventory as inventory_panel, jobs as jobs_panel, keyboard as keyboard_panel,
     logs as logs_panel, mesh_bus as mesh_bus_panel, mesh_control as mesh_control_panel,
     mesh_federation as mesh_federation_panel, mesh_history as mesh_history_panel,
-    mesh_join as mesh_join_panel, mesh_pending as mesh_pending_panel,
+    mesh_join as mesh_join_panel, mesh_logs as mesh_logs_panel, mesh_pending as mesh_pending_panel,
     mesh_services as mesh_services_panel, mesh_storage as mesh_storage_panel,
     mesh_topology as mesh_topology_panel, mouse as mouse_panel, music as music_panel,
     network_hosts as network_hosts_panel, notifications as notifications_panel,
@@ -150,6 +150,8 @@ pub enum Message {
     Jobs(jobs_panel::Message),
     /// PLANES-12 — Audit panel (hash-chain timeline + verify) sub-message.
     Audit(audit_panel::Message),
+    /// PLANES-8 — Mesh Logs panel (journald mesh-unit view) sub-message.
+    MeshLogs(mesh_logs_panel::Message),
     /// CB-1.5.b — Fleet playbooks panel sub-message.
     Playbooks(playbooks_panel::Message),
     /// CB-1.5.c — Fleet run-history panel sub-message.
@@ -258,6 +260,7 @@ pub struct App {
     hardware: hardware_panel::HardwarePanel,
     jobs: jobs_panel::JobsPanel,
     audit: audit_panel::AuditPanel,
+    mesh_logs: mesh_logs_panel::MeshLogsPanel,
     playbooks: playbooks_panel::PlaybooksPanel,
     run_history: run_history_panel::RunHistoryPanel,
     datetime: datetime_panel::DateTimePanel,
@@ -365,6 +368,7 @@ impl App {
             hardware: hardware_panel::HardwarePanel::new(),
             jobs: jobs_panel::JobsPanel::new(),
             audit: audit_panel::AuditPanel::new(),
+            mesh_logs: mesh_logs_panel::MeshLogsPanel::new(),
             playbooks: playbooks_panel::PlaybooksPanel::new(),
             run_history: run_history_panel::RunHistoryPanel::new(),
             datetime: datetime_panel::DateTimePanel::new(),
@@ -803,6 +807,7 @@ impl App {
             Message::Hardware(msg) => self.hardware.update(msg),
             Message::Jobs(msg) => self.jobs.update(msg),
             Message::Audit(msg) => self.audit.update(msg),
+            Message::MeshLogs(msg) => self.mesh_logs.update(msg),
             Message::Playbooks(msg) => self.playbooks.update(msg),
             Message::RunHistory(msg) => self.run_history.update(msg),
             Message::DateTime(msg) => self.datetime.update(msg),
@@ -901,6 +906,7 @@ impl App {
             // v4.0.1 WB-2.g — mackesd events list --json scan.
             (Group::Maintain, "drift") => drift_panel::DriftPanel::load(),
             (Group::Maintain, "audit") => audit_panel::AuditPanel::load(),
+            (Group::Maintain, "mesh_logs") => mesh_logs_panel::MeshLogsPanel::load(),
             // v4.0.1 WB-2.h — leader lock + healthz probe.
             (Group::Network, "mesh_control") => mesh_control_panel::MeshControlPanel::load(),
             // v4.0.1 WB-2.i — scan probe.json cache for pending peers.
@@ -1238,6 +1244,10 @@ impl App {
                 group: Group::Maintain,
                 panel: "audit",
             } => self.audit.view(),
+            View::Panel {
+                group: Group::Maintain,
+                panel: "mesh_logs",
+            } => self.mesh_logs.view(),
             // v4.0.1 WB-2.g (2026-05-23) — Maintain → Drift
             // renders mackesd events list --json output filtered
             // for drift-flavoured rows.

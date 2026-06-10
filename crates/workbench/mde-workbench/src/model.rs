@@ -284,6 +284,8 @@ pub fn nav_model() -> Vec<NavEntry> {
                 Panel::new("drift", "Drift"),
                 // PLANES-12 — hash-chained audit timeline + verify-chain.
                 Panel::new("audit", "Audit"),
+                // PLANES-8 — journald mesh-unit view + Netdata deep-link.
+                Panel::new("mesh_logs", "Mesh Logs"),
             ],
         },
         NavEntry {

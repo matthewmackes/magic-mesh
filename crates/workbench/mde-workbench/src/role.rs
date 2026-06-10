@@ -458,7 +458,8 @@ mod tests {
                 "health_check",
                 "repair",
                 "drift",
-                "audit"
+                "audit",
+                "mesh_logs"
             ]
         );
     }
