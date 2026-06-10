@@ -134,7 +134,7 @@ host-local Ansible apply.
 ## TEST-OBS — testing/CI + observability (resolves E1)
 
 - [ ] **OBS-1: retarget integration tests to Nebula** — real `nebula-lighthouse` + 2 peer containers via testcontainers; assert overlay reachability + handshake; daemon-absent skip = hard fail (Q87–89). *(resolves E1.)*
-- [ ] **OBS-2: multi-process convergence harness** — N real `mackesd` binaries over one QNM root assert newest-wins + single leader (Q91).
+- [✓] **OBS-2: multi-process convergence harness** — done — multiprocess_convergence.rs: N real threads racing one shared replicated root flip the FPG control-plane acceptances live — leaderless minters converge on one head (FPG-3), concurrent acks all land + union (FPG-5), cold node converges to the existing head (FPG-6), append-only survives the write race (FPG-2). The Nebula data-plane drop (revoked tunnels) stays on the VM bed — N real `mackesd` binaries over one QNM root assert newest-wins + single leader (Q91).
 - [ ] **OBS-3: GitHub Actions CI** — hosted runners; the §7 gates (build/test/clippy/fmt + boundary/Carbon/Nebula lints) + a hard 80% line-coverage floor (Q90/93).
 - [ ] **OBS-4: screenshot-artifact visual regression** — a scripted `/preview` capture posting screenshots as CI artifacts for human review (Q92).
 - [→] **OBS-5: mesh-replicated structured logging** — **RE-HOMED → PLANES-14** (W96, planes re-IA); spec text lives in the PLANES task + `docs/design/planes.md`.
