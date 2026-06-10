@@ -670,6 +670,16 @@ enum Cmd {
         cmd: NetstateCmd,
     },
 
+    /// PLANES-18 — the mesh DNS surface. `mded dns list --json` emits
+    /// the flat `<host>.mesh → overlay-ip` record set the mesh_dns
+    /// worker feeds to systemd-resolved (W74/W75), built from the live
+    /// roster. The Network ▸ Mesh DNS panel consumes the JSON.
+    #[cfg(feature = "async-services")]
+    Dns {
+        #[command(subcommand)]
+        cmd: DnsCmd,
+    },
+
     /// CB-1.5.a — fleet node roster. `mded nodes list --json` emits
     /// every row from the `nodes` table as a JSON array; the Iced
     /// inventory panel (in `crates/mde-workbench/src/panels/
@@ -1219,6 +1229,19 @@ enum RemediateCmd {
         /// The drifted peer hostname to remediate.
         #[arg(long)]
         peer: String,
+    },
+}
+
+/// Subcommands for `mackesd dns`. PLANES-18 (W74/W75).
+#[cfg(feature = "async-services")]
+#[derive(Subcommand)]
+enum DnsCmd {
+    /// List the `<host>.mesh → overlay-ip` records built from the live
+    /// roster. `--json` emits the array the Mesh DNS panel consumes.
+    List {
+        /// Emit the JSON array instead of the table.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -3637,6 +3660,49 @@ fn main() -> anyhow::Result<()> {
                         ),
                         sync
                     );
+                }
+            }
+            return Ok(());
+        }
+        #[cfg(feature = "async-services")]
+        Cmd::Dns { cmd } => {
+            // PLANES-18 — the flat <host>.mesh record set, built from
+            // the live roster (the same records mesh_dns feeds resolved).
+            use mackesd_core::workers::mesh_dns;
+            let DnsCmd::List { json } = cmd;
+            let root = mackesd_core::default_qnm_shared_root();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
+            let svc =
+                mackesd_core::ipc::directory::DirectoryService::new(&root, Some(db_path.clone()));
+            let dir = svc.build_directory(now);
+            let peers: Vec<(String, String)> = dir["peers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|p| {
+                    p["hostname"].as_str().map(|h| {
+                        (
+                            h.to_string(),
+                            p["overlay_ip"].as_str().unwrap_or("").to_string(),
+                        )
+                    })
+                })
+                .collect();
+            let records = mesh_dns::build_records(&peers);
+            if json {
+                let rows: Vec<serde_json::Value> = records
+                    .iter()
+                    .map(|r| serde_json::json!({ "fqdn": r.fqdn, "overlay_ip": r.overlay_ip }))
+                    .collect();
+                println!("{}", serde_json::to_string(&rows)?);
+            } else if records.is_empty() {
+                println!("no mesh DNS records (no roster peers with overlay IPs yet)");
+            } else {
+                println!("{:<28} {:<16}", "NAME", "OVERLAY IP");
+                for r in &records {
+                    println!("{:<28} {:<16}", r.fqdn, r.overlay_ip);
                 }
             }
             return Ok(());
