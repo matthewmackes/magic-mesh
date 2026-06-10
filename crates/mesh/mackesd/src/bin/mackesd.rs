@@ -501,6 +501,16 @@ enum Cmd {
         cmd: RevisionsCmd,
     },
 
+    /// ENT-5 — voluntarily exit the mesh: evict own cert from the
+    /// data plane, leave the roster, wipe /etc/nebula + keys, and
+    /// unpin the role (back to fail-closed). No ban — re-enroll
+    /// stays a clean fresh join.
+    Leave {
+        /// Required confirmation — this wipes local mesh state.
+        #[arg(long)]
+        yes: bool,
+    },
+
     /// ENT-4 — bootstrap THIS box as the mesh's founding lighthouse:
     /// pin the role (if unpinned), mint the CA, self-sign + write the
     /// bundle, and print the first peer's single-use join token.
@@ -2796,6 +2806,36 @@ fn main() -> anyhow::Result<()> {
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 }
             }
+        }
+        Cmd::Leave { yes } => {
+            if !yes {
+                anyhow::bail!(
+                    "leave wipes this box's mesh state (cert, keys, role). \
+                     Re-run with --yes to confirm."
+                );
+            }
+            let root = mackesd_core::default_qnm_shared_root();
+            let hostname = std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "unknown".to_string());
+            let node_id = format!("peer:{hostname}");
+            let report = mackesd_core::leave::leave(
+                &root,
+                &hostname,
+                &node_id,
+                std::path::Path::new("/etc/nebula"),
+                std::path::Path::new("/var/lib/mde/role.toml"),
+            );
+            let _ = std::process::Command::new("systemctl")
+                .args(["stop", "nebula.service"])
+                .status();
+            println!("left the mesh: {report:#?}");
+            println!("re-join later with: mackesd enroll --token <fresh token from a lighthouse>");
+            return Ok(());
         }
         Cmd::MeshInit {
             mesh_id,
