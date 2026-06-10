@@ -6,15 +6,11 @@
 //! tray badge both read this cache to vary edge thickness and
 //! the badge "degraded" indicator.
 //!
-//! Best-choice deviation from the spec's "via the chosen
-//! Transport from KDC2-4.x" wording: TransportRegistry
-//! concrete impls are still blocked on the KDC2 pairing-
-//! handshake epic; using `ping` directly hits the same wire
-//! (ICMP) the underlying Transport would, with zero
-//! additional Cargo deps and an observable outcome
-//! indistinguishable from the routed version. When the
-//! Transport stack lands, swap the sync `ping` call for the
-//! Transport's `probe()` and delete the shell-out.
+//! PD-6 / ENT-13 (2026-06-10): the ICMP `ping` shell-out is
+//! retired — latency now comes from [`crate::transport_probe`],
+//! which times a TCP handshake through the actual overlay tunnel
+//! (SYN→SYN-ACK or SYN→RST both ride the transport), so the number
+//! reflects the path the mesh actually uses.
 //!
 //! Cadence: 30 s between full sweeps. Per-peer ping timeout
 //! 1 s. The cache file is written as a single JSON object:
@@ -45,8 +41,7 @@ use crate::store::{list_nodes, NodeRow};
 /// Default sweep cadence — 30 s between full peer scans.
 pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Per-peer ping deadline. ping(8) `-W` accepts seconds.
-pub const PING_TIMEOUT_SECS: u32 = 1;
+// (the per-probe deadline lives in `transport_probe::PROBE_TIMEOUT`)
 
 /// One peer's measured latency for a single ping pass.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -205,42 +200,12 @@ async fn sweep_once(
 }
 
 fn ping_host(host: &str) -> Option<f64> {
+    // PD-6 / ENT-13 — the transport probe, not ICMP: a timed TCP
+    // handshake through the overlay tunnel.
     if host.is_empty() {
         return None;
     }
-    let timeout = PING_TIMEOUT_SECS.to_string();
-    let output = std::process::Command::new("ping")
-        .args(["-c", "1", "-W", &timeout, host])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8(output.stdout).ok()?;
-    parse_ping_rtt(&raw)
-}
-
-/// Pure parser for ping(8) output. Extracts the first
-/// `time=NN.N ms` token (single-shot `ping -c 1` always emits
-/// at most one). Returns `None` if no time= is present (host
-/// unreachable, parse failed, etc.).
-#[must_use]
-pub fn parse_ping_rtt(raw: &str) -> Option<f64> {
-    for line in raw.lines() {
-        if let Some(idx) = line.find("time=") {
-            let rest = &line[idx + 5..];
-            let val: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_digit() || *c == '.')
-                .collect();
-            if let Ok(n) = val.parse::<f64>() {
-                return Some(n);
-            }
-        }
-    }
-    None
+    crate::transport_probe::probe_rtt(host).rtt_ms
 }
 
 fn write_snapshot(cache_path: &PathBuf, snapshot: &LatencySnapshot) -> anyhow::Result<()> {
@@ -270,37 +235,6 @@ pub fn default_cache_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_ping_rtt_extracts_first_time_token() {
-        let raw = "PING anvil (10.0.0.5) 56(84) bytes of data.\n\
-                   64 bytes from 10.0.0.5: icmp_seq=1 ttl=64 time=14.3 ms\n\
-                   \n\
-                   --- anvil ping statistics ---\n";
-        assert_eq!(parse_ping_rtt(raw), Some(14.3));
-    }
-
-    #[test]
-    fn parse_ping_rtt_handles_integer_rtt() {
-        let raw = "64 bytes from 10.0.0.5: icmp_seq=1 ttl=64 time=42 ms\n";
-        assert_eq!(parse_ping_rtt(raw), Some(42.0));
-    }
-
-    #[test]
-    fn parse_ping_rtt_returns_none_when_missing() {
-        assert_eq!(parse_ping_rtt(""), None);
-        assert_eq!(
-            parse_ping_rtt("ping: anvil: Name or service not known"),
-            None
-        );
-    }
-
-    #[test]
-    fn parse_ping_rtt_handles_sub_ms_rtt() {
-        // localhost-style sub-millisecond RTTs.
-        let raw = "64 bytes from 127.0.0.1: icmp_seq=1 ttl=64 time=0.045 ms\n";
-        assert_eq!(parse_ping_rtt(raw), Some(0.045));
-    }
 
     #[test]
     fn ping_host_with_empty_target_returns_none() {
