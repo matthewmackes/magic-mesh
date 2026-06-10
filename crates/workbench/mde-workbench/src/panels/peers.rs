@@ -1,0 +1,559 @@
+//! PD-3 — the **Peers** directory panel: the platform Front Door.
+//!
+//! Master-detail over `action/mesh/directory` (PD-1): peer list left
+//! — self pinned "(this machine)" first, then Online, Idle, Offline
+//! (grayed) groups — detail pane right with the identity header,
+//! presence + health, version + revision currency, and the Services
+//! Provided inventory (PD-2 descriptors: remote access, Podman
+//! containers, libvirt guests, media). A type-to-filter box matches
+//! hostname or offered service (L2). Degraded mesh states render the
+//! guided empty states (L3): no mackesd → "Start the mesh service",
+//! empty roster → "Invite a peer".
+//!
+//! Per-peer ops (Call/SSH/RDP/VNC, PD-5), tag chips (L1 — tags join
+//! the directory record with the tag-manifest merge), device rows
+//! (L6) and the live map (PD-7) layer onto this surface in their own
+//! tasks. The legacy Mesh Topology panel keeps the graph until PD-7
+//! absorbs it.
+
+use std::time::Duration;
+
+use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
+use iced::{Background, Border, Element, Length, Padding, Task};
+use mde_theme::TypeRole;
+
+/// One row of the directory reply, parsed leniently.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PeerRow {
+    pub hostname: String,
+    pub presence: String,
+    pub health: String,
+    pub version: String,
+    pub overlay_ip: String,
+    pub role: String,
+    pub currency: String,
+    /// Flattened "what this peer offers" lines for the detail pane +
+    /// the service filter (L2).
+    pub services: Vec<String>,
+}
+
+/// Panel state.
+#[derive(Debug, Clone, Default)]
+pub struct PeersPanel {
+    pub rows: Vec<PeerRow>,
+    pub filter: String,
+    pub selected: Option<String>,
+    /// `None` = loading; `Some(Err)` = mackesd unreachable (L3 state).
+    pub loaded: Option<Result<(), String>>,
+    pub self_hostname: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum Message {
+    Loaded(Result<Vec<PeerRow>, String>),
+    FilterChanged(String),
+    Select(String),
+    RefreshClicked,
+}
+
+/// Parse the PD-1 directory JSON into rows (pure, testable).
+#[must_use]
+pub fn parse_directory(raw: &str) -> Result<Vec<PeerRow>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(raw.trim()).map_err(|e| format!("bad directory reply: {e}"))?;
+    if v.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("directory verb replied not-ok")
+            .to_string());
+    }
+    let rows = v
+        .get("peers")
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| {
+                    let hostname = p.get("hostname")?.as_str()?.to_string();
+                    let gs = |k: &str| {
+                        p.get(k)
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    let mut services = Vec::new();
+                    if let Some(d) = p.get("descriptors").filter(|d| !d.is_null()) {
+                        let ra = &d["remote_access"];
+                        for (label, key) in [("SSH", "ssh"), ("RDP", "rdp"), ("VNC", "vnc")] {
+                            if ra.get(key).and_then(serde_json::Value::as_bool) == Some(true) {
+                                services.push(label.to_string());
+                            }
+                        }
+                        for c in d["containers"].as_array().into_iter().flatten() {
+                            services.push(format!(
+                                "podman: {} ({}) {}",
+                                c["name"].as_str().unwrap_or("?"),
+                                c["state"].as_str().unwrap_or("?"),
+                                c["image"].as_str().unwrap_or(""),
+                            ));
+                        }
+                        for vm in d["vms"].as_array().into_iter().flatten() {
+                            let specs = match (vm["vcpus"].as_u64(), vm["memory_mb"].as_u64()) {
+                                (Some(c), Some(m)) => format!(" · {c} vCPU / {m} MiB"),
+                                _ => String::new(),
+                            };
+                            services.push(format!(
+                                "kvm: {} ({}){specs}",
+                                vm["name"].as_str().unwrap_or("?"),
+                                vm["state"].as_str().unwrap_or("?"),
+                            ));
+                        }
+                        for m in d["media"].as_array().into_iter().flatten() {
+                            services.push(format!(
+                                "media: {} :{}",
+                                m["name"].as_str().unwrap_or("?"),
+                                m["port"].as_u64().unwrap_or(0),
+                            ));
+                        }
+                    }
+                    Some(PeerRow {
+                        hostname,
+                        presence: gs("presence"),
+                        health: gs("health"),
+                        version: gs("mde_version"),
+                        overlay_ip: gs("overlay_ip"),
+                        role: gs("role"),
+                        currency: p["revision"]["currency"]
+                            .as_str()
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        services,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(rows)
+}
+
+/// Filter predicate (L2): hostname OR any offered-service line.
+#[must_use]
+pub fn matches_filter(row: &PeerRow, filter: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    let f = filter.to_lowercase();
+    row.hostname.to_lowercase().contains(&f)
+        || row.services.iter().any(|s| s.to_lowercase().contains(&f))
+}
+
+/// Group order for the list (Q4/Q5): self first, then online, idle,
+/// offline. Returns the group label for a row.
+#[must_use]
+pub fn group_of(row: &PeerRow, self_hostname: &str) -> &'static str {
+    if row.hostname == self_hostname {
+        "This machine"
+    } else {
+        match row.presence.as_str() {
+            "online" => "Online",
+            "idle" => "Idle",
+            _ => "Offline",
+        }
+    }
+}
+
+impl PeersPanel {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            self_hostname: detect_hostname(),
+            ..Self::default()
+        }
+    }
+
+    /// Fetch the directory (the Bus client needs its own thread —
+    /// same contract as the home-panel probes).
+    pub fn load() -> Task<crate::Message> {
+        Task::perform(
+            async {
+                tokio::task::spawn_blocking(|| {
+                    crate::dbus::action_request("action/mesh/directory", Duration::from_secs(2))
+                })
+                .await
+                .ok()
+                .flatten()
+                .map_or_else(
+                    || Err("mackesd unreachable (is the mesh service running?)".to_string()),
+                    |raw| parse_directory(&raw),
+                )
+            },
+            |result| crate::Message::Peers(Message::Loaded(result)),
+        )
+    }
+
+    pub fn update(&mut self, msg: Message) -> Task<crate::Message> {
+        match msg {
+            Message::Loaded(result) => {
+                match result {
+                    Ok(rows) => {
+                        self.rows = rows;
+                        self.loaded = Some(Ok(()));
+                        if self.selected.is_none() {
+                            // Default-select self, else the first row.
+                            let self_row = self
+                                .rows
+                                .iter()
+                                .find(|r| r.hostname == self.self_hostname)
+                                .or_else(|| self.rows.first());
+                            self.selected = self_row.map(|r| r.hostname.clone());
+                        }
+                    }
+                    Err(e) => self.loaded = Some(Err(e)),
+                }
+                Task::none()
+            }
+            Message::FilterChanged(f) => {
+                self.filter = f;
+                Task::none()
+            }
+            Message::Select(host) => {
+                self.selected = Some(host);
+                Task::none()
+            }
+            Message::RefreshClicked => Self::load(),
+        }
+    }
+
+    pub fn view(&self) -> Element<'_, crate::Message> {
+        let palette = crate::live_theme::palette();
+        let sizes = mde_theme::FontSize::defaults();
+        let title = text("Peers")
+            .size(TypeRole::Display.size_in(sizes))
+            .color(palette.text.into_iced_color());
+
+        // L3 — guided empty states.
+        match &self.loaded {
+            None => {
+                return shell(title, text("Loading the mesh directory…").into(), palette);
+            }
+            Some(Err(e)) => {
+                let body = column![
+                    text("The mesh service isn't answering.")
+                        .size(16)
+                        .color(palette.text.into_iced_color()),
+                    text(e.clone())
+                        .size(12)
+                        .color(palette.text_muted.into_iced_color()),
+                    text("Start it from Network → Mesh Services, then refresh.")
+                        .size(13)
+                        .color(palette.text_muted.into_iced_color()),
+                    refresh_btn(palette),
+                ]
+                .spacing(8);
+                return shell(title, body.into(), palette);
+            }
+            Some(Ok(())) if self.rows.is_empty() => {
+                let body = column![
+                    text("No peers in this mesh yet.")
+                        .size(16)
+                        .color(palette.text.into_iced_color()),
+                    text("Invite a peer: mint a join token with `mackesd enroll-token` and run `mackesd enroll --token …` on the new box.")
+                        .size(13)
+                        .color(palette.text_muted.into_iced_color()),
+                    refresh_btn(palette),
+                ]
+                .spacing(8);
+                return shell(title, body.into(), palette);
+            }
+            Some(Ok(())) => {}
+        }
+
+        // Left: filter + grouped list.
+        let filter_box = text_input("Filter peers or services…", &self.filter)
+            .on_input(|f| crate::Message::Peers(Message::FilterChanged(f)))
+            .padding(Padding::from([6u16, 10u16]))
+            .width(Length::Fill);
+        let mut list = column![].spacing(4);
+        for group in ["This machine", "Online", "Idle", "Offline"] {
+            let members: Vec<&PeerRow> = self
+                .rows
+                .iter()
+                .filter(|r| group_of(r, &self.self_hostname) == group)
+                .filter(|r| matches_filter(r, &self.filter))
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            list = list.push(
+                text(group)
+                    .size(11)
+                    .color(palette.text_muted.into_iced_color()),
+            );
+            for r in members {
+                let selected = self.selected.as_deref() == Some(r.hostname.as_str());
+                let dimmed = group == "Offline";
+                let label = format!("{} {}", presence_pip(&r.presence), r.hostname);
+                let fg = if dimmed {
+                    palette.text_muted
+                } else {
+                    palette.text
+                };
+                let bg = if selected {
+                    palette.raised
+                } else {
+                    palette.surface
+                };
+                list = list.push(
+                    button(text(label).size(13).color(fg.into_iced_color()))
+                        .width(Length::Fill)
+                        .padding(Padding::from([6u16, 10u16]))
+                        .style(move |_t, _s| iced::widget::button::Style {
+                            snap: false,
+                            background: Some(Background::Color(bg.into_iced_color())),
+                            text_color: fg.into_iced_color(),
+                            border: Border {
+                                color: iced::Color::TRANSPARENT,
+                                width: 0.0,
+                                radius: 4.0.into(),
+                            },
+                            shadow: iced::Shadow::default(),
+                        })
+                        .on_press(crate::Message::Peers(Message::Select(r.hostname.clone()))),
+                );
+            }
+        }
+        let left = column![filter_box, scrollable(list).height(Length::Fill)]
+            .spacing(8)
+            .width(Length::Fixed(240.0));
+
+        // Right: the detail pane.
+        let detail: Element<'_, crate::Message> = match self
+            .rows
+            .iter()
+            .find(|r| Some(r.hostname.as_str()) == self.selected.as_deref())
+        {
+            None => text("Select a peer.")
+                .color(palette.text_muted.into_iced_color())
+                .into(),
+            Some(r) => {
+                let header = row![
+                    text(&r.hostname)
+                        .size(20)
+                        .color(palette.text.into_iced_color()),
+                    Space::new().width(Length::Fixed(10.0)),
+                    badge(
+                        if r.role.is_empty() {
+                            "role: -"
+                        } else {
+                            &r.role
+                        },
+                        palette
+                    ),
+                    Space::new().width(Length::Fill),
+                    refresh_btn(palette),
+                ]
+                .align_y(iced::alignment::Vertical::Center);
+                let facts = column![
+                    fact("Presence", &r.presence, palette),
+                    fact("Health", &r.health, palette),
+                    fact(
+                        "Overlay IP",
+                        if r.overlay_ip.is_empty() {
+                            "-"
+                        } else {
+                            &r.overlay_ip
+                        },
+                        palette
+                    ),
+                    fact(
+                        "Version",
+                        if r.version.is_empty() {
+                            "-"
+                        } else {
+                            &r.version
+                        },
+                        palette
+                    ),
+                    fact("Revision", &r.currency, palette),
+                ]
+                .spacing(4);
+                let mut services = column![text("Services provided")
+                    .size(13)
+                    .color(palette.text.into_iced_color())]
+                .spacing(4);
+                if r.services.is_empty() {
+                    services = services.push(
+                        text("Nothing published (peer pre-PD-2, or nothing offered).")
+                            .size(12)
+                            .color(palette.text_muted.into_iced_color()),
+                    );
+                } else {
+                    for s in &r.services {
+                        services = services.push(
+                            text(format!("• {s}"))
+                                .size(12)
+                                .color(palette.text_muted.into_iced_color()),
+                        );
+                    }
+                }
+                column![header, facts, services].spacing(16).into()
+            }
+        };
+        let right = container(scrollable(detail))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(Padding::from([0u16, 16u16]));
+
+        let body = row![left, right].spacing(16).height(Length::Fill);
+        shell(title, body.into(), palette)
+    }
+}
+
+fn shell<'a>(
+    title: iced::widget::Text<'a, iced::Theme>,
+    body: Element<'a, crate::Message>,
+    _palette: mde_theme::Palette,
+) -> Element<'a, crate::Message> {
+    container(column![title, Space::new().height(Length::Fixed(14.0)), body].spacing(2))
+        .padding(Padding::from([24u16, 32u16]))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+fn fact<'a>(
+    label: &'a str,
+    value: &'a str,
+    palette: mde_theme::Palette,
+) -> Element<'a, crate::Message> {
+    row![
+        text(label)
+            .size(12)
+            .width(Length::Fixed(100.0))
+            .color(palette.text_muted.into_iced_color()),
+        text(value).size(12).color(palette.text.into_iced_color()),
+    ]
+    .into()
+}
+
+fn badge<'a>(label: &'a str, palette: mde_theme::Palette) -> Element<'a, crate::Message> {
+    container(text(label).size(11).color(palette.text.into_iced_color()))
+        .padding(Padding::from([2u16, 8u16]))
+        .style(move |_| container::Style {
+            snap: false,
+            background: Some(Background::Color(palette.raised.into_iced_color())),
+            border: Border {
+                color: palette.border.into_iced_color(),
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+fn refresh_btn(palette: mde_theme::Palette) -> Element<'static, crate::Message> {
+    crate::controls::variant_button(
+        "Refresh",
+        crate::controls::ButtonVariant::Secondary,
+        Some(crate::Message::Peers(Message::RefreshClicked)),
+        palette,
+    )
+}
+
+fn presence_pip(presence: &str) -> &'static str {
+    match presence {
+        "online" => "●",
+        "idle" => "◐",
+        _ => "○",
+    }
+}
+
+fn detect_hostname() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REPLY: &str = r#"{"ok":true,"head":2,"peers":[
+        {"hostname":"pine","presence":"online","health":"healthy","mde_version":"4.2.1",
+         "overlay_ip":"10.42.0.2","role":"host","revision":{"currency":"synced"},
+         "descriptors":{"remote_access":{"ssh":true,"rdp":false,"vnc":false},
+            "containers":[{"name":"nginx","image":"nginx:latest","state":"running","ports":["8080->80/tcp"]}],
+            "vms":[{"name":"win11","state":"running","vcpus":4,"memory_mb":8192,"addresses":["192.168.122.5"]}],
+            "media":[{"name":"mpd","port":6600}],
+            "alarms":{"tier":"healthy","worst":null}}},
+        {"hostname":"oak","presence":"offline","health":"unknown","mde_version":null,
+         "overlay_ip":null,"role":null,"revision":{"currency":"unknown"},"descriptors":null}
+    ]}"#;
+
+    #[test]
+    fn parse_directory_reads_rows_and_services() {
+        let rows = parse_directory(REPLY).unwrap();
+        assert_eq!(rows.len(), 2);
+        let pine = &rows[0];
+        assert_eq!(pine.presence, "online");
+        assert_eq!(pine.currency, "synced");
+        assert!(pine.services.contains(&"SSH".to_string()));
+        assert!(pine.services.iter().any(|s| s.contains("podman: nginx")));
+        assert!(pine
+            .services
+            .iter()
+            .any(|s| s.contains("kvm: win11") && s.contains("4 vCPU / 8192 MiB")));
+        assert!(pine.services.iter().any(|s| s.contains("media: mpd :6600")));
+        // Descriptor-less peer degrades honestly.
+        assert!(rows[1].services.is_empty());
+    }
+
+    #[test]
+    fn parse_directory_surfaces_errors() {
+        assert!(parse_directory("not json").is_err());
+        assert!(parse_directory(r#"{"ok":false,"error":"nope"}"#).is_err());
+    }
+
+    #[test]
+    fn filter_matches_hostname_or_service() {
+        let rows = parse_directory(REPLY).unwrap();
+        assert!(matches_filter(&rows[0], ""));
+        assert!(matches_filter(&rows[0], "pine"));
+        assert!(matches_filter(&rows[0], "podman"));
+        assert!(matches_filter(&rows[0], "WIN11"));
+        assert!(!matches_filter(&rows[1], "podman"));
+    }
+
+    #[test]
+    fn grouping_pins_self_then_presence() {
+        let rows = parse_directory(REPLY).unwrap();
+        assert_eq!(group_of(&rows[0], "pine"), "This machine");
+        assert_eq!(group_of(&rows[0], "elsewhere"), "Online");
+        assert_eq!(group_of(&rows[1], "elsewhere"), "Offline");
+    }
+
+    #[test]
+    fn select_and_filter_reduce_through_update() {
+        let mut p = PeersPanel::new();
+        let rows = parse_directory(REPLY).unwrap();
+        let _ = p.update(Message::Loaded(Ok(rows)));
+        assert!(p.loaded == Some(Ok(())));
+        assert!(p.selected.is_some(), "something selected by default");
+        let _ = p.update(Message::Select("oak".into()));
+        assert_eq!(p.selected.as_deref(), Some("oak"));
+        let _ = p.update(Message::FilterChanged("podman".into()));
+        assert_eq!(p.filter, "podman");
+    }
+
+    #[test]
+    fn unreachable_mackesd_is_the_l3_state() {
+        let mut p = PeersPanel::new();
+        let _ = p.update(Message::Loaded(Err("mackesd unreachable".into())));
+        assert!(matches!(&p.loaded, Some(Err(e)) if e.contains("unreachable")));
+        let _ = p.view(); // renders the guided state without panic
+    }
+}

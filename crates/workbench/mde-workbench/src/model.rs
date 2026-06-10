@@ -282,7 +282,8 @@ pub fn nav_model() -> Vec<NavEntry> {
                 Panel::new("mesh_pending", "Mesh Pending"),
                 Panel::new("mesh_history", "Mesh History"),
                 Panel::new("mesh_join", "Mesh Join"),
-                Panel::new("mesh_topology", "Mesh Topology"),
+                Panel::new("peers", "Peers"),
+                Panel::new("mesh_topology", "Mesh Map"),
                 Panel::new("mesh_services", "Mesh Services"),
                 // MESHFS-13.1 (v5.0.0) — Mesh Storage panel (per-peer
                 // chunkserver status). Already wired in app.rs's panel

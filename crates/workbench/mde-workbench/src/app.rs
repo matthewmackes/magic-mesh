@@ -30,8 +30,8 @@ use crate::panels::{
     mesh_services as mesh_services_panel, mesh_storage as mesh_storage_panel,
     mesh_topology as mesh_topology_panel, mouse as mouse_panel, music as music_panel,
     network_hosts as network_hosts_panel, notifications as notifications_panel,
-    panel_apps as panel_apps_panel, playbooks as playbooks_panel, power as power_panel,
-    printers as printers_panel, remote_desktop as remote_desktop_panel,
+    panel_apps as panel_apps_panel, peers as peers_panel, playbooks as playbooks_panel,
+    power as power_panel, printers as printers_panel, remote_desktop as remote_desktop_panel,
     removable as removable_panel, repair as repair_panel, resources as resources_panel,
     run_history as run_history_panel, service_publishing as service_publishing_panel,
     session as session_panel, snapshots as snapshots_panel, sound as sound_panel,
@@ -188,6 +188,8 @@ pub enum Message {
     MeshTopology(mesh_topology_panel::Message),
     PanelApps(panel_apps_panel::Message),
     RemoteDesktop(remote_desktop_panel::Message),
+    /// PD-3 — the Peers directory (Front Door) sub-message.
+    Peers(peers_panel::Message),
     SyncStatus(sync_status_panel::Message),
     /// CB-1.8 partial — Network → Firewall panel sub-message.
     Firewall(firewall_panel::Message),
@@ -276,6 +278,7 @@ pub struct App {
     mesh_topology: mesh_topology_panel::MeshTopologyPanel,
     panel_apps: panel_apps_panel::PanelAppsPanel,
     remote_desktop: remote_desktop_panel::RemoteDesktopPanel,
+    peers: peers_panel::PeersPanel,
     sync_status: sync_status_panel::SyncStatusPanel,
     firewall: firewall_panel::FirewallPanel,
     wifi: wifi_panel::WifiPanel,
@@ -376,6 +379,7 @@ impl App {
             mesh_topology: mesh_topology_panel::MeshTopologyPanel::new(),
             panel_apps: panel_apps_panel::PanelAppsPanel::new(),
             remote_desktop: remote_desktop_panel::RemoteDesktopPanel::new(),
+            peers: peers_panel::PeersPanel::new(),
             sync_status: sync_status_panel::SyncStatusPanel::new(),
             firewall: firewall_panel::FirewallPanel::new(),
             wifi: wifi_panel::WifiPanel::new(),
@@ -792,6 +796,7 @@ impl App {
             Message::MeshTopology(msg) => self.mesh_topology.update(msg),
             Message::PanelApps(msg) => self.panel_apps.update(msg),
             Message::RemoteDesktop(msg) => self.remote_desktop.update(msg),
+            Message::Peers(msg) => self.peers.update(msg),
             Message::SyncStatus(msg) => self.sync_status.update(msg),
             Message::Firewall(msg) => self.firewall.update(msg),
             Message::Wifi(msg) => self.wifi.update(msg),
@@ -886,6 +891,7 @@ impl App {
             // v4.0.1 WB-2.l — load cached peer-macs.json on
             // first nav so the known-hosts table is populated.
             (Group::Network, "remote_desktop") => remote_desktop_panel::RemoteDesktopPanel::load(),
+            (Group::Network, "peers") => peers_panel::PeersPanel::load(),
             (Group::Apps, "installed") => apps_installed_panel::AppsInstalledPanel::load(),
             (Group::Apps, "sources") => apps_sources_panel::AppsSourcesPanel::load(),
             (Group::Network, "firewall") => firewall_panel::FirewallPanel::load(),
@@ -1257,6 +1263,11 @@ impl App {
                 group: Group::Network,
                 panel: "remote_desktop",
             } => self.remote_desktop.view(),
+            // PD-3 — the Peers directory (the Front Door).
+            View::Panel {
+                group: Group::Network,
+                panel: "peers",
+            } => self.peers.view(),
             View::Panel {
                 group: Group::Network,
                 panel: "firewall",

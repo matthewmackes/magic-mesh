@@ -164,15 +164,14 @@ mod tests {
 
     #[test]
     fn page_subtitle_counts_panels_for_group_view() {
-        // 15 panels in Network: wifi, mesh_control, mesh_pending,
-        // mesh_history, mesh_join, mesh_topology, mesh_services,
-        // mesh_bus (8 mesh/net panels — mesh_ssh retired into
-        // Remote Access, SVC-1/B1) + service_publishing (NF-13.8)
-        // + vpn + firewall + remote_desktop (Remote Access)
-        // + mesh_federation (TUNE-15.b) + network_hosts
-        // (MESH-PROBE-9.a) + mesh_storage (MESHFS-13.1).
+        // 16 panels in Network: peers (PD-3, the Front Door), wifi,
+        // mesh_control, mesh_pending, mesh_history, mesh_join,
+        // mesh_topology (Mesh Map until PD-7 absorbs it),
+        // mesh_services, mesh_bus + service_publishing + vpn +
+        // firewall + remote_desktop (Remote Access) + mesh_federation
+        // + network_hosts + mesh_storage.
         // See `crates/mde-workbench/src/model.rs` for the lock.
-        assert_eq!(page_subtitle(View::Group(Group::Network)), "15 panels");
+        assert_eq!(page_subtitle(View::Group(Group::Network)), "16 panels");
     }
 
     #[test]

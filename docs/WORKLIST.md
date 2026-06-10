@@ -169,7 +169,7 @@ host-local Ansible apply.
     - [ ] a WARNING alarm flips health to degraded; a CRITICAL to critical, with the alarm named (L15)
     - [ ] the port-scan touches localhost only; the scan list is a pinned constant, never user input
     - [ ] no network probe leaves the publishing host
-- [ ] **PD-3: PEERS — the master-detail Peers panel (mesh_topology evolves)**
+- [>] **PD-3: PEERS — the master-detail Peers panel** — CORE LANDED (peers.rs: master-detail over the directory verb, self/online/idle/offline groups, L2 filter by host/service, L3 guided empty states, Services Provided pane, nav 'Peers' + 'Mesh Map'); REMAINING: tag chips (L1), Devices group (L6), 30s poll + Bus subscription (Q10), CR-6.c modal retirement (moves with PD-7's graph rebuild)
   **As** an operator,
   **I want** the topology panel reborn as "Peers": list left (self pinned "(this machine)" → Online → Offline grayed → Devices group from `action/connect/devices`) with hostname + colored tag chips (L1) and a type-to-filter box matching hostname/tag/service (L2); detail pane right (identity header + role badge, two presence fields, version + sync currency, drift count + last event → pre-filtered Drift panel link, Services Provided section, inline result strip); Bus-subscription refresh + 30 s poll floor; guided empty states when the mesh isn't fully running (unenrolled → "Join a mesh", mackesd down → one-click "Start the mesh service", no peers → "Invite a peer", L3); device rows carry presence+battery, Ring, Send-file, and a jump to the KDC hub card (L6),
   **so that** the whole fleet and everything it offers is one surface (Q1–7, Q10–12, Q15, Q20–22, D1, L1–L3, L6).
