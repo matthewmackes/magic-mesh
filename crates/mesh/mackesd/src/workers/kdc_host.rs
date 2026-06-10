@@ -357,15 +357,78 @@ async fn run_host(pairing: Arc<PairingStore>, roster: Roster) {
             return;
         }
     };
-    let transport = LanTransport::new(announce, discovery, pairing).with_listen_addr(bind);
+    let transport =
+        LanTransport::new(announce, discovery, Arc::clone(&pairing)).with_listen_addr(bind);
     let (sink, mut stream) = EventStream::channel();
     if let Err(e) = transport.start(sink).await {
         warn!(error = %e, "kdc-host: transport start failed; serving static roster");
         return;
     }
-    while let Some(ev) = stream.recv().await {
+    // SEC-5 — the mesh-shunt: publish this peer's paired phones to the
+    // replicated volume + relay neighbors' phones into the roster, so a
+    // phone paired on another peer shows up here (and is outbound-
+    // pairable) without a direct LAN broadcast.
+    let shunt_root = crate::default_qnm_shared_root();
+    let shunt_host = hostname_for_shunt();
+    let shunt_registry = std::sync::Mutex::new(mde_kdc_proto::discovery::DiscoveryRegistry::new());
+    let mut shunt_tick = tokio::time::interval(super::mesh_shunt::TICK);
+    loop {
+        tokio::select! {
+            ev = stream.recv() => {
+                let Some(ev) = ev else { break };
+                if let Ok(mut m) = roster.lock() {
+                    apply_event(&mut m, ev);
+                }
+            }
+            _ = shunt_tick.tick() => {
+                run_shunt_tick(&pairing, &roster, &shunt_root, &shunt_host, &shunt_registry);
+            }
+        }
+    }
+}
+
+/// This peer's hostname for the shunt's published filename.
+fn hostname_for_shunt() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// One mesh-shunt pass (SEC-5): publish our paired devices, relay
+/// neighbors' into the discovery registry, then fold every fresh
+/// relayed announce into the roster as a discovered peer.
+fn run_shunt_tick(
+    pairing: &Arc<PairingStore>,
+    roster: &Roster,
+    root: &std::path::Path,
+    hostname: &str,
+    registry: &std::sync::Mutex<mde_kdc_proto::discovery::DiscoveryRegistry>,
+) {
+    let mine: Vec<super::mesh_shunt::PublishedDevice> = pairing
+        .records()
+        .iter()
+        .map(|r| super::mesh_shunt::PublishedDevice {
+            device_id: r.device_id.clone(),
+            device_name: r.device_name.clone(),
+        })
+        .collect();
+    if let Err(e) = super::mesh_shunt::publish_phones(root, hostname, &mine) {
+        warn!(error = %e, "kdc-host: mesh-shunt publish failed");
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    let synthetic = super::mesh_shunt::collect_synthetic(root, hostname, now);
+    super::mesh_shunt::inject_fresh(registry, synthetic, now);
+    if let Ok(reg) = registry.lock() {
         if let Ok(mut m) = roster.lock() {
-            apply_event(&mut m, ev);
+            for a in reg.take_fresh(now) {
+                apply_event(&mut m, HostEvent::PeerDiscovered(a));
+            }
         }
     }
 }

@@ -264,6 +264,8 @@ pub mod ssh_pubkey_gossip;
 pub mod fleet_reconcile;
 // PD-13 — presence-transition alerts riding the alert_relay pipeline.
 pub mod presence_watch;
+// SEC-5 / KDC2-4 — relays neighbors' paired phones mesh-wide.
+pub mod mesh_shunt;
 // PD-11 — executes descriptor-gated container/VM lifecycle requests.
 pub mod lifecycle_exec;
 // NF-21.3 — owns the firewalld preset that opens Nebula's
