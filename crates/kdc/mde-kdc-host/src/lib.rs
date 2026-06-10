@@ -29,6 +29,7 @@
 pub mod discovery;
 pub mod error;
 pub mod event;
+pub mod first_pair;
 pub mod keygen;
 pub mod lan;
 pub mod pairing;

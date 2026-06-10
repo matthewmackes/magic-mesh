@@ -51,11 +51,12 @@ use super::{ShutdownToken, Worker};
 /// the retired `dev.mackes.MDE.Connect` D-Bus surface). `version`/`list`/
 /// `get` read the store; `pair`/`unpair` mutate it; `ring`/`sms`/
 /// `clipboard` enqueue a `Packet` onto the outbound queue.
-const CONNECT_VERBS: [&str; 8] = [
+const CONNECT_VERBS: [&str; 9] = [
     "version",
     "list",
     "get",
     "pair",
+    "pair-device",
     "unpair",
     "ring",
     "sms",
@@ -417,6 +418,47 @@ fn handle_connect_verb(
             match store.pair(record) {
                 Ok(()) => json!({ "ok": true }),
                 Err(e) => json!({ "ok": false, "error": format!("PersistFailed: {e}") }),
+            }
+        }
+        // SEC-4 — the operator-initiated OUTBOUND first pair: dial the
+        // device's TLS port, capture the fingerprint it actually
+        // presents, persist the sealed session + the pin. The body
+        // carries {id, name, addr} (addr from the discovery roster).
+        "pair-device" => 'pd: {
+            let (Some(id), Some(addr)) = (
+                body.get("id").and_then(Value::as_str).map(str::to_string),
+                body.get("addr").and_then(Value::as_str).map(str::to_string),
+            ) else {
+                break 'pd json!({ "ok": false, "error": "pair-device: need id + addr" });
+            };
+            let name = body
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(&id)
+                .to_string();
+            let Ok(sock_addr) = addr.parse() else {
+                break 'pd json!({ "ok": false, "error": format!("pair-device: bad addr {addr}") });
+            };
+            // The responder is a sync poller thread — spin a
+            // current-thread runtime for the async dial (the same
+            // bridge pattern the Bus clients use).
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("runtime: {e}"))
+                .and_then(|rt| {
+                    rt.block_on(mde_kdc_host::first_pair::first_pair(
+                        store, &id, &name, sock_addr,
+                    ))
+                    .map_err(|e| e.to_string())
+                });
+            match result {
+                Ok(outcome) => json!({
+                    "ok": true,
+                    "device_id": outcome.device_id,
+                    "fingerprint": outcome.fingerprint,
+                }),
+                Err(e) => json!({ "ok": false, "error": e }),
             }
         }
         "unpair" => match dev_id() {

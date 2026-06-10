@@ -39,6 +39,11 @@ pub enum HostError {
     #[error("keygen: {0}")]
     Keygen(String),
 
+    /// SEC-4 — the outbound first-pair flow failed (dial, TLS, no
+    /// presented cert, or a refused re-TOFU).
+    #[error("pairing: {0}")]
+    Pairing(String),
+
     /// No config directory could be resolved — neither `$XDG_CONFIG_HOME` nor
     /// `$HOME` is set.
     #[error("no config directory ($XDG_CONFIG_HOME / $HOME unset)")]
