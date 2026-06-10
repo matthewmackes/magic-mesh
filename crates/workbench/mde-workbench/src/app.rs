@@ -37,7 +37,7 @@ use crate::panels::{
     playbooks as playbooks_panel, policy as policy_panel, power as power_panel,
     printers as printers_panel, registration as registration_panel,
     remote_desktop as remote_desktop_panel, removable as removable_panel, repair as repair_panel,
-    resources as resources_panel, run_history as run_history_panel,
+    resources as resources_panel, routing as routing_panel, run_history as run_history_panel,
     service_publishing as service_publishing_panel, session as session_panel,
     snapshots as snapshots_panel, sound as sound_panel, sync_status as sync_status_panel,
     system_update as system_update_panel, themes as themes_panel, vpn as vpn_panel,
@@ -199,6 +199,7 @@ pub enum Message {
     Policy(policy_panel::Message),
     Interfaces(interfaces_panel::Message),
     Dns(dns_panel::Message),
+    Routing(routing_panel::Message),
     /// BUS-7.2 — Network → Mackes Bus panel sub-message.
     MeshBus(mesh_bus_panel::Message),
     /// TUNE-15.b — Network → Mesh Federation panel sub-message.
@@ -302,6 +303,7 @@ pub struct App {
     policy: policy_panel::PolicyPanel,
     interfaces: interfaces_panel::InterfacesPanel,
     dns: dns_panel::DnsPanel,
+    routing: routing_panel::RoutingPanel,
     mesh_bus: mesh_bus_panel::MeshBusPanel,
     mesh_federation: mesh_federation_panel::MeshFederationPanel,
     mesh_control: mesh_control_panel::MeshControlPanel,
@@ -418,6 +420,7 @@ impl App {
             policy: policy_panel::PolicyPanel::new(),
             interfaces: interfaces_panel::InterfacesPanel::new(),
             dns: dns_panel::DnsPanel::new(),
+            routing: routing_panel::RoutingPanel::new(),
             mesh_bus: mesh_bus_panel::MeshBusPanel::new(),
             mesh_federation: mesh_federation_panel::MeshFederationPanel::new(),
             mesh_control: mesh_control_panel::MeshControlPanel::new(),
@@ -889,6 +892,7 @@ impl App {
             Message::Policy(msg) => self.policy.update(msg),
             Message::Interfaces(msg) => self.interfaces.update(msg),
             Message::Dns(msg) => self.dns.update(msg),
+            Message::Routing(msg) => self.routing.update(msg),
             Message::MeshBus(msg) => self.mesh_bus.update(msg),
             Message::MeshFederation(msg) => self.mesh_federation.update(msg),
             Message::MeshControl(msg) => self.mesh_control.update(msg),
@@ -982,6 +986,8 @@ impl App {
             (Group::Network, "interfaces") => interfaces_panel::InterfacesPanel::load(),
             // PLANES-18 — the mesh DNS record set.
             (Group::Network, "dns") => dns_panel::DnsPanel::load(),
+            // PLANES-19 — the overlay-reachability validation verdict.
+            (Group::Network, "routing") => routing_panel::RoutingPanel::load(),
             (Group::Controller, "audit") => audit_panel::AuditPanel::load(),
             (Group::ThisNode, "mesh_logs") => mesh_logs_panel::MeshLogsPanel::load(),
             (Group::Controller, "fleet_logs") => fleet_logs_panel::FleetLogsPanel::load(),
@@ -1383,6 +1389,11 @@ impl App {
                 group: Group::Network,
                 panel: "dns",
             } => self.dns.view(),
+            // PLANES-19 — the overlay-reachability validation verdict.
+            View::Panel {
+                group: Group::Network,
+                panel: "routing",
+            } => self.routing.view(),
             // BUS-7.2 — Mackes Bus 5-tab operator surface.
             View::Panel {
                 group: Group::Network,
@@ -1533,7 +1544,6 @@ impl App {
 /// follow-up.
 fn panel_worklist_item(group: Group, panel: &str) -> Option<&'static str> {
     match (group, panel) {
-        (Group::Network, "routing") => Some("PLANES-19 (validation suite)"),
         (Group::Fleet, "tags") => Some("W82 (capability tags)"),
         (Group::Provisioning, "profiles") => Some("PLANES-21 (install profiles)"),
         (Group::Provisioning, "images") => Some("PLANES-22 (images)"),
@@ -1610,7 +1620,6 @@ mod tests {
         // the worklist item building it, so the console never reads as
         // vaporware.
         for (g, p) in [
-            (Group::Network, "routing"),
             (Group::Fleet, "tags"),
             (Group::Provisioning, "profiles"),
             (Group::Provisioning, "images"),

@@ -680,6 +680,15 @@ enum Cmd {
         cmd: DnsCmd,
     },
 
+    /// PLANES-19 — the overlay-reachability validation surface. `mded
+    /// validate status --json` reports the newest run's directed-edge
+    /// verdict (W79/W80); `mded validate run` requests a fresh run (the
+    /// leader mints it). The Network ▸ Routing panel consumes the JSON.
+    Validate {
+        #[command(subcommand)]
+        cmd: ValidateCmd,
+    },
+
     /// CB-1.5.a — fleet node roster. `mded nodes list --json` emits
     /// every row from the `nodes` table as a JSON array; the Iced
     /// inventory panel (in `crates/mde-workbench/src/panels/
@@ -1243,6 +1252,21 @@ enum DnsCmd {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// Subcommands for `mackesd validate`. PLANES-19 (W79/W80).
+#[derive(Subcommand)]
+enum ValidateCmd {
+    /// Report the newest validation run's directed-edge reachability
+    /// verdict. `--json` emits the object the Routing panel consumes.
+    Status {
+        /// Emit the JSON object instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Request a fresh overlay-reachability run (drops a `runnow`
+    /// marker; the FPG leader mints the run).
+    Run,
 }
 
 /// Subcommands for `mackesd netstate`. PLANES-15 (W65–W68).
@@ -3706,6 +3730,69 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             return Ok(());
+        }
+        Cmd::Validate { cmd } => {
+            // PLANES-19 — the overlay-reachability verdict (W79/W80).
+            use magic_fleet::validation;
+            let root = mackesd_core::default_qnm_shared_root();
+            match cmd {
+                ValidateCmd::Run => {
+                    let vdir = root.join("validation");
+                    std::fs::create_dir_all(&vdir)?;
+                    std::fs::write(vdir.join("runnow"), b"mackesd")?;
+                    println!("requested a fresh overlay-reachability run (the leader mints it)");
+                    return Ok(());
+                }
+                ValidateCmd::Status { json } => {
+                    let latest = validation::list_run_ids(&root).into_iter().next_back();
+                    let Some(id) = latest else {
+                        if json {
+                            println!("{}", serde_json::json!({ "run_id": null }));
+                        } else {
+                            println!("no validation run yet (mded validate run to request one)");
+                        }
+                        return Ok(());
+                    };
+                    let Some(run) = validation::read_run(&root, &id) else {
+                        anyhow::bail!("run {id} has no run.json");
+                    };
+                    let rows = validation::read_rows(&root, &id);
+                    let verdict = validation::aggregate(&run, &rows);
+                    let edge =
+                        |e: &validation::Edge| serde_json::json!({ "from": e.from, "to": e.to });
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "run_id": run.run_id,
+                                "kind": run.kind,
+                                "at": run.at,
+                                "passed": verdict.passed(),
+                                "reachable": verdict.reachable.iter().map(edge).collect::<Vec<_>>(),
+                                "failed": verdict.failed.iter().map(edge).collect::<Vec<_>>(),
+                                "missing_reporters": verdict.missing_reporters,
+                            })
+                        );
+                    } else {
+                        println!(
+                            "run {} ({:?}) — {}",
+                            run.run_id,
+                            run.kind,
+                            if verdict.passed() { "PASS" } else { "FAIL" }
+                        );
+                        println!(
+                            "  reachable edges: {}  failed: {}  missing reporters: {}",
+                            verdict.reachable.len(),
+                            verdict.failed.len(),
+                            verdict.missing_reporters.len()
+                        );
+                        for e in &verdict.failed {
+                            println!("  FAIL  {} → {}", e.from, e.to);
+                        }
+                    }
+                    return Ok(());
+                }
+            }
         }
         Cmd::Nodes { cmd } => {
             // CB-1.5.a — fleet node roster surface. The Iced

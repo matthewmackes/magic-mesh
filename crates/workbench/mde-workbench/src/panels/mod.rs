@@ -64,6 +64,7 @@ pub mod remote_desktop;
 pub mod removable;
 pub mod repair;
 pub mod resources;
+pub mod routing;
 pub mod run_history;
 pub mod service_publishing;
 pub mod session;
