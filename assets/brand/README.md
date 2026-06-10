@@ -5,12 +5,15 @@ Environment shell loads at runtime. Every file in this pack is
 **designed to be replaced** — drop in your own SVG/PNG with the
 same basename and the running MDE picks it up.
 
-> **Current state (2026-05-21):** 7 PNGs imported from
-> ChatGPT-generated source art. The original AI outputs are
-> archived in `raw/`; the previous placeholder SVGs are archived
-> in `baked/` (and still serve as the `include_bytes!` ultimate
-> fallback). Replace any `<basename>.png` here with a hand-traced
-> `<basename>.svg` to upgrade that slot to vector + tintable.
+> **Current state (2026-06-09):** all 7 slots re-cut from the
+> operator-supplied **MCNF** master (fedora-penguin mesh emblem,
+> navy `srgb(18,37,67)` ground) — archived as
+> `raw/mcnf-master-2026-06-09.png`. The hicolor app-icon set
+> (16–512 px) lives in `../icons/hicolor/<size>/apps/magic-mesh.png`
+> plus `favicon.ico` here. The previous placeholder SVGs remain in
+> `baked/` as the `include_bytes!` ultimate fallback. Replace any
+> `<basename>.png` with a hand-traced `<basename>.svg` to upgrade
+> that slot to vector + tintable.
 
 ---
 

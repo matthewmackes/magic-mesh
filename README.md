@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/brand/logo-lockup.png" alt="MCNF — Mackes Cosmic Nebula Fedora, Network Mesh Platform" width="340">
+</p>
+
 # Magic Mesh
 
 **A secure, no-fixed-center workgroup mesh — and its native-Rust Carbon GUIs —
