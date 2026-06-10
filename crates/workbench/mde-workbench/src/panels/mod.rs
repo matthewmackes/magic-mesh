@@ -54,6 +54,7 @@ pub mod peers;
 /// PD-7 — the live mesh map (the Peers panel's Map view).
 pub mod peers_map;
 pub mod playbooks;
+pub mod policy;
 pub mod power;
 pub mod printers;
 pub mod registration;

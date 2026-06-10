@@ -33,13 +33,14 @@ use crate::panels::{
     mesh_topology as mesh_topology_panel, mouse as mouse_panel, music as music_panel,
     network_hosts as network_hosts_panel, node_roles as node_roles_panel,
     notifications as notifications_panel, panel_apps as panel_apps_panel, peers as peers_panel,
-    playbooks as playbooks_panel, power as power_panel, printers as printers_panel,
-    registration as registration_panel, remote_desktop as remote_desktop_panel,
-    removable as removable_panel, repair as repair_panel, resources as resources_panel,
-    run_history as run_history_panel, service_publishing as service_publishing_panel,
-    session as session_panel, snapshots as snapshots_panel, sound as sound_panel,
-    sync_status as sync_status_panel, system_update as system_update_panel, themes as themes_panel,
-    vpn as vpn_panel, wallpaper as wallpaper_panel, wifi as wifi_panel,
+    playbooks as playbooks_panel, policy as policy_panel, power as power_panel,
+    printers as printers_panel, registration as registration_panel,
+    remote_desktop as remote_desktop_panel, removable as removable_panel, repair as repair_panel,
+    resources as resources_panel, run_history as run_history_panel,
+    service_publishing as service_publishing_panel, session as session_panel,
+    snapshots as snapshots_panel, sound as sound_panel, sync_status as sync_status_panel,
+    system_update as system_update_panel, themes as themes_panel, vpn as vpn_panel,
+    wallpaper as wallpaper_panel, wifi as wifi_panel,
 };
 use crate::patternfly::{breadcrumb, page_subtitle, page_title};
 use crate::sidebar::SidebarState;
@@ -194,6 +195,7 @@ pub enum Message {
     AppsRemove(apps_remove_panel::Message),
     HealthCheck(health_check_panel::Message),
     Drift(drift_panel::Message),
+    Policy(policy_panel::Message),
     /// BUS-7.2 — Network → Mackes Bus panel sub-message.
     MeshBus(mesh_bus_panel::Message),
     /// TUNE-15.b — Network → Mesh Federation panel sub-message.
@@ -294,6 +296,7 @@ pub struct App {
     apps_remove: apps_remove_panel::AppsRemovePanel,
     health_check: health_check_panel::HealthCheckPanel,
     drift: drift_panel::DriftPanel,
+    policy: policy_panel::PolicyPanel,
     mesh_bus: mesh_bus_panel::MeshBusPanel,
     mesh_federation: mesh_federation_panel::MeshFederationPanel,
     mesh_control: mesh_control_panel::MeshControlPanel,
@@ -407,6 +410,7 @@ impl App {
             apps_remove: apps_remove_panel::AppsRemovePanel::new(),
             health_check: health_check_panel::HealthCheckPanel::new(),
             drift: drift_panel::DriftPanel::new(),
+            policy: policy_panel::PolicyPanel::new(),
             mesh_bus: mesh_bus_panel::MeshBusPanel::new(),
             mesh_federation: mesh_federation_panel::MeshFederationPanel::new(),
             mesh_control: mesh_control_panel::MeshControlPanel::new(),
@@ -875,6 +879,7 @@ impl App {
             Message::AppsRemove(msg) => self.apps_remove.update(msg),
             Message::HealthCheck(msg) => self.health_check.update(msg),
             Message::Drift(msg) => self.drift.update(msg),
+            Message::Policy(msg) => self.policy.update(msg),
             Message::MeshBus(msg) => self.mesh_bus.update(msg),
             Message::MeshFederation(msg) => self.mesh_federation.update(msg),
             Message::MeshControl(msg) => self.mesh_control.update(msg),
@@ -962,6 +967,8 @@ impl App {
             (Group::ThisNode, "health_check") => health_check_panel::HealthCheckPanel::load(),
             // PLANES-11 — Drift folds into Controller/Remediation.
             (Group::Controller, "drift") => drift_panel::DriftPanel::load(),
+            // PLANES-13 — the policy engine surface.
+            (Group::Controller, "policy") => policy_panel::PolicyPanel::load(),
             (Group::Controller, "audit") => audit_panel::AuditPanel::load(),
             (Group::ThisNode, "mesh_logs") => mesh_logs_panel::MeshLogsPanel::load(),
             (Group::Controller, "fleet_logs") => fleet_logs_panel::FleetLogsPanel::load(),
@@ -1348,6 +1355,11 @@ impl App {
                 group: Group::Controller,
                 panel: "drift",
             } => self.drift.view(),
+            // PLANES-13 — the policy engine surface.
+            View::Panel {
+                group: Group::Controller,
+                panel: "policy",
+            } => self.policy.view(),
             // BUS-7.2 — Mackes Bus 5-tab operator surface.
             View::Panel {
                 group: Group::Network,
@@ -1498,7 +1510,6 @@ impl App {
 /// follow-up.
 fn panel_worklist_item(group: Group, panel: &str) -> Option<&'static str> {
     match (group, panel) {
-        (Group::Controller, "policy") => Some("PLANES-13 (Policy engine UI)"),
         (Group::Network, "interfaces") => Some("PLANES-15 (netstate panel)"),
         (Group::Network, "dns") => Some("PLANES-18 (mesh DNS)"),
         (Group::Network, "routing") => Some("PLANES-19 (validation suite)"),
@@ -1578,7 +1589,6 @@ mod tests {
         // the worklist item building it, so the console never reads as
         // vaporware.
         for (g, p) in [
-            (Group::Controller, "policy"),
             (Group::Network, "interfaces"),
             (Group::Network, "dns"),
             (Group::Network, "routing"),
