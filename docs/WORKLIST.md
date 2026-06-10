@@ -179,7 +179,7 @@ host-local Ansible apply.
     - [ ] typing in the filter narrows by hostname, tag, or offered service
     - [ ] each degraded mesh state shows its guided CTA and the CTA works
     - [ ] the CR-6.c graph modal is deleted; graph-node click selects the peer in the directory
-- [ ] **PD-4: PEERS — Front Door: Workbench lands on Peers**
+- [✓] **PD-4: PEERS — Front Door: Workbench lands on Peers** — done — View::default = the peers panel; boot fires the directory load; unknown deep-links fall back to the Front Door; nav lists Peers first in Network
   **As** a user launching the Workbench,
   **I want** Peers as the default landing panel and first nav entry,
   **so that** the platform's front door shows what the mesh offers and its health (D2).

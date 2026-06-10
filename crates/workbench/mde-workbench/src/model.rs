@@ -150,7 +150,12 @@ pub enum View {
 
 impl Default for View {
     fn default() -> Self {
-        Self::Group(Group::Dashboard)
+        // PD-4 / D2 — the Peers directory is the platform Front Door:
+        // a plain launch lands on it (deep-links still override).
+        Self::Panel {
+            group: Group::Network,
+            panel: "peers",
+        }
     }
 }
 
@@ -461,8 +466,15 @@ mod tests {
     }
 
     #[test]
-    fn view_default_is_dashboard_group() {
-        assert_eq!(View::default(), View::Group(Group::Dashboard));
+    fn view_default_is_the_peers_front_door() {
+        // PD-4 / D2 — a plain launch lands on the Peers directory.
+        assert_eq!(
+            View::default(),
+            View::Panel {
+                group: Group::Network,
+                panel: "peers"
+            }
+        );
     }
 
     #[test]

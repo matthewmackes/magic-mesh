@@ -620,16 +620,23 @@ impl App {
         // also fall back to client-side chrome.
         // iced 0.14: application(boot, update, view) — the first arg
         // is the boot fn (initial State); the title moved to .title().
-        iced::application(App::new, Self::update, Self::view)
-            .title(Self::title)
-            .theme(Self::theme)
-            .subscription(Self::subscription)
-            .window(window::Settings {
-                size: Size::new(WIN_W, WIN_H),
-                decorations: false,
-                ..window::Settings::default()
-            })
-            .run()
+        // PD-4 — boot lands on the Peers Front Door; fire its
+        // directory load immediately so the panel is live, not
+        // "Loading…" until the first manual refresh.
+        iced::application(
+            || (App::new(), crate::panels::peers::PeersPanel::load()),
+            Self::update,
+            Self::view,
+        )
+        .title(Self::title)
+        .theme(Self::theme)
+        .subscription(Self::subscription)
+        .window(window::Settings {
+            size: Size::new(WIN_W, WIN_H),
+            decorations: false,
+            ..window::Settings::default()
+        })
+        .run()
     }
 
     /// Iced subscription bundle. Two streams:
@@ -1369,9 +1376,16 @@ mod tests {
     use crate::backend::DemoBackend;
 
     #[test]
-    fn new_app_lands_on_dashboard_view() {
+    fn new_app_lands_on_the_peers_front_door() {
         let app = App::new();
-        assert_eq!(app.current_view(), View::Group(Group::Dashboard));
+        // PD-4 / D2 — the Front Door.
+        assert_eq!(
+            app.current_view(),
+            View::Panel {
+                group: Group::Network,
+                panel: "peers"
+            }
+        );
         assert_eq!(app.focused_pane(), Pane::Sidebar);
     }
 
@@ -1438,10 +1452,11 @@ mod tests {
     #[test]
     fn toggle_group_expansion_flips_state() {
         let mut app = App::new();
-        // Inactive group starts collapsed.
-        assert!(!app.sidebar.is_expanded(Group::Network, Group::Dashboard));
-        let _ = app.update(Message::ToggleGroupExpansion(Group::Network));
-        assert!(app.sidebar.is_expanded(Group::Network, Group::Dashboard));
+        // Inactive group starts collapsed (the active group is now
+        // Network — the Peers Front Door — so probe System instead).
+        assert!(!app.sidebar.is_expanded(Group::System, Group::Dashboard));
+        let _ = app.update(Message::ToggleGroupExpansion(Group::System));
+        assert!(app.sidebar.is_expanded(Group::System, Group::Dashboard));
     }
 
     #[test]
@@ -1460,9 +1475,10 @@ mod tests {
     }
 
     #[test]
-    fn with_focus_falls_back_to_dashboard_on_unknown_slug() {
+    fn with_focus_falls_back_to_the_front_door_on_unknown_slug() {
         let app = App::with_focus("not-a-real-slug");
-        assert_eq!(app.current_view(), View::Group(Group::Dashboard));
+        // PD-4 — the fallback is the default view (the Peers Front Door).
+        assert_eq!(app.current_view(), View::default());
     }
 
     #[test]
