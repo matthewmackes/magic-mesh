@@ -31,8 +31,10 @@
 //!      master role (detected via VIP ownership), the VIP is failed
 //!      over to the next shadow before the eviction.
 //!
-//! Design locks (25-Q survey 2026-05-29):
-//!   Q4  — goal = N (every chunkserver holds every chunk)
+//! Design locks (25-Q survey 2026-05-29; goal policy superseded by
+//! FPG-7 / platform-survey Q12, 2026-06-09):
+//!   Q4  — ~~goal = N~~ → **goal 2 default** (FPG-7/Q12): replicate
+//!         every chunk twice, capped by enrolled peer count
 //!   Q6  — every peer: chunkserver + shadow + client
 //!   Q12 — FS-agnostic: `meshfs_worker`, `MeshFS`, `meshfs` config
 //!   Q14 — storage paths: `/var/lib/mde/meshfs/{chunks,meta,stage}/`
@@ -106,6 +108,74 @@ pub const EXPORT_NAME: &str = "mesh-storage";
 
 /// Mount path for the LizardFS client.
 pub const DEFAULT_MOUNT_PATH: &str = "/mnt/mesh-storage";
+
+/// FPG-7 / Q12 — the default replication goal. Every chunk lives on
+/// two chunkservers (capped by the enrolled peer count on tiny
+/// meshes); the old goal=N everything-everywhere policy is retired.
+pub const DEFAULT_REPLICATION_GOAL: u8 = 2;
+
+/// The five XDG user dirs the mesh bind-mounts (FPG-7 / Q13).
+/// `~/Local/` is deliberately absent — it is NEVER mesh-mounted.
+pub const XDG_MESH_DIRS: [&str; 5] = ["Documents", "Downloads", "Music", "Pictures", "Videos"];
+
+/// Execute the [`xdg_bind_plan`]: for each pair whose target is not
+/// already a mountpoint, create both dirs and `mount --bind`. Errors
+/// degrade to debug logs (unprivileged dev runs, missing mount).
+pub fn ensure_xdg_binds(mount_path: &Path, home: &Path) {
+    if !mount_path.is_dir() {
+        return;
+    }
+    for (source, target) in xdg_bind_plan(mount_path, home) {
+        // `mountpoint -q` exits 0 when target is already a mountpoint.
+        let already = Command::new("mountpoint")
+            .arg("-q")
+            .arg(&target)
+            .status()
+            .map(|st| st.success())
+            .unwrap_or(false);
+        if already {
+            continue;
+        }
+        if std::fs::create_dir_all(&source).is_err() || std::fs::create_dir_all(&target).is_err() {
+            continue;
+        }
+        match Command::new("mount")
+            .arg("--bind")
+            .arg(&source)
+            .arg(&target)
+            .status()
+        {
+            Ok(st) if st.success() => {
+                tracing::info!(
+                    target: "mackesd::meshfs_worker",
+                    "FPG-7: bind-mounted {} -> {}",
+                    source.display(),
+                    target.display()
+                );
+            }
+            Ok(_) | Err(_) => {
+                tracing::debug!(
+                    target: "mackesd::meshfs_worker",
+                    "FPG-7: bind of {} skipped (unprivileged or mount unavailable)",
+                    target.display()
+                );
+            }
+        }
+    }
+}
+
+/// The bind-mount plan for one user's home (FPG-7 / Q13): pairs of
+/// `(mesh-source, home-target)` for [`XDG_MESH_DIRS`]. Pure — the
+/// sweep executes it only for pairs whose target isn't already a
+/// mountpoint.
+#[must_use]
+pub fn xdg_bind_plan(mount_path: &Path, home: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let user_root = mount_path.join("home");
+    XDG_MESH_DIRS
+        .iter()
+        .map(|d| (user_root.join(d), home.join(d)))
+        .collect()
+}
 
 /// MESHFS-6.1 — offline write staging directory. Writes that fail when the
 /// master is unreachable land here; `meshfs_worker` replays them on reconnect.
@@ -341,13 +411,14 @@ impl MeshFsWorker {
             let enrolled = enrolled_peer_ips(workgroup_root, self_id);
             let peer_count = enrolled.len();
             if peer_count > 0 {
-                // Raise/lower goal to match enrolled peer count.
-                let goal = peer_count as u8;
+                // FPG-7 / Q12 — goal 2 default, capped by peer count
+                // (a 1-peer mesh can only hold one copy).
+                let goal = (peer_count as u8).min(DEFAULT_REPLICATION_GOAL).max(1);
                 let argv = setgoal_argv(&self.setgoal_binary, goal, DEFAULT_MOUNT_PATH);
                 tracing::info!(
                     target: "mackesd::meshfs_worker",
                     goal,
-                    "converging replication goal to enrolled peer count",
+                    "converging replication goal (FPG-7: goal-2 default, peer-capped)",
                 );
                 let _ = run_argv(&argv);
                 publish_meshfs_event(
@@ -416,6 +487,17 @@ impl MeshFsWorker {
 
         // 8. Quota: hourly setquota call (MESHFS-9.1).
         self.tick_once_quota();
+
+        // 8b. FPG-7 / Q13 — bind-mount the five XDG user dirs from the
+        //     mesh volume over the user's home dirs (never ~/Local/).
+        //     Only when the mesh mount is live; idempotent (a target
+        //     already mounted is skipped); degrades to a debug log when
+        //     not permitted (non-root dev runs).
+        if master_up {
+            if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+                ensure_xdg_binds(Path::new(DEFAULT_MOUNT_PATH), &home);
+            }
+        }
 
         // 9. MESHFS-6.1 — Replay staged offline writes now that master is up.
         //    Skipped when master is unreachable (don't replay into a down master;
@@ -1943,6 +2025,32 @@ ip              port  used       avail       undergoal\n\
         assert!(report.limiting_peer_addr.is_none());
         assert_eq!(report.goal, 0);
         assert!(report.offline_peers.is_empty());
+    }
+
+    #[test]
+    fn replication_goal_is_two_capped_by_peers() {
+        // FPG-7 / Q12 — the goal-2 default, peer-capped.
+        for (peers, want) in [(1usize, 1u8), (2, 2), (3, 2), (8, 2)] {
+            let goal = (peers as u8).min(DEFAULT_REPLICATION_GOAL).max(1);
+            assert_eq!(goal, want, "{peers} peers");
+        }
+    }
+
+    #[test]
+    fn xdg_bind_plan_covers_five_dirs_and_never_local() {
+        // FPG-7 / Q13 — the five XDG dirs; ~/Local/ NEVER mesh-mounted.
+        let plan = xdg_bind_plan(Path::new("/mnt/mesh-storage"), Path::new("/home/mm"));
+        assert_eq!(plan.len(), 5);
+        let targets: Vec<String> = plan.iter().map(|(_, t)| t.display().to_string()).collect();
+        assert!(targets.contains(&"/home/mm/Documents".to_string()));
+        assert!(targets.contains(&"/home/mm/Videos".to_string()));
+        assert!(
+            !targets.iter().any(|t| t.contains("Local")),
+            "~/Local/ must never be mesh-mounted (Q13)"
+        );
+        assert!(plan
+            .iter()
+            .all(|(s, _)| s.starts_with("/mnt/mesh-storage/home")));
     }
 
     #[test]
