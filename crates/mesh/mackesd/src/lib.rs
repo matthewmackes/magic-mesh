@@ -59,6 +59,9 @@ pub mod nebula_enroll;
 // SQL projection; consumed by the `mackesd nebula export-roster`
 // CLI + by the NF-18.4 automated backup worker (planned).
 pub mod nebula_roster;
+// PLANES-17 — Nebula topology as fleet state: hop subnet routes, exit
+// nodes (validation-gated), and external VPN client profiles.
+pub mod nebula_topology;
 pub mod passcode;
 // EPIC-SEC-PASSCODE-CREDS (Q52) — encrypt the mesh passcode at rest
 // via systemd-creds (TPM-or-host-key).

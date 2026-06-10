@@ -167,6 +167,35 @@ enum Cmd {
         role: Option<String>,
     },
 
+    /// PLANES-17 (W72/W73) — advertise this node as a hop: the underlay
+    /// subnets it routes for the fleet. Every other peer installs a
+    /// `tun.unsafe_routes` edge through this node's overlay IP. Pass
+    /// `0.0.0.0/0` (or `--exit`) to offer a full exit — but the exit edge
+    /// only activates fleet-wide once a validation run passes (W73).
+    HopAdvertise {
+        /// Comma-separated subnets in CIDR form (e.g. `192.168.50.0/24`).
+        #[arg(long, value_name = "CIDRS")]
+        subnets: Option<String>,
+        /// Shorthand for advertising the `0.0.0.0/0` full-exit route.
+        #[arg(long)]
+        exit: bool,
+    },
+
+    /// PLANES-17 — import an external VPN *client* profile (WireGuard /
+    /// OpenVPN) into the replicated store. These reach external networks;
+    /// they are never the mesh transport (§1 — Nebula is the only overlay).
+    VpnImport {
+        /// Profile name (the stored filename stem).
+        #[arg(long)]
+        name: String,
+        /// `wireguard` | `openvpn`.
+        #[arg(long)]
+        kind: String,
+        /// Path to the profile config file to import.
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+
     /// E1.3 — systemd `ExecCondition` role gate. Exits 0 when the box's pinned
     /// deployment rank is at least `--min-rank`, else exits non-zero (systemd
     /// then *skips* the unit rather than failing it) after logging the conflict
@@ -1398,6 +1427,69 @@ fn main() -> anyhow::Result<()> {
                         names.join(", ")
                     }
                 );
+            }
+            return Ok(());
+        }
+        Cmd::HopAdvertise { subnets, exit } => {
+            use mackesd_core::nebula_topology::{write_advert, HopAdvert, EXIT_ROUTE};
+            let root = mackesd_core::default_qnm_shared_root();
+            let host = local_hostname();
+            let overlay_ip = local_overlay_ip().ok_or_else(|| {
+                anyhow::anyhow!("no overlay IP on nebula1 — is this node enrolled and up?")
+            })?;
+            let mut nets: Vec<String> = subnets
+                .as_deref()
+                .unwrap_or("")
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            if exit && !nets.iter().any(|s| s == EXIT_ROUTE) {
+                nets.push(EXIT_ROUTE.to_string());
+            }
+            if nets.is_empty() {
+                anyhow::bail!("nothing to advertise — pass --subnets <cidr,...> and/or --exit");
+            }
+            let advert = HopAdvert {
+                hop: host.clone(),
+                overlay_ip,
+                subnets: nets.clone(),
+            };
+            write_advert(&root, &advert)?;
+            tracing::info!(
+                target: "mackesd::audit",
+                event = "topology.hop_advertise",
+                host = %host,
+                subnets = %nets.join(","),
+                "PLANES-17: hop advertisement updated"
+            );
+            println!("hop {host} now advertises: {}", nets.join(", "));
+            return Ok(());
+        }
+        Cmd::VpnImport { name, kind, file } => {
+            use mackesd_core::nebula_topology::{write_vpn_profile, VpnKind, VpnProfile};
+            let root = mackesd_core::default_qnm_shared_root();
+            let kind = match kind.to_ascii_lowercase().as_str() {
+                "wireguard" | "wg" => VpnKind::Wireguard,
+                "openvpn" | "ovpn" => VpnKind::Openvpn,
+                other => anyhow::bail!("unknown VPN kind `{other}` — expected wireguard|openvpn"),
+            };
+            let config = std::fs::read_to_string(&file)
+                .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
+            let path = write_vpn_profile(
+                &root,
+                &VpnProfile {
+                    name: name.clone(),
+                    kind,
+                    config,
+                },
+            )?;
+            println!("imported VPN client profile `{name}` → {}", path.display());
+            let all = mackesd_core::nebula_topology::list_vpn_profiles(&root);
+            println!("stored client profiles ({}):", all.len());
+            for (n, k) in all {
+                println!("  - {n} ({k:?})");
             }
             return Ok(());
         }
@@ -3233,6 +3325,34 @@ fn ansible_runs_root() -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("/var/empty"))
     });
     base.join(".qnm-sync").join("ansible-runs")
+}
+
+/// This node's short hostname (`hostname`), or `"unknown"`.
+fn local_hostname() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// This node's Nebula overlay IP via `ip -4 addr show nebula1`, if up.
+fn local_overlay_ip() -> Option<String> {
+    let out = std::process::Command::new("ip")
+        .args(["-4", "addr", "show", "nebula1"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("inet ")
+            .and_then(|rest| rest.split('/').next())
+            .map(str::to_string)
+    })
 }
 
 /// Walk every peer subdir + parse each `*.json` as a record.
