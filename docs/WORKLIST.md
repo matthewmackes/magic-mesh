@@ -300,7 +300,7 @@ host-local Ansible apply.
 
 ### Fleet
 
-- [ ] **PLANES-20: Fleet rollup dashboard** — groups by role + tag, cards = members online / worst health / drift (W86), live map centerpiece, drill-down selects into Peers (W81/W87); `mackesd fleet status` CLI parity. Absorbs **OBS-6** + **ENT-8**.
+- [>] **PLANES-20: Fleet rollup dashboard** — groups by role + tag, cards = members online / worst health / drift (W86), live map centerpiece, drill-down selects into Peers (W81/W87); `mackesd fleet status` CLI parity. Absorbs **OBS-6** + **ENT-8**.
 
 ### Provisioning (after PKG core, W64)
 

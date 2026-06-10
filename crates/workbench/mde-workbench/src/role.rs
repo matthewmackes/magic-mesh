@@ -329,6 +329,7 @@ mod tests {
             slugs,
             vec![
                 "registration",
+                "fleet_rollup",
                 "inventory",
                 "hardware",
                 "jobs",

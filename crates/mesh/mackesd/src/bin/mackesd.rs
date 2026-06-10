@@ -367,6 +367,15 @@ enum Cmd {
         cred_path: Option<PathBuf>,
     },
 
+    /// PLANES-20 / ENT-8 — fleet rollup: the roster grouped by role with
+    /// each group's member count + worst health. `--json` for the
+    /// Fleet-rollup panel; otherwise a short table.
+    FleetStatus {
+        /// Emit the rollup as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// PLANES-4 (W25) — print this node's signing-key fingerprint + its
     /// word-pair (the out-of-band verbal-comparison rendering). `--json`
     /// emits both for the Registration panel.
@@ -1967,6 +1976,29 @@ fn main() -> anyhow::Result<()> {
                     "(encrypt at rest with: mackesd generate-passcode --store, \
                      or save to libsecret manually)"
                 );
+            }
+        }
+        Cmd::FleetStatus { json } => {
+            let conn = mackesd_core::store::open(&db_path)
+                .with_context(|| format!("opening store at {}", db_path.display()))?;
+            let nodes = mackesd_core::store::list_nodes(&conn).context("listing nodes")?;
+            let pairs: Vec<(String, String)> = nodes
+                .iter()
+                .map(|n| (n.role.clone(), n.health.clone()))
+                .collect();
+            let groups = mackesd_core::fleet_rollup::rollup(&pairs);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "total": nodes.len(), "groups": groups })
+                );
+            } else if groups.is_empty() {
+                println!("fleet empty (no enrolled nodes)");
+            } else {
+                println!("{:<14} {:>5}  {:<12}", "ROLE", "TOTAL", "WORST HEALTH");
+                for g in &groups {
+                    println!("{:<14} {:>5}  {:<12}", g.role, g.total, g.worst_health);
+                }
             }
         }
         Cmd::Identity { json } => {

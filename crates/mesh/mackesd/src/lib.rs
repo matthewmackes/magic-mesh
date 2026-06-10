@@ -62,6 +62,9 @@ pub mod nebula_roster;
 // PLANES-17 — Nebula topology as fleet state: hop subnet routes, exit
 // nodes (validation-gated), and external VPN client profiles.
 pub mod nebula_topology;
+// PLANES-20 / ENT-8 — fleet rollup aggregation (roster grouped by role +
+// worst-health) behind `mackesd fleet-status`.
+pub mod fleet_rollup;
 pub mod passcode;
 // EPIC-SEC-PASSCODE-CREDS (Q52) — encrypt the mesh passcode at rest
 // via systemd-creds (TPM-or-host-key).

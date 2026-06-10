@@ -19,6 +19,7 @@ pub mod displays;
 pub mod drift;
 pub mod firewall;
 pub mod fleet_revisions;
+pub mod fleet_rollup;
 pub mod fleet_settings;
 pub mod fonts;
 pub mod hardware;

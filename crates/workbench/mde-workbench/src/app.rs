@@ -22,9 +22,10 @@ use crate::panels::{
     compute as compute_panel, config_apply as config_apply_panel, connect as connect_panel,
     datetime as datetime_panel, default_apps as default_apps_panel, displays as displays_panel,
     drift as drift_panel, firewall as firewall_panel, fleet_revisions as fleet_revisions_panel,
-    fleet_settings as fleet_settings_panel, fonts as fonts_panel, hardware as hardware_panel,
-    health_check as health_check_panel, help_index as help_index_panel, home as home_panel,
-    hub as hub_panel, inventory as inventory_panel, jobs as jobs_panel, keyboard as keyboard_panel,
+    fleet_rollup as fleet_rollup_panel, fleet_settings as fleet_settings_panel,
+    fonts as fonts_panel, hardware as hardware_panel, health_check as health_check_panel,
+    help_index as help_index_panel, home as home_panel, hub as hub_panel,
+    inventory as inventory_panel, jobs as jobs_panel, keyboard as keyboard_panel,
     logs as logs_panel, mesh_bus as mesh_bus_panel, mesh_control as mesh_control_panel,
     mesh_federation as mesh_federation_panel, mesh_history as mesh_history_panel,
     mesh_join as mesh_join_panel, mesh_logs as mesh_logs_panel, mesh_pending as mesh_pending_panel,
@@ -157,6 +158,8 @@ pub enum Message {
     ConfigApply(config_apply_panel::Message),
     /// PLANES-4 — Registration panel (identity + cert lifecycle) sub-message.
     Registration(registration_panel::Message),
+    /// PLANES-20 — Fleet rollup dashboard sub-message.
+    FleetRollup(fleet_rollup_panel::Message),
     /// CB-1.5.b — Fleet playbooks panel sub-message.
     Playbooks(playbooks_panel::Message),
     /// CB-1.5.c — Fleet run-history panel sub-message.
@@ -268,6 +271,7 @@ pub struct App {
     mesh_logs: mesh_logs_panel::MeshLogsPanel,
     config_apply: config_apply_panel::ConfigApplyPanel,
     registration: registration_panel::RegistrationPanel,
+    fleet_rollup: fleet_rollup_panel::FleetRollupPanel,
     playbooks: playbooks_panel::PlaybooksPanel,
     run_history: run_history_panel::RunHistoryPanel,
     datetime: datetime_panel::DateTimePanel,
@@ -378,6 +382,7 @@ impl App {
             mesh_logs: mesh_logs_panel::MeshLogsPanel::new(),
             config_apply: config_apply_panel::ConfigApplyPanel::new(),
             registration: registration_panel::RegistrationPanel::new(),
+            fleet_rollup: fleet_rollup_panel::FleetRollupPanel::new(),
             playbooks: playbooks_panel::PlaybooksPanel::new(),
             run_history: run_history_panel::RunHistoryPanel::new(),
             datetime: datetime_panel::DateTimePanel::new(),
@@ -819,6 +824,7 @@ impl App {
             Message::MeshLogs(msg) => self.mesh_logs.update(msg),
             Message::ConfigApply(msg) => self.config_apply.update(msg),
             Message::Registration(msg) => self.registration.update(msg),
+            Message::FleetRollup(msg) => self.fleet_rollup.update(msg),
             Message::Playbooks(msg) => self.playbooks.update(msg),
             Message::RunHistory(msg) => self.run_history.update(msg),
             Message::DateTime(msg) => self.datetime.update(msg),
@@ -905,6 +911,7 @@ impl App {
             (Group::Fleet, "jobs") => jobs_panel::JobsPanel::load(),
             (Group::Fleet, "config_apply") => config_apply_panel::ConfigApplyPanel::load(),
             (Group::Fleet, "registration") => registration_panel::RegistrationPanel::load(),
+            (Group::Fleet, "fleet_rollup") => fleet_rollup_panel::FleetRollupPanel::load(),
             (Group::Fleet, "playbooks") => playbooks_panel::PlaybooksPanel::load(),
             (Group::Fleet, "run_history") => run_history_panel::RunHistoryPanel::load(),
             (Group::System, "datetime") => datetime_panel::DateTimePanel::load(),
@@ -1176,6 +1183,10 @@ impl App {
                 group: Group::Fleet,
                 panel: "registration",
             } => self.registration.view(),
+            View::Panel {
+                group: Group::Fleet,
+                panel: "fleet_rollup",
+            } => self.fleet_rollup.view(),
             View::Panel {
                 group: Group::Fleet,
                 panel: "playbooks",

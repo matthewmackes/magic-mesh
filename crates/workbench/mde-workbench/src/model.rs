@@ -242,6 +242,8 @@ pub fn nav_model() -> Vec<NavEntry> {
             panels: vec![
                 // PLANES-4 — enrollment identity + cert lifecycle.
                 Panel::new("registration", "Registration"),
+                // PLANES-20 — role-grouped fleet rollup dashboard.
+                Panel::new("fleet_rollup", "Fleet Rollup"),
                 Panel::new("inventory", "Inventory"),
                 // PLANES-5 — replicated PeerProbe hardware view
                 // (PCI/USB/kernel/power/descriptors), no new collectors.
