@@ -48,6 +48,12 @@ tests: **Ed25519** node identity · **AES-256-GCM** / **ChaCha20-Poly1305** ·
 **XChaCha20-Poly1305** CA backup · **RSA-4096** KDC device identity. Enrollment
 uses max key complexity. No OpenSSL — **rustls** throughout.
 
+**Documented interop exceptions (not violations — sweep-3 I6/I7):** MD5 where an
+external spec mandates it and it carries no MDE security: the freedesktop
+thumbnail-cache filename (`mde-files/thumbnails.rs` — cache key per the XDG spec)
+and the Subsonic API auth token (`mde-musicd/airsonic.rs` — the upstream API's
+scheme; mitigate by using TLS to the server). Anything else MD5/SHA1 is a finding.
+
 ## §4 — Look: strictly IBM Carbon
 
 - The GUI is **IBM Carbon** (carbondesignsystem.com) — the only switchable themes

@@ -73,19 +73,6 @@ pub enum RosterSource {
     EmbeddedFixture,
 }
 
-impl RosterSource {
-    /// Short label for the topbar source chip.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            RosterSource::EnvOverride => "roster · env",
-            RosterSource::MeshStorage => "roster · mesh-storage",
-            RosterSource::LocalFallback => "roster · local",
-            RosterSource::EmbeddedFixture => "roster · fixture",
-        }
-    }
-}
-
 /// Try every roster source in order, returning the first hit.
 #[must_use]
 pub fn load() -> RosterLoad {

@@ -244,7 +244,10 @@ enum Message {
     PlayPause,
     SkipNext,
     SkipPrev,
-    TransportDone(Result<(), String>),
+    /// A transport command (volume/play/skip) finished — outcome is
+    /// irrelevant; the follow-up state fetch is the truth (sweep-3 I8
+    /// dropped the never-read `Result` payload).
+    TransportDone,
 }
 
 impl State {
@@ -695,15 +698,16 @@ impl State {
             }
             Message::SetVolume(v) => {
                 self.now_state.volume = v;
-                Task::perform(nowplaying::set_volume(v), Message::TransportDone)
+                Task::perform(nowplaying::set_volume(v), |_| Message::TransportDone)
             }
-            Message::PlayPause => Task::perform(
-                nowplaying::play_pause(self.now_state.playing),
-                Message::TransportDone,
-            ),
-            Message::SkipNext => Task::perform(nowplaying::skip_next(), Message::TransportDone),
-            Message::SkipPrev => Task::perform(nowplaying::skip_prev(), Message::TransportDone),
-            Message::TransportDone(_) => Task::perform(nowplaying::fetch_state(), |r| {
+            Message::PlayPause => {
+                Task::perform(nowplaying::play_pause(self.now_state.playing), |_| {
+                    Message::TransportDone
+                })
+            }
+            Message::SkipNext => Task::perform(nowplaying::skip_next(), |_| Message::TransportDone),
+            Message::SkipPrev => Task::perform(nowplaying::skip_prev(), |_| Message::TransportDone),
+            Message::TransportDone => Task::perform(nowplaying::fetch_state(), |r| {
                 Message::StateLoaded(r.unwrap_or_default())
             }),
         }

@@ -32,7 +32,6 @@ use iced_layershell::settings::{LayerShellSettings, Settings};
 use iced_layershell::to_layer_message;
 
 mod media;
-mod recents;
 mod resolve;
 mod roster;
 mod sip;
@@ -177,6 +176,7 @@ fn namespace() -> String {
     "mde-voice-hud".to_string()
 }
 
+/// iced update — drives the HUD state machine (calls, registration, roster).
 pub fn update(state: &mut VoiceHud, message: Message) -> Task<Message> {
     match message {
         Message::DialerInputChanged(value) => {
@@ -204,13 +204,13 @@ pub fn update(state: &mut VoiceHud, message: Message) -> Task<Message> {
             sip::AgentEvent::Incoming { from, .. } => {
                 tracing::info!(%from, "voice-hud: incoming call");
                 state.call = sip::CallState::Incoming { from: from.clone() };
-                // Surface an Action-Center toast via the FDO Notifications path
-                // (notify-send → mde's notifyd → Action Center), the same way
-                // snip.rs emits — best-effort, never fatal.
+                // Document the call as a desktop notification via the FDO
+                // Notifications path (Cosmic's notification daemon) — the
+                // system notification IS the call record (sweep-3 I1; no
+                // stored recents list). Best-effort, never fatal.
                 let _ = std::process::Command::new("notify-send")
-                    .args(["-a", "Mackes Workstation Voice", "Incoming call", &from])
+                    .args(["-a", "Magic Mesh Voice", "Incoming call", &from])
                     .spawn();
-                recents::record_incoming(&from);
             }
             sip::AgentEvent::Established => {
                 let peer = match &state.call {
@@ -309,6 +309,7 @@ pub fn update(state: &mut VoiceHud, message: Message) -> Task<Message> {
     Task::none()
 }
 
+/// iced view — renders the HUD overlay surface.
 pub fn view(state: &VoiceHud) -> Element<'_, Message> {
     container(
         column![

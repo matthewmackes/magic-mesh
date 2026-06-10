@@ -64,12 +64,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MeshResource {
-    /// A mesh peer (Headscale-known machine). Click → action popover (Q34):
+    /// A mesh peer (Nebula-enrolled machine). Click → action popover (Q34):
     /// Files / SSH / RDP / VNC / Services / Send file.
     Peer {
         /// Hostname / mesh node name. Stable across reboots.
         name: String,
-        /// Mesh IP (Tailscale-assigned 100.x.x.x).
+        /// Mesh IP (Nebula overlay address, e.g. 10.42.x.x).
         mesh_ip: Option<String>,
         /// Whether the peer has been seen as online in the last poll.
         online: bool,

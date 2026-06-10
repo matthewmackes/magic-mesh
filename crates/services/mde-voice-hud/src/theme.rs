@@ -1,4 +1,4 @@
-//! Color tokens + spacing constants for `mde-voice-hud`.
+//! Color tokens for `mde-voice-hud`.
 //!
 //! The HUD is a Portal-full overlay surface. E9.9 (§1) — its palette is the
 //! IBM Carbon Gray-100 dark tokens + Blue accent, like the rest of the
@@ -10,7 +10,8 @@
 //! single-sourced [`mde_theme::carbon`] ramp, converted to this crate's
 //! `iced::Color` locally (the HUD's iced version skews from the one
 //! `Rgba::into_iced_color()` targets). This module maps Carbon ramp steps to
-//! HUD roles; it holds no raw color literals.
+//! HUD roles; it holds no raw color literals. Only roles with live call
+//! sites are kept (sweep-3 I3 removed the dead H2-residue set).
 
 use iced::Color;
 use mde_theme::carbon;
@@ -26,30 +27,15 @@ const fn tok(c: Rgba) -> Color {
         a: c.a,
     }
 }
-/// Same, overriding the alpha — for translucent scrims / hover tints.
-const fn tok_a(c: Rgba, a: f32) -> Color {
-    Color {
-        r: c.r as f32 / 255.0,
-        g: c.g as f32 / 255.0,
-        b: c.b as f32 / 255.0,
-        a,
-    }
-}
 
 // ---------- Surface palette (IBM Carbon Gray-100 dark ramp) ----------
 
 /// Base surface — Carbon Gray 100.
 pub const SURF: Color = tok(carbon::GRAY_100);
-/// Dim variant for the inner SIP-log + activity panels — Gray 100.
-pub const SURF_DIM: Color = tok(carbon::GRAY_100);
-/// Low-elevation container (topbar / call bar) — Gray 90.
-pub const SURF_C_LOW: Color = tok(carbon::GRAY_90);
 /// Mid-elevation container (keypad keys / hop pills) — Gray 80.
 pub const SURF_C: Color = tok(carbon::GRAY_80);
 /// High-elevation hover state — Gray 70.
 pub const SURF_C_HI: Color = tok(carbon::GRAY_70);
-/// Hierarchical accent surface (selected tab / avatar bg) — Gray 60.
-pub const SURF_C_HIER: Color = tok(carbon::GRAY_60);
 /// Outline / divider line — Gray 70.
 pub const OUTLINE: Color = tok(carbon::GRAY_70);
 /// Outline variant (lighter divider) — Gray 80.
@@ -68,8 +54,6 @@ pub const ON_SURF_MUTED: Color = tok(carbon::GRAY_50);
 
 /// Success — on-dark Green 40.
 pub const SUCCESS: Color = tok(carbon::GREEN_40);
-/// Warning — Yellow 30.
-pub const WARNING: Color = tok(carbon::YELLOW_30);
 /// Error — on-dark Red 50.
 pub const ERROR: Color = tok(carbon::RED_50);
 /// Info — Blue 40.
@@ -81,58 +65,11 @@ pub const INFO: Color = tok(carbon::BLUE_40);
 pub const PRIMARY: Color = tok(carbon::BLUE_50);
 /// Text on the Blue fill — White.
 pub const ON_PRIMARY: Color = tok(carbon::WHITE);
-/// Interactive container — Blue 70.
-pub const PRIMARY_C: Color = tok(carbon::BLUE_70);
-/// On-container text — Blue 20.
-pub const ON_PRIMARY_C: Color = tok(carbon::BLUE_20);
-/// On-call pip — Blue 40.
-pub const PRIMARY_FIXED: Color = tok(carbon::BLUE_40);
-
-// ---------- Accept / decline FAB ----------
-
-/// Background for the Call FAB — Carbon Green 60.
-pub const ACCEPT_C: Color = tok(carbon::GREEN_60);
-/// Foreground glyph color on the Call FAB — Green 30.
-pub const ACCEPT_FG: Color = tok(carbon::GREEN_30);
-/// Background for the Hangup FAB — Carbon Red 60.
-pub const ERROR_C: Color = tok(carbon::RED_60);
-/// Text/glyph on the Hangup FAB — White.
-pub const ON_ERROR_C: Color = tok(carbon::WHITE);
 
 // ---------- Presence pip colors ----------
 
 pub const PRESENCE_AVAILABLE: Color = SUCCESS;
-pub const PRESENCE_ON_CALL: Color = PRIMARY_FIXED;
-pub const PRESENCE_AWAY: Color = WARNING;
-pub const PRESENCE_DND: Color = ERROR;
 pub const PRESENCE_OFFLINE: Color = OUTLINE;
-
-// ---------- Translucent overlays ----------
-
-pub const SCRIM_55: Color = tok_a(carbon::BLACK, 0.55);
-pub const HOVER_TINT_8: Color = tok_a(carbon::WHITE, 0.04);
-
-// ---------- HUD dimensions ----------
-
-/// Cozy default width (px).
-pub const HUD_W: f32 = 420.0;
-/// Cozy default height (px).
-pub const HUD_H: f32 = 720.0;
-/// Bottom margin above the dock (px).
-pub const HUD_MARGIN_BOTTOM: i32 = 56;
-/// Right margin from the screen edge (px).
-pub const HUD_MARGIN_RIGHT: i32 = 16;
-/// Row height for keypad keys + peer rows (cozy density, px).
-pub const ROW_H: f32 = 64.0;
-
-// ---------- Border radii ----------
-
-pub const R_XS: f32 = 8.0;
-pub const R_S: f32 = 12.0;
-pub const R_M: f32 = 16.0;
-pub const R_L: f32 = 20.0;
-pub const R_XL: f32 = 28.0;
-pub const R_FULL: f32 = 999.0;
 
 #[cfg(test)]
 mod tests {
@@ -156,6 +93,5 @@ mod tests {
         assert_eq!(rgb8(PRIMARY), (0x45, 0x89, 0xff), "accent = Blue 50");
         assert_eq!(rgb8(SUCCESS), (0x42, 0xbe, 0x65), "success = Green 40");
         assert_eq!(rgb8(ERROR), (0xfa, 0x4d, 0x56), "error = Red 50");
-        assert_eq!(rgb8(WARNING), (0xf1, 0xc2, 0x1b), "warning = Yellow 30");
     }
 }

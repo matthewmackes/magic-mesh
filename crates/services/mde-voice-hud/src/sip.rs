@@ -251,7 +251,7 @@ fn build_register(
     let _ = write!(m, "CSeq: {} REGISTER\r\n", ids.cseq);
     let _ = write!(m, "Contact: <{contact}>\r\n");
     let _ = write!(m, "Expires: {}\r\n", account.expires);
-    let _ = write!(m, "User-Agent: Mackes Workstation Voice/{version}\r\n");
+    let _ = write!(m, "User-Agent: Magic Mesh Voice/{version}\r\n");
     if let Some((name, value)) = auth {
         let _ = write!(m, "{name}: {value}\r\n");
     }
@@ -363,19 +363,6 @@ fn parse_challenge(resp: &rsip::Response) -> Option<Challenge> {
     None
 }
 
-/// Read the granted `Expires` from a 200 OK (header, else the Contact param),
-/// falling back to the requested value.
-fn parse_granted_expires(resp: &rsip::Response, requested: u32) -> u32 {
-    for h in resp.headers.iter() {
-        if let Header::Expires(e) = h {
-            if let Ok(secs) = e.seconds() {
-                return secs;
-            }
-        }
-    }
-    requested
-}
-
 /// A monotonic, collision-free token for Call-ID / tags / branches / cnonce.
 fn gen_token(prefix: &str) -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -393,93 +380,6 @@ fn recv_response(sock: &UdpSocket) -> Result<rsip::Response, String> {
         .recv(&mut buf)
         .map_err(|e| format!("no reply from registrar ({e})"))?;
     rsip::Response::try_from(&buf[..n]).map_err(|e| format!("malformed SIP reply ({e})"))
-}
-
-/// Attempt a single REGISTER, returning the granted expiry on success.
-///
-/// Blocking + socket-touching → call off the UI thread (the HUD runs it via
-/// `Task::perform`). Never panics: every failure maps to `Err(String)`.
-pub fn register_once(account: &SipAccount, timeout: Duration) -> RegistrationState {
-    match try_register(account, timeout) {
-        Ok(expires) => RegistrationState::Registered {
-            server: format!("{}:{}", account.server_host, account.server_port),
-            expires,
-        },
-        Err(e) => RegistrationState::Failed(e),
-    }
-}
-
-fn try_register(account: &SipAccount, timeout: Duration) -> Result<u32, String> {
-    let server_addr = (account.server_host.as_str(), account.server_port)
-        .to_socket_addrs()
-        .map_err(|e| format!("cannot resolve {}: {e}", account.server_host))?
-        .next()
-        .ok_or_else(|| format!("no address for {}", account.server_host))?;
-
-    let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("socket bind failed ({e})"))?;
-    sock.set_read_timeout(Some(timeout)).ok();
-    sock.connect(server_addr)
-        .map_err(|e| format!("connect failed ({e})"))?;
-    let local = sock
-        .local_addr()
-        .map_err(|e| format!("no local addr ({e})"))?;
-    let local_host = local.ip().to_string();
-    let local_port = local.port();
-
-    let call_id = gen_token("mwv-");
-    let from_tag = gen_token("t");
-    let ids = TxnIds {
-        call_id: call_id.clone(),
-        from_tag: from_tag.clone(),
-        branch: format!("z9hG4bK{}", gen_token("")),
-        cseq: 1,
-    };
-
-    // First REGISTER (unauthenticated).
-    let req = build_register(account, &local_host, local_port, &ids, None);
-    sock.send(req.as_bytes())
-        .map_err(|e| format!("send failed ({e})"))?;
-    let resp = recv_response(&sock)?;
-    let code = u16::from(resp.status_code.clone());
-
-    if code == 200 {
-        return Ok(parse_granted_expires(&resp, account.expires));
-    }
-    if code != 401 && code != 407 {
-        return Err(format!("registrar replied {code}"));
-    }
-
-    // Authenticated retry.
-    let ch = parse_challenge(&resp).ok_or("auth challenge missing or unparseable")?;
-    let cnonce = gen_token("c");
-    let auth_value = authorization_value(account, &ch, &cnonce, 1)?;
-    let header_name = if ch.proxy {
-        "Proxy-Authorization"
-    } else {
-        "Authorization"
-    };
-    let ids2 = TxnIds {
-        call_id,
-        from_tag,
-        branch: format!("z9hG4bK{}", gen_token("")),
-        cseq: 2,
-    };
-    let req2 = build_register(
-        account,
-        &local_host,
-        local_port,
-        &ids2,
-        Some((header_name, &auth_value)),
-    );
-    sock.send(req2.as_bytes())
-        .map_err(|e| format!("send failed ({e})"))?;
-    let resp2 = recv_response(&sock)?;
-    let code2 = u16::from(resp2.status_code.clone());
-    if code2 == 200 {
-        Ok(parse_granted_expires(&resp2, account.expires))
-    } else {
-        Err(format!("registrar rejected auth ({code2})"))
-    }
 }
 
 // ── VOIP-28 slice 2: outbound call signaling (INVITE / SDP / ACK / BYE) ──────
@@ -581,7 +481,7 @@ fn build_sdp_offer(local_host: &str, rtp_port: u16) -> String {
     format!(
         "v=0\r\n\
          o=mwv 0 0 IN IP4 {local_host}\r\n\
-         s=Mackes Workstation Voice\r\n\
+         s=Magic Mesh Voice\r\n\
          c=IN IP4 {local_host}\r\n\
          t=0 0\r\n\
          m=audio {rtp_port} RTP/AVP 0 8\r\n\
@@ -1013,8 +913,6 @@ pub enum AgentCommand {
     Decline,
     /// Hang up the active inbound call.
     HangUp,
-    /// Stop the agent (the app is exiting).
-    Shutdown,
 }
 
 /// Discover the local IP that routes to `peer` (the overlay IP for a mesh
@@ -1177,7 +1075,8 @@ pub fn run_agent(
                 }
                 pending = None;
             }
-            Ok(AgentCommand::Shutdown) | Err(TryRecvError::Disconnected) => {
+            // The UI dropping its sender (app exit) is the shutdown signal.
+            Err(TryRecvError::Disconnected) => {
                 if let Some(m) = media.take() {
                     m.stop();
                 }

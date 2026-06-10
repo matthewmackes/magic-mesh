@@ -212,8 +212,9 @@ pub enum Message {
     /// every `get_latest()` so a `--focus` hand-off and a normal
     /// startup go through the same code path.
     WindowControl(HeaderAction),
-    /// No-op — placeholder for buttons whose behaviour lands in
-    /// later CB-1.x substeps.
+    /// No-op — the inert default for declaratively-wired fallbacks
+    /// (focus-drain misses, lazy widget message slots). Not a stub:
+    /// every live use is a functional "nothing to do" value.
     Noop,
 }
 
