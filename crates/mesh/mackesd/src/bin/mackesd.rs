@@ -710,6 +710,17 @@ enum Cmd {
         json: bool,
     },
 
+    /// PLANES-24 — the package-mirror catalog. `mded mirrors --json`
+    /// emits every mirror (the `magic-mesh` GitHub-RPM core pack + any
+    /// TOML in `<root>/mirrors/`): upstream, the `file://` baseurl every
+    /// node serves itself from (W62), and the last-sync freshness (W63).
+    /// The Provisioning ▸ Mirrors panel consumes the JSON.
+    Mirrors {
+        /// Emit the JSON array instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// CB-1.5.a — fleet node roster. `mded nodes list --json` emits
     /// every row from the `nodes` table as a JSON array; the Iced
     /// inventory panel (in `crates/mde-workbench/src/panels/
@@ -3890,6 +3901,42 @@ fn main() -> anyhow::Result<()> {
                         p.role,
                         p.tags.iter().cloned().collect::<Vec<_>>().join(","),
                         p.auto_join
+                    );
+                }
+            }
+            return Ok(());
+        }
+        Cmd::Mirrors { json } => {
+            // PLANES-24 — the package-mirror catalog (core pack + TOML),
+            // each with its file:// serving baseurl + last-sync state.
+            use mackesd_core::mirrors;
+            let root = mackesd_core::default_qnm_shared_root();
+            let list = mirrors::load_mirrors(&root);
+            if json {
+                let rows: Vec<serde_json::Value> = list
+                    .iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "name": m.name,
+                            "description": m.description,
+                            "upstream": m.upstream,
+                            "enabled": m.enabled,
+                            "file_baseurl": m.file_baseurl(&root),
+                            "last_sync_ms": m.last_sync_ms(&root),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string(&rows)?);
+            } else {
+                println!("{:<14} {:<8} {}", "MIRROR", "ENABLED", "UPSTREAM");
+                for m in &list {
+                    let synced = m
+                        .last_sync_ms(&root)
+                        .map_or_else(|| "never synced".to_string(), |ms| format!("synced @{ms}"));
+                    println!("{:<14} {:<8} {}", m.name, m.enabled, m.upstream);
+                    println!(
+                        "               serves: {}  ({synced})",
+                        m.file_baseurl(&root)
                     );
                 }
             }

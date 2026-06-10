@@ -45,6 +45,7 @@ pub mod mesh_pending;
 pub mod mesh_services;
 pub mod mesh_storage;
 pub mod mesh_topology;
+pub mod mirrors;
 pub mod mouse;
 pub mod music;
 pub mod network_hosts;
