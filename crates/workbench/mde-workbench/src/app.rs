@@ -659,7 +659,24 @@ impl App {
         // directory load immediately so the panel is live, not
         // "Loading…" until the first manual refresh.
         iced::application(
-            || (App::new(), crate::panels::peers::PeersPanel::load()),
+            || {
+                // Deep-link boot: a `--focus <slug>` (queued in PendingFocus
+                // by main before run()) lands DIRECTLY on the target panel
+                // and fires its load, instead of flashing the Peers front
+                // door and only navigating on the next 200 ms poll. The poll
+                // still serves sibling-process `--focus` handoffs.
+                match PendingFocus::drain() {
+                    Some(slug) if !slug.is_empty() => {
+                        let app = App::with_focus(&slug);
+                        let boot = match app.view {
+                            View::Panel { group, panel } => app.on_panel_navigated(group, panel),
+                            View::Group(g) => app.on_group_navigated(g),
+                        };
+                        (app, boot)
+                    }
+                    _ => (App::new(), crate::panels::peers::PeersPanel::load()),
+                }
+            },
             Self::update,
             Self::view,
         )
