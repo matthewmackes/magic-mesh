@@ -6,6 +6,9 @@
 //!   magic-fleet watch    <baseline.yml> [--interval=SECS] [--audit=PATH] [--once]
 //!                                         drift-watch daemon: converge on a timer, persist an audit log
 //!   magic-fleet elect    <revision.yml>...  pick the newest-wins revision and converge to it
+//!   magic-fleet reconcile [--root=DIR] [--hostname=NAME] [--except=PATH]
+//!                                         FPG-8: elect the head of the LizardFS revision log,
+//!                                         converge to it host-local, write the apply-ack
 //!
 //! `converge`/`watch`/`elect` accept `--except=PATH` — a node's locally-declared
 //! exceptions (Q124), filtered out of the baseline before it applies.
@@ -26,6 +29,9 @@ fn main() -> ExitCode {
     }
     if args.get(1).map(String::as_str) == Some("elect") {
         return elect(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("reconcile") {
+        return reconcile(&args[2..]);
     }
     let (Some(verb @ ("apply" | "heal" | "converge")), Some(path)) =
         (args.get(1).map(String::as_str), args.get(2))
@@ -151,6 +157,87 @@ fn elect(args: &[String]) -> ExitCode {
     };
     let root = std::env::temp_dir().join(format!("magic-fleet-elect-{}", std::process::id()));
     drift_exit("elect", magic_fleet::converge(&spec, &root))
+}
+
+/// FPG-8 — the unified-baseline reconcile: elect the head of the
+/// replicated revision log (FPG-2), converge to it host-local (Q10 —
+/// no push-SSH; this node applies itself), then write this node's
+/// apply-ack into `<root>/fleet/acks/<version>/` (FPG-5 / Q14) so the
+/// author's FSM can advance to Verified. Revision authenticity rests
+/// on the Nebula transport carrying the replicated volume; `author`
+/// is advisory (Q17). The `settings` domain is skipped here — mackesd
+/// applies settings natively (FPG-1/Q9).
+fn reconcile(args: &[String]) -> ExitCode {
+    let mut root: Option<String> = None;
+    let mut hostname: Option<String> = None;
+    for a in args {
+        if let Some(v) = a.strip_prefix("--root=") {
+            root = Some(v.to_string());
+        } else if let Some(v) = a.strip_prefix("--hostname=") {
+            hostname = Some(v.to_string());
+        }
+    }
+    let root = root
+        .or_else(|| std::env::var("MDE_WORKGROUP_ROOT").ok())
+        .or_else(|| std::env::var("QNM_SHARED_ROOT").ok());
+    let Some(root) = root else {
+        eprintln!(
+            "magic-fleet: reconcile needs --root=DIR or $MDE_WORKGROUP_ROOT (the replicated workgroup root)"
+        );
+        return ExitCode::FAILURE;
+    };
+    let root = std::path::PathBuf::from(root);
+    let hostname = hostname.unwrap_or_else(|| {
+        std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".to_string())
+    });
+    let log_dir = magic_fleet::store::revisions_dir(&root);
+    let Some(head) = magic_fleet::store::elect_head(&log_dir) else {
+        println!("magic-fleet: revision log empty — nothing to reconcile");
+        return ExitCode::SUCCESS;
+    };
+    println!(
+        "magic-fleet: reconciling to elected head v{} (author={})",
+        head.version, head.author
+    );
+    let spec = match with_exceptions(head.spec.clone(), args) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let work = std::env::temp_dir().join(format!("magic-fleet-reconcile-{}", std::process::id()));
+    let outcome = magic_fleet::converge(&spec, &work);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let ack = match &outcome {
+        Ok((status, _)) if *status != DriftStatus::Failed => magic_fleet::store::ApplyAck {
+            peer: hostname,
+            status: "applied".into(),
+            at: now,
+            detail: String::new(),
+        },
+        Ok((_, r)) => magic_fleet::store::ApplyAck {
+            peer: hostname,
+            status: "failed".into(),
+            at: now,
+            detail: format!("failures={} unreachable={}", r.failures, r.unreachable),
+        },
+        Err(e) => magic_fleet::store::ApplyAck {
+            peer: hostname,
+            status: "failed".into(),
+            at: now,
+            detail: e.to_string(),
+        },
+    };
+    if let Err(e) = magic_fleet::store::write_ack(&root, head.version, &ack) {
+        eprintln!("magic-fleet: ack write failed: {e}");
+    }
+    drift_exit("reconcile", outcome)
 }
 
 /// The drift-watch daemon: parse `watch` flags, then converge-on-a-timer,

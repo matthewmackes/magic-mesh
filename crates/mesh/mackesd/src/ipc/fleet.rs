@@ -41,6 +41,8 @@ use serde_json::json;
 /// author identity stamped on mints from this node.
 #[derive(Debug, Default, Clone)]
 pub struct FleetService {
+    /// The replicated workgroup root (acks live under it, FPG-5).
+    pub workgroup_root: PathBuf,
     /// `<workgroup-root>/fleet/revisions` (FPG-2).
     pub revisions_dir: PathBuf,
     /// This node's id — the default `author` for push/rollback mints.
@@ -52,11 +54,17 @@ impl FleetService {
     #[must_use]
     pub fn new(workgroup_root: &std::path::Path, node_id: String) -> Self {
         Self {
+            workgroup_root: workgroup_root.to_path_buf(),
             revisions_dir: store::revisions_dir(workgroup_root),
             node_id,
         }
     }
 }
+
+/// The Bus event topic apply-acks surface on (FPG-5 / Q15). One
+/// retained-style event per new `(version, peer, status)` triple:
+/// `{revision, peer, status, at}` — the Workbench subscribes here.
+pub const SIGNALS_TOPIC: &str = "event/fleet/signals";
 
 /// Flat top-level domain diff (Q7): the domain names whose content
 /// differs between two specs.
@@ -157,7 +165,15 @@ pub fn build_reply(svc: &FleetService, verb: &str, body: Option<&str>) -> String
             let head = magic_fleet::elect_revision(&all).map(|r| r.version);
             let rows: Vec<_> = all
                 .iter()
-                .map(|r| json!({ "version": r.version, "author": r.author, "at": r.at }))
+                .map(|r| {
+                    let acks = store::read_acks(&svc.workgroup_root, r.version);
+                    let applied = acks.iter().filter(|a| a.status == "applied").count();
+                    let failed = acks.iter().filter(|a| a.status == "failed").count();
+                    json!({
+                        "version": r.version, "author": r.author, "at": r.at,
+                        "acks": { "applied": applied, "failed": failed },
+                    })
+                })
                 .collect();
             json!({ "ok": true, "head": head, "revisions": rows }).to_string()
         }
@@ -215,9 +231,47 @@ pub fn build_reply(svc: &FleetService, verb: &str, body: Option<&str>) -> String
 /// thread — same shape as the Shell responder).
 pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &FleetService, should_stop: F) {
     let mut cursors: HashMap<String, String> = HashMap::new();
+    // FPG-5 — the ack→signal emitter's dedup memory. Seeded silently
+    // on the first sweep so a responder restart doesn't replay
+    // historical acks as fresh notifications.
+    let mut seen_acks: std::collections::HashSet<(u64, String, String)> =
+        std::collections::HashSet::new();
+    let mut first_sweep = true;
     while !should_stop() {
         poll_once(persist, svc, &mut cursors);
+        emit_new_acks(persist, svc, &mut seen_acks, first_sweep);
+        first_sweep = false;
         std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// FPG-5 — scan the ack dirs for `(version, peer, status)` triples not
+/// yet seen and emit each on [`SIGNALS_TOPIC`]. `seed_only` populates
+/// the dedup set without emitting (the restart-replay guard).
+pub fn emit_new_acks(
+    persist: &Persist,
+    svc: &FleetService,
+    seen: &mut std::collections::HashSet<(u64, String, String)>,
+    seed_only: bool,
+) {
+    for r in store::read_revisions(&svc.revisions_dir) {
+        for ack in store::read_acks(&svc.workgroup_root, r.version) {
+            let key = (r.version, ack.peer.clone(), ack.status.clone());
+            if !seen.insert(key) {
+                continue;
+            }
+            if seed_only {
+                continue;
+            }
+            let body = json!({
+                "revision": r.version, "peer": ack.peer,
+                "status": ack.status, "at": ack.at,
+            })
+            .to_string();
+            if let Err(e) = persist.write(SIGNALS_TOPIC, Priority::Default, None, Some(&body)) {
+                tracing::warn!(error = %e, "fleet responder: signal emit failed");
+            }
+        }
     }
 }
 
@@ -342,6 +396,28 @@ mod tests {
             ["packages", "settings"],
             "flat top-level diff (Q7)"
         );
+    }
+
+    #[test]
+    fn list_revisions_carries_ack_summaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = svc_in(tmp.path());
+        let _ = build_reply(&svc, "push-revision", Some(r#"{"spec": "packages: []\n"}"#));
+        magic_fleet::store::write_ack(
+            tmp.path(),
+            1,
+            &magic_fleet::store::ApplyAck {
+                peer: "oak".into(),
+                status: "applied".into(),
+                at: 5,
+                detail: String::new(),
+            },
+        )
+        .unwrap();
+        let list: serde_json::Value =
+            serde_json::from_str(&build_reply(&svc, "list-revisions", None)).unwrap();
+        assert_eq!(list["revisions"][0]["acks"]["applied"], 1);
+        assert_eq!(list["revisions"][0]["acks"]["failed"], 0);
     }
 
     #[test]

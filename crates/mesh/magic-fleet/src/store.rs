@@ -99,6 +99,73 @@ pub fn elect_head(dir: &Path) -> Option<Revision> {
     crate::elect_revision(&all).cloned()
 }
 
+// ── FPG-5: apply-acks ───────────────────────────────────────────────
+//
+// After a node converges to a revision it writes an ack at
+// `<root>/fleet/acks/<version>/<hostname>.json`; replication gossips
+// it back to every node (incl. the author, whose FSM advances to
+// Verified when acks arrive — Q14). Own-file authority, the PEERVER
+// pattern: each node only ever writes its own ack file.
+
+/// One node's apply outcome for one revision.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ApplyAck {
+    /// Acking node's hostname.
+    pub peer: String,
+    /// `"applied"` or `"failed"` (plus anything richer later — read
+    /// tolerantly).
+    pub status: String,
+    /// Ack time, Unix seconds.
+    pub at: u64,
+    /// Optional failure detail.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
+/// The acks directory for one revision version.
+#[must_use]
+pub fn acks_dir(workgroup_root: &Path, version: u64) -> PathBuf {
+    workgroup_root
+        .join("fleet")
+        .join("acks")
+        .join(format!("{version:020}"))
+}
+
+/// Write this node's ack for `version` (atomic temp + rename;
+/// overwrites its own prior ack — re-applies re-ack).
+///
+/// # Errors
+/// IO or serialization failures.
+pub fn write_ack(workgroup_root: &Path, version: u64, ack: &ApplyAck) -> io::Result<PathBuf> {
+    let dir = acks_dir(workgroup_root, version);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.json", ack.peer));
+    let json = serde_json::to_string_pretty(ack)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let tmp = dir.join(format!(".{}.json.tmp", ack.peer));
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+/// Read every parseable ack for `version`, sorted by peer. Tolerant
+/// of junk/half-replicated files, like [`read_revisions`].
+#[must_use]
+pub fn read_acks(workgroup_root: &Path, version: u64) -> Vec<ApplyAck> {
+    let dir = acks_dir(workgroup_root, version);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<ApplyAck> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|raw| serde_json::from_str(&raw).ok())
+        .collect();
+    out.sort_by(|a, b| a.peer.cmp(&b.peer));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +228,54 @@ mod tests {
         std::fs::write(dir.join("garbage.yaml"), "{{not yaml").unwrap();
         std::fs::write(dir.join("README.txt"), "hello").unwrap();
         assert_eq!(read_revisions(&dir).len(), 1);
+    }
+
+    #[test]
+    fn acks_round_trip_and_reack_overwrites() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ack = ApplyAck {
+            peer: "pine".into(),
+            status: "applied".into(),
+            at: 100,
+            detail: String::new(),
+        };
+        write_ack(tmp.path(), 3, &ack).unwrap();
+        write_ack(
+            tmp.path(),
+            3,
+            &ApplyAck {
+                peer: "oak".into(),
+                status: "failed".into(),
+                at: 110,
+                detail: "dnf exploded".into(),
+            },
+        )
+        .unwrap();
+        let acks = read_acks(tmp.path(), 3);
+        assert_eq!(acks.len(), 2);
+        assert_eq!(acks[0].peer, "oak");
+        assert_eq!(acks[0].detail, "dnf exploded");
+        // Re-ack overwrites own file (re-apply -> re-ack).
+        write_ack(
+            tmp.path(),
+            3,
+            &ApplyAck {
+                peer: "oak".into(),
+                status: "applied".into(),
+                at: 120,
+                detail: String::new(),
+            },
+        )
+        .unwrap();
+        let again = read_acks(tmp.path(), 3);
+        assert_eq!(again.len(), 2);
+        assert_eq!(again[0].status, "applied");
+    }
+
+    #[test]
+    fn acks_for_unacked_version_are_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(read_acks(tmp.path(), 99).is_empty());
     }
 
     #[test]
