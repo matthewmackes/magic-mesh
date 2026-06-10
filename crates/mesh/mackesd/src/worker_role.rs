@@ -37,6 +37,7 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     ("sshd_overlay_bind", 0),
     ("ssh_pubkey_gossip", 0),
     ("fleet_reconcile", 0),
+    ("presence_watch", 0),
     ("reconcile", 0),
     // ── Server (rank 1) — adds fleet + mesh storage.
     ("ansible-pull", 1),
@@ -106,8 +107,8 @@ mod tests {
         // worker (RETIRE-PY.4, mesh storage is LizardFS/E3).
         // -12 sway/desktop workers (E11 'Cosmic owns the desktop' — the
         // labwc/sway worker stack deleted). +1 ssh_pubkey_gossip (SVC-2),
-        // +1 fleet_reconcile (PD-9/FPG).
-        assert_eq!(WORKER_TIERS.len(), 19);
+        // +1 fleet_reconcile (PD-9/FPG), +1 presence_watch (PD-13).
+        assert_eq!(WORKER_TIERS.len(), 20);
     }
 
     #[test]
@@ -115,8 +116,8 @@ mod tests {
         let count = |rank: u8| WORKER_TIERS.iter().filter(|(_, r)| *r == rank).count();
         assert_eq!(
             count(0),
-            13,
-            "Lighthouse control plane (+ssh_pubkey_gossip SVC-2, +fleet_reconcile PD-9)"
+            14,
+            "Lighthouse control plane (+ssh_pubkey_gossip, +fleet_reconcile, +presence_watch)"
         );
         assert_eq!(
             count(1),
@@ -174,9 +175,9 @@ mod tests {
         let lh = workers_for_rank(Role::Lighthouse.rank());
         let srv = workers_for_rank(Role::Server.rank());
         let ws = workers_for_rank(Role::Workstation.rank());
-        assert_eq!(lh.len(), 13);
-        assert_eq!(srv.len(), 15);
-        assert_eq!(ws.len(), 19);
+        assert_eq!(lh.len(), 14);
+        assert_eq!(srv.len(), 16);
+        assert_eq!(ws.len(), 20);
         // Strict superset: every lower-tier worker is in the higher tier.
         assert!(lh.iter().all(|w| srv.contains(w)));
         assert!(srv.iter().all(|w| ws.contains(w)));

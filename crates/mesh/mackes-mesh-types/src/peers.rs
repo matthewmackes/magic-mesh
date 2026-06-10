@@ -56,6 +56,9 @@ pub struct ServiceDescriptors {
     pub media: Vec<MediaService>,
     /// Netdata alarm summary (L15 3-tier).
     pub alarms: AlarmSummary,
+    /// This peer's physical LAN MAC addresses (PD-12 — the Wake-on-LAN
+    /// targets; own-row authority beats ARP-cache guessing).
+    pub lan_macs: Vec<String>,
 }
 
 /// Which remote-access services listen locally.

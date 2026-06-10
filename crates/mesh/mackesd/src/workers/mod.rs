@@ -262,6 +262,8 @@ pub mod sshd_overlay_bind;
 pub mod ssh_pubkey_gossip;
 // PD-9 / FPG — drives `magic-fleet reconcile` on cadence + on nudge.
 pub mod fleet_reconcile;
+// PD-13 — presence-transition alerts riding the alert_relay pipeline.
+pub mod presence_watch;
 // NF-21.3 — owns the firewalld preset that opens Nebula's
 // UDP/4242 (all peers) + TCP/443 (lighthouses) inbound. Replaces
 // mesh_nebula.py::apply_nebula_firewall_preset so the Python

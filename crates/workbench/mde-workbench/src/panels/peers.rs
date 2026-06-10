@@ -39,6 +39,8 @@ pub struct PeerRow {
     pub ssh: bool,
     pub rdp: bool,
     pub vnc: bool,
+    /// PD-12 — the peer's published LAN MACs (Wake-on-LAN targets).
+    pub lan_macs: Vec<String>,
 }
 
 /// Panel state.
@@ -74,6 +76,15 @@ pub enum Message {
         host: String,
         ok: bool,
     },
+    /// PD-12 — Wake-on-LAN an offline peer (first published MAC).
+    WakeClicked {
+        host: String,
+        mac: String,
+    },
+    WakeFinished {
+        host: String,
+        ok: bool,
+    },
 }
 
 /// Parse the PD-1 directory JSON into rows (pure, testable).
@@ -103,6 +114,7 @@ pub fn parse_directory(raw: &str) -> Result<Vec<PeerRow>, String> {
                     };
                     let mut services = Vec::new();
                     let (mut ssh, mut rdp, mut vnc) = (false, false, false);
+                    let mut lan_macs: Vec<String> = Vec::new();
                     if let Some(d) = p.get("descriptors").filter(|d| !d.is_null()) {
                         let ra = &d["remote_access"];
                         for (label, key, flag) in [
@@ -134,6 +146,11 @@ pub fn parse_directory(raw: &str) -> Result<Vec<PeerRow>, String> {
                                 vm["state"].as_str().unwrap_or("?"),
                             ));
                         }
+                        for mac in d["lan_macs"].as_array().into_iter().flatten() {
+                            if let Some(m) = mac.as_str() {
+                                lan_macs.push(m.to_string());
+                            }
+                        }
                         for m in d["media"].as_array().into_iter().flatten() {
                             services.push(format!(
                                 "media: {} :{}",
@@ -157,6 +174,7 @@ pub fn parse_directory(raw: &str) -> Result<Vec<PeerRow>, String> {
                         ssh,
                         rdp,
                         vnc,
+                        lan_macs,
                     })
                 })
                 .collect()
@@ -302,6 +320,38 @@ impl PeersPanel {
                     format!("{host}: nudged — it reconciles within ~10 s")
                 } else {
                     format!("{host}: nudge failed (mackesd unreachable?)")
+                };
+                Task::none()
+            }
+            Message::WakeClicked { host, mac } => {
+                self.op_result = format!("waking {host} ({mac})…");
+                let h = host.clone();
+                Task::perform(
+                    async move {
+                        let body = format!(r#"{{"mac":"{mac}"}}"#);
+                        let ok = tokio::task::spawn_blocking(move || {
+                            crate::dbus::action_request_with_body(
+                                "action/mesh/wake",
+                                Some(&body),
+                                Duration::from_secs(2),
+                            )
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                        .map(|v| v["ok"] == true)
+                        .unwrap_or(false);
+                        (h, ok)
+                    },
+                    |(host, ok)| crate::Message::Peers(Message::WakeFinished { host, ok }),
+                )
+            }
+            Message::WakeFinished { host, ok } => {
+                self.op_result = if ok {
+                    format!("{host}: magic packet sent — watch for it to come online")
+                } else {
+                    format!("{host}: wake failed (mackesd unreachable?)")
                 };
                 Task::none()
             }
@@ -482,6 +532,20 @@ impl PeersPanel {
                         .color(palette.text_muted.into_iced_color())
                         .into()
                 };
+                // PD-12 — Wake is the one op an offline peer offers (L4).
+                let wake: Element<'_, crate::Message> =
+                    match (r.presence.as_str(), r.lan_macs.first()) {
+                        ("offline", Some(mac)) => crate::controls::variant_button(
+                            "Wake",
+                            crate::controls::ButtonVariant::Primary,
+                            Some(crate::Message::Peers(Message::WakeClicked {
+                                host: r.hostname.clone(),
+                                mac: mac.clone(),
+                            })),
+                            palette,
+                        ),
+                        _ => Space::new().height(Length::Fixed(0.0)).into(),
+                    };
                 // PD-9 — Apply now appears only for a behind peer (Q16).
                 let nudge: Element<'_, crate::Message> = if r.currency == "behind" {
                     crate::controls::variant_button(
@@ -539,7 +603,7 @@ impl PeersPanel {
                         );
                     }
                 }
-                column![header, ops, strip, facts, services]
+                column![header, ops, wake, strip, facts, services]
                     .spacing(16)
                     .into()
             }
@@ -707,6 +771,16 @@ mod tests {
         assert!(!op_enabled(pine, pine.ssh, "pine"), "no SSH-to-self");
         let oak = &rows[1]; // offline
         assert!(!op_enabled(oak, true, "elsewhere"), "offline disables ops");
+    }
+
+    #[test]
+    fn wake_results_land_in_the_strip() {
+        let mut p = PeersPanel::new();
+        let _ = p.update(Message::WakeFinished {
+            host: "oak".into(),
+            ok: true,
+        });
+        assert!(p.op_result.contains("magic packet sent"));
     }
 
     #[test]

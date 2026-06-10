@@ -241,7 +241,7 @@ pub fn notify_send_argv(binary: &str, event: &AlertEventPartial) -> Vec<String> 
 
 /// Resolve `~/.local/share/mde/alerts/` honoring
 /// `$XDG_DATA_HOME` first.
-fn default_alerts_dir() -> Option<PathBuf> {
+pub fn default_alerts_dir() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
         return Some(PathBuf::from(xdg).join("mde").join("alerts"));
     }

@@ -31,6 +31,10 @@ use serde_json::json;
 /// The directory verb's action topic.
 pub const ACTION_TOPIC: &str = "action/mesh/directory";
 
+/// PD-12 — the Wake-on-LAN verb: `{mac}` → broadcast the magic
+/// packet from THIS box (the segment-sharing relay is a follow-up).
+pub const WAKE_TOPIC: &str = "action/mesh/wake";
+
 /// Responder poll interval (matches the fleet responder).
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
@@ -170,9 +174,47 @@ fn now_ms() -> u64 {
 /// dedicated-OS-thread shape as the fleet responder.
 pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &DirectoryService, should_stop: F) {
     let mut cursor: Option<String> = None;
+    let mut wake_cursor: Option<String> = None;
     while !should_stop() {
         poll_once(persist, svc, &mut cursor);
+        poll_wake_once(persist, &mut wake_cursor);
         std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// PD-12 — answer wake requests: validate the MAC, fire the magic
+/// packet (UDP/9 broadcast), reply `{ok}` / honest error.
+pub fn poll_wake_once(persist: &Persist, cursor: &mut Option<String>) {
+    let msgs = match persist.list_since(WAKE_TOPIC, cursor.as_deref()) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    for msg in msgs {
+        *cursor = Some(msg.ulid.clone());
+        let reply = wake_reply(msg.body.as_deref());
+        let _ = persist.write(
+            &reply_topic(&msg.ulid),
+            Priority::Default,
+            None,
+            Some(&reply),
+        );
+    }
+}
+
+/// Build the wake reply (pure-ish; the send is the side effect).
+#[must_use]
+pub fn wake_reply(body: Option<&str>) -> String {
+    let req: serde_json::Value =
+        serde_json::from_str(body.unwrap_or("{}")).unwrap_or(serde_json::Value::Null);
+    let Some(mac_str) = req.get("mac").and_then(|v| v.as_str()) else {
+        return json!({ "ok": false, "error": "wake: missing `mac`" }).to_string();
+    };
+    let Some(mac) = crate::workers::wol::normalize_mac(mac_str) else {
+        return json!({ "ok": false, "error": format!("wake: bad mac {mac_str}") }).to_string();
+    };
+    match crate::workers::wol::wake(mac, "255.255.255.255", 9) {
+        Ok(()) => json!({ "ok": true, "woke": mac_str }).to_string(),
+        Err(e) => json!({ "ok": false, "error": format!("wake: {e}") }).to_string(),
     }
 }
 
@@ -276,6 +318,20 @@ mod tests {
         assert_eq!(p["mde_version"], "4.2.1");
         // No roster DB → overlay/role are honest nulls.
         assert!(p["overlay_ip"].is_null());
+    }
+
+    #[test]
+    fn wake_reply_validates_macs_honestly() {
+        let bad: serde_json::Value = serde_json::from_str(&wake_reply(None)).unwrap();
+        assert_eq!(bad["ok"], false);
+        let garbage: serde_json::Value =
+            serde_json::from_str(&wake_reply(Some(r#"{"mac":"zz:zz"}"#))).unwrap();
+        assert_eq!(garbage["ok"], false);
+        // A well-formed MAC broadcasts (UDP send to 255.255.255.255:9
+        // succeeds without a listener — fire-and-forget by design).
+        let ok: serde_json::Value =
+            serde_json::from_str(&wake_reply(Some(r#"{"mac":"aa:bb:cc:dd:ee:ff"}"#))).unwrap();
+        assert_eq!(ok["ok"], true);
     }
 
     #[test]

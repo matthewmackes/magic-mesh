@@ -48,7 +48,27 @@ pub fn probe_local() -> ServiceDescriptors {
         vms: probe_libvirt(),
         media: probe_media(),
         alarms: probe_netdata_alarms(),
+        lan_macs: probe_lan_macs(),
     }
+}
+
+/// Physical-interface MACs from `/sys/class/net` (PD-12). Physical =
+/// has a `device` symlink (filters lo, bridges, veths, tunnels).
+#[must_use]
+pub fn probe_lan_macs() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return Vec::new();
+    };
+    let mut macs: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.path().join("device").exists())
+        .filter_map(|e| std::fs::read_to_string(e.path().join("address")).ok())
+        .map(|m| m.trim().to_lowercase())
+        .filter(|m| m.len() == 17 && m != "00:00:00:00:00:00")
+        .collect();
+    macs.sort();
+    macs.dedup();
+    macs
 }
 
 /// `podman ps --all --format json` → L10 rows. Empty without podman.

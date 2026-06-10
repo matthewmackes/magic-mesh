@@ -242,14 +242,14 @@ host-local Ansible apply.
     - [ ] stop/restart requires the inline confirm; start does not
     - [ ] the verb refuses any target not present in the peer's published descriptor set (no arbitrary podman/virsh passthrough)
     - [ ] failures land in the inline result strip with the executor's error text
-- [ ] **PD-12: PEERS — Wake-on-LAN for offline peers**
+- [✓] **PD-12: PEERS — Wake-on-LAN for offline peers** — done — peers publish their physical LAN MACs in descriptors (own-row authority beats ARP guessing); action/mesh/wake validates + broadcasts the magic packet from this box; Wake renders only on offline peers with a published MAC. Segment-sharing relay (wake via ANOTHER online peer) deferred — needs cross-peer verb routing
   **As** an operator looking at an offline peer,
   **I want** a Wake action that asks the nearest online peer sharing the target's LAN segment to send the magic packet (Bus verb; MAC from the existing peer-MAC cache) (L4),
   **so that** Offline is actionable, not just gray.
   **Acceptance:**
     - [ ] waking a WoL-enabled offline peer brings it Online in the directory within its boot time
     - [ ] the button is absent when no online peer shares the target's segment or no MAC is cached
-- [ ] **PD-13: PEERS — presence-transition alerts**
+- [✓] **PD-13: PEERS — presence-transition alerts** — done — presence_watch worker (rank 0, census 20): 30s sweeps diff Q11 tiers, offline-boundary crossings write alert JSON into the alert_relay pipeline (warn on drop, info on return); restart-seeded silently; idle flaps quiet
   **As** a user anywhere on the desktop,
   **I want** peer Online↔Offline transitions emitted through alert_relay → the cosmic-applet FDO notification path (L5, rides OBS-7/OBS-8 plumbing),
   **so that** mesh-shape changes reach me without watching the directory.
