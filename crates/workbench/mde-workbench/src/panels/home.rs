@@ -799,12 +799,11 @@ async fn probe_mesh_services() -> ProbeOutcome {
 // --- Fleet -----------------------------------------------------------------
 
 async fn probe_fleet_revision() -> ProbeOutcome {
-    // action/fleet/list-revisions over the mesh Bus (E0.3.3, was the
-    // dev.mackes.MDE.Fleet D-Bus ListRevisions). The verb is a Phase-G
-    // stub today → the reply is an error envelope → no "r-" id → the
-    // pill reads "No revisions pushed yet" (extract_first_revision_id
-    // finds no token). spawn_blocking: the Bus client spins its own
-    // current-thread runtime (Persist isn't Send).
+    // action/fleet/list-revisions over the mesh Bus (FPG-4): the reply
+    // is `{ok, head, revisions: [{version, author, at}]}`. The pill
+    // shows the elected head version; an ok-empty log reads "No
+    // revisions pushed yet". spawn_blocking: the Bus client spins its
+    // own current-thread runtime (Persist isn't Send).
     let raw = match tokio::task::spawn_blocking(|| {
         crate::dbus::action_request(
             "action/fleet/list-revisions",
@@ -816,37 +815,20 @@ async fn probe_fleet_revision() -> ProbeOutcome {
         Ok(Some(s)) => s,
         _ => return ProbeOutcome::unknown(),
     };
-    let latest = extract_first_revision_id(&raw);
-    match latest {
-        Some(id) => {
-            ProbeOutcome::active(Some(format!("Last update {}", humanize_revision_age(&id))))
-        }
+    match extract_head_version(&raw) {
+        Some(head) => ProbeOutcome::active(Some(format!("Fleet at revision {head}"))),
         None => ProbeOutcome::setup_needed(Some("No revisions pushed yet".into())),
     }
 }
 
-fn extract_first_revision_id(raw: &str) -> Option<String> {
-    // Match the first "r-YYYY-MM-DD-NNNN" token in the raw
-    // dbus-send output. dbus-send's text format is more
-    // permissive than JSON so a quick token scan is the
-    // most resilient parse.
-    for tok in
-        raw.split(|c: char| c == '"' || c == ' ' || c == '\n' || c == ',' || c == '[' || c == ']')
-    {
-        if tok.starts_with("r-") && tok.len() >= 12 {
-            return Some(tok.to_string());
-        }
+/// Parse the FPG-4 list-revisions reply's elected `head` version.
+/// `None` for an empty log, an error envelope, or non-JSON.
+fn extract_head_version(raw: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    if v.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
     }
-    None
-}
-
-fn humanize_revision_age(id: &str) -> String {
-    // r-YYYY-MM-DD-NNNN — show the YYYY-MM-DD portion.
-    if let Some(date) = id.strip_prefix("r-").and_then(|s| s.get(..10)) {
-        date.to_string()
-    } else {
-        id.to_string()
-    }
+    v.get("head").and_then(serde_json::Value::as_u64)
 }
 
 // --- Notifications ---------------------------------------------------------
@@ -2092,23 +2074,19 @@ mod tests {
     }
 
     #[test]
-    fn extract_first_revision_id_picks_first_token() {
-        let raw = "array [\n  string \"r-2026-05-24-0042\"\n  string \"r-2026-05-23-0017\"\n]";
+    fn extract_head_version_reads_the_fpg4_reply() {
+        let raw = r#"{"ok":true,"head":7,"revisions":[{"version":7,"author":"peer:pine","at":1}]}"#;
+        assert_eq!(extract_head_version(raw), Some(7));
+    }
+
+    #[test]
+    fn extract_head_version_none_for_empty_log_or_errors() {
         assert_eq!(
-            extract_first_revision_id(raw),
-            Some("r-2026-05-24-0042".into())
+            extract_head_version(r#"{"ok":true,"head":null,"revisions":[]}"#),
+            None
         );
-    }
-
-    #[test]
-    fn extract_first_revision_id_handles_empty_array() {
-        assert_eq!(extract_first_revision_id("array [\n]"), None);
-    }
-
-    #[test]
-    fn humanize_revision_age_extracts_date() {
-        assert_eq!(humanize_revision_age("r-2026-05-24-0042"), "2026-05-24");
-        assert_eq!(humanize_revision_age("garbage"), "garbage");
+        assert_eq!(extract_head_version(r#"{"ok":false,"error":"x"}"#), None);
+        assert_eq!(extract_head_version("not json"), None);
     }
 
     #[test]

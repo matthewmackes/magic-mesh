@@ -35,6 +35,7 @@ path = "src/bin/mackesd.rs"
 
 [dependencies]
 mackes-mesh-types = { path = "../mackes-mesh-types" }
+magic-fleet = { path = "../magic-fleet" }
 # NF-1 (v2.5) — covert TCP/443 transport. mackesd consumes the
 # activation state machine + framing + rustls listener/dialer
 # from the new crate; `https_fallback.rs` re-exports the

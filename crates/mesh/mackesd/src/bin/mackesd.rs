@@ -4152,7 +4152,12 @@ fn run_serve(
             .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
         {
             Ok(persist) => {
-                let fleet_svc = mackesd_core::ipc::fleet::FleetService::default();
+                // FPG-4 — the verbs run against the LizardFS revision
+                // log; any node serves + mints (leaderless, FPG-3).
+                let fleet_svc = mackesd_core::ipc::fleet::FleetService::new(
+                    &workgroup_root,
+                    node_id.clone(),
+                );
                 let resp_shutdown = Arc::clone(&shutdown);
                 std::thread::Builder::new()
                     .name("fleet-bus-responder".into())
@@ -4165,7 +4170,7 @@ fn run_serve(
                         tracing::info!(
                             "Fleet Bus responder spawned; serving \
                              action/fleet/{{push-revision,list-revisions,diff-revisions,rollback}} \
-                             (Phase-G stubs)"
+                             (FPG-4, LizardFS revision log)"
                         );
                     })
                     .unwrap_or_else(|e| {

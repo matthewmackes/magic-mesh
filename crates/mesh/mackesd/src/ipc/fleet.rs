@@ -3,37 +3,107 @@
 //! `action/fleet/<verb>` (E0.3.3), replacing the retired
 //! `dev.mackes.MDE.Fleet` D-Bus interface.
 //!
-//! Phase A shipped the interface shell; the verbs are still STUBS
-//! ("not implemented until v2.0.0 Phase G"). Per the migrate-all
-//! disposition (operator, 2026-06-04) the surface moves onto the
-//! Bus now — the responder replies the stub envelope — so Phase G
-//! fills in the real revision logic on the Bus (in [`build_reply`]),
-//! not on D-Bus. The Workbench fleet panels already drive
-//! push/rollback via the `mackesd` CLI; the only Bus reader today is
-//! home.rs `probe_fleet_revision` (list-revisions → "no revisions").
+//! **FPG-4 (2026-06-09): the verbs are real.** They run against the
+//! `magic_fleet::store` append-only revision log on the LizardFS
+//! workgroup root (FPG-2) — replication is the transport, the
+//! directory is the truth. **Leaderless (FPG-3):** any node serves
+//! these verbs and any node mints; `next_version` + the append-only
+//! write + the `version → at → author` total order make concurrent
+//! mints converge identically everywhere. The leader lease guards
+//! only per-node SQLite mirror writes, never authorship.
 //!
-//! The old `revision_applied` D-Bus signal retires with the
-//! interface: nothing emits it today, so there is no Bus event topic
-//! yet — Phase G adds `event/fleet/signals` + a worker emitter +
-//! the Workbench subscription when revision-apply actually lands.
+//! Verb contract (request body / reply, all JSON):
+//! - `push-revision`  `{spec: <BaselineSpec YAML>, author?}` →
+//!   `{ok, version}` — mints the next version.
+//! - `list-revisions` `{}` → `{ok, head, revisions: [{version,
+//!   author, at}]}` — the full held set tagged with the winner (Q16).
+//! - `diff-revisions` `{from, to}` → `{ok, from, to, changed:
+//!   [<domain>…]}` — flat top-level domain diff (Q7).
+//! - `rollback`       `{target}` → `{ok, version, of}` — mints a
+//!   HIGHER version carrying the target's spec; history is immutable
+//!   (Q6).
+//!
+//! `event/fleet/signals` (apply-acks) lands with FPG-5.
 
 #![cfg(feature = "async-services")]
 
 use std::collections::HashMap;
 
+use std::path::PathBuf;
+
+use magic_fleet::{store, BaselineSpec, Revision};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use serde_json::json;
 
-/// Fleet control service. Stateless today (the verbs are Phase-G
-/// stubs); kept as the responder handle so Phase G can hang the
-/// revision store off it without changing call sites.
+/// Fleet control service — owns the revision-log location + the
+/// author identity stamped on mints from this node.
 #[derive(Debug, Default, Clone)]
-pub struct FleetService;
+pub struct FleetService {
+    /// `<workgroup-root>/fleet/revisions` (FPG-2).
+    pub revisions_dir: PathBuf,
+    /// This node's id — the default `author` for push/rollback mints.
+    pub node_id: String,
+}
 
-/// Action verbs served on `action/fleet/<verb>` (E0.3.3). All are
-/// Phase-G stubs today.
+impl FleetService {
+    /// Service rooted at the replicated workgroup root.
+    #[must_use]
+    pub fn new(workgroup_root: &std::path::Path, node_id: String) -> Self {
+        Self {
+            revisions_dir: store::revisions_dir(workgroup_root),
+            node_id,
+        }
+    }
+}
+
+/// Flat top-level domain diff (Q7): the domain names whose content
+/// differs between two specs.
+#[must_use]
+pub fn diff_domains(a: &BaselineSpec, b: &BaselineSpec) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    if a.packages != b.packages {
+        changed.push("packages");
+    }
+    if a.services != b.services {
+        changed.push("services");
+    }
+    if a.files != b.files {
+        changed.push("files");
+    }
+    if a.users != b.users {
+        changed.push("users");
+    }
+    if a.groups != b.groups {
+        changed.push("groups");
+    }
+    if a.cron != b.cron {
+        changed.push("cron");
+    }
+    if a.sysctl != b.sysctl {
+        changed.push("sysctl");
+    }
+    if a.firewall != b.firewall {
+        changed.push("firewall");
+    }
+    if a.settings != b.settings {
+        changed.push("settings");
+    }
+    changed
+}
+
+fn now_s() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn err(msg: impl std::fmt::Display) -> String {
+    json!({ "ok": false, "error": msg.to_string() }).to_string()
+}
+
+/// Action verbs served on `action/fleet/<verb>` (E0.3.3).
 pub const ACTION_VERBS: [&str; 4] = [
     "push-revision",
     "list-revisions",
@@ -50,27 +120,99 @@ pub fn action_topic(verb: &str) -> String {
     format!("action/fleet/{verb}")
 }
 
-/// Build the reply body for one `action/fleet/<verb>` request. Every
-/// verb is a Phase-G stub today, so the reply is the not-implemented
-/// error envelope; consumers surface it as "no fleet data" (home.rs
-/// `probe_fleet_revision` → "No revisions pushed yet"). Phase G
-/// replaces these arms with real revision logic over the store.
+/// Build the reply body for one `action/fleet/<verb>` request
+/// against the revision log (FPG-4). `body` is the request JSON
+/// (absent body = `{}`).
 #[must_use]
-pub fn build_reply(_svc: &FleetService, verb: &str) -> String {
-    let msg = match verb {
-        "push-revision" | "list-revisions" | "diff-revisions" | "rollback" => {
-            format!("Fleet.{verb} — not implemented until v2.0.0 Phase G")
+pub fn build_reply(svc: &FleetService, verb: &str, body: Option<&str>) -> String {
+    let req: serde_json::Value =
+        serde_json::from_str(body.unwrap_or("{}")).unwrap_or(serde_json::Value::Null);
+    match verb {
+        "push-revision" => {
+            let Some(spec_yaml) = req.get("spec").and_then(|v| v.as_str()) else {
+                return err("push-revision: missing `spec` (BaselineSpec YAML)");
+            };
+            let spec = match BaselineSpec::from_yaml(spec_yaml) {
+                Ok(s) => s,
+                Err(e) => return err(format!("push-revision: bad spec: {e}")),
+            };
+            let author = req
+                .get("author")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&svc.node_id)
+                .to_string();
+            let revision = Revision {
+                version: store::next_version(&svc.revisions_dir),
+                author,
+                at: now_s(),
+                spec,
+            };
+            match store::write_revision(&svc.revisions_dir, &revision) {
+                Ok(_) => json!({ "ok": true, "version": revision.version }).to_string(),
+                Err(e) => err(format!("push-revision: {e}")),
+            }
         }
-        other => format!("unknown fleet verb: {other}"),
-    };
-    json!({ "error": msg }).to_string()
+        "list-revisions" => {
+            let all = store::read_revisions(&svc.revisions_dir);
+            let head = magic_fleet::elect_revision(&all).map(|r| r.version);
+            let rows: Vec<_> = all
+                .iter()
+                .map(|r| json!({ "version": r.version, "author": r.author, "at": r.at }))
+                .collect();
+            json!({ "ok": true, "head": head, "revisions": rows }).to_string()
+        }
+        "diff-revisions" => {
+            let (Some(from), Some(to)) = (
+                req.get("from").and_then(serde_json::Value::as_u64),
+                req.get("to").and_then(serde_json::Value::as_u64),
+            ) else {
+                return err("diff-revisions: need numeric `from` + `to`");
+            };
+            let all = store::read_revisions(&svc.revisions_dir);
+            let (Some(a), Some(b)) = (
+                all.iter().find(|r| r.version == from),
+                all.iter().find(|r| r.version == to),
+            ) else {
+                return err(format!("diff-revisions: unknown version ({from} or {to})"));
+            };
+            json!({ "ok": true, "from": from, "to": to,
+                    "changed": diff_domains(&a.spec, &b.spec) })
+            .to_string()
+        }
+        "rollback" => {
+            let Some(target) = req.get("target").and_then(serde_json::Value::as_u64) else {
+                return err("rollback: need numeric `target`");
+            };
+            let all = store::read_revisions(&svc.revisions_dir);
+            let Some(old) = all.iter().find(|r| r.version == target) else {
+                return err(format!("rollback: unknown version {target}"));
+            };
+            let revision = Revision {
+                version: store::next_version(&svc.revisions_dir),
+                author: req
+                    .get("author")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&svc.node_id)
+                    .to_string(),
+                at: now_s(),
+                spec: old.spec.clone(),
+            };
+            match store::write_revision(&svc.revisions_dir, &revision) {
+                Ok(_) => {
+                    json!({ "ok": true, "version": revision.version, "of": target }).to_string()
+                }
+                Err(e) => err(format!("rollback: {e}")),
+            }
+        }
+        other => err(format!("unknown fleet verb: {other}")),
+    }
 }
 
 /// Run the Fleet Bus responder loop on the current thread until
-/// `should_stop()`. No tokio runtime needed (the stub builders are
-/// synchronous; `Persist`/rusqlite isn't `Send`, so `mackesd`
-/// `run_serve` spawns this on a dedicated OS thread — same shape as
-/// the Shell responder).
+/// `should_stop()`. No tokio runtime needed (the verb handlers are
+/// synchronous filesystem reads/writes; `Persist`/rusqlite isn't
+/// `Send`, so `mackesd` `run_serve` spawns this on a dedicated OS
+/// thread — same shape as the Shell responder).
 pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &FleetService, should_stop: F) {
     let mut cursors: HashMap<String, String> = HashMap::new();
     while !should_stop() {
@@ -95,7 +237,7 @@ pub fn poll_once(persist: &Persist, svc: &FleetService, cursors: &mut HashMap<St
         };
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
-            let reply = build_reply(svc, verb);
+            let reply = build_reply(svc, verb, msg.body.as_deref());
             if let Err(e) = persist.write(
                 &reply_topic(&msg.ulid),
                 Priority::Default,
@@ -129,12 +271,92 @@ mod tests {
         );
     }
 
+    fn svc_in(dir: &std::path::Path) -> FleetService {
+        FleetService::new(dir, "peer:test".into())
+    }
+
     #[test]
-    fn build_reply_stubs_until_phase_g() {
-        let svc = FleetService;
-        for v in ACTION_VERBS {
-            assert!(build_reply(&svc, v).contains("not implemented until v2.0.0 Phase G"));
+    fn push_then_list_round_trips_with_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = svc_in(tmp.path());
+        let r1 = build_reply(&svc, "push-revision", Some(r#"{"spec": "packages: []\n"}"#));
+        let v1: serde_json::Value = serde_json::from_str(&r1).unwrap();
+        assert_eq!(v1["ok"], true);
+        assert_eq!(v1["version"], 1);
+        let list: serde_json::Value =
+            serde_json::from_str(&build_reply(&svc, "list-revisions", None)).unwrap();
+        assert_eq!(list["ok"], true);
+        assert_eq!(
+            list["head"], 1,
+            "the held set is tagged with the winner (Q16)"
+        );
+        assert_eq!(list["revisions"].as_array().unwrap().len(), 1);
+        assert_eq!(list["revisions"][0]["author"], "peer:test");
+    }
+
+    #[test]
+    fn rollback_mints_a_higher_version_of_the_old_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = svc_in(tmp.path());
+        let _ = build_reply(
+            &svc,
+            "push-revision",
+            Some(r#"{"spec": "packages:\n  - name: vim\n"}"#),
+        );
+        let _ = build_reply(&svc, "push-revision", Some(r#"{"spec": "packages: []\n"}"#));
+        let rb: serde_json::Value =
+            serde_json::from_str(&build_reply(&svc, "rollback", Some(r#"{"target": 1}"#))).unwrap();
+        assert_eq!(rb["ok"], true);
+        assert_eq!(rb["version"], 3, "rollback = a HIGHER version (Q6)");
+        assert_eq!(rb["of"], 1);
+        // The new head carries v1's spec again.
+        let head = magic_fleet::store::elect_head(&svc.revisions_dir).unwrap();
+        assert_eq!(head.spec.packages.len(), 1);
+    }
+
+    #[test]
+    fn diff_reports_flat_changed_domains() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = svc_in(tmp.path());
+        let _ = build_reply(&svc, "push-revision", Some(r#"{"spec": "packages: []\n"}"#));
+        let _ = build_reply(
+            &svc,
+            "push-revision",
+            Some(r#"{"spec": "packages:\n  - name: vim\nsettings:\n  theme.accent: '\"x\"'\n"}"#),
+        );
+        let d: serde_json::Value = serde_json::from_str(&build_reply(
+            &svc,
+            "diff-revisions",
+            Some(r#"{"from": 1, "to": 2}"#),
+        ))
+        .unwrap();
+        assert_eq!(d["ok"], true);
+        let changed: Vec<&str> = d["changed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            changed,
+            ["packages", "settings"],
+            "flat top-level diff (Q7)"
+        );
+    }
+
+    #[test]
+    fn bad_requests_reply_honest_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = svc_in(tmp.path());
+        for (verb, body) in [
+            ("push-revision", None),
+            ("diff-revisions", Some(r#"{"from": 1}"#)),
+            ("rollback", Some(r#"{"target": 99}"#)),
+        ] {
+            let r: serde_json::Value =
+                serde_json::from_str(&build_reply(&svc, verb, body)).unwrap();
+            assert_eq!(r["ok"], false, "{verb} must report not panic");
         }
-        assert!(build_reply(&svc, "bogus").contains("unknown fleet verb"));
+        assert!(build_reply(&svc, "bogus", None).contains("unknown fleet verb"));
     }
 }
