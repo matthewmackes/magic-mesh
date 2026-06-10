@@ -32,6 +32,7 @@ pub mod event;
 pub mod keygen;
 pub mod lan;
 pub mod pairing;
+pub mod session_persist;
 pub mod tls;
 pub mod transport;
 

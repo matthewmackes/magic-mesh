@@ -110,13 +110,54 @@ impl PairingStore {
         let public_key_der = public_key_pkcs1_from_pkcs8(&pkcs8)?;
         let devices = read_devices(&dir);
 
-        Ok(Self {
+        let store = Self {
             dir,
             keypair,
             public_key_der,
             devices: Mutex::new(devices),
             sessions: RingKeyStore::new(),
-        })
+        };
+        // SEC-8 (Q34) — restore the sealed session keys so live links
+        // survive a daemon restart instead of forcing a re-pair.
+        // Fails closed to empty (wrong master / tampered / absent).
+        let master_path = store.dir.join("session-master.key");
+        if let Ok(master) = crate::session_persist::load_or_create_master(&master_path) {
+            let restored =
+                crate::session_persist::load_sessions(&store.dir.join("sessions.enc"), &master);
+            for (device_id, raw) in &restored {
+                let handle = store.sessions.install_session_key(raw);
+                tracing::debug!(device = %device_id, ?handle, "SEC-8: session restored");
+            }
+            if !restored.is_empty() {
+                tracing::info!(
+                    count = restored.len(),
+                    "SEC-8: restored sealed KDC sessions across restart"
+                );
+            }
+        }
+        Ok(store)
+    }
+
+    /// SEC-8 — install a fresh session key AND persist the sealed map
+    /// (the SEC-4 handshake's completion hook): the device's link
+    /// survives the next restart.
+    ///
+    /// # Errors
+    /// Master-key / seal IO failures (the in-memory install still
+    /// happened — the link works until restart).
+    pub fn install_and_persist_session(
+        &self,
+        device_id: &str,
+        raw_key: &[u8],
+    ) -> Result<KeyHandle, HostError> {
+        let handle = self.sessions.install_session_key(raw_key);
+        let master =
+            crate::session_persist::load_or_create_master(&self.dir.join("session-master.key"))?;
+        let path = self.dir.join("sessions.enc");
+        let mut map = crate::session_persist::load_sessions(&path, &master);
+        map.insert(device_id.to_string(), raw_key.to_vec());
+        crate::session_persist::save_sessions(&path, &master, &map)?;
+        Ok(handle)
     }
 
     /// This host's RSA public key (PKCS#1 `RSAPublicKey` DER), to advertise

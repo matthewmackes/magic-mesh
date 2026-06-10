@@ -4136,6 +4136,7 @@ dependencies = [
  "pkcs8",
  "rand 0.8.6",
  "rcgen",
+ "ring",
  "rsa",
  "rustls",
  "serde",
@@ -4146,6 +4147,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
+ "tracing",
 ]
 
 [[package]]
