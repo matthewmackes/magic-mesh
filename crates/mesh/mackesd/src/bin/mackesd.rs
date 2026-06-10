@@ -699,6 +699,17 @@ enum Cmd {
         json: bool,
     },
 
+    /// PLANES-21 — the install-profile catalog. `mded profiles list
+    /// --json` emits every profile (the per-role core pack + any TOML in
+    /// `<root>/profiles/`): role pin, capability tags, kickstart
+    /// fragments, and the auto-join slot (W56/W60). The Provisioning ▸
+    /// Install Profiles panel consumes the JSON.
+    Profiles {
+        /// Emit the JSON array instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// CB-1.5.a — fleet node roster. `mded nodes list --json` emits
     /// every row from the `nodes` table as a JSON array; the Iced
     /// inventory panel (in `crates/mde-workbench/src/panels/
@@ -3855,6 +3866,30 @@ fn main() -> anyhow::Result<()> {
                         "{:<12} {}",
                         r["tag"].as_str().unwrap_or("-"),
                         if nodes.is_empty() { "(none)" } else { &nodes }
+                    );
+                }
+            }
+            return Ok(());
+        }
+        Cmd::Profiles { json } => {
+            // PLANES-21 — the install-profile catalog (core pack + TOML).
+            use mackesd_core::install_profiles;
+            let root = mackesd_core::default_qnm_shared_root();
+            let profiles = install_profiles::load_profiles(&root);
+            if json {
+                println!("{}", serde_json::to_string(&profiles)?);
+            } else {
+                println!(
+                    "{:<14} {:<12} {:<22} {:<9}",
+                    "PROFILE", "ROLE", "TAGS", "AUTO-JOIN"
+                );
+                for p in &profiles {
+                    println!(
+                        "{:<14} {:<12} {:<22} {:<9}",
+                        p.name,
+                        p.role,
+                        p.tags.iter().cloned().collect::<Vec<_>>().join(","),
+                        p.auto_join
                     );
                 }
             }

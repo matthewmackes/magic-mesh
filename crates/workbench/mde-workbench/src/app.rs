@@ -35,7 +35,7 @@ use crate::panels::{
     music as music_panel, network_hosts as network_hosts_panel, node_roles as node_roles_panel,
     notifications as notifications_panel, panel_apps as panel_apps_panel, peers as peers_panel,
     playbooks as playbooks_panel, policy as policy_panel, power as power_panel,
-    printers as printers_panel, registration as registration_panel,
+    printers as printers_panel, profiles as profiles_panel, registration as registration_panel,
     remote_desktop as remote_desktop_panel, removable as removable_panel, repair as repair_panel,
     resources as resources_panel, routing as routing_panel, run_history as run_history_panel,
     service_publishing as service_publishing_panel, session as session_panel,
@@ -201,6 +201,7 @@ pub enum Message {
     Dns(dns_panel::Message),
     Routing(routing_panel::Message),
     Tags(tags_panel::Message),
+    Profiles(profiles_panel::Message),
     /// BUS-7.2 — Network → Mackes Bus panel sub-message.
     MeshBus(mesh_bus_panel::Message),
     /// TUNE-15.b — Network → Mesh Federation panel sub-message.
@@ -306,6 +307,7 @@ pub struct App {
     dns: dns_panel::DnsPanel,
     routing: routing_panel::RoutingPanel,
     tags: tags_panel::TagsPanel,
+    profiles: profiles_panel::ProfilesPanel,
     mesh_bus: mesh_bus_panel::MeshBusPanel,
     mesh_federation: mesh_federation_panel::MeshFederationPanel,
     mesh_control: mesh_control_panel::MeshControlPanel,
@@ -424,6 +426,7 @@ impl App {
             dns: dns_panel::DnsPanel::new(),
             routing: routing_panel::RoutingPanel::new(),
             tags: tags_panel::TagsPanel::new(),
+            profiles: profiles_panel::ProfilesPanel::new(),
             mesh_bus: mesh_bus_panel::MeshBusPanel::new(),
             mesh_federation: mesh_federation_panel::MeshFederationPanel::new(),
             mesh_control: mesh_control_panel::MeshControlPanel::new(),
@@ -897,6 +900,7 @@ impl App {
             Message::Dns(msg) => self.dns.update(msg),
             Message::Routing(msg) => self.routing.update(msg),
             Message::Tags(msg) => self.tags.update(msg),
+            Message::Profiles(msg) => self.profiles.update(msg),
             Message::MeshBus(msg) => self.mesh_bus.update(msg),
             Message::MeshFederation(msg) => self.mesh_federation.update(msg),
             Message::MeshControl(msg) => self.mesh_control.update(msg),
@@ -994,6 +998,8 @@ impl App {
             (Group::Network, "routing") => routing_panel::RoutingPanel::load(),
             // PLANES-3/W82 — the fleet capability-tag census.
             (Group::Fleet, "tags") => tags_panel::TagsPanel::load(),
+            // PLANES-21 — the install-profile catalog.
+            (Group::Provisioning, "profiles") => profiles_panel::ProfilesPanel::load(),
             (Group::Controller, "audit") => audit_panel::AuditPanel::load(),
             (Group::ThisNode, "mesh_logs") => mesh_logs_panel::MeshLogsPanel::load(),
             (Group::Controller, "fleet_logs") => fleet_logs_panel::FleetLogsPanel::load(),
@@ -1405,6 +1411,11 @@ impl App {
                 group: Group::Fleet,
                 panel: "tags",
             } => self.tags.view(),
+            // PLANES-21 — the install-profile catalog.
+            View::Panel {
+                group: Group::Provisioning,
+                panel: "profiles",
+            } => self.profiles.view(),
             // BUS-7.2 — Mackes Bus 5-tab operator surface.
             View::Panel {
                 group: Group::Network,
@@ -1555,7 +1566,6 @@ impl App {
 /// follow-up.
 fn panel_worklist_item(group: Group, panel: &str) -> Option<&'static str> {
     match (group, panel) {
-        (Group::Provisioning, "profiles") => Some("PLANES-21 (install profiles)"),
         (Group::Provisioning, "images") => Some("PLANES-22 (images)"),
         (Group::Provisioning, "mirrors") => Some("PLANES-24 (mirrors)"),
         _ => None,
@@ -1630,7 +1640,6 @@ mod tests {
         // the worklist item building it, so the console never reads as
         // vaporware.
         for (g, p) in [
-            (Group::Provisioning, "profiles"),
             (Group::Provisioning, "images"),
             (Group::Provisioning, "mirrors"),
         ] {

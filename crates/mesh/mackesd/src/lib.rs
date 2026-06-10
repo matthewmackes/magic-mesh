@@ -113,6 +113,7 @@ pub mod surrounding_hosts;
 // behind `async-services` because it uses tokio UDP + tokio time.
 pub mod bearer_ledger;
 pub mod descriptors;
+pub mod install_profiles;
 pub mod leave;
 pub mod lifecycle;
 pub mod mesh_init;
