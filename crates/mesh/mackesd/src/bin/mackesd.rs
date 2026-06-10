@@ -367,6 +367,16 @@ enum Cmd {
         cred_path: Option<PathBuf>,
     },
 
+    /// PLANES-4 (W25) — print this node's signing-key fingerprint + its
+    /// word-pair (the out-of-band verbal-comparison rendering). `--json`
+    /// emits both for the Registration panel.
+    Identity {
+        /// Emit `{fingerprint, word_pair}` as JSON instead of the
+        /// human two-line form.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Walk the `events` table forward and verify every row's hash
     /// (Phase 12.10.3). Exits 0 on Intact / Empty, 1 on Break.
     AuditVerify {
@@ -1957,6 +1967,25 @@ fn main() -> anyhow::Result<()> {
                     "(encrypt at rest with: mackesd generate-passcode --store, \
                      or save to libsecret manually)"
                 );
+            }
+        }
+        Cmd::Identity { json } => {
+            // Load (or first-create) this node's signing key, fingerprint
+            // it, and render the W25 word-pair.
+            let key_path = std::path::PathBuf::from(mackesd_core::node_key::DEFAULT_KEY_PATH);
+            let signing = mackesd_core::node_key::load_or_create(&key_path)
+                .with_context(|| format!("loading node key at {}", key_path.display()))?;
+            let node = mackesd_core::identity::NodeKey::from_bytes(signing.to_bytes());
+            let fingerprint = node.fingerprint();
+            let word_pair = mackesd_core::identity::fingerprint_word_pair(&fingerprint);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "fingerprint": fingerprint, "word_pair": word_pair })
+                );
+            } else {
+                println!("fingerprint: {fingerprint}");
+                println!("word-pair:   {word_pair}");
             }
         }
         Cmd::AuditVerify { json } => {

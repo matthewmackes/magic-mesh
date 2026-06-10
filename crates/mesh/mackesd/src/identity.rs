@@ -86,6 +86,43 @@ impl std::fmt::Debug for NodeKey {
     }
 }
 
+/// PLANES-4 (W25) — a compact, deterministic **word-pair** rendering of a
+/// fingerprint, for verbal/visual out-of-band comparison ("do our two
+/// nodes show the same words?"). It is a *tripwire*, not the security
+/// boundary — the full hex fingerprint is the real check. The pair is the
+/// first two bytes of the hex mapped into a fixed 64-word list, so the
+/// same fingerprint always yields the same pair on every node. Returns an
+/// empty string for a malformed (non-hex / too-short) input.
+#[must_use]
+pub fn fingerprint_word_pair(fingerprint_hex: &str) -> String {
+    let byte = |i: usize| -> Option<u8> {
+        let s = fingerprint_hex.get(i * 2..i * 2 + 2)?;
+        u8::from_str_radix(s, 16).ok()
+    };
+    match (byte(0), byte(1)) {
+        (Some(b0), Some(b1)) => format!(
+            "{}-{}",
+            FINGERPRINT_WORDS[(b0 % 64) as usize],
+            FINGERPRINT_WORDS[(b1 % 64) as usize],
+        ),
+        _ => String::new(),
+    }
+}
+
+/// 64 short, distinct, easily-spoken nouns for [`fingerprint_word_pair`].
+/// Order is the protocol — never reorder (it would change every node's
+/// rendered pair). 64 = 6 bits/word, 12 bits across the pair: enough for
+/// a human cross-check, backed by the full hex.
+const FINGERPRINT_WORDS: [&str; 64] = [
+    "anchor", "amber", "arrow", "atlas", "basin", "birch", "blaze", "bloom", "cabin", "cedar",
+    "chalk", "clover", "comet", "coral", "crane", "delta", "dune", "ember", "fable", "falcon",
+    "fern", "flint", "frost", "glade", "grove", "harbor", "hazel", "heron", "ivory", "jade",
+    "kettle", "lagoon", "lantern", "ledger", "linen", "maple", "marble", "meadow", "moss",
+    "nectar", "oasis", "onyx", "opal", "otter", "pebble", "pine", "quartz", "quill", "raven",
+    "reef", "ridge", "saffron", "sage", "slate", "spruce", "tamarisk", "thistle", "topaz", "umber",
+    "vale", "willow", "wren", "yarrow", "zephyr",
+];
+
 /// Verify a signature using a peer's published verifying key.
 /// Returns `true` only when the signature is well-formed AND
 /// matches.
@@ -127,6 +164,25 @@ mod tests {
         let k2 = NodeKey::generate();
         let sig = k1.sign(b"payload");
         assert!(!verify(&k2.verifying_key(), b"payload", &sig));
+    }
+
+    #[test]
+    fn word_pair_is_deterministic_and_distinct_words() {
+        // 0x00.. → words[0]-words[0]; 0x41 0x82 → words[1]-words[2].
+        assert_eq!(fingerprint_word_pair("0000abcd"), "anchor-anchor");
+        assert_eq!(fingerprint_word_pair("4182dead"), "amber-arrow");
+        // Stable for the same fingerprint.
+        let fp = NodeKey::from_bytes([9u8; 32]).fingerprint();
+        assert_eq!(fingerprint_word_pair(&fp), fingerprint_word_pair(&fp));
+        // The pair is two real words joined by a hyphen.
+        assert!(fingerprint_word_pair(&fp).contains('-'));
+    }
+
+    #[test]
+    fn word_pair_rejects_malformed_input() {
+        assert_eq!(fingerprint_word_pair(""), "");
+        assert_eq!(fingerprint_word_pair("zz"), "");
+        assert_eq!(fingerprint_word_pair("a"), ""); // too short for one byte
     }
 
     #[test]
