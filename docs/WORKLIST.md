@@ -209,7 +209,7 @@ host-local Ansible apply.
     - [ ] edge click renders the trace card with the overlay path report, RTT sparkline, and expandable underlay hops
     - [ ] particles flow along an edge while real traffic moves between the two peers (Netdata-sourced)
     - [ ] the canvas honors the adaptive render budget (L22) — idle mesh ≈ idle CPU
-- [ ] **PD-8: PEERS — Netdata in the detail pane (sparklines + deep-link)**
+- [✓] **PD-8: PEERS — Netdata in the detail pane (sparklines + deep-link)** — done — view-gated 2s tick (Compute pattern, stops on nav-away); CPU/load/net/disk 60s series via std-only overlay HTTP; unicode sparklines (canvas treatment = /preview polish); stale fetches dropped; Metrics ↗ opens :19999; honest offline/unreachable states. NOTE: overlay-interface binding for Netdata (the security half) lands with the NET plane firewall work
   **As** an operator inspecting a peer,
   **I want** live CPU/load/net/disk sparklines (60 s window, ~2 s refresh while selected, L14) pulled from that peer's own Netdata REST API (:19999 over the overlay, bound to the overlay interface only) plus a Metrics button opening its full dashboard,
   **so that** per-peer telemetry is one selection away with no central aggregation (Q26a/Q26d, Q95/96 held).

@@ -54,6 +54,18 @@ pub struct PeersPanel {
     pub self_hostname: String,
     /// PD-5 — the inline result strip under the op toolbar (Q22).
     pub op_result: String,
+    /// PD-8 — live Netdata series for the selected peer (L14).
+    pub metrics: Option<PeerMetrics>,
+    pub metrics_err: Option<String>,
+}
+
+/// PD-8 — the four L14 series, oldest→newest over the last ~60 s.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PeerMetrics {
+    pub cpu: Vec<f64>,
+    pub load: Vec<f64>,
+    pub net: Vec<f64>,
+    pub disk: Vec<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +96,15 @@ pub enum Message {
     WakeFinished {
         host: String,
         ok: bool,
+    },
+    /// PD-8 — the 2 s metrics tick (app-level, view-gated).
+    MetricsTick,
+    /// PD-8 — open the peer's full Netdata dashboard in the browser.
+    OpenDashboard(String),
+    /// PD-8 — a metrics fetch resolved for `host`.
+    MetricsLoaded {
+        host: String,
+        result: Result<PeerMetrics, String>,
     },
 }
 
@@ -218,6 +239,93 @@ pub fn group_of(row: &PeerRow, self_hostname: &str) -> &'static str {
     }
 }
 
+/// PD-8 — the view-gated 2 s metrics tick (registered by `App::
+/// subscription` only while the Peers panel is the active view, so
+/// nothing polls when the operator is elsewhere — the Compute-panel
+/// pattern).
+#[must_use]
+pub fn metrics_subscription() -> iced::Subscription<crate::Message> {
+    iced::time::every(Duration::from_secs(2)).map(|_| crate::Message::Peers(Message::MetricsTick))
+}
+
+/// Fetch one Netdata chart's last-60s series over the overlay
+/// (std-only HTTP/1.0 GET — no HTTP-client dep, the D-W1 pattern).
+/// Blocking — call inside `spawn_blocking`.
+fn fetch_series(ip: &str, chart: &str) -> Result<Vec<f64>, String> {
+    use std::io::{Read, Write};
+    let addr = format!("{ip}:19999");
+    let mut stream = std::net::TcpStream::connect_timeout(
+        &addr
+            .parse()
+            .map_err(|e| format!("bad address {addr}: {e}"))?,
+        Duration::from_millis(900),
+    )
+    .map_err(|e| format!("netdata unreachable: {e}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(1500)))
+        .ok();
+    write!(
+        stream,
+        "GET /api/v1/data?chart={chart}&after=-60&points=20&format=json HTTP/1.0\r\nHost: {ip}\r\nConnection: close\r\n\r\n"
+    )
+    .map_err(|e| e.to_string())?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).map_err(|e| e.to_string())?;
+    let body = raw
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b)
+        .ok_or("malformed HTTP reply")?;
+    parse_netdata_series(body)
+}
+
+/// Parse Netdata's `/api/v1/data` JSON into a chronological series:
+/// each row's non-time columns summed (abs — net in/out are signed).
+#[must_use = "the parsed series"]
+pub fn parse_netdata_series(body: &str) -> Result<Vec<f64>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body.trim()).map_err(|e| format!("bad netdata json: {e}"))?;
+    let rows = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or("netdata reply missing data")?;
+    let mut series: Vec<f64> = rows
+        .iter()
+        .filter_map(|row| {
+            let cols = row.as_array()?;
+            // Column 0 is the timestamp; the rest are dimensions.
+            Some(
+                cols[1..]
+                    .iter()
+                    .filter_map(|c| c.as_f64())
+                    .map(f64::abs)
+                    .sum(),
+            )
+        })
+        .collect();
+    series.reverse(); // netdata returns newest-first
+    Ok(series)
+}
+
+/// Render a unicode sparkline (L14 — the Carbon-restrained v1; the
+/// canvas treatment can layer on in the /preview pass).
+#[must_use]
+pub fn sparkline(values: &[f64]) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if values.is_empty() {
+        return String::new();
+    }
+    let max = values.iter().copied().fold(f64::MIN, f64::max);
+    let min = values.iter().copied().fold(f64::MAX, f64::min);
+    let span = (max - min).max(f64::EPSILON);
+    values
+        .iter()
+        .map(|v| {
+            let idx = (((v - min) / span) * 7.0).round() as usize;
+            BARS[idx.min(7)]
+        })
+        .collect()
+}
+
 impl PeersPanel {
     #[must_use]
     pub fn new() -> Self {
@@ -274,6 +382,8 @@ impl PeersPanel {
             }
             Message::Select(host) => {
                 self.selected = Some(host);
+                self.metrics = None;
+                self.metrics_err = None;
                 Task::none()
             }
             Message::RefreshClicked => Self::load(),
@@ -353,6 +463,67 @@ impl PeersPanel {
                 } else {
                     format!("{host}: wake failed (mackesd unreachable?)")
                 };
+                Task::none()
+            }
+            Message::MetricsTick => {
+                // Fetch only for an online selected peer with an
+                // overlay address; otherwise the pane shows why not.
+                let Some(r) = self
+                    .rows
+                    .iter()
+                    .find(|r| Some(r.hostname.as_str()) == self.selected.as_deref())
+                else {
+                    return Task::none();
+                };
+                if r.presence == "offline" || r.overlay_ip.is_empty() {
+                    return Task::none();
+                }
+                let ip = r.overlay_ip.clone();
+                let host = r.hostname.clone();
+                Task::perform(
+                    async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            Ok(PeerMetrics {
+                                cpu: fetch_series(&ip, "system.cpu")?,
+                                load: fetch_series(&ip, "system.load")?,
+                                net: fetch_series(&ip, "system.net")?,
+                                disk: fetch_series(&ip, "system.io")?,
+                            })
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()));
+                        (host, result)
+                    },
+                    |(host, result)| crate::Message::Peers(Message::MetricsLoaded { host, result }),
+                )
+            }
+            Message::OpenDashboard(ip) => {
+                self.op_result = format!("opening dashboard http://{ip}:19999 …");
+                Task::perform(
+                    async move {
+                        let url = format!("http://{ip}:19999");
+                        matches!(
+                            tokio::process::Command::new("xdg-open").arg(&url).spawn(),
+                            Ok(_)
+                        )
+                    },
+                    |_| crate::Message::Peers(Message::MetricsTick),
+                )
+            }
+            Message::MetricsLoaded { host, result } => {
+                // Stale fetches (selection moved on) are dropped.
+                if Some(host.as_str()) == self.selected.as_deref() {
+                    match result {
+                        Ok(m) => {
+                            self.metrics = Some(m);
+                            self.metrics_err = None;
+                        }
+                        Err(e) => {
+                            self.metrics = None;
+                            self.metrics_err = Some(e);
+                        }
+                    }
+                }
                 Task::none()
             }
             Message::OpFinished { label, host, ok } => {
@@ -584,6 +755,74 @@ impl PeersPanel {
                     nudge,
                 ]
                 .spacing(4);
+                // PD-8 — live Netdata block (L14): four sparklines
+                // while the 2s tick feeds; honest absence otherwise.
+                let mut metrics_col = column![row![
+                    text("Live metrics")
+                        .size(13)
+                        .color(palette.text.into_iced_color()),
+                    Space::new().width(Length::Fixed(10.0)),
+                    if !r.overlay_ip.is_empty() && r.presence != "offline" {
+                        crate::controls::variant_button(
+                            "Metrics ↗",
+                            crate::controls::ButtonVariant::Secondary,
+                            Some(crate::Message::Peers(Message::OpenDashboard(
+                                r.overlay_ip.clone(),
+                            ))),
+                            palette,
+                        )
+                    } else {
+                        Space::new().height(Length::Fixed(0.0)).into()
+                    },
+                ]
+                .align_y(iced::alignment::Vertical::Center)]
+                .spacing(4);
+                match (&self.metrics, &self.metrics_err) {
+                    (Some(m), _) => {
+                        for (label, series) in [
+                            ("CPU %", &m.cpu),
+                            ("Load", &m.load),
+                            ("Net", &m.net),
+                            ("Disk I/O", &m.disk),
+                        ] {
+                            let last = series.last().copied().unwrap_or(0.0);
+                            metrics_col = metrics_col.push(
+                                row![
+                                    text(label)
+                                        .size(12)
+                                        .width(Length::Fixed(100.0))
+                                        .color(palette.text_muted.into_iced_color()),
+                                    text(sparkline(series))
+                                        .size(12)
+                                        .color(palette.accent.into_iced_color()),
+                                    text(format!(" {last:.1}"))
+                                        .size(12)
+                                        .color(palette.text.into_iced_color()),
+                                ]
+                                .align_y(iced::alignment::Vertical::Center),
+                            );
+                        }
+                    }
+                    (None, Some(e)) => {
+                        metrics_col = metrics_col.push(
+                            text(format!("Netdata not answering on this peer: {e}"))
+                                .size(12)
+                                .color(palette.text_muted.into_iced_color()),
+                        );
+                    }
+                    (None, None) => {
+                        metrics_col = metrics_col.push(
+                            text(if r.presence == "offline" {
+                                "Peer offline — no live metrics."
+                            } else {
+                                "Waiting for the first sample…"
+                            })
+                            .size(12)
+                            .color(palette.text_muted.into_iced_color()),
+                        );
+                    }
+                }
+
                 let mut services = column![text("Services provided")
                     .size(13)
                     .color(palette.text.into_iced_color())]
@@ -603,7 +842,7 @@ impl PeersPanel {
                         );
                     }
                 }
-                column![header, ops, wake, strip, facts, services]
+                column![header, ops, wake, strip, facts, metrics_col, services]
                     .spacing(16)
                     .into()
             }
@@ -771,6 +1010,47 @@ mod tests {
         assert!(!op_enabled(pine, pine.ssh, "pine"), "no SSH-to-self");
         let oak = &rows[1]; // offline
         assert!(!op_enabled(oak, true, "elsewhere"), "offline disables ops");
+    }
+
+    #[test]
+    fn netdata_series_parse_sums_dimensions_chronologically() {
+        // Netdata returns newest-first rows; col 0 = timestamp.
+        let body = r#"{"labels":["time","in","out"],"data":[[300,5.0,-2.0],[298,1.0,-1.0]]}"#;
+        let s = parse_netdata_series(body).unwrap();
+        assert_eq!(s, vec![2.0, 7.0], "abs-summed, oldest first");
+        assert!(parse_netdata_series("nope").is_err());
+    }
+
+    #[test]
+    fn sparkline_normalizes_into_eight_bars() {
+        let s = sparkline(&[0.0, 50.0, 100.0]);
+        assert_eq!(s.chars().count(), 3);
+        assert!(s.starts_with('▁') && s.ends_with('█'));
+        assert_eq!(sparkline(&[]), "");
+        // Flat series renders without panic (span clamp).
+        assert_eq!(sparkline(&[5.0, 5.0]).chars().count(), 2);
+    }
+
+    #[test]
+    fn stale_metrics_are_dropped_fresh_applied() {
+        let mut p = PeersPanel::new();
+        let rows = parse_directory(REPLY).unwrap();
+        let _ = p.update(Message::Loaded(Ok(rows)));
+        let _ = p.update(Message::Select("pine".into()));
+        // A fetch for a peer no longer selected is dropped.
+        let _ = p.update(Message::MetricsLoaded {
+            host: "oak".into(),
+            result: Ok(PeerMetrics::default()),
+        });
+        assert!(p.metrics.is_none());
+        let _ = p.update(Message::MetricsLoaded {
+            host: "pine".into(),
+            result: Ok(PeerMetrics {
+                cpu: vec![1.0],
+                ..PeerMetrics::default()
+            }),
+        });
+        assert!(p.metrics.is_some());
     }
 
     #[test]

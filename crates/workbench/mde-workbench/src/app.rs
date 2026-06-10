@@ -665,6 +665,17 @@ impl App {
         if self.view.group() == Group::Compute {
             subs.push(compute_panel::ComputePanel::sample_subscription());
         }
+        // PD-8 (L14) — Netdata sampling only while the Peers
+        // directory is the active view (the Compute pattern).
+        if matches!(
+            self.view,
+            View::Panel {
+                group: Group::Network,
+                panel: "peers"
+            }
+        ) {
+            subs.push(peers_panel::metrics_subscription());
+        }
         Subscription::batch(subs)
     }
 
