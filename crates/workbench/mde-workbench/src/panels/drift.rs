@@ -65,18 +65,51 @@ pub struct DriftRow {
     pub message: String,
 }
 
+/// PLANES-11 — one live policy violation paired with its remediation
+/// plan, parsed from `mackesd remediate match --json` (the `MatchedDrift`
+/// shape). The Fire button enqueues the matched plan's job bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemediationMatch {
+    pub peer: String,
+    pub policy: String,
+    pub severity: DriftSeverity,
+    pub detail: String,
+    /// The matched plan name, or `None` when no plan covers the drift.
+    pub plan: Option<String>,
+    /// W42 — whether the matched plan auto-fires on the leader sweep.
+    pub auto: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DriftPanel {
     pub rows: Vec<DriftRow>,
+    /// PLANES-11 — live drift→plan matches (the remediation list).
+    pub matches: Vec<RemediationMatch>,
     pub busy: bool,
     pub last_run_at: Option<SystemTime>,
     pub error: Option<String>,
+    /// Result strip from the most recent Fire (the loud launch reply).
+    pub fire_result: Option<Result<String, String>>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Loaded(Result<Vec<DriftRow>, String>),
+    Loaded(Result<Loaded, String>),
     RefreshClicked,
+    /// PLANES-11 (W41) — fire `plan` against the drifted `peer`.
+    Fire {
+        plan: String,
+        peer: String,
+    },
+    Fired(Result<String, String>),
+}
+
+/// The combined load: audit-chain drift events + live remediation
+/// matches (PLANES-11).
+#[derive(Debug, Clone, Default)]
+pub struct Loaded {
+    pub events: Vec<DriftRow>,
+    pub matches: Vec<RemediationMatch>,
 }
 
 impl DriftPanel {
@@ -86,15 +119,16 @@ impl DriftPanel {
     }
 
     pub fn load() -> Task<crate::Message> {
-        Task::perform(async { fetch_drift_events() }, |result| {
+        Task::perform(async { fetch_drift_and_matches() }, |result| {
             crate::Message::Drift(Message::Loaded(result))
         })
     }
 
     pub fn update(&mut self, msg: Message) -> Task<crate::Message> {
         match msg {
-            Message::Loaded(Ok(rows)) => {
-                self.rows = rows;
+            Message::Loaded(Ok(loaded)) => {
+                self.rows = loaded.events;
+                self.matches = loaded.matches;
                 self.error = None;
                 self.busy = false;
                 self.last_run_at = Some(SystemTime::now());
@@ -102,6 +136,7 @@ impl DriftPanel {
             }
             Message::Loaded(Err(e)) => {
                 self.rows = Vec::new();
+                self.matches = Vec::new();
                 self.error = Some(e);
                 self.busy = false;
                 self.last_run_at = Some(SystemTime::now());
@@ -109,6 +144,19 @@ impl DriftPanel {
             }
             Message::RefreshClicked => {
                 self.busy = true;
+                self.fire_result = None;
+                Self::load()
+            }
+            Message::Fire { plan, peer } => {
+                self.busy = true;
+                Task::perform(async move { fire_plan(&plan, &peer) }, |result| {
+                    crate::Message::Drift(Message::Fired(result))
+                })
+            }
+            Message::Fired(result) => {
+                self.fire_result = Some(result);
+                self.busy = false;
+                // Reload so the matched-drift list reflects the fire.
                 Self::load()
             }
         }
@@ -118,13 +166,15 @@ impl DriftPanel {
         let palette = crate::live_theme::palette();
         let sizes = FontSize::defaults();
 
-        let title = text("Drift")
+        let title = text("Remediation")
             .size(TypeRole::Display.size_in(sizes))
             .color(palette.text.into_iced_color());
 
         let subtitle_text = if let Some(t) = self.last_run_at {
             format!(
-                "{} event{} · last refresh {}",
+                "{} live drift match{} · {} audit event{} · last refresh {}",
+                self.matches.len(),
+                if self.matches.len() == 1 { "" } else { "es" },
                 self.rows.len(),
                 if self.rows.len() == 1 { "" } else { "s" },
                 fmt_age(t)
@@ -177,10 +227,29 @@ impl DriftPanel {
         .align_y(iced::alignment::Vertical::Center);
 
         let mut rows_col = column![].spacing(6);
+
+        // PLANES-11 — the loud result strip from the last Fire.
+        if let Some(res) = &self.fire_result {
+            rows_col = rows_col.push(fire_result_strip(res, palette));
+        }
+
+        // PLANES-11 — the live drift→plan matches with Fire buttons.
+        if !self.matches.is_empty() {
+            rows_col = rows_col.push(section_heading("Drift → remediation plan", palette));
+            for m in &self.matches {
+                rows_col = rows_col.push(remediation_row(m, palette, self.busy));
+            }
+            rows_col = rows_col.push(Space::new().height(Length::Fixed(14.0)));
+        }
+
+        // The audit-chain drift events (historical view).
+        if !self.rows.is_empty() {
+            rows_col = rows_col.push(section_heading("Recent drift events", palette));
+        }
         for r in &self.rows {
             rows_col = rows_col.push(drift_row(r, palette));
         }
-        if self.rows.is_empty() && self.last_run_at.is_some() {
+        if self.rows.is_empty() && self.matches.is_empty() && self.last_run_at.is_some() {
             rows_col = rows_col.push(empty_state_card(palette, self.error.as_deref()));
         }
 
@@ -197,6 +266,173 @@ impl DriftPanel {
         .height(Length::Fill)
         .into()
     }
+}
+
+/// A small uppercase section divider label.
+fn section_heading<'a>(label: &'static str, palette: Palette) -> Element<'a, crate::Message> {
+    container(
+        text(label)
+            .size(11)
+            .color(palette.text_muted.into_iced_color()),
+    )
+    .padding(Padding::from([4u16, 2u16]))
+    .into()
+}
+
+/// PLANES-11 — one drift→plan row: severity + peer + policy, the
+/// matched plan (or "no plan"), an AUTO badge (W42), and a Fire button
+/// (enabled only when a plan matched and the panel isn't busy).
+fn remediation_row<'a>(
+    m: &'a RemediationMatch,
+    palette: Palette,
+    busy: bool,
+) -> Element<'a, crate::Message> {
+    let icon_color = m.severity.color();
+    let resolved = mde_icon(m.severity.icon(), IconSize::Inline);
+    let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
+        use iced::widget::svg as widget_svg;
+        widget_svg(widget_svg::Handle::from_memory(svg_bytes))
+            .width(Length::Fixed(16.0))
+            .height(Length::Fixed(16.0))
+            .style(
+                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
+                    color: Some(icon_color),
+                },
+            )
+            .into()
+    } else {
+        text(resolved.fallback_glyph)
+            .size(16.0)
+            .color(icon_color)
+            .into()
+    };
+
+    let plan_label: Element<'a, crate::Message> = match &m.plan {
+        Some(plan) => text(format!("→ {plan}"))
+            .size(11)
+            .color(palette.accent.into_iced_color())
+            .into(),
+        None => text("→ no remediation plan")
+            .size(11)
+            .color(palette.text_muted.into_iced_color())
+            .into(),
+    };
+
+    let mut head = row![
+        icon_widget,
+        text(m.severity.label()).size(10).color(icon_color),
+        text(m.peer.clone())
+            .size(11)
+            .color(palette.text.into_iced_color()),
+        text(m.policy.clone())
+            .size(11)
+            .color(palette.text_muted.into_iced_color()),
+        plan_label,
+    ]
+    .spacing(8)
+    .align_y(iced::alignment::Vertical::Center);
+
+    // W42 — surface the auto flag so the operator sees which plans the
+    // leader sweep will fire on its own.
+    if m.auto {
+        head = head.push(
+            text("AUTO")
+                .size(9)
+                .color(palette.warning.into_iced_color()),
+        );
+    }
+    head = head.push(Space::new().width(Length::Fill));
+
+    // Fire button — only when a plan matched (W41). Disabled while busy.
+    if let Some(plan) = &m.plan {
+        let accent = palette.accent.into_iced_color();
+        let mut btn = button(text("Fire").size(12).color(Color::WHITE))
+            .padding(Padding::from([4u16, 12u16]))
+            .style(move |_t: &Theme, status: iced::widget::button::Status| {
+                let bg = match status {
+                    iced::widget::button::Status::Hovered => Color {
+                        r: accent.r * 1.10,
+                        g: accent.g * 1.10,
+                        b: accent.b * 1.10,
+                        a: accent.a,
+                    },
+                    iced::widget::button::Status::Disabled => palette.raised.into_iced_color(),
+                    _ => accent,
+                };
+                iced::widget::button::Style {
+                    snap: false,
+                    background: Some(Background::Color(bg)),
+                    text_color: Color::WHITE,
+                    border: Border {
+                        color: Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 5.0.into(),
+                    },
+                    shadow: iced::Shadow::default(),
+                }
+            });
+        if !busy {
+            btn = btn.on_press(crate::Message::Drift(Message::Fire {
+                plan: plan.clone(),
+                peer: m.peer.clone(),
+            }));
+        }
+        head = head.push(btn);
+    }
+
+    let detail = text(m.detail.clone())
+        .size(11)
+        .color(palette.text_muted.into_iced_color());
+
+    let bg = palette.raised.into_iced_color();
+    let border = palette.border.into_iced_color();
+    container(column![head, detail].spacing(4))
+        .padding(Padding::from([10u16, 14u16]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            snap: false,
+            background: Some(Background::Color(bg)),
+            border: Border {
+                color: border,
+                width: 1.0,
+                radius: 5.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// PLANES-11 — the loud result strip from the most recent Fire: the
+/// launch reply (run id + targets) on success, the error on failure.
+fn fire_result_strip<'a>(
+    res: &'a Result<String, String>,
+    palette: Palette,
+) -> Element<'a, crate::Message> {
+    let (accent, label): (Color, String) = match res {
+        Ok(reply) => (
+            palette.success.into_iced_color(),
+            format!("Fired — {reply}"),
+        ),
+        Err(e) => (
+            palette.danger.into_iced_color(),
+            format!("Fire failed — {e}"),
+        ),
+    };
+    let bg = palette.raised.into_iced_color();
+    container(text(label).size(11).color(accent))
+        .padding(Padding::from([8u16, 14u16]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            snap: false,
+            background: Some(Background::Color(bg)),
+            border: Border {
+                color: accent,
+                width: 1.0,
+                radius: 5.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
 }
 
 fn drift_row<'a>(r: &'a DriftRow, palette: Palette) -> Element<'a, crate::Message> {
@@ -332,6 +568,84 @@ pub fn fetch_drift_events() -> Result<Vec<DriftRow>, String> {
     Ok(parse_events(&raw))
 }
 
+/// PLANES-11 — load both the audit-chain drift events and the live
+/// remediation matches. The matches drive the Fire UI; a failure to
+/// fetch matches is non-fatal (the events still render).
+pub fn fetch_drift_and_matches() -> Result<Loaded, String> {
+    let events = fetch_drift_events()?;
+    let matches = fetch_matches().unwrap_or_default();
+    Ok(Loaded { events, matches })
+}
+
+/// Shell out to `mackesd remediate match --json` and parse the
+/// `MatchedDrift` array into [`RemediationMatch`] rows.
+pub fn fetch_matches() -> Result<Vec<RemediationMatch>, String> {
+    let out = std::process::Command::new("mackesd")
+        .args(["remediate", "match", "--json"])
+        .output()
+        .map_err(|e| format!("mackesd remediate match failed to spawn: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        return Err(format!("mackesd remediate match exited non-zero: {stderr}"));
+    }
+    Ok(parse_matches(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Pure parser for the `MatchedDrift` JSON array
+/// (`[{violation:{peer,policy,severity,detail}, plan, template, auto}]`).
+#[must_use]
+pub fn parse_matches(raw: &str) -> Vec<RemediationMatch> {
+    let Ok(top) = serde_json::from_str::<Vec<serde_json::Value>>(raw) else {
+        return Vec::new();
+    };
+    top.into_iter()
+        .map(|m| {
+            let v = m
+                .get("violation")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let sev = v.get("severity").and_then(|x| x.as_str()).unwrap_or("");
+            RemediationMatch {
+                peer: v
+                    .get("peer")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                policy: v
+                    .get("policy")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                severity: DriftSeverity::from_str(sev),
+                detail: v
+                    .get("detail")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                plan: m.get("plan").and_then(|x| x.as_str()).map(str::to_string),
+                auto: m
+                    .get("auto")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            }
+        })
+        .collect()
+}
+
+/// Shell out to `mackesd remediate fire --plan <p> --peer <h>`;
+/// returns the launch reply (run id + targets) on success.
+pub fn fire_plan(plan: &str, peer: &str) -> Result<String, String> {
+    let out = std::process::Command::new("mackesd")
+        .args(["remediate", "fire", "--plan", plan, "--peer", peer])
+        .output()
+        .map_err(|e| format!("mackesd remediate fire failed to spawn: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        return Err(format!("mackesd remediate fire exited non-zero: {stderr}"));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// Pure parser exposed for tests. Pulls the drift-flavoured
 /// payloads out of `mackesd events list --json` output. The
 /// CLI emits a JSON array; each entry is
@@ -440,6 +754,46 @@ mod tests {
     fn parse_events_returns_empty_for_garbage() {
         assert!(parse_events("not json").is_empty());
         assert!(parse_events("").is_empty());
+    }
+
+    #[test]
+    fn parse_matches_reads_the_matched_drift_shape() {
+        // The `mackesd remediate match --json` (MatchedDrift) shape.
+        let raw = r#"[
+            {"violation":{"policy":"all-nodes-current","peer":"pine","severity":"warn","detail":"behind"},
+             "plan":"resync-behind-node","template":"reconcile-config","auto":false,"vars":{}},
+            {"violation":{"policy":"unknown","peer":"oak","severity":"crit","detail":"x"},
+             "plan":null,"template":null,"auto":false,"vars":{}}
+        ]"#;
+        let rows = parse_matches(raw);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].peer, "pine");
+        assert_eq!(rows[0].plan.as_deref(), Some("resync-behind-node"));
+        assert_eq!(rows[0].severity, DriftSeverity::Warn);
+        // Unmatched drift surfaces with no plan (Fire button hidden).
+        assert!(rows[1].plan.is_none());
+    }
+
+    #[test]
+    fn parse_matches_returns_empty_for_garbage() {
+        assert!(parse_matches("not json").is_empty());
+        assert!(parse_matches("").is_empty());
+    }
+
+    #[test]
+    fn view_renders_with_matches_and_fire_strip_without_panic() {
+        let mut p = DriftPanel::new();
+        p.matches = vec![RemediationMatch {
+            peer: "pine".into(),
+            policy: "all-nodes-current".into(),
+            severity: DriftSeverity::Warn,
+            detail: "behind".into(),
+            plan: Some("resync-behind-node".into()),
+            auto: true,
+        }];
+        p.fire_result = Some(Ok("{\"ok\":true,\"run_id\":\"rem-1\"}".into()));
+        p.last_run_at = Some(SystemTime::now());
+        let _ = p.view();
     }
 
     #[test]
