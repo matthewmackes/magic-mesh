@@ -18,13 +18,13 @@ use crate::keyboard::{KeyAction, Pane};
 use crate::model::{resolve_panel_label, view_from_focus_slug, Group, View};
 use crate::panels::{
     apps_install as apps_install_panel, apps_installed as apps_installed_panel,
-    apps_remove as apps_remove_panel, apps_sources as apps_sources_panel, compute as compute_panel,
-    connect as connect_panel, datetime as datetime_panel, default_apps as default_apps_panel,
-    displays as displays_panel, drift as drift_panel, firewall as firewall_panel,
-    fleet_revisions as fleet_revisions_panel, fleet_settings as fleet_settings_panel,
-    fonts as fonts_panel, hardware as hardware_panel, health_check as health_check_panel,
-    help_index as help_index_panel, home as home_panel, hub as hub_panel,
-    inventory as inventory_panel, jobs as jobs_panel, keyboard as keyboard_panel,
+    apps_remove as apps_remove_panel, apps_sources as apps_sources_panel, audit as audit_panel,
+    compute as compute_panel, connect as connect_panel, datetime as datetime_panel,
+    default_apps as default_apps_panel, displays as displays_panel, drift as drift_panel,
+    firewall as firewall_panel, fleet_revisions as fleet_revisions_panel,
+    fleet_settings as fleet_settings_panel, fonts as fonts_panel, hardware as hardware_panel,
+    health_check as health_check_panel, help_index as help_index_panel, home as home_panel,
+    hub as hub_panel, inventory as inventory_panel, jobs as jobs_panel, keyboard as keyboard_panel,
     logs as logs_panel, mesh_bus as mesh_bus_panel, mesh_control as mesh_control_panel,
     mesh_federation as mesh_federation_panel, mesh_history as mesh_history_panel,
     mesh_join as mesh_join_panel, mesh_pending as mesh_pending_panel,
@@ -148,6 +148,8 @@ pub enum Message {
     Hardware(hardware_panel::Message),
     /// PLANES-10 — Jobs panel (templates + run history) sub-message.
     Jobs(jobs_panel::Message),
+    /// PLANES-12 — Audit panel (hash-chain timeline + verify) sub-message.
+    Audit(audit_panel::Message),
     /// CB-1.5.b — Fleet playbooks panel sub-message.
     Playbooks(playbooks_panel::Message),
     /// CB-1.5.c — Fleet run-history panel sub-message.
@@ -255,6 +257,7 @@ pub struct App {
     inventory: inventory_panel::InventoryPanel,
     hardware: hardware_panel::HardwarePanel,
     jobs: jobs_panel::JobsPanel,
+    audit: audit_panel::AuditPanel,
     playbooks: playbooks_panel::PlaybooksPanel,
     run_history: run_history_panel::RunHistoryPanel,
     datetime: datetime_panel::DateTimePanel,
@@ -361,6 +364,7 @@ impl App {
             inventory: inventory_panel::InventoryPanel::new(),
             hardware: hardware_panel::HardwarePanel::new(),
             jobs: jobs_panel::JobsPanel::new(),
+            audit: audit_panel::AuditPanel::new(),
             playbooks: playbooks_panel::PlaybooksPanel::new(),
             run_history: run_history_panel::RunHistoryPanel::new(),
             datetime: datetime_panel::DateTimePanel::new(),
@@ -798,6 +802,7 @@ impl App {
             Message::Inventory(msg) => self.inventory.update(msg),
             Message::Hardware(msg) => self.hardware.update(msg),
             Message::Jobs(msg) => self.jobs.update(msg),
+            Message::Audit(msg) => self.audit.update(msg),
             Message::Playbooks(msg) => self.playbooks.update(msg),
             Message::RunHistory(msg) => self.run_history.update(msg),
             Message::DateTime(msg) => self.datetime.update(msg),
@@ -895,6 +900,7 @@ impl App {
             (Group::Maintain, "health_check") => health_check_panel::HealthCheckPanel::load(),
             // v4.0.1 WB-2.g — mackesd events list --json scan.
             (Group::Maintain, "drift") => drift_panel::DriftPanel::load(),
+            (Group::Maintain, "audit") => audit_panel::AuditPanel::load(),
             // v4.0.1 WB-2.h — leader lock + healthz probe.
             (Group::Network, "mesh_control") => mesh_control_panel::MeshControlPanel::load(),
             // v4.0.1 WB-2.i — scan probe.json cache for pending peers.
@@ -1228,6 +1234,10 @@ impl App {
                 group: Group::Maintain,
                 panel: "health_check",
             } => self.health_check.view(),
+            View::Panel {
+                group: Group::Maintain,
+                panel: "audit",
+            } => self.audit.view(),
             // v4.0.1 WB-2.g (2026-05-23) — Maintain → Drift
             // renders mackesd events list --json output filtered
             // for drift-flavoured rows.

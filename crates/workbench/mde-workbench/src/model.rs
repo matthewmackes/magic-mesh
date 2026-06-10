@@ -282,6 +282,8 @@ pub fn nav_model() -> Vec<NavEntry> {
                 Panel::new("health_check", "Health Check"),
                 Panel::new("repair", "Repair"),
                 Panel::new("drift", "Drift"),
+                // PLANES-12 — hash-chained audit timeline + verify-chain.
+                Panel::new("audit", "Audit"),
             ],
         },
         NavEntry {
