@@ -1,0 +1,10 @@
+[package]
+name = "mde-cosmic-applet"
+version = "0.1.0"
+edition = "2021"
+description = "Magic Mesh cosmic-applet: mesh health pip + quick actions over mde-bus, deep-linking into the Workbench (GUI-6/Q46-47). Logic layer is render-agnostic + tested; the libcosmic panel shell is the hardware-gated render target."
+
+[dependencies]
+serde_json = "1"
+
+[dev-dependencies]

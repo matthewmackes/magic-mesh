@@ -4097,6 +4097,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mde-cosmic-applet"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "mde-disclaimer"
 version = "10.0.0"
 
