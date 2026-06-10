@@ -95,6 +95,16 @@ pub struct PodcastChannel {
     pub title: String,
 }
 
+/// An internet radio station from `getInternetRadioStations` (SVC-3).
+/// `stream_url` is the raw upstream URL the engine plays directly.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RadioStation {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "streamUrl")]
+    pub stream_url: String,
+}
+
 /// A podcast episode from `getPodcasts?id=<channel>` (AIR-21). `id` is the
 /// episode's `streamId` — the media id the player streams + enqueues.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -223,6 +233,12 @@ impl Client {
     /// fetch GET this).
     #[must_use]
     pub fn stream_url(&self, song_id: &str) -> String {
+        // SVC-3 — radio stations enqueue their raw upstream URL as the
+        // "song id"; pass URLs through untouched so the engine streams
+        // the station directly instead of asking Subsonic for it.
+        if song_id.starts_with("http://") || song_id.starts_with("https://") {
+            return song_id.to_string();
+        }
         self.endpoint_url("stream", &[("id", song_id)])
     }
 
@@ -400,6 +416,16 @@ impl Client {
             .get("getPodcasts", &[("includeEpisodes", "false")])
             .await?;
         Ok(parse_podcast_channels(&inner))
+    }
+
+    /// `getInternetRadioStations` — the server's saved radio stations
+    /// (SVC-3, resolves the H6 unbacked Radio card).
+    ///
+    /// # Errors
+    /// Transport / API / parse failures.
+    pub async fn get_internet_radio_stations(&self) -> Result<Vec<RadioStation>, AirsonicError> {
+        let inner = self.get("getInternetRadioStations", &[]).await?;
+        Ok(parse_radio_stations(&inner))
     }
 
     /// `getPodcasts?id=<channel>&includeEpisodes=true` — one channel's
@@ -668,6 +694,31 @@ pub fn parse_genres(inner: &Value) -> Vec<Genre> {
 
 /// Parse `getPodcasts` → `podcasts.channel[]` (id + title).
 #[must_use]
+/// Parse `getInternetRadioStations`'s
+/// `internetRadioStations.internetRadioStation[]` array (SVC-3).
+#[must_use]
+pub fn parse_radio_stations(inner: &Value) -> Vec<RadioStation> {
+    inner
+        .get("internetRadioStations")
+        .and_then(|p| p.get("internetRadioStation"))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    let id = c.get("id").and_then(Value::as_str)?;
+                    let stream_url = c.get("streamUrl").and_then(Value::as_str)?;
+                    let name = c.get("name").and_then(Value::as_str).unwrap_or(id);
+                    Some(RadioStation {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        stream_url: stream_url.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn parse_podcast_channels(inner: &Value) -> Vec<PodcastChannel> {
     inner
         .get("podcasts")

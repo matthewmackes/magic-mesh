@@ -21,9 +21,8 @@ pub struct LibraryItem {
     pub art_id: Option<String>,
 }
 
-/// The `action/music/<verb>` topic a hub card fetches from. `None` for
-/// categories not yet backed by a daemon verb (only Radio —
-/// AIR-4.b endpoint).
+/// The `action/music/<verb>` topic a hub card fetches from. Every
+/// hub card is daemon-backed (SVC-3 landed `list-radio`, the last one).
 #[must_use]
 pub fn verb_for(card: HubCard) -> Option<&'static str> {
     match card {
@@ -33,7 +32,7 @@ pub fn verb_for(card: HubCard) -> Option<&'static str> {
         HubCard::Podcasts => Some("list-podcasts"),
         HubCard::Recents => Some("list-recents"),
         HubCard::Playlists => Some("list-playlists"),
-        _ => None,
+        HubCard::Radio => Some("list-radio"),
     }
 }
 
@@ -61,6 +60,26 @@ pub fn parse_items(reply_json: &str) -> Vec<LibraryItem> {
                 Some(LibraryItem {
                     id: value.to_string(),
                     label: value.to_string(),
+                    art_id: None,
+                })
+            })
+            .collect();
+    }
+    // Radio rows (SVC-3): the station's raw stream URL becomes the row
+    // id — clicking a station enqueues/plays that URL directly (the
+    // engine passes http(s) ids through untouched).
+    if let Some(arr) = result.get("radio").and_then(serde_json::Value::as_array) {
+        return arr
+            .iter()
+            .filter_map(|st| {
+                let url = st.get("streamUrl").and_then(serde_json::Value::as_str)?;
+                let label = st
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(url);
+                Some(LibraryItem {
+                    id: url.to_string(),
+                    label: label.to_string(),
                     art_id: None,
                 })
             })
@@ -205,7 +224,22 @@ mod tests {
     fn verb_mapping() {
         assert_eq!(verb_for(HubCard::Albums), Some("list-albums"));
         assert_eq!(verb_for(HubCard::Artists), Some("list-artists"));
-        assert_eq!(verb_for(HubCard::Radio), None);
+        // SVC-3 — Radio is daemon-backed now.
+        assert_eq!(verb_for(HubCard::Radio), Some("list-radio"));
+    }
+
+    #[test]
+    fn parse_items_reads_radio_stations_with_stream_url_ids() {
+        let items = parse_items(
+            r#"{"ok":true,"result":{"radio":[
+                {"id":"1","name":"FIP","streamUrl":"https://stream.example/fip"},
+                {"id":"2","name":"SomaFM","streamUrl":"https://stream.example/soma"}
+            ]}}"#,
+        );
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].label, "FIP");
+        assert_eq!(items[0].id, "https://stream.example/fip");
+        assert!(items[0].art_id.is_none());
     }
 
     #[test]
@@ -292,7 +326,7 @@ mod tests {
     fn verb_for_recents_and_playlists() {
         assert_eq!(verb_for(HubCard::Recents), Some("list-recents"));
         assert_eq!(verb_for(HubCard::Playlists), Some("list-playlists"));
-        assert_eq!(verb_for(HubCard::Radio), None);
+        assert_eq!(verb_for(HubCard::Radio), Some("list-radio"));
     }
 
     #[test]

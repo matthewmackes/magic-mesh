@@ -45,7 +45,7 @@ pub const ACTION_VERBS: [&str; 6] = [
 
 /// The library-browse verbs served on `action/music/<verb>`
 /// (asynchronous — each proxies an Airsonic REST call).
-pub const BROWSE_VERBS: [&str; 14] = [
+pub const BROWSE_VERBS: [&str; 15] = [
     "list-albums",
     "list-artists",
     "search",
@@ -55,6 +55,7 @@ pub const BROWSE_VERBS: [&str; 14] = [
     "get-song",
     "get-cover-art",
     "list-podcasts",
+    "list-radio",
     "podcast-episodes",
     "list-recents",
     "list-playlists",
@@ -258,6 +259,12 @@ fn dispatch_browse(
                 .get_podcast_channels()
                 .await
                 .map(|c| json!({ "podcasts": c }))
+                .map_err(|e| e.to_string()),
+            // SVC-3 — the Radio hub card: the server's saved stations.
+            "list-radio" => client
+                .get_internet_radio_stations()
+                .await
+                .map(|r| json!({ "radio": r }))
                 .map_err(|e| e.to_string()),
             "podcast-episodes" => {
                 let id = song_id_from(body).unwrap_or_default();

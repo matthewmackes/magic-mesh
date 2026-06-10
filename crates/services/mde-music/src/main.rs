@@ -901,6 +901,11 @@ impl State {
                                 Route::Podcast(..) => {
                                     btn.on_press(Message::PlayEpisode(item.id.clone()))
                                 }
+                                // SVC-3 — a radio station's id IS its stream
+                                // URL; clicking plays it directly.
+                                Route::Category(HubCard::Radio) => {
+                                    btn.on_press(Message::PlayEpisode(item.id.clone()))
+                                }
                                 _ => btn,
                             };
                             r = r.push(btn);
