@@ -13,7 +13,7 @@ use iced::widget::button::Status as ButtonStatus;
 use iced::widget::{button, column, row, text, text_editor, text_input, Space};
 use iced::{alignment, Background, Border, Color, Element, Length, Task};
 use mde_theme::{
-    CardState, Density, EmptyState, FontSize, Icon, ObjectCard, Palette, Radii, TypeRole,
+    CardState, EmptyState, FontSize, Icon, ObjectCard, Palette, Radii, TypeRole,
 };
 
 use crate::panel_chrome::{empty_state, object_card, panel_container};
@@ -983,7 +983,7 @@ impl MeshBusPanel {
 
     pub fn view(&self) -> Element<'_, crate::Message> {
         let palette = crate::live_theme::palette();
-        let density = Density::Comfortable;
+        let density = crate::live_theme::tokens().density;
         let sizes = FontSize::defaults();
         let radii = Radii::defaults();
         let accent = palette.accent.into_iced_color();

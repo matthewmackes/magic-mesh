@@ -990,7 +990,7 @@ impl App {
             column![page_heading, body]
                 .spacing(20)
                 .padding(crate::panel_chrome::outer_padding(
-                    mde_theme::Density::Comfortable,
+                    crate::live_theme::tokens().density,
                 ));
 
         let layout = row![
@@ -1345,7 +1345,7 @@ fn panel_under_construction(view: View) -> Element<'static, Message> {
         crate::panel_chrome::empty_state(state, palette, move || Message::SelectGroup(group));
     iced::widget::container(inner)
         .padding(crate::panel_chrome::outer_padding(
-            mde_theme::Density::Comfortable,
+            crate::live_theme::tokens().density,
         ))
         .width(iced::Length::Fill)
         .height(iced::Length::Fill)

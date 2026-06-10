@@ -8,7 +8,7 @@
 
 use iced::widget::{column, container, row, scrollable, text};
 use iced::{Element, Length, Task};
-use mde_theme::{Density, EmptyState, Icon};
+use mde_theme::{EmptyState, Icon};
 use serde::Deserialize;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -157,7 +157,7 @@ impl FleetRevisionsPanel {
                 empty_state(state, crate::live_theme::palette(), || {
                     crate::Message::FleetRevisions(Message::RefreshClicked)
                 }),
-                Density::Comfortable,
+                crate::live_theme::tokens().density,
             );
         }
 

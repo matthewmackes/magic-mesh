@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use iced::widget::button::Status as ButtonStatus;
 use iced::widget::{button, column, row, text, text_input, Space};
 use iced::{alignment, Background, Border, Color, Element, Length, Task};
-use mde_theme::{Density, EmptyState, FontSize, Icon, Palette, Radii, TypeRole};
+use mde_theme::{EmptyState, FontSize, Icon, Palette, Radii, TypeRole};
 
 use crate::panel_chrome::{empty_state, panel_container};
 
@@ -601,7 +601,7 @@ impl MeshFederationPanel {
 
     pub fn view(&self) -> Element<'_, crate::Message> {
         let palette = crate::live_theme::palette();
-        let density = Density::Comfortable;
+        let density = crate::live_theme::tokens().density;
         let sizes = FontSize::defaults();
         let radii = Radii::defaults();
         let accent = palette.accent.into_iced_color();

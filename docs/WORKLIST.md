@@ -104,8 +104,8 @@ host-local Ansible apply.
 - [✓] **GUI-5: remove dead `mde-iced-components` widgets** — done — 457 lines cut; motion slimmed to a private 2-fn module (context_menu_surface deps); crate warning-free; delete `motion`, `skeleton_shimmer`, `toast_chip`, `elevation_container`, `icon_fill_morph` (Q41–45). *(resolves H4.)*
 - [ ] **GUI-6: build `mde-cosmic-applet`** — a libcosmic applet subscribing to `mde-bus`: health pip + quick actions (join/leave, DnD, transfers) + deep links into Workbench (Q46/47).
 - [ ] **GUI-7: maximize-Cosmic-native cutover** — notifications via Cosmic's daemon, mde-files chrome reskinned to libcosmic, panel hosted by Cosmic (Q43/51).
-- [ ] **GUI-8: density boot-apply** — read `theme.density` at boot and apply app-wide (Q50).
-- [ ] **GUI-9: reduced-motion from Cosmic** — source the reduce-motion flag from Cosmic's a11y setting (Q49).
+- [✓] **GUI-8: density boot-apply** — done — density resolves from preferences.toml at boot (live_theme Tokens) and all render-path Density::Comfortable sites now read the live density; read `theme.density` at boot and apply app-wide (Q50).
+- [!] **GUI-9: reduced-motion from Cosmic** — BLOCKED upstream (2026-06-09): Cosmic has no reduce-motion/animations setting (cosmic-comp#376 open) and the FDO portal appearance namespace lacks the key; nothing exists to read. Local coverage: MDE_REDUCE_MOTION + prefs a11y.reduce_motion. Revisit when cosmic-comp lands the setting. Original: source the reduce-motion flag from Cosmic's a11y setting (Q49).
 - [✓] **GUI-10: refactor `palette.rs` onto the carbon ramp** — done — zero raw hex in palette.rs; GRAY_10_HOVER added to the ramp (test-pinned); `dark()/light()` reference `carbon::*` so the ramp is the sole hex source (Q52). *(closes the H2 follow-up.)*
 
 ## SERVICES — Remote Access, music, voice, files, KDC (resolves B1, H6)

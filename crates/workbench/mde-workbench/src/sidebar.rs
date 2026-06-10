@@ -18,7 +18,7 @@ use iced::widget::button::Status as ButtonStatus;
 use iced::widget::{button, column, container, row, text, Column, Space};
 use iced::{alignment, Background, Border, Color, Element, Length, Padding, Shadow};
 
-use mde_theme::{Density, Palette, Space as MdeSpace};
+use mde_theme::{Palette, Space as MdeSpace};
 
 use crate::keyboard::Pane;
 use crate::model::{nav_model, Group, View};
@@ -103,7 +103,7 @@ pub fn view<'a>(
     on_panel_click: impl Fn(Group, &'static str) -> crate::Message + 'a,
 ) -> Element<'a, crate::Message> {
     let palette = crate::live_theme::palette();
-    let space = MdeSpace::for_density(Density::Comfortable);
+    let space = MdeSpace::for_density(crate::live_theme::tokens().density);
     let active = view.group();
     let sidebar_focused = focused_pane == Pane::Sidebar;
 

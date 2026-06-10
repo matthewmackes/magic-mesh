@@ -216,7 +216,7 @@ impl SnapshotsPanel {
                 empty_state(state, crate::live_theme::palette(), || {
                     crate::Message::Snapshots(Message::CreateClicked)
                 }),
-                Density::Comfortable,
+                crate::live_theme::tokens().density,
             );
         }
 
@@ -254,7 +254,7 @@ impl SnapshotsPanel {
             col.push(card(
                 card_body,
                 crate::live_theme::palette(),
-                Density::Comfortable,
+                crate::live_theme::tokens().density,
             ))
         });
 
@@ -305,7 +305,7 @@ impl SnapshotsPanel {
         .into();
         panel_container(
             dialog(body, crate::live_theme::palette(), Density::Comfortable),
-            Density::Comfortable,
+            crate::live_theme::tokens().density,
         )
     }
 }

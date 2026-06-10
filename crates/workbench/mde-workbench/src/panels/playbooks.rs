@@ -24,7 +24,7 @@ use std::path::PathBuf;
 
 use iced::widget::{column, container, row, scrollable, text};
 use iced::{Element, Length, Task};
-use mde_theme::{Density, EmptyState, Icon};
+use mde_theme::{EmptyState, Icon};
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -139,7 +139,7 @@ impl PlaybooksPanel {
                 empty_state(state, crate::live_theme::palette(), || {
                     crate::Message::Playbooks(Message::RefreshClicked)
                 }),
-                Density::Comfortable,
+                crate::live_theme::tokens().density,
             );
         }
 
