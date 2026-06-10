@@ -26,6 +26,28 @@ use tokio::sync::Mutex;
 
 use super::{ShutdownToken, Worker};
 
+/// SEC-7 — drop the unbacked-CA alert into the alert_relay watch dir
+/// (one per day via the deterministic id; the relay dedupes).
+fn emit_unbacked_ca_alert(env_var: &str) {
+    let Some(dir) = super::alert_relay::default_alerts_dir() else {
+        return;
+    };
+    let id = NebulaCaBackup::unbacked_alert_id();
+    let event = serde_json::json!({
+        "id": id,
+        "severity": "crit",
+        "alert": "mesh.ca.unbacked",
+        "host": "this lighthouse",
+        "summary": format!(
+            "The mesh CA on this box has NO encrypted backup — export {env_var} \
+             in the mackesd unit (SEC-7)."
+        ),
+    });
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(dir.join(format!("{id}.json")), event.to_string());
+    }
+}
+
 /// Default tick — once per 24 hours. Operators with shorter
 /// CA-rotation cadences override via [`with_tick`].
 pub const TICK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -34,7 +56,8 @@ pub const TICK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 ///
 /// GF-9.1 (v5.0.0) — renamed from the legacy `ca-backup.enc`.
 /// The file now carries both the Nebula CA payload (NF-18.1)
-/// and the optional GlusterFS topology snapshot (GF-9.2), so
+/// and the optional storage topology snapshot (GF-9.2-era field,
+/// LizardFS since E3 — the payload key keeps its wire name), so
 /// the broader name reflects what's inside. Operators who
 /// upgrade from v4.x will see the old `ca-backup.enc` sit
 /// untouched alongside the new `state-backup.enc` — manual
@@ -154,12 +177,28 @@ impl NebulaCaBackup {
         let passphrase = match std::env::var(&self.passphrase_env) {
             Ok(p) if !p.is_empty() => p,
             _ => {
-                // Quiet skip: log at debug so non-lighthouse +
-                // disabled-on-purpose boxes don't spam the journal.
-                tracing::debug!(
-                    env_var = %self.passphrase_env,
-                    "nebula-ca-backup: passphrase env unset; skipping tick",
-                );
+                // SEC-7 (Q31/32) — on a box that actually HOLDS the
+                // CA (lighthouse duty), an unset backup passphrase is
+                // a standing data-loss risk: the CA is the mesh's
+                // single point of loss. Loud-warn every tick + drop an
+                // alert into the alert_relay dir so the operator sees
+                // a desktop notification — not a quiet debug skip.
+                // Boxes without a CA key stay quiet (peer-role).
+                if self.ca_key_path.exists() {
+                    tracing::error!(
+                        env_var = %self.passphrase_env,
+                        "SEC-7: this box holds the mesh CA but has no backup \
+                         passphrase — the CA is UNBACKED-UP. Export {} in the \
+                         mackesd unit and restart.",
+                        self.passphrase_env,
+                    );
+                    emit_unbacked_ca_alert(&self.passphrase_env);
+                } else {
+                    tracing::debug!(
+                        env_var = %self.passphrase_env,
+                        "nebula-ca-backup: passphrase env unset; skipping tick",
+                    );
+                }
                 return;
             }
         };
@@ -181,6 +220,14 @@ impl NebulaCaBackup {
                 );
             }
         }
+    }
+
+    fn unbacked_alert_id() -> String {
+        // One alert per day per box — loud, not spammy.
+        let day = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() / 86_400);
+        format!("sec7-ca-unbacked-{day}")
     }
 
     async fn try_backup(&self, passphrase: &str) -> Result<BackupStats, BackupTickError> {

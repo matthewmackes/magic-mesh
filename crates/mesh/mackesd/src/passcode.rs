@@ -1,16 +1,12 @@
-//! 16-character mesh passcode (Phase 12.10.1, locked 2026-05-19).
+//! 16-character LAN-credential passcode (Phase 12.10.1).
 //!
-//! Single shared code gates **both** peer enrollment and
-//! service-to-service authentication. Stored in libsecret on the
-//! Host peer as `org.mackes.mesh.passcode`; the panel reads it via
-//! the libsecret API. Never plaintext on disk.
-//!
-//! Per 12.10.1: "generated at Host setup with
-//! `secrets.token_urlsafe(12)` (yields exactly 16 chars URL-safe)."
-//! This module is the Rust equivalent. The output character set is
-//! the standard URL-safe base64 alphabet
-//! (`A-Z`, `a-z`, `0-9`, `-`, `_`) so it round-trips through every
-//! transport without encoding.
+//! **SEC-3 (2026-06-10): NOT an enrollment credential.** Mesh
+//! enrollment runs exclusively on 256-bit single-use bearers
+//! (`bearer_ledger`, delivered as the `mesh:` wire token / QR —
+//! ENT-1 enforces the ledger at the signing lighthouse, so a typed
+//! 16-char code can never enroll). This module survives for the
+//! LAN-service credential uses only (cups_sync, surrounding_hosts,
+//! the passcode_creds store).
 
 use rand::RngCore;
 

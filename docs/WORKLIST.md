@@ -44,7 +44,7 @@ Ordered by priority — security lock first, then largest structural debt, then 
 
 - [✓] **F1 · `mde <subcommand>` dispatcher doc-drift** — done (`b6d74de`). Also fixed the mde-role NotPinned error + role.toml header (operator-facing strings pointing at the non-existent `mde setup`) and two extra `pre-mde-setup` comments in mackesd.
 - [✓] **F2 · labwc-as-current doc-drift** — done (`b6d74de`). `repair.rs` reload action marked the legacy labwc path (code untouched, pending A1/A2). `mackesd/Cargo.toml:240` left — it's accurate heritage.
-- [✓] **F3 · GlusterFS-lock doc-drift** — done (`b6d74de` + `38edbcf`); also caught mesh-types `tags.rs`/`peers.rs`. **Residual (defer):** `mackesd/workers/nebula_ca_backup.rs:37` "GlusterFS topology snapshot (GF-9.2)" describes a versioned backup payload field — needs checking the snapshot code before relabeling (don't guess). `mackesd/src/ipc/nebula.rs:7` + `window_manager.rs:8` cite deleted `crates/shell/` paths — the latter dies with A2.
+- [✓] **F3 · GlusterFS-lock doc-drift** — done (`b6d74de` + `38edbcf`); also caught mesh-types `tags.rs`/`peers.rs`. **Residual (defer):** ~~nebula_ca_backup.rs GlusterFS doc~~ relabeled with SEC-7 (wire key keeps its name; storage is LizardFS). `mackesd/src/ipc/nebula.rs:7` + `window_manager.rs:8` cite deleted `crates/shell/` paths — the latter dies with A2.
 - [✓] **H7 · `mde-music/src/library.rs:24–26` stale comment** — done (`b6d74de`); only Radio is unbacked.
 
 ## P7 — Vestigial model / soft seams
@@ -88,11 +88,11 @@ host-local Ansible apply.
 
 - [✓] **SEC-1: non-expiring peer certs** — done — the backend never passed -duration (nebula already signs to CA lifetime); the fictional 365-day bookkeeping expiry is gone: cert_lifetime_days removed through sign/enroll/watcher/epoch/CLI, expires_at=0 is the epoch-lifetime sentinel; turnover = rotation (bump_epoch) / revocation (ENT-3). Display polish ('epoch-lifetime' label for 0) rides the PLANES Registration panel — drop mid-epoch expiry; turnover via rotation/revocation (Q19).
 - [✓] **SEC-2: passphrase-gated CA rotation** — done — rotation_gate (SHA-256 hash on the replicated root, fail-closed when unset); BOTH doors gated: `ca rotate` (env/--passphrase-stdin) + the regen-certs Bus verb ({passphrase} body); `ca set-passphrase` with current-phrase requirement to change; promotion verified mint-only; all three states smoked live + Bus gate test — `mackesd ca rotate` requires an operator passphrase, never auto-on-promotion (Q20).
-- [ ] **SEC-3: QR/file 256-bit enrollment token** — replace the typed 16-char passcode with a delivered 256-bit token; keep auto-sign/TOFU (Q21/22).
+- [✓] **SEC-3: QR/file 256-bit enrollment token** — done — enrollment runs exclusively on ENT-1's 256-bit single-use bearers delivered as the wire token (QR-bounded TOKEN_MAX_LEN); a typed 16-char code can never pass the ledger gate; auto-sign/TOFU kept (csr_watcher signs issued bearers); passcode.rs doc-retired to LAN-credential uses only — replace the typed 16-char passcode with a delivered 256-bit token; keep auto-sign/TOFU (Q21/22).
 - [ ] **SEC-4: outbound first-pair flow** — an operator-initiated KDC pairing flow that completes the handshake and writes the fingerprint pin (Q24/25); keep RSA-4096 (Q23).
 - [ ] **SEC-5: KDC2-4 mesh-shunt worker** — consume `SyntheticAnnounce`/`inject_synthetic`, relay neighbors' `phones.json` mesh-wide; accept any relayer (Q26/27). *(resolves H8; SVC-6.)*
 - [ ] **SEC-6: gossiped signed revocations** — a signed retract record gossips peer-to-peer (like fleet revisions) alongside the per-node ban files (Q28/29).
-- [ ] **SEC-7: mandatory CA backup on lighthouse** — refuse-start / loud-warn without `MDE_BACKUP_PASSPHRASE`; one combined CA+topology bundle (Q31/32).
+- [✓] **SEC-7: mandatory CA backup on lighthouse** — done — a CA-holding box with MDE_BACKUP_PASSPHRASE unset now ERRORs every tick + drops a crit alert (one/day, deduped) into the alert_relay pipeline → desktop notification; peer boxes stay quiet; the combined CA+topology bundle already shipped (GF-9.1 state-backup.enc, gluster-era doc relabeled). Chose loud-warn over refuse-start: availability over liveness-coupling, the alert makes it unmissable — refuse-start / loud-warn without `MDE_BACKUP_PASSPHRASE`; one combined CA+topology bundle (Q31/32).
 - [ ] **SEC-8: encrypt KDC session keys at rest** — persist session keys encrypted so links survive a daemon restart (Q34); keep AES-256-GCM (Q33).
 
 ## GUI — Carbon look + component cleanup (resolves H3, H4, H2-followup)
