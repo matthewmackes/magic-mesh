@@ -30,36 +30,10 @@ use iced::widget::{button, column, container, row, scrollable, text, text_input,
 use iced::{Background, Border, Color, Element, Length, Padding, Task, Theme};
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Protocol {
-    Ssh,
-    Rdp,
-    Vnc,
-}
-
-impl Protocol {
-    fn scheme(self) -> &'static str {
-        match self {
-            Self::Ssh => "ssh",
-            Self::Rdp => "rdp",
-            Self::Vnc => "vnc",
-        }
-    }
-    fn default_port(self) -> u16 {
-        match self {
-            Self::Ssh => 22,
-            Self::Rdp => 3389,
-            Self::Vnc => 5900,
-        }
-    }
-    fn label(self) -> &'static str {
-        match self {
-            Self::Ssh => "SSH",
-            Self::Rdp => "RDP",
-            Self::Vnc => "VNC",
-        }
-    }
-}
+// PD-5 / Q8 — the protocol + launch engine moved to the shared
+// crate::launcher module (one engine for this panel + the Peers
+// directory). Re-exported so existing call sites/tests keep working.
+pub use crate::launcher::Protocol;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct KnownHost {
@@ -548,45 +522,9 @@ pub fn parse_peer_macs(raw: &str) -> Option<Vec<KnownHost>> {
 }
 
 /// Shell out to `remmina -c <proto>://<host>:<port>`. Returns
-/// `true` when `remmina` exits 0 within the spawn window —
-/// remmina detaches into its own window so this is really just
-/// "did the binary launch."
+/// Shared-launcher delegate (PD-5/Q8) — kept for call-site stability.
 pub async fn launch_remmina(host: &str, protocol: Protocol) -> bool {
-    use tokio::process::Command;
-    if protocol == Protocol::Ssh {
-        // SVC-1 / PEERS L7 — SSH opens the platform terminal running
-        // `ssh $USER@host` (Cosmic owns the desktop; cosmic-term is
-        // its terminal). $USER default per L7 — zero config.
-        let user = std::env::var("USER").unwrap_or_else(|_| "root".into());
-        let target = format!("{user}@{host}");
-        let status = Command::new("cosmic-term")
-            .args(["--", "ssh", &target])
-            .spawn();
-        return match status {
-            Ok(mut child) => {
-                let _ = child.try_wait();
-                true
-            }
-            Err(_) => false,
-        };
-    }
-    let url = format!(
-        "{}://{}:{}",
-        protocol.scheme(),
-        host,
-        protocol.default_port()
-    );
-    let status = Command::new("remmina").args(["-c", &url]).spawn();
-    match status {
-        Ok(mut child) => {
-            // Don't wait — remmina opens a window + we want the
-            // workbench to stay responsive. The spawn itself is
-            // the success signal.
-            let _ = child.try_wait();
-            true
-        }
-        Err(_) => false,
-    }
+    crate::launcher::launch(host, protocol).await
 }
 
 /// SVC-1 — TCP probe of port 22 on `host` (800 ms budget). `true`

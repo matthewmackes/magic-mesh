@@ -35,6 +35,10 @@ pub struct PeerRow {
     /// Flattened "what this peer offers" lines for the detail pane +
     /// the service filter (L2).
     pub services: Vec<String>,
+    /// PD-5 op gates from the descriptors (false when unpublished).
+    pub ssh: bool,
+    pub rdp: bool,
+    pub vnc: bool,
 }
 
 /// Panel state.
@@ -46,6 +50,8 @@ pub struct PeersPanel {
     /// `None` = loading; `Some(Err)` = mackesd unreachable (L3 state).
     pub loaded: Option<Result<(), String>>,
     pub self_hostname: String,
+    /// PD-5 — the inline result strip under the op toolbar (Q22).
+    pub op_result: String,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +60,14 @@ pub enum Message {
     FilterChanged(String),
     Select(String),
     RefreshClicked,
+    /// PD-5 — launch a connection op against the selected peer.
+    Op(crate::launcher::Protocol, String),
+    /// PD-5 — a launch finished (spawned or failed).
+    OpFinished {
+        label: &'static str,
+        host: String,
+        ok: bool,
+    },
 }
 
 /// Parse the PD-1 directory JSON into rows (pure, testable).
@@ -82,11 +96,17 @@ pub fn parse_directory(raw: &str) -> Result<Vec<PeerRow>, String> {
                             .to_string()
                     };
                     let mut services = Vec::new();
+                    let (mut ssh, mut rdp, mut vnc) = (false, false, false);
                     if let Some(d) = p.get("descriptors").filter(|d| !d.is_null()) {
                         let ra = &d["remote_access"];
-                        for (label, key) in [("SSH", "ssh"), ("RDP", "rdp"), ("VNC", "vnc")] {
+                        for (label, key, flag) in [
+                            ("SSH", "ssh", &mut ssh),
+                            ("RDP", "rdp", &mut rdp),
+                            ("VNC", "vnc", &mut vnc),
+                        ] {
                             if ra.get(key).and_then(serde_json::Value::as_bool) == Some(true) {
                                 services.push(label.to_string());
+                                *flag = true;
                             }
                         }
                         for c in d["containers"].as_array().into_iter().flatten() {
@@ -128,6 +148,9 @@ pub fn parse_directory(raw: &str) -> Result<Vec<PeerRow>, String> {
                             .unwrap_or("unknown")
                             .to_string(),
                         services,
+                        ssh,
+                        rdp,
+                        vnc,
                     })
                 })
                 .collect()
@@ -145,6 +168,15 @@ pub fn matches_filter(row: &PeerRow, filter: &str) -> bool {
     let f = filter.to_lowercase();
     row.hostname.to_lowercase().contains(&f)
         || row.services.iter().any(|s| s.to_lowercase().contains(&f))
+}
+
+/// PD-5 gating: an op button is live only when the peer's
+/// descriptors offer the service AND the peer isn't offline AND it
+/// isn't this machine (no SSH-to-self chrome — self-inapplicable ops
+/// hidden, Q5).
+#[must_use]
+pub fn op_enabled(row: &PeerRow, offered: bool, self_hostname: &str) -> bool {
+    offered && row.presence != "offline" && row.hostname != self_hostname
 }
 
 /// Group order for the list (Q4/Q5): self first, then online, idle,
@@ -221,6 +253,35 @@ impl PeersPanel {
                 Task::none()
             }
             Message::RefreshClicked => Self::load(),
+            Message::Op(proto, host) => {
+                self.op_result = format!("launching {} → {host}…", proto.label());
+                let label = proto.label();
+                let h = host.clone();
+                Task::perform(
+                    async move {
+                        let ok = crate::launcher::launch(&h, proto).await;
+                        (label, h, ok)
+                    },
+                    |(label, host, ok)| {
+                        crate::Message::Peers(Message::OpFinished { label, host, ok })
+                    },
+                )
+            }
+            Message::OpFinished { label, host, ok } => {
+                self.op_result = if ok {
+                    format!("{label} {host}: launched")
+                } else {
+                    format!(
+                        "{label} {host}: failed to launch — is {} installed?",
+                        if label == "SSH" {
+                            "cosmic-term"
+                        } else {
+                            "remmina"
+                        }
+                    )
+                };
+                Task::none()
+            }
         }
     }
 
@@ -353,6 +414,36 @@ impl PeersPanel {
                     refresh_btn(palette),
                 ]
                 .align_y(iced::alignment::Vertical::Center);
+                // PD-5 — the op toolbar, descriptor- + presence-gated.
+                let mut ops = row![].spacing(8);
+                for (offered, proto) in [
+                    (r.ssh, crate::launcher::Protocol::Ssh),
+                    (r.rdp, crate::launcher::Protocol::Rdp),
+                    (r.vnc, crate::launcher::Protocol::Vnc),
+                ] {
+                    let target = r.overlay_ip.clone();
+                    let target = if target.is_empty() {
+                        r.hostname.clone()
+                    } else {
+                        target
+                    };
+                    let live = op_enabled(r, offered, &self.self_hostname)
+                        .then(|| crate::Message::Peers(Message::Op(proto, target)));
+                    ops = ops.push(crate::controls::variant_button(
+                        proto.label(),
+                        crate::controls::ButtonVariant::Secondary,
+                        live,
+                        palette,
+                    ));
+                }
+                let strip: Element<'_, crate::Message> = if self.op_result.is_empty() {
+                    Space::new().height(Length::Fixed(0.0)).into()
+                } else {
+                    text(self.op_result.clone())
+                        .size(12)
+                        .color(palette.text_muted.into_iced_color())
+                        .into()
+                };
                 let facts = column![
                     fact("Presence", &r.presence, palette),
                     fact("Health", &r.health, palette),
@@ -396,7 +487,9 @@ impl PeersPanel {
                         );
                     }
                 }
-                column![header, facts, services].spacing(16).into()
+                column![header, ops, strip, facts, services]
+                    .spacing(16)
+                    .into()
             }
         };
         let right = container(scrollable(detail))
@@ -547,6 +640,33 @@ mod tests {
         assert_eq!(p.selected.as_deref(), Some("oak"));
         let _ = p.update(Message::FilterChanged("podman".into()));
         assert_eq!(p.filter, "podman");
+    }
+
+    #[test]
+    fn op_gating_honors_descriptors_presence_and_self() {
+        let rows = parse_directory(REPLY).unwrap();
+        let pine = &rows[0]; // online, ssh offered
+        assert!(pine.ssh && !pine.rdp);
+        assert!(op_enabled(pine, pine.ssh, "elsewhere"));
+        assert!(
+            !op_enabled(pine, pine.rdp, "elsewhere"),
+            "unoffered stays dead"
+        );
+        assert!(!op_enabled(pine, pine.ssh, "pine"), "no SSH-to-self");
+        let oak = &rows[1]; // offline
+        assert!(!op_enabled(oak, true, "elsewhere"), "offline disables ops");
+    }
+
+    #[test]
+    fn op_results_land_in_the_strip() {
+        let mut p = PeersPanel::new();
+        let _ = p.update(Message::OpFinished {
+            label: "SSH",
+            host: "10.42.0.2".into(),
+            ok: false,
+        });
+        assert!(p.op_result.contains("failed to launch"));
+        assert!(p.op_result.contains("cosmic-term"));
     }
 
     #[test]

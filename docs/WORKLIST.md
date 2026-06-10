@@ -185,7 +185,7 @@ host-local Ansible apply.
   **so that** the platform's front door shows what the mesh offers and its health (D2).
   **Acceptance:**
     - [ ] `mde-workbench` with no `--focus` opens Peers; nav lists Peers first; Overview remains reachable
-- [ ] **PD-5: PEERS — per-peer ops wiring (Call / SSH / RDP / VNC) via a shared launcher engine**
+- [>] **PD-5: PEERS — per-peer ops wiring** — SSH/RDP/VNC LANDED (shared crate::launcher engine, Remote Access delegates to it — Q8 done; buttons descriptor- + presence-gated, no-ops-on-self, inline result strip Q22); REMAINING: Call via action/voice/dial (needs the voice agent's Bus dial subscriber)
   **As** an operator on a selected peer,
   **I want** Call → `action/voice/dial {peer}` (HUD pops), SSH → cosmic-term `ssh $USER@<overlay-ip>` (L7), RDP/VNC → remmina via a launcher module extracted from `remote_desktop.rs` and shared with the Remote Access panel; buttons gated by descriptors + presence (Call additionally by voice presence); no permission gate — desktop = operator (L8),
   **so that** every reach-this-peer gesture is one click from the directory (Q8/Q17/Q18/Q19).
