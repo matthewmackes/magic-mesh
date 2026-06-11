@@ -248,6 +248,16 @@ pub struct NebulaStatusService {
     /// `mackesd_core::default_qnm_shared_root`) when the
     /// caller doesn't override.
     workgroup_root: std::path::PathBuf,
+    /// CA cert / key / peer-cert dir the RegenCerts() rotation
+    /// writes through. Default to the canonical system paths in
+    /// production; tests redirect all three under one tempdir via
+    /// [`with_ca_dir`](Self::with_ca_dir) so the rotation never
+    /// touches `/var/lib/mackesd` (which made the regen-certs tests
+    /// non-hermetic — they passed only on a box with no `nebula-cert`
+    /// AND a clean CA dir, and failed wherever a real CA already sat).
+    ca_crt_path: std::path::PathBuf,
+    ca_key_path: std::path::PathBuf,
+    peer_cert_dir: std::path::PathBuf,
 }
 
 impl NebulaStatusService {
@@ -268,7 +278,22 @@ impl NebulaStatusService {
             role_marker_path: std::path::PathBuf::from(DEFAULT_ROLE_HOST_MARKER),
             mesh_id: std::env::var("MDE_MESH_ID").unwrap_or(default_mesh),
             workgroup_root: crate::default_qnm_shared_root(),
+            ca_crt_path: std::path::PathBuf::from(crate::ca::DEFAULT_CA_CERT_PATH),
+            ca_key_path: std::path::PathBuf::from(crate::ca::DEFAULT_CA_KEY_PATH),
+            peer_cert_dir: std::path::PathBuf::from(crate::ca::epoch::DEFAULT_PEER_CERT_DIR),
         }
+    }
+
+    /// Redirect the CA cert/key + peer-cert dir under one directory —
+    /// used by tests so the RegenCerts() rotation writes into a tempdir
+    /// instead of `/var/lib/mackesd/nebula-ca`. `ca.crt` + `ca.key` land
+    /// directly in `dir`; per-peer certs under `dir/peers`.
+    #[must_use]
+    pub fn with_ca_dir(mut self, dir: &std::path::Path) -> Self {
+        self.ca_crt_path = dir.join("ca.crt");
+        self.ca_key_path = dir.join("ca.key");
+        self.peer_cert_dir = dir.join("peers");
+        self
     }
 
     /// Override the mesh_id — used by tests that need a
@@ -408,7 +433,14 @@ impl NebulaStatusService {
         use crate::ca::{CaError, SubprocessBackend};
         let mesh_id = self.mesh_id.clone();
         let mut conn = self.store.lock().await;
-        match epoch::bump_epoch(&SubprocessBackend, &mut *conn, &mesh_id, None, None) {
+        match epoch::bump_epoch_into(
+            &SubprocessBackend,
+            &mut *conn,
+            &mesh_id,
+            Some(&self.ca_crt_path),
+            Some(&self.ca_key_path),
+            &self.peer_cert_dir,
+        ) {
             Ok(o) => Ok(format!(
                 "CA rotated to epoch {} (retired {}); {} peer certs re-signed.",
                 o.new_epoch,
@@ -899,7 +931,8 @@ mod tests {
     async fn regen_certs_is_passphrase_gated_sec2() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let svc = NebulaStatusService::new(fresh_store(), "peer:local", "host")
-            .with_workgroup_root(tmp.path().to_path_buf());
+            .with_workgroup_root(tmp.path().to_path_buf())
+            .with_ca_dir(tmp.path());
         // Unset gate → fail-closed refusal naming set-passphrase.
         let r: serde_json::Value =
             serde_json::from_str(&build_reply(&svc, "regen-certs", None).await).unwrap();
@@ -933,16 +966,16 @@ mod tests {
 
     #[tokio::test]
     async fn regen_certs_handles_binary_missing_gracefully() {
-        // On a dev box without `nebula-cert` installed (the
-        // dominant case in CI / local dev), the rotation
-        // surfaces a human-readable hint rather than a raw
-        // subprocess error.
-        let svc = NebulaStatusService::new(fresh_store(), "peer:local", "host");
+        // Hermetic: redirect the CA dir into a tempdir so the rotation
+        // never touches /var/lib/mackesd. Outcome depends only on whether
+        // `nebula-cert` is on PATH — installed → "CA rotated to epoch 0"
+        // (into the empty tempdir, no leftover to refuse); absent → the
+        // "not on PATH" hint. Both are valid; neither depends on host CA
+        // state, so this no longer flakes on a box with a real CA present.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let svc =
+            NebulaStatusService::new(fresh_store(), "peer:local", "host").with_ca_dir(tmp.path());
         let msg = svc.regen_certs_inner().await.expect("ok");
-        // Either the rotation succeeded (rare — only on a
-        // bench host with nebula installed + writable
-        // /var/lib/mackesd) or surfaced the install hint.
-        // Both are valid outcomes.
         assert!(
             msg.contains("nebula-cert not on PATH") || msg.contains("CA rotated to epoch"),
             "unexpected regen-certs reply: {msg}",
