@@ -32,6 +32,10 @@ pub struct PeerRow {
     pub overlay_ip: String,
     pub role: String,
     pub currency: String,
+    /// L1 — the peer's capability tags (`hop`/`execution`/`headless`)
+    /// from the directory record. Rendered as chips in the detail pane
+    /// and folded into the filter; empty when the peer has none.
+    pub tags: Vec<String>,
     /// Flattened "what this peer offers" lines for the detail pane +
     /// the service filter (L2).
     pub services: Vec<String>,
@@ -165,6 +169,16 @@ pub fn parse_directory(raw: &str) -> Result<Vec<PeerRow>, String> {
                             .unwrap_or_default()
                             .to_string()
                     };
+                    // L1 — capability tags from the directory record.
+                    let tags: Vec<String> = p
+                        .get("tags")
+                        .and_then(|t| t.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     let mut services = Vec::new();
                     let (mut ssh, mut rdp, mut vnc) = (false, false, false);
                     let mut lan_macs: Vec<String> = Vec::new();
@@ -233,6 +247,7 @@ pub fn parse_directory(raw: &str) -> Result<Vec<PeerRow>, String> {
                             .as_str()
                             .unwrap_or("unknown")
                             .to_string(),
+                        tags,
                         services,
                         ssh,
                         rdp,
@@ -248,7 +263,8 @@ pub fn parse_directory(raw: &str) -> Result<Vec<PeerRow>, String> {
     Ok(rows)
 }
 
-/// Filter predicate (L2): hostname OR any offered-service line.
+/// Filter predicate (L2): hostname OR capability tag (L1) OR any
+/// offered-service line.
 #[must_use]
 pub fn matches_filter(row: &PeerRow, filter: &str) -> bool {
     if filter.is_empty() {
@@ -256,6 +272,7 @@ pub fn matches_filter(row: &PeerRow, filter: &str) -> bool {
     }
     let f = filter.to_lowercase();
     row.hostname.to_lowercase().contains(&f)
+        || row.tags.iter().any(|t| t.to_lowercase().contains(&f))
         || row.services.iter().any(|s| s.to_lowercase().contains(&f))
 }
 
@@ -841,6 +858,20 @@ impl PeersPanel {
                     refresh_btn(palette),
                 ]
                 .align_y(iced::alignment::Vertical::Center);
+                // L1 — capability-tag chips; honest absence when none.
+                let tags_row: Element<'_, crate::Message> = if r.tags.is_empty() {
+                    Space::new().height(Length::Fixed(0.0)).into()
+                } else {
+                    let mut chips = row![text("Tags")
+                        .size(11)
+                        .color(palette.text_muted.into_iced_color())]
+                    .spacing(6)
+                    .align_y(iced::alignment::Vertical::Center);
+                    for t in &r.tags {
+                        chips = chips.push(badge(t.as_str(), palette));
+                    }
+                    chips.into()
+                };
                 // PD-5 — the op toolbar, descriptor- + presence-gated.
                 let mut ops = row![].spacing(8);
                 for (offered, proto) in [
@@ -1072,9 +1103,18 @@ impl PeersPanel {
                         );
                     }
                 }
-                column![header, ops, wake, strip, facts, metrics_col, services]
-                    .spacing(16)
-                    .into()
+                column![
+                    header,
+                    tags_row,
+                    ops,
+                    wake,
+                    strip,
+                    facts,
+                    metrics_col,
+                    services
+                ]
+                .spacing(16)
+                .into()
             }
         };
         let right = container(scrollable(detail))
@@ -1200,7 +1240,8 @@ mod tests {
 
     const REPLY: &str = r#"{"ok":true,"head":2,"peers":[
         {"hostname":"pine","presence":"online","health":"healthy","mde_version":"4.2.1",
-         "overlay_ip":"10.42.0.2","role":"host","revision":{"currency":"synced"},
+         "overlay_ip":"10.42.0.2","role":"host","tags":["execution","headless"],
+         "revision":{"currency":"synced"},
          "descriptors":{"remote_access":{"ssh":true,"rdp":false,"vnc":false},
             "containers":[{"name":"nginx","image":"nginx:latest","state":"running","ports":["8080->80/tcp"]}],
             "vms":[{"name":"win11","state":"running","vcpus":4,"memory_mb":8192,"addresses":["192.168.122.5"]}],
@@ -1224,8 +1265,14 @@ mod tests {
             .iter()
             .any(|s| s.contains("kvm: win11") && s.contains("4 vCPU / 8192 MiB")));
         assert!(pine.services.iter().any(|s| s.contains("media: mpd :6600")));
+        // L1 — capability tags parse; a peer without a `tags` key has none.
+        assert_eq!(
+            pine.tags,
+            vec!["execution".to_string(), "headless".to_string()]
+        );
         // Descriptor-less peer degrades honestly.
         assert!(rows[1].services.is_empty());
+        assert!(rows[1].tags.is_empty());
     }
 
     #[test]
@@ -1235,13 +1282,18 @@ mod tests {
     }
 
     #[test]
-    fn filter_matches_hostname_or_service() {
+    fn filter_matches_hostname_tag_or_service() {
         let rows = parse_directory(REPLY).unwrap();
         assert!(matches_filter(&rows[0], ""));
         assert!(matches_filter(&rows[0], "pine"));
         assert!(matches_filter(&rows[0], "podman"));
         assert!(matches_filter(&rows[0], "WIN11"));
+        // L1 — the filter narrows by capability tag too (case-insensitive).
+        assert!(matches_filter(&rows[0], "execution"));
+        assert!(matches_filter(&rows[0], "HEADLESS"));
+        assert!(!matches_filter(&rows[0], "hop"));
         assert!(!matches_filter(&rows[1], "podman"));
+        assert!(!matches_filter(&rows[1], "execution"));
     }
 
     #[test]

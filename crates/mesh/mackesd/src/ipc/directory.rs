@@ -73,12 +73,18 @@ pub fn revision_currency(head: Option<u64>, acked: Option<u64>) -> &'static str 
 }
 
 /// One peer's joined directory row.
+///
+/// `tags` are the peer's capability tags (L1 — `hop`/`execution`/
+/// `headless`) read from the replicated tag manifest; empty when the
+/// peer has none. The Peers Front Door renders them as chips and folds
+/// them into the filter.
 #[must_use]
 pub fn directory_row(
     rec: &PeerRecord,
     overlay: Option<&(String, String)>,
     head: Option<u64>,
     acked: Option<u64>,
+    tags: &[String],
     now_ms: u64,
 ) -> serde_json::Value {
     json!({
@@ -90,6 +96,7 @@ pub fn directory_row(
         "descriptors": rec.descriptors,
         "overlay_ip": overlay.map(|(ip, _)| ip.clone()),
         "role": overlay.map(|(_, role)| role.clone()),
+        "tags": tags,
         "revision": {
             "head": head,
             "acked": acked,
@@ -160,11 +167,21 @@ impl DirectoryService {
         let rows: Vec<_> = records
             .iter()
             .map(|rec| {
+                // L1 — join the peer's capability tags from the
+                // replicated manifest. Read-only; an absent manifest
+                // is an honest empty tag list, never an error.
+                let tags: Vec<String> =
+                    mackes_mesh_types::cap_tags::read_tags(&self.workgroup_root, &rec.hostname)
+                        .tags
+                        .iter()
+                        .map(|t| t.as_str().to_string())
+                        .collect();
                 directory_row(
                     rec,
                     roster.get(&rec.hostname),
                     head,
                     acked.get(&rec.hostname).copied(),
+                    &tags,
                     now_ms,
                 )
             })
@@ -412,6 +429,62 @@ mod tests {
         assert_eq!(p["mde_version"], "4.2.1");
         // No roster DB → overlay/role are honest nulls.
         assert!(p["overlay_ip"].is_null());
+    }
+
+    #[test]
+    fn directory_joins_capability_tags_l1() {
+        use mackes_mesh_types::cap_tags::{write_tags, CapabilityTag, NodeTags};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let pdir = mackes_mesh_types::peers::peers_dir(root);
+        std::fs::create_dir_all(&pdir).unwrap();
+        let now = now_ms();
+        write_peer_record(
+            &pdir,
+            &PeerRecord {
+                hostname: "anvil".into(),
+                mde_version: Some("4.2.1".into()),
+                last_seen_ms: now,
+                health: "healthy".into(),
+                descriptors: None,
+            },
+        )
+        .unwrap();
+        let mut t = NodeTags::default();
+        t.tags.insert(CapabilityTag::Execution);
+        t.tags.insert(CapabilityTag::Headless);
+        write_tags(root, "anvil", &t).unwrap();
+
+        let svc = DirectoryService::new(root, None);
+        let dir = svc.build_directory(now);
+        let tags = dir["peers"][0]["tags"].as_array().unwrap();
+        let tags: Vec<&str> = tags.iter().filter_map(|v| v.as_str()).collect();
+        assert!(tags.contains(&"execution"));
+        assert!(tags.contains(&"headless"));
+        assert!(!tags.contains(&"hop"));
+    }
+
+    #[test]
+    fn directory_tags_are_empty_without_a_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let pdir = mackes_mesh_types::peers::peers_dir(root);
+        std::fs::create_dir_all(&pdir).unwrap();
+        let now = now_ms();
+        write_peer_record(
+            &pdir,
+            &PeerRecord {
+                hostname: "bare".into(),
+                mde_version: None,
+                last_seen_ms: now,
+                health: "unknown".into(),
+                descriptors: None,
+            },
+        )
+        .unwrap();
+        let svc = DirectoryService::new(root, None);
+        let dir = svc.build_directory(now);
+        assert!(dir["peers"][0]["tags"].as_array().unwrap().is_empty());
     }
 
     #[test]
