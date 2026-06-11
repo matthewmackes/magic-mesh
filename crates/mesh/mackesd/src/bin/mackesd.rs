@@ -796,6 +796,20 @@ enum Cmd {
         profile: Option<String>,
     },
 
+    /// PLANES-7 (W28) — coordinate a fleet upgrade. `--coordinate` writes
+    /// an upgrade-intent on the replicated volume; every peer's
+    /// upgrade-intent watcher then upgrades to repo-latest behind the
+    /// quorum + grace barrier (the best-practice typed update path — not a
+    /// raw GUI dnf). `--version` is an optional coordination label.
+    Upgrade {
+        /// Publish the coordinated-upgrade intent.
+        #[arg(long)]
+        coordinate: bool,
+        /// Coordination label for the intent (default `latest`).
+        #[arg(long)]
+        version: Option<String>,
+    },
+
     /// CB-1.5.a — fleet node roster. `mded nodes list --json` emits
     /// every row from the `nodes` table as a JSON array; the Iced
     /// inventory panel (in `crates/mde-workbench/src/panels/
@@ -4277,6 +4291,35 @@ fn main() -> anyhow::Result<()> {
                     for m in manifests.iter().filter(|m| m.kind == kind.as_str()) {
                         println!("    {} v{}", m.name, m.version);
                     }
+                }
+            }
+            return Ok(());
+        }
+        Cmd::Upgrade {
+            coordinate,
+            version,
+        } => {
+            // PLANES-7 (W28) — publish a coordinated-upgrade intent the
+            // fleet's watchers process (quorum + grace barrier).
+            if !coordinate {
+                eprintln!("mackesd upgrade: pass --coordinate to publish an upgrade intent");
+                std::process::exit(1);
+            }
+            let root = mackesd_core::default_qnm_shared_root();
+            let label = version.unwrap_or_else(|| "latest".to_string());
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+            match mackesd_core::workers::upgrade_intent_watcher::write_intent(&root, &label, now_ms)
+            {
+                Ok(p) => println!(
+                    "coordinated upgrade '{label}' — intent published at {} \
+                     (each peer upgrades behind the quorum + grace barrier)",
+                    p.display()
+                ),
+                Err(e) => {
+                    eprintln!("mackesd upgrade --coordinate: {e}");
+                    std::process::exit(1);
                 }
             }
             return Ok(());

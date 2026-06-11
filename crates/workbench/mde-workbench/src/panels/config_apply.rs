@@ -8,8 +8,10 @@
 //! Reconcile-now shells `mackesd reconcile`.
 //!
 //! The newest/applied projection + the last-apply log tail (W22) are
-//! pure + unit-tested. Update-now-via-typed-job (W28's action half) is
-//! the deferred tail (design-coupled to the jobs engine).
+//! pure + unit-tested. Update-now (W28) coordinates a fleet RPM upgrade
+//! the best-practice way — `mackesd upgrade --coordinate` publishes a
+//! typed upgrade-intent the per-peer watcher processes behind a quorum +
+//! grace barrier — not a raw GUI-side dnf.
 
 use std::path::{Path, PathBuf};
 
@@ -159,6 +161,10 @@ pub enum Message {
     ReconcileClicked,
     Reconciled(String),
     RefreshClicked,
+    /// W28 — coordinate a fleet RPM upgrade via the typed upgrade-intent
+    /// mechanism (`mackesd upgrade --coordinate`), not a raw local dnf.
+    UpdateClicked,
+    Updated(String),
 }
 
 fn hostname() -> String {
@@ -303,6 +309,29 @@ impl ConfigApplyPanel {
                 // Reload to reflect the new applied version.
                 Self::load()
             }
+            Message::UpdateClicked => {
+                if self.busy {
+                    return Task::none();
+                }
+                self.busy = true;
+                self.status = "Coordinating fleet upgrade (typed upgrade-intent)…".into();
+                Task::perform(
+                    async move {
+                        match run_mackesd(&["upgrade".into(), "--coordinate".into()]).await {
+                            Ok(out) => {
+                                Message::Updated(format!("upgrade coordinated — {}", out.trim()))
+                            }
+                            Err(e) => Message::Updated(format!("update failed: {e}")),
+                        }
+                    },
+                    crate::Message::ConfigApply,
+                )
+            }
+            Message::Updated(msg) => {
+                self.status = msg;
+                self.busy = false;
+                Task::none()
+            }
             Message::RefreshClicked => {
                 if self.busy {
                     return Task::none();
@@ -339,6 +368,14 @@ impl ConfigApplyPanel {
             (!self.busy).then_some(crate::Message::ConfigApply(Message::RefreshClicked)),
             palette,
         );
+        // W28 — update-now via the typed fleet upgrade-intent (best-practice
+        // path: coordinated dnf behind the quorum + grace barrier).
+        let update = variant_button(
+            "Update now",
+            ButtonVariant::Secondary,
+            (!self.busy).then_some(crate::Message::ConfigApply(Message::UpdateClicked)),
+            palette,
+        );
 
         let mut rows = column![
             text("Fleet configuration").size(20),
@@ -364,7 +401,7 @@ impl ConfigApplyPanel {
                 text(s.repo_source.clone()).size(13)
             ]
             .spacing(8),
-            row![reconcile, refresh].spacing(12),
+            row![reconcile, update, refresh].spacing(12),
             text(self.status.clone()).size(13),
         ]
         .spacing(10);

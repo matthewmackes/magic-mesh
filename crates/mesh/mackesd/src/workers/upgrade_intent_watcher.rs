@@ -132,6 +132,46 @@ fn normalize(intent: &Value) -> Value {
     v
 }
 
+/// PLANES-7 (INST-10 in-tree equivalent) — publish a coordinated-upgrade
+/// **intent** that every peer's watcher fleet-processes (quorum + grace
+/// barrier). This is the best-practice update-now path: a typed intent on
+/// the replicated volume, not a raw GUI-side dnf. `target_version` is a
+/// coordination label (the watcher upgrades to repo-latest; the label
+/// names/dedups the intent), so `"latest"` or a release tag both work.
+/// Re-coordinating the same label overwrites the file with an empty
+/// ready-set, so every peer upgrades again.
+///
+/// # Errors
+/// IO / serialization failure writing the intent file.
+pub fn write_intent(
+    mesh_home: &Path,
+    target_version: &str,
+    now_ms: u64,
+) -> std::io::Result<PathBuf> {
+    let dir = mesh_home.join("upgrade-intent");
+    std::fs::create_dir_all(&dir)?;
+    let safe: String = target_version
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let stem = if safe.is_empty() { "latest" } else { &safe };
+    let path = dir.join(format!("{stem}.json"));
+    let body = json!({
+        "target_version": target_version,
+        "initiated_at_ms": now_ms,
+        "ready": {},
+    });
+    let text = serde_json::to_string_pretty(&body).map_err(std::io::Error::other)?;
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
+
 /// All intent files in `dir`, sorted. Missing dir → empty.
 #[must_use]
 pub fn pending_intents(dir: &Path) -> Vec<PathBuf> {
@@ -570,6 +610,33 @@ mod tests {
             "initiated_at_ms": ts_ms,
             "ready": [],
         })
+    }
+
+    #[test]
+    fn write_intent_publishes_a_watcher_readable_intent() {
+        // PLANES-7 — the in-tree coordinate writer lands an intent that
+        // pending_intents finds, carrying the minimal watcher schema.
+        let home = tempdir().unwrap();
+        let path = write_intent(home.path(), "latest", 4242).unwrap();
+        assert!(path.ends_with("upgrade-intent/latest.json"));
+        let found = pending_intents(&home.path().join("upgrade-intent"));
+        assert_eq!(found.len(), 1);
+        let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["target_version"], "latest");
+        assert_eq!(v["initiated_at_ms"], 4242);
+        assert!(v["ready"].is_object());
+        // A peer hasn't acked it yet → it should act.
+        assert!(should_act(&v, "anvil"));
+    }
+
+    #[test]
+    fn write_intent_sanitizes_the_filename() {
+        let home = tempdir().unwrap();
+        let path = write_intent(home.path(), "v2.7.1/weird name", 1).unwrap();
+        // Path-unsafe chars collapse to '-'; the label is preserved inside.
+        assert!(path.ends_with("upgrade-intent/v2.7.1-weird-name.json"));
+        let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["target_version"], "v2.7.1/weird name");
     }
 
     #[test]
