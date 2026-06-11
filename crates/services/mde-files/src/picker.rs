@@ -13,8 +13,13 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use iced::widget::{button, container, pick_list, scrollable, svg, text, text_input, Column, Row};
-use iced::{Background, Border, Color, Element, Length, Size, Task, Theme};
+use crate::cosmic_compat::{ButtonSty, ContainerSty, SvgSty, TextSty};
+use cosmic::app::ApplicationExt;
+use cosmic::iced::widget::{
+    button, container, pick_list, scrollable, svg, text, text_input, Column, Row,
+};
+use cosmic::iced::{Background, Border, Color, Length, Task};
+use cosmic::{Application, Element, Theme};
 
 use crate::backend::LocalFsBackend;
 use crate::theme as t;
@@ -91,6 +96,8 @@ impl std::fmt::Display for FilterChoice {
 }
 
 struct Picker {
+    /// GUI-7 — the libcosmic application core (set from `init`).
+    core: cosmic::app::Core,
     save: bool,
     title: String,
     current: PathBuf,
@@ -100,6 +107,16 @@ struct Picker {
     filename: String,
     filters: Vec<Filter>,
     filter_idx: usize,
+}
+
+/// GUI-7 — the parsed chooser config handed to `Application::init` as the flag.
+struct PickerFlags {
+    save: bool,
+    title: String,
+    current: PathBuf,
+    entries: Vec<Entry>,
+    filename: String,
+    filters: Vec<Filter>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,7 +135,7 @@ enum Message {
 
 /// Parse the `--pick …` argv tail and run the chooser. The `--pick` flag itself
 /// (consumed by `main`) may still be present; it is ignored here.
-pub fn run(args: &[String]) -> iced::Result {
+pub fn run(args: &[String]) -> cosmic::iced::Result {
     let mut save = false;
     let mut title = String::new();
     let mut dir: Option<PathBuf> = None;
@@ -151,36 +168,64 @@ pub fn run(args: &[String]) -> iced::Result {
         title
     };
 
-    iced::application(
-        move || {
-            let entries = read_entries(&current, &filters[0]);
-            Picker {
-                save,
-                title: title.clone(),
-                current: current.clone(),
-                entries,
-                selected: None,
-                last_click: None,
-                filename: filename.clone(),
-                filters: filters.clone(),
-                filter_idx: 0,
-            }
-        },
-        update,
-        view,
-    )
-    .title(win_title)
-    .theme(theme_of)
-    .window_size(Size::new(560.0, 410.0))
-    .run()
+    let entries = read_entries(&current, &filters[0]);
+    let flags = PickerFlags {
+        save,
+        title,
+        current,
+        entries,
+        filename,
+        filters,
+    };
+    cosmic::app::run::<Picker>(cosmic::app::Settings::default(), flags)
 }
 
-fn win_title(state: &Picker) -> String {
-    state.title.clone()
-}
+impl Application for Picker {
+    type Executor = cosmic::executor::Default;
+    type Flags = PickerFlags;
+    type Message = Message;
+    const APP_ID: &'static str = "com.mackes.MagicMeshFilePicker";
 
-fn theme_of(_state: &Picker) -> Theme {
-    t::theme()
+    fn core(&self) -> &cosmic::app::Core {
+        &self.core
+    }
+
+    fn core_mut(&mut self) -> &mut cosmic::app::Core {
+        &mut self.core
+    }
+
+    fn init(
+        core: cosmic::app::Core,
+        flags: Self::Flags,
+    ) -> (Self, cosmic::app::Task<Self::Message>) {
+        let mut picker = Picker {
+            core,
+            save: flags.save,
+            title: flags.title,
+            current: flags.current,
+            entries: flags.entries,
+            selected: None,
+            last_click: None,
+            filename: flags.filename,
+            filters: flags.filters,
+            filter_idx: 0,
+        };
+        // Keep the chooser's own chrome; suppress Cosmic's headerbar. The
+        // parsed title still names the window (Open / Save As).
+        picker.core.window.show_headerbar = false;
+        let win_title = picker.title.clone();
+        picker.set_header_title(win_title);
+        (picker, cosmic::app::Task::none())
+    }
+
+    fn update(&mut self, message: Self::Message) -> cosmic::app::Task<Self::Message> {
+        // Delegate to the free reducer, then lift into the cosmic Action space.
+        update(self, message).map(cosmic::Action::App)
+    }
+
+    fn view(&self) -> Element<'_, Self::Message> {
+        view(self)
+    }
 }
 
 /// Parse `"Images:png,jpg;All Files:*"` into filters; default to All Files.
@@ -374,7 +419,7 @@ fn glyph<'a>(bytes: &'static [u8], color: Color) -> Element<'a, Message> {
     svg(crate::icons::handle(bytes))
         .width(Length::Fixed(16.0))
         .height(Length::Fixed(16.0))
-        .style(move |_t: &Theme, _s: svg::Status| svg::Style { color: Some(color) })
+        .sty(move |_t: &Theme| svg::Style { color: Some(color) })
         .into()
 }
 
@@ -460,19 +505,19 @@ fn entry_row<'a>(state: &Picker, i: usize, e: &Entry) -> Element<'a, Message> {
     };
     let row = Row::new()
         .spacing(8.0)
-        .align_y(iced::Alignment::Center)
+        .align_y(cosmic::iced::Alignment::Center)
         .push(glyph(icon_bytes, color))
         .push(text(e.name.clone()).size(ROW_PX).width(Length::Fill));
     button(row)
         .on_press(Message::ClickEntry(i))
         .width(Length::Fill)
-        .padding(iced::Padding {
+        .padding(cosmic::iced::Padding {
             top: 3.0,
             right: 8.0,
             bottom: 3.0,
             left: 6.0,
         })
-        .style(row_button_style(state.selected == Some(i)))
+        .sty(row_button_style(state.selected == Some(i)))
         .into()
 }
 
@@ -492,8 +537,8 @@ fn view(state: &Picker) -> Element<'_, Message> {
     // Look in: ancestor dropdown + Up button.
     let look_in = Row::new()
         .spacing(8.0)
-        .align_y(iced::Alignment::Center)
-        .push(text("Look in:").size(ROW_PX).color(t::FG_DIM))
+        .align_y(cosmic::iced::Alignment::Center)
+        .push(text("Look in:").size(ROW_PX).colr(t::FG_DIM))
         .push(
             pick_list(
                 ancestors(&state.current),
@@ -506,13 +551,13 @@ fn view(state: &Picker) -> Element<'_, Message> {
         .push(
             button(glyph(crate::icons::ARROW_LEFT, t::FG))
                 .on_press(Message::Up)
-                .padding(iced::Padding {
+                .padding(cosmic::iced::Padding {
                     top: 4.0,
                     right: 6.0,
                     bottom: 4.0,
                     left: 6.0,
                 })
-                .style(secondary_button_style),
+                .sty(secondary_button_style),
         );
 
     // Quick-access places column.
@@ -525,35 +570,35 @@ fn view(state: &Picker) -> Element<'_, Message> {
             button(
                 Row::new()
                     .spacing(8.0)
-                    .align_y(iced::Alignment::Center)
+                    .align_y(cosmic::iced::Alignment::Center)
                     .push(glyph(icon, t::FG_DIM))
                     .push(text(label.to_string()).size(ROW_PX)),
             )
             .on_press(Message::Place(i))
             .width(Length::Fill)
-            .padding(iced::Padding {
+            .padding(cosmic::iced::Padding {
                 top: 4.0,
                 right: 6.0,
                 bottom: 4.0,
                 left: 6.0,
             })
-            .style(row_button_style(false)),
+            .sty(row_button_style(false)),
         );
     }
     let places_pane = container(places_col)
-        .style(surface_style(t::WINDOW_SIDE, t::PF_BORDER))
+        .sty(surface_style(t::WINDOW_SIDE, t::PF_BORDER))
         .height(Length::Fill);
 
     // File list well.
     let mut list = Column::new().spacing(0.0);
     if state.entries.is_empty() {
-        list = list.push(container(text("(empty)").size(ROW_PX).color(t::FG_FAINT)).padding(6.0));
+        list = list.push(container(text("(empty)").size(ROW_PX).colr(t::FG_FAINT)).padding(6.0));
     }
     for (i, e) in state.entries.iter().enumerate() {
         list = list.push(entry_row(state, i, e));
     }
     let well = container(scrollable(list).height(Length::Fill))
-        .style(surface_style(t::WINDOW, t::PF_BORDER))
+        .sty(surface_style(t::WINDOW, t::PF_BORDER))
         .padding(2.0)
         .width(Length::Fill)
         .height(Length::Fill);
@@ -564,11 +609,11 @@ fn view(state: &Picker) -> Element<'_, Message> {
     let accept_label = if state.save { "Save" } else { "Open" };
     let name_row = Row::new()
         .spacing(8.0)
-        .align_y(iced::Alignment::Center)
+        .align_y(cosmic::iced::Alignment::Center)
         .push(
             text("File name:")
                 .size(ROW_PX)
-                .color(t::FG_DIM)
+                .colr(t::FG_DIM)
                 .width(Length::Fixed(72.0)),
         )
         .push(
@@ -581,13 +626,13 @@ fn view(state: &Picker) -> Element<'_, Message> {
         .push(
             button(text(accept_label).size(ROW_PX))
                 .on_press(Message::Accept)
-                .padding(iced::Padding {
+                .padding(cosmic::iced::Padding {
                     top: 5.0,
                     right: 14.0,
                     bottom: 5.0,
                     left: 14.0,
                 })
-                .style(primary_button_style),
+                .sty(primary_button_style),
         );
 
     // Files of type row + Cancel button.
@@ -606,11 +651,11 @@ fn view(state: &Picker) -> Element<'_, Message> {
         .collect();
     let type_row = Row::new()
         .spacing(8.0)
-        .align_y(iced::Alignment::Center)
+        .align_y(cosmic::iced::Alignment::Center)
         .push(
             text("Files of type:")
                 .size(ROW_PX)
-                .color(t::FG_DIM)
+                .colr(t::FG_DIM)
                 .width(Length::Fixed(72.0)),
         )
         .push(
@@ -621,13 +666,13 @@ fn view(state: &Picker) -> Element<'_, Message> {
         .push(
             button(text("Cancel").size(ROW_PX))
                 .on_press(Message::Cancel)
-                .padding(iced::Padding {
+                .padding(cosmic::iced::Padding {
                     top: 5.0,
                     right: 14.0,
                     bottom: 5.0,
                     left: 14.0,
                 })
-                .style(secondary_button_style),
+                .sty(secondary_button_style),
         );
 
     let body = Column::new()
@@ -639,7 +684,7 @@ fn view(state: &Picker) -> Element<'_, Message> {
         .push(type_row);
 
     container(body)
-        .style(|_t| container::Style {
+        .sty(|_t| container::Style {
             snap: false,
             background: Some(Background::Color(t::BG)),
             ..container::Style::default()

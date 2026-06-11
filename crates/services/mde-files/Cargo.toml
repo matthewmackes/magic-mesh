@@ -13,12 +13,16 @@ name = "mde-files"
 path = "src/main.rs"
 
 [dependencies]
-iced       = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "svg", "tokio", "advanced", "wayland"] }
-# CR-4 (2026-05-25) — Object Card consumer. Pulls `object_card` from
-# the shared widget crate that CR-3.b introduced; the data form +
-# spec constants come from mde-theme (no toolkit dep there).
-mde-theme  = { path = "../../shared/mde-theme", features = ["iced"] }
-mde-iced-components = { path = "../../shared/mde-iced-components" }
+# GUI-7 (2026-06-11) — maximize-Cosmic-native cutover: mde-files is ported off
+# iced 0.14 onto libcosmic (the same rev GUI-6's applet pinned). `cosmic::iced`
+# is libcosmic's vendored iced fork, so the view/style code ports largely
+# mechanically (iced:: → cosmic::iced::); the shell becomes a `cosmic::
+# Application`. wgpu render + svg + wayland for the windowed app.
+libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "cca48bc29ef7a9f22160c0ab6ba117ab22d1ae87", default-features = false, features = ["tokio", "winit", "wgpu", "a11y", "wayland", "multi-window"] }
+# Object Card data form (ObjectCard / Icon / Palette) — the toolkit-free data
+# types. The iced-0.14 renderer (`mde-iced-components`) is dropped in the
+# cutover; mde-files renders the card with a local cosmic::iced helper.
+mde-theme  = { path = "../../shared/mde-theme" }
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 # v2.0.0 Phase 2.x — Backend trait + DemoBackend audit-log

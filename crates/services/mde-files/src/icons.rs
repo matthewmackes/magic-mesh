@@ -6,7 +6,7 @@
 //! `currentColor` is honored by the Iced `svg::Style` closure so the rendered
 //! glyph picks up the surrounding text colour.
 
-use iced::widget::svg;
+use cosmic::iced::widget::svg;
 
 use crate::model::PinIcon;
 

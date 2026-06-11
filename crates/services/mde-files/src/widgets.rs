@@ -2,8 +2,10 @@
 //! cards, file rows, section headers, mime icons. Each function takes the data
 //! it needs and returns an `Element<'_, Message>`.
 
-use iced::widget::{button, column, container, row, svg, text, Space};
-use iced::{Background, Border, Color, Element, Length, Padding, Theme};
+use crate::cosmic_compat::{ButtonSty, ContainerSty, SvgSty, TextSty};
+use cosmic::iced::widget::{button, column, container, row, svg, text, Space};
+use cosmic::iced::{Background, Border, Color, Length, Padding};
+use cosmic::{Element, Theme};
 
 use crate::app::Message;
 use crate::icons;
@@ -12,6 +14,75 @@ use crate::model::{
     TxDir,
 };
 use crate::theme as t;
+
+/// GUI-7 — local cosmic renderer for an `mde_theme::ObjectCard` (replaces the
+/// dropped iced-0.14 `mde_iced_components::object_card` in the Cosmic cutover).
+/// Faithful to the small-card spec: a leading Material icon + title (+
+/// subtitle) on a state-tinted Carbon surface.
+pub fn object_card(
+    card: mde_theme::ObjectCard,
+    palette: mde_theme::Palette,
+) -> Element<'static, Message> {
+    use mde_theme::{CardState, IconSize, IconState};
+    let to_color = |c: mde_theme::Rgba| Color {
+        r: f32::from(c.r) / 255.0,
+        g: f32::from(c.g) / 255.0,
+        b: f32::from(c.b) / 255.0,
+        a: c.a,
+    };
+    let title_color = to_color(card.title_color_override.unwrap_or(palette.text));
+    let subtitle_color = to_color(card.subtitle_color_override.unwrap_or(palette.text_muted));
+    let icon_px = card.size.icon_size();
+    let icon_slot: Element<'static, Message> = if let Some(ic) = card.icon {
+        let state = match card.state {
+            CardState::Selected => IconState::Active,
+            _ => IconState::Idle,
+        };
+        let bytes = mde_theme::mde_icon(ic, IconSize::Nav).svg_bytes_for_state(state);
+        svg(svg::Handle::from_memory(bytes))
+            .width(Length::Fixed(icon_px))
+            .height(Length::Fixed(icon_px))
+            .sty(move |_t: &Theme| svg::Style {
+                color: Some(title_color),
+            })
+            .into()
+    } else {
+        Space::new()
+            .width(Length::Fixed(icon_px))
+            .height(Length::Fixed(icon_px))
+            .into()
+    };
+    let title_w = text(card.title).size(13).colr(title_color);
+    let text_col = if let Some(sub) = card.subtitle {
+        column![title_w, text(sub).size(11).colr(subtitle_color)].spacing(2)
+    } else {
+        column![title_w]
+    };
+    let (bg, border) = match card.state {
+        CardState::Selected => (t::ACTIVE_RUST_BG, t::ACTIVE_RUST_BORDER),
+        CardState::Focused => (t::ROW_HOVER, t::PF_BORDER),
+        CardState::Hover => (t::ROW_HOVER_FAINT, t::DIVIDER),
+        _ => (t::PF_BG_300, t::PF_BORDER),
+    };
+    container(
+        row![icon_slot, text_col]
+            .spacing(12)
+            .align_y(cosmic::iced::alignment::Vertical::Center),
+    )
+    .padding(Padding::from([8.0, 10.0]))
+    .width(Length::Fill)
+    .sty(move |_t: &Theme| container::Style {
+        snap: false,
+        background: Some(Background::Color(bg)),
+        border: Border {
+            color: border,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..container::Style::default()
+    })
+    .into()
+}
 
 // ─── Generic helpers ───────────────────────────────────────────────────────
 
@@ -22,7 +93,7 @@ pub fn status_dot(color: Color, size: f32) -> Element<'static, Message> {
             .width(Length::Fixed(size))
             .height(Length::Fixed(size)),
     )
-    .style(move |_theme: &Theme| container::Style {
+    .sty(move |_theme: &Theme| container::Style {
         snap: false,
         background: Some(Background::Color(color)),
         border: Border {
@@ -40,14 +111,14 @@ pub fn icon(svg_bytes: &'static [u8], size: f32, color: Color) -> Element<'stati
     svg(icons::handle(svg_bytes))
         .width(Length::Fixed(size))
         .height(Length::Fixed(size))
-        .style(move |_theme: &Theme, _status: svg::Status| svg::Style { color: Some(color) })
+        .sty(move |_theme: &Theme| svg::Style { color: Some(color) })
         .into()
 }
 
 /// 1-px horizontal divider line (`var(--divider)`).
 pub fn hdivider() -> Element<'static, Message> {
     container(Space::new().width(Length::Fill).height(Length::Fixed(1.0)))
-        .style(|_| container::Style {
+        .sty(|_| container::Style {
             snap: false,
             background: Some(Background::Color(t::DIVIDER)),
             ..container::Style::default()
@@ -71,13 +142,13 @@ pub fn surface<'a, M: 'a>(bg: Color, border: Color) -> impl Fn(&Theme) -> contai
 
 /// Caps section header (`.fm-section-h h3`) — 11 px, letter-spaced.
 pub fn section_h(label: &str, right: Option<&str>) -> Element<'static, Message> {
-    let mut r = row![text(label.to_uppercase()).size(11).color(t::FG_DIM),]
+    let mut r = row![text(label.to_uppercase()).size(11).colr(t::FG_DIM),]
         .spacing(8)
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
     if let Some(rt) = right {
         r = r.push(Space::new().width(Length::Fill));
-        r = r.push(text(rt.to_string()).size(10).color(t::FG_FAINT));
+        r = r.push(text(rt.to_string()).size(10).colr(t::FG_FAINT));
     } else {
         r = r.push(Space::new().width(Length::Fill));
     }
@@ -98,13 +169,13 @@ pub fn section_h(label: &str, right: Option<&str>) -> Element<'static, Message> 
 pub fn mesh_pill(peer_host: &str) -> Element<'static, Message> {
     container(
         row![
-            text("↘").size(10).color(t::RUST),
-            text(peer_host.to_string()).size(10).color(t::ACCENT_HI),
+            text("↘").size(10).colr(t::RUST),
+            text(peer_host.to_string()).size(10).colr(t::ACCENT_HI),
         ]
         .spacing(4),
     )
     .padding(Padding::from([1.0, 6.0]))
-    .style(|_| container::Style {
+    .sty(|_| container::Style {
         snap: false,
         background: Some(Background::Color(t::MESH_PILL_BG)),
         border: Border {
@@ -119,9 +190,9 @@ pub fn mesh_pill(peer_host: &str) -> Element<'static, Message> {
 
 /// Neutral local-origin pill — `local`.
 pub fn local_pill() -> Element<'static, Message> {
-    container(text("local").size(10).color(t::FG_FAINT))
+    container(text("local").size(10).colr(t::FG_FAINT))
         .padding(Padding::from([1.0, 6.0]))
-        .style(|_| container::Style {
+        .sty(|_| container::Style {
             snap: false,
             background: Some(Background::Color(t::LOCAL_PILL_BG)),
             border: Border {
@@ -141,9 +212,9 @@ pub fn breadcrumb_tag(text_label: &str, is_mesh: bool) -> Element<'static, Messa
     } else {
         (t::LOCAL_PILL_BG, t::FG_FAINT, t::LOCAL_PILL_BORDER)
     };
-    container(text(text_label.to_string()).size(10).color(fg))
+    container(text(text_label.to_string()).size(10).colr(fg))
         .padding(Padding::from([1.0, 6.0]))
-        .style(move |_| container::Style {
+        .sty(move |_| container::Style {
             snap: false,
             background: Some(Background::Color(bg)),
             border: Border {
@@ -186,18 +257,18 @@ pub fn banner(
     for st in stats {
         stats_row = stats_row.push(
             column![
-                text(st.n).size(20).color(t::ACCENT_HI),
-                text(st.k.to_uppercase()).size(9).color(t::FG_FAINT),
+                text(st.n).size(20).colr(t::ACCENT_HI),
+                text(st.k.to_uppercase()).size(9).colr(t::FG_FAINT),
             ]
             .spacing(4)
-            .align_x(iced::alignment::Horizontal::Right),
+            .align_x(cosmic::iced::alignment::Horizontal::Right),
         );
     }
 
     let layout = row![
         container(icon(icon_svg, 22.0, t::ACCENT_HI))
             .padding(Padding::new(9.0))
-            .style(|_| container::Style {
+            .sty(|_| container::Style {
                 snap: false,
                 background: Some(Background::Color(t::MESH_PILL_BG)),
                 border: Border {
@@ -208,19 +279,19 @@ pub fn banner(
                 ..container::Style::default()
             }),
         column![
-            text(title).size(15).color(t::FG),
-            text(subtitle).size(11).color(t::FG_DIM),
+            text(title).size(15).colr(t::FG),
+            text(subtitle).size(11).colr(t::FG_DIM),
         ]
         .spacing(2)
         .width(Length::Fill),
         stats_row,
     ]
     .spacing(16)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     container(layout)
         .padding(Padding::from([14.0, 18.0]))
-        .style(|_| container::Style {
+        .sty(|_| container::Style {
             snap: false,
             background: Some(Background::Color(t::PF_BG_200)),
             border: Border {
@@ -254,7 +325,7 @@ pub fn peer_card(peer: Peer) -> Element<'static, Message> {
     let head = row![
         container(icon(kind_icon, 20.0, avatar_color))
             .padding(Padding::new(8.0))
-            .style(|_| container::Style {
+            .sty(|_| container::Style {
                 snap: false,
                 background: Some(Background::Color(Color {
                     a: 0.04,
@@ -273,36 +344,36 @@ pub fn peer_card(peer: Peer) -> Element<'static, Message> {
         column![
             row![
                 status_dot(t::peer_status_dot(peer.status), 6.0),
-                text(peer.host.to_string()).size(13).color(t::FG),
+                text(peer.host.to_string()).size(13).colr(t::FG),
             ]
             .spacing(6)
-            .align_y(iced::alignment::Vertical::Center),
-            text(peer.label.to_string()).size(11).color(t::FG_FAINT),
+            .align_y(cosmic::iced::alignment::Vertical::Center),
+            text(peer.label.to_string()).size(11).colr(t::FG_FAINT),
         ]
         .spacing(2)
         .width(Length::Fill),
     ]
     .spacing(10)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     let num_row = row![
         row![
-            text(fmt_count(peer.files)).size(16).color(t::FG),
-            text("FILES").size(9).color(t::FG_FAINT),
+            text(fmt_count(peer.files)).size(16).colr(t::FG),
+            text("FILES").size(9).colr(t::FG_FAINT),
         ]
         .spacing(4)
-        .align_y(iced::alignment::Vertical::Center),
+        .align_y(cosmic::iced::alignment::Vertical::Center),
         row![
-            text(fmt_count(peer.shared)).size(16).color(t::FG),
-            text("SHARED").size(9).color(t::FG_FAINT),
+            text(fmt_count(peer.shared)).size(16).colr(t::FG),
+            text("SHARED").size(9).colr(t::FG_FAINT),
         ]
         .spacing(4)
-        .align_y(iced::alignment::Vertical::Center),
+        .align_y(cosmic::iced::alignment::Vertical::Center),
     ]
     .spacing(16);
 
     let meta_row = row![
-        text(peer.addr.to_string()).size(10).color(t::FG_FAINT),
+        text(peer.addr.to_string()).size(10).colr(t::FG_FAINT),
         Space::new().width(Length::Fill),
         match peer.latency {
             Some(ms) => {
@@ -311,21 +382,21 @@ pub fn peer_card(peer: Peer) -> Element<'static, Message> {
                     LatencyBucket::Ok => t::ACCENT,
                     LatencyBucket::Slow => t::FG_FAINT,
                 };
-                Element::from(text(format!("{ms} ms")).size(10).color(c))
+                Element::from(text(format!("{ms} ms")).size(10).colr(c))
             }
             None => Element::from(
                 text(format!("last seen {}", peer.last))
                     .size(10)
-                    .color(t::FG_FAINT)
+                    .colr(t::FG_FAINT)
             ),
         },
     ];
 
     let id = peer.id.clone();
     let actions = row![
-        button(text("Browse →").size(11).color(t::ACCENT_HI))
+        button(text("Browse →").size(11).colr(t::ACCENT_HI))
             .padding(Padding::from([4.0, 8.0]))
-            .style(|_, _| button::Style {
+            .sty(|_, _| button::Style {
                 snap: false,
                 background: Some(Background::Color(t::MESH_PILL_BG)),
                 text_color: t::ACCENT_HI,
@@ -337,19 +408,19 @@ pub fn peer_card(peer: Peer) -> Element<'static, Message> {
                 ..button::Style::default()
             })
             .on_press(Message::PeerCardBrowse(id.clone())),
-        button(text("Send file").size(11).color(t::FG_DIM))
+        button(text("Send file").size(11).colr(t::FG_DIM))
             .padding(Padding::from([4.0, 8.0]))
-            .style(|_, _| ghost_button_style())
+            .sty(|_, _| ghost_button_style())
             .on_press(Message::PeerCardSend(id)),
         button(icon(icons::MORE, 14.0, t::FG_DIM))
             .padding(Padding::from([4.0, 8.0]))
-            .style(|_, _| ghost_button_style())
+            .sty(|_, _| ghost_button_style())
             .on_press(Message::Noop),
     ]
     .spacing(4);
 
     let stripe =
-        container(Space::new().width(Length::Fill).height(Length::Fixed(2.0))).style(move |_| {
+        container(Space::new().width(Length::Fill).height(Length::Fixed(2.0))).sty(move |_| {
             container::Style {
                 snap: false,
                 background: Some(Background::Color(stripe_color)),
@@ -390,7 +461,7 @@ pub fn peer_card(peer: Peer) -> Element<'static, Message> {
     };
 
     container(body)
-        .style(move |_| container::Style {
+        .sty(move |_| container::Style {
             snap: false,
             background: Some(Background::Color(card_bg)),
             border: Border {
@@ -494,7 +565,7 @@ pub fn file_row(
     if !subtitle.is_empty() {
         card = card.with_subtitle(subtitle);
     }
-    let card_el = mde_iced_components::object_card(card, palette);
+    let card_el = object_card(card, palette);
 
     // MESHFS-11.1: conflict chip — rendered below the card when present.
     let conflict_chip: Option<Element<'static, Message>> = if has_conflict {
@@ -503,16 +574,16 @@ pub fn file_row(
             button(
                 container(
                     row![
-                        text("⚠").size(10).color(t::ACCENT_HI),
-                        text("conflict").size(10).color(t::ACCENT_HI),
+                        text("⚠").size(10).colr(t::ACCENT_HI),
+                        text("conflict").size(10).colr(t::ACCENT_HI),
                     ]
                     .spacing(3)
-                    .align_y(iced::alignment::Vertical::Center),
+                    .align_y(cosmic::iced::alignment::Vertical::Center),
                 )
                 .padding(Padding::from([1.0, 6.0])),
             )
             .padding(0)
-            .style(|_, status| {
+            .sty(|_, status| {
                 let bg = match status {
                     button::Status::Hovered => t::PRIMARY_AMBER_BG_HOVER,
                     _ => t::PRIMARY_AMBER_BG,
@@ -539,7 +610,7 @@ pub fn file_row(
     // MESHFS-11.1: sync badge — renders below the card while healing.
     let sync_badge: Option<Element<'static, Message>> = if syncing {
         Some(
-            container(text("⟳").size(10).color(t::FG_FAINT))
+            container(text("⟳").size(10).colr(t::FG_FAINT))
                 .padding(Padding::from([1.0, 4.0]))
                 .into(),
         )
@@ -565,20 +636,20 @@ pub fn file_row(
 pub fn file_row_head(src_label: &str) -> Element<'static, Message> {
     let layout = row![
         Space::new().width(Length::Fixed(22.0)),
-        container(text("Name".to_string()).size(10).color(t::FG_FAINT)).width(Length::Fill),
-        container(text(src_label.to_string()).size(10).color(t::FG_FAINT)).width(Length::Shrink),
-        container(text("Size".to_string()).size(10).color(t::FG_FAINT))
+        container(text("Name".to_string()).size(10).colr(t::FG_FAINT)).width(Length::Fill),
+        container(text(src_label.to_string()).size(10).colr(t::FG_FAINT)).width(Length::Shrink),
+        container(text("Size".to_string()).size(10).colr(t::FG_FAINT))
             .width(Length::Fixed(120.0))
-            .align_x(iced::alignment::Horizontal::Right),
-        container(text("Modified".to_string()).size(10).color(t::FG_FAINT))
+            .align_x(cosmic::iced::alignment::Horizontal::Right),
+        container(text("Modified".to_string()).size(10).colr(t::FG_FAINT))
             .width(Length::Fixed(100.0))
-            .align_x(iced::alignment::Horizontal::Right),
+            .align_x(cosmic::iced::alignment::Horizontal::Right),
     ]
     .spacing(12);
 
     container(layout)
         .padding(Padding::from([6.0, 8.0]))
-        .style(|_| container::Style {
+        .sty(|_| container::Style {
             snap: false,
             background: Some(Background::Color(Color {
                 a: 0.02,
@@ -631,41 +702,40 @@ pub fn list_row(
     let icon_bytes = resolved.svg_bytes_for_state(mde_theme::IconState::Idle);
     let icon_el = icon(icon_bytes, mde_theme::IconSize::Nav.px(), t::FG_DIM);
 
-    let roboto = iced::Font::with_name("Roboto");
+    let roboto = cosmic::iced::Font::with_name("Roboto");
 
     let mut inner = row![
         container(icon_el)
             .width(Length::Fixed(22.0))
-            .align_x(iced::alignment::Horizontal::Center),
-        container(text(name.clone()).size(13).font(roboto).color(t::FG)).width(Length::Fill),
+            .align_x(cosmic::iced::alignment::Horizontal::Center),
+        container(text(name.clone()).size(13).font(roboto).colr(t::FG)).width(Length::Fill),
     ]
     .spacing(12)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     if show_src {
         let origin_str = origin_host.as_deref().unwrap_or("local").to_owned();
         inner = inner.push(
-            container(text(origin_str).size(11).font(roboto).color(t::FG_DIM))
-                .width(Length::Shrink),
+            container(text(origin_str).size(11).font(roboto).colr(t::FG_DIM)).width(Length::Shrink),
         );
     }
 
     inner = inner
         .push(
-            container(text(size).size(11).font(roboto).color(t::FG_DIM))
+            container(text(size).size(11).font(roboto).colr(t::FG_DIM))
                 .width(Length::Fixed(120.0))
-                .align_x(iced::alignment::Horizontal::Right),
+                .align_x(cosmic::iced::alignment::Horizontal::Right),
         )
         .push(
-            container(text(age).size(11).font(roboto).color(t::FG_DIM))
+            container(text(age).size(11).font(roboto).colr(t::FG_DIM))
                 .width(Length::Fixed(100.0))
-                .align_x(iced::alignment::Horizontal::Right),
+                .align_x(cosmic::iced::alignment::Horizontal::Right),
         );
 
     let row_el: Element<'static, Message> = container(inner)
         .padding(Padding::from([0.0, 8.0]))
         .height(Length::Fixed(28.0))
-        .style(move |_| container::Style {
+        .sty(move |_| container::Style {
             snap: false,
             background: Some(Background::Color(bg)),
             ..container::Style::default()
@@ -674,7 +744,7 @@ pub fn list_row(
 
     let divider_el: Element<'static, Message> =
         container(Space::new().width(Length::Fill).height(Length::Fixed(1.0)))
-            .style(|_| container::Style {
+            .sty(|_| container::Style {
                 snap: false,
                 background: Some(Background::Color(t::LIST_ROW_DIVIDER)),
                 ..container::Style::default()
@@ -689,16 +759,16 @@ pub fn list_row(
             button(
                 container(
                     row![
-                        text("⚠").size(10).color(t::ACCENT_HI),
-                        text("conflict").size(10).color(t::ACCENT_HI),
+                        text("⚠").size(10).colr(t::ACCENT_HI),
+                        text("conflict").size(10).colr(t::ACCENT_HI),
                     ]
                     .spacing(3)
-                    .align_y(iced::alignment::Vertical::Center),
+                    .align_y(cosmic::iced::alignment::Vertical::Center),
                 )
                 .padding(Padding::from([1.0, 6.0])),
             )
             .padding(0)
-            .style(|_, status| {
+            .sty(|_, status| {
                 let bg_chip = match status {
                     button::Status::Hovered => t::PRIMARY_AMBER_BG_HOVER,
                     _ => t::PRIMARY_AMBER_BG,
@@ -724,7 +794,7 @@ pub fn list_row(
 
     let sync_badge: Option<Element<'static, Message>> = if syncing {
         Some(
-            container(text("⟳").size(10).color(t::FG_FAINT))
+            container(text("⟳").size(10).colr(t::FG_FAINT))
                 .padding(Padding::from([1.0, 4.0]))
                 .into(),
         )
@@ -766,9 +836,9 @@ pub fn tx_row(tx: Transfer) -> Element<'static, Message> {
     };
 
     let layout = row![
-        container(text(dir_label.to_string()).size(10).color(dir_fg))
+        container(text(dir_label.to_string()).size(10).colr(dir_fg))
             .padding(Padding::from([1.0, 6.0]))
-            .style(move |_| container::Style {
+            .sty(move |_| container::Style {
                 snap: false,
                 background: Some(Background::Color(dir_bg)),
                 border: Border {
@@ -778,14 +848,14 @@ pub fn tx_row(tx: Transfer) -> Element<'static, Message> {
                 },
                 ..container::Style::default()
             }),
-        container(text(tx.name.to_string()).size(12).color(t::FG)).width(Length::Fill),
-        text(tx.peer.to_string()).size(11).color(t::ACCENT),
+        container(text(tx.name.to_string()).size(12).colr(t::FG)).width(Length::Fill),
+        text(tx.peer.to_string()).size(11).colr(t::ACCENT),
         text(format!("{} · {}", tx.size, tx.age))
             .size(11)
-            .color(t::FG_FAINT),
+            .colr(t::FG_FAINT),
     ]
     .spacing(10)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     container(layout).padding(Padding::from([8.0, 10.0])).into()
 }
@@ -833,22 +903,22 @@ pub fn side_row(
         _ => fg,
     };
 
-    let mut name_row = row![text(label.to_string()).size(13).color(fg)].spacing(6);
+    let mut name_row = row![text(label.to_string()).size(13).colr(fg)].spacing(6);
     if let Some(s) = secondary {
-        name_row = name_row.push(text(s.to_string()).size(10).color(t::FG_FAINT));
+        name_row = name_row.push(text(s.to_string()).size(10).colr(t::FG_FAINT));
     }
 
     let mut grid = row![
         container(icon(icon_svg, 16.0, icon_color))
             .width(Length::Fixed(18.0))
-            .align_x(iced::alignment::Horizontal::Center),
+            .align_x(cosmic::iced::alignment::Horizontal::Center),
         container(name_row).width(Length::Fill),
     ]
     .spacing(t::SIDE_ROW_GAP)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     if let Some(m) = meta {
-        grid = grid.push(text(m).size(10).color(t::FG_FAINT));
+        grid = grid.push(text(m).size(10).colr(t::FG_FAINT));
     }
 
     let inner = container(grid)
@@ -859,7 +929,7 @@ pub fn side_row(
             // leave room for the 2-px active border
             left: t::SIDE_ROW_PAD_X - 2.0,
         })
-        .style(move |_| container::Style {
+        .sty(move |_| container::Style {
             snap: false,
             background: Some(Background::Color(bg)),
             border: Border {
@@ -872,7 +942,7 @@ pub fn side_row(
 
     button(inner)
         .padding(0)
-        .style(|_, _| button::Style {
+        .sty(|_, _| button::Style {
             snap: false,
             background: Some(Background::Color(Color::TRANSPARENT)),
             text_color: t::FG_DIM,
@@ -900,11 +970,11 @@ pub fn side_section_header(
     };
     container(
         row![
-            text(label.to_uppercase()).size(10).color(fg),
+            text(label.to_uppercase()).size(10).colr(fg),
             Space::new().width(Length::Fill),
-            text(meta.to_string()).size(10).color(t::FG_FAINT),
+            text(meta.to_string()).size(10).colr(t::FG_FAINT),
         ]
-        .align_y(iced::alignment::Vertical::Center),
+        .align_y(cosmic::iced::alignment::Vertical::Center),
     )
     .padding(Padding {
         top: 10.0,
@@ -925,15 +995,15 @@ pub fn disclosure_row(open: bool, msg: Message) -> Element<'static, Message> {
     let inner = container(
         row![
             icon(chevron, 14.0, t::FG_FAINT),
-            text("Browse filesystem…").size(12).color(t::FG_DIM),
+            text("Browse filesystem…").size(12).colr(t::FG_DIM),
             Space::new().width(Length::Fill),
-            text("/").size(10).color(t::FG_FAINT),
+            text("/").size(10).colr(t::FG_FAINT),
         ]
         .spacing(8)
-        .align_y(iced::alignment::Vertical::Center),
+        .align_y(cosmic::iced::alignment::Vertical::Center),
     )
     .padding(Padding::from([8.0, 12.0]))
-    .style(move |_| container::Style {
+    .sty(move |_| container::Style {
         snap: false,
         background: Some(Background::Color(if open {
             Color {
@@ -960,7 +1030,7 @@ pub fn disclosure_row(open: bool, msg: Message) -> Element<'static, Message> {
     container(
         button(inner)
             .padding(0)
-            .style(|_, _| ghost_button_style())
+            .sty(|_, _| ghost_button_style())
             .on_press(msg),
     )
     .padding(Padding {

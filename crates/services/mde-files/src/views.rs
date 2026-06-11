@@ -1,8 +1,12 @@
 //! The five primary views — Mesh Overview, Peer Folder, Inbox, Downloads, Local
 //! Veil — plus the persistent sidebar / toolbar / titlebar chrome around them.
 
-use iced::widget::{button, column, container, row, scrollable, text, text_input, tooltip, Space};
-use iced::{Background, Border, Color, Element, Length, Padding, Theme};
+use crate::cosmic_compat::{ButtonSty, ContainerSty, TextSty};
+use cosmic::iced::widget::{
+    button, column, container, row, scrollable, text, text_input, tooltip, Space,
+};
+use cosmic::iced::{Background, Border, Color, Length, Padding};
+use cosmic::{Element, Theme};
 
 use crate::a11y_labels::{self, A11yAction};
 use crate::app::{Crumb, Message, TrashItem};
@@ -35,23 +39,23 @@ fn titlebar_inner(online: usize, total: usize) -> Element<'static, Message> {
     let mesh_text = format!("mesh up · {online}/{total} peers");
 
     let title = row![
-        text("Artifact Manager").size(12).color(t::FG),
+        text("Artifact Manager").size(12).colr(t::FG),
         Space::new().width(Length::Fixed(6.0)),
-        text(mesh_text).size(11).color(t::FG_FAINT),
+        text(mesh_text).size(11).colr(t::FG_FAINT),
     ]
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     let app_icon = container(icon(icons::MESH_HUB, 14.0, t::ACCENT))
         .width(Length::Fixed(32.0))
         .height(Length::Fixed(t::TITLEBAR_H))
-        .align_x(iced::alignment::Horizontal::Center)
-        .align_y(iced::alignment::Vertical::Center);
+        .align_x(cosmic::iced::alignment::Horizontal::Center)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
     let title_cell = container(title)
         .width(Length::Fill)
         .height(Length::Fixed(t::TITLEBAR_H))
         .padding(Padding::from([0.0, 6.0]))
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
     let make_btn = |svg_bytes: &'static [u8], msg: Message, is_close: bool| {
         let style_fn = move |_theme: &Theme, status: button::Status| {
@@ -89,13 +93,13 @@ fn titlebar_inner(online: usize, total: usize) -> Element<'static, Message> {
             container(icon(svg_bytes, 12.0, t::FG_DIM))
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .align_x(iced::alignment::Horizontal::Center)
-                .align_y(iced::alignment::Vertical::Center),
+                .align_x(cosmic::iced::alignment::Horizontal::Center)
+                .align_y(cosmic::iced::alignment::Vertical::Center),
         )
         .padding(0)
         .width(Length::Fixed(46.0))
         .height(Length::Fixed(t::TITLEBAR_H))
-        .style(style_fn)
+        .sty(style_fn)
         .on_press(msg)
     };
 
@@ -105,20 +109,22 @@ fn titlebar_inner(online: usize, total: usize) -> Element<'static, Message> {
         make_btn(icons::CLOSE, Message::TitlebarClose, true),
     ];
 
-    container(row![app_icon, title_cell, controls].align_y(iced::alignment::Vertical::Center))
-        .width(Length::Fill)
-        .height(Length::Fixed(t::TITLEBAR_H))
-        .style(|_| container::Style {
-            snap: false,
-            background: Some(Background::Color(t::WINDOW_TITLEBAR)),
-            border: Border {
-                color: t::DIVIDER,
-                width: 0.0,
-                radius: 0.0.into(),
-            },
-            ..container::Style::default()
-        })
-        .into()
+    container(
+        row![app_icon, title_cell, controls].align_y(cosmic::iced::alignment::Vertical::Center),
+    )
+    .width(Length::Fill)
+    .height(Length::Fixed(t::TITLEBAR_H))
+    .sty(|_| container::Style {
+        snap: false,
+        background: Some(Background::Color(t::WINDOW_TITLEBAR)),
+        border: Border {
+            color: t::DIVIDER,
+            width: 0.0,
+            radius: 0.0.into(),
+        },
+        ..container::Style::default()
+    })
+    .into()
 }
 
 // ─── Sidebar ───────────────────────────────────────────────────────────────
@@ -140,7 +146,7 @@ pub fn sidebar<'a>(
     let top_btn = |svg_bytes: &'static [u8], msg: Message| {
         button(icon(svg_bytes, 16.0, t::FG_DIM))
             .padding(Padding::from([4.0, 6.0]))
-            .style(|_, _| ghost_button_style())
+            .sty(|_, _| ghost_button_style())
             .on_press(msg)
     };
     let top = container(
@@ -151,10 +157,10 @@ pub fn sidebar<'a>(
             top_btn(icons::REFRESH, Message::Refresh),
         ]
         .spacing(4)
-        .align_y(iced::alignment::Vertical::Center),
+        .align_y(cosmic::iced::alignment::Vertical::Center),
     )
     .padding(Padding::new(6.0))
-    .style(|_| container::Style {
+    .sty(|_| container::Style {
         snap: false,
         background: Some(Background::Color(t::WINDOW_SIDE)),
         border: Border {
@@ -345,7 +351,7 @@ pub fn sidebar<'a>(
             bottom: 4.0,
             left: 0.0,
         })
-        .style(|_| container::Style {
+        .sty(|_| container::Style {
             snap: false,
             background: Some(Background::Color(Color {
                 a: 0.18,
@@ -373,17 +379,17 @@ pub fn sidebar<'a>(
     };
     let foot = container(
         row![
-            text(foot_text).size(11).color(t::FG_FAINT),
+            text(foot_text).size(11).colr(t::FG_FAINT),
             Space::new().width(Length::Fill),
             button(
                 row![
                     icon(icons::PLUS, 12.0, t::ACCENT_HI),
-                    text("Peer").size(11).color(t::ACCENT_HI),
+                    text("Peer").size(11).colr(t::ACCENT_HI),
                 ]
                 .spacing(6),
             )
             .padding(Padding::from([4.0, 8.0]))
-            .style(|_, _| button::Style {
+            .sty(|_, _| button::Style {
                 snap: false,
                 background: Some(Background::Color(Color {
                     a: 0.10,
@@ -402,10 +408,10 @@ pub fn sidebar<'a>(
             })
             .on_press(Message::Noop),
         ]
-        .align_y(iced::alignment::Vertical::Center),
+        .align_y(cosmic::iced::alignment::Vertical::Center),
     )
     .padding(Padding::from([10.0, 14.0]))
-    .style(|_| container::Style {
+    .sty(|_| container::Style {
         snap: false,
         background: Some(Background::Color(t::WINDOW_SIDE)),
         border: Border {
@@ -423,7 +429,7 @@ pub fn sidebar<'a>(
     container(col)
         .width(Length::Fixed(t::SIDEBAR_W))
         .height(Length::Fill)
-        .style(|_| container::Style {
+        .sty(|_| container::Style {
             snap: false,
             background: Some(Background::Color(t::WINDOW_SIDE)),
             border: Border {
@@ -443,22 +449,22 @@ pub fn sidebar<'a>(
 pub fn tab_strip(tabs: &[Tab], active: usize) -> Element<'static, Message> {
     let mut strip = row![]
         .spacing(2.0)
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
     let show_close = tabs.len() > 1;
     for (i, tab) in tabs.iter().enumerate() {
         let is_active = i == active;
         let mut chip =
             row![text(tab.title())
                 .size(12)
-                .color(if is_active { t::FG } else { t::FG_DIM })]
+                .colr(if is_active { t::FG } else { t::FG_DIM })]
             .spacing(6.0)
-            .align_y(iced::alignment::Vertical::Center);
+            .align_y(cosmic::iced::alignment::Vertical::Center);
         if show_close {
             chip = chip.push(
                 button(icon(icons::CLOSE, 11.0, t::FG_FAINT))
                     .on_press(Message::CloseTab(i))
                     .padding(2.0)
-                    .style(|_t: &Theme, status: button::Status| button::Style {
+                    .sty(|_t: &Theme, status: button::Status| button::Style {
                         snap: false,
                         background: matches!(status, button::Status::Hovered).then_some(
                             Background::Color(Color {
@@ -480,7 +486,7 @@ pub fn tab_strip(tabs: &[Tab], active: usize) -> Element<'static, Message> {
             button(chip)
                 .on_press(Message::SwitchTab(i))
                 .padding(Padding::from([5.0, 10.0]))
-                .style(move |_t: &Theme, status: button::Status| {
+                .sty(move |_t: &Theme, status: button::Status| {
                     let hot = matches!(status, button::Status::Hovered);
                     button::Style {
                         snap: false,
@@ -506,7 +512,7 @@ pub fn tab_strip(tabs: &[Tab], active: usize) -> Element<'static, Message> {
         button(icon(icons::PLUS, 13.0, t::FG_DIM))
             .on_press(Message::NewTab)
             .padding(Padding::from([5.0, 8.0]))
-            .style(|_t: &Theme, status: button::Status| button::Style {
+            .sty(|_t: &Theme, status: button::Status| button::Style {
                 snap: false,
                 background: matches!(status, button::Status::Hovered)
                     .then_some(Background::Color(t::ROW_HOVER)),
@@ -522,7 +528,7 @@ pub fn tab_strip(tabs: &[Tab], active: usize) -> Element<'static, Message> {
     container(strip)
         .width(Length::Fill)
         .padding(Padding::from([3.0, 8.0]))
-        .style(|_| container::Style {
+        .sty(|_| container::Style {
             snap: false,
             background: Some(Background::Color(t::WINDOW_TITLEBAR)),
             border: Border {
@@ -546,10 +552,12 @@ pub fn toolbar<'a>(
     search: &'a str,
     crumbs: Vec<Crumb>,
 ) -> Element<'a, Message> {
-    let mut crumb_row = row![].spacing(6).align_y(iced::alignment::Vertical::Center);
+    let mut crumb_row = row![]
+        .spacing(6)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
     for (i, c) in crumbs.iter().enumerate() {
         if i > 0 {
-            crumb_row = crumb_row.push(text("/").size(12).color(t::FG_FAINT));
+            crumb_row = crumb_row.push(text("/").size(12).colr(t::FG_FAINT));
         }
         let is_last = i == crumbs.len() - 1;
         let fg = if c.mesh {
@@ -559,7 +567,7 @@ pub fn toolbar<'a>(
         } else {
             t::FG_DIM
         };
-        crumb_row = crumb_row.push(text(c.label.clone()).size(12).color(fg));
+        crumb_row = crumb_row.push(text(c.label.clone()).size(12).colr(fg));
     }
     let is_mesh = crumbs.iter().any(|c| c.mesh);
     crumb_row = crumb_row.push(breadcrumb_tag(
@@ -582,11 +590,11 @@ pub fn toolbar<'a>(
                 .width(Length::Fill),
         ]
         .spacing(6)
-        .align_y(iced::alignment::Vertical::Center),
+        .align_y(cosmic::iced::alignment::Vertical::Center),
     )
     .padding(Padding::from([4.0, 8.0]))
     .width(Length::Fixed(220.0))
-    .style(|_| container::Style {
+    .sty(|_| container::Style {
         snap: false,
         background: Some(Background::Color(Color {
             a: 0.05,
@@ -630,7 +638,7 @@ pub fn toolbar<'a>(
         ]
         .spacing(0),
     )
-    .style(|_| container::Style {
+    .sty(|_| container::Style {
         snap: false,
         background: Some(Background::Color(Color::TRANSPARENT)),
         border: Border {
@@ -652,11 +660,11 @@ pub fn toolbar<'a>(
             primary,
         ]
         .spacing(10)
-        .align_y(iced::alignment::Vertical::Center),
+        .align_y(cosmic::iced::alignment::Vertical::Center),
     )
     .padding(Padding::from([8.0, 16.0]))
     .width(Length::Fill)
-    .style(|_| container::Style {
+    .sty(|_| container::Style {
         snap: false,
         background: Some(Background::Color(t::PF_BG_200)),
         border: Border {
@@ -687,11 +695,11 @@ fn view_toggle_btn(
         container(icon(svg_bytes, 14.0, fg))
             .width(Length::Fixed(28.0))
             .height(Length::Fixed(24.0))
-            .align_x(iced::alignment::Horizontal::Center)
-            .align_y(iced::alignment::Vertical::Center),
+            .align_x(cosmic::iced::alignment::Horizontal::Center)
+            .align_y(cosmic::iced::alignment::Vertical::Center),
     )
     .padding(0)
-    .style(move |_, _| button::Style {
+    .sty(move |_, _| button::Style {
         snap: false,
         background: Some(Background::Color(bg)),
         text_color: fg,
@@ -725,14 +733,14 @@ fn primary_action(view: &View) -> Element<'static, Message> {
                 Color::WHITE
             },
         ),
-        text(label.to_string()).size(12).color(if ghost {
+        text(label.to_string()).size(12).colr(if ghost {
             t::BUTTON_ACCENT
         } else {
             Color::WHITE
         }),
     ]
     .spacing(6)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     let btn = button(inner)
         .padding(Padding {
@@ -745,7 +753,7 @@ fn primary_action(view: &View) -> Element<'static, Message> {
         .on_press(Message::PrimaryAction);
 
     if ghost {
-        btn.style(|_, _| button::Style {
+        btn.sty(|_, _| button::Style {
             snap: false,
             background: Some(Background::Color(Color::TRANSPARENT)),
             text_color: t::BUTTON_ACCENT,
@@ -758,7 +766,7 @@ fn primary_action(view: &View) -> Element<'static, Message> {
         })
         .into()
     } else {
-        btn.style(|_, status| {
+        btn.sty(|_, status| {
             let bg = if matches!(status, button::Status::Hovered) {
                 t::BUTTON_ACCENT_HI
             } else {
@@ -811,7 +819,7 @@ pub fn mesh_overview<'a>(snap: &'a BackendSnapshot) -> Element<'a, Message> {
 
     let card_children: Vec<Element<'_, Message>> =
         snap.peers.iter().cloned().map(peer_card).collect();
-    let cards = iced::widget::Row::with_children(card_children)
+    let cards = cosmic::iced::widget::Row::with_children(card_children)
         .spacing(10)
         .wrap();
 
@@ -1016,19 +1024,19 @@ pub fn local_browser<'a>(
 ) -> Element<'a, Message> {
     let up = button(icon(icons::ARROW_LEFT, 16.0, t::FG))
         .on_press(Message::LocalUp)
-        .style(|_, _| ghost_button_style());
+        .sty(|_, _| ghost_button_style());
     let header = row![
         up,
         icon(icons::HDD, 18.0, t::FG),
-        text(path.to_string()).size(13).color(t::FG),
+        text(path.to_string()).size(13).colr(t::FG),
     ]
     .spacing(8)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     let mut list = column![file_row_head("Name")];
     if files.is_empty() {
         list = list.push(
-            container(text("Empty folder").size(12).color(t::FG_DIM))
+            container(text("Empty folder").size(12).colr(t::FG_DIM))
                 .padding(Padding::from([8.0, 4.0])),
         );
     } else {
@@ -1053,10 +1061,10 @@ pub fn cloud_devices<'a>(
 ) -> Element<'a, Message> {
     let header = row![
         icon(icons::HDD, 18.0, t::FG),
-        text("Cloud Files · paired devices").size(13).color(t::FG),
+        text("Cloud Files · paired devices").size(13).colr(t::FG),
     ]
     .spacing(8)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     let mut list = column![file_row_head("Device")];
     if files.is_empty() {
@@ -1064,7 +1072,7 @@ pub fn cloud_devices<'a>(
             container(
                 text("No paired devices — pair one from Settings ▸ Mobile Devices.")
                     .size(12)
-                    .color(t::FG_DIM),
+                    .colr(t::FG_DIM),
             )
             .padding(Padding::from([8.0, 4.0])),
         );
@@ -1091,27 +1099,27 @@ pub fn network<'a>(
 ) -> Element<'a, Message> {
     let header = row![
         icon(icons::MESH_HUB, 18.0, t::FG),
-        text("Network · SMB shares").size(13).color(t::FG),
+        text("Network · SMB shares").size(13).colr(t::FG),
     ]
     .spacing(8)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     let host_box = text_input("SMB host (e.g. nas.local or 10.0.0.4)", host)
         .on_input(Message::NetHostChanged)
         .on_submit(Message::NetBrowse)
         .size(13)
         .padding(Padding::from([6.0, 8.0]));
-    let browse = button(text("Browse").size(13).color(t::FG))
+    let browse = button(text("Browse").size(13).colr(t::FG))
         .on_press(Message::NetBrowse)
         .padding(Padding::from([6.0, 12.0]))
-        .style(|_, _| ghost_button_style());
+        .sty(|_, _| ghost_button_style());
     let input_row = row![host_box, browse]
         .spacing(8)
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
     let mut list = column![];
     if let Some(s) = status {
-        list = list.push(text(s.to_string()).size(12).color(t::FG_DIM));
+        list = list.push(text(s.to_string()).size(12).colr(t::FG_DIM));
     }
     if !shares.is_empty() {
         list = list.push(file_row_head("Share"));
@@ -1119,15 +1127,15 @@ pub fn network<'a>(
             let r = button(
                 row![
                     icon(icons::HDD, 16.0, t::FG_DIM),
-                    text(sh.to_string()).size(13).color(t::FG),
+                    text(sh.to_string()).size(13).colr(t::FG),
                 ]
                 .spacing(8)
-                .align_y(iced::alignment::Vertical::Center),
+                .align_y(cosmic::iced::alignment::Vertical::Center),
             )
             .on_press(Message::NetMount(sh.clone()))
             .padding(Padding::from([6.0, 8.0]))
             .width(Length::Fill)
-            .style(|_, _| ghost_button_style());
+            .sty(|_, _| ghost_button_style());
             list = list.push(r);
         }
     }
@@ -1173,7 +1181,9 @@ pub fn mesh_home<'a>(snap: &'a BackendSnapshot) -> Element<'a, Message> {
         .iter()
         .map(|(slug, label, pin_icon)| mesh_home_card(slug, label, *pin_icon))
         .collect();
-    let card_grid = iced::widget::Row::with_children(cards).spacing(10).wrap();
+    let card_grid = cosmic::iced::widget::Row::with_children(cards)
+        .spacing(10)
+        .wrap();
 
     column![
         banner_widget,
@@ -1275,17 +1285,17 @@ fn parent_link_row() -> Element<'static, Message> {
             row![
                 icon(icons::ARROW_LEFT, 14.0, t::FG_DIM),
                 Space::new().width(Length::Fixed(8.0)),
-                text("..").size(12).color(t::FG_DIM),
+                text("..").size(12).colr(t::FG_DIM),
                 Space::new().width(Length::Fill),
-                text("parent folder").size(10).color(t::FG_FAINT),
+                text("parent folder").size(10).colr(t::FG_FAINT),
             ]
-            .align_y(iced::alignment::Vertical::Center),
+            .align_y(cosmic::iced::alignment::Vertical::Center),
         )
         .padding(Padding::from([6.0, 12.0]))
         .width(Length::Fill),
     )
     .padding(0)
-    .style(|_, _| ghost_button_style())
+    .sty(|_, _| ghost_button_style())
     .on_press(Message::MeshFolderUp)
     .into()
 }
@@ -1319,9 +1329,9 @@ fn folder_row_button(f: FileRow) -> Element<'static, Message> {
     if !subtitle.is_empty() {
         card = card.with_subtitle(subtitle);
     }
-    button(mde_iced_components::object_card(card, palette))
+    button(crate::widgets::object_card(card, palette))
         .padding(0)
-        .style(|_, _| ghost_button_style())
+        .sty(|_, _| ghost_button_style())
         .on_press(Message::MeshFolderEnter(name_payload))
         .into()
 }
@@ -1348,19 +1358,19 @@ fn mesh_home_card(
             row![
                 icon(icons::svg_for_pin(pin_icon), 20.0, t::ACCENT),
                 Space::new().width(Length::Fill),
-                text("shared").size(9).color(t::ACCENT),
+                text("shared").size(9).colr(t::ACCENT),
             ]
-            .align_y(iced::alignment::Vertical::Center),
+            .align_y(cosmic::iced::alignment::Vertical::Center),
             Space::new().height(Length::Fixed(12.0)),
-            text(label).size(14).color(t::FG),
-            text(format!("~/{label}")).size(10).color(t::FG_FAINT),
+            text(label).size(14).colr(t::FG),
+            text(format!("~/{label}")).size(10).colr(t::FG_FAINT),
         ]
         .spacing(2),
     )
     .padding(Padding::from([14.0, 16.0]))
     .width(Length::Fixed(180.0))
     .height(Length::Fixed(110.0))
-    .style(|_| container::Style {
+    .sty(|_| container::Style {
         snap: false,
         background: Some(Background::Color(Color {
             a: 0.04,
@@ -1382,7 +1392,7 @@ fn mesh_home_card(
         .on_press(Message::SelectView(crate::model::View::MeshHomeChild(
             slug.into(),
         )))
-        .style(|_, _| button::Style {
+        .sty(|_, _| button::Style {
             snap: false,
             background: Some(Background::Color(Color::TRANSPARENT)),
             text_color: t::FG,
@@ -1401,7 +1411,7 @@ fn mesh_home_card(
 /// Modal overlay for resolving a `.conflict-*` file pair. Renders as a
 /// semi-transparent full-screen backdrop (click to dismiss) with a
 /// centered card showing the two resolution options. Compose via
-/// `iced::widget::Stack::with_children(vec![base_view, resolve_conflict_dialog(...)])`.
+/// `cosmic::iced::widget::Stack::with_children(vec![base_view, resolve_conflict_dialog(...)])`.
 pub fn resolve_conflict_dialog<'a>(original: &'a str, sibling: &'a str) -> Element<'a, Message> {
     let orig = original.to_owned();
     let sib = sibling.to_owned();
@@ -1410,7 +1420,7 @@ pub fn resolve_conflict_dialog<'a>(original: &'a str, sibling: &'a str) -> Eleme
         .padding(0)
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(|_, _| button::Style {
+        .sty(|_, _| button::Style {
             snap: false,
             background: Some(Background::Color(Color {
                 r: 0.0,
@@ -1430,22 +1440,22 @@ pub fn resolve_conflict_dialog<'a>(original: &'a str, sibling: &'a str) -> Eleme
 
     let dialog_card = container(
         column![
-            text("Merge conflict").size(14).color(t::FG),
+            text("Merge conflict").size(14).colr(t::FG),
             Space::new().height(Length::Fixed(4.0)),
-            text(format!("File: {original}")).size(12).color(t::FG_DIM),
+            text(format!("File: {original}")).size(12).colr(t::FG_DIM),
             Space::new().height(Length::Fixed(16.0)),
             button(
                 column![
-                    text("Keep original").size(12).color(t::FG),
+                    text("Keep original").size(12).colr(t::FG),
                     text(format!("Archive: {sibling}"))
                         .size(10)
-                        .color(t::FG_FAINT),
+                        .colr(t::FG_FAINT),
                 ]
                 .spacing(2),
             )
             .padding(Padding::from([10.0, 14.0]))
             .width(Length::Fill)
-            .style(|_, status| {
+            .sty(|_, status| {
                 let bg = match status {
                     button::Status::Hovered => t::PRIMARY_AMBER_BG_HOVER,
                     _ => t::PRIMARY_AMBER_BG,
@@ -1466,16 +1476,16 @@ pub fn resolve_conflict_dialog<'a>(original: &'a str, sibling: &'a str) -> Eleme
             Space::new().height(Length::Fixed(8.0)),
             button(
                 column![
-                    text("Keep conflict copy").size(12).color(t::FG),
+                    text("Keep conflict copy").size(12).colr(t::FG),
                     text(format!("Archive: {original}"))
                         .size(10)
-                        .color(t::FG_FAINT),
+                        .colr(t::FG_FAINT),
                 ]
                 .spacing(2),
             )
             .padding(Padding::from([10.0, 14.0]))
             .width(Length::Fill)
-            .style(|_, status| {
+            .sty(|_, status| {
                 let bg = match status {
                     button::Status::Hovered => Color {
                         a: 0.08,
@@ -1500,9 +1510,9 @@ pub fn resolve_conflict_dialog<'a>(original: &'a str, sibling: &'a str) -> Eleme
             })
             .on_press(Message::ArchiveConflictFile(orig)),
             Space::new().height(Length::Fixed(12.0)),
-            button(text("Dismiss").size(11).color(t::FG_FAINT))
+            button(text("Dismiss").size(11).colr(t::FG_FAINT))
                 .padding(Padding::from([4.0, 10.0]))
-                .style(|_, _| button::Style {
+                .sty(|_, _| button::Style {
                     snap: false,
                     background: Some(Background::Color(Color::TRANSPARENT)),
                     text_color: t::FG_FAINT,
@@ -1519,7 +1529,7 @@ pub fn resolve_conflict_dialog<'a>(original: &'a str, sibling: &'a str) -> Eleme
     )
     .width(Length::Fixed(420.0))
     .padding(Padding::from([24.0, 28.0]))
-    .style(|_| container::Style {
+    .sty(|_| container::Style {
         snap: false,
         background: Some(Background::Color(t::PF_BG_200)),
         border: Border {
@@ -1533,13 +1543,16 @@ pub fn resolve_conflict_dialog<'a>(original: &'a str, sibling: &'a str) -> Eleme
     let centered_dialog = container(dialog_card)
         .width(Length::Fill)
         .height(Length::Fill)
-        .align_x(iced::alignment::Horizontal::Center)
-        .align_y(iced::alignment::Vertical::Center);
+        .align_x(cosmic::iced::alignment::Horizontal::Center)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
-    iced::widget::Stack::with_children(vec![dismiss_backdrop.into(), centered_dialog.into()])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+    cosmic::iced::widget::Stack::with_children(vec![
+        dismiss_backdrop.into(),
+        centered_dialog.into(),
+    ])
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
 }
 
 // ── MESHFS-8.1: Recycle Bin view ────────────────────────────────────────────
@@ -1553,18 +1566,18 @@ pub fn mesh_undelete<'a>(
     error: Option<&'a str>,
 ) -> Element<'a, Message> {
     let header = row![
-        text("Recycle Bin").size(13).color(t::FG),
+        text("Recycle Bin").size(13).colr(t::FG),
         Space::new().width(Length::Fill),
         text(if busy { "Loading…" } else { "" })
             .size(11)
-            .color(t::FG_FAINT),
+            .colr(t::FG_FAINT),
     ]
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     let body: Element<'a, Message> = if let Some(err) = error {
         text(format!("Error: {err}"))
             .size(12)
-            .color(Color {
+            .colr(Color {
                 r: 1.0,
                 g: 0.35,
                 b: 0.35,
@@ -1574,7 +1587,7 @@ pub fn mesh_undelete<'a>(
     } else if items.is_empty() && !busy {
         text("Recycle Bin is empty — no files recoverable.")
             .size(12)
-            .color(t::FG_FAINT)
+            .colr(t::FG_FAINT)
             .into()
     } else {
         let rows: Vec<Element<'a, Message>> = items.iter().map(|item| trash_row(item)).collect();
@@ -1588,11 +1601,11 @@ pub fn mesh_undelete<'a>(
 
 fn trash_row(item: &TrashItem) -> Element<'_, Message> {
     let path = item.trash_path.clone();
-    let restore_btn = button(text("Restore").size(11).color(t::FG))
+    let restore_btn = button(text("Restore").size(11).colr(t::FG))
         .padding(Padding::from([4.0, 10.0]))
-        .style(|_, status: iced::widget::button::Status| {
+        .sty(|_, status: cosmic::iced::widget::button::Status| {
             let bg = match status {
-                iced::widget::button::Status::Hovered => Color {
+                cosmic::iced::widget::button::Status::Hovered => Color {
                     a: 0.12,
                     ..Color::WHITE
                 },
@@ -1601,7 +1614,7 @@ fn trash_row(item: &TrashItem) -> Element<'_, Message> {
                     ..Color::WHITE
                 },
             };
-            iced::widget::button::Style {
+            cosmic::iced::widget::button::Style {
                 snap: false,
                 background: Some(Background::Color(bg)),
                 text_color: t::FG,
@@ -1610,7 +1623,8 @@ fn trash_row(item: &TrashItem) -> Element<'_, Message> {
                     width: 0.0,
                     radius: 4.0.into(),
                 },
-                shadow: iced::Shadow::default(),
+                shadow: cosmic::iced::Shadow::default(),
+                ..cosmic::iced::widget::button::Style::default()
             }
         })
         .on_press(Message::RestoreTrashItem(path));
@@ -1619,12 +1633,12 @@ fn trash_row(item: &TrashItem) -> Element<'_, Message> {
         icon(icons::TRASH2, 14.0, t::FG_FAINT),
         text(item.name.clone())
             .size(12)
-            .color(t::FG)
+            .colr(t::FG)
             .width(Length::Fill),
         restore_btn,
     ]
     .spacing(8)
-    .align_y(iced::alignment::Vertical::Center)
+    .align_y(cosmic::iced::alignment::Vertical::Center)
     .padding(Padding::from([4.0, 0.0]))
     .into()
 }

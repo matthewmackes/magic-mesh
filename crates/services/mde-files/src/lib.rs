@@ -24,6 +24,8 @@ pub mod backend;
 pub mod bookmarks;
 #[cfg(feature = "dbus")]
 pub mod bus_backend;
+/// GUI-7 — libcosmic `.sty()` styling shims (see module docs).
+pub mod cosmic_compat;
 pub mod demo_data;
 pub mod desktop;
 pub mod fileops;

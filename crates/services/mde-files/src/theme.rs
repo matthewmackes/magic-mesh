@@ -7,7 +7,7 @@
 //! the shell has no GTK layer to stay in sync with, and tokens.css carried the
 //! non-Carbon Material values.)
 
-use iced::Color;
+use cosmic::iced::Color;
 
 const fn rgb_hex(r: u8, g: u8, b: u8) -> Color {
     Color {
@@ -183,10 +183,10 @@ pub fn peer_status_dot(status: PeerStatus) -> Color {
 /// with any more. The accent is fixed Carbon Blue (the per-user accent picker
 /// only retints icons, not the UI accent).
 #[must_use]
-pub fn theme() -> iced::Theme {
-    iced::Theme::custom(
-        "MDE",
-        iced::theme::Palette {
+pub fn theme() -> cosmic::iced::Theme {
+    cosmic::iced::Theme::custom(
+        "MDE".to_string(),
+        cosmic::iced::theme::Palette {
             background: WINDOW,
             text: FG,
             primary: ACCENT,

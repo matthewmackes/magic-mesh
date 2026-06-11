@@ -1,7 +1,16 @@
-//! Iced application — top-level State, Message, update, view.
+//! libcosmic application — top-level State, Message, update, view (GUI-7).
+//!
+//! Ported off iced 0.14 onto `cosmic::Application` (the maximize-Cosmic-native
+//! cutover). The view/widget layer renders against `cosmic::iced` (libcosmic's
+//! vendored iced fork), so the Carbon style closures port unchanged; the shell
+//! is a `cosmic::Application` with a `Core`. The custom titlebar is kept
+//! (Cosmic's headerbar is disabled in `init`).
 
-use iced::widget::{column, container, row, scrollable};
-use iced::{Background, Border, Color, Element, Length, Padding, Size, Task, Theme};
+use crate::cosmic_compat::{ContainerSty, TextSty};
+use cosmic::app::ApplicationExt;
+use cosmic::iced::widget::{column, container, row, scrollable};
+use cosmic::iced::{Background, Border, Color, Length, Padding, Task};
+use cosmic::{Application, Element};
 
 use crate::backend::{Backend, BackendSnapshot, RealBackend};
 use crate::model::{Layout, View};
@@ -173,6 +182,11 @@ pub struct Crumb {
 }
 
 pub struct MdeFiles {
+    /// GUI-7 — the libcosmic application core (window state, theme, nav). Set
+    /// from the `Core` libcosmic hands `Application::init`; a throwaway
+    /// `Core::default()` fills it on the `Default`/test path (the GUI never
+    /// runs there).
+    pub core: cosmic::app::Core,
     /// v4.0.1 AF-* (2026-05-23) — backend that supplies the
     /// rendered roster + file lists. Defaults to `RealBackend`
     /// in production builds (LocalFsBackend + DBusBackend
@@ -298,6 +312,7 @@ impl Default for MdeFiles {
         let backend: Box<dyn Backend> = Box::new(RealBackend::new());
         let snapshot = BackendSnapshot::capture(&*backend);
         Self {
+            core: cosmic::app::Core::default(),
             backend,
             snapshot,
             peer_files: Vec::new(),
@@ -348,53 +363,33 @@ impl MdeFiles {
         }
     }
 
-    /// Run the Iced application.
+    /// Run the libcosmic application (GUI-7).
     ///
-    /// Builds a fresh `MdeFiles` state, registers the warm-dark theme, opens a
-    /// 1480×940 window, and dispatches updates from `Message`.
-    pub fn run() -> iced::Result {
-        // E10 — `mde-files [PATH]` opens the Local browser at PATH (a directory),
-        // so a "open folder" / inode-directory handler that execs this binary
-        // lands there.
+    /// Builds the cosmic [`Settings`](cosmic::app::Settings) (1480×940 window,
+    /// Carbon dark) + passes the optional initial directory as the flag, then
+    /// hands off to `cosmic::app::run`.
+    ///
+    /// E10 — `mde-files [PATH]` opens the Local browser at PATH (a directory),
+    /// so a "open folder" / inode-directory handler that execs this binary
+    /// lands there.
+    pub fn run() -> cosmic::iced::Result {
         let initial_dir = std::env::args()
             .nth(1)
             .filter(|p| std::path::Path::new(p).is_dir());
-        iced::application(
-            move || {
-                let mut s = Self::new();
-                if let Some(dir) = &initial_dir {
-                    s.local_path = dir.clone();
-                    s.view = View::Local;
-                    // E10.5 — fold the initial dir into the first tab's state.
-                    s.sync_active_tab();
-                }
-                s
-            },
-            Self::update,
-            Self::view,
-        )
-        .title(Self::title)
-        .theme(Self::theme)
-        .subscription(Self::subscription)
-        .window_size(Size::new(t::WIN_W, t::WIN_H))
-        .run()
-    }
-
-    fn title(&self) -> String {
-        "Artifact Manager".into()
-    }
-
-    fn theme(&self) -> Theme {
-        t::theme()
+        // The compositor manages window geometry under Cosmic; Settings carries
+        // the defaults (Carbon dark theme is applied via the per-widget style
+        // closures + the Application `style` override).
+        cosmic::app::run::<MdeFiles>(cosmic::app::Settings::default(), initial_dir)
     }
 
     /// E10.5 — global tab keybindings: Ctrl+T new tab, Ctrl+W close tab,
     /// Ctrl+Tab cycle. Plain keys are left to the focused widget (the
     /// `listen_with` filter drops everything else).
-    fn subscription(&self) -> iced::Subscription<Message> {
-        iced::event::listen_with(|event, _status, _window| {
-            use iced::keyboard::{key::Named, Event as Kbd, Key};
-            let iced::Event::Keyboard(Kbd::KeyPressed { key, modifiers, .. }) = event else {
+    fn key_subscription() -> cosmic::iced::Subscription<Message> {
+        cosmic::iced::event::listen_with(|event, _status, _window| {
+            use cosmic::iced::keyboard::{key::Named, Event as Kbd, Key};
+            let cosmic::iced::Event::Keyboard(Kbd::KeyPressed { key, modifiers, .. }) = event
+            else {
                 return None;
             };
             if !modifiers.command() {
@@ -867,7 +862,7 @@ impl MdeFiles {
         })))
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(|_| container::Style {
+        .sty(|_| container::Style {
             snap: false,
             background: Some(Background::Color(t::PF_BG_300)),
             border: Border {
@@ -902,7 +897,7 @@ impl MdeFiles {
             container(column![views::titlebar_with_status(online, total), body].spacing(0))
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .style(|_| container::Style {
+                .sty(|_| container::Style {
                     snap: false,
                     background: Some(Background::Color(t::WINDOW)),
                     border: Border {
@@ -919,7 +914,7 @@ impl MdeFiles {
 
         // MESHFS-11.1 — overlay the resolve dialog when active.
         if let Some((orig, sib)) = &self.resolve_dialog {
-            iced::widget::Stack::with_children(vec![
+            cosmic::iced::widget::Stack::with_children(vec![
                 root,
                 views::resolve_conflict_dialog(orig, sib),
             ])
@@ -929,6 +924,57 @@ impl MdeFiles {
         } else {
             root
         }
+    }
+}
+
+/// GUI-7 — the `cosmic::Application` shell. The inherent `update`/`view`/
+/// `key_subscription` carry the real logic (inherent methods win direct calls,
+/// so these trait methods delegate without recursion); the trait wraps the
+/// reducer's iced `Task` into the cosmic `Action` space.
+impl Application for MdeFiles {
+    type Executor = cosmic::executor::Default;
+    /// The optional initial directory (`mde-files [PATH]`).
+    type Flags = Option<String>;
+    type Message = Message;
+    const APP_ID: &'static str = "com.mackes.MagicMeshFiles";
+
+    fn core(&self) -> &cosmic::app::Core {
+        &self.core
+    }
+
+    fn core_mut(&mut self) -> &mut cosmic::app::Core {
+        &mut self.core
+    }
+
+    fn init(
+        core: cosmic::app::Core,
+        flags: Self::Flags,
+    ) -> (Self, cosmic::app::Task<Self::Message>) {
+        let mut s = Self::new();
+        s.core = core;
+        // Keep mde-files' custom titlebar; suppress Cosmic's headerbar.
+        s.core.window.show_headerbar = false;
+        s.set_header_title("Artifact Manager".to_string());
+        if let Some(dir) = flags {
+            s.local_path = dir;
+            s.view = View::Local;
+            s.sync_active_tab();
+        }
+        (s, cosmic::app::Task::none())
+    }
+
+    fn subscription(&self) -> cosmic::iced::Subscription<Self::Message> {
+        Self::key_subscription()
+    }
+
+    fn update(&mut self, message: Self::Message) -> cosmic::app::Task<Self::Message> {
+        // Delegate to the inherent reducer (inherent resolution wins), then lift
+        // the iced Task into the cosmic Action space the runtime expects.
+        MdeFiles::update(self, message).map(cosmic::Action::App)
+    }
+
+    fn view(&self) -> Element<'_, Self::Message> {
+        MdeFiles::view(self)
     }
 }
 
@@ -1248,13 +1294,13 @@ fn archive_conflict_file(path: String) -> Task<Message> {
 
 fn empty_state(label: &str) -> Element<'static, Message> {
     container(
-        iced::widget::text(label.to_string())
+        cosmic::iced::widget::text(label.to_string())
             .size(12)
-            .color(t::FG_FAINT),
+            .colr(t::FG_FAINT),
     )
     .padding(Padding::new(56.0))
     .width(Length::Fill)
-    .style(|_| container::Style {
+    .sty(|_| container::Style {
         snap: false,
         background: Some(Background::Color(Color::TRANSPARENT)),
         border: Border {
