@@ -1187,9 +1187,6 @@ enum CaCmd {
         /// override.
         #[arg(long, value_name = "HOST:PORT")]
         lighthouse_addr: Option<String>,
-        /// Cert lifetime in days (default 365).
-        #[arg(long, default_value_t = 365)]
-        cert_lifetime_days: u32,
         /// TUNE-11 — bypass the 8-peer cap (Q3 + Q22 lock). The
         /// override engages an audit-log entry. Document any
         /// real use in `docs/design/cap-overrides.md`.
@@ -2990,7 +2987,6 @@ fn main() -> anyhow::Result<()> {
                     ca_key,
                     scratch_dir,
                     lighthouse_addr,
-                    cert_lifetime_days,
                     override_cap,
                 } => {
                     // NF-3.6.b — sign the peer's pending-enroll
