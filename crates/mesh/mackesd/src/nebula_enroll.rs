@@ -685,6 +685,16 @@ pub fn sign_pending_csr<B: crate::ca::NebulaCertBackend + ?Sized>(
     })?;
     let crt_out = paths.scratch_dir.join(format!("{}.crt", csr.node_id));
     let key_out = paths.scratch_dir.join(format!("{}.key", csr.node_id));
+    // Bed fix #7: clear any stale scratch cert/key from a PRIOR sign of
+    // this same node before re-signing. nebula-cert hard-refuses to
+    // overwrite an existing cert ("refusing to overwrite existing cert:
+    // .../scratch/<node>.crt"), so without this a re-enroll (or any second
+    // sign — operator re-issue, CA rotation, the auto-signer retrying)
+    // fails permanently. These files are an ephemeral hand-off buffer:
+    // they're read straight into the bundle below and never consulted
+    // again, so removing a leftover is always safe. Ignore NotFound.
+    let _ = std::fs::remove_file(&crt_out);
+    let _ = std::fs::remove_file(&key_out);
     let signed = crate::ca::sign::sign_peer_cert(
         backend,
         conn,
@@ -993,6 +1003,87 @@ mod tests {
     // ---- sign_pending_csr (lighthouse side) -----------------
 
     use crate::ca::{mint, MockBackend};
+
+    /// Test backend that mimics the real `nebula-cert sign` refusal to
+    /// overwrite an existing cert file — the behaviour MockBackend lacks
+    /// (it `fs::write`s unconditionally). Used to reproduce bed bug #7:
+    /// a leftover scratch cert from a prior sign must not wedge re-signs.
+    struct RefuseOverwriteBackend;
+    impl crate::ca::NebulaCertBackend for RefuseOverwriteBackend {
+        fn mint_ca(
+            &self,
+            mesh_id: &str,
+            crt_out: &Path,
+            key_out: &Path,
+        ) -> Result<(), crate::ca::CaError> {
+            MockBackend.mint_ca(mesh_id, crt_out, key_out)
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn sign_peer(
+            &self,
+            ca_crt: &Path,
+            ca_key: &Path,
+            node_id: &str,
+            overlay_ip: &str,
+            cidr_prefix: u8,
+            groups: &[&str],
+            crt_out: &Path,
+            key_out: &Path,
+        ) -> Result<(), crate::ca::CaError> {
+            if crt_out.exists() {
+                return Err(crate::ca::CaError::Io(format!(
+                    "refusing to overwrite existing cert: {}",
+                    crt_out.display()
+                )));
+            }
+            MockBackend.sign_peer(
+                ca_crt,
+                ca_key,
+                node_id,
+                overlay_ip,
+                cidr_prefix,
+                groups,
+                crt_out,
+                key_out,
+            )
+        }
+    }
+
+    #[test]
+    fn sign_csr_clears_stale_scratch_cert_before_resigning() {
+        // Bed fix #7 regression: a leftover scratch cert from a PRIOR
+        // sign of this same node must be cleared first — nebula-cert
+        // hard-refuses to overwrite it, which otherwise wedges every
+        // re-enroll / re-issue. RefuseOverwriteBackend models that
+        // refusal; seed a stale `<node>.crt` and assert the sign still
+        // succeeds (the fix removes it before signing).
+        let tmp = tempdir().expect("tempdir");
+        let conn = fresh_store();
+        let (ca_crt, ca_key) = make_test_ca(tmp.path(), &conn);
+        let _ = place_csr(tmp.path(), "peer:anvil");
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&scratch).expect("mkdir scratch");
+        // Leftover from a prior sign — exactly what nebula-cert chokes on.
+        std::fs::write(scratch.join("peer:anvil.crt"), b"STALE LEFTOVER")
+            .expect("seed stale scratch cert");
+        let paths = SignCsrPaths {
+            ca_crt,
+            ca_key,
+            scratch_dir: scratch,
+        };
+        let outcome = sign_pending_csr(
+            &RefuseOverwriteBackend,
+            &conn,
+            tmp.path(),
+            "peer:anvil",
+            "test-mesh",
+            &paths,
+            Vec::new(),
+            false,
+        )
+        .expect("re-sign must clear the stale scratch cert and succeed");
+        assert!(outcome.bundle_path.exists());
+    }
 
     fn fresh_store() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().expect("memory db");
