@@ -227,7 +227,18 @@ impl NebulaSupervisor {
     async fn refresh_config(&self) -> Result<(), String> {
         let bundle =
             crate::ca::bundle::read_bundle(&self.bundle_path).map_err(|e| e.to_string())?;
-        let role = if self.last_is_leader {
+        // Bug #3 (operator decision 2026-06-10): a node's nebula lighthouse
+        // role is STATIC — it's a lighthouse iff its own overlay IP is in
+        // the bundle's lighthouse set — NOT a function of FPG leadership.
+        // Tying am_lighthouse to `last_is_leader` made the founding host
+        // render a peer config (am_lighthouse: false) pointing
+        // static_host_map at itself, so the overlay never formed. FPG
+        // leadership stays a separate control-plane concern.
+        let role = if bundle
+            .lighthouses
+            .iter()
+            .any(|lh| lh.overlay_ip == bundle.overlay_ip)
+        {
             ConfigRole::Host
         } else {
             ConfigRole::Peer
@@ -426,6 +437,12 @@ fn render_config_yaml_inner(
     }
     out.push_str("static_host_map:\n");
     for lh in &bundle.lighthouses {
+        // Never map ourselves — a lighthouse that lists its own overlay
+        // IP here tries to handshake itself ("Refusing to handshake with
+        // myself"). Bug #3, found on the VM bed 2026-06-10.
+        if lh.overlay_ip == bundle.overlay_ip {
+            continue;
+        }
         out.push_str(&format!(
             "  \"{}\": [\"{}\"]\n",
             lh.overlay_ip, lh.external_addr,
@@ -723,6 +740,38 @@ mod tests {
     }
 
     // VIRT-4.a (v5.0.0) — VM subnet `unsafe_routes` announcement.
+
+    #[test]
+    fn a_lighthouse_node_never_maps_itself() {
+        // Bug #3 (decouple decision): a node that IS a bundle lighthouse
+        // must render am_lighthouse + must NOT list its own overlay IP in
+        // static_host_map (else nebula "refuses to handshake with myself").
+        let mut b = sample_bundle();
+        // Make THIS node the lighthouse: own overlay IP == the lh entry.
+        b.overlay_ip = "10.42.0.1".into();
+        let yaml = render_config_yaml(&b, ConfigRole::Host);
+        assert!(yaml.contains("am_lighthouse: true"));
+        assert!(
+            !yaml.contains("lh1.example.com:4242"),
+            "a lighthouse must not map itself in static_host_map:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn a_second_lighthouse_is_still_mapped() {
+        // With two lighthouses, a lighthouse maps the OTHER one (relay
+        // mesh) but still not itself.
+        let mut b = sample_bundle();
+        b.overlay_ip = "10.42.0.1".into(); // self = lh1
+        b.lighthouses.push(LighthouseEntry {
+            node_id: "peer:lh2".into(),
+            overlay_ip: "10.42.0.2".into(),
+            external_addr: "lh2.example.com:4242".into(),
+        });
+        let yaml = render_config_yaml(&b, ConfigRole::Host);
+        assert!(!yaml.contains("lh1.example.com:4242"), "self excluded");
+        assert!(yaml.contains("lh2.example.com:4242"), "other lh mapped");
+    }
 
     #[test]
     fn every_config_names_the_tun_device_nebula1() {
