@@ -4896,15 +4896,40 @@ fn run_serve(
         // Ok arm so the watcher runs even if the supervisor's
         // SQLite open failed (the watcher opens its own per-tick
         // connection).
-        let csr_watcher_mesh_id = std::env::var("MDE_MESH_ID")
-            .unwrap_or_else(|_| format!("mesh-{node_id}"));
+        // Advisory only — sign_pending_csr authoritatively signs under the
+        // peer's own token mesh (bed fix #5). Kept solely so the watcher's
+        // log line names the real mesh: prefer this lighthouse's own bundle,
+        // then MDE_MESH_ID, then the legacy mesh-<node> placeholder.
+        let csr_watcher_mesh_id = mackesd_core::ca::bundle::read_bundle(
+            &mackesd_core::ca::bundle::bundle_path(&workgroup_root, &node_id),
+        )
+        .ok()
+        .map(|b| b.mesh_id)
+        .filter(|m| !m.is_empty())
+        .or_else(|| std::env::var("MDE_MESH_ID").ok())
+        .unwrap_or_else(|| format!("mesh-{node_id}"));
+        // Bed fix #6 (auto-signer path): the bundle the auto-signer hands
+        // a joining peer must carry the lighthouse's REAL externally-dialable
+        // address, not its hostname. mesh-init recorded that address in this
+        // lighthouse's own bundle (`lighthouses[0].external_addr`); read it
+        // back. Falls back to the hostname guess only when no bundle exists
+        // (a peer-role box has no CA, so it never actually signs anyway).
         let csr_watcher_lighthouse_addr = {
-            let host = std::fs::read_to_string("/etc/hostname")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| node_id.clone());
-            format!("{host}:4242")
+            let from_bundle = mackesd_core::ca::bundle::read_bundle(
+                &mackesd_core::ca::bundle::bundle_path(&workgroup_root, &node_id),
+            )
+            .ok()
+            .and_then(|b| b.lighthouses.into_iter().next())
+            .map(|lh| lh.external_addr)
+            .filter(|a| !a.is_empty());
+            from_bundle.unwrap_or_else(|| {
+                let host = std::fs::read_to_string("/etc/hostname")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| node_id.clone());
+                format!("{host}:4242")
+            })
         };
         sup.spawn(Spawn::new(
             mackesd_core::workers::nebula_csr_watcher::NebulaCsrWatcher::new(
