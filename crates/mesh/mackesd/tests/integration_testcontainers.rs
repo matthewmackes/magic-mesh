@@ -70,7 +70,8 @@ fn mackesd_binary() -> PathBuf {
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
-        .nth(3).map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+        .nth(3)
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
 /// Run `sudo podman <args>`; return `(stdout, stderr, exit_code)`.
@@ -278,7 +279,10 @@ impl Node {
                 .lines()
                 .find(|l| l.trim_start().starts_with("inet 10.42."))
             {
-                return line.split_whitespace().nth(1).map(std::borrow::ToOwned::to_owned);
+                return line
+                    .split_whitespace()
+                    .nth(1)
+                    .map(std::borrow::ToOwned::to_owned);
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
