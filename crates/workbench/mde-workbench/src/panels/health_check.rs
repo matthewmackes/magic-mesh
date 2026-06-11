@@ -335,7 +335,7 @@ fn probe_row<'a>(p: &'a ProbeResult, palette: Palette) -> Element<'a, crate::Mes
 
 #[must_use]
 pub fn run_all_probes() -> Vec<ProbeResult> {
-    vec![
+    let mut probes = vec![
         probe_disk_space(),
         probe_memory(),
         probe_failed_units(),
@@ -350,7 +350,91 @@ pub fn run_all_probes() -> Vec<ProbeResult> {
         probe_mesh_binaries(),
         probe_mackesd_service(),
         probe_overlay_link(),
-    ]
+    ];
+    // PLANES-6 / W20 — the local Netdata active-alarm list, one row per
+    // firing alarm (or a single honest "none active" / "not reachable").
+    probes.extend(netdata_alarm_probes());
+    probes
+}
+
+/// PLANES-6 / W20 — parse Netdata's `/api/v1/alarms` reply into a list
+/// of `(name, status)` for the alarms actually firing (WARNING or
+/// CRITICAL); CLEAR/UNDEFINED and anything else are dropped. Sorted by
+/// name for a stable render. Pure + testable (mirrors the mackesd-side
+/// `descriptors::parse_netdata_alarms`, which keeps only the 3-tier
+/// summary; here we keep the names for the operator-facing list).
+#[must_use]
+pub fn parse_netdata_alarms(body: &str) -> Vec<(String, String)> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    if let Some(alarms) = v.get("alarms").and_then(|a| a.as_object()) {
+        for (name, alarm) in alarms {
+            if let Some(s @ ("WARNING" | "CRITICAL")) = alarm.get("status").and_then(|s| s.as_str())
+            {
+                out.push((name.clone(), s.to_string()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// W20 — fetch the local Netdata active alarms over a std-only HTTP/1.0
+/// GET (same approach as the Peers panel's metrics fetch — no client
+/// dep). `None` when Netdata is unreachable, so the probe row can say so
+/// honestly rather than imply "no alarms".
+fn fetch_netdata_alarms() -> Option<Vec<(String, String)>> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect_timeout(
+        &"127.0.0.1:19999".parse().ok()?,
+        Duration::from_millis(900),
+    )
+    .ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(1500)))
+        .ok();
+    write!(
+        stream,
+        "GET /api/v1/alarms?active HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).ok()?;
+    let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+    Some(parse_netdata_alarms(body))
+}
+
+/// W20 — turn the fetched alarms into probe rows.
+fn netdata_alarm_probes() -> Vec<ProbeResult> {
+    match fetch_netdata_alarms() {
+        None => vec![ProbeResult {
+            name: "Netdata alarms".into(),
+            status: ProbeStatus::Unknown,
+            detail: "Netdata not reachable on localhost:19999".into(),
+            remediation: Some("sudo systemctl enable --now netdata".into()),
+        }],
+        Some(active) if active.is_empty() => vec![ProbeResult {
+            name: "Netdata alarms".into(),
+            status: ProbeStatus::Ok,
+            detail: "no active alarms".into(),
+            remediation: None,
+        }],
+        Some(active) => active
+            .into_iter()
+            .map(|(name, status)| ProbeResult {
+                status: if status == "CRITICAL" {
+                    ProbeStatus::Fail
+                } else {
+                    ProbeStatus::Warn
+                },
+                name: format!("Netdata: {name}"),
+                detail: status,
+                remediation: None,
+            })
+            .collect(),
+    }
 }
 
 /// PLANES-6 / ENT-7 — required mesh binaries on PATH (nebula + nebula-cert).
@@ -752,10 +836,37 @@ mod tests {
 
     #[test]
     fn run_all_probes_returns_all_results() {
-        // 7 local probes + 3 PLANES-6/ENT-7 doctor probes (binaries,
-        // daemon, overlay).
+        // 7 local probes + 3 PLANES-6/ENT-7 doctor probes + the W20
+        // Netdata alarm rows (≥1: a list, or one honest summary row). The
+        // alarm count varies with the environment, so assert the floor.
         let probes = run_all_probes();
-        assert_eq!(probes.len(), 10);
+        assert!(probes.len() >= 11, "got {}", probes.len());
+    }
+
+    #[test]
+    fn netdata_alarm_parse_keeps_only_firing_alarms() {
+        // W20 — WARNING/CRITICAL kept (sorted), CLEAR/other dropped.
+        let body = r#"{"alarms":{
+            "oom":{"status":"CRITICAL"},
+            "disk_fill":{"status":"WARNING"},
+            "cpu":{"status":"CLEAR"},
+            "ram":{"status":"UNDEFINED"}
+        }}"#;
+        let got = parse_netdata_alarms(body);
+        assert_eq!(
+            got,
+            vec![
+                ("disk_fill".to_string(), "WARNING".to_string()),
+                ("oom".to_string(), "CRITICAL".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn netdata_alarm_parse_handles_empty_and_garbage() {
+        assert!(parse_netdata_alarms(r#"{"alarms":{}}"#).is_empty());
+        assert!(parse_netdata_alarms("not json").is_empty());
+        assert!(parse_netdata_alarms("{}").is_empty());
     }
 
     #[test]
