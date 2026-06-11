@@ -71,20 +71,33 @@ pub struct HealthCheckPanel {
     pub probes: Vec<ProbeResult>,
     pub busy: bool,
     pub last_run_at: Option<SystemTime>,
-    /// W24 — a mackesd self-restart is in flight.
-    pub restarting: bool,
-    /// W24 — last restart outcome line (empty until one is issued).
-    pub restart_msg: String,
+    /// W20/W24 — a mesh-service start/stop/restart is in flight.
+    pub service_busy: bool,
+    /// W20/W24 — last service-control outcome line (empty until one runs).
+    pub service_msg: String,
 }
+
+/// PLANES-6 / W20 — the mesh services the Health panel can start/stop/
+/// restart inline (all System-scope systemd units). A degraded daemon
+/// is actionable from the same place it's flagged, without leaving for
+/// the standalone Mesh Services panel.
+pub const HEALTH_SERVICES: &[&str] = &["mackesd", "nebula"];
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Loaded(Vec<ProbeResult>),
     RunClicked,
-    /// PLANES-6 / W24 — restart the mackesd daemon via systemd.
-    RestartMackesd,
-    /// W24 — the restart command resolved; re-probe for honest reconnect.
-    Restarted(bool),
+    /// PLANES-6 / W20/W24 — start/stop/restart a mesh service via systemd.
+    ServiceOp {
+        unit: String,
+        op: &'static str,
+    },
+    /// W20/W24 — the op resolved; on success re-probe (honest reconnect).
+    ServiceOpDone {
+        unit: String,
+        op: &'static str,
+        ok: bool,
+    },
 }
 
 impl HealthCheckPanel {
@@ -111,36 +124,44 @@ impl HealthCheckPanel {
                 self.busy = true;
                 Self::load()
             }
-            Message::RestartMackesd => {
-                if self.restarting {
+            Message::ServiceOp { unit, op } => {
+                if self.service_busy {
                     return Task::none();
                 }
-                self.restarting = true;
-                self.restart_msg = "Restarting mackesd…".into();
+                self.service_busy = true;
+                self.service_msg = format!("{op} {unit}…");
+                let unit_for_done = unit.clone();
                 Task::perform(
-                    async {
-                        // mackesd is a system unit (see mesh_services::MESH_UNITS).
+                    async move {
+                        // All HEALTH_SERVICES are System-scope units
+                        // (see mesh_services::MESH_UNITS).
                         crate::panels::mesh_services::run_pkexec_systemctl(
                             &crate::panels::mesh_services::UnitScope::System,
-                            "restart",
-                            "mackesd",
+                            op,
+                            &unit,
                         )
                         .await
                     },
-                    |ok| crate::Message::HealthCheck(Message::Restarted(ok)),
+                    move |ok| {
+                        crate::Message::HealthCheck(Message::ServiceOpDone {
+                            unit: unit_for_done.clone(),
+                            op,
+                            ok,
+                        })
+                    },
                 )
             }
-            Message::Restarted(ok) => {
-                self.restarting = false;
+            Message::ServiceOpDone { unit, op, ok } => {
+                self.service_busy = false;
                 if ok {
-                    // W24 "honest reconnect": re-probe so the mackesd
-                    // status reflects whether it actually came back.
-                    self.restart_msg = "Restart issued — re-probing…".into();
+                    // W24 "honest reconnect": re-probe so the service's
+                    // status row reflects whether it actually changed.
+                    self.service_msg = format!("{op} {unit} issued — re-probing…");
                     self.busy = true;
                     Self::load()
                 } else {
-                    self.restart_msg =
-                        "Restart failed (authorization declined or unit error).".into();
+                    self.service_msg =
+                        format!("{op} {unit} failed (authorization declined or unit error).");
                     Task::none()
                 }
             }
@@ -203,32 +224,12 @@ impl HealthCheckPanel {
         })
         .on_press(crate::Message::HealthCheck(Message::RunClicked));
 
-        // PLANES-6 / W24 — mackesd self-restart, folded next to Run.
-        // Disabled while a restart or probe pass is in flight.
-        let restart_btn = crate::controls::variant_button(
-            if self.restarting {
-                "Restarting…"
-            } else {
-                "Restart mackesd"
-            },
-            crate::controls::ButtonVariant::Secondary,
-            (!self.restarting && !self.busy)
-                .then_some(crate::Message::HealthCheck(Message::RestartMackesd)),
-            palette,
-        );
-
-        let mut left = column![title, subtitle].spacing(2);
-        if !self.restart_msg.is_empty() {
-            left = left.push(
-                text(self.restart_msg.clone())
-                    .size(TypeRole::Body.size_in(sizes))
-                    .color(palette.text_muted.into_iced_color()),
-            );
-        }
-
-        let header = row![left, Space::new().width(Length::Fill), restart_btn, run_btn,]
-            .spacing(8)
-            .align_y(iced::alignment::Vertical::Center);
+        let header = row![
+            column![title, subtitle].spacing(2),
+            Space::new().width(Length::Fill),
+            run_btn,
+        ]
+        .align_y(iced::alignment::Vertical::Center);
 
         let mut probe_col = column![].spacing(8);
         for p in &self.probes {
@@ -245,10 +246,49 @@ impl HealthCheckPanel {
             );
         }
 
+        // PLANES-6 / W20 — folded mesh-service start/stop/restart
+        // controls. One row per HEALTH_SERVICES unit; buttons disabled
+        // while any op (or a probe pass) is in flight. A degraded daemon
+        // flagged above is actionable right here.
+        let mut services_col = column![text("Mesh services")
+            .size(TypeRole::Body.size_in(sizes))
+            .color(palette.text.into_iced_color())]
+        .spacing(8);
+        let controls_live = !self.service_busy && !self.busy;
+        for unit in HEALTH_SERVICES {
+            let mut btns = row![text((*unit).to_string())
+                .size(14)
+                .width(Length::Fixed(160.0))
+                .color(palette.text.into_iced_color())]
+            .spacing(8)
+            .align_y(iced::alignment::Vertical::Center);
+            for op in ["start", "stop", "restart"] {
+                btns = btns.push(crate::controls::variant_button(
+                    op,
+                    crate::controls::ButtonVariant::Secondary,
+                    controls_live.then_some(crate::Message::HealthCheck(Message::ServiceOp {
+                        unit: (*unit).to_string(),
+                        op,
+                    })),
+                    palette,
+                ));
+            }
+            services_col = services_col.push(btns);
+        }
+        if !self.service_msg.is_empty() {
+            services_col = services_col.push(
+                text(self.service_msg.clone())
+                    .size(12)
+                    .color(palette.text_muted.into_iced_color()),
+            );
+        }
+
         container(
             column![
                 header,
-                Space::new().height(Length::Fixed(20.0)),
+                Space::new().height(Length::Fixed(16.0)),
+                services_col,
+                Space::new().height(Length::Fixed(16.0)),
                 scrollable(probe_col).height(Length::Fill),
             ]
             .spacing(2),
@@ -890,42 +930,63 @@ mod tests {
     }
 
     #[test]
-    fn restart_click_marks_restarting_with_a_message() {
-        // W24 — clicking Restart flips state + shows progress.
+    fn service_op_marks_busy_with_a_message() {
+        // W20/W24 — issuing a service op flips busy + shows progress.
         let mut panel = HealthCheckPanel::new();
-        let _ = panel.update(Message::RestartMackesd);
-        assert!(panel.restarting);
-        assert!(panel.restart_msg.contains("Restarting"));
+        let _ = panel.update(Message::ServiceOp {
+            unit: "mackesd".into(),
+            op: "restart",
+        });
+        assert!(panel.service_busy);
+        assert!(panel.service_msg.contains("restart mackesd"));
     }
 
     #[test]
-    fn restart_click_while_restarting_is_noop() {
+    fn service_op_while_busy_is_noop() {
         let mut panel = HealthCheckPanel::new();
-        panel.restarting = true;
-        panel.restart_msg = "Restarting mackesd…".into();
-        let _ = panel.update(Message::RestartMackesd);
-        assert!(panel.restarting);
+        panel.service_busy = true;
+        panel.service_msg = "restart mackesd…".into();
+        let _ = panel.update(Message::ServiceOp {
+            unit: "nebula".into(),
+            op: "stop",
+        });
+        // Still the original op's message — the second was ignored.
+        assert!(panel.service_msg.contains("mackesd"));
     }
 
     #[test]
-    fn restart_failure_reports_and_clears_restarting() {
+    fn service_op_failure_reports_and_clears_busy() {
         let mut panel = HealthCheckPanel::new();
-        panel.restarting = true;
-        let _ = panel.update(Message::Restarted(false));
-        assert!(!panel.restarting);
-        assert!(panel.restart_msg.to_lowercase().contains("failed"));
+        panel.service_busy = true;
+        let _ = panel.update(Message::ServiceOpDone {
+            unit: "mackesd".into(),
+            op: "restart",
+            ok: false,
+        });
+        assert!(!panel.service_busy);
+        assert!(panel.service_msg.to_lowercase().contains("failed"));
     }
 
     #[test]
-    fn restart_success_reprobes_with_honest_reconnect() {
-        // W24 — a successful restart clears restarting, sets busy (the
-        // re-probe is in flight), and says it's re-probing.
+    fn service_op_success_reprobes_with_honest_reconnect() {
+        // W24 — success clears busy, sets the probe pass busy, re-probes.
         let mut panel = HealthCheckPanel::new();
-        panel.restarting = true;
-        let _ = panel.update(Message::Restarted(true));
-        assert!(!panel.restarting);
+        panel.service_busy = true;
+        let _ = panel.update(Message::ServiceOpDone {
+            unit: "nebula".into(),
+            op: "start",
+            ok: true,
+        });
+        assert!(!panel.service_busy);
         assert!(panel.busy, "re-probe should be in flight");
-        assert!(panel.restart_msg.contains("re-probing"));
+        assert!(panel.service_msg.contains("re-probing"));
+    }
+
+    #[test]
+    fn health_services_are_system_units() {
+        // The folded controls target the known mesh units.
+        assert!(HEALTH_SERVICES.contains(&"mackesd"));
+        assert!(HEALTH_SERVICES.contains(&"nebula"));
     }
 
     #[test]
