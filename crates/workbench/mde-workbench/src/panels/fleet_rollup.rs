@@ -10,6 +10,8 @@
 //! live-map centerpiece (W81) + drill-down-into-Peers (W87) + the on-Cosmic
 //! `/preview` are the deferred tail.
 
+use std::collections::HashMap;
+
 use iced::widget::{column, container, row, scrollable, text};
 use iced::{Element, Length, Padding, Task};
 use mde_theme::{EmptyState, Icon};
@@ -18,6 +20,8 @@ use serde::Deserialize;
 use crate::controls::{variant_button, ButtonVariant};
 use crate::panel_chrome::{empty_state, panel_container, status_badge, BadgeSeverity};
 use crate::panels::fleet_settings::run_mackesd;
+use crate::panels::peers::{parse_directory, PeerRow};
+use crate::panels::peers_map::{layout, read_latency_cache, MapNode, MapProgram};
 
 /// One role group (mirrors `mackesd_core::fleet_rollup::RoleRollup`).
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -46,6 +50,17 @@ pub fn parse_rollup(raw: &str) -> Rollup {
     serde_json::from_str(raw).unwrap_or_default()
 }
 
+/// This node's hostname (anchors the live map; "localhost" on failure).
+fn hostname() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "localhost".into())
+}
+
 /// Map a worst-health string to its badge severity.
 #[must_use]
 pub fn health_severity(worst: &str) -> BadgeSeverity {
@@ -60,6 +75,12 @@ pub fn health_severity(worst: &str) -> BadgeSeverity {
 #[derive(Debug, Clone, Default)]
 pub struct FleetRollupPanel {
     pub rollup: Rollup,
+    /// W81 — peer rows feeding the live-map centerpiece.
+    pub rows: Vec<PeerRow>,
+    /// W81 — host→RTT for the map's edge labels/spring lengths.
+    pub rtt: HashMap<String, Option<f64>>,
+    /// W81 — this node, anchored at the map's center.
+    pub self_hostname: String,
     pub loaded: bool,
     pub status: String,
     pub busy: bool,
@@ -67,7 +88,12 @@ pub struct FleetRollupPanel {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Loaded(Rollup),
+    Loaded {
+        rollup: Rollup,
+        rows: Vec<PeerRow>,
+        rtt: HashMap<String, Option<f64>>,
+        self_hostname: String,
+    },
     RefreshClicked,
 }
 
@@ -84,7 +110,21 @@ impl FleetRollupPanel {
                     .await
                     .map(|out| parse_rollup(&out))
                     .unwrap_or_default();
-                Message::Loaded(rollup)
+                // W81 — the live-map data: the same directory the Peers
+                // Front Door reads, plus the mesh-latency cache.
+                let rows = run_mackesd(&["peers".into(), "--json".into()])
+                    .await
+                    .ok()
+                    .and_then(|out| parse_directory(&out).ok())
+                    .unwrap_or_default();
+                let rtt = read_latency_cache();
+                let self_hostname = hostname();
+                Message::Loaded {
+                    rollup,
+                    rows,
+                    rtt,
+                    self_hostname,
+                }
             },
             crate::Message::FleetRollup,
         )
@@ -92,8 +132,16 @@ impl FleetRollupPanel {
 
     pub fn update(&mut self, message: Message) -> Task<crate::Message> {
         match message {
-            Message::Loaded(rollup) => {
+            Message::Loaded {
+                rollup,
+                rows,
+                rtt,
+                self_hostname,
+            } => {
                 self.rollup = rollup;
+                self.rows = rows;
+                self.rtt = rtt;
+                self.self_hostname = self_hostname;
                 self.loaded = true;
                 self.busy = false;
                 self.status.clear();
@@ -180,6 +228,34 @@ impl FleetRollupPanel {
             );
         }
 
+        // W81 — the live-map centerpiece: the same PD-7 force-graph the
+        // Peers panel + wallpaper render, fed by the directory + RTT cache.
+        // Sits above the role cards as the dashboard's focal point. (Node
+        // click pre-selects the peer; the cards' "View peers ›" navigates.)
+        let centerpiece: Element<'_, crate::Message> = if self.rows.is_empty() {
+            iced::widget::Space::new().height(Length::Fixed(0.0)).into()
+        } else {
+            let nodes: Vec<MapNode> = self
+                .rows
+                .iter()
+                .map(|r| MapNode {
+                    hostname: r.hostname.clone(),
+                    presence: r.presence.clone(),
+                    rtt_ms: self.rtt.get(&r.hostname).copied().flatten(),
+                    is_self: r.hostname == self.self_hostname,
+                })
+                .collect();
+            let positions = layout(&nodes);
+            iced::widget::canvas(MapProgram {
+                nodes,
+                positions,
+                palette,
+            })
+            .width(Length::Fill)
+            .height(Length::Fixed(260.0))
+            .into()
+        };
+
         panel_container(
             column![
                 row![
@@ -188,6 +264,7 @@ impl FleetRollupPanel {
                 ]
                 .spacing(12)
                 .align_y(iced::Alignment::Center),
+                centerpiece,
                 scrollable(cards).height(Length::Fill),
             ]
             .spacing(16)
@@ -236,11 +313,17 @@ mod tests {
     fn loaded_sets_rollup_and_clears_busy() {
         let mut p = FleetRollupPanel::new();
         p.busy = true;
-        let _ = p.update(Message::Loaded(parse_rollup(
-            r#"{"total":1,"groups":[{"role":"host","total":1,"worst_health":"healthy"}]}"#,
-        )));
+        let _ = p.update(Message::Loaded {
+            rollup: parse_rollup(
+                r#"{"total":1,"groups":[{"role":"host","total":1,"worst_health":"healthy"}]}"#,
+            ),
+            rows: Vec::new(),
+            rtt: HashMap::new(),
+            self_hostname: "pine".into(),
+        });
         assert!(p.loaded);
         assert!(!p.busy);
         assert_eq!(p.rollup.total, 1);
+        assert_eq!(p.self_hostname, "pine");
     }
 }
