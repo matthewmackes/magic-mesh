@@ -2,13 +2,14 @@
 //!
 //! Shows this node's *applied* fleet revision against the *newest* in the
 //! replicated revision log, with a **Reconcile-now** action (W22), plus
-//! the installed RPM version (W28). Reads the `magic_fleet::store` log
-//! directly (`<root>/fleet/revisions/<v>.yaml` + `fleet/acks/<v>/<host>.json`)
-//! — the established panel pattern; Reconcile-now shells `mackesd reconcile`.
+//! the installed RPM version and the repo it came from (W28). Reads the
+//! `magic_fleet::store` log directly (`<root>/fleet/revisions/<v>.yaml` +
+//! `fleet/acks/<v>/<host>.json`) — the established panel pattern;
+//! Reconcile-now shells `mackesd reconcile`.
 //!
 //! Build-now-defer-visual: the newest/applied projection is pure +
 //! unit-tested; the on-Cosmic `/preview`, the last-Ansible-log tail, and
-//! update-now-via-typed-job (W28) are the deferred tail.
+//! update-now-via-typed-job (W28's action half) are the deferred tail.
 
 use std::path::{Path, PathBuf};
 
@@ -84,6 +85,8 @@ pub struct ConfigState {
     pub newest_author: String,
     pub applied: Option<u64>,
     pub rpm_version: String,
+    /// W28 — the dnf repo the installed RPM came from.
+    pub repo_source: String,
     pub hostname: String,
 }
 
@@ -134,6 +137,40 @@ fn rpm_version() -> String {
         .unwrap_or_else(|| "not installed via RPM".into())
 }
 
+/// W28 — parse `dnf repoquery --installed --qf '%{from_repo}'` output
+/// into the repo the package was installed from. dnf reports `@System`
+/// or `<unknown>` (or nothing) when it can't attribute one — a local
+/// `rpm -i` or an in-tree build — which we surface honestly rather than
+/// inventing a source.
+fn parse_from_repo(out: &str) -> Option<String> {
+    let line = out.lines().map(str::trim).find(|l| !l.is_empty())?;
+    match line {
+        "@System" | "<unknown>" => None,
+        repo => Some(repo.to_string()),
+    }
+}
+
+/// W28 — which dnf repo served the installed `magic-mesh` RPM (the
+/// PLANES-24 `file://` self-mirror, an upstream GitHub-Pages repo, or
+/// honestly "unknown" when it wasn't installed from a configured repo).
+fn repo_source() -> String {
+    std::process::Command::new("dnf")
+        .args([
+            "repoquery",
+            "--installed",
+            "--qf",
+            "%{from_repo}",
+            "magic-mesh",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .as_deref()
+        .and_then(parse_from_repo)
+        .unwrap_or_else(|| "unknown (not from a configured repo)".into())
+}
+
 impl ConfigApplyPanel {
     #[must_use]
     pub fn new() -> Self {
@@ -152,6 +189,7 @@ impl ConfigApplyPanel {
                     newest_author,
                     applied: applied_version(&root, &host),
                     rpm_version: rpm_version(),
+                    repo_source: repo_source(),
                     hostname: host,
                 })
             },
@@ -246,6 +284,11 @@ impl ConfigApplyPanel {
             ]
             .spacing(8),
             row![text("RPM:").size(13), text(s.rpm_version.clone()).size(13)].spacing(8),
+            row![
+                text("Repo source:").size(13),
+                text(s.repo_source.clone()).size(13)
+            ]
+            .spacing(8),
             row![reconcile, refresh].spacing(12),
             text(self.status.clone()).size(13),
         ]
@@ -310,6 +353,21 @@ mod tests {
         assert!(!s.up_to_date());
         s.applied = None;
         assert!(!s.up_to_date());
+    }
+
+    #[test]
+    fn from_repo_parse_handles_real_repos_and_unattributed_installs() {
+        // A configured repo (the PLANES-24 self-mirror or upstream).
+        assert_eq!(
+            parse_from_repo("mackes-mirror-magic-mesh\n"),
+            Some("mackes-mirror-magic-mesh".to_string())
+        );
+        // dnf's "no attributable repo" sentinels → honest None.
+        assert_eq!(parse_from_repo("@System\n"), None);
+        assert_eq!(parse_from_repo("<unknown>"), None);
+        // Empty output (package absent / dnf error) → None.
+        assert_eq!(parse_from_repo(""), None);
+        assert_eq!(parse_from_repo("   \n"), None);
     }
 
     #[test]
