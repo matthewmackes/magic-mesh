@@ -587,7 +587,14 @@ pub fn sign_pending_csr<B: crate::ca::NebulaCertBackend + ?Sized>(
     conn: &rusqlite::Connection,
     workgroup_root: &Path,
     peer_id: &str,
-    mesh_id: &str,
+    // The CALLER's advisory mesh-id. IGNORED: the authoritative mesh is
+    // the one the peer's join token declares (`csr.token.mesh_id`) — the
+    // peer is joining the mesh named in its token, and the lighthouse
+    // signs under THAT mesh's active CA (erroring if it has none for it).
+    // Both the CLI and the auto-signer used to pass a bogus
+    // `mesh-<local-node-id>` fallback here, which is why manual sign-csr
+    // AND the auto-signer both failed with "no active CA". Bed fix #5.
+    _mesh_hint: &str,
     paths: &SignCsrPaths,
     lighthouses: Vec<crate::ca::bundle::LighthouseEntry>,
     allow_override: bool,
@@ -603,6 +610,8 @@ pub fn sign_pending_csr<B: crate::ca::NebulaCertBackend + ?Sized>(
         serde_json::from_slice(&csr_bytes).map_err(|e| SignCsrError::CsrCorrupt {
             reason: e.to_string(),
         })?;
+    // The mesh the peer is actually joining (authoritative — bed fix #5).
+    let mesh_id: &str = &csr.token.mesh_id;
     // EPIC-SEC-BANLIST (Q53) — refuse a banned node-id BEFORE the
     // cap check + before any signing work. A ban is a deliberate,
     // permanent block that survives CA rotation; there is no
@@ -1108,6 +1117,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row_count, 1);
+    }
+
+    #[test]
+    fn sign_csr_ignores_advisory_mesh_hint_and_uses_token_mesh() {
+        // Bed fix #5 regression: the caller's `_mesh_hint` is advisory and
+        // MUST be ignored — the authoritative mesh is the one the peer's
+        // join token declares (`csr.token.mesh_id` == "test-mesh", and the
+        // CA is minted for "test-mesh"). Pass a BOGUS hint that has no CA;
+        // under the old code this errored "no active CA for mesh
+        // mesh-peer:bogus" (and silently broke the auto-signer). The sign
+        // must now succeed and the bundle must carry the token's mesh.
+        let tmp = tempdir().expect("tempdir");
+        let conn = fresh_store();
+        let (ca_crt, ca_key) = make_test_ca(tmp.path(), &conn);
+        let _ = place_csr(tmp.path(), "peer:anvil");
+        let paths = SignCsrPaths {
+            ca_crt,
+            ca_key,
+            scratch_dir: tmp.path().join("scratch"),
+        };
+        let outcome = sign_pending_csr(
+            &MockBackend,
+            &conn,
+            tmp.path(),
+            "peer:anvil",
+            "mesh-peer:bogus", // advisory hint with no matching CA — ignored
+            &paths,
+            Vec::new(),
+            false,
+        )
+        .expect("sign must use the token's mesh, not the bogus hint");
+        let bundle = crate::ca::bundle::read_bundle(&outcome.bundle_path).expect("read");
+        assert_eq!(bundle.mesh_id, "test-mesh");
     }
 
     #[test]
