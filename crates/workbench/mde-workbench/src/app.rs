@@ -765,6 +765,9 @@ impl App {
                 }
         ) {
             subs.push(peers_panel::metrics_subscription());
+            // PD-3/Q10 — refresh the directory itself every 30 s while
+            // the Front Door is open, so presence/health/tags stay live.
+            subs.push(peers_panel::directory_subscription());
         }
         Subscription::batch(subs)
     }

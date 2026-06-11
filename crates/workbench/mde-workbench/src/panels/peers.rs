@@ -113,6 +113,11 @@ pub enum Message {
     },
     /// PD-7 — flip between the List and Map views.
     ToggleMap,
+    /// PD-3/Q10 — the 30 s directory-refresh tick (app-level,
+    /// view-gated). Re-reads the directory so presence/health/tags
+    /// stay live without an operator click; the reload preserves the
+    /// current filter + selection.
+    PollTick,
     /// PD-8 — the 2 s metrics tick (app-level, view-gated).
     MetricsTick,
     /// PD-8 — open the peer's full Netdata dashboard in the browser.
@@ -309,6 +314,16 @@ pub fn metrics_subscription() -> iced::Subscription<crate::Message> {
     iced::time::every(Duration::from_secs(2)).map(|_| crate::Message::Peers(Message::MetricsTick))
 }
 
+/// PD-3/Q10 — the view-gated 30 s directory-refresh tick (registered
+/// by `App::subscription` only while the Peers panel is the active
+/// view). Re-reads `action/mesh/directory` so presence/health/tags
+/// stay current without an operator click; the reload preserves the
+/// current filter + selection.
+#[must_use]
+pub fn directory_subscription() -> iced::Subscription<crate::Message> {
+    iced::time::every(Duration::from_secs(30)).map(|_| crate::Message::Peers(Message::PollTick))
+}
+
 /// PD-11 — poll the executor's result file via the verb, with a 2 s
 /// gap between attempts.
 fn poll_lifecycle_result(host: String, id: String, attempts_left: u8) -> Task<crate::Message> {
@@ -501,7 +516,10 @@ impl PeersPanel {
                 }
                 Task::none()
             }
-            Message::RefreshClicked => Self::load(),
+            // PD-3/Q10 — the manual button and the 30 s tick both
+            // re-read the directory; the Loaded handler keeps the
+            // operator's filter + selection across the swap.
+            Message::RefreshClicked | Message::PollTick => Self::load(),
             Message::Op(proto, host) => {
                 self.op_result = format!("launching {} → {host}…", proto.label());
                 let label = proto.label();
@@ -1315,6 +1333,25 @@ mod tests {
         assert_eq!(p.selected.as_deref(), Some("oak"));
         let _ = p.update(Message::FilterChanged("podman".into()));
         assert_eq!(p.filter, "podman");
+    }
+
+    #[test]
+    fn poll_reload_preserves_filter_and_selection_q10() {
+        // PD-3/Q10 — the 30 s tick (PollTick) re-reads the directory.
+        // The reload must NOT clobber the operator's current filter or
+        // selection, otherwise a background refresh would yank the UI.
+        let mut p = PeersPanel::new();
+        let _ = p.update(Message::Loaded(Ok(parse_directory(REPLY).unwrap())));
+        let _ = p.update(Message::Select("oak".into()));
+        let _ = p.update(Message::FilterChanged("podman".into()));
+        // A fresh directory arrives (what PollTick → load → Loaded does).
+        let _ = p.update(Message::Loaded(Ok(parse_directory(REPLY).unwrap())));
+        assert_eq!(
+            p.selected.as_deref(),
+            Some("oak"),
+            "selection survives reload"
+        );
+        assert_eq!(p.filter, "podman", "filter survives reload");
     }
 
     #[test]
