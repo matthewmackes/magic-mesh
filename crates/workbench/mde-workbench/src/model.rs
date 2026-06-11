@@ -213,14 +213,12 @@ pub fn nav_model() -> Vec<NavEntry> {
     vec![
         // ── Front Door ──────────────────────────────────────────────
         // PLANES-1 (W7) — the Peers directory, one component two doors
-        // (also surfaced as Controller/Inventory below). Mesh Map rides
-        // along as the live graph view.
+        // (also surfaced as Controller/Inventory below). The live map is
+        // the Peers panel's Map toggle (PD-7 peers_map), not a separate
+        // entry — the retired Mesh Topology panel's slot.
         NavEntry {
             group: Group::Peers,
-            panels: vec![
-                Panel::new("peers", "Peers"),
-                Panel::new("mesh_topology", "Mesh Map"),
-            ],
+            panels: vec![Panel::new("peers", "Peers")],
         },
         // ── Plane 1: This Node (the local box, W9/W17–W28) ──────────
         NavEntry {

@@ -46,7 +46,7 @@ use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
 
 use crate::model::Group;
 use crate::panels::mesh_services::MESH_UNITS;
-use crate::panels::mesh_topology::fetch_peers;
+use crate::panels::node_roster::fetch_peers;
 
 // ---------------------------------------------------------------------------
 // Capability types (OV-1)
@@ -1151,7 +1151,7 @@ fn build_peers_row(p: &ProbeOutcome) -> CapabilityRow {
         icon: Icon::Peer,
         status: p.status.clone(),
         sub_status: p.sub_status.clone(),
-        jump: Some((Group::Peers, "mesh_topology")),
+        jump: Some((Group::Peers, "peers")),
         launch: None,
     }
 }
@@ -2036,10 +2036,7 @@ mod tests {
             lookup(CapabilityId::Mesh),
             Some((Group::Controller, "mesh_control"))
         );
-        assert_eq!(
-            lookup(CapabilityId::Peers),
-            Some((Group::Peers, "mesh_topology"))
-        );
+        assert_eq!(lookup(CapabilityId::Peers), Some((Group::Peers, "peers")));
         assert_eq!(
             lookup(CapabilityId::Files),
             Some((Group::Network, "mesh_storage"))

@@ -31,8 +31,8 @@ use crate::panels::{
     mesh_control as mesh_control_panel, mesh_federation as mesh_federation_panel,
     mesh_history as mesh_history_panel, mesh_join as mesh_join_panel, mesh_logs as mesh_logs_panel,
     mesh_pending as mesh_pending_panel, mesh_services as mesh_services_panel,
-    mesh_storage as mesh_storage_panel, mesh_topology as mesh_topology_panel,
-    mirrors as mirrors_panel, mouse as mouse_panel, music as music_panel,
+    mesh_storage as mesh_storage_panel, mirrors as mirrors_panel, mouse as mouse_panel,
+    music as music_panel,
     network_hosts as network_hosts_panel, node_roles as node_roles_panel,
     notifications as notifications_panel, panel_apps as panel_apps_panel, peers as peers_panel,
     playbooks as playbooks_panel, policy as policy_panel, power as power_panel,
@@ -220,7 +220,6 @@ pub enum Message {
     MeshStorage(mesh_storage_panel::Message),
     /// MESH-PROBE-9.a — Network → Network Hosts panel sub-message.
     NetworkHosts(network_hosts_panel::Message),
-    MeshTopology(mesh_topology_panel::Message),
     PanelApps(panel_apps_panel::Message),
     RemoteDesktop(remote_desktop_panel::Message),
     /// PD-3 — the Peers directory (Front Door) sub-message.
@@ -327,7 +326,6 @@ pub struct App {
     /// MESH-PROBE-9.a — Network → Network Hosts panel state (the probe
     /// host/service inventory read off mesh-storage).
     network_hosts: network_hosts_panel::NetworkHostsPanel,
-    mesh_topology: mesh_topology_panel::MeshTopologyPanel,
     panel_apps: panel_apps_panel::PanelAppsPanel,
     remote_desktop: remote_desktop_panel::RemoteDesktopPanel,
     peers: peers_panel::PeersPanel,
@@ -445,7 +443,6 @@ impl App {
             service_publishing: service_publishing_panel::ServicePublishingPanel::new(),
             mesh_storage: mesh_storage_panel::MeshStoragePanel::new(),
             network_hosts: network_hosts_panel::NetworkHostsPanel::new(),
-            mesh_topology: mesh_topology_panel::MeshTopologyPanel::new(),
             panel_apps: panel_apps_panel::PanelAppsPanel::new(),
             remote_desktop: remote_desktop_panel::RemoteDesktopPanel::new(),
             peers: peers_panel::PeersPanel::new(),
@@ -934,7 +931,6 @@ impl App {
             Message::ServicePublishing(msg) => self.service_publishing.update(msg),
             Message::MeshStorage(msg) => self.mesh_storage.update(msg),
             Message::NetworkHosts(msg) => self.network_hosts.update(msg),
-            Message::MeshTopology(msg) => self.mesh_topology.update(msg),
             Message::PanelApps(msg) => self.panel_apps.update(msg),
             Message::RemoteDesktop(msg) => self.remote_desktop.update(msg),
             Message::Peers(msg) => self.peers.update(msg),
@@ -1046,8 +1042,6 @@ impl App {
             // MESH-PROBE-9.a — Network Hosts reads the merged probe
             // inventory off mesh-storage on first nav (read-only).
             (Group::Network, "network_hosts") => network_hosts_panel::NetworkHostsPanel::load(),
-            // PLANES-1 — Mesh Map rides the Peers Front Door plane.
-            (Group::Peers, "mesh_topology") => mesh_topology_panel::MeshTopologyPanel::load(),
             // PLANES-1 (W4) — Mesh Services folds into This Node/Health.
             (Group::ThisNode, "mesh_services") => mesh_services_panel::MeshServicesPanel::load(),
             // NF-13.8 (v2.5) — shell-out to
@@ -1494,11 +1488,6 @@ impl App {
                 group: Group::Network,
                 panel: "network_hosts",
             } => self.network_hosts.view(),
-            // PLANES-1 — Mesh Map rides the Peers Front Door plane.
-            View::Panel {
-                group: Group::Peers,
-                panel: "mesh_topology",
-            } => self.mesh_topology.view(),
             // v4.0.1 WB-2.j (2026-05-23) — Network → Mesh
             // Services renders systemctl status + start/stop/
             // restart for the mesh-fabric daemons. v2.5 NF-5.4
