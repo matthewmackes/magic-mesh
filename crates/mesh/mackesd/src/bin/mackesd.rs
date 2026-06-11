@@ -3447,16 +3447,17 @@ fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("opening store at {}", db_path.display()))?;
             mackesd_core::store::migrate(&conn).context("migrating store")?;
             let root = mackesd_core::default_qnm_shared_root();
-            let node_id = format!(
-                "peer:{}",
-                std::process::Command::new("hostname")
-                    .output()
-                    .ok()
-                    .and_then(|o| String::from_utf8(o.stdout).ok())
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "founder".to_string())
-            );
+            // Bed fix #10: use the SAME node-id resolution `serve` uses
+            // (MACKESD_NODE_ID → HOSTNAME → `hostname` → peer:unknown). The
+            // old code here shelled ONLY `hostname` (falling back to
+            // "founder") and ignored MACKESD_NODE_ID + the HOSTNAME env — so
+            // on a box where those disagree (a container with no `hostname`
+            // binary, or an operator-set MACKESD_NODE_ID), mesh-init wrote the
+            // founding bundle under one id while the next `serve`'s
+            // nebula-supervisor looked under a DIFFERENT id, never found it,
+            // and the founding lighthouse's overlay never came up. Caught by
+            // the OBS-1 container E2E.
+            let node_id = default_node_id();
             let report = mackesd_core::mesh_init::mesh_init(
                 &mackesd_core::ca::SubprocessBackend,
                 &conn,

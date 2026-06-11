@@ -183,15 +183,6 @@ dirs = "5"
 # stays reproducible across the workspace.
 signal-hook = { version = "0.4", features = ["iterator"] }
 
-# Phase 12.11.2 — testcontainers-based E2E integration suite. Gated
-# behind the `docker-tests` feature so `cargo test` stays Docker-free
-# on a fresh checkout. Pinned to 0.25 because the workspace's rust-
-# version (1.85) is below the 1.88 minimum of 0.27+. Used only by
-# `tests/integration_testcontainers.rs`. Cargo disallows optional
-# dev-dependencies, so it lives in [dependencies] under a feature
-# gate; the library/binary code never touches it.
-testcontainers = { version = "0.25", features = ["blocking"], optional = true }
-
 # --- v2.0.0 Phase A — async surface for in-process worker pool + DBus ---
 #
 # These three deps are gated behind the `async-services` feature so the
@@ -265,11 +256,13 @@ rcgen    = "0.13"
 # another crate to turn it on.
 default = ["async-services"]
 
-# Phase 12.11.2 — opt-in E2E suite that needs a running Docker daemon.
-# Run with `cargo test -p mackesd --features docker-tests`. Tests
-# self-skip when the daemon isn't reachable so they're safe to enable
-# in CI without forcing every developer to install Docker.
-docker-tests = ["dep:testcontainers"]
+# OBS-1 — opt-in E2E suite that drives real nebula-overlay containers via
+# `sudo podman` (see tests/integration_testcontainers.rs). Run with
+# `cargo test -p mackesd --features docker-tests -- --test-threads=1`. Tests
+# self-skip when root podman + /dev/net/tun aren't available, so the feature is
+# safe to enable without forcing every developer to have a root container
+# runtime. No extra crate dep — the suite shells podman directly.
+docker-tests = []
 
 # XOrg fork — compile mackesd with X11 session plumbing (i3 / xrandr).
 # Used by the `mde-xorg` RPM sub-package build.
