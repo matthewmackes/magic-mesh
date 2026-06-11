@@ -765,7 +765,8 @@ enum Cmd {
     /// the versioned builds present on LizardFS (W55). The Provisioning
     /// ▸ Images panel consumes the JSON. `--record --name --kind --version`
     /// registers a completed build's manifest (W55 — the write side a
-    /// build job calls when its output lands).
+    /// build job calls when its output lands). `--build --kind --name
+    /// --version` runs the actual build (W54) on this node then records it.
     Images {
         /// Emit the JSON array instead of the table.
         #[arg(long)]
@@ -773,6 +774,11 @@ enum Cmd {
         /// Record a completed build's manifest (with --name/--kind/--version).
         #[arg(long)]
         record: bool,
+        /// W54 — build the image now (with --kind/--name/--version), then
+        /// record its manifest. Runs the real per-kind tool; meant to run
+        /// as a job on an execution-tagged node.
+        #[arg(long)]
+        build: bool,
         /// Image name for --record.
         #[arg(long)]
         name: Option<String>,
@@ -4146,6 +4152,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Images {
             json,
             record,
+            build,
             name,
             kind,
             version,
@@ -4156,6 +4163,49 @@ fn main() -> anyhow::Result<()> {
             // versioned builds present on LizardFS (W53/W55).
             use mackesd_core::image_catalog::{self, ImageKind};
             let root = mackesd_core::default_qnm_shared_root();
+            // W54 — build the artifact now (then record it). Runs the real
+            // per-kind tool; gated to execution-tagged nodes when launched
+            // via the jobs engine.
+            if build {
+                let (Some(name), Some(kind_s), Some(version)) =
+                    (name.clone(), kind.clone(), version.clone())
+                else {
+                    eprintln!("mackesd images --build requires --name, --kind, and --version");
+                    std::process::exit(1);
+                };
+                let Some(image_kind) = ImageKind::parse(&kind_s) else {
+                    eprintln!(
+                        "mackesd images --build: unknown kind '{kind_s}' (iso|vm|container|usb)"
+                    );
+                    std::process::exit(1);
+                };
+                use mackesd_core::image_build::{
+                    build_image, now_ms, BuildInputs, SubprocessBuild,
+                };
+                let runner = SubprocessBuild::new(BuildInputs::default());
+                match build_image(
+                    &runner,
+                    &root,
+                    image_kind,
+                    &name,
+                    &version,
+                    profile.clone(),
+                    now_ms(),
+                ) {
+                    Ok(m) => println!(
+                        "built {} {} v{} ({} bytes) — manifest recorded",
+                        m.kind,
+                        m.name,
+                        m.version,
+                        m.size_bytes.unwrap_or(0)
+                    ),
+                    Err(e) => {
+                        eprintln!("mackesd images --build: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                return Ok(());
+            }
             // W55 — register a completed build's manifest.
             if record {
                 let (Some(name), Some(kind), Some(version)) = (name, kind, version) else {
