@@ -41,12 +41,17 @@ pub struct ImagesPanel {
     pub busy: bool,
     pub last_run_at: Option<SystemTime>,
     pub error: Option<String>,
+    /// W54 — last build-launch outcome line.
+    pub build_msg: String,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Loaded(Result<Vec<ImageKindRow>, String>),
     RefreshClicked,
+    /// W54 — launch a build of `kind` as a job on an execution-tagged node.
+    BuildClicked(String),
+    BuildLaunched(String),
 }
 
 impl ImagesPanel {
@@ -80,6 +85,56 @@ impl ImagesPanel {
             Message::RefreshClicked => {
                 self.busy = true;
                 Self::load()
+            }
+            Message::BuildClicked(kind) => {
+                // W54 — launch the build playbook as a job on the
+                // execution-tagged nodes; the target node runs `mackesd
+                // images --build` (which records the manifest on success).
+                self.build_msg = format!("launching {kind} build job…");
+                let body = serde_json::json!({
+                    "playbook": "playbooks/build-image.yml",
+                    "targets": { "tags": ["execution"] },
+                    "vars": {
+                        "image_kind": kind,
+                        "image_name": format!("magic-{kind}"),
+                        "image_version": "dev",
+                    },
+                })
+                .to_string();
+                Task::perform(
+                    async move {
+                        let reply = tokio::task::spawn_blocking(move || {
+                            crate::dbus::action_request_with_body(
+                                "action/jobs/launch",
+                                Some(&body),
+                                std::time::Duration::from_secs(3),
+                            )
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+                        match reply
+                            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                        {
+                            Some(v) if v["ok"] == true => {
+                                let n = v["targets"].as_array().map_or(0, Vec::len);
+                                format!("build job launched on {n} execution node(s) — Refresh for the build")
+                            }
+                            Some(v) => {
+                                format!(
+                                    "build launch failed: {}",
+                                    v["error"].as_str().unwrap_or("unknown")
+                                )
+                            }
+                            None => "build launch failed: mackesd not answering on the Bus".into(),
+                        }
+                    },
+                    |msg| crate::Message::Images(Message::BuildLaunched(msg)),
+                )
+            }
+            Message::BuildLaunched(msg) => {
+                self.build_msg = msg;
+                Task::none()
             }
         }
     }
@@ -151,10 +206,21 @@ impl ImagesPanel {
             rows_col = rows_col.push(empty_state_card(palette, self.error.as_deref()));
         }
 
+        let build_line: Element<'_, crate::Message> = if self.build_msg.is_empty() {
+            Space::new().height(Length::Fixed(0.0)).into()
+        } else {
+            text(self.build_msg.clone())
+                .size(12)
+                .color(palette.text_muted.into_iced_color())
+                .into()
+        };
+
         container(
             column![
                 header,
-                Space::new().height(Length::Fixed(20.0)),
+                Space::new().height(Length::Fixed(8.0)),
+                build_line,
+                Space::new().height(Length::Fixed(12.0)),
                 scrollable(rows_col).height(Length::Fill),
             ]
             .spacing(2),
@@ -202,6 +268,15 @@ fn kind_row<'a>(r: &'a ImageKindRow, palette: Palette) -> Element<'a, crate::Mes
         text(format!("{} build(s)", r.builds.len()))
             .size(11)
             .color(count_color),
+        // W54 — launch a build of this kind as a job on execution nodes.
+        crate::controls::variant_button(
+            "Build",
+            crate::controls::ButtonVariant::Secondary,
+            Some(crate::Message::Images(Message::BuildClicked(
+                r.kind.clone()
+            ))),
+            palette,
+        ),
     ]
     .spacing(8)
     .align_y(iced::alignment::Vertical::Center);

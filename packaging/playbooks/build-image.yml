@@ -1,0 +1,32 @@
+# PLANES-22 (W54) — the image-build job, launched via the jobs engine.
+#
+# `action/jobs/launch` runs this playbook on an execution-tagged node with
+# vars {image_kind, image_name, image_version[, image_profile]}. The node
+# runs `mackesd images --build`, which produces the artifact under the
+# LizardFS image catalog's versioned dir and records its manifest (W55),
+# so the Images panel picks it up everywhere.
+#
+# Shipped in the RPM under the playbooks dir; the Images panel's "Build"
+# button targets the `execution` capability tag.
+- name: Build a Magic Mesh image
+  hosts: all
+  become: true
+  tasks:
+    - name: Run the per-kind image build (records its manifest on success)
+      ansible.builtin.command:
+        argv:
+          - mackesd
+          - images
+          - --build
+          - --kind
+          - "{{ image_kind }}"
+          - --name
+          - "{{ image_name }}"
+          - --version
+          - "{{ image_version }}"
+      register: mde_build
+      changed_when: true
+
+    - name: Report the build outcome
+      ansible.builtin.debug:
+        var: mde_build.stdout_lines
