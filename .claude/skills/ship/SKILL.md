@@ -62,10 +62,12 @@ For each open `[ ]` task, highest priority first:
      metric change)
    - `cargo clippy --all-targets` · `cargo fmt --all`
    - `./install-helpers/lint-mesh-boundary.sh` (the mesh/desktop boundary gate)
-   - **Visual tasks (iced/Cosmic GUIs):** confirm the render, don't trust a green
-     `cargo test`. Launch the actual app (`cargo run -p mde-files` / `mde-workbench`
-     / etc.) and inspect against the IBM-Carbon reference (Gray 10 / 90 / 100 — Gray
-     100 is the default dark). See `/preview`.
+   - **Visual tasks (iced/Cosmic GUIs):** the operator/on-session visual-confirmation
+     gate is **lifted (2026-06-11, operator directive)** — see §7. A GUI change is done
+     when it builds, tests green, and renders through the `mde-theme` Carbon tokens (§4,
+     still enforced: no raw hex / scattered metrics). `/preview` is optional/best-effort,
+     never a blocker; do **not** hold a feature `[>]` solely for an on-Cosmic visual
+     check.
    - Note: a full build needs the system dev libs (`sudo dnf install -y gtk3-devel
      alsa-lib-devel`) — the audio chain links ALSA. No crates are excluded; all 20
      workspace members build. `.cargo/config.toml` sets `CMAKE_POLICY_VERSION_MINIMUM=3.5`

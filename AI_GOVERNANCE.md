@@ -87,7 +87,16 @@ crates.
 A change is done only when it is **runtime-reachable and observably works** — no
 `todo!()`/`unimplemented!()`, no stub match arms, no `pub mod` with zero external
 refs, no mockups/`demo_data` passing as features. Builds clean, tests green, clippy
-+ fmt clean; visual changes confirmed against the Carbon reference, not eyeballed.
++ fmt clean.
+
+**Visual-confirmation gate lifted (2026-06-11, operator directive).** Render
+correctness now rests on the `mde-theme` Carbon tokens (§4 — still enforced: no raw
+hex / scattered metric literals) plus palette/component tests and render-agnostic
+logic. Operator or on-session (`/preview`) visual confirmation is **no longer a
+condition of Done** — a GUI change that builds, tests green, and renders through the
+Carbon tokens is §7-complete. A `/preview` check remains available but is
+optional/best-effort, never a blocker (it stays hardware-gated and so cannot hold a
+feature on a headless host).
 
 ## §8 — Positioning & trust envelope (2026-06-09, enterprise-readiness verification)
 

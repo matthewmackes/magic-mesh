@@ -41,10 +41,10 @@ repo).
    --all-targets` and `cargo fmt --all --check` clean (run from the repo root).
 5. **Boundary gate.** `./install-helpers/lint-mesh-boundary.sh` clean — no mesh-side
    crate depends on a deleted desktop-shell crate (§6).
-6. **Visual verification.** For any shipped iced/Cosmic GUI, confirm the render
-   against the Carbon reference (see `/preview`) — launch the app binary
-   (`cargo run -p mde-workbench` / `mde-files` / etc.) and inspect; don't trust a
-   green `cargo test`.
+6. **Visual verification — gate lifted (2026-06-11, operator directive).** A shipped
+   iced/Cosmic GUI no longer needs operator/on-session (`/preview`) visual confirmation
+   to release; render correctness rests on the `mde-theme` Carbon tokens (§4) + tests
+   (§7). `/preview` stays available but is optional/best-effort and never holds the cut.
 
 ## Steps
 
