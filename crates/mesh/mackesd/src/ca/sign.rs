@@ -109,6 +109,18 @@ pub fn sign_peer_cert<B: NebulaCertBackend + ?Sized>(
         PeerRole::Peer => &["role:peer"],
     };
 
+    // Bed fix #7/#9: nebula-cert hard-refuses to overwrite an existing
+    // cert ("refusing to overwrite existing cert: <crt_out>"), so a stale
+    // file from a prior sign at this same output path wedges the re-sign.
+    // Clearing here — the single point every signer funnels through —
+    // makes BOTH the peer-enroll path (sign_pending_csr) and the
+    // founding-lighthouse self-sign (mesh_init, which re-runs onto
+    // scratch/self.crt) idempotent. These outputs are an ephemeral
+    // hand-off buffer (read straight into the bundle below), so removing a
+    // leftover is always safe. Ignore NotFound.
+    let _ = std::fs::remove_file(crt_out);
+    let _ = std::fs::remove_file(key_out);
+
     backend.sign_peer(
         ca_crt_path,
         ca_key_path,
@@ -297,6 +309,67 @@ mod tests {
         let key = tmp.path().join("ca.key");
         mint::mint_ca(&MockBackend, conn, "m1", Some(&crt), Some(&key)).expect("mint");
         tmp
+    }
+
+    /// Backend that models real nebula-cert's refusal to overwrite an
+    /// existing cert file (MockBackend `fs::write`s unconditionally and so
+    /// can't reproduce it). Used to lock bed fix #7/#9: sign_peer_cert must
+    /// clear a stale output before signing, for EVERY caller — the peer
+    /// enroll path and the mesh-init self-sign alike.
+    struct RefuseOverwriteBackend;
+    impl crate::ca::NebulaCertBackend for RefuseOverwriteBackend {
+        fn mint_ca(&self, m: &str, c: &Path, k: &Path) -> Result<(), CaError> {
+            MockBackend.mint_ca(m, c, k)
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn sign_peer(
+            &self,
+            ca_crt: &Path,
+            ca_key: &Path,
+            node_id: &str,
+            overlay_ip: &str,
+            cidr: u8,
+            groups: &[&str],
+            crt_out: &Path,
+            key_out: &Path,
+        ) -> Result<(), CaError> {
+            if crt_out.exists() {
+                return Err(CaError::Io(format!(
+                    "refusing to overwrite existing cert: {}",
+                    crt_out.display()
+                )));
+            }
+            MockBackend.sign_peer(
+                ca_crt, ca_key, node_id, overlay_ip, cidr, groups, crt_out, key_out,
+            )
+        }
+    }
+
+    #[test]
+    fn sign_peer_cert_clears_stale_output_before_signing() {
+        // Bed fix #9 (and #7): a leftover cert at the output path — e.g.
+        // mesh-init re-running onto scratch/self.crt — must not wedge the
+        // sign. RefuseOverwriteBackend models nebula-cert's refusal; seed a
+        // stale file and assert sign_peer_cert still succeeds.
+        let conn = fresh_conn();
+        let tmp = mint_one(&conn);
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let crt_out = scratch.join("self.crt");
+        let key_out = scratch.join("self.key");
+        std::fs::write(&crt_out, b"STALE SELF CERT").unwrap();
+        sign_peer_cert(
+            &RefuseOverwriteBackend,
+            &conn,
+            "m1",
+            "peer:self",
+            PeerRole::Host,
+            &tmp.path().join("ca.crt"),
+            &tmp.path().join("ca.key"),
+            &crt_out,
+            &key_out,
+        )
+        .expect("re-sign onto a stale output must succeed");
     }
 
     #[test]

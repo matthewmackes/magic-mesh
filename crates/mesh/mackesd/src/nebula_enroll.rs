@@ -685,16 +685,10 @@ pub fn sign_pending_csr<B: crate::ca::NebulaCertBackend + ?Sized>(
     })?;
     let crt_out = paths.scratch_dir.join(format!("{}.crt", csr.node_id));
     let key_out = paths.scratch_dir.join(format!("{}.key", csr.node_id));
-    // Bed fix #7: clear any stale scratch cert/key from a PRIOR sign of
-    // this same node before re-signing. nebula-cert hard-refuses to
-    // overwrite an existing cert ("refusing to overwrite existing cert:
-    // .../scratch/<node>.crt"), so without this a re-enroll (or any second
-    // sign — operator re-issue, CA rotation, the auto-signer retrying)
-    // fails permanently. These files are an ephemeral hand-off buffer:
-    // they're read straight into the bundle below and never consulted
-    // again, so removing a leftover is always safe. Ignore NotFound.
-    let _ = std::fs::remove_file(&crt_out);
-    let _ = std::fs::remove_file(&key_out);
+    // Bed fix #7: a stale scratch cert from a PRIOR sign of this node would
+    // make nebula-cert refuse to overwrite. That clearing now lives inside
+    // sign_peer_cert (the single signer funnel — covers this path AND the
+    // mesh-init self-sign), so no removal is needed here.
     let signed = crate::ca::sign::sign_peer_cert(
         backend,
         conn,
