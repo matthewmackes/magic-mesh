@@ -136,18 +136,29 @@ impl SystemUpdatePanel {
         let check_btn = variant_button(
             "Check for updates",
             ButtonVariant::Ghost,
-            (!self.busy).then(|| crate::Message::SystemUpdate(Message::CheckClicked)),
+            (!self.busy).then_some(crate::Message::SystemUpdate(Message::CheckClicked)),
             palette,
         );
         let install_btn = variant_button(
             "Install all updates",
             ButtonVariant::Primary,
-            (!self.busy).then(|| crate::Message::SystemUpdate(Message::InstallClicked)),
+            (!self.busy).then_some(crate::Message::SystemUpdate(Message::InstallClicked)),
             palette,
         );
 
+        // PLANES-2 — System Update is the Fedora (dnf) surface.
+        let fedora = crate::panel_chrome::hero_band(
+            mde_theme::hero::Hero::Fedora,
+            crate::panel_chrome::pkg_version_cached("fedora-release").as_deref(),
+            palette,
+        );
         column![
-            text("System Update").size(20),
+            row![
+                text("System Update").size(20),
+                iced::widget::Space::new().width(Length::Fill),
+                fedora,
+            ]
+            .align_y(iced::Alignment::Center),
             text(
                 "Install the latest fixes and updates for your machine. \
                  This may take a few minutes."
