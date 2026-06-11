@@ -469,9 +469,17 @@ fn render_config_yaml_inner(
     // inherits the same block from this renderer. Guest VM configs
     // (VIRT-6 render_guest_config_yaml) pass include_vm_route=false
     // since a leaf node must not route the VM subnet to itself.
+    // The overlay interface MUST be named `nebula1` — mackesd's workers
+    // and the per-service overlay bindings resolve the interface by that
+    // name (compute_provision::DEFAULT_NEBULA_INTERFACE). Without an
+    // explicit `tun.dev`, nebula auto-names it `tun0` and every
+    // overlay-bound lookup fails ("Failed to resolve interface nebula1").
+    // The `tun:` block is therefore ALWAYS emitted (was: only when an
+    // unsafe_route existed). Found bringing up the local VM bed 2026-06-10.
+    out.push_str("\ntun:\n");
+    out.push_str("  dev: nebula1\n");
     if include_vm_route || !extra_routes.is_empty() {
-        out.push_str("\n# VM subnet routing (VIRT-4.a) + hop/exit routes (PLANES-17):\n");
-        out.push_str("tun:\n");
+        // VM subnet routing (VIRT-4.a) + hop/exit routes (PLANES-17):
         out.push_str("  unsafe_routes:\n");
         if include_vm_route {
             out.push_str(&format!("    - route: {VM_SUBNET_CIDR}\n"));
@@ -715,6 +723,20 @@ mod tests {
     }
 
     // VIRT-4.a (v5.0.0) — VM subnet `unsafe_routes` announcement.
+
+    #[test]
+    fn every_config_names_the_tun_device_nebula1() {
+        // The overlay interface must be `nebula1`, else mackesd's
+        // overlay-bound lookups fail (it auto-named `tun0` without this).
+        // Found on the VM bed 2026-06-10.
+        for role in [ConfigRole::Peer, ConfigRole::Host] {
+            let yaml = render_config_yaml(&sample_bundle(), role);
+            assert!(
+                yaml.contains("tun:") && yaml.contains("dev: nebula1"),
+                "config for {role:?} must name the tun device nebula1:\n{yaml}"
+            );
+        }
+    }
 
     #[test]
     fn render_peer_config_includes_vm_subnet_unsafe_route() {
