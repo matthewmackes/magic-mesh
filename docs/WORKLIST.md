@@ -301,7 +301,7 @@ host-local Ansible apply.
 
 ### Fleet
 
-- [>] **PLANES-20: Fleet rollup dashboard** — groups by role + tag, cards = members online / worst health / drift (W86), live map centerpiece, drill-down selects into Peers (W81/W87); `mackesd fleet status` CLI parity. Absorbs **OBS-6** + **ENT-8**.
+- [>] **PLANES-20: Fleet rollup dashboard** — groups by role + tag, cards = members online / worst health / drift (W86), live map centerpiece, drill-down selects into Peers (W81/W87); `mackesd fleet status` CLI parity. Absorbs **OBS-6** + **ENT-8**. Role-grouped cards over `fleet-status --json` (W86) + CLI parity landed. **W87 DRILL-DOWN LANDED 2026-06-11 (`f24cb78`):** each card's "View peers ›" opens the Peers Front Door pre-filtered to the role (`Message::DrillToPeers`); app-tested. REMAINING: the live-map centerpiece (W81 — embed peers_map) + on-Cosmic /preview.
 
 ### Provisioning (after PKG core, W64)
 
