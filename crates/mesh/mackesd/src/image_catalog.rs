@@ -131,6 +131,93 @@ pub fn load_manifests(workgroup_root: &Path) -> Vec<ImageManifest> {
     out
 }
 
+// ─────────────────────────────────────────────────────────────────
+// W55 — register a completed build. A build job (W54) calls
+// record_manifest when its output lands, writing the versioned-dir TOML
+// that load_manifests + the Images panel then surface. LizardFS
+// replicates it so the whole fleet sees the new build.
+// ─────────────────────────────────────────────────────────────────
+
+/// Why recording a manifest was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestWriteError {
+    /// `name` was empty or not a path-safe `[a-z0-9._-]+` token.
+    BadName(String),
+    /// `version` was empty or not a path-safe `[a-z0-9._-]+` token.
+    BadVersion(String),
+    /// `kind` is not one of the four [`ImageKind`] tokens.
+    BadKind(String),
+    /// TOML serialization failed (practically never).
+    Serialize(String),
+    /// Filesystem write failed.
+    Io(String),
+}
+
+impl std::fmt::Display for ManifestWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadName(n) => write!(f, "invalid image name '{n}' (need a [a-z0-9._-]+ token)"),
+            Self::BadVersion(v) => write!(f, "invalid version '{v}' (need a [a-z0-9._-]+ token)"),
+            Self::BadKind(k) => {
+                write!(f, "invalid kind '{k}' (expected iso|vm|container|usb)")
+            }
+            Self::Serialize(e) => write!(f, "serialize manifest: {e}"),
+            Self::Io(e) => write!(f, "write manifest: {e}"),
+        }
+    }
+}
+impl std::error::Error for ManifestWriteError {}
+
+/// A name/version is a path-safe token — each becomes a directory level.
+fn is_path_safe(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-' || c == '_'
+        })
+}
+
+/// Validate a manifest's kind + name + version (the build job's inputs)
+/// without writing it.
+///
+/// # Errors
+/// [`ManifestWriteError`] naming the offending field.
+pub fn validate_manifest(m: &ImageManifest) -> Result<(), ManifestWriteError> {
+    if !is_path_safe(&m.name) {
+        return Err(ManifestWriteError::BadName(m.name.clone()));
+    }
+    if !is_path_safe(&m.version) {
+        return Err(ManifestWriteError::BadVersion(m.version.clone()));
+    }
+    if ImageKind::parse(&m.kind).is_none() {
+        return Err(ManifestWriteError::BadKind(m.kind.clone()));
+    }
+    Ok(())
+}
+
+/// Write `manifest` to `<root>/images/<name>/<version>/manifest.toml`
+/// after validating it, overwriting an existing manifest at that version.
+/// Returns the path written.
+///
+/// # Errors
+/// [`ManifestWriteError`] on validation, serialization, or IO failure.
+pub fn record_manifest(
+    manifest: &ImageManifest,
+    workgroup_root: &Path,
+) -> Result<PathBuf, ManifestWriteError> {
+    validate_manifest(manifest)?;
+    let dir = images_dir(workgroup_root)
+        .join(&manifest.name)
+        .join(&manifest.version);
+    std::fs::create_dir_all(&dir).map_err(|e| ManifestWriteError::Io(e.to_string()))?;
+    let body = toml::to_string_pretty(manifest)
+        .map_err(|e| ManifestWriteError::Serialize(e.to_string()))?;
+    let path = dir.join("manifest.toml");
+    std::fs::write(&path, body).map_err(|e| ManifestWriteError::Io(e.to_string()))?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +259,68 @@ mod tests {
     fn load_manifests_empty_when_dir_absent() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(load_manifests(tmp.path()).is_empty());
+    }
+
+    // ---- W55 record_manifest ------------------------------------
+
+    fn sample(name: &str, kind: &str, ver: &str) -> ImageManifest {
+        ImageManifest {
+            name: name.into(),
+            kind: kind.into(),
+            version: ver.into(),
+            built_at_ms: Some(1_700_000_000_000),
+            size_bytes: Some(4096),
+            profile: Some("workstation".into()),
+        }
+    }
+
+    #[test]
+    fn record_manifest_round_trips_through_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = sample("cosmic-iso", "iso", "3.0");
+        let path = record_manifest(&m, tmp.path()).expect("record");
+        assert_eq!(
+            path,
+            images_dir(tmp.path())
+                .join("cosmic-iso")
+                .join("3.0")
+                .join("manifest.toml")
+        );
+        let loaded = load_manifests(tmp.path());
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0], m);
+    }
+
+    #[test]
+    fn record_manifest_overwrites_same_version_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        record_manifest(&sample("vmgold", "vm", "1.0"), tmp.path()).unwrap();
+        let mut m2 = sample("vmgold", "vm", "1.0");
+        m2.size_bytes = Some(9999);
+        record_manifest(&m2, tmp.path()).unwrap();
+        let loaded = load_manifests(tmp.path());
+        assert_eq!(loaded.len(), 1, "same version → overwrite, not duplicate");
+        assert_eq!(loaded[0].size_bytes, Some(9999));
+    }
+
+    #[test]
+    fn record_manifest_rejects_bad_kind_name_and_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            record_manifest(&sample("x", "floppy", "1.0"), tmp.path()),
+            Err(ManifestWriteError::BadKind(_))
+        ));
+        assert!(matches!(
+            record_manifest(&sample("../escape", "iso", "1.0"), tmp.path()),
+            Err(ManifestWriteError::BadName(_))
+        ));
+        assert!(matches!(
+            record_manifest(&sample("ok", "iso", ".."), tmp.path()),
+            Err(ManifestWriteError::BadVersion(_))
+        ));
+        assert!(
+            load_manifests(tmp.path()).is_empty(),
+            "no reject wrote a file"
+        );
     }
 }

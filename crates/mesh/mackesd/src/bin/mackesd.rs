@@ -763,11 +763,31 @@ enum Cmd {
     /// PLANES-22 — the image catalog. `mded images --json` emits the
     /// four buildable kinds (ISO / VM / container / USB, W53) each with
     /// the versioned builds present on LizardFS (W55). The Provisioning
-    /// ▸ Images panel consumes the JSON.
+    /// ▸ Images panel consumes the JSON. `--record --name --kind --version`
+    /// registers a completed build's manifest (W55 — the write side a
+    /// build job calls when its output lands).
     Images {
         /// Emit the JSON array instead of the table.
         #[arg(long)]
         json: bool,
+        /// Record a completed build's manifest (with --name/--kind/--version).
+        #[arg(long)]
+        record: bool,
+        /// Image name for --record.
+        #[arg(long)]
+        name: Option<String>,
+        /// Image kind for --record (iso|vm|container|usb).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Version for --record.
+        #[arg(long)]
+        version: Option<String>,
+        /// Output size in bytes for --record.
+        #[arg(long)]
+        size_bytes: Option<u64>,
+        /// Install profile baked into the image, for --record.
+        #[arg(long)]
+        profile: Option<String>,
     },
 
     /// CB-1.5.a — fleet node roster. `mded nodes list --json` emits
@@ -4126,11 +4146,51 @@ fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        Cmd::Images { json } => {
+        Cmd::Images {
+            json,
+            record,
+            name,
+            kind,
+            version,
+            size_bytes,
+            profile,
+        } => {
             // PLANES-22 — the four buildable kinds, each with its
             // versioned builds present on LizardFS (W53/W55).
             use mackesd_core::image_catalog::{self, ImageKind};
             let root = mackesd_core::default_qnm_shared_root();
+            // W55 — register a completed build's manifest.
+            if record {
+                let (Some(name), Some(kind), Some(version)) = (name, kind, version) else {
+                    eprintln!("mackesd images --record requires --name, --kind, and --version");
+                    std::process::exit(1);
+                };
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64);
+                let manifest = image_catalog::ImageManifest {
+                    name,
+                    kind,
+                    version,
+                    built_at_ms: Some(now_ms),
+                    size_bytes,
+                    profile,
+                };
+                match image_catalog::record_manifest(&manifest, &root) {
+                    Ok(p) => println!(
+                        "recorded {} {} v{} → {}",
+                        manifest.kind,
+                        manifest.name,
+                        manifest.version,
+                        p.display()
+                    ),
+                    Err(e) => {
+                        eprintln!("mackesd images: record failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                return Ok(());
+            }
             let manifests = image_catalog::load_manifests(&root);
             let rows: Vec<serde_json::Value> = ImageKind::all()
                 .iter()
