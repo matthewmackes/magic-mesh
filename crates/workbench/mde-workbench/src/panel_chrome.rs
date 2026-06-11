@@ -521,6 +521,43 @@ pub fn tooltip<'a, Message: 'a>(body: impl Into<String>, palette: Palette) -> El
     .into()
 }
 
+/// PLANES-2 (H3/H4/H8/H10) — the primary-service **hero band**: a
+/// service's monochrome line-art (tinted with the single `HERO_STROKE`
+/// Carbon token, §4 — H6/H7) at 112 px, captioned with the service NAME
+/// (H8) and a live version, or an honest "not installed" when the
+/// service is absent (the art always renders — H10). A primary-service
+/// panel drops this into its header, aligned right (H3/H4).
+pub fn hero_band<'a, Message: 'a>(
+    hero: mde_theme::hero::Hero,
+    version: Option<&str>,
+    palette: Palette,
+) -> Element<'a, Message> {
+    let art = iced::widget::svg(iced::widget::svg::Handle::from_memory(hero.svg_bytes()))
+        .width(Length::Fixed(112.0))
+        .height(Length::Fixed(112.0))
+        .style(
+            |_t: &iced::Theme, _s: iced::widget::svg::Status| iced::widget::svg::Style {
+                color: Some(mde_theme::hero::HERO_STROKE.into_iced_color()),
+            },
+        );
+    let caption = match version {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => "not installed".to_string(),
+    };
+    column![
+        art,
+        text(hero.name())
+            .size(13)
+            .color(palette.text.into_iced_color()),
+        text(caption)
+            .size(11)
+            .color(palette.text_muted.into_iced_color()),
+    ]
+    .spacing(2)
+    .align_x(alignment::Horizontal::Center)
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

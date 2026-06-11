@@ -18,8 +18,9 @@ use iced::{Element, Length, Task};
 use serde::Deserialize;
 
 use crate::controls::{variant_button, ButtonVariant};
-use crate::panel_chrome::{panel_container, status_badge, BadgeSeverity};
+use crate::panel_chrome::{hero_band, panel_container, status_badge, BadgeSeverity};
 use crate::panels::fleet_settings::run_mackesd;
+use mde_theme::hero::Hero;
 
 /// Minimal revision projection (the store's Revision, spec ignored).
 #[derive(Debug, Clone, Deserialize)]
@@ -129,6 +130,9 @@ pub struct ConfigState {
     pub repo_source: String,
     /// W22 — this host's most recent apply (the "last Ansible log").
     pub last_apply: Option<ApplyLogEntry>,
+    /// PLANES-2 / H8 — installed Ansible version for the hero caption
+    /// (`None` ⇒ the hero shows "not installed", H10).
+    pub ansible_version: Option<String>,
     pub hostname: String,
 }
 
@@ -213,6 +217,24 @@ fn repo_source() -> String {
         .unwrap_or_else(|| "unknown (not from a configured repo)".into())
 }
 
+/// PLANES-2 / H8 — the installed Ansible version (the first line of
+/// `ansible --version`, e.g. "ansible [core 2.16.3]"), or `None` when
+/// Ansible isn't installed — so the hero band shows an honest state.
+fn ansible_version() -> Option<String> {
+    let out = std::process::Command::new("ansible")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    String::from_utf8(out.stdout)
+        .ok()?
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// W22 — the last `n` lines of a log blob (oldest→newest), so a long
 /// apply detail renders as a readable tail rather than a wall of text.
 #[must_use]
@@ -242,6 +264,7 @@ impl ConfigApplyPanel {
                     rpm_version: rpm_version(),
                     repo_source: repo_source(),
                     last_apply: last_apply(&root, &host),
+                    ansible_version: ansible_version(),
                     hostname: host,
                 })
             },
@@ -375,7 +398,17 @@ impl ConfigApplyPanel {
             }
         }
 
-        panel_container(rows.width(Length::Fill).into(), density)
+        // PLANES-2 — fleet config is applied via Ansible, so the panel
+        // carries the Ansible hero band (right), captioned with the live
+        // version (H8) or "not installed" (H10).
+        let palette = crate::live_theme::palette();
+        let hero = hero_band(Hero::Ansible, s.ansible_version.as_deref(), palette);
+        let body = row![
+            rows.width(Length::Fill),
+            iced::widget::Space::new().width(Length::Fixed(16.0)),
+            hero,
+        ];
+        panel_container(body.into(), density)
     }
 }
 
