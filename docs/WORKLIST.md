@@ -141,6 +141,7 @@ host-local Ansible apply.
 - [→] **OBS-6: Mesh Health Workbench panel** — **RE-HOMED → PLANES-20** (W96, planes re-IA); spec text lives in the PLANES task + `docs/design/planes.md`.
 - [✓] **OBS-7: upgrade-transition alerts** — `alert_relay` emits each upgrade-state transition as a desktop alert (Q97).
 - [✓] **OBS-8: alerts via the cosmic-applet** — deliver through the mde-bus → cosmic-applet FDO Notifications path instead of `notify-send` (Q100).
+- [✓] **OBS-9: mde-kdc-host RSA-4096 keygen tests appeared to hang the workspace gate** — ROOT-CAUSED + FIXED 2026-06-11. `keygen::generate_pkcs8` (RSA-4096, the locked Q23 identity) runs through the pure-Rust `rsa` + `num-bigint-dig` crates; **unoptimized in a debug build, a single keygen takes minutes**, so `keygen::tests::generate_pkcs8_returns_loadable_keypair` and `first_pair::tests::first_pair_captures_…` (which keygens in `spawn_device`) blew past any reasonable timeout and stalled `cargo test --workspace`. NOT a deadlock — the same keygen test passes in **3.84 s** under the release profile. Fix: `[profile.dev.package.rsa]` + `[profile.dev.package.num-bigint-dig]` `opt-level = 3` in the root `Cargo.toml` — debug keygen drops from >120 s to ~4 s, RSA-4096 unchanged, rest of the workspace still compiles fast. (A misdiagnosed `#[ignore]` was added then removed.)
 
 ## PEERS — Directory of Mesh Peers, the platform Front Door (design: `docs/design/peer-directory.md`, 2026-06-09)
 

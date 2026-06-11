@@ -68,3 +68,17 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
+
+# Optimize the pure-Rust RSA stack even in dev/test builds. mde-kdc-host's
+# RSA-4096 keygen (E11.8 max-crypto, locked at Q23) runs through the `rsa`
+# crate + `num-bigint-dig`; unoptimized those make a single keygen take
+# minutes in a debug build, which made the keygen + first_pair tests appear to
+# hang and could stall `cargo test --workspace` indefinitely. opt-level=3 on
+# just these two crates drops a keygen from >120 s to ~4 s while leaving the
+# rest of the workspace fast to compile. Verified: the same test passes in
+# 3.84 s under the release profile.
+[profile.dev.package.rsa]
+opt-level = 3
+
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
