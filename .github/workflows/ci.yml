@@ -94,6 +94,56 @@ jobs:
       # which is a richer judgement than a blunt grep can make in CI without
       # false-positiving on tests, parse-examples, and computed grays.
 
+  screenshots:
+    name: preview gallery (visual artifact)
+    runs-on: ubuntu-latest
+    # OBS-4 (Q92) — a scripted /preview capture of the Workbench surfaces,
+    # uploaded as a build artifact for human visual review. Advisory: the
+    # on-session visual-confirmation gate is lifted (2026-06-11), and a flaky
+    # headless render must never red master — the job RUNS, captures whatever
+    # it can, and always uploads. `continue-on-error` keeps a capture miss
+    # off the required-checks path.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
+
+      # The iced GUI links GTK; the vendored Opus build needs CMake. sway
+      # (headless wlroots) + grim (wlr-screencopy) drive the capture; the
+      # software-render path needs no GPU.
+      - name: System dev libraries + headless capture stack
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libgtk-3-dev cmake pkg-config sway grim
+
+      - name: Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the Workbench
+        run: cargo build -p mde-workbench --locked
+
+      - name: Capture the preview gallery
+        run: ./install-helpers/preview-gallery.sh "$GITHUB_WORKSPACE/preview-gallery"
+
+      - name: Upload the gallery artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workbench-preview-gallery
+          path: preview-gallery/
+          if-no-files-found: warn
+
   coverage:
     name: coverage floor (80%)
     runs-on: ubuntu-latest
