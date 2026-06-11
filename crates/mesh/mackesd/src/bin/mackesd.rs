@@ -2950,30 +2950,51 @@ fn main() -> anyhow::Result<()> {
                     if let Some(p) = scratch_dir {
                         paths.scratch_dir = p;
                     }
-                    let lh_addr = lighthouse_addr.unwrap_or_else(|| {
-                        let host = std::fs::read_to_string("/etc/hostname")
-                            .ok()
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or_else(|| default_node_id());
-                        format!("{host}:4242")
-                    });
-                    // Self-roster: the lighthouse running this
-                    // CLI is the only entry. Multi-lighthouse
-                    // setups can re-sign with a different roster
-                    // via a future --lighthouse flag set.
+                    // Bug #6: the joining peer must dial the lighthouse's
+                    // REAL external address. Resolution order:
+                    //   1. an explicit `--lighthouse-addr` override, else
+                    //   2. inherit the lighthouse's own roster (the real
+                    //      overlay_ip + external_addr mesh-init recorded)
+                    //      from its own bundle, else
+                    //   3. last-resort hostname guess (NOT DNS-resolvable
+                    //      for the peer — the old default that broke joins).
                     let local_id = default_node_id();
-                    let lighthouses = vec![mackesd_core::ca::bundle::LighthouseEntry {
-                        node_id: local_id.clone(),
-                        // Best-choice: until the lighthouse knows
-                        // its own overlay IP (it gets one only
-                        // after it self-enrolls), advertise the
-                        // conventional first-host address. Operator
-                        // can override by re-signing post-mint or
-                        // by editing the bundle directly.
-                        overlay_ip: "10.42.0.1".to_string(),
-                        external_addr: lh_addr,
-                    }];
+                    let lighthouses = if let Some(addr) = lighthouse_addr {
+                        vec![mackesd_core::ca::bundle::LighthouseEntry {
+                            node_id: local_id.clone(),
+                            overlay_ip: "10.42.0.1".to_string(),
+                            external_addr: addr,
+                        }]
+                    } else {
+                        let self_bundle = mackesd_core::ca::bundle::read_bundle(
+                            &mackesd_core::ca::bundle::bundle_path(&workgroup_root, &local_id),
+                        );
+                        match self_bundle {
+                            Ok(b) if !b.lighthouses.is_empty() => b.lighthouses,
+                            _ => {
+                                let host = std::fs::read_to_string("/etc/hostname")
+                                    .ok()
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or_else(default_node_id);
+                                eprintln!(
+                                    "mackesd ca sign-csr: no lighthouse bundle at {} — \
+                                     falling back to hostname '{host}:4242', which the peer \
+                                     may not resolve. Pass --lighthouse-addr <public-ip>:4242.",
+                                    mackesd_core::ca::bundle::bundle_path(
+                                        &workgroup_root,
+                                        &local_id
+                                    )
+                                    .display()
+                                );
+                                vec![mackesd_core::ca::bundle::LighthouseEntry {
+                                    node_id: local_id.clone(),
+                                    overlay_ip: "10.42.0.1".to_string(),
+                                    external_addr: format!("{host}:4242"),
+                                }]
+                            }
+                        }
+                    };
                     match mackesd_core::nebula_enroll::sign_pending_csr(
                         &mackesd_core::ca::SubprocessBackend,
                         &conn,
