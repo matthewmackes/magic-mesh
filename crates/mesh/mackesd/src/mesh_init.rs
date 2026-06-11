@@ -147,9 +147,21 @@ pub fn mesh_init<B: NebulaCertBackend>(
 mod tests {
     use super::*;
     use crate::ca::MockBackend;
+    use std::sync::Mutex;
+
+    /// Serialize tests that mutate `MDE_ROLE_PATH`. The env is a
+    /// process-wide singleton — Rust's test runner uses threads, so two
+    /// sibling tests each `set_var`-ing it to their own tempdir race, and
+    /// one mesh_init() reads the other's half-written role.toml → flake.
+    /// Holding this mutex for the test's duration eliminates it. Mirrors
+    /// the `ENV_LOCK` pattern in `enrollment.rs` / `settings/*`.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn mesh_init_yields_a_signing_lighthouse_and_a_redeemable_token() {
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         // Hermetic role pin: redirect role.toml into the tempdir so the
         // test never touches (or depends on) the privileged
@@ -199,6 +211,9 @@ mod tests {
         // Regression for the VM-bed finding (2026-06-10): on a manual
         // deploy without `meshctl install`, the CA dir doesn't exist and
         // nebula-cert can't write ca.key. mesh-init must mkdir -p it.
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("MDE_ROLE_PATH", tmp.path().join("role.toml"));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
