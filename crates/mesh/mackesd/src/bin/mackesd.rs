@@ -728,6 +728,13 @@ enum Cmd {
         /// Sync every enabled mirror instead of listing.
         #[arg(long)]
         sync_all: bool,
+        /// Write each mirror's dnf `.repo` (local `file://` first, upstream
+        /// fallback) into `--repo-dir`, flipping this node to self-serve (W62).
+        #[arg(long)]
+        write_repo: bool,
+        /// Where `--write-repo` lands the `.repo` files (default /etc/yum.repos.d).
+        #[arg(long, value_name = "DIR")]
+        repo_dir: Option<std::path::PathBuf>,
     },
 
     /// PLANES-22 — the image catalog. `mded images --json` emits the
@@ -3950,12 +3957,34 @@ fn main() -> anyhow::Result<()> {
             json,
             sync,
             sync_all,
+            write_repo,
+            repo_dir,
         } => {
             // PLANES-24 — the package-mirror catalog (core pack + TOML),
             // each with its file:// serving baseurl + last-sync state.
             use mackesd_core::mirrors;
             let root = mackesd_core::default_qnm_shared_root();
             let list = mirrors::load_mirrors(&root);
+            // W62 — flip this node to self-serve: write each enabled mirror's
+            // dnf .repo (local file:// first, upstream fallback).
+            if write_repo {
+                let dir =
+                    repo_dir.unwrap_or_else(|| std::path::PathBuf::from(mirrors::DEFAULT_REPO_DIR));
+                let mut failures = 0;
+                for m in list.iter().filter(|m| m.enabled) {
+                    match mirrors::write_dnf_repo(m, &root, &dir) {
+                        Ok(p) => println!("wrote {} → {}", m.name, p.display()),
+                        Err(e) => {
+                            failures += 1;
+                            eprintln!("mackesd mirrors: write .repo for {} failed: {e}", m.name);
+                        }
+                    }
+                }
+                if failures > 0 {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
             // W63 — the one-puller sync path. `--sync <name>` / `--sync-all`
             // reposync the upstream into the LizardFS mirror dir, createrepo_c
             // the metadata, then stamp `.last-sync`.

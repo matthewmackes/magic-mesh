@@ -267,6 +267,61 @@ pub fn sync_mirror<R: MirrorSyncRunner + ?Sized>(
     })
 }
 
+// ─────────────────────────────────────────────────────────────────
+// W62 — flip a node to self-serve. Render the dnf `.repo` so its
+// baseurl is the local `file://` mirror FIRST, with the upstream as a
+// fallback line: dnf tries each baseurl in order, so a node reads from
+// its replicated LizardFS mount and only falls back to GitHub when the
+// mount is unavailable. No HTTP tier.
+// ─────────────────────────────────────────────────────────────────
+
+/// The canonical dnf repo-config directory a node serves from.
+pub const DEFAULT_REPO_DIR: &str = "/etc/yum.repos.d";
+
+/// Render the dnf `.repo` INI for `mirror`: `file://` local baseurl
+/// first, upstream second (the W62 self-serve-with-fallback order).
+#[must_use]
+pub fn render_dnf_repo(mirror: &Mirror, workgroup_root: &Path) -> String {
+    let descr = if mirror.description.is_empty() {
+        mirror.name.clone()
+    } else {
+        mirror.description.clone()
+    };
+    // dnf accepts multiple baseurls (whitespace/newline-separated) and
+    // tries them in order — local mount first, GitHub upstream as the
+    // fallback. The continuation line is indented per INI convention.
+    format!(
+        "[{name}]\n\
+         name={descr}\n\
+         baseurl={local}\n\
+         \x20      {upstream}\n\
+         enabled={enabled}\n\
+         gpgcheck=0\n\
+         metadata_expire=300\n",
+        name = mirror.name,
+        local = mirror.file_baseurl(workgroup_root),
+        upstream = mirror.upstream,
+        enabled = u8::from(mirror.enabled),
+    )
+}
+
+/// Write `mirror`'s `.repo` into `repo_dir` (e.g. `/etc/yum.repos.d`).
+/// Returns the path written. `repo_dir` is a parameter (not the const)
+/// so tests redirect into a tempdir instead of touching `/etc`.
+///
+/// # Errors
+/// [`std::io::Error`] when the dir can't be created or the file written.
+pub fn write_dnf_repo(
+    mirror: &Mirror,
+    workgroup_root: &Path,
+    repo_dir: &Path,
+) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(repo_dir)?;
+    let path = repo_dir.join(format!("mackes-mirror-{}.repo", mirror.name));
+    std::fs::write(&path, render_dnf_repo(mirror, workgroup_root))?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +455,42 @@ mod tests {
         let r = sync_mirror(&runner, m, tmp.path(), 1);
         assert!(matches!(r, Err(MirrorSyncError::Createrepo(_))));
         assert!(m.last_sync_ms(tmp.path()).is_none());
+    }
+
+    // ---- W62 dnf .repo rewrite ----------------------------------
+
+    #[test]
+    fn render_dnf_repo_puts_local_first_upstream_fallback() {
+        let m = &core_pack()[0];
+        let root = Path::new("/wg");
+        let repo = render_dnf_repo(m, root);
+        // Section id + both baseurls present, local BEFORE upstream so dnf
+        // self-serves and only falls back to GitHub.
+        assert!(repo.contains("[magic-mesh]"));
+        let local = "file:///wg/mirrors/magic-mesh";
+        let up = "matthewmackes.github.io";
+        let li = repo.find(local).expect("local baseurl present");
+        let ui = repo.find(up).expect("upstream fallback present");
+        assert!(li < ui, "local file:// must precede the upstream fallback");
+        assert!(repo.contains("enabled=1"));
+    }
+
+    #[test]
+    fn render_dnf_repo_marks_disabled_mirror_enabled_zero() {
+        let mut m = core_pack()[0].clone();
+        m.enabled = false;
+        let repo = render_dnf_repo(&m, Path::new("/wg"));
+        assert!(repo.contains("enabled=0"));
+    }
+
+    #[test]
+    fn write_dnf_repo_lands_a_named_file_with_the_rendered_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = &core_pack()[0];
+        let repo_dir = tmp.path().join("yum.repos.d");
+        let path = write_dnf_repo(m, tmp.path(), &repo_dir).expect("write");
+        assert_eq!(path, repo_dir.join("mackes-mirror-magic-mesh.repo"));
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body, render_dnf_repo(m, tmp.path()));
     }
 }
