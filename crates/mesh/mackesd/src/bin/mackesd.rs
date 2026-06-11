@@ -5406,6 +5406,19 @@ fn run_serve(
             }
         }
 
+        // PLANES-24 W63 — scheduled one-puller mirror sync. Every node writes
+        // its dnf .repo to self-serve from the local file:// mount (W62); the
+        // leader additionally pulls upstream + indexes, LizardFS replicating
+        // the result. No DB handle needed — it works off the replicated root.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::mirror_syncd::MirrorSyncd::new(workgroup_root.clone()),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("mirror_syncd".into());
+
         // NF-1.5 (v2.5) — TCP/443 covert listener. Binds the
         // TLS 1.3 listener on :443 (default; env-overrideable),
         // spawns the per-stream demux pump per accepted peer

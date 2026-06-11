@@ -113,6 +113,10 @@ pub mod nebula_supervisor;
 // step for the common case (single-lighthouse mesh with an
 // active CA).
 pub mod nebula_csr_watcher;
+// PLANES-24 W63 — scheduled one-puller mirror sync. Every node writes its
+// dnf .repo to self-serve (W62); only the leader pulls upstream + indexes,
+// LizardFS replicating the result fleet-wide.
+pub mod mirror_syncd;
 // NF-1.5 (v2.5) — Lighthouse-side TCP/443 covert listener.
 // Binds the TLS 1.3 listener on :443, spawns one demux pump
 // per accepted stream (TLS ↔ UDP 127.0.0.1:4242). Inner Nebula
