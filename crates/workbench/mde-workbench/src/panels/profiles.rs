@@ -12,9 +12,17 @@
 
 use std::time::SystemTime;
 
-use iced::widget::{button, column, container, row, scrollable, text, Space};
+use iced::widget::{
+    button, column, container, pick_list, row, scrollable, text, text_input, Space,
+};
 use iced::{Background, Border, Color, Element, Length, Padding, Task, Theme};
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
+
+use crate::controls::{variant_button, ButtonVariant};
+
+/// W56 — the roles a profile may pin (the backend validates against the
+/// same set; surfaced here as the form's picker).
+pub const ROLES: &[&str] = &["lighthouse", "server", "workstation"];
 
 /// One install profile, parsed from `mackesd profiles --json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,12 +41,33 @@ pub struct ProfilesPanel {
     pub busy: bool,
     pub last_run_at: Option<SystemTime>,
     pub error: Option<String>,
+    // W56 — the form-edit write side. A blank name = create; an existing
+    // name = overwrite (the backend overwrites a same-named profile).
+    pub form_name: String,
+    pub form_role: String,
+    pub form_tags: String,
+    pub form_ks: String,
+    pub form_auto_join: bool,
+    pub form_busy: bool,
+    pub form_msg: String,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Loaded(Result<Vec<ProfileRow>, String>),
     RefreshClicked,
+    // W56 — form-edit write side.
+    FormName(String),
+    FormRole(String),
+    FormTags(String),
+    FormKs(String),
+    FormAutoJoin(bool),
+    /// Load an existing row into the form to edit it.
+    EditRow(String),
+    SaveClicked,
+    Saved(Result<(), String>),
+    DeleteClicked(String),
+    Deleted(Result<(), String>),
 }
 
 impl ProfilesPanel {
@@ -72,6 +101,94 @@ impl ProfilesPanel {
             Message::RefreshClicked => {
                 self.busy = true;
                 Self::load()
+            }
+            Message::FormName(v) => {
+                self.form_name = v;
+                Task::none()
+            }
+            Message::FormRole(v) => {
+                self.form_role = v;
+                Task::none()
+            }
+            Message::FormTags(v) => {
+                self.form_tags = v;
+                Task::none()
+            }
+            Message::FormKs(v) => {
+                self.form_ks = v;
+                Task::none()
+            }
+            Message::FormAutoJoin(v) => {
+                self.form_auto_join = v;
+                Task::none()
+            }
+            Message::EditRow(name) => {
+                if let Some(r) = self.rows.iter().find(|r| r.name == name) {
+                    self.form_name = r.name.clone();
+                    self.form_role = r.role.clone();
+                    self.form_tags = r.tags.join(", ");
+                    self.form_ks = r.ks_fragments.join(", ");
+                    self.form_auto_join = r.auto_join;
+                    self.form_msg = format!("editing {name} — Save overwrites it");
+                }
+                Task::none()
+            }
+            Message::SaveClicked => {
+                if self.form_busy {
+                    return Task::none();
+                }
+                let name = self.form_name.trim().to_string();
+                if name.is_empty() {
+                    self.form_msg = "name is required".into();
+                    return Task::none();
+                }
+                if self.form_role.is_empty() {
+                    self.form_msg = "pick a role".into();
+                    return Task::none();
+                }
+                self.form_busy = true;
+                self.form_msg = format!("saving {name}…");
+                let args = build_set_args(
+                    &name,
+                    &self.form_role,
+                    &self.form_tags,
+                    &self.form_ks,
+                    self.form_auto_join,
+                );
+                Task::perform(run_profiles_cmd(args), |r| {
+                    crate::Message::Profiles(Message::Saved(r))
+                })
+            }
+            Message::Saved(Ok(())) => {
+                self.form_busy = false;
+                self.form_msg = "saved.".into();
+                Self::load()
+            }
+            Message::Saved(Err(e)) => {
+                self.form_busy = false;
+                self.form_msg = format!("save failed: {e}");
+                Task::none()
+            }
+            Message::DeleteClicked(name) => {
+                if self.form_busy {
+                    return Task::none();
+                }
+                self.form_busy = true;
+                self.form_msg = format!("deleting {name}…");
+                let args = vec!["profiles".to_string(), "--rm".into(), name];
+                Task::perform(run_profiles_cmd(args), |r| {
+                    crate::Message::Profiles(Message::Deleted(r))
+                })
+            }
+            Message::Deleted(Ok(())) => {
+                self.form_busy = false;
+                self.form_msg = "deleted (core profiles revert to the shipped default).".into();
+                Self::load()
+            }
+            Message::Deleted(Err(e)) => {
+                self.form_busy = false;
+                self.form_msg = format!("delete failed: {e}");
+                Task::none()
             }
         }
     }
@@ -142,10 +259,59 @@ impl ProfilesPanel {
             rows_col = rows_col.push(empty_state_card(palette, self.error.as_deref()));
         }
 
+        // W56 — the form-edit write side: create a profile or overwrite
+        // an existing one (Edit on a row populates this), validated +
+        // written by `mackesd profiles --set`.
+        let role_pick: pick_list::PickList<'_, &'static str, _, _, crate::Message> =
+            pick_list(ROLES, current_role(&self.form_role), |r| {
+                crate::Message::Profiles(Message::FormRole(r.to_string()))
+            });
+        let auto_btn = variant_button(
+            if self.form_auto_join {
+                "auto-join: on"
+            } else {
+                "auto-join: off"
+            },
+            ButtonVariant::Secondary,
+            Some(crate::Message::Profiles(Message::FormAutoJoin(
+                !self.form_auto_join,
+            ))),
+            palette,
+        );
+        let save_btn = variant_button(
+            if self.form_busy {
+                "Saving…"
+            } else {
+                "Save profile"
+            },
+            ButtonVariant::Primary,
+            (!self.form_busy).then_some(crate::Message::Profiles(Message::SaveClicked)),
+            palette,
+        );
+        let form = column![
+            text("New / edit profile").size(14),
+            row![
+                text_input("name (a-z0-9-)", &self.form_name)
+                    .on_input(|v| crate::Message::Profiles(Message::FormName(v)))
+                    .width(Length::Fixed(200.0)),
+                role_pick,
+                auto_btn,
+            ]
+            .spacing(8),
+            text_input("tags (comma: hop, execution, headless)", &self.form_tags)
+                .on_input(|v| crate::Message::Profiles(Message::FormTags(v))),
+            text_input("kickstart %post fragments (comma)", &self.form_ks)
+                .on_input(|v| crate::Message::Profiles(Message::FormKs(v))),
+            row![save_btn, text(self.form_msg.clone()).size(12)].spacing(12),
+        ]
+        .spacing(6);
+
         container(
             column![
                 header,
-                Space::new().height(Length::Fixed(20.0)),
+                Space::new().height(Length::Fixed(16.0)),
+                form,
+                Space::new().height(Length::Fixed(16.0)),
                 scrollable(rows_col).height(Length::Fill),
             ]
             .spacing(2),
@@ -155,6 +321,12 @@ impl ProfilesPanel {
         .height(Length::Fill)
         .into()
     }
+}
+
+/// W56 — the form role picker's current selection (None until picked).
+#[must_use]
+fn current_role(v: &str) -> Option<&'static str> {
+    ROLES.iter().copied().find(|r| *r == v)
 }
 
 fn profile_row<'a>(r: &'a ProfileRow, palette: Palette) -> Element<'a, crate::Message> {
@@ -198,6 +370,22 @@ fn profile_row<'a>(r: &'a ProfileRow, palette: Palette) -> Element<'a, crate::Me
         } else {
             palette.text_muted.into_iced_color()
         }),
+        // W56 — per-row edit/delete (delete reverts a core profile to its
+        // shipped default; removes an operator-authored one).
+        variant_button(
+            "Edit",
+            ButtonVariant::Ghost,
+            Some(crate::Message::Profiles(Message::EditRow(r.name.clone()))),
+            palette,
+        ),
+        variant_button(
+            "Delete",
+            ButtonVariant::Ghost,
+            Some(crate::Message::Profiles(Message::DeleteClicked(
+                r.name.clone()
+            ))),
+            palette,
+        ),
     ]
     .spacing(8)
     .align_y(iced::alignment::Vertical::Center);
@@ -297,6 +485,62 @@ fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a,
 
 // ---- I/O ------------------------------------------------------
 
+/// W56 — split a comma-separated form field into trimmed, non-empty items.
+#[must_use]
+fn csv_items(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// W56 — build the `mackesd profiles --set …` argv from the form. Pure +
+/// tested; the backend does the authoritative role/tag/name validation.
+#[must_use]
+pub fn build_set_args(
+    name: &str,
+    role: &str,
+    tags_csv: &str,
+    ks_csv: &str,
+    auto_join: bool,
+) -> Vec<String> {
+    let mut a = vec![
+        "profiles".to_string(),
+        "--set".to_string(),
+        name.to_string(),
+        "--role".to_string(),
+        role.to_string(),
+    ];
+    for t in csv_items(tags_csv) {
+        a.push("--tag".to_string());
+        a.push(t);
+    }
+    for k in csv_items(ks_csv) {
+        a.push("--ks-fragment".to_string());
+        a.push(k);
+    }
+    if auto_join {
+        a.push("--auto-join".to_string());
+    }
+    a
+}
+
+/// W56 — run a `mackesd profiles …` write command; `Ok` on exit 0, else
+/// the trimmed stderr (the backend's validation message).
+async fn run_profiles_cmd(args: Vec<String>) -> Result<(), String> {
+    let out = tokio::process::Command::new("mackesd")
+        .args(&args)
+        .output()
+        .await
+        .map_err(|e| format!("mackesd profiles failed to spawn: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
 /// Shell out to `mackesd profiles --json` and parse the catalog.
 pub fn fetch_profiles() -> Result<Vec<ProfileRow>, String> {
     let out = std::process::Command::new("mackesd")
@@ -375,6 +619,80 @@ mod tests {
     fn parse_profiles_returns_empty_for_garbage() {
         assert!(parse_profiles("not json").is_empty());
         assert!(parse_profiles("").is_empty());
+    }
+
+    #[test]
+    fn build_set_args_assembles_the_cli_invocation() {
+        // W56 — name/role + repeated --tag/--ks-fragment + the auto-join flag.
+        let a = build_set_args(
+            "anvil",
+            "server",
+            "execution, headless",
+            "role-server",
+            true,
+        );
+        assert_eq!(
+            a,
+            vec![
+                "profiles",
+                "--set",
+                "anvil",
+                "--role",
+                "server",
+                "--tag",
+                "execution",
+                "--tag",
+                "headless",
+                "--ks-fragment",
+                "role-server",
+                "--auto-join",
+            ]
+        );
+        // No tags/ks, manual-enroll → no repeated flags, no --auto-join.
+        let b = build_set_args("hop1", "lighthouse", "", "  ", false);
+        assert_eq!(b, vec!["profiles", "--set", "hop1", "--role", "lighthouse"]);
+    }
+
+    #[test]
+    fn save_requires_name_and_role_before_shelling() {
+        let mut p = ProfilesPanel::new();
+        // No name → refused, not busy.
+        let _ = p.update(Message::SaveClicked);
+        assert!(!p.form_busy);
+        assert!(p.form_msg.contains("name is required"));
+        // Name but no role → refused.
+        let _ = p.update(Message::FormName("anvil".into()));
+        let _ = p.update(Message::SaveClicked);
+        assert!(!p.form_busy);
+        assert!(p.form_msg.contains("role"));
+        // Name + role → goes busy (shells out).
+        let _ = p.update(Message::FormRole("server".into()));
+        let _ = p.update(Message::SaveClicked);
+        assert!(p.form_busy);
+    }
+
+    #[test]
+    fn edit_row_populates_the_form() {
+        let mut p = ProfilesPanel::new();
+        p.rows = parse_profiles(
+            r#"[{"name":"server","description":"d","role":"server",
+                 "tags":["execution"],"ks_fragments":["role-server"],"auto_join":true}]"#,
+        );
+        let _ = p.update(Message::EditRow("server".into()));
+        assert_eq!(p.form_name, "server");
+        assert_eq!(p.form_role, "server");
+        assert_eq!(p.form_tags, "execution");
+        assert_eq!(p.form_ks, "role-server");
+        assert!(p.form_auto_join);
+    }
+
+    #[test]
+    fn save_result_clears_busy_with_a_message() {
+        let mut p = ProfilesPanel::new();
+        p.form_busy = true;
+        let _ = p.update(Message::Saved(Err("bad role 'x'".into())));
+        assert!(!p.form_busy);
+        assert!(p.form_msg.contains("save failed"));
     }
 
     #[test]
