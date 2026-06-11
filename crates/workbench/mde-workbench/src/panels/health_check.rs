@@ -71,12 +71,20 @@ pub struct HealthCheckPanel {
     pub probes: Vec<ProbeResult>,
     pub busy: bool,
     pub last_run_at: Option<SystemTime>,
+    /// W24 — a mackesd self-restart is in flight.
+    pub restarting: bool,
+    /// W24 — last restart outcome line (empty until one is issued).
+    pub restart_msg: String,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Loaded(Vec<ProbeResult>),
     RunClicked,
+    /// PLANES-6 / W24 — restart the mackesd daemon via systemd.
+    RestartMackesd,
+    /// W24 — the restart command resolved; re-probe for honest reconnect.
+    Restarted(bool),
 }
 
 impl HealthCheckPanel {
@@ -102,6 +110,39 @@ impl HealthCheckPanel {
             Message::RunClicked => {
                 self.busy = true;
                 Self::load()
+            }
+            Message::RestartMackesd => {
+                if self.restarting {
+                    return Task::none();
+                }
+                self.restarting = true;
+                self.restart_msg = "Restarting mackesd…".into();
+                Task::perform(
+                    async {
+                        // mackesd is a system unit (see mesh_services::MESH_UNITS).
+                        crate::panels::mesh_services::run_pkexec_systemctl(
+                            &crate::panels::mesh_services::UnitScope::System,
+                            "restart",
+                            "mackesd",
+                        )
+                        .await
+                    },
+                    |ok| crate::Message::HealthCheck(Message::Restarted(ok)),
+                )
+            }
+            Message::Restarted(ok) => {
+                self.restarting = false;
+                if ok {
+                    // W24 "honest reconnect": re-probe so the mackesd
+                    // status reflects whether it actually came back.
+                    self.restart_msg = "Restart issued — re-probing…".into();
+                    self.busy = true;
+                    Self::load()
+                } else {
+                    self.restart_msg =
+                        "Restart failed (authorization declined or unit error).".into();
+                    Task::none()
+                }
             }
         }
     }
@@ -162,12 +203,32 @@ impl HealthCheckPanel {
         })
         .on_press(crate::Message::HealthCheck(Message::RunClicked));
 
-        let header = row![
-            column![title, subtitle].spacing(2),
-            Space::new().width(Length::Fill),
-            run_btn,
-        ]
-        .align_y(iced::alignment::Vertical::Center);
+        // PLANES-6 / W24 — mackesd self-restart, folded next to Run.
+        // Disabled while a restart or probe pass is in flight.
+        let restart_btn = crate::controls::variant_button(
+            if self.restarting {
+                "Restarting…"
+            } else {
+                "Restart mackesd"
+            },
+            crate::controls::ButtonVariant::Secondary,
+            (!self.restarting && !self.busy)
+                .then_some(crate::Message::HealthCheck(Message::RestartMackesd)),
+            palette,
+        );
+
+        let mut left = column![title, subtitle].spacing(2);
+        if !self.restart_msg.is_empty() {
+            left = left.push(
+                text(self.restart_msg.clone())
+                    .size(TypeRole::Body.size_in(sizes))
+                    .color(palette.text_muted.into_iced_color()),
+            );
+        }
+
+        let header = row![left, Space::new().width(Length::Fill), restart_btn, run_btn,]
+            .spacing(8)
+            .align_y(iced::alignment::Vertical::Center);
 
         let mut probe_col = column![].spacing(8);
         for p in &self.probes {
@@ -715,6 +776,45 @@ mod tests {
         let probes = run_all_probes();
         let names: std::collections::HashSet<_> = probes.iter().map(|p| p.name.clone()).collect();
         assert_eq!(names.len(), probes.len(), "duplicate probe name");
+    }
+
+    #[test]
+    fn restart_click_marks_restarting_with_a_message() {
+        // W24 — clicking Restart flips state + shows progress.
+        let mut panel = HealthCheckPanel::new();
+        let _ = panel.update(Message::RestartMackesd);
+        assert!(panel.restarting);
+        assert!(panel.restart_msg.contains("Restarting"));
+    }
+
+    #[test]
+    fn restart_click_while_restarting_is_noop() {
+        let mut panel = HealthCheckPanel::new();
+        panel.restarting = true;
+        panel.restart_msg = "Restarting mackesd…".into();
+        let _ = panel.update(Message::RestartMackesd);
+        assert!(panel.restarting);
+    }
+
+    #[test]
+    fn restart_failure_reports_and_clears_restarting() {
+        let mut panel = HealthCheckPanel::new();
+        panel.restarting = true;
+        let _ = panel.update(Message::Restarted(false));
+        assert!(!panel.restarting);
+        assert!(panel.restart_msg.to_lowercase().contains("failed"));
+    }
+
+    #[test]
+    fn restart_success_reprobes_with_honest_reconnect() {
+        // W24 — a successful restart clears restarting, sets busy (the
+        // re-probe is in flight), and says it's re-probing.
+        let mut panel = HealthCheckPanel::new();
+        panel.restarting = true;
+        let _ = panel.update(Message::Restarted(true));
+        assert!(!panel.restarting);
+        assert!(panel.busy, "re-probe should be in flight");
+        assert!(panel.restart_msg.contains("re-probing"));
     }
 
     #[test]
