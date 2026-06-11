@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use iced::widget::{column, container, row, scrollable, text};
 use iced::{Element, Length, Padding, Task};
@@ -184,6 +185,11 @@ pub enum Message {
     OpenRun(String),
     Back,
     RefreshClicked,
+    /// PLANES-10 / W38 — launch the focused template now (resolves its
+    /// selector + writes a run via `action/jobs/launch`).
+    LaunchClicked(String),
+    /// The launch verb replied — show the outcome line.
+    Launched(String),
 }
 
 impl JobsPanel {
@@ -239,6 +245,72 @@ impl JobsPanel {
                 self.status = "Refreshing…".into();
                 Self::load()
             }
+            Message::LaunchClicked(id) => {
+                if self.busy {
+                    return Task::none();
+                }
+                let Some(t) = self.templates.iter().find(|t| t.id == id) else {
+                    self.status = "template no longer present".into();
+                    return Task::none();
+                };
+                // A selector that matches nothing would be refused by the
+                // verb anyway — say so up front rather than round-trip.
+                if t.targets.tags.is_empty()
+                    && t.targets.roles.is_empty()
+                    && t.targets.peers.is_empty()
+                {
+                    self.status = "this template has no targets — it would match no nodes".into();
+                    return Task::none();
+                }
+                self.busy = true;
+                self.status = format!("launching {id}…");
+                let body = serde_json::json!({
+                    "playbook": t.playbook,
+                    "targets": {
+                        "tags": t.targets.tags,
+                        "roles": t.targets.roles,
+                        "peers": t.targets.peers,
+                    },
+                    "vars": t.vars,
+                })
+                .to_string();
+                Task::perform(
+                    async move {
+                        let reply = tokio::task::spawn_blocking(move || {
+                            crate::dbus::action_request_with_body(
+                                "action/jobs/launch",
+                                Some(&body),
+                                Duration::from_secs(3),
+                            )
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+                        match reply
+                            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                        {
+                            Some(v) if v["ok"] == true => {
+                                let n = v["targets"].as_array().map_or(0, Vec::len);
+                                let run = v["run_id"].as_str().unwrap_or("?").to_string();
+                                format!("launched run {run} → {n} target(s) — Refresh for results")
+                            }
+                            Some(v) => {
+                                format!(
+                                    "launch failed: {}",
+                                    v["error"].as_str().unwrap_or("unknown")
+                                )
+                            }
+                            None => "launch failed: mackesd not answering on the Bus".into(),
+                        }
+                    },
+                    |msg| crate::Message::Jobs(Message::Launched(msg)),
+                )
+            }
+            Message::Launched(msg) => {
+                self.status = msg;
+                self.busy = false;
+                Task::none()
+            }
         }
     }
 
@@ -256,7 +328,7 @@ impl JobsPanel {
         let refresh = variant_button(
             "Refresh",
             ButtonVariant::Ghost,
-            (!self.busy).then(|| crate::Message::Jobs(Message::RefreshClicked)),
+            (!self.busy).then_some(crate::Message::Jobs(Message::RefreshClicked)),
             palette,
         );
 
@@ -379,11 +451,28 @@ impl JobsPanel {
                 yaml.push_str(&format!("  {k}: {v}\n"));
             }
         }
+        // W38 — the interactive launch: fire the template's playbook +
+        // selector at action/jobs/launch. Disabled while busy or when the
+        // template targets nothing (it would match no nodes).
+        let no_targets =
+            t.targets.tags.is_empty() && t.targets.roles.is_empty() && t.targets.peers.is_empty();
+        let launch = variant_button(
+            if self.busy {
+                "Launching…"
+            } else {
+                "Launch now"
+            },
+            ButtonVariant::Primary,
+            (!self.busy && !no_targets)
+                .then_some(crate::Message::Jobs(Message::LaunchClicked(t.id.clone()))),
+            palette,
+        );
         panel_container(
             column![
-                back,
+                row![back, launch].spacing(12),
                 text(format!("Template: {}", t.id)).size(20),
-                text(yaml).size(13)
+                text(yaml).size(13),
+                text(self.status.clone()).size(13),
             ]
             .spacing(12)
             .into(),
@@ -483,6 +572,61 @@ mod tests {
             TargetSelectorRow::default().summary(),
             "(no targets — never runs)"
         );
+    }
+
+    fn template(id: &str, targets: TargetSelectorRow) -> TemplateRow {
+        TemplateRow {
+            id: id.into(),
+            description: String::new(),
+            playbook: "playbooks/p.yml".into(),
+            vars: BTreeMap::new(),
+            targets,
+            schedule: None,
+        }
+    }
+
+    #[test]
+    fn launch_with_no_targets_warns_and_stays_idle() {
+        // W38 — a target-less template can't run; the panel says so
+        // without a Bus round-trip and without going busy.
+        let mut panel = JobsPanel::new();
+        panel.templates = vec![template("empty", TargetSelectorRow::default())];
+        let _ = panel.update(Message::LaunchClicked("empty".into()));
+        assert!(!panel.busy);
+        assert!(panel.status.contains("no targets"));
+    }
+
+    #[test]
+    fn launch_unknown_template_reports_missing() {
+        let mut panel = JobsPanel::new();
+        let _ = panel.update(Message::LaunchClicked("ghost".into()));
+        assert!(!panel.busy);
+        assert!(panel.status.contains("no longer present"));
+    }
+
+    #[test]
+    fn launch_with_targets_goes_busy() {
+        // A targeted template fires the verb (busy until the reply).
+        let mut panel = JobsPanel::new();
+        panel.templates = vec![template(
+            "patch",
+            TargetSelectorRow {
+                tags: vec!["execution".into()],
+                ..Default::default()
+            },
+        )];
+        let _ = panel.update(Message::LaunchClicked("patch".into()));
+        assert!(panel.busy);
+        assert!(panel.status.contains("launching patch"));
+    }
+
+    #[test]
+    fn launched_sets_status_and_clears_busy() {
+        let mut panel = JobsPanel::new();
+        panel.busy = true;
+        let _ = panel.update(Message::Launched("launched run 01H… → 2 target(s)".into()));
+        assert!(!panel.busy);
+        assert!(panel.status.contains("launched run"));
     }
 
     #[test]
