@@ -7,9 +7,9 @@
 //! `fleet/acks/<v>/<host>.json`) — the established panel pattern;
 //! Reconcile-now shells `mackesd reconcile`.
 //!
-//! Build-now-defer-visual: the newest/applied projection is pure +
-//! unit-tested; the on-Cosmic `/preview`, the last-Ansible-log tail, and
-//! update-now-via-typed-job (W28's action half) are the deferred tail.
+//! The newest/applied projection + the last-apply log tail (W22) are
+//! pure + unit-tested. Update-now-via-typed-job (W28's action half) is
+//! the deferred tail (design-coupled to the jobs engine).
 
 use std::path::{Path, PathBuf};
 
@@ -31,11 +31,27 @@ struct RevisionHead {
     at: u64,
 }
 
-/// Minimal ack projection.
+/// Minimal ack projection (the fields the panel reads).
 #[derive(Debug, Clone, Deserialize)]
 struct AckRow {
     #[serde(default)]
     status: String,
+    /// Ack time, Unix seconds (W22 — picks the most recent run).
+    #[serde(default)]
+    at: u64,
+    /// The apply summary/output — the "last Ansible log" (W22).
+    #[serde(default)]
+    detail: String,
+}
+
+/// W22 — this host's most recent apply: which revision, its outcome,
+/// when, and the apply detail (the "last Ansible log").
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApplyLogEntry {
+    pub version: u64,
+    pub status: String,
+    pub at: u64,
+    pub detail: String,
 }
 
 /// `MDE_WORKGROUP_ROOT`-or-`/mnt/mesh-storage` (matches network_hosts/jobs).
@@ -78,6 +94,30 @@ pub fn applied_version(root: &Path, host: &str) -> Option<u64> {
         .max()
 }
 
+/// W22 — this host's most recent apply across all revisions, by ack time
+/// — regardless of outcome, so a *failed* run's log is still shown
+/// (that's exactly when the operator needs it). `None` when this host
+/// has never acked.
+#[must_use]
+pub fn last_apply(root: &Path, host: &str) -> Option<ApplyLogEntry> {
+    let acks_root = root.join("fleet").join("acks");
+    std::fs::read_dir(acks_root)
+        .ok()?
+        .filter_map(std::result::Result::ok)
+        .filter_map(|e| {
+            let version: u64 = e.file_name().to_str()?.parse().ok()?;
+            let raw = std::fs::read_to_string(e.path().join(format!("{host}.json"))).ok()?;
+            let ack: AckRow = serde_json::from_str(&raw).ok()?;
+            Some(ApplyLogEntry {
+                version,
+                status: ack.status,
+                at: ack.at,
+                detail: ack.detail,
+            })
+        })
+        .max_by_key(|a| a.at)
+}
+
 /// The loaded config state.
 #[derive(Debug, Clone, Default)]
 pub struct ConfigState {
@@ -87,6 +127,8 @@ pub struct ConfigState {
     pub rpm_version: String,
     /// W28 — the dnf repo the installed RPM came from.
     pub repo_source: String,
+    /// W22 — this host's most recent apply (the "last Ansible log").
+    pub last_apply: Option<ApplyLogEntry>,
     pub hostname: String,
 }
 
@@ -171,6 +213,15 @@ fn repo_source() -> String {
         .unwrap_or_else(|| "unknown (not from a configured repo)".into())
 }
 
+/// W22 — the last `n` lines of a log blob (oldest→newest), so a long
+/// apply detail renders as a readable tail rather than a wall of text.
+#[must_use]
+fn tail_lines(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
 impl ConfigApplyPanel {
     #[must_use]
     pub fn new() -> Self {
@@ -190,6 +241,7 @@ impl ConfigApplyPanel {
                     applied: applied_version(&root, &host),
                     rpm_version: rpm_version(),
                     repo_source: repo_source(),
+                    last_apply: last_apply(&root, &host),
                     hostname: host,
                 })
             },
@@ -255,17 +307,17 @@ impl ConfigApplyPanel {
         let reconcile = variant_button(
             "Reconcile now",
             ButtonVariant::Secondary,
-            (!self.busy).then(|| crate::Message::ConfigApply(Message::ReconcileClicked)),
+            (!self.busy).then_some(crate::Message::ConfigApply(Message::ReconcileClicked)),
             palette,
         );
         let refresh = variant_button(
             "Refresh",
             ButtonVariant::Ghost,
-            (!self.busy).then(|| crate::Message::ConfigApply(Message::RefreshClicked)),
+            (!self.busy).then_some(crate::Message::ConfigApply(Message::RefreshClicked)),
             palette,
         );
 
-        let rows = column![
+        let mut rows = column![
             text("Fleet configuration").size(20),
             row![
                 text("Newest revision:").size(14),
@@ -294,6 +346,35 @@ impl ConfigApplyPanel {
         ]
         .spacing(10);
 
+        // W22 — the last Ansible/apply log for this host. Shows even a
+        // failed run's detail (that's when it's most needed); honest
+        // "none recorded" otherwise.
+        rows = rows.push(text("Last apply").size(16));
+        match &s.last_apply {
+            Some(a) => {
+                let head = format!(
+                    "rev {} — {}",
+                    a.version,
+                    if a.status.is_empty() {
+                        "(no status)"
+                    } else {
+                        &a.status
+                    },
+                );
+                let detail = if a.detail.trim().is_empty() {
+                    "(no log detail recorded)".to_string()
+                } else {
+                    tail_lines(&a.detail, 20)
+                };
+                rows = rows
+                    .push(text(head).size(13))
+                    .push(text(detail).size(12).font(iced::Font::MONOSPACE));
+            }
+            None => {
+                rows = rows.push(text("none recorded yet").size(13));
+            }
+        }
+
         panel_container(rows.width(Length::Fill).into(), density)
     }
 }
@@ -316,6 +397,19 @@ mod tests {
             .join(format!("{version:020}"));
         std::fs::create_dir_all(&dir).unwrap();
         let json = format!(r#"{{"peer":"{host}","status":"{status}","at":1}}"#);
+        std::fs::write(dir.join(format!("{host}.json")), json).unwrap();
+    }
+
+    fn write_ack_full(root: &Path, version: u64, host: &str, status: &str, at: u64, detail: &str) {
+        let dir = root
+            .join("fleet")
+            .join("acks")
+            .join(format!("{version:020}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = format!(
+            r#"{{"peer":"{host}","status":"{status}","at":{at},"detail":{}}}"#,
+            serde_json::to_string(detail).unwrap()
+        );
         std::fs::write(dir.join(format!("{host}.json")), json).unwrap();
     }
 
@@ -375,5 +469,36 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         assert!(newest_revision(tmp.path()).is_none());
         assert!(applied_version(tmp.path(), "pine").is_none());
+    }
+
+    #[test]
+    fn last_apply_picks_most_recent_by_time_even_if_failed() {
+        // W22 — the latest run (by ack time) wins, regardless of outcome,
+        // so a failed run's log is what the operator sees.
+        let tmp = tempfile::tempdir().unwrap();
+        write_ack_full(tmp.path(), 1, "pine", "applied", 100, "rev1 ok");
+        write_ack_full(
+            tmp.path(),
+            2,
+            "pine",
+            "failed",
+            200,
+            "TASK [x] FAILED\nerror: boom",
+        );
+        write_ack_full(tmp.path(), 2, "oak", "applied", 999, "other host");
+        let got = last_apply(tmp.path(), "pine").unwrap();
+        assert_eq!(got.version, 2);
+        assert_eq!(got.status, "failed");
+        assert!(got.detail.contains("boom"));
+        // None for a host with no acks.
+        assert!(last_apply(tmp.path(), "stranger").is_none());
+    }
+
+    #[test]
+    fn tail_lines_keeps_the_last_n() {
+        let blob = "l1\nl2\nl3\nl4\nl5";
+        assert_eq!(tail_lines(blob, 2), "l4\nl5");
+        assert_eq!(tail_lines(blob, 99), blob);
+        assert_eq!(tail_lines("", 5), "");
     }
 }
