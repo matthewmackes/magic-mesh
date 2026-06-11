@@ -96,6 +96,10 @@ pub enum Message {
         host: String,
         ok: bool,
     },
+    /// PD-5 — Call (voice): publish `action/voice/dial` so the voice HUD
+    /// resolves the peer's extension and rings it.
+    CallClicked(String),
+    Called(String),
     /// PD-9 — "Apply now": nudge a behind peer to reconcile.
     NudgeClicked(String),
     NudgeFinished {
@@ -598,6 +602,35 @@ impl PeersPanel {
                     },
                 )
             }
+            Message::CallClicked(host) => {
+                // PD-5 — fire-and-forget a dial request to the voice HUD,
+                // which resolves the hostname to its extension and rings it.
+                self.op_result = format!("ringing {host} on the voice HUD…");
+                let body = serde_json::json!({ "target": host }).to_string();
+                Task::perform(
+                    async move {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Some(dir) = mde_bus::default_data_dir() {
+                                if let Ok(p) = mde_bus::persist::Persist::open(dir) {
+                                    let _ = p.write(
+                                        "action/voice/dial",
+                                        mde_bus::hooks::config::Priority::Default,
+                                        None,
+                                        Some(&body),
+                                    );
+                                }
+                            }
+                        })
+                        .await;
+                        host
+                    },
+                    |host| crate::Message::Peers(Message::Called(host)),
+                )
+            }
+            Message::Called(host) => {
+                self.op_result = format!("dial request sent for {host} — answer on the voice HUD");
+                Task::none()
+            }
             Message::NudgeClicked(host) => {
                 self.op_result = format!("nudging {host} to reconcile…");
                 let h = host.clone();
@@ -956,6 +989,16 @@ impl PeersPanel {
                 };
                 // PD-5 — the op toolbar, descriptor- + presence-gated.
                 let mut ops = row![].spacing(8);
+                // PD-5 — Call (voice): rings an online, non-self peer via
+                // the voice HUD's Bus dial subscriber.
+                let can_call = r.presence != "offline" && r.hostname != self.self_hostname;
+                ops = ops.push(crate::controls::variant_button(
+                    "Call",
+                    crate::controls::ButtonVariant::Secondary,
+                    can_call
+                        .then(|| crate::Message::Peers(Message::CallClicked(r.hostname.clone()))),
+                    palette,
+                ));
                 for (offered, proto) in [
                     (r.ssh, crate::launcher::Protocol::Ssh),
                     (r.rdp, crate::launcher::Protocol::Rdp),

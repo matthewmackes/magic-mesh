@@ -147,6 +147,10 @@ pub enum Message {
     HangUp,
     /// The BYE task finished — the call is fully torn down (no-op confirm).
     CallEnded,
+    /// PD-5 — a dial request arrived over the Bus (`action/voice/dial`),
+    /// carrying the target the Peers panel asked to call (a mesh hostname,
+    /// an extension, or a SIP URI). Resolved against the roster then placed.
+    DialRequested(String),
 }
 
 /// Top-level HUD state.
@@ -229,6 +233,23 @@ pub fn update(state: &mut VoiceHud, message: Message) -> Task<Message> {
         Message::Decline => {
             agent_send(sip::AgentCommand::Decline);
             state.call = sip::CallState::Idle;
+        }
+        Message::DialRequested(target) => {
+            // PD-5 — resolve a mesh hostname to its extension via the live
+            // roster (so "Call pine" dials pine's 1NNN); fall back to the
+            // raw target for an extension / SIP URI the panel already sent.
+            let t = target.trim();
+            if t.is_empty() || state.call.is_active() {
+                return Task::none();
+            }
+            let dial = state
+                .roster
+                .iter()
+                .find(|p| p.name.eq_ignore_ascii_case(t))
+                .map(|p| p.ext.clone())
+                .unwrap_or_else(|| t.to_string());
+            state.dialer_input = dial;
+            return Task::done(Message::PlaceCall);
         }
         Message::PlaceCall => {
             let dialed = state.dialer_input.trim().to_string();
@@ -331,7 +352,82 @@ pub fn view(state: &VoiceHud) -> Element<'_, Message> {
 }
 
 fn subscription(_state: &VoiceHud) -> iced::Subscription<Message> {
-    iced::Subscription::batch([keyboard_subscription(), agent_subscription()])
+    iced::Subscription::batch([
+        keyboard_subscription(),
+        agent_subscription(),
+        dial_subscription(),
+    ])
+}
+
+/// PD-5 — the Bus topic the Peers panel publishes a dial request on.
+const DIAL_TOPIC: &str = "action/voice/dial";
+
+/// PD-5 — subscribe to `action/voice/dial`; each new request becomes a
+/// [`Message::DialRequested`]. Cursor-seeded so it only acts on requests
+/// published after the HUD starts (an old request never re-dials).
+fn dial_subscription() -> iced::Subscription<Message> {
+    use iced::futures::SinkExt;
+    use iced::stream;
+    iced::Subscription::run(|| {
+        stream::channel(
+            8,
+            |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+                let mut cursor = dial_cursor_init().await;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                    let (targets, next) = dial_poll(cursor.clone()).await;
+                    cursor = next;
+                    for t in targets {
+                        let _ = output.send(Message::DialRequested(t)).await;
+                    }
+                }
+            },
+        )
+    })
+}
+
+/// Seed the cursor at the latest existing dial request.
+async fn dial_cursor_init() -> Option<String> {
+    tokio::task::spawn_blocking(|| {
+        let dir = mde_bus::default_data_dir()?;
+        let persist = mde_bus::persist::Persist::open(dir).ok()?;
+        persist
+            .list_since(DIAL_TOPIC, None)
+            .ok()?
+            .last()
+            .map(|m| m.ulid.clone())
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// New dial targets (each request's `target` field) since `cursor`, plus
+/// the advanced cursor. Bus unavailable → nothing, cursor unchanged.
+async fn dial_poll(cursor: Option<String>) -> (Vec<String>, Option<String>) {
+    tokio::task::spawn_blocking(move || {
+        let Some(dir) = mde_bus::default_data_dir() else {
+            return (Vec::new(), cursor);
+        };
+        let Ok(persist) = mde_bus::persist::Persist::open(dir) else {
+            return (Vec::new(), cursor);
+        };
+        let msgs = persist
+            .list_since(DIAL_TOPIC, cursor.as_deref())
+            .unwrap_or_default();
+        let next = msgs.last().map(|m| m.ulid.clone()).or(cursor);
+        let targets = msgs
+            .iter()
+            .filter_map(|m| {
+                let body = m.body.as_deref()?;
+                let v: serde_json::Value = serde_json::from_str(body).ok()?;
+                v.get("target").and_then(|t| t.as_str()).map(str::to_string)
+            })
+            .collect();
+        (targets, next)
+    })
+    .await
+    .unwrap_or((Vec::new(), None))
 }
 
 fn keyboard_subscription() -> iced::Subscription<Message> {
@@ -828,6 +924,34 @@ mod tests {
             session: None,
             media: None,
         }
+    }
+
+    #[test]
+    fn dial_request_resolves_hostname_to_extension() {
+        // PD-5 — a Bus dial request for a mesh hostname dials its 1NNN
+        // extension via the roster; an unknown target dials verbatim.
+        let mut hud = make_hud();
+        hud.roster = vec![Peer {
+            ext: "1007".into(),
+            name: "pine".into(),
+            role: "Host".into(),
+            presence: "available".into(),
+            lan: true,
+            hint: String::new(),
+        }];
+        let _ = update(&mut hud, Message::DialRequested("PINE".into()));
+        assert_eq!(hud.dialer_input, "1007", "hostname resolves to its ext");
+
+        let _ = update(&mut hud, Message::DialRequested("1009".into()));
+        assert_eq!(hud.dialer_input, "1009", "unknown target dials verbatim");
+    }
+
+    #[test]
+    fn dial_request_ignores_empty_target() {
+        let mut hud = make_hud();
+        hud.dialer_input = "keep".into();
+        let _ = update(&mut hud, Message::DialRequested("  ".into()));
+        assert_eq!(hud.dialer_input, "keep");
     }
 
     #[test]
