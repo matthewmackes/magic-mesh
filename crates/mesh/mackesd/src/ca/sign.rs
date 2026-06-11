@@ -12,9 +12,17 @@ use rusqlite::Connection;
 
 use super::{seal, CaError, NebulaCertBackend};
 
-/// Default CIDR prefix length when callers don't override.
-/// Locked to /16 per the design doc's `10.42.0.0/16`.
-pub const DEFAULT_CIDR_PREFIX: u8 = 16;
+/// Default CIDR prefix length on a node's overlay cert.
+///
+/// **/17, not /16** — the `10.42.0.0/16` mesh is split into the peer
+/// subnet (`10.42.0.0/17`) and the VM subnet (`10.42.128.0/17`, reached
+/// via a `tun.unsafe_route` to the guest's host — see
+/// [`crate::workers::nebula_supervisor::VM_SUBNET_CIDR`]). nebula refuses
+/// an `unsafe_route` *contained within* the cert's own network, so a node
+/// cert MUST be the lower /17; a /16 cert silently broke the overlay
+/// (`nebula -config` exits 1, no `nebula1` interface) on every node that
+/// rendered the VM route. Found bringing up the local VM bed 2026-06-10.
+pub const DEFAULT_CIDR_PREFIX: u8 = 17;
 
 /// Default mesh CIDR; allocator walks it sequentially.
 pub const DEFAULT_MESH_CIDR_BASE: &str = "10.42.0.0";
@@ -324,7 +332,9 @@ mod tests {
         )
         .expect("sign");
         assert_eq!(signed.overlay_ip, "10.42.0.1");
-        assert!(signed.cert_pem.contains("ip=10.42.0.1/16"));
+        // /17 (the peer subnet) — NOT /16, so the VM /17 unsafe-route is
+        // outside the cert's network and nebula accepts the config.
+        assert!(signed.cert_pem.contains("ip=10.42.0.1/17"));
         assert!(signed.cert_pem.contains("groups=role:peer"));
         // Row landed.
         let count: i64 = conn

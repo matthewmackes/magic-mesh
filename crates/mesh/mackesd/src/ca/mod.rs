@@ -77,8 +77,9 @@ pub trait NebulaCertBackend: Send + Sync {
     fn mint_ca(&self, mesh_id: &str, crt_out: &Path, key_out: &Path) -> Result<(), CaError>;
 
     /// Equivalent of `nebula-cert sign -ca-crt <ca_crt> -ca-key <ca_key>
-    /// -name <node_id> -ip <overlay_ip>/16 -groups <groups>
-    /// -out-crt <crt_out> -out-key <key_out>`.
+    /// -name <node_id> -ip <overlay_ip>/<cidr_prefix> -groups <groups>
+    /// -out-crt <crt_out> -out-key <key_out>` (the prefix defaults to the
+    /// lower /17 peer subnet — see [`crate::ca::sign::DEFAULT_CIDR_PREFIX`]).
     fn sign_peer(
         &self,
         ca_crt: &Path,
