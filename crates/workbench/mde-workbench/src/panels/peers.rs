@@ -11,10 +11,11 @@
 //! empty roster → "Invite a peer".
 //!
 //! Per-peer ops (Call/SSH/RDP/VNC, PD-5), tag chips (L1 — tags join
-//! the directory record with the tag-manifest merge), device rows
-//! (L6) and the live map (PD-7) layer onto this surface in their own
-//! tasks. The legacy Mesh Topology panel keeps the graph until PD-7
-//! absorbs it.
+//! the directory record with the tag-manifest merge) and the live map
+//! (PD-7) layer onto this surface. L6 adds the **Devices** group: the
+//! paired KDE-Connect roster (`action/connect/devices`) renders below
+//! the peers with presence + battery, Ring + Send-file (the live
+//! Connect verbs), and a jump to the KDC hub.
 
 use std::time::Duration;
 
@@ -50,6 +51,17 @@ pub struct PeerRow {
     pub vms: Vec<(String, String)>,
 }
 
+/// PD-3/L6 — one paired KDE-Connect device as the directory renders it,
+/// parsed from the `action/connect/devices` roster (the daemon's
+/// `WireDevice`: `{id, name, online, battery}`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeviceRow {
+    pub id: String,
+    pub name: String,
+    pub online: bool,
+    pub battery: Option<u8>,
+}
+
 /// Panel state.
 #[derive(Debug, Clone, Default)]
 pub struct PeersPanel {
@@ -71,6 +83,14 @@ pub struct PeersPanel {
     pub map_view: bool,
     /// PD-7 — host→RTT from the mesh-latency cache.
     pub rtt: std::collections::HashMap<String, Option<f64>>,
+    /// PD-3/L6 — the paired KDE-Connect devices, rendered as their own
+    /// "Devices" group in the master list (fetched from
+    /// `action/connect/devices` alongside the directory).
+    pub devices: Vec<DeviceRow>,
+    /// PD-3/L6 — the selected device id (mutually exclusive with
+    /// `selected`: a peer selection clears this and vice-versa). When set,
+    /// the detail pane renders the device card instead of a peer.
+    pub selected_device: Option<String>,
 }
 
 /// PD-8 — the four L14 series, oldest→newest over the last ~60 s.
@@ -150,6 +170,30 @@ pub enum Message {
         id: String,
         attempts_left: u8,
         outcome: Option<Result<(), String>>,
+    },
+    /// PD-3/L6 — the paired-device roster resolved (fetched alongside the
+    /// directory). Replaces the `devices` list; preserves the device
+    /// selection if it's still present.
+    DevicesLoaded(Vec<DeviceRow>),
+    /// PD-3/L6 — a device row was clicked: select it (clears the peer
+    /// selection) so the detail pane shows the device card.
+    SelectDevice(String),
+    /// PD-3/L6 — Ring a paired device (`action/connect/ring`).
+    RingDevice {
+        id: String,
+        name: String,
+    },
+    /// PD-3/L6 — Send a file to a paired device: pick a file, then
+    /// `action/connect/share`. `None` path = the picker was cancelled.
+    SendFile {
+        id: String,
+        name: String,
+    },
+    /// PD-3/L6 — a Ring/Send-file verb resolved for `name`.
+    DeviceActionFinished {
+        name: String,
+        verb: &'static str,
+        ok: bool,
     },
 }
 
@@ -272,6 +316,40 @@ pub fn parse_directory(raw: &str) -> Result<Vec<PeerRow>, String> {
     Ok(rows)
 }
 
+/// PD-3/L6 — parse the `action/connect/devices` reply (a JSON array of
+/// `{id, name, online, battery}`) into device rows. A non-array / bad reply
+/// degrades to an empty roster (the Devices group simply doesn't render) —
+/// the KDC host may be absent on a peer that never paired anything.
+#[must_use]
+pub fn parse_devices(raw: &str) -> Vec<DeviceRow> {
+    serde_json::from_str::<serde_json::Value>(raw.trim())
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|d| {
+                    let id = d.get("id")?.as_str()?.to_string();
+                    let name = d
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(&id)
+                        .to_string();
+                    Some(DeviceRow {
+                        id,
+                        name,
+                        online: d.get("online").and_then(serde_json::Value::as_bool) == Some(true),
+                        battery: d
+                            .get("battery")
+                            .and_then(serde_json::Value::as_u64)
+                            .and_then(|b| u8::try_from(b).ok()),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Filter predicate (L2): hostname OR capability tag (L1) OR any
 /// offered-service line.
 #[must_use]
@@ -390,6 +468,50 @@ async fn dir_event_poll(cursor: Option<String>) -> (usize, Option<String>) {
     })
     .await
     .unwrap_or((0, None))
+}
+
+/// PD-3/L6 — fire a Connect verb (`action/connect/<verb>`) with a JSON body
+/// over the Bus and report whether the reply was `{"ok":true}`. Runs the
+/// blocking Bus client off-thread.
+async fn device_verb(topic: &'static str, body: String) -> bool {
+    tokio::task::spawn_blocking(move || {
+        crate::dbus::action_request_with_body(topic, Some(&body), Duration::from_secs(2))
+    })
+    .await
+    .ok()
+    .flatten()
+    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    .map(|v| v["ok"] == true)
+    .unwrap_or(false)
+}
+
+/// PD-3/L6 — shell out to the system file picker (`zenity --file-selection`)
+/// and return the chosen file's basename + byte size. `None` = cancelled,
+/// no selection, or no picker installed. The D-W1 no-toolkit-dep pattern.
+async fn pick_file() -> Option<(String, u64)> {
+    tokio::task::spawn_blocking(|| {
+        let out = std::process::Command::new("zenity")
+            .args(["--file-selection", "--title=Send a file to this device"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let path = String::from_utf8(out.stdout).ok()?.trim().to_string();
+        if path.is_empty() {
+            return None;
+        }
+        let size = std::fs::metadata(&path).ok()?.len();
+        let filename = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        Some((filename, size))
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// PD-11 — poll the executor's result file via the verb, with a 2 s
@@ -524,10 +646,11 @@ impl PeersPanel {
         }
     }
 
-    /// Fetch the directory (the Bus client needs its own thread —
-    /// same contract as the home-panel probes).
+    /// Fetch the directory + the paired-device roster (each Bus client
+    /// needs its own thread — same contract as the home-panel probes). The
+    /// two run as a batch so the Devices group (L6) lands alongside peers.
     pub fn load() -> Task<crate::Message> {
-        Task::perform(
+        let directory = Task::perform(
             async {
                 tokio::task::spawn_blocking(|| {
                     crate::dbus::action_request("action/mesh/directory", Duration::from_secs(2))
@@ -541,6 +664,25 @@ impl PeersPanel {
                 )
             },
             |result| crate::Message::Peers(Message::Loaded(result)),
+        );
+        Task::batch([directory, Self::fetch_devices()])
+    }
+
+    /// PD-3/L6 — query the KDC host's live roster over the Bus. A missing
+    /// host / empty roster resolves to no devices (the group hides).
+    pub fn fetch_devices() -> Task<crate::Message> {
+        Task::perform(
+            async {
+                tokio::task::spawn_blocking(|| {
+                    crate::dbus::action_request("action/connect/devices", Duration::from_secs(2))
+                })
+                .await
+                .ok()
+                .flatten()
+                .map(|raw| parse_devices(&raw))
+                .unwrap_or_default()
+            },
+            |devices| crate::Message::Peers(Message::DevicesLoaded(devices)),
         )
     }
 
@@ -571,6 +713,8 @@ impl PeersPanel {
             }
             Message::Select(host) => {
                 self.selected = Some(host);
+                // L6 — peer and device selection are mutually exclusive.
+                self.selected_device = None;
                 self.metrics = None;
                 self.metrics_err = None;
                 // A map-node click lands you on the peer's detail (W87).
@@ -826,6 +970,79 @@ impl PeersPanel {
                 }
                 None => poll_lifecycle_result(host, id, attempts_left),
             },
+            Message::DevicesLoaded(devices) => {
+                // Drop a stale device selection (device unpaired between polls).
+                if let Some(sel) = &self.selected_device {
+                    if !devices.iter().any(|d| &d.id == sel) {
+                        self.selected_device = None;
+                    }
+                }
+                self.devices = devices;
+                Task::none()
+            }
+            Message::SelectDevice(id) => {
+                self.selected_device = Some(id);
+                // L6 — clear the peer selection so the device card shows.
+                self.selected = None;
+                self.metrics = None;
+                self.metrics_err = None;
+                self.map_view = false;
+                Task::none()
+            }
+            Message::RingDevice { id, name } => {
+                self.op_result = format!("ringing {name}…");
+                Task::perform(
+                    async move {
+                        let body = serde_json::json!({ "device_id": id }).to_string();
+                        let ok = device_verb("action/connect/ring", body).await;
+                        (name, "Ring", ok)
+                    },
+                    |(name, verb, ok)| {
+                        crate::Message::Peers(Message::DeviceActionFinished { name, verb, ok })
+                    },
+                )
+            }
+            Message::SendFile { id, name } => {
+                self.op_result = format!("choose a file to send to {name}…");
+                Task::perform(
+                    async move {
+                        // D-W1 — shell out to the system file picker (no GUI
+                        // toolkit dep); the chosen path's basename + size ride
+                        // the share announce. Cancel / no picker → no send.
+                        let Some((filename, size)) = pick_file().await else {
+                            return (name, "Send-file", false, true);
+                        };
+                        let body = serde_json::json!({
+                            "device_id": id,
+                            "filename": filename,
+                            "payload_size": size,
+                        })
+                        .to_string();
+                        let ok = device_verb("action/connect/share", body).await;
+                        (name, "Send-file", ok, false)
+                    },
+                    |(name, verb, ok, cancelled)| {
+                        if cancelled {
+                            crate::Message::Peers(Message::DeviceActionFinished {
+                                name,
+                                verb: "Send-file-cancel",
+                                ok: false,
+                            })
+                        } else {
+                            crate::Message::Peers(Message::DeviceActionFinished { name, verb, ok })
+                        }
+                    },
+                )
+            }
+            Message::DeviceActionFinished { name, verb, ok } => {
+                self.op_result = match (verb, ok) {
+                    ("Send-file-cancel", _) => format!("send to {name} cancelled"),
+                    ("Ring", true) => format!("{name}: ringing now"),
+                    ("Send-file", true) => format!("{name}: file queued to send"),
+                    (v, _) => format!("{name}: {v} failed (device offline or unpaired?)"),
+                };
+                Task::none()
+            }
             Message::OpFinished { label, host, ok } => {
                 self.op_result = if ok {
                     format!("{label} {host}: launched")
@@ -942,12 +1159,73 @@ impl PeersPanel {
                 );
             }
         }
+        // PD-3/L6 — the paired KDE-Connect devices as their own group,
+        // below the peers. Filtered by the same box (device name).
+        let devices: Vec<&DeviceRow> = self
+            .devices
+            .iter()
+            .filter(|d| {
+                self.filter.is_empty() || d.name.to_lowercase().contains(&self.filter.to_lowercase())
+            })
+            .collect();
+        if !devices.is_empty() {
+            list = list.push(
+                text("Devices")
+                    .size(11)
+                    .color(palette.text_muted.into_iced_color()),
+            );
+            for d in devices {
+                let selected = self.selected_device.as_deref() == Some(d.id.as_str());
+                let pip = if d.online { "●" } else { "○" };
+                let batt = d
+                    .battery
+                    .map(|b| format!("  {b}%"))
+                    .unwrap_or_default();
+                let label = format!("{pip} {}{batt}", d.name);
+                let fg = if d.online {
+                    palette.text
+                } else {
+                    palette.text_muted
+                };
+                let bg = if selected {
+                    palette.raised
+                } else {
+                    palette.surface
+                };
+                let id = d.id.clone();
+                list = list.push(
+                    button(text(label).size(13).color(fg.into_iced_color()))
+                        .width(Length::Fill)
+                        .padding(Padding::from([6u16, 10u16]))
+                        .style(move |_t, _s| iced::widget::button::Style {
+                            snap: false,
+                            background: Some(Background::Color(bg.into_iced_color())),
+                            text_color: fg.into_iced_color(),
+                            border: Border {
+                                color: iced::Color::TRANSPARENT,
+                                width: 0.0,
+                                radius: 4.0.into(),
+                            },
+                            shadow: iced::Shadow::default(),
+                        })
+                        .on_press(crate::Message::Peers(Message::SelectDevice(id))),
+                );
+            }
+        }
         let left = column![filter_box, scrollable(list).height(Length::Fill)]
             .spacing(8)
             .width(Length::Fixed(240.0));
 
-        // Right: the detail pane.
-        let detail: Element<'_, crate::Message> = match self
+        // Right: the detail pane. A selected device (L6) takes priority
+        // and renders the device card; otherwise the peer detail.
+        let selected_device = self
+            .selected_device
+            .as_deref()
+            .and_then(|id| self.devices.iter().find(|d| d.id == id));
+        let detail: Element<'_, crate::Message> = if let Some(d) = selected_device {
+            device_detail(d, &self.op_result, palette)
+        } else {
+            match self
             .rows
             .iter()
             .find(|r| Some(r.hostname.as_str()) == self.selected.as_deref())
@@ -1241,6 +1519,7 @@ impl PeersPanel {
                 .spacing(16)
                 .into()
             }
+        }
         };
         let right = container(scrollable(detail))
             .width(Length::Fill)
@@ -1288,6 +1567,90 @@ impl PeersPanel {
             .height(Length::Fill);
         shell(title, body.into(), palette)
     }
+}
+
+/// PD-3/L6 — the device detail card: identity + presence/battery facts,
+/// Ring + Send-file (the live Connect verbs), and a jump to the KDC hub
+/// (the Connected Devices panel) for pairing + richer plugins.
+fn device_detail<'a>(
+    d: &'a DeviceRow,
+    op_result: &str,
+    palette: mde_theme::Palette,
+) -> Element<'a, crate::Message> {
+    let header = row![
+        text(&d.name)
+            .size(20)
+            .color(palette.text.into_iced_color()),
+        Space::new().width(Length::Fixed(10.0)),
+        badge("KDE Connect", palette),
+    ]
+    .align_y(iced::alignment::Vertical::Center);
+    // Ring is live only for an online device (offline phones can't ring).
+    let ring = crate::controls::variant_button(
+        "Ring",
+        crate::controls::ButtonVariant::Secondary,
+        d.online.then(|| {
+            crate::Message::Peers(Message::RingDevice {
+                id: d.id.clone(),
+                name: d.name.clone(),
+            })
+        }),
+        palette,
+    );
+    let send = crate::controls::variant_button(
+        "Send file…",
+        crate::controls::ButtonVariant::Secondary,
+        d.online.then(|| {
+            crate::Message::Peers(Message::SendFile {
+                id: d.id.clone(),
+                name: d.name.clone(),
+            })
+        }),
+        palette,
+    );
+    let hub = crate::controls::variant_button(
+        "Open in Connect hub",
+        crate::controls::ButtonVariant::Secondary,
+        Some(crate::Message::SelectPanel {
+            group: crate::model::Group::Devices,
+            panel: "connect",
+        }),
+        palette,
+    );
+    let ops = row![ring, send, hub].spacing(8);
+    let strip: Element<'_, crate::Message> = if op_result.is_empty() {
+        Space::new().height(Length::Fixed(0.0)).into()
+    } else {
+        text(op_result.to_string())
+            .size(12)
+            .color(palette.text_muted.into_iced_color())
+            .into()
+    };
+    let battery = d
+        .battery
+        .map(|b| format!("{b}%"))
+        .unwrap_or_else(|| "-".to_string());
+    // Battery carries an owned String, so it builds its own row (the
+    // `fact` helper borrows its value for the element lifetime).
+    let battery_row = row![
+        text("Battery")
+            .size(12)
+            .width(Length::Fixed(100.0))
+            .color(palette.text_muted.into_iced_color()),
+        text(battery).size(12).color(palette.text.into_iced_color()),
+    ];
+    let facts = column![
+        fact(
+            "Presence",
+            if d.online { "online" } else { "offline" },
+            palette
+        ),
+        battery_row,
+    ]
+    .spacing(4);
+    column![header, ops, strip, facts]
+        .spacing(16)
+        .into()
 }
 
 fn shell<'a>(
@@ -1605,6 +1968,93 @@ mod tests {
         });
         assert!(p.op_result.contains("failed to launch"));
         assert!(p.op_result.contains("cosmic-term"));
+    }
+
+    #[test]
+    fn parse_devices_reads_roster_and_degrades_on_garbage() {
+        // PD-3/L6 — the `action/connect/devices` reply is a JSON array.
+        let raw = r#"[
+            {"id":"d1","name":"Pixel","online":true,"battery":83},
+            {"id":"d2","name":"","online":false,"battery":null}
+        ]"#;
+        let devs = parse_devices(raw);
+        assert_eq!(devs.len(), 2);
+        assert_eq!(devs[0].name, "Pixel");
+        assert!(devs[0].online);
+        assert_eq!(devs[0].battery, Some(83));
+        // Empty name falls back to the id; null battery → None.
+        assert_eq!(devs[1].name, "d2");
+        assert!(!devs[1].online);
+        assert_eq!(devs[1].battery, None);
+        // A non-array / bad reply degrades to an empty roster.
+        assert!(parse_devices("not json").is_empty());
+        assert!(parse_devices(r#"{"ok":false}"#).is_empty());
+    }
+
+    #[test]
+    fn select_device_and_peer_are_mutually_exclusive_l6() {
+        let mut p = PeersPanel::new();
+        let _ = p.update(Message::Loaded(Ok(parse_directory(REPLY).unwrap())));
+        let _ = p.update(Message::DevicesLoaded(parse_devices(
+            r#"[{"id":"d1","name":"Pixel","online":true,"battery":50}]"#,
+        )));
+        let _ = p.update(Message::Select("pine".into()));
+        assert_eq!(p.selected.as_deref(), Some("pine"));
+        // Selecting a device clears the peer selection…
+        let _ = p.update(Message::SelectDevice("d1".into()));
+        assert_eq!(p.selected_device.as_deref(), Some("d1"));
+        assert!(p.selected.is_none());
+        // …and selecting a peer clears the device selection.
+        let _ = p.update(Message::Select("oak".into()));
+        assert!(p.selected_device.is_none());
+        assert_eq!(p.selected.as_deref(), Some("oak"));
+    }
+
+    #[test]
+    fn stale_device_selection_drops_when_unpaired() {
+        let mut p = PeersPanel::new();
+        let _ = p.update(Message::DevicesLoaded(parse_devices(
+            r#"[{"id":"d1","name":"Pixel","online":true,"battery":50}]"#,
+        )));
+        let _ = p.update(Message::SelectDevice("d1".into()));
+        assert_eq!(p.selected_device.as_deref(), Some("d1"));
+        // d1 unpairs (no longer in the roster) → selection drops.
+        let _ = p.update(Message::DevicesLoaded(vec![]));
+        assert!(p.selected_device.is_none());
+    }
+
+    #[test]
+    fn device_action_results_land_in_the_strip() {
+        let mut p = PeersPanel::new();
+        let _ = p.update(Message::DeviceActionFinished {
+            name: "Pixel".into(),
+            verb: "Ring",
+            ok: true,
+        });
+        assert!(p.op_result.contains("ringing now"));
+        let _ = p.update(Message::DeviceActionFinished {
+            name: "Pixel".into(),
+            verb: "Send-file",
+            ok: false,
+        });
+        assert!(p.op_result.contains("failed"));
+        let _ = p.update(Message::DeviceActionFinished {
+            name: "Pixel".into(),
+            verb: "Send-file-cancel",
+            ok: false,
+        });
+        assert!(p.op_result.contains("cancelled"));
+    }
+
+    #[test]
+    fn device_card_renders_without_panic() {
+        let mut p = PeersPanel::new();
+        let _ = p.update(Message::Loaded(Ok(parse_directory(REPLY).unwrap())));
+        let _ = p.update(Message::DevicesLoaded(parse_devices(
+            r#"[{"id":"d1","name":"Pixel","online":true,"battery":50}]"#,
+        )));
+        let _ = p.update(Message::SelectDevice("d1".into()));
+        let _ = p.view();
     }
 
     #[test]

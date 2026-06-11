@@ -51,7 +51,7 @@ use super::{ShutdownToken, Worker};
 /// the retired `dev.mackes.MDE.Connect` D-Bus surface). `version`/`list`/
 /// `get` read the store; `pair`/`unpair` mutate it; `ring`/`sms`/
 /// `clipboard` enqueue a `Packet` onto the outbound queue.
-const CONNECT_VERBS: [&str; 9] = [
+const CONNECT_VERBS: [&str; 10] = [
     "version",
     "list",
     "get",
@@ -61,6 +61,10 @@ const CONNECT_VERBS: [&str; 9] = [
     "ring",
     "sms",
     "clipboard",
+    // PD-3/L6 — the Peers "Devices" group's Send-file action enqueues a
+    // `kdeconnect.share.request` (file or URL/text) onto the outbound queue,
+    // same delivery path as ring/sms/clipboard.
+    "share",
 ];
 
 /// Bus topic the worker answers with the live device roster (E2.3 — the same
@@ -559,6 +563,53 @@ fn handle_connect_verb(
             });
             json!({ "ok": true })
         }
+        // PD-3/L6 — Send-file (or paste-share a URL) from the Peers Devices
+        // group. A `url` body builds a URL share; otherwise a `filename`
+        // (+ optional `payload_size`) builds a file-share announce. The
+        // binary payload streams over the KDC file-transfer port — the same
+        // KDC2-3 host follow-up that delivers ring/sms (the outbound queue
+        // is drained by `kdc_outbound`).
+        "share" => {
+            let Some(id) = dev_id() else {
+                return json!({ "ok": false, "error": "NoSuchDevice" }).to_string();
+            };
+            if !store.is_paired(&id) {
+                return json!({ "ok": false, "error": "NoSuchDevice" }).to_string();
+            }
+            let id_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+                .unwrap_or(0);
+            let url = body.get("url").and_then(Value::as_str).unwrap_or_default();
+            let filename = body
+                .get("filename")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let packet = if url.is_empty() {
+                if filename.is_empty() {
+                    return json!({ "ok": false, "error": "share: need url or filename" })
+                        .to_string();
+                }
+                let payload_size = body
+                    .get("payload_size")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                mde_kdc_proto::plugins::share::file_share_packet(
+                    id_ms,
+                    filename.to_string(),
+                    payload_size,
+                    String::new(),
+                )
+            } else {
+                let open = body.get("open").and_then(Value::as_bool).unwrap_or(true);
+                mde_kdc_proto::plugins::share::url_share_packet(id_ms, url.to_string(), open)
+            };
+            outbound.push(OutboundSend {
+                device_id: id,
+                packet,
+            });
+            json!({ "ok": true })
+        }
         other => json!({ "ok": false, "error": format!("unknown verb: {other}") }),
     };
     reply.to_string()
@@ -855,6 +906,57 @@ mod tests {
         .unwrap();
         assert_eq!(r2["ok"], true);
         assert_eq!(outbound.len(), 1);
+    }
+
+    #[test]
+    fn connect_verb_share_requires_paired_and_enqueues_file_or_url() {
+        // PD-3/L6 — Send-file from the Peers Devices group enqueues a
+        // share packet; an unpaired device is refused with nothing queued,
+        // and a share with neither url nor filename is rejected.
+        let tmp = tempdir().unwrap();
+        let store = test_store(tmp.path());
+        let outbound = PendingSends::new();
+        // share to an unpaired device -> NoSuchDevice, nothing queued.
+        let r: Value = serde_json::from_str(&handle_connect_verb(
+            &store,
+            &outbound,
+            "share",
+            &json!({ "device_id": "d1", "filename": "report.pdf" }),
+        ))
+        .unwrap();
+        assert_eq!(r["error"], "NoSuchDevice");
+        assert_eq!(outbound.len(), 0);
+        handle_connect_verb(&store, &outbound, "pair", &pair_body("d1", "Pixel"));
+        // empty share (no url, no filename) is rejected, still nothing queued.
+        let empty: Value = serde_json::from_str(&handle_connect_verb(
+            &store,
+            &outbound,
+            "share",
+            &json!({ "device_id": "d1" }),
+        ))
+        .unwrap();
+        assert_eq!(empty["ok"], false);
+        assert_eq!(outbound.len(), 0);
+        // file share -> ok + one queued packet.
+        let f: Value = serde_json::from_str(&handle_connect_verb(
+            &store,
+            &outbound,
+            "share",
+            &json!({ "device_id": "d1", "filename": "report.pdf", "payload_size": 2048 }),
+        ))
+        .unwrap();
+        assert_eq!(f["ok"], true);
+        assert_eq!(outbound.len(), 1);
+        // url share -> ok + a second queued packet.
+        let u: Value = serde_json::from_str(&handle_connect_verb(
+            &store,
+            &outbound,
+            "share",
+            &json!({ "device_id": "d1", "url": "https://example.com" }),
+        ))
+        .unwrap();
+        assert_eq!(u["ok"], true);
+        assert_eq!(outbound.len(), 2);
     }
 
     #[tokio::test(flavor = "current_thread")]
