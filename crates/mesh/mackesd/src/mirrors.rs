@@ -102,6 +102,171 @@ pub fn core_pack() -> Vec<Mirror> {
     }]
 }
 
+// ─────────────────────────────────────────────────────────────────
+// W63 — the one-puller sync. A node pulls the upstream dnf repo into
+// the mirror's local_dir + (re)builds repo metadata with createrepo_c,
+// then stamps `.last-sync`; LizardFS replicates the result so every
+// other node serves it from the `file://` mount without pulling again.
+// ─────────────────────────────────────────────────────────────────
+
+/// What one successful sync produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncReport {
+    /// The mirror that was synced.
+    pub name: String,
+    /// Where the RPMs + repodata landed on the replicated mount.
+    pub local_dir: PathBuf,
+    /// Count of RPMs present after the pull.
+    pub rpm_count: u32,
+    /// Unix-ms stamped into `.last-sync`.
+    pub synced_at_ms: u64,
+    /// The `file://` baseurl nodes now serve themselves from (W62).
+    pub served_baseurl: String,
+}
+
+/// Why a sync did not complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MirrorSyncError {
+    /// The mirror is `enabled = false` — the puller skips it.
+    Disabled,
+    /// Creating the local mirror dir failed.
+    MkDir(String),
+    /// `dnf reposync` failed (binary missing, network, bad upstream).
+    Reposync(String),
+    /// `createrepo_c` failed (binary missing, bad tree).
+    Createrepo(String),
+    /// Writing the `.last-sync` marker failed.
+    Marker(String),
+}
+
+impl std::fmt::Display for MirrorSyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => write!(f, "mirror is disabled (enabled = false)"),
+            Self::MkDir(e) => write!(f, "create mirror dir: {e}"),
+            Self::Reposync(e) => write!(f, "dnf reposync: {e}"),
+            Self::Createrepo(e) => write!(f, "createrepo_c: {e}"),
+            Self::Marker(e) => write!(f, "write .last-sync: {e}"),
+        }
+    }
+}
+impl std::error::Error for MirrorSyncError {}
+
+/// The two subprocess steps a sync shells out — behind a trait so the
+/// sync orchestration (dir creation, marker write, report assembly) is
+/// unit-tested with a mock, exactly as the CA flow mocks `nebula-cert`
+/// via [`crate::ca::NebulaCertBackend`]. `reposync` returns the count of
+/// RPMs present in `dest` after the pull.
+pub trait MirrorSyncRunner {
+    /// Mirror `upstream` (a dnf repo baseurl) into `dest`. Returns the
+    /// number of `.rpm` files present afterwards.
+    ///
+    /// # Errors
+    /// A human-readable string on subprocess failure.
+    fn reposync(&self, name: &str, upstream: &str, dest: &Path) -> Result<u32, String>;
+    /// (Re)build `repodata/` over `dir` with `createrepo_c`.
+    ///
+    /// # Errors
+    /// A human-readable string on subprocess failure.
+    fn createrepo(&self, dir: &Path) -> Result<(), String>;
+}
+
+/// Production runner: shells the real Fedora tools (`Requires: dnf-plugins-core`
+/// for `dnf reposync`, `createrepo_c` for the indexer — both pulled by the RPM).
+pub struct SubprocessSync;
+
+impl MirrorSyncRunner for SubprocessSync {
+    fn reposync(&self, name: &str, upstream: &str, dest: &Path) -> Result<u32, String> {
+        // `--repofrompath` defines an ad-hoc repo so no /etc/yum.repos.d
+        // file is needed; `--norepopath` drops the packages straight into
+        // `dest` (not `dest/<name>`) so the `file://` baseurl resolves.
+        let out = std::process::Command::new("dnf")
+            .arg("reposync")
+            .arg(format!("--repofrompath={name},{upstream}"))
+            .arg(format!("--repoid={name}"))
+            .arg("--download-path")
+            .arg(dest)
+            .arg("--norepopath")
+            .arg("--delete")
+            .output()
+            .map_err(|e| format!("spawn dnf reposync: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "exit {:?}: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(count_rpms(dest))
+    }
+
+    fn createrepo(&self, dir: &Path) -> Result<(), String> {
+        let out = std::process::Command::new("createrepo_c")
+            .arg("--update")
+            .arg(dir)
+            .output()
+            .map_err(|e| format!("spawn createrepo_c: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "exit {:?}: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    }
+}
+
+/// Count `.rpm` files directly under `dir` (non-recursive — `--norepopath`
+/// drops them flat). Missing dir → 0.
+#[must_use]
+pub fn count_rpms(dir: &Path) -> u32 {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "rpm"))
+                .count() as u32
+        })
+        .unwrap_or(0)
+}
+
+/// Sync one mirror: create its dir, pull the upstream repo, rebuild the
+/// metadata, stamp `.last-sync` with `now_ms`. `now_ms` is injected (not
+/// read from the clock here) so the orchestration is deterministically
+/// testable. A disabled mirror is refused before any work.
+///
+/// # Errors
+/// [`MirrorSyncError`] at the first failing step.
+pub fn sync_mirror<R: MirrorSyncRunner + ?Sized>(
+    runner: &R,
+    mirror: &Mirror,
+    workgroup_root: &Path,
+    now_ms: u64,
+) -> Result<SyncReport, MirrorSyncError> {
+    if !mirror.enabled {
+        return Err(MirrorSyncError::Disabled);
+    }
+    let dir = mirror.local_dir(workgroup_root);
+    std::fs::create_dir_all(&dir).map_err(|e| MirrorSyncError::MkDir(e.to_string()))?;
+    let rpm_count = runner
+        .reposync(&mirror.name, &mirror.upstream, &dir)
+        .map_err(MirrorSyncError::Reposync)?;
+    runner
+        .createrepo(&dir)
+        .map_err(MirrorSyncError::Createrepo)?;
+    // Stamp freshness LAST — only a fully-indexed mirror is "synced".
+    std::fs::write(dir.join(".last-sync"), now_ms.to_string())
+        .map_err(|e| MirrorSyncError::Marker(e.to_string()))?;
+    Ok(SyncReport {
+        name: mirror.name.clone(),
+        local_dir: dir.clone(),
+        rpm_count,
+        synced_at_ms: now_ms,
+        served_baseurl: mirror.file_baseurl(workgroup_root),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +312,93 @@ mod tests {
         assert_eq!(m.upstream, "https://example/repo/");
         assert!(!m.enabled);
         assert_eq!(mirrors.len(), 1);
+    }
+
+    // ---- W63 sync ------------------------------------------------
+
+    /// Mock runner: records the calls, writes a couple of fake RPMs so
+    /// the orchestration's real dir + marker writes are exercised, and
+    /// returns a canned count — no `dnf`/`createrepo_c` needed.
+    struct MockRunner {
+        fail_reposync: bool,
+        fail_createrepo: bool,
+    }
+    impl MirrorSyncRunner for MockRunner {
+        fn reposync(&self, _name: &str, _upstream: &str, dest: &Path) -> Result<u32, String> {
+            if self.fail_reposync {
+                return Err("network unreachable".into());
+            }
+            std::fs::write(dest.join("pkg-a-1.0.rpm"), b"rpm").unwrap();
+            std::fs::write(dest.join("pkg-b-2.0.rpm"), b"rpm").unwrap();
+            Ok(count_rpms(dest))
+        }
+        fn createrepo(&self, dir: &Path) -> Result<(), String> {
+            if self.fail_createrepo {
+                return Err("createrepo_c not found".into());
+            }
+            std::fs::create_dir_all(dir.join("repodata")).unwrap();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sync_mirror_pulls_indexes_and_stamps_last_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = &core_pack()[0];
+        let runner = MockRunner {
+            fail_reposync: false,
+            fail_createrepo: false,
+        };
+        let report = sync_mirror(&runner, m, tmp.path(), 1_700_000_000_000).expect("sync");
+        assert_eq!(report.name, "magic-mesh");
+        assert_eq!(report.rpm_count, 2);
+        assert_eq!(report.synced_at_ms, 1_700_000_000_000);
+        assert_eq!(report.served_baseurl, m.file_baseurl(tmp.path()));
+        // The marker is on disk AND readable back through the model.
+        assert_eq!(m.last_sync_ms(tmp.path()), Some(1_700_000_000_000));
+        assert!(m.local_dir(tmp.path()).join("repodata").exists());
+    }
+
+    #[test]
+    fn sync_mirror_refuses_a_disabled_mirror_before_any_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = core_pack()[0].clone();
+        m.enabled = false;
+        let runner = MockRunner {
+            fail_reposync: false,
+            fail_createrepo: false,
+        };
+        let r = sync_mirror(&runner, &m, tmp.path(), 1);
+        assert_eq!(r, Err(MirrorSyncError::Disabled));
+        // No dir, no marker — the refusal short-circuits before mkdir.
+        assert!(m.last_sync_ms(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn sync_mirror_does_not_stamp_when_reposync_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = &core_pack()[0];
+        let runner = MockRunner {
+            fail_reposync: true,
+            fail_createrepo: false,
+        };
+        let r = sync_mirror(&runner, m, tmp.path(), 1);
+        assert!(matches!(r, Err(MirrorSyncError::Reposync(_))));
+        // Freshness is stamped LAST — a failed pull leaves no .last-sync,
+        // so the mirror never falsely reports as synced.
+        assert!(m.last_sync_ms(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn sync_mirror_does_not_stamp_when_createrepo_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = &core_pack()[0];
+        let runner = MockRunner {
+            fail_reposync: false,
+            fail_createrepo: true,
+        };
+        let r = sync_mirror(&runner, m, tmp.path(), 1);
+        assert!(matches!(r, Err(MirrorSyncError::Createrepo(_))));
+        assert!(m.last_sync_ms(tmp.path()).is_none());
     }
 }

@@ -714,11 +714,20 @@ enum Cmd {
     /// emits every mirror (the `magic-mesh` GitHub-RPM core pack + any
     /// TOML in `<root>/mirrors/`): upstream, the `file://` baseurl every
     /// node serves itself from (W62), and the last-sync freshness (W63).
-    /// The Provisioning ▸ Mirrors panel consumes the JSON.
+    /// The Provisioning ▸ Mirrors panel consumes the JSON. `--sync <name>`
+    /// (or `--sync-all`) runs the W63 one-puller: `dnf reposync` the
+    /// upstream into the LizardFS mirror dir, `createrepo_c` the metadata,
+    /// then stamp `.last-sync` (LizardFS replicates it to every node).
     Mirrors {
         /// Emit the JSON array instead of the table.
         #[arg(long)]
         json: bool,
+        /// Sync just this mirror (by name) instead of listing.
+        #[arg(long, value_name = "NAME")]
+        sync: Option<String>,
+        /// Sync every enabled mirror instead of listing.
+        #[arg(long)]
+        sync_all: bool,
     },
 
     /// PLANES-22 — the image catalog. `mded images --json` emits the
@@ -3937,12 +3946,56 @@ fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        Cmd::Mirrors { json } => {
+        Cmd::Mirrors {
+            json,
+            sync,
+            sync_all,
+        } => {
             // PLANES-24 — the package-mirror catalog (core pack + TOML),
             // each with its file:// serving baseurl + last-sync state.
             use mackesd_core::mirrors;
             let root = mackesd_core::default_qnm_shared_root();
             let list = mirrors::load_mirrors(&root);
+            // W63 — the one-puller sync path. `--sync <name>` / `--sync-all`
+            // reposync the upstream into the LizardFS mirror dir, createrepo_c
+            // the metadata, then stamp `.last-sync`.
+            if sync.is_some() || sync_all {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64);
+                let targets: Vec<&mirrors::Mirror> = if let Some(name) = &sync {
+                    match list.iter().find(|m| &m.name == name) {
+                        Some(m) => vec![m],
+                        None => {
+                            eprintln!("mackesd mirrors: no mirror named '{name}'");
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    list.iter().filter(|m| m.enabled).collect()
+                };
+                if targets.is_empty() {
+                    eprintln!("mackesd mirrors: nothing to sync (no enabled mirrors)");
+                    return Ok(());
+                }
+                let mut failures = 0;
+                for m in targets {
+                    match mirrors::sync_mirror(&mirrors::SubprocessSync, m, &root, now_ms) {
+                        Ok(r) => println!(
+                            "synced {} — {} rpm(s) → {} (@{})",
+                            r.name, r.rpm_count, r.served_baseurl, r.synced_at_ms
+                        ),
+                        Err(e) => {
+                            failures += 1;
+                            eprintln!("mackesd mirrors: sync {} failed: {e}", m.name);
+                        }
+                    }
+                }
+                if failures > 0 {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
             if json {
                 let rows: Vec<serde_json::Value> = list
                     .iter()
