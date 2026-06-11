@@ -196,6 +196,67 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// PD-3 / Q10 — the topic the responder publishes a tiny "directory
+/// changed" event on when the joined roster meaningfully changes, so the
+/// Peers Front Door refreshes on **push** (not just its 30 s poll).
+pub const EVENT_TOPIC: &str = "event/mesh/directory";
+
+/// How many `POLL_INTERVAL` sweeps between change-detect passes (~3 s at
+/// 400 ms) — frequent enough to feel live, rare enough not to re-read
+/// every peer file 2½×/s.
+const CHANGE_DETECT_EVERY: u64 = 8;
+
+/// A digest of the *change-relevant* directory fields (hostnames,
+/// presence, health, revision currency, tags).
+///
+/// A heartbeat-only `last_seen_ms` bump doesn't change it (no event
+/// spam); a real presence/health/membership/tag change does.
+#[must_use]
+pub fn directory_digest(dir: &serde_json::Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if let Some(peers) = dir.get("peers").and_then(|p| p.as_array()) {
+        for p in peers {
+            for k in ["hostname", "presence", "health"] {
+                p.get(k).and_then(|v| v.as_str()).unwrap_or("").hash(&mut h);
+            }
+            p["revision"]["currency"]
+                .as_str()
+                .unwrap_or("")
+                .hash(&mut h);
+            for t in p
+                .get("tags")
+                .and_then(|t| t.as_array())
+                .into_iter()
+                .flatten()
+            {
+                t.as_str().unwrap_or("").hash(&mut h);
+            }
+        }
+    }
+    h.finish()
+}
+
+/// PD-3 / Q10 — publish a directory-changed event when the digest moves.
+/// The first sweep only seeds `last` (startup state isn't a "change").
+pub fn poll_directory_change(
+    persist: &Persist,
+    svc: &DirectoryService,
+    last: &mut Option<u64>,
+    now_ms: u64,
+) {
+    let digest = directory_digest(&svc.build_directory(now_ms));
+    if *last == Some(digest) {
+        return;
+    }
+    let seeding = last.is_none();
+    *last = Some(digest);
+    if !seeding {
+        let body = json!({ "ok": true, "changed_at_ms": now_ms }).to_string();
+        let _ = persist.write(EVENT_TOPIC, Priority::Default, None, Some(&body));
+    }
+}
+
 /// Run the directory Bus responder until `should_stop()` — same
 /// dedicated-OS-thread shape as the fleet responder.
 pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &DirectoryService, should_stop: F) {
@@ -203,11 +264,18 @@ pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &DirectoryService, sho
     let mut wake_cursor: Option<String> = None;
     let mut lifecycle_cursor: Option<String> = None;
     let mut result_cursor: Option<String> = None;
+    let mut last_digest: Option<u64> = None;
+    let mut tick: u64 = 0;
     while !should_stop() {
         poll_once(persist, svc, &mut cursor);
         poll_wake_once(persist, &mut wake_cursor);
         poll_lifecycle_once(persist, svc, &mut lifecycle_cursor);
         poll_lifecycle_result_once(persist, svc, &mut result_cursor);
+        // PD-3/Q10 — push a change event ~every 3 s when the roster moves.
+        if tick % CHANGE_DETECT_EVERY == 0 {
+            poll_directory_change(persist, svc, &mut last_digest, now_ms());
+        }
+        tick = tick.wrapping_add(1);
         std::thread::sleep(POLL_INTERVAL);
     }
 }
@@ -522,6 +590,61 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(bad["ok"], false);
+    }
+
+    #[test]
+    fn directory_digest_ignores_heartbeat_bumps_but_catches_real_changes() {
+        // PD-3/Q10 — last_seen_ms bumps must not change the digest (no
+        // event spam); presence/health/tags must.
+        let base = json!({"peers":[{
+            "hostname":"pine","presence":"online","health":"healthy",
+            "last_seen_ms": 100, "revision":{"currency":"synced"}, "tags":["execution"],
+        }]});
+        let mut bumped = base.clone();
+        bumped["peers"][0]["last_seen_ms"] = json!(999_999);
+        assert_eq!(directory_digest(&base), directory_digest(&bumped));
+
+        let mut degraded = base.clone();
+        degraded["peers"][0]["health"] = json!("degraded");
+        assert_ne!(directory_digest(&base), directory_digest(&degraded));
+
+        let mut retagged = base.clone();
+        retagged["peers"][0]["tags"] = json!(["execution", "headless"]);
+        assert_ne!(directory_digest(&base), directory_digest(&retagged));
+    }
+
+    #[test]
+    fn poll_directory_change_seeds_then_publishes_on_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let pdir = mackes_mesh_types::peers::peers_dir(root);
+        std::fs::create_dir_all(&pdir).unwrap();
+        let now = now_ms();
+        let mut rec = PeerRecord {
+            hostname: "pine".into(),
+            mde_version: Some("4.2.1".into()),
+            last_seen_ms: now,
+            health: "healthy".into(),
+            descriptors: None,
+        };
+        write_peer_record(&pdir, &rec).unwrap();
+
+        let bus = tmp.path().join("bus");
+        let persist = mde_bus::persist::Persist::open(bus).unwrap();
+        let svc = DirectoryService::new(root, None);
+        let mut last: Option<u64> = None;
+
+        // First sweep seeds — no event.
+        poll_directory_change(&persist, &svc, &mut last, now);
+        assert!(persist.list_since(EVENT_TOPIC, None).unwrap().is_empty());
+        // No change → still no event.
+        poll_directory_change(&persist, &svc, &mut last, now);
+        assert!(persist.list_since(EVENT_TOPIC, None).unwrap().is_empty());
+        // A real change (health) → one event.
+        rec.health = "degraded".into();
+        write_peer_record(&pdir, &rec).unwrap();
+        poll_directory_change(&persist, &svc, &mut last, now);
+        assert_eq!(persist.list_since(EVENT_TOPIC, None).unwrap().len(), 1);
     }
 
     #[test]

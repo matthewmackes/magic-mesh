@@ -771,6 +771,9 @@ impl App {
             // PD-3/Q10 — refresh the directory itself every 30 s while
             // the Front Door is open, so presence/health/tags stay live.
             subs.push(peers_panel::directory_subscription());
+            // PD-3/Q10 — plus the Bus-push half: reload the instant the
+            // responder reports a roster change.
+            subs.push(peers_panel::directory_event_subscription());
         }
         Subscription::batch(subs)
     }

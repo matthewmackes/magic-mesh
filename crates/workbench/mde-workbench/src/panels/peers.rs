@@ -324,6 +324,70 @@ pub fn directory_subscription() -> iced::Subscription<crate::Message> {
     iced::time::every(Duration::from_secs(30)).map(|_| crate::Message::Peers(Message::PollTick))
 }
 
+/// PD-3/Q10 — the **Bus-push** half: subscribe to the directory-changed
+/// event the responder publishes (`event/mesh/directory`) and reload the
+/// instant the roster changes, instead of waiting out the 30 s poll. The
+/// poll stays registered as a backstop in case an event is missed.
+const DIRECTORY_EVENT_TOPIC: &str = "event/mesh/directory";
+
+#[must_use]
+pub fn directory_event_subscription() -> iced::Subscription<crate::Message> {
+    use iced::futures::SinkExt;
+    iced::Subscription::run(|| {
+        iced::stream::channel(
+            8,
+            |mut output: iced::futures::channel::mpsc::Sender<crate::Message>| async move {
+                let mut cursor = dir_event_cursor_init().await;
+                loop {
+                    tokio::time::sleep(Duration::from_millis(900)).await;
+                    let (n, next) = dir_event_poll(cursor.clone()).await;
+                    cursor = next;
+                    for _ in 0..n {
+                        let _ = output.send(crate::Message::Peers(Message::PollTick)).await;
+                    }
+                }
+            },
+        )
+    })
+}
+
+/// Seed the cursor at the latest existing event so the subscription only
+/// reacts to changes published *after* it starts.
+async fn dir_event_cursor_init() -> Option<String> {
+    tokio::task::spawn_blocking(|| {
+        let dir = mde_bus::default_data_dir()?;
+        let persist = mde_bus::persist::Persist::open(dir).ok()?;
+        persist
+            .list_since(DIRECTORY_EVENT_TOPIC, None)
+            .ok()?
+            .last()
+            .map(|m| m.ulid.clone())
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Count new directory-changed events since `cursor`; return the count +
+/// the advanced cursor. Bus unavailable → no events, cursor unchanged.
+async fn dir_event_poll(cursor: Option<String>) -> (usize, Option<String>) {
+    tokio::task::spawn_blocking(move || {
+        let Some(dir) = mde_bus::default_data_dir() else {
+            return (0, cursor);
+        };
+        let Ok(persist) = mde_bus::persist::Persist::open(dir) else {
+            return (0, cursor);
+        };
+        let msgs = persist
+            .list_since(DIRECTORY_EVENT_TOPIC, cursor.as_deref())
+            .unwrap_or_default();
+        let next = msgs.last().map(|m| m.ulid.clone()).or(cursor);
+        (msgs.len(), next)
+    })
+    .await
+    .unwrap_or((0, None))
+}
+
 /// PD-11 — poll the executor's result file via the verb, with a 2 s
 /// gap between attempts.
 fn poll_lifecycle_result(host: String, id: String, attempts_left: u8) -> Task<crate::Message> {
