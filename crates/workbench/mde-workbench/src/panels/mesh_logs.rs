@@ -174,14 +174,14 @@ impl MeshLogsPanel {
                 } else {
                     ButtonVariant::Ghost
                 },
-                (!active).then(|| crate::Message::MeshLogs(Message::SetWindow(w.since))),
+                (!active).then_some(crate::Message::MeshLogs(Message::SetWindow(w.since))),
                 palette,
             ));
         }
         controls = controls.push(variant_button(
             "Refresh",
             ButtonVariant::Ghost,
-            (!self.busy).then(|| crate::Message::MeshLogs(Message::RefreshClicked)),
+            (!self.busy).then_some(crate::Message::MeshLogs(Message::RefreshClicked)),
             palette,
         ));
         // W23 — Netdata metrics deep-link (the strip embeds on Cosmic; the
@@ -201,9 +201,20 @@ impl MeshLogsPanel {
                 .into()
         };
 
+        // PLANES-2 — the journal/metrics panel is the Netdata surface.
+        let netdata = crate::panel_chrome::hero_band(
+            mde_theme::hero::Hero::Netdata,
+            crate::panel_chrome::pkg_version_cached("netdata").as_deref(),
+            palette,
+        );
         crate::panel_chrome::panel_container(
             column![
-                text(format!("Mesh daemon journal — {MESH_UNIT}")).size(20),
+                row![
+                    text(format!("Mesh daemon journal — {MESH_UNIT}")).size(20),
+                    iced::widget::Space::new().width(Length::Fill),
+                    netdata,
+                ]
+                .align_y(iced::Alignment::Center),
                 controls,
                 body,
             ]

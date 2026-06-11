@@ -184,7 +184,19 @@ impl ThemesPanel {
             palette,
         );
 
+        // PLANES-2 — Look & Feel rides on COSMIC; carry its hero.
+        let cosmic = crate::panel_chrome::hero_band(
+            mde_theme::hero::Hero::Cosmic,
+            crate::panel_chrome::pkg_version_cached("cosmic-comp").as_deref(),
+            palette,
+        );
         column![
+            row![
+                text("Appearance").size(20),
+                iced::widget::Space::new().width(Length::Fill),
+                cosmic,
+            ]
+            .align_y(iced::Alignment::Center),
             row![text("Theme").width(Length::Fixed(120.0)), theme_pick].spacing(12),
             row![text("Density").width(Length::Fixed(120.0)), density_pick].spacing(12),
             row![apply_btn, text(&self.status).size(13)].spacing(12),
