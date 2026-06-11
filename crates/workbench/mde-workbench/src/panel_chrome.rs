@@ -299,7 +299,7 @@ pub fn empty_state<'a, Message: Clone + 'a>(
         .align_x(alignment::Horizontal::Center);
 
     let mut col: Column<'a, Message> = column![icon_slot, heading, body]
-        .spacing(HEADING_BODY_GAP as f32)
+        .spacing(HEADING_BODY_GAP)
         .align_x(alignment::Horizontal::Center);
 
     if let Some(label) = state.cta_label {
@@ -521,12 +521,56 @@ pub fn tooltip<'a, Message: 'a>(body: impl Into<String>, palette: Palette) -> El
     .into()
 }
 
-/// PLANES-2 (H3/H4/H8/H10) — the primary-service **hero band**: a
+/// PLANES-2 / H8 — the installed version of a distro **package**, from
+/// `rpm -q <pkg>` (the NVR string), or `None` when it isn't installed —
+/// the uniform, honest version source for hero captions. Call from a
+/// panel's `load()` (it shells out), never from `view()`.
+#[must_use]
+pub fn pkg_version(pkg: &str) -> Option<String> {
+    let out = std::process::Command::new("rpm")
+        .args(["-q", pkg])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if s.is_empty() || s.contains("not installed") {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// PLANES-2 — process-lifetime memo of [`pkg_version`] so a panel can
+/// caption its hero straight from `view()` without threading a version
+/// field through its load/state. The first lookup per package shells
+/// `rpm -q` once; every later call (and every repaint) is a map hit.
+#[must_use]
+pub fn pkg_version_cached(pkg: &str) -> Option<String> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Option<String>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Ok(map) = cache.lock() {
+        if let Some(hit) = map.get(pkg) {
+            return hit.clone();
+        }
+    }
+    let v = pkg_version(pkg);
+    if let Ok(mut map) = cache.lock() {
+        map.insert(pkg.to_string(), v.clone());
+    }
+    v
+}
+
+/// PLANES-2 (H3/H4/H8/H9/H10) — the primary-service **hero band**: a
 /// service's monochrome line-art (tinted with the single `HERO_STROKE`
 /// Carbon token, §4 — H6/H7) at 112 px, captioned with the service NAME
 /// (H8) and a live version, or an honest "not installed" when the
-/// service is absent (the art always renders — H10). A primary-service
-/// panel drops this into its header, aligned right (H3/H4).
+/// service is absent (the art always renders — H10). Hovering reveals a
+/// small stack card (H9). A primary-service panel drops this into its
+/// header, aligned right (H3/H4).
 pub fn hero_band<'a, Message: 'a>(
     hero: mde_theme::hero::Hero,
     version: Option<&str>,
@@ -544,18 +588,29 @@ pub fn hero_band<'a, Message: 'a>(
         Some(v) if !v.is_empty() => v.to_string(),
         _ => "not installed".to_string(),
     };
-    column![
+    let band = column![
         art,
         text(hero.name())
             .size(13)
             .color(palette.text.into_iced_color()),
-        text(caption)
+        text(caption.clone())
             .size(11)
             .color(palette.text_muted.into_iced_color()),
     ]
     .spacing(2)
-    .align_x(alignment::Horizontal::Center)
-    .into()
+    .align_x(alignment::Horizontal::Center);
+    // H9 — hover reveals a small "stack card": the service's role in the
+    // Magic Mesh platform + its version line.
+    let card = tooltip(
+        format!(
+            "{} — {caption}\npart of the Magic Mesh platform stack",
+            hero.name()
+        ),
+        palette,
+    );
+    iced::widget::tooltip(band, card, iced::widget::tooltip::Position::Bottom)
+        .gap(6.0)
+        .into()
 }
 
 #[cfg(test)]

@@ -8,7 +8,10 @@ use std::time::SystemTime;
 
 use iced::widget::{button, column, container, row, scrollable, text, Space};
 use iced::{Background, Border, Color, Element, Length, Padding, Task, Theme};
+use mde_theme::hero::Hero;
 use mde_theme::{FontSize, Palette, TypeRole};
+
+use crate::panel_chrome::{hero_band, pkg_version_cached};
 
 fn human_bytes(b: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
@@ -147,8 +150,20 @@ impl MeshStoragePanel {
         })
         .on_press(crate::Message::MeshStorage(Message::RefreshClicked));
 
-        let header = row![title, Space::new().width(Length::Fill), refresh_btn]
-            .align_y(iced::Alignment::Center);
+        // PLANES-2 — Mesh Storage is the LizardFS surface; carry its hero.
+        let lizardfs = hero_band(
+            Hero::LizardFs,
+            pkg_version_cached("lizardfs-client").as_deref(),
+            palette,
+        );
+        let header = row![
+            title,
+            Space::new().width(Length::Fill),
+            refresh_btn,
+            lizardfs
+        ]
+        .spacing(12)
+        .align_y(iced::Alignment::Center);
         let sub_row = row![subtitle];
 
         let body: Element<'_, crate::Message> = if let Some(ref e) = self.error {
