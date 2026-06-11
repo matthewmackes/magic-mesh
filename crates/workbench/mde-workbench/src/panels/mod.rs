@@ -45,12 +45,12 @@ pub mod mesh_logs;
 pub mod mesh_pending;
 pub mod mesh_services;
 pub mod mesh_storage;
-pub mod node_roster;
 pub mod mirrors;
 pub mod mouse;
 pub mod music;
 pub mod network_hosts;
 pub mod node_roles;
+pub mod node_roster;
 pub mod notifications;
 pub mod panel_apps;
 /// PD-3 — the Peers directory (the Front Door).

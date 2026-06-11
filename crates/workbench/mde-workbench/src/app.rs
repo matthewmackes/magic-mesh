@@ -32,8 +32,7 @@ use crate::panels::{
     mesh_history as mesh_history_panel, mesh_join as mesh_join_panel, mesh_logs as mesh_logs_panel,
     mesh_pending as mesh_pending_panel, mesh_services as mesh_services_panel,
     mesh_storage as mesh_storage_panel, mirrors as mirrors_panel, mouse as mouse_panel,
-    music as music_panel,
-    network_hosts as network_hosts_panel, node_roles as node_roles_panel,
+    music as music_panel, network_hosts as network_hosts_panel, node_roles as node_roles_panel,
     notifications as notifications_panel, panel_apps as panel_apps_panel, peers as peers_panel,
     playbooks as playbooks_panel, policy as policy_panel, power as power_panel,
     printers as printers_panel, profiles as profiles_panel, registration as registration_panel,
@@ -771,6 +770,19 @@ impl App {
             // PD-3/Q10 — plus the Bus-push half: reload the instant the
             // responder reports a roster change.
             subs.push(peers_panel::directory_event_subscription());
+            // PD-7 — the live map's flow + trace ticks, each view-gated so
+            // nothing polls when the map is closed / no edge is traced, and
+            // the particle-animation loop runs only while real traffic flows
+            // (L18/L22 — idle mesh ≈ idle CPU).
+            if self.peers.map_view {
+                subs.push(peers_panel::flow_data_subscription());
+            }
+            if self.peers.has_flow() {
+                subs.push(peers_panel::flow_anim_subscription());
+            }
+            if self.peers.traced_edge.is_some() {
+                subs.push(peers_panel::trace_subscription());
+            }
         }
         Subscription::batch(subs)
     }

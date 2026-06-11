@@ -31,6 +31,11 @@ pub struct MapNode {
     pub rtt_ms: Option<f64>,
     /// `true` for this machine (the map's anchor).
     pub is_self: bool,
+    /// PD-7/L18 — this peer's recent overlay throughput, normalized to
+    /// 0.0..=1.0 (from its Netdata `system.net`). Drives the flow-particle
+    /// density + speed on its self→peer edge; 0.0 = idle (no particles, so
+    /// an idle mesh draws nothing extra — the L22 budget).
+    pub flow: f64,
 }
 
 /// Deterministic seed angle for a hostname (stable across refreshes
@@ -110,10 +115,18 @@ pub struct MapProgram {
     pub nodes: Vec<MapNode>,
     pub positions: HashMap<String, (f32, f32)>,
     pub palette: Palette,
+    /// PD-7/L18 — the flow-particle animation phase (0.0..=1.0), advanced
+    /// by the panel's frame tick. Particles ride each active edge at
+    /// `(phase + k/N) mod 1`; a fresh value each frame moves them.
+    pub flow_phase: f32,
 }
 
 /// Node hit radius (px, post-scale).
 const HIT_R: f32 = 26.0;
+
+/// Edge hit half-width (px) — how close a click must land to a self→peer
+/// segment to open its trace card (PD-7/L19-20).
+const EDGE_HIT: f32 = 8.0;
 
 impl MapProgram {
     /// Scale unit-space positions into the canvas rect.
@@ -161,6 +174,44 @@ impl MapProgram {
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, h)| h)
     }
+
+    /// PD-7/L19-20 — the peer whose self→peer **edge** is under `point`
+    /// (within [`EDGE_HIT`] px of the segment), if any. Used for the
+    /// trace-card open: a click that misses every node but lands on an
+    /// edge opens that edge's trace. Self has no edge to itself.
+    #[must_use]
+    pub fn hit_edge(&self, bounds: &Rectangle, point: Point) -> Option<String> {
+        let proj = self.projected(bounds);
+        let origin = self
+            .nodes
+            .iter()
+            .find(|n| n.is_self)
+            .and_then(|n| proj.get(&n.hostname))
+            .copied()?;
+        self.nodes
+            .iter()
+            .filter(|n| !n.is_self)
+            .filter_map(|n| {
+                let to = proj.get(&n.hostname)?;
+                let d = point_segment_dist(point, origin, *to);
+                (d <= EDGE_HIT).then(|| (d, n.hostname.clone()))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, h)| h)
+    }
+}
+
+/// Perpendicular distance from `p` to the segment `a`–`b` (px).
+fn point_segment_dist(p: Point, a: Point, b: Point) -> f32 {
+    let (vx, vy) = (b.x - a.x, b.y - a.y);
+    let (wx, wy) = (p.x - a.x, p.y - a.y);
+    let len2 = vx * vx + vy * vy;
+    if len2 <= f32::EPSILON {
+        return (wx * wx + wy * wy).sqrt();
+    }
+    let t = ((wx * vx + wy * vy) / len2).clamp(0.0, 1.0);
+    let (cx, cy) = (a.x + t * vx, a.y + t * vy);
+    ((p.x - cx).powi(2) + (p.y - cy).powi(2)).sqrt()
 }
 
 impl canvas::Program<crate::Message> for MapProgram {
@@ -175,10 +226,19 @@ impl canvas::Program<crate::Message> for MapProgram {
     ) -> Option<canvas::Action<crate::Message>> {
         if let iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
             let pos = cursor.position_in(bounds)?;
-            let host = self.hit(&Rectangle::with_size(bounds.size()), pos)?;
-            return Some(canvas::Action::publish(crate::Message::Peers(
-                super::peers::Message::Select(host),
-            )));
+            let rect = Rectangle::with_size(bounds.size());
+            // A node click selects the peer (W87); a click that misses every
+            // node but lands on an edge opens that edge's trace card (L19-20).
+            if let Some(host) = self.hit(&rect, pos) {
+                return Some(canvas::Action::publish(crate::Message::Peers(
+                    super::peers::Message::Select(host),
+                )));
+            }
+            if let Some(host) = self.hit_edge(&rect, pos) {
+                return Some(canvas::Action::publish(crate::Message::Peers(
+                    super::peers::Message::EdgeClicked(host),
+                )));
+            }
         }
         None
     }
@@ -220,6 +280,24 @@ impl canvas::Program<crate::Message> for MapProgram {
                         .with_color(color)
                         .with_width(if reachable { 1.5 } else { 1.0 }),
                 );
+                // PD-7/L18 — flow particles: dots riding the edge while the
+                // peer moves real overlay traffic (Netdata-sourced `flow`).
+                // Density + along-edge speed scale with `flow`; an idle edge
+                // (flow ≈ 0) draws nothing, so the canvas stays cheap (L22).
+                if reachable && n.flow > 0.02 {
+                    let count = 1 + (n.flow * 5.0).round() as usize; // 1..=6
+                    let speed = 0.5 + n.flow as f32; // laps-per-cycle
+                    for k in 0..count {
+                        let base = (k as f32) / count as f32;
+                        let t = (self.flow_phase * speed + base).fract();
+                        let px = origin.x + (to.x - origin.x) * t;
+                        let py = origin.y + (to.y - origin.y) * t;
+                        frame.fill(
+                            &Path::circle(Point::new(px, py), 2.0),
+                            p.accent.into_iced_color(),
+                        );
+                    }
+                }
                 // RTT label at the midpoint; × for unreachable.
                 let mid = Point::new((origin.x + to.x) / 2.0, (origin.y + to.y) / 2.0);
                 let label = n.rtt_ms.map_or("×".to_string(), |ms| format!("{ms:.0} ms"));
@@ -307,6 +385,7 @@ mod tests {
             presence: presence.into(),
             rtt_ms: rtt,
             is_self,
+            flow: 0.0,
         }
     }
 
@@ -353,6 +432,7 @@ mod tests {
             nodes,
             positions,
             palette: Palette::dark(),
+            flow_phase: 0.0,
         };
         let bounds = Rectangle::with_size(iced::Size::new(800.0, 600.0));
         // A click far outside any node hits nothing.
@@ -369,5 +449,45 @@ mod tests {
             }
         }
         assert!(found.is_some(), "a node must be clickable somewhere");
+    }
+
+    #[test]
+    fn point_segment_dist_is_perpendicular_and_clamped() {
+        let a = Point::new(0.0, 0.0);
+        let b = Point::new(10.0, 0.0);
+        // On the segment → ~0.
+        assert!(point_segment_dist(Point::new(5.0, 0.0), a, b) < 0.01);
+        // Above the midpoint → the perpendicular offset.
+        assert!((point_segment_dist(Point::new(5.0, 3.0), a, b) - 3.0).abs() < 0.01);
+        // Past an endpoint → clamps to that endpoint's distance.
+        assert!((point_segment_dist(Point::new(13.0, 4.0), a, b) - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn edge_click_lands_between_self_and_a_peer() {
+        // The midpoint of the self→peer segment must hit that edge (and no
+        // node, since nodes sit at the segment's ends).
+        let nodes = vec![
+            node("self", "online", None, true),
+            node("oak", "online", Some(20.0), false),
+        ];
+        let positions = layout(&nodes);
+        let prog = MapProgram {
+            nodes,
+            positions,
+            palette: Palette::dark(),
+            flow_phase: 0.0,
+        };
+        let bounds = Rectangle::with_size(iced::Size::new(800.0, 600.0));
+        let proj = prog.projected(&bounds);
+        let s = proj["self"];
+        let o = proj["oak"];
+        let mid = Point::new((s.x + o.x) / 2.0, (s.y + o.y) / 2.0);
+        assert_eq!(prog.hit(&bounds, mid), None, "midpoint hits no node");
+        assert_eq!(
+            prog.hit_edge(&bounds, mid).as_deref(),
+            Some("oak"),
+            "midpoint hits the self→oak edge"
+        );
     }
 }

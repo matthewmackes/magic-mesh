@@ -243,6 +243,9 @@ impl FleetRollupPanel {
                     presence: r.presence.clone(),
                     rtt_ms: self.rtt.get(&r.hostname).copied().flatten(),
                     is_self: r.hostname == self.self_hostname,
+                    // PD-7/L18 — the rollup map is a static overview; no live
+                    // flow particles here (the Peers Map drives those).
+                    flow: 0.0,
                 })
                 .collect();
             let positions = layout(&nodes);
@@ -250,6 +253,7 @@ impl FleetRollupPanel {
                 nodes,
                 positions,
                 palette,
+                flow_phase: 0.0,
             })
             .width(Length::Fill)
             .height(Length::Fixed(260.0))

@@ -156,6 +156,9 @@ fn parse_nodes(
                         presence,
                         rtt_ms,
                         is_self,
+                        // The wallpaper is a pure ambient render (no Netdata
+                        // sampling loop); flow particles stay off here.
+                        flow: 0.0,
                     })
                 })
                 .collect()
@@ -190,6 +193,7 @@ fn view(state: &Wallpaper) -> Element<'_, Message> {
         nodes: state.nodes.clone(),
         positions: state.positions.clone(),
         palette: mde_theme::Palette::dark(),
+        flow_phase: 0.0,
     };
     let map: Element<'_, mde_workbench::Message> =
         canvas(prog).width(Length::Fill).height(Length::Fill).into();
