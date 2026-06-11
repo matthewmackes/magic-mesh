@@ -78,6 +78,9 @@ pub fn mde_workbench_iced_theme() -> Theme {
 pub enum Message {
     /// Sidebar click on a top-level group row.
     SelectGroup(Group),
+    /// PLANES-20 / W87 — drill from a Fleet-rollup card into the Peers
+    /// Front Door, pre-filtered to the clicked role.
+    DrillToPeers(String),
     /// Sidebar click on a leaf panel row.
     SelectPanel {
         group: Group,
@@ -799,6 +802,16 @@ impl App {
                 self.focused_pane = Pane::Main;
                 self.on_group_navigated(group)
             }
+            // PLANES-20 / W87 — open the Peers Front Door filtered to the
+            // role the operator drilled into. The filter is set before the
+            // load resolves; the Peers Loaded handler preserves it.
+            Message::DrillToPeers(role) => {
+                self.view = View::Group(Group::Peers);
+                self.focused_pane = Pane::Main;
+                let task = self.on_group_navigated(Group::Peers);
+                self.peers.filter = role;
+                task
+            }
             Message::SelectPanel { group, panel } => {
                 self.view = View::Panel { group, panel };
                 self.focused_pane = Pane::Main;
@@ -812,10 +825,7 @@ impl App {
                 self.apply_key_action(action);
                 Task::none()
             }
-            Message::FocusRequest(slug) => {
-                let task = self.apply_focus_request(&slug);
-                task
-            }
+            Message::FocusRequest(slug) => self.apply_focus_request(&slug),
             Message::Themes(msg) => self.themes.update(msg),
             Message::Fonts(msg) => self.fonts.update(msg, self.backend()),
             Message::Session(msg) => self.session.update(msg, self.backend()),
@@ -1713,6 +1723,16 @@ mod tests {
         let _ = app.update(Message::KeyPressed(KeyAction::JumpToGroup(Group::Help)));
         assert_eq!(app.current_view(), View::Group(Group::Help));
         assert_eq!(app.focused_pane(), Pane::Sidebar);
+    }
+
+    #[test]
+    fn drill_to_peers_opens_peers_front_door_filtered_by_role() {
+        // PLANES-20 / W87 — a Fleet-rollup card drill-down lands on the
+        // Peers plane with the role pre-filtered.
+        let mut app = App::new();
+        let _ = app.update(Message::DrillToPeers("host".into()));
+        assert_eq!(app.current_view(), View::Group(Group::Peers));
+        assert_eq!(app.peers.filter, "host");
     }
 
     #[test]

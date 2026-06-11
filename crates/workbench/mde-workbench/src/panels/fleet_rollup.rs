@@ -116,7 +116,7 @@ impl FleetRollupPanel {
         let refresh = variant_button(
             "Refresh",
             ButtonVariant::Ghost,
-            (!self.busy).then(|| crate::Message::FleetRollup(Message::RefreshClicked)),
+            (!self.busy).then_some(crate::Message::FleetRollup(Message::RefreshClicked)),
             palette,
         );
 
@@ -143,6 +143,14 @@ impl FleetRollupPanel {
                 g.healthy, g.degraded, g.unreachable, g.unknown
             ))
             .size(12);
+            // W87 — drill-down: open the Peers Front Door filtered to this
+            // role. The directory filter matches the role token.
+            let drill = variant_button(
+                "View peers ›",
+                ButtonVariant::Ghost,
+                Some(crate::Message::DrillToPeers(g.role.clone())),
+                palette,
+            );
             cards = cards.push(
                 container(
                     row![
@@ -162,6 +170,8 @@ impl FleetRollupPanel {
                             health_severity(&g.worst_health),
                             palette
                         ),
+                        iced::widget::Space::new().width(Length::Fill),
+                        drill,
                     ]
                     .spacing(12)
                     .align_y(iced::Alignment::Center),
