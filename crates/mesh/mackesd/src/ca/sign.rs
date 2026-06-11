@@ -91,7 +91,18 @@ pub fn sign_peer_cert<B: NebulaCertBackend + ?Sized>(
     let active_epoch = active_epoch(conn, mesh_id)?
         .ok_or_else(|| CaError::Sql(format!("no active CA for mesh {mesh_id}")))?;
 
-    let allocated_ip = allocate_overlay_ip(conn, active_epoch)?;
+    // Bed fix #8: a re-sign of a node that already holds an active cert at
+    // this epoch (re-enroll, operator re-issue, the auto-signer retrying)
+    // must REUSE that node's overlay IP, not allocate a fresh one. Allocating
+    // anew both churned the node's IP every re-enroll and — together with the
+    // plain INSERT below — collided on the (node_id, epoch) primary key
+    // ("UNIQUE constraint failed: nebula_peer_certs.node_id, .epoch"), which
+    // silently wedged the auto-signer. Reusing the IP keeps re-enroll
+    // idempotent and steers clear of the (overlay_ip, epoch) unique index.
+    let allocated_ip = match existing_overlay_ip(conn, node_id, active_epoch)? {
+        Some(ip) => ip,
+        None => allocate_overlay_ip(conn, active_epoch)?,
+    };
 
     let groups: &[&str] = match role {
         PeerRole::Host => &["role:host"],
@@ -124,10 +135,19 @@ pub fn sign_peer_cert<B: NebulaCertBackend + ?Sized>(
     // — ENT-3 makes revocation real).
     let expires_at: i64 = 0;
 
+    // Bed fix #8: upsert on the (node_id, epoch) primary key so a re-sign
+    // replaces the node's row in place (fresh cert PEM, same reused IP) and
+    // clears any prior revocation — instead of failing the whole sign on a
+    // PK collision.
     conn.execute(
         "INSERT INTO nebula_peer_certs \
          (node_id, epoch, cert_pem, overlay_ip, expires_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(node_id, epoch) DO UPDATE SET \
+           cert_pem = excluded.cert_pem, \
+           overlay_ip = excluded.overlay_ip, \
+           expires_at = excluded.expires_at, \
+           revoked_at = NULL",
         rusqlite::params![node_id, active_epoch, cert_pem, allocated_ip, expires_at],
     )
     .map_err(|e| CaError::Sql(e.to_string()))?;
@@ -212,6 +232,31 @@ pub fn count_active_peers(conn: &Connection, mesh_id: &str) -> Result<u32, CaErr
         .query_row([epoch], |r| r.get(0))
         .map_err(|e| CaError::Sql(e.to_string()))?;
     Ok(u32::try_from(count.max(0)).unwrap_or(u32::MAX))
+}
+
+/// The overlay IP a node already holds via a non-revoked cert at
+/// `epoch`, if any. Used to keep re-enroll idempotent (bed fix #8) —
+/// a node re-signing at the same epoch keeps its IP rather than
+/// churning to a freshly-allocated one.
+///
+/// # Errors
+/// [`CaError::Sql`] on database failure.
+pub fn existing_overlay_ip(
+    conn: &Connection,
+    node_id: &str,
+    epoch: i64,
+) -> Result<Option<String>, CaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT overlay_ip FROM nebula_peer_certs \
+             WHERE node_id = ?1 AND epoch = ?2 AND revoked_at IS NULL \
+             LIMIT 1",
+        )
+        .map_err(|e| CaError::Sql(e.to_string()))?;
+    let ip: Option<String> = stmt
+        .query_row(rusqlite::params![node_id, epoch], |r| r.get(0))
+        .ok();
+    Ok(ip)
 }
 
 fn load_taken_ips(
@@ -309,6 +354,59 @@ mod tests {
         .unwrap();
         let next = allocate_overlay_ip(&conn, 0).unwrap();
         assert_eq!(next, "10.42.0.2");
+    }
+
+    #[test]
+    fn resigning_a_node_is_idempotent_keeps_ip_and_upserts_row() {
+        // Bed fix #8: signing the same node twice at the same epoch
+        // (re-enroll / re-issue / auto-signer retry) must NOT collide on
+        // the (node_id, epoch) primary key, must keep the node's overlay
+        // IP, and must leave exactly one row (the cert replaced in place).
+        let conn = fresh_conn();
+        let tmp = mint_one(&conn);
+        let ca_crt = tmp.path().join("ca.crt");
+        let ca_key = tmp.path().join("ca.key");
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let crt_out = scratch.join("peer:anvil.crt");
+        let key_out = scratch.join("peer:anvil.key");
+
+        let first = sign_peer_cert(
+            &MockBackend,
+            &conn,
+            "m1",
+            "peer:anvil",
+            PeerRole::Peer,
+            &ca_crt,
+            &ca_key,
+            &crt_out,
+            &key_out,
+        )
+        .expect("first sign");
+
+        // Re-sign — the second time must succeed, not hit a PK collision.
+        let second = sign_peer_cert(
+            &MockBackend,
+            &conn,
+            "m1",
+            "peer:anvil",
+            PeerRole::Peer,
+            &ca_crt,
+            &ca_key,
+            &crt_out,
+            &key_out,
+        )
+        .expect("re-sign must succeed (upsert, not collide)");
+
+        assert_eq!(first.overlay_ip, second.overlay_ip, "IP must be stable");
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nebula_peer_certs WHERE node_id = 'peer:anvil'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1, "re-sign upserts in place — exactly one row");
     }
 
     #[test]
