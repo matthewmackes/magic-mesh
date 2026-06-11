@@ -175,8 +175,19 @@ impl RegistrationPanel {
             self.identity.fingerprint.clone()
         };
 
+        // PLANES-2 — Registration is the Nebula overlay-identity surface.
+        let nebula = crate::panel_chrome::hero_band(
+            mde_theme::hero::Hero::Nebula,
+            crate::panel_chrome::pkg_version_cached("nebula").as_deref(),
+            palette,
+        );
         let mut col = column![
-            text("Registration").size(20),
+            row![
+                text("Registration").size(20),
+                iced::widget::Space::new().width(Length::Fill),
+                nebula,
+            ]
+            .align_y(iced::Alignment::Center),
             text("Identity fingerprint").size(14),
             text(fp).size(12).font(iced::Font::MONOSPACE),
             row![

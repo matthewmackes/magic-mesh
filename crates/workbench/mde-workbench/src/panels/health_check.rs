@@ -224,11 +224,19 @@ impl HealthCheckPanel {
         })
         .on_press(crate::Message::HealthCheck(Message::RunClicked));
 
+        // PLANES-2 — Health is the systemd surface (units + the daemon).
+        let systemd = crate::panel_chrome::hero_band(
+            mde_theme::hero::Hero::Systemd,
+            crate::panel_chrome::pkg_version_cached("systemd").as_deref(),
+            palette,
+        );
         let header = row![
             column![title, subtitle].spacing(2),
             Space::new().width(Length::Fill),
             run_btn,
+            systemd,
         ]
+        .spacing(12)
         .align_y(iced::alignment::Vertical::Center);
 
         let mut probe_col = column![].spacing(8);

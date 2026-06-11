@@ -310,12 +310,20 @@ impl RemoteDesktopPanel {
             );
         }
 
+        // PLANES-2 — Remote Access is the Remmina surface (RDP/VNC client).
+        let remmina = crate::panel_chrome::hero_band(
+            mde_theme::hero::Hero::Remmina,
+            crate::panel_chrome::pkg_version_cached("remmina").as_deref(),
+            palette,
+        );
         container(
             column![
                 row![
                     column![title, subtitle].spacing(2),
                     Space::new().width(Length::Fill),
-                ],
+                    remmina,
+                ]
+                .align_y(iced::Alignment::Center),
                 Space::new().height(Length::Fixed(20.0)),
                 manual_block,
                 Space::new().height(Length::Fixed(16.0)),
