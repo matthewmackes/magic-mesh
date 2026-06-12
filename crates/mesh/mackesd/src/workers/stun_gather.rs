@@ -309,8 +309,11 @@ mod tests {
                 // address; in real STUN this would be `src`).
                 if n >= 20 {
                     let txid: [u8; 12] = buf[8..20].try_into().unwrap();
-                    let resp = crate::stun::encode_binding_success_with_xor_mapped(txid, src);
-                    let _ = socket.send_to(&resp, src).await;
+                    if let Some(resp) =
+                        crate::stun::encode_binding_success_with_xor_mapped(txid, src)
+                    {
+                        let _ = socket.send_to(&resp, src).await;
+                    }
                 }
             }
         });

@@ -65,7 +65,7 @@ Lifted from a 5-pass parallel fit-and-finish evaluation (reliability · security
 - [ ] **EFF-45 · GUI · ~18 workbench panels lack explicit error-state handling** (vs empty states); audit them + retire the catch-all placeholder branch.
 - [ ] **EFF-46 · QA · `#[ignore]`d tests** (systemd-creds, throughput-floor) never run in CI — add an `--include-ignored` nightly/pre-cut job.
 - [ ] **EFF-47 · BUS · RPC reply/request topics persist at Default (7-day TTL)** — give `reply/*` + ephemeral `action/*` a short per-topic TTL so interactive RPCs don't accumulate.
-- [ ] **EFF-48 · CLI · STUN encoder `panic!` on IPv6** (`stun.rs:104`) — return Result/skip-with-warn.
+- [✓] **EFF-48 · CLI · STUN encoder `panic!` on IPv6** (`stun.rs:104`) — return Result/skip-with-warn. — DONE: `encode_binding_success_with_xor_mapped` now returns `Option<Vec<u8>>` (`None` for IPv6, deferred per Q9) instead of panicking; the stun_gather responder skips a `None`. Test asserts IPv6→None, IPv4→Some round-trips.
 - [ ] **EFF-49 · I18N · No localization provision** (all en-US). Likely out-of-envelope for a ≤8-peer workgroup — document the en-US-only scope in SUPPORT, or introduce `i18n-embed`+Fluent if in scope.
 
 ## AUDIT-2026-06-11 — fit-for-purpose follow-ups (current actionable set)

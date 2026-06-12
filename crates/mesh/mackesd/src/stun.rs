@@ -94,14 +94,20 @@ pub fn random_transaction_id() -> TransactionId {
 /// caller's address back unchanged.
 ///
 /// IPv4 only; the v12 connectivity-scope lock (Q9) defers IPv6.
+/// Returns `None` for an IPv6 `reflexive` (EFF-48 — was a `panic!`;
+/// an IPv6 address must not crash the responder thread, the caller
+/// skips it with a warn instead).
 #[must_use]
 pub fn encode_binding_success_with_xor_mapped(
     txid: TransactionId,
     reflexive: SocketAddr,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     let ip = match reflexive {
         SocketAddr::V4(v4) => v4.ip().octets(),
-        SocketAddr::V6(_) => panic!("encode_binding_success_with_xor_mapped: IPv4 only"),
+        // IPv6 deferred (Q9). Skip rather than panic — XOR-MAPPED-ADDRESS
+        // for AF_INET6 needs the 16-byte family-0x02 encoding we don't
+        // emit yet.
+        SocketAddr::V6(_) => return None,
     };
     // X-Port = port XOR high 16 bits of MAGIC_COOKIE.
     let x_port = reflexive.port() ^ ((MAGIC_COOKIE >> 16) as u16);
@@ -132,7 +138,7 @@ pub fn encode_binding_success_with_xor_mapped(
     msg.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
     msg.extend_from_slice(&txid);
     msg.extend_from_slice(&attrs);
-    msg
+    Some(msg)
 }
 
 /// One parsed STUN response. We only model the success case (the
@@ -409,6 +415,20 @@ mod tests {
             }
             other => panic!("expected NotBindingSuccess, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn encode_binding_success_skips_ipv6_instead_of_panicking() {
+        // EFF-48 — an IPv6 reflexive must yield None (skip), never a
+        // panic that would kill the responder thread.
+        let txid: TransactionId = [0x22; 12];
+        let v6: SocketAddr = "[2001:db8::1]:5555".parse().unwrap();
+        assert!(encode_binding_success_with_xor_mapped(txid, v6).is_none());
+        // IPv4 still encodes and round-trips through the parser.
+        let v4: SocketAddr = "203.0.113.7:4444".parse().unwrap();
+        let msg = encode_binding_success_with_xor_mapped(txid, v4).expect("v4 encodes");
+        let resp = parse_binding_response(&msg).expect("parsed");
+        assert_eq!(resp.reflexive, Some(v4));
     }
 
     #[test]
