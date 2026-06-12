@@ -71,3 +71,18 @@ All 11 rows were resolved the same day and **independently re-verified by a fres
 Re-audit residuals F-1/F-2/F-3 (stale RSA-2048 prose in kdc-host, the sub-package install docs) fixed in the same cycle; F-4 (`percentile_estimate` test-only) accepted as a legitimate analysis API; F-5 cleared as correct interop prose.
 
 **Cycle status: CLEAN.** Gates at close: workspace build green, `cargo test --workspace` 63/63 suites green, mackesd 1447 serial tests green, all three governance lints clean, zero `todo!()`/`unimplemented!()`.
+
+---
+
+## Cycle 3 (2026-06-12, same day) — fresh sweep + resolution
+
+A third, deeper sweep (previously-skimmed crates, off-scale metrics, substrate gates, doc command accuracy) found **12 findings; all closed same day** (commit `a2b3c5a`) and **independently re-verified clean (10/10)**:
+
+- **S-2/S-5 (the substantive pair):** the KDC2-1.9 scorer and KDC2-1.12 audit feed — scaffolded since v2.1 with comments promising "follow-up" — are now genuinely in the production path: `tick_once` → `select_paths` → `scorer::select` per peer, and every primary flip appends a hash-chained `PathSwitchEvent` (kind=`lifecycle`, so the EFF-25 alert hooks fire on path switches).
+- **CV-1:** the `encryption_kind` field stopped being decorative — `score()` now filters content classes (Clipboard/FileBulk/Notification) below the AES-256-class floor (`Policy.min_content_encryption`, operator-tunable, typo = hard error); the stale WireGuard-AES-128 default corrected to the Nebula AES-256 reality.
+- **S-3:** `peer_join` (PC-3) REMOVED rather than wired — it spawned `mde-peer-card`, deleted in the E11 pivot; the audit's FINISH verdict would have wired a dead modal.
+- **S-4:** false positive (mdns_relay's inbound half is implemented; stale module doc fixed).
+- **EFF-43 closed:** `kamailio-mde.service` + `rtpengine-mde.service` shipped disabled with render-config ExecStartPre, in the RPM assets.
+- Plus: stale "Phase G stubs" comment, `mackesd --help` XFCE string, 3 wrong doc command examples, off-scale/density-blind spacing literals.
+
+**Cycle-3 status: CLEAN (verified).** Three consecutive audit cycles have now converged same-day; the remaining open worklist is feature backlog (EFF P2/P3, PEERS epic), not integrity findings.
