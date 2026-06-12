@@ -5123,6 +5123,14 @@ name = "mde-role"
 version = "10.0.0"
 
 [[package]]
+name = "mde-role-chooser"
+version = "0.1.0"
+dependencies = [
+ "libcosmic",
+ "mde-role",
+]
+
+[[package]]
 name = "mde-theme"
 version = "10.0.0"
 dependencies = [

@@ -323,6 +323,8 @@ assets = [
     # AUD-4 — the §5 Cosmic integration: the mesh-health cosmic-applet binary +
     # its X-CosmicApplet .desktop so cosmic-panel discovers + hosts it.
     { source = "target/release/mde-cosmic-applet",  dest = "/usr/bin/mde-cosmic-applet",  mode = "755" },
+    # AUD-6 / PKG-5 — the first-run deployment-role chooser GUI (autostart below).
+    { source = "target/release/mde-role-chooser",   dest = "/usr/bin/mde-role-chooser",   mode = "755" },
     # PKG-3 — the self-gating daemon unit + the role-gated app units.
     { source = "packaging/systemd/mackesd.service",   dest = "/usr/lib/systemd/system/mackesd.service",   mode = "644" },
     { source = "packaging/systemd/mde-musicd.service", dest = "/usr/lib/systemd/user/mde-musicd.service", mode = "644" },

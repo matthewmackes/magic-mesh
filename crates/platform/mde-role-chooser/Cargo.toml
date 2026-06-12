@@ -1,0 +1,20 @@
+[package]
+name = "mde-role-chooser"
+version = "0.1.0"
+edition = "2021"
+description = "Magic Mesh first-run deployment-role chooser (PKG-5 / AUD-6): a libcosmic GUI that pins Lighthouse / Server / Workstation at install via `mackesd role-pin`. Self-exits when a role is already pinned, so it can run as a first-boot autostart."
+
+[[bin]]
+name = "mde-role-chooser"
+path = "src/main.rs"
+
+[dependencies]
+mde-role = { path = "../mde-role" }
+
+# AUD-6 — the libcosmic windowed app (same rev the GUI-6 applet + the GUI-7
+# mde-files port pin). winit/wgpu for a real window; tokio for the executor.
+[dependencies.libcosmic]
+git = "https://github.com/pop-os/libcosmic.git"
+rev = "cca48bc29ef7a9f22160c0ab6ba117ab22d1ae87"
+default-features = false
+features = ["tokio", "winit", "wgpu", "a11y", "wayland", "multi-window"]
