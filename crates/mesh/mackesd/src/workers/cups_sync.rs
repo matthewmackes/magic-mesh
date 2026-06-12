@@ -429,9 +429,13 @@ impl CupsSyncWorker {
             if cupsd_needs_listen(&text, overlay_ip) {
                 let next = cupsd_with_listen(&text, overlay_ip, &self.overlay_cidr);
                 if std::fs::write(&conf, next).is_ok() {
-                    let _ = Command::new("systemctl")
-                        .args(["reload", "cups.service"])
-                        .status();
+                    // EFF-20 — bound systemctl reload.
+                    let mut cmd = Command::new("systemctl");
+                    cmd.args(["reload", "cups.service"]);
+                    let _ = crate::workers::proc::status_with_timeout(
+                        cmd,
+                        crate::workers::proc::DEFAULT_CMD_TIMEOUT,
+                    );
                 }
             }
         }
@@ -471,7 +475,13 @@ impl CupsSyncWorker {
         let winner = resolve_defaults_lww(std::slice::from_ref(&rec));
         if let Some(d) = winner {
             if let Some(def) = d.get("default_printer").and_then(Value::as_str) {
-                let _ = Command::new(&self.lpoptions).args(["-d", def]).status();
+                // EFF-20 — bound lpoptions.
+                let mut cmd = Command::new(&self.lpoptions);
+                cmd.args(["-d", def]);
+                let _ = crate::workers::proc::status_with_timeout(
+                    cmd,
+                    crate::workers::proc::DEFAULT_CMD_TIMEOUT,
+                );
             }
         }
     }
@@ -541,17 +551,19 @@ impl CupsSyncWorker {
     }
 
     fn run_lpadmin(&self, args: &[&str]) -> bool {
-        Command::new(&self.lpadmin)
-            .args(args)
-            .status()
+        // EFF-20 — bound lpadmin so a wedged CUPS can't pin the tick.
+        let mut cmd = Command::new(&self.lpadmin);
+        cmd.args(args);
+        crate::workers::proc::status_with_timeout(cmd, crate::workers::proc::DEFAULT_CMD_TIMEOUT)
             .map(|s| s.success())
             .unwrap_or(false)
     }
 
     fn run_capture(&self, bin: &str, args: &[&str]) -> Option<String> {
-        Command::new(bin)
-            .args(args)
-            .output()
+        // EFF-20 — bound the capture so a wedged CUPS tool can't pin the tick.
+        let mut cmd = Command::new(bin);
+        cmd.args(args);
+        crate::workers::proc::output_with_timeout(cmd, crate::workers::proc::DEFAULT_CMD_TIMEOUT)
             .ok()
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
@@ -599,8 +611,8 @@ fn which(bin: &str) -> Option<PathBuf> {
 }
 
 fn local_hostname() -> String {
-    Command::new("hostname")
-        .output()
+    let cmd = Command::new("hostname");
+    crate::workers::proc::output_with_timeout(cmd, crate::workers::proc::DEFAULT_CMD_TIMEOUT)
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())

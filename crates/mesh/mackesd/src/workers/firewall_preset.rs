@@ -315,10 +315,12 @@ pub fn zone_cmd_batches(plan: &ZonePlan) -> Vec<Vec<String>> {
 /// is absent or there's no default route (we then bind only the overlay).
 #[must_use]
 pub fn default_underlay_iface() -> Option<String> {
-    let out = std::process::Command::new("ip")
-        .args(["route", "show", "default"])
-        .output()
-        .ok()?;
+    // EFF-20 — bound `ip` so a hung invocation can't pin the tick.
+    let mut cmd = std::process::Command::new("ip");
+    cmd.args(["route", "show", "default"]);
+    let out =
+        crate::workers::proc::output_with_timeout(cmd, crate::workers::proc::DEFAULT_CMD_TIMEOUT)
+            .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -355,10 +357,13 @@ fn apply_zones(firewall_cmd: &str, plan: &ZonePlan) -> Result<(), String> {
         return Err(format!("{firewall_cmd} not on PATH; zone plan deferred"));
     }
     for batch in zone_cmd_batches(plan) {
-        let out = std::process::Command::new(firewall_cmd)
-            .args(&batch)
-            .output()
-            .map_err(|e| format!("spawn {firewall_cmd} {batch:?}: {e}"))?;
+        let mut cmd = std::process::Command::new(firewall_cmd);
+        cmd.args(&batch);
+        let out = crate::workers::proc::output_with_timeout(
+            cmd,
+            crate::workers::proc::DEFAULT_CMD_TIMEOUT,
+        )
+        .map_err(|e| format!("spawn {firewall_cmd} {batch:?}: {e}"))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             if !stderr.contains("ALREADY_ENABLED") && !stderr.contains("ZONE_ALREADY_SET") {
@@ -369,10 +374,11 @@ fn apply_zones(firewall_cmd: &str, plan: &ZonePlan) -> Result<(), String> {
             }
         }
     }
-    let out = std::process::Command::new(firewall_cmd)
-        .arg("--reload")
-        .output()
-        .map_err(|e| format!("spawn {firewall_cmd} --reload: {e}"))?;
+    let mut reload = std::process::Command::new(firewall_cmd);
+    reload.arg("--reload");
+    let out =
+        crate::workers::proc::output_with_timeout(reload, crate::workers::proc::DEFAULT_CMD_TIMEOUT)
+            .map_err(|e| format!("spawn {firewall_cmd} --reload: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "{firewall_cmd} --reload failed: {}",
@@ -393,10 +399,13 @@ fn apply_preset(firewall_cmd: &str, ports: &[(u16, &'static str)]) -> Result<(),
     }
     for (port, proto) in ports {
         let spec = format!("{port}/{proto}");
-        let out = std::process::Command::new(firewall_cmd)
-            .args(["--permanent", "--add-port", &spec])
-            .output()
-            .map_err(|e| format!("spawn {firewall_cmd} --add-port {spec}: {e}"))?;
+        let mut cmd = std::process::Command::new(firewall_cmd);
+        cmd.args(["--permanent", "--add-port", &spec]);
+        let out = crate::workers::proc::output_with_timeout(
+            cmd,
+            crate::workers::proc::DEFAULT_CMD_TIMEOUT,
+        )
+        .map_err(|e| format!("spawn {firewall_cmd} --add-port {spec}: {e}"))?;
         if !out.status.success() {
             // firewall-cmd returns non-zero when the port is
             // already there — treat that as success by checking
@@ -411,10 +420,11 @@ fn apply_preset(firewall_cmd: &str, ports: &[(u16, &'static str)]) -> Result<(),
             }
         }
     }
-    let out = std::process::Command::new(firewall_cmd)
-        .arg("--reload")
-        .output()
-        .map_err(|e| format!("spawn {firewall_cmd} --reload: {e}"))?;
+    let mut reload = std::process::Command::new(firewall_cmd);
+    reload.arg("--reload");
+    let out =
+        crate::workers::proc::output_with_timeout(reload, crate::workers::proc::DEFAULT_CMD_TIMEOUT)
+            .map_err(|e| format!("spawn {firewall_cmd} --reload: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "{firewall_cmd} --reload failed: {}",

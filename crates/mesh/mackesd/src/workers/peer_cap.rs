@@ -173,7 +173,14 @@ async fn publish_cap(snapshot: &PeerCapSnapshot) {
         .arg(CAP_TOPIC)
         .arg("--body-flag")
         .arg(&body);
-    match cmd.status().await {
+    // EFF-20 — bound the publish so a wedged mde-bus can't leave this
+    // future pending forever.
+    match crate::workers::proc::status_with_timeout_async(
+        cmd,
+        crate::workers::proc::DEFAULT_CMD_TIMEOUT,
+    )
+    .await
+    {
         Ok(s) if s.success() => {
             tracing::debug!(cap_used = snapshot.cap_used, "peer-cap published");
         }

@@ -165,9 +165,13 @@ impl MeshDnsWorker {
         // /etc/hosts merge already guarantees resolution, so a missing
         // resolvectl is a quiet degrade, not a failure.)
         if which("resolvectl") {
-            let _ = std::process::Command::new("resolvectl")
-                .args(["domain", "nebula1", &format!("~{MESH_SUFFIX}")])
-                .status();
+            // EFF-20 — bound resolvectl so a hung invocation can't pin the tick.
+            let mut cmd = std::process::Command::new("resolvectl");
+            cmd.args(["domain", "nebula1", &format!("~{MESH_SUFFIX}")]);
+            let _ = crate::workers::proc::status_with_timeout(
+                cmd,
+                crate::workers::proc::DEFAULT_CMD_TIMEOUT,
+            );
         }
         Ok(())
     }

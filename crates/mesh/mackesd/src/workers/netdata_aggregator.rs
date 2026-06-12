@@ -499,9 +499,10 @@ fn atomic_write(path: &Path, body: &[u8]) -> Result<(), String> {
 }
 
 fn systemctl_reload(unit: &str) -> Result<(), String> {
-    let out = std::process::Command::new("systemctl")
-        .args(["reload-or-restart", unit])
-        .output()
+    // EFF-20 — bound systemctl so a hung reload can't pin the tick.
+    let mut cmd = std::process::Command::new("systemctl");
+    cmd.args(["reload-or-restart", unit]);
+    let out = crate::workers::proc::output_with_timeout(cmd, crate::workers::proc::DEFAULT_CMD_TIMEOUT)
         .map_err(|e| format!("systemctl reload-or-restart {unit}: {e}"))?;
     if out.status.success() {
         Ok(())

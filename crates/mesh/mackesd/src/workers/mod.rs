@@ -101,6 +101,9 @@ pub mod health_reconciler;
 // 30 s cadence; the renderer (metrics::write_textfile) existed with
 // no production caller until this worker.
 pub mod metrics_exporter;
+// EFF-20 — timeout-bounded subprocess execution shared by the workers
+// that shell out on a tick, so a hung child can't pin a runtime thread.
+pub mod proc;
 // KDC2-6.6 — legacy `kdc_bridge` retired alongside the upstream
 // kdeconnectd wrapper. The native KDC host worker
 // (`workers::kdc_host`) replaces it in the v2.1+ stack.

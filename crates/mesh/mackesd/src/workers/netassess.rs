@@ -494,7 +494,12 @@ pub fn trim_older_than(dir: &Path, cutoff_ms: i64) -> std::io::Result<()> {
 // ── Collectors (shell-out; bench-gated) ────────────────────────────
 
 fn run_stdout(bin: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(bin).args(args).output().ok()?;
+    // EFF-20 — bound the collector so a hung tool can't pin the tick.
+    let mut cmd = Command::new(bin);
+    cmd.args(args);
+    let out =
+        crate::workers::proc::output_with_timeout(cmd, crate::workers::proc::DEFAULT_CMD_TIMEOUT)
+            .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -502,7 +507,9 @@ fn run_stdout(bin: &str, args: &[&str]) -> Option<String> {
 }
 
 fn binary_present(bin: &str) -> bool {
-    Command::new(bin).arg("--version").output().is_ok()
+    let mut cmd = Command::new(bin);
+    cmd.arg("--version");
+    crate::workers::proc::output_with_timeout(cmd, crate::workers::proc::DEFAULT_CMD_TIMEOUT).is_ok()
 }
 
 fn ping_reachable(target: &str, v6: bool) -> bool {
@@ -511,9 +518,11 @@ fn ping_reachable(target: &str, v6: bool) -> bool {
         args.insert(0, "-6");
     }
     args.push(target);
-    Command::new("ping")
-        .args(&args)
-        .output()
+    // EFF-20 — ping already has -W, but bound it anyway so a wedged
+    // resolver/network stack can't hang the worker thread.
+    let mut cmd = Command::new("ping");
+    cmd.args(&args);
+    crate::workers::proc::output_with_timeout(cmd, crate::workers::proc::DEFAULT_CMD_TIMEOUT)
         .map(|o| o.status.success())
         .unwrap_or(false)
 }

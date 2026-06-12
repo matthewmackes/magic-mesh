@@ -140,11 +140,16 @@ impl SshPubkeyGossipWorker {
         if !pub_path.exists() {
             let _ = tokio::fs::create_dir_all(&ssh_dir).await;
             let comment = format!("mde-mesh@{}", self.hostname);
-            match tokio::process::Command::new("ssh-keygen")
+            let mut keygen = tokio::process::Command::new("ssh-keygen");
+            keygen
                 .args(["-q", "-t", "ed25519", "-N", "", "-C", &comment, "-f"])
-                .arg(&key_path)
-                .status()
-                .await
+                .arg(&key_path);
+            // EFF-20 — bound keygen so a stuck entropy/IO wait can't hang the tick.
+            match crate::workers::proc::status_with_timeout_async(
+                keygen,
+                crate::workers::proc::DEFAULT_CMD_TIMEOUT,
+            )
+            .await
             {
                 Ok(st) if st.success() => {
                     tracing::info!("ssh_pubkey_gossip: generated {}", key_path.display());

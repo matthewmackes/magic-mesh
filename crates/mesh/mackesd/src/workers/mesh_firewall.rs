@@ -115,15 +115,19 @@ fn remove_drop_args(ip: &str) -> Vec<String> {
 }
 
 fn run_firewall_cmd(args: &[String]) -> bool {
-    Command::new("firewall-cmd")
-        .args(args)
-        .status()
+    // EFF-20 — bound firewall-cmd so a wedged invocation can't pin the
+    // runtime thread the worker tick runs on.
+    let mut cmd = Command::new("firewall-cmd");
+    cmd.args(args);
+    crate::workers::proc::status_with_timeout(cmd, crate::workers::proc::DEFAULT_CMD_TIMEOUT)
         .map(|s| s.success())
         .unwrap_or(false)
 }
 
 fn binary_present(bin: &str) -> bool {
-    Command::new(bin).arg("--version").output().is_ok()
+    let mut cmd = Command::new(bin);
+    cmd.arg("--version");
+    crate::workers::proc::status_with_timeout(cmd, crate::workers::proc::DEFAULT_CMD_TIMEOUT).is_ok()
 }
 
 #[async_trait::async_trait]
