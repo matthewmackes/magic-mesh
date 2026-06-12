@@ -340,6 +340,12 @@ enum Cmd {
     StateRestore {
         /// Path to the armored `state-backup.enc` bundle.
         bundle: std::path::PathBuf,
+        /// EFF-28 — dry-run: decode + unseal + report the bundle's
+        /// contents WITHOUT touching the store or writing recovery
+        /// artifacts. Exit 0 = the bundle is restorable with this
+        /// passphrase. Use in DR drills + before a real restore.
+        #[clap(long)]
+        verify: bool,
         /// Passphrase env-var. Defaults to
         /// `MDE_BACKUP_PASSPHRASE` (same as the daily backup
         /// worker's env).
@@ -2102,6 +2108,7 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::StateRestore {
             bundle,
+            verify,
             passphrase_env,
             recovery_dir,
         } => {
@@ -2122,6 +2129,24 @@ fn main() -> anyhow::Result<()> {
                 mackesd_core::ca::backup::dearmor(&armored).context("ASCII-armor decode")?;
             let plaintext = mackesd_core::ca::backup::unseal(&passphrase, &sealed)
                 .context("AEAD unseal — wrong passphrase OR tampered bundle")?;
+
+            // EFF-28 — --verify: report + stop before any mutation.
+            if verify {
+                eprintln!(
+                    "[state-restore --verify] bundle OK: mesh '{}' · exported_at unix:{} · \
+                     {} CA cert(s) · {} peer cert(s) · meshfs snapshot: {}",
+                    plaintext.mesh_id,
+                    plaintext.exported_at,
+                    plaintext.ca_certs.len(),
+                    plaintext.peer_certs.len(),
+                    if plaintext.meshfs_snapshot.is_some() { "present" } else { "absent" },
+                );
+                eprintln!(
+                    "[state-restore --verify] dry-run complete — nothing was written. \
+                     Re-run without --verify to restore."
+                );
+                return Ok(());
+            }
 
             let conn = mackesd_core::store::open(&db_path)
                 .with_context(|| format!("opening store at {}", db_path.display()))?;
