@@ -60,6 +60,18 @@ pub struct MetricsExporterWorker {
     /// histogram section, closing the observe-but-never-export seam.
     /// `None` omits the series (tests / a daemon without the router).
     router_decision_us: Option<std::sync::Arc<std::sync::Mutex<Histogram>>>,
+    /// EFF-26 — the supervisor's live worker registry (EFF-24): emits
+    /// `mackesd_workers_alive/total` + `mackesd_breaker_tripped` and
+    /// error-logs on any breaker trip (the headless alert).
+    worker_status: Option<crate::workers::WorkerStatusMap>,
+    /// EFF-26 — filesystems to report disk headroom for (the QNM
+    /// replicated root + the store's filesystem). Gauge + warn under
+    /// 10% free.
+    disk_paths: Vec<PathBuf>,
+    /// EFF-26 — the daily `state-backup.enc` path; drives the
+    /// backup-staleness gauge/alert (and the passphrase-unset alert
+    /// via the `MDE_BACKUP_PASSPHRASE` env check).
+    backup_file: Option<PathBuf>,
     /// Override the tick cadence (default [`TICK_INTERVAL`]). Used by
     /// tests to drive the loop without 30 s waits.
     tick: Duration,
@@ -75,6 +87,9 @@ impl MetricsExporterWorker {
             textfile_dir,
             ca_cert_path,
             router_decision_us: None,
+            worker_status: None,
+            disk_paths: Vec::new(),
+            backup_file: None,
             tick: TICK_INTERVAL,
         }
     }
@@ -87,6 +102,27 @@ impl MetricsExporterWorker {
         metrics: std::sync::Arc<std::sync::Mutex<Histogram>>,
     ) -> Self {
         self.router_decision_us = Some(metrics);
+        self
+    }
+
+    /// EFF-26 — attach the supervisor's live worker registry.
+    #[must_use]
+    pub fn with_worker_status(mut self, map: crate::workers::WorkerStatusMap) -> Self {
+        self.worker_status = Some(map);
+        self
+    }
+
+    /// EFF-26 — filesystems whose headroom is reported each tick.
+    #[must_use]
+    pub fn with_disk_paths(mut self, paths: Vec<PathBuf>) -> Self {
+        self.disk_paths = paths;
+        self
+    }
+
+    /// EFF-26 — the daily backup bundle path (staleness alert).
+    #[must_use]
+    pub fn with_backup_file(mut self, path: PathBuf) -> Self {
+        self.backup_file = Some(path);
         self
     }
 
@@ -111,21 +147,46 @@ impl Worker for MetricsExporterWorker {
             tokio::select! {
                 _ = shutdown.wait() => return Ok(()),
                 _ = interval.tick() => {
-                    let db = self.db_path.clone();
-                    let dir = self.textfile_dir.clone();
-                    let ca = self.ca_cert_path.clone();
-                    let hist = self.router_decision_us.clone();
+                    let inputs = TickInputs {
+                        db_path: self.db_path.clone(),
+                        textfile_dir: self.textfile_dir.clone(),
+                        ca_cert_path: self.ca_cert_path.clone(),
+                        router_decision_us: self.router_decision_us.clone(),
+                        worker_status: self.worker_status.clone(),
+                        disk_paths: self.disk_paths.clone(),
+                        backup_file: self.backup_file.clone(),
+                    };
                     // tick_once is sync (rusqlite + blocking file I/O +
-                    // a nebula-cert subprocess) — hop onto a blocking
-                    // task so it doesn't pin the tokio scheduler.
+                    // subprocesses) — hop onto a blocking task so it
+                    // doesn't pin the tokio scheduler.
                     let _ = tokio::task::spawn_blocking(move || {
-                        tick_once(&db, &dir, ca.as_deref(), hist.as_deref());
+                        tick_once(&inputs);
                     })
                     .await;
                 }
             }
         }
     }
+}
+
+/// Owned per-tick inputs (built from the worker, moved into the
+/// blocking task; also how tests drive a single pass).
+#[derive(Default)]
+pub struct TickInputs {
+    /// SQLite store path.
+    pub db_path: PathBuf,
+    /// Textfile-collector output dir.
+    pub textfile_dir: PathBuf,
+    /// EFF-11 CA-cert expiry probe target.
+    pub ca_cert_path: Option<PathBuf>,
+    /// AUD2-1 router histogram handle.
+    pub router_decision_us: Option<std::sync::Arc<std::sync::Mutex<Histogram>>>,
+    /// EFF-26/EFF-24 worker registry.
+    pub worker_status: Option<crate::workers::WorkerStatusMap>,
+    /// EFF-26 disk-headroom targets.
+    pub disk_paths: Vec<PathBuf>,
+    /// EFF-26 backup bundle (staleness alert).
+    pub backup_file: Option<PathBuf>,
 }
 
 /// One export pass: open the store, snapshot the counters, write the
@@ -136,31 +197,43 @@ impl Worker for MetricsExporterWorker {
 /// Pulled out as a free function so tests can drive a single pass
 /// against a tempdir + in-memory-then-file store without owning the
 /// tokio scheduler.
-pub fn tick_once(
-    db_path: &std::path::Path,
-    textfile_dir: &std::path::Path,
-    ca_cert_path: Option<&std::path::Path>,
-    router_decision_us: Option<&std::sync::Mutex<Histogram>>,
-) {
-    let conn = match crate::store::open(db_path) {
+pub fn tick_once(inputs: &TickInputs) {
+    let conn = match crate::store::open(&inputs.db_path) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                db_path = %db_path.display(),
+                db_path = %inputs.db_path.display(),
                 "metrics-exporter: sqlite open failed; skipping tick",
             );
             return;
         }
     };
     let mut counters = snapshot_counters(&conn);
-    if let Some(ca) = ca_cert_path {
+    if let Some(ca) = &inputs.ca_cert_path {
         counters.extend(cert_counters(ca, now_unix()));
     }
+    // EFF-26/EFF-24 — worker liveness + breaker gauges; a trip is a
+    // headless-visible ERROR (the alert).
+    if let Some(map) = &inputs.worker_status {
+        counters.extend(worker_counters(map));
+    }
+    // EFF-26 — disk headroom per configured filesystem.
+    for path in &inputs.disk_paths {
+        counters.extend(disk_counters(path));
+    }
+    // EFF-26 — backup posture: passphrase set? bundle fresh?
+    counters.extend(backup_counters(
+        inputs.backup_file.as_deref(),
+        std::env::var_os("MDE_BACKUP_PASSPHRASE").is_some(),
+        now_unix(),
+    ));
     // AUD2-1 — snapshot the router's decision-time histogram (brief
     // lock + clone) so the SLO instrumentation actually reaches the
     // scrape instead of being observed-and-dropped.
-    let histograms: Vec<Histogram> = router_decision_us
+    let histograms: Vec<Histogram> = inputs
+        .router_decision_us
+        .as_ref()
         .map(|m| {
             vec![m
                 .lock()
@@ -168,11 +241,11 @@ pub fn tick_once(
                 .clone()]
         })
         .unwrap_or_default();
-    match write_textfile(textfile_dir, &counters, &histograms) {
+    match write_textfile(&inputs.textfile_dir, &counters, &histograms) {
         Ok(path) => tracing::debug!(path = %path.display(), "metrics-exporter: wrote snapshot"),
         Err(e) => tracing::warn!(
             error = %e,
-            dir = %textfile_dir.display(),
+            dir = %inputs.textfile_dir.display(),
             "metrics-exporter: textfile write failed",
         ),
     }
@@ -270,6 +343,148 @@ fn cert_counters(ca_cert_path: &std::path::Path, now_unix: i64) -> Vec<Counter> 
     ]
 }
 
+/// EFF-26/EFF-24 — worker-liveness gauges from the supervisor's
+/// registry. A breaker trip error-logs every tick it persists (the
+/// headless journal alert — deliberately repeated so a log pipeline's
+/// time-window alerts keep firing while the condition holds).
+fn worker_counters(map: &crate::workers::WorkerStatusMap) -> Vec<Counter> {
+    let (alive, total, tripped) = crate::workers::workers_ready(map);
+    if tripped > 0 {
+        tracing::error!(
+            target: "mackesd::alert",
+            tripped,
+            "ALERT (crit): circuit breaker tripped — worker(s) down until mackesd restarts",
+        );
+    }
+    let mk = |name: &'static str, help: &'static str, value: u64| Counter {
+        name,
+        help,
+        value,
+        labels: BTreeMap::new(),
+    };
+    vec![
+        mk("mackesd_workers_alive", "Workers currently alive", u64::from(alive)),
+        mk("mackesd_workers_total", "Workers spawned this daemon lifetime", u64::from(total)),
+        mk(
+            "mackesd_breaker_tripped",
+            "ENT-6 circuit-breaker trips (worker stays down until restart)",
+            u64::from(tripped),
+        ),
+    ]
+}
+
+/// EFF-26 — threshold below which free space warns.
+const DISK_WARN_FREE_PCT: u64 = 10;
+
+/// EFF-26 — free-bytes gauge for one filesystem via `df -B1` (bounded
+/// by the EFF-20 timeout helper; no libc/statvfs dep). Warns under
+/// [`DISK_WARN_FREE_PCT`]% free. Empty vec when `df` fails.
+fn disk_counters(path: &std::path::Path) -> Vec<Counter> {
+    let mut cmd = std::process::Command::new("df");
+    cmd.arg("-B1").arg("--output=avail,pcent").arg(path);
+    let Ok(out) = crate::workers::proc::output_with_timeout(
+        cmd,
+        crate::workers::proc::DEFAULT_CMD_TIMEOUT,
+    ) else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Second line: "<avail> <used%>".
+    let Some(line) = text.lines().nth(1) else {
+        return Vec::new();
+    };
+    let mut parts = line.split_whitespace();
+    let (Some(avail), Some(pcent)) = (parts.next(), parts.next()) else {
+        return Vec::new();
+    };
+    let Ok(avail_bytes) = avail.parse::<u64>() else {
+        return Vec::new();
+    };
+    let used_pct: u64 = pcent.trim_end_matches('%').parse().unwrap_or(0);
+    let free_pct = 100u64.saturating_sub(used_pct);
+    if free_pct < DISK_WARN_FREE_PCT {
+        tracing::warn!(
+            target: "mackesd::alert",
+            path = %path.display(),
+            free_pct,
+            "ALERT (warn): disk headroom low",
+        );
+    }
+    let mut labels = BTreeMap::new();
+    labels.insert("path".to_owned(), path.display().to_string());
+    vec![Counter {
+        name: "mackesd_disk_available_bytes",
+        help: "Free bytes on the monitored filesystem",
+        value: avail_bytes,
+        labels,
+    }]
+}
+
+/// EFF-26 — staleness threshold: the backup worker runs daily, so a
+/// bundle older than 48 h means at least one missed cycle.
+const BACKUP_STALE_SECS: i64 = 48 * 60 * 60;
+
+/// EFF-26 — backup-posture gauges/alerts. Exposed for tests.
+pub fn backup_counters(
+    backup_file: Option<&std::path::Path>,
+    passphrase_set: bool,
+    now_unix: i64,
+) -> Vec<Counter> {
+    let mk = |name: &'static str, help: &'static str, value: u64| Counter {
+        name,
+        help,
+        value,
+        labels: BTreeMap::new(),
+    };
+    let mut out = vec![mk(
+        "mackesd_backup_passphrase_set",
+        "1 when MDE_BACKUP_PASSPHRASE is set (daily CA/state backup enabled)",
+        u64::from(passphrase_set),
+    )];
+    if !passphrase_set {
+        tracing::warn!(
+            target: "mackesd::alert",
+            "ALERT (warn): MDE_BACKUP_PASSPHRASE unset — the daily state backup is DISABLED",
+        );
+    }
+    if let Some(path) = backup_file {
+        if let Ok(meta) = std::fs::metadata(path) {
+            let age_secs = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(i64::MAX, |d| {
+                    now_unix.saturating_sub(i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+                });
+            out.push(mk(
+                "mackesd_backup_age_seconds",
+                "Seconds since the state-backup bundle was last written",
+                u64::try_from(age_secs.max(0)).unwrap_or(u64::MAX),
+            ));
+            if passphrase_set && age_secs > BACKUP_STALE_SECS {
+                tracing::warn!(
+                    target: "mackesd::alert",
+                    age_hours = age_secs / 3600,
+                    path = %path.display(),
+                    "ALERT (warn): state backup is stale (daily cycle missed)",
+                );
+            }
+        } else if passphrase_set {
+            // Passphrase set but no bundle yet — first cycle pending or
+            // the worker is failing; surface it.
+            tracing::warn!(
+                target: "mackesd::alert",
+                path = %path.display(),
+                "ALERT (warn): backup enabled but no state-backup bundle exists yet",
+            );
+        }
+    }
+    out
+}
+
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -332,11 +547,69 @@ mod tests {
             upsert_node(&conn, "peer:a", "a", "pk", None).expect("seed");
             crate::store::set_node_health(&conn, "peer:a", "healthy").expect("health");
         }
-        tick_once(&db, dir.path(), None, None);
+        tick_once(&TickInputs {
+            db_path: db.clone(),
+            textfile_dir: dir.path().to_path_buf(),
+            ..TickInputs::default()
+        });
         let prom = std::fs::read_to_string(dir.path().join("mackesd.prom")).expect("prom written");
         assert!(prom.contains("# TYPE mackesd_mesh_nodes_total counter"));
         assert!(prom.contains("mackesd_mesh_nodes_total 1"));
         assert!(prom.contains("mackesd_mesh_nodes_healthy 1"));
+    }
+
+    #[test]
+    fn backup_counters_report_posture_and_staleness() {
+        // EFF-26 — passphrase flag + bundle age land as gauges; a
+        // fresh bundle isn't stale.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let bundle = tmp.path().join("state-backup.enc");
+        std::fs::write(&bundle, b"enc").expect("write bundle");
+        let now = i64::try_from(
+            std::fs::metadata(&bundle)
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let counters = backup_counters(Some(&bundle), true, now + 60);
+        let by_name: BTreeMap<_, _> = counters.iter().map(|c| (c.name, c.value)).collect();
+        assert_eq!(by_name["mackesd_backup_passphrase_set"], 1);
+        assert!(by_name["mackesd_backup_age_seconds"] < 3_600);
+
+        // Unset passphrase: flag 0, no age gauge required.
+        let counters = backup_counters(None, false, now);
+        let by_name: BTreeMap<_, _> = counters.iter().map(|c| (c.name, c.value)).collect();
+        assert_eq!(by_name["mackesd_backup_passphrase_set"], 0);
+    }
+
+    #[test]
+    fn tick_once_with_worker_status_and_disk_paths_exports_gauges() {
+        // EFF-26 — the full tick writes worker + disk + backup series.
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = dir.path().join("mackesd.db");
+        let _ = crate::store::open(&db).expect("open file store");
+        let status = crate::workers::new_status_map();
+        tick_once(&TickInputs {
+            db_path: db,
+            textfile_dir: dir.path().to_path_buf(),
+            worker_status: Some(status),
+            disk_paths: vec![dir.path().to_path_buf()],
+            ..TickInputs::default()
+        });
+        let prom = std::fs::read_to_string(dir.path().join("mackesd.prom")).expect("written");
+        assert!(prom.contains("mackesd_workers_total 0"));
+        assert!(prom.contains("mackesd_breaker_tripped 0"));
+        assert!(prom.contains("mackesd_backup_passphrase_set"));
+        // df runs on real systems; tolerate absence (container without df)
+        // by not hard-asserting the disk series — but when present it must
+        // carry the path label.
+        if prom.contains("mackesd_disk_available_bytes") {
+            assert!(prom.contains(r#"path=""#));
+        }
     }
 
     #[test]
@@ -346,10 +619,17 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmp");
         let db = dir.path().join("mackesd.db");
         let _ = crate::store::open(&db).expect("open file store");
-        let hist = std::sync::Mutex::new(crate::metrics::kdc2_router_decision_us());
+        let hist = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::metrics::kdc2_router_decision_us(),
+        ));
         hist.lock().unwrap().observe(250.0);
         hist.lock().unwrap().observe(1_500.0);
-        tick_once(&db, dir.path(), None, Some(&hist));
+        tick_once(&TickInputs {
+            db_path: db.clone(),
+            textfile_dir: dir.path().to_path_buf(),
+            router_decision_us: Some(hist),
+            ..TickInputs::default()
+        });
         let prom = std::fs::read_to_string(dir.path().join("mackesd.prom")).expect("prom written");
         assert!(prom.contains("# TYPE kdc2_router_decision_us histogram"));
         assert!(prom.contains("kdc2_router_decision_us_count 2"));

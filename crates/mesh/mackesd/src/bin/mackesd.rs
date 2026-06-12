@@ -4940,7 +4940,22 @@ fn run_serve(
                     mackesd_core::metrics::default_textfile_dir(),
                     Some(mackesd_core::workers::cert_authority::default_ca_cert_path()),
                 )
-                .with_router_metrics(Arc::clone(&router_metrics)),
+                .with_router_metrics(Arc::clone(&router_metrics))
+                // EFF-26 — worker/breaker gauges + trip alert.
+                .with_worker_status(Arc::clone(&worker_status))
+                // EFF-26 — disk headroom for the replicated volume + the
+                // store's filesystem.
+                .with_disk_paths(vec![
+                    workgroup_root.clone(),
+                    db_path.parent().map(PathBuf::from).unwrap_or_default(),
+                ])
+                // EFF-26 — backup staleness against the daily bundle.
+                .with_backup_file(
+                    mackesd_core::workers::nebula_ca_backup::backup_path_for(
+                        &workgroup_root,
+                        &node_id,
+                    ),
+                ),
                 RestartPolicy::OnFailure,
             ));
             worker_names.lock().expect("worker_names mutex").push("metrics_exporter".into());

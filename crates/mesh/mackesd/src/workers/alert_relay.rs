@@ -191,6 +191,34 @@ impl AlertRelayWorker {
     }
 
     fn fire_notification(&self, event: &AlertEventPartial) {
+        // EFF-26 — the headless route: EVERY alert lands in the journal
+        // at its severity level, unconditionally and first. On a
+        // Lighthouse/Server with no desktop and no applet, the journal
+        // (+ the operator's log pipeline) IS the alert surface; toast
+        // delivery below is additive, not load-bearing.
+        match event.severity.as_str() {
+            "crit" => tracing::error!(
+                target: "mackesd::alert",
+                alert = %event.alert,
+                host = %event.host,
+                summary = %event.summary,
+                "ALERT (crit)",
+            ),
+            "warn" => tracing::warn!(
+                target: "mackesd::alert",
+                alert = %event.alert,
+                host = %event.host,
+                summary = %event.summary,
+                "ALERT (warn)",
+            ),
+            _ => tracing::info!(
+                target: "mackesd::alert",
+                alert = %event.alert,
+                host = %event.host,
+                summary = %event.summary,
+                "ALERT (info)",
+            ),
+        }
         // OBS-8 — primary path: publish on the `fdo/*` Bus topic so the
         // cosmic-applet renders it through the FDO Notifications path
         // (the same bridge `ipc::notifications` uses). Only when the Bus
