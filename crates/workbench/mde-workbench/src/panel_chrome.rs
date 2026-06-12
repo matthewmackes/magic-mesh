@@ -38,7 +38,7 @@ use mde_theme::{
 // Object Cards without taking a heavyweight dep on mde-workbench.
 // Re-exported here so existing workbench call sites stay
 // unchanged.
-pub use mde_iced_components::{object_card, overlay_color_on, overlay_white_on, with_alpha};
+pub use mde_iced_components::object_card;
 
 /// UX-6 — minimum data-row height. Component dimension, not
 /// density-scaled.

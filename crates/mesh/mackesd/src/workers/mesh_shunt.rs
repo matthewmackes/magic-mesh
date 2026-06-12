@@ -28,8 +28,6 @@ use std::time::Duration;
 
 use mde_kdc_proto::discovery::{Announce, DeviceType, DiscoveryRegistry, SyntheticAnnounce};
 
-use super::{ShutdownToken, Worker};
-
 /// Republish + relay cadence — phones change rarely; 30 s keeps a
 /// newly-paired phone visible mesh-wide within half a minute.
 pub const TICK: Duration = Duration::from_secs(30);
@@ -135,71 +133,10 @@ pub fn inject_fresh(
     n
 }
 
-/// The worker. Holds a shared synthetic-announce registry the host
-/// roster drains; a `phones` provider closure supplies this box's
-/// current paired devices each tick (the `PairingStore` in prod).
-pub struct MeshShuntWorker {
-    workgroup_root: PathBuf,
-    hostname: String,
-    registry: Arc<Mutex<DiscoveryRegistry>>,
-    phones: Arc<dyn Fn() -> Vec<PublishedDevice> + Send + Sync>,
-    tick: Duration,
-}
-
-impl MeshShuntWorker {
-    /// `phones` returns this box's paired devices (live, each tick).
-    #[must_use]
-    pub fn new(
-        workgroup_root: PathBuf,
-        hostname: String,
-        registry: Arc<Mutex<DiscoveryRegistry>>,
-        phones: Arc<dyn Fn() -> Vec<PublishedDevice> + Send + Sync>,
-    ) -> Self {
-        Self {
-            workgroup_root,
-            hostname,
-            registry,
-            phones,
-            tick: TICK,
-        }
-    }
-
-    fn now_ms() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as i64)
-    }
-
-    fn run_once(&self) {
-        let mine = (self.phones)();
-        if let Err(e) = publish_phones(&self.workgroup_root, &self.hostname, &mine) {
-            tracing::warn!(error = %e, "mesh_shunt: publishing own phones failed");
-        }
-        let now = Self::now_ms();
-        let synthetic = collect_synthetic(&self.workgroup_root, &self.hostname, now);
-        let injected = inject_fresh(&self.registry, synthetic, now);
-        if injected > 0 {
-            tracing::debug!(injected, "mesh_shunt: relayed neighbor phones (SEC-5)");
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl Worker for MeshShuntWorker {
-    fn name(&self) -> &'static str {
-        "mesh_shunt"
-    }
-
-    async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        loop {
-            self.run_once();
-            tokio::select! {
-                _ = shutdown.wait() => return Ok(()),
-                () = tokio::time::sleep(self.tick) => {}
-            }
-        }
-    }
-}
+// AUD-14 (2026-06-11): the `MeshShuntWorker` struct + its `impl Worker` were
+// removed as dead — never instantiated/spawned anywhere (the live SEC-5 shunt
+// tick is driven inline by `kdc_host::run_shunt_tick`, which consumes the free
+// functions above: `publish_phones` / `collect_synthetic` / `inject_fresh`).
 
 #[cfg(test)]
 mod tests {
@@ -257,24 +194,4 @@ mod tests {
         assert!(collect_synthetic(root, "pine", 1).is_empty());
     }
 
-    #[tokio::test]
-    async fn worker_publishes_and_exits_on_shutdown() {
-        let tmp = tempfile::tempdir().unwrap();
-        let registry = Arc::new(Mutex::new(DiscoveryRegistry::new()));
-        let mut w = MeshShuntWorker::new(
-            tmp.path().to_path_buf(),
-            "pine".into(),
-            registry,
-            Arc::new(|| vec![dev("p1", "Pine")]),
-        );
-        w.run_once();
-        assert!(phones_dir(tmp.path()).join("pine.json").exists());
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        let token = ShutdownToken::from_receiver(rx);
-        let _ = tx.send(true);
-        let r = tokio::time::timeout(Duration::from_secs(3), w.run(token))
-            .await
-            .expect("must exit on shutdown");
-        assert!(r.is_ok());
-    }
 }
