@@ -297,12 +297,12 @@ mod tests {
 // v4.0.1 WB-1 — Workbench panel surface (Phase 0.7 rescue)
 // ──────────────────────────────────────────────────────────────
 
-/// Iced-side state for the Connected Devices panel. Holds the
-/// list of paired peers + a busy flag for in-flight pair/unpair
-/// operations. Real backend integration (subscribing to the
-/// `dev.mackes.MDE.Connect` D-Bus surface) lands when KDC2-3.3+
-/// closes — until then this renders an honest empty state so
-/// the Phase 0.7 audit doesn't flag a mockup [✓].
+/// Iced-side state for the Connected Devices panel (the KDC hub that PD-3 L6
+/// links to). Holds the live paired-device roster + a busy flag for in-flight
+/// actions. AUD-3 (2026-06-11): `load()` fetches the real roster from the KDC
+/// host worker over `action/connect/devices`; per-row actions publish the
+/// Connect verbs (delivered by the AUD-2 outbound drainer). Empty roster → the
+/// honest empty state.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectPanel {
     pub peers: Vec<ConnectPeer>,
@@ -337,12 +337,26 @@ impl ConnectPanel {
         Self::default()
     }
 
-    /// Workbench panel router fans out to `Panel::load()` on
-    /// navigation. Returns Task::none because the real load
-    /// path is a D-Bus subscription not a one-shot fetch (KDC2-
-    /// 3.9 DeviceAdded / DeviceRemoved signals).
+    /// AUD-3 — fetch the live paired-device roster from the KDC host worker
+    /// over the Bus (`action/connect/devices`, the same surface PD-3 L6 reads).
+    /// One-shot on nav; empty roster degrades to the honest empty state.
     pub fn load() -> Task<crate::Message> {
-        Task::none()
+        Task::perform(
+            async {
+                tokio::task::spawn_blocking(|| {
+                    crate::dbus::action_request(
+                        "action/connect/devices",
+                        std::time::Duration::from_secs(2),
+                    )
+                })
+                .await
+                .ok()
+                .flatten()
+                .map(|raw| parse_connect_devices(&raw))
+                .unwrap_or_default()
+            },
+            |peers| crate::Message::Connect(Message::Loaded(peers)),
+        )
     }
 
     /// Dispatch a panel-scoped message.
@@ -350,19 +364,40 @@ impl ConnectPanel {
         match msg {
             Message::Loaded(peers) => {
                 self.peers = peers;
-                Task::none()
-            }
-            Message::PeerAction {
-                peer_id: _,
-                action: _,
-            } => {
-                // Real D-Bus routing lands when KDC2-3.4..3.6/3.9
-                // close. The Phase 0.7 audit catches this branch
-                // as a Tier 1-mockup if it ships with an action
-                // that fakes work — keep it as a no-op so the
-                // chip flashes a busy state but doesn't lie.
                 self.busy = false;
                 Task::none()
+            }
+            Message::PeerAction { peer_id, action } => {
+                // AUD-3 — publish the Connect verb (delivered by the AUD-2
+                // outbound drainer), then reload the roster. Unpair removes a
+                // device; ring/find buzz it.
+                self.busy = true;
+                let topic = match action {
+                    PeerAction::Unpair => "action/connect/unpair",
+                    PeerAction::Ring | PeerAction::Find => "action/connect/ring",
+                };
+                let body = serde_json::json!({ "device_id": peer_id }).to_string();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let _ = crate::dbus::action_request_with_body(
+                                topic,
+                                Some(&body),
+                                std::time::Duration::from_secs(2),
+                            );
+                            crate::dbus::action_request(
+                                "action/connect/devices",
+                                std::time::Duration::from_secs(2),
+                            )
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|raw| parse_connect_devices(&raw))
+                        .unwrap_or_default()
+                    },
+                    |peers| crate::Message::Connect(Message::Loaded(peers)),
+                )
             }
         }
     }
@@ -513,6 +548,44 @@ fn short_fingerprint(full: &str) -> String {
     full.split(':').take(8).collect::<Vec<_>>().join(":")
 }
 
+/// AUD-3 — parse the KDC host's `action/connect/devices` reply (a JSON array of
+/// `{id, name, online, battery}`) into [`ConnectPeer`] rows. A bad/non-array
+/// reply degrades to an empty roster (the panel shows its empty state). Devices
+/// are treated as phones so the phone section (battery / ring / find) renders.
+#[must_use]
+pub fn parse_connect_devices(raw: &str) -> Vec<ConnectPeer> {
+    serde_json::from_str::<serde_json::Value>(raw.trim())
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|d| {
+                    let id = d.get("id")?.as_str()?.to_string();
+                    let name = d
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(&id)
+                        .to_string();
+                    let online = d.get("online").and_then(serde_json::Value::as_bool) == Some(true);
+                    let battery_pct = d
+                        .get("battery")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|n| u8::try_from(n).ok());
+                    Some(ConnectPeer {
+                        id,
+                        name,
+                        kind: "phone".to_string(),
+                        battery_pct,
+                        last_seen_at: i64::from(online),
+                        ..ConnectPeer::default()
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod view_tests {
     use super::*;
@@ -523,6 +596,24 @@ mod view_tests {
         // Construct the Element to make sure no panic + the
         // empty branch is reachable.
         let _ = panel.view();
+    }
+
+    #[test]
+    fn parse_connect_devices_maps_the_live_roster() {
+        // AUD-3 — the action/connect/devices reply → ConnectPeer rows.
+        let raw = r#"[
+            {"id":"d1","name":"Pixel","online":true,"battery":72},
+            {"id":"d2","name":"","online":false,"battery":null}
+        ]"#;
+        let peers = parse_connect_devices(raw);
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].name, "Pixel");
+        assert_eq!(peers[0].battery_pct, Some(72));
+        assert_eq!(peers[0].kind, "phone");
+        assert_eq!(peers[1].name, "d2", "blank name falls back to id");
+        assert_eq!(peers[1].battery_pct, None);
+        // Bad reply → empty roster (honest empty state), never panics.
+        assert!(parse_connect_devices("not json").is_empty());
     }
 
     #[test]

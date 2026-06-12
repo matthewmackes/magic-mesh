@@ -97,6 +97,8 @@ pub enum Message {
     /// only — don't change the view" (the 1.x taskbar
     /// click-through contract).
     FocusRequest(String),
+    /// AUD-3 — Connected Devices (KDC hub) panel sub-message.
+    Connect(connect_panel::Message),
     /// CB-1.6 — Look & Feel themes panel sub-message.
     Themes(themes_panel::Message),
     /// CB-1.6 — Look & Feel fonts panel sub-message.
@@ -838,6 +840,7 @@ impl App {
                 Task::none()
             }
             Message::FocusRequest(slug) => self.apply_focus_request(&slug),
+            Message::Connect(msg) => self.connect.update(msg),
             Message::Themes(msg) => self.themes.update(msg),
             Message::Fonts(msg) => self.fonts.update(msg, self.backend()),
             Message::Session(msg) => self.session.update(msg, self.backend()),
