@@ -30,6 +30,11 @@ md5        = "0.7"
 ulid       = "1"
 tokio      = { version = "1", features = ["rt-multi-thread", "macros"] }
 clap       = { version = "4.5", features = ["derive"] }
+# EFF-39b — the logging plane: library/daemon paths log via tracing
+# (subscriber initialized once in main(); stderr writer so interactive
+# CLI runs still see warns). CLI *result* output stays println/eprintln.
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # AIR-2 daemon control surface: Bus-native (action/music/* + reply/<ulid>)
 # per the Q96 Bus-canonical lock (no new D-Bus interface).
 mde-bus    = { path = "../../platform/mde-bus" }

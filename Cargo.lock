@@ -5114,6 +5114,8 @@ dependencies = [
  "symphonia",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "ulid",
  "zbus",
 ]

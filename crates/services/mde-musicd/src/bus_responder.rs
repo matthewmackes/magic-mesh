@@ -554,7 +554,7 @@ pub fn serve<F: Fn() -> bool>(persist: &Persist, queue_path: &Path, should_stop:
     // queue + browse keep working.
     let engine = Engine::new()
         .map_err(|e| {
-            eprintln!("mde-musicd: no audio output — playback disabled ({e}); queue + browse still served");
+            tracing::warn!(error = %e, "no audio output — playback disabled; queue + browse still served");
         })
         .ok();
     // AIR-6: bring up the MPRIS surface sharing this engine, so media keys

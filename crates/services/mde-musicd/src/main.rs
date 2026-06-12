@@ -109,6 +109,17 @@ enum CacheOp {
 }
 
 fn main() -> ExitCode {
+    // EFF-39b — the logging plane. Library/daemon paths (engine, MPRIS,
+    // bus responder, serve) log through tracing; this stderr subscriber
+    // makes them visible both under systemd (journal captures stderr)
+    // and in interactive CLI runs. CLI *result* output stays
+    // println/eprintln. RUST_LOG overrides the `info` default.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
     let args = Args::parse();
     match args.cmd {
         Cmd::Ping { retry } => ping(retry),
@@ -154,17 +165,17 @@ fn play_cmd(song_ids: &[String]) -> ExitCode {
 
 fn serve() -> ExitCode {
     let Some(bus_root) = mde_bus::default_data_dir() else {
-        eprintln!("mde-musicd: no Bus data dir (XDG) — cannot serve");
+        tracing::error!("no Bus data dir (XDG) — cannot serve");
         return ExitCode::FAILURE;
     };
     let persist = match mde_bus::persist::Persist::open(bus_root) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("mde-musicd: opening Bus store: {e}");
+            tracing::error!(error = %e, "opening Bus store failed");
             return ExitCode::FAILURE;
         }
     };
-    println!("mde-musicd: serving action/music/* on the Bus");
+    tracing::info!("serving action/music/* on the Bus");
     // Runs until SIGTERM (the AIR-1 systemd unit manages the lifecycle);
     // `serve`'s stop predicate is exercised by the unit tests' one-shot
     // poll path.

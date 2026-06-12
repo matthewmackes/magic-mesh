@@ -347,7 +347,7 @@ impl EngineHandle {
                         break;
                     }
                     if let Err(e) = decode_track(&url, codec, &shared) {
-                        eprintln!("mde-musicd: {e}");
+                        tracing::warn!(error = %e, "decode_track failed");
                     }
                 }
                 shared.decode_done.store(true, Ordering::Relaxed);
@@ -360,7 +360,7 @@ impl EngineHandle {
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(joined);
             }
             Err(e) => {
-                eprintln!("mde-musicd: could not start decode thread: {e}");
+                tracing::error!(error = %e, "could not start decode thread");
                 // Nothing will play — let the playhead/idle checks settle.
                 self.shared.decode_done.store(true, Ordering::Relaxed);
                 self.shared.playing.store(false, Ordering::Relaxed);
@@ -497,7 +497,7 @@ where
                 .frames_played
                 .fetch_add((real / channels) as u64, Ordering::Relaxed);
         },
-        |err| eprintln!("mde-musicd: audio stream error: {err}"),
+        |err| tracing::warn!(error = %err, "audio stream error"),
         None,
     )
 }

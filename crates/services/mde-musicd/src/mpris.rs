@@ -732,7 +732,7 @@ pub fn spawn(engine: EngineHandle, queue_path: PathBuf, data_dir: PathBuf) -> Mp
             {
                 Ok(rt) => rt,
                 Err(e) => {
-                    eprintln!("mde-musicd: MPRIS runtime unavailable: {e}");
+                    tracing::warn!(error = %e, "MPRIS runtime unavailable");
                     return;
                 }
             };
@@ -746,14 +746,15 @@ pub fn spawn(engine: EngineHandle, queue_path: PathBuf, data_dir: PathBuf) -> Mp
                     Ok(b) => match b.build().await {
                         Ok(c) => c,
                         Err(e) => {
-                            eprintln!(
-                                "mde-musicd: no MPRIS session bus ({e}); media-key control disabled"
+                            tracing::warn!(
+                                error = %e,
+                                "no MPRIS session bus; media-key control disabled"
                             );
                             return;
                         }
                     },
                     Err(e) => {
-                        eprintln!("mde-musicd: MPRIS setup failed: {e}");
+                        tracing::warn!(error = %e, "MPRIS setup failed");
                         return;
                     }
                 };
