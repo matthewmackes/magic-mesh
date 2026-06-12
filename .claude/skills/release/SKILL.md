@@ -25,9 +25,12 @@ repo).
 > DISCLAIMER/LICENSE/NOTICE/SUPPORT, and `docs/help/`. Scriptlets (post_install /
 > pre_uninstall / post_uninstall) are in the same block. The role split stays
 > install-time (Lighthouse ⊂ Server ⊂ Workstation via `mackesd role pin` + the
-> first-run chooser GUI). **Still operator-gated/open:** RPM GPG signing (the
-> committed `RPM-GPG-KEY-magic-mesh` — EFF-17), the signed COPR, and the
-> Magic-on-Cosmic ISO.
+> first-run chooser GUI). **Signing (EFF-17/EFF-30):** the public key is
+> committed (`packaging/repo/RPM-GPG-KEY-magic-mesh`); sign at cut time with
+> `./install-helpers/sign-release.sh <rpm> [iso…]` — rpmsign-embeds the RPM
+> signature and emits `SHA256SUMS` + a detached `.asc` (run on the operator's
+> machine holding the "Magic Mesh Release Signing" secret key). **Still
+> operator-gated/open:** the signed COPR and the Magic-on-Cosmic ISO build.
 
 > **The package is HELD.** Per §5/§7, it does not cut until **every feature is
 > §7-complete** (runtime-reachable, no stubs). If the operator asks for a cut before

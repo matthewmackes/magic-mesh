@@ -29,6 +29,26 @@ TimeoutStopSec=20
 #     > /etc/systemd/system/mackesd.service.d/backup-passphrase.conf
 #   systemctl daemon-reload && systemctl restart mackesd
 
+# EFF-29 — service identity: root is INTENTIONAL, here is why.
+# mackesd is the node's system-management plane, not a network service that
+# could hide behind DynamicUser. Its role-gated workers, by design:
+#   * materialize /etc/nebula/ and write /etc/kamailio-mde, /etc/rtpengine-mde
+#   * merge mesh hosts into /etc/hosts (mesh_dns) + drive resolvectl
+#   * drive firewalld (zones/rich rules) and systemctl restart/reload units
+#   * manage CUPS queues (lpadmin), sshd overlay binds, dnf mirror pulls
+# DynamicUser=yes (or a %pre system user) breaks every one of those paths or
+# re-grants them via a sudo/polkit matrix wider than root itself. The trade is
+# documented; containment comes from the sandbox below + dropping the cap
+# classes the daemon can never legitimately need:
+CapabilityBoundingSet=~CAP_SYS_MODULE CAP_SYS_RAWIO CAP_SYS_BOOT CAP_SYS_TIME
+CapabilityBoundingSet=~CAP_AUDIT_CONTROL CAP_AUDIT_READ CAP_AUDIT_WRITE
+CapabilityBoundingSet=~CAP_MAC_ADMIN CAP_MAC_OVERRIDE
+CapabilityBoundingSet=~CAP_BLOCK_SUSPEND CAP_WAKE_ALARM CAP_LEASE CAP_LINUX_IMMUTABLE
+CapabilityBoundingSet=~CAP_SYS_PACCT CAP_SYS_TTY_CONFIG CAP_IPC_LOCK
+ProtectKernelModules=true
+ProtectClock=true
+SystemCallArchitectures=native
+
 # EFF-12 — sandboxing. Conservative for a root network daemon that materializes
 # /etc/nebula, writes /var/lib/mackesd, and shells ansible/nebula: protect the
 # OS image + kernel surfaces without restricting the network/fs/subprocess paths
@@ -46,7 +66,6 @@ RestrictSUIDSGID=true
 StateDirectory=mackesd
 TasksMax=4096
 MemoryAccounting=true
-CPUAccounting=true
 
 [Install]
 WantedBy=multi-user.target
