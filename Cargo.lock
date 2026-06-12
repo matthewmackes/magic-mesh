@@ -4903,6 +4903,7 @@ dependencies = [
 name = "magic-fleet"
 version = "0.0.0"
 dependencies = [
+ "clap",
  "serde",
  "serde_json",
  "serde_yaml",
