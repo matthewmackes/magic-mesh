@@ -96,6 +96,11 @@ pub mod heartbeat;
 // heartbeat file (peer hasn't enrolled yet) and the local peer
 // (heartbeat-self is unreachable by definition).
 pub mod health_reconciler;
+// EFF-9 — Prometheus textfile exporter. Snapshots store-derivable
+// control-plane gauges into <textfile_collector>/mackesd.prom on a
+// 30 s cadence; the renderer (metrics::write_textfile) existed with
+// no production caller until this worker.
+pub mod metrics_exporter;
 // KDC2-6.6 — legacy `kdc_bridge` retired alongside the upstream
 // kdeconnectd wrapper. The native KDC host worker
 // (`workers::kdc_host`) replaces it in the v2.1+ stack.

@@ -4957,6 +4957,21 @@ fn run_serve(
             ));
             worker_names.lock().expect("worker_names mutex").push("health_reconciler".into());
         }
+        // EFF-9 — Prometheus textfile exporter. Lighthouse-tier (the
+        // observability surface lives on the control plane). Snapshots
+        // mesh node-health buckets + audit-chain status + migration
+        // count into <textfile_collector>/mackesd.prom every 30 s; a
+        // node_exporter textfile collector scrapes it.
+        if mackesd_core::worker_role::runs("metrics_exporter", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::metrics_exporter::MetricsExporterWorker::new(
+                    db_path.clone(),
+                    mackesd_core::metrics::default_textfile_dir(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names.lock().expect("worker_names mutex").push("metrics_exporter".into());
+        }
         // VV-2 (v4.1.0) — voice_config worker. Seeds the
         // /var/lib/mackesd/voice-desired.json document on first
         // tick + triggers `systemctl try-reload-or-restart` on
