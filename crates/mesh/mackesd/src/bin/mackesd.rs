@@ -6132,6 +6132,9 @@ fn run_serve(
                 // LizardFS-replicated QNM-Shared volume. One `FileXfer` per
                 // surface (cheap: just a root path + host id) backs inbox /
                 // outbox / file-ops with genuine copy/list/rollback.
+                // EFF-2 — `FileXfer::new` confines send-to sources to the
+                // operator's home dir (the share root), so a Bus writer
+                // can't exfil /etc/shadow / keys into a peer's inbox.
                 let qnm_root = mackesd_core::default_qnm_shared_root();
                 let xfer_inbox = files::FileXfer::new(qnm_root.clone(), host.clone());
                 let xfer_outbox = files::FileXfer::new(qnm_root.clone(), host.clone());

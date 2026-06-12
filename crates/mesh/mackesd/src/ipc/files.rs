@@ -211,13 +211,51 @@ pub fn file_ops_reply(verb: &str, _body: Option<&str>) -> String {
 pub struct FileXfer {
     qnm_root: std::path::PathBuf,
     host: String,
+    /// EFF-2 — allowlisted root that `send-to` sources must resolve
+    /// within. Defaults to the operator's home dir: a Bus writer can
+    /// only exfil files the operator could already read by hand, never
+    /// `/etc/shadow`, host keys, or another user's data. Canonicalized
+    /// at construction so the per-source `starts_with` check compares
+    /// real paths (symlinks resolved).
+    share_root: std::path::PathBuf,
 }
 
 impl FileXfer {
     /// Construct over the QNM-Shared root + this node's host identity.
+    /// The send-to source allowlist defaults to the operator's home
+    /// directory (see [`FileXfer::with_share_root`] to override).
     #[must_use]
     pub fn new(qnm_root: std::path::PathBuf, host: String) -> Self {
-        Self { qnm_root, host }
+        let home = dirs::home_dir().unwrap_or_else(|| qnm_root.clone());
+        let share_root = std::fs::canonicalize(&home).unwrap_or(home);
+        Self {
+            qnm_root,
+            host,
+            share_root,
+        }
+    }
+
+    /// Override the send-to source allowlist root (EFF-2). The root is
+    /// canonicalized so symlinked roots compare correctly. Used by the
+    /// daemon to point at a declared share + by tests to allow a
+    /// tempdir source tree.
+    #[must_use]
+    pub fn with_share_root(mut self, root: std::path::PathBuf) -> Self {
+        self.share_root = std::fs::canonicalize(&root).unwrap_or(root);
+        self
+    }
+
+    /// EFF-2 — resolve a caller-supplied send-to source and confirm it
+    /// is a regular file whose real path (symlinks + `..` resolved)
+    /// lives under [`Self::share_root`]. Returns the canonical path on
+    /// success; `None` (refused) for a missing file, a non-file, or
+    /// any path that escapes the allowlisted root.
+    fn allowed_source(&self, src: &std::path::Path) -> Option<std::path::PathBuf> {
+        let canon = std::fs::canonicalize(src).ok()?;
+        if !canon.is_file() {
+            return None;
+        }
+        canon.starts_with(&self.share_root).then_some(canon)
     }
 
     fn inbox_root(&self, peer: &str) -> std::path::PathBuf {
@@ -296,20 +334,36 @@ impl FileXfer {
         }
         let mut delivered: Vec<String> = Vec::new();
         let mut bytes: u64 = 0;
+        let mut refused = 0;
         for src in &sources {
             let src_path = std::path::Path::new(src);
-            let Some(name) = src_path.file_name().and_then(|n| n.to_str()) else {
+            // EFF-2 — never copy a caller-supplied path that escapes the
+            // operator's share root. A Bus writer must not be able to
+            // exfil /etc/shadow / host keys / another user's files into
+            // a peer's replicated inbox. Symlinks + `..` are resolved by
+            // canonicalize, so a symlink-under-home → /etc/shadow is
+            // refused too.
+            let Some(canon) = self.allowed_source(src_path) else {
+                tracing::warn!(
+                    source = %src_path.display(),
+                    share_root = %self.share_root.display(),
+                    "send-to: refused source outside the share root",
+                );
+                refused += 1;
+                continue;
+            };
+            let Some(name) = canon.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
             let Some(dest) = resolve_conflict(&dest_dir, name, conflict) else {
                 continue; // skip policy, or unresolved
             };
-            match std::fs::copy(src_path, &dest) {
+            match std::fs::copy(&canon, &dest) {
                 Ok(n) => {
                     bytes += n;
                     delivered.push(name.to_string());
                     if mode == "move" {
-                        let _ = std::fs::remove_file(src_path);
+                        let _ = std::fs::remove_file(&canon);
                     }
                 }
                 Err(e) => return err(format!("send-to: copy {name} failed: {e}")),
@@ -322,6 +376,7 @@ impl FileXfer {
             "op_id": op_id,
             "count": delivered.len(),
             "bytes": bytes,
+            "refused": refused,
         })
         .to_string()
     }
@@ -675,7 +730,8 @@ mod tests {
         let src = tmp.path().join("notes.md");
         std::fs::write(&src, b"hello mesh").unwrap();
 
-        let pine = FileXfer::new(qnm.clone(), "pine".to_string());
+        let pine =
+            FileXfer::new(qnm.clone(), "pine".to_string()).with_share_root(qnm.clone());
         let body = json!({
             "sources": [src.to_string_lossy()],
             "selector": "peer:oak",
@@ -708,7 +764,8 @@ mod tests {
         let qnm = tmp.path().to_path_buf();
         let src = tmp.path().join("doc.txt");
         std::fs::write(&src, b"abc").unwrap();
-        let pine = FileXfer::new(qnm.clone(), "pine".to_string());
+        let pine =
+            FileXfer::new(qnm.clone(), "pine".to_string()).with_share_root(qnm.clone());
         let body = json!({"sources":[src.to_string_lossy()],"selector":"peer:oak","mode":"move"})
             .to_string();
         let reply: serde_json::Value =
@@ -763,12 +820,77 @@ mod tests {
     }
 
     #[test]
+    fn send_to_refuses_source_outside_share_root() {
+        // EFF-2 — a Bus writer must not exfil a file outside the
+        // operator's share root (e.g. /etc/shadow) into a peer's inbox.
+        let tmp = tempfile::tempdir().unwrap();
+        let qnm = tmp.path().join("qnm");
+        std::fs::create_dir_all(&qnm).unwrap();
+        let share = tmp.path().join("home");
+        std::fs::create_dir_all(&share).unwrap();
+
+        // A secret living OUTSIDE the share root.
+        let secret = tmp.path().join("secret.txt");
+        std::fs::write(&secret, b"top secret").unwrap();
+        // A legit file INSIDE the share root.
+        let ok = share.join("ok.txt");
+        std::fs::write(&ok, b"fine").unwrap();
+
+        let pine =
+            FileXfer::new(qnm.clone(), "pine".to_string()).with_share_root(share.clone());
+        let body = json!({
+            "sources": [secret.to_string_lossy(), ok.to_string_lossy()],
+            "selector": "peer:oak",
+            "mode": "copy",
+        })
+        .to_string();
+        let reply: serde_json::Value =
+            serde_json::from_str(&pine.file_ops_reply("send-to", Some(&body))).unwrap();
+        assert_eq!(reply["ok"], true);
+        // Only the in-root file was delivered; the secret was refused.
+        assert_eq!(reply["count"], 1);
+        assert_eq!(reply["refused"], 1);
+        assert!(qnm.join("inbox/oak/pine/ok.txt").exists());
+        assert!(!qnm.join("inbox/oak/pine/secret.txt").exists());
+    }
+
+    #[test]
+    fn send_to_refuses_symlink_escaping_share_root() {
+        // EFF-2 — a symlink UNDER the share root pointing OUTSIDE it
+        // must be refused: canonicalize resolves the link target, and
+        // the target escapes the root.
+        let tmp = tempfile::tempdir().unwrap();
+        let qnm = tmp.path().join("qnm");
+        std::fs::create_dir_all(&qnm).unwrap();
+        let share = tmp.path().join("home");
+        std::fs::create_dir_all(&share).unwrap();
+        let secret = tmp.path().join("secret.txt");
+        std::fs::write(&secret, b"top secret").unwrap();
+        let link = share.join("link-to-secret.txt");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        let pine =
+            FileXfer::new(qnm.clone(), "pine".to_string()).with_share_root(share.clone());
+        let body = json!({
+            "sources": [link.to_string_lossy()],
+            "selector": "peer:oak",
+        })
+        .to_string();
+        let reply: serde_json::Value =
+            serde_json::from_str(&pine.file_ops_reply("send-to", Some(&body))).unwrap();
+        assert_eq!(reply["count"], 0);
+        assert_eq!(reply["refused"], 1);
+        assert!(!qnm.join("inbox/oak/pine/link-to-secret.txt").exists());
+    }
+
+    #[test]
     fn rename_conflict_keeps_both_copies() {
         let tmp = tempfile::tempdir().unwrap();
         let qnm = tmp.path().to_path_buf();
         let src = tmp.path().join("a.txt");
         std::fs::write(&src, b"v1").unwrap();
-        let pine = FileXfer::new(qnm.clone(), "pine".to_string());
+        let pine =
+            FileXfer::new(qnm.clone(), "pine".to_string()).with_share_root(qnm.clone());
         let body =
             json!({"sources":[src.to_string_lossy()],"selector":"peer:oak","conflict":"rename"})
                 .to_string();
