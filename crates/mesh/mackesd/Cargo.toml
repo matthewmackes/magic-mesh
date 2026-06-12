@@ -307,7 +307,9 @@ workspace = true
 [package.metadata.generate-rpm]
 name = "magic-mesh"
 summary = "Magic Mesh — secure no-fixed-center workgroup mesh + native-Rust Carbon GUIs on Fedora-Cosmic"
-license = "proprietary"
+# EFF-13 — matches the workspace license (GPL-3.0-or-later). Bundled deps add
+# MPL-2.0 (libcosmic/iced stack) + permissive (MIT/Apache-2.0/BSD); see NOTICE.
+license = "GPL-3.0-or-later AND MPL-2.0"
 # Every binary the workspace builds, placed under /usr/bin.
 assets = [
     { source = "target/release/mackesd",            dest = "/usr/bin/mackesd",            mode = "755" },
@@ -334,11 +336,33 @@ assets = [
     # Brand: the MCNF hicolor icon set + the DISCLAIMER the gate checks.
     { source = "assets/icons/hicolor/**/*",        dest = "/usr/share/icons/hicolor/",     mode = "644" },
     { source = "DISCLAIMER.md",                    dest = "/usr/share/magic-mesh/DISCLAIMER.md", mode = "644" },
+    # EFF-13 — license + third-party notices ship with the package.
+    { source = "LICENSE",                          dest = "/usr/share/licenses/magic-mesh/LICENSE", mode = "644" },
+    { source = "NOTICE",                           dest = "/usr/share/licenses/magic-mesh/NOTICE",  mode = "644" },
     { source = "SUPPORT.md",                       dest = "/usr/share/magic-mesh/SUPPORT.md", mode = "644" },
     # ENT-12 — operator help docs; the Workbench Help panel + `mackesd
     # state-restore` reference these at /usr/share/mde/help/.
     { source = "docs/help/*.md",                   dest = "/usr/share/mde/help/", mode = "644" },
 ]
+# EFF-14 — install/upgrade/remove scriptlets: register the daemon unit, create
+# the config dir, refresh icon/desktop caches; clean up on removal. Guards keep
+# them no-fatal in minimal/container roots.
+post_install_script = """
+systemctl daemon-reload >/dev/null 2>&1 || :
+systemctl enable mackesd.service >/dev/null 2>&1 || :
+[ -d /etc/mackesd ] || install -d -m 0700 /etc/mackesd
+gtk-update-icon-cache -q -f /usr/share/icons/hicolor >/dev/null 2>&1 || :
+update-desktop-database -q >/dev/null 2>&1 || :
+"""
+pre_uninstall_script = """
+if [ "$1" = 0 ]; then
+  systemctl --no-reload disable --now mackesd.service >/dev/null 2>&1 || :
+fi
+"""
+post_uninstall_script = """
+systemctl daemon-reload >/dev/null 2>&1 || :
+"""
+
 # Runtime deps the platform shells to (D-W1 / §1-§5 substrate).
 [package.metadata.generate-rpm.requires]
 nebula = "*"

@@ -14,16 +14,39 @@ Restart=on-failure
 RestartSec=3
 # ENT-6 acceptance: kill -9 -> restarted within seconds.
 TimeoutStopSec=20
-# ENT-11 (C8) — the CA-backup passphrase is delivered as a
-# systemd-encrypted credential (TPM/host-bound where available), NOT
-# an Environment= var: it is invisible to `systemctl show` and
-# /proc/<pid>/environ. mackesd reads it from
-# $CREDENTIALS_DIRECTORY/backup-passphrase. Provision once with:
+
+# EFF-15 — the CA-backup passphrase is an OPTIONAL systemd-encrypted credential
+# (ENT-11/C8): TPM/host-bound, invisible to `systemctl show` + /proc/<pid>/environ.
+# It is NOT in the base unit (a `LoadCredentialEncrypted` whose source file is
+# absent makes systemd refuse to start the unit — a fresh install would be
+# dead-on-arrival). Instead, on a CA-holding box, provision it once and add the
+# drop-in that loads it (mackesd reads $CREDENTIALS_DIRECTORY/backup-passphrase;
+# SEC-7 alerts loudly if it is unset on a CA holder):
 #   systemd-creds encrypt --name=backup-passphrase - \
 #     /etc/mackesd/backup-passphrase.cred  < phrase.txt
-LoadCredentialEncrypted=backup-passphrase:/etc/mackesd/backup-passphrase.cred
-# Hardening (the daemon manages /var/lib/mackesd + the mesh mount).
+#   mkdir -p /etc/systemd/system/mackesd.service.d
+#   printf '[Service]\nLoadCredentialEncrypted=backup-passphrase:/etc/mackesd/backup-passphrase.cred\n' \
+#     > /etc/systemd/system/mackesd.service.d/backup-passphrase.conf
+#   systemctl daemon-reload && systemctl restart mackesd
+
+# EFF-12 — sandboxing. Conservative for a root network daemon that materializes
+# /etc/nebula, writes /var/lib/mackesd, and shells ansible/nebula: protect the
+# OS image + kernel surfaces without restricting the network/fs/subprocess paths
+# it needs. (Stricter ProtectSystem/ProtectHome/RestrictAddressFamilies are
+# deferred to EFF-12 follow-up — they need a live Fedora bring-up to verify
+# nebula tun + the QNM mount keep working.)
 NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+StateDirectory=mackesd
+TasksMax=4096
+MemoryAccounting=true
+CPUAccounting=true
 
 [Install]
 WantedBy=multi-user.target
