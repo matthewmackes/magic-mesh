@@ -306,6 +306,10 @@ workspace = true
 # Workstation, one artifact). RPM GPG signing + the ISO stay operator-gated.
 [package.metadata.generate-rpm]
 name = "magic-mesh"
+# EFF-40 — the NEVRA release field: bump THIS (not the workspace
+# version) for asset-only/packaging-only changes so `dnf upgrade`
+# sees a newer NEVRA; reset to "1" on every workspace version bump.
+release = "1"
 summary = "Magic Mesh — secure no-fixed-center workgroup mesh + native-Rust Carbon GUIs on Fedora-Cosmic"
 # EFF-13 — matches the workspace license (GPL-3.0-or-later). Bundled deps add
 # MPL-2.0 (libcosmic/iced stack) + permissive (MIT/Apache-2.0/BSD); see NOTICE.
@@ -381,6 +385,22 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 """
 
 # Runtime deps the platform shells to (D-W1 / §1-§5 substrate).
+# EFF-42 — verified: `nebula` IS packaged in stock Fedora (1.10.3 on
+# F44), so the hard Requires resolves without our repo.
 [package.metadata.generate-rpm.requires]
 nebula = "*"
+
+# EFF-42 — ansible-core is a WEAK dep (Recommends): only the Server-tier
+# ansible_pull/job_exec workers shell to it, and they degrade gracefully
+# (spawn failure → recoverable error + back-off) when it's absent. A
+# Lighthouse VPS or a desktop-only Workstation shouldn't drag in the
+# whole ansible stack; `dnf install` still pulls it by default
+# (weak deps on), and `--setopt=install_weak_deps=False` opts out.
+[package.metadata.generate-rpm.recommends]
 ansible-core = "*"
+
+# EFF-42 — upgrade continuity: the pre-pivot package name was `mde-core`
+# (the E8-era RPM; see config/daemon.rs's template note). Obsolete it so
+# a box carrying the old package upgrades cleanly into `magic-mesh`.
+[package.metadata.generate-rpm.obsoletes]
+mde-core = "*"
