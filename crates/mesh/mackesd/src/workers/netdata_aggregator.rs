@@ -279,6 +279,11 @@ impl NetdataAggregator {
         let target_ip = if am_aggregator { None } else { aggregator_ip };
         let block = build_stream_block(target_ip, self.stream_port, &self.api_key);
         let rewritten = rewrite_stream_block(&existing, block.as_deref());
+        // EFF-22 — also confine the dashboard's [web] bind to loopback +
+        // this node's overlay IP so :19999 is never exposed on the underlay.
+        let overlay_ip = read_overlay_ip(&self.overlay_ip_source).ok();
+        let web_block = build_web_block(overlay_ip.as_deref());
+        let rewritten = rewrite_named_section(&rewritten, "[web]", Some(&web_block));
         let outcome = if rewritten == existing {
             StreamRewriteOutcome::Unchanged
         } else {
@@ -455,20 +460,54 @@ pub fn build_stream_block(aggregator_ip: Option<&str>, port: u16, api_key: &str)
 /// body.
 #[must_use]
 pub fn rewrite_stream_block(existing: &str, block: Option<&str>) -> String {
+    rewrite_named_section(existing, "[stream]", block)
+}
+
+/// EFF-22 — build the `[web]` block confining the Netdata dashboard
+/// (`:19999`) to loopback + the overlay IP, never the underlay/default
+/// `0.0.0.0`. With no overlay IP yet (pre-enrolment) it binds loopback
+/// only — the dashboard is reachable locally but never exposed off-box.
+#[must_use]
+pub fn build_web_block(overlay_ip: Option<&str>) -> String {
+    let bind = match overlay_ip {
+        Some(ip) if !ip.is_empty() => format!("127.0.0.1 {ip}"),
+        _ => "127.0.0.1".to_string(),
+    };
+    format!(
+        "[web]\n\
+         \x20\x20\x20\x20# Written by mackesd netdata_aggregator (EFF-22).\n\
+         \x20\x20\x20\x20# Confine the :19999 dashboard to loopback + overlay,\n\
+         \x20\x20\x20\x20# never the underlay. Don't edit by hand.\n\
+         \x20\x20\x20\x20bind to = {bind}\n"
+    )
+}
+
+/// Replace (or strip/append) a named `[section]` block in a Netdata
+/// `netdata.conf`. `header` is the exact bracketed section name (e.g.
+/// `[stream]`). When `block` is `None` any existing section is removed;
+/// `Some(text)` replaces the existing one or appends after the last
+/// pre-existing section.
+///
+/// Section boundaries follow Netdata's INI dialect: a section starts at
+/// a line whose first non-whitespace character is `[` and ends at the
+/// next such line (or EOF). Comments + blank lines inside a section
+/// count as section body.
+#[must_use]
+pub fn rewrite_named_section(existing: &str, header: &str, block: Option<&str>) -> String {
     let mut sections: Vec<Vec<String>> = Vec::new();
     let mut current: Vec<String> = Vec::new();
-    let mut in_stream = false;
+    let mut in_target = false;
     for line in existing.split_inclusive('\n') {
         let trimmed = line.trim_start();
         if trimmed.starts_with('[') {
             if !current.is_empty() {
                 sections.push(std::mem::take(&mut current));
             }
-            in_stream = trimmed.starts_with("[stream]");
-            if !in_stream {
+            in_target = trimmed.starts_with(header);
+            if !in_target {
                 current.push(line.to_owned());
             }
-        } else if !in_stream {
+        } else if !in_target {
             current.push(line.to_owned());
         }
     }
@@ -477,11 +516,15 @@ pub fn rewrite_stream_block(existing: &str, block: Option<&str>) -> String {
     }
     let mut out: String = sections.into_iter().flatten().collect();
     if let Some(text) = block {
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push('\n');
+        // Collapse the trailing blank-line run to a single separator so
+        // re-running over an already-rewritten conf is idempotent — a
+        // non-idempotent append would grow a blank line per tick and
+        // churn a netdata reload every cycle.
+        while out.ends_with('\n') {
+            out.pop();
         }
         if !out.is_empty() {
-            out.push('\n');
+            out.push_str("\n\n");
         }
         out.push_str(text);
     }
@@ -755,6 +798,34 @@ mod tests {
         assert!(pos_cloud < pos_plugins);
         // Stream block always trails the existing sections.
         assert!(pos_plugins < pos_stream);
+    }
+
+    #[test]
+    fn build_web_block_confines_to_overlay_and_loopback() {
+        // EFF-22 — with an overlay IP, bind to loopback + overlay only.
+        let block = build_web_block(Some("10.42.0.5"));
+        assert!(block.contains("bind to = 127.0.0.1 10.42.0.5"));
+        assert!(!block.contains("0.0.0.0"));
+        // Pre-enrolment (no overlay IP): loopback only.
+        let none = build_web_block(None);
+        assert!(none.contains("bind to = 127.0.0.1\n"));
+        assert!(!none.contains("0.0.0.0"));
+    }
+
+    #[test]
+    fn rewrite_named_section_replaces_default_web_bind() {
+        // A stock netdata.conf binding 0.0.0.0 must be rewritten to the
+        // confined block; the result must not leave the wildcard bind.
+        let existing = "[global]\n    memory mode = dbengine\n\n\
+                        [web]\n    bind to = 0.0.0.0\n    mode = static-threaded\n";
+        let web = build_web_block(Some("10.42.0.7"));
+        let out = rewrite_named_section(existing, "[web]", Some(&web));
+        assert!(!out.contains("0.0.0.0"), "wildcard bind must be gone: {out}");
+        assert!(out.contains("bind to = 127.0.0.1 10.42.0.7"));
+        assert!(out.contains("[global]"));
+        // Idempotent: re-running over the rewritten conf is a no-op.
+        let again = rewrite_named_section(&out, "[web]", Some(&web));
+        assert_eq!(again, out);
     }
 
     #[test]
