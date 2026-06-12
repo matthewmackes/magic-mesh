@@ -119,6 +119,11 @@ Lifted from the 2026-06-11 `docs/COMPLIANCE.md` sweep ("audit the platform for f
 - [✓] **AUD-14 · REMOVE the never-spawned `MeshShuntWorker` struct.** `mesh_shunt.rs:141` wrapper is never instantiated; its free fns stay (inlined into `kdc_host.rs`).
 - [✓] **AUD-15..20 · Doc drift + dead retired-surface actions (FINISH-doc/retarget).** `app.rs:885` live `mde settings` exec (retired dispatcher); `repair.rs` `labwc --reconfigure` action (EOL shell → retarget Cosmic/drop); `displays/keyboard/mouse` docs naming labwc as current; `picker.rs:7` "warm-dark"; `mackes-transport` docs "Tailscale DERP" heritage prose; `home.rs:894` stale `dev.mackes.MDE.Connect` probe → use the Bus.
 
+## AUDIT-2026-06-12 r4 — cycle-4 fresh sweep (all closed same day)
+
+- [✓] **AUD4-1 · Unreachable · VV-4 voice heuristic was test-only.** `voice::best_path`/`pick_relay`/`score` were built+tested but `voice::materialize` wrote `priority: 0` for every dispatcher row (the "until VV-4 ships" comment) and `Candidate::loss_pct` had no production consumer. DONE: new `voice::dispatcher_priority` (best_path → inverted score → u8; non-direct floors to 0) wired into `build_voice_desired` via a per-peer latency-lookup reading the mesh-latency cache (generic JSON parse — the worker struct is async-gated, this reconcile path isn't). Faster direct paths rank higher; unmeasured peers neutral; over-budget/unreachable floor. 2 new tests; loss_pct doc corrected.
+- [✓] **AUD4-2 · Supply-chain · yanked swash 0.2.8.** `cargo deny` advisories FAILED (swash 0.2.8 yanked, transitive via cosmic-text→iced). DONE: `cargo update -p swash` → 0.2.9; advisories green.
+
 ## P0 — Security / substrate lock (urgent)
 
 - [✓] **H1 · RSA-2048 → RSA-4096 KDC device identity (§3)** — done (`a5186c5`); 49/0 green. — `mde-kdc-host/src/pairing.rs:236` `generate_pkcs8()` generates the live `identity.pkcs8` at 2048 bits via `PairingStore::open:101`. Rewire to the compliant 4096 generator that already exists (`keygen.rs:63`, `RSA_MODULUS_BITS=4096`, exported `lib.rs:41`); delete the duplicate 2048 `generate_pkcs8` in `pairing.rs`. Add/confirm a config test asserting 4096. **Do first — a max-crypto lock regression where the correct code already exists, just isn't called.**

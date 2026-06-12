@@ -38,11 +38,14 @@ pub struct Candidate {
     /// here rounds to integer compare anyway.
     pub rtt_ms: f32,
     /// Packet-loss percentage on the underlying path
-    /// (0.0..=100.0). The mesh-latency worker today only
-    /// tracks per-peer reachability (loss = 0 when up, 100
-    /// when down), so for now this is `0.0` on healthy paths
-    /// and `100.0` on dead paths; VV-2.a's reader populates it
-    /// from a smoothed window once the worker grows that.
+    /// (0.0..=100.0). VV-2.a's writer (`voice::materialize`) builds
+    /// candidates from the mesh-latency cache, which today tracks
+    /// per-peer reachability (an entry's presence ⇒ reachable ⇒
+    /// loss `0.0`; absence ⇒ no candidate). A true smoothed
+    /// loss-rate window would feed richer values here; the scorer
+    /// already weights this dimension (`score` = loss·10 + rtt),
+    /// so that upgrade needs no scorer change — only a loss-aware
+    /// cache.
     pub loss_pct: f32,
 }
 
@@ -152,9 +155,63 @@ pub fn score(c: &Candidate) -> f32 {
     c.loss_pct.mul_add(10.0, c.rtt_ms)
 }
 
+/// VV-2.a — the Kamailio `dispatcher.list` priority for a peer,
+/// derived from VV-4's [`best_path`]. Kamailio prefers the
+/// **higher** priority among rows sharing a `setid`, while VV-4's
+/// [`score`] is lower-is-better, so the mapping inverts:
+///
+///   * A candidate that wins a [`Path::Direct`] decision (RTT <
+///     80 ms, loss < 5%) gets a priority that falls as its score
+///     rises — a 10 ms path outranks a 70 ms one.
+///   * A candidate that only reaches [`Path::Transit`] (too slow
+///     or unreachable) gets priority `0` — Kamailio keeps the row
+///     but tries it last.
+///
+/// This is the function the materialize writer calls per direct
+/// row, making the VV-4 heuristic (`best_path` → `pick_relay` →
+/// `score`) reachable from production rather than test-only.
+#[must_use]
+pub fn dispatcher_priority(target_node_id: &str, candidates: &[Candidate]) -> u8 {
+    match best_path(target_node_id, candidates) {
+        Path::Direct { .. } => {
+            // Find the winning direct candidate's score (best_path
+            // already proved one qualifies) and invert it into the
+            // u8 priority band. Healthy paths land high (~near 100);
+            // an 80 ms path floors near the transit tier.
+            let best = candidates
+                .iter()
+                .filter(|c| c.via == target_node_id && c.rtt_ms < MAX_DIRECT_RTT_MS)
+                .map(score)
+                .fold(f32::INFINITY, f32::min);
+            // score ∈ [0, ~80) for a qualifying direct path → map to
+            // priority (100 - score), clamped to the 1..=100 band so
+            // a qualifying peer always outranks a Transit (0).
+            let pri = (100.0 - best).clamp(1.0, 100.0);
+            pri as u8
+        }
+        Path::Transit { .. } => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatcher_priority_inverts_score_and_floors_non_direct() {
+        // VV-2.a — direct winners rank high (faster ⇒ higher);
+        // unreachable / over-budget candidates floor to 0 (transit).
+        let fast = dispatcher_priority("peer:x", &[c("peer:x", 8.0, 0.0)]);
+        let slow = dispatcher_priority("peer:x", &[c("peer:x", 60.0, 0.0)]);
+        assert!(fast > slow, "faster direct path ranks higher ({fast} > {slow})");
+        assert!(fast >= 1 && fast <= 100);
+        // Over the 80 ms direct cap → Transit → 0.
+        assert_eq!(dispatcher_priority("peer:x", &[c("peer:x", 120.0, 0.0)]), 0);
+        // Unreachable (loss 100) → Transit → 0.
+        assert_eq!(dispatcher_priority("peer:x", &[c("peer:x", 10.0, 100.0)]), 0);
+        // No candidates → Transit fallback → 0.
+        assert_eq!(dispatcher_priority("peer:x", &[]), 0);
+    }
 
     fn c(via: &str, rtt: f32, loss: f32) -> Candidate {
         Candidate {

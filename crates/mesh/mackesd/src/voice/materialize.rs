@@ -98,10 +98,46 @@ pub fn materialize_voice_desired(
         return Ok(MaterializeOutcome::SkippedNoPolicies);
     }
 
-    let desired = build_voice_desired(snapshot, node_id, |peer_id| {
-        read_overlay_ip(workgroup_root, peer_id)
-    });
+    // VV-2.a — the per-peer RTT resolver reads the mesh-latency
+    // worker's cache so the dispatcher priority is latency-aware.
+    // `None` (no measurement yet) leaves the row at neutral priority.
+    let latency = read_latency_cache();
+    let desired = build_voice_desired(
+        snapshot,
+        node_id,
+        |peer_id| read_overlay_ip(workgroup_root, peer_id),
+        |peer_id| latency.as_ref().and_then(|l| l.get(peer_id).copied()),
+    );
     write_if_changed(&desired, desired_json_path)
+}
+
+/// VV-2.a — peer → measured RTT (ms) from the mesh-latency worker's
+/// cache. `None` when the worker hasn't written it yet (fresh boot)
+/// or it's unparseable — callers fall back to neutral priority.
+///
+/// The cache is parsed generically (only the `peers.<id>.rtt_ms`
+/// path is read) rather than via the worker's `LatencySnapshot`
+/// type, because that type lives behind the `async-services` feature
+/// while this reconcile path is always-compiled. The on-disk field
+/// path is the only coupling.
+type LatencyMap = std::collections::BTreeMap<String, f64>;
+fn read_latency_cache() -> Option<LatencyMap> {
+    // Mirror of the worker's path logic: $XDG_CACHE_HOME/mde or
+    // $HOME/.cache/mde, file `mesh-latency.json`.
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    let path = base.join("mde").join("mesh-latency.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let peers = v.get("peers")?.as_object()?;
+    let mut out = LatencyMap::new();
+    for (id, pl) in peers {
+        if let Some(rtt) = pl.get("rtt_ms").and_then(serde_json::Value::as_f64) {
+            out.insert(id.clone(), rtt);
+        }
+    }
+    Some(out)
 }
 
 /// Build a [`VoiceDesired`] from the snapshot's voice policies +
@@ -112,13 +148,16 @@ pub fn materialize_voice_desired(
 /// bundles. The reconciler call passes a closure that reads
 /// `<workgroup_root>/<peer_id>/mackesd/nebula-bundle.json`; tests pass
 /// a closure backed by a `HashMap`.
-pub fn build_voice_desired<F>(
+pub fn build_voice_desired<F, G>(
     snapshot: &DesiredSnapshot,
     node_id: &str,
     mut address_lookup: F,
+    mut latency_lookup: G,
 ) -> VoiceDesired
 where
     F: FnMut(&str) -> Option<String>,
+    // VV-2.a — per-peer measured RTT (ms); `None` ⇒ neutral priority.
+    G: FnMut(&str) -> Option<f64>,
 {
     let mut out = VoiceDesired::boot_default(node_id);
 
@@ -145,11 +184,22 @@ where
                 node_id: target.clone(),
                 display_name: display_name.clone(),
                 mesh_address: address_lookup(target).unwrap_or_else(|| "0.0.0.0".to_owned()),
-                // Priority is left at the default until the
-                // VV-4 latency-aware writer ships; today every
-                // direct row gets the same weight + Kamailio
-                // falls back to round-robin within a setid.
-                priority: 0,
+                // VV-2.a — latency-aware priority via VV-4's
+                // `dispatcher_priority` (best_path → score). With a
+                // measured RTT, a healthy direct path ranks high and
+                // Kamailio prefers it within the setid; with no
+                // measurement yet the row stays at neutral `0`
+                // (round-robin) — never fabricate a ranking.
+                priority: latency_lookup(target).map_or(0, |rtt| {
+                    let cand = crate::voice::Candidate {
+                        via: target.clone(),
+                        rtt_ms: rtt as f32,
+                        // The latency cache only carries RTT; an
+                        // entry's presence means reachable (loss 0).
+                        loss_pct: 0.0,
+                    };
+                    crate::voice::dispatcher_priority(target, std::slice::from_ref(&cand))
+                }),
             }),
             _ => None,
         })
@@ -302,7 +352,7 @@ mod tests {
         map.insert("peer:self", "10.42.0.5");
         map.insert("peer:alice", "10.42.0.7");
         map.insert("peer:bob", "10.42.0.8");
-        let desired = build_voice_desired(&snap, "peer:self", lookup(map));
+        let desired = build_voice_desired(&snap, "peer:self", lookup(map), |_| None);
 
         assert_eq!(desired.node_id, "peer:self");
         assert_eq!(desired.mesh_bind_address, "10.42.0.5");
@@ -313,6 +363,65 @@ mod tests {
         assert_eq!(desired.peers[0].display_name, "Alice");
         assert_eq!(desired.peers[1].extension, "1002");
         assert_eq!(desired.peers[1].node_id, "peer:bob");
+        // No latency supplied → neutral priority (round-robin).
+        assert_eq!(desired.peers[0].priority, 0);
+        assert_eq!(desired.peers[1].priority, 0);
+    }
+
+    #[test]
+    fn vv4_latency_aware_priority_prefers_the_faster_peer() {
+        // VV-2.a / AUD4-1 — a measured RTT drives the dispatcher
+        // priority via VV-4's best_path: lower RTT ⇒ higher priority,
+        // an unmeasured peer stays neutral, an over-budget peer floors.
+        let snap = DesiredSnapshot {
+            nodes: vec![],
+            allow_east_west: vec![],
+            settings_keys: vec![],
+            voice_policies: vec![
+                Policy::VoiceMesh {
+                    id: "vm-fast".into(),
+                    extension: "1001".into(),
+                    node_id: "peer:fast".into(),
+                    display_name: "Fast".into(),
+                },
+                Policy::VoiceMesh {
+                    id: "vm-slow".into(),
+                    extension: "1002".into(),
+                    node_id: "peer:slow".into(),
+                    display_name: "Slow".into(),
+                },
+                Policy::VoiceMesh {
+                    id: "vm-unknown".into(),
+                    extension: "1003".into(),
+                    node_id: "peer:unknown".into(),
+                    display_name: "Unknown".into(),
+                },
+                Policy::VoiceMesh {
+                    id: "vm-faraway".into(),
+                    extension: "1004".into(),
+                    node_id: "peer:faraway".into(),
+                    display_name: "Faraway".into(),
+                },
+            ],
+        };
+        let rtt = |peer: &str| match peer {
+            "peer:fast" => Some(8.0),
+            "peer:slow" => Some(60.0),
+            "peer:faraway" => Some(120.0), // over the 80 ms direct cap
+            _ => None,                     // peer:unknown — no measurement
+        };
+        let desired = build_voice_desired(&snap, "peer:self", |_| Some("10.0.0.1".into()), rtt);
+        let pri = |ext: &str| {
+            desired
+                .peers
+                .iter()
+                .find(|p| p.extension == ext)
+                .unwrap()
+                .priority
+        };
+        assert!(pri("1001") > pri("1002"), "fast peer outranks slow peer");
+        assert_eq!(pri("1003"), 0, "unmeasured peer stays neutral");
+        assert_eq!(pri("1004"), 0, "over-budget peer floors to the transit tier");
     }
 
     #[test]
@@ -328,7 +437,7 @@ mod tests {
                 display_name: "Alice".into(),
             }],
         };
-        let desired = build_voice_desired(&snap, "peer:self", |_| None);
+        let desired = build_voice_desired(&snap, "peer:self", |_| None, |_| None);
         // Own bind: stays at boot-default 0.0.0.0 when own
         // bundle is missing.
         assert_eq!(desired.mesh_bind_address, "0.0.0.0");
@@ -361,7 +470,7 @@ mod tests {
                 },
             ],
         };
-        let desired = build_voice_desired(&snap, "peer:self", |_| None);
+        let desired = build_voice_desired(&snap, "peer:self", |_| None, |_| None);
         let v = desired.vitelity.expect("own vitelity populated");
         assert_eq!(v.username, "mde-self");
         assert_eq!(v.outbound_cid, "15551234567");
@@ -381,7 +490,7 @@ mod tests {
                 outbound_cid: "1".into(),
             }],
         };
-        let desired = build_voice_desired(&snap, "peer:self", |_| None);
+        let desired = build_voice_desired(&snap, "peer:self", |_| None, |_| None);
         assert!(desired.vitelity.is_none());
     }
 

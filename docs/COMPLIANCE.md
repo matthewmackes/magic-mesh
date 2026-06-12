@@ -86,3 +86,14 @@ A third, deeper sweep (previously-skimmed crates, off-scale metrics, substrate g
 - Plus: stale "Phase G stubs" comment, `mackesd --help` XFCE string, 3 wrong doc command examples, off-scale/density-blind spacing literals.
 
 **Cycle-3 status: CLEAN (verified).** Three consecutive audit cycles have now converged same-day; the remaining open worklist is feature backlog (EFF P2/P3, PEERS epic), not integrity findings.
+
+---
+
+## Cycle 4 (2026-06-12) — fresh sweep + resolution
+
+Fourth full sweep over the heavily-hardened tree (unreachable/stubs · conventions/mockups · docs/packaging). Docs/packaging pass: **NO FINDINGS** (every cited command/flag/path/metric/asset in the new ADMIN.md/CONTRIBUTING.md/architecture.md verified against the tree). Two findings, both fixed same day:
+
+- **AUD4-1 (Unreachable, FINISH):** the VV-4 voice-routing heuristic (`voice::best_path`/`pick_relay`/`score`) was built + tested but had **only test callers** — the VV-2.a writer (`voice::materialize`) emitted `priority: 0` for every dispatcher row with an "until VV-4 ships" comment, and `Candidate::loss_pct` was a permanently-unconsumed field. **Fixed:** added `voice::dispatcher_priority` (best_path → inverted score → u8 band; non-direct floors to 0) and wired it into `build_voice_desired` via a per-peer latency-lookup closure that reads the mesh-latency cache (generic JSON parse — the worker type is async-gated, this path isn't). Healthy direct paths now rank high (faster ⇒ higher); unmeasured peers stay neutral; over-budget/unreachable floor to the transit tier. 2 new tests + the doc corrected.
+- **AUD4-2 (Supply-chain, FINISH):** `cargo deny` advisories FAILED — `swash 0.2.8` (transitive via cosmic-text→iced) was yanked. **Fixed:** `cargo update -p swash` → 0.2.9; advisories green again.
+
+**Cycle-4 status: CLEAN.** Four consecutive same-day audit cycles converged. Gates: mackesd 1450 serial green, three governance lints clean, cargo deny all-ok.
