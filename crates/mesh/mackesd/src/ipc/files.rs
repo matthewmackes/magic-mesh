@@ -94,7 +94,16 @@ fn poll_once<F>(
         };
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
-            let body = reply(verb, msg.body.as_deref());
+            // EFF-7 — a panicking reply closure must not kill the responder
+            // thread (which serves every file/fleet surface). Catch the unwind
+            // and answer with an honest error envelope instead.
+            let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reply(verb, msg.body.as_deref())
+            }))
+            .unwrap_or_else(|_| {
+                tracing::error!(topic = %topic, "files responder: reply handler panicked");
+                err(format!("internal error handling {verb}"))
+            });
             if let Err(e) = persist.write(
                 &reply_topic(&msg.ulid),
                 Priority::Default,

@@ -672,7 +672,15 @@ fn serve_connect_bus(
                     .as_deref()
                     .and_then(|b| serde_json::from_str(b).ok())
                     .unwrap_or(Value::Null);
-                let reply = handle_connect_verb(store, outbound, verb, &body);
+                // EFF-7 — a panicking verb handler must not kill the Connect
+                // responder thread; answer with an error envelope instead.
+                let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle_connect_verb(store, outbound, verb, &body)
+                }))
+                .unwrap_or_else(|_| {
+                    error!(verb = %verb, "kdc-host: connect verb handler panicked");
+                    json!({ "ok": false, "error": "internal error" }).to_string()
+                });
                 let _ = persist.write(
                     &reply_topic(&msg.ulid),
                     Priority::Default,

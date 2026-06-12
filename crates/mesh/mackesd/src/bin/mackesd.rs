@@ -1466,13 +1466,30 @@ enum RevisionsCmd {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .init();
+    // EFF-10 — structured JSON logs when running non-interactively (under
+    // systemd/journald, the daemon case) so they're machine-grep-able + ship to
+    // a log aggregator; human-readable text when attached to a TTY (interactive
+    // CLI use). Force either with MDE_LOG_FORMAT=json|text.
+    use std::io::IsTerminal;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let json = match std::env::var("MDE_LOG_FORMAT").as_deref() {
+        Ok("json") => true,
+        Ok("text") => false,
+        _ => !std::io::stderr().is_terminal(),
+    };
+    if json {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .with_target(true)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .init();
+    }
 
     let cli = Cli::parse();
     let db_path = cli.db.unwrap_or_else(mackesd_core::default_db_path);
