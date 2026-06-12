@@ -14,7 +14,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "mackesd",
     version,
-    about = "Mesh control plane for Mackes XFCE Workstation"
+    about = "Magic Mesh control plane — secure no-fixed-center workgroup mesh on Fedora-Cosmic"
 )]
 struct Cli {
     /// Override the default `SQLite` store path (defaults to
@@ -907,23 +907,8 @@ enum Cmd {
         node_id: Option<String>,
     },
 
-    /// PC-3.a — trigger the `peer-joined` handler for a given
-    /// peer-id.
-    ///
-    /// Writes the peer's [`PeerProbe`] to the cache, then spawns
-    /// `mde-peer-card --peer <id>` (subject to the 30s per-peer
-    /// debounce). Today the probe is the fixture; once the
-    /// store grows live probe data, this command will load from
-    /// there. Operator-driven for now; the reconcile loop will
-    /// emit the same event when a new peer enrolls.
-    PeerCard {
-        /// Stable peer id (e.g. `peer:lab-01`).
-        #[arg(long, value_name = "PEER_ID")]
-        peer: String,
-        /// Don't spawn the modal — print the would-be action.
-        #[arg(long)]
-        dry_run: bool,
-    },
+    // AUD3 S-3 (2026-06-12): `PeerCard` (PC-3.a) removed — it spawned
+    // the `mde-peer-card` modal, deleted in the E11 pivot.
 
     /// NF-2.6 (v2.5) — Nebula CA management subcommands.
     /// Mint / rotate / list / dump-ca the mesh-CA artifacts.
@@ -3323,37 +3308,8 @@ fn main() -> anyhow::Result<()> {
                 println!("wake-peer: sent magic packet to {mac} via {broadcast}:{port}");
             }
         }
-        Cmd::PeerCard { peer, dry_run } => {
-            // PC-3.a — operator-driven trigger for the peer-card
-            // modal. Writes the probe + spawns mde-peer-card with
-            // a 30 s per-peer debounce. Uses a fixture probe for
-            // now (the live probe-from-store path lands when
-            // PC-3.b ships the read query). dry-run reports the
-            // intended action without touching disk or spawning
-            // the child.
-            use mackes_mesh_types::PeerProbe;
-            let mut probe = PeerProbe::fixture();
-            probe.peer_id = peer.clone();
-            if dry_run {
-                println!(
-                    "peer-card: would write probe + spawn modal for peer={peer} (debounce respected)",
-                );
-                return Ok(());
-            }
-            match mackesd_core::peer_join::handle_peer_joined(&probe) {
-                Ok(Some(pid)) => {
-                    println!("peer-card: spawned modal (pid={pid}) for peer={peer}");
-                }
-                Ok(None) => {
-                    println!(
-                        "peer-card: peer={peer} probe written; spawn skipped (debounced within 30s window)",
-                    );
-                }
-                Err(e) => {
-                    return Err(anyhow::anyhow!("peer-card failed for {peer}: {e}"));
-                }
-            }
-        }
+        // AUD3 S-3 (2026-06-12): `Cmd::PeerCard` arm removed with the
+        // peer_join module (targeted the deleted mde-peer-card modal).
         #[cfg(feature = "async-services")]
         Cmd::FleetPushSetting {
             key,
@@ -5167,11 +5123,29 @@ fn run_serve(
             Arc::new(mackesd_core::transport::https443::NebulaHttps443Transport::new());
         let router_registry: mackesd_core::workers::mesh_router::TransportRegistry =
             Arc::new(vec![https443]);
+        // KDC2-1.9 (AUD3 S-2) — load the routing policy (system +
+        // user policy.toml; fail-open to baseline with a warn so a
+        // typo'd file never strands the router).
+        let router_policy = mackesd_core::transport::policy::load_with_paths(
+            std::path::Path::new("/etc/mde/connect/policy.toml"),
+            &dirs::config_dir()
+                .unwrap_or_default()
+                .join("mde/connect/policy.toml"),
+        )
+        .map(|loaded| loaded.scorer)
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "mesh-router: policy.toml load failed; baseline policy");
+            mackes_transport::scorer::Policy::baseline()
+        });
         sup.spawn(Spawn::new(
             // AUD2-1 — attach the shared decision-time histogram so the
             // router's per-tick observe() lands in the exporter's scrape.
+            // AUD3 S-2/S-5 — scorer policy + the audit sink (path flips
+            // land in the hash-chained events table + alert hooks).
             MeshRouterWorker::new(Arc::clone(&router_state), router_registry)
-                .with_metrics(Arc::clone(&router_metrics)),
+                .with_metrics(Arc::clone(&router_metrics))
+                .with_policy(router_policy)
+                .with_audit_sink(db_path.clone(), node_id.clone()),
             RestartPolicy::OnFailure,
         ));
         worker_names.lock().expect("worker_names mutex").push("mesh_router".into());
@@ -5945,12 +5919,13 @@ fn run_serve(
                 );
             }
         }
-        // E0.3.3 — Fleet control surface (push/list/diff/rollback) on
-        // the mesh Bus at action/fleet/<verb>, replacing the retired
-        // dev.mackes.MDE.Fleet D-Bus interface. Stub verbs today (the
-        // responder replies "not implemented until Phase G"); Phase G
-        // fills the real revision logic on the Bus. Own OS thread
-        // (Persist/rusqlite isn't Send); no tokio runtime (sync stubs).
+        // E0.3.3 / FPG-4 — Fleet control surface (push/list/diff/
+        // rollback/nudge) on the mesh Bus at action/fleet/<verb>,
+        // replacing the retired dev.mackes.MDE.Fleet D-Bus interface.
+        // The verbs are REAL (FPG-4): they run against the LizardFS
+        // revision log via magic-fleet; any node serves + mints
+        // (leaderless, FPG-3). Own OS thread (Persist/rusqlite isn't
+        // Send); no tokio runtime (the responders are sync).
         match mde_bus::default_data_dir()
             .ok_or_else(|| "no XDG data dir for bus".to_string())
             .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))

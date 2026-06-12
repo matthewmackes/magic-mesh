@@ -9,9 +9,11 @@
 //!      (`_jellyfin._tcp`, `_googlecast._tcp`, …) via `mdns_sd::ServiceDaemon`.
 //!   2. **Publish** each discovered local service to the `mesh/mdns/announce`
 //!      Bus topic as an [`MdnsAnnounce`] tagged with this peer's mesh IP.
-//!   3. (inbound half — follow-up) subscribe to other peers' announces and
-//!      **republish** them on the LOCAL LAN, substituting the originating
-//!      peer's mesh IP for the source LAN IP.
+//!   3. **Republish (inbound half)** — poll the announce topic for other
+//!      peers' services and republish them on the LOCAL LAN, substituting
+//!      the originating peer's mesh IP for the source LAN IP (see the
+//!      INBOUND block in `run_relay_blocking`; landed, no longer a
+//!      follow-up).
 //!
 //! **Anti-loop:** republished services carry an `mde-relay-origin` TXT record;
 //! the browse step skips anything carrying it, so a relayed service is never

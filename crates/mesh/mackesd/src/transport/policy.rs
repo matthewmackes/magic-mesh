@@ -54,6 +54,10 @@ struct PolicyFile {
     pinned_primary: Option<Vec<String>>,
     denylist: Option<Vec<String>>,
     plugins: Option<PluginsSection>,
+    /// CV-1 — content-class encryption floor token
+    /// (`"aes256_gcm"` / `"chacha20_poly1305"` / `"aes128_gcm"` /
+    /// `"none"`). Absent → the AES-256-class baseline.
+    min_content_encryption: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -221,6 +225,7 @@ fn merge(system: PolicyFile, user: PolicyFile) -> PolicyFile {
         pinned_primary: user.pinned_primary.or(system.pinned_primary),
         denylist: user.denylist.or(system.denylist),
         plugins: user.plugins.or(system.plugins),
+        min_content_encryption: user.min_content_encryption.or(system.min_content_encryption),
     }
 }
 
@@ -248,6 +253,16 @@ impl PolicyFile {
             flap_penalty: self.flap_penalty.unwrap_or(baseline.scorer.flap_penalty),
             pinned_primary: parse_transport_kinds(self.pinned_primary.unwrap_or_default())?,
             denylist: parse_transport_kinds(self.denylist.unwrap_or_default())?,
+            // CV-1 — operator-tunable content-encryption floor; an
+            // unknown token is a hard parse error (never silently
+            // weaken the floor on a typo).
+            min_content_encryption: match self.min_content_encryption {
+                None => baseline.scorer.min_content_encryption,
+                Some(s) => serde_json::from_value(serde_json::Value::String(s.clone()))
+                    .map_err(|_| PolicyError::UnknownTransportKind(format!(
+                        "min_content_encryption: {s}"
+                    )))?,
+            },
         };
         let plugins = self.plugins.unwrap_or_default();
         let plugin_allow = plugins.allow;

@@ -1226,7 +1226,11 @@ impl App {
         // `panel_chrome::outer_padding`.
         let main =
             column![page_heading, body]
-                .spacing(20)
+                // CV-3 — density-aware gap (space.lg), in step with the
+                // density-aware outer padding below.
+                .spacing(crate::panel_chrome::column_gap(
+                    crate::live_theme::tokens().density,
+                ))
                 .padding(crate::panel_chrome::outer_padding(
                     crate::live_theme::tokens().density,
                 ));

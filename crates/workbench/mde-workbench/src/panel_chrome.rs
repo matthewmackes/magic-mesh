@@ -44,6 +44,13 @@ pub use mde_iced_components::object_card;
 /// density-scaled.
 pub const DATA_ROW_MIN_HEIGHT: f32 = 44.0;
 
+/// CV-3 — the standard heading↔body / section column gap
+/// (`space.lg`, 20 px at Comfortable), density-aware so Compact /
+/// Spacious modes scale the gap in step with `outer_padding`.
+pub fn column_gap(density: Density) -> f32 {
+    f32::from(MdeSpace::for_density(density).lg)
+}
+
 /// UX-6 — outer panel padding (~SPACE_24 token).
 pub fn outer_padding(density: Density) -> Padding {
     let space = MdeSpace::for_density(density);

@@ -61,13 +61,29 @@ Lifted from a 5-pass parallel fit-and-finish evaluation (reliability · security
 - [ ] **EFF-40 · PKG · No CHANGELOG / release tags / `release` NEVRA field.** Add a Keep-a-Changelog, start tagging `magic-mesh-v<ver>`, add `release =` so asset-only bumps don't churn the workspace version.
 - [✓] **EFF-41 · PKG · Release skill stale** — says "no generate-rpm metadata / cut blocked" though it exists. Update `/release` to the live packaging + signing/publish steps. — DONE (2026-06-12): rewrote the "not yet wired" block to the live state (generate-rpm metadata location, asset-list-as-source-of-truth, build steps, 22-crate count), and the failure-modes section now gates a public release on the signing key while allowing a scoped unsigned test cut.
 - [ ] **EFF-42 · PKG · RPM metadata gaps** — no `Obsoletes`/`Provides`; `nebula` not in stock Fedora (confirm the repo supplies it); consider `Recommends` vs hard `Requires` for ansible-core.
-- [ ] **EFF-43 · PKG · Voice units referenced but not shipped** — `mackesd voice render-config` ExecStartPre cites kamailio/rtpengine units absent from `packaging/systemd/`. Ship them or fix the comments.
+- [✓] **EFF-43 · PKG · Voice units referenced but not shipped** — `mackesd voice render-config` ExecStartPre cites kamailio/rtpengine units absent from `packaging/systemd/`. Ship them or fix the comments. — DONE (2026-06-12): shipped `kamailio-mde.service` + `rtpengine-mde.service` (disabled by default per the v4.1.0 spec; ExecStartPre regenerates the config set via `mackesd voice render-config`; EFF-12-style hardening; external kamailio/rtpengine packages deliberately not hard-Required) + added both to the generate-rpm assets.
 - [ ] **EFF-44 · GUI · Workbench window controls render Unicode-glyph fallback** (`header.rs:11`) — complete the UX-8.a Material Symbols SVG swap.
 - [ ] **EFF-45 · GUI · ~18 workbench panels lack explicit error-state handling** (vs empty states); audit them + retire the catch-all placeholder branch.
 - [ ] **EFF-46 · QA · `#[ignore]`d tests** (systemd-creds, throughput-floor) never run in CI — add an `--include-ignored` nightly/pre-cut job.
 - [ ] **EFF-47 · BUS · RPC reply/request topics persist at Default (7-day TTL)** — give `reply/*` + ephemeral `action/*` a short per-topic TTL so interactive RPCs don't accumulate.
 - [✓] **EFF-48 · CLI · STUN encoder `panic!` on IPv6** (`stun.rs:104`) — return Result/skip-with-warn. — DONE: `encode_binding_success_with_xor_mapped` now returns `Option<Vec<u8>>` (`None` for IPv6, deferred per Q9) instead of panicking; the stun_gather responder skips a `None`. Test asserts IPv6→None, IPv4→Some round-trips.
 - [ ] **EFF-49 · I18N · No localization provision** (all en-US). Likely out-of-envelope for a ≤8-peer workgroup — document the en-US-only scope in SUPPORT, or introduce `i18n-embed`+Fluent if in scope.
+
+## AUDIT-2026-06-12 r3 — cycle-3 fresh sweep (all closed same day)
+
+Cycle-3 sweep over the post-CLEAN tree (deeper dig: previously-skimmed crates, off-scale metrics, substrate gates, doc command accuracy). 12 findings, all resolved:
+
+- [✓] **AUD3 S-1 · stale "Phase G stubs" comment** at the fleet responder spawn — rewritten to the real FPG-4 state.
+- [✓] **AUD3 S-2 · KDC2-1.9 scorer never wired.** `tick_once` now runs `scorer::select` per tracked peer (Control class drives primary; fallback refreshed on quiet ticks; "nothing sendable" leaves the prior path); daemon loads policy.toml (system+user, fail-open) into `with_policy`. 3 new router tests.
+- [✓] **AUD3 S-3 · `peer_join` REMOVED** — it spawned `mde-peer-card`, a binary deleted in the E11 pivot, so the PC-3.a "wire into enrollment" plan would have wired a dead modal. Module + `Cmd::PeerCard` deleted; peer-arrival UX is the Workbench PEERS surfaces.
+- [✓] **AUD3 S-4 · FALSE POSITIVE** — mdns_relay's inbound half IS implemented (INBOUND block + tests); only the module doc still said "follow-up". Doc fixed.
+- [✓] **AUD3 S-5 · KDC2-1.12 audit emission wired.** New `events::append_event` (hash-chained, verifier-intact test) + `append_and_alert`; every primary flip appends a `PathSwitchEvent` row (kind=lifecycle → `[[alert_hooks]]` fire on path switches too) via `with_audit_sink(db_path, node_id)`.
+- [✓] **AUD3 CV-1 · encryption floor enforced.** `TransportSample.encryption` + `Policy.min_content_encryption` (default AES-256-class; `strength_rank`: None<128<{256,ChaCha20}); content classes (Clipboard/FileBulk/Notification) filter out weaker transports in `score()`; Control exempt so path negotiation keeps working. `EncryptionKind::for_transport` maps all four kinds (all ≥ floor — locked by test); `direct_udp_default` corrected from the stale WireGuard-AES-128 claim to Nebula AES-256. policy.toml gains `min_content_encryption` (typo = hard parse error, never silently weakened). 4 new scorer tests.
+- [✓] **AUD3 CV-2 · off-scale `spacing(22)`** in mde-files banner → space.lg (20).
+- [✓] **AUD3 CV-3 · density-blind `spacing(20)`** ×2 (workbench app shell, jobs panel) → new `panel_chrome::column_gap(density)`.
+- [✓] **AUD3 F-1..F-3 · doc command accuracy:** `mackesd decommission` is positional (not `--node-id`); `enroll-token` examples gained the required `--mesh-id` (×3); `state-restore` example gained the required bundle path.
+- [✓] **AUD3 F-4 · `mackesd --help` said "Mackes XFCE Workstation"** → Magic Mesh / Fedora-Cosmic.
+- [✓] **AUD3 F-5 = EFF-43** — closed above (units shipped).
 
 ## AUDIT-2026-06-12 — post-hardening integrity sweep (current actionable set)
 

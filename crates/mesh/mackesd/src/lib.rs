@@ -69,10 +69,10 @@ pub mod passcode;
 // EPIC-SEC-PASSCODE-CREDS (Q52) — encrypt the mesh passcode at rest
 // via systemd-creds (TPM-or-host-key).
 pub mod passcode_creds;
-// PC-3 (2026-05-21) — peer-join handler: writes probe.json +
-// spawns mde-peer-card on mesh peer-join events. Event-source
-// integration into the mesh / topology layer is PC-3.a.
-pub mod peer_join;
+// AUD3 S-3 (2026-06-12): `peer_join` (PC-3) REMOVED — it spawned the
+// `mde-peer-card` modal, a binary deleted in the E11 pivot, so wiring
+// it into the enrollment loop (PC-3.a) would have wired a dead spawn.
+// Peer-arrival UX lives in the Workbench PEERS/Directory surfaces now.
 // v2.0.0 Phase 2.5 — path safety + allowed-roots resolver for the
 // Send-To pipeline. Pure-fn validation; no async / DBus surface.
 // v2.0.0 Phase 2.6 — Send-To operation orchestrator. Owns the

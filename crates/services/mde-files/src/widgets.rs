@@ -253,7 +253,8 @@ pub fn banner(
     subtitle: String,
     stats: Vec<BannerStat>,
 ) -> Element<'static, Message> {
-    let mut stats_row = row![].spacing(22);
+    // CV-2 — on the §4 12-step scale: space.lg (20). Was an off-scale 22.
+    let mut stats_row = row![].spacing(20);
     for st in stats {
         stats_row = stats_row.push(
             column![

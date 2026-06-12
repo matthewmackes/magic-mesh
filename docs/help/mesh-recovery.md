@@ -38,7 +38,7 @@ only lighthouse is gone, go to **Case B**.
    lighthouse + relay units; peers re-home to it on their next tick.
 3. Verify enrollment works again by minting a token and re-checking:
    ```bash
-   mackesd enroll-token
+   mackesd enroll-token --mesh-id <mesh>
    meshctl test connectivity
    ```
 
@@ -56,7 +56,7 @@ the LizardFS master.
    off the dead node. `mackesd state-restore` lays the recovery files into a
    directory and prints the exact steps:
    ```bash
-   mackesd state-restore
+   mackesd state-restore <path/to/state-backup.enc>
    # then, as it instructs:
    cp <dir>/mfsexports.cfg /etc/mfs/mfsexports.cfg
    mfsmaster --import-metadata <dir>/metadata.mfs.dump
@@ -68,7 +68,7 @@ the LizardFS master.
    certs were signed by the lost CA):
    ```bash
    meshctl mesh init
-   mackesd enroll-token        # issue one token per surviving peer
+   mackesd enroll-token --mesh-id <mesh>   # issue one token per surviving peer
    # On each peer:
    meshctl join --token <token>
    ```

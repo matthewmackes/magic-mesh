@@ -10,19 +10,25 @@
 //!   4. Emits a `PathSwitch` audit-chain entry whenever the
 //!      primary transport flips (with the [`SwitchReason`]).
 //!
-//! Concrete scoring + transport selection (KDC2-1.9) +
-//! audit-chain feed (KDC2-1.12) land as follow-ups. This commit
-//! ships the worker scaffold: trait impl, tick loop, registry,
-//! state-map.
+//! AUD3 S-2/S-5 (2026-06-12): the KDC2-1.9 scorer + KDC2-1.12
+//! audit-chain feed are WIRED — `tick_once` runs
+//! [`mackes_transport::scorer::select`] per tracked peer (Control
+//! class drives the primary; the CV-1 encryption floor gates
+//! content classes inside the scorer) and every primary flip
+//! emits a [`PathSwitchEvent`] into the hash-chained events table
+//! via [`crate::events::append_and_alert`] (so `[[alert_hooks]]`
+//! with `kind = "lifecycle"` fire on path switches too).
 
 #![cfg(feature = "async-services")]
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use mackes_transport::peer_path::{PeerPath, SwitchReason};
-use mackes_transport::{Transport, TransportKind};
+use mackes_transport::scorer::Policy;
+use mackes_transport::{MessageClass, Transport, TransportKind};
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
@@ -72,6 +78,15 @@ pub struct MeshRouterWorker {
     /// `Histogram::observe`. `None` for tests + bootstrap paths
     /// that don't care about telemetry.
     metrics: Option<RouterMetrics>,
+    /// KDC2-1.9 (AUD3 S-2) — routing policy the scorer consumes.
+    /// Loaded from `/etc/mde/connect/policy.toml` (+ user
+    /// override) at spawn; defaults to baseline.
+    policy: Policy,
+    /// KDC2-1.12 (AUD3 S-5) — audit sink: `(db_path, node_id)`.
+    /// When `Some`, every primary flip appends a hash-chained
+    /// `PathSwitchEvent` row (kind = `lifecycle`) and fires the
+    /// configured alert hooks. `None` for tests.
+    audit_sink: Option<(PathBuf, String)>,
 }
 
 impl MeshRouterWorker {
@@ -84,7 +99,25 @@ impl MeshRouterWorker {
             registry,
             tick: DEFAULT_TICK,
             metrics: None,
+            policy: Policy::baseline(),
+            audit_sink: None,
         }
+    }
+
+    /// KDC2-1.9 (AUD3 S-2) — override the routing policy (loaded
+    /// from policy.toml by the daemon; baseline otherwise).
+    #[must_use]
+    pub fn with_policy(mut self, policy: Policy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// KDC2-1.12 (AUD3 S-5) — attach the audit sink so primary
+    /// flips land in the hash-chained events table (+ alert hooks).
+    #[must_use]
+    pub fn with_audit_sink(mut self, db_path: PathBuf, node_id: String) -> Self {
+        self.audit_sink = Some((db_path, node_id));
+        self
     }
 
     /// Override the tick cadence. Useful for tests (set to
@@ -180,13 +213,17 @@ impl MeshRouterWorker {
         debug!(
             peer_count,
             transport_count,
-            "mesh-router: tick (12.18 D.3 active; full scorer integration KDC2-1.9 follow-up)",
+            "mesh-router: tick (12.18 D.3 + KDC2-1.9 scorer active)",
         );
         // 12.18 D.3 — drive HTTPS-fallback activation. Reads
         // the state map under a snapshot lock so the registry
         // walk + open() don't hold the write lock across a
         // network-IO await.
         self.drive_https_fallback_activations().await;
+        // KDC2-1.9 (AUD3 S-2) — run the scorer over the registry
+        // per tracked peer; flip primaries + emit the KDC2-1.12
+        // audit entries on change.
+        self.select_paths().await;
         // KDC2-1.12.b — record decision time. Use saturating
         // cast so a freakishly long tick (clock skew, stall)
         // bucket-saturates rather than panics.
@@ -348,6 +385,100 @@ impl MeshRouterWorker {
         };
         Some(crate::https_fallback::observe_peer(path, input))
     }
+
+    /// KDC2-1.9 (AUD3 S-2) — run the scorer over the registry for
+    /// every tracked peer and apply the selection. The `Control`
+    /// class drives the primary (control reachability is the
+    /// router's baseline guarantee; per-class dispatch reads
+    /// `PeerPath::transport_for`, and the CV-1 encryption floor
+    /// gates content classes inside the scorer itself).
+    ///
+    /// On a primary flip: update `primary`/`fallback`/`last_switch_*`
+    /// and emit the KDC2-1.12 [`PathSwitchEvent`] through
+    /// [`crate::events::append_and_alert`] (hash-chained events row,
+    /// kind = `lifecycle`, + the configured 12.6.4 alert hooks).
+    /// Quiet ticks only refresh the fallback. Returns the number of
+    /// switches applied this tick.
+    ///
+    /// Probing happens outside the state lock (scorer::select awaits
+    /// each transport's `probe`); the write lock is held only for the
+    /// in-memory flip.
+    pub async fn select_paths(&self) -> usize {
+        if self.registry.is_empty() {
+            return 0;
+        }
+        let peer_ids: Vec<String> = {
+            let state = self.state.read().await;
+            state.keys().cloned().collect()
+        };
+        let mut switches = 0;
+        for peer_id in peer_ids {
+            let Some(selection) = mackes_transport::scorer::select(
+                self.registry.as_slice(),
+                &peer_id,
+                MessageClass::Control,
+                &self.policy,
+            )
+            .await
+            else {
+                // No sendable transport this tick — leave the prior
+                // path in place (the https_fallback machine handles
+                // degradation; flapping to "nothing" helps no one).
+                continue;
+            };
+            let event = {
+                let mut state = self.state.write().await;
+                let Some(path) = state.get_mut(&peer_id) else {
+                    continue; // peer evicted between snapshot + lock
+                };
+                if path.primary == selection.primary {
+                    // Quiet tick — refresh the fallback only.
+                    path.fallback = selection.fallback;
+                    continue;
+                }
+                let from = path.primary;
+                // Prior-state-aware reason: a pin/deny decision
+                // surfaces as Policy from the scorer; any other flip
+                // with a prior primary means the old one lost on
+                // health/rank.
+                let reason = match selection.reason {
+                    SwitchReason::Initial => SwitchReason::HealthDegraded(from),
+                    other => other,
+                };
+                path.primary = selection.primary;
+                path.fallback = selection.fallback;
+                path.last_switch_at = Some(std::time::SystemTime::now());
+                path.last_switch_reason = reason.clone();
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                PathSwitchEvent::switch(
+                    peer_id.clone(),
+                    Some(from),
+                    selection.primary,
+                    reason,
+                    now_ms,
+                )
+            };
+            switches += 1;
+            info!("mesh-router: {}", event.summary());
+            // KDC2-1.12 (AUD3 S-5) — append to the hash-chained
+            // events table + fire alert hooks, off the runtime
+            // thread (sync sqlite). Best-effort by design.
+            if let Some((db_path, node_id)) = self.audit_sink.clone() {
+                let detail = serde_json::to_value(&event)
+                    .unwrap_or_else(|_| serde_json::json!({"event": "path_switch"}));
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::events::append_and_alert(
+                        &db_path,
+                        &node_id,
+                        crate::events::EventKind::Lifecycle,
+                        detail,
+                    );
+                })
+                .await;
+            }
+        }
+        switches
+    }
 }
 
 #[cfg(test)]
@@ -402,6 +533,73 @@ mod tests {
             );
         }
         assert_eq!(w.peer_count().await, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn select_paths_flips_primary_to_the_scored_choice() {
+        // AUD3 S-2 — a peer whose primary lost the scoring is flipped
+        // to the scorer's choice; the switch metadata is recorded.
+        let state = new_state();
+        {
+            let mut s = state.write().await;
+            // Seed with KdcTls primary; the scorer prefers
+            // NebulaDirect (preference-order rank 0) for Control.
+            s.insert(
+                "paired".into(),
+                PeerPath::initial("paired".into(), TransportKind::KdcTls),
+            );
+        }
+        let w = MeshRouterWorker::new(state.clone(), new_registry());
+        let switches = w.select_paths().await;
+        assert_eq!(switches, 1);
+        let s = state.read().await;
+        let path = s.get("paired").unwrap();
+        assert_eq!(path.primary, TransportKind::NebulaDirect);
+        assert_eq!(path.fallback, Some(TransportKind::KdcTls));
+        assert!(path.last_switch_at.is_some());
+        assert_eq!(
+            path.last_switch_reason,
+            SwitchReason::HealthDegraded(TransportKind::KdcTls),
+            "prior-state-aware reason names the bumped transport"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn select_paths_quiet_tick_keeps_primary_and_refreshes_fallback() {
+        let state = new_state();
+        {
+            let mut s = state.write().await;
+            s.insert(
+                "paired".into(),
+                PeerPath::initial("paired".into(), TransportKind::NebulaDirect),
+            );
+        }
+        let w = MeshRouterWorker::new(state.clone(), new_registry());
+        assert_eq!(w.select_paths().await, 0, "already-best primary: no switch");
+        let s = state.read().await;
+        let path = s.get("paired").unwrap();
+        assert_eq!(path.primary, TransportKind::NebulaDirect);
+        assert_eq!(path.fallback, Some(TransportKind::KdcTls), "fallback refreshed");
+        assert!(path.last_switch_at.is_none(), "no switch recorded");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn select_paths_leaves_path_alone_when_nothing_sendable() {
+        // The mock probes Down for unknown peers → scorer returns
+        // None → the prior path must remain untouched (no flap to
+        // nothing).
+        let state = new_state();
+        {
+            let mut s = state.write().await;
+            s.insert(
+                "unknown-peer".into(),
+                PeerPath::initial("unknown-peer".into(), TransportKind::KdcTls),
+            );
+        }
+        let w = MeshRouterWorker::new(state.clone(), new_registry());
+        assert_eq!(w.select_paths().await, 0);
+        let s = state.read().await;
+        assert_eq!(s.get("unknown-peer").unwrap().primary, TransportKind::KdcTls);
     }
 
     #[tokio::test(flavor = "current_thread")]

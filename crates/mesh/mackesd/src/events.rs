@@ -69,6 +69,123 @@ pub struct AlertHook {
     pub command: Vec<String>,
 }
 
+/// Append one event to the hash-chained `events` table (12.6.3) and
+/// return the constructed [`Event`]. Same chain the reconcile
+/// worker's `apply_repair_rows` writes — genesis is 32 zero bytes,
+/// each row chains on the previous row's hash via
+/// [`crate::audit::next_hash`].
+///
+/// # Errors
+/// Returns an error when the SQL insert (or the transaction) fails.
+pub fn append_event(
+    conn: &mut rusqlite::Connection,
+    node_id: &str,
+    kind: EventKind,
+    detail: serde_json::Value,
+) -> anyhow::Result<Event> {
+    use anyhow::Context;
+    crate::store::with_transaction(conn, |tx| {
+        let prev_hash_hex: String = tx
+            .query_row(
+                "SELECT hash FROM events ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap_or_default();
+        let prev_hash = decode_hex32(&prev_hash_hex).unwrap_or([0u8; 32]);
+        let now_ms = now_ms();
+        let event = Event {
+            event_id: u64::try_from(now_ms.max(0)).unwrap_or(0),
+            kind,
+            node_id: node_id.to_owned(),
+            timestamp_ms: now_ms,
+            detail,
+        };
+        let payload = event
+            .payload_bytes()
+            .context("serializing event payload")?;
+        let hash = crate::audit::next_hash(&prev_hash, &payload, now_ms);
+        let payload_str = String::from_utf8(payload)
+            .context("event payload is not valid UTF-8 (impossible from serde_json)")?;
+        let kind_token = serde_json::to_string(&kind)
+            .unwrap_or_else(|_| "\"lifecycle\"".to_owned())
+            .trim_matches('"')
+            .to_owned();
+        tx.execute(
+            "INSERT INTO events (prev_hash, hash, kind, actor, payload_json, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                encode_hex(&prev_hash),
+                encode_hex(&hash),
+                kind_token,
+                node_id,
+                payload_str,
+                chrono::Utc::now().to_rfc3339(),
+            ),
+        )
+        .context("inserting event row")?;
+        Ok(event)
+    })
+}
+
+/// Append an event (see [`append_event`]) AND fire the configured
+/// 12.6.4 alert hooks for it, post-commit. Opens the store at
+/// `db_path` itself — convenience for callers (the mesh-router)
+/// that don't hold a connection. Best-effort end to end: failures
+/// are logged, never propagated.
+pub fn append_and_alert(
+    db_path: &std::path::Path,
+    node_id: &str,
+    kind: EventKind,
+    detail: serde_json::Value,
+) {
+    let mut conn = match crate::store::open(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "append_and_alert: store open failed; event dropped");
+            return;
+        }
+    };
+    match append_event(&mut conn, node_id, kind, detail) {
+        Ok(event) => {
+            let hooks = crate::config::daemon::load().alert_hooks();
+            if !hooks.is_empty() {
+                dispatch_alerts(&event, &hooks);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "append_and_alert: event append failed");
+        }
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+fn encode_hex(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::with_capacity(64), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+fn decode_hex32(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let s = std::str::from_utf8(chunk).ok()?;
+        out[i] = u8::from_str_radix(s, 16).ok()?;
+    }
+    Some(out)
+}
+
 /// Walk the configured hooks and fire each whose `for_kind` matches.
 /// Pipes the event JSON to each hook's stdin. Failures are logged
 /// but never propagate — alerting is best-effort by design.
@@ -176,5 +293,33 @@ mod tests {
     fn dispatch_alerts_empty_hook_list_is_a_noop() {
         let e = mk(EventKind::Lifecycle);
         dispatch_alerts(&e, &[]); // doesn't panic, doesn't fire anything
+    }
+
+    #[test]
+    fn append_event_chains_rows_and_verifies_intact() {
+        // AUD3 S-5 — two appended events form an intact hash chain
+        // the audit verifier accepts.
+        let mut conn = crate::store::open_in_memory().expect("store");
+        let e1 = append_event(
+            &mut conn,
+            "peer:a",
+            EventKind::Lifecycle,
+            serde_json::json!({"action": "path_switch", "to": "nebula_https443"}),
+        )
+        .expect("append 1");
+        assert_eq!(e1.kind, EventKind::Lifecycle);
+        append_event(
+            &mut conn,
+            "peer:a",
+            EventKind::Lifecycle,
+            serde_json::json!({"action": "path_switch", "to": "nebula_direct"}),
+        )
+        .expect("append 2");
+        let rows = crate::store::load_audit_rows(&conn).expect("rows");
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(
+            crate::audit::verify(&rows),
+            crate::audit::VerifyOutcome::Intact { verified: 2, .. }
+        ));
     }
 }

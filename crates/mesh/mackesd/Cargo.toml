@@ -333,6 +333,11 @@ assets = [
     # PKG-3 — the self-gating daemon unit + the role-gated app units.
     { source = "packaging/systemd/mackesd.service",   dest = "/usr/lib/systemd/system/mackesd.service",   mode = "644" },
     { source = "packaging/systemd/mde-musicd.service", dest = "/usr/lib/systemd/user/mde-musicd.service", mode = "644" },
+    # EFF-43 / VV-1 — the voice-stack units, shipped DISABLED (the
+    # operator/fleet policy enables them; ExecStartPre regenerates the
+    # config set via `mackesd voice render-config`).
+    { source = "packaging/systemd/kamailio-mde.service",  dest = "/usr/lib/systemd/system/kamailio-mde.service",  mode = "644" },
+    { source = "packaging/systemd/rtpengine-mde.service", dest = "/usr/lib/systemd/system/rtpengine-mde.service", mode = "644" },
     # App launchers + the SVC-4 voice-agent autostart.
     { source = "packaging/applications/*.desktop", dest = "/usr/share/applications/",      mode = "644" },
     { source = "packaging/autostart/*.desktop",    dest = "/etc/xdg/autostart/",           mode = "644" },

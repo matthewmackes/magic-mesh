@@ -58,6 +58,40 @@ impl EncryptionKind {
     pub const fn is_authenticated(self) -> bool {
         !matches!(self, EncryptionKind::None)
     }
+
+    /// CV-1 — comparable strength rank for the router's
+    /// content-class encryption floor. `None` (0) < AES-128 (1)
+    /// < {AES-256, ChaCha20-Poly1305} (2 — the §3 floor pair,
+    /// deliberately equal).
+    #[must_use]
+    pub const fn strength_rank(self) -> u8 {
+        match self {
+            EncryptionKind::None => 0,
+            EncryptionKind::Aes128Gcm => 1,
+            EncryptionKind::Aes256Gcm | EncryptionKind::ChaCha20Poly1305 => 2,
+        }
+    }
+
+    /// CV-1 — the transport-level encryption each
+    /// [`crate::TransportKind`] guarantees in this stack. Every
+    /// production transport rides the Nebula overlay (AES-256-GCM
+    /// per the §3 lock) or TLS 1.3 (AES-256-GCM); the scorer reads
+    /// this to enforce the content-class floor so a future weaker
+    /// transport can never silently carry clipboard/file/SMS
+    /// payloads.
+    #[must_use]
+    pub const fn for_transport(kind: crate::TransportKind) -> Self {
+        match kind {
+            // Nebula tunnel cipher (§3): AES-256-GCM (relay paths may
+            // negotiate ChaCha20-Poly1305 — equal rank either way).
+            crate::TransportKind::NebulaDirect => EncryptionKind::Aes256Gcm,
+            crate::TransportKind::NebulaLighthouseRelay => EncryptionKind::ChaCha20Poly1305,
+            // TLS 1.3 inside the overlay.
+            crate::TransportKind::NebulaHttps443 | crate::TransportKind::KdcTls => {
+                EncryptionKind::Aes256Gcm
+            }
+        }
+    }
 }
 
 /// Per-transport capability advertisement consumed by the
@@ -83,9 +117,11 @@ pub struct TransportCapabilities {
 }
 
 impl TransportCapabilities {
-    /// Default direct-UDP transport capabilities (WireGuard
-    /// tunnel: ~1280-byte MTU, AES-128-GCM, no broadcast, no
-    /// streaming framing).
+    /// Default direct-UDP transport capabilities (Nebula tunnel:
+    /// ~1280-byte MTU, AES-256-GCM per the §3 lock, no broadcast,
+    /// no streaming framing). CV-1 fix: previously claimed the
+    /// WireGuard-era AES-128 default — this mesh's substrate is
+    /// Nebula, whose cipher is AES-256-GCM.
     #[must_use]
     pub fn direct_udp_default() -> Self {
         Self {
@@ -93,7 +129,7 @@ impl TransportCapabilities {
             supports_streaming: false,
             supports_broadcast: false,
             mtu: Some(1280),
-            encryption_kind: EncryptionKind::Aes128Gcm,
+            encryption_kind: EncryptionKind::Aes256Gcm,
         }
     }
 
@@ -178,12 +214,41 @@ mod tests {
     }
 
     #[test]
-    fn direct_udp_default_capabilities_match_wireguard_defaults() {
+    fn direct_udp_default_capabilities_match_nebula_tunnel() {
         let c = TransportCapabilities::direct_udp_default();
         assert!(!c.supports_bulk);
         assert!(!c.supports_streaming);
         assert!(!c.supports_broadcast);
         assert_eq!(c.mtu, Some(1280));
-        assert_eq!(c.encryption_kind, EncryptionKind::Aes128Gcm);
+        // CV-1 — the Nebula substrate cipher (§3), not the old
+        // WireGuard-era AES-128 claim.
+        assert_eq!(c.encryption_kind, EncryptionKind::Aes256Gcm);
+    }
+
+    #[test]
+    fn strength_rank_orders_none_128_then_floor_pair() {
+        assert!(EncryptionKind::None.strength_rank() < EncryptionKind::Aes128Gcm.strength_rank());
+        assert!(
+            EncryptionKind::Aes128Gcm.strength_rank()
+                < EncryptionKind::Aes256Gcm.strength_rank()
+        );
+        assert_eq!(
+            EncryptionKind::Aes256Gcm.strength_rank(),
+            EncryptionKind::ChaCha20Poly1305.strength_rank(),
+            "the §3 floor pair ranks equal"
+        );
+    }
+
+    #[test]
+    fn every_production_transport_meets_the_content_floor() {
+        // CV-1 — all four registered TransportKinds ride Nebula or
+        // TLS 1.3; none may fall below the AES-256-class floor.
+        for kind in crate::TransportKind::all() {
+            assert!(
+                EncryptionKind::for_transport(kind).strength_rank()
+                    >= EncryptionKind::Aes256Gcm.strength_rank(),
+                "{kind:?} below the content-class encryption floor"
+            );
+        }
     }
 }

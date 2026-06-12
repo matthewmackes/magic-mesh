@@ -29,7 +29,7 @@ convergence) and LizardFS replicated storage.
 
 ```bash
 # On a lighthouse: mint a single-use enrollment token.
-mackesd enroll-token            # prints a token
+mackesd enroll-token --mesh-id <mesh>   # prints a token
 
 # On the new node:
 meshctl provision --role server --token <token>

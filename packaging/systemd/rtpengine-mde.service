@@ -1,0 +1,33 @@
+# EFF-43 / VV-1 (v4.1.0) — the MDE-instance RTPengine media relay.
+#
+# Ships DISABLED (per the v4.1.0 voice-stack spec) — see
+# kamailio-mde.service for the enable/reload contract. Config is
+# regenerated from the replicated voice-desired.json on every
+# (re)start; the voice_config worker reloads on policy change.
+#
+# Requires the (third-party / RPM Fusion) `rtpengine` package; not a
+# hard Requires so voice-less nodes install cleanly.
+
+[Unit]
+Description=RTPengine media relay (Magic Mesh voice instance)
+After=network-online.target mackesd.service
+Wants=network-online.target
+
+[Service]
+Type=forking
+# Regenerate /etc/rtpengine-mde/rtpengine.conf from the replicated
+# desired-state document before every start.
+ExecStartPre=/usr/bin/mackesd voice render-config --kamailio-dir /etc/kamailio-mde --rtpengine-dir /etc/rtpengine-mde
+ExecStart=/usr/bin/rtpengine --config-file=/etc/rtpengine-mde/rtpengine.conf --pidfile=/run/rtpengine-mde.pid
+PIDFile=/run/rtpengine-mde.pid
+Restart=on-failure
+RestartSec=5
+
+# Hardening (mirrors mackesd.service's EFF-12 baseline).
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

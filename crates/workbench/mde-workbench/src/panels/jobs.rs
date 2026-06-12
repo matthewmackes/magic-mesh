@@ -407,7 +407,11 @@ impl JobsPanel {
         panel_container(
             column![
                 refresh,
-                scrollable(column![tcol, rcol].spacing(20)).height(Length::Fill)
+                // CV-3 — density-aware section gap (space.lg).
+                scrollable(
+                    column![tcol, rcol].spacing(crate::panel_chrome::column_gap(density))
+                )
+                .height(Length::Fill)
             ]
             .spacing(16)
             .width(Length::Fill)

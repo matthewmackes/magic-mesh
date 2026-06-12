@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::transport_capabilities::EncryptionKind;
 use crate::{HealthState, MessageClass, MessageClassSet, SwitchReason, Transport, TransportKind};
 
 /// Per-message-class weight bundle. Values 0.0..=1.0; higher
@@ -74,11 +75,19 @@ pub struct Policy {
     /// Hard denylist: TransportKinds in this list are never
     /// selected, even when they're the only reachable option.
     pub denylist: Vec<TransportKind>,
+    /// CV-1 — minimum transport-encryption strength for
+    /// content-carrying message classes (Clipboard / FileBulk /
+    /// Notification — i.e. clipboard contents, files, SMS bodies).
+    /// `Control` frames (ring, find, presence) are exempt. A
+    /// transport whose [`EncryptionKind::strength_rank`] falls
+    /// below this floor is filtered out of content-class
+    /// candidate sets entirely.
+    pub min_content_encryption: EncryptionKind,
 }
 
 impl Policy {
     /// Default policy — baseline weights, mild flap penalty,
-    /// no pins, no denies.
+    /// no pins, no denies, AES-256-class content floor (§3).
     #[must_use]
     pub fn baseline() -> Self {
         Self {
@@ -86,6 +95,7 @@ impl Policy {
             flap_penalty: 0.25,
             pinned_primary: Vec::new(),
             denylist: Vec::new(),
+            min_content_encryption: EncryptionKind::Aes256Gcm,
         }
     }
 }
@@ -110,11 +120,16 @@ pub struct TransportSample {
     /// Recent-failure count from the FailureWindow (drives the
     /// flap penalty). Zero means no penalty.
     pub recent_failures: u32,
+    /// CV-1 — transport-level encryption guarantee, checked
+    /// against [`Policy::min_content_encryption`] for content
+    /// classes.
+    pub encryption: EncryptionKind,
 }
 
 impl TransportSample {
     /// Build a sample with no failures from the constituent
-    /// pieces. Convenience for tests.
+    /// pieces. Convenience for tests; encryption defaults to the
+    /// transport kind's guarantee ([`EncryptionKind::for_transport`]).
     #[must_use]
     pub fn healthy(kind: TransportKind, carries: MessageClassSet) -> Self {
         Self {
@@ -122,7 +137,16 @@ impl TransportSample {
             health: HealthState::Healthy,
             carries,
             recent_failures: 0,
+            encryption: EncryptionKind::for_transport(kind),
         }
+    }
+
+    /// Override the encryption guarantee (tests / a future
+    /// transport that negotiates its cipher at runtime).
+    #[must_use]
+    pub fn with_encryption(mut self, encryption: EncryptionKind) -> Self {
+        self.encryption = encryption;
+        self
     }
 }
 
@@ -151,12 +175,19 @@ pub fn score(
     class: MessageClass,
     policy: &Policy,
 ) -> Option<ScoredSelection> {
-    // Filter: sendable + carries class + not denylisted.
+    // Filter: sendable + carries class + not denylisted + (CV-1)
+    // meets the content-class encryption floor. Control frames are
+    // exempt — they carry no user content and must keep working so
+    // the router can negotiate a stronger path.
     let candidates: Vec<&TransportSample> = samples
         .iter()
         .filter(|s| s.health.is_sendable())
         .filter(|s| s.carries.carries(class))
         .filter(|s| !policy.denylist.contains(&s.kind))
+        .filter(|s| {
+            class == MessageClass::Control
+                || s.encryption.strength_rank() >= policy.min_content_encryption.strength_rank()
+        })
         .collect();
     if candidates.is_empty() {
         return None;
@@ -272,6 +303,8 @@ pub async fn select(
             health,
             carries: caps.carries,
             recent_failures: 0,
+            // CV-1 — per-kind transport encryption guarantee.
+            encryption: EncryptionKind::for_transport(t.kind()),
         });
     }
     score(&samples, class, policy)
@@ -293,6 +326,55 @@ mod tests {
     fn empty_input_yields_none() {
         let r = score(&[], MessageClass::Control, &Policy::default());
         assert!(r.is_none());
+    }
+
+    #[test]
+    fn weak_encryption_is_filtered_for_content_classes_but_not_control() {
+        // CV-1 — an AES-128 transport must never carry clipboard /
+        // file / notification payloads under the AES-256 floor, but
+        // stays eligible for Control frames.
+        let weak = all_carrier(TransportKind::NebulaDirect)
+            .with_encryption(EncryptionKind::Aes128Gcm);
+        for class in [
+            MessageClass::Clipboard,
+            MessageClass::FileBulk,
+            MessageClass::Notification,
+        ] {
+            assert!(
+                score(&[weak.clone()], class, &Policy::default()).is_none(),
+                "{class:?} must refuse the weak transport"
+            );
+        }
+        let r = score(&[weak], MessageClass::Control, &Policy::default()).unwrap();
+        assert_eq!(r.primary, TransportKind::NebulaDirect);
+    }
+
+    #[test]
+    fn chacha20_meets_the_content_floor() {
+        // The §3 floor pair: ChaCha20-Poly1305 ranks equal to
+        // AES-256-GCM and passes the content gate.
+        let s = all_carrier(TransportKind::NebulaLighthouseRelay)
+            .with_encryption(EncryptionKind::ChaCha20Poly1305);
+        let r = score(&[s], MessageClass::Clipboard, &Policy::default()).unwrap();
+        assert_eq!(r.primary, TransportKind::NebulaLighthouseRelay);
+    }
+
+    #[test]
+    fn floor_prefers_strong_transport_when_weak_one_outranks_it() {
+        // A better-ranked but weakly-encrypted transport loses the
+        // content classes to the strong one outright (filtered, not
+        // merely penalized).
+        let weak_fast = all_carrier(TransportKind::NebulaDirect)
+            .with_encryption(EncryptionKind::Aes128Gcm);
+        let strong_slow = all_carrier(TransportKind::KdcTls);
+        let r = score(
+            &[weak_fast, strong_slow],
+            MessageClass::FileBulk,
+            &Policy::default(),
+        )
+        .unwrap();
+        assert_eq!(r.primary, TransportKind::KdcTls);
+        assert_eq!(r.fallback, None, "the weak transport is not even a fallback");
     }
 
     #[test]
@@ -437,6 +519,7 @@ mod tests {
             flap_penalty: 0.0,
             pinned_primary: vec![],
             denylist: vec![],
+            min_content_encryption: EncryptionKind::Aes256Gcm,
         };
         let samples = vec![
             all_carrier(TransportKind::NebulaHttps443),

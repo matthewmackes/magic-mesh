@@ -1,0 +1,37 @@
+# EFF-43 / VV-1 (v4.1.0) — the MDE-instance Kamailio SIP proxy.
+#
+# Ships DISABLED (per the v4.1.0 voice-stack spec): the operator (or a
+# fleet voice policy via the voice_config worker) enables it explicitly.
+# Config is never hand-edited — ExecStartPre regenerates the full
+# /etc/kamailio-mde/ set from the replicated voice-desired.json on every
+# (re)start, and the voice_config worker issues try-reload-or-restart
+# when the policy changes (a no-op while the unit is disabled).
+#
+# Requires the Fedora `kamailio` package (with the tls module); this
+# unit deliberately does NOT hard-Require it so the magic-mesh RPM
+# installs cleanly on nodes that never enable voice.
+
+[Unit]
+Description=Kamailio SIP proxy (Magic Mesh voice instance)
+Documentation=man:kamailio(8)
+After=network-online.target mackesd.service
+Wants=network-online.target
+
+[Service]
+# -DD -E keeps kamailio in the foreground logging to stderr → simple.
+Type=simple
+# Regenerate /etc/kamailio-mde/{kamailio.cfg,dispatcher.list,uacreg.list}
+# from the replicated desired-state document before every start.
+ExecStartPre=/usr/bin/mackesd voice render-config --kamailio-dir /etc/kamailio-mde --rtpengine-dir /etc/rtpengine-mde
+ExecStart=/usr/sbin/kamailio -DD -E -f /etc/kamailio-mde/kamailio.cfg
+Restart=on-failure
+RestartSec=5
+
+# Hardening (mirrors mackesd.service's EFF-12 baseline).
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

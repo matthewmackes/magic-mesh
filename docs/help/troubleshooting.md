@@ -53,7 +53,7 @@ without `resolvectl` the `/etc/hosts` block is the always-applied fallback.
 
 Revocation is immediate and fleet-wide via the Nebula blocklist, not the firewall:
 ```bash
-mackesd decommission --node-id peer:<name>     # or: meshctl decommission peer:<name>
+mackesd decommission peer:<name>               # or: meshctl decommission peer:<name>
 ```
 Every node folds the revocation into its Nebula `pki.blocklist` on the next config
 refresh and drops the tunnel.
