@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Magic Mesh
+Comment=Mesh health pip + quick actions in the Cosmic panel
+Exec=mde-cosmic-applet
+Icon=magic-mesh
+Terminal=false
+Categories=COSMIC;System;
+# AUD-4 — cosmic-panel discovers applets by this key; NoDisplay keeps it out
+# of the app launcher (it only ever runs inside the panel).
+X-CosmicApplet=true
+NoDisplay=true

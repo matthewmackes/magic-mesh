@@ -320,6 +320,9 @@ assets = [
     { source = "target/release/mde-voice-hud",      dest = "/usr/bin/mde-voice-hud",      mode = "755" },
     { source = "target/release/mde-music",          dest = "/usr/bin/mde-music",          mode = "755" },
     { source = "target/release/mde-musicd",         dest = "/usr/bin/mde-musicd",         mode = "755" },
+    # AUD-4 — the §5 Cosmic integration: the mesh-health cosmic-applet binary +
+    # its X-CosmicApplet .desktop so cosmic-panel discovers + hosts it.
+    { source = "target/release/mde-cosmic-applet",  dest = "/usr/bin/mde-cosmic-applet",  mode = "755" },
     # PKG-3 — the self-gating daemon unit + the role-gated app units.
     { source = "packaging/systemd/mackesd.service",   dest = "/usr/lib/systemd/system/mackesd.service",   mode = "644" },
     { source = "packaging/systemd/mde-musicd.service", dest = "/usr/lib/systemd/user/mde-musicd.service", mode = "644" },
