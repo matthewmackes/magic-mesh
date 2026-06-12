@@ -28,7 +28,8 @@
 //!
 //! - [`codec`] — frame encoding/decoding. The wire's
 //!   newline-delimited JSON frame structure + framing helpers.
-//! - [`crypto`] — RSA-2048 pairing handshake + AES-256-GCM
+//! - [`crypto`] — RSA pairing handshake (own keys 4096-bit;
+//!   verify accepts 2048–8192 for KDE Connect interop) + AES-256-GCM
 //!   session key. Trait surface only here; impls land in
 //!   KDC2-2.4.
 //! - [`discovery`] — UDP-broadcast peer-discovery announcements +

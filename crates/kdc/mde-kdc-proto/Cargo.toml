@@ -15,7 +15,8 @@ serde_json = "1"
 # KDC2-2.4 crypto (user-locked 2026-05-22: ring 0.17, picked
 # over pure-Rust rsa/aes-gcm for the BoringSSL audit history and
 # the existing usage in the mesh stack). Used by `crypto::RingKeyStore`
-# + the RSA-2048 pairing handshake + the AES-256-GCM session
+# + the RSA pairing handshake (own keys 4096; verify accepts 2048–8192
+# for stock KDE Connect interop) + the AES-256-GCM session
 # encryption.
 ring = "0.17"
 

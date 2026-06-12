@@ -52,3 +52,22 @@ What remains is **second-order**: one observability seam left half-plumbed by th
 ## Verdict
 
 The 2026-06-11 → 2026-06-12 delta is what a §7-disciplined hardening pass should look like: every prior headline gap closed *and reachable*, no new stubs introduced, and the governance gates that were missing are now both present and passing. The remaining work is small and precisely nameable — **fix the RPM wallpaper asset before any release cut (#7)**, plumb or prune the router-histogram seam (#1), delete three dead surfaces (#2–#4), and clear four doc-drift items (#6, #9–#11). Nothing found this sweep contradicts production-readiness; #7 is the only item that would actually break a release.
+
+---
+
+## Fix-cycle resolution (2026-06-12, same day)
+
+All 11 rows were resolved the same day and **independently re-verified by a fresh agent pass** (verification table: 20/20 YES):
+
+- **#7 (the "release blocker") was a FALSE POSITIVE** — `mde-mesh-wallpaper` is a real PD-10 bin (`mde-workbench/src/bin/`), auto-discovered by Cargo without an explicit `[[bin]]` block; `cargo build --bin mde-mesh-wallpaper` verified green. The audit skill now carries an auto-discovery safeguard so this class of false positive doesn't recur.
+- **#1** — worse than reported: production never even attached the histogram (`with_metrics` had zero bin callers). run_serve now shares one `RouterMetrics` Arc between `MeshRouterWorker` and the exporter; mackesd.prom carries the full `_bucket`/`_sum`/`_count` series (tested).
+- **#2** — dead free fns deleted (`downloads_reply` kept; tests folded onto the live `FileXfer` methods).
+- **#3** — `Elevation` REMOVED (shell-era Q29/Q30 tiers; `shadows` stays live via `Theme::modal_shadow`).
+- **#4** — `brand` WIRED: role-chooser renders the wordmark via the Brand loader; the RPM ships the swappable pack to `/usr/share/mde/brand/`.
+- **#5 (EFF-25)** — alert layer WIRED: `[[alert_hooks]]` in mackesd.toml → `dispatch_alerts` post-commit from the reconcile tick (typo'd kinds drop with a warn; rolled-back events can never alert). Remainder: only `Reconcile` is emitted today; new emission sites inherit the dispatch automatically.
+- **#6, #9–#11** — all doc drift fixed (KDC RSA prose now states own-keys-4096/verify-range-2048–8192 everywhere incl. three sites the sweep missed; both skills updated; README platform row complete).
+- **#8 (EFF-17)** — project Ed25519 signing key generated (private in operator `~/.gnupg`); public key committed at `packaging/repo/RPM-GPG-KEY-magic-mesh`; the one RPM ships the `.repo` + key so one-shot installs get a gpgcheck'd upgrade channel. The `magic-mesh-release` sub-package concept retired from `packaging/README.md` + `docs/help/install.md` (the re-audit's F-3).
+
+Re-audit residuals F-1/F-2/F-3 (stale RSA-2048 prose in kdc-host, the sub-package install docs) fixed in the same cycle; F-4 (`percentile_estimate` test-only) accepted as a legitimate analysis API; F-5 cleared as correct interop prose.
+
+**Cycle status: CLEAN.** Gates at close: workspace build green, `cargo test --workspace` 63/63 suites green, mackesd 1447 serial tests green, all three governance lints clean, zero `todo!()`/`unimplemented!()`.

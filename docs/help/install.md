@@ -17,10 +17,11 @@ Two supported paths:
     https://github.com/matthewmackes/magic-mesh/releases/latest/download/magic-mesh.rpm
   ```
 
-  Or enable the GitHub-hosted dnf repo (for updates) by installing the
-  `magic-mesh-release` RPM, then `sudo dnf install magic-mesh` — it drops the
-  `[magic-mesh]` repo (GitHub Pages baseurl, GPG-checked against the project
-  key). There is no COPR.
+  That one-shot install also leaves the update channel behind: the RPM itself
+  ships the `[magic-mesh]` dnf repo to `/etc/yum.repos.d/` and the project's
+  public signing key to `/etc/pki/rpm-gpg/` (GitHub Pages baseurl, gpgcheck
+  on), so a plain `sudo dnf upgrade` picks up later releases. There is no
+  separate release/bootstrap RPM and no COPR.
 
 The RPM installs every binary (`mackesd`, `meshctl`, `magic-fleet`, `mde-bus`,
 `mde-workbench`, `mde-files`, …) under `/usr/bin`, the systemd units, the Carbon

@@ -26,7 +26,8 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use sha2::{Digest, Sha256};
 
-/// The self-signed RSA-2048 identity certs only ever sign with these schemes;
+/// The self-signed RSA-4096 identity certs (our own keys, §3 floor; stock
+/// KDE Connect peers may present 2048) only ever sign with these schemes;
 /// every custom verifier advertises exactly this set (mirrors upstream KDC).
 fn rsa_identity_schemes() -> Vec<SignatureScheme> {
     vec![

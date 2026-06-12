@@ -19,6 +19,9 @@ into the filesystem; the hicolor icon set lives in `../assets/icons/`.
 
 - `kickstart/`    → the Magic-on-Cosmic ISO kickstart (PKG-9) with the
   install-time role-chooser `%post` (PKG-5); built with livemedia-creator.
-- `repo/`         → the GitHub-hosted `.repo` (PKG-8), shipped by the
-  `magic-mesh-release` RPM (gpgcheck on, project GPG key; GitHub Pages baseurl).
+- `repo/`         → the GitHub-hosted `.repo` (PKG-8) + the committed public
+  signing key `RPM-GPG-KEY-magic-mesh` (EFF-17). Both ship inside the main
+  `magic-mesh` RPM (one-RPM design, §5 — no separate release sub-package):
+  the `.repo` lands at `/etc/yum.repos.d/`, the key at `/etc/pki/rpm-gpg/`,
+  so a one-shot `dnf install <url>` leaves a gpgcheck'd upgrade channel.
 - `ENROLLMENT.md` → the post-install enroll/mesh-init steps (PKG-10).

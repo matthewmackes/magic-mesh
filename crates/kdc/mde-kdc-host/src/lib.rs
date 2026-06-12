@@ -17,7 +17,7 @@
 //! [`LoopbackTransport`]); and the UDP-1716 LAN [`discovery`] half of the live
 //! transport ([`UdpDiscovery`], which broadcasts our identity and surfaces peers
 //! as `PeerDiscovered` / `PeerLost` events); and — increment 3b — the identity
-//! [`keygen`] (RSA-2048 PKCS#8 + a self-signed X.509 cert) plus the [`tls`]
+//! [`keygen`] (RSA-4096 PKCS#8 + a self-signed X.509 cert, §3 floor) plus the [`tls`]
 //! fingerprint-pinning layer ([`compute_fingerprint`], the pinned/first-pair
 //! verifiers, and [`connect_pinned_tls`], the live TLS-over-TCP connect path).
 //! Still to come: wiring that connect path into a `LanTransport` + router
