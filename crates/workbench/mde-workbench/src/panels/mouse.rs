@@ -47,7 +47,7 @@ impl MousePanel {
             text(
                 "Pointer speed, scrolling, tap-to-click and button mapping are \
                  configured in Settings, which applies them to the compositor \
-                 (labwc) directly."
+                 (Cosmic) directly."
             ),
             variant_button(
                 "Open Mouse settings",

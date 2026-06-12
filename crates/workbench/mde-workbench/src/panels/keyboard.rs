@@ -45,7 +45,7 @@ impl KeyboardPanel {
             text("Keyboard").size(18),
             text(
                 "Key-repeat delay, repeat rate and layout are configured in \
-                 Settings, which applies them to the compositor (labwc) directly."
+                 Settings, which applies them to the compositor (Cosmic) directly."
             ),
             variant_button(
                 "Open Keyboard settings",

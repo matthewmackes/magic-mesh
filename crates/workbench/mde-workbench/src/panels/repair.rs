@@ -9,9 +9,6 @@
 //! Iced port ships a reframed action set against the
 //! v2.0.0 MDE stack:
 //!
-//!   * Reload compositor (Cosmic now owns the desktop; this action
-//!     targets the legacy labwc reload — ask labwc to re-read its
-//!     config without a full session restart)
 //!   * Restart mackesd (kicks the user systemd unit if a worker
 //!     wedged)
 //!   * Re-install the MDE .desktop launcher (copies the
@@ -51,7 +48,6 @@ pub struct RepairPanel {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    ReloadCompositorClicked,
     RestartMackesdClicked,
     ReinstallDesktopClicked,
     RestorePresetClicked,
@@ -66,9 +62,6 @@ impl RepairPanel {
 
     pub fn update(&mut self, message: Message) -> Task<crate::Message> {
         match message {
-            Message::ReloadCompositorClicked => {
-                self.dispatch("labwc --reconfigure", vec!["labwc", "--reconfigure"])
-            }
             Message::RestartMackesdClicked => self.dispatch(
                 "systemctl --user restart mackesd",
                 vec!["systemctl", "--user", "restart", "mackesd"],
@@ -147,12 +140,6 @@ impl RepairPanel {
         // (none of them is THE primary action; user picks based
         // on the problem).
         let palette = crate::live_theme::palette();
-        let reload_btn = variant_button(
-            "Reload compositor",
-            ButtonVariant::Secondary,
-            (!self.busy).then(|| crate::Message::Repair(Message::ReloadCompositorClicked)),
-            palette,
-        );
         let restart_btn = variant_button(
             "Restart mackesd",
             ButtonVariant::Secondary,
@@ -179,16 +166,6 @@ impl RepairPanel {
                  runs on its own — none of them touch your personal files."
             )
             .size(13),
-            row![
-                column![
-                    text("Reload compositor").size(14),
-                    text("Ask labwc to re-read its config (rc.xml/themerc/menu) without restarting the session.").size(12)
-                ]
-                .spacing(2)
-                .width(Length::Fill),
-                reload_btn,
-            ]
-            .spacing(12),
             row![
                 column![
                     text("Restart mackesd").size(14),
@@ -324,14 +301,6 @@ mod tests {
     }
 
     #[test]
-    fn reload_compositor_clicked_sets_busy_and_status() {
-        let mut panel = RepairPanel::new();
-        let _ = panel.update(Message::ReloadCompositorClicked);
-        assert!(panel.busy);
-        assert!(panel.status.contains("labwc"));
-    }
-
-    #[test]
     fn restart_mackesd_clicked_sets_busy_and_status() {
         let mut panel = RepairPanel::new();
         let _ = panel.update(Message::RestartMackesdClicked);
@@ -369,7 +338,7 @@ mod tests {
         let mut panel = RepairPanel::new();
         panel.busy = true;
         panel.status = "Running …".into();
-        let _ = panel.update(Message::ReloadCompositorClicked);
+        let _ = panel.update(Message::RestartMackesdClicked);
         assert_eq!(panel.status, "Running …");
     }
 
@@ -378,7 +347,7 @@ mod tests {
         let mut panel = RepairPanel::new();
         panel.busy = true;
         let _ = panel.update(Message::Finished {
-            argv: "labwc --reconfigure".into(),
+            argv: "systemctl --user restart mackesd".into(),
             output: "ok".into(),
         });
         assert!(!panel.busy);

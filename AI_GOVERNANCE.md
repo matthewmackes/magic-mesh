@@ -50,9 +50,12 @@ uses max key complexity. No OpenSSL — **rustls** throughout.
 
 **Documented interop exceptions (not violations — sweep-3 I6/I7):** MD5 where an
 external spec mandates it and it carries no MDE security: the freedesktop
-thumbnail-cache filename (`mde-files/thumbnails.rs` — cache key per the XDG spec)
-and the Subsonic API auth token (`mde-musicd/airsonic.rs` — the upstream API's
-scheme; mitigate by using TLS to the server). Anything else MD5/SHA1 is a finding.
+thumbnail-cache filename (`mde-files/thumbnails.rs` — cache key per the XDG spec),
+the Subsonic API auth token (`mde-musicd/airsonic.rs` — the upstream API's
+scheme; mitigate by using TLS to the server), and SIP digest authentication
+(`mde-voice-hud/sip.rs` — RFC 3261 mandates MD5 for the digest; it is
+server-chosen, so prefer SHA-256 when the registrar offers it). Anything else
+MD5/SHA1 is a finding.
 
 ## §4 — Look: strictly IBM Carbon
 

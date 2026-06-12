@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn file_bulk_skips_small_only_transports() {
-        // DERP is small_only — must not be picked for FileBulk
+        // the lighthouse relay is small_only — must not be picked for FileBulk
         // even if it's the "best" by rank.
         let samples = vec![
             small_only(TransportKind::NebulaLighthouseRelay),
@@ -412,7 +412,7 @@ mod tests {
     fn notification_uses_reliability_weight() {
         // For Notification, weight is `reliability` (= 0.7
         // baseline). Order should still come out NebulaDirect >
-        // KdcTls > DERP > HTTPS at equal-health.
+        // KdcTls > relay > HTTPS at equal-health.
         let samples = vec![
             all_carrier(TransportKind::NebulaDirect),
             all_carrier(TransportKind::KdcTls),

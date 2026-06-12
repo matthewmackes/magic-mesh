@@ -855,15 +855,12 @@ impl App {
                 Task::none()
             }
             Message::OpenSettings(slug) => {
-                // E6.2 — bridge to the shell's Win10 Settings app. Spawn
-                // detached (mirrors the help xdg-open path); `mde` resolves
-                // on PATH post-install. Empty slug opens the Settings home.
-                let mut cmd = std::process::Command::new("mde");
-                cmd.arg("settings");
-                if !slug.is_empty() {
-                    cmd.arg(slug);
-                }
-                let _ = cmd
+                // AUD-15 (2026-06-11): Cosmic owns the desktop (§5) — the retired
+                // `mde settings` dispatcher is gone. Open Cosmic Settings (the
+                // desktop's own config surface); the legacy mde page slug no
+                // longer maps, so we open its home. Detached best-effort spawn.
+                let _ = slug; // legacy mde page slug — no longer routable
+                let _ = std::process::Command::new("cosmic-settings")
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
@@ -883,15 +880,11 @@ impl App {
                 Task::none()
             }
             Message::OpenSettingsPage(category, page) => {
-                // E0.15 — bridge to the legacy `mde settings <category> --page
-                // <page>` config surface (Cosmic now owns the desktop; this exec
-                // targets the retired dispatcher path). Detached spawn, mirrors
-                // OpenSettings above.
-                let _ = std::process::Command::new("mde")
-                    .arg("settings")
-                    .arg(category)
-                    .arg("--page")
-                    .arg(page)
+                // AUD-15 (2026-06-11): retired `mde settings` dispatcher → open
+                // Cosmic Settings (§5, Cosmic owns the desktop). The legacy
+                // category/page args no longer map; open its home. Detached.
+                let _ = (category, page); // legacy mde page coords — unroutable
+                let _ = std::process::Command::new("cosmic-settings")
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())

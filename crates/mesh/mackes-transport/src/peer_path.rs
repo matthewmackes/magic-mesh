@@ -21,7 +21,7 @@ use crate::{MessageClass, TransportKind};
 /// `mackesd::https_fallback`). When the failure window meets the
 /// 3-cycle threshold, this state advances from `Inactive` to
 /// `Activating`; once the NebulaHttps443 transport reports a successful
-/// TLS handshake, to `Active`. A fresh direct-UDP-or-DERP success
+/// TLS handshake, to `Active`. A fresh direct-UDP-or-relay success
 /// snaps it back to `Inactive`.
 ///
 /// Mirrors `mackesd::https_fallback::HttpsFallbackState` 1:1 so
@@ -32,7 +32,7 @@ use crate::{MessageClass, TransportKind};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HttpsFallbackState {
-    /// Default — direct-UDP / DERP-UDP paths are healthy.
+    /// Default — direct-UDP / relay-UDP paths are healthy.
     #[default]
     Inactive,
     /// Failure threshold met; TLS handshake to the configured
@@ -62,7 +62,7 @@ impl HttpsFallbackState {
 }
 
 /// One ICE-style candidate sourced from STUN (Phase 12.17) for a
-/// peer. Tailscale's WireGuard endpoint set is seeded with the
+/// peer. Nebula's lighthouse endpoint set is seeded with the
 /// `reflexive` address ahead of its own NAT-traversal probe so
 /// symmetric-NAT edges find a hole-punch path inside the 1.5 s
 /// candidate-gather budget locked by Q8 in
@@ -163,8 +163,8 @@ pub struct PeerPath {
     /// regardless of `primary` / health.
     pub message_class_overrides: BTreeMap<MessageClass, TransportKind>,
     /// Phase 12.17 — STUN candidates the router can hand to
-    /// Tailscale's endpoint set so symmetric-NAT edges
-    /// hole-punch before falling through to DERP. The
+    /// Nebula's endpoint set so symmetric-NAT edges
+    /// hole-punch before falling through to the lighthouse relay. The
     /// `kdc_stun_gather` worker (`mackesd::workers::stun_gather`)
     /// populates this list; the mesh-router consults it on each
     /// tick when picking the primary.
@@ -175,7 +175,7 @@ pub struct PeerPath {
     pub candidates: Vec<StunCandidate>,
     /// Phase 12.18 — per-peer consecutive UDP-failure count.
     /// The mesh-router increments this on each tick when both
-    /// direct-UDP and DERP-UDP probes fail; resets to 0 when
+    /// direct-UDP and relay-UDP probes fail; resets to 0 when
     /// either succeeds. Crossing the 3-cycle threshold flips
     /// `https_state` to `Activating`. Plain u32 (instead of the
     /// richer `FailureWindow`) so the field is serde-friendly +

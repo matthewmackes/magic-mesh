@@ -30,7 +30,7 @@ pub enum EncryptionKind {
     Aes128Gcm,
     /// AES-256-GCM (KDC2 + TLS 1.3 default).
     Aes256Gcm,
-    /// ChaCha20-Poly1305 (some Tailscale / DERP paths).
+    /// ChaCha20-Poly1305 (some Nebula relay paths).
     // Serde's snake_case would render this as
     // `cha_cha20_poly1305` (it splits between every capital
     // and digit cluster). Override to the more readable
@@ -111,7 +111,7 @@ impl TransportCapabilities {
         }
     }
 
-    /// Default DERP-relay capabilities (Tailscale DERP: small
+    /// Default lighthouse-relay capabilities (Nebula lighthouse-relay: small
     /// frames, no bulk, ChaCha20-Poly1305).
     #[must_use]
     pub fn derp_relay_default() -> Self {

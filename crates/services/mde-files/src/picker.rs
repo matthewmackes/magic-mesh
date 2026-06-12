@@ -4,8 +4,8 @@
 //!                   [--filter "Images:png,jpg;All Files:*"]`
 //!
 //! A self-contained chooser that reuses the same local listing engine the
-//! manager browses with (`LocalFsBackend::list_dir`) and the same warm-dark
-//! theme, so the platform has ONE file engine rather than a separate dialog.
+//! manager browses with (`LocalFsBackend::list_dir`) and the same IBM Carbon
+//! Gray-100 theme, so the platform has ONE file engine rather than a separate dialog.
 //! It prints the chosen absolute path to stdout and exits 0, or exits non-zero
 //! on Cancel — the exact stdout/exit contract a portal/file-dialog caller
 //! spawns this binary against.

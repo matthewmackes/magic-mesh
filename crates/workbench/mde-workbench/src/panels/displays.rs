@@ -48,7 +48,7 @@ impl DisplaysPanel {
             text("Displays").size(18),
             text(
                 "Resolution, scale, arrangement and night light are configured in \
-                 Settings ▸ Display, which applies them to the compositor (labwc) \
+                 Settings ▸ Display, which applies them to the compositor (Cosmic) \
                  directly."
             ),
             variant_button(

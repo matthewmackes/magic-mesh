@@ -3,7 +3,7 @@
 //! v2.1 KDC2 lock (2026-05-22): the mesh router (`mackesd::workers::
 //! mesh_router`) picks the per-message path between peers. To do that
 //! generically, it needs a single trait every transport implementation
-//! consumes — direct UDP, DERP relay, HTTPS-443 tunnel, KDC-TLS. This
+//! consumes — direct UDP, lighthouse relay, HTTPS-443 tunnel, KDC-TLS. This
 //! crate is the seam.
 //!
 //! Why a stand-alone crate (instead of a module inside `mackesd`)?
@@ -52,7 +52,7 @@ pub enum TransportKind {
     /// Best-case: direct UDP between two peers' WireGuard sockets
     /// (matches `EdgeKind::NebulaDirect`).
     NebulaDirect,
-    /// Tailscale DERP relay fallback (matches `EdgeKind::NebulaLighthouseRelay`).
+    /// Nebula lighthouse-relay fallback (matches `EdgeKind::NebulaLighthouseRelay`).
     NebulaLighthouseRelay,
     /// HTTPS-tunneled TCP/443 (matches `EdgeKind::NebulaHttps443`).
     NebulaHttps443,
@@ -72,7 +72,7 @@ impl TransportKind {
     /// survey (`project_v12_connectivity_scope.md`): NebulaDirect >
     /// KdcTls > NebulaLighthouseRelay > NebulaHttps443. KdcTls outranks NebulaLighthouseRelay
     /// because the KDC handshake reuses a long-lived TLS session
-    /// (~0 RTT for steady-state messages), where DERP requires a
+    /// (~0 RTT for steady-state messages), where the relay requires a
     /// fresh client every minute.
     #[must_use]
     pub const fn all() -> [TransportKind; 4] {
@@ -181,7 +181,7 @@ pub enum NebulaMode {
     Direct,
     /// HTTPS-tunneled TCP/443 fallback.
     Https443,
-    /// Lighthouse-relay UDP fallback (Nebula's own DERP-style relay).
+    /// Lighthouse-relay UDP fallback (Nebula's own lighthouse-relay).
     LighthouseRelay,
 }
 
@@ -305,7 +305,7 @@ pub struct Capabilities {
 /// Locks per memory `project_v2_1_kdc2_native.md`:
 ///   * `Control` — KDC always (paired-device commands, ring, find).
 ///   * `Clipboard` — best-path (latency-bound, small frames).
-///   * `FileBulk` — throughput-best (large frames, DERP/HTTPS only
+///   * `FileBulk` — throughput-best (large frames, relay/HTTPS only
 ///     when NebulaDirect is unhealthy).
 ///   * `Notification` — dual-send, idempotent at receiver. Router
 ///     sends through every healthy transport; receiver dedupes.
@@ -335,7 +335,7 @@ impl MessageClassSet {
     }
 
     /// Transport that carries only control + clipboard (small-frame
-    /// reach via a relay). Used by DERP defaults.
+    /// reach via a relay). Used by lighthouse-relay defaults.
     #[must_use]
     pub const fn small_only() -> Self {
         Self {
@@ -431,7 +431,7 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
 #[derive(Debug)]
 pub enum TransportError {
     /// Peer is not reachable via this transport right now (NAT
-    /// blocked direct UDP, DERP region down, etc.).
+    /// blocked direct UDP, relay down, etc.).
     Unreachable {
         /// Stable code for audit entries (e.g. `nat_blocked`).
         code: &'static str,
