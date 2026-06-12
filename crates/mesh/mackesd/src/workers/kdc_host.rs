@@ -21,9 +21,10 @@
 //! `mde_kdc_proto::wire::Packet`, and the plugin-dispatch policy trait now
 //! lives in the canonical `mde_kdc_proto::dispatch`. With that the legacy
 //! `crates/legacy/mde-kdc{,-proto}` path-deps are gone and `cargo tree`
-//! shows one KDE Connect host (E2.2 acceptance #1/#2). The live
-//! ring/sms/clipboard send is the 2-device bench / the `kdc_outbound`
-//! drainer follow-up.
+//! shows one KDE Connect host (E2.2 acceptance #1/#2). **AUD-2 (2026-06-11):**
+//! the outbound drainer is live — `run_host` drains the `PendingSends` queue
+//! over the `LanTransport` once a second, so ring/sms/clipboard/share actually
+//! reach a paired device (end-to-end byte delivery is the 2-device bench).
 
 #![cfg(feature = "async-services")]
 
@@ -39,7 +40,7 @@ use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use mde_kdc_host::error::HostError;
 use mde_kdc_host::pairing::{DeviceRecord, PairingStore};
-use mde_kdc_host::{EventStream, HostEvent, LanTransport, Transport, UdpDiscovery};
+use mde_kdc_host::{EventStream, HostEvent, LanTransport, PeerId, Transport, UdpDiscovery};
 use mde_kdc_proto::discovery::{Announce, DeviceType};
 use mde_kdc_proto::plugins::battery::BatteryBody;
 use serde_json::{json, Value};
@@ -77,6 +78,10 @@ const KDC_PORT: u16 = 1716;
 
 /// Poll cadence for the Connect action topics (operator-scale — clicks).
 const CONNECT_POLL: Duration = Duration::from_millis(400);
+
+/// AUD-2 — how often the host drains the outbound queue over the live
+/// transport. 1 s keeps a clicked Ring/Send-file imperceptibly prompt.
+const OUTBOUND_DRAIN: Duration = Duration::from_secs(1);
 
 /// Health-tick cadence. 30s is the same window
 /// `lan_discovery` uses for its idle scan.
@@ -122,6 +127,17 @@ impl PendingSends {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(send);
+    }
+
+    /// AUD-2 — drain the whole backlog (the `kdc_outbound` drainer takes these
+    /// + delivers each over the live `LanTransport`). Poison-tolerant.
+    fn take_all(&self) -> Vec<OutboundSend> {
+        std::mem::take(
+            &mut *self
+                .inner
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
     }
 
     /// Current backlog length. O(1).
@@ -351,7 +367,7 @@ fn roster_json(roster: &Roster) -> String {
 /// the shared pairing store, folding its events into `roster`. Best-effort: a
 /// discovery-bind or transport-start failure logs + returns, leaving the worker
 /// serving the seeded (static) roster — never fails worker startup.
-async fn run_host(pairing: Arc<PairingStore>, roster: Roster) {
+async fn run_host(pairing: Arc<PairingStore>, roster: Roster, outbound: PendingSends) {
     let announce = local_announce();
     let bind = SocketAddr::from(([0, 0, 0, 0], KDC_PORT));
     let discovery = match UdpDiscovery::bind(bind, announce.clone()).await {
@@ -376,6 +392,11 @@ async fn run_host(pairing: Arc<PairingStore>, roster: Roster) {
     let shunt_host = hostname_for_shunt();
     let shunt_registry = std::sync::Mutex::new(mde_kdc_proto::discovery::DiscoveryRegistry::new());
     let mut shunt_tick = tokio::time::interval(super::mesh_shunt::TICK);
+    // AUD-2 — the kdc_outbound drainer: every second, take the operator-queued
+    // ring/sms/clipboard/share packets and deliver each over the live
+    // LanTransport to its paired device. Failures (device offline / not yet
+    // connected) are logged, not retried — operator actions are fire-and-forget.
+    let mut drain_tick = tokio::time::interval(OUTBOUND_DRAIN);
     loop {
         tokio::select! {
             ev = stream.recv() => {
@@ -386,6 +407,16 @@ async fn run_host(pairing: Arc<PairingStore>, roster: Roster) {
             }
             _ = shunt_tick.tick() => {
                 run_shunt_tick(&pairing, &roster, &shunt_root, &shunt_host, &shunt_registry);
+            }
+            _ = drain_tick.tick() => {
+                for send in outbound.take_all() {
+                    let peer = PeerId::from(send.device_id.as_str());
+                    if let Err(e) = transport.send_to(&peer, send.packet).await {
+                        warn!(device = %send.device_id, error = %e, "kdc-host: outbound send failed (device offline?)");
+                    } else {
+                        debug!(device = %send.device_id, "kdc-host: delivered queued packet");
+                    }
+                }
             }
         }
     }
@@ -692,7 +723,11 @@ impl Worker for KdcHostWorker {
         // supervisor runtime, folding its events into the roster. Best-effort:
         // a bind/start failure leaves the seeded (static) roster served.
         let roster: Roster = Arc::new(Mutex::new(seed_roster(&pairing_arc)));
-        let host_task = tokio::spawn(run_host(Arc::clone(&pairing_arc), Arc::clone(&roster)));
+        let host_task = tokio::spawn(run_host(
+            Arc::clone(&pairing_arc),
+            Arc::clone(&roster),
+            self.outbound.clone(),
+        ));
 
         // E2.2/E2.3 — serve the operator Connect actions (`action/connect/<verb>`)
         // + the live roster (`action/connect/devices`) over the Bus, replacing
@@ -906,6 +941,28 @@ mod tests {
         .unwrap();
         assert_eq!(r2["ok"], true);
         assert_eq!(outbound.len(), 1);
+    }
+
+    #[test]
+    fn outbound_take_all_drains_the_queue() {
+        // AUD-2 — the kdc_outbound drainer takes the whole backlog each tick.
+        let q = PendingSends::new();
+        assert_eq!(q.len(), 0);
+        q.push(OutboundSend {
+            device_id: "d1".into(),
+            packet: build_packet("kdeconnect.findmyphone.request", json!({})),
+        });
+        q.push(OutboundSend {
+            device_id: "d2".into(),
+            packet: build_packet("kdeconnect.findmyphone.request", json!({})),
+        });
+        assert_eq!(q.len(), 2);
+        let drained = q.take_all();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].device_id, "d1");
+        assert_eq!(q.len(), 0, "queue is empty after a drain");
+        // A second drain on the empty queue is a no-op.
+        assert!(q.take_all().is_empty());
     }
 
     #[test]
