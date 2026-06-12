@@ -111,6 +111,15 @@ pub fn append_event(
             .unwrap_or_else(|_| "\"lifecycle\"".to_owned())
             .trim_matches('"')
             .to_owned();
+        // `created_at` MUST encode exactly `now_ms` — `load_audit_rows`
+        // reparses this RFC3339 string back to epoch-millis and
+        // recomputes `next_hash` over it, so a second `Utc::now()` call
+        // here would drift from the `now_ms` baked into `hash` and break
+        // chain verification (flaky under load). Derive it from the one
+        // instant instead.
+        let created_at = chrono::DateTime::from_timestamp_millis(now_ms)
+            .unwrap_or_else(chrono::Utc::now)
+            .to_rfc3339();
         tx.execute(
             "INSERT INTO events (prev_hash, hash, kind, actor, payload_json, created_at) \
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -120,7 +129,7 @@ pub fn append_event(
                 kind_token,
                 node_id,
                 payload_str,
-                chrono::Utc::now().to_rfc3339(),
+                created_at,
             ),
         )
         .context("inserting event row")?;

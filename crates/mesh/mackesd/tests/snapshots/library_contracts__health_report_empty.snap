@@ -1,5 +1,5 @@
 ---
-source: crates/mackesd/tests/library_contracts.rs
+source: crates/mesh/mackesd/tests/library_contracts.rs
 expression: report
 ---
 {
@@ -11,5 +11,9 @@ expression: report
   "degraded_nodes": 0,
   "unreachable_nodes": 0,
   "audit_chain_intact": true,
-  "version": "[version]"
+  "version": "[version]",
+  "workers_alive": 0,
+  "workers_total": 0,
+  "breaker_tripped": 0,
+  "ready": false
 }

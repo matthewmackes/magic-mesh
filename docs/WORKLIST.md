@@ -124,6 +124,11 @@ Lifted from the 2026-06-11 `docs/COMPLIANCE.md` sweep ("audit the platform for f
 - [✓] **AUD4-1 · Unreachable · VV-4 voice heuristic was test-only.** `voice::best_path`/`pick_relay`/`score` were built+tested but `voice::materialize` wrote `priority: 0` for every dispatcher row (the "until VV-4 ships" comment) and `Candidate::loss_pct` had no production consumer. DONE: new `voice::dispatcher_priority` (best_path → inverted score → u8; non-direct floors to 0) wired into `build_voice_desired` via a per-peer latency-lookup reading the mesh-latency cache (generic JSON parse — the worker struct is async-gated, this reconcile path isn't). Faster direct paths rank higher; unmeasured peers neutral; over-budget/unreachable floor. 2 new tests; loss_pct doc corrected.
 - [✓] **AUD4-2 · Supply-chain · yanked swash 0.2.8.** `cargo deny` advisories FAILED (swash 0.2.8 yanked, transitive via cosmic-text→iced). DONE: `cargo update -p swash` → 0.2.9; advisories green.
 
+## AUDIT-2026-06-12 r5 — cycle-5 verify + convergence (all closed same day)
+
+- [✓] **AUD5-1 · QA · stale insta snapshot.** EFF-24 added 4 HealthReport fields but committed only the `.snap.new`; `snapshot_health_report_shape` failed at workspace scope. Promoted the accepted snapshot (shape verified against `HealthReport::empty()`).
+- [✓] **AUD5-2 · SEC/QA · audit-chain hash flake (latent).** `events::append_event` + `worker::apply_repair_rows` hashed each row with `now_ms()` but stored `created_at` from a separate `Utc::now()`; `load_audit_rows` reparses created_at to recompute the chain hash, so sub-ms drift spuriously failed `audit::verify` (false tamper alarm). Both now derive created_at from the single now_ms instant. Passed in isolation, failed under load.
+
 ## P0 — Security / substrate lock (urgent)
 
 - [✓] **H1 · RSA-2048 → RSA-4096 KDC device identity (§3)** — done (`a5186c5`); 49/0 green. — `mde-kdc-host/src/pairing.rs:236` `generate_pkcs8()` generates the live `identity.pkcs8` at 2048 bits via `PairingStore::open:101`. Rewire to the compliant 4096 generator that already exists (`keygen.rs:63`, `RSA_MODULUS_BITS=4096`, exported `lib.rs:41`); delete the duplicate 2048 `generate_pkcs8` in `pairing.rs`. Add/confirm a config test asserting 4096. **Do first — a max-crypto lock regression where the correct code already exists, just isn't called.**

@@ -97,3 +97,14 @@ Fourth full sweep over the heavily-hardened tree (unreachable/stubs · conventio
 - **AUD4-2 (Supply-chain, FINISH):** `cargo deny` advisories FAILED — `swash 0.2.8` (transitive via cosmic-text→iced) was yanked. **Fixed:** `cargo update -p swash` → 0.2.9; advisories green again.
 
 **Cycle-4 status: CLEAN.** Four consecutive same-day audit cycles converged. Gates: mackesd 1450 serial green, three governance lints clean, cargo deny all-ok.
+
+---
+
+## Cycle 5 (2026-06-12) — verify + convergence
+
+Verify-and-light-sweep pass. Cycle-4 fixes re-verified PASS (VV-4 dispatcher_priority reachable end-to-end from build_voice_desired; best_path/pick_relay/score now have a non-test caller; swash 0.2.8 gone, cargo deny all-ok). Fresh sweep otherwise CLEAN (zero todo!/unimplemented!, three lints clean, no new dead surface, latency-cache parse panic-safe). It surfaced **two real test-integrity bugs** the per-crate runs had masked, both fixed:
+
+- **AUD5-1 (stale insta snapshot):** EFF-24 (`e0a337b`) added 4 fields to `HealthReport` but committed only the `.snap.new` — the accepted `library_contracts__health_report_empty.snap` was never promoted, so `snapshot_health_report_shape` failed at workspace scope. Promoted the snapshot (verified the new shape matches `HealthReport::empty()`).
+- **AUD5-2 (audit-chain hash flake — latent, security-relevant):** `events::append_event` (EFF-25) and the original `worker::apply_repair_rows` computed each row's hash from `now_ms()` but stored `created_at` from a *separate* `Utc::now()` call. `load_audit_rows` reparses `created_at` → epoch-millis to recompute the chain hash, so a sub-millisecond drift between the two clock reads makes `audit::verify` spuriously report a `Break` (a false tamper alarm). Both now derive `created_at` from the single `now_ms` instant via `from_timestamp_millis`. Passed in isolation, failed under load — caught only by the workspace-scope run.
+
+**Cycle-5 status: CLEAN — CONVERGED.** Five consecutive same-day audit cycles; the last two found only second-order test-integrity issues, now resolved. Gates: full workspace test green, mackesd 9/9 targets green, three governance lints clean, cargo deny all-ok.

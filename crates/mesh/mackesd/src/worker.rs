@@ -520,8 +520,15 @@ pub fn apply_repair_rows(
             .unwrap_or_default();
         let mut prev_hash = decode_hex32(&prev_hash_hex).unwrap_or([0u8; 32]);
 
-        let now_iso = chrono::Utc::now().to_rfc3339();
+        // `now_iso` MUST encode exactly `now_ms_val`: load_audit_rows
+        // reparses created_at → epoch-millis to recompute the chain
+        // hash, so a separate Utc::now() here would drift from the
+        // now_ms_val baked into each row's hash and spuriously fail
+        // `audit::verify`. Derive both from one instant.
         let now_ms_val = now_ms();
+        let now_iso = chrono::DateTime::from_timestamp_millis(now_ms_val)
+            .unwrap_or_else(chrono::Utc::now)
+            .to_rfc3339();
         let mut emitted: Vec<Event> = Vec::with_capacity(rows.len());
         for (idx, row) in rows.iter().enumerate() {
             // Build the structured Event payload; serialize once for
