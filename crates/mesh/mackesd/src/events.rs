@@ -76,7 +76,7 @@ pub fn dispatch_alerts(event: &Event, hooks: &[AlertHook]) {
     let payload = match serde_json::to_vec(event) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("alert dispatch: failed to serialize event: {e}");
+            tracing::warn!(error = %e, "alert dispatch: failed to serialize event");
             return;
         }
     };
@@ -98,7 +98,7 @@ pub fn dispatch_alerts(event: &Event, hooks: &[AlertHook]) {
         let mut child = match spawn_result {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("alert dispatch: failed to spawn {bin}: {e}");
+                tracing::warn!(error = %e, bin = %bin, "alert dispatch: failed to spawn hook");
                 continue;
             }
         };

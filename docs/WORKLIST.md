@@ -56,7 +56,8 @@ Lifted from a 5-pass parallel fit-and-finish evaluation (reliability · security
 
 ### P3 — polish
 
-- [ ] **EFF-39 · OPS · `eprintln!` in daemon/library paths** (telemetry/mdns_relay/events/mde-musicd) bypass the logging plane → `tracing::warn!/error!` with fields. (CLI `println` is fine.)
+- [✓] **EFF-39 · OPS · `eprintln!` in daemon/library paths** (telemetry/mdns_relay/events/mde-musicd) bypass the logging plane → `tracing::warn!/error!` with fields. (CLI `println` is fine.) — DONE (mackesd scope): converted the 8 daemon/library `eprintln!` in `telemetry/mod.rs` (2), `workers/mdns_relay.rs` (4), `events.rs` (2) to `tracing::warn!/info!` with structured fields — these run under mackesd's initialized subscriber. Split: mde-musicd is a separate binary with NO `tracing` subscriber (and is dual CLI/daemon), so its conversion is **EFF-39b** below.
+- [ ] **EFF-39b · OPS · mde-musicd has no logging plane.** 18 `eprintln!` across `main.rs`/`engine.rs`/`mpris.rs`/`bus_responder.rs`; the binary inits no `tracing` subscriber. Add `tracing`+`tracing-subscriber` to it, init in `serve()` (the daemon path), and convert the daemon/library `eprintln!` (keep the CLI-subcommand `eprintln!`/`println!` as user output).
 - [ ] **EFF-40 · PKG · No CHANGELOG / release tags / `release` NEVRA field.** Add a Keep-a-Changelog, start tagging `magic-mesh-v<ver>`, add `release =` so asset-only bumps don't churn the workspace version.
 - [ ] **EFF-41 · PKG · Release skill stale** — says "no generate-rpm metadata / cut blocked" though it exists. Update `/release` to the live packaging + signing/publish steps.
 - [ ] **EFF-42 · PKG · RPM metadata gaps** — no `Obsoletes`/`Provides`; `nebula` not in stock Fedora (confirm the repo supplies it); consider `Recommends` vs hard `Requires` for ansible-core.

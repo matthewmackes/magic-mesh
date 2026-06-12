@@ -160,7 +160,7 @@ pub fn spawn_heartbeat_worker(
         while !shutdown.load(Ordering::Relaxed) {
             let hb = build_heartbeat(&node_id, None);
             if let Err(e) = write_heartbeat(&workgroup_root, &hb) {
-                eprintln!("heartbeat: write failed: {e}");
+                tracing::warn!(error = %e, "heartbeat: write failed");
             }
             // PEERVER-2 — refresh the peer-convergence record at most
             // once/min (own-row authority: we are the sole writer of
@@ -185,7 +185,7 @@ pub fn spawn_heartbeat_worker(
                 rec.descriptors = Some(descriptors);
                 match mackes_mesh_types::peers::write_peer_record(&peers_dir, &rec) {
                     Ok(_) => last_peer_write = Some(std::time::Instant::now()),
-                    Err(e) => eprintln!("peer-record: write failed: {e}"),
+                    Err(e) => tracing::warn!(error = %e, "peer-record: write failed"),
                 }
             }
             // Interruptible interval sleep.

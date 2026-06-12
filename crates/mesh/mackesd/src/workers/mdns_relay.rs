@@ -213,14 +213,14 @@ fn own_mesh_ip() -> Option<String> {
 /// gracefully when there's no mesh IP yet or no multicast-capable interface.
 fn run_relay_blocking(stop: &AtomicBool) {
     let Some(own_ip) = own_mesh_ip() else {
-        eprintln!("mdns_relay: no nebula1 mesh IP (pre-enrolment); relay idle");
+        tracing::info!("mdns_relay: no nebula1 mesh IP (pre-enrolment); relay idle");
         wait_until_stop(stop);
         return;
     };
     let daemon = match ServiceDaemon::new() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("mdns_relay: no mDNS daemon ({e}); relay idle");
+            tracing::warn!(error = %e, "mdns_relay: no mDNS daemon; relay idle");
             wait_until_stop(stop);
             return;
         }
@@ -231,7 +231,7 @@ fn run_relay_blocking(stop: &AtomicBool) {
     for bare in RELAYED_TYPES {
         match daemon.browse(&browse_type(bare)) {
             Ok(rx) => browsers.push((*bare, rx)),
-            Err(e) => eprintln!("mdns_relay: browse {bare} failed: {e}"),
+            Err(e) => tracing::warn!(error = %e, service_type = bare, "mdns_relay: browse failed"),
         }
     }
 
@@ -273,7 +273,7 @@ fn run_relay_blocking(stop: &AtomicBool) {
                     if registered.insert(service_key(&ann)) {
                         if let Some(info) = build_republish_info(&ann) {
                             if let Err(e) = daemon.register(info) {
-                                eprintln!("mdns_relay: republish {} failed: {e}", ann.service);
+                                tracing::warn!(error = %e, service = %ann.service, "mdns_relay: republish failed");
                             }
                         }
                     }
