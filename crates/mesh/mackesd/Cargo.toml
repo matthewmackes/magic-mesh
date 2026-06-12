@@ -318,6 +318,9 @@ assets = [
     { source = "target/release/mde-bus",            dest = "/usr/bin/mde-bus",            mode = "755" },
     { source = "target/release/mde-files",          dest = "/usr/bin/mde-files",          mode = "755" },
     { source = "target/release/mde-workbench",      dest = "/usr/bin/mde-workbench",      mode = "755" },
+    # PD-10 — the live-map layer-shell wallpaper. Auto-discovered bin target
+    # (mde-workbench src/bin/mde-mesh-wallpaper.rs); verified building
+    # 2026-06-12 (AUD2-7 cleared as a false positive).
     { source = "target/release/mde-mesh-wallpaper", dest = "/usr/bin/mde-mesh-wallpaper", mode = "755" },
     { source = "target/release/mde-voice-hud",      dest = "/usr/bin/mde-voice-hud",      mode = "755" },
     { source = "target/release/mde-music",          dest = "/usr/bin/mde-music",          mode = "755" },
@@ -335,10 +338,19 @@ assets = [
     { source = "packaging/autostart/*.desktop",    dest = "/etc/xdg/autostart/",           mode = "644" },
     # Brand: the MCNF hicolor icon set + the DISCLAIMER the gate checks.
     { source = "assets/icons/hicolor/**/*",        dest = "/usr/share/icons/hicolor/",     mode = "644" },
+    # AUD2-4 — the swappable brand pack (mde_theme::Brand's system layer;
+    # binaries fall back to the baked copies if absent).
+    { source = "assets/brand/baked/*",             dest = "/usr/share/mde/brand/",         mode = "644" },
     { source = "DISCLAIMER.md",                    dest = "/usr/share/magic-mesh/DISCLAIMER.md", mode = "644" },
     # EFF-13 — license + third-party notices ship with the package.
     { source = "LICENSE",                          dest = "/usr/share/licenses/magic-mesh/LICENSE", mode = "644" },
     { source = "NOTICE",                           dest = "/usr/share/licenses/magic-mesh/NOTICE",  mode = "644" },
+    # EFF-17 — the upgrade path: the dnf repo definition + the committed
+    # public signing key (Fedora convention location), so a one-shot
+    # `dnf install <url>` leaves a working `dnf upgrade` channel with
+    # gpgcheck on. Signing itself stays operator-gated at /release.
+    { source = "packaging/repo/magic-mesh.repo",         dest = "/etc/yum.repos.d/magic-mesh.repo",          mode = "644" },
+    { source = "packaging/repo/RPM-GPG-KEY-magic-mesh",  dest = "/etc/pki/rpm-gpg/RPM-GPG-KEY-magic-mesh",   mode = "644" },
     { source = "SUPPORT.md",                       dest = "/usr/share/magic-mesh/SUPPORT.md", mode = "644" },
     # ENT-12 — operator help docs; the Workbench Help panel + `mackesd
     # state-restore` reference these at /usr/share/mde/help/.

@@ -32,7 +32,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::{ShutdownToken, Worker};
-use crate::metrics::{write_textfile, Counter};
+use crate::metrics::{write_textfile, Counter, Histogram};
 
 /// Default tick cadence. 30 s matches the node_exporter default
 /// scrape interval — writing faster than the collector reads wastes
@@ -54,6 +54,12 @@ pub struct MetricsExporterWorker {
     /// threshold. `None` (or a missing `nebula-cert`) silently omits
     /// the cert series rather than alerting on an unknown.
     ca_cert_path: Option<PathBuf>,
+    /// AUD2-1 — shared handle to the router's `kdc2_router_decision_us`
+    /// histogram ([`crate::workers::mesh_router::RouterMetrics`]). Each
+    /// tick snapshots it (brief lock + clone) into the textfile's
+    /// histogram section, closing the observe-but-never-export seam.
+    /// `None` omits the series (tests / a daemon without the router).
+    router_decision_us: Option<std::sync::Arc<std::sync::Mutex<Histogram>>>,
     /// Override the tick cadence (default [`TICK_INTERVAL`]). Used by
     /// tests to drive the loop without 30 s waits.
     tick: Duration,
@@ -68,8 +74,20 @@ impl MetricsExporterWorker {
             db_path,
             textfile_dir,
             ca_cert_path,
+            router_decision_us: None,
             tick: TICK_INTERVAL,
         }
+    }
+
+    /// AUD2-1 — attach the router's shared decision-time histogram so
+    /// the per-tick snapshot exports it alongside the counters.
+    #[must_use]
+    pub fn with_router_metrics(
+        mut self,
+        metrics: std::sync::Arc<std::sync::Mutex<Histogram>>,
+    ) -> Self {
+        self.router_decision_us = Some(metrics);
+        self
     }
 
     /// Override the tick cadence — used by tests to avoid 30-second
@@ -96,11 +114,12 @@ impl Worker for MetricsExporterWorker {
                     let db = self.db_path.clone();
                     let dir = self.textfile_dir.clone();
                     let ca = self.ca_cert_path.clone();
+                    let hist = self.router_decision_us.clone();
                     // tick_once is sync (rusqlite + blocking file I/O +
                     // a nebula-cert subprocess) — hop onto a blocking
                     // task so it doesn't pin the tokio scheduler.
                     let _ = tokio::task::spawn_blocking(move || {
-                        tick_once(&db, &dir, ca.as_deref());
+                        tick_once(&db, &dir, ca.as_deref(), hist.as_deref());
                     })
                     .await;
                 }
@@ -121,6 +140,7 @@ pub fn tick_once(
     db_path: &std::path::Path,
     textfile_dir: &std::path::Path,
     ca_cert_path: Option<&std::path::Path>,
+    router_decision_us: Option<&std::sync::Mutex<Histogram>>,
 ) {
     let conn = match crate::store::open(db_path) {
         Ok(c) => c,
@@ -137,7 +157,18 @@ pub fn tick_once(
     if let Some(ca) = ca_cert_path {
         counters.extend(cert_counters(ca, now_unix()));
     }
-    match write_textfile(textfile_dir, &counters, &[]) {
+    // AUD2-1 — snapshot the router's decision-time histogram (brief
+    // lock + clone) so the SLO instrumentation actually reaches the
+    // scrape instead of being observed-and-dropped.
+    let histograms: Vec<Histogram> = router_decision_us
+        .map(|m| {
+            vec![m
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()]
+        })
+        .unwrap_or_default();
+    match write_textfile(textfile_dir, &counters, &histograms) {
         Ok(path) => tracing::debug!(path = %path.display(), "metrics-exporter: wrote snapshot"),
         Err(e) => tracing::warn!(
             error = %e,
@@ -301,10 +332,27 @@ mod tests {
             upsert_node(&conn, "peer:a", "a", "pk", None).expect("seed");
             crate::store::set_node_health(&conn, "peer:a", "healthy").expect("health");
         }
-        tick_once(&db, dir.path(), None);
+        tick_once(&db, dir.path(), None, None);
         let prom = std::fs::read_to_string(dir.path().join("mackesd.prom")).expect("prom written");
         assert!(prom.contains("# TYPE mackesd_mesh_nodes_total counter"));
         assert!(prom.contains("mackesd_mesh_nodes_total 1"));
         assert!(prom.contains("mackesd_mesh_nodes_healthy 1"));
+    }
+
+    #[test]
+    fn tick_once_exports_the_router_histogram_when_attached() {
+        // AUD2-1 — an attached router histogram lands in the textfile
+        // as a full Prometheus histogram series.
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = dir.path().join("mackesd.db");
+        let _ = crate::store::open(&db).expect("open file store");
+        let hist = std::sync::Mutex::new(crate::metrics::kdc2_router_decision_us());
+        hist.lock().unwrap().observe(250.0);
+        hist.lock().unwrap().observe(1_500.0);
+        tick_once(&db, dir.path(), None, Some(&hist));
+        let prom = std::fs::read_to_string(dir.path().join("mackesd.prom")).expect("prom written");
+        assert!(prom.contains("# TYPE kdc2_router_decision_us histogram"));
+        assert!(prom.contains("kdc2_router_decision_us_count 2"));
+        assert!(prom.contains(r#"kdc2_router_decision_us_bucket{le="+Inf"} 2"#));
     }
 }

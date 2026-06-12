@@ -14,7 +14,6 @@
 //! - [`typography`] — type-scale sizes + font-stack constants.
 //! - [`radii`] — corner-radius tokens.
 //! - [`shadows`] — elevation shadow specs.
-//! - [`elevation`] — per-tier radius + shadow bundles (Q29 + Q30).
 //! - [`Theme`] — Dark / Light enum.
 //! - [`Density`] — Compact / Comfortable / Spacious enum
 //!   (UX-15). UX-24 sub-lock: density scales spacing tokens only,
@@ -44,7 +43,10 @@ pub mod carbon;
 pub mod color;
 pub mod components;
 pub mod density;
-pub mod elevation;
+// AUD2-3 (2026-06-12): `elevation` removed — the Q29/Q30 per-tier
+// radius+shadow bundles targeted the deleted shell's OSD/greeter/menu
+// surfaces, which Cosmic owns post-E11; zero workspace callers. The
+// shadow specs live on in `shadows` (consumed via `Theme::modal_shadow`).
 pub mod hero;
 pub mod icons;
 pub mod motion;
@@ -70,7 +72,6 @@ pub use components::{
     CARD_SHADOW_PRESSED_BLUR, CARD_SHADOW_PRESSED_OFFSET_Y, CARD_SUBTITLE_SIZE, CARD_TITLE_SIZE,
 };
 pub use density::Density;
-pub use elevation::Elevation;
 pub use icons::{
     icon_for_device_type, mde_icon, FillMode, Icon, IconSize, IconState, ResolvedIcon,
     MATERIAL_LINE_WEIGHT_PX,

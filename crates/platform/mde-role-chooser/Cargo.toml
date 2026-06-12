@@ -10,6 +10,10 @@ path = "src/main.rs"
 
 [dependencies]
 mde-role = { path = "../mde-role" }
+# AUD2-4 — the Brand asset loader: the chooser header renders the Magic Mesh
+# wordmark via mde_theme::Brand (baked SVG fallback, /usr/share/mde/brand
+# system layer, $MDE_BRAND_DIR override).
+mde-theme = { path = "../../shared/mde-theme" }
 
 # AUD-6 — the libcosmic windowed app (same rev the GUI-6 applet + the GUI-7
 # mde-files port pin). winit/wgpu for a real window; tokio for the executor.

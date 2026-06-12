@@ -136,17 +136,12 @@ pub const INBOX_PREFIX: &str = "files-inbox";
 /// Verbs served on `action/files-inbox/<verb>`.
 pub const INBOX_VERBS: [&str; 2] = ["list", "mark-opened"];
 
-/// Reply builder for the inbox surface. `list` is the honest empty
-/// state (mesh inbox is the `send_to` destination; AF-5 wires the
-/// producer); `mark-opened` has nothing to mark yet.
-#[must_use]
-pub fn inbox_reply(verb: &str, _body: Option<&str>) -> String {
-    match verb {
-        "list" => "[]".to_string(),
-        "mark-opened" => err("no inbox entries to mark — AF-5 wires the producer side"),
-        other => err(format!("unknown inbox verb: {other}")),
-    }
-}
+// AUD2-2 (2026-06-12) — the pre-FileXfer "honest empty" free reply
+// builders for inbox/outbox/file-ops were removed: the daemon always
+// constructs `FileXfer` and serves its methods, so the free fns were
+// dead code that could silently drift from the live responders. Only
+// `downloads_reply` (below) remains a free fn — it is still the wired
+// production responder for the downloads surface.
 
 // ---- Outbox — action/files-outbox/<verb> --------------------------
 
@@ -154,17 +149,6 @@ pub fn inbox_reply(verb: &str, _body: Option<&str>) -> String {
 pub const OUTBOX_PREFIX: &str = "files-outbox";
 /// Verbs served on `action/files-outbox/<verb>`.
 pub const OUTBOX_VERBS: [&str; 2] = ["list", "cancel"];
-
-/// Reply builder for the outbox surface. `list` is honest empty;
-/// `cancel` (body = op id) has no in-flight upload to cancel yet.
-#[must_use]
-pub fn outbox_reply(verb: &str, _body: Option<&str>) -> String {
-    match verb {
-        "list" => "[]".to_string(),
-        "cancel" => err("no in-flight uploads to cancel — AF-5 wires the producer side"),
-        other => err(format!("unknown outbox verb: {other}")),
-    }
-}
 
 // ---- Downloads — action/files-downloads/<verb> --------------------
 
@@ -191,23 +175,6 @@ pub fn downloads_reply(verb: &str, _body: Option<&str>) -> String {
 pub const FILE_OPS_PREFIX: &str = "file-ops";
 /// Verbs served on `action/file-ops/<verb>`.
 pub const FILE_OPS_VERBS: [&str; 3] = ["send-to", "rollback", "audit-log"];
-
-/// User-facing message when the operator tries a mesh send but no
-/// transport is wired. A future epic dispatches `send-to` through the
-/// `orchestrator` Send-To engine.
-const SEND_TO_NOT_CONFIGURED: &str =
-    "mesh send not configured — no transport (rsync / scp / qnm-share) is wired yet";
-
-/// Reply builder for the file-operations surface when no transport is
-/// available (no QNM-Shared root) — kept for the degraded path.
-#[must_use]
-pub fn file_ops_reply(verb: &str, _body: Option<&str>) -> String {
-    match verb {
-        "send-to" | "rollback" => err(SEND_TO_NOT_CONFIGURED),
-        "audit-log" => "[]".to_string(),
-        other => err(format!("unknown file-ops verb: {other}")),
-    }
-}
 
 // ---- FileXfer — the real cross-mesh file transport (AUD-1 / AUD-7) ----
 //
@@ -703,44 +670,22 @@ mod tests {
         assert_eq!(FLEET_FILES_VERBS, ["peers", "self-node", "list-peer"]);
     }
 
-    // The four stub surfaces keep their honest empty /
-    // transport-not-configured shape — a regression to a "Phase G"
-    // jargon leak is caught here.
-    #[test]
-    fn inbox_list_is_honest_empty() {
-        assert_eq!(inbox_reply("list", None), "[]");
-    }
-
-    #[test]
-    fn outbox_list_is_honest_empty() {
-        assert_eq!(outbox_reply("list", None), "[]");
-    }
-
+    // AUD2-2 — the pre-FileXfer free reply builders were removed; the
+    // honest-empty / unknown-verb contracts now live on the FileXfer
+    // methods (covered below + here for downloads, the one remaining
+    // free responder).
     #[test]
     fn downloads_list_is_honest_empty() {
         assert_eq!(downloads_reply("list", None), "[]");
     }
 
     #[test]
-    fn file_ops_send_to_returns_transport_not_configured() {
-        let msg = file_ops_reply("send-to", Some(r#"{"sources":[]}"#));
-        assert!(
-            msg.contains("transport") && msg.contains("not configured"),
-            "expected human-readable 'transport not configured' message, got: {msg}"
-        );
-        // Negative: must not leak the old "Phase G" jargon.
-        assert!(!msg.contains("Phase G"), "Phase G jargon leaked: {msg}");
-    }
-
-    #[test]
-    fn file_ops_audit_log_is_honest_empty() {
-        assert_eq!(file_ops_reply("audit-log", Some("100")), "[]");
-    }
-
-    #[test]
     fn unknown_verb_yields_error_envelope() {
-        assert!(inbox_reply("bogus", None).contains("unknown inbox verb"));
-        assert!(file_ops_reply("bogus", None).contains("unknown file-ops verb"));
+        let tmp = tempfile::tempdir().unwrap();
+        let x = FileXfer::new(tmp.path().to_path_buf(), "pine".to_string());
+        assert!(x.inbox_reply("bogus", None).contains("unknown"));
+        assert!(x.file_ops_reply("bogus", None).contains("unknown"));
+        assert!(downloads_reply("bogus", None).contains("unknown downloads verb"));
     }
 
     // ---- FileXfer: the real QNM-Shared transport (AUD-1/AUD-7) --------

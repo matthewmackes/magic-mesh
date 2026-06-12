@@ -17,12 +17,17 @@ before anything leaves the machine. Push to a **single** remote `origin`, branch
 dual-remote. The rulebook is the root `AI_GOVERNANCE.md` (no `CLAUDE.md` in this
 repo).
 
-> **Packaging is not yet wired.** There is no RPM spec and no
-> `[package.metadata.generate-rpm]` in any `Cargo.toml` today. The intended target
-> (`AI_GOVERNANCE.md` §5) is **ONE RPM with an install-time deployment-role chooser**
-> — Lighthouse ⊂ Server ⊂ Workstation, each a strict superset — plus a signed COPR
-> and a Magic-on-Cosmic ISO. Until the spec/metadata land, a real cut is blocked;
-> the build steps below describe the target mechanism, not something runnable today.
+> **Packaging IS wired (EFF-41 update, 2026-06-12).** The
+> `[package.metadata.generate-rpm]` block lives in `crates/mesh/mackesd/Cargo.toml`
+> — ONE `magic-mesh` RPM (`AI_GOVERNANCE.md` §5) whose assets bundle every workspace
+> binary (incl. the auto-discovered `mde-mesh-wallpaper`), the systemd units,
+> `.desktop` launchers/autostarts (role-chooser first-run, cosmic-applet), icons,
+> DISCLAIMER/LICENSE/NOTICE/SUPPORT, and `docs/help/`. Scriptlets (post_install /
+> pre_uninstall / post_uninstall) are in the same block. The role split stays
+> install-time (Lighthouse ⊂ Server ⊂ Workstation via `mackesd role pin` + the
+> first-run chooser GUI). **Still operator-gated/open:** RPM GPG signing (the
+> committed `RPM-GPG-KEY-magic-mesh` — EFF-17), the signed COPR, and the
+> Magic-on-Cosmic ISO.
 
 > **The package is HELD.** Per §5/§7, it does not cut until **every feature is
 > §7-complete** (runtime-reachable, no stubs). If the operator asks for a cut before
@@ -49,18 +54,21 @@ repo).
 ## Steps
 
 1. **Version — single-sourced, no per-crate bump.** The version is
-   `[workspace.package] version = "10.0.0"` at the **repo-root `Cargo.toml`** (one
-   version, all 20 crates inherit via `version.workspace = true`). Do NOT edit a
+   `[workspace.package] version` at the **repo-root `Cargo.toml`** (one version,
+   all 22 crates inherit via `version.workspace = true`). Do NOT edit a
    per-crate `version` — they inherit. Bump the workspace version on shipped
-   changes; if/when packaging metadata exists, bump only the packaging `release`
-   field for asset-only changes so `dnf upgrade` sees a newer NEVRA.
+   changes; for asset-only changes bump only a packaging `release` field (add it
+   to the generate-rpm block if absent — EFF-40) so `dnf upgrade` sees a newer
+   NEVRA.
 2. **Update** release notes if present.
-3. **Stage assets** (once the packaging layout is defined): bundle only what §5/the
-   locked asset decision permits; verify any `NOTICE.md` / license coverage before a
-   public RPM. *No asset-staging script exists in the repo yet.*
-4. **Build** (target mechanism, once metadata lands): `cargo generate-rpm` is the
-   intended mechanism — never raw `rpmbuild`. The layout is **ONE spec** with an
-   install-time deployment-role chooser (Lighthouse ⊂ Server ⊂ Workstation).
+3. **Stage assets:** the asset list IS the `[package.metadata.generate-rpm]`
+   `assets` array in `crates/mesh/mackesd/Cargo.toml` — verify every `source`
+   path exists after the release build (`cargo build --workspace --release`)
+   and that LICENSE/NOTICE coverage is current before a public RPM.
+4. **Build:** `cargo build --workspace --release` then
+   `cargo generate-rpm -p crates/mesh/mackesd` — never raw `rpmbuild`. ONE
+   `magic-mesh` RPM; role selection happens at install/first-run, not via
+   per-role packages.
 5. **Smoke test:** install in a throwaway env and confirm the role chooser deploys
    the right workers/surfaces for each role.
 6. **Commit** the version bump (named pathspecs, `Co-Authored-By` trailer).
@@ -70,9 +78,11 @@ repo).
 ## Failure modes
 
 `cargo generate-rpm` missing → `cargo install cargo-generate-rpm`. Empty/missing
-`DISCLAIMER.md` → the build is gated; do not proceed. No RPM spec / packaging
-metadata present → packaging is not yet wired; a real cut is blocked until it lands
-(flag it, don't fabricate a build).
+`DISCLAIMER.md` → the build is gated; do not proceed. A generate-rpm asset whose
+`source` is missing after the release build → fix the asset list or the bin
+target before cutting (don't fabricate a build). GPG signing without the
+committed key (EFF-17) → the unsigned-RPM cut may proceed only as an explicitly
+scoped "cut for testing"; a public release stays blocked on the key.
 
 > The live skill set is exactly five: plan, ship, release, audit, preview.
 > `release` is operator-gated and is never auto-triggered from a `/ship` run.

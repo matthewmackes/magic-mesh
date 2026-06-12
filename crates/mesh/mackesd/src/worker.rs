@@ -271,7 +271,20 @@ pub fn tick(workgroup_root: &Path, node_id: &str, db_path: &Path) -> Result<Tick
     // Emit one ConfigChange-or-Reconcile event per repair-now row +
     // log every inbox row. Audit hash chain is per-row so an audit
     // verify walks back through them cleanly (12.6.3 / 12.10.3).
-    apply_repair_rows(&mut conn, node_id, &plan.repair_now)?;
+    let emitted = apply_repair_rows(&mut conn, node_id, &plan.repair_now)?;
+    // EFF-25 — fire the 12.6.4 alert hooks for the committed events.
+    // Hooks come from /etc/mackesd/mackesd.toml `[[alert_hooks]]`
+    // (fail-open load, default empty → no-op). Dispatch is post-commit
+    // so a rolled-back event can never alert, and best-effort by
+    // design (spawn failures warn + continue).
+    if !emitted.is_empty() {
+        let hooks = crate::config::daemon::load().alert_hooks();
+        if !hooks.is_empty() {
+            for event in &emitted {
+                crate::events::dispatch_alerts(event, &hooks);
+            }
+        }
+    }
     surface_inbox_rows(node_id, &plan.inbox);
 
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -471,22 +484,29 @@ fn materialize_voice_desired_for_tick(
 
 /// Emit one audit-log event per `repair_now` row and write a
 /// `tracing::info` line describing the intended repair action.
+/// Returns the emitted [`Event`]s so the caller can fire the 12.6.4
+/// alert hooks AFTER the transaction commits (EFF-25 — alerts must
+/// never fire for a rolled-back event).
 ///
-/// Actual repair execution (pushing routes via Tailscale, restarting
-/// peer services) is gated on the connectivity layer (12.14+) per the
-/// Phase 12.5 lock — this is an explicit, documented scope boundary,
-/// not a stub. The audit event records that the reconciler *would
-/// have* repaired the drift; the connectivity layer wires the
-/// take-action step when it ships.
+/// Actual repair execution (pushing routes over the Nebula overlay,
+/// restarting peer services) is gated on the connectivity layer
+/// (12.14+) per the Phase 12.5 lock — this is an explicit, documented
+/// scope boundary, not a stub. The audit event records that the
+/// reconciler *would have* repaired the drift; the connectivity layer
+/// wires the take-action step when it ships.
 ///
 /// # Errors
 ///
 /// Returns an error only when the SQL `INSERT INTO events` fails
 /// (e.g. WAL contention beyond the busy timeout). FS / serde errors
 /// are logged and the loop continues.
-pub fn apply_repair_rows(conn: &mut Connection, node_id: &str, rows: &[DriftRow]) -> Result<()> {
+pub fn apply_repair_rows(
+    conn: &mut Connection,
+    node_id: &str,
+    rows: &[DriftRow],
+) -> Result<Vec<Event>> {
     if rows.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     crate::store::with_transaction(conn, |tx| {
         // Bootstrap: load the most recent event's hash to chain
@@ -502,6 +522,7 @@ pub fn apply_repair_rows(conn: &mut Connection, node_id: &str, rows: &[DriftRow]
 
         let now_iso = chrono::Utc::now().to_rfc3339();
         let now_ms_val = now_ms();
+        let mut emitted: Vec<Event> = Vec::with_capacity(rows.len());
         for (idx, row) in rows.iter().enumerate() {
             // Build the structured Event payload; serialize once for
             // both the audit chain and the JSON column.
@@ -550,8 +571,9 @@ pub fn apply_repair_rows(conn: &mut Connection, node_id: &str, rows: &[DriftRow]
             );
 
             prev_hash = hash;
+            emitted.push(event);
         }
-        Ok(())
+        Ok(emitted)
     })
 }
 

@@ -20,7 +20,7 @@ shipped as Cosmic apps + applets with a strict IBM-Carbon identity.
 
 | Group | Crates | Role |
 |---|---|---|
-| `platform` | `mde-bus`, `mde-role` | the internal pub/sub backbone + deployment-role gating |
+| `platform` | `mde-bus`, `mde-role`, `mde-cosmic-applet`, `mde-role-chooser` | the internal pub/sub backbone, deployment-role gating, the cosmic-panel mesh-health applet, and the first-run role-chooser GUI |
 | `mesh` | `mackesd`, `mackes-{config,mesh-types,nebula-https-tunnel,transport}`, `magic-fleet` | the supervised control-plane daemon, Nebula overlay, transport/types/config, and the **Automation Mesh** node engine |
 | `services` | `mde-files`, `mde-voice-{hud,config}`, `mde-music`, `mde-musicd` | the file manager, voice/SIP HUD + config, music player + daemon |
 | `workbench` | `mde-workbench` | the Cosmic **control surface** (fleet, devices, maintain, mesh health) |

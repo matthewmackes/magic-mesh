@@ -10,19 +10,29 @@
 //! needed here.
 
 use cosmic::app::{Core, Settings, Task};
+use cosmic::iced::widget::svg;
 use cosmic::iced::window::Id;
 use cosmic::iced::Length;
 use cosmic::widget;
 use cosmic::{Application, Element};
 
 use mde_role::Role;
+use mde_theme::{Brand, BrandSlot};
 
 const APP_ID: &str = "com.mackes.MagicMeshRoleChooser";
+
+/// Wordmark display width. 4:1 aspect (per the BrandSlot contract), so
+/// this renders ~50 px tall above the title.
+const WORDMARK_WIDTH: f32 = 200.0;
 
 struct RoleChooser {
     core: Core,
     /// Inline status line (e.g. a role-pin failure). Empty on launch.
     status: String,
+    /// AUD2-4 — Magic Mesh wordmark bytes, resolved once at init via
+    /// the [`Brand`] loader ($MDE_BRAND_DIR → /usr/share/mde/brand →
+    /// baked fallback; the baked SVG guarantees this is never empty).
+    wordmark: svg::Handle,
 }
 
 #[derive(Clone, Debug)]
@@ -84,6 +94,7 @@ impl Application for RoleChooser {
             RoleChooser {
                 core,
                 status: String::new(),
+                wordmark: svg::Handle::from_memory(Brand::new().bytes(BrandSlot::Wordmark)),
             },
             Task::none(),
         )
@@ -105,6 +116,11 @@ impl Application for RoleChooser {
     fn view(&self) -> Element<'_, Message> {
         let mut col = widget::Column::new()
             .spacing(16)
+            // AUD2-4 — brand header: the wordmark resolved through the
+            // Brand loader (system layer / env override / baked SVG).
+            .push(
+                svg::Svg::new(self.wordmark.clone()).width(Length::Fixed(WORDMARK_WIDTH)),
+            )
             .push(widget::text::title2("Choose this machine's role"))
             .push(widget::text::body(
                 "Magic Mesh pins one deployment role per machine at install. You \

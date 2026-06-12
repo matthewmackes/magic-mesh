@@ -56,6 +56,31 @@ pub struct MackesdConfig {
     /// Mesh-latency-worker sweep cadence, in seconds. Default
     /// [`DEFAULT_MESH_LATENCY_SWEEP_SECS`].
     pub mesh_latency_sweep_secs: u64,
+    /// EFF-25 — 12.6.4 alert hooks. Each entry fires a shell command
+    /// with the event JSON on stdin when a matching audit event lands:
+    ///
+    /// ```toml
+    /// [[alert_hooks]]
+    /// kind = "reconcile"            # omit to fire on every kind
+    /// command = ["/usr/local/bin/notify-ops", "--channel", "mesh"]
+    /// ```
+    ///
+    /// No webhooks by design — operators wire `curl` themselves.
+    /// Default: empty (no hooks fire).
+    pub alert_hooks: Vec<AlertHookEntry>,
+}
+
+/// One configured 12.6.4 alert hook (the TOML shape of
+/// [`crate::events::AlertHook`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AlertHookEntry {
+    /// Event kind to match (snake_case, e.g. `"reconcile"`,
+    /// `"config_change"`, `"auth"`, `"lifecycle"`, `"admin_action"`).
+    /// `None`/omitted fires on every kind.
+    pub kind: Option<String>,
+    /// Executable + args to spawn. Empty commands are skipped.
+    pub command: Vec<String>,
 }
 
 impl Default for MackesdConfig {
@@ -65,6 +90,7 @@ impl Default for MackesdConfig {
             // 12.3.3 lock lives on the telemetry const, not duplicated.
             heartbeat_interval_secs: crate::telemetry::HEARTBEAT_INTERVAL_S,
             mesh_latency_sweep_secs: DEFAULT_MESH_LATENCY_SWEEP_SECS,
+            alert_hooks: Vec::new(),
         }
     }
 }
@@ -86,6 +112,42 @@ impl MackesdConfig {
     #[must_use]
     pub fn mesh_latency_sweep(&self) -> Duration {
         Duration::from_secs(self.mesh_latency_sweep_secs.max(Self::MIN_INTERVAL_SECS))
+    }
+
+    /// EFF-25 — resolve the configured [`AlertHookEntry`]s into the
+    /// [`crate::events::AlertHook`]s `dispatch_alerts` consumes. An
+    /// unrecognized `kind` string drops that hook with a warn (never
+    /// silently widen a typo'd kind to fire-on-everything); an empty
+    /// `command` is skipped.
+    #[must_use]
+    pub fn alert_hooks(&self) -> Vec<crate::events::AlertHook> {
+        self.alert_hooks
+            .iter()
+            .filter(|e| !e.command.is_empty())
+            .filter_map(|e| {
+                let for_kind = match &e.kind {
+                    None => None,
+                    Some(s) => {
+                        match serde_json::from_value::<crate::events::EventKind>(
+                            serde_json::Value::String(s.clone()),
+                        ) {
+                            Ok(k) => Some(k),
+                            Err(_) => {
+                                tracing::warn!(
+                                    kind = %s,
+                                    "alert_hooks: unknown event kind; hook dropped",
+                                );
+                                return None;
+                            }
+                        }
+                    }
+                };
+                Some(crate::events::AlertHook {
+                    for_kind,
+                    command: e.command.clone(),
+                })
+            })
+            .collect()
     }
 }
 
@@ -209,6 +271,7 @@ some_future_knob = "ignored"
         let cfg = MackesdConfig {
             heartbeat_interval_secs: 0,
             mesh_latency_sweep_secs: 0,
+            ..MackesdConfig::default()
         };
         assert_eq!(
             cfg.heartbeat_interval(),
@@ -236,6 +299,39 @@ some_future_knob = "ignored"
     }
 
     #[test]
+    fn alert_hooks_parse_and_resolve() {
+        // EFF-25 — [[alert_hooks]] TOML → events::AlertHook, with kind
+        // matching, typo'd-kind drop, and empty-command skip.
+        let cfg = parse(
+            "[[alert_hooks]]\n\
+             kind = \"reconcile\"\n\
+             command = [\"/usr/bin/notify-ops\", \"--mesh\"]\n\
+             [[alert_hooks]]\n\
+             command = [\"/usr/bin/log-all\"]\n\
+             [[alert_hooks]]\n\
+             kind = \"not_a_kind\"\n\
+             command = [\"/usr/bin/never\"]\n\
+             [[alert_hooks]]\n\
+             kind = \"auth\"\n\
+             command = []\n",
+        )
+        .expect("parses");
+        assert_eq!(cfg.alert_hooks.len(), 4);
+        let hooks = cfg.alert_hooks();
+        // typo'd kind dropped (never widened to fire-on-everything),
+        // empty command skipped.
+        assert_eq!(hooks.len(), 2);
+        assert_eq!(hooks[0].for_kind, Some(crate::events::EventKind::Reconcile));
+        assert_eq!(hooks[0].command, vec!["/usr/bin/notify-ops", "--mesh"]);
+        assert_eq!(hooks[1].for_kind, None, "omitted kind fires on every event");
+    }
+
+    #[test]
+    fn alert_hooks_default_empty_keeps_dispatch_a_noop() {
+        assert!(MackesdConfig::default().alert_hooks().is_empty());
+    }
+
+    #[test]
     fn load_well_formed_file_round_trips_off_disk() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("mackesd.toml");
@@ -254,6 +350,7 @@ some_future_knob = "ignored"
         let cfg = MackesdConfig {
             heartbeat_interval_secs: 20,
             mesh_latency_sweep_secs: 90,
+            ..MackesdConfig::default()
         };
         let body = toml::to_string(&cfg).unwrap();
         assert_eq!(parse(&body).unwrap(), cfg);

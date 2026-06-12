@@ -1,5 +1,6 @@
-//! KDC2-2 crypto trait surface — RSA-2048 pairing handshake +
-//! AES-256-GCM session.
+//! KDC2-2 crypto trait surface — RSA pairing handshake (own keys
+//! 4096-bit; verify accepts 2048–8192 for stock KDE Connect interop)
+//! + AES-256-GCM session.
 //!
 //! Implementations land in KDC2-2.4. This file ships the **trait
 //! shapes only** so the wire / discovery / plugins modules can
@@ -206,23 +207,32 @@ impl KeyStore for RingKeyStore {
 }
 
 // ────────────────────────────────────────────────────────────────
-// KDC2-2.4b — RSA-2048 pairing handshake helpers
+// KDC2-2.4b — RSA pairing handshake helpers
 // ────────────────────────────────────────────────────────────────
 //
 // The KDE Connect pairing handshake is a sign-and-verify dance:
-// each peer signs a challenge with its RSA-2048 private key and
-// the other peer verifies against a previously-exchanged public
-// key. Upstream uses RSA-PKCS1-v1_5 with SHA-256 (NOT RSA-PSS).
-// We match upstream for stock-client interop.
+// each peer signs a challenge with its RSA private key and the
+// other peer verifies against a previously-exchanged public key.
+// Upstream uses RSA-PKCS1-v1_5 with SHA-256 (NOT RSA-PSS). We
+// match upstream for stock-client interop.
+//
+// Key sizes (§3, AUD2-5): OUR OWN keypairs are always 4096-bit —
+// generated via `mde-kdc-host::keygen` (`RSA_MODULUS_BITS = 4096`,
+// the pinned crypto floor). The VERIFY side uses ring's
+// `RSA_PKCS1_2048_8192_SHA256`, a *range* constant accepting peer
+// keys from 2048 to 8192 bits, because stock KDE Connect clients
+// (Android/desktop) still present 2048-bit keys and refusing them
+// would break pairing with unmodified upstream devices. 2048 here
+// is interop acceptance of a foreign key, never our own key size.
 //
 // These helpers are PURE — they take key material + a message and
-// return signatures / verification results. Key generation lives
-// here too (one helper). All persistence (writing the keypair to
-// disk, loading it on next boot) lives in mde-kdc::pairing — not
-// in this crate.
+// return signatures / verification results. All persistence
+// (writing the keypair to disk, loading it on next boot) lives in
+// mde-kdc::pairing — not in this crate.
 
-/// RSA-2048 keypair holder. Wraps ring's `RsaKeyPair` with the
-/// raw DER-encoded private key bytes the host needs to persist.
+/// RSA keypair holder (own keys: 4096-bit, see module note). Wraps
+/// ring's `RsaKeyPair` with the raw DER-encoded private key bytes
+/// the host needs to persist.
 pub struct PairingKeyPair {
     key_pair: RsaKeyPair,
     der_bytes: Vec<u8>,
@@ -285,7 +295,7 @@ impl Drop for PairingKeyPair {
 }
 
 // NOTE on RSA keypair generation: ring 0.17.x does NOT expose a
-// stable public API for generating fresh RSA-2048 keypairs. We
+// stable public API for generating fresh RSA keypairs. We
 // intentionally do not ship a `generate_pairing_keypair()` stub
 // here — it would only return an error in production, which is
 // worse than not existing at all (the host crate must visibly

@@ -57,9 +57,12 @@ the dead surface). Don't fix unless asked — report first.
    install-time deployment-role chooser, Lighthouse ⊂ Server ⊂ Workstation, plus a
    signed COPR and a Magic-on-Cosmic ISO), flag assets/symbols the package ships
    but nothing uses. Confirm the `DISCLAIMER.md` pre-flight gate exists + is
-   non-empty. **Note:** no RPM spec / `generate-rpm` metadata exists in the repo
-   yet, so treat packaging as not-yet-implemented — flag the gap, don't treat a
-   missing RPM as a defect.
+   non-empty. **Note:** packaging IS wired — `[package.metadata.generate-rpm]`
+   lives in `crates/mesh/mackesd/Cargo.toml` (one `magic-mesh` RPM; assets =
+   every workspace binary + `packaging/` units/launchers + docs). Audit asset
+   source paths for existence and binaries against real bin targets (explicit
+   `[[bin]]` OR auto-discovered `src/bin/*.rs`). The GPG key + COPR + ISO
+   remain operator-gated.
 
 ## Safeguards (avoid false positives)
 
@@ -67,10 +70,14 @@ Framework lifecycle callbacks (`iced` `update`/`view`/`subscription`, `Default`,
 `Drop`, serde derives), `#[test]`/`#[cfg(test)]` helpers, and declaratively-wired
 handlers are **reachable** even with no direct textual caller — don't flag them.
 Confirm a "dead" symbol with `rg` across the whole workspace before the verdict.
-All 20 crates are workspace members (none are excluded from the build), so a symbol
+All 22 crates are workspace members (none are excluded from the build), so a symbol
 is not dead merely because a sibling crate is the only caller — check the whole
-graph. `mackesd` is a **library** crate (no `main.rs`); its workers are reached
-through the crates that consume it, not a standalone binary.
+graph. `mackesd` is a **lib + bins** crate: the daemon binary lives at
+`src/bin/mackesd.rs` (plus `meshctl`); workers are spawned from its `run_serve`.
+**Cargo auto-discovers `src/bin/*.rs` as bin targets** — a binary is NOT missing
+merely because no explicit `[[bin]]` block names it (AUD2-7 false-positive
+lesson, 2026-06-12); confirm with `cargo build -p <crate> --bin <name>` before
+flagging a packaging asset as unbuildable.
 
 ## Output
 

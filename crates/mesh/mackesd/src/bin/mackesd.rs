@@ -4957,18 +4957,28 @@ fn run_serve(
             ));
             worker_names.lock().expect("worker_names mutex").push("health_reconciler".into());
         }
+        // AUD2-1 — the shared `kdc2_router_decision_us` histogram: the
+        // mesh_router observes its per-tick decision time into it, and
+        // the metrics_exporter snapshots it into mackesd.prom — without
+        // this shared handle the SLO instrumentation was observed (or,
+        // before 2026-06-12, not even attached) and never exported.
+        let router_metrics: mackesd_core::workers::mesh_router::RouterMetrics = Arc::new(
+            std::sync::Mutex::new(mackesd_core::metrics::kdc2_router_decision_us()),
+        );
         // EFF-9 — Prometheus textfile exporter. Lighthouse-tier (the
         // observability surface lives on the control plane). Snapshots
         // mesh node-health buckets + audit-chain status + migration
-        // count into <textfile_collector>/mackesd.prom every 30 s; a
-        // node_exporter textfile collector scrapes it.
+        // count + the router decision histogram into
+        // <textfile_collector>/mackesd.prom every 30 s; a node_exporter
+        // textfile collector scrapes it.
         if mackesd_core::worker_role::runs("metrics_exporter", role_rank) {
             sup.spawn(Spawn::new(
                 mackesd_core::workers::metrics_exporter::MetricsExporterWorker::new(
                     db_path.clone(),
                     mackesd_core::metrics::default_textfile_dir(),
                     Some(mackesd_core::workers::cert_authority::default_ca_cert_path()),
-                ),
+                )
+                .with_router_metrics(Arc::clone(&router_metrics)),
                 RestartPolicy::OnFailure,
             ));
             worker_names.lock().expect("worker_names mutex").push("metrics_exporter".into());
@@ -5158,7 +5168,10 @@ fn run_serve(
         let router_registry: mackesd_core::workers::mesh_router::TransportRegistry =
             Arc::new(vec![https443]);
         sup.spawn(Spawn::new(
-            MeshRouterWorker::new(Arc::clone(&router_state), router_registry),
+            // AUD2-1 — attach the shared decision-time histogram so the
+            // router's per-tick observe() lands in the exporter's scrape.
+            MeshRouterWorker::new(Arc::clone(&router_state), router_registry)
+                .with_metrics(Arc::clone(&router_metrics)),
             RestartPolicy::OnFailure,
         ));
         worker_names.lock().expect("worker_names mutex").push("mesh_router".into());
