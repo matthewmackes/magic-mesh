@@ -97,6 +97,8 @@ pub enum Message {
     /// only — don't change the view" (the 1.x taskbar
     /// click-through contract).
     FocusRequest(String),
+    /// AUD-5 — operator accepted the DISCLAIMER pre-flight gate.
+    AcceptDisclaimer,
     /// AUD-3 — Connected Devices (KDC hub) panel sub-message.
     Connect(connect_panel::Message),
     /// CB-1.6 — Look & Feel themes panel sub-message.
@@ -339,6 +341,9 @@ pub struct App {
     fleet_settings: fleet_settings_panel::FleetSettingsPanel,
     fleet_revisions: fleet_revisions_panel::FleetRevisionsPanel,
     wallpaper: wallpaper_panel::WallpaperPanel,
+    /// AUD-5 — whether the operator has accepted the current DISCLAIMER. Until
+    /// `true`, `view()` shows the blocking accept gate instead of the app.
+    disclaimer_accepted: bool,
 }
 
 impl std::fmt::Debug for App {
@@ -456,6 +461,8 @@ impl App {
             fleet_settings: fleet_settings_panel::FleetSettingsPanel::new(),
             fleet_revisions: fleet_revisions_panel::FleetRevisionsPanel::new(),
             wallpaper: wallpaper_panel::WallpaperPanel::new(),
+            // AUD-5 — the runtime DISCLAIMER pre-flight accept gate (§5).
+            disclaimer_accepted: mde_disclaimer::is_accepted(),
         }
     }
 
@@ -840,6 +847,16 @@ impl App {
                 Task::none()
             }
             Message::FocusRequest(slug) => self.apply_focus_request(&slug),
+            Message::AcceptDisclaimer => {
+                // AUD-5 — record consent (keyed to the disclaimer fingerprint),
+                // then drop the gate. A write failure still lets the operator in
+                // (they accepted); they'll just be re-prompted next launch.
+                if let Err(e) = mde_disclaimer::record_acceptance() {
+                    tracing::warn!(error = %e, "could not persist disclaimer acceptance");
+                }
+                self.disclaimer_accepted = true;
+                Task::none()
+            }
             Message::Connect(msg) => self.connect.update(msg),
             Message::Themes(msg) => self.themes.update(msg),
             Message::Fonts(msg) => self.fonts.update(msg, self.backend()),
@@ -1143,7 +1160,43 @@ impl App {
         }
     }
 
+    /// AUD-5 — the blocking DISCLAIMER accept screen shown until the operator
+    /// consents (§5 pre-flight gate). Renders the canonical `mde_disclaimer`
+    /// text with a single "I understand and accept" action.
+    fn disclaimer_gate_view(&self) -> Element<'_, Message> {
+        let palette = crate::live_theme::palette();
+        let (title, body) = mde_disclaimer::split();
+        let accept = crate::controls::variant_button(
+            "I understand and accept",
+            crate::controls::ButtonVariant::Primary,
+            Some(Message::AcceptDisclaimer),
+            palette,
+        );
+        let content = column![
+            text(title).size(22).color(palette.text.into_iced_color()),
+            iced::widget::scrollable(
+                text(body)
+                    .size(13)
+                    .color(palette.text_muted.into_iced_color())
+            )
+            .height(Length::Fill),
+            row![accept],
+        ]
+        .spacing(18)
+        .padding(iced::Padding::from(32.0));
+        container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
+        // AUD-5 — the DISCLAIMER pre-flight accept gate (§5): until the operator
+        // accepts the current disclaimer, the whole app is replaced by a
+        // blocking accept screen.
+        if !self.disclaimer_accepted {
+            return self.disclaimer_gate_view();
+        }
         let sidebar = crate::sidebar::view(
             &self.sidebar,
             self.view,

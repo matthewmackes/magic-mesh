@@ -41,6 +41,9 @@ export XDG_RUNTIME_DIR="$RT"
 export XDG_DATA_HOME="$RT/data"
 export XDG_CONFIG_HOME="$RT/config"
 mkdir -p "$XDG_DATA_HOME" "$XDG_CONFIG_HOME"
+# AUD-5 — pre-satisfy the DISCLAIMER accept gate so the headless capture renders
+# the actual panels, not the (real, operator-facing) first-run accept screen.
+export MDE_DISCLAIMER_ACCEPTED=1
 export WLR_BACKENDS=headless
 export WLR_LIBINPUT_NO_DEVICES=1
 export WLR_RENDERER=pixman          # software render — no GPU on a headless box
