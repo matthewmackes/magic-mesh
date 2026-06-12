@@ -11,6 +11,15 @@
 # (mde-files, voice HUD/config, music) · workbench (the Cosmic control surface) ·
 # shared (the Carbon look stack: theme, iced-components, card, disclaimer) ·
 # kdc (the canonical KDE Connect host).
+#
+# EFF-35 — libcosmic git-pin policy. libcosmic has no crates.io release, so
+# the three consumers (mde-cosmic-applet, mde-files, mde-role-chooser) pin
+# the SAME explicit `rev` (today cca48bc29ef7a9f22160c0ab6ba117ab22d1ae87 —
+# the GUI-6 probe rev). Update cadence: bump deliberately, never track a
+# branch — re-pin all three in one commit when (a) a Cosmic point release
+# lands on the target Fedora spin, or (b) a needed fix/API lands upstream;
+# gate the bump on the full workspace build + the GUI crates' tests. Keep
+# the revs identical across crates so Cargo resolves one libcosmic tree.
 
 [workspace]
 resolver = "2"
@@ -42,6 +51,9 @@ members = [
 [workspace.package]
 version      = "10.0.0"
 edition      = "2021"
+# EFF-33 — the MSRV floor, enforced by CI (every ci.yml job builds the
+# full workspace on pinned 1.85). The dev/build ceiling (1.94, the
+# softbuffer cap) lives in rust-toolchain.toml — see its header.
 rust-version = "1.85"
 license      = "GPL-3.0-or-later"
 authors      = ["Matthew Mackes <matthewmackes@gmail.com>"]

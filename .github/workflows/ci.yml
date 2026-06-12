@@ -13,6 +13,12 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+  # EFF-46 — the nightly schedule drives the `ignored-tests` job below
+  # (the #[ignore]d suites that are too slow / host-dependent for the
+  # per-push gates). workflow_dispatch allows an on-demand pre-cut run.
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -200,3 +206,43 @@ jobs:
             --features mackesd/async-services \
             --fail-under-lines 80 \
             --summary-only
+
+  # EFF-46 — the #[ignore]d suites, exercised on the nightly schedule +
+  # on-demand (workflow_dispatch) so they can't rot silently. Two suites
+  # exist today:
+  #   * throughput_floor (mackes-nebula-https-tunnel) — slow 100 MB
+  #     loopback bench; runner-runnable, hard-fails below the 5 Mb/s floor.
+  #   * passcode_creds::round_trip_on_real_host (mackesd) — needs
+  #     systemd-creds + the host credential key; advisory on shared
+  #     runners (continue-on-error), authoritative when an operator
+  #     dispatches it on a real host runner.
+  ignored-tests:
+    name: nightly · ignored suites
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System dev libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libgtk-3-dev cmake pkg-config
+
+      - name: Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Throughput floor (NF-1.6, --include-ignored)
+        run: |
+          cargo test -p mackes-nebula-https-tunnel --locked \
+            --test throughput_floor -- --include-ignored
+
+      - name: systemd-creds round trip (advisory on shared runners)
+        continue-on-error: true
+        run: |
+          cargo test -p mackesd --features async-services --locked \
+            passcode_creds -- --include-ignored --test-threads=1

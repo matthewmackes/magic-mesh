@@ -1,5 +1,13 @@
-# rust-toolchain.toml — pins the Rust toolchain for Mackes Desktop
-# Environment.
+# rust-toolchain.toml — pins the Rust toolchain for Magic Mesh.
+#
+# EFF-33 (2026-06-12) — this pin and the workspace `rust-version` are
+# NOT in conflict; they bound opposite ends:
+#   * `rust-version = "1.85"` (root Cargo.toml) is the MSRV **floor**,
+#     enforced by CI: every ci.yml job runs the pinned 1.85 toolchain
+#     and builds/tests the full workspace, so an MSRV break fails CI.
+#   * `channel = "1.94.0"` here is the dev/build **ceiling** pin — the
+#     newest toolchain that still compiles softbuffer 0.4.8 (see the
+#     1.95 note below). Drop the ceiling when softbuffer 0.5 lands.
 #
 # v2.5 Iced 0.14 bump path (2026-05-23) — downgraded from 1.95.0
 # to 1.94.0. The UX-PRE Iced 0.14 + iced_layershell 0.18.1 probe on
