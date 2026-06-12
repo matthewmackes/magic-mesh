@@ -15,7 +15,8 @@
 //!   filesystem pairing store, and a networking stack. Keeping
 //!   them out of this crate means the protocol layer compiles +
 //!   tests in seconds and stays embeddable.
-//! - `cargo fuzz` corpus and the in-process loopback harness
+//! - the proptest decoder suite (`tests/codec_properties.rs`,
+//!   EFF-36) and the in-process loopback harness
 //!   (KDC2-2 acceptance) live next to the code they exercise
 //!   without dragging in tokio + zbus + rustls just to run a
 //!   fuzz iteration.

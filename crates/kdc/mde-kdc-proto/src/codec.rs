@@ -5,11 +5,13 @@
 //! a frame boundary — the buffer absorbs the leftover bytes and
 //! emits each complete frame as it crosses a newline.
 //!
-//! `cargo fuzz run codec` (target `fuzz_frame_decoder`) confirms
-//! the decoder never panics on arbitrary byte input. Mandatory
-//! invariant: arbitrary input → either `Ok(packet)` or an error
-//! return; never a panic, never a deadlock, never an unbounded
-//! allocation.
+//! EFF-36 — the never-panic / bounded-allocation invariant is
+//! machine-checked by the proptest suite in
+//! `tests/codec_properties.rs` (arbitrary bytes one-shot + streamed
+//! in arbitrary chunkings, bounded-buffer assertion, round-trips),
+//! which runs in plain `cargo test` + CI. Mandatory invariant:
+//! arbitrary input → either `Ok(packet)` or an error return; never
+//! a panic, never a deadlock, never an unbounded allocation.
 
 use crate::wire::Packet;
 

@@ -28,5 +28,8 @@ ring = "0.17"
 zeroize = { version = "1.7", features = ["zeroize_derive"] }
 
 [dev-dependencies]
-# (none yet — libFuzzer corpus integration lands when
-# `cargo-fuzz` is added to the workspace dev tier.)
+# EFF-36 — property tests over the untrusted wire decoder: arbitrary
+# bytes must never panic / grow unbounded; encode-decode round-trips.
+# (Replaces the previously-claimed cargo-fuzz target, which never
+# existed in-tree — proptest runs in plain cargo test + CI.)
+proptest = "1"

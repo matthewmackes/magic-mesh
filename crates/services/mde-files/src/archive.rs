@@ -213,3 +213,91 @@ mod tests {
         assert!(list(&dir.join("nope.tar")).is_err());
     }
 }
+
+#[cfg(test)]
+mod adversarial_tests {
+    //! EFF-36 — adversarial inputs for the untrusted archive parser:
+    //! traversal members must never land outside `dest`, junk bytes
+    //! must error (never panic).
+    use super::*;
+    use std::io::Write;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mde-files-archive-adv-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A tar carrying a `../escape.txt` member (zip-slip class).
+    /// `tar::Builder` itself refuses to WRITE `..` names, so the
+    /// malicious header block is forged raw — byte-patched name +
+    /// recomputed checksum — exactly what an attacker's file is.
+    fn build_traversal_tar(path: &Path) {
+        use std::io::Write as _;
+        let mut out = File::create(path).unwrap();
+        let evil_name = b"../escape.txt";
+        let data = b"pwned";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.as_mut_bytes()[..evil_name.len()].copy_from_slice(evil_name);
+        header.set_cksum();
+        out.write_all(header.as_bytes()).unwrap();
+        out.write_all(data).unwrap();
+        out.write_all(&vec![0u8; 512 - data.len()]).unwrap(); // pad block
+        // One legitimate member (via a second raw block for symmetry).
+        let ok_data = b"ok";
+        let mut ok = tar::Header::new_gnu();
+        ok.set_path("ok.txt").unwrap();
+        ok.set_size(ok_data.len() as u64);
+        ok.set_mode(0o644);
+        ok.set_cksum();
+        out.write_all(ok.as_bytes()).unwrap();
+        out.write_all(ok_data).unwrap();
+        out.write_all(&vec![0u8; 512 - ok_data.len()]).unwrap();
+        // End-of-archive: two zero blocks.
+        out.write_all(&[0u8; 1024]).unwrap();
+    }
+
+    #[test]
+    fn traversal_member_is_refused_and_never_escapes_dest() {
+        let dir = scratch("traversal");
+        let tar_path = dir.join("evil.tar");
+        build_traversal_tar(&tar_path);
+        let dest = dir.join("out");
+        let written = extract(&tar_path, &dest).expect("extract runs");
+        assert_eq!(written, 1, "only the legitimate member lands");
+        assert!(dest.join("ok.txt").exists());
+        assert!(
+            !dir.join("escape.txt").exists(),
+            "the ../ member must not land beside dest"
+        );
+    }
+
+    #[test]
+    fn junk_bytes_error_never_panic() {
+        let dir = scratch("junk");
+        for (name, bytes) in [
+            ("empty.tar", Vec::new()),
+            ("short.tar", vec![0x42; 17]),
+            // gzip magic followed by garbage — exercises the gunzip path.
+            ("fake.tgz", {
+                let mut v = vec![0x1f, 0x8b];
+                v.extend(std::iter::repeat(0xA5).take(700));
+                v
+            }),
+        ] {
+            let p = dir.join(name);
+            let mut f = File::create(&p).unwrap();
+            f.write_all(&bytes).unwrap();
+            // list + extract: Ok-or-Err, never a panic. (An all-zero
+            // or truncated stream may legally parse as an empty tar.)
+            let _ = list(&p);
+            let _ = extract(&p, &dir.join(format!("{name}.out")));
+        }
+    }
+}
