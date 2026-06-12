@@ -477,7 +477,27 @@ impl Supervisor {
             let last_result: anyhow::Result<()> = loop {
                 info!(worker = %name, "starting worker");
                 let token_for_run = shutdown.clone();
-                let outcome = worker.run(token_for_run).await;
+                // EFF-4 — a worker that PANICS (not just returns Err) must be
+                // restarted too. Without this, a panic unwinds the whole
+                // supervisor task and `join_all` only logs the JoinError —
+                // the worker is silently dead for the daemon's lifetime.
+                // Catch the unwind so it flows through the same restart-policy
+                // + back-off + circuit-breaker path as an Err below.
+                let outcome = match futures_util::FutureExt::catch_unwind(
+                    std::panic::AssertUnwindSafe(worker.run(token_for_run)),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(panic) => {
+                        let msg = panic
+                            .downcast_ref::<&str>()
+                            .map(|s| (*s).to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "worker panicked".to_string());
+                        Err(anyhow::anyhow!("worker panicked: {msg}"))
+                    }
+                };
                 let should_restart = match (policy, &outcome) {
                     (RestartPolicy::Never, _) => false,
                     (RestartPolicy::OnFailure, Err(_)) => true,
@@ -671,6 +691,46 @@ mod tests {
         // Final attempt should have returned Ok.
         assert!(outcomes[0].1.is_ok());
         assert!(attempts.load(Ordering::SeqCst) >= 2);
+    }
+
+    struct PanicOnce {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Worker for PanicOnce {
+        fn name(&self) -> &'static str {
+            "panic-once"
+        }
+        async fn run(&mut self, _shutdown: ShutdownToken) -> anyhow::Result<()> {
+            let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+            assert!(n != 0, "intentional first-attempt panic");
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn on_failure_policy_restarts_after_a_panic() {
+        // EFF-4 — a worker that PANICS (not just returns Err) is caught + fed
+        // through the restart policy, not silently lost as a JoinError.
+        let mut sup = Supervisor::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        sup.spawn(Spawn::new(
+            PanicOnce {
+                attempts: attempts.clone(),
+            },
+            RestartPolicy::OnFailure,
+        ));
+        let outcomes = sup.join_all().await;
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            outcomes[0].1.is_ok(),
+            "worker recovered on the post-panic restart"
+        );
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 2,
+            "panicked then restarted"
+        );
     }
 
     #[test]

@@ -525,7 +525,7 @@ fn apply_expose(
     wan_zone: &str,
     req: &ExposeRequest,
 ) {
-    let mut active = worker.active.lock().expect("active mutex");
+    let mut active = worker.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let new_rules = diff_expose(&active, req);
     if new_rules.is_empty() {
         return;
@@ -559,7 +559,7 @@ fn apply_expose(
 }
 
 fn apply_unexpose(worker: &ComputeExposeWorker, wan_zone: &str, req: &UnexposeRequest) {
-    let mut active = worker.active.lock().expect("active mutex");
+    let mut active = worker.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let removals = diff_unexpose(&active, req);
     if removals.is_empty() {
         return;
@@ -691,7 +691,7 @@ fn default_bus_root() -> Option<PathBuf> {
 /// is attributed to the more-exposed network (Wan before Lan) so the
 /// display never under-reports reach.
 fn seed_active_from_firewalld(worker: &ComputeExposeWorker, wan_zone: &str) {
-    let mut active = worker.active.lock().expect("active mutex");
+    let mut active = worker.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut seen_zones: BTreeSet<String> = BTreeSet::new();
     for network in [Network::Mesh, Network::Wan, Network::Lan] {
         let zone = zone_for_network(network, wan_zone);
@@ -1048,7 +1048,7 @@ mod tests {
     fn apply_unexpose_drops_shadow_rules_even_when_firewall_cmd_unavailable() {
         let worker = ComputeExposeWorker::new();
         {
-            let mut active = worker.active.lock().expect("active mutex");
+            let mut active = worker.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             active.insert(ActiveRule {
                 network: Network::Mesh,
                 vm_nebula_ip: "10.42.128.1".into(),
@@ -1067,7 +1067,7 @@ mod tests {
         // published `compute/exposed/<peer>` stays consistent with
         // operator intent.
         apply_unexpose(&worker, "public", &unexpose_req("10.42.128.1", 8080));
-        let active = worker.active.lock().expect("active mutex");
+        let active = worker.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
             active.is_empty(),
             "shadow set should be empty after unexpose"

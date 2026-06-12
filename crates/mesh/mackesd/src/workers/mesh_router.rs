@@ -412,7 +412,7 @@ mod tests {
         let w =
             MeshRouterWorker::new(new_state(), new_registry()).with_metrics(Arc::clone(&metrics));
         w.tick_once().await;
-        let snapshot = metrics.lock().unwrap();
+        let snapshot = metrics.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(snapshot.count, 1, "tick_once must record one sample");
         // Some bucket must be non-zero — concrete value depends
         // on machine speed; the test_loop is well under 50 ms.

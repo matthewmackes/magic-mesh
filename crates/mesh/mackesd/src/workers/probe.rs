@@ -67,7 +67,7 @@ impl ProbeWorker {
     /// `quota_probe_due` rate-limit so the heavy `-sV`/NSE pass fires
     /// at most once per `deep_interval`.
     fn deep_due(&self) -> bool {
-        let mut guard = self.last_deep.lock().expect("last_deep mutex");
+        let mut guard = self.last_deep.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = std::time::Instant::now();
         let due = match *guard {
             None => true,

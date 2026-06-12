@@ -603,17 +603,49 @@ pub fn parse_lease(raw: &str) -> Option<LeaseInfo> {
     })
 }
 
+/// EFF-6 — a hung `mackesd` must not spin the Mesh Control panel forever.
+/// Bounds the call: spawn, poll, and kill after [`HEALTHZ_TIMEOUT`] (the GUI
+/// renders an empty/"unreachable" state on timeout rather than blocking).
+const HEALTHZ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 fn run_mackesd_healthz() -> String {
-    let out = std::process::Command::new("mackesd")
+    use std::io::Read;
+    use std::time::Instant;
+    let mut child = match std::process::Command::new("mackesd")
         .arg("healthz")
-        .output();
-    let Ok(out) = out else {
-        return String::new();
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return String::new(),
     };
-    if !out.status.success() {
-        return String::new();
+    let deadline = Instant::now() + HEALTHZ_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return String::new();
+                }
+                break;
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return String::new();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => return String::new(),
+        }
     }
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+    let mut out = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_string(&mut out);
+    }
+    out.trim().to_string()
 }
 
 #[must_use]

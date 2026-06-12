@@ -186,7 +186,7 @@ impl AlertRelayWorker {
     /// notification); `false` if we've already surfaced it
     /// in this worker's lifetime.
     fn mark_seen(&self, id: &str) -> bool {
-        let mut guard = self.seen_alert_ids.lock().expect("seen_alert_ids mutex");
+        let mut guard = self.seen_alert_ids.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.insert(id.to_owned())
     }
 

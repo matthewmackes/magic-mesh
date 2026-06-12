@@ -637,7 +637,7 @@ impl ComputeRegistryWorker {
     }
 
     fn collect_vms(&self, interval_secs: f64) -> Vec<VmEntry> {
-        let mut prev = self.prev_cpu_ns.lock().expect("prev_cpu_ns mutex");
+        let mut prev = self.prev_cpu_ns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         collect_vm_entries(&self.vm_storage, interval_secs, &mut prev)
     }
 
@@ -656,7 +656,7 @@ impl ComputeRegistryWorker {
         // replace the snapshot with current states. VMs that vanished
         // (undefined since last tick) drop out silently — no event.
         {
-            let mut prev = self.prev_state.lock().expect("prev_state mutex");
+            let mut prev = self.prev_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             for vm in &inventory.vms {
                 if let Some(ev) =
                     classify_transition(prev.get(&vm.id).map(String::as_str), &vm.state)

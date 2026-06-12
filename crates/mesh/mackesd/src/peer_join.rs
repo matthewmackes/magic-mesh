@@ -68,7 +68,7 @@ pub fn probe_cache_path(peer_id: &str) -> Option<PathBuf> {
 /// [`DEBOUNCE_WINDOW`] (or never happened).
 pub fn debounce_allows(peer_id: &str, now: Instant) -> bool {
     let map = debounce_map();
-    let mut guard = map.lock().expect("debounce-map mutex poisoned");
+    let mut guard = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match guard.get(peer_id) {
         Some(last) if now.duration_since(*last) < DEBOUNCE_WINDOW => false,
         _ => {
@@ -83,7 +83,7 @@ pub fn debounce_allows(peer_id: &str, now: Instant) -> bool {
 /// operators want to force a re-spawn.
 pub fn debounce_reset(peer_id: &str) {
     let map = debounce_map();
-    let mut guard = map.lock().expect("debounce-map mutex poisoned");
+    let mut guard = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     guard.remove(peer_id);
 }
 

@@ -64,7 +64,7 @@ impl MeshFirewallWorker {
         let desired: BTreeSet<String> = blocked_ips(&read_all_surrounding(&self.base_dir))
             .into_iter()
             .collect();
-        let mut active = self.active.lock().expect("active mutex");
+        let mut active = self.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (to_add, to_remove) = reconcile(&active, &desired);
         let mut changed = false;
         for ip in &to_add {

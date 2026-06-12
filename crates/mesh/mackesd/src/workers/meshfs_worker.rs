@@ -719,7 +719,7 @@ impl Worker for MeshFsWorker {
                 _ = lfs_tick.tick() => self.tick_once(),
                 _ = action_tick.tick() => {
                     if let Some(ref p_mutex) = persist_opt {
-                        let p = p_mutex.lock().expect("meshfs persist lock");
+                        let p = p_mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         self.poll_meshfs_actions(&p, &mut cursors);
                     }
                 }
