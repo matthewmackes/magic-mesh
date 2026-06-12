@@ -284,3 +284,40 @@ jobs:
           name: magic-mesh-sbom
           path: "**/magic-mesh-sbom.json"
           if-no-files-found: warn
+
+  # EFF-32 — build/test on the REAL target: Fedora (the RPM platform),
+  # with the same dnf dev libs the install docs name, plus nebula +
+  # ansible-core present so environment-sensitive tests see the
+  # platform binaries. Advisory (continue-on-error) until it has
+  # soaked on the runner fleet — the per-push ubuntu gates stay the
+  # required check; this job catches Fedora-specific drift (package
+  # names, linker, system lib versions).
+  #
+  # aarch64 remains a noted gap: a faithful build needs an arm64
+  # runner or a full cross sysroot for ALSA/GTK — tracked, not faked
+  # with a check-only cross job.
+  fedora:
+    name: fedora-native build · test
+    runs-on: ubuntu-latest
+    container: fedora:44
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System dev libraries (dnf)
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            gcc gcc-c++ cmake pkg-config git \
+            gtk3-devel alsa-lib-devel openssl-devel \
+            rust cargo nebula ansible-core
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (workspace, Fedora rustc)
+        run: cargo build --workspace --locked
+
+      - name: Test (workspace, excl. mackesd)
+        run: cargo test --workspace --exclude mackesd --locked
+
+      - name: Test (mackesd, serial)
+        run: cargo test -p mackesd --features async-services --locked -- --test-threads=1
