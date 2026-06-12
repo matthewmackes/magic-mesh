@@ -83,6 +83,10 @@ pub struct FleetRollupPanel {
     pub self_hostname: String,
     pub loaded: bool,
     pub status: String,
+    /// EFF-45 — set when `mackesd fleet-status --json` failed (I/O, non-zero
+    /// exit). The view renders the error state instead of the misleading "No
+    /// enrolled nodes yet" empty state.
+    pub load_error: Option<String>,
     pub busy: bool,
 }
 
@@ -94,6 +98,9 @@ pub enum Message {
         rtt: HashMap<String, Option<f64>>,
         self_hostname: String,
     },
+    /// EFF-45 — emitted when `mackesd fleet-status --json` fails (I/O /
+    /// non-zero exit / parse error) so the view can render the error state.
+    LoadError(String),
     RefreshClicked,
 }
 
@@ -106,12 +113,30 @@ impl FleetRollupPanel {
     pub fn load() -> Task<crate::Message> {
         Task::perform(
             async move {
-                let rollup = run_mackesd(&["fleet-status".into(), "--json".into()])
+                // EFF-45: distinguish a real fleet-status failure from an
+                // empty fleet. `run_mackesd` returns Err on non-zero exit or
+                // I/O error; parse failure on non-empty output is also an
+                // error (the source exists but is unreadable).
+                let rollup_result = run_mackesd(&["fleet-status".into(), "--json".into()])
                     .await
-                    .map(|out| parse_rollup(&out))
-                    .unwrap_or_default();
+                    .and_then(|out| {
+                        let t = out.trim();
+                        if t.is_empty() {
+                            // Empty output = no nodes yet, legitimately empty.
+                            Ok(Rollup::default())
+                        } else {
+                            serde_json::from_str::<Rollup>(t)
+                                .map_err(|e| format!("parse fleet-status: {e}"))
+                        }
+                    });
+                let rollup = match rollup_result {
+                    Ok(r) => r,
+                    Err(e) => return Message::LoadError(e),
+                };
                 // W81 — the live-map data: the same directory the Peers
                 // Front Door reads, plus the mesh-latency cache.
+                // Junk-tolerant: a missing or unparseable peers list degrades
+                // to an empty map overlay, not an error.
                 let rows = run_mackesd(&["peers".into(), "--json".into()])
                     .await
                     .ok()
@@ -143,8 +168,16 @@ impl FleetRollupPanel {
                 self.rtt = rtt;
                 self.self_hostname = self_hostname;
                 self.loaded = true;
+                self.load_error = None;
                 self.busy = false;
                 self.status.clear();
+                Task::none()
+            }
+            Message::LoadError(e) => {
+                // EFF-45 — fleet-status failure is an error, not an empty
+                // fleet.
+                self.load_error = Some(e);
+                self.busy = false;
                 Task::none()
             }
             Message::RefreshClicked => {
@@ -167,6 +200,17 @@ impl FleetRollupPanel {
             (!self.busy).then_some(crate::Message::FleetRollup(Message::RefreshClicked)),
             palette,
         );
+
+        // EFF-45 — a failed fleet-status run renders as failure, never as the
+        // "No enrolled nodes yet" empty state.
+        if let Some(err) = &self.load_error {
+            return panel_container(
+                crate::panel_chrome::error_state(err.clone(), palette, || {
+                    crate::Message::FleetRollup(Message::RefreshClicked)
+                }),
+                density,
+            );
+        }
 
         if self.rollup.groups.is_empty() {
             let state = EmptyState::with_cta(

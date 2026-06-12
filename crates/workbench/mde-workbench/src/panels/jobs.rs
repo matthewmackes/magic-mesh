@@ -103,12 +103,15 @@ pub fn workgroup_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/mnt/mesh-storage"))
 }
 
-/// Read every `jobs/templates/*.yaml`, sorted by id (junk-tolerant).
-#[must_use]
-pub fn load_templates(root: &Path) -> Vec<TemplateRow> {
+/// EFF-45 — Read every `jobs/templates/*.yaml`, sorted by id (junk-tolerant
+/// per FILE). Source-absent (NotFound) = legitimately empty; an existing dir
+/// we cannot read = load failure.
+pub fn load_templates(root: &Path) -> Result<Vec<TemplateRow>, String> {
     let dir = root.join("jobs").join("templates");
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("reading {}: {e}", dir.display())),
     };
     let mut out: Vec<TemplateRow> = entries
         .filter_map(Result::ok)
@@ -117,15 +120,17 @@ pub fn load_templates(root: &Path) -> Vec<TemplateRow> {
         .filter_map(|raw| serde_yaml::from_str(&raw).ok())
         .collect();
     out.sort_by(|a, b| a.id.cmp(&b.id));
-    out
+    Ok(out)
 }
 
-/// Read every run manifest, newest first (junk-tolerant).
-#[must_use]
-pub fn load_runs(root: &Path) -> Vec<RunRow> {
+/// EFF-45 — Read every run manifest, newest first (junk-tolerant per FILE).
+/// Source-absent = legitimately empty; existing-but-unreadable = load failure.
+pub fn load_runs(root: &Path) -> Result<Vec<RunRow>, String> {
     let runs_dir = root.join("jobs").join("runs");
-    let Ok(entries) = std::fs::read_dir(runs_dir) else {
-        return Vec::new();
+    let entries = match std::fs::read_dir(&runs_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("reading {}: {e}", runs_dir.display())),
     };
     let mut out: Vec<RunRow> = entries
         .filter_map(Result::ok)
@@ -133,7 +138,7 @@ pub fn load_runs(root: &Path) -> Vec<RunRow> {
         .filter_map(|raw| serde_json::from_str(&raw).ok())
         .collect();
     out.sort_by(|a, b| b.at.cmp(&a.at)); // newest first
-    out
+    Ok(out)
 }
 
 /// Read one run's per-target results, sorted by hostname.
@@ -174,12 +179,16 @@ pub struct JobsPanel {
     pub results: Vec<ResultRow>,
     pub status: String,
     pub busy: bool,
+    /// EFF-45 — set when the jobs LOAD failed (vs legitimately empty).
+    /// The view renders the error state instead of the misleading
+    /// "No job templates yet" empty state.
+    pub load_error: Option<String>,
     pub focus: Focus,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Loaded(Vec<TemplateRow>, Vec<RunRow>),
+    Loaded(Result<(Vec<TemplateRow>, Vec<RunRow>), String>),
     FocusTemplate(String),
     FocusRun(String, Vec<ResultRow>),
     OpenRun(String),
@@ -202,7 +211,11 @@ impl JobsPanel {
         Task::perform(
             async move {
                 let root = workgroup_root();
-                Message::Loaded(load_templates(&root), load_runs(&root))
+                // EFF-45 — both loaders now return Result; first failure wins.
+                let result = load_templates(&root).and_then(|templates| {
+                    load_runs(&root).map(|runs| (templates, runs))
+                });
+                Message::Loaded(result)
             },
             crate::Message::Jobs,
         )
@@ -210,11 +223,18 @@ impl JobsPanel {
 
     pub fn update(&mut self, message: Message) -> Task<crate::Message> {
         match message {
-            Message::Loaded(templates, runs) => {
+            Message::Loaded(Ok((templates, runs))) => {
                 self.templates = templates;
                 self.runs = runs;
                 self.busy = false;
+                self.load_error = None;
                 self.status.clear();
+                Task::none()
+            }
+            Message::Loaded(Err(e)) => {
+                // EFF-45 — a failed load is an ERROR state, never an empty panel.
+                self.load_error = Some(e);
+                self.busy = false;
                 Task::none()
             }
             Message::FocusTemplate(id) => {
@@ -331,6 +351,17 @@ impl JobsPanel {
             (!self.busy).then_some(crate::Message::Jobs(Message::RefreshClicked)),
             palette,
         );
+
+        // EFF-45 — a failed load renders as failure, never as the
+        // "No job templates yet" empty state.
+        if let Some(err) = &self.load_error {
+            return panel_container(
+                crate::panel_chrome::error_state(err.clone(), palette, || {
+                    crate::Message::Jobs(Message::RefreshClicked)
+                }),
+                density,
+            );
+        }
 
         if self.templates.is_empty() && self.runs.is_empty() {
             let state = EmptyState::with_cta(
@@ -549,7 +580,7 @@ mod tests {
     fn templates_load_sorted_with_target_summary() {
         let tmp = tempfile::tempdir().unwrap();
         seed_template(tmp.path(), "patch-all");
-        let tpls = load_templates(tmp.path());
+        let tpls = load_templates(tmp.path()).unwrap();
         assert_eq!(tpls.len(), 1);
         assert_eq!(tpls[0].id, "patch-all");
         assert_eq!(tpls[0].schedule.as_deref(), Some("0 3 * * *"));
@@ -557,17 +588,35 @@ mod tests {
     }
 
     #[test]
+    fn templates_missing_dir_is_empty_not_err() {
+        // EFF-45 — NotFound = legitimately empty, not a load failure.
+        let tmp = tempfile::tempdir().unwrap();
+        let result = load_templates(tmp.path());
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
     fn runs_load_newest_first_and_results_resolve() {
         let tmp = tempfile::tempdir().unwrap();
         seed_run(tmp.path(), "r-old", 100);
         seed_run(tmp.path(), "r-new", 200);
-        let runs = load_runs(tmp.path());
+        let runs = load_runs(tmp.path()).unwrap();
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].run_id, "r-new", "newest first");
         let results = load_results(tmp.path(), "r-new");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].hostname, "pine");
         assert_eq!(results[0].status, "ok");
+    }
+
+    #[test]
+    fn runs_missing_dir_is_empty_not_err() {
+        // EFF-45 — NotFound = legitimately empty, not a load failure.
+        let tmp = tempfile::tempdir().unwrap();
+        let result = load_runs(tmp.path());
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
     }
 
     #[test]

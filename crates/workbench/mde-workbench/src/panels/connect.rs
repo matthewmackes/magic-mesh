@@ -306,6 +306,10 @@ mod tests {
 #[derive(Debug, Clone, Default)]
 pub struct ConnectPanel {
     pub peers: Vec<ConnectPeer>,
+    /// EFF-45 — set when the Bus RPC call to `action/connect/devices` failed
+    /// (timeout, bus offline, or a spawn error). The view renders the error
+    /// state instead of the misleading "No paired devices" empty state.
+    pub load_error: Option<String>,
     pub busy: bool,
 }
 
@@ -314,11 +318,14 @@ pub struct ConnectPanel {
 /// dispatches arms back to `ConnectPanel::update`.
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// Backend pushed a fresh peer list.
-    Loaded(Vec<ConnectPeer>),
+    /// Backend pushed a fresh peer list — `Err` when the Bus RPC failed
+    /// (timeout / bus offline), `Ok` for a roster (may be empty).
+    Loaded(Result<Vec<ConnectPeer>, String>),
     /// User clicked Pair / Unpair / Ring / SendFile on a row —
     /// `peer_id` identifies the row.
     PeerAction { peer_id: String, action: PeerAction },
+    /// EFF-45 — retry after a load error; re-fires `load()`.
+    RefreshClicked,
 }
 
 /// The per-row actions the panel exposes today. Each routes to a
@@ -339,33 +346,54 @@ impl ConnectPanel {
 
     /// AUD-3 — fetch the live paired-device roster from the KDC host worker
     /// over the Bus (`action/connect/devices`, the same surface PD-3 L6 reads).
-    /// One-shot on nav; empty roster degrades to the honest empty state.
+    /// One-shot on nav; empty roster is the honest empty state; Bus
+    /// timeout/offline is a load ERROR (EFF-45).
     pub fn load() -> Task<crate::Message> {
         Task::perform(
             async {
-                tokio::task::spawn_blocking(|| {
+                // EFF-45: distinguish Bus failure (None) from an empty roster
+                // (Some(array)). spawn_blocking join-error also maps to Err.
+                let result = tokio::task::spawn_blocking(|| {
                     crate::dbus::action_request(
                         "action/connect/devices",
                         std::time::Duration::from_secs(2),
                     )
                 })
                 .await
-                .ok()
-                .flatten()
-                .map(|raw| parse_connect_devices(&raw))
-                .unwrap_or_default()
+                .map_err(|e| format!("spawn error: {e}"))
+                .and_then(|opt| {
+                    opt.ok_or_else(|| {
+                        "Bus RPC failed — mde host worker not responding".to_string()
+                    })
+                })
+                .map(|raw| parse_connect_devices(&raw));
+                result
             },
-            |peers| crate::Message::Connect(Message::Loaded(peers)),
+            |result| crate::Message::Connect(Message::Loaded(result)),
         )
     }
 
     /// Dispatch a panel-scoped message.
     pub fn update(&mut self, msg: Message) -> Task<crate::Message> {
         match msg {
-            Message::Loaded(peers) => {
+            Message::Loaded(Ok(peers)) => {
                 self.peers = peers;
+                self.load_error = None;
                 self.busy = false;
                 Task::none()
+            }
+            Message::Loaded(Err(e)) => {
+                // EFF-45 — Bus failure is an error, not an empty roster.
+                self.load_error = Some(e);
+                self.busy = false;
+                Task::none()
+            }
+            Message::RefreshClicked => {
+                if self.busy {
+                    return Task::none();
+                }
+                self.busy = true;
+                Self::load()
             }
             Message::PeerAction { peer_id, action } => {
                 // AUD-3 — publish the Connect verb (delivered by the AUD-2
@@ -391,12 +419,15 @@ impl ConnectPanel {
                             )
                         })
                         .await
-                        .ok()
-                        .flatten()
+                        .map_err(|e| format!("spawn error: {e}"))
+                        .and_then(|opt| {
+                            opt.ok_or_else(|| {
+                                "Bus RPC failed — mde host worker not responding".to_string()
+                            })
+                        })
                         .map(|raw| parse_connect_devices(&raw))
-                        .unwrap_or_default()
                     },
-                    |peers| crate::Message::Connect(Message::Loaded(peers)),
+                    |result| crate::Message::Connect(Message::Loaded(result)),
                 )
             }
         }
@@ -408,6 +439,19 @@ impl ConnectPanel {
     /// sections (Phone / Messaging / Share / CommonChrome).
     pub fn view(&self) -> Element<'_, crate::Message> {
         let palette = crate::live_theme::palette();
+        let density = crate::live_theme::tokens().density;
+
+        // EFF-45 — a failed Bus RPC renders as failure, never as the
+        // "No paired devices" empty state.
+        if let Some(err) = &self.load_error {
+            return crate::panel_chrome::panel_container(
+                crate::panel_chrome::error_state(err.clone(), palette, || {
+                    crate::Message::Connect(Message::RefreshClicked)
+                }),
+                density,
+            );
+        }
+
         if self.peers.is_empty() {
             return self.empty_state_view(palette);
         }

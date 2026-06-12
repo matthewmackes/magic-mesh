@@ -16,7 +16,7 @@ use iced::{Element, Length, Padding, Task};
 use mde_theme::{EmptyState, Icon};
 
 use crate::controls::{variant_button, ButtonVariant};
-use crate::panel_chrome::{empty_state, panel_container};
+use crate::panel_chrome::{empty_state, error_state, panel_container};
 
 /// One row in the run-history table.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -41,6 +41,10 @@ pub struct RunRow {
 pub struct RunHistoryPanel {
     pub rows: Vec<RunRow>,
     pub status: String,
+    /// EFF-45 — set when the run-history LOAD failed (vs
+    /// legitimately empty). The view renders the error state
+    /// instead of the misleading "No runs recorded" empty state.
+    pub load_error: Option<String>,
     /// Path of the row currently drilled into; `None` = list
     /// view; `Some(_)` = detail view.
     pub focused_path: Option<String>,
@@ -79,10 +83,13 @@ impl RunHistoryPanel {
             Message::Loaded(rows) => {
                 self.rows = rows;
                 self.status.clear();
+                self.load_error = None;
                 Task::none()
             }
             Message::Error(msg) => {
-                self.status = msg;
+                // EFF-45 — a failed load is an ERROR state, never an
+                // empty run list.
+                self.load_error = Some(msg);
                 Task::none()
             }
             Message::FocusRow(path) => {
@@ -111,13 +118,26 @@ impl RunHistoryPanel {
     }
 
     fn view_list(&self) -> Element<'_, crate::Message> {
+        let palette = crate::live_theme::palette();
+        let density = crate::live_theme::tokens().density;
         // UX-7.a — refresh routed through the shared button variant.
         let refresh_btn = variant_button(
             "Refresh",
             ButtonVariant::Ghost,
             Some(crate::Message::RunHistory(Message::RefreshClicked)),
-            crate::live_theme::palette(),
+            palette,
         );
+
+        // EFF-45 — a failed load renders as failure, never as the
+        // "No runs recorded" empty state.
+        if let Some(err) = &self.load_error {
+            return panel_container(
+                error_state(err.clone(), palette, || {
+                    crate::Message::RunHistory(Message::RefreshClicked)
+                }),
+                density,
+            );
+        }
 
         if self.rows.is_empty() {
             // UX-6.b — empty-state with refresh CTA.
@@ -131,10 +151,10 @@ impl RunHistoryPanel {
             )
             .with_icon(Icon::History);
             return panel_container(
-                empty_state(state, crate::live_theme::palette(), || {
+                empty_state(state, palette, || {
                     crate::Message::RunHistory(Message::RefreshClicked)
                 }),
-                crate::live_theme::tokens().density,
+                density,
             );
         }
 
@@ -156,7 +176,7 @@ impl RunHistoryPanel {
                     "Detail",
                     ButtonVariant::Ghost,
                     Some(crate::Message::RunHistory(Message::FocusRow(path))),
-                    crate::live_theme::palette(),
+                    palette,
                 )
             };
             col.push(
@@ -461,10 +481,12 @@ mod tests {
     fn loaded_message_records_rows_and_clears_status() {
         let mut panel = RunHistoryPanel::new();
         panel.status = "stale".into();
+        panel.load_error = Some("old error".into());
         let rows = vec![parse_run_record("a", "x", SAMPLE).unwrap()];
         let _ = panel.update(Message::Loaded(rows.clone()));
         assert_eq!(panel.rows, rows);
         assert!(panel.status.is_empty());
+        assert!(panel.load_error.is_none());
     }
 
     #[test]
@@ -483,10 +505,10 @@ mod tests {
     }
 
     #[test]
-    fn error_message_stores_status() {
+    fn error_message_stores_load_error() {
         let mut panel = RunHistoryPanel::new();
         let _ = panel.update(Message::Error("dir unreadable".into()));
-        assert_eq!(panel.status, "dir unreadable");
+        assert_eq!(panel.load_error.as_deref(), Some("dir unreadable"));
     }
 
     #[tokio::test]

@@ -28,7 +28,7 @@ use mde_theme::{EmptyState, Icon};
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
-use crate::panel_chrome::{empty_state, panel_container};
+use crate::panel_chrome::{empty_state, error_state, panel_container};
 
 /// One role under `roles/` — `name` is the directory name, the
 /// canonical Ansible role identifier.
@@ -42,6 +42,11 @@ pub struct Playbook {
 pub struct PlaybooksPanel {
     pub playbooks: Vec<Playbook>,
     pub status: String,
+    /// EFF-45 — set when the playbook directory LOAD failed (vs
+    /// legitimately absent). The view renders the error state
+    /// instead of the misleading "No curated playbooks found"
+    /// empty state.
+    pub load_error: Option<String>,
     /// Name of the playbook currently mid-run; `None` when idle.
     /// The reducer uses this to grey out other Run buttons until
     /// the in-flight ansible-pull returns.
@@ -50,7 +55,7 @@ pub struct PlaybooksPanel {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Loaded(Vec<Playbook>),
+    Loaded(Result<Vec<Playbook>, String>),
     Error(String),
     RunClicked(String),
     RunFinished { name: String, success: bool },
@@ -66,23 +71,32 @@ impl PlaybooksPanel {
     pub fn load() -> Task<crate::Message> {
         Task::perform(
             async move {
+                // EFF-45 — distinguish a missing roles dir (the
+                // QNM-Shared tree simply isn't mounted yet →
+                // Ok(vec![])) from a real I/O failure on an
+                // existing dir (permissions / mount gone →
+                // Err(String)).
                 let dir = playbooks_root();
-                let entries = enumerate_role_dirs(&dir).await;
-                Message::Loaded(entries.into_iter().map(playbook_from_name).collect())
+                enumerate_role_dirs_result(&dir)
+                    .await
+                    .map(|names| names.into_iter().map(playbook_from_name).collect())
             },
-            crate::Message::Playbooks,
+            |result| crate::Message::Playbooks(Message::Loaded(result)),
         )
     }
 
     pub fn update(&mut self, message: Message) -> Task<crate::Message> {
         match message {
-            Message::Loaded(rows) => {
+            Message::Loaded(Ok(rows)) => {
                 self.playbooks = rows;
                 self.status.clear();
+                self.load_error = None;
                 Task::none()
             }
-            Message::Error(msg) => {
-                self.status = msg;
+            Message::Loaded(Err(e)) | Message::Error(e) => {
+                // EFF-45 — a failed load is an ERROR state, never an
+                // empty playbook list.
+                self.load_error = Some(e);
                 Task::none()
             }
             Message::RunClicked(name) => {
@@ -117,13 +131,26 @@ impl PlaybooksPanel {
     }
 
     pub fn view(&self) -> Element<'_, crate::Message> {
+        let palette = crate::live_theme::palette();
+        let density = crate::live_theme::tokens().density;
         // UX-7.a — refresh routed through the shared button variant.
         let refresh_btn = variant_button(
             "Refresh",
             ButtonVariant::Ghost,
             Some(crate::Message::Playbooks(Message::RefreshClicked)),
-            crate::live_theme::palette(),
+            palette,
         );
+
+        // EFF-45 — a failed load renders as failure, never as the
+        // "No curated playbooks found" empty state.
+        if let Some(err) = &self.load_error {
+            return panel_container(
+                error_state(err.clone(), palette, || {
+                    crate::Message::Playbooks(Message::RefreshClicked)
+                }),
+                density,
+            );
+        }
 
         if self.playbooks.is_empty() {
             // UX-6.b — empty-state with refresh CTA.
@@ -136,10 +163,10 @@ impl PlaybooksPanel {
             )
             .with_icon(Icon::Playbook);
             return panel_container(
-                empty_state(state, crate::live_theme::palette(), || {
+                empty_state(state, palette, || {
                     crate::Message::Playbooks(Message::RefreshClicked)
                 }),
-                crate::live_theme::tokens().density,
+                density,
             );
         }
 
@@ -157,7 +184,7 @@ impl PlaybooksPanel {
                 run_label,
                 ButtonVariant::Secondary,
                 (!running).then(|| crate::Message::Playbooks(Message::RunClicked(name))),
-                crate::live_theme::palette(),
+                palette,
             );
             col.push(
                 row![
@@ -169,6 +196,7 @@ impl PlaybooksPanel {
             )
         });
 
+        let _ = (palette, density); // bound above; used in guards
         column![
             scrollable(container(rows.spacing(8))).height(Length::Fill),
             row![
@@ -202,12 +230,18 @@ fn playbooks_root() -> PathBuf {
     base.join(".qnm-sync").join("playbooks").join("roles")
 }
 
-/// Walk the roles directory and collect every subdirectory name.
-/// Returns an empty Vec on any I/O error so the panel can show
-/// its "no curated playbooks found" empty state.
-async fn enumerate_role_dirs(dir: &std::path::Path) -> Vec<String> {
-    let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
-        return Vec::new();
+/// EFF-45 — honest version of the former `enumerate_role_dirs`: a missing
+/// dir is the legitimately empty state (QNM-Shared not mounted
+/// yet → `Ok(vec![])`); an EXISTING dir we cannot read (bad
+/// permissions, stale mount, I/O error) is a load FAILURE →
+/// `Err(String)`.
+pub async fn enumerate_role_dirs_result(
+    dir: &std::path::Path,
+) -> Result<Vec<String>, String> {
+    let mut rd = match tokio::fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("reading {}: {e}", dir.display())),
     };
     let mut out = Vec::new();
     while let Ok(Some(entry)) = rd.next_entry().await {
@@ -218,7 +252,7 @@ async fn enumerate_role_dirs(dir: &std::path::Path) -> Vec<String> {
         }
     }
     out.sort();
-    out
+    Ok(out)
 }
 
 /// Map a role name to the curated description from the Phase
@@ -291,16 +325,24 @@ mod tests {
         let mut panel = PlaybooksPanel::new();
         panel.status = "stale".into();
         let pbs = vec![playbook_from_name("system-update".into())];
-        let _ = panel.update(Message::Loaded(pbs.clone()));
+        let _ = panel.update(Message::Loaded(Ok(pbs.clone())));
         assert_eq!(panel.playbooks, pbs);
         assert!(panel.status.is_empty());
+        assert!(panel.load_error.is_none());
     }
 
     #[test]
-    fn error_message_stores_status() {
+    fn loaded_err_stores_load_error() {
+        let mut panel = PlaybooksPanel::new();
+        let _ = panel.update(Message::Loaded(Err("dir unreadable".into())));
+        assert_eq!(panel.load_error.as_deref(), Some("dir unreadable"));
+    }
+
+    #[test]
+    fn error_message_stores_load_error() {
         let mut panel = PlaybooksPanel::new();
         let _ = panel.update(Message::Error("dir unreadable".into()));
-        assert_eq!(panel.status, "dir unreadable");
+        assert_eq!(panel.load_error.as_deref(), Some("dir unreadable"));
     }
 
     #[test]
@@ -346,8 +388,9 @@ mod tests {
     #[tokio::test]
     async fn enumerate_role_dirs_empty_on_missing_dir() {
         // The home dir is never going to contain this random
-        // suffix; verifies the I/O-error → empty-Vec path.
+        // suffix; verifies the NotFound → Ok(empty) path.
         let bogus = PathBuf::from("/nonexistent-mde-test-7234923");
-        assert!(enumerate_role_dirs(&bogus).await.is_empty());
+        let result = enumerate_role_dirs_result(&bogus).await;
+        assert!(result.unwrap().is_empty());
     }
 }

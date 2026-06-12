@@ -330,7 +330,7 @@ mod tests {
         std::fs::create_dir_all(&junk).unwrap();
         std::fs::write(junk.join("probe.json"), "not json").unwrap();
 
-        let probes = load_probes(tmp.path());
+        let probes = load_probes(tmp.path()).expect("should succeed");
         assert_eq!(probes.len(), 2, "two valid probes, junk skipped");
         assert_eq!(probes[0].hostname, "alpha", "sorted by hostname");
         assert_eq!(probes[1].hostname, "zeta");
@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn load_probes_missing_dir_is_empty_not_panic() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(load_probes(&tmp.path().join("nope")).is_empty());
+        assert!(load_probes(&tmp.path().join("nope")).unwrap().is_empty());
     }
 
     #[test]
@@ -348,7 +348,7 @@ mod tests {
         panel.busy = true;
         let mut probe = PeerProbe::fixture();
         probe.hostname = "node".into();
-        let _ = panel.update(Message::Loaded(vec![probe]));
+        let _ = panel.update(Message::Loaded(Ok(vec![probe])));
         assert_eq!(panel.probes.len(), 1);
         assert!(!panel.busy);
     }

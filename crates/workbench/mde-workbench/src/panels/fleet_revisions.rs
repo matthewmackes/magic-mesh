@@ -33,6 +33,10 @@ pub struct Revision {
 pub struct FleetRevisionsPanel {
     pub revisions: Vec<Revision>,
     pub status: String,
+    /// EFF-45 — set when `mackesd revisions list --json` failed (I/O,
+    /// non-zero exit, parse error). The view renders the error state
+    /// instead of the misleading "No revisions yet" empty state.
+    pub load_error: Option<String>,
     pub busy: bool,
 }
 
@@ -81,6 +85,7 @@ impl FleetRevisionsPanel {
             Message::RefreshCompleted(Ok(rows)) => {
                 let n = rows.len();
                 self.revisions = rows;
+                self.load_error = None;
                 self.busy = false;
                 self.status = if n == 0 {
                     "No revisions yet.".into()
@@ -90,6 +95,9 @@ impl FleetRevisionsPanel {
                 Task::none()
             }
             Message::RefreshCompleted(Err(e)) => {
+                // EFF-45 — a failed CLI run is an error state, not an
+                // empty revision list.
+                self.load_error = Some(e.clone());
                 self.busy = false;
                 self.status = format!("Refresh failed: {e}");
                 Task::none()
@@ -135,6 +143,17 @@ impl FleetRevisionsPanel {
             (!self.busy).then(|| crate::Message::FleetRevisions(Message::RefreshClicked)),
             crate::live_theme::palette(),
         );
+
+        // EFF-45 — a failed CLI run renders as failure, never as the
+        // "No revisions yet" empty state.
+        if let Some(err) = &self.load_error {
+            return panel_container(
+                crate::panel_chrome::error_state(err.clone(), crate::live_theme::palette(), || {
+                    crate::Message::FleetRevisions(Message::RefreshClicked)
+                }),
+                crate::live_theme::tokens().density,
+            );
+        }
 
         let rows: Vec<Element<'_, crate::Message>> = self
             .revisions

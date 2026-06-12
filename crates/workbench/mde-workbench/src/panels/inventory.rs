@@ -32,6 +32,10 @@ pub struct InventoryPanel {
     pub rows: Vec<NodeRow>,
     pub status: String,
     pub busy: bool,
+    /// EFF-45 — set when the node-roster LOAD failed (vs legitimately
+    /// empty). The view renders the error state instead of the
+    /// misleading "No peers enrolled" empty state.
+    pub load_error: Option<String>,
     /// `node_id` of the row the user has drilled into via
     /// `peers-why`. `None` = list view; `Some(id)` = drill-in
     /// view rendering the per-edge reason chain.
@@ -58,10 +62,14 @@ impl InventoryPanel {
     pub fn load() -> Task<crate::Message> {
         Task::perform(
             async move {
-                let raw = run_mackesd(&["nodes", "list", "--json"]).await;
-                match parse_nodes_json(&raw) {
-                    Ok(rows) => Message::Loaded(rows),
+                // EFF-45 — distinguish a CLI failure (load error) from an
+                // empty roster (legitimately no peers enrolled yet).
+                match run_mackesd_result(&["nodes", "list", "--json"]).await {
                     Err(e) => Message::Error(e),
+                    Ok(raw) => match parse_nodes_json(&raw) {
+                        Ok(rows) => Message::Loaded(rows),
+                        Err(e) => Message::Error(e),
+                    },
                 }
             },
             crate::Message::Inventory,
@@ -73,11 +81,13 @@ impl InventoryPanel {
             Message::Loaded(rows) => {
                 self.rows = rows;
                 self.status.clear();
+                self.load_error = None;
                 self.busy = false;
                 Task::none()
             }
             Message::Error(msg) => {
-                self.status = msg;
+                // EFF-45 — a failed load is an ERROR state, never an empty roster.
+                self.load_error = Some(msg);
                 self.busy = false;
                 Task::none()
             }
@@ -125,13 +135,26 @@ impl InventoryPanel {
     }
 
     fn view_list(&self) -> Element<'_, crate::Message> {
+        let palette = crate::live_theme::palette();
+        let density = crate::live_theme::tokens().density;
         // UX-7.a — refresh routed through the shared button variant.
         let refresh_btn = variant_button(
             "Refresh",
             ButtonVariant::Ghost,
             (!self.busy).then(|| crate::Message::Inventory(Message::RefreshClicked)),
-            crate::live_theme::palette(),
+            palette,
         );
+
+        // EFF-45 — a failed load renders as failure, never as the
+        // "No peers enrolled" empty state.
+        if let Some(err) = &self.load_error {
+            return panel_container(
+                crate::panel_chrome::error_state(err.clone(), palette, || {
+                    crate::Message::Inventory(Message::RefreshClicked)
+                }),
+                density,
+            );
+        }
 
         if self.rows.is_empty() {
             // UX-6 — canonical empty-state for fleet panels.
@@ -144,10 +167,10 @@ impl InventoryPanel {
             )
             .with_icon(Icon::Fleet);
             return panel_container(
-                empty_state(state, crate::live_theme::palette(), || {
+                empty_state(state, palette, || {
                     crate::Message::Inventory(Message::RefreshClicked)
                 }),
-                crate::live_theme::tokens().density,
+                density,
             );
         }
 
@@ -168,7 +191,7 @@ impl InventoryPanel {
                     "Detail",
                     ButtonVariant::Ghost,
                     Some(crate::Message::Inventory(Message::FocusRow(id))),
-                    crate::live_theme::palette(),
+                    palette,
                 )
             };
             // UX-6 — health renders as a pill-shaped status
@@ -184,7 +207,7 @@ impl InventoryPanel {
                     container(status_badge(
                         health_glyph(&row_data.health),
                         severity,
-                        crate::live_theme::palette(),
+                        palette,
                     ))
                     .width(Length::Fixed(100.0)),
                     text(row_data.region.as_deref().unwrap_or("-")).width(Length::Fixed(120.0)),
@@ -328,6 +351,26 @@ pub async fn run_mackesd(args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap_or_default()
 }
 
+/// EFF-45 — honest version of [`run_mackesd`]: returns `Err` when the
+/// command cannot be spawned or exits non-zero, so callers can distinguish
+/// a real CLI failure from an empty (but valid) response.
+pub async fn run_mackesd_result(args: &[&str]) -> Result<String, String> {
+    let output = Command::new("mackesd")
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| format!("mackesd not found or could not be spawned: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8(output.stderr).unwrap_or_default();
+        return Err(if stderr.trim().is_empty() {
+            format!("mackesd exited with status {}", output.status)
+        } else {
+            stderr
+        });
+    }
+    Ok(String::from_utf8(output.stdout).unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,12 +455,24 @@ mod tests {
     }
 
     #[test]
-    fn error_message_clears_busy_and_stores_msg() {
+    fn error_message_clears_busy_and_stores_load_error() {
+        // EFF-45 — a load error goes to load_error, not status.
         let mut panel = InventoryPanel::new();
         panel.busy = true;
         let _ = panel.update(Message::Error("mackesd not on PATH".into()));
-        assert_eq!(panel.status, "mackesd not on PATH");
+        assert_eq!(panel.load_error.as_deref(), Some("mackesd not on PATH"));
+        assert!(panel.status.is_empty());
         assert!(!panel.busy);
+    }
+
+    #[test]
+    fn loaded_message_clears_load_error() {
+        // EFF-45 — a successful reload must clear any prior load_error.
+        let mut panel = InventoryPanel::new();
+        panel.load_error = Some("prior failure".into());
+        let rows = parse_nodes_json(SAMPLE).unwrap();
+        let _ = panel.update(Message::Loaded(rows));
+        assert!(panel.load_error.is_none());
     }
 
     #[test]

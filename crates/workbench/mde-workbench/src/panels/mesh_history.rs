@@ -14,7 +14,7 @@ use mde_theme::{EmptyState, Icon};
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
-use crate::panel_chrome::{empty_state, panel_container};
+use crate::panel_chrome::{empty_state, error_state, panel_container};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventRow {
@@ -64,6 +64,10 @@ pub struct MeshHistoryPanel {
     pub rows: Vec<EventRow>,
     pub status: String,
     pub busy: bool,
+    /// EFF-45 — set when the event-log LOAD failed (vs legitimately
+    /// empty). The view renders the error state instead of the
+    /// misleading "Audit chain empty" empty state.
+    pub load_error: Option<String>,
     /// Event-id of the row currently drilled into. None = list
     /// view; Some(_) = detail view showing the raw payload + hash.
     pub focused: Option<u64>,
@@ -71,7 +75,7 @@ pub struct MeshHistoryPanel {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Loaded(Vec<EventRow>),
+    Loaded(Result<Vec<EventRow>, String>),
     Error(String),
     FocusRow(u64),
     Back,
@@ -87,26 +91,31 @@ impl MeshHistoryPanel {
     pub fn load() -> Task<crate::Message> {
         Task::perform(
             async move {
-                let raw = run_mackesd_events_list().await;
-                match parse_events_json(&raw) {
-                    Ok(rows) => Message::Loaded(rows),
-                    Err(e) => Message::Error(e),
+                // EFF-45 — distinguish binary-absent / non-zero exit
+                // (source failure → Err) from a legitimately empty
+                // event log (Ok(vec![])).
+                match run_mackesd_events_list().await {
+                    Ok(raw) => parse_events_json(&raw).map_err(|e| e),
+                    Err(e) => Err(e),
                 }
             },
-            crate::Message::MeshHistory,
+            |result| crate::Message::MeshHistory(Message::Loaded(result)),
         )
     }
 
     pub fn update(&mut self, message: Message) -> Task<crate::Message> {
         match message {
-            Message::Loaded(rows) => {
+            Message::Loaded(Ok(rows)) => {
                 self.rows = rows;
                 self.status.clear();
+                self.load_error = None;
                 self.busy = false;
                 Task::none()
             }
-            Message::Error(msg) => {
-                self.status = msg;
+            Message::Loaded(Err(e)) | Message::Error(e) => {
+                // EFF-45 — a failed load is an ERROR state, never an
+                // empty log.
+                self.load_error = Some(e);
                 self.busy = false;
                 Task::none()
             }
@@ -140,13 +149,26 @@ impl MeshHistoryPanel {
     }
 
     fn view_list(&self) -> Element<'_, crate::Message> {
+        let palette = crate::live_theme::palette();
+        let density = crate::live_theme::tokens().density;
         // UX-7.a — refresh routed through the shared button variant.
         let refresh_btn = variant_button(
             "Refresh",
             ButtonVariant::Ghost,
             (!self.busy).then(|| crate::Message::MeshHistory(Message::RefreshClicked)),
-            crate::live_theme::palette(),
+            palette,
         );
+
+        // EFF-45 — a failed load renders as failure, never as the
+        // "Audit chain empty" empty state.
+        if let Some(err) = &self.load_error {
+            return panel_container(
+                error_state(err.clone(), palette, || {
+                    crate::Message::MeshHistory(Message::RefreshClicked)
+                }),
+                density,
+            );
+        }
 
         if self.rows.is_empty() {
             // UX-6 — canonical empty-state pattern (icon slot +
@@ -162,10 +184,10 @@ impl MeshHistoryPanel {
             )
             .with_icon(Icon::History);
             return panel_container(
-                empty_state(state, crate::live_theme::palette(), || {
+                empty_state(state, palette, || {
                     crate::Message::MeshHistory(Message::RefreshClicked)
                 }),
-                crate::live_theme::tokens().density,
+                density,
             );
         }
 
@@ -176,7 +198,7 @@ impl MeshHistoryPanel {
                 "Detail",
                 ButtonVariant::Ghost,
                 Some(crate::Message::MeshHistory(Message::FocusRow(id))),
-                crate::live_theme::palette(),
+                palette,
             );
             let payload_preview: String = r.payload.chars().take(80).collect();
             col.push(
@@ -301,21 +323,29 @@ pub fn parse_events_json(raw: &str) -> Result<Vec<EventRow>, String> {
         .collect())
 }
 
-/// Shell out to `mackesd events list --json`. Returns stdout on
-/// success; empty on failure (consumer surfaces "audit chain
-/// empty" empty-state).
-pub async fn run_mackesd_events_list() -> String {
-    let Ok(output) = Command::new("mackesd")
+/// Shell out to `mackesd events list --json`. Returns `Ok(stdout)`
+/// when the command succeeds.
+///
+/// EFF-45 — distinguishes source failures from an honest empty log:
+/// * binary not on PATH → `Err("mackesd not found: …")`
+/// * non-zero exit → `Err("mackesd events list failed (exit N): …")`
+/// * zero exit + empty output → `Ok("")` which `parse_events_json`
+///   maps to `Ok(vec![])` — the legitimately empty case.
+pub async fn run_mackesd_events_list() -> Result<String, String> {
+    let output = Command::new("mackesd")
         .args(["events", "list", "--json"])
         .output()
         .await
-    else {
-        return String::new();
-    };
+        .map_err(|e| format!("mackesd not found: {e}"))?;
     if !output.status.success() {
-        return String::new();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "mackesd events list failed (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim()
+        ));
     }
-    String::from_utf8(output.stdout).unwrap_or_default()
+    Ok(String::from_utf8(output.stdout).unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -376,9 +406,10 @@ mod tests {
         let mut panel = MeshHistoryPanel::new();
         panel.busy = true;
         let rows = parse_events_json(SAMPLE).unwrap();
-        let _ = panel.update(Message::Loaded(rows.clone()));
+        let _ = panel.update(Message::Loaded(Ok(rows.clone())));
         assert_eq!(panel.rows, rows);
         assert!(!panel.busy);
+        assert!(panel.load_error.is_none());
     }
 
     #[test]
@@ -400,11 +431,20 @@ mod tests {
     }
 
     #[test]
-    fn error_message_clears_busy_and_stores_msg() {
+    fn error_message_clears_busy_and_stores_load_error() {
+        let mut panel = MeshHistoryPanel::new();
+        panel.busy = true;
+        let _ = panel.update(Message::Loaded(Err("mackesd not on PATH".into())));
+        assert_eq!(panel.load_error.as_deref(), Some("mackesd not on PATH"));
+        assert!(!panel.busy);
+    }
+
+    #[test]
+    fn error_variant_also_sets_load_error() {
         let mut panel = MeshHistoryPanel::new();
         panel.busy = true;
         let _ = panel.update(Message::Error("mackesd not on PATH".into()));
-        assert_eq!(panel.status, "mackesd not on PATH");
+        assert_eq!(panel.load_error.as_deref(), Some("mackesd not on PATH"));
         assert!(!panel.busy);
     }
 

@@ -25,7 +25,7 @@ use iced::{Element, Length, Task};
 use mde_theme::{Density, EmptyState, Icon};
 
 use crate::controls::{styled_text_input, variant_button, ButtonVariant};
-use crate::panel_chrome::{card, dialog, empty_state, panel_container};
+use crate::panel_chrome::{card, dialog, empty_state, error_state, panel_container};
 
 /// Subdirectory name under each snapshot dir that holds the
 /// copied config tree.
@@ -51,6 +51,10 @@ pub struct SnapshotsPanel {
     pub new_name_input: String,
     pub status: String,
     pub busy: bool,
+    /// EFF-45 — set when the snapshot LOAD failed (vs
+    /// legitimately empty). The view renders the error state
+    /// instead of the misleading "No snapshots yet" empty state.
+    pub load_error: Option<String>,
     /// Path of the snapshot pending restore confirmation;
     /// `None` = no confirmation modal up.
     pub pending_restore: Option<String>,
@@ -58,7 +62,7 @@ pub struct SnapshotsPanel {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Loaded(Vec<SnapshotRow>),
+    Loaded(Result<Vec<SnapshotRow>, String>),
     Error(String),
     NewNameChanged(String),
     CreateClicked,
@@ -78,29 +82,38 @@ impl SnapshotsPanel {
     pub fn load() -> Task<crate::Message> {
         Task::perform(
             async move {
-                let mut rows = collect_snapshots(&snapshots_root_mde()).await;
-                // Legacy v1.x path — keep readable through the
-                // rebrand window so existing snapshots aren't
-                // orphaned.
+                // EFF-45 — the primary MDE path uses the honest
+                // loader: NotFound → Ok(vec![]) (fresh install),
+                // existing-but-unreadable → Err(String). The
+                // legacy v1.x path is junk-tolerant (swallows
+                // per-entry errors) so migrated users don't see a
+                // scary error when the legacy dir partially migrated.
+                let mut rows = match collect_snapshots_result(&snapshots_root_mde()).await {
+                    Ok(r) => r,
+                    Err(e) => return Err(e),
+                };
                 let legacy = collect_snapshots(&snapshots_root_legacy()).await;
                 rows.extend(legacy);
                 rows.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-                Message::Loaded(rows)
+                Ok(rows)
             },
-            crate::Message::Snapshots,
+            |result| crate::Message::Snapshots(Message::Loaded(result)),
         )
     }
 
     pub fn update(&mut self, message: Message) -> Task<crate::Message> {
         match message {
-            Message::Loaded(rows) => {
+            Message::Loaded(Ok(rows)) => {
                 self.rows = rows;
                 self.status.clear();
+                self.load_error = None;
                 self.busy = false;
                 Task::none()
             }
-            Message::Error(msg) => {
-                self.status = msg;
+            Message::Loaded(Err(e)) | Message::Error(e) => {
+                // EFF-45 — a failed load is an ERROR state, never an
+                // empty snapshot list.
+                self.load_error = Some(e);
                 self.busy = false;
                 Task::none()
             }
@@ -179,6 +192,19 @@ impl SnapshotsPanel {
         // control primitives so hover/focus/active/disabled
         // states are consistent across panels.
         let palette = crate::live_theme::palette();
+        let density = crate::live_theme::tokens().density;
+
+        // EFF-45 — a failed load renders as failure, never as the
+        // "No snapshots yet" empty state.
+        if let Some(err) = &self.load_error {
+            return panel_container(
+                error_state(err.clone(), palette, || {
+                    crate::Message::Snapshots(Message::CreateClicked)
+                }),
+                density,
+            );
+        }
+
         let create_press = if self.busy {
             None
         } else {
@@ -353,6 +379,32 @@ pub async fn collect_snapshots(root: &Path) -> Vec<SnapshotRow> {
         }
     }
     out
+}
+
+/// EFF-45 — honest variant of [`collect_snapshots`]: NotFound = legitimately
+/// empty (fresh install); an existing-but-unreadable root = load failure.
+/// Per-entry junk (unparseable manifest.json) is still silently skipped.
+pub async fn collect_snapshots_result(root: &Path) -> Result<Vec<SnapshotRow>, String> {
+    let mut rd = match tokio::fs::read_dir(root).await {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("reading {}: {e}", root.display())),
+    };
+    let mut out = Vec::new();
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let dir = entry.path();
+        let manifest_path = dir.join(MANIFEST_FILE);
+        let Ok(raw) = tokio::fs::read_to_string(&manifest_path).await else {
+            continue;
+        };
+        if let Some(row) = parse_manifest(&dir.to_string_lossy(), &raw) {
+            out.push(row);
+        }
+    }
+    Ok(out)
 }
 
 /// Pure parser for the per-snapshot manifest. The JSON shape
@@ -595,7 +647,7 @@ mod tests {
         let mut panel = SnapshotsPanel::new();
         panel.busy = true;
         let rows = vec![parse_manifest("/x/y", SAMPLE).unwrap()];
-        let _ = panel.update(Message::Loaded(rows.clone()));
+        let _ = panel.update(Message::Loaded(Ok(rows.clone())));
         assert_eq!(panel.rows, rows);
         assert!(!panel.busy);
     }

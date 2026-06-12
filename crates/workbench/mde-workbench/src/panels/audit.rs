@@ -55,6 +55,9 @@ pub struct AuditPanel {
     pub report: AuditReport,
     pub loaded: bool,
     pub status: String,
+    /// EFF-45 — set when the audit-verify CLI FAILED (exit non-zero + no JSON).
+    /// The view renders the error state instead of the misleading empty state.
+    pub load_error: Option<String>,
     pub busy: bool,
 }
 
@@ -93,12 +96,15 @@ impl AuditPanel {
             Message::Loaded(report) => {
                 self.report = report;
                 self.loaded = true;
+                self.load_error = None;
                 self.busy = false;
                 self.status.clear();
                 Task::none()
             }
             Message::Error(e) => {
-                self.status = e;
+                // EFF-45 — a failed CLI run is an error state, not an empty
+                // audit log.
+                self.load_error = Some(e);
                 self.busy = false;
                 Task::none()
             }
@@ -122,6 +128,16 @@ impl AuditPanel {
             (!self.busy).then(|| crate::Message::Audit(Message::VerifyClicked)),
             palette,
         );
+
+        // EFF-45 — a failed CLI run renders as failure, never as the empty state.
+        if let Some(err) = &self.load_error {
+            return panel_container(
+                crate::panel_chrome::error_state(err.clone(), palette, || {
+                    crate::Message::Audit(Message::VerifyClicked)
+                }),
+                density,
+            );
+        }
 
         if !self.loaded || (self.report.timeline.is_empty() && self.report.verify == "empty") {
             let state = EmptyState::with_cta(
