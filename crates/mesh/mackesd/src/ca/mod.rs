@@ -40,6 +40,10 @@ pub mod backup;
 // the CSR sign gate (nebula_enroll::sign_pending_csr).
 pub mod ban_list;
 pub mod blocklist;
+// EFF-11 — CA-cert expiry probe (days-remaining via nebula-cert
+// print -json). Consumed by the metrics_exporter worker for the
+// mackesd_ca_cert_days_remaining metric + threshold alert.
+pub mod expiry;
 pub mod rotation_gate;
 // INST-7 prerequisite — peer cert revocation CLI (`mackesd ca
 // revoke <node-id>`). Replaces the originally-planned D-Bus method;

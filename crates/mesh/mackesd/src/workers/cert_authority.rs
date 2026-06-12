@@ -419,6 +419,15 @@ fn expand_home(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Home-expanded [`DEFAULT_CA_CERT_PATH`] — the path the CA worker
+/// signs against. Exposed so other workers (the EFF-9 metrics
+/// exporter's EFF-11 cert-expiry probe) point at the same cert
+/// without re-deriving the location.
+#[must_use]
+pub fn default_ca_cert_path() -> PathBuf {
+    expand_home(DEFAULT_CA_CERT_PATH)
+}
+
 fn default_bus_root() -> Option<PathBuf> {
     Some(dirs::data_dir()?.join("mde").join("bus"))
 }

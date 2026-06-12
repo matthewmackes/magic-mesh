@@ -48,18 +48,26 @@ pub struct MetricsExporterWorker {
     /// node_exporter textfile collector dir
     /// ([`crate::metrics::default_textfile_dir`]).
     textfile_dir: PathBuf,
+    /// Path to the Nebula CA cert, for the EFF-11 expiry probe. When
+    /// set, each tick emits `mackesd_ca_cert_days_remaining` +
+    /// `mackesd_ca_cert_expiry_warning` and logs a warn under the
+    /// threshold. `None` (or a missing `nebula-cert`) silently omits
+    /// the cert series rather than alerting on an unknown.
+    ca_cert_path: Option<PathBuf>,
     /// Override the tick cadence (default [`TICK_INTERVAL`]). Used by
     /// tests to drive the loop without 30 s waits.
     tick: Duration,
 }
 
 impl MetricsExporterWorker {
-    /// Construct with production defaults: 30 s tick.
+    /// Construct with production defaults: 30 s tick, CA-cert expiry
+    /// probe against `ca_cert_path`.
     #[must_use]
-    pub fn new(db_path: PathBuf, textfile_dir: PathBuf) -> Self {
+    pub fn new(db_path: PathBuf, textfile_dir: PathBuf, ca_cert_path: Option<PathBuf>) -> Self {
         Self {
             db_path,
             textfile_dir,
+            ca_cert_path,
             tick: TICK_INTERVAL,
         }
     }
@@ -87,11 +95,12 @@ impl Worker for MetricsExporterWorker {
                 _ = interval.tick() => {
                     let db = self.db_path.clone();
                     let dir = self.textfile_dir.clone();
-                    // tick_once is sync (rusqlite + blocking file I/O) —
-                    // hop onto a blocking task so it doesn't pin the
-                    // tokio scheduler.
+                    let ca = self.ca_cert_path.clone();
+                    // tick_once is sync (rusqlite + blocking file I/O +
+                    // a nebula-cert subprocess) — hop onto a blocking
+                    // task so it doesn't pin the tokio scheduler.
                     let _ = tokio::task::spawn_blocking(move || {
-                        tick_once(&db, &dir);
+                        tick_once(&db, &dir, ca.as_deref());
                     })
                     .await;
                 }
@@ -108,7 +117,11 @@ impl Worker for MetricsExporterWorker {
 /// Pulled out as a free function so tests can drive a single pass
 /// against a tempdir + in-memory-then-file store without owning the
 /// tokio scheduler.
-pub fn tick_once(db_path: &std::path::Path, textfile_dir: &std::path::Path) {
+pub fn tick_once(
+    db_path: &std::path::Path,
+    textfile_dir: &std::path::Path,
+    ca_cert_path: Option<&std::path::Path>,
+) {
     let conn = match crate::store::open(db_path) {
         Ok(c) => c,
         Err(e) => {
@@ -120,7 +133,10 @@ pub fn tick_once(db_path: &std::path::Path, textfile_dir: &std::path::Path) {
             return;
         }
     };
-    let counters = snapshot_counters(&conn);
+    let mut counters = snapshot_counters(&conn);
+    if let Some(ca) = ca_cert_path {
+        counters.extend(cert_counters(ca, now_unix()));
+    }
     match write_textfile(textfile_dir, &counters, &[]) {
         Ok(path) => tracing::debug!(path = %path.display(), "metrics-exporter: wrote snapshot"),
         Err(e) => tracing::warn!(
@@ -185,6 +201,51 @@ pub fn snapshot_counters(conn: &rusqlite::Connection) -> Vec<Counter> {
     ]
 }
 
+/// EFF-11 — CA-cert expiry series. Probes `ca_cert_path` for days
+/// remaining and renders two counters: `mackesd_ca_cert_days_remaining`
+/// (clamped at 0 — an expired cert reads as "0 days", and the metric
+/// stays representable in the u64 counter value) and
+/// `mackesd_ca_cert_expiry_warning` (1 when at/under
+/// [`crate::ca::expiry::CERT_EXPIRY_WARN_DAYS`], else 0). Logs a warn
+/// under the threshold so the cliff is visible in logs as well as the
+/// scrape. Returns an empty vec when the probe can't read the cert
+/// (`nebula-cert` missing / unreadable) — an unknown is not an alert.
+fn cert_counters(ca_cert_path: &std::path::Path, now_unix: i64) -> Vec<Counter> {
+    let Some(days) = crate::ca::expiry::ca_cert_days_remaining(ca_cert_path, now_unix) else {
+        return Vec::new();
+    };
+    let warning = days <= crate::ca::expiry::CERT_EXPIRY_WARN_DAYS;
+    if warning {
+        tracing::warn!(
+            days_remaining = days,
+            threshold = crate::ca::expiry::CERT_EXPIRY_WARN_DAYS,
+            ca_cert = %ca_cert_path.display(),
+            "metrics-exporter: CA cert near expiry — rotate with `mackesd ca rotate`",
+        );
+    }
+    vec![
+        Counter {
+            name: "mackesd_ca_cert_days_remaining",
+            help: "Days until the Nebula CA cert expires (clamped at 0)",
+            value: u64::try_from(days.max(0)).unwrap_or(0),
+            labels: BTreeMap::new(),
+        },
+        Counter {
+            name: "mackesd_ca_cert_expiry_warning",
+            help: "1 when the CA cert is at/under the expiry warn threshold, else 0",
+            value: u64::from(warning),
+            labels: BTreeMap::new(),
+        },
+    ]
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,7 +257,11 @@ mod tests {
 
     #[test]
     fn worker_name_matches_tier_table() {
-        let w = MetricsExporterWorker::new(PathBuf::from("/tmp/db"), PathBuf::from("/tmp/tf"));
+        let w = MetricsExporterWorker::new(
+            PathBuf::from("/tmp/db"),
+            PathBuf::from("/tmp/tf"),
+            None,
+        );
         assert_eq!(w.name(), "metrics_exporter");
     }
 
@@ -236,7 +301,7 @@ mod tests {
             upsert_node(&conn, "peer:a", "a", "pk", None).expect("seed");
             crate::store::set_node_health(&conn, "peer:a", "healthy").expect("health");
         }
-        tick_once(&db, dir.path());
+        tick_once(&db, dir.path(), None);
         let prom = std::fs::read_to_string(dir.path().join("mackesd.prom")).expect("prom written");
         assert!(prom.contains("# TYPE mackesd_mesh_nodes_total counter"));
         assert!(prom.contains("mackesd_mesh_nodes_total 1"));

@@ -4967,6 +4967,7 @@ fn run_serve(
                 mackesd_core::workers::metrics_exporter::MetricsExporterWorker::new(
                     db_path.clone(),
                     mackesd_core::metrics::default_textfile_dir(),
+                    Some(mackesd_core::workers::cert_authority::default_ca_cert_path()),
                 ),
                 RestartPolicy::OnFailure,
             ));
