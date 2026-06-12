@@ -5,11 +5,19 @@
 //! grids behind each card + playback land with the `mde-musicd` data
 //! path (AIR-10.b / AIR-2); this shell is the §0.12 runtime-reachable
 //! entry point that makes the [`hub`]/[`nav`] models live.
+//!
+//! EFF-34 — ported off iced 0.13 onto libcosmic's vendored iced. `cosmic::iced`
+//! is the fork; the shell is a `cosmic::Application`, and the per-widget style
+//! closures bridge to cosmic's class-based theming via [`cosmic_compat`].
 
-use iced::widget::{
+mod cosmic_compat;
+use cosmic_compat::TextSty;
+
+use cosmic::iced::widget::{
     button, column, container, image, row, scrollable, stack, text, text_input, Space,
 };
-use iced::{Element, Length, Size, Subscription, Task};
+use cosmic::iced::{Length, Subscription};
+use cosmic::{Application, ApplicationExt, Element};
 
 use mde_music::album::{self, AlbumView};
 use mde_music::color;
@@ -21,16 +29,13 @@ use mde_music::prefs::{self, SortKey};
 use mde_music::search::{self, SearchResults};
 use mde_musicd::creds::{self, Creds};
 
-fn main() -> iced::Result {
-    iced::application(
-        |_state: &State| String::from("MDE Music"),
-        State::update,
-        State::view,
-    )
-    .subscription(State::subscription)
-    .theme(|_state: &State| mde_music_iced_theme())
-    .window_size(Size::new(1100.0, 720.0))
-    .run_with(|| (State::new(), Task::none()))
+/// The reducer's iced-space [`Task`] (the inherent `update`/subscription build
+/// these; the `cosmic::Application` trait lifts them into the cosmic Action
+/// space). Aliased to keep the AIR-* call sites reading as plain `Task`.
+type Task<M> = cosmic::iced::Task<M>;
+
+fn main() -> cosmic::iced::Result {
+    cosmic::app::run::<State>(cosmic::app::Settings::default(), ())
 }
 
 /// Convert an mde-theme Carbon token (`Rgba`, u8 channels) to this crate's
@@ -38,8 +43,8 @@ fn main() -> iced::Result {
 /// `mde_theme::into_iced_color()` targets, so the conversion is by hand — the
 /// single sanctioned spot for raw channel math, keeping every call site on a
 /// token rather than a literal (§4).
-fn carbon(rgba: mde_theme::Rgba, a: f32) -> iced::Color {
-    iced::Color {
+fn carbon(rgba: mde_theme::Rgba, a: f32) -> cosmic::iced::Color {
+    cosmic::iced::Color {
         r: f32::from(rgba.r) / 255.0,
         g: f32::from(rgba.g) / 255.0,
         b: f32::from(rgba.b) / 255.0,
@@ -47,32 +52,37 @@ fn carbon(rgba: mde_theme::Rgba, a: f32) -> iced::Color {
     }
 }
 
-/// Build the media player's `iced::Theme` from the canonical
-/// `mde_theme::Palette` (E5.3) — the Q2 indigo accent, Apple-charcoal
-/// background, and the centralized semantic tokens, single-sourced so
-/// the player's chrome matches the rest of the MDE dark desktop instead
-/// of iced's default light theme. (The now-playing surface keeps its
-/// album-art-driven accent on top of this base.)
+/// Build a Carbon `cosmic::iced::Theme` from the canonical `mde_theme::Palette`
+/// (E5.3) — the Q2 indigo accent, Apple-charcoal background, and the semantic
+/// tokens, single-sourced from the design palette.
+///
+/// EFF-34 — under the `cosmic::Application` shell the global theme is cosmic's
+/// (the `.theme(..)` builder of the old `iced::application` is gone), so this is
+/// no longer wired into the runtime; it's retained as the **§4 token-derivation
+/// guard** exercised by [`theme_tests`] (a future per-widget Carbon pass, à la
+/// mde-files, would consume the same palette). Hence `dead_code` outside tests.
 #[must_use]
-fn mde_music_iced_theme() -> iced::Theme {
+#[cfg_attr(not(test), allow(dead_code))]
+fn mde_music_iced_theme() -> cosmic::iced::Theme {
     use mde_theme::Palette;
     // Opaque conversion of an mde_theme token — delegates to the module-level
     // `carbon` helper (the one place channel math lives).
-    fn c(rgba: mde_theme::Rgba) -> iced::Color {
+    fn c(rgba: mde_theme::Rgba) -> cosmic::iced::Color {
         carbon(rgba, 1.0)
     }
     let p = Palette::dark();
-    // NB: this crate's iced `theme::Palette` predates the `warning`
-    // field (a dep skew from the workbench's iced), so it carries the
-    // 5 base roles only.
-    let palette = iced::theme::Palette {
+    // EFF-34 — libcosmic's vendored iced `theme::Palette` carries the
+    // `warning` role (unlike the crates.io iced 0.13 this crate used to
+    // target), so seed it from the Carbon warning token alongside the rest.
+    let palette = cosmic::iced::theme::Palette {
         background: c(p.background),
         text: c(p.text),
         primary: c(p.accent),
         success: c(p.success),
+        warning: c(p.warning),
         danger: c(p.danger),
     };
-    iced::Theme::custom("MDE Music".to_string(), palette)
+    cosmic::iced::Theme::custom("MDE Music".to_string(), palette)
 }
 
 /// The first-run "connect your Airsonic server" form, shown until valid
@@ -86,6 +96,8 @@ struct FirstRunForm {
 }
 
 struct State {
+    /// EFF-34 — the `cosmic::Application` shell state (window/theme/a11y).
+    core: cosmic::app::Core,
     nav: NavState,
     /// `Some` until the operator connects a server (first run); `None`
     /// once creds exist and the library shell is shown.
@@ -251,12 +263,13 @@ enum Message {
 }
 
 impl State {
-    fn new() -> Self {
+    fn new(core: cosmic::app::Core) -> Self {
         let (form, connection) = match creds::load() {
             Ok(c) => (None, format!("Connected to {}", c.server_url)),
             Err(_) => (Some(FirstRunForm::default()), String::new()),
         };
         Self {
+            core,
             nav: NavState::new(),
             form,
             connection,
@@ -321,9 +334,14 @@ impl State {
                     .get(&self.nav.current().segment())
                     .copied()
                     .unwrap_or(0.0);
-                let restore = iced::widget::scrollable::scroll_to(
+                let restore = cosmic::iced::widget::scrollable::scroll_to(
                     grid_scroll_id(),
-                    iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },
+                    // EFF-34 — the fork's `AbsoluteOffset` axes are `Option<f32>`
+                    // (a per-axis "leave as-is" None); pin y, leave x untouched.
+                    cosmic::iced::widget::scrollable::AbsoluteOffset {
+                        x: None,
+                        y: Some(y),
+                    },
                 );
                 // AIR-11.c.3 — fan out per-card cover-art fetches (the AIR-7
                 // mesh cache makes re-fetches cheap; visible perf is §0.15 bench).
@@ -503,7 +521,7 @@ impl State {
             }
             Message::FocusSearch => {
                 self.search_open = true;
-                text_input::focus(search_id())
+                cosmic::widget::text_input::focus(search_id())
             }
             Message::DismissSearch => {
                 self.dismiss_search();
@@ -724,22 +742,26 @@ impl State {
 
     /// Keyboard shortcuts: Cmd/Ctrl-F focuses search, Esc dismisses it.
     fn subscription(&self) -> Subscription<Message> {
-        let keys = iced::keyboard::on_key_press(|key, modifiers| {
-            use iced::keyboard::key::Named;
-            use iced::keyboard::Key;
-            match key {
-                Key::Character(c) if c.as_str() == "f" && modifiers.command() => {
-                    Some(Message::FocusSearch)
-                }
+        // EFF-34 — the fork's keyboard facade has no `on_key_press`; the raw
+        // `KeyPressed` event (via `listen_with`) drives the same shortcuts.
+        let keys = cosmic::iced::event::listen_with(|event, _status, _id| {
+            use cosmic::iced::keyboard::key::Named;
+            use cosmic::iced::keyboard::{Event as Kbd, Key};
+            let cosmic::iced::Event::Keyboard(Kbd::KeyPressed { key, modifiers, .. }) = event
+            else {
+                return None;
+            };
+            match key.as_ref() {
+                Key::Character("f") if modifiers.command() => Some(Message::FocusSearch),
                 Key::Named(Named::Escape) => Some(Message::DismissSearch),
                 _ => None,
             }
         });
         // AIR-11.c — track window width so the library grid can reflow
-        // its columns (iced 0.13's facade has no `responsive`; the resize
-        // event drives the adaptive layout instead).
-        let resizes = iced::event::listen_with(|event, _status, _id| match event {
-            iced::Event::Window(iced::window::Event::Resized(size)) => {
+        // its columns (the facade has no `responsive`; the resize event
+        // drives the adaptive layout instead).
+        let resizes = cosmic::iced::event::listen_with(|event, _status, _id| match event {
+            cosmic::iced::Event::Window(cosmic::iced::window::Event::Resized(size)) => {
                 Some(Message::WindowResized(size.width))
             }
             _ => None,
@@ -752,7 +774,7 @@ impl State {
             Subscription::batch([
                 keys,
                 resizes,
-                iced::time::every(nowplaying::POLL).map(|_| Message::PollState),
+                cosmic::iced::time::every(nowplaying::POLL).map(|_| Message::PollState),
             ])
         }
     }
@@ -771,22 +793,22 @@ impl State {
     fn first_run_view(&self, f: &FirstRunForm) -> Element<'_, Message> {
         let mut col = column![
             text("Connect your music").size(22),
-            Space::with_height(Length::Fixed(8.0)),
+            Space::new().height(Length::Fixed(8.0)),
             text("Point MDE Music at your Airsonic / Navidrome server.").size(13),
-            Space::with_height(Length::Fixed(16.0)),
+            Space::new().height(Length::Fixed(16.0)),
             text_input("https://music.your-mesh:4040", &f.url).on_input(Message::UrlChanged),
             text_input("username", &f.user).on_input(Message::UserChanged),
             text_input("password", &f.pass)
                 .secure(true)
                 .on_input(Message::PassChanged),
-            Space::with_height(Length::Fixed(12.0)),
+            Space::new().height(Length::Fixed(12.0)),
             button(text("Connect")).on_press(Message::Connect),
         ]
         .spacing(8)
         .padding(28)
         .max_width(440);
         if let Some(err) = &f.error {
-            col = col.push(Space::with_height(Length::Fixed(8.0)));
+            col = col.push(Space::new().height(Length::Fixed(8.0)));
             col = col.push(text(err.clone()).size(13));
         }
         container(col)
@@ -831,7 +853,7 @@ impl State {
                 // wrapping 160×160 card grid, ordered by the persisted sort.
                 let title_row = row![
                     text(route.segment()).size(20),
-                    Space::with_width(Length::Fill),
+                    Space::new().width(Length::Fill),
                     button(text(format!("Sort: {}", self.sort.label())).size(12))
                         .on_press(Message::ToggleSort),
                 ]
@@ -929,16 +951,16 @@ impl State {
             .width(Length::Fixed(340.0));
         let header = row![
             text(&self.connection).size(13),
-            Space::with_width(Length::Fill),
+            Space::new().width(Length::Fill),
             search_field,
         ]
         .spacing(12);
 
         let mut page_col = column![
             header,
-            Space::with_height(Length::Fixed(12.0)),
+            Space::new().height(Length::Fixed(12.0)),
             crumbs,
-            Space::with_height(Length::Fixed(16.0)),
+            Space::new().height(Length::Fixed(16.0)),
             body,
         ]
         .padding(20)
@@ -983,7 +1005,7 @@ impl State {
                 }));
             }
         }
-        col = col.push(Space::with_height(Length::Fixed(8.0)));
+        col = col.push(Space::new().height(Length::Fixed(8.0)));
         col = col.push(button(text("Close")).on_press(Message::DismissSearch));
         container(scrollable(col))
             .width(Length::Fill)
@@ -1026,7 +1048,7 @@ impl State {
             text(a.name.clone()).size(24),
             text(a.artist.clone()).size(15),
             text(meta).size(12),
-            Space::with_height(Length::Fixed(10.0)),
+            Space::new().height(Length::Fixed(10.0)),
             actions,
         ]
         .spacing(4);
@@ -1070,14 +1092,14 @@ impl State {
         let header_band = container(header)
             .padding(16)
             .width(Length::Fill)
-            .style(move |_| iced::widget::container::Style {
-                background: Some(iced::Color::from_rgb8(cr, cg, cb).into()), // carbon-ok: dynamic album-art colour, not a UI token
-                text_color: Some(iced::Color::from_rgb8(tr, tg, tb)), // carbon-ok: dynamic album-art colour
+            .style(move |_| cosmic::iced::widget::container::Style {
+                background: Some(cosmic::iced::Color::from_rgb8(cr, cg, cb).into()), // carbon-ok: dynamic album-art colour, not a UI token
+                text_color: Some(cosmic::iced::Color::from_rgb8(tr, tg, tb)), // carbon-ok: dynamic album-art colour
                 ..Default::default()
             });
         let content = column![
             header_band,
-            Space::with_height(Length::Fixed(16.0)),
+            Space::new().height(Length::Fixed(16.0)),
             scrollable(list)
         ]
         .spacing(8)
@@ -1154,12 +1176,13 @@ impl State {
                 .width(Length::Fixed(240.0))
                 .height(Length::Fixed(240.0))
                 .into(),
-            None => Space::with_height(Length::Fixed(0.0)).into(),
+            None => Space::new().height(Length::Fixed(0.0)).into(),
         };
         let ratio = (self.now_state.position_ms as f32 / self.now_duration_ms.max(1) as f32)
             .clamp(0.0, 1.0);
         let scrub: Element<'_, Message> = column![
-            iced::widget::progress_bar(0.0..=1.0, ratio).height(Length::Fixed(6.0)),
+            // EFF-34 — the fork renamed the bar's cross-axis setter to `girth`.
+            cosmic::iced::widget::progress_bar(0.0..=1.0, ratio).girth(Length::Fixed(6.0)),
             text(format!(
                 "{}:{:02} / {}:{:02}",
                 self.now_state.position_ms / 60000,
@@ -1172,7 +1195,7 @@ impl State {
         .spacing(2)
         .into();
         let volume_slider: Element<'_, Message> =
-            iced::widget::slider(0.0..=1.0, self.now_state.volume, Message::SetVolume)
+            cosmic::iced::widget::slider(0.0..=1.0, self.now_state.volume, Message::SetVolume)
                 .step(0.01_f32)
                 .width(Length::Fixed(200.0))
                 .into();
@@ -1181,7 +1204,7 @@ impl State {
                 text("Now Playing").size(22).width(Length::Fill),
                 button(text("Close").size(13)).on_press(Message::ToggleMaxi),
             ]
-            .align_y(iced::Alignment::Center),
+            .align_y(cosmic::iced::Alignment::Center),
             art,
             text(title).size(28),
             text(self.now_artist.clone()).size(16),
@@ -1216,7 +1239,7 @@ impl State {
         let lyrics: Element<'_, Message> = if self.maxi_lyrics.is_empty() {
             text("No lyrics for this track")
                 .size(13)
-                .color(muted)
+                .colr(muted)
                 .into()
         } else {
             let mut col = column![].spacing(2);
@@ -1226,7 +1249,7 @@ impl State {
             col.into()
         };
         let peers: Element<'_, Message> = if self.maxi_peers.is_empty() {
-            text("No peers on the mesh").size(13).color(muted).into()
+            text("No peers on the mesh").size(13).colr(muted).into()
         } else {
             let mut col = column![].spacing(6);
             for p in &self.maxi_peers {
@@ -1234,7 +1257,7 @@ impl State {
                 col = col.push(
                     row![
                         text(p.host.clone()).size(14).width(Length::Fixed(150.0)),
-                        text(status).size(12).color(muted),
+                        text(status).size(12).colr(muted),
                         button(text("Take over").size(12))
                             .on_press(Message::TakeOver(p.host.clone())),
                     ]
@@ -1245,7 +1268,7 @@ impl State {
         };
         let tab = |label: &'static str, t: MaxiTab| {
             let color = if self.maxi_tab == t { accent } else { muted };
-            button(text(label).size(13).color(color)).on_press(Message::MaxiTabSelected(t))
+            button(text(label).size(13).colr(color)).on_press(Message::MaxiTabSelected(t))
         };
         let tab_bar = row![
             tab("Queue", MaxiTab::Queue),
@@ -1270,15 +1293,57 @@ impl State {
     }
 }
 
+/// EFF-34 — the `cosmic::Application` shell. The inherent `update`/`view`/
+/// `subscription` carry the real AIR-* logic (inherent methods win direct
+/// calls, so these trait methods delegate without recursion); the trait wraps
+/// the reducer's iced `Task` into the cosmic `Action` space.
+impl Application for State {
+    type Executor = cosmic::executor::Default;
+    type Flags = ();
+    type Message = Message;
+    const APP_ID: &'static str = "com.mackes.MdeMusic";
+
+    fn core(&self) -> &cosmic::app::Core {
+        &self.core
+    }
+
+    fn core_mut(&mut self) -> &mut cosmic::app::Core {
+        &mut self.core
+    }
+
+    fn init(core: cosmic::app::Core, _flags: ()) -> (Self, cosmic::app::Task<Self::Message>) {
+        let mut s = Self::new(core);
+        // Keep mde-music's in-app chrome; suppress Cosmic's headerbar so the
+        // breadcrumb/connection header reads as the only top bar.
+        s.core.window.show_headerbar = false;
+        s.set_header_title("MDE Music".to_string());
+        (s, cosmic::app::Task::none())
+    }
+
+    fn subscription(&self) -> Subscription<Self::Message> {
+        State::subscription(self)
+    }
+
+    fn update(&mut self, message: Self::Message) -> cosmic::app::Task<Self::Message> {
+        // Delegate to the inherent reducer (inherent resolution wins), then lift
+        // the iced Task into the cosmic Action space the runtime expects.
+        State::update(self, message).map(cosmic::Action::App)
+    }
+
+    fn view(&self) -> Element<'_, Self::Message> {
+        State::view(self)
+    }
+}
+
 /// The stable widget id for the AIR-14 search field (so Cmd-F can focus it).
-fn search_id() -> text_input::Id {
-    text_input::Id::new("mde-music-search")
+fn search_id() -> cosmic::iced::widget::Id {
+    cosmic::iced::widget::Id::new("mde-music-search")
 }
 
 /// AIR-11.c.2 — stable id for the library card grid's scrollable, so the
 /// scroll position can be saved on scroll + restored on category re-entry.
-fn grid_scroll_id() -> iced::widget::scrollable::Id {
-    iced::widget::scrollable::Id::new("mde-music-grid")
+fn grid_scroll_id() -> cosmic::iced::widget::Id {
+    cosmic::iced::widget::Id::new("mde-music-grid")
 }
 
 /// Render one search section: a heading + a clickable row per item. An
@@ -1296,7 +1361,7 @@ fn result_section<'a>(
     for item in items {
         col = col.push(button(text(item.label.clone())).on_press(on_click(item)));
     }
-    col = col.push(Space::with_height(Length::Fixed(10.0)));
+    col = col.push(Space::new().height(Length::Fixed(10.0)));
     col.into()
 }
 

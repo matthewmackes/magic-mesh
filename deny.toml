@@ -120,9 +120,11 @@ license-files = []
 
 
 [bans]
-# The iced 0.13 (mde-music) vs libcosmic-vendored fork duplication is a
-# known, tracked condition (EFF-34) — warn keeps it visible without
-# redding master until the music port lands.
+# multiple-versions stays warn: the remaining same-name duplication is
+# crates.io iced 0.14 (workbench/voice-hud/iced-components) vs the
+# libcosmic fork's 0.14 (the four cosmic-native crates) — deliberate
+# until the operator-locked full-libcosmic cutover ports the rest.
+# (EFF-34's iced 0.13 is GONE and hard-banned below.)
 multiple-versions = "warn"
 wildcards = "allow"
 
@@ -133,6 +135,13 @@ name = "openssl"
 name = "openssl-sys"
 [[bans.deny]]
 name = "native-tls"
+# EFF-34 — the iced 0.13 renderer is retired (mde-music ported to the
+# libcosmic fork, 2026-06-12); a reintroduced 0.13 dep is a regression.
+# (The crates.io 0.14 + fork 0.14 pair coexist deliberately until the
+# operator-locked full-libcosmic cutover lands the remaining crates.)
+[[bans.deny]]
+name = "iced"
+version = "<0.14"
 
 [sources]
 unknown-registry = "deny"

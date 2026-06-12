@@ -17,7 +17,15 @@ name = "mde_music"
 path = "src/lib.rs"
 
 [dependencies]
-iced       = { version = "0.13", default-features = false, features = ["wgpu", "tiny-skia", "tokio", "advanced", "image"] }
+# EFF-34 (2026-06-12) — Cosmic-native cutover: mde-music is ported off iced
+# 0.13 onto libcosmic (the same git rev the other three consumers pin, per the
+# EFF-35 identical-rev policy). `cosmic::iced` is libcosmic's vendored iced
+# fork, so the view/style code ports mechanically (iced:: → cosmic::iced::) and
+# the shell becomes a `cosmic::Application`. libcosmic always builds its iced
+# with `advanced` + `image-without-codecs` + `svg`, so the album-art `image`
+# widget needs no extra feature here — wgpu render + wayland for the windowed
+# app, mirroring mde-files' GUI-7 feature set.
+libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "cca48bc29ef7a9f22160c0ab6ba117ab22d1ae87", default-features = false, features = ["tokio", "winit", "wgpu", "a11y", "wayland", "multi-window"] }
 # The credential loader (shared with the daemon) — the hub banner reads
 # the configured server.
 mde-musicd = { path = "../mde-musicd" }
