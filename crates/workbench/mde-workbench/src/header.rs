@@ -8,9 +8,14 @@
 //! size / weight tokens come from `mde-theme` — zero hardcoded
 //! literals.
 //!
-//! Material Symbols glyph swap-in lands with UX-8 (icon system).
-//! Until then the controls render with single-Unicode placeholders
-//! (`−` / `□` / `×`) that match the v8.7 panel-side fallback.
+//! Window controls render the Material Symbols SVGs (UX-8.a /
+//! BUG-13.c): `control_button` resolves each via
+//! `mde_icon(..).svg_bytes()` (WindowMinimize→remove,
+//! WindowMaximize→fullscreen, WindowClose→close — all baked at the
+//! inline optical size), so the SVG path always wins. The
+//! single-Unicode glyphs (`−` / `□` / `×`) survive only as the
+//! `fallback_glyph` branch for an unbaked variant — never reached by
+//! these three today.
 //!
 //! Acceptance fields per the worklist UX-4 entry:
 //!   (a) 48 px height, surface background, 1 px divider border ✓
