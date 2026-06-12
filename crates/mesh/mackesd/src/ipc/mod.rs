@@ -52,6 +52,31 @@ pub mod shell;
 /// session bus.
 pub const MACKESD_BUS_NAME: &str = "org.mackes.mackesd";
 
+/// EFF-23 — maximum inbound RPC body size a Bus responder will hand to
+/// `serde_json::from_str`. Bodies above this are answered with an error
+/// envelope and never parsed, bounding the CPU/allocation an untrusted
+/// Bus writer can force with one oversized message. 64 KiB comfortably
+/// fits every real action body (selectors, peer lists, a send-to source
+/// list for a ≤8-peer mesh); legitimate bulk transfer goes over the
+/// LizardFS-replicated volume, not an action body.
+pub const MAX_RPC_BODY_BYTES: usize = 64 * 1024;
+
+/// True when `body` is absent or within [`MAX_RPC_BODY_BYTES`]. A
+/// responder calls this before parsing; an over-cap body is refused
+/// with an error envelope instead of reaching `from_str`.
+#[must_use]
+pub fn body_within_cap(body: Option<&str>) -> bool {
+    body.is_none_or(|b| b.len() <= MAX_RPC_BODY_BYTES)
+}
+
+/// EFF-23 — the `{"error": …}` envelope a responder returns when it
+/// refuses an over-cap body. Shared so every surface answers the same
+/// shape (callers already branch on `error`).
+#[must_use]
+pub fn body_too_large_reply(verb: &str) -> String {
+    serde_json::json!({ "error": format!("{verb}: request body too large") }).to_string()
+}
+
 /// Convenience: the canonical object path for each service.
 pub mod paths {
     /// `/org/mackes/Shell`

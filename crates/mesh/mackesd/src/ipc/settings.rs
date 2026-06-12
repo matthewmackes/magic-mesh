@@ -173,7 +173,18 @@ pub fn poll_once(persist: &Persist, svc: &SettingsService, cursors: &mut HashMap
         };
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
-            let reply = build_reply(svc, verb, msg.body.as_deref());
+            // EFF-23 — refuse an oversized body before build_reply parses it.
+            let reply = if crate::ipc::body_within_cap(msg.body.as_deref()) {
+                build_reply(svc, verb, msg.body.as_deref())
+            } else {
+                tracing::warn!(
+                    topic = %topic,
+                    len = msg.body.as_ref().map_or(0, String::len),
+                    cap = crate::ipc::MAX_RPC_BODY_BYTES,
+                    "settings responder: body exceeds cap; refusing",
+                );
+                crate::ipc::body_too_large_reply(verb)
+            };
             if let Err(e) = persist.write(
                 &reply_topic(&msg.ulid),
                 Priority::Default,

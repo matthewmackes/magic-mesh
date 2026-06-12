@@ -94,16 +94,29 @@ fn poll_once<F>(
         };
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
-            // EFF-7 — a panicking reply closure must not kill the responder
-            // thread (which serves every file/fleet surface). Catch the unwind
-            // and answer with an honest error envelope instead.
-            let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                reply(verb, msg.body.as_deref())
-            }))
-            .unwrap_or_else(|_| {
-                tracing::error!(topic = %topic, "files responder: reply handler panicked");
-                err(format!("internal error handling {verb}"))
-            });
+            // EFF-23 — refuse an oversized body before it reaches the
+            // reply handler's `from_str`, bounding the work an untrusted
+            // Bus writer can force.
+            let body = if crate::ipc::body_within_cap(msg.body.as_deref()) {
+                // EFF-7 — a panicking reply closure must not kill the responder
+                // thread (which serves every file/fleet surface). Catch the unwind
+                // and answer with an honest error envelope instead.
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    reply(verb, msg.body.as_deref())
+                }))
+                .unwrap_or_else(|_| {
+                    tracing::error!(topic = %topic, "files responder: reply handler panicked");
+                    err(format!("internal error handling {verb}"))
+                })
+            } else {
+                tracing::warn!(
+                    topic = %topic,
+                    len = msg.body.as_ref().map_or(0, String::len),
+                    cap = crate::ipc::MAX_RPC_BODY_BYTES,
+                    "files responder: body exceeds cap; refusing",
+                );
+                err(format!("{verb}: request body too large"))
+            };
             if let Err(e) = persist.write(
                 &reply_topic(&msg.ulid),
                 Priority::Default,
@@ -325,6 +338,16 @@ impl FileXfer {
             .unwrap_or_default();
         if sources.is_empty() {
             return err("send-to: no sources");
+        }
+        // EFF-23 — bound the per-request source count (the body cap already
+        // bounds total bytes; this caps the row count a single send fans out
+        // to, well above any real ≤8-peer transfer).
+        const MAX_SOURCES: usize = 1024;
+        if sources.len() > MAX_SOURCES {
+            return err(format!(
+                "send-to: too many sources ({}, max {MAX_SOURCES})",
+                sources.len()
+            ));
         }
         let conflict = v.get("conflict").and_then(serde_json::Value::as_str).unwrap_or("rename");
         let mode = v.get("mode").and_then(serde_json::Value::as_str).unwrap_or("copy");
@@ -817,6 +840,35 @@ mod tests {
         assert!(!qnm.parent().unwrap().join("etc").exists());
         assert!(is_clean_component("oak"));
         assert!(!is_clean_component("../oak"));
+    }
+
+    #[test]
+    fn poll_once_refuses_over_cap_body_before_dispatch() {
+        // EFF-23 — a body over MAX_RPC_BODY_BYTES never reaches the
+        // reply handler; a within-cap body does.
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().join("bus")).expect("persist");
+        let dispatched = std::cell::Cell::new(0u32);
+        let observing = |_verb: &str, _body: Option<&str>| {
+            dispatched.set(dispatched.get() + 1);
+            "{}".to_string()
+        };
+        let mut cursors = HashMap::new();
+
+        // Over-cap: must be suppressed.
+        let big = "x".repeat(crate::ipc::MAX_RPC_BODY_BYTES + 1);
+        persist
+            .write("action/file-ops/send-to", Priority::Default, None, Some(&big))
+            .unwrap();
+        poll_once(&persist, FILE_OPS_PREFIX, &FILE_OPS_VERBS, &observing, &mut cursors);
+        assert_eq!(dispatched.get(), 0, "over-cap body must not reach the handler");
+
+        // Within-cap: must dispatch.
+        persist
+            .write("action/file-ops/send-to", Priority::Default, None, Some("{}"))
+            .unwrap();
+        poll_once(&persist, FILE_OPS_PREFIX, &FILE_OPS_VERBS, &observing, &mut cursors);
+        assert_eq!(dispatched.get(), 1, "within-cap body must reach the handler");
     }
 
     #[test]

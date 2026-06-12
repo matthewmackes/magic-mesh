@@ -192,7 +192,18 @@ pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &JobsService, should_s
             };
             for msg in msgs {
                 cursors.insert(topic.clone(), msg.ulid.clone());
-                let reply = build_reply(svc, verb, msg.body.as_deref(), &msg.ulid);
+                // EFF-23 — refuse an oversized body before build_reply parses it.
+                let reply = if crate::ipc::body_within_cap(msg.body.as_deref()) {
+                    build_reply(svc, verb, msg.body.as_deref(), &msg.ulid)
+                } else {
+                    tracing::warn!(
+                        topic = %topic,
+                        len = msg.body.as_ref().map_or(0, String::len),
+                        cap = crate::ipc::MAX_RPC_BODY_BYTES,
+                        "jobs responder: body exceeds cap; refusing",
+                    );
+                    crate::ipc::body_too_large_reply(verb)
+                };
                 let _ = persist.write(
                     &reply_topic(&msg.ulid),
                     Priority::Default,

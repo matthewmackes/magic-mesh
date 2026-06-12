@@ -292,6 +292,21 @@ pub fn poll_lifecycle_result_once(
     };
     for msg in msgs {
         *cursor = Some(msg.ulid.clone());
+        // EFF-23 — refuse an oversized body before from_str.
+        if !crate::ipc::body_within_cap(msg.body.as_deref()) {
+            tracing::warn!(
+                topic = LIFECYCLE_RESULT_TOPIC,
+                len = msg.body.as_ref().map_or(0, String::len),
+                "directory responder: lifecycle-result body exceeds cap; refusing",
+            );
+            let _ = persist.write(
+                &reply_topic(&msg.ulid),
+                Priority::Default,
+                None,
+                Some(&crate::ipc::body_too_large_reply("lifecycle-result")),
+            );
+            continue;
+        }
         let req: serde_json::Value = serde_json::from_str(msg.body.as_deref().unwrap_or("{}"))
             .unwrap_or(serde_json::Value::Null);
         let reply = match (
@@ -326,7 +341,17 @@ pub fn poll_lifecycle_once(persist: &Persist, svc: &DirectoryService, cursor: &m
     };
     for msg in msgs {
         *cursor = Some(msg.ulid.clone());
-        let reply = lifecycle_reply(svc, msg.body.as_deref(), &msg.ulid);
+        // EFF-23 — refuse an oversized body before lifecycle_reply parses it.
+        let reply = if crate::ipc::body_within_cap(msg.body.as_deref()) {
+            lifecycle_reply(svc, msg.body.as_deref(), &msg.ulid)
+        } else {
+            tracing::warn!(
+                topic = LIFECYCLE_TOPIC,
+                len = msg.body.as_ref().map_or(0, String::len),
+                "directory responder: lifecycle body exceeds cap; refusing",
+            );
+            crate::ipc::body_too_large_reply("lifecycle")
+        };
         let _ = persist.write(
             &reply_topic(&msg.ulid),
             Priority::Default,
@@ -370,7 +395,17 @@ pub fn poll_wake_once(persist: &Persist, cursor: &mut Option<String>) {
     };
     for msg in msgs {
         *cursor = Some(msg.ulid.clone());
-        let reply = wake_reply(msg.body.as_deref());
+        // EFF-23 — refuse an oversized body before wake_reply parses it.
+        let reply = if crate::ipc::body_within_cap(msg.body.as_deref()) {
+            wake_reply(msg.body.as_deref())
+        } else {
+            tracing::warn!(
+                topic = WAKE_TOPIC,
+                len = msg.body.as_ref().map_or(0, String::len),
+                "directory responder: wake body exceeds cap; refusing",
+            );
+            crate::ipc::body_too_large_reply("wake")
+        };
         let _ = persist.write(
             &reply_topic(&msg.ulid),
             Priority::Default,
