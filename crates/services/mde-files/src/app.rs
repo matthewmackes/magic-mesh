@@ -12,10 +12,13 @@ use cosmic::iced::widget::{column, container, row, scrollable};
 use cosmic::iced::{Background, Border, Color, Length, Padding, Task};
 use cosmic::{Application, Element};
 
-use crate::backend::{Backend, BackendSnapshot, RealBackend};
+use crate::backend::{
+    Backend, BackendSnapshot, ConflictPolicy, Destination, RealBackend, SendMode,
+};
 use crate::model::{Layout, View};
 use crate::panels::{
-    ContextMenu, ContextMenuItem, DetailsPanel, DragSession, DragTarget, OpRow, OperationDrawer,
+    ContextMenu, ContextMenuItem, DetailsPanel, DragSession, DragTarget, OpRow, OpState,
+    OperationDrawer,
 };
 use crate::prefs::Accessibility;
 use crate::selection::Selection;
@@ -640,27 +643,33 @@ impl MdeFiles {
             Message::DragStart(rows) => self.drag.start(rows),
             Message::DragHover(target) => self.drag.set_hover(target),
             Message::DragDrop => {
-                // The actual `Backend::send_to` call lives at the
-                // view-side because the reducer is sync and the
-                // backend is mut. `finish()` returns the drop
-                // target so the view can route the call; here we
-                // just clean up the session state.
-                let _ = self.drag.finish();
+                // AUD-1 — a drop onto a sidebar peer is a Send-To. `finish()`
+                // yields (row keys, target); resolve the keys to paths under
+                // the current local dir and dispatch through the backend.
+                if let Some((keys, target)) = self.drag.finish() {
+                    let sources = keys
+                        .into_iter()
+                        .map(|k| {
+                            let p = std::path::PathBuf::from(&k);
+                            if p.is_absolute() {
+                                p
+                            } else {
+                                std::path::Path::new(&self.local_path).join(k)
+                            }
+                        })
+                        .collect();
+                    let destination = drag_target_to_destination(target);
+                    self.dispatch_send(sources, destination, SendMode::Copy, ConflictPolicy::Rename);
+                }
             }
             Message::DragCancel => {
                 let _ = self.drag.cancel();
             }
-            Message::SendTo(_req) => {
-                // View-side handlers (the `Backend` trait
-                // consumer in `mde-files::main`) pick this up and
-                // route to `Backend::send_to`. The reducer is sync
-                // + the backend is mut, so we don't perform the
-                // call here; instead `Subscription`-driven side-
-                // effect Tasks (Phase 2.3 + 2.6) take the request
-                // from here. The Phase 3.1 work is the
-                // canonical Message shape — the wire-up to
-                // mded.Shell.Send is the Phase 2.3 DBus backend's
-                // job.
+            Message::SendTo(req) => {
+                // AUD-1 — every entry point funnels here; perform the real
+                // send through the backend (mesh → mackesd file-ops → the
+                // target peer's replicated inbox) and record an op row.
+                self.dispatch_send(req.sources, req.destination, req.mode, req.conflict);
             }
             Message::TabFocus => {
                 self.keyboard_pane = self.keyboard_pane.next();
@@ -738,6 +747,51 @@ impl MdeFiles {
         // live mirror so the tab strip always renders the current view/path.
         self.sync_active_tab();
         pending_task.unwrap_or_else(Task::none)
+    }
+
+    /// AUD-1 — perform a Send-To through the backend (mesh → mackesd file-ops
+    /// → the target peer's replicated inbox) and record the outcome as an op
+    /// row in the drawer. Shared by `Message::SendTo` (all six entry points)
+    /// and `Message::DragDrop`.
+    fn dispatch_send(
+        &mut self,
+        sources: Vec<std::path::PathBuf>,
+        destination: Destination,
+        mode: SendMode,
+        conflict: ConflictPolicy,
+    ) {
+        if sources.is_empty() {
+            return;
+        }
+        let dest_label = match &destination {
+            Destination::Peer(n) => format!("{n}.mesh"),
+            Destination::Group(g) => format!("{g} group"),
+            Destination::Role(r) => format!("role:{r}"),
+            Destination::Site(s) => format!("site:{s}"),
+        };
+        let src_label = match sources.len() {
+            1 => sources[0]
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file")
+                .to_string(),
+            n => format!("{n} files"),
+        };
+        let result = self
+            .backend
+            .send_to(&sources, destination, mode, conflict);
+        let (op_id, state, progress) = match &result {
+            Ok(id) => (*id, OpState::Completed, 1000),
+            Err(_) => (0, OpState::Failed, 0),
+        };
+        self.op_drawer.upsert(OpRow {
+            op_id,
+            source: src_label,
+            destination: dest_label,
+            progress_permille: progress,
+            state,
+        });
+        self.op_drawer.set_open(true);
     }
 
     /// E10.5 — copy the live nav fields into the active tab's stored state.
@@ -1155,6 +1209,16 @@ fn fetch_trash_items() -> Result<Vec<TrashItem>, String> {
             })
         })
         .collect())
+}
+
+/// AUD-1 — map a drag drop target onto the canonical Send-To destination.
+fn drag_target_to_destination(t: DragTarget) -> Destination {
+    match t {
+        DragTarget::Peer(n) => Destination::Peer(n),
+        DragTarget::Group(g) => Destination::Group(g),
+        DragTarget::Role(r) => Destination::Role(r),
+        DragTarget::Site(s) => Destination::Site(s),
+    }
 }
 
 /// Build a Task that shells `mackesd meshfs-trash-list` and emits

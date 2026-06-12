@@ -6090,16 +6090,24 @@ fn run_serve(
         {
             Ok(persist) => {
                 use mackesd_core::ipc::files;
+                // AUD-1/AUD-7 — the real cross-mesh transport over the
+                // LizardFS-replicated QNM-Shared volume. One `FileXfer` per
+                // surface (cheap: just a root path + host id) backs inbox /
+                // outbox / file-ops with genuine copy/list/rollback.
+                let qnm_root = mackesd_core::default_qnm_shared_root();
+                let xfer_inbox = files::FileXfer::new(qnm_root.clone(), host.clone());
+                let xfer_outbox = files::FileXfer::new(qnm_root.clone(), host.clone());
+                let xfer_ops = files::FileXfer::new(qnm_root.clone(), host.clone());
                 let mut surfaces = vec![
                     files::Surface {
                         prefix: files::INBOX_PREFIX,
                         verbs: &files::INBOX_VERBS,
-                        reply: Box::new(files::inbox_reply),
+                        reply: Box::new(move |verb, body| xfer_inbox.inbox_reply(verb, body)),
                     },
                     files::Surface {
                         prefix: files::OUTBOX_PREFIX,
                         verbs: &files::OUTBOX_VERBS,
-                        reply: Box::new(files::outbox_reply),
+                        reply: Box::new(move |verb, body| xfer_outbox.outbox_reply(verb, body)),
                     },
                     files::Surface {
                         prefix: files::DOWNLOADS_PREFIX,
@@ -6109,7 +6117,7 @@ fn run_serve(
                     files::Surface {
                         prefix: files::FILE_OPS_PREFIX,
                         verbs: &files::FILE_OPS_VERBS,
-                        reply: Box::new(files::file_ops_reply),
+                        reply: Box::new(move |verb, body| xfer_ops.file_ops_reply(verb, body)),
                     },
                 ];
                 // Fleet.Files joins only when sqlite opens; its stub

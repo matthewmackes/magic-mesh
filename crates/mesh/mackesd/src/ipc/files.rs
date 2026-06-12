@@ -176,15 +176,303 @@ pub const FILE_OPS_VERBS: [&str; 3] = ["send-to", "rollback", "audit-log"];
 const SEND_TO_NOT_CONFIGURED: &str =
     "mesh send not configured — no transport (rsync / scp / qnm-share) is wired yet";
 
-/// Reply builder for the file-operations surface. `send-to` (body =
-/// `{sources,selector,mode,conflict}`) and `rollback` (body = op id)
-/// honestly report no transport; `audit-log` is the honest empty log.
+/// Reply builder for the file-operations surface when no transport is
+/// available (no QNM-Shared root) — kept for the degraded path.
 #[must_use]
 pub fn file_ops_reply(verb: &str, _body: Option<&str>) -> String {
     match verb {
         "send-to" | "rollback" => err(SEND_TO_NOT_CONFIGURED),
         "audit-log" => "[]".to_string(),
         other => err(format!("unknown file-ops verb: {other}")),
+    }
+}
+
+// ---- FileXfer — the real cross-mesh file transport (AUD-1 / AUD-7) ----
+//
+// Send-To moves bytes over the **LizardFS-replicated QNM-Shared volume** —
+// no extra transport daemon, the replicated volume IS the wire. Sending to
+// peer `P` copies each source into `<qnm>/inbox/<P>/<self>/<name>`; LizardFS
+// replication delivers it to P, whose Inbox view lists `<qnm>/inbox/<P>/**`
+// (the sender is the subdirectory name — attribution for free). The sender's
+// own record is appended to `<qnm>/outbox/<self>.jsonl`. (Closes the §7
+// "send not configured" stub + the AF-5 empty-inbox producer.)
+
+/// The replicated-volume file transport backing the file-ops / inbox /
+/// outbox Bus surfaces. Holds the QNM-Shared root + this node's host id.
+pub struct FileXfer {
+    qnm_root: std::path::PathBuf,
+    host: String,
+}
+
+impl FileXfer {
+    /// Construct over the QNM-Shared root + this node's host identity.
+    #[must_use]
+    pub fn new(qnm_root: std::path::PathBuf, host: String) -> Self {
+        Self { qnm_root, host }
+    }
+
+    fn inbox_root(&self, peer: &str) -> std::path::PathBuf {
+        self.qnm_root.join("inbox").join(peer)
+    }
+
+    fn outbox_log(&self) -> std::path::PathBuf {
+        self.qnm_root.join("outbox").join(format!("{}.jsonl", self.host))
+    }
+
+    /// `action/file-ops/<verb>` — `send-to` / `rollback` / `audit-log`.
+    #[must_use]
+    pub fn file_ops_reply(&self, verb: &str, body: Option<&str>) -> String {
+        match verb {
+            "send-to" => self.send_to(body),
+            "rollback" => self.rollback(body),
+            "audit-log" => self.read_outbox_rows(),
+            other => err(format!("unknown file-ops verb: {other}")),
+        }
+    }
+
+    /// `action/files-inbox/<verb>` — `list` reads this node's replicated inbox.
+    #[must_use]
+    pub fn inbox_reply(&self, verb: &str, _body: Option<&str>) -> String {
+        match verb {
+            "list" => self.inbox_list(),
+            "mark-opened" => json!({ "ok": true }).to_string(),
+            other => err(format!("unknown inbox verb: {other}")),
+        }
+    }
+
+    /// `action/files-outbox/<verb>` — `list` reads this node's send record.
+    #[must_use]
+    pub fn outbox_reply(&self, verb: &str, _body: Option<&str>) -> String {
+        match verb {
+            "list" => self.read_outbox_rows(),
+            "cancel" => json!({ "ok": true }).to_string(),
+            other => err(format!("unknown outbox verb: {other}")),
+        }
+    }
+
+    /// Copy each source into the target peer's replicated inbox.
+    fn send_to(&self, body: Option<&str>) -> String {
+        let Some(v) = body.and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok()) else {
+            return err("send-to: missing/invalid body (need {sources,selector,mode,conflict})");
+        };
+        // Selector grammar: `peer:<name>` is the direct-delivery target. group/
+        // role/site fan-out is a follow-up — report honestly rather than guess.
+        let selector = v
+            .get("selector")
+            .or_else(|| v.get("destination"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let Some(target) = selector.strip_prefix("peer:").filter(|t| !t.is_empty()) else {
+            return err(format!(
+                "send-to: only peer: destinations deliver directly (got '{selector}')"
+            ));
+        };
+        let sources: Vec<String> = v
+            .get("sources")
+            .and_then(|s| s.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if sources.is_empty() {
+            return err("send-to: no sources");
+        }
+        let conflict = v.get("conflict").and_then(serde_json::Value::as_str).unwrap_or("rename");
+        let mode = v.get("mode").and_then(serde_json::Value::as_str).unwrap_or("copy");
+        let dest_dir = self.inbox_root(target).join(&self.host);
+        if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+            return err(format!("send-to: cannot open inbox {}: {e}", dest_dir.display()));
+        }
+        let mut delivered: Vec<String> = Vec::new();
+        let mut bytes: u64 = 0;
+        for src in &sources {
+            let src_path = std::path::Path::new(src);
+            let Some(name) = src_path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(dest) = resolve_conflict(&dest_dir, name, conflict) else {
+                continue; // skip policy, or unresolved
+            };
+            match std::fs::copy(src_path, &dest) {
+                Ok(n) => {
+                    bytes += n;
+                    delivered.push(name.to_string());
+                    if mode == "move" {
+                        let _ = std::fs::remove_file(src_path);
+                    }
+                }
+                Err(e) => return err(format!("send-to: copy {name} failed: {e}")),
+            }
+        }
+        let op_id = now_ms();
+        self.append_outbox(op_id, target, mode, bytes, &delivered);
+        json!({
+            "ok": true,
+            "op_id": op_id,
+            "count": delivered.len(),
+            "bytes": bytes,
+        })
+        .to_string()
+    }
+
+    /// Undo a prior send: remove the files it delivered (looked up in the
+    /// outbox log by op id) from the target's inbox.
+    fn rollback(&self, body: Option<&str>) -> String {
+        let op_id = body
+            .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+            .and_then(|v| {
+                v.get("op_id")
+                    .or_else(|| v.get("id"))
+                    .and_then(serde_json::Value::as_i64)
+            });
+        let Some(op_id) = op_id else {
+            return err("rollback: need {op_id}");
+        };
+        let mut removed = 0;
+        for row in self.outbox_rows() {
+            if row.get("op_id").and_then(serde_json::Value::as_i64) != Some(op_id) {
+                continue;
+            }
+            let target = row.get("target").and_then(serde_json::Value::as_str).unwrap_or_default();
+            if let Some(files) = row.get("files").and_then(|f| f.as_array()) {
+                for f in files.iter().filter_map(|x| x.as_str()) {
+                    let p = self.inbox_root(target).join(&self.host).join(f);
+                    if std::fs::remove_file(&p).is_ok() {
+                        removed += 1;
+                    }
+                }
+            }
+        }
+        json!({ "ok": true, "removed": removed }).to_string()
+    }
+
+    /// List this node's replicated inbox: every file under
+    /// `<qnm>/inbox/<self>/<sender>/` as a `WireFileRow` (the sender is the
+    /// subdir name → the `peer`/"from" column).
+    fn inbox_list(&self) -> String {
+        let root = self.inbox_root(&self.host);
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        let Ok(senders) = std::fs::read_dir(&root) else {
+            return "[]".to_string();
+        };
+        for sender_entry in senders.flatten() {
+            let sender = sender_entry.file_name().to_string_lossy().into_owned();
+            let Ok(files) = std::fs::read_dir(sender_entry.path()) else {
+                continue;
+            };
+            for f in files.flatten() {
+                let meta = match f.metadata() {
+                    Ok(m) if m.is_file() => m,
+                    _ => continue,
+                };
+                let name = f.file_name().to_string_lossy().into_owned();
+                rows.push(json!({
+                    "name": name,
+                    "size": meta.len(),
+                    "mime": guess_mime(&f.file_name().to_string_lossy()),
+                    "peer": sender,
+                    "modified_ms": mtime_ms(&meta),
+                }));
+            }
+        }
+        serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    fn append_outbox(&self, op_id: i64, target: &str, mode: &str, bytes: u64, files: &[String]) {
+        let log = self.outbox_log();
+        if let Some(parent) = log.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let row = json!({
+            "op_id": op_id,
+            "at_ms": op_id,
+            "target": target,
+            "mode": mode,
+            "count": files.len(),
+            "bytes": bytes,
+            "files": files,
+        });
+        use std::io::Write;
+        if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(&log) {
+            let _ = writeln!(fh, "{row}");
+        }
+    }
+
+    fn outbox_rows(&self) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(self.outbox_log())
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .collect()
+    }
+
+    /// The outbox/audit log as a JSON array (newest first).
+    fn read_outbox_rows(&self) -> String {
+        let mut rows = self.outbox_rows();
+        rows.reverse();
+        serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string())
+    }
+}
+
+/// Resolve the destination path for `name` in `dir` under a conflict policy.
+/// `None` = skip (existing + skip policy, or no resolvable name).
+fn resolve_conflict(dir: &std::path::Path, name: &str, conflict: &str) -> Option<std::path::PathBuf> {
+    let dest = dir.join(name);
+    if !dest.exists() {
+        return Some(dest);
+    }
+    match conflict {
+        "overwrite" => Some(dest),
+        "skip" => None,
+        // "rename" / "ask" (daemon has no prompt) → find a free " (n)" name.
+        _ => {
+            let p = std::path::Path::new(name);
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+            let ext = p.extension().and_then(|e| e.to_str());
+            for n in 1..1000 {
+                let candidate = match ext {
+                    Some(e) => dir.join(format!("{stem} ({n}).{e}")),
+                    None => dir.join(format!("{stem} ({n})")),
+                };
+                if !candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Wall-clock ms (the op id + delivery timestamp).
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// File mtime as epoch-ms (0 on error).
+fn mtime_ms(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Coarse mime tag from a filename extension (matches `WireFileRow.mime`).
+fn guess_mime(name: &str) -> &'static str {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" => "image",
+        "pdf" => "pdf",
+        "zip" | "tar" | "gz" | "xz" | "zst" | "bz2" => "archive",
+        "iso" | "qcow2" | "img" | "raw" => "disk",
+        _ => "doc",
     }
 }
 
@@ -346,6 +634,95 @@ mod tests {
     fn unknown_verb_yields_error_envelope() {
         assert!(inbox_reply("bogus", None).contains("unknown inbox verb"));
         assert!(file_ops_reply("bogus", None).contains("unknown file-ops verb"));
+    }
+
+    // ---- FileXfer: the real QNM-Shared transport (AUD-1/AUD-7) --------
+
+    #[test]
+    fn send_to_delivers_into_target_inbox_and_recipient_lists_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let qnm = tmp.path().to_path_buf();
+        // A source file on the sender ("pine").
+        let src = tmp.path().join("notes.md");
+        std::fs::write(&src, b"hello mesh").unwrap();
+
+        let pine = FileXfer::new(qnm.clone(), "pine".to_string());
+        let body = json!({
+            "sources": [src.to_string_lossy()],
+            "selector": "peer:oak",
+            "mode": "copy",
+            "conflict": "rename",
+        })
+        .to_string();
+        let reply: serde_json::Value =
+            serde_json::from_str(&pine.file_ops_reply("send-to", Some(&body))).unwrap();
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["count"], 1);
+        assert_eq!(reply["bytes"], 10);
+
+        // The file landed under inbox/oak/pine/ (sender = subdir).
+        assert!(qnm.join("inbox/oak/pine/notes.md").exists());
+
+        // oak lists its inbox and sees the file attributed to pine.
+        let oak = FileXfer::new(qnm.clone(), "oak".to_string());
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&oak.inbox_reply("list", None)).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "notes.md");
+        assert_eq!(rows[0]["peer"], "pine");
+        assert_eq!(rows[0]["size"], 10);
+    }
+
+    #[test]
+    fn send_to_move_removes_source_and_rollback_undoes_delivery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let qnm = tmp.path().to_path_buf();
+        let src = tmp.path().join("doc.txt");
+        std::fs::write(&src, b"abc").unwrap();
+        let pine = FileXfer::new(qnm.clone(), "pine".to_string());
+        let body = json!({"sources":[src.to_string_lossy()],"selector":"peer:oak","mode":"move"})
+            .to_string();
+        let reply: serde_json::Value =
+            serde_json::from_str(&pine.file_ops_reply("send-to", Some(&body))).unwrap();
+        let op_id = reply["op_id"].as_i64().unwrap();
+        assert!(!src.exists(), "move removes the source");
+        assert!(qnm.join("inbox/oak/pine/doc.txt").exists());
+        // Rollback removes the delivered copy.
+        let rb: serde_json::Value = serde_json::from_str(
+            &pine.file_ops_reply("rollback", Some(&json!({ "op_id": op_id }).to_string())),
+        )
+        .unwrap();
+        assert_eq!(rb["removed"], 1);
+        assert!(!qnm.join("inbox/oak/pine/doc.txt").exists());
+    }
+
+    #[test]
+    fn send_to_rejects_non_peer_selector_and_empty_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let x = FileXfer::new(tmp.path().to_path_buf(), "pine".to_string());
+        assert!(x
+            .file_ops_reply("send-to", Some(r#"{"sources":["/x"],"selector":"group:crew"}"#))
+            .contains("peer:"));
+        assert!(x
+            .file_ops_reply("send-to", Some(r#"{"sources":[],"selector":"peer:oak"}"#))
+            .contains("no sources"));
+    }
+
+    #[test]
+    fn rename_conflict_keeps_both_copies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let qnm = tmp.path().to_path_buf();
+        let src = tmp.path().join("a.txt");
+        std::fs::write(&src, b"v1").unwrap();
+        let pine = FileXfer::new(qnm.clone(), "pine".to_string());
+        let body =
+            json!({"sources":[src.to_string_lossy()],"selector":"peer:oak","conflict":"rename"})
+                .to_string();
+        let _ = pine.file_ops_reply("send-to", Some(&body));
+        let _ = pine.file_ops_reply("send-to", Some(&body));
+        let dir = qnm.join("inbox/oak/pine");
+        assert!(dir.join("a.txt").exists());
+        assert!(dir.join("a (1).txt").exists(), "second copy renamed, not clobbered");
     }
 
     #[test]

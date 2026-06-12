@@ -704,6 +704,17 @@ impl Backend for RealBackend {
                 .and_then(|d| d.list_peer(peer).ok())
                 .unwrap_or_default();
         }
+        // AUD-7 — the empty path is the mesh Inbox: received files from the
+        // LizardFS-replicated inbox over the Bus. Falls back to the local
+        // backend's inbox when mackesd/Bus is unavailable.
+        if path.is_empty() {
+            if let Some(rows) = self.bus.as_ref().map(BusBackend::inbox) {
+                if !rows.is_empty() {
+                    return rows;
+                }
+            }
+            return self.local.list(path);
+        }
         // E10 — Cloud-Files: the paired KDE-Connect device roster.
         if path == "cloud:" {
             return self
@@ -729,10 +740,14 @@ impl Backend for RealBackend {
         mode: SendMode,
         conflict: ConflictPolicy,
     ) -> Result<OpId, BackendError> {
-        // When DBus is up, route the send through mded so it can
-        // actually deliver across the mesh. With no mackesd, fall
-        // back to the local-FS backend which records an audit row
-        // but rejects mesh destinations.
+        // AUD-1 — route the send through mackesd's file-ops surface, which
+        // copies the sources into the target peer's LizardFS-replicated
+        // inbox (the real cross-mesh transport). With no mackesd, fall back
+        // to the local-FS backend (records an audit row, rejects mesh dests).
+        #[cfg(feature = "dbus")]
+        if let Some(bus) = self.bus.as_ref() {
+            return bus.send_to(sources, &destination, mode, conflict);
+        }
         self.local.send_to(sources, destination, mode, conflict)
     }
 

@@ -27,12 +27,16 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio::runtime::Runtime;
 
-use crate::backend::{BackendError, ConflictPolicy, Destination, SendMode};
+use crate::backend::{BackendError, ConflictPolicy, Destination, OpId, SendMode};
 use crate::model::{FileRow, Mime, Peer, PeerKind, PeerStatus, SelfNode};
 
 /// Action-topic prefix for mackesd's Fleet.Files Bus surface — must
 /// equal `mackesd_core::ipc::files::FLEET_FILES_PREFIX`.
 pub const FLEET_FILES_PREFIX: &str = "fleet-files";
+/// AUD-1 — the file-operations surface (Send-To / rollback / audit-log).
+pub const FILE_OPS_PREFIX: &str = "file-ops";
+/// AUD-1/AUD-7 — the replicated inbox surface (received files).
+pub const INBOX_PREFIX: &str = "files-inbox";
 
 /// E10 — one row of the `action/connect/devices` KDE-Connect roster reply
 /// (mirrors the shell's `connect::WireDevice`). Extra fields are ignored.
@@ -251,6 +255,59 @@ impl BusBackend {
         raw.as_deref().map(cloud_rows_from_json).unwrap_or_default()
     }
 
+    /// AUD-7 — this node's replicated mesh inbox (files other peers sent us),
+    /// over `action/files-inbox/list`. Empty (never errors) when the daemon /
+    /// Bus / reply is unavailable, so the Inbox view degrades honestly.
+    pub fn inbox(&self) -> Vec<FileRow> {
+        self.bus_request_at(INBOX_PREFIX, "list", None)
+            .ok()
+            .and_then(|raw| parse_files(&raw))
+            .map(|wires| wires.into_iter().map(WireFileRow::into_model).collect())
+            .unwrap_or_default()
+    }
+
+    /// AUD-1 — fire a Send-To over `action/file-ops/send-to`: the sender's
+    /// mackesd copies each source into the target peer's replicated inbox.
+    /// Returns the op id mackesd assigned.
+    ///
+    /// # Errors
+    ///
+    /// `BackendError::Rejected` when the Bus call fails or mackesd rejects
+    /// the send (e.g. a non-`peer:` destination, unreadable source).
+    pub fn send_to(
+        &self,
+        sources: &[PathBuf],
+        destination: &Destination,
+        mode: SendMode,
+        conflict: ConflictPolicy,
+    ) -> Result<OpId, BackendError> {
+        let body = serde_json::json!({
+            "sources": sources.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
+            "selector": destination_to_selector(destination),
+            "mode": send_mode_to_str(mode),
+            "conflict": conflict_policy_to_str(conflict),
+        })
+        .to_string();
+        let raw = self.bus_request_at(FILE_OPS_PREFIX, "send-to", Some(&body))?;
+        let v: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| BackendError::Rejected(format!("send-to decode: {e}")))?;
+        if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+            let op = v
+                .get("op_id")
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|n| u64::try_from(n).ok())
+                .unwrap_or_default();
+            Ok(op)
+        } else {
+            Err(BackendError::Rejected(
+                v.get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("send-to rejected")
+                    .to_string(),
+            ))
+        }
+    }
+
     /// Publish one `action/fleet-files/<verb>` request on the Bus
     /// (carrying `body` for arg-bearing verbs) + block for the reply
     /// body. A fresh `Persist` is opened per call (it isn't `Send`);
@@ -260,7 +317,19 @@ impl BusBackend {
     /// not a JSON array/object the parsers accept, so it surfaces as a
     /// decode `Rejected` upstream.
     fn bus_request(&self, verb: &str, body: Option<&str>) -> Result<String, BackendError> {
-        let topic = format!("action/{FLEET_FILES_PREFIX}/{verb}");
+        self.bus_request_at(FLEET_FILES_PREFIX, verb, body)
+    }
+
+    /// AUD-1 — issue `action/<prefix>/<verb>` (carrying `body`) + block for
+    /// the reply, for surfaces other than Fleet.Files (file-ops, inbox).
+    /// Same contract as [`Self::bus_request`].
+    fn bus_request_at(
+        &self,
+        prefix: &str,
+        verb: &str,
+        body: Option<&str>,
+    ) -> Result<String, BackendError> {
+        let topic = format!("action/{prefix}/{verb}");
         self.rt.block_on(async {
             let persist = mde_bus::persist::Persist::open(self.bus_dir.clone())
                 .map_err(|e| BackendError::Rejected(format!("bus persist: {e}")))?;
