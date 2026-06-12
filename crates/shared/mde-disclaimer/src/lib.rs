@@ -77,8 +77,7 @@ pub fn is_accepted() -> bool {
     }
     acceptance_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|recorded| recorded.trim() == fingerprint())
-        .unwrap_or(false)
+        .is_some_and(|recorded| recorded.trim() == fingerprint())
 }
 
 /// Record the operator's acceptance of the current disclaimer (writes the
