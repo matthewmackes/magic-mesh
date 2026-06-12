@@ -1510,11 +1510,16 @@ fn main() -> anyhow::Result<()> {
             println!("migrations applied: {n}");
         }
         Cmd::Healthz => {
-            // First-class panel/CLI parity per 12.1.3. Today the
-            // report is the empty baseline; subsequent substeps
-            // (12.3.3 heartbeats, 12.5.1 drift detector) populate
-            // the live fields.
-            let report = mackesd_core::health::HealthReport::empty();
+            // EFF-8 — live report off the store: real node counts +
+            // health buckets + audit-chain status (was a hardcoded
+            // `empty()` baseline). On a fresh peer whose store hasn't
+            // migrated yet this still degrades to the zero-node report.
+            // (`is_leader`/`applied_revision` remain at defaults pending
+            // the leader-lease + applied-revision query plumbing.)
+            let report = match mackesd_core::store::open(&db_path) {
+                Ok(conn) => mackesd_core::health::HealthReport::from_store(&conn),
+                Err(_) => mackesd_core::health::HealthReport::empty(),
+            };
             println!("{}", report.to_json_line()?);
         }
         Cmd::Connect { ip, port } => match mackesd_core::connect_actions::connect_argv(&ip, port) {

@@ -91,15 +91,25 @@ impl ShellService {
         env!("CARGO_PKG_VERSION")
     }
 
-    /// JSON-encoded [`crate::health::HealthReport`] — the same
-    /// `HealthReport::empty()` shape the `mackesd healthz` CLI emits,
-    /// so panel reads stay in parity. When the CLI's healthz grows a
-    /// live-probe path both surfaces inherit it.
+    /// JSON-encoded [`crate::health::HealthReport`] — the same live
+    /// report the `mackesd healthz` CLI emits (EFF-8), so panel reads
+    /// stay in parity. Opens the store at `state.db_path` on each call
+    /// so the report reflects current contents; falls back to the
+    /// zero-node `empty()` baseline when no store is bound or the open
+    /// fails (e.g. the daemon is running version-only).
     ///
     /// # Errors
     /// Returns the encode error string if the report won't serialize.
     pub fn build_healthz(&self) -> Result<String, String> {
-        crate::health::HealthReport::empty()
+        let report = if self.state.db_path.as_os_str().is_empty() {
+            crate::health::HealthReport::empty()
+        } else {
+            match crate::store::open(&self.state.db_path) {
+                Ok(conn) => crate::health::HealthReport::from_store(&conn),
+                Err(_) => crate::health::HealthReport::empty(),
+            }
+        };
+        report
             .to_json_line()
             .map_err(|e| format!("healthz encode: {e}"))
     }

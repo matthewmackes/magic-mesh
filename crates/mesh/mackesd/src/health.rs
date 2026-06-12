@@ -63,6 +63,39 @@ impl HealthReport {
         }
     }
 
+    /// EFF-8 — build a LIVE report from the SQLite store: real `node_count` +
+    /// healthy/degraded/unreachable buckets (from each node's recorded health)
+    /// + `audit_chain_intact` (from `audit::verify`) + version. Each probe is
+    /// independent — a query failure leaves that field at its `empty()` default
+    /// rather than poisoning the others.
+    ///
+    /// NOTE (EFF-8 remainder): `is_leader` + `applied_revision` stay at their
+    /// defaults (false / None) pending the leader-lease + applied-revision
+    /// query plumbing (today the leader check is per-worker + partly stubbed);
+    /// wiring those is the remaining half of EFF-8.
+    #[must_use]
+    pub fn from_store(conn: &rusqlite::Connection) -> Self {
+        let mut r = Self::empty();
+        if let Ok(nodes) = crate::store::list_nodes(conn) {
+            r.node_count = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
+            for n in &nodes {
+                match n.health.as_str() {
+                    "healthy" => r.healthy_nodes += 1,
+                    "degraded" => r.degraded_nodes += 1,
+                    _ => r.unreachable_nodes += 1,
+                }
+            }
+        }
+        if let Ok(rows) = crate::store::load_audit_rows(conn) {
+            // Only a detected `Break` is unhealthy; an `Empty` chain (fresh
+            // peer, nothing logged yet) is intact-by-vacuity, same as a
+            // fully-verified `Intact` chain.
+            r.audit_chain_intact =
+                !matches!(crate::audit::verify(&rows), crate::audit::VerifyOutcome::Break { .. });
+        }
+        r
+    }
+
     /// JSON one-liner for `mackesd healthz`. Stable shape — every
     /// field always present, no schema-conditional keys.
     ///
@@ -100,6 +133,18 @@ mod tests {
     #[test]
     fn version_string_matches_cargo() {
         let r = HealthReport::empty();
+        assert_eq!(r.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn from_store_reports_live_node_and_audit_state() {
+        // EFF-8 — a migrated-but-empty store yields a real (zero-node,
+        // intact-chain) report, not the hardcoded baseline-by-accident.
+        let conn = crate::store::open_in_memory().expect("in-memory store");
+        let r = HealthReport::from_store(&conn);
+        assert_eq!(r.node_count, 0);
+        assert_eq!(r.healthy_nodes, 0);
+        assert!(r.audit_chain_intact, "empty audit chain verifies as intact");
         assert_eq!(r.version, env!("CARGO_PKG_VERSION"));
     }
 }
