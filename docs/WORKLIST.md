@@ -69,7 +69,20 @@ Lifted from a 5-pass parallel fit-and-finish evaluation (reliability · security
 - [✓] **EFF-48 · CLI · STUN encoder `panic!` on IPv6** (`stun.rs:104`) — return Result/skip-with-warn. — DONE: `encode_binding_success_with_xor_mapped` now returns `Option<Vec<u8>>` (`None` for IPv6, deferred per Q9) instead of panicking; the stun_gather responder skips a `None`. Test asserts IPv6→None, IPv4→Some round-trips.
 - [ ] **EFF-49 · I18N · No localization provision** (all en-US). Likely out-of-envelope for a ≤8-peer workgroup — document the en-US-only scope in SUPPORT, or introduce `i18n-embed`+Fluent if in scope.
 
-## AUDIT-2026-06-11 — fit-for-purpose follow-ups (current actionable set)
+## AUDIT-2026-06-12 — post-hardening integrity sweep (current actionable set)
+
+Lifted from the 2026-06-12 `docs/COMPLIANCE.md` sweep (supersedes 2026-06-11; every prior headline item verified resolved + reachable). 5 new actionable + 3 REMOVE-or-FINISH; 3 cross-refs confirmed still open (EFF-17, EFF-25, EFF-41 — tracked above, not duplicated). Finding ids `AUD2-#` → COMPLIANCE.md row #.
+
+- [ ] **AUD2-7 · PKG · RPM ships a binary nothing builds — release-blocking.** `mackesd/Cargo.toml:321` declares asset `target/release/mde-mesh-wallpaper` but no workspace crate has that `[[bin]]` (PD-10's *planned* layer-shell bin). `cargo generate-rpm` fails at cut time on the missing file. Build the PD-10 bin or drop the asset line until it exists. *(Fix before any release cut.)*
+- [ ] **AUD2-1 · OPS · Router histogram observed but never exported.** `mesh_router` observes `kdc2_router_decision_us` per tick, but the EFF-9 exporter passes `write_textfile(…, &[])` — the SLO instrumentation is silently dropped at the export seam; `percentile_estimate` has zero production callers. Share the histogram (Arc) into `MetricsExporterWorker`, or `#[cfg(test)]`-gate the percentile API. *(Completes the EFF-9 remainder.)*
+- [ ] **AUD2-2 · REMOVE dead pre-FileXfer free fns.** `mackesd/ipc/files.rs:143–199` free `inbox_reply`/`outbox_reply`/`file_ops_reply` are wired nowhere (bin always uses `FileXfer` methods; only free `downloads_reply` is live). Delete the three; keep `downloads_reply`.
+- [ ] **AUD2-3 · THEME · `Elevation` enum unused.** `mde-theme/elevation.rs` (`Inline`/`PopoverMenu`/`Floating`/`Modal` + `radius()`/`shadow()`) has zero workspace callers. Adopt in panel/dialog chrome or REMOVE.
+- [ ] **AUD2-4 · THEME · `brand` module unused.** `mde-theme/brand.rs` (`Brand`/`BrandSlot`/`BrandAsset`/…) re-exported but never instantiated in production. Wire into app-header/role-chooser logo resolution or REMOVE.
+- [ ] **AUD2-5 · DOC · KDC crypto prose says "RSA-2048".** `mde-kdc-proto/crypto.rs:209–224` docs say "RSA-2048 keypair holder / generating fresh RSA-2048 keypairs" — misleading vs §3. Reality: own keygen pinned 4096; `RSA_PKCS1_2048_8192_SHA256` is ring's *verify range* for stock KDE Connect peers. Fix the prose: "verify accepts 2048–8192 (KDE Connect interop); own keys always 4096."
+- [ ] **AUD2-6 · DOC · audit skill says "20 crates"** (`.claude/skills/audit/SKILL.md:70`) — workspace has 22 members. (The release skill's same error folds into EFF-41.)
+- [ ] **AUD2-8 · DOC · README platform table omits `mde-cosmic-applet` + `mde-role-chooser`** — both ship real RPM-packaged binaries.
+
+## AUDIT-2026-06-11 — fit-for-purpose follow-ups (superseded — all closed)
 
 Lifted from the 2026-06-11 `docs/COMPLIANCE.md` sweep ("audit the platform for fit for purpose"). The mesh control plane is solid; these close the data-plane + distribution + guardrail gaps. Finding ids are `AUD-#` → COMPLIANCE.md row #. Ordered by impact.
 
