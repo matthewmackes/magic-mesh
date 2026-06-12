@@ -1071,8 +1071,8 @@ impl State {
             .padding(16)
             .width(Length::Fill)
             .style(move |_| iced::widget::container::Style {
-                background: Some(iced::Color::from_rgb8(cr, cg, cb).into()),
-                text_color: Some(iced::Color::from_rgb8(tr, tg, tb)),
+                background: Some(iced::Color::from_rgb8(cr, cg, cb).into()), // carbon-ok: dynamic album-art colour, not a UI token
+                text_color: Some(iced::Color::from_rgb8(tr, tg, tb)), // carbon-ok: dynamic album-art colour
                 ..Default::default()
             });
         let content = column![

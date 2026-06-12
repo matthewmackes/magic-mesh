@@ -37,4 +37,4 @@ pub use dbus::{
     ACTION_TOPIC,
 };
 pub use model::{nav_model, Group, NavEntry, Panel, View};
-pub use single_instance::{decide_primary_status, PrimaryStatus, BUS_NAME};
+pub use single_instance::{acquire as acquire_single_instance, PrimaryStatus};

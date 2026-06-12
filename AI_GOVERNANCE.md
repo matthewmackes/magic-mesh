@@ -36,8 +36,9 @@ node can leave, and the fabric heals.
 
 - Surfaces and `mackesd` communicate over **`mde-bus`** (internal pub/sub). MDE-
   private D-Bus is retired; the only `dbus`/`zbus` use is **FDO interop**
-  (`org.freedesktop.*` — Notifications host, session FDO). A lint gate forbids new
-  MDE-private bus names.
+  (`org.freedesktop.*` — Notifications host, session FDO — and the FDO MPRIS
+  standard `org.mpris.*`). A lint gate forbids new MDE-private bus names
+  (`install-helpers/lint-bus-names.sh`, in CI).
 - Bus calls **degrade gracefully** with no mesh / no peers: cached state, Bus
   timeouts, never panic.
 
@@ -62,8 +63,10 @@ MD5/SHA1 is a finding.
 - The GUI is **IBM Carbon** (carbondesignsystem.com) — the only switchable themes
   are Carbon's gray themes: **Gray 10** (light) / **Gray 90** / **Gray 100**
   (default dark). Carbon tokens (type scale, 8px spacing, components, 2px focus,
-  motion) are **single-sourced in `mde-theme`** and guarded by a lint gate. No raw
-  hex / scattered metric literals outside the token modules.
+  motion) are **single-sourced in `mde-theme`** and guarded by a lint gate
+  (`install-helpers/lint-carbon-tokens.sh`, in CI). No raw hex / scattered metric
+  literals outside the token modules (mark a genuinely-dynamic/test colour
+  `// carbon-ok` with a reason).
 - **Pure-Rust toolkit:** iced 0.14 (wgpu) + cosmic-text (no FreeType), rustls (no
   OpenSSL). GUIs ship as Cosmic apps + a native cosmic-applet; Cosmic draws the
   panel/decorations, Magic Mesh draws its client areas.

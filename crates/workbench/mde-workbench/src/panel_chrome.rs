@@ -645,17 +645,17 @@ mod tests {
 
     #[test]
     fn brighten_lightens_then_clamps() {
-        let c = Color::from_rgb(0.5, 0.5, 0.5);
+        let c = Color::from_rgb(0.5, 0.5, 0.5); // carbon-ok: test fixture (not a render-path token)
         let b = brighten(c, 1.5);
         assert!((b.r - 0.75).abs() < 0.001);
         // Clamp at 1.0.
-        let max = brighten(Color::from_rgb(0.9, 0.9, 0.9), 2.0);
+        let max = brighten(Color::from_rgb(0.9, 0.9, 0.9), 2.0); // carbon-ok: test fixture
         assert!((max.r - 1.0).abs() < 0.001);
     }
 
     #[test]
     fn brighten_darkens_for_factor_below_one() {
-        let c = Color::from_rgb(0.6, 0.6, 0.6);
+        let c = Color::from_rgb(0.6, 0.6, 0.6); // carbon-ok: test fixture
         let d = brighten(c, 0.5);
         assert!((d.r - 0.3).abs() < 0.001);
     }

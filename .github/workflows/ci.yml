@@ -87,6 +87,12 @@ jobs:
       - name: Mesh/desktop boundary lint (§6)
         run: ./install-helpers/lint-mesh-boundary.sh
 
+      - name: Carbon single-source lint (§4)
+        run: ./install-helpers/lint-carbon-tokens.sh
+
+      - name: No-private-D-Bus-name lint (§2)
+        run: ./install-helpers/lint-bus-names.sh
+
       # NOTE on §1–§4 deeper checks: the Carbon single-source rule (§4) is
       # enforced by the mde-theme token tests above (a palette/metric value
       # changes only with a backing assertion); the substrate locks (§1–§3)

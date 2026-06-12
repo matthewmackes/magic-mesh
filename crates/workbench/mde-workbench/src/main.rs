@@ -19,12 +19,9 @@ use clap::Parser;
 use mde_bus::hooks::config::Priority;
 use mde_bus::rpc::{request_with_interval, INTERACTIVE_POLL_INTERVAL};
 use mde_workbench::{
-    decide_primary_status, serve_focus_bus, App, PendingFocus, PrimaryStatus, ACTION_TOPIC,
-    BUS_NAME,
+    acquire_single_instance, serve_focus_bus, App, PendingFocus, PrimaryStatus, ACTION_TOPIC,
 };
-use tracing::{debug, error, info};
-use zbus::fdo::{DBusProxy, RequestNameFlags};
-use zbus::{names::WellKnownName, Connection};
+use tracing::{error, info};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -76,38 +73,24 @@ fn main() -> ExitCode {
         }
     };
 
-    // Single-instance handshake — block on tokio for the bus
-    // round-trips, then either hand off and exit, or spawn the
-    // long-running zbus connection alongside the Iced loop.
-    let status = match runtime.block_on(acquire_primary()) {
-        Ok((status, conn)) => {
-            if status == PrimaryStatus::Existing {
-                drop(conn);
-                return hand_off_to_running(&runtime, &target);
-            }
-            start_primary_focus_responder(conn)
-        }
-        Err(e) => {
-            // Couldn't reach the session bus at all — fall back
-            // to launching the workbench without single-instance
-            // protection so the user isn't dead-in-the-water
-            // when D-Bus is missing (e.g. early-boot recovery
-            // shells). Log loudly.
-            error!(
-                "session bus unreachable ({e}); launching workbench without \
-                 single-instance protection"
-            );
-            Err(())
-        }
-    };
-
-    if status.is_err() {
-        info!("continuing without D-Bus single-instance protection");
+    // AUD-8 / §2 — single-instance via a pidfile (no private D-Bus name). A
+    // live sibling → hand the focus slug off over the Bus + exit; else become
+    // primary and keep the lockfile handle alive for the process lifetime.
+    let (status, lock) = acquire_single_instance();
+    if status == PrimaryStatus::Existing {
+        return hand_off_to_running(&runtime, &target);
+    }
+    if let Some(handle) = lock {
+        Box::leak(Box::new(handle));
+    } else {
+        info!("continuing without single-instance protection (lockfile unavailable)");
+    }
+    if start_primary_focus_responder().is_err() {
+        info!("focus responder unavailable; --focus hand-off may not work");
     }
 
-    // Iced takes over the main thread — keep the tokio runtime
-    // (and the zbus connection it owns) alive for the lifetime
-    // of the process via a leaked handle.
+    // Iced takes over the main thread — keep the tokio runtime alive for the
+    // lifetime of the process via a leaked handle.
     let _runtime = Box::leak(Box::new(runtime));
 
     if !initial_focus.is_empty() {
@@ -121,23 +104,6 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
-}
-
-/// Connect to the session bus and try to acquire [`BUS_NAME`]
-/// with `DoNotQueue`, returning the resulting status + the live
-/// connection. The connection is the single-instance primitive —
-/// the primary path keeps it alive to retain name ownership; the
-/// sibling path drops it and hands off the focus slug over the Bus.
-async fn acquire_primary() -> zbus::Result<(PrimaryStatus, Connection)> {
-    let conn = Connection::session().await?;
-    let dbus = DBusProxy::new(&conn).await?;
-    let wk = WellKnownName::try_from(BUS_NAME)?;
-    let reply = dbus
-        .request_name(wk, RequestNameFlags::DoNotQueue.into())
-        .await?;
-    let status = decide_primary_status(reply);
-    debug!(?status, %BUS_NAME, "single-instance handshake complete");
-    Ok((status, conn))
 }
 
 /// Sibling-process branch — publish the `--focus <slug>` request on
@@ -177,17 +143,12 @@ fn hand_off_to_running(runtime: &tokio::runtime::Runtime, focus: &Option<String>
     }
 }
 
-/// Primary-process branch — keep the D-Bus connection alive (so we
-/// retain ownership of [`BUS_NAME`], the single-instance primitive)
-/// and spawn the Bus focus responder so the [`PendingFocus`] slot
-/// fills whenever a sibling invocation publishes to
-/// `action/shell/workbench-focus`. The responder runs on its own
-/// thread because `Persist` (rusqlite) isn't `Send`.
-fn start_primary_focus_responder(conn: Connection) -> Result<(), ()> {
-    // No object is served on the connection anymore — only the name
-    // matters. Leak it so its background tokio tasks (which keep the
-    // name owned) outlive this function.
-    Box::leak(Box::new(conn));
+/// Primary-process branch — spawn the Bus focus responder so the
+/// [`PendingFocus`] slot fills whenever a sibling invocation publishes to
+/// `action/shell/workbench-focus` (the single-instance primitive itself is now
+/// the pidfile, AUD-8). The responder runs on its own thread because `Persist`
+/// (rusqlite) isn't `Send`.
+fn start_primary_focus_responder() -> Result<(), ()> {
     std::thread::Builder::new()
         .name("workbench-focus-bus".into())
         .spawn(|| {

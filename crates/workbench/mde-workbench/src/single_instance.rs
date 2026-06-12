@@ -1,48 +1,87 @@
-//! D-Bus single-instance handshake.
+//! Lockfile single-instance guard (AUD-8 / §2).
 //!
-//! CB-1.1 lock: "Single-instance via the already-shipped
-//! `dev.mackes.MDE.Shell` D-Bus surface (existing service
-//! registers the workbench when one is already running, else
-//! launches)." The Shell service in `crates/mackesd/src/ipc/shell.rs`
-//! ships the host name + healthz; the workbench *itself* claims
-//! [`BUS_NAME`] (`dev.mackes.MDE.Workbench`) as its own
-//! well-known name. If the request returns `Exists` /
-//! `AlreadyOwner`, a sibling process is already running and the
-//! caller should hand its `--focus <slug>` argument off via
-//! CB-1.13's `Focus` interface instead of opening a second
-//! window.
+//! The workbench used to claim a private D-Bus well-known name
+//! (`dev.mackes.MDE.Workbench`) for single-instance detection — a §2
+//! violation (only FDO `org.freedesktop.*` interop is allowed on D-Bus; new
+//! MDE-private bus names are not). This replaces it with a dep-free pidfile:
+//! `$XDG_RUNTIME_DIR/mde-workbench.lock` holds the live primary's PID. A second
+//! launch reads it, confirms the holder is a live `mde-workbench` via
+//! `/proc/<pid>/comm`, and hands its `--focus` slug off over the **Bus** (the
+//! focus path was already Bus-native — only the name claim was D-Bus).
 //!
-//! The decision logic is split off from the zbus I/O so it can
-//! be tested without spinning up a real session bus.
+//! The decision logic is split from the I/O so it can be unit-tested.
 
-use zbus::fdo::RequestNameReply;
+use std::io::Write;
+use std::path::PathBuf;
 
-/// Well-known D-Bus name the workbench acquires at startup.
-/// Sibling-process detection uses [`Connection::request_name_with_flags`]
-/// + the [`DoNotQueue`](zbus::fdo::RequestNameFlags::DO_NOT_QUEUE)
-/// flag so a second process gets a clean `Exists` immediately,
-/// not a queued reply.
-pub const BUS_NAME: &str = "dev.mackes.MDE.Workbench";
-
-/// Result of asking the bus for [`BUS_NAME`].
+/// Result of the single-instance check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrimaryStatus {
-    /// This process now owns [`BUS_NAME`]. Open the workbench
-    /// window normally.
+    /// This process is the primary. Open the workbench window normally.
     Primary,
-    /// A sibling already owns the name. Hand the `--focus`
-    /// argument off via CB-1.13's `Focus` and exit.
+    /// A sibling is already running. Hand the `--focus` slug off over the
+    /// Bus and exit.
     Existing,
 }
 
-/// Pure decision function — maps zbus's request-name outcome
-/// onto the workbench's single-instance contract. Tested in
-/// isolation against every [`RequestNameReply`] variant.
+/// The pidfile path: `$XDG_RUNTIME_DIR/mde-workbench.lock`, falling back to
+/// `/tmp` when the runtime dir is unset (early-boot / recovery shells).
 #[must_use]
-pub const fn decide_primary_status(reply: RequestNameReply) -> PrimaryStatus {
-    match reply {
-        RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner => PrimaryStatus::Primary,
-        RequestNameReply::Exists | RequestNameReply::InQueue => PrimaryStatus::Existing,
+pub fn lock_path() -> PathBuf {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("mde-workbench.lock")
+}
+
+/// Pure decision: given the PID recorded in the lockfile (if any) and a
+/// liveness probe, decide whether we are primary. A live sibling means
+/// `Existing`; a missing/stale holder means we become `Primary`.
+#[must_use]
+pub fn decide(holder_pid: Option<u32>, is_live_sibling: impl Fn(u32) -> bool) -> PrimaryStatus {
+    match holder_pid {
+        Some(pid) if is_live_sibling(pid) => PrimaryStatus::Existing,
+        _ => PrimaryStatus::Primary,
+    }
+}
+
+/// `true` if `pid` is a live process whose comm is `mde-workbench` (guards
+/// against PID reuse — a recycled PID owned by some other program must not
+/// read as "the workbench is already running"). Linux `/proc`, dep-free.
+#[must_use]
+pub fn live_workbench(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|comm| comm.trim() == "mde-workbench")
+        .unwrap_or(false)
+}
+
+/// Acquire the single-instance pidfile. Returns the status plus, when
+/// `Primary`, the open lockfile handle — the caller keeps it alive for the
+/// process lifetime so the recorded PID stays current. An I/O failure
+/// degrades to `Primary` with no handle (run without protection rather than
+/// refuse to start).
+#[must_use]
+pub fn acquire() -> (PrimaryStatus, Option<std::fs::File>) {
+    let path = lock_path();
+    let holder = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    if decide(holder, live_workbench) == PrimaryStatus::Existing {
+        return (PrimaryStatus::Existing, None);
+    }
+    // Become primary: (re)write our PID into the lockfile.
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            let _ = write!(f, "{}", std::process::id());
+            let _ = f.flush();
+            (PrimaryStatus::Primary, Some(f))
+        }
+        Err(_) => (PrimaryStatus::Primary, None),
     }
 }
 
@@ -51,46 +90,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bus_name_carries_mde_namespace() {
-        assert_eq!(BUS_NAME, "dev.mackes.MDE.Workbench");
-        assert!(BUS_NAME.starts_with("dev.mackes.MDE."));
+    fn live_sibling_means_existing() {
+        assert_eq!(decide(Some(1234), |_| true), PrimaryStatus::Existing);
     }
 
     #[test]
-    fn primary_owner_means_we_are_primary() {
+    fn stale_holder_means_primary() {
+        // PID recorded but not a live workbench (crashed / reused) → us.
+        assert_eq!(decide(Some(1234), |_| false), PrimaryStatus::Primary);
+    }
+
+    #[test]
+    fn no_holder_means_primary() {
+        assert_eq!(decide(None, |_| true), PrimaryStatus::Primary);
+    }
+
+    #[test]
+    fn lock_path_lives_under_runtime_dir() {
+        // Whatever the base, the file name is stable.
         assert_eq!(
-            decide_primary_status(RequestNameReply::PrimaryOwner),
-            PrimaryStatus::Primary
+            lock_path().file_name().unwrap().to_str().unwrap(),
+            "mde-workbench.lock"
         );
     }
 
     #[test]
-    fn already_owner_treated_as_primary() {
-        // Re-requesting our own name on the same connection
-        // returns AlreadyOwner — still us, so still Primary.
-        assert_eq!(
-            decide_primary_status(RequestNameReply::AlreadyOwner),
-            PrimaryStatus::Primary
-        );
-    }
-
-    #[test]
-    fn exists_means_hand_off() {
-        assert_eq!(
-            decide_primary_status(RequestNameReply::Exists),
-            PrimaryStatus::Existing
-        );
-    }
-
-    #[test]
-    fn in_queue_still_means_hand_off() {
-        // DO_NOT_QUEUE should keep us out of this branch in
-        // practice; the mapping still has to be defined so
-        // an accidental queue request doesn't silently launch
-        // a duplicate window.
-        assert_eq!(
-            decide_primary_status(RequestNameReply::InQueue),
-            PrimaryStatus::Existing
-        );
+    fn live_workbench_false_for_impossible_pid() {
+        // PID 0 has no /proc/0/comm → not a live workbench.
+        assert!(!live_workbench(0));
     }
 }
