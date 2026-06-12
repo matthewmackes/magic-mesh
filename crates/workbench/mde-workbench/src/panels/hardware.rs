@@ -27,6 +27,10 @@ pub struct HardwarePanel {
     /// One entry per peer whose probe we hold, sorted by hostname.
     pub probes: Vec<PeerProbe>,
     pub status: String,
+    /// EFF-45 — set when the probe LOAD failed (vs legitimately
+    /// empty). The view renders the error state instead of the
+    /// misleading "No probes yet" empty state.
+    pub load_error: Option<String>,
     pub busy: bool,
     /// `peer_id` of the drilled-in peer; `None` = list view.
     pub focused: Option<String>,
@@ -34,7 +38,7 @@ pub struct HardwarePanel {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Loaded(Vec<PeerProbe>),
+    Loaded(Result<Vec<PeerProbe>, String>),
     Error(String),
     Focus(String),
     Back,
@@ -52,12 +56,16 @@ pub fn peers_cache_dir() -> Option<PathBuf> {
 }
 
 /// Read every `<dir>/<peer>/probe.json` into a [`PeerProbe`], sorted by
-/// hostname. Junk-tolerant: an unreadable / unparseable file is skipped,
-/// never aborting the walk. Pure — the panel's load Task wraps it.
-#[must_use]
-pub fn load_probes(dir: &Path) -> Vec<PeerProbe> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+/// hostname. Junk-tolerant per FILE (an unparseable probe.json is
+/// skipped) — but EFF-45-honest per DIRECTORY: a missing dir is the
+/// legitimate empty state (no peer has published yet), while an
+/// EXISTING dir we cannot read (permissions, I/O) is a load FAILURE,
+/// not "no probes".
+pub fn load_probes(dir: &Path) -> Result<Vec<PeerProbe>, String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("reading {}: {e}", dir.display())),
     };
     let mut out: Vec<PeerProbe> = entries
         .filter_map(Result::ok)
@@ -66,7 +74,7 @@ pub fn load_probes(dir: &Path) -> Vec<PeerProbe> {
         .filter_map(|raw| serde_json::from_str::<PeerProbe>(&raw).ok())
         .collect();
     out.sort_by(|a, b| a.hostname.cmp(&b.hostname));
-    out
+    Ok(out)
 }
 
 impl HardwarePanel {
@@ -78,10 +86,13 @@ impl HardwarePanel {
     pub fn load() -> Task<crate::Message> {
         Task::perform(
             async move {
-                let probes = peers_cache_dir()
-                    .map(|d| load_probes(&d))
-                    .unwrap_or_default();
-                Message::Loaded(probes)
+                let result = match peers_cache_dir() {
+                    Some(d) => load_probes(&d),
+                    // No HOME/XDG at all — a real environment failure,
+                    // not an empty roster.
+                    None => Err("cannot resolve the peer cache dir (no HOME/XDG_CACHE_HOME)".into()),
+                };
+                Message::Loaded(result)
             },
             crate::Message::Hardware,
         )
@@ -89,14 +100,17 @@ impl HardwarePanel {
 
     pub fn update(&mut self, message: Message) -> Task<crate::Message> {
         match message {
-            Message::Loaded(probes) => {
+            Message::Loaded(Ok(probes)) => {
                 self.probes = probes;
                 self.status.clear();
+                self.load_error = None;
                 self.busy = false;
                 Task::none()
             }
-            Message::Error(msg) => {
-                self.status = msg;
+            Message::Loaded(Err(e)) | Message::Error(e) => {
+                // EFF-45 — a failed load is an ERROR state, never an
+                // empty roster.
+                self.load_error = Some(e);
                 self.busy = false;
                 Task::none()
             }
@@ -135,6 +149,17 @@ impl HardwarePanel {
             (!self.busy).then(|| crate::Message::Hardware(Message::RefreshClicked)),
             palette,
         );
+
+        // EFF-45 — a failed load renders as failure, never as the
+        // "No probes yet" empty state.
+        if let Some(err) = &self.load_error {
+            return panel_container(
+                crate::panel_chrome::error_state(err.clone(), palette, || {
+                    crate::Message::Hardware(Message::RefreshClicked)
+                }),
+                density,
+            );
+        }
 
         if self.probes.is_empty() {
             let state = EmptyState::with_cta(

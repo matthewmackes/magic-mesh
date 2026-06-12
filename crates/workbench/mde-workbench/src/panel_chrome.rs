@@ -29,7 +29,7 @@ use mde_theme::{
     components::empty_state::{BODY_CTA_GAP, EMPTY_ICON_SIZE, HEADING_BODY_GAP, VERTICAL_PADDING},
     mde_icon,
     motion::dialog as dialog_tokens,
-    Density, EmptyState, FontSize, IconSize, Palette, Radii, Shadow as MdeShadow,
+    Density, EmptyState, FontSize, Icon, IconSize, Palette, Radii, Shadow as MdeShadow,
     Space as MdeSpace, TypeRole,
 };
 
@@ -246,6 +246,31 @@ pub fn card<'a, Message: 'a>(
             text_color: Some(palette.text.into_iced_color()),
         })
         .into()
+}
+
+/// EFF-45 — error-state renderer: the load-FAILED counterpart to
+/// [`empty_state`], so a panel whose data source errored never
+/// masquerades as "nothing to show yet". Same layout family
+/// (icon · heading · body · CTA) but unambiguous failure styling:
+/// [`Icon::StatusError`], a fixed "Couldn't load this panel"
+/// heading, the error detail danger-tinted, and a Retry CTA.
+///
+/// Pattern: panel state carries `load_error: Option<String>`; its
+/// loader message is a `Result` (never silently mapped to an empty
+/// vec); `view()` checks `load_error` BEFORE the is-empty branch.
+pub fn error_state<'a, Message: Clone + 'a>(
+    detail: impl Into<String>,
+    palette: Palette,
+    on_retry: impl Fn() -> Message + 'a,
+) -> Element<'a, Message> {
+    let mut state = EmptyState::with_cta(
+        "Couldn't load this panel",
+        detail.into(),
+        "Retry",
+    )
+    .with_icon(Icon::StatusError);
+    state.body_color_override = Some(palette.danger);
+    empty_state(state, palette, on_retry)
 }
 
 /// UX-6 — empty-state renderer. Take ownership of `EmptyState`
