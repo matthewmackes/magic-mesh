@@ -472,12 +472,22 @@ enum Cmd {
     /// one must be set.
     Enroll {
         /// 16-character URL-safe shared passcode (v1.x flow).
-        #[arg(long, conflicts_with = "token")]
+        /// EFF-21: prefer `--passcode-stdin` — argv is visible in
+        /// /proc/<pid>/cmdline and shell history.
+        #[arg(long, conflicts_with_all = ["token", "token_stdin", "passcode_stdin"])]
         passcode: Option<String>,
+        /// EFF-21 — read the passcode as one line from stdin.
+        #[arg(long, conflicts_with_all = ["token", "token_stdin", "passcode"])]
+        passcode_stdin: bool,
         /// v2.5 Nebula join token —
         /// `mesh:<mesh_id>@<lighthouse_ip>:<port>#<bearer>`.
-        #[arg(long, conflicts_with = "passcode")]
+        /// EFF-21: prefer `--token-stdin` — the bearer rides argv
+        /// otherwise.
+        #[arg(long, conflicts_with_all = ["passcode", "passcode_stdin", "token_stdin"])]
         token: Option<String>,
+        /// EFF-21 — read the join token as one line from stdin.
+        #[arg(long, conflicts_with_all = ["passcode", "passcode_stdin", "token"])]
+        token_stdin: bool,
         /// Optional display name; defaults to the system hostname.
         #[arg(long)]
         name: Option<String>,
@@ -1136,6 +1146,11 @@ enum CaCmd {
         /// Mesh id (defaults to `mesh-<hostname>`).
         #[arg(long, value_name = "MESH_ID")]
         mesh_id: Option<String>,
+        /// EFF-21 — read the passphrase as one line from stdin
+        /// (preferred: the env form is visible in /proc/<pid>/environ
+        /// and inherited by children).
+        #[arg(long)]
+        passphrase_stdin: bool,
         /// Where to write the armored bundle. Default: stdout.
         #[arg(long, value_name = "PATH")]
         output: Option<PathBuf>,
@@ -1154,6 +1169,11 @@ enum CaCmd {
         /// stdin.
         #[arg(long, value_name = "PATH")]
         input: Option<PathBuf>,
+        /// EFF-21 — read the passphrase as one line from stdin
+        /// (requires `--input`, since the default bundle source is
+        /// stdin). Preferred over the env form.
+        #[arg(long, requires = "input")]
+        passphrase_stdin: bool,
     },
 
     /// NF-3.6.b (v2.5) — sign a peer's pending-enroll CSR.
@@ -1448,6 +1468,23 @@ enum RevisionsCmd {
         #[arg(long, default_value = "all")]
         peers: String,
     },
+}
+
+/// EFF-21 — read one secret line from stdin (trailing newline
+/// stripped). Used by the `--*-stdin` flags so secrets never ride
+/// argv (`/proc/<pid>/cmdline`) or the inherited environment.
+fn read_secret_line(ctx: &str) -> anyhow::Result<String> {
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| anyhow::anyhow!("{ctx}: reading secret from stdin: {e}"))?;
+    let secret = line.trim_end_matches(['\r', '\n']).to_string();
+    if secret.is_empty() {
+        anyhow::bail!("{ctx}: empty secret on stdin");
+    }
+    Ok(secret)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -2454,10 +2491,25 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::Enroll {
             passcode,
+            passcode_stdin,
             token,
+            token_stdin,
             name,
             workgroup_root,
         } => {
+            // EFF-21 — stdin intake keeps the secret out of
+            // /proc/<pid>/cmdline + shell history. clap's conflict
+            // rules guarantee at most one source is set.
+            let passcode = if passcode_stdin {
+                Some(read_secret_line("enroll --passcode-stdin")?)
+            } else {
+                passcode
+            };
+            let token = if token_stdin {
+                Some(read_secret_line("enroll --token-stdin")?)
+            } else {
+                token
+            };
             let display = name.unwrap_or_else(|| {
                 std::env::var("HOSTNAME").unwrap_or_else(|_| {
                     std::process::Command::new("hostname")
@@ -2925,20 +2977,24 @@ fn main() -> anyhow::Result<()> {
                 }
                 CaCmd::Export {
                     mesh_id,
+                    passphrase_stdin,
                     output,
                     ca_key,
                 } => {
-                    // NF-18.1 — encrypted CA backup. Passphrase
-                    // via env var so it doesn't land in shell
-                    // history. CA key path defaults to the
-                    // SignCsrPaths production value.
+                    // NF-18.1 — encrypted CA backup. EFF-21: prefer
+                    // --passphrase-stdin (env is environ-visible +
+                    // child-inherited); env stays the fallback.
                     let mesh = mesh_id.unwrap_or(default_mesh);
-                    let passphrase = std::env::var("MDE_BACKUP_PASSPHRASE").map_err(|_| {
-                        anyhow::anyhow!(
-                            "export: set MDE_BACKUP_PASSPHRASE before invoking \
-                             (the bundle is encrypted with this passphrase)"
-                        )
-                    })?;
+                    let passphrase = if passphrase_stdin {
+                        read_secret_line("export")?
+                    } else {
+                        std::env::var("MDE_BACKUP_PASSPHRASE").map_err(|_| {
+                            anyhow::anyhow!(
+                                "export: pass --passphrase-stdin (preferred) or set \
+                                 MDE_BACKUP_PASSPHRASE before invoking"
+                            )
+                        })?
+                    };
                     let key_path = ca_key.unwrap_or_else(|| {
                         mackesd_core::nebula_enroll::SignCsrPaths::production_defaults().ca_key
                     });
@@ -2974,11 +3030,23 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                CaCmd::Import { input } => {
-                    // NF-18.1 — encrypted CA bundle restore.
-                    let passphrase = std::env::var("MDE_BACKUP_PASSPHRASE").map_err(|_| {
-                        anyhow::anyhow!("import: set MDE_BACKUP_PASSPHRASE before invoking",)
-                    })?;
+                CaCmd::Import {
+                    input,
+                    passphrase_stdin,
+                } => {
+                    // NF-18.1 — encrypted CA bundle restore. EFF-21:
+                    // --passphrase-stdin preferred (requires --input,
+                    // since the default bundle source is stdin).
+                    let passphrase = if passphrase_stdin {
+                        read_secret_line("import")?
+                    } else {
+                        std::env::var("MDE_BACKUP_PASSPHRASE").map_err(|_| {
+                            anyhow::anyhow!(
+                                "import: pass --passphrase-stdin with --input \
+                                 (preferred) or set MDE_BACKUP_PASSPHRASE"
+                            )
+                        })?
+                    };
                     let armored = match input {
                         Some(path) => std::fs::read_to_string(&path)
                             .with_context(|| format!("read {}", path.display()))?,
@@ -4832,6 +4900,18 @@ fn run_serve(
         // them as gauges.
         let worker_status = mackesd_core::workers::new_status_map();
         sup.set_status_map(Arc::clone(&worker_status));
+        // EFF-21 — capture the dev-fallback backup passphrase ONCE and
+        // scrub it from the process environment immediately, so none of
+        // the worker subprocesses (nebula-cert, df, firewall-cmd, …)
+        // inherit the secret via environ. The systemd-creds path
+        // (CREDENTIALS_DIRECTORY) is unaffected — never env-borne
+        // (ENT-11). The captured value feeds the backup worker; the
+        // boolean feeds the exporter's backup-posture gauge.
+        let backup_passphrase: Option<String> = std::env::var("MDE_BACKUP_PASSPHRASE")
+            .ok()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty());
+        std::env::remove_var("MDE_BACKUP_PASSPHRASE");
         // v4.1 — track spawned worker names so Shell.Workers can
         // surface them via D-Bus. Strings get pushed alongside
         // each sup.spawn(); skipped workers (sqlite open failure)
@@ -4955,7 +5035,9 @@ fn run_serve(
                         &workgroup_root,
                         &node_id,
                     ),
-                ),
+                )
+                // EFF-21 — env is scrubbed at boot; presence rides this flag.
+                .with_backup_passphrase_set(backup_passphrase.is_some()),
                 RestartPolicy::OnFailure,
             ));
             worker_names.lock().expect("worker_names mutex").push("metrics_exporter".into());
@@ -5307,15 +5389,19 @@ fn run_serve(
                 let backup_store = Arc::new(tokio::sync::Mutex::new(conn));
                 let backup_mesh = std::env::var("MDE_MESH_ID")
                     .unwrap_or_else(|_| format!("mesh-{node_id}"));
-                sup.spawn(Spawn::new(
+                let mut backup_worker =
                     mackesd_core::workers::nebula_ca_backup::NebulaCaBackup::new(
                         workgroup_root.clone(),
                         node_id.clone(),
                         backup_mesh,
                         backup_store,
-                    ),
-                    RestartPolicy::OnFailure,
-                ));
+                    );
+                // EFF-21 — hand over the boot-captured passphrase (the
+                // env was scrubbed right after capture, top of run_serve).
+                if let Some(phrase) = backup_passphrase.clone() {
+                    backup_worker = backup_worker.with_passphrase(phrase);
+                }
+                sup.spawn(Spawn::new(backup_worker, RestartPolicy::OnFailure));
                 worker_names
                     .lock()
                     .expect("worker_names mutex")

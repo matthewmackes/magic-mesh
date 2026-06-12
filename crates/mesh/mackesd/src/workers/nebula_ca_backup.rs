@@ -85,6 +85,11 @@ pub struct NebulaCaBackup {
     /// `MDE_BACKUP_PASSPHRASE`. Tests use a unique name per test
     /// to avoid cross-test interference.
     passphrase_env: String,
+    /// EFF-21 — startup-captured passphrase (run_serve reads the env
+    /// var once, hands it here, then scrubs the environment so worker
+    /// subprocesses never inherit the secret). Wins over both the
+    /// creds dir and the env fallback when set.
+    passphrase_override: Option<String>,
 }
 
 impl NebulaCaBackup {
@@ -106,7 +111,16 @@ impl NebulaCaBackup {
             ca_key_path: PathBuf::from("/var/lib/mackesd/nebula-ca/ca.key"),
             tick: TICK_INTERVAL,
             passphrase_env: "MDE_BACKUP_PASSPHRASE".to_string(),
+            passphrase_override: None,
         }
+    }
+
+    /// EFF-21 — supply the startup-captured passphrase (see the
+    /// field doc). The caller is responsible for scrubbing the env.
+    #[must_use]
+    pub fn with_passphrase(mut self, phrase: String) -> Self {
+        self.passphrase_override = Some(phrase);
+        self
     }
 
     /// Override the CA key path. Tests redirect to a tempdir.
@@ -181,6 +195,15 @@ impl NebulaCaBackup {
     /// pre-creds boxes. Returns the trimmed phrase, or empty.
     #[must_use]
     pub fn read_passphrase(&self) -> String {
+        // EFF-21 — a startup-captured override wins: run_serve reads
+        // the dev-fallback env var ONCE at boot, hands it here, and
+        // scrubs it from the environment so worker subprocesses
+        // (nebula-cert, df, firewall-cmd, …) never inherit it.
+        if let Some(p) = &self.passphrase_override {
+            if !p.is_empty() {
+                return p.clone();
+            }
+        }
         if let Some(dir) = std::env::var_os("CREDENTIALS_DIRECTORY") {
             let path = std::path::Path::new(&dir).join("backup-passphrase");
             if let Ok(p) = std::fs::read_to_string(&path) {

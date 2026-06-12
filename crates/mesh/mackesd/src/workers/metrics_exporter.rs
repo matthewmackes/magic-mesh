@@ -69,9 +69,12 @@ pub struct MetricsExporterWorker {
     /// 10% free.
     disk_paths: Vec<PathBuf>,
     /// EFF-26 — the daily `state-backup.enc` path; drives the
-    /// backup-staleness gauge/alert (and the passphrase-unset alert
-    /// via the `MDE_BACKUP_PASSPHRASE` env check).
+    /// backup-staleness gauge/alert.
     backup_file: Option<PathBuf>,
+    /// EFF-21/26 — whether the backup passphrase was provided at boot
+    /// (env captured-then-scrubbed by run_serve, or systemd-creds; the
+    /// env can no longer be read per tick BECAUSE it is scrubbed).
+    backup_passphrase_set: bool,
     /// Override the tick cadence (default [`TICK_INTERVAL`]). Used by
     /// tests to drive the loop without 30 s waits.
     tick: Duration,
@@ -90,6 +93,7 @@ impl MetricsExporterWorker {
             worker_status: None,
             disk_paths: Vec::new(),
             backup_file: None,
+            backup_passphrase_set: false,
             tick: TICK_INTERVAL,
         }
     }
@@ -126,6 +130,14 @@ impl MetricsExporterWorker {
         self
     }
 
+    /// EFF-21/26 — record whether the backup passphrase was provided
+    /// at boot (env-captured or creds; see run_serve).
+    #[must_use]
+    pub fn with_backup_passphrase_set(mut self, set: bool) -> Self {
+        self.backup_passphrase_set = set;
+        self
+    }
+
     /// Override the tick cadence — used by tests to avoid 30-second
     /// wall-clock waits.
     #[must_use]
@@ -155,6 +167,7 @@ impl Worker for MetricsExporterWorker {
                         worker_status: self.worker_status.clone(),
                         disk_paths: self.disk_paths.clone(),
                         backup_file: self.backup_file.clone(),
+                        backup_passphrase_set: self.backup_passphrase_set,
                     };
                     // tick_once is sync (rusqlite + blocking file I/O +
                     // subprocesses) — hop onto a blocking task so it
@@ -187,6 +200,8 @@ pub struct TickInputs {
     pub disk_paths: Vec<PathBuf>,
     /// EFF-26 backup bundle (staleness alert).
     pub backup_file: Option<PathBuf>,
+    /// EFF-21/26 — boot-time passphrase presence (env or creds).
+    pub backup_passphrase_set: bool,
 }
 
 /// One export pass: open the store, snapshot the counters, write the
@@ -222,10 +237,12 @@ pub fn tick_once(inputs: &TickInputs) {
     for path in &inputs.disk_paths {
         counters.extend(disk_counters(path));
     }
-    // EFF-26 — backup posture: passphrase set? bundle fresh?
+    // EFF-26 — backup posture: passphrase set? bundle fresh? The env
+    // var is scrubbed at boot (EFF-21), so presence comes from the
+    // boot-time flag OR'd with the systemd-creds file.
     counters.extend(backup_counters(
         inputs.backup_file.as_deref(),
-        std::env::var_os("MDE_BACKUP_PASSPHRASE").is_some(),
+        inputs.backup_passphrase_set || creds_backup_present(),
         now_unix(),
     ));
     // AUD2-1 — snapshot the router's decision-time histogram (brief
@@ -483,6 +500,15 @@ pub fn backup_counters(
         }
     }
     out
+}
+
+/// EFF-21/26 — true when the systemd-creds backup passphrase file
+/// exists non-empty (`$CREDENTIALS_DIRECTORY/backup-passphrase`).
+fn creds_backup_present() -> bool {
+    std::env::var_os("CREDENTIALS_DIRECTORY")
+        .map(|d| std::path::Path::new(&d).join("backup-passphrase"))
+        .and_then(|p| std::fs::metadata(p).ok())
+        .is_some_and(|m| m.len() > 0)
 }
 
 fn now_unix() -> i64 {
