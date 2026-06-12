@@ -41,6 +41,12 @@ use crate::persist::Persist;
 pub const DEFAULT_TTL_MIN_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_TTL_DEFAULT_SECS: u64 = 7 * 24 * 60 * 60;
 pub const DEFAULT_TTL_HIGH_SECS: u64 = 30 * 24 * 60 * 60;
+/// EFF-47 — ephemeral RPC topics (`reply/<ulid>` + `action/…`).
+/// Interactive request/response pairs are garbage minutes after
+/// the exchange; without this class they sat at the `default`
+/// 7-day TTL and accumulated one row + file per RPC. One hour
+/// comfortably covers any in-flight poll/retry window.
+pub const DEFAULT_TTL_EPHEMERAL_SECS: u64 = 60 * 60;
 
 /// GFS quota thresholds.
 pub const DEFAULT_QUOTA_SOFT_BYTES: u64 = 500 * 1024 * 1024;
@@ -61,6 +67,9 @@ pub struct RetentionPolicy {
     pub ttl_default_secs: u64,
     /// Seconds before `high`-priority messages are GC'd.
     pub ttl_high_secs: u64,
+    /// EFF-47 — seconds before ephemeral RPC topics (`reply/*`,
+    /// `action/*`) are GC'd regardless of priority class.
+    pub ttl_ephemeral_secs: u64,
     /// Soft quota — exceeding this publishes `bus/sys/quota`
     /// warning (default priority).
     pub quota_soft_bytes: u64,
@@ -75,6 +84,7 @@ impl Default for RetentionPolicy {
             ttl_min_secs: DEFAULT_TTL_MIN_SECS,
             ttl_default_secs: DEFAULT_TTL_DEFAULT_SECS,
             ttl_high_secs: DEFAULT_TTL_HIGH_SECS,
+            ttl_ephemeral_secs: DEFAULT_TTL_EPHEMERAL_SECS,
             quota_soft_bytes: DEFAULT_QUOTA_SOFT_BYTES,
             quota_hard_bytes: DEFAULT_QUOTA_HARD_BYTES,
         }
@@ -227,6 +237,38 @@ pub fn run_pass_at(
             .map_err(|e| RetentionError::Sql(format!("query: {e}")))?;
         for r in rows {
             victims.push(r.map_err(|e| RetentionError::Sql(format!("decode: {e}")))?);
+        }
+    }
+
+    // EFF-47 — ephemeral RPC topics (`reply/<ulid>` request-response
+    // pairs + the `action/…` requests that produced them) reap on the
+    // short ephemeral TTL regardless of priority class. Without this,
+    // every interactive RPC accumulated a row + file for the full
+    // 7-day default TTL. `audit/*` can't match either prefix, but the
+    // exclusion is kept for defense in depth.
+    {
+        let cutoff = now_unix_ms
+            - i64::try_from(policy.ttl_ephemeral_secs * 1000).unwrap_or(i64::MAX);
+        let mut stmt = conn
+            .prepare(
+                "SELECT ulid, file_path FROM messages \
+                 WHERE (topic LIKE 'reply/%' OR topic LIKE 'action/%') \
+                   AND ts_unix_ms < ?1 AND topic NOT LIKE ?2",
+            )
+            .map_err(|e| RetentionError::Sql(format!("prepare ephemeral: {e}")))?;
+        let rows = stmt
+            .query_map(params![cutoff, audit_like], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| RetentionError::Sql(format!("query ephemeral: {e}")))?;
+        for r in rows {
+            let v = r.map_err(|e| RetentionError::Sql(format!("decode ephemeral: {e}")))?;
+            // The per-priority pass may already hold this victim
+            // (a reply older than its priority TTL) — dedupe so the
+            // delete loop doesn't double-count.
+            if !victims.iter().any(|(u, _)| u == &v.0) {
+                victims.push(v);
+            }
         }
     }
 
@@ -483,6 +525,51 @@ mod tests {
             !p.list_since("audit/peerx", None).unwrap().is_empty(),
             "audit/peerx survived the reap"
         );
+    }
+
+    #[test]
+    fn ephemeral_rpc_topics_reap_after_one_hour() {
+        // EFF-47 — reply/* + action/* reap on the 1h ephemeral TTL
+        // while a same-age default-priority normal topic survives its
+        // 7-day class TTL.
+        let now = 1_000_000_000_000_i64;
+        let two_hours_ago = now - (2_i64 * 60 * 60 * 1000);
+        let (_tmp, root) = open_tmp_with(&[
+            ("reply/01OLDULID", Priority::Default, two_hours_ago),
+            ("action/fleet/list-revisions", Priority::Default, two_hours_ago),
+            ("t/normal", Priority::Default, two_hours_ago),
+        ]);
+        let report = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
+        assert_eq!(report.removed, 2, "both RPC topics reaped, normal survives");
+        let p = Persist::open(root.clone()).unwrap();
+        assert!(p.list_since("reply/01OLDULID", None).unwrap().is_empty());
+        assert!(p
+            .list_since("action/fleet/list-revisions", None)
+            .unwrap()
+            .is_empty());
+        assert!(!p.list_since("t/normal", None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fresh_rpc_topics_survive_the_ephemeral_ttl() {
+        // An in-flight RPC (30 min old) must NOT be reaped.
+        let now = 1_000_000_000_000_i64;
+        let half_hour_ago = now - (30_i64 * 60 * 1000);
+        let (_tmp, root) =
+            open_tmp_with(&[("reply/01FRESH", Priority::Default, half_hour_ago)]);
+        let report = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
+        assert_eq!(report.removed, 0);
+    }
+
+    #[test]
+    fn ephemeral_pass_dedupes_against_priority_pass() {
+        // A reply/* row older than BOTH its priority TTL and the
+        // ephemeral TTL is removed exactly once.
+        let now = 1_000_000_000_000_i64;
+        let ten_days_ago = now - (10_i64 * 24 * 60 * 60 * 1000);
+        let (_tmp, root) = open_tmp_with(&[("reply/01ANCIENT", Priority::Min, ten_days_ago)]);
+        let report = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
+        assert_eq!(report.removed, 1, "single removal despite matching both passes");
     }
 
     #[test]
