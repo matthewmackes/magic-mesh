@@ -246,3 +246,41 @@ jobs:
         run: |
           cargo test -p mackesd --features async-services --locked \
             passcode_creds -- --include-ignored --test-threads=1
+
+  # EFF-16 — supply-chain gates: cargo-deny (advisories · licenses ·
+  # bans · sources, config in deny.toml) + a CycloneDX SBOM artifact.
+  # HARD gate: the policy was validated green locally (cargo-deny
+  # 0.19.8, 2026-06-12) against the full lock — advisories ok, bans ok,
+  # licenses ok, sources ok — so a red here is a real regression.
+  supply-chain:
+    name: supply chain (cargo-deny + SBOM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+
+      - name: cargo-deny (advisories · licenses · bans · sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx
+
+      - name: CycloneDX SBOM
+        run: cargo cyclonedx --format json --override-filename magic-mesh-sbom
+
+      - name: Upload SBOM artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: magic-mesh-sbom
+          path: "**/magic-mesh-sbom.json"
+          if-no-files-found: warn

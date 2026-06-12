@@ -37,6 +37,24 @@ pub struct HealthReport {
     pub audit_chain_intact: bool,
     /// Mackesd version (Cargo package version).
     pub version: String,
+    /// EFF-24 — workers currently alive (live only on the Bus healthz,
+    /// served in-process by the daemon; the CLI's store-only view
+    /// reports 0/0). Serde-defaulted so schema 1 readers/writers
+    /// interoperate.
+    #[serde(default)]
+    pub workers_alive: u32,
+    /// EFF-24 — workers spawned this daemon lifetime.
+    #[serde(default)]
+    pub workers_total: u32,
+    /// EFF-24 — count of ENT-6 circuit-breaker trips (a tripped
+    /// worker stays down until the daemon restarts).
+    #[serde(default)]
+    pub breaker_tripped: u32,
+    /// EFF-24 — the readiness verdict. Store view: audit chain
+    /// intact. Daemon (Bus) view: that AND every worker alive AND no
+    /// breaker tripped.
+    #[serde(default)]
+    pub ready: bool,
 }
 
 impl HealthReport {
@@ -60,6 +78,11 @@ impl HealthReport {
             unreachable_nodes: 0,
             audit_chain_intact: true,
             version: env!("CARGO_PKG_VERSION").to_owned(),
+            workers_alive: 0,
+            workers_total: 0,
+            breaker_tripped: 0,
+            // A bare baseline report has verified nothing — not ready.
+            ready: false,
         }
     }
 
@@ -93,7 +116,23 @@ impl HealthReport {
             r.audit_chain_intact =
                 !matches!(crate::audit::verify(&rows), crate::audit::VerifyOutcome::Break { .. });
         }
+        // EFF-24 — the store-only readiness verdict (the daemon's Bus
+        // healthz ANDs worker liveness on top — see ipc::shell).
+        r.ready = r.audit_chain_intact;
         r
+    }
+
+    /// EFF-24 — enrich a store-derived report with live per-worker
+    /// status (the daemon-side Bus healthz path). Readiness becomes:
+    /// store-ready AND every spawned worker alive AND no ENT-6
+    /// breaker tripped.
+    #[must_use]
+    pub fn with_worker_status(mut self, alive: u32, total: u32, tripped: u32) -> Self {
+        self.workers_alive = alive;
+        self.workers_total = total;
+        self.breaker_tripped = tripped;
+        self.ready = self.ready && tripped == 0 && alive == total;
+        self
     }
 
     /// JSON one-liner for `mackesd healthz`. Stable shape — every
@@ -134,6 +173,22 @@ mod tests {
     fn version_string_matches_cargo() {
         let r = HealthReport::empty();
         assert_eq!(r.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn readiness_folds_worker_status_onto_store_health() {
+        // EFF-24 — store-ready + all workers alive + no trip → ready;
+        // any breaker trip or a dead worker flips it off.
+        let conn = crate::store::open_in_memory().expect("in-memory store");
+        let base = HealthReport::from_store(&conn);
+        assert!(base.ready, "intact store view is ready");
+        let ok = base.clone().with_worker_status(5, 5, 0);
+        assert!(ok.ready);
+        assert_eq!((ok.workers_alive, ok.workers_total), (5, 5));
+        let dead_worker = base.clone().with_worker_status(4, 5, 0);
+        assert!(!dead_worker.ready, "a dead worker breaks readiness");
+        let tripped = base.with_worker_status(5, 5, 1);
+        assert!(!tripped.ready, "a breaker trip breaks readiness");
     }
 
     #[test]

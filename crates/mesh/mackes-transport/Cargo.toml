@@ -2,6 +2,8 @@
 name        = "mackes-transport"
 version     = "0.0.0"
 edition     = "2021"
+# EFF-16 — license metadata so cargo-deny's unlicensed gate passes.
+license.workspace = true
 publish     = false
 description = "KDC2-1 — Transport trait + capability model + TransportKind / HealthState / Capabilities. Pulled out into its own crate so the mesh router can depend on the trait without dragging in any transport implementation. Implementations live in their own crates (mde-kdc, mackes-https-tunnel, mackesd's direct-UDP module)."
 

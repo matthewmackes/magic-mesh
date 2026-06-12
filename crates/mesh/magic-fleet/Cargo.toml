@@ -2,6 +2,8 @@
 name        = "magic-fleet"
 version     = "0.0.0"
 edition     = "2021"
+# EFF-16 — license metadata so cargo-deny's unlicensed gate passes.
+license.workspace = true
 publish     = false
 description = "E11.7 — Magic Mesh \"Automation Mesh\" node engine: apply a desired-state Ansible playbook to the local node via ansible-runner and report convergence (ok/changed/failures/unreachable). The peer-to-peer routing + fleet baseline layer build on this local-apply primitive."
 

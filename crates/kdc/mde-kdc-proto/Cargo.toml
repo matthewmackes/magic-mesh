@@ -2,6 +2,8 @@
 name        = "mde-kdc-proto"
 version     = "0.0.0"
 edition     = "2021"
+# EFF-16 — license metadata so cargo-deny's unlicensed gate passes.
+license.workspace = true
 publish     = false
 description = "KDC2-2 — greenfield Rust KDE Connect protocol library. Pure pure-library: zero D-Bus, zero filesystem, zero networking. Implementations of those layers live in mde-kdc (host integration, KDC2-3). Wire-compatible with the upstream KDE Connect protocol so stock Android/iOS clients pair without modification. Capability-negotiation header on every handshake unlocks MDE-only features for two-MDE-peer pairs with graceful fallback."
 

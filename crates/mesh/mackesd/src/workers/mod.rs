@@ -28,12 +28,76 @@
 
 #![cfg(feature = "async-services")]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
+
+/// EFF-24 — live per-worker status the supervisor maintains and the
+/// Bus `healthz` (+ the metrics exporter) read. One row per spawned
+/// worker, updated at every lifecycle transition.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WorkerStatus {
+    /// Worker name (the `Worker::name()` kebab/snake token).
+    pub name: &'static str,
+    /// True while the worker's `run()` future is live (incl. between
+    /// restarts only during the back-off sleep — set false on exit).
+    pub alive: bool,
+    /// Restart count since daemon start.
+    pub restarts: u32,
+    /// True once the ENT-6 circuit breaker tripped (the supervisor
+    /// stopped restarting it).
+    pub breaker_tripped: bool,
+    /// Outcome of the most recent `run()` exit: `Some(true)` clean,
+    /// `Some(false)` error/panic, `None` while still on first run.
+    pub last_exit_ok: Option<bool>,
+}
+
+/// Shared map: worker name → live status. `std::sync::Mutex` (brief
+/// lock-and-update, never held across await).
+pub type WorkerStatusMap = Arc<std::sync::Mutex<HashMap<&'static str, WorkerStatus>>>;
+
+/// Fresh empty status map for [`Supervisor::set_status_map`].
+#[must_use]
+pub fn new_status_map() -> WorkerStatusMap {
+    Arc::new(std::sync::Mutex::new(HashMap::new()))
+}
+
+/// EFF-24 — apply one status mutation for `name`, inserting the row
+/// on first touch. No-op when no registry is attached (`None`).
+fn update_status(
+    map: &Option<WorkerStatusMap>,
+    name: &'static str,
+    f: impl FnOnce(&mut WorkerStatus),
+) {
+    if let Some(map) = map {
+        let mut g = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(g.entry(name).or_insert(WorkerStatus {
+            name,
+            alive: false,
+            restarts: 0,
+            breaker_tripped: false,
+            last_exit_ok: None,
+        }));
+    }
+}
+
+/// EFF-24 — the readiness reduction over a status map: every spawned
+/// worker alive and no breaker tripped. (The daemon-level `ready`
+/// verdict ANDs this with the store/audit health — see
+/// `ipc::shell::build_healthz`.)
+#[must_use]
+pub fn workers_ready(map: &WorkerStatusMap) -> (u32, u32, u32) {
+    let g = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let total = u32::try_from(g.len()).unwrap_or(u32::MAX);
+    let alive = u32::try_from(g.values().filter(|w| w.alive).count()).unwrap_or(u32::MAX);
+    let tripped =
+        u32::try_from(g.values().filter(|w| w.breaker_tripped).count()).unwrap_or(u32::MAX);
+    (alive, total, tripped)
+}
 
 /// Shutdown signal handed to every worker. Workers should `select!`
 /// on the underlying `watch::Receiver` so they exit promptly when
@@ -434,6 +498,9 @@ pub struct Supervisor {
     shutdown_tx: Arc<watch::Sender<bool>>,
     shutdown_rx: watch::Receiver<bool>,
     join: JoinSet<(&'static str, anyhow::Result<()>)>,
+    /// EFF-24 — optional live status registry; when set, every spawn
+    /// records lifecycle transitions into it.
+    status: Option<WorkerStatusMap>,
 }
 
 impl Default for Supervisor {
@@ -453,7 +520,14 @@ impl Supervisor {
             shutdown_tx: Arc::new(tx),
             shutdown_rx: rx,
             join: JoinSet::new(),
+            status: None,
         }
+    }
+
+    /// EFF-24 — attach the shared per-worker status registry. Call
+    /// before the first `spawn` so every worker is tracked.
+    pub fn set_status_map(&mut self, map: WorkerStatusMap) {
+        self.status = Some(map);
     }
 
     /// Issue every spawned worker a fresh shutdown token cloned from
@@ -473,17 +547,28 @@ impl Supervisor {
         let Spawn { mut worker, policy } = spec;
         let name = worker.name();
         let shutdown = token;
+        // EFF-24 — register + maintain the live status row.
+        let status = self.status.clone();
+        update_status(&status, name, |w| w.alive = true);
         self.join.spawn(async move {
             // ENT-6 — restart-policy state for this worker.
             let mut delay = INITIAL_BACKOFF;
             let mut rapid_failures: u32 = 0;
             let mut window_start = std::time::Instant::now();
+            let mut first_run = true;
             // `break outcome` carries the worker's final result out
             // of the loop, so we don't need a pre-initialized
             // `last_result` slot (which would dead-code in the
             // can-never-be-empty `loop {}`).
             let last_result: anyhow::Result<()> = loop {
                 info!(worker = %name, "starting worker");
+                if !first_run {
+                    update_status(&status, name, |w| {
+                        w.restarts += 1;
+                        w.alive = true;
+                    });
+                }
+                first_run = false;
                 let token_for_run = shutdown.clone();
                 // EFF-4 — a worker that PANICS (not just returns Err) must be
                 // restarted too. Without this, a panic unwinds the whole
@@ -516,6 +601,13 @@ impl Supervisor {
                     Ok(()) => info!(worker = %name, "worker returned Ok"),
                     Err(e) => warn!(worker = %name, error = ?e, "worker returned Err"),
                 }
+                // EFF-24 — record the exit; `alive` flips back on if a
+                // restart follows.
+                let exit_ok = outcome.is_ok();
+                update_status(&status, name, |w| {
+                    w.alive = false;
+                    w.last_exit_ok = Some(exit_ok);
+                });
                 if !should_restart {
                     break outcome;
                 }
@@ -549,6 +641,9 @@ impl Supervisor {
                             "ENT-6: circuit breaker tripped — worker will NOT be restarted \
                              (restart mackesd to re-arm after fixing the cause)",
                         );
+                        // EFF-24 — surface the trip in the status map
+                        // (drives readiness=false on healthz).
+                        update_status(&status, name, |w| w.breaker_tripped = true);
                         break outcome;
                     }
                     RestartDecision::Backoff(d) => tokio::time::sleep(d).await,
@@ -739,6 +834,54 @@ mod tests {
             attempts.load(Ordering::SeqCst) >= 2,
             "panicked then restarted"
         );
+    }
+
+    #[tokio::test]
+    async fn status_map_tracks_lifecycle_and_restarts() {
+        // EFF-24 — the registry records spawn (alive), restart count,
+        // and the final clean exit.
+        let mut sup = Supervisor::new();
+        let status = new_status_map();
+        sup.set_status_map(Arc::clone(&status));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        sup.spawn(Spawn::new(
+            FailOnce {
+                attempts: attempts.clone(),
+            },
+            RestartPolicy::OnFailure,
+        ));
+        let _ = sup.join_all().await;
+        let g = status.lock().unwrap();
+        let w = g.get("fail-once").expect("status row exists");
+        assert!(!w.alive, "exited cleanly after the restart");
+        assert!(w.restarts >= 1, "first failure produced a restart");
+        assert_eq!(w.last_exit_ok, Some(true), "final exit was Ok");
+        assert!(!w.breaker_tripped);
+        drop(g);
+        let (alive, total, tripped) = workers_ready(&status);
+        assert_eq!((alive, total, tripped), (0, 1, 0));
+    }
+
+    #[tokio::test]
+    async fn status_map_alive_while_running() {
+        // A long-running worker shows alive=true until shutdown.
+        let mut sup = Supervisor::new();
+        let status = new_status_map();
+        sup.set_status_map(Arc::clone(&status));
+        let observed = Arc::new(AtomicUsize::new(0));
+        sup.spawn(Spawn::new(
+            ShutdownObserver {
+                observed: observed.clone(),
+            },
+            RestartPolicy::Never,
+        ));
+        // Give the spawn a beat to register.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let (alive, total, tripped) = workers_ready(&status);
+        assert_eq!((alive, total, tripped), (1, 1, 0));
+        sup.shutdown_and_join().await.unwrap();
+        let (alive, _, _) = workers_ready(&status);
+        assert_eq!(alive, 0, "exit recorded after shutdown");
     }
 
     #[test]

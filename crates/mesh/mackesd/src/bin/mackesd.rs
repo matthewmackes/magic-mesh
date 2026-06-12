@@ -4826,6 +4826,12 @@ fn run_serve(
         // because its sync rusqlite calls would block the tokio
         // scheduler if hosted here; both supervisors coexist.
         let mut sup = Supervisor::new();
+        // EFF-24 — the live per-worker status registry: the supervisor
+        // records alive/restarts/breaker transitions; the Bus healthz
+        // folds them into the readiness verdict and the exporter emits
+        // them as gauges.
+        let worker_status = mackesd_core::workers::new_status_map();
+        sup.set_status_map(Arc::clone(&worker_status));
         // v4.1 — track spawned worker names so Shell.Workers can
         // surface them via D-Bus. Strings get pushed alongside
         // each sup.spawn(); skipped workers (sqlite open failure)
@@ -5884,6 +5890,8 @@ fn run_serve(
                     mackesd_core::ipc::shell::ShellState {
                         db_path: db_path.clone(),
                         worker_names: Arc::clone(&worker_names),
+                        // EFF-24 — live worker status → healthz readiness.
+                        worker_status: Some(Arc::clone(&worker_status)),
                     },
                 );
                 let resp_shutdown = Arc::clone(&shutdown);

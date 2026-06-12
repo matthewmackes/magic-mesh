@@ -65,6 +65,11 @@ pub struct ShellState {
     /// momentary lock acquisition (clone-then-drop pattern), so
     /// there's no deadlock risk with the tokio scheduler.
     pub worker_names: Arc<std::sync::Mutex<Vec<String>>>,
+    /// EFF-24 — the supervisor's live per-worker status registry.
+    /// `None` in tests / minimal boots; when present, `healthz`
+    /// reports `workers_alive`/`workers_total`/`breaker_tripped`
+    /// and folds them into the `ready` verdict.
+    pub worker_status: Option<crate::workers::WorkerStatusMap>,
 }
 
 impl ShellService {
@@ -108,6 +113,15 @@ impl ShellService {
                 Ok(conn) => crate::health::HealthReport::from_store(&conn),
                 Err(_) => crate::health::HealthReport::empty(),
             }
+        };
+        // EFF-24 — fold live worker status into the daemon-side report
+        // (the in-process view the CLI's store-only healthz can't see).
+        let report = match &self.state.worker_status {
+            Some(map) => {
+                let (alive, total, tripped) = crate::workers::workers_ready(map);
+                report.with_worker_status(alive, total, tripped)
+            }
+            None => report,
         };
         report
             .to_json_line()
@@ -243,6 +257,7 @@ mod tests {
         let state = ShellState {
             db_path: PathBuf::from("/tmp/test.sqlite"),
             worker_names: Arc::clone(&names_shared),
+            worker_status: None,
         };
         let svc = ShellService::new(state);
         assert_eq!(
@@ -266,6 +281,7 @@ mod tests {
         let state = ShellState {
             db_path: PathBuf::new(),
             worker_names: Arc::clone(&names_shared),
+            worker_status: None,
         };
         let svc = ShellService::new(state);
         names_shared.lock().unwrap().push("kdc_host".into());

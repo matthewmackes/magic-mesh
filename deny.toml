@@ -1,0 +1,157 @@
+# EFF-16 — cargo-deny supply-chain gates (advisories · licenses · bans ·
+# sources). Run locally with `cargo deny check`; CI runs it in the
+# `supply-chain` job (see .github/workflows/ci.yml).
+#
+# Policy stance:
+#   * advisories — RUSTSEC vulns are deny-level; unmaintained/notice-class
+#     advisories warn (a ≤8-peer workgroup product tracks them via the
+#     nightly job, not a hard master-red).
+#   * licenses — allow the copyleft-compatible set the workspace actually
+#     ships (GPL-3.0-or-later workspace + MPL-2.0 libcosmic stack +
+#     permissive deps). Anything new fails until reviewed here.
+#   * bans — multiple-version duplicates warn (the iced 0.13/0.14 pair is
+#     tracked as EFF-34); genuinely banned crates: openssl (rustls is the
+#     §3 lock).
+#   * sources — crates.io + the single pinned pop-os/libcosmic git rev.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+# Unmaintained: fail only on DIRECT workspace deps (the actionable
+# class — e.g. rustls-pemfile, which we migrated off when this gate
+# landed); transitive unmaintained crates (paste/instant/audiopus_sys/
+# proc-macro-error2, all pulled by the GUI/audio stacks with no safe
+# upgrade) surface in the nightly job's log without redding master.
+unmaintained = "workspace"
+ignore = [
+    # RUSTSEC-2023-0071 (rsa crate, Marvin timing sidechannel; no fixed
+    # release exists). Our exposure: mde-kdc-host uses `rsa` for LOCAL
+    # KEY GENERATION only (the §3-pinned 4096-bit identity keypair);
+    # sign/verify on the wire goes through ring. Keygen offers no
+    # remote timing oracle, so the advisory doesn't apply to this
+    # usage. Re-evaluate if `rsa` ever lands on a decrypt/sign path.
+    "RUSTSEC-2023-0071",
+]
+
+[licenses]
+version = 2
+# The workspace's own license plus everything the dep tree ships today.
+# Adding a dep with a license outside this set is a deliberate review
+# moment, not a silent merge.
+allow = [
+    "GPL-3.0-or-later",
+    "GPL-3.0-only",
+    "MPL-2.0",
+    "Unlicense",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+confidence-threshold = 0.8
+
+# rsip + rsip-derives ship no `license` field; their LICENSE file is an
+# MIT-text variant cargo-deny fingerprints as "X11-swapped" (X11 with
+# the final paragraphs swapped — a permissive MIT/X11-family text).
+# Scope the acceptance to exactly these two crates rather than widening
+# the global allow set.
+[[licenses.exceptions]]
+crate = "rsip"
+allow = ["X11-swapped"]
+
+[[licenses.exceptions]]
+crate = "rsip-derives"
+allow = ["X11-swapped"]
+
+# The pinned pop-os git trees ship member crates without per-crate
+# `license` fields (the repo-root LICENSE governs). Clarify each from
+# its repository's declared license: libcosmic + cosmic-panel +
+# cosmic-settings-daemon trees are GPL-3.0-only; the window_clipboard
+# tree (dnd, mime) and the iced-fork's iced_accessibility are MIT.
+[[licenses.clarify]]
+crate = "cosmic-config"
+expression = "GPL-3.0-only"
+license-files = []
+[[licenses.clarify]]
+crate = "cosmic-config-derive"
+expression = "GPL-3.0-only"
+license-files = []
+[[licenses.clarify]]
+crate = "cosmic-theme"
+expression = "GPL-3.0-only"
+license-files = []
+[[licenses.clarify]]
+crate = "cosmic-panel-config"
+expression = "GPL-3.0-only"
+license-files = []
+[[licenses.clarify]]
+crate = "cosmic-settings-daemon"
+expression = "GPL-3.0-only"
+license-files = []
+[[licenses.clarify]]
+crate = "xdg-shell-wrapper-config"
+expression = "GPL-3.0-only"
+license-files = []
+[[licenses.clarify]]
+crate = "dnd"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "mime"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "iced_accessibility"
+expression = "MIT"
+license-files = []
+
+
+[bans]
+# The iced 0.13 (mde-music) vs libcosmic-vendored fork duplication is a
+# known, tracked condition (EFF-34) — warn keeps it visible without
+# redding master until the music port lands.
+multiple-versions = "warn"
+wildcards = "allow"
+
+# §3 substrate lock: rustls everywhere; no OpenSSL linkage.
+[[bans.deny]]
+name = "openssl"
+[[bans.deny]]
+name = "openssl-sys"
+[[bans.deny]]
+name = "native-tls"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+    # The single pinned libcosmic rev (EFF-35 policy: all consumers pin
+    # the same rev; bump deliberately, never track a branch) — plus the
+    # transitive git tree that rev resolves (libcosmic's vendored iced
+    # fork pulls these; the lockfile pins each to an exact commit).
+    "https://github.com/pop-os/libcosmic",
+    "https://github.com/pop-os/cosmic-panel",
+    "https://github.com/pop-os/cosmic-protocols",
+    "https://github.com/pop-os/dbus-settings-bindings",
+    "https://github.com/pop-os/freedesktop-icons",
+    "https://github.com/pop-os/smithay-clipboard",
+    "https://github.com/pop-os/softbuffer",
+    "https://github.com/pop-os/window_clipboard",
+    "https://github.com/pop-os/winit",
+    "https://github.com/iced-rs/cryoglyph",
+    "https://github.com/jackpot51/rust-atomicwrites",
+    "https://github.com/wash2/accesskit",
+]

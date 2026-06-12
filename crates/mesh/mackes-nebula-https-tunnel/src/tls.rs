@@ -24,6 +24,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::net::{TcpListener, TcpStream};
@@ -92,7 +93,9 @@ fn build_server_config(
     let key_pem = std::fs::read(server_key)
         .map_err(|e| TunnelError::CertIo(format!("read {}: {e}", server_key.display())))?;
 
-    let cert_chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+    // RUSTSEC-2025-0134 — rustls-pemfile is unmaintained; parse via the
+    // rustls-pki-types PemObject API it wrapped.
+    let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| TunnelError::CertIo(format!("parse cert pem: {e}")))?;
     if cert_chain.is_empty() {
@@ -102,9 +105,10 @@ fn build_server_config(
         )));
     }
 
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .map_err(|e| TunnelError::CertIo(format!("parse key pem: {e}")))?
-        .ok_or_else(|| TunnelError::CertIo(format!("no key in {}", server_key.display())))?;
+    let key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_slice(&key_pem)
+        .map_err(|e| {
+            TunnelError::CertIo(format!("parse key pem {}: {e}", server_key.display()))
+        })?;
 
     let mut config = ServerConfig::builder()
         .with_no_client_auth()
@@ -131,7 +135,7 @@ fn build_client_config(ca_bundle: Option<&Path>) -> Result<Arc<ClientConfig>, Tu
     let pem = std::fs::read(&bundle_path).map_err(|e| {
         TunnelError::CertIo(format!("read CA bundle {}: {e}", bundle_path.display()))
     })?;
-    for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+    for cert in CertificateDer::pem_slice_iter(&pem) {
         let cert = cert.map_err(|e| TunnelError::CertIo(format!("parse CA pem: {e}")))?;
         roots
             .add(cert)
