@@ -108,3 +108,9 @@ Verify-and-light-sweep pass. Cycle-4 fixes re-verified PASS (VV-4 dispatcher_pri
 - **AUD5-2 (audit-chain hash flake — latent, security-relevant):** `events::append_event` (EFF-25) and the original `worker::apply_repair_rows` computed each row's hash from `now_ms()` but stored `created_at` from a *separate* `Utc::now()` call. `load_audit_rows` reparses `created_at` → epoch-millis to recompute the chain hash, so a sub-millisecond drift between the two clock reads makes `audit::verify` spuriously report a `Break` (a false tamper alarm). Both now derive `created_at` from the single `now_ms` instant via `from_timestamp_millis`. Passed in isolation, failed under load — caught only by the workspace-scope run.
 
 **Cycle-5 status: CLEAN — CONVERGED.** Five consecutive same-day audit cycles; the last two found only second-order test-integrity issues, now resolved. Gates: full workspace test green, mackesd 9/9 targets green, three governance lints clean, cargo deny all-ok.
+
+---
+
+## EFF-31 resolved (2026-06-12) — coverage gate made hard
+
+Operator authorized package installs, unblocking the measurement EFF-31 needed. Installed cargo-llvm-cov 0.8.7 and measured the **library-logic** denominator — the 7 iced/libcosmic GUI crates excluded (render code; correctness rests on mde-theme tokens + the lifted visual gate) and the binary entrypoints (`src/bin/*.rs`, `src/main.rs`; ~5.7k integration-level lines in mackesd.rs alone) ignored: **84.84% lines**. Flipped the CI coverage job from advisory (`continue-on-error: true`) to a **hard `--fail-under-lines 80`** gate over that denominator (~5% margin), mackesd at `--test-threads=1`. Coverage can no longer silently rot. EFF-18 remains the sole CI-decision item parked for an operator call.
