@@ -14,6 +14,7 @@ go for help.
 | Transport | Nebula overlay only | No unencrypted fallback; underlay stays firewalled. |
 | Storage | LizardFS replicated volume | Backups remain the operator's responsibility. |
 | Desktop | Cosmic | The GUI is strictly IBM Carbon (Gray 10/90/100). |
+| Language | **en-US only** | All GUIs, CLI output, logs, and docs are English. Localization is deliberately out of envelope for a ≤8-peer workgroup product (EFF-49); revisit only if the envelope ever widens. |
 
 Running **beyond 8 peers**, on non-Fedora hosts, or in regulated / safety-critical
 / high-availability settings is **out of envelope** and unsupported without
