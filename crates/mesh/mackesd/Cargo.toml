@@ -361,6 +361,8 @@ assets = [
     { source = "packaging/repo/magic-mesh.repo",         dest = "/etc/yum.repos.d/magic-mesh.repo",          mode = "644" },
     { source = "packaging/repo/RPM-GPG-KEY-magic-mesh",  dest = "/etc/pki/rpm-gpg/RPM-GPG-KEY-magic-mesh",   mode = "644" },
     { source = "SUPPORT.md",                       dest = "/usr/share/magic-mesh/SUPPORT.md", mode = "644" },
+    # EFF-27 — the operator day-2 guide ships beside SUPPORT.
+    { source = "ADMIN.md",                         dest = "/usr/share/magic-mesh/ADMIN.md", mode = "644" },
     # ENT-12 — operator help docs; the Workbench Help panel + `mackesd
     # state-restore` reference these at /usr/share/mde/help/.
     { source = "docs/help/*.md",                   dest = "/usr/share/mde/help/", mode = "644" },

@@ -55,4 +55,21 @@ cargo clippy --all-targets
 cargo fmt --all
 ```
 
+Full prerequisites, test rules (mackesd runs serially), and the lint gates:
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Documentation
+
+| For | Read |
+|---|---|
+| Understanding the system | [`docs/architecture.md`](docs/architecture.md) |
+| Running a mesh day-2 | [`ADMIN.md`](ADMIN.md) |
+| Installing | [`docs/help/install.md`](docs/help/install.md) |
+| Per-role setup | [`docs/help/node-setup.md`](docs/help/node-setup.md) |
+| When it breaks | [`docs/help/troubleshooting.md`](docs/help/troubleshooting.md) |
+| Losing a lighthouse | [`docs/help/mesh-recovery.md`](docs/help/mesh-recovery.md) |
+| Contributing | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
+| What's supported | [`SUPPORT.md`](SUPPORT.md) |
+| The rules of the repo | [`AI_GOVERNANCE.md`](AI_GOVERNANCE.md) |
+
 GPL-3.0-or-later. See [`DISCLAIMER.md`](DISCLAIMER.md).
