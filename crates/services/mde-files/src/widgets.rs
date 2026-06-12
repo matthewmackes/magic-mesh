@@ -822,7 +822,7 @@ pub fn tx_row(tx: Transfer) -> Element<'static, Message> {
     let (dir_label, dir_fg, dir_bg, dir_bd) = match tx.dir {
         TxDir::In => (
             "↘ IN",
-            Color::from_rgb(0x6f as f32 / 255.0, 0xb1 as f32 / 255.0, 1.0),
+            t::ACCENT_HI,
             Color {
                 a: 0.08,
                 ..t::PF_INFO

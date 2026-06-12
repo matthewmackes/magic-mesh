@@ -47,6 +47,11 @@ pub const BLUE_60: Rgba = Rgba::rgb(0x0f, 0x62, 0xfe);
 /// Blue 70 — interactive container.
 pub const BLUE_70: Rgba = Rgba::rgb(0x00, 0x43, 0xce);
 
+// ---- Teal ramp (the "self / local node" status hue) ----
+/// Teal 30 — the local-node / "this machine" status hue, kept distinct from
+/// the Blue interactive accent. Used by mde-files' self-peer marker.
+pub const TEAL_30: Rgba = Rgba::rgb(0x3d, 0xdb, 0xd9);
+
 // ---- Support ramp ----
 /// Green 30 — on-dark success glyph.
 pub const GREEN_30: Rgba = Rgba::rgb(0x6f, 0xdc, 0x8c);
@@ -92,6 +97,7 @@ mod tests {
             (BLUE_50, (0x45, 0x89, 0xff)),
             (BLUE_60, (0x0f, 0x62, 0xfe)),
             (BLUE_70, (0x00, 0x43, 0xce)),
+            (TEAL_30, (0x3d, 0xdb, 0xd9)),
             (GREEN_30, (0x6f, 0xdc, 0x8c)),
             (GREEN_40, (0x42, 0xbe, 0x65)),
             (GREEN_50, (0x24, 0xa1, 0x48)),
