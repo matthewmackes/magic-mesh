@@ -262,9 +262,9 @@ impl FileXfer {
             .or_else(|| v.get("destination"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        let Some(target) = selector.strip_prefix("peer:").filter(|t| !t.is_empty()) else {
+        let Some(target) = selector.strip_prefix("peer:").filter(|t| is_clean_component(t)) else {
             return err(format!(
-                "send-to: only peer: destinations deliver directly (got '{selector}')"
+                "send-to: destination must be peer:<name> with a clean name (got '{selector}')"
             ));
         };
         let sources: Vec<String> = v
@@ -336,8 +336,16 @@ impl FileXfer {
                 continue;
             }
             let target = row.get("target").and_then(serde_json::Value::as_str).unwrap_or_default();
+            // EFF-3 — never let a forged/edited outbox row's target or filename
+            // drive a remove_file outside this peer's inbox.
+            if !is_clean_component(target) {
+                continue;
+            }
             if let Some(files) = row.get("files").and_then(|f| f.as_array()) {
                 for f in files.iter().filter_map(|x| x.as_str()) {
+                    if !is_clean_component(f) {
+                        continue;
+                    }
                     let p = self.inbox_root(target).join(&self.host).join(f);
                     if std::fs::remove_file(&p).is_ok() {
                         removed += 1;
@@ -414,6 +422,18 @@ impl FileXfer {
         rows.reverse();
         serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string())
     }
+}
+
+/// EFF-1/EFF-3 — `true` iff `s` is safe to use as a single path component (a
+/// peer name or a filename): non-empty, not `.`/`..`, and free of path
+/// separators / NUL. Blocks the Send-To / rollback path-traversal primitives.
+fn is_clean_component(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !s.contains('\0')
 }
 
 /// Resolve the destination path for `name` in `dir` under a conflict policy.
@@ -706,6 +726,31 @@ mod tests {
         assert!(x
             .file_ops_reply("send-to", Some(r#"{"sources":[],"selector":"peer:oak"}"#))
             .contains("no sources"));
+    }
+
+    #[test]
+    fn send_to_rejects_traversal_in_the_peer_target() {
+        // EFF-1 — a peer:<name> with path separators / .. must not escape the
+        // QNM inbox root.
+        let tmp = tempfile::tempdir().unwrap();
+        let qnm = tmp.path().to_path_buf();
+        let src = tmp.path().join("x.txt");
+        std::fs::write(&src, b"x").unwrap();
+        let x = FileXfer::new(qnm.clone(), "pine".to_string());
+        for evil in ["peer:../../etc", "peer:..", "peer:a/b", "peer:"] {
+            let body =
+                json!({ "sources": [src.to_string_lossy()], "selector": evil }).to_string();
+            let reply: serde_json::Value =
+                serde_json::from_str(&x.file_ops_reply("send-to", Some(&body))).unwrap();
+            assert!(
+                reply.get("error").is_some(),
+                "traversal selector '{evil}' must be rejected"
+            );
+        }
+        // Nothing escaped the qnm tree.
+        assert!(!qnm.parent().unwrap().join("etc").exists());
+        assert!(is_clean_component("oak"));
+        assert!(!is_clean_component("../oak"));
     }
 
     #[test]

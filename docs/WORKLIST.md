@@ -6,6 +6,68 @@ Ordered by priority — security lock first, then largest structural debt, then 
 
 **Operator decisions (2026-06-09):** A1/A2 → **DELETE** the labwc/sway surface · B1/H6/H3/H4 → **BUILD/WIRE** them · C1 → **implement Phase-G** · E1 → **retarget tests to Nebula**.
 
+## ENTERPRISE FIT-AND-FINISH (2026-06-11) — toward an enterprise-class deliverable
+
+Lifted from a 5-pass parallel fit-and-finish evaluation (reliability · security · observability · packaging/release · quality/UX) for an enterprise deliverable **within the stated ≤8-peer flat-trust envelope** (§8 — NOT a zero-trust/hyperscale product). `EFF-#` ids. P1 = blocks a credible enterprise/production cut.
+
+### P1 — blockers for a production cut
+
+- [✓] **EFF-1 · SEC · FileXfer Send-To path traversal (target).** `ipc/files.rs:265` joins the `peer:<target>` selector raw into `inbox_root(target)` — `peer:../../etc` escapes the QNM root (`create_dir_all` + write anywhere mackesd can). Reject `target` with `/`,`..`,`\0`,non-`[A-Za-z0-9._-]`; assert the resolved dest is under `<qnm>/inbox/`. *(Regression from AUD-1 this session.)*
+- [ ] **EFF-2 · SEC · FileXfer Send-To arbitrary-file read (sources).** `ipc/files.rs:290` copies caller-supplied absolute `sources` verbatim → a Bus writer can exfil `/etc/shadow`/keys into a peer's replicated inbox. Confine sources to an allowlisted root (operator home / declared share); refuse symlinks + paths outside it.
+- [✓] **EFF-3 · SEC · FileXfer rollback path traversal.** `ipc/files.rs:338` removes files from `inbox_root(target).join(host).join(f)` off forgeable outbox rows. Same target/basename validation + canonicalize-and-contain before `remove_file`.
+- [ ] **EFF-4 · REL · Supervisor doesn't restart on worker PANIC.** `workers/mod.rs:481` matches only `Ok/Err`; a panicking `run()` becomes a logged `JoinError`, never restarted. Wrap each `worker.run()` so a panic → restartable `Err` (feed the back-off/breaker).
+- [ ] **EFF-5 · REL · Worker-loop `Mutex.lock().expect()` poisons → permanently kills the worker** (compute_expose/firewall_monitor/compute_registry/peer_join). With EFF-4 this silently downs workers. Use poison-tolerant locks (`PoisonError::into_inner`) or `parking_lot`.
+- [ ] **EFF-6 · REL · `mackesd healthz` GUI refresh has no timeout** (`panels/mesh_control.rs:606`) — a hung daemon spins the panel forever. Run with a timeout wrapper + render "healthz timed out".
+- [ ] **EFF-7 · REL · Bus responder threads have no restart + reply closures no `catch_unwind`** (`bin/mackesd.rs:6146`, `ipc/files.rs:64`) — one panicking request downs Fleet.Files/Settings/file surfaces for the session. Wrap reply dispatch in `catch_unwind` → `err()` body.
+- [ ] **EFF-8 · OPS · `healthz` returns a hardcoded `HealthReport::empty()`** (`bin/mackesd.rs:1500`, `ipc/shell.rs:102`) — never live state (leader/node-count/applied-revision all unset). Populate from the store via one shared fn used by CLI + IPC. *(Highest-value ops gap.)*
+- [ ] **EFF-9 · OPS · Prometheus textfile exporter built but never written.** `metrics::write_textfile` has zero callers. Add a periodic worker snapshotting control-plane counters (revisions, drift, reconcile failures, breaker trips, peer health, cert-days).
+- [ ] **EFF-10 · OPS · Structured-logging plane logs human text, not the documented JSON.** `bin/mackesd.rs:1469` uses `fmt()` not `.json()`; `LogContext`/correlation-id unused. Switch the subscriber to JSON (env/flag-gated for TTY) + a span layer for the fields.
+- [ ] **EFF-11 · OPS · No certificate-expiry monitoring/alert.** Certs store `expire_at` but nothing computes days-remaining; a ≤8 mesh silently loses every cert at turnover. Add a periodic check → `healthz`/metrics/alert under a threshold.
+- [ ] **EFF-12 · OPS · systemd units have no sandboxing.** `packaging/systemd/*.service` set only `NoNewPrivileges`. Add `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `ReadWritePaths`/`StateDirectory`, `RestrictAddressFamilies`, `MemoryMax`/`CPUQuota`, `LockPersonality`.
+- [ ] **EFF-13 · PKG · RPM license contradicts the workspace license + copyleft deps.** generate-rpm `license = "proprietary"` vs workspace `GPL-3.0-or-later` + MPL/GPL pop-os deps. Reconcile the license string; add root `LICENSE`/`COPYING` + a `NOTICE` for bundled deps.
+- [ ] **EFF-14 · PKG · No RPM scriptlets** — daemon never enabled, no `systemctl daemon-reload`, no icon/desktop cache, no `/etc/mackesd` dir. Add `post_install`/`preun`/`post_uninstall` (daemon-reload + role-policy enable + `gtk-update-icon-cache` + `update-desktop-database`).
+- [ ] **EFF-15 · PKG · `mackesd.service` won't start without the encrypted credential** (`LoadCredentialEncrypted=…/backup-passphrase.cred`, never created) — fresh install = dead unit. Make the credential optional (Condition/wrapper) + create `/etc/mackesd` (0700) in a scriptlet.
+- [ ] **EFF-16 · PKG · No supply-chain gating.** No `cargo audit`/`cargo deny`/SBOM/`deny.toml`. Add a `cargo deny` (advisories+licenses+bans) + `cargo audit` CI job; emit a CycloneDX SBOM as a release artifact.
+- [ ] **EFF-17 · PKG · `magic-mesh-release` repo RPM referenced but never defined** (`packaging/repo/magic-mesh.repo:11`) — so `dnf install <url>` leaves no repo for upgrades + the `gpgkey=` URL has no key. Define the release sub-package shipping the `.repo` + committed `RPM-GPG-KEY-magic-mesh`.
+- [ ] **EFF-18 · QA · `set_var` env-race forces serial mackesd CI.** ~40 `std::env::set_var` sites pin `cargo test -p mackesd -- --test-threads=1`. Refactor env-reads to injected config (or gate with `serial_test`), then drop the serial flag.
+- [ ] **EFF-19 · CLI · `magic-fleet` is a hand-rolled CLI** — no `--help`/`-h`, no `--json`, binary exit codes. Port to clap (parity with meshctl); add `--json` to apply/heal/converge/reconcile.
+
+### P2 — enterprise ratchet
+
+- [ ] **EFF-20 · REL · ~8 daemon workers shell out blocking, no timeout** (firewall_preset/mesh_dns/mesh_firewall/cups_sync/netassess/peer_cap/netdata_aggregator/ssh_pubkey_gossip) — a hung child pins a runtime thread. Route through the existing `subprocess_tick` timeout helper.
+- [ ] **EFF-21 · SEC · Secrets via env-var + argv.** CA/backup passphrase read from env (`/proc/<pid>/environ`, inherited by children); enroll passcode in argv (`/proc/cmdline`). Prefer the existing `--passphrase-stdin`; pass passcode via stdin; scrub env after read.
+- [ ] **EFF-22 · SEC · Netdata `:19999` web UI not confined to the overlay** (aggregator rewrites only `[stream]`). Set `[web] bind to = <overlay-ip>`/127.0.0.1 and/or land the firewalld rule (the open NET-plane item).
+- [ ] **EFF-23 · SEC · No body-size cap on Bus responders** — `from_str` on unbounded bodies; cap inbound length + `sources`/row counts before parse.
+- [ ] **EFF-24 · OPS · No readiness probe / per-worker liveness.** `mackesd status` prints only DB info. Record per-worker `last_run`/`last_ok` in shared state, surface via `healthz`, expose a readiness verdict (overlay up + leader known + breaker not tripped).
+- [ ] **EFF-25 · OPS · Wire or remove the dead alert layer.** `events.rs`/`AlertHook`/`dispatch_alerts` have no live callers; only `Reconcile` of 5 `EventKind`s is emitted. Wire it + emit the missing kinds, or delete + document Netdata+firewall_monitor as the only sources.
+- [ ] **EFF-26 · OPS · Headless alert path + disk/breaker/backup alerts.** alert_relay is desktop-only (`notify-send`). Route alerts to the metrics file/known log level for headless Server/Lighthouse; add continuous disk-headroom, breaker-trip, and backup-passphrase-unset/backup-staleness alerts.
+- [ ] **EFF-27 · OPS · No day-2 admin guide.** Author `ADMIN.md` (install→enroll→backup-provision→upgrade→rollback→restore→cert-rotation→troubleshoot), cross-linking `docs/help/*` + the SEC-7/state-restore flows.
+- [ ] **EFF-28 · OPS · DR path untested + manual.** Add a DR-drill integration test (lighthouse loss → state-restore → re-enroll) + a `mackesd state-restore --verify` dry-run.
+- [ ] **EFF-29 · PKG · Daemon runs as root, no service identity.** Decide `DynamicUser=yes`+`StateDirectory` vs a `%pre` system user (likely needs `CAP_NET_ADMIN` for nebula — document if root is intentional + drop other caps).
+- [ ] **EFF-30 · PKG · RPM GPG signing + ISO checksum/signature undefined.** Script the operator-gated `rpm --addsign`; generate ISO `SHA256SUMS` + detached signature in the publish step.
+- [ ] **EFF-31 · CI · Coverage gate is advisory (`continue-on-error`).** Ratchet to hard (the comment already says "flip once 80%"); meet 80% or carve GUI crates from the denominator.
+- [ ] **EFF-32 · CI · Build on the real target.** CI is x86_64 ubuntu-latest only; add a Fedora-native build job (the RPM target, with nebula/ansible) + an aarch64 target + an MSRV check.
+- [ ] **EFF-33 · DEPS · MSRV drift.** `rust-toolchain.toml` 1.94 vs `rust-version`/CI 1.85. Reconcile + enforce with the MSRV job.
+- [ ] **EFF-34 · DEPS · Duplicate iced 0.13 (mde-music) vs 0.14.** Migrate mde-music to libcosmic's iced to collapse to one iced renderer; guard with `cargo deny bans`.
+- [ ] **EFF-35 · DEPS · Floating git pins.** Pin every pop-os git dep by explicit `rev`; document the libcosmic update cadence.
+- [ ] **EFF-36 · QA · No property/fuzz tests on untrusted parsers** (Bus bodies, selector/predicate, KDC wire, archive extract) despite a stale "cargo-fuzz added" comment. Add `proptest` round-trips + a `cargo-fuzz` target for archive/Bus framing (or fix the comment).
+- [ ] **EFF-37 · GUI/a11y · The iced Workbench has no a11y** (no accesskit; only the libcosmic crates enable it). Enable iced's a11y feature + add labels/focus order — it's the primary operator surface.
+- [ ] **EFF-38 · DOCS · No CONTRIBUTING / architecture doc / README doc-links.** Add `CONTRIBUTING.md` (build prereqs, test-thread note, lint gates) + `docs/architecture.md` + a README "Documentation" section linking `docs/help/*` + SUPPORT.
+
+### P3 — polish
+
+- [ ] **EFF-39 · OPS · `eprintln!` in daemon/library paths** (telemetry/mdns_relay/events/mde-musicd) bypass the logging plane → `tracing::warn!/error!` with fields. (CLI `println` is fine.)
+- [ ] **EFF-40 · PKG · No CHANGELOG / release tags / `release` NEVRA field.** Add a Keep-a-Changelog, start tagging `magic-mesh-v<ver>`, add `release =` so asset-only bumps don't churn the workspace version.
+- [ ] **EFF-41 · PKG · Release skill stale** — says "no generate-rpm metadata / cut blocked" though it exists. Update `/release` to the live packaging + signing/publish steps.
+- [ ] **EFF-42 · PKG · RPM metadata gaps** — no `Obsoletes`/`Provides`; `nebula` not in stock Fedora (confirm the repo supplies it); consider `Recommends` vs hard `Requires` for ansible-core.
+- [ ] **EFF-43 · PKG · Voice units referenced but not shipped** — `mackesd voice render-config` ExecStartPre cites kamailio/rtpengine units absent from `packaging/systemd/`. Ship them or fix the comments.
+- [ ] **EFF-44 · GUI · Workbench window controls render Unicode-glyph fallback** (`header.rs:11`) — complete the UX-8.a Material Symbols SVG swap.
+- [ ] **EFF-45 · GUI · ~18 workbench panels lack explicit error-state handling** (vs empty states); audit them + retire the catch-all placeholder branch.
+- [ ] **EFF-46 · QA · `#[ignore]`d tests** (systemd-creds, throughput-floor) never run in CI — add an `--include-ignored` nightly/pre-cut job.
+- [ ] **EFF-47 · BUS · RPC reply/request topics persist at Default (7-day TTL)** — give `reply/*` + ephemeral `action/*` a short per-topic TTL so interactive RPCs don't accumulate.
+- [ ] **EFF-48 · CLI · STUN encoder `panic!` on IPv6** (`stun.rs:104`) — return Result/skip-with-warn.
+- [ ] **EFF-49 · I18N · No localization provision** (all en-US). Likely out-of-envelope for a ≤8-peer workgroup — document the en-US-only scope in SUPPORT, or introduce `i18n-embed`+Fluent if in scope.
+
 ## AUDIT-2026-06-11 — fit-for-purpose follow-ups (current actionable set)
 
 Lifted from the 2026-06-11 `docs/COMPLIANCE.md` sweep ("audit the platform for fit for purpose"). The mesh control plane is solid; these close the data-plane + distribution + guardrail gaps. Finding ids are `AUD-#` → COMPLIANCE.md row #. Ordered by impact.
