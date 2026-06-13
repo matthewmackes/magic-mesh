@@ -60,6 +60,12 @@ pub mod nebula_enroll;
 // The rustls listener that serves it is workers::nebula_enroll_listener.
 #[cfg(feature = "async-services")]
 pub mod nebula_enroll_endpoint;
+// ONBOARD-3 — the peer-side fingerprint-pinned network-enroll client:
+// the rustls PinnedCertVerifier (fail-closed) + the POST-CSR-over-TLS
+// flow + materializing /etc/nebula from the returned bundle. The peer
+// half of the MESH-1 fix.
+#[cfg(feature = "async-services")]
+pub mod nebula_enroll_client;
 // NF-18.2 (v2.5) — typed export of the live nebula_peer_certs
 // table, joined with nodes.role for the groups column. Pure-fn
 // SQL projection; consumed by the `mackesd nebula export-roster`

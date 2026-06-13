@@ -555,4 +555,138 @@ mod tests {
         };
         assert_eq!(dispatch(bad_method, &ctx).await.status, 405);
     }
+
+    // ---- ONBOARD-3: full-stack pinned client <-> server ------
+
+    /// Stand up the endpoint identity + a serving socket; return the
+    /// bound port and the endpoint fingerprint. Serves exactly one
+    /// connection in a spawned task.
+    async fn serve_once(root: &std::path::Path, fp_out: &mut String) -> u16 {
+        let id = crate::nebula_enroll_endpoint::generate_endpoint_identity(&["127.0.0.1".into()])
+            .expect("gen");
+        *fp_out = id.fingerprint.clone();
+        let crt = root.join("e.crt");
+        let key = root.join("e.key");
+        std::fs::write(&crt, &id.cert_pem).unwrap();
+        std::fs::write(&key, &id.key_pem).unwrap();
+        let acceptor = build_acceptor(&crt, &key).expect("acceptor");
+        let ctx = roster_ctx(root);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                let _ = serve_connection(acceptor, tcp, ctx).await;
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn full_stack_pinned_client_enrolls_and_materializes() {
+        use crate::nebula_enroll::JoinToken;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let lighthouse_root = tmp.path().join("lighthouse");
+        std::fs::create_dir_all(&lighthouse_root).unwrap();
+        // test_listener mints the CA + sets ctx.workgroup_root = root;
+        // seed the issued bearer there (the lighthouse's ledger).
+        let _ = test_listener(&lighthouse_root); // mints CA at lighthouse_root
+        crate::bearer_ledger::record_issued(&lighthouse_root, "stack-bearer").unwrap();
+        // Consume 10.42.0.1 for the lighthouse itself (mesh-init does this
+        // in production via self-sign) so the joining peer is allocated
+        // 10.42.0.2 and doesn't collide with the roster's lighthouse
+        // overlay IP (which static_host_map would otherwise skip-self).
+        {
+            let conn = crate::store::open(&lighthouse_root.join("mackesd.db")).unwrap();
+            crate::ca::sign::sign_peer_cert(
+                &MockBackend,
+                &conn,
+                "test-mesh",
+                "peer:lighthouse-1",
+                crate::ca::sign::PeerRole::Peer,
+                &lighthouse_root.join("ca.crt"),
+                &lighthouse_root.join("ca.key"),
+                &lighthouse_root.join("scratch/lh.crt"),
+                &lighthouse_root.join("scratch/lh.key"),
+            )
+            .expect("seed lighthouse self-cert at .1");
+        }
+
+        let mut fp = String::new();
+        let port = serve_once(&lighthouse_root, &mut fp).await;
+
+        // Peer side: distinct dirs (different machine in reality).
+        let peer_root = tmp.path().join("peer");
+        let config_dir = tmp.path().join("etc-nebula");
+        let token = JoinToken {
+            mesh_id: "test-mesh".into(),
+            lighthouse: "127.0.0.1".into(),
+            port,
+            bearer: "stack-bearer".into(),
+            fp: Some(fp),
+        };
+        let bundle = crate::nebula_enroll_client::network_enroll(
+            &peer_root,
+            &config_dir,
+            "peer:anvil",
+            "anvil",
+            token,
+        )
+        .await
+        .expect("network enroll");
+
+        assert_eq!(bundle.mesh_id, "test-mesh");
+        // The bearer is spent on the LIGHTHOUSE side.
+        assert!(!crate::bearer_ledger::is_pending(
+            &lighthouse_root,
+            "stack-bearer"
+        ));
+        // /etc/nebula materialized with the PUBLIC external_addr in
+        // static_host_map (the MESH-2 guard) — not a local interface.
+        let config = std::fs::read_to_string(config_dir.join("config.yaml")).unwrap();
+        assert!(
+            config.contains("203.0.113.7:4242"),
+            "static_host_map must carry the lighthouse public addr:\n{config}"
+        );
+        assert!(config_dir.join("ca.crt").exists());
+        assert!(config_dir.join("host.crt").exists());
+        assert!(config_dir.join("host.key").exists());
+    }
+
+    #[tokio::test]
+    async fn full_stack_fp_mismatch_is_refused_fail_closed() {
+        use crate::nebula_enroll::JoinToken;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let lighthouse_root = tmp.path().join("lighthouse");
+        std::fs::create_dir_all(&lighthouse_root).unwrap();
+        let _ = test_listener(&lighthouse_root);
+        crate::bearer_ledger::record_issued(&lighthouse_root, "mismatch-bearer").unwrap();
+
+        let mut _fp = String::new();
+        let port = serve_once(&lighthouse_root, &mut _fp).await;
+
+        // Pin a WRONG fingerprint — the TLS handshake must fail closed,
+        // so the CSR is never sent and the bearer stays unspent.
+        let token = JoinToken {
+            mesh_id: "test-mesh".into(),
+            lighthouse: "127.0.0.1".into(),
+            port,
+            bearer: "mismatch-bearer".into(),
+            fp: Some("0".repeat(64)),
+        };
+        let result = crate::nebula_enroll_client::network_enroll(
+            &tmp.path().join("peer"),
+            &tmp.path().join("etc-nebula"),
+            "peer:anvil",
+            "anvil",
+            token,
+        )
+        .await;
+        assert!(result.is_err(), "fp mismatch must fail closed");
+        assert!(
+            crate::bearer_ledger::is_pending(&lighthouse_root, "mismatch-bearer"),
+            "a refused handshake must NOT spend the bearer",
+        );
+    }
 }
