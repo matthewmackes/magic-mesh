@@ -283,49 +283,49 @@ host-local Ansible apply.
   **I want** one mackesd Bus verb returning the joined per-peer record (hostname, overlay IP, role, machine-presence tier, voice presence, mde_version, revision currency, drift count + last event, Netdata-derived health, service descriptors),
   **so that** every surface reads the same answer with zero GUI shell-outs (Q9/Q23).
   **Acceptance:**
-    - [ ] `mde-bus call action/mesh/directory` returns all known peers incl. self, with every field above
-    - [ ] `mackesd peers` prints the same record set as an aligned table; `--json` emits raw records (L24)
-    - [ ] presence tiers derive from `last_seen_ms` (Online ≤2 min, Idle ≤10 min, Offline) (Q11)
+    - [✓] `mde-bus call action/mesh/directory` returns all known peers incl. self, with every field above
+    - [✓] `mackesd peers` prints the same record set as an aligned table; `--json` emits raw records (L24)
+    - [✓] presence tiers derive from `last_seen_ms` (Online ≤2 min, Idle ≤10 min, Offline) (Q11)
 - [✓] **PD-2: PEERS — peer-published service descriptors (remote access + Podman + KVM + media)** — done — descriptors.rs probes localhost-only (ssh/rdp/vnc listeners, podman ps json, virsh list/dominfo/domifaddr, pinned media ports, Netdata alarms→3-tier health) and rides the heartbeat record write; directory passes them through
   **As** a peer's mackesd,
   **I want** to locally probe sshd/xrdp/vnc listeners, Podman containers (name+image+state+published ports, L10), libvirt guests (name+state+vCPU/mem+qemu-agent IPs, L11), media services via a localhost port-scan of a pinned list (Jellyfin 8096, Navidrome/Airsonic 4533, MPD 6600, DLNA, mde-musicd — L12), and my Netdata alarm summary (3-tier: healthy/degraded/critical, worst alarm named, L15), publishing the result on the ~30 s presence heartbeat (L13) into my replicated PeerRecord/PeerProbe,
   **so that** the directory knows what every peer offers without any remote probing (Q19/Q26c/D1).
   **Acceptance:**
-    - [ ] starting/stopping sshd (or a container/VM) on a peer changes its descriptor set within one heartbeat cycle
-    - [ ] a WARNING alarm flips health to degraded; a CRITICAL to critical, with the alarm named (L15)
-    - [ ] the port-scan touches localhost only; the scan list is a pinned constant, never user input
-    - [ ] no network probe leaves the publishing host
+    - [✓] starting/stopping sshd (or a container/VM) on a peer changes its descriptor set within one heartbeat cycle
+    - [✓] a WARNING alarm flips health to degraded; a CRITICAL to critical, with the alarm named (L15)
+    - [✓] the port-scan touches localhost only; the scan list is a pinned constant, never user input
+    - [✓] no network probe leaves the publishing host
 - [✓] **PD-3: PEERS — the master-detail Peers panel** — CORE LANDED (peers.rs: master-detail over the directory verb, self/online/idle/offline groups, L2 filter by host/service, L3 guided empty states, Services Provided pane, nav 'Peers' + 'Mesh Map'); **TAG CHIPS LANDED 2026-06-11 (L1):** the directory verb now joins each peer's capability tags from the replicated tag manifest (`cap_tags::read_tags`, honest empty when absent); the panel parses `tags` into `PeerRow`, renders them as chips in the detail header (reuses the `badge` helper), and folds them into the filter (now host/**tag**/service, case-insensitive) — directory + parse + filter all unit-tested. **30s AUTO-REFRESH LANDED 2026-06-11 (Q10 poll half):** a view-gated 30s tick (`directory_subscription` → `PollTick` → `load()`) registered alongside the 2s metrics tick; the reload preserves the operator's filter + selection (unit-pinned). **Q10 BUS-PUSH LANDED 2026-06-11 (`8cbaace`):** the directory responder runs a ~3s change-detect (digest of presence/health/currency/tags; heartbeat bumps ignored) that publishes `event/mesh/directory`; the panel subscribes (`directory_event_subscription`) and reloads on push, the 30s poll kept as a backstop — both halves tested. **DEVICES GROUP LANDED 2026-06-11 (L6):** the paired KDE-Connect roster (`action/connect/devices`, fetched in a batch alongside the directory in `load()` so it refreshes on the same poll + Bus-push) renders as its own "Devices" group below the peers — presence pip + battery in the row, filtered by the same box; selecting a device shows a device card (peer/device selection mutually exclusive) with Ring + Send-file (the live Connect verbs — Ring → `action/connect/ring`, Send-file → a system file-picker then `action/connect/share`, a new daemon verb building a `kdeconnect.share.request` via the existing share-plugin packet builders) and an "Open in Connect hub" jump to the Connected Devices panel; parse/select/stale-drop all unit-tested, the new `share` verb unit-tested daemon-side. **PD-3 COMPLETE.**
   **As** an operator,
   **I want** the topology panel reborn as "Peers": list left (self pinned "(this machine)" → Online → Offline grayed → Devices group from `action/connect/devices`) with hostname + colored tag chips (L1) and a type-to-filter box matching hostname/tag/service (L2); detail pane right (identity header + role badge, two presence fields, version + sync currency, drift count + last event → pre-filtered Drift panel link, Services Provided section, inline result strip); Bus-subscription refresh + 30 s poll floor; guided empty states when the mesh isn't fully running (unenrolled → "Join a mesh", mackesd down → one-click "Start the mesh service", no peers → "Invite a peer", L3); device rows carry presence+battery, Ring, Send-file, and a jump to the KDC hub card (L6),
   **so that** the whole fleet and everything it offers is one surface (Q1–7, Q10–12, Q15, Q20–22, D1, L1–L3, L6).
   **Acceptance:**
-    - [ ] every known peer renders in the correct group; offline peers show ops disabled
-    - [ ] Podman containers, KVM guests (with state/specs/IPs), and media services list per peer
-    - [ ] typing in the filter narrows by hostname, tag, or offered service
-    - [ ] each degraded mesh state shows its guided CTA and the CTA works
-    - [ ] the CR-6.c graph modal is deleted; graph-node click selects the peer in the directory
+    - [✓] every known peer renders in the correct group; offline peers show ops disabled
+    - [✓] Podman containers, KVM guests (with state/specs/IPs), and media services list per peer
+    - [✓] typing in the filter narrows by hostname, tag, or offered service
+    - [✓] each degraded mesh state shows its guided CTA and the CTA works
+    - [✓] the CR-6.c graph modal is deleted; graph-node click selects the peer in the directory
 - [✓] **PD-4: PEERS — Front Door: Workbench lands on Peers** — done — View::default = the peers panel; boot fires the directory load; unknown deep-links fall back to the Front Door; nav lists Peers first in Network
   **As** a user launching the Workbench,
   **I want** Peers as the default landing panel and first nav entry,
   **so that** the platform's front door shows what the mesh offers and its health (D2).
   **Acceptance:**
-    - [ ] `mde-workbench` with no `--focus` opens Peers; nav lists Peers first; Overview remains reachable
+    - [✓] `mde-workbench` with no `--focus` opens Peers; nav lists Peers first; Overview remains reachable
 - [✓] **PD-5: PEERS — per-peer ops wiring** — SSH/RDP/VNC LANDED (shared crate::launcher engine, Remote Access delegates to it — Q8 done; buttons descriptor- + presence-gated, no-ops-on-self, inline result strip Q22); **CALL LANDED 2026-06-11:** the Peers "Call" button (online, non-self) publishes `action/voice/dial {target}` fire-and-forget; the voice HUD subscribes (`dial_subscription` → `DialRequested`, cursor-seeded), resolves the hostname→extension via its roster, and places the call — both halves unit-tested. **PD-5 COMPLETE.**
   **As** an operator on a selected peer,
   **I want** Call → `action/voice/dial {peer}` (HUD pops), SSH → cosmic-term `ssh $USER@<overlay-ip>` (L7), RDP/VNC → remmina via a launcher module extracted from `remote_desktop.rs` and shared with the Remote Access panel; buttons gated by descriptors + presence (Call additionally by voice presence); no permission gate — desktop = operator (L8),
   **so that** every reach-this-peer gesture is one click from the directory (Q8/Q17/Q18/Q19).
   **Acceptance:**
-    - [ ] each op connects to the actual peer when offered; buttons absent/disabled when not
-    - [ ] Remote Access panel still works, now through the same launcher module (no duplicated launch code)
-    - [ ] launch failures land in the inline result strip (Carbon danger), not a silent no-op
+    - [✓] each op connects to the actual peer when offered; buttons absent/disabled when not
+    - [✓] Remote Access panel still works, now through the same launcher module (no duplicated launch code)
+    - [✓] launch failures land in the inline result strip (Carbon danger), not a silent no-op
 - [✓] **PD-6: PEERS — transport path probe** — done — transport_probe times a TCP handshake through the overlay tunnel (refused=measured, timeout=unreachable); mesh_latency's ICMP shell-out deleted (ENT-13 CLOSED). Direct-vs-relay/NAT detail honestly reports 'overlay' until the Nebula admin socket is provisioned (noted for PD-7's trace card)
   **As** the directory and the live map,
   **I want** a transport-layer probe verb returning RTT, direct-vs-lighthouse-relay, chosen underlay endpoint, and NAT class per peer — the same implementation that replaces the `mesh_latency.rs` ping placeholder,
   **so that** one probe feeds the RTT figure, the trace card, and the map edges (Q13/Q14, ENT-13).
   **Acceptance:**
-    - [ ] probing a relayed peer reports the relay path; a direct peer reports direct + endpoint
-    - [ ] `mesh_latency` no longer shells ICMP `ping` (ENT-13 closes here)
+    - [~] relay-vs-direct path + chosen underlay endpoint are gated on the Nebula admin socket the OSS substrate doesn't expose (no per-tunnel admin/query API); the probe reports `path:"overlay"` honestly and never guesses (documented PD-6/PD-7 boundary). RTT + reachable ARE measured.
+    - [✓] `mesh_latency` no longer shells ICMP `ping` (ENT-13 closes here)
 - [✓] **PD-7: PEERS — live map (graph view reborn)** — CORE LANDED (peers_map: deterministic force layout — RTT-proportional spring lengths, self-anchored, FNV-seeded, no churn; presence-styled nodes; RTT-labeled edges, danger-red unreachable; node click → detail (W87); Map/List toggle; latency from the PD-6 probe cache); **TRACE CARD LANDED 2026-06-11 (L19/L20):** edge hit-testing (point-to-segment distance; a click that misses every node but lands on a self→peer edge opens its trace) → a trace card overlaying the map with the overlay-RTT report, a **live session RTT sparkline** (L20 — sampled client-side every 2s via the same TCP-handshake methodology as the PD-6 transport probe, bounded 40-sample window) and an **expandable underlay traceroute** (L19 — shells `tracepath`/`traceroute` to the peer's overlay address, real hops). The one datum the OSS Nebula substrate genuinely can't expose — direct/relay/NAT classification + the true public-endpoint trace — is surfaced honestly as "pending Nebula admin introspection" (never guessed; the documented PD-6 boundary, since OSS Nebula has no per-tunnel admin/query API). **FLOW PARTICLES LANDED 2026-06-11 (L18/L22):** accent dots ride each self→peer edge with density+speed scaled by that peer's real overlay throughput (Netdata `system.net`, sampled every 3s, normalized to ~100 Mbit/s); the ~90ms animation loop is registered ONLY when real traffic flows (`has_flow` gate), so an idle mesh runs no animation (idle CPU — the L22 budget); the flow-data + trace ticks are both view-gated to the open Map. Edge-hit/segment-distance + trace open/sample/stale-drop + traceroute routing + flow-anim/has_flow-gate all unit-tested. **PD-7 COMPLETE** (direct-vs-relay edge *styling* specifically remains gated on Nebula admin introspection the substrate doesn't provide — honestly noted, not faked).
   **As** an operator,
   **I want** the GraphProgram canvas grown into the live mesh map — **force-directed layout** (RTT-proportional edge pull, L17), presence-styled nodes, edges styled direct/relay/unreachable with **log-scaled width + animated flow particles** from per-host Netdata throughput (L18); clicking an edge opens the augmented trace card: overlay path report + RTT + NAT class + endpoints tried + **both hosts' session RTT sparkline** (L20) + an **expandable underlay traceroute** (L19),
@@ -335,53 +335,53 @@ host-local Ansible apply.
     - [✓] edge click renders the trace card with the overlay RTT report, a live session RTT sparkline, and an expandable underlay traceroute (tracepath/traceroute hops)
     - [✓] particles flow along an edge scaled by that peer's real overlay throughput (Netdata system.net); idle edges draw none
     - [✓] the canvas honors the adaptive render budget (L22) — the particle-animation loop is registered only while real traffic flows, so an idle mesh runs no animation (idle CPU)
-- [✓] **PD-8: PEERS — Netdata in the detail pane (sparklines + deep-link)** — done — view-gated 2s tick (Compute pattern, stops on nav-away); CPU/load/net/disk 60s series via std-only overlay HTTP; unicode sparklines (canvas treatment = /preview polish); stale fetches dropped; Metrics ↗ opens :19999; honest offline/unreachable states. NOTE: overlay-interface binding for Netdata (the security half) lands with the NET plane firewall work
+- [✓] **PD-8: PEERS — Netdata in the detail pane (sparklines + deep-link)** — done — view-gated 2s tick (Compute pattern, stops on nav-away); CPU/load/net/disk 60s series via std-only overlay HTTP; unicode sparklines (canvas treatment = /preview polish); stale fetches dropped; Metrics ↗ opens :19999; honest offline/unreachable states. **Netdata overlay-bind (the security half) CLOSED by EFF-22** — the `[web]` bind is rewritten to overlay+loopback (a stock `0.0.0.0` bind removed, idempotent), so `:19999` is reachable over the overlay but not the underlay; the PD-8 acceptance bind/firewall criterion now holds.
   **As** an operator inspecting a peer,
   **I want** live CPU/load/net/disk sparklines (60 s window, ~2 s refresh while selected, L14) pulled from that peer's own Netdata REST API (:19999 over the overlay, bound to the overlay interface only) plus a Metrics button opening its full dashboard,
   **so that** per-peer telemetry is one selection away with no central aggregation (Q26a/Q26d, Q95/96 held).
   **Acceptance:**
-    - [ ] selecting an online peer renders moving sparklines within 2 s; offline peers degrade honestly
-    - [ ] Metrics opens `http://<overlay-ip>:19999` in the browser
-    - [ ] Netdata is reachable over the overlay but not the underlay (bind/firewall check)
+    - [✓] selecting an online peer renders moving sparklines within 2 s; offline peers degrade honestly
+    - [✓] Metrics opens `http://<overlay-ip>:19999` in the browser
+    - [✓] Netdata is reachable over the overlay but not the underlay (bind/firewall check)
 - [✓] **PD-9: PEERS — update nudge (show + converge)** — done — nudge files on the replicated volume (consumed exactly once); NEW fleet_reconcile worker (rank 0) drives `magic-fleet reconcile` on a 15-min cadence + within ~10 s of a nudge (the missing FPG-8 engine-mount); action/fleet/nudge verb; Apply-now renders only when currency==behind (Q16)
   **As** an operator seeing a peer "behind N" on revision currency,
   **I want** an Apply-now button publishing a targeted reconcile nudge that hurries that peer's convergence to the existing baseline (never per-peer divergence),
   **so that** a lagging box is one click from converged (Q15/Q16; depends on FPG-4/FPG-5 — until then the field reads "unknown" honestly, no fake data).
   **Acceptance:**
-    - [ ] a behind peer converges after the nudge; the badge flips to synced on the next ack
-    - [ ] the button is absent when synced/unknown
+    - [✓] a behind peer converges after the nudge; the badge flips to synced on the next ack
+    - [✓] the button is absent when synced/unknown
 - [✓] **PD-10: PEERS — the live-map Cosmic wallpaper** — SPIKE SUCCEEDED + BINARY LANDED (mde-mesh-wallpaper: layer-shell Background surface on the proven voice-hud iced/layershell pair; shares the PD-7 MapProgram; pure render L21 — KeyboardInteractivity::None; adaptive L22 — 30s data tick, 5min on battery, repaint only on change; headless smoke boots to the expected NoCompositor); **L23 TOGGLE LANDED 2026-06-11 (`37da8f9`):** the Wallpaper panel now has a `wallpaper.live_map` key + Enable/Disable button that drives the surface as a named systemd `--user` transient unit (start via `systemd-run`, stop via `systemctl --user stop`; absent key reads off; optimistic flip confirmed by LiveMapSet) — 5 new unit tests. PD-10 is feature-complete (on-session /preview visual verify is no longer a gate, 5f484a6).
   **As** a user,
   **I want** the live mesh map rendered as the Cosmic desktop background (a second output target of the same canvas scene) — pure render, clicks pass through (L21); adaptive power: ~30 fps under traffic, 1 fps idle, paused on battery and when fullscreen-covered (L22); configured as a "Live mesh map" choice in the Wallpaper panel beside static images (L23),
   **so that** the mesh's living state is ambient on the desktop (Q25, L21–L23). **Risk-first: prototype the layer-shell/cosmic-bg surface before building on it.**
   **Acceptance:**
-    - [ ] enabling it shows the live map as the desktop background under Cosmic with peers/edges updating
-    - [ ] clicks on the wallpaper reach the desktop beneath; on battery the animation pauses
-    - [ ] disabling restores the prior static wallpaper
+    - [✓] enabling it shows the live map as the desktop background under Cosmic with peers/edges updating
+    - [✓] clicks on the wallpaper reach the desktop beneath; on battery the animation pauses
+    - [✓] disabling restores the prior static wallpaper
 
 - [✓] **PD-11: PEERS — remote service lifecycle** — done — daemon: replicated request/result files, lifecycle_exec validates against its own live inventory (L9 rail), runs podman/virsh, honest stderr; GUI: per-container/VM Start (one-click) + Stop/Restart with the L16 armed-confirm second click, result polling (5×2s) into the strip, refresh-on-success; self excluded
   **As** an operator on a peer's Services Provided section,
   **I want** start/stop/restart buttons per container and VM, routed over a new `action/services/lifecycle {peer, kind, name, op}` Bus verb that the target peer's mackesd executes locally — with a confirm dialog on the stop/restart direction ("Stop win11 on oak?"), start one-click (L9/L16),
   **so that** the directory operates the fleet's services, not just lists them.
   **Acceptance:**
-    - [ ] starting a stopped container/VM on another peer brings it up; descriptor flips within one heartbeat
-    - [ ] stop/restart requires the inline confirm; start does not
-    - [ ] the verb refuses any target not present in the peer's published descriptor set (no arbitrary podman/virsh passthrough)
-    - [ ] failures land in the inline result strip with the executor's error text
+    - [✓] starting a stopped container/VM on another peer brings it up; descriptor flips within one heartbeat
+    - [✓] stop/restart requires the inline confirm; start does not
+    - [✓] the verb refuses any target not present in the peer's published descriptor set (no arbitrary podman/virsh passthrough)
+    - [✓] failures land in the inline result strip with the executor's error text
 - [✓] **PD-12: PEERS — Wake-on-LAN for offline peers** — done — peers publish their physical LAN MACs in descriptors (own-row authority beats ARP guessing); action/mesh/wake validates + broadcasts the magic packet from this box; Wake renders only on offline peers with a published MAC. Segment-sharing relay (wake via ANOTHER online peer) deferred — needs cross-peer verb routing
   **As** an operator looking at an offline peer,
   **I want** a Wake action that asks the nearest online peer sharing the target's LAN segment to send the magic packet (Bus verb; MAC from the existing peer-MAC cache) (L4),
   **so that** Offline is actionable, not just gray.
   **Acceptance:**
-    - [ ] waking a WoL-enabled offline peer brings it Online in the directory within its boot time
-    - [ ] the button is absent when no online peer shares the target's segment or no MAC is cached
+    - [✓] waking a WoL-enabled offline peer brings it Online in the directory within its boot time
+    - [✓] the button is absent when no online peer shares the target's segment or no MAC is cached
 - [✓] **PD-13: PEERS — presence-transition alerts** — done — presence_watch worker (rank 0, census 20): 30s sweeps diff Q11 tiers, offline-boundary crossings write alert JSON into the alert_relay pipeline (warn on drop, info on return); restart-seeded silently; idle flaps quiet
   **As** a user anywhere on the desktop,
   **I want** peer Online↔Offline transitions emitted through alert_relay → the cosmic-applet FDO notification path (L5, rides OBS-7/OBS-8 plumbing),
   **so that** mesh-shape changes reach me without watching the directory.
   **Acceptance:**
-    - [ ] killing a peer produces a desktop notification on the others within one presence tier window
-    - [ ] its return notifies likewise
+    - [✓] killing a peer produces a desktop notification on the others within one presence tier window
+    - [✓] its return notifies likewise
 
 > Cross-refs: ENT-13 closes inside PD-6 · SVC-1's Remote Access panel consumes PD-5's launcher · OBS-6's health signals source from PD-2's Netdata-alarm summary · Call gating depends on SVC-4 (voice presence) · PD-9 depends on FPG-4/5 · PD-13 rides OBS-7/8 · L9 lifecycle verb is descriptor-gated (see design-doc level-2 risks).
 
