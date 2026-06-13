@@ -16,21 +16,30 @@ use serde_json::Value;
 /// One track row on the album page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
+    /// Airsonic song id, used for queue/play actions.
     pub id: String,
+    /// Display title (falls back to the id when absent from the daemon reply).
     pub title: String,
+    /// 1-based track number within the album, `None` when unset.
     pub track_no: Option<u32>,
+    /// Track length in seconds as reported by the daemon.
     pub duration: u32,
 }
 
 /// A fetched album: metadata + ordered tracks.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AlbumView {
+    /// Airsonic album id, used as the body of `action/music/get-album` requests.
     pub id: String,
+    /// Album title (falls back to the id when the daemon omits it).
     pub name: String,
+    /// Primary artist name; empty string when absent.
     pub artist: String,
+    /// Release year, `None` when unset in the Airsonic catalogue.
     pub year: Option<u32>,
     /// The `coverArt` id (AIR-16 dominant-colour fetch); empty when absent.
     pub cover_art: String,
+    /// Ordered list of tracks as returned by the daemon.
     pub tracks: Vec<Track>,
 }
 

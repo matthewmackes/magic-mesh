@@ -579,8 +579,6 @@ pub fn serve<F: Fn() -> bool>(persist: &Persist, queue_path: &Path, should_stop:
     }
 }
 
-/// One poll sweep across the action verbs (extracted so a test can drive
-/// it deterministically without the sleep loop).
 /// One poll sweep over the AIR-15.b.5 peer verbs (`peer-states`,
 /// `take-over`) — reads/writes the AIR-8 state dir, replies on reply/<ulid>.
 pub fn poll_peers(persist: &Persist, cursors: &mut HashMap<String, String>) {
@@ -605,6 +603,8 @@ pub fn poll_peers(persist: &Persist, cursors: &mut HashMap<String, String>) {
     }
 }
 
+/// One poll sweep across the queue-control action verbs (extracted so tests
+/// can drive it deterministically without the sleep loop).
 pub fn poll_once(persist: &Persist, queue_path: &Path, cursors: &mut HashMap<String, String>) {
     let mut q = queue::read_from(queue_path);
     for verb in ACTION_VERBS {

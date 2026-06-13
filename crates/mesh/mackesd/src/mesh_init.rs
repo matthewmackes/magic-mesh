@@ -16,8 +16,11 @@ use crate::ca::NebulaCertBackend;
 /// What `mesh_init` accomplished — printed by the CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeshInitReport {
+    /// The mesh identifier this lighthouse was initialized for.
     pub mesh_id: String,
+    /// Nebula overlay IP assigned to this founding node.
     pub overlay_ip: String,
+    /// Path to the Nebula bundle file the supervisor will materialize from.
     pub bundle_path: PathBuf,
     /// The full wire-form join token (single-use bearer, ENT-1).
     pub join_token: String,

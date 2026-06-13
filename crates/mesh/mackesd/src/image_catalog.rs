@@ -19,9 +19,13 @@ use serde::{Deserialize, Serialize};
 /// The four image kinds the mesh can build (W53).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ImageKind {
+    /// Install ISO with embedded kickstart; used for bare-metal provisioning.
     Iso,
+    /// Pre-enrolled golden VM image for libvirt/KVM fleet provisioning.
     Vm,
+    /// OCI container images of the mesh services.
     Container,
+    /// Bootable USB writer image (dd-able); shares content with the ISO build.
     Usb,
 }
 

@@ -22,8 +22,11 @@ pub const DEBOUNCE: Duration = Duration::from_millis(250);
 /// The three independently-scrollable result sections of a `search3`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchResults {
+    /// Artist matches, each row linking to the artist's album list.
     pub artists: Vec<LibraryItem>,
+    /// Album matches, each row linking to the album page.
     pub albums: Vec<LibraryItem>,
+    /// Song matches; clicking one enqueues the song via [`enqueue`].
     pub songs: Vec<LibraryItem>,
 }
 

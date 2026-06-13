@@ -27,8 +27,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityTag {
+    /// Node may load relay / subnet-advertise / exit config (Network plane).
     Hop,
+    /// Node accepts job bundles beyond self-targeted ones (Controller plane).
     Execution,
+    /// GUI app-surface units are disabled; agent runs fully headless.
     Headless,
 }
 
@@ -65,6 +68,7 @@ pub fn tags_dir(workgroup_root: &Path) -> PathBuf {
 /// A node's tag set (the JSON file shape).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeTags {
+    /// The active capability tags for this node.
     #[serde(default)]
     pub tags: BTreeSet<CapabilityTag>,
 }

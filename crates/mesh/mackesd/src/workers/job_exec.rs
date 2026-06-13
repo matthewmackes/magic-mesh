@@ -35,6 +35,8 @@ pub struct JobExecWorker {
 }
 
 impl JobExecWorker {
+    /// Create the executor. Only runs on boxes where `hostname` carries
+    /// the `execution` capability tag (W84 gate).
     #[must_use]
     pub fn new(workgroup_root: PathBuf, hostname: String) -> Self {
         Self {
@@ -141,6 +143,7 @@ impl Worker for JobExecWorker {
 mod tests {
     use super::*;
     use mackes_mesh_types::cap_tags::{write_tags, NodeTags};
+    use magic_fleet::jobs::read_target_results; // test-only reader
     use magic_fleet::jobs::write_run;
 
     fn seed_run(root: &std::path::Path) {

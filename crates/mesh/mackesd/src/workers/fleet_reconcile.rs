@@ -29,6 +29,8 @@ pub struct FleetReconcileWorker {
 }
 
 impl FleetReconcileWorker {
+    /// Create the driver. `hostname` is used to locate and consume
+    /// nudge files written by any peer's "Apply now" action.
     #[must_use]
     pub fn new(workgroup_root: PathBuf, hostname: String) -> Self {
         Self {

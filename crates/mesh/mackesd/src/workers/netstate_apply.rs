@@ -33,6 +33,8 @@ pub struct NetstateApplyWorker {
 }
 
 impl NetstateApplyWorker {
+    /// Create the worker. `store_db` is the roster mirror used to derive
+    /// post-apply self-test probe targets (lighthouse + one peer).
     #[must_use]
     pub fn new(workgroup_root: PathBuf, store_db: Option<PathBuf>, hostname: String) -> Self {
         Self {

@@ -22,9 +22,13 @@ pub const POLL: std::time::Duration = std::time::Duration::from_secs(2);
 /// The live transport snapshot from `get-state`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct NowState {
+    /// `true` when the engine is actively playing (not paused).
     pub playing: bool,
+    /// `true` when a track is loaded (even if paused); `false` when the queue is idle.
     pub active: bool,
+    /// Airsonic song id of the current track; empty when nothing is loaded.
     pub song_id: String,
+    /// Current playback position in milliseconds.
     pub position_ms: u64,
     /// AIR-15.b.3 — playback volume 0.0..=1.0 (engine.volume() via get-state).
     pub volume: f32,
@@ -159,8 +163,11 @@ pub async fn fetch_lyrics(song_id: String) -> Result<Vec<String>, String> {
 /// AIR-15.b.5 — a peer's last music activity snapshot (Peers-tab roster).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerState {
+    /// Overlay hostname of the peer node.
     pub host: String,
+    /// `true` when the peer is actively playing.
     pub playing: bool,
+    /// Airsonic song id the peer last reported; empty when idle.
     pub song_id: String,
 }
 

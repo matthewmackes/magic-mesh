@@ -21,10 +21,12 @@ use crate::tls;
 /// What a completed first pair pinned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairOutcome {
+    /// KDE-Connect device identifier that was just paired.
     pub device_id: String,
     /// SHA-256 fingerprint of the cert the device presented —
     /// the pin all future connections verify against.
     pub fingerprint: String,
+    /// The address the device was reached at during the TOFU dial.
     pub addr: SocketAddr,
 }
 

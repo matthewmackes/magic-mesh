@@ -30,9 +30,11 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-/// Binary defaults.
+/// Default `mfsmetadump` binary name — dumps the master metadata file for backup/restore.
 pub const DEFAULT_METADUMP_BINARY: &str = "mfsmetadump";
+/// Default `mfsadmin` binary name — the LizardFS admin CLI (CS-LIST, CS-EVICT, etc.).
 pub const DEFAULT_ADMIN_BINARY: &str = "mfsadmin";
+/// Default `mfsgetgoal` binary name — reads a file/dir's replication goal.
 pub const DEFAULT_GETGOAL_BINARY: &str = "mfsgetgoal";
 
 /// Default LizardFS metadata file path (under the MESHFS-1.2 storage layout).
@@ -86,13 +88,21 @@ pub struct MeshFsSnapshot {
 /// tests override individual fields via the builder methods.
 #[derive(Debug, Clone)]
 pub struct SnapshotConfig {
+    /// Path (or name on `PATH`) of the `mfsmetadump` binary.
     pub metadump_binary: String,
+    /// Path (or name on `PATH`) of the `mfsadmin` binary.
     pub admin_binary: String,
+    /// Path (or name on `PATH`) of the `mfsgetgoal` binary.
     pub getgoal_binary: String,
+    /// LizardFS master metadata file passed to `mfsmetadump`.
     pub metadata_file: PathBuf,
+    /// LizardFS exports config file read verbatim for the snapshot.
     pub exports_config_path: PathBuf,
+    /// Mount path passed to `mfsgetgoal` when querying the replication goal.
     pub mount_path: String,
+    /// Floating overlay VIP recorded in the snapshot for restore reference.
     pub vip: String,
+    /// Per-subprocess wall-clock timeout; all subcommands are killed after this.
     pub timeout: Duration,
 }
 
@@ -112,30 +122,40 @@ impl Default for SnapshotConfig {
 }
 
 impl SnapshotConfig {
+    /// Override the `mfsmetadump` binary. Tests pass an absolute path
+    /// to a stub or `/nonexistent/…` to simulate absence.
     #[must_use]
     pub fn with_metadump_binary(mut self, name: impl Into<String>) -> Self {
         self.metadump_binary = name.into();
         self
     }
 
+    /// Override the `mfsadmin` binary. Tests pass `/bin/false` or a
+    /// nonexistent path to exercise the best-effort fallback.
     #[must_use]
     pub fn with_admin_binary(mut self, name: impl Into<String>) -> Self {
         self.admin_binary = name.into();
         self
     }
 
+    /// Override the `mfsgetgoal` binary. Tests pass a nonexistent name
+    /// to skip the goal query without touching other fields.
     #[must_use]
     pub fn with_getgoal_binary(mut self, name: impl Into<String>) -> Self {
         self.getgoal_binary = name.into();
         self
     }
 
+    /// Override the LizardFS metadata file path. Tests redirect to a
+    /// temp file containing a synthetic metadata dump.
     #[must_use]
     pub fn with_metadata_file(mut self, path: impl Into<PathBuf>) -> Self {
         self.metadata_file = path.into();
         self
     }
 
+    /// Override the floating VIP. Tests use a non-routable address so
+    /// `mfsadmin CS-LIST` fails fast without a live master.
     #[must_use]
     pub fn with_vip(mut self, vip: impl Into<String>) -> Self {
         self.vip = vip.into();

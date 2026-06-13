@@ -42,6 +42,7 @@ pub struct CacheEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheIndex {
     #[serde(default)]
+    /// Map of song-id → cache entry, sorted for deterministic JSON output.
     pub entries: BTreeMap<String, CacheEntry>,
 }
 

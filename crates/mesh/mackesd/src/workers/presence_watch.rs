@@ -56,6 +56,9 @@ pub struct PresenceWatchWorker {
 }
 
 impl PresenceWatchWorker {
+    /// Create a watcher. `alerts_dir` is the drop-dir consumed by `alert_relay`;
+    /// `self_hostname` is excluded from presence checks (a node can't go offline
+    /// relative to itself).
     #[must_use]
     pub fn new(workgroup_root: PathBuf, alerts_dir: PathBuf, self_hostname: String) -> Self {
         Self {

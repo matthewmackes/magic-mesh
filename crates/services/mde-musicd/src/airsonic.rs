@@ -47,7 +47,12 @@ pub enum AirsonicError {
     /// Transport failure (DNS, connect, timeout, non-2xx).
     Http(String),
     /// The server returned `status: "failed"` with a Subsonic error.
-    Api { code: i64, message: String },
+    Api {
+        /// Subsonic error code (e.g. 40 = wrong credentials).
+        code: i64,
+        /// Human-readable error description from the server.
+        message: String,
+    },
     /// The envelope didn't parse / was missing expected fields.
     Parse(String),
 }
@@ -69,9 +74,12 @@ impl std::error::Error for AirsonicError {}
 /// An artist row from `getArtists`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 pub struct Artist {
+    /// Subsonic artist id (opaque server-assigned string).
     pub id: String,
+    /// Display name of the artist.
     pub name: String,
     #[serde(default, rename = "albumCount")]
+    /// Number of albums the server has for this artist.
     pub album_count: u32,
 }
 
@@ -80,10 +88,13 @@ pub struct Artist {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 pub struct Genre {
     #[serde(rename = "value")]
+    /// Genre label (also the `genre=` query value for `getAlbumList2?type=byGenre`).
     pub name: String,
     #[serde(default, rename = "albumCount")]
+    /// Number of albums tagged with this genre on the server.
     pub album_count: u32,
     #[serde(default, rename = "songCount")]
+    /// Number of songs tagged with this genre on the server.
     pub song_count: u32,
 }
 
@@ -91,7 +102,9 @@ pub struct Genre {
 /// `{id, title}` so the GUI's `parse_items` reads it like any row.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PodcastChannel {
+    /// Subsonic channel id — used as the `id=` param for `getPodcasts` to fetch episodes.
     pub id: String,
+    /// Display name of the podcast channel.
     pub title: String,
 }
 
@@ -99,9 +112,12 @@ pub struct PodcastChannel {
 /// `stream_url` is the raw upstream URL the engine plays directly.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RadioStation {
+    /// Subsonic station id (opaque server-assigned string).
     pub id: String,
+    /// Display name of the radio station.
     pub name: String,
     #[serde(rename = "streamUrl")]
+    /// Raw upstream stream URL the playback engine connects to directly.
     pub stream_url: String,
 }
 
@@ -109,41 +125,57 @@ pub struct RadioStation {
 /// episode's `streamId` — the media id the player streams + enqueues.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PodcastEpisode {
+    /// Playable media id — the episode's `streamId` (falls back to `id`) for the stream endpoint.
     pub id: String,
+    /// Display title of the episode.
     pub title: String,
 }
 
 /// An album row from `getAlbumList2` / `search3`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 pub struct Album {
+    /// Subsonic album id (opaque server-assigned string).
     pub id: String,
+    /// Album title.
     pub name: String,
     #[serde(default)]
+    /// Primary artist display name.
     pub artist: String,
     #[serde(default, rename = "artistId")]
+    /// Id of the primary artist (links to `getArtist`).
     pub artist_id: String,
     #[serde(default, rename = "songCount")]
+    /// Number of tracks on the album.
     pub song_count: u32,
     #[serde(default, rename = "coverArt")]
+    /// Cover-art token — resolve via [`Client::cover_art_url`].
     pub cover_art: String,
     #[serde(default)]
+    /// Release year, if the server has it.
     pub year: Option<u32>,
 }
 
 /// A song row from `search3` (and, later, `getAlbum`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 pub struct Song {
+    /// Subsonic song id — passed to `stream` / `getSong`.
     pub id: String,
+    /// Track title.
     pub title: String,
     #[serde(default)]
+    /// Album title the song belongs to.
     pub album: String,
     #[serde(default)]
+    /// Primary artist display name.
     pub artist: String,
     #[serde(default)]
+    /// Track length in seconds.
     pub duration: u32,
     #[serde(default)]
+    /// 1-based disc-ordered track number, if present.
     pub track: Option<u32>,
     #[serde(default)]
+    /// File format suffix (`flac` / `mp3` / `opus` / …).
     pub suffix: String,
     /// `coverArt` token — resolve via [`Client::cover_art_url`] for the
     /// MPRIS `mpris:artUrl` + the AIR-12 album art.
@@ -154,15 +186,20 @@ pub struct Song {
 /// Result of `search3` — three independently-scrollable sections.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchResult3 {
+    /// Artist matches from the `artist[]` section of `searchResult3`.
     pub artists: Vec<Artist>,
+    /// Album matches from the `album[]` section of `searchResult3`.
     pub albums: Vec<Album>,
+    /// Song matches from the `song[]` section of `searchResult3`.
     pub songs: Vec<Song>,
 }
 
 /// Result of `getAlbum` — the album's metadata + its ordered track list.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AlbumDetail {
+    /// Album metadata (id, name, artist, cover, year, …).
     pub album: Album,
+    /// Ordered track list for the album.
     pub songs: Vec<Song>,
 }
 
@@ -547,7 +584,9 @@ pub fn parse_album_list2(inner: &Value) -> Vec<Album> {
 /// server fields are ignored on deserialize).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct Playlist {
+    /// Subsonic playlist id — used as the `id=` param for `getPlaylist`.
     pub id: String,
+    /// Display name of the playlist.
     pub name: String,
 }
 
@@ -692,10 +731,9 @@ pub fn parse_genres(inner: &Value) -> Vec<Genre> {
         .unwrap_or_default()
 }
 
-/// Parse `getPodcasts` → `podcasts.channel[]` (id + title).
-#[must_use]
 /// Parse `getInternetRadioStations`'s
 /// `internetRadioStations.internetRadioStation[]` array (SVC-3).
+#[must_use]
 pub fn parse_radio_stations(inner: &Value) -> Vec<RadioStation> {
     inner
         .get("internetRadioStations")
@@ -718,6 +756,8 @@ pub fn parse_radio_stations(inner: &Value) -> Vec<RadioStation> {
         .unwrap_or_default()
 }
 
+/// Parse `getPodcasts` → `podcasts.channel[]` (id + title).
+#[must_use]
 pub fn parse_podcast_channels(inner: &Value) -> Vec<PodcastChannel> {
     inner
         .get("podcasts")

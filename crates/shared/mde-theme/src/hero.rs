@@ -22,18 +22,31 @@ pub const HERO_STROKE: Rgba = carbon::GRAY_50;
 /// rendering); add new services at the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Hero {
+    /// Ansible automation platform — configuration management and playbook runner.
     Ansible,
+    /// LizardFS distributed filesystem — shared storage layer for the mesh.
     LizardFs,
+    /// Nebula overlay network — the encrypted mesh fabric connecting all nodes.
     Nebula,
+    /// Fedora Linux — the host operating system and DNF package substrate.
     Fedora,
+    /// Netdata real-time monitoring — per-node metrics and alerting.
     Netdata,
+    /// Podman container runtime — rootless OCI containers on each node.
     Podman,
+    /// libvirt virtualisation manager — KVM guest lifecycle and networking.
     Libvirt,
+    /// COSMIC desktop environment — the Rust-native Wayland shell on the workbench host.
     Cosmic,
+    /// systemd init and service manager — unit supervision across the fleet.
     Systemd,
+    /// Remmina remote desktop client — RDP/VNC/SSH sessions to mesh nodes.
     Remmina,
+    /// PipeWire audio/video graph — low-latency A/V routing on the workbench host.
     PipeWire,
+    /// rustls TLS library — memory-safe TLS for all mesh service endpoints.
     Rustls,
+    /// Generic VPN indicator — shown when no more-specific overlay hero applies.
     Vpn,
 }
 

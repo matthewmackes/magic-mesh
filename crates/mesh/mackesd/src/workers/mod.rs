@@ -415,9 +415,6 @@ pub trait Worker: Send + 'static {
     async fn run(&mut self, shutdown: ShutdownToken) -> anyhow::Result<()>;
 }
 
-/// Restart policy for a worker. Phase A only honors `Never` and
-/// `OnFailure` — Phase B integrates the `task-supervisor` crate to
-/// implement back-off + max-restarts + circuit-breaker semantics.
 // ── ENT-6: supervisor restart policy constants ──────────────────────
 
 /// Restart back-off floor (the old fixed delay).
@@ -461,6 +458,9 @@ pub fn advance_restart_state(
     (reset, failures, delay, decision)
 }
 
+/// Restart policy for a worker. Phase A only honors `Never` and
+/// `OnFailure` — Phase B integrates the `task-supervisor` crate to
+/// implement back-off + max-restarts + circuit-breaker semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartPolicy {
     /// Don't restart — once the worker returns (Ok or Err), the

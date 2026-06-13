@@ -65,8 +65,11 @@ pub struct ServiceDescriptors {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RemoteAccess {
+    /// SSH daemon is listening on this host.
     pub ssh: bool,
+    /// RDP (xrdp) is listening on this host.
     pub rdp: bool,
+    /// VNC server is listening on this host.
     pub vnc: bool,
 }
 
@@ -74,7 +77,9 @@ pub struct RemoteAccess {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ContainerInfo {
+    /// Container name (`podman ps --format {{.Names}}`).
     pub name: String,
+    /// Image reference the container was created from.
     pub image: String,
     /// `running` | `exited` | …
     pub state: String,
@@ -86,10 +91,13 @@ pub struct ContainerInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VmInfo {
+    /// libvirt domain name.
     pub name: String,
     /// `running` | `shut off` | `paused` | …
     pub state: String,
+    /// Virtual CPU count (`None` when unavailable).
     pub vcpus: Option<u32>,
+    /// Allocated memory in mebibytes (`None` when unavailable).
     pub memory_mb: Option<u64>,
     /// Guest IPs via the qemu agent (empty when no agent).
     pub addresses: Vec<String>,
@@ -99,7 +107,9 @@ pub struct VmInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MediaService {
+    /// Human-readable service name (e.g. `jellyfin`, `plex`).
     pub name: String,
+    /// Pinned localhost port the service is bound to.
     pub port: u16,
 }
 
@@ -109,7 +119,9 @@ pub struct MediaService {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AlarmSummary {
+    /// Worst-case tier: `healthy` | `degraded` | `critical`.
     pub tier: String,
+    /// Name of the worst active Netdata alarm (`None` when healthy).
     pub worst: Option<String>,
 }
 

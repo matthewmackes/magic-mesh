@@ -37,12 +37,16 @@ pub enum Op {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
+    /// Informational — the fleet should know but no immediate action required.
     Info,
+    /// Warning — a policy invariant is drifting; operator attention advised.
     Warn,
+    /// Critical — a hard fleet invariant is broken; remediation should trigger.
     Crit,
 }
 
 impl Severity {
+    /// Returns the lowercase wire token (`"info"`, `"warn"`, `"crit"`).
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -65,9 +69,11 @@ pub struct Policy {
     /// Dotted field into the directory record (e.g. `revision.currency`,
     /// `health`, `mde_version`).
     pub field: String,
+    /// Comparison operator applied between `field` value and `expected`.
     pub op: Op,
     /// Expected value (string-compared; numeric ops parse both sides).
     pub expected: String,
+    /// Severity written into the drift event when this policy is violated.
     pub severity: Severity,
 }
 
@@ -101,9 +107,13 @@ impl Policy {
 /// A violation, ready to become a drift event (W49).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Violation {
+    /// Name of the policy whose assertion failed (matches [`Policy::name`]).
     pub policy: String,
+    /// Hostname of the peer whose directory record triggered the violation.
     pub peer: String,
+    /// Serialized severity token (`"info"`, `"warn"`, `"crit"`).
     pub severity: String,
+    /// Human-readable explanation of what failed (field, op, expected value).
     pub detail: String,
 }
 

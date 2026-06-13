@@ -61,6 +61,8 @@ pub struct ValidationSuiteWorker {
 }
 
 impl ValidationSuiteWorker {
+    /// Create a worker. `role_marker_path` is the leader proxy file —
+    /// its existence makes this node act as the run-minter and aggregator.
     #[must_use]
     pub fn new(
         workgroup_root: PathBuf,

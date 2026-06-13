@@ -10,12 +10,19 @@
 /// One of the seven hub categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HubCard {
+    /// All albums in the Airsonic library.
     Albums,
+    /// All artists in the Airsonic library.
     Artists,
+    /// User-created playlists.
     Playlists,
+    /// Recently played / added items.
     Recents,
+    /// Browse by genre tag.
     Genres,
+    /// Podcast channels.
     Podcasts,
+    /// Internet-radio stations.
     Radio,
 }
 

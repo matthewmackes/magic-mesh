@@ -26,6 +26,8 @@ pub struct LifecycleExecWorker {
 }
 
 impl LifecycleExecWorker {
+    /// Create the worker. `self_hostname` gates which lifecycle requests
+    /// are picked up — only requests addressed to this node are executed.
     #[must_use]
     pub fn new(workgroup_root: PathBuf, self_hostname: String) -> Self {
         Self {

@@ -41,7 +41,9 @@ pub fn phones_dir(workgroup_root: &Path) -> PathBuf {
 /// One published device entry (the JSON shape on the volume).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PublishedDevice {
+    /// KDE-Connect device identifier (stable across renames).
     pub device_id: String,
+    /// Human-readable device name as reported by KDE-Connect.
     pub device_name: String,
 }
 
@@ -141,6 +143,7 @@ pub fn inject_fresh(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc; // test-only (the registry fixture)
 
     fn dev(id: &str, name: &str) -> PublishedDevice {
         PublishedDevice {

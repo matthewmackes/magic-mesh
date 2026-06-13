@@ -14,7 +14,9 @@ use crate::hub::HubCard;
 /// One row in a library grid: a stable id + a display label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryItem {
+    /// Airsonic entity id (or stream URL for radio stations).
     pub id: String,
+    /// Display text shown in the grid card.
     pub label: String,
     /// AIR-11.c.3 — coverArt token for the per-card thumbnail (None when the
     /// section carries no cover art, e.g. genres / playlists).

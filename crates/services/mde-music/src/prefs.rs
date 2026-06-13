@@ -47,6 +47,7 @@ impl SortKey {
 /// Persisted library-view preferences.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MusicPrefs {
+    /// Active sort order for all library grids.
     #[serde(default)]
     pub sort: SortKey,
     /// AIR-11.c.4 — per-route library-grid scroll offset (y), persisted so

@@ -30,12 +30,15 @@ pub const MESH_SUFFIX: &str = "mesh";
 
 /// `/etc/hosts` managed-block markers (the resolvectl-absent path).
 pub const HOSTS_BEGIN: &str = "# >>> mde mesh-dns (managed) >>>";
+/// Closing sentinel for the managed `/etc/hosts` block.
 pub const HOSTS_END: &str = "# <<< mde mesh-dns <<<";
 
 /// One name→ip record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeshHost {
+    /// The fully-qualified mesh hostname (e.g. `pine.mesh`).
     pub fqdn: String,
+    /// The peer's Nebula overlay IP address.
     pub overlay_ip: String,
 }
 

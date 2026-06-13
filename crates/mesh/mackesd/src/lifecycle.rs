@@ -36,8 +36,11 @@ pub struct LifecycleRequest {
 /// A lifecycle result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleResult {
+    /// Request id — matches the [`LifecycleRequest::id`] this result answers.
     pub id: String,
+    /// `true` if the operation succeeded; `false` if the executor caught an error.
     pub ok: bool,
+    /// Human-readable error message when `ok` is `false`; empty on success.
     #[serde(default)]
     pub error: String,
 }

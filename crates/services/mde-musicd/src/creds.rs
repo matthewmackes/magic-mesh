@@ -21,7 +21,9 @@ pub const MISSING_HINT: &str =
 pub struct Creds {
     /// Base server URL, e.g. `http://airsonic.anvil.mesh:4040`.
     pub server_url: String,
+    /// Subsonic username (the `u=` auth param).
     pub username: String,
+    /// Plaintext password — hashed with the per-request salt into a Subsonic token at call time.
     pub password: String,
 }
 

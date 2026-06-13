@@ -1077,8 +1077,11 @@ pub fn parse_cslist_output(text: &str) -> Vec<String> {
 /// Per-chunkserver row from `mfsadmin CS-LIST`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChunkserverStatus {
+    /// Overlay IP address of this chunkserver (column 0 of CS-LIST output).
     pub addr: String,
+    /// Bytes currently consumed by stored chunks on this chunkserver.
     pub used_bytes: u64,
+    /// Free bytes available for new chunks on this chunkserver.
     pub avail_bytes: u64,
     /// Chunks below their replication goal on this CS. Absent from the
     /// compact 4-column CS-LIST format; defaults to 0.
@@ -1144,7 +1147,9 @@ pub fn parse_cslist_full(text: &str) -> Vec<ChunkserverStatus> {
 /// Fleet status report emitted by `mackesd meshfs-status --json`.
 #[derive(Debug, serde::Serialize)]
 pub struct MeshFsStatusReport {
+    /// Whether the active LizardFS master answered on the floating VIP at report time.
     pub master_reachable: bool,
+    /// Per-chunkserver rows returned by `mfsadmin CS-LIST`; empty when the master is unreachable.
     pub peers: Vec<ChunkserverStatus>,
     /// Replication goal = current peer count (converges on tick).
     pub goal: usize,
@@ -1396,16 +1401,27 @@ fn dispatch_undelete(admin_binary: &str, vip: &str, body: &str) -> String {
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReplayOutcome {
     /// Staged file applied to the mesh mount (no conflict or staged won).
-    Applied { mesh_path: PathBuf },
+    Applied {
+        /// Absolute path of the file on the mesh mount after the copy.
+        mesh_path: PathBuf,
+    },
     /// Staged file won the LWW race; old mesh file renamed to the conflict path.
     ConflictStagedWins {
+        /// Absolute path of the winning (updated) file on the mesh mount.
         mesh_path: PathBuf,
+        /// Absolute path of the loser: the old mesh file renamed to `<name>.conflict-<host>-<ts>`.
         conflict_path: PathBuf,
     },
     /// Mesh file won the LWW race; staged file renamed to the conflict path.
-    ConflictMeshWins { conflict_path: PathBuf },
+    ConflictMeshWins {
+        /// Absolute path of the loser: the staged file renamed to `<name>.conflict-<host>-<ts>`.
+        conflict_path: PathBuf,
+    },
     /// Replay skipped (IO error or could not determine relative path).
-    Skipped { reason: String },
+    Skipped {
+        /// Human-readable description of why the replay was skipped.
+        reason: String,
+    },
 }
 
 /// Recursively collect regular files under `dir` into `out`.

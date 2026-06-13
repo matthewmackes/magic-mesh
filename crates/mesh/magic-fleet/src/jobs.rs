@@ -37,8 +37,11 @@ pub struct TargetSelector {
 /// One candidate node the selector resolves against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
+    /// The node's mesh hostname.
     pub hostname: String,
+    /// The node's declared role (`lighthouse`, `server`, `workstation`).
     pub role: String,
+    /// Capability tags the node advertises (`execution`, `hop`, …).
     pub tags: BTreeSet<String>,
 }
 
@@ -69,12 +72,14 @@ impl TargetSelector {
 pub struct JobTemplate {
     /// Stable template id (filename stem).
     pub id: String,
+    /// Human-readable description of what this template does.
     pub description: String,
     /// Playbook ref — a path under the replicated `playbooks/` dir.
     pub playbook: String,
     /// Variable defaults (overridable at launch).
     #[serde(default)]
     pub vars: std::collections::BTreeMap<String, String>,
+    /// Target selector applied at launch to determine which nodes run the playbook.
     pub targets: TargetSelector,
     /// Optional cron schedule; the leader fires it (W35).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -128,8 +133,11 @@ pub fn read_templates(root: &Path) -> Vec<JobTemplate> {
 /// where, and the resolved target list at launch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRun {
+    /// Unique run identifier (UUIDv4 or similar); doubles as the subdirectory name under `runs/`.
     pub run_id: String,
+    /// Playbook path executed by every target (relative to the replicated `playbooks/` dir).
     pub playbook: String,
+    /// Variable overrides applied for this run (merged over template defaults at launch).
     #[serde(default)]
     pub vars: std::collections::BTreeMap<String, String>,
     /// The resolved target hostnames (selector already applied).
@@ -145,9 +153,11 @@ pub struct JobRun {
 /// (`jobs/runs/<run-id>/<hostname>.json`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetResult {
+    /// The target node's mesh hostname.
     pub hostname: String,
     /// `ok` | `changed` | `failed`.
     pub status: String,
+    /// Optional human-readable detail from the playbook run (stderr snippet, task name, etc.).
     #[serde(default)]
     pub detail: String,
 }
