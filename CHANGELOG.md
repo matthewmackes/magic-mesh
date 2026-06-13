@@ -13,7 +13,17 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
+## [10.0.0] - 2026-06-13
+
+First packaged release.
+
 ### Added
+- Full **libcosmic** desktop cutover: every GUI (`mde-workbench`, `mde-files`,
+  `mde-music`, `mde-voice-hud`, `mde-cosmic-applet`, `mde-role-chooser`, the
+  live-map wallpaper) runs on libcosmic's vendored iced fork with the IBM
+  Carbon look; the Workbench exposes an accesskit (a11y) tree.
+- Direct-vs-relay tunnel path classification + chosen underlay endpoint in the
+  Peers map trace card, via Nebula's loopback debug-SSH hostmap.
 - One-RPM packaging (`cargo generate-rpm`): every workspace binary, systemd
   units (incl. the disabled voice pair), `.desktop` launchers/autostarts,
   icons, the swappable brand pack, DISCLAIMER/LICENSE/NOTICE/SUPPORT, help
@@ -42,5 +52,11 @@ starts at the first packaged release line.
 - Netdata dashboard confined to loopback + overlay bind.
 - Own KDC RSA keys pinned 4096-bit (stock-client 2048 accepted for
   verify-interop only).
+- Secrets never on argv/inherited env (`--*-stdin` / systemd-creds; env
+  scrubbed at boot); enrollment passcode piped via stdin.
+- Nebula debug-SSH for path introspection bound loopback-only, key-auth
+  (Ed25519); GPG-signed RPM + `SHA256SUMS`/`.asc`; full GPL-3.0 text shipped
+  + a `SECURITY.md` disclosure policy.
 
-[Unreleased]: https://github.com/matthewmackes/magic-mesh/commits/master
+[Unreleased]: https://github.com/matthewmackes/magic-mesh/compare/magic-mesh-v10.0.0...HEAD
+[10.0.0]: https://github.com/matthewmackes/magic-mesh/releases/tag/magic-mesh-v10.0.0
