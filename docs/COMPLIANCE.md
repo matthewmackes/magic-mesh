@@ -145,3 +145,5 @@ Operator-directed lens: *would the product actually work for an arriving operato
 **Counts:** 14 findings — 1 REMOVE, 13 FINISH (1 secrets-hygiene regression, 2 packaging, 2 verify-and-close, 8 doc/polish). Zero stubs, zero mockups, zero substrate/crypto/boundary violations, zero dead workers/panels. Lints clean ×3; workspace suite green.
 
 **Cycle-6 status: FIT FOR PURPOSE with a short punch list.** The one security-relevant item is AUD6-1 (passcode on argv — a caller-side regression against the EFF-21 stdin path). Findings lifted into `docs/WORKLIST.md` as AUD6-*.
+
+**Cycle-6 resolution (2026-06-13, same day):** all 14 findings closed in `f539430`. Highlights: AUD6-1 (passcode now rides `--passcode-stdin`, argv pinned secret-free by test) and AUD6-5's verify, which surfaced a REAL interop bug — rsip 0.4 can't parse the RFC 7616 `SHA-256` token, so an RFC-compliant registrar's challenge broke SIP registration outright; fixed with a manual fallback challenge parser + test. 847 dead lines removed (orchestrator.rs, ipc/notifications.rs, MACKESD_BUS_NAME). Gates: full workspace suite green, three lints clean. **Worklist: zero open items again.**
