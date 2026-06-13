@@ -410,6 +410,11 @@ rtpengine = "*"
 # a bare-Fedora spin actually has the daemon the services line names.
 libvirt-daemon-driver-qemu = "*"
 libvirt-daemon-config-network = "*"
+# AUD7-8 (NET-INTROSPECT) — the relay/direct path classifier shells `ssh-keygen`
+# (debug-SSH keys) + `ssh` (the loopback `list-hostmap -json` query). Without
+# openssh-clients the feature silently degrades to "overlay" (no crash); a weak
+# dep so a default install gets real classification, opt-out-able.
+openssh-clients = "*"
 
 # EFF-42 — upgrade continuity: the pre-pivot package name was `mde-core`
 # (the E8-era RPM; see config/daemon.rs's template note). Obsolete it so

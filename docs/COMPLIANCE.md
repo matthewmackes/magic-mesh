@@ -147,3 +147,28 @@ Operator-directed lens: *would the product actually work for an arriving operato
 **Cycle-6 status: FIT FOR PURPOSE with a short punch list.** The one security-relevant item is AUD6-1 (passcode on argv — a caller-side regression against the EFF-21 stdin path). Findings lifted into `docs/WORKLIST.md` as AUD6-*.
 
 **Cycle-6 resolution (2026-06-13, same day):** all 14 findings closed in `f539430`. Highlights: AUD6-1 (passcode now rides `--passcode-stdin`, argv pinned secret-free by test) and AUD6-5's verify, which surfaced a REAL interop bug — rsip 0.4 can't parse the RFC 7616 `SHA-256` token, so an RFC-compliant registrar's challenge broke SIP registration outright; fixed with a manual fallback challenge parser + test. 847 dead lines removed (orchestrator.rs, ipc/notifications.rs, MACKESD_BUS_NAME). Gates: full workspace suite green, three lints clean. **Worklist: zero open items again.**
+
+---
+
+## Cycle 7 (2026-06-13) — post-NET-INTROSPECT + post-cutover sweep
+
+Fresh integrity sweep after the NET-INTROSPECT feature (Nebula debug-SSH relay/direct classification) + the full libcosmic cutover. Inline: 5 governance/iced lints clean, zero stubs, zero raw hex. Three parallel deep passes (unreachable/stubs/mockups · substrate/crypto/secrets locks · doc-drift/packaging).
+
+**NET-INTROSPECT security verdict: CLEAN.** The new Nebula debug-SSH is loopback-only (`render_sshd_block` hardcodes `listen: 127.0.0.1:{port}`, test asserts no `0.0.0.0`), Ed25519 keys 0600 under `/etc/nebula` (not a replicated path), no secret on argv (`-i <path>` only), needs no firewall rule (loopback). One zero-cost hardening noted (not a violation): host-key pinning over `StrictHostKeyChecking=no` — loopback has no MITM surface, so deferred.
+
+### Findings
+
+| # | Location | Category | Evidence | Confidence | Verdict |
+|---|---|---|---|---|---|
+| AUD7-8 | `crates/mesh/mackesd/Cargo.toml` generate-rpm | Packaging | NET-INTROSPECT shells `ssh-keygen`/`ssh`; `openssh-clients` not in Requires/Recommends → feature silently no-ops ("overlay") on minimal installs | High | **FIXED 2026-06-13** — added `openssh-clients` to weak `recommends` |
+| AUD7-4 | `transport_probe.rs:11` doc | Doc drift | comment said direct/relay "needs the Nebula admin socket (not yet provisioned)" — NET-INTROSPECT provides it now | High | **FIXED** — points at `nebula_admin`; NAT-class noted as the remaining gap |
+| AUD7-5 | `docs/WORKLIST.md` PD-6/PD-7 body prose | Doc drift | descriptions still said "pending Nebula admin introspection" / "until the Nebula admin socket is provisioned" (acceptance bullets were already flipped) | High | **FIXED** — prose refreshed to NET-INTROSPECT |
+| AUD7-6 | `AI_GOVERNANCE.md §4` | Doc drift | "iced 0.14 (wgpu) + cosmic-text" — post-cutover it's libcosmic's vendored iced fork (carries a11y) | High | **FIXED** |
+| AUD7-7 | `AI_GOVERNANCE.md §3` | Doc/security-model | §3 omitted the new loopback debug-SSH listener mackesd now enables | Med | **FIXED** — added the listener note (loopback-only, key-auth, graceful degradation) |
+| AUD7-2 | `nebula_admin.rs` | Over-exposed API | `ensure_sshd_keys`/`render_sshd_block`/`parse_hostmap` were `pub` but consumed only within the mackesd lib + tests | Med | **FIXED** — demoted to `pub(crate)` |
+| AUD7-1 | `workers/nebula_supervisor.rs:623` `check_leader` | Stub/dead params (PRE-EXISTING) | private async fn takes `_store`/`_node_id` (never read) + comment references a non-existent `leader::current_holder`; actually just a marker-file check | High | **OPEN — FINISH** (lifted) |
+| AUD7-3 | `crates/services/mde-voice-hud/src/main.rs:1` module doc | Doc drift (PRE-EXISTING) | claims VOIP-28/29 "scaffold ships idle-state only" + a hardcoded `Registered · 127.0.0.1:5060` string; both shipped (live registration machine + call handlers) | High | **OPEN — FINISH** (lifted) |
+
+**Counts:** 8 findings — 6 fixed same-day (the direct fallout of NET-INTROSPECT/cutover I'd just landed: 1 packaging, 4 doc-drift, 1 API-surface), 2 lifted OPEN (pre-existing, unrelated to this work: a dead-param stub + a stale voice-hud doc). Zero stubs, zero mockups, zero substrate/crypto/secrets violations, zero dead NET-INTROSPECT wiring (all 5 call chains verified reachable). Note: a few benign pre-existing unused-import/attribute warnings in unrelated workers (job_exec/mesh_shunt/mesh_dns/nebula_csr_watcher) — out of scope, candidate for a warnings-cleanup /ship.
+
+**Cycle-7 status: CLEAN — NET-INTROSPECT fit for purpose, debug-SSH security verified.** The 2 open items are pre-existing and lifted to the worklist.

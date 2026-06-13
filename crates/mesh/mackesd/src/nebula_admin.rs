@@ -63,7 +63,7 @@ impl TunnelPath {
 /// nebula-side server host key; `authorized_pubkey` is mackesd's client public
 /// key (an OpenSSH `authorized_keys` line). Bound to `127.0.0.1` only.
 #[must_use]
-pub fn render_sshd_block(host_key_path: &str, authorized_pubkey: &str, port: u16) -> String {
+pub(crate) fn render_sshd_block(host_key_path: &str, authorized_pubkey: &str, port: u16) -> String {
     format!(
         "\n# NET-INTROSPECT (PD-6/PD-7) — loopback-only debug SSH for direct/relay\n\
          # tunnel classification. 127.0.0.1 only: no overlay/underlay exposure.\n\
@@ -86,7 +86,7 @@ pub fn render_sshd_block(host_key_path: &str, authorized_pubkey: &str, port: u16
 /// # Errors
 /// When `ssh-keygen` is absent/fails or the generated pubkey can't be read —
 /// the caller treats this as "no debug SSH this run" and degrades honestly.
-pub fn ensure_sshd_keys(config_dir: &Path) -> Result<String, String> {
+pub(crate) fn ensure_sshd_keys(config_dir: &Path) -> Result<String, String> {
     let host_key = config_dir.join(HOST_KEY_FILE);
     let client_key = config_dir.join(CLIENT_KEY_FILE);
     keygen_if_absent(&host_key, "nebula-sshd-host")?;
@@ -185,7 +185,7 @@ pub fn query_tunnels_default() -> HashMap<String, TunnelPath> {
 /// either `cert.details.name` (v1) or `cert.name` (v2), and relay state in
 /// either `currentRelaysToMe` or `relay`. Entries without a name are skipped.
 #[must_use]
-pub fn parse_hostmap(json: &str) -> HashMap<String, TunnelPath> {
+pub(crate) fn parse_hostmap(json: &str) -> HashMap<String, TunnelPath> {
     let mut out = HashMap::new();
     let Ok(serde_json::Value::Array(entries)) = serde_json::from_str::<serde_json::Value>(json)
     else {

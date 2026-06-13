@@ -49,6 +49,13 @@ tests: **Ed25519** node identity · **AES-256-GCM** / **ChaCha20-Poly1305** ·
 **XChaCha20-Poly1305** CA backup · **RSA-4096** KDC device identity. Enrollment
 uses max key complexity. No OpenSSL — **rustls** throughout.
 
+**Loopback debug-SSH (NET-INTROSPECT, 2026-06-13):** mackesd enables Nebula's
+built-in debug SSH server to classify direct-vs-relay tunnel paths
+(`nebula_admin`). It is bound to **`127.0.0.1` only** (never the overlay or the
+underlay — no firewall-reachable surface), **key-auth** with an Ed25519 keypair
+(0600, under `/etc/nebula`), and shells `ssh`/`ssh-keygen`. Absent those it
+degrades silently to the honest `path:"overlay"` — never a guess.
+
 **Documented interop exceptions (not violations — sweep-3 I6/I7):** MD5 where an
 external spec mandates it and it carries no MDE security: the freedesktop
 thumbnail-cache filename (`mde-files/thumbnails.rs` — cache key per the XDG spec),
@@ -67,7 +74,8 @@ MD5/SHA1 is a finding.
   (`install-helpers/lint-carbon-tokens.sh`, in CI). No raw hex / scattered metric
   literals outside the token modules (mark a genuinely-dynamic/test colour
   `// carbon-ok` with a reason).
-- **Pure-Rust toolkit:** iced 0.14 (wgpu) + cosmic-text (no FreeType), rustls (no
+- **Pure-Rust toolkit:** libcosmic's vendored iced fork (wgpu + cosmic-text, no
+  FreeType; carries a11y/accesskit — the full-libcosmic cutover, 2026-06-13), rustls (no
   OpenSSL). GUIs ship as Cosmic apps + a native cosmic-applet; Cosmic draws the
   panel/decorations, Magic Mesh draws its client areas.
 

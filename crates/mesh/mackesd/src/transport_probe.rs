@@ -8,9 +8,12 @@
 //! a *successful* measurement (the peer's stack answered); only a
 //! timeout means unreachable.
 //!
-//! Direct-vs-relay / NAT-class detail needs the Nebula admin socket
-//! (not yet provisioned in our config) — the probe reports
-//! `path: "overlay"` until that introspection lands; it never guesses.
+//! This probe reports `path: "overlay"` (it only times the path). The
+//! direct-vs-relay classification + chosen underlay endpoint now come
+//! from [`crate::nebula_admin`] (NET-INTROSPECT, 2026-06-13 — Nebula's
+//! loopback debug SSH `list-hostmap -json`), joined into the latency
+//! cache by `mesh_latency`; NAT-class is the one field OSS Nebula's
+//! debug SSH still doesn't expose. This probe never guesses.
 
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
