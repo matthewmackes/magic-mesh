@@ -130,6 +130,13 @@ chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 rand = "0.8"
 
+# ONBOARD-2 — self-signed TLS identity for the lighthouse `/enroll`
+# HTTPS endpoint (its SHA-256 fingerprint is pinned into every minted
+# join token). Pure Rust, same version the Https443 loopback test +
+# the KDC keygen path already use. Non-optional so the cert-gen helper
+# compiles in every build/test config.
+rcgen = "0.13"
+
 # NF-18.1 (v2.5) — passphrase-encrypted CA bundle export/import.
 # Argon2id KDF + ChaCha20-Poly1305 AEAD. Best-choice picks per
 # the iteration skill standing authorizations (2026-05-24):
@@ -242,10 +249,8 @@ futures-util = { version = "0.3", optional = true }
 # Deterministic snapshot diffs for library-contract tests (12.11.5).
 insta    = { version = "1", features = ["json", "redactions"] }
 tempfile = "3"
-# Phase 12.18 D.2 — self-signed certs for the Https443 loopback
-# integration test. Same version mde-kdc uses for the KDC TLS
-# bench harness.
-rcgen    = "0.13"
+# (rcgen moved to [dependencies] — ONBOARD-2 needs it at runtime for
+# the `/enroll` endpoint's self-signed identity, not just in tests.)
 
 [features]
 # Magic Mesh (E11.12 split): mackesd here is the daemon, and the only consumer

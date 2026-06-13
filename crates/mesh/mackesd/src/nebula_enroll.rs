@@ -645,6 +645,65 @@ pub fn sign_pending_csr<B: crate::ca::NebulaCertBackend + ?Sized>(
         serde_json::from_slice(&csr_bytes).map_err(|e| SignCsrError::CsrCorrupt {
             reason: e.to_string(),
         })?;
+    // Delegate to the transport-independent signing core (the same
+    // core the ONBOARD-2 network `/enroll` endpoint calls). On
+    // success the bundle is written to QNM-Shared + the bearer
+    // redeemed, preserving the file-flow's "deliver, then spend"
+    // ordering.
+    let signed_node_id = csr.node_id.clone();
+    let bundle = sign_csr_into_bundle(
+        backend,
+        conn,
+        workgroup_root,
+        &csr,
+        paths,
+        lighthouses,
+        allow_override,
+    )?;
+    let bundle_path = crate::ca::bundle::bundle_path(workgroup_root, peer_id);
+    crate::ca::bundle::write_bundle(&bundle_path, &bundle).map_err(|e| {
+        SignCsrError::BundleWriteFailed {
+            reason: e.to_string(),
+        }
+    })?;
+    // ENT-1 — single-use: the sign that honored the bearer spends it.
+    let _ = crate::bearer_ledger::redeem(workgroup_root, &csr.token.bearer);
+    Ok(SignOutcome {
+        peer_id: signed_node_id,
+        overlay_ip: bundle.overlay_ip,
+        epoch: bundle.epoch,
+        bundle_path,
+    })
+}
+
+/// Transport-independent signing core (ONBOARD-2). Takes an
+/// already-parsed [`PendingEnrollment`] and returns the signed
+/// [`crate::ca::bundle::NebulaBundle`] **without** reading the CSR
+/// from disk, writing the bundle, or redeeming the bearer — those
+/// delivery steps belong to the caller, because they differ between
+/// the QNM-Shared file flow ([`sign_pending_csr`], which writes the
+/// bundle then redeems) and the network `/enroll` endpoint (which
+/// returns the bundle in the HTTPS response then redeems).
+///
+/// Runs the identical authorization gates as the file flow, in the
+/// same order: ban-list → bearer ledger → 8-peer cap → sign. The
+/// authoritative mesh is `csr.token.mesh_id` (bed fix #5), never a
+/// caller-supplied hint.
+///
+/// # Errors
+///
+/// Per [`SignCsrError`] — except `CsrMissing` / `CsrCorrupt` (the
+/// CSR is already parsed) and `BundleWriteFailed` (no write here).
+#[allow(clippy::too_many_arguments)]
+pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
+    backend: &B,
+    conn: &rusqlite::Connection,
+    workgroup_root: &Path,
+    csr: &PendingEnrollment,
+    paths: &SignCsrPaths,
+    lighthouses: Vec<crate::ca::bundle::LighthouseEntry>,
+    allow_override: bool,
+) -> Result<crate::ca::bundle::NebulaBundle, SignCsrError> {
     // The mesh the peer is actually joining (authoritative — bed fix #5).
     let mesh_id: &str = &csr.token.mesh_id;
     // EPIC-SEC-BANLIST (Q53) — refuse a banned node-id BEFORE the
@@ -763,30 +822,16 @@ pub fn sign_pending_csr<B: crate::ca::NebulaCertBackend + ?Sized>(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let bundle = crate::ca::bundle::NebulaBundle {
+    Ok(crate::ca::bundle::NebulaBundle {
         mesh_id: mesh_id.to_string(),
         epoch: active_epoch,
         ca_cert_pem,
         peer_cert_pem: signed.cert_pem,
         peer_key_pem,
-        overlay_ip: signed.overlay_ip.clone(),
+        overlay_ip: signed.overlay_ip,
         mesh_cidr: format!("{}/16", crate::ca::sign::DEFAULT_MESH_CIDR_BASE),
         lighthouses,
         created_at,
-    };
-    let bundle_path = crate::ca::bundle::bundle_path(workgroup_root, peer_id);
-    crate::ca::bundle::write_bundle(&bundle_path, &bundle).map_err(|e| {
-        SignCsrError::BundleWriteFailed {
-            reason: e.to_string(),
-        }
-    })?;
-    // ENT-1 — single-use: the sign that honored the bearer spends it.
-    let _ = crate::bearer_ledger::redeem(workgroup_root, &csr.token.bearer);
-    Ok(SignOutcome {
-        peer_id: csr.node_id,
-        overlay_ip: signed.overlay_ip,
-        epoch: active_epoch,
-        bundle_path,
     })
 }
 

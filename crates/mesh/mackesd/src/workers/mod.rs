@@ -198,6 +198,12 @@ pub mod mirror_syncd;
 // per accepted stream (TLS ↔ UDP 127.0.0.1:4242). Inner Nebula
 // stack runs unmodified.
 pub mod nebula_https_listener;
+// ONBOARD-2 — the lighthouse `/enroll` rustls HTTPS listener. Serves
+// network bootstrap for NAT'd peers (MESH-1 fix): POST /enroll signs a
+// peer CSR via the shared core + returns the bundle, authed by the
+// single-use bearer; endpoint identity is the token-pinned self-signed
+// cert. Spawned under am_lighthouse; warn-and-exit on peer-role boxes.
+pub mod nebula_enroll_listener;
 // NF-18.4 (v2.5) — Daily encrypted CA backup worker. Writes
 // sealed (Argon2id + XChaCha20-Poly1305) bundles to
 // QNM-Shared/<self>/mackesd/ca-backup.enc on a 24h tick.

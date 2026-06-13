@@ -5398,7 +5398,7 @@ fn run_serve(
                 db_path.clone(),
                 csr_watcher_mesh_id,
                 node_id.clone(),
-                csr_watcher_lighthouse_addr,
+                csr_watcher_lighthouse_addr.clone(),
             )
             .with_signal_slot(std::sync::Arc::clone(&nebula_signal_slot)),
             RestartPolicy::OnFailure,
@@ -5407,6 +5407,54 @@ fn run_serve(
             .lock()
             .expect("worker_names mutex")
             .push("nebula_csr_watcher".into());
+
+        // ONBOARD-2 — the lighthouse `/enroll` rustls HTTPS listener
+        // (MESH-1 fix: network bootstrap for NAT'd peers). Spawned ONLY
+        // when the endpoint cert is present — `mackesd found` (ONBOARD-4)
+        // generates it on a lighthouse; a peer-role box has none, so we
+        // skip rather than let the bind respin under OnFailure (same
+        // gate the covert :443 listener uses). The roster the signed
+        // bundles advertise reuses the csr-watcher's external-addr probe
+        // so peers materialize static_host_map to the PUBLIC addr
+        // (MESH-2 guard). Cert/key/bind overridable for LAN testing
+        // (ONBOARD-8) via MDE_ENROLL_{CERT,KEY,BIND}.
+        let enroll_cert = std::env::var("MDE_ENROLL_CERT").unwrap_or_else(|_| {
+            mackesd_core::workers::nebula_enroll_listener::DEFAULT_CERT_PATH.to_string()
+        });
+        if std::path::Path::new(&enroll_cert).exists() {
+            let mut w = mackesd_core::workers::nebula_enroll_listener::NebulaEnrollListener::new(
+                std::sync::Arc::new(mackesd_core::ca::SubprocessBackend),
+                db_path.clone(),
+                workgroup_root.clone(),
+                mackesd_core::nebula_enroll::SignCsrPaths::production_defaults(),
+                node_id.clone(),
+                csr_watcher_lighthouse_addr.clone(),
+            )
+            .with_cert(PathBuf::from(&enroll_cert));
+            if let Ok(p) = std::env::var("MDE_ENROLL_KEY") {
+                w = w.with_key(PathBuf::from(p));
+            }
+            if let Ok(addr) = std::env::var("MDE_ENROLL_BIND") {
+                match addr.parse() {
+                    Ok(parsed) => w = w.with_bind_addr(parsed),
+                    Err(_) => tracing::warn!(
+                        value = %addr,
+                        "nebula-enroll-listener: MDE_ENROLL_BIND parse failed; using default",
+                    ),
+                }
+            }
+            sup.spawn(Spawn::new(w, RestartPolicy::OnFailure));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("nebula_enroll_listener".into());
+        } else {
+            tracing::info!(
+                cert = %enroll_cert,
+                "nebula-enroll-listener: no endpoint cert present; not a lighthouse \
+                 (or `mackesd found` not yet run) — worker skipped",
+            );
+        }
 
         // NF-18.4 (v2.5) — automated CA backup worker.
         // Opens its own SQLite handle for the per-tick

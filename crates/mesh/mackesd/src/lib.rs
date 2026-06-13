@@ -54,6 +54,12 @@ pub mod metrics;
 // signed bundle. Consumed by the `mackesd enroll --token` CLI +
 // the future NF-3.6 D-Bus method.
 pub mod nebula_enroll;
+// ONBOARD-2 — the lighthouse network `/enroll` endpoint core (self-
+// signed pinned identity + minimal HTTP framing + the pure POST
+// handler). Drives MESH-1's fix: network bootstrap for NAT'd peers.
+// The rustls listener that serves it is workers::nebula_enroll_listener.
+#[cfg(feature = "async-services")]
+pub mod nebula_enroll_endpoint;
 // NF-18.2 (v2.5) — typed export of the live nebula_peer_certs
 // table, joined with nodes.role for the groups column. Pure-fn
 // SQL projection; consumed by the `mackesd nebula export-roster`
