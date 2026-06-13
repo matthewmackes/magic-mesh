@@ -313,7 +313,15 @@ pub async fn network_enroll(
 /// Write the received bundle to `/etc/nebula` (via the supervisor's
 /// materializer — `static_host_map` from `external_addr`, MESH-2 guard)
 /// and to the QNM-Shared `bundle_path` for steady-state consistency.
-fn persist_bundle(
+///
+/// Public so the enrollment TUI (`mde-enroll`, ONBOARD-5) can drive the
+/// stages itself — `enroll_over_network` then `persist_bundle` — and
+/// report granular progress between them, sharing this crate's building
+/// blocks rather than reimplementing them.
+///
+/// # Errors
+/// [`NetEnrollError::Materialize`] on a config/bundle write failure.
+pub fn persist_bundle(
     workgroup_root: &std::path::Path,
     config_dir: &std::path::Path,
     node_id: &str,

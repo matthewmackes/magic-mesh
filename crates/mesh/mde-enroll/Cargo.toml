@@ -1,0 +1,25 @@
+[package]
+name = "mde-enroll"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Magic Mesh enrollment TUI (ONBOARD-5): a full-screen ratatui app where an operator pastes a join token (and optionally overrides the lighthouse IP), then watches the fingerprint-pinned network enroll progress live. Headless over SSH — lighthouses/servers have no display."
+
+[[bin]]
+name = "mde-enroll"
+path = "src/main.rs"
+
+[dependencies]
+# The mesh control-plane lib — the network-enroll client (ONBOARD-3),
+# token parser, and bundle materializer the TUI drives.
+mackesd = { path = "../mackesd" }
+# Terminal UI + raw-mode/event backend. ratatui ships with the crossterm
+# backend; pin crossterm to match for the event loop.
+ratatui = "0.29"
+crossterm = "0.28"
+# The async runtime the network enroll runs on (one current-thread rt).
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+anyhow = "1"
+# Serialize the CSR (PendingEnrollment) the same way the daemon does.
+serde_json = "1"

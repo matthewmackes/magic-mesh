@@ -33,6 +33,7 @@ members = [
     "crates/mesh/mackes-nebula-https-tunnel",
     "crates/mesh/mackes-transport",
     "crates/mesh/mackesd",
+    "crates/mesh/mde-enroll",
     "crates/mesh/magic-fleet",
     "crates/services/mde-files",
     "crates/services/mde-music",

@@ -324,6 +324,9 @@ assets = [
     { source = "target/release/mackesd",            dest = "/usr/bin/mackesd",            mode = "755" },
     { source = "target/release/meshctl",            dest = "/usr/bin/meshctl",            mode = "755" },
     { source = "target/release/magic-fleet",        dest = "/usr/bin/magic-fleet",        mode = "755" },
+    # ONBOARD-5 — the Magic enrollment TUI (`mackesd join` with no token
+    # launches it; runs headless over SSH).
+    { source = "target/release/mde-enroll",         dest = "/usr/bin/mde-enroll",         mode = "755" },
     { source = "target/release/mde-bus",            dest = "/usr/bin/mde-bus",            mode = "755" },
     { source = "target/release/mde-files",          dest = "/usr/bin/mde-files",          mode = "755" },
     { source = "target/release/mde-workbench",      dest = "/usr/bin/mde-workbench",      mode = "755" },
