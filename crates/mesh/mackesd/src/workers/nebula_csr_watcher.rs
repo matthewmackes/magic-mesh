@@ -133,7 +133,7 @@ impl NebulaCsrWatcher {
     /// Override the cert backend — used by tests to inject
     /// `MockBackend` so the worker can run without nebula-cert
     /// on PATH.
-    #[must_use]
+
     pub fn with_backend(mut self, backend: Arc<dyn NebulaCertBackend>) -> Self {
         self.backend = backend;
         self

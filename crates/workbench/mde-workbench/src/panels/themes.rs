@@ -14,8 +14,6 @@ use cosmic::iced::{Length, Task};
 use cosmic::Element;
 use mde_theme::{Density, Preferences, Theme};
 
-use crate::cosmic_compat::prelude::*;
-
 use crate::controls::{variant_button, ButtonVariant};
 
 /// The three Carbon gray themes, as (id, label) pairs — §4's full set.

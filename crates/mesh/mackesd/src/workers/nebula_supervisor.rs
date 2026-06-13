@@ -180,7 +180,7 @@ impl NebulaSupervisor {
     /// Leader-promotion: mint CA if missing, write
     /// role.host marker, start lighthouse + tunnel units.
     async fn promote(&self) -> Result<(), String> {
-        tracing::info!("nebula-supervisor: promoting to host role");
+        tracing::info!(node = %self.node_id, "nebula-supervisor: promoting to host role");
         // a. Mint the CA if no active row exists.
         {
             let conn = self.store.lock().await;
@@ -213,7 +213,7 @@ impl NebulaSupervisor {
     /// marker. nebula.service stays up — the local peer
     /// needs its tun device regardless of role.
     fn demote(&self) -> Result<(), String> {
-        tracing::info!("nebula-supervisor: demoting to peer role");
+        tracing::info!(node = %self.node_id, "nebula-supervisor: demoting to peer role");
         let _ = systemctl_stop("mackes-nebula-https-tunnel.service");
         let _ = systemctl_stop("nebula-lighthouse.service");
         if self.role_marker_path.exists() {

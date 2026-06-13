@@ -5174,7 +5174,7 @@ fn run_serve(
         // /etc/hosts on every node (rank 0 plumbing).
         if mackesd_core::worker_role::runs("mesh_dns", role_rank) {
             sup.spawn(Spawn::new(
-                mesh_dns::MeshDnsWorker::new(workgroup_root.clone(), Some(db_path.clone())),
+                mesh_dns::MeshDnsWorker::new(Some(db_path.clone())),
                 RestartPolicy::OnFailure,
             ));
             worker_names.lock().expect("worker_names mutex").push("mesh_dns".into());

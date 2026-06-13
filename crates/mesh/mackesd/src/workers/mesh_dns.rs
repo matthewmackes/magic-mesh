@@ -17,7 +17,7 @@
 
 #![cfg(feature = "async-services")]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use super::{ShutdownToken, Worker};
@@ -106,16 +106,15 @@ pub fn merge_hosts(existing: &str, records: &[MeshHost]) -> String {
 
 /// The mesh-DNS worker.
 pub struct MeshDnsWorker {
-    workgroup_root: PathBuf,
     store_db: Option<PathBuf>,
     hosts_path: PathBuf,
 }
 
 impl MeshDnsWorker {
+    /// `store_db` is the roster source — peers resolve from the SQLite mirror.
     #[must_use]
-    pub fn new(workgroup_root: PathBuf, store_db: Option<PathBuf>) -> Self {
+    pub fn new(store_db: Option<PathBuf>) -> Self {
         Self {
-            workgroup_root,
             store_db,
             hosts_path: PathBuf::from("/etc/hosts"),
         }
@@ -245,7 +244,7 @@ mod tests {
         let hosts = tmp.path().join("hosts");
         std::fs::write(&hosts, "127.0.0.1 localhost\n").unwrap();
         // No store_db → empty roster → no block, file unchanged.
-        let w = MeshDnsWorker::new(tmp.path().to_path_buf(), None).with_hosts_path(hosts.clone());
+        let w = MeshDnsWorker::new(None).with_hosts_path(hosts.clone());
         w.sync();
         assert_eq!(
             std::fs::read_to_string(&hosts).unwrap(),

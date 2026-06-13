@@ -696,7 +696,6 @@ pub fn parse_genres(inner: &Value) -> Vec<Genre> {
 #[must_use]
 /// Parse `getInternetRadioStations`'s
 /// `internetRadioStations.internetRadioStation[]` array (SVC-3).
-#[must_use]
 pub fn parse_radio_stations(inner: &Value) -> Vec<RadioStation> {
     inner
         .get("internetRadioStations")

@@ -20,8 +20,7 @@ use std::time::Duration;
 
 use mackes_mesh_types::cap_tags::{read_tags, CapabilityTag};
 use magic_fleet::jobs::{
-    read_run, read_target_results, run_pending_for, runs_dir, write_target_result, JobRun,
-    TargetResult,
+    read_run, run_pending_for, runs_dir, write_target_result, JobRun, TargetResult,
 };
 
 use super::{ShutdownToken, Worker};
