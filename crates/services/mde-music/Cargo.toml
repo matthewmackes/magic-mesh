@@ -35,7 +35,7 @@ mde-bus    = { path = "../../platform/mde-bus" }
 # E5.3 — single-source colors from the canonical design palette (the Q2
 # indigo accent + semantic tokens) instead of hardcoded hex; the `iced`
 # feature enables `Rgba::into_iced_color()` for the app theme.
-mde-theme  = { path = "../../shared/mde-theme", features = ["iced"] }
+mde-theme  = { path = "../../shared/mde-theme" }
 # AIR-10.b — parse the daemon's JSON Bus replies into display rows.
 serde_json = "1"
 # AIR-11.b — derive (de)serialize for the persisted MusicPrefs (sort).

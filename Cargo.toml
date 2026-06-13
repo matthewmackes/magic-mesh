@@ -42,7 +42,6 @@ members = [
     "crates/workbench/mde-workbench",
     "crates/shared/mde-card",
     "crates/shared/mde-disclaimer",
-    "crates/shared/mde-iced-components",
     "crates/shared/mde-theme",
     "crates/kdc/mde-kdc-host",
     "crates/kdc/mde-kdc-proto",

@@ -3227,7 +3227,6 @@ dependencies = [
  "iced_core 0.14.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "iced_futures 0.14.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "log",
- "lyon_path",
  "raw-window-handle",
  "rustc-hash 2.1.2",
  "thiserror 2.0.18",
@@ -3380,7 +3379,6 @@ dependencies = [
  "iced_graphics 0.14.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "kurbo 0.10.4",
  "log",
- "resvg",
  "rustc-hash 2.1.2",
  "softbuffer 0.4.8",
  "tiny-skia",
@@ -3418,8 +3416,6 @@ dependencies = [
  "iced_debug 0.14.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "iced_graphics 0.14.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "log",
- "lyon",
- "resvg",
  "rustc-hash 2.1.2",
  "thiserror 2.0.18",
  "wgpu 27.0.1",
@@ -4521,14 +4517,6 @@ dependencies = [
  "serde_json",
  "tar",
  "tokio",
-]
-
-[[package]]
-name = "mde-iced-components"
-version = "10.0.0"
-dependencies = [
- "iced 0.14.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "mde-theme",
 ]
 
 [[package]]
