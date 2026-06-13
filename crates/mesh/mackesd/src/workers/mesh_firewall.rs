@@ -64,7 +64,10 @@ impl MeshFirewallWorker {
         let desired: BTreeSet<String> = blocked_ips(&read_all_surrounding(&self.base_dir))
             .into_iter()
             .collect();
-        let mut active = self.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (to_add, to_remove) = reconcile(&active, &desired);
         let mut changed = false;
         for ip in &to_add {
@@ -127,7 +130,8 @@ fn run_firewall_cmd(args: &[String]) -> bool {
 fn binary_present(bin: &str) -> bool {
     let mut cmd = Command::new(bin);
     cmd.arg("--version");
-    crate::workers::proc::status_with_timeout(cmd, crate::workers::proc::DEFAULT_CMD_TIMEOUT).is_ok()
+    crate::workers::proc::status_with_timeout(cmd, crate::workers::proc::DEFAULT_CMD_TIMEOUT)
+        .is_ok()
 }
 
 #[async_trait::async_trait]

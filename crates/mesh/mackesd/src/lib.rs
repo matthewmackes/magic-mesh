@@ -1,11 +1,11 @@
-//! `mackesd_core` — the authoritative read API for the Mesh control
-//! plane. Linked directly into `mackes-panel` (no IPC, no networked
-//! API per Phase 12.A.3 lock 2026-05-19).
+//! `mackesd_core` — the Mesh control-plane library behind the
+//! `mackesd` daemon/CLI binary (`src/bin/mackesd.rs`) and its
+//! workers. Surfaces reach it over the Mackes Bus
+//! (`action/<domain>/<verb>`) and the replicated QNM-Shared volume —
+//! no MDE-private D-Bus, no central server (§1/§2/§6).
 //!
-//! Module organization mirrors the 8-layer architecture in
-//! `docs/PROJECT_WORKLIST.md` § Phase 12. Modules land one at a time
-//! as their substeps ship; only those whose substep is `[✓] Done`
-//! are exposed here.
+//! The durable tracker is `docs/WORKLIST.md`; modules land only when
+//! runtime-reachable per the §7 Definition of Done.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -75,13 +75,13 @@ pub mod passcode_creds;
 // Peer-arrival UX lives in the Workbench PEERS/Directory surfaces now.
 // v2.0.0 Phase 2.5 — path safety + allowed-roots resolver for the
 // Send-To pipeline. Pure-fn validation; no async / DBus surface.
-// v2.0.0 Phase 2.6 — Send-To operation orchestrator. Owns the
-// validate → execute → verify state machine + the in-process
-// audit-log + progress-event stream.
+// (The Phase 2.6 Send-To operation orchestrator was removed
+// 2026-06-13, AUD6-2 — 522 lines with zero production callers.
+// Git history keeps it for the epic that wires the real
+// transfer engine into `ipc/files.rs`.)
 // v2.0.0 Phase 12.18 — HTTPS-tunneled fallback policy layer.
 // Failure-window detector + activation state machine. Pure-fn.
 pub mod https_fallback;
-pub mod orchestrator;
 pub mod path_safety;
 pub mod policy;
 // v2.0.0 Phase 3.5 — pre-flight validation for Send-To requests.

@@ -988,16 +988,28 @@ pub fn parse_podman_ps(stdout: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// AUD6-8 — hard deadline per hypervisor query. `virsh` blocks
+/// indefinitely when libvirtd is wedged (the `qemu:///system`
+/// connect never returns), which left the panel's first paint on
+/// "Loading instances…" forever. A wedged daemon now degrades to
+/// "this hypervisor isn't available here" within 10 s.
+const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Run a hypervisor query command, returning its stdout on success.
-/// `None` when the binary is absent or the command fails — the caller
-/// treats that as "this hypervisor isn't available here".
+/// `None` when the binary is absent, the command fails, or it blows
+/// the [`QUERY_TIMEOUT`] deadline — the caller treats all three as
+/// "this hypervisor isn't available here".
 async fn run_query(program: &str, args: &[&str]) -> Option<String> {
-    let output = tokio::process::Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .await
-        .ok()?;
+    let output = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        tokio::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
     if !output.status.success() {
         return None;
     }

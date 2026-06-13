@@ -362,9 +362,7 @@ impl ConnectPanel {
                 .await
                 .map_err(|e| format!("spawn error: {e}"))
                 .and_then(|opt| {
-                    opt.ok_or_else(|| {
-                        "Bus RPC failed — mde host worker not responding".to_string()
-                    })
+                    opt.ok_or_else(|| "Bus RPC failed — mde host worker not responding".to_string())
                 })
                 .map(|raw| parse_connect_devices(&raw));
                 result

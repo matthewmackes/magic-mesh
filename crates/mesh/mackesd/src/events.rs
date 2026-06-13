@@ -101,9 +101,7 @@ pub fn append_event(
             timestamp_ms: now_ms,
             detail,
         };
-        let payload = event
-            .payload_bytes()
-            .context("serializing event payload")?;
+        let payload = event.payload_bytes().context("serializing event payload")?;
         let hash = crate::audit::next_hash(&prev_hash, &payload, now_ms);
         let payload_str = String::from_utf8(payload)
             .context("event payload is not valid UTF-8 (impossible from serde_json)")?;

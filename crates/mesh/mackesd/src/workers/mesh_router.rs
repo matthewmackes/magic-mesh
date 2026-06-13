@@ -212,8 +212,7 @@ impl MeshRouterWorker {
         let transport_count = self.transport_count();
         debug!(
             peer_count,
-            transport_count,
-            "mesh-router: tick (12.18 D.3 + KDC2-1.9 scorer active)",
+            transport_count, "mesh-router: tick (12.18 D.3 + KDC2-1.9 scorer active)",
         );
         // 12.18 D.3 — drive HTTPS-fallback activation. Reads
         // the state map under a snapshot lock so the registry
@@ -579,7 +578,11 @@ mod tests {
         let s = state.read().await;
         let path = s.get("paired").unwrap();
         assert_eq!(path.primary, TransportKind::NebulaDirect);
-        assert_eq!(path.fallback, Some(TransportKind::KdcTls), "fallback refreshed");
+        assert_eq!(
+            path.fallback,
+            Some(TransportKind::KdcTls),
+            "fallback refreshed"
+        );
         assert!(path.last_switch_at.is_none(), "no switch recorded");
     }
 
@@ -599,7 +602,10 @@ mod tests {
         let w = MeshRouterWorker::new(state.clone(), new_registry());
         assert_eq!(w.select_paths().await, 0);
         let s = state.read().await;
-        assert_eq!(s.get("unknown-peer").unwrap().primary, TransportKind::KdcTls);
+        assert_eq!(
+            s.get("unknown-peer").unwrap().primary,
+            TransportKind::KdcTls
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -610,7 +616,9 @@ mod tests {
         let w =
             MeshRouterWorker::new(new_state(), new_registry()).with_metrics(Arc::clone(&metrics));
         w.tick_once().await;
-        let snapshot = metrics.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot = metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(snapshot.count, 1, "tick_once must record one sample");
         // Some bucket must be non-zero — concrete value depends
         // on machine speed; the test_loop is well under 50 ms.

@@ -29,7 +29,7 @@ monorepo (the labwc/Windows-era *MackesDE* desktop, now end-of-life) by the
 │                                                                                │
 │   Apps & applets (Cosmic-native, libcosmic):                                   │
 │     mde-workbench · mde-files · mde-music · mde-voice-hud                       │
-│     mde-cosmic-applet (panel) · mde-role-chooser (first-run) · mesh-wallpaper  │
+│     mde-cosmic-applet (panel) · mde-role-chooser (first-run)                   │
 └───────────────┬────────────────────────────────────────────────────────────── ┘
                 │ renders through
 ┌───────────────▼──────────────────────────────────────────────────────────────┐
@@ -44,7 +44,7 @@ monorepo (the labwc/Windows-era *MackesDE* desktop, now end-of-life) by the
                 │ served by
 ┌───────────────▼──────────────────────────────────────────────────────────────┐
 │  CONTROL PLANE                                                                 │
-│     mackesd      — supervised daemon: ~30 role-gated workers, reconcile loop,   │
+│     mackesd      — supervised daemon: ~50 role-gated workers, reconcile loop,   │
 │                    Nebula CA, enrollment, scanning, healthz/metrics/alerts      │
 │     magic-fleet  — desired-state engine (ansible-backed), replicated revisions │
 │     meshctl      — the friendly operator CLI facade                            │
@@ -144,7 +144,8 @@ among ≤8 peers, an accepted, documented trade-off (see `DISCLAIMER.md`):
   identity, rustls everywhere; **no OpenSSL** (cargo-deny-banned).
 - **Secrets hygiene** — passphrases/passcodes read via systemd-creds or
   `--*-stdin`, never argv/inherited-env; the daemon scrubs its env at boot.
-- **Hardening** — overlay-confined firewalld presets, sshd overlay-bind,
+- **Hardening** — overlay-confined firewalld presets, an additive sshd
+  overlay listener (the public listener is always kept),
   encrypted daily state backup + verifiable restore, a root-by-design daemon
   with a dropped capability set, and supply-chain gating (`cargo deny` +
   CycloneDX SBOM).
@@ -204,7 +205,7 @@ The load-bearing identity (full detail in [`AI_GOVERNANCE.md`](AI_GOVERNANCE.md)
 ## Build
 
 ```sh
-cargo build --workspace        # needs gtk3-devel + alsa-lib-devel (the audio chain)
+cargo build --workspace        # needs alsa-lib-devel (the audio chain links ALSA)
 cargo test
 cargo clippy --all-targets
 cargo fmt --all

@@ -509,7 +509,8 @@ fn run_stdout(bin: &str, args: &[&str]) -> Option<String> {
 fn binary_present(bin: &str) -> bool {
     let mut cmd = Command::new(bin);
     cmd.arg("--version");
-    crate::workers::proc::output_with_timeout(cmd, crate::workers::proc::DEFAULT_CMD_TIMEOUT).is_ok()
+    crate::workers::proc::output_with_timeout(cmd, crate::workers::proc::DEFAULT_CMD_TIMEOUT)
+        .is_ok()
 }
 
 fn ping_reachable(target: &str, v6: bool) -> bool {

@@ -1,18 +1,15 @@
-//! Mackes Desktop Environment (MDE) Workbench — Iced rewrite of
-//! the v1.x GTK3 Python Workbench.
+//! Magic Mesh Workbench — the operator console, an iced GUI in
+//! the IBM Carbon look (§4, tokens single-sourced in `mde-theme`)
+//! running on the Cosmic desktop (E11 pivot).
 //!
-//! **CB-1.1 scaffold** (`docs/PROJECT_WORKLIST.md`): exposes
-//! [`App`], [`Message`], and [`View`] mirroring the v1.x sidebar
-//! group structure; [`single_instance`] guards against duplicate
-//! processes via the `dev.mackes.MDE.Workbench` bus name.
+//! Exposes [`App`], [`Message`], and [`View`]; the sidebar is the
+//! five-plane nav (Peers Front Door · This Node · Controller ·
+//! Network · Fleet · Provisioning — see [`model::nav_model`]).
+//! [`single_instance`] guards against duplicate processes.
 //!
-//! **CB-1.2 nav layer** ports `_build_nav` and `_common.py` helpers
-//! into a pure-Rust sidebar/breadcrumb model (see [`model::nav_model`]
-//! + [`patternfly`]).
-//!
-//! The crate stays Iced-only at the public surface — the live
-//! `Backend::DBus` impls (zbus calls into `dev.mackes.MDE.Shell.*`)
-//! are routed through `mded` (CB-1.13) rather than open-coded here.
+//! All daemon reads ride the Mackes Bus (`action/<domain>/<verb>`
+//! via `mde-bus`) or shell out to `mackesd`/`meshctl` — no
+//! MDE-private D-Bus (§2).
 
 pub mod app;
 pub mod backend;

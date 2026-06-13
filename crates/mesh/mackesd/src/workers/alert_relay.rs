@@ -186,7 +186,10 @@ impl AlertRelayWorker {
     /// notification); `false` if we've already surfaced it
     /// in this worker's lifetime.
     fn mark_seen(&self, id: &str) -> bool {
-        let mut guard = self.seen_alert_ids.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = self
+            .seen_alert_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.insert(id.to_owned())
     }
 
@@ -221,7 +224,7 @@ impl AlertRelayWorker {
         }
         // OBS-8 — primary path: publish on the `fdo/*` Bus topic so the
         // cosmic-applet renders it through the FDO Notifications path
-        // (the same bridge `ipc::notifications` uses). Only when the Bus
+        // (the same bridge `ipc::bus_bridge` rides). Only when the Bus
         // path is unavailable (no `mde-bus`, e.g. a pre-RPM dev box) do
         // we fall back to a direct `notify-send`.
         if !self.bus_binary.is_empty() {

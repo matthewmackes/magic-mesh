@@ -249,7 +249,7 @@ mod adversarial_tests {
         out.write_all(header.as_bytes()).unwrap();
         out.write_all(data).unwrap();
         out.write_all(&vec![0u8; 512 - data.len()]).unwrap(); // pad block
-        // One legitimate member (via a second raw block for symmetry).
+                                                              // One legitimate member (via a second raw block for symmetry).
         let ok_data = b"ok";
         let mut ok = tar::Header::new_gnu();
         ok.set_path("ok.txt").unwrap();

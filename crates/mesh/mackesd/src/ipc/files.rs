@@ -9,8 +9,8 @@
 //! `Shell.*` surfaces were never registered on D-Bus and have no live
 //! consumer yet, so they ship as Bus responders returning their honest
 //! empty / "transport not configured" states — a future epic fills the
-//! real transfer engine (the `mackesd::orchestrator` Send-To state
-//! machine) and wires consumers. **Fleet.Files is the live one**:
+//! real transfer engine (the Send-To orchestrator state
+//! machine, removed to git history 2026-06-13 AUD6-2) and wires consumers. **Fleet.Files is the live one**:
 //! mde-files's mesh-browse reads its peer roster from the SQLite
 //! `nodes` table.
 //!
@@ -243,7 +243,9 @@ impl FileXfer {
     }
 
     fn outbox_log(&self) -> std::path::PathBuf {
-        self.qnm_root.join("outbox").join(format!("{}.jsonl", self.host))
+        self.qnm_root
+            .join("outbox")
+            .join(format!("{}.jsonl", self.host))
     }
 
     /// `action/file-ops/<verb>` — `send-to` / `rollback` / `audit-log`.
@@ -289,7 +291,10 @@ impl FileXfer {
             .or_else(|| v.get("destination"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        let Some(target) = selector.strip_prefix("peer:").filter(|t| is_clean_component(t)) else {
+        let Some(target) = selector
+            .strip_prefix("peer:")
+            .filter(|t| is_clean_component(t))
+        else {
             return err(format!(
                 "send-to: destination must be peer:<name> with a clean name (got '{selector}')"
             ));
@@ -316,11 +321,20 @@ impl FileXfer {
                 sources.len()
             ));
         }
-        let conflict = v.get("conflict").and_then(serde_json::Value::as_str).unwrap_or("rename");
-        let mode = v.get("mode").and_then(serde_json::Value::as_str).unwrap_or("copy");
+        let conflict = v
+            .get("conflict")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("rename");
+        let mode = v
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("copy");
         let dest_dir = self.inbox_root(target).join(&self.host);
         if let Err(e) = std::fs::create_dir_all(&dest_dir) {
-            return err(format!("send-to: cannot open inbox {}: {e}", dest_dir.display()));
+            return err(format!(
+                "send-to: cannot open inbox {}: {e}",
+                dest_dir.display()
+            ));
         }
         let mut delivered: Vec<String> = Vec::new();
         let mut bytes: u64 = 0;
@@ -389,7 +403,10 @@ impl FileXfer {
             if row.get("op_id").and_then(serde_json::Value::as_i64) != Some(op_id) {
                 continue;
             }
-            let target = row.get("target").and_then(serde_json::Value::as_str).unwrap_or_default();
+            let target = row
+                .get("target")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
             // EFF-3 — never let a forged/edited outbox row's target or filename
             // drive a remove_file outside this peer's inbox.
             if !is_clean_component(target) {
@@ -457,7 +474,11 @@ impl FileXfer {
             "files": files,
         });
         use std::io::Write;
-        if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(&log) {
+        if let Ok(mut fh) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+        {
             let _ = writeln!(fh, "{row}");
         }
     }
@@ -492,7 +513,11 @@ fn is_clean_component(s: &str) -> bool {
 
 /// Resolve the destination path for `name` in `dir` under a conflict policy.
 /// `None` = skip (existing + skip policy, or no resolvable name).
-fn resolve_conflict(dir: &std::path::Path, name: &str, conflict: &str) -> Option<std::path::PathBuf> {
+fn resolve_conflict(
+    dir: &std::path::Path,
+    name: &str,
+    conflict: &str,
+) -> Option<std::path::PathBuf> {
     let dest = dir.join(name);
     if !dest.exists() {
         return Some(dest);
@@ -698,8 +723,7 @@ mod tests {
         let src = tmp.path().join("notes.md");
         std::fs::write(&src, b"hello mesh").unwrap();
 
-        let pine =
-            FileXfer::new(qnm.clone(), "pine".to_string()).with_share_root(qnm.clone());
+        let pine = FileXfer::new(qnm.clone(), "pine".to_string()).with_share_root(qnm.clone());
         let body = json!({
             "sources": [src.to_string_lossy()],
             "selector": "peer:oak",
@@ -732,8 +756,7 @@ mod tests {
         let qnm = tmp.path().to_path_buf();
         let src = tmp.path().join("doc.txt");
         std::fs::write(&src, b"abc").unwrap();
-        let pine =
-            FileXfer::new(qnm.clone(), "pine".to_string()).with_share_root(qnm.clone());
+        let pine = FileXfer::new(qnm.clone(), "pine".to_string()).with_share_root(qnm.clone());
         let body = json!({"sources":[src.to_string_lossy()],"selector":"peer:oak","mode":"move"})
             .to_string();
         let reply: serde_json::Value =
@@ -755,7 +778,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let x = FileXfer::new(tmp.path().to_path_buf(), "pine".to_string());
         assert!(x
-            .file_ops_reply("send-to", Some(r#"{"sources":["/x"],"selector":"group:crew"}"#))
+            .file_ops_reply(
+                "send-to",
+                Some(r#"{"sources":["/x"],"selector":"group:crew"}"#)
+            )
             .contains("peer:"));
         assert!(x
             .file_ops_reply("send-to", Some(r#"{"sources":[],"selector":"peer:oak"}"#))
@@ -772,8 +798,7 @@ mod tests {
         std::fs::write(&src, b"x").unwrap();
         let x = FileXfer::new(qnm.clone(), "pine".to_string());
         for evil in ["peer:../../etc", "peer:..", "peer:a/b", "peer:"] {
-            let body =
-                json!({ "sources": [src.to_string_lossy()], "selector": evil }).to_string();
+            let body = json!({ "sources": [src.to_string_lossy()], "selector": evil }).to_string();
             let reply: serde_json::Value =
                 serde_json::from_str(&x.file_ops_reply("send-to", Some(&body))).unwrap();
             assert!(
@@ -803,17 +828,47 @@ mod tests {
         // Over-cap: must be suppressed.
         let big = "x".repeat(crate::ipc::MAX_RPC_BODY_BYTES + 1);
         persist
-            .write("action/file-ops/send-to", Priority::Default, None, Some(&big))
+            .write(
+                "action/file-ops/send-to",
+                Priority::Default,
+                None,
+                Some(&big),
+            )
             .unwrap();
-        poll_once(&persist, FILE_OPS_PREFIX, &FILE_OPS_VERBS, &observing, &mut cursors);
-        assert_eq!(dispatched.get(), 0, "over-cap body must not reach the handler");
+        poll_once(
+            &persist,
+            FILE_OPS_PREFIX,
+            &FILE_OPS_VERBS,
+            &observing,
+            &mut cursors,
+        );
+        assert_eq!(
+            dispatched.get(),
+            0,
+            "over-cap body must not reach the handler"
+        );
 
         // Within-cap: must dispatch.
         persist
-            .write("action/file-ops/send-to", Priority::Default, None, Some("{}"))
+            .write(
+                "action/file-ops/send-to",
+                Priority::Default,
+                None,
+                Some("{}"),
+            )
             .unwrap();
-        poll_once(&persist, FILE_OPS_PREFIX, &FILE_OPS_VERBS, &observing, &mut cursors);
-        assert_eq!(dispatched.get(), 1, "within-cap body must reach the handler");
+        poll_once(
+            &persist,
+            FILE_OPS_PREFIX,
+            &FILE_OPS_VERBS,
+            &observing,
+            &mut cursors,
+        );
+        assert_eq!(
+            dispatched.get(),
+            1,
+            "within-cap body must reach the handler"
+        );
     }
 
     #[test]
@@ -833,8 +888,7 @@ mod tests {
         let ok = share.join("ok.txt");
         std::fs::write(&ok, b"fine").unwrap();
 
-        let pine =
-            FileXfer::new(qnm.clone(), "pine".to_string()).with_share_root(share.clone());
+        let pine = FileXfer::new(qnm.clone(), "pine".to_string()).with_share_root(share.clone());
         let body = json!({
             "sources": [secret.to_string_lossy(), ok.to_string_lossy()],
             "selector": "peer:oak",
@@ -866,8 +920,7 @@ mod tests {
         let link = share.join("link-to-secret.txt");
         std::os::unix::fs::symlink(&secret, &link).unwrap();
 
-        let pine =
-            FileXfer::new(qnm.clone(), "pine".to_string()).with_share_root(share.clone());
+        let pine = FileXfer::new(qnm.clone(), "pine".to_string()).with_share_root(share.clone());
         let body = json!({
             "sources": [link.to_string_lossy()],
             "selector": "peer:oak",
@@ -886,8 +939,7 @@ mod tests {
         let qnm = tmp.path().to_path_buf();
         let src = tmp.path().join("a.txt");
         std::fs::write(&src, b"v1").unwrap();
-        let pine =
-            FileXfer::new(qnm.clone(), "pine".to_string()).with_share_root(qnm.clone());
+        let pine = FileXfer::new(qnm.clone(), "pine".to_string()).with_share_root(qnm.clone());
         let body =
             json!({"sources":[src.to_string_lossy()],"selector":"peer:oak","conflict":"rename"})
                 .to_string();
@@ -895,7 +947,10 @@ mod tests {
         let _ = pine.file_ops_reply("send-to", Some(&body));
         let dir = qnm.join("inbox/oak/pine");
         assert!(dir.join("a.txt").exists());
-        assert!(dir.join("a (1).txt").exists(), "second copy renamed, not clobbered");
+        assert!(
+            dir.join("a (1).txt").exists(),
+            "second copy renamed, not clobbered"
+        );
     }
 
     #[test]

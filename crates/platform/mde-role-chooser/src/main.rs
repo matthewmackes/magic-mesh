@@ -118,9 +118,7 @@ impl Application for RoleChooser {
             .spacing(16)
             // AUD2-4 — brand header: the wordmark resolved through the
             // Brand loader (system layer / env override / baked SVG).
-            .push(
-                svg::Svg::new(self.wordmark.clone()).width(Length::Fixed(WORDMARK_WIDTH)),
-            )
+            .push(svg::Svg::new(self.wordmark.clone()).width(Length::Fixed(WORDMARK_WIDTH)))
             .push(widget::text::title2("Choose this machine's role"))
             .push(widget::text::body(
                 "Magic Mesh pins one deployment role per machine at install. You \

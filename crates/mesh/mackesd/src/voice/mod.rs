@@ -203,12 +203,18 @@ mod tests {
         // unreachable / over-budget candidates floor to 0 (transit).
         let fast = dispatcher_priority("peer:x", &[c("peer:x", 8.0, 0.0)]);
         let slow = dispatcher_priority("peer:x", &[c("peer:x", 60.0, 0.0)]);
-        assert!(fast > slow, "faster direct path ranks higher ({fast} > {slow})");
+        assert!(
+            fast > slow,
+            "faster direct path ranks higher ({fast} > {slow})"
+        );
         assert!(fast >= 1 && fast <= 100);
         // Over the 80 ms direct cap → Transit → 0.
         assert_eq!(dispatcher_priority("peer:x", &[c("peer:x", 120.0, 0.0)]), 0);
         // Unreachable (loss 100) → Transit → 0.
-        assert_eq!(dispatcher_priority("peer:x", &[c("peer:x", 10.0, 100.0)]), 0);
+        assert_eq!(
+            dispatcher_priority("peer:x", &[c("peer:x", 10.0, 100.0)]),
+            0
+        );
         // No candidates → Transit fallback → 0.
         assert_eq!(dispatcher_priority("peer:x", &[]), 0);
     }

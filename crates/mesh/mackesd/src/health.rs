@@ -113,8 +113,10 @@ impl HealthReport {
             // Only a detected `Break` is unhealthy; an `Empty` chain (fresh
             // peer, nothing logged yet) is intact-by-vacuity, same as a
             // fully-verified `Intact` chain.
-            r.audit_chain_intact =
-                !matches!(crate::audit::verify(&rows), crate::audit::VerifyOutcome::Break { .. });
+            r.audit_chain_intact = !matches!(
+                crate::audit::verify(&rows),
+                crate::audit::VerifyOutcome::Break { .. }
+            );
         }
         // EFF-24 — the store-only readiness verdict (the daemon's Bus
         // healthz ANDs worker liveness on top — see ipc::shell).

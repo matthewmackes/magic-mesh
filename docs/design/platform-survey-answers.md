@@ -145,7 +145,7 @@ gating.
 
 | Q | Lock | Q | Lock |
 |---|------|---|------|
-| Q71 | **A** RPM tool = cargo-generate-rpm | Q79 | **A** COPR built-in per-project GPG signing |
+| Q71 | **A** RPM tool = cargo-generate-rpm | Q79 | **A** ~~COPR built-in GPG~~ → GitHub-hosted dnf repo + project GPG key (superseded 2026-06-10) |
 | Q72 | **A** one monolithic magic-mesh RPM | Q80 | **A** ISO = kickstart + livemedia-creator |
 | Q73 | **D** chooser = Cosmic first-run GUI | Q81 | **A** role chosen inline in Anaconda %post |
 | Q74 | **B** pin via `mackesd role pin` | Q82 | **C** disclaimer gate at build + install |
@@ -163,7 +163,7 @@ during Anaconda (Q81) (reconcile: Anaconda-inline is the automated/headless path
 handles interactive desktop first-run / unpinned boxes), plus a separate "initialize new mesh vs
 join existing" prompt orthogonal to role (Q84). Upgrades are unit-only — re-pin + daemon reload,
 all bins already present (Q77) — and downgrade is refused at both the RPM scriptlet and the
-`mde_role::pin` lib (Q78). Distribution: a signed COPR via COPR's built-in per-project GPG, shipping
+`mde_role::pin` lib (Q78). Distribution (superseded 2026-06-10): a GitHub-hosted dnf repo (Releases asset + gh-pages createrepo tree), GPG-signed with the project key — replaces the originally-chosen COPR — shipping
 the pubkey + a `magic-mesh-release.rpm` (Q79), and a Magic-on-Cosmic ISO built from a Fedora-Cosmic
 kickstart with livemedia-creator (Q80). The DISCLAIMER.md gate binds at both build (refuse to
 package without it) and install (mandatory accept screen) (Q82). Nebula enrollment is deferred to
@@ -173,7 +173,7 @@ in a new top-level `packaging/` dir (Q85).
 **Lifts to worklist tasks:** PKG-1 cargo-generate-rpm monolithic RPM · PKG-2 packaging/ dir scaffold ·
 PKG-3 self-gating mackesd.service + app surface units · PKG-4 `mackesd role pin` subcommand · PKG-5
 Cosmic first-run GUI chooser + Anaconda %post + init-vs-join prompt · PKG-6 disclaimer build+install
-gate · PKG-7 upgrade-only enforcement (scriptlet + lib) · PKG-8 signed COPR · PKG-9 Magic-on-Cosmic
+gate · PKG-7 upgrade-only enforcement (scriptlet + lib) · PKG-8 GitHub-hosted dnf repo (ex-COPR) · PKG-9 Magic-on-Cosmic
 ISO (kickstart + livemedia-creator) · PKG-10 post-install enrollment flow.
 
 ## §6 — Testing/CI, Observability & Lifecycle — COMPLETE

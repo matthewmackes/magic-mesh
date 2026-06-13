@@ -90,7 +90,9 @@ impl HardwarePanel {
                     Some(d) => load_probes(&d),
                     // No HOME/XDG at all — a real environment failure,
                     // not an empty roster.
-                    None => Err("cannot resolve the peer cache dir (no HOME/XDG_CACHE_HOME)".into()),
+                    None => {
+                        Err("cannot resolve the peer cache dir (no HOME/XDG_CACHE_HOME)".into())
+                    }
                 };
                 Message::Loaded(result)
             },

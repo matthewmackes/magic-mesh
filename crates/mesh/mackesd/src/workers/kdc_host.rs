@@ -132,12 +132,7 @@ impl PendingSends {
     /// AUD-2 — drain the whole backlog (the `kdc_outbound` drainer takes these
     /// + delivers each over the live `LanTransport`). Poison-tolerant.
     fn take_all(&self) -> Vec<OutboundSend> {
-        std::mem::take(
-            &mut *self
-                .inner
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        )
+        std::mem::take(&mut *self.inner.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// Current backlog length. O(1).

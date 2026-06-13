@@ -159,21 +159,48 @@ pub fn validate_passcode(input: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Shell out to `mackesd enroll --passcode <code>` (with an
-/// optional `--name <name>` flag). Returns the stdout
-/// (enrollment-request JSON) on success.
-pub async fn run_mackesd_enroll(passcode: &str, name: &str) -> Result<String, String> {
-    let mut argv: Vec<String> = vec![
-        "enroll".to_string(),
-        "--passcode".to_string(),
-        passcode.to_string(),
-    ];
+/// The enroll argv — the passcode is deliberately NOT here. It
+/// travels via `--passcode-stdin` so it never lands in
+/// `/proc/<pid>/cmdline` or shell history (EFF-21).
+#[must_use]
+pub fn enroll_argv(name: &str) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["enroll".to_string(), "--passcode-stdin".to_string()];
     if !name.is_empty() {
         argv.push("--name".to_string());
         argv.push(name.to_string());
     }
-    let Ok(output) = Command::new("mackesd").args(&argv).output().await else {
-        return Err("`mackesd` not on PATH — install MackesWorkstation or check $PATH.".into());
+    argv
+}
+
+/// Shell out to `mackesd enroll --passcode-stdin` (with an
+/// optional `--name <name>` flag), piping the passcode through
+/// stdin — never argv, which is world-readable via
+/// `/proc/<pid>/cmdline` (EFF-21). Returns the stdout
+/// (enrollment-request JSON) on success.
+pub async fn run_mackesd_enroll(passcode: &str, name: &str) -> Result<String, String> {
+    let argv = enroll_argv(name);
+    let mut child = match Command::new("mackesd")
+        .args(&argv)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => {
+            return Err("`mackesd` not on PATH — install MackesWorkstation or check $PATH.".into())
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let line = format!("{passcode}\n");
+        if let Err(e) = stdin.write_all(line.as_bytes()).await {
+            return Err(format!("writing passcode to mackesd stdin: {e}"));
+        }
+        // Drop closes the pipe so the daemon's read_line returns.
+    }
+    let Ok(output) = child.wait_with_output().await else {
+        return Err("`mackesd enroll` did not complete.".into());
     };
     if output.status.success() {
         Ok(String::from_utf8(output.stdout)
@@ -213,6 +240,16 @@ mod tests {
         assert!(validate_passcode("abcdef0123456789!").is_err()); // 17 chars
         assert!(validate_passcode("abcdef 123456789").is_err()); // space
         assert!(validate_passcode("abcdef+/23456789").is_err()); // + and /
+    }
+
+    #[test]
+    fn enroll_argv_never_carries_the_passcode() {
+        // EFF-21 / AUD6-1: the secret rides stdin, never argv.
+        let argv = enroll_argv("anvil");
+        assert_eq!(argv[..2], ["enroll", "--passcode-stdin"]);
+        assert!(!argv.contains(&"--passcode".to_string()));
+        let bare = enroll_argv("");
+        assert_eq!(bare, ["enroll", "--passcode-stdin"]);
     }
 
     #[test]

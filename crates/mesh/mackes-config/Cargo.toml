@@ -1,6 +1,6 @@
 [package]
 name        = "mackes-config"
-description = "Serde TOML schema for ~/.config/mackes-panel/panel.toml."
+description = "Serde TOML schema for ~/.config/mde/panel.toml (consumed by mde-workbench)."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

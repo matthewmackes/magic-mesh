@@ -162,6 +162,8 @@ enum Cmd {
         set: Option<String>,
     },
 
+    /// Show which mackesd workers each deployment role runs (the
+    /// Lighthouse ⊂ Server ⊂ Workstation tier table).
     RoleWorkers {
         /// lighthouse | server | workstation (default: all three tiers).
         role: Option<String>,
@@ -925,7 +927,6 @@ enum Cmd {
 
     // AUD3 S-3 (2026-06-12): `PeerCard` (PC-3.a) removed — it spawned
     // the `mde-peer-card` modal, deleted in the E11 pivot.
-
     /// NF-2.6 (v2.5) — Nebula CA management subcommands.
     /// Mint / rotate / list / dump-ca the mesh-CA artifacts.
     Ca {
@@ -2139,7 +2140,11 @@ fn main() -> anyhow::Result<()> {
                     plaintext.exported_at,
                     plaintext.ca_certs.len(),
                     plaintext.peer_certs.len(),
-                    if plaintext.meshfs_snapshot.is_some() { "present" } else { "absent" },
+                    if plaintext.meshfs_snapshot.is_some() {
+                        "present"
+                    } else {
+                        "absent"
+                    },
                 );
                 eprintln!(
                     "[state-restore --verify] dry-run complete — nothing was written. \

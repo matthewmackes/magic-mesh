@@ -541,6 +541,7 @@ lifecycle (Q87–100).
 - C) Both: scriptlet pre-check for a clean error, plus `pin` as the authoritative refusal
 
 ### Q79. How is the signed COPR repository's package signing keyed?
+*(Superseded 2026-06-10: distribution moved to a GitHub-hosted dnf repo — Releases asset + gh-pages createrepo tree, signed with the project GPG key. The COPR options below are historical.)*
 *§5 requires "a signed COPR"; the repo has no GPG handling, `.repo` file, or COPR config.*
 - A) COPR's built-in per-project GPG signing; ship the pubkey + a `magic-mesh-release.rpm` carrying the `.repo` + key
 - B) Self-managed detached GPG signing of every RPM before upload, with the pubkey pinned in the repo

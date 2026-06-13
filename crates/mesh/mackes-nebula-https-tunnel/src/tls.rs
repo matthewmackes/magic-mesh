@@ -106,9 +106,7 @@ fn build_server_config(
     }
 
     let key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_slice(&key_pem)
-        .map_err(|e| {
-            TunnelError::CertIo(format!("parse key pem {}: {e}", server_key.display()))
-        })?;
+        .map_err(|e| TunnelError::CertIo(format!("parse key pem {}: {e}", server_key.display())))?;
 
     let mut config = ServerConfig::builder()
         .with_no_client_auth()

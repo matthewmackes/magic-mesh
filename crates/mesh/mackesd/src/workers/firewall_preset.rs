@@ -376,9 +376,11 @@ fn apply_zones(firewall_cmd: &str, plan: &ZonePlan) -> Result<(), String> {
     }
     let mut reload = std::process::Command::new(firewall_cmd);
     reload.arg("--reload");
-    let out =
-        crate::workers::proc::output_with_timeout(reload, crate::workers::proc::DEFAULT_CMD_TIMEOUT)
-            .map_err(|e| format!("spawn {firewall_cmd} --reload: {e}"))?;
+    let out = crate::workers::proc::output_with_timeout(
+        reload,
+        crate::workers::proc::DEFAULT_CMD_TIMEOUT,
+    )
+    .map_err(|e| format!("spawn {firewall_cmd} --reload: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "{firewall_cmd} --reload failed: {}",
@@ -422,9 +424,11 @@ fn apply_preset(firewall_cmd: &str, ports: &[(u16, &'static str)]) -> Result<(),
     }
     let mut reload = std::process::Command::new(firewall_cmd);
     reload.arg("--reload");
-    let out =
-        crate::workers::proc::output_with_timeout(reload, crate::workers::proc::DEFAULT_CMD_TIMEOUT)
-            .map_err(|e| format!("spawn {firewall_cmd} --reload: {e}"))?;
+    let out = crate::workers::proc::output_with_timeout(
+        reload,
+        crate::workers::proc::DEFAULT_CMD_TIMEOUT,
+    )
+    .map_err(|e| format!("spawn {firewall_cmd} --reload: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "{firewall_cmd} --reload failed: {}",

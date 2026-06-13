@@ -47,12 +47,12 @@ is `cargo build --workspace` (`README.md:46`), which does not check prerequisite
 `alsa-lib-devel`), OS, ports, permissions, or networking. No idempotent, scriptable, prerequisite-
 validating install path exists.
 
-### Packaging — **FAIL (unbuilt, self-acknowledged)**
+### Packaging — **FAIL (unbuilt, self-acknowledged)** *(historical — resolved: PKG-1..10 shipped; `[package.metadata.generate-rpm]` + kickstart + GitHub-hosted repo all exist under `packaging/`)*
 No `.spec`, no `[package.metadata.generate-rpm]`, no `cargo-deb`, no kickstart `.ks`, no COPR config,
 no Containerfile. `docs/COMPLIANCE.md:85` confirms packaging is unbuilt; the entire PKG-1..10 epic is
 open in the worklist.
 
-### systemd / boot-start — **FAIL**
+### systemd / boot-start — **FAIL** *(historical — resolved by ENT-6/PKG-3: `packaging/systemd/` ships `mackesd.service` (Restart=on-failure) + `mde-musicd.service` + the operator-enabled voice units)*
 Zero `.service`/`.target`/`.socket`/`.timer`/`.preset` units ship. The binaries are service-shaped
 (`mackesd serve` boots a tokio supervisor and blocks on SIGTERM behind the `async-services` feature;
 `mde-bus daemon`, `magic-fleet watch`, `mde-musicd serve` are long-running) and several doc-comments
@@ -272,7 +272,7 @@ overlay IP `10.42.0.1`. 19. README has no deploy section. 20. Config inventory/b
 ## 6. Acceptance criteria (each testable)
 
 - **Fresh install** — *Req:* one command installs all node software on a clean Fedora-Cosmic box. *Test:*
-  `dnf install magic-mesh` (from the signed COPR) on a fresh VM. *Expected:* binaries + `mackesd.service`
+  `dnf install magic-mesh` (from the GitHub-hosted dnf repo — superseded COPR, operator decision 2026-06-10) on a fresh VM. *Expected:* binaries + `mackesd.service`
   present; `systemctl status mackesd` shows loaded; prerequisites validated or pulled as deps.
 - **Lighthouse creation** — *Req:* one guided command stands up a new mesh's first node. *Test:*
   `mackesd mesh init --workgroup acme`. *Expected:* CA minted, role pinned Lighthouse, self peer-cert +

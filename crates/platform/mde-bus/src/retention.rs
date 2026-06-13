@@ -247,8 +247,8 @@ pub fn run_pass_at(
     // 7-day default TTL. `audit/*` can't match either prefix, but the
     // exclusion is kept for defense in depth.
     {
-        let cutoff = now_unix_ms
-            - i64::try_from(policy.ttl_ephemeral_secs * 1000).unwrap_or(i64::MAX);
+        let cutoff =
+            now_unix_ms - i64::try_from(policy.ttl_ephemeral_secs * 1000).unwrap_or(i64::MAX);
         let mut stmt = conn
             .prepare(
                 "SELECT ulid, file_path FROM messages \
@@ -536,7 +536,11 @@ mod tests {
         let two_hours_ago = now - (2_i64 * 60 * 60 * 1000);
         let (_tmp, root) = open_tmp_with(&[
             ("reply/01OLDULID", Priority::Default, two_hours_ago),
-            ("action/fleet/list-revisions", Priority::Default, two_hours_ago),
+            (
+                "action/fleet/list-revisions",
+                Priority::Default,
+                two_hours_ago,
+            ),
             ("t/normal", Priority::Default, two_hours_ago),
         ]);
         let report = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
@@ -555,8 +559,7 @@ mod tests {
         // An in-flight RPC (30 min old) must NOT be reaped.
         let now = 1_000_000_000_000_i64;
         let half_hour_ago = now - (30_i64 * 60 * 1000);
-        let (_tmp, root) =
-            open_tmp_with(&[("reply/01FRESH", Priority::Default, half_hour_ago)]);
+        let (_tmp, root) = open_tmp_with(&[("reply/01FRESH", Priority::Default, half_hour_ago)]);
         let report = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
         assert_eq!(report.removed, 0);
     }
@@ -569,7 +572,10 @@ mod tests {
         let ten_days_ago = now - (10_i64 * 24 * 60 * 60 * 1000);
         let (_tmp, root) = open_tmp_with(&[("reply/01ANCIENT", Priority::Min, ten_days_ago)]);
         let report = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
-        assert_eq!(report.removed, 1, "single removal despite matching both passes");
+        assert_eq!(
+            report.removed, 1,
+            "single removal despite matching both passes"
+        );
     }
 
     #[test]

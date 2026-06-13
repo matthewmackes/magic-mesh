@@ -1,6 +1,6 @@
 [package]
 name        = "mde-workbench"
-description = "Mackes Desktop Environment (MDE) Workbench — Iced rewrite of the v1.x GTK3 Python Workbench (CB-1.1 scaffold)."
+description = "Magic Mesh Workbench — the Carbon-look iced operator console (five-plane nav, Peers Front Door) for the mesh."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

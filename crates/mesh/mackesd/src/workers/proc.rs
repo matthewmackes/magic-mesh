@@ -43,7 +43,9 @@ const POLL: Duration = Duration::from_millis(25);
 /// Spawn failure, a wait error, or the timeout (after which the child
 /// is killed and reaped).
 pub fn output_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Result<Output> {
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
     let deadline = Instant::now() + timeout;
     loop {
@@ -66,7 +68,9 @@ pub fn output_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Resu
 /// Spawn failure, a wait error, or the timeout (after which the child
 /// is killed and reaped).
 pub fn status_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Result<ExitStatus> {
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let mut child = cmd.spawn()?;
     let deadline = Instant::now() + timeout;
     loop {
@@ -140,7 +144,10 @@ mod tests {
         assert!(r.is_err());
         assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
         // Returned promptly at the deadline, not after sleep's 60 s.
-        assert!(start.elapsed() < Duration::from_secs(5), "must not wait for the child");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must not wait for the child"
+        );
     }
 
     #[test]

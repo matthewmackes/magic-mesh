@@ -263,12 +263,8 @@ pub fn error_state<'a, Message: Clone + 'a>(
     palette: Palette,
     on_retry: impl Fn() -> Message + 'a,
 ) -> Element<'a, Message> {
-    let mut state = EmptyState::with_cta(
-        "Couldn't load this panel",
-        detail.into(),
-        "Retry",
-    )
-    .with_icon(Icon::StatusError);
+    let mut state = EmptyState::with_cta("Couldn't load this panel", detail.into(), "Retry")
+        .with_icon(Icon::StatusError);
     state.body_color_override = Some(palette.danger);
     empty_state(state, palette, on_retry)
 }

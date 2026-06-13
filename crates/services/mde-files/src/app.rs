@@ -659,7 +659,12 @@ impl MdeFiles {
                         })
                         .collect();
                     let destination = drag_target_to_destination(target);
-                    self.dispatch_send(sources, destination, SendMode::Copy, ConflictPolicy::Rename);
+                    self.dispatch_send(
+                        sources,
+                        destination,
+                        SendMode::Copy,
+                        ConflictPolicy::Rename,
+                    );
                 }
             }
             Message::DragCancel => {
@@ -777,9 +782,7 @@ impl MdeFiles {
                 .to_string(),
             n => format!("{n} files"),
         };
-        let result = self
-            .backend
-            .send_to(&sources, destination, mode, conflict);
+        let result = self.backend.send_to(&sources, destination, mode, conflict);
         let (op_id, state, progress) = match &result {
             Ok(id) => (*id, OpState::Completed, 1000),
             Err(_) => (0, OpState::Failed, 0),

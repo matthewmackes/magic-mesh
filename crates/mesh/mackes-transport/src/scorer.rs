@@ -333,8 +333,8 @@ mod tests {
         // CV-1 — an AES-128 transport must never carry clipboard /
         // file / notification payloads under the AES-256 floor, but
         // stays eligible for Control frames.
-        let weak = all_carrier(TransportKind::NebulaDirect)
-            .with_encryption(EncryptionKind::Aes128Gcm);
+        let weak =
+            all_carrier(TransportKind::NebulaDirect).with_encryption(EncryptionKind::Aes128Gcm);
         for class in [
             MessageClass::Clipboard,
             MessageClass::FileBulk,
@@ -364,8 +364,8 @@ mod tests {
         // A better-ranked but weakly-encrypted transport loses the
         // content classes to the strong one outright (filtered, not
         // merely penalized).
-        let weak_fast = all_carrier(TransportKind::NebulaDirect)
-            .with_encryption(EncryptionKind::Aes128Gcm);
+        let weak_fast =
+            all_carrier(TransportKind::NebulaDirect).with_encryption(EncryptionKind::Aes128Gcm);
         let strong_slow = all_carrier(TransportKind::KdcTls);
         let r = score(
             &[weak_fast, strong_slow],
@@ -374,7 +374,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.primary, TransportKind::KdcTls);
-        assert_eq!(r.fallback, None, "the weak transport is not even a fallback");
+        assert_eq!(
+            r.fallback, None,
+            "the weak transport is not even a fallback"
+        );
     }
 
     #[test]

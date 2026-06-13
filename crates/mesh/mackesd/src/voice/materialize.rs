@@ -421,7 +421,11 @@ mod tests {
         };
         assert!(pri("1001") > pri("1002"), "fast peer outranks slow peer");
         assert_eq!(pri("1003"), 0, "unmeasured peer stays neutral");
-        assert_eq!(pri("1004"), 0, "over-budget peer floors to the transit tier");
+        assert_eq!(
+            pri("1004"),
+            0,
+            "over-budget peer floors to the transit tier"
+        );
     }
 
     #[test]

@@ -74,7 +74,9 @@ fn update_status(
     f: impl FnOnce(&mut WorkerStatus),
 ) {
     if let Some(map) = map {
-        let mut g = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut g = map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         f(g.entry(name).or_insert(WorkerStatus {
             name,
             alive: false,
@@ -91,7 +93,9 @@ fn update_status(
 /// `ipc::shell::build_healthz`.)
 #[must_use]
 pub fn workers_ready(map: &WorkerStatusMap) -> (u32, u32, u32) {
-    let g = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let g = map
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let total = u32::try_from(g.len()).unwrap_or(u32::MAX);
     let alive = u32::try_from(g.values().filter(|w| w.alive).count()).unwrap_or(u32::MAX);
     let tripped =

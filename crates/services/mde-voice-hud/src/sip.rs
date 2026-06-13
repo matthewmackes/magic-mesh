@@ -328,7 +328,15 @@ fn authorization_value(
 }
 
 /// Extract a digest challenge from a 401/407 response.
+///
+/// Tries rsip's typed parser first, then falls back to a manual
+/// param parse (AUD6-5): rsip 0.4 only accepts the non-RFC
+/// `SHA256` spelling, so a registrar sending the RFC 7616 token
+/// `algorithm=SHA-256` fails `typed()` wholesale — without the
+/// fallback, an RFC-compliant SHA-256 challenge broke
+/// registration outright.
 fn parse_challenge(resp: &rsip::Response) -> Option<Challenge> {
+    use rsip::headers::untyped::UntypedHeader;
     for h in resp.headers.iter() {
         match h {
             Header::WwwAuthenticate(w) => {
@@ -341,6 +349,9 @@ fn parse_challenge(resp: &rsip::Response) -> Option<Challenge> {
                         opaque: t.opaque,
                         proxy: false,
                     });
+                }
+                if let Some(ch) = parse_challenge_value(w.value(), false) {
+                    return Some(ch);
                 }
             }
             Header::ProxyAuthenticate(p) => {
@@ -356,11 +367,97 @@ fn parse_challenge(resp: &rsip::Response) -> Option<Challenge> {
                         proxy: true,
                     });
                 }
+                if let Some(ch) = parse_challenge_value(p.value(), true) {
+                    return Some(ch);
+                }
             }
             _ => {}
         }
     }
     None
+}
+
+/// Parse a digest algorithm token, accepting both the RFC 7616
+/// hyphenated spellings (`SHA-256`, `SHA-256-sess`) and the bare
+/// ones rsip emits (`SHA256`). `None` for algorithms we can't
+/// compute (e.g. RFC 8760 `SHA-512-256`) — the caller skips the
+/// header so a sibling challenge can win.
+fn parse_algorithm_token(s: &str) -> Option<Algorithm> {
+    match s.trim().trim_matches('"').to_ascii_lowercase().as_str() {
+        "md5" => Some(Algorithm::Md5),
+        "md5-sess" => Some(Algorithm::Md5Sess),
+        "sha-256" | "sha256" => Some(Algorithm::Sha256),
+        "sha-256-sess" | "sha256-sess" => Some(Algorithm::Sha256Sess),
+        "sha-512" | "sha512" => Some(Algorithm::Sha512),
+        "sha-512-sess" | "sha512-sess" => Some(Algorithm::Sha512Sess),
+        _ => None,
+    }
+}
+
+/// Manual fallback parse of a `Digest k=v, k=v, …` challenge value.
+fn parse_challenge_value(raw: &str, proxy: bool) -> Option<Challenge> {
+    let rest = raw.trim();
+    if rest.len() < 6 || !rest[..6].eq_ignore_ascii_case("digest") {
+        return None;
+    }
+    let rest = &rest[6..];
+
+    // Split on commas outside double quotes.
+    let mut params: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    for c in rest.chars() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                cur.push(c);
+            }
+            ',' if !in_quotes => {
+                params.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() {
+        params.push(cur);
+    }
+
+    let mut realm = None;
+    let mut nonce = None;
+    let mut qop = None;
+    let mut algorithm = Algorithm::Md5; // absent param = MD5 (RFC 7616)
+    let mut opaque = None;
+    for p in &params {
+        let Some((k, v)) = p.split_once('=') else {
+            continue;
+        };
+        let v = v.trim().trim_matches('"');
+        match k.trim().to_ascii_lowercase().as_str() {
+            "realm" => realm = Some(v.to_string()),
+            "nonce" => nonce = Some(v.to_string()),
+            "opaque" => opaque = Some(v.to_string()),
+            "algorithm" => algorithm = parse_algorithm_token(v)?,
+            "qop" => {
+                let opts: Vec<&str> = v.split(',').map(str::trim).collect();
+                qop = if opts.iter().any(|o| o.eq_ignore_ascii_case("auth")) {
+                    Some(Qop::Auth)
+                } else if opts.iter().any(|o| o.eq_ignore_ascii_case("auth-int")) {
+                    Some(Qop::AuthInt)
+                } else {
+                    None
+                };
+            }
+            _ => {}
+        }
+    }
+    Some(Challenge {
+        realm: realm?,
+        nonce: nonce?,
+        qop,
+        algorithm,
+        opaque,
+        proxy,
+    })
 }
 
 /// A monotonic, collision-free token for Call-ID / tags / branches / cnonce.
@@ -1307,6 +1404,28 @@ mod tests {
         assert_eq!(ch.nonce, "abc");
         assert!(!ch.proxy);
         assert!(matches!(ch.qop, Some(Qop::Auth)));
+    }
+
+    #[test]
+    fn sha256_challenge_answered_with_sha256() {
+        // AUD6-5 (§3): the client echoes the registrar's challenged
+        // algorithm — a SHA-256 challenge gets a SHA-256 response;
+        // the MD5 default applies ONLY when the challenge omits the
+        // algorithm param (which RFC 7616 defines as MD5).
+        let raw = "SIP/2.0 401 Unauthorized\r\n\
+             Via: SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bKx\r\n\
+             From: <sip:alice@sip.example.com>;tag=t\r\n\
+             To: <sip:alice@sip.example.com>;tag=s\r\n\
+             Call-ID: cid\r\n\
+             CSeq: 1 REGISTER\r\n\
+             WWW-Authenticate: Digest realm=\"asterisk\", nonce=\"abc\", algorithm=SHA-256, qop=\"auth\"\r\n\
+             Content-Length: 0\r\n\r\n";
+        let resp = rsip::Response::try_from(raw.as_bytes()).unwrap();
+        let ch = parse_challenge(&resp).expect("challenge");
+        assert!(matches!(ch.algorithm, Algorithm::Sha256));
+        let value = authorization_value(&sample_account(), &ch, "abc123", 1).unwrap();
+        assert!(value.contains("algorithm=SHA-256"));
+        assert!(!value.contains("algorithm=MD5"));
     }
 
     #[test]

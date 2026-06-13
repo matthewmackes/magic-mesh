@@ -1,9 +1,9 @@
-//! Serde schema for `~/.config/mackes-panel/panel.toml`.
+//! Serde schema for `~/.config/mde/panel.toml`.
 //!
-//! Per the 50-question lock (Q18–Q22), this file lives in TOML, is mesh-
-//! replicated whole-file via QNM-Shared, and is hot-reloaded by inotify
-//! diff-and-apply. This crate carries the schema only — I/O and inotify
-//! watching live in `mackes-panel`.
+//! Per the 50-question lock (Q18–Q22), this file lives in TOML and is
+//! mesh-replicated whole-file via QNM-Shared. This crate carries the
+//! schema only — I/O lives in the consumer (`mde-workbench`'s
+//! panel-apps editor).
 
 #![forbid(unsafe_code)]
 

@@ -229,8 +229,7 @@ mod tests {
     fn strength_rank_orders_none_128_then_floor_pair() {
         assert!(EncryptionKind::None.strength_rank() < EncryptionKind::Aes128Gcm.strength_rank());
         assert!(
-            EncryptionKind::Aes128Gcm.strength_rank()
-                < EncryptionKind::Aes256Gcm.strength_rank()
+            EncryptionKind::Aes128Gcm.strength_rank() < EncryptionKind::Aes256Gcm.strength_rank()
         );
         assert_eq!(
             EncryptionKind::Aes256Gcm.strength_rank(),

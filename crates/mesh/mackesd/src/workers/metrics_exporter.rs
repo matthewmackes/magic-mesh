@@ -380,8 +380,16 @@ fn worker_counters(map: &crate::workers::WorkerStatusMap) -> Vec<Counter> {
         labels: BTreeMap::new(),
     };
     vec![
-        mk("mackesd_workers_alive", "Workers currently alive", u64::from(alive)),
-        mk("mackesd_workers_total", "Workers spawned this daemon lifetime", u64::from(total)),
+        mk(
+            "mackesd_workers_alive",
+            "Workers currently alive",
+            u64::from(alive),
+        ),
+        mk(
+            "mackesd_workers_total",
+            "Workers spawned this daemon lifetime",
+            u64::from(total),
+        ),
         mk(
             "mackesd_breaker_tripped",
             "ENT-6 circuit-breaker trips (worker stays down until restart)",
@@ -399,10 +407,9 @@ const DISK_WARN_FREE_PCT: u64 = 10;
 fn disk_counters(path: &std::path::Path) -> Vec<Counter> {
     let mut cmd = std::process::Command::new("df");
     cmd.arg("-B1").arg("--output=avail,pcent").arg(path);
-    let Ok(out) = crate::workers::proc::output_with_timeout(
-        cmd,
-        crate::workers::proc::DEFAULT_CMD_TIMEOUT,
-    ) else {
+    let Ok(out) =
+        crate::workers::proc::output_with_timeout(cmd, crate::workers::proc::DEFAULT_CMD_TIMEOUT)
+    else {
         return Vec::new();
     };
     if !out.status.success() {
@@ -529,11 +536,8 @@ mod tests {
 
     #[test]
     fn worker_name_matches_tier_table() {
-        let w = MetricsExporterWorker::new(
-            PathBuf::from("/tmp/db"),
-            PathBuf::from("/tmp/tf"),
-            None,
-        );
+        let w =
+            MetricsExporterWorker::new(PathBuf::from("/tmp/db"), PathBuf::from("/tmp/tf"), None);
         assert_eq!(w.name(), "metrics_exporter");
     }
 

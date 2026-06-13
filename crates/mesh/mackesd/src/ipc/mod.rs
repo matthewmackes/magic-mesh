@@ -1,24 +1,20 @@
-//! v2.0.0 Phase A.3 (locked 2026-05-19) — DBus surface served by
-//! `mackesd` (and one cross-process consumer at `mackes-session`).
+//! mackesd's IPC surface — **Mackes Bus responders, not D-Bus
+//! services** (EPIC-RETIRE-DBUS / §2: the MDE-private
+//! `org.mackes.*` session-bus services this module once served
+//! were retired to `mde-bus` `action/<domain>/<verb>` topics;
+//! only FDO interop remains anywhere in the tree, and under the
+//! E11 pivot Cosmic owns `org.freedesktop.Notifications`).
 //!
-//! Five services live on the session bus:
+//! What lives here now:
+//! - `bus_bridge` — bridges FDO `Notify` calls into `mde-bus
+//!   publish` (client side; BUS-4.4).
+//! - `directory` / `fleet` / `jobs` / `files` / `nebula` /
+//!   `shell` / `settings` — Bus responder + record-shape modules
+//!   consumed by `run_serve` and the workers.
 //!
-//! | Object path                | Interface                          | Owner       |
-//! |----------------------------|------------------------------------|-------------|
-//! | `/org/mackes/Shell`        | `org.mackes.Shell`                 | mackesd     |
-//! | `/org/mackes/Settings`     | `org.mackes.Settings`              | mackesd     |
-//! | `/org/freedesktop/Notifications` | `org.freedesktop.Notifications` | mackesd     |
-//! | `/org/mackes/Session`      | `org.mackes.Session`               | mackes-session |
-//! | `/org/mackes/Fleet`        | `org.mackes.Fleet`                 | mackesd     |
-//!
-//! Phase A scaffolded the service structs with `#[interface]`
-//! decoration in place; Phase B + C filled in the handler bodies,
-//! so the historical `UNIMPLEMENTED` placeholder has been retired
-//! and every dispatch path returns either a real value or `()`.
-//!
-//! `Notifications` deliberately matches the spec object path
-//! `/org/freedesktop/Notifications` so existing apps (notify-send,
-//! libnotify, etc.) reach mackesd transparently.
+//! (The mackesd-side FDO Notifications *server* scaffolding and
+//! the `org.mackes.mackesd` well-known-name constant were removed
+//! 2026-06-13, AUD6-3/4 — zero production callers.)
 
 #![cfg(feature = "async-services")]
 // zbus's #[interface] macro expands to additional dispatch methods
@@ -36,7 +32,6 @@ pub mod jobs;
 // Foundation that NF-10..NF-18 desktop consumers chain on.
 // Reachable from run_serve at boot.
 pub mod nebula;
-pub mod notifications;
 // E4.20 (2026-06-04): the `portal` Bus-publish client (action/shell/<verb>) was
 // retired with mde-portal — its only caller (alert_relay's CRITICAL goto) is
 // redundant with the notify-send → notifyd → Action Center path.
@@ -47,10 +42,6 @@ pub mod notifications;
 // name + `/org/mackes/Session` path were removed with it.
 pub mod settings;
 pub mod shell;
-
-/// Convenience: the well-known bus name mackesd registers on the
-/// session bus.
-pub const MACKESD_BUS_NAME: &str = "org.mackes.mackesd";
 
 /// EFF-23 — maximum inbound RPC body size a Bus responder will hand to
 /// `serde_json::from_str`. Bodies above this are answered with an error

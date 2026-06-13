@@ -235,9 +235,7 @@ fn playbooks_root() -> PathBuf {
 /// yet → `Ok(vec![])`); an EXISTING dir we cannot read (bad
 /// permissions, stale mount, I/O error) is a load FAILURE →
 /// `Err(String)`.
-pub async fn enumerate_role_dirs_result(
-    dir: &std::path::Path,
-) -> Result<Vec<String>, String> {
+pub async fn enumerate_role_dirs_result(dir: &std::path::Path) -> Result<Vec<String>, String> {
     let mut rd = match tokio::fs::read_dir(dir).await {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),

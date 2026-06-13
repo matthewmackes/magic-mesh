@@ -1237,10 +1237,7 @@ impl State {
         }
 
         let lyrics: Element<'_, Message> = if self.maxi_lyrics.is_empty() {
-            text("No lyrics for this track")
-                .size(13)
-                .colr(muted)
-                .into()
+            text("No lyrics for this track").size(13).colr(muted).into()
         } else {
             let mut col = column![].spacing(2);
             for line in &self.maxi_lyrics {

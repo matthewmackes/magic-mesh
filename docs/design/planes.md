@@ -87,7 +87,7 @@ reconciliation); stored as versioned dirs + TOML manifests on LizardFS (W55).
 (W56); one image carries all profiles, **boot-menu choice** at install (W57);
 **auto-join**: single-use bearer baked in, firstboot enrolls + pins + tags (W60).
 Bootstrap v1 = USB/ISO only, PXE deferred (W59). **Node roles panel** (role pins +
-tag editor) lives here (W58). **Mirrors**: magic-mesh COPR (W61); **every node serves
+tag editor) lives here (W58). **Mirrors**: the magic-mesh GitHub-hosted dnf repo (W61, ex-COPR); **every node serves
 itself** — dnf reads the LizardFS mount via `file://` baseurl, no HTTP tier (W62);
 sync = scheduled job, one puller, LizardFS replicates (W63).
 

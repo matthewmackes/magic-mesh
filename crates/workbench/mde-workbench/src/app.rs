@@ -1224,16 +1224,15 @@ impl App {
         // here once for every panel, replacing the per-panel
         // `Padding::new(0.0)` no-op wrappers. Density-aware via
         // `panel_chrome::outer_padding`.
-        let main =
-            column![page_heading, body]
-                // CV-3 — density-aware gap (space.lg), in step with the
-                // density-aware outer padding below.
-                .spacing(crate::panel_chrome::column_gap(
-                    crate::live_theme::tokens().density,
-                ))
-                .padding(crate::panel_chrome::outer_padding(
-                    crate::live_theme::tokens().density,
-                ));
+        let main = column![page_heading, body]
+            // CV-3 — density-aware gap (space.lg), in step with the
+            // density-aware outer padding below.
+            .spacing(crate::panel_chrome::column_gap(
+                crate::live_theme::tokens().density,
+            ))
+            .padding(crate::panel_chrome::outer_padding(
+                crate::live_theme::tokens().density,
+            ));
 
         let layout = row![
             sidebar,

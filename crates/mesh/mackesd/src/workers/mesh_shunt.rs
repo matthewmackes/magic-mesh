@@ -193,5 +193,4 @@ mod tests {
         std::fs::write(phones_dir(root).join("README.txt"), "hi").unwrap();
         assert!(collect_synthetic(root, "pine", 1).is_empty());
     }
-
 }

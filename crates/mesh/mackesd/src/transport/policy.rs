@@ -225,7 +225,9 @@ fn merge(system: PolicyFile, user: PolicyFile) -> PolicyFile {
         pinned_primary: user.pinned_primary.or(system.pinned_primary),
         denylist: user.denylist.or(system.denylist),
         plugins: user.plugins.or(system.plugins),
-        min_content_encryption: user.min_content_encryption.or(system.min_content_encryption),
+        min_content_encryption: user
+            .min_content_encryption
+            .or(system.min_content_encryption),
     }
 }
 
@@ -258,10 +260,11 @@ impl PolicyFile {
             // weaken the floor on a typo).
             min_content_encryption: match self.min_content_encryption {
                 None => baseline.scorer.min_content_encryption,
-                Some(s) => serde_json::from_value(serde_json::Value::String(s.clone()))
-                    .map_err(|_| PolicyError::UnknownTransportKind(format!(
-                        "min_content_encryption: {s}"
-                    )))?,
+                Some(s) => {
+                    serde_json::from_value(serde_json::Value::String(s.clone())).map_err(|_| {
+                        PolicyError::UnknownTransportKind(format!("min_content_encryption: {s}"))
+                    })?
+                }
             },
         };
         let plugins = self.plugins.unwrap_or_default();

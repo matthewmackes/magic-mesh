@@ -545,8 +545,9 @@ fn systemctl_reload(unit: &str) -> Result<(), String> {
     // EFF-20 — bound systemctl so a hung reload can't pin the tick.
     let mut cmd = std::process::Command::new("systemctl");
     cmd.args(["reload-or-restart", unit]);
-    let out = crate::workers::proc::output_with_timeout(cmd, crate::workers::proc::DEFAULT_CMD_TIMEOUT)
-        .map_err(|e| format!("systemctl reload-or-restart {unit}: {e}"))?;
+    let out =
+        crate::workers::proc::output_with_timeout(cmd, crate::workers::proc::DEFAULT_CMD_TIMEOUT)
+            .map_err(|e| format!("systemctl reload-or-restart {unit}: {e}"))?;
     if out.status.success() {
         Ok(())
     } else {
@@ -820,7 +821,10 @@ mod tests {
                         [web]\n    bind to = 0.0.0.0\n    mode = static-threaded\n";
         let web = build_web_block(Some("10.42.0.7"));
         let out = rewrite_named_section(existing, "[web]", Some(&web));
-        assert!(!out.contains("0.0.0.0"), "wildcard bind must be gone: {out}");
+        assert!(
+            !out.contains("0.0.0.0"),
+            "wildcard bind must be gone: {out}"
+        );
         assert!(out.contains("bind to = 127.0.0.1 10.42.0.7"));
         assert!(out.contains("[global]"));
         // Idempotent: re-running over the rewritten conf is a no-op.

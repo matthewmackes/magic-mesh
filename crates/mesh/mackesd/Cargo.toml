@@ -400,6 +400,16 @@ nebula = "*"
 # (weak deps on), and `--setopt=install_weak_deps=False` opts out.
 [package.metadata.generate-rpm.recommends]
 ansible-core = "*"
+# AUD6-6 — the shipped (disabled, operator-enabled per EFF-43)
+# kamailio-mde/rtpengine-mde units ExecStart these external binaries;
+# without them `systemctl start kamailio-mde` fails silently. Weak deps
+# so a default install carries them, opt-out-able like ansible-core.
+kamailio = "*"
+rtpengine = "*"
+# AUD6-14 — the kickstart enables libvirtd; back it with a weak dep so
+# a bare-Fedora spin actually has the daemon the services line names.
+libvirt-daemon-driver-qemu = "*"
+libvirt-daemon-config-network = "*"
 
 # EFF-42 — upgrade continuity: the pre-pivot package name was `mde-core`
 # (the E8-era RPM; see config/daemon.rs's template note). Obsolete it so

@@ -53,10 +53,11 @@ pub struct Edge {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
-    /// Best-case: direct UDP between two peers' WireGuard sockets.
+    /// Best-case: direct UDP between two peers' Nebula sockets
+    /// (hole-punched via the lighthouse).
     NebulaDirect,
-    /// Tailscale's relayed-via-DERP transport (used when direct UDP
-    /// fails NAT traversal).
+    /// Relayed through a Nebula lighthouse/relay node (used when
+    /// direct UDP fails NAT traversal).
     NebulaLighthouseRelay,
     /// HTTPS-tunneled fallback over TCP/443 (per 12.18).
     NebulaHttps443,

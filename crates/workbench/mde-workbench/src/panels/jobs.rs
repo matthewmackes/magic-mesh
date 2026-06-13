@@ -212,9 +212,8 @@ impl JobsPanel {
             async move {
                 let root = workgroup_root();
                 // EFF-45 — both loaders now return Result; first failure wins.
-                let result = load_templates(&root).and_then(|templates| {
-                    load_runs(&root).map(|runs| (templates, runs))
-                });
+                let result = load_templates(&root)
+                    .and_then(|templates| load_runs(&root).map(|runs| (templates, runs)));
                 Message::Loaded(result)
             },
             crate::Message::Jobs,
@@ -439,10 +438,8 @@ impl JobsPanel {
             column![
                 refresh,
                 // CV-3 — density-aware section gap (space.lg).
-                scrollable(
-                    column![tcol, rcol].spacing(crate::panel_chrome::column_gap(density))
-                )
-                .height(Length::Fill)
+                scrollable(column![tcol, rcol].spacing(crate::panel_chrome::column_gap(density)))
+                    .height(Length::Fill)
             ]
             .spacing(16)
             .width(Length::Fill)
