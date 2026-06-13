@@ -284,7 +284,11 @@ impl MeshServicesPanel {
 
 fn unit_row<'a>(u: &'a UnitStatus, palette: Palette) -> Element<'a, crate::Message> {
     let (status_icon, status_color, status_label) = match u.active_state.as_str() {
-        "active" => (Icon::StatusOk, palette.success.into_cosmic_color(), "ACTIVE"),
+        "active" => (
+            Icon::StatusOk,
+            palette.success.into_cosmic_color(),
+            "ACTIVE",
+        ),
         "activating" | "reloading" => (
             Icon::StatusWarning,
             palette.warning.into_cosmic_color(),

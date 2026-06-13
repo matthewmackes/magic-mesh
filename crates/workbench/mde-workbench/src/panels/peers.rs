@@ -1929,7 +1929,9 @@ impl PeersPanel {
                 .size(12)
                 .width(Length::Fixed(100.0))
                 .colr(palette.text_muted.into_cosmic_color()),
-            text(rtt_str).size(12).colr(palette.text.into_cosmic_color()),
+            text(rtt_str)
+                .size(12)
+                .colr(palette.text.into_cosmic_color()),
         ];
         let reach_line = fact("Reachable", if reachable { "yes" } else { "no" }, palette);
         // Honest path classification: measured as overlay; direct-vs-relay +
@@ -1995,8 +1997,11 @@ impl PeersPanel {
             None => {}
             Some(Ok(hops)) => {
                 for h in hops {
-                    trace_block = trace_block
-                        .push(text(h).size(11).colr(palette.text_muted.into_cosmic_color()));
+                    trace_block = trace_block.push(
+                        text(h)
+                            .size(11)
+                            .colr(palette.text_muted.into_cosmic_color()),
+                    );
                 }
             }
             Some(Err(e)) => {
@@ -2050,7 +2055,9 @@ fn device_detail<'a>(
     palette: mde_theme::Palette,
 ) -> Element<'a, crate::Message> {
     let header = row![
-        text(&d.name).size(20).colr(palette.text.into_cosmic_color()),
+        text(&d.name)
+            .size(20)
+            .colr(palette.text.into_cosmic_color()),
         Space::new().width(Length::Fixed(10.0)),
         badge("KDE Connect", palette),
     ]
@@ -2107,7 +2114,9 @@ fn device_detail<'a>(
             .size(12)
             .width(Length::Fixed(100.0))
             .colr(palette.text_muted.into_cosmic_color()),
-        text(battery).size(12).colr(palette.text.into_cosmic_color()),
+        text(battery)
+            .size(12)
+            .colr(palette.text.into_cosmic_color()),
     ];
     let facts = column![
         fact(

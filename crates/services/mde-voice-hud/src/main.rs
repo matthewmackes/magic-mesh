@@ -72,8 +72,8 @@ const WIDTH: u32 = 420;
 /// VOIP-27 §2.5 size lock — cozy density default.
 const HEIGHT: u32 = 720;
 /// VOIP-27 §2.5 margin lock: right=16 px, bottom=56 px (over
-/// dock clearance). `LayerShellSettings::margin` order is
-/// `(top, right, bottom, left)` per iced_layershell convention.
+/// dock clearance). Applied via the fork's `IcedMargin`
+/// (top/right/bottom/left) in `boot_surface` (CUT-2).
 const MARGIN_RIGHT: i32 = 16;
 const MARGIN_BOTTOM: i32 = 56;
 
@@ -105,17 +105,11 @@ fn account_initials(name: &str) -> String {
     }
 }
 
-/// Iced application messages. `#[to_layer_message]` derives the
-/// `TryInto<LayershellCustomActions>` bound that the
-/// iced_layershell 0.18 builder requires; the attribute also
-/// adds variants for layer-shell actions (size, anchor, margin
-/// changes etc.) which we don't use directly here but the
-/// runtime expects to exist.
-// The `to_layer_message` proc-macro injects layer-shell-specific
-// variants (size / anchor / margin / etc.) onto the enum but
-// doesn't propagate the hand-written doc comments. Allow-list
-// scoped to the enum keeps the macro-side warnings quiet while
-// preserving the doc requirement on every hand-written variant.
+/// HUD application messages. CUT-2: the surface is a plain
+/// `cosmic::iced::daemon` over the fork's native layer-shell, so
+/// the old `#[to_layer_message]` macro (and its injected
+/// size/anchor/margin action variants, which the HUD never used)
+/// are gone — only these hand-written variants remain.
 #[derive(Debug, Clone)]
 pub enum Message {
     /// Operator typed into the display text-input or clicked a
@@ -135,9 +129,9 @@ pub enum Message {
     /// `Task::done(Message::Exit)` which routes through the
     /// runtime to a graceful exit.
     Escape,
-    /// Sentinel that the runtime uses to flag exit. Currently
-    /// triggers `std::process::exit(0)` since iced_layershell
-    /// 0.18 doesn't expose a clean shutdown API.
+    /// Sentinel that the runtime uses to flag exit. Triggers
+    /// `std::process::exit(0)` — a layer-shell daemon has no
+    /// last-window-closed shutdown signal.
     Exit,
     /// An event from the persistent SIP agent (registration / inbound call).
     Agent(sip::AgentEvent),
@@ -180,7 +174,7 @@ pub struct VoiceHud {
     pub media: Option<media::MediaSession>,
 }
 
-// ── iced_layershell 0.18 builder-pattern functions ──────────────────────────
+// ── cosmic::iced daemon builder functions (CUT-2) ────────────────────────────
 
 fn namespace(_state: &VoiceHud, _id: window::Id) -> String {
     "mde-voice-hud".to_string()
@@ -353,13 +347,6 @@ pub fn update(state: &mut VoiceHud, message: Message) -> Task<Message> {
         Message::CallEnded => {
             // BYE delivered; state is already `Ended`.
         }
-        // `#[to_layer_message]` injects extra variants for
-        // layer-shell control actions (anchor / margin / etc.
-        // changes). VOIP-27 ships idle-state only — no
-        // runtime relayout, so these are unreachable. The
-        // wildcard arm keeps the match exhaustive without
-        // pulling in the LayershellCustomActions imports.
-        _ => {}
     }
     Task::none()
 }

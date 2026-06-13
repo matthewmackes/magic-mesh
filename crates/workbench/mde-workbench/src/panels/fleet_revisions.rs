@@ -12,7 +12,6 @@ use cosmic::Element;
 use mde_theme::{EmptyState, Icon};
 use serde::Deserialize;
 
-
 use crate::controls::{variant_button, ButtonVariant};
 use crate::panel_chrome::{empty_state, panel_container};
 use crate::panels::fleet_settings::run_mackesd;

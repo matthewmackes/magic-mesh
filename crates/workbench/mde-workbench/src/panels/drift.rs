@@ -337,7 +337,11 @@ fn remediation_row<'a>(
     // W42 — surface the auto flag so the operator sees which plans the
     // leader sweep will fire on its own.
     if m.auto {
-        head = head.push(text("AUTO").size(9).colr(palette.warning.into_cosmic_color()));
+        head = head.push(
+            text("AUTO")
+                .size(9)
+                .colr(palette.warning.into_cosmic_color()),
+        );
     }
     head = head.push(Space::new().width(Length::Fill));
 

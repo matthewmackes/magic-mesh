@@ -258,7 +258,9 @@ fn empty_state_card<'a>(
         column![
             icon_widget,
             Space::new().height(Length::Fixed(8.0)),
-            text(heading).size(14).colr(palette.text.into_cosmic_color()),
+            text(heading)
+                .size(14)
+                .colr(palette.text.into_cosmic_color()),
             text(body)
                 .size(11)
                 .colr(palette.text_muted.into_cosmic_color()),

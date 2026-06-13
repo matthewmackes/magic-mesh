@@ -9,7 +9,6 @@ use std::sync::Arc;
 use cosmic::iced::widget::{column, pick_list, row, text, text_input};
 use cosmic::iced::{Element, Length, Task};
 
-
 use crate::controls::{variant_button, ButtonVariant};
 
 use crate::backend::Backend;

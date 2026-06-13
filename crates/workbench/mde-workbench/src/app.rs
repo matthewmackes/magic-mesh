@@ -776,22 +776,15 @@ impl App {
         Subscription::batch(subs)
     }
 
-    fn title(&self) -> String {
-        format!("MDE Workbench — {}", page_title(self.view))
-    }
-
-    #[allow(clippy::unused_self)]
-    fn theme(&self) -> cosmic::iced::Theme {
-        // UX-3 — Iced framework palette is derived from the
-        // locked `mde_theme::Palette` so every widget that defers
-        // to the theme (default backgrounds, text, primary
-        // buttons) renders with Q-locked indigo + Q-locked
-        // charcoal instead of Iced's stock dark navy. Widget-
-        // level deep restyling is the scope of UX-4..UX-9; this
-        // step alone moves the workbench's base surface onto the
-        // MDE identity.
-        mde_workbench_iced_theme()
-    }
+    // CUT-1 (2026-06-13): the iced-era inherent `title()` + `theme()` were
+    // removed. Under cosmic::Application the window title is set via
+    // `set_header_title` in `init` (the cosmic headerbar is suppressed and the
+    // custom `header::view` renders the live `page_title`), and the base theme
+    // is the user's COSMIC theme + the explicit Carbon styling every panel
+    // applies through `cosmic_compat`/`panel_chrome` — the same pattern as the
+    // mde-files port (cosmic::Application::theme returns cosmic::Theme, which
+    // the old iced-Theme helper cannot supply). `mde_workbench_iced_theme()` is
+    // retained as the §4 Carbon-palette reference its token tests assert.
 
     /// Apply a [`Message`] to the state. Returns [`Task::none`]
     /// for synchronous variants; panel messages fan out into
@@ -2072,11 +2065,12 @@ mod tests {
     }
 
     #[test]
-    fn title_includes_active_page() {
+    fn page_title_tracks_active_page() {
+        // CUT-1: the page-aware title now drives the custom header heading via
+        // `page_title(self.view)` (the iced-era window `title()` was removed).
         let mut app = App::new();
         let _ = app.update(Message::SelectGroup(Group::Apps));
-        assert!(app.title().contains("Apps"));
-        assert!(app.title().starts_with("MDE Workbench"));
+        assert!(page_title(app.current_view()).contains("Apps"));
     }
 
     // UX-3 — theme() returns a custom Iced theme derived from

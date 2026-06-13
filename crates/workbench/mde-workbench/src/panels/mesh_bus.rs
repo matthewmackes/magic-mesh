@@ -488,6 +488,30 @@ fn format_relative_time(ms: i64) -> String {
     }
 }
 
+/// Human "time left" for a snooze that expires at `until_unix_ms` (epoch ms).
+/// Wraps [`snooze_remaining_at`] with the wall clock.
+fn snooze_remaining(until_unix_ms: i64) -> String {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    snooze_remaining_at(until_unix_ms, now_ms)
+}
+
+/// Pure core of [`snooze_remaining`]: the remaining-time label at `now_ms`.
+fn snooze_remaining_at(until_unix_ms: i64, now_ms: i64) -> String {
+    let left_s = (until_unix_ms - now_ms) / 1000;
+    if left_s <= 0 {
+        "expired".to_string()
+    } else if left_s < 3600 {
+        format!("{}m left", (left_s / 60).max(1))
+    } else if left_s < 86400 {
+        format!("{}h left", left_s / 3600)
+    } else {
+        format!("{}d left", left_s / 86400)
+    }
+}
+
 async fn load_subs() -> Result<(Vec<String>, Vec<String>), String> {
     let root = bus_root().ok_or_else(|| "no data dir".to_string())?;
     let path = root.join("subs.yaml");
@@ -1660,10 +1684,15 @@ impl MeshBusPanel {
                     } else {
                         format!(" (by @{})", sn.set_by_peer)
                     };
-                    text(format!("{}{}", sn.topic, by))
-                        .size(TypeRole::Caption.size_in(sizes))
-                        .colr(palette.text.into_cosmic_color())
-                        .into()
+                    text(format!(
+                        "{}{} · {}",
+                        sn.topic,
+                        by,
+                        snooze_remaining(sn.until_unix_ms)
+                    ))
+                    .size(TypeRole::Caption.size_in(sizes))
+                    .colr(palette.text.into_cosmic_color())
+                    .into()
                 })
                 .collect();
             column(rows).spacing(4).into()
@@ -1848,6 +1877,17 @@ impl MeshBusPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snooze_remaining_labels() {
+        let now = 1_000_000_000_000_i64;
+        assert_eq!(snooze_remaining_at(now - 5_000, now), "expired");
+        assert_eq!(snooze_remaining_at(now, now), "expired");
+        assert_eq!(snooze_remaining_at(now + 90_000, now), "1m left"); // 1.5 min
+        assert_eq!(snooze_remaining_at(now + 1_800_000, now), "30m left");
+        assert_eq!(snooze_remaining_at(now + 7_200_000, now), "2h left");
+        assert_eq!(snooze_remaining_at(now + 172_800_000, now), "2d left");
+    }
 
     #[test]
     fn default_tab_is_topics() {

@@ -167,7 +167,11 @@ fn file_status_card<'a>(
     palette: Palette,
 ) -> Element<'a, crate::Message, Theme> {
     let (status_icon, status_color, status_label) = if snap.file_exists {
-        (Icon::StatusOk, palette.success.into_cosmic_color(), "PRESENT")
+        (
+            Icon::StatusOk,
+            palette.success.into_cosmic_color(),
+            "PRESENT",
+        )
     } else {
         (
             Icon::StatusWarning,
