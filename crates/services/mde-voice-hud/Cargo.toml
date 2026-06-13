@@ -13,10 +13,11 @@ name = "mde-voice-hud"
 path = "src/main.rs"
 
 [dependencies]
-# Same Iced + iced_layershell pair as crates/mde-popover so the
-# workspace dep tree stays on a single resolution.
-iced            = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "tokio", "advanced", "wayland"] }
-iced_layershell = "0.18"
+# CUT-2 (2026-06-13) — the HUD is a layer-shell Overlay surface; ported off
+# crates.io iced + iced_layershell onto libcosmic's vendored iced fork (the
+# EFF-35 rev) which ships native wlr-layer-shell. This evicts the last
+# crates.io iced from the workspace (→ CUT-3 deny-flip).
+libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "cca48bc29ef7a9f22160c0ab6ba117ab22d1ae87", default-features = false, features = ["tokio", "winit", "wgpu", "a11y", "wayland", "multi-window"] }
 
 # §4 — the HUD's Carbon hex is single-sourced from the mde-theme ramp, not
 # re-typed here. Default features only (no `iced`): we take the `Rgba` ramp

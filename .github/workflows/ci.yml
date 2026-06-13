@@ -102,6 +102,9 @@ jobs:
       - name: libcosmic single-rev lint (EFF-35 / CUT-5)
         run: ./install-helpers/lint-libcosmic-rev.sh
 
+      - name: No-crates.io-iced lint (CUT-3 — GUI is all-libcosmic)
+        run: ./install-helpers/lint-no-cratesio-iced.sh
+
       # NOTE on §1–§4 deeper checks: the Carbon single-source rule (§4) is
       # enforced by the mde-theme token tests above (a palette/metric value
       # changes only with a backing assertion); the substrate locks (§1–§3)

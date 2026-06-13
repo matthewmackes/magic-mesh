@@ -60,19 +60,12 @@ impl fmt::Debug for Rgba {
     }
 }
 
-#[cfg(feature = "iced")]
-impl Rgba {
-    /// Convert to an Iced color value. Available when the `iced`
-    /// feature is enabled.
-    pub fn into_iced_color(self) -> iced_core::Color {
-        iced_core::Color {
-            r: (self.r as f32) / 255.0,
-            g: (self.g as f32) / 255.0,
-            b: (self.b as f32) / 255.0,
-            a: self.a,
-        }
-    }
-}
+// CUT-3 (2026-06-13): the `iced` feature + its crates.io `iced_core` optional
+// dep were removed — the whole GUI is on the libcosmic fork now, and every
+// consumer converts `Rgba` to the fork's `Color` locally (mde-files' `tok()`,
+// the workbench/voice-hud cosmic_compat `into_cosmic_color`). Keeping the
+// crates.io `iced_core` optional dep was the last thing pinning crates.io
+// iced into the lock. (git history has the old `into_iced_color` impl.)
 
 #[cfg(test)]
 mod tests {

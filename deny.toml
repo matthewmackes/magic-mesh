@@ -120,11 +120,14 @@ license-files = []
 
 
 [bans]
-# multiple-versions stays warn: the remaining same-name duplication is
-# crates.io iced 0.14 (workbench/voice-hud/iced-components) vs the
-# libcosmic fork's 0.14 (the four cosmic-native crates) — deliberate
-# until the operator-locked full-libcosmic cutover ports the rest.
-# (EFF-34's iced 0.13 is GONE and hard-banned below.)
+# CUT-3 (2026-06-13): the full-libcosmic cutover is complete — every GUI crate
+# (workbench, voice-hud, files, music, applet, role-chooser) rides the
+# libcosmic fork's vendored iced; crates.io iced + iced_layershell are GONE
+# from the tree. multiple-versions stays `warn` (a large workspace carries
+# dozens of benign transitive version skews — bitflags/hashbrown/getrandom/…;
+# blanket-denying them is impractical). The specific regression CUT-3 guards
+# against — crates.io iced sneaking back — is caught precisely by
+# `install-helpers/lint-no-cratesio-iced.sh` (wired into CI), not by this knob.
 multiple-versions = "warn"
 wildcards = "allow"
 
