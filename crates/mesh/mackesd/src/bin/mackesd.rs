@@ -646,6 +646,54 @@ enum Cmd {
         note: String,
     },
 
+    /// ONBOARD-4 — **the Magic founding verb.** Stand up THIS box as
+    /// the mesh's first lighthouse in one command: mesh-init (pin role,
+    /// mint CA, self-sign, write bundle), generate the self-signed
+    /// `/enroll` endpoint identity, and print a ready-to-paste
+    /// `mackesd join` line whose token embeds the endpoint's cert
+    /// fingerprint + enroll port (token v3). The `nebula-enroll-listener`
+    /// activates on the next `mackesd serve` (the endpoint cert now
+    /// exists).
+    Found {
+        /// Mesh id (e.g. `home-mesh`).
+        mesh_id: String,
+        /// This lighthouse's externally-dialable IPv4. `auto` (default)
+        /// detects the primary outbound IP — operators behind NAT pass
+        /// the public IP explicitly.
+        #[arg(long, default_value = "auto")]
+        external_addr: String,
+        /// Role to pin when unpinned (lighthouse|server|workstation).
+        #[arg(long, default_value = "lighthouse")]
+        role: String,
+        /// Override the `/enroll` HTTPS port the token advertises.
+        #[arg(long)]
+        enroll_port: Option<u16>,
+    },
+
+    /// ONBOARD-4 — **the Magic joining verb.** Join an existing mesh in
+    /// one command: pin the role, network-enroll against the
+    /// lighthouse's `/enroll` endpoint over TLS pinned to the token's
+    /// fingerprint (fixes MESH-1 — no QNM-Shared pre-mount), and
+    /// materialize `/etc/nebula`. Run `mackesd serve` afterwards to
+    /// bring up the overlay. With no token, launches the enrollment TUI
+    /// (ONBOARD-5).
+    Join {
+        /// The v3 join token printed by `mackesd found`
+        /// (`mesh:<id>@<ip>:<port>#<bearer>?fp=<sha256>`). Omit to
+        /// launch the TUI.
+        token: Option<String>,
+        /// Role to pin when unpinned (lighthouse|server|workstation).
+        #[arg(long, default_value = "workstation")]
+        role: String,
+        /// Optional display name; defaults to the system hostname.
+        #[arg(long)]
+        name: Option<String>,
+        /// Override the workgroup root (`$QNM_SHARED_ROOT` or
+        /// `~/QNM-Shared`).
+        #[arg(long, env = "QNM_SHARED_ROOT")]
+        workgroup_root: Option<PathBuf>,
+    },
+
     /// PD-1 (Q23/W27) — the joined peer directory: every known peer
     /// with presence tier, health, version, overlay ip/role, and
     /// revision currency — the same record `action/mesh/directory`
@@ -3601,6 +3649,22 @@ fn main() -> anyhow::Result<()> {
                 "single-use token minted (ENT-1) — run on the joining box:\n  mackesd enroll --token 'mesh:{mesh_id}@{lh}#{bearer}'"
             );
             return Ok(());
+        }
+        Cmd::Found {
+            mesh_id,
+            external_addr,
+            role,
+            enroll_port,
+        } => {
+            return cmd_found(&db_path, &mesh_id, &external_addr, &role, enroll_port);
+        }
+        Cmd::Join {
+            token,
+            role,
+            name,
+            workgroup_root,
+        } => {
+            return cmd_join(token, &role, name, workgroup_root);
         }
         Cmd::Peers { json } => {
             // PD-1 — the joined directory, CLI face.
@@ -6786,6 +6850,218 @@ fn write_voice_config_files(
             )
         })?;
     }
+    Ok(())
+}
+
+/// ONBOARD-4 — detect the primary outbound IPv4 by opening a UDP
+/// socket "to" a public address and reading back the kernel-chosen
+/// source IP. No packets are sent (UDP connect only sets the route);
+/// works offline as long as a default route exists. Behind NAT this
+/// is the LAN IP — operators pass `--external-addr <public-ip>`
+/// explicitly when the lighthouse sits behind NAT.
+fn detect_primary_ipv4() -> anyhow::Result<String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0")
+        .map_err(|e| anyhow::anyhow!("bind probe socket: {e}"))?;
+    // 198.51.100.1 is TEST-NET-2 (RFC 5737) — never routed, but the
+    // connect still resolves the default-route source address.
+    sock.connect("198.51.100.1:9")
+        .map_err(|e| anyhow::anyhow!("no default route to detect a primary IP: {e}"))?;
+    let local = sock
+        .local_addr()
+        .map_err(|e| anyhow::anyhow!("read local addr: {e}"))?;
+    Ok(local.ip().to_string())
+}
+
+/// ONBOARD-4 — the `found` verb. One-command founding lighthouse:
+/// mesh-init + `/enroll` endpoint identity + a v3 join line.
+fn cmd_found(
+    db_path: &std::path::Path,
+    mesh_id: &str,
+    external_addr: &str,
+    role: &str,
+    enroll_port: Option<u16>,
+) -> anyhow::Result<()> {
+    use mackesd_core::nebula_enroll_endpoint::{generate_endpoint_identity, DEFAULT_ENROLL_PORT};
+    use mackesd_core::workers::nebula_enroll_listener::{DEFAULT_CERT_PATH, DEFAULT_KEY_PATH};
+
+    let parsed: mde_role::Role = role.parse().map_err(|_| {
+        anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
+    })?;
+    // Resolve the externally-dialable IPv4 (strip any :port the operator
+    // included; `auto` detects the primary outbound IP).
+    let ip = if external_addr.eq_ignore_ascii_case("auto") {
+        detect_primary_ipv4()?
+    } else {
+        external_addr
+            .rsplit_once(':')
+            .map_or(external_addr, |(host, _)| host)
+            .to_string()
+    };
+    let enroll_port = enroll_port.unwrap_or(DEFAULT_ENROLL_PORT);
+
+    let conn = mackesd_core::store::open(db_path)
+        .with_context(|| format!("opening store at {}", db_path.display()))?;
+    mackesd_core::store::migrate(&conn).context("migrating store")?;
+    let root = mackesd_core::default_qnm_shared_root();
+    let node_id = default_node_id();
+
+    // Generate + persist the self-signed `/enroll` endpoint identity
+    // BEFORE printing the token (the token pins its fingerprint). The
+    // key lands at 0600.
+    let identity = generate_endpoint_identity(&[ip.clone()])
+        .map_err(|e| anyhow::anyhow!("generating /enroll endpoint identity: {e}"))?;
+    let cert_path = std::path::Path::new(DEFAULT_CERT_PATH);
+    if let Some(dir) = cert_path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    std::fs::write(cert_path, identity.cert_pem.as_bytes())
+        .with_context(|| format!("writing {DEFAULT_CERT_PATH}"))?;
+    std::fs::write(DEFAULT_KEY_PATH, identity.key_pem.as_bytes())
+        .with_context(|| format!("writing {DEFAULT_KEY_PATH}"))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(DEFAULT_KEY_PATH, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 600 {DEFAULT_KEY_PATH}"))?;
+    }
+
+    // mesh-init: pin role, mint CA, self-sign, write the founding bundle,
+    // and mint the first single-use bearer.
+    let report = mackesd_core::mesh_init::mesh_init(
+        &mackesd_core::ca::SubprocessBackend,
+        &conn,
+        &root,
+        &node_id,
+        mesh_id,
+        &format!("{ip}:4242"),
+        std::path::Path::new("/var/lib/mackesd/nebula-ca/ca.crt"),
+        std::path::Path::new("/var/lib/mackesd/nebula-ca/ca.key"),
+        std::path::Path::new("/var/lib/mackesd/nebula-ca/scratch"),
+        parsed,
+    )?;
+
+    // Re-express mesh-init's freshly-minted bearer as a v3 token that
+    // points at the PUBLIC ip + enroll port and pins the endpoint fp.
+    let legacy = mackesd_core::nebula_enroll::parse_join_token(&report.join_token)
+        .ok_or_else(|| anyhow::anyhow!("mesh-init returned an unparseable join token"))?;
+    let v3 = mackesd_core::nebula_enroll::JoinToken {
+        mesh_id: mesh_id.to_string(),
+        lighthouse: ip.clone(),
+        port: enroll_port,
+        bearer: legacy.bearer,
+        fp: Some(identity.fingerprint.clone()),
+    };
+    let join_token = v3.encode();
+
+    // Best-effort overlay bring-up (the supervisor also does this on serve).
+    let _ = std::process::Command::new("systemctl")
+        .args(["start", "nebula.service"])
+        .status();
+
+    println!(
+        "mesh `{}` founded — lighthouse {} ({})",
+        report.mesh_id, node_id, report.overlay_ip
+    );
+    if let Some(r) = &report.pinned_role {
+        println!("role pinned: {r}");
+    }
+    println!(
+        "/enroll endpoint: https://{ip}:{enroll_port}  (cert fp {})",
+        identity.fingerprint
+    );
+    println!("bundle: {}", report.bundle_path.display());
+    println!("\nAdd a peer — run this on the joining box:\n  mackesd join '{join_token}'");
+    println!(
+        "\nStart serving (activates the /enroll listener):\n  sudo systemctl restart mackesd   # or: mackesd serve"
+    );
+    Ok(())
+}
+
+/// ONBOARD-4 — the `join` verb. One-command peer join: pin role +
+/// fingerprint-pinned network-enroll + materialize /etc/nebula.
+fn cmd_join(
+    token: Option<String>,
+    role: &str,
+    name: Option<String>,
+    workgroup_root: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    // No token → hand off to the enrollment TUI (ONBOARD-5, `mde-enroll`).
+    let Some(raw_token) = token else {
+        let launched = std::process::Command::new("mde-enroll").status();
+        return match launched {
+            Ok(s) if s.success() => Ok(()),
+            _ => Err(anyhow::anyhow!(
+                "no token given and the `mde-enroll` TUI isn't on PATH. \
+                 Pass the token from `mackesd found`:\n  mackesd join '<token>'"
+            )),
+        };
+    };
+
+    let parsed: mde_role::Role = role.parse().map_err(|_| {
+        anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
+    })?;
+    let token = mackesd_core::nebula_enroll::parse_join_token(&raw_token).ok_or_else(|| {
+        anyhow::anyhow!("invalid join token (expected mesh:<id>@<ip>:<port>#<bearer>?fp=<sha256>)")
+    })?;
+    let root = workgroup_root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
+    let node_id = default_node_id();
+    let display_name = name.unwrap_or_else(|| {
+        node_id
+            .strip_prefix("peer:")
+            .unwrap_or(&node_id)
+            .to_string()
+    });
+
+    // Pin the role when unpinned (an already-pinned box keeps its role).
+    match mde_role::load() {
+        Ok(existing) => println!("role already pinned: {existing}"),
+        Err(mde_role::LoadError::NotPinned) => {
+            mde_role::pin(parsed).map_err(|e| anyhow::anyhow!("pinning role: {e}"))?;
+            println!("role pinned: {}", parsed.as_str());
+        }
+        Err(e) => anyhow::bail!("reading role: {e}"),
+    }
+
+    if token.fp.is_none() {
+        // No fingerprint → legacy co-located QNM-Shared flow (the network
+        // path requires the pinned fp). Honest fallback, not an error.
+        println!("token has no fingerprint — using the co-located QNM-Shared enroll flow");
+        let outcome = mackesd_core::nebula_enroll::enroll_with_token(
+            &root,
+            &node_id,
+            &display_name,
+            &raw_token,
+        )
+        .map_err(|e| anyhow::anyhow!("enroll: {e}"))?;
+        println!(
+            "enrolled into `{}` as {} (waited {:?})",
+            outcome.mesh_id, outcome.overlay_ip, outcome.waited
+        );
+        return Ok(());
+    }
+
+    // Network enroll (the MESH-1 fix) — runs on a small async runtime.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building async runtime for network enroll")?;
+    let config_dir = std::path::PathBuf::from("/etc/nebula");
+    let bundle = runtime.block_on(mackesd_core::nebula_enroll_client::network_enroll(
+        &root,
+        &config_dir,
+        &node_id,
+        &display_name,
+        token,
+    ))?;
+
+    let _ = std::process::Command::new("systemctl")
+        .args(["start", "nebula.service"])
+        .status();
+
+    println!(
+        "joined `{}` as {} (overlay {})",
+        bundle.mesh_id, node_id, bundle.overlay_ip
+    );
+    println!("\nBring up the overlay:\n  sudo systemctl restart mackesd   # or: mackesd serve");
     Ok(())
 }
 
