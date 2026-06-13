@@ -378,9 +378,93 @@ pub fn parse_latency_cache(raw: &str) -> HashMap<String, Option<f64>> {
         .unwrap_or_default()
 }
 
+/// NET-3 (PD-6/PD-7) — one peer's underlay path, as the `mesh_latency` cache
+/// records it from the Nebula debug-SSH hostmap.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PathInfo {
+    /// `"direct"` / `"relay"` / `"overlay"` (unknown).
+    pub path: String,
+    /// Chosen remote UDP endpoint (`"ip:port"`), when direct.
+    pub endpoint: Option<String>,
+    /// Relay peer this tunnel routes through, when relayed.
+    pub relay_via: Option<String>,
+}
+
+/// Read the host→path map from the same `mesh-latency.json` cache (NET-3).
+/// Missing cache / older snapshot = empty (the trace card falls back to the
+/// honest "overlay" line).
+#[must_use]
+pub fn read_latency_paths() -> HashMap<String, PathInfo> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return HashMap::new();
+    };
+    let path = std::path::PathBuf::from(home).join(".cache/mde/mesh-latency.json");
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    parse_latency_paths(&raw)
+}
+
+/// Parse the snapshot's per-peer path fields (pure).
+#[must_use]
+pub fn parse_latency_paths(raw: &str) -> HashMap<String, PathInfo> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return HashMap::new();
+    };
+    v.get("peers")
+        .and_then(|p| p.as_object())
+        .map(|obj| {
+            obj.iter()
+                .map(|(host, e)| {
+                    let info = PathInfo {
+                        path: e
+                            .get("path")
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("overlay")
+                            .to_string(),
+                        endpoint: e
+                            .get("endpoint")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_string),
+                        relay_via: e
+                            .get("relay_via")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_string),
+                    };
+                    (host.clone(), info)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_latency_paths_reads_direct_and_relay() {
+        let raw = r#"{"checked_at":1,"peers":{
+            "anvil":{"rtt_ms":12.0,"ok":true,"path":"direct","endpoint":"203.0.113.5:4242"},
+            "forge":{"rtt_ms":null,"ok":false,"path":"relay","relay_via":"10.42.0.1"},
+            "pine":{"rtt_ms":9.0,"ok":true,"path":"overlay"}
+        }}"#;
+        let m = parse_latency_paths(raw);
+        assert_eq!(m["anvil"].path, "direct");
+        assert_eq!(m["anvil"].endpoint.as_deref(), Some("203.0.113.5:4242"));
+        assert_eq!(m["forge"].path, "relay");
+        assert_eq!(m["forge"].relay_via.as_deref(), Some("10.42.0.1"));
+        assert_eq!(m["pine"].path, "overlay");
+        assert_eq!(m["pine"].endpoint, None);
+    }
+
+    #[test]
+    fn parse_latency_paths_defaults_overlay_for_old_cache() {
+        // A pre-NET-3 snapshot without path fields reads honestly as overlay.
+        let raw = r#"{"checked_at":1,"peers":{"oak":{"rtt_ms":5.0,"ok":true}}}"#;
+        let m = parse_latency_paths(raw);
+        assert_eq!(m["oak"].path, "overlay");
+    }
 
     fn node(host: &str, presence: &str, rtt: Option<f64>, is_self: bool) -> MapNode {
         MapNode {

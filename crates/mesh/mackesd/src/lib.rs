@@ -120,6 +120,10 @@ pub mod leave;
 pub mod lifecycle;
 pub mod mesh_init;
 pub mod mirrors;
+// NET-INTROSPECT (PD-6/PD-7) — direct-vs-relay tunnel classification via
+// Nebula's loopback debug SSH server. Consumed by nebula_supervisor (renders
+// the sshd block) + mesh_latency (queries + joins the hostmap).
+pub mod nebula_admin;
 pub mod node_key;
 pub mod policy_engine;
 pub mod remediation;

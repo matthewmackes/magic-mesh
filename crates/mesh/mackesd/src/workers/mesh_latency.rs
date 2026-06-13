@@ -51,6 +51,22 @@ pub struct PeerLatency {
     pub rtt_ms: Option<f64>,
     /// Convenience flag — `true` iff `rtt_ms.is_some()`.
     pub ok: bool,
+    /// NET-3 (PD-6/PD-7) — underlay path class from the Nebula debug-SSH
+    /// hostmap: `"direct"` / `"relay"` / `"overlay"` (unknown). Defaults to
+    /// `"overlay"` so an older cache (or a node without the debug SSH) reads
+    /// honestly.
+    #[serde(default = "default_path")]
+    pub path: String,
+    /// The chosen remote UDP endpoint (`"ip:port"`) when the path is direct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// The relay peer this tunnel routes through, when the path is relayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_via: Option<String>,
+}
+
+fn default_path() -> String {
+    "overlay".to_string()
 }
 
 /// One pass of the mesh-latency worker — every peer measured
@@ -170,14 +186,25 @@ async fn sweep_once(
         }));
     }
 
+    // NET-3 (PD-6/PD-7) — one debug-SSH hostmap query for the whole sweep,
+    // joined to each peer by name (the Nebula cert CN == NodeRow.name). Empty
+    // when the debug SSH is unavailable → every peer stays "overlay".
+    let paths = tokio::task::spawn_blocking(crate::nebula_admin::query_tunnels_default)
+        .await
+        .unwrap_or_default();
+
     let mut peers = BTreeMap::new();
     for h in handles {
         if let Ok((name, rtt)) = h.await {
+            let tp = paths.get(&name);
             peers.insert(
                 name,
                 PeerLatency {
                     ok: rtt.is_some(),
                     rtt_ms: rtt,
+                    path: tp.map_or_else(|| "overlay".to_string(), |t| t.kind().to_string()),
+                    endpoint: tp.and_then(|t| t.endpoint.clone()),
+                    relay_via: tp.and_then(|t| t.relay_via.clone()),
                 },
             );
         }
@@ -262,6 +289,9 @@ mod tests {
             PeerLatency {
                 rtt_ms: Some(12.5),
                 ok: true,
+                path: "direct".to_string(),
+                endpoint: Some("203.0.113.5:4242".to_string()),
+                relay_via: None,
             },
         );
         peers.insert(
@@ -269,6 +299,9 @@ mod tests {
             PeerLatency {
                 rtt_ms: None,
                 ok: false,
+                path: "overlay".to_string(),
+                endpoint: None,
+                relay_via: None,
             },
         );
         let snap = LatencySnapshot {

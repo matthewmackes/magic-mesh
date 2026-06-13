@@ -87,6 +87,10 @@ pub struct PeersPanel {
     pub map_view: bool,
     /// PD-7 — host→RTT from the mesh-latency cache.
     pub rtt: std::collections::HashMap<String, Option<f64>>,
+    /// NET-3 (PD-6/PD-7) — host→underlay path (direct/relay/overlay + endpoint
+    /// + relay peer) from the Nebula debug-SSH hostmap, read from the same
+    /// latency cache. Drives the trace card's path line.
+    pub paths: std::collections::HashMap<String, super::peers_map::PathInfo>,
     /// PD-3/L6 — the paired KDE-Connect devices, rendered as their own
     /// "Devices" group in the master list (fetched from
     /// `action/connect/devices` alongside the directory).
@@ -878,6 +882,7 @@ impl PeersPanel {
                 self.map_view = !self.map_view;
                 if self.map_view {
                     self.rtt = super::peers_map::read_latency_cache();
+                    self.paths = super::peers_map::read_latency_paths();
                 } else {
                     // Leaving the map closes any open trace card + stops flow.
                     self.traced_edge = None;
@@ -1934,12 +1939,44 @@ impl PeersPanel {
                 .colr(palette.text.into_cosmic_color()),
         ];
         let reach_line = fact("Reachable", if reachable { "yes" } else { "no" }, palette);
-        // Honest path classification: measured as overlay; direct-vs-relay +
-        // NAT class + endpoints-tried need the Nebula admin socket (not
-        // exposed by the OSS substrate) — never guessed (PD-6).
+        // NET-3 (PD-6/PD-7) — real path classification from the Nebula
+        // debug-SSH hostmap (mesh_latency join). Direct → the chosen remote
+        // endpoint; relay → the relay peer; overlay → still handshaking or the
+        // debug SSH is unavailable (honest, never guessed). NAT class remains
+        // the one datum OSS Nebula doesn't expose.
+        let info = self.paths.get(host);
+        let (path_value, path_note): (String, String) = match info.map(|i| i.path.as_str()) {
+            Some("direct") => (
+                "direct".to_string(),
+                info.and_then(|i| i.endpoint.clone())
+                    .map_or_else(|| "hole-punched".to_string(), |e| format!("endpoint {e}")),
+            ),
+            Some("relay") => (
+                "relayed".to_string(),
+                info.and_then(|i| i.relay_via.clone()).map_or_else(
+                    || "via a lighthouse relay".to_string(),
+                    |r| format!("via {r}"),
+                ),
+            ),
+            _ => (
+                "overlay (tunnelled)".to_string(),
+                "direct/relay pending handshake or debug SSH; NAT class not exposed by OSS Nebula"
+                    .to_string(),
+            ),
+        };
+        // Inline (not `fact`) so the owned path string moves into `text`
+        // rather than being borrowed from this local.
         let path_line = column![
-            fact("Path", "overlay (tunnelled)", palette),
-            text("direct/relay · NAT class · endpoints tried — pending Nebula admin introspection")
+            row![
+                text("Path")
+                    .size(12)
+                    .width(Length::Fixed(100.0))
+                    .colr(palette.text_muted.into_cosmic_color()),
+                text(path_value)
+                    .size(12)
+                    .colr(palette.text.into_cosmic_color()),
+            ],
+            text(path_note)
                 .size(10)
                 .colr(palette.text_muted.into_cosmic_color()),
         ]

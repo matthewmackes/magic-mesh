@@ -335,13 +335,20 @@ pub fn materialize_config(
         &bundle.overlay_ip,
         crate::nebula_topology::exits_validated(workgroup_root),
     );
+    // NET-1 (PD-6/PD-7): append the loopback debug-SSH block so nebula exposes
+    // per-tunnel direct/relay introspection. Empty string (no block) when keys
+    // can't be generated — honest degradation, classification stays "overlay".
+    let sshd = crate::nebula_admin::ensure_and_render_sshd(config_dir);
     let yaml = render_config_yaml_with_routes(bundle, role, blocklist, &routes);
-    write_atomic(&config_dir.join("config.yaml"), yaml.as_bytes())?;
+    write_atomic(
+        &config_dir.join("config.yaml"),
+        format!("{yaml}{sshd}").as_bytes(),
+    )?;
     if role == ConfigRole::Host {
         let lh_yaml = render_lighthouse_config_yaml_with_routes(bundle, &routes);
         write_atomic(
             &config_dir.join("lighthouse-config.yaml"),
-            lh_yaml.as_bytes(),
+            format!("{lh_yaml}{sshd}").as_bytes(),
         )?;
     }
     Ok(())
