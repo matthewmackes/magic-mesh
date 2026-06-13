@@ -114,3 +114,34 @@ Verify-and-light-sweep pass. Cycle-4 fixes re-verified PASS (VV-4 dispatcher_pri
 ## EFF-31 resolved (2026-06-12) — coverage gate made hard
 
 Operator authorized package installs, unblocking the measurement EFF-31 needed. Installed cargo-llvm-cov 0.8.7 and measured the **library-logic** denominator — the 7 iced/libcosmic GUI crates excluded (render code; correctness rests on mde-theme tokens + the lifted visual gate) and the binary entrypoints (`src/bin/*.rs`, `src/main.rs`; ~5.7k integration-level lines in mackesd.rs alone) ignored: **84.84% lines**. Flipped the CI coverage job from advisory (`continue-on-error: true`) to a **hard `--fail-under-lines 80`** gate over that denominator (~5% margin), mackesd at `--test-threads=1`. Coverage can no longer silently rot. EFF-18 remains the sole CI-decision item parked for an operator call.
+
+---
+
+## Cycle 6 (2026-06-13) — "fit for purpose" sweep
+
+Operator-directed lens: *would the product actually work for an arriving operator, end to end?* Four parallel passes (unreachable/stubs/mockups · substrate/crypto/secrets locks · doc drift · fit-for-purpose journeys) + the three governance lints (all clean) + green workspace suite.
+
+**Journeys: all six PASS** — install→first-boot (RPM assets map 1:1 to the 12 workspace binaries; DISCLAIMER gate live), enroll (all 5 documented verbs exist with the quoted flags), daily driving (Front Door = Peers, directory responder live), failure honesty (EFF-45 pattern verified in peers/mesh_storage/profiles/home), systemd units, CLI smoke. **No blocking finding for a real operator.**
+
+### Findings
+
+| # | Location | Category | Evidence | Confidence | Verdict |
+|---|---|---|---|---|---|
+| AUD6-1 | `crates/workbench/mde-workbench/src/panels/mesh_join.rs:165–176` | Secrets (EFF-21 regression) | `run_mackesd_enroll` passes the 16-char passcode as `--passcode <value>` on argv (visible in `/proc/<pid>/cmdline`); `--passcode-stdin` exists and is ignored by this caller | High | FINISH — pipe via `--passcode-stdin` |
+| AUD6-2 | `crates/mesh/mackesd/src/orchestrator.rs` | Unreachable | 522-line Send-To state machine; zero production callers workspace-wide (only a "future epic" comment in `ipc/files.rs`); internal tests only | High | REMOVE |
+| AUD6-3 | `crates/mesh/mackesd/src/ipc/mod.rs:53` + doc table | Dead constant + stale doc | `MACKESD_BUS_NAME = "org.mackes.mackesd"` never referenced; module doc table still lists retired `org.mackes.*` D-Bus services as active (retired to mde-bus, E0.3.5) | High | REMOVE constant + FINISH doc |
+| AUD6-4 | `crates/mesh/mackesd/src/ipc/notifications.rs` | Possibly-dead scaffolding | zbus `#[interface]` for FDO Notifications with no `serve_at` in `run_serve` — verify wiring; REMOVE if dead | Medium | FINISH (verify) |
+| AUD6-5 | `crates/services/mde-voice-hud/src/sip.rs:1249` | Crypto preference | SIP digest default falls back to MD5 (RFC-mandated interop §3 exception) — verify negotiation prefers SHA-256 when the registrar offers it | Medium | FINISH (verify) |
+| AUD6-6 | `packaging/` RPM metadata | Packaging gap | `kamailio-mde.service`/`rtpengine-mde.service` ExecStart external binaries not in `Recommends`; enabling the voice units without them = silent ExecStart failure | High | FINISH — add weak `Recommends` |
+| AUD6-7 | `crates/mesh/mackesd/src/bin/mackesd.rs` | CLI polish | `role-workers` subcommand renders an empty description in `--help` | High | FINISH — add doc comment |
+| AUD6-8 | `crates/workbench/mde-workbench/src/panels/compute.rs` | Failure honesty | first-paint "Loading instances…" has no timeout/error arm (panel probes local hypervisors, not mackesd — EFF-45 N/A but a hung probe shows Loading forever) | Medium | FINISH — error/timeout arm |
+| AUD6-9 | `crates/mesh/mackesd/src/topology/mod.rs:58` | Doc drift (substrate) | `NebulaLighthouseRelay` doc says "Tailscale's relayed-via-DERP transport" — Tailscale copy on a Nebula-native variant | High | FINISH — fix doc |
+| AUD6-10 | README.md (4 spots) | Doc drift | `gtk3-devel` prereq (no GTK dep exists); "sshd overlay-bind" (actual worker is additive, public kept — [[ssh-always-public]]); `mesh-wallpaper` in the crate diagram (bin lives in mde-workbench); "~30 workers" (52 today) | High | FINISH — 4 line fixes |
+| AUD6-11 | Crate headers (5 crates) | Doc drift (pre-pivot heritage) | `mackesd/src/lib.rs` ("linked into mackes-panel", `PROJECT_WORKLIST.md`), `mde-workbench` lib.rs+Cargo.toml ("GTK3 Python Workbench", "mded", `dev.mackes.MDE.Shell.*`), `mackes-config` lib.rs+Cargo.toml ("mackes-panel"), `mackes-mesh-types` lib.rs ("mackes-panel") | High | FINISH — rewrite headers |
+| AUD6-12 | docs/design (4 files) | Doc drift (COPR) | enterprise-readiness.md ("signed COPR", "no unit exists to start any of them at boot" — units ship now), platform-survey-answers.md ("signed COPR" ×2), planes.md ("magic-mesh COPR (W61)"), platform-survey.md Q79 reads as current | High | FINISH — GitHub-repo wording + annotate Q79 |
+| AUD6-13 | `packaging/ENROLLMENT.md` | Doc gap | doesn't state the token embeds the lighthouse address (it does) — operator may hand-carry the IP needlessly | Medium | FINISH — one line |
+| AUD6-14 | `packaging/kickstart/magic-on-cosmic.ks` | Packaging gap | `services --enabled=libvirtd` but libvirt not a Recommends — bare-Fedora Workstation spin may lack it | Low | FINISH — Recommends or drop |
+
+**Counts:** 14 findings — 1 REMOVE, 13 FINISH (1 secrets-hygiene regression, 2 packaging, 2 verify-and-close, 8 doc/polish). Zero stubs, zero mockups, zero substrate/crypto/boundary violations, zero dead workers/panels. Lints clean ×3; workspace suite green.
+
+**Cycle-6 status: FIT FOR PURPOSE with a short punch list.** The one security-relevant item is AUD6-1 (passcode on argv — a caller-side regression against the EFF-21 stdin path). Findings lifted into `docs/WORKLIST.md` as AUD6-*.

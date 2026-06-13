@@ -131,6 +131,25 @@ Lifted from the 2026-06-11 `docs/COMPLIANCE.md` sweep ("audit the platform for f
 - [✓] **AUD5-1 · QA · stale insta snapshot.** EFF-24 added 4 HealthReport fields but committed only the `.snap.new`; `snapshot_health_report_shape` failed at workspace scope. Promoted the accepted snapshot (shape verified against `HealthReport::empty()`).
 - [✓] **AUD5-2 · SEC/QA · audit-chain hash flake (latent).** `events::append_event` + `worker::apply_repair_rows` hashed each row with `now_ms()` but stored `created_at` from a separate `Utc::now()`; `load_audit_rows` reparses created_at to recompute the chain hash, so sub-ms drift spuriously failed `audit::verify` (false tamper alarm). Both now derive created_at from the single now_ms instant. Passed in isolation, failed under load.
 
+## AUDIT-2026-06-13 r6 — cycle-6 "fit for purpose" sweep (open punch list)
+
+All six operator journeys PASS (install→first-boot, enroll, daily driving, failure honesty, units, smoke) — no blocking finding. Punch list, priority order:
+
+- [ ] **AUD6-1 · SEC · passcode on argv (EFF-21 caller regression).** `mesh_join.rs:165–176` `run_mackesd_enroll` passes the 16-char passcode as `--passcode <value>` on argv (`/proc/<pid>/cmdline`-visible); the daemon's `--passcode-stdin` path exists and is ignored. FINISH — pipe via stdin.
+- [ ] **AUD6-2 · DEAD · orchestrator.rs unreachable.** 522-line Send-To state machine in mackesd, zero production callers workspace-wide (only a "future epic" comment in `ipc/files.rs`); internal tests only. REMOVE (git history keeps it for the future epic).
+- [ ] **AUD6-3 · DEAD/DOC · ipc/mod.rs.** `MACKESD_BUS_NAME = "org.mackes.mackesd"` never referenced (delete); module doc table still lists retired `org.mackes.*` D-Bus services as active (rewrite for the mde-bus reality).
+- [ ] **AUD6-4 · VERIFY · ipc/notifications.rs.** zbus FDO-Notifications `#[interface]` with no apparent `serve_at` in `run_serve` — confirm wiring; REMOVE if dead scaffolding.
+- [ ] **AUD6-5 · VERIFY · SIP digest algorithm preference.** `sip.rs:1249` defaults to MD5 (RFC 3261 §3 interop exception) — confirm SHA-256 is preferred when the registrar offers it; fix if not.
+- [ ] **AUD6-6 · PKG · voice externals not Recommends.** `kamailio-mde.service`/`rtpengine-mde.service` ExecStart `/usr/sbin/kamailio`+`/usr/bin/rtpengine` but neither is in generate-rpm Requires/Recommends — enabling the units on a fresh install fails silently. Add weak Recommends (ansible-core pattern).
+- [ ] **AUD6-7 · POLISH · `role-workers` empty help text.** Add the clap doc comment in bin/mackesd.rs.
+- [ ] **AUD6-8 · GUI · compute panel Loading-forever.** First-paint "Loading instances…" has no timeout/error arm (probes local hypervisors directly; EFF-45 N/A) — add a failure arm.
+- [ ] **AUD6-9 · DOC · topology/mod.rs:58.** `NebulaLighthouseRelay` doc says "Tailscale's relayed-via-DERP transport" — Nebula-native variant, fix the copy.
+- [ ] **AUD6-10 · DOC · README 4 fixes.** Drop `gtk3-devel` (no GTK dep); "sshd overlay-bind" → additive (public listener kept); remove `mesh-wallpaper` from the crate diagram (bin lives in mde-workbench); "~30 workers" → ~50.
+- [ ] **AUD6-11 · DOC · pre-pivot crate headers (5 crates).** mackesd lib.rs ("linked into mackes-panel", `PROJECT_WORKLIST.md`); mde-workbench lib.rs+Cargo.toml ("GTK3 Python Workbench", "mded", `dev.mackes.MDE.Shell.*`); mackes-config lib.rs+Cargo.toml ("mackes-panel"); mackes-mesh-types lib.rs ("mackes-panel"). Rewrite for current reality.
+- [ ] **AUD6-12 · DOC · COPR residue in design docs.** enterprise-readiness.md ("signed COPR"; "no unit exists to start any of them at boot" — units ship now), platform-survey-answers.md ×2, planes.md W61, platform-survey.md Q79 (annotate superseded → GitHub-hosted dnf repo, 2026-06-10 decision).
+- [ ] **AUD6-13 · DOC · ENROLLMENT.md.** One line: the token already embeds the lighthouse address — copy it verbatim, no hand-carried IP needed.
+- [ ] **AUD6-14 · PKG · kickstart enables libvirtd without a dep.** `services --enabled=libvirtd` but libvirt isn't a Recommends — add `libvirt-daemon-driver-qemu` as Recommends or drop it from the services line.
+
 ## P0 — Security / substrate lock (urgent)
 
 - [✓] **H1 · RSA-2048 → RSA-4096 KDC device identity (§3)** — done (`a5186c5`); 49/0 green. — `mde-kdc-host/src/pairing.rs:236` `generate_pkcs8()` generates the live `identity.pkcs8` at 2048 bits via `PairingStore::open:101`. Rewire to the compliant 4096 generator that already exists (`keygen.rs:63`, `RSA_MODULUS_BITS=4096`, exported `lib.rs:41`); delete the duplicate 2048 `generate_pkcs8` in `pairing.rs`. Add/confirm a config test asserting 4096. **Do first — a max-crypto lock regression where the correct code already exists, just isn't called.**
