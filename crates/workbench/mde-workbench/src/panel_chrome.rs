@@ -19,11 +19,16 @@
 //! Component dimensions (44 px row, 32 px icon slot) are NOT
 //! density-scaled per UX-24 sub-lock.
 
-use iced::widget::button::Status as ButtonStatus;
-use iced::widget::{button, column, container, row, text, Column, Space};
-use iced::{
-    alignment, Background, Border, Color, Element, Font, Length, Padding, Shadow as IcedShadow,
+use cosmic::iced::widget::button::Status as ButtonStatus;
+use cosmic::iced::widget::{button, column, container, row, text, Column, Space};
+use cosmic::iced::{
+    alignment, Background, Border, Color, Font, Length, Padding, Shadow as IcedShadow,
 };
+// CUT-1: cosmic::Element bakes in cosmic::Theme, matching the theme the
+// .colr()/.sty() compat widgets thread through the tree.
+use cosmic::Element;
+
+use crate::cosmic_compat::prelude::*;
 
 use mde_theme::{
     components::empty_state::{BODY_CTA_GAP, EMPTY_ICON_SIZE, HEADING_BODY_GAP, VERTICAL_PADDING},
@@ -38,7 +43,7 @@ use mde_theme::{
 // Object Cards without taking a heavyweight dep on mde-workbench.
 // Re-exported here so existing workbench call sites stay
 // unchanged.
-pub use mde_iced_components::object_card;
+pub use crate::cosmic_compat::object_card;
 
 /// UX-6 — minimum data-row height. Component dimension, not
 /// density-scaled.
@@ -85,7 +90,7 @@ pub fn section_header<'a, Message: 'a>(
     let sizes = FontSize::defaults();
     text(title.into())
         .size(TypeRole::Section.size_in(sizes))
-        .color(palette.text.into_iced_color())
+        .colr(palette.text.into_cosmic_color())
         .into()
 }
 
@@ -117,12 +122,12 @@ pub fn data_row<'a, Message: 'a + Clone>(
     let sizes = FontSize::defaults();
     let label_text = text(label.into())
         .size(TypeRole::Body.size_in(sizes))
-        .color(palette.text_muted.into_iced_color())
+        .colr(palette.text_muted.into_cosmic_color())
         .align_y(alignment::Vertical::Center)
         .width(Length::FillPortion(40));
     let value_text = text(value.into())
         .size(TypeRole::Body.size_in(sizes))
-        .color(palette.text.into_iced_color())
+        .colr(palette.text.into_cosmic_color())
         .align_y(alignment::Vertical::Center)
         .width(Length::FillPortion(60));
     row![label_text, value_text]
@@ -158,40 +163,40 @@ pub fn status_badge<'a, Message: 'a>(
     let sizes = FontSize::defaults();
     let (bg, fg) = match severity {
         BadgeSeverity::Neutral => (
-            palette.raised.into_iced_color(),
-            palette.text.into_iced_color(),
+            palette.raised.into_cosmic_color(),
+            palette.text.into_cosmic_color(),
         ),
         BadgeSeverity::Success => (
             Color {
                 a: 0.20,
-                ..palette.success.into_iced_color()
+                ..palette.success.into_cosmic_color()
             },
-            palette.success.into_iced_color(),
+            palette.success.into_cosmic_color(),
         ),
         BadgeSeverity::Warning => (
             Color {
                 a: 0.20,
-                ..palette.warning.into_iced_color()
+                ..palette.warning.into_cosmic_color()
             },
-            palette.warning.into_iced_color(),
+            palette.warning.into_cosmic_color(),
         ),
         BadgeSeverity::Danger => (
             Color {
                 a: 0.20,
-                ..palette.danger.into_iced_color()
+                ..palette.danger.into_cosmic_color()
             },
-            palette.danger.into_iced_color(),
+            palette.danger.into_cosmic_color(),
         ),
         BadgeSeverity::Info => (
-            palette.hover_tint().into_iced_color(),
-            palette.accent.into_iced_color(),
+            palette.hover_tint().into_cosmic_color(),
+            palette.accent.into_cosmic_color(),
         ),
     };
 
     container(
         text(label.into())
             .size(TypeRole::Caption.size_in(sizes))
-            .color(fg)
+            .colr(fg)
             .align_y(alignment::Vertical::Center),
     )
     .padding(Padding {
@@ -202,6 +207,7 @@ pub fn status_badge<'a, Message: 'a>(
     })
     .style(move |_theme| container::Style {
         snap: false,
+        icon_color: None,
         background: Some(Background::Color(bg)),
         border: Border {
             color: Color::TRANSPARENT,
@@ -236,14 +242,15 @@ pub fn card<'a, Message: 'a>(
         })
         .style(move |_theme| container::Style {
             snap: false,
-            background: Some(Background::Color(palette.surface.into_iced_color())),
+            icon_color: None,
+            background: Some(Background::Color(palette.surface.into_cosmic_color())),
             border: Border {
-                color: palette.border.into_iced_color(),
+                color: palette.border.into_cosmic_color(),
                 width: 1.0,
                 radius: f32::from(radii.md).into(),
             },
             shadow: mde_shadow_to_iced(MdeShadow::lift()),
-            text_color: Some(palette.text.into_iced_color()),
+            text_color: Some(palette.text.into_cosmic_color()),
         })
         .into()
 }
@@ -283,7 +290,7 @@ pub fn empty_state<'a, Message: Clone + 'a>(
     let body_color = state
         .body_color_override
         .unwrap_or(palette.text_muted)
-        .into_iced_color();
+        .into_cosmic_color();
 
     // UX-8 — render the hero icon when set; otherwise reserve
     // the slot as empty space so the body block centers
@@ -296,21 +303,17 @@ pub fn empty_state<'a, Message: Clone + 'a>(
     let icon_slot: Element<'a, Message> = if let Some(icon) = state.icon {
         let resolved = mde_icon(icon, IconSize::EmptyState);
         if let Some(svg_bytes) = resolved.svg_bytes() {
-            use iced::widget::svg as widget_svg;
-            let muted = palette.text_muted.into_iced_color();
+            use cosmic::iced::widget::svg as widget_svg;
+            let muted = palette.text_muted.into_cosmic_color();
             widget_svg(widget_svg::Handle::from_memory(svg_bytes))
                 .width(Length::Fixed(resolved.size_px()))
                 .height(Length::Fixed(resolved.size_px()))
-                .style(
-                    move |_t: &iced::Theme, _s: widget_svg::Status| widget_svg::Style {
-                        color: Some(muted),
-                    },
-                )
+                .sty(move |_t: &cosmic::Theme| widget_svg::Style { color: Some(muted) })
                 .into()
         } else {
             text(resolved.fallback_glyph)
                 .size(resolved.size_px())
-                .color(palette.text_muted.into_iced_color())
+                .colr(palette.text_muted.into_cosmic_color())
                 .align_x(alignment::Horizontal::Center)
                 .into()
         }
@@ -319,24 +322,24 @@ pub fn empty_state<'a, Message: Clone + 'a>(
     };
     let heading = text(state.heading)
         .size(TypeRole::Heading.size_in(sizes))
-        .color(palette.text.into_iced_color())
+        .colr(palette.text.into_cosmic_color())
         .align_x(alignment::Horizontal::Center);
     let body = text(state.body)
         .size(TypeRole::Body.size_in(sizes))
-        .color(body_color)
+        .colr(body_color)
         .align_x(alignment::Horizontal::Center);
 
-    let mut col: Column<'a, Message> = column![icon_slot, heading, body]
+    let mut col: Column<'a, Message, cosmic::Theme> = column![icon_slot, heading, body]
         .spacing(HEADING_BODY_GAP)
         .align_x(alignment::Horizontal::Center);
 
     if let Some(label) = state.cta_label {
-        let accent_color = palette.accent.into_iced_color();
+        let accent_color = palette.accent.into_cosmic_color();
         let radii = Radii::defaults();
         let cta_button: Element<'a, Message> = button(
             text(label)
                 .size(TypeRole::Body.size_in(sizes))
-                .color(Color::WHITE),
+                .colr(Color::WHITE),
         )
         .padding(Padding {
             top: 8.0,
@@ -345,7 +348,7 @@ pub fn empty_state<'a, Message: Clone + 'a>(
             left: 20.0,
         })
         .on_press(on_cta())
-        .style(move |_theme, status: ButtonStatus| {
+        .sty(move |_theme, status: ButtonStatus| {
             let bg = match status {
                 ButtonStatus::Hovered => brighten(accent_color, 1.10),
                 ButtonStatus::Pressed => brighten(accent_color, 0.90),
@@ -353,8 +356,12 @@ pub fn empty_state<'a, Message: Clone + 'a>(
             };
             button::Style {
                 snap: false,
+                icon_color: None,
                 background: Some(Background::Color(bg)),
                 text_color: Color::WHITE,
+                border_color: Color::TRANSPARENT,
+                border_width: 0.0,
+                border_radius: f32::from(radii.md).into(),
                 border: Border {
                     color: Color::TRANSPARENT,
                     width: 0.0,
@@ -383,8 +390,8 @@ pub fn empty_state<'a, Message: Clone + 'a>(
 
 fn mde_shadow_to_iced(s: MdeShadow) -> IcedShadow {
     IcedShadow {
-        color: s.color.into_iced_color(),
-        offset: iced::Vector::new(s.offset_x, s.offset_y),
+        color: s.color.into_cosmic_color(),
+        offset: cosmic::iced::Vector::new(s.offset_x, s.offset_y),
         blur_radius: s.blur,
     }
 }
@@ -425,14 +432,15 @@ pub fn dialog<'a, Message: 'a>(
         })
         .style(move |_theme| container::Style {
             snap: false,
-            background: Some(Background::Color(palette.raised.into_iced_color())),
+            icon_color: None,
+            background: Some(Background::Color(palette.raised.into_cosmic_color())),
             border: Border {
-                color: palette.border.into_iced_color(),
+                color: palette.border.into_cosmic_color(),
                 width: 1.0,
                 radius: f32::from(radii.sm).into(),
             },
             shadow: mde_shadow_to_iced(MdeShadow::modal()),
-            text_color: Some(palette.text.into_iced_color()),
+            text_color: Some(palette.text.into_cosmic_color()),
         })
         .into()
 }
@@ -447,10 +455,10 @@ pub fn dialog_title_row<'a, Message: 'a>(
         text(title.into())
             .size(dialog_tokens::TITLE_FONT_SIZE)
             .font(Font {
-                weight: iced::font::Weight::Medium,
+                weight: cosmic::iced::font::Weight::Medium,
                 ..Font::DEFAULT
             })
-            .color(palette.text.into_iced_color()),
+            .colr(palette.text.into_cosmic_color()),
     )
     .width(Length::Fill)
     .height(dialog_tokens::TITLE_ROW_HEIGHT)
@@ -527,7 +535,7 @@ pub fn tooltip<'a, Message: 'a>(body: impl Into<String>, palette: Palette) -> El
     container(
         text(body.into())
             .size(TypeRole::Caption.size_in(sizes))
-            .color(palette.text.into_iced_color()),
+            .colr(palette.text.into_cosmic_color()),
     )
     .padding(Padding {
         top: 6.0,
@@ -537,14 +545,15 @@ pub fn tooltip<'a, Message: 'a>(body: impl Into<String>, palette: Palette) -> El
     })
     .style(move |_theme| container::Style {
         snap: false,
-        background: Some(Background::Color(palette.overlay.into_iced_color())),
+        icon_color: None,
+        background: Some(Background::Color(palette.overlay.into_cosmic_color())),
         border: Border {
-            color: palette.border.into_iced_color(),
+            color: palette.border.into_cosmic_color(),
             width: 1.0,
             radius: f32::from(radii.sm).into(),
         },
         shadow: mde_shadow_to_iced(MdeShadow::lift()),
-        text_color: Some(palette.text.into_iced_color()),
+        text_color: Some(palette.text.into_cosmic_color()),
     })
     .into()
 }
@@ -604,14 +613,14 @@ pub fn hero_band<'a, Message: 'a>(
     version: Option<&str>,
     palette: Palette,
 ) -> Element<'a, Message> {
-    let art = iced::widget::svg(iced::widget::svg::Handle::from_memory(hero.svg_bytes()))
-        .width(Length::Fixed(112.0))
-        .height(Length::Fixed(112.0))
-        .style(
-            |_t: &iced::Theme, _s: iced::widget::svg::Status| iced::widget::svg::Style {
-                color: Some(mde_theme::hero::HERO_STROKE.into_iced_color()),
-            },
-        );
+    let art = cosmic::iced::widget::svg(cosmic::iced::widget::svg::Handle::from_memory(
+        hero.svg_bytes(),
+    ))
+    .width(Length::Fixed(112.0))
+    .height(Length::Fixed(112.0))
+    .sty(|_t: &cosmic::Theme| cosmic::iced::widget::svg::Style {
+        color: Some(mde_theme::hero::HERO_STROKE.into_cosmic_color()),
+    });
     let caption = match version {
         Some(v) if !v.is_empty() => v.to_string(),
         _ => "not installed".to_string(),
@@ -620,10 +629,10 @@ pub fn hero_band<'a, Message: 'a>(
         art,
         text(hero.name())
             .size(13)
-            .color(palette.text.into_iced_color()),
+            .colr(palette.text.into_cosmic_color()),
         text(caption.clone())
             .size(11)
-            .color(palette.text_muted.into_iced_color()),
+            .colr(palette.text_muted.into_cosmic_color()),
     ]
     .spacing(2)
     .align_x(alignment::Horizontal::Center);
@@ -636,7 +645,7 @@ pub fn hero_band<'a, Message: 'a>(
         ),
         palette,
     );
-    iced::widget::tooltip(band, card, iced::widget::tooltip::Position::Bottom)
+    cosmic::iced::widget::tooltip(band, card, cosmic::iced::widget::tooltip::Position::Bottom)
         .gap(6.0)
         .into()
 }
@@ -712,7 +721,9 @@ mod tests {
         // fields from outside iced. The motion::dialog module's
         // tests guard the underlying token values directly.
         let palette = crate::live_theme::palette();
-        let body: Element<'_, ()> = iced::widget::text("body").into();
+        let body: Element<'_, ()> = cosmic::iced::widget::text("body")
+            .colr(palette.text.into_cosmic_color())
+            .into();
         let _ = dialog::<()>(body, palette, Density::Comfortable);
         let _: Element<'_, ()> = dialog_backdrop();
         let _ = tooltip::<()>("hi", palette);

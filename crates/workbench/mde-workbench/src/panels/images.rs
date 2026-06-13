@@ -12,9 +12,13 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use iced::widget::{button, column, container, row, scrollable, text, Space};
-use iced::{Background, Border, Color, Element, Length, Padding, Task, Theme};
+use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
+use cosmic::iced::Task;
+use cosmic::iced::{Background, Border, Color, Length, Padding};
+use cosmic::{Element, Theme};
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
+
+use crate::cosmic_compat::prelude::*;
 
 /// One built image under a kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,7 +149,7 @@ impl ImagesPanel {
 
         let title = text("Images")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
         let total: usize = self.rows.iter().map(|r| r.builds.len()).sum();
         let subtitle_text = if self.last_run_at.is_some() {
             format!(
@@ -158,37 +162,43 @@ impl ImagesPanel {
         };
         let subtitle = text(subtitle_text)
             .size(TypeRole::Body.size_in(sizes))
-            .color(palette.text_muted.into_iced_color());
+            .colr(palette.text_muted.into_cosmic_color());
 
-        let accent = palette.accent.into_iced_color();
+        let accent = palette.accent.into_cosmic_color();
         let refresh_btn = button(
             text(if self.busy { "Loading…" } else { "Refresh" })
                 .size(13)
-                .color(Color::WHITE),
+                .colr(Color::WHITE),
         )
         .padding(Padding::from([6u16, 14u16]))
-        .style(move |_t: &Theme, status: iced::widget::button::Status| {
-            let bg = match status {
-                iced::widget::button::Status::Hovered => Color {
-                    r: accent.r * 1.10,
-                    g: accent.g * 1.10,
-                    b: accent.b * 1.10,
-                    a: accent.a,
-                },
-                _ => accent,
-            };
-            iced::widget::button::Style {
-                snap: false,
-                background: Some(Background::Color(bg)),
-                text_color: Color::WHITE,
-                border: Border {
-                    color: Color::TRANSPARENT,
-                    width: 0.0,
-                    radius: 6.0.into(),
-                },
-                shadow: iced::Shadow::default(),
-            }
-        })
+        .sty(
+            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+                let bg = match status {
+                    cosmic::iced::widget::button::Status::Hovered => Color {
+                        r: accent.r * 1.10,
+                        g: accent.g * 1.10,
+                        b: accent.b * 1.10,
+                        a: accent.a,
+                    },
+                    _ => accent,
+                };
+                cosmic::iced::widget::button::Style {
+                    snap: false,
+                    background: Some(Background::Color(bg)),
+                    icon_color: None,
+                    text_color: Color::WHITE,
+                    border_color: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    border_radius: 6.0.into(),
+                    border: Border {
+                        color: Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 6.0.into(),
+                    },
+                    shadow: cosmic::iced::Shadow::default(),
+                }
+            },
+        )
         .on_press(crate::Message::Images(Message::RefreshClicked));
 
         let header = row![
@@ -196,7 +206,7 @@ impl ImagesPanel {
             Space::new().width(Length::Fill),
             refresh_btn,
         ]
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
         let mut rows_col = column![].spacing(6);
         for r in &self.rows {
@@ -211,7 +221,7 @@ impl ImagesPanel {
         } else {
             text(self.build_msg.clone())
                 .size(12)
-                .color(palette.text_muted.into_iced_color())
+                .colr(palette.text_muted.into_cosmic_color())
                 .into()
         };
 
@@ -233,41 +243,36 @@ impl ImagesPanel {
 }
 
 fn kind_row<'a>(r: &'a ImageKindRow, palette: Palette) -> Element<'a, crate::Message> {
-    let accent = palette.accent.into_iced_color();
+    let accent = palette.accent.into_cosmic_color();
     let resolved = mde_icon(Icon::Update, IconSize::Inline);
     let icon_widget: Element<'a, crate::Message> = if let Some(b) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
+        use cosmic::iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(b))
             .width(Length::Fixed(16.0))
             .height(Length::Fixed(16.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
-                    color: Some(accent),
-                },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style {
+                color: Some(accent),
+            })
             .into()
     } else {
-        text(resolved.fallback_glyph)
-            .size(16.0)
-            .color(accent)
-            .into()
+        text(resolved.fallback_glyph).size(16.0).colr(accent).into()
     };
 
     let has_builds = !r.builds.is_empty();
     let count_color = if has_builds {
-        palette.success.into_iced_color()
+        palette.success.into_cosmic_color()
     } else {
-        palette.text_muted.into_iced_color()
+        palette.text_muted.into_cosmic_color()
     };
     let head = row![
         icon_widget,
         text(r.label.clone())
             .size(12)
-            .color(palette.text.into_iced_color()),
+            .colr(palette.text.into_cosmic_color()),
         Space::new().width(Length::Fill),
         text(format!("{} build(s)", r.builds.len()))
             .size(11)
-            .color(count_color),
+            .colr(count_color),
         // W54 — launch a build of this kind as a job on execution nodes.
         crate::controls::variant_button(
             "Build",
@@ -279,11 +284,11 @@ fn kind_row<'a>(r: &'a ImageKindRow, palette: Palette) -> Element<'a, crate::Mes
         ),
     ]
     .spacing(8)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     let desc = text(r.description.clone())
         .size(11)
-        .color(palette.text_muted.into_iced_color());
+        .colr(palette.text_muted.into_cosmic_color());
 
     let mut body = column![head, desc].spacing(3);
     if has_builds {
@@ -295,23 +300,23 @@ fn kind_row<'a>(r: &'a ImageKindRow, palette: Palette) -> Element<'a, crate::Mes
             body = body.push(
                 text(format!("  • {} v{} ({when}{size})", b.name, b.version))
                     .size(10)
-                    .color(palette.accent.into_iced_color()),
+                    .colr(palette.accent.into_cosmic_color()),
             );
         }
     } else {
         body = body.push(
             text("  no builds yet — run an image-build job on an execution node")
                 .size(10)
-                .color(palette.text_muted.into_iced_color()),
+                .colr(palette.text_muted.into_cosmic_color()),
         );
     }
 
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
     container(body)
         .padding(Padding::from([10u16, 14u16]))
         .width(Length::Fill)
-        .style(move |_| container::Style {
+        .sty(move |_| container::Style {
             snap: false,
             background: Some(Background::Color(bg)),
             border: Border {
@@ -354,13 +359,13 @@ fn fmt_size(bytes: u64) -> String {
 fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a, crate::Message> {
     let (icon_color, heading, body): (Color, String, String) = if let Some(err) = error {
         (
-            palette.danger.into_iced_color(),
+            palette.danger.into_cosmic_color(),
             "Couldn't read images".to_string(),
             err.to_string(),
         )
     } else {
         (
-            palette.accent.into_iced_color(),
+            palette.accent.into_cosmic_color(),
             "No image catalog".to_string(),
             "The mesh builds four kinds of image (ISO / VM / container / USB) as jobs on \
              execution-tagged nodes; built versions land on LizardFS and appear here."
@@ -374,33 +379,31 @@ fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a,
     };
     let resolved = mde_icon(icon_kind, IconSize::PanelHeader);
     let icon_widget: Element<'a, crate::Message> = if let Some(b) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
+        use cosmic::iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(b))
             .width(Length::Fixed(32.0))
             .height(Length::Fixed(32.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
-                    color: Some(icon_color),
-                },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style {
+                color: Some(icon_color),
+            })
             .into()
     } else {
         text(resolved.fallback_glyph)
             .size(32.0)
-            .color(icon_color)
+            .colr(icon_color)
             .into()
     };
     container(
         column![
             icon_widget,
             Space::new().height(Length::Fixed(8.0)),
-            text(heading).size(14).color(palette.text.into_iced_color()),
+            text(heading).size(14).colr(palette.text.into_cosmic_color()),
             text(body)
                 .size(11)
-                .color(palette.text_muted.into_iced_color()),
+                .colr(palette.text_muted.into_cosmic_color()),
         ]
         .spacing(2)
-        .align_x(iced::alignment::Horizontal::Center),
+        .align_x(cosmic::iced::alignment::Horizontal::Center),
     )
     .padding(Padding::from([32u16, 16u16]))
     .width(Length::Fill)

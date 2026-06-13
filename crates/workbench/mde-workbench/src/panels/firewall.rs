@@ -12,8 +12,8 @@
 //! `mackesd::firewall_monitor` and shows recent denials, the
 //! top offending sources, and per-peer denial counts.
 
-use iced::widget::{checkbox, column, container, pick_list, row, scrollable, text};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{checkbox, column, container, pick_list, row, scrollable, text};
+use cosmic::iced::{Element, Length, Task};
 
 use crate::controls::{variant_button, ButtonVariant};
 use tokio::process::Command;
@@ -215,7 +215,7 @@ impl FirewallPanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         if !self.firewalld_available {
             return column![
                 text("firewalld unavailable").size(18),
@@ -239,11 +239,12 @@ impl FirewallPanel {
             crate::live_theme::palette(),
         );
 
-        let zone_pick: pick_list::PickList<'_, String, _, _, crate::Message> = pick_list(
-            self.zones.clone(),
-            current_or_none(&self.zones, &self.default_zone),
-            |v| crate::Message::Firewall(Message::DefaultZoneSelected(v)),
-        );
+        let zone_pick: pick_list::PickList<'_, String, _, _, crate::Message, cosmic::Theme> =
+            pick_list(
+                self.zones.clone(),
+                current_or_none(&self.zones, &self.default_zone),
+                |v| crate::Message::Firewall(Message::DefaultZoneSelected(v)),
+            );
 
         let service_rows = COMMON_SERVICES.iter().fold(column![], |col, service| {
             let svc = (*service).to_string();
@@ -261,7 +262,8 @@ impl FirewallPanel {
 
         // FWMON-5: Activity section — recent denials, top sources,
         // per-peer counts from the mesh-storage firewall JSONL union.
-        let activity_section: Element<'_, crate::Message> = if !self.activity_loaded {
+        let activity_section: Element<'_, crate::Message, cosmic::Theme> = if !self.activity_loaded
+        {
             text("Activity loading…").size(13).into()
         } else if self.activity_events.is_empty() {
             text("No firewall denials recorded. Denied packets appear here once firewalld LogDenied=all is active and external traffic is seen.").size(13).into()

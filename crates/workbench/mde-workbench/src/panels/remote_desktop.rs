@@ -26,9 +26,12 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
-use iced::{Background, Border, Color, Element, Length, Padding, Task, Theme};
+use cosmic::iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
+use cosmic::iced::{Background, Border, Color, Length, Padding, Task};
+use cosmic::{Element, Theme};
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
+
+use crate::cosmic_compat::prelude::*;
 
 // PD-5 / Q8 — the protocol + launch engine moved to the shared
 // crate::launcher module (one engine for this panel + the Peers
@@ -209,10 +212,10 @@ impl RemoteDesktopPanel {
         };
         let title = text("Remote Access")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
         let subtitle = text(format!("{} · {}", self.status, local_sshd_line))
             .size(TypeRole::Body.size_in(sizes))
-            .color(palette.text_muted.into_iced_color());
+            .colr(palette.text_muted.into_cosmic_color());
 
         let manual_field = row![
             text_input("hostname or IP (e.g. 172.20.146.245)", &self.manual_input)
@@ -229,22 +232,22 @@ impl RemoteDesktopPanel {
             ),),
         ]
         .spacing(6)
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
         let manual_block = container(
             column![
                 text("Manual connect")
                     .size(12)
-                    .color(palette.text_muted.into_iced_color()),
+                    .colr(palette.text_muted.into_cosmic_color()),
                 manual_field,
             ]
             .spacing(6),
         )
         .padding(Padding::from([12u16, 16u16]))
         .width(Length::Fill)
-        .style({
-            let bg = palette.raised.into_iced_color();
-            let border = palette.border.into_iced_color();
+        .sty({
+            let bg = palette.raised.into_cosmic_color();
+            let border = palette.border.into_cosmic_color();
             move |_| container::Style {
                 snap: false,
                 background: Some(Background::Color(bg)),
@@ -257,13 +260,13 @@ impl RemoteDesktopPanel {
             }
         });
 
-        let reload_btn = button(text("Reload ARP cache").size(11).color(Color::WHITE))
+        let reload_btn = button(text("Reload ARP cache").size(11).colr(Color::WHITE))
             .padding(Padding::from([4u16, 10u16]))
-            .style({
-                let accent = palette.accent.into_iced_color();
-                move |_t: &Theme, status: iced::widget::button::Status| {
+            .sty({
+                let accent = palette.accent.into_cosmic_color();
+                move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
                     let bg = match status {
-                        iced::widget::button::Status::Hovered => Color {
+                        cosmic::iced::widget::button::Status::Hovered => Color {
                             r: accent.r * 1.10,
                             g: accent.g * 1.10,
                             b: accent.b * 1.10,
@@ -271,16 +274,20 @@ impl RemoteDesktopPanel {
                         },
                         _ => accent,
                     };
-                    iced::widget::button::Style {
+                    cosmic::iced::widget::button::Style {
                         snap: false,
                         background: Some(Background::Color(bg)),
                         text_color: Color::WHITE,
+                        icon_color: None,
+                        border_radius: 4.0.into(),
+                        border_width: 0.0,
+                        border_color: Color::TRANSPARENT,
                         border: Border {
                             color: Color::TRANSPARENT,
                             width: 0.0,
                             radius: 4.0.into(),
                         },
-                        shadow: iced::Shadow::default(),
+                        shadow: cosmic::iced::Shadow::default(),
                     }
                 }
             })
@@ -289,11 +296,11 @@ impl RemoteDesktopPanel {
         let known_header = row![
             text(format!("Known hosts ({})", self.hosts.len()))
                 .size(13)
-                .color(palette.text.into_iced_color()),
+                .colr(palette.text.into_cosmic_color()),
             Space::new().width(Length::Fill),
             reload_btn,
         ]
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
         let mut hosts_col = column![].spacing(6);
         for h in &self.hosts {
@@ -304,7 +311,7 @@ impl RemoteDesktopPanel {
                 container(
                     text("No cached hosts. Populate the ARP cache by running mackes mesh wake from a terminal, or use the manual field above.")
                         .size(12)
-                        .color(palette.text_muted.into_iced_color()),
+                        .colr(palette.text_muted.into_cosmic_color()),
                 )
                 .padding(Padding::from([12u16, 0u16])),
             );
@@ -323,7 +330,7 @@ impl RemoteDesktopPanel {
                     Space::new().width(Length::Fill),
                     remmina,
                 ]
-                .align_y(iced::Alignment::Center),
+                .align_y(cosmic::iced::Alignment::Center),
                 Space::new().height(Length::Fixed(20.0)),
                 manual_block,
                 Space::new().height(Length::Fixed(16.0)),
@@ -341,30 +348,28 @@ impl RemoteDesktopPanel {
 
 fn host_row<'a>(h: &'a KnownHost, palette: Palette) -> Element<'a, crate::Message> {
     let resolved = mde_icon(Icon::Network, IconSize::Inline);
-    let icon_color = palette.text_muted.into_iced_color();
+    let icon_color = palette.text_muted.into_cosmic_color();
     let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
+        use cosmic::iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(svg_bytes))
             .width(Length::Fixed(16.0))
             .height(Length::Fixed(16.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
-                    color: Some(icon_color),
-                },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style {
+                color: Some(icon_color),
+            })
             .into()
     } else {
         text(resolved.fallback_glyph)
             .size(16.0)
-            .color(icon_color)
+            .colr(icon_color)
             .into()
     };
     let ip_text = text(h.ip.clone())
         .size(13)
-        .color(palette.text.into_iced_color());
+        .colr(palette.text.into_cosmic_color());
     let mac_text = text(h.mac.clone())
         .size(11)
-        .color(palette.text_muted.into_iced_color());
+        .colr(palette.text_muted.into_cosmic_color());
 
     let ip = h.ip.clone();
     // SVC-1 — SSH button gates on the probed remote sshd state:
@@ -413,14 +418,14 @@ fn host_row<'a>(h: &'a KnownHost, palette: Palette) -> Element<'a, crate::Messag
         vnc_btn,
     ]
     .spacing(10)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
     container(body)
         .padding(Padding::from([10u16, 14u16]))
         .width(Length::Fill)
-        .style(move |_| container::Style {
+        .sty(move |_| container::Style {
             snap: false,
             background: Some(Background::Color(bg)),
             border: Border {
@@ -437,52 +442,58 @@ fn connect_btn<'a>(
     label: &'a str,
     palette: Palette,
     ghost: bool,
-) -> iced::widget::Button<'a, crate::Message> {
-    let accent = palette.accent.into_iced_color();
-    let border = palette.border.into_iced_color();
-    let text_main = palette.text.into_iced_color();
+) -> cosmic::iced::widget::Button<'a, crate::Message, Theme> {
+    let accent = palette.accent.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
+    let text_main = palette.text.into_cosmic_color();
     button(
         text(label)
             .size(11)
-            .color(if ghost { text_main } else { Color::WHITE }),
+            .colr(if ghost { text_main } else { Color::WHITE }),
     )
     .padding(Padding::from([4u16, 12u16]))
-    .style(move |_t: &Theme, status: iced::widget::button::Status| {
-        let (bg, fg) = if ghost {
-            let hover_bg = Color {
-                r: 0.20,
-                g: 0.20,
-                b: 0.22,
-                a: 1.0,
+    .sty(
+        move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+            let (bg, fg) = if ghost {
+                let hover_bg = Color {
+                    r: 0.20,
+                    g: 0.20,
+                    b: 0.22,
+                    a: 1.0,
+                };
+                match status {
+                    cosmic::iced::widget::button::Status::Hovered => (hover_bg, text_main),
+                    _ => (Color::TRANSPARENT, text_main),
+                }
+            } else {
+                let bg = match status {
+                    cosmic::iced::widget::button::Status::Hovered => Color {
+                        r: accent.r * 1.10,
+                        g: accent.g * 1.10,
+                        b: accent.b * 1.10,
+                        a: accent.a,
+                    },
+                    _ => accent,
+                };
+                (bg, Color::WHITE)
             };
-            match status {
-                iced::widget::button::Status::Hovered => (hover_bg, text_main),
-                _ => (Color::TRANSPARENT, text_main),
-            }
-        } else {
-            let bg = match status {
-                iced::widget::button::Status::Hovered => Color {
-                    r: accent.r * 1.10,
-                    g: accent.g * 1.10,
-                    b: accent.b * 1.10,
-                    a: accent.a,
+            cosmic::iced::widget::button::Style {
+                snap: false,
+                background: Some(Background::Color(bg)),
+                text_color: fg,
+                icon_color: None,
+                border_radius: 4.0.into(),
+                border_width: if ghost { 1.0 } else { 0.0 },
+                border_color: if ghost { border } else { Color::TRANSPARENT },
+                border: Border {
+                    color: if ghost { border } else { Color::TRANSPARENT },
+                    width: if ghost { 1.0 } else { 0.0 },
+                    radius: 4.0.into(),
                 },
-                _ => accent,
-            };
-            (bg, Color::WHITE)
-        };
-        iced::widget::button::Style {
-            snap: false,
-            background: Some(Background::Color(bg)),
-            text_color: fg,
-            border: Border {
-                color: if ghost { border } else { Color::TRANSPARENT },
-                width: if ghost { 1.0 } else { 0.0 },
-                radius: 4.0.into(),
-            },
-            shadow: iced::Shadow::default(),
-        }
-    })
+                shadow: cosmic::iced::Shadow::default(),
+            }
+        },
+    )
 }
 
 // ---- I/O ------------------------------------------------------

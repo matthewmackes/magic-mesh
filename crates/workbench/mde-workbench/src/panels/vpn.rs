@@ -9,8 +9,9 @@
 //! CB-1.8 follow-up. Users can still `nmcli connection
 //! import type wireguard file <path>` directly.
 
-use iced::widget::{column, container, row, scrollable, text};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{column, container, row, scrollable, text};
+use cosmic::iced::{Length, Task};
+use cosmic::Element;
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};

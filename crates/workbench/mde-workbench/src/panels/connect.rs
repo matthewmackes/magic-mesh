@@ -36,9 +36,12 @@
 
 use serde::{Deserialize, Serialize};
 
-use iced::widget::{column, container, row, text, Space};
-use iced::{Element, Length, Padding, Task};
+use cosmic::iced::widget::{column, container, row, text, Container, Space};
+use cosmic::iced::{Length, Padding};
+use cosmic::{Element, Task};
 use mde_theme::{mde_icon, Icon, IconSize, Palette, TypeRole};
+
+use crate::cosmic_compat::prelude::*;
 
 /// One paired device — wire-equivalent to the
 /// `dev.mackes.MDE.Connect1.DeviceInfo` struct in mde-kdc.
@@ -457,17 +460,17 @@ impl ConnectPanel {
         for peer in &self.peers {
             col = col.push(peer_card_view(peer, palette));
         }
-        container(col)
+        let body: Container<'_, crate::Message, cosmic::Theme> = container(col)
             .padding(Padding::from([16u16, 24u16]))
-            .width(Length::Fill)
-            .into()
+            .width(Length::Fill);
+        body.into()
     }
 
     fn empty_state_view(&self, palette: Palette) -> Element<'_, crate::Message> {
         let resolved = mde_icon(Icon::Peer, IconSize::EmptyState);
         let heading = text("No paired devices yet")
             .size(TypeRole::Heading.size_in(mde_theme::FontSize::defaults()))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
         let body = text(
             "Open KDE Connect on a phone or tablet and pick this PC \
              to pair. Paired devices land here with Ring / Find / \
@@ -475,26 +478,22 @@ impl ConnectPanel {
              your other peers.",
         )
         .size(TypeRole::Body.size_in(mde_theme::FontSize::defaults()))
-        .color(palette.text_muted.into_iced_color());
+        .colr(palette.text_muted.into_cosmic_color());
         // Use the same SVG-or-fallback resolver chain BUG-13.c
         // wired in panel_chrome.rs::view, but stripped to the
         // minimum needed for an inline empty state.
         let icon_slot: Element<'_, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
-            use iced::widget::svg as widget_svg;
-            let muted = palette.text_muted.into_iced_color();
+            use cosmic::iced::widget::svg as widget_svg;
+            let muted = palette.text_muted.into_cosmic_color();
             widget_svg(widget_svg::Handle::from_memory(svg_bytes))
                 .width(Length::Fixed(resolved.size_px()))
                 .height(Length::Fixed(resolved.size_px()))
-                .style(
-                    move |_t: &iced::Theme, _s: widget_svg::Status| widget_svg::Style {
-                        color: Some(muted),
-                    },
-                )
+                .sty(move |_t: &cosmic::Theme| widget_svg::Style { color: Some(muted) })
                 .into()
         } else {
             text(resolved.fallback_glyph)
                 .size(resolved.size_px())
-                .color(palette.text_muted.into_iced_color())
+                .colr(palette.text_muted.into_cosmic_color())
                 .into()
         };
         container(
@@ -505,12 +504,12 @@ impl ConnectPanel {
                 Space::new().height(Length::Fixed(4.0)),
                 body,
             ]
-            .align_x(iced::alignment::Horizontal::Center)
+            .align_x(cosmic::iced::alignment::Horizontal::Center)
             .spacing(2),
         )
         .padding(Padding::from([48u16, 24u16]))
         .width(Length::Fill)
-        .align_x(iced::alignment::Horizontal::Center)
+        .align_x(cosmic::iced::alignment::Horizontal::Center)
         .into()
     }
 }
@@ -528,27 +527,23 @@ fn peer_card_view<'a>(peer: &'a ConnectPeer, palette: Palette) -> Element<'a, cr
     let kind_icon: Element<'a, crate::Message> = {
         let resolved = mde_icon(kind_glyph, IconSize::Nav);
         if let Some(svg_bytes) = resolved.svg_bytes() {
-            use iced::widget::svg as widget_svg;
-            let fg = palette.text.into_iced_color();
+            use cosmic::iced::widget::svg as widget_svg;
+            let fg = palette.text.into_cosmic_color();
             widget_svg(widget_svg::Handle::from_memory(svg_bytes))
                 .width(Length::Fixed(resolved.size_px()))
                 .height(Length::Fixed(resolved.size_px()))
-                .style(
-                    move |_t: &iced::Theme, _s: widget_svg::Status| widget_svg::Style {
-                        color: Some(fg),
-                    },
-                )
+                .sty(move |_t: &cosmic::Theme| widget_svg::Style { color: Some(fg) })
                 .into()
         } else {
             text(resolved.fallback_glyph)
                 .size(resolved.size_px())
-                .color(palette.text.into_iced_color())
+                .colr(palette.text.into_cosmic_color())
                 .into()
         }
     };
     let name = text(peer.name.clone())
         .size(TypeRole::Subheading.size_in(mde_theme::FontSize::defaults()))
-        .color(palette.text.into_iced_color());
+        .colr(palette.text.into_cosmic_color());
     let identity = row![
         kind_icon,
         Space::new().width(Length::Fixed(8.0)),
@@ -556,30 +551,35 @@ fn peer_card_view<'a>(peer: &'a ConnectPeer, palette: Palette) -> Element<'a, cr
         Space::new().width(Length::Fill),
         text(short_fingerprint(&peer.fingerprint))
             .size(11)
-            .color(palette.text_muted.into_iced_color()),
+            .colr(palette.text_muted.into_cosmic_color()),
     ]
-    .align_y(iced::Alignment::Center);
+    .align_y(cosmic::iced::Alignment::Center);
     let mut card = column![identity].spacing(8);
     for (_section, body_text) in render_card(peer) {
         card = card.push(
             text(body_text)
                 .size(12)
-                .color(palette.text_muted.into_iced_color()),
+                .colr(palette.text_muted.into_cosmic_color()),
         );
     }
     container(card.padding(Padding::from([12u16, 16u16])))
         .width(Length::Fill)
-        .style(move |_t: &iced::Theme| iced::widget::container::Style {
-            snap: false,
-            background: Some(iced::Background::Color(palette.raised.into_iced_color())),
-            border: iced::Border {
-                color: palette.border.into_iced_color(),
-                width: 1.0,
-                radius: 8.0.into(),
+        .sty(
+            move |_t: &cosmic::Theme| cosmic::iced::widget::container::Style {
+                snap: false,
+                icon_color: None,
+                background: Some(cosmic::iced::Background::Color(
+                    palette.raised.into_cosmic_color(),
+                )),
+                border: cosmic::iced::Border {
+                    color: palette.border.into_cosmic_color(),
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                text_color: Some(palette.text.into_cosmic_color()),
+                shadow: cosmic::iced::Shadow::default(),
             },
-            text_color: Some(palette.text.into_iced_color()),
-            shadow: iced::Shadow::default(),
-        })
+        )
         .into()
 }
 

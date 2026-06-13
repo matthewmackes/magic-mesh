@@ -16,8 +16,15 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use iced::widget::{button, column, container, row, scrollable, text, Space};
-use iced::{Background, Border, Color, Element, Length, Padding, Task, Theme};
+use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
+use cosmic::iced::{Background, Border, Color, Length, Padding, Task};
+use cosmic::Theme;
+
+/// Theme-bound element alias: the workbench tree threads libcosmic's
+/// `cosmic::Theme`, not the crates.io `iced::Theme`.
+type Element<'a, M> = cosmic::iced::Element<'a, M, Theme>;
+
+use crate::cosmic_compat::prelude::*;
 use mde_card::probe::{host_facts, service_facts, HostSource};
 use mde_card::Card;
 use mde_theme::{FontSize, Palette, TypeRole};
@@ -112,7 +119,7 @@ impl NetworkHostsPanel {
 
         let title = text("Network Hosts")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
 
         let subtitle_str = if self.last_run_at.is_some() {
             let n = self.inventory.hosts.len();
@@ -131,46 +138,52 @@ impl NetworkHostsPanel {
         };
         let subtitle = text(subtitle_str)
             .size(TypeRole::Body.size_in(sizes))
-            .color(palette.text_muted.into_iced_color());
+            .colr(palette.text_muted.into_cosmic_color());
 
-        let accent = palette.accent.into_iced_color();
+        let accent = palette.accent.into_cosmic_color();
         let refresh_btn = button(
             text(if self.busy { "Loading…" } else { "Refresh" })
                 .size(13)
-                .color(Color::WHITE),
+                .colr(Color::WHITE),
         )
         .padding(Padding::from([6u16, 14u16]))
-        .style(move |_t: &Theme, status: iced::widget::button::Status| {
-            let bg = match status {
-                iced::widget::button::Status::Hovered => Color {
-                    r: (accent.r * 1.10).min(1.0),
-                    g: (accent.g * 1.10).min(1.0),
-                    b: (accent.b * 1.10).min(1.0),
-                    a: accent.a,
-                },
-                _ => accent,
-            };
-            iced::widget::button::Style {
-                snap: false,
-                background: Some(Background::Color(bg)),
-                text_color: Color::WHITE,
-                border: Border {
-                    color: Color::TRANSPARENT,
-                    width: 0.0,
-                    radius: 6.0.into(),
-                },
-                shadow: iced::Shadow::default(),
-            }
-        })
+        .sty(
+            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+                let bg = match status {
+                    cosmic::iced::widget::button::Status::Hovered => Color {
+                        r: (accent.r * 1.10).min(1.0),
+                        g: (accent.g * 1.10).min(1.0),
+                        b: (accent.b * 1.10).min(1.0),
+                        a: accent.a,
+                    },
+                    _ => accent,
+                };
+                cosmic::iced::widget::button::Style {
+                    snap: false,
+                    background: Some(Background::Color(bg)),
+                    icon_color: None,
+                    text_color: Color::WHITE,
+                    border_radius: 6.0.into(),
+                    border_width: 0.0,
+                    border_color: Color::TRANSPARENT,
+                    border: Border {
+                        color: Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 6.0.into(),
+                    },
+                    shadow: cosmic::iced::Shadow::default(),
+                }
+            },
+        )
         .on_press(crate::Message::NetworkHosts(Message::RefreshClicked));
 
         let header = row![title, Space::new().width(Length::Fill), refresh_btn]
-            .align_y(iced::Alignment::Center);
+            .align_y(cosmic::iced::Alignment::Center);
 
         let body: Element<'_, crate::Message> = if let Some(ref e) = self.error {
             text(format!("Error: {e}"))
                 .size(TypeRole::Body.size_in(sizes))
-                .color(Color {
+                .colr(Color {
                     r: 1.0,
                     g: 0.35,
                     b: 0.35,
@@ -180,7 +193,7 @@ impl NetworkHostsPanel {
         } else if self.inventory.hosts.is_empty() && self.last_run_at.is_some() {
             text("No hosts in the inventory yet — the probe worker populates it on its scan cadence.")
                 .size(TypeRole::Body.size_in(sizes))
-                .color(palette.text_muted.into_iced_color())
+                .colr(palette.text_muted.into_cosmic_color())
                 .into()
         } else {
             let blocks: Vec<Element<'_, crate::Message>> = self
@@ -194,12 +207,12 @@ impl NetworkHostsPanel {
 
         let page = column![header, row![subtitle], Space::new().height(12), body].spacing(4);
 
-        let surface_color = palette.surface.into_iced_color();
+        let surface_color = palette.surface.into_cosmic_color();
         container(page)
             .padding(24)
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(move |_t: &Theme| container::Style {
+            .sty(move |_t: &Theme| container::Style {
                 snap: false,
                 background: Some(Background::Color(surface_color)),
                 ..Default::default()
@@ -224,7 +237,7 @@ fn trust_color(trust: &str, palette: Palette) -> Color {
             b: 0.35,
             a: 1.0,
         },
-        _ => palette.text_muted.into_iced_color(),
+        _ => palette.text_muted.into_cosmic_color(),
     }
 }
 
@@ -246,26 +259,26 @@ fn host_block<'a>(
     // chip on the right, trust badge.
     let mut head = row![text(&h.display)
         .size(TypeRole::Body.size_in(sizes))
-        .color(palette.text.into_iced_color())]
+        .colr(palette.text.into_cosmic_color())]
     .spacing(8)
-    .align_y(iced::Alignment::Center);
+    .align_y(cosmic::iced::Alignment::Center);
     if h.display != h.ip {
         head = head.push(
             text(format!("· {}", h.ip))
                 .size(TypeRole::Caption.size_in(sizes))
-                .color(palette.text_muted.into_iced_color()),
+                .colr(palette.text_muted.into_cosmic_color()),
         );
     }
     head = head.push(Space::new().width(Length::Fill));
     head = head.push(
         text(h.source.clone())
             .size(TypeRole::Caption.size_in(sizes))
-            .color(palette.text_muted.into_iced_color()),
+            .colr(palette.text_muted.into_cosmic_color()),
     );
     head = head.push(
         text(trust_label(&h.trust))
             .size(TypeRole::Caption.size_in(sizes))
-            .color(trust_color(&h.trust, palette)),
+            .colr(trust_color(&h.trust, palette)),
     );
 
     let mut block = column![head].spacing(2);
@@ -273,7 +286,7 @@ fn host_block<'a>(
         block = block.push(
             text("  no open ports identified")
                 .size(TypeRole::Caption.size_in(sizes))
-                .color(palette.text_muted.into_iced_color()),
+                .colr(palette.text_muted.into_cosmic_color()),
         );
     } else {
         for s in &h.services {
@@ -285,7 +298,7 @@ fn host_block<'a>(
             block = block.push(
                 text(detail)
                     .size(TypeRole::Caption.size_in(sizes))
-                    .color(palette.text_muted.into_iced_color()),
+                    .colr(palette.text_muted.into_cosmic_color()),
             );
         }
     }
@@ -472,8 +485,8 @@ mod tests {
         assert_eq!(trust_label("trusted"), "trusted");
         // Unscored uses the muted token, not green/red.
         let p = crate::live_theme::palette();
-        assert_eq!(trust_color("", p), p.text_muted.into_iced_color());
-        assert_ne!(trust_color("trusted", p), p.text_muted.into_iced_color());
+        assert_eq!(trust_color("", p), p.text_muted.into_cosmic_color());
+        assert_ne!(trust_color("trusted", p), p.text_muted.into_cosmic_color());
     }
 
     #[test]

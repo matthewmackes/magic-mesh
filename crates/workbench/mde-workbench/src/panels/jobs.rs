@@ -18,8 +18,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use iced::widget::{column, container, row, scrollable, text};
-use iced::{Element, Length, Padding, Task};
+use cosmic::iced::widget::{column, container, row, scrollable, text};
+use cosmic::iced::{Length, Padding, Task};
+// CUT-1: cosmic::Element bakes in cosmic::Theme — the theme panel_chrome and
+// the .colr()/.sty() compat widgets thread through the tree. Using
+// cosmic::iced::Element here would default to cosmic::iced::Theme and mismatch.
+use cosmic::Element;
 use mde_theme::{EmptyState, Icon};
 use serde::Deserialize;
 
@@ -402,7 +406,7 @@ impl JobsPanel {
                         open,
                     ]
                     .spacing(12)
-                    .align_y(iced::Alignment::Center),
+                    .align_y(cosmic::iced::Alignment::Center),
                 )
                 .padding(Padding::from(10)),
             );
@@ -428,7 +432,7 @@ impl JobsPanel {
                         open,
                     ]
                     .spacing(12)
-                    .align_y(iced::Alignment::Center),
+                    .align_y(cosmic::iced::Alignment::Center),
                 )
                 .padding(Padding::from(10)),
             );
@@ -538,7 +542,7 @@ impl JobsPanel {
                         text(r.detail.clone()).size(12),
                     ]
                     .spacing(12)
-                    .align_y(iced::Alignment::Center),
+                    .align_y(cosmic::iced::Alignment::Center),
                 );
             }
         }

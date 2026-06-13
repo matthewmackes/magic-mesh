@@ -13,8 +13,8 @@
 //! `dnf5-plugins` package which is install-by-default on
 //! Fedora workstation.
 
-use iced::widget::{column, container, row, scrollable, text, text_input};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{column, container, row, scrollable, text, text_input};
+use cosmic::iced::{Element, Length, Task};
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -217,7 +217,7 @@ impl AppsSourcesPanel {
         )
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         let filter_input = text_input("Filter…", &self.filter)
             .on_input(|v| crate::Message::AppsSources(Message::FilterChanged(v)));
         // UX-7.a — refresh routed through the shared button variant.

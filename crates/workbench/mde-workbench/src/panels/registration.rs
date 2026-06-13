@@ -12,8 +12,9 @@
 //! unit-tested; the enroll-with-token text input + the on-Cosmic
 //! `/preview` are the deferred tail.
 
-use iced::widget::{column, row, text};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{column, row, text};
+use cosmic::iced::{Length, Task};
+use cosmic::Element;
 use serde::Deserialize;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -184,12 +185,12 @@ impl RegistrationPanel {
         let mut col = column![
             row![
                 text("Registration").size(20),
-                iced::widget::Space::new().width(Length::Fill),
+                cosmic::iced::widget::Space::new().width(Length::Fill),
                 nebula,
             ]
-            .align_y(iced::Alignment::Center),
+            .align_y(cosmic::iced::Alignment::Center),
             text("Identity fingerprint").size(14),
-            text(fp).size(12).font(iced::Font::MONOSPACE),
+            text(fp).size(12).font(cosmic::iced::Font::MONOSPACE),
             row![
                 text("word-pair:").size(14),
                 text(if self.identity.word_pair.is_empty() {
@@ -221,7 +222,7 @@ impl RegistrationPanel {
             col = col.push(
                 text(self.last_token.clone())
                     .size(12)
-                    .font(iced::Font::MONOSPACE),
+                    .font(cosmic::iced::Font::MONOSPACE),
             );
         }
         if !self.status.is_empty() {

@@ -10,12 +10,13 @@
 
 use std::path::{Path, PathBuf};
 
-use iced::widget::{checkbox, column, container, row, text, text_input, Space};
-use iced::{Background, Border, Element, Length};
+use cosmic::iced::widget::{checkbox, column, container, row, text, text_input, Space};
+use cosmic::iced::{Background, Border, Length};
 use mde_theme::{spacing, FontSize, Palette, TypeRole};
 use serde::{Deserialize, Serialize};
 
 use crate::controls::{variant_button, ButtonVariant};
+use crate::cosmic_compat::prelude::*;
 
 /// Directory scanned for installer / cloud-image ISOs.
 const ISO_DIR: &str = "/var/lib/mde-vms/isos";
@@ -267,12 +268,12 @@ impl WizardState {
         }
     }
 
-    pub fn view(&self, palette: Palette) -> Element<'_, WizardMsg> {
+    pub fn view(&self, palette: Palette) -> cosmic::Element<'_, WizardMsg> {
         let title = text(format!("Add VM — step {} of 4", self.step))
             .size(TypeRole::Subheading.size_in(FontSize::defaults()))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
 
-        let body: Element<'_, WizardMsg> = match self.step {
+        let body: cosmic::Element<'_, WizardMsg> = match self.step {
             1 => self.step_name(palette),
             2 => self.step_resources(palette),
             3 => self.step_disk_iso(palette),
@@ -293,12 +294,12 @@ impl WizardState {
         }
 
         let col = column![title, body, nav].spacing(sp(4)).width(Length::Fill);
-        let surface = palette.surface.into_iced_color();
-        let border = palette.border.into_iced_color();
+        let surface = palette.surface.into_cosmic_color();
+        let border = palette.border.into_cosmic_color();
         container(col)
             .width(Length::Fill)
             .padding([sp(4), sp(6)])
-            .style(move |_t| container::Style {
+            .sty(move |_t| container::Style {
                 background: Some(Background::Color(surface)),
                 border: Border {
                     color: border,
@@ -310,7 +311,7 @@ impl WizardState {
             .into()
     }
 
-    fn step_name(&self, palette: Palette) -> Element<'_, WizardMsg> {
+    fn step_name(&self, palette: Palette) -> cosmic::Element<'_, WizardMsg> {
         let mut col = column![
             label(palette, "VM name"),
             text_input("my-vm", &self.name)
@@ -340,14 +341,14 @@ impl WizardState {
                         ghost(palette, "Remove", Some(WizardMsg::DeleteTemplate(i))),
                     ]
                     .spacing(sp(1))
-                    .align_y(iced::alignment::Vertical::Center),
+                    .align_y(cosmic::iced::alignment::Vertical::Center),
                 );
             }
         }
         col.into()
     }
 
-    fn step_resources(&self, palette: Palette) -> Element<'_, WizardMsg> {
+    fn step_resources(&self, palette: Palette) -> cosmic::Element<'_, WizardMsg> {
         column![
             stepper(
                 palette,
@@ -369,7 +370,7 @@ impl WizardState {
         .into()
     }
 
-    fn step_disk_iso(&self, palette: Palette) -> Element<'_, WizardMsg> {
+    fn step_disk_iso(&self, palette: Palette) -> cosmic::Element<'_, WizardMsg> {
         let mut col = column![
             stepper(
                 palette,
@@ -417,7 +418,7 @@ impl WizardState {
         col.into()
     }
 
-    fn step_review(&self, palette: Palette) -> Element<'_, WizardMsg> {
+    fn step_review(&self, palette: Palette) -> cosmic::Element<'_, WizardMsg> {
         let iso = self.effective_iso().unwrap_or_else(|| "none".to_string());
         // "Add template" is enabled once the name is valid (the template
         // store keys on a usable name).
@@ -545,44 +546,56 @@ fn clamp_i64(v: i64, lo: i64, hi: i64) -> i64 {
 
 // ── small view helpers (mde-theme palette/type/spacing tokens) ───────────
 
-fn label<'a>(palette: Palette, t: &str) -> Element<'a, WizardMsg> {
+fn label<'a>(palette: Palette, t: &str) -> cosmic::Element<'a, WizardMsg> {
     text(t.to_string())
         .size(body_size())
-        .color(palette.text.into_iced_color())
+        .colr(palette.text.into_cosmic_color())
         .into()
 }
 
-fn muted<'a>(palette: Palette, t: &str) -> Element<'a, WizardMsg> {
+fn muted<'a>(palette: Palette, t: &str) -> cosmic::Element<'a, WizardMsg> {
     text(t.to_string())
         .size(caption_size())
-        .color(palette.text_muted.into_iced_color())
+        .colr(palette.text_muted.into_cosmic_color())
         .into()
 }
 
-fn kv<'a>(palette: Palette, k: &str, v: &str) -> Element<'a, WizardMsg> {
+fn kv<'a>(palette: Palette, k: &str, v: &str) -> cosmic::Element<'a, WizardMsg> {
     row![
         text(k.to_string())
             .size(caption_size())
-            .color(palette.text_muted.into_iced_color())
+            .colr(palette.text_muted.into_cosmic_color())
             .width(Length::FillPortion(2)),
         text(v.to_string())
             .size(body_size())
-            .color(palette.text.into_iced_color())
+            .colr(palette.text.into_cosmic_color())
             .width(Length::FillPortion(3)),
     ]
     .spacing(sp(1))
     .into()
 }
 
-fn ghost<'a>(palette: Palette, lbl: &str, msg: Option<WizardMsg>) -> Element<'a, WizardMsg> {
+fn ghost<'a>(
+    palette: Palette,
+    lbl: &str,
+    msg: Option<WizardMsg>,
+) -> cosmic::Element<'a, WizardMsg> {
     variant_button(lbl.to_string(), ButtonVariant::Ghost, msg, palette)
 }
 
-fn secondary<'a>(palette: Palette, lbl: &str, msg: Option<WizardMsg>) -> Element<'a, WizardMsg> {
+fn secondary<'a>(
+    palette: Palette,
+    lbl: &str,
+    msg: Option<WizardMsg>,
+) -> cosmic::Element<'a, WizardMsg> {
     variant_button(lbl.to_string(), ButtonVariant::Secondary, msg, palette)
 }
 
-fn primary<'a>(palette: Palette, lbl: &str, msg: Option<WizardMsg>) -> Element<'a, WizardMsg> {
+fn primary<'a>(
+    palette: Palette,
+    lbl: &str,
+    msg: Option<WizardMsg>,
+) -> cosmic::Element<'a, WizardMsg> {
     variant_button(lbl.to_string(), ButtonVariant::Primary, msg, palette)
 }
 
@@ -593,20 +606,20 @@ fn stepper<'a>(
     value: &str,
     dec: WizardMsg,
     inc: WizardMsg,
-) -> Element<'a, WizardMsg> {
+) -> cosmic::Element<'a, WizardMsg> {
     row![
         text(lbl.to_string())
             .size(body_size())
-            .color(palette.text.into_iced_color())
+            .colr(palette.text.into_cosmic_color())
             .width(Length::Fill),
         secondary(palette, "-", Some(dec)),
         text(value.to_string())
             .size(body_size())
-            .color(palette.text.into_iced_color()),
+            .colr(palette.text.into_cosmic_color()),
         secondary(palette, "+", Some(inc)),
     ]
     .spacing(sp(1))
-    .align_y(iced::alignment::Vertical::Center)
+    .align_y(cosmic::iced::alignment::Vertical::Center)
     .into()
 }
 
@@ -616,7 +629,7 @@ fn iso_choice<'a>(
     lbl: &str,
     selected: bool,
     msg: WizardMsg,
-) -> Element<'a, WizardMsg> {
+) -> cosmic::Element<'a, WizardMsg> {
     let variant = if selected {
         ButtonVariant::Secondary
     } else {

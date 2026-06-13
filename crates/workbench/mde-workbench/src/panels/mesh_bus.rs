@@ -9,12 +9,19 @@
 
 use std::path::PathBuf;
 
-use iced::widget::button::Status as ButtonStatus;
-use iced::widget::{button, column, row, text, text_editor, text_input, Space};
-use iced::{alignment, Background, Border, Color, Element, Length, Task};
+use cosmic::iced::widget::button::Status as ButtonStatus;
+use cosmic::iced::widget::{button, column, row, text, text_editor, text_input, Space};
+use cosmic::iced::{alignment, Background, Border, Color, Length, Task};
+use cosmic::Theme;
 use mde_theme::{CardState, EmptyState, FontSize, Icon, ObjectCard, Palette, Radii, TypeRole};
 
-use crate::panel_chrome::{empty_state, object_card, panel_container};
+use crate::cosmic_compat::prelude::*;
+use crate::panel_chrome::{empty_state, panel_container};
+
+/// libcosmic-themed element alias: cosmic widgets default their theme param to
+/// `cosmic::Theme`, so the panel's `Element<'_, M>` annotations must carry it
+/// (matches `cosmic::Element`). See CUT-1 port rule 6.
+type Element<'a, M> = cosmic::iced::Element<'a, M, Theme>;
 
 // ─── local mirror types ──────────────────────────────────────────────────────
 // These shadow the mde-bus structs so the workbench crate does not
@@ -984,16 +991,16 @@ impl MeshBusPanel {
         let density = crate::live_theme::tokens().density;
         let sizes = FontSize::defaults();
         let radii = Radii::defaults();
-        let accent = palette.accent.into_iced_color();
-        let raised = palette.raised.into_iced_color();
+        let accent = palette.accent.into_cosmic_color();
+        let raised = palette.raised.into_cosmic_color();
 
         let title = text("Mackes Bus")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
 
         let subtitle = text("Per-peer notification distribution · ntfy over Nebula")
             .size(TypeRole::Body.size_in(sizes))
-            .color(palette.text_muted.into_iced_color());
+            .colr(palette.text_muted.into_cosmic_color());
 
         let tab_bar: Element<'_, crate::Message> = {
             let r = f32::from(radii.sm);
@@ -1004,15 +1011,15 @@ impl MeshBusPanel {
                     let (bg, fg) = if is_active {
                         (accent, Color::WHITE)
                     } else {
-                        (Color::TRANSPARENT, palette.text.into_iced_color())
+                        (Color::TRANSPARENT, palette.text.into_cosmic_color())
                     };
                     button(
                         text(tab.label())
                             .size(TypeRole::Body.size_in(sizes))
-                            .color(fg),
+                            .colr(fg),
                     )
                     .padding([6u16, 14u16])
-                    .style(move |_t, status: ButtonStatus| {
+                    .sty(move |_t: &Theme, status: ButtonStatus| {
                         let fill = match (is_active, status) {
                             (true, _) => bg,
                             (false, ButtonStatus::Hovered) => Color {
@@ -1032,7 +1039,8 @@ impl MeshBusPanel {
                                 width: 0.0,
                                 radius: r.into(),
                             },
-                            shadow: iced::Shadow::default(),
+                            shadow: cosmic::iced::Shadow::default(),
+                            ..button::Style::default()
                         }
                     })
                     .on_press(crate::Message::MeshBus(Message::SelectTab(tab)))
@@ -1044,9 +1052,9 @@ impl MeshBusPanel {
         };
 
         let tab_separator = {
-            use iced::widget::container;
+            use cosmic::iced::widget::container;
             container(Space::new().width(Length::Fill).height(Length::Fixed(1.0)))
-                .style(move |_t: &iced::Theme| iced::widget::container::Style {
+                .sty(move |_t: &Theme| cosmic::iced::widget::container::Style {
                     snap: false,
                     background: Some(Background::Color(raised)),
                     ..Default::default()
@@ -1091,7 +1099,7 @@ impl MeshBusPanel {
         if self.topics.loading {
             return text("Loading…")
                 .size(TypeRole::Body.size_in(sizes))
-                .color(palette.text_muted.into_iced_color())
+                .colr(palette.text_muted.into_cosmic_color())
                 .into();
         }
 
@@ -1109,7 +1117,7 @@ impl MeshBusPanel {
 
         let radii = Radii::defaults();
         let r = f32::from(radii.sm);
-        let raised = palette.raised.into_iced_color();
+        let raised = palette.raised.into_cosmic_color();
 
         // Build the cascading topic list.
         let mut items: Vec<Element<'_, crate::Message>> = Vec::new();
@@ -1150,7 +1158,7 @@ impl MeshBusPanel {
 
             let card_btn: Element<'_, crate::Message> = button(object_card(card, palette))
                 .padding(0)
-                .style(move |_t, _s: ButtonStatus| button::Style {
+                .sty(move |_t: &Theme, _s: ButtonStatus| button::Style {
                     snap: false,
                     background: None,
                     text_color: Color::TRANSPARENT,
@@ -1159,7 +1167,8 @@ impl MeshBusPanel {
                         width: 0.0,
                         radius: r.into(),
                     },
-                    shadow: iced::Shadow::default(),
+                    shadow: cosmic::iced::Shadow::default(),
+                    ..button::Style::default()
                 })
                 .on_press(press_msg)
                 .into();
@@ -1172,18 +1181,18 @@ impl MeshBusPanel {
                     items.push(
                         text("Loading messages…")
                             .size(TypeRole::Caption.size_in(sizes))
-                            .color(palette.text_muted.into_iced_color())
+                            .colr(palette.text_muted.into_cosmic_color())
                             .into(),
                     );
                 } else if self.topics.messages.is_empty() {
                     items.push(
                         text("No messages stored for this topic yet.")
                             .size(TypeRole::Caption.size_in(sizes))
-                            .color(palette.text_muted.into_iced_color())
+                            .colr(palette.text_muted.into_cosmic_color())
                             .into(),
                     );
                 } else {
-                    use iced::widget::container;
+                    use cosmic::iced::widget::container;
                     let msg_rows: Vec<Element<'_, crate::Message>> = self
                         .topics
                         .messages
@@ -1198,10 +1207,10 @@ impl MeshBusPanel {
                             column![
                                 text(m.title.as_str())
                                     .size(TypeRole::Body.size_in(sizes))
-                                    .color(palette.text.into_iced_color()),
+                                    .colr(palette.text.into_cosmic_color()),
                                 text(format!("{}{} · {}", age, by, m.body_preview.as_str()))
                                     .size(TypeRole::Caption.size_in(sizes))
-                                    .color(palette.text_muted.into_iced_color()),
+                                    .colr(palette.text_muted.into_cosmic_color()),
                             ]
                             .spacing(2)
                             .into()
@@ -1210,13 +1219,13 @@ impl MeshBusPanel {
                     let msg_list = column(msg_rows).spacing(10);
                     items.push(
                         container(msg_list)
-                            .padding(iced::Padding {
+                            .padding(cosmic::iced::Padding {
                                 top: 8.0,
                                 right: 16.0,
                                 bottom: 8.0,
                                 left: 16.0,
                             })
-                            .style(move |_t: &iced::Theme| iced::widget::container::Style {
+                            .sty(move |_t: &Theme| cosmic::iced::widget::container::Style {
                                 snap: false,
                                 background: Some(Background::Color(raised)),
                                 border: Border {
@@ -1238,7 +1247,7 @@ impl MeshBusPanel {
             items.push(
                 text(format!("Error: {e}"))
                     .size(TypeRole::Caption.size_in(sizes))
-                    .color(Color {
+                    .colr(Color {
                         r: 0.9,
                         g: 0.2,
                         b: 0.2,
@@ -1259,7 +1268,7 @@ impl MeshBusPanel {
         if self.subs.loading {
             return text("Loading…")
                 .size(TypeRole::Body.size_in(sizes))
-                .color(palette.text_muted.into_iced_color())
+                .colr(palette.text_muted.into_cosmic_color())
                 .into();
         }
 
@@ -1275,19 +1284,19 @@ impl MeshBusPanel {
             );
         }
 
-        let accent = palette.accent.into_iced_color();
+        let accent = palette.accent.into_cosmic_color();
         let radii = Radii::defaults();
         let r = f32::from(radii.sm);
 
         // — Topic list —
         let list_label = text(format!("Subscriptions ({})", self.subs.topics.len()))
             .size(TypeRole::Subheading.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
 
         let topic_rows: Vec<Element<'_, crate::Message>> = if self.subs.topics.is_empty() {
             vec![text("No topics subscribed yet.")
                 .size(TypeRole::Caption.size_in(sizes))
-                .color(palette.text_muted.into_iced_color())
+                .colr(palette.text_muted.into_cosmic_color())
                 .into()]
         } else {
             self.subs
@@ -1297,15 +1306,15 @@ impl MeshBusPanel {
                     let topic = t.clone();
                     let is_muted = self.subs.muted.contains(&topic);
                     let label_color = if is_muted {
-                        palette.text_muted.into_iced_color()
+                        palette.text_muted.into_cosmic_color()
                     } else {
-                        palette.text.into_iced_color()
+                        palette.text.into_cosmic_color()
                     };
                     let mute_note: Option<Element<'_, crate::Message>> = if is_muted {
                         Some(
                             text("muted")
                                 .size(TypeRole::Caption.size_in(sizes))
-                                .color(palette.text_muted.into_iced_color())
+                                .colr(palette.text_muted.into_cosmic_color())
                                 .into(),
                         )
                     } else {
@@ -1315,10 +1324,10 @@ impl MeshBusPanel {
                     let remove_btn: Element<'_, crate::Message> = button(
                         text("Remove")
                             .size(TypeRole::Caption.size_in(sizes))
-                            .color(label_color),
+                            .colr(label_color),
                     )
                     .padding([2u16, 8u16])
-                    .style(move |_t, _s: ButtonStatus| button::Style {
+                    .sty(move |_t: &Theme, _s: ButtonStatus| button::Style {
                         snap: false,
                         background: Some(Background::Color(Color {
                             r: 0.8,
@@ -1337,7 +1346,8 @@ impl MeshBusPanel {
                             width: 0.0,
                             radius: r.into(),
                         },
-                        shadow: iced::Shadow::default(),
+                        shadow: cosmic::iced::Shadow::default(),
+                        ..button::Style::default()
                     })
                     .on_press(crate::Message::MeshBus(Message::SubsRemoveClicked(
                         remove_topic,
@@ -1346,7 +1356,7 @@ impl MeshBusPanel {
 
                     let mut row_items: Vec<Element<'_, crate::Message>> = vec![text(t.as_str())
                         .size(TypeRole::Body.size_in(sizes))
-                        .color(label_color)
+                        .colr(label_color)
                         .into()];
                     if let Some(mn) = mute_note {
                         row_items.push(Space::new().width(8).into());
@@ -1355,7 +1365,9 @@ impl MeshBusPanel {
                     row_items.push(Space::new().width(Length::Fill).into());
                     row_items.push(remove_btn);
 
-                    row(row_items).align_y(iced::Alignment::Center).into()
+                    row(row_items)
+                        .align_y(cosmic::iced::Alignment::Center)
+                        .into()
                 })
                 .collect()
         };
@@ -1373,10 +1385,10 @@ impl MeshBusPanel {
         let add_btn: Element<'_, crate::Message> = button(
             text("Subscribe")
                 .size(TypeRole::Body.size_in(sizes))
-                .color(Color::WHITE),
+                .colr(Color::WHITE),
         )
         .padding([6u16, 14u16])
-        .style(move |_t, _s: ButtonStatus| button::Style {
+        .sty(move |_t: &Theme, _s: ButtonStatus| button::Style {
             snap: false,
             background: Some(Background::Color(accent)),
             text_color: Color::WHITE,
@@ -1385,24 +1397,25 @@ impl MeshBusPanel {
                 width: 0.0,
                 radius: r.into(),
             },
-            shadow: iced::Shadow::default(),
+            shadow: cosmic::iced::Shadow::default(),
+            ..button::Style::default()
         })
         .on_press(crate::Message::MeshBus(Message::SubsAddClicked))
         .into();
 
         let add_row: Element<'_, crate::Message> = row![add_input, Space::new().width(8), add_btn,]
-            .align_y(iced::Alignment::Center)
+            .align_y(cosmic::iced::Alignment::Center)
             .into();
 
         // — Match @peer section —
         let peer_label = text("Copy from peer")
             .size(TypeRole::Subheading.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
 
         let peer_hint =
             text("Copies all subscriptions from another peer's subs.yaml via mesh storage.")
                 .size(TypeRole::Caption.size_in(sizes))
-                .color(palette.text_muted.into_iced_color());
+                .colr(palette.text_muted.into_cosmic_color());
 
         let peer_input: Element<'_, crate::Message> = text_input("hostname", &self.subs.peer_input)
             .on_input(|s| crate::Message::MeshBus(Message::SubsPeerInputChanged(s)))
@@ -1413,33 +1426,34 @@ impl MeshBusPanel {
         let match_btn: Element<'_, crate::Message> = button(
             text("Match @peer")
                 .size(TypeRole::Body.size_in(sizes))
-                .color(palette.text.into_iced_color()),
+                .colr(palette.text.into_cosmic_color()),
         )
         .padding([6u16, 14u16])
-        .style(move |_t, _s: ButtonStatus| button::Style {
+        .sty(move |_t: &Theme, _s: ButtonStatus| button::Style {
             snap: false,
-            background: Some(Background::Color(palette.raised.into_iced_color())),
-            text_color: palette.text.into_iced_color(),
+            background: Some(Background::Color(palette.raised.into_cosmic_color())),
+            text_color: palette.text.into_cosmic_color(),
             border: Border {
                 color: Color::TRANSPARENT,
                 width: 0.0,
                 radius: r.into(),
             },
-            shadow: iced::Shadow::default(),
+            shadow: cosmic::iced::Shadow::default(),
+            ..button::Style::default()
         })
         .on_press(crate::Message::MeshBus(Message::SubsMatchPeerClicked))
         .into();
 
         let peer_row: Element<'_, crate::Message> =
             row![peer_input, Space::new().width(8), match_btn,]
-                .align_y(iced::Alignment::Center)
+                .align_y(cosmic::iced::Alignment::Center)
                 .into();
 
         // — Error display —
         let error_row: Option<Element<'_, crate::Message>> = self.subs.error.as_deref().map(|e| {
             text(format!("Error: {e}"))
                 .size(TypeRole::Caption.size_in(sizes))
-                .color(Color {
+                .colr(Color {
                     r: 0.9,
                     g: 0.2,
                     b: 0.2,
@@ -1474,11 +1488,11 @@ impl MeshBusPanel {
         if self.dnd.loading {
             return text("Loading…")
                 .size(TypeRole::Body.size_in(sizes))
-                .color(palette.text_muted.into_iced_color())
+                .colr(palette.text_muted.into_cosmic_color())
                 .into();
         }
 
-        let accent = palette.accent.into_iced_color();
+        let accent = palette.accent.into_cosmic_color();
         let radii = Radii::defaults();
         let r = f32::from(radii.sm);
 
@@ -1504,21 +1518,21 @@ impl MeshBusPanel {
         let toggle_bg = if active {
             accent
         } else {
-            palette.raised.into_iced_color()
+            palette.raised.into_cosmic_color()
         };
         let toggle_fg = if active {
             Color::WHITE
         } else {
-            palette.text.into_iced_color()
+            palette.text.into_cosmic_color()
         };
 
         let toggle_btn: Element<'_, crate::Message> = button(
             text(toggle_label)
                 .size(TypeRole::Body.size_in(sizes))
-                .color(toggle_fg),
+                .colr(toggle_fg),
         )
         .padding([8u16, 20u16])
-        .style(move |_t, _s: ButtonStatus| button::Style {
+        .sty(move |_t: &Theme, _s: ButtonStatus| button::Style {
             snap: false,
             background: Some(Background::Color(toggle_bg)),
             text_color: toggle_fg,
@@ -1527,7 +1541,8 @@ impl MeshBusPanel {
                 width: 0.0,
                 radius: r.into(),
             },
-            shadow: iced::Shadow::default(),
+            shadow: cosmic::iced::Shadow::default(),
+            ..button::Style::default()
         })
         .on_press(crate::Message::MeshBus(Message::DndToggleClicked))
         .into();
@@ -1546,22 +1561,22 @@ impl MeshBusPanel {
                 Space::new().width(12),
                 text(meta_str)
                     .size(TypeRole::Caption.size_in(sizes))
-                    .color(palette.text_muted.into_iced_color()),
+                    .colr(palette.text_muted.into_cosmic_color()),
             ]
-            .align_y(iced::Alignment::Center)
+            .align_y(cosmic::iced::Alignment::Center)
             .into()
         };
 
         // — Quiet hours editor —
         let quiet_label = text("Global quiet window")
             .size(TypeRole::Subheading.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
 
         let quiet_hint = text(
             "Messages delivered outside this window only. Leave blank to deliver around the clock.",
         )
         .size(TypeRole::Caption.size_in(sizes))
-        .color(palette.text_muted.into_iced_color());
+        .colr(palette.text_muted.into_cosmic_color());
 
         let start_input: Element<'_, crate::Message> = text_input("22:00", &self.dnd.quiet_start)
             .on_input(|s| crate::Message::MeshBus(Message::DndQuietStartChanged(s)))
@@ -1582,10 +1597,10 @@ impl MeshBusPanel {
                 "Apply"
             })
             .size(TypeRole::Body.size_in(sizes))
-            .color(save_fg),
+            .colr(save_fg),
         )
         .padding([6u16, 16u16])
-        .style(move |_t, _s: ButtonStatus| button::Style {
+        .sty(move |_t: &Theme, _s: ButtonStatus| button::Style {
             snap: false,
             background: Some(Background::Color(save_bg)),
             text_color: save_fg,
@@ -1594,7 +1609,8 @@ impl MeshBusPanel {
                 width: 0.0,
                 radius: r.into(),
             },
-            shadow: iced::Shadow::default(),
+            shadow: cosmic::iced::Shadow::default(),
+            ..button::Style::default()
         })
         .on_press(crate::Message::MeshBus(Message::DndSaveClicked))
         .into();
@@ -1604,13 +1620,13 @@ impl MeshBusPanel {
             Space::new().width(8),
             text("→")
                 .size(TypeRole::Body.size_in(sizes))
-                .color(palette.text_muted.into_iced_color()),
+                .colr(palette.text_muted.into_cosmic_color()),
             Space::new().width(8),
             end_input,
             Space::new().width(12),
             save_btn,
         ]
-        .align_y(iced::Alignment::Center)
+        .align_y(cosmic::iced::Alignment::Center)
         .into();
 
         // — Active snoozes —
@@ -1623,12 +1639,12 @@ impl MeshBusPanel {
 
         let snooze_label = text(format!("Active fleet snoozes ({snooze_count})"))
             .size(TypeRole::Subheading.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
 
         let snooze_body: Element<'_, crate::Message> = if snooze_count == 0 {
             text("No active snoozes — use `mde-bus mute <topic> --duration <D>` to snooze.")
                 .size(TypeRole::Caption.size_in(sizes))
-                .color(palette.text_muted.into_iced_color())
+                .colr(palette.text_muted.into_cosmic_color())
                 .into()
         } else {
             let rows: Vec<Element<'_, crate::Message>> = self
@@ -1646,7 +1662,7 @@ impl MeshBusPanel {
                     };
                     text(format!("{}{}", sn.topic, by))
                         .size(TypeRole::Caption.size_in(sizes))
-                        .color(palette.text.into_iced_color())
+                        .colr(palette.text.into_cosmic_color())
                         .into()
                 })
                 .collect();
@@ -1657,7 +1673,7 @@ impl MeshBusPanel {
         let error_row: Option<Element<'_, crate::Message>> = self.dnd.error.as_deref().map(|e| {
             text(format!("Error: {e}"))
                 .size(TypeRole::Caption.size_in(sizes))
-                .color(Color {
+                .colr(Color {
                     r: 0.9,
                     g: 0.2,
                     b: 0.2,
@@ -1692,11 +1708,11 @@ impl MeshBusPanel {
         if self.hooks.loading {
             return text("Loading…")
                 .size(TypeRole::Body.size_in(sizes))
-                .color(palette.text_muted.into_iced_color())
+                .colr(palette.text_muted.into_cosmic_color())
                 .into();
         }
 
-        let accent = palette.accent.into_iced_color();
+        let accent = palette.accent.into_cosmic_color();
         let radii = Radii::defaults();
         let r = f32::from(radii.sm);
 
@@ -1710,7 +1726,7 @@ impl MeshBusPanel {
         let mut sample_row_items: Vec<Element<'_, crate::Message>> = vec![
             text("Insert sample:")
                 .size(TypeRole::Caption.size_in(sizes))
-                .color(palette.text_muted.into_iced_color())
+                .colr(palette.text_muted.into_cosmic_color())
                 .into(),
             Space::new().width(8).into(),
         ];
@@ -1719,19 +1735,20 @@ impl MeshBusPanel {
                 button(
                     text(s.label)
                         .size(TypeRole::Caption.size_in(sizes))
-                        .color(palette.text.into_iced_color()),
+                        .colr(palette.text.into_cosmic_color()),
                 )
                 .padding([4u16, 10u16])
-                .style(move |_t, _s: ButtonStatus| button::Style {
+                .sty(move |_t: &Theme, _s: ButtonStatus| button::Style {
                     snap: false,
-                    background: Some(Background::Color(palette.raised.into_iced_color())),
-                    text_color: palette.text.into_iced_color(),
+                    background: Some(Background::Color(palette.raised.into_cosmic_color())),
+                    text_color: palette.text.into_cosmic_color(),
                     border: Border {
                         color: Color::TRANSPARENT,
                         width: 0.0,
                         radius: r.into(),
                     },
-                    shadow: iced::Shadow::default(),
+                    shadow: cosmic::iced::Shadow::default(),
+                    ..button::Style::default()
                 })
                 .on_press(crate::Message::MeshBus(Message::HooksSampleInserted(i)))
                 .into(),
@@ -1739,18 +1756,18 @@ impl MeshBusPanel {
         }
         let sample_row: Element<'_, crate::Message> = row(sample_row_items)
             .spacing(6)
-            .align_y(iced::Alignment::Center)
+            .align_y(cosmic::iced::Alignment::Center)
             .into();
 
         // — Apply button —
         let has_error = self.hooks.validation_error.is_some();
         let apply_bg = if has_error {
-            palette.raised.into_iced_color()
+            palette.raised.into_cosmic_color()
         } else {
             accent
         };
         let apply_fg = if has_error {
-            palette.text_muted.into_iced_color()
+            palette.text_muted.into_cosmic_color()
         } else {
             Color::WHITE
         };
@@ -1764,10 +1781,10 @@ impl MeshBusPanel {
             button(
                 text(apply_label)
                     .size(TypeRole::Body.size_in(sizes))
-                    .color(apply_fg),
+                    .colr(apply_fg),
             )
             .padding([6u16, 16u16])
-            .style(move |_t, _s: ButtonStatus| button::Style {
+            .sty(move |_t: &Theme, _s: ButtonStatus| button::Style {
                 snap: false,
                 background: Some(Background::Color(apply_bg)),
                 text_color: apply_fg,
@@ -1776,17 +1793,18 @@ impl MeshBusPanel {
                     width: 0.0,
                     radius: r.into(),
                 },
-                shadow: iced::Shadow::default(),
+                shadow: cosmic::iced::Shadow::default(),
+                ..button::Style::default()
             })
             .into()
         } else {
             button(
                 text(apply_label)
                     .size(TypeRole::Body.size_in(sizes))
-                    .color(apply_fg),
+                    .colr(apply_fg),
             )
             .padding([6u16, 16u16])
-            .style(move |_t, _s: ButtonStatus| button::Style {
+            .sty(move |_t: &Theme, _s: ButtonStatus| button::Style {
                 snap: false,
                 background: Some(Background::Color(apply_bg)),
                 text_color: apply_fg,
@@ -1795,7 +1813,8 @@ impl MeshBusPanel {
                     width: 0.0,
                     radius: r.into(),
                 },
-                shadow: iced::Shadow::default(),
+                shadow: cosmic::iced::Shadow::default(),
+                ..button::Style::default()
             })
             .on_press(crate::Message::MeshBus(Message::HooksSaveClicked))
             .into()
@@ -1808,7 +1827,7 @@ impl MeshBusPanel {
             items.push(
                 text(format!("⚠ {e}"))
                     .size(TypeRole::Caption.size_in(sizes))
-                    .color(Color {
+                    .colr(Color {
                         r: 0.9,
                         g: 0.2,
                         b: 0.2,

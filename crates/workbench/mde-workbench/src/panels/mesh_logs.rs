@@ -11,8 +11,11 @@
 //! pure and unit-tested; the on-Cosmic `/preview` pass (and embedding the
 //! live Netdata strip vs. the deep-link) is the deferred tail.
 
-use iced::widget::{column, row, scrollable, text};
-use iced::{Element, Length, Task};
+// CUT-1: cosmic::Element bakes in cosmic::Theme, matching panel_chrome's
+// container helpers; the local view/body elements must thread the same theme.
+use cosmic::iced::widget::{column, row, scrollable, text};
+use cosmic::iced::{Length, Task};
+use cosmic::Element;
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -164,7 +167,7 @@ impl MeshLogsPanel {
         let density = crate::live_theme::tokens().density;
 
         // Window selector buttons (the active one is non-pressable).
-        let mut controls = row![].spacing(8).align_y(iced::Alignment::Center);
+        let mut controls = row![].spacing(8).align_y(cosmic::iced::Alignment::Center);
         for w in WINDOWS {
             let active = w.since == self.since;
             controls = controls.push(variant_button(
@@ -196,9 +199,13 @@ impl MeshLogsPanel {
             };
             text(msg).size(13).into()
         } else {
-            scrollable(text(self.log.clone()).size(12).font(iced::Font::MONOSPACE))
-                .height(Length::Fill)
-                .into()
+            scrollable(
+                text(self.log.clone())
+                    .size(12)
+                    .font(cosmic::iced::Font::MONOSPACE),
+            )
+            .height(Length::Fill)
+            .into()
         };
 
         // PLANES-2 — the journal/metrics panel is the Netdata surface.
@@ -211,10 +218,10 @@ impl MeshLogsPanel {
             column![
                 row![
                     text(format!("Mesh daemon journal — {MESH_UNIT}")).size(20),
-                    iced::widget::Space::new().width(Length::Fill),
+                    cosmic::iced::widget::Space::new().width(Length::Fill),
                     netdata,
                 ]
-                .align_y(iced::Alignment::Center),
+                .align_y(cosmic::iced::Alignment::Center),
                 controls,
                 body,
             ]

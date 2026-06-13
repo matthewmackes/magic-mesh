@@ -13,8 +13,11 @@
 
 use std::path::{Path, PathBuf};
 
-use iced::widget::{column, row, scrollable, text, text_input};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{column, row, scrollable, text, text_input};
+use cosmic::iced::{Length, Task};
+// CUT-1: cosmic::Element bakes in cosmic::Theme, matching panel_chrome's
+// panel_container signature (which takes cosmic::Element).
+use cosmic::Element;
 use serde::Deserialize;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -185,7 +188,7 @@ impl FleetLogsPanel {
             .padding(8)
             .width(Length::Fixed(360.0));
 
-        let mut levels = row![].spacing(6).align_y(iced::Alignment::Center);
+        let mut levels = row![].spacing(6).align_y(cosmic::iced::Alignment::Center);
         for l in LEVELS {
             let active = self.min_level == l;
             levels = levels.push(variant_button(
@@ -232,28 +235,26 @@ impl FleetLogsPanel {
                     text(r.message.clone()).size(13),
                 ]
                 .spacing(10)
-                .align_y(iced::Alignment::Center),
+                .align_y(cosmic::iced::Alignment::Center),
             );
         }
 
-        panel_container(
-            column![
-                text(format!(
-                    "Fleet logs — {} record(s), {} shown",
-                    self.all.len(),
-                    visible.len()
-                ))
-                .size(20),
-                row![search, levels, refresh]
-                    .spacing(12)
-                    .align_y(iced::Alignment::Center),
-                scrollable(list).height(Length::Fill),
-            ]
-            .spacing(16)
-            .width(Length::Fill)
-            .into(),
-            density,
-        )
+        let body: Element<'_, crate::Message> = column![
+            text(format!(
+                "Fleet logs — {} record(s), {} shown",
+                self.all.len(),
+                visible.len()
+            ))
+            .size(20),
+            row![search, levels, refresh]
+                .spacing(12)
+                .align_y(cosmic::iced::Alignment::Center),
+            scrollable(list).height(Length::Fill),
+        ]
+        .spacing(16)
+        .width(Length::Fill)
+        .into();
+        panel_container(body, density)
     }
 }
 

@@ -6,8 +6,9 @@
 //! text as the shell About, the installer, and the daemon banner. Edit
 //! `DISCLAIMER.md` and every consumer updates on the next build.
 
-use iced::widget::{column, container, scrollable, text, Space};
-use iced::{Element, Length, Padding};
+use crate::cosmic_compat::prelude::*;
+use cosmic::iced::widget::{column, container, scrollable, text, Space};
+use cosmic::iced::{Element, Length, Padding};
 use mde_theme::{FontSize, TypeRole};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -27,17 +28,17 @@ impl AboutPanel {
         mde_disclaimer::TEXT
     }
 
-    pub fn view<'a>() -> Element<'a, crate::Message> {
+    pub fn view<'a>() -> Element<'a, crate::Message, cosmic::Theme> {
         let palette = crate::live_theme::palette();
         let sizes = FontSize::defaults();
         let title = text("About Mackes Workstation")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
         // The full canonical text in one block so the rendered copy
         // matches the file exactly (no re-splitting / re-wording).
         let body = text(Self::disclaimer_text())
             .size(TypeRole::Body.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
         let col = column![title, Space::new().height(Length::Fixed(12.0)), body].spacing(0);
         container(scrollable(col))
             .padding(Padding::from([24u16, 32u16]))

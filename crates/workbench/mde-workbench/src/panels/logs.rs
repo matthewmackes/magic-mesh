@@ -10,10 +10,10 @@
 
 use std::path::PathBuf;
 
-use iced::widget::{column, container, row, scrollable, text};
+use cosmic::iced::widget::{column, container, row, scrollable, text};
 
 use crate::controls::{variant_button, ButtonVariant};
-use iced::{Element, Length, Padding, Task};
+use cosmic::iced::{Element, Length, Padding, Task};
 use tokio::process::Command;
 
 /// Max lines tailed from each log source. Matches the v1.x
@@ -71,7 +71,7 @@ impl LogsPanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         // UX-7.a — refresh routed through the shared button variant.
         let refresh_btn = variant_button(
             "Refresh",

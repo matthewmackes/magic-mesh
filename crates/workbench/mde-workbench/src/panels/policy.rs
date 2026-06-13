@@ -12,9 +12,12 @@
 
 use std::time::SystemTime;
 
-use iced::widget::{button, column, container, row, scrollable, text, Space};
-use iced::{Background, Border, Color, Element, Length, Padding, Task, Theme};
+use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
+use cosmic::iced::{Background, Border, Color, Length, Padding, Task};
+use cosmic::{Element, Theme};
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
+
+use crate::cosmic_compat::prelude::*;
 
 /// One policy + its current compliance, parsed from
 /// `mackesd policy list --json`.
@@ -102,7 +105,7 @@ impl PolicyPanel {
 
         let title = text("Policy")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
 
         let violating = self.rows.iter().filter(|r| !r.is_compliant()).count();
         let subtitle_text = if self.last_run_at.is_some() {
@@ -117,37 +120,43 @@ impl PolicyPanel {
         };
         let subtitle = text(subtitle_text)
             .size(TypeRole::Body.size_in(sizes))
-            .color(palette.text_muted.into_iced_color());
+            .colr(palette.text_muted.into_cosmic_color());
 
-        let accent = palette.accent.into_iced_color();
+        let accent = palette.accent.into_cosmic_color();
         let refresh_btn = button(
             text(if self.busy { "Loading…" } else { "Refresh" })
                 .size(13)
-                .color(Color::WHITE),
+                .colr(Color::WHITE),
         )
         .padding(Padding::from([6u16, 14u16]))
-        .style(move |_t: &Theme, status: iced::widget::button::Status| {
-            let bg = match status {
-                iced::widget::button::Status::Hovered => Color {
-                    r: accent.r * 1.10,
-                    g: accent.g * 1.10,
-                    b: accent.b * 1.10,
-                    a: accent.a,
-                },
-                _ => accent,
-            };
-            iced::widget::button::Style {
-                snap: false,
-                background: Some(Background::Color(bg)),
-                text_color: Color::WHITE,
-                border: Border {
-                    color: Color::TRANSPARENT,
-                    width: 0.0,
-                    radius: 6.0.into(),
-                },
-                shadow: iced::Shadow::default(),
-            }
-        })
+        .sty(
+            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+                let bg = match status {
+                    cosmic::iced::widget::button::Status::Hovered => Color {
+                        r: accent.r * 1.10,
+                        g: accent.g * 1.10,
+                        b: accent.b * 1.10,
+                        a: accent.a,
+                    },
+                    _ => accent,
+                };
+                cosmic::iced::widget::button::Style {
+                    snap: false,
+                    background: Some(Background::Color(bg)),
+                    text_color: Color::WHITE,
+                    icon_color: None,
+                    border_radius: 6.0.into(),
+                    border_width: 0.0,
+                    border_color: Color::TRANSPARENT,
+                    border: Border {
+                        color: Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 6.0.into(),
+                    },
+                    shadow: cosmic::iced::Shadow::default(),
+                }
+            },
+        )
         .on_press(crate::Message::Policy(Message::RefreshClicked));
 
         let header = row![
@@ -155,7 +164,7 @@ impl PolicyPanel {
             Space::new().width(Length::Fill),
             refresh_btn,
         ]
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
         let mut rows_col = column![].spacing(6);
         for r in &self.rows {
@@ -182,9 +191,9 @@ impl PolicyPanel {
 
 fn severity_color(sev: &str, palette: Palette) -> Color {
     match sev {
-        "crit" => palette.danger.into_iced_color(),
-        "warn" => palette.warning.into_iced_color(),
-        _ => palette.accent.into_iced_color(),
+        "crit" => palette.danger.into_cosmic_color(),
+        "warn" => palette.warning.into_cosmic_color(),
+        _ => palette.accent.into_cosmic_color(),
     }
 }
 
@@ -193,7 +202,7 @@ fn policy_row<'a>(r: &'a PolicyRow, palette: Palette) -> Element<'a, crate::Mess
     let (status_icon, status_color, status_text) = if compliant {
         (
             Icon::StatusOk,
-            palette.success.into_iced_color(),
+            palette.success.into_cosmic_color(),
             "compliant".to_string(),
         )
     } else {
@@ -206,20 +215,18 @@ fn policy_row<'a>(r: &'a PolicyRow, palette: Palette) -> Element<'a, crate::Mess
 
     let resolved = mde_icon(status_icon, IconSize::Inline);
     let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
+        use cosmic::iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(svg_bytes))
             .width(Length::Fixed(16.0))
             .height(Length::Fixed(16.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
-                    color: Some(status_color),
-                },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style {
+                color: Some(status_color),
+            })
             .into()
     } else {
         text(resolved.fallback_glyph)
             .size(16.0)
-            .color(status_color)
+            .colr(status_color)
             .into()
     };
 
@@ -227,22 +234,22 @@ fn policy_row<'a>(r: &'a PolicyRow, palette: Palette) -> Element<'a, crate::Mess
         icon_widget,
         text(r.name.clone())
             .size(12)
-            .color(palette.text.into_iced_color()),
+            .colr(palette.text.into_cosmic_color()),
         text(r.severity.to_uppercase())
             .size(9)
-            .color(severity_color(&r.severity, palette)),
+            .colr(severity_color(&r.severity, palette)),
         Space::new().width(Length::Fill),
-        text(status_text).size(11).color(status_color),
+        text(status_text).size(11).colr(status_color),
     ]
     .spacing(8)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     let assertion = text(r.assertion())
         .size(11)
-        .color(palette.accent.into_iced_color());
+        .colr(palette.accent.into_cosmic_color());
     let desc = text(r.description.clone())
         .size(11)
-        .color(palette.text_muted.into_iced_color());
+        .colr(palette.text_muted.into_cosmic_color());
 
     // When violated, name the offending peers so the operator can act
     // (the Remediation panel fires a plan against them).
@@ -251,16 +258,16 @@ fn policy_row<'a>(r: &'a PolicyRow, palette: Palette) -> Element<'a, crate::Mess
         body = body.push(
             text(format!("violating: {}", r.violated_peers.join(", ")))
                 .size(10)
-                .color(severity_color(&r.severity, palette)),
+                .colr(severity_color(&r.severity, palette)),
         );
     }
 
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
     container(column![head, body].spacing(4))
         .padding(Padding::from([10u16, 14u16]))
         .width(Length::Fill)
-        .style(move |_| container::Style {
+        .sty(move |_| container::Style {
             snap: false,
             background: Some(Background::Color(bg)),
             border: Border {
@@ -278,14 +285,14 @@ fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a,
         if let Some(err) = error {
             (
                 Icon::StatusError,
-                palette.danger.into_iced_color(),
+                palette.danger.into_cosmic_color(),
                 "Couldn't load policies".to_string(),
                 err.to_string(),
             )
         } else {
             (
                 Icon::StatusOk,
-                palette.success.into_iced_color(),
+                palette.success.into_cosmic_color(),
                 "No policies loaded".to_string(),
                 "The core pack ships enabled (all-nodes-current, no-critical-alarms). \
                  Drop a TOML policy under the workgroup's policies/ dir to add more."
@@ -294,33 +301,31 @@ fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a,
         };
     let resolved = mde_icon(icon_kind, IconSize::PanelHeader);
     let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
+        use cosmic::iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(svg_bytes))
             .width(Length::Fixed(32.0))
             .height(Length::Fixed(32.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
-                    color: Some(icon_color),
-                },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style {
+                color: Some(icon_color),
+            })
             .into()
     } else {
         text(resolved.fallback_glyph)
             .size(32.0)
-            .color(icon_color)
+            .colr(icon_color)
             .into()
     };
     container(
         column![
             icon_widget,
             Space::new().height(Length::Fixed(8.0)),
-            text(heading).size(14).color(palette.text.into_iced_color()),
+            text(heading).size(14).colr(palette.text.into_cosmic_color()),
             text(body)
                 .size(11)
-                .color(palette.text_muted.into_iced_color()),
+                .colr(palette.text_muted.into_cosmic_color()),
         ]
         .spacing(2)
-        .align_x(iced::alignment::Horizontal::Center),
+        .align_x(cosmic::iced::alignment::Horizontal::Center),
     )
     .padding(Padding::from([32u16, 16u16]))
     .width(Length::Fill)

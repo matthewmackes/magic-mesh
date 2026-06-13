@@ -8,8 +8,12 @@
 
 use std::collections::VecDeque;
 
-use iced::widget::canvas::{self, Frame, Geometry, Path, Program, Stroke};
-use iced::{mouse, Color, Element, Length, Point, Rectangle, Renderer, Theme};
+use cosmic::iced::widget::canvas::{self, Frame, Geometry, Path, Program, Stroke};
+use cosmic::iced::{mouse, Color, Element, Length, Point, Rectangle, Renderer};
+// CUT-1: the canvas renders inside a `cosmic::Theme`-themed tree (libcosmic's
+// theme), NOT the built-in `cosmic::iced::Theme` — pin both the Program impl
+// and the returned Element to it so they unify with every other panel.
+use cosmic::Theme;
 
 /// Ring-buffer capacity (≈2 min at the 2 s sample cadence).
 pub const SPARK_CAP: usize = 60;
@@ -50,7 +54,7 @@ struct Spark {
     color: Color,
 }
 
-impl<Message> Program<Message> for Spark {
+impl<Message> Program<Message, Theme> for Spark {
     type State = ();
 
     fn draw(
@@ -89,7 +93,7 @@ pub fn sparkline<'a, Message: 'a>(
     color: Color,
     width: f32,
     height: f32,
-) -> Element<'a, Message> {
+) -> Element<'a, Message, Theme> {
     canvas::Canvas::new(Spark { values, color })
         .width(Length::Fixed(width))
         .height(Length::Fixed(height))

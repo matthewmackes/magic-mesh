@@ -12,13 +12,15 @@
 
 use std::time::SystemTime;
 
-use iced::widget::{
+use cosmic::iced::widget::{
     button, column, container, pick_list, row, scrollable, text, text_input, Space,
 };
-use iced::{Background, Border, Color, Element, Length, Padding, Task, Theme};
+use cosmic::iced::{Background, Border, Color, Length, Padding};
+use cosmic::{Element, Task, Theme};
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
 
 use crate::controls::{variant_button, ButtonVariant};
+use crate::cosmic_compat::prelude::*;
 
 /// W56 — the roles a profile may pin (the backend validates against the
 /// same set; surfaced here as the form's picker).
@@ -199,7 +201,7 @@ impl ProfilesPanel {
 
         let title = text("Install Profiles")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
         let subtitle_text = if self.last_run_at.is_some() {
             format!(
                 "{} profile{} — one image carries them all (boot-menu choice at install)",
@@ -211,37 +213,40 @@ impl ProfilesPanel {
         };
         let subtitle = text(subtitle_text)
             .size(TypeRole::Body.size_in(sizes))
-            .color(palette.text_muted.into_iced_color());
+            .colr(palette.text_muted.into_cosmic_color());
 
-        let accent = palette.accent.into_iced_color();
+        let accent = palette.accent.into_cosmic_color();
         let refresh_btn = button(
             text(if self.busy { "Loading…" } else { "Refresh" })
                 .size(13)
-                .color(Color::WHITE),
+                .colr(Color::WHITE),
         )
         .padding(Padding::from([6u16, 14u16]))
-        .style(move |_t: &Theme, status: iced::widget::button::Status| {
-            let bg = match status {
-                iced::widget::button::Status::Hovered => Color {
-                    r: accent.r * 1.10,
-                    g: accent.g * 1.10,
-                    b: accent.b * 1.10,
-                    a: accent.a,
-                },
-                _ => accent,
-            };
-            iced::widget::button::Style {
-                snap: false,
-                background: Some(Background::Color(bg)),
-                text_color: Color::WHITE,
-                border: Border {
-                    color: Color::TRANSPARENT,
-                    width: 0.0,
-                    radius: 6.0.into(),
-                },
-                shadow: iced::Shadow::default(),
-            }
-        })
+        .sty(
+            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+                let bg = match status {
+                    cosmic::iced::widget::button::Status::Hovered => Color {
+                        r: accent.r * 1.10,
+                        g: accent.g * 1.10,
+                        b: accent.b * 1.10,
+                        a: accent.a,
+                    },
+                    _ => accent,
+                };
+                cosmic::iced::widget::button::Style {
+                    snap: false,
+                    background: Some(Background::Color(bg)),
+                    text_color: Color::WHITE,
+                    border: Border {
+                        color: Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 6.0.into(),
+                    },
+                    shadow: cosmic::iced::Shadow::default(),
+                    ..cosmic::iced::widget::button::Style::default()
+                }
+            },
+        )
         .on_press(crate::Message::Profiles(Message::RefreshClicked));
 
         let header = row![
@@ -249,7 +254,7 @@ impl ProfilesPanel {
             Space::new().width(Length::Fill),
             refresh_btn,
         ]
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
         let mut rows_col = column![].spacing(6);
         for r in &self.rows {
@@ -262,7 +267,7 @@ impl ProfilesPanel {
         // W56 — the form-edit write side: create a profile or overwrite
         // an existing one (Edit on a row populates this), validated +
         // written by `mackesd profiles --set`.
-        let role_pick: pick_list::PickList<'_, &'static str, _, _, crate::Message> =
+        let role_pick: pick_list::PickList<'_, &'static str, _, _, crate::Message, cosmic::Theme> =
             pick_list(ROLES, current_role(&self.form_role), |r| {
                 crate::Message::Profiles(Message::FormRole(r.to_string()))
             });
@@ -330,34 +335,29 @@ fn current_role(v: &str) -> Option<&'static str> {
 }
 
 fn profile_row<'a>(r: &'a ProfileRow, palette: Palette) -> Element<'a, crate::Message> {
-    let accent = palette.accent.into_iced_color();
+    let accent = palette.accent.into_cosmic_color();
     let resolved = mde_icon(Icon::Update, IconSize::Inline);
     let icon_widget: Element<'a, crate::Message> = if let Some(b) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
+        use cosmic::iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(b))
             .width(Length::Fixed(16.0))
             .height(Length::Fixed(16.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
-                    color: Some(accent),
-                },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style {
+                color: Some(accent),
+            })
             .into()
     } else {
-        text(resolved.fallback_glyph)
-            .size(16.0)
-            .color(accent)
-            .into()
+        text(resolved.fallback_glyph).size(16.0).colr(accent).into()
     };
 
     let head = row![
         icon_widget,
         text(r.name.clone())
             .size(12)
-            .color(palette.text.into_iced_color()),
+            .colr(palette.text.into_cosmic_color()),
         text(format!("role: {}", r.role))
             .size(10)
-            .color(palette.accent.into_iced_color()),
+            .colr(palette.accent.into_cosmic_color()),
         Space::new().width(Length::Fill),
         text(if r.auto_join {
             "auto-join"
@@ -365,10 +365,10 @@ fn profile_row<'a>(r: &'a ProfileRow, palette: Palette) -> Element<'a, crate::Me
             "manual enroll"
         })
         .size(10)
-        .color(if r.auto_join {
-            palette.success.into_iced_color()
+        .colr(if r.auto_join {
+            palette.success.into_cosmic_color()
         } else {
-            palette.text_muted.into_iced_color()
+            palette.text_muted.into_cosmic_color()
         }),
         // W56 — per-row edit/delete (delete reverts a core profile to its
         // shipped default; removes an operator-authored one).
@@ -388,11 +388,11 @@ fn profile_row<'a>(r: &'a ProfileRow, palette: Palette) -> Element<'a, crate::Me
         ),
     ]
     .spacing(8)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     let desc = text(r.description.clone())
         .size(11)
-        .color(palette.text_muted.into_iced_color());
+        .colr(palette.text_muted.into_cosmic_color());
     let tags_line = text(format!(
         "tags: {} · ks: {}",
         if r.tags.is_empty() {
@@ -407,14 +407,14 @@ fn profile_row<'a>(r: &'a ProfileRow, palette: Palette) -> Element<'a, crate::Me
         }
     ))
     .size(10)
-    .color(palette.text_muted.into_iced_color());
+    .colr(palette.text_muted.into_cosmic_color());
 
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
     container(column![head, desc, tags_line].spacing(3))
         .padding(Padding::from([10u16, 14u16]))
         .width(Length::Fill)
-        .style(move |_| container::Style {
+        .sty(move |_| container::Style {
             snap: false,
             background: Some(Background::Color(bg)),
             border: Border {
@@ -430,13 +430,13 @@ fn profile_row<'a>(r: &'a ProfileRow, palette: Palette) -> Element<'a, crate::Me
 fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a, crate::Message> {
     let (icon_color, heading, body): (Color, String, String) = if let Some(err) = error {
         (
-            palette.danger.into_iced_color(),
+            palette.danger.into_cosmic_color(),
             "Couldn't read profiles".to_string(),
             err.to_string(),
         )
     } else {
         (
-            palette.accent.into_iced_color(),
+            palette.accent.into_cosmic_color(),
             "No install profiles".to_string(),
             "The core pack ships one profile per role (lighthouse / server / workstation). \
              Drop a TOML profile under the workgroup's profiles/ dir to add more."
@@ -450,33 +450,31 @@ fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a,
     };
     let resolved = mde_icon(icon_kind, IconSize::PanelHeader);
     let icon_widget: Element<'a, crate::Message> = if let Some(b) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
+        use cosmic::iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(b))
             .width(Length::Fixed(32.0))
             .height(Length::Fixed(32.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
-                    color: Some(icon_color),
-                },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style {
+                color: Some(icon_color),
+            })
             .into()
     } else {
         text(resolved.fallback_glyph)
             .size(32.0)
-            .color(icon_color)
+            .colr(icon_color)
             .into()
     };
     container(
         column![
             icon_widget,
             Space::new().height(Length::Fixed(8.0)),
-            text(heading).size(14).color(palette.text.into_iced_color()),
+            text(heading).size(14).colr(palette.text.into_cosmic_color()),
             text(body)
                 .size(11)
-                .color(palette.text_muted.into_iced_color()),
+                .colr(palette.text_muted.into_cosmic_color()),
         ]
         .spacing(2)
-        .align_x(iced::alignment::Horizontal::Center),
+        .align_x(cosmic::iced::alignment::Horizontal::Center),
     )
     .padding(Padding::from([32u16, 16u16]))
     .width(Length::Fill)

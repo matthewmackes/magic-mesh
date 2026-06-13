@@ -15,8 +15,8 @@
 //! active sink + changes propagate to PipeWire immediately",
 //! which the pickers alone satisfy.
 
-use iced::widget::{checkbox, column, pick_list, row, slider, text};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{checkbox, column, pick_list, row, slider, text};
+use cosmic::iced::{Element, Length, Task};
 
 use crate::controls::{variant_button, ButtonVariant};
 use tokio::process::Command;
@@ -214,9 +214,9 @@ impl SoundPanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         if !self.pactl_available {
-            return column![
+            let body: Element<'_, crate::Message, cosmic::Theme> = column![
                 text("Audio routing unavailable").size(18),
                 text(
                     "MDE talks to PulseAudio / PipeWire through `pactl`. \
@@ -228,6 +228,7 @@ impl SoundPanel {
             .spacing(8)
             .width(Length::Fill)
             .into();
+            return body;
         }
 
         // UX-7.a — refresh routed through the shared button
@@ -242,16 +243,18 @@ impl SoundPanel {
 
         let sinks = self.sinks.clone();
         let sources = self.sources.clone();
-        let sink_pick: pick_list::PickList<'_, String, _, _, crate::Message> = pick_list(
-            sinks,
-            current_or_none(&self.sinks, &self.default_sink),
-            |v| crate::Message::Sound(Message::SinkSelected(v)),
-        );
-        let source_pick: pick_list::PickList<'_, String, _, _, crate::Message> = pick_list(
-            sources,
-            current_or_none(&self.sources, &self.default_source),
-            |v| crate::Message::Sound(Message::SourceSelected(v)),
-        );
+        let sink_pick: pick_list::PickList<'_, String, _, _, crate::Message, cosmic::Theme> =
+            pick_list(
+                sinks,
+                current_or_none(&self.sinks, &self.default_sink),
+                |v| crate::Message::Sound(Message::SinkSelected(v)),
+            );
+        let source_pick: pick_list::PickList<'_, String, _, _, crate::Message, cosmic::Theme> =
+            pick_list(
+                sources,
+                current_or_none(&self.sources, &self.default_source),
+                |v| crate::Message::Sound(Message::SourceSelected(v)),
+            );
 
         let volume_slider = slider(0.0..=150.0, self.volume_pct as f32, |v| {
             crate::Message::Sound(Message::VolumeChanged(v as u32))
@@ -261,25 +264,33 @@ impl SoundPanel {
             .label("Muted")
             .on_toggle(|v| crate::Message::Sound(Message::MuteToggled(v)));
 
-        column![
-            row![text("Default sink").width(Length::Fixed(180.0)), sink_pick,].spacing(12),
-            row![
-                text("Volume").width(Length::Fixed(180.0)),
-                volume_slider,
-                text(format!("{}%", self.volume_pct)).width(Length::Fixed(60.0)),
-                mute_checkbox,
-            ]
-            .spacing(12),
-            row![
-                text("Default source").width(Length::Fixed(180.0)),
-                source_pick,
-            ]
-            .spacing(12),
-            row![refresh_btn, text(&self.status).size(13)].spacing(12),
+        let sink_row: Element<'_, crate::Message, cosmic::Theme> =
+            row![text("Default sink").width(Length::Fixed(180.0)), sink_pick,]
+                .spacing(12)
+                .into();
+        let volume_row: Element<'_, crate::Message, cosmic::Theme> = row![
+            text("Volume").width(Length::Fixed(180.0)),
+            volume_slider,
+            text(format!("{}%", self.volume_pct)).width(Length::Fixed(60.0)),
+            mute_checkbox,
         ]
         .spacing(12)
-        .width(Length::Fill)
-        .into()
+        .into();
+        let source_row: Element<'_, crate::Message, cosmic::Theme> = row![
+            text("Default source").width(Length::Fixed(180.0)),
+            source_pick,
+        ]
+        .spacing(12)
+        .into();
+        let refresh_row: Element<'_, crate::Message, cosmic::Theme> =
+            row![refresh_btn, text(&self.status).size(13)]
+                .spacing(12)
+                .into();
+
+        column![sink_row, volume_row, source_row, refresh_row]
+            .spacing(12)
+            .width(Length::Fill)
+            .into()
     }
 }
 

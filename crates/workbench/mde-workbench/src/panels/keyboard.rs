@@ -9,8 +9,8 @@
 
 use std::sync::Arc;
 
-use iced::widget::{column, text};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{column, text};
+use cosmic::iced::{Element, Length, Task};
 
 use crate::backend::Backend;
 use crate::controls::{variant_button, ButtonVariant};
@@ -40,7 +40,7 @@ impl KeyboardPanel {
         match message {}
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         column![
             text("Keyboard").size(18),
             text(

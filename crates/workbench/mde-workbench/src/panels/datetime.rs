@@ -19,8 +19,8 @@
 //! networked machine, falls through to shell access if
 //! someone really needs it).
 
-use iced::widget::{checkbox, column, pick_list, row, text};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{checkbox, column, pick_list, row, text};
+use cosmic::iced::{Length, Task};
 use tokio::process::Command;
 
 #[derive(Debug, Clone, Default)]
@@ -151,7 +151,7 @@ impl DateTimePanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> cosmic::Element<'_, crate::Message> {
         if !self.timedatectl_available {
             return column![
                 text("timedatectl unavailable").size(18),
@@ -167,11 +167,12 @@ impl DateTimePanel {
             .into();
         }
 
-        let tz_pick: pick_list::PickList<'_, String, _, _, crate::Message> = pick_list(
-            self.timezones.clone(),
-            current_or_none(&self.timezones, &self.timezone),
-            |v| crate::Message::DateTime(Message::TimezoneSelected(v)),
-        );
+        let tz_pick: pick_list::PickList<'_, String, _, _, crate::Message, cosmic::Theme> =
+            pick_list(
+                self.timezones.clone(),
+                current_or_none(&self.timezones, &self.timezone),
+                |v| crate::Message::DateTime(Message::TimezoneSelected(v)),
+            );
 
         column![
             row![text("Timezone").width(Length::Fixed(180.0)), tz_pick,].spacing(12),

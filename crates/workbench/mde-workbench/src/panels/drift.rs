@@ -13,9 +13,12 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use iced::widget::{button, column, container, row, scrollable, text, Space};
-use iced::{Background, Border, Color, Element, Length, Padding, Task, Theme};
+use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
+use cosmic::iced::{Background, Border, Color, Length, Padding, Task};
+use cosmic::{Element, Theme};
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
+
+use crate::cosmic_compat::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriftSeverity {
@@ -42,9 +45,9 @@ impl DriftSeverity {
     fn color(self) -> Color {
         let palette = crate::live_theme::palette();
         match self {
-            Self::Info => palette.accent.into_iced_color(),
-            Self::Warn => palette.warning.into_iced_color(),
-            Self::Error => palette.danger.into_iced_color(),
+            Self::Info => palette.accent.into_cosmic_color(),
+            Self::Warn => palette.warning.into_cosmic_color(),
+            Self::Error => palette.danger.into_cosmic_color(),
         }
     }
     fn label(self) -> &'static str {
@@ -168,7 +171,7 @@ impl DriftPanel {
 
         let title = text("Remediation")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
 
         let subtitle_text = if let Some(t) = self.last_run_at {
             format!(
@@ -184,19 +187,19 @@ impl DriftPanel {
         };
         let subtitle = text(subtitle_text)
             .size(TypeRole::Body.size_in(sizes))
-            .color(palette.text_muted.into_iced_color());
+            .colr(palette.text_muted.into_cosmic_color());
 
         let refresh_btn = button(
             text(if self.busy { "Loading…" } else { "Refresh" })
                 .size(13)
-                .color(Color::WHITE),
+                .colr(Color::WHITE),
         )
         .padding(Padding::from([6u16, 14u16]))
-        .style({
-            let accent = palette.accent.into_iced_color();
-            move |_t: &Theme, status: iced::widget::button::Status| {
+        .sty({
+            let accent = palette.accent.into_cosmic_color();
+            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
                 let bg = match status {
-                    iced::widget::button::Status::Hovered => Color {
+                    cosmic::iced::widget::button::Status::Hovered => Color {
                         r: accent.r * 1.10,
                         g: accent.g * 1.10,
                         b: accent.b * 1.10,
@@ -204,7 +207,7 @@ impl DriftPanel {
                     },
                     _ => accent,
                 };
-                iced::widget::button::Style {
+                cosmic::iced::widget::button::Style {
                     snap: false,
                     background: Some(Background::Color(bg)),
                     text_color: Color::WHITE,
@@ -213,7 +216,8 @@ impl DriftPanel {
                         width: 0.0,
                         radius: 6.0.into(),
                     },
-                    shadow: iced::Shadow::default(),
+                    shadow: cosmic::iced::Shadow::default(),
+                    ..cosmic::iced::widget::button::Style::default()
                 }
             }
         })
@@ -224,7 +228,7 @@ impl DriftPanel {
             Space::new().width(Length::Fill),
             refresh_btn,
         ]
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
         let mut rows_col = column![].spacing(6);
 
@@ -273,7 +277,7 @@ fn section_heading<'a>(label: &'static str, palette: Palette) -> Element<'a, cra
     container(
         text(label)
             .size(11)
-            .color(palette.text_muted.into_iced_color()),
+            .colr(palette.text_muted.into_cosmic_color()),
     )
     .padding(Padding::from([4u16, 2u16]))
     .into()
@@ -290,87 +294,86 @@ fn remediation_row<'a>(
     let icon_color = m.severity.color();
     let resolved = mde_icon(m.severity.icon(), IconSize::Inline);
     let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
+        use cosmic::iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(svg_bytes))
             .width(Length::Fixed(16.0))
             .height(Length::Fixed(16.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
-                    color: Some(icon_color),
-                },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style {
+                color: Some(icon_color),
+            })
             .into()
     } else {
         text(resolved.fallback_glyph)
             .size(16.0)
-            .color(icon_color)
+            .colr(icon_color)
             .into()
     };
 
     let plan_label: Element<'a, crate::Message> = match &m.plan {
         Some(plan) => text(format!("→ {plan}"))
             .size(11)
-            .color(palette.accent.into_iced_color())
+            .colr(palette.accent.into_cosmic_color())
             .into(),
         None => text("→ no remediation plan")
             .size(11)
-            .color(palette.text_muted.into_iced_color())
+            .colr(palette.text_muted.into_cosmic_color())
             .into(),
     };
 
     let mut head = row![
         icon_widget,
-        text(m.severity.label()).size(10).color(icon_color),
+        text(m.severity.label()).size(10).colr(icon_color),
         text(m.peer.clone())
             .size(11)
-            .color(palette.text.into_iced_color()),
+            .colr(palette.text.into_cosmic_color()),
         text(m.policy.clone())
             .size(11)
-            .color(palette.text_muted.into_iced_color()),
+            .colr(palette.text_muted.into_cosmic_color()),
         plan_label,
     ]
     .spacing(8)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     // W42 — surface the auto flag so the operator sees which plans the
     // leader sweep will fire on its own.
     if m.auto {
-        head = head.push(
-            text("AUTO")
-                .size(9)
-                .color(palette.warning.into_iced_color()),
-        );
+        head = head.push(text("AUTO").size(9).colr(palette.warning.into_cosmic_color()));
     }
     head = head.push(Space::new().width(Length::Fill));
 
     // Fire button — only when a plan matched (W41). Disabled while busy.
     if let Some(plan) = &m.plan {
-        let accent = palette.accent.into_iced_color();
-        let mut btn = button(text("Fire").size(12).color(Color::WHITE))
+        let accent = palette.accent.into_cosmic_color();
+        let mut btn = button(text("Fire").size(12).colr(Color::WHITE))
             .padding(Padding::from([4u16, 12u16]))
-            .style(move |_t: &Theme, status: iced::widget::button::Status| {
-                let bg = match status {
-                    iced::widget::button::Status::Hovered => Color {
-                        r: accent.r * 1.10,
-                        g: accent.g * 1.10,
-                        b: accent.b * 1.10,
-                        a: accent.a,
-                    },
-                    iced::widget::button::Status::Disabled => palette.raised.into_iced_color(),
-                    _ => accent,
-                };
-                iced::widget::button::Style {
-                    snap: false,
-                    background: Some(Background::Color(bg)),
-                    text_color: Color::WHITE,
-                    border: Border {
-                        color: Color::TRANSPARENT,
-                        width: 0.0,
-                        radius: 5.0.into(),
-                    },
-                    shadow: iced::Shadow::default(),
-                }
-            });
+            .sty(
+                move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+                    let bg = match status {
+                        cosmic::iced::widget::button::Status::Hovered => Color {
+                            r: accent.r * 1.10,
+                            g: accent.g * 1.10,
+                            b: accent.b * 1.10,
+                            a: accent.a,
+                        },
+                        cosmic::iced::widget::button::Status::Disabled => {
+                            palette.raised.into_cosmic_color()
+                        }
+                        _ => accent,
+                    };
+                    cosmic::iced::widget::button::Style {
+                        snap: false,
+                        background: Some(Background::Color(bg)),
+                        text_color: Color::WHITE,
+                        border: Border {
+                            color: Color::TRANSPARENT,
+                            width: 0.0,
+                            radius: 5.0.into(),
+                        },
+                        shadow: cosmic::iced::Shadow::default(),
+                        ..cosmic::iced::widget::button::Style::default()
+                    }
+                },
+            );
         if !busy {
             btn = btn.on_press(crate::Message::Drift(Message::Fire {
                 plan: plan.clone(),
@@ -382,14 +385,14 @@ fn remediation_row<'a>(
 
     let detail = text(m.detail.clone())
         .size(11)
-        .color(palette.text_muted.into_iced_color());
+        .colr(palette.text_muted.into_cosmic_color());
 
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
     container(column![head, detail].spacing(4))
         .padding(Padding::from([10u16, 14u16]))
         .width(Length::Fill)
-        .style(move |_| container::Style {
+        .sty(move |_| container::Style {
             snap: false,
             background: Some(Background::Color(bg)),
             border: Border {
@@ -410,19 +413,19 @@ fn fire_result_strip<'a>(
 ) -> Element<'a, crate::Message> {
     let (accent, label): (Color, String) = match res {
         Ok(reply) => (
-            palette.success.into_iced_color(),
+            palette.success.into_cosmic_color(),
             format!("Fired — {reply}"),
         ),
         Err(e) => (
-            palette.danger.into_iced_color(),
+            palette.danger.into_cosmic_color(),
             format!("Fire failed — {e}"),
         ),
     };
-    let bg = palette.raised.into_iced_color();
-    container(text(label).size(11).color(accent))
+    let bg = palette.raised.into_cosmic_color();
+    container(text(label).size(11).colr(accent))
         .padding(Padding::from([8u16, 14u16]))
         .width(Length::Fill)
-        .style(move |_| container::Style {
+        .sty(move |_| container::Style {
             snap: false,
             background: Some(Background::Color(bg)),
             border: Border {
@@ -439,50 +442,48 @@ fn drift_row<'a>(r: &'a DriftRow, palette: Palette) -> Element<'a, crate::Messag
     let resolved = mde_icon(r.severity.icon(), IconSize::Inline);
     let icon_color = r.severity.color();
     let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
+        use cosmic::iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(svg_bytes))
             .width(Length::Fixed(16.0))
             .height(Length::Fixed(16.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
-                    color: Some(icon_color),
-                },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style {
+                color: Some(icon_color),
+            })
             .into()
     } else {
         text(resolved.fallback_glyph)
             .size(16.0)
-            .color(icon_color)
+            .colr(icon_color)
             .into()
     };
 
     let head = row![
         icon_widget,
-        text(r.severity.label()).size(10).color(icon_color),
+        text(r.severity.label()).size(10).colr(icon_color),
         text(format!("#{}", r.event_id))
             .size(10)
-            .color(palette.text_muted.into_iced_color()),
+            .colr(palette.text_muted.into_cosmic_color()),
         text(r.peer.clone())
             .size(11)
-            .color(palette.text.into_iced_color()),
+            .colr(palette.text.into_cosmic_color()),
         Space::new().width(Length::Fill),
         text(fmt_epoch_ms(r.timestamp_ms))
             .size(10)
-            .color(palette.text_muted.into_iced_color()),
+            .colr(palette.text_muted.into_cosmic_color()),
     ]
     .spacing(8)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     let body = text(r.message.clone())
         .size(12)
-        .color(palette.text_muted.into_iced_color());
+        .colr(palette.text_muted.into_cosmic_color());
 
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
     container(column![head, body].spacing(4))
         .padding(Padding::from([10u16, 14u16]))
         .width(Length::Fill)
-        .style(move |_| container::Style {
+        .sty(move |_| container::Style {
             snap: false,
             background: Some(Background::Color(bg)),
             border: Border {
@@ -500,14 +501,14 @@ fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a,
         if let Some(err) = error {
             (
                 Icon::StatusError,
-                palette.danger.into_iced_color(),
+                palette.danger.into_cosmic_color(),
                 "Couldn't load drift events".to_string(),
                 err.to_string(),
             )
         } else {
             (
                 Icon::StatusOk,
-                palette.success.into_iced_color(),
+                palette.success.into_cosmic_color(),
                 "No drift detected".to_string(),
                 "mackesd's reconciler has not surfaced any divergence between the locked TOML \
                  config and the live state. When mackesd is running, new events will appear here."
@@ -516,20 +517,18 @@ fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a,
         };
     let resolved = mde_icon(icon_kind, IconSize::PanelHeader);
     let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
+        use cosmic::iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(svg_bytes))
             .width(Length::Fixed(32.0))
             .height(Length::Fixed(32.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
-                    color: Some(icon_color),
-                },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style {
+                color: Some(icon_color),
+            })
             .into()
     } else {
         text(resolved.fallback_glyph)
             .size(32.0)
-            .color(icon_color)
+            .colr(icon_color)
             .into()
     };
     container(
@@ -538,13 +537,13 @@ fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a,
             Space::new().height(Length::Fixed(8.0)),
             text(heading_text)
                 .size(14)
-                .color(palette.text.into_iced_color()),
+                .colr(palette.text.into_cosmic_color()),
             text(body_text)
                 .size(11)
-                .color(palette.text_muted.into_iced_color()),
+                .colr(palette.text_muted.into_cosmic_color()),
         ]
         .spacing(2)
-        .align_x(iced::alignment::Horizontal::Center),
+        .align_x(cosmic::iced::alignment::Horizontal::Center),
     )
     .padding(Padding::from([32u16, 16u16]))
     .width(Length::Fill)

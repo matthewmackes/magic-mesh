@@ -9,8 +9,8 @@
 //! <name>` directly so it doesn't need to depend on the v1.x
 //! Python library through the rebrand window.
 
-use iced::widget::{column, container, row, scrollable, text, text_input};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{column, container, row, scrollable, text, text_input};
+use cosmic::iced::{Element, Length, Task};
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -107,7 +107,7 @@ impl AppsInstalledPanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         let filter_input = text_input("Filter…", &self.filter)
             .on_input(|v| crate::Message::AppsInstalled(Message::FilterChanged(v)));
         // UX-7.a — refresh routed through the shared button variant.

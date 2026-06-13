@@ -10,8 +10,8 @@
 //! grid baked into the binary (filter by Fedora-shipped vs
 //! third-party at build time, no per-preset coupling).
 
-use iced::widget::{column, container, row, scrollable, text, text_input};
-use iced::{Element, Length, Padding, Task};
+use cosmic::iced::widget::{column, container, row, scrollable, text, text_input};
+use cosmic::iced::{Element, Length, Padding, Task};
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -122,7 +122,7 @@ impl AppsInstallPanel {
         )
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         let name_input = text_input("Package name (e.g. ripgrep)", &self.name_input)
             .on_input(|v| crate::Message::AppsInstall(Message::NameChanged(v)));
         // UX-7.a — install routed through Primary (dominant CTA).

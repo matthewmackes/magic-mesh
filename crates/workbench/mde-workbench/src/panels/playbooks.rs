@@ -22,8 +22,11 @@
 
 use std::path::PathBuf;
 
-use iced::widget::{column, container, row, scrollable, text};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{column, container, row, scrollable, text};
+use cosmic::iced::{Length, Task};
+// CUT-1: cosmic::Element bakes in cosmic::Theme, matching the theme the
+// panel_chrome helpers and the column!/scrollable widgets thread through.
+use cosmic::Element;
 use mde_theme::{EmptyState, Icon};
 use tokio::process::Command;
 

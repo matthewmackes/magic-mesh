@@ -33,8 +33,8 @@
 //! toggles are the wizard's domain — Repair restores the
 //! preset the operator is already on).
 
-use iced::widget::{column, container, row, scrollable, text};
-use iced::{Element, Length, Padding, Task};
+use cosmic::iced::widget::{column, container, row, scrollable, text};
+use cosmic::iced::{Element, Length, Padding, Task};
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -135,7 +135,7 @@ impl RepairPanel {
         )
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         // UX-7.a — three repair actions routed through Secondary
         // (none of them is THE primary action; user picks based
         // on the problem).

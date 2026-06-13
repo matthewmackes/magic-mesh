@@ -8,8 +8,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use iced::widget::{column, container, row, text};
-use iced::{window, Element, Length, Size, Subscription, Task, Theme};
+use cosmic::app::ApplicationExt;
+use cosmic::iced::widget::{column, container, row, text};
+use cosmic::iced::{window, Length, Subscription, Task};
+use cosmic::{Application, Element};
+
+use crate::cosmic_compat::prelude::*;
 
 use crate::backend::{Backend, RemoteBackend};
 use crate::dbus::PendingFocus;
@@ -59,17 +63,17 @@ pub const WIN_H: f32 = 760.0;
 /// the design-token crate) instead of hardcoded RGB literals here, so
 /// every surface shares the one source.
 #[must_use]
-pub fn mde_workbench_iced_theme() -> Theme {
+pub fn mde_workbench_iced_theme() -> cosmic::iced::Theme {
     let p = crate::live_theme::palette();
-    let palette = iced::theme::Palette {
-        background: p.background.into_iced_color(),
-        text: p.text.into_iced_color(),
-        primary: p.accent.into_iced_color(),
-        warning: p.warning.into_iced_color(),
-        success: p.success.into_iced_color(),
-        danger: p.danger.into_iced_color(),
+    let palette = cosmic::iced::theme::Palette {
+        background: p.background.into_cosmic_color(),
+        text: p.text.into_cosmic_color(),
+        primary: p.accent.into_cosmic_color(),
+        warning: p.warning.into_cosmic_color(),
+        success: p.success.into_cosmic_color(),
+        danger: p.danger.into_cosmic_color(),
     };
-    Theme::custom("MDE".to_string(), palette)
+    cosmic::iced::Theme::custom("MDE".to_string(), palette)
 }
 
 /// Reducer messages — every interaction lands here.
@@ -259,6 +263,11 @@ pub enum Message {
 /// Workbench application state.
 #[derive(Clone)]
 pub struct App {
+    /// GUI-7 — the libcosmic application core (window state, theme, nav). Set
+    /// from the `Core` libcosmic hands `Application::init`; a throwaway
+    /// `Core::default()` fills it on the `Default`/test path (the GUI never
+    /// runs there).
+    core: cosmic::app::Core,
     view: View,
     sidebar: SidebarState,
     focused_pane: Pane,
@@ -387,6 +396,7 @@ impl App {
     #[must_use]
     pub fn with_backend(backend: Arc<dyn Backend>) -> Self {
         Self {
+            core: cosmic::app::Core::default(),
             view: View::default(),
             sidebar: SidebarState::new(),
             focused_pane: Pane::Sidebar,
@@ -683,51 +693,21 @@ impl App {
         self.focused_pane
     }
 
-    /// Run the Iced application.
-    pub fn run() -> iced::Result {
-        // UX-4 (d) — request a decoration-less window so the
-        // custom `crate::header` bar is the only title strip the
-        // user sees. sway tiles Iced apps without server-side
-        // decorations regardless, but setting this explicitly
-        // means GNOME-shell / KDE-on-Wayland sessions (which the
-        // X11 build feature enables for the v2.0.0 fallback path)
-        // also fall back to client-side chrome.
-        // iced 0.14: application(boot, update, view) — the first arg
-        // is the boot fn (initial State); the title moved to .title().
-        // PD-4 — boot lands on the Peers Front Door; fire its
-        // directory load immediately so the panel is live, not
-        // "Loading…" until the first manual refresh.
-        iced::application(
-            || {
-                // Deep-link boot: a `--focus <slug>` (queued in PendingFocus
-                // by main before run()) lands DIRECTLY on the target panel
-                // and fires its load, instead of flashing the Peers front
-                // door and only navigating on the next 200 ms poll. The poll
-                // still serves sibling-process `--focus` handoffs.
-                match PendingFocus::drain() {
-                    Some(slug) if !slug.is_empty() => {
-                        let app = App::with_focus(&slug);
-                        let boot = match app.view {
-                            View::Panel { group, panel } => app.on_panel_navigated(group, panel),
-                            View::Group(g) => app.on_group_navigated(g),
-                        };
-                        (app, boot)
-                    }
-                    _ => (App::new(), crate::panels::peers::PeersPanel::load()),
-                }
-            },
-            Self::update,
-            Self::view,
-        )
-        .title(Self::title)
-        .theme(Self::theme)
-        .subscription(Self::subscription)
-        .window(window::Settings {
-            size: Size::new(WIN_W, WIN_H),
-            decorations: false,
-            ..window::Settings::default()
-        })
-        .run()
+    /// Run the libcosmic application (GUI-7).
+    ///
+    /// Builds the cosmic [`Settings`](cosmic::app::Settings) (WIN_W×WIN_H
+    /// window, custom titlebar via the suppressed headerbar) then hands off to
+    /// `cosmic::app::run`. The deep-link boot (a `--focus <slug>` queued in
+    /// [`PendingFocus`] by `main` before `run()`) is drained in `init`, so a
+    /// `--focus` hand-off lands directly on the target panel rather than
+    /// flashing the Front Door.
+    pub fn run() -> cosmic::iced::Result {
+        // UX-4 (d) — the custom `crate::header` bar is the only title strip the
+        // user sees; Cosmic's headerbar is suppressed in `init`. The compositor
+        // manages window geometry under Cosmic; Settings carries the default
+        // size.
+        let settings = cosmic::app::Settings::default().size(cosmic::iced::Size::new(WIN_W, WIN_H));
+        cosmic::app::run::<App>(settings, ())
     }
 
     /// Iced subscription bundle. Two streams:
@@ -743,7 +723,7 @@ impl App {
     #[allow(clippy::unused_self)]
     fn subscription(&self) -> Subscription<Message> {
         let mut subs = vec![
-            iced::time::every(Duration::from_millis(200))
+            cosmic::iced::time::every(Duration::from_millis(200))
                 .map(|_| PendingFocus::drain().map_or(Message::Noop, Message::FocusRequest)),
             home_panel::dbus_subscription(),
             // E0.3.1.b — Nebula signals now arrive over the mesh Bus
@@ -801,7 +781,7 @@ impl App {
     }
 
     #[allow(clippy::unused_self)]
-    fn theme(&self) -> Theme {
+    fn theme(&self) -> cosmic::iced::Theme {
         // UX-3 — Iced framework palette is derived from the
         // locked `mde_theme::Palette` so every widget that defers
         // to the theme (default backgrounds, text, primary
@@ -1173,17 +1153,17 @@ impl App {
             palette,
         );
         let content = column![
-            text(title).size(22).color(palette.text.into_iced_color()),
-            iced::widget::scrollable(
+            text(title).size(22).colr(palette.text.into_cosmic_color()),
+            cosmic::iced::widget::scrollable(
                 text(body)
                     .size(13)
-                    .color(palette.text_muted.into_iced_color())
+                    .colr(palette.text_muted.into_cosmic_color())
             )
             .height(Length::Fill),
             row![accept],
         ]
         .spacing(18)
-        .padding(iced::Padding::from(32.0));
+        .padding(cosmic::iced::Padding::from(32.0));
         container(content)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1642,6 +1622,69 @@ impl App {
     }
 }
 
+/// GUI-7 — the `cosmic::Application` shell. The inherent `update`/`view`/
+/// `subscription` carry the real logic (inherent methods win direct calls, so
+/// these trait methods delegate without recursion); the trait wraps the
+/// reducer's iced `Task` into the cosmic `Action` space.
+impl Application for App {
+    type Executor = cosmic::executor::Default;
+    type Flags = ();
+    type Message = Message;
+    const APP_ID: &'static str = "dev.mackes.MDE.Workbench";
+
+    fn core(&self) -> &cosmic::app::Core {
+        &self.core
+    }
+
+    fn core_mut(&mut self) -> &mut cosmic::app::Core {
+        &mut self.core
+    }
+
+    fn init(
+        core: cosmic::app::Core,
+        _flags: Self::Flags,
+    ) -> (Self, cosmic::app::Task<Self::Message>) {
+        // PD-4 — boot lands on the Peers Front Door; fire its directory load
+        // immediately so the panel is live, not "Loading…" until the first
+        // manual refresh. Deep-link boot: a `--focus <slug>` (queued in
+        // PendingFocus by main before run()) lands DIRECTLY on the target
+        // panel and fires its load, instead of flashing the Peers front door
+        // and only navigating on the next 200 ms poll. The poll still serves
+        // sibling-process `--focus` handoffs.
+        let (mut app, boot) = match PendingFocus::drain() {
+            Some(slug) if !slug.is_empty() => {
+                let app = App::with_focus(&slug);
+                let boot = match app.view {
+                    View::Panel { group, panel } => app.on_panel_navigated(group, panel),
+                    View::Group(g) => app.on_group_navigated(g),
+                };
+                (app, boot)
+            }
+            _ => (App::new(), crate::panels::peers::PeersPanel::load()),
+        };
+        app.core = core;
+        // UX-4 (d) — keep the workbench's custom `crate::header` bar; suppress
+        // Cosmic's headerbar so it's the only title strip the user sees.
+        app.core.window.show_headerbar = false;
+        app.set_header_title("MDE Workbench".to_string());
+        (app, boot.map(cosmic::Action::App))
+    }
+
+    fn subscription(&self) -> Subscription<Self::Message> {
+        App::subscription(self)
+    }
+
+    fn update(&mut self, message: Self::Message) -> cosmic::app::Task<Self::Message> {
+        // Delegate to the inherent reducer (inherent resolution wins), then lift
+        // the iced Task into the cosmic Action space the runtime expects.
+        App::update(self, message).map(cosmic::Action::App)
+    }
+
+    fn view(&self) -> Element<'_, Self::Message> {
+        App::view(self)
+    }
+}
+
 /// v4.0.1 BUG-19 (2026-05-23) — friendly "panel not ready yet"
 /// surface for sidebar entries whose reducer hasn't shipped. The
 /// previous catch-all rendered a raw internal-jargon line that
@@ -1698,12 +1741,12 @@ fn panel_under_construction(view: View) -> Element<'static, Message> {
         .with_icon(mde_theme::Icon::Maintain);
     let inner =
         crate::panel_chrome::empty_state(state, palette, move || Message::SelectGroup(group));
-    iced::widget::container(inner)
+    cosmic::iced::widget::container(inner)
         .padding(crate::panel_chrome::outer_padding(
             crate::live_theme::tokens().density,
         ))
-        .width(iced::Length::Fill)
-        .height(iced::Length::Fill)
+        .width(cosmic::iced::Length::Fill)
+        .height(cosmic::iced::Length::Fill)
         .into()
 }
 

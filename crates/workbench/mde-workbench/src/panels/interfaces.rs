@@ -14,9 +14,12 @@
 
 use std::time::SystemTime;
 
-use iced::widget::{button, column, container, row, scrollable, text, Space};
-use iced::{Background, Border, Color, Element, Length, Padding, Task, Theme};
+use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
+use cosmic::iced::{Background, Border, Color, Length, Padding, Task};
+use cosmic::{Element, Theme};
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
+
+use crate::cosmic_compat::prelude::*;
 
 /// One interface's desired-vs-actual row, parsed from
 /// `mackesd netstate diff --json`.
@@ -87,7 +90,7 @@ impl InterfacesPanel {
 
         let title = text("Interfaces")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
 
         let managed = self.rows.iter().filter(|r| r.managed).count();
         let drifted = self
@@ -106,37 +109,43 @@ impl InterfacesPanel {
         };
         let subtitle = text(subtitle_text)
             .size(TypeRole::Body.size_in(sizes))
-            .color(palette.text_muted.into_iced_color());
+            .colr(palette.text_muted.into_cosmic_color());
 
-        let accent = palette.accent.into_iced_color();
+        let accent = palette.accent.into_cosmic_color();
         let refresh_btn = button(
             text(if self.busy { "Loading…" } else { "Refresh" })
                 .size(13)
-                .color(Color::WHITE),
+                .colr(Color::WHITE),
         )
         .padding(Padding::from([6u16, 14u16]))
-        .style(move |_t: &Theme, status: iced::widget::button::Status| {
-            let bg = match status {
-                iced::widget::button::Status::Hovered => Color {
-                    r: accent.r * 1.10,
-                    g: accent.g * 1.10,
-                    b: accent.b * 1.10,
-                    a: accent.a,
-                },
-                _ => accent,
-            };
-            iced::widget::button::Style {
-                snap: false,
-                background: Some(Background::Color(bg)),
-                text_color: Color::WHITE,
-                border: Border {
-                    color: Color::TRANSPARENT,
-                    width: 0.0,
-                    radius: 6.0.into(),
-                },
-                shadow: iced::Shadow::default(),
-            }
-        })
+        .sty(
+            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+                let bg = match status {
+                    cosmic::iced::widget::button::Status::Hovered => Color {
+                        r: accent.r * 1.10,
+                        g: accent.g * 1.10,
+                        b: accent.b * 1.10,
+                        a: accent.a,
+                    },
+                    _ => accent,
+                };
+                cosmic::iced::widget::button::Style {
+                    snap: false,
+                    background: Some(Background::Color(bg)),
+                    icon_color: None,
+                    text_color: Color::WHITE,
+                    border_color: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    border_radius: 6.0.into(),
+                    border: Border {
+                        color: Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 6.0.into(),
+                    },
+                    shadow: cosmic::iced::Shadow::default(),
+                }
+            },
+        )
         .on_press(crate::Message::Interfaces(Message::RefreshClicked));
 
         let header = row![
@@ -144,7 +153,7 @@ impl InterfacesPanel {
             Space::new().width(Length::Fill),
             refresh_btn,
         ]
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
         let mut rows_col = column![].spacing(6);
         for r in &self.rows {
@@ -173,37 +182,35 @@ fn interface_row<'a>(r: &'a InterfaceRow, palette: Palette) -> Element<'a, crate
     let (status_icon, status_color, status_text) = match r.in_sync {
         Some(true) => (
             Icon::StatusOk,
-            palette.success.into_iced_color(),
+            palette.success.into_cosmic_color(),
             "in sync".to_string(),
         ),
         Some(false) => (
             Icon::StatusWarning,
-            palette.warning.into_iced_color(),
+            palette.warning.into_cosmic_color(),
             "drift".to_string(),
         ),
         None => (
             Icon::Network,
-            palette.text_muted.into_iced_color(),
+            palette.text_muted.into_cosmic_color(),
             "unmanaged".to_string(),
         ),
     };
 
     let resolved = mde_icon(status_icon, IconSize::Inline);
     let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
+        use cosmic::iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(svg_bytes))
             .width(Length::Fixed(16.0))
             .height(Length::Fixed(16.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
-                    color: Some(status_color),
-                },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style {
+                color: Some(status_color),
+            })
             .into()
     } else {
         text(resolved.fallback_glyph)
             .size(16.0)
-            .color(status_color)
+            .colr(status_color)
             .into()
     };
 
@@ -211,12 +218,12 @@ fn interface_row<'a>(r: &'a InterfaceRow, palette: Palette) -> Element<'a, crate
         icon_widget,
         text(r.name.clone())
             .size(12)
-            .color(palette.text.into_iced_color()),
+            .colr(palette.text.into_cosmic_color()),
         Space::new().width(Length::Fill),
-        text(status_text).size(11).color(status_color),
+        text(status_text).size(11).colr(status_color),
     ]
     .spacing(8)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     // Desired and actual columns; "—" where a side isn't present.
     let desired = format!(
@@ -230,24 +237,24 @@ fn interface_row<'a>(r: &'a InterfaceRow, palette: Palette) -> Element<'a, crate
         r.actual_ipv4.as_deref().unwrap_or("—"),
     );
     let desired_color = if r.managed {
-        palette.accent.into_iced_color()
+        palette.accent.into_cosmic_color()
     } else {
-        palette.text_muted.into_iced_color()
+        palette.text_muted.into_cosmic_color()
     };
     let body = column![
-        text(desired).size(11).color(desired_color),
+        text(desired).size(11).colr(desired_color),
         text(actual)
             .size(11)
-            .color(palette.text_muted.into_iced_color()),
+            .colr(palette.text_muted.into_cosmic_color()),
     ]
     .spacing(2);
 
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
     container(column![head, body].spacing(4))
         .padding(Padding::from([10u16, 14u16]))
         .width(Length::Fill)
-        .style(move |_| container::Style {
+        .sty(move |_| container::Style {
             snap: false,
             background: Some(Background::Color(bg)),
             border: Border {
@@ -265,14 +272,14 @@ fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a,
         if let Some(err) = error {
             (
                 Icon::StatusError,
-                palette.danger.into_iced_color(),
+                palette.danger.into_cosmic_color(),
                 "Couldn't read interfaces".to_string(),
                 err.to_string(),
             )
         } else {
             (
                 Icon::Network,
-                palette.accent.into_iced_color(),
+                palette.accent.into_cosmic_color(),
                 "No interfaces to show".to_string(),
                 "No fleet revision declares a managed nmstate, and the live nmstate \
                  reader returned nothing (NetworkManager / nmstate tooling may not be \
@@ -283,33 +290,31 @@ fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a,
         };
     let resolved = mde_icon(icon_kind, IconSize::PanelHeader);
     let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
+        use cosmic::iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(svg_bytes))
             .width(Length::Fixed(32.0))
             .height(Length::Fixed(32.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
-                    color: Some(icon_color),
-                },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style {
+                color: Some(icon_color),
+            })
             .into()
     } else {
         text(resolved.fallback_glyph)
             .size(32.0)
-            .color(icon_color)
+            .colr(icon_color)
             .into()
     };
     container(
         column![
             icon_widget,
             Space::new().height(Length::Fixed(8.0)),
-            text(heading).size(14).color(palette.text.into_iced_color()),
+            text(heading).size(14).colr(palette.text.into_cosmic_color()),
             text(body)
                 .size(11)
-                .color(palette.text_muted.into_iced_color()),
+                .colr(palette.text_muted.into_cosmic_color()),
         ]
         .spacing(2)
-        .align_x(iced::alignment::Horizontal::Center),
+        .align_x(cosmic::iced::alignment::Horizontal::Center),
     )
     .padding(Padding::from([32u16, 16u16]))
     .width(Length::Fill)

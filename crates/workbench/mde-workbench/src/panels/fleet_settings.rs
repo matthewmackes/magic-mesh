@@ -9,8 +9,8 @@
 
 use std::process::Stdio;
 
-use iced::widget::{column, row, text, text_input};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{column, row, text, text_input};
+use cosmic::iced::{Element, Length, Task};
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -100,7 +100,7 @@ impl FleetSettingsPanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         let push_label = if self.busy {
             "Pushing…"
         } else {

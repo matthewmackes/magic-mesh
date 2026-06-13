@@ -19,9 +19,12 @@
 
 use std::path::PathBuf;
 
-use iced::widget::{button, column, container, row, text, Space};
-use iced::{Background, Border, Color, Element, Length, Padding, Task, Theme};
+use cosmic::iced::widget::{button, column, container, row, text, Space};
+use cosmic::iced::{Background, Border, Color, Element, Length, Padding, Task};
+use cosmic::Theme;
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
+
+use crate::cosmic_compat::prelude::*;
 
 /// Well-known applet ids the operator can toggle. Locked in
 /// code (not in `panel.toml`) — adding a new applet means a
@@ -94,13 +97,13 @@ impl PanelAppsPanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, Theme> {
         let palette = crate::live_theme::palette();
         let sizes = FontSize::defaults();
 
         let title = text("Panel Apps")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
         let subtitle_text = if self.status.is_empty() {
             "toggle which applets render in the panel's tray zone".to_string()
         } else {
@@ -108,7 +111,7 @@ impl PanelAppsPanel {
         };
         let subtitle = text(subtitle_text)
             .size(TypeRole::Body.size_in(sizes))
-            .color(palette.text_muted.into_iced_color());
+            .colr(palette.text_muted.into_cosmic_color());
 
         let header = column![title, subtitle].spacing(2);
 
@@ -122,7 +125,7 @@ impl PanelAppsPanel {
             "Changes save to ~/.config/mde/panel.toml; restart mde-panel (or rerun `restart-panel-stack.sh panel`) to apply.",
         )
         .size(10)
-        .color(palette.text_muted.into_iced_color());
+        .colr(palette.text_muted.into_cosmic_color());
 
         container(
             column![
@@ -147,93 +150,100 @@ fn applet_row<'a>(
     icon: Icon,
     on: bool,
     palette: Palette,
-) -> Element<'a, crate::Message> {
+) -> Element<'a, crate::Message, Theme> {
     let resolved = mde_icon(icon, IconSize::Inline);
     let icon_color = if on {
-        palette.accent.into_iced_color()
+        palette.accent.into_cosmic_color()
     } else {
-        palette.text_muted.into_iced_color()
+        palette.text_muted.into_cosmic_color()
     };
-    let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
-        widget_svg(widget_svg::Handle::from_memory(svg_bytes))
-            .width(Length::Fixed(18.0))
-            .height(Length::Fixed(18.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
+    let icon_widget: Element<'a, crate::Message, Theme> =
+        if let Some(svg_bytes) = resolved.svg_bytes() {
+            use cosmic::iced::widget::svg as widget_svg;
+            widget_svg(widget_svg::Handle::from_memory(svg_bytes))
+                .width(Length::Fixed(18.0))
+                .height(Length::Fixed(18.0))
+                .sty(move |_t: &Theme| widget_svg::Style {
                     color: Some(icon_color),
-                },
-            )
-            .into()
-    } else {
-        text(resolved.fallback_glyph)
-            .size(18.0)
-            .color(icon_color)
-            .into()
-    };
+                })
+                .into()
+        } else {
+            text(resolved.fallback_glyph)
+                .size(18.0)
+                .colr(icon_color)
+                .into()
+        };
 
     let label_text = text(label.to_string())
         .size(14)
-        .color(palette.text.into_iced_color());
+        .colr(palette.text.into_cosmic_color());
     let id_text = text(format!("({id})"))
         .size(11)
-        .color(palette.text_muted.into_iced_color());
+        .colr(palette.text_muted.into_cosmic_color());
 
     let toggle_label = if on { "ON" } else { "OFF" };
-    let accent = palette.accent.into_iced_color();
-    let muted = palette.text_muted.into_iced_color();
+    let accent = palette.accent.into_cosmic_color();
+    let muted = palette.text_muted.into_cosmic_color();
     let id_owned = id.to_string();
-    let toggle_btn = button(text(toggle_label).size(11).color(if on {
+    let toggle_btn = button(text(toggle_label).size(11).colr(if on {
         Color::WHITE
     } else {
-        palette.text_muted.into_iced_color()
+        palette.text_muted.into_cosmic_color()
     }))
     .padding(Padding::from([4u16, 14u16]))
-    .style(move |_t: &Theme, status: iced::widget::button::Status| {
-        let bg = if on {
-            match status {
-                iced::widget::button::Status::Hovered => Color {
-                    r: accent.r * 1.10,
-                    g: accent.g * 1.10,
-                    b: accent.b * 1.10,
-                    a: accent.a,
+    .sty(
+        move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+            let bg = if on {
+                match status {
+                    cosmic::iced::widget::button::Status::Hovered => Color {
+                        r: accent.r * 1.10,
+                        g: accent.g * 1.10,
+                        b: accent.b * 1.10,
+                        a: accent.a,
+                    },
+                    _ => accent,
+                }
+            } else {
+                match status {
+                    cosmic::iced::widget::button::Status::Hovered => Color {
+                        r: 0.15,
+                        g: 0.15,
+                        b: 0.17,
+                        a: 1.0,
+                    },
+                    _ => Color::TRANSPARENT,
+                }
+            };
+            let border_color = if on {
+                Color::TRANSPARENT
+            } else {
+                Color {
+                    a: 0.20,
+                    ..Color::WHITE
+                }
+            };
+            let border_width = if on { 0.0 } else { 1.0 };
+            cosmic::iced::widget::button::Style {
+                snap: false,
+                background: Some(Background::Color(bg)),
+                text_color: if on { Color::WHITE } else { muted },
+                icon_color: None,
+                border_color,
+                border_width,
+                border_radius: 4.0.into(),
+                border: Border {
+                    color: border_color,
+                    width: border_width,
+                    radius: 4.0.into(),
                 },
-                _ => accent,
+                shadow: cosmic::iced::Shadow::default(),
             }
-        } else {
-            match status {
-                iced::widget::button::Status::Hovered => Color {
-                    r: 0.15,
-                    g: 0.15,
-                    b: 0.17,
-                    a: 1.0,
-                },
-                _ => Color::TRANSPARENT,
-            }
-        };
-        iced::widget::button::Style {
-            snap: false,
-            background: Some(Background::Color(bg)),
-            text_color: if on { Color::WHITE } else { muted },
-            border: Border {
-                color: if on {
-                    Color::TRANSPARENT
-                } else {
-                    Color {
-                        a: 0.20,
-                        ..Color::WHITE
-                    }
-                },
-                width: if on { 0.0 } else { 1.0 },
-                radius: 4.0.into(),
-            },
-            shadow: iced::Shadow::default(),
-        }
-    })
+        },
+    )
     .on_press(crate::Message::PanelApps(Message::Toggle(id_owned)));
 
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
     container(
         row![
             icon_widget,
@@ -242,11 +252,11 @@ fn applet_row<'a>(
             toggle_btn,
         ]
         .spacing(12)
-        .align_y(iced::alignment::Vertical::Center),
+        .align_y(cosmic::iced::alignment::Vertical::Center),
     )
     .padding(Padding::from([10u16, 16u16]))
     .width(Length::Fill)
-    .style(move |_| container::Style {
+    .sty(move |_: &Theme| container::Style {
         snap: false,
         background: Some(Background::Color(bg)),
         border: Border {

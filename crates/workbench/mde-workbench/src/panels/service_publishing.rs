@@ -18,10 +18,13 @@
 
 use std::time::SystemTime;
 
-use iced::widget::{button, column, container, row, scrollable, text, Space};
-use iced::{Background, Border, Color, Element, Length, Padding, Task, Theme};
+use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
+use cosmic::iced::{Background, Border, Color, Length, Padding, Task};
+use cosmic::{Element, Theme};
 use mde_theme::{FontSize, Palette, TypeRole};
 use serde::{Deserialize, Serialize};
+
+use crate::cosmic_compat::prelude::*;
 
 /// JSON wire shape published by
 /// `mackes.mesh_nebula.published_services_summary()`. The
@@ -102,7 +105,7 @@ impl ServicePublishingPanel {
 
         let title = text("Service Publishing")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
 
         let subtitle_text = if !self.last_op.is_empty() {
             self.last_op.clone()
@@ -113,19 +116,19 @@ impl ServicePublishingPanel {
         };
         let subtitle = text(subtitle_text)
             .size(TypeRole::Body.size_in(sizes))
-            .color(palette.text_muted.into_iced_color());
+            .colr(palette.text_muted.into_cosmic_color());
 
         let refresh_btn = button(
             text(if self.busy { "Working…" } else { "Refresh" })
                 .size(13)
-                .color(Color::WHITE),
+                .colr(Color::WHITE),
         )
         .padding(Padding::from([6u16, 14u16]))
-        .style({
-            let accent = palette.accent.into_iced_color();
-            move |_t: &Theme, status: iced::widget::button::Status| {
+        .sty({
+            let accent = palette.accent.into_cosmic_color();
+            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
                 let bg = match status {
-                    iced::widget::button::Status::Hovered => Color {
+                    cosmic::iced::widget::button::Status::Hovered => Color {
                         r: accent.r * 1.10,
                         g: accent.g * 1.10,
                         b: accent.b * 1.10,
@@ -133,7 +136,7 @@ impl ServicePublishingPanel {
                     },
                     _ => accent,
                 };
-                iced::widget::button::Style {
+                cosmic::iced::widget::button::Style {
                     snap: false,
                     background: Some(Background::Color(bg)),
                     text_color: Color::WHITE,
@@ -142,7 +145,8 @@ impl ServicePublishingPanel {
                         width: 0.0,
                         radius: 6.0.into(),
                     },
-                    shadow: iced::Shadow::default(),
+                    shadow: cosmic::iced::Shadow::default(),
+                    ..cosmic::iced::widget::button::Style::default()
                 }
             }
         })
@@ -153,7 +157,7 @@ impl ServicePublishingPanel {
             Space::new().width(Length::Fill),
             refresh_btn,
         ]
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
         let rows_widget: Element<'_, crate::Message> = if self.rows.is_empty() {
             empty_state(palette)
@@ -185,7 +189,7 @@ fn empty_state<'a>(palette: Palette) -> Element<'a, crate::Message> {
         column![
             text("No service rows available")
                 .size(13)
-                .color(palette.text.into_iced_color()),
+                .colr(palette.text.into_cosmic_color()),
             Space::new().height(Length::Fixed(6.0)),
             text(
                 "Run Refresh after mackesd starts (it answers the \
@@ -194,7 +198,7 @@ fn empty_state<'a>(palette: Palette) -> Element<'a, crate::Message> {
                  rsync / WoL / AV) will populate from the overlay state."
             )
             .size(12)
-            .color(palette.text_muted.into_iced_color()),
+            .colr(palette.text_muted.into_cosmic_color()),
         ]
         .spacing(2),
     )
@@ -202,9 +206,9 @@ fn empty_state<'a>(palette: Palette) -> Element<'a, crate::Message> {
     .width(Length::Fill)
     .style(move |_| container::Style {
         snap: false,
-        background: Some(Background::Color(palette.raised.into_iced_color())),
+        background: Some(Background::Color(palette.raised.into_cosmic_color())),
         border: Border {
-            color: palette.border.into_iced_color(),
+            color: palette.border.into_cosmic_color(),
             width: 1.0,
             radius: 6.0.into(),
         },
@@ -215,11 +219,11 @@ fn empty_state<'a>(palette: Palette) -> Element<'a, crate::Message> {
 
 fn service_row_view<'a>(r: &ServiceRow, palette: Palette) -> Element<'a, crate::Message> {
     let (pill_label, pill_color) = if r.is_publishable {
-        ("Published", palette.accent.into_iced_color())
+        ("Published", palette.accent.into_cosmic_color())
     } else {
-        ("Not enrolled", palette.warning.into_iced_color())
+        ("Not enrolled", palette.warning.into_cosmic_color())
     };
-    let pill = container(text(pill_label).size(10).color(Color::WHITE))
+    let pill = container(text(pill_label).size(10).colr(Color::WHITE))
         .padding(Padding::from([2u16, 8u16]))
         .style(move |_| container::Style {
             snap: false,
@@ -235,17 +239,17 @@ fn service_row_view<'a>(r: &ServiceRow, palette: Palette) -> Element<'a, crate::
     let overlay_text = r.overlay_ip.clone().unwrap_or_else(|| "—".to_string());
     let port_proto = format!("{}/{}", r.port, r.proto);
 
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
     container(
         row![
             column![
                 text(r.name.clone())
                     .size(13)
-                    .color(palette.text.into_iced_color()),
+                    .colr(palette.text.into_cosmic_color()),
                 text(format!("id: {}", r.id))
                     .size(10)
-                    .color(palette.text_muted.into_iced_color()),
+                    .colr(palette.text_muted.into_cosmic_color()),
             ]
             .spacing(2)
             .width(Length::FillPortion(3)),
@@ -253,16 +257,16 @@ fn service_row_view<'a>(r: &ServiceRow, palette: Palette) -> Element<'a, crate::
             // the Ableton content-zone influence.
             text(port_proto)
                 .size(12)
-                .color(palette.text.into_iced_color())
+                .colr(palette.text.into_cosmic_color())
                 .width(Length::FillPortion(1)),
             text(overlay_text)
                 .size(12)
-                .color(palette.text_muted.into_iced_color())
+                .colr(palette.text_muted.into_cosmic_color())
                 .width(Length::FillPortion(2)),
             pill,
         ]
         .spacing(12)
-        .align_y(iced::alignment::Vertical::Center),
+        .align_y(cosmic::iced::alignment::Vertical::Center),
     )
     .padding(Padding::from([10u16, 16u16]))
     .width(Length::Fill)

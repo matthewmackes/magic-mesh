@@ -9,8 +9,8 @@
 //! `mackes/workbench/maintain/resources.py`. Reads /proc
 //! directly — no psutil-equivalent dep needed.
 
-use iced::widget::{column, progress_bar, row, text};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{column, progress_bar, row, text};
+use cosmic::iced::{Element, Length, Task};
 
 use crate::controls::{variant_button, ButtonVariant};
 
@@ -77,7 +77,7 @@ impl ResourcesPanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         let mem_frac = safe_fraction(self.mem_used_mib, self.mem_total_mib);
         let disk_frac = safe_fraction(self.disk_used_gib, self.disk_total_gib);
         // UX-7.a — refresh routed through the shared button variant.

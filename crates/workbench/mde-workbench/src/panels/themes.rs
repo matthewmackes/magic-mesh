@@ -9,9 +9,12 @@
 //! theme swaps [`crate::live_theme`] (GUI-2) so the whole Workbench
 //! repaints live, then persists via [`Preferences::save`].
 
-use iced::widget::{column, pick_list, row, text};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{column, pick_list, row, text};
+use cosmic::iced::{Length, Task};
+use cosmic::Element;
 use mde_theme::{Density, Preferences, Theme};
+
+use crate::cosmic_compat::prelude::*;
 
 use crate::controls::{variant_button, ButtonVariant};
 
@@ -154,7 +157,7 @@ impl ThemesPanel {
             .iter()
             .find(|(id, _)| *id == self.theme)
             .map(|(_, l)| *l);
-        let theme_pick: pick_list::PickList<'_, &'static str, _, _, crate::Message> =
+        let theme_pick: pick_list::PickList<'_, &'static str, _, _, crate::Message, cosmic::Theme> =
             pick_list(theme_labels, theme_selected, |label| {
                 let id = THEMES
                     .iter()
@@ -168,14 +171,20 @@ impl ThemesPanel {
             .iter()
             .find(|(id, _)| *id == self.density)
             .map(|(_, l)| *l);
-        let density_pick: pick_list::PickList<'_, &'static str, _, _, crate::Message> =
-            pick_list(density_labels, density_selected, |label| {
-                let id = DENSITIES
-                    .iter()
-                    .find(|(_, l)| *l == label)
-                    .map_or("comfortable", |(id, _)| *id);
-                crate::Message::Themes(Message::DensityPicked(id.to_string()))
-            });
+        let density_pick: pick_list::PickList<
+            '_,
+            &'static str,
+            _,
+            _,
+            crate::Message,
+            cosmic::Theme,
+        > = pick_list(density_labels, density_selected, |label| {
+            let id = DENSITIES
+                .iter()
+                .find(|(_, l)| *l == label)
+                .map_or("comfortable", |(id, _)| *id);
+            crate::Message::Themes(Message::DensityPicked(id.to_string()))
+        });
 
         let apply_btn = variant_button(
             "Apply",
@@ -193,10 +202,10 @@ impl ThemesPanel {
         column![
             row![
                 text("Appearance").size(20),
-                iced::widget::Space::new().width(Length::Fill),
+                cosmic::iced::widget::Space::new().width(Length::Fill),
                 cosmic,
             ]
-            .align_y(iced::Alignment::Center),
+            .align_y(cosmic::iced::Alignment::Center),
             row![text("Theme").width(Length::Fixed(120.0)), theme_pick].spacing(12),
             row![text("Density").width(Length::Fixed(120.0)), density_pick].spacing(12),
             row![apply_btn, text(&self.status).size(13)].spacing(12),

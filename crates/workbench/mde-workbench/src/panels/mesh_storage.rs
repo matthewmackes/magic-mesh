@@ -6,11 +6,13 @@
 
 use std::time::SystemTime;
 
-use iced::widget::{button, column, container, row, scrollable, text, Space};
-use iced::{Background, Border, Color, Element, Length, Padding, Task, Theme};
+use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
+use cosmic::iced::{Background, Border, Color, Length, Padding, Task};
+use cosmic::{Element, Theme};
 use mde_theme::hero::Hero;
 use mde_theme::{FontSize, Palette, TypeRole};
 
+use crate::cosmic_compat::prelude::*;
 use crate::panel_chrome::{hero_band, pkg_version_cached};
 
 fn human_bytes(b: u64) -> String {
@@ -97,7 +99,7 @@ impl MeshStoragePanel {
 
         let title = text("Mesh Storage")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
 
         let subtitle_str = if let Some(t) = self.last_run_at {
             let age_s = t.elapsed().map(|d| d.as_secs()).unwrap_or(0);
@@ -117,37 +119,40 @@ impl MeshStoragePanel {
         };
         let subtitle = text(subtitle_str)
             .size(TypeRole::Body.size_in(sizes))
-            .color(palette.text_muted.into_iced_color());
+            .colr(palette.text_muted.into_cosmic_color());
 
-        let accent = palette.accent.into_iced_color();
+        let accent = palette.accent.into_cosmic_color();
         let refresh_btn = button(
             text(if self.busy { "Loading…" } else { "Refresh" })
                 .size(13)
-                .color(Color::WHITE),
+                .colr(Color::WHITE),
         )
         .padding(Padding::from([6u16, 14u16]))
-        .style(move |_t: &Theme, status: iced::widget::button::Status| {
-            let bg = match status {
-                iced::widget::button::Status::Hovered => Color {
-                    r: (accent.r * 1.10).min(1.0),
-                    g: (accent.g * 1.10).min(1.0),
-                    b: (accent.b * 1.10).min(1.0),
-                    a: accent.a,
-                },
-                _ => accent,
-            };
-            iced::widget::button::Style {
-                snap: false,
-                background: Some(Background::Color(bg)),
-                text_color: Color::WHITE,
-                border: Border {
-                    color: Color::TRANSPARENT,
-                    width: 0.0,
-                    radius: 6.0.into(),
-                },
-                shadow: iced::Shadow::default(),
-            }
-        })
+        .sty(
+            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+                let bg = match status {
+                    cosmic::iced::widget::button::Status::Hovered => Color {
+                        r: (accent.r * 1.10).min(1.0),
+                        g: (accent.g * 1.10).min(1.0),
+                        b: (accent.b * 1.10).min(1.0),
+                        a: accent.a,
+                    },
+                    _ => accent,
+                };
+                cosmic::iced::widget::button::Style {
+                    snap: false,
+                    background: Some(Background::Color(bg)),
+                    text_color: Color::WHITE,
+                    border: Border {
+                        color: Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 6.0.into(),
+                    },
+                    shadow: cosmic::iced::Shadow::default(),
+                    ..cosmic::iced::widget::button::Style::default()
+                }
+            },
+        )
         .on_press(crate::Message::MeshStorage(Message::RefreshClicked));
 
         // PLANES-2 — Mesh Storage is the LizardFS surface; carry its hero.
@@ -163,13 +168,13 @@ impl MeshStoragePanel {
             lizardfs
         ]
         .spacing(12)
-        .align_y(iced::Alignment::Center);
+        .align_y(cosmic::iced::Alignment::Center);
         let sub_row = row![subtitle];
 
         let body: Element<'_, crate::Message> = if let Some(ref e) = self.error {
             text(format!("Error: {e}"))
                 .size(TypeRole::Body.size_in(sizes))
-                .color(Color {
+                .colr(Color {
                     r: 1.0,
                     g: 0.35,
                     b: 0.35,
@@ -179,7 +184,7 @@ impl MeshStoragePanel {
         } else if self.status.peers.is_empty() && self.last_run_at.is_some() {
             text("Master unreachable — mesh-storage not yet active.")
                 .size(TypeRole::Body.size_in(sizes))
-                .color(palette.text_muted.into_iced_color())
+                .colr(palette.text_muted.into_cosmic_color())
                 .into()
         } else {
             let rows: Vec<Element<'_, crate::Message>> = self
@@ -210,14 +215,14 @@ impl MeshStoragePanel {
                 content_col = content_col.push(
                     text(quota_line)
                         .size(TypeRole::Caption.size_in(sizes))
-                        .color(palette.text_muted.into_iced_color()),
+                        .colr(palette.text_muted.into_cosmic_color()),
                 );
             }
             if !limiting_line.is_empty() {
                 content_col = content_col.push(
                     text(limiting_line)
                         .size(TypeRole::Caption.size_in(sizes))
-                        .color(palette.text_muted.into_iced_color()),
+                        .colr(palette.text_muted.into_cosmic_color()),
                 );
             }
             scrollable(content_col).into()
@@ -225,12 +230,12 @@ impl MeshStoragePanel {
 
         let page = column![header, sub_row, Space::new().height(12), body].spacing(4);
 
-        let surface_color = palette.surface.into_iced_color();
+        let surface_color = palette.surface.into_cosmic_color();
         container(page)
             .padding(24)
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(move |_t: &Theme| container::Style {
+            .sty(move |_t: &Theme| container::Style {
                 snap: false,
                 background: Some(Background::Color(surface_color)),
                 ..Default::default()
@@ -254,7 +259,7 @@ fn peer_row<'a>(
             a: 1.0,
         }
     } else {
-        palette.text.into_iced_color()
+        palette.text.into_cosmic_color()
     };
     let pct_used = if p.used_bytes + p.avail_bytes > 0 {
         format!(
@@ -268,23 +273,23 @@ fn peer_row<'a>(
     row![
         text(format!("{}{label}", p.addr))
             .size(TypeRole::Body.size_in(sizes))
-            .color(addr_color)
+            .colr(addr_color)
             .width(Length::FillPortion(4)),
         text(format!("used {}", human_bytes(p.used_bytes)))
             .size(TypeRole::Caption.size_in(sizes))
-            .color(palette.text_muted.into_iced_color())
+            .colr(palette.text_muted.into_cosmic_color())
             .width(Length::FillPortion(3)),
         text(format!("avail {}", human_bytes(p.avail_bytes)))
             .size(TypeRole::Caption.size_in(sizes))
-            .color(palette.text_muted.into_iced_color())
+            .colr(palette.text_muted.into_cosmic_color())
             .width(Length::FillPortion(3)),
         text(pct_used)
             .size(TypeRole::Caption.size_in(sizes))
-            .color(palette.text_muted.into_iced_color())
+            .colr(palette.text_muted.into_cosmic_color())
             .width(Length::FillPortion(2)),
     ]
     .spacing(8)
-    .align_y(iced::Alignment::Center)
+    .align_y(cosmic::iced::Alignment::Center)
     .into()
 }
 

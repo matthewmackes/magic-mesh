@@ -12,9 +12,12 @@
 
 use std::time::SystemTime;
 
-use iced::widget::{button, column, container, row, scrollable, text, Space};
-use iced::{Background, Border, Color, Element, Length, Padding, Task, Theme};
+use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
+use cosmic::iced::{Background, Border, Color, Element, Length, Padding, Task};
+use cosmic::Theme;
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
+
+use crate::cosmic_compat::prelude::*;
 
 /// One `<host>.mesh → overlay-ip` record, parsed from
 /// `mackesd dns list --json`.
@@ -73,13 +76,13 @@ impl DnsPanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, Theme> {
         let palette = crate::live_theme::palette();
         let sizes = FontSize::defaults();
 
         let title = text("Mesh DNS")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
 
         let subtitle_text = if self.last_run_at.is_some() {
             format!(
@@ -92,37 +95,43 @@ impl DnsPanel {
         };
         let subtitle = text(subtitle_text)
             .size(TypeRole::Body.size_in(sizes))
-            .color(palette.text_muted.into_iced_color());
+            .colr(palette.text_muted.into_cosmic_color());
 
-        let accent = palette.accent.into_iced_color();
+        let accent = palette.accent.into_cosmic_color();
         let refresh_btn = button(
             text(if self.busy { "Loading…" } else { "Refresh" })
                 .size(13)
-                .color(Color::WHITE),
+                .colr(Color::WHITE),
         )
         .padding(Padding::from([6u16, 14u16]))
-        .style(move |_t: &Theme, status: iced::widget::button::Status| {
-            let bg = match status {
-                iced::widget::button::Status::Hovered => Color {
-                    r: accent.r * 1.10,
-                    g: accent.g * 1.10,
-                    b: accent.b * 1.10,
-                    a: accent.a,
-                },
-                _ => accent,
-            };
-            iced::widget::button::Style {
-                snap: false,
-                background: Some(Background::Color(bg)),
-                text_color: Color::WHITE,
-                border: Border {
-                    color: Color::TRANSPARENT,
-                    width: 0.0,
-                    radius: 6.0.into(),
-                },
-                shadow: iced::Shadow::default(),
-            }
-        })
+        .sty(
+            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+                let bg = match status {
+                    cosmic::iced::widget::button::Status::Hovered => Color {
+                        r: accent.r * 1.10,
+                        g: accent.g * 1.10,
+                        b: accent.b * 1.10,
+                        a: accent.a,
+                    },
+                    _ => accent,
+                };
+                cosmic::iced::widget::button::Style {
+                    snap: false,
+                    background: Some(Background::Color(bg)),
+                    text_color: Color::WHITE,
+                    icon_color: None,
+                    border_color: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    border_radius: 6.0.into(),
+                    border: Border {
+                        color: Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 6.0.into(),
+                    },
+                    shadow: cosmic::iced::Shadow::default(),
+                }
+            },
+        )
         .on_press(crate::Message::Dns(Message::RefreshClicked));
 
         let header = row![
@@ -130,7 +139,7 @@ impl DnsPanel {
             Space::new().width(Length::Fill),
             refresh_btn,
         ]
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
         let mut rows_col = column![].spacing(6);
         for r in &self.rows {
@@ -155,46 +164,42 @@ impl DnsPanel {
     }
 }
 
-fn dns_row<'a>(r: &'a DnsRow, palette: Palette) -> Element<'a, crate::Message> {
+fn dns_row<'a>(r: &'a DnsRow, palette: Palette) -> Element<'a, crate::Message, Theme> {
     let resolved = mde_icon(Icon::Network, IconSize::Inline);
-    let accent = palette.accent.into_iced_color();
-    let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
-        widget_svg(widget_svg::Handle::from_memory(svg_bytes))
-            .width(Length::Fixed(16.0))
-            .height(Length::Fixed(16.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
+    let accent = palette.accent.into_cosmic_color();
+    let icon_widget: Element<'a, crate::Message, Theme> =
+        if let Some(svg_bytes) = resolved.svg_bytes() {
+            use cosmic::iced::widget::svg as widget_svg;
+            widget_svg(widget_svg::Handle::from_memory(svg_bytes))
+                .width(Length::Fixed(16.0))
+                .height(Length::Fixed(16.0))
+                .sty(move |_t: &Theme| widget_svg::Style {
                     color: Some(accent),
-                },
-            )
-            .into()
-    } else {
-        text(resolved.fallback_glyph)
-            .size(16.0)
-            .color(accent)
-            .into()
-    };
+                })
+                .into()
+        } else {
+            text(resolved.fallback_glyph).size(16.0).colr(accent).into()
+        };
 
     let line = row![
         icon_widget,
         text(r.fqdn.clone())
             .size(12)
-            .color(palette.text.into_iced_color()),
+            .colr(palette.text.into_cosmic_color()),
         Space::new().width(Length::Fill),
         text(r.overlay_ip.clone())
             .size(12)
-            .color(palette.text_muted.into_iced_color()),
+            .colr(palette.text_muted.into_cosmic_color()),
     ]
     .spacing(8)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
     container(line)
         .padding(Padding::from([10u16, 14u16]))
         .width(Length::Fill)
-        .style(move |_| container::Style {
+        .sty(move |_| container::Style {
             snap: false,
             background: Some(Background::Color(bg)),
             border: Border {
@@ -207,16 +212,19 @@ fn dns_row<'a>(r: &'a DnsRow, palette: Palette) -> Element<'a, crate::Message> {
         .into()
 }
 
-fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a, crate::Message> {
+fn empty_state_card<'a>(
+    palette: Palette,
+    error: Option<&'a str>,
+) -> Element<'a, crate::Message, Theme> {
     let (icon_color, heading, body): (Color, String, String) = if let Some(err) = error {
         (
-            palette.danger.into_iced_color(),
+            palette.danger.into_cosmic_color(),
             "Couldn't read mesh DNS".to_string(),
             err.to_string(),
         )
     } else {
         (
-            palette.accent.into_iced_color(),
+            palette.accent.into_cosmic_color(),
             "No mesh names yet".to_string(),
             "Mesh DNS publishes <host>.mesh for every roster peer with a known overlay IP. \
              Once peers enrol and their overlay addresses are known, their names resolve here \
@@ -230,34 +238,33 @@ fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a,
         Icon::Network
     };
     let resolved = mde_icon(icon_kind, IconSize::PanelHeader);
-    let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
-        widget_svg(widget_svg::Handle::from_memory(svg_bytes))
-            .width(Length::Fixed(32.0))
-            .height(Length::Fixed(32.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
+    let icon_widget: Element<'a, crate::Message, Theme> =
+        if let Some(svg_bytes) = resolved.svg_bytes() {
+            use cosmic::iced::widget::svg as widget_svg;
+            widget_svg(widget_svg::Handle::from_memory(svg_bytes))
+                .width(Length::Fixed(32.0))
+                .height(Length::Fixed(32.0))
+                .sty(move |_t: &Theme| widget_svg::Style {
                     color: Some(icon_color),
-                },
-            )
-            .into()
-    } else {
-        text(resolved.fallback_glyph)
-            .size(32.0)
-            .color(icon_color)
-            .into()
-    };
+                })
+                .into()
+        } else {
+            text(resolved.fallback_glyph)
+                .size(32.0)
+                .colr(icon_color)
+                .into()
+        };
     container(
         column![
             icon_widget,
             Space::new().height(Length::Fixed(8.0)),
-            text(heading).size(14).color(palette.text.into_iced_color()),
+            text(heading).size(14).colr(palette.text.into_cosmic_color()),
             text(body)
                 .size(11)
-                .color(palette.text_muted.into_iced_color()),
+                .colr(palette.text_muted.into_cosmic_color()),
         ]
         .spacing(2)
-        .align_x(iced::alignment::Horizontal::Center),
+        .align_x(cosmic::iced::alignment::Horizontal::Center),
     )
     .padding(Padding::from([32u16, 16u16]))
     .width(Length::Fill)
