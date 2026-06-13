@@ -25,12 +25,20 @@
 
 #![forbid(unsafe_code)]
 
-use iced::widget::{button, column, container, row, text, text_input};
-use iced::{Color, Element, Length, Padding, Task, Theme};
-use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
-use iced_layershell::settings::{LayerShellSettings, Settings};
-use iced_layershell::to_layer_message;
+use cosmic::iced::widget::{button, column, container, row, text, text_input};
+use cosmic::iced::{window, Color, Length, Padding, Task};
+// CUT-2: cosmic::Element/Theme bake in cosmic::Theme (the cosmic_compat
+// .sty()/.colr() shims thread through it); the layer surface is created with
+// the fork's native wlr-layer-shell commands (iced_layershell is dropped).
+use cosmic::iced::platform_specific::runtime::wayland::layer_surface::SctkLayerSurfaceSettings;
+use cosmic::iced::platform_specific::shell::commands::layer_surface::{
+    get_layer_surface, Anchor, KeyboardInteractivity, Layer,
+};
+use cosmic::{Element, Theme};
 
+use crate::cosmic_compat::prelude::*;
+
+mod cosmic_compat;
 mod media;
 mod resolve;
 mod roster;
@@ -108,8 +116,6 @@ fn account_initials(name: &str) -> String {
 // doesn't propagate the hand-written doc comments. Allow-list
 // scoped to the enum keeps the macro-side warnings quiet while
 // preserving the doc requirement on every hand-written variant.
-#[allow(missing_docs)]
-#[to_layer_message]
 #[derive(Debug, Clone)]
 pub enum Message {
     /// Operator typed into the display text-input or clicked a
@@ -176,8 +182,36 @@ pub struct VoiceHud {
 
 // ── iced_layershell 0.18 builder-pattern functions ──────────────────────────
 
-fn namespace() -> String {
+fn namespace(_state: &VoiceHud, _id: window::Id) -> String {
     "mde-voice-hud".to_string()
+}
+
+/// CUT-2 — the HUD's Carbon Gray-100 dark theme for the cosmic daemon.
+fn theme(_state: &VoiceHud, _id: window::Id) -> Theme {
+    cosmic::Theme::dark()
+}
+
+/// Boot the layer-shell Overlay surface: bottom-right, fixed size, OnDemand
+/// keyboard (focus on click), Overlay layer (above normal windows, below the
+/// lock screen) — the §2.5 surface lock, now via the fork's native commands.
+fn boot_surface() -> Task<Message> {
+    get_layer_surface(SctkLayerSurfaceSettings {
+        id: window::Id::unique(),
+        namespace: "mde-voice-hud".to_string(),
+        size: Some((Some(WIDTH), Some(HEIGHT))),
+        exclusive_zone: 0,
+        // (top, right, bottom, left) — anchored bottom-right with margins.
+        margin: cosmic::iced::platform_specific::runtime::wayland::layer_surface::IcedMargin {
+            top: 0,
+            right: MARGIN_RIGHT,
+            bottom: MARGIN_BOTTOM,
+            left: 0,
+        },
+        anchor: Anchor::BOTTOM.union(Anchor::RIGHT),
+        layer: Layer::Overlay,
+        keyboard_interactivity: KeyboardInteractivity::OnDemand,
+        ..Default::default()
+    })
 }
 
 /// iced update — drives the HUD state machine (calls, registration, roster).
@@ -331,7 +365,7 @@ pub fn update(state: &mut VoiceHud, message: Message) -> Task<Message> {
 }
 
 /// iced view — renders the HUD overlay surface.
-pub fn view(state: &VoiceHud) -> Element<'_, Message> {
+pub fn view(state: &VoiceHud, _id: window::Id) -> Element<'_, Message> {
     container(
         column![
             build_topbar(state),
@@ -344,15 +378,15 @@ pub fn view(state: &VoiceHud) -> Element<'_, Message> {
     .padding(Padding::from([16, 16]))
     .width(Length::Fill)
     .height(Length::Fill)
-    .style(|_: &Theme| iced::widget::container::Style {
-        background: Some(iced::Background::Color(theme::SURF)),
+    .sty(|_: &Theme| cosmic::iced::widget::container::Style {
+        background: Some(cosmic::iced::Background::Color(theme::SURF)),
         ..Default::default()
     })
     .into()
 }
 
-fn subscription(_state: &VoiceHud) -> iced::Subscription<Message> {
-    iced::Subscription::batch([
+fn subscription(_state: &VoiceHud) -> cosmic::iced::Subscription<Message> {
+    cosmic::iced::Subscription::batch([
         keyboard_subscription(),
         agent_subscription(),
         dial_subscription(),
@@ -365,13 +399,13 @@ const DIAL_TOPIC: &str = "action/voice/dial";
 /// PD-5 — subscribe to `action/voice/dial`; each new request becomes a
 /// [`Message::DialRequested`]. Cursor-seeded so it only acts on requests
 /// published after the HUD starts (an old request never re-dials).
-fn dial_subscription() -> iced::Subscription<Message> {
-    use iced::futures::SinkExt;
-    use iced::stream;
-    iced::Subscription::run(|| {
+fn dial_subscription() -> cosmic::iced::Subscription<Message> {
+    use cosmic::iced::futures::SinkExt;
+    use cosmic::iced::stream;
+    cosmic::iced::Subscription::run(|| {
         stream::channel(
             8,
-            |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            |mut output: cosmic::iced::futures::channel::mpsc::Sender<Message>| async move {
                 let mut cursor = dial_cursor_init().await;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(700)).await;
@@ -430,14 +464,14 @@ async fn dial_poll(cursor: Option<String>) -> (Vec<String>, Option<String>) {
     .unwrap_or((Vec::new(), None))
 }
 
-fn keyboard_subscription() -> iced::Subscription<Message> {
-    use iced::event;
-    use iced::keyboard;
+fn keyboard_subscription() -> cosmic::iced::Subscription<Message> {
+    use cosmic::iced::event;
+    use cosmic::iced::keyboard;
     event::listen_with(|event, status, _window| match event {
-        iced::Event::Keyboard(keyboard::Event::KeyPressed { key, .. })
+        cosmic::iced::Event::Keyboard(keyboard::Event::KeyPressed { key, .. })
             if status == event::Status::Ignored =>
         {
-            use iced::keyboard::{key::Named, Key};
+            use cosmic::iced::keyboard::{key::Named, Key};
             match key {
                 Key::Named(Named::Escape) => Some(Message::Escape),
                 Key::Named(Named::Backspace) => Some(Message::Backspace),
@@ -459,13 +493,13 @@ fn keyboard_subscription() -> iced::Subscription<Message> {
 /// Bridge the persistent SIP agent's event channel (set up at boot) into iced
 /// `Message::Agent`s. Drains the std-mpsc receiver on a 50 ms poll inside the
 /// subscription's async task (mirrors the workbench's `stream::channel` idiom).
-fn agent_subscription() -> iced::Subscription<Message> {
-    use iced::futures::SinkExt;
-    use iced::stream;
-    iced::Subscription::run(|| {
+fn agent_subscription() -> cosmic::iced::Subscription<Message> {
+    use cosmic::iced::futures::SinkExt;
+    use cosmic::iced::stream;
+    cosmic::iced::Subscription::run(|| {
         stream::channel(
             64,
-            |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            |mut output: cosmic::iced::futures::channel::mpsc::Sender<Message>| async move {
                 let rx = AGENT_EVENTS.lock().ok().and_then(|mut g| g.take());
                 if let Some(rx) = rx {
                     loop {
@@ -497,26 +531,26 @@ fn build_topbar(state: &VoiceHud) -> Element<'_, Message> {
     let account_dot = container(
         text(account_initials(&peer_name))
             .size(13.0)
-            .color(theme::ON_PRIMARY),
+            .colr(theme::ON_PRIMARY),
     )
-    .style(|_: &Theme| iced::widget::container::Style {
-        background: Some(iced::Background::Color(theme::PRIMARY)),
-        border: iced::Border {
-            radius: iced::border::Radius::from(16.0),
+    .sty(|_: &Theme| cosmic::iced::widget::container::Style {
+        background: Some(cosmic::iced::Background::Color(theme::PRIMARY)),
+        border: cosmic::iced::Border {
+            radius: cosmic::iced::border::Radius::from(16.0),
             ..Default::default()
         },
         ..Default::default()
     })
     .width(Length::Fixed(32.0))
     .height(Length::Fixed(32.0))
-    .align_x(iced::alignment::Horizontal::Center)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_x(cosmic::iced::alignment::Horizontal::Center)
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
-    let presence_pip = container(iced::widget::Space::new())
-        .style(move |_: &Theme| iced::widget::container::Style {
-            background: Some(iced::Background::Color(pip_color)),
-            border: iced::Border {
-                radius: iced::border::Radius::from(4.0),
+    let presence_pip = container(cosmic::iced::widget::Space::new())
+        .sty(move |_: &Theme| cosmic::iced::widget::container::Style {
+            background: Some(cosmic::iced::Background::Color(pip_color)),
+            border: cosmic::iced::Border {
+                radius: cosmic::iced::border::Radius::from(4.0),
                 ..Default::default()
             },
             ..Default::default()
@@ -525,24 +559,24 @@ fn build_topbar(state: &VoiceHud) -> Element<'_, Message> {
         .height(Length::Fixed(8.0));
 
     let name_col = column![
-        text(peer_name).size(14.0).color(theme::ON_SURF),
+        text(peer_name).size(14.0).colr(theme::ON_SURF),
         row![
             presence_pip,
-            iced::widget::space().width(Length::Fixed(6.0)),
+            cosmic::iced::widget::space().width(Length::Fixed(6.0)),
             text(registration_status)
                 .size(11.0)
-                .color(theme::ON_SURF_VAR),
+                .colr(theme::ON_SURF_VAR),
         ]
-        .align_y(iced::Alignment::Center),
+        .align_y(cosmic::iced::Alignment::Center),
     ]
     .spacing(2);
 
     row![
         account_dot,
-        iced::widget::space().width(Length::Fixed(12.0)),
+        cosmic::iced::widget::space().width(Length::Fixed(12.0)),
         name_col,
     ]
-    .align_y(iced::Alignment::Center)
+    .align_y(cosmic::iced::Alignment::Center)
     .into()
 }
 
@@ -563,10 +597,10 @@ fn build_display<'a>(state: &VoiceHud) -> Element<'a, Message> {
     let chip = build_resolved_chip(&resolved);
 
     column![
-        container(display).style(|_: &Theme| iced::widget::container::Style {
-            background: Some(iced::Background::Color(theme::SURF_C)),
-            border: iced::Border {
-                radius: iced::border::Radius::from(8.0),
+        container(display).sty(|_: &Theme| cosmic::iced::widget::container::Style {
+            background: Some(cosmic::iced::Background::Color(theme::SURF_C)),
+            border: cosmic::iced::Border {
+                radius: cosmic::iced::border::Radius::from(8.0),
                 color: theme::OUTLINE_VAR,
                 width: 1.0,
             },
@@ -582,11 +616,11 @@ fn build_display<'a>(state: &VoiceHud) -> Element<'a, Message> {
 /// display contents. One pill per state, colored by category.
 fn build_resolved_chip<'a>(resolved: &Resolved) -> Element<'a, Message> {
     let (label, color) = resolved_chip_label_and_color(resolved);
-    container(text(label).size(12.0).color(Color::WHITE))
-        .style(move |_: &Theme| iced::widget::container::Style {
-            background: Some(iced::Background::Color(color)),
-            border: iced::Border {
-                radius: iced::border::Radius::from(12.0),
+    container(text(label).size(12.0).colr(Color::WHITE))
+        .sty(move |_: &Theme| cosmic::iced::widget::container::Style {
+            background: Some(cosmic::iced::Background::Color(color)),
+            border: cosmic::iced::Border {
+                radius: cosmic::iced::border::Radius::from(12.0),
                 ..Default::default()
             },
             ..Default::default()
@@ -647,20 +681,20 @@ fn build_keypad<'a>() -> Element<'a, Message> {
 /// `Message::KeypadPressed(c)`.
 fn keypad_button<'a>(c: char) -> Element<'a, Message> {
     button(
-        container(text(c.to_string()).size(22.0).color(theme::ON_SURF))
+        container(text(c.to_string()).size(22.0).colr(theme::ON_SURF))
             .width(Length::Fill)
             .height(Length::Fill)
-            .align_x(iced::alignment::Horizontal::Center)
-            .align_y(iced::alignment::Vertical::Center),
+            .align_x(cosmic::iced::alignment::Horizontal::Center)
+            .align_y(cosmic::iced::alignment::Vertical::Center),
     )
     .on_press(Message::KeypadPressed(c))
     .width(Length::Fill)
     .height(Length::Fixed(56.0))
-    .style(|_: &Theme, _status| iced::widget::button::Style {
-        background: Some(iced::Background::Color(theme::SURF_C)),
+    .sty(|_: &Theme, _status| cosmic::iced::widget::button::Style {
+        background: Some(cosmic::iced::Background::Color(theme::SURF_C)),
         text_color: theme::ON_SURF,
-        border: iced::Border {
-            radius: iced::border::Radius::from(8.0),
+        border: cosmic::iced::Border {
+            radius: cosmic::iced::border::Radius::from(8.0),
             ..Default::default()
         },
         ..Default::default()
@@ -671,22 +705,24 @@ fn keypad_button<'a>(c: char) -> Element<'a, Message> {
 /// A full-width call-action pill in `fill` with a white label.
 fn call_pill<'a>(label: &'a str, fill: Color, msg: Message) -> Element<'a, Message> {
     button(
-        container(text(label).size(16.0).color(theme::SURF))
+        container(text(label).size(16.0).colr(theme::SURF))
             .width(Length::Fill)
-            .align_x(iced::alignment::Horizontal::Center),
+            .align_x(cosmic::iced::alignment::Horizontal::Center),
     )
     .on_press(msg)
     .width(Length::Fill)
     .height(Length::Fixed(48.0))
-    .style(move |_: &Theme, _status| iced::widget::button::Style {
-        background: Some(iced::Background::Color(fill)),
-        text_color: theme::SURF,
-        border: iced::Border {
-            radius: iced::border::Radius::from(8.0),
+    .sty(
+        move |_: &Theme, _status| cosmic::iced::widget::button::Style {
+            background: Some(cosmic::iced::Background::Color(fill)),
+            text_color: theme::SURF,
+            border: cosmic::iced::Border {
+                radius: cosmic::iced::border::Radius::from(8.0),
+                ..Default::default()
+            },
             ..Default::default()
         },
-        ..Default::default()
-    })
+    )
     .into()
 }
 
@@ -701,18 +737,18 @@ fn build_call_bar(state: &VoiceHud) -> Element<'_, Message> {
         .into()
     } else if state.call.is_active() {
         button(
-            container(text("Hang up").size(16.0).color(theme::SURF))
+            container(text("Hang up").size(16.0).colr(theme::SURF))
                 .width(Length::Fill)
-                .align_x(iced::alignment::Horizontal::Center),
+                .align_x(cosmic::iced::alignment::Horizontal::Center),
         )
         .on_press(Message::HangUp)
         .width(Length::Fill)
         .height(Length::Fixed(48.0))
-        .style(|_: &Theme, _status| iced::widget::button::Style {
-            background: Some(iced::Background::Color(theme::ERROR)),
+        .sty(|_: &Theme, _status| cosmic::iced::widget::button::Style {
+            background: Some(cosmic::iced::Background::Color(theme::ERROR)),
             text_color: theme::SURF,
-            border: iced::Border {
-                radius: iced::border::Radius::from(8.0),
+            border: cosmic::iced::Border {
+                radius: cosmic::iced::border::Radius::from(8.0),
                 ..Default::default()
             },
             ..Default::default()
@@ -721,29 +757,31 @@ fn build_call_bar(state: &VoiceHud) -> Element<'_, Message> {
     } else {
         let enabled = !state.dialer_input.trim().is_empty();
         let mut b = button(
-            container(text("Call").size(16.0).color(if enabled {
+            container(text("Call").size(16.0).colr(if enabled {
                 theme::SURF
             } else {
                 theme::ON_SURF_MUTED
             }))
             .width(Length::Fill)
-            .align_x(iced::alignment::Horizontal::Center),
+            .align_x(cosmic::iced::alignment::Horizontal::Center),
         )
         .width(Length::Fill)
         .height(Length::Fixed(48.0))
-        .style(move |_: &Theme, _status| iced::widget::button::Style {
-            background: Some(iced::Background::Color(if enabled {
-                theme::SUCCESS
-            } else {
-                theme::SURF_C
-            })),
-            text_color: theme::SURF,
-            border: iced::Border {
-                radius: iced::border::Radius::from(8.0),
+        .sty(
+            move |_: &Theme, _status| cosmic::iced::widget::button::Style {
+                background: Some(cosmic::iced::Background::Color(if enabled {
+                    theme::SUCCESS
+                } else {
+                    theme::SURF_C
+                })),
+                text_color: theme::SURF,
+                border: cosmic::iced::Border {
+                    radius: cosmic::iced::border::Radius::from(8.0),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            ..Default::default()
-        });
+        );
         if enabled {
             b = b.on_press(Message::PlaceCall);
         }
@@ -751,9 +789,7 @@ fn build_call_bar(state: &VoiceHud) -> Element<'_, Message> {
     };
     column![
         action,
-        text(state.call.label())
-            .size(11.0)
-            .color(theme::ON_SURF_VAR),
+        text(state.call.label()).size(11.0).colr(theme::ON_SURF_VAR),
     ]
     .spacing(6)
     .into()
@@ -810,7 +846,7 @@ fn run_headless_agent() {
     sip::run_agent(&acct, &event_tx, &cmd_rx);
 }
 
-fn main() -> iced_layershell::Result {
+fn main() -> Result<(), cosmic::iced::Error> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("MDE_VOICE_HUD_LOG")
@@ -828,7 +864,7 @@ fn main() -> iced_layershell::Result {
         return Ok(());
     }
 
-    iced_layershell::application(
+    cosmic::iced::daemon(
         || {
             let RosterLoad { peers, source } = roster::load();
             tracing::info!(
@@ -871,30 +907,15 @@ fn main() -> iced_layershell::Result {
                     session: None,
                     media: None,
                 },
-                Task::none(),
+                boot_surface(),
             )
         },
-        namespace,
         update,
         view,
     )
+    .title(namespace)
     .subscription(subscription)
-    .settings(Settings {
-        id: Some("mde-voice-hud".to_string()),
-        layer_settings: LayerShellSettings {
-            size: Some((WIDTH, HEIGHT)),
-            exclusive_zone: 0,
-            // (top, right, bottom, left) per iced_layershell convention.
-            margin: (0, MARGIN_RIGHT, MARGIN_BOTTOM, 0),
-            anchor: Anchor::Bottom | Anchor::Right,
-            // §2.5 Layer lock: Overlay (above normal windows; below lock).
-            layer: Layer::Overlay,
-            // §2.5 keyboard lock: OnDemand — focus on click.
-            keyboard_interactivity: KeyboardInteractivity::OnDemand,
-            ..Default::default()
-        },
-        ..Default::default()
-    })
+    .theme(theme)
     .run()
 }
 

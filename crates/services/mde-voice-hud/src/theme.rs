@@ -8,16 +8,16 @@
 //!
 //! §4 — the hex is **not** carried here: every value is a named step from the
 //! single-sourced [`mde_theme::carbon`] ramp, converted to this crate's
-//! `iced::Color` locally (the HUD's iced version skews from the one
+//! `cosmic::iced::Color` locally (the HUD's iced version skews from the one
 //! `Rgba::into_iced_color()` targets). This module maps Carbon ramp steps to
 //! HUD roles; it holds no raw color literals. Only roles with live call
 //! sites are kept (sweep-3 I3 removed the dead H2-residue set).
 
-use iced::Color;
+use cosmic::iced::Color;
 use mde_theme::carbon;
 use mde_theme::Rgba;
 
-/// Convert an `mde_theme` ramp token to this crate's `iced::Color`, carrying the
+/// Convert an `mde_theme` ramp token to this crate's `cosmic::iced::Color`, carrying the
 /// token's own alpha. The hex lives once, in [`mde_theme::carbon`].
 const fn tok(c: Rgba) -> Color {
     Color {

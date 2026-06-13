@@ -14,17 +14,16 @@ path = "src/lib.rs"
 
 [features]
 default = []
-# Enable Iced (0.13/0.14) interop — `Rgba::into_iced_color()`,
-# `FontSize::into_iced_pixels()`, etc. Without this feature the
-# crate has no runtime dependencies and is fully testable in
-# isolation.
-iced = ["dep:iced_core"]
+# CUT-3 (2026-06-13): the `iced` interop feature (+ its crates.io iced_core
+# optional dep) was removed — the GUI is all-libcosmic now and converts Rgba to
+# the fork's Color locally, so the crate again has no GUI-toolkit dep. Keeping
+# the optional crates.io iced_core was the last pin holding crates.io iced in
+# the workspace lock.
 # Enable serde Serialize/Deserialize on Theme / Density / A11y /
 # Preferences for TOML persistence to ~/.config/mde/preferences.toml.
 serde = ["dep:serde", "dep:toml"]
 
 [dependencies]
-iced_core = { version = "0.14", optional = true }
 serde     = { version = "1", features = ["derive"], optional = true }
 toml      = { version = "0.8", default-features = false, features = ["parse", "display"], optional = true }
 
