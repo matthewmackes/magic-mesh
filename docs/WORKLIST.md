@@ -168,9 +168,7 @@ Surfaced standing up a fresh `magic-mesh` across 2 public-IP cloud lighthouses +
 
 Fixes MESH-1 by promoting cert-signing from a shared filesystem to a lighthouse network service, + collapses setup to two verbs with a TUI. §1: Nebula control plane only (no Tailscale/Headscale/DERP). Locks: dedicated rustls HTTPS `/enroll` endpoint · token-pinned cert fingerprint · `found`+`join` verbs · ratatui TUI.
 
-- [ ] **ONBOARD-1: join token v3 — embed the endpoint cert fingerprint + enroll port.**
-  **As** a joining peer, **I want** the token to carry `?fp=<sha256>` + the enroll port, **so that** I can verify the lighthouse before sending my CSR.
-  **Acceptance:** token parser reads `fp`+port (additive; v2.5 tokens still parse); mint includes the live endpoint cert fp; round-trip unit-tested.
+- [✓] **ONBOARD-1: join token v3 — embed the endpoint cert fingerprint + enroll port.** Done — `nebula_enroll.rs` `JoinToken` gained `fp: Option<String>` (`#[serde(default, skip_serializing_if)]`, additive); wire form `mesh:<id>@<ip>:<port>#<bearer>?fp=<sha256-hex>`; `parse_join_token` splits `?fp=` off the bearer + validates 64-char lowercase hex; `encode()` round-trips the suffix; `JOIN_TOKEN_MAX_LEN` 120→200 (fits the +68-char fp, still QR-friendly). v2.5 tokens parse with `fp: None`. 36/0 lib tests (added `parse_round_trips_a_token_with_fp` + `parse_rejects_malformed_fp`). *(Mint-side fp injection lands with the endpoint in ONBOARD-2/4 — the fp is the endpoint cert's, which doesn't exist until `found`.)*
 - [ ] **ONBOARD-2: lighthouse rustls `/enroll` endpoint.**
   **As** a lighthouse, **I want** a bearer-authed HTTPS endpoint that signs a peer's pubkey with the mesh CA and returns the nebula bundle, **so that** remote/NAT'd peers enroll over the public internet.
   **Acceptance:** rustls listener starts under `am_lighthouse`; `POST /enroll {bearer,name,pubkey,role}` validates the single-use bearer (reuses the enroll-token ledger; replay/expired rejected), signs via the `ca` module, returns the bundle; self-signed endpoint cert generated at `found`, its fp surfaced for tokens. Pure handler unit-tested (bearer accept/reject, bundle shape).

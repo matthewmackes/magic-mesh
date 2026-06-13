@@ -32,10 +32,17 @@ use serde::{Deserialize, Serialize};
 use crate::ca::bundle::{bundle_path, read_bundle};
 use crate::enrollment::{build_identity, EnrolledIdentity};
 
-/// QR-friendly upper bound on the wire-form join token. Matches
-/// the Python helper's `JOIN_TOKEN_MAX_LEN` lock at
-/// `mackes/wizard/pages/mesh_passcode.py`.
-pub const JOIN_TOKEN_MAX_LEN: usize = 120;
+/// QR-friendly upper bound on the wire-form join token. The v2.5
+/// base form (`mesh:<id>@<ip>:<port>#<bearer>`) fits in ~120 chars;
+/// ONBOARD-1's additive `?fp=<sha256-hex>` suffix adds up to 68
+/// (`?fp=` + 64 hex), so the bound is lifted to 200 to keep a
+/// fingerprint-bearing token QR-friendly. The Python helper's
+/// `JOIN_TOKEN_MAX_LEN` lock at `mackes/wizard/pages/mesh_passcode.py`
+/// tracks this value.
+pub const JOIN_TOKEN_MAX_LEN: usize = 200;
+
+/// Length of a SHA-256 fingerprint rendered as lowercase hex.
+const SHA256_HEX_LEN: usize = 64;
 
 /// Filename for the per-peer pending-enrollment CSR the
 /// lighthouse looks for. Lives alongside `heartbeat.json` +
@@ -66,17 +73,28 @@ pub struct JoinToken {
     /// Base32/URL-safe bearer the lighthouse validates against
     /// its pending-enroll allow-list.
     pub bearer: String,
+    /// ONBOARD-1 — optional SHA-256 fingerprint (lowercase hex) of the
+    /// lighthouse's `/enroll` HTTPS endpoint TLS cert. When present, the
+    /// network-enroll client pins the lighthouse cert to this before sending
+    /// the CSR (no trust-on-first-use). Absent → the legacy QNM-Shared flow
+    /// (co-located nodes). Additive: v2.5 tokens parse with `fp: None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fp: Option<String>,
 }
 
 impl JoinToken {
     /// Round-trip back to the wire form. Symmetric with
-    /// [`parse_join_token`].
+    /// [`parse_join_token`]. Appends `?fp=<hex>` when a fingerprint is set.
     #[must_use]
     pub fn encode(&self) -> String {
-        format!(
+        let base = format!(
             "mesh:{}@{}:{}#{}",
             self.mesh_id, self.lighthouse, self.port, self.bearer
-        )
+        );
+        match &self.fp {
+            Some(fp) => format!("{base}?fp={fp}"),
+            None => base,
+        }
     }
 }
 
@@ -102,7 +120,18 @@ pub fn parse_join_token(raw: &str) -> Option<JoinToken> {
     if mesh_id.is_empty() || !is_mesh_id_url_safe(mesh_id) {
         return None;
     }
-    let (lighthouse_port, bearer) = rest.split_once('#')?;
+    let (lighthouse_port, bearer_and_fp) = rest.split_once('#')?;
+    // ONBOARD-1: split the additive `?fp=<hex>` suffix off the bearer.
+    // v2.5 tokens have no `?fp=` and parse with `fp: None`.
+    let (bearer, fp) = match bearer_and_fp.split_once("?fp=") {
+        Some((bearer, fp_hex)) => {
+            if fp_hex.len() != SHA256_HEX_LEN || !is_lower_hex(fp_hex) {
+                return None;
+            }
+            (bearer, Some(fp_hex.to_string()))
+        }
+        None => (bearer_and_fp, None),
+    };
     if bearer.is_empty() || !is_bearer_url_safe(bearer) {
         return None;
     }
@@ -122,6 +151,7 @@ pub fn parse_join_token(raw: &str) -> Option<JoinToken> {
         lighthouse: lighthouse.to_string(),
         port,
         bearer: bearer.to_string(),
+        fp,
     })
 }
 
@@ -133,6 +163,11 @@ fn is_mesh_id_url_safe(s: &str) -> bool {
 fn is_bearer_url_safe(s: &str) -> bool {
     s.chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '=' | '-'))
+}
+
+fn is_lower_hex(s: &str) -> bool {
+    s.chars()
+        .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f'))
 }
 
 fn is_ipv4(s: &str) -> bool {
@@ -779,7 +814,32 @@ mod tests {
         assert_eq!(tok.lighthouse, "10.0.0.5");
         assert_eq!(tok.port, 4242);
         assert_eq!(tok.bearer, "dGVzdC1iZWFyZXItYWJjZGVm");
+        assert_eq!(tok.fp, None);
         assert_eq!(tok.encode(), raw);
+    }
+
+    // ---- ONBOARD-1: cert-fingerprint suffix -----------------
+
+    #[test]
+    fn parse_round_trips_a_token_with_fp() {
+        let fp = "a".repeat(SHA256_HEX_LEN);
+        let raw = format!("mesh:mesh-001@10.0.0.5:4242#bearer?fp={fp}");
+        let tok = parse_join_token(&raw).expect("decoded");
+        assert_eq!(tok.bearer, "bearer");
+        assert_eq!(tok.fp.as_deref(), Some(fp.as_str()));
+        // encode() reproduces the `?fp=` suffix verbatim.
+        assert_eq!(tok.encode(), raw);
+    }
+
+    #[test]
+    fn parse_rejects_malformed_fp() {
+        // Wrong length (63), uppercase hex, and non-hex all reject.
+        let short = "a".repeat(SHA256_HEX_LEN - 1);
+        assert!(parse_join_token(&format!("mesh:m@10.0.0.5:4242#b?fp={short}")).is_none());
+        let upper = "A".repeat(SHA256_HEX_LEN);
+        assert!(parse_join_token(&format!("mesh:m@10.0.0.5:4242#b?fp={upper}")).is_none());
+        let nonhex = "g".repeat(SHA256_HEX_LEN);
+        assert!(parse_join_token(&format!("mesh:m@10.0.0.5:4242#b?fp={nonhex}")).is_none());
     }
 
     #[test]
