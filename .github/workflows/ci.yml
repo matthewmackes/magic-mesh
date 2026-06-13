@@ -99,6 +99,9 @@ jobs:
       - name: No-private-D-Bus-name lint (§2)
         run: ./install-helpers/lint-bus-names.sh
 
+      - name: libcosmic single-rev lint (EFF-35 / CUT-5)
+        run: ./install-helpers/lint-libcosmic-rev.sh
+
       # NOTE on §1–§4 deeper checks: the Carbon single-source rule (§4) is
       # enforced by the mde-theme token tests above (a palette/metric value
       # changes only with a backing assertion); the substrate locks (§1–§3)
