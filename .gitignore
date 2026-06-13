@@ -24,3 +24,6 @@ lizardfs-binaries.tar.gz
 .claude/.drain-active
 .claude/settings.local.json
 .claude/hooks/drain-stop-guard.sh
+
+# Claude Code session workflow scripts (one-off, local paths) — not source
+.claude/workflows/
