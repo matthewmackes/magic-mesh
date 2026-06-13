@@ -146,8 +146,9 @@ impl NebulaSupervisor {
     /// success; logs + swallows individual step failures so
     /// a single bad tick doesn't kill the worker.
     async fn tick(&mut self) {
-        // 1. Check current leader state.
-        let is_leader_now = check_leader(&self.store, &self.node_id).await;
+        // 1. Check current leader state — the role-host marker (configurable
+        //    path, so tests don't read the production marker).
+        let is_leader_now = check_leader(&self.role_marker_path);
         if is_leader_now != self.last_is_leader {
             if is_leader_now {
                 if let Err(e) = self.promote().await {
@@ -614,20 +615,16 @@ fn systemctl_reload(unit: &str) -> Result<(), String> {
     systemctl("reload-or-restart", unit)
 }
 
-/// Pure helper — returns `true` when this node currently
-/// holds the leader-election lease. Stub-flavoured today
-/// (always false in tests); the real implementation
-/// consults `crate::leader::current_holder()` once the
-/// leader module's read API is reachable from the
-/// async-services feature.
-async fn check_leader(_store: &Arc<Mutex<rusqlite::Connection>>, _node_id: &str) -> bool {
-    // NF-3.4.a follow-up: read crate::leader::current_holder
-    // once that module ships an async-services entry point.
-    // For now, the boot-time wizard explicitly promotes the
-    // first host via `mackesd ca mint` + a manual marker
-    // write; this worker handles the steady-state demote
-    // case (marker removed externally).
-    std::path::Path::new(DEFAULT_ROLE_HOST_MARKER).exists()
+/// Pure helper — `true` when this node currently holds the host (leader)
+/// role, signalled by the presence of the role-host marker at
+/// `marker_path`. The marker is the leader signal in both directions: the
+/// boot-time wizard / a promotion writes it (via [`write_role_marker`],
+/// reached from `promote`), and `demote` (or an external actor) removes it.
+/// `marker_path` is the supervisor's configurable `role_marker_path` so
+/// tests point it at a tempdir rather than the production
+/// `/var/lib/mackesd/nebula/role.host`.
+fn check_leader(marker_path: &Path) -> bool {
+    marker_path.exists()
 }
 
 #[cfg(test)]
@@ -859,6 +856,17 @@ mod tests {
         write_role_marker(&marker).expect("write");
         assert!(marker.exists());
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "role:host\n");
+    }
+
+    #[test]
+    fn check_leader_reads_the_given_marker_path() {
+        // AUD7-1: leadership is the presence of the *configurable* marker, not
+        // the hardcoded production path — so a test marker is honoured.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let marker = tmp.path().join("role.host");
+        assert!(!check_leader(&marker), "absent marker → not leader");
+        write_role_marker(&marker).expect("write");
+        assert!(check_leader(&marker), "present marker → leader");
     }
 
     #[tokio::test]

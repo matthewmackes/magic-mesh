@@ -1,27 +1,24 @@
-//! VOIP-27 (v6.0) — `mde-voice-hud` Iced + wlr-layer-shell scaffold
-//! + idle dialer view.
+//! `mde-voice-hud` — the libcosmic + wlr-layer-shell voice HUD.
 //!
-//! Opens a 420 × 720 layer-shell HUD anchored bottom-right with
+//! Opens a 420 × 720 layer-shell Overlay surface anchored bottom-right with
 //! 16 px right + 56 px bottom clearance per
-//! `docs/design/v6.0-pjsip-presence-and-hud.md` §2.5. Renders the
-//! topbar (account dot + peer name + registration status), a
-//! dialer display + resolved-chip strip, and a 3 × 4 keypad.
+//! `docs/design/v6.0-pjsip-presence-and-hud.md` §2.5 (CUT-2: now on the
+//! libcosmic fork's native layer-shell, not iced_layershell). Renders the
+//! topbar (account dot + peer name + live registration status), a dialer
+//! display + resolved-chip strip, and a 3 × 4 keypad.
 //!
-//! VOIP-27's acceptance bullets are bench-observable on a clean
-//! `cargo run -p mde-voice-hud`:
+//! **Shipped state** (VOIP-27/28/29, not a scaffold):
+//! - The topbar renders the *live* `RegistrationState` (`registration.label()`)
+//!   driven by a persistent SIP agent thread (`AGENT_EVENTS`/`AGENT_CMD`), which
+//!   REGISTERs on launch and surfaces inbound INVITE/BYE (VOIP-28).
+//! - Outbound calls are real: `PlaceCall`/`DialRequested` → INVITE, plus
+//!   `Answer`/`Decline`/`HangUp` (VOIP-29). PD-5 `action/voice/dial` lands a
+//!   call from the Peers panel.
+//! - The resolved chip classifies mesh / PSTN / partial / invalid via
+//!   `resolve_target` against the live roster.
 //!
-//! 1. Workspace member registered + `cargo build` exits 0.
-//! 2. Layer-shell surface opens at Overlay layer with the
-//!    Bottom|Right anchor + margin / size lock.
-//! 3. Topbar renders the account dot + peer name placeholder +
-//!    presence pip + `Registered · 127.0.0.1:5060` static string.
-//! 4. Display field accepts keypad input; the resolved chip
-//!    renders mesh / PSTN / partial / invalid per the
-//!    `resolve_target` heuristic against the live roster.
-//!
-//! VOIP-28 wires the Bus subscription for live registration
-//! data; VOIP-29 wires the actual PJSIP call placement. This
-//! scaffold ships idle-state only.
+//! `--agent` runs the headless SIP agent (no window) for login autostart.
+//! The one honest gap is the same NAT-class detail OSS Nebula doesn't expose.
 
 #![forbid(unsafe_code)]
 
