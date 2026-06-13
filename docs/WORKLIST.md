@@ -164,6 +164,35 @@ Surfaced standing up a fresh `magic-mesh` across 2 public-IP cloud lighthouses +
 - [ ] **MESH-1 · DESIGN/SEC · enrollment has no network bootstrap — remote/NAT'd peers can't self-join.** `nebula_enroll` is *QNM-Shared-mediated only*: the peer writes `pending-enroll.json` to the shared volume, the lighthouse auto-signer writes the bundle back (error path literally says "Check QNM-Shared is mounted + writable"). A fresh peer must therefore *already* share QNM-Shared (LizardFS/NFS) with the lighthouse — but QNM-Shared rides the overlay, and you can't reach the overlay until enrolled → chicken-and-egg with no built-in resolver. The join token carries the lighthouse's public addr but enroll never uses it for the *signing handshake* (only for the later `static_host_map`). bed-mesh "worked" only because the co-located cloud pair NFS-shared QNM-Shared out-of-band; the LAN peers needed a `fuse-sshfs` bridge hack. **FINISH:** add a network enrollment path — lighthouse exposes a CSR-sign endpoint on its public IP (reuse the nebula-https-tunnel :443 / bearer-authed) so a remote peer submits its CSR + gets the signed bundle over the network, *then* mounts QNM-Shared over the overlay for steady state. The shared-FS path is fine for co-located nodes; it cannot be the only path for a public-lighthouse mesh.
 - [ ] **MESH-2 · BUG · peer materialized the lighthouse `static_host_map` with a LOCAL interface IP.** On the `fedora` peer, `nebula_supervisor` rendered `/etc/nebula/config.yaml` as `"10.42.0.1": ["192.168.122.1:4242"]` — `192.168.122.1` is the peer's own libvirt `virbr0`, not the lighthouse's public `45.55.33.179`. The received bundle was CORRECT (`external_addr: 45.55.33.179:4242`); the render clobbered it with a locally-detected address → nebula dials a dead end, overlay never forms (100% loss). The co-located cloud peer `.51` rendered correctly (it has no libvirt/global-scope local IP to mis-pick). **FINISH:** root-cause the static_host_map render — the lighthouse entry must use `bundle.lighthouses[].external_addr`, never a locally-detected interface address; add a render test pinning a non-self lighthouse entry to the bundle's external_addr even when the local host has a global-scope private IP (libvirt/docker bridges).
 
+## ONBOARD — Magic onboarding: network enrollment + zero-friction join (design: docs/design/magic-onboarding.md, 2026-06-13)
+
+Fixes MESH-1 by promoting cert-signing from a shared filesystem to a lighthouse network service, + collapses setup to two verbs with a TUI. §1: Nebula control plane only (no Tailscale/Headscale/DERP). Locks: dedicated rustls HTTPS `/enroll` endpoint · token-pinned cert fingerprint · `found`+`join` verbs · ratatui TUI.
+
+- [ ] **ONBOARD-1: join token v3 — embed the endpoint cert fingerprint + enroll port.**
+  **As** a joining peer, **I want** the token to carry `?fp=<sha256>` + the enroll port, **so that** I can verify the lighthouse before sending my CSR.
+  **Acceptance:** token parser reads `fp`+port (additive; v2.5 tokens still parse); mint includes the live endpoint cert fp; round-trip unit-tested.
+- [ ] **ONBOARD-2: lighthouse rustls `/enroll` endpoint.**
+  **As** a lighthouse, **I want** a bearer-authed HTTPS endpoint that signs a peer's pubkey with the mesh CA and returns the nebula bundle, **so that** remote/NAT'd peers enroll over the public internet.
+  **Acceptance:** rustls listener starts under `am_lighthouse`; `POST /enroll {bearer,name,pubkey,role}` validates the single-use bearer (reuses the enroll-token ledger; replay/expired rejected), signs via the `ca` module, returns the bundle; self-signed endpoint cert generated at `found`, its fp surfaced for tokens. Pure handler unit-tested (bearer accept/reject, bundle shape).
+- [ ] **ONBOARD-3: peer network-enroll client (fingerprint-pinned).**
+  **As** a peer, **I want** `join` to POST my CSR to the lighthouse over TLS pinned to the token fp and materialize the bundle, **so that** I join without QNM-Shared.
+  **Acceptance:** custom rustls verifier rejects a cert whose fp != token (fail-closed, unit-tested); on match, writes /etc/nebula from the bundle using `bundle.lighthouses[].external_addr` (NOT a local iface — closes the MESH-2 class); serve → overlay.
+- [ ] **ONBOARD-4: `found` + `join` verbs.**
+  **As** an operator, **I want** `mackesd found <mesh-id>` (become 1st lighthouse + print a join line) and `mackesd join <lighthouse-ip> <token>` (role-pin+enroll+serve), **so that** setup is two commands not five.
+  **Acceptance:** `found` brings up a lighthouse + enroll endpoint + prints a working `join` line with embedded fp; `join` onboards a peer end-to-end; both smoked.
+- [ ] **ONBOARD-5: ratatui enrollment TUI (`mde-enroll`).**
+  **As** an operator, **I want** a full-screen TUI to enter the lighthouse IP + token and watch progress, **so that** onboarding is guided + headless-friendly.
+  **Acceptance:** ratatui UI: IP+token fields, Join, live steps (CSR sent → signed → /etc/nebula → nebula up → ping OK), Carbon-danger error strip; runs over SSH; pure state-machine unit-tested.
+- [ ] **ONBOARD-6: QNM-Shared over the overlay (steady state).**
+  **As** a freshly-joined peer, **I want** QNM-Shared mounted over the overlay after join, **so that** directory/fleet features work.
+  **Acceptance:** post-join, the peer mounts the lighthouse's QNM-Shared at the overlay IP (NFS over nebula); directory verb returns peers; honest-degrade if unavailable.
+- [ ] **ONBOARD-7: portable build for older-glibc (F43) lighthouses.**
+  **As** the release, **I want** the RPM/binaries to run on F43 (glibc 2.42), **so that** the live cloud lighthouses can run the current build (today the F44 build needs GLIBC_2.43).
+  **Acceptance:** a build target (older-glibc or static/musl) that installs + runs on F43; the gh-pages repo serves a matching `fedora-43-*` tree; documented.
+- [ ] **ONBOARD-8: live two-node test on the F44 LAN boxes.**
+  **As** the operator, **I want** the new flow proven, **so that** we trust it before cloud rollout.
+  **Acceptance:** on the two F44 boxes — one `found`, one `join` over the LAN/NAT — bidirectional overlay ping verified; fp-mismatch refusal demonstrated.
+
 ## P0 — Security / substrate lock (urgent)
 
 - [✓] **H1 · RSA-2048 → RSA-4096 KDC device identity (§3)** — done (`a5186c5`); 49/0 green. — `mde-kdc-host/src/pairing.rs:236` `generate_pkcs8()` generates the live `identity.pkcs8` at 2048 bits via `PairingStore::open:101`. Rewire to the compliant 4096 generator that already exists (`keygen.rs:63`, `RSA_MODULUS_BITS=4096`, exported `lib.rs:41`); delete the duplicate 2048 `generate_pkcs8` in `pairing.rs`. Add/confirm a config test asserting 4096. **Do first — a max-crypto lock regression where the correct code already exists, just isn't called.**
