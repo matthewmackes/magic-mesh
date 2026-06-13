@@ -15,8 +15,9 @@
 
 use std::path::{Path, PathBuf};
 
-use iced::widget::{column, row, text};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{column, row, text};
+use cosmic::iced::{Length, Task};
+use cosmic::Element;
 use serde::Deserialize;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -428,7 +429,7 @@ impl ConfigApplyPanel {
                 };
                 rows = rows
                     .push(text(head).size(13))
-                    .push(text(detail).size(12).font(iced::Font::MONOSPACE));
+                    .push(text(detail).size(12).font(cosmic::iced::Font::MONOSPACE));
             }
             None => {
                 rows = rows.push(text("none recorded yet").size(13));
@@ -442,7 +443,7 @@ impl ConfigApplyPanel {
         let hero = hero_band(Hero::Ansible, s.ansible_version.as_deref(), palette);
         let body = row![
             rows.width(Length::Fill),
-            iced::widget::Space::new().width(Length::Fixed(16.0)),
+            cosmic::iced::widget::Space::new().width(Length::Fixed(16.0)),
             hero,
         ];
         panel_container(body.into(), density)

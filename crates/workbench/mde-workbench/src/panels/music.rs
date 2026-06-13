@@ -12,8 +12,8 @@
 //! AIR-8 handoff path reads a setting (AIR-20.b); everything here works
 //! end-to-end against the shipped modules with no audio backend.
 
-use iced::widget::{column, container, row, slider, text, text_input, Space};
-use iced::{Element, Length, Padding, Task};
+use cosmic::iced::widget::{column, container, row, slider, text, text_input, Space};
+use cosmic::iced::{Element, Length, Padding, Task};
 
 use mde_musicd::airsonic::Client;
 use mde_musicd::cache;
@@ -187,7 +187,7 @@ impl MusicPanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         let pal = crate::live_theme::palette();
         let m = |msg: Message| crate::Message::Music(msg);
 

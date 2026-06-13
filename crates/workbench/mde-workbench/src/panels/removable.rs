@@ -10,8 +10,8 @@
 
 use std::sync::Arc;
 
-use iced::widget::{checkbox, column, row, text};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{checkbox, column, row, text};
+use cosmic::iced::{Element, Length, Task};
 
 use crate::controls::{variant_button, ButtonVariant};
 
@@ -134,7 +134,7 @@ impl RemovablePanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         let apply_label = if self.busy { "Applying…" } else { "Apply" };
         // UX-7.a — save routed through the shared button variant.
         // Primary because save is the panel's dominant CTA.

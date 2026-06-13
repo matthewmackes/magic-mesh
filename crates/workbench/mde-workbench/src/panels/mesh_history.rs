@@ -8,8 +8,8 @@
 //! surfaces the same rows for human inspection without
 //! requiring the user to run audit-verify by hand.
 
-use iced::widget::{column, container, row, scrollable, text};
-use iced::{Element, Length, Padding, Task};
+use cosmic::iced::widget::{column, container, row, scrollable, text};
+use cosmic::iced::{Element, Length, Padding, Task};
 use mde_theme::{EmptyState, Icon};
 use tokio::process::Command;
 
@@ -138,7 +138,7 @@ impl MeshHistoryPanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         if let Some(id) = self.focused {
             let Some(row) = self.rows.iter().find(|r| r.event_id == id) else {
                 return self.view_list();
@@ -148,7 +148,7 @@ impl MeshHistoryPanel {
         self.view_list()
     }
 
-    fn view_list(&self) -> Element<'_, crate::Message> {
+    fn view_list(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         let palette = crate::live_theme::palette();
         let density = crate::live_theme::tokens().density;
         // UX-7.a — refresh routed through the shared button variant.
@@ -222,7 +222,7 @@ impl MeshHistoryPanel {
         .into()
     }
 
-    fn view_detail<'a>(&'a self, row: &'a EventRow) -> Element<'a, crate::Message> {
+    fn view_detail<'a>(&'a self, row: &'a EventRow) -> Element<'a, crate::Message, cosmic::Theme> {
         // UX-7.a — back routed through Ghost.
         let back = variant_button(
             "← Back",

@@ -21,8 +21,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use iced::widget::{column, pick_list, row, text};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{column, pick_list, row, text};
+use cosmic::iced::{Length, Task};
 
 /// Curated MIME categories. Order is the panel render order.
 pub const CATEGORIES: &[(&str, &[&str])] = &[
@@ -169,7 +169,7 @@ impl DefaultAppsPanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> cosmic::Element<'_, crate::Message> {
         let mut col = column![].spacing(12);
         for (idx, (label, _)) in CATEGORIES.iter().enumerate() {
             let handlers = self
@@ -183,20 +183,21 @@ impl DefaultAppsPanel {
                 .cloned()
                 .unwrap_or_default();
             let id_list: Vec<String> = handlers.iter().map(|h| h.id.clone()).collect();
-            let pick: pick_list::PickList<'_, String, _, _, crate::Message> = pick_list(
-                id_list,
-                if current.is_empty() {
-                    None
-                } else {
-                    Some(current)
-                },
-                move |v| {
-                    crate::Message::DefaultApps(Message::CategorySelected {
-                        category_idx: idx,
-                        desktop_id: v,
-                    })
-                },
-            );
+            let pick: pick_list::PickList<'_, String, _, _, crate::Message, cosmic::Theme> =
+                pick_list(
+                    id_list,
+                    if current.is_empty() {
+                        None
+                    } else {
+                        Some(current)
+                    },
+                    move |v| {
+                        crate::Message::DefaultApps(Message::CategorySelected {
+                            category_idx: idx,
+                            desktop_id: v,
+                        })
+                    },
+                );
             col = col.push(row![text(*label).width(Length::Fixed(180.0)), pick,].spacing(12));
         }
         col.push(row![text(&self.status).size(13)].spacing(12))

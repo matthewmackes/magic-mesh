@@ -15,9 +15,14 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use iced::widget::{button, column, container, row, scrollable, text, Space};
-use iced::{Background, Border, Color, Element, Length, Padding, Task, Theme};
+use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
+use cosmic::iced::Task;
+use cosmic::iced::{Background, Border, Color, Length, Padding};
+use cosmic::Element;
+use cosmic::Theme;
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
+
+use crate::cosmic_compat::prelude::*;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PendingPeer {
@@ -140,7 +145,7 @@ impl MeshPendingPanel {
 
         let title = text("Mesh Pending")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
 
         let subtitle_text = if !self.last_op.is_empty() {
             self.last_op.clone()
@@ -155,19 +160,19 @@ impl MeshPendingPanel {
         };
         let subtitle = text(subtitle_text)
             .size(TypeRole::Body.size_in(sizes))
-            .color(palette.text_muted.into_iced_color());
+            .colr(palette.text_muted.into_cosmic_color());
 
         let refresh_btn = button(
             text(if self.busy { "Working…" } else { "Refresh" })
                 .size(13)
-                .color(Color::WHITE),
+                .colr(Color::WHITE),
         )
         .padding(Padding::from([6u16, 14u16]))
-        .style({
-            let accent = palette.accent.into_iced_color();
-            move |_t: &Theme, status: iced::widget::button::Status| {
+        .sty({
+            let accent = palette.accent.into_cosmic_color();
+            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
                 let bg = match status {
-                    iced::widget::button::Status::Hovered => Color {
+                    cosmic::iced::widget::button::Status::Hovered => Color {
                         r: accent.r * 1.10,
                         g: accent.g * 1.10,
                         b: accent.b * 1.10,
@@ -175,7 +180,7 @@ impl MeshPendingPanel {
                     },
                     _ => accent,
                 };
-                iced::widget::button::Style {
+                cosmic::iced::widget::button::Style {
                     snap: false,
                     background: Some(Background::Color(bg)),
                     text_color: Color::WHITE,
@@ -184,7 +189,8 @@ impl MeshPendingPanel {
                         width: 0.0,
                         radius: 6.0.into(),
                     },
-                    shadow: iced::Shadow::default(),
+                    shadow: cosmic::iced::Shadow::default(),
+                    ..cosmic::iced::widget::button::Style::default()
                 }
             }
         })
@@ -195,7 +201,7 @@ impl MeshPendingPanel {
             Space::new().width(Length::Fill),
             refresh_btn,
         ]
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
         let mut peers_col = column![].spacing(10);
         for p in &self.peers {
@@ -222,37 +228,35 @@ impl MeshPendingPanel {
 
 fn peer_row<'a>(p: &'a PendingPeer, palette: Palette) -> Element<'a, crate::Message> {
     let resolved = mde_icon(Icon::Peer, IconSize::PanelHeader);
-    let icon_color = palette.accent.into_iced_color();
+    let icon_color = palette.accent.into_cosmic_color();
     let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
+        use cosmic::iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(svg_bytes))
             .width(Length::Fixed(28.0))
             .height(Length::Fixed(28.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
-                    color: Some(icon_color),
-                },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style {
+                color: Some(icon_color),
+            })
             .into()
     } else {
         text(resolved.fallback_glyph)
             .size(28.0)
-            .color(icon_color)
+            .colr(icon_color)
             .into()
     };
 
     let hostname_text = text(p.hostname.clone())
         .size(14)
-        .color(palette.text.into_iced_color());
+        .colr(palette.text.into_cosmic_color());
     let id_text = text(p.peer_id.clone())
         .size(11)
-        .color(palette.text_muted.into_iced_color());
+        .colr(palette.text_muted.into_cosmic_color());
     let distro_text = text(format!(
         "{} · mded {} · {} ms",
         p.distro, p.mded_version, p.rtt_ms
     ))
     .size(11)
-    .color(palette.text_muted.into_iced_color());
+    .colr(palette.text_muted.into_cosmic_color());
 
     let accept_btn = action_btn("Accept", palette, false).on_press(crate::Message::MeshPending(
         Message::AcceptClicked(p.peer_id.clone()),
@@ -272,14 +276,14 @@ fn peer_row<'a>(p: &'a PendingPeer, palette: Palette) -> Element<'a, crate::Mess
         reject_btn,
     ]
     .spacing(12)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
     container(body)
         .padding(Padding::from([12u16, 16u16]))
         .width(Length::Fill)
-        .style(move |_| container::Style {
+        .sty(move |_| container::Style {
             snap: false,
             background: Some(Background::Color(bg)),
             border: Border {
@@ -294,22 +298,20 @@ fn peer_row<'a>(p: &'a PendingPeer, palette: Palette) -> Element<'a, crate::Mess
 
 fn empty_state_card<'a>(palette: Palette) -> Element<'a, crate::Message> {
     let resolved = mde_icon(Icon::StatusOk, IconSize::PanelHeader);
-    let icon_color = palette.success.into_iced_color();
+    let icon_color = palette.success.into_cosmic_color();
     let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
+        use cosmic::iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(svg_bytes))
             .width(Length::Fixed(32.0))
             .height(Length::Fixed(32.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
-                    color: Some(icon_color),
-                },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style {
+                color: Some(icon_color),
+            })
             .into()
     } else {
         text(resolved.fallback_glyph)
             .size(32.0)
-            .color(icon_color)
+            .colr(icon_color)
             .into()
     };
     container(
@@ -318,16 +320,16 @@ fn empty_state_card<'a>(palette: Palette) -> Element<'a, crate::Message> {
             Space::new().height(Length::Fixed(8.0)),
             text("No pending pair requests")
                 .size(14)
-                .color(palette.text.into_iced_color()),
+                .colr(palette.text.into_cosmic_color()),
             text(
                 "When a peer initiates a pair request mackesd caches its probe under \
                  ~/.cache/mde/peers/<peer-id>/probe.json; rows appear here.",
             )
             .size(11)
-            .color(palette.text_muted.into_iced_color()),
+            .colr(palette.text_muted.into_cosmic_color()),
         ]
         .spacing(2)
-        .align_x(iced::alignment::Horizontal::Center),
+        .align_x(cosmic::iced::alignment::Horizontal::Center),
     )
     .padding(Padding::from([32u16, 16u16]))
     .width(Length::Fill)
@@ -338,51 +340,54 @@ fn action_btn<'a>(
     label: &'a str,
     palette: Palette,
     ghost: bool,
-) -> iced::widget::Button<'a, crate::Message> {
-    let accent = palette.accent.into_iced_color();
-    let danger = palette.danger.into_iced_color();
+) -> cosmic::iced::widget::Button<'a, crate::Message, Theme> {
+    let accent = palette.accent.into_cosmic_color();
+    let danger = palette.danger.into_cosmic_color();
     button(
         text(label)
             .size(11)
-            .color(if ghost { danger } else { Color::WHITE }),
+            .colr(if ghost { danger } else { Color::WHITE }),
     )
     .padding(Padding::from([4u16, 14u16]))
-    .style(move |_t: &Theme, status: iced::widget::button::Status| {
-        let (bg, fg) = if ghost {
-            let hover_bg = Color {
-                r: 0.20,
-                g: 0.08,
-                b: 0.08,
-                a: 1.0,
+    .sty(
+        move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+            let (bg, fg) = if ghost {
+                let hover_bg = Color {
+                    r: 0.20,
+                    g: 0.08,
+                    b: 0.08,
+                    a: 1.0,
+                };
+                match status {
+                    cosmic::iced::widget::button::Status::Hovered => (hover_bg, danger),
+                    _ => (Color::TRANSPARENT, danger),
+                }
+            } else {
+                let bg = match status {
+                    cosmic::iced::widget::button::Status::Hovered => Color {
+                        r: accent.r * 1.10,
+                        g: accent.g * 1.10,
+                        b: accent.b * 1.10,
+                        a: accent.a,
+                    },
+                    _ => accent,
+                };
+                (bg, Color::WHITE)
             };
-            match status {
-                iced::widget::button::Status::Hovered => (hover_bg, danger),
-                _ => (Color::TRANSPARENT, danger),
-            }
-        } else {
-            let bg = match status {
-                iced::widget::button::Status::Hovered => Color {
-                    r: accent.r * 1.10,
-                    g: accent.g * 1.10,
-                    b: accent.b * 1.10,
-                    a: accent.a,
+            cosmic::iced::widget::button::Style {
+                snap: false,
+                background: Some(Background::Color(bg)),
+                text_color: fg,
+                border: Border {
+                    color: if ghost { danger } else { Color::TRANSPARENT },
+                    width: if ghost { 1.0 } else { 0.0 },
+                    radius: 4.0.into(),
                 },
-                _ => accent,
-            };
-            (bg, Color::WHITE)
-        };
-        iced::widget::button::Style {
-            snap: false,
-            background: Some(Background::Color(bg)),
-            text_color: fg,
-            border: Border {
-                color: if ghost { danger } else { Color::TRANSPARENT },
-                width: if ghost { 1.0 } else { 0.0 },
-                radius: 4.0.into(),
-            },
-            shadow: iced::Shadow::default(),
-        }
-    })
+                shadow: cosmic::iced::Shadow::default(),
+                ..cosmic::iced::widget::button::Style::default()
+            }
+        },
+    )
 }
 
 // ---- I/O ------------------------------------------------------

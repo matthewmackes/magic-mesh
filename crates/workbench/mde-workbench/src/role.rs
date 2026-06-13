@@ -16,10 +16,12 @@
 //! same dark palette every workbench panel reads. E6.2–6.9 then fill
 //! each role's bespoke card view; this is the shared foundation.
 
-use iced::widget::{button, column, row, text, Space};
-use iced::{Background, Border, Color, Element, Length, Padding, Theme};
+use cosmic::iced::widget::{button, column, row, text, Space};
+use cosmic::iced::{Background, Border, Color, Element, Length, Padding};
+use cosmic::Theme;
 use mde_theme::{mde_icon, Icon, IconSize, Palette};
 
+use crate::cosmic_compat::prelude::*;
 use crate::model::{nav_model, Group, Panel};
 use crate::Message;
 
@@ -128,34 +130,35 @@ pub fn role_action_panels(group: Group) -> Vec<Panel> {
 
 /// Render the role-card landing for a group-root view.
 #[must_use]
-pub fn role_landing<'a>(group: Group) -> Element<'a, Message> {
+pub fn role_landing<'a>(group: Group) -> Element<'a, Message, Theme> {
     let palette = crate::live_theme::palette();
 
     // ── header: icon + title + description ──────────────────────────
     let icon_widget = header_icon(role_icon(group), palette);
     let title = text(group.label().to_string())
         .size(26)
-        .color(palette.text.into_iced_color());
+        .colr(palette.text.into_cosmic_color());
     let description = text(role_description(group).to_string())
         .size(13)
-        .color(palette.text_muted.into_iced_color());
+        .colr(palette.text_muted.into_cosmic_color());
     let header = row![
         icon_widget,
         Space::new().width(Length::Fixed(14.0)),
         column![title, Space::new().height(Length::Fixed(4.0)), description].spacing(0),
     ]
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     // ── tasks: one action-link per panel in this group ──────────────
     let panels = role_action_panels(group);
-    let mut task_links: Vec<Element<'a, Message>> = vec![section_label("Tasks", palette)];
+    let mut task_links: Vec<Element<'a, Message, Theme>> = vec![section_label("Tasks", palette)];
     for panel in panels {
         task_links.push(action_link(panel.label(), group, panel.slug(), palette));
     }
     let tasks_col = column(task_links).spacing(4).width(Length::FillPortion(3));
 
     // ── see also: related-role jumps ────────────────────────────────
-    let mut see_also_links: Vec<Element<'a, Message>> = vec![section_label("See also", palette)];
+    let mut see_also_links: Vec<Element<'a, Message, Theme>> =
+        vec![section_label("See also", palette)];
     for related in see_also(group).iter().copied() {
         see_also_links.push(group_link(related, palette));
     }
@@ -173,50 +176,48 @@ pub fn role_landing<'a>(group: Group) -> Element<'a, Message> {
     let content = column![header, Space::new().height(Length::Fixed(20.0)), body].spacing(0);
 
     // The card surface: raised background + 1 px border, palette-tokened.
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
-    iced::widget::container(content)
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
+    cosmic::iced::widget::container(content)
         .padding(Padding::from([24u16, 28u16]))
         .width(Length::Fill)
-        .style(move |_t: &Theme| iced::widget::container::Style {
+        .sty(move |_t: &Theme| cosmic::iced::widget::container::Style {
             background: Some(Background::Color(bg)),
             border: Border {
                 color: border,
                 width: 1.0,
                 radius: 8.0.into(),
             },
-            ..iced::widget::container::Style::default()
+            ..cosmic::iced::widget::container::Style::default()
         })
         .into()
 }
 
 /// The card-header icon (PanelHeader size), falling back to the glyph
 /// char when no SVG resolves.
-fn header_icon<'a>(icon: Icon, palette: Palette) -> Element<'a, Message> {
+fn header_icon<'a>(icon: Icon, palette: Palette) -> Element<'a, Message, Theme> {
     let resolved = mde_icon(icon, IconSize::PanelHeader);
     if let Some(svg_bytes) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
-        let tint = palette.text.into_iced_color();
+        use cosmic::iced::widget::svg as widget_svg;
+        let tint = palette.text.into_cosmic_color();
         widget_svg(widget_svg::Handle::from_memory(svg_bytes))
             .width(Length::Fixed(resolved.size_px()))
             .height(Length::Fixed(resolved.size_px()))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style { color: Some(tint) },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style { color: Some(tint) })
             .into()
     } else {
         text(resolved.fallback_glyph)
             .size(resolved.size_px())
-            .color(palette.text.into_iced_color())
+            .colr(palette.text.into_cosmic_color())
             .into()
     }
 }
 
 /// A small uppercase section divider label ("Tasks" / "See also").
-fn section_label<'a>(label: &'static str, palette: Palette) -> Element<'a, Message> {
+fn section_label<'a>(label: &'static str, palette: Palette) -> Element<'a, Message, Theme> {
     text(label)
         .size(11)
-        .color(palette.text_muted.into_iced_color())
+        .colr(palette.text_muted.into_cosmic_color())
         .into()
 }
 
@@ -226,11 +227,11 @@ fn action_link<'a>(
     group: Group,
     panel_slug: &'static str,
     palette: Palette,
-) -> Element<'a, Message> {
-    let accent = palette.accent.into_iced_color();
-    button(text(label.to_string()).size(13).color(accent))
+) -> Element<'a, Message, Theme> {
+    let accent = palette.accent.into_cosmic_color();
+    button(text(label.to_string()).size(13).colr(accent))
         .padding(Padding::from([4u16, 8u16]))
-        .style(link_button_style(palette))
+        .sty(link_button_style(palette))
         .on_press(Message::SelectPanel {
             group,
             panel: panel_slug,
@@ -239,11 +240,11 @@ fn action_link<'a>(
 }
 
 /// One See-also link → jumps to the related role's landing.
-fn group_link<'a>(group: Group, palette: Palette) -> Element<'a, Message> {
-    let muted = palette.text_muted.into_iced_color();
-    button(text(group.label().to_string()).size(13).color(muted))
+fn group_link<'a>(group: Group, palette: Palette) -> Element<'a, Message, Theme> {
+    let muted = palette.text_muted.into_cosmic_color();
+    button(text(group.label().to_string()).size(13).colr(muted))
         .padding(Padding::from([4u16, 8u16]))
-        .style(link_button_style(palette))
+        .sty(link_button_style(palette))
         .on_press(Message::SelectGroup(group))
         .into()
 }
@@ -252,19 +253,21 @@ fn group_link<'a>(group: Group, palette: Palette) -> Element<'a, Message> {
 /// raised tint on hover (tint of the palette token, no raw hex).
 fn link_button_style(
     palette: Palette,
-) -> impl Fn(&Theme, iced::widget::button::Status) -> iced::widget::button::Style {
-    let raised = palette.raised.into_iced_color();
-    move |_t: &Theme, status: iced::widget::button::Status| {
+) -> impl Fn(&Theme, cosmic::iced::widget::button::Status) -> cosmic::iced::widget::button::Style + 'static
+{
+    let raised = palette.raised.into_cosmic_color();
+    move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
         let hover_bg = Color {
             r: raised.r * 1.12,
             g: raised.g * 1.12,
             b: raised.b * 1.12,
             a: raised.a,
         };
-        iced::widget::button::Style {
+        cosmic::iced::widget::button::Style {
             snap: false,
             background: match status {
-                iced::widget::button::Status::Hovered | iced::widget::button::Status::Pressed => {
+                cosmic::iced::widget::button::Status::Hovered
+                | cosmic::iced::widget::button::Status::Pressed => {
                     Some(Background::Color(hover_bg))
                 }
                 _ => None,
@@ -275,7 +278,8 @@ fn link_button_style(
                 width: 0.0,
                 radius: 4.0.into(),
             },
-            shadow: iced::Shadow::default(),
+            shadow: cosmic::iced::Shadow::default(),
+            ..cosmic::iced::widget::button::Style::default()
         }
     }
 }
@@ -319,7 +323,7 @@ mod tests {
     #[test]
     fn role_landing_constructs_for_every_group() {
         for g in Group::all() {
-            let _: Element<'_, Message> = role_landing(g);
+            let _: Element<'_, Message, Theme> = role_landing(g);
         }
     }
 

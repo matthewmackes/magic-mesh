@@ -40,9 +40,14 @@
 
 use std::path::PathBuf;
 
-use iced::widget::{button, column, container, row, scrollable, svg as widget_svg, text, Space};
-use iced::{Background, Border, Color, Element, Length, Padding, Task, Theme};
+use cosmic::iced::widget::{
+    button, column, container, row, scrollable, svg as widget_svg, text, Space,
+};
+use cosmic::iced::{Background, Border, Color, Element, Length, Padding, Task};
+use cosmic::Theme;
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
+
+use crate::cosmic_compat::prelude::*;
 
 use crate::model::Group;
 use crate::panels::mesh_services::MESH_UNITS;
@@ -102,10 +107,10 @@ impl CapabilityStatus {
     pub fn color(&self) -> Color {
         let palette = crate::live_theme::palette();
         match self {
-            Self::Active => palette.success.into_iced_color(),
-            Self::SetupNeeded => palette.warning.into_iced_color(),
-            Self::Unknown => palette.text_muted.into_iced_color(),
-            Self::Failed { .. } => palette.danger.into_iced_color(),
+            Self::Active => palette.success.into_cosmic_color(),
+            Self::SetupNeeded => palette.warning.into_cosmic_color(),
+            Self::Unknown => palette.text_muted.into_cosmic_color(),
+            Self::Failed { .. } => palette.danger.into_cosmic_color(),
         }
     }
     #[must_use]
@@ -379,13 +384,13 @@ impl HomePanel {
     }
 
     /// Render the Overview.
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, Theme> {
         let palette = crate::live_theme::palette();
         let sizes = FontSize::defaults();
 
         let title = text("Overview")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
 
         let identity = text(format!(
             "MDE {ver} · Fedora {rel} · {host}",
@@ -394,7 +399,7 @@ impl HomePanel {
             host = self.snapshot.hostname,
         ))
         .size(TypeRole::Body.size_in(sizes))
-        .color(palette.text_muted.into_iced_color());
+        .colr(palette.text_muted.into_cosmic_color());
 
         let cards = row![
             stat_card(
@@ -436,7 +441,7 @@ impl HomePanel {
 
         // Optional mackesd-down banner — only renders when the
         // last probe could not reach the control plane.
-        let banner: Element<'_, crate::Message> = if self.snapshot.mackesd_reachable {
+        let banner: Element<'_, crate::Message, Theme> = if self.snapshot.mackesd_reachable {
             Space::new().height(Length::Fixed(0.0)).into()
         } else {
             mackesd_banner(palette)
@@ -444,34 +449,34 @@ impl HomePanel {
 
         let section_title = text("What this Mackes mesh can do for you")
             .size(TypeRole::Heading.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
         let section_subtitle = text(
             "Each row shows a feature, whether it is running on this machine, \
              and a shortcut to set it up.",
         )
         .size(TypeRole::Body.size_in(sizes))
-        .color(palette.text_muted.into_iced_color());
+        .colr(palette.text_muted.into_cosmic_color());
 
         let refresh_btn = refresh_button(palette);
 
-        let capability_list: Element<'_, crate::Message> = if self.snapshot.capabilities.is_empty()
-        {
-            text("Loading capability status…")
-                .size(TypeRole::Body.size_in(sizes))
-                .color(palette.text_muted.into_iced_color())
-                .into()
-        } else {
-            let mut col = column![].spacing(8);
-            for row_data in &self.snapshot.capabilities {
-                col = col.push(capability_card(row_data, palette));
-            }
-            col.into()
-        };
+        let capability_list: Element<'_, crate::Message, Theme> =
+            if self.snapshot.capabilities.is_empty() {
+                text("Loading capability status…")
+                    .size(TypeRole::Body.size_in(sizes))
+                    .colr(palette.text_muted.into_cosmic_color())
+                    .into()
+            } else {
+                let mut col = column![].spacing(8);
+                for row_data in &self.snapshot.capabilities {
+                    col = col.push(capability_card(row_data, palette));
+                }
+                col.into()
+            };
 
         // E6.2 — role navigation + a "See also" bridge to Win10 Settings.
         let manage_label = text("Manage")
             .size(TypeRole::Heading.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
         let manage_row = row![
             role_link("Apps", Group::Apps, palette),
             role_link("Devices", Group::Devices, palette),
@@ -483,13 +488,13 @@ impl HomePanel {
         let see_also_row = row![
             text("See also:")
                 .size(TypeRole::Body.size_in(sizes))
-                .color(palette.text_muted.into_iced_color()),
+                .colr(palette.text_muted.into_cosmic_color()),
             settings_link("All settings", "", palette),
             settings_link("Storage", "storage", palette),
             settings_link("Backup & recovery", "recovery", palette),
         ]
         .spacing(8)
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
         let body = column![
             title,
@@ -506,7 +511,7 @@ impl HomePanel {
             Space::new().height(Length::Fixed(24.0)),
             banner,
             row![section_title, Space::new().width(Length::Fill), refresh_btn]
-                .align_y(iced::alignment::Vertical::Center),
+                .align_y(cosmic::iced::alignment::Vertical::Center),
             Space::new().height(Length::Fixed(2.0)),
             section_subtitle,
             Space::new().height(Length::Fixed(12.0)),
@@ -530,7 +535,7 @@ fn role_link<'a>(
     label: &'static str,
     group: Group,
     palette: Palette,
-) -> Element<'a, crate::Message> {
+) -> Element<'a, crate::Message, Theme> {
     nav_chip(label, palette, crate::Message::SelectGroup(group))
 }
 
@@ -540,7 +545,7 @@ fn settings_link<'a>(
     label: &'static str,
     slug: &'static str,
     palette: Palette,
-) -> Element<'a, crate::Message> {
+) -> Element<'a, crate::Message, Theme> {
     nav_chip(label, palette, crate::Message::OpenSettings(slug))
 }
 
@@ -550,35 +555,41 @@ fn nav_chip<'a>(
     label: &'static str,
     palette: Palette,
     msg: crate::Message,
-) -> Element<'a, crate::Message> {
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
-    let fg = palette.text.into_iced_color();
-    button(text(label).size(13).color(fg))
+) -> Element<'a, crate::Message, Theme> {
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
+    let fg = palette.text.into_cosmic_color();
+    button(text(label).size(13).colr(fg))
         .padding(Padding::from([6u16, 12u16]))
-        .style(move |_t: &Theme, status: iced::widget::button::Status| {
-            let hover_bg = Color {
-                r: bg.r * 1.1,
-                g: bg.g * 1.1,
-                b: bg.b * 1.1,
-                a: bg.a,
-            };
-            iced::widget::button::Style {
-                snap: false,
-                background: Some(Background::Color(match status {
-                    iced::widget::button::Status::Hovered
-                    | iced::widget::button::Status::Pressed => hover_bg,
-                    _ => bg,
-                })),
-                text_color: fg,
-                border: Border {
-                    color: border,
-                    width: 1.0,
-                    radius: 6.0.into(),
-                },
-                shadow: iced::Shadow::default(),
-            }
-        })
+        .sty(
+            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+                let hover_bg = Color {
+                    r: bg.r * 1.1,
+                    g: bg.g * 1.1,
+                    b: bg.b * 1.1,
+                    a: bg.a,
+                };
+                cosmic::iced::widget::button::Style {
+                    snap: false,
+                    background: Some(Background::Color(match status {
+                        cosmic::iced::widget::button::Status::Hovered
+                        | cosmic::iced::widget::button::Status::Pressed => hover_bg,
+                        _ => bg,
+                    })),
+                    text_color: fg,
+                    icon_color: None,
+                    border: Border {
+                        color: border,
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    border_color: border,
+                    border_width: 1.0,
+                    border_radius: 6.0.into(),
+                    shadow: cosmic::iced::Shadow::default(),
+                }
+            },
+        )
         .on_press(msg)
         .into()
 }
@@ -1299,20 +1310,18 @@ pub fn build_all_rows_with_unknown_status() -> Vec<CapabilityRow> {
 // Widgets (OV-6 + OV-10)
 // ---------------------------------------------------------------------------
 
-fn icon_widget<'a>(icon: Icon, size: IconSize, color: Color) -> Element<'a, crate::Message> {
+fn icon_widget<'a>(icon: Icon, size: IconSize, color: Color) -> Element<'a, crate::Message, Theme> {
     let resolved = mde_icon(icon, size);
     if let Some(svg_bytes) = resolved.svg_bytes() {
         widget_svg(widget_svg::Handle::from_memory(svg_bytes))
             .width(Length::Fixed(resolved.size_px()))
             .height(Length::Fixed(resolved.size_px()))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style { color: Some(color) },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style { color: Some(color) })
             .into()
     } else {
         text(resolved.fallback_glyph)
             .size(resolved.size_px())
-            .color(color)
+            .colr(color)
             .into()
     }
 }
@@ -1320,19 +1329,19 @@ fn icon_widget<'a>(icon: Icon, size: IconSize, color: Color) -> Element<'a, crat
 fn capability_card<'a>(
     row_data: &'a CapabilityRow,
     palette: Palette,
-) -> Element<'a, crate::Message> {
+) -> Element<'a, crate::Message, Theme> {
     let icon = icon_widget(
         row_data.icon,
         IconSize::PanelHeader,
-        palette.text.into_iced_color(),
+        palette.text.into_cosmic_color(),
     );
     let name = text(row_data.name)
         .size(16)
-        .color(palette.text.into_iced_color());
+        .colr(palette.text.into_cosmic_color());
     let description = text(row_data.description)
         .size(13)
-        .color(palette.text_muted.into_iced_color());
-    let sub_status: Element<'_, crate::Message> = match row_data
+        .colr(palette.text_muted.into_cosmic_color());
+    let sub_status: Element<'_, crate::Message, Theme> = match row_data
         .status
         .detail()
         .map(str::to_string)
@@ -1340,7 +1349,7 @@ fn capability_card<'a>(
     {
         Some(s) => text(s)
             .size(12)
-            .color(palette.text_muted.into_iced_color())
+            .colr(palette.text_muted.into_cosmic_color())
             .into(),
         None => Space::new().height(Length::Fixed(0.0)).into(),
     };
@@ -1355,17 +1364,17 @@ fn capability_card<'a>(
         Space::new().width(Length::Fill),
         pill,
     ]
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     let bottom_row = row![sub_status, Space::new().width(Length::Fill), jump]
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
     container(column![top_row, Space::new().height(Length::Fixed(8.0)), bottom_row].spacing(0))
         .padding(Padding::from([16u16, 16u16]))
         .width(Length::Fill)
-        .style(move |_t: &Theme| iced::widget::container::Style {
+        .sty(move |_t: &Theme| cosmic::iced::widget::container::Style {
             snap: false,
             background: Some(Background::Color(bg)),
             border: Border {
@@ -1378,55 +1387,62 @@ fn capability_card<'a>(
         .into()
 }
 
-fn status_pill(status: &CapabilityStatus, _palette: Palette) -> Element<'_, crate::Message> {
+fn status_pill(status: &CapabilityStatus, _palette: Palette) -> Element<'_, crate::Message, Theme> {
     let color = status.color();
     let label = status.label();
     row![
         icon_widget(status.icon(), IconSize::Inline, color),
         Space::new().width(Length::Fixed(4.0)),
-        text(label).size(12).color(color),
+        text(label).size(12).colr(color),
     ]
-    .align_y(iced::alignment::Vertical::Center)
+    .align_y(cosmic::iced::alignment::Vertical::Center)
     .into()
 }
 
-fn jump_button<'a>(row_data: &'a CapabilityRow, palette: Palette) -> Element<'a, crate::Message> {
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
-    let text_color = palette.text.into_iced_color();
-    let style = move |_t: &Theme, status: iced::widget::button::Status| {
+fn jump_button<'a>(
+    row_data: &'a CapabilityRow,
+    palette: Palette,
+) -> Element<'a, crate::Message, Theme> {
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
+    let text_color = palette.text.into_cosmic_color();
+    let style = move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
         let hover_bg = Color {
             r: bg.r * 1.12,
             g: bg.g * 1.12,
             b: bg.b * 1.12,
             a: bg.a,
         };
-        iced::widget::button::Style {
+        cosmic::iced::widget::button::Style {
             snap: false,
             background: Some(Background::Color(match status {
-                iced::widget::button::Status::Hovered => hover_bg,
+                cosmic::iced::widget::button::Status::Hovered => hover_bg,
                 _ => bg,
             })),
             text_color,
+            icon_color: None,
             border: Border {
                 color: border,
                 width: 1.0,
                 radius: 6.0.into(),
             },
-            shadow: iced::Shadow::default(),
+            border_color: border,
+            border_width: 1.0,
+            border_radius: 6.0.into(),
+            shadow: cosmic::iced::Shadow::default(),
         }
     };
 
     if let Some((group, panel)) = row_data.jump {
         button(text("Configure  ▸").size(13))
             .padding(Padding::from([6u16, 14u16]))
-            .style(style)
+            .sty(style)
             .on_press(crate::Message::SelectPanel { group, panel })
             .into()
     } else if let Some(bin) = row_data.launch {
         button(text("Set up  ▸").size(13))
             .padding(Padding::from([6u16, 14u16]))
-            .style(style)
+            .sty(style)
             .on_press(crate::Message::LaunchApp(bin))
             .into()
     } else {
@@ -1434,54 +1450,60 @@ fn jump_button<'a>(row_data: &'a CapabilityRow, palette: Palette) -> Element<'a,
     }
 }
 
-fn refresh_button<'a>(palette: Palette) -> Element<'a, crate::Message> {
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
-    let text_color = palette.text.into_iced_color();
+fn refresh_button<'a>(palette: Palette) -> Element<'a, crate::Message, Theme> {
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
+    let text_color = palette.text.into_cosmic_color();
     button(text("Refresh").size(12))
         .padding(Padding::from([4u16, 12u16]))
-        .style(move |_t: &Theme, status: iced::widget::button::Status| {
-            let hover_bg = Color {
-                r: bg.r * 1.12,
-                g: bg.g * 1.12,
-                b: bg.b * 1.12,
-                a: bg.a,
-            };
-            iced::widget::button::Style {
-                snap: false,
-                background: Some(Background::Color(match status {
-                    iced::widget::button::Status::Hovered => hover_bg,
-                    _ => bg,
-                })),
-                text_color,
-                border: Border {
-                    color: border,
-                    width: 1.0,
-                    radius: 6.0.into(),
-                },
-                shadow: iced::Shadow::default(),
-            }
-        })
+        .sty(
+            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+                let hover_bg = Color {
+                    r: bg.r * 1.12,
+                    g: bg.g * 1.12,
+                    b: bg.b * 1.12,
+                    a: bg.a,
+                };
+                cosmic::iced::widget::button::Style {
+                    snap: false,
+                    background: Some(Background::Color(match status {
+                        cosmic::iced::widget::button::Status::Hovered => hover_bg,
+                        _ => bg,
+                    })),
+                    text_color,
+                    icon_color: None,
+                    border: Border {
+                        color: border,
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    border_color: border,
+                    border_width: 1.0,
+                    border_radius: 6.0.into(),
+                    shadow: cosmic::iced::Shadow::default(),
+                }
+            },
+        )
         .on_press(crate::Message::Home(Message::RefreshClicked))
         .into()
 }
 
-fn mackesd_banner<'a>(palette: Palette) -> Element<'a, crate::Message> {
-    let yellow = palette.warning.into_iced_color();
-    let bg = palette.raised.into_iced_color();
+fn mackesd_banner<'a>(palette: Palette) -> Element<'a, crate::Message, Theme> {
+    let yellow = palette.warning.into_cosmic_color();
+    let bg = palette.raised.into_cosmic_color();
     container(
         row![
             icon_widget(Icon::StatusWarning, IconSize::PanelHeader, yellow),
             Space::new().width(Length::Fixed(8.0)),
             text("mackesd is not responding — capability statuses may be stale.")
                 .size(13)
-                .color(palette.text.into_iced_color()),
+                .colr(palette.text.into_cosmic_color()),
         ]
-        .align_y(iced::alignment::Vertical::Center),
+        .align_y(cosmic::iced::alignment::Vertical::Center),
     )
     .padding(Padding::from([10u16, 14u16]))
     .width(Length::Fill)
-    .style(move |_t: &Theme| iced::widget::container::Style {
+    .sty(move |_t: &Theme| cosmic::iced::widget::container::Style {
         snap: false,
         background: Some(Background::Color(bg)),
         border: Border {
@@ -1505,11 +1527,11 @@ fn stat_card<'a>(
     target_group: Group,
     target_panel: &'a str,
     palette: Palette,
-) -> Element<'a, crate::Message> {
+) -> Element<'a, crate::Message, Theme> {
     let icon = icon_widget(
         icon,
         IconSize::PanelHeader,
-        palette.text_muted.into_iced_color(),
+        palette.text_muted.into_cosmic_color(),
     );
     let value_display = match value {
         Some(n) => n.to_string(),
@@ -1517,10 +1539,10 @@ fn stat_card<'a>(
     };
     let value_text = text(value_display)
         .size(28)
-        .color(palette.text.into_iced_color());
+        .colr(palette.text.into_cosmic_color());
     let label_text = text(label.to_string())
         .size(12)
-        .color(palette.text_muted.into_iced_color());
+        .colr(palette.text_muted.into_cosmic_color());
     let card_panel_slug: &'static str = match target_panel {
         "snapshots" => "snapshots",
         "drift" => "drift",
@@ -1535,36 +1557,42 @@ fn stat_card<'a>(
         label_text,
     ]
     .spacing(0)
-    .align_x(iced::alignment::Horizontal::Left);
+    .align_x(cosmic::iced::alignment::Horizontal::Left);
 
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
-    let muted_text = palette.text_muted.into_iced_color();
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
+    let muted_text = palette.text_muted.into_cosmic_color();
     button(card)
         .width(Length::Fill)
         .padding(Padding::from([16u16, 16u16]))
-        .style(move |_t: &Theme, status: iced::widget::button::Status| {
-            let hover_bg = Color {
-                r: bg.r * 1.08,
-                g: bg.g * 1.08,
-                b: bg.b * 1.08,
-                a: bg.a,
-            };
-            iced::widget::button::Style {
-                snap: false,
-                background: Some(Background::Color(match status {
-                    iced::widget::button::Status::Hovered => hover_bg,
-                    _ => bg,
-                })),
-                text_color: muted_text,
-                border: Border {
-                    color: border,
-                    width: 1.0,
-                    radius: 8.0.into(),
-                },
-                shadow: iced::Shadow::default(),
-            }
-        })
+        .sty(
+            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+                let hover_bg = Color {
+                    r: bg.r * 1.08,
+                    g: bg.g * 1.08,
+                    b: bg.b * 1.08,
+                    a: bg.a,
+                };
+                cosmic::iced::widget::button::Style {
+                    snap: false,
+                    background: Some(Background::Color(match status {
+                        cosmic::iced::widget::button::Status::Hovered => hover_bg,
+                        _ => bg,
+                    })),
+                    text_color: muted_text,
+                    icon_color: None,
+                    border: Border {
+                        color: border,
+                        width: 1.0,
+                        radius: 8.0.into(),
+                    },
+                    border_color: border,
+                    border_width: 1.0,
+                    border_radius: 8.0.into(),
+                    shadow: cosmic::iced::Shadow::default(),
+                }
+            },
+        )
         .on_press(crate::Message::SelectPanel {
             group: target_group,
             panel: card_panel_slug,
@@ -1613,9 +1641,9 @@ fn extract_peer_count(row: &CapabilityRow) -> Option<u32> {
 /// On connection loss (mackesd restart, bus disconnect) the
 /// loop re-establishes with a 5 s backoff so the Overview
 /// resumes live updates without a Workbench relaunch.
-pub fn dbus_subscription() -> iced::Subscription<crate::Message> {
-    use iced::stream;
-    iced::Subscription::run(|| {
+pub fn dbus_subscription() -> cosmic::iced::Subscription<crate::Message> {
+    use cosmic::iced::stream;
+    cosmic::iced::Subscription::run(|| {
         stream::channel(32, |mut output| async move {
             loop {
                 if let Err(e) = run_subscription(&mut output).await {
@@ -1647,13 +1675,13 @@ const NEBULA_EVENT_TOPIC: &str = "event/nebula/signals";
 /// poll opens a short-lived `Persist` inside `spawn_blocking`
 /// (rusqlite isn't `Send`, so it can't cross the executor's await
 /// points).
-pub fn nebula_event_subscription() -> iced::Subscription<crate::Message> {
-    use iced::futures::SinkExt;
-    use iced::stream;
-    iced::Subscription::run(|| {
+pub fn nebula_event_subscription() -> cosmic::iced::Subscription<crate::Message> {
+    use cosmic::iced::futures::SinkExt;
+    use cosmic::iced::stream;
+    cosmic::iced::Subscription::run(|| {
         stream::channel(
             32,
-            |mut output: iced::futures::channel::mpsc::Sender<crate::Message>| async move {
+            |mut output: cosmic::iced::futures::channel::mpsc::Sender<crate::Message>| async move {
                 let mut cursor = nebula_event_cursor_init().await;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(750)).await;
@@ -1754,9 +1782,9 @@ pub fn systemd_watch_list() -> Vec<String> {
 }
 
 async fn run_subscription(
-    output: &mut iced::futures::channel::mpsc::Sender<crate::Message>,
+    output: &mut cosmic::iced::futures::channel::mpsc::Sender<crate::Message>,
 ) -> Result<(), String> {
-    use iced::futures::SinkExt;
+    use cosmic::iced::futures::SinkExt;
     use zbus::MatchRule;
     use zbus::MessageStream;
 
@@ -1802,7 +1830,7 @@ async fn run_subscription(
         .map_err(|e| format!("add_match_rule systemd PropertiesChanged: {e}"))?;
 
     let stream = MessageStream::from(&conn);
-    use iced::futures::StreamExt;
+    use cosmic::iced::futures::StreamExt;
     let mut stream = stream;
     while let Some(msg) = stream.next().await {
         let msg = match msg {

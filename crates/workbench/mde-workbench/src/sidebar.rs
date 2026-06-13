@@ -14,12 +14,13 @@
 //! width) are NOT density-scaled — UX-24 sub-lock requires
 //! density to scale spacing tokens only.
 
-use iced::widget::button::Status as ButtonStatus;
-use iced::widget::{button, column, container, row, text, Column, Space};
-use iced::{alignment, Background, Border, Color, Element, Length, Padding, Shadow};
+use cosmic::iced::widget::button::Status as ButtonStatus;
+use cosmic::iced::widget::{button, column, container, row, text, Column, Space};
+use cosmic::iced::{alignment, Background, Border, Color, Element, Length, Padding, Shadow};
 
 use mde_theme::{Palette, Space as MdeSpace};
 
+use crate::cosmic_compat::prelude::*;
 use crate::keyboard::Pane;
 use crate::model::{nav_model, Group, View};
 
@@ -101,7 +102,7 @@ pub fn view<'a>(
     focused_pane: Pane,
     on_group_click: impl Fn(Group) -> crate::Message + 'a,
     on_panel_click: impl Fn(Group, &'static str) -> crate::Message + 'a,
-) -> Element<'a, crate::Message> {
+) -> Element<'a, crate::Message, cosmic::Theme> {
     let palette = crate::live_theme::palette();
     let space = MdeSpace::for_density(crate::live_theme::tokens().density);
     let active = view.group();
@@ -110,7 +111,7 @@ pub fn view<'a>(
     // UX-5 (a) — SPACE_16 ≈ md2 (17 px). Outer container padding.
     let outer_padding = f32::from(space.md2);
 
-    let mut col: Column<'a, crate::Message> = column![].spacing(0);
+    let mut col: Column<'a, crate::Message, cosmic::Theme> = column![].spacing(0);
 
     // PLANES-1 (W4/W16) — the full five-plane tree is shown day-one:
     // Peers Front Door, the five planes (Network is a first-class plane
@@ -149,33 +150,34 @@ pub fn view<'a>(
             bottom: outer_padding,
             left: outer_padding,
         })
-        .style(move |_theme| container::Style {
+        .sty(move |_theme| container::Style {
+            icon_color: None,
             snap: false,
-            background: Some(Background::Color(palette.background.into_iced_color())),
+            background: Some(Background::Color(palette.background.into_cosmic_color())),
             border: Border {
-                color: palette.border.into_iced_color(),
+                color: palette.border.into_cosmic_color(),
                 width: 1.0,
                 radius: 0.0.into(),
             },
             shadow: Shadow::default(),
-            text_color: Some(palette.text.into_iced_color()),
+            text_color: Some(palette.text.into_cosmic_color()),
         })
         .into()
 }
 
 /// UX-5 (e) — section divider. 1 px rule using the adaptive
 /// border token.
-fn section_divider<'a>(palette: Palette) -> Element<'a, crate::Message> {
-    container(iced::widget::rule::horizontal(1))
+fn section_divider<'a>(palette: Palette) -> Element<'a, crate::Message, cosmic::Theme> {
+    container(cosmic::iced::widget::rule::horizontal(1))
         .padding(Padding {
             top: 8.0,
             right: 0.0,
             bottom: 4.0,
             left: 0.0,
         })
-        .style(move |_| container::Style {
+        .sty(move |_| container::Style {
             snap: false,
-            text_color: Some(palette.border.into_iced_color()),
+            text_color: Some(palette.border.into_cosmic_color()),
             ..container::Style::default()
         })
         .into()
@@ -190,31 +192,36 @@ fn section_label<'a>(
     active: Group,
     palette: Palette,
     on_click: &(impl Fn(Group) -> crate::Message + 'a),
-) -> Element<'a, crate::Message> {
+) -> Element<'a, crate::Message, cosmic::Theme> {
     let is_active = group == active;
     let label_text = group.label().to_uppercase();
     let text_color = if is_active {
-        palette.text.into_iced_color()
+        palette.text.into_cosmic_color()
     } else {
-        palette.text_muted.into_iced_color()
+        palette.text_muted.into_cosmic_color()
     };
 
     let label = text(label_text)
         .size(SECTION_LABEL_SIZE)
-        .color(text_color)
+        .colr(text_color)
         .align_y(alignment::Vertical::Center);
 
-    let style = move |_theme: &iced::Theme, status: ButtonStatus| {
+    let style = move |_theme: &cosmic::Theme, status: ButtonStatus| {
         let bg = match status {
-            ButtonStatus::Hovered => Background::Color(palette.raised.into_iced_color()),
-            ButtonStatus::Pressed => Background::Color(palette.overlay.into_iced_color()),
+            ButtonStatus::Hovered => Background::Color(palette.raised.into_cosmic_color()),
+            ButtonStatus::Pressed => Background::Color(palette.overlay.into_cosmic_color()),
             _ => Background::Color(Color::TRANSPARENT),
         };
+        let border = Border::default();
         button::Style {
             snap: false,
+            icon_color: None,
             background: Some(bg),
             text_color,
-            border: Border::default(),
+            border,
+            border_color: border.color,
+            border_width: border.width,
+            border_radius: border.radius,
             shadow: Shadow::default(),
         }
     };
@@ -228,7 +235,7 @@ fn section_label<'a>(
             left: 0.0,
         })
         .on_press(on_click(group))
-        .style(style)
+        .sty(style)
         .into()
 }
 
@@ -248,16 +255,16 @@ fn nav_row<'a>(
     sidebar_focused: bool,
     palette: Palette,
     on_click: &(impl Fn(Group, &'static str) -> crate::Message + 'a),
-) -> Element<'a, crate::Message> {
+) -> Element<'a, crate::Message, cosmic::Theme> {
     let stripe_color = if is_active {
-        palette.accent.into_iced_color()
+        palette.accent.into_cosmic_color()
     } else {
         Color::TRANSPARENT
     };
     let stripe = container(Space::new().height(Length::Fixed(NAV_ROW_HEIGHT)))
         .width(Length::Fixed(SELECTED_STRIPE_WIDTH))
         .height(Length::Fixed(NAV_ROW_HEIGHT))
-        .style(move |_| container::Style {
+        .sty(move |_| container::Style {
             snap: false,
             background: Some(Background::Color(stripe_color)),
             ..container::Style::default()
@@ -266,13 +273,13 @@ fn nav_row<'a>(
     let icon_slot = Space::new().width(Length::Fixed(NAV_ICON_SIZE));
 
     let text_color = if is_active {
-        palette.accent.into_iced_color()
+        palette.accent.into_cosmic_color()
     } else {
-        palette.text.into_iced_color()
+        palette.text.into_cosmic_color()
     };
     let label = text(label_text)
         .size(NAV_LABEL_SIZE)
-        .color(text_color)
+        .colr(text_color)
         .align_y(alignment::Vertical::Center);
 
     let content = row![
@@ -285,19 +292,19 @@ fn nav_row<'a>(
     .align_y(alignment::Vertical::Center)
     .height(Length::Fixed(NAV_ROW_HEIGHT));
 
-    let style = move |_theme: &iced::Theme, status: ButtonStatus| {
+    let style = move |_theme: &cosmic::Theme, status: ButtonStatus| {
         let bg = if is_active {
-            Background::Color(palette.hover_tint().into_iced_color())
+            Background::Color(palette.hover_tint().into_cosmic_color())
         } else {
             match status {
-                ButtonStatus::Hovered => Background::Color(palette.raised.into_iced_color()),
-                ButtonStatus::Pressed => Background::Color(palette.overlay.into_iced_color()),
+                ButtonStatus::Hovered => Background::Color(palette.raised.into_cosmic_color()),
+                ButtonStatus::Pressed => Background::Color(palette.overlay.into_cosmic_color()),
                 _ => Background::Color(Color::TRANSPARENT),
             }
         };
         let border = if is_active && sidebar_focused {
             Border {
-                color: palette.accent.into_iced_color(),
+                color: palette.accent.into_cosmic_color(),
                 width: FOCUS_RING_WIDTH,
                 radius: 0.0.into(),
             }
@@ -306,9 +313,13 @@ fn nav_row<'a>(
         };
         button::Style {
             snap: false,
+            icon_color: None,
             background: Some(bg),
             text_color,
             border,
+            border_color: border.color,
+            border_width: border.width,
+            border_radius: border.radius,
             shadow: Shadow::default(),
         }
     };
@@ -318,7 +329,7 @@ fn nav_row<'a>(
         .height(Length::Fixed(NAV_ROW_HEIGHT))
         .padding(0)
         .on_press(on_click(group, slug))
-        .style(style)
+        .sty(style)
         .into()
 }
 

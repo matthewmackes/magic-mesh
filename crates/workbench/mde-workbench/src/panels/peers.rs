@@ -19,9 +19,13 @@
 
 use std::time::Duration;
 
-use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
-use iced::{Background, Border, Element, Length, Padding, Task};
+use cosmic::iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
+use cosmic::iced::Task;
+use cosmic::iced::{Background, Border, Length, Padding};
+use cosmic::Element;
 use mde_theme::TypeRole;
+
+use crate::cosmic_compat::prelude::*;
 
 /// One row of the directory reply, parsed leniently.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -438,8 +442,9 @@ pub fn group_of(row: &PeerRow, self_hostname: &str) -> &'static str {
 /// nothing polls when the operator is elsewhere — the Compute-panel
 /// pattern).
 #[must_use]
-pub fn metrics_subscription() -> iced::Subscription<crate::Message> {
-    iced::time::every(Duration::from_secs(2)).map(|_| crate::Message::Peers(Message::MetricsTick))
+pub fn metrics_subscription() -> cosmic::iced::Subscription<crate::Message> {
+    cosmic::iced::time::every(Duration::from_secs(2))
+        .map(|_| crate::Message::Peers(Message::MetricsTick))
 }
 
 /// PD-3/Q10 — the view-gated 30 s directory-refresh tick (registered
@@ -448,8 +453,9 @@ pub fn metrics_subscription() -> iced::Subscription<crate::Message> {
 /// stay current without an operator click; the reload preserves the
 /// current filter + selection.
 #[must_use]
-pub fn directory_subscription() -> iced::Subscription<crate::Message> {
-    iced::time::every(Duration::from_secs(30)).map(|_| crate::Message::Peers(Message::PollTick))
+pub fn directory_subscription() -> cosmic::iced::Subscription<crate::Message> {
+    cosmic::iced::time::every(Duration::from_secs(30))
+        .map(|_| crate::Message::Peers(Message::PollTick))
 }
 
 /// PD-3/Q10 — the **Bus-push** half: subscribe to the directory-changed
@@ -459,12 +465,12 @@ pub fn directory_subscription() -> iced::Subscription<crate::Message> {
 const DIRECTORY_EVENT_TOPIC: &str = "event/mesh/directory";
 
 #[must_use]
-pub fn directory_event_subscription() -> iced::Subscription<crate::Message> {
-    use iced::futures::SinkExt;
-    iced::Subscription::run(|| {
-        iced::stream::channel(
+pub fn directory_event_subscription() -> cosmic::iced::Subscription<crate::Message> {
+    use cosmic::iced::futures::SinkExt;
+    cosmic::iced::Subscription::run(|| {
+        cosmic::iced::stream::channel(
             8,
-            |mut output: iced::futures::channel::mpsc::Sender<crate::Message>| async move {
+            |mut output: cosmic::iced::futures::channel::mpsc::Sender<crate::Message>| async move {
                 let mut cursor = dir_event_cursor_init().await;
                 loop {
                     tokio::time::sleep(Duration::from_millis(900)).await;
@@ -631,23 +637,26 @@ fn sample_flows(targets: &[(String, String)]) -> std::collections::HashMap<Strin
 /// PD-7/L20 — the ~2 s trace tick, registered only while a trace card is
 /// open (App::subscription gates on `traced_edge`).
 #[must_use]
-pub fn trace_subscription() -> iced::Subscription<crate::Message> {
-    iced::time::every(Duration::from_secs(2)).map(|_| crate::Message::Peers(Message::TraceTick))
+pub fn trace_subscription() -> cosmic::iced::Subscription<crate::Message> {
+    cosmic::iced::time::every(Duration::from_secs(2))
+        .map(|_| crate::Message::Peers(Message::TraceTick))
 }
 
 /// PD-7/L18 — the ~3 s flow-data tick (re-sample peer overlay throughput),
 /// registered only while the Map view is open.
 #[must_use]
-pub fn flow_data_subscription() -> iced::Subscription<crate::Message> {
-    iced::time::every(Duration::from_secs(3)).map(|_| crate::Message::Peers(Message::FlowTick))
+pub fn flow_data_subscription() -> cosmic::iced::Subscription<crate::Message> {
+    cosmic::iced::time::every(Duration::from_secs(3))
+        .map(|_| crate::Message::Peers(Message::FlowTick))
 }
 
 /// PD-7/L18/L22 — the ~90 ms particle-animation tick. Registered ONLY when
 /// real traffic is flowing (App::subscription gates on [`PeersPanel::
 /// has_flow`]), so an idle mesh runs no animation loop (idle CPU).
 #[must_use]
-pub fn flow_anim_subscription() -> iced::Subscription<crate::Message> {
-    iced::time::every(Duration::from_millis(90)).map(|_| crate::Message::Peers(Message::FlowAnim))
+pub fn flow_anim_subscription() -> cosmic::iced::Subscription<crate::Message> {
+    cosmic::iced::time::every(Duration::from_millis(90))
+        .map(|_| crate::Message::Peers(Message::FlowAnim))
 }
 
 /// PD-11 — poll the executor's result file via the verb, with a 2 s
@@ -1345,7 +1354,7 @@ impl PeersPanel {
         let sizes = mde_theme::FontSize::defaults();
         let title = text("Peers")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
 
         // L3 — guided empty states.
         match &self.loaded {
@@ -1356,13 +1365,13 @@ impl PeersPanel {
                 let body = column![
                     text("The mesh service isn't answering.")
                         .size(16)
-                        .color(palette.text.into_iced_color()),
+                        .colr(palette.text.into_cosmic_color()),
                     text(e.clone())
                         .size(12)
-                        .color(palette.text_muted.into_iced_color()),
+                        .colr(palette.text_muted.into_cosmic_color()),
                     text("Start it from Network → Mesh Services, then refresh.")
                         .size(13)
-                        .color(palette.text_muted.into_iced_color()),
+                        .colr(palette.text_muted.into_cosmic_color()),
                     refresh_btn(palette),
                 ]
                 .spacing(8);
@@ -1372,10 +1381,10 @@ impl PeersPanel {
                 let body = column![
                     text("No peers in this mesh yet.")
                         .size(16)
-                        .color(palette.text.into_iced_color()),
+                        .colr(palette.text.into_cosmic_color()),
                     text("Invite a peer: mint a join token with `mackesd enroll-token` and run `mackesd enroll --token …` on the new box.")
                         .size(13)
-                        .color(palette.text_muted.into_iced_color()),
+                        .colr(palette.text_muted.into_cosmic_color()),
                     refresh_btn(palette),
                 ]
                 .spacing(8);
@@ -1403,7 +1412,7 @@ impl PeersPanel {
             list = list.push(
                 text(group)
                     .size(11)
-                    .color(palette.text_muted.into_iced_color()),
+                    .colr(palette.text_muted.into_cosmic_color()),
             );
             for r in members {
                 let selected = self.selected.as_deref() == Some(r.hostname.as_str());
@@ -1420,19 +1429,23 @@ impl PeersPanel {
                     palette.surface
                 };
                 list = list.push(
-                    button(text(label).size(13).color(fg.into_iced_color()))
+                    button(text(label).size(13).colr(fg.into_cosmic_color()))
                         .width(Length::Fill)
                         .padding(Padding::from([6u16, 10u16]))
-                        .style(move |_t, _s| iced::widget::button::Style {
+                        .sty(move |_t, _s| cosmic::iced::widget::button::Style {
                             snap: false,
-                            background: Some(Background::Color(bg.into_iced_color())),
-                            text_color: fg.into_iced_color(),
+                            background: Some(Background::Color(bg.into_cosmic_color())),
+                            text_color: fg.into_cosmic_color(),
+                            icon_color: None,
+                            border_radius: 4.0.into(),
+                            border_width: 0.0,
+                            border_color: cosmic::iced::Color::TRANSPARENT,
                             border: Border {
-                                color: iced::Color::TRANSPARENT,
+                                color: cosmic::iced::Color::TRANSPARENT,
                                 width: 0.0,
                                 radius: 4.0.into(),
                             },
-                            shadow: iced::Shadow::default(),
+                            shadow: cosmic::iced::Shadow::default(),
                         })
                         .on_press(crate::Message::Peers(Message::Select(r.hostname.clone()))),
                 );
@@ -1452,7 +1465,7 @@ impl PeersPanel {
             list = list.push(
                 text("Devices")
                     .size(11)
-                    .color(palette.text_muted.into_iced_color()),
+                    .colr(palette.text_muted.into_cosmic_color()),
             );
             for d in devices {
                 let selected = self.selected_device.as_deref() == Some(d.id.as_str());
@@ -1471,19 +1484,23 @@ impl PeersPanel {
                 };
                 let id = d.id.clone();
                 list = list.push(
-                    button(text(label).size(13).color(fg.into_iced_color()))
+                    button(text(label).size(13).colr(fg.into_cosmic_color()))
                         .width(Length::Fill)
                         .padding(Padding::from([6u16, 10u16]))
-                        .style(move |_t, _s| iced::widget::button::Style {
+                        .sty(move |_t, _s| cosmic::iced::widget::button::Style {
                             snap: false,
-                            background: Some(Background::Color(bg.into_iced_color())),
-                            text_color: fg.into_iced_color(),
+                            background: Some(Background::Color(bg.into_cosmic_color())),
+                            text_color: fg.into_cosmic_color(),
+                            icon_color: None,
+                            border_radius: 4.0.into(),
+                            border_width: 0.0,
+                            border_color: cosmic::iced::Color::TRANSPARENT,
                             border: Border {
-                                color: iced::Color::TRANSPARENT,
+                                color: cosmic::iced::Color::TRANSPARENT,
                                 width: 0.0,
                                 radius: 4.0.into(),
                             },
-                            shadow: iced::Shadow::default(),
+                            shadow: cosmic::iced::Shadow::default(),
                         })
                         .on_press(crate::Message::Peers(Message::SelectDevice(id))),
                 );
@@ -1508,13 +1525,13 @@ impl PeersPanel {
                 .find(|r| Some(r.hostname.as_str()) == self.selected.as_deref())
             {
                 None => text("Select a peer.")
-                    .color(palette.text_muted.into_iced_color())
+                    .colr(palette.text_muted.into_cosmic_color())
                     .into(),
                 Some(r) => {
                     let header = row![
                         text(&r.hostname)
                             .size(20)
-                            .color(palette.text.into_iced_color()),
+                            .colr(palette.text.into_cosmic_color()),
                         Space::new().width(Length::Fixed(10.0)),
                         badge(
                             if r.role.is_empty() {
@@ -1527,16 +1544,16 @@ impl PeersPanel {
                         Space::new().width(Length::Fill),
                         refresh_btn(palette),
                     ]
-                    .align_y(iced::alignment::Vertical::Center);
+                    .align_y(cosmic::iced::alignment::Vertical::Center);
                     // L1 — capability-tag chips; honest absence when none.
                     let tags_row: Element<'_, crate::Message> = if r.tags.is_empty() {
                         Space::new().height(Length::Fixed(0.0)).into()
                     } else {
                         let mut chips = row![text("Tags")
                             .size(11)
-                            .color(palette.text_muted.into_iced_color())]
+                            .colr(palette.text_muted.into_cosmic_color())]
                         .spacing(6)
-                        .align_y(iced::alignment::Vertical::Center);
+                        .align_y(cosmic::iced::alignment::Vertical::Center);
                         for t in &r.tags {
                             chips = chips.push(badge(t.as_str(), palette));
                         }
@@ -1580,7 +1597,7 @@ impl PeersPanel {
                     } else {
                         text(self.op_result.clone())
                             .size(12)
-                            .color(palette.text_muted.into_iced_color())
+                            .colr(palette.text_muted.into_cosmic_color())
                             .into()
                     };
                     // PD-12 — Wake is the one op an offline peer offers (L4).
@@ -1640,7 +1657,7 @@ impl PeersPanel {
                     let mut metrics_col = column![row![
                         text("Live metrics")
                             .size(13)
-                            .color(palette.text.into_iced_color()),
+                            .colr(palette.text.into_cosmic_color()),
                         Space::new().width(Length::Fixed(10.0)),
                         if !r.overlay_ip.is_empty() && r.presence != "offline" {
                             crate::controls::variant_button(
@@ -1655,7 +1672,7 @@ impl PeersPanel {
                             Space::new().height(Length::Fixed(0.0)).into()
                         },
                     ]
-                    .align_y(iced::alignment::Vertical::Center)]
+                    .align_y(cosmic::iced::alignment::Vertical::Center)]
                     .spacing(4);
                     match (&self.metrics, &self.metrics_err) {
                         (Some(m), _) => {
@@ -1671,15 +1688,15 @@ impl PeersPanel {
                                         text(label)
                                             .size(12)
                                             .width(Length::Fixed(100.0))
-                                            .color(palette.text_muted.into_iced_color()),
+                                            .colr(palette.text_muted.into_cosmic_color()),
                                         text(sparkline(series))
                                             .size(12)
-                                            .color(palette.accent.into_iced_color()),
+                                            .colr(palette.accent.into_cosmic_color()),
                                         text(format!(" {last:.1}"))
                                             .size(12)
-                                            .color(palette.text.into_iced_color()),
+                                            .colr(palette.text.into_cosmic_color()),
                                     ]
-                                    .align_y(iced::alignment::Vertical::Center),
+                                    .align_y(cosmic::iced::alignment::Vertical::Center),
                                 );
                             }
                         }
@@ -1687,7 +1704,7 @@ impl PeersPanel {
                             metrics_col = metrics_col.push(
                                 text(format!("Netdata not answering on this peer: {e}"))
                                     .size(12)
-                                    .color(palette.text_muted.into_iced_color()),
+                                    .colr(palette.text_muted.into_cosmic_color()),
                             );
                         }
                         (None, None) => {
@@ -1698,14 +1715,14 @@ impl PeersPanel {
                                     "Waiting for the first sample…"
                                 })
                                 .size(12)
-                                .color(palette.text_muted.into_iced_color()),
+                                .colr(palette.text_muted.into_cosmic_color()),
                             );
                         }
                     }
 
                     let mut services = column![text("Services provided")
                         .size(13)
-                        .color(palette.text.into_iced_color())]
+                        .colr(palette.text.into_cosmic_color())]
                     .spacing(4);
                     // PD-11 — lifecycle rows: start one-click; stop/
                     // restart armed-confirm (L16). Self excluded (local
@@ -1716,9 +1733,9 @@ impl PeersPanel {
                                 let running = state == "running";
                                 let mut ops_row = row![text(format!("{kind}: {name} ({state})"))
                                     .size(12)
-                                    .color(palette.text_muted.into_iced_color())]
+                                    .colr(palette.text_muted.into_cosmic_color())]
                                 .spacing(8)
-                                .align_y(iced::alignment::Vertical::Center);
+                                .align_y(cosmic::iced::alignment::Vertical::Center);
                                 let mk = |op: &str| {
                                     crate::Message::Peers(Message::Lifecycle {
                                         host: r.hostname.clone(),
@@ -1773,14 +1790,14 @@ impl PeersPanel {
                         services = services.push(
                             text("Nothing published (peer pre-PD-2, or nothing offered).")
                                 .size(12)
-                                .color(palette.text_muted.into_iced_color()),
+                                .colr(palette.text_muted.into_cosmic_color()),
                         );
                     } else {
                         for s in &r.services {
                             services = services.push(
                                 text(format!("• {s}"))
                                     .size(12)
-                                    .color(palette.text_muted.into_iced_color()),
+                                    .colr(palette.text_muted.into_cosmic_color()),
                             );
                         }
                     }
@@ -1829,8 +1846,13 @@ impl PeersPanel {
                 })
                 .collect();
             let positions = super::peers_map::layout(&nodes);
-            let canvas: Element<'_, crate::Message> =
-                iced::widget::canvas(super::peers_map::MapProgram {
+            // `MapProgram` implements `canvas::Program` for the stock
+            // `cosmic::iced::Theme`, so the canvas is a stock-themed element;
+            // `themer` bridges it into the surrounding `cosmic::Theme` tree.
+            // The program ignores the passed theme (it paints from `palette`),
+            // so `None` (Base default) carries no styling decision.
+            let canvas_stock: cosmic::iced::Element<'_, crate::Message, cosmic::iced::Theme> =
+                cosmic::iced::widget::canvas(super::peers_map::MapProgram {
                     nodes,
                     positions,
                     palette,
@@ -1839,6 +1861,8 @@ impl PeersPanel {
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into();
+            let canvas: Element<'_, crate::Message> =
+                cosmic::iced::widget::themer(None, canvas_stock).into();
             // PD-7/L19-20 — the trace card overlays to the right when an edge
             // is selected; otherwise the canvas fills the body.
             let map_body: Element<'_, crate::Message> = match self.traced_edge.as_deref() {
@@ -1855,7 +1879,7 @@ impl PeersPanel {
             };
             let hint = text("Click a node to inspect a peer · click an edge for its trace")
                 .size(11)
-                .color(palette.text_muted.into_iced_color());
+                .colr(palette.text_muted.into_cosmic_color());
             let body = column![toggle, hint, map_body]
                 .spacing(8)
                 .height(Length::Fill);
@@ -1888,7 +1912,7 @@ impl PeersPanel {
         let header = row![
             text(format!("Trace · {host}"))
                 .size(16)
-                .color(palette.text.into_iced_color()),
+                .colr(palette.text.into_cosmic_color()),
             Space::new().width(Length::Fill),
             crate::controls::variant_button(
                 "Close",
@@ -1897,15 +1921,15 @@ impl PeersPanel {
                 palette,
             ),
         ]
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
         let rtt_str =
             last_rtt.map_or_else(|| "unreachable".to_string(), |ms| format!("{ms:.1} ms"));
         let rtt_line = row![
             text("Overlay RTT")
                 .size(12)
                 .width(Length::Fixed(100.0))
-                .color(palette.text_muted.into_iced_color()),
-            text(rtt_str).size(12).color(palette.text.into_iced_color()),
+                .colr(palette.text_muted.into_cosmic_color()),
+            text(rtt_str).size(12).colr(palette.text.into_cosmic_color()),
         ];
         let reach_line = fact("Reachable", if reachable { "yes" } else { "no" }, palette);
         // Honest path classification: measured as overlay; direct-vs-relay +
@@ -1915,26 +1939,26 @@ impl PeersPanel {
             fact("Path", "overlay (tunnelled)", palette),
             text("direct/relay · NAT class · endpoints tried — pending Nebula admin introspection")
                 .size(10)
-                .color(palette.text_muted.into_iced_color()),
+                .colr(palette.text_muted.into_cosmic_color()),
         ]
         .spacing(2);
         // L20 — the session RTT sparkline, built while the card is open.
         let spark: Element<'_, crate::Message> = if self.trace_rtt.is_empty() {
             text("sampling session RTT…")
                 .size(11)
-                .color(palette.text_muted.into_iced_color())
+                .colr(palette.text_muted.into_cosmic_color())
                 .into()
         } else {
             row![
                 text("Session RTT")
                     .size(12)
                     .width(Length::Fixed(90.0))
-                    .color(palette.text_muted.into_iced_color()),
+                    .colr(palette.text_muted.into_cosmic_color()),
                 text(sparkline(&self.trace_rtt))
                     .size(12)
-                    .color(palette.accent.into_iced_color()),
+                    .colr(palette.accent.into_cosmic_color()),
             ]
-            .align_y(iced::alignment::Vertical::Center)
+            .align_y(cosmic::iced::alignment::Vertical::Center)
             .into()
         };
         // L19 — the expandable underlay traceroute.
@@ -1942,7 +1966,7 @@ impl PeersPanel {
         let mut trace_block = column![row![
             text("Underlay traceroute")
                 .size(12)
-                .color(palette.text.into_iced_color()),
+                .colr(palette.text.into_cosmic_color()),
             Space::new().width(Length::Fixed(8.0)),
             crate::controls::variant_button(
                 if self.traceroute_running {
@@ -1958,28 +1982,28 @@ impl PeersPanel {
                 palette,
             ),
         ]
-        .align_y(iced::alignment::Vertical::Center)]
+        .align_y(cosmic::iced::alignment::Vertical::Center)]
         .spacing(4);
         match &self.traceroute {
             None if !self.traceroute_running => {
                 trace_block = trace_block.push(
                     text("Trace the path to this peer's overlay address.")
                         .size(10)
-                        .color(palette.text_muted.into_iced_color()),
+                        .colr(palette.text_muted.into_cosmic_color()),
                 );
             }
             None => {}
             Some(Ok(hops)) => {
                 for h in hops {
                     trace_block = trace_block
-                        .push(text(h).size(11).color(palette.text_muted.into_iced_color()));
+                        .push(text(h).size(11).colr(palette.text_muted.into_cosmic_color()));
                 }
             }
             Some(Err(e)) => {
                 trace_block = trace_block.push(
                     text(format!("trace failed: {e}"))
                         .size(11)
-                        .color(palette.text_muted.into_iced_color()),
+                        .colr(palette.text_muted.into_cosmic_color()),
                 );
             }
         }
@@ -2003,11 +2027,11 @@ impl PeersPanel {
             .height(Length::Fill),
         )
         .padding(Padding::from([12u16, 12u16]))
-        .style(move |_| container::Style {
+        .sty(move |_| container::Style {
             snap: false,
-            background: Some(Background::Color(palette.surface.into_iced_color())),
+            background: Some(Background::Color(palette.surface.into_cosmic_color())),
             border: Border {
-                color: palette.border.into_iced_color(),
+                color: palette.border.into_cosmic_color(),
                 width: 1.0,
                 radius: 6.0.into(),
             },
@@ -2026,11 +2050,11 @@ fn device_detail<'a>(
     palette: mde_theme::Palette,
 ) -> Element<'a, crate::Message> {
     let header = row![
-        text(&d.name).size(20).color(palette.text.into_iced_color()),
+        text(&d.name).size(20).colr(palette.text.into_cosmic_color()),
         Space::new().width(Length::Fixed(10.0)),
         badge("KDE Connect", palette),
     ]
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
     // Ring is live only for an online device (offline phones can't ring).
     let ring = crate::controls::variant_button(
         "Ring",
@@ -2069,7 +2093,7 @@ fn device_detail<'a>(
     } else {
         text(op_result.to_string())
             .size(12)
-            .color(palette.text_muted.into_iced_color())
+            .colr(palette.text_muted.into_cosmic_color())
             .into()
     };
     let battery = d
@@ -2082,8 +2106,8 @@ fn device_detail<'a>(
         text("Battery")
             .size(12)
             .width(Length::Fixed(100.0))
-            .color(palette.text_muted.into_iced_color()),
-        text(battery).size(12).color(palette.text.into_iced_color()),
+            .colr(palette.text_muted.into_cosmic_color()),
+        text(battery).size(12).colr(palette.text.into_cosmic_color()),
     ];
     let facts = column![
         fact(
@@ -2098,7 +2122,7 @@ fn device_detail<'a>(
 }
 
 fn shell<'a>(
-    title: iced::widget::Text<'a, iced::Theme>,
+    title: cosmic::iced::widget::Text<'a, cosmic::Theme>,
     body: Element<'a, crate::Message>,
     _palette: mde_theme::Palette,
 ) -> Element<'a, crate::Message> {
@@ -2118,20 +2142,20 @@ fn fact<'a>(
         text(label)
             .size(12)
             .width(Length::Fixed(100.0))
-            .color(palette.text_muted.into_iced_color()),
-        text(value).size(12).color(palette.text.into_iced_color()),
+            .colr(palette.text_muted.into_cosmic_color()),
+        text(value).size(12).colr(palette.text.into_cosmic_color()),
     ]
     .into()
 }
 
 fn badge<'a>(label: &'a str, palette: mde_theme::Palette) -> Element<'a, crate::Message> {
-    container(text(label).size(11).color(palette.text.into_iced_color()))
+    container(text(label).size(11).colr(palette.text.into_cosmic_color()))
         .padding(Padding::from([2u16, 8u16]))
-        .style(move |_| container::Style {
+        .sty(move |_| container::Style {
             snap: false,
-            background: Some(Background::Color(palette.raised.into_iced_color())),
+            background: Some(Background::Color(palette.raised.into_cosmic_color())),
             border: Border {
-                color: palette.border.into_iced_color(),
+                color: palette.border.into_cosmic_color(),
                 width: 1.0,
                 radius: 8.0.into(),
             },

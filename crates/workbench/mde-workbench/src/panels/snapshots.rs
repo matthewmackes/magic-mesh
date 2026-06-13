@@ -20,8 +20,11 @@
 
 use std::path::{Path, PathBuf};
 
-use iced::widget::{column, row, scrollable, text};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{column, row, scrollable, text};
+use cosmic::iced::{Length, Task};
+// CUT-1: cosmic::Element bakes in cosmic::Theme, matching the theme threaded
+// through panel_chrome (card/dialog/panel_container) and cosmic_compat.
+use cosmic::Element;
 use mde_theme::{Density, EmptyState, Icon};
 
 use crate::controls::{styled_text_input, variant_button, ButtonVariant};

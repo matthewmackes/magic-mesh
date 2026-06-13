@@ -14,8 +14,8 @@
 
 use std::collections::HashSet;
 
-use iced::widget::{checkbox, column, container, row, scrollable, text};
-use iced::{Element, Length, Padding, Task};
+use cosmic::iced::widget::{checkbox, column, container, row, scrollable, text};
+use cosmic::iced::{Element, Length, Padding, Task};
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -159,7 +159,7 @@ impl AppsRemovePanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         let busy = self.busy;
         // UX-7.a — bulk select toggles → Ghost (low emphasis).
         let palette = crate::live_theme::palette();

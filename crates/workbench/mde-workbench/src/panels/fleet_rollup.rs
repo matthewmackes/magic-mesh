@@ -12,10 +12,12 @@
 
 use std::collections::HashMap;
 
-use iced::widget::{column, container, row, scrollable, text};
-use iced::{Element, Length, Padding, Task};
+use cosmic::iced::widget::{column, container, row, scrollable, text};
+use cosmic::iced::{Length, Padding, Task};
+use cosmic::Element;
 use mde_theme::{EmptyState, Icon};
 use serde::Deserialize;
+
 
 use crate::controls::{variant_button, ButtonVariant};
 use crate::panel_chrome::{empty_state, panel_container, status_badge, BadgeSeverity};
@@ -262,11 +264,11 @@ impl FleetRollupPanel {
                             health_severity(&g.worst_health),
                             palette
                         ),
-                        iced::widget::Space::new().width(Length::Fill),
+                        cosmic::iced::widget::Space::new().width(Length::Fill),
                         drill,
                     ]
                     .spacing(12)
-                    .align_y(iced::Alignment::Center),
+                    .align_y(cosmic::iced::Alignment::Center),
                 )
                 .padding(Padding::from(12)),
             );
@@ -277,7 +279,9 @@ impl FleetRollupPanel {
         // Sits above the role cards as the dashboard's focal point. (Node
         // click pre-selects the peer; the cards' "View peers ›" navigates.)
         let centerpiece: Element<'_, crate::Message> = if self.rows.is_empty() {
-            iced::widget::Space::new().height(Length::Fixed(0.0)).into()
+            cosmic::iced::widget::Space::new()
+                .height(Length::Fixed(0.0))
+                .into()
         } else {
             let nodes: Vec<MapNode> = self
                 .rows
@@ -293,15 +297,22 @@ impl FleetRollupPanel {
                 })
                 .collect();
             let positions = layout(&nodes);
-            iced::widget::canvas(MapProgram {
-                nodes,
-                positions,
-                palette,
-                flow_phase: 0.0,
-            })
-            .width(Length::Fill)
-            .height(Length::Fixed(260.0))
-            .into()
+            // `MapProgram` implements `canvas::Program` for the stock
+            // `cosmic::iced::Theme`, so the canvas is a stock-themed element;
+            // `themer` bridges it into the surrounding `cosmic::Theme` tree.
+            // The program ignores the passed theme (it paints from `palette`),
+            // so `None` (Base default) carries no styling decision.
+            let canvas: cosmic::iced::Element<'_, crate::Message, cosmic::iced::Theme> =
+                cosmic::iced::widget::canvas(MapProgram {
+                    nodes,
+                    positions,
+                    palette,
+                    flow_phase: 0.0,
+                })
+                .width(Length::Fill)
+                .height(Length::Fixed(260.0))
+                .into();
+            cosmic::iced::widget::themer(None, canvas).into()
         };
 
         panel_container(
@@ -311,7 +322,7 @@ impl FleetRollupPanel {
                     refresh
                 ]
                 .spacing(12)
-                .align_y(iced::Alignment::Center),
+                .align_y(cosmic::iced::Alignment::Center),
                 centerpiece,
                 scrollable(cards).height(Length::Fill),
             ]

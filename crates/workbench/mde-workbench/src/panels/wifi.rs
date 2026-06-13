@@ -12,8 +12,8 @@
 //! re-joining a known SSID (where NM already has the
 //! credentials) work end-to-end through `nmcli connection up`.
 
-use iced::widget::{column, container, row, scrollable, text};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{column, container, row, scrollable, text};
+use cosmic::iced::{Element, Length, Task};
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -144,7 +144,7 @@ impl WifiPanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         if !self.nm_available {
             return column![
                 text("NetworkManager unavailable").size(18),

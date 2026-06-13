@@ -14,6 +14,7 @@
 pub mod app;
 pub mod backend;
 pub mod controls;
+pub mod cosmic_compat;
 pub mod dbus;
 pub mod header;
 pub mod keyboard;

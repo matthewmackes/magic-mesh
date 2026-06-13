@@ -6,8 +6,9 @@
 
 use std::sync::Arc;
 
-use iced::widget::{column, pick_list, row, text, text_input};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{column, pick_list, row, text, text_input};
+use cosmic::iced::{Element, Length, Task};
+
 
 use crate::controls::{variant_button, ButtonVariant};
 
@@ -156,7 +157,7 @@ impl FontsPanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         let apply_label = if self.busy { "Applying…" } else { "Apply" };
         // UX-7.a — save routed through the shared button variant.
         let apply_btn = variant_button(
@@ -165,32 +166,55 @@ impl FontsPanel {
             (!self.busy).then(|| crate::Message::Fonts(Message::SaveClicked)),
             crate::live_theme::palette(),
         );
-        let hinting_pick: pick_list::PickList<'_, &'static str, _, _, crate::Message> =
-            pick_list(HINTING, current_value(HINTING, &self.hinting), |v| {
-                crate::Message::Fonts(Message::HintingChanged(v.to_string()))
-            });
-        let antialias_pick: pick_list::PickList<'_, &'static str, _, _, crate::Message> =
-            pick_list(ANTIALIAS, current_value(ANTIALIAS, &self.antialias), |v| {
-                crate::Message::Fonts(Message::AntialiasChanged(v.to_string()))
-            });
+        let hinting_pick: pick_list::PickList<
+            '_,
+            &'static str,
+            _,
+            _,
+            crate::Message,
+            cosmic::Theme,
+        > = pick_list(HINTING, current_value(HINTING, &self.hinting), |v| {
+            crate::Message::Fonts(Message::HintingChanged(v.to_string()))
+        });
+        let antialias_pick: pick_list::PickList<
+            '_,
+            &'static str,
+            _,
+            _,
+            crate::Message,
+            cosmic::Theme,
+        > = pick_list(ANTIALIAS, current_value(ANTIALIAS, &self.antialias), |v| {
+            crate::Message::Fonts(Message::AntialiasChanged(v.to_string()))
+        });
 
-        column![
+        let hinting_row: Element<'_, crate::Message, cosmic::Theme> =
+            row![text("Hinting").width(Length::Fixed(140.0)), hinting_pick,]
+                .spacing(12)
+                .into();
+        let antialias_row: Element<'_, crate::Message, cosmic::Theme> = row![
+            text("Antialias").width(Length::Fixed(140.0)),
+            antialias_pick,
+        ]
+        .spacing(12)
+        .into();
+        let apply_row: Element<'_, crate::Message, cosmic::Theme> =
+            row![apply_btn, text(&self.status).size(13)]
+                .spacing(12)
+                .into();
+
+        let body = column![
             field_row("Interface font", &self.name, |v| crate::Message::Fonts(
                 Message::NameChanged(v)
             )),
             field_row("Monospace font", &self.monospace, |v| {
                 crate::Message::Fonts(Message::MonospaceChanged(v))
             }),
-            row![text("Hinting").width(Length::Fixed(140.0)), hinting_pick,].spacing(12),
-            row![
-                text("Antialias").width(Length::Fixed(140.0)),
-                antialias_pick,
-            ]
-            .spacing(12),
-            row![apply_btn, text(&self.status).size(13)].spacing(12),
+            hinting_row,
+            antialias_row,
+            apply_row,
         ]
-        .spacing(10)
-        .into()
+        .spacing(10);
+        body.into()
     }
 }
 
@@ -198,7 +222,11 @@ fn current_value(table: &'static [&'static str], value: &str) -> Option<&'static
     table.iter().copied().find(|t| *t == value)
 }
 
-fn field_row<'a, F>(label: &'a str, value: &'a str, on_change: F) -> Element<'a, crate::Message>
+fn field_row<'a, F>(
+    label: &'a str,
+    value: &'a str,
+    on_change: F,
+) -> Element<'a, crate::Message, cosmic::Theme>
 where
     F: 'a + Fn(String) -> crate::Message,
 {

@@ -26,9 +26,12 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use iced::widget::{button, column, container, row, scrollable, text, Space};
-use iced::{Background, Border, Color, Element, Length, Padding, Task, Theme};
+use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
+use cosmic::iced::{Background, Border, Color, Length, Padding, Task};
+use cosmic::{Element, Theme};
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
+
+use crate::cosmic_compat::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeStatus {
@@ -174,7 +177,7 @@ impl HealthCheckPanel {
 
         let title = text("Health Check")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
 
         let subtitle_text = if let Some(t) = self.last_run_at {
             format!("last run {}", fmt_age(t))
@@ -185,7 +188,7 @@ impl HealthCheckPanel {
         };
         let subtitle = text(subtitle_text)
             .size(TypeRole::Body.size_in(sizes))
-            .color(palette.text_muted.into_iced_color());
+            .colr(palette.text_muted.into_cosmic_color());
 
         let run_btn = button(
             text(if self.busy {
@@ -194,14 +197,14 @@ impl HealthCheckPanel {
                 "Run checks"
             })
             .size(13)
-            .color(Color::WHITE),
+            .colr(Color::WHITE),
         )
         .padding(Padding::from([6u16, 14u16]))
-        .style({
-            let accent = palette.accent.into_iced_color();
-            move |_t: &Theme, status: iced::widget::button::Status| {
+        .sty({
+            let accent = palette.accent.into_cosmic_color();
+            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
                 let bg = match status {
-                    iced::widget::button::Status::Hovered => Color {
+                    cosmic::iced::widget::button::Status::Hovered => Color {
                         r: accent.r * 1.10,
                         g: accent.g * 1.10,
                         b: accent.b * 1.10,
@@ -209,7 +212,7 @@ impl HealthCheckPanel {
                     },
                     _ => accent,
                 };
-                iced::widget::button::Style {
+                cosmic::iced::widget::button::Style {
                     snap: false,
                     background: Some(Background::Color(bg)),
                     text_color: Color::WHITE,
@@ -218,7 +221,8 @@ impl HealthCheckPanel {
                         width: 0.0,
                         radius: 6.0.into(),
                     },
-                    shadow: iced::Shadow::default(),
+                    shadow: cosmic::iced::Shadow::default(),
+                    ..cosmic::iced::widget::button::Style::default()
                 }
             }
         })
@@ -237,7 +241,7 @@ impl HealthCheckPanel {
             systemd,
         ]
         .spacing(12)
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
         let mut probe_col = column![].spacing(8);
         for p in &self.probes {
@@ -248,7 +252,7 @@ impl HealthCheckPanel {
                 container(
                     text("No probes have been run yet. Click \"Run checks\" above to refresh.")
                         .size(TypeRole::Body.size_in(sizes))
-                        .color(palette.text_muted.into_iced_color()),
+                        .colr(palette.text_muted.into_cosmic_color()),
                 )
                 .padding(Padding::from([24u16, 0u16])),
             );
@@ -260,16 +264,16 @@ impl HealthCheckPanel {
         // flagged above is actionable right here.
         let mut services_col = column![text("Mesh services")
             .size(TypeRole::Body.size_in(sizes))
-            .color(palette.text.into_iced_color())]
+            .colr(palette.text.into_cosmic_color())]
         .spacing(8);
         let controls_live = !self.service_busy && !self.busy;
         for unit in HEALTH_SERVICES {
             let mut btns = row![text((*unit).to_string())
                 .size(14)
                 .width(Length::Fixed(160.0))
-                .color(palette.text.into_iced_color())]
+                .colr(palette.text.into_cosmic_color())]
             .spacing(8)
-            .align_y(iced::alignment::Vertical::Center);
+            .align_y(cosmic::iced::alignment::Vertical::Center);
             for op in ["start", "stop", "restart"] {
                 btns = btns.push(crate::controls::variant_button(
                     op,
@@ -287,7 +291,7 @@ impl HealthCheckPanel {
             services_col = services_col.push(
                 text(self.service_msg.clone())
                     .size(12)
-                    .color(palette.text_muted.into_iced_color()),
+                    .colr(palette.text_muted.into_cosmic_color()),
             );
         }
 
@@ -311,36 +315,34 @@ impl HealthCheckPanel {
 fn probe_row<'a>(p: &'a ProbeResult, palette: Palette) -> Element<'a, crate::Message> {
     let resolved = mde_icon(p.status.icon(), IconSize::Inline);
     let icon_color = match p.status {
-        ProbeStatus::Ok => palette.success.into_iced_color(),
-        ProbeStatus::Warn => palette.warning.into_iced_color(),
-        ProbeStatus::Fail => palette.danger.into_iced_color(),
-        ProbeStatus::Unknown => palette.text_muted.into_iced_color(),
+        ProbeStatus::Ok => palette.success.into_cosmic_color(),
+        ProbeStatus::Warn => palette.warning.into_cosmic_color(),
+        ProbeStatus::Fail => palette.danger.into_cosmic_color(),
+        ProbeStatus::Unknown => palette.text_muted.into_cosmic_color(),
     };
     let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
+        use cosmic::iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(svg_bytes))
             .width(Length::Fixed(18.0))
             .height(Length::Fixed(18.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
-                    color: Some(icon_color),
-                },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style {
+                color: Some(icon_color),
+            })
             .into()
     } else {
         text(resolved.fallback_glyph)
             .size(18.0)
-            .color(icon_color)
+            .colr(icon_color)
             .into()
     };
 
     let label = text(p.name.clone())
         .size(14)
-        .color(palette.text.into_iced_color());
-    let status_chip = text(p.status.label()).size(11).color(icon_color);
+        .colr(palette.text.into_cosmic_color());
+    let status_chip = text(p.status.label()).size(11).colr(icon_color);
     let detail = text(p.detail.clone())
         .size(12)
-        .color(palette.text_muted.into_iced_color());
+        .colr(palette.text_muted.into_cosmic_color());
     let mut col = column![
         row![
             icon_widget,
@@ -349,7 +351,7 @@ fn probe_row<'a>(p: &'a ProbeResult, palette: Palette) -> Element<'a, crate::Mes
             status_chip
         ]
         .spacing(10)
-        .align_y(iced::alignment::Vertical::Center),
+        .align_y(cosmic::iced::alignment::Vertical::Center),
         detail,
     ]
     .spacing(2);
@@ -357,16 +359,16 @@ fn probe_row<'a>(p: &'a ProbeResult, palette: Palette) -> Element<'a, crate::Mes
         col = col.push(
             text(format!("→ {rem}"))
                 .size(11)
-                .color(palette.text_muted.into_iced_color()),
+                .colr(palette.text_muted.into_cosmic_color()),
         );
     }
 
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
     container(col)
         .padding(Padding::from([12u16, 16u16]))
         .width(Length::Fill)
-        .style(move |_| container::Style {
+        .sty(move |_| container::Style {
             snap: false,
             background: Some(Background::Color(bg)),
             border: Border {

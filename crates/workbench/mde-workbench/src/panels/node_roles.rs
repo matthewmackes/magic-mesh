@@ -14,8 +14,9 @@
 
 use std::collections::BTreeMap;
 
-use iced::widget::{column, row, scrollable, text};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{column, row, scrollable, text};
+use cosmic::iced::{Length, Task};
+use cosmic::Element;
 use serde::Deserialize;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -267,7 +268,7 @@ impl NodeRolesPanel {
                     tag_toggles,
                 ]
                 .spacing(12)
-                .align_y(iced::Alignment::Center),
+                .align_y(cosmic::iced::Alignment::Center),
             );
         }
 
@@ -275,7 +276,7 @@ impl NodeRolesPanel {
             column![
                 row![text("Node roles & tags").size(20), refresh]
                     .spacing(12)
-                    .align_y(iced::Alignment::Center),
+                    .align_y(cosmic::iced::Alignment::Center),
                 scrollable(list).height(Length::Fill),
             ]
             .spacing(16)

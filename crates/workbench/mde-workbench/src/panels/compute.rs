@@ -19,9 +19,15 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
-use iced::widget::{column, row, text, text_input, Space};
-use iced::{Element, Length, Subscription, Task};
+use cosmic::iced::widget::{column, row, text, text_input, Space};
+use cosmic::iced::{Length, Subscription, Task};
+// CUT-1: cosmic::Element bakes in cosmic::Theme — the theme panel_chrome and
+// the .colr()/.sty() compat widgets thread through the tree. Using
+// cosmic::iced::Element here would default to cosmic::iced::Theme and mismatch.
+use cosmic::Element;
 use mde_theme::{spacing, FontSize, Palette, TypeRole};
+
+use crate::cosmic_compat::prelude::*;
 
 use crate::controls::{variant_button, ButtonVariant};
 use crate::panels::sparkline::{push_sample, sparkline};
@@ -337,7 +343,7 @@ impl ComputePanel {
     /// only includes it while the Compute view is active, so sampling
     /// commands don't run when the operator is elsewhere.
     pub fn sample_subscription() -> Subscription<crate::Message> {
-        iced::time::every(Duration::from_secs_f32(SAMPLE_SECS))
+        cosmic::iced::time::every(Duration::from_secs_f32(SAMPLE_SECS))
             .map(|_| crate::Message::Compute(Message::SampleTick))
     }
 
@@ -374,10 +380,10 @@ impl ComputePanel {
         let sizes = FontSize::defaults();
         let title = text("Compute")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
         let subtitle = text("Local and fleet VMs and containers")
             .size(TypeRole::Body.size_in(sizes))
-            .color(palette.text_muted.into_iced_color());
+            .colr(palette.text_muted.into_cosmic_color());
         let refresh = variant_button(
             "Refresh",
             ButtonVariant::Ghost,
@@ -422,7 +428,7 @@ impl ComputePanel {
             refresh,
         ]
         .spacing(f32::from(spacing::BASE[1]))
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
         // When the wizard is open it owns the body (a focused create flow).
         if let Some(w) = &self.wizard {
@@ -461,7 +467,7 @@ impl ComputePanel {
             };
             column![text(msg)
                 .size(TypeRole::Body.size_in(sizes))
-                .color(palette.text_muted.into_iced_color())]
+                .colr(palette.text_muted.into_cosmic_color())]
             .into()
         } else {
             let mut rows: Vec<Element<'_, crate::Message>> = vec![instance_header_row(palette)];
@@ -479,7 +485,7 @@ impl ComputePanel {
             Space::new().height(Length::Fixed(f32::from(spacing::BASE[2]))),
             text(&self.status)
                 .size(TypeRole::Caption.size_in(sizes))
-                .color(palette.text_muted.into_iced_color()),
+                .colr(palette.text_muted.into_cosmic_color()),
         ]
         .padding(f32::from(spacing::BASE[2]))
         .width(Length::Fill)
@@ -489,28 +495,28 @@ impl ComputePanel {
 
 /// The instance-table header row (Name / Kind / State).
 fn instance_header_row<'a>(palette: Palette) -> Element<'a, crate::Message> {
-    let muted = palette.text_muted.into_iced_color();
+    let muted = palette.text_muted.into_cosmic_color();
     let cap = TypeRole::Caption.size_in(FontSize::defaults());
     row![
         text("Name")
             .size(cap)
-            .color(muted)
+            .colr(muted)
             .width(Length::FillPortion(3)),
         text("Kind")
             .size(cap)
-            .color(muted)
+            .colr(muted)
             .width(Length::FillPortion(1)),
         text("State")
             .size(cap)
-            .color(muted)
+            .colr(muted)
             .width(Length::FillPortion(2)),
         text("CPU / Mem")
             .size(cap)
-            .color(muted)
+            .colr(muted)
             .width(Length::Fixed(SPARK_W * 2.0 + f32::from(spacing::BASE[1]))),
         text("Action")
             .size(cap)
-            .color(muted)
+            .colr(muted)
             .width(Length::FillPortion(2)),
     ]
     .spacing(f32::from(spacing::BASE[3]))
@@ -527,7 +533,7 @@ fn metric_cell<'a>(
     let spark = |buf: Option<&VecDeque<f32>>, color| -> Element<'a, crate::Message> {
         match buf {
             Some(b) if b.len() >= 2 => {
-                sparkline(b.iter().copied().collect(), color, SPARK_W, SPARK_H)
+                sparkline(b.iter().copied().collect(), color, SPARK_W, SPARK_H).into()
             }
             _ => Space::new()
                 .width(Length::Fixed(SPARK_W))
@@ -536,8 +542,8 @@ fn metric_cell<'a>(
         }
     };
     row![
-        spark(metrics.map(|m| &m.cpu), palette.success.into_iced_color()),
-        spark(metrics.map(|m| &m.mem), palette.accent.into_iced_color()),
+        spark(metrics.map(|m| &m.cpu), palette.success.into_cosmic_color()),
+        spark(metrics.map(|m| &m.mem), palette.accent.into_cosmic_color()),
     ]
     .spacing(f32::from(spacing::BASE[1]))
     .into()
@@ -548,13 +554,13 @@ fn migrate_sheet_view<'a>(sheet: &MigrateSheet, palette: Palette) -> Element<'a,
     let sizes = FontSize::defaults();
     let title = text(format!("Migrate {} to another host", sheet.domain))
         .size(TypeRole::Subheading.size_in(sizes))
-        .color(palette.text.into_iced_color());
+        .colr(palette.text.into_cosmic_color());
     let hint = text(
         "Cold migration moves the powered-off VM's definition to the target host over SSH; \
          the disk rides shared mesh storage.",
     )
     .size(TypeRole::Caption.size_in(sizes))
-    .color(palette.text_muted.into_iced_color());
+    .colr(palette.text_muted.into_cosmic_color());
     let input = text_input("target host (e.g. peer2.mesh)", &sheet.host)
         .on_input(|h| crate::Message::Compute(Message::MigrateHostInput(h)))
         .padding(f32::from(spacing::BASE[0]))
@@ -640,22 +646,22 @@ fn instance_row<'a>(
     row![
         text(inst.name.clone())
             .size(body)
-            .color(palette.text.into_iced_color())
+            .colr(palette.text.into_cosmic_color())
             .width(Length::FillPortion(3)),
         text(inst.kind.label())
             .size(body)
-            .color(palette.text_muted.into_iced_color())
+            .colr(palette.text_muted.into_cosmic_color())
             .width(Length::FillPortion(1)),
         text(inst.state.clone())
             .size(body)
-            .color(state_color.into_iced_color())
+            .colr(state_color.into_cosmic_color())
             .width(Length::FillPortion(2)),
-        iced::widget::container(metric_cell(metrics, palette))
+        cosmic::iced::widget::container(metric_cell(metrics, palette))
             .width(Length::Fixed(SPARK_W * 2.0 + f32::from(spacing::BASE[1]))),
-        iced::widget::container(action_cell).width(Length::FillPortion(2)),
+        cosmic::iced::widget::container(action_cell).width(Length::FillPortion(2)),
     ]
     .spacing(f32::from(spacing::BASE[3]))
-    .align_y(iced::alignment::Vertical::Center)
+    .align_y(cosmic::iced::alignment::Vertical::Center)
     .into()
 }
 

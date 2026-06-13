@@ -22,9 +22,10 @@ path = "src/main.rs"
 # set so the workspace dep tree stays one resolution).
 # v4.0.1 BUG-13.c: `svg` so panel_chrome + header can render Material
 # Symbols glyphs via iced::widget::svg when Icon::svg_bytes() is Some.
-iced       = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "svg", "tokio", "advanced", "canvas", "wayland"] }
-# PD-10 - the live-map wallpaper binary renders on a layer-shell Background surface.
-iced_layershell = "0.18"
+# CUT-1 — libcosmic replaces the crates.io iced 0.14 + iced_layershell
+# 0.18 deps. The fork carries iced as `cosmic::iced`; layer-shell support
+# lives under the `wayland` feature. Pinned to the proven rev.
+libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "cca48bc29ef7a9f22160c0ab6ba117ab22d1ae87", default-features = false, features = ["tokio", "winit", "wgpu", "a11y", "wayland", "multi-window"] }
 # CB-1.13 will land the dev.mackes.MDE.Shell.Workbench.Focus
 # interface; CB-1.1's single-instance handshake already needs the
 # dep so the bus-name constants + RequestNameReply mapping live
@@ -72,12 +73,10 @@ mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
 # enables the `Rgba::into_iced_color()` helper so the workbench
 # can derive its `iced::Theme::Custom` palette from
 # `mde_theme::Palette` without hardcoding hex literals.
-mde-theme = { path = "../../shared/mde-theme", features = ["iced", "serde"] }
-# CR-3.b (2026-05-25) — shared Iced widget builders. `object_card`
-# moved here from panel_chrome.rs so peer crates (mde-files,
-# mde-popover, mde-music) can render the canonical Material Object
-# Card without taking a dep on the entire workbench crate.
-mde-iced-components = { path = "../../shared/mde-iced-components" }
+mde-theme = { path = "../../shared/mde-theme", features = ["serde"] }
+# CR-3.b object_card absorbed into src/cosmic_compat.rs for the CUT-1
+# libcosmic port (the crates.io iced the shared crate carries will not
+# unify with the fork's cosmic::iced).
 # E6.9 — the Help → About surface renders the single-source project
 # disclaimer/mission (embedded from the repo-root DISCLAIMER.md at build
 # time), shared with the shell About, installer, and daemon banner.

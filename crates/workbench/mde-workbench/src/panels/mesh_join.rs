@@ -10,8 +10,8 @@
 //! output area showing the enrollment-request JSON the leader
 //! ingests.
 
-use iced::widget::{column, container, row, scrollable, text, text_input};
-use iced::{Element, Length, Padding, Task};
+use cosmic::iced::widget::{column, container, row, scrollable, text, text_input};
+use cosmic::iced::{Length, Padding, Task};
 use tokio::process::Command;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -91,7 +91,7 @@ impl MeshJoinPanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> cosmic::Element<'_, crate::Message> {
         let passcode_input = text_input("16-character shared passcode", &self.passcode_input)
             .on_input(|v| crate::Message::MeshJoin(Message::PasscodeChanged(v)));
         let name_input = text_input(

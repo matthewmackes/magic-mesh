@@ -10,8 +10,11 @@
 //! Build-now-defer-visual: the JSON projection is pure + unit-tested; the
 //! on-Cosmic `/preview` pass is the deferred tail.
 
-use iced::widget::{column, container, row, scrollable, text};
-use iced::{Element, Length, Padding, Task};
+use cosmic::iced::widget::{column, container, row, scrollable, text};
+use cosmic::iced::{Length, Padding, Task};
+// CUT-1: cosmic::Element bakes in cosmic::Theme, matching the theme the
+// panel_chrome / controls helpers thread through the tree.
+use cosmic::Element;
 use mde_theme::{EmptyState, Icon};
 use serde::Deserialize;
 
@@ -162,7 +165,7 @@ impl AuditPanel {
             "break" => ("CHAIN BREAK", BadgeSeverity::Warning),
             _ => ("empty", BadgeSeverity::Neutral),
         };
-        let header = row![
+        let header: Element<'_, crate::Message> = row![
             verify_btn,
             status_badge(badge_label, severity, palette),
             text(format!(
@@ -178,7 +181,8 @@ impl AuditPanel {
             .size(13),
         ]
         .spacing(12)
-        .align_y(iced::Alignment::Center);
+        .align_y(cosmic::iced::Alignment::Center)
+        .into();
 
         let mut list = column![].spacing(6);
         for e in &self.report.timeline {

@@ -15,8 +15,14 @@
 //!   * default picker writes the default queue
 //!     (lpoptions -d <queue>)
 
-use iced::widget::{column, pick_list, row, text};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{column, pick_list, row, text};
+use cosmic::iced::{Length, Task};
+use cosmic::Theme;
+
+/// Theme-bound element alias: the workbench panels render through libcosmic's
+/// `cosmic::Theme`, not the default `cosmic::iced::Theme` that bare
+/// `cosmic::iced::Element` resolves to.
+type Element<'a, M> = cosmic::iced::Element<'a, M, Theme>;
 
 use crate::controls::{variant_button, ButtonVariant};
 use tokio::process::Command;
@@ -174,7 +180,7 @@ impl PrintersPanel {
         );
 
         let queues = self.queues.clone();
-        let default_pick: pick_list::PickList<'_, String, _, _, crate::Message> = pick_list(
+        let default_pick: pick_list::PickList<'_, String, _, _, crate::Message, Theme> = pick_list(
             queues,
             current_or_none(&self.queues, &self.default_queue),
             |v| crate::Message::Printers(Message::DefaultSelected(v)),
@@ -206,7 +212,7 @@ impl PrintersPanel {
                 default_pick,
             ]
             .spacing(12),
-            iced::widget::column(rows).spacing(4),
+            cosmic::iced::widget::column(rows).spacing(4),
             text(format!("Queues configured: {}", self.queues.len())).size(13),
             row![refresh_btn, text(&self.status).size(13)].spacing(12),
         ]

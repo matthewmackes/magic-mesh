@@ -13,8 +13,12 @@
 
 use std::path::{Path, PathBuf};
 
-use iced::widget::{column, container, row, scrollable, text};
-use iced::{Element, Length, Padding, Task};
+// CUT-1: cosmic::Element bakes in cosmic::Theme — matching the theme the
+// widgets (column/container/scrollable) and the panel_chrome helpers produce.
+// cosmic::iced::Element would default to iced's own Theme and mismatch.
+use cosmic::iced::widget::{column, container, row, scrollable, text};
+use cosmic::iced::{Length, Padding, Task};
+use cosmic::Element;
 use mackes_mesh_types::PeerProbe;
 use mde_theme::{EmptyState, Icon};
 
@@ -209,7 +213,7 @@ impl HardwarePanel {
                         open,
                     ]
                     .spacing(12)
-                    .align_y(iced::Alignment::Center),
+                    .align_y(cosmic::iced::Alignment::Center),
                 )
                 .padding(Padding::from(12)),
             );

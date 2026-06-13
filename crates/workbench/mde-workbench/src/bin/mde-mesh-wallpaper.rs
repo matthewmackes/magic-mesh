@@ -1,75 +1,64 @@
 //! PD-10 (Q25 / L21–L23) — the live mesh map as the Cosmic desktop
 //! background.
 //!
-//! A layer-shell **Background** surface (the same iced 0.14 +
-//! iced_layershell 0.18 pair the voice HUD ships) rendering the
-//! PD-7 map scene full-screen: presence-styled nodes, RTT-shaped
-//! force layout, Gray 100 ground. **Pure render** (L21): keyboard
-//! interactivity None and the Background layer keep it ambient —
-//! interaction lives in the Workbench. **Adaptive budget** (L22):
-//! no animation loop — the scene redraws only when the data tick
-//! (30 s, or 5 min on battery) actually changes the roster/RTT,
-//! so a quiet mesh costs idle CPU.
+//! A layer-shell **Background** surface (now on the libcosmic fork's
+//! vendored iced + native wlr-layer-shell, replacing the retired
+//! iced_layershell 0.18) rendering the PD-7 map scene full-screen:
+//! presence-styled nodes, RTT-shaped force layout, Gray 100 ground.
+//! **Pure render** (L21): keyboard interactivity None and the
+//! Background layer keep it ambient — interaction lives in the
+//! Workbench. **Adaptive budget** (L22): no animation loop — the scene
+//! redraws only when the data tick (30 s, or 5 min on battery)
+//! actually changes the roster/RTT, so a quiet mesh costs idle CPU.
 //!
 //! Data: `mackesd peers --json` (the PD-1 join) + the mesh-latency
 //! cache (the PD-6 probe) — the same sources the panel reads.
 
-use iced::widget::canvas;
-use iced::{Element, Length, Subscription, Task, Theme};
-use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
-use iced_layershell::settings::{LayerShellSettings, Settings};
-use iced_layershell::to_layer_message;
+use cosmic::iced::platform_specific::runtime::wayland::layer_surface::SctkLayerSurfaceSettings;
+use cosmic::iced::platform_specific::shell::commands::layer_surface::{
+    get_layer_surface, Anchor, KeyboardInteractivity, Layer,
+};
+use cosmic::iced::widget::canvas;
+use cosmic::iced::{window, Element, Length, Subscription, Task, Theme};
+use mde_workbench::cosmic_compat::prelude::*;
 use mde_workbench::panels::peers_map::{layout, read_latency_cache, MapNode, MapProgram};
 
-fn main() -> Result<(), iced_layershell::Error> {
+fn main() -> Result<(), cosmic::iced::Error> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
-    iced_layershell::application(
-        || (Wallpaper::default(), refresh_task()),
-        namespace,
-        update,
-        view,
-    )
-    .subscription(subscription)
-    .theme(|_s: &Wallpaper| {
-        // Carbon Gray 100 ground — the brand navy stays the logo's.
-        let p = mde_theme::Palette::dark();
-        Theme::custom(
-            "MDE Wallpaper".to_string(),
-            iced::theme::Palette {
-                background: p.background.into_iced_color(),
-                text: p.text.into_iced_color(),
-                primary: p.accent.into_iced_color(),
-                success: p.success.into_iced_color(),
-                warning: p.warning.into_iced_color(),
-                danger: p.danger.into_iced_color(),
-            },
-        )
-    })
-    .settings(Settings {
-        id: Some("mde-mesh-wallpaper".to_string()),
-        layer_settings: LayerShellSettings {
-            // Fill the output; Background = under every window, over
-            // cosmic-bg's static image when launched after it.
-            size: None,
-            exclusive_zone: -1,
-            margin: (0, 0, 0, 0),
-            anchor: Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right,
-            layer: Layer::Background,
-            // L21 — pure render: never takes the keyboard.
-            keyboard_interactivity: KeyboardInteractivity::None,
-            ..Default::default()
-        },
-        ..Default::default()
-    })
-    .run()
+    // CUT-2: the fork's `daemon(boot, update, view)` takes the boot fn first
+    // (returns the initial state + task); title/subscription/theme are builder
+    // methods and the runner is `.run()`.
+    cosmic::iced::daemon(|| (Wallpaper::default(), boot_task()), update, view)
+        .title(namespace)
+        .subscription(subscription)
+        .theme(theme)
+        .run()
 }
 
-fn namespace() -> String {
+/// The daemon title / namespace (the layer-surface namespace is set on
+/// the surface settings below).
+fn namespace(_state: &Wallpaper, _id: window::Id) -> String {
     "mde-mesh-wallpaper".to_string()
+}
+
+/// Carbon Gray 100 ground — the brand navy stays the logo's.
+fn theme(_state: &Wallpaper, _id: window::Id) -> Theme {
+    let p = mde_theme::Palette::dark();
+    Theme::custom(
+        "MDE Wallpaper".to_string(),
+        cosmic::iced::theme::Palette {
+            background: p.background.into_cosmic_color(),
+            text: p.text.into_cosmic_color(),
+            primary: p.accent.into_cosmic_color(),
+            success: p.success.into_cosmic_color(),
+            warning: p.warning.into_cosmic_color(),
+            danger: p.danger.into_cosmic_color(),
+        },
+    )
 }
 
 #[derive(Default)]
@@ -78,9 +67,6 @@ struct Wallpaper {
     positions: std::collections::HashMap<String, (f32, f32)>,
 }
 
-// `to_layer_message` injects the layer-shell control variants the
-// runtime requires on the message type.
-#[to_layer_message]
 #[derive(Debug, Clone)]
 enum Message {
     /// The periodic data tick (the only repaint source — L22).
@@ -98,7 +84,34 @@ fn on_battery() -> bool {
 
 fn subscription(_s: &Wallpaper) -> Subscription<Message> {
     let period = if on_battery() { 300 } else { 30 };
-    iced::time::every(std::time::Duration::from_secs(period)).map(|_| Message::Refresh)
+    cosmic::iced::time::every(std::time::Duration::from_secs(period)).map(|_| Message::Refresh)
+}
+
+/// Boot: spawn the Background layer surface (native wlr-layer-shell on
+/// the libcosmic fork) and kick off the first data fetch.
+fn boot_task() -> Task<Message> {
+    let id = window::Id::unique();
+    Task::batch([
+        get_layer_surface(SctkLayerSurfaceSettings {
+            id,
+            namespace: "mde-mesh-wallpaper".to_string(),
+            // Fill the output; Background = under every window, over
+            // cosmic-bg's static image when launched after it.
+            size: None,
+            exclusive_zone: -1,
+            margin: Default::default(),
+            anchor: Anchor::TOP
+                .union(Anchor::BOTTOM)
+                .union(Anchor::LEFT)
+                .union(Anchor::RIGHT),
+            layer: Layer::Background,
+            // L21 — pure render: never takes the keyboard; clicks pass
+            // through (the PD-10 contract).
+            keyboard_interactivity: KeyboardInteractivity::None,
+            ..Default::default()
+        }),
+        refresh_task(),
+    ])
 }
 
 /// Fetch the directory + latency off-thread and build the node set.
@@ -178,24 +191,21 @@ fn update(state: &mut Wallpaper, message: Message) -> Task<Message> {
             }
             Task::none()
         }
-        // The to_layer_message control variants — a pure-render
-        // wallpaper never drives them.
-        _ => Task::none(),
     }
 }
 
-fn view(state: &Wallpaper) -> Element<'_, Message> {
+fn view(state: &Wallpaper, _id: window::Id) -> Element<'_, Message, Theme> {
     // The MapProgram publishes workbench messages on click; the
     // wallpaper never receives them (KeyboardInteractivity::None +
     // Background layer), and we drop any that arrive by mapping the
-    // canvas into a unit element wrapped in `Ignored`.
+    // canvas into the wallpaper's own Refresh message.
     let prog = MapProgram {
         nodes: state.nodes.clone(),
         positions: state.positions.clone(),
         palette: mde_theme::Palette::dark(),
         flow_phase: 0.0,
     };
-    let map: Element<'_, mde_workbench::Message> =
+    let map: Element<'_, mde_workbench::Message, Theme> =
         canvas(prog).width(Length::Fill).height(Length::Fill).into();
     map.map(|_| Message::Refresh)
 }

@@ -36,10 +36,12 @@
 //! iced header: bare "MDE"). User directive: "Copy the branding
 //! from one interface to another."
 
-use iced::widget::button::{self, Status as ButtonStatus};
-use iced::widget::{container, row, svg as widget_svg, text, Space};
-use iced::{alignment, Background, Border, Color, Element, Length, Shadow, Vector};
+use cosmic::iced::widget::button::{self, Status as ButtonStatus};
+use cosmic::iced::widget::{container, row, svg as widget_svg, text, Space};
+use cosmic::iced::{alignment, Background, Border, Color, Length, Shadow, Vector};
+use cosmic::Element;
 
+use crate::cosmic_compat::prelude::*;
 use mde_theme::{
     mde_icon, FontSize, FontWeight, Icon, IconSize, Palette, Shadow as MdeShadow, TypeRole,
 };
@@ -96,12 +98,12 @@ pub fn view<'a, Message: Clone + 'a>(
 
     let wordmark = text(WORDMARK)
         .size(TypeRole::Subheading.size_in(sizes))
-        .font(iced::Font {
-            family: iced::font::Family::Name(TypeRole::Subheading.family()),
+        .font(cosmic::iced::Font {
+            family: cosmic::iced::font::Family::Name(TypeRole::Subheading.family()),
             weight: weight_from_u16(TypeRole::Subheading.weight_in(weights)),
-            ..iced::Font::DEFAULT
+            ..cosmic::iced::Font::DEFAULT
         })
-        .color(palette.text.into_iced_color());
+        .colr(palette.text.into_cosmic_color());
 
     // v4.0.1 BUG-20 — Workbench glyph (Material Symbols) to the
     // left of the wordmark. Mirrors the icon the start-menu
@@ -110,20 +112,18 @@ pub fn view<'a, Message: Clone + 'a>(
     let brand_icon_resolved = mde_icon(Icon::Workbench, IconSize::Inline);
     let brand_icon: Element<'a, Message> = if let Some(svg_bytes) = brand_icon_resolved.svg_bytes()
     {
-        let icon_tint = palette.text.into_iced_color();
+        let icon_tint = palette.text.into_cosmic_color();
         widget_svg(widget_svg::Handle::from_memory(svg_bytes))
             .width(Length::Fixed(BRAND_ICON_SIZE))
             .height(Length::Fixed(BRAND_ICON_SIZE))
-            .style(
-                move |_t: &iced::Theme, _s: widget_svg::Status| widget_svg::Style {
-                    color: Some(icon_tint),
-                },
-            )
+            .sty(move |_t| widget_svg::Style {
+                color: Some(icon_tint),
+            })
             .into()
     } else {
         text(brand_icon_resolved.fallback_glyph)
             .size(BRAND_ICON_SIZE)
-            .color(palette.text.into_iced_color())
+            .colr(palette.text.into_cosmic_color())
             .into()
     };
 
@@ -164,14 +164,15 @@ pub fn view<'a, Message: Clone + 'a>(
         .height(Length::Fixed(HEADER_HEIGHT))
         .style(move |_| container::Style {
             snap: false,
-            background: Some(Background::Color(palette.surface.into_iced_color())),
+            icon_color: Some(palette.text.into_cosmic_color()),
+            background: Some(Background::Color(palette.surface.into_cosmic_color())),
             border: Border {
-                color: palette.border.into_iced_color(),
+                color: palette.border.into_cosmic_color(),
                 width: 1.0,
                 radius: 0.0.into(),
             },
             shadow: mde_shadow_to_iced(MdeShadow::raised()),
-            text_color: Some(palette.text.into_iced_color()),
+            text_color: Some(palette.text.into_cosmic_color()),
         })
         .into()
 }
@@ -187,22 +188,18 @@ fn control_button<'a, Message: Clone + 'a>(
     accent_close: bool,
 ) -> Element<'a, Message> {
     let resolved = mde_icon(icon, IconSize::Inline);
-    let muted = palette.text_muted.into_iced_color();
+    let muted = palette.text_muted.into_cosmic_color();
     let label: Element<'a, Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
+        use cosmic::iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(svg_bytes))
             .width(Length::Fixed(16.0))
             .height(Length::Fixed(16.0))
-            .style(
-                move |_t: &iced::Theme, _s: widget_svg::Status| widget_svg::Style {
-                    color: Some(muted),
-                },
-            )
+            .sty(move |_t| widget_svg::Style { color: Some(muted) })
             .into()
     } else {
         text(resolved.fallback_glyph)
             .size(16.0)
-            .color(muted)
+            .colr(muted)
             .align_x(alignment::Horizontal::Center)
             .align_y(alignment::Vertical::Center)
             .width(Length::Fixed(CONTROL_WIDTH))
@@ -212,68 +209,73 @@ fn control_button<'a, Message: Clone + 'a>(
     // Wrap whatever content we picked in a fixed-size container so
     // the button width stays predictable regardless of whether
     // we rendered an SVG or a text fallback.
-    let label = iced::widget::container(label)
+    let label = cosmic::iced::widget::container(label)
         .width(Length::Fixed(CONTROL_WIDTH))
         .height(Length::Fixed(HEADER_HEIGHT))
         .align_x(alignment::Horizontal::Center)
         .align_y(alignment::Vertical::Center);
 
-    let style = move |_theme: &iced::Theme, status: ButtonStatus| {
+    let style = move |_theme: &cosmic::Theme, status: ButtonStatus| {
         let bg: Color = match status {
             ButtonStatus::Hovered if accent_close => Color {
                 a: 0.85,
-                ..palette.danger.into_iced_color()
+                ..palette.danger.into_cosmic_color()
             },
-            ButtonStatus::Hovered => palette.hover_tint().into_iced_color(),
-            ButtonStatus::Pressed => palette.active_tint().into_iced_color(),
+            ButtonStatus::Hovered => palette.hover_tint().into_cosmic_color(),
+            ButtonStatus::Pressed => palette.active_tint().into_cosmic_color(),
             _ => Color::TRANSPARENT,
         };
         let text_color = match (status, accent_close) {
             (ButtonStatus::Hovered, true) => Color::WHITE,
-            (ButtonStatus::Hovered, false) => palette.accent.into_iced_color(),
-            _ => palette.text_muted.into_iced_color(),
+            (ButtonStatus::Hovered, false) => palette.accent.into_cosmic_color(),
+            _ => palette.text_muted.into_cosmic_color(),
+        };
+        let border = Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: 0.0.into(),
         };
         button::Style {
             snap: false,
             background: Some(Background::Color(bg)),
             text_color,
-            border: Border {
-                color: Color::TRANSPARENT,
-                width: 0.0,
-                radius: 0.0.into(),
-            },
+            icon_color: Some(text_color),
+            border_color: border.color,
+            border_width: border.width,
+            border_radius: border.radius,
+            border,
             shadow: Shadow::default(),
         }
     };
 
-    iced::widget::button(label)
+    cosmic::iced::widget::button(label)
         .padding(0)
         .on_press(on_press)
-        .style(style)
+        .sty(style)
         .into()
 }
 
 fn mde_shadow_to_iced(s: MdeShadow) -> Shadow {
     Shadow {
-        color: s.color.into_iced_color(),
+        color: s.color.into_cosmic_color(),
         offset: Vector::new(s.offset_x, s.offset_y),
         blur_radius: s.blur,
     }
 }
 
-fn weight_from_u16(w: u16) -> iced::font::Weight {
+fn weight_from_u16(w: u16) -> cosmic::iced::font::Weight {
     // Standard CSS weight buckets, midpoint-split. 400 lands on
     // Normal, 500 on Medium — matches FontWeight::defaults().
     match w {
-        0..=150 => iced::font::Weight::Thin,
-        151..=250 => iced::font::Weight::ExtraLight,
-        251..=350 => iced::font::Weight::Light,
-        351..=450 => iced::font::Weight::Normal,
-        451..=550 => iced::font::Weight::Medium,
-        551..=650 => iced::font::Weight::Semibold,
-        651..=750 => iced::font::Weight::Bold,
-        751..=850 => iced::font::Weight::ExtraBold,
-        _ => iced::font::Weight::Black,
+        0..=150 => cosmic::iced::font::Weight::Thin,
+        151..=250 => cosmic::iced::font::Weight::ExtraLight,
+        251..=350 => cosmic::iced::font::Weight::Light,
+        351..=450 => cosmic::iced::font::Weight::Normal,
+        451..=550 => cosmic::iced::font::Weight::Medium,
+        551..=650 => cosmic::iced::font::Weight::Semibold,
+        651..=750 => cosmic::iced::font::Weight::Bold,
+        751..=850 => cosmic::iced::font::Weight::ExtraBold,
+        _ => cosmic::iced::font::Weight::Black,
     }
 }
 
@@ -341,6 +343,9 @@ mod tests {
         // UX-4 (b) — not Normal.
         let weights = FontWeight::defaults();
         let role_weight = TypeRole::Subheading.weight_in(weights);
-        assert_eq!(weight_from_u16(role_weight), iced::font::Weight::Medium);
+        assert_eq!(
+            weight_from_u16(role_weight),
+            cosmic::iced::font::Weight::Medium
+        );
     }
 }

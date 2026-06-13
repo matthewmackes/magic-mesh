@@ -9,8 +9,8 @@
 
 use std::sync::Arc;
 
-use iced::widget::{checkbox, column, pick_list, row, text, text_input};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{checkbox, column, pick_list, row, text, text_input};
+use cosmic::iced::{Element, Length, Task};
 
 use crate::controls::{variant_button, ButtonVariant};
 
@@ -198,7 +198,7 @@ impl PowerPanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         let apply_label = if self.busy { "Applying…" } else { "Apply" };
         // UX-7.a — save routed through the shared button variant.
         let apply_btn = variant_button(
@@ -207,11 +207,17 @@ impl PowerPanel {
             (!self.busy).then(|| crate::Message::Power(Message::SaveClicked)),
             crate::live_theme::palette(),
         );
-        let profile_pick: pick_list::PickList<'_, &'static str, _, _, crate::Message> =
-            pick_list(PROFILES, current(&PROFILES, &self.profile), |v| {
-                crate::Message::Power(Message::ProfileChanged(v.to_string()))
-            });
-        let lid_pick: pick_list::PickList<'_, &'static str, _, _, crate::Message> =
+        let profile_pick: pick_list::PickList<
+            '_,
+            &'static str,
+            _,
+            _,
+            crate::Message,
+            cosmic::Theme,
+        > = pick_list(PROFILES, current(&PROFILES, &self.profile), |v| {
+            crate::Message::Power(Message::ProfileChanged(v.to_string()))
+        });
+        let lid_pick: pick_list::PickList<'_, &'static str, _, _, crate::Message, cosmic::Theme> =
             pick_list(LID_ACTIONS, current(&LID_ACTIONS, &self.lid_action), |v| {
                 crate::Message::Power(Message::LidActionChanged(v.to_string()))
             });

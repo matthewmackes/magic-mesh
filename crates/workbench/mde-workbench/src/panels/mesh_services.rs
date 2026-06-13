@@ -19,9 +19,12 @@
 
 use std::time::SystemTime;
 
-use iced::widget::{button, column, container, row, scrollable, text, Space};
-use iced::{Background, Border, Color, Element, Length, Padding, Task, Theme};
+use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
+use cosmic::iced::{Background, Border, Color, Length, Padding, Task};
+use cosmic::{Element, Theme};
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
+
+use crate::cosmic_compat::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnitScope {
@@ -195,7 +198,7 @@ impl MeshServicesPanel {
 
         let title = text("Mesh Services")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
 
         let subtitle_text = if !self.last_op.is_empty() {
             self.last_op.clone()
@@ -206,19 +209,19 @@ impl MeshServicesPanel {
         };
         let subtitle = text(subtitle_text)
             .size(TypeRole::Body.size_in(sizes))
-            .color(palette.text_muted.into_iced_color());
+            .colr(palette.text_muted.into_cosmic_color());
 
         let refresh_btn = button(
             text(if self.busy { "Working…" } else { "Refresh" })
                 .size(13)
-                .color(Color::WHITE),
+                .colr(Color::WHITE),
         )
         .padding(Padding::from([6u16, 14u16]))
-        .style({
-            let accent = palette.accent.into_iced_color();
-            move |_t: &Theme, status: iced::widget::button::Status| {
+        .sty({
+            let accent = palette.accent.into_cosmic_color();
+            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
                 let bg = match status {
-                    iced::widget::button::Status::Hovered => Color {
+                    cosmic::iced::widget::button::Status::Hovered => Color {
                         r: accent.r * 1.10,
                         g: accent.g * 1.10,
                         b: accent.b * 1.10,
@@ -226,7 +229,7 @@ impl MeshServicesPanel {
                     },
                     _ => accent,
                 };
-                iced::widget::button::Style {
+                cosmic::iced::widget::button::Style {
                     snap: false,
                     background: Some(Background::Color(bg)),
                     text_color: Color::WHITE,
@@ -235,7 +238,8 @@ impl MeshServicesPanel {
                         width: 0.0,
                         radius: 6.0.into(),
                     },
-                    shadow: iced::Shadow::default(),
+                    shadow: cosmic::iced::Shadow::default(),
+                    ..cosmic::iced::widget::button::Style::default()
                 }
             }
         })
@@ -246,7 +250,7 @@ impl MeshServicesPanel {
             Space::new().width(Length::Fill),
             refresh_btn,
         ]
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
         let mut units_col = column![].spacing(10);
         for u in &self.units {
@@ -257,7 +261,7 @@ impl MeshServicesPanel {
                 container(
                     text("Click \"Refresh\" to probe the mesh-fabric daemons.")
                         .size(TypeRole::Body.size_in(sizes))
-                        .color(palette.text_muted.into_iced_color()),
+                        .colr(palette.text_muted.into_cosmic_color()),
                 )
                 .padding(Padding::from([24u16, 0u16])),
             );
@@ -280,50 +284,48 @@ impl MeshServicesPanel {
 
 fn unit_row<'a>(u: &'a UnitStatus, palette: Palette) -> Element<'a, crate::Message> {
     let (status_icon, status_color, status_label) = match u.active_state.as_str() {
-        "active" => (Icon::StatusOk, palette.success.into_iced_color(), "ACTIVE"),
+        "active" => (Icon::StatusOk, palette.success.into_cosmic_color(), "ACTIVE"),
         "activating" | "reloading" => (
             Icon::StatusWarning,
-            palette.warning.into_iced_color(),
+            palette.warning.into_cosmic_color(),
             "ACTIVATING",
         ),
         "failed" => (
             Icon::StatusError,
-            palette.danger.into_iced_color(),
+            palette.danger.into_cosmic_color(),
             "FAILED",
         ),
         "not-found" => (
             Icon::StatusUnknown,
-            palette.text_muted.into_iced_color(),
+            palette.text_muted.into_cosmic_color(),
             "NOT INSTALLED",
         ),
         _ => (
             Icon::StatusUnknown,
-            palette.text_muted.into_iced_color(),
+            palette.text_muted.into_cosmic_color(),
             "INACTIVE",
         ),
     };
     let resolved = mde_icon(status_icon, IconSize::Inline);
     let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
+        use cosmic::iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(svg_bytes))
             .width(Length::Fixed(18.0))
             .height(Length::Fixed(18.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
-                    color: Some(status_color),
-                },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style {
+                color: Some(status_color),
+            })
             .into()
     } else {
         text(resolved.fallback_glyph)
             .size(18.0)
-            .color(status_color)
+            .colr(status_color)
             .into()
     };
 
     let name_text = text(u.name.clone())
         .size(14)
-        .color(palette.text.into_iced_color());
+        .colr(palette.text.into_cosmic_color());
     let scope_chip = text(format!(
         "[{}]",
         match u.scope {
@@ -332,29 +334,29 @@ fn unit_row<'a>(u: &'a UnitStatus, palette: Palette) -> Element<'a, crate::Messa
         }
     ))
     .size(11)
-    .color(palette.text_muted.into_iced_color());
-    let status_chip = text(status_label).size(11).color(status_color);
+    .colr(palette.text_muted.into_cosmic_color());
+    let status_chip = text(status_label).size(11).colr(status_color);
     let enable_chip = text(format!("{}", u.enable_state))
         .size(11)
-        .color(palette.text_muted.into_iced_color());
+        .colr(palette.text_muted.into_cosmic_color());
 
     let description = text(u.description.clone())
         .size(12)
-        .color(palette.text_muted.into_iced_color());
+        .colr(palette.text_muted.into_cosmic_color());
 
     let is_installed = u.active_state != "not-found";
     let name = u.name.clone();
     let scope = u.scope;
-    let start_btn = button(text("Start").size(11).color(Color::WHITE))
+    let start_btn = button(text("Start").size(11).colr(Color::WHITE))
         .padding(Padding::from([3u16, 10u16]))
-        .style(action_btn_style(palette, false))
+        .sty(action_btn_style(palette, false))
         .on_press(crate::Message::MeshServices(Message::StartClicked {
             name: name.clone(),
             scope,
         }));
-    let stop_btn = button(text("Stop").size(11).color(palette.text.into_iced_color()))
+    let stop_btn = button(text("Stop").size(11).colr(palette.text.into_cosmic_color()))
         .padding(Padding::from([3u16, 10u16]))
-        .style(action_btn_style(palette, true))
+        .sty(action_btn_style(palette, true))
         .on_press(crate::Message::MeshServices(Message::StopClicked {
             name: name.clone(),
             scope,
@@ -362,10 +364,10 @@ fn unit_row<'a>(u: &'a UnitStatus, palette: Palette) -> Element<'a, crate::Messa
     let restart_btn = button(
         text("Restart")
             .size(11)
-            .color(palette.text.into_iced_color()),
+            .colr(palette.text.into_cosmic_color()),
     )
     .padding(Padding::from([3u16, 10u16]))
-    .style(action_btn_style(palette, true))
+    .sty(action_btn_style(palette, true))
     .on_press(crate::Message::MeshServices(Message::RestartClicked {
         name,
         scope,
@@ -376,7 +378,7 @@ fn unit_row<'a>(u: &'a UnitStatus, palette: Palette) -> Element<'a, crate::Messa
     } else {
         text("(unit not installed)")
             .size(11)
-            .color(palette.text_muted.into_iced_color())
+            .colr(palette.text_muted.into_cosmic_color())
             .into()
     };
 
@@ -385,7 +387,7 @@ fn unit_row<'a>(u: &'a UnitStatus, palette: Palette) -> Element<'a, crate::Messa
         column![
             row![name_text, scope_chip, status_chip, enable_chip]
                 .spacing(8)
-                .align_y(iced::alignment::Vertical::Center),
+                .align_y(cosmic::iced::alignment::Vertical::Center),
             description,
         ]
         .spacing(2),
@@ -393,7 +395,7 @@ fn unit_row<'a>(u: &'a UnitStatus, palette: Palette) -> Element<'a, crate::Messa
         buttons,
     ]
     .spacing(10)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     let mut col = column![header_row].spacing(8);
     if !u.journal_tail.trim().is_empty() {
@@ -401,10 +403,10 @@ fn unit_row<'a>(u: &'a UnitStatus, palette: Palette) -> Element<'a, crate::Messa
             container(
                 text(u.journal_tail.clone())
                     .size(10)
-                    .color(palette.text_muted.into_iced_color()),
+                    .colr(palette.text_muted.into_cosmic_color()),
             )
             .padding(Padding::from([8u16, 12u16]))
-            .style(move |_| container::Style {
+            .sty(move |_| container::Style {
                 snap: false,
                 background: Some(Background::Color(Color {
                     r: 0.06,
@@ -413,7 +415,7 @@ fn unit_row<'a>(u: &'a UnitStatus, palette: Palette) -> Element<'a, crate::Messa
                     a: 1.0,
                 })),
                 border: Border {
-                    color: palette.border.into_iced_color(),
+                    color: palette.border.into_cosmic_color(),
                     width: 1.0,
                     radius: 4.0.into(),
                 },
@@ -422,12 +424,12 @@ fn unit_row<'a>(u: &'a UnitStatus, palette: Palette) -> Element<'a, crate::Messa
         );
     }
 
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
     container(col)
         .padding(Padding::from([12u16, 16u16]))
         .width(Length::Fill)
-        .style(move |_| container::Style {
+        .sty(move |_| container::Style {
             snap: false,
             background: Some(Background::Color(bg)),
             border: Border {
@@ -443,10 +445,10 @@ fn unit_row<'a>(u: &'a UnitStatus, palette: Palette) -> Element<'a, crate::Messa
 fn action_btn_style(
     palette: Palette,
     ghost: bool,
-) -> impl Fn(&Theme, iced::widget::button::Status) -> iced::widget::button::Style {
-    let accent = palette.accent.into_iced_color();
-    let border = palette.border.into_iced_color();
-    move |_t: &Theme, status: iced::widget::button::Status| {
+) -> impl Fn(&Theme, cosmic::iced::widget::button::Status) -> cosmic::iced::widget::button::Style {
+    let accent = palette.accent.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
+    move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
         let (bg, text_color) = if ghost {
             let hover_bg = Color {
                 r: 0.20,
@@ -455,12 +457,14 @@ fn action_btn_style(
                 a: 1.0,
             };
             match status {
-                iced::widget::button::Status::Hovered => (hover_bg, palette.text.into_iced_color()),
-                _ => (Color::TRANSPARENT, palette.text.into_iced_color()),
+                cosmic::iced::widget::button::Status::Hovered => {
+                    (hover_bg, palette.text.into_cosmic_color())
+                }
+                _ => (Color::TRANSPARENT, palette.text.into_cosmic_color()),
             }
         } else {
             let bg = match status {
-                iced::widget::button::Status::Hovered => Color {
+                cosmic::iced::widget::button::Status::Hovered => Color {
                     r: accent.r * 1.10,
                     g: accent.g * 1.10,
                     b: accent.b * 1.10,
@@ -470,7 +474,7 @@ fn action_btn_style(
             };
             (bg, Color::WHITE)
         };
-        iced::widget::button::Style {
+        cosmic::iced::widget::button::Style {
             snap: false,
             background: Some(Background::Color(bg)),
             text_color,
@@ -479,7 +483,8 @@ fn action_btn_style(
                 width: if ghost { 1.0 } else { 0.0 },
                 radius: 4.0.into(),
             },
-            shadow: iced::Shadow::default(),
+            shadow: cosmic::iced::Shadow::default(),
+            ..cosmic::iced::widget::button::Style::default()
         }
     }
 }

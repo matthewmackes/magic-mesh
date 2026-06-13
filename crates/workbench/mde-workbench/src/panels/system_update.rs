@@ -12,9 +12,13 @@
 use std::process::Stdio;
 
 use async_stream::stream;
+use cosmic::iced::widget::{column, container, row, scrollable, text};
+use cosmic::iced::{Length, Padding, Task};
 use futures::stream::{Stream, StreamExt};
-use iced::widget::{column, container, row, scrollable, text};
-use iced::{Element, Length, Padding, Task};
+// CUT-1: cosmic::Element bakes in cosmic::Theme, matching hero_band and
+// app::panel_body. cosmic::iced::Element defaults to cosmic::iced::Theme,
+// which mismatches the cosmic widgets the view builds.
+use cosmic::Element;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
@@ -147,7 +151,7 @@ impl SystemUpdatePanel {
         );
 
         // PLANES-2 — System Update is the Fedora (dnf) surface.
-        let fedora = crate::panel_chrome::hero_band(
+        let fedora: Element<'_, crate::Message> = crate::panel_chrome::hero_band(
             mde_theme::hero::Hero::Fedora,
             crate::panel_chrome::pkg_version_cached("fedora-release").as_deref(),
             palette,
@@ -155,10 +159,10 @@ impl SystemUpdatePanel {
         column![
             row![
                 text("System Update").size(20),
-                iced::widget::Space::new().width(Length::Fill),
+                cosmic::iced::widget::Space::new().width(Length::Fill),
                 fedora,
             ]
-            .align_y(iced::Alignment::Center),
+            .align_y(cosmic::iced::Alignment::Center),
             text(
                 "Install the latest fixes and updates for your machine. \
                  This may take a few minutes."

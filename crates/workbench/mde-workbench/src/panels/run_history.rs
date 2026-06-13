@@ -11,8 +11,8 @@
 
 use std::path::PathBuf;
 
-use iced::widget::{column, container, row, scrollable, text};
-use iced::{Element, Length, Padding, Task};
+use cosmic::iced::widget::{column, container, row, scrollable, text};
+use cosmic::iced::{Element, Length, Padding, Task};
 use mde_theme::{EmptyState, Icon};
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -104,7 +104,7 @@ impl RunHistoryPanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         if let Some(path) = &self.focused_path {
             let Some(row) = self.rows.iter().find(|r| r.path == *path) else {
                 // The row disappeared (refresh during drill-in);
@@ -117,7 +117,7 @@ impl RunHistoryPanel {
         self.view_list()
     }
 
-    fn view_list(&self) -> Element<'_, crate::Message> {
+    fn view_list(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         let palette = crate::live_theme::palette();
         let density = crate::live_theme::tokens().density;
         // UX-7.a — refresh routed through the shared button variant.
@@ -208,7 +208,7 @@ impl RunHistoryPanel {
         .into()
     }
 
-    fn view_detail<'a>(&'a self, row: &'a RunRow) -> Element<'a, crate::Message> {
+    fn view_detail<'a>(&'a self, row: &'a RunRow) -> Element<'a, crate::Message, cosmic::Theme> {
         // UX-7.a — back routed through Ghost.
         let back_btn = variant_button(
             "← Back to history",

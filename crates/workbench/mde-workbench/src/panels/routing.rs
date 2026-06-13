@@ -11,9 +11,13 @@
 
 use std::time::SystemTime;
 
-use iced::widget::{button, column, container, row, scrollable, text, Space};
-use iced::{Background, Border, Color, Element, Length, Padding, Task, Theme};
+use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
+use cosmic::iced::Task;
+use cosmic::iced::{Background, Border, Color, Length, Padding};
+use cosmic::{Element, Theme};
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
+
+use crate::cosmic_compat::prelude::*;
 
 /// One directed `from → to` edge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,15 +108,15 @@ impl RoutingPanel {
 
         let title = text("Routing")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
         let subtitle = text("overlay-reachability validation")
             .size(TypeRole::Body.size_in(sizes))
-            .color(palette.text_muted.into_iced_color());
+            .colr(palette.text_muted.into_cosmic_color());
 
-        let accent = palette.accent.into_iced_color();
-        let style_btn = move |_t: &Theme, status: iced::widget::button::Status| {
+        let accent = palette.accent.into_cosmic_color();
+        let style_btn = move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
             let bg = match status {
-                iced::widget::button::Status::Hovered => Color {
+                cosmic::iced::widget::button::Status::Hovered => Color {
                     r: accent.r * 1.10,
                     g: accent.g * 1.10,
                     b: accent.b * 1.10,
@@ -120,7 +124,7 @@ impl RoutingPanel {
                 },
                 _ => accent,
             };
-            iced::widget::button::Style {
+            cosmic::iced::widget::button::Style {
                 snap: false,
                 background: Some(Background::Color(bg)),
                 text_color: Color::WHITE,
@@ -129,20 +133,21 @@ impl RoutingPanel {
                     width: 0.0,
                     radius: 6.0.into(),
                 },
-                shadow: iced::Shadow::default(),
+                shadow: cosmic::iced::Shadow::default(),
+                ..cosmic::iced::widget::button::Style::default()
             }
         };
-        let run_btn = button(text("Run validation now").size(13).color(Color::WHITE))
+        let run_btn = button(text("Run validation now").size(13).colr(Color::WHITE))
             .padding(Padding::from([6u16, 14u16]))
-            .style(style_btn)
+            .sty(style_btn)
             .on_press(crate::Message::Routing(Message::RunNow));
         let refresh_btn = button(
             text(if self.busy { "…" } else { "Refresh" })
                 .size(13)
-                .color(Color::WHITE),
+                .colr(Color::WHITE),
         )
         .padding(Padding::from([6u16, 14u16]))
-        .style(style_btn)
+        .sty(style_btn)
         .on_press(crate::Message::Routing(Message::RefreshClicked));
 
         let header = row![
@@ -152,7 +157,7 @@ impl RoutingPanel {
             Space::new().width(Length::Fixed(8.0)),
             refresh_btn,
         ]
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
         let mut body_col = column![].spacing(6);
         if let Some(res) = &self.run_result {
@@ -188,13 +193,13 @@ fn verdict_card<'a>(s: &ValidationStatus, palette: Palette) -> Element<'a, crate
     let (icon, color, label) = if s.passed {
         (
             Icon::StatusOk,
-            palette.success.into_iced_color(),
+            palette.success.into_cosmic_color(),
             "PASS — every overlay edge reachable".to_string(),
         )
     } else {
         (
             Icon::StatusError,
-            palette.danger.into_iced_color(),
+            palette.danger.into_cosmic_color(),
             format!(
                 "FAIL — {} unreachable edge{}, {} missing reporter{}",
                 s.failed_edges.len(),
@@ -210,34 +215,32 @@ fn verdict_card<'a>(s: &ValidationStatus, palette: Palette) -> Element<'a, crate
     };
     let resolved = mde_icon(icon, IconSize::Inline);
     let icon_widget: Element<'a, crate::Message> = if let Some(b) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
+        use cosmic::iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(b))
             .width(Length::Fixed(16.0))
             .height(Length::Fixed(16.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style { color: Some(color) },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style { color: Some(color) })
             .into()
     } else {
-        text(resolved.fallback_glyph).size(16.0).color(color).into()
+        text(resolved.fallback_glyph).size(16.0).colr(color).into()
     };
     let head = row![
         icon_widget,
-        text(label).size(12).color(color),
+        text(label).size(12).colr(color),
         Space::new().width(Length::Fill),
         text(format!("{} reachable", s.reachable))
             .size(11)
-            .color(palette.text_muted.into_iced_color()),
+            .colr(palette.text_muted.into_cosmic_color()),
     ]
     .spacing(8)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
     let rid = s.run_id.clone().unwrap_or_default();
     card(
         column![
             head,
             text(format!("run {rid}"))
                 .size(10)
-                .color(palette.text_muted.into_iced_color())
+                .colr(palette.text_muted.into_cosmic_color())
         ]
         .spacing(4),
         palette,
@@ -245,28 +248,28 @@ fn verdict_card<'a>(s: &ValidationStatus, palette: Palette) -> Element<'a, crate
 }
 
 fn failed_edge_row<'a>(e: &Edge, palette: Palette) -> Element<'a, crate::Message> {
-    let danger = palette.danger.into_iced_color();
+    let danger = palette.danger.into_cosmic_color();
     card(
         row![
             text(format!("{} → {}", e.from, e.to))
                 .size(12)
-                .color(palette.text.into_iced_color()),
+                .colr(palette.text.into_cosmic_color()),
             Space::new().width(Length::Fill),
-            text("unreachable").size(11).color(danger),
+            text("unreachable").size(11).colr(danger),
         ]
         .spacing(8)
-        .align_y(iced::alignment::Vertical::Center),
+        .align_y(cosmic::iced::alignment::Vertical::Center),
         palette,
     )
 }
 
 fn result_strip<'a>(res: &Result<String, String>, palette: Palette) -> Element<'a, crate::Message> {
     let (color, label) = match res {
-        Ok(msg) => (palette.success.into_iced_color(), msg.clone()),
-        Err(e) => (palette.danger.into_iced_color(), format!("error — {e}")),
+        Ok(msg) => (palette.success.into_cosmic_color(), msg.clone()),
+        Err(e) => (palette.danger.into_cosmic_color(), format!("error — {e}")),
     };
-    let bg = palette.raised.into_iced_color();
-    container(text(label).size(11).color(color))
+    let bg = palette.raised.into_cosmic_color();
+    container(text(label).size(11).colr(color))
         .padding(Padding::from([8u16, 14u16]))
         .width(Length::Fill)
         .style(move |_| container::Style {
@@ -287,14 +290,14 @@ fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a,
         if let Some(err) = error {
             (
                 Icon::StatusError,
-                palette.danger.into_iced_color(),
+                palette.danger.into_cosmic_color(),
                 "Couldn't read validation".to_string(),
                 err.to_string(),
             )
         } else {
             (
                 Icon::Network,
-                palette.accent.into_iced_color(),
+                palette.accent.into_cosmic_color(),
                 "No validation run yet".to_string(),
                 "The overlay-reachability suite probes every directed edge between \
                  participants. Click \"Run validation now\" to request a run — the FPG \
@@ -305,33 +308,31 @@ fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a,
         };
     let resolved = mde_icon(icon_kind, IconSize::PanelHeader);
     let icon_widget: Element<'a, crate::Message> = if let Some(b) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
+        use cosmic::iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(b))
             .width(Length::Fixed(32.0))
             .height(Length::Fixed(32.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
-                    color: Some(icon_color),
-                },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style {
+                color: Some(icon_color),
+            })
             .into()
     } else {
         text(resolved.fallback_glyph)
             .size(32.0)
-            .color(icon_color)
+            .colr(icon_color)
             .into()
     };
     container(
         column![
             icon_widget,
             Space::new().height(Length::Fixed(8.0)),
-            text(heading).size(14).color(palette.text.into_iced_color()),
+            text(heading).size(14).colr(palette.text.into_cosmic_color()),
             text(body)
                 .size(11)
-                .color(palette.text_muted.into_iced_color()),
+                .colr(palette.text_muted.into_cosmic_color()),
         ]
         .spacing(2)
-        .align_x(iced::alignment::Horizontal::Center),
+        .align_x(cosmic::iced::alignment::Horizontal::Center),
     )
     .padding(Padding::from([32u16, 16u16]))
     .width(Length::Fill)
@@ -342,8 +343,8 @@ fn card<'a>(
     inner: impl Into<Element<'a, crate::Message>>,
     palette: Palette,
 ) -> Element<'a, crate::Message> {
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
     container(inner)
         .padding(Padding::from([10u16, 14u16]))
         .width(Length::Fill)

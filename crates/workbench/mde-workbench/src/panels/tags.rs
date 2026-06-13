@@ -13,9 +13,17 @@
 
 use std::time::SystemTime;
 
-use iced::widget::{button, column, container, row, scrollable, text, Space};
-use iced::{Background, Border, Color, Element, Length, Padding, Task, Theme};
+use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
+use cosmic::iced::Task;
+use cosmic::iced::{Background, Border, Color, Length, Padding};
+use cosmic::Theme;
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
+
+use crate::cosmic_compat::prelude::*;
+
+/// Elements in this panel thread libcosmic's `cosmic::Theme` (the cosmic_compat
+/// style-closure traits resolve against it), so the alias pins that theme param.
+type Element<'a, M> = cosmic::iced::Element<'a, M, Theme>;
 
 /// One capability tag and the nodes carrying it, parsed from
 /// `mackesd tags --json`.
@@ -92,7 +100,7 @@ impl TagsPanel {
 
         let title = text("Capability Tags")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
 
         let tagged: usize = self.rows.iter().map(|r| r.nodes.len()).sum();
         let subtitle_text = if self.last_run_at.is_some() {
@@ -102,37 +110,40 @@ impl TagsPanel {
         };
         let subtitle = text(subtitle_text)
             .size(TypeRole::Body.size_in(sizes))
-            .color(palette.text_muted.into_iced_color());
+            .colr(palette.text_muted.into_cosmic_color());
 
-        let accent = palette.accent.into_iced_color();
+        let accent = palette.accent.into_cosmic_color();
         let refresh_btn = button(
             text(if self.busy { "Loading…" } else { "Refresh" })
                 .size(13)
-                .color(Color::WHITE),
+                .colr(Color::WHITE),
         )
         .padding(Padding::from([6u16, 14u16]))
-        .style(move |_t: &Theme, status: iced::widget::button::Status| {
-            let bg = match status {
-                iced::widget::button::Status::Hovered => Color {
-                    r: accent.r * 1.10,
-                    g: accent.g * 1.10,
-                    b: accent.b * 1.10,
-                    a: accent.a,
-                },
-                _ => accent,
-            };
-            iced::widget::button::Style {
-                snap: false,
-                background: Some(Background::Color(bg)),
-                text_color: Color::WHITE,
-                border: Border {
-                    color: Color::TRANSPARENT,
-                    width: 0.0,
-                    radius: 6.0.into(),
-                },
-                shadow: iced::Shadow::default(),
-            }
-        })
+        .sty(
+            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+                let bg = match status {
+                    cosmic::iced::widget::button::Status::Hovered => Color {
+                        r: accent.r * 1.10,
+                        g: accent.g * 1.10,
+                        b: accent.b * 1.10,
+                        a: accent.a,
+                    },
+                    _ => accent,
+                };
+                cosmic::iced::widget::button::Style {
+                    snap: false,
+                    background: Some(Background::Color(bg)),
+                    text_color: Color::WHITE,
+                    border: Border {
+                        color: Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 6.0.into(),
+                    },
+                    shadow: cosmic::iced::Shadow::default(),
+                    ..cosmic::iced::widget::button::Style::default()
+                }
+            },
+        )
         .on_press(crate::Message::Tags(Message::RefreshClicked));
 
         let header = row![
@@ -140,7 +151,7 @@ impl TagsPanel {
             Space::new().width(Length::Fill),
             refresh_btn,
         ]
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
         let mut rows_col = column![].spacing(6);
         for r in &self.rows {
@@ -167,65 +178,60 @@ impl TagsPanel {
 
 fn tag_row<'a>(r: &'a TagRow, palette: Palette) -> Element<'a, crate::Message> {
     let has_nodes = !r.nodes.is_empty();
-    let accent = palette.accent.into_iced_color();
+    let accent = palette.accent.into_cosmic_color();
     let resolved = mde_icon(Icon::Fleet, IconSize::Inline);
     let icon_widget: Element<'a, crate::Message> = if let Some(b) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
+        use cosmic::iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(b))
             .width(Length::Fixed(16.0))
             .height(Length::Fixed(16.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
-                    color: Some(accent),
-                },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style {
+                color: Some(accent),
+            })
             .into()
     } else {
-        text(resolved.fallback_glyph)
-            .size(16.0)
-            .color(accent)
-            .into()
+        text(resolved.fallback_glyph).size(16.0).colr(accent).into()
     };
 
     let count_color = if has_nodes {
-        palette.accent.into_iced_color()
+        palette.accent.into_cosmic_color()
     } else {
-        palette.text_muted.into_iced_color()
+        palette.text_muted.into_cosmic_color()
     };
     let head = row![
         icon_widget,
         text(r.tag.to_uppercase())
             .size(12)
-            .color(palette.text.into_iced_color()),
+            .colr(palette.text.into_cosmic_color()),
         Space::new().width(Length::Fill),
         text(format!("{} node(s)", r.nodes.len()))
             .size(11)
-            .color(count_color),
+            .colr(count_color),
     ]
     .spacing(8)
-    .align_y(iced::alignment::Vertical::Center);
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     let purpose = text(r.purpose())
         .size(11)
-        .color(palette.text_muted.into_iced_color());
+        .colr(palette.text_muted.into_cosmic_color());
     let nodes_line = text(if has_nodes {
         r.nodes.join(", ")
     } else {
         "no nodes carry this tag yet".to_string()
     })
     .size(11)
-    .color(if has_nodes {
-        palette.text.into_iced_color()
+    .colr(if has_nodes {
+        palette.text.into_cosmic_color()
     } else {
-        palette.text_muted.into_iced_color()
+        palette.text_muted.into_cosmic_color()
     });
 
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
     container(column![head, purpose, nodes_line].spacing(3))
         .padding(Padding::from([10u16, 14u16]))
         .width(Length::Fill)
-        .style(move |_| container::Style {
+        .sty(move |_| container::Style {
             snap: false,
             background: Some(Background::Color(bg)),
             border: Border {
@@ -241,13 +247,13 @@ fn tag_row<'a>(r: &'a TagRow, palette: Palette) -> Element<'a, crate::Message> {
 fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a, crate::Message> {
     let (icon_color, heading, body): (Color, String, String) = if let Some(err) = error {
         (
-            palette.danger.into_iced_color(),
+            palette.danger.into_cosmic_color(),
             "Couldn't read tags".to_string(),
             err.to_string(),
         )
     } else {
         (
-            palette.accent.into_iced_color(),
+            palette.accent.into_cosmic_color(),
             "No tag census".to_string(),
             "The v1 capability tags are hop, execution, and headless. Assign them per node \
              in Provisioning ▸ Node Roles; this census then shows which nodes carry each."
@@ -261,33 +267,31 @@ fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a,
     };
     let resolved = mde_icon(icon_kind, IconSize::PanelHeader);
     let icon_widget: Element<'a, crate::Message> = if let Some(b) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
+        use cosmic::iced::widget::svg as widget_svg;
         widget_svg(widget_svg::Handle::from_memory(b))
             .width(Length::Fixed(32.0))
             .height(Length::Fixed(32.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
-                    color: Some(icon_color),
-                },
-            )
+            .sty(move |_t: &Theme| widget_svg::Style {
+                color: Some(icon_color),
+            })
             .into()
     } else {
         text(resolved.fallback_glyph)
             .size(32.0)
-            .color(icon_color)
+            .colr(icon_color)
             .into()
     };
     container(
         column![
             icon_widget,
             Space::new().height(Length::Fixed(8.0)),
-            text(heading).size(14).color(palette.text.into_iced_color()),
+            text(heading).size(14).colr(palette.text.into_cosmic_color()),
             text(body)
                 .size(11)
-                .color(palette.text_muted.into_iced_color()),
+                .colr(palette.text_muted.into_cosmic_color()),
         ]
         .spacing(2)
-        .align_x(iced::alignment::Horizontal::Center),
+        .align_x(cosmic::iced::alignment::Horizontal::Center),
     )
     .padding(Padding::from([32u16, 16u16]))
     .width(Length::Fill)

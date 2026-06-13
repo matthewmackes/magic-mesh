@@ -8,8 +8,8 @@
 //! shell-out to a direct zbus surface; until then the subprocess
 //! pattern matches the fleet_settings + fleet_revisions panels.
 
-use iced::widget::{column, container, row, scrollable, text};
-use iced::{Element, Length, Padding, Task};
+use cosmic::iced::widget::{column, container, row, scrollable, text};
+use cosmic::iced::{Element, Length, Padding, Task};
 use mde_theme::{EmptyState, Icon};
 use tokio::process::Command;
 
@@ -127,14 +127,14 @@ impl InventoryPanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         if let Some(node_id) = &self.focused {
             return self.view_focus(node_id);
         }
         self.view_list()
     }
 
-    fn view_list(&self) -> Element<'_, crate::Message> {
+    fn view_list(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         let palette = crate::live_theme::palette();
         let density = crate::live_theme::tokens().density;
         // UX-7.a — refresh routed through the shared button variant.
@@ -232,7 +232,7 @@ impl InventoryPanel {
         .into()
     }
 
-    fn view_focus(&self, node_id: &str) -> Element<'_, crate::Message> {
+    fn view_focus(&self, node_id: &str) -> Element<'_, crate::Message, cosmic::Theme> {
         // UX-7.a — back routed through Ghost (low-emphasis nav).
         let back_btn = variant_button(
             "← Back to roster",

@@ -6,10 +6,12 @@
 //! shipped the Python wrapper around the same `mackesd
 //! revisions` subcommand tree; this Iced port mirrors it.
 
-use iced::widget::{column, container, row, scrollable, text};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{column, container, row, scrollable, text};
+use cosmic::iced::{Length, Task};
+use cosmic::Element;
 use mde_theme::{EmptyState, Icon};
 use serde::Deserialize;
+
 
 use crate::controls::{variant_button, ButtonVariant};
 use crate::panel_chrome::{empty_state, panel_container};
@@ -184,13 +186,14 @@ impl FleetRevisionsPanel {
             .height(Length::Fixed(360.0))
             .into();
 
-        column![
+        let body: Element<'_, crate::Message> = column![
             row![refresh_btn, text(&self.status).size(13)].spacing(12),
             container(list_body).width(Length::Fill),
         ]
         .spacing(12)
         .width(Length::Fill)
-        .into()
+        .into();
+        body
     }
 }
 
@@ -228,9 +231,11 @@ fn revision_row<'a>(rev: &'a Revision, busy: bool) -> Element<'a, crate::Message
         }),
         crate::live_theme::palette(),
     );
-    row![text(label).size(13).width(Length::Fill), rollback_btn]
-        .spacing(12)
-        .into()
+    let body: Element<'a, crate::Message> =
+        row![text(label).size(13).width(Length::Fill), rollback_btn]
+            .spacing(12)
+            .into();
+    body
 }
 
 /// Pure-fn arg builder for `mackesd revisions list --json`.

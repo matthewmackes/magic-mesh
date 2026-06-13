@@ -16,9 +16,11 @@
 
 use std::collections::HashMap;
 
-use iced::widget::canvas::{self, Frame, Path, Stroke, Text};
-use iced::{mouse, Pixels, Point, Rectangle, Renderer, Theme};
+use cosmic::iced::widget::canvas::{self, Frame, Path, Stroke, Text};
+use cosmic::iced::{mouse, Pixels, Point, Rectangle, Renderer, Theme};
 use mde_theme::Palette;
+
+use crate::cosmic_compat::prelude::*;
 
 /// One node's map datum.
 #[derive(Debug, Clone, PartialEq)]
@@ -220,11 +222,12 @@ impl canvas::Program<crate::Message> for MapProgram {
     fn update(
         &self,
         _state: &mut Self::State,
-        event: &iced::Event,
+        event: &cosmic::iced::Event,
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<canvas::Action<crate::Message>> {
-        if let iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
+        if let cosmic::iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event
+        {
             let pos = cursor.position_in(bounds)?;
             let rect = Rectangle::with_size(bounds.size());
             // A node click selects the peer (W87); a click that misses every
@@ -270,9 +273,9 @@ impl canvas::Program<crate::Message> for MapProgram {
                 };
                 let reachable = n.rtt_ms.is_some();
                 let color = if reachable {
-                    p.border.into_iced_color()
+                    p.border.into_cosmic_color()
                 } else {
-                    p.danger.into_iced_color()
+                    p.danger.into_cosmic_color()
                 };
                 frame.stroke(
                     &Path::line(origin, to),
@@ -294,7 +297,7 @@ impl canvas::Program<crate::Message> for MapProgram {
                         let py = origin.y + (to.y - origin.y) * t;
                         frame.fill(
                             &Path::circle(Point::new(px, py), 2.0),
-                            p.accent.into_iced_color(),
+                            p.accent.into_cosmic_color(),
                         );
                     }
                 }
@@ -304,7 +307,7 @@ impl canvas::Program<crate::Message> for MapProgram {
                 frame.fill_text(Text {
                     content: label,
                     position: mid,
-                    color: p.text_muted.into_iced_color(),
+                    color: p.text_muted.into_cosmic_color(),
                     size: Pixels(11.0),
                     ..Text::default()
                 });
@@ -322,11 +325,11 @@ impl canvas::Program<crate::Message> for MapProgram {
                 _ => (p.text_muted, p.danger),
             };
             let r = if n.is_self { 14.0 } else { 10.0 };
-            frame.fill(&Path::circle(at, r), fill.into_iced_color());
+            frame.fill(&Path::circle(at, r), fill.into_cosmic_color());
             frame.stroke(
                 &Path::circle(at, r + 2.0),
                 Stroke::default()
-                    .with_color(ring.into_iced_color())
+                    .with_color(ring.into_cosmic_color())
                     .with_width(1.0),
             );
             frame.fill_text(Text {
@@ -336,7 +339,7 @@ impl canvas::Program<crate::Message> for MapProgram {
                     n.hostname.clone()
                 },
                 position: Point::new(at.x, at.y + r + 6.0),
-                color: p.text.into_iced_color(),
+                color: p.text.into_cosmic_color(),
                 size: Pixels(12.0),
                 ..Text::default()
             });
@@ -434,7 +437,7 @@ mod tests {
             palette: Palette::dark(),
             flow_phase: 0.0,
         };
-        let bounds = Rectangle::with_size(iced::Size::new(800.0, 600.0));
+        let bounds = Rectangle::with_size(cosmic::iced::Size::new(800.0, 600.0));
         // A click far outside any node hits nothing.
         assert_eq!(prog.hit(&bounds, Point::new(5.0, 5.0)), None);
         // Some grid point lands on a node (exact projection is an
@@ -478,7 +481,7 @@ mod tests {
             palette: Palette::dark(),
             flow_phase: 0.0,
         };
-        let bounds = Rectangle::with_size(iced::Size::new(800.0, 600.0));
+        let bounds = Rectangle::with_size(cosmic::iced::Size::new(800.0, 600.0));
         let proj = prog.projected(&bounds);
         let s = proj["self"];
         let o = proj["oak"];

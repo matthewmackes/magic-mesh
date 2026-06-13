@@ -10,9 +10,12 @@
 
 use std::path::{Path, PathBuf};
 
-use iced::widget::{button, column, container, row, text, Space};
-use iced::{Background, Border, Color, Element, Length, Padding, Theme};
+use cosmic::iced::widget::{button, column, container, row, text, Space};
+use cosmic::iced::{Background, Border, Color, Element, Length, Padding};
+use cosmic::Theme;
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
+
+use crate::cosmic_compat::prelude::*;
 
 #[derive(Debug, Clone, Default)]
 pub struct HelpIndexPanel {
@@ -33,12 +36,12 @@ impl HelpIndexPanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, Theme> {
         let palette = crate::live_theme::palette();
         let sizes = FontSize::defaults();
         let title = text("Help")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
         let body = if self.topics.is_empty() {
             text(
                 "No help topics shipped with this install. The mde RPM \
@@ -47,11 +50,11 @@ impl HelpIndexPanel {
                  tree for the upstream copies.",
             )
             .size(TypeRole::Body.size_in(sizes))
-            .color(palette.text_muted.into_iced_color())
+            .colr(palette.text_muted.into_cosmic_color())
         } else {
             text(format!("{} topic(s) available.", self.topics.len()))
                 .size(TypeRole::Body.size_in(sizes))
-                .color(palette.text_muted.into_iced_color())
+                .colr(palette.text_muted.into_cosmic_color())
         };
         let mut col = column![
             title,
@@ -69,65 +72,70 @@ impl HelpIndexPanel {
     }
 }
 
-fn topic_row<'a>(topic: &'a HelpTopic, palette: Palette) -> Element<'a, crate::Message> {
+fn topic_row<'a>(topic: &'a HelpTopic, palette: Palette) -> Element<'a, crate::Message, Theme> {
     let resolved = mde_icon(Icon::Help, IconSize::Nav);
-    let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
-        let muted = palette.text_muted.into_iced_color();
-        widget_svg(widget_svg::Handle::from_memory(svg_bytes))
-            .width(Length::Fixed(resolved.size_px()))
-            .height(Length::Fixed(resolved.size_px()))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style { color: Some(muted) },
-            )
-            .into()
-    } else {
-        text(resolved.fallback_glyph)
-            .size(resolved.size_px())
-            .color(palette.text_muted.into_iced_color())
-            .into()
-    };
+    let icon_widget: Element<'a, crate::Message, Theme> =
+        if let Some(svg_bytes) = resolved.svg_bytes() {
+            use cosmic::iced::widget::svg as widget_svg;
+            let muted = palette.text_muted.into_cosmic_color();
+            widget_svg(widget_svg::Handle::from_memory(svg_bytes))
+                .width(Length::Fixed(resolved.size_px()))
+                .height(Length::Fixed(resolved.size_px()))
+                .sty(move |_t: &Theme| widget_svg::Style { color: Some(muted) })
+                .into()
+        } else {
+            text(resolved.fallback_glyph)
+                .size(resolved.size_px())
+                .colr(palette.text_muted.into_cosmic_color())
+                .into()
+        };
     let title_text = text(topic.title.clone())
         .size(14)
-        .color(palette.text.into_iced_color());
+        .colr(palette.text.into_cosmic_color());
     let path_text = text(topic.path.display().to_string())
         .size(10)
-        .color(palette.text_muted.into_iced_color());
+        .colr(palette.text_muted.into_cosmic_color());
     let inner = row![
         icon_widget,
         Space::new().width(Length::Fixed(12.0)),
         column![title_text, path_text].spacing(2),
     ]
-    .align_y(iced::Alignment::Center);
+    .align_y(cosmic::iced::Alignment::Center);
     let path = topic.path.clone();
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
-    let muted_text = palette.text_muted.into_iced_color();
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
+    let muted_text = palette.text_muted.into_cosmic_color();
     button(inner)
         .width(Length::Fill)
         .padding(Padding::from([12u16, 16u16]))
-        .style(move |_t: &Theme, status: iced::widget::button::Status| {
-            let hover_bg = Color {
-                r: bg.r * 1.08,
-                g: bg.g * 1.08,
-                b: bg.b * 1.08,
-                a: bg.a,
-            };
-            iced::widget::button::Style {
-                snap: false,
-                background: Some(Background::Color(match status {
-                    iced::widget::button::Status::Hovered => hover_bg,
-                    _ => bg,
-                })),
-                text_color: muted_text,
-                border: Border {
-                    color: border,
-                    width: 1.0,
-                    radius: 6.0.into(),
-                },
-                shadow: iced::Shadow::default(),
-            }
-        })
+        .sty(
+            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+                let hover_bg = Color {
+                    r: bg.r * 1.08,
+                    g: bg.g * 1.08,
+                    b: bg.b * 1.08,
+                    a: bg.a,
+                };
+                cosmic::iced::widget::button::Style {
+                    snap: false,
+                    background: Some(Background::Color(match status {
+                        cosmic::iced::widget::button::Status::Hovered => hover_bg,
+                        _ => bg,
+                    })),
+                    text_color: muted_text,
+                    icon_color: None,
+                    border_color: border,
+                    border_width: 1.0,
+                    border_radius: 6.0.into(),
+                    border: Border {
+                        color: border,
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    shadow: cosmic::iced::Shadow::default(),
+                }
+            },
+        )
         .on_press(crate::Message::HelpTopicOpened(path))
         .into()
 }

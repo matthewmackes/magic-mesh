@@ -18,13 +18,16 @@
 //!   * scrollbar: 12 px always-visible, surface track, border thumb
 //!   * focus ring: 2 px indigo, 1 px offset
 
-use iced::widget::button::Status as ButtonStatus;
-use iced::widget::checkbox::{Status as CheckboxStatus, Style as CheckboxStyle};
-use iced::widget::radio::{Status as RadioStatus, Style as RadioStyle};
-use iced::widget::scrollable::{Rail, Scroller, Status as ScrollStatus, Style as ScrollStyle};
-use iced::widget::{button, container, row, text, text_input, Space};
-use iced::{alignment, Background, Border, Color, Element, Length, Padding, Shadow};
+use cosmic::iced::widget::button::Status as ButtonStatus;
+use cosmic::iced::widget::checkbox::{Status as CheckboxStatus, Style as CheckboxStyle};
+use cosmic::iced::widget::radio::{Status as RadioStatus, Style as RadioStyle};
+use cosmic::iced::widget::scrollable::{
+    Rail, Scroller, Status as ScrollStatus, Style as ScrollStyle,
+};
+use cosmic::iced::widget::{button, container, row, text, text_input, Space};
+use cosmic::iced::{alignment, Background, Border, Color, Element, Length, Padding, Shadow};
 
+use crate::cosmic_compat::prelude::*;
 use mde_theme::{FontSize, Palette, Radii, TypeRole};
 
 /// CR-9 — button height. 32 px per Classic ChromeOS spec.
@@ -75,16 +78,16 @@ pub fn variant_button<'a, Message: Clone + 'a>(
     variant: ButtonVariant,
     on_press: Option<Message>,
     palette: Palette,
-) -> Element<'a, Message> {
+) -> Element<'a, Message, cosmic::Theme> {
     let sizes = FontSize::defaults();
-    let accent = palette.accent.into_iced_color();
+    let accent = palette.accent.into_cosmic_color();
     let text_role = TypeRole::Body;
     let label_text = text(label.into())
         .size(text_role.size_in(sizes))
-        .color(text_color_for_variant(variant, palette))
+        .colr(text_color_for_variant(variant, palette))
         .align_y(alignment::Vertical::Center);
 
-    let style = move |_theme: &iced::Theme, status: ButtonStatus| {
+    let style = move |_theme: &cosmic::Theme, status: ButtonStatus| {
         let mut bg = base_bg_for_variant(variant, accent, palette);
         let mut fg = text_color_for_variant(variant, palette);
         let mut border = border_for_variant(variant, accent, palette);
@@ -104,6 +107,7 @@ pub fn variant_button<'a, Message: Clone + 'a>(
             text_color: fg,
             border,
             shadow: Shadow::default(),
+            ..button::Style::default()
         }
     };
 
@@ -115,7 +119,7 @@ pub fn variant_button<'a, Message: Clone + 'a>(
             left: BUTTON_HORIZONTAL_PADDING,
         })
         .height(Length::Fixed(BUTTON_HEIGHT))
-        .style(style);
+        .sty(style);
     if let Some(msg) = on_press {
         btn = btn.on_press(msg);
     }
@@ -132,8 +136,8 @@ fn base_bg_for_variant(variant: ButtonVariant, accent: Color, _palette: Palette)
 fn text_color_for_variant(variant: ButtonVariant, palette: Palette) -> Color {
     match variant {
         ButtonVariant::Primary => Color::WHITE,
-        ButtonVariant::Secondary => palette.accent.into_iced_color(),
-        ButtonVariant::Ghost => palette.text.into_iced_color(),
+        ButtonVariant::Secondary => palette.accent.into_cosmic_color(),
+        ButtonVariant::Ghost => palette.text.into_cosmic_color(),
     }
 }
 
@@ -168,13 +172,14 @@ pub fn styled_text_input<'a, Message: Clone + 'a>(
     placeholder: &'a str,
     value: &'a str,
     on_input: impl Fn(String) -> Message + 'a,
-    palette: Palette,
-) -> Element<'a, Message> {
-    let divider = palette.border.into_iced_color();
-    let accent = palette.accent.into_iced_color();
-    let muted = palette.text_muted.into_iced_color();
-    let text_color = palette.text.into_iced_color();
-
+    _palette: Palette,
+) -> Element<'a, Message, cosmic::Theme> {
+    // CUT-1 fork-drift note: the libcosmic `cosmic::Theme` text_input Catalog
+    // (cosmic/src/theme/style/iced.rs — `enum TextInput { Default, Search }`,
+    // marked `TODO: Text Input`) has NO per-instance closure variant, so the
+    // crates.io-iced `.style(|theme, status| ...)` Carbon-token closure cannot
+    // be threaded here. Select the built-in `Default` class until the fork
+    // grows a custom text_input variant (then re-thread the palette closure).
     text_input(placeholder, value)
         .on_input(on_input)
         .padding(Padding {
@@ -184,24 +189,7 @@ pub fn styled_text_input<'a, Message: Clone + 'a>(
             left: 10.0,
         })
         .size(13)
-        .style(move |_theme, status| {
-            let (border_color, border_width) = match status {
-                text_input::Status::Focused { .. } => (accent, 2.0),
-                _ => (divider, 1.0),
-            };
-            text_input::Style {
-                background: Background::Color(Color::TRANSPARENT),
-                border: Border {
-                    color: border_color,
-                    width: border_width,
-                    radius: 0.0.into(),
-                },
-                icon: muted,
-                placeholder: muted,
-                value: text_color,
-                selection: with_alpha(accent, 0.3),
-            }
-        })
+        .class(cosmic::theme::iced::TextInput::Default)
         .into()
 }
 
@@ -212,10 +200,10 @@ pub fn toggle<'a, Message: Clone + 'a>(
     value: bool,
     on_toggle: impl Fn(bool) -> Message + 'a,
     palette: Palette,
-) -> Element<'a, Message> {
+) -> Element<'a, Message, cosmic::Theme> {
     let radii = Radii::defaults();
-    let accent = palette.accent.into_iced_color();
-    let bg_off = palette.border.into_iced_color();
+    let accent = palette.accent.into_cosmic_color();
+    let bg_off = palette.border.into_cosmic_color();
     let bg_on = accent;
     let knob_color = Color::WHITE;
 
@@ -254,7 +242,7 @@ pub fn toggle<'a, Message: Clone + 'a>(
         .width(Length::Fixed(TOGGLE_WIDTH))
         .height(Length::Fixed(TOGGLE_HEIGHT))
         .on_press(on_msg)
-        .style(move |_theme, status| {
+        .sty(move |_theme, status| {
             let mut bg = if value { bg_on } else { bg_off };
             if matches!(status, ButtonStatus::Hovered) {
                 bg = brighten(bg, 1.05);
@@ -269,6 +257,7 @@ pub fn toggle<'a, Message: Clone + 'a>(
                     radius: f32::from(radii.full).into(),
                 },
                 shadow: Shadow::default(),
+                ..button::Style::default()
             }
         })
         .into()
@@ -277,9 +266,11 @@ pub fn toggle<'a, Message: Clone + 'a>(
 /// CR-9 — checkbox style closure for `iced::widget::checkbox::style()`.
 /// 16 px sharp square (set via `.size(16)` on the widget), accent fill
 /// when checked, white checkmark icon.
-pub fn checkbox_style(palette: Palette) -> impl Fn(&iced::Theme, CheckboxStatus) -> CheckboxStyle {
-    let accent = palette.accent.into_iced_color();
-    let divider = palette.border.into_iced_color();
+pub fn checkbox_style(
+    palette: Palette,
+) -> impl Fn(&cosmic::Theme, CheckboxStatus) -> CheckboxStyle {
+    let accent = palette.accent.into_cosmic_color();
+    let divider = palette.border.into_cosmic_color();
     move |_theme, status| {
         let is_checked = match status {
             CheckboxStatus::Active { is_checked }
@@ -321,9 +312,9 @@ pub fn checkbox_style(palette: Palette) -> impl Fn(&iced::Theme, CheckboxStatus)
 /// CR-9 — radio style closure for `iced::widget::radio::style()`.
 /// 16 px circle (set via `.size(16)` on the widget), transparent bg,
 /// accent dot when selected, palette.border ring when idle.
-pub fn radio_style(palette: Palette) -> impl Fn(&iced::Theme, RadioStatus) -> RadioStyle {
-    let accent = palette.accent.into_iced_color();
-    let divider = palette.border.into_iced_color();
+pub fn radio_style(palette: Palette) -> impl Fn(&cosmic::Theme, RadioStatus) -> RadioStyle {
+    let accent = palette.accent.into_cosmic_color();
+    let divider = palette.border.into_cosmic_color();
     move |_theme, status| {
         let is_selected = match status {
             RadioStatus::Active { is_selected } | RadioStatus::Hovered { is_selected } => {
@@ -357,9 +348,9 @@ pub fn radio_style(palette: Palette) -> impl Fn(&iced::Theme, RadioStatus) -> Ra
 /// Colors: palette.surface track, palette.border thumb, slight brightening
 /// on hover/drag. Rail width is caller-controlled via
 /// `scrollable::Scrollbar::new().width(SCROLLBAR_WIDTH)`.
-pub fn scrollbar_style(palette: Palette) -> impl Fn(&iced::Theme, ScrollStatus) -> ScrollStyle {
-    let track_bg = palette.surface.into_iced_color();
-    let thumb_default = palette.border.into_iced_color();
+pub fn scrollbar_style(palette: Palette) -> impl Fn(&cosmic::Theme, ScrollStatus) -> ScrollStyle {
+    let track_bg = palette.surface.into_cosmic_color();
+    let thumb_default = palette.border.into_cosmic_color();
     move |_theme, status| {
         let thumb_color = match status {
             ScrollStatus::Hovered {
@@ -395,7 +386,7 @@ pub fn scrollbar_style(palette: Palette) -> impl Fn(&iced::Theme, ScrollStatus) 
             gap: None,
             // iced 0.14 added the auto-scroll overlay; render it
             // invisible (transparent) to preserve prior behavior.
-            auto_scroll: iced::widget::scrollable::AutoScroll {
+            auto_scroll: cosmic::iced::widget::scrollable::AutoScroll {
                 background: Background::Color(Color::TRANSPARENT),
                 border: Border {
                     color: Color::TRANSPARENT,
@@ -415,9 +406,9 @@ pub fn skeleton<'a, Message: 'a>(
     width: f32,
     height: f32,
     palette: Palette,
-) -> Element<'a, Message> {
+) -> Element<'a, Message, cosmic::Theme> {
     let radii = Radii::defaults();
-    let bg = with_alpha(palette.raised.into_iced_color(), 0.6);
+    let bg = with_alpha(palette.raised.into_cosmic_color(), 0.6);
     container(
         Space::new()
             .width(Length::Fixed(width))
@@ -440,9 +431,9 @@ pub fn skeleton<'a, Message: 'a>(
 
 /// UX-7 (d) — spinner placeholder. Static accent circle; animation
 /// wiring deferred to UX-9.a.
-pub fn spinner<'a, Message: 'a>(palette: Palette) -> Element<'a, Message> {
+pub fn spinner<'a, Message: 'a>(palette: Palette) -> Element<'a, Message, cosmic::Theme> {
     let radii = Radii::defaults();
-    let accent = palette.accent.into_iced_color();
+    let accent = palette.accent.into_cosmic_color();
     container(
         Space::new()
             .width(Length::Fixed(16.0))

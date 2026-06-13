@@ -17,9 +17,12 @@
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use iced::widget::{button, column, container, row, text, Space};
-use iced::{Background, Border, Color, Element, Length, Padding, Task, Theme};
+use cosmic::iced::widget::{button, column, container, row, text, Space};
+use cosmic::iced::{Background, Border, Color, Element, Length, Padding, Task};
+use cosmic::Theme;
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
+
+use crate::cosmic_compat::prelude::*;
 
 #[derive(Debug, Clone, Default)]
 pub struct SyncSnapshot {
@@ -83,32 +86,32 @@ impl SyncStatusPanel {
         }
     }
 
-    pub fn view(&self) -> Element<'_, crate::Message> {
+    pub fn view(&self) -> Element<'_, crate::Message, Theme> {
         let palette = crate::live_theme::palette();
         let sizes = FontSize::defaults();
 
         let title = text("Panel Sync Status")
             .size(TypeRole::Display.size_in(sizes))
-            .color(palette.text.into_iced_color());
+            .colr(palette.text.into_cosmic_color());
         let subtitle = text(if let Some(t) = self.last_run_at {
             format!("last probe {}", fmt_age(t))
         } else {
             "click Refresh to probe".into()
         })
         .size(TypeRole::Body.size_in(sizes))
-        .color(palette.text_muted.into_iced_color());
+        .colr(palette.text_muted.into_cosmic_color());
 
         let refresh_btn = button(
             text(if self.busy { "Probing…" } else { "Refresh" })
                 .size(13)
-                .color(Color::WHITE),
+                .colr(Color::WHITE),
         )
         .padding(Padding::from([6u16, 14u16]))
-        .style({
-            let accent = palette.accent.into_iced_color();
-            move |_t: &Theme, status: iced::widget::button::Status| {
+        .sty({
+            let accent = palette.accent.into_cosmic_color();
+            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
                 let bg = match status {
-                    iced::widget::button::Status::Hovered => Color {
+                    cosmic::iced::widget::button::Status::Hovered => Color {
                         r: accent.r * 1.10,
                         g: accent.g * 1.10,
                         b: accent.b * 1.10,
@@ -116,7 +119,7 @@ impl SyncStatusPanel {
                     },
                     _ => accent,
                 };
-                iced::widget::button::Style {
+                cosmic::iced::widget::button::Style {
                     snap: false,
                     background: Some(Background::Color(bg)),
                     text_color: Color::WHITE,
@@ -125,7 +128,8 @@ impl SyncStatusPanel {
                         width: 0.0,
                         radius: 6.0.into(),
                     },
-                    shadow: iced::Shadow::default(),
+                    shadow: cosmic::iced::Shadow::default(),
+                    ..cosmic::iced::widget::button::Style::default()
                 }
             }
         })
@@ -136,7 +140,7 @@ impl SyncStatusPanel {
             Space::new().width(Length::Fill),
             refresh_btn,
         ]
-        .align_y(iced::alignment::Vertical::Center);
+        .align_y(cosmic::iced::alignment::Vertical::Center);
 
         let local_card = file_status_card(&self.snapshot, palette);
         let healthz_card = healthz_status_card(&self.snapshot, palette);
@@ -158,34 +162,36 @@ impl SyncStatusPanel {
     }
 }
 
-fn file_status_card<'a>(snap: &'a SyncSnapshot, palette: Palette) -> Element<'a, crate::Message> {
+fn file_status_card<'a>(
+    snap: &'a SyncSnapshot,
+    palette: Palette,
+) -> Element<'a, crate::Message, Theme> {
     let (status_icon, status_color, status_label) = if snap.file_exists {
-        (Icon::StatusOk, palette.success.into_iced_color(), "PRESENT")
+        (Icon::StatusOk, palette.success.into_cosmic_color(), "PRESENT")
     } else {
         (
             Icon::StatusWarning,
-            palette.warning.into_iced_color(),
+            palette.warning.into_cosmic_color(),
             "ABSENT",
         )
     };
     let resolved = mde_icon(status_icon, IconSize::PanelHeader);
-    let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
-        widget_svg(widget_svg::Handle::from_memory(svg_bytes))
-            .width(Length::Fixed(28.0))
-            .height(Length::Fixed(28.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
+    let icon_widget: Element<'a, crate::Message, Theme> =
+        if let Some(svg_bytes) = resolved.svg_bytes() {
+            use cosmic::iced::widget::svg as widget_svg;
+            widget_svg(widget_svg::Handle::from_memory(svg_bytes))
+                .width(Length::Fixed(28.0))
+                .height(Length::Fixed(28.0))
+                .sty(move |_t: &Theme| widget_svg::Style {
                     color: Some(status_color),
-                },
-            )
-            .into()
-    } else {
-        text(resolved.fallback_glyph)
-            .size(28.0)
-            .color(status_color)
-            .into()
-    };
+                })
+                .into()
+        } else {
+            text(resolved.fallback_glyph)
+                .size(28.0)
+                .colr(status_color)
+                .into()
+        };
     let path_text = text(
         snap.panel_toml_path
             .as_ref()
@@ -193,7 +199,7 @@ fn file_status_card<'a>(snap: &'a SyncSnapshot, palette: Palette) -> Element<'a,
             .unwrap_or_else(|| "(no $HOME)".into()),
     )
     .size(12)
-    .color(palette.text_muted.into_iced_color());
+    .colr(palette.text_muted.into_cosmic_color());
     let detail_text = text(if snap.file_exists {
         format!(
             "{} bytes · changed {}",
@@ -204,10 +210,10 @@ fn file_status_card<'a>(snap: &'a SyncSnapshot, palette: Palette) -> Element<'a,
         "no local panel.toml yet — Workbench Apps→Panel Apps writes one on first save".to_string()
     })
     .size(11)
-    .color(palette.text_muted.into_iced_color());
+    .colr(palette.text_muted.into_cosmic_color());
 
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
     container(
         row![
             icon_widget,
@@ -215,22 +221,22 @@ fn file_status_card<'a>(snap: &'a SyncSnapshot, palette: Palette) -> Element<'a,
                 row![
                     text("Local panel.toml")
                         .size(13)
-                        .color(palette.text.into_iced_color()),
-                    text(status_label).size(11).color(status_color),
+                        .colr(palette.text.into_cosmic_color()),
+                    text(status_label).size(11).colr(status_color),
                 ]
                 .spacing(10)
-                .align_y(iced::alignment::Vertical::Center),
+                .align_y(cosmic::iced::alignment::Vertical::Center),
                 path_text,
                 detail_text,
             ]
             .spacing(3),
         ]
         .spacing(12)
-        .align_y(iced::alignment::Vertical::Center),
+        .align_y(cosmic::iced::alignment::Vertical::Center),
     )
     .padding(Padding::from([14u16, 18u16]))
     .width(Length::Fill)
-    .style(move |_| container::Style {
+    .sty(move |_| container::Style {
         snap: false,
         background: Some(Background::Color(bg)),
         border: Border {
@@ -246,7 +252,7 @@ fn file_status_card<'a>(snap: &'a SyncSnapshot, palette: Palette) -> Element<'a,
 fn healthz_status_card<'a>(
     snap: &'a SyncSnapshot,
     palette: Palette,
-) -> Element<'a, crate::Message> {
+) -> Element<'a, crate::Message, Theme> {
     let (status_icon, status_color, summary): (Icon, Color, String) =
         if !snap.healthz_node.is_empty()
             && (!snap.healthz_revision.is_empty() || snap.drift_count.is_some())
@@ -262,40 +268,39 @@ fn healthz_status_card<'a>(
                 .unwrap_or_default();
             (
                 Icon::StatusOk,
-                palette.success.into_iced_color(),
+                palette.success.into_cosmic_color(),
                 format!("synced to revision {rev} on {}{drift}", snap.healthz_node),
             )
         } else if !snap.healthz_raw.is_empty() {
             (
                 Icon::StatusWarning,
-                palette.warning.into_iced_color(),
+                palette.warning.into_cosmic_color(),
                 "mackesd healthz returned data but no revision/drift fields populated yet".into(),
             )
         } else {
             (
                 Icon::StatusUnknown,
-                palette.text_muted.into_iced_color(),
+                palette.text_muted.into_cosmic_color(),
                 "mackesd healthz not reachable — is the daemon installed?".into(),
             )
         };
     let resolved = mde_icon(status_icon, IconSize::Inline);
-    let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
-        use iced::widget::svg as widget_svg;
-        widget_svg(widget_svg::Handle::from_memory(svg_bytes))
-            .width(Length::Fixed(18.0))
-            .height(Length::Fixed(18.0))
-            .style(
-                move |_t: &Theme, _s: widget_svg::Status| widget_svg::Style {
+    let icon_widget: Element<'a, crate::Message, Theme> =
+        if let Some(svg_bytes) = resolved.svg_bytes() {
+            use cosmic::iced::widget::svg as widget_svg;
+            widget_svg(widget_svg::Handle::from_memory(svg_bytes))
+                .width(Length::Fixed(18.0))
+                .height(Length::Fixed(18.0))
+                .sty(move |_t: &Theme| widget_svg::Style {
                     color: Some(status_color),
-                },
-            )
-            .into()
-    } else {
-        text(resolved.fallback_glyph)
-            .size(18.0)
-            .color(status_color)
-            .into()
-    };
+                })
+                .into()
+        } else {
+            text(resolved.fallback_glyph)
+                .size(18.0)
+                .colr(status_color)
+                .into()
+        };
 
     let body_text = if snap.healthz_raw.trim().is_empty() {
         "no JSON body".to_string()
@@ -303,8 +308,8 @@ fn healthz_status_card<'a>(
         snap.healthz_raw.clone()
     };
 
-    let bg = palette.raised.into_iced_color();
-    let border = palette.border.into_iced_color();
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
     let raw_bg = Color {
         r: 0.06,
         g: 0.06,
@@ -317,21 +322,21 @@ fn healthz_status_card<'a>(
                 icon_widget,
                 text("Mesh sync state")
                     .size(13)
-                    .color(palette.text.into_iced_color()),
+                    .colr(palette.text.into_cosmic_color()),
             ]
             .spacing(8)
-            .align_y(iced::alignment::Vertical::Center),
+            .align_y(cosmic::iced::alignment::Vertical::Center),
             text(summary)
                 .size(12)
-                .color(palette.text_muted.into_iced_color()),
+                .colr(palette.text_muted.into_cosmic_color()),
             container(
                 text(body_text)
                     .size(10)
-                    .color(palette.text_muted.into_iced_color())
+                    .colr(palette.text_muted.into_cosmic_color())
             )
             .padding(Padding::from([8u16, 12u16]))
             .width(Length::Fill)
-            .style(move |_| container::Style {
+            .sty(move |_| container::Style {
                 snap: false,
                 background: Some(Background::Color(raw_bg)),
                 border: Border {
@@ -346,7 +351,7 @@ fn healthz_status_card<'a>(
     )
     .padding(Padding::from([14u16, 18u16]))
     .width(Length::Fill)
-    .style(move |_| container::Style {
+    .sty(move |_| container::Style {
         snap: false,
         background: Some(Background::Color(bg)),
         border: Border {

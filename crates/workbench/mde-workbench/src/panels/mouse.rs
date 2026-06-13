@@ -10,8 +10,9 @@
 
 use std::sync::Arc;
 
-use iced::widget::{column, text};
-use iced::{Element, Length, Task};
+use cosmic::iced::widget::{column, text};
+use cosmic::iced::{Length, Task};
+use cosmic::Element;
 
 use crate::backend::Backend;
 use crate::controls::{variant_button, ButtonVariant};
