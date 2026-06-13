@@ -1,0 +1,10 @@
+<!doctype html><meta charset=utf-8><title>Magic Mesh — dnf repo</title>
+<h1>Magic Mesh dnf repository</h1>
+<p>Secure no-fixed-center workgroup mesh on Fedora-Cosmic. GPL-3.0-or-later.</p>
+<p>The main <code>magic-mesh</code> RPM installs this repo + key automatically. To add it manually on Fedora:</p>
+<pre>sudo curl -o /etc/yum.repos.d/magic-mesh.repo \
+  https://matthewmackes.github.io/magic-mesh/magic-mesh.repo
+sudo dnf install magic-mesh</pre>
+<p>Or one-shot from the release asset:
+<code>sudo dnf install https://github.com/matthewmackes/magic-mesh/releases/download/magic-mesh-v10.0.0/magic-mesh-10.0.0-1.x86_64.rpm</code></p>
+<p><a href="RPM-GPG-KEY-magic-mesh">Signing key</a> · <a href="https://github.com/matthewmackes/magic-mesh">Source</a></p>

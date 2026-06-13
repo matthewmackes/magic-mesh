@@ -1,0 +1,24 @@
+# PKG-8 — the Magic Mesh dnf repo, hosted on GitHub (replaces COPR).
+#
+# Published from the project's GitHub repository: `createrepo_c` metadata
+# + the signed RPMs land on the `gh-pages` branch (served at
+# matthewmackes.github.io/magic-mesh/), and each release also attaches the
+# RPM as a GitHub Releases asset for a one-shot `dnf install <url>`. There
+# is no COPR; packages are GPG-signed at /release time with the project
+# key (operator-gated), and the public key is published alongside the repo
+# so gpgcheck stays on.
+#
+# Shipped by the main `magic-mesh` RPM (one-RPM design, §5) at
+# /etc/yum.repos.d/, alongside the committed public key at
+# /etc/pki/rpm-gpg/RPM-GPG-KEY-magic-mesh (EFF-17; also published at the
+# gpgkey URL below when the gh-pages repo is stood up).
+[magic-mesh]
+name=Magic Mesh (GitHub)
+baseurl=https://matthewmackes.github.io/magic-mesh/fedora-$releasever-$basearch/
+type=rpm-md
+skip_if_unavailable=True
+gpgcheck=1
+gpgkey=https://matthewmackes.github.io/magic-mesh/RPM-GPG-KEY-magic-mesh
+repo_gpgcheck=0
+enabled=1
+enabled_metadata=1
