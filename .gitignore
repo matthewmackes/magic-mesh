@@ -27,3 +27,4 @@ lizardfs-binaries.tar.gz
 
 # Claude Code session workflow scripts (one-off, local paths) — not source
 .claude/workflows/
+target-f43/
