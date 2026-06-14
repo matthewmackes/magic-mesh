@@ -43,6 +43,18 @@ restart() {
     systemctl restart "$1" >/dev/null 2>&1 || log "  restart $1 failed"
 }
 
+# 0. QNM-Shared must be a REAL mount, not a silently-local directory (ONBOARD-6
+#    process fix #3 — the exact failure that hid for the whole project: the
+#    shared-state code works identically against a local dir, so a missing mount
+#    no-ops silently → NO LEADER / empty directory). If qnm-shared.service exists
+#    but the volume isn't a fuse mount, recover it + alert loudly.
+QNM="${QNM_PATH:-/root/QNM-Shared}"
+if systemctl list-unit-files qnm-shared.service >/dev/null 2>&1 && [ -d "$QNM" ]; then
+    if ! mount 2>/dev/null | grep -q " $QNM type fuse"; then
+        restart qnm-shared.service "QNM-Shared not mounted (shared-state plane down)"
+    fi
+fi
+
 # 1. The worker daemon must be active. If it stopped (incl. StartLimit
 #    exhaustion → 'failed'), restart resets the counter and revives it.
 if ! systemctl is-active --quiet mackesd.service; then
