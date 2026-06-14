@@ -504,22 +504,56 @@ fn connect_btn<'a>(
 /// state.py BUG-1 fix). Returns an empty Vec when neither file
 /// exists or the JSON fails to parse.
 pub fn load_known_hosts() -> Vec<KnownHost> {
-    let home = match std::env::var("HOME") {
-        Ok(h) => PathBuf::from(h),
-        Err(_) => return Vec::new(),
-    };
-    let candidates = [
-        home.join(".config/mde/peer-macs.json"),
-        home.join(".config/mackes-shell/peer-macs.json"),
-    ];
-    for path in &candidates {
-        if let Ok(raw) = std::fs::read_to_string(path) {
-            if let Some(hosts) = parse_peer_macs(&raw) {
-                return hosts;
+    // SUBAUDIT-A2 — start from the replicated mesh directory so every
+    // enrolled peer (with a known overlay IP) is connectable, not just
+    // ARP-discovered LAN hosts. The ARP/peer-macs cache is merged on top
+    // for one-off LAN targets. Was: ARP cache only → "Known hosts (0)" on
+    // a fresh node even with a healthy 4-node mesh.
+    let mut hosts = directory_known_hosts();
+    let mut seen: std::collections::BTreeSet<String> = hosts.iter().map(|h| h.ip.clone()).collect();
+
+    if let Ok(home) = std::env::var("HOME") {
+        let home = PathBuf::from(home);
+        let candidates = [
+            home.join(".config/mde/peer-macs.json"),
+            home.join(".config/mackes-shell/peer-macs.json"),
+        ];
+        for path in &candidates {
+            if let Ok(raw) = std::fs::read_to_string(path) {
+                if let Some(arp) = parse_peer_macs(&raw) {
+                    for h in arp {
+                        if seen.insert(h.ip.clone()) {
+                            hosts.push(h);
+                        }
+                    }
+                    break;
+                }
             }
         }
     }
-    Vec::new()
+    hosts
+}
+
+/// The mesh peers from the replicated directory, as connectable known
+/// hosts: `ip` = the resolvable `<host>.mesh` name, `mac` = the overlay
+/// IP (shown as the secondary label). Empty when the directory is absent.
+#[must_use]
+pub fn directory_known_hosts() -> Vec<KnownHost> {
+    let root = mackes_mesh_types::peers::default_workgroup_root();
+    let mut out: Vec<KnownHost> =
+        mackes_mesh_types::peers::read_peers(&mackes_mesh_types::peers::peers_dir(&root))
+            .into_iter()
+            .filter_map(|rec| {
+                let ip = rec.overlay_ip?;
+                Some(KnownHost {
+                    ip: format!("{}.mesh", rec.hostname),
+                    mac: ip,
+                    sshd: None,
+                })
+            })
+            .collect();
+    out.sort_by(|a, b| a.ip.cmp(&b.ip));
+    out
 }
 
 /// Pure parser for the `peer-macs.json` shape:
