@@ -562,3 +562,17 @@ Scope (measured 2026-06-13): `mde-workbench` 47.9k lines / 94 files on crates.io
 *Audit (sweeps 1–2): 18 findings, A1–H8. **8 shipped** (H1 §3, D1/H5/H2 §4, F1–F3/H7 §5-doc, G1 §1, A1/A2 deletion). The 7 open findings are now **specified** by the survey and resolve into the epics above.*
 *Survey (2026-06-09): 100/100 answered → 6 epics, 51 tasks. Packaging (PKG-*) is held until every feature is §7-complete; releasing is operator-gated.*
 *Enterprise-readiness verification (2026-06-09): verdict **prototype with enterprise direction**; +14 ENTERPRISE tasks (ENT-1/2/3 CRITICAL). Full report: `docs/design/enterprise-readiness.md`.*
+
+### NAV-1 — MDE Workbench navigation grouping redesign
+Design: docs/design/workbench-nav-grouping.md (15-question survey locked 2026-06-14).
+- [ ] **NAV-1.1: Workbench — regroup the left nav to the 9 locked sections**
+  **As** a mesh operator,
+  **I want** the Workbench nav organized scope→function (Overview · This Node ·
+  Mesh · Fleet · Provisioning · Monitoring · System[=Config+Maintain+Help]) with
+  desktop settings deferred to Cosmic and plain-language labels,
+  **so that** I can find mesh services without hunting across 15 ad-hoc groups.
+  **Acceptance** (runtime-observable):
+    - [ ] left nav renders exactly the 7 sections in the locked order; Overview/Home selected on launch
+    - [ ] no duplicate/ambiguous labels (no three "Inventory"s); renames applied (Mackes Bus→Message Bus, etc.)
+    - [ ] every retained panel routes to its working view; deferred desktop panels gone from nav
+    - [ ] Group::all() order matches the lock; from_slug round-trips; cargo test -p mde-workbench green
