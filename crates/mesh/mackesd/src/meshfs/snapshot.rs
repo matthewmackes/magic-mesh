@@ -43,9 +43,6 @@ pub const DEFAULT_METADATA_FILE: &str = "/var/lib/mde/meshfs/meta/metadata.mfs";
 /// Default LizardFS exports config path.
 pub const DEFAULT_EXPORTS_CONFIG: &str = "/etc/mfs/mfsexports.cfg";
 
-/// Default mount path for `mfsgetgoal`.
-pub const DEFAULT_MOUNT_PATH: &str = "/mnt/mesh-storage";
-
 /// Default floating overlay VIP.
 pub const DEFAULT_VIP: &str = "10.42.0.1";
 
@@ -114,7 +111,12 @@ impl Default for SnapshotConfig {
             getgoal_binary: DEFAULT_GETGOAL_BINARY.to_owned(),
             metadata_file: PathBuf::from(DEFAULT_METADATA_FILE),
             exports_config_path: PathBuf::from(DEFAULT_EXPORTS_CONFIG),
-            mount_path: DEFAULT_MOUNT_PATH.to_owned(),
+            // Single-sourced with the directory/healthz read: query the
+            // goal on the real mount (`~/QNM-Shared`), not the phantom
+            // `/mnt/mesh-storage` that nothing mounts.
+            mount_path: crate::default_qnm_shared_root()
+                .to_string_lossy()
+                .into_owned(),
             vip: DEFAULT_VIP.to_owned(),
             timeout: DEFAULT_TIMEOUT,
         }

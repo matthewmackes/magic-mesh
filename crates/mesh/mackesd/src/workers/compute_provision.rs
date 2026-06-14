@@ -88,9 +88,6 @@ pub const DEFAULT_NEBULA_INTERFACE: &str = "nebula1";
 /// VM disk + ISO storage root.
 pub const DEFAULT_VM_STORAGE: &str = "/var/lib/mde-vms";
 
-/// MeshFS mount checked for the `--filesystem` attach decision.
-pub const DEFAULT_MESHFS_MOUNT: &str = "/mnt/mesh-storage";
-
 /// libvirt storage pool name (VIRT-3).
 pub const POOL_NAME: &str = "mde-vms";
 
@@ -795,7 +792,7 @@ impl ComputeProvisionWorker {
             poll_interval: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
             vm_storage: PathBuf::from(DEFAULT_VM_STORAGE),
-            meshfs_mount: PathBuf::from(DEFAULT_MESHFS_MOUNT),
+            meshfs_mount: crate::default_qnm_shared_root(),
         }
     }
 

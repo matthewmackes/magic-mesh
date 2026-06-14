@@ -128,8 +128,10 @@ fn parse(body: &str) -> Result<Vec<Peer>, toml::de::Error> {
 /// Best-effort resolution of `<mesh_storage_home>` per the
 /// [[project_v5_0_0_lizardfs_mesh_storage]] FUSE-mount convention.
 ///
-/// Honors `$MDE_MESH_STORAGE_HOME` if set; otherwise falls back to
-/// `/mnt/mesh-storage` (the MESHFS v5.0 default mount target).
+/// Honors `$MDE_MESH_STORAGE_HOME` if set; otherwise resolves the
+/// QNM-Shared mount the same way `mackesd` does (`default_workgroup_root`
+/// — `~/QNM-Shared` by default), so the roster reads the mount the
+/// daemon actually writes rather than a phantom `/mnt/mesh-storage`.
 fn mesh_storage_home() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("MDE_MESH_STORAGE_HOME") {
         let pb = PathBuf::from(p);
@@ -137,7 +139,7 @@ fn mesh_storage_home() -> Option<PathBuf> {
             return Some(pb);
         }
     }
-    let p = PathBuf::from("/mnt/mesh-storage");
+    let p = mackes_mesh_types::peers::default_workgroup_root();
     p.exists().then_some(p)
 }
 

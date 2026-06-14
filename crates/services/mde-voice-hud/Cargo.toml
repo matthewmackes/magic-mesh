@@ -24,6 +24,10 @@ libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "cca48bc29e
 # constants and convert to this crate's `iced::Color` locally, sidestepping the
 # cross-crate iced-version skew of `Rgba::into_iced_color()`.
 mde-theme = { path = "../../shared/mde-theme" }
+# Single-source the QNM-Shared mount resolution (default_workgroup_root)
+# shared with mackesd + the workbench, so the VOIP roster reads the same
+# mount the daemon writes (not the phantom /mnt/mesh-storage).
+mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
 
 # Fixture + activity-feed parsing.
 serde      = { version = "1", features = ["derive"] }

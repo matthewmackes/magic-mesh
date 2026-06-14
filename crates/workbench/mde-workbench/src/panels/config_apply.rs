@@ -58,12 +58,11 @@ pub struct ApplyLogEntry {
     pub detail: String,
 }
 
-/// `MDE_WORKGROUP_ROOT`-or-`/mnt/mesh-storage` (matches network_hosts/jobs).
+/// Resolved mesh-storage mount, single-sourced with `mackesd` via
+/// `mackes_mesh_types` (`~/QNM-Shared` by default — matches the daemon).
 #[must_use]
 pub fn workgroup_root() -> PathBuf {
-    std::env::var_os("MDE_WORKGROUP_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/mnt/mesh-storage"))
+    mackes_mesh_types::peers::default_workgroup_root()
 }
 
 /// The newest revision in the log: `(version, author, at)`, or `None`

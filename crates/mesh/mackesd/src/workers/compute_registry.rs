@@ -41,9 +41,6 @@ use super::{ShutdownToken, Worker};
 /// 10 s tick cadence per design doc §1 / §3.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Mesh-storage mount point checked for `meshfs_available`.
-pub const DEFAULT_MESHFS_MOUNT: &str = "/mnt/mesh-storage";
-
 /// Directory holding per-VM Nebula-IP sidecar files
 /// (`<vm-storage>/<uuid>.nebula-ip`) written by `compute_provision`.
 pub const DEFAULT_VM_STORAGE: &str = "/var/lib/mde-vms";
@@ -608,7 +605,7 @@ impl ComputeRegistryWorker {
             hostname,
             nebula_addr: nebula_addr_hint,
             tick: DEFAULT_TICK_INTERVAL,
-            meshfs_mount: PathBuf::from(DEFAULT_MESHFS_MOUNT),
+            meshfs_mount: crate::default_qnm_shared_root(),
             vm_storage: PathBuf::from(DEFAULT_VM_STORAGE),
             prev_cpu_ns: Mutex::new(BTreeMap::new()),
             prev_state: Mutex::new(BTreeMap::new()),

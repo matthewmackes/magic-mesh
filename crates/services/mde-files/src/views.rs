@@ -1163,7 +1163,10 @@ pub fn mesh_home<'a>(snap: &'a BackendSnapshot) -> Element<'a, Message> {
     let peer_count = snap.peers.len();
     let vol_summary = vec![BannerStat::new(peer_count.to_string(), "Peers")];
     let mount_subtitle = if peer_count > 0 {
-        "mesh-storage active · /mnt/mesh-storage".into()
+        format!(
+            "mesh-storage active · {}",
+            mackes_mesh_types::peers::default_workgroup_root().display()
+        )
     } else {
         "mesh-storage pending · no peers enrolled yet".into()
     };

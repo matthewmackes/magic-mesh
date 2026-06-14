@@ -50,12 +50,11 @@ fn level_rank(level: &str) -> u8 {
     }
 }
 
-/// `MDE_WORKGROUP_ROOT`-or-`/mnt/mesh-storage`.
+/// Resolved mesh-storage mount, single-sourced with `mackesd` via
+/// `mackes_mesh_types` (`~/QNM-Shared` by default).
 #[must_use]
 pub fn workgroup_root() -> PathBuf {
-    std::env::var_os("MDE_WORKGROUP_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/mnt/mesh-storage"))
+    mackes_mesh_types::peers::default_workgroup_root()
 }
 
 /// Read every `logs/<host>.jsonl` record under `root` (junk-tolerant).

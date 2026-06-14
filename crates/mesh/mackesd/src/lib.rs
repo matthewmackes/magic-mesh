@@ -216,16 +216,12 @@ pub fn default_db_path() -> std::path::PathBuf {
 /// is EPIC-RETIRE-QNM Phase B.
 #[must_use]
 pub fn default_qnm_shared_root() -> std::path::PathBuf {
-    if let Ok(root) = std::env::var("MDE_WORKGROUP_ROOT") {
-        return std::path::PathBuf::from(root);
-    }
-    if let Ok(root) = std::env::var("QNM_SHARED_ROOT") {
-        return std::path::PathBuf::from(root);
-    }
-    if let Some(home) = dirs::home_dir() {
-        return home.join("QNM-Shared");
-    }
-    std::path::PathBuf::from("/var/lib/mackesd/qnm-shared")
+    // Single-sourced in `mackes-mesh-types` so `mde-workbench` resolves
+    // byte-for-byte the same mount (EPIC-RETIRE-QNM split-brain fix,
+    // 2026-06-14): the workbench panels used to fall back to a phantom
+    // `/mnt/mesh-storage` while this read `~/QNM-Shared`, so the GUI
+    // showed "mesh-storage not mounted" against a healthy 4-node mesh.
+    mackes_mesh_types::peers::default_workgroup_root()
 }
 
 /// v2.0.0 Phase 0.6 — env-var rename shim.

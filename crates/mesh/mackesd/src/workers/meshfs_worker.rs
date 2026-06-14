@@ -106,9 +106,6 @@ pub const MFSMASTER_PORT: u16 = 9419;
 /// LizardFS export directory under mesh-storage.
 pub const EXPORT_NAME: &str = "mesh-storage";
 
-/// Mount path for the LizardFS client.
-pub const DEFAULT_MOUNT_PATH: &str = "/mnt/mesh-storage";
-
 /// FPG-7 / Q12 — the default replication goal. Every chunk lives on
 /// two chunkservers (capped by the enrolled peer count on tiny
 /// meshes); the old goal=N everything-everywhere policy is retired.
@@ -268,6 +265,21 @@ impl MeshFsWorker {
         }
     }
 
+    /// The QNM-Shared / LizardFS mount this worker operates on.
+    ///
+    /// Single-sourced with `mackesd`'s directory read and the
+    /// `mde-workbench` panels via `default_qnm_shared_root()` — so
+    /// `mfssetgoal`/`mfssetquota`/`mfssettrashtime` and the XDG binds
+    /// all target the *real* mount (`~/QNM-Shared` by default), never
+    /// the phantom `/mnt/mesh-storage` that nothing mounts (the
+    /// split-brain that made the Mesh Storage panel report
+    /// "goal 0 / not mounted" against a healthy mesh).
+    fn mount_path(&self) -> PathBuf {
+        self.workgroup_root
+            .clone()
+            .unwrap_or_else(crate::default_qnm_shared_root)
+    }
+
     /// Opt into QNM-Shared peer discovery. Both args must be
     /// supplied or the worker skips goal-convergence and eviction
     /// (silent no-op).
@@ -414,7 +426,11 @@ impl MeshFsWorker {
                 // FPG-7 / Q12 — goal 2 default, capped by peer count
                 // (a 1-peer mesh can only hold one copy).
                 let goal = (peer_count as u8).min(DEFAULT_REPLICATION_GOAL).max(1);
-                let argv = setgoal_argv(&self.setgoal_binary, goal, DEFAULT_MOUNT_PATH);
+                let argv = setgoal_argv(
+                    &self.setgoal_binary,
+                    goal,
+                    &self.mount_path().to_string_lossy(),
+                );
                 tracing::info!(
                     target: "mackesd::meshfs_worker",
                     goal,
@@ -495,7 +511,7 @@ impl MeshFsWorker {
         //     not permitted (non-root dev runs).
         if master_up {
             if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-                ensure_xdg_binds(Path::new(DEFAULT_MOUNT_PATH), &home);
+                ensure_xdg_binds(&self.mount_path(), &home);
             }
         }
 
@@ -504,8 +520,8 @@ impl MeshFsWorker {
         //    wait for the next tick when it recovers).
         if master_up {
             let stage = Path::new(STAGE_DIR);
-            let mount = Path::new(DEFAULT_MOUNT_PATH);
-            for line in replay_all_staged(stage, mount, &overlay_ip) {
+            let mount = self.mount_path();
+            for line in replay_all_staged(stage, &mount, &overlay_ip) {
                 tracing::info!(target: "mackesd::meshfs_worker", "{line}");
             }
         }
@@ -518,7 +534,7 @@ impl MeshFsWorker {
             let argv = settrashtime_argv(
                 &self.settrashtime_binary,
                 self.trash_retention_secs,
-                DEFAULT_MOUNT_PATH,
+                &self.mount_path().to_string_lossy(),
             );
             tracing::info!(
                 target: "mackesd::meshfs_worker",
@@ -605,7 +621,12 @@ impl MeshFsWorker {
         };
         let hard = (min_avail as f64 * QUOTA_HARD_FACTOR) as u64;
         let soft = (min_avail as f64 * QUOTA_SOFT_FACTOR) as u64;
-        let argv = setquota_argv(&self.setquota_binary, soft, hard, DEFAULT_MOUNT_PATH);
+        let argv = setquota_argv(
+            &self.setquota_binary,
+            soft,
+            hard,
+            &self.mount_path().to_string_lossy(),
+        );
         tracing::info!(
             target: "mackesd::meshfs_worker",
             hard_bytes = hard,

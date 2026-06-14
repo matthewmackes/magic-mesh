@@ -18,9 +18,6 @@ use cosmic::iced::{Element, Length, Task};
 use crate::controls::{variant_button, ButtonVariant};
 use tokio::process::Command;
 
-/// Default mesh-storage mount root (FWMON-5).
-pub const MESH_STORAGE_MOUNT: &str = "/mnt/mesh-storage";
-
 /// Firewall JSONL subdirectory under mesh-storage.
 pub const FIREWALL_SUBDIR: &str = "firewall";
 
@@ -132,7 +129,10 @@ impl FirewallPanel {
     pub fn load_activity() -> Task<crate::Message> {
         Task::perform(
             async move {
-                let events = read_activity_jsonl(MESH_STORAGE_MOUNT, FIREWALL_SUBDIR);
+                // Single-sourced with `mackesd` so the union is read from
+                // the real mount (`~/QNM-Shared`), not a phantom path.
+                let root = mackes_mesh_types::peers::default_workgroup_root();
+                let events = read_activity_jsonl(&root.to_string_lossy(), FIREWALL_SUBDIR);
                 Message::ActivityLoaded { events }
             },
             crate::Message::Firewall,

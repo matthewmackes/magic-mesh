@@ -297,8 +297,9 @@ enum Cmd {
     /// path is absent or `.trash` is empty.
     MeshFsTrashList {
         /// Mount path of the LizardFS client (must be mounted).
-        #[clap(long, default_value = "/mnt/mesh-storage")]
-        mount_path: String,
+        /// Defaults to the resolved QNM-Shared mount (`~/QNM-Shared`).
+        #[clap(long)]
+        mount_path: Option<String>,
     },
 
     /// MESHFS-8.1 (v5.0.0) — restore one file from the LizardFS trash
@@ -2326,6 +2327,11 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::MeshFsTrashList { mount_path } => {
+            let mount_path = mount_path.unwrap_or_else(|| {
+                mackesd_core::default_qnm_shared_root()
+                    .to_string_lossy()
+                    .into_owned()
+            });
             let entries = mackesd_core::workers::meshfs_worker::list_trash_entries(&mount_path);
             println!(
                 "{}",

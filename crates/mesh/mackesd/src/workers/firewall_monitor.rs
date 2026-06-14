@@ -39,9 +39,6 @@ use super::{ShutdownToken, Worker};
 /// `meshfs_worker`.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Default JSONL directory under the mesh-storage mount.
-pub const DEFAULT_MESH_STORAGE_MOUNT: &str = "/mnt/mesh-storage";
-
 /// Firewall subdirectory inside mesh-storage.
 pub const FIREWALL_SUBDIR: &str = "firewall";
 
@@ -220,7 +217,10 @@ impl FirewallMonitorWorker {
     pub fn new(host: String) -> Self {
         Self {
             host,
-            mesh_storage: PathBuf::from(DEFAULT_MESH_STORAGE_MOUNT),
+            // Write the firewall JSONL union to the real mount so the
+            // workbench Firewall panel (which reads the same resolved
+            // root) finds it — single-sourced via default_qnm_shared_root.
+            mesh_storage: crate::default_qnm_shared_root(),
             tick: DEFAULT_TICK_INTERVAL,
             cursor_path: PathBuf::from(DEFAULT_CURSOR_PATH),
             threshold: DEFAULT_THRESHOLD,

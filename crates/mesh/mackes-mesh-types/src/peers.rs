@@ -176,6 +176,34 @@ pub fn default_mesh_home() -> PathBuf {
     PathBuf::from(home).join(".mde-mesh")
 }
 
+/// Resolve the QNM-Shared workgroup-root mount — the single source of
+/// truth shared by `mackesd` (directory/healthz/meshfs) and
+/// `mde-workbench` (every panel that reads off mesh-storage).
+///
+/// Precedence (matches `setup-qnm-shared.sh`, which mounts the LizardFS
+/// volume at `~/QNM-Shared`): `$MDE_WORKGROUP_ROOT` (canonical) >
+/// `$QNM_SHARED_ROOT` (back-compat) > `~/QNM-Shared` > the system
+/// fallback `/var/lib/mackesd/qnm-shared`.
+///
+/// Historically the workbench panels and `meshfs_worker` fell back to a
+/// phantom `/mnt/mesh-storage` that nothing mounts, so they reported
+/// "not mounted" while `mackesd`'s directory read the real
+/// `~/QNM-Shared` and reported a healthy 4-node mesh. Routing every
+/// caller through this one function removes that split-brain.
+#[must_use]
+pub fn default_workgroup_root() -> PathBuf {
+    if let Ok(root) = std::env::var("MDE_WORKGROUP_ROOT") {
+        return PathBuf::from(root);
+    }
+    if let Ok(root) = std::env::var("QNM_SHARED_ROOT") {
+        return PathBuf::from(root);
+    }
+    if let Some(home) = dirs::home_dir() {
+        return home.join("QNM-Shared");
+    }
+    PathBuf::from("/var/lib/mackesd/qnm-shared")
+}
+
 /// Write `rec` to `<dir>/<hostname>.json` atomically (temp + rename),
 /// creating `dir` if needed.
 ///

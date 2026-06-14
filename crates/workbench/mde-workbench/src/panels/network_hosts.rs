@@ -306,13 +306,13 @@ fn host_block<'a>(
 }
 
 /// The mesh-storage mount that holds every peer's `mackesd/` state.
-/// Mirrors `mackesd_core`'s `MDE_WORKGROUP_ROOT`-or-`/mnt/mesh-storage`
-/// resolution (the workbench doesn't depend on mackesd, so the default
-/// is duplicated here — a single string constant, not logic).
+/// Single-sourced with `mackesd` via `mackes_mesh_types` so the panel
+/// and the daemon resolve the identical mount (`~/QNM-Shared` by
+/// default). Previously this fell back to a phantom `/mnt/mesh-storage`
+/// that diverged from the daemon's `~/QNM-Shared`, so the panel showed
+/// "not mounted" against a healthy mesh.
 fn workgroup_root() -> PathBuf {
-    std::env::var_os("MDE_WORKGROUP_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/mnt/mesh-storage"))
+    mackes_mesh_types::peers::default_workgroup_root()
 }
 
 /// Read + merge every peer's `<root>/<peer>/mackesd/probe-inventory.json`
