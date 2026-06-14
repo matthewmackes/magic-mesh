@@ -344,6 +344,16 @@ assets = [
     { source = "target/release/mde-role-chooser",   dest = "/usr/bin/mde-role-chooser",   mode = "755" },
     # PKG-3 — the self-gating daemon unit + the role-gated app units.
     { source = "packaging/systemd/mackesd.service",   dest = "/usr/lib/systemd/system/mackesd.service",   mode = "644" },
+    # ONBOARD-9 — the service manager: a health watchdog (recovery) + a
+    # failure-notification handler. mesh-health.timer drives the watchdog;
+    # mesh-alert@.service is fired by OnFailure= on mackesd/nebula; the
+    # nebula drop-in adds Restart=on-failure + boot-enable to the stock unit.
+    { source = "packaging/systemd/mesh-health.service",  dest = "/usr/lib/systemd/system/mesh-health.service",  mode = "644" },
+    { source = "packaging/systemd/mesh-health.timer",    dest = "/usr/lib/systemd/system/mesh-health.timer",    mode = "644" },
+    { source = "packaging/systemd/mesh-alert@.service",  dest = "/usr/lib/systemd/system/mesh-alert@.service",  mode = "644" },
+    { source = "packaging/systemd/nebula.service.d/10-mesh-recovery.conf", dest = "/usr/lib/systemd/system/nebula.service.d/10-mesh-recovery.conf", mode = "644" },
+    { source = "install-helpers/mesh-health-check.sh",   dest = "/usr/libexec/mackesd/mesh-health-check",       mode = "755" },
+    { source = "install-helpers/mesh-alert.sh",          dest = "/usr/libexec/mackesd/mesh-alert",              mode = "755" },
     { source = "packaging/systemd/mde-musicd.service", dest = "/usr/lib/systemd/user/mde-musicd.service", mode = "644" },
     # EFF-43 / VV-1 — the voice-stack units, shipped DISABLED (the
     # operator/fleet policy enables them; ExecStartPre regenerates the
@@ -380,14 +390,19 @@ assets = [
 # them no-fatal in minimal/container roots.
 post_install_script = """
 systemctl daemon-reload >/dev/null 2>&1 || :
-systemctl enable mackesd.service >/dev/null 2>&1 || :
+# Service manager (ONBOARD-9): the daemon, the overlay, and the health
+# watchdog all start at boot. nebula.service ships disabled by the stock
+# `nebula` RPM — enable it so the overlay is boot-durable independently of
+# the mackesd supervisor. (mackesd self-gates on a pinned role, so enabling
+# it pre-enrollment is safe — it idles until `found`/`join` pins a role.)
+systemctl enable mackesd.service nebula.service mesh-health.timer >/dev/null 2>&1 || :
 [ -d /etc/mackesd ] || install -d -m 0700 /etc/mackesd
 gtk-update-icon-cache -q -f /usr/share/icons/hicolor >/dev/null 2>&1 || :
 update-desktop-database -q >/dev/null 2>&1 || :
 """
 pre_uninstall_script = """
 if [ "$1" = 0 ]; then
-  systemctl --no-reload disable --now mackesd.service >/dev/null 2>&1 || :
+  systemctl --no-reload disable --now mackesd.service mesh-health.timer >/dev/null 2>&1 || :
 fi
 """
 post_uninstall_script = """

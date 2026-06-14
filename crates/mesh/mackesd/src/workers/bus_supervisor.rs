@@ -40,6 +40,14 @@ const DEFAULT_PROD_PATH: &str = "/usr/bin/mde-bus";
 /// systemctl restart). 1s mirrors `nebula_supervisor`'s reload pace.
 const RESPAWN_COOLDOWN: Duration = Duration::from_secs(1);
 
+/// Exit code `mde-bus daemon` returns when another daemon already owns the
+/// node-wide broker lock (the singleton guard). Contract mirror of
+/// `mde_bus::EXIT_ALREADY_RUNNING` (mde-bus is a binary crate, so the value is
+/// duplicated here rather than imported). On this code the supervisor backs off
+/// to a slow poll instead of tight-respawning — preventing the duplicate-daemon
+/// zombie pile.
+const EXIT_ALREADY_RUNNING: i32 = 3;
+
 /// Async worker that supervises the `mde-bus` subprocess.
 pub struct BusSupervisor {
     /// Optional explicit binary path. When `None`, the supervisor
@@ -140,7 +148,18 @@ impl Worker for BusSupervisor {
                 Some(child) => {
                     tokio::select! {
                         wait = child.wait() => {
+                            // EXIT_ALREADY_RUNNING (3): another daemon already
+                            // owns the broker lock. A broker IS healthy — don't
+                            // tight-respawn into a zombie pile; back off to the
+                            // slow 30s poll like the binary-missing case. Re-check
+                            // periodically so we take over if the holder dies.
+                            let already_running = matches!(
+                                wait, Ok(ref s) if s.code() == Some(EXIT_ALREADY_RUNNING)
+                            );
                             match wait {
+                                _ if already_running => {
+                                    debug!("a mde-bus broker is already running; idling (slow re-check)");
+                                }
                                 Ok(status) if status.success() => {
                                     info!("mde-bus exited cleanly; respawning");
                                 }
@@ -152,7 +171,12 @@ impl Worker for BusSupervisor {
                                 }
                             }
                             self.child = None;
-                            tokio::time::sleep(RESPAWN_COOLDOWN).await;
+                            let cooldown = if already_running {
+                                Duration::from_secs(30)
+                            } else {
+                                RESPAWN_COOLDOWN
+                            };
+                            tokio::time::sleep(cooldown).await;
                         }
                         () = shutdown.wait() => {
                             info!("shutdown requested; killing mde-bus child");

@@ -3,6 +3,13 @@ Description=Magic Mesh control-plane daemon (mackesd)
 Documentation=https://github.com/matthewmackes/magic-mesh
 After=network-online.target
 Wants=network-online.target
+# Service-manager policy: keep retrying across a generous window (a fixed role
+# / mount brings it up without manual help) but don't tight-loop forever; the
+# mesh-health watchdog is the backstop if the start limit is ever hit.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+# Notify when the daemon enters a failed state (the node "goes offline").
+OnFailure=mesh-alert@%n.service
 
 [Service]
 Type=simple

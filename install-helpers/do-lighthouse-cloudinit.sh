@@ -79,10 +79,12 @@ if systemctl is-active --quiet firewalld 2>/dev/null; then
     log "firewalld: opened 4242/udp, $ENROLL_PORT/tcp, 443/tcp"
 fi
 
-# 5. Start the daemon — run_serve spawns the nebula-enroll-listener (the
-#    endpoint cert now exists) so peers can `mackesd join` immediately.
-systemctl enable --now mackesd.service || fail "could not start mackesd.service"
-log "mackesd.service started — /enroll endpoint live on $PUBLIC_IP:$ENROLL_PORT"
+# 5. Start the services — the daemon (run_serve spawns the nebula-enroll-listener
+#    so peers can `mackesd join` immediately), the overlay, and the health
+#    watchdog. enable = boot-durable (ONBOARD-9 service manager).
+systemctl enable --now nebula.service mackesd.service mesh-health.timer \
+    || fail "could not start mesh services"
+log "services up (boot-durable) — /enroll endpoint live on $PUBLIC_IP:$ENROLL_PORT"
 
 echo "OK $PUBLIC_IP $ENROLL_PORT" >"$STATUS_FILE"
 log "lighthouse ready. Add a peer with:  mackesd join '$JOIN_TOKEN'"

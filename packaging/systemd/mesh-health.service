@@ -1,0 +1,12 @@
+# Magic Mesh node health watchdog — recovery + alerting. Run by mesh-health.timer.
+# Restarts a stopped/wedged mackesd or nebula (the cases systemd's own
+# Restart=on-failure can't see: StartLimit exhaustion, a missing nebula1
+# interface, or an alive-but-unreachable overlay) and notifies on recovery.
+[Unit]
+Description=Magic Mesh node health watchdog (recovery + alerting)
+After=mackesd.service
+Wants=mackesd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/mackesd/mesh-health-check

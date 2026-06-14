@@ -6952,10 +6952,14 @@ fn cmd_found(
     };
     let join_token = v3.encode();
 
-    // Best-effort overlay bring-up (the supervisor also does this on serve).
-    let _ = std::process::Command::new("systemctl")
-        .args(["start", "nebula.service"])
-        .status();
+    // Bring the node fully live + boot-durable: enable+start the overlay, the
+    // worker daemon (activates the /enroll listener), and the health watchdog.
+    // `enable` makes each start at boot independently — nebula.service ships
+    // disabled, and was previously only `start`ed, so a reboot left the overlay
+    // down until the supervisor happened to revive it (ONBOARD-9).
+    enable_now_service("nebula.service");
+    enable_now_service("mackesd.service");
+    enable_now_service("mesh-health.timer");
 
     println!(
         "mesh `{}` founded — lighthouse {} ({})",
@@ -6969,10 +6973,8 @@ fn cmd_found(
         identity.fingerprint
     );
     println!("bundle: {}", report.bundle_path.display());
+    println!("services: nebula + mackesd + mesh-health enabled (boot-durable) and running");
     println!("\nAdd a peer — run this on the joining box:\n  mackesd join '{join_token}'");
-    println!(
-        "\nStart serving (activates the /enroll listener):\n  sudo systemctl restart mackesd   # or: mackesd serve"
-    );
     Ok(())
 }
 
@@ -7053,16 +7055,29 @@ fn cmd_join(
         token,
     ))?;
 
-    let _ = std::process::Command::new("systemctl")
-        .args(["start", "nebula.service"])
-        .status();
+    // Bring the peer fully live + boot-durable (ONBOARD-9): the overlay, the
+    // worker daemon, and the health watchdog — not just nebula. A `join` now
+    // leaves a node that survives reboot and self-recovers, instead of one the
+    // operator must `systemctl restart mackesd` by hand.
+    enable_now_service("nebula.service");
+    enable_now_service("mackesd.service");
+    enable_now_service("mesh-health.timer");
 
     println!(
         "joined `{}` as {} (overlay {})",
         bundle.mesh_id, node_id, bundle.overlay_ip
     );
-    println!("\nBring up the overlay:\n  sudo systemctl restart mackesd   # or: mackesd serve");
+    println!("services: nebula + mackesd + mesh-health enabled (boot-durable) and running");
     Ok(())
+}
+
+/// ONBOARD-4/9 — enable + start a systemd unit so it is live now AND comes up
+/// automatically on every boot. Best-effort: a container/dev env without
+/// systemd just no-ops (the daemon also self-heals via the supervisor).
+fn enable_now_service(name: &str) {
+    let _ = std::process::Command::new("systemctl")
+        .args(["enable", "--now", name])
+        .status();
 }
 
 fn default_node_id() -> String {

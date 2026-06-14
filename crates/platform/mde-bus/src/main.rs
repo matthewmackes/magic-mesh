@@ -73,7 +73,40 @@ fn build_seeded_registry() -> anyhow::Result<Registry> {
     Ok(reg)
 }
 
+/// Exit code a redundant `mde-bus daemon` returns when another daemon already
+/// owns the node-wide broker lock. The bus_supervisor treats this as "a broker
+/// is healthy" and backs off to a slow poll instead of a tight respawn — so a
+/// duplicate spawn can never crash-loop into a pile of zombies (the .13 wedge).
+pub const EXIT_ALREADY_RUNNING: i32 = 3;
+
+/// Claim the node-wide singleton lock via a Linux abstract-namespace unix
+/// socket. The kernel releases the name automatically when this process exits,
+/// so there is no stale lockfile to clean up after a crash. Returns the bound
+/// listener (held for the daemon's lifetime) or `None` if another daemon holds
+/// it. Abstract sockets are per-network-namespace, giving exactly one broker
+/// per node — which is correct: the broker is node-level (mDNS + overlay
+/// discovery), not per-user.
+#[must_use]
+fn acquire_singleton_lock() -> Option<std::os::unix::net::UnixListener> {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixListener};
+    let addr = SocketAddr::from_abstract_name(b"mde-bus-broker").ok()?;
+    UnixListener::bind_addr(&addr).ok()
+}
+
 async fn run_daemon() -> anyhow::Result<()> {
+    // Singleton guard: refuse to start a second broker. Held for the daemon's
+    // whole lifetime (dropped on return) so the lock tracks liveness exactly.
+    let _singleton = match acquire_singleton_lock() {
+        Some(listener) => listener,
+        None => {
+            tracing::info!(
+                "another mde-bus daemon already owns the broker lock; exiting cleanly \
+                 (a node runs exactly one broker)"
+            );
+            std::process::exit(EXIT_ALREADY_RUNNING);
+        }
+    };
     let reg = build_seeded_registry()?;
     // BUS-1.2 — try to spawn the ntfy broker. Missing prereqs
     // (pre-enrollment peer, ntfy not installed, template not

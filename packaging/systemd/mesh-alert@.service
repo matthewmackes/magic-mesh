@@ -1,0 +1,11 @@
+# Magic Mesh failure-notification handler — fired by `OnFailure=mesh-alert@%n.service`
+# on mackesd/nebula. The instance name (%i) is the failed unit; emit an alert
+# through the platform's alert path (FDO notification + journal + configured hooks).
+[Unit]
+Description=Magic Mesh failure notification for %i
+# Don't let a notification storm trip a start limit.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/mackesd/mesh-alert "%i" crit "%i entered a failed state on %H"
