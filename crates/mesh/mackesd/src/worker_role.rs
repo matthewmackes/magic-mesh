@@ -140,8 +140,9 @@ mod tests {
         // +1 fleet_reconcile (PD-9), +1 presence_watch (PD-13),
         // +1 lifecycle_exec (PD-11), +1 job_exec (PLANES-9),
         // +1 mesh_dns (PLANES-18), +1 netstate_apply (PLANES-15),
-        // +1 validation_suite (PLANES-19), +1 metrics_exporter (EFF-9).
-        assert_eq!(WORKER_TIERS.len(), 26);
+        // +1 validation_suite (PLANES-19), +1 metrics_exporter (EFF-9),
+        // +1 hardware_probe (SUBAUDIT-D2 — the PeerProbe producer).
+        assert_eq!(WORKER_TIERS.len(), 27);
     }
 
     #[test]
@@ -164,8 +165,8 @@ mod tests {
         let count = |rank: u8| WORKER_TIERS.iter().filter(|(_, r)| *r == rank).count();
         assert_eq!(
             count(0),
-            19,
-            "Lighthouse control plane (+gossip/reconcile/presence/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter)"
+            20,
+            "Lighthouse control plane (+gossip/reconcile/presence/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe)"
         );
         assert_eq!(
             count(1),
@@ -223,9 +224,10 @@ mod tests {
         let lh = workers_for_rank(Role::Lighthouse.rank());
         let srv = workers_for_rank(Role::Server.rank());
         let ws = workers_for_rank(Role::Workstation.rank());
-        assert_eq!(lh.len(), 19);
-        assert_eq!(srv.len(), 22);
-        assert_eq!(ws.len(), 26);
+        // +1 each (hardware_probe, rank 0 → present in every tier).
+        assert_eq!(lh.len(), 20);
+        assert_eq!(srv.len(), 23);
+        assert_eq!(ws.len(), 27);
         // Strict superset: every lower-tier worker is in the higher tier.
         assert!(lh.iter().all(|w| srv.contains(w)));
         assert!(srv.iter().all(|w| ws.contains(w)));

@@ -103,7 +103,18 @@ pub fn directory_row(
             .overlay_ip
             .clone()
             .or_else(|| overlay.map(|(ip, _)| ip.clone())),
-        "role": overlay.map(|(_, role)| role.clone()),
+        // Role: the roster mirror when present (only on the signer),
+        // else derived from the capability tags so every peer shows a
+        // real role mesh-wide ("lighthouse" if tagged, else "peer") —
+        // was null on a peer, rendering "role: -" and breaking role
+        // filters/rollups.
+        "role": overlay.map(|(_, role)| role.clone()).unwrap_or_else(|| {
+            if tags.iter().any(|t| t.eq_ignore_ascii_case("lighthouse")) {
+                "lighthouse".to_string()
+            } else {
+                "peer".to_string()
+            }
+        }),
         "tags": tags,
         "revision": {
             "head": head,

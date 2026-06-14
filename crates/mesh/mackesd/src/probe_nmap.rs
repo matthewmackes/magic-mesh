@@ -66,11 +66,14 @@ fn port_spec() -> String {
 /// `targets`. Pure — exposed for unit tests.
 #[must_use]
 pub fn fast_argv(targets: &[String]) -> Vec<String> {
+    // SUBAUDIT-C2 — no `--open`: Discovered Hosts must list every *up*
+    // mesh peer, even one with no open curated port (the parser already
+    // cards an up host with empty services). `--open` suppressed those,
+    // leaving the panel at "0 hosts" on a healthy mesh.
     let mut argv = vec![
         TIMING.to_owned(),
         "-p".to_owned(),
         port_spec(),
-        "--open".to_owned(),
         "-oX".to_owned(),
         "-".to_owned(),
     ];
@@ -90,7 +93,7 @@ pub fn deep_argv(targets: &[String], nse_dir: &str) -> Vec<String> {
         "--version-all".to_owned(),
         "-p".to_owned(),
         port_spec(),
-        "--open".to_owned(),
+        // SUBAUDIT-C2 — no `--open`; list up hosts even with no open port.
     ];
     if !nse_dir.is_empty() {
         argv.push("--script".to_owned());

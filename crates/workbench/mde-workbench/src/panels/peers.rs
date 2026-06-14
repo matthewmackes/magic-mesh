@@ -413,6 +413,9 @@ pub fn matches_filter(row: &PeerRow, filter: &str) -> bool {
     }
     let f = filter.to_lowercase();
     row.hostname.to_lowercase().contains(&f)
+        // Match the role too (now populated mesh-wide: peer/lighthouse) so
+        // typing "peer" surfaces the peers instead of an empty list.
+        || row.role.to_lowercase().contains(&f)
         || row.tags.iter().any(|t| t.to_lowercase().contains(&f))
         || row.services.iter().any(|s| s.to_lowercase().contains(&f))
 }
