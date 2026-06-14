@@ -304,17 +304,19 @@ pub enum Message {
 // ─── Async helpers ────────────────────────────────────────────────────────────
 
 fn bus_root() -> Option<PathBuf> {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
-        .map(|d| d.join("mde").join("bus"))
+    // Honor MDE_BUS_ROOT (the shared /run/mde-bus spool the daemon + GUIs
+    // share) via the canonical resolver — was a per-HOME path that read an
+    // empty ~/.local/share/mde/bus while all real traffic landed on
+    // /run/mde-bus, so the panel showed no activity.
+    mde_bus::default_data_dir()
 }
 
-/// Walk `bus_root()/topics/` (BFS, depth ≤ 4) and return one
+/// Walk `bus_root()` (BFS, depth ≤ 4) and return one
 /// [`TopicInfo`] per leaf directory that contains `.json` files.
 async fn load_topics() -> Result<Vec<TopicInfo>, String> {
-    let root = bus_root().ok_or_else(|| "no data dir".to_string())?;
-    let topics_dir = root.join("topics");
+    // Topic dirs live directly under the bus root (action/, event/, mesh/,
+    // …), not under a `topics/` subdir — walk the root itself.
+    let topics_dir = bus_root().ok_or_else(|| "no data dir".to_string())?;
 
     if tokio::fs::metadata(&topics_dir).await.is_err() {
         return Ok(Vec::new());
@@ -418,7 +420,8 @@ async fn stat_topic_dir(name: String, dir: &PathBuf) -> TopicInfo {
 /// Load the 5 most-recent messages from a topic directory.
 async fn load_topic_messages(topic: String) -> Result<Vec<TopicMessage>, String> {
     let root = bus_root().ok_or_else(|| "no data dir".to_string())?;
-    let topic_dir = root.join("topics").join(std::path::Path::new(
+    // Topic dirs are directly under the bus root (no `topics/` segment).
+    let topic_dir = root.join(std::path::Path::new(
         &topic.replace('/', &std::path::MAIN_SEPARATOR.to_string()),
     ));
 

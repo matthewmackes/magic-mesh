@@ -113,10 +113,15 @@ pub fn view<'a>(
 
     let mut col: Column<'a, crate::Message, cosmic::Theme> = column![].spacing(0);
 
-    // PLANES-1 (W4/W16) — the full five-plane tree is shown day-one:
-    // Peers Front Door, the five planes (Network is a first-class plane
-    // again, superseding the E4.15 hide), then the Desktop cluster.
-    for (i, entry) in nav_model().into_iter().enumerate() {
+    // NAV-1 — render only the visible sections (the 7 mesh sections in
+    // locked order). The hidden `Group::Desktop` carries the deferred
+    // desktop panels for deep-link routing only and must never appear in
+    // the sidebar (Q2 — desktop settings defer to Cosmic).
+    for (i, entry) in nav_model()
+        .into_iter()
+        .filter(|e| e.group != Group::Desktop)
+        .enumerate()
+    {
         if i > 0 {
             col = col.push(section_divider(palette));
         }
