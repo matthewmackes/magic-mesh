@@ -102,8 +102,12 @@ impl Worker for ProbeWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        // First tick is a deep pass (last_deep is None) so a fresh
-        // daemon publishes a full inventory promptly.
+        // SUBAUDIT-C2 — first tick is FAST so the mesh peers appear in
+        // Discovered Hosts within seconds; the slow deep -sV/NSE pass
+        // (which on a fresh start could scan a LAN /24 and block the
+        // inventory for minutes) runs on the deep interval. Prime the
+        // deep timer so the first cycle is the quick liveness scan.
+        let _ = self.deep_due();
         self.tick_once();
         loop {
             tokio::select! {

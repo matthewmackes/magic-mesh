@@ -72,6 +72,10 @@ pub fn fast_argv(targets: &[String]) -> Vec<String> {
     // leaving the panel at "0 hosts" on a healthy mesh.
     let mut argv = vec![
         TIMING.to_owned(),
+        // SUBAUDIT-C2 — bound per-host time so a slow/LAN target can't
+        // stall the inventory write (the fast cycle must stay fast).
+        "--host-timeout".to_owned(),
+        "20s".to_owned(),
         "-p".to_owned(),
         port_spec(),
         "-oX".to_owned(),
@@ -89,6 +93,8 @@ pub fn fast_argv(targets: &[String]) -> Vec<String> {
 pub fn deep_argv(targets: &[String], nse_dir: &str) -> Vec<String> {
     let mut argv = vec![
         TIMING.to_owned(),
+        "--host-timeout".to_owned(),
+        "60s".to_owned(),
         "-sV".to_owned(),
         "--version-all".to_owned(),
         "-p".to_owned(),
