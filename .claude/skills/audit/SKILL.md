@@ -63,6 +63,24 @@ the dead surface). Don't fix unless asked — report first.
    source paths for existence and binaries against real bin targets (explicit
    `[[bin]]` OR auto-discovered `src/bin/*.rs`). The GPG key + COPR + ISO
    remain operator-gated.
+7. **Unprovisioned infrastructure preconditions** (ONBOARD-6 lesson, 2026-06-14)
+   — the gap §7 + the passes above CANNOT see: a feature whose code is fully
+   reachable + unit-tested yet **silently no-ops in the mesh because its
+   deployed substrate was never provisioned**. QNM-Shared hid for the whole
+   project this way — the leader/directory/fleet code is real + reachable, but
+   the tests bind `QNM_SHARED_ROOT` to a **tempdir**, and the code behaves
+   identically against a local dir vs a real LizardFS mount, so nothing failed
+   while the mesh showed NO LEADER / node_count 0. Flag any feature that reads a
+   shared path / mount / external daemon (`default_qnm_shared_root`,
+   `QNM_SHARED_ROOT`, a `*mount*`, a `Command::new("<daemon>")`) whose ONLY
+   coverage is a single-instance tempdir/mock — it needs a **multi-node /
+   real-substrate assertion** (cross-node visibility, leader contention) and a
+   **fail-loud runtime check** that the substrate is real, else "works locally"
+   masquerades as "works in the mesh". Guardrails:
+   `./install-helpers/lint-shared-substrate.sh` (the watchdog mount-assert +
+   the multi-node test must stay), `tests/mesh_shared_state.rs` (the gate),
+   `install-helpers/setup-qnm-shared.sh` (the provisioning). §7 = necessary,
+   not sufficient.
 
 ## Safeguards (avoid false positives)
 
