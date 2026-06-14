@@ -115,10 +115,12 @@ feature on a headless host).
 ## §8 — Positioning & trust envelope (2026-06-09, enterprise-readiness verification)
 
 - **Production workgroup-grade, not hyperscale.** The supported envelope is a **single workgroup of
-  ≤ 8 peers** (the `ca/sign.rs` cap). Within that envelope the bar is **reliable + operable +
-  documented** — once the ENTERPRISE + PKG epics land, the platform is held to production-grade for
-  that scale, and `DISCLAIMER.md` is repositioned accordingly (no longer "not for production"). Going
-  beyond ≤ 8 peers / HA-multi-lighthouse / multi-tenant is **out of scope** for this identity.
+  up to 3 lighthouses + 9 Headless/Full peers (12 nodes)** — operator directive 2026-06-14, raising
+  the prior ≤ 8-peer / single-lighthouse cap; `ca/sign.rs` `MAX_PEER_CAP` follows. Up to 3 public
+  lighthouses give NAT relay/discovery + LizardFS/QNM-Shared redundancy (LH1 = founding CA holder;
+  LH2/LH3 = additional lighthouses, one CA on LH1 — see `docs/design/magic-setup-wizard.md`). Within
+  this envelope the bar is **reliable + operable + documented**. Going beyond 3 LH + 9 peers /
+  full multi-CA HA / multi-tenant is **out of scope** for this identity.
 - **Open-mesh is a deliberate trade-off, honestly documented.** Trust stays **flat** (any enrolled
   cert reaches every peer + every service; no per-service ACL) — the §0 "Simple" lever. This is
   accepted *only* because the envelope is a small trusted workgroup; the blast radius MUST be

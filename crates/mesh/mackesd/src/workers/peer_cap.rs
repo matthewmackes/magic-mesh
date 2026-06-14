@@ -34,7 +34,7 @@ use crate::store::{list_nodes, NodeRow};
 
 /// Q22 hard cap: maximum enrolled non-local, non-observer peers
 /// (including phones) in one Mackes mesh.
-pub const PEER_CAP: u8 = 8;
+pub const PEER_CAP: u8 = 12;
 
 /// Default sweep cadence.
 pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
@@ -262,23 +262,23 @@ mod tests {
     }
 
     #[test]
-    fn peer_cap_limit_is_8() {
-        // Q22 lock — the constant must not drift.
-        assert_eq!(PEER_CAP, 8);
+    fn peer_cap_limit_is_12() {
+        // §8 (2026-06-14) — 3 lighthouses + 9 peers = 12; must not drift.
+        assert_eq!(PEER_CAP, 12);
     }
 
     #[test]
     fn snapshot_from_count_sets_fields_correctly() {
         let s = PeerCapSnapshot::from_count(5);
         assert_eq!(s.cap_used, 5);
-        assert_eq!(s.cap_limit, 8);
+        assert_eq!(s.cap_limit, 12);
         assert!(!s.cap_full);
-        assert_eq!(s.remaining_slots(), 3);
+        assert_eq!(s.remaining_slots(), 7);
     }
 
     #[test]
     fn snapshot_cap_full_at_limit() {
-        let s = PeerCapSnapshot::from_count(8);
+        let s = PeerCapSnapshot::from_count(12);
         assert!(s.cap_full);
         assert_eq!(s.remaining_slots(), 0);
     }
@@ -286,8 +286,8 @@ mod tests {
     #[test]
     fn snapshot_remaining_slots_saturates_at_zero_when_over_cap() {
         // Should not underflow if somehow cap_used > cap_limit.
-        let mut s = PeerCapSnapshot::from_count(8);
-        s.cap_used = 9;
+        let mut s = PeerCapSnapshot::from_count(12);
+        s.cap_used = 13;
         assert_eq!(s.remaining_slots(), 0);
     }
 
@@ -295,12 +295,12 @@ mod tests {
     fn cap_payload_format_is_correct() {
         let s = PeerCapSnapshot::from_count(3);
         let p = cap_payload(&s);
-        assert_eq!(p, r#"{"cap_used":3,"cap_limit":8,"cap_full":false}"#);
+        assert_eq!(p, r#"{"cap_used":3,"cap_limit":12,"cap_full":false}"#);
     }
 
     #[test]
     fn cap_payload_cap_full_true_when_at_limit() {
-        let s = PeerCapSnapshot::from_count(8);
+        let s = PeerCapSnapshot::from_count(12);
         let p = cap_payload(&s);
         assert!(p.contains(r#""cap_full":true"#));
     }

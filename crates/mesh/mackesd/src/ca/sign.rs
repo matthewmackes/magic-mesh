@@ -30,17 +30,18 @@ pub const DEFAULT_MESH_CIDR_BASE: &str = "10.42.0.0";
 /// Maximum number of distinct active (non-revoked) peer certs the
 /// CA will sign at the current epoch without an explicit override.
 ///
-/// Locked at **8** by Q3 + Q22 of the 100-Q tightening survey
-/// (2026-05-25) + Q3 of the 25-Q tuning survey (2026-05-26):
-/// MackesDE for Workgroups is sized for ≤ 8 peers; gluster replica
-/// cost, Bus broker mesh, and attendance election all assume this
-/// cap. TUNE-11 (2026-05-26) makes the cap a runtime check on the
-/// CSR sign path rather than a paper-only design assumption.
+/// Raised to **12** by operator directive (2026-06-14, §8): the mesh envelope
+/// is now **up to 3 lighthouses + 9 Headless/Full peers = 12 nodes** (was ≤ 8,
+/// single lighthouse). The cap counts all active signed certs (lighthouses
+/// self-sign/enroll as certs too), so 12 total accommodates 3 LH + 9 peers.
+/// (A role-aware split — ≤3 Host + ≤9 Peer — is a refinement tracked in the
+/// SETUP epic; 12-total is the v1 cap.) TUNE-11 (2026-05-26) keeps this as a
+/// runtime check on the CSR sign path.
 ///
 /// Operators with a legitimate need to exceed the cap must invoke
 /// `mackesd ca sign-csr --override-cap` per
 /// `docs/design/cap-overrides.md`. Each override is audit-logged.
-pub const MAX_PEER_CAP: u32 = 8;
+pub const MAX_PEER_CAP: u32 = 12;
 
 /// Outcome of one signing call.
 #[derive(Debug, Clone, PartialEq, Eq)]

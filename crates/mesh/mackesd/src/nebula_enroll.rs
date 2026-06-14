@@ -1553,23 +1553,27 @@ mod tests {
     }
 
     #[test]
-    fn sign_csr_rejects_ninth_peer_without_override() {
-        // Pre-populate 8 peer certs at the active epoch, then
-        // attempt to sign a 9th from scratch. The cap check
-        // fires before any sign machinery runs.
+    fn sign_csr_rejects_over_cap_peer_without_override() {
+        // Pre-populate MAX_PEER_CAP peer certs at the active epoch, then
+        // attempt to sign one more from scratch. The cap check fires
+        // before any sign machinery runs. (§8: cap is 12 — 3 LH + 9 peers.)
+        let cap = crate::ca::sign::MAX_PEER_CAP;
         let tmp = tempdir().expect("tempdir");
         let conn = fresh_store();
         let (ca_crt, ca_key) = make_test_ca(tmp.path(), &conn);
-        for i in 1..=8 {
+        for i in 1..=cap {
             conn.execute(
                 "INSERT INTO nebula_peer_certs \
                  (node_id, epoch, cert_pem, overlay_ip, expires_at) \
                  VALUES (?1, 0, 'pem', ?2, 9999999)",
-                rusqlite::params![format!("peer:slot-{i}"), format!("10.42.0.{i}")],
+                rusqlite::params![
+                    format!("peer:slot-{i}"),
+                    format!("10.42.{}.{}", i / 256, i % 256)
+                ],
             )
             .unwrap();
         }
-        let _pending = place_csr(tmp.path(), "peer:ninth");
+        let _pending = place_csr(tmp.path(), "peer:over");
         let paths = SignCsrPaths {
             ca_crt,
             ca_key,
@@ -1579,36 +1583,43 @@ mod tests {
             &MockBackend,
             &conn,
             tmp.path(),
-            "peer:ninth",
+            "peer:over",
             "test-mesh",
             &paths,
             Vec::new(),
             false,
         );
         match r {
-            Err(SignCsrError::PeerCapReached { current, cap }) => {
-                assert_eq!(current, 8);
-                assert_eq!(cap, 8);
+            Err(SignCsrError::PeerCapReached {
+                current,
+                cap: reported,
+            }) => {
+                assert_eq!(current, cap);
+                assert_eq!(reported, cap);
             }
             other => panic!("expected PeerCapReached, got {other:?}"),
         }
     }
 
     #[test]
-    fn sign_csr_accepts_ninth_peer_with_override() {
+    fn sign_csr_accepts_over_cap_peer_with_override() {
+        let cap = crate::ca::sign::MAX_PEER_CAP;
         let tmp = tempdir().expect("tempdir");
         let conn = fresh_store();
         let (ca_crt, ca_key) = make_test_ca(tmp.path(), &conn);
-        for i in 1..=8 {
+        for i in 1..=cap {
             conn.execute(
                 "INSERT INTO nebula_peer_certs \
                  (node_id, epoch, cert_pem, overlay_ip, expires_at) \
                  VALUES (?1, 0, 'pem', ?2, 9999999)",
-                rusqlite::params![format!("peer:slot-{i}"), format!("10.42.0.{i}")],
+                rusqlite::params![
+                    format!("peer:slot-{i}"),
+                    format!("10.42.{}.{}", i / 256, i % 256)
+                ],
             )
             .unwrap();
         }
-        let _pending = place_csr(tmp.path(), "peer:ninth");
+        let _pending = place_csr(tmp.path(), "peer:over");
         let paths = SignCsrPaths {
             ca_crt,
             ca_key,
@@ -1618,19 +1629,19 @@ mod tests {
             &MockBackend,
             &conn,
             tmp.path(),
-            "peer:ninth",
+            "peer:over",
             "test-mesh",
             &paths,
             Vec::new(),
             true,
         )
         .expect("override path succeeds");
-        assert_eq!(outcome.peer_id, "peer:ninth");
+        assert_eq!(outcome.peer_id, "peer:over");
         // Row landed past the cap.
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM nebula_peer_certs \
-                 WHERE node_id = 'peer:ninth' AND revoked_at IS NULL",
+                 WHERE node_id = 'peer:over' AND revoked_at IS NULL",
                 [],
                 |r| r.get(0),
             )
