@@ -174,10 +174,10 @@ pub enum Message {
 // ─── Async helpers ────────────────────────────────────────────────────────────
 
 fn federation_data_root() -> Option<PathBuf> {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
-        .map(|d| d.join("mde").join("bus"))
+    // SUBAUDIT-B2 — honor MDE_BUS_ROOT (the shared /run/mde-bus spool the
+    // daemon writes federation state into) via the canonical resolver;
+    // was a per-HOME path that read an empty ~/.local/share/mde/bus.
+    mde_bus::default_data_dir()
 }
 
 async fn mint_passcode() -> Result<MintJsonOutput, String> {
