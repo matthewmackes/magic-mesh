@@ -447,6 +447,15 @@ pub const DEFAULT_EXCLUDE_IFACE_PREFIXES: &[&str] = &[
     "lo", "nebula", "docker", "podman", "virbr", "cni", "veth", "br-",
 ];
 
+/// SUBAUDIT-C3 — smallest LAN prefix (largest range) the probe will
+/// auto-scan. A `/16` home LAN (65 536 hosts — real on .13's wlan) makes
+/// the full scan run effectively forever, hanging the probe cycle so the
+/// inventory never updates (Discovered Hosts stuck at 0). Cap at `/22`
+/// (≤1024 hosts); larger LANs are skipped from auto-scan — the mesh peers
+/// still come from `mesh_targets`, and a specific subnet can be added via
+/// `probe-targets.toml`.
+pub const MIN_LAN_SCAN_PREFIX: u8 = 22;
+
 /// Config file (under `~/.config/mde/`) of operator-arbitrary scan
 /// targets — TOML `targets = ["host", "cidr", ...]`.
 pub const ARBITRARY_TARGETS_FILE: &str = "probe-targets.toml";
@@ -512,6 +521,17 @@ pub fn lan_cidrs_from_ip_json(json: &str, exclude_prefixes: &[&str]) -> Vec<Stri
         }
         for a in iface.addr_info {
             if a.family != "inet" {
+                continue;
+            }
+            // SUBAUDIT-C3 — skip oversized LANs (e.g. a /16) that would
+            // hang the scan; a /22-or-smaller range is safe to enumerate.
+            if a.prefixlen < MIN_LAN_SCAN_PREFIX {
+                tracing::debug!(
+                    target: "mackesd::probe_nmap",
+                    iface = %iface.ifname,
+                    cidr = %format!("{}/{}", a.local, a.prefixlen),
+                    "LAN too large to auto-scan; skipped (mesh_targets still covered)",
+                );
                 continue;
             }
             if let Some(cidr) = ipv4_network_cidr(&a.local, a.prefixlen) {
