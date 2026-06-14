@@ -295,7 +295,7 @@ fn peer_row<'a>(
 
 pub fn fetch_status() -> Result<StorageStatus, String> {
     let out = std::process::Command::new("mackesd")
-        .args(["mesh-fs-status", "--json"])
+        .args(["mesh-fs-status"])
         .output()
         .map_err(|e| format!("mackesd mesh-fs-status failed to spawn: {e}"))?;
     // Exit 1 means master unreachable — still parse the JSON.

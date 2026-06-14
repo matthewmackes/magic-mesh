@@ -1332,7 +1332,7 @@ fn load_meshfs_health() -> Task<Message> {
     Task::perform(
         async {
             std::process::Command::new("mackesd")
-                .args(["mesh-fs-status", "--json"])
+                .args(["mesh-fs-status"])
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
                 .unwrap_or_default()
