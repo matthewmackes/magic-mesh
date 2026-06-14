@@ -89,6 +89,12 @@ pub enum Message {
         group: Group,
         panel: &'static str,
     },
+    /// GUI-RECONNECT — periodic Bus liveness tick (fires the probe).
+    ReconnectTick,
+    /// GUI-RECONNECT — Bus liveness probe result. A `false→true`
+    /// transition re-loads the active panel so it recovers after a
+    /// `systemctl restart mackesd` without a manual refresh.
+    ReconnectProbed(bool),
     /// Keyboard / chord-bar generated key. Translated by
     /// [`crate::keyboard::interpret_key`] before landing here.
     KeyPressed(KeyAction),
@@ -271,6 +277,11 @@ pub struct App {
     view: View,
     sidebar: SidebarState,
     focused_pane: Pane,
+    /// GUI-RECONNECT — last known Bus/mackesd reachability. A down→up
+    /// transition (the control plane came back after a restart) re-fires
+    /// the active panel's load so its data recovers without a manual
+    /// refresh. Starts optimistic (`true`).
+    bus_reachable: bool,
     backend: Arc<dyn Backend>,
     themes: themes_panel::ThemesPanel,
     fonts: fonts_panel::FontsPanel,
@@ -400,6 +411,7 @@ impl App {
             view: View::default(),
             sidebar: SidebarState::new(),
             focused_pane: Pane::Sidebar,
+            bus_reachable: true,
             backend,
             themes: themes_panel::ThemesPanel::new(),
             fonts: fonts_panel::FontsPanel::new(),
@@ -729,6 +741,12 @@ impl App {
             // E0.3.1.b — Nebula signals now arrive over the mesh Bus
             // event topic, not D-Bus; this polls them into DbusEvents.
             home_panel::nebula_event_subscription(),
+            // GUI-RECONNECT — a slow Bus liveness tick. On a down→up
+            // transition (mackesd came back) the handler re-loads the
+            // active panel, so panels recover on their own instead of
+            // showing a stale "mesh service isn't answering" until a
+            // manual refresh.
+            cosmic::iced::time::every(Duration::from_secs(10)).map(|_| Message::ReconnectTick),
         ];
         // E6.10 — sample Compute instance CPU/mem only while that view is
         // active, so virsh/podman stats aren't polled when the operator is
@@ -935,6 +953,23 @@ impl App {
             Message::Wallpaper(msg) => self.wallpaper.update(msg, self.backend()),
             Message::WindowControl(action) => Self::dispatch_window_action(action),
             Message::Noop => Task::none(),
+            // GUI-RECONNECT — fire the cheap Bus liveness probe.
+            Message::ReconnectTick => {
+                Task::perform(probe_bus_reachable(), Message::ReconnectProbed)
+            }
+            // GUI-RECONNECT — on a down→up transition, re-load the active
+            // panel so its data recovers on its own. No reload while the
+            // Bus stays healthy (no flicker / no clobbered input).
+            Message::ReconnectProbed(reachable) => {
+                let recovered = reachable && !self.bus_reachable;
+                self.bus_reachable = reachable;
+                if recovered {
+                    if let View::Panel { group, panel } = self.view {
+                        return self.on_panel_navigated(group, panel);
+                    }
+                }
+                Task::none()
+            }
         }
     }
 
@@ -1583,6 +1618,23 @@ impl Application for App {
 /// name it honestly. Returns `None` for panels that already have a
 /// reducer (they never reach the catch-all) or that carry no tracked
 /// follow-up.
+/// GUI-RECONNECT — a cheap Bus liveness probe: ask mackesd for `healthz`
+/// over the shared Bus with a short timeout. `true` ⇒ the control plane
+/// answered. Bounded (3 s) so a wedged/absent responder can never hang the
+/// GUI; the child inherits `MDE_BUS_ROOT` from the session so it hits the
+/// same spool the daemon serves.
+async fn probe_bus_reachable() -> bool {
+    tokio::task::spawn_blocking(|| {
+        std::process::Command::new("mde-bus")
+            .args(["request", "action/shell/healthz", "--timeout-secs", "3"])
+            .output()
+            .map(|o| o.status.success() && !o.stdout.is_empty())
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false)
+}
+
 fn panel_worklist_item(_group: Group, _panel: &str) -> Option<&'static str> {
     // PLANES-1 (W16) — every plane panel now has a real reducer, so no
     // plane slug reaches the catch-all with a tracked follow-up. The hook
@@ -1650,6 +1702,19 @@ mod tests {
             }
         );
         assert_eq!(app.focused_pane(), Pane::Sidebar);
+    }
+
+    #[test]
+    fn reconnect_probe_tracks_bus_reachability_transition() {
+        // GUI-RECONNECT — the probe result drives `bus_reachable`; a
+        // down→up transition is what triggers the active-panel reload.
+        let mut app = App::new();
+        assert!(app.bus_reachable, "starts optimistic");
+        let _ = app.update(Message::ReconnectProbed(false));
+        assert!(!app.bus_reachable, "probe failure marks the Bus down");
+        // Recovery: false→true flips the flag back (and re-loads the panel).
+        let _ = app.update(Message::ReconnectProbed(true));
+        assert!(app.bus_reachable, "probe success marks the Bus back up");
     }
 
     #[test]
