@@ -47,7 +47,18 @@ pub mod wildcard;
 /// Returns `None` when neither `$XDG_DATA_HOME` nor `$HOME` is set
 /// (e.g. the daemon was launched from a context with no user home).
 /// Callers should fall back to `/var/lib/mde/bus/` in that case.
+///
+/// **`MDE_BUS_ROOT` (SETUP-fix) takes precedence** — it pins a SHARED bus spool
+/// so the root `mackesd` system daemon (responders) and the uid-1000 desktop
+/// GUIs (workbench/applet) land on ONE bus. Without it, `dirs::data_dir()` is
+/// per-HOME (`/root/.local/share/mde/bus` vs `/home/<u>/.local/share/mde/bus`),
+/// so every workbench↔mackesd request/reply times out ("mesh service isn't
+/// answering"). The RPM sets `MDE_BUS_ROOT=/run/mde-bus` for both the unit and
+/// the user session (environment.d) over a sticky 1777 runtime dir.
 #[must_use]
 pub fn default_data_dir() -> Option<std::path::PathBuf> {
+    if let Some(root) = std::env::var_os("MDE_BUS_ROOT") {
+        return Some(std::path::PathBuf::from(root));
+    }
     dirs::data_dir().map(|d| d.join("mde").join("bus"))
 }

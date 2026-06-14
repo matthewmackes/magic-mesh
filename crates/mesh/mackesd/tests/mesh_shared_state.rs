@@ -60,7 +60,10 @@ fn exactly_one_leader_is_elected_across_nodes_on_a_shared_volume() {
     );
     match node_b.tick_once() {
         Some(AcquireResult::HeldBy { leader_id, .. }) => {
-            assert_eq!(leader_id, "peer:a", "second node must follow the real leader");
+            assert_eq!(
+                leader_id, "peer:a",
+                "second node must follow the real leader"
+            );
         }
         other => panic!("second node on the shared lock must follow, got {other:?}"),
     }
@@ -84,7 +87,10 @@ fn a_heartbeat_on_one_node_is_visible_in_another_nodes_directory() {
     // Node "beta" builds its directory view off the shared dir and sees BOTH.
     let svc = DirectoryService::new(shared.path(), None);
     let (count, healthy, _deg, _unreach, _leader) = svc.mesh_health_counts("peer:beta", now);
-    assert_eq!(count, 2, "both peers' heartbeats visible across the shared volume");
+    assert_eq!(
+        count, 2,
+        "both peers' heartbeats visible across the shared volume"
+    );
     assert_eq!(healthy, 2, "both report healthy");
 }
 

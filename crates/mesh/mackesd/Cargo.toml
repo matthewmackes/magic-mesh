@@ -358,6 +358,11 @@ assets = [
     # shared-state volume over the overlay, boot-durable. Run per-node with
     # --master/--chunkserver/--client (see the script header).
     { source = "install-helpers/setup-qnm-shared.sh",    dest = "/usr/libexec/mackesd/setup-qnm-shared",        mode = "755" },
+    # SETUP-fix — SHARED bus spool so the root mackesd daemon + the uid-1000
+    # desktop GUIs share one bus (tmpfiles makes the sticky dir; environment.d
+    # gives the user session the same MDE_BUS_ROOT the unit sets).
+    { source = "packaging/tmpfiles/magic-mesh.conf",     dest = "/usr/lib/tmpfiles.d/magic-mesh.conf",          mode = "644" },
+    { source = "packaging/environment.d/90-mde-bus.conf", dest = "/usr/lib/environment.d/90-mde-bus.conf",       mode = "644" },
     { source = "packaging/systemd/mde-musicd.service", dest = "/usr/lib/systemd/user/mde-musicd.service", mode = "644" },
     # EFF-43 / VV-1 — the voice-stack units, shipped DISABLED (the
     # operator/fleet policy enables them; ExecStartPre regenerates the
@@ -400,6 +405,8 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 # the mackesd supervisor. (mackesd self-gates on a pinned role, so enabling
 # it pre-enrollment is safe — it idles until `found`/`join` pins a role.)
 systemctl enable mackesd.service nebula.service mesh-health.timer >/dev/null 2>&1 || :
+# SETUP-fix — materialize the shared bus dir now (no reboot needed).
+systemd-tmpfiles --create /usr/lib/tmpfiles.d/magic-mesh.conf >/dev/null 2>&1 || :
 [ -d /etc/mackesd ] || install -d -m 0700 /etc/mackesd
 gtk-update-icon-cache -q -f /usr/share/icons/hicolor >/dev/null 2>&1 || :
 update-desktop-database -q >/dev/null 2>&1 || :
