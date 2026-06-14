@@ -152,6 +152,12 @@ impl Persist {
             .map_err(|e| PersistError::Sql(format!("busy_timeout: {e}")))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| PersistError::Sql(format!("schema: {e}")))?;
+        // SETUP-fix — a SHARED spool (MDE_BUS_ROOT) is read+written by both the
+        // root mackesd daemon AND the uid-1000 desktop GUIs, so the spool dir +
+        // sqlite must be cross-uid writable (else the user's request/reply +
+        // index writes are denied → "mesh service isn't answering").
+        relax_shared(&bus_root, true);
+        relax_db(&bus_root);
         Ok(Self { bus_root, conn })
     }
 
@@ -216,6 +222,7 @@ impl Persist {
         let topic_dir = self.bus_root.join(topic);
         std::fs::create_dir_all(&topic_dir)
             .map_err(|e| PersistError::Io(format!("mkdir {}: {e}", topic_dir.display())))?;
+        relax_shared(&topic_dir, true); // SETUP-fix: shared-spool cross-uid writes
 
         let file_name = format!("{ulid}.json");
         let abs_path = topic_dir.join(&file_name);
@@ -254,6 +261,7 @@ impl Persist {
                 abs_path.display()
             ))
         })?;
+        relax_shared(&abs_path, false); // SETUP-fix: shared-spool cross-uid reads
 
         // Index INSERT. If this fails after the file write, the
         // file lingers on disk and detect_divergence will surface
@@ -275,6 +283,7 @@ impl Persist {
                 ],
             )
             .map_err(|e| PersistError::Sql(format!("insert {ulid}: {e}")))?;
+        relax_db(&self.bus_root); // SETUP-fix: the INSERT (re)created sqlite -wal/-shm
 
         // BUS-7.1 + EPIC-BUS-EXT-AUDIT-BUS (Q28) — emit a metadata-only
         // audit record to the `audit/<peer>` Bus topic (uniform
@@ -475,6 +484,32 @@ impl DivergenceReport {
 /// `$HOSTNAME` env, then `/proc/sys/kernel/hostname`, then
 /// falls back to the literal `"mde-bus"` (same fallback chain
 /// the mDNS discovery hostname uses for symmetry).
+/// SETUP-fix — when `MDE_BUS_ROOT` pins a SHARED spool (the root mackesd daemon
+/// and the uid-1000 desktop GUIs use ONE bus), relax a freshly-created bus path
+/// to cross-uid writable: `0o777` dirs / `0o666` files. No-op on the per-user
+/// default spool (no env). The bus carries mesh **control** messages, not
+/// secrets (those live in the CA + QNM-Shared), so a world-rw runtime spool on a
+/// single-operator node is an accepted trade — see docs/design/magic-setup-wizard.md.
+#[cfg(unix)]
+fn relax_shared(path: &std::path::Path, dir: bool) {
+    if std::env::var_os("MDE_BUS_ROOT").is_none() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if dir { 0o777 } else { 0o666 };
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+#[cfg(not(unix))]
+fn relax_shared(_path: &std::path::Path, _dir: bool) {}
+
+/// Relax the sqlite index + its WAL/SHM sidecars (created lazily by sqlite) for
+/// the shared spool, so both uids can write the index.
+fn relax_db(bus_root: &std::path::Path) {
+    relax_shared(&bus_root.join("index.sqlite"), false);
+    relax_shared(&bus_root.join("index.sqlite-wal"), false);
+    relax_shared(&bus_root.join("index.sqlite-shm"), false);
+}
+
 fn publisher_id() -> String {
     if let Ok(v) = std::env::var("HOSTNAME") {
         let t = v.trim();
