@@ -107,9 +107,9 @@ pub fn publish_link_rtt(sample: &LinkRtt) {
         return;
     };
     let topic = rtt_topic(&sample.peer);
-    let _ = Command::new("mde-bus")
-        .args(["publish", &topic, "--body-flag", &body])
-        .spawn();
+    let mut cmd = Command::new("mde-bus");
+    cmd.args(["publish", &topic, "--body-flag", &body]);
+    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
 }
 
 /// Measure this peer's Vitelity-link RTT + publish it to

@@ -134,9 +134,9 @@ pub fn revoke_peer(
 fn publish_revoke_event(node_id: &str) {
     let topic = format!("ca/revoke/{node_id}");
     let body = format!(r#"{{"node_id":"{node_id}","ok":true}}"#);
-    let _ = std::process::Command::new("mde-bus")
-        .args(["publish", &topic, "--body-flag", &body])
-        .spawn();
+    let mut cmd = std::process::Command::new("mde-bus");
+    cmd.args(["publish", &topic, "--body-flag", &body]);
+    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
 }
 
 #[cfg(test)]

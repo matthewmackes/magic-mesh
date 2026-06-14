@@ -4965,12 +4965,15 @@ fn run_serve(
                             m.layout.replace('"', "\\\""),
                             m.autostart,
                         );
-                        let _ = std::process::Command::new("mde-bus")
-                            .arg("publish")
+                        let mut cmd = std::process::Command::new("mde-bus");
+                        cmd.arg("publish")
                             .arg(&topic)
                             .arg("--body-flag")
-                            .arg(&body)
-                            .spawn();
+                            .arg(&body);
+                        mackesd_core::proc_reap::fire_and_reap(
+                            cmd,
+                            mackesd_core::proc_reap::DEFAULT_REAP_TIMEOUT,
+                        );
                     }
                 }
                 Err(e) => {

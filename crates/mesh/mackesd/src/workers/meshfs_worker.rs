@@ -620,9 +620,9 @@ impl MeshFsWorker {
             let body = format!(
                 r#"{{"ok":true,"min_avail_bytes":{min_avail},"hard_bytes":{hard},"soft_bytes":{soft}}}"#
             );
-            let _ = Command::new("mde-bus")
-                .args(["publish", "meshfs/quota-warning", "--body-flag", &body])
-                .spawn();
+            let mut cmd = Command::new("mde-bus");
+            cmd.args(["publish", "meshfs/quota-warning", "--body-flag", &body]);
+            crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
         }
     }
 
@@ -1280,9 +1280,9 @@ fn default_meshfs_bus_root() -> Option<PathBuf> {
 /// No-ops when `mde-bus` isn't on PATH.
 fn publish_meshfs_event(topic: &str, body: &str) {
     if binary_on_path("mde-bus") {
-        let _ = Command::new("mde-bus")
-            .args(["publish", topic, "--body-flag", body])
-            .spawn();
+        let mut cmd = Command::new("mde-bus");
+        cmd.args(["publish", topic, "--body-flag", body]);
+        crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
     }
 }
 

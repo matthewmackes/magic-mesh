@@ -160,6 +160,10 @@ pub mod voice;
 // Vitelity SIP edge + publishes `voip/link-rtt/<peer>`. Consumed by the
 // `mackesd voip-rtt` CLI (VOIP-4.a) + the 60s broadcast worker (VOIP-4.b).
 pub mod voip_rtt;
+// Fire-and-forget subprocess reaping — prevents the `mde-bus publish` zombie
+// pile (the live-mesh wedge). Non-gated so the always-compiled `ca::revoke` +
+// `voip_rtt` callers can use it in a no-default-features build.
+pub mod proc_reap;
 pub mod worker;
 /// E1.2 — role-gated worker subsets (which workers `run_serve` spawns per role).
 pub mod worker_role;

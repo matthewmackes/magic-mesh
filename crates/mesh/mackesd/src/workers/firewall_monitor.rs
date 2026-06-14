@@ -364,9 +364,9 @@ fn publish_firewall_alert(host: &str, src_ip: &str, count: usize) {
     let topic = format!("event/firewall/{host}");
     let body =
         format!(r#"{{"host":"{host}","src_ip":"{src_ip}","denial_count":{count},"alert":true}}"#);
-    let _ = Command::new("mde-bus")
-        .args(["publish", &topic, "--body-flag", &body])
-        .spawn();
+    let mut cmd = Command::new("mde-bus");
+    cmd.args(["publish", &topic, "--body-flag", &body]);
+    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
 }
 
 #[async_trait::async_trait]

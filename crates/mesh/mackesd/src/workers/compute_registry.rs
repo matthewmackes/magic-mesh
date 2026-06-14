@@ -434,9 +434,9 @@ pub fn publish_inventory(peer: &str, inv: &Inventory) {
     let Ok(body) = serde_json::to_string(inv) else {
         return;
     };
-    let _ = Command::new("mde-bus")
-        .args(["publish", &topic, "--body-flag", &body])
-        .spawn();
+    let mut cmd = Command::new("mde-bus");
+    cmd.args(["publish", &topic, "--body-flag", &body]);
+    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
 }
 
 /// One VM state-change event published to `compute/event/<peer>` when
@@ -499,9 +499,9 @@ pub fn publish_event(peer: &str, ev: &ComputeEvent) {
     let Ok(body) = serde_json::to_string(ev) else {
         return;
     };
-    let _ = Command::new("mde-bus")
-        .args(["publish", &topic, "--body-flag", &body])
-        .spawn();
+    let mut cmd = Command::new("mde-bus");
+    cmd.args(["publish", &topic, "--body-flag", &body]);
+    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
 }
 
 /// Collect VM entries via virsh. `prev` carries cumulative
