@@ -363,6 +363,9 @@ assets = [
     # gives the user session the same MDE_BUS_ROOT the unit sets).
     { source = "packaging/tmpfiles/magic-mesh.conf",     dest = "/usr/lib/tmpfiles.d/magic-mesh.conf",          mode = "644" },
     { source = "packaging/environment.d/90-mde-bus.conf", dest = "/usr/lib/environment.d/90-mde-bus.conf",       mode = "644" },
+    # Same split-brain fix for the QNM-Shared mount: the user session gets the
+    # MDE_WORKGROUP_ROOT the unit sets, so GUI panels read the daemon's mount.
+    { source = "packaging/environment.d/90-mde-workgroup.conf", dest = "/usr/lib/environment.d/90-mde-workgroup.conf", mode = "644" },
     { source = "packaging/systemd/mde-musicd.service", dest = "/usr/lib/systemd/user/mde-musicd.service", mode = "644" },
     # EFF-43 / VV-1 — the voice-stack units, shipped DISABLED (the
     # operator/fleet policy enables them; ExecStartPre regenerates the

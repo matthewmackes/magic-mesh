@@ -19,6 +19,14 @@ Type=simple
 # user session gets the same value via /usr/lib/environment.d/90-mde-bus.conf;
 # the sticky 1777 dir is created by tmpfiles (magic-mesh.conf).
 Environment=MDE_BUS_ROOT=/run/mde-bus
+# SETUP-fix — SHARED QNM-Shared mount so this root daemon and the uid-1000
+# desktop GUIs resolve the SAME mesh-storage path. The code default is
+# ~/QNM-Shared (HOME-relative), which splits /root/QNM-Shared (root daemon)
+# from /home/<u>/QNM-Shared (workbench) — and /root is 0750 so the GUI can't
+# even traverse it. Pinning a neutral mount (mounted with allow_other +
+# user_allow_other) lets both uids read the one LizardFS volume. The user
+# session gets the same value via environment.d/90-mde-workgroup.conf.
+Environment=MDE_WORKGROUP_ROOT=/mnt/mesh-storage
 ExecStart=/usr/bin/mackesd serve
 # ENT-2: serve fails closed without a pinned role — that's a
 # configuration error, not a crash loop; on-failure still retries

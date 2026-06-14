@@ -22,7 +22,10 @@
 # F43 lizardfs RPMs on PATH/installed first (the F43 client binary runs on F44).
 set -euo pipefail
 
-MASTER_IP=10.42.0.1; LISTEN=""; QNM_PATH=/root/QNM-Shared; GOAL=2
+# Neutral, world-traversable mount (parent /mnt is 0755) so the root mackesd
+# daemon AND the uid-1000 desktop GUIs share one volume — /root/QNM-Shared is
+# unreadable to the GUI because /root is 0750. Pin MDE_WORKGROUP_ROOT to this.
+MASTER_IP=10.42.0.1; LISTEN=""; QNM_PATH=/mnt/mesh-storage; GOAL=2
 DO_MASTER=0; DO_CHUNK=0; DO_CLIENT=0
 while [ $# -gt 0 ]; do case "$1" in
   --master) DO_MASTER=1; shift;;
@@ -101,6 +104,16 @@ if [ "$DO_CLIENT" = 1 ]; then
   log "QNM-Shared client mount at $QNM_PATH -> $MASTER_IP"
   command -v mfsmount >/dev/null || { echo "mfsmount missing (install lizardfs-client; F44: the F43 client RPM)"; exit 1; }
   echo "$MASTER_IP" > /etc/mackesd-qnm-master 2>/dev/null || true
+  # allow_other lets the uid-1000 desktop GUIs read the root-owned FUSE mount;
+  # it requires user_allow_other in /etc/fuse.conf. Enable it idempotently.
+  if [ -f /etc/fuse.conf ] && ! grep -qE '^[[:space:]]*user_allow_other' /etc/fuse.conf; then
+    if grep -qE '^[[:space:]]*#[[:space:]]*user_allow_other' /etc/fuse.conf; then
+      sed -i 's/^[[:space:]]*#[[:space:]]*user_allow_other/user_allow_other/' /etc/fuse.conf
+    else
+      echo user_allow_other >> /etc/fuse.conf
+    fi
+    log "enabled user_allow_other in /etc/fuse.conf"
+  fi
   # A oneshot mount unit ordered after nebula; mackesd is made to wait on it so
   # it never reads a not-yet-mounted QNM-Shared. ExecStartPre waits for the
   # overlay master to answer so a boot race can't fail the mount.
@@ -114,7 +127,7 @@ Before=mackesd.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStartPre=/bin/sh -c 'for i in \$(seq 1 30); do mfsmount -H $MASTER_IP -t 2 /mnt 2>/dev/null && fusermount -u /mnt 2>/dev/null && exit 0; sleep 2; done; exit 0'
-ExecStart=/bin/sh -c 'mountpoint -q $QNM_PATH || mfsmount $QNM_PATH -H $MASTER_IP'
+ExecStart=/bin/sh -c 'mountpoint -q $QNM_PATH || mfsmount $QNM_PATH -H $MASTER_IP -o allow_other'
 ExecStop=/bin/sh -c 'fusermount -u $QNM_PATH 2>/dev/null || umount -l $QNM_PATH 2>/dev/null || true'
 Restart=on-failure
 RestartSec=5
