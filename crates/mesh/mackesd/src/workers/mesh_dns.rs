@@ -111,16 +111,29 @@ pub fn merge_hosts(existing: &str, records: &[MeshHost]) -> String {
 pub struct MeshDnsWorker {
     store_db: Option<PathBuf>,
     hosts_path: PathBuf,
+    /// QNM-Shared root — the worker resolves `<host>.mesh` from the
+    /// replicated directory (peer records carry their own overlay IP),
+    /// not the local SQLite roster, which is empty on a peer.
+    workgroup_root: PathBuf,
 }
 
 impl MeshDnsWorker {
-    /// `store_db` is the roster source — peers resolve from the SQLite mirror.
+    /// `store_db` is the leader's roster fallback; the directory under the
+    /// resolved QNM-Shared root is the primary `<host>.mesh` source.
     #[must_use]
     pub fn new(store_db: Option<PathBuf>) -> Self {
         Self {
             store_db,
             hosts_path: PathBuf::from("/etc/hosts"),
+            workgroup_root: crate::default_qnm_shared_root(),
         }
+    }
+
+    /// Test seam — point the directory read at a fixture root.
+    #[must_use]
+    pub fn with_workgroup_root(mut self, p: PathBuf) -> Self {
+        self.workgroup_root = p;
+        self
     }
 
     /// Test seam — redirect the hosts file.
@@ -130,20 +143,32 @@ impl MeshDnsWorker {
         self
     }
 
-    /// (hostname, overlay_ip) from the roster mirror.
+    /// `(hostname, overlay_ip)` for every peer with a known overlay IP —
+    /// read from the replicated directory (the same source the Workbench
+    /// Mesh DNS panel shows). The directory joins each peer's own recorded
+    /// overlay IP with the leader's roster mirror as a fallback, so this
+    /// is populated on every node, not just the signer. (Was: the local
+    /// SQLite roster, empty on a peer → an empty `/etc/hosts` block → the
+    /// bug where `<host>.mesh` never resolved from the terminal.)
     fn peers(&self) -> Vec<(String, String)> {
-        self.store_db
-            .as_ref()
-            .and_then(|db| {
-                rusqlite::Connection::open_with_flags(
-                    db,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                )
-                .ok()
+        let svc = crate::ipc::directory::DirectoryService::new(
+            &self.workgroup_root,
+            self.store_db.clone(),
+        );
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        svc.build_directory(now_ms)["peers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| {
+                Some((
+                    p["hostname"].as_str()?.to_string(),
+                    p["overlay_ip"].as_str()?.to_string(),
+                ))
             })
-            .and_then(|conn| crate::nebula_roster::export_roster(&conn).ok())
-            .map(|rows| rows.into_iter().map(|r| (r.name, r.overlay_ip)).collect())
-            .unwrap_or_default()
+            .collect()
     }
 
     fn sync(&self) {
@@ -246,8 +271,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let hosts = tmp.path().join("hosts");
         std::fs::write(&hosts, "127.0.0.1 localhost\n").unwrap();
-        // No store_db → empty roster → no block, file unchanged.
-        let w = MeshDnsWorker::new(None).with_hosts_path(hosts.clone());
+        // No store_db + an empty workgroup root → empty directory → no
+        // block, file unchanged.
+        let w = MeshDnsWorker::new(None)
+            .with_hosts_path(hosts.clone())
+            .with_workgroup_root(tmp.path().join("empty-wg"));
         w.sync();
         assert_eq!(
             std::fs::read_to_string(&hosts).unwrap(),
