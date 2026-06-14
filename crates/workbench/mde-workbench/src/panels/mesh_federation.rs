@@ -1416,7 +1416,7 @@ impl MeshFederationPanel {
                 ..Default::default()
             })
             .on_press(crate::Message::SelectPanel {
-                group: crate::model::Group::Network,
+                group: crate::model::Group::Mesh,
                 panel: "mesh_bus",
             })
             .into();

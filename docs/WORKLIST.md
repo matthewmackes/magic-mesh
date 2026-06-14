@@ -161,8 +161,8 @@ NET-INTROSPECT security verdict CLEAN (loopback-only debug-SSH, Ed25519 0600, no
 
 Surfaced standing up a fresh `magic-mesh` across 2 public-IP cloud lighthouses + 2 NAT'd LAN peers (operator-directed test). Both are real; logged before continuing the hand-assembled test mesh.
 
-- [ ] **MESH-1 · DESIGN/SEC · enrollment has no network bootstrap — remote/NAT'd peers can't self-join.** `nebula_enroll` is *QNM-Shared-mediated only*: the peer writes `pending-enroll.json` to the shared volume, the lighthouse auto-signer writes the bundle back (error path literally says "Check QNM-Shared is mounted + writable"). A fresh peer must therefore *already* share QNM-Shared (LizardFS/NFS) with the lighthouse — but QNM-Shared rides the overlay, and you can't reach the overlay until enrolled → chicken-and-egg with no built-in resolver. The join token carries the lighthouse's public addr but enroll never uses it for the *signing handshake* (only for the later `static_host_map`). bed-mesh "worked" only because the co-located cloud pair NFS-shared QNM-Shared out-of-band; the LAN peers needed a `fuse-sshfs` bridge hack. **FINISH:** add a network enrollment path — lighthouse exposes a CSR-sign endpoint on its public IP (reuse the nebula-https-tunnel :443 / bearer-authed) so a remote peer submits its CSR + gets the signed bundle over the network, *then* mounts QNM-Shared over the overlay for steady state. The shared-FS path is fine for co-located nodes; it cannot be the only path for a public-lighthouse mesh.
-- [ ] **MESH-2 · BUG · peer materialized the lighthouse `static_host_map` with a LOCAL interface IP.** On the `fedora` peer, `nebula_supervisor` rendered `/etc/nebula/config.yaml` as `"10.42.0.1": ["192.168.122.1:4242"]` — `192.168.122.1` is the peer's own libvirt `virbr0`, not the lighthouse's public `45.55.33.179`. The received bundle was CORRECT (`external_addr: 45.55.33.179:4242`); the render clobbered it with a locally-detected address → nebula dials a dead end, overlay never forms (100% loss). The co-located cloud peer `.51` rendered correctly (it has no libvirt/global-scope local IP to mis-pick). **FINISH:** root-cause the static_host_map render — the lighthouse entry must use `bundle.lighthouses[].external_addr`, never a locally-detected interface address; add a render test pinning a non-self lighthouse entry to the bundle's external_addr even when the local host has a global-scope private IP (libvirt/docker bridges).
+- [✓] **MESH-1 · DESIGN/SEC · enrollment has no network bootstrap — remote/NAT'd peers can't self-join.** `nebula_enroll` is *QNM-Shared-mediated only*: the peer writes `pending-enroll.json` to the shared volume, the lighthouse auto-signer writes the bundle back (error path literally says "Check QNM-Shared is mounted + writable"). A fresh peer must therefore *already* share QNM-Shared (LizardFS/NFS) with the lighthouse — but QNM-Shared rides the overlay, and you can't reach the overlay until enrolled → chicken-and-egg with no built-in resolver. The join token carries the lighthouse's public addr but enroll never uses it for the *signing handshake* (only for the later `static_host_map`). bed-mesh "worked" only because the co-located cloud pair NFS-shared QNM-Shared out-of-band; the LAN peers needed a `fuse-sshfs` bridge hack. **FINISH:** add a network enrollment path — lighthouse exposes a CSR-sign endpoint on its public IP (reuse the nebula-https-tunnel :443 / bearer-authed) so a remote peer submits its CSR + gets the signed bundle over the network, *then* mounts QNM-Shared over the overlay for steady state. The shared-FS path is fine for co-located nodes; it cannot be the only path for a public-lighthouse mesh.
+- [✓] **MESH-2 · BUG · peer materialized the lighthouse `static_host_map` with a LOCAL interface IP.** On the `fedora` peer, `nebula_supervisor` rendered `/etc/nebula/config.yaml` as `"10.42.0.1": ["192.168.122.1:4242"]` — `192.168.122.1` is the peer's own libvirt `virbr0`, not the lighthouse's public `45.55.33.179`. The received bundle was CORRECT (`external_addr: 45.55.33.179:4242`); the render clobbered it with a locally-detected address → nebula dials a dead end, overlay never forms (100% loss). The co-located cloud peer `.51` rendered correctly (it has no libvirt/global-scope local IP to mis-pick). **FINISH:** root-cause the static_host_map render — the lighthouse entry must use `bundle.lighthouses[].external_addr`, never a locally-detected interface address; add a render test pinning a non-self lighthouse entry to the bundle's external_addr even when the local host has a global-scope private IP (libvirt/docker bridges).
 
 ## ONBOARD — Magic onboarding: network enrollment + zero-friction join (design: docs/design/magic-onboarding.md, 2026-06-13)
 
@@ -565,7 +565,7 @@ Scope (measured 2026-06-13): `mde-workbench` 47.9k lines / 94 files on crates.io
 
 ### NAV-1 — MDE Workbench navigation grouping redesign
 Design: docs/design/workbench-nav-grouping.md (15-question survey locked 2026-06-14).
-- [ ] **NAV-1.1: Workbench — regroup the left nav to the 9 locked sections**
+- [✓] **NAV-1.1: Workbench — regroup the left nav to the 9 locked sections**
   **As** a mesh operator,
   **I want** the Workbench nav organized scope→function (Overview · This Node ·
   Mesh · Fleet · Provisioning · Monitoring · System[=Config+Maintain+Help]) with
@@ -576,3 +576,14 @@ Design: docs/design/workbench-nav-grouping.md (15-question survey locked 2026-06
     - [ ] no duplicate/ambiguous labels (no three "Inventory"s); renames applied (Mackes Bus→Message Bus, etc.)
     - [ ] every retained panel routes to its working view; deferred desktop panels gone from nav
     - [ ] Group::all() order matches the lock; from_slug round-trips; cargo test -p mde-workbench green
+- [ ] **NAV-1.2: delete the deferred desktop panel modules + wire the Cosmic hand-off**
+  **As** a maintainer,
+  **I want** the desktop-settings panels (apps/displays/keyboard/mouse/power/session/
+  sound/printers/removable/themes/fonts/wallpaper/sync_status/datetime/system_update/
+  notifications) removed from the workbench and owned by Cosmic Settings,
+  **so that** the hidden `Group::Desktop` placeholder + its panel modules stop being
+  dead weight (NAV-1.1 left them deep-link-reachable to avoid orphaning).
+  **Acceptance** (runtime-observable):
+    - [ ] the `Desktop` group + its nav entry are gone; `Group::all()` is the 7 visible sections
+    - [ ] each deferred panel module + its Message/update/view/load wiring is deleted (or moved to Cosmic)
+    - [ ] no dead `pub mod`/unreachable panel remains; cargo test -p mde-workbench green

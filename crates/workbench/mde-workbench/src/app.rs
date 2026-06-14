@@ -733,25 +733,14 @@ impl App {
         // E6.10 — sample Compute instance CPU/mem only while that view is
         // active, so virsh/podman stats aren't polled when the operator is
         // elsewhere.
-        if self.view.group() == Group::Compute {
+        if self.view.panel_slug() == Some("instances") {
             subs.push(compute_panel::ComputePanel::sample_subscription());
         }
         // PD-8 (L14) / PLANES-1 — Netdata sampling only while the Peers
         // directory is the active view (the Compute pattern). The Front
         // Door is reachable as the Peers plane root/panel or the
         // Controller/Inventory door.
-        if matches!(
-            self.view,
-            View::Group(Group::Peers)
-                | View::Panel {
-                    group: Group::Peers,
-                    panel: "peers"
-                }
-                | View::Panel {
-                    group: Group::Controller,
-                    panel: "peers"
-                }
-        ) {
+        if self.view.panel_slug() == Some("peers") {
             subs.push(peers_panel::metrics_subscription());
             // PD-3/Q10 — refresh the directory itself every 30 s while
             // the Front Door is open, so presence/health/tags stay live.
@@ -800,9 +789,12 @@ impl App {
             // role the operator drilled into. The filter is set before the
             // load resolves; the Peers Loaded handler preserves it.
             Message::DrillToPeers(role) => {
-                self.view = View::Group(Group::Peers);
+                self.view = View::Panel {
+                    group: Group::Mesh,
+                    panel: "peers",
+                };
                 self.focused_pane = Pane::Main;
-                let task = self.on_group_navigated(Group::Peers);
+                let task = self.on_panel_navigated(Group::Mesh, "peers");
                 self.peers.filter = role;
                 task
             }
@@ -961,117 +953,107 @@ impl App {
     /// CB-1.6 — when the user lands on a known panel, kick off
     /// the panel's initial load. Unknown panels (no Iced view
     /// shipped yet) just no-op.
-    fn on_panel_navigated(&self, group: Group, panel: &'static str) -> Task<Message> {
-        match (group, panel) {
-            (Group::LookAndFeel, "themes") => themes_panel::ThemesPanel::load(),
-            (Group::LookAndFeel, "fonts") => fonts_panel::FontsPanel::load(self.backend()),
-            (Group::LookAndFeel, "wallpaper") => {
-                wallpaper_panel::WallpaperPanel::load(self.backend())
-            }
-            (Group::Devices, "session") => session_panel::SessionPanel::load(self.backend()),
-            (Group::System, "notifications") => {
-                notifications_panel::NotificationsPanel::load(self.backend())
-            }
-            (Group::Devices, "power") => power_panel::PowerPanel::load(self.backend()),
-            (Group::Devices, "removable") => removable_panel::RemovablePanel::load(self.backend()),
-            (Group::Devices, "displays") => displays_panel::DisplaysPanel::load(self.backend()),
-            (Group::Devices, "keyboard") => keyboard_panel::KeyboardPanel::load(self.backend()),
-            (Group::Devices, "mouse") => mouse_panel::MousePanel::load(self.backend()),
-            (Group::Devices, "sound") => sound_panel::SoundPanel::load(),
-            (Group::Devices, "printers") => printers_panel::PrintersPanel::load(),
-            (Group::Devices, "music") => music_panel::MusicPanel::load(),
+    fn on_panel_navigated(&self, _group: Group, panel: &'static str) -> Task<Message> {
+        match panel {
+            "themes" => themes_panel::ThemesPanel::load(),
+            "fonts" => fonts_panel::FontsPanel::load(self.backend()),
+            "wallpaper" => wallpaper_panel::WallpaperPanel::load(self.backend()),
+            "session" => session_panel::SessionPanel::load(self.backend()),
+            "notifications" => notifications_panel::NotificationsPanel::load(self.backend()),
+            "power" => power_panel::PowerPanel::load(self.backend()),
+            "removable" => removable_panel::RemovablePanel::load(self.backend()),
+            "displays" => displays_panel::DisplaysPanel::load(self.backend()),
+            "keyboard" => keyboard_panel::KeyboardPanel::load(self.backend()),
+            "mouse" => mouse_panel::MousePanel::load(self.backend()),
+            "sound" => sound_panel::SoundPanel::load(),
+            "printers" => printers_panel::PrintersPanel::load(),
+            "music" => music_panel::MusicPanel::load(),
             // v4.0.1 WB-1 (Phase 0.7 rescue): Connected Devices
             // panel. Real D-Bus subscription wiring chains on
             // KDC2-3.9 signals; the panel.load() returns
             // Task::none today.
-            (Group::Devices, "connect") => connect_panel::ConnectPanel::load(),
+            "connect" => connect_panel::ConnectPanel::load(),
             // PLANES-1 — Fleet keeps the rollup lens + fleet inventory;
             // the operational panels re-home into the planes.
-            (Group::Fleet, "inventory") => inventory_panel::InventoryPanel::load(),
-            (Group::Fleet, "fleet_rollup") => fleet_rollup_panel::FleetRollupPanel::load(),
-            (Group::ThisNode, "hardware") => hardware_panel::HardwarePanel::load(),
-            (Group::ThisNode, "config_apply") => config_apply_panel::ConfigApplyPanel::load(),
-            (Group::ThisNode, "registration") => registration_panel::RegistrationPanel::load(),
-            (Group::Controller, "jobs") => jobs_panel::JobsPanel::load(),
-            (Group::Provisioning, "node_roles") => node_roles_panel::NodeRolesPanel::load(),
-            (Group::Controller, "playbooks") => playbooks_panel::PlaybooksPanel::load(),
-            (Group::Controller, "run_history") => run_history_panel::RunHistoryPanel::load(),
-            (Group::System, "datetime") => datetime_panel::DateTimePanel::load(),
-            (Group::Apps, "default_apps") => default_apps_panel::DefaultAppsPanel::load(),
-            (Group::Maintain, "snapshots") => snapshots_panel::SnapshotsPanel::load(),
-            (Group::System, "logs") => logs_panel::LogsPanel::load(),
-            (Group::System, "resources") => resources_panel::ResourcesPanel::load(),
-            (Group::System, "system_update") => system_update_panel::SystemUpdatePanel::load(),
+            "inventory" => inventory_panel::InventoryPanel::load(),
+            "fleet_rollup" => fleet_rollup_panel::FleetRollupPanel::load(),
+            "hardware" => hardware_panel::HardwarePanel::load(),
+            "config_apply" => config_apply_panel::ConfigApplyPanel::load(),
+            "registration" => registration_panel::RegistrationPanel::load(),
+            "jobs" => jobs_panel::JobsPanel::load(),
+            "node_roles" => node_roles_panel::NodeRolesPanel::load(),
+            "playbooks" => playbooks_panel::PlaybooksPanel::load(),
+            "run_history" => run_history_panel::RunHistoryPanel::load(),
+            "datetime" => datetime_panel::DateTimePanel::load(),
+            "default_apps" => default_apps_panel::DefaultAppsPanel::load(),
+            "snapshots" => snapshots_panel::SnapshotsPanel::load(),
+            "logs" => logs_panel::LogsPanel::load(),
+            "resources" => resources_panel::ResourcesPanel::load(),
+            "system_update" => system_update_panel::SystemUpdatePanel::load(),
             // v4.0.1 WB-2.f — auto-run probes on first nav so
             // the panel lands populated rather than empty.
-            (Group::ThisNode, "health_check") => health_check_panel::HealthCheckPanel::load(),
+            "health_check" => health_check_panel::HealthCheckPanel::load(),
             // PLANES-11 — Drift folds into Controller/Remediation.
-            (Group::Controller, "drift") => drift_panel::DriftPanel::load(),
+            "drift" => drift_panel::DriftPanel::load(),
             // PLANES-13 — the policy engine surface.
-            (Group::Controller, "policy") => policy_panel::PolicyPanel::load(),
+            "policy" => policy_panel::PolicyPanel::load(),
             // PLANES-15 — the netstate desired-vs-actual diff.
-            (Group::Network, "interfaces") => interfaces_panel::InterfacesPanel::load(),
+            "interfaces" => interfaces_panel::InterfacesPanel::load(),
             // PLANES-18 — the mesh DNS record set.
-            (Group::Network, "dns") => dns_panel::DnsPanel::load(),
+            "dns" => dns_panel::DnsPanel::load(),
             // PLANES-19 — the overlay-reachability validation verdict.
-            (Group::Network, "routing") => routing_panel::RoutingPanel::load(),
+            "routing" => routing_panel::RoutingPanel::load(),
             // PLANES-3/W82 — the fleet capability-tag census.
-            (Group::Fleet, "tags") => tags_panel::TagsPanel::load(),
+            "tags" => tags_panel::TagsPanel::load(),
             // PLANES-21 — the install-profile catalog.
-            (Group::Provisioning, "profiles") => profiles_panel::ProfilesPanel::load(),
+            "profiles" => profiles_panel::ProfilesPanel::load(),
             // PLANES-24 — the package-mirror catalog.
-            (Group::Provisioning, "mirrors") => mirrors_panel::MirrorsPanel::load(),
+            "mirrors" => mirrors_panel::MirrorsPanel::load(),
             // PLANES-22 — the image catalog.
-            (Group::Provisioning, "images") => images_panel::ImagesPanel::load(),
-            (Group::Controller, "audit") => audit_panel::AuditPanel::load(),
-            (Group::ThisNode, "mesh_logs") => mesh_logs_panel::MeshLogsPanel::load(),
-            (Group::Controller, "fleet_logs") => fleet_logs_panel::FleetLogsPanel::load(),
+            "images" => images_panel::ImagesPanel::load(),
+            "audit" => audit_panel::AuditPanel::load(),
+            "mesh_logs" => mesh_logs_panel::MeshLogsPanel::load(),
+            "fleet_logs" => fleet_logs_panel::FleetLogsPanel::load(),
             // PLANES-1 (W52) — Mesh Control gets its own Controller entry.
-            (Group::Controller, "mesh_control") => mesh_control_panel::MeshControlPanel::load(),
+            "mesh_control" => mesh_control_panel::MeshControlPanel::load(),
             // v4.0.1 WB-2.i — scan probe.json cache for pending peers.
-            (Group::Network, "mesh_pending") => mesh_pending_panel::MeshPendingPanel::load(),
+            "mesh_pending" => mesh_pending_panel::MeshPendingPanel::load(),
             // v4.0.1 WB-2.d — load applet visibility from panel.toml.
-            (Group::Apps, "panel") => panel_apps_panel::PanelAppsPanel::load(),
+            "panel" => panel_apps_panel::PanelAppsPanel::load(),
             // v4.0.1 — panel.toml sync-status surface (Look & Feel).
-            (Group::LookAndFeel, "sync_status") => sync_status_panel::SyncStatusPanel::load(),
+            "sync_status" => sync_status_panel::SyncStatusPanel::load(),
             // v4.0.1 WB-2.k — peer roster via `mackesd nodes list --json`.
             // MESHFS-13.1 — Mesh Storage status panel.
-            (Group::Network, "mesh_storage") => mesh_storage_panel::MeshStoragePanel::load(),
+            "mesh_storage" => mesh_storage_panel::MeshStoragePanel::load(),
             // MESH-PROBE-9.a — Network Hosts reads the merged probe
             // inventory off mesh-storage on first nav (read-only).
-            (Group::Network, "network_hosts") => network_hosts_panel::NetworkHostsPanel::load(),
+            "network_hosts" => network_hosts_panel::NetworkHostsPanel::load(),
             // PLANES-1 (W4) — Mesh Services folds into This Node/Health.
-            (Group::ThisNode, "mesh_services") => mesh_services_panel::MeshServicesPanel::load(),
+            "mesh_services" => mesh_services_panel::MeshServicesPanel::load(),
             // NF-13.8 (v2.5) — shell-out to
             // mackes.mesh_nebula.published_services_summary
             // for the 7 canonical services + per-row overlay
             // bind state.
-            (Group::Network, "service_publishing") => {
-                service_publishing_panel::ServicePublishingPanel::load()
-            }
+            "service_publishing" => service_publishing_panel::ServicePublishingPanel::load(),
             // v4.0.1 WB-2.l — load cached peer-macs.json on
             // first nav so the known-hosts table is populated.
-            (Group::Network, "remote_desktop") => remote_desktop_panel::RemoteDesktopPanel::load(),
+            "remote_desktop" => remote_desktop_panel::RemoteDesktopPanel::load(),
             // PLANES-1 (W7) — the Peers directory: Front Door plane +
             // the Controller/Inventory door both load it.
-            (Group::Peers, "peers") | (Group::Controller, "peers") => {
-                peers_panel::PeersPanel::load()
-            }
-            (Group::Apps, "installed") => apps_installed_panel::AppsInstalledPanel::load(),
-            (Group::Apps, "sources") => apps_sources_panel::AppsSourcesPanel::load(),
-            (Group::Network, "firewall") => firewall_panel::FirewallPanel::load(),
-            (Group::Network, "wifi") => wifi_panel::WifiPanel::load(),
-            (Group::Network, "mesh_history") => mesh_history_panel::MeshHistoryPanel::load(),
-            (Group::Network, "vpn") => vpn_panel::VpnPanel::load(),
+            "peers" => peers_panel::PeersPanel::load(),
+            "installed" => apps_installed_panel::AppsInstalledPanel::load(),
+            "sources" => apps_sources_panel::AppsSourcesPanel::load(),
+            "firewall" => firewall_panel::FirewallPanel::load(),
+            "wifi" => wifi_panel::WifiPanel::load(),
+            "mesh_history" => mesh_history_panel::MeshHistoryPanel::load(),
+            "vpn" => vpn_panel::VpnPanel::load(),
             // PLANES-1 (W4) — Fleet Revisions folds into Controller/Config.
-            (Group::Controller, "revisions") => fleet_revisions_panel::FleetRevisionsPanel::load(),
+            "revisions" => fleet_revisions_panel::FleetRevisionsPanel::load(),
             // Fleet settings has no Load — it's a push-only
             // surface, so navigation doesn't fan a refresh.
-            (Group::Controller, "settings") => Task::none(),
+            "settings" => Task::none(),
             // TUNE-15.b — Federation pairing panel: load active pairs on nav.
-            (Group::Network, "mesh_federation") => {
-                mesh_federation_panel::MeshFederationPanel::load()
-            }
+            "mesh_federation" => mesh_federation_panel::MeshFederationPanel::load(),
             _ => Task::none(),
         }
     }
@@ -1081,14 +1063,11 @@ impl App {
     /// the Compute root enumerates local VMs/pods on entry (E6.10), so a
     /// jump to it — sidebar click, `--page compute`, See-also link — lands
     /// the instance list already populated.
-    fn on_group_navigated(&self, group: Group) -> Task<Message> {
-        match group {
-            Group::Compute => compute_panel::ComputePanel::load(),
-            // PLANES-1 — the Peers Front Door plane lands on the live
-            // directory (like Compute), not a role card.
-            Group::Peers => peers_panel::PeersPanel::load(),
-            _ => Task::none(),
-        }
+    fn on_group_navigated(&self, _group: Group) -> Task<Message> {
+        // NAV-1 — group roots render the role card; the live directory
+        // (Peers) and the instance list (Compute→Provisioning/Instances)
+        // load via their slug-routed panels, not a group root.
+        Task::none()
     }
 
     fn apply_focus_request(&mut self, slug: &str) -> Task<Message> {
@@ -1237,174 +1216,122 @@ impl App {
             // card (via the View::Group(g) catch-all), matching the other
             // roles; the hub overview dashboard becomes the "Hub" sub-panel
             // below so the Maintain card's Hub action-link opens it.
-            View::Panel {
-                group: Group::Maintain,
-                panel: "hub",
-            } => self.hub.view(),
+            View::Panel { panel: "hub", .. } => self.hub.view(),
             // E6.9 — the Help group root renders the role card (catch-all);
             // its action-links open the help topics index + the About/Help
             // disclaimer surface as sub-panels.
+            View::Panel { panel: "index", .. } => self.help.view(),
+            View::Panel { panel: "about", .. } => crate::panels::about::AboutPanel::view(),
             View::Panel {
-                group: Group::Help,
-                panel: "index",
-            } => self.help.view(),
-            View::Panel {
-                group: Group::Help,
-                panel: "about",
-            } => crate::panels::about::AboutPanel::view(),
-            View::Panel {
-                group: Group::LookAndFeel,
-                panel: "themes",
+                panel: "themes", ..
             } => self.themes.view(),
+            View::Panel { panel: "fonts", .. } => self.fonts.view(),
             View::Panel {
-                group: Group::LookAndFeel,
-                panel: "fonts",
-            } => self.fonts.view(),
-            View::Panel {
-                group: Group::LookAndFeel,
-                panel: "wallpaper",
+                panel: "wallpaper", ..
             } => self.wallpaper.view(),
             View::Panel {
-                group: Group::Devices,
-                panel: "session",
+                panel: "session", ..
             } => self.session.view(),
             View::Panel {
-                group: Group::System,
                 panel: "notifications",
+                ..
             } => self.notifications.view(),
+            View::Panel { panel: "power", .. } => self.power.view(),
             View::Panel {
-                group: Group::Devices,
-                panel: "power",
-            } => self.power.view(),
-            View::Panel {
-                group: Group::Devices,
-                panel: "removable",
+                panel: "removable", ..
             } => self.removable.view(),
             View::Panel {
-                group: Group::Devices,
-                panel: "displays",
+                panel: "displays", ..
             } => self.displays.view(),
             View::Panel {
-                group: Group::Devices,
-                panel: "keyboard",
+                panel: "keyboard", ..
             } => self.keyboard.view(),
+            View::Panel { panel: "mouse", .. } => self.mouse.view(),
+            View::Panel { panel: "sound", .. } => self.sound.view(),
             View::Panel {
-                group: Group::Devices,
-                panel: "mouse",
-            } => self.mouse.view(),
-            View::Panel {
-                group: Group::Devices,
-                panel: "sound",
-            } => self.sound.view(),
-            View::Panel {
-                group: Group::Devices,
-                panel: "printers",
+                panel: "printers", ..
             } => self.printers.view(),
+            View::Panel { panel: "music", .. } => self.music.view(),
             View::Panel {
-                group: Group::Devices,
-                panel: "music",
-            } => self.music.view(),
-            View::Panel {
-                group: Group::Devices,
-                panel: "connect",
+                panel: "connect", ..
             } => self.connect.view(),
             // PLANES-1 — Fleet keeps the rollup lens + fleet inventory.
             View::Panel {
-                group: Group::Fleet,
-                panel: "inventory",
+                panel: "inventory", ..
             } => self.inventory.view(),
             View::Panel {
-                group: Group::Fleet,
                 panel: "fleet_rollup",
+                ..
             } => self.fleet_rollup.view(),
             // This Node plane — registration / inventory / config.
             View::Panel {
-                group: Group::ThisNode,
-                panel: "hardware",
+                panel: "hardware", ..
             } => self.hardware.view(),
             View::Panel {
-                group: Group::ThisNode,
                 panel: "config_apply",
+                ..
             } => self.config_apply.view(),
             View::Panel {
-                group: Group::ThisNode,
                 panel: "registration",
+                ..
             } => self.registration.view(),
             // Controller plane — jobs / playbooks / run history.
+            View::Panel { panel: "jobs", .. } => self.jobs.view(),
             View::Panel {
-                group: Group::Controller,
-                panel: "jobs",
-            } => self.jobs.view(),
-            View::Panel {
-                group: Group::Controller,
-                panel: "playbooks",
+                panel: "playbooks", ..
             } => self.playbooks.view(),
             View::Panel {
-                group: Group::Controller,
                 panel: "run_history",
+                ..
             } => self.run_history.view(),
             // Provisioning plane — node role pins + tags (W58).
             View::Panel {
-                group: Group::Provisioning,
                 panel: "node_roles",
+                ..
             } => self.node_roles.view(),
             View::Panel {
-                group: Group::System,
-                panel: "datetime",
+                panel: "datetime", ..
             } => self.datetime.view(),
             View::Panel {
-                group: Group::Apps,
                 panel: "default_apps",
+                ..
             } => self.default_apps.view(),
             View::Panel {
-                group: Group::Maintain,
-                panel: "snapshots",
+                panel: "snapshots", ..
             } => self.snapshots.view(),
+            View::Panel { panel: "logs", .. } => self.logs.view(),
             View::Panel {
-                group: Group::System,
-                panel: "logs",
-            } => self.logs.view(),
-            View::Panel {
-                group: Group::System,
-                panel: "resources",
+                panel: "resources", ..
             } => self.resources.view(),
             View::Panel {
-                group: Group::System,
                 panel: "system_update",
+                ..
             } => self.system_update.view(),
             View::Panel {
-                group: Group::Maintain,
-                panel: "repair",
+                panel: "repair", ..
             } => self.repair.view(),
             View::Panel {
-                group: Group::Apps,
-                panel: "installed",
+                panel: "installed", ..
             } => self.apps_installed.view(),
             View::Panel {
-                group: Group::Apps,
-                panel: "sources",
+                panel: "sources", ..
             } => self.apps_sources.view(),
             View::Panel {
-                group: Group::Apps,
-                panel: "install",
+                panel: "install", ..
             } => self.apps_install.view(),
             View::Panel {
-                group: Group::Apps,
-                panel: "remove",
+                panel: "remove", ..
             } => self.apps_remove.view(),
             // v4.0.1 WB-2.d (2026-05-23) — Apps → Panel Apps
             // visibility editor (per-applet toggles, writes to
             // ~/.config/mde/panel.toml).
-            View::Panel {
-                group: Group::Apps,
-                panel: "panel",
-            } => self.panel_apps.view(),
+            View::Panel { panel: "panel", .. } => self.panel_apps.view(),
             // v4.0.1 (2026-05-23) — Look & Feel → Panel Sync
             // Status reads panel.toml mtime + mackesd healthz
             // JSON to surface the mesh-sync state.
             View::Panel {
-                group: Group::LookAndFeel,
                 panel: "sync_status",
+                ..
             } => self.sync_status.view(),
             // v4.0.1 WB-2.e (2026-05-23) — the Maintain → Debloat
             // sidebar entry routes to the same curated-bloat-list
@@ -1414,8 +1341,7 @@ impl App {
             // the Apps → Remove path retained as the per-app
             // entry point.
             View::Panel {
-                group: Group::Maintain,
-                panel: "debloat",
+                panel: "debloat", ..
             } => self.apps_remove.view(),
             // v4.0.1 WB-2.f (2026-05-23) — Maintain → Health
             // Check renders the local-probe table (disk space,
@@ -1423,107 +1349,88 @@ impl App {
             // count, parity overlay).
             // PLANES-1 — Health re-homes to This Node (W20).
             View::Panel {
-                group: Group::ThisNode,
                 panel: "health_check",
+                ..
             } => self.health_check.view(),
             // PLANES-12 — Audit re-homes to Controller.
-            View::Panel {
-                group: Group::Controller,
-                panel: "audit",
-            } => self.audit.view(),
+            View::Panel { panel: "audit", .. } => self.audit.view(),
             // PLANES-8 — Logs & Metrics re-home to This Node.
             View::Panel {
-                group: Group::ThisNode,
-                panel: "mesh_logs",
+                panel: "mesh_logs", ..
             } => self.mesh_logs.view(),
             // PLANES-14 — Fleet Logs re-home to Controller.
             View::Panel {
-                group: Group::Controller,
                 panel: "fleet_logs",
+                ..
             } => self.fleet_logs.view(),
             // PLANES-11 — Drift folds into Controller/Remediation.
-            View::Panel {
-                group: Group::Controller,
-                panel: "drift",
-            } => self.drift.view(),
+            View::Panel { panel: "drift", .. } => self.drift.view(),
             // PLANES-13 — the policy engine surface.
             View::Panel {
-                group: Group::Controller,
-                panel: "policy",
+                panel: "policy", ..
             } => self.policy.view(),
             // PLANES-15 — the netstate desired-vs-actual diff.
             View::Panel {
-                group: Group::Network,
                 panel: "interfaces",
+                ..
             } => self.interfaces.view(),
             // PLANES-18 — the mesh DNS record set.
-            View::Panel {
-                group: Group::Network,
-                panel: "dns",
-            } => self.dns.view(),
+            View::Panel { panel: "dns", .. } => self.dns.view(),
             // PLANES-19 — the overlay-reachability validation verdict.
             View::Panel {
-                group: Group::Network,
-                panel: "routing",
+                panel: "routing", ..
             } => self.routing.view(),
             // PLANES-3/W82 — the fleet capability-tag census.
-            View::Panel {
-                group: Group::Fleet,
-                panel: "tags",
-            } => self.tags.view(),
+            View::Panel { panel: "tags", .. } => self.tags.view(),
             // PLANES-21 — the install-profile catalog.
             View::Panel {
-                group: Group::Provisioning,
-                panel: "profiles",
+                panel: "profiles", ..
             } => self.profiles.view(),
             // PLANES-24 — the package-mirror catalog.
             View::Panel {
-                group: Group::Provisioning,
-                panel: "mirrors",
+                panel: "mirrors", ..
             } => self.mirrors.view(),
             // PLANES-22 — the image catalog.
             View::Panel {
-                group: Group::Provisioning,
-                panel: "images",
+                panel: "images", ..
             } => self.images.view(),
             // BUS-7.2 — Mackes Bus 5-tab operator surface.
             View::Panel {
-                group: Group::Network,
-                panel: "mesh_bus",
+                panel: "mesh_bus", ..
             } => self.mesh_bus.view(),
             // TUNE-15.b — Mesh Federation 4-tab pairing surface.
             View::Panel {
-                group: Group::Network,
                 panel: "mesh_federation",
+                ..
             } => self.mesh_federation.view(),
             // v4.0.1 WB-2.h (2026-05-23) — Network → Mesh
             // Control renders the leader-lease state + healthz.
             // PLANES-1 (W52) — Mesh Control gets its own Controller entry.
             View::Panel {
-                group: Group::Controller,
                 panel: "mesh_control",
+                ..
             } => self.mesh_control.view(),
             // v4.0.1 WB-2.i (2026-05-23) — Network → Mesh
             // Pending lists peer-probe rows from
             // $XDG_CACHE_HOME/mde/peers/<id>/probe.json with
             // Accept / Reject buttons.
             View::Panel {
-                group: Group::Network,
                 panel: "mesh_pending",
+                ..
             } => self.mesh_pending.view(),
             // v4.0.1 WB-2.k (2026-05-23) — Network → Mesh
             // Topology renders the peer roster as a sortable
             // table (canvas-graph variant deferred to v4.1).
             // MESHFS-13.1 — Network → Mesh Storage status.
             View::Panel {
-                group: Group::Network,
                 panel: "mesh_storage",
+                ..
             } => self.mesh_storage.view(),
             // MESH-PROBE-9.a — Network → Network Hosts lists the probe
             // inventory (hosts + identified services + trust-state).
             View::Panel {
-                group: Group::Network,
                 panel: "network_hosts",
+                ..
             } => self.network_hosts.view(),
             // v4.0.1 WB-2.j (2026-05-23) — Network → Mesh
             // Services renders systemctl status + start/stop/
@@ -1533,74 +1440,58 @@ impl App {
             // mackesd.
             // PLANES-1 (W4) — Mesh Services folds into This Node/Health.
             View::Panel {
-                group: Group::ThisNode,
                 panel: "mesh_services",
+                ..
             } => self.mesh_services.view(),
             // NF-13.8 (v2.5) — Network → Service Publishing
             // renders the 7 canonical Nebula-published services
             // with overlay-bind status pills.
             View::Panel {
-                group: Group::Network,
                 panel: "service_publishing",
+                ..
             } => self.service_publishing.view(),
             // v4.0.1 WB-2.l (2026-05-23) — Network → Remote
             // Desktop renders cached peer-macs.json hosts +
             // per-host RDP/VNC launch buttons + a manual-entry
             // text field.
             View::Panel {
-                group: Group::Network,
                 panel: "remote_desktop",
+                ..
             } => self.remote_desktop.view(),
             // PD-3 / PLANES-1 (W7) — the Peers directory (the Front
             // Door), one component two doors: the Peers plane root +
             // its panel, and the Controller/Inventory door.
-            View::Group(Group::Peers)
-            | View::Panel {
-                group: Group::Peers,
-                panel: "peers",
-            }
-            | View::Panel {
-                group: Group::Controller,
-                panel: "peers",
-            } => self.peers.view(),
+            // NAV-1 — the Peers directory now lives as the first panel
+            // under the Mesh section (slug-routed).
+            View::Panel { panel: "peers", .. } => self.peers.view(),
             View::Panel {
-                group: Group::Network,
-                panel: "firewall",
+                panel: "firewall", ..
             } => self.firewall.view(),
+            View::Panel { panel: "wifi", .. } => self.wifi.view(),
+            View::Panel { panel: "vpn", .. } => self.vpn.view(),
             View::Panel {
-                group: Group::Network,
-                panel: "wifi",
-            } => self.wifi.view(),
-            View::Panel {
-                group: Group::Network,
-                panel: "vpn",
-            } => self.vpn.view(),
-            View::Panel {
-                group: Group::Network,
-                panel: "mesh_join",
+                panel: "mesh_join", ..
             } => self.mesh_join.view(),
             View::Panel {
-                group: Group::Network,
                 panel: "mesh_history",
+                ..
             } => self.mesh_history.view(),
             // PLANES-1 (W4) — fleet settings + Config (Revisions) re-home
             // to the Controller plane.
             View::Panel {
-                group: Group::Controller,
-                panel: "settings",
+                panel: "settings", ..
             } => self.fleet_settings.view(),
             View::Panel {
-                group: Group::Controller,
-                panel: "revisions",
+                panel: "revisions", ..
             } => self.fleet_revisions.view(),
             // E6.10 — the Compute group root (and its "Instances"
             // sub-panel) render the bespoke local + fleet VM/pod list,
             // not the generic role card: `--page compute` lands directly
             // on the instance enumeration per the E6.10 acceptance.
-            View::Group(Group::Compute)
-            | View::Panel {
-                group: Group::Compute,
-                panel: "instances",
+            // NAV-1 — Compute folds into Provisioning; the Instances panel
+            // (slug-routed) renders the local + fleet VM/pod list.
+            View::Panel {
+                panel: "instances", ..
             } => self.compute.view(),
             // E6.1 — any group-root view without a bespoke landing
             // (Apps / Devices / Fleet / Look & Feel / System, plus
@@ -1746,17 +1637,16 @@ fn panel_under_construction(view: View) -> Element<'static, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::DemoBackend;
 
     #[test]
-    fn new_app_lands_on_the_peers_front_door() {
+    fn new_app_lands_on_overview_home() {
         let app = App::new();
-        // PD-4 / D2 / PLANES-1 — the Front Door, now its own plane.
+        // NAV-1 (Q14) — a plain launch lands on Overview/Home.
         assert_eq!(
             app.current_view(),
             View::Panel {
-                group: Group::Peers,
-                panel: "peers"
+                group: Group::Dashboard,
+                panel: "home"
             }
         );
         assert_eq!(app.focused_pane(), Pane::Sidebar);
@@ -1769,10 +1659,10 @@ mod tests {
         // images, mirrors) all shipped real reducers, so the
         // worklist-item hook no longer fires for any of them.
         for (g, p) in [
-            (Group::Controller, "policy"),
-            (Group::Network, "interfaces"),
-            (Group::Network, "dns"),
-            (Group::Network, "routing"),
+            (Group::Fleet, "policy"),
+            (Group::ThisNode, "interfaces"),
+            (Group::ThisNode, "dns"),
+            (Group::ThisNode, "routing"),
             (Group::Fleet, "tags"),
             (Group::Provisioning, "profiles"),
             (Group::Provisioning, "images"),
@@ -1788,8 +1678,8 @@ mod tests {
     #[test]
     fn select_group_updates_view_and_focuses_main_pane() {
         let mut app = App::new();
-        let _ = app.update(Message::SelectGroup(Group::Network));
-        assert_eq!(app.current_view(), View::Group(Group::Network));
+        let _ = app.update(Message::SelectGroup(Group::ThisNode));
+        assert_eq!(app.current_view(), View::Group(Group::ThisNode));
         assert_eq!(app.focused_pane(), Pane::Main);
     }
 
@@ -1797,13 +1687,13 @@ mod tests {
     fn select_panel_carries_group_and_panel_slug() {
         let mut app = App::new();
         let _ = app.update(Message::SelectPanel {
-            group: Group::Network,
+            group: Group::ThisNode,
             panel: "remote_desktop",
         });
         assert_eq!(
             app.current_view(),
             View::Panel {
-                group: Group::Network,
+                group: Group::ThisNode,
                 panel: "remote_desktop"
             }
         );
@@ -1812,8 +1702,8 @@ mod tests {
     #[test]
     fn ctrl_digit_key_action_jumps_to_group_and_refocuses_sidebar() {
         let mut app = App::new();
-        let _ = app.update(Message::KeyPressed(KeyAction::JumpToGroup(Group::Help)));
-        assert_eq!(app.current_view(), View::Group(Group::Help));
+        let _ = app.update(Message::KeyPressed(KeyAction::JumpToGroup(Group::System)));
+        assert_eq!(app.current_view(), View::Group(Group::System));
         assert_eq!(app.focused_pane(), Pane::Sidebar);
     }
 
@@ -1823,7 +1713,14 @@ mod tests {
         // Peers plane with the role pre-filtered.
         let mut app = App::new();
         let _ = app.update(Message::DrillToPeers("host".into()));
-        assert_eq!(app.current_view(), View::Group(Group::Peers));
+        // NAV-1 — Peers is now the first panel under the Mesh section.
+        assert_eq!(
+            app.current_view(),
+            View::Panel {
+                group: Group::Mesh,
+                panel: "peers"
+            }
+        );
         assert_eq!(app.peers.filter, "host");
     }
 
@@ -1831,11 +1728,11 @@ mod tests {
     fn escape_from_panel_view_returns_to_parent_group_landing() {
         let mut app = App::new();
         let _ = app.update(Message::SelectPanel {
-            group: Group::Maintain,
+            group: Group::System,
             panel: "snapshots",
         });
         let _ = app.update(Message::KeyPressed(KeyAction::CloseDetail));
-        assert_eq!(app.current_view(), View::Group(Group::Maintain));
+        assert_eq!(app.current_view(), View::Group(Group::System));
         assert_eq!(app.focused_pane(), Pane::Sidebar);
     }
 
@@ -1873,7 +1770,7 @@ mod tests {
         assert_eq!(
             app.current_view(),
             View::Panel {
-                group: Group::Network,
+                group: Group::ThisNode,
                 panel: "remote_desktop"
             }
         );
@@ -1905,13 +1802,13 @@ mod tests {
         // change + backend identity confirm the navigation
         // path fired.
         let _ = app.update(Message::SelectPanel {
-            group: Group::LookAndFeel,
+            group: Group::Desktop,
             panel: "themes",
         });
         assert_eq!(
             app.current_view(),
             View::Panel {
-                group: Group::LookAndFeel,
+                group: Group::Desktop,
                 panel: "themes"
             }
         );
@@ -1937,13 +1834,13 @@ mod tests {
         // E6.4 — session lives under Devices now (moved from System).
         let mut app = App::new();
         let _ = app.update(Message::SelectPanel {
-            group: Group::Devices,
+            group: Group::Desktop,
             panel: "session",
         });
         assert_eq!(
             app.current_view(),
             View::Panel {
-                group: Group::Devices,
+                group: Group::Desktop,
                 panel: "session"
             }
         );
@@ -2021,7 +1918,7 @@ mod tests {
         assert_eq!(
             app.current_view(),
             View::Panel {
-                group: Group::Network,
+                group: Group::ThisNode,
                 panel: "remote_desktop"
             }
         );
@@ -2031,15 +1928,15 @@ mod tests {
     #[test]
     fn focus_request_with_group_slug_lands_on_group_view() {
         let mut app = App::new();
-        let _ = app.update(Message::FocusRequest("help".into()));
-        assert_eq!(app.current_view(), View::Group(Group::Help));
+        let _ = app.update(Message::FocusRequest("system".into()));
+        assert_eq!(app.current_view(), View::Group(Group::System));
     }
 
     #[test]
     fn focus_request_empty_slug_preserves_view() {
         let mut app = App::new();
         let _ = app.update(Message::SelectPanel {
-            group: Group::Apps,
+            group: Group::Desktop,
             panel: "sources",
         });
         let before = app.current_view();
@@ -2054,7 +1951,7 @@ mod tests {
     #[test]
     fn focus_request_unknown_slug_preserves_view() {
         let mut app = App::new();
-        let _ = app.update(Message::SelectGroup(Group::Maintain));
+        let _ = app.update(Message::SelectGroup(Group::System));
         let before = app.current_view();
         let _ = app.update(Message::FocusRequest("not-a-real-slug".into()));
         assert_eq!(
@@ -2069,8 +1966,8 @@ mod tests {
         // CUT-1: the page-aware title now drives the custom header heading via
         // `page_title(self.view)` (the iced-era window `title()` was removed).
         let mut app = App::new();
-        let _ = app.update(Message::SelectGroup(Group::Apps));
-        assert!(page_title(app.current_view()).contains("Apps"));
+        let _ = app.update(Message::SelectGroup(Group::Mesh));
+        assert!(page_title(app.current_view()).contains("Mesh"));
     }
 
     // UX-3 — theme() returns a custom Iced theme derived from
@@ -2132,7 +2029,7 @@ mod tests {
     #[test]
     fn window_control_message_does_not_mutate_view_state() {
         let mut app = App::new();
-        let _ = app.update(Message::SelectGroup(Group::Network));
+        let _ = app.update(Message::SelectGroup(Group::ThisNode));
         let before = app.current_view();
         let _ = app.update(Message::WindowControl(HeaderAction::Minimize));
         let _ = app.update(Message::WindowControl(HeaderAction::ToggleMaximize));

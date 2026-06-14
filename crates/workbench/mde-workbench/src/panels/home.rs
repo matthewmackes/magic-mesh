@@ -415,7 +415,7 @@ impl HomePanel {
                 "Updates pending",
                 self.snapshot.pending_updates,
                 Icon::Update,
-                Group::Maintain,
+                Group::System,
                 "snapshots",
                 palette,
             ),
@@ -424,7 +424,7 @@ impl HomePanel {
                 "Snapshots",
                 self.snapshot.snapshot_count,
                 Icon::Snapshot,
-                Group::Maintain,
+                Group::System,
                 "snapshots",
                 palette,
             ),
@@ -433,7 +433,7 @@ impl HomePanel {
                 "Drift events",
                 self.snapshot.drift_count,
                 Icon::Repair,
-                Group::Controller,
+                Group::Fleet,
                 "drift",
                 palette,
             ),
@@ -478,10 +478,10 @@ impl HomePanel {
             .size(TypeRole::Heading.size_in(sizes))
             .colr(palette.text.into_cosmic_color());
         let manage_row = row![
-            role_link("Apps", Group::Apps, palette),
-            role_link("Devices", Group::Devices, palette),
+            role_link("Mesh", Group::Mesh, palette),
             role_link("Fleet", Group::Fleet, palette),
-            role_link("Maintain", Group::Maintain, palette),
+            role_link("Provisioning", Group::Provisioning, palette),
+            role_link("Monitoring", Group::Monitoring, palette),
             role_link("System", Group::System, palette),
         ]
         .spacing(8);
@@ -1149,7 +1149,7 @@ fn build_mesh_row(p: &ProbeOutcome) -> CapabilityRow {
         icon: Icon::Network,
         status: p.status.clone(),
         sub_status: p.sub_status.clone(),
-        jump: Some((Group::Controller, "mesh_control")),
+        jump: Some((Group::Mesh, "mesh_control")),
         launch: None,
     }
 }
@@ -1162,7 +1162,7 @@ fn build_peers_row(p: &ProbeOutcome) -> CapabilityRow {
         icon: Icon::Peer,
         status: p.status.clone(),
         sub_status: p.sub_status.clone(),
-        jump: Some((Group::Peers, "peers")),
+        jump: Some((Group::Mesh, "peers")),
         launch: None,
     }
 }
@@ -1175,7 +1175,7 @@ fn build_files_row(p: &ProbeOutcome) -> CapabilityRow {
         icon: Icon::Files,
         status: p.status.clone(),
         sub_status: p.sub_status.clone(),
-        jump: Some((Group::Network, "mesh_storage")),
+        jump: Some((Group::Mesh, "mesh_storage")),
         launch: None,
     }
 }
@@ -1188,7 +1188,7 @@ fn build_ssh_row(p: &ProbeOutcome) -> CapabilityRow {
         icon: Icon::System,
         status: p.status.clone(),
         sub_status: p.sub_status.clone(),
-        jump: Some((Group::Network, "mesh_ssh")),
+        jump: Some((Group::ThisNode, "remote_desktop")),
         launch: None,
     }
 }
@@ -1201,7 +1201,7 @@ fn build_rdp_row(p: &ProbeOutcome) -> CapabilityRow {
         icon: Icon::Display,
         status: p.status.clone(),
         sub_status: p.sub_status.clone(),
-        jump: Some((Group::Network, "remote_desktop")),
+        jump: Some((Group::ThisNode, "remote_desktop")),
         launch: None,
     }
 }
@@ -1214,7 +1214,7 @@ fn build_vnc_row(p: &ProbeOutcome) -> CapabilityRow {
         icon: Icon::Display,
         status: p.status.clone(),
         sub_status: p.sub_status.clone(),
-        jump: Some((Group::Network, "remote_desktop")),
+        jump: Some((Group::ThisNode, "remote_desktop")),
         launch: None,
     }
 }
@@ -1240,7 +1240,7 @@ fn build_phone_row(p: &ProbeOutcome) -> CapabilityRow {
         icon: Icon::Devices,
         status: p.status.clone(),
         sub_status: p.sub_status.clone(),
-        jump: Some((Group::Devices, "connect")),
+        jump: Some((Group::Mesh, "connect")),
         launch: None,
     }
 }
@@ -1269,7 +1269,7 @@ fn build_fleet_row(p: &ProbeOutcome) -> CapabilityRow {
         icon: Icon::Fleet,
         status: p.status.clone(),
         sub_status: p.sub_status.clone(),
-        jump: Some((Group::Controller, "playbooks")),
+        jump: Some((Group::Fleet, "playbooks")),
         launch: None,
     }
 }
@@ -1999,9 +1999,9 @@ mod tests {
         let files = rows.iter().find(|r| r.id == CapabilityId::Files).unwrap();
         let phone = rows.iter().find(|r| r.id == CapabilityId::Phone).unwrap();
         let voice = rows.iter().find(|r| r.id == CapabilityId::Voice).unwrap();
-        assert_eq!(files.jump, Some((Group::Network, "mesh_storage")));
+        assert_eq!(files.jump, Some((Group::Mesh, "mesh_storage")));
         assert!(files.launch.is_none());
-        assert_eq!(phone.jump, Some((Group::Devices, "connect")));
+        assert_eq!(phone.jump, Some((Group::Mesh, "connect")));
         assert!(phone.launch.is_none());
         assert!(voice.jump.is_none());
         assert_eq!(voice.launch, Some("mde-voice-config"));
@@ -2062,28 +2062,25 @@ mod tests {
         // PLANES-1 — capability jumps follow the panels into their planes.
         assert_eq!(
             lookup(CapabilityId::Mesh),
-            Some((Group::Controller, "mesh_control"))
+            Some((Group::Mesh, "mesh_control"))
         );
-        assert_eq!(lookup(CapabilityId::Peers), Some((Group::Peers, "peers")));
+        assert_eq!(lookup(CapabilityId::Peers), Some((Group::Mesh, "peers")));
         assert_eq!(
             lookup(CapabilityId::Files),
-            Some((Group::Network, "mesh_storage"))
+            Some((Group::Mesh, "mesh_storage"))
         );
-        assert_eq!(
-            lookup(CapabilityId::Phone),
-            Some((Group::Devices, "connect"))
-        );
+        assert_eq!(lookup(CapabilityId::Phone), Some((Group::Mesh, "connect")));
         assert_eq!(
             lookup(CapabilityId::Ssh),
-            Some((Group::Network, "mesh_ssh"))
+            Some((Group::ThisNode, "remote_desktop"))
         );
         assert_eq!(
             lookup(CapabilityId::Rdp),
-            Some((Group::Network, "remote_desktop"))
+            Some((Group::ThisNode, "remote_desktop"))
         );
         assert_eq!(
             lookup(CapabilityId::Vnc),
-            Some((Group::Network, "remote_desktop"))
+            Some((Group::ThisNode, "remote_desktop"))
         );
         assert_eq!(
             lookup(CapabilityId::Services),
@@ -2091,7 +2088,7 @@ mod tests {
         );
         assert_eq!(
             lookup(CapabilityId::Fleet),
-            Some((Group::Controller, "playbooks"))
+            Some((Group::Fleet, "playbooks"))
         );
         assert_eq!(
             lookup(CapabilityId::Notifications),

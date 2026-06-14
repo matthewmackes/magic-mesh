@@ -2126,7 +2126,7 @@ fn device_detail<'a>(
         "Open in Connect hub",
         crate::controls::ButtonVariant::Secondary,
         Some(crate::Message::SelectPanel {
-            group: crate::model::Group::Devices,
+            group: crate::model::Group::Mesh,
             panel: "connect",
         }),
         palette,

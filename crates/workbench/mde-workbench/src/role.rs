@@ -29,21 +29,16 @@ use crate::Message;
 /// PLANES-1: the four new plane groups reuse existing Material glyphs
 /// (no new SVG assets) — kept distinct per the `role_icons_*` test.
 const fn role_icon(group: Group) -> Icon {
+    // NAV-1 — distinct glyph per visible section (+ hidden Desktop).
     match group {
-        Group::Peers => Icon::Peer,
-        Group::ThisNode => Icon::Workbench,
-        Group::Controller => Icon::Playbook,
-        Group::Provisioning => Icon::Update,
         Group::Dashboard => Icon::Dashboard,
-        Group::Apps => Icon::Apps,
-        Group::Devices => Icon::Devices,
+        Group::ThisNode => Icon::Workbench,
+        Group::Mesh => Icon::Network,
         Group::Fleet => Icon::Fleet,
-        Group::Compute => Icon::Compute,
-        Group::LookAndFeel => Icon::LookAndFeel,
-        Group::Maintain => Icon::Maintain,
-        Group::Network => Icon::Network,
+        Group::Provisioning => Icon::Update,
+        Group::Monitoring => Icon::Maintain,
         Group::System => Icon::System,
-        Group::Help => Icon::Help,
+        Group::Desktop => Icon::Devices,
     }
 }
 
@@ -51,46 +46,30 @@ const fn role_icon(group: Group) -> Icon {
 /// console voice). Shown under the role title on the card.
 const fn role_description(group: Group) -> &'static str {
     match group {
-        Group::Peers => {
-            "The Front Door — every mesh peer, its presence, and the per-peer ops (call, ping, remote access, drift, sync)."
+        Group::Dashboard => {
+            "At-a-glance system and fleet status, with quick links into every section."
         }
         Group::ThisNode => {
-            "This box — registration and cert lifecycle, hardware inventory, health, services, config, and logs."
+            "This box — hardware, services, and its local networking (interfaces, Wi-Fi, VPN, firewall, remote access)."
         }
-        Group::Controller => {
-            "The fleet control plane — jobs and playbooks, remediation, audit, policy, fleet logs, and config revisions."
-        }
-        Group::Provisioning => {
-            "Build and enrol nodes — install profiles, images (ISO/VM/container/USB), node roles, and package mirrors."
-        }
-        Group::Dashboard => {
-            "At-a-glance system and fleet status, with quick links into every management role."
-        }
-        Group::Apps => {
-            "Install, update, and remove software; manage package sources and default apps."
-        }
-        Group::Devices => {
-            "Configure displays, sound, printers, input devices, power, and connected peripherals."
+        Group::Mesh => {
+            "The mesh — every peer plus mesh-wide services: control, storage, DNS, routing, federation, bus, publishing, and join."
         }
         Group::Fleet => {
-            "Drive multi-host deployment — inventory, playbooks, run history, and config revisions."
+            "Drive the fleet — roster, rollup, tags, and orchestration (jobs, playbooks, remediation)."
         }
-        Group::Compute => {
-            "Run local and fleet VMs and containers — create, start, stop, migrate, and open consoles."
+        Group::Provisioning => {
+            "Build and enrol nodes — node roles, install profiles, images (ISO/VM/container/USB), mirrors, and compute instances."
         }
-        Group::LookAndFeel => {
-            "Restyle the desktop — themes, fonts, wallpaper, and panel sync status."
-        }
-        Group::Maintain => {
-            "Keep the workstation healthy — snapshots, debloat, health checks, repair, and drift."
-        }
-        Group::Network => {
-            "Manage the mesh and local networking — peers, VPN, firewall, and remote desktop."
+        Group::Monitoring => {
+            "Observe everything — health, logs and metrics, fleet logs, run history, audit, mesh history, and resources."
         }
         Group::System => {
-            "Administer core system settings — date & time, logs, resources, updates, notifications."
+            "Configure and maintain — local/fleet config, policy, snapshots, debloat, repair, and help."
         }
-        Group::Help => "Browse help topics and the embedded disclaimer.",
+        Group::Desktop => {
+            "Desktop settings (deferred to Cosmic Settings) — apps, displays, sound, look & feel, and system."
+        }
     }
 }
 
@@ -98,20 +77,14 @@ const fn role_description(group: Group) -> &'static str {
 /// live [`Message::SelectGroup`] jump; never includes `group` itself.
 const fn see_also(group: Group) -> &'static [Group] {
     match group {
-        Group::Peers => &[Group::ThisNode, Group::Controller, Group::Network],
-        Group::ThisNode => &[Group::Controller, Group::Network, Group::Fleet],
-        Group::Controller => &[Group::Fleet, Group::Provisioning, Group::ThisNode],
-        Group::Provisioning => &[Group::Controller, Group::Fleet, Group::Network],
-        Group::Dashboard => &[Group::Maintain, Group::System, Group::Fleet],
-        Group::Apps => &[Group::System, Group::Maintain],
-        Group::Devices => &[Group::LookAndFeel, Group::System],
-        Group::Fleet => &[Group::Controller, Group::Network, Group::Provisioning],
-        Group::Compute => &[Group::Fleet, Group::System],
-        Group::LookAndFeel => &[Group::Devices, Group::System],
-        Group::Maintain => &[Group::System, Group::ThisNode],
-        Group::Network => &[Group::Peers, Group::Controller, Group::Fleet],
-        Group::System => &[Group::Maintain, Group::Apps],
-        Group::Help => &[Group::Dashboard],
+        Group::Dashboard => &[Group::Mesh, Group::Fleet, Group::Monitoring],
+        Group::ThisNode => &[Group::Mesh, Group::Monitoring, Group::System],
+        Group::Mesh => &[Group::Fleet, Group::ThisNode, Group::Monitoring],
+        Group::Fleet => &[Group::Mesh, Group::Provisioning, Group::Monitoring],
+        Group::Provisioning => &[Group::Fleet, Group::Mesh, Group::System],
+        Group::Monitoring => &[Group::Mesh, Group::Fleet, Group::System],
+        Group::System => &[Group::ThisNode, Group::Monitoring, Group::Provisioning],
+        Group::Desktop => &[Group::System, Group::ThisNode],
     }
 }
 
@@ -340,169 +313,85 @@ mod tests {
     }
 
     #[test]
-    fn fleet_plane_is_a_rollup_lens_after_planes_1() {
-        // PLANES-1 (W81) — Fleet is a rollup lens, not a config surface:
-        // its operational panels re-homed into This Node / Controller /
-        // Provisioning, leaving the rollup dashboard, the fleet inventory,
-        // and the capability-tags surface.
+    fn mesh_section_leads_with_peers_then_mesh_services() {
+        // NAV-1 (Q9) — Peers is the first item under Mesh, followed by the
+        // mesh-wide services.
+        let slugs: Vec<&str> = role_action_panels(Group::Mesh)
+            .iter()
+            .map(Panel::slug)
+            .collect();
+        assert_eq!(slugs.first(), Some(&"peers"));
+        for want in [
+            "mesh_control",
+            "mesh_storage",
+            "dns",
+            "routing",
+            "mesh_join",
+        ] {
+            assert!(slugs.contains(&want), "Mesh missing {want}: {slugs:?}");
+        }
+    }
+
+    #[test]
+    fn fleet_section_has_roster_plus_orchestration() {
+        // NAV-1 (Q6) — Fleet absorbs the old Controller orchestration.
         let slugs: Vec<&str> = role_action_panels(Group::Fleet)
             .iter()
             .map(Panel::slug)
             .collect();
-        assert_eq!(slugs, vec!["fleet_rollup", "inventory", "tags"]);
-    }
-
-    #[test]
-    fn this_node_and_controller_planes_absorb_the_mesh_panels() {
-        // PLANES-1 (W4) — the operational panels re-home into the planes.
-        let node: Vec<&str> = role_action_panels(Group::ThisNode)
-            .iter()
-            .map(Panel::slug)
-            .collect();
-        for want in ["registration", "hardware", "health_check", "config_apply"] {
-            assert!(node.contains(&want), "This Node missing {want}: {node:?}");
-        }
-        let ctrl: Vec<&str> = role_action_panels(Group::Controller)
-            .iter()
-            .map(Panel::slug)
-            .collect();
-        // Folds: Mesh Control (own entry), Jobs (absorbs Playbooks),
-        // Remediation (drift), Config (revisions), Fleet Logs.
-        for want in ["mesh_control", "jobs", "drift", "revisions", "fleet_logs"] {
-            assert!(ctrl.contains(&want), "Controller missing {want}: {ctrl:?}");
+        for want in [
+            "fleet_rollup",
+            "inventory",
+            "tags",
+            "jobs",
+            "playbooks",
+            "drift",
+        ] {
+            assert!(slugs.contains(&want), "Fleet missing {want}: {slugs:?}");
         }
     }
 
     #[test]
-    fn look_and_feel_role_card_includes_the_e6_6_acceptance_panels() {
-        // E6.6 acceptance #1: the Look & Feel role card surfaces
-        // action-links to Themes, Wallpaper, and Fonts. (E11 retired the
-        // Window Manager panel — Cosmic owns window management — so it is
-        // no longer surfaced here.) sync_status stays as a bonus link.
-        let slugs: Vec<&str> = role_action_panels(Group::LookAndFeel)
-            .iter()
-            .map(Panel::slug)
-            .collect();
-        for want in ["themes", "wallpaper", "fonts"] {
-            assert!(
-                slugs.contains(&want),
-                "Look & Feel card missing {want}: {slugs:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn apps_role_card_includes_the_e6_3_acceptance_panels() {
-        // E6.3 acceptance #1: the Apps role card surfaces action-links to
-        // Install / Installed / Remove / Sources / Default-Apps (install &
-        // remove added to nav_model — they were already wired; default_apps
-        // moved here from System). `panel` (Panel Apps) stays as a bonus.
-        let slugs: Vec<&str> = role_action_panels(Group::Apps)
-            .iter()
-            .map(Panel::slug)
-            .collect();
-        for want in ["install", "installed", "remove", "sources", "default_apps"] {
-            assert!(slugs.contains(&want), "Apps card missing {want}: {slugs:?}");
-        }
-    }
-
-    #[test]
-    fn default_apps_left_system_for_apps() {
-        // E6.3 — default_apps moved out of System into Apps; it must not
-        // appear under both.
-        let system: Vec<&str> = role_action_panels(Group::System)
-            .iter()
-            .map(Panel::slug)
-            .collect();
-        assert!(
-            !system.contains(&"default_apps"),
-            "default_apps must leave System (E6.3): {system:?}"
-        );
-    }
-
-    #[test]
-    fn devices_role_card_includes_the_e6_4_acceptance_panels() {
-        // E6.4 acceptance #1: the Devices role card surfaces action-links
-        // to the 9 device panels (displays/sound/printers/removable/
-        // keyboard/mouse/session/power/connect). `music` stays as a bonus
-        // pending the E5.3 Media Player app.
-        let slugs: Vec<&str> = role_action_panels(Group::Devices)
+    fn monitoring_section_gathers_observability() {
+        // NAV-1 (Q11) — one Monitoring section across scopes.
+        let slugs: Vec<&str> = role_action_panels(Group::Monitoring)
             .iter()
             .map(Panel::slug)
             .collect();
         for want in [
-            "displays",
-            "sound",
-            "printers",
-            "removable",
-            "keyboard",
-            "mouse",
-            "session",
-            "power",
-            "connect",
+            "health_check",
+            "fleet_logs",
+            "audit",
+            "mesh_history",
+            "resources",
         ] {
             assert!(
                 slugs.contains(&want),
-                "Devices card missing {want}: {slugs:?}"
+                "Monitoring missing {want}: {slugs:?}"
             );
         }
     }
 
     #[test]
-    fn session_left_system_for_devices() {
-        // E6.4 — session moved out of System into Devices.
-        let system: Vec<&str> = role_action_panels(Group::System)
-            .iter()
-            .map(Panel::slug)
-            .collect();
-        assert!(
-            !system.contains(&"session"),
-            "session must leave System (E6.4): {system:?}"
-        );
-    }
-
-    #[test]
-    fn help_role_card_has_index_and_about() {
-        // E6.9 acceptance #1: the Help role card surfaces action-links to
-        // the help topics index and the About/Help (disclaimer) surface.
-        let slugs: Vec<&str> = role_action_panels(Group::Help)
-            .iter()
-            .map(Panel::slug)
-            .collect();
-        assert_eq!(slugs, vec!["index", "about"]);
-    }
-
-    #[test]
-    fn maintain_role_card_is_personal_upkeep_after_planes_1() {
-        // PLANES-1 — the mesh-facing Maintain panels (health_check, drift,
-        // audit, mesh_logs, fleet_logs) re-home into the planes; Maintain
-        // keeps personal workstation upkeep only.
-        let slugs: Vec<&str> = role_action_panels(Group::Maintain)
-            .iter()
-            .map(Panel::slug)
-            .collect();
-        assert_eq!(slugs, vec!["hub", "snapshots", "debloat", "repair"]);
-    }
-
-    #[test]
-    fn system_role_card_matches_the_e6_8_acceptance() {
-        // E6.8 acceptance #1: the System role card surfaces exactly
-        // Date & Time / Logs / Resources / System Update / Notifications
-        // (logs/resources/system_update surfaced here from Maintain, where
-        // they were wired but orphaned from the nav).
+    fn system_section_combines_config_maintain_help() {
+        // NAV-1 follow-up — System = Config + Maintenance + Help.
         let slugs: Vec<&str> = role_action_panels(Group::System)
             .iter()
             .map(Panel::slug)
             .collect();
-        assert_eq!(
-            slugs,
-            vec![
-                "datetime",
-                "logs",
-                "resources",
-                "system_update",
-                "notifications"
-            ]
+        for want in ["config_apply", "policy", "hub", "repair", "index", "about"] {
+            assert!(slugs.contains(&want), "System missing {want}: {slugs:?}");
+        }
+    }
+
+    #[test]
+    fn desktop_settings_are_not_in_the_sidebar() {
+        // NAV-1 (Q2) — desktop settings defer to Cosmic; the Desktop group
+        // is hidden from the sidebar but stays deep-link-reachable.
+        assert!(!Group::sidebar_groups().contains(&Group::Desktop));
+        assert!(
+            !role_action_panels(Group::Desktop).is_empty(),
+            "hidden Desktop still holds its (deep-link-reachable) panels"
         );
     }
 }

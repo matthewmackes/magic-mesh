@@ -340,7 +340,7 @@ mod tests {
     #[test]
     fn new_state_has_no_user_expansions() {
         let state = SidebarState::new();
-        assert!(!state.is_expanded(Group::Apps, Group::Dashboard));
+        assert!(!state.is_expanded(Group::Mesh, Group::Dashboard));
     }
 
     #[test]
@@ -358,11 +358,11 @@ mod tests {
     fn toggle_expands_then_collapses_inactive_group() {
         let mut state = SidebarState::new();
         let active = Group::Dashboard;
-        assert!(!state.is_expanded(Group::Network, active));
-        state.toggle(Group::Network, active);
-        assert!(state.is_expanded(Group::Network, active));
-        state.toggle(Group::Network, active);
-        assert!(!state.is_expanded(Group::Network, active));
+        assert!(!state.is_expanded(Group::ThisNode, active));
+        state.toggle(Group::ThisNode, active);
+        assert!(state.is_expanded(Group::ThisNode, active));
+        state.toggle(Group::ThisNode, active);
+        assert!(!state.is_expanded(Group::ThisNode, active));
     }
 
     #[test]
@@ -379,10 +379,10 @@ mod tests {
     fn multiple_groups_can_be_user_expanded_simultaneously() {
         let mut state = SidebarState::new();
         let active = Group::Dashboard;
-        state.toggle(Group::Apps, active);
-        state.toggle(Group::Network, active);
-        assert!(state.is_expanded(Group::Apps, active));
-        assert!(state.is_expanded(Group::Network, active));
+        state.toggle(Group::Mesh, active);
+        state.toggle(Group::ThisNode, active);
+        assert!(state.is_expanded(Group::Mesh, active));
+        assert!(state.is_expanded(Group::ThisNode, active));
         assert!(!state.is_expanded(Group::Fleet, active));
     }
 

@@ -112,15 +112,16 @@ pub fn interpret_key(key: Key, mods: Modifiers, current_pane: Pane) -> KeyAction
         }
         (Key::Escape, _) => KeyAction::CloseDetail,
         (Key::Digit(n), m) if m.ctrl && (1..=9).contains(&n) => {
-            // Group-hotkey table: Ctrl+1 → first sidebar group, Ctrl+9 →
-            // ninth. Order comes from [`Group::sidebar_groups`]. PLANES-1
-            // makes the first nine the Front Door + the five planes +
-            // the first Desktop-cluster groups (Peers, This Node,
-            // Controller, Network, Fleet, Provisioning, Overview, Apps,
-            // Devices); the tail (Compute…Help) is reachable by click.
+            // Group-hotkey table: Ctrl+1 → first sidebar section … Ctrl+7
+            // → seventh. NAV-1 has seven visible sections (Overview, This
+            // Node, Mesh, Fleet, Provisioning, Monitoring, System); the
+            // hidden Desktop group is not hotkey-reachable. A digit past
+            // the last section is ignored (no panic).
             let idx = (n - 1) as usize;
-            let group = Group::sidebar_groups()[idx];
-            KeyAction::JumpToGroup(group)
+            Group::sidebar_groups()
+                .get(idx)
+                .copied()
+                .map_or(KeyAction::Ignored, KeyAction::JumpToGroup)
         }
         _ => KeyAction::Ignored,
     }
@@ -171,19 +172,16 @@ mod tests {
 
     #[test]
     fn ctrl_digit_jumps_to_matching_sidebar_group() {
-        // PLANES-1 — Ctrl+1..9 map to the first nine sidebar groups:
-        // the Peers Front Door, the five planes, then the first three
-        // Desktop-cluster groups.
+        // NAV-1 — Ctrl+1..7 map to the seven visible sections; Ctrl+8/9
+        // are ignored (the hidden Desktop group is not hotkey-reachable).
         let cases = [
-            (1, Group::Peers),
+            (1, Group::Dashboard),
             (2, Group::ThisNode),
-            (3, Group::Controller),
-            (4, Group::Network),
-            (5, Group::Fleet),
-            (6, Group::Provisioning),
-            (7, Group::Dashboard),
-            (8, Group::Apps),
-            (9, Group::Devices),
+            (3, Group::Mesh),
+            (4, Group::Fleet),
+            (5, Group::Provisioning),
+            (6, Group::Monitoring),
+            (7, Group::System),
         ];
         for (n, expected) in cases {
             assert_eq!(
@@ -192,6 +190,11 @@ mod tests {
                 "Ctrl+{n} should land on {expected:?}",
             );
         }
+        // Past the last section → no-op (no panic).
+        assert_eq!(
+            interpret_key(Key::Digit(8), Modifiers::ctrl(), Pane::Sidebar),
+            KeyAction::Ignored,
+        );
     }
 
     #[test]

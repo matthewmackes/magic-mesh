@@ -115,36 +115,36 @@ mod tests {
     #[test]
     fn breadcrumb_for_panel_has_three_crumbs_with_full_slug() {
         let crumbs = breadcrumb(View::Panel {
-            group: Group::Network,
+            group: Group::ThisNode,
             panel: "remote_desktop",
         });
         assert_eq!(crumbs.len(), 3);
         assert_eq!(crumbs[0].slug, "");
-        assert_eq!(crumbs[1].slug, "network");
-        assert_eq!(crumbs[2].slug, "network.remote_desktop");
+        assert_eq!(crumbs[1].slug, "node");
+        assert_eq!(crumbs[2].slug, "node.remote_desktop");
         assert_eq!(crumbs[2].label, "Remote Access");
     }
 
     #[test]
     fn breadcrumb_for_unknown_panel_collapses_to_group_chain() {
         let crumbs = breadcrumb(View::Panel {
-            group: Group::Help,
+            group: Group::System,
             panel: "ghost",
         });
         assert_eq!(crumbs.len(), 2, "unknown panel drops the leaf crumb");
-        assert_eq!(crumbs[1].slug, "help");
+        assert_eq!(crumbs[1].slug, "system");
     }
 
     #[test]
     fn page_title_uses_group_label_for_group_view() {
-        assert_eq!(page_title(View::Group(Group::LookAndFeel)), "Look & Feel");
+        assert_eq!(page_title(View::Group(Group::Mesh)), "Mesh");
     }
 
     #[test]
     fn page_title_uses_panel_label_for_panel_view() {
         assert_eq!(
             page_title(View::Panel {
-                group: Group::Maintain,
+                group: Group::System,
                 panel: "snapshots"
             }),
             "Snapshots"
@@ -155,7 +155,7 @@ mod tests {
     fn page_title_falls_back_to_slug_for_unknown_panel() {
         assert_eq!(
             page_title(View::Panel {
-                group: Group::Help,
+                group: Group::System,
                 panel: "ghost"
             }),
             "ghost"
@@ -171,7 +171,7 @@ mod tests {
         // (peers/mesh_topology moved to the Peers Front Door;
         // mesh_control/mesh_services re-homed into the planes.)
         // See `crates/mde-workbench/src/model.rs` for the lock.
-        assert_eq!(page_subtitle(View::Group(Group::Network)), "15 panels");
+        assert_eq!(page_subtitle(View::Group(Group::ThisNode)), "7 panels");
     }
 
     #[test]
@@ -184,10 +184,10 @@ mod tests {
     fn page_subtitle_names_parent_group_for_panel_view() {
         assert_eq!(
             page_subtitle(View::Panel {
-                group: Group::Apps,
-                panel: "sources"
+                group: Group::Mesh,
+                panel: "peers"
             }),
-            "in Apps"
+            "in Mesh"
         );
     }
 }

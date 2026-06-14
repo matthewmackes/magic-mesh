@@ -45,7 +45,7 @@ impl HubPanel {
                 "Snapshots",
                 "Capture / restore the live config",
                 Icon::Snapshot,
-                Group::Maintain,
+                Group::System,
                 "snapshots",
                 palette
             ),
@@ -54,7 +54,7 @@ impl HubPanel {
                 "Debloat",
                 "Remove apps you don't use",
                 Icon::Delete,
-                Group::Maintain,
+                Group::System,
                 "debloat",
                 palette
             ),
@@ -64,7 +64,7 @@ impl HubPanel {
                 "Health Check",
                 "Probe daemons and services",
                 Icon::StatusOk,
-                Group::ThisNode,
+                Group::Monitoring,
                 "health_check",
                 palette
             ),
@@ -74,7 +74,7 @@ impl HubPanel {
                 "Repair",
                 "Reset broken settings",
                 Icon::Repair,
-                Group::Maintain,
+                Group::System,
                 "repair",
                 palette
             ),
@@ -84,7 +84,7 @@ impl HubPanel {
                 "Drift",
                 "Find config divergence",
                 Icon::History,
-                Group::Controller,
+                Group::Fleet,
                 "drift",
                 palette
             ),
@@ -93,7 +93,7 @@ impl HubPanel {
                 "Logs",
                 "Recent daemon + worker output",
                 Icon::Logs,
-                Group::System,
+                Group::Monitoring,
                 "logs",
                 palette
             ),
