@@ -280,10 +280,20 @@ fn write_dropin_atomic(path: &Path, body: &str) -> std::io::Result<()> {
 /// `try-reload-or-restart`) matches the Python helper's behavior +
 /// keeps existing sessions alive during the rebind.
 fn reload_sshd(unit: &str) -> Result<(), String> {
+    // `reload-or-restart`, NOT plain `reload`: a bare reload is a no-op (in
+    // fact errors) when sshd is dead/failed — exactly the state it lands in
+    // when an OLD overlay-only drop-in made it try to bind the overlay IP at
+    // boot, before nebula brought that IP up. `reload-or-restart` reloads a
+    // live sshd in place AND revives a dead one, so applying the additive
+    // drop-in always restores SSH instead of silently leaving it down.
+    // First clear any failed/start-limited state so the (re)start isn't refused.
+    let _ = std::process::Command::new("systemctl")
+        .args(["reset-failed", unit])
+        .output();
     let out = std::process::Command::new("systemctl")
-        .args(["reload", unit])
+        .args(["reload-or-restart", unit])
         .output()
-        .map_err(|e| format!("systemctl reload {unit}: {e}"))?;
+        .map_err(|e| format!("systemctl reload-or-restart {unit}: {e}"))?;
     if out.status.success() {
         Ok(())
     } else {
