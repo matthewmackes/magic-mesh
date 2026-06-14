@@ -594,6 +594,6 @@ Live testing on .13 surfaced a run of empty panels — all four classes of subst
 - [✓] **SUBAUDIT-B1: Message Bus panel reads /run/mde-bus (MDE_BUS_ROOT) + walks the bus root, not a phantom topics/.**
 - [ ] **SUBAUDIT-A2: audit the other 13 export_roster/list_nodes consumers** for the empty-sqlite trap; switch to the directory where the panel/worker needs the mesh-wide roster.
 - [ ] **SUBAUDIT-B2: per-HOME bus paths in mesh_federation / vm_wizard / mde-files honor MDE_BUS_ROOT.**
-- [ ] **SUBAUDIT-C1: declare helper-binary deps (nmap/resolvectl/firewalld/NetworkManager/podman/lizardfs-client/rsync) in the RPM + degrade honestly in the UI.** (nmap = Discovered Hosts.)
+- [✓] **SUBAUDIT-C1: declare helper-binary deps (nmap/resolvectl/firewalld/NetworkManager/podman/lizardfs-client/rsync) in the RPM + degrade honestly in the UI.** (nmap = Discovered Hosts.)
 - [ ] **SUBAUDIT-D1: https-tunnel on by default on all installs + tested; Mesh Services reports in-process workers correctly (not a phantom systemd unit).**
 - [ ] **SUBAUDIT-D2: Hardware panel — root-cause the empty per-peer hardware probe (data-source or worker-not-running).**

@@ -173,15 +173,42 @@ impl MeshDnsWorker {
 
     fn sync(&self) {
         let records = build_records(&self.peers());
+        tracing::debug!(
+            target: "mackesd::mesh_dns",
+            workgroup_root = %self.workgroup_root.display(),
+            records = records.len(),
+            "mesh_dns sync tick",
+        );
         // Preferred: per-link systemd-resolved domain (FDO interop).
         // Best-effort; the /etc/hosts merge is the always-applied
         // fallback so names resolve even without resolvectl.
         let _ = self.push_resolved(&records);
-        if let Ok(existing) = std::fs::read_to_string(&self.hosts_path) {
-            let merged = merge_hosts(&existing, &records);
-            if merged != existing {
-                let _ = std::fs::write(&self.hosts_path, merged);
+        match std::fs::read_to_string(&self.hosts_path) {
+            Ok(existing) => {
+                let merged = merge_hosts(&existing, &records);
+                if merged != existing {
+                    match std::fs::write(&self.hosts_path, &merged) {
+                        Ok(()) => tracing::info!(
+                            target: "mackesd::mesh_dns",
+                            path = %self.hosts_path.display(),
+                            names = records.len(),
+                            "mesh_dns: wrote <host>.mesh block to hosts file",
+                        ),
+                        Err(e) => tracing::warn!(
+                            target: "mackesd::mesh_dns",
+                            error = %e,
+                            path = %self.hosts_path.display(),
+                            "mesh_dns: hosts write FAILED",
+                        ),
+                    }
+                }
             }
+            Err(e) => tracing::warn!(
+                target: "mackesd::mesh_dns",
+                error = %e,
+                path = %self.hosts_path.display(),
+                "mesh_dns: hosts read FAILED",
+            ),
         }
     }
 

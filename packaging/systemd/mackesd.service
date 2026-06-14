@@ -77,7 +77,12 @@ SystemCallArchitectures=native
 # deferred to EFF-12 follow-up — they need a live Fedora bring-up to verify
 # nebula tun + the QNM mount keep working.)
 NoNewPrivileges=true
-ProtectSystem=full
+# SUBAUDIT-D (2026-06-14) — `full` makes /etc READ-ONLY, which silently broke
+# every /etc write this daemon legitimately makes (mesh_dns → /etc/hosts for
+# <host>.mesh resolution; /etc/nebula materialization; /etc/ssh drop-ins;
+# /etc/fuse.conf). `true` keeps the OS image (/usr,/boot) read-only — the stated
+# intent above — while leaving /etc writable for the config-management role.
+ProtectSystem=true
 PrivateTmp=true
 ProtectKernelLogs=true
 ProtectControlGroups=true

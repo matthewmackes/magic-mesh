@@ -428,6 +428,11 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 # F44), so the hard Requires resolves without our repo.
 [package.metadata.generate-rpm.requires]
 nebula = "*"
+# SUBAUDIT-C1 (2026-06-14) — the network-probe inventory ("Discovered Hosts")
+# shells `nmap`; absent, the probe silently writes an empty inventory and the
+# panel shows 0 hosts. Hard Require: nmap is small + in the base Fedora repos,
+# and the feature is core to the mesh host map.
+nmap = "*"
 
 # EFF-42 — ansible-core is a WEAK dep (Recommends): only the Server-tier
 # ansible_pull/job_exec workers shell to it, and they degrade gracefully
@@ -452,6 +457,16 @@ libvirt-daemon-config-network = "*"
 # openssh-clients the feature silently degrades to "overlay" (no crash); a weak
 # dep so a default install gets real classification, opt-out-able.
 openssh-clients = "*"
+# SUBAUDIT-C1 (2026-06-14) — workers shell these helpers; absent, the owning
+# panel silently degrades to empty. Weak deps so a default install carries them
+# (opt-out-able), matching the ansible-core pattern: NetworkManager (Interfaces/
+# Wi-Fi via nmcli), firewalld (Firewall via firewall-cmd), podman (Compute
+# containers), rsync (mirror sync). systemd-resolved/resolvectl ship with
+# systemd; lizardfs-client is installed out-of-band (not in F44 repos).
+NetworkManager = "*"
+firewalld = "*"
+podman = "*"
+rsync = "*"
 
 # EFF-42 — upgrade continuity: the pre-pivot package name was `mde-core`
 # (the E8-era RPM; see config/daemon.rs's template note). Obsolete it so
