@@ -2,7 +2,7 @@
 //!
 //! Shows per-peer chunkserver status (address, used/available bytes),
 //! the current replication goal, the effective quota cap, and which
-//! peer is the bottleneck. Data comes from `mackesd meshfs-status --json`.
+//! peer is the bottleneck. Data comes from `mackesd mesh-fs-status --json`.
 
 use std::time::SystemTime;
 
@@ -295,13 +295,13 @@ fn peer_row<'a>(
 
 pub fn fetch_status() -> Result<StorageStatus, String> {
     let out = std::process::Command::new("mackesd")
-        .args(["meshfs-status", "--json"])
+        .args(["mesh-fs-status", "--json"])
         .output()
-        .map_err(|e| format!("mackesd meshfs-status failed to spawn: {e}"))?;
+        .map_err(|e| format!("mackesd mesh-fs-status failed to spawn: {e}"))?;
     // Exit 1 means master unreachable — still parse the JSON.
     let stdout = String::from_utf8_lossy(&out.stdout);
     if stdout.trim().is_empty() {
-        return Err("mackesd meshfs-status returned no output".to_string());
+        return Err("mackesd mesh-fs-status returned no output".to_string());
     }
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).map_err(|e| format!("JSON parse: {e}"))?;

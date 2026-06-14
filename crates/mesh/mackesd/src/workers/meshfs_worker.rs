@@ -1165,7 +1165,7 @@ pub fn parse_cslist_full(text: &str) -> Vec<ChunkserverStatus> {
         .collect()
 }
 
-/// Fleet status report emitted by `mackesd meshfs-status --json`.
+/// Fleet status report emitted by `mackesd mesh-fs-status --json`.
 #[derive(Debug, serde::Serialize)]
 pub struct MeshFsStatusReport {
     /// Whether the active LizardFS master answered on the floating VIP at report time.

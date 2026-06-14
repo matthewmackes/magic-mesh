@@ -151,7 +151,7 @@ pub enum Message {
     RestoreTrashItem(String),
     /// MESHFS-8.1 — restore operation completed.
     TrashRestored(String, Result<(), String>),
-    /// MESHFS-11.1 — raw JSON from `mackesd meshfs-status --json` loaded.
+    /// MESHFS-11.1 — raw JSON from `mackesd mesh-fs-status --json` loaded.
     MeshFsHealthLoaded(String),
     /// MESHFS-11.1 — user clicked the yellow conflict chip: open the
     /// resolve dialog. `(original_name, conflict_sibling_name)` — both
@@ -1300,7 +1300,7 @@ fn strip_conflict_suffix(name: &str) -> Option<String> {
     Some(name[..idx].to_owned())
 }
 
-/// Parse raw meshfs-status JSON to extract whether the fleet is healing.
+/// Parse raw mesh-fs-status JSON to extract whether the fleet is healing.
 fn parse_meshfs_healing(json: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(json)
         .ok()
@@ -1327,12 +1327,12 @@ fn parse_meshfs_healing(json: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Shell `mackesd meshfs-status --json` and emit `Message::MeshFsHealthLoaded`.
+/// Shell `mackesd mesh-fs-status --json` and emit `Message::MeshFsHealthLoaded`.
 fn load_meshfs_health() -> Task<Message> {
     Task::perform(
         async {
             std::process::Command::new("mackesd")
-                .args(["meshfs-status", "--json"])
+                .args(["mesh-fs-status", "--json"])
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
                 .unwrap_or_default()

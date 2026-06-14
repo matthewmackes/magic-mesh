@@ -21,7 +21,7 @@
 //!   caches (BUG-11 `~/.cache/mde/dnf-updates.count`,
 //!   `~/.local/share/mackes-shell/snapshots/`);
 //! - capability probes shell out to systemctl / dbus-send /
-//!   `mackesd nodes list --json` / `mackesd meshfs-status --json`
+//!   `mackesd nodes list --json` / `mackesd mesh-fs-status --json`
 //!   and read the mesh Bus (`state/voice/status`) in parallel via
 //!   `tokio::join!`;
 //! - live refresh comes from a D-Bus signal subscription
@@ -872,7 +872,7 @@ async fn probe_notifications() -> ProbeOutcome {
 // --- File Sharing (MeshFS / LizardFS) --------------------------------------
 
 async fn probe_files() -> ProbeOutcome {
-    // Same source as the Mesh Storage panel: `mackesd meshfs-status --json`.
+    // Same source as the Mesh Storage panel: `mackesd mesh-fs-status --json`.
     // `fetch_status` is a sync std::process::Command, so bounce it onto the
     // executor with spawn_blocking. Err => mackesd absent/unreachable
     // (Unknown); Ok with no peers => master up but no chunkservers online

@@ -4484,12 +4484,21 @@ fn main() -> anyhow::Result<()> {
         Cmd::Nodes { cmd } => {
             // CB-1.5.a — fleet node roster surface. The Iced
             // inventory panel consumes the JSON shape directly.
-            let conn = mackesd_core::store::open(&db_path)
-                .with_context(|| format!("opening store at {}", db_path.display()))?;
             match cmd {
                 NodesCmd::List { json } => {
-                    let nodes = mackesd_core::store::list_nodes(&conn)
-                        .context("listing nodes from store")?;
+                    // The roster is the replicated directory, not the
+                    // local sqlite `nodes` table (empty mesh-wide). See
+                    // directory_to_node_rows for the why.
+                    let root = mackesd_core::default_qnm_shared_root();
+                    let svc = mackesd_core::ipc::directory::DirectoryService::new(
+                        &root,
+                        Some(db_path.clone()),
+                    );
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis() as u64);
+                    let dir = svc.build_directory(now);
+                    let nodes = directory_to_node_rows(&dir);
                     if json {
                         println!("{}", serde_json::to_string_pretty(&nodes_to_json(&nodes))?);
                     } else {
@@ -4799,6 +4808,50 @@ fn print_ansible_history_table(rows: &[serde_json::Value]) {
 /// `#[derive(Serialize)]` on `NodeRow` because the store struct
 /// already serves topology + lifecycle callers and the JSON
 /// shape is a CLI-surface contract.
+/// Project the replicated directory (`action/mesh/directory` /
+/// `mackesd peers`) onto the flat roster shape the `nodes list`
+/// consumers (Workbench Fleet Inventory / node_roster / inventory /
+/// home / node_roles) expect.
+///
+/// The roster source is the directory, NOT the local sqlite `nodes`
+/// table: enrollment records land in QNM-Shared `peers/`, so
+/// `store::list_nodes` is empty mesh-wide (confirmed on the lighthouse,
+/// the dev host, and .13 — every node's sqlite roster is `[]` while the
+/// directory holds the full fleet). Reading the directory here is what
+/// makes "No peers enrolled" turn into the real 4-node roster.
+fn directory_to_node_rows(dir: &serde_json::Value) -> Vec<mackesd_core::store::NodeRow> {
+    dir["peers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| {
+            let hostname = p["hostname"].as_str().unwrap_or("").to_string();
+            if hostname.is_empty() {
+                return None;
+            }
+            // The directory role is often null; fall back to the
+            // capability tags (a "lighthouse" tag → lighthouse) then
+            // to a plain peer so the panel still renders a role.
+            let tags = p["tags"].as_array();
+            let role = p["role"].as_str().map(str::to_string).unwrap_or_else(|| {
+                let is_lh = tags.into_iter().flatten().any(|t| {
+                    t.as_str()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("lighthouse"))
+                });
+                if is_lh { "lighthouse" } else { "peer" }.to_string()
+            });
+            Some(mackesd_core::store::NodeRow {
+                node_id: hostname.clone(),
+                name: hostname,
+                public_key: String::new(),
+                role,
+                health: p["health"].as_str().unwrap_or("unknown").to_string(),
+                region: p["overlay_ip"].as_str().map(str::to_string),
+            })
+        })
+        .collect()
+}
+
 fn nodes_to_json(nodes: &[mackesd_core::store::NodeRow]) -> serde_json::Value {
     serde_json::Value::Array(
         nodes
