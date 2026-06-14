@@ -49,17 +49,17 @@ pub enum Message {
     RefreshClicked,
 }
 
-/// The per-peer probe cache dir (`$XDG_CACHE_HOME`/`~/.cache` → mde/peers).
+/// The replicated peer-probe root — the QNM-Shared workgroup directory,
+/// where each node's `hardware_probe` worker publishes its
+/// `<peer>/mackesd/probe.json` (SUBAUDIT-D2). Was a per-HOME
+/// `~/.cache/mde/peers` that nothing populated, so the panel was
+/// permanently empty.
 #[must_use]
 pub fn peers_cache_dir() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-        return Some(PathBuf::from(xdg).join("mde").join("peers"));
-    }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".cache").join("mde").join("peers"))
+    Some(mackes_mesh_types::peers::default_workgroup_root())
 }
 
-/// Read every `<dir>/<peer>/probe.json` into a [`PeerProbe`], sorted by
+/// Read every `<dir>/<peer>/mackesd/probe.json` into a [`PeerProbe`], sorted by
 /// hostname. Junk-tolerant per FILE (an unparseable probe.json is
 /// skipped) — but EFF-45-honest per DIRECTORY: a missing dir is the
 /// legitimate empty state (no peer has published yet), while an
@@ -73,7 +73,7 @@ pub fn load_probes(dir: &Path) -> Result<Vec<PeerProbe>, String> {
     };
     let mut out: Vec<PeerProbe> = entries
         .filter_map(Result::ok)
-        .map(|e| e.path().join("probe.json"))
+        .map(|e| e.path().join("mackesd").join("probe.json"))
         .filter_map(|p| std::fs::read_to_string(p).ok())
         .filter_map(|raw| serde_json::from_str::<PeerProbe>(&raw).ok())
         .collect();
@@ -314,7 +314,8 @@ mod tests {
     use super::*;
 
     fn write_probe(dir: &Path, peer: &str, hostname: &str) {
-        let pdir = dir.join(peer);
+        // Mirrors the replicated layout: <root>/<peer>/mackesd/probe.json.
+        let pdir = dir.join(peer).join("mackesd");
         std::fs::create_dir_all(&pdir).unwrap();
         let mut probe = PeerProbe::fixture();
         probe.peer_id = peer.to_string();
@@ -332,7 +333,7 @@ mod tests {
         write_probe(tmp.path(), "p-2", "zeta");
         write_probe(tmp.path(), "p-1", "alpha");
         // A junk peer dir with an unparseable probe is skipped, not fatal.
-        let junk = tmp.path().join("p-3");
+        let junk = tmp.path().join("p-3").join("mackesd");
         std::fs::create_dir_all(&junk).unwrap();
         std::fs::write(junk.join("probe.json"), "not json").unwrap();
 

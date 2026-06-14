@@ -328,6 +328,10 @@ pub mod netdata_aggregator;
 // worker; writes the per-peer probe-inventory.json + announces
 // probe/changed on the Bus. Spawned in run_serve; reuses probe_nmap.
 pub mod probe;
+// SUBAUDIT-D2 — the missing PeerProbe producer: gathers this node's
+// hardware probe + writes it to the replicated directory so the
+// Workbench Hardware panel renders the fleet. Spawned in run_serve.
+pub mod hardware_probe;
 // notification_relay retired in BUS-4.2 (2026-05-26). Cross-peer
 // notification routing is now handled by the BUS-4.4 FDO bridge:
 // every Notify call publishes to `fdo/<app>` on the Mackes Bus,

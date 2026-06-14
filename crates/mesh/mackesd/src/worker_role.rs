@@ -33,6 +33,7 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     ("mdns_relay", 0),
     ("mesh_latency", 0),
     ("mesh_dns", 0),
+    ("hardware_probe", 0),
     ("bus_supervisor", 0),
     ("firewall_preset", 0),
     ("sshd_overlay_bind", 0),

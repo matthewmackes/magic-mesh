@@ -597,4 +597,4 @@ Live testing on .13 surfaced a run of empty panels — all four classes of subst
 - [✓] **SUBAUDIT-C1: declare helper-binary deps (nmap/resolvectl/firewalld/NetworkManager/podman/lizardfs-client/rsync) in the RPM + degrade honestly in the UI.** (nmap = Discovered Hosts.)
 - [ ] **SUBAUDIT-C2: probe — surface up-but-no-open-curated-port hosts** so Discovered Hosts lists reachable peers even when no scanned service is open (fast_argv uses `--open`; add a host-discovery pass / host element for up hosts). Plumbing now works (nmap declared+installed, targets from nebula-bundle.json, inventory written).
 - [ ] **SUBAUDIT-D1: https-tunnel on by default on all installs + tested; Mesh Services reports in-process workers correctly (not a phantom systemd unit).**
-- [ ] **SUBAUDIT-D2: Hardware panel — root-cause the empty per-peer hardware probe (data-source or worker-not-running).**
+- [✓] **SUBAUDIT-D2: Hardware panel — root-cause the empty per-peer hardware probe (data-source or worker-not-running).**

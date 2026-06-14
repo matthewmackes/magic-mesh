@@ -5954,6 +5954,22 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("probe".into());
 
+        // SUBAUDIT-D2 — hardware-probe producer. Gathers this node's
+        // PeerProbe (PCI/USB/kernel/power) + writes it to the replicated
+        // directory so every peer's Workbench Hardware panel renders the
+        // fleet. Was never built — the panel was permanently empty.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::hardware_probe::HardwareProbeWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("hardware_probe".into());
+
         // MON-1.b (v2.6) — Netdata aggregator-IP publisher.
         // Pairs with `apply_netdata_monitor`'s baseline
         // /etc/netdata/netdata.conf: when this peer wins
