@@ -58,7 +58,7 @@ pub const MESH_UNITS: &[(&str, UnitScope, &str)] = &[
     (
         "mackes-nebula-https-tunnel",
         UnitScope::System,
-        "TCP/443 covert tunnel for peers behind UDP-blocking firewalls (NF-1 fallback)",
+        "TCP/443 covert tunnel (NF-1 fallback) — in-process in mackesd: relay listener on public nodes, client fallback on NAT'd peers",
     ),
     (
         "mackesd",
@@ -504,6 +504,33 @@ pub fn probe_all_units() -> Vec<UnitStatus> {
 }
 
 fn probe_unit(name: &str, scope: UnitScope, description: &str) -> UnitStatus {
+    // SUBAUDIT-D1 — the covert :443 tunnel is an IN-PROCESS mackesd
+    // capability, not a systemd unit: the relay listener binds :443 on a
+    // public node, and on a NAT'd peer the client fallback rides mackesd.
+    // Checking a `mackes-nebula-https-tunnel` systemd unit always returned
+    // "not-found" → a permanent false "NOT INSTALLED". Report it as a
+    // facet of mackesd: active wherever mackesd is, with a local :443-bound
+    // upgrade to confirm the relay listener.
+    if name == "mackes-nebula-https-tunnel" {
+        let mackesd = systemctl_show_property("mackesd", UnitScope::System, "ActiveState");
+        let relay_listening = tcp_probe_443();
+        let active_state = if relay_listening {
+            "active".to_string()
+        } else if mackesd == "active" {
+            // Client fallback present (rides mackesd); listener not bound here.
+            "active".to_string()
+        } else {
+            mackesd
+        };
+        return UnitStatus {
+            name: name.to_string(),
+            scope,
+            description: description.to_string(),
+            active_state,
+            enable_state: "in-process".to_string(),
+            journal_tail: String::new(),
+        };
+    }
     // `LoadState` distinguishes "really missing" from
     // "inactive but exists". `ActiveState` reports inactive
     // for every unknown unit which would tag every uninstalled
@@ -528,6 +555,20 @@ fn probe_unit(name: &str, scope: UnitScope, description: &str) -> UnitStatus {
         enable_state,
         journal_tail,
     }
+}
+
+/// SUBAUDIT-D1 — is the covert :443 relay listener bound locally? A quick
+/// loopback TCP connect (200 ms) — `true` confirms the relay tunnel is up.
+fn tcp_probe_443() -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    "127.0.0.1:443"
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut a| a.next())
+        .map(|addr| {
+            TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)).is_ok()
+        })
+        .unwrap_or(false)
 }
 
 fn systemctl_show_property(name: &str, scope: UnitScope, property: &str) -> String {
