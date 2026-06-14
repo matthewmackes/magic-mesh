@@ -1597,6 +1597,17 @@ fn main() -> anyhow::Result<()> {
                 Ok(conn) => mackesd_core::health::HealthReport::from_store(&conn),
                 Err(_) => mackesd_core::health::HealthReport::empty(),
             };
+            // OB6-FIX-4 — node_count/health-buckets/is_leader from the LIVE
+            // directory + leader lease (the store nodes table read 0 on peers).
+            let root = mackesd_core::default_qnm_shared_root();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
+            let svc =
+                mackesd_core::ipc::directory::DirectoryService::new(&root, Some(db_path.clone()));
+            let (n, healthy, degraded, unreachable, is_leader) =
+                svc.mesh_health_counts(&default_node_id(), now_ms);
+            let report = report.with_mesh(n, healthy, degraded, unreachable, is_leader);
             println!("{}", report.to_json_line()?);
         }
         Cmd::Connect { ip, port } => match mackesd_core::connect_actions::connect_argv(&ip, port) {
@@ -6157,6 +6168,9 @@ fn run_serve(
                         worker_names: Arc::clone(&worker_names),
                         // EFF-24 — live worker status → healthz readiness.
                         worker_status: Some(Arc::clone(&worker_status)),
+                        // OB6-FIX-4 — live mesh size + leadership in healthz.
+                        workgroup_root: workgroup_root.clone(),
+                        node_id: node_id.clone(),
                     },
                 );
                 let resp_shutdown = Arc::clone(&shutdown);

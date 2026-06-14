@@ -146,6 +146,33 @@ impl DirectoryService {
         }
     }
 
+    /// ONBOARD-6 (OB6-FIX-4) — `(node_count, healthy, degraded, unreachable,
+    /// is_leader)` for the healthz surfaces, from the LIVE directory + the
+    /// leader lease rather than the store's enrolled-nodes table. This is the
+    /// same peer set `mackesd peers` shows, so the Mesh-Control healthz card
+    /// now matches the Inventory + reflects the elected leader.
+    #[must_use]
+    pub fn mesh_health_counts(&self, node_id: &str, now_ms: u64) -> (u32, u32, u32, u32, bool) {
+        let dir = self.build_directory(now_ms);
+        let peers = dir["peers"].as_array().cloned().unwrap_or_default();
+        let total = u32::try_from(peers.len()).unwrap_or(u32::MAX);
+        let (mut healthy, mut degraded, mut unreachable) = (0u32, 0u32, 0u32);
+        for p in &peers {
+            match p["health"].as_str() {
+                Some("healthy") => healthy += 1,
+                Some("degraded") => degraded += 1,
+                _ => {}
+            }
+            if p["presence"].as_str() == Some("offline") {
+                unreachable += 1;
+            }
+        }
+        let is_leader =
+            crate::leader::read_current_lease(&self.workgroup_root.join(".mackesd-leader.lock"))
+                .is_some_and(|l| l.node_id == node_id);
+        (total, healthy, degraded, unreachable, is_leader)
+    }
+
     /// Build the full directory reply (the verb body + the CLI both
     /// call this).
     #[must_use]

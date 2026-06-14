@@ -137,6 +137,29 @@ impl HealthReport {
         self
     }
 
+    /// ONBOARD-6 (OB6-FIX-4) — override the mesh-size + leadership fields
+    /// from the LIVE directory (QNM-Shared heartbeats) + the leader lease,
+    /// instead of the store's `nodes` table. The store only holds rows the
+    /// leader has enrolled; the live mesh view is the replicated directory,
+    /// which is what `mackesd peers` shows — so the healthz card now matches
+    /// the Inventory (was: `node_count:0` / `is_leader:false` stubs).
+    #[must_use]
+    pub fn with_mesh(
+        mut self,
+        node_count: u32,
+        healthy: u32,
+        degraded: u32,
+        unreachable: u32,
+        is_leader: bool,
+    ) -> Self {
+        self.node_count = node_count;
+        self.healthy_nodes = healthy;
+        self.degraded_nodes = degraded;
+        self.unreachable_nodes = unreachable;
+        self.is_leader = is_leader;
+        self
+    }
+
     /// JSON one-liner for `mackesd healthz`. Stable shape — every
     /// field always present, no schema-conditional keys.
     ///

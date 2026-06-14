@@ -70,6 +70,13 @@ pub struct ShellState {
     /// reports `workers_alive`/`workers_total`/`breaker_tripped`
     /// and folds them into the `ready` verdict.
     pub worker_status: Option<crate::workers::WorkerStatusMap>,
+    /// ONBOARD-6 (OB6-FIX-4) — QNM-Shared root + this node's id, so
+    /// `healthz` reports `node_count`/`is_leader` from the live directory
+    /// + leader lease (not the store's enrolled-nodes stub). Empty root
+    /// disables the enrichment (the store-derived counts stand).
+    pub workgroup_root: PathBuf,
+    /// Stable node id, for the leader-lease holder check.
+    pub node_id: String,
 }
 
 impl ShellService {
@@ -122,6 +129,23 @@ impl ShellService {
                 report.with_worker_status(alive, total, tripped)
             }
             None => report,
+        };
+        // OB6-FIX-4 — override node_count/health-buckets/is_leader from the
+        // live directory + leader lease (the store nodes table is the wrong
+        // source — it only holds enrolled rows, so it read 0 on every peer).
+        let report = if self.state.workgroup_root.as_os_str().is_empty() {
+            report
+        } else {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
+            let svc = crate::ipc::directory::DirectoryService::new(
+                &self.state.workgroup_root,
+                Some(self.state.db_path.clone()),
+            );
+            let (n, healthy, degraded, unreachable, is_leader) =
+                svc.mesh_health_counts(&self.state.node_id, now_ms);
+            report.with_mesh(n, healthy, degraded, unreachable, is_leader)
         };
         report
             .to_json_line()
@@ -258,6 +282,8 @@ mod tests {
             db_path: PathBuf::from("/tmp/test.sqlite"),
             worker_names: Arc::clone(&names_shared),
             worker_status: None,
+            workgroup_root: PathBuf::new(),
+            node_id: String::new(),
         };
         let svc = ShellService::new(state);
         assert_eq!(
@@ -282,6 +308,8 @@ mod tests {
             db_path: PathBuf::new(),
             worker_names: Arc::clone(&names_shared),
             worker_status: None,
+            workgroup_root: PathBuf::new(),
+            node_id: String::new(),
         };
         let svc = ShellService::new(state);
         names_shared.lock().unwrap().push("kdc_host".into());

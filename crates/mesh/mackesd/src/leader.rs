@@ -164,6 +164,21 @@ pub fn try_acquire(lock_path: &Path, node_id: &str) -> std::io::Result<AcquireRe
     Ok(AcquireResult::Acquired)
 }
 
+/// Read-only: the current **non-expired** leader lease, or `None` when
+/// the lock is absent/empty or the lease has aged past
+/// [`LEASE_DURATION`]. Acquires nothing — for status surfaces (healthz)
+/// that need to know *who* leads without contending for the lock.
+#[must_use]
+pub fn read_current_lease(lock_path: &Path) -> Option<Lease> {
+    let mut file = OpenOptions::new().read(true).open(lock_path).ok()?;
+    let lease = read_lease(&mut file).ok().flatten()?;
+    if lease.is_expired(now_s()) {
+        None
+    } else {
+        Some(lease)
+    }
+}
+
 /// Force this peer into leadership by writing a fresh lease with a
 /// bumped epoch. Used by `mackesd take-leadership --force` (the
 /// operator's last resort when automatic resolution wedges).
