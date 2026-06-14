@@ -5630,6 +5630,25 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("upgrade_intent_watcher".into());
 
+        // ONBOARD-6 — continuous leader election. Renews the
+        // <QNM-Shared>/.mackesd-leader.lock lease every 20s so exactly one
+        // node always holds leadership (previously only the upgrade watcher
+        // touched the lock, and only while an upgrade was in flight, so a
+        // steady-state mesh had NO LEADER and every leader-gated surface was
+        // dark). Runs on every node; the shared QNM-Shared mount makes them
+        // contend for the same lock.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::leader_election::LeaderElection::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("leader_election".into());
+
         // PRINT-2..PRINT-6 + PRINT-8 (v5.0.0) — auto CUPS print
         // sharing + sync. Spawned on headless + full; SKIPPED on
         // lighthouse (routing-only, no printers — Q8 lock). The

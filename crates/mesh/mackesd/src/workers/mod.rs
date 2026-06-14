@@ -204,6 +204,11 @@ pub mod nebula_https_listener;
 // single-use bearer; endpoint identity is the token-pinned self-signed
 // cert. Spawned under am_lighthouse; warn-and-exit on peer-role boxes.
 pub mod nebula_enroll_listener;
+// ONBOARD-6 — continuous leader election: renews the lease on
+// <QNM-Shared>/.mackesd-leader.lock every 20s so a leader is always
+// elected (the upgrade watcher only acquired it opportunistically, so
+// steady-state meshes had NO LEADER + dark leader-gated surfaces).
+pub mod leader_election;
 // NF-18.4 (v2.5) — Daily encrypted CA backup worker. Writes
 // sealed (Argon2id + XChaCha20-Poly1305) bundles to
 // QNM-Shared/<self>/mackesd/ca-backup.enc on a 24h tick.

@@ -354,6 +354,10 @@ assets = [
     { source = "packaging/systemd/nebula.service.d/10-mesh-recovery.conf", dest = "/usr/lib/systemd/system/nebula.service.d/10-mesh-recovery.conf", mode = "644" },
     { source = "install-helpers/mesh-health-check.sh",   dest = "/usr/libexec/mackesd/mesh-health-check",       mode = "755" },
     { source = "install-helpers/mesh-alert.sh",          dest = "/usr/libexec/mackesd/mesh-alert",              mode = "755" },
+    # ONBOARD-6 — QNM-Shared (LizardFS) setup: stands up the replicated
+    # shared-state volume over the overlay, boot-durable. Run per-node with
+    # --master/--chunkserver/--client (see the script header).
+    { source = "install-helpers/setup-qnm-shared.sh",    dest = "/usr/libexec/mackesd/setup-qnm-shared",        mode = "755" },
     { source = "packaging/systemd/mde-musicd.service", dest = "/usr/lib/systemd/user/mde-musicd.service", mode = "644" },
     # EFF-43 / VV-1 — the voice-stack units, shipped DISABLED (the
     # operator/fleet policy enables them; ExecStartPre regenerates the
