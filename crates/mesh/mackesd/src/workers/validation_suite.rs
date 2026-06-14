@@ -252,6 +252,13 @@ impl Worker for ValidationSuiteWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
+        // The Workbench Routing panel shells `mackesd validate run` as the
+        // uid-1000 desktop user, which drops `validation/runnow` here — but
+        // mackesd (root) owns the QNM-Shared mount, so a root-owned dir
+        // rejects that write ("Permission denied"). Pre-create the request
+        // dir sticky-world-writable (like /tmp) so the GUI can request a
+        // run; this worker (root) consumes + removes the marker.
+        ensure_request_dir(&self.workgroup_root.join("validation"));
         loop {
             let this = ValidationSuiteWorker {
                 workgroup_root: self.workgroup_root.clone(),
@@ -267,6 +274,21 @@ impl Worker for ValidationSuiteWorker {
                 () = tokio::time::sleep(POLL) => {}
             }
         }
+    }
+}
+
+/// Create `dir` (and parents) and relax it to sticky world-writable
+/// (`1777`) so the uid-1000 desktop GUI can drop a request marker into a
+/// mount that mackesd owns as root. Best-effort: a chmod failure (e.g. a
+/// read-only replica) is logged and ignored, never fatal.
+fn ensure_request_dir(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!(error = %e, dir = %dir.display(), "validation_suite: request dir create failed");
+        return;
+    }
+    if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o1777)) {
+        tracing::debug!(error = %e, dir = %dir.display(), "validation_suite: request dir chmod skipped");
     }
 }
 

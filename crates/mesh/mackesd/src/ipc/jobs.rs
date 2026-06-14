@@ -232,6 +232,7 @@ mod tests {
                 last_seen_ms: 1,
                 health: "healthy".into(),
                 descriptors: None,
+                overlay_ip: None,
             },
         )
         .unwrap();

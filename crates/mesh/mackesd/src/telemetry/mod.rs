@@ -183,6 +183,10 @@ pub fn spawn_heartbeat_worker(
                     health,
                 );
                 rec.descriptors = Some(descriptors);
+                // Record our own overlay IP into the replicated directory so
+                // every node (not just the signer) can resolve <host>.mesh,
+                // publish overlay services, and validate routing edges.
+                rec.overlay_ip = crate::voip_rtt::own_nebula_ip();
                 match mackes_mesh_types::peers::write_peer_record(&peers_dir, &rec) {
                     Ok(_) => last_peer_write = Some(std::time::Instant::now()),
                     Err(e) => tracing::warn!(error = %e, "peer-record: write failed"),

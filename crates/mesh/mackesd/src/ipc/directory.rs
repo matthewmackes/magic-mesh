@@ -94,7 +94,15 @@ pub fn directory_row(
         "health": rec.health,
         "mde_version": rec.mde_version,
         "descriptors": rec.descriptors,
-        "overlay_ip": overlay.map(|(ip, _)| ip.clone()),
+        // Prefer the overlay IP the peer recorded into its own replicated
+        // record (available mesh-wide); fall back to the local nebula
+        // roster mirror (only populated on the signer). This is what lets
+        // a peer's Mesh DNS / Service Publishing / Routing panels resolve
+        // overlay addresses instead of showing empty.
+        "overlay_ip": rec
+            .overlay_ip
+            .clone()
+            .or_else(|| overlay.map(|(ip, _)| ip.clone())),
         "role": overlay.map(|(_, role)| role.clone()),
         "tags": tags,
         "revision": {
@@ -519,6 +527,7 @@ mod tests {
                 last_seen_ms: now,
                 health: "healthy".into(),
                 descriptors: None,
+                overlay_ip: None,
             },
         )
         .unwrap();
@@ -577,6 +586,7 @@ mod tests {
                 last_seen_ms: now,
                 health: "healthy".into(),
                 descriptors: None,
+                overlay_ip: None,
             },
         )
         .unwrap();
@@ -609,6 +619,7 @@ mod tests {
                 last_seen_ms: now,
                 health: "unknown".into(),
                 descriptors: None,
+                overlay_ip: None,
             },
         )
         .unwrap();
@@ -688,6 +699,7 @@ mod tests {
             last_seen_ms: now,
             health: "healthy".into(),
             descriptors: None,
+            overlay_ip: None,
         };
         write_peer_record(&pdir, &rec).unwrap();
 

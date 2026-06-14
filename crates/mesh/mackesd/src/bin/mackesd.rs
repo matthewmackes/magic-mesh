@@ -2408,9 +2408,17 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Cmd::FleetStatus { json } => {
-            let conn = mackesd_core::store::open(&db_path)
-                .with_context(|| format!("opening store at {}", db_path.display()))?;
-            let nodes = mackesd_core::store::list_nodes(&conn).context("listing nodes")?;
+            // Roster source is the replicated directory, not the local
+            // sqlite `nodes` table (empty mesh-wide — see
+            // directory_to_node_rows). This is what makes Fleet Rollup
+            // group the real fleet instead of "no enrolled nodes".
+            let root = mackesd_core::default_qnm_shared_root();
+            let svc =
+                mackesd_core::ipc::directory::DirectoryService::new(&root, Some(db_path.clone()));
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
+            let nodes = directory_to_node_rows(&svc.build_directory(now));
             let pairs: Vec<(String, String)> = nodes
                 .iter()
                 .map(|n| (n.role.clone(), n.health.clone()))

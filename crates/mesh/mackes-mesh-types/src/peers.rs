@@ -38,6 +38,14 @@ pub struct PeerRecord {
     /// summary. `None` from pre-PD-2 writers; readers tolerate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub descriptors: Option<ServiceDescriptors>,
+    /// This peer's own Nebula overlay IP (`nebula1`), recorded by the
+    /// node itself each heartbeat so the directory carries it mesh-wide.
+    /// Previously the overlay IP lived only in the signer's local sqlite
+    /// nebula roster, so peers (whose sqlite is empty) rendered Mesh DNS /
+    /// Service Publishing / Routing with no overlay addresses. `None` from
+    /// pre-overlay-IP writers / pre-enrollment; readers tolerate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_ip: Option<String>,
 }
 
 /// PD-2 (L10–L15) — a peer's locally-probed service inventory,
@@ -143,6 +151,7 @@ impl PeerRecord {
             last_seen_ms: now_ms(),
             health: health.into(),
             descriptors: None,
+            overlay_ip: None,
         }
     }
 
