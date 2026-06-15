@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Magic Mesh Notification Hub
+Comment=Mesh + desktop alert center — grouped, color-coded, on the live bus (NOTIFY)
+Exec=mde-notify-center
+Icon=magic-mesh
+Terminal=false
+Categories=System;Utility;
+Keywords=notifications;alerts;mesh;hub;

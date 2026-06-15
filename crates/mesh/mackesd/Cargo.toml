@@ -334,6 +334,11 @@ assets = [
     # (mde-workbench src/bin/mde-mesh-wallpaper.rs); verified building
     # 2026-06-12 (AUD2-7 cleared as a false positive).
     { source = "target/release/mde-mesh-wallpaper", dest = "/usr/bin/mde-mesh-wallpaper", mode = "755" },
+    # NOTIFY-3 — the MDE-Notification-Hub center (layer-shell slide-out).
+    # Auto-discovered bin (mde-workbench src/bin/mde-notify-center.rs); launched
+    # on demand (app launcher + the applet bell, NOTIFY-7), not autostarted.
+    { source = "target/release/mde-notify-center",  dest = "/usr/bin/mde-notify-center",  mode = "755" },
+    { source = "packaging/applications/org.magicmesh.NotifyCenter.desktop", dest = "/usr/share/applications/org.magicmesh.NotifyCenter.desktop", mode = "644" },
     { source = "target/release/mde-voice-hud",      dest = "/usr/bin/mde-voice-hud",      mode = "755" },
     { source = "target/release/mde-music",          dest = "/usr/bin/mde-music",          mode = "755" },
     { source = "target/release/mde-musicd",         dest = "/usr/bin/mde-musicd",         mode = "755" },

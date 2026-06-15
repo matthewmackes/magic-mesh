@@ -619,7 +619,7 @@ A professional, themed, desktop-wide notification center replacing the Cosmic tr
     - [ ] one classifier fn maps topic prefix → Source (Security/Presence/Firewall/Compute/DesktopApp/Peer/System)
     - [ ] severity derives from the alert `severity` field AND/OR bus `Priority`; unit-tested both ways
     - [ ] severity→`mde_theme::Palette` token map (danger/warning/accent/success) — no raw hex (§4 lint clean)
-- [ ] **NOTIFY-3: the standalone center — layer-shell slide-out table view.**
+- [✓] **NOTIFY-3: the standalone center — layer-shell slide-out table view.**
   **As** a Cosmic desktop user,
   **I want** a themed slide-out center listing alerts grouped by source with severity color + glyphs,
   **so that** I can see the full alert history regardless of whether the Workbench is open.

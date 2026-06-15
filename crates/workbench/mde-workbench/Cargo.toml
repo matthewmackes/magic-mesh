@@ -91,6 +91,9 @@ mde-musicd = { path = "../../services/mde-musicd" }
 # NAME is still owned for single-instance detection (finding #3
 # documented exception); only the method moves to the Bus.
 mde-bus = { path = "../../platform/mde-bus" }
+# NOTIFY-3 — the mde-notify-center layer-shell bin reads the alert model + bus
+# tail from the render-agnostic mde-notify crate.
+mde-notify = { path = "../../services/mde-notify" }
 
 [features]
 # `wayland` (default): Iced renders via Wayland/wgpu.
