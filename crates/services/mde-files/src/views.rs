@@ -988,9 +988,42 @@ pub fn peer_folder<'a>(
     .into()
 }
 
+// ─── Shared file-list renderer (AFM-7) ──────────────────────────────────────
+
+/// AFM-7 — render a file listing honoring the layout toggle: **List** = dense
+/// 28px tabular rows under a column header; **Grid** = `ObjectCard`s. Shared by
+/// Inbox / Downloads / Peer folder so the toolbar's grid/list switch is live on
+/// every file view, not just the peer folder.
+fn file_listing(
+    rows: &[FileRow],
+    show_src: bool,
+    head_label: &str,
+    layout: Layout,
+    selection: &Selection,
+) -> Element<'static, Message> {
+    let mut list = match layout {
+        Layout::List => column![file_row_head(head_label)],
+        Layout::Grid => column![].spacing(8),
+    };
+    for f in rows {
+        let sel = selection.is_selected(&f.name);
+        let foc = selection.is_focused(&f.name);
+        let el = match layout {
+            Layout::List => list_row(f.clone(), show_src, sel, foc),
+            Layout::Grid => file_row(f.clone(), show_src, sel, foc),
+        };
+        list = list.push(el);
+    }
+    list.into()
+}
+
 // ─── Inbox ─────────────────────────────────────────────────────────────────
 
-pub fn inbox<'a>(snap: &'a BackendSnapshot, selection: &'a Selection) -> Element<'a, Message> {
+pub fn inbox<'a>(
+    snap: &'a BackendSnapshot,
+    layout: Layout,
+    selection: &'a Selection,
+) -> Element<'a, Message> {
     let self_node = &snap.self_node;
     let unique_senders = {
         let mut hosts: Vec<&str> = snap
@@ -1016,12 +1049,7 @@ pub fn inbox<'a>(snap: &'a BackendSnapshot, selection: &'a Selection) -> Element
         ],
     );
 
-    let mut list = column![file_row_head("From")];
-    for f in &snap.inbox {
-        let sel = selection.is_selected(&f.name);
-        let foc = selection.is_focused(&f.name);
-        list = list.push(file_row(f.clone(), true, sel, foc));
-    }
+    let list = file_listing(&snap.inbox, true, "From", layout, selection);
 
     column![
         banner_widget,
@@ -1034,7 +1062,11 @@ pub fn inbox<'a>(snap: &'a BackendSnapshot, selection: &'a Selection) -> Element
 
 // ─── Downloads ─────────────────────────────────────────────────────────────
 
-pub fn downloads<'a>(snap: &'a BackendSnapshot, selection: &'a Selection) -> Element<'a, Message> {
+pub fn downloads<'a>(
+    snap: &'a BackendSnapshot,
+    layout: Layout,
+    selection: &'a Selection,
+) -> Element<'a, Message> {
     let mesh_count = snap.downloads.iter().filter(|d| d.mesh.is_some()).count();
 
     let banner_widget = banner(
@@ -1050,12 +1082,7 @@ pub fn downloads<'a>(snap: &'a BackendSnapshot, selection: &'a Selection) -> Ele
         ],
     );
 
-    let mut list = column![file_row_head("Origin")];
-    for f in &snap.downloads {
-        let sel = selection.is_selected(&f.name);
-        let foc = selection.is_focused(&f.name);
-        list = list.push(file_row(f.clone(), true, sel, foc));
-    }
+    let list = file_listing(&snap.downloads, true, "Origin", layout, selection);
 
     column![
         banner_widget,
@@ -1074,6 +1101,7 @@ pub fn downloads<'a>(snap: &'a BackendSnapshot, selection: &'a Selection) -> Ele
 pub fn local_browser<'a>(
     files: &'a [crate::model::FileRow],
     path: &'a str,
+    layout: Layout,
     selection: &'a Selection,
 ) -> Element<'a, Message> {
     let up = button(icon(icons::ARROW_LEFT, 16.0, t::FG))
@@ -1087,7 +1115,10 @@ pub fn local_browser<'a>(
     .spacing(8)
     .align_y(cosmic::iced::alignment::Vertical::Center);
 
-    let mut list = column![file_row_head("Name")];
+    let mut list = match layout {
+        Layout::List => column![file_row_head("Name")],
+        Layout::Grid => column![].spacing(8),
+    };
     if files.is_empty() {
         list = list.push(
             container(text("Empty folder").size(12).colr(t::FG_DIM))
@@ -1099,9 +1130,14 @@ pub fn local_browser<'a>(
             let foc = selection.is_focused(&f.name);
             // AFM-4 — every local row is now actionable: clicking descends a
             // directory or opens a file (LocalActivate resolves the path in the
-            // reducer). Was an inert card that no click reached.
+            // reducer). Was an inert card that no click reached. AFM-7 — the
+            // row shape honors the toolbar list/grid toggle.
+            let row_el = match layout {
+                Layout::List => list_row(f.clone(), true, sel, foc),
+                Layout::Grid => file_row(f.clone(), true, sel, foc),
+            };
             list = list.push(
-                button(file_row(f.clone(), true, sel, foc))
+                button(row_el)
                     .padding(0)
                     .width(Length::Fill)
                     .sty(|_, _| ghost_button_style())
@@ -1279,7 +1315,7 @@ pub fn mesh_home_child<'a>(
     slug: &'a str,
     files: Vec<FileRow>,
     search: &'a str,
-    _layout: Layout,
+    layout: Layout,
     path: &'a [String],
     selection: &'a Selection,
 ) -> Element<'a, Message> {
@@ -1314,7 +1350,10 @@ pub fn mesh_home_child<'a>(
         vec![BannerStat::new(count.to_string(), "Items")],
     );
 
-    let mut list = column![file_row_head("Modified")];
+    let mut list = match layout {
+        Layout::List => column![file_row_head("Modified")],
+        Layout::Grid => column![].spacing(8),
+    };
     // Parent-link row when descended at least one level.
     if !path.is_empty() {
         list = list.push(parent_link_row());
@@ -1329,7 +1368,12 @@ pub fn mesh_home_child<'a>(
         } else {
             let sel = selection.is_selected(&f.name);
             let foc = selection.is_focused(&f.name);
-            list = list.push(file_row(f, false, sel, foc));
+            // AFM-7 — honor the list/grid toggle for file rows.
+            let row_el = match layout {
+                Layout::List => list_row(f, false, sel, foc),
+                Layout::Grid => file_row(f, false, sel, foc),
+            };
+            list = list.push(row_el);
         }
     }
 
