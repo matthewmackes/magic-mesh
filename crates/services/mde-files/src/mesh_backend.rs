@@ -137,7 +137,7 @@ impl MeshBackend {
             .enable_all()
             .build()
             .map_err(|e| MeshError::Unavailable(format!("tokio runtime: {e}")))?;
-        let bus_dir = mde_bus::default_data_dir()
+        let bus_dir = mde_bus::client_data_dir()
             .ok_or_else(|| MeshError::Unavailable("no Bus data dir".into()))?;
         // Liveness probe — one `action/nebula/status` round-trip. If
         // mackesd's responder isn't up it times out, mirroring the

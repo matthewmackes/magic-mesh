@@ -155,7 +155,7 @@ impl BusBackend {
             .enable_all()
             .build()
             .map_err(|e| BackendError::Rejected(format!("tokio runtime: {e}")))?;
-        let bus_dir = mde_bus::default_data_dir()
+        let bus_dir = mde_bus::client_data_dir()
             .ok_or_else(|| BackendError::Rejected("no Bus data dir".into()))?;
         rt.block_on(async {
             let persist = mde_bus::persist::Persist::open(bus_dir.clone())
