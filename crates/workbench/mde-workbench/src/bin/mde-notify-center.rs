@@ -144,11 +144,34 @@ fn theme(_s: &Center, _id: window::Id) -> Theme {
     )
 }
 
+/// NOTIFY-AC — the Now-Playing snapshot for the Music section.
+#[derive(Debug, Clone, Default)]
+struct MusicNow {
+    active: bool,
+    playing: bool,
+    title: String,
+    artist: String,
+}
+
+/// NOTIFY-AC — the voice agent snapshot for the Voice section.
+#[derive(Debug, Clone, Default)]
+struct VoiceStatus {
+    registered: bool,
+    listening: bool,
+    detail: String,
+    /// True when the snapshot's `ts` is within the staleness window (live agent).
+    fresh: bool,
+}
+
 struct Center {
     items: Vec<AlertItem>,
     tail: AlertTail,
     /// Source-group labels the operator collapsed.
     collapsed: HashSet<String>,
+    /// NOTIFY-AC — Now-Playing snapshot (`None` until first poll / music idle).
+    music: Option<MusicNow>,
+    /// NOTIFY-AC — voice agent snapshot (`None` when no agent has published).
+    voice: Option<VoiceStatus>,
 }
 
 impl Center {
@@ -157,6 +180,8 @@ impl Center {
             items: Vec::new(),
             tail: AlertTail::default(),
             collapsed: HashSet::new(),
+            music: None,
+            voice: None,
         }
     }
 }
@@ -176,6 +201,95 @@ enum Message {
     Close,
     /// Launch one of the bottom quick-launch apps and close the panel.
     OpenApp(&'static str),
+    /// NOTIFY-AC — music transport: previous / play-pause toggle / next.
+    MusicPrev,
+    MusicToggle,
+    MusicNext,
+}
+
+/// NOTIFY-AC — fetch the Now-Playing snapshot over the bus (best-effort, short
+/// timeouts). `None` when music is idle / the daemon is down.
+fn fetch_music() -> Option<MusicNow> {
+    use std::time::Duration;
+    // get-state: flat transport reply {ok, playing, active, song_id, ...}.
+    let state =
+        mde_workbench::dbus::action_request("action/music/get-state", Duration::from_millis(700))?;
+    let sv: serde_json::Value = serde_json::from_str(&state).ok()?;
+    if sv.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Some(MusicNow::default());
+    }
+    let active = sv
+        .get("active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let song_id = sv
+        .get("song_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !active || song_id.is_empty() {
+        return Some(MusicNow::default());
+    }
+    let playing = sv
+        .get("playing")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    // get-song: browse reply {ok, result:{song:{title, artist}}}.
+    let body = serde_json::json!({ "id": song_id }).to_string();
+    let (title, artist) = mde_workbench::dbus::action_request_with_body(
+        "action/music/get-song",
+        Some(&body),
+        Duration::from_millis(700),
+    )
+    .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
+    .and_then(|v| {
+        let song = v.get("result")?.get("song")?;
+        let title = song
+            .get("title")
+            .and_then(serde_json::Value::as_str)?
+            .to_string();
+        let artist = song
+            .get("artist")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Some((title, artist))
+    })
+    .unwrap_or_else(|| ("Unknown track".to_string(), String::new()));
+    Some(MusicNow {
+        active: true,
+        playing,
+        title,
+        artist,
+    })
+}
+
+/// NOTIFY-AC — read the latest `state/voice/status` snapshot from the bus.
+/// `fresh` is true when the agent's `ts` is within ~3× its heartbeat (live).
+fn fetch_voice() -> Option<VoiceStatus> {
+    let dir = mde_bus::client_data_dir()?;
+    let persist = mde_bus::persist::Persist::open(dir).ok()?;
+    // Newest message on the topic = the last row (list_since orders by ulid asc).
+    let last = persist.list_since("state/voice/status", None).ok()?.pop()?;
+    let body = last.body.as_deref().unwrap_or("");
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let now = (now_ms() / 1000).max(0) as u64;
+    let ts = v.get("ts").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    Some(VoiceStatus {
+        registered: v
+            .get("registered")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        listening: v
+            .get("listening")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        detail: v
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        fresh: now.saturating_sub(ts) <= 45,
+    })
 }
 
 fn subscription(_s: &Center) -> Subscription<Message> {
@@ -230,6 +344,27 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
                     state.items.truncate(MAX_ROWS);
                 }
             }
+            // NOTIFY-AC — refresh the Music + Voice section snapshots.
+            state.music = fetch_music();
+            state.voice = fetch_voice();
+        }
+        Message::MusicPrev | Message::MusicToggle | Message::MusicNext => {
+            use std::time::Duration;
+            // Resume vs pause depends on the live state; default to resume.
+            let verb = match message {
+                Message::MusicPrev => "action/music/prev",
+                Message::MusicNext => "action/music/next",
+                _ => {
+                    if state.music.as_ref().is_some_and(|m| m.playing) {
+                        "action/music/pause"
+                    } else {
+                        "action/music/resume"
+                    }
+                }
+            };
+            let _ = mde_workbench::dbus::action_request(verb, Duration::from_millis(700));
+            // Reflect the new transport state immediately.
+            state.music = fetch_music();
         }
         Message::ToggleGroup(label) => {
             if !state.collapsed.remove(&label) {
@@ -409,10 +544,124 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
     .padding(Padding::from([10u16, 14u16]))
     .width(Length::Fill);
 
-    container(column![container(scroll).height(Length::Fill), launch_bar,].spacing(0))
-        .width(Length::Fill)
-        .height(Length::Fill)
+    container(
+        column![
+            container(scroll).height(Length::Fill),
+            section_divider(p),
+            now_playing_section(state.music.as_ref(), p),
+            section_divider(p),
+            voice_section(state.voice.as_ref(), p),
+            launch_bar,
+        ]
+        .spacing(0),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
+
+/// A thin horizontal divider between the pinned bottom sections.
+fn section_divider(p: Palette) -> Element<'static, Message> {
+    container(Space::new().width(Length::Fill).height(Length::Fixed(1.0)))
+        .style(move |_| container::Style {
+            snap: false,
+            background: Some(cosmic::iced::Background::Color(
+                p.border.into_cosmic_color(),
+            )),
+            ..Default::default()
+        })
         .into()
+}
+
+/// NOTIFY-AC — the "Now Playing" media section: track line + transport controls.
+/// Honest idle state when nothing is playing / the music daemon is down.
+fn now_playing_section(music: Option<&MusicNow>, p: Palette) -> Element<'static, Message> {
+    let body: Element<'static, Message> = match music {
+        Some(m) if m.active => {
+            let track = if m.artist.is_empty() {
+                m.title.clone()
+            } else {
+                format!("{} — {}", m.title, m.artist)
+            };
+            let toggle_glyph = if m.playing { "⏸" } else { "▶" };
+            row![
+                text("♪").size(14).color(p.accent.into_cosmic_color()),
+                Space::new().width(Length::Fixed(8.0)),
+                text(track)
+                    .size(12)
+                    .color(p.text.into_cosmic_color())
+                    .width(Length::Fill),
+                transport_button("⏮", Message::MusicPrev, p),
+                transport_button(toggle_glyph, Message::MusicToggle, p),
+                transport_button("⏭", Message::MusicNext, p),
+            ]
+            .align_y(cosmic::iced::Alignment::Center)
+            .into()
+        }
+        _ => text("♪  Nothing playing")
+            .size(12)
+            .color(p.text_muted.into_cosmic_color())
+            .into(),
+    };
+    container(body)
+        .padding(Padding::from([10u16, 14u16]))
+        .width(Length::Fill)
+        .into()
+}
+
+/// NOTIFY-AC — the Voice section: agent registration + listening state.
+fn voice_section(voice: Option<&VoiceStatus>, p: Palette) -> Element<'static, Message> {
+    let (glyph, gcolor, line) = match voice {
+        Some(v) if v.fresh => {
+            let g = if v.listening { "●" } else { "○" };
+            let c = if v.listening {
+                p.success
+            } else if v.registered {
+                p.accent
+            } else {
+                p.text_muted
+            };
+            let detail = if v.detail.is_empty() {
+                if v.registered {
+                    "registered".to_string()
+                } else {
+                    "not registered".to_string()
+                }
+            } else {
+                v.detail.clone()
+            };
+            let listen = if v.listening { " · listening" } else { "" };
+            (g, c, format!("Voice · {detail}{listen}"))
+        }
+        _ => ("○", p.text_muted, "Voice · agent offline".to_string()),
+    };
+    container(
+        row![
+            text(glyph).size(13).color(gcolor.into_cosmic_color()),
+            Space::new().width(Length::Fixed(8.0)),
+            text(line)
+                .size(12)
+                .color(p.text.into_cosmic_color())
+                .width(Length::Fill),
+            action_button("Open", Message::OpenApp("mde-voice-hud"), p),
+        ]
+        .align_y(cosmic::iced::Alignment::Center),
+    )
+    .padding(Padding::from([10u16, 14u16]))
+    .width(Length::Fill)
+    .into()
+}
+
+/// A compact transport control button.
+fn transport_button(glyph: &str, msg: Message, p: Palette) -> Element<'_, Message> {
+    button(
+        text(glyph.to_string())
+            .size(14)
+            .color(p.text.into_cosmic_color()),
+    )
+    .padding(Padding::from([4u16, 8u16]))
+    .on_press(msg)
+    .into()
 }
 
 /// A bottom quick-launch tile: label + the binary it spawns (`OpenApp`).
