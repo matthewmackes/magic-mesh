@@ -41,6 +41,10 @@ pub enum Message {
     CycleTab,
     /// E10 — navigate the Local browser to the parent directory.
     LocalUp,
+    /// AFM-4 — activate a Local-browser row by its display name: descend into a
+    /// directory, or open a file with its default app (`xdg-open`). The reducer
+    /// resolves the name against the current `local_files` listing for the path.
+    LocalActivate(String),
     /// E10 — jump the Local browser to an absolute path (sidebar quick-access:
     /// Home / XDG dirs / the GVfs network-mount dir for mounted SMB shares).
     LocalGoto(String),
@@ -51,6 +55,11 @@ pub enum Message {
     /// E10 — Network view: mount a share over GVfs + open it in the browser.
     NetMount(String),
     ToggleLocal,
+    /// AFM-2 — collapse / expand the sidebar rail.
+    ToggleSidebar,
+    /// AFM-2 — the "+ Peer" footer button: launch the workbench (where mesh
+    /// enrollment / peer registration lives).
+    OpenRegistration,
     SetLayout(Layout),
     SearchChanged(String),
     Refresh,
@@ -250,6 +259,10 @@ pub struct MdeFiles {
     /// E10.5 — index into `tabs` of the currently-shown tab.
     pub active_tab: usize,
     pub local_open: bool,
+    /// AFM-2 — sidebar collapse state. When true the full rail is replaced by a
+    /// slim button strip (the prototype's `.sidebar-collapsed` 0px grid), with
+    /// the panel-toggle still reachable to expand it again.
+    pub sidebar_collapsed: bool,
     pub layout: Layout,
     pub search: String,
     /// AF-mesh.3 — path stack inside `View::MeshHomeChild(slug)`.
@@ -353,6 +366,7 @@ impl Default for MdeFiles {
             tabs: vec![crate::model::Tab::default()],
             active_tab: 0,
             local_open: false,
+            sidebar_collapsed: false,
             layout: Layout::default(),
             search: String::new(),
             mesh_home_path: Vec::new(),
@@ -478,6 +492,21 @@ impl MdeFiles {
                 self.view = View::Local;
                 self.selection.clear();
             }
+            Message::LocalActivate(name) => {
+                // AFM-4 — resolve the clicked row in the current listing and
+                // either descend (directory) or launch it (file). The
+                // end-of-update refresh re-lists the new directory.
+                if let Some(row) = self.local_files.iter().find(|r| r.name == name) {
+                    if let Some(path) = row.path.clone() {
+                        if row.is_dir() {
+                            self.local_path = path;
+                            self.selection.clear();
+                        } else {
+                            let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+                        }
+                    }
+                }
+            }
             Message::NetHostChanged(host) => self.net_host = host,
             Message::NetBrowse => {
                 // E10 — synchronous SMB browse (bounded by smbclient's timeout;
@@ -582,6 +611,12 @@ impl MdeFiles {
                     self.view = View::default();
                     self.selection.clear();
                 }
+            }
+            Message::ToggleSidebar => self.sidebar_collapsed = !self.sidebar_collapsed,
+            Message::OpenRegistration => {
+                // AFM-2 — peer enrollment/registration lives in the workbench;
+                // launch it detached. Best-effort: a missing binary is a no-op.
+                let _ = std::process::Command::new("mde-workbench").spawn();
             }
             Message::SetLayout(l) => self.layout = l,
             Message::SearchChanged(s) => self.search = s,
@@ -971,7 +1006,7 @@ impl MdeFiles {
         .spacing(0);
 
         let body = row![
-            views::sidebar(&self.view, self.local_open, snap),
+            views::sidebar(&self.view, self.local_open, self.sidebar_collapsed, snap),
             container(main).width(Length::Fill).height(Length::Fill),
         ]
         .height(Length::Fill);

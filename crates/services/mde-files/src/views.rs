@@ -132,6 +132,7 @@ fn titlebar_inner(online: usize, total: usize) -> Element<'static, Message> {
 pub fn sidebar<'a>(
     view: &'a View,
     local_open: bool,
+    collapsed: bool,
     snap: &'a BackendSnapshot,
 ) -> Element<'a, Message> {
     let self_node = &snap.self_node;
@@ -149,9 +150,39 @@ pub fn sidebar<'a>(
             .sty(|_, _| ghost_button_style())
             .on_press(msg)
     };
+
+    // AFM-2 — collapsed rail: just the panel-toggle (to expand again), back,
+    // and refresh, stacked vertically in a slim column. The full rail is
+    // suppressed (the prototype's `.sidebar-collapsed`).
+    if collapsed {
+        let rail = container(
+            column![
+                top_btn(icons::PANEL_RIGHT, Message::ToggleSidebar),
+                top_btn(icons::ARROW_LEFT, Message::SelectView(View::MeshOverview)),
+                top_btn(icons::REFRESH, Message::Refresh),
+            ]
+            .spacing(4)
+            .align_x(cosmic::iced::alignment::Horizontal::Center),
+        )
+        .padding(Padding::new(6.0))
+        .width(Length::Fixed(44.0))
+        .height(Length::Fill)
+        .sty(|_| container::Style {
+            snap: false,
+            background: Some(Background::Color(t::WINDOW_SIDE)),
+            border: Border {
+                color: t::DIVIDER,
+                width: 0.0,
+                radius: 0.0.into(),
+            },
+            ..container::Style::default()
+        });
+        return rail.into();
+    }
+
     let top = container(
         row![
-            top_btn(icons::PANEL_RIGHT, Message::Noop),
+            top_btn(icons::PANEL_RIGHT, Message::ToggleSidebar),
             top_btn(icons::ARROW_LEFT, Message::SelectView(View::MeshOverview)),
             Space::new().width(Length::Fill),
             top_btn(icons::REFRESH, Message::Refresh),
@@ -230,9 +261,11 @@ pub fn sidebar<'a>(
         Some(self_node.shared.to_string()),
         SideRowVariant::Peer {
             status: PeerStatus::Self_,
-            active: false,
+            active: matches!(view, View::MeshHome | View::MeshHomeChild(_)),
         },
-        Message::Noop,
+        // AFM-2 — the self row opens this node's shared folder (the replicated
+        // Mesh Home), instead of being inert.
+        Message::SelectView(View::MeshHome),
     ));
 
     for p in &snap.peers {
@@ -406,7 +439,7 @@ pub fn sidebar<'a>(
                 },
                 ..button::Style::default()
             })
-            .on_press(Message::Noop),
+            .on_press(Message::OpenRegistration),
         ]
         .align_y(cosmic::iced::alignment::Vertical::Center),
     )
@@ -1064,7 +1097,16 @@ pub fn local_browser<'a>(
         for f in files {
             let sel = selection.is_selected(&f.name);
             let foc = selection.is_focused(&f.name);
-            list = list.push(file_row(f.clone(), true, sel, foc));
+            // AFM-4 — every local row is now actionable: clicking descends a
+            // directory or opens a file (LocalActivate resolves the path in the
+            // reducer). Was an inert card that no click reached.
+            list = list.push(
+                button(file_row(f.clone(), true, sel, foc))
+                    .padding(0)
+                    .width(Length::Fill)
+                    .sty(|_, _| ghost_button_style())
+                    .on_press(Message::LocalActivate(f.name.clone())),
+            );
         }
     }
 
