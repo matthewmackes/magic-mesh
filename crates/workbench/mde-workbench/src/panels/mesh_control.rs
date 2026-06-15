@@ -568,13 +568,21 @@ fn leader_lock_paths() -> Vec<PathBuf> {
         .ok()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"));
-    vec![
+    // AUDIT-MESH-10 — the daemon writes the lock to its workgroup root
+    // (`$MDE_WORKGROUP_ROOT/.mackesd-leader.lock`, i.e. /mnt/mesh-storage in the
+    // deployed mesh), but the GUI session usually doesn't inherit that env, so
+    // `default_workgroup_root()` resolved to ~/QNM-Shared and the panel showed
+    // NO LEADER even with a live lock. Check the canonical resolver FIRST, then
+    // the deployed mount explicitly, then the legacy fallbacks. De-dup so an
+    // env that already points at /mnt/mesh-storage isn't probed twice.
+    let mut paths = vec![
+        mackes_mesh_types::peers::default_workgroup_root().join(".mackesd-leader.lock"),
+        PathBuf::from("/mnt/mesh-storage/.mackesd-leader.lock"),
         home.join("QNM-Shared/.mackesd-leader.lock"),
-        // mackesd_core::default_qnm_shared_root() landing —
-        // covers the case where QNM_SHARED_ROOT env-var pointed
-        // elsewhere at the daemon's launch.
         PathBuf::from("/var/lib/mackesd/qnm-shared/.mackesd-leader.lock"),
-    ]
+    ];
+    paths.dedup();
+    paths
 }
 
 fn read_leader_lock() -> Option<LeaseInfo> {
