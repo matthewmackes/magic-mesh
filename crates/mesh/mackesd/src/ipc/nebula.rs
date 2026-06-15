@@ -341,20 +341,40 @@ impl NebulaStatusService {
     /// Pure helper — builds the [`PeerRow`] list from the
     /// live SQLite state.
     pub async fn build_peer_list(&self) -> Result<Vec<PeerRow>, String> {
+        // SUBAUDIT-A2 — read the replicated directory (the real roster), not the
+        // empty sqlite `nodes` table, so the mde-files mesh overview + any
+        // ListPeers() consumer sees the live mesh (was always 0 peers). Cert
+        // details still come from the local cert store per peer.
         let conn = self.store.lock().await;
-        let nodes = crate::store::list_nodes(&conn).map_err(|e| e.to_string())?;
+        let dir = crate::ipc::directory::DirectoryService::new(&self.workgroup_root, None);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0u64, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let built = dir.build_directory(now);
+        let rows = built["peers"].as_array().cloned().unwrap_or_default();
         let mut out = Vec::new();
-        for n in nodes.iter().filter(|n| n.node_id != self.node_id) {
-            let (overlay_ip, fingerprint, cert_epoch, cert_expires_at) =
-                peer_cert_for(&conn, &n.node_id).unwrap_or_default();
+        for p in &rows {
+            let name = p["hostname"].as_str().unwrap_or("").to_string();
+            // Exclude self (it surfaces via self-node).
+            if name == self.host {
+                continue;
+            }
+            let node_id = p["node_id"].as_str().unwrap_or(&name).to_string();
+            // Prefer the directory's overlay_ip; fall back to the local cert.
+            let (cert_ip, fingerprint, cert_epoch, cert_expires_at) =
+                peer_cert_for(&conn, &node_id).unwrap_or_default();
+            let overlay_ip = p["overlay_ip"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map_or(cert_ip, str::to_string);
             out.push(PeerRow {
-                node_id: n.node_id.clone(),
-                name: n.name.clone(),
+                node_id,
+                name,
                 overlay_ip,
                 fingerprint,
                 cert_epoch,
                 cert_expires_at,
-                reachable: match n.health.as_str() {
+                reachable: match p["health"].as_str().unwrap_or("") {
                     "healthy" => "online".to_string(),
                     "degraded" => "idle".to_string(),
                     _ => "offline".to_string(),
@@ -882,33 +902,28 @@ mod tests {
     #[tokio::test]
     async fn list_peers_excludes_local_and_emits_overlay_ip() {
         let store = fresh_store();
-        {
-            let conn = store.lock().await;
-            conn.execute(
-                "INSERT INTO nodes (node_id, name, public_key, role, health, enrolled_at) \
-                 VALUES ('peer:local', 'self', 'pk', 'host', 'healthy', 1)",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO nodes (node_id, name, public_key, role, health, enrolled_at) \
-                 VALUES ('peer:anvil', 'anvil', 'pk', 'peer', 'healthy', 2)",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO nebula_peer_certs \
-                 (node_id, epoch, cert_pem, overlay_ip, expires_at) \
-                 VALUES ('peer:anvil', 0, 'PEM1234ABCDEF', '10.42.0.5', 9999999)",
-                [],
+        // SUBAUDIT-A2 — build_peer_list reads the replicated directory now, not
+        // the sqlite nodes table. Seed two peer records; self ("host") is
+        // excluded, anvil surfaces with its overlay IP.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let peers_dir = mackes_mesh_types::peers::peers_dir(tmp.path());
+        std::fs::create_dir_all(&peers_dir).unwrap();
+        for (host, ip) in [("host", "10.42.0.1"), ("anvil", "10.42.0.5")] {
+            let mut rec =
+                mackes_mesh_types::peers::PeerRecord::now(host, Some("v10".into()), "healthy");
+            rec.overlay_ip = Some(ip.to_string());
+            std::fs::write(
+                peers_dir.join(format!("{host}.json")),
+                serde_json::to_string(&rec).unwrap(),
             )
             .unwrap();
         }
         let svc = NebulaStatusService::new(store, "peer:local", "host")
+            .with_workgroup_root(tmp.path().to_path_buf())
             .with_role_marker("/nonexistent/marker".into());
         let peers = svc.build_peer_list().await.expect("peers");
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].node_id, "peer:anvil");
+        assert_eq!(peers.len(), 1, "self excluded, anvil present");
+        assert_eq!(peers[0].name, "anvil");
         assert_eq!(peers[0].overlay_ip, "10.42.0.5");
         assert_eq!(peers[0].reachable, "online");
     }
@@ -1094,27 +1109,23 @@ mod tests {
         // build_peer_list returns a non-empty Vec<PeerRow>.
         let conn = rusqlite::Connection::open_in_memory().expect("memory db");
         crate::store::migrate(&conn).expect("migrate");
-        conn.execute(
-            "INSERT INTO nodes (node_id, name, public_key, role, health, enrolled_at) \
-             VALUES ('peer:local', 'self', 'pk', 'host', 'healthy', 1)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO nodes (node_id, name, public_key, role, health, enrolled_at) \
-             VALUES ('peer:anvil', 'anvil', 'pk', 'peer', 'healthy', 2)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO nebula_peer_certs \
-             (node_id, epoch, cert_pem, overlay_ip, expires_at) \
-             VALUES ('peer:anvil', 0, 'PEM1234ABCDEF', '10.42.0.7', 9999999)",
-            [],
-        )
-        .unwrap();
         let store = Arc::new(Mutex::new(conn));
+        // SUBAUDIT-A2 — seed the replicated directory (build_peer_list's source).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let peers_dir = mackes_mesh_types::peers::peers_dir(tmp.path());
+        std::fs::create_dir_all(&peers_dir).unwrap();
+        for (host, ip) in [("host", "10.42.0.1"), ("anvil", "10.42.0.7")] {
+            let mut rec =
+                mackes_mesh_types::peers::PeerRecord::now(host, Some("v10".into()), "healthy");
+            rec.overlay_ip = Some(ip.to_string());
+            std::fs::write(
+                peers_dir.join(format!("{host}.json")),
+                serde_json::to_string(&rec).unwrap(),
+            )
+            .unwrap();
+        }
         let svc = NebulaStatusService::new(store, "peer:local", "host")
+            .with_workgroup_root(tmp.path().to_path_buf())
             .with_role_marker("/nonexistent/marker".into());
 
         // Consumer side: publish the request to the action topic.
@@ -1144,7 +1155,7 @@ mod tests {
         let body = replies[0].body.as_deref().expect("reply body");
         let peers: Vec<PeerRow> = serde_json::from_str(body).expect("decode Vec<PeerRow>");
         assert_eq!(peers.len(), 1, "self excluded, one peer remains");
-        assert_eq!(peers[0].node_id, "peer:anvil");
+        assert_eq!(peers[0].name, "anvil");
         assert_eq!(peers[0].overlay_ip, "10.42.0.7");
         assert_eq!(peers[0].reachable, "online");
 
