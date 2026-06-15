@@ -260,26 +260,52 @@ pub fn update(state: &mut VoiceHud, message: Message) -> Task<Message> {
             state.call = sip::CallState::Idle;
         }
         Message::DialRequested(target) => {
-            // PD-5 — resolve a mesh hostname to its extension via the live
-            // roster (so "Call pine" dials pine's 1NNN); fall back to the
-            // raw target for an extension / SIP URI the panel already sent.
+            // VOIP-P2P — registrar-less model: a mesh peer is dialed DIRECTLY by
+            // name over the overlay (PlaceCall routes a peer name to
+            // `place_call_direct`), not resolved to an extension on a registrar.
+            // A bare number / SIP URI is kept as-is for the registrar path.
             let t = target.trim();
             if t.is_empty() || state.call.is_active() {
                 return Task::none();
             }
-            let dial = state
-                .roster
-                .iter()
-                .find(|p| p.name.eq_ignore_ascii_case(t))
-                .map(|p| p.ext.clone())
-                .unwrap_or_else(|| t.to_string());
-            state.dialer_input = dial;
+            state.dialer_input = t.to_string();
             return Task::done(Message::PlaceCall);
         }
         Message::PlaceCall => {
             let dialed = state.dialer_input.trim().to_string();
             if dialed.is_empty() || state.call.is_active() {
                 return Task::none();
+            }
+            // VOIP-P2P — a mesh-peer name dials DIRECTLY over the overlay
+            // (registrar-less); a bare number/extension routes via the registrar
+            // account. Direct calls work even with no account.toml (a local
+            // overlay identity is synthesized).
+            if looks_like_peer(&dialed) {
+                let acct = state
+                    .account
+                    .clone()
+                    .unwrap_or_else(sip::SipAccount::local_identity);
+                let peer_host = peer_host_for(&dialed);
+                state.call = sip::CallState::Calling {
+                    peer: dialed.clone(),
+                };
+                let peer = dialed.clone();
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            sip::place_call_direct(
+                                &acct,
+                                "",
+                                &peer_host,
+                                5060,
+                                std::time::Duration::from_secs(30),
+                            )
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("call task failed: {e}")))
+                    },
+                    move |res| Message::CallConnected(res.map_err(|e| format!("{peer}: {e}"))),
+                );
             }
             match state.account.clone() {
                 Some(acct) => {
@@ -299,7 +325,9 @@ pub fn update(state: &mut VoiceHud, message: Message) -> Task<Message> {
                     );
                 }
                 None => {
-                    state.call = sip::CallState::Failed("no SIP account configured".into());
+                    state.call = sip::CallState::Failed(
+                        "no registrar account — dial a peer by name for a direct call".into(),
+                    );
                 }
             }
         }
@@ -789,6 +817,31 @@ pub fn is_dialer_char(c: char) -> bool {
     c.is_ascii_digit() || c == '*' || c == '#'
 }
 
+/// VOIP-P2P — a dialed string names a mesh PEER (vs a number/extension) when it
+/// contains an alphabetic character (a hostname). Peer names route to a direct
+/// registrar-less overlay call; pure numbers route to the registrar. Pure.
+#[must_use]
+pub fn looks_like_peer(dialed: &str) -> bool {
+    dialed.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// VOIP-P2P — normalize a dialed peer name to a resolvable overlay host. A bare
+/// name gets the `.mesh.mde` mesh-DNS suffix (which resolves to the peer's
+/// overlay IP); an already-qualified host (contains `.`), or a `sip:`/`user@`
+/// form, yields just its host part. Pure + testable.
+#[must_use]
+pub fn peer_host_for(dialed: &str) -> String {
+    let d = dialed.trim();
+    let host = d.strip_prefix("sip:").unwrap_or(d);
+    // Take the host part after any `user@`.
+    let host = host.rsplit('@').next().unwrap_or(host).trim();
+    if host.contains('.') {
+        host.to_string()
+    } else {
+        format!("{host}.mesh.mde")
+    }
+}
+
 /// Strip non-dialer characters from a pasted string. Operator
 /// pasting `"(415) 555-1234"` into the field should resolve to
 /// `"4155551234"`. Spaces, parens, dashes all drop.
@@ -932,9 +985,11 @@ mod tests {
     }
 
     #[test]
-    fn dial_request_resolves_hostname_to_extension() {
-        // PD-5 — a Bus dial request for a mesh hostname dials its 1NNN
-        // extension via the roster; an unknown target dials verbatim.
+    fn dial_request_keeps_peer_name_for_direct_p2p() {
+        // VOIP-P2P — registrar-less: a Bus dial request for a mesh peer keeps
+        // the NAME in the dialer (PlaceCall then routes it to a direct overlay
+        // call), instead of resolving it to a registrar extension. A bare number
+        // is kept verbatim for the registrar path.
         let mut hud = make_hud();
         hud.roster = vec![Peer {
             ext: "1007".into(),
@@ -944,11 +999,22 @@ mod tests {
             lan: true,
             hint: String::new(),
         }];
-        let _ = update(&mut hud, Message::DialRequested("PINE".into()));
-        assert_eq!(hud.dialer_input, "1007", "hostname resolves to its ext");
+        let _ = update(&mut hud, Message::DialRequested("pine".into()));
+        assert_eq!(
+            hud.dialer_input, "pine",
+            "peer name kept for direct P2P dial"
+        );
+        assert!(
+            looks_like_peer(&hud.dialer_input),
+            "routes to place_call_direct"
+        );
 
         let _ = update(&mut hud, Message::DialRequested("1009".into()));
-        assert_eq!(hud.dialer_input, "1009", "unknown target dials verbatim");
+        assert_eq!(
+            hud.dialer_input, "1009",
+            "a number is kept for the registrar"
+        );
+        assert!(!looks_like_peer(&hud.dialer_input));
     }
 
     #[test]
@@ -981,6 +1047,30 @@ mod tests {
         assert_eq!(filter_dialer_chars(""), "");
         // Letters dropped, digits preserved.
         assert_eq!(filter_dialer_chars("call 1003 now"), "1003");
+    }
+
+    #[test]
+    fn looks_like_peer_distinguishes_names_from_numbers() {
+        // Mesh peer names (have letters) → direct P2P.
+        assert!(looks_like_peer("pine"));
+        assert!(looks_like_peer("pine.mesh.mde"));
+        assert!(looks_like_peer("UNIT-EAGLE"));
+        // Numbers / extensions / SIP digits → registrar.
+        assert!(!looks_like_peer("1004"));
+        assert!(!looks_like_peer("+15551234567"));
+        assert!(!looks_like_peer("*69"));
+        assert!(!looks_like_peer(""));
+    }
+
+    #[test]
+    fn peer_host_for_appends_mesh_suffix_for_bare_names() {
+        assert_eq!(peer_host_for("pine"), "pine.mesh.mde");
+        // Already-qualified hosts are used as-is.
+        assert_eq!(peer_host_for("pine.mesh.mde"), "pine.mesh.mde");
+        assert_eq!(peer_host_for("pine.mesh"), "pine.mesh");
+        // sip: / user@ forms reduce to the host part.
+        assert_eq!(peer_host_for("sip:pine"), "pine.mesh.mde");
+        assert_eq!(peer_host_for("sip:matt@birch.mesh.mde"), "birch.mesh.mde");
     }
 
     #[test]

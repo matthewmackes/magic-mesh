@@ -67,6 +67,28 @@ impl SipAccount {
         Self::from_toml(&text).ok()
     }
 
+    /// VOIP-P2P — a registrar-less local identity for direct peer calls: no
+    /// `account.toml` required. The username is this node's hostname (the mesh
+    /// name peers dial); there is no registrar `server_host`. Used as the
+    /// From/Contact identity by `place_call_direct` when the node has no SIP
+    /// account configured.
+    #[must_use]
+    pub fn local_identity() -> SipAccount {
+        let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "mde".to_string());
+        SipAccount {
+            username: host.clone(),
+            password: String::new(),
+            server_host: String::new(),
+            server_port: 5060,
+            display_name: host,
+            expires: 0,
+        }
+    }
+
     fn from_toml(text: &str) -> Result<SipAccount, String> {
         let f: AccountFile = toml::from_str(text).map_err(|e| e.to_string())?;
         let (server_host, server_port) = split_host_port(&f.server, 5060);
@@ -542,6 +564,11 @@ pub struct RemoteMedia {
 pub struct CallSession {
     account: SipAccount,
     target: String,
+    /// VOIP-P2P — the From URI used for this dialog. For a registrar call this
+    /// is `account.aor()` (sip:user@server); for a registrar-less P2P call it is
+    /// the local overlay identity (sip:user@<local-overlay-host>). In-dialog
+    /// ACK/BYE must echo the SAME From, so it is stored rather than re-derived.
+    from_uri: String,
     call_id: String,
     from_tag: String,
     to_tag: String,
@@ -614,13 +641,14 @@ fn parse_sdp(body: &str) -> Option<RemoteMedia> {
 fn build_invite(
     account: &SipAccount,
     target: &str,
+    from_uri: &str,
     local_host: &str,
     local_port: u16,
     ids: &TxnIds,
     sdp: &str,
     auth: Option<(&str, &str)>,
 ) -> String {
-    let from = account.aor();
+    let from = from_uri.to_string();
     let contact = format!("sip:{}@{local_host}:{local_port}", account.username);
     let mut m = String::new();
     let _ = write!(m, "INVITE {target} SIP/2.0\r\n");
@@ -646,7 +674,7 @@ fn build_invite(
 
 /// Build the in-dialog ACK for a 2xx (its own transaction, same branch rules).
 fn build_ack(session: &CallSession, branch: &str) -> String {
-    let from = session.account.aor();
+    let from = session.from_uri.clone();
     let mut m = String::new();
     let _ = write!(m, "ACK {} SIP/2.0\r\n", session.target);
     let _ = write!(
@@ -665,7 +693,7 @@ fn build_ack(session: &CallSession, branch: &str) -> String {
 
 /// Build a BYE to tear down an established dialog.
 fn build_bye(session: &CallSession, branch: &str, cseq: u32) -> String {
-    let from = session.account.aor();
+    let from = session.from_uri.clone();
     let mut m = String::new();
     let _ = write!(m, "BYE {} SIP/2.0\r\n", session.target);
     let _ = write!(
@@ -696,29 +724,82 @@ fn parse_to_tag(resp: &rsip::Response) -> Option<String> {
     None
 }
 
-/// Place an outbound call: INVITE (+ digest retry) → await a final response,
-/// ACK a 2xx, and return the established `CallSession`. Blocking + socket —
-/// run off the UI thread. The live audio path is slice 3 (RTP/ALSA).
+/// Place an outbound call via the configured registrar: the dialed string is
+/// normalized to `sip:<n>@<server>` and the INVITE is sent to the registrar
+/// (the original behavior). Identity is `account.aor()`.
 pub fn place_call(
     account: &SipAccount,
     dialed: &str,
     ring_timeout: Duration,
 ) -> Result<CallSession, String> {
     let target = target_uri(account, dialed);
-    let server_addr = (account.server_host.as_str(), account.server_port)
+    let dest = (account.server_host.as_str(), account.server_port)
         .to_socket_addrs()
         .map_err(|e| format!("cannot resolve {}: {e}", account.server_host))?
         .next()
         .ok_or_else(|| format!("no address for {}", account.server_host))?;
+    place_call_inner(account, &target, dest, false, ring_timeout)
+}
+
+/// VOIP-P2P — place a registrar-less call DIRECTLY to a mesh peer over the
+/// overlay. `peer_user` is the dialed user/extension; `peer_host`/`peer_port`
+/// are the peer's overlay SIP address (resolved from the mesh directory or
+/// `<peer>.mesh.mde` DNS). No registrar is involved — the INVITE goes straight
+/// to the peer and the From identity is this node's local overlay address.
+pub fn place_call_direct(
+    account: &SipAccount,
+    peer_user: &str,
+    peer_host: &str,
+    peer_port: u16,
+    ring_timeout: Duration,
+) -> Result<CallSession, String> {
+    let target = direct_target_uri(peer_user, peer_host);
+    let dest = (peer_host, peer_port)
+        .to_socket_addrs()
+        .map_err(|e| format!("cannot resolve {peer_host}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("no address for {peer_host}"))?;
+    place_call_inner(account, &target, dest, true, ring_timeout)
+}
+
+/// VOIP-P2P — build the request-URI for a direct peer call: `sip:<user>@<host>`
+/// (or `sip:<host>` when no user/extension is supplied). Pure + testable.
+#[must_use]
+pub fn direct_target_uri(peer_user: &str, peer_host: &str) -> String {
+    let user = peer_user.trim();
+    if user.is_empty() {
+        format!("sip:{peer_host}")
+    } else {
+        format!("sip:{user}@{peer_host}")
+    }
+}
+
+/// Place an outbound call: INVITE (+ digest retry) → await a final response,
+/// ACK a 2xx, and return the established `CallSession`. Blocking + socket —
+/// run off the UI thread. The live audio path is slice 3 (RTP/ALSA).
+fn place_call_inner(
+    account: &SipAccount,
+    target: &str,
+    dest_addr: std::net::SocketAddr,
+    direct: bool,
+    ring_timeout: Duration,
+) -> Result<CallSession, String> {
     let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("socket bind failed ({e})"))?;
     sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
-    sock.connect(server_addr)
+    sock.connect(dest_addr)
         .map_err(|e| format!("connect failed ({e})"))?;
     let local = sock
         .local_addr()
         .map_err(|e| format!("no local addr ({e})"))?;
     let local_host = local.ip().to_string();
     let local_port = local.port();
+    // VOIP-P2P — From identity: registrar AOR for a registrar call; the local
+    // overlay address for a registrar-less direct (P2P) call.
+    let from_uri = if direct {
+        format!("sip:{}@{local_host}", account.username)
+    } else {
+        account.aor()
+    };
     // Advertise an RTP port (slice 3 binds it); derive it from the signaling
     // port range so it is deterministic per call without a second bind here.
     let rtp_port = 40000 + (local_port % 1000) * 2;
@@ -733,7 +814,16 @@ pub fn place_call(
         cseq: 1,
     };
 
-    let req = build_invite(account, &target, &local_host, local_port, &ids, &sdp, None);
+    let req = build_invite(
+        account,
+        &target,
+        &from_uri,
+        &local_host,
+        local_port,
+        &ids,
+        &sdp,
+        None,
+    );
     sock.send(req.as_bytes())
         .map_err(|e| format!("send failed ({e})"))?;
 
@@ -755,7 +845,8 @@ pub fn place_call(
                     .ok_or("200 OK without a usable SDP answer")?;
                 let session = CallSession {
                     account: account.clone(),
-                    target: target.clone(),
+                    target: target.to_string(),
+                    from_uri: from_uri.clone(),
                     call_id,
                     from_tag,
                     to_tag,
@@ -788,7 +879,8 @@ pub fn place_call(
                 };
                 let req2 = build_invite(
                     account,
-                    &target,
+                    target,
+                    &from_uri,
                     &local_host,
                     local_port,
                     &ids,
@@ -1229,6 +1321,31 @@ pub fn run_agent(
 mod tests {
     use super::*;
 
+    #[test]
+    fn direct_target_uri_builds_peer_request_uri() {
+        assert_eq!(direct_target_uri("", "pine.mesh.mde"), "sip:pine.mesh.mde");
+        assert_eq!(
+            direct_target_uri("1004", "pine.mesh.mde"),
+            "sip:1004@pine.mesh.mde"
+        );
+        // Whitespace-only user is treated as no user.
+        assert_eq!(
+            direct_target_uri("  ", "birch.mesh.mde"),
+            "sip:birch.mesh.mde"
+        );
+    }
+
+    #[test]
+    fn local_identity_is_registrar_less() {
+        let id = SipAccount::local_identity();
+        // No registrar server, non-empty local username (the hostname).
+        assert!(id.server_host.is_empty());
+        assert!(!id.username.is_empty());
+        // Its From identity is sip:<host>@<host> shape only via place_call_direct
+        // (which substitutes the local overlay host); the AOR here is degenerate
+        // but never used for a direct call's From.
+    }
+
     fn sample_account() -> SipAccount {
         SipAccount {
             username: "alice".into(),
@@ -1493,6 +1610,7 @@ mod tests {
         let msg = build_invite(
             &sample_account(),
             "sip:1001@sip.example.com",
+            "sip:alice@sip.example.com",
             "10.0.0.5",
             5070,
             &ids,
@@ -1510,6 +1628,7 @@ mod tests {
         CallSession {
             account: sample_account(),
             target: "sip:1001@sip.example.com".into(),
+            from_uri: "sip:alice@sip.example.com".into(),
             call_id: "cid".into(),
             from_tag: "ft".into(),
             to_tag: "tt".into(),
