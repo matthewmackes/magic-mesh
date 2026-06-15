@@ -422,9 +422,40 @@ impl NebulaStatusService {
         } else {
             "peer".to_string()
         };
-        let (ca_epoch, mesh_id) = current_ca_row(&conn).unwrap_or_default();
-        let (overlay_ip, _fingerprint, cert_epoch, cert_expires_at) =
+        let (ca_epoch, db_mesh_id) = current_ca_row(&conn).unwrap_or_default();
+        let (cert_ip, _fingerprint, cert_epoch, cert_expires_at) =
             peer_cert_for(&conn, &self.node_id).unwrap_or_default();
+
+        // AUDIT-MESH-2 — on a peer the local cert store has no self-CA row and no
+        // self-cert (the host issues those), so `overlay_ip` and `mesh_id` come
+        // back blank and Mesh Control renders empty. Mirror `build_peer_list`:
+        // fall back to the replicated directory's self-record for the overlay IP,
+        // and to the daemon's configured `mesh_id` for the mesh name.
+        let overlay_ip = if cert_ip.is_empty() {
+            let dir = crate::ipc::directory::DirectoryService::new(&self.workgroup_root, None);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0u64, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+            let built = dir.build_directory(now);
+            built["peers"]
+                .as_array()
+                .and_then(|peers| {
+                    peers.iter().find_map(|p| {
+                        (p["hostname"].as_str() == Some(self.host.as_str()))
+                            .then(|| p["overlay_ip"].as_str().unwrap_or("").to_string())
+                            .filter(|s| !s.is_empty())
+                    })
+                })
+                .unwrap_or(cert_ip)
+        } else {
+            cert_ip
+        };
+        let mesh_id = if db_mesh_id.is_empty() {
+            self.mesh_id.clone()
+        } else {
+            db_mesh_id
+        };
+
         Ok(SelfNodeSnapshot {
             node_id: self.node_id.clone(),
             host: self.host.clone(),
@@ -940,6 +971,39 @@ mod tests {
         std::fs::write(&marker, "role:host\n").expect("write");
         let s2 = svc.build_self_node().await.expect("self after promote");
         assert_eq!(s2.role, "host");
+    }
+
+    #[tokio::test]
+    async fn self_node_falls_back_to_directory_and_mesh_id_on_a_peer() {
+        // AUDIT-MESH-2 — on a peer the local cert store has no self-cert and no
+        // CA row, so overlay_ip + mesh_id used to come back blank (Mesh Control
+        // empty). They must now fall back to the replicated directory self-record
+        // (overlay_ip) and the daemon's configured mesh_id.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let peers_dir = mackes_mesh_types::peers::peers_dir(tmp.path());
+        std::fs::create_dir_all(&peers_dir).unwrap();
+        let mut rec =
+            mackes_mesh_types::peers::PeerRecord::now("birch", Some("v10".into()), "healthy");
+        rec.overlay_ip = Some("10.42.0.9".to_string());
+        std::fs::write(
+            peers_dir.join("birch.json"),
+            serde_json::to_string(&rec).unwrap(),
+        )
+        .unwrap();
+        let svc = NebulaStatusService::new(fresh_store(), "peer:birch", "birch")
+            .with_workgroup_root(tmp.path().to_path_buf())
+            .with_mesh_id("mesh-prod")
+            .with_role_marker("/nonexistent/marker".into());
+        let s = svc.build_self_node().await.expect("self");
+        assert_eq!(s.role, "peer");
+        assert_eq!(
+            s.overlay_ip, "10.42.0.9",
+            "overlay_ip falls back to the directory self-record"
+        );
+        assert_eq!(
+            s.mesh_id, "mesh-prod",
+            "mesh_id falls back to the configured daemon mesh_id"
+        );
     }
 
     #[tokio::test]
