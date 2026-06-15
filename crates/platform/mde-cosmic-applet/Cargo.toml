@@ -19,6 +19,10 @@ path = "src/bin/mde-cosmic-applet.rs"
 [dependencies]
 serde_json = "1"
 mde-bus = { path = "../mde-bus" }
+# NOTIFY-7 / AC — the bell tints by the highest-severity unread alert tailed off
+# the bus, and shares the severity→Carbon-token map with the Action Center.
+mde-notify = { path = "../../services/mde-notify" }
+mde-theme = { path = "../../shared/mde-theme" }
 tokio = { version = "1", features = ["process", "rt"] }
 
 [dependencies.libcosmic]

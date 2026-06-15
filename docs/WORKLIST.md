@@ -653,7 +653,7 @@ A professional, themed, desktop-wide notification center replacing the Cosmic tr
     - [ ] one settings sidecar single-sources DND/placement/expire-ms + the new per-group settings
     - [ ] the Workbench `notifications.rs` panel deep-links into the Hub settings (or is retired) — no duplicate state
     - [ ] settings round-trip across a restart (test-covered)
-- [ ] **NOTIFY-7: applet integration — bell pip + unread count + toggle.**
+- [✓] **NOTIFY-7: applet integration — notification bell + toggle + severity tint.** Operator direction (2026-06-15): the applet is now the notification bell — a single click **toggles the Action Center** open/closed (instant spawn-or-kill; the slow 4s quick-action popover is gone) and the bell **tints by the highest-severity unread alert** (shared `severity_token` Carbon map), clearing when the center is opened. Replaces the numeric-count idea with color-by-class per the operator.
   **As** a Cosmic user,
   **I want** a panel bell that shows unread count and opens the center,
   **so that** the Hub is reachable from the panel like the Cosmic tray it replaces.
