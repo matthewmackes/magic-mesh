@@ -4244,6 +4244,7 @@ dependencies = [
  "mde-theme",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tempfile",
 ]
 

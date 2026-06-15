@@ -21,7 +21,9 @@ use cosmic::iced::widget::{column, container, row, text, Space};
 use cosmic::iced::{
     window, Background, Border, Color, Element, Length, Padding, Subscription, Task,
 };
-use mde_notify::{severity_token, AlertItem, AlertTail, Severity, Source};
+use mde_notify::{
+    severity_token, sound_for_alert, AlertItem, AlertTail, Severity, SoundSettings, Source,
+};
 use mde_theme::Palette;
 use mde_workbench::cosmic_compat::IntoIcedColor;
 
@@ -189,16 +191,27 @@ fn update(state: &mut Toaster, message: Message) -> Task<Message> {
     match message {
         Message::Poll => {
             // DND state gates ordinary alerts (Critical bypasses).
-            let dnd_active = mde_bus::client_data_dir()
-                .map(|d| mde_bus::dnd::load_default(&d).active)
+            let dir = mde_bus::client_data_dir();
+            let dnd_active = dir
+                .as_ref()
+                .map(|d| mde_bus::dnd::load_default(d).active)
                 .unwrap_or(false);
+            // NOTIFY-5 — per-group sound preferences (shared YAML next to the bus).
+            let sound = dir
+                .as_ref()
+                .map(|d| SoundSettings::load(d))
+                .unwrap_or_default();
             // Pull fresh alerts off the shared bus tail (Persist is !Send — open
             // + drop within this call, never across an await).
-            if let Some(dir) = mde_bus::client_data_dir() {
+            if let Some(dir) = dir {
                 if let Ok(persist) = mde_bus::persist::Persist::open(dir) {
                     let fresh = state.tail.poll(&persist);
                     for item in fresh {
                         if should_toast(&item, dnd_active) {
+                            // NOTIFY-5 — play the severity sound (DND/mute-gated).
+                            if let Some(name) = sound_for_alert(&sound, &item, dnd_active) {
+                                play_sound(name);
+                            }
                             state.toasts.push(Toast {
                                 item,
                                 shown_at_ms: now,
@@ -219,6 +232,33 @@ fn update(state: &mut Toaster, message: Message) -> Task<Message> {
         }
     }
     Task::none()
+}
+
+/// NOTIFY-5 — play a freedesktop XDG sound-theme sound by name. Prefers
+/// `canberra-gtk-play` (theme-aware); falls back to `paplay` of the matching
+/// `/usr/share/sounds/freedesktop/stereo/<name>.oga`. Fire-and-forget +
+/// best-effort: a missing player or sound is a silent no-op (never blocks the
+/// UI thread — the child is detached and not awaited).
+fn play_sound(name: &str) {
+    use std::process::{Command, Stdio};
+    let quiet = |c: &mut Command| {
+        c.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    };
+    let mut canberra = Command::new("canberra-gtk-play");
+    canberra.args(["-i", name]);
+    quiet(&mut canberra);
+    if canberra.spawn().is_ok() {
+        return;
+    }
+    let oga = format!("/usr/share/sounds/freedesktop/stereo/{name}.oga");
+    if std::path::Path::new(&oga).exists() {
+        let mut paplay = Command::new("paplay");
+        paplay.arg(&oga);
+        quiet(&mut paplay);
+        let _ = paplay.spawn();
+    }
 }
 
 /// One-glyph severity marker (matches the center).

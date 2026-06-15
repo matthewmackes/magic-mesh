@@ -172,6 +172,99 @@ pub fn severity_token(severity: Severity, palette: &Palette) -> Rgba {
     }
 }
 
+/// NOTIFY-5 — the freedesktop XDG sound-theme name for a severity, played via
+/// `canberra-gtk-play -i <name>` (falling back to `paplay` of the matching
+/// `/usr/share/sounds/freedesktop/stereo/<name>.oga`). Using named theme sounds
+/// means no bundled audio assets to license/ship (operator decision, 2026-06-15).
+#[must_use]
+pub fn severity_sound_name(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Critical => "dialog-error",
+        Severity::Warning => "dialog-warning",
+        Severity::Info => "message",
+        Severity::Success => "complete",
+    }
+}
+
+/// NOTIFY-5 — per-group sound preferences. Persisted as YAML next to the bus
+/// data so the toast surface + the (NOTIFY-6) settings sidecar share one file.
+/// `enabled` is the global on/off; `muted_sources` carries the [`Source::label`]
+/// of any group the operator silenced.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SoundSettings {
+    /// Master switch — `false` silences every group.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Group labels (per [`Source::label`]) the operator has muted.
+    #[serde(default)]
+    pub muted_sources: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for SoundSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            muted_sources: Vec::new(),
+        }
+    }
+}
+
+impl SoundSettings {
+    /// Load from `<bus_root>/notify-sound.yaml`; missing/corrupt → defaults
+    /// (sound on) so a bad file never silently kills audio.
+    #[must_use]
+    pub fn load(bus_root: &std::path::Path) -> Self {
+        let path = bus_root.join("notify-sound.yaml");
+        std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_yaml::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    /// Atomic-write to `<bus_root>/notify-sound.yaml` (temp + rename).
+    pub fn save(&self, bus_root: &std::path::Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(bus_root)?;
+        let s = serde_yaml::to_string(self)
+            .map_err(|e| std::io::Error::other(format!("serialize notify-sound.yaml: {e}")))?;
+        let tmp = bus_root.join("notify-sound.yaml.tmp");
+        let dst = bus_root.join("notify-sound.yaml");
+        std::fs::write(&tmp, s)?;
+        std::fs::rename(&tmp, &dst)
+    }
+
+    /// True when this source group is currently muted.
+    #[must_use]
+    pub fn is_muted(&self, source: &Source) -> bool {
+        self.muted_sources.contains(&source.label())
+    }
+}
+
+/// NOTIFY-5 — the sound to play for a fresh alert, or `None` when it should be
+/// silent. Mirrors the toast's gating: sound is silent under DND (Critical
+/// bypasses, matching the emergency rule), when globally disabled, or when the
+/// alert's source group is muted. Pure + testable.
+#[must_use]
+pub fn sound_for_alert(
+    settings: &SoundSettings,
+    item: &AlertItem,
+    dnd_active: bool,
+) -> Option<&'static str> {
+    if !settings.enabled {
+        return None;
+    }
+    if dnd_active && item.severity != Severity::Critical {
+        return None;
+    }
+    if settings.is_muted(&item.source) {
+        return None;
+    }
+    Some(severity_sound_name(item.severity))
+}
+
 /// Normalize one [`StoredMessage`] into an [`AlertItem`]. The body is parsed as
 /// JSON for `severity`/`host`/`title`/`summary` when present; everything
 /// degrades gracefully (a non-JSON body becomes the alert text).
@@ -444,5 +537,96 @@ mod tests {
         assert_eq!(first[0].severity, Severity::Warning);
         // Second poll, no new traffic → empty (cursor advanced + deduped).
         assert!(tail.poll(&persist).is_empty());
+    }
+
+    // ── NOTIFY-5: sound layer ───────────────────────────────────────────
+
+    fn alert(src: Source, sev: Severity) -> AlertItem {
+        AlertItem {
+            id: "x".into(),
+            ts_unix_ms: 0,
+            severity: sev,
+            source: src,
+            topic: "t".into(),
+            host: None,
+            title: "t".into(),
+            body: String::new(),
+            read: false,
+        }
+    }
+
+    #[test]
+    fn severity_sound_names_are_freedesktop() {
+        assert_eq!(severity_sound_name(Severity::Critical), "dialog-error");
+        assert_eq!(severity_sound_name(Severity::Warning), "dialog-warning");
+        assert_eq!(severity_sound_name(Severity::Info), "message");
+        assert_eq!(severity_sound_name(Severity::Success), "complete");
+    }
+
+    #[test]
+    fn sound_default_on_plays_for_ordinary_alert() {
+        let s = SoundSettings::default();
+        assert!(s.enabled);
+        assert_eq!(
+            sound_for_alert(&s, &alert(Source::Security, Severity::Warning), false),
+            Some("dialog-warning")
+        );
+    }
+
+    #[test]
+    fn sound_global_disable_silences_all() {
+        let s = SoundSettings {
+            enabled: false,
+            muted_sources: Vec::new(),
+        };
+        assert_eq!(
+            sound_for_alert(&s, &alert(Source::Security, Severity::Critical), false),
+            None
+        );
+    }
+
+    #[test]
+    fn sound_muted_group_is_silent_others_play() {
+        let s = SoundSettings {
+            enabled: true,
+            muted_sources: vec![Source::Firewall.label()],
+        };
+        assert_eq!(
+            sound_for_alert(&s, &alert(Source::Firewall, Severity::Warning), false),
+            None
+        );
+        assert!(sound_for_alert(&s, &alert(Source::Security, Severity::Warning), false).is_some());
+    }
+
+    #[test]
+    fn sound_dnd_silences_ordinary_but_not_critical() {
+        let s = SoundSettings::default();
+        assert_eq!(
+            sound_for_alert(&s, &alert(Source::System, Severity::Info), true),
+            None
+        );
+        assert_eq!(
+            sound_for_alert(&s, &alert(Source::Security, Severity::Critical), true),
+            Some("dialog-error")
+        );
+    }
+
+    #[test]
+    fn sound_settings_round_trip_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = SoundSettings {
+            enabled: false,
+            muted_sources: vec!["Compute".into(), "Presence".into()],
+        };
+        original.save(dir.path()).unwrap();
+        let loaded = SoundSettings::load(dir.path());
+        assert_eq!(loaded, original);
+    }
+
+    #[test]
+    fn sound_settings_missing_file_defaults_on() {
+        let dir = tempfile::tempdir().unwrap();
+        // No file → defaults (sound on) so a fresh install isn't silent.
+        assert_eq!(SoundSettings::load(dir.path()), SoundSettings::default());
     }
 }

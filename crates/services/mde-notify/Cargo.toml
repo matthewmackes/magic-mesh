@@ -18,6 +18,9 @@ mde-bus = { path = "../../platform/mde-bus" }
 mde-theme = { path = "../../shared/mde-theme" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# NOTIFY-5 — per-group sound settings persisted as YAML next to the bus data
+# (same format mde-bus uses for dnd.yaml/subs.yaml).
+serde_yaml = "0.9"
 
 [dev-dependencies]
 tempfile = "3"

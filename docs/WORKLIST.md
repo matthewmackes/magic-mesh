@@ -637,7 +637,7 @@ A professional, themed, desktop-wide notification center replacing the Cosmic tr
     - [ ] animation style (slide/fade/none) is honored; adaptive-budget (motion only on events)
     - [ ] toasts suppressed when `mde_bus::dnd` is active (unless `override=dnd`); the center still records the alert
     - [ ] mesh alerts toast by default; `fdo/*` app notifications shown in the center, not double-toasted
-- [ ] **NOTIFY-5: per-group sound packs (DND-aware audio effects).**
+- [✓] **NOTIFY-5: per-group sound packs (DND-aware audio effects).** Operator decision (2026-06-15): use freedesktop XDG sound-theme names via `canberra-gtk-play` (→ `paplay` fallback) — no bundled OGGs to license/ship. `mde_notify::severity_sound_name` maps severity→theme sound; `SoundSettings` (global enable + per-source mute) persists to `<bus_root>/notify-sound.yaml`; `sound_for_alert` gates by enable/mute/DND (Critical bypasses). Wired into the toast Poll (best-effort detached play); 7 unit tests.
   **As** an operator,
   **I want** distinct, configurable sounds per group/severity,
   **so that** I can recognize an alert class by ear without looking.
