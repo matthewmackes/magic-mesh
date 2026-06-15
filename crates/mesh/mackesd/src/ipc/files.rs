@@ -582,31 +582,28 @@ pub const FLEET_FILES_PREFIX: &str = "fleet-files";
 /// Verbs served on `action/fleet-files/<verb>`.
 pub const FLEET_FILES_VERBS: [&str; 3] = ["peers", "self-node", "list-peer"];
 
-/// The live mesh-roster surface. Reads from the mackesd SQLite store
-/// (`nodes` table via `crate::store::list_nodes`) so mde-files's
-/// mesh-browse gets a real peer roster. Holds the same `Arc`-shared
-/// connection the reconcile worker upserts into, plus the host's own
-/// identity.
+/// The live mesh-roster surface for Magic Mesh Files' mesh-browse.
+///
+/// SUBAUDIT-A2 (2026-06-15): this read the mackesd SQLite `nodes` table
+/// (`crate::store::list_nodes`), which is **empty mesh-wide** (the nebula roster
+/// is never populated into sqlite — the replicated `peers/*.json` directory is
+/// the truth), so Files always showed "0 of 0 peers". It now reads the same
+/// [`DirectoryService`] the Peers Front Door uses, so the mesh view matches.
 #[derive(Debug, Clone)]
 pub struct FleetFilesService {
-    store: std::sync::Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+    workgroup_root: std::path::PathBuf,
     host: String,
-    node_id: String,
 }
 
 impl FleetFilesService {
-    /// Build a service rooted at a live SQLite connection and the
-    /// host's own identity.
+    /// Build a service rooted at the replicated workgroup root + the host's own
+    /// hostname (used to exclude self from the peer roster — self surfaces via
+    /// `self-node`).
     #[must_use]
-    pub fn new(
-        store: std::sync::Arc<tokio::sync::Mutex<rusqlite::Connection>>,
-        host: impl Into<String>,
-        node_id: impl Into<String>,
-    ) -> Self {
+    pub fn new(workgroup_root: impl Into<std::path::PathBuf>, host: impl Into<String>) -> Self {
         Self {
-            store,
+            workgroup_root: workgroup_root.into(),
             host: host.into(),
-            node_id: node_id.into(),
         }
     }
 
@@ -620,29 +617,36 @@ impl FleetFilesService {
             // JSON array of `WirePeer` rows from the live mesh roster,
             // excluding the local host (it surfaces via `self-node`).
             "peers" => {
-                let nodes = {
-                    let conn = self.store.blocking_lock();
-                    match crate::store::list_nodes(&conn) {
-                        Ok(n) => n,
-                        Err(e) => return err(format!("list_nodes: {e}")),
-                    }
-                };
-                let wires: Vec<WirePeer<'_>> = nodes
+                // SUBAUDIT-A2 — read the replicated directory (the real roster),
+                // not the empty sqlite `nodes` table. Excludes self (self-node).
+                let dir = crate::ipc::directory::DirectoryService::new(&self.workgroup_root, None);
+                let now_u64 = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0u64, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+                let built = dir.build_directory(now_u64);
+                let empty = Vec::new();
+                let rows = built["peers"].as_array().unwrap_or(&empty);
+                let wires: Vec<WirePeer> = rows
                     .iter()
-                    .filter(|n| n.node_id != self.node_id)
-                    .map(|n| WirePeer {
-                        name: &n.name,
-                        addr: n.region.as_deref().unwrap_or("—"),
-                        kind: match n.role.as_str() {
-                            "host" => "server",
-                            "observer" => "ci",
+                    .filter(|p| p["hostname"].as_str() != Some(self.host.as_str()))
+                    .map(|p| WirePeer {
+                        name: p["hostname"].as_str().unwrap_or("").to_string(),
+                        addr: p["overlay_ip"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("—")
+                            .to_string(),
+                        kind: match p["role"].as_str().unwrap_or("peer") {
+                            "lighthouse" => "server",
                             _ => "desktop",
-                        },
-                        status: match n.health.as_str() {
+                        }
+                        .to_string(),
+                        status: match p["health"].as_str().unwrap_or("") {
                             "healthy" => "online",
                             "degraded" => "idle",
                             _ => "offline",
-                        },
+                        }
+                        .to_string(),
                     })
                     .collect();
                 serde_json::to_string(&wires).unwrap_or_else(|e| err(format!("encode peers: {e}")))
@@ -667,11 +671,11 @@ impl FleetFilesService {
 }
 
 #[derive(serde::Serialize)]
-struct WirePeer<'a> {
-    name: &'a str,
-    addr: &'a str,
-    kind: &'a str,
-    status: &'a str,
+struct WirePeer {
+    name: String,
+    addr: String,
+    kind: String,
+    status: String,
 }
 
 #[derive(serde::Serialize)]
@@ -954,20 +958,48 @@ mod tests {
     }
 
     #[test]
-    fn fleet_files_peers_returns_empty_when_db_is_empty() {
-        // In-memory connection with the nodes table migrated but no
-        // rows → an empty roster, not an error.
-        let conn = crate::store::open_in_memory().expect("open in-memory");
-        let store = std::sync::Arc::new(tokio::sync::Mutex::new(conn));
-        let s = FleetFilesService::new(store, "test-host", "peer:test");
+    fn fleet_files_peers_returns_empty_when_no_peer_files() {
+        // SUBAUDIT-A2 — reads the replicated directory now; an empty workgroup
+        // root (no peers/*.json) → an empty roster, not an error.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let s = FleetFilesService::new(tmp.path(), "test-host");
         assert_eq!(s.reply("peers", None), "[]");
     }
 
     #[test]
+    fn fleet_files_peers_reads_the_directory_excluding_self() {
+        // Write two replicated peer records; the roster returns the other peer
+        // (overlay IP + role mapped), excluding self (test-host).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let peers_dir = mackes_mesh_types::peers::peers_dir(tmp.path());
+        std::fs::create_dir_all(&peers_dir).unwrap();
+        for (host, ip) in [("test-host", "10.42.0.9"), ("birch", "10.42.0.6")] {
+            let mut rec =
+                mackes_mesh_types::peers::PeerRecord::now(host, Some("v10".into()), "healthy");
+            rec.overlay_ip = Some(ip.to_string());
+            std::fs::write(
+                peers_dir.join(format!("{host}.json")),
+                serde_json::to_string(&rec).unwrap(),
+            )
+            .unwrap();
+        }
+        let s = FleetFilesService::new(tmp.path(), "test-host");
+        let reply = s.reply("peers", None);
+        assert!(
+            reply.contains("\"name\":\"birch\""),
+            "birch present: {reply}"
+        );
+        assert!(reply.contains("10.42.0.6"), "overlay ip present: {reply}");
+        assert!(
+            !reply.contains("\"name\":\"test-host\""),
+            "self excluded: {reply}"
+        );
+    }
+
+    #[test]
     fn fleet_files_self_node_encodes_hostname() {
-        let conn = crate::store::open_in_memory().expect("open in-memory");
-        let store = std::sync::Arc::new(tokio::sync::Mutex::new(conn));
-        let s = FleetFilesService::new(store, "anvil", "peer:anvil");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let s = FleetFilesService::new(tmp.path(), "anvil");
         let json = s.reply("self-node", None);
         assert!(json.contains("\"host\":\"anvil\""));
         assert!(json.contains("\"role\":"));
@@ -977,17 +1009,15 @@ mod tests {
     fn fleet_files_list_peer_returns_empty_array() {
         // The per-peer file index isn't built yet; `[]` is the correct
         // empty-state response.
-        let conn = crate::store::open_in_memory().expect("open in-memory");
-        let store = std::sync::Arc::new(tokio::sync::Mutex::new(conn));
-        let s = FleetFilesService::new(store, "test-host", "peer:test");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let s = FleetFilesService::new(tmp.path(), "test-host");
         assert_eq!(s.reply("list-peer", Some("birch")), "[]");
     }
 
     #[test]
     fn fleet_files_unknown_verb_yields_error_envelope() {
-        let conn = crate::store::open_in_memory().expect("open in-memory");
-        let store = std::sync::Arc::new(tokio::sync::Mutex::new(conn));
-        let s = FleetFilesService::new(store, "test-host", "peer:test");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let s = FleetFilesService::new(tmp.path(), "test-host");
         assert!(s.reply("bogus", None).contains("unknown fleet-files verb"));
     }
 }

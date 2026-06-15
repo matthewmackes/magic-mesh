@@ -6522,10 +6522,14 @@ fn run_serve(
                 // Fleet.Files joins only when sqlite opens; its stub
                 // siblings serve regardless.
                 match mackesd_core::store::open(&db_path) {
-                    Ok(conn) => {
-                        let store = Arc::new(tokio::sync::Mutex::new(conn));
-                        let svc =
-                            files::FleetFilesService::new(store, host.clone(), node_id.clone());
+                    Ok(_conn) => {
+                        // SUBAUDIT-A2 — FleetFilesService now reads the replicated
+                        // directory (not the empty sqlite `nodes` table), so it
+                        // needs the workgroup root, not the db handle.
+                        let svc = files::FleetFilesService::new(
+                            mackes_mesh_types::peers::default_workgroup_root(),
+                            host.clone(),
+                        );
                         surfaces.push(files::Surface {
                             prefix: files::FLEET_FILES_PREFIX,
                             verbs: &files::FLEET_FILES_VERBS,
