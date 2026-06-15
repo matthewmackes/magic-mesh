@@ -1,0 +1,26 @@
+# mde-notify — the shared notification model + bus tail for the
+# MDE-Notification-Hub (NOTIFY epic, docs/design/mde-notification-hub.md).
+# Pure-Rust core: tails the mde-bus alert lanes into a typed, deduped,
+# severity-classified alert stream that both surfaces (the standalone
+# center binary + the toast layer) render. No GUI deps here — the layer-
+# shell binary (NOTIFY-3/4) lives in its own bin target.
+[package]
+name = "mde-notify"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[dependencies]
+mde-bus = { path = "../../platform/mde-bus" }
+mde-theme = { path = "../../shared/mde-theme" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

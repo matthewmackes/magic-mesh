@@ -4237,6 +4237,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mde-notify"
+version = "10.0.5"
+dependencies = [
+ "mde-bus",
+ "mde-theme",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "mde-role"
 version = "10.0.5"
 

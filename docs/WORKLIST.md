@@ -602,7 +602,7 @@ Live testing on .13 surfaced a run of empty panels — all four classes of subst
 
 ### NOTIFY — MDE-Notification-Hub (design: `docs/design/mde-notification-hub.md`, 2026-06-14)
 A professional, themed, desktop-wide notification center replacing the Cosmic tray for mesh + desktop alerts. Locks (operator survey): standalone center + toasts (new `crates/services/mde-notify`); render the bus, don't own FDO; group by source, color by severity; configurable per-group sound packs; all effects DND-aware. The Carbon look (§4) + no-stub reachability (§7) gate every task.
-- [ ] **NOTIFY-1: scaffold the `mde-notify` shared crate — bus tail + AlertItem model.**
+- [✓] **NOTIFY-1: scaffold the `mde-notify` shared crate — bus tail + AlertItem model.**
   **As** a mesh operator,
   **I want** a library that tails the live bus alert lanes into a typed, deduped alert stream,
   **so that** every notification surface reads one source of truth (no demo data).
@@ -611,7 +611,7 @@ A professional, themed, desktop-wide notification center replacing the Cosmic tr
     - [ ] tails `fdo/*`, `peer/*/alerts`, `fleet/sec`, `event/firewall/*`, `compute/event/*`, presence + `mackesd::alert` lanes via `Persist::list_since` with a per-lane cursor
     - [ ] bus root resolves through `mde_bus::client_data_dir()` (reaches the live system bus)
     - [ ] `AlertItem` populated from real bus messages; dedup by ULID; retention horizon honored
-- [ ] **NOTIFY-2: severity + source classifier (the grouping + color engine).**
+- [✓] **NOTIFY-2: severity + source classifier (the grouping + color engine).**
   **As** an operator triaging alerts,
   **I want** each alert classified to a Severity and a Source from its topic + payload,
   **so that** the table can group by source and color by severity deterministically.
