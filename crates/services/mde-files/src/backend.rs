@@ -159,6 +159,9 @@ pub struct BackendSnapshot {
     pub self_node: SelfNode,
     pub peers: Vec<Peer>,
     pub inbox: Vec<FileRow>,
+    /// AFM-6 — files this node has sent to peers, projected from the send
+    /// audit log (kind `send_to`). Empty until the operator sends something.
+    pub outbox: Vec<FileRow>,
     pub downloads: Vec<FileRow>,
     pub local_pins: Vec<LocalPin>,
     pub local_recent: Vec<FileRow>,
@@ -200,6 +203,28 @@ impl BackendSnapshot {
         let peers = backend.peers();
         let inbox = backend.list("");
         let downloads = backend.list("downloads");
+        // AFM-6 — Outbox: the files this node has sent, projected from the send
+        // audit log. Newest first (audit_log returns reverse-chronological).
+        let outbox: Vec<FileRow> = backend
+            .audit_log()
+            .into_iter()
+            .filter(|a| a.kind == "send_to" && a.ok)
+            .map(|a| {
+                let name = a
+                    .source
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| a.source.display().to_string());
+                let peer = match a.destination {
+                    Destination::Peer(p)
+                    | Destination::Group(p)
+                    | Destination::Role(p)
+                    | Destination::Site(p) => p,
+                };
+                FileRow::local(name, crate::model::Mime::Doc, format!("{} B", a.bytes), "")
+                    .with_mesh(peer)
+            })
+            .collect();
         let local_pins = local_pins_xdg(&std::env::var_os("HOME"));
         let local_recent = local_recent_from(&std::env::var_os("HOME"));
         // Transfers live in the audit log feed; until mackesd
@@ -234,6 +259,7 @@ impl BackendSnapshot {
             self_node,
             peers,
             inbox,
+            outbox,
             downloads,
             local_pins,
             local_recent,
@@ -711,11 +737,7 @@ impl Backend for RealBackend {
         // resolved to `$HOME`, so an offline Bus made the Inbox view show the
         // operator's home directory as if those files had been received.)
         if path.is_empty() {
-            return self
-                .bus
-                .as_ref()
-                .map(BusBackend::inbox)
-                .unwrap_or_default();
+            return self.bus.as_ref().map(BusBackend::inbox).unwrap_or_default();
         }
         // E10 — Cloud-Files: the paired KDE-Connect device roster.
         if path == "cloud:" {

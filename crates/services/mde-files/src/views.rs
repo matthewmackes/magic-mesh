@@ -308,9 +308,13 @@ pub fn sidebar<'a>(
         icons::SEND,
         "Outbox",
         None,
-        Some("0".to_string()),
-        SideRowVariant::Default,
-        Message::Noop,
+        Some(snap.outbox.len().to_string()),
+        if matches!(view, View::Outbox) {
+            SideRowVariant::Active
+        } else {
+            SideRowVariant::Default
+        },
+        Message::SelectView(View::Outbox),
     ));
 
     let mesh_scroll = scrollable(mesh_col.spacing(0)).height(Length::Fill);
@@ -1055,6 +1059,58 @@ pub fn inbox<'a>(
         banner_widget,
         Space::new().height(Length::Fixed(22.0)),
         list,
+    ]
+    .spacing(0)
+    .into()
+}
+
+// ─── Outbox (AFM-6) ──────────────────────────────────────────────────────────
+
+/// Files this node has sent to peers — projected from the send audit log.
+/// Honest empty state when nothing has been sent.
+pub fn outbox<'a>(
+    snap: &'a BackendSnapshot,
+    layout: Layout,
+    selection: &'a Selection,
+) -> Element<'a, Message> {
+    let self_node = &snap.self_node;
+    let unique_targets = {
+        let mut hosts: Vec<&str> = snap
+            .outbox
+            .iter()
+            .filter_map(|f| f.mesh.as_deref())
+            .collect();
+        hosts.sort_unstable();
+        hosts.dedup();
+        hosts.len()
+    };
+
+    let banner_widget = banner(
+        icons::SEND,
+        "Mesh outbox".to_string(),
+        format!("files {} has sent to peers across the mesh", self_node.host),
+        vec![
+            BannerStat::new(snap.outbox.len().to_string(), "Sent"),
+            BannerStat::new(unique_targets.to_string(), "To peers"),
+        ],
+    );
+
+    let body: Element<'a, Message> = if snap.outbox.is_empty() {
+        container(
+            text("Nothing sent yet — use Send on a file or drop one onto a peer.")
+                .size(12)
+                .colr(t::FG_DIM),
+        )
+        .padding(Padding::from([8.0, 4.0]))
+        .into()
+    } else {
+        file_listing(&snap.outbox, true, "To", layout, selection)
+    };
+
+    column![
+        banner_widget,
+        Space::new().height(Length::Fixed(22.0)),
+        body,
     ]
     .spacing(0)
     .into()

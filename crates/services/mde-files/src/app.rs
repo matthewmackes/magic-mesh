@@ -69,6 +69,8 @@ pub enum Message {
     PeerCardBrowse(String),
     PeerCardSend(String),
     PrimaryAction,
+    /// AFM-9 — create a new folder in the current Local directory.
+    MakeDir,
     /// v2.0.0 Phase 1.3 — plain click on a file row.
     RowClick(String),
     /// v2.0.0 Phase 1.3 — ctrl-click on a file row (toggle in
@@ -762,13 +764,37 @@ impl MdeFiles {
             Message::TitlebarClose => {
                 pending_task = Some(window::latest().and_then(window::close));
             }
-            Message::Refresh
-            | Message::PeerCardSend(_)
-            | Message::PrimaryAction
-            | Message::Noop => {
+            // AFM-9 — per-peer Send: open a file chooser, then dispatch a
+            // real Send-To to that peer through the wired backend transport.
+            Message::PeerCardSend(id) => {
+                if let Some(dest) = self.peer_destination(&id) {
+                    pending_task = Some(pick_file_then_send(dest));
+                }
+            }
+            // AFM-9 — the toolbar primary action is view-sensitive: "New" makes
+            // a folder (Local), "Send" sends to the open peer (Peer view).
+            // Views with no single destination (overview/inbox/outbox/downloads)
+            // have no toolbar send target — the per-peer card / drag is the path.
+            Message::PrimaryAction => match &self.view {
+                View::Local => make_unique_dir(&self.local_path),
+                View::Peer(id) => {
+                    if let Some(dest) = self.peer_destination(id) {
+                        pending_task = Some(pick_file_then_send(dest));
+                    }
+                }
+                _ => {}
+            },
+            Message::MakeDir => {
+                // AFM-9 — create a uniquely-named folder in the current local
+                // directory; the end-of-update refresh re-lists it.
+                if matches!(self.view, View::Local) {
+                    make_unique_dir(&self.local_path);
+                }
+            }
+            Message::Refresh | Message::Noop => {
                 // Refresh is the explicit reload signal (the end-of-update
-                // `refresh_snapshot()` re-captures live state). The remaining
-                // variants are no-op routing hooks pending their own AFM tasks.
+                // `refresh_snapshot()` re-captures live state). Noop is the
+                // sink for affordances with no destination-specific action.
             }
             // MESHFS-8.1 — trash operations.
             Message::UndeleteLoaded(result) => {
@@ -865,6 +891,28 @@ impl MdeFiles {
         self.op_drawer.set_open(true);
     }
 
+    /// AFM-9 — resolve a peer id (as carried by the card / peer view) to a
+    /// Send-To destination, using the live roster to prefer the real host.
+    fn peer_destination(&self, id: &str) -> Option<Destination> {
+        let host = self
+            .snapshot
+            .peers
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.host.clone())
+            .unwrap_or_else(|| id.to_string());
+        // Strip a trailing ".mesh" — the transport keys on the bare hostname.
+        let name = host
+            .strip_suffix(".mesh")
+            .map(str::to_owned)
+            .unwrap_or(host);
+        if name.is_empty() {
+            None
+        } else {
+            Some(Destination::Peer(name))
+        }
+    }
+
     /// E10.5 — copy the live nav fields into the active tab's stored state.
     fn sync_active_tab(&mut self) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
@@ -941,6 +989,7 @@ impl MdeFiles {
         let main_body: Element<'_, Message> = match &self.view {
             View::MeshOverview => views::mesh_overview(snap),
             View::Inbox => views::inbox(snap, self.layout, &self.selection),
+            View::Outbox => views::outbox(snap, self.layout, &self.selection),
             View::Peer(id) => {
                 if let Some(p) = snap.peers.iter().find(|p| &p.id == id) {
                     views::peer_folder(
@@ -1124,7 +1173,11 @@ pub fn breadcrumbs_for_with_path(view: &View, path: &[String]) -> Vec<Crumb> {
             ),
         ];
         for (depth, seg) in path.iter().enumerate() {
-            out.push(Crumb::link(seg.clone(), true, Message::MeshFolderPop(depth)));
+            out.push(Crumb::link(
+                seg.clone(),
+                true,
+                Message::MeshFolderPop(depth),
+            ));
         }
         // The final crumb is the current location: leaf styling, not clickable.
         if let Some(last) = out.last_mut() {
@@ -1141,6 +1194,7 @@ fn breadcrumbs_for(view: &View) -> Vec<Crumb> {
     match view {
         View::MeshOverview => vec![mesh_root(), Crumb::leaf("Overview", false)],
         View::Inbox => vec![mesh_root(), Crumb::leaf("Inbox", false)],
+        View::Outbox => vec![mesh_root(), Crumb::leaf("Outbox", false)],
         View::CloudDevices => vec![Crumb::leaf("Cloud Files", false)],
         View::Network => vec![Crumb::leaf("Network", false)],
         View::Peer(id) => {
@@ -1150,10 +1204,7 @@ fn breadcrumbs_for(view: &View) -> Vec<Crumb> {
             vec![mesh_root(), Crumb::leaf(format!("{id}.mesh"), false)]
         }
         View::Downloads => vec![mesh_root(), Crumb::leaf("Downloads", false)],
-        View::Local => vec![
-            Crumb::leaf("Local", false),
-            Crumb::leaf("/", false),
-        ],
+        View::Local => vec![Crumb::leaf("Local", false), Crumb::leaf("/", false)],
         View::MeshHome => vec![mesh_root(), Crumb::leaf("Home", false)],
         View::MeshHomeChild(slug) => vec![
             mesh_root(),
@@ -1345,6 +1396,63 @@ fn archive_conflict_file(path: String) -> Task<Message> {
         },
         Message::ConflictArchived,
     )
+}
+
+/// AFM-9 — pop a desktop file chooser (zenity → kdialog), then dispatch a real
+/// Send-To of the chosen file to `dest`. Cancelling / no chooser installed →
+/// `Noop` (no fake transfer). Runs the chooser off the UI thread via a Task.
+fn pick_file_then_send(dest: Destination) -> Task<Message> {
+    Task::perform(async { pick_file_blocking() }, move |picked| match picked {
+        Some(path) => Message::SendTo(SendToRequest::copy_ask(
+            vec![path],
+            dest.clone(),
+            crate::send_to::SendToEntry::Toolbar,
+        )),
+        None => Message::Noop,
+    })
+}
+
+/// Run a system file chooser and return the selected path. Tries `zenity` then
+/// `kdialog`; returns `None` on cancel, error, or when neither is installed.
+fn pick_file_blocking() -> Option<std::path::PathBuf> {
+    let attempts: [(&str, &[&str]); 2] = [
+        (
+            "zenity",
+            &["--file-selection", "--title=Send a file to the mesh"],
+        ),
+        ("kdialog", &["--getopenfilename"]),
+    ];
+    for (bin, args) in attempts {
+        match std::process::Command::new(bin).args(args).output() {
+            Ok(out) if out.status.success() => {
+                let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Some(std::path::PathBuf::from(path));
+                }
+                return None; // chooser ran but selected nothing
+            }
+            Ok(_) => return None, // user cancelled
+            Err(_) => continue,   // binary missing — try the next chooser
+        }
+    }
+    None
+}
+
+/// AFM-9 — create a uniquely-named "New Folder" (then "New Folder 2"…) in `dir`.
+fn make_unique_dir(dir: &str) {
+    let base = std::path::Path::new(dir);
+    for n in 0..100 {
+        let name = if n == 0 {
+            "New Folder".to_string()
+        } else {
+            format!("New Folder {}", n + 1)
+        };
+        let candidate = base.join(&name);
+        if !candidate.exists() {
+            let _ = std::fs::create_dir(&candidate);
+            return;
+        }
+    }
 }
 
 fn empty_state(label: &str) -> Element<'static, Message> {

@@ -251,6 +251,8 @@ pub enum Mime {
 pub enum View {
     MeshOverview,
     Inbox,
+    /// AFM-6 — files this node has sent to peers (the send audit feed).
+    Outbox,
     Peer(String),
     Downloads,
     Local,
@@ -287,6 +289,7 @@ impl View {
             self,
             Self::MeshOverview
                 | Self::Inbox
+                | Self::Outbox
                 | Self::Peer(_)
                 | Self::MeshHome
                 | Self::MeshHomeChild(_)
@@ -302,6 +305,7 @@ impl View {
         match self {
             Self::MeshOverview => "Mesh",
             Self::Inbox => "Inbox",
+            Self::Outbox => "Outbox",
             Self::Peer(_) => "Peer",
             Self::Downloads => "Downloads",
             Self::Local => "Local",
