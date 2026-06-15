@@ -246,18 +246,18 @@ impl RunHistoryPanel {
     }
 }
 
-/// Resolve the ansible-runs root. Matches the v1.x Python
-/// panel's `peer_runs_dir` resolver:
-/// `$QNM_SHARED_ROOT/.qnm-sync/ansible-runs/`, falling back
-/// to `~/QNM-Shared/.qnm-sync/ansible-runs/`.
+/// Resolve the ansible-runs root under the shared workgroup mount:
+/// `<workgroup_root>/.qnm-sync/ansible-runs/`.
+///
+/// AUDIT-MESH-11 — uses the canonical [`default_workgroup_root`] resolver
+/// (MDE_WORKGROUP_ROOT → QNM_SHARED_ROOT → ~/QNM-Shared) rather than the old
+/// QNM_SHARED_ROOT-or-HOME logic, which ignored `MDE_WORKGROUP_ROOT` and so
+/// read an empty `~/QNM-Shared` on a deployed node where the daemon (and the
+/// session env.d drop-in) point at `/mnt/mesh-storage`.
 fn ansible_runs_root() -> PathBuf {
-    let base = std::env::var("QNM_SHARED_ROOT").map(PathBuf::from).ok();
-    let base = base.unwrap_or_else(|| {
-        std::env::var("HOME")
-            .map(|h| PathBuf::from(h).join("QNM-Shared"))
-            .unwrap_or_else(|_| PathBuf::from("/var/empty"))
-    });
-    base.join(".qnm-sync").join("ansible-runs")
+    mackes_mesh_types::peers::default_workgroup_root()
+        .join(".qnm-sync")
+        .join("ansible-runs")
 }
 
 /// Walk `<root>/<peer>/*.json` files, parse each, and return
