@@ -48,7 +48,11 @@ restart() {
 #    shared-state code works identically against a local dir, so a missing mount
 #    no-ops silently → NO LEADER / empty directory). If qnm-shared.service exists
 #    but the volume isn't a fuse mount, recover it + alert loudly.
-QNM="${QNM_PATH:-/root/QNM-Shared}"
+# AUDIT-MESH-1 — assert the SAME root the daemon uses. mackesd runs with
+# MDE_WORKGROUP_ROOT=/mnt/mesh-storage (systemd unit + env.d drop-in), and
+# setup-qnm-shared.sh mounts there; the old /root/QNM-Shared default checked the
+# wrong path, so a failed /mnt/mesh-storage mount slipped past the watchdog.
+QNM="${MDE_WORKGROUP_ROOT:-${QNM_PATH:-/mnt/mesh-storage}}"
 if systemctl list-unit-files qnm-shared.service >/dev/null 2>&1 && [ -d "$QNM" ]; then
     if ! mount 2>/dev/null | grep -q " $QNM type fuse"; then
         restart qnm-shared.service "QNM-Shared not mounted (shared-state plane down)"
