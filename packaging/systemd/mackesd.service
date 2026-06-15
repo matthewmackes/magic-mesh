@@ -76,7 +76,17 @@ SystemCallArchitectures=native
 # it needs. (Stricter ProtectSystem/ProtectHome/RestrictAddressFamilies are
 # deferred to EFF-12 follow-up — they need a live Fedora bring-up to verify
 # nebula tun + the QNM mount keep working.)
-NoNewPrivileges=true
+# SELINUX-1 (2026-06-15) — NoNewPrivileges REMOVED. mackesd is the node's
+# system-orchestrator: it execs helpers that legitimately change SELinux domain
+# (podman → container_runtime_t for the compute-descriptor probe; libvirt/virsh;
+# firewall-cmd; nebula-cert). NoNewPrivileges=yes makes the kernel forbid every
+# such domain transition (`nnp_transition` denials), which broke the
+# container/VM probe on a confined host AND flooded setroubleshoot with alerts
+# (UNIT-EAGLE: 13×+ tokio-rt-worker → container_runtime_t, plus the libvirt
+# rpc-virtqemud noise). NNP directly contradicts this unit's stated intent
+# ("without restricting the network/fs/subprocess paths it needs"). Containment
+# stays via the CapabilityBoundingSet drops + the Protect*/Restrict* knobs
+# below, none of which block domain transitions. Do NOT re-add NoNewPrivileges.
 # SUBAUDIT-D (2026-06-14) — `full` makes /etc READ-ONLY, which silently broke
 # every /etc write this daemon legitimately makes (mesh_dns → /etc/hosts for
 # <host>.mesh resolution; /etc/nebula materialization; /etc/ssh drop-ins;
