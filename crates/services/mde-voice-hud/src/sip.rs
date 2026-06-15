@@ -178,6 +178,27 @@ pub const VOICE_STATUS_TOPIC: &str = "state/voice/status";
 /// staleness window should be a small multiple of this (birthright uses 45s).
 pub const STATUS_HEARTBEAT_SECS: u64 = 15;
 
+/// VOIP-P2P — the well-known SIP port the registrar-less agent listens on over
+/// the overlay, so a peer dialing `sip:<peer>@<overlay-ip>:5060` (see
+/// `place_call_direct`) reaches it.
+pub const P2P_SIP_PORT: u16 = 5060;
+
+/// VOIP-P2P — the mesh Nebula overlay subnet anchor. Routing a socket toward it
+/// yields this node's own overlay source IP (the address peers reach it on),
+/// without enumerating interfaces. The lighthouse sits at `.1`.
+const MESH_OVERLAY_ANCHOR: &str = "10.42.0.1:5060";
+
+/// VOIP-P2P — discover this node's overlay (Nebula) source IP by asking the
+/// kernel which local address it would use to reach the overlay anchor. Returns
+/// `None` when the node has no route onto the overlay (voice P2P unavailable).
+fn overlay_source_ip() -> Option<String> {
+    let anchor: std::net::SocketAddr = MESH_OVERLAY_ANCHOR.parse().ok()?;
+    let ip = route_source_ip(anchor)?;
+    // Only accept an address actually on the overlay subnet — a default-route
+    // (public) source means there is no overlay path.
+    ip.starts_with("10.42.").then_some(ip)
+}
+
 /// Current wall-clock seconds since the Unix epoch (0 if the clock is before it).
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
@@ -1185,28 +1206,47 @@ pub fn run_agent(
     use std::sync::mpsc::TryRecvError;
     use std::time::Instant;
 
-    let Some(registrar) = (account.server_host.as_str(), account.server_port)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut it| it.next())
-    else {
-        let st = RegistrationState::Failed("cannot resolve registrar".into());
+    // VOIP-P2P — registrar-less mode (no `server_host`): skip REGISTER and bind
+    // the well-known SIP port on the overlay so peers can dial us directly.
+    let registrar_less = account.server_host.trim().is_empty();
+    let bail = |events: &std::sync::mpsc::Sender<AgentEvent>, why: &str| {
+        let st = RegistrationState::Failed(why.to_string());
         publish_voice_status(&st, false);
         let _ = events.send(AgentEvent::Registration(st));
-        return;
     };
-    let Some(local_ip) = route_source_ip(registrar) else {
-        let st = RegistrationState::Failed("no route to registrar".into());
-        publish_voice_status(&st, false);
-        let _ = events.send(AgentEvent::Registration(st));
-        return;
-    };
-    let Ok(sock) = UdpSocket::bind((local_ip.as_str(), 0)) else {
-        let st = RegistrationState::Failed("agent socket bind failed".into());
-        publish_voice_status(&st, false);
-        let _ = events.send(AgentEvent::Registration(st));
-        return;
-    };
+    let (sock, local_ip, registrar): (UdpSocket, String, Option<std::net::SocketAddr>) =
+        if registrar_less {
+            let Some(local_ip) = overlay_source_ip() else {
+                bail(events, "no overlay address for P2P voice");
+                return;
+            };
+            // Prefer the well-known P2P port; fall back to ephemeral if taken.
+            let Ok(sock) = UdpSocket::bind((local_ip.as_str(), P2P_SIP_PORT))
+                .or_else(|_| UdpSocket::bind((local_ip.as_str(), 0)))
+            else {
+                bail(events, "agent socket bind failed");
+                return;
+            };
+            (sock, local_ip, None)
+        } else {
+            let Some(registrar) = (account.server_host.as_str(), account.server_port)
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut it| it.next())
+            else {
+                bail(events, "cannot resolve registrar");
+                return;
+            };
+            let Some(local_ip) = route_source_ip(registrar) else {
+                bail(events, "no route to registrar");
+                return;
+            };
+            let Ok(sock) = UdpSocket::bind((local_ip.as_str(), 0)) else {
+                bail(events, "agent socket bind failed");
+                return;
+            };
+            (sock, local_ip, Some(registrar))
+        };
     sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
     let local_port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
     let rtp_port = 40000 + (local_port % 1000) * 2;
@@ -1214,7 +1254,14 @@ pub fn run_agent(
     let reg_period = Duration::from_secs(u64::from(account.expires.max(60)) / 2);
     // The socket is bound, so the agent is now listening for inbound INVITEs;
     // `listening` stays true for the rest of the loop.
-    let mut reg_state = agent_register(&sock, registrar, account, &local_ip, local_port);
+    let mut reg_state = match registrar {
+        Some(registrar) => agent_register(&sock, registrar, account, &local_ip, local_port),
+        // VOIP-P2P — no registrar: we are reachable on the overlay directly.
+        None => RegistrationState::Registered {
+            server: format!("{local_ip}:{local_port} · P2P overlay"),
+            expires: 0,
+        },
+    };
     publish_voice_status(&reg_state, true);
     let _ = events.send(AgentEvent::Registration(reg_state.clone()));
     let mut next_reg = Instant::now() + reg_period;
@@ -1301,11 +1348,15 @@ pub fn run_agent(
             }
         }
 
-        if Instant::now() >= next_reg {
-            reg_state = agent_register(&sock, registrar, account, &local_ip, local_port);
-            publish_voice_status(&reg_state, true);
-            let _ = events.send(AgentEvent::Registration(reg_state.clone()));
-            next_reg = Instant::now() + reg_period;
+        // VOIP-P2P — only re-REGISTER when there is a registrar; a registrar-less
+        // P2P agent just keeps listening (no registration to refresh).
+        if let Some(registrar) = registrar {
+            if Instant::now() >= next_reg {
+                reg_state = agent_register(&sock, registrar, account, &local_ip, local_port);
+                publish_voice_status(&reg_state, true);
+                let _ = events.send(AgentEvent::Registration(reg_state.clone()));
+                next_reg = Instant::now() + reg_period;
+            }
         }
 
         // Heartbeat: re-publish the (unchanged) status so a reader can tell a

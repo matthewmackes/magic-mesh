@@ -860,13 +860,10 @@ pub fn filter_dialer_chars(s: &str) -> String {
 /// exiting, so a reader can still distinguish "agent up, no account" from "agent
 /// not running".
 fn run_headless_agent() {
-    let Some(acct) = sip::SipAccount::load() else {
-        tracing::info!("voice agent: no account.toml — publishing unregistered heartbeat");
-        loop {
-            sip::publish_voice_status(&sip::RegistrationState::NoAccount, false);
-            std::thread::sleep(std::time::Duration::from_secs(sip::STATUS_HEARTBEAT_SECS));
-        }
-    };
+    // VOIP-P2P — registrar-less by default: with no account.toml, run as a P2P
+    // agent on the overlay (a local identity, no registrar) so peers can still
+    // dial this node directly. A configured account.toml uses the registrar.
+    let acct = sip::SipAccount::load().unwrap_or_else(sip::SipAccount::local_identity);
     tracing::info!(server = %acct.server_host, "voice agent: starting (headless)");
     let (event_tx, event_rx) = mpsc::channel::<sip::AgentEvent>();
     // Hold the command sender for the agent's lifetime so its loop never sees a
@@ -913,26 +910,31 @@ fn main() -> Result<(), cosmic::iced::Error> {
             // is configured. The blocking socket work runs off the UI thread
             // via spawn_blocking; the result lands as Message::Registered.
             let account = sip::SipAccount::load();
-            let registration = match account.clone() {
-                Some(acct) => {
-                    tracing::info!(server = %acct.server_host, "voice-hud: starting SIP agent");
-                    // Spawn the persistent SIP agent (registration + re-register
-                    // + inbound INVITE/BYE) on its own thread, bridged to the UI
-                    // via the AGENT_* channels (events ← agent, commands → agent).
-                    let (event_tx, event_rx) = mpsc::channel::<sip::AgentEvent>();
-                    let (cmd_tx, cmd_rx) = mpsc::channel::<sip::AgentCommand>();
-                    if let Ok(mut g) = AGENT_EVENTS.lock() {
-                        *g = Some(event_rx);
-                    }
-                    if let Ok(mut g) = AGENT_CMD.lock() {
-                        *g = Some(cmd_tx);
-                    }
-                    let _ = std::thread::Builder::new()
-                        .name("mwv-sip-agent".into())
-                        .spawn(move || sip::run_agent(&acct, &event_tx, &cmd_rx));
-                    sip::RegistrationState::Registering
+            // VOIP-P2P — the agent ALWAYS runs: a registrar account when
+            // configured, else a registrar-less local overlay identity so the
+            // node still listens for direct peer INVITEs. `state.account` keeps
+            // the loaded Option (None → outbound dials synthesize a local
+            // identity in PlaceCall); the agent thread gets the resolved one.
+            let agent_account = account
+                .clone()
+                .unwrap_or_else(sip::SipAccount::local_identity);
+            let registration = {
+                tracing::info!(server = %agent_account.server_host, "voice-hud: starting SIP agent");
+                // Spawn the persistent SIP agent (register/listen or P2P-listen +
+                // inbound INVITE/BYE) on its own thread, bridged to the UI via the
+                // AGENT_* channels (events ← agent, commands → agent).
+                let (event_tx, event_rx) = mpsc::channel::<sip::AgentEvent>();
+                let (cmd_tx, cmd_rx) = mpsc::channel::<sip::AgentCommand>();
+                if let Ok(mut g) = AGENT_EVENTS.lock() {
+                    *g = Some(event_rx);
                 }
-                None => sip::RegistrationState::NoAccount,
+                if let Ok(mut g) = AGENT_CMD.lock() {
+                    *g = Some(cmd_tx);
+                }
+                let _ = std::thread::Builder::new()
+                    .name("mwv-sip-agent".into())
+                    .spawn(move || sip::run_agent(&agent_account, &event_tx, &cmd_rx));
+                sip::RegistrationState::Registering
             };
             (
                 VoiceHud {
