@@ -411,7 +411,12 @@ fn roster_json(roster: &Roster) -> String {
 /// the shared pairing store, folding its events into `roster`. Best-effort: a
 /// discovery-bind or transport-start failure logs + returns, leaving the worker
 /// serving the seeded (static) roster — never fails worker startup.
-async fn run_host(pairing: Arc<PairingStore>, roster: Roster, outbound: PendingSends) {
+async fn run_host(
+    pairing: Arc<PairingStore>,
+    roster: Roster,
+    outbound: PendingSends,
+    config_dir: PathBuf,
+) {
     let announce = local_announce();
     let bind = SocketAddr::from(([0, 0, 0, 0], KDC_PORT));
     let discovery = match UdpDiscovery::bind(bind, announce.clone()).await {
@@ -469,6 +474,12 @@ async fn run_host(pairing: Arc<PairingStore>, roster: Roster, outbound: PendingS
                             == Some(true)
                     {
                         accept_pair(&pairing, &transport, &roster, peer).await;
+                    }
+                    // KDC-PLUGINS — Run Command: the phone asks for the command list
+                    // (`requestCommandList`) or triggers a curated key. Results come
+                    // back as a `kdeconnect.ping` notification on the phone.
+                    if packet.kind == "kdeconnect.runcommand.request" {
+                        handle_runcommand(&transport, &config_dir, peer, &packet.body).await;
                     }
                 }
                 if let Ok(mut m) = roster.lock() {
@@ -539,6 +550,167 @@ async fn accept_pair(
         warn!(device = %device_id, error = %e, "kdc-host: pair-accept send failed");
     } else {
         info!(device = %device_id, "kdc-host: paired (accepted phone request)");
+    }
+}
+
+// ───────────────────────── KDC-PLUGINS: Run Command ──────────────────────
+//
+// KDE Connect's runcommand plugin: the phone requests the host's curated command
+// list, then triggers a command by key. **Curated keys only — never arbitrary
+// shell from the phone** (the phone can only invoke pre-defined commands), and
+// only over the paired+authenticated link. Results are returned to the phone as a
+// `kdeconnect.ping` notification so a "Mesh health check" actually shows its
+// output on the phone. Editable via `<config_dir>/runcommands.toml`.
+
+/// One operator-curated command the phone can trigger by `key`.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RunCmd {
+    key: String,
+    name: String,
+    command: String,
+}
+
+/// `runcommands.toml` document root (`[[command]]` tables).
+#[derive(Debug, Default, serde::Deserialize)]
+struct RunCommandFile {
+    #[serde(default)]
+    command: Vec<RunCmd>,
+}
+
+/// The built-in **Mesh-ops** bundle (operator survey pick). Each result is sent
+/// back to the phone as a ping notification.
+fn default_runcommands() -> Vec<RunCmd> {
+    [
+        // Phone-friendly one-line summaries (the result is shown as a phone
+        // notification, so raw JSON is unreadable — parse the key fields out).
+        (
+            "mesh-health",
+            "Mesh health check",
+            "h=$(mackesd healthz 2>&1); \
+             printf 'Mesh %s/%s nodes healthy · audit=%s · v%s · ready=%s' \
+               \"$(printf '%s' \"$h\" | grep -oP '\"healthy_nodes\":\\K[0-9]+')\" \
+               \"$(printf '%s' \"$h\" | grep -oP '\"node_count\":\\K[0-9]+')\" \
+               \"$(printf '%s' \"$h\" | grep -oP '\"audit_chain_intact\":\\K(true|false)')\" \
+               \"$(printf '%s' \"$h\" | grep -oP '\"version\":\"\\K[^\"]+')\" \
+               \"$(printf '%s' \"$h\" | grep -oP '\"ready\":\\K(true|false)')\"",
+        ),
+        (
+            "mesh-status",
+            "Mesh status (peers)",
+            "printf 'Peers: '; mackesd peers --json 2>/dev/null \
+             | grep -oP '\"hostname\":\"\\K[^\"]+' | paste -sd ', ' -",
+        ),
+        (
+            "disk-headroom",
+            "Disk headroom",
+            "df -h --output=target,pcent,avail / /mnt/mesh-storage 2>/dev/null \
+             | tail -n +2 | awk '{print $1\": \"$3\" free (\"$2\" used)\"}' | paste -sd ' | ' -",
+        ),
+        (
+            "restart-mesh",
+            "Restart mesh service",
+            "systemd-run --on-active=2 systemctl restart mackesd >/dev/null 2>&1; \
+             echo 'mesh service restarting in 2s'",
+        ),
+    ]
+    .iter()
+    .map(|(key, name, command)| RunCmd {
+        key: (*key).to_string(),
+        name: (*name).to_string(),
+        command: (*command).to_string(),
+    })
+    .collect()
+}
+
+/// Load the curated command list: `<config_dir>/runcommands.toml` when present +
+/// parseable, else the built-in [`default_runcommands`]. An empty file (no
+/// `[[command]]`) also falls back to defaults so the phone is never left with an
+/// empty list.
+fn load_runcommands(config_dir: &std::path::Path) -> Vec<RunCmd> {
+    let path = config_dir.join("runcommands.toml");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match toml::from_str::<RunCommandFile>(&text) {
+            Ok(f) if !f.command.is_empty() => f.command,
+            _ => default_runcommands(),
+        },
+        Err(_) => default_runcommands(),
+    }
+}
+
+/// Build the `commandList` payload: KDE Connect expects a **stringified** JSON map
+/// of `key → {name, command}` inside the `kdeconnect.runcommand` body.
+fn command_list_json(cmds: &[RunCmd]) -> String {
+    let map: serde_json::Map<String, Value> = cmds
+        .iter()
+        .map(|c| {
+            (
+                c.key.clone(),
+                json!({ "name": c.name, "command": c.command }),
+            )
+        })
+        .collect();
+    Value::Object(map).to_string()
+}
+
+/// Run the command bound to `key` and return a phone-friendly result line. Unknown
+/// keys (a phone can't invent commands, but be defensive) return an error string.
+/// Output is trimmed + truncated for the ping notification.
+fn execute_runcommand(cmds: &[RunCmd], key: &str) -> String {
+    let Some(cmd) = cmds.iter().find(|c| c.key == key) else {
+        return format!("unknown command: {key}");
+    };
+    match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd.command)
+        .output()
+    {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let body = if stdout.trim().is_empty() {
+                String::from_utf8_lossy(&out.stderr).trim().to_string()
+            } else {
+                stdout.trim().to_string()
+            };
+            let shown: String = body.chars().take(480).collect();
+            if shown.is_empty() {
+                format!("{}: done", cmd.name)
+            } else {
+                format!("{}\n{shown}", cmd.name)
+            }
+        }
+        Err(e) => format!("{}: failed to run ({e})", cmd.name),
+    }
+}
+
+/// Handle one `kdeconnect.runcommand.request`: either publish the command list
+/// (`requestCommandList`) or execute a `key` and ping the result back. Execution
+/// runs off the reactor thread (`spawn_blocking`) so a slow command can't stall
+/// the host event loop.
+async fn handle_runcommand(
+    transport: &LanTransport,
+    config_dir: &std::path::Path,
+    peer: &PeerId,
+    body: &Value,
+) {
+    let cmds = load_runcommands(config_dir);
+    if body.get("requestCommandList").and_then(Value::as_bool) == Some(true) {
+        let list = command_list_json(&cmds);
+        let pkt = build_packet("kdeconnect.runcommand", json!({ "commandList": list }));
+        if let Err(e) = transport.send_to(peer, pkt).await {
+            warn!(error = %e, "kdc-host: runcommand list send failed");
+        }
+        return;
+    }
+    if let Some(key) = body.get("key").and_then(Value::as_str) {
+        let key = key.to_string();
+        let result = tokio::task::spawn_blocking(move || execute_runcommand(&cmds, &key))
+            .await
+            .unwrap_or_else(|_| "command execution failed".to_string());
+        info!(device = %peer.as_str(), "kdc-host: ran phone command");
+        let pkt = build_packet("kdeconnect.ping", json!({ "message": result }));
+        if let Err(e) = transport.send_to(peer, pkt).await {
+            warn!(error = %e, "kdc-host: runcommand result ping failed");
+        }
     }
 }
 
@@ -855,6 +1027,7 @@ impl Worker for KdcHostWorker {
             Arc::clone(&pairing_arc),
             Arc::clone(&roster),
             self.outbound.clone(),
+            self.config_dir.clone(),
         ));
 
         // E2.2/E2.3 — serve the operator Connect actions (`action/connect/<verb>`)
@@ -927,6 +1100,67 @@ mod tests {
     fn worker_name_matches_module() {
         let w = KdcHostWorker::new(PathBuf::from("/tmp"));
         assert_eq!(w.name(), "kdc-host");
+    }
+
+    #[test]
+    fn default_runcommands_are_the_mesh_ops_bundle() {
+        let defaults = default_runcommands();
+        let keys: Vec<&str> = defaults.iter().map(|c| c.key.as_str()).collect();
+        // The operator-selected Mesh-ops set.
+        for k in [
+            "mesh-health",
+            "mesh-status",
+            "disk-headroom",
+            "restart-mesh",
+        ] {
+            assert!(keys.contains(&k), "missing default runcommand {k}");
+        }
+    }
+
+    #[test]
+    fn load_runcommands_falls_back_to_defaults_without_a_toml() {
+        let tmp = tempdir().unwrap();
+        let cmds = load_runcommands(tmp.path());
+        assert_eq!(cmds.len(), default_runcommands().len());
+    }
+
+    #[test]
+    fn load_runcommands_reads_a_custom_toml() {
+        let tmp = tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("runcommands.toml"),
+            "[[command]]\nkey=\"lock\"\nname=\"Lock screen\"\ncommand=\"loginctl lock-session\"\n",
+        )
+        .unwrap();
+        let cmds = load_runcommands(tmp.path());
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].key, "lock");
+        assert_eq!(cmds[0].name, "Lock screen");
+    }
+
+    #[test]
+    fn command_list_json_is_a_keyed_name_command_map() {
+        let cmds = vec![RunCmd {
+            key: "k1".into(),
+            name: "N1".into(),
+            command: "echo hi".into(),
+        }];
+        let s = command_list_json(&cmds);
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["k1"]["name"], "N1");
+        assert_eq!(v["k1"]["command"], "echo hi");
+    }
+
+    #[test]
+    fn execute_runcommand_runs_known_key_and_rejects_unknown() {
+        let cmds = vec![RunCmd {
+            key: "say".into(),
+            name: "Say hi".into(),
+            command: "echo mesh-ok".into(),
+        }];
+        let out = execute_runcommand(&cmds, "say");
+        assert!(out.contains("mesh-ok"), "output should carry stdout: {out}");
+        assert!(execute_runcommand(&cmds, "nope").contains("unknown command"));
     }
 
     #[test]
