@@ -567,7 +567,28 @@ pub fn toolbar<'a>(
         } else {
             t::FG_DIM
         };
-        crumb_row = crumb_row.push(text(c.label.clone()).size(12).colr(fg));
+        // AFM-3 — a crumb with a nav target renders as a button that routes
+        // there; the leaf (current location) renders as plain text.
+        crumb_row = match &c.nav {
+            Some(msg) => crumb_row.push(
+                button(text(c.label.clone()).size(12).colr(fg))
+                    .padding(Padding::from([2.0, 4.0]))
+                    .on_press(msg.clone())
+                    .sty(|_t: &Theme, status: button::Status| button::Style {
+                        snap: false,
+                        background: matches!(status, button::Status::Hovered)
+                            .then_some(Background::Color(t::ROW_HOVER_FAINT)),
+                        text_color: t::FG,
+                        border: Border {
+                            color: Color::TRANSPARENT,
+                            width: 0.0,
+                            radius: 0.0.into(),
+                        },
+                        ..button::Style::default()
+                    }),
+            ),
+            None => crumb_row.push(text(c.label.clone()).size(12).colr(fg)),
+        };
     }
     let is_mesh = crumbs.iter().any(|c| c.mesh);
     crumb_row = crumb_row.push(breadcrumb_tag(
@@ -833,7 +854,7 @@ pub fn mesh_overview<'a>(snap: &'a BackendSnapshot) -> Element<'a, Message> {
         Space::new().height(Length::Fixed(22.0)),
         section_h(
             &format!("Peers · {total}"),
-            Some("tailnet · sorted by latency")
+            Some("overlay · sorted by latency")
         ),
         cards,
         section_h("Recent mesh transfers", Some("last 24 h")),

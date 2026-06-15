@@ -9,7 +9,7 @@
 use crate::cosmic_compat::{ContainerSty, TextSty};
 use cosmic::app::ApplicationExt;
 use cosmic::iced::widget::{column, container, row, scrollable};
-use cosmic::iced::{Background, Border, Color, Length, Padding, Task};
+use cosmic::iced::{window, Background, Border, Color, Length, Padding, Task};
 use cosmic::{Application, Element};
 
 use crate::backend::{
@@ -182,6 +182,30 @@ pub struct Crumb {
     pub label: String,
     /// True if this crumb belongs to a mesh path. Affects colour + the trailing tag chip.
     pub mesh: bool,
+    /// AFM-3 — navigation target when this crumb is clicked. `None` for the
+    /// leaf (current location) + purely-decorative segments; `Some` makes the
+    /// crumb a real button that routes there.
+    pub nav: Option<Message>,
+}
+
+impl Crumb {
+    /// A non-clickable crumb (the current location / decorative segment).
+    fn leaf(label: impl Into<String>, mesh: bool) -> Self {
+        Self {
+            label: label.into(),
+            mesh,
+            nav: None,
+        }
+    }
+
+    /// A clickable crumb that routes to `nav` when pressed.
+    fn link(label: impl Into<String>, mesh: bool, nav: Message) -> Self {
+        Self {
+            label: label.into(),
+            mesh,
+            nav: Some(nav),
+        }
+    }
 }
 
 pub struct MdeFiles {
@@ -690,17 +714,26 @@ impl MdeFiles {
             }
             Message::KeyboardActivity => self.keyboard_active = true,
             Message::PointerActivity => self.keyboard_active = false,
+            // AFM-1 — real window controls. `window::latest()` resolves the
+            // most-recently-created window (the single app window) and the inner
+            // match maps to the iced window Task, mirroring
+            // `mde-workbench::dispatch_window_action`.
+            Message::TitlebarMinimize => {
+                pending_task = Some(window::latest().and_then(|id| window::minimize(id, true)));
+            }
+            Message::TitlebarMaximize => {
+                pending_task = Some(window::latest().and_then(window::toggle_maximize));
+            }
+            Message::TitlebarClose => {
+                pending_task = Some(window::latest().and_then(window::close));
+            }
             Message::Refresh
-            | Message::TitlebarMinimize
-            | Message::TitlebarMaximize
-            | Message::TitlebarClose
             | Message::PeerCardSend(_)
             | Message::PrimaryAction
             | Message::Noop => {
-                // Refresh is the explicit reload signal. The
-                // other variants are no-op routing hooks that
-                // pre-date the live backend; touching them only
-                // re-captures so the snapshot stays current.
+                // Refresh is the explicit reload signal (the end-of-update
+                // `refresh_snapshot()` re-captures live state). The remaining
+                // variants are no-op routing hooks pending their own AFM tasks.
             }
             // MESHFS-8.1 — trash operations.
             Message::UndeleteLoaded(result) => {
@@ -1041,30 +1074,24 @@ impl Application for MdeFiles {
 /// crumb and the leaf.
 pub fn breadcrumbs_for_with_path(view: &View, path: &[String]) -> Vec<Crumb> {
     if let View::MeshHomeChild(slug) = view {
+        // Mesh → overview · Home → mesh-home landing · <Dir> → the slug root
+        // (resets the descent) · each path segment → pop to that depth.
         let mut out = vec![
-            Crumb {
-                label: "Mesh".into(),
-                mesh: true,
-            },
-            Crumb {
-                label: "Home".into(),
-                mesh: true,
-            },
-            Crumb {
-                label: mesh_home_label(slug).into(),
-                mesh: true,
-            },
+            Crumb::link("Mesh", true, Message::SelectView(View::MeshOverview)),
+            Crumb::link("Home", true, Message::SelectView(View::MeshHome)),
+            Crumb::link(
+                mesh_home_label(slug),
+                true,
+                Message::SelectView(View::MeshHomeChild(slug.clone())),
+            ),
         ];
-        for seg in path {
-            out.push(Crumb {
-                label: seg.clone(),
-                mesh: true,
-            });
+        for (depth, seg) in path.iter().enumerate() {
+            out.push(Crumb::link(seg.clone(), true, Message::MeshFolderPop(depth)));
         }
-        // Mark the final crumb as leaf (mesh: false) so the
-        // styling matches the other leaf crumbs.
+        // The final crumb is the current location: leaf styling, not clickable.
         if let Some(last) = out.last_mut() {
             last.mesh = false;
+            last.nav = None;
         }
         return out;
     }
@@ -1072,107 +1099,30 @@ pub fn breadcrumbs_for_with_path(view: &View, path: &[String]) -> Vec<Crumb> {
 }
 
 fn breadcrumbs_for(view: &View) -> Vec<Crumb> {
+    let mesh_root = || Crumb::link("Mesh", true, Message::SelectView(View::MeshOverview));
     match view {
-        View::MeshOverview => vec![
-            Crumb {
-                label: "Mesh".into(),
-                mesh: true,
-            },
-            Crumb {
-                label: "Overview".into(),
-                mesh: false,
-            },
-        ],
-        View::Inbox => vec![
-            Crumb {
-                label: "Mesh".into(),
-                mesh: true,
-            },
-            Crumb {
-                label: "Inbox".into(),
-                mesh: false,
-            },
-        ],
-        View::CloudDevices => vec![Crumb {
-            label: "Cloud Files".into(),
-            mesh: false,
-        }],
-        View::Network => vec![Crumb {
-            label: "Network".into(),
-            mesh: false,
-        }],
+        View::MeshOverview => vec![mesh_root(), Crumb::leaf("Overview", false)],
+        View::Inbox => vec![mesh_root(), Crumb::leaf("Inbox", false)],
+        View::CloudDevices => vec![Crumb::leaf("Cloud Files", false)],
+        View::Network => vec![Crumb::leaf("Network", false)],
         View::Peer(id) => {
-            // The host string is built from the peer id by
-            // convention (id "pine" → host "pine.mesh"). We
-            // don't have the live peer list here; the toolbar
-            // shows the host literal which the runtime can
-            // patch on next render.
-            let host = format!("{id}.mesh");
-            vec![
-                Crumb {
-                    label: "Mesh".into(),
-                    mesh: true,
-                },
-                Crumb {
-                    label: host,
-                    mesh: false,
-                },
-            ]
+            // The host string is built from the peer id by convention
+            // (id "pine" → host "pine.mesh"); the runtime patches the live
+            // host on next render. The leaf is the current peer (not clickable).
+            vec![mesh_root(), Crumb::leaf(format!("{id}.mesh"), false)]
         }
-        View::Downloads => vec![
-            Crumb {
-                label: "Mesh".into(),
-                mesh: true,
-            },
-            Crumb {
-                label: "Downloads".into(),
-                mesh: false,
-            },
-        ],
+        View::Downloads => vec![mesh_root(), Crumb::leaf("Downloads", false)],
         View::Local => vec![
-            Crumb {
-                label: "Local".into(),
-                mesh: false,
-            },
-            Crumb {
-                label: "/".into(),
-                mesh: false,
-            },
+            Crumb::leaf("Local", false),
+            Crumb::leaf("/", false),
         ],
-        View::MeshHome => vec![
-            Crumb {
-                label: "Mesh".into(),
-                mesh: true,
-            },
-            Crumb {
-                label: "Home".into(),
-                mesh: false,
-            },
-        ],
+        View::MeshHome => vec![mesh_root(), Crumb::leaf("Home", false)],
         View::MeshHomeChild(slug) => vec![
-            Crumb {
-                label: "Mesh".into(),
-                mesh: true,
-            },
-            Crumb {
-                label: "Home".into(),
-                mesh: true,
-            },
-            Crumb {
-                label: mesh_home_label(slug).into(),
-                mesh: false,
-            },
+            mesh_root(),
+            Crumb::link("Home", true, Message::SelectView(View::MeshHome)),
+            Crumb::leaf(mesh_home_label(slug), false),
         ],
-        View::MeshUndelete => vec![
-            Crumb {
-                label: "Mesh".into(),
-                mesh: true,
-            },
-            Crumb {
-                label: "Recycle Bin".into(),
-                mesh: false,
-            },
-        ],
+        View::MeshUndelete => vec![mesh_root(), Crumb::leaf("Recycle Bin", false)],
     }
 }
 

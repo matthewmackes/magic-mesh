@@ -704,16 +704,18 @@ impl Backend for RealBackend {
                 .and_then(|d| d.list_peer(peer).ok())
                 .unwrap_or_default();
         }
-        // AUD-7 — the empty path is the mesh Inbox: received files from the
-        // LizardFS-replicated inbox over the Bus. Falls back to the local
-        // backend's inbox when mackesd/Bus is unavailable.
+        // AFM-5 — the empty path is the mesh Inbox ONLY: received files from the
+        // LizardFS-replicated inbox over the Bus. When mackesd/Bus is
+        // unavailable the inbox is empty — return an honest empty list, never
+        // the local home directory. (The old fallback to `local.list("")`
+        // resolved to `$HOME`, so an offline Bus made the Inbox view show the
+        // operator's home directory as if those files had been received.)
         if path.is_empty() {
-            if let Some(rows) = self.bus.as_ref().map(BusBackend::inbox) {
-                if !rows.is_empty() {
-                    return rows;
-                }
-            }
-            return self.local.list(path);
+            return self
+                .bus
+                .as_ref()
+                .map(BusBackend::inbox)
+                .unwrap_or_default();
         }
         // E10 — Cloud-Files: the paired KDE-Connect device roster.
         if path == "cloud:" {
@@ -1019,6 +1021,21 @@ mod tests {
     fn local_fs_backend_unknown_local_slug_returns_empty() {
         let b = LocalFsBackend::new();
         assert!(b.list("local:does-not-exist").is_empty());
+    }
+
+    /// AFM-5 — the Inbox view (empty path) must NEVER fall back to the local
+    /// home directory. With no Bus connected (the test env), `list("")` is the
+    /// mesh inbox and must come back empty, not the operator's `$HOME` listing.
+    #[test]
+    fn real_backend_inbox_is_empty_not_home_without_bus() {
+        let b = RealBackend::new();
+        // No mackesd/Bus in the test env → honest empty inbox.
+        if b.bus.is_none() {
+            assert!(
+                b.list("").is_empty(),
+                "Inbox must be empty (not the home directory) when the Bus is down"
+            );
+        }
     }
 
     #[test]
