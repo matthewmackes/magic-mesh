@@ -358,6 +358,13 @@ async fn load_topics() -> Result<Vec<TopicInfo>, String> {
             leaf_dirs.push((dir.clone(), rel));
         }
         for sub in subdirs {
+            // AUDIT-MESH-9 — don't descend into the request/reply plumbing tree
+            // (`reply/<ulid>/…`): it's RPC correlation spool, not a user-facing
+            // notification topic, and on a busy node it's hundreds of dirs that
+            // would bury the real topics (and slow the walk).
+            if sub.file_name().is_some_and(|n| n == "reply") {
+                continue;
+            }
             queue.push_back((sub, depth + 1));
         }
     }
@@ -694,6 +701,18 @@ impl MeshBusPanel {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// AUDIT-MESH-9 — load the default (Topics) tab when the panel opens.
+    /// The per-tab fetch only fired on a `SelectTab` message, but opening the
+    /// panel lands on Topics WITHOUT sending one, so a live bus rendered "No
+    /// topics active yet". The nav dispatch calls this on open (mirroring every
+    /// other panel's load-on-nav); it kicks the Topics walk so the registry
+    /// shows real traffic immediately.
+    pub fn load() -> Task<crate::Message> {
+        Task::perform(load_topics(), |r| {
+            crate::Message::MeshBus(Message::TopicsLoaded(r))
+        })
     }
 
     pub fn update(&mut self, msg: Message) -> Task<crate::Message> {

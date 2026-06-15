@@ -1051,6 +1051,9 @@ impl App {
             "fleet_logs" => fleet_logs_panel::FleetLogsPanel::load(),
             // PLANES-1 (W52) — Mesh Control gets its own Controller entry.
             "mesh_control" => mesh_control_panel::MeshControlPanel::load(),
+            // AUDIT-MESH-9 — load the bus Topics tab on open (was never fetched
+            // until a tab click, so a live bus showed "No topics active yet").
+            "mesh_bus" => mesh_bus_panel::MeshBusPanel::load(),
             // v4.0.1 WB-2.i — scan probe.json cache for pending peers.
             "mesh_pending" => mesh_pending_panel::MeshPendingPanel::load(),
             // v4.0.1 WB-2.d — load applet visibility from panel.toml.
