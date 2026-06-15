@@ -45,14 +45,39 @@ pub fn decide(holder_pid: Option<u32>, is_live_sibling: impl Fn(u32) -> bool) ->
     }
 }
 
-/// `true` if `pid` is a live process whose comm is `mde-workbench` (guards
-/// against PID reuse — a recycled PID owned by some other program must not
-/// read as "the workbench is already running"). Linux `/proc`, dep-free.
+/// `true` if `pid` is a **live** process whose comm is `mde-workbench` (guards
+/// against PID reuse — a recycled PID owned by some other program must not read
+/// as "the workbench is already running"). Linux `/proc`, dep-free.
+///
+/// BUGFIX (zombie storm): a **defunct/zombie** workbench (dead but unreaped by
+/// its launcher) keeps both its `/proc/<pid>` entry and a readable `comm`, so a
+/// stale pidfile pointing at it used to read as "running" — every new launch
+/// then handed off `--focus` to a corpse, the hand-off timed out, and the launch
+/// exited (becoming another zombie). Result: the window never opens + zombies
+/// pile up. So a zombie (`/proc/<pid>/stat` state `Z`) is NOT a live primary —
+/// the launch takes over instead.
 #[must_use]
 pub fn live_workbench(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+    let comm_ok = std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .map(|comm| comm.trim() == "mde-workbench")
-        .unwrap_or(false)
+        .unwrap_or(false);
+    comm_ok && !is_zombie(pid)
+}
+
+/// `true` if `pid` is a zombie (defunct, awaiting reap). Reads the process state
+/// from `/proc/<pid>/stat` — the char after the last `)` (the `comm` field is
+/// parenthesized and may itself contain `)`, so split on the last one). A
+/// missing/unreadable stat reads as not-a-zombie (the comm check already gated
+/// existence). Linux `/proc`, dep-free.
+#[must_use]
+pub fn is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(')')
+                .and_then(|(_, after)| after.trim_start().chars().next())
+        })
+        .is_some_and(|state| state == 'Z')
 }
 
 /// Acquire the single-instance pidfile. Returns the status plus, when
@@ -118,5 +143,25 @@ mod tests {
     fn live_workbench_false_for_impossible_pid() {
         // PID 0 has no /proc/0/comm → not a live workbench.
         assert!(!live_workbench(0));
+    }
+
+    #[test]
+    fn is_zombie_false_for_running_self_and_missing_pid() {
+        // Our own test process is running (state R/S), never a zombie.
+        assert!(!is_zombie(std::process::id()));
+        // No /proc/0/stat → not a zombie.
+        assert!(!is_zombie(0));
+    }
+
+    #[test]
+    fn is_zombie_parses_state_after_parenthesized_comm() {
+        // Pure parse check on the /proc/<pid>/stat shape, incl. a comm that
+        // itself contains ')': the state is the char after the LAST ')'.
+        let parse = |stat: &str| -> Option<char> {
+            stat.rsplit_once(')')
+                .and_then(|(_, after)| after.trim_start().chars().next())
+        };
+        assert_eq!(parse("42 (mde-workbench) Z 1 1 0"), Some('Z'));
+        assert_eq!(parse("42 (weird (name)) S 1 1 0"), Some('S'));
     }
 }
