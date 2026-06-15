@@ -34,12 +34,90 @@ const POLL_SECS: u64 = 8;
 /// Cap on retained rows in the center (oldest dropped) — bounds a long uptime.
 const MAX_ROWS: usize = 500;
 
+/// Single-instance guard — dep-free pidfile so re-launching the Action Center
+/// (e.g. the applet bell pressed twice) never STACKS a second full-height
+/// layer-surface. A live sibling → this launch exits; a stale/zombie holder →
+/// this launch takes over. (Mirrors `single_instance.rs`, scoped to this bin.)
+mod instance {
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    /// Outcome of the single-instance check.
+    pub enum Primary {
+        /// We own the lock — keep the handle alive for the process lifetime.
+        Yes(Option<std::fs::File>),
+        /// A live sibling already owns the panel — this launch must exit.
+        No,
+    }
+
+    fn lock_path() -> PathBuf {
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("mde-action-center.lock")
+    }
+
+    /// `true` if `pid` is a live (non-zombie) Action Center. The comm name is
+    /// truncated to 15 chars by the kernel ("mde-notify-cent"); `starts_with`
+    /// distinguishes it from the toast ("mde-notify-toas").
+    fn live(pid: u32) -> bool {
+        let comm_ok = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .map(|c| c.trim().starts_with("mde-notify-c"))
+            .unwrap_or(false);
+        // A zombie (state Z after the parenthesized comm) is not a live primary.
+        let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| {
+                s.rsplit_once(')')
+                    .and_then(|(_, a)| a.trim_start().chars().next())
+            })
+            .is_some_and(|st| st == 'Z');
+        comm_ok && !zombie
+    }
+
+    /// Try to become the single primary. I/O failure degrades to running
+    /// unprotected (`Yes(None)`) rather than refusing to start.
+    pub fn acquire() -> Primary {
+        let path = lock_path();
+        if let Some(pid) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        {
+            if live(pid) {
+                return Primary::No;
+            }
+        }
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                let _ = write!(f, "{}", std::process::id());
+                let _ = f.flush();
+                Primary::Yes(Some(f))
+            }
+            Err(_) => Primary::Yes(None),
+        }
+    }
+}
+
 fn main() -> Result<(), cosmic::iced::Error> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    // Single-instance: a live sibling already owns the panel — exit cleanly
+    // instead of stacking another surface.
+    let _lock = match instance::acquire() {
+        instance::Primary::No => {
+            tracing::info!("Action Center already running; exiting (no stacking).");
+            return Ok(());
+        }
+        instance::Primary::Yes(handle) => handle,
+    };
     cosmic::iced::daemon(|| (Center::new(), boot_task()), update, view)
         .title(namespace)
         .subscription(subscription)
@@ -93,10 +171,27 @@ enum Message {
     MarkAllRead,
     /// Drop every alert.
     ClearAll,
+    /// Close the Action Center (X button / Esc / click-away). Exits the process
+    /// so the single-instance lock is released and a later launch re-opens it.
+    Close,
+    /// Launch one of the bottom quick-launch apps and close the panel.
+    OpenApp(&'static str),
 }
 
 fn subscription(_s: &Center) -> Subscription<Message> {
-    cosmic::iced::time::every(std::time::Duration::from_secs(POLL_SECS)).map(|_| Message::Refresh)
+    let poll = cosmic::iced::time::every(std::time::Duration::from_secs(POLL_SECS))
+        .map(|_| Message::Refresh);
+    // Esc closes the panel (W10 Action Center dismiss).
+    let esc = cosmic::iced::event::listen_with(|event, _status, _window| {
+        use cosmic::iced::keyboard::{key::Named, Event as Kbd, Key};
+        if let cosmic::iced::Event::Keyboard(Kbd::KeyPressed { key, .. }) = event {
+            if key == Key::Named(Named::Escape) {
+                return Some(Message::Close);
+            }
+        }
+        None
+    });
+    Subscription::batch([poll, esc])
 }
 
 /// Boot: spawn the right-anchored Overlay slide-out + first poll.
@@ -147,6 +242,17 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
             }
         }
         Message::ClearAll => state.items.clear(),
+        Message::OpenApp(cmd) => {
+            // Spawn the target app (detached) then close the panel.
+            let _ = std::process::Command::new(cmd).spawn();
+            std::process::exit(0);
+        }
+        Message::Close => {
+            // Exit so the single-instance lock is released; the applet bell (or
+            // any launch) re-opens a fresh panel. A layer-shell daemon has no
+            // window to "hide", so closing == exiting.
+            std::process::exit(0);
+        }
     }
     Task::none()
 }
@@ -237,6 +343,9 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
         action_button("Mark all read", Message::MarkAllRead, p),
         Space::new().width(Length::Fixed(8.0)),
         action_button("Clear all", Message::ClearAll, p),
+        Space::new().width(Length::Fixed(8.0)),
+        // Close (✕) — also bound to Esc + click-away.
+        action_button("✕", Message::Close, p),
     ];
     let header = row![title, Space::new().width(Length::Fill), actions]
         .align_y(cosmic::iced::Alignment::Center);
@@ -286,10 +395,36 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
             .padding(Padding::from([12u16, 14u16]))
             .width(Length::Fill),
     );
-    container(scroll)
+
+    // Bottom quick-launch bar (W10 Action Center "quick actions" row): open the
+    // Workbench, MDE-Files, or Cosmic Settings, then dismiss the panel.
+    let launch_bar = container(
+        row![
+            launch_tile("Workbench", "mde-workbench", p),
+            launch_tile("MDE-Files", "mde-files", p),
+            launch_tile("Settings", "cosmic-settings", p),
+        ]
+        .spacing(8),
+    )
+    .padding(Padding::from([10u16, 14u16]))
+    .width(Length::Fill);
+
+    container(column![container(scroll).height(Length::Fill), launch_bar,].spacing(0))
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+
+/// A bottom quick-launch tile: label + the binary it spawns (`OpenApp`).
+fn launch_tile<'a>(label: &'a str, cmd: &'static str, p: Palette) -> Element<'a, Message> {
+    button(
+        container(text(label).size(12).color(p.text.into_cosmic_color()))
+            .center_x(Length::Fill)
+            .padding(Padding::from([8u16, 6u16])),
+    )
+    .width(Length::Fill)
+    .on_press(Message::OpenApp(cmd))
+    .into()
 }
 
 /// One alert row: severity glyph (colored) · age · host · title / body. Takes the
