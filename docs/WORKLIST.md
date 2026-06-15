@@ -694,3 +694,14 @@ Operator: unify Music + Notification Hub + Voice into ONE right-hand W10-style p
 - [✓] **AC-3: Now Playing (Music) section.** Polls `action/music/get-state`+`get-song`; track line + ⏮/▶-⏸/⏭ transport (`action/music/{prev,pause,resume,next}`); honest idle state.
 - [✓] **AC-4: Voice section.** Reads latest `state/voice/status` (registration + listening, freshness-gated); Open→Voice HUD; 'agent offline' when stale.
 - [ ] **AC-5: unified W10 styling pass.** Section headers/spacing/quick-toggle tiles (DND toggle) to match the W10 Action Center look more closely; fold the standalone Music/Voice launchers' "feel" in. (polish)
+
+### VOIP-P2P — registrar-less peer-to-peer voice over the overlay (operator direction, 2026-06-15)
+Operator decision (2026-06-15): each Workstation is a SIP UA on the overlay that dials `sip:peer@<overlay-ip>` **directly** using the mesh directory for addressing — **no central registrar** for intra-mesh calls. The Asterisk PBX at 172.18.0.2 (reachable via the lighthouses) becomes the **external/PSTN gateway**, not the intra-mesh registrar. Builds on the existing rsip + media.rs (RTP/G.711) stack; current model is single-server `account.toml` registration.
+- [ ] **VOIP-P2P-1: overlay SIP UAS.** Bind a SIP signaling listener on the node's Nebula overlay IP that accepts incoming INVITE/ACK/BYE from peers registrar-less (no REGISTER required); publish the listen addr in `state/voice/status`.
+  **Acceptance:** an inbound INVITE from a peer's overlay IP rings the HUD + establishes RTP; unit-tested SIP parse/build of the INVITE/200/ACK path.
+- [ ] **VOIP-P2P-2: directory-addressed dial.** Resolve a peer (hostname) → overlay IP from the mesh directory and place a direct INVITE to `sip:<peer>@<overlay-ip>:<port>`; no registrar lookup.
+  **Acceptance:** dialing a peer by hostname rings that peer's HUD; media flows P2P over the overlay; offline/unknown peer degrades honestly.
+- [ ] **VOIP-P2P-3: peer roster in the HUD + Action Center voice section.** The dialable peers come from the directory (every reachable Workstation), shown in the HUD + the Action Center Voice section.
+  **Acceptance:** the HUD lists every reachable peer; click-to-call works; the Action Center Voice section reflects in-call state.
+- [ ] **VOIP-P2P-4: Asterisk as external gateway (optional account).** Keep the single-server `account.toml` path as an OPTIONAL external/PSTN trunk to the Asterisk at 172.18.0.2 (via the lighthouses) — additive to, not replacing, the P2P mesh.
+  **Acceptance:** with an account.toml present, external calls route via Asterisk; intra-mesh calls still go P2P direct; absent account.toml, P2P still works.
