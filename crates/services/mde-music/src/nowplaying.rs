@@ -32,6 +32,13 @@ pub struct NowState {
     pub position_ms: u64,
     /// AIR-15.b.3 — playback volume 0.0..=1.0 (engine.volume() via get-state).
     pub volume: f32,
+    /// AUDIT-MESH-4 — `true` when this peer has a working audio output device.
+    /// `false` on a headless peer: the panel shows "no audio device here"
+    /// rather than a misleading idle transport.
+    pub audio_available: bool,
+    /// AUDIT-MESH-4 — `true` when no Airsonic server is configured yet, so the
+    /// panel can prompt the operator to configure one instead of looking idle.
+    pub needs_airsonic: bool,
 }
 
 impl NowState {
@@ -39,6 +46,13 @@ impl NowState {
     #[must_use]
     pub fn has_track(&self) -> bool {
         !self.song_id.is_empty()
+    }
+
+    /// AUDIT-MESH-4 — whether the panel should show a "configure Airsonic"
+    /// prompt: the daemon answered, no server is set up, and nothing is loaded.
+    #[must_use]
+    pub fn needs_config(&self) -> bool {
+        self.needs_airsonic && !self.has_track()
     }
 }
 
@@ -67,6 +81,17 @@ pub fn parse_state(reply_json: &str) -> NowState {
             .and_then(Value::as_f64)
             .map(|x| x as f32)
             .unwrap_or(1.0),
+        // AUDIT-MESH-4 — older daemons omit these; absence means "capable"
+        // (audio present) / "configured" (no needs-Airsonic prompt) so the
+        // panel doesn't regress to a config prompt against a pre-fix peer.
+        audio_available: v
+            .get("audio_available")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        needs_airsonic: v
+            .get("needs_airsonic")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     }
 }
 

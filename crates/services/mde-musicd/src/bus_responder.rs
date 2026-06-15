@@ -428,11 +428,30 @@ fn apply_transport(
         return json!({ "ok": false, "error": format!("unknown transport verb: {verb}") })
             .to_string();
     };
-    let Some(engine) = engine else {
-        return json!({ "ok": false, "error": "no audio output device on this peer" }).to_string();
-    };
+    let no_audio =
+        || json!({ "ok": false, "error": "no audio output device on this peer" }).to_string();
     match cmd {
+        // AUDIT-MESH-4: get-state is answered unconditionally so the Music
+        // panel can render an honest idle / needs-audio / needs-Airsonic state
+        // even on a headless peer (no audio device) or before Airsonic creds
+        // are configured. `audio_available` / `needs_airsonic` let the panel
+        // tell those apart instead of silently looking "idle". The mutating
+        // verbs below still require a live engine.
+        TransportCommand::GetState => json!({
+            "ok": true,
+            "playing": engine.map_or(false, |e| e.is_playing()),
+            "active": engine.map_or(false, |e| e.is_active()),
+            "position_ms": engine.map_or(0, |e| e.position_ms()),
+            "volume": engine.map_or(1.0_f32, |e| e.volume()),
+            "song_id": queue.current(),
+            "audio_available": engine.is_some(),
+            "needs_airsonic": client.is_none(),
+        })
+        .to_string(),
         TransportCommand::Play => {
+            let Some(engine) = engine else {
+                return no_audio();
+            };
             let Some(client) = client else {
                 return json!({ "ok": false, "error": "no Airsonic server configured" })
                     .to_string();
@@ -453,33 +472,36 @@ fn apply_transport(
             json!({ "ok": true, "playing": true, "song_id": song }).to_string()
         }
         TransportCommand::Pause => {
+            let Some(engine) = engine else {
+                return no_audio();
+            };
             engine.pause();
             write_playback_state(false, queue.current().unwrap_or(""), engine.position_ms());
             json!({ "ok": true, "playing": false }).to_string()
         }
         TransportCommand::Resume => {
+            let Some(engine) = engine else {
+                return no_audio();
+            };
             engine.resume();
             write_playback_state(true, queue.current().unwrap_or(""), engine.position_ms());
             json!({ "ok": true, "playing": true }).to_string()
         }
         TransportCommand::Stop => {
+            let Some(engine) = engine else {
+                return no_audio();
+            };
             engine.stop();
             write_playback_state(false, "", 0);
             json!({ "ok": true, "playing": false }).to_string()
         }
         TransportCommand::SetVolume(v) => {
+            let Some(engine) = engine else {
+                return no_audio();
+            };
             engine.set_volume(v);
             json!({ "ok": true, "volume": engine.volume() }).to_string()
         }
-        TransportCommand::GetState => json!({
-            "ok": true,
-            "playing": engine.is_playing(),
-            "active": engine.is_active(),
-            "position_ms": engine.position_ms(),
-            "volume": engine.volume(),
-            "song_id": queue.current(),
-        })
-        .to_string(),
     }
 }
 
@@ -758,5 +780,26 @@ mod tests {
         );
         // Non-numeric body → no command.
         assert_eq!(parse_transport("set-volume", "loud"), None);
+    }
+
+    #[test]
+    fn get_state_is_answered_without_engine_or_creds() {
+        // AUDIT-MESH-4: a headless peer with no audio device + no Airsonic creds
+        // must still answer get-state with ok:true and honest capability flags
+        // (so the panel shows "configure Airsonic" / "no audio device" rather
+        // than a silent blank). Mutating verbs still return the no-audio error.
+        let queue = queue::Queue::default();
+        let reply = apply_transport("get-state", "", None, None, &queue);
+        let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["active"], false);
+        assert_eq!(v["playing"], false);
+        assert_eq!(v["audio_available"], false);
+        assert_eq!(v["needs_airsonic"], true);
+
+        // A mutating verb without an engine is still refused.
+        let play = apply_transport("play", "", None, None, &queue);
+        let pv: serde_json::Value = serde_json::from_str(&play).unwrap();
+        assert_eq!(pv["ok"], false);
     }
 }

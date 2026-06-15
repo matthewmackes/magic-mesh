@@ -151,6 +151,10 @@ struct MusicNow {
     playing: bool,
     title: String,
     artist: String,
+    /// AUDIT-MESH-4 — this peer has a working audio output device.
+    audio_available: bool,
+    /// AUDIT-MESH-4 — no Airsonic server configured yet (prompt to set one up).
+    needs_airsonic: bool,
 }
 
 /// NOTIFY-AC — the voice agent snapshot for the Voice section.
@@ -218,6 +222,17 @@ fn fetch_music() -> Option<MusicNow> {
     if sv.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
         return Some(MusicNow::default());
     }
+    // AUDIT-MESH-4 — capability flags so the section can show idle vs
+    // needs-audio vs needs-Airsonic honestly (older daemons omit them →
+    // assume capable/configured so we don't false-prompt a pre-fix peer).
+    let audio_available = sv
+        .get("audio_available")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let needs_airsonic = sv
+        .get("needs_airsonic")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let active = sv
         .get("active")
         .and_then(serde_json::Value::as_bool)
@@ -227,7 +242,11 @@ fn fetch_music() -> Option<MusicNow> {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     if !active || song_id.is_empty() {
-        return Some(MusicNow::default());
+        return Some(MusicNow {
+            audio_available,
+            needs_airsonic,
+            ..MusicNow::default()
+        });
     }
     let playing = sv
         .get("playing")
@@ -260,6 +279,8 @@ fn fetch_music() -> Option<MusicNow> {
         playing,
         title,
         artist,
+        audio_available,
+        needs_airsonic,
     })
 }
 
@@ -598,6 +619,24 @@ fn now_playing_section(music: Option<&MusicNow>, p: Palette) -> Element<'static,
             .align_y(cosmic::iced::Alignment::Center)
             .into()
         }
+        // AUDIT-MESH-4 — honest idle states instead of a silent blank: tell
+        // the operator when no Airsonic server is configured or this peer has
+        // no audio device, otherwise plain "Nothing playing".
+        Some(m) if m.needs_airsonic => row![
+            text("♪").size(14).color(p.text_muted.into_cosmic_color()),
+            Space::new().width(Length::Fixed(8.0)),
+            text("Configure an Airsonic server to play music")
+                .size(12)
+                .color(p.text.into_cosmic_color())
+                .width(Length::Fill),
+            action_button("Set up", Message::OpenApp("mde-workbench"), p),
+        ]
+        .align_y(cosmic::iced::Alignment::Center)
+        .into(),
+        Some(m) if !m.audio_available => text("♪  No audio device on this peer")
+            .size(12)
+            .color(p.text_muted.into_cosmic_color())
+            .into(),
         _ => text("♪  Nothing playing")
             .size(12)
             .color(p.text_muted.into_cosmic_color())
