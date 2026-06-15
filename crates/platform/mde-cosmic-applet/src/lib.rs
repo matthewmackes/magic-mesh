@@ -84,6 +84,8 @@ pub enum QuickAction {
     OpenTransfers,
     /// Open the Registration panel to join/leave the mesh.
     OpenRegistration,
+    /// Open the MDE-Notification-Hub center (NOTIFY-7).
+    OpenNotifications,
 }
 
 /// The Bus topic (action) a quick action publishes, if any. `None`
@@ -92,7 +94,10 @@ pub enum QuickAction {
 pub fn action_bus_topic(action: QuickAction) -> Option<&'static str> {
     match action {
         QuickAction::ToggleDnd => Some("action/dnd/toggle"),
-        QuickAction::OpenPeers | QuickAction::OpenTransfers | QuickAction::OpenRegistration => None,
+        QuickAction::OpenPeers
+        | QuickAction::OpenTransfers
+        | QuickAction::OpenRegistration
+        | QuickAction::OpenNotifications => None,
     }
 }
 
@@ -106,7 +111,9 @@ pub fn action_deep_link(action: QuickAction) -> Option<&'static str> {
         QuickAction::OpenPeers => Some("peers"),
         QuickAction::OpenTransfers => Some("files.transfers"),
         QuickAction::OpenRegistration => Some("node.registration"),
-        QuickAction::ToggleDnd => None,
+        // Notifications launches its own layer-shell binary, not a Workbench
+        // panel — see launch_argv.
+        QuickAction::ToggleDnd | QuickAction::OpenNotifications => None,
     }
 }
 
@@ -114,6 +121,11 @@ pub fn action_deep_link(action: QuickAction) -> Option<&'static str> {
 /// spawns). `None` for pure Bus actions.
 #[must_use]
 pub fn launch_argv(action: QuickAction) -> Option<Vec<String>> {
+    // The notification center is its own layer-shell binary (NOTIFY-7), not a
+    // Workbench deep-link.
+    if matches!(action, QuickAction::OpenNotifications) {
+        return Some(vec!["mde-notify-center".to_string()]);
+    }
     action_deep_link(action).map(|slug| {
         vec![
             "mde-workbench".to_string(),

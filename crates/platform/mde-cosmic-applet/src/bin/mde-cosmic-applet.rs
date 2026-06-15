@@ -247,6 +247,7 @@ impl Applet {
     fn popover(&self) -> Element<'_, Message> {
         let mut col = widget::list_column().add(widget::text::body(self.pip.tooltip()));
         for action in [
+            QuickAction::OpenNotifications,
             QuickAction::ToggleDnd,
             QuickAction::OpenPeers,
             QuickAction::OpenTransfers,
@@ -265,6 +266,7 @@ impl Applet {
 /// Human label for a quick action's popover button.
 fn action_label(action: QuickAction) -> &'static str {
     match action {
+        QuickAction::OpenNotifications => "🔔 Notifications",
         QuickAction::ToggleDnd => "Toggle Do-Not-Disturb",
         QuickAction::OpenPeers => "Open Peers",
         QuickAction::OpenTransfers => "Open Transfers",
