@@ -8,9 +8,9 @@
 //! **Collected payloads:**
 //! - `metadata_dump` — output of `mfsmetadump <metadata_file>`;
 //!   the primary input for a bare-peer metadata restore.
-//! - `cs_list` — `mfsadmin <vip> CS-LIST`; records which peers
-//!   held chunkservers at backup time (useful for topology
-//!   reconciliation on restore).
+//! - `cs_list` — `lizardfs-admin list-chunkservers <vip> <port>`;
+//!   records which peers held chunkservers at backup time (useful
+//!   for topology reconciliation on restore).
 //! - `exports_config` — content of the LizardFS exports config
 //!   (`/etc/mfs/mfsexports.cfg`); re-applied verbatim on restore.
 //! - `goal` — current replication goal (from `mfsgetgoal`); the
@@ -20,7 +20,7 @@
 //! **Best-effort:** all fields are `Option<_>`. A missing binary
 //! or a failed subcommand produces `None` for that field; the
 //! rest of the snapshot is still written. When neither
-//! `mfsmetadump` nor `mfsadmin` is on PATH, [`collect`] returns
+//! `mfsmetadump` nor `lizardfs-admin` is on PATH, [`collect`] returns
 //! `None` so the backup worker stays at schema_version 2 (Gluster
 //! path) rather than bumping to 3.
 
@@ -32,8 +32,10 @@ use serde::{Deserialize, Serialize};
 
 /// Default `mfsmetadump` binary name — dumps the master metadata file for backup/restore.
 pub const DEFAULT_METADUMP_BINARY: &str = "mfsmetadump";
-/// Default `mfsadmin` binary name — the LizardFS admin CLI (CS-LIST, CS-EVICT, etc.).
-pub const DEFAULT_ADMIN_BINARY: &str = "mfsadmin";
+/// Default LizardFS admin CLI — `lizardfs-admin` (`list-chunkservers`, `info`,
+/// `chunks-health`, …). AUDIT-MESH-3: the deployed substrate is LizardFS, whose
+/// admin tool is `lizardfs-admin`, not MooseFS's `mfsadmin`.
+pub const DEFAULT_ADMIN_BINARY: &str = "lizardfs-admin";
 /// Default `mfsgetgoal` binary name — reads a file/dir's replication goal.
 pub const DEFAULT_GETGOAL_BINARY: &str = "mfsgetgoal";
 
@@ -59,9 +61,9 @@ pub struct MeshFsSnapshot {
     #[serde(default)]
     pub metadata_dump: Option<String>,
 
-    /// Output of `mfsadmin <vip> CS-LIST` at backup time.
-    /// Lists the overlay IPs of all registered chunkservers so
-    /// the operator can verify topology after restore.
+    /// Output of `lizardfs-admin list-chunkservers <vip> <port>` at
+    /// backup time. Lists the registered chunkservers so the operator
+    /// can verify topology after restore.
     #[serde(default)]
     pub cs_list: Option<String>,
 
@@ -209,7 +211,11 @@ fn run_cs_list(config: &SnapshotConfig) -> Option<String> {
         return None;
     }
     let out = Command::new(&config.admin_binary)
-        .args([config.vip.as_str(), "CS-LIST"])
+        .args([
+            "list-chunkservers",
+            config.vip.as_str(),
+            &crate::workers::meshfs_worker::MFSMASTER_CLIENT_PORT.to_string(),
+        ])
         .output()
         .ok()?;
     if out.status.success() {
@@ -217,7 +223,7 @@ fn run_cs_list(config: &SnapshotConfig) -> Option<String> {
     } else {
         tracing::debug!(
             status = ?out.status,
-            "mfsadmin CS-LIST failed; cs_list field will be None",
+            "lizardfs-admin list-chunkservers failed; cs_list field will be None",
         );
         None
     }

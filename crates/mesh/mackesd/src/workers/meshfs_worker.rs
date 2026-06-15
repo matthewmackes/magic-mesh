@@ -64,8 +64,15 @@ pub const DEFAULT_MASTER_BINARY: &str = "mfsmaster";
 /// LizardFS chunkserver binary.
 pub const DEFAULT_CHUNKSERVER_BINARY: &str = "mfschunkserver";
 
-/// LizardFS admin CLI binary (used for CS-EVICT + goal queries).
-pub const DEFAULT_ADMIN_BINARY: &str = "mfsadmin";
+/// LizardFS admin CLI binary. AUDIT-MESH-3: the deployed substrate is
+/// LizardFS, whose admin tool is `lizardfs-admin` (`list-chunkservers`,
+/// `info`, …), NOT MooseFS's `mfsadmin`. The read-paths
+/// ([`query_chunkservers`], [`min_chunkserver_avail_bytes`],
+/// [`current_chunkserver_ips`]) use `lizardfs-admin list-chunkservers`.
+/// (The eviction/failover/topology argv builders still emit MooseFS
+/// `CS-EVICT`/`MASTER-STOP` syntax — tracked as a follow-up; they were
+/// already non-functional against the missing `mfsadmin`.)
+pub const DEFAULT_ADMIN_BINARY: &str = "lizardfs-admin";
 
 /// LizardFS goal-set CLI binary.
 pub const DEFAULT_SETGOAL_BINARY: &str = "mfssetgoal";
@@ -102,6 +109,12 @@ pub const DEFAULT_OVERLAY_IP_PATH: &str = "/var/lib/mackesd/nebula/overlay-ip";
 
 /// LizardFS master TCP port (default: 9419).
 pub const MFSMASTER_PORT: u16 = 9419;
+
+/// LizardFS matocl (client/admin) TCP port — the port `lizardfs-admin`
+/// connects to for `list-chunkservers` / `info` queries (default: 9421).
+/// Distinct from [`MFSMASTER_PORT`] (9419, the matoml/metalogger port the
+/// reachability probe pings).
+pub const MFSMASTER_CLIENT_PORT: u16 = 9421;
 
 /// LizardFS export directory under mesh-storage.
 pub const EXPORT_NAME: &str = "mesh-storage";
@@ -905,40 +918,15 @@ pub fn setquota_argv(
     ]
 }
 
-/// Parse `mfsadmin CS-LIST` output to find the minimum `avail` column
-/// value across all chunkservers. Returns `None` when the output is
-/// empty or unparseable.
-///
-/// CS-LIST table columns (space-separated, first line is a header):
-/// ```text
-/// ip  port  used  avail
-/// 10.42.0.5  9422  2147483648  53687091200
-/// ```
-#[must_use]
-pub fn parse_cslist_min_avail(text: &str) -> Option<u64> {
-    text.lines()
-        .skip(1) // header
-        .filter_map(|line| {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            // avail is column index 3 (0-indexed)
-            cols.get(3)?.parse::<u64>().ok()
-        })
-        .min()
-}
-
 /// Query the active master for the minimum available bytes across all
-/// registered chunkservers. Returns `None` when `mfsadmin` is absent or
-/// the master is unreachable.
+/// registered chunkservers. Returns `None` when `lizardfs-admin` is absent,
+/// the master is unreachable, or no chunkservers are registered.
 #[must_use]
 pub fn min_chunkserver_avail_bytes(admin_binary: &str, vip: &str) -> Option<u64> {
-    let Ok(out) = Command::new(admin_binary).args([vip, "CS-LIST"]).output() else {
-        return None;
-    };
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    parse_cslist_min_avail(&text)
+    query_chunkservers(admin_binary, vip)
+        .iter()
+        .map(|cs| cs.avail_bytes)
+        .min()
 }
 
 /// Build the argv for claiming the floating VIP on the Nebula overlay
@@ -1051,114 +1039,102 @@ pub fn enrolled_peer_ips(workgroup_root: &Path, self_node_id: &str) -> Vec<Strin
 }
 
 /// List the overlay IPs of chunkservers currently registered with the
-/// active master. Returns an empty list when `mfsadmin` isn't
+/// active master. Returns an empty list when `lizardfs-admin` isn't
 /// installed or the master is unreachable.
 #[must_use]
 pub fn current_chunkserver_ips(admin_binary: &str, vip: &str) -> Vec<String> {
-    let Ok(out) = Command::new(admin_binary).args([vip, "CS-LIST"]).output() else {
+    query_chunkservers(admin_binary, vip)
+        .into_iter()
+        .map(|cs| cs.addr)
+        .collect()
+}
+
+/// AUDIT-MESH-3 — single source of truth for the live chunkserver roster.
+/// Shells `lizardfs-admin list-chunkservers <vip> <matocl-port> --porcelain`
+/// (the deployed substrate is LizardFS, whose admin CLI is `lizardfs-admin`,
+/// not MooseFS's `mfsadmin <vip> CS-LIST`), and parses the porcelain rows.
+/// Returns an empty list when `lizardfs-admin` is absent, the master is
+/// unreachable, or the query fails. All read-paths (status panel, quota
+/// tick, reconcile/eviction) funnel through here so they share one format.
+#[must_use]
+pub fn query_chunkservers(admin_binary: &str, vip: &str) -> Vec<ChunkserverStatus> {
+    let Ok(out) = Command::new(admin_binary)
+        .args([
+            "list-chunkservers",
+            vip,
+            &MFSMASTER_CLIENT_PORT.to_string(),
+            "--porcelain",
+        ])
+        .output()
+    else {
         return Vec::new();
     };
     if !out.status.success() {
         return Vec::new();
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    parse_cslist_output(&text)
-}
-
-/// Parse `mfsadmin CS-LIST` output into a list of chunkserver IPs.
-///
-/// `mfsadmin CS-LIST` table shape:
-/// ```text
-/// ip              port  used       avail      ...
-/// 10.42.0.5       9422  1234567    8765432    ...
-/// 10.42.0.7       9422  987654     9012345    ...
-/// ```
-#[must_use]
-pub fn parse_cslist_output(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for (i, line) in text.lines().enumerate() {
-        if i == 0 {
-            continue; // skip header
-        }
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.is_empty() {
-            continue;
-        }
-        let ip = cols[0].to_owned();
-        // Rudimentary IPv4/IPv6 check — skip obvious non-IPs.
-        if ip.contains('.') || ip.contains(':') {
-            out.push(ip);
-        }
-    }
-    out
+    parse_chunkservers_porcelain(&String::from_utf8_lossy(&out.stdout))
 }
 
 // ── MESHFS-13.1: status report (Workbench "Mesh Storage" panel) ─────────────
 
-/// Per-chunkserver row from `mfsadmin CS-LIST`.
+/// Per-chunkserver row from `lizardfs-admin list-chunkservers --porcelain`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChunkserverStatus {
-    /// Overlay IP address of this chunkserver (column 0 of CS-LIST output).
+    /// Overlay IP address of this chunkserver (the `:port` suffix from the
+    /// porcelain `addr:port` column is stripped so it matches enrolled IPs).
     pub addr: String,
     /// Bytes currently consumed by stored chunks on this chunkserver.
     pub used_bytes: u64,
-    /// Free bytes available for new chunks on this chunkserver.
+    /// Free bytes available for new chunks (total − used).
     pub avail_bytes: u64,
-    /// Chunks below their replication goal on this CS. Absent from the
-    /// compact 4-column CS-LIST format; defaults to 0.
+    /// Chunks below their replication goal on this CS. Not present in the
+    /// porcelain `list-chunkservers` output (it lives in `chunks-health`);
+    /// defaults to 0.
     #[serde(default)]
     pub undergoal_chunks: u64,
-    /// Whether this CS is flagged for decommission. Absent from the
-    /// compact 4-column format; defaults to false.
+    /// Whether this CS has chunks marked for removal (porcelain column 6 > 0
+    /// — i.e. a rebalance/decommission is draining it).
     #[serde(default)]
     pub marked_for_removal: bool,
 }
 
-/// Parse `mfsadmin CS-LIST` output into per-chunkserver status rows.
-/// Handles both the compact 4-column format and the full LizardFS format
-/// that includes `undergoal_chunks` / `markedforremoval` columns.
-/// Column positions are detected from the header line — unknown columns
-/// default to 0 / false.
+/// AUDIT-MESH-3 — parse `lizardfs-admin list-chunkservers <ip> <port>
+/// --porcelain` output into per-chunkserver status rows. Porcelain emits one
+/// space-separated row per chunkserver (no header):
+/// ```text
+/// <addr>:<port> <version> <chunks> <used_bytes> <total_bytes> \
+///   <todel_chunks> <todel_used> <todel_total> <errors> <label>
+/// ```
+/// e.g. `10.42.0.2:9422 3.12.0 47237 5966987264 24306466816 0 0 0 0 _`.
+/// `avail = total − used`; rows that don't parse are skipped.
 #[must_use]
-pub fn parse_cslist_full(text: &str) -> Vec<ChunkserverStatus> {
-    let mut lines = text.lines();
-    let Some(header) = lines.next() else {
-        return Vec::new();
-    };
-    let hdrs: Vec<&str> = header.split_whitespace().collect();
-    let undergoal_col = hdrs.iter().position(|h| {
-        h.eq_ignore_ascii_case("undergoal_chunks") || h.eq_ignore_ascii_case("undergoal")
-    });
-    let removal_col = hdrs.iter().position(|h| {
-        h.eq_ignore_ascii_case("markedforremoval") || h.eq_ignore_ascii_case("marked_for_removal")
-    });
-    lines
+pub fn parse_chunkservers_porcelain(text: &str) -> Vec<ChunkserverStatus> {
+    text.lines()
         .filter_map(|line| {
             let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() < 4 {
+            if cols.len() < 5 {
                 return None;
             }
-            let addr = cols[0].to_owned();
+            // Strip the :port suffix so the addr matches enrolled overlay IPs.
+            let addr = cols[0]
+                .rsplit_once(':')
+                .map_or(cols[0], |(ip, _)| ip)
+                .to_owned();
             if !addr.contains('.') && !addr.contains(':') {
                 return None;
             }
-            let used_bytes = cols[2].parse::<u64>().ok()?;
-            let avail_bytes = cols[3].parse::<u64>().ok()?;
-            let undergoal_chunks = undergoal_col
-                .and_then(|i| cols.get(i))
+            let used_bytes = cols[3].parse::<u64>().ok()?;
+            let total_bytes = cols[4].parse::<u64>().ok()?;
+            let avail_bytes = total_bytes.saturating_sub(used_bytes);
+            let marked_for_removal = cols
+                .get(5)
                 .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0);
-            let marked_for_removal = removal_col
-                .and_then(|i| cols.get(i))
-                .map(|v| {
-                    *v == "1" || v.eq_ignore_ascii_case("yes") || v.eq_ignore_ascii_case("true")
-                })
-                .unwrap_or(false);
+                .is_some_and(|todel| todel > 0);
             Some(ChunkserverStatus {
                 addr,
                 used_bytes,
                 avail_bytes,
-                undergoal_chunks,
+                undergoal_chunks: 0,
                 marked_for_removal,
             })
         })
@@ -1192,12 +1168,7 @@ pub struct MeshFsStatusReport {
 pub fn meshfs_status_report(admin_binary: &str, vip: &str) -> MeshFsStatusReport {
     let master_reachable = master_reachable(vip);
     let peers = if master_reachable {
-        match Command::new(admin_binary).args([vip, "CS-LIST"]).output() {
-            Ok(out) if out.status.success() => {
-                parse_cslist_full(&String::from_utf8_lossy(&out.stdout))
-            }
-            _ => Vec::new(),
-        }
+        query_chunkservers(admin_binary, vip)
     } else {
         Vec::new()
     };
@@ -1679,27 +1650,49 @@ mod tests {
         );
     }
 
+    /// The real `lizardfs-admin list-chunkservers <ip> <port> --porcelain`
+    /// output captured from the live 2-chunkserver mesh (Lighthouse-01/02).
+    const PORCELAIN_FIXTURE: &str = "\
+10.42.0.2:9422 3.12.0 47237 5966987264 24306466816 0 0 0 0 _\n\
+10.42.0.1:9422 3.12.0 38862 5845155840 24283152384 0 0 0 0 _\n";
+
     #[test]
-    fn parse_cslist_output_extracts_ips() {
-        let output = "\
-ip              port  used       avail\n\
-10.42.0.5       9422  1234567    8765432\n\
-10.42.0.7       9422  987654     9012345\n";
-        let ips = parse_cslist_output(output);
-        assert_eq!(ips, vec!["10.42.0.5", "10.42.0.7"]);
+    fn parse_chunkservers_porcelain_strips_port_and_computes_avail() {
+        let rows = parse_chunkservers_porcelain(PORCELAIN_FIXTURE);
+        assert_eq!(rows.len(), 2);
+        // :port stripped → addr matches enrolled overlay IPs.
+        assert_eq!(rows[0].addr, "10.42.0.2");
+        assert_eq!(rows[0].used_bytes, 5_966_987_264);
+        // avail = total − used.
+        assert_eq!(rows[0].avail_bytes, 24_306_466_816 - 5_966_987_264);
+        assert!(!rows[0].marked_for_removal);
+        assert_eq!(rows[0].undergoal_chunks, 0);
+        assert_eq!(rows[1].addr, "10.42.0.1");
     }
 
     #[test]
-    fn parse_cslist_output_empty() {
-        assert_eq!(parse_cslist_output(""), Vec::<String>::new());
+    fn parse_chunkservers_porcelain_flags_marked_for_removal() {
+        // todel_chunks (column 6) > 0 → marked_for_removal.
+        let line = "10.42.0.9:9422 3.12.0 100 1000 5000 12 0 0 0 _\n";
+        let rows = parse_chunkservers_porcelain(line);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].marked_for_removal);
+        assert_eq!(rows[0].avail_bytes, 4000);
     }
 
     #[test]
-    fn parse_cslist_output_header_only() {
-        assert_eq!(
-            parse_cslist_output("ip  port  used  avail\n"),
-            Vec::<String>::new()
-        );
+    fn parse_chunkservers_porcelain_empty_returns_empty() {
+        assert!(parse_chunkservers_porcelain("").is_empty());
+    }
+
+    #[test]
+    fn current_chunkserver_ips_derives_from_porcelain_rows() {
+        // Pure-parse cross-check: the IP list is the addr column of the rows.
+        let ips: Vec<String> = parse_chunkservers_porcelain(PORCELAIN_FIXTURE)
+            .into_iter()
+            .map(|cs| cs.addr)
+            .collect();
+        assert_eq!(ips, vec!["10.42.0.2", "10.42.0.1"]);
     }
 
     #[test]
@@ -1823,22 +1816,13 @@ ip              port  used       avail\n\
     }
 
     #[test]
-    fn parse_cslist_min_avail_basic() {
-        let output = "\
-ip              port  used       avail\n\
-10.42.0.5       9422  1234567    8765432\n\
-10.42.0.7       9422  987654     5000000\n";
-        assert_eq!(parse_cslist_min_avail(output), Some(5_000_000));
-    }
-
-    #[test]
-    fn parse_cslist_min_avail_empty() {
-        assert_eq!(parse_cslist_min_avail(""), None);
-    }
-
-    #[test]
-    fn parse_cslist_min_avail_header_only() {
-        assert_eq!(parse_cslist_min_avail("ip  port  used  avail\n"), None);
+    fn min_chunkserver_avail_derived_from_porcelain_rows() {
+        // The min-avail used by the quota tick is the smallest (total−used)
+        // across the porcelain rows.
+        let rows = parse_chunkservers_porcelain(PORCELAIN_FIXTURE);
+        let min = rows.iter().map(|cs| cs.avail_bytes).min();
+        // Row 0 (10.42.0.2) has the smaller free space of the two.
+        assert_eq!(min, Some(24_306_466_816 - 5_966_987_264));
     }
 
     // MESHFS-10.1 — dispatch_meshfs_action tests (no subprocess; verb shapes only).
@@ -1991,66 +1975,7 @@ ip              port  used       avail\n\
         assert!(log.iter().all(|l| l.contains("meshfs replay")));
     }
 
-    // ── MESHFS-13.1 + MESHFS-12.b: parse_cslist_full + meshfs_status_report ──
-
-    #[test]
-    fn parse_cslist_full_extracts_addr_used_avail() {
-        let output = "\
-ip              port  used       avail\n\
-10.42.0.5       9422  1234567    8765432\n\
-10.42.0.7       9422  987654     9012345\n";
-        let rows = parse_cslist_full(output);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].addr, "10.42.0.5");
-        assert_eq!(rows[0].used_bytes, 1_234_567);
-        assert_eq!(rows[0].avail_bytes, 8_765_432);
-        assert_eq!(rows[1].addr, "10.42.0.7");
-        assert_eq!(rows[1].used_bytes, 987_654);
-        assert_eq!(rows[1].avail_bytes, 9_012_345);
-    }
-
-    #[test]
-    fn parse_cslist_full_compact_defaults_undergoal_and_removal() {
-        let output = "\
-ip              port  used       avail\n\
-10.42.0.5       9422  1234567    8765432\n";
-        let rows = parse_cslist_full(output);
-        assert_eq!(rows[0].undergoal_chunks, 0);
-        assert!(!rows[0].marked_for_removal);
-    }
-
-    #[test]
-    fn parse_cslist_full_extended_reads_undergoal_and_removal() {
-        let output = "\
-ip              port  used       avail       chunks  undergoal_chunks  markedforremoval\n\
-10.42.0.5       9422  1234567    8765432     1000    42                0\n\
-10.42.0.7       9422  987654     9012345     800     0                 1\n";
-        let rows = parse_cslist_full(output);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].undergoal_chunks, 42);
-        assert!(!rows[0].marked_for_removal);
-        assert_eq!(rows[1].undergoal_chunks, 0);
-        assert!(rows[1].marked_for_removal);
-    }
-
-    #[test]
-    fn parse_cslist_full_undergoal_alias_detected() {
-        let output = "\
-ip              port  used       avail       undergoal\n\
-10.42.0.9       9422  111        222         17\n";
-        let rows = parse_cslist_full(output);
-        assert_eq!(rows[0].undergoal_chunks, 17);
-    }
-
-    #[test]
-    fn parse_cslist_full_empty_returns_empty() {
-        assert!(parse_cslist_full("").is_empty());
-    }
-
-    #[test]
-    fn parse_cslist_full_header_only_returns_empty() {
-        assert!(parse_cslist_full("ip  port  used  avail\n").is_empty());
-    }
+    // ── MESHFS-13.1 + MESHFS-12.b: meshfs_status_report ──
 
     #[test]
     fn meshfs_status_report_unreachable_returns_empty_peers() {

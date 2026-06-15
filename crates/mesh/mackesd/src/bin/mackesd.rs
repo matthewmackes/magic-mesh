@@ -286,8 +286,9 @@ enum Cmd {
         /// Floating overlay VIP the active master listens on.
         #[clap(long, default_value = "10.42.0.1")]
         vip: String,
-        /// `mfsadmin` binary name (must be on PATH).
-        #[clap(long, default_value = "mfsadmin")]
+        /// LizardFS admin CLI name (must be on PATH). AUDIT-MESH-3:
+        /// `lizardfs-admin`, not MooseFS's `mfsadmin`.
+        #[clap(long, default_value = "lizardfs-admin")]
         admin_binary: String,
     },
 
