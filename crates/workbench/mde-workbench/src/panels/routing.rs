@@ -45,6 +45,11 @@ pub struct RoutingPanel {
     pub last_run_at: Option<SystemTime>,
     pub error: Option<String>,
     pub run_result: Option<Result<String, String>>,
+    /// AUDIT-MESH-5 — guards the one-shot auto-run: when the panel opens and no
+    /// validation run has ever been minted, it requests one automatically (so
+    /// Routing shows live reachability without a manual click), but only once
+    /// per panel session — a genuinely empty mesh won't re-probe on every load.
+    pub auto_ran: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -70,10 +75,22 @@ impl RoutingPanel {
     pub fn update(&mut self, msg: Message) -> Task<crate::Message> {
         match msg {
             Message::Loaded(Ok(status)) => {
+                let never_run = status.run_id.is_none();
                 self.status = status;
                 self.error = None;
-                self.busy = false;
                 self.last_run_at = Some(SystemTime::now());
+                // AUDIT-MESH-5 — no run has ever been minted: auto-request one
+                // (once) so the panel shows live reachability without the
+                // operator having to click "Run validation now".
+                if never_run && !self.auto_ran {
+                    self.auto_ran = true;
+                    self.busy = true;
+                    self.run_result = None;
+                    return Task::perform(async { request_run() }, |result| {
+                        crate::Message::Routing(Message::RunRequested(result))
+                    });
+                }
+                self.busy = false;
                 Task::none()
             }
             Message::Loaded(Err(e)) => {
@@ -170,7 +187,8 @@ impl RoutingPanel {
                     body_col = body_col.push(failed_edge_row(e, palette));
                 }
             } else {
-                body_col = body_col.push(empty_state_card(palette, self.error.as_deref()));
+                body_col =
+                    body_col.push(empty_state_card(palette, self.error.as_deref(), self.busy));
             }
         }
 
@@ -285,7 +303,11 @@ fn result_strip<'a>(res: &Result<String, String>, palette: Palette) -> Element<'
         .into()
 }
 
-fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a, crate::Message> {
+fn empty_state_card<'a>(
+    palette: Palette,
+    error: Option<&'a str>,
+    busy: bool,
+) -> Element<'a, crate::Message> {
     let (icon_kind, icon_color, heading, body): (Icon, Color, String, String) =
         if let Some(err) = error {
             (
@@ -293,6 +315,17 @@ fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a,
                 palette.danger.into_cosmic_color(),
                 "Couldn't read validation".to_string(),
                 err.to_string(),
+            )
+        } else if busy {
+            // AUDIT-MESH-5 — the one-shot auto-run is in flight.
+            (
+                Icon::Network,
+                palette.accent.into_cosmic_color(),
+                "Running validation…".to_string(),
+                "Probing every directed overlay edge between participants — the \
+                 FPG leader mints the run and each node reports what it could \
+                 reach. The verdict appears here as soon as the reporters return."
+                    .to_string(),
             )
         } else {
             (
@@ -466,6 +499,34 @@ mod tests {
     fn parse_status_handles_no_run_and_garbage() {
         assert!(parse_status(r#"{"run_id":null}"#).run_id.is_none());
         assert!(parse_status("not json").run_id.is_none());
+    }
+
+    #[test]
+    fn no_prior_run_auto_runs_once() {
+        // AUDIT-MESH-5 — first load with run_id:null auto-requests a run (busy
+        // + auto_ran set); a second null load does NOT re-trigger (guarded).
+        let mut p = RoutingPanel::new();
+        assert!(!p.auto_ran);
+        let none_status = parse_status(r#"{"run_id":null}"#);
+        let _ = p.update(Message::Loaded(Ok(none_status.clone())));
+        assert!(p.auto_ran, "auto-run armed on first empty load");
+        assert!(p.busy, "auto-run is in flight");
+
+        // Simulate the load that follows another empty status: no re-trigger.
+        let _ = p.update(Message::Loaded(Ok(none_status)));
+        assert!(!p.busy, "second empty load does not re-run");
+    }
+
+    #[test]
+    fn existing_run_does_not_auto_run() {
+        let mut p = RoutingPanel::new();
+        let status = parse_status(
+            r#"{"run_id":"v-9","passed":true,"reachable":[],
+            "failed":[],"missing_reporters":[]}"#,
+        );
+        let _ = p.update(Message::Loaded(Ok(status)));
+        assert!(!p.auto_ran, "a real run is present — no auto-run");
+        assert!(!p.busy);
     }
 
     #[test]
