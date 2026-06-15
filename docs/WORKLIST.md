@@ -664,15 +664,15 @@ A professional, themed, desktop-wide notification center replacing the Cosmic tr
 
 ### PEERS-DT — Peers page as a Carbon data table (design: `docs/design/peers-data-table.md`, 2026-06-15)
 Operator-locked (5-Q survey): flat + sortable table (status as a colored tag column), columns Name·Status·Role·Overlay IP·Latency·Services·Last seen, single-select with **Carbon expandable rows** (inline actions/details, replacing the side panel), toolbar = Search + Refresh only. All color via mde-theme tokens (§4).
-- [ ] **PEERS-DT-1: flat sortable Carbon data table.**
+- [✓] **PEERS-DT-1: flat sortable Carbon data table.** Replaced the status-grouped master list with one flat sortable table; rows from the live directory; default sort Status(online-first)→Name; status as a colored `mde-theme` tag column.
   **As** a mesh operator, **I want** the Peers list as one flat sortable table with a Status tag column, **so that** I can sort/scan all peers uniformly.
   **Acceptance:** one flat table (no group sections); sortable headers (default Status→Name); rows from the live directory; status tags + accents are mde-theme tokens; cargo test -p mde-workbench green.
-- [ ] **PEERS-DT-2: columns Name·Status·Role·Overlay IP·Latency·Services·Last seen.**
+- [✓] **PEERS-DT-2: columns Name·Status·Role·Overlay IP·Latency·Services·Last seen.** All populated (latency from the rtt cache, last-seen humanized from the directory `last_seen_ms`); unknown renders `—`.
   **Acceptance:** each column populated from the directory + latency cache + service set; empty/unknown render honestly (—).
-- [ ] **PEERS-DT-3: Carbon expandable rows (replace the side detail panel).**
+- [✓] **PEERS-DT-3: Carbon expandable rows (replace the side detail panel).** Clicking a row toggles inline expansion rendering the full detail (Call/SSH/RDP/VNC/Wake/Apply-now/metrics/lifecycle/services) below it; the side pane is gone — one detail mechanism. Device rows expand to the KDC actions (Q6).
   **As** an operator, **I want** a row to expand inline to its actions + details, **so that** Ring/Send-file/Open/lifecycle + battery/presence live under the row (no separate panel).
   **Acceptance:** chevron expands/collapses a row; expanded content carries every action the old detail panel had (incl. KDC actions for device rows); exactly one detail mechanism remains.
-- [ ] **PEERS-DT-4: toolbar = Search + Refresh.**
+- [✓] **PEERS-DT-4: toolbar = Search + Refresh.** The filter became the Carbon search (name/role/IP/service); Refresh + Map toggle alongside; no add-peer/density/column-config.
   **Acceptance:** the existing filter becomes the Carbon search (name/role/IP/service); Refresh re-pulls; no add-peer/density/column-config.
 
 ### AFM — Artifact Manager interaction-layer completion (design: `docs/design/artifact-manager.md`, 2026-06-15)

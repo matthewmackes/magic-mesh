@@ -37,6 +37,9 @@ pub struct PeerRow {
     pub overlay_ip: String,
     pub role: String,
     pub currency: String,
+    /// PEERS-DT — last-seen wall-clock (epoch ms) from the directory record;
+    /// drives the "Last seen" column + its sort. `0` when the field is absent.
+    pub last_seen_ms: i64,
     /// L1 — the peer's capability tags (`hop`/`execution`/`headless`)
     /// from the directory record. Rendered as chips in the detail pane
     /// and folded into the filter; empty when the peer has none.
@@ -66,12 +69,58 @@ pub struct DeviceRow {
     pub battery: Option<u8>,
 }
 
+/// PEERS-DT — the sortable columns of the Carbon data table. Default sort is
+/// `Status` (online first) then Name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortColumn {
+    Name,
+    #[default]
+    Status,
+    Role,
+    OverlayIp,
+    Latency,
+    Services,
+    LastSeen,
+}
+
+impl SortColumn {
+    /// Column header label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Status => "Status",
+            Self::Role => "Role",
+            Self::OverlayIp => "Overlay IP",
+            Self::Latency => "Latency",
+            Self::Services => "Services",
+            Self::LastSeen => "Last seen",
+        }
+    }
+}
+
+/// PEERS-DT — presence → sort rank (online first, offline last) for the default
+/// Status sort.
+#[must_use]
+pub fn presence_rank(presence: &str) -> u8 {
+    match presence {
+        "online" => 0,
+        "idle" => 1,
+        _ => 2, // offline / unknown
+    }
+}
+
 /// Panel state.
 #[derive(Debug, Clone, Default)]
 pub struct PeersPanel {
     pub rows: Vec<PeerRow>,
     pub filter: String,
+    /// PEERS-DT — the host whose row is expanded inline (Carbon expandable row),
+    /// replacing the old side detail pane. `None` = all rows collapsed.
     pub selected: Option<String>,
+    /// PEERS-DT — active sort column + direction.
+    pub sort: SortColumn,
+    pub sort_asc: bool,
     /// `None` = loading; `Some(Err)` = mackesd unreachable (L3 state).
     pub loaded: Option<Result<(), String>>,
     pub self_hostname: String,
@@ -134,6 +183,8 @@ pub enum Message {
     Loaded(Result<Vec<PeerRow>, String>),
     FilterChanged(String),
     Select(String),
+    /// PEERS-DT — sort the table by a column (re-click toggles direction).
+    SortBy(SortColumn),
     RefreshClicked,
     /// PD-5 — launch a connection op against the selected peer.
     Op(crate::launcher::Protocol, String),
@@ -354,6 +405,10 @@ pub fn parse_directory(raw: &str) -> Result<Vec<PeerRow>, String> {
                             .as_str()
                             .unwrap_or("unknown")
                             .to_string(),
+                        last_seen_ms: p
+                            .get("last_seen_ms")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or(0),
                         tags,
                         services,
                         ssh,
@@ -794,8 +849,50 @@ impl PeersPanel {
     pub fn new() -> Self {
         Self {
             self_hostname: detect_hostname(),
+            // PEERS-DT — default sort Status, online-first (ascending rank).
+            sort: SortColumn::Status,
+            sort_asc: true,
             ..Self::default()
         }
+    }
+
+    /// PEERS-DT — the rows in current sort order, with the search filter
+    /// applied. Default sort is Status (online first) then Name.
+    #[must_use]
+    pub fn sorted_rows(&self) -> Vec<&PeerRow> {
+        let mut v: Vec<&PeerRow> = self
+            .rows
+            .iter()
+            .filter(|r| matches_filter(r, &self.filter))
+            .collect();
+        let rtt_of = |r: &PeerRow| {
+            self.rtt
+                .get(&r.hostname)
+                .copied()
+                .flatten()
+                .unwrap_or(f64::INFINITY)
+        };
+        v.sort_by(|a, b| {
+            use std::cmp::Ordering;
+            let name = |r: &PeerRow| r.hostname.to_lowercase();
+            let o = match self.sort {
+                SortColumn::Name => name(a).cmp(&name(b)),
+                SortColumn::Status => presence_rank(&a.presence)
+                    .cmp(&presence_rank(&b.presence))
+                    .then_with(|| name(a).cmp(&name(b))),
+                SortColumn::Role => a.role.cmp(&b.role).then_with(|| name(a).cmp(&name(b))),
+                SortColumn::OverlayIp => a.overlay_ip.cmp(&b.overlay_ip),
+                SortColumn::Latency => rtt_of(a).partial_cmp(&rtt_of(b)).unwrap_or(Ordering::Equal),
+                SortColumn::Services => a.services.len().cmp(&b.services.len()),
+                SortColumn::LastSeen => a.last_seen_ms.cmp(&b.last_seen_ms),
+            };
+            if self.sort_asc {
+                o
+            } else {
+                o.reverse()
+            }
+        });
+        v
     }
 
     /// PD-7/L18/L22 — any edge currently carrying enough flow to animate?
@@ -853,14 +950,13 @@ impl PeersPanel {
                     Ok(rows) => {
                         self.rows = rows;
                         self.loaded = Some(Ok(()));
-                        if self.selected.is_none() {
-                            // Default-select self, else the first row.
-                            let self_row = self
-                                .rows
-                                .iter()
-                                .find(|r| r.hostname == self.self_hostname)
-                                .or_else(|| self.rows.first());
-                            self.selected = self_row.map(|r| r.hostname.clone());
+                        // PEERS-DT — the table opens with every row collapsed (no
+                        // auto-expand); a stale selection that's no longer in the
+                        // roster is cleared so it can't expand a missing row.
+                        if let Some(sel) = self.selected.clone() {
+                            if !self.rows.iter().any(|r| r.hostname == sel) {
+                                self.selected = None;
+                            }
                         }
                     }
                     Err(e) => self.loaded = Some(Err(e)),
@@ -872,13 +968,30 @@ impl PeersPanel {
                 Task::none()
             }
             Message::Select(host) => {
-                self.selected = Some(host);
+                // PEERS-DT — clicking a row toggles its inline expansion. A
+                // map-node click (map_view) always expands the clicked peer.
+                if self.selected.as_deref() == Some(host.as_str()) && !self.map_view {
+                    self.selected = None;
+                } else {
+                    self.selected = Some(host);
+                }
                 // L6 — peer and device selection are mutually exclusive.
                 self.selected_device = None;
                 self.metrics = None;
                 self.metrics_err = None;
                 // A map-node click lands you on the peer's detail (W87).
                 self.map_view = false;
+                Task::none()
+            }
+            Message::SortBy(col) => {
+                // PEERS-DT — re-click toggles direction; a new column resets to
+                // ascending.
+                if self.sort == col {
+                    self.sort_asc = !self.sort_asc;
+                } else {
+                    self.sort = col;
+                    self.sort_asc = true;
+                }
                 Task::none()
             }
             Message::ToggleMap => {
@@ -1401,122 +1514,15 @@ impl PeersPanel {
             Some(Ok(())) => {}
         }
 
-        // Left: filter + grouped list.
-        let filter_box = text_input("Filter peers or services…", &self.filter)
+        // PEERS-DT — Search + Refresh toolbar (the old filter becomes the
+        // Carbon search input).
+        let filter_box = text_input("Search peers, roles, IPs, services…", &self.filter)
             .on_input(|f| crate::Message::Peers(Message::FilterChanged(f)))
             .padding(Padding::from([6u16, 10u16]))
             .width(Length::Fill);
-        let mut list = column![].spacing(4);
-        for group in ["This machine", "Online", "Idle", "Offline"] {
-            let members: Vec<&PeerRow> = self
-                .rows
-                .iter()
-                .filter(|r| group_of(r, &self.self_hostname) == group)
-                .filter(|r| matches_filter(r, &self.filter))
-                .collect();
-            if members.is_empty() {
-                continue;
-            }
-            list = list.push(
-                text(group)
-                    .size(11)
-                    .colr(palette.text_muted.into_cosmic_color()),
-            );
-            for r in members {
-                let selected = self.selected.as_deref() == Some(r.hostname.as_str());
-                let dimmed = group == "Offline";
-                let label = format!("{} {}", presence_pip(&r.presence), r.hostname);
-                let fg = if dimmed {
-                    palette.text_muted
-                } else {
-                    palette.text
-                };
-                let bg = if selected {
-                    palette.raised
-                } else {
-                    palette.surface
-                };
-                list = list.push(
-                    button(text(label).size(13).colr(fg.into_cosmic_color()))
-                        .width(Length::Fill)
-                        .padding(Padding::from([6u16, 10u16]))
-                        .sty(move |_t, _s| cosmic::iced::widget::button::Style {
-                            snap: false,
-                            background: Some(Background::Color(bg.into_cosmic_color())),
-                            text_color: fg.into_cosmic_color(),
-                            icon_color: None,
-                            border_radius: 4.0.into(),
-                            border_width: 0.0,
-                            border_color: cosmic::iced::Color::TRANSPARENT,
-                            border: Border {
-                                color: cosmic::iced::Color::TRANSPARENT,
-                                width: 0.0,
-                                radius: 4.0.into(),
-                            },
-                            shadow: cosmic::iced::Shadow::default(),
-                        })
-                        .on_press(crate::Message::Peers(Message::Select(r.hostname.clone()))),
-                );
-            }
-        }
-        // PD-3/L6 — the paired KDE-Connect devices as their own group,
-        // below the peers. Filtered by the same box (device name).
-        let devices: Vec<&DeviceRow> = self
-            .devices
-            .iter()
-            .filter(|d| {
-                self.filter.is_empty()
-                    || d.name.to_lowercase().contains(&self.filter.to_lowercase())
-            })
-            .collect();
-        if !devices.is_empty() {
-            list = list.push(
-                text("Devices")
-                    .size(11)
-                    .colr(palette.text_muted.into_cosmic_color()),
-            );
-            for d in devices {
-                let selected = self.selected_device.as_deref() == Some(d.id.as_str());
-                let pip = if d.online { "●" } else { "○" };
-                let batt = d.battery.map(|b| format!("  {b}%")).unwrap_or_default();
-                let label = format!("{pip} {}{batt}", d.name);
-                let fg = if d.online {
-                    palette.text
-                } else {
-                    palette.text_muted
-                };
-                let bg = if selected {
-                    palette.raised
-                } else {
-                    palette.surface
-                };
-                let id = d.id.clone();
-                list = list.push(
-                    button(text(label).size(13).colr(fg.into_cosmic_color()))
-                        .width(Length::Fill)
-                        .padding(Padding::from([6u16, 10u16]))
-                        .sty(move |_t, _s| cosmic::iced::widget::button::Style {
-                            snap: false,
-                            background: Some(Background::Color(bg.into_cosmic_color())),
-                            text_color: fg.into_cosmic_color(),
-                            icon_color: None,
-                            border_radius: 4.0.into(),
-                            border_width: 0.0,
-                            border_color: cosmic::iced::Color::TRANSPARENT,
-                            border: Border {
-                                color: cosmic::iced::Color::TRANSPARENT,
-                                width: 0.0,
-                                radius: 4.0.into(),
-                            },
-                            shadow: cosmic::iced::Shadow::default(),
-                        })
-                        .on_press(crate::Message::Peers(Message::SelectDevice(id))),
-                );
-            }
-        }
-        let left = column![filter_box, scrollable(list).height(Length::Fill)]
-            .spacing(8)
-            .width(Length::Fixed(240.0));
+
+        // The peer-detail element (computed below) is rendered inline under the
+        // expanded row — see the table build after it.
 
         // Right: the detail pane. A selected device (L6) takes priority
         // and renders the device card; otherwise the peer detail.
@@ -1824,10 +1830,254 @@ impl PeersPanel {
                 }
             }
         };
-        let right = container(scrollable(detail))
+        // PEERS-DT — flat sortable Carbon data table. The selected peer/device
+        // row expands inline (Carbon expandable row) and renders `detail` below
+        // it — the single detail mechanism (replaces the old side pane).
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let w_name = Length::FillPortion(3);
+        let w_status = Length::Fixed(86.0);
+        let w_role = Length::Fixed(104.0);
+        let w_ip = Length::Fixed(120.0);
+        let w_lat = Length::Fixed(80.0);
+        let w_svc = Length::Fixed(80.0);
+        let w_seen = Length::Fixed(86.0);
+        let vcenter = cosmic::iced::alignment::Vertical::Center;
+
+        let header = container(
+            row![
+                Space::new().width(Length::Fixed(20.0)),
+                sort_header(SortColumn::Name, self.sort, self.sort_asc, w_name, palette),
+                sort_header(
+                    SortColumn::Status,
+                    self.sort,
+                    self.sort_asc,
+                    w_status,
+                    palette
+                ),
+                sort_header(SortColumn::Role, self.sort, self.sort_asc, w_role, palette),
+                sort_header(
+                    SortColumn::OverlayIp,
+                    self.sort,
+                    self.sort_asc,
+                    w_ip,
+                    palette
+                ),
+                sort_header(
+                    SortColumn::Latency,
+                    self.sort,
+                    self.sort_asc,
+                    w_lat,
+                    palette
+                ),
+                sort_header(
+                    SortColumn::Services,
+                    self.sort,
+                    self.sort_asc,
+                    w_svc,
+                    palette
+                ),
+                sort_header(
+                    SortColumn::LastSeen,
+                    self.sort,
+                    self.sort_asc,
+                    w_seen,
+                    palette
+                ),
+            ]
+            .spacing(8)
+            .align_y(vcenter),
+        )
+        .padding(Padding::from([2u16, 6u16]));
+
+        let mut detail_slot = Some(detail);
+        let mut table = column![header].spacing(0);
+
+        let row_style = move |bg: mde_theme::Rgba| {
+            move |_t: &cosmic::Theme, _s: cosmic::iced::widget::button::Status| {
+                cosmic::iced::widget::button::Style {
+                    snap: false,
+                    background: Some(Background::Color(bg.into_cosmic_color())),
+                    text_color: palette.text.into_cosmic_color(),
+                    icon_color: None,
+                    border_radius: 0.0.into(),
+                    border_width: 0.0,
+                    border_color: cosmic::iced::Color::TRANSPARENT,
+                    border: Border {
+                        color: cosmic::iced::Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 0.0.into(),
+                    },
+                    shadow: cosmic::iced::Shadow::default(),
+                }
+            }
+        };
+
+        for r in self.sorted_rows() {
+            let expanded = self.selected.as_deref() == Some(r.hostname.as_str());
+            let chevron = if expanded { "▾" } else { "▸" };
+            let lat = self
+                .rtt
+                .get(&r.hostname)
+                .copied()
+                .flatten()
+                .map(|ms| format!("{ms:.0} ms"))
+                .unwrap_or_else(|| "—".to_string());
+            let role = if r.role.is_empty() {
+                "—".to_string()
+            } else {
+                r.role.clone()
+            };
+            let ip = if r.overlay_ip.is_empty() {
+                "—".to_string()
+            } else {
+                r.overlay_ip.clone()
+            };
+            let name_label = if r.hostname == self.self_hostname {
+                format!("{} · you", r.hostname)
+            } else {
+                r.hostname.clone()
+            };
+            let row_bg = if expanded {
+                palette.raised
+            } else {
+                palette.surface
+            };
+            let cells = row![
+                text(chevron)
+                    .size(12)
+                    .width(Length::Fixed(20.0))
+                    .colr(palette.text_muted.into_cosmic_color()),
+                text(name_label)
+                    .size(13)
+                    .width(w_name)
+                    .colr(palette.text.into_cosmic_color()),
+                container(status_tag(&r.presence, palette)).width(w_status),
+                text(role)
+                    .size(12)
+                    .width(w_role)
+                    .colr(palette.text_muted.into_cosmic_color()),
+                text(ip)
+                    .size(12)
+                    .width(w_ip)
+                    .colr(palette.text_muted.into_cosmic_color()),
+                text(lat)
+                    .size(12)
+                    .width(w_lat)
+                    .colr(palette.text_muted.into_cosmic_color()),
+                text(r.services.len().to_string())
+                    .size(12)
+                    .width(w_svc)
+                    .colr(palette.text_muted.into_cosmic_color()),
+                text(humanize_last_seen(r.last_seen_ms, now_ms))
+                    .size(12)
+                    .width(w_seen)
+                    .colr(palette.text_muted.into_cosmic_color()),
+            ]
+            .spacing(8)
+            .align_y(vcenter);
+            let host = r.hostname.clone();
+            table = table.push(
+                button(cells)
+                    .width(Length::Fill)
+                    .padding(Padding::from([6u16, 6u16]))
+                    .sty(row_style(row_bg))
+                    .on_press(crate::Message::Peers(Message::Select(host))),
+            );
+            if expanded {
+                if let Some(d) = detail_slot.take() {
+                    table = table.push(container(d).padding(Padding::from([8u16, 28u16])));
+                }
+            }
+        }
+
+        // PD-3/L6/Q6 — paired KDE-Connect devices share the table; a device row
+        // expands to the KDC actions (device_detail, carried by `detail`).
+        let device_rows: Vec<&DeviceRow> = self
+            .devices
+            .iter()
+            .filter(|d| {
+                self.filter.is_empty()
+                    || d.name.to_lowercase().contains(&self.filter.to_lowercase())
+            })
+            .collect();
+        if !device_rows.is_empty() {
+            table = table.push(
+                container(
+                    text("Devices")
+                        .size(11)
+                        .colr(palette.text_muted.into_cosmic_color()),
+                )
+                .padding(Padding::from([8u16, 6u16])),
+            );
+            for d in device_rows {
+                let expanded = self.selected_device.as_deref() == Some(d.id.as_str());
+                let chevron = if expanded { "▾" } else { "▸" };
+                let presence = if d.online { "online" } else { "offline" };
+                let batt = d
+                    .battery
+                    .map(|b| format!("{b}%"))
+                    .unwrap_or_else(|| "—".to_string());
+                let row_bg = if expanded {
+                    palette.raised
+                } else {
+                    palette.surface
+                };
+                let cells = row![
+                    text(chevron)
+                        .size(12)
+                        .width(Length::Fixed(20.0))
+                        .colr(palette.text_muted.into_cosmic_color()),
+                    text(d.name.clone())
+                        .size(13)
+                        .width(w_name)
+                        .colr(palette.text.into_cosmic_color()),
+                    container(status_tag(presence, palette)).width(w_status),
+                    text("device")
+                        .size(12)
+                        .width(w_role)
+                        .colr(palette.text_muted.into_cosmic_color()),
+                    text("—")
+                        .size(12)
+                        .width(w_ip)
+                        .colr(palette.text_muted.into_cosmic_color()),
+                    text("—")
+                        .size(12)
+                        .width(w_lat)
+                        .colr(palette.text_muted.into_cosmic_color()),
+                    text(batt)
+                        .size(12)
+                        .width(w_svc)
+                        .colr(palette.text_muted.into_cosmic_color()),
+                    text("—")
+                        .size(12)
+                        .width(w_seen)
+                        .colr(palette.text_muted.into_cosmic_color()),
+                ]
+                .spacing(8)
+                .align_y(vcenter);
+                let id = d.id.clone();
+                table = table.push(
+                    button(cells)
+                        .width(Length::Fill)
+                        .padding(Padding::from([6u16, 6u16]))
+                        .sty(row_style(row_bg))
+                        .on_press(crate::Message::Peers(Message::SelectDevice(id))),
+                );
+                if expanded {
+                    if let Some(dt) = detail_slot.take() {
+                        table = table.push(container(dt).padding(Padding::from([8u16, 28u16])));
+                    }
+                }
+            }
+        }
+
+        let right = container(scrollable(table))
             .width(Length::Fill)
             .height(Length::Fill)
-            .padding(Padding::from([0u16, 16u16]));
+            .padding(Padding::from([0u16, 4u16]));
 
         // PD-7 — the Map view replaces the master-detail body; a node
         // click selects the peer and returns to the detail view.
@@ -1893,9 +2143,11 @@ impl PeersPanel {
                 .height(Length::Fill);
             return shell(title, body.into(), palette);
         }
-        let body = column![toggle, row![left, right].spacing(16).height(Length::Fill)]
+        // PEERS-DT — toolbar (Search + Refresh + Map toggle) over the table.
+        let toolbar = row![filter_box, refresh_btn(palette), toggle]
             .spacing(8)
-            .height(Length::Fill);
+            .align_y(cosmic::iced::alignment::Vertical::Center);
+        let body = column![toolbar, right].spacing(8).height(Length::Fill);
         shell(title, body.into(), palette)
     }
 
@@ -2170,6 +2422,100 @@ fn device_detail<'a>(
     column![header, ops, strip, facts].spacing(16).into()
 }
 
+/// PEERS-DT — a colored Carbon status tag (Online/Idle/Offline) for the Status
+/// column. Color comes from the live palette (§4 tokens), never raw hex.
+fn status_tag(presence: &str, palette: mde_theme::Palette) -> Element<'static, crate::Message> {
+    let (label, color) = match presence {
+        "online" => ("Online", palette.success),
+        "idle" => ("Idle", palette.warning),
+        _ => ("Offline", palette.text_muted),
+    };
+    container(text(label).size(11).colr(color.into_cosmic_color()))
+        .padding(Padding::from([1u16, 8u16]))
+        .style(move |_| cosmic::iced::widget::container::Style {
+            snap: false,
+            background: Some(Background::Color(cosmic::iced::Color {
+                a: 0.14,
+                ..color.into_cosmic_color()
+            })),
+            text_color: Some(color.into_cosmic_color()),
+            border: Border {
+                color: cosmic::iced::Color {
+                    a: 0.35,
+                    ..color.into_cosmic_color()
+                },
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// PEERS-DT — humanize an epoch-ms `last_seen` against now. `0` (absent) → "—".
+#[must_use]
+pub fn humanize_last_seen(ms: i64, now_ms: i64) -> String {
+    if ms <= 0 {
+        return "—".to_string();
+    }
+    let secs = (now_ms - ms).max(0) / 1000;
+    if secs < 10 {
+        "now".to_string()
+    } else if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+/// PEERS-DT — a sortable column header cell: label + active-sort arrow, the
+/// whole cell a button that emits `SortBy(col)`.
+fn sort_header(
+    col: SortColumn,
+    active: SortColumn,
+    asc: bool,
+    width: Length,
+    palette: mde_theme::Palette,
+) -> Element<'static, crate::Message> {
+    let arrow = if col == active {
+        if asc {
+            " ▲"
+        } else {
+            " ▼"
+        }
+    } else {
+        ""
+    };
+    button(
+        text(format!("{}{arrow}", col.label()))
+            .size(11)
+            .colr(palette.text_muted.into_cosmic_color()),
+    )
+    .width(width)
+    .padding(Padding::from([4u16, 6u16]))
+    .sty(|_t, _s| cosmic::iced::widget::button::Style {
+        snap: false,
+        background: None,
+        text_color: cosmic::iced::Color::TRANSPARENT,
+        icon_color: None,
+        border_radius: 0.0.into(),
+        border_width: 0.0,
+        border_color: cosmic::iced::Color::TRANSPARENT,
+        border: Border {
+            color: cosmic::iced::Color::TRANSPARENT,
+            width: 0.0,
+            radius: 0.0.into(),
+        },
+        shadow: cosmic::iced::Shadow::default(),
+    })
+    .on_press(crate::Message::Peers(Message::SortBy(col)))
+    .into()
+}
+
 fn shell<'a>(
     title: cosmic::iced::widget::Text<'a, cosmic::Theme>,
     body: Element<'a, crate::Message>,
@@ -2220,14 +2566,6 @@ fn refresh_btn(palette: mde_theme::Palette) -> Element<'static, crate::Message> 
         Some(crate::Message::Peers(Message::RefreshClicked)),
         palette,
     )
-}
-
-fn presence_pip(presence: &str) -> &'static str {
-    match presence {
-        "online" => "●",
-        "idle" => "◐",
-        _ => "○",
-    }
 }
 
 fn detect_hostname() -> String {
@@ -2315,11 +2653,68 @@ mod tests {
         let rows = parse_directory(REPLY).unwrap();
         let _ = p.update(Message::Loaded(Ok(rows)));
         assert!(p.loaded == Some(Ok(())));
-        assert!(p.selected.is_some(), "something selected by default");
+        // PEERS-DT — the table opens with every row collapsed (no auto-select).
+        assert!(p.selected.is_none(), "no row expanded by default");
         let _ = p.update(Message::Select("oak".into()));
         assert_eq!(p.selected.as_deref(), Some("oak"));
+        // PEERS-DT — re-clicking the expanded row collapses it.
+        let _ = p.update(Message::Select("oak".into()));
+        assert!(p.selected.is_none(), "re-click collapses the row");
         let _ = p.update(Message::FilterChanged("podman".into()));
         assert_eq!(p.filter, "podman");
+    }
+
+    #[test]
+    fn peers_dt_default_sort_is_status_then_name() {
+        let mut p = PeersPanel::new();
+        let _ = p.update(Message::Loaded(Ok(parse_directory(REPLY).unwrap())));
+        // Default sort = Status (online first), Name as tiebreak.
+        assert_eq!(p.sort, SortColumn::Status);
+        assert!(p.sort_asc);
+        let order: Vec<&str> = p
+            .sorted_rows()
+            .iter()
+            .map(|r| r.hostname.as_str())
+            .collect();
+        // Within each presence bucket, names are ascending; offline last.
+        let ranks: Vec<u8> = p
+            .sorted_rows()
+            .iter()
+            .map(|r| presence_rank(&r.presence))
+            .collect();
+        let mut sorted_ranks = ranks.clone();
+        sorted_ranks.sort_unstable();
+        assert_eq!(
+            ranks, sorted_ranks,
+            "rows grouped online→idle→offline: {order:?}"
+        );
+    }
+
+    #[test]
+    fn peers_dt_sort_by_name_toggles_direction() {
+        let mut p = PeersPanel::new();
+        let _ = p.update(Message::Loaded(Ok(parse_directory(REPLY).unwrap())));
+        let _ = p.update(Message::SortBy(SortColumn::Name));
+        assert_eq!(p.sort, SortColumn::Name);
+        assert!(p.sort_asc);
+        let asc: Vec<String> = p.sorted_rows().iter().map(|r| r.hostname.clone()).collect();
+        let _ = p.update(Message::SortBy(SortColumn::Name));
+        assert!(!p.sort_asc, "re-click flips direction");
+        let desc: Vec<String> = p.sorted_rows().iter().map(|r| r.hostname.clone()).collect();
+        let mut rev = asc.clone();
+        rev.reverse();
+        assert_eq!(desc, rev, "descending is the reverse of ascending");
+    }
+
+    #[test]
+    fn humanize_last_seen_buckets() {
+        let now = 1_000_000_000_000i64;
+        assert_eq!(humanize_last_seen(0, now), "—");
+        assert_eq!(humanize_last_seen(now - 5_000, now), "now");
+        assert_eq!(humanize_last_seen(now - 30_000, now), "30s");
+        assert_eq!(humanize_last_seen(now - 120_000, now), "2m");
+        assert_eq!(humanize_last_seen(now - 7_200_000, now), "2h");
+        assert_eq!(humanize_last_seen(now - 172_800_000, now), "2d");
     }
 
     #[test]
