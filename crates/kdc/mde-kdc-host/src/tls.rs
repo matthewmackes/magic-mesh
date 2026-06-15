@@ -26,11 +26,26 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use sha2::{Digest, Sha256};
 
-/// The self-signed RSA-4096 identity certs (our own keys, §3 floor; stock
-/// KDE Connect peers may present 2048) only ever sign with these schemes;
-/// every custom verifier advertises exactly this set (mirrors upstream KDC).
-fn rsa_identity_schemes() -> Vec<SignatureScheme> {
+/// Signature schemes our custom verifiers advertise (the ClientHello's
+/// `signature_algorithms`, and what we accept verifying a peer's cert).
+///
+/// KDC-INTEROP: this MUST include **ECDSA + Ed25519**, not just RSA. Our own
+/// identity is RSA-4096 (§3 floor) and older KDE Connect peers present RSA-2048,
+/// but **KDE Connect protocol v8 switched device certs to elliptic-curve
+/// (ECDSA P-256)**. Advertising RSA-only made the phone's TLS server unable to
+/// pick a signature algorithm to sign its CertificateVerify over its EC cert →
+/// it aborted the handshake with `handshake_failure(40)` right after our
+/// ClientHello (observed live against a Moto G v8 device). Our cipher list
+/// already offers ECDHE_ECDSA suites; this closes the matching sig-alg gap so
+/// both RSA (v7) and EC (v8) peers negotiate.
+fn identity_sig_schemes() -> Vec<SignatureScheme> {
     vec![
+        // EC (KDE Connect v8 device certs + our future EC support).
+        SignatureScheme::ECDSA_NISTP256_SHA256,
+        SignatureScheme::ECDSA_NISTP384_SHA384,
+        SignatureScheme::ECDSA_NISTP521_SHA512,
+        SignatureScheme::ED25519,
+        // RSA (our RSA-4096 identity + v7 RSA-2048 peers).
         SignatureScheme::RSA_PKCS1_SHA256,
         SignatureScheme::RSA_PKCS1_SHA384,
         SignatureScheme::RSA_PKCS1_SHA512,
@@ -114,7 +129,7 @@ impl ServerCertVerifier for PinnedFingerprintVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rsa_identity_schemes()
+        identity_sig_schemes()
     }
 }
 
@@ -160,7 +175,7 @@ impl ServerCertVerifier for FirstPairVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rsa_identity_schemes()
+        identity_sig_schemes()
     }
 }
 
@@ -217,7 +232,7 @@ impl ClientCertVerifier for AcceptAnyClientCert {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rsa_identity_schemes()
+        identity_sig_schemes()
     }
 }
 

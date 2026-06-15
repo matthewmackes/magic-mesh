@@ -279,8 +279,15 @@ fn apply_event(map: &mut HashMap<String, DeviceInfo>, ev: HostEvent) {
     }
 }
 
+/// The display-name prefix every mesh host advertises over KDE Connect, so a
+/// paired phone groups them together (e.g. `MDE-MESH UNIT-EAGLE`). Prefixes the
+/// `device_name` only — the `device_id` stays the stable machine-id so an
+/// existing pairing is never broken by a name change.
+const MESH_NAME_PREFIX: &str = "MDE-MESH";
+
 /// This host's identity announce: `device_id` the machine id (stable across
-/// boots), `device_name` the hostname; type Desktop, protocol 7.
+/// boots), `device_name` the `MDE-MESH`-prefixed hostname; type Desktop,
+/// protocol 7.
 fn local_announce() -> Announce {
     let device_id = std::fs::read_to_string("/etc/machine-id")
         .ok()
@@ -288,19 +295,61 @@ fn local_announce() -> Announce {
         .filter(|s| !s.is_empty())
         .or_else(|| std::env::var("HOSTNAME").ok())
         .unwrap_or_else(|| "mde-host".to_string());
-    let device_name = std::fs::read_to_string("/etc/hostname")
+    let hostname = std::fs::read_to_string("/etc/hostname")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .or_else(|| std::env::var("HOSTNAME").ok())
-        .unwrap_or_else(|| "MDE".to_string());
+        .unwrap_or_else(|| "host".to_string());
+    let device_name = format!("{MESH_NAME_PREFIX} {hostname}");
+    // KDC-INTEROP — advertise the plugin capabilities we actually drive. An
+    // identity with EMPTY capabilities makes a stock KDE Connect peer treat the
+    // link as having nothing to run and tear it down right after the handshake
+    // (observed: a paired phone reconnecting every ~30s, never persistent, no
+    // features). `incoming` = packets we accept; `outgoing` = packets we send.
+    let incoming_capabilities = [
+        "kdeconnect.ping",
+        "kdeconnect.battery",
+        "kdeconnect.battery.request",
+        "kdeconnect.clipboard",
+        "kdeconnect.clipboard.connect",
+        "kdeconnect.notification",
+        "kdeconnect.notification.request",
+        "kdeconnect.mpris",
+        "kdeconnect.mpris.request",
+        "kdeconnect.share.request",
+        "kdeconnect.findmyphone.request",
+        "kdeconnect.runcommand.request",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    let outgoing_capabilities = [
+        "kdeconnect.ping",
+        "kdeconnect.battery",
+        "kdeconnect.battery.request",
+        "kdeconnect.clipboard",
+        "kdeconnect.clipboard.connect",
+        "kdeconnect.notification",
+        "kdeconnect.notification.request",
+        "kdeconnect.mpris",
+        "kdeconnect.mpris.request",
+        "kdeconnect.share.request",
+        "kdeconnect.findmyphone.request",
+        "kdeconnect.sms.request",
+        "kdeconnect.telephony.request",
+        "kdeconnect.runcommand",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
     Announce {
         device_id,
         device_name,
         device_type: DeviceType::Desktop,
         protocol_version: 7,
-        incoming_capabilities: Vec::new(),
-        outgoing_capabilities: Vec::new(),
+        incoming_capabilities,
+        outgoing_capabilities,
     }
 }
 
@@ -396,6 +445,32 @@ async fn run_host(pairing: Arc<PairingStore>, roster: Roster, outbound: PendingS
         tokio::select! {
             ev = stream.recv() => {
                 let Some(ev) = ev else { break };
+                // KDC-INTEROP diagnostics — surface every host event so the
+                // pairing handshake is observable in the journal.
+                match &ev {
+                    HostEvent::Packet { peer, packet } => {
+                        info!(peer = %peer.as_str(), kind = %packet.kind, body = %packet.body, "kdc-host: rx packet");
+                    }
+                    HostEvent::TransportError(e) => {
+                        warn!(error = %e, "kdc-host: transport error");
+                    }
+                    HostEvent::Connected(p) => info!(peer = %p.as_str(), "kdc-host: connected"),
+                    HostEvent::Disconnected(p) => info!(peer = %p.as_str(), "kdc-host: disconnected"),
+                    HostEvent::PeerDiscovered(a) => {
+                        info!(device = %a.device_id, name = %a.device_name, "kdc-host: discovered")
+                    }
+                    HostEvent::PeerLost(_) => {}
+                }
+                // A phone-initiated `kdeconnect.pair{pair:true}`: pin the cert seen
+                // at TLS time, persist the device, and accept.
+                if let HostEvent::Packet { peer, packet } = &ev {
+                    if packet.kind == "kdeconnect.pair"
+                        && packet.body.get("pair").and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                    {
+                        accept_pair(&pairing, &transport, &roster, peer).await;
+                    }
+                }
                 if let Ok(mut m) = roster.lock() {
                     apply_event(&mut m, ev);
                 }
@@ -414,6 +489,56 @@ async fn run_host(pairing: Arc<PairingStore>, roster: Roster, outbound: PendingS
                 }
             }
         }
+    }
+}
+
+/// KDC-INTEROP — accept a phone-initiated `kdeconnect.pair{pair:true}`: pin the
+/// cert fingerprint captured during the inbound TLS handshake, persist the device
+/// as paired, and send the `kdeconnect.pair{pair:true}` acceptance back over the
+/// live link. Auto-accepts — the operator already initiated the request from the
+/// phone, so a second confirm on the desktop would be friction (the "magic" UX);
+/// a confirmation prompt can layer on later via the Connect panel.
+async fn accept_pair(
+    pairing: &Arc<PairingStore>,
+    transport: &LanTransport,
+    roster: &Roster,
+    peer: &PeerId,
+) {
+    let device_id = peer.as_str().to_string();
+    // Re-ack an already-paired device so a repeat request settles cleanly.
+    if pairing.is_paired(&device_id) {
+        let ack = build_packet("kdeconnect.pair", json!({ "pair": true }));
+        let _ = transport.send_to(peer, ack).await;
+        return;
+    }
+    let fingerprint = transport
+        .inbound_fingerprint(&device_id)
+        .await
+        .unwrap_or_default();
+    let device_name = roster
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&device_id).map(|d| d.name.clone()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| device_id.clone());
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    let record = DeviceRecord {
+        device_id: device_id.clone(),
+        device_name,
+        paired_at_ms: now_ms,
+        fingerprint,
+    };
+    if let Err(e) = pairing.pair(record) {
+        warn!(device = %device_id, error = %e, "kdc-host: pairing persist failed");
+        return;
+    }
+    let ack = build_packet("kdeconnect.pair", json!({ "pair": true }));
+    if let Err(e) = transport.send_to(peer, ack).await {
+        warn!(device = %device_id, error = %e, "kdc-host: pair-accept send failed");
+    } else {
+        info!(device = %device_id, "kdc-host: paired (accepted phone request)");
     }
 }
 

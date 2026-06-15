@@ -56,6 +56,21 @@ pub const DEFAULT_ROLE_MARKER_PATH: &str = crate::ipc::nebula::DEFAULT_ROLE_HOST
 const NEBULA_PORTS_ALL_PEERS: &[(u16, &str)] = &[(4242, "udp")];
 const NEBULA_PORTS_LIGHTHOUSE_EXTRA: &[(u16, &str)] = &[(443, "tcp")];
 
+/// KDC-INTEROP — KDE Connect's LAN port range (TCP+UDP 1714–1764). Opened only
+/// on **Workstation-rank** peers, where the `kdc_host` worker runs and binds
+/// 1716; a paired phone discovers + connects over the LAN through these. Headless
+/// Lighthouse/Server peers don't run `kdc_host`, so they never open them (keeps
+/// their underlay attack surface to the Nebula bootstrap ports). Expressed as
+/// `firewall-cmd` port-range specs since the range is 51 ports.
+const KDE_CONNECT_PORT_SPECS: &[&str] = &["1714-1764/tcp", "1714-1764/udp"];
+
+/// Whether this peer runs the Workstation worker set (rank ≥ 2) — i.e. it runs
+/// `kdc_host` and therefore should open the KDE Connect ports. Tolerant resolver
+/// (an unpinned dev box reads as Workstation), matching the worker pool's default.
+fn runs_kdc_host() -> bool {
+    crate::worker_role::resolve_rank() >= mde_role::Role::Workstation.rank()
+}
+
 /// Worker handle. Tracks the last-observed role-marker state +
 /// last-applied port set so the worker doesn't re-shell-out on
 /// every tick.
@@ -151,6 +166,18 @@ impl FirewallPresetWorker {
         match apply_preset(self.firewall_cmd, &ports) {
             Ok(()) => {
                 self.last_applied_lighthouse = Some(is_lighthouse);
+                // KDC-INTEROP — Workstation peers also open the KDE Connect range
+                // so a phone can pair/connect over the LAN. Best-effort: a failure
+                // here must not undo the (succeeded) Nebula preset.
+                if runs_kdc_host() {
+                    if let Err(e) = apply_port_specs(self.firewall_cmd, KDE_CONNECT_PORT_SPECS) {
+                        tracing::warn!(
+                            target: "mackesd::firewall_preset",
+                            error = %e,
+                            "nebula preset applied, but KDE Connect ports deferred (KDC-INTEROP)"
+                        );
+                    }
+                }
                 // PLANES-16 — bind the overlay to the trusted zone and the
                 // underlay to the tight public zone (W69/W70). Best-effort:
                 // a zone failure must not undo the (succeeded) port preset,
@@ -438,6 +465,50 @@ fn apply_preset(firewall_cmd: &str, ports: &[(u16, &'static str)]) -> Result<(),
     Ok(())
 }
 
+/// Shell out to `firewall-cmd --permanent --add-port <spec>` for each
+/// port-range spec (e.g. `1714-1764/tcp`) + a single `--reload`. Like
+/// [`apply_preset`] but for range specs (KDE Connect). Idempotent:
+/// `ALREADY_ENABLED` is treated as success.
+fn apply_port_specs(firewall_cmd: &str, specs: &[&str]) -> Result<(), String> {
+    if which(firewall_cmd).is_none() {
+        return Err(format!(
+            "{firewall_cmd} not on PATH; KDE Connect ports deferred until firewalld is installed"
+        ));
+    }
+    for spec in specs {
+        let mut cmd = std::process::Command::new(firewall_cmd);
+        cmd.args(["--permanent", "--add-port", spec]);
+        let out = crate::workers::proc::output_with_timeout(
+            cmd,
+            crate::workers::proc::DEFAULT_CMD_TIMEOUT,
+        )
+        .map_err(|e| format!("spawn {firewall_cmd} --add-port {spec}: {e}"))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !stderr.contains("ALREADY_ENABLED") {
+                return Err(format!(
+                    "{firewall_cmd} --add-port {spec} failed: {}",
+                    stderr.trim()
+                ));
+            }
+        }
+    }
+    let mut reload = std::process::Command::new(firewall_cmd);
+    reload.arg("--reload");
+    let out = crate::workers::proc::output_with_timeout(
+        reload,
+        crate::workers::proc::DEFAULT_CMD_TIMEOUT,
+    )
+    .map_err(|e| format!("spawn {firewall_cmd} --reload: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "{firewall_cmd} --reload failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 /// Minimal `which`-style lookup over `$PATH`. Avoids pulling the
 /// `which` crate just for this single use.
 fn which(cmd: &str) -> Option<PathBuf> {
@@ -604,6 +675,21 @@ mod tests {
         std::fs::remove_file(&marker).expect("remove marker");
         assert_eq!(w.tick_once(), TickOutcome::AppliedSkippedShell);
         assert_eq!(w.last_applied_lighthouse, Some(false));
+    }
+
+    #[test]
+    fn kde_connect_specs_cover_the_lan_range_tcp_and_udp() {
+        // KDC-INTEROP — the Workstation-only KDE Connect ports are the full
+        // 1714–1764 range over both TCP and UDP (discovery is UDP, links TCP).
+        assert_eq!(KDE_CONNECT_PORT_SPECS, &["1714-1764/tcp", "1714-1764/udp"]);
+    }
+
+    #[test]
+    fn apply_port_specs_skips_shell_for_empty_cmd() {
+        // Empty firewall_cmd → which() returns None → deferred (no panic, no
+        // shell-out), the same test-safe contract apply_preset honors.
+        let r = apply_port_specs("", KDE_CONNECT_PORT_SPECS);
+        assert!(r.is_err(), "empty cmd defers rather than shelling out");
     }
 
     #[test]
