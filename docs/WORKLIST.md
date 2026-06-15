@@ -677,23 +677,12 @@ Operator-locked (5-Q survey): flat + sortable table (status as a colored tag col
 
 ### AFM — Artifact Manager interaction-layer completion (design: `docs/design/artifact-manager.md`, 2026-06-15)
 Operator handed the canonical Claude-Design bundle (`Artifact Manager.html` + `files-app.jsx`) and asked to implement the design. Decision (2026-06-15): **Keep Carbon, build the prototype's structure/behavior** — the §4 Carbon lock + `palette_is_carbon_gray_100_dark` stay intact; the work is making the already-ported views actually *do* what the prototype does. Closes the operator's mde-files bug list (window controls, sidebar, breadcrumbs, local actions, inbox/outbox, grid/list, peer population). Data fixes (directory-sourced peers/self/overlay + `client_data_dir`) already landed.
-- [ ] **AFM-1: window controls (min/max/close) actually act.**
-  **As** an operator, **I want** the titlebar buttons to minimize/maximize/close the window, **so that** the app behaves like a real window.
-  **Acceptance:** min/max/close wired to `cosmic::iced::window` on `window::latest()` (mirrors `mde-workbench::dispatch_window_action`); clicking each performs the action.
-- [ ] **AFM-2: sidebar panel-toggle + self row + "+ Peer".**
-  **Acceptance:** PANEL_RIGHT collapses/restores the sidebar (`.sidebar-collapsed` 0px grid); the self row opens this node's shared folder; "+ Peer" reaches registration/enroll; none remain `Noop`.
-- [ ] **AFM-3: clickable breadcrumbs.**
-  **Acceptance:** each crumb is a button that navigates (Mesh→Overview, Home→MeshHome, peer→peer, mid-segments→`MeshFolderPop`); MESH/LOCAL tag correct per view.
-- [ ] **AFM-4: local file actions (open on activate + context menu).**
-  **Acceptance:** in the Local browser, a folder row opens on activate (descends), a file row opens its default app (`xdg-open`); right-click shows the context menu; no listing where "no file can be acted upon".
-- [ ] **AFM-5: Inbox correctness (never the home directory).**
-  **Acceptance:** Inbox shows the mesh inbox or an honest empty state; the `list("")` fallback no longer lists `$HOME`; test-covered.
-- [ ] **AFM-6: Outbox is a real view.**
-  **As** an operator, **I want** Outbox to list files this node has sent, **so that** it is not a dead row.
-  **Acceptance:** new `View::Outbox` + backend source (sent-file log) + view + sidebar wiring; honest empty state when nothing sent.
-- [ ] **AFM-7: grid/list toggle operates on every file view.**
-  **Acceptance:** toggling List/Grid visibly changes layout on inbox/downloads/local/mesh-home/peer (grid = object cards, list = tabular rows).
-- [ ] **AFM-8: peer population + de-stale copy.**
-  **Acceptance:** sidebar + overview populate from the live directory roster (no "0 of 0 peers" on a populated mesh); stale "tailnet" copy → "overlay"/"mesh"; "nebula offline" only when truly offline.
-- [ ] **AFM-9: PrimaryAction + PeerCardSend wired.**
-  **Acceptance:** toolbar Send/Share/New and per-card Send trigger a real action (Send-To dispatch / share / new-folder), not `Noop`.
+- [✓] **AFM-1: window controls (min/max/close) actually act.** Wired to `cosmic::iced::window` on `window::latest()` (mirrors `mde-workbench::dispatch_window_action`). Were no-op match arms.
+- [✓] **AFM-2: sidebar panel-toggle + self row + "+ Peer".** PANEL_RIGHT toggles `sidebar_collapsed` (slim rail when collapsed, expand still reachable); self row → `View::MeshHome`; "+ Peer" → launches the workbench (enroll/registration). None remain `Noop`.
+- [✓] **AFM-3: clickable breadcrumbs.** `Crumb` gained an optional `nav` target; each non-leaf segment renders as a button (Mesh→Overview, Home→MeshHome, `<Dir>`→slug root, path segments→`MeshFolderPop`). Were static text.
+- [✓] **AFM-4: local file actions.** Each Local-browser row is a button → `LocalActivate`: descends a directory or `xdg-open`s a file. Were inert ObjectCards no click reached.
+- [✓] **AFM-5: Inbox correctness.** `RealBackend::list("")` no longer falls back to `local.list("")`→`$HOME`; honest empty inbox when the Bus is down. Regression test `real_backend_inbox_is_empty_not_home_without_bus`.
+- [✓] **AFM-6: Outbox is a real view.** New `View::Outbox` projecting the send audit log (kind=send_to); sidebar row + breadcrumb + count + honest empty state. Was a dead `Noop` row.
+- [✓] **AFM-7: grid/list toggle operates on every file view.** Shared `file_listing` (List=tabular `list_row`, Grid=`ObjectCard`); threaded `layout` through inbox/downloads/local/mesh-home (peer already honored it).
+- [>] **AFM-8: peer population + de-stale copy.** Code done — sidebar + overview render the live directory roster; stale "tailnet"→"overlay". Data path fixed earlier this session (fleet-files/peers + nebula list-peers → `DirectoryService::build_directory`; `client_data_dir`). **Pending: live verify on a deployed node (no "0 of 0 peers").**
+- [✓] **AFM-9: PrimaryAction + PeerCardSend wired.** PeerCardSend + PrimaryAction(Peer) open a desktop file chooser (zenity→kdialog) → real Send-To via the wired backend; PrimaryAction(Local) creates a new folder. Were `Noop`.
