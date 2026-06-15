@@ -172,3 +172,29 @@ Fresh integrity sweep after the NET-INTROSPECT feature (Nebula debug-SSH relay/d
 **Counts:** 8 findings — 6 fixed same-day (the direct fallout of NET-INTROSPECT/cutover I'd just landed: 1 packaging, 4 doc-drift, 1 API-surface), 2 lifted OPEN (pre-existing, unrelated to this work: a dead-param stub + a stale voice-hud doc). Zero stubs, zero mockups, zero substrate/crypto/secrets violations, zero dead NET-INTROSPECT wiring (all 5 call chains verified reachable). Note: a few benign pre-existing unused-import/attribute warnings in unrelated workers (job_exec/mesh_shunt/mesh_dns/nebula_csr_watcher) — out of scope, candidate for a warnings-cleanup /ship.
 
 **Cycle-7 status: CLEAN — NET-INTROSPECT fit for purpose, debug-SSH security verified.** The 2 open items are pre-existing and lifted to the worklist.
+
+## AUDIT-MESH — workbench Mesh-section end-to-end data (2026-06-15, operator /audit)
+
+Live audit: each Mesh-nav panel's data source tested against the running mesh
+(host = healthy baseline w/ full mount; .13 = the "no data" node). Per the
+finding→worklist+patch directive, each FINISH has an `AUDIT-MESH-*` worklist item.
+
+| Panel | Data source | Live result | Finding | Verdict |
+|---|---|---|---|---|
+| Peers | `action/mesh/directory` | host=4 peers · .13=1 (self only) | `/mnt/mesh-storage` unmounted on .13 → local 1-record dir | **FINISH** (AUDIT-MESH-1; .13 live-patched) |
+| Mesh DNS | `mackesd dns list` | host=4 fqdns · .13=1 | same mount root cause | **FINISH** (AUDIT-MESH-1) |
+| Mesh Storage | `mackesd mesh-fs-status` | `master_reachable:true, peers:[], goal:0` | chunkservers/goal/usage not reported | **FINISH** (AUDIT-MESH-3) |
+| Mesh Control | `action/nebula/self-node` | `overlay_ip:"", mesh_id:""` | self-node responder leaves overlay_ip/mesh_id blank | **FINISH** (AUDIT-MESH-2) |
+| Routing | `mackesd validate status` | `{run_id:null}` | empty until a manual run | **FINISH** (AUDIT-MESH-5) |
+| Discovered Hosts | `mackesd` probe (nmap) | nmap was absent → empty | nmap not a hard RPM dep | **FINISH** (AUDIT-MESH-6) |
+| Music | `action/music/get-state` | empty | musicd serves no parseable state when idle/unconfigured | **FINISH** (AUDIT-MESH-4) |
+| Connected Devices | `action/connect/devices` | `[]` | no paired devices (by-design unless KDC down) | OK (verify) |
+| Message Bus | `mde-bus` (dnd + activity) | `dnd ok` | works | OK |
+| nebula list-peers (mde-files) | `action/nebula/list-peers` | host=peers · .13 was `[]` | same mount root cause | **FINISH** (AUDIT-MESH-1) |
+| Mesh Federation / Registration / Mesh Join / Mesh Pending | `mackesd`/`mde-bus` actions | action surfaces (not data reads) | n/a | OK |
+
+**Root cause of "many panels return no data":** AUDIT-MESH-1 — the workgroup
+mount (`/mnt/mesh-storage`) was missing on .13, so every directory/DNS/storage
+read saw a local 1-record dir. Fixed live on .13 (directory now returns 4). The
+durable fix (mount on every node, boot-durable, fail-loud watchdog) + the
+code-level findings (2–6) are worklist items for the next release.
