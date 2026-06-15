@@ -628,7 +628,7 @@ A professional, themed, desktop-wide notification center replacing the Cosmic tr
     - [ ] collapsible per-source groups; rows show ts/severity/host/title/body + BUS-2.7 action buttons
     - [ ] mark-read / clear-all / mark-all-read work and persist
     - [ ] renders through `mde-theme` tokens + density (matches Workbench); `cargo test -p mde-notify` green
-- [ ] **NOTIFY-4: the transient toast layer (DND-aware visual effects).**
+- [✓] **NOTIFY-4: the transient toast layer (DND-aware visual effects).** New `mde-notify-toast` bin — a Top-layer, non-interactive, non-exclusive layer-shell surface anchored top-right. Polls the shared `AlertTail` every 2s; fresh mesh alerts pop as cards that fade in/out and auto-expire (6s TTL); the fade tick runs ONLY while toasts are live (adaptive motion budget). DND-aware via `mde_bus::dnd` (Critical bypasses, ordinary suppressed — center still records); `Source::DesktopApp`/`fdo/*` never double-toasted. Autostart `.desktop` (Workstation-rank gated) + RPM asset added. 5 pure tests (should_toast/prune/alpha) + clippy clean.
   **As** an operator,
   **I want** new alerts to slide/fade in as transient toasts that auto-expire,
   **so that** I'm interrupted only for live events and only when DND allows.

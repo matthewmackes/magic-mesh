@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Magic Mesh Notification Toasts
+Comment=Transient top-right toast layer for new mesh alerts (NOTIFY-4); DND-aware; Workstation-rank gated — Servers/Lighthouses are headless
+Exec=sh -c "mackesd role-gate --min-rank 2 && exec mde-notify-toast"
+Icon=magic-mesh
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
