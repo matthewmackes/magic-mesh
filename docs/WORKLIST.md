@@ -599,3 +599,65 @@ Live testing on .13 surfaced a run of empty panels — all four classes of subst
 - [✓] **SUBAUDIT-C2: probe — surface up-but-no-open-curated-port hosts** so Discovered Hosts lists reachable peers even when no scanned service is open (fast_argv uses `--open`; add a host-discovery pass / host element for up hosts). Plumbing now works (nmap declared+installed, targets from nebula-bundle.json, inventory written).
 - [>] **SUBAUDIT-D1: https-tunnel — panel now reports the in-process capability honestly (active wherever mackesd runs; :443 probe confirms the relay).** FOLLOW-UP: no node has /etc/nebula/lighthouse.crt, so the :443 relay listener never binds — make it self-bootstrap a self-signed TLS cert on public/lighthouse nodes so the relay actually runs by default (guard the :443 bind against crash-loops; do NOT bind on NAT'd workstations like .13).
 - [✓] **SUBAUDIT-D2: Hardware panel — root-cause the empty per-peer hardware probe (data-source or worker-not-running).**
+
+### NOTIFY — MDE-Notification-Hub (design: `docs/design/mde-notification-hub.md`, 2026-06-14)
+A professional, themed, desktop-wide notification center replacing the Cosmic tray for mesh + desktop alerts. Locks (operator survey): standalone center + toasts (new `crates/services/mde-notify`); render the bus, don't own FDO; group by source, color by severity; configurable per-group sound packs; all effects DND-aware. The Carbon look (§4) + no-stub reachability (§7) gate every task.
+- [ ] **NOTIFY-1: scaffold the `mde-notify` shared crate — bus tail + AlertItem model.**
+  **As** a mesh operator,
+  **I want** a library that tails the live bus alert lanes into a typed, deduped alert stream,
+  **so that** every notification surface reads one source of truth (no demo data).
+  **Acceptance** (runtime-observable):
+    - [ ] `crates/services/mde-notify` is a workspace member; `cargo test -p mde-notify` runs
+    - [ ] tails `fdo/*`, `peer/*/alerts`, `fleet/sec`, `event/firewall/*`, `compute/event/*`, presence + `mackesd::alert` lanes via `Persist::list_since` with a per-lane cursor
+    - [ ] bus root resolves through `mde_bus::client_data_dir()` (reaches the live system bus)
+    - [ ] `AlertItem` populated from real bus messages; dedup by ULID; retention horizon honored
+- [ ] **NOTIFY-2: severity + source classifier (the grouping + color engine).**
+  **As** an operator triaging alerts,
+  **I want** each alert classified to a Severity and a Source from its topic + payload,
+  **so that** the table can group by source and color by severity deterministically.
+  **Acceptance**:
+    - [ ] one classifier fn maps topic prefix → Source (Security/Presence/Firewall/Compute/DesktopApp/Peer/System)
+    - [ ] severity derives from the alert `severity` field AND/OR bus `Priority`; unit-tested both ways
+    - [ ] severity→`mde_theme::Palette` token map (danger/warning/accent/success) — no raw hex (§4 lint clean)
+- [ ] **NOTIFY-3: the standalone center — layer-shell slide-out table view.**
+  **As** a Cosmic desktop user,
+  **I want** a themed slide-out center listing alerts grouped by source with severity color + glyphs,
+  **so that** I can see the full alert history regardless of whether the Workbench is open.
+  **Acceptance**:
+    - [ ] `mde-notify-center` binary opens an Overlay-layer slide-out (the `mde-mesh-wallpaper` layer-shell pattern)
+    - [ ] collapsible per-source groups; rows show ts/severity/host/title/body + BUS-2.7 action buttons
+    - [ ] mark-read / clear-all / mark-all-read work and persist
+    - [ ] renders through `mde-theme` tokens + density (matches Workbench); `cargo test -p mde-notify` green
+- [ ] **NOTIFY-4: the transient toast layer (DND-aware visual effects).**
+  **As** an operator,
+  **I want** new alerts to slide/fade in as transient toasts that auto-expire,
+  **so that** I'm interrupted only for live events and only when DND allows.
+  **Acceptance**:
+    - [ ] a Top-layer, non-interactive toast surface renders new alerts within one poll cycle of a real bus publish
+    - [ ] animation style (slide/fade/none) is honored; adaptive-budget (motion only on events)
+    - [ ] toasts suppressed when `mde_bus::dnd` is active (unless `override=dnd`); the center still records the alert
+    - [ ] mesh alerts toast by default; `fdo/*` app notifications shown in the center, not double-toasted
+- [ ] **NOTIFY-5: per-group sound packs (DND-aware audio effects).**
+  **As** an operator,
+  **I want** distinct, configurable sounds per group/severity,
+  **so that** I can recognize an alert class by ear without looking.
+  **Acceptance**:
+    - [ ] ≥2 bundled OGG sound packs under `/usr/share/mde/sounds/<pack>/<severity>.ogg` (CC0/self-authored; in NOTICE)
+    - [ ] `cpal`+`symphonia` player plays the configured pack per severity; `paplay` fallback
+    - [ ] per-group enable/mute + pack selection persist; silent under DND (unless `override=dnd`)
+- [ ] **NOTIFY-6: settings — fold the Workbench notifications panel into the Hub.**
+  **As** an operator,
+  **I want** one settings surface for DND, placement, expire-ms, per-group sound + animation + retention,
+  **so that** there is no duplicate/contradictory notification state.
+  **Acceptance**:
+    - [ ] one settings sidecar single-sources DND/placement/expire-ms + the new per-group settings
+    - [ ] the Workbench `notifications.rs` panel deep-links into the Hub settings (or is retired) — no duplicate state
+    - [ ] settings round-trip across a restart (test-covered)
+- [ ] **NOTIFY-7: applet integration — bell pip + unread count + toggle.**
+  **As** a Cosmic user,
+  **I want** a panel bell that shows unread count and opens the center,
+  **so that** the Hub is reachable from the panel like the Cosmic tray it replaces.
+  **Acceptance**:
+    - [ ] `mde-cosmic-applet` gains a bell/quick action that toggles `mde-notify-center`
+    - [ ] the pip/badge reflects unread count from the shared model; badge pulse on new (DND-aware)
+    - [ ] center autostart `.desktop` ships in the RPM (role-gated to Workstation rank, like the wallpaper)
