@@ -103,6 +103,14 @@ fi
 if [ "$DO_CLIENT" = 1 ]; then
   log "QNM-Shared client mount at $QNM_PATH -> $MASTER_IP"
   command -v mfsmount >/dev/null || { echo "mfsmount missing (install lizardfs-client; F44: the F43 client RPM)"; exit 1; }
+  # AUDIT-MESH-12 — the Mesh Storage panel shells `lizardfs-admin
+  # list-chunkservers <vip> 9421 --porcelain` (mackesd's mesh-fs-status, the
+  # LizardFS admin CLI, NOT MooseFS mfsadmin). It ships in `lizardfs-adm`, which
+  # like lizardfs-client is absent from the F44 base repos — install the F43
+  # `lizardfs-adm` RPM out-of-band on F44 (the fc43 binary runs on F44). Warn,
+  # don't fail: the mount itself works without it, only the storage panel needs it.
+  command -v lizardfs-admin >/dev/null || \
+    log "WARN: lizardfs-admin missing — Mesh Storage panel can't query the master (install lizardfs-adm; F44: the F43 lizardfs-adm RPM)"
   echo "$MASTER_IP" > /etc/mackesd-qnm-master 2>/dev/null || true
   # allow_other lets the uid-1000 desktop GUIs read the root-owned FUSE mount;
   # it requires user_allow_other in /etc/fuse.conf. Enable it idempotently.
