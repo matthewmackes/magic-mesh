@@ -308,7 +308,7 @@ fn bus_root() -> Option<PathBuf> {
     // share) via the canonical resolver — was a per-HOME path that read an
     // empty ~/.local/share/mde/bus while all real traffic landed on
     // /run/mde-bus, so the panel showed no activity.
-    mde_bus::default_data_dir()
+    mde_bus::client_data_dir()
 }
 
 /// Walk `bus_root()` (BFS, depth ≤ 4) and return one

@@ -496,7 +496,7 @@ pub fn directory_event_subscription() -> cosmic::iced::Subscription<crate::Messa
 /// reacts to changes published *after* it starts.
 async fn dir_event_cursor_init() -> Option<String> {
     tokio::task::spawn_blocking(|| {
-        let dir = mde_bus::default_data_dir()?;
+        let dir = mde_bus::client_data_dir()?;
         let persist = mde_bus::persist::Persist::open(dir).ok()?;
         persist
             .list_since(DIRECTORY_EVENT_TOPIC, None)
@@ -513,7 +513,7 @@ async fn dir_event_cursor_init() -> Option<String> {
 /// the advanced cursor. Bus unavailable → no events, cursor unchanged.
 async fn dir_event_poll(cursor: Option<String>) -> (usize, Option<String>) {
     tokio::task::spawn_blocking(move || {
-        let Some(dir) = mde_bus::default_data_dir() else {
+        let Some(dir) = mde_bus::client_data_dir() else {
             return (0, cursor);
         };
         let Ok(persist) = mde_bus::persist::Persist::open(dir) else {
@@ -921,7 +921,7 @@ impl PeersPanel {
                 Task::perform(
                     async move {
                         let _ = tokio::task::spawn_blocking(move || {
-                            if let Some(dir) = mde_bus::default_data_dir() {
+                            if let Some(dir) = mde_bus::client_data_dir() {
                                 if let Ok(p) = mde_bus::persist::Persist::open(dir) {
                                     let _ = p.write(
                                         "action/voice/dial",

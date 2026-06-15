@@ -177,7 +177,7 @@ fn federation_data_root() -> Option<PathBuf> {
     // SUBAUDIT-B2 — honor MDE_BUS_ROOT (the shared /run/mde-bus spool the
     // daemon writes federation state into) via the canonical resolver;
     // was a per-HOME path that read an empty ~/.local/share/mde/bus.
-    mde_bus::default_data_dir()
+    mde_bus::client_data_dir()
 }
 
 async fn mint_passcode() -> Result<MintJsonOutput, String> {

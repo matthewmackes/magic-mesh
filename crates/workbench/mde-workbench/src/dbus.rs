@@ -85,7 +85,7 @@ pub fn action_request_with_body(
     body: Option<&str>,
     timeout: Duration,
 ) -> Option<String> {
-    let bus_dir = mde_bus::default_data_dir()?;
+    let bus_dir = mde_bus::client_data_dir()?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -108,7 +108,7 @@ pub fn action_request_with_body(
 /// responder costs one db write, not a timeout. Returns `true` on a
 /// successful enqueue.
 pub fn action_publish(topic: &str, body: &str) -> bool {
-    let Some(bus_dir) = mde_bus::default_data_dir() else {
+    let Some(bus_dir) = mde_bus::client_data_dir() else {
         return false;
     };
     let Ok(persist) = Persist::open(bus_dir) else {

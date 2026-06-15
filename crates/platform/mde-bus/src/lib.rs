@@ -62,3 +62,41 @@ pub fn default_data_dir() -> Option<std::path::PathBuf> {
     }
     dirs::data_dir().map(|d| d.join("mde").join("bus"))
 }
+
+/// The canonical RPM-managed shared bus spool the system `mackesd` daemon
+/// and its responders run on (mirrors `MDE_BUS_ROOT` in `mackesd.service` +
+/// `environment.d`). A sticky 1777 runtime dir over a 0666 `index.sqlite`,
+/// so the uid-1000 desktop GUIs can read/write it without being root.
+pub const SYSTEM_BUS_ROOT: &str = "/run/mde-bus";
+
+/// Bus spool a **desktop GUI client** (workbench / applet) should use to
+/// reach the local `mackesd` responders. Resolution order:
+///
+///   1. `MDE_BUS_ROOT` when set (the explicit pin — honored everywhere);
+///   2. else the live [`SYSTEM_BUS_ROOT`] when its `index.sqlite` exists —
+///      i.e. a system `mackesd` is running on this box;
+///   3. else the per-HOME [`default_data_dir`] (no system daemon — a dev
+///      tree or a standalone GUI).
+///
+/// SUBAUDIT — why this exists over [`default_data_dir`]: `environment.d`
+/// only seeds `MDE_BUS_ROOT` into sessions that *log in after* the RPM
+/// drops the file. A Cosmic session already running at upgrade time keeps
+/// the old (empty) env, so the GUI silently falls back to its per-HOME
+/// spool while `mackesd` answers on `/run/mde-bus` — every request/reply
+/// then times out as "mde host worker not responding". Preferring the live
+/// system bus makes the GUI robust to that session-env staleness instead of
+/// depending on a re-login. Daemon-side code keeps [`default_data_dir`]
+/// (it always has the explicit env pin), and step 2 is gated on the file
+/// existing so test/headless contexts (no system bus) still get the
+/// per-HOME path.
+#[must_use]
+pub fn client_data_dir() -> Option<std::path::PathBuf> {
+    if let Some(root) = std::env::var_os("MDE_BUS_ROOT") {
+        return Some(std::path::PathBuf::from(root));
+    }
+    let system = std::path::Path::new(SYSTEM_BUS_ROOT);
+    if system.join("index.sqlite").exists() {
+        return Some(system.to_path_buf());
+    }
+    dirs::data_dir().map(|d| d.join("mde").join("bus"))
+}

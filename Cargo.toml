@@ -49,7 +49,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "10.0.2"
+version      = "10.0.3"
 edition      = "2021"
 # EFF-33 — the MSRV floor, enforced by CI (every ci.yml job builds the
 # full workspace on pinned 1.85). The dev/build ceiling (1.94, the

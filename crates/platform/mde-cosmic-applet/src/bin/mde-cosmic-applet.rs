@@ -48,6 +48,8 @@ enum Message {
     /// libcosmic popup lifecycle.
     PopupClosed(Id),
     Surface(cosmic::surface::Action),
+    /// An off-thread bus publish completed — nothing to render.
+    Noop,
 }
 
 /// Shell `mackesd peers --json` and derive the pip. Any failure
@@ -76,24 +78,20 @@ fn pip_icon(pip: Pip) -> &'static str {
     }
 }
 
-/// Fire a quick action's side effect: publish its Bus verb, or spawn the
-/// Workbench at its deep-link slug. Exactly one of the two per action
-/// (the lib guarantees `bus XOR link`).
-fn fire(action: QuickAction) {
-    if let Some(topic) = action_bus_topic(action) {
-        if let Some(dir) = mde_bus::default_data_dir() {
-            if let Ok(persist) = mde_bus::persist::Persist::open(dir) {
-                let _ = persist.write(
-                    topic,
-                    mde_bus::hooks::config::Priority::Default,
-                    None,
-                    Some("{}"),
-                );
-            }
-        }
-    } else if let Some(argv) = launch_argv(action) {
-        if let Some((cmd, args)) = argv.split_first() {
-            let _ = std::process::Command::new(cmd).args(args).spawn();
+/// Synchronously publish a quick action's Bus verb. BLOCKING — opens the
+/// (multi-MB) system `index.sqlite` and writes one message, so callers MUST
+/// run it off the UI thread (see the `Message::Action` arm). Factored out of
+/// the old `fire()` so the popup can close instantly while this runs in a
+/// `spawn_blocking` task.
+fn publish_action(topic: &'static str) {
+    if let Some(dir) = mde_bus::client_data_dir() {
+        if let Ok(persist) = mde_bus::persist::Persist::open(dir) {
+            let _ = persist.write(
+                topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some("{}"),
+            );
         }
     }
 }
@@ -140,14 +138,37 @@ impl Application for Applet {
             }
             Message::PipLoaded(pip) => self.pip = pip,
             Message::Action(action) => {
-                fire(action);
-                // Close the popover after acting.
-                if let Some(id) = self.popup.take() {
-                    return cosmic::task::message(cosmic::Action::Cosmic(
-                        cosmic::app::Action::Surface(destroy_popup(id)),
-                    ));
+                // SUBAUDIT — close the popover IMMEDIATELY so the click feels
+                // instant. The old path ran the Bus write (`Persist::open` on
+                // the multi-MB system `index.sqlite`) synchronously on the
+                // SingleThreadExecutor, freezing the applet for seconds per
+                // click. Now the popup closes first and the publish (or the
+                // Workbench launch) runs off the UI thread.
+                let close: Task<Message> = if let Some(id) = self.popup.take() {
+                    cosmic::task::message(cosmic::Action::Cosmic(cosmic::app::Action::Surface(
+                        destroy_popup(id),
+                    )))
+                } else {
+                    Task::none()
+                };
+                if let Some(topic) = action_bus_topic(action) {
+                    let write = Task::perform(
+                        async move {
+                            let _ =
+                                tokio::task::spawn_blocking(move || publish_action(topic)).await;
+                        },
+                        |()| cosmic::Action::App(Message::Noop),
+                    );
+                    return Task::batch([close, write]);
+                } else if let Some(argv) = launch_argv(action) {
+                    // Process spawn is already non-blocking (fire-and-forget).
+                    if let Some((cmd, args)) = argv.split_first() {
+                        let _ = std::process::Command::new(cmd).args(args).spawn();
+                    }
                 }
+                return close;
             }
+            Message::Noop => {}
             Message::PopupClosed(id) => {
                 if self.popup.as_ref() == Some(&id) {
                     self.popup = None;

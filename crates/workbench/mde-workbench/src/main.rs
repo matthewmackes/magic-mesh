@@ -114,7 +114,7 @@ fn main() -> ExitCode {
 fn hand_off_to_running(runtime: &tokio::runtime::Runtime, focus: &Option<String>) -> ExitCode {
     let slug = focus.clone().unwrap_or_default();
     info!(%slug, "primary workbench already running — handing off focus over the Bus");
-    let Some(bus_root) = mde_bus::default_data_dir() else {
+    let Some(bus_root) = mde_bus::client_data_dir() else {
         error!("no Bus data dir; cannot hand off focus");
         return ExitCode::from(2);
     };
@@ -152,7 +152,7 @@ fn start_primary_focus_responder() -> Result<(), ()> {
     std::thread::Builder::new()
         .name("workbench-focus-bus".into())
         .spawn(|| {
-            let Some(bus_root) = mde_bus::default_data_dir() else {
+            let Some(bus_root) = mde_bus::client_data_dir() else {
                 error!("workbench focus responder: no Bus data dir; --focus hand-off unavailable");
                 return;
             };

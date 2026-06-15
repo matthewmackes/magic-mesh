@@ -977,7 +977,7 @@ async fn probe_voice() -> ProbeOutcome {
 /// Latest retained body on `state/voice/status`, or `None` when the topic
 /// is empty / the Bus is unavailable.
 fn read_voice_status() -> Option<String> {
-    let dir = mde_bus::default_data_dir()?;
+    let dir = mde_bus::client_data_dir()?;
     let persist = mde_bus::persist::Persist::open(dir).ok()?;
     let msgs = persist.list_since(VOICE_STATUS_TOPIC, None).ok()?;
     msgs.last().and_then(|m| m.body.clone())
@@ -1705,7 +1705,7 @@ pub fn nebula_event_subscription() -> cosmic::iced::Subscription<crate::Message>
 /// still "new since we started").
 async fn nebula_event_cursor_init() -> Option<String> {
     tokio::task::spawn_blocking(|| {
-        let dir = mde_bus::default_data_dir()?;
+        let dir = mde_bus::client_data_dir()?;
         let persist = mde_bus::persist::Persist::open(dir).ok()?;
         let msgs = persist.list_since(NEBULA_EVENT_TOPIC, None).ok()?;
         msgs.last().map(|m| m.ulid.clone())
@@ -1721,7 +1721,7 @@ async fn nebula_event_cursor_init() -> Option<String> {
 async fn nebula_poll_events(cursor: Option<String>) -> (Vec<DbusEvent>, Option<String>) {
     let fallback = cursor.clone();
     tokio::task::spawn_blocking(move || {
-        let Some(dir) = mde_bus::default_data_dir() else {
+        let Some(dir) = mde_bus::client_data_dir() else {
             return (Vec::new(), cursor);
         };
         let Ok(persist) = mde_bus::persist::Persist::open(dir) else {

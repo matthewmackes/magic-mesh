@@ -174,23 +174,27 @@ fn spawn_enroll(token: JoinToken) -> mpsc::Receiver<EnrollMsg> {
         };
 
         let _ = tx.send(EnrollMsg::Step(Step::Connect));
-        let bundle = match runtime.block_on(mackesd_core::nebula_enroll_client::enroll_over_network(
-            &lighthouse,
-            port,
-            &fp,
-            &csr_json,
-        )) {
-            Ok(b) => b,
-            Err(e) => {
-                let _ = tx.send(EnrollMsg::Failed(e.to_string()));
-                return;
-            }
-        };
+        let bundle =
+            match runtime.block_on(mackesd_core::nebula_enroll_client::enroll_over_network(
+                &lighthouse,
+                port,
+                &fp,
+                &csr_json,
+            )) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = tx.send(EnrollMsg::Failed(e.to_string()));
+                    return;
+                }
+            };
         let _ = tx.send(EnrollMsg::Step(Step::Receive));
 
-        if let Err(e) =
-            mackesd_core::nebula_enroll_client::persist_bundle(&root, &config_dir, &node_id, &bundle)
-        {
+        if let Err(e) = mackesd_core::nebula_enroll_client::persist_bundle(
+            &root,
+            &config_dir,
+            &node_id,
+            &bundle,
+        ) {
             let _ = tx.send(EnrollMsg::Failed(e.to_string()));
             return;
         }
@@ -274,7 +278,11 @@ fn render_title(f: &mut Frame, area: Rect) {
 }
 
 fn render_field(f: &mut Frame, area: Rect, label: &str, value: &str, focused: bool) {
-    let border = if focused { Color::Cyan } else { Color::DarkGray };
+    let border = if focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
     let shown = if focused {
         format!("{value}\u{2588}") // block cursor
     } else {
@@ -303,33 +311,33 @@ fn render_steps(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(step.label(), Style::default().fg(color)),
         ]));
     }
-    let p = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title("Progress"));
+    let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Progress"));
     f.render_widget(p, area);
 }
 
 fn render_status(f: &mut Frame, area: Rect, app: &App) {
     let (text, style) = match app.phase {
         Phase::Editing => (
-            app.error.clone().unwrap_or_else(|| {
-                "Paste the token, then press Enter to join.".to_string()
-            }),
+            app.error
+                .clone()
+                .unwrap_or_else(|| "Paste the token, then press Enter to join.".to_string()),
             if app.error.is_some() {
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Gray)
             },
         ),
-        Phase::Enrolling => (
-            "Enrolling…".to_string(),
-            Style::default().fg(Color::Yellow),
-        ),
+        Phase::Enrolling => ("Enrolling…".to_string(), Style::default().fg(Color::Yellow)),
         Phase::Done => (
             app.outcome.clone().unwrap_or_else(|| "Done.".to_string()),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         ),
         Phase::Failed => (
-            app.error.clone().unwrap_or_else(|| "Enrollment failed.".to_string()),
+            app.error
+                .clone()
+                .unwrap_or_else(|| "Enrollment failed.".to_string()),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
     };
