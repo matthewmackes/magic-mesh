@@ -661,3 +661,16 @@ A professional, themed, desktop-wide notification center replacing the Cosmic tr
     - [ ] `mde-cosmic-applet` gains a bell/quick action that toggles `mde-notify-center`
     - [ ] the pip/badge reflects unread count from the shared model; badge pulse on new (DND-aware)
     - [ ] center autostart `.desktop` ships in the RPM (role-gated to Workstation rank, like the wallpaper)
+
+### PEERS-DT — Peers page as a Carbon data table (design: `docs/design/peers-data-table.md`, 2026-06-15)
+Operator-locked (5-Q survey): flat + sortable table (status as a colored tag column), columns Name·Status·Role·Overlay IP·Latency·Services·Last seen, single-select with **Carbon expandable rows** (inline actions/details, replacing the side panel), toolbar = Search + Refresh only. All color via mde-theme tokens (§4).
+- [ ] **PEERS-DT-1: flat sortable Carbon data table.**
+  **As** a mesh operator, **I want** the Peers list as one flat sortable table with a Status tag column, **so that** I can sort/scan all peers uniformly.
+  **Acceptance:** one flat table (no group sections); sortable headers (default Status→Name); rows from the live directory; status tags + accents are mde-theme tokens; cargo test -p mde-workbench green.
+- [ ] **PEERS-DT-2: columns Name·Status·Role·Overlay IP·Latency·Services·Last seen.**
+  **Acceptance:** each column populated from the directory + latency cache + service set; empty/unknown render honestly (—).
+- [ ] **PEERS-DT-3: Carbon expandable rows (replace the side detail panel).**
+  **As** an operator, **I want** a row to expand inline to its actions + details, **so that** Ring/Send-file/Open/lifecycle + battery/presence live under the row (no separate panel).
+  **Acceptance:** chevron expands/collapses a row; expanded content carries every action the old detail panel had (incl. KDC actions for device rows); exactly one detail mechanism remains.
+- [ ] **PEERS-DT-4: toolbar = Search + Refresh.**
+  **Acceptance:** the existing filter becomes the Carbon search (name/role/IP/service); Refresh re-pulls; no add-peer/density/column-config.
