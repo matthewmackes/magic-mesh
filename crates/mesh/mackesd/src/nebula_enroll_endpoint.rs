@@ -99,6 +99,21 @@ pub fn generate_endpoint_identity(sans: &[String]) -> Result<EndpointIdentity, S
     })
 }
 
+/// SETUP-5 — the SHA-256 fingerprint of the FIRST certificate in a PEM blob,
+/// as lowercase hex — the value a v3 join token pins as `?fp=`. Used by
+/// `mackesd add-peer` to re-express a fresh bearer as a v3 token against the
+/// lighthouse's already-on-disk `/enroll` endpoint cert. Returns `None` when
+/// the PEM holds no certificate.
+#[must_use]
+pub fn endpoint_fingerprint_from_pem(cert_pem: &[u8]) -> Option<String> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::CertificateDer;
+    let der = CertificateDer::pem_slice_iter(cert_pem)
+        .next()?
+        .ok()?;
+    Some(fingerprint(&der))
+}
+
 /// SUBAUDIT-D1 — ensure a self-signed TLS cert+key pair exists at the given
 /// paths, generating one if absent. Returns `Ok(true)` when a usable pair is
 /// present afterwards (pre-existing or freshly written), `Ok(false)` only on a
@@ -407,6 +422,21 @@ mod tests {
             cert_bytes,
             "cert must not be re-minted"
         );
+    }
+
+    #[test]
+    fn endpoint_fingerprint_from_pem_matches_generated_identity() {
+        // SETUP-5: re-reading an endpoint cert's PEM yields the same fingerprint
+        // the identity reported at mint time (so add-peer pins the right fp).
+        let id = generate_endpoint_identity(&["203.0.113.5".to_string()]).expect("gen");
+        let fp = endpoint_fingerprint_from_pem(id.cert_pem.as_bytes()).expect("fp");
+        assert_eq!(fp, id.fingerprint);
+        assert_eq!(fp.len(), 64);
+    }
+
+    #[test]
+    fn endpoint_fingerprint_from_pem_none_without_a_cert() {
+        assert!(endpoint_fingerprint_from_pem(b"not a pem").is_none());
     }
 
     #[test]

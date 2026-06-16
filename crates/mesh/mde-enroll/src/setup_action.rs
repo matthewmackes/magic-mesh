@@ -68,6 +68,29 @@ pub fn peers_argv() -> Vec<String> {
     vec!["mackesd".to_owned(), "peers".to_owned()]
 }
 
+/// `mackesd add-peer --role <role>` — mint a single-use v3 join token for a new
+/// peer (SETUP-5) or a second/third lighthouse (SETUP-4, `--role lighthouse`).
+/// mesh-id + the endpoint fingerprint are sourced by the verb itself.
+#[must_use]
+pub fn add_peer_argv(role: SetupRole) -> Vec<String> {
+    vec![
+        "mackesd".to_owned(),
+        "add-peer".to_owned(),
+        "--role".to_owned(),
+        role.as_arg().to_owned(),
+    ]
+}
+
+/// `mackesd remove-peer <node-id>` — decommission + revoke + ban a peer (SETUP-5).
+#[must_use]
+pub fn remove_peer_argv(node_id: &str) -> Vec<String> {
+    vec![
+        "mackesd".to_owned(),
+        "remove-peer".to_owned(),
+        node_id.to_owned(),
+    ]
+}
+
 /// `systemctl is-active <unit>` — used by the Status screen to report each
 /// service's state without a privileged call.
 #[must_use]
@@ -153,6 +176,18 @@ mod tests {
     #[test]
     fn peers_shape() {
         assert_eq!(peers_argv(), vec!["mackesd", "peers"]);
+    }
+
+    #[test]
+    fn add_and_remove_peer_shapes() {
+        assert_eq!(
+            add_peer_argv(SetupRole::Lighthouse),
+            vec!["mackesd", "add-peer", "--role", "lighthouse"]
+        );
+        assert_eq!(
+            remove_peer_argv("peer:anvil"),
+            vec!["mackesd", "remove-peer", "peer:anvil"]
+        );
     }
 
     #[test]

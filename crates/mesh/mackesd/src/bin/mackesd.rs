@@ -648,6 +648,37 @@ enum Cmd {
         note: String,
     },
 
+    /// SETUP-4/5 — mint a single-use **v3** join token for a new peer (or a
+    /// second/third lighthouse) on THIS lighthouse, pinning the `/enroll`
+    /// endpoint cert fingerprint so the joining box can use the network path.
+    /// mesh-id is read from the local founding bundle. Prints the
+    /// ready-to-paste token + a `magic-setup`/`mackesd join` line.
+    AddPeer {
+        /// Role the new peer will pin (lighthouse|server|workstation).
+        #[arg(long, default_value = "workstation")]
+        role: String,
+        /// Operator note recorded beside the issued bearer hash.
+        #[arg(long, default_value = "")]
+        note: String,
+        /// Public address the joining box dials (`ip` or `ip:port`).
+        /// Defaults to this lighthouse's detected primary IPv4.
+        #[arg(long)]
+        lighthouse: Option<String>,
+        /// Override the `/enroll` HTTPS port the token advertises.
+        #[arg(long)]
+        enroll_port: Option<u16>,
+    },
+
+    /// SETUP-5 — remove a peer: decommission its directory row, revoke its
+    /// cert, and ban its node-id from re-enrolling. The inverse of `add-peer`.
+    RemovePeer {
+        /// The peer's node-id (`peer:<host>`), as shown by `mackesd peers`.
+        node_id: String,
+        /// Proceed even when the peer is unreachable.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// ONBOARD-4 — **the Magic founding verb.** Stand up THIS box as
     /// the mesh's first lighthouse in one command: mesh-init (pin role,
     /// mint CA, self-sign, write bundle), generate the self-signed
@@ -3675,6 +3706,17 @@ fn main() -> anyhow::Result<()> {
                 "single-use token minted (ENT-1) — run on the joining box:\n  mackesd enroll --token 'mesh:{mesh_id}@{lh}#{bearer}'"
             );
             return Ok(());
+        }
+        Cmd::AddPeer {
+            role,
+            note,
+            lighthouse,
+            enroll_port,
+        } => {
+            return cmd_add_peer(&role, &note, lighthouse, enroll_port);
+        }
+        Cmd::RemovePeer { node_id, force } => {
+            return cmd_remove_peer(&db_path, &node_id, force);
         }
         Cmd::Found {
             mesh_id,
@@ -7058,6 +7100,103 @@ fn detect_primary_ipv4() -> anyhow::Result<String> {
 
 /// ONBOARD-4 — the `found` verb. One-command founding lighthouse:
 /// mesh-init + `/enroll` endpoint identity + a v3 join line.
+/// SETUP-4/5 — mint a single-use v3 join token for a new peer/lighthouse on
+/// THIS lighthouse. Reads the mesh-id from the local founding bundle and the
+/// `?fp=` from the on-disk `/enroll` endpoint cert, mints a fresh bearer, and
+/// prints the ready-to-paste token + join line. `role` only shapes the printed
+/// guidance (the joining box pins its own role); add-lighthouse is `--role
+/// lighthouse`.
+fn cmd_add_peer(
+    role: &str,
+    note: &str,
+    lighthouse: Option<String>,
+    enroll_port: Option<u16>,
+) -> anyhow::Result<()> {
+    let parsed: mde_role::Role = role.parse().map_err(|_| {
+        anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
+    })?;
+    let root = mackesd_core::default_qnm_shared_root();
+    let node_id = default_node_id();
+
+    // mesh-id comes from the founding bundle this lighthouse wrote at `found`.
+    let bpath = mackesd_core::ca::bundle::bundle_path(&root, &node_id);
+    let bundle = mackesd_core::ca::bundle::read_bundle(&bpath).map_err(|e| {
+        anyhow::anyhow!(
+            "reading the founding bundle {} — is this a founded lighthouse? ({e})",
+            bpath.display()
+        )
+    })?;
+
+    // Pin the on-disk /enroll endpoint cert fingerprint (the v3 contract).
+    let cert_path = mackesd_core::workers::nebula_enroll_listener::DEFAULT_CERT_PATH;
+    let cert_pem = std::fs::read(cert_path)
+        .map_err(|e| anyhow::anyhow!("reading the /enroll endpoint cert {cert_path}: {e}"))?;
+    let fp = mackesd_core::nebula_enroll_endpoint::endpoint_fingerprint_from_pem(&cert_pem)
+        .ok_or_else(|| anyhow::anyhow!("no certificate in {cert_path}"))?;
+
+    // Public address the joining box dials (strip any :port; detect if absent).
+    let ip = match lighthouse {
+        Some(l) => l
+            .rsplit_once(':')
+            .map_or(l.as_str(), |(h, _)| h)
+            .to_string(),
+        None => detect_primary_ipv4()?,
+    };
+    let port = enroll_port.unwrap_or(mackesd_core::nebula_enroll_endpoint::DEFAULT_ENROLL_PORT);
+
+    let bearer = mackesd_core::bearer_ledger::issue(&root, note)
+        .map_err(|e| anyhow::anyhow!("minting bearer: {e}"))?;
+    let token = mackesd_core::nebula_enroll::JoinToken {
+        mesh_id: bundle.mesh_id,
+        lighthouse: ip,
+        port,
+        bearer,
+        fp: Some(fp),
+    }
+    .encode();
+
+    println!("{token}");
+    eprintln!(
+        "single-use v3 token minted (SETUP-5) for a {} — run on the joining box:\n  \
+         magic-setup   (Join → paste it)\n  or:  mackesd join '{token}' --role {}",
+        parsed.as_str(),
+        parsed.as_str()
+    );
+    Ok(())
+}
+
+/// SETUP-5 — remove a peer: decommission its directory row, revoke its certs,
+/// and ban its node-id from re-enrolling (the inverse of `add-peer`). Proceeds
+/// with the revoke+ban even when no directory row matches, so a stale identity
+/// can still be locked out.
+fn cmd_remove_peer(db_path: &std::path::Path, node_id: &str, force: bool) -> anyhow::Result<()> {
+    let root = mackesd_core::default_qnm_shared_root();
+    let self_id = default_node_id();
+    let mut conn = mackesd_core::store::open(db_path)
+        .with_context(|| format!("opening store at {}", db_path.display()))?;
+    mackesd_core::store::migrate(&conn).context("migrating store")?;
+
+    let updated = mackesd_core::store::set_node_role(&conn, node_id, "decommissioned")?;
+    if updated == 0 {
+        eprintln!("mackesd remove-peer: no directory row for {node_id} — revoking + banning anyway");
+    }
+    let payload = serde_json::json!({
+        "kind":  if force { "forced" } else { "soft" },
+        "node":  node_id,
+        "event": "remove-peer",
+    })
+    .to_string();
+    mackesd_core::store::insert_event(&mut conn, "lifecycle", &self_id, &payload)?;
+
+    let rows = mackesd_core::ca::revoke::revoke_peer(&conn, &root, &self_id, node_id)
+        .context("revoking peer certs")?;
+    println!(
+        "removed '{node_id}': decommissioned ({updated} row), {rows} cert row(s) revoked, banned \
+         (propagates to every peer via QNM-Shared)."
+    );
+    Ok(())
+}
+
 fn cmd_found(
     db_path: &std::path::Path,
     mesh_id: &str,

@@ -29,7 +29,8 @@ use ratatui::{Frame, Terminal};
 
 use mde_enroll::setup::{Screen, Wizard};
 use mde_enroll::setup_action::{
-    found_argv, is_active_argv, join_argv, peers_argv, run_streaming, SetupRole, WIZARD_SERVICES,
+    add_peer_argv, found_argv, is_active_argv, join_argv, peers_argv, remove_peer_argv,
+    run_streaming, SetupRole, WIZARD_SERVICES,
 };
 
 /// The action screens that collect one input value before running a verb.
@@ -61,8 +62,10 @@ fn run(
     role: &mut SetupRole,
     input: &mut String,
 ) -> anyhow::Result<()> {
+    // Manage screen "type a node-id to remove" sub-mode.
+    let mut manage_removing = false;
     loop {
-        terminal.draw(|f| draw(f, wiz, *role, input))?;
+        terminal.draw(|f| draw(f, wiz, *role, input, manage_removing))?;
         if !event::poll(Duration::from_millis(200))? {
             continue;
         }
@@ -111,16 +114,41 @@ fn run(
                 }
                 _ => {}
             },
-            Screen::Status | Screen::Manage => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    wiz.back_to_menu();
+            Screen::Status => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => wiz.back_to_menu(),
+                KeyCode::Char('r') => run_status(wiz),
+                _ => {}
+            },
+            Screen::Manage if manage_removing => match key.code {
+                KeyCode::Esc => {
+                    manage_removing = false;
+                    input.clear();
                 }
-                KeyCode::Char('r') => {
-                    if wiz.screen == Screen::Status {
-                        run_status(wiz);
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Enter => {
+                    let target = input.trim().to_string();
+                    if target.is_empty() {
+                        wiz.push_log("(enter a node-id, e.g. peer:anvil)".to_string());
                     } else {
-                        run_peers(wiz);
+                        run_remove_peer(wiz, &target);
                     }
+                    manage_removing = false;
+                    input.clear();
+                }
+                KeyCode::Char(c) => input.push(c),
+                _ => {}
+            },
+            Screen::Manage => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => wiz.back_to_menu(),
+                KeyCode::Char('r') => run_peers(wiz),
+                KeyCode::Char('a') => run_add_peer(wiz, *role),
+                KeyCode::Char('l') => run_add_peer(wiz, SetupRole::Lighthouse),
+                KeyCode::Tab => *role = cycle_role(*role),
+                KeyCode::Char('d') => {
+                    manage_removing = true;
+                    input.clear();
                 }
                 _ => {}
             },
@@ -184,6 +212,39 @@ fn run_peers(wiz: &mut Wizard) {
     }
 }
 
+fn run_add_peer(wiz: &mut Wizard, role: SetupRole) {
+    wiz.push_log(format!(
+        "minting a single-use join token for a {}…",
+        role.as_arg()
+    ));
+    let mut lines = Vec::new();
+    let ok = run_streaming(&add_peer_argv(role), |l| lines.push(l));
+    for l in lines {
+        wiz.push_log(l);
+    }
+    if ok {
+        wiz.push_log(
+            "↑ paste that token into the new node's `magic-setup` Join screen.".to_string(),
+        );
+    } else {
+        wiz.push_log("✗ add-peer failed — is this a founded lighthouse?".to_string());
+    }
+}
+
+fn run_remove_peer(wiz: &mut Wizard, node_id: &str) {
+    wiz.push_log(format!("removing {node_id}…"));
+    let mut lines = Vec::new();
+    let ok = run_streaming(&remove_peer_argv(node_id), |l| lines.push(l));
+    for l in lines {
+        wiz.push_log(l);
+    }
+    wiz.push_log(if ok {
+        format!("✓ {node_id} removed (decommissioned + cert revoked + banned)")
+    } else {
+        format!("✗ remove {node_id} failed — see the log above")
+    });
+}
+
 fn run_status(wiz: &mut Wizard) {
     let role = mde_role::load()
         .map(|r| r.to_string())
@@ -198,7 +259,7 @@ fn run_status(wiz: &mut Wizard) {
 
 // ── render ──────────────────────────────────────────────────────────────────
 
-fn draw(f: &mut Frame, wiz: &Wizard, role: SetupRole, input: &str) {
+fn draw(f: &mut Frame, wiz: &Wizard, role: SetupRole, input: &str, manage_removing: bool) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -227,13 +288,17 @@ fn draw(f: &mut Frame, wiz: &Wizard, role: SetupRole, input: &str) {
 
     match wiz.screen {
         Screen::Menu => draw_menu(f, wiz, chunks[1]),
-        _ => draw_screen(f, wiz, role, input, chunks[1]),
+        _ => draw_screen(f, wiz, role, input, manage_removing, chunks[1]),
     }
 
     let help = match wiz.screen {
         Screen::Menu => "↑/↓ move · Enter select · q quit",
         Screen::Create | Screen::Join => "type value · Tab cycle role · Enter run · Esc back",
-        Screen::Status | Screen::Manage => "r refresh · Esc back",
+        Screen::Status => "r refresh · Esc back",
+        Screen::Manage if manage_removing => "type node-id · Enter remove · Esc cancel",
+        Screen::Manage => {
+            "a add peer · l add lighthouse · d remove · Tab role · r refresh · Esc back"
+        }
     };
     f.render_widget(
         Paragraph::new(help).block(Block::default().borders(Borders::ALL)),
@@ -267,6 +332,7 @@ fn draw_screen(
     wiz: &Wizard,
     role: SetupRole,
     input: &str,
+    manage_removing: bool,
     area: ratatui::layout::Rect,
 ) {
     let rows = Layout::default()
@@ -274,22 +340,33 @@ fn draw_screen(
         .constraints([Constraint::Length(3), Constraint::Min(4)])
         .split(area);
 
-    // Input prompt (Create/Join) or a screen heading.
+    // Input prompt (Create/Join, or Manage remove-mode) or a screen heading.
     if let Some(prompt) = screen_prompt(wiz.screen) {
         let line = format!("{prompt}\n> {input}_   (role: {})", role.as_arg());
         f.render_widget(
             Paragraph::new(line).block(Block::default().borders(Borders::ALL).title("Input")),
             rows[0],
         );
+    } else if wiz.screen == Screen::Manage && manage_removing {
+        let line = format!("Remove which peer? node-id, then Enter:\n> {input}_");
+        f.render_widget(
+            Paragraph::new(line).block(Block::default().borders(Borders::ALL).title("Remove peer")),
+            rows[0],
+        );
     } else {
-        let title = match wiz.screen {
-            Screen::Status => "Status & services",
-            Screen::Manage => "Peers & lighthouses",
-            _ => "",
+        let (title, hint) = match wiz.screen {
+            Screen::Status => ("Status & services", "press r to refresh".to_string()),
+            Screen::Manage => (
+                "Peers & lighthouses",
+                format!(
+                    "a add peer · l add lighthouse · d remove (role: {})",
+                    role.as_arg()
+                ),
+            ),
+            _ => ("", String::new()),
         };
         f.render_widget(
-            Paragraph::new("press r to refresh")
-                .block(Block::default().borders(Borders::ALL).title(title)),
+            Paragraph::new(hint).block(Block::default().borders(Borders::ALL).title(title)),
             rows[0],
         );
     }
