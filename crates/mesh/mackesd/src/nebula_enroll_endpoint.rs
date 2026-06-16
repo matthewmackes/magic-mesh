@@ -99,6 +99,45 @@ pub fn generate_endpoint_identity(sans: &[String]) -> Result<EndpointIdentity, S
     })
 }
 
+/// SUBAUDIT-D1 — ensure a self-signed TLS cert+key pair exists at the given
+/// paths, generating one if absent. Returns `Ok(true)` when a usable pair is
+/// present afterwards (pre-existing or freshly written), `Ok(false)` only on a
+/// best-effort write skip. The key is written 0600.
+///
+/// Used by the `:443` covert-relay listener so a public/lighthouse node
+/// self-bootstraps its relay cert (the relay never ran because no node ever had
+/// `/etc/nebula/lighthouse.crt`). A pre-existing operator cert (e.g. Let's
+/// Encrypt) is left untouched.
+///
+/// # Errors
+/// Returns the underlying error string on cert generation or write failure.
+pub fn ensure_self_signed_cert(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+    sans: &[String],
+) -> Result<bool, String> {
+    if cert_path.exists() && key_path.exists() {
+        return Ok(true);
+    }
+    let identity = generate_endpoint_identity(sans)?;
+    if let Some(dir) = cert_path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    if let Some(dir) = key_path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    std::fs::write(cert_path, identity.cert_pem.as_bytes())
+        .map_err(|e| format!("write {}: {e}", cert_path.display()))?;
+    std::fs::write(key_path, identity.key_pem.as_bytes())
+        .map_err(|e| format!("write {}: {e}", key_path.display()))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod 600 {}: {e}", key_path.display()))?;
+    }
+    Ok(true)
+}
+
 /// A parsed HTTP/1.1 request — only the fields the endpoint cares
 /// about. Deliberately tiny: this is a single-route control service,
 /// not a general HTTP server.
@@ -344,6 +383,31 @@ mod tests {
     use crate::nebula_enroll::{build_pending, parse_join_token};
 
     // ---- endpoint identity / fingerprint --------------------
+
+    #[test]
+    fn ensure_self_signed_cert_generates_then_is_idempotent() {
+        // SUBAUDIT-D1: a relay-eligible node with no cert gets one written
+        // 0600; a second call leaves the existing pair untouched.
+        let dir = tempfile::tempdir().expect("tmp");
+        let cert = dir.path().join("nebula/lighthouse.crt");
+        let key = dir.path().join("nebula/lighthouse.key");
+        let sans = vec!["203.0.113.7".to_string()];
+        assert!(ensure_self_signed_cert(&cert, &key, &sans).expect("gen"));
+        assert!(cert.exists() && key.exists());
+        let cert_bytes = std::fs::read(&cert).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "relay key must be 0600");
+        }
+        // Idempotent — same bytes, not regenerated.
+        assert!(ensure_self_signed_cert(&cert, &key, &sans).expect("idem"));
+        assert_eq!(
+            std::fs::read(&cert).unwrap(),
+            cert_bytes,
+            "cert must not be re-minted"
+        );
+    }
 
     #[test]
     fn generated_identity_has_pem_and_64_char_fingerprint() {

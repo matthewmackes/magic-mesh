@@ -6083,21 +6083,61 @@ fn run_serve(
                 // relay cert is actually present. A box with no lighthouse /
                 // Let's-Encrypt cert is not a relay; spawning anyway only fails
                 // the bind (and a per-user daemon can never bind a privileged
-                // port at all), which the OnFailure policy then respins ~4x/s —
-                // the worker's "backoff quarantines it" claim never held. Skip.
+                // port at all), which the OnFailure policy then respins ~4x/s.
+                //
+                // SUBAUDIT-D1 (2026-06-16) — the relay never ran *anywhere*
+                // because no node ever had /etc/nebula/lighthouse.crt. A
+                // public/lighthouse node now SELF-BOOTSTRAPS a self-signed relay
+                // cert so the :443 listener actually binds by default. Gated on
+                // relay-eligibility — the lighthouse role.host marker OR a pinned
+                // Lighthouse role — so a NAT'd workstation (e.g. .13) never
+                // generates a cert or binds :443.
                 let https_cert = std::env::var("MDE_HTTPS_TUNNEL_CERT").unwrap_or_else(|_| {
                     mackesd_core::workers::nebula_https_listener::DEFAULT_CERT_PATH.to_string()
                 });
+                let https_key = std::env::var("MDE_HTTPS_TUNNEL_KEY").unwrap_or_else(|_| {
+                    mackesd_core::workers::nebula_https_listener::DEFAULT_KEY_PATH.to_string()
+                });
+                let relay_eligible = std::path::Path::new(
+                    mackesd_core::workers::meshfs_worker::DEFAULT_ROLE_MARKER_PATH,
+                )
+                .exists()
+                    || matches!(mde_role::load(), Ok(mde_role::Role::Lighthouse));
+                if relay_eligible && !std::path::Path::new(&https_cert).exists() {
+                    let sans = vec![
+                        detect_primary_ipv4().unwrap_or_else(|_| "127.0.0.1".to_string()),
+                        "lighthouse.mesh.local".to_string(),
+                    ];
+                    match mackesd_core::nebula_enroll_endpoint::ensure_self_signed_cert(
+                        std::path::Path::new(&https_cert),
+                        std::path::Path::new(&https_key),
+                        &sans,
+                    ) {
+                        Ok(_) => tracing::info!(
+                            cert = %https_cert,
+                            "nebula-https-listener: self-bootstrapped a relay cert (SUBAUDIT-D1)",
+                        ),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "nebula-https-listener: relay cert bootstrap failed; relay stays down",
+                        ),
+                    }
+                }
                 if std::path::Path::new(&https_cert).exists() {
                     sup.spawn(Spawn::new(w, RestartPolicy::OnFailure));
                     worker_names
                         .lock()
                         .expect("worker_names mutex")
                         .push("nebula_https_listener".into());
+                } else if relay_eligible {
+                    tracing::warn!(
+                        cert = %https_cert,
+                        "nebula-https-listener: relay-eligible but no cert after bootstrap — relay down",
+                    );
                 } else {
                     tracing::info!(
                         cert = %https_cert,
-                        "nebula-https-listener: no relay cert present; not a relay — worker skipped",
+                        "nebula-https-listener: not a relay node (no role.host marker / not Lighthouse) — skipped",
                     );
                 }
             }
