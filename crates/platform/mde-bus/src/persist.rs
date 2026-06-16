@@ -143,22 +143,61 @@ impl Persist {
         std::fs::create_dir_all(&bus_root)
             .map_err(|e| PersistError::Io(format!("mkdir {}: {e}", bus_root.display())))?;
         let db_path = bus_root.join("index.sqlite");
-        let conn = Connection::open(&db_path)
-            .map_err(|e| PersistError::Sql(format!("open {}: {e}", db_path.display())))?;
-        // 5s busy_timeout absorbs short-lived contention (the
-        // SubsWatcher mtime poller + retention pass + webhook
-        // publishes can all touch the DB concurrently).
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|e| PersistError::Sql(format!("busy_timeout: {e}")))?;
-        conn.execute_batch(SCHEMA)
-            .map_err(|e| PersistError::Sql(format!("schema: {e}")))?;
+        let mut conn = Self::open_conn(&db_path)?;
         // SETUP-fix — a SHARED spool (MDE_BUS_ROOT) is read+written by both the
         // root mackesd daemon AND the uid-1000 desktop GUIs, so the spool dir +
         // sqlite must be cross-uid writable (else the user's request/reply +
         // index writes are denied → "mesh service isn't answering").
         relax_shared(&bus_root, true);
         relax_db(&bus_root);
+        // BOOT-REC-3 — a cold-boot cross-uid create race (the desktop session
+        // creates the WAL index before the daemon, or before tmpfiles sets the
+        // spool perms) can leave the DB latched UNWRITABLE: every write then
+        // returns "attempt to write a readonly database", so every RPC reply
+        // fails and the workbench shows "mesh service unreachable / no peers"
+        // until a manual clear. The index lives on /run (tmpfs, ephemeral — the
+        // durable directory/heartbeat data is on QNM-Shared), so self-heal by
+        // recreating it when a write-probe fails.
+        if Self::write_probe(&conn).is_err() {
+            drop(conn);
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
+            }
+            conn = Self::open_conn(&db_path)?;
+            relax_db(&bus_root);
+            tracing::warn!(
+                target: "mde_bus::persist",
+                db = %db_path.display(),
+                "bus index was unwritable on open (boot-race) — recreated it (BOOT-REC-3)",
+            );
+        }
         Ok(Self { bus_root, conn })
+    }
+
+    /// Open the SQLite index with the standard busy-timeout + schema. Split out
+    /// so [`Self::open`]'s BOOT-REC-3 self-heal can reopen after recreating it.
+    fn open_conn(db_path: &std::path::Path) -> Result<Connection, PersistError> {
+        let conn = Connection::open(db_path)
+            .map_err(|e| PersistError::Sql(format!("open {}: {e}", db_path.display())))?;
+        // 5s busy_timeout absorbs short-lived contention (the SubsWatcher mtime
+        // poller + retention pass + webhook publishes can all touch the DB).
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| PersistError::Sql(format!("busy_timeout: {e}")))?;
+        conn.execute_batch(SCHEMA)
+            .map_err(|e| PersistError::Sql(format!("schema: {e}")))?;
+        Ok(conn)
+    }
+
+    /// BOOT-REC-3 write-probe: a trivial write that surfaces a latched
+    /// read-only/locked DB at open time. `Ok(())` ⇒ the index accepts writes.
+    fn write_probe(conn: &Connection) -> Result<(), rusqlite::Error> {
+        // Create→insert→drop a scratch table: a real write that surfaces a
+        // latched read-only DB, leaving no artifact behind.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _mde_probe(x INTEGER);\
+             INSERT INTO _mde_probe(x) VALUES(1);\
+             DROP TABLE _mde_probe;",
+        )
     }
 
     /// Append a new message: write the on-disk JSON file
@@ -646,6 +685,45 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = Persist::open(tmp.path().to_path_buf()).unwrap();
         (tmp, p)
+    }
+
+    #[test]
+    fn write_probe_distinguishes_readonly_from_writable() {
+        // BOOT-REC-3: the probe must FAIL on a read-only DB (the latched
+        // boot-race state) and PASS on a writable one — that verdict is what
+        // drives the self-heal recreate in `open`.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("probe.sqlite");
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch("CREATE TABLE t(x)")
+            .unwrap();
+        let ro =
+            Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert!(
+            Persist::write_probe(&ro).is_err(),
+            "read-only DB must fail the probe"
+        );
+        let rw = Connection::open(&db).unwrap();
+        assert!(
+            Persist::write_probe(&rw).is_ok(),
+            "writable DB must pass the probe"
+        );
+    }
+
+    #[test]
+    fn open_self_heals_after_recreate_and_stays_writable() {
+        // A reopened bus accepts writes (probe + recreate path is idempotent).
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let p = Persist::open(tmp.path().to_path_buf()).unwrap();
+            p.write("test/a", Priority::Default, None, Some("x"))
+                .unwrap();
+        }
+        let p2 = Persist::open(tmp.path().to_path_buf()).unwrap();
+        // Must still accept writes after reopen (no false recreate / no latch).
+        p2.write("test/b", Priority::Default, None, Some("y"))
+            .unwrap();
     }
 
     #[test]
