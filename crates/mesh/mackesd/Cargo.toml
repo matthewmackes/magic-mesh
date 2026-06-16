@@ -421,6 +421,8 @@ assets = [
     { source = "install-helpers/mesh-prompt-nodes.sh", dest = "/usr/libexec/mackesd/mesh-prompt-nodes", mode = "755" },
     { source = "packaging/starship/starship.toml",     dest = "/etc/starship.toml",                       mode = "644" },
     { source = "packaging/profile.d/zz-mde-starship.sh", dest = "/etc/profile.d/zz-mde-starship.sh",      mode = "644" },
+    { source = "install-helpers/mesh-install-starship.sh", dest = "/usr/libexec/mackesd/mesh-install-starship", mode = "755" },
+    { source = "packaging/systemd/mesh-shell-setup.service", dest = "/usr/lib/systemd/system/mesh-shell-setup.service", mode = "644" },
 ]
 # EFF-14 — install/upgrade/remove scriptlets: register the daemon unit, create
 # the config dir, refresh icon/desktop caches; clean up on removal. Guards keep
@@ -440,6 +442,9 @@ systemctl enable magic-mesh-brand.service >/dev/null 2>&1 || :
 # MESHSHELL — the mesh-status snapshot timer feeds the bash prompt + greeting
 # on every role.
 systemctl enable --now mesh-status.timer >/dev/null 2>&1 || :
+# MESHSHELL — fetch the starship prompt binary on first boot (checksum-verified;
+# self-skips once /usr/bin/starship exists). All roles.
+systemctl enable mesh-shell-setup.service >/dev/null 2>&1 || :
 # SETUP-fix — materialize the shared bus dir now (no reboot needed).
 systemd-tmpfiles --create /usr/lib/tmpfiles.d/magic-mesh.conf >/dev/null 2>&1 || :
 [ -d /etc/mackesd ] || install -d -m 0700 /etc/mackesd
