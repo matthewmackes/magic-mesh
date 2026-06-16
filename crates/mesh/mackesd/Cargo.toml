@@ -423,6 +423,9 @@ assets = [
     { source = "packaging/profile.d/zz-mde-starship.sh", dest = "/etc/profile.d/zz-mde-starship.sh",      mode = "644" },
     { source = "install-helpers/mesh-install-starship.sh", dest = "/usr/libexec/mackesd/mesh-install-starship", mode = "755" },
     { source = "packaging/systemd/mesh-shell-setup.service", dest = "/usr/lib/systemd/system/mesh-shell-setup.service", mode = "644" },
+    # MESHSHELL SHELL-3 — the per-shell Carbon welcome greeting.
+    { source = "install-helpers/mesh-welcome.py",       dest = "/usr/libexec/mackesd/mesh-welcome",        mode = "755" },
+    { source = "packaging/profile.d/zz-mde-welcome.sh", dest = "/etc/profile.d/zz-mde-welcome.sh",         mode = "644" },
 ]
 # EFF-14 — install/upgrade/remove scriptlets: register the daemon unit, create
 # the config dir, refresh icon/desktop caches; clean up on removal. Guards keep
