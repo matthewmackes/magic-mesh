@@ -432,6 +432,10 @@ assets = [
     # SETUP-6 — first-run console wizard unit + the unconfigured-node MOTD hint.
     { source = "packaging/systemd/magic-setup.service", dest = "/usr/lib/systemd/system/magic-setup.service", mode = "644" },
     { source = "packaging/profile.d/zz-mde-setup-motd.sh", dest = "/etc/profile.d/zz-mde-setup-motd.sh",   mode = "644" },
+    # SETUP-7 — the hybrid-Ansible convergence role (re-applied by `mackesd
+    # converge` against the generated /etc/mackesd/site.yml).
+    { source = "ansible/ansible.cfg",              dest = "/usr/share/mackes/ansible/ansible.cfg",      mode = "644" },
+    { source = "ansible/roles/mackes/**/*",        dest = "/usr/share/mackes/ansible/roles/mackes/",    mode = "644" },
     # BUS cross-node notifications — the ntfy broker template (was never shipped,
     # so the broker skipped 'TemplateMissing') + the first-boot ntfy fetch
     # (ntfy isn't in the Fedora repos, so it can't be a hard Require). All roles.

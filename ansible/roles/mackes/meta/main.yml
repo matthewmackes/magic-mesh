@@ -1,0 +1,12 @@
+# SETUP-7 — the `mackes` convergence role metadata.
+---
+galaxy_info:
+  role_name: mackes
+  author: Magic Mesh
+  description: >-
+    Idempotently converge a Magic Mesh node to the steady state captured in
+    /etc/mackesd/site.yml (pinned role, boot-durable service set, QNM-Shared
+    mount assert). Mirrors the imperative found/join/setup-qnm-shared verbs.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.14"
+dependencies: []

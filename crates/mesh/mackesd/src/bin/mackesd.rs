@@ -679,6 +679,16 @@ enum Cmd {
         force: bool,
     },
 
+    /// SETUP-7 — re-apply the steady-state convergence playbook
+    /// (`/etc/mackesd/site.yml`) locally via `ansible-playbook`. The playbook
+    /// is generated at `found`/`join`; this restores role/services/mount
+    /// idempotently. No-op (with a hint) when ansible or the playbook is absent.
+    Converge {
+        /// Override the playbook path (default `/etc/mackesd/site.yml`).
+        #[arg(long)]
+        site: Option<PathBuf>,
+    },
+
     /// ONBOARD-4 — **the Magic founding verb.** Stand up THIS box as
     /// the mesh's first lighthouse in one command: mesh-init (pin role,
     /// mint CA, self-sign, write bundle), generate the self-signed
@@ -3717,6 +3727,9 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::RemovePeer { node_id, force } => {
             return cmd_remove_peer(&db_path, &node_id, force);
+        }
+        Cmd::Converge { site } => {
+            return cmd_converge(site);
         }
         Cmd::Found {
             mesh_id,
@@ -7178,7 +7191,9 @@ fn cmd_remove_peer(db_path: &std::path::Path, node_id: &str, force: bool) -> any
 
     let updated = mackesd_core::store::set_node_role(&conn, node_id, "decommissioned")?;
     if updated == 0 {
-        eprintln!("mackesd remove-peer: no directory row for {node_id} — revoking + banning anyway");
+        eprintln!(
+            "mackesd remove-peer: no directory row for {node_id} — revoking + banning anyway"
+        );
     }
     let payload = serde_json::json!({
         "kind":  if force { "forced" } else { "soft" },
@@ -7288,6 +7303,9 @@ fn cmd_found(
     // all assume it mounted). The founder is the master, bound on its own
     // overlay IP. Best-effort: a miss logs loudly, the overlay still comes up.
     provision_qnm_shared(parsed, true, &report.overlay_ip, &report.overlay_ip);
+
+    // SETUP-7 — capture the founding facts for idempotent re-convergence.
+    emit_site_yml_best_effort(parsed.as_str(), mesh_id, vec![report.overlay_ip.clone()]);
 
     enable_now_service("mackesd.service");
     enable_now_service("mesh-health.timer");
@@ -7403,6 +7421,15 @@ fn cmd_join(
         &bundle.overlay_ip,
     );
 
+    // SETUP-7 — capture the joined facts (mesh-id + lighthouse roster from the
+    // signed bundle) for idempotent re-convergence.
+    let roster: Vec<String> = bundle
+        .lighthouses
+        .iter()
+        .map(|lh| lh.overlay_ip.clone())
+        .collect();
+    emit_site_yml_best_effort(parsed.as_str(), &bundle.mesh_id, roster);
+
     enable_now_service("mackesd.service");
     enable_now_service("mesh-health.timer");
 
@@ -7478,6 +7505,64 @@ fn provision_qnm_shared(role: mde_role::Role, is_founder: bool, master_ip: &str,
              shared-state plane is DOWN until provisioned"
         ),
     }
+}
+
+/// SETUP-7 — write `/etc/mackesd/site.yml` from the bootstrap result so a later
+/// `mackesd converge` (or the ansible-pull worker) can idempotently restore
+/// steady state. Best-effort: a write failure logs but never fails the enroll.
+fn emit_site_yml_best_effort(role: &str, mesh_id: &str, lighthouses: Vec<String>) {
+    let facts =
+        mackesd_core::site_yml::SiteFacts::new(role, mesh_id, lighthouses, "/mnt/mesh-storage");
+    let path = std::path::Path::new(mackesd_core::site_yml::DEFAULT_SITE_YML);
+    match mackesd_core::site_yml::write_site_yml(path, &facts) {
+        Ok(()) => println!("convergence playbook written: {}", path.display()),
+        Err(e) => eprintln!(
+            "site.yml: could not write {} ({e}) — `mackesd converge` skipped",
+            path.display()
+        ),
+    }
+}
+
+/// SETUP-7 — re-apply `/etc/mackesd/site.yml` locally via `ansible-playbook`.
+fn cmd_converge(site: Option<PathBuf>) -> anyhow::Result<()> {
+    let site = site.unwrap_or_else(|| PathBuf::from(mackesd_core::site_yml::DEFAULT_SITE_YML));
+    if !site.exists() {
+        anyhow::bail!(
+            "no convergence playbook at {} — found/join generates it; run one first",
+            site.display()
+        );
+    }
+    if which_on_path("ansible-playbook").is_none() {
+        println!(
+            "ansible-playbook not installed — skipping converge ({} is ready for when it is)",
+            site.display()
+        );
+        return Ok(());
+    }
+    println!("converging from {} …", site.display());
+    let status = std::process::Command::new("ansible-playbook")
+        .arg("-c")
+        .arg("local")
+        .arg("-i")
+        .arg("localhost,")
+        .arg(&site)
+        .env("ANSIBLE_ROLES_PATH", "/usr/share/mackes/ansible/roles")
+        .status()
+        .context("running ansible-playbook")?;
+    if status.success() {
+        println!("converge complete");
+        Ok(())
+    } else {
+        anyhow::bail!("ansible-playbook exited {:?}", status.code())
+    }
+}
+
+/// Best-effort `which`: returns the resolved path of `bin` on `$PATH`, or None.
+fn which_on_path(bin: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join(bin))
+        .find(|p| p.is_file())
 }
 
 /// ONBOARD-4/9 — enable + start a systemd unit so it is live now AND comes up

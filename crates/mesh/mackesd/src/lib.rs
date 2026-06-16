@@ -116,6 +116,8 @@ pub mod secrets;
 // 2026-05-22 per .claude/CLAUDE.md §0.12 (no stubs), matching the
 // same-day deploy/ scaffold deletion.
 pub mod settings;
+/// SETUP-7 — the `/etc/mackesd/site.yml` convergence playbook emitter.
+pub mod site_yml;
 pub mod store;
 // MESH-A-4.a (v5.0.0) — surrounding-host taxonomy + classifier,
 // consumed by the `mackesd classify-host` CLI + (later) the A-4.b

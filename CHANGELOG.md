@@ -20,6 +20,10 @@ starts at the first packaged release line.
   (unconfigured nodes) via `magic-setup.service` (tty1 only, never hijacks SSH)
   and on demand as `sudo magic-setup`. A thin narrated layer over the existing
   `mackesd found`/`join` verbs (which already provision LizardFS/QNM-Shared).
+  Adds peers/lighthouses (`mackesd add-peer` mints a v3 token), removes them
+  (`mackesd remove-peer` = decommission + revoke + ban), and emits a
+  `/etc/mackesd/site.yml` Ansible playbook re-appliable with `mackesd converge`
+  for idempotent steady-state convergence.
 - **LizardFS is now a birthright (BIRTHRIGHT-1):** `mackesd found`/`join`
   auto-provision the QNM-Shared shared-state plane role-aware — install the
   LizardFS binaries (dnf on F43, the bundled fc43 RPMs on F44/offline) and run

@@ -1,0 +1,55 @@
+# SETUP-7 — the `mackes` convergence role. Idempotently restores the steady
+# state captured by magic-setup/mackesd into /etc/mackesd/site.yml: the pinned
+# role, the boot-durable service set, and a fail-loud QNM-Shared mount assert.
+# It mirrors the imperative verbs (found/join/setup-qnm-shared) for re-apply —
+# it never re-enrolls or re-mints CA material (that is the interactive bootstrap).
+---
+- name: Ensure the MDE state dir exists
+  ansible.builtin.file:
+    path: /var/lib/mde
+    state: directory
+    mode: "0755"
+
+- name: Pin the deployment role (role.toml)
+  ansible.builtin.copy:
+    dest: /var/lib/mde/role.toml
+    content: |
+      # Managed by the mackes Ansible role (SETUP-7). Pinned by magic-setup.
+      role = "{{ mde_role }}"
+    mode: "0644"
+
+- name: Ensure the boot-durable service set is enabled and running
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop: "{{ mde_services }}"
+  # A unit absent on this role (e.g. qnm-shared before LizardFS provisioning)
+  # must not fail the whole converge — surface it as a warning instead.
+  register: svc_result
+  failed_when: false
+
+- name: Report any service that could not be brought up
+  ansible.builtin.debug:
+    msg: "service {{ item.item }} not converged: {{ item.msg | default('see journal') }}"
+  loop: "{{ svc_result.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item is failed or (item.state is defined and item.state != 'started')
+
+- name: Assert QNM-Shared (the shared-state plane) is actually mounted
+  # Fail-loud (the ONBOARD-6 lesson): a converge that "succeeds" against an
+  # unmounted /mnt/mesh-storage would mask a dead shared-state plane.
+  ansible.builtin.command:
+    cmd: "mountpoint -q {{ mde_qnm_path }}"
+  changed_when: false
+  failed_when: false
+  register: qnm_mount
+
+- name: Warn when QNM-Shared is not mounted
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ mde_qnm_path }} is NOT a mountpoint — the shared-state plane is
+      down (leader/directory/fleet will not work mesh-wide). Provision it with
+      `/usr/libexec/mackesd/setup-qnm-shared --client`.
+  when: qnm_mount.rc != 0
