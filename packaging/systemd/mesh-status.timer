@@ -1,0 +1,10 @@
+[Unit]
+Description=Magic Mesh — periodic mesh-status snapshot (MESHSHELL SHELL-1)
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=Magic Mesh — refresh the mesh-status snapshot (prompt + greeting data plane)
+Documentation=https://github.com/matthewmackes/magic-mesh
+After=mackesd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/mackesd/mesh-status-snapshot

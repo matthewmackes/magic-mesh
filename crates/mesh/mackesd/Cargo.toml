@@ -412,6 +412,10 @@ assets = [
     { source = "assets/brand/cosmic-layout/**/*",  dest = "/usr/share/magic-mesh/brand/cosmic-layout/", mode = "644" },
     { source = "assets/brand/monogram.png",        dest = "/usr/share/magic-mesh/brand/monogram.png",   mode = "644" },
     { source = "assets/brand/greeter-hero.png",    dest = "/usr/share/magic-mesh/brand/greeter-hero.png", mode = "644" },
+    # MESHSHELL SHELL-1 — the mesh-status snapshot data plane (all roles).
+    { source = "install-helpers/mesh-status-snapshot.sh", dest = "/usr/libexec/mackesd/mesh-status-snapshot", mode = "755" },
+    { source = "packaging/systemd/mesh-status.service", dest = "/usr/lib/systemd/system/mesh-status.service", mode = "644" },
+    { source = "packaging/systemd/mesh-status.timer",   dest = "/usr/lib/systemd/system/mesh-status.timer",   mode = "644" },
 ]
 # EFF-14 — install/upgrade/remove scriptlets: register the daemon unit, create
 # the config dir, refresh icon/desktop caches; clean up on removal. Guards keep
@@ -428,6 +432,9 @@ systemctl enable mackesd.service nebula.service mesh-health.timer >/dev/null 2>&
 # Workstation role (ExecCondition) + a run-once stamp, so enabling it everywhere
 # is safe: Server/Lighthouse skip it.
 systemctl enable magic-mesh-brand.service >/dev/null 2>&1 || :
+# MESHSHELL — the mesh-status snapshot timer feeds the bash prompt + greeting
+# on every role.
+systemctl enable --now mesh-status.timer >/dev/null 2>&1 || :
 # SETUP-fix — materialize the shared bus dir now (no reboot needed).
 systemd-tmpfiles --create /usr/lib/tmpfiles.d/magic-mesh.conf >/dev/null 2>&1 || :
 [ -d /etc/mackesd ] || install -d -m 0700 /etc/mackesd
