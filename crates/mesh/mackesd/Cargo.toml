@@ -416,6 +416,11 @@ assets = [
     { source = "install-helpers/mesh-status-snapshot.sh", dest = "/usr/libexec/mackesd/mesh-status-snapshot", mode = "755" },
     { source = "packaging/systemd/mesh-status.service", dest = "/usr/lib/systemd/system/mesh-status.service", mode = "644" },
     { source = "packaging/systemd/mesh-status.timer",   dest = "/usr/lib/systemd/system/mesh-status.timer",   mode = "644" },
+    # MESHSHELL SHELL-2 — Carbon starship prompt (the mesh node-list module +
+    # config + profile.d hook; the hook no-ops until starship is installed).
+    { source = "install-helpers/mesh-prompt-nodes.sh", dest = "/usr/libexec/mackesd/mesh-prompt-nodes", mode = "755" },
+    { source = "packaging/starship/starship.toml",     dest = "/etc/starship.toml",                       mode = "644" },
+    { source = "packaging/profile.d/zz-mde-starship.sh", dest = "/etc/profile.d/zz-mde-starship.sh",      mode = "644" },
 ]
 # EFF-14 — install/upgrade/remove scriptlets: register the daemon unit, create
 # the config dir, refresh icon/desktop caches; clean up on removal. Guards keep

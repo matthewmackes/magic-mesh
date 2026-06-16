@@ -1,0 +1,32 @@
+# MESHSHELL SHELL-2 — Magic Mesh Carbon starship prompt (bash).
+# Carbon tokens: Blue-60 #0f62fe accent · Gray-60 #6f6f6f muted · Red #da1e28.
+add_newline = true
+format = "$custom$username$hostname$directory$git_branch$git_status$character"
+
+# The mesh module: the online-hostname list, fed by the cached snapshot.
+[custom.mesh]
+command = "/usr/libexec/mackesd/mesh-prompt-nodes"
+when = true
+shell = ["bash", "--noprofile", "--norc"]
+format = "[$output]($style)\n"
+style = "bold #0f62fe"
+description = "Online mesh nodes from /run/mde/mesh-status.json"
+
+[hostname]
+ssh_only = false
+format = "[$hostname]($style) "
+style = "#6f6f6f"
+
+[username]
+show_always = true
+format = "[$user]($style)@"
+style_user = "#6f6f6f"
+style_root = "#da1e28"
+
+[directory]
+style = "#4589ff"
+truncation_length = 3
+
+[character]
+success_symbol = "[❯](#0f62fe)"
+error_symbol = "[❯](#da1e28)"
