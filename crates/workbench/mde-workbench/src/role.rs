@@ -34,6 +34,7 @@ const fn role_icon(group: Group) -> Icon {
         Group::Dashboard => Icon::Dashboard,
         Group::ThisNode => Icon::Workbench,
         Group::Mesh => Icon::Network,
+        Group::MeshProvisioning => Icon::Peer,
         Group::Fleet => Icon::Fleet,
         Group::Provisioning => Icon::Update,
         Group::Monitoring => Icon::Maintain,
@@ -52,7 +53,10 @@ const fn role_description(group: Group) -> &'static str {
             "This box — hardware, services, and its local networking (interfaces, Wi-Fi, VPN, firewall, remote access)."
         }
         Group::Mesh => {
-            "The mesh — every peer plus mesh-wide services: control, storage, DNS, routing, federation, bus, publishing, and join."
+            "The mesh — every peer plus mesh-wide services: control, storage, DNS, routing, bus, publishing, and discovered hosts."
+        }
+        Group::MeshProvisioning => {
+            "Grow the mesh — enrol new peers (registration, join, pending approvals) and federate with other meshes."
         }
         Group::Fleet => {
             "Drive the fleet — roster, rollup, tags, and orchestration (jobs, playbooks, remediation)."
@@ -75,7 +79,8 @@ const fn see_also(group: Group) -> &'static [Group] {
     match group {
         Group::Dashboard => &[Group::Mesh, Group::Fleet, Group::Monitoring],
         Group::ThisNode => &[Group::Mesh, Group::Monitoring, Group::System],
-        Group::Mesh => &[Group::Fleet, Group::ThisNode, Group::Monitoring],
+        Group::Mesh => &[Group::MeshProvisioning, Group::Fleet, Group::Monitoring],
+        Group::MeshProvisioning => &[Group::Mesh, Group::Fleet, Group::Provisioning],
         Group::Fleet => &[Group::Mesh, Group::Provisioning, Group::Monitoring],
         Group::Provisioning => &[Group::Fleet, Group::Mesh, Group::System],
         Group::Monitoring => &[Group::Mesh, Group::Fleet, Group::System],
@@ -316,15 +321,29 @@ mod tests {
             .map(Panel::slug)
             .collect();
         assert_eq!(slugs.first(), Some(&"peers"));
-        for want in [
-            "mesh_control",
-            "mesh_storage",
-            "dns",
-            "routing",
-            "mesh_join",
-        ] {
+        for want in ["mesh_control", "mesh_storage", "dns", "routing"] {
             assert!(slugs.contains(&want), "Mesh missing {want}: {slugs:?}");
         }
+        // 2026-06-16: enrollment/federation moved to MESH: PROVISIONING.
+        let prov: Vec<&str> = role_action_panels(Group::MeshProvisioning)
+            .iter()
+            .map(Panel::slug)
+            .collect();
+        for want in [
+            "registration",
+            "mesh_join",
+            "mesh_pending",
+            "mesh_federation",
+        ] {
+            assert!(
+                prov.contains(&want),
+                "MeshProvisioning missing {want}: {prov:?}"
+            );
+        }
+        assert!(
+            !slugs.contains(&"mesh_join"),
+            "mesh_join should have left Mesh"
+        );
     }
 
     #[test]

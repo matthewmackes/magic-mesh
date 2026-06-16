@@ -23,8 +23,9 @@ pub enum Group {
     Dashboard, // "Overview"
     ThisNode,
     Mesh,
-    Fleet,
-    Provisioning,
+    MeshProvisioning, // "MESH: PROVISIONING" — enrollment/federation (operator 2026-06-16)
+    Fleet,            // labelled "OTHER NODES"
+    Provisioning,     // labelled "MESH: VIRTUAL WORKLOADS"
     Monitoring,
     System, // Config + Maintain + Help
 }
@@ -39,6 +40,7 @@ impl Group {
             Self::Dashboard => "dashboard",
             Self::ThisNode => "node",
             Self::Mesh => "mesh",
+            Self::MeshProvisioning => "mesh_provisioning",
             Self::Fleet => "fleet",
             Self::Provisioning => "provisioning",
             Self::Monitoring => "monitoring",
@@ -53,21 +55,23 @@ impl Group {
             Self::Dashboard => "Overview",
             Self::ThisNode => "This Node",
             Self::Mesh => "Mesh",
-            Self::Fleet => "Fleet",
-            Self::Provisioning => "Provisioning",
+            Self::MeshProvisioning => "MESH: PROVISIONING",
+            Self::Fleet => "OTHER NODES",
+            Self::Provisioning => "MESH: VIRTUAL WORKLOADS",
             Self::Monitoring => "Monitoring",
             Self::System => "System",
         }
     }
 
-    /// Stable display order (drives the Ctrl+1..7 hotkey dispatch).
-    /// The seven visible sections map cleanly to Ctrl+1..7.
+    /// Stable display order (drives the Ctrl+1..8 hotkey dispatch).
+    /// The eight visible sections map cleanly to Ctrl+1..8.
     #[must_use]
-    pub const fn all() -> [Self; 7] {
+    pub const fn all() -> [Self; 8] {
         [
             Self::Dashboard,
             Self::ThisNode,
             Self::Mesh,
+            Self::MeshProvisioning,
             Self::Fleet,
             Self::Provisioning,
             Self::Monitoring,
@@ -213,21 +217,28 @@ pub fn nav_model() -> Vec<NavEntry> {
                 Panel::new("mesh_storage", "Mesh Storage"),
                 Panel::new("dns", "Mesh DNS"),
                 Panel::new("routing", "Routing"),
-                Panel::new("mesh_federation", "Mesh Federation"),
                 // Plain-language renames (Q13).
                 Panel::new("mesh_bus", "Message Bus"),
                 Panel::new("service_publishing", "Published Services"),
                 Panel::new("network_hosts", "Discovered Hosts"),
-                // Join flow folded into Mesh (Q10).
-                Panel::new("registration", "Registration"),
-                Panel::new("mesh_join", "Mesh Join"),
-                Panel::new("mesh_pending", "Mesh Pending"),
                 // Mesh-relevant peer/device services kept here (Q2 exception).
                 Panel::new("connect", "Connected Devices"),
                 Panel::new("music", "Music"),
             ],
         },
-        // ── Fleet — roster + orchestration (Q6) ─────────────────────
+        // ── MESH: PROVISIONING — enrollment + federation (operator 2026-06-16):
+        //    the join/registration/pending/federation flow lifted out of Mesh
+        //    into its own top-level section.
+        NavEntry {
+            group: Group::MeshProvisioning,
+            panels: vec![
+                Panel::new("registration", "Registration"),
+                Panel::new("mesh_join", "Mesh Join"),
+                Panel::new("mesh_pending", "Mesh Pending"),
+                Panel::new("mesh_federation", "Mesh Federation"),
+            ],
+        },
+        // ── OTHER NODES (Group::Fleet) — roster + orchestration (Q6) ─
         NavEntry {
             group: Group::Fleet,
             panels: vec![
@@ -357,10 +368,8 @@ mod tests {
     #[test]
     fn nav_model_has_all_groups_in_locked_order() {
         let nav = nav_model();
-        // NAV-1.2 — exactly the 7 visible mesh sections; the hidden Desktop
-        // group was retired (its 17 settings panels deleted, its 4 mesh
-        // panels relocated into This Node + System).
-        assert_eq!(nav.len(), 7);
+        // 8 visible sections (2026-06-16: MESH: PROVISIONING split out of Mesh).
+        assert_eq!(nav.len(), 8);
         let order: Vec<Group> = nav.iter().map(|e| e.group).collect();
         assert_eq!(order, Group::all().to_vec());
     }
@@ -429,6 +438,7 @@ mod tests {
                 Group::Dashboard,
                 Group::ThisNode,
                 Group::Mesh,
+                Group::MeshProvisioning,
                 Group::Fleet,
                 Group::Provisioning,
                 Group::Monitoring,

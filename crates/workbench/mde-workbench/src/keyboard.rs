@@ -172,16 +172,17 @@ mod tests {
 
     #[test]
     fn ctrl_digit_jumps_to_matching_sidebar_group() {
-        // NAV-1 — Ctrl+1..7 map to the seven sections; Ctrl+8/9 are ignored
-        // (there is no eighth section after NAV-1.2 retired Desktop).
+        // Ctrl+1..8 map to the eight sections (2026-06-16: MESH: PROVISIONING
+        // split out of Mesh); Ctrl+9 is ignored (no ninth section).
         let cases = [
             (1, Group::Dashboard),
             (2, Group::ThisNode),
             (3, Group::Mesh),
-            (4, Group::Fleet),
-            (5, Group::Provisioning),
-            (6, Group::Monitoring),
-            (7, Group::System),
+            (4, Group::MeshProvisioning),
+            (5, Group::Fleet),
+            (6, Group::Provisioning),
+            (7, Group::Monitoring),
+            (8, Group::System),
         ];
         for (n, expected) in cases {
             assert_eq!(
@@ -192,7 +193,7 @@ mod tests {
         }
         // Past the last section → no-op (no panic).
         assert_eq!(
-            interpret_key(Key::Digit(8), Modifiers::ctrl(), Pane::Sidebar),
+            interpret_key(Key::Digit(9), Modifiers::ctrl(), Pane::Sidebar),
             KeyAction::Ignored,
         );
     }
