@@ -1,0 +1,13 @@
+[Unit]
+Description=Magic Mesh — install the ntfy notification broker binary (BUS)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!/usr/bin/ntfy
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/mackesd/mesh-install-ntfy
+
+[Install]
+WantedBy=multi-user.target

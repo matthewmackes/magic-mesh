@@ -428,6 +428,12 @@ assets = [
     { source = "packaging/profile.d/zz-mde-welcome.sh", dest = "/etc/profile.d/zz-mde-welcome.sh",         mode = "644" },
     # MESHSHELL SHELL-4 — the `mesh-help` cheat sheet (user-facing on PATH).
     { source = "install-helpers/mesh-help.sh",          dest = "/usr/bin/mesh-help",                       mode = "755" },
+    # BUS cross-node notifications — the ntfy broker template (was never shipped,
+    # so the broker skipped 'TemplateMissing') + the first-boot ntfy fetch
+    # (ntfy isn't in the Fedora repos, so it can't be a hard Require). All roles.
+    { source = "data/ntfy/server.yml.tmpl",             dest = "/usr/share/mde/ntfy/server.yml.tmpl",      mode = "644" },
+    { source = "install-helpers/mesh-install-ntfy.sh",  dest = "/usr/libexec/mackesd/mesh-install-ntfy",   mode = "755" },
+    { source = "packaging/systemd/mesh-broker-setup.service", dest = "/usr/lib/systemd/system/mesh-broker-setup.service", mode = "644" },
 ]
 # EFF-14 — install/upgrade/remove scriptlets: register the daemon unit, create
 # the config dir, refresh icon/desktop caches; clean up on removal. Guards keep
@@ -450,6 +456,10 @@ systemctl enable --now mesh-status.timer >/dev/null 2>&1 || :
 # MESHSHELL — fetch the starship prompt binary on first boot (checksum-verified;
 # self-skips once /usr/bin/starship exists). All roles.
 systemctl enable mesh-shell-setup.service >/dev/null 2>&1 || :
+# BUS — fetch the ntfy cross-node notification broker on first boot (not in the
+# Fedora repos; self-skips once /usr/bin/ntfy exists). All roles → mesh-wide
+# notification distribution.
+systemctl enable mesh-broker-setup.service >/dev/null 2>&1 || :
 # SETUP-fix — materialize the shared bus dir now (no reboot needed).
 systemd-tmpfiles --create /usr/lib/tmpfiles.d/magic-mesh.conf >/dev/null 2>&1 || :
 [ -d /etc/mackesd ] || install -d -m 0700 /etc/mackesd
