@@ -113,15 +113,10 @@ pub fn view<'a>(
 
     let mut col: Column<'a, crate::Message, cosmic::Theme> = column![].spacing(0);
 
-    // NAV-1 — render only the visible sections (the 7 mesh sections in
-    // locked order). The hidden `Group::Desktop` carries the deferred
-    // desktop panels for deep-link routing only and must never appear in
-    // the sidebar (Q2 — desktop settings defer to Cosmic).
-    for (i, entry) in nav_model()
-        .into_iter()
-        .filter(|e| e.group != Group::Desktop)
-        .enumerate()
-    {
+    // NAV-1 — render the visible sections (the 7 mesh sections in locked
+    // order). NAV-1.2 retired the hidden Desktop group, so nav_model() now
+    // contains exactly the sidebar sections.
+    for (i, entry) in nav_model().into_iter().enumerate() {
         if i > 0 {
             col = col.push(section_divider(palette));
         }

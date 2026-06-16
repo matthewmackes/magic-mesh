@@ -164,14 +164,12 @@ mod tests {
 
     #[test]
     fn page_subtitle_counts_panels_for_group_view() {
-        // PLANES-1 — the Network plane carries 15 panels: interfaces,
-        // wifi, vpn, firewall, dns, routing, remote_desktop,
-        // network_hosts, mesh_storage, mesh_bus, mesh_federation,
-        // service_publishing, mesh_pending, mesh_history, mesh_join.
-        // (peers/mesh_topology moved to the Peers Front Door;
-        // mesh_control/mesh_services re-homed into the planes.)
+        // NAV-1.2 — This Node carries 9 panels: hardware, mesh_services,
+        // interfaces, wifi, vpn, firewall, remote_desktop, plus the two
+        // mesh-specific panels relocated from the retired Desktop group
+        // (wallpaper, notifications).
         // See `crates/mde-workbench/src/model.rs` for the lock.
-        assert_eq!(page_subtitle(View::Group(Group::ThisNode)), "7 panels");
+        assert_eq!(page_subtitle(View::Group(Group::ThisNode)), "9 panels");
     }
 
     #[test]

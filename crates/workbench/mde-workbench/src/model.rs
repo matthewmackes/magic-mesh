@@ -12,9 +12,10 @@ use std::fmt;
 /// scope→function sections — **Overview · This Node · Mesh · Fleet ·
 /// Provisioning · Monitoring · System** (System = Config + Maintain +
 /// Help) — and defers the desktop-settings panels to Cosmic Settings
-/// (Q2). The desktop panels live under a hidden [`Group::Desktop`] that
-/// is NOT shown in the sidebar but stays deep-link-reachable until
-/// NAV-1.2 deletes them + wires the Cosmic hand-off. Order is
+/// (Q2). NAV-1.2 deleted the 17 desktop-settings panels (Cosmic Store/
+/// Settings owns them) and relocated the 4 mesh-specific kept panels
+/// (wallpaper + notifications → This Node; system update + sync status →
+/// System), retiring the hidden Desktop group entirely. Order is
 /// load-bearing — it drives the Ctrl+digit hotkey dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Group {
@@ -26,9 +27,6 @@ pub enum Group {
     Provisioning,
     Monitoring,
     System, // Config + Maintain + Help
-    // ── Hidden: desktop settings deferred to Cosmic (Q2). Excluded
-    //    from sidebar_groups(); deep-link-reachable pending NAV-1.2. ──
-    Desktop,
 }
 
 impl Group {
@@ -45,7 +43,6 @@ impl Group {
             Self::Provisioning => "provisioning",
             Self::Monitoring => "monitoring",
             Self::System => "system",
-            Self::Desktop => "desktop",
         }
     }
 
@@ -60,15 +57,13 @@ impl Group {
             Self::Provisioning => "Provisioning",
             Self::Monitoring => "Monitoring",
             Self::System => "System",
-            Self::Desktop => "Desktop",
         }
     }
 
     /// Stable display order (drives the Ctrl+1..7 hotkey dispatch).
-    /// The hidden `Desktop` group is last so the seven visible
-    /// sections map cleanly to Ctrl+1..7.
+    /// The seven visible sections map cleanly to Ctrl+1..7.
     #[must_use]
-    pub const fn all() -> [Self; 8] {
+    pub const fn all() -> [Self; 7] {
         [
             Self::Dashboard,
             Self::ThisNode,
@@ -77,20 +72,15 @@ impl Group {
             Self::Provisioning,
             Self::Monitoring,
             Self::System,
-            Self::Desktop,
         ]
     }
 
     /// The groups EXPOSED in the sidebar + the Ctrl+digit hotkeys —
-    /// the seven mesh sections (NAV-1). `Desktop` is hidden (Q2:
-    /// desktop settings defer to Cosmic) but stays in [`Self::all`]
-    /// for deep-link routing.
+    /// the seven mesh sections (NAV-1). NAV-1.2 retired the hidden
+    /// Desktop group, so this is now identical to [`Self::all`].
     #[must_use]
     pub fn sidebar_groups() -> Vec<Self> {
-        Self::all()
-            .into_iter()
-            .filter(|g| !matches!(g, Self::Desktop))
-            .collect()
+        Self::all().to_vec()
     }
 
     /// Parse a kebab-case slug back into the matching group.
@@ -206,6 +196,11 @@ pub fn nav_model() -> Vec<NavEntry> {
                 Panel::new("vpn", "VPN"),
                 Panel::new("firewall", "Firewall"),
                 Panel::new("remote_desktop", "Remote Access"),
+                // NAV-1.2 — mesh-specific desktop panels relocated here from
+                // the retired Desktop group (wallpaper + notifications are
+                // mesh-synced surfaces, not Cosmic-owned settings).
+                Panel::new("wallpaper", "Wallpaper"),
+                Panel::new("notifications", "Notifications"),
             ],
         },
         // ── Mesh — Peers front door + all mesh-wide services (Q5/Q9) ─
@@ -285,40 +280,14 @@ pub fn nav_model() -> Vec<NavEntry> {
                 Panel::new("snapshots", "Snapshots"),
                 Panel::new("debloat", "Debloat"),
                 Panel::new("repair", "Repair"),
+                // Maintenance — NAV-1.2 relocated System Update + Panel Sync
+                // Status here from the retired Desktop group (mesh-synced
+                // maintenance surfaces).
+                Panel::new("system_update", "System Update"),
+                Panel::new("sync_status", "Panel Sync Status"),
                 // Help.
                 Panel::new("index", "Help Topics"),
                 Panel::new("about", "About"),
-            ],
-        },
-        // ── Desktop — HIDDEN (Q2: deferred to Cosmic Settings). Not in
-        //    sidebar_groups(); kept deep-link-reachable so no panel is
-        //    orphaned. NAV-1.2 deletes these modules + wires the Cosmic
-        //    hand-off. Mesh-relevant device services (Connected Devices,
-        //    Music) live under Mesh, not here. ──────────────────────────
-        NavEntry {
-            group: Group::Desktop,
-            panels: vec![
-                Panel::new("install", "Install"),
-                Panel::new("installed", "Installed"),
-                Panel::new("remove", "Remove"),
-                Panel::new("sources", "Sources"),
-                Panel::new("default_apps", "Default Apps"),
-                Panel::new("panel", "Panel Apps"),
-                Panel::new("displays", "Displays"),
-                Panel::new("keyboard", "Keyboard"),
-                Panel::new("mouse", "Mouse & Touchpad"),
-                Panel::new("power", "Power"),
-                Panel::new("session", "Session"),
-                Panel::new("sound", "Sound"),
-                Panel::new("printers", "Printers"),
-                Panel::new("removable", "Removable Media"),
-                Panel::new("themes", "Themes"),
-                Panel::new("fonts", "Fonts"),
-                Panel::new("wallpaper", "Wallpaper"),
-                Panel::new("sync_status", "Panel Sync Status"),
-                Panel::new("datetime", "Date & Time"),
-                Panel::new("system_update", "System Update"),
-                Panel::new("notifications", "Notifications"),
             ],
         },
     ]
@@ -389,10 +358,66 @@ mod tests {
     #[test]
     fn nav_model_has_all_groups_in_locked_order() {
         let nav = nav_model();
-        // NAV-1 — 8 groups: the 7 visible mesh sections + hidden Desktop.
-        assert_eq!(nav.len(), 8);
+        // NAV-1.2 — exactly the 7 visible mesh sections; the hidden Desktop
+        // group was retired (its 17 settings panels deleted, its 4 mesh
+        // panels relocated into This Node + System).
+        assert_eq!(nav.len(), 7);
         let order: Vec<Group> = nav.iter().map(|e| e.group).collect();
         assert_eq!(order, Group::all().to_vec());
+    }
+
+    #[test]
+    fn kept_desktop_panels_relocated_into_visible_groups() {
+        // NAV-1.2 — the 4 mesh-specific panels kept from the retired Desktop
+        // group must be deep-link-reachable in their new homes.
+        for (group_panel, want) in [
+            ("node.wallpaper", (Group::ThisNode, "wallpaper")),
+            ("node.notifications", (Group::ThisNode, "notifications")),
+            ("system.system_update", (Group::System, "system_update")),
+            ("system.sync_status", (Group::System, "sync_status")),
+        ] {
+            assert_eq!(
+                view_from_focus_slug(group_panel),
+                Some(View::Panel {
+                    group: want.0,
+                    panel: want.1,
+                }),
+                "{group_panel} must resolve after NAV-1.2 relocation",
+            );
+        }
+    }
+
+    #[test]
+    fn deleted_desktop_settings_panels_no_longer_resolve() {
+        // NAV-1.2 — the 17 deleted desktop-settings slugs (Cosmic owns them)
+        // must NOT resolve under any group anymore.
+        for slug in [
+            "displays",
+            "keyboard",
+            "mouse",
+            "power",
+            "session",
+            "sound",
+            "printers",
+            "removable",
+            "themes",
+            "fonts",
+            "datetime",
+            "install",
+            "installed",
+            "remove",
+            "sources",
+            "default_apps",
+            "panel",
+        ] {
+            for group in ["node", "system", "mesh"] {
+                assert_eq!(
+                    view_from_focus_slug(&format!("{group}.{slug}")),
+                    None,
+                    "deleted desktop slug {slug} must not resolve under {group}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -411,7 +436,6 @@ mod tests {
                 Group::System,
             ]
         );
-        assert!(!Group::sidebar_groups().contains(&Group::Desktop));
         assert_eq!(Group::Dashboard.label(), "Overview");
         assert_eq!(Group::Mesh.label(), "Mesh");
         // Peers is the first item under Mesh (Q9).

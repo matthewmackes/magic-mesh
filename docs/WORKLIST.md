@@ -576,7 +576,12 @@ Design: docs/design/workbench-nav-grouping.md (15-question survey locked 2026-06
     - [ ] no duplicate/ambiguous labels (no three "Inventory"s); renames applied (Mackes Bus→Message Bus, etc.)
     - [ ] every retained panel routes to its working view; deferred desktop panels gone from nav
     - [ ] Group::all() order matches the lock; from_slug round-trips; cargo test -p mde-workbench green
-- [ ] **NAV-1.2: delete the deferred desktop panel modules + wire the Cosmic hand-off**
+- [>] **NAV-1.2: delete the deferred desktop panel modules + wire the Cosmic hand-off** *(operator decisions locked 2026-06-16)*
+  **LOCKED PLAN:**
+  - **Delete (no hand-off, Cosmic Store/Settings owns them):** standard settings — displays, keyboard, mouse, power, session, sound, printers, removable, themes, fonts, datetime (11); app/package mgmt — install, installed, remove, sources, default_apps, panel (6). = 17 panels: delete the module files + `pub mod` + Message/update/view/load wiring.
+  - **Keep + relocate to a visible group:** wallpaper (mesh-map), sync_status (QNM-Shared), system_update (magic-mesh RPM), notifications (MDE Notification Hub) → wallpaper+notifications → This Node; system_update+sync_status → System.
+  - **Remove** the hidden `Group::Desktop` entirely (Group enum + all()/sidebar_groups + role.rs arms + the test).
+  - **Gate:** `cargo test -p mde-workbench` green, no dead `pub mod`, clippy + fmt clean.
   **As** a maintainer,
   **I want** the desktop-settings panels (apps/displays/keyboard/mouse/power/session/
   sound/printers/removable/themes/fonts/wallpaper/sync_status/datetime/system_update/

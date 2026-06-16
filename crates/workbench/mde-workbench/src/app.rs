@@ -21,31 +21,26 @@ use crate::header::HeaderAction;
 use crate::keyboard::{KeyAction, Pane};
 use crate::model::{resolve_panel_label, view_from_focus_slug, Group, View};
 use crate::panels::{
-    apps_install as apps_install_panel, apps_installed as apps_installed_panel,
-    apps_remove as apps_remove_panel, apps_sources as apps_sources_panel, audit as audit_panel,
-    compute as compute_panel, config_apply as config_apply_panel, connect as connect_panel,
-    datetime as datetime_panel, default_apps as default_apps_panel, displays as displays_panel,
-    dns as dns_panel, drift as drift_panel, firewall as firewall_panel,
+    audit as audit_panel, compute as compute_panel, config_apply as config_apply_panel,
+    connect as connect_panel, dns as dns_panel, drift as drift_panel, firewall as firewall_panel,
     fleet_logs as fleet_logs_panel, fleet_revisions as fleet_revisions_panel,
     fleet_rollup as fleet_rollup_panel, fleet_settings as fleet_settings_panel,
-    fonts as fonts_panel, hardware as hardware_panel, health_check as health_check_panel,
-    help_index as help_index_panel, home as home_panel, hub as hub_panel, images as images_panel,
-    interfaces as interfaces_panel, inventory as inventory_panel, jobs as jobs_panel,
-    keyboard as keyboard_panel, logs as logs_panel, mesh_bus as mesh_bus_panel,
-    mesh_control as mesh_control_panel, mesh_federation as mesh_federation_panel,
-    mesh_history as mesh_history_panel, mesh_join as mesh_join_panel, mesh_logs as mesh_logs_panel,
-    mesh_pending as mesh_pending_panel, mesh_services as mesh_services_panel,
-    mesh_storage as mesh_storage_panel, mirrors as mirrors_panel, mouse as mouse_panel,
-    music as music_panel, network_hosts as network_hosts_panel, node_roles as node_roles_panel,
-    notifications as notifications_panel, panel_apps as panel_apps_panel, peers as peers_panel,
-    playbooks as playbooks_panel, policy as policy_panel, power as power_panel,
-    printers as printers_panel, profiles as profiles_panel, registration as registration_panel,
-    remote_desktop as remote_desktop_panel, removable as removable_panel, repair as repair_panel,
-    resources as resources_panel, routing as routing_panel, run_history as run_history_panel,
-    service_publishing as service_publishing_panel, session as session_panel,
-    snapshots as snapshots_panel, sound as sound_panel, sync_status as sync_status_panel,
-    system_update as system_update_panel, tags as tags_panel, themes as themes_panel,
-    vpn as vpn_panel, wallpaper as wallpaper_panel, wifi as wifi_panel,
+    hardware as hardware_panel, health_check as health_check_panel, help_index as help_index_panel,
+    home as home_panel, hub as hub_panel, images as images_panel, interfaces as interfaces_panel,
+    inventory as inventory_panel, jobs as jobs_panel, logs as logs_panel,
+    mesh_bus as mesh_bus_panel, mesh_control as mesh_control_panel,
+    mesh_federation as mesh_federation_panel, mesh_history as mesh_history_panel,
+    mesh_join as mesh_join_panel, mesh_logs as mesh_logs_panel, mesh_pending as mesh_pending_panel,
+    mesh_services as mesh_services_panel, mesh_storage as mesh_storage_panel,
+    mirrors as mirrors_panel, music as music_panel, network_hosts as network_hosts_panel,
+    node_roles as node_roles_panel, notifications as notifications_panel, peers as peers_panel,
+    playbooks as playbooks_panel, policy as policy_panel, profiles as profiles_panel,
+    registration as registration_panel, remote_desktop as remote_desktop_panel,
+    repair as repair_panel, resources as resources_panel, routing as routing_panel,
+    run_history as run_history_panel, service_publishing as service_publishing_panel,
+    snapshots as snapshots_panel, sync_status as sync_status_panel,
+    system_update as system_update_panel, tags as tags_panel, vpn as vpn_panel,
+    wallpaper as wallpaper_panel, wifi as wifi_panel,
 };
 use crate::patternfly::{breadcrumb, page_subtitle, page_title};
 use crate::sidebar::SidebarState;
@@ -111,26 +106,8 @@ pub enum Message {
     AcceptDisclaimer,
     /// AUD-3 — Connected Devices (KDC hub) panel sub-message.
     Connect(connect_panel::Message),
-    /// CB-1.6 — Look & Feel themes panel sub-message.
-    Themes(themes_panel::Message),
-    /// CB-1.6 — Look & Feel fonts panel sub-message.
-    Fonts(fonts_panel::Message),
-    /// CB-1.9 partial — System session panel sub-message.
-    Session(session_panel::Message),
     /// CB-1.9 partial — System notifications panel sub-message.
     Notifications(notifications_panel::Message),
-    /// CB-1.4 partial — Devices power panel sub-message.
-    Power(power_panel::Message),
-    /// CB-1.4 partial — Devices removable panel sub-message.
-    Removable(removable_panel::Message),
-    /// CB-1.4.a — Devices displays panel sub-message.
-    Displays(displays_panel::Message),
-    /// EPIC-RETIRE-PY-WORKBENCH.port-keyboard — Devices keyboard panel sub-message.
-    Keyboard(keyboard_panel::Message),
-    /// EPIC-RETIRE-PY-WORKBENCH.port-mouse — Devices mouse/touchpad panel sub-message.
-    Mouse(mouse_panel::Message),
-    /// CB-1.4.b — Devices sound panel sub-message.
-    Sound(sound_panel::Message),
     /// v4.0.1 WB-2.a — Dashboard `home` landing-page messages.
     Home(home_panel::Message),
     /// v4.0.1 WB-2.c — Help index opened a topic; the path is
@@ -150,19 +127,8 @@ pub enum Message {
     /// rather than a Workbench panel (e.g. Voice & Video →
     /// `mde-voice-config`). The binary resolves on PATH post-install.
     LaunchApp(&'static str),
-    /// CB-1.4.b — Devices sound panel Refresh button. Re-runs
-    /// the panel's Load so a freshly-plugged speaker shows up
-    /// in the picker without the user having to navigate
-    /// away and back.
-    SoundRefresh,
-    /// CB-1.4.c — Devices printers panel sub-message.
-    Printers(printers_panel::Message),
     /// AIR-20 — Devices → Music settings panel sub-message.
     Music(music_panel::Message),
-    /// CB-1.4.c — Devices printers panel Refresh button.
-    /// Re-runs the panel's Load so a newly-added CUPS queue
-    /// shows up in the picker.
-    PrintersRefresh,
     /// CB-1.5.a — Fleet inventory panel sub-message.
     Inventory(inventory_panel::Message),
     /// PLANES-5 — hardware inventory (replicated PeerProbe) sub-message.
@@ -187,10 +153,6 @@ pub enum Message {
     Playbooks(playbooks_panel::Message),
     /// CB-1.5.c — Fleet run-history panel sub-message.
     RunHistory(run_history_panel::Message),
-    /// CB-1.9.a — System date/time panel sub-message.
-    DateTime(datetime_panel::Message),
-    /// CB-1.9.b — System default-apps panel sub-message.
-    DefaultApps(default_apps_panel::Message),
     /// CB-1.9.d — Maintain snapshots panel sub-message.
     Snapshots(snapshots_panel::Message),
     /// CB-1.7 partial — Maintain logs panel sub-message.
@@ -203,14 +165,6 @@ pub enum Message {
     SystemUpdate(system_update_panel::Message),
     /// CB-1.7 partial — Maintain repair panel sub-message.
     Repair(repair_panel::Message),
-    /// CB-1.3 partial — Apps → Installed panel sub-message.
-    AppsInstalled(apps_installed_panel::Message),
-    /// CB-1.3 partial — Apps → Sources panel sub-message.
-    AppsSources(apps_sources_panel::Message),
-    /// CB-1.3 follow-up — Apps → Install panel sub-message.
-    AppsInstall(apps_install_panel::Message),
-    /// CB-1.3 follow-up — Apps → Remove panel sub-message.
-    AppsRemove(apps_remove_panel::Message),
     HealthCheck(health_check_panel::Message),
     Drift(drift_panel::Message),
     Policy(policy_panel::Message),
@@ -233,7 +187,6 @@ pub enum Message {
     MeshStorage(mesh_storage_panel::Message),
     /// MESH-PROBE-9.a — Network → Network Hosts panel sub-message.
     NetworkHosts(network_hosts_panel::Message),
-    PanelApps(panel_apps_panel::Message),
     RemoteDesktop(remote_desktop_panel::Message),
     /// PD-3 — the Peers directory (Front Door) sub-message.
     Peers(peers_panel::Message),
@@ -283,17 +236,7 @@ pub struct App {
     /// refresh. Starts optimistic (`true`).
     bus_reachable: bool,
     backend: Arc<dyn Backend>,
-    themes: themes_panel::ThemesPanel,
-    fonts: fonts_panel::FontsPanel,
-    session: session_panel::SessionPanel,
     notifications: notifications_panel::NotificationsPanel,
-    power: power_panel::PowerPanel,
-    removable: removable_panel::RemovablePanel,
-    displays: displays_panel::DisplaysPanel,
-    keyboard: keyboard_panel::KeyboardPanel,
-    mouse: mouse_panel::MousePanel,
-    sound: sound_panel::SoundPanel,
-    printers: printers_panel::PrintersPanel,
     music: music_panel::MusicPanel,
     /// v4.0.1 WB-1 — Connected Devices panel state. Hosts the
     /// paired-peer list + per-row action handlers.
@@ -316,18 +259,12 @@ pub struct App {
     fleet_logs: fleet_logs_panel::FleetLogsPanel,
     playbooks: playbooks_panel::PlaybooksPanel,
     run_history: run_history_panel::RunHistoryPanel,
-    datetime: datetime_panel::DateTimePanel,
-    default_apps: default_apps_panel::DefaultAppsPanel,
     snapshots: snapshots_panel::SnapshotsPanel,
     logs: logs_panel::LogsPanel,
     resources: resources_panel::ResourcesPanel,
     compute: compute_panel::ComputePanel,
     system_update: system_update_panel::SystemUpdatePanel,
     repair: repair_panel::RepairPanel,
-    apps_installed: apps_installed_panel::AppsInstalledPanel,
-    apps_sources: apps_sources_panel::AppsSourcesPanel,
-    apps_install: apps_install_panel::AppsInstallPanel,
-    apps_remove: apps_remove_panel::AppsRemovePanel,
     health_check: health_check_panel::HealthCheckPanel,
     drift: drift_panel::DriftPanel,
     policy: policy_panel::PolicyPanel,
@@ -349,7 +286,6 @@ pub struct App {
     /// MESH-PROBE-9.a — Network → Network Hosts panel state (the probe
     /// host/service inventory read off mesh-storage).
     network_hosts: network_hosts_panel::NetworkHostsPanel,
-    panel_apps: panel_apps_panel::PanelAppsPanel,
     remote_desktop: remote_desktop_panel::RemoteDesktopPanel,
     peers: peers_panel::PeersPanel,
     sync_status: sync_status_panel::SyncStatusPanel,
@@ -371,9 +307,6 @@ impl std::fmt::Debug for App {
         f.debug_struct("App")
             .field("view", &self.view)
             .field("focused_pane", &self.focused_pane)
-            .field("themes", &self.themes)
-            .field("fonts", &self.fonts)
-            .field("session", &self.session)
             .field("notifications", &self.notifications)
             .finish_non_exhaustive()
     }
@@ -413,17 +346,7 @@ impl App {
             focused_pane: Pane::Sidebar,
             bus_reachable: true,
             backend,
-            themes: themes_panel::ThemesPanel::new(),
-            fonts: fonts_panel::FontsPanel::new(),
-            session: session_panel::SessionPanel::new(),
             notifications: notifications_panel::NotificationsPanel::new(),
-            power: power_panel::PowerPanel::new(),
-            removable: removable_panel::RemovablePanel::new(),
-            displays: displays_panel::DisplaysPanel::new(),
-            keyboard: keyboard_panel::KeyboardPanel::new(),
-            mouse: mouse_panel::MousePanel::new(),
-            sound: sound_panel::SoundPanel::new(),
-            printers: printers_panel::PrintersPanel::new(),
             music: music_panel::MusicPanel::new(),
             connect: connect_panel::ConnectPanel::new(),
             home: home_panel::HomePanel::new(),
@@ -441,18 +364,12 @@ impl App {
             fleet_logs: fleet_logs_panel::FleetLogsPanel::new(),
             playbooks: playbooks_panel::PlaybooksPanel::new(),
             run_history: run_history_panel::RunHistoryPanel::new(),
-            datetime: datetime_panel::DateTimePanel::new(),
-            default_apps: default_apps_panel::DefaultAppsPanel::new(),
             snapshots: snapshots_panel::SnapshotsPanel::new(),
             logs: logs_panel::LogsPanel::new(),
             resources: resources_panel::ResourcesPanel::new(),
             compute: compute_panel::ComputePanel::new(),
             system_update: system_update_panel::SystemUpdatePanel::new(),
             repair: repair_panel::RepairPanel::new(),
-            apps_installed: apps_installed_panel::AppsInstalledPanel::new(),
-            apps_sources: apps_sources_panel::AppsSourcesPanel::new(),
-            apps_install: apps_install_panel::AppsInstallPanel::new(),
-            apps_remove: apps_remove_panel::AppsRemovePanel::new(),
             health_check: health_check_panel::HealthCheckPanel::new(),
             drift: drift_panel::DriftPanel::new(),
             policy: policy_panel::PolicyPanel::new(),
@@ -471,7 +388,6 @@ impl App {
             service_publishing: service_publishing_panel::ServicePublishingPanel::new(),
             mesh_storage: mesh_storage_panel::MeshStoragePanel::new(),
             network_hosts: network_hosts_panel::NetworkHostsPanel::new(),
-            panel_apps: panel_apps_panel::PanelAppsPanel::new(),
             remote_desktop: remote_desktop_panel::RemoteDesktopPanel::new(),
             peers: peers_panel::PeersPanel::new(),
             sync_status: sync_status_panel::SyncStatusPanel::new(),
@@ -508,59 +424,10 @@ impl App {
         Arc::clone(&self.backend)
     }
 
-    /// Read-only view of the themes panel state — used by tests
-    /// + by the view layer to render the panel chrome.
-    #[must_use]
-    pub fn themes(&self) -> &themes_panel::ThemesPanel {
-        &self.themes
-    }
-
-    /// Read-only view of the fonts panel state.
-    #[must_use]
-    pub fn fonts(&self) -> &fonts_panel::FontsPanel {
-        &self.fonts
-    }
-
-    /// Read-only view of the session panel state.
-    #[must_use]
-    pub fn session(&self) -> &session_panel::SessionPanel {
-        &self.session
-    }
-
     /// Read-only view of the notifications panel state.
     #[must_use]
     pub fn notifications(&self) -> &notifications_panel::NotificationsPanel {
         &self.notifications
-    }
-
-    /// Read-only view of the power panel state.
-    #[must_use]
-    pub fn power(&self) -> &power_panel::PowerPanel {
-        &self.power
-    }
-
-    /// Read-only view of the removable panel state.
-    #[must_use]
-    pub fn removable(&self) -> &removable_panel::RemovablePanel {
-        &self.removable
-    }
-
-    /// Read-only view of the displays panel state.
-    #[must_use]
-    pub fn displays(&self) -> &displays_panel::DisplaysPanel {
-        &self.displays
-    }
-
-    /// Read-only view of the sound panel state.
-    #[must_use]
-    pub fn sound(&self) -> &sound_panel::SoundPanel {
-        &self.sound
-    }
-
-    /// Read-only view of the printers panel state.
-    #[must_use]
-    pub fn printers(&self) -> &printers_panel::PrintersPanel {
-        &self.printers
     }
 
     /// Read-only view of the inventory panel state.
@@ -579,18 +446,6 @@ impl App {
     #[must_use]
     pub fn run_history(&self) -> &run_history_panel::RunHistoryPanel {
         &self.run_history
-    }
-
-    /// Read-only view of the datetime panel state.
-    #[must_use]
-    pub fn datetime(&self) -> &datetime_panel::DateTimePanel {
-        &self.datetime
-    }
-
-    /// Read-only view of the default-apps panel state.
-    #[must_use]
-    pub fn default_apps(&self) -> &default_apps_panel::DefaultAppsPanel {
-        &self.default_apps
     }
 
     /// Read-only view of the snapshots panel state.
@@ -621,30 +476,6 @@ impl App {
     #[must_use]
     pub fn repair(&self) -> &repair_panel::RepairPanel {
         &self.repair
-    }
-
-    /// Read-only view of the apps-installed panel state.
-    #[must_use]
-    pub fn apps_installed(&self) -> &apps_installed_panel::AppsInstalledPanel {
-        &self.apps_installed
-    }
-
-    /// Read-only view of the apps-sources panel state.
-    #[must_use]
-    pub fn apps_sources(&self) -> &apps_sources_panel::AppsSourcesPanel {
-        &self.apps_sources
-    }
-
-    /// Read-only view of the apps-install panel state.
-    #[must_use]
-    pub fn apps_install(&self) -> &apps_install_panel::AppsInstallPanel {
-        &self.apps_install
-    }
-
-    /// Read-only view of the apps-remove panel state.
-    #[must_use]
-    pub fn apps_remove(&self) -> &apps_remove_panel::AppsRemovePanel {
-        &self.apps_remove
     }
 
     /// Read-only view of the firewall panel state.
@@ -841,17 +672,7 @@ impl App {
                 Task::none()
             }
             Message::Connect(msg) => self.connect.update(msg),
-            Message::Themes(msg) => self.themes.update(msg),
-            Message::Fonts(msg) => self.fonts.update(msg, self.backend()),
-            Message::Session(msg) => self.session.update(msg, self.backend()),
             Message::Notifications(msg) => self.notifications.update(msg, self.backend()),
-            Message::Power(msg) => self.power.update(msg, self.backend()),
-            Message::Removable(msg) => self.removable.update(msg, self.backend()),
-            Message::Displays(msg) => self.displays.update(msg, self.backend()),
-            Message::Keyboard(msg) => self.keyboard.update(msg, self.backend()),
-            Message::Mouse(msg) => self.mouse.update(msg, self.backend()),
-            Message::Sound(msg) => self.sound.update(msg),
-            Message::SoundRefresh => sound_panel::SoundPanel::load(),
             Message::Home(msg) => self.home.update(msg),
             Message::HelpTopicOpened(path) => {
                 help_index_panel::spawn_xdg_open(&path);
@@ -894,9 +715,7 @@ impl App {
                     .spawn();
                 Task::none()
             }
-            Message::Printers(msg) => self.printers.update(msg),
             Message::Music(msg) => self.music.update(msg),
-            Message::PrintersRefresh => printers_panel::PrintersPanel::load(),
             Message::Inventory(msg) => self.inventory.update(msg),
             Message::Hardware(msg) => self.hardware.update(msg),
             Message::Jobs(msg) => self.jobs.update(msg),
@@ -909,18 +728,12 @@ impl App {
             Message::FleetLogs(msg) => self.fleet_logs.update(msg),
             Message::Playbooks(msg) => self.playbooks.update(msg),
             Message::RunHistory(msg) => self.run_history.update(msg),
-            Message::DateTime(msg) => self.datetime.update(msg),
-            Message::DefaultApps(msg) => self.default_apps.update(msg),
             Message::Snapshots(msg) => self.snapshots.update(msg),
             Message::Logs(msg) => self.logs.update(msg),
             Message::Resources(msg) => self.resources.update(msg),
             Message::Compute(msg) => self.compute.update(msg),
             Message::SystemUpdate(msg) => self.system_update.update(msg),
             Message::Repair(msg) => self.repair.update(msg),
-            Message::AppsInstalled(msg) => self.apps_installed.update(msg),
-            Message::AppsSources(msg) => self.apps_sources.update(msg),
-            Message::AppsInstall(msg) => self.apps_install.update(msg),
-            Message::AppsRemove(msg) => self.apps_remove.update(msg),
             Message::HealthCheck(msg) => self.health_check.update(msg),
             Message::Drift(msg) => self.drift.update(msg),
             Message::Policy(msg) => self.policy.update(msg),
@@ -939,7 +752,6 @@ impl App {
             Message::ServicePublishing(msg) => self.service_publishing.update(msg),
             Message::MeshStorage(msg) => self.mesh_storage.update(msg),
             Message::NetworkHosts(msg) => self.network_hosts.update(msg),
-            Message::PanelApps(msg) => self.panel_apps.update(msg),
             Message::RemoteDesktop(msg) => self.remote_desktop.update(msg),
             Message::Peers(msg) => self.peers.update(msg),
             Message::SyncStatus(msg) => self.sync_status.update(msg),
@@ -990,18 +802,8 @@ impl App {
     /// shipped yet) just no-op.
     fn on_panel_navigated(&self, _group: Group, panel: &'static str) -> Task<Message> {
         match panel {
-            "themes" => themes_panel::ThemesPanel::load(),
-            "fonts" => fonts_panel::FontsPanel::load(self.backend()),
             "wallpaper" => wallpaper_panel::WallpaperPanel::load(self.backend()),
-            "session" => session_panel::SessionPanel::load(self.backend()),
             "notifications" => notifications_panel::NotificationsPanel::load(self.backend()),
-            "power" => power_panel::PowerPanel::load(self.backend()),
-            "removable" => removable_panel::RemovablePanel::load(self.backend()),
-            "displays" => displays_panel::DisplaysPanel::load(self.backend()),
-            "keyboard" => keyboard_panel::KeyboardPanel::load(self.backend()),
-            "mouse" => mouse_panel::MousePanel::load(self.backend()),
-            "sound" => sound_panel::SoundPanel::load(),
-            "printers" => printers_panel::PrintersPanel::load(),
             "music" => music_panel::MusicPanel::load(),
             // v4.0.1 WB-1 (Phase 0.7 rescue): Connected Devices
             // panel. Real D-Bus subscription wiring chains on
@@ -1019,8 +821,6 @@ impl App {
             "node_roles" => node_roles_panel::NodeRolesPanel::load(),
             "playbooks" => playbooks_panel::PlaybooksPanel::load(),
             "run_history" => run_history_panel::RunHistoryPanel::load(),
-            "datetime" => datetime_panel::DateTimePanel::load(),
-            "default_apps" => default_apps_panel::DefaultAppsPanel::load(),
             "snapshots" => snapshots_panel::SnapshotsPanel::load(),
             "logs" => logs_panel::LogsPanel::load(),
             "resources" => resources_panel::ResourcesPanel::load(),
@@ -1056,8 +856,6 @@ impl App {
             "mesh_bus" => mesh_bus_panel::MeshBusPanel::load(),
             // v4.0.1 WB-2.i — scan probe.json cache for pending peers.
             "mesh_pending" => mesh_pending_panel::MeshPendingPanel::load(),
-            // v4.0.1 WB-2.d — load applet visibility from panel.toml.
-            "panel" => panel_apps_panel::PanelAppsPanel::load(),
             // v4.0.1 — panel.toml sync-status surface (Look & Feel).
             "sync_status" => sync_status_panel::SyncStatusPanel::load(),
             // v4.0.1 WB-2.k — peer roster via `mackesd nodes list --json`.
@@ -1079,8 +877,6 @@ impl App {
             // PLANES-1 (W7) — the Peers directory: Front Door plane +
             // the Controller/Inventory door both load it.
             "peers" => peers_panel::PeersPanel::load(),
-            "installed" => apps_installed_panel::AppsInstalledPanel::load(),
-            "sources" => apps_sources_panel::AppsSourcesPanel::load(),
             "firewall" => firewall_panel::FirewallPanel::load(),
             "wifi" => wifi_panel::WifiPanel::load(),
             "mesh_history" => mesh_history_panel::MeshHistoryPanel::load(),
@@ -1261,34 +1057,12 @@ impl App {
             View::Panel { panel: "index", .. } => self.help.view(),
             View::Panel { panel: "about", .. } => crate::panels::about::AboutPanel::view(),
             View::Panel {
-                panel: "themes", ..
-            } => self.themes.view(),
-            View::Panel { panel: "fonts", .. } => self.fonts.view(),
-            View::Panel {
                 panel: "wallpaper", ..
             } => self.wallpaper.view(),
-            View::Panel {
-                panel: "session", ..
-            } => self.session.view(),
             View::Panel {
                 panel: "notifications",
                 ..
             } => self.notifications.view(),
-            View::Panel { panel: "power", .. } => self.power.view(),
-            View::Panel {
-                panel: "removable", ..
-            } => self.removable.view(),
-            View::Panel {
-                panel: "displays", ..
-            } => self.displays.view(),
-            View::Panel {
-                panel: "keyboard", ..
-            } => self.keyboard.view(),
-            View::Panel { panel: "mouse", .. } => self.mouse.view(),
-            View::Panel { panel: "sound", .. } => self.sound.view(),
-            View::Panel {
-                panel: "printers", ..
-            } => self.printers.view(),
             View::Panel { panel: "music", .. } => self.music.view(),
             View::Panel {
                 panel: "connect", ..
@@ -1328,13 +1102,6 @@ impl App {
                 ..
             } => self.node_roles.view(),
             View::Panel {
-                panel: "datetime", ..
-            } => self.datetime.view(),
-            View::Panel {
-                panel: "default_apps",
-                ..
-            } => self.default_apps.view(),
-            View::Panel {
                 panel: "snapshots", ..
             } => self.snapshots.view(),
             View::Panel { panel: "logs", .. } => self.logs.view(),
@@ -1348,22 +1115,6 @@ impl App {
             View::Panel {
                 panel: "repair", ..
             } => self.repair.view(),
-            View::Panel {
-                panel: "installed", ..
-            } => self.apps_installed.view(),
-            View::Panel {
-                panel: "sources", ..
-            } => self.apps_sources.view(),
-            View::Panel {
-                panel: "install", ..
-            } => self.apps_install.view(),
-            View::Panel {
-                panel: "remove", ..
-            } => self.apps_remove.view(),
-            // v4.0.1 WB-2.d (2026-05-23) — Apps → Panel Apps
-            // visibility editor (per-applet toggles, writes to
-            // ~/.config/mde/panel.toml).
-            View::Panel { panel: "panel", .. } => self.panel_apps.view(),
             // v4.0.1 (2026-05-23) — Look & Feel → Panel Sync
             // Status reads panel.toml mtime + mackesd healthz
             // JSON to surface the mesh-sync state.
@@ -1371,16 +1122,6 @@ impl App {
                 panel: "sync_status",
                 ..
             } => self.sync_status.view(),
-            // v4.0.1 WB-2.e (2026-05-23) — the Maintain → Debloat
-            // sidebar entry routes to the same curated-bloat-list
-            // panel the Apps → Remove path uses. Two nav paths
-            // hit one panel surface; the design lock places
-            // Debloat under Maintain (mass system cleanup), with
-            // the Apps → Remove path retained as the per-app
-            // entry point.
-            View::Panel {
-                panel: "debloat", ..
-            } => self.apps_remove.view(),
             // v4.0.1 WB-2.f (2026-05-23) — Maintain → Health
             // Check renders the local-probe table (disk space,
             // memory, failed units, DNS, dnf backlog, snapshot
@@ -1863,94 +1604,21 @@ mod tests {
     }
 
     #[test]
-    fn select_look_and_feel_themes_swaps_view_and_returns_load_task() {
+    fn select_kept_wallpaper_panel_relocates_to_this_node() {
+        // NAV-1.2 — wallpaper is a mesh-specific kept panel, relocated from
+        // the retired Desktop group into This Node.
         let mut app = App::new();
-        // The Task isn't directly observable in unit tests
-        // (it lands inside iced's executor), but the View
-        // change + backend identity confirm the navigation
-        // path fired.
         let _ = app.update(Message::SelectPanel {
-            group: Group::Desktop,
-            panel: "themes",
+            group: Group::ThisNode,
+            panel: "wallpaper",
         });
         assert_eq!(
             app.current_view(),
             View::Panel {
-                group: Group::Desktop,
-                panel: "themes"
+                group: Group::ThisNode,
+                panel: "wallpaper"
             }
         );
-    }
-
-    #[test]
-    fn themes_panel_picks_route_through_app_reducer() {
-        // GUI-3 — the rewritten panel holds the pending Carbon-gray
-        // selection; picks route through the App reducer.
-        let mut app = App::new();
-        let _ = app.update(Message::Themes(themes_panel::Message::ThemePicked(
-            "gray90".into(),
-        )));
-        let _ = app.update(Message::Themes(themes_panel::Message::DensityPicked(
-            "compact".into(),
-        )));
-        assert_eq!(app.themes().theme, "gray90");
-        assert_eq!(app.themes().density, "compact");
-    }
-
-    #[test]
-    fn select_devices_session_swaps_view_to_panel() {
-        // E6.4 — session lives under Devices now (moved from System).
-        let mut app = App::new();
-        let _ = app.update(Message::SelectPanel {
-            group: Group::Desktop,
-            panel: "session",
-        });
-        assert_eq!(
-            app.current_view(),
-            View::Panel {
-                group: Group::Desktop,
-                panel: "session"
-            }
-        );
-    }
-
-    #[test]
-    fn session_panel_toggle_messages_persist_in_app_state() {
-        let mut app = App::new();
-        let _ = app.update(Message::Session(session_panel::Message::SaveOnExitChanged(
-            true,
-        )));
-        let _ = app.update(Message::Session(
-            session_panel::Message::LockOnSuspendChanged(true),
-        ));
-        assert!(app.session().save_on_exit);
-        assert!(app.session().lock_on_suspend);
-    }
-
-    #[test]
-    fn power_panel_field_changes_persist_in_app_state() {
-        let mut app = App::new();
-        let _ = app.update(Message::Power(power_panel::Message::ProfileChanged(
-            "performance".into(),
-        )));
-        let _ = app.update(Message::Power(power_panel::Message::PresentationChanged(
-            true,
-        )));
-        assert_eq!(app.power().profile, "performance");
-        assert!(app.power().presentation_mode);
-    }
-
-    #[test]
-    fn removable_panel_field_changes_persist_in_app_state() {
-        let mut app = App::new();
-        let _ = app.update(Message::Removable(
-            removable_panel::Message::OnInsertChanged(true),
-        ));
-        let _ = app.update(Message::Removable(
-            removable_panel::Message::AutorunChanged(false),
-        ));
-        assert!(app.removable().on_insert);
-        assert!(!app.removable().autorun);
     }
 
     #[test]
@@ -1964,19 +1632,6 @@ mod tests {
         ));
         assert!(app.notifications().dnd);
         assert_eq!(app.notifications().location, "top-left");
-    }
-
-    #[test]
-    fn fonts_panel_field_changes_persist_in_app_state() {
-        let mut app = App::new();
-        let _ = app.update(Message::Fonts(fonts_panel::Message::NameChanged(
-            "Inter 11".into(),
-        )));
-        let _ = app.update(Message::Fonts(fonts_panel::Message::HintingChanged(
-            "full".into(),
-        )));
-        assert_eq!(app.fonts().name, "Inter 11");
-        assert_eq!(app.fonts().hinting, "full");
     }
 
     #[test]
@@ -2004,8 +1659,8 @@ mod tests {
     fn focus_request_empty_slug_preserves_view() {
         let mut app = App::new();
         let _ = app.update(Message::SelectPanel {
-            group: Group::Desktop,
-            panel: "sources",
+            group: Group::System,
+            panel: "snapshots",
         });
         let before = app.current_view();
         let _ = app.update(Message::FocusRequest(String::new()));

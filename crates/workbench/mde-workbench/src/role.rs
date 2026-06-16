@@ -29,7 +29,7 @@ use crate::Message;
 /// PLANES-1: the four new plane groups reuse existing Material glyphs
 /// (no new SVG assets) — kept distinct per the `role_icons_*` test.
 const fn role_icon(group: Group) -> Icon {
-    // NAV-1 — distinct glyph per visible section (+ hidden Desktop).
+    // NAV-1 — distinct glyph per visible section.
     match group {
         Group::Dashboard => Icon::Dashboard,
         Group::ThisNode => Icon::Workbench,
@@ -38,7 +38,6 @@ const fn role_icon(group: Group) -> Icon {
         Group::Provisioning => Icon::Update,
         Group::Monitoring => Icon::Maintain,
         Group::System => Icon::System,
-        Group::Desktop => Icon::Devices,
     }
 }
 
@@ -67,9 +66,6 @@ const fn role_description(group: Group) -> &'static str {
         Group::System => {
             "Configure and maintain — local/fleet config, policy, snapshots, debloat, repair, and help."
         }
-        Group::Desktop => {
-            "Desktop settings (deferred to Cosmic Settings) — apps, displays, sound, look & feel, and system."
-        }
     }
 }
 
@@ -84,7 +80,6 @@ const fn see_also(group: Group) -> &'static [Group] {
         Group::Provisioning => &[Group::Fleet, Group::Mesh, Group::System],
         Group::Monitoring => &[Group::Mesh, Group::Fleet, Group::System],
         Group::System => &[Group::ThisNode, Group::Monitoring, Group::Provisioning],
-        Group::Desktop => &[Group::System, Group::ThisNode],
     }
 }
 
@@ -385,13 +380,33 @@ mod tests {
     }
 
     #[test]
-    fn desktop_settings_are_not_in_the_sidebar() {
-        // NAV-1 (Q2) — desktop settings defer to Cosmic; the Desktop group
-        // is hidden from the sidebar but stays deep-link-reachable.
-        assert!(!Group::sidebar_groups().contains(&Group::Desktop));
-        assert!(
-            !role_action_panels(Group::Desktop).is_empty(),
-            "hidden Desktop still holds its (deep-link-reachable) panels"
-        );
+    fn this_node_role_card_surfaces_relocated_wallpaper_and_notifications() {
+        // NAV-1.2 — the Desktop group was retired; wallpaper + notifications
+        // (mesh-specific kept panels) now surface as This Node role tasks.
+        let slugs: Vec<&str> = role_action_panels(Group::ThisNode)
+            .iter()
+            .map(Panel::slug)
+            .collect();
+        for want in ["wallpaper", "notifications"] {
+            assert!(
+                slugs.contains(&want),
+                "This Node missing relocated {want}: {slugs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn system_role_card_surfaces_relocated_update_and_sync_status() {
+        // NAV-1.2 — system update + panel sync status relocated into System.
+        let slugs: Vec<&str> = role_action_panels(Group::System)
+            .iter()
+            .map(Panel::slug)
+            .collect();
+        for want in ["system_update", "sync_status"] {
+            assert!(
+                slugs.contains(&want),
+                "System missing relocated {want}: {slugs:?}"
+            );
+        }
     }
 }

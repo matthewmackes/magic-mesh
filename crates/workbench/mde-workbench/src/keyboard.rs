@@ -113,10 +113,10 @@ pub fn interpret_key(key: Key, mods: Modifiers, current_pane: Pane) -> KeyAction
         (Key::Escape, _) => KeyAction::CloseDetail,
         (Key::Digit(n), m) if m.ctrl && (1..=9).contains(&n) => {
             // Group-hotkey table: Ctrl+1 → first sidebar section … Ctrl+7
-            // → seventh. NAV-1 has seven visible sections (Overview, This
-            // Node, Mesh, Fleet, Provisioning, Monitoring, System); the
-            // hidden Desktop group is not hotkey-reachable. A digit past
-            // the last section is ignored (no panic).
+            // → seventh. NAV-1 has seven sections (Overview, This Node,
+            // Mesh, Fleet, Provisioning, Monitoring, System); NAV-1.2 retired
+            // the hidden Desktop group. A digit past the last section is
+            // ignored (no panic).
             let idx = (n - 1) as usize;
             Group::sidebar_groups()
                 .get(idx)
@@ -172,8 +172,8 @@ mod tests {
 
     #[test]
     fn ctrl_digit_jumps_to_matching_sidebar_group() {
-        // NAV-1 — Ctrl+1..7 map to the seven visible sections; Ctrl+8/9
-        // are ignored (the hidden Desktop group is not hotkey-reachable).
+        // NAV-1 — Ctrl+1..7 map to the seven sections; Ctrl+8/9 are ignored
+        // (there is no eighth section after NAV-1.2 retired Desktop).
         let cases = [
             (1, Group::Dashboard),
             (2, Group::ThisNode),
