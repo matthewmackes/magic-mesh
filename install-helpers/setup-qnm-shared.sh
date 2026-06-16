@@ -131,10 +131,19 @@ Description=Mount the QNM-Shared LizardFS volume over the overlay
 After=nebula.service network-online.target
 Wants=nebula.service
 Before=mackesd.service
+# BOOT-REC-2: never let the start-limit burst give up + leave the mount failed
+# (the stuck-"activating"/NO-LEADER state seen after a cold reboot). Retry until
+# the overlay+master are reachable; the mesh-health watchdog covers later drops.
+StartLimitIntervalSec=0
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStartPre=/bin/sh -c 'for i in \$(seq 1 30); do mfsmount -H $MASTER_IP -t 2 /mnt 2>/dev/null && fusermount -u /mnt 2>/dev/null && exit 0; sleep 2; done; exit 0'
+# BOOT-REC-2: a cold boot brings nebula + the LizardFS master up AFTER this unit
+# is first scheduled, so wait for the master to actually answer on the overlay
+# (matocl port 9421) before mounting — a TCP probe, not a doomed test-mount of a
+# possibly-non-empty /mnt. Bounded (~2 min) so a genuinely-down master still
+# falls through to ExecStart (which fails → Restart + the mesh-health watchdog).
+ExecStartPre=/bin/sh -c 'for i in \$(seq 1 60); do (exec 3<>/dev/tcp/$MASTER_IP/9421) 2>/dev/null && exec 3>&- && exit 0; sleep 2; done; exit 0'
 ExecStart=/bin/sh -c 'mountpoint -q $QNM_PATH || mfsmount $QNM_PATH -H $MASTER_IP -o allow_other'
 ExecStop=/bin/sh -c 'fusermount -u $QNM_PATH 2>/dev/null || umount -l $QNM_PATH 2>/dev/null || true'
 Restart=on-failure

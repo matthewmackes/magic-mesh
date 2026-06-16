@@ -367,6 +367,8 @@ assets = [
     # shared-state volume over the overlay, boot-durable. Run per-node with
     # --master/--chunkserver/--client (see the script header).
     { source = "install-helpers/setup-qnm-shared.sh",    dest = "/usr/libexec/mackesd/setup-qnm-shared",        mode = "755" },
+    # BOOT-REC-4 — the reboot-recovery verification gate (run after a reboot).
+    { source = "install-helpers/verify-boot-recovery.sh", dest = "/usr/libexec/mackesd/verify-boot-recovery",   mode = "755" },
     # SETUP-fix — SHARED bus spool so the root mackesd daemon + the uid-1000
     # desktop GUIs share one bus (tmpfiles makes the sticky dir; environment.d
     # gives the user session the same MDE_BUS_ROOT the unit sets).
