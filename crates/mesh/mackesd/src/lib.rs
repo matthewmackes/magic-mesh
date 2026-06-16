@@ -226,6 +226,32 @@ pub fn default_qnm_shared_root() -> std::path::PathBuf {
     mackes_mesh_types::peers::default_workgroup_root()
 }
 
+/// The canonical deployed QNM-Shared mount point — the only path where an
+/// unmounted-but-written-to directory poisons LizardFS (see
+/// [`shared_root_writable`]).
+pub const CANONICAL_QNM_MOUNT: &str = "/mnt/mesh-storage";
+
+/// ONBOARD-6 / AUDIT-MESH-15 guard: is it SAFE to write under `root`?
+///
+/// The one unsafe case is the canonical shared mount
+/// ([`CANONICAL_QNM_MOUNT`]) when it is **not actually a FUSE mount** — writing
+/// there (the leader lock, peer heartbeats, the directory) fills the mountpoint
+/// so LizardFS can never `mfsmount` over it again ("mountpoint is not empty"),
+/// and the daemon then silently reads a stale local 1-node dir. Any other root
+/// (a dev `~/QNM-Shared`, a tempdir, or the mount when genuinely mounted) is
+/// always writable, so dev/test paths are unaffected.
+#[must_use]
+pub fn shared_root_writable(root: &std::path::Path) -> bool {
+    if root != std::path::Path::new(CANONICAL_QNM_MOUNT) {
+        return true;
+    }
+    // Canonical mount path: writable only when it's a real mount.
+    std::fs::read_to_string("/proc/mounts").is_ok_and(|c| {
+        c.lines()
+            .any(|l| l.split_whitespace().nth(1) == Some(CANONICAL_QNM_MOUNT))
+    })
+}
+
 /// v2.0.0 Phase 0.6 — env-var rename shim.
 ///
 /// Reads `$new_name` first. If unset, reads `$legacy_name`; when
@@ -259,6 +285,34 @@ pub fn env_with_legacy_fallback(new_name: &str, legacy_name: &str) -> Option<Str
             Some(v)
         }
         Err(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod shared_root_tests {
+    use super::shared_root_writable;
+    use std::path::Path;
+
+    #[test]
+    fn non_canonical_roots_are_always_writable() {
+        // Dev/test paths (tempdirs, ~/QNM-Shared) are never the poison case.
+        assert!(shared_root_writable(Path::new("/home/mm/QNM-Shared")));
+        assert!(shared_root_writable(Path::new("/tmp/anything")));
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(shared_root_writable(tmp.path()));
+    }
+
+    #[test]
+    fn canonical_mount_writable_iff_actually_mounted() {
+        // The canonical path is writable exactly when /proc/mounts lists it —
+        // so on a machine where it isn't mounted, the guard blocks the write.
+        let listed = std::fs::read_to_string("/proc/mounts")
+            .map(|c| {
+                c.lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some("/mnt/mesh-storage"))
+            })
+            .unwrap_or(false);
+        assert_eq!(shared_root_writable(Path::new("/mnt/mesh-storage")), listed);
     }
 }
 

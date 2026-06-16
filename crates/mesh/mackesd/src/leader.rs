@@ -104,6 +104,19 @@ impl Lease {
 /// rewritten.
 pub fn try_acquire(lock_path: &Path, node_id: &str) -> std::io::Result<AcquireResult> {
     if let Some(parent) = lock_path.parent() {
+        // ONBOARD-6 guard: never create the leader lock under the canonical QNM
+        // mount when it isn't actually mounted — that poisons the mountpoint so
+        // LizardFS can't remount, and leadership would be against a stale local
+        // dir (the NO-LEADER churn seen on .13).
+        if !crate::shared_root_writable(parent) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "QNM-Shared mount {} is down — refusing to take leadership on an unmounted volume",
+                    parent.display()
+                ),
+            ));
+        }
         std::fs::create_dir_all(parent)?;
     }
     let mut file = OpenOptions::new()

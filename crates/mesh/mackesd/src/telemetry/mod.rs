@@ -228,6 +228,17 @@ pub fn detect_mde_core_version() -> Option<String> {
 /// Returns `std::io::Error` when the parent directory isn't
 /// writable or the rename fails.
 pub fn write_heartbeat(workgroup_root: &Path, hb: &Heartbeat) -> std::io::Result<PathBuf> {
+    // ONBOARD-6 guard: never write into the canonical QNM mount when it isn't
+    // actually mounted — that poisons the mountpoint so LizardFS can't remount.
+    if !crate::shared_root_writable(workgroup_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "QNM-Shared mount {} is down — skipping heartbeat write (would poison the mountpoint)",
+                workgroup_root.display()
+            ),
+        ));
+    }
     let path = heartbeat_path(workgroup_root, &hb.node_id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
