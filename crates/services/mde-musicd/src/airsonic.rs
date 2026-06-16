@@ -21,6 +21,7 @@
 //! so the client is fully unit-testable without a live server.
 
 use std::fmt;
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -234,8 +235,24 @@ impl Client {
             user: user.into(),
             token: auth_token(password, salt),
             salt: salt.to_string(),
-            http: reqwest::Client::new(),
+            http: Self::build_http_client(),
         }
+    }
+
+    /// AUDIT-MESH-14 — the HTTP client used for every Airsonic call, with hard
+    /// connect + total timeouts. Without these (`reqwest::Client::new()` has no
+    /// timeout), a call to an unreachable/misconfigured server hangs forever and
+    /// wedges `mde-musicd`'s single-threaded Bus serve loop, starving EVERY
+    /// `action/music/*` verb (get-state, list-albums, …) — observed live on a
+    /// node with no reachable Airsonic. Falls back to the untimed client only if
+    /// the builder somehow fails (it won't with these options).
+    #[must_use]
+    fn build_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
     }
 
     /// The common auth + format query params attached to every call.
