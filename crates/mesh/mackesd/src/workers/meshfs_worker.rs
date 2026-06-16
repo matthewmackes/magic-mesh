@@ -597,30 +597,12 @@ impl MeshFsWorker {
         // 8. Quota: hourly setquota call (MESHFS-9.1).
         self.tick_once_quota();
 
-        // 8b. FPG-7 / Q13 — bind-mount the five XDG user dirs from the
-        //     mesh volume over each desktop user's home dirs (never
-        //     ~/Local/). Only when the mesh mount is live; idempotent (a
-        //     target already mounted is skipped). AUDIT-MESH-15: bind for
-        //     the real desktop user(s) — NOT the daemon's $HOME=/root,
-        //     which is the home nobody sees — and surface bind failures at
-        //     WARN (a silent debug log is how this hid for the whole
-        //     project; the ONBOARD-6 failure class).
-        if master_up {
-            let mount = self.mount_path();
-            let mut homes = desktop_user_homes();
-            // Headless node with no desktop user: fall back to the daemon's
-            // own home so a Server's communal dirs still materialize.
-            if homes.is_empty() {
-                if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-                    homes.push(home);
-                }
-            }
-            for home in homes {
-                for line in ensure_xdg_binds(&mount, &home) {
-                    tracing::warn!(target: "mackesd::meshfs_worker", "{line}");
-                }
-            }
-        }
+        // 8b. FPG-7 / Q13 — the XDG bind moved to `tick_xdg_binds` (called
+        //     independently from the run loop). AUDIT-MESH-15 fix: it must NOT
+        //     be gated behind tick_once's step-1 `mfsmaster on PATH` guard —
+        //     a Workstation runs lizardfs-client ONLY (mfsmount, no mfsmaster),
+        //     so the bind was unreachable on exactly the desktop nodes that
+        //     need ~/Documents synced. The bind only needs the mount live.
 
         // 9. MESHFS-6.1 — Replay staged offline writes now that master is up.
         //    Skipped when master is unreachable (don't replay into a down master;
@@ -664,6 +646,34 @@ impl MeshFsWorker {
     ///   2. (Re)start `mfsmaster -a` so the local shadow promotes itself
     ///      to active master — LizardFS HA-cluster mode picks up the
     ///      promotion once the VIP is on this interface.
+    /// AUDIT-MESH-15 — bind the desktop user(s)' XDG dirs onto the communal
+    /// mesh volume. Runs INDEPENDENTLY of `tick_once` so it is never gated
+    /// behind that method's step-1 `mfsmaster on PATH` guard: a Workstation
+    /// runs lizardfs-client only (mfsmount, no mfsmaster), so the bind must
+    /// not require a local master. Only needs the mount live (master
+    /// reachable). Binds for the real desktop user(s) — not the daemon's
+    /// `$HOME=/root` — and surfaces failures at WARN (not a silent debug log,
+    /// the ONBOARD-6 lesson).
+    pub fn tick_xdg_binds(&self) {
+        if !master_reachable(&self.vip) {
+            return;
+        }
+        let mount = self.mount_path();
+        let mut homes = desktop_user_homes();
+        // Headless node with no desktop user: fall back to the daemon's own
+        // home so a Server's communal dirs still materialize.
+        if homes.is_empty() {
+            if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+                homes.push(home);
+            }
+        }
+        for home in homes {
+            for line in ensure_xdg_binds(&mount, &home) {
+                tracing::warn!(target: "mackesd::meshfs_worker", "{line}");
+            }
+        }
+    }
+
     pub fn tick_once_ha(&self) {
         // Only lighthouses can hold the VIP.
         if !self.role_marker_path.exists() {
@@ -819,6 +829,9 @@ impl Worker for MeshFsWorker {
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
         self.tick_once();
+        // AUDIT-MESH-15: the XDG bind runs independently of tick_once's
+        // mfsmaster guard (Workstations have no mfsmaster).
+        self.tick_xdg_binds();
 
         // MESHFS-10.1: open Bus persist for action polling. Persist is !Sync,
         // so it's wrapped in a Mutex (the standard Bus-responder pattern).
@@ -838,7 +851,10 @@ impl Worker for MeshFsWorker {
             tokio::select! {
                 biased;
                 _ = shutdown.wait() => break,
-                _ = lfs_tick.tick() => self.tick_once(),
+                _ = lfs_tick.tick() => {
+                    self.tick_once();
+                    self.tick_xdg_binds();
+                }
                 _ = action_tick.tick() => {
                     if let Some(ref p_mutex) = persist_opt {
                         let p = p_mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
