@@ -404,6 +404,14 @@ assets = [
     # ENT-12 — operator help docs; the Workbench Help panel + `mackesd
     # state-restore` reference these at /usr/share/mde/help/.
     { source = "docs/help/*.md",                   dest = "/usr/share/mde/help/", mode = "644" },
+    # BRAND epic — Carbon system-wide branding, applied one-way on first boot of
+    # a Workstation-role node by magic-mesh-brand.service (operator lock 2026-06-16).
+    { source = "install-helpers/magic-mesh-brand.sh", dest = "/usr/libexec/mackesd/magic-mesh-brand", mode = "755" },
+    { source = "packaging/systemd/magic-mesh-brand.service", dest = "/usr/lib/systemd/system/magic-mesh-brand.service", mode = "644" },
+    { source = "assets/brand/mackes-carbon-icons.zip", dest = "/usr/share/magic-mesh/brand/mackes-carbon-icons.zip", mode = "644" },
+    { source = "assets/brand/cosmic-layout/**/*",  dest = "/usr/share/magic-mesh/brand/cosmic-layout/", mode = "644" },
+    { source = "assets/brand/monogram.png",        dest = "/usr/share/magic-mesh/brand/monogram.png",   mode = "644" },
+    { source = "assets/brand/greeter-hero.png",    dest = "/usr/share/magic-mesh/brand/greeter-hero.png", mode = "644" },
 ]
 # EFF-14 — install/upgrade/remove scriptlets: register the daemon unit, create
 # the config dir, refresh icon/desktop caches; clean up on removal. Guards keep
@@ -416,6 +424,10 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 # the mackesd supervisor. (mackesd self-gates on a pinned role, so enabling
 # it pre-enrollment is safe — it idles until `found`/`join` pins a role.)
 systemctl enable mackesd.service nebula.service mesh-health.timer >/dev/null 2>&1 || :
+# BRAND — arm the one-way Carbon branding for first boot. The unit self-gates on
+# Workstation role (ExecCondition) + a run-once stamp, so enabling it everywhere
+# is safe: Server/Lighthouse skip it.
+systemctl enable magic-mesh-brand.service >/dev/null 2>&1 || :
 # SETUP-fix — materialize the shared bus dir now (no reboot needed).
 systemd-tmpfiles --create /usr/lib/tmpfiles.d/magic-mesh.conf >/dev/null 2>&1 || :
 [ -d /etc/mackesd ] || install -d -m 0700 /etc/mackesd
