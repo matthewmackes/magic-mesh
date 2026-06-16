@@ -113,6 +113,9 @@ pub enum Message {
     /// v4.0.1 WB-2.c — Help index opened a topic; the path is
     /// dispatched to `xdg-open`.
     HelpTopicOpened(std::path::PathBuf),
+    /// About panel — open an external URL/mailto (GitHub, Releases,
+    /// Contact) detached via `xdg-open`.
+    OpenExternal(&'static str),
     /// E6.2 — open a Settings page at the given deep-link slug
     /// (`""` = the Settings home). Fired by the Dashboard role's
     /// See-also links.
@@ -676,6 +679,17 @@ impl App {
             Message::Home(msg) => self.home.update(msg),
             Message::HelpTopicOpened(path) => {
                 help_index_panel::spawn_xdg_open(&path);
+                Task::none()
+            }
+            Message::OpenExternal(url) => {
+                // About panel links (GitHub / Releases / mailto). Detached,
+                // best-effort — a missing xdg-open simply no-ops.
+                let _ = std::process::Command::new("xdg-open")
+                    .arg(url)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
                 Task::none()
             }
             Message::OpenSettings(slug) => {

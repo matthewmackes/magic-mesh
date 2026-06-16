@@ -13,6 +13,22 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
+### Added
+- **About panel** (System → About) now surfaces the GitHub repository, a
+  Releases/changelog link, and a maintainer contact (all open via `xdg-open`),
+  the build version, and the embedded changelog — alongside the existing
+  disclaimer, each single-sourced from the repo (`CHANGELOG.md` / `DISCLAIMER.md`).
+- **Air-gapped birthrights (BIRTHRIGHT-2):** the ntfy broker and starship prompt
+  are now bundled in the RPM (`/usr/share/magic-mesh/vendor/`) and provisioned
+  bundled-first at first boot, so an offline install still comes up fully
+  provisioned; the network fetch remains a fallback.
+
+### Fixed
+- **`~/Documents` mesh sync (AUDIT-MESH-15):** the FPG-7 XDG bind-mount now
+  targets the real desktop user's home (not the daemon's `/root`), creates the
+  communal mesh source tree, and logs bind failures loudly instead of swallowing
+  them — so files dropped in `~/Documents` replicate mesh-wide.
+
 ## [10.0.0] - 2026-06-13
 
 First packaged release.
