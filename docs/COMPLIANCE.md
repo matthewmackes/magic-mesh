@@ -198,3 +198,27 @@ mount (`/mnt/mesh-storage`) was missing on .13, so every directory/DNS/storage
 read saw a local 1-record dir. Fixed live on .13 (directory now returns 4). The
 durable fix (mount on every node, boot-durable, fail-loud watchdog) + the
 code-level findings (2–6) are worklist items for the next release.
+
+---
+
+## AUDIT — Birthrights vs advertised service requirements (fit-for-purpose), 2026-06-16
+
+**Question:** do the install + first-boot *birthrights* match what the advertised services actually need to run?
+**Birthrights inventory:** hard `Requires:` = `nebula`, `nmap`, `alsa-lib`. `Recommends:` = ansible-core, kamailio, rtpengine, libvirt-*, openssh-clients, firewalld, podman, rsync. First-boot fetches = starship, ntfy (added this session). Enabled units = mackesd, nebula, mesh-health.timer, mesh-status.timer, mesh-shell-setup, mesh-broker-setup, magic-mesh-brand (Workstation). All workspace binaries + Carbon icons + brand assets are bundled.
+
+**Thesis:** dnf-repo deps are birthrights; **out-of-repo deps were silently NOT provisioned**. The pattern repeats across the platform's substrate.
+
+| Location | Category | Evidence | Confidence | Verdict |
+|---|---|---|---|---|
+| LizardFS substrate (§1 shared-state plane) | Unprovisioned precondition | No `lizardfs` Require; `setup-qnm-shared.sh` shipped to /usr/libexec but **never auto-invoked** — `cmd_found`/`cmd_join` (ONBOARD-4) don't provision it; the QNM-Shared mount + master/chunkserver are manual. Leader election, CSR watcher, directory, Documents, fleet, CA all REQUIRE it mounted but a fresh `dnf install` + `found`/`join` doesn't mount it → silent NO-LEADER/empty-mesh (the ONBOARD-6 failure class). **NOT fit-for-purpose out of the box.** | High | **FINISH** (BIRTHRIGHT-1) |
+| ntfy cross-node broker | Unprovisioned precondition | Template not shipped (`TemplateMissing`) + ntfy not installed (`NtfyMissing`) → broker permanently skipped → per-node-local bus, no mesh-wide notifications. | High | **FINISH — FIXED this session** (NOTIFY-DIST-1: template shipped + first-boot fetch) |
+| starship (MESHSHELL prompt) | Unprovisioned precondition | Not in Fedora repos; the Carbon prompt is inert without it. | Med | **FINISH — FIXED this session** (SHELL-2: checksum-verified first-boot fetch) |
+| lizardfs-admin (Mesh Storage query) | Unprovisioned precondition | Not in F44 repos; the Mesh Storage panel can't query the master without it. | High | **FINISH** — handled out-of-band (AUDIT-MESH-12); fold into BIRTHRIGHT-1 |
+| First-boot fetch model (ntfy/starship/future LizardFS) | Fit-for-purpose caveat | The fetch birthrights need **internet at first boot**; an offline/air-gapped install won't provision them, and there's no bundled fallback. | Med | **FINISH** (BIRTHRIGHT-2: decide bundle-vs-fetch for air-gapped) |
+| Recommends (kamailio/rtpengine/libvirt/ansible-core) | Weak-dep birthright | `Recommends:` → dnf pulls by default but `--setopt=install_weak_deps=False` skips them; voice/VM/fleet degrade if skipped. The daemons degrade gracefully (logged), so acceptable — but the advertised feature is silently absent. | Low | OK (documented; graceful degrade) |
+| alsa-lib | Birthright | Now a hard Require (REL-2, this session). | High | OK |
+| nebula, nmap | Birthright | Hard Requires, in base repos. | High | OK |
+
+**Counts:** Unprovisioned-precondition FINISH = 4 (1 critical open: LizardFS; 2 fixed this session: ntfy, starship; 1 out-of-band: lizardfs-admin) · Fit-for-purpose caveat = 1 · OK = 3.
+
+**Bottom line — fit for purpose?** Partially. The in-repo birthrights are correct, and this session closed the ntfy + starship gaps. **But the core shared-state substrate (LizardFS) is not a birthright** — a fresh install is not a working mesh until LizardFS is manually provisioned. That + the air-gapped-fetch caveat are the open items.
