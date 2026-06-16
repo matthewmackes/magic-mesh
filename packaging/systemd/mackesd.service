@@ -94,6 +94,13 @@ SystemCallArchitectures=native
 # intent above — while leaving /etc writable for the config-management role.
 ProtectSystem=true
 PrivateTmp=true
+# AUDIT-MESH-15 (2026-06-16) — PrivateTmp puts the daemon in a private mount
+# namespace, so the FPG-7 `mount --bind` of the desktop user's XDG dirs
+# (~/Documents → the communal QNM-Shared dir) was invisible to the user's
+# session. MountFlags=shared propagates the daemon's mounts out to the host
+# namespace so the desktop user actually sees the synced dirs. (Also lets the
+# qnm-shared FUSE mount changes propagate in.)
+MountFlags=shared
 ProtectKernelLogs=true
 ProtectControlGroups=true
 LockPersonality=true
