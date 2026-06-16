@@ -16,13 +16,23 @@ log(){ echo "mesh-install-ntfy: $*"; }
 if command -v ntfy >/dev/null 2>&1 && ntfy --version 2>/dev/null | grep -q "${VER#v}"; then
   log "ntfy ${VER} already present"; exit 0
 fi
-command -v curl >/dev/null || { log "curl missing — skipping"; exit 0; }
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-log "fetching ntfy ${VER}"
-curl -fsSL "$URL" -o "$TMP/$ASSET" || { log "download failed (will retry next boot)"; exit 0; }
-echo "${SHA256}  $TMP/$ASSET" | sha256sum -c - >/dev/null 2>&1 \
-  || { log "SHA256 MISMATCH — refusing to install"; exit 1; }
-tar -xzf "$TMP/$ASSET" -C "$TMP" || { log "extract failed"; exit 0; }
+# BIRTHRIGHT-2 — bundled-first (air-gapped). The RPM ships the pinned tarball
+# at /usr/share/magic-mesh/vendor/$ASSET; prefer it so a first boot with no
+# network still provisions the broker. Only reach the network when absent.
+VENDOR="/usr/share/magic-mesh/vendor/${ASSET}"
+SRC=""
+if [ -f "$VENDOR" ] && echo "${SHA256}  $VENDOR" | sha256sum -c - >/dev/null 2>&1; then
+  log "using bundled ntfy ${VER} (offline)"; SRC="$VENDOR"
+else
+  command -v curl >/dev/null || { log "no bundle + curl missing — skipping"; exit 0; }
+  log "no valid bundle — fetching ntfy ${VER}"
+  curl -fsSL "$URL" -o "$TMP/$ASSET" || { log "download failed (will retry next boot)"; exit 0; }
+  echo "${SHA256}  $TMP/$ASSET" | sha256sum -c - >/dev/null 2>&1 \
+    || { log "SHA256 MISMATCH — refusing to install"; exit 1; }
+  SRC="$TMP/$ASSET"
+fi
+tar -xzf "$SRC" -C "$TMP" || { log "extract failed"; exit 0; }
 bin="$(find "$TMP" -type f -name ntfy | head -1)"
 [ -n "$bin" ] || { log "ntfy binary not found in tarball"; exit 0; }
 install -m755 "$bin" "$DEST" && log "installed ntfy ${VER} -> $DEST"

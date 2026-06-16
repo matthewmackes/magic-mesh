@@ -434,6 +434,14 @@ assets = [
     { source = "data/ntfy/server.yml.tmpl",             dest = "/usr/share/mde/ntfy/server.yml.tmpl",      mode = "644" },
     { source = "install-helpers/mesh-install-ntfy.sh",  dest = "/usr/libexec/mackesd/mesh-install-ntfy",   mode = "755" },
     { source = "packaging/systemd/mesh-broker-setup.service", dest = "/usr/lib/systemd/system/mesh-broker-setup.service", mode = "644" },
+    # BIRTHRIGHT-2 — bundled air-gapped first-boot blobs. The mesh-install-*
+    # helpers prefer these over a network fetch, so an offline install still
+    # provisions ntfy + starship. NOT in git — fetched + sha256-verified at
+    # build time by install-helpers/vendor-birthright-blobs.sh (which
+    # build-rpm-fedora43.sh runs before generate-rpm). lizardfs stays fetch-only
+    # under BIRTHRIGHT-1 (see docs/design/birthrights.md).
+    { source = "vendor/birthright/ntfy_2.24.0_linux_amd64.tar.gz", dest = "/usr/share/magic-mesh/vendor/ntfy_2.24.0_linux_amd64.tar.gz", mode = "644" },
+    { source = "vendor/birthright/starship-x86_64-unknown-linux-musl.tar.gz", dest = "/usr/share/magic-mesh/vendor/starship-x86_64-unknown-linux-musl.tar.gz", mode = "644" },
 ]
 # EFF-14 — install/upgrade/remove scriptlets: register the daemon unit, create
 # the config dir, refresh icon/desktop caches; clean up on removal. Guards keep

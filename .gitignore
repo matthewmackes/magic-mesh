@@ -28,3 +28,8 @@ lizardfs-binaries.tar.gz
 # Claude Code session workflow scripts (one-off, local paths) — not source
 .claude/workflows/
 target-f43/
+
+# BIRTHRIGHT-2 — bundled air-gapped first-boot blobs (ntfy, starship). Fetched +
+# sha256-verified at build time by install-helpers/vendor-birthright-blobs.sh and
+# shipped in the RPM; third-party binaries, not source.
+/vendor/birthright/

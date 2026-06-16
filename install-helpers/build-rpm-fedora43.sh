@@ -21,6 +21,11 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGE="registry.fedoraproject.org/fedora:${FEDORA}"
 command -v podman >/dev/null || { echo "podman required" >&2; exit 1; }
 
+# BIRTHRIGHT-2 — stage the bundled air-gapped first-boot blobs on the host
+# (has network) before the container build, so the generate-rpm assets exist.
+echo "==> staging bundled birthright blobs (ntfy, starship)"
+"$REPO/install-helpers/vendor-birthright-blobs.sh"
+
 echo "==> pulling $IMAGE"
 podman pull "$IMAGE" >/dev/null
 
