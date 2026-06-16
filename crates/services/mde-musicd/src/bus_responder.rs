@@ -589,10 +589,19 @@ pub fn serve<F: Fn() -> bool>(persist: &Persist, queue_path: &Path, should_stop:
         .map(|e| crate::mpris::spawn(e.handle(), queue_path.to_path_buf(), state::data_dir()));
     let mut last_state_write = Instant::now();
     while !should_stop() {
+        // AUDIT-MESH-14 — run the FAST, local-only responders (queue control,
+        // transport/get-state, peer roster) BEFORE the network-bound browse
+        // proxy. `poll_browse` does blocking Airsonic REST calls; if it ran
+        // first, a slow/unreachable server would starve every transport reply
+        // in this single-threaded loop (observed live: get-state timed out at
+        // 9s, just under poll_browse's ~10s HTTP timeout). With transport first,
+        // get-state is answered within POLL_INTERVAL of the request regardless
+        // of browse latency. (The Airsonic client also has connect/total
+        // timeouts now so browse itself can't hang forever.)
         poll_once(persist, queue_path, &mut cursors);
-        poll_browse(persist, &rt, &mut cursors);
         poll_transport(persist, queue_path, engine.as_ref(), &mut cursors);
         poll_peers(persist, &mut cursors);
+        poll_browse(persist, &rt, &mut cursors);
         if last_state_write.elapsed() >= STATE_WRITE_INTERVAL {
             write_periodic_state(engine.as_ref(), queue_path);
             last_state_write = Instant::now();
