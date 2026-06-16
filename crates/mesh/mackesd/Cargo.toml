@@ -85,6 +85,9 @@ mde-card = { path = "../../shared/mde-card" }
 # SWAY-4 (v6.0 Q89/Q94) — marks_state worker uses Persist + rpc::reply_topic
 # to serve action/marks/* Bus action topics. Optional (async-services gate).
 mde-bus = { path = "../../platform/mde-bus", optional = true }
+# NOTIFY-DIST-2 — the alert-mirror worker reuses the alert-lane predicate +
+# shared-dir mirror helpers (async-services gate, with mde-bus).
+mde-notify = { path = "../../services/mde-notify", optional = true }
 # E1.2 — role-gated worker subsets: run_serve gates each worker spawn by the
 # pinned deployment role (mde_role::load → rank). Non-optional + zero-dep, so
 # the gating logic is available regardless of feature set.
@@ -291,6 +294,7 @@ async-services = [
     "dep:rustls-native-certs",
     "dep:futures-util",
     "dep:mde-bus",
+    "dep:mde-notify",
 ]
 
 [package.metadata.docs.rs]

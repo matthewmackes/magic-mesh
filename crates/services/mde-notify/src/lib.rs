@@ -370,6 +370,45 @@ impl AlertTail {
         fresh
     }
 
+    /// NOTIFY-DIST-2 — poll the replicated shared-alerts directory (every peer's
+    /// mirrored alerts under `<workgroup_root>/.mesh-alerts/<host>/`) and return
+    /// new, deduped [`AlertItem`]s (oldest first). Shares the dedup set with
+    /// [`poll`](Self::poll), so a node's own alert (present in both its local bus
+    /// and its own mirror) is shown once. This is what makes the panel mesh-wide:
+    /// each node only ever tails its *local* bus, but reads *everyone's* mirror.
+    pub fn poll_shared(&mut self, workgroup_root: &std::path::Path) -> Vec<AlertItem> {
+        let base = shared_alert_dir(workgroup_root);
+        let mut fresh = Vec::new();
+        let Ok(hosts) = std::fs::read_dir(&base) else {
+            return fresh;
+        };
+        for host in hosts.flatten() {
+            if !host.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let Ok(files) = std::fs::read_dir(host.path()) else {
+                continue;
+            };
+            for f in files.flatten() {
+                let p = f.path();
+                if p.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&p) else {
+                    continue;
+                };
+                let Ok(msg) = serde_json::from_slice::<StoredMessage>(&bytes) else {
+                    continue;
+                };
+                if self.mark_seen(&msg.ulid) {
+                    fresh.push(alert_from_message(&msg));
+                }
+            }
+        }
+        fresh.sort_by_key(|a| a.ts_unix_ms);
+        fresh
+    }
+
     /// Record `id` as seen; returns `true` if it's new. Bounds the set FIFO.
     fn mark_seen(&mut self, id: &str) -> bool {
         if self.seen.contains(id) {
@@ -383,6 +422,39 @@ impl AlertTail {
         }
         true
     }
+}
+
+/// NOTIFY-DIST-2 — the replicated shared-alerts directory on the workgroup
+/// (QNM-Shared) root. Each node mirrors its own alert-lane messages under
+/// `<root>/.mesh-alerts/<host>/` so every node's panel can render mesh-wide.
+#[must_use]
+pub fn shared_alert_dir(workgroup_root: &std::path::Path) -> std::path::PathBuf {
+    workgroup_root.join(".mesh-alerts")
+}
+
+/// NOTIFY-DIST-2 — mirror one alert message into the shared dir under `host`,
+/// atomically (temp + rename). Idempotent: an existing `<ulid>.json` is left
+/// untouched (the mirror worker re-runs over the same lane). Used by the
+/// mackesd alert-mirror worker; the receiving side is [`AlertTail::poll_shared`].
+///
+/// # Errors
+/// Filesystem create/write/rename failures (e.g. the mount is read-only).
+pub fn write_shared_alert(
+    workgroup_root: &std::path::Path,
+    host: &str,
+    msg: &StoredMessage,
+) -> std::io::Result<()> {
+    let dir = shared_alert_dir(workgroup_root).join(host);
+    std::fs::create_dir_all(&dir)?;
+    let dst = dir.join(format!("{}.json", msg.ulid));
+    if dst.exists() {
+        return Ok(());
+    }
+    let body = serde_json::to_string(msg)
+        .map_err(|e| std::io::Error::other(format!("serialize alert: {e}")))?;
+    let tmp = dir.join(format!("{}.json.tmp", msg.ulid));
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &dst)
 }
 
 #[cfg(test)]
@@ -401,6 +473,38 @@ mod tests {
             actions: Vec::new(),
             reply_to: None,
         }
+    }
+
+    #[test]
+    fn shared_alert_roundtrip_and_dedup() {
+        // NOTIFY-DIST-2 — mirror two peers' alerts to the shared dir, then a
+        // node's tail picks them all up via poll_shared; a second poll is empty.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let a = msg("01AAA", "peer/alpha/alerts", "high", "{\"summary\":\"a\"}");
+        let b = msg("01BBB", "fleet/sec", "urgent", "{\"summary\":\"b\"}");
+        write_shared_alert(root, "alpha", &a).unwrap();
+        write_shared_alert(root, "bravo", &b).unwrap();
+        // Idempotent re-mirror is a no-op (no error, no dup file content).
+        write_shared_alert(root, "alpha", &a).unwrap();
+
+        let mut tail = AlertTail::default();
+        let got = tail.poll_shared(root);
+        let ids: Vec<&str> = got.iter().map(|i| i.id.as_str()).collect();
+        assert!(
+            ids.contains(&"01AAA") && ids.contains(&"01BBB"),
+            "got {ids:?}"
+        );
+        assert_eq!(got.len(), 2);
+        // Dedup: nothing new on the next poll.
+        assert!(tail.poll_shared(root).is_empty());
+    }
+
+    #[test]
+    fn poll_shared_missing_dir_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tail = AlertTail::default();
+        assert!(tail.poll_shared(tmp.path()).is_empty());
     }
 
     #[test]

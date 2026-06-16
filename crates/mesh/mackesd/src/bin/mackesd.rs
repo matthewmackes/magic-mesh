@@ -5072,6 +5072,29 @@ fn bus_retention_policy(bus_root: &std::path::Path) -> mde_bus::retention::Reten
     policy
 }
 
+/// NOTIFY-DIST-2 — keep a node's shared-alert subdir bounded. ULID filenames
+/// sort chronologically, so lexicographic order is age order; remove the oldest
+/// beyond `keep`. Best-effort (a failed unlink is ignored).
+#[cfg(feature = "async-services")]
+fn prune_shared_alerts(dir: &std::path::Path, keep: usize) {
+    let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+            .collect(),
+        Err(_) => return,
+    };
+    if files.len() <= keep {
+        return;
+    }
+    files.sort();
+    let remove = files.len() - keep;
+    for p in files.into_iter().take(remove) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 #[cfg(feature = "async-services")]
 fn run_serve(
     workgroup_root: Option<PathBuf>,
@@ -6492,6 +6515,63 @@ fn run_serve(
                 ))
                 .unwrap_or_else(|e| tracing::warn!(error = %e, "Bus retention GC thread spawn failed"));
             worker_names.lock().expect("worker_names mutex").push("bus_retention_gc".into());
+        }
+        // NOTIFY-DIST-2 — mirror THIS node's alert-lane messages to the
+        // replicated QNM-Shared dir so EVERY node's notification panel shows
+        // mesh-wide alerts. The bus is per-node (tmpfs) and AlertTail only ever
+        // tails the LOCAL bus, so without this a panel shows only its own node's
+        // alerts (the "no notifications in the mesh app" report). Each node
+        // writes its own `<workgroup>/.mesh-alerts/<host>/` subdir; every node
+        // reads all subdirs (mde_notify::AlertTail::poll_shared). Own OS thread
+        // (Persist is !Send); gated on a writable shared root so it never
+        // poisons an unmounted mountpoint (BOOT-REC-1).
+        if let Some(bus_root) = mde_bus::default_data_dir() {
+            let wg = workgroup_root.clone();
+            let host = local_hostname();
+            let resp_shutdown = Arc::clone(&shutdown);
+            std::thread::Builder::new()
+                .name("alert-mirror".into())
+                .spawn(move || {
+                    let persist = match mde_bus::persist::Persist::open(bus_root) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "alert-mirror: bus open failed; worker skipped");
+                            return;
+                        }
+                    };
+                    let mut cursors: HashMap<String, String> = HashMap::new();
+                    let mut tick: u64 = 0;
+                    while !resp_shutdown.load(Ordering::Relaxed) {
+                        if mackesd_core::shared_root_writable(&wg) {
+                            let topics = persist.list_topics().unwrap_or_default();
+                            for topic in topics.into_iter().filter(|t| mde_notify::topic_is_alert_lane(t)) {
+                                let cur = cursors.get(&topic).cloned();
+                                if let Ok(msgs) = persist.list_since(&topic, cur.as_deref()) {
+                                    for m in msgs {
+                                        cursors.insert(topic.clone(), m.ulid.clone());
+                                        if let Err(e) = mde_notify::write_shared_alert(&wg, &host, &m) {
+                                            tracing::debug!(error = %e, "alert-mirror: shared write failed");
+                                        }
+                                    }
+                                }
+                            }
+                            // Bound our subdir every ~5 min (ULIDs sort by age).
+                            if tick % 75 == 0 {
+                                prune_shared_alerts(&mde_notify::shared_alert_dir(&wg).join(&host), 2000);
+                            }
+                        }
+                        tick = tick.wrapping_add(1);
+                        for _ in 0..4 {
+                            if resp_shutdown.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                        }
+                    }
+                })
+                .map(|_h| tracing::info!("Alert-mirror worker spawned (NOTIFY-DIST-2: mesh-wide notifications)"))
+                .unwrap_or_else(|e| tracing::warn!(error = %e, "alert-mirror thread spawn failed"));
+            worker_names.lock().expect("worker_names mutex").push("alert_mirror".into());
         }
         // E0.3.3 / FPG-4 — Fleet control surface (push/list/diff/
         // rollback/nudge) on the mesh Bus at action/fleet/<verb>,

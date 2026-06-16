@@ -371,6 +371,20 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
                     state.items.truncate(MAX_ROWS);
                 }
             }
+            // NOTIFY-DIST-2 — also read the replicated shared-alerts dir so the
+            // panel shows mesh-wide notifications (every peer's mirrored alerts),
+            // not just this node's. Deduped against the local tail (shared
+            // dedup set). The workgroup root honors MDE_WORKGROUP_ROOT.
+            {
+                let wg = mackes_mesh_types::peers::default_workgroup_root();
+                let mut fresh = state.tail.poll_shared(&wg);
+                fresh.sort_by(|a, b| b.ts_unix_ms.cmp(&a.ts_unix_ms));
+                for item in fresh {
+                    state.items.insert(0, item);
+                }
+                state.items.sort_by(|a, b| b.ts_unix_ms.cmp(&a.ts_unix_ms));
+                state.items.truncate(MAX_ROWS);
+            }
             // NOTIFY-AC — refresh the Music + Voice section snapshots.
             state.music = fetch_music();
             state.voice = fetch_voice();
