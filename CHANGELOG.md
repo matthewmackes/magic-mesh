@@ -13,6 +13,8 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
+## [10.0.10] - 2026-06-16
+
 ### Added
 - **`magic-setup` wizard (SETUP):** a full-screen TUI that takes a fresh node
   from install to running mesh member — Create a mesh, Join one, list peers, and
