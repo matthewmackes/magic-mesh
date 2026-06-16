@@ -176,6 +176,9 @@ struct Center {
     music: Option<MusicNow>,
     /// NOTIFY-AC — voice agent snapshot (`None` when no agent has published).
     voice: Option<VoiceStatus>,
+    /// AC-5 — live Do-Not-Disturb state (the quick-toggle tile reflects + flips
+    /// the same `mde_bus::dnd` the toast/sound paths honor).
+    dnd_active: bool,
 }
 
 impl Center {
@@ -186,6 +189,7 @@ impl Center {
             collapsed: HashSet::new(),
             music: None,
             voice: None,
+            dnd_active: false,
         }
     }
 }
@@ -205,6 +209,8 @@ enum Message {
     Close,
     /// Launch one of the bottom quick-launch apps and close the panel.
     OpenApp(&'static str),
+    /// AC-5 — flip Do-Not-Disturb (quick-toggle tile).
+    ToggleDnd,
     /// NOTIFY-AC — music transport: previous / play-pause toggle / next.
     MusicPrev,
     MusicToggle,
@@ -368,6 +374,21 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
             // NOTIFY-AC — refresh the Music + Voice section snapshots.
             state.music = fetch_music();
             state.voice = fetch_voice();
+            // AC-5 — reflect the live DND state in the quick-toggle.
+            if let Some(dir) = mde_bus::client_data_dir() {
+                state.dnd_active = mde_bus::dnd::load_default(&dir).active;
+            }
+        }
+        Message::ToggleDnd => {
+            // AC-5 — flip + persist DND to the same store the toast/sound paths
+            // read, so the quick-toggle is authoritative, not a separate flag.
+            if let Some(dir) = mde_bus::client_data_dir() {
+                let mut st = mde_bus::dnd::load_default(&dir);
+                st.active = !st.active;
+                if mde_bus::dnd::save_default(&dir, &st).is_ok() {
+                    state.dnd_active = st.active;
+                }
+            }
         }
         Message::MusicPrev | Message::MusicToggle | Message::MusicNext => {
             use std::time::Duration;
@@ -565,6 +586,24 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
     .padding(Padding::from([10u16, 14u16]))
     .width(Length::Fill);
 
+    // AC-5 — W10-style quick-actions row (toggles), above the app launchers.
+    let dnd_label = if state.dnd_active {
+        "🔕 Do Not Disturb · on"
+    } else {
+        "🔔 Do Not Disturb · off"
+    };
+    let quick_actions = container(
+        row![quick_toggle(
+            dnd_label,
+            state.dnd_active,
+            Message::ToggleDnd,
+            p
+        )]
+        .spacing(8),
+    )
+    .padding(Padding::from([6u16, 14u16]))
+    .width(Length::Fill);
+
     container(
         column![
             container(scroll).height(Length::Fill),
@@ -572,6 +611,8 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
             now_playing_section(state.music.as_ref(), p),
             section_divider(p),
             voice_section(state.voice.as_ref(), p),
+            section_divider(p),
+            quick_actions,
             launch_bar,
         ]
         .spacing(0),
@@ -712,6 +753,21 @@ fn launch_tile<'a>(label: &'a str, cmd: &'static str, p: Palette) -> Element<'a,
     )
     .width(Length::Fill)
     .on_press(Message::OpenApp(cmd))
+    .into()
+}
+
+/// AC-5 — a W10-style quick-action toggle tile. When `on`, the label is drawn in
+/// the Carbon accent so the active state reads at a glance (matching the W10
+/// Action Center's highlighted quick-actions).
+fn quick_toggle<'a>(label: &'a str, on: bool, msg: Message, p: Palette) -> Element<'a, Message> {
+    let fg = if on { p.accent } else { p.text_muted };
+    button(
+        container(text(label).size(12).color(fg.into_cosmic_color()))
+            .center_x(Length::Fill)
+            .padding(Padding::from([8u16, 6u16])),
+    )
+    .width(Length::Fill)
+    .on_press(msg)
     .into()
 }
 
