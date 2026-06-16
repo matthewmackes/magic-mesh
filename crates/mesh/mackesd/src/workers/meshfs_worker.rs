@@ -128,12 +128,56 @@ pub const DEFAULT_REPLICATION_GOAL: u8 = 2;
 /// `~/Local/` is deliberately absent — it is NEVER mesh-mounted.
 pub const XDG_MESH_DIRS: [&str; 5] = ["Documents", "Downloads", "Music", "Pictures", "Videos"];
 
+/// Resolve the home directories of the regular desktop users (uid
+/// 1000–60000) whose home exists under `/home` (AUDIT-MESH-15 bug #1).
+///
+/// The daemon runs as **root** (`$HOME=/root`), so binding the XDG dirs
+/// against `$HOME` only ever touched `/root/Documents` — never the
+/// `/home/<u>/Documents` the desktop user actually sees. Parse
+/// `/etc/passwd` directly (no extra crate dep) and bind for every real
+/// desktop user so a file dropped in their `~/Documents` lands in the
+/// communal mesh source. Headless Server/Lighthouse nodes return an
+/// empty list (no desktop user → nothing to bind).
+#[must_use]
+pub fn desktop_user_homes() -> Vec<PathBuf> {
+    let Ok(contents) = std::fs::read_to_string("/etc/passwd") else {
+        return Vec::new();
+    };
+    let mut homes = Vec::new();
+    for line in contents.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() < 7 {
+            continue;
+        }
+        let Ok(uid) = fields[2].parse::<u32>() else {
+            continue;
+        };
+        if !(1000..60000).contains(&uid) {
+            continue;
+        }
+        let home = PathBuf::from(fields[5]);
+        if home.starts_with("/home") && home.is_dir() && !homes.contains(&home) {
+            homes.push(home);
+        }
+    }
+    homes
+}
+
 /// Execute the [`xdg_bind_plan`]: for each pair whose target is not
-/// already a mountpoint, create both dirs and `mount --bind`. Errors
-/// degrade to debug logs (unprivileged dev runs, missing mount).
-pub fn ensure_xdg_binds(mount_path: &Path, home: &Path) {
+/// already a mountpoint, create the communal source + the target and
+/// `mount --bind`. The communal source is made world-writable (0777) so
+/// any desktop user on any node can drop files into the shared dir
+/// (mirrors the cross-uid bus-spool fix, AUDIT-MESH-16). Returns the
+/// human-readable failure lines (empty ⇒ all binds satisfied) so the
+/// caller can surface them **loudly** — a silent debug log is exactly
+/// how AUDIT-MESH-15 hid (the ONBOARD-6 failure class).
+pub fn ensure_xdg_binds(mount_path: &Path, home: &Path) -> Vec<String> {
+    let mut failures = Vec::new();
     if !mount_path.is_dir() {
-        return;
+        return vec![format!(
+            "FPG-7: mesh mount {} is not a directory — XDG binds skipped",
+            mount_path.display()
+        )];
     }
     for (source, target) in xdg_bind_plan(mount_path, home) {
         // `mountpoint -q` exits 0 when target is already a mountpoint.
@@ -146,7 +190,22 @@ pub fn ensure_xdg_binds(mount_path: &Path, home: &Path) {
         if already {
             continue;
         }
-        if std::fs::create_dir_all(&source).is_err() || std::fs::create_dir_all(&target).is_err() {
+        if let Err(e) = std::fs::create_dir_all(&source) {
+            failures.push(format!(
+                "FPG-7: cannot create communal source {} — {e}",
+                source.display()
+            ));
+            continue;
+        }
+        // Communal: any desktop uid (this node or a peer) must be able to
+        // write. Best-effort — a non-root dev run can't chmod a foreign dir.
+        let _ =
+            std::fs::set_permissions(&source, std::os::unix::fs::PermissionsExt::from_mode(0o777));
+        if let Err(e) = std::fs::create_dir_all(&target) {
+            failures.push(format!(
+                "FPG-7: cannot create home target {} — {e}",
+                target.display()
+            ));
             continue;
         }
         match Command::new("mount")
@@ -163,15 +222,24 @@ pub fn ensure_xdg_binds(mount_path: &Path, home: &Path) {
                     target.display()
                 );
             }
-            Ok(_) | Err(_) => {
-                tracing::debug!(
-                    target: "mackesd::meshfs_worker",
-                    "FPG-7: bind of {} skipped (unprivileged or mount unavailable)",
+            Ok(st) => {
+                failures.push(format!(
+                    "FPG-7: `mount --bind {} {}` failed (exit {:?})",
+                    source.display(),
+                    target.display(),
+                    st.code()
+                ));
+            }
+            Err(e) => {
+                failures.push(format!(
+                    "FPG-7: `mount --bind {} {}` could not spawn — {e}",
+                    source.display(),
                     target.display()
-                );
+                ));
             }
         }
     }
+    failures
 }
 
 /// The bind-mount plan for one user's home (FPG-7 / Q13): pairs of
@@ -518,13 +586,27 @@ impl MeshFsWorker {
         self.tick_once_quota();
 
         // 8b. FPG-7 / Q13 — bind-mount the five XDG user dirs from the
-        //     mesh volume over the user's home dirs (never ~/Local/).
-        //     Only when the mesh mount is live; idempotent (a target
-        //     already mounted is skipped); degrades to a debug log when
-        //     not permitted (non-root dev runs).
+        //     mesh volume over each desktop user's home dirs (never
+        //     ~/Local/). Only when the mesh mount is live; idempotent (a
+        //     target already mounted is skipped). AUDIT-MESH-15: bind for
+        //     the real desktop user(s) — NOT the daemon's $HOME=/root,
+        //     which is the home nobody sees — and surface bind failures at
+        //     WARN (a silent debug log is how this hid for the whole
+        //     project; the ONBOARD-6 failure class).
         if master_up {
-            if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-                ensure_xdg_binds(&self.mount_path(), &home);
+            let mount = self.mount_path();
+            let mut homes = desktop_user_homes();
+            // Headless node with no desktop user: fall back to the daemon's
+            // own home so a Server's communal dirs still materialize.
+            if homes.is_empty() {
+                if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+                    homes.push(home);
+                }
+            }
+            for home in homes {
+                for line in ensure_xdg_binds(&mount, &home) {
+                    tracing::warn!(target: "mackesd::meshfs_worker", "{line}");
+                }
             }
         }
 
@@ -2013,6 +2095,47 @@ mod tests {
         assert!(plan
             .iter()
             .all(|(s, _)| s.starts_with("/mnt/mesh-storage/home")));
+    }
+
+    #[test]
+    fn ensure_xdg_binds_reports_loudly_when_mount_absent() {
+        // AUDIT-MESH-15: a missing mesh mount must return a failure line,
+        // not silently no-op (the ONBOARD-6 failure class).
+        let failures = ensure_xdg_binds(
+            Path::new("/nonexistent-mesh-mount-xyz"),
+            Path::new("/home/mm"),
+        );
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("is not a directory"));
+    }
+
+    #[test]
+    fn ensure_xdg_binds_creates_communal_source_when_mount_is_a_dir() {
+        // With a real (temp) mount dir but no privilege to bind, the
+        // communal source dirs are still created + the bind failures are
+        // surfaced — never swallowed.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let home = tmp.path().join("home-mm");
+        std::fs::create_dir_all(&home).expect("home");
+        let failures = ensure_xdg_binds(tmp.path(), &home);
+        // Source communal dirs must exist regardless of bind privilege.
+        assert!(tmp.path().join("home").join("Documents").is_dir());
+        // Unprivileged test run can't `mount --bind` → every dir reports a
+        // failure (loud), proving nothing is silently dropped.
+        assert_eq!(failures.len(), XDG_MESH_DIRS.len());
+    }
+
+    #[test]
+    fn desktop_user_homes_excludes_root_and_system_uids() {
+        // The resolver must never return /root (uid 0) or system accounts —
+        // that exact bug (binding the daemon's $HOME=/root) is AUDIT-MESH-15.
+        for home in desktop_user_homes() {
+            assert!(
+                home.starts_with("/home"),
+                "desktop home {} must live under /home, never /root or a system path",
+                home.display()
+            );
+        }
     }
 
     #[test]
