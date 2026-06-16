@@ -139,12 +139,12 @@ StartLimitIntervalSec=0
 Type=oneshot
 RemainAfterExit=yes
 # BOOT-REC-2: a cold boot brings nebula + the LizardFS master up AFTER this unit
-# is first scheduled, so wait for the master to actually answer on the overlay
-# (matocl port 9421) before mounting — a TCP probe, not a doomed test-mount of a
-# possibly-non-empty /mnt. Bounded (~2 min) so a genuinely-down master still
-# falls through to ExecStart (which fails → Restart + the mesh-health watchdog).
-ExecStartPre=/bin/sh -c 'for i in \$(seq 1 60); do (exec 3<>/dev/tcp/$MASTER_IP/9421) 2>/dev/null && exec 3>&- && exit 0; sleep 2; done; exit 0'
-ExecStart=/bin/sh -c 'mountpoint -q $QNM_PATH || mfsmount $QNM_PATH -H $MASTER_IP -o allow_other'
+# is first scheduled, so RETRY the actual mount until it succeeds (the master
+# becomes reachable a few seconds into boot). A portable POSIX loop — no bashism
+# (/dev/tcp is unavailable under /bin/sh=dash, which made the old probe spin the
+# full timeout and block mackesd). Bounded ~2 min; on a genuinely-down master it
+# exits non-zero → Restart + the mesh-health watchdog keep retrying.
+ExecStart=/bin/sh -c 'i=0; while [ \$i -lt 60 ]; do mountpoint -q $QNM_PATH && exit 0; mfsmount $QNM_PATH -H $MASTER_IP -o allow_other 2>/dev/null && exit 0; i=\$((i+1)); sleep 2; done; exit 1'
 ExecStop=/bin/sh -c 'fusermount -u $QNM_PATH 2>/dev/null || umount -l $QNM_PATH 2>/dev/null || true'
 Restart=on-failure
 RestartSec=5
