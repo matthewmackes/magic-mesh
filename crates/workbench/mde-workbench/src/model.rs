@@ -278,7 +278,6 @@ pub fn nav_model() -> Vec<NavEntry> {
                 // Maintenance.
                 Panel::new("hub", "Hub"),
                 Panel::new("snapshots", "Snapshots"),
-                Panel::new("debloat", "Debloat"),
                 Panel::new("repair", "Repair"),
                 // Maintenance — NAV-1.2 relocated System Update + Panel Sync
                 // Status here from the retired Desktop group (mesh-synced

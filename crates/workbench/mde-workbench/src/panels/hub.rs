@@ -50,15 +50,6 @@ impl HubPanel {
                 palette
             ),
             Space::new().width(Length::Fixed(12.0)),
-            tile(
-                "Debloat",
-                "Remove apps you don't use",
-                Icon::Delete,
-                Group::System,
-                "debloat",
-                palette
-            ),
-            Space::new().width(Length::Fixed(12.0)),
             // PLANES-1 — Health re-homed to the This Node plane.
             tile(
                 "Health Check",

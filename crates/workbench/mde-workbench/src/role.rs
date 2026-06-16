@@ -64,7 +64,7 @@ const fn role_description(group: Group) -> &'static str {
             "Observe everything — health, logs and metrics, fleet logs, run history, audit, mesh history, and resources."
         }
         Group::System => {
-            "Configure and maintain — local/fleet config, policy, snapshots, debloat, repair, and help."
+            "Configure and maintain — local/fleet config, policy, snapshots, repair, and help."
         }
     }
 }
