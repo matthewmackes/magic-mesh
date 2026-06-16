@@ -6,14 +6,25 @@ rust-version.workspace = true
 license.workspace = true
 description = "Magic Mesh enrollment TUI (ONBOARD-5): a full-screen ratatui app where an operator pastes a join token (and optionally overrides the lighthouse IP), then watches the fingerprint-pinned network enroll progress live. Headless over SSH — lighthouses/servers have no display."
 
+[lib]
+name = "mde_enroll"
+path = "src/lib.rs"
+
 [[bin]]
 name = "mde-enroll"
 path = "src/main.rs"
+
+# SETUP epic — the full-lifecycle wizard (grown from the mde-enroll TUI code).
+[[bin]]
+name = "magic-setup"
+path = "src/bin/magic-setup.rs"
 
 [dependencies]
 # The mesh control-plane lib — the network-enroll client (ONBOARD-3),
 # token parser, and bundle materializer the TUI drives.
 mackesd = { path = "../mackesd" }
+# SETUP — detect whether a deployment role is pinned (configured vs first-run).
+mde-role = { path = "../../platform/mde-role" }
 # Terminal UI + raw-mode/event backend. ratatui ships with the crossterm
 # backend; pin crossterm to match for the event loop.
 ratatui = "0.29"

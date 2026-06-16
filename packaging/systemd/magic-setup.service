@@ -1,0 +1,29 @@
+[Unit]
+# SETUP-6 — first-run console wizard. Launches magic-setup on the physical
+# console (tty1) ONLY when the node is unconfigured (no deployment role pinned),
+# and self-skips once /var/lib/mde/role.toml exists. It takes over tty1 (the
+# Fedora initial-setup pattern) but never touches SSH/pts sessions, so a remote
+# operator's session is never hijacked.
+Description=Magic Mesh first-run setup wizard (console)
+Documentation=man:magic-setup
+ConditionPathExists=!/var/lib/mde/role.toml
+After=systemd-user-sessions.service plymouth-quit-wait.service
+Conflicts=getty@tty1.service
+Before=getty.target
+
+[Service]
+Type=idle
+ExecStart=/usr/bin/magic-setup
+# Bind to the physical console only — never an SSH pts.
+StandardInput=tty
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+Restart=no
+# Hand tty1 back to getty after the wizard exits (configured or quit).
+ExecStopPost=-/usr/bin/systemctl start getty@tty1.service
+
+[Install]
+WantedBy=multi-user.target

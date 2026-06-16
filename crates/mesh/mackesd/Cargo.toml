@@ -327,6 +327,7 @@ assets = [
     # ONBOARD-5 — the Magic enrollment TUI (`mackesd join` with no token
     # launches it; runs headless over SSH).
     { source = "target/release/mde-enroll",         dest = "/usr/bin/mde-enroll",         mode = "755" },
+    { source = "target/release/magic-setup",        dest = "/usr/bin/magic-setup",        mode = "755" },
     { source = "target/release/mde-bus",            dest = "/usr/bin/mde-bus",            mode = "755" },
     { source = "target/release/mde-files",          dest = "/usr/bin/mde-files",          mode = "755" },
     { source = "target/release/mde-workbench",      dest = "/usr/bin/mde-workbench",      mode = "755" },
@@ -428,6 +429,9 @@ assets = [
     { source = "packaging/profile.d/zz-mde-welcome.sh", dest = "/etc/profile.d/zz-mde-welcome.sh",         mode = "644" },
     # MESHSHELL SHELL-4 — the `mesh-help` cheat sheet (user-facing on PATH).
     { source = "install-helpers/mesh-help.sh",          dest = "/usr/bin/mesh-help",                       mode = "755" },
+    # SETUP-6 — first-run console wizard unit + the unconfigured-node MOTD hint.
+    { source = "packaging/systemd/magic-setup.service", dest = "/usr/lib/systemd/system/magic-setup.service", mode = "644" },
+    { source = "packaging/profile.d/zz-mde-setup-motd.sh", dest = "/etc/profile.d/zz-mde-setup-motd.sh",   mode = "644" },
     # BUS cross-node notifications — the ntfy broker template (was never shipped,
     # so the broker skipped 'TemplateMissing') + the first-boot ntfy fetch
     # (ntfy isn't in the Fedora repos, so it can't be a hard Require). All roles.
@@ -476,6 +480,10 @@ systemctl enable mesh-shell-setup.service >/dev/null 2>&1 || :
 # Fedora repos; self-skips once /usr/bin/ntfy exists). All roles → mesh-wide
 # notification distribution.
 systemctl enable mesh-broker-setup.service >/dev/null 2>&1 || :
+# SETUP-6 — first-run console wizard. Self-gates on an unconfigured node
+# (ConditionPathExists=!/var/lib/mde/role.toml) + takes tty1 only, so enabling
+# it everywhere is safe: a configured node skips it and getty owns tty1.
+systemctl enable magic-setup.service >/dev/null 2>&1 || :
 # SETUP-fix — materialize the shared bus dir now (no reboot needed).
 systemd-tmpfiles --create /usr/lib/tmpfiles.d/magic-mesh.conf >/dev/null 2>&1 || :
 [ -d /etc/mackesd ] || install -d -m 0700 /etc/mackesd

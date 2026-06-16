@@ -12,7 +12,7 @@
 //! ([`mackesd_core::nebula_enroll_client`]) and reports progress over a
 //! channel.
 
-mod app;
+use mde_enroll::app;
 
 use std::io::{self, Stdout};
 use std::sync::mpsc;

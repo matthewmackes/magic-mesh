@@ -14,6 +14,12 @@ starts at the first packaged release line.
 ## [Unreleased]
 
 ### Added
+- **`magic-setup` wizard (SETUP):** a full-screen TUI that takes a fresh node
+  from install to running mesh member — Create a mesh, Join one, list peers, and
+  check service Status — narrating each step. Runs on the console at first boot
+  (unconfigured nodes) via `magic-setup.service` (tty1 only, never hijacks SSH)
+  and on demand as `sudo magic-setup`. A thin narrated layer over the existing
+  `mackesd found`/`join` verbs (which already provision LizardFS/QNM-Shared).
 - **LizardFS is now a birthright (BIRTHRIGHT-1):** `mackesd found`/`join`
   auto-provision the QNM-Shared shared-state plane role-aware — install the
   LizardFS binaries (dnf on F43, the bundled fc43 RPMs on F44/offline) and run
