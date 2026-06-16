@@ -650,6 +650,9 @@ A professional, themed, desktop-wide notification center replacing the Cosmic tr
     - [ ] ≥2 bundled OGG sound packs under `/usr/share/mde/sounds/<pack>/<severity>.ogg` (CC0/self-authored; in NOTICE)
     - [ ] `cpal`+`symphonia` player plays the configured pack per severity; `paplay` fallback
     - [ ] per-group enable/mute + pack selection persist; silent under DND (unless `override=dnd`)
+- [>] **NOTIFY-6: settings — consolidate notification settings into one surface. CODE DONE (2026-06-16); live-verify pending.** The Workbench `notifications.rs` panel is now the single settings home: it already single-sourced DND/placement/expire-ms (the `notification.*` sidecar keys → flag file + prefs.json); added a **Sounds** section (master switch + per-group mute for the 6 fixed `Source` groups) that reads/writes the **same** `notify-sound.yaml` (`mde_notify::SoundSettings` at `mde_bus::client_data_dir()`) the Hub + toast read — so there is no duplicate/contradictory state. The Hub's launch bar already opens the Workbench (where the panel lives). Per-group sound previously had no UI at all. Tests: `group_mute_toggle_adds_and_removes_one_label`, `sound_groups_are_the_six_fixed_non_peer_sources`. **Live-verify:** mute a group in the panel → the Hub/toast respects it; no setting lives in two places. *(animation-style + retention settings are deferred — no backing store/consumer yet, so no stub control.)*
+  <details><summary>(original story)</summary>
+
 - [ ] **NOTIFY-6: settings — fold the Workbench notifications panel into the Hub.**
   **As** an operator,
   **I want** one settings surface for DND, placement, expire-ms, per-group sound + animation + retention,
@@ -657,6 +660,7 @@ A professional, themed, desktop-wide notification center replacing the Cosmic tr
   **Acceptance**:
     - [ ] one settings sidecar single-sources DND/placement/expire-ms + the new per-group settings
     - [ ] the Workbench `notifications.rs` panel deep-links into the Hub settings (or is retired) — no duplicate state
+  </details>
     - [ ] settings round-trip across a restart (test-covered)
 - [✓] **NOTIFY-7: applet integration — notification bell + toggle + severity tint.** Operator direction (2026-06-15): the applet is now the notification bell — a single click **toggles the Action Center** open/closed (instant spawn-or-kill; the slow 4s quick-action popover is gone) and the bell **tints by the highest-severity unread alert** (shared `severity_token` Carbon map), clearing when the center is opened. Replaces the numeric-count idea with color-by-class per the operator.
   **As** a Cosmic user,

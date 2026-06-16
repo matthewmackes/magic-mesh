@@ -38,6 +38,22 @@ pub const KEY_DND: &str = "notification.do_not_disturb";
 pub const KEY_LOCATION: &str = "notification.location";
 pub const KEY_EXPIRE_MS: &str = "notification.default_expire_ms";
 
+/// NOTIFY-6 — the fixed (non-`Peer`) alert groups whose sound the operator can
+/// mute from this single settings surface. `Peer(<host>)` is dynamic and not a
+/// fixed toggle. Order is the table's display order.
+#[must_use]
+pub fn sound_groups() -> [mde_notify::Source; 6] {
+    use mde_notify::Source;
+    [
+        Source::Security,
+        Source::Presence,
+        Source::Firewall,
+        Source::Compute,
+        Source::DesktopApp,
+        Source::System,
+    ]
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct NotificationsPanel {
     pub dnd: bool,
@@ -47,6 +63,10 @@ pub struct NotificationsPanel {
     pub expire_ms_input: String,
     pub status: String,
     pub busy: bool,
+    /// NOTIFY-6 — master notification-sound switch (mde-notify `SoundSettings`).
+    pub sound_enabled: bool,
+    /// NOTIFY-6 — muted group labels (per [`mde_notify::Source::label`]).
+    pub muted_sources: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +75,8 @@ pub enum Message {
         dnd: bool,
         location: String,
         expire_ms: u32,
+        sound_enabled: bool,
+        muted_sources: Vec<String>,
     },
     Error(String),
     Saved,
@@ -62,6 +84,13 @@ pub enum Message {
     LocationChanged(String),
     ExpireMsChanged(String),
     SaveClicked,
+    /// NOTIFY-6 — master sound switch toggled (persists immediately).
+    SoundMasterChanged(bool),
+    /// NOTIFY-6 — a group's sound mute toggled (persists immediately).
+    GroupMuteChanged {
+        label: String,
+        mute: bool,
+    },
 }
 
 impl NotificationsPanel {
@@ -77,10 +106,15 @@ impl NotificationsPanel {
                 let location = strip_json_quotes(&backend.get(KEY_LOCATION).await?);
                 let expire_ms =
                     parse_u32(&backend.get(KEY_EXPIRE_MS).await?).unwrap_or(DEFAULT_EXPIRE_MS);
+                // NOTIFY-6 — per-group sound settings live in the same
+                // notify-sound.yaml the Hub + toast read (single source).
+                let sound = load_sound_settings();
                 Ok::<_, crate::backend::BackendError>(Message::Loaded {
                     dnd,
                     location,
                     expire_ms,
+                    sound_enabled: sound.enabled,
+                    muted_sources: sound.muted_sources,
                 })
             },
             |result| {
@@ -97,6 +131,8 @@ impl NotificationsPanel {
                 dnd,
                 location,
                 expire_ms,
+                sound_enabled,
+                muted_sources,
             } => {
                 self.dnd = dnd;
                 self.location = if LOCATIONS.iter().any(|l| *l == location) {
@@ -105,8 +141,23 @@ impl NotificationsPanel {
                     "bottom-right".into()
                 };
                 self.expire_ms_input = expire_ms.to_string();
+                self.sound_enabled = sound_enabled;
+                self.muted_sources = muted_sources;
                 self.status.clear();
                 self.busy = false;
+                Task::none()
+            }
+            Message::SoundMasterChanged(v) => {
+                self.sound_enabled = v;
+                self.persist_sound();
+                Task::none()
+            }
+            Message::GroupMuteChanged { label, mute } => {
+                self.muted_sources.retain(|l| l != &label);
+                if mute {
+                    self.muted_sources.push(label);
+                }
+                self.persist_sound();
                 Task::none()
             }
             Message::Error(msg) => {
@@ -174,6 +225,23 @@ impl NotificationsPanel {
         }
     }
 
+    /// NOTIFY-6 — write the current sound state to the shared
+    /// `notify-sound.yaml` (the single source the Hub + toast read). Sync +
+    /// tiny; best-effort (a missing bus root just sets a status note).
+    fn persist_sound(&mut self) {
+        let settings = mde_notify::SoundSettings {
+            enabled: self.sound_enabled,
+            muted_sources: self.muted_sources.clone(),
+        };
+        match mde_bus::client_data_dir() {
+            Some(root) => match settings.save(&root) {
+                Ok(()) => self.status = "Sound settings saved.".into(),
+                Err(e) => self.status = format!("sound save failed: {e}"),
+            },
+            None => self.status = "no bus root — sound settings not saved".into(),
+        }
+    }
+
     pub fn view(&self) -> Element<'_, crate::Message, cosmic::Theme> {
         let apply_label = if self.busy { "Applying…" } else { "Apply" };
         // UX-7.a — save routed through the shared button variant.
@@ -194,6 +262,33 @@ impl NotificationsPanel {
             crate::Message::Notifications(Message::LocationChanged(selected.to_string()))
         });
 
+        // NOTIFY-6 — the per-group sound section (single source: notify-sound.yaml).
+        let master_enabled = self.sound_enabled;
+        let mut sounds = column![
+            text("Sounds").size(15),
+            checkbox(self.sound_enabled)
+                .label("Play notification sounds")
+                .on_toggle(|v| crate::Message::Notifications(Message::SoundMasterChanged(v))),
+        ]
+        .spacing(8);
+        for source in sound_groups() {
+            let label = source.label();
+            let muted = self.muted_sources.contains(&label);
+            let group_label = label.clone();
+            // Checked = audible; mute when unchecked. Disabled visually when the
+            // master switch is off (toggling still records intent).
+            sounds = sounds.push(
+                checkbox(master_enabled && !muted)
+                    .label(format!("  {label}"))
+                    .on_toggle(move |audible| {
+                        crate::Message::Notifications(Message::GroupMuteChanged {
+                            label: group_label.clone(),
+                            mute: !audible,
+                        })
+                    }),
+            );
+        }
+
         column![
             checkbox(self.dnd)
                 .label("Do Not Disturb")
@@ -206,6 +301,7 @@ impl NotificationsPanel {
             ]
             .spacing(12),
             row![apply_btn, text(&self.status).size(13)].spacing(12),
+            sounds,
         ]
         .spacing(12)
         .width(Length::Fill)
@@ -215,6 +311,14 @@ impl NotificationsPanel {
 
 fn current_location(value: &str) -> Option<&'static str> {
     LOCATIONS.iter().copied().find(|l| *l == value)
+}
+
+/// NOTIFY-6 — load the shared sound settings (the same `notify-sound.yaml` the
+/// Hub + toast read). Missing bus root or file → defaults (sound on).
+fn load_sound_settings() -> mde_notify::SoundSettings {
+    mde_bus::client_data_dir()
+        .map(|root| mde_notify::SoundSettings::load(&root))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -250,12 +354,61 @@ mod tests {
                 dnd: true,
                 location: "ghost".into(),
                 expire_ms: 4000,
+                sound_enabled: true,
+                muted_sources: vec![],
             },
             backend,
         );
         assert_eq!(panel.location, "bottom-right");
         assert!(panel.dnd);
         assert_eq!(panel.expire_ms_input, "4000");
+    }
+
+    #[test]
+    fn group_mute_toggle_adds_and_removes_one_label() {
+        // NOTIFY-6: muting a group records its label; unmuting removes it —
+        // single-sourced into the same list the Hub reads. (persist is
+        // best-effort; with no bus root it just sets a status note.)
+        let backend = Arc::new(DemoBackend::new());
+        let mut panel = NotificationsPanel::new();
+        let sec = mde_notify::Source::Security.label();
+        let _ = panel.update(
+            Message::GroupMuteChanged {
+                label: sec.clone(),
+                mute: true,
+            },
+            backend.clone(),
+        );
+        assert!(panel.muted_sources.contains(&sec));
+        let _ = panel.update(
+            Message::GroupMuteChanged {
+                label: sec.clone(),
+                mute: false,
+            },
+            backend.clone(),
+        );
+        assert!(!panel.muted_sources.contains(&sec));
+        // No duplicate when muted twice.
+        let _ = panel.update(
+            Message::GroupMuteChanged {
+                label: sec.clone(),
+                mute: true,
+            },
+            backend.clone(),
+        );
+        let _ = panel.update(
+            Message::GroupMuteChanged {
+                label: sec.clone(),
+                mute: true,
+            },
+            backend,
+        );
+        assert_eq!(panel.muted_sources.iter().filter(|l| **l == sec).count(), 1);
+    }
+
+    #[test]
+    fn sound_groups_are_the_six_fixed_non_peer_sources() {
+        assert_eq!(sound_groups().len(), 6);
     }
 
     #[test]
