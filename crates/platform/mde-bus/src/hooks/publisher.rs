@@ -35,11 +35,38 @@ pub enum PublisherError {
     },
 }
 
+/// NOTIFY-DIST — ntfy topics must be a single `[-_A-Za-z0-9]{1,64}` segment,
+/// but bus topics are hierarchical (`peer/<host>/alerts`) and may contain
+/// spaces (`fdo/Magic Mesh Alerts`). Posting the raw bus topic makes ntfy read
+/// only the first path segment and return **404 Not Found** for the rest, so
+/// every mesh-alert publish failed and nothing federated. Flatten any
+/// non-conforming character to `_` (capped at 64) so the publish returns 200;
+/// the lossless original rides the `X-Topic` header for the consumer to restore.
+#[must_use]
+pub fn ntfy_topic(bus_topic: &str) -> String {
+    let mut s: String = bus_topic
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    s.truncate(64);
+    if s.is_empty() {
+        s.push('_');
+    }
+    s
+}
+
 /// POST the rendered publish to `http://<broker_host>:<broker_port>/<topic>`.
 ///
 /// `broker_base` is typically `format!("http://{overlay_ip}:8443")`.
 /// We accept it as a base so tests can point at a stub server on
-/// `127.0.0.1`.
+/// `127.0.0.1`. The ntfy topic segment is flattened ([`ntfy_topic`]); the real
+/// bus topic is preserved in the `X-Topic` header.
 ///
 /// # Errors
 /// See [`PublisherError`].
@@ -48,11 +75,16 @@ pub async fn publish_to_ntfy(
     broker_base: &str,
     rendered: &RenderedPublish,
 ) -> Result<(), PublisherError> {
-    let url = format!("{}/{}", broker_base.trim_end_matches('/'), rendered.topic);
+    let url = format!(
+        "{}/{}",
+        broker_base.trim_end_matches('/'),
+        ntfy_topic(&rendered.topic)
+    );
     let resp = client
         .post(&url)
         .header("X-Title", &rendered.title)
         .header("X-Priority", rendered.priority.ntfy_header())
+        .header("X-Topic", &rendered.topic)
         .body(rendered.body.clone())
         .send()
         .await
@@ -120,7 +152,7 @@ mod tests {
         let base = format!("http://{addr}");
         let rendered = RenderedPublish {
             rule_name: "test".to_string(),
-            topic: "gh/push".to_string(),
+            topic: "peer/UNIT-EAGLE/alerts".to_string(),
             priority: Priority::High,
             title: "hello world".to_string(),
             body: "payload body".to_string(),
@@ -130,7 +162,17 @@ mod tests {
             .await
             .expect("publish ok");
         let req = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
-        assert!(req.contains("POST /gh/push"));
+        // NOTIFY-DIST — the hierarchical bus topic is flattened to a valid ntfy
+        // segment in the path; the real topic rides X-Topic.
+        assert!(
+            req.contains("POST /peer_UNIT-EAGLE_alerts"),
+            "expected flattened ntfy topic, got:\n{req}"
+        );
+        assert!(
+            req.contains("x-topic: peer/UNIT-EAGLE/alerts")
+                || req.contains("X-Topic: peer/UNIT-EAGLE/alerts"),
+            "expected X-Topic with the real bus topic, got:\n{req}"
+        );
         assert!(req.contains("x-title: hello world") || req.contains("X-Title: hello world"));
         assert!(
             req.contains("x-priority: 4") || req.contains("X-Priority: 4"),
@@ -164,6 +206,23 @@ mod tests {
             }
             PublisherError::Transport(_) => panic!("expected BadStatus, got Transport"),
         }
+    }
+
+    #[test]
+    fn ntfy_topic_flattens_hierarchical_and_spaced_names() {
+        assert_eq!(
+            ntfy_topic("peer/UNIT-EAGLE/alerts"),
+            "peer_UNIT-EAGLE_alerts"
+        );
+        assert_eq!(ntfy_topic("fdo/Magic Mesh Alerts"), "fdo_Magic_Mesh_Alerts");
+        assert_eq!(ntfy_topic("fleet/sec"), "fleet_sec");
+        assert_eq!(ntfy_topic("flat"), "flat");
+        // valid ntfy class only, capped at 64, never empty.
+        let long = ntfy_topic(&"a/".repeat(100));
+        assert!(long.len() <= 64 && !long.is_empty());
+        assert!(long
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
     }
 
     #[tokio::test]
