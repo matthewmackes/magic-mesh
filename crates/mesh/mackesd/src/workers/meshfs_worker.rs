@@ -25,11 +25,13 @@
 //!      server start`). Every peer runs a shadow master (`mfsmaster
 //!      -o ha` in shadow mode).
 //!
-//!   5. **CA-revoke path (MESHFS-2.1 Q17).** When a peer's bundle
-//!      disappears from QNM-Shared, fires `mfsadmin CS-EVICT` +
-//!      lowers the replication goal. If this peer holds the active
-//!      master role (detected via VIP ownership), the VIP is failed
-//!      over to the next shadow before the eviction.
+//!   5. **CA-revoke path (MESHFS-2.1 Q17; AUDIT-MESH-7).** When a peer's
+//!      bundle disappears from QNM-Shared, LizardFS auto-replicates the
+//!      departed chunkserver's chunks to satisfy the goal — there is no
+//!      manual eviction command (the old `mfsadmin CS-EVICT`/`MASTER-STOP`
+//!      were dead MooseFS syntax). The worker records the departure +
+//!      logs the replication backlog (`chunks-health`). Real master
+//!      failover is the `tick_once_ha` VIP-claim + shadow-promote path.
 //!
 //! Design locks (25-Q survey 2026-05-29; goal policy superseded by
 //! FPG-7 / platform-survey Q12, 2026-06-09):
@@ -66,12 +68,13 @@ pub const DEFAULT_CHUNKSERVER_BINARY: &str = "mfschunkserver";
 
 /// LizardFS admin CLI binary. AUDIT-MESH-3: the deployed substrate is
 /// LizardFS, whose admin tool is `lizardfs-admin` (`list-chunkservers`,
-/// `info`, …), NOT MooseFS's `mfsadmin`. The read-paths
+/// `info`, `chunks-health`, …), NOT MooseFS's `mfsadmin`. The read-paths
 /// ([`query_chunkservers`], [`min_chunkserver_avail_bytes`],
 /// [`current_chunkserver_ips`]) use `lizardfs-admin list-chunkservers`.
-/// (The eviction/failover/topology argv builders still emit MooseFS
-/// `CS-EVICT`/`MASTER-STOP` syntax — tracked as a follow-up; they were
-/// already non-functional against the missing `mfsadmin`.)
+/// AUDIT-MESH-7: the dead MooseFS write-path argv (`CS-EVICT`/`MASTER-STOP`/
+/// `CS-SET-TOPOLOGY`/`TRASH-RECOVER`) are gone — LizardFS auto-replicates,
+/// failover is `tick_once_ha`, topology is file-side, and undelete is a
+/// trash-tree `rename` into `undel/`.
 pub const DEFAULT_ADMIN_BINARY: &str = "lizardfs-admin";
 
 /// LizardFS goal-set CLI binary.
@@ -309,8 +312,9 @@ pub struct MeshFsWorker {
     /// Nebula overlay interface on which the floating VIP is claimed or
     /// released via `ip addr add/del`.
     overlay_iface: String,
-    /// Peer IPs we have already issued CS-EVICT for this session.
-    /// Prevents re-evicting on every tick while replication heals.
+    /// Departed peer IPs already handled this session (logged + event
+    /// emitted once). Prevents re-logging every tick while LizardFS
+    /// auto-replicates the lost chunkserver's chunks.
     evicted_ips: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// Tracks whether the master was reachable on the last tick so
     /// `meshfs/export-ready` fires exactly once on down→up (MESHFS-10.1).
@@ -541,22 +545,32 @@ impl MeshFsWorker {
                         guard.contains(cs_ip)
                     };
                     if !already {
+                        // AUDIT-MESH-7 — LizardFS has no manual chunkserver
+                        // eviction: when a CA-revoked peer's overlay drops, the
+                        // master detects the disconnected chunkserver and
+                        // auto-replicates its chunks to satisfy the goal. The old
+                        // MooseFS `CS-EVICT`/`MASTER-STOP` argv were dead (the
+                        // syntax `lizardfs-admin` rejects). VIP failover is the
+                        // real `tick_once_ha` path (claim VIP + promote shadow),
+                        // not a remote `MASTER-STOP`. Here we only record the
+                        // departure + log the replication backlog so the operator
+                        // can see healing is underway.
                         tracing::warn!(
                             target: "mackesd::meshfs_worker",
                             cs_ip,
-                            "chunkserver IP absent from QNM-Shared; evicting (CA-revoke proxy)",
+                            "chunkserver IP absent from QNM-Shared; LizardFS auto-replicating its chunks",
                         );
-                        // If this peer holds the active master VIP, fail
-                        // it over before eviction so clients don't lose
-                        // the metadata server.
-                        if cs_ip == &overlay_ip && !master_reachable_via_shadow(&self.vip) {
-                            let argv = failover_vip_argv(&self.admin_binary, &self.vip);
-                            tracing::info!(target: "mackesd::meshfs_worker", argv = ?argv, "failing over master VIP");
-                            let _ = run_argv(&argv);
+                        if binary_on_path(&self.admin_binary) && master_reachable(&self.vip) {
+                            let argv = chunks_health_argv(&self.admin_binary, &self.vip);
+                            if let Ok(out) = run_argv(&argv) {
+                                tracing::info!(
+                                    target: "mackesd::meshfs_worker",
+                                    cs_ip,
+                                    replication = %String::from_utf8_lossy(&out.stdout).trim(),
+                                    "post-departure replication health",
+                                );
+                            }
                         }
-                        let argv = evict_argv(&self.admin_binary, &self.vip, cs_ip);
-                        tracing::info!(target: "mackesd::meshfs_worker", argv = ?argv, "evicting chunkserver");
-                        let _ = run_argv(&argv);
                         self.evicted_ips
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -573,14 +587,12 @@ impl MeshFsWorker {
         // 6. HA: lighthouse VIP claim + shadow promotion (MESHFS-3.1).
         self.tick_once_ha();
 
-        // 7. Topology label: register this peer's chunkserver in its own
-        //    topology group (MESHFS-7.1). LizardFS uses these labels to
-        //    prefer local reads when a client's IP matches a label.
-        if binary_on_path(&self.admin_binary) && master_reachable(&self.vip) {
-            let argv = set_topology_argv(&self.admin_binary, &self.vip, &overlay_ip, &overlay_ip);
-            tracing::debug!(target: "mackesd::meshfs_worker", argv = ?argv, "setting CS topology label");
-            let _ = run_argv(&argv);
-        }
+        // 7. Topology (MESHFS-7.1) — AUDIT-MESH-7: removed. LizardFS has no
+        //    `CS-SET-TOPOLOGY` admin command (that was dead MooseFS syntax);
+        //    topology is configured file-side via /etc/mfs/mfstopology.cfg
+        //    (setup-qnm-shared writes an empty one) + `reload-config`. For a
+        //    flat ≤8-peer mesh (§8) per-CS topology labels add no value, so
+        //    there is nothing to do per tick.
 
         // 8. Quota: hourly setquota call (MESHFS-9.1).
         self.tick_once_quota();
@@ -774,14 +786,8 @@ impl MeshFsWorker {
                     .zip(self.self_node_id.as_ref())
                     .map(|(qnm, id)| enrolled_peer_ips(qnm, id).len())
                     .unwrap_or(0);
-                let reply_json = dispatch_meshfs_action(
-                    &self.master_binary,
-                    &self.admin_binary,
-                    &self.vip,
-                    enrolled,
-                    verb,
-                    body,
-                );
+                let reply_json =
+                    dispatch_meshfs_action(&self.master_binary, &self.vip, enrolled, verb, body);
                 if let Err(e) = persist.write(
                     &reply_topic(&msg.ulid),
                     Priority::Default,
@@ -877,13 +883,6 @@ pub fn master_reachable(vip: &str) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
 }
 
-/// Probe whether a shadow master is reachable (same port). Used to
-/// determine if a VIP failover can proceed before eviction.
-#[must_use]
-pub fn master_reachable_via_shadow(vip: &str) -> bool {
-    master_reachable(vip)
-}
-
 /// Build the argv for starting `mfsmaster` in genesis mode.
 ///
 /// ```text
@@ -920,56 +919,25 @@ pub fn setgoal_argv(setgoal_binary: &str, goal: u8, mount_path: &str) -> Vec<Str
     ]
 }
 
-/// Build the argv for evicting a chunkserver by IP via `mfsadmin`.
+/// AUDIT-MESH-7 — LizardFS replication-health observability.
 ///
-/// ```text
-/// mfsadmin <vip> CS-EVICT <cs_ip>
-/// ```
+/// `lizardfs-admin chunks-health <vip> <port> --replication --porcelain`
+///
+/// Replaces the dead MooseFS `CS-EVICT` write-path: LizardFS has **no**
+/// manual chunkserver-eviction command — when a chunkserver disconnects
+/// (a CA-revoked peer's overlay drops), the master detects it and
+/// **auto-replicates** its chunks to satisfy the goal. There is nothing
+/// to "evict"; this read-only command surfaces the replication backlog so
+/// the worker can log that healing is underway after a peer leaves.
 #[must_use]
-pub fn evict_argv(admin_binary: &str, vip: &str, cs_ip: &str) -> Vec<String> {
+pub fn chunks_health_argv(admin_binary: &str, vip: &str) -> Vec<String> {
     vec![
         admin_binary.to_owned(),
+        "chunks-health".to_owned(),
         vip.to_owned(),
-        "CS-EVICT".to_owned(),
-        cs_ip.to_owned(),
-    ]
-}
-
-/// Build the argv for forcing a VIP failover (stop the active master
-/// so a shadow promotes itself).
-///
-/// ```text
-/// mfsadmin <vip> MASTER-STOP
-/// ```
-#[must_use]
-pub fn failover_vip_argv(admin_binary: &str, vip: &str) -> Vec<String> {
-    vec![
-        admin_binary.to_owned(),
-        vip.to_owned(),
-        "MASTER-STOP".to_owned(),
-    ]
-}
-
-/// Build the argv for registering this peer's chunkserver in a named
-/// topology group. LizardFS uses topology groups to prefer local reads:
-/// a client with the same group label as a chunkserver will read from
-/// that chunkserver first, avoiding unnecessary overlay traffic.
-///
-/// ```text
-/// mfsadmin <vip> CS-SET-TOPOLOGY <cs_ip> <label>
-/// ```
-///
-/// In MDE's single-group-per-peer scheme, `label` = `cs_ip` so each
-/// peer has its own named group. `mfsmount` clients that pass
-/// `-o mfspreferredip=<overlay_ip>` will read local chunks first.
-#[must_use]
-pub fn set_topology_argv(admin_binary: &str, vip: &str, cs_ip: &str, label: &str) -> Vec<String> {
-    vec![
-        admin_binary.to_owned(),
-        vip.to_owned(),
-        "CS-SET-TOPOLOGY".to_owned(),
-        cs_ip.to_owned(),
-        label.to_owned(),
+        MFSMASTER_CLIENT_PORT.to_string(),
+        "--replication".to_owned(),
+        "--porcelain".to_owned(),
     ]
 }
 
@@ -1366,7 +1334,6 @@ fn publish_meshfs_event(topic: &str, body: &str) {
 /// trivially testable without a running Bus or persist layer.
 pub fn dispatch_meshfs_action(
     master_binary: &str,
-    admin_binary: &str,
     vip: &str,
     enrolled_peer_count: usize,
     verb: &str,
@@ -1388,7 +1355,7 @@ pub fn dispatch_meshfs_action(
             r#"{"ok":true,"note":"goal converges on next tick"}"#.to_owned()
         }
         "resolve-conflict" => dispatch_resolve_conflict(body),
-        "undelete" => dispatch_undelete(admin_binary, vip, body),
+        "undelete" => dispatch_undelete(body),
         _ => r#"{"ok":false,"error":"unknown verb"}"#.to_owned(),
     }
 }
@@ -1450,23 +1417,42 @@ fn dispatch_resolve_conflict(body: &str) -> String {
     }
 }
 
-/// Invoke `mfsadmin TRASH-RECOVER` for the path named in the request body.
-fn dispatch_undelete(admin_binary: &str, vip: &str, body: &str) -> String {
-    let path: String = match serde_json::from_str::<serde_json::Value>(body)
+/// AUDIT-MESH-7 — recover a trashed file the LizardFS way: move the trash
+/// entry into the sibling `undel/` directory of the trash meta tree. The old
+/// `mfsadmin TRASH-RECOVER` was dead MooseFS syntax (`lizardfs-admin` rejects
+/// it). In LizardFS the trash is a filesystem tree (`<mount>/.trash/<entry>`
+/// + `<mount>/.trash/undel/`); restoring a file is a `rename` of the entry
+/// into `undel/`, which the master replays as an undelete. `body` carries the
+/// full `trash_path` (as listed by [`list_trash_entries`]).
+fn dispatch_undelete(body: &str) -> String {
+    let trash_path: String = match serde_json::from_str::<serde_json::Value>(body)
         .ok()
-        .and_then(|v| v["path"].as_str().map(|s| s.to_owned()))
-    {
+        .and_then(|v| {
+            v["trash_path"]
+                .as_str()
+                .or_else(|| v["path"].as_str())
+                .map(str::to_owned)
+        }) {
         Some(p) => p,
-        None => return r#"{"ok":false,"error":"missing path"}"#.to_owned(),
+        None => return r#"{"ok":false,"error":"missing trash_path"}"#.to_owned(),
     };
-    let argv = vec![
-        admin_binary.to_owned(),
-        vip.to_owned(),
-        "TRASH-RECOVER".to_owned(),
-        path,
-    ];
-    let ok = run_argv(&argv).is_ok();
-    format!(r#"{{"ok":{ok}}}"#)
+    let src = std::path::Path::new(&trash_path);
+    let (Some(parent), Some(name)) = (src.parent(), src.file_name()) else {
+        return r#"{"ok":false,"error":"malformed trash_path"}"#.to_owned();
+    };
+    if !src.exists() {
+        return r#"{"ok":false,"error":"trash entry not found"}"#.to_owned();
+    }
+    // The undel/ inbox lives beside the entry inside the trash tree.
+    let undel_dir = parent.join("undel");
+    if let Err(e) = std::fs::create_dir_all(&undel_dir) {
+        return format!(r#"{{"ok":false,"error":"undel dir: {e}"}}"#);
+    }
+    let dest = undel_dir.join(name);
+    match std::fs::rename(src, &dest) {
+        Ok(()) => r#"{"ok":true}"#.to_owned(),
+        Err(e) => format!(r#"{{"ok":false,"error":"undelete rename: {e}"}}"#),
+    }
 }
 
 // ── MESHFS-6.1: offline staging + LWW replay ────────────────────────────────
@@ -1717,18 +1703,20 @@ mod tests {
     }
 
     #[test]
-    fn evict_argv_shape() {
+    fn chunks_health_argv_is_real_lizardfs_syntax() {
+        // AUDIT-MESH-7: the eviction observability command is the real
+        // `lizardfs-admin chunks-health <ip> <port> ...` form (subcommand
+        // FIRST, then ip+port) — NOT the dead MooseFS `<ip> VERB` shape.
         assert_eq!(
-            evict_argv("mfsadmin", "10.42.0.1", "10.42.0.5"),
-            vec!["mfsadmin", "10.42.0.1", "CS-EVICT", "10.42.0.5"]
-        );
-    }
-
-    #[test]
-    fn failover_vip_argv_shape() {
-        assert_eq!(
-            failover_vip_argv("mfsadmin", "10.42.0.1"),
-            vec!["mfsadmin", "10.42.0.1", "MASTER-STOP"]
+            chunks_health_argv("lizardfs-admin", "10.42.0.1"),
+            vec![
+                "lizardfs-admin",
+                "chunks-health",
+                "10.42.0.1",
+                "9421",
+                "--replication",
+                "--porcelain"
+            ]
         );
     }
 
@@ -1865,21 +1853,6 @@ mod tests {
     }
 
     #[test]
-    fn set_topology_argv_shape() {
-        let argv = set_topology_argv("mfsadmin", "10.42.0.1", "10.42.0.5", "10.42.0.5");
-        assert_eq!(
-            argv,
-            [
-                "mfsadmin",
-                "10.42.0.1",
-                "CS-SET-TOPOLOGY",
-                "10.42.0.5",
-                "10.42.0.5"
-            ]
-        );
-    }
-
-    #[test]
     fn setquota_argv_shape() {
         let argv = setquota_argv("mfssetquota", 70_000_000, 80_000_000, "/mnt/mesh-storage");
         assert_eq!(
@@ -1911,24 +1884,21 @@ mod tests {
 
     #[test]
     fn dispatch_action_unknown_verb_returns_error() {
-        let reply =
-            dispatch_meshfs_action("mfsmaster", "mfsadmin", "10.42.0.1", 2, "frobnicate", "{}");
+        let reply = dispatch_meshfs_action("mfsmaster", "10.42.0.1", 2, "frobnicate", "{}");
         let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(v["ok"], false);
     }
 
     #[test]
     fn dispatch_action_add_peer_ok() {
-        let reply =
-            dispatch_meshfs_action("mfsmaster", "mfsadmin", "10.42.0.1", 3, "add-peer", "{}");
+        let reply = dispatch_meshfs_action("mfsmaster", "10.42.0.1", 3, "add-peer", "{}");
         let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(v["ok"], true);
     }
 
     #[test]
     fn dispatch_action_remove_peer_ok() {
-        let reply =
-            dispatch_meshfs_action("mfsmaster", "mfsadmin", "10.42.0.1", 1, "remove-peer", "{}");
+        let reply = dispatch_meshfs_action("mfsmaster", "10.42.0.1", 1, "remove-peer", "{}");
         let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(v["ok"], true);
     }
@@ -1953,10 +1923,39 @@ mod tests {
 
     #[test]
     fn dispatch_undelete_missing_path() {
-        let reply = dispatch_undelete("mfsadmin", "10.42.0.1", "{}");
+        let reply = dispatch_undelete("{}");
         let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(v["ok"], false);
-        assert!(v["error"].as_str().unwrap_or("").contains("path"));
+        assert!(v["error"].as_str().unwrap_or("").contains("trash_path"));
+    }
+
+    #[test]
+    fn dispatch_undelete_moves_entry_into_undel() {
+        // AUDIT-MESH-7: undelete is a filesystem move into the trash's undel/
+        // inbox (the real LizardFS mechanism), not a dead `mfsadmin TRASH-RECOVER`.
+        let trash = tempfile::tempdir().unwrap();
+        let entry = trash.path().join("0000ABCDreport.txt");
+        std::fs::write(&entry, b"recover me").unwrap();
+        let body = format!(
+            r#"{{"trash_path":{}}}"#,
+            serde_json::Value::String(entry.to_string_lossy().into_owned())
+        );
+        let reply = dispatch_undelete(&body);
+        let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(v["ok"], true, "reply was {reply}");
+        // Entry moved out of the trash root into undel/.
+        assert!(!entry.exists());
+        let moved = trash.path().join("undel").join("0000ABCDreport.txt");
+        assert!(moved.exists());
+        assert_eq!(std::fs::read_to_string(&moved).unwrap(), "recover me");
+    }
+
+    #[test]
+    fn dispatch_undelete_missing_entry_reports_error() {
+        let body = r#"{"trash_path":"/nonexistent/.trash/0000DEADfile"}"#;
+        let v: serde_json::Value = serde_json::from_str(&dispatch_undelete(body)).unwrap();
+        assert_eq!(v["ok"], false);
+        assert!(v["error"].as_str().unwrap_or("").contains("not found"));
     }
 
     // MESHFS-6.1 — offline staging + LWW replay tests.
