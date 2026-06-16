@@ -96,6 +96,12 @@ pub const ACTION_VERBS: [&str; 3] = ["version", "healthz", "workers"];
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// SHELL-RPC-1 — hard cap on the mount-touching mesh enrichment in `healthz`.
+/// A healthy QNM-Shared read returns in single-digit ms; anything beyond this
+/// means the FUSE mount is wedged, so we drop the enrichment and keep the
+/// liveness probe answering. Generous enough not to trip on a loaded mount.
+pub const MESH_ENRICH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
 impl ShellService {
     /// Compiled crate version (`CARGO_PKG_VERSION`).
     #[must_use]
@@ -133,23 +139,66 @@ impl ShellService {
         // OB6-FIX-4 — override node_count/health-buckets/is_leader from the
         // live directory + leader lease (the store nodes table is the wrong
         // source — it only holds enrolled rows, so it read 0 on every peer).
+        //
+        // SHELL-RPC-1 — this enrichment reads the shared QNM-Shared FUSE mount
+        // (`read_peers`/lease over /mnt/mesh-storage). healthz is the daemon
+        // LIVENESS probe (`probe_mackesd_alive`), and the single-threaded shell
+        // responder serves version/healthz/workers in one loop — so if a wedged
+        // mount blocks this read, it hangs the WHOLE responder and every verb
+        // times out (the field symptom). A liveness surface must never depend on
+        // the shared mount being healthy (the boot-recovery window mounts it
+        // AFTER the daemon). So the mount-touching enrichment runs under a hard
+        // timeout; on a stall it's skipped and the base report stands — healthz
+        // still answers truthfully about the daemon itself.
         let report = if self.state.workgroup_root.as_os_str().is_empty() {
             report
         } else {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis() as u64);
-            let svc = crate::ipc::directory::DirectoryService::new(
-                &self.state.workgroup_root,
-                Some(self.state.db_path.clone()),
-            );
-            let (n, healthy, degraded, unreachable, is_leader) =
-                svc.mesh_health_counts(&self.state.node_id, now_ms);
-            report.with_mesh(n, healthy, degraded, unreachable, is_leader)
+            match self.mesh_enrichment_bounded(MESH_ENRICH_TIMEOUT) {
+                Some((n, healthy, degraded, unreachable, is_leader)) => {
+                    report.with_mesh(n, healthy, degraded, unreachable, is_leader)
+                }
+                None => {
+                    tracing::warn!(
+                        root = %self.state.workgroup_root.display(),
+                        "healthz: mesh enrichment timed out (wedged QNM-Shared mount?) \
+                         — answering with the daemon-local report (SHELL-RPC-1)"
+                    );
+                    report
+                }
+            }
         };
         report
             .to_json_line()
             .map_err(|e| format!("healthz encode: {e}"))
+    }
+
+    /// Run the mount-touching mesh enrichment on a short-lived helper thread
+    /// and wait at most `timeout` for it. `None` means it didn't finish in
+    /// time (a wedged/slow shared mount) — the caller falls back to the
+    /// daemon-local report rather than blocking the responder. SHELL-RPC-1.
+    fn mesh_enrichment_bounded(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Option<(u32, u32, u32, u32, bool)> {
+        let root = self.state.workgroup_root.clone();
+        let db_path = self.state.db_path.clone();
+        let node_id = self.state.node_id.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Detached: if the read is truly wedged the helper leaks until the
+        // mount recovers — acceptable, and far better than stalling the
+        // responder. We just stop waiting for it.
+        std::thread::Builder::new()
+            .name("healthz-mesh-enrich".into())
+            .spawn(move || {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64);
+                let svc = crate::ipc::directory::DirectoryService::new(&root, Some(db_path));
+                let counts = svc.mesh_health_counts(&node_id, now_ms);
+                let _ = tx.send(counts);
+            })
+            .ok()?;
+        rx.recv_timeout(timeout).ok()
     }
 
     /// Currently-spawned worker names, in spawn order — sourced from
@@ -338,5 +387,78 @@ mod tests {
         let s = ShellState::default();
         assert_eq!(s.db_path, PathBuf::new());
         assert!(s.worker_names.lock().unwrap().is_empty());
+    }
+
+    /// SHELL-RPC-1 — healthz with a live workgroup_root answers promptly and
+    /// stays valid JSON (the mount enrichment runs under MESH_ENRICH_TIMEOUT
+    /// and folds in; an empty mount just yields zero mesh counts).
+    #[test]
+    fn healthz_with_workgroup_root_answers_within_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = ShellState {
+            db_path: PathBuf::new(),
+            worker_names: Arc::new(std::sync::Mutex::new(vec![])),
+            worker_status: None,
+            workgroup_root: tmp.path().to_path_buf(),
+            node_id: "node-a".into(),
+        };
+        let svc = ShellService::new(state);
+        let start = std::time::Instant::now();
+        let json = svc.build_healthz().expect("healthz");
+        // Comfortably under the enrichment cap even on a slow CI disk.
+        assert!(
+            start.elapsed() < MESH_ENRICH_TIMEOUT + std::time::Duration::from_secs(1),
+            "healthz blocked too long: {:?}",
+            start.elapsed()
+        );
+        let parsed: crate::health::HealthReport = serde_json::from_str(&json).expect("decode");
+        assert_eq!(parsed.schema, crate::health::HealthReport::CURRENT_SCHEMA);
+        // Empty mount → zero peers, not leader.
+        assert!(svc.mesh_enrichment_bounded(MESH_ENRICH_TIMEOUT).is_some());
+    }
+
+    /// SHELL-RPC-1 — full request→reply round-trip over a real `Persist`,
+    /// exactly as `mde-bus request action/shell/<verb>` drives it: publish
+    /// to the action topic, run one poll sweep, assert the reply landed on
+    /// `reply/<ulid>`. Proves the responder logic answers every verb (a
+    /// no-reply in the field is then a stale-binary / env issue, not code).
+    #[test]
+    fn poll_once_replies_to_each_verb_end_to_end() {
+        use mde_bus::rpc::{publish_request, reply_topic};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).unwrap();
+        let svc = ShellService::default();
+        let mut cursors: HashMap<String, String> = HashMap::new();
+
+        // A pre-existing request must be answered on the FIRST sweep
+        // (cursor starts empty → list_since(None) sees history).
+        for verb in ACTION_VERBS {
+            let ulid =
+                publish_request(&persist, &action_topic(verb), Priority::Default, None, None)
+                    .unwrap();
+            poll_once(&persist, &svc, &mut cursors);
+            let reply = persist.list_since(&reply_topic(&ulid), None).unwrap();
+            assert_eq!(reply.len(), 1, "verb {verb} got no reply");
+            assert_eq!(
+                reply[0].body.as_deref(),
+                Some(build_reply(&svc, verb).as_str())
+            );
+        }
+
+        // A request arriving AFTER the cursor advanced must also be answered
+        // (the steady-state path: cursor=Some(last) → list_since sees only new).
+        let ulid = publish_request(
+            &persist,
+            &action_topic("version"),
+            Priority::Default,
+            None,
+            None,
+        )
+        .unwrap();
+        poll_once(&persist, &svc, &mut cursors);
+        let reply = persist.list_since(&reply_topic(&ulid), None).unwrap();
+        assert_eq!(reply.len(), 1, "steady-state version request got no reply");
+        assert_eq!(reply[0].body.as_deref(), Some(env!("CARGO_PKG_VERSION")));
     }
 }

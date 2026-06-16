@@ -108,9 +108,7 @@ pub fn generate_endpoint_identity(sans: &[String]) -> Result<EndpointIdentity, S
 pub fn endpoint_fingerprint_from_pem(cert_pem: &[u8]) -> Option<String> {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::CertificateDer;
-    let der = CertificateDer::pem_slice_iter(cert_pem)
-        .next()?
-        .ok()?;
+    let der = CertificateDer::pem_slice_iter(cert_pem).next()?.ok()?;
     Some(fingerprint(&der))
 }
 

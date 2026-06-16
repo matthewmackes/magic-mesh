@@ -218,7 +218,11 @@ pub fn ensure_xdg_binds(mount_path: &Path, home: &Path) -> Vec<String> {
         match host_ns_command(
             &host_ns,
             "mount",
-            &["--bind", &source.to_string_lossy(), &target.to_string_lossy()],
+            &[
+                "--bind",
+                &source.to_string_lossy(),
+                &target.to_string_lossy(),
+            ],
         )
         .status()
         {
