@@ -5032,6 +5032,46 @@ fn print_revisions_table(rows: &[serde_json::Value]) {
 /// Also wires `mackesd_core::logging::LogContext` (Tier 3 — Phase 12.1.4):
 /// every log line inside `run_serve` inherits the daemon's
 /// correlation_id + node_id via a top-level tracing span.
+/// BULLETPROOF-1 — total bytes of the filesystem hosting `path`, via `df`.
+/// `None` if the probe fails (caller falls back to the tmpfs-safe defaults).
+#[cfg(feature = "async-services")]
+fn filesystem_total_bytes(path: &std::path::Path) -> Option<u64> {
+    let out = std::process::Command::new("df")
+        .arg("-B1")
+        .arg("--output=size")
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // Line 1 is the "1B-blocks" header; line 2 is the size in bytes.
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .nth(1)?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+/// BULLETPROOF-1 — a filesystem-relative bus retention policy. The bus spool
+/// lives on `/run` (tmpfs), whose size ranges from ~190 MB (lighthouse) to
+/// multiple GB (workstation). Cap hard at ~50% of the hosting filesystem and
+/// soft at ~33%, with floors, so the spool is bounded well below ENOSPC on any
+/// node. Falls back to the (already tmpfs-safe) library defaults if `df` fails.
+#[cfg(feature = "async-services")]
+fn bus_retention_policy(bus_root: &std::path::Path) -> mde_bus::retention::RetentionPolicy {
+    let mut policy = mde_bus::retention::RetentionPolicy::default();
+    if let Some(total) = filesystem_total_bytes(bus_root) {
+        policy.quota_hard_bytes = (total / 2).max(32 * 1024 * 1024);
+        policy.quota_soft_bytes = (total / 3).max(16 * 1024 * 1024);
+        if policy.quota_soft_bytes >= policy.quota_hard_bytes {
+            policy.quota_soft_bytes = policy.quota_hard_bytes.saturating_sub(8 * 1024 * 1024);
+        }
+    }
+    policy
+}
+
 #[cfg(feature = "async-services")]
 fn run_serve(
     workgroup_root: Option<PathBuf>,
@@ -6404,6 +6444,54 @@ fn run_serve(
                     "Shell Bus responder: bus persist open failed; responder skipped"
                 );
             }
+        }
+        // BULLETPROOF-1 — run the bus retention GC. The spool lives on `/run`
+        // (tmpfs); the GC pass exists in mde-bus but only the standalone
+        // `mde-bus` daemon ran it, and mackesd embeds the bus as a library and
+        // ships NO `mde-bus.service` — so on every deployed node retention
+        // NEVER ran and the `audit/*` (retention=forever) lane grew until it
+        // filled `/run` and bricked the node (found live on both lighthouses
+        // 2026-06-16). Own OS thread (sync pass); cap is filesystem-relative so
+        // a ~190 MB lighthouse tmpfs and a multi-GB workstation tmpfs are both
+        // bounded well below ENOSPC; the hard-cap valve sheds oldest-first.
+        if let Some(bus_root) = mde_bus::default_data_dir() {
+            let policy = bus_retention_policy(&bus_root);
+            let resp_shutdown = Arc::clone(&shutdown);
+            std::thread::Builder::new()
+                .name("bus-retention-gc".into())
+                .spawn(move || {
+                    // Faster than the 1h library default — a small tmpfs needs
+                    // tighter bounding; cheap (a SQLite scan + a dir walk).
+                    let interval = std::time::Duration::from_secs(120);
+                    while !resp_shutdown.load(Ordering::Relaxed) {
+                        match mde_bus::retention::run_pass_at(
+                            &policy,
+                            &bus_root,
+                            mde_bus::retention::current_unix_ms(),
+                        ) {
+                            Ok(r) if r.evicted > 0 => tracing::warn!(
+                                removed = r.removed, evicted = r.evicted, bytes_after = r.bytes_after,
+                                "bus retention: hard-cap reached — evicted oldest to stay off ENOSPC (BULLETPROOF-1)"
+                            ),
+                            Ok(r) => tracing::debug!(
+                                removed = r.removed, bytes_after = r.bytes_after, "bus retention pass"
+                            ),
+                            Err(e) => tracing::warn!(error = %e, "bus retention pass failed"),
+                        }
+                        // Sleep in short slices so shutdown is responsive.
+                        for _ in 0..interval.as_secs() {
+                            if resp_shutdown.load(Ordering::Relaxed) { break; }
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                        }
+                    }
+                })
+                .map(|_h| tracing::info!(
+                    soft_mb = policy.quota_soft_bytes / 1024 / 1024,
+                    hard_mb = policy.quota_hard_bytes / 1024 / 1024,
+                    "Bus retention GC spawned (BULLETPROOF-1)"
+                ))
+                .unwrap_or_else(|e| tracing::warn!(error = %e, "Bus retention GC thread spawn failed"));
+            worker_names.lock().expect("worker_names mutex").push("bus_retention_gc".into());
         }
         // E0.3.3 / FPG-4 — Fleet control surface (push/list/diff/
         // rollback/nudge) on the mesh Bus at action/fleet/<verb>,

@@ -48,9 +48,15 @@ pub const DEFAULT_TTL_HIGH_SECS: u64 = 30 * 24 * 60 * 60;
 /// comfortably covers any in-flight poll/retry window.
 pub const DEFAULT_TTL_EPHEMERAL_SECS: u64 = 60 * 60;
 
-/// GFS quota thresholds.
-pub const DEFAULT_QUOTA_SOFT_BYTES: u64 = 500 * 1024 * 1024;
-pub const DEFAULT_QUOTA_HARD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// GFS quota thresholds. These are the conservative **tmpfs-safe** fallback
+/// defaults: the bus spool lives on `/run` (tmpfs), and a lighthouse `/run` is
+/// as small as ~190 MB, so the old 500 MB soft / 2 GB hard could never fire
+/// before ENOSPC bricked the node (BULLETPROOF-1, found live 2026-06-16 — both
+/// lighthouses filled `/run` to 100% on the unreaped `audit/*` lane). mackesd
+/// overrides these with a filesystem-relative cap at spawn; the fixed default
+/// stays small enough that it alone keeps the smallest tmpfs from filling.
+pub const DEFAULT_QUOTA_SOFT_BYTES: u64 = 96 * 1024 * 1024;
+pub const DEFAULT_QUOTA_HARD_BYTES: u64 = 144 * 1024 * 1024;
 
 /// Default GC pass cadence — one pass per hour. Faster than
 /// the shortest TTL (24h for `min`) so messages don't linger
@@ -109,8 +115,13 @@ impl RetentionPolicy {
 /// Result of one retention pass.
 #[derive(Debug, Clone, Default)]
 pub struct PassReport {
-    /// Files (and matching index rows) removed during this pass.
+    /// Files (and matching index rows) removed by TTL expiry this pass.
     pub removed: usize,
+    /// BULLETPROOF-1 — messages evicted by the hard-cap safety valve
+    /// (oldest-first, regardless of TTL) because the spool exceeded the
+    /// hard quota. Distinct from `removed` so the log shows when the bus
+    /// is shedding live data to stay off ENOSPC.
+    pub evicted: usize,
     /// Total disk bytes used by remaining on-disk messages.
     pub bytes_after: u64,
     /// Quota state post-pass.
@@ -288,17 +299,80 @@ pub fn run_pass_at(
         removed += 1;
     }
 
-    // Compute disk usage + quota state.
-    let bytes_after = disk_usage_bytes(bus_root)?;
+    // BULLETPROOF-1 — hard-cap safety valve. The TTL reap above leaves
+    // `audit/*` untouched (Q28: the audit trail is retention=forever). On the
+    // tmpfs that backs the bus that is unbounded growth → a full `/run` that
+    // downs the whole node. So if we're still over the HARD cap after the TTL
+    // reap, evict oldest-first until back under the SOFT cap. Non-audit goes
+    // first; `audit/*` is shed only as a last resort (a full `/run` is strictly
+    // worse than losing ephemeral tmpfs audit that does not survive reboot).
+    let mut bytes_after = disk_usage_bytes(bus_root)?;
+    let mut evicted = 0_usize;
+    if bytes_after > policy.quota_hard_bytes {
+        evicted = evict_oldest_to_cap(&conn, bus_root, bytes_after, policy.quota_soft_bytes)?;
+        bytes_after = disk_usage_bytes(bus_root)?;
+    }
     let quota = QuotaReport {
         soft_exceeded: bytes_after > policy.quota_soft_bytes,
         hard_exceeded: bytes_after > policy.quota_hard_bytes,
     };
     Ok(PassReport {
         removed,
+        evicted,
         bytes_after,
         quota,
     })
+}
+
+/// BULLETPROOF-1 — evict oldest messages (by `ts_unix_ms`) until on-disk usage
+/// drops from `start_bytes` to at most `soft_bytes`. Two phases: non-`audit/*`
+/// first, then `audit/*` only if shedding all eligible non-audit still leaves
+/// us over the cap. Tracks the running total by subtracting each file's size
+/// (no full re-walk per delete). Returns the number of messages evicted.
+fn evict_oldest_to_cap(
+    conn: &rusqlite::Connection,
+    bus_root: &Path,
+    start_bytes: u64,
+    soft_bytes: u64,
+) -> Result<usize, RetentionError> {
+    let audit_like = format!("{}%", crate::persist::AUDIT_TOPIC_PREFIX);
+    let mut running = start_bytes;
+    let mut evicted = 0_usize;
+    // Phase 1: non-audit oldest-first. Phase 2: audit oldest-first.
+    for sql in [
+        "SELECT ulid, file_path FROM messages WHERE topic NOT LIKE ?1 ORDER BY ts_unix_ms ASC",
+        "SELECT ulid, file_path FROM messages WHERE topic LIKE ?1 ORDER BY ts_unix_ms ASC",
+    ] {
+        if running <= soft_bytes {
+            break;
+        }
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| RetentionError::Sql(format!("evict prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![audit_like], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| RetentionError::Sql(format!("evict query: {e}")))?;
+        for r in rows {
+            if running <= soft_bytes {
+                break;
+            }
+            let (ulid, rel_path) =
+                r.map_err(|e| RetentionError::Sql(format!("evict decode: {e}")))?;
+            let abs = bus_root.join(&rel_path);
+            let sz = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
+            if abs.exists() {
+                std::fs::remove_file(&abs)
+                    .map_err(|e| RetentionError::Io(format!("evict rm {}: {e}", abs.display())))?;
+            }
+            conn.execute("DELETE FROM messages WHERE ulid = ?1", params![ulid])
+                .map_err(|e| RetentionError::Sql(format!("evict row {ulid}: {e}")))?;
+            running = running.saturating_sub(sz);
+            evicted += 1;
+        }
+    }
+    Ok(evicted)
 }
 
 /// Convenience: today's clock as unix-ms.
@@ -337,11 +411,20 @@ pub async fn run_loop(
                         tracing::info!(
                             target: "mde_bus::retention",
                             removed = report.removed,
+                            evicted = report.evicted,
                             bytes_after = report.bytes_after,
                             soft_exceeded = report.quota.soft_exceeded,
                             hard_exceeded = report.quota.hard_exceeded,
                             "retention pass complete"
                         );
+                        if report.evicted > 0 {
+                            tracing::warn!(
+                                target: "mde_bus::retention",
+                                evicted = report.evicted,
+                                bytes_after = report.bytes_after,
+                                "BULLETPROOF-1: hard-cap reached — evicted oldest messages to keep the bus tmpfs off ENOSPC"
+                            );
+                        }
                         if report.quota.soft_exceeded && !last_soft_warn {
                             // Publish a warning to bus/sys/quota.
                             // Best-effort — failure to publish is
@@ -628,15 +711,18 @@ mod tests {
 
     #[test]
     fn quota_soft_breach_surfaces_in_report() {
+        // Soft breach that is NOT a hard breach: advisory only, no eviction
+        // (the hard-cap valve fires only above the hard quota — BULLETPROOF-1).
         let policy = RetentionPolicy {
-            quota_soft_bytes: 1, // 1 byte — guaranteed exceeded
-            quota_hard_bytes: 2,
+            quota_soft_bytes: 1,                // 1 byte — guaranteed exceeded
+            quota_hard_bytes: 10 * 1024 * 1024, // 10 MB — not reached by one small msg
             ..RetentionPolicy::default()
         };
         let (_tmp, root) = open_tmp_with(&[("t/x", Priority::Urgent, 1)]);
         let report = run_pass_at(&policy, &root, 100).unwrap();
-        assert!(report.quota.soft_exceeded);
-        assert!(report.quota.hard_exceeded);
+        assert!(report.quota.soft_exceeded, "soft quota surfaces");
+        assert!(!report.quota.hard_exceeded, "below hard quota");
+        assert_eq!(report.evicted, 0, "no eviction below the hard cap");
     }
 
     #[test]
@@ -655,5 +741,139 @@ mod tests {
         // until the operator backfills them.
         let report = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
         assert_eq!(report.removed, 0);
+    }
+
+    // BULLETPROOF-1 — hard-cap eviction safety valve.
+
+    /// Seed `topic` with a `body_len`-byte body at `ts`, returning its ULID.
+    fn write_sized(root: &Path, topic: &str, prio: Priority, ts: i64, body_len: usize) -> String {
+        let p = Persist::open(root.to_path_buf()).unwrap();
+        let body = "x".repeat(body_len);
+        let m = p.write(topic, prio, None, Some(&body)).unwrap();
+        let conn = Connection::open(root.join("index.sqlite")).unwrap();
+        conn.execute(
+            "UPDATE messages SET ts_unix_ms = ?1 WHERE ulid = ?2",
+            params![ts, m.ulid],
+        )
+        .unwrap();
+        m.ulid
+    }
+
+    fn purge_audit(root: &Path) {
+        let conn = Connection::open(root.join("index.sqlite")).unwrap();
+        conn.execute("DELETE FROM messages WHERE topic LIKE 'audit/%'", [])
+            .unwrap();
+        let _ = std::fs::remove_dir_all(root.join("audit"));
+    }
+
+    #[test]
+    fn hard_cap_evicts_oldest_first_until_under_soft() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        // Six 1 MB messages (6 MB) on a 3 MB-hard / 2 MB-soft policy.
+        let mb = 1024 * 1024;
+        let now = 1_000_000_000_000_i64;
+        let mut ulids = Vec::new();
+        for i in 0..6 {
+            // Recent, ascending ts so High's 30d TTL never reaps them — the
+            // hard-cap valve is the only thing that should fire.
+            ulids.push(write_sized(
+                &root,
+                "t/bulk",
+                Priority::High,
+                now - (6 - i) * 1000,
+                mb,
+            ));
+        }
+        purge_audit(&root);
+        let policy = RetentionPolicy {
+            quota_soft_bytes: 2 * mb as u64,
+            quota_hard_bytes: 3 * mb as u64,
+            ..RetentionPolicy::default()
+        };
+        let report = run_pass_at(&policy, &root, now).unwrap();
+        assert_eq!(report.removed, 0, "no TTL expiry — High survives 30d");
+        assert!(report.evicted >= 1, "hard cap must shed oldest");
+        assert!(
+            report.bytes_after <= policy.quota_hard_bytes,
+            "post-eviction must be under the hard cap, was {}",
+            report.bytes_after
+        );
+        // The newest message (highest ts) must survive; the oldest must be gone.
+        let p = Persist::open(root.clone()).unwrap();
+        let remaining: Vec<String> = p
+            .list_since("t/bulk", None)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.ulid)
+            .collect();
+        assert!(remaining.contains(ulids.last().unwrap()), "newest survives");
+        assert!(!remaining.contains(&ulids[0]), "oldest evicted");
+    }
+
+    #[test]
+    fn hard_cap_sheds_non_audit_before_audit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let mb = 1024 * 1024;
+        let now = 1_000_000_000_000_i64;
+        // 4 non-audit (1 MB each) + 2 audit (1 MB each), all recent so nothing
+        // TTL-reaps. Eviction is phase-ordered (non-audit first) regardless of
+        // ts, so shedding the non-audit lane alone gets us under the cap.
+        let mut non_audit = Vec::new();
+        for i in 0..4 {
+            non_audit.push(write_sized(
+                &root,
+                "t/data",
+                Priority::High,
+                now - (6 - i) * 1000,
+                mb,
+            ));
+        }
+        let audit_a = write_sized(&root, "audit/peerx", Priority::Min, now - 2000, mb);
+        let audit_b = write_sized(&root, "audit/peerx", Priority::Min, now - 1000, mb);
+        let policy = RetentionPolicy {
+            quota_soft_bytes: 3 * mb as u64,
+            quota_hard_bytes: 4 * mb as u64,
+            ..RetentionPolicy::default()
+        };
+        let report = run_pass_at(&policy, &root, now).unwrap();
+        assert!(report.evicted >= 1);
+        // Audit is shed last: both audit records must survive because evicting
+        // the non-audit lane alone gets us under the cap.
+        let p = Persist::open(root.clone()).unwrap();
+        let audit_left: Vec<String> = p
+            .list_since("audit/peerx", None)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.ulid)
+            .collect();
+        assert!(
+            audit_left.contains(&audit_a) && audit_left.contains(&audit_b),
+            "audit/* must be preserved when non-audit eviction suffices"
+        );
+        assert!(
+            p.list_since("t/data", None).unwrap().len() < non_audit.len(),
+            "non-audit lane shed first"
+        );
+    }
+
+    #[test]
+    fn under_hard_cap_evicts_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_sized(&root, "t/small", Priority::High, 1, 1024);
+        purge_audit(&root);
+        // Default tmpfs-safe policy (96/144 MB) is far above a 1 KB spool.
+        let report = run_pass_at(&RetentionPolicy::default(), &root, 1_000_000_000_000).unwrap();
+        assert_eq!(report.evicted, 0);
+    }
+
+    #[test]
+    fn default_quota_is_tmpfs_safe() {
+        // Regression: the old 500 MB/2 GB defaults exceeded a ~190 MB
+        // lighthouse /run, so the cap could never fire before ENOSPC.
+        assert!(DEFAULT_QUOTA_HARD_BYTES < 190 * 1024 * 1024);
+        assert!(DEFAULT_QUOTA_SOFT_BYTES < DEFAULT_QUOTA_HARD_BYTES);
     }
 }
