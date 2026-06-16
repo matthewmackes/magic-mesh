@@ -701,7 +701,32 @@ impl Supervisor {
         self.shutdown_tx
             .send(true)
             .context("broadcasting shutdown to workers")?;
-        Ok(self.join_all().await)
+        // REL-1 (2026-06-16) — bound the drain. A single worker that doesn't
+        // honor the shutdown token within the grace (a blocking subprocess /
+        // sync I/O outside a `select!`) used to hold the whole shutdown until
+        // systemd's TimeoutStopSec SIGKILLed the daemon — which left
+        // `systemctl restart mackesd` wedged ("active" but not answering RPCs)
+        // for ~20s on every node during the v10.0.9 roll. After the grace,
+        // abort the stragglers so the daemon exits promptly and a restart
+        // comes back responsive fast.
+        const GRACE: std::time::Duration = std::time::Duration::from_secs(6);
+        match tokio::time::timeout(GRACE, self.join_all()).await {
+            Ok(outcomes) => Ok(outcomes),
+            Err(_) => {
+                warn!(
+                    grace_s = GRACE.as_secs(),
+                    "shutdown: workers did not finish within grace; aborting stragglers"
+                );
+                self.join.abort_all();
+                let mut outcomes = Vec::new();
+                while let Some(joined) = self.join.join_next().await {
+                    if let Ok(o) = joined {
+                        outcomes.push(o);
+                    }
+                }
+                Ok(outcomes)
+            }
+        }
     }
 }
 

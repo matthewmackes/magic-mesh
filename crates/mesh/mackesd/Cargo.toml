@@ -475,6 +475,11 @@ nebula = "*"
 # panel shows 0 hosts. Hard Require: nmap is small + in the base Fedora repos,
 # and the feature is core to the mesh host map.
 nmap = "*"
+# REL-2 (2026-06-16) — the binaries link libasound.so.2 (the AIR-5 audio chain
+# in mde-musicd/mde-voice-hud), so it's an implicit ELF dep. Declare it: a
+# headless lighthouse without alsa-lib failed the v10.0.9 install until it was
+# added by hand. alsa-lib is small + in the base Fedora repos.
+alsa-lib = "*"
 
 # EFF-42 — ansible-core is a WEAK dep (Recommends): only the Server-tier
 # ansible_pull/job_exec workers shell to it, and they degrade gracefully
