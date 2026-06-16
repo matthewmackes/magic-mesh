@@ -426,6 +426,8 @@ assets = [
     # MESHSHELL SHELL-3 — the per-shell Carbon welcome greeting.
     { source = "install-helpers/mesh-welcome.py",       dest = "/usr/libexec/mackesd/mesh-welcome",        mode = "755" },
     { source = "packaging/profile.d/zz-mde-welcome.sh", dest = "/etc/profile.d/zz-mde-welcome.sh",         mode = "644" },
+    # MESHSHELL SHELL-4 — the `mesh-help` cheat sheet (user-facing on PATH).
+    { source = "install-helpers/mesh-help.sh",          dest = "/usr/bin/mesh-help",                       mode = "755" },
 ]
 # EFF-14 — install/upgrade/remove scriptlets: register the daemon unit, create
 # the config dir, refresh icon/desktop caches; clean up on removal. Guards keep
