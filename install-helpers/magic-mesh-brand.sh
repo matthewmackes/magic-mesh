@@ -71,7 +71,21 @@ gtk-theme-name=${GTK_DARK}
 gtk-icon-theme-name=${ICON_THEME}
 EOF
     done
-    # Per-user (live session) via gsettings — best-effort.
+    # System-wide dconf default — applies on the user's FIRST login (the
+    # first-boot service runs before anyone is logged in, so a live `gsettings`
+    # set has no session to write to). A per-user override still wins later.
+    if have dconf; then
+        mkdir -p /etc/dconf/db/local.d /etc/dconf/profile
+        [ -f /etc/dconf/profile/user ] || printf 'user-db:user\nsystem-db:local\n' > /etc/dconf/profile/user
+        cat > /etc/dconf/db/local.d/10-mde-carbon <<EOF
+[org/gnome/desktop/interface]
+icon-theme='${ICON_THEME}'
+gtk-theme='${GTK_DARK}'
+color-scheme='prefer-dark'
+EOF
+        dconf update 2>/dev/null || true
+    fi
+    # Also apply live to an already-logged-in session (best-effort).
     if [ -n "$USER_NAME" ] && have gsettings; then
         as_user gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark' 2>/dev/null || true
         as_user gsettings set org.gnome.desktop.interface gtk-theme "$GTK_DARK" 2>/dev/null || true
@@ -175,12 +189,12 @@ brand_default_apps() {
     log "setting mde-files as the default file manager"
     # System-wide MIME default for directories.
     if have xdg-mime; then
-        as_user xdg-mime default mde-files.desktop inode/directory 2>/dev/null || true
+        as_user xdg-mime default org.magicmesh.Files.desktop inode/directory 2>/dev/null || true
     fi
     mkdir -p /etc/xdg
     # Belt-and-suspenders system default.
-    grep -q "inode/directory=mde-files.desktop" /etc/xdg/mimeapps.list 2>/dev/null || {
-        printf '[Default Applications]\ninode/directory=mde-files.desktop\n' >> /etc/xdg/mimeapps.list
+    grep -q "inode/directory=org.magicmesh.Files.desktop" /etc/xdg/mimeapps.list 2>/dev/null || {
+        printf '[Default Applications]\ninode/directory=org.magicmesh.Files.desktop\n' >> /etc/xdg/mimeapps.list
     }
     # The notification-applet swap is baked into the seeded layout
     # (CosmicAppletNotifications removed; com.mackes.MagicMeshApplet kept).
