@@ -182,11 +182,15 @@ pub fn ensure_xdg_binds(mount_path: &Path, home: &Path) -> Vec<String> {
             mount_path.display()
         )];
     }
+    // AUDIT-MESH-15: mackesd runs in a PRIVATE mount namespace (PrivateTmp), so a
+    // `mount --bind` it makes is invisible to the user's session. Run the
+    // mountpoint check + the bind in the HOST (pid 1) mount namespace via
+    // `nsenter` so the desktop user actually sees the synced dirs. In a dev/test
+    // run (no /proc/1/ns/mnt access, or already the host ns) the prefix is empty.
+    let host_ns = host_mount_ns_prefix();
     for (source, target) in xdg_bind_plan(mount_path, home) {
-        // `mountpoint -q` exits 0 when target is already a mountpoint.
-        let already = Command::new("mountpoint")
-            .arg("-q")
-            .arg(&target)
+        // `mountpoint -q` (in the host ns) exits 0 when already a mountpoint.
+        let already = host_ns_command(&host_ns, "mountpoint", &["-q", &target.to_string_lossy()])
             .status()
             .map(|st| st.success())
             .unwrap_or(false);
@@ -211,11 +215,12 @@ pub fn ensure_xdg_binds(mount_path: &Path, home: &Path) -> Vec<String> {
             ));
             continue;
         }
-        match Command::new("mount")
-            .arg("--bind")
-            .arg(&source)
-            .arg(&target)
-            .status()
+        match host_ns_command(
+            &host_ns,
+            "mount",
+            &["--bind", &source.to_string_lossy(), &target.to_string_lossy()],
+        )
+        .status()
         {
             Ok(st) if st.success() => {
                 tracing::info!(
@@ -243,6 +248,44 @@ pub fn ensure_xdg_binds(mount_path: &Path, home: &Path) -> Vec<String> {
         }
     }
     failures
+}
+
+/// AUDIT-MESH-15 — whether to run mount ops through `nsenter` to reach the host
+/// (pid 1) mount namespace. Returns the nsenter argv prefix when the daemon is
+/// in a DIFFERENT mount namespace than pid 1 (the sandboxed-service case) and
+/// `nsenter` + `/proc/1/ns/mnt` are usable; otherwise an empty prefix (dev/test
+/// or already the host ns → run `mount`/`mountpoint` directly).
+#[must_use]
+fn host_mount_ns_prefix() -> Vec<String> {
+    let self_ns = std::fs::read_link("/proc/self/ns/mnt").ok();
+    let pid1_ns = std::fs::read_link("/proc/1/ns/mnt").ok();
+    let differ = matches!((&self_ns, &pid1_ns), (Some(a), Some(b)) if a != b);
+    if differ && binary_on_path("nsenter") && std::path::Path::new("/proc/1/ns/mnt").exists() {
+        vec![
+            "nsenter".to_owned(),
+            "--target".to_owned(),
+            "1".to_owned(),
+            "--mount".to_owned(),
+            "--".to_owned(),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Build a [`Command`] for `prog args…`, prefixed with the host-namespace
+/// `nsenter` invocation when [`host_mount_ns_prefix`] is non-empty.
+#[must_use]
+fn host_ns_command(prefix: &[String], prog: &str, args: &[&str]) -> Command {
+    if prefix.is_empty() {
+        let mut cmd = Command::new(prog);
+        cmd.args(args);
+        cmd
+    } else {
+        let mut cmd = Command::new(&prefix[0]);
+        cmd.args(&prefix[1..]).arg(prog).args(args);
+        cmd
+    }
 }
 
 /// The bind-mount plan for one user's home (FPG-7 / Q13): pairs of
