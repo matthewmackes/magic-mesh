@@ -222,7 +222,15 @@ impl Persist {
         let topic_dir = self.bus_root.join(topic);
         std::fs::create_dir_all(&topic_dir)
             .map_err(|e| PersistError::Io(format!("mkdir {}: {e}", topic_dir.display())))?;
-        relax_shared(&topic_dir, true); // SETUP-fix: shared-spool cross-uid writes
+        // SETUP-fix / AUDIT-MESH-16 — relax EVERY component of the topic path,
+        // not just the leaf. `create_dir_all` makes intermediate dirs with the
+        // creator's umask (root → 0755), so a parent like `reply/` created by
+        // the root daemon would block a different-uid responder (e.g. mde-musicd
+        // running as the desktop user) from creating its `reply/<ulid>` subdir —
+        // its replies were silently dropped (`let _ = persist.write`), so every
+        // music RPC timed out. Relaxing the whole chain to 0777 lets any mesh
+        // uid write into the shared spool.
+        relax_topic_chain(&self.bus_root, topic);
 
         let file_name = format!("{ulid}.json");
         let abs_path = topic_dir.join(&file_name);
@@ -501,6 +509,19 @@ fn relax_shared(path: &std::path::Path, dir: bool) {
 }
 #[cfg(not(unix))]
 fn relax_shared(_path: &std::path::Path, _dir: bool) {}
+
+/// AUDIT-MESH-16 — relax every directory component of `topic` under `bus_root`
+/// to 0777 (not just the leaf), so a topic like `reply/<ulid>` makes BOTH the
+/// `reply/` parent and the `<ulid>` leaf writable by any mesh uid. Without this,
+/// the intermediate dir created by the first writer (often the root daemon at
+/// umask 022 → 0755) blocks a different-uid responder from writing its replies.
+fn relax_topic_chain(bus_root: &std::path::Path, topic: &str) {
+    let mut dir = bus_root.to_path_buf();
+    for comp in topic.split('/').filter(|c| !c.is_empty()) {
+        dir.push(comp);
+        relax_shared(&dir, true);
+    }
+}
 
 /// Relax the sqlite index + its WAL/SHM sidecars (created lazily by sqlite) for
 /// the shared spool, so both uids can write the index.
