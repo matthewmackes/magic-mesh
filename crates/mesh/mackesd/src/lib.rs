@@ -115,6 +115,8 @@ pub mod secrets;
 // one commit with real code. The empty-scaffold version was deleted
 // 2026-05-22 per .claude/CLAUDE.md §0.12 (no stubs), matching the
 // same-day deploy/ scaffold deletion.
+/// BULLETPROOF-2 — minimal sd_notify (systemd readiness + watchdog), no dep.
+pub mod sd_notify;
 pub mod settings;
 /// SETUP-7 — the `/etc/mackesd/site.yml` convergence playbook emitter.
 pub mod site_yml;

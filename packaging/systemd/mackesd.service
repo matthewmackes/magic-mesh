@@ -12,7 +12,17 @@ StartLimitBurst=10
 OnFailure=mesh-alert@%n.service
 
 [Service]
-Type=simple
+# BULLETPROOF-2 — Type=notify + a watchdog so a HUNG daemon (process alive but
+# the runtime wedged, e.g. a thread stuck in D-state on a bad FUSE read) is
+# auto-restarted; the plain process-alive check can't see a hang. mackesd sends
+# READY=1 once the supervisor + all responders are up, then pings WATCHDOG=1
+# from its main loop. NotifyAccess=main: only the main process's notifications
+# count. TimeoutStartSec is generous so a slow-but-not-hung init (cold mount,
+# debug keygen) is never killed before READY=1; WatchdogSec restarts a true hang.
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=120
+WatchdogSec=60
 # SETUP-fix — SHARED bus spool so this root daemon's responders + the uid-1000
 # desktop GUIs (workbench/applet) share ONE bus (per-HOME data_dir() otherwise
 # splits /root from /home/<u>, so every workbench<->mackesd RPC times out). The

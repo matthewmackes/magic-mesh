@@ -6894,14 +6894,39 @@ fn run_serve(
             Arc::clone(&shutdown),
         );
 
+        // BULLETPROOF-2 — the daemon is up (supervisor + all responders +
+        // workers spawned). Tell systemd we're READY (Type=notify gate) and
+        // arm the watchdog ping below. Best-effort: a non-systemd launch
+        // (NOTIFY_SOCKET unset) is a clean no-op.
+        match mackesd_core::sd_notify::notify_ready() {
+            Ok(true) => tracing::info!("sd_notify: READY=1 (Type=notify)"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(error = %e, "sd_notify READY=1 failed"),
+        }
+        let watchdog_interval = mackesd_core::sd_notify::watchdog_interval();
+        if let Some(iv) = watchdog_interval {
+            tracing::info!(secs = iv.as_secs(), "systemd watchdog armed");
+        }
+        let mut last_watchdog = std::time::Instant::now();
+
         // Watch loop: wake every 250 ms to check the shutdown flag.
         // When it flips, drop out so reconcile.join() can wait for
         // the worker to finish its current tick. The async
         // supervisor's workers see shutdown via the SIGTERM signal
         // handler installed above (mackesd_core::workers::ShutdownToken
         // wraps the same broadcast channel).
+        //
+        // BULLETPROOF-2 — this is also the systemd watchdog heartbeat: the ping
+        // rides the main loop, so a wedged/deadlocked runtime stops pinging and
+        // systemd restarts the daemon (a hang the process-alive check can't see).
         while !shutdown.load(Ordering::Relaxed) {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            if let Some(iv) = watchdog_interval {
+                if last_watchdog.elapsed() >= iv {
+                    let _ = mackesd_core::sd_notify::notify_watchdog();
+                    last_watchdog = std::time::Instant::now();
+                }
+            }
             if reconcile.is_finished() {
                 tracing::warn!(
                     "mackesd serve: reconcile worker exited without \
