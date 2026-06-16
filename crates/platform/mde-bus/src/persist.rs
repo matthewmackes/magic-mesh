@@ -41,6 +41,16 @@ use crate::hooks::config::Priority;
 /// need a separate file at runtime.
 const SCHEMA: &str = include_str!("../migrations/0001_init.sql");
 
+/// BOOT-REC-3 — true only for a definitive SQLite **read-only** failure (the
+/// boot-race latch), NOT busy/locked contention. Gates the self-heal recreate
+/// so transient concurrency never deletes the live index.
+fn is_readonly_err(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::ReadOnly
+    )
+}
+
 /// Default `bus_root` path. Matches BUS-1.7 + BUS-1.6 conventions.
 pub const DEFAULT_BUS_ROOT: &str = "~/.local/share/mde/bus";
 
@@ -157,8 +167,12 @@ impl Persist {
         // fails and the workbench shows "mesh service unreachable / no peers"
         // until a manual clear. The index lives on /run (tmpfs, ephemeral — the
         // durable directory/heartbeat data is on QNM-Shared), so self-heal by
-        // recreating it when a write-probe fails.
-        if Self::write_probe(&conn).is_err() {
+        // recreating it when the probe reports a TRUE read-only DB. We must NOT
+        // recreate on lock/busy contention (many processes — daemon, GUIs, CLI —
+        // open Persist concurrently): busy is transient + absorbed by
+        // busy_timeout, and recreating on it would delete the live DB out from
+        // under everyone. So gate strictly on the ReadOnly error code.
+        if matches!(Self::write_probe(&conn), Err(e) if is_readonly_err(&e)) {
             drop(conn);
             for suffix in ["", "-wal", "-shm"] {
                 let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
@@ -168,7 +182,7 @@ impl Persist {
             tracing::warn!(
                 target: "mde_bus::persist",
                 db = %db_path.display(),
-                "bus index was unwritable on open (boot-race) — recreated it (BOOT-REC-3)",
+                "bus index was read-only on open (boot-race) — recreated it (BOOT-REC-3)",
             );
         }
         Ok(Self { bus_root, conn })
@@ -188,16 +202,14 @@ impl Persist {
         Ok(conn)
     }
 
-    /// BOOT-REC-3 write-probe: a trivial write that surfaces a latched
-    /// read-only/locked DB at open time. `Ok(())` ⇒ the index accepts writes.
+    /// BOOT-REC-3 write-probe: a NON-contending write that surfaces a latched
+    /// read-only DB at open time. Rewrites `PRAGMA user_version` to its current
+    /// value (a real header write, no value change, no schema/table contention),
+    /// so concurrent opens don't fight over a scratch table. `Ok(())` ⇒ the
+    /// index accepts writes; a ReadOnly error ⇒ the boot-race latch.
     fn write_probe(conn: &Connection) -> Result<(), rusqlite::Error> {
-        // Create→insert→drop a scratch table: a real write that surfaces a
-        // latched read-only DB, leaving no artifact behind.
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS _mde_probe(x INTEGER);\
-             INSERT INTO _mde_probe(x) VALUES(1);\
-             DROP TABLE _mde_probe;",
-        )
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        conn.execute_batch(&format!("PRAGMA user_version = {v};"))
     }
 
     /// Append a new message: write the on-disk JSON file
