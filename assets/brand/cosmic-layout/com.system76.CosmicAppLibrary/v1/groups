@@ -1,0 +1,99 @@
+[
+    (
+        name: "Internet",
+        icon: "folder-symbolic",
+        filter: AppIds([
+            "filezilla",
+            "transmission-gtk",
+            "org.mozilla.firefox",
+            "com.microsoft.Edge",
+            "pidgin",
+        ]),
+    ),
+    (
+        name: "cosmic-office",
+        icon: "folder-symbolic",
+        filter: Categories(
+            categories: [
+                "Office",
+            ],
+            exclude: [],
+            include: [
+                "org.gnome.Totem",
+                "org.gnome.eog",
+                "simple-scan",
+                "thunderbird",
+            ],
+        ),
+    ),
+    (
+        name: "cosmic-system",
+        icon: "folder-symbolic",
+        filter: Categories(
+            categories: [
+                "System",
+            ],
+            exclude: [
+                "com.system76.CosmicStore",
+                "com.system76.CosmicTerm",
+                "gparted",
+                "xfce4-terminal",
+                "xterm",
+                "com.system76.CosmicSettings",
+                "com.system76.CosmicFiles",
+                "org.magicmesh.Files",
+            ],
+            include: [
+                "gnome-language-selector",
+                "im-config",
+                "org.freedesktop.IBus.Setup",
+                "system76-driver",
+                "qt6ct",
+                "qt5ct",
+                "im-chooser",
+                "blueman-manager",
+                "thunar-settings",
+                "org.xfce.xfdashboard-settings",
+            ],
+        ),
+    ),
+    (
+        name: "cosmic-utilities",
+        icon: "folder-symbolic",
+        filter: Categories(
+            categories: [
+                "Utility",
+            ],
+            exclude: [
+                "com.system76.CosmicFiles",
+                "asunder",
+                "blueman-manager",
+                "thunar-settings",
+                "org.xfce.xfdashboard-settings",
+                "com.system76.CosmicTerm",
+                "org.magicmesh.NotifyCenter",
+            ],
+            include: [
+                "nm-connection-editor",
+                "geany",
+                "org.pulseaudio.pavucontrol",
+                "com.system76.CosmicEdit",
+                "com.system76.CosmicStore",
+                "gparted",
+                "xfce4-terminal",
+                "xterm",
+            ],
+        ),
+    ),
+    (
+        name: "Media",
+        icon: "folder-symbolic",
+        filter: AppIds([
+            "pragha",
+            "org.xfce.ristretto",
+            "org.xfce.Parole",
+            "com.system76.CosmicPlayer",
+            "asunder",
+        ]),
+    ),
+]
