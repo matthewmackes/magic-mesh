@@ -442,6 +442,14 @@ assets = [
     # under BIRTHRIGHT-1 (see docs/design/birthrights.md).
     { source = "vendor/birthright/ntfy_2.24.0_linux_amd64.tar.gz", dest = "/usr/share/magic-mesh/vendor/ntfy_2.24.0_linux_amd64.tar.gz", mode = "644" },
     { source = "vendor/birthright/starship-x86_64-unknown-linux-musl.tar.gz", dest = "/usr/share/magic-mesh/vendor/starship-x86_64-unknown-linux-musl.tar.gz", mode = "644" },
+    # BIRTHRIGHT-1 — the role-aware LizardFS installer + the bundled fc43 RPM
+    # family (the §1 shared-state substrate). LizardFS isn't in F44 base repos;
+    # the fc43 binaries run on F44 via `rpm --nodeps`. setup-qnm-shared (already
+    # shipped above) is auto-invoked by `mackesd found`/`join`. RPMs are NOT in
+    # git — staged at build time by install-helpers/vendor-lizardfs-rpms.sh
+    # (build-rpm-fedora43.sh runs it before generate-rpm).
+    { source = "install-helpers/mesh-install-lizardfs.sh", dest = "/usr/libexec/mackesd/mesh-install-lizardfs", mode = "755" },
+    { source = "vendor/birthright/lizardfs/*.rpm", dest = "/usr/share/magic-mesh/vendor/lizardfs/", mode = "644" },
 ]
 # EFF-14 — install/upgrade/remove scriptlets: register the daemon unit, create
 # the config dir, refresh icon/desktop caches; clean up on removal. Guards keep

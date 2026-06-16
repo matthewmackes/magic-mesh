@@ -4997,6 +4997,26 @@ fn run_serve(
     let workgroup_root = workgroup_root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
     let node_id = node_id.unwrap_or_else(default_node_id);
 
+    // BIRTHRIGHT-1 — fail-loud shared-state assertion. On a deployed node the
+    // workgroup root is the LizardFS FUSE mount at /mnt/mesh-storage; if it's
+    // that canonical path but NOT actually mounted, the §1 shared-state plane
+    // is DOWN (leader election, the peer directory, fleet rollups, and the CA
+    // all silently no-op against a bare local dir — the ONBOARD-6 failure
+    // class). Surface it LOUDLY at startup rather than degrading in silence.
+    // Not fatal: the daemon still runs the overlay, and the mesh-health
+    // watchdog restarts qnm-shared.service to recover the mount.
+    if workgroup_root == std::path::Path::new("/mnt/mesh-storage")
+        && !mackesd_core::workers::compute_registry::is_meshfs_mounted(&workgroup_root)
+    {
+        tracing::error!(
+            target: "mackesd",
+            path = %workgroup_root.display(),
+            "QNM-Shared is NOT mounted — the shared-state plane is DOWN; leader/directory/\
+             fleet will not work mesh-wide. Provision it: `mackesd found`/`join` auto-runs \
+             setup-qnm-shared, or run `/usr/libexec/mackesd/setup-qnm-shared --client` by hand."
+        );
+    }
+
     // v3.0.3 — daemon-scope tracing span so every log line below
     // carries correlation_id + node_id. The JSON formatter
     // (initialized in main.rs's tracing-subscriber setup) picks up
@@ -7082,6 +7102,14 @@ fn cmd_found(
     // disabled, and was previously only `start`ed, so a reboot left the overlay
     // down until the supervisor happened to revive it (ONBOARD-9).
     enable_now_service("nebula.service");
+
+    // BIRTHRIGHT-1 — the founding lighthouse provisions LizardFS (master +
+    // chunkserver + client) and mounts QNM-Shared BEFORE mackesd starts, so the
+    // daemon comes up against a real shared-state plane (leader/directory/fleet
+    // all assume it mounted). The founder is the master, bound on its own
+    // overlay IP. Best-effort: a miss logs loudly, the overlay still comes up.
+    provision_qnm_shared(parsed, true, &report.overlay_ip, &report.overlay_ip);
+
     enable_now_service("mackesd.service");
     enable_now_service("mesh-health.timer");
 
@@ -7184,6 +7212,18 @@ fn cmd_join(
     // leaves a node that survives reboot and self-recovers, instead of one the
     // operator must `systemctl restart mackesd` by hand.
     enable_now_service("nebula.service");
+
+    // BIRTHRIGHT-1 — a joining peer provisions LizardFS for its role (client,
+    // +chunkserver on Server/Lighthouse) and mounts QNM-Shared against the
+    // floating master VIP BEFORE mackesd starts, so the node has shared state
+    // from the first boot — no manual setup-qnm-shared. Best-effort.
+    provision_qnm_shared(
+        parsed,
+        false,
+        mackesd_core::workers::meshfs_worker::DEFAULT_VIP,
+        &bundle.overlay_ip,
+    );
+
     enable_now_service("mackesd.service");
     enable_now_service("mesh-health.timer");
 
@@ -7193,6 +7233,72 @@ fn cmd_join(
     );
     println!("services: nebula + mackesd + mesh-health enabled (boot-durable) and running");
     Ok(())
+}
+
+/// BIRTHRIGHT-1 — install LizardFS + stand up QNM-Shared (the §1 shared-state
+/// plane) for this role at enroll time, so a fresh `found`/`join` yields a
+/// working mesh with NO manual `setup-qnm-shared` step.
+///
+/// `is_founder` is true only for `mackesd found` — the founding lighthouse runs
+/// the master; everyone else (incl. a second lighthouse) is chunkserver/client.
+/// `master_ip` is the master's overlay address (the founder's own overlay IP on
+/// `found`; the floating VIP on `join`). `listen_ip` is this node's overlay IP.
+///
+/// Best-effort + idempotent: a failure logs loudly but NEVER aborts the enroll
+/// (the node still joins the overlay; the daemon's startup mount-assert + the
+/// mesh-health watchdog surface a degraded plane). Mirrors the provisioning
+/// ladder in `mesh-install-lizardfs` (dnf → bundled fc43 RPMs → fetch → warn).
+/// BIRTHRIGHT-1 — the `setup-qnm-shared` role flags for a node. Pure (no I/O)
+/// so the role→flags policy is unit-tested. Master only on the founding
+/// lighthouse; chunkserver on the founder + every Lighthouse/Server (storage
+/// tier); client on every node (all nodes mount the volume).
+fn qnm_setup_flags(role: mde_role::Role, is_founder: bool) -> Vec<&'static str> {
+    use mde_role::Role;
+    let mut flags = Vec::new();
+    if is_founder {
+        flags.push("--master");
+    }
+    if is_founder || role == Role::Lighthouse || role == Role::Server {
+        flags.push("--chunkserver");
+    }
+    flags.push("--client");
+    flags
+}
+
+fn provision_qnm_shared(role: mde_role::Role, is_founder: bool, master_ip: &str, listen_ip: &str) {
+    // 1. Binaries (role-aware; the script is non-fatal on a miss).
+    let install = std::process::Command::new("/usr/libexec/mackesd/mesh-install-lizardfs")
+        .arg(role.as_str())
+        .status();
+    if let Err(e) = &install {
+        eprintln!("provision: mesh-install-lizardfs not run ({e}) — QNM-Shared may be degraded");
+    }
+
+    // 2. setup-qnm-shared role flags.
+    let flags = qnm_setup_flags(role, is_founder);
+
+    let mut cmd = std::process::Command::new("/usr/libexec/mackesd/setup-qnm-shared");
+    cmd.args(&flags)
+        .arg("--master-ip")
+        .arg(master_ip)
+        .arg("--listen")
+        .arg(listen_ip);
+    println!(
+        "QNM-Shared: provisioning [{}] master-ip {master_ip} listen {listen_ip}",
+        flags.join(" ")
+    );
+    match cmd.status() {
+        Ok(s) if s.success() => println!("QNM-Shared: provisioned (shared-state plane up)"),
+        Ok(s) => eprintln!(
+            "provision: setup-qnm-shared exited {:?} — shared-state plane may be DOWN; \
+             check `systemctl status qnm-shared.service`",
+            s.code()
+        ),
+        Err(e) => eprintln!(
+            "provision: setup-qnm-shared not run ({e}) — is the RPM installed? \
+             shared-state plane is DOWN until provisioned"
+        ),
+    }
 }
 
 /// ONBOARD-4/9 — enable + start a systemd unit so it is live now AND comes up
@@ -7250,4 +7356,53 @@ fn install_signal_handlers(
         })
         .context("spawning signal-reader thread")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::qnm_setup_flags;
+    use mde_role::Role;
+
+    #[test]
+    fn founding_lighthouse_runs_master_chunkserver_client() {
+        // BIRTHRIGHT-1: the founder is the only --master.
+        let f = qnm_setup_flags(Role::Lighthouse, true);
+        assert_eq!(f, vec!["--master", "--chunkserver", "--client"]);
+    }
+
+    #[test]
+    fn joining_lighthouse_and_server_are_chunkserver_client_not_master() {
+        // A second lighthouse / a server store chunks but never run a 2nd master.
+        for role in [Role::Lighthouse, Role::Server] {
+            let f = qnm_setup_flags(role, false);
+            assert!(
+                !f.contains(&"--master"),
+                "{role:?} must not run a master on join"
+            );
+            assert_eq!(f, vec!["--chunkserver", "--client"]);
+        }
+    }
+
+    #[test]
+    fn joining_workstation_is_client_only() {
+        // A workstation only mounts the volume — no storage, no master.
+        let f = qnm_setup_flags(Role::Workstation, false);
+        assert_eq!(f, vec!["--client"]);
+    }
+
+    #[test]
+    fn every_role_mounts_the_volume() {
+        // --client (the mount) is universal; without it the node has no QNM-Shared.
+        for (role, founder) in [
+            (Role::Lighthouse, true),
+            (Role::Lighthouse, false),
+            (Role::Server, false),
+            (Role::Workstation, false),
+        ] {
+            assert!(
+                qnm_setup_flags(role, founder).contains(&"--client"),
+                "{role:?} (founder={founder}) must mount QNM-Shared"
+            );
+        }
+    }
 }

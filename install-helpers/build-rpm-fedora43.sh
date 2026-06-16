@@ -26,6 +26,11 @@ command -v podman >/dev/null || { echo "podman required" >&2; exit 1; }
 echo "==> staging bundled birthright blobs (ntfy, starship)"
 "$REPO/install-helpers/vendor-birthright-blobs.sh"
 
+# BIRTHRIGHT-1 — stage the fc43 LizardFS RPM family (the shared-state substrate)
+# so the magic-mesh RPM bundles it for F44 / air-gapped provisioning.
+echo "==> staging bundled LizardFS fc43 RPMs"
+"$REPO/install-helpers/vendor-lizardfs-rpms.sh" "$FEDORA"
+
 echo "==> pulling $IMAGE"
 podman pull "$IMAGE" >/dev/null
 

@@ -26,14 +26,16 @@ no provision). Per dependency:
 |---|---|---|---|
 | **ntfy** | cross-node notification broker (NOTIFY-DIST-1) | **Bundle** | RPM ships the pinned tarball under `/usr/share/magic-mesh/vendor/`; first boot provisions with **no network**. |
 | **starship** | mesh bash prompt (SHELL-2) | **Bundle** | Same — bundled-first, offline-capable. |
-| **lizardfs / lizardfs-adm** | §1 shared-state substrate | **Fetch-only (deferred)** | Held under **BIRTHRIGHT-1** (the substrate-provisioning epic). Until then, an air-gapped install has NO shared state — stated loudly, not silent. |
+| **lizardfs / lizardfs-adm** | §1 shared-state substrate | **Bundle (BIRTHRIGHT-1, done)** | The fc43 LizardFS family is bundled in the RPM (`/usr/share/magic-mesh/vendor/lizardfs/`) and installed `--nodeps` on F44 by `mesh-install-lizardfs`; `mackesd found`/`join` auto-provisions it role-aware. |
 
-**Why bundle ntfy + starship but not LizardFS:** ntfy + starship are small
-(~31 MB + ~5 MB), permissively licensed (Apache-2.0 / ISC — see NOTICE), single
-static binaries, and already wired this session. LizardFS is a larger,
-role-aware, multi-package substrate whose provisioning (master vs chunkserver vs
-client, the mount, goal/quota) is a design problem in its own right — that is
-BIRTHRIGHT-1, held for operator go-ahead.
+**LizardFS (BIRTHRIGHT-1):** the fc43 LizardFS family (`lizardfs-master`,
+`-chunkserver`, `-client`, `-adm`, `-cgi*`, `-metalogger`; 7 RPMs / ~2.5 MB) is
+bundled the same way. `vendor-lizardfs-rpms.sh` runs `dnf download 'lizardfs*'`
+(family only — NOT the base-OS closure, since F44 already has glibc/systemd/
+fuse) inside a fedora:43 container into `vendor/birthright/lizardfs/`; the RPM
+ships them to `/usr/share/magic-mesh/vendor/lizardfs/`. They install on F44 via
+`rpm --nodeps` (the fc43 binaries run on F44, the only path that works since
+LizardFS is absent from the F44 base repos).
 
 ### Mechanics (bundle path)
 
@@ -60,8 +62,27 @@ The *build* machine still needs network the first time it stages the blobs
 fully air-gapped build would pre-seed `vendor/birthright/` out-of-band; the
 vendor step is idempotent and leaves a present, checksum-valid blob untouched.
 
-## Out of scope (BIRTHRIGHT-1, held)
+## BIRTHRIGHT-1 — auto-provision LizardFS/QNM-Shared at enrollment (done)
 
-Auto-provisioning LizardFS/QNM-Shared at enrollment (install the binaries +
-auto-run `setup-qnm-shared` role-aware during `found`/`join`) so a fresh install
-is a working shared-state mesh. Large substrate change — operator-gated.
+A fresh `dnf install magic-mesh` + `mackesd found`/`join` now stands up the
+shared-state plane automatically:
+
+- **`mackesd found`** (founding lighthouse) → `provision_qnm_shared(role,
+  is_founder=true, …)` installs LizardFS and runs `setup-qnm-shared --master
+  --chunkserver --client` (master bound on the founder's overlay IP), mounting
+  `/mnt/mesh-storage`, BEFORE `mackesd.service` starts.
+- **`mackesd join`** → role-aware: Workstation = `--client`; Server / a second
+  Lighthouse = `--chunkserver --client`; master via the floating VIP
+  (`10.42.0.1`). Never a second master.
+- **Binary install** (`mesh-install-lizardfs <role>`): dnf-first (F43), then the
+  bundled fc43 RPMs (F44 / offline), then a pinned fetch manifest, then a loud
+  non-fatal warning. Best-effort — a miss never aborts the overlay join.
+- **Fail-loud runtime check:** `run_serve` asserts at startup that
+  `/mnt/mesh-storage` is a real FUSE mount; if not, it logs an ERROR (the
+  shared-state plane is down) instead of degrading silently — the ONBOARD-6
+  failure class. The `mesh-health` watchdog then restarts `qnm-shared.service`.
+- Flag policy is unit-tested (`qnm_setup_flags`); `tests/mesh_shared_state.rs`
+  (the multi-node gate) and `install-helpers/lint-shared-substrate.sh` remain.
+
+Air-gapped build still needs network once to stage the blobs (`build-rpm-
+fedora43.sh` runs both vendor scripts); the install target is fully offline.

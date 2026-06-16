@@ -14,6 +14,13 @@ starts at the first packaged release line.
 ## [Unreleased]
 
 ### Added
+- **LizardFS is now a birthright (BIRTHRIGHT-1):** `mackesd found`/`join`
+  auto-provision the QNM-Shared shared-state plane role-aware — install the
+  LizardFS binaries (dnf on F43, the bundled fc43 RPMs on F44/offline) and run
+  `setup-qnm-shared` (master+chunkserver+client on the founder; client/+chunk on
+  peers) before the daemon starts. A fresh `dnf install` + enroll now yields a
+  working shared-state mesh with no manual step. `mackesd` also logs a loud error
+  at startup if `/mnt/mesh-storage` isn't actually mounted.
 - **About panel** (System → About) now surfaces the GitHub repository, a
   Releases/changelog link, and a maintainer contact (all open via `xdg-open`),
   the build version, and the embedded changelog — alongside the existing
