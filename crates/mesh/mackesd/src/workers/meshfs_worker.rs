@@ -698,10 +698,18 @@ impl MeshFsWorker {
     /// `$HOME=/root` — and surfaces failures at WARN (not a silent debug log,
     /// the ONBOARD-6 lesson).
     pub fn tick_xdg_binds(&self) {
+        let mount = self.mount_path();
+        // BOOT-REC: gate on the mount being a REAL FUSE mount, not merely on the
+        // master being reachable — after a reboot the master answers before the
+        // mount is up, and creating the communal source dirs on the unmounted
+        // path poisons the mountpoint (mfsmount then refuses "not empty"). The
+        // canonical /mnt/mesh-storage is only writable when truly mounted.
+        if !crate::shared_root_writable(&mount) {
+            return;
+        }
         if !master_reachable(&self.vip) {
             return;
         }
-        let mount = self.mount_path();
         let mut homes = desktop_user_homes();
         // Headless node with no desktop user: fall back to the daemon's own
         // home so a Server's communal dirs still materialize.
