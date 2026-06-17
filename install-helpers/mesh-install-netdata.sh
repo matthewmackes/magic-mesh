@@ -19,6 +19,19 @@ log(){ echo "mesh-install-netdata: $*"; }
 if [ -x "$OPT_BIN" ]; then
   log "netdata already present at $OPT_BIN"
 else
+  # NETDATA-1 SAFETY GATE (2026-06-17): the 181 MB static build extracts to
+  # hundreds of MB + runs an installer; on a low-RAM node (≤~2.5 GB droplet/VM)
+  # this OOM-thrashes the box — it once wedged a lighthouse's LizardFS master and
+  # cascaded a mesh-wide QNM-Shared outage. Skip the install on low-RAM hosts; the
+  # live-metrics map degrades gracefully (that peer just has no :19999). Override
+  # with MDE_NETDATA_FORCE=1. Workstations (the surfaces that read the map) have
+  # the headroom; tiny headless droplets don't need to self-monitor via netdata.
+  MIN_MB="${MDE_NETDATA_MIN_MB:-3072}"
+  totmb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
+  if [ "${MDE_NETDATA_FORCE:-0}" != "1" ] && [ "$totmb" -lt "$MIN_MB" ]; then
+    log "skipping: host has ${totmb}MB RAM (< ${MIN_MB}MB) — netdata static install would thrash; set MDE_NETDATA_FORCE=1 to override"
+    exit 0
+  fi
   command -v curl >/dev/null || { log "curl missing — skipping (retry next boot)"; exit 0; }
   command -v sha256sum >/dev/null || { log "sha256sum missing — skipping"; exit 0; }
   TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
