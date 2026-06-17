@@ -60,6 +60,12 @@ starts at the first packaged release line.
   grid fanned out one cover-art request per item, so a 200+-item folder
   stampeded the single-threaded music daemon + the shared bus and froze the
   window. Concurrent art fetches are now bounded by a semaphore.
+- **Music: daemon stops responding after a restart (MUSIC-WEDGE):** `mde-musicd`
+  started with empty poll cursors and reprocessed the entire historical backlog
+  of every action topic before answering anything new (and could replay a stale
+  command). It now seeds each cursor at the topic's current tail on startup, so
+  only new requests are handled — the daemon is responsive immediately after a
+  (re)start.
 
 ## [10.0.13] - 2026-06-17
 
