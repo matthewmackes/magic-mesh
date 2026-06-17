@@ -26,14 +26,15 @@ SIZES="16 22 24 32 48 64 128 256 512"
 for s in $SIZES; do
   dst="$HICOLOR/${s}x${s}/apps/magic-mesh.png"
   mkdir -p "$(dirname "$dst")"
-  # -strip removes metadata; high-quality Lanczos downscale; preserve alpha.
-  $IM "$SRC" -strip -resize "${s}x${s}" -background none -gravity center -extent "${s}x${s}" "$dst"
+  # -strip metadata; fill the square (^) + center-crop (-extent) so a near-square
+  # source gets no transparent bars or distortion; high-quality downscale, alpha kept.
+  $IM "$SRC" -strip -resize "${s}x${s}^" -background none -gravity center -extent "${s}x${s}" "$dst"
   echo "wrote $dst"
 done
 
-$IM "$SRC" -strip -resize 580x580 -background none -gravity center -extent 580x580 "$BRAND/app-icon.png"
+$IM "$SRC" -strip -resize 580x580^ -background none -gravity center -extent 580x580 "$BRAND/app-icon.png"
 echo "wrote $BRAND/app-icon.png"
-$IM "$SRC" -strip -resize 256x256 -background none -gravity center -extent 256x256 "$BRAND/monogram.png"
+$IM "$SRC" -strip -resize 256x256^ -background none -gravity center -extent 256x256 "$BRAND/monogram.png"
 echo "wrote $BRAND/monogram.png"
 
 echo "done — re-brand the fleet by cutting a release (the magic-mesh hicolor set + brand masters ship in the RPM; %post runs gtk-update-icon-cache)."
