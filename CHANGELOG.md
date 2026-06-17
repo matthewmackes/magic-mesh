@@ -13,6 +13,26 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
+## [10.0.12] - 2026-06-17
+
+### Added
+- **Mesh-wide SIP outbound gateway (VOIP-GW-1):** a new Workbench **Mesh → SIP
+  Gateway** panel sets ONE outbound SIP/PSTN gateway (host/port/user/password/
+  display) for the whole mesh. Apply sends it to `mackesd`
+  (`action/voip/set-gateway`), which writes it to QNM-Shared
+  (`<workgroup_root>/voip/gateway.toml`, the voice agent's `account.toml` shape,
+  0600); every node's `mde-voice-hud` reads the mesh gateway first and registers
+  to it — bare numbers route out via the gateway, intra-mesh peer calls stay P2P.
+  Test probes registrar reachability; Clear reverts the mesh to P2P.
+- **Music player navigation (MUSIC-NAV):** the `mde-music` app gained explicit
+  **Back / Home / Exit** header controls (the window has no title-bar chrome).
+
+### Fixed
+- **Radio playback (MUSIC-RADIO):** infinite icecast/shoutcast streams now play —
+  the engine streams them through an unseekable source instead of buffering the
+  whole (never-ending) body, which had failed with a decode error + underrun.
+  Finite songs are still buffered for seek support.
+
 ## [10.0.11] - 2026-06-17
 
 This roll bundles everything since `v10.0.9`: the SETUP wizard, the LizardFS/ntfy/
