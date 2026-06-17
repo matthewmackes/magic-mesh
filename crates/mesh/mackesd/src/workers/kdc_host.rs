@@ -240,6 +240,103 @@ impl DeviceInfo {
 /// The shared roster the host task writes and the Bus responder reads.
 type Roster = Arc<Mutex<HashMap<String, DeviceInfo>>>;
 
+/// NOTIFY-SRC-3 — map a KDC host event to an Alert Center `(summary, severity)`,
+/// or `None` to skip noisy/uninteresting events (discovery refreshes, peer-lost,
+/// transport errors). Pure + testable. These flow to `fdo/KDE Connect` so KDE
+/// Connect device events (pair, file share, find-my-device, phone notifications,
+/// low battery, connect/disconnect) reach the global Alert Center + federate.
+fn kdc_event_alert(ev: &HostEvent) -> Option<(String, &'static str)> {
+    match ev {
+        HostEvent::Connected(p) => Some((format!("{} connected", p.as_str()), "info")),
+        HostEvent::Disconnected(p) => Some((format!("{} disconnected", p.as_str()), "info")),
+        HostEvent::Packet { peer, packet } => {
+            let who = peer.as_str();
+            match packet.kind.as_str() {
+                "kdeconnect.pair" => (packet.body.get("pair").and_then(Value::as_bool)
+                    == Some(true))
+                .then(|| (format!("{who} paired"), "info")),
+                "kdeconnect.share.request" => Some((format!("{who} shared a file"), "info")),
+                "kdeconnect.findmyphone.request" => {
+                    Some((format!("Find-my-device from {who}"), "warn"))
+                }
+                "kdeconnect.ping" => Some((format!("Ping from {who}"), "info")),
+                "kdeconnect.notification" => {
+                    if packet.body.get("isCancel").and_then(Value::as_bool) == Some(true) {
+                        return None;
+                    }
+                    let app = packet
+                        .body
+                        .get("appName")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let text = packet
+                        .body
+                        .get("ticker")
+                        .or_else(|| packet.body.get("text"))
+                        .or_else(|| packet.body.get("title"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let sep = if app.is_empty() || text.is_empty() {
+                        ""
+                    } else {
+                        ": "
+                    };
+                    let s = format!("{app}{sep}{text}");
+                    (!s.is_empty()).then_some((s, "info"))
+                }
+                "kdeconnect.battery" => {
+                    let charge = packet
+                        .body
+                        .get("currentCharge")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(-1);
+                    let threshold =
+                        packet.body.get("thresholdEvent").and_then(Value::as_i64) == Some(1);
+                    (threshold || (0..=15).contains(&charge))
+                        .then(|| (format!("{who} battery low ({charge}%)"), "warn"))
+                }
+                _ => None,
+            }
+        }
+        // Discovery refreshes repeat every announce (too noisy); peer-lost +
+        // transport errors aren't device-facing alerts.
+        HostEvent::PeerDiscovered(_) | HostEvent::PeerLost(_) | HostEvent::TransportError(_) => {
+            None
+        }
+    }
+}
+
+/// NOTIFY-SRC-3 — publish a KDC device event to the bus alert lane
+/// `fdo/KDE Connect` (the panel's DesktopApp group); the `alert-mirror` worker
+/// federates it mesh-wide. Best-effort (open+write+drop; `Persist` is `!Send`).
+fn publish_kdc_alert(summary: &str, severity: &str) {
+    let Some(dir) = mde_bus::default_data_dir() else {
+        return;
+    };
+    let Ok(persist) = Persist::open(dir) else {
+        return;
+    };
+    let host = std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "localhost".to_string());
+    let body = json!({
+        "appName": "KDE Connect",
+        "title": "KDE Connect",
+        "summary": summary,
+        "severity": severity,
+        "host": host,
+    })
+    .to_string();
+    let prio = if severity == "warn" {
+        Priority::High
+    } else {
+        Priority::Default
+    };
+    let _ = persist.write("fdo/KDE Connect", prio, Some("KDE Connect"), Some(&body));
+}
+
 /// Fold one host event into the roster: connections flip `online`, battery
 /// packets update the charge, discovery announces refresh the display name.
 /// Pure (no I/O) so the state machine is unit-tested without a bus or a phone.
@@ -465,6 +562,10 @@ async fn run_host(
                         info!(device = %a.device_id, name = %a.device_name, "kdc-host: discovered")
                     }
                     HostEvent::PeerLost(_) => {}
+                }
+                // NOTIFY-SRC-3 — surface notable device events to the Alert Center.
+                if let Some((summary, severity)) = kdc_event_alert(&ev) {
+                    publish_kdc_alert(&summary, severity);
                 }
                 // A phone-initiated `kdeconnect.pair{pair:true}`: pin the cert seen
                 // at TLS time, persist the device, and accept.
@@ -1407,6 +1508,38 @@ mod tests {
             incoming_capabilities: vec![],
             outgoing_capabilities: vec![],
         }
+    }
+
+    #[test]
+    fn kdc_event_alert_classifies_notable_events() {
+        use mde_kdc_proto::wire::Packet;
+        let pkt = |kind: &str, body: serde_json::Value| HostEvent::Packet {
+            peer: PeerId::from("moto"),
+            packet: serde_json::from_value::<Packet>(json!({"id":0,"type":kind,"body":body}))
+                .expect("packet"),
+        };
+        // connect/disconnect surface.
+        assert!(kdc_event_alert(&HostEvent::Connected(PeerId::from("moto"))).is_some());
+        // a phone notification mirrors app + text.
+        let (s, sev) = kdc_event_alert(&pkt(
+            "kdeconnect.notification",
+            json!({"appName":"Signal","ticker":"new message"}),
+        ))
+        .expect("notification alert");
+        assert_eq!(sev, "info");
+        assert!(s.contains("Signal") && s.contains("new message"));
+        // a cancel is skipped.
+        assert!(
+            kdc_event_alert(&pkt("kdeconnect.notification", json!({"isCancel":true}))).is_none()
+        );
+        // low battery warns; healthy battery is silent.
+        assert_eq!(
+            kdc_event_alert(&pkt("kdeconnect.battery", json!({"currentCharge":9}))).map(|(_, s)| s),
+            Some("warn")
+        );
+        assert!(kdc_event_alert(&pkt("kdeconnect.battery", json!({"currentCharge":80}))).is_none());
+        // noisy discovery refreshes are skipped.
+        assert!(kdc_event_alert(&HostEvent::PeerLost(PeerId::from("moto"))).is_none());
     }
 
     #[test]
