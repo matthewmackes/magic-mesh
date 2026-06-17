@@ -993,3 +993,39 @@ Operator: an informative, at-boot view of how the mesh fabric + app daemons come
     - [ ] a recreate by one process does not wedge other live consumers — verify by forcing a recreate while a second consumer is polling and confirming it keeps answering (it reopens within a bounded window).
     - [ ] prefer the root fix: avoid the inode swap where possible (fix perms in place / gate the recreate so a uid-1000 GUI never nukes a root-owned index the daemon is using), OR make every long-running consumer reopen on inode change (lift the MUSIC-WEDGE-2 pattern into a shared `mde-bus` helper).
     - [ ] the recreate is logged loudly by the process that does it (which pid/uid recreated), so the cause is attributable.
+
+### MUSIC-RFX — music client/interface refactor, sonixd-inspired (design: `docs/design/music-refactor.md`, 3-round /plan, 2026-06-17)
+sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adopt its UX in our iced mde-music + mde-musicd. Ship as ONE release (Q10). Strictly IBM Carbon; mesh hand-off + shared caches preserved.
+- [ ] **MUSIC-RFX-1: daemon queue model — reorder / remove / play-next**
+  **As** a listener, **I want** to reorder and prune the play queue, **so that** I control what plays next.
+  **Acceptance:** queue.rs gains move(from,to)/remove(idx)/remove_many(idxs)/move_to_next(idx) with the current-cursor kept correct; new bus verbs `queue-move`/`queue-remove`/`queue-remove-many`/`queue-move-to-next` reply ok + persist; unit tests for cursor math under each op.
+- [ ] **MUSIC-RFX-2: engine seek + `seek` transport verb**
+  **As** a listener, **I want** to scrub within a track, **so that** I can jump to a position.
+  **Acceptance:** engine.rs repositions a *finite* track's decode to a target ms; `action/music/seek` applies it and get-state's position reflects the jump; seek is a no-op (disabled) for live/radio streams.
+- [ ] **MUSIC-RFX-3: playlist write verbs (Subsonic)**
+  **As** a listener, **I want** to create/rename/delete/modify playlists, **so that** I can curate.
+  **Acceptance:** airsonic.rs create_playlist/update_playlist(add/remove/rename)/delete_playlist; bus verbs `playlist-create`/`playlist-update`/`playlist-delete` reply ok; a re-query of getPlaylists reflects the change on the server.
+- [ ] **MUSIC-RFX-4: maxi now-playing view (art + scrubber + up-next)**
+  **As** a listener, **I want** a full now-playing screen, **so that** I see art, scrub, and what's next.
+  **Acceptance:** large cover art (dominant-colour tint), a seek scrubber wired to MUSIC-RFX-2 (position jumps on drag), prev/next, and an up-next list reflecting the real queue; live streams hide the scrubber.
+- [ ] **MUSIC-RFX-5: queue panel — drag-reorder + multi-select + remove**
+  **As** a listener, **I want** to manage the queue visually, **so that** I can curate playback.
+  **Acceptance:** drag a row to reorder (persists + playback follows), select multiple rows, remove one/selected, "play next"; all via MUSIC-RFX-1 verbs.
+- [ ] **MUSIC-RFX-6: playlist editor UI**
+  **As** a listener, **I want** to create/rename/delete/reorder playlists in the GUI, **so that** I manage them without a server admin.
+  **Acceptance:** create/rename/delete + reorder tracks via MUSIC-RFX-3; the playlist hub card reflects edits live.
+- [ ] **MUSIC-RFX-7: Add-to-playlist everywhere**
+  **As** a listener, **I want** to add any track to a playlist from anywhere, **so that** curating is frictionless.
+  **Acceptance:** an "Add to playlist" action (existing playlists + "new") in every track context (album, search, queue, now-playing) → server reflects the add.
+- [ ] **MUSIC-RFX-8: right-click context menus**
+  **As** a listener, **I want** right-click actions on rows, **so that** actions are dense + discoverable.
+  **Acceptance:** right-click a track/album/playlist row opens a Carbon-styled menu (play, play-next, add-to-playlist, go-to-album, remove) whose actions all work; pairs with multi-select for bulk actions. (Spike iced menu/drag maturity early; inline-button fallback per action if needed — logged, not silent.)
+- [ ] **MUSIC-RFX-9: virtualize long lists**
+  **As** a listener with a large library, **I want** smooth scrolling, **so that** thousands of items don't lag.
+  **Acceptance:** album grid / artist list / queue render only visible rows; a multi-thousand-item library scrolls smoothly (observable: no per-row cost blow-up).
+- [ ] **MUSIC-RFX-10: Carbon density/row polish**
+  **As** a user, **I want** sonixd-class density, **so that** the UI feels like a real music app.
+  **Acceptance:** denser rows/grid tuned to sonixd's information density but sourced entirely from `mde-theme` tokens (no raw hex/metrics, §4); mde-theme tests cover any new metric.
+- [ ] **MUSIC-RFX-11: preserve mesh hand-off + shared caches through the refactor**
+  **As** an operator, **I want** the mesh features intact, **so that** the refactor is non-regressive.
+  **Acceptance:** peer playback hand-off (`take-over`), the QNM-Shared artwork cache (MUSIC-ART-SYNC), the audio cache, and MPRIS all still work after the refactor (re-verified live).
