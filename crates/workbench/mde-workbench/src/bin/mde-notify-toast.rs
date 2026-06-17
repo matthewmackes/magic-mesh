@@ -139,18 +139,32 @@ fn boot_task() -> Task<Message> {
 }
 
 /// True when an alert should pop a toast. Mesh alerts toast; desktop-app
-/// (`fdo/*`) alerts are shown in the center only (never double-toasted). When
-/// DND is active, ordinary alerts are suppressed — only Critical bypasses (a
-/// genuine emergency still reaches the operator).
+/// (`fdo/*`) alerts are shown in the center only (never double-toasted). SELinux
+/// AVC denials (`fleet/sec/selinux/*`) are recorded in the Security group but
+/// never toast below Critical — they are noisy, repeat across restarts, and are
+/// explicitly not latency-critical (the selinux_monitor worker), so a benign
+/// permissive/warning denial must not pop a toast on every reboot. When DND is
+/// active, ordinary alerts are suppressed — only Critical bypasses (a genuine
+/// emergency still reaches the operator).
 #[must_use]
 pub fn should_toast(item: &AlertItem, dnd_active: bool) -> bool {
     if item.source == Source::DesktopApp {
+        return false;
+    }
+    if is_selinux_denial(&item.topic) && item.severity != Severity::Critical {
         return false;
     }
     if dnd_active && item.severity != Severity::Critical {
         return false;
     }
     true
+}
+
+/// SELinux AVC denials publish to `fleet/sec/selinux/<host>`; classified as the
+/// Security group but kept out of the toast stream (center-only) below Critical.
+#[must_use]
+fn is_selinux_denial(topic: &str) -> bool {
+    topic.trim().starts_with("fleet/sec/selinux/")
 }
 
 /// Drop toasts whose TTL has elapsed.
@@ -371,6 +385,22 @@ mod tests {
             &item(Source::DesktopApp, Severity::Critical),
             false
         ));
+    }
+
+    #[test]
+    fn selinux_denials_record_but_never_toast_below_critical() {
+        // A benign AVC denial (info/warning) lands in the Security group but must
+        // not pop a toast — it repeats across reboots and is not latency-critical.
+        let mut warn = item(Source::Security, Severity::Warning);
+        warn.topic = "fleet/sec/selinux/UNIT-EAGLE".into();
+        assert!(!should_toast(&warn, false));
+        let mut info = item(Source::Security, Severity::Info);
+        info.topic = "fleet/sec/selinux/fedora".into();
+        assert!(!should_toast(&info, false));
+        // A real (non-SELinux) security alert still toasts.
+        let mut enrol = item(Source::Security, Severity::Warning);
+        enrol.topic = "fleet/sec".into();
+        assert!(should_toast(&enrol, false));
     }
 
     #[test]

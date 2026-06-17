@@ -467,6 +467,12 @@ assets = [
     # (build-rpm-fedora43.sh runs it before generate-rpm).
     { source = "install-helpers/mesh-install-lizardfs.sh", dest = "/usr/libexec/mackesd/mesh-install-lizardfs", mode = "755" },
     { source = "vendor/birthright/lizardfs/*.rpm", dest = "/usr/share/magic-mesh/vendor/lizardfs/", mode = "644" },
+    # SELINUX-1 — the local SELinux policy modules + their installer, so a node
+    # runs clean under Enforcing (no AVC flood / repeating "SELinux security
+    # alert" toasts). CIL is toolchain-free (`semodule -i`) and version-portable;
+    # split by precondition so a missing optional type only skips that module.
+    { source = "install-helpers/selinux/*.cil", dest = "/usr/share/magic-mesh/selinux/", mode = "644" },
+    { source = "install-helpers/setup-selinux-policy.sh", dest = "/usr/libexec/mackesd/setup-selinux-policy", mode = "755" },
 ]
 # EFF-14 — install/upgrade/remove scriptlets: register the daemon unit, create
 # the config dir, refresh icon/desktop caches; clean up on removal. Guards keep
@@ -497,6 +503,10 @@ systemctl enable mesh-broker-setup.service >/dev/null 2>&1 || :
 # (ConditionPathExists=!/var/lib/mde/role.toml) + takes tty1 only, so enabling
 # it everywhere is safe: a configured node skips it and getty owns tty1.
 systemctl enable magic-setup.service >/dev/null 2>&1 || :
+# SELINUX-1 — load the local SELinux policy module so the node runs clean under
+# Enforcing (no AVC flood from mackesd's podman transition / libvirt /proc scans;
+# no repeating "SELinux security alert" toasts). Self-skips if SELinux is off.
+/usr/libexec/mackesd/setup-selinux-policy >/dev/null 2>&1 || :
 # SETUP-fix — materialize the shared bus dir now (no reboot needed).
 systemd-tmpfiles --create /usr/lib/tmpfiles.d/magic-mesh.conf >/dev/null 2>&1 || :
 [ -d /etc/mackesd ] || install -d -m 0700 /etc/mackesd
@@ -510,6 +520,10 @@ fi
 """
 post_uninstall_script = """
 systemctl daemon-reload >/dev/null 2>&1 || :
+# SELINUX-1 — drop the local policy modules on a full removal (not an upgrade).
+if [ "$1" = 0 ]; then
+  semodule -r magicmesh-base magicmesh-podman magicmesh-libvirt >/dev/null 2>&1 || :
+fi
 """
 
 # Runtime deps the platform shells to (D-W1 / §1-§5 substrate).

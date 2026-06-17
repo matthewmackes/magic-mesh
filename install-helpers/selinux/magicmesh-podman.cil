@@ -1,0 +1,11 @@
+; magicmesh-podman.cil — allows mackesd's compute_* workers to run podman cleanly.
+; References container_runtime_t (from container-selinux, installed with podman),
+; so it is installed best-effort: on a node without podman the type is absent and
+; this module is skipped — but such a node never trips the denial anyway.
+;
+; mackesd runs as unconfined_service_t; podman's runtime sets no_new_privs on the
+; child, so the transition into the container runtime domain needs
+; process2:nnp_transition. Without this, the denial floods the audit log (one node
+; logged 32,521 in a single boot) and the transition is refused (podman stays
+; unconfined). Allowing it makes mackesd's podman MORE correctly confined.
+(allow unconfined_service_t container_runtime_t (process2 (nnp_transition)))

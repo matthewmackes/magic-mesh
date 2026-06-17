@@ -1,0 +1,6 @@
+; magicmesh-libvirt.cil — allows libvirt's virtqemud (the compute provider) to
+; scan /proc of mackesd's processes. References virtqemud_t (from the libvirt
+; SELinux policy), so it is installed best-effort: skipped on a node without
+; libvirt, which never trips the denial anyway.
+(allow virtqemud_t unconfined_service_t (dir (search)))
+(allow virtqemud_t unconfined_service_t (file (open read)))

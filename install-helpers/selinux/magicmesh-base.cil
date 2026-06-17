@@ -1,0 +1,6 @@
+; magicmesh-base.cil — always-safe Magic Mesh SELinux allows (base-policy types
+; only, so this module loads on every Fedora node regardless of which optional
+; subsystems are installed). See setup-selinux-policy.sh for the install flow.
+;
+; systemd-logind's user-namespace ptrace capability check (stock Fedora behavior).
+(allow systemd_logind_t self (cap_userns (sys_ptrace)))
