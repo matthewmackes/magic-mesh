@@ -52,7 +52,7 @@ use symphonia::core::audio::{SampleBuffer, SignalSpec};
 use symphonia::core::codecs::{CodecParameters, DecoderOptions, CODEC_TYPE_NULL, CODEC_TYPE_OPUS};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::{FormatOptions, FormatReader};
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::io::{MediaSourceStream, ReadOnlySource};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
@@ -506,13 +506,35 @@ where
 /// into the shared ring. Returns when the track is exhausted or `stop` is
 /// signalled.
 fn decode_track(url: &str, codec: SourceCodec, shared: &Shared) -> Result<(), String> {
-    let bytes = reqwest::blocking::get(url)
+    let resp = reqwest::blocking::get(url)
         .and_then(reqwest::blocking::Response::error_for_status)
-        .and_then(reqwest::blocking::Response::bytes)
-        .map_err(|e| format!("fetch {url}: {e}"))?
-        .to_vec();
+        .map_err(|e| format!("fetch {url}: {e}"))?;
 
-    let mss = MediaSourceStream::new(Box::new(Cursor::new(bytes)), Default::default());
+    // AIR — radio/live streams are infinite (no Content-Length / chunked), so
+    // buffering the whole body with `.bytes()` never returns → "error decoding
+    // response body" + an audio underrun (the reported Radio bug). Stream those
+    // through a pipe into an unseekable source instead. A finite track (a song
+    // from the Airsonic `stream` endpoint, which sends Content-Length) is still
+    // buffered into a seekable Cursor so format decoders that seek keep working.
+    let finite = resp.content_length().is_some_and(|n| n > 0);
+    let source: Box<dyn symphonia::core::io::MediaSource> = if finite {
+        let bytes = resp
+            .bytes()
+            .map_err(|e| format!("read body {url}: {e}"))?
+            .to_vec();
+        Box::new(Cursor::new(bytes))
+    } else {
+        // Stream: a producer thread copies the response into a pipe; the decoder
+        // reads the pipe as an unseekable MediaSource (PipeReader is Send+Sync).
+        let (reader, mut writer) = std::io::pipe().map_err(|e| format!("pipe {url}: {e}"))?;
+        let mut resp = resp;
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut resp, &mut writer);
+        });
+        Box::new(ReadOnlySource::new(reader))
+    };
+
+    let mss = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
     if let Some(ext) = codec.hint_ext() {
         hint.with_extension(ext);
