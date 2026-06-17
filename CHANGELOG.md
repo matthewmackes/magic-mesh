@@ -13,6 +13,20 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
+## [10.0.13] - 2026-06-17
+
+### Added
+- **Live metrics (NETDATA-1):** netdata is now provisioned as a first-boot
+  birthright (`mesh-netdata-setup.service` → `mesh-install-netdata`, a
+  sha256-pinned static fetch; netdata isn't in the Fedora repos), confined to
+  loopback + the node's overlay IP, so the PD-2 peer-health tiers and the PD-7
+  live mesh map / flow particles finally have a data source. The
+  `netdata_aggregator` confines the dashboard `[web]` bind on every tick
+  (never the underlay — safe on the public lighthouses).
+- **Music daemon autostart (MUSIC-DAEMON-AUTOSTART):** the `mde-musicd` user
+  service is now `%post`-enabled (`systemctl --global enable`), so the music
+  library works on a fresh Workstation with no manual daemon start.
+
 ## [10.0.12] - 2026-06-17
 
 ### Added
