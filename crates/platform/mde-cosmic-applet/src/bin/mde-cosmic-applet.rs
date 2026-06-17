@@ -146,7 +146,15 @@ impl Application for Applet {
         // A bell glyph tinted by the highest unread severity (filled ● when
         // unread, hollow ○ when idle). The whole button toggles the center.
         let unread = self.severity.is_some();
-        let glyph = if unread { "\u{1F514}" } else { "\u{1F515}" }; // 🔔 / 🔕
+        // U+FE0E (text variation selector) forces MONOCHROME presentation so the
+        // glyph honors our Carbon `Text::Color` tint. Without it the bell renders
+        // as a color-emoji that ignores the tint and shows up black/invisible on
+        // the dark Carbon panel (operator-reported 2026-06-16).
+        let glyph = if unread {
+            "\u{1F514}\u{FE0E}"
+        } else {
+            "\u{1F515}\u{FE0E}"
+        }; // 🔔︎ / 🔕︎
         let color = bell_color(self.severity);
         let dot = if unread { " \u{25CF}" } else { "" }; // trailing ● when unread
         let label = cosmic::widget::text(format!("{glyph}{dot}"))

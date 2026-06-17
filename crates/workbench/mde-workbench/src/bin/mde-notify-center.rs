@@ -525,23 +525,31 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
     let p = Palette::dark();
     let now = now_ms();
 
-    // Header bar: title + actions.
+    // Header: title + close on the top line, the bulk actions on their own
+    // line below so a long "· N unread" title never collides with the buttons
+    // (the panel is only ~390px wide). Generous top/side padding so nothing is
+    // jammed against the window edge.
     let unread = state.items.iter().filter(|i| !i.read).count();
     let title = text(format!("Notification Hub · {unread} unread"))
         .size(16)
         .color(p.text.into_cosmic_color());
+    let title_row = row![
+        title,
+        Space::new().width(Length::Fill),
+        // Close (✕) — also bound to Esc + click-away.
+        action_button("✕", Message::Close, p),
+    ]
+    .align_y(cosmic::iced::Alignment::Center);
     let actions = row![
         action_button("Mark all read", Message::MarkAllRead, p),
         Space::new().width(Length::Fixed(8.0)),
         action_button("Clear all", Message::ClearAll, p),
-        Space::new().width(Length::Fixed(8.0)),
-        // Close (✕) — also bound to Esc + click-away.
-        action_button("✕", Message::Close, p),
     ];
-    let header = row![title, Space::new().width(Length::Fill), actions]
-        .align_y(cosmic::iced::Alignment::Center);
+    let header = column![title_row, actions].spacing(10);
 
-    let mut body = column![header, Space::new().height(Length::Fixed(8.0))].spacing(6);
+    let mut body = column![header, Space::new().height(Length::Fixed(12.0))]
+        .spacing(8)
+        .padding(Padding::from([14u16, 16u16]));
 
     if state.items.is_empty() {
         body = body.push(
