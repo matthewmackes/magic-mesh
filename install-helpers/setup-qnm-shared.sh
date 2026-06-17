@@ -130,7 +130,13 @@ if [ "$DO_CLIENT" = 1 ]; then
 Description=Mount the QNM-Shared LizardFS volume over the overlay
 After=nebula.service network-online.target
 Wants=nebula.service
-Before=mackesd.service
+# XPA-8 (2026-06-17): do NOT order before mackesd. This unit RETRIES the mount
+# for up to ~2 min and Restart=on-failure loops it; a hard `Before=mackesd`
+# (and the matching `After=qnm-shared` drop-in) made mackesd's start job QUEUE
+# behind it and, on a node where the mount can't yet succeed (e.g. fuse-libs
+# missing — XPA-9), mackesd NEVER started (silent "inactive", no journal).
+# mackesd self-heals the mount via meshfs_worker + BOOT-REC, so it must start
+# independently; this unit is a best-effort Wants= pull only (drop-in below).
 # BOOT-REC-2: never let the start-limit burst give up + leave the mount failed
 # (the stuck-"activating"/NO-LEADER state seen after a cold reboot). Retry until
 # the overlay+master are reachable; the mesh-health watchdog covers later drops.
@@ -154,7 +160,9 @@ EOF
   mkdir -p /etc/systemd/system/mackesd.service.d
   cat > /etc/systemd/system/mackesd.service.d/20-qnm.conf <<EOF
 [Unit]
-After=qnm-shared.service
+# XPA-8: Wants (best-effort pull) but NOT After — mackesd must not block on the
+# mount-retry loop. mackesd self-heals the mount (meshfs_worker + BOOT-REC) and
+# refuses to poison the unmounted mountpoint (shared_root_writable guard).
 Wants=qnm-shared.service
 EOF
   mkdir -p "$QNM_PATH"

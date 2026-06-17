@@ -527,6 +527,14 @@ nmap = "*"
 # headless lighthouse without alsa-lib failed the v10.0.9 install until it was
 # added by hand. alsa-lib is small + in the base Fedora repos.
 alsa-lib = "*"
+# XPA-9 (2026-06-17) — the bundled fc43 lizardfs-client's `mfsmount` links
+# libfuse.so.2 (FUSE 2). Fedora 44 ships only FUSE 3 by default, so a fresh
+# node failed `mfsmount: error while loading shared libraries: libfuse.so.2`
+# → QNM-Shared could NEVER mount → the Server never joined the directory
+# (found bringing up MDE-VM-1..4 on XCP). Hard Require the FUSE 2 runtime +
+# its mount helper (both small, base Fedora repos).
+fuse-libs = "*"
+fuse = "*"
 
 # EFF-42 — ansible-core is a WEAK dep (Recommends): only the Server-tier
 # ansible_pull/job_exec workers shell to it, and they degrade gracefully
