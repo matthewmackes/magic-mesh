@@ -946,3 +946,41 @@ Live audit of the clone→boot→install→enroll flow on the XCP host; each bec
 - [✓] **XPA-11 (FIXED): `mackesd join` enroll transport intermittently times out on the first attempt (retry succeeds).** Add an internal retry/backoff to the enroll transport.
 - [✓] **XPA-12 (MET + VERIFIED on VM-5: `dnf install rpm` + `mackesd join --role server` → full member, QNM-Shared provisioned, nebula+mackesd+mesh-health up, in the directory, ZERO manual steps): there is NO single "install a Server + join" command.** Bringing one node to full membership took ~9 manual steps (dnf install, dnf fuse-libs, role-pin, mint token, join, stop services, clear mount stray, mfsmount, start mackesd). `mackesd join --role server` should **fully provision**: pull deps (fuse-libs), pin role, enroll, mount QNM-Shared, and start the daemon — one command → a member. This is the headline onboarding gap.
 - [ ] **XPA-13 (local-KVM path): a hand-built flow-style cloud-init seed breaks on the unquoted SSH key (spaces) → cloud-init silently drops user-data (no user/key/password).** Found provisioning MDE-KVM-1 on local KVM. Use block-style YAML with the key **quoted**, or `virt-install --cloud-init user-data=<file>` (builds the NoCloud datasource correctly). The XCP seeds used block-style + worked; the KVM one regressed via compact flow-style. Bake the block-style template into the provisioner (XCP-3) for both back-ends.
+
+### BOOT-STATUS — desktop boot mesh-services status dialog (design: `docs/design/boot-status-dialog.md`, 10-Q, 2026-06-17)
+Operator: an informative, at-boot view of how the mesh fabric + app daemons come up (handshake/setup/pings), in the Workbench HOME tab. Locks in the design doc.
+- [ ] **BOOT-STATUS-1: mackesd `boot_readiness` worker — fabric steps + bus snapshot**
+  **As** an operator, **I want** the daemon to probe the fabric bring-up steps in dependency order and publish one snapshot, **so that** every surface renders the same authoritative boot state (works headless).
+  **Acceptance:**
+    - [ ] a `boot_readiness` worker probes, in order: Nebula up/cert, overlay-IP assigned, mackesd serving, mde-bus broker bound, QNM-Shared mounted+writable, peer directory replicated; emits an ordered `{id,label,group,status,detail,blocked_by,since_ms}` list.
+    - [ ] publishes to `state/boot-readiness` on the bus each tick (fast while any step `pending`, backing off once steady).
+- [ ] **BOOT-STATUS-2: app-daemon probes + continuous liveness**
+  **As** an operator, **I want** the worker to also report the app daemons + live pings, **so that** the dialog shows the whole picture with real RTT.
+  **Acceptance:**
+    - [ ] musicd / voice-hud / KDC / netdata active+reachable steps appended to the snapshot.
+    - [ ] continuous ping RTT to the lighthouse(s) + each peer included while consumers are subscribed.
+- [ ] **BOOT-STATUS-3: per-peer readiness roll-up**
+  **As** an operator, **I want** a compact readiness verdict per other mesh node, **so that** I can see "is the whole mesh up" in one place.
+  **Acceptance:**
+    - [ ] each node's ready/degraded/down verdict aggregated into the snapshot for the roll-up rows.
+- [ ] **BOOT-STATUS-4: Workbench HOME panel — dependency chain, streaming, ready-chip**
+  **As** an operator, **I want** the HOME panel to render the dependency chain with always-on sub-steps, live, **so that** I watch the handshake happen and it collapses when healthy.
+  **Acceptance:**
+    - [ ] subscribes to `state/boot-readiness`, repaints sub-second as steps transition pending→ok.
+    - [ ] renders the boot-sequence dependency chain with always-shown sub-steps + per-peer roll-up rows.
+    - [ ] collapses to a glanceable green "mesh ready" chip once all-green; re-expands on regression.
+- [ ] **BOOT-STATUS-5: auto-popup at desktop session start**
+  **As** an operator, **I want** the dialog to auto-open at login, **so that** boot status is front-and-center without me opening it.
+  **Acceptance:**
+    - [ ] a `.desktop` autostart opens the dialog at session start; it minimizes to the chip on all-green.
+- [ ] **BOOT-STATUS-6: inline remediation actions**
+  **As** an operator, **I want** Retry / Restart / View-journal per failed step, **so that** I can fix a stuck service without leaving HOME.
+  **Acceptance:**
+    - [ ] a failed step renders its `remediation` verb as a button wired to the existing service-control + journal paths (e.g. `systemctl --user stop mde-musicd` → a working Restart).
+
+### BOOT-PEERS — peer-list settling indicator (operator-reported 2026-06-17)
+- [ ] **BOOT-PEERS-1: peer list "settling" state after a cold reboot**
+  **As** an operator, **I want** the Peers panel to distinguish "still converging" from "empty mesh" after a reboot, **so that** the multi-minute cold-boot warm-up (Nebula overlay-IP → bus broker bind → QNM directory replication → first 30s peer sweep) doesn't look broken.
+  **Acceptance:**
+    - [ ] while the boot chain is incomplete the panel shows a "peers settling…" state (not an empty/"no hosts" state).
+    - [ ] it resolves to the live roster once the directory has replicated + the first sweep completes. (Subsumed by BOOT-STATUS once that lands; keep until then.)
