@@ -578,7 +578,15 @@ fn write_periodic_state(engine: Option<&Engine>, queue_path: &Path) {
 /// If the internal tokio runtime (for the async browse proxy) can't be
 /// built — an environment fault, not a runtime condition.
 pub fn serve<F: Fn() -> bool>(persist: &Persist, queue_path: &Path, should_stop: F) {
-    let mut cursors: HashMap<String, String> = HashMap::new();
+    // MUSIC-WEDGE — seed every poll cursor at the topic's CURRENT tail so a
+    // restart skips the historical backlog. Without this, the first sweep's
+    // `list_since(None)` returns every request ever made on each action topic
+    // and the single-threaded loop reprocesses the whole backlog (each browse
+    // verb = an Airsonic round-trip) before answering anything new — observed
+    // live as the daemon "not responding" after a restart, and a stale `play`
+    // could even replay. New (post-start) requests have a larger ULID and are
+    // still picked up normally.
+    let mut cursors: HashMap<String, String> = seed_cursors_at_tail(persist);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -620,6 +628,27 @@ pub fn serve<F: Fn() -> bool>(persist: &Persist, queue_path: &Path, should_stop:
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// MUSIC-WEDGE — build the initial cursor map seeded at each polled topic's
+/// current tail (its newest ULID), so the serve loop only handles requests that
+/// arrive AFTER startup and never reprocesses the historical backlog. Topics with
+/// no messages get no entry (cursor `None` → first real message is picked up).
+#[must_use]
+pub fn seed_cursors_at_tail(persist: &Persist) -> HashMap<String, String> {
+    let mut cursors = HashMap::new();
+    let verbs = ACTION_VERBS
+        .iter()
+        .chain(BROWSE_VERBS.iter())
+        .chain(TRANSPORT_VERBS.iter())
+        .chain(PEER_VERBS.iter());
+    for verb in verbs {
+        let topic = format!("action/music/{verb}");
+        if let Ok(Some(latest)) = persist.latest_ulid(&topic) {
+            cursors.insert(topic, latest);
+        }
+    }
+    cursors
 }
 
 /// One poll sweep over the AIR-15.b.5 peer verbs (`peer-states`,
@@ -718,6 +747,43 @@ mod tests {
         let d = dispatch_queue_action("next", "", &mut q);
         assert!(d.mutated);
         assert_eq!(q.current(), Some("x"));
+    }
+
+    #[test]
+    fn seed_cursors_at_tail_skips_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let persist = Persist::open(dir.path().join("bus")).unwrap();
+        let queue_path = dir.path().join("queue.json");
+        // A stale enqueue sits in the backlog from "before the restart".
+        persist
+            .write(
+                "action/music/enqueue",
+                Priority::Default,
+                None,
+                Some(r#"{"song_id":"stale"}"#),
+            )
+            .unwrap();
+        // Seed cursors at the tail (simulating daemon startup), then poll.
+        let mut cursors = seed_cursors_at_tail(&persist);
+        poll_once(&persist, &queue_path, &mut cursors);
+        // The stale request is NOT replayed — the queue stays empty.
+        assert!(queue::read_from(&queue_path).songs.is_empty());
+        // A NEW request after seeding IS handled.
+        let fresh = persist
+            .write(
+                "action/music/enqueue",
+                Priority::Default,
+                None,
+                Some(r#"{"song_id":"fresh"}"#),
+            )
+            .unwrap();
+        poll_once(&persist, &queue_path, &mut cursors);
+        assert_eq!(queue::read_from(&queue_path).songs, vec!["fresh"]);
+        assert!(persist
+            .list_since(&reply_topic(&fresh.ulid), None)
+            .unwrap()
+            .iter()
+            .any(|m| m.body.as_deref().unwrap_or("").contains("\"ok\":true")));
     }
 
     #[test]

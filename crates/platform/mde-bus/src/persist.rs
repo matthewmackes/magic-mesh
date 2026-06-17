@@ -399,6 +399,25 @@ impl Persist {
     ///
     /// # Errors
     /// [`PersistError::Sql`] on query or row-decode failure.
+    /// The newest (max) ULID currently stored on `topic`, or `None` if the
+    /// topic has no messages. Used to seed a poll cursor at the current tail so a
+    /// restarting consumer skips the historical backlog and only handles NEW
+    /// messages (a stale request must not replay on restart). Cheap — a single
+    /// `ORDER BY ulid DESC LIMIT 1` index probe, not a full scan.
+    pub fn latest_ulid(&self, topic: &str) -> Result<Option<String>, PersistError> {
+        self.conn
+            .query_row(
+                "SELECT ulid FROM messages WHERE topic = ?1 ORDER BY ulid DESC LIMIT 1",
+                params![topic],
+                |row| row.get::<_, String>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(PersistError::Sql(format!("latest_ulid: {other}"))),
+            })
+    }
+
     pub fn list_since(
         &self,
         topic: &str,
@@ -697,6 +716,37 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = Persist::open(tmp.path().to_path_buf()).unwrap();
         (tmp, p)
+    }
+
+    #[test]
+    fn latest_ulid_returns_newest_or_none() {
+        let (_tmp, p) = open_tmp();
+        // Empty topic → None (consumer starts with no cursor).
+        assert_eq!(p.latest_ulid("action/music/list-radio").unwrap(), None);
+        let a = p
+            .write(
+                "action/music/list-radio",
+                Priority::Default,
+                None,
+                Some("1"),
+            )
+            .unwrap();
+        let b = p
+            .write(
+                "action/music/list-radio",
+                Priority::Default,
+                None,
+                Some("2"),
+            )
+            .unwrap();
+        // Newest (max ULID) wins, and ULIDs are monotonic so b > a.
+        assert!(b.ulid > a.ulid);
+        assert_eq!(
+            p.latest_ulid("action/music/list-radio").unwrap(),
+            Some(b.ulid)
+        );
+        // A different topic is unaffected.
+        assert_eq!(p.latest_ulid("action/music/play").unwrap(), None);
     }
 
     #[test]
