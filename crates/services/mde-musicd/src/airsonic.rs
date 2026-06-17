@@ -26,9 +26,52 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::Value;
 
-/// Subsonic API version this client advertises (`v=`). 1.16.1 is the
-/// floor every endpoint we call is available at.
+/// Subsonic API version this client advertises by default (`v=`). 1.16.1 covers
+/// every endpoint we call. It is the **ceiling**, not a hard floor: a server
+/// older than this rejects the request with API error 30 ("incompatible REST
+/// protocol version, server must upgrade"), so the client auto-negotiates DOWN to
+/// the server's reported version and retries (see [`Client::get`]). This makes
+/// `mde-music` work against older Airsonic/Subsonic servers, not just current ones.
 pub const API_VERSION: &str = "1.16.1";
+
+/// Subsonic error code returned when the client's requested `v=` is newer than
+/// the server supports ("incompatible REST protocol version, server must upgrade").
+const ERR_INCOMPATIBLE_VERSION: i64 = 30;
+
+/// Conservative fallback `v=` used when a server rejects our version (error 30)
+/// but doesn't report its own version in the envelope. 1.13.0 is implemented by
+/// essentially every Subsonic-era server (Subsonic 5.3+).
+const FALLBACK_API_VERSION: &str = "1.13.0";
+
+/// Compare two dotted Subsonic versions (`"1.16.1"`); returns `Ordering` on the
+/// numeric components (missing components count as 0). Non-numeric components sort
+/// as 0 so a malformed version never panics.
+fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
+    let parse = |s: &str| -> Vec<u32> { s.split('.').map(|p| p.parse().unwrap_or(0)).collect() };
+    let (va, vb) = (parse(a), parse(b));
+    for i in 0..va.len().max(vb.len()) {
+        let (x, y) = (
+            va.get(i).copied().unwrap_or(0),
+            vb.get(i).copied().unwrap_or(0),
+        );
+        match x.cmp(&y) {
+            std::cmp::Ordering::Equal => continue,
+            ord => return ord,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// The lower of two versions (so we never advertise higher than the server or our
+/// own ceiling). Pure + testable.
+#[must_use]
+fn min_version(a: &str, b: &str) -> String {
+    if cmp_version(a, b) == std::cmp::Ordering::Greater {
+        b.to_string()
+    } else {
+        a.to_string()
+    }
+}
 
 /// Client identifier sent as `c=` (shows up in the server's session
 /// list).
@@ -211,6 +254,11 @@ pub struct Client {
     token: String,
     salt: String,
     http: reqwest::Client,
+    /// The `v=` we currently advertise. Starts at [`API_VERSION`] and is
+    /// negotiated DOWN (interior-mutable, since `get` is `&self`) the first time a
+    /// server rejects us with error 30 — so an older server starts working
+    /// transparently after one retry.
+    version: std::sync::Mutex<String>,
 }
 
 impl Client {
@@ -236,7 +284,18 @@ impl Client {
             token: auth_token(password, salt),
             salt: salt.to_string(),
             http: Self::build_http_client(),
+            version: std::sync::Mutex::new(API_VERSION.to_string()),
         }
+    }
+
+    /// The `v=` currently advertised (negotiated value; [`API_VERSION`] until a
+    /// server forces a downgrade).
+    #[must_use]
+    pub fn api_version(&self) -> String {
+        self.version
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_else(|_| API_VERSION.to_string())
     }
 
     /// AUDIT-MESH-14 — the HTTP client used for every Airsonic call, with hard
@@ -262,7 +321,7 @@ impl Client {
             ("u".into(), self.user.clone()),
             ("t".into(), self.token.clone()),
             ("s".into(), self.salt.clone()),
-            ("v".into(), API_VERSION.into()),
+            ("v".into(), self.api_version()),
             ("c".into(), CLIENT_NAME.into()),
             ("f".into(), "json".into()),
         ]
@@ -308,6 +367,52 @@ impl Client {
     /// # Errors
     /// Transport, API-error, or parse failures.
     pub async fn get(&self, view: &str, extra: &[(&str, &str)]) -> Result<Value, AirsonicError> {
+        let body = self.fetch_body(view, extra).await?;
+        match unwrap_envelope(&body) {
+            Err(AirsonicError::Api {
+                code: ERR_INCOMPATIBLE_VERSION,
+                ..
+            }) => {
+                // Our advertised v= is newer than the server supports. The Subsonic
+                // error envelope still carries the server's own REST `version` — so
+                // negotiate down to it (clamped to our ceiling) and retry ONCE.
+                // Falls back to a conservative version if the server omits its own.
+                let server_v = body
+                    .get("subsonic-response")
+                    .and_then(|r| r.get("version"))
+                    .and_then(Value::as_str)
+                    .map_or_else(
+                        || FALLBACK_API_VERSION.to_string(),
+                        |sv| min_version(sv, API_VERSION),
+                    );
+                let changed = self
+                    .version
+                    .lock()
+                    .map(|mut cur| {
+                        if *cur != server_v {
+                            *cur = server_v.clone();
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if changed {
+                    // Retry with the negotiated version (it sticks for later calls).
+                    let body2 = self.fetch_body(view, extra).await?;
+                    unwrap_envelope(&body2)
+                } else {
+                    unwrap_envelope(&body)
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// GET `view` and parse the JSON envelope body (no status interpretation).
+    /// Split out so [`get`](Self::get) can re-issue a request after negotiating
+    /// the API version down (NOTIFY/AIR — Airsonic error 30 compatibility).
+    async fn fetch_body(&self, view: &str, extra: &[(&str, &str)]) -> Result<Value, AirsonicError> {
         let url = self.endpoint_url(view, extra);
         let resp = self
             .http
@@ -318,11 +423,9 @@ impl Client {
         if !resp.status().is_success() {
             return Err(AirsonicError::Http(format!("HTTP {}", resp.status())));
         }
-        let body: Value = resp
-            .json()
+        resp.json()
             .await
-            .map_err(|e| AirsonicError::Parse(e.to_string()))?;
-        unwrap_envelope(&body)
+            .map_err(|e| AirsonicError::Parse(e.to_string()))
     }
 
     /// `ping` — returns the server's reported API version on success.
@@ -884,6 +987,36 @@ mod tests {
         assert_eq!(p.iter().find(|(k, _)| k == "u").unwrap().1, "alice");
         assert_eq!(p.iter().find(|(k, _)| k == "s").unwrap().1, "abc");
         assert_eq!(p.iter().find(|(k, _)| k == "f").unwrap().1, "json");
+        // Default v= is the ceiling until a server negotiates it down.
+        assert_eq!(p.iter().find(|(k, _)| k == "v").unwrap().1, API_VERSION);
+    }
+
+    #[test]
+    fn version_compare_and_min() {
+        use std::cmp::Ordering;
+        assert_eq!(cmp_version("1.16.1", "1.13.0"), Ordering::Greater);
+        assert_eq!(cmp_version("1.13.0", "1.16.1"), Ordering::Less);
+        assert_eq!(cmp_version("1.16.1", "1.16.1"), Ordering::Equal);
+        assert_eq!(cmp_version("1.9.0", "1.10.0"), Ordering::Less); // numeric, not lexical
+                                                                    // min_version never exceeds either input.
+        assert_eq!(min_version("1.16.1", "1.13.0"), "1.13.0");
+        assert_eq!(min_version("1.13.0", "1.16.1"), "1.13.0");
+        // A server that reports a newer version than our ceiling is clamped to us.
+        assert_eq!(min_version("1.99.0", API_VERSION), API_VERSION);
+    }
+
+    #[test]
+    fn negotiated_version_is_advertised_after_downgrade() {
+        // Simulate the negotiation effect: lowering the client version flows into
+        // the next request's v= (what get() does on error 30).
+        let c = Client::with_salt("http://h:4040", "alice", "pw", "abc");
+        assert_eq!(c.api_version(), API_VERSION);
+        *c.version.lock().unwrap() = "1.13.0".to_string();
+        assert_eq!(c.api_version(), "1.13.0");
+        assert_eq!(
+            c.query_params().iter().find(|(k, _)| k == "v").unwrap().1,
+            "1.13.0"
+        );
     }
 
     #[test]
