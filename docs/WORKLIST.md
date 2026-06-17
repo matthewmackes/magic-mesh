@@ -897,7 +897,7 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
 - [✓] **APPS-2: launcher dropdown in `mde-cosmic-applet` (grid glyph + tabbed body).**
   **As** an operator, **I want** a panel grid-glyph button that drops a tabbed launcher (Favorites/Apps/Mesh/Workloads/Services) with a persistent header, **so that** I launch anything from one place (Q3/Q7/Q16).
   **Acceptance:** clicking the panel grid glyph drops the menu; opens to the **Favorites** tab (Q6); tabs switch; renders through Carbon tokens at the Carbon-standard density (Q13); XDG-theme icons (Q14); fuzzy search filters across tabs.
-- [ ] **APPS-3: header — QNM-Shared disk + quick links.**
+- [✓] **APPS-3: header — QNM-Shared disk + quick links.**
   **Acceptance:** header shows live QNM-Shared used/total (`/mnt/mesh-storage`, Q8) + working links that launch Workbench, MDE Files, and Cosmic Settings.
 - [ ] **APPS-4: mesh-synced Favorites (per user).**
   **Acceptance:** pin/unpin persists to `<QNM-Shared>/<user>/apps-favorites.json` (Q10); the Favorites tab reflects it; the same set appears on a second node logged in as the same user; no usage/recents tracking (Q12).

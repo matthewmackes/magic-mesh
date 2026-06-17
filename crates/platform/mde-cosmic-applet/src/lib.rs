@@ -268,9 +268,57 @@ pub fn filter_entries<'a>(
     out
 }
 
+/// APPS-3 — human-readable bytes for the launcher header's QNM-Shared usage
+/// (Q8). Binary units (KiB/MiB/GiB/TiB), one decimal above MiB.
+#[must_use]
+pub fn fmt_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u <= 1 {
+        format!("{} {}", v.round() as u64, UNITS[u])
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+/// The header disk label, e.g. `"QNM-Shared: 1.2 GiB / 200.0 GiB"`. `None`
+/// total → an "unavailable" label (mount not up).
+#[must_use]
+pub fn qnm_usage_label(usage: Option<(u64, u64)>) -> String {
+    match usage {
+        Some((used, total)) if total > 0 => {
+            format!("QNM-Shared: {} / {}", fmt_bytes(used), fmt_bytes(total))
+        }
+        _ => "QNM-Shared: unavailable".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fmt_bytes_scales_units() {
+        assert_eq!(fmt_bytes(512), "512 B");
+        assert_eq!(fmt_bytes(2048), "2 KiB");
+        assert_eq!(fmt_bytes(5 * 1024 * 1024), "5.0 MiB");
+        assert_eq!(fmt_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    #[test]
+    fn qnm_label_handles_present_and_absent() {
+        assert_eq!(
+            qnm_usage_label(Some((1024 * 1024 * 1024, 200 * 1024 * 1024 * 1024))),
+            "QNM-Shared: 1.0 GiB / 200.0 GiB"
+        );
+        assert_eq!(qnm_usage_label(None), "QNM-Shared: unavailable");
+        assert_eq!(qnm_usage_label(Some((5, 0))), "QNM-Shared: unavailable");
+    }
 
     #[test]
     fn pip_reads_the_directory_record() {

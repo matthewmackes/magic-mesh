@@ -35,6 +35,8 @@ struct AppsApplet {
     query: String,
     /// Pinned favorites (APPS-4 wires the mesh-synced store; empty until then).
     favorites: HashSet<String>,
+    /// QNM-Shared (used, total) bytes for the header (Q8); None = unavailable.
+    qnm: Option<(u64, u64)>,
     /// Last load error, shown in the dropdown's empty state.
     error: Option<String>,
 }
@@ -47,8 +49,8 @@ enum Message {
     PopupClosed(Id),
     /// Open-or-close the launcher dropdown.
     TogglePopup,
-    /// Fresh entries arrived from `action/apps/list`.
-    Loaded(Vec<Entry>),
+    /// Fresh entries + QNM disk usage arrived from the load.
+    Loaded(Vec<Entry>, Option<(u64, u64)>),
     /// A load failed.
     LoadFailed(String),
     /// Switch the active tab.
@@ -61,11 +63,38 @@ enum Message {
     Refresh,
 }
 
-/// Fetch `action/apps/list` off the shared bus and parse it. `Persist` isn't
-/// `Send`, so the round-trip runs on a blocking thread with a local runtime;
-/// only the `Send` `Vec<Entry>` crosses back. An unreachable daemon → empty.
-async fn fetch_apps() -> Result<Vec<Entry>, String> {
-    tokio::task::spawn_blocking(|| -> Result<Vec<Entry>, String> {
+/// QNM-Shared mount the header reports on (Q8).
+const QNM_MOUNT: &str = "/mnt/mesh-storage";
+
+/// Read `(used, total)` bytes of the QNM-Shared mount via `df` (Q8). `None` when
+/// the mount is absent/unreadable (the header then shows "unavailable").
+fn read_qnm_usage() -> Option<(u64, u64)> {
+    let out = std::process::Command::new("df")
+        .args(["-B1", "--output=used,size", QNM_MOUNT])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // Line 2 is "<used> <size>".
+    let text = String::from_utf8_lossy(&out.stdout);
+    let nums: Vec<u64> = text
+        .lines()
+        .nth(1)?
+        .split_whitespace()
+        .filter_map(|t| t.parse().ok())
+        .collect();
+    match nums.as_slice() {
+        [used, size, ..] => Some((*used, *size)),
+        _ => None,
+    }
+}
+
+/// Fetch `action/apps/list` off the shared bus + the QNM disk usage. `Persist`
+/// isn't `Send`, so the round-trip runs on a blocking thread with a local
+/// runtime; only the `Send` results cross back. An unreachable daemon → empty.
+async fn fetch_apps() -> Result<(Vec<Entry>, Option<(u64, u64)>), String> {
+    tokio::task::spawn_blocking(|| -> Result<(Vec<Entry>, Option<(u64, u64)>), String> {
         let dir = mde_bus::default_data_dir().ok_or_else(|| "no Bus data dir".to_string())?;
         let persist =
             mde_bus::persist::Persist::open(dir).map_err(|e| format!("bus store: {e}"))?;
@@ -83,17 +112,20 @@ async fn fetch_apps() -> Result<Vec<Entry>, String> {
                 Duration::from_secs(5),
             ))
             .map_err(|e| format!("apps daemon not responding ({e})"))?;
-        Ok(parse_entries(&reply.body.unwrap_or_default()))
+        Ok((
+            parse_entries(&reply.body.unwrap_or_default()),
+            read_qnm_usage(),
+        ))
     })
     .await
     .map_err(|e| format!("fetch task join: {e}"))?
 }
 
-/// The `Task` that loads entries, mapped into messages.
+/// The `Task` that loads entries + disk usage, mapped into messages.
 fn load_task() -> Task<Message> {
     Task::perform(fetch_apps(), |r| {
         cosmic::Action::App(match r {
-            Ok(entries) => Message::Loaded(entries),
+            Ok((entries, qnm)) => Message::Loaded(entries, qnm),
             Err(e) => Message::LoadFailed(e),
         })
     })
@@ -154,6 +186,7 @@ impl Application for AppsApplet {
                 tab: LauncherTab::Favorites,
                 query: String::new(),
                 favorites: HashSet::new(),
+                qnm: None,
                 error: None,
             },
             // Prime the list so the first open is instant.
@@ -209,8 +242,9 @@ impl Application for AppsApplet {
                 ));
                 return Task::batch([open, load_task()]);
             }
-            Message::Loaded(entries) => {
+            Message::Loaded(entries, qnm) => {
                 self.entries = entries;
+                self.qnm = qnm;
                 self.error = None;
             }
             Message::LoadFailed(e) => {
@@ -270,6 +304,25 @@ impl AppsApplet {
         let body_sz = TypeRole::Body.size_in(sizes);
         let cap_sz = TypeRole::Caption.size_in(sizes);
 
+        // APPS-3 header: live QNM-Shared usage (Q8) + quick links (Q4). The links
+        // launch detached, like any local app.
+        let disk = text(mde_cosmic_applet::qnm_usage_label(self.qnm))
+            .size(cap_sz)
+            .class(cosmic::theme::Text::Color(carbon(p.text_muted)));
+        let quick = |label: &'static str, exec: &'static str| -> Element<Message> {
+            button::custom(text(label).size(cap_sz))
+                .on_press(Message::LaunchLocal(exec.to_string()))
+                .class(cosmic::theme::Button::Text)
+                .into()
+        };
+        let links = row(vec![
+            quick("Workbench", "mde-workbench"),
+            quick("Files", "mde-files"),
+            quick("Settings", "cosmic-settings"),
+        ])
+        .spacing(4);
+        let header = column(vec![disk.into(), links.into()]).spacing(2);
+
         // Tab row (Favorites first — Q6). The active tab is accented.
         let tabs: Vec<Element<Message>> = LauncherTab::all()
             .into_iter()
@@ -316,6 +369,7 @@ impl AppsApplet {
         };
 
         column(vec![
+            header.into(),
             row(tabs).spacing(4).into(),
             search.into(),
             scrollable(column(list).spacing(2).width(Length::Fill))
