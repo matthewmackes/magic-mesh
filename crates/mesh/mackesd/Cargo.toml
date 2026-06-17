@@ -507,6 +507,12 @@ systemctl enable magic-setup.service >/dev/null 2>&1 || :
 # Enforcing (no AVC flood from mackesd's podman transition / libvirt /proc scans;
 # no repeating "SELinux security alert" toasts). Self-skips if SELinux is off.
 /usr/libexec/mackesd/setup-selinux-policy >/dev/null 2>&1 || :
+# MUSIC-DAEMON-AUTOSTART — enable the mde-musicd USER service for every user so
+# the music library has its action/music/* responder in the desktop session
+# (the GUI talks to it over the bus). It self-gates on Workstation rank
+# (ExecCondition) + only starts where a user session exists, so enabling it
+# globally is safe: a headless Server/Lighthouse has no session to start it in.
+systemctl --global enable mde-musicd.service >/dev/null 2>&1 || :
 # SETUP-fix — materialize the shared bus dir now (no reboot needed).
 systemd-tmpfiles --create /usr/lib/tmpfiles.d/magic-mesh.conf >/dev/null 2>&1 || :
 [ -d /etc/mackesd ] || install -d -m 0700 /etc/mackesd

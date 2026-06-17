@@ -11,6 +11,12 @@ ExecCondition=/usr/bin/mackesd role-gate --min-rank 2
 # exited 2 (printed help) so the daemon never started. `serve` runs the Bus
 # control responder (action/music/<verb> → reply/<ulid>), the daemon's loop.
 ExecStart=/usr/bin/mde-musicd serve
+# MUSIC-DAEMON-AUTOSTART (2026-06-17) — pin the shared bus root so this user
+# service answers on the SAME bus the desktop GUIs use (/run/mde-bus). It is also
+# inherited from /usr/lib/environment.d/90-mde-bus.conf, but setting it explicitly
+# means a user-manager environment.d ordering quirk can't leave the daemon
+# answering a per-HOME bus (the "daemon not responding" library failure).
+Environment=MDE_BUS_ROOT=/run/mde-bus
 Restart=on-failure
 RestartSec=5
 
