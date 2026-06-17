@@ -834,6 +834,7 @@ Operator: "include all of these findings in the next build." Every fix below is 
 - [ ] **NOTIFY-DIST-2** (`b07772c`) — cross-node alert federation via QNM-Shared (`alert-mirror` worker + `AlertTail::poll_shared` + Hub wiring). *(hot-applied: fedora mirrors; .13 has new mackesd + notify-center.)*
 - [ ] **NOTIFY-DIST-3** (`95fc7f2`) — ntfy publish topic flattening (was 404ing every alert).
 - [ ] **SELINUX-1** — `%post` loads the magicmesh CIL modules + toast suppresses SELinux denials. *(live-patched on all 4 nodes; the RPM `%post` makes it durable for fresh installs.)*
+- [ ] **NOTIFY-UI-4** (`5517794` + `fec2245`) — Action Center FUSE-read moved off the iced update loop (the "won't open" hang) + applet launches the center detached (no zombie-per-toggle). *(center binary live-deployed to both Workstation nodes — .13 + dev host; applet fix ships in the GUI roll, its zombies clear on applet restart.)*
 - [ ] Then re-run the `[>]` "live-verify pending" batch (SUBAUDIT-D1, AUDIT-MESH-7/15, AC-5, NOTIFY-6, BRAND-2..8) against the freshly-rolled fleet.
 
 ## NOTIFY-SRC — alert SOURCES (the Alert Center renders, but few sources fed it; found live 2026-06-16)
