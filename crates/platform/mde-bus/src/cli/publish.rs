@@ -190,7 +190,16 @@ pub async fn run(args: PublishArgs) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
-    let url = format!("{}/{}", broker_url.trim_end_matches('/'), args.topic);
+    // NOTIFY-DIST-3 — flatten the hierarchical bus topic to a valid ntfy topic
+    // segment (slashes/spaces → `_`). The hooks publisher already did this, but
+    // the CLI publish path (used by the alert sources: selinux_monitor, kdc_host,
+    // mesh-alert, …) posted the raw `a/b/c` topic → ntfy 404 → every alert fell
+    // back to persist-only with no real-time broker push.
+    let url = format!(
+        "{}/{}",
+        broker_url.trim_end_matches('/'),
+        crate::hooks::publisher::ntfy_topic(&args.topic)
+    );
     let mut req = client.post(&url).body(body.clone());
     if let Some(t) = args.title.as_ref() {
         req = req.header("X-Title", t.as_str());
