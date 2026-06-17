@@ -399,23 +399,32 @@ fn local_announce() -> Announce {
         .or_else(|| std::env::var("HOSTNAME").ok())
         .unwrap_or_else(|| "host".to_string());
     let device_name = format!("{MESH_NAME_PREFIX} {hostname}");
-    // KDC-INTEROP — advertise the plugin capabilities we actually drive. An
-    // identity with EMPTY capabilities makes a stock KDE Connect peer treat the
-    // link as having nothing to run and tear it down right after the handshake
-    // (observed: a paired phone reconnecting every ~30s, never persistent, no
-    // features). `incoming` = packets we accept; `outgoing` = packets we send.
+    // KDC-INTEROP / KDC-PLUGINS — advertise ONLY the plugin capabilities we
+    // actually drive. An identity with EMPTY capabilities makes a stock KDE
+    // Connect peer treat the link as having nothing to run and tear it down
+    // right after the handshake (observed: a paired phone reconnecting every
+    // ~30s, never persistent, no features). But advertising packets we DON'T
+    // handle is the false advertising the KDC-PLUGINS epic removes — so
+    // `mpris{,.request}` and `notification.request` (no inbound handler:
+    // media control + notification-pull are not implemented) are dropped.
+    // `incoming` = packets we accept + act on; `outgoing` = packets we send.
     let incoming_capabilities = [
+        // Liveness — surfaced to the Alert Center.
         "kdeconnect.ping",
+        // Peer battery snapshot (folded into the roster); the request kind is
+        // answered with THIS host's battery (handle_battery_request).
         "kdeconnect.battery",
         "kdeconnect.battery.request",
+        // Clipboard copy + the connection-time push, applied via wl-copy.
         "kdeconnect.clipboard",
         "kdeconnect.clipboard.connect",
+        // Peer notifications, mirrored to the Alert Center.
         "kdeconnect.notification",
-        "kdeconnect.notification.request",
-        "kdeconnect.mpris",
-        "kdeconnect.mpris.request",
+        // Inbound file/URL share — surfaced to the Alert Center.
         "kdeconnect.share.request",
+        // Ring this host (ring_local_device).
         "kdeconnect.findmyphone.request",
+        // Curated command list + execution (handle_runcommand).
         "kdeconnect.runcommand.request",
     ]
     .iter()
@@ -428,9 +437,6 @@ fn local_announce() -> Announce {
         "kdeconnect.clipboard",
         "kdeconnect.clipboard.connect",
         "kdeconnect.notification",
-        "kdeconnect.notification.request",
-        "kdeconnect.mpris",
-        "kdeconnect.mpris.request",
         "kdeconnect.share.request",
         "kdeconnect.findmyphone.request",
         "kdeconnect.sms.request",
@@ -581,6 +587,29 @@ async fn run_host(
                     // back as a `kdeconnect.ping` notification on the phone.
                     if packet.kind == "kdeconnect.runcommand.request" {
                         handle_runcommand(&transport, &config_dir, peer, &packet.body).await;
+                    }
+                    // KDC-PLUGINS — Battery request: the peer polls THIS host's
+                    // battery. Answer with a `kdeconnect.battery` snapshot read
+                    // from `/sys/class/power_supply` (a desktop replies cleanly
+                    // with the "-1 / not a battery" sentinel).
+                    if packet.kind == "kdeconnect.battery.request" {
+                        handle_battery_request(&transport, peer).await;
+                    }
+                    // KDC-PLUGINS — Find My Phone: the peer rings THIS host. Play
+                    // an audible alert through the desktop sound path (the same
+                    // canberra/paplay path the notify-toast uses).
+                    if packet.kind == "kdeconnect.findmyphone.request" {
+                        ring_local_device();
+                    }
+                    // KDC-PLUGINS — Clipboard: a peer's copy (live or the
+                    // connection-time `.connect` push) is applied to THIS host's
+                    // Wayland clipboard via `wl-copy` when present.
+                    if packet.kind == "kdeconnect.clipboard"
+                        || packet.kind == "kdeconnect.clipboard.connect"
+                    {
+                        if let Some(content) = packet.body.get("content").and_then(Value::as_str) {
+                            apply_clipboard(content);
+                        }
                     }
                 }
                 if let Ok(mut m) = roster.lock() {
@@ -813,6 +842,114 @@ async fn handle_runcommand(
             warn!(error = %e, "kdc-host: runcommand result ping failed");
         }
     }
+}
+
+// ───────────────────────── KDC-PLUGINS: Battery ──────────────────────────
+//
+// A peer (typically a phone) sends `kdeconnect.battery.request` to poll this
+// host's power state. We read `/sys/class/power_supply` (the same source the
+// hardware-probe worker uses) and reply with a `kdeconnect.battery` snapshot.
+// A desktop/server/VM with no battery answers the clean upstream "-1 / not a
+// battery" sentinel so the phone renders nothing rather than a bogus 0%.
+
+/// Read a `/sys/class/power_supply` integer file, if present.
+fn read_power_supply_u8(path: &str) -> Option<u8> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// This host's battery snapshot for a `battery.request` reply, read from
+/// sysfs. Returns the "not a battery" sentinel on a machine with no
+/// `BAT0`/`BAT1` capacity node (the common mesh-host case).
+fn local_battery_body() -> BatteryBody {
+    let charge = read_power_supply_u8("/sys/class/power_supply/BAT0/capacity")
+        .or_else(|| read_power_supply_u8("/sys/class/power_supply/BAT1/capacity"));
+    charge.map_or_else(BatteryBody::not_a_battery, |pct| {
+        // `AC/online == 1` means plugged in (charging). Absent AC node →
+        // assume on battery (laptop unplugged) rather than guessing.
+        let on_ac = read_power_supply_u8("/sys/class/power_supply/AC/online")
+            .or_else(|| read_power_supply_u8("/sys/class/power_supply/ACAD/online"))
+            .or_else(|| read_power_supply_u8("/sys/class/power_supply/ADP1/online"))
+            .is_some_and(|v| v == 1);
+        BatteryBody::from_charge(pct, on_ac)
+    })
+}
+
+/// Answer a `kdeconnect.battery.request` with this host's live snapshot.
+async fn handle_battery_request(transport: &LanTransport, peer: &PeerId) {
+    let body = local_battery_body();
+    let pkt = build_packet(
+        "kdeconnect.battery",
+        serde_json::to_value(&body).unwrap_or(Value::Null),
+    );
+    if let Err(e) = transport.send_to(peer, pkt).await {
+        warn!(error = %e, "kdc-host: battery reply send failed");
+    }
+}
+
+// ──────────────────────── KDC-PLUGINS: Find My Phone ──────────────────────
+//
+// `kdeconnect.findmyphone.request` rings the receiving device. When a phone
+// rings THIS host, play an audible alert through the desktop sound path
+// (canberra theme sound, falling back to paplay of the bell .oga). Best-effort
+// + non-blocking: a headless/soundless host simply stays silent.
+
+/// Ring this host audibly in response to a Find-My-Device request. Spawns the
+/// sound player detached (never blocks the host event loop) and is silent when
+/// neither player nor a sound theme is present.
+fn ring_local_device() {
+    use std::process::{Command, Stdio};
+    // Theme-aware bell via canberra; falls back to paplay of the freedesktop
+    // sound-theme bell if canberra isn't installed.
+    let canberra = Command::new("canberra-gtk-play")
+        .args(["-i", "bell"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if canberra.is_ok() {
+        return;
+    }
+    for oga in [
+        "/usr/share/sounds/freedesktop/stereo/bell.oga",
+        "/usr/share/sounds/freedesktop/stereo/complete.oga",
+    ] {
+        if std::path::Path::new(oga).exists() {
+            let _ = Command::new("paplay")
+                .arg(oga)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            return;
+        }
+    }
+    info!("kdc-host: find-my-device ring requested (no audio player available)");
+}
+
+// ───────────────────────── KDC-PLUGINS: Clipboard ────────────────────────
+//
+// A peer's clipboard copy (a live `kdeconnect.clipboard` or the connection-time
+// `kdeconnect.clipboard.connect` push) is applied to THIS host's Wayland
+// clipboard via `wl-copy`. Best-effort: a host without wl-clipboard installed
+// (or no Wayland session) simply skips — no error surfaced to the peer.
+
+/// Apply inbound clipboard `content` to this host's Wayland clipboard via
+/// `wl-copy`. Pipes the content over stdin (no shell-quoting hazard) and
+/// detaches; silently no-ops when `wl-copy` is absent.
+fn apply_clipboard(content: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let child = Command::new("wl-copy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else {
+        return; // wl-copy not installed / no Wayland — skip cleanly
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(content.as_bytes());
+    }
+    // Don't block the event loop waiting on wl-copy; it exits promptly.
+    drop(child);
 }
 
 /// This peer's hostname for the shunt's published filename.
@@ -1201,6 +1338,40 @@ mod tests {
     fn worker_name_matches_module() {
         let w = KdcHostWorker::new(PathBuf::from("/tmp"));
         assert_eq!(w.name(), "kdc-host");
+    }
+
+    #[test]
+    fn read_power_supply_u8_handles_missing_and_garbage() {
+        // A non-existent sysfs node is None (the desktop case).
+        assert_eq!(
+            read_power_supply_u8("/sys/class/power_supply/__nope__/capacity"),
+            None
+        );
+        // A bogus path never panics.
+        assert_eq!(read_power_supply_u8("/definitely/not/a/file"), None);
+    }
+
+    #[test]
+    fn local_battery_body_is_serializable_and_sane() {
+        // Whatever this host is (laptop or desktop), the reply body must be a
+        // valid `kdeconnect.battery` JSON object. A desktop yields the -1
+        // sentinel; a laptop yields a 0..=100 charge — both are valid.
+        let body = local_battery_body();
+        let v = serde_json::to_value(&body).expect("battery body serializes");
+        assert!(v.get("currentCharge").is_some());
+        assert!(v.get("isCharging").is_some());
+        // charge_pct() is None (sentinel) or Some(0..=100); never out of range.
+        if let Some(p) = body.charge_pct() {
+            assert!(p <= 100);
+        }
+    }
+
+    #[test]
+    fn ring_and_clipboard_helpers_never_panic_when_tools_absent() {
+        // Best-effort host actions: with no audio player / wl-copy present (CI),
+        // these spawn-or-skip without panicking or blocking.
+        ring_local_device();
+        apply_clipboard("test clipboard content");
     }
 
     #[test]

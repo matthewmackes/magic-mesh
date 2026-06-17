@@ -144,7 +144,30 @@ mod tests {
     fn clipboard_plugin_kind_and_handles_match_token() {
         let p = ClipboardPlugin::new();
         assert_eq!(p.kind(), PluginKind::Clipboard);
-        assert_eq!(p.handles(), &["kdeconnect.clipboard"]);
+        assert_eq!(
+            p.handles(),
+            &["kdeconnect.clipboard", "kdeconnect.clipboard.connect"]
+        );
+    }
+
+    #[test]
+    fn clipboard_plugin_queues_connect_variant() {
+        // The `.connect` push (current contents at link-up) routes
+        // through the same body path and queues like a live copy.
+        let mut plugin = ClipboardPlugin::new();
+        let ctx = PluginContext::new("phone", true);
+        let pkt = Packet {
+            id: 1,
+            kind: "kdeconnect.clipboard.connect".to_string(),
+            body: serde_json::json!({ "content": "from connect" }),
+            mde_caps: None,
+            payload_size: None,
+            payload_transfer_info: None,
+        };
+        plugin.process(&pkt, &ctx);
+        let drained = plugin.take_received();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].content, "from connect");
     }
 
     #[test]
@@ -257,17 +280,24 @@ pub struct ClipboardPlugin {
     /// Proactive outbound packets queued for the paired phone
     /// (mesh clipboard → phone). Drained by the host on each tick.
     outbound: Vec<crate::wire::Packet>,
-    handles: [&'static str; 1],
+    handles: [&'static str; 2],
 }
 
 impl ClipboardPlugin {
     /// New empty plugin.
+    ///
+    /// Handles both `kdeconnect.clipboard` (a live copy on the peer)
+    /// AND `kdeconnect.clipboard.connect` (the current-contents push
+    /// a peer sends at connection time). Both carry the identical
+    /// [`ClipboardBody`] shape, so the same `process` path queues
+    /// them — closing the advertised-but-unrouted `.connect`
+    /// incoming capability.
     #[must_use]
     pub fn new() -> Self {
         Self {
             received: Vec::new(),
             outbound: Vec::new(),
-            handles: ["kdeconnect.clipboard"],
+            handles: ["kdeconnect.clipboard", "kdeconnect.clipboard.connect"],
         }
     }
 
