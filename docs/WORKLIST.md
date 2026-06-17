@@ -854,6 +854,14 @@ The NOTIFY epic shipped the panel/format + (now) federation, but most alert SOUR
 
 - [✓] **NOTIFY-SRC-3: KDC (KDE Connect) events into the global events.** KDC device events (paired/unpaired, file received, battery low, find-my-phone, etc.) don't flow into the Alert Center. **Fix:** the `mde-kdc-host` worker publishes each device event to a bus alert lane (e.g. `peer/<host>/alerts` or `fdo/KDE Connect`/`compute/event`), classified so the panel groups it; NOTIFY-DIST-2 federates it. **Acceptance:** a phone pair / file-received / low-battery event appears in the Alert Center mesh-wide. *(not yet built.)*
 
+## OPERATOR DECISIONS — 2026-06-17 (AskUserQuestion)
+- **NETDATA-1:** BUILD it (the chosen next work). Fleet-wide install incl. the production lighthouses is authorized.
+- **KDC-PLUGINS:** IMPLEMENT the advertised KDE Connect plugins (not trim).
+- **ntfy real-time broker (NOTIFY-DIST-1/3):** ACTIVATE fleet-wide (on top of the QNM-Shared federation).
+- **AUDIT-MESH-7:** run the destructive live-verify (chunkserver eviction + VIP failover) on the **live** mesh.
+- **BULLETPROOF-4:** sweep + remove any `/etc/systemd/system/mackesd.service` shadow fleet-wide (keep `.service.d/`; verify mackesd stays up).
+- `/loop /ship` stays armed. See [[test-infra-authorization]] for the standing fleet-wide install + destructive-verify authorization.
+
 ## NETDATA-1 — live metrics dead: netdata never installed (the unprovisioned-substrate class)
 - [ ] **NETDATA-1: the live-metrics surfaces (PD-7 flow map, peer health 3-tier, throughput particles) have no data — `netdata` is never installed on any node.** Verified 2026-06-17 on the v10.0.12 fleet: `:19999` is down everywhere and `dnf list netdata` → **"No matching packages"** (netdata is NOT in the Fedora 44 base/updates repos). The platform CODE is complete + reachable (the `netdata_aggregator` worker rewrites `/etc/netdata/netdata.conf` `[stream]`+`[web]` to confine the dashboard to overlay+loopback (EFF-22), `descriptors.rs` reads netdata alarms for the PD-2 health tier, peers_map draws PD-7 flow particles from `system.net`) — but it all silently no-ops because the **substrate was never provisioned** (the ONBOARD-6 / audit-gap class: code reachable + unit-tested, real daemon absent). **Fix:** netdata can't be a hard RPM `Requires:` (absent from the repos — same class as ntfy/starship/lizardfs); it needs a **first-boot birthright installer** `mesh-install-netdata` (checksum-verified upstream fetch or a bundled package, mirroring `mesh-install-ntfy`), enabled in `%post`, with the aggregator then confining it to the overlay. **Acceptance:** on a fresh node `:19999` LISTENs on overlay+loopback only, the PD-7 map shows live flow particles + peer health, verified mesh-wide. *(substantial — an outward-fetching fleet-wide install; not auto-started this session. Aggregator/panel/health code is already done.)*
 
