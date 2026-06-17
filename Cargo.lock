@@ -4129,6 +4129,7 @@ dependencies = [
  "mde-bus",
  "mde-notify",
  "mde-theme",
+ "serde",
  "serde_json",
  "tokio",
 ]
