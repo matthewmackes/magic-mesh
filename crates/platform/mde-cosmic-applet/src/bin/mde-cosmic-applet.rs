@@ -74,7 +74,15 @@ fn toggle_center() {
             .args(["-f", "mde-notify-center"])
             .status();
     } else {
-        let _ = std::process::Command::new("mde-notify-center").spawn();
+        // Launch detached via `setsid --fork` so the Action Center reparents to
+        // init (which reaps it on exit). A bare `spawn()` leaves the child as the
+        // applet's own un-waited child → a zombie accumulates on every toggle
+        // (NOTIFY-UI-4: an operator clicking the bell repeatedly left ~18 defunct
+        // `mde-notify-center` entries). `.status()` reaps the short-lived forking
+        // parent immediately; the real process detaches.
+        let _ = std::process::Command::new("setsid")
+            .args(["--fork", "mde-notify-center"])
+            .status();
     }
 }
 
