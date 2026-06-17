@@ -984,3 +984,12 @@ Operator: an informative, at-boot view of how the mesh fabric + app daemons come
   **Acceptance:**
     - [ ] while the boot chain is incomplete the panel shows a "peers settling…" state (not an empty/"no hosts" state).
     - [ ] it resolves to the live roster once the directory has replicated + the first sweep completes. (Subsumed by BOOT-STATUS once that lands; keep until then.)
+
+### BUS-INODE-ORPHAN — the index.sqlite self-heal recreate strands live consumers (live root cause 2026-06-17)
+- [ ] **BUS-INODE-ORPHAN-1: the BOOT-REC-3 recreate must not orphan open consumers**
+  **As** any long-running bus consumer (mackesd workers, mde-workbench, mde-musicd), **I want** an `index.sqlite` recreate to not strand me on the deleted inode, **so that** I don't silently stop seeing new messages until a restart.
+  **Context:** BOOT-REC-3 self-heals a read-only `index.sqlite` by **unlink + recreate** (a new inode). Any other process holding the old fd keeps reading/writing the now-DELETED file and never sees new writes — the live "daemon not responding after long uptime" wedge (musicd fd pointed at `index.sqlite (deleted)`). musicd is patched defensively (MUSIC-WEDGE-2: detect the inode swap + reopen), but mackesd + workbench are equally exposed.
+  **Acceptance** (each runtime-observable):
+    - [ ] a recreate by one process does not wedge other live consumers — verify by forcing a recreate while a second consumer is polling and confirming it keeps answering (it reopens within a bounded window).
+    - [ ] prefer the root fix: avoid the inode swap where possible (fix perms in place / gate the recreate so a uid-1000 GUI never nukes a root-owned index the daemon is using), OR make every long-running consumer reopen on inode change (lift the MUSIC-WEDGE-2 pattern into a shared `mde-bus` helper).
+    - [ ] the recreate is logged loudly by the process that does it (which pid/uid recreated), so the cause is attributable.
