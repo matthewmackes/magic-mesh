@@ -13,6 +13,36 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
+## [10.0.14] - 2026-06-17
+
+### Added
+- **QNM-Shared HA shadow master (HA-1):** `setup-qnm-shared.sh --shadow` stands
+  up a live LizardFS **shadow master** (`PERSONALITY=shadow` + `MASTER_HOST`,
+  live metadata replication, promotable) plus a metalogger on a second
+  lighthouse, so the QNM-Shared master is no longer a silent SPOF. `159.65.183.51`
+  (overlay `10.42.0.2`) now tracks `45.55.33.179` as a warm standby. Design
+  locked in `docs/design/ha-shadow-master.md` (10-Q survey); HA-2..HA-6 (floating
+  VIP + auto-failover worker + 2-LH-minimum degraded flag + HA panel) tracked in
+  the worklist.
+- **KDE Connect plugins (KDC-PLUGINS):** the advertised KDE Connect plugin set is
+  now implemented for real; false advertisements removed from the capability list.
+
+### Changed
+- **netdata RAM safety gate (NETDATA-1):** `mesh-install-netdata.sh` now refuses
+  the 181 MB static install on nodes with `< 3 GB` RAM
+  (`MDE_NETDATA_MIN_MB` / `MDE_NETDATA_FORCE=1` to override). The static build
+  extracts to hundreds of MB and once OOM-thrashed a 947 MB lighthouse, killing
+  its LizardFS master and cascading a mesh-wide QNM-Shared FUSE outage. The two
+  lighthouses have `mesh-netdata-setup.service` masked; netdata runs only on
+  high-RAM hosts.
+- **Lighthouse `/tmp` shrink (HA-6):** both lighthouse `/tmp` tmpfs sized down to
+  128 MB so a heavy transient can't OOM the master (pairs with the netdata gate).
+
+### Fixed
+- **Notification CLI fan-out (NOTIFY-DIST-3):** `mde-bus publish` now flattens
+  hierarchical topics (slashes → `_`) before the ntfy POST, so CLI-published
+  alerts reach the broker on the same topic the subscribers watch.
+
 ## [10.0.13] - 2026-06-17
 
 ### Added
