@@ -179,6 +179,13 @@ struct Center {
     /// AC-5 — live Do-Not-Disturb state (the quick-toggle tile reflects + flips
     /// the same `mde_bus::dnd` the toast/sound paths honor).
     dnd_active: bool,
+    /// NOTIFY-UI-4 — in-flight handle for the shared-alerts read. The shared dir
+    /// is on the QNM-Shared (FUSE) mount; reading it inline once hung the iced
+    /// update loop on a wedged mount so the layer surface never mapped and the
+    /// Action Center "wouldn't open". The read now runs on a helper thread and
+    /// the result is picked up here non-blockingly — at most one read is ever in
+    /// flight, so a permanently-wedged mount leaks a single thread, never the UI.
+    shared_rx: Option<std::sync::mpsc::Receiver<Vec<AlertItem>>>,
 }
 
 impl Center {
@@ -190,6 +197,7 @@ impl Center {
             music: None,
             voice: None,
             dnd_active: false,
+            shared_rx: None,
         }
     }
 }
@@ -375,15 +383,44 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
             // panel shows mesh-wide notifications (every peer's mirrored alerts),
             // not just this node's. Deduped against the local tail (shared
             // dedup set). The workgroup root honors MDE_WORKGROUP_ROOT.
+            //
+            // NOTIFY-UI-4 — this dir is on the QNM-Shared (FUSE) mount, so the
+            // read MUST NOT run inline: a wedged mount blocks uninterruptibly,
+            // which previously froze the iced update loop on the very first
+            // Refresh (batched with the layer-surface creation in boot_task) so
+            // the surface never mapped and the panel "wouldn't open". Instead, run
+            // the read on a helper thread and pick the result up non-blockingly:
+            //   * if a prior read finished, dedup + merge it now;
+            //   * if none is in flight, kick a new one off;
+            //   * if one is still running (slow/wedged mount), do nothing this
+            //     cycle — the UI stays fully responsive, at most one read is ever
+            //     in flight, and a recovered mount is picked up on a later poll.
             {
-                let wg = mackes_mesh_types::peers::default_workgroup_root();
-                let mut fresh = state.tail.poll_shared(&wg);
-                fresh.sort_by(|a, b| b.ts_unix_ms.cmp(&a.ts_unix_ms));
-                for item in fresh {
-                    state.items.insert(0, item);
+                if let Some(rx) = &state.shared_rx {
+                    match rx.try_recv() {
+                        Ok(items) => {
+                            state.shared_rx = None;
+                            let fresh = state.tail.dedup_fresh(items);
+                            for item in fresh {
+                                state.items.insert(0, item);
+                            }
+                            state.items.sort_by(|a, b| b.ts_unix_ms.cmp(&a.ts_unix_ms));
+                            state.items.truncate(MAX_ROWS);
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            state.shared_rx = None;
+                        }
+                    }
                 }
-                state.items.sort_by(|a, b| b.ts_unix_ms.cmp(&a.ts_unix_ms));
-                state.items.truncate(MAX_ROWS);
+                if state.shared_rx.is_none() {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let wg = mackes_mesh_types::peers::default_workgroup_root();
+                        let _ = tx.send(mde_notify::read_shared_alert_items(&wg));
+                    });
+                    state.shared_rx = Some(rx);
+                }
             }
             // NOTIFY-AC — refresh the Music + Voice section snapshots.
             state.music = fetch_music();

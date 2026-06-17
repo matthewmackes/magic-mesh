@@ -377,34 +377,19 @@ impl AlertTail {
     /// and its own mirror) is shown once. This is what makes the panel mesh-wide:
     /// each node only ever tails its *local* bus, but reads *everyone's* mirror.
     pub fn poll_shared(&mut self, workgroup_root: &std::path::Path) -> Vec<AlertItem> {
-        let base = shared_alert_dir(workgroup_root);
-        let mut fresh = Vec::new();
-        let Ok(hosts) = std::fs::read_dir(&base) else {
-            return fresh;
-        };
-        for host in hosts.flatten() {
-            if !host.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            let Ok(files) = std::fs::read_dir(host.path()) else {
-                continue;
-            };
-            for f in files.flatten() {
-                let p = f.path();
-                if p.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                let Ok(bytes) = std::fs::read(&p) else {
-                    continue;
-                };
-                let Ok(msg) = serde_json::from_slice::<StoredMessage>(&bytes) else {
-                    continue;
-                };
-                if self.mark_seen(&msg.ulid) {
-                    fresh.push(alert_from_message(&msg));
-                }
-            }
-        }
+        self.dedup_fresh(read_shared_alert_items(workgroup_root))
+    }
+
+    /// Dedup a batch of candidate items against the seen-set + sort oldest-first.
+    /// Split out so the (FUSE-backed, potentially-wedged) directory read can run
+    /// on a helper thread via [`read_shared_alert_items`] while the dedup — which
+    /// needs `&mut self` — stays on the caller's thread (NOTIFY-UI-4: the read
+    /// must never block the UI loop, or the Action Center never maps its window).
+    pub fn dedup_fresh(&mut self, items: Vec<AlertItem>) -> Vec<AlertItem> {
+        let mut fresh: Vec<AlertItem> = items
+            .into_iter()
+            .filter(|it| self.mark_seen(&it.id))
+            .collect();
         fresh.sort_by_key(|a| a.ts_unix_ms);
         fresh
     }
@@ -430,6 +415,44 @@ impl AlertTail {
 #[must_use]
 pub fn shared_alert_dir(workgroup_root: &std::path::Path) -> std::path::PathBuf {
     workgroup_root.join(".mesh-alerts")
+}
+
+/// Read + parse every mirrored shared-alert message into an [`AlertItem`].
+///
+/// Pure and `&self`-free (no dedup state), so it is safe to run on a helper
+/// thread. The shared dir lives on the QNM-Shared (LizardFS/FUSE) mount; a wedged
+/// mount makes these reads block uninterruptibly, so the caller runs this off the
+/// UI thread and picks the result up non-blockingly (NOTIFY-UI-4). Dedup the
+/// result with [`AlertTail::dedup_fresh`].
+#[must_use]
+pub fn read_shared_alert_items(workgroup_root: &std::path::Path) -> Vec<AlertItem> {
+    let base = shared_alert_dir(workgroup_root);
+    let mut items = Vec::new();
+    let Ok(hosts) = std::fs::read_dir(&base) else {
+        return items;
+    };
+    for host in hosts.flatten() {
+        if !host.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(host.path()) else {
+            continue;
+        };
+        for f in files.flatten() {
+            let p = f.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&p) else {
+                continue;
+            };
+            let Ok(msg) = serde_json::from_slice::<StoredMessage>(&bytes) else {
+                continue;
+            };
+            items.push(alert_from_message(&msg));
+        }
+    }
+    items
 }
 
 /// NOTIFY-DIST-2 — mirror one alert message into the shared dir under `host`,
@@ -505,6 +528,29 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut tail = AlertTail::default();
         assert!(tail.poll_shared(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn read_shared_alert_items_is_pure_and_dedup_is_separate() {
+        // NOTIFY-UI-4 — the FUSE-backed read (`read_shared_alert_items`) is a pure
+        // function with no dedup state, so it can run on a helper thread; the
+        // dedup (`dedup_fresh`) happens separately on the caller's thread.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let a = msg("01AAA", "peer/alpha/alerts", "high", "{\"summary\":\"a\"}");
+        let b = msg("01BBB", "fleet/sec", "urgent", "{\"summary\":\"b\"}");
+        write_shared_alert(root, "alpha", &a).unwrap();
+        write_shared_alert(root, "bravo", &b).unwrap();
+
+        // The pure read returns every item every time (no dedup of its own).
+        assert_eq!(read_shared_alert_items(root).len(), 2);
+        assert_eq!(read_shared_alert_items(root).len(), 2);
+
+        // dedup_fresh applied to the same batch yields each once, then nothing.
+        let mut tail = AlertTail::default();
+        let first = tail.dedup_fresh(read_shared_alert_items(root));
+        assert_eq!(first.len(), 2);
+        assert!(tail.dedup_fresh(read_shared_alert_items(root)).is_empty());
     }
 
     #[test]
