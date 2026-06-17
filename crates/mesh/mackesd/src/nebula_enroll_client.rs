@@ -39,6 +39,14 @@ use crate::nebula_enroll_endpoint::fingerprint;
 /// Whole-exchange budget — TCP connect + TLS handshake + POST + read.
 pub const NETWORK_ENROLL_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// XPA-11 — the enroll transport occasionally fails on the first attempt (the
+/// lighthouse busy, a cold relay path), so `network_enroll` retries **transient
+/// transport errors** this many times. Deterministic failures (fp mismatch,
+/// HTTP refusal, bad bundle) fail fast and are NOT retried.
+pub const ENROLL_ATTEMPTS: u32 = 3;
+/// Backoff between enroll transport retries.
+pub const ENROLL_RETRY_BACKOFF: Duration = Duration::from_secs(3);
+
 /// Errors the peer-side network enroll can hit.
 #[derive(Debug)]
 pub enum NetEnrollError {
@@ -304,7 +312,27 @@ pub async fn network_enroll(
     let csr_json =
         serde_json::to_vec(&pending).map_err(|e| NetEnrollError::Transport(e.to_string()))?;
 
-    let bundle = enroll_over_network(&lighthouse, port, &pinned_fp, &csr_json).await?;
+    // XPA-11 — retry transient transport errors (timeout / connection); fail
+    // fast on deterministic ones (pin mismatch, HTTP refusal, bad bundle).
+    let mut last_err: Option<NetEnrollError> = None;
+    let mut bundle: Option<NebulaBundle> = None;
+    for attempt in 1..=ENROLL_ATTEMPTS {
+        match enroll_over_network(&lighthouse, port, &pinned_fp, &csr_json).await {
+            Ok(b) => {
+                bundle = Some(b);
+                break;
+            }
+            Err(NetEnrollError::Transport(e)) if attempt < ENROLL_ATTEMPTS => {
+                tracing::warn!(attempt, error = %e, "enroll transport failed; retrying");
+                last_err = Some(NetEnrollError::Transport(e));
+                tokio::time::sleep(ENROLL_RETRY_BACKOFF).await;
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    let bundle = bundle.ok_or_else(|| {
+        last_err.unwrap_or_else(|| NetEnrollError::Transport("enroll failed".into()))
+    })?;
 
     persist_bundle(workgroup_root, config_dir, node_id, &bundle)?;
     Ok(bundle)
