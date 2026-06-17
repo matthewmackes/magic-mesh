@@ -347,6 +347,9 @@ assets = [
     # NOTIFY-4 — the transient toast layer (mde-workbench src/bin/mde-notify-toast.rs).
     # Autostarted (Workstation-rank gated) via packaging/autostart/*.desktop glob.
     { source = "target/release/mde-notify-toast",   dest = "/usr/bin/mde-notify-toast",   mode = "755" },
+    # NOTIFY-SRC-2 — session-bus monitor that captures desktop-app (Firefox etc.)
+    # notifications into the bus fdo/* lane. Autostarted (Workstation-rank gated).
+    { source = "target/release/mde-notify-capture", dest = "/usr/bin/mde-notify-capture", mode = "755" },
     { source = "target/release/mde-voice-hud",      dest = "/usr/bin/mde-voice-hud",      mode = "755" },
     { source = "target/release/mde-music",          dest = "/usr/bin/mde-music",          mode = "755" },
     { source = "target/release/mde-musicd",         dest = "/usr/bin/mde-musicd",         mode = "755" },
