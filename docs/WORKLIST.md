@@ -874,7 +874,7 @@ The NOTIFY epic shipped the panel/format + (now) federation, but most alert SOUR
 
 ## HA — QNM-Shared shadow master + 2-lighthouse minimum (design: docs/design/ha-shadow-master.md; locked 2026-06-17)
 Prompted by the QNM master SPOF outage. Master `45.55.33.179` (10.42.0.1) + shadow `159.65.183.51` (10.42.0.2), auto fenced failover over a floating overlay VIP. All §6-clean (mackesd worker + setup helpers); the panel is Carbon §4.
-- [ ] **HA-6: shrink the lighthouse `/tmp` tmpfs (reclaim master RAM headroom).** *(do now — pairs with the netdata gate)*
+- [✓] **HA-6: lighthouse `/tmp` tmpfs shrunk to 128M (2026-06-17).** Both 947 MB lighthouses: `tmp.mount` drop-in `Options=…size=128M` + live remount → /tmp 474M→128M, freed ~350 MB so a heavy transient can't OOM mfsmaster. Master verified UP through the remount. *(persistent via the drop-in.)* Original:
   **Acceptance:** both 947 MB lighthouses have `/tmp` sized to ~128 MB (persistent via fstab/tmpfiles), freeing ~350 MB usable RAM so a heavy transient can't OOM the master; verified `df -h /tmp` + survives reboot.
 - [ ] **HA-1: shadow-master substrate — configure the 2nd lighthouse as LizardFS `PERSONALITY=shadow` + metalogger.**
   **As** an operator, **I want** a live metadata standby, **so that** the master is no longer a hard SPOF.

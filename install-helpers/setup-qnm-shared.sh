@@ -26,9 +26,10 @@ set -euo pipefail
 # daemon AND the uid-1000 desktop GUIs share one volume — /root/QNM-Shared is
 # unreadable to the GUI because /root is 0750. Pin MDE_WORKGROUP_ROOT to this.
 MASTER_IP=10.42.0.1; LISTEN=""; QNM_PATH=/mnt/mesh-storage; GOAL=2
-DO_MASTER=0; DO_CHUNK=0; DO_CLIENT=0
+DO_MASTER=0; DO_CHUNK=0; DO_CLIENT=0; DO_SHADOW=0
 while [ $# -gt 0 ]; do case "$1" in
   --master) DO_MASTER=1; shift;;
+  --shadow) DO_SHADOW=1; shift;;
   --chunkserver) DO_CHUNK=1; shift;;
   --client) DO_CLIENT=1; shift;;
   --master-ip) MASTER_IP="$2"; shift 2;;
@@ -37,7 +38,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --goal) GOAL="$2"; shift 2;;
   *) echo "unknown arg: $1" >&2; exit 1;;
 esac; done
-[ "$DO_MASTER$DO_CHUNK$DO_CLIENT" = "000" ] && { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+[ "$DO_MASTER$DO_SHADOW$DO_CHUNK$DO_CLIENT" = "0000" ] && { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 LISTEN="${LISTEN:-$MASTER_IP}"
 log() { echo "==> $*"; }
 
@@ -71,6 +72,49 @@ EOF
   systemctl daemon-reload
   systemctl reset-failed lizardfs-master 2>/dev/null || true
   systemctl enable --now lizardfs-master
+fi
+
+# ---- shadow master (HA-1) -------------------------------------------------
+# A live metadata standby: lizardfs-master with PERSONALITY=shadow streams the
+# metadata from the real master + a metalogger keeps a cold backup. On master
+# loss the HA worker (HA-3) promotes this node (personality→master + claim the
+# VIP), fenced by the QNM leader-lease. Runs alongside the chunkserver (Q8). The
+# QNM-Shared master is otherwise a SPOF (2026-06-17 outage) — this removes it.
+if [ "$DO_SHADOW" = 1 ]; then
+  log "lizardfs shadow master -> master $MASTER_IP, listen $LISTEN"
+  cat > /etc/mfs/mfsmaster.cfg <<EOF
+PERSONALITY = shadow
+DATA_PATH = /var/lib/mfs
+MASTER_HOST = $MASTER_IP
+MATOML_LISTEN_HOST = $LISTEN
+MATOCS_LISTEN_HOST = $LISTEN
+MATOCL_LISTEN_HOST = $LISTEN
+EOF
+  echo "10.42.0.0/16    /    rw,alldirs,maproot=0" > /etc/mfs/mfsexports.cfg
+  : > /etc/mfs/mfsgoals.cfg; : > /etc/mfs/mfstopology.cfg
+  [ -s /var/lib/mfs/metadata.mfs ] || cp -a /var/lib/mfs/metadata.mfs.empty /var/lib/mfs/metadata.mfs
+  # Metalogger — a cold metadata backup pulled from the master.
+  cat > /etc/mfs/mfsmetalogger.cfg <<EOF
+MASTER_HOST = $MASTER_IP
+DATA_PATH = /var/lib/mfs
+EOF
+  chown -R mfs:mfs /var/lib/mfs /etc/mfs/mfs*.cfg 2>/dev/null || true
+  mkdir -p /etc/systemd/system/lizardfs-master.service.d
+  cat > /etc/systemd/system/lizardfs-master.service.d/10-mesh.conf <<EOF
+[Unit]
+After=nebula.service
+Wants=nebula.service
+[Service]
+# A shadow refusing to start on a stale lock would leave the mesh without HA.
+ExecStartPre=-/bin/sh -c 'rm -f /var/lib/mfs/.mfsmaster.lock /var/lib/mfs/metadata.mfs.lock'
+Restart=on-failure
+RestartSec=5
+EOF
+  systemctl daemon-reload
+  systemctl reset-failed lizardfs-master 2>/dev/null || true
+  systemctl enable --now lizardfs-master
+  systemctl enable --now lizardfs-metalogger 2>/dev/null \
+    || log "WARN: lizardfs-metalogger unit absent (install lizardfs-metalogger; F44: the F43 RPM)"
 fi
 
 # ---- chunkserver ----------------------------------------------------------
