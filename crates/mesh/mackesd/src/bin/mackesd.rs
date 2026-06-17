@@ -6790,6 +6790,65 @@ fn run_serve(
                 tracing::warn!(error = %e, "VOIP gateway Bus responder: bus persist open failed; skipped");
             }
         }
+        // APPS-1 — the apps_aggregator: serves action/apps/list (the unified
+        // launchable-entry list for the Applications Panel launcher). Thin applet
+        // (Q24): this root daemon is the single source of truth, aggregating local
+        // XDG+flatpak apps, mesh peers' apps (PD-2 directory), workloads (compute
+        // inventory), and published services. Own OS thread (Persist isn't Send).
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let home = std::env::var_os("HOME")
+                    .map_or_else(|| PathBuf::from("/root"), PathBuf::from);
+                let node_id = local_hostname();
+                let apps_svc =
+                    mackesd_core::ipc::apps::AppsService::new(&workgroup_root, &node_id, &home);
+                let dir_root = workgroup_root.clone();
+                let dir_db = db_path.clone();
+                let inv_node = default_node_id();
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("apps-bus-responder".into())
+                    .spawn(move || {
+                        let dir_doc = move || {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| d.as_millis() as u64);
+                            mackesd_core::ipc::directory::DirectoryService::new(
+                                &dir_root,
+                                Some(dir_db.clone()),
+                            )
+                            .build_directory(now)
+                        };
+                        let inv_doc =
+                            move || mackesd_core::ipc::apps::read_local_inventory(&inv_node);
+                        mackesd_core::ipc::apps::serve_bus(
+                            &persist,
+                            &apps_svc,
+                            dir_doc,
+                            inv_doc,
+                            || resp_shutdown.load(Ordering::Relaxed),
+                        );
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "APPS aggregator Bus responder spawned; serving action/apps/list"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "APPS aggregator Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("apps_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "APPS aggregator Bus responder: bus persist open failed; skipped");
+            }
+        }
         // E0.3.1.b — the Nebula signal dispatcher drains worker
         // NebulaSignal events onto the Bus event topic
         // (event/nebula/signals) + fills nebula_signal_slot so the

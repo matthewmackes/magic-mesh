@@ -891,7 +891,7 @@ Prompted by the QNM master SPOF outage. Master `45.55.33.179` (10.42.0.1) + shad
 
 ## APPS — re-envisioned Applications Panel / Magic-Mesh launcher (design: docs/design/apps-launcher.md; locked 2026-06-17)
 Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in `mde-cosmic-applet`, fed by a `mackesd` aggregator. **MVP = full mesh from day one** (Q25). All tasks `mde-theme` Carbon (§4); thin applet + mackesd worker (§6 boundary).
-- [ ] **APPS-1: mackesd `apps_aggregator` worker + `action/apps/list`.**
+- [✓] **APPS-1: mackesd `apps_aggregator` worker + `action/apps/list`.**
   **As** an operator, **I want** one bus verb that returns the unified launchable-entry list, **so that** the applet stays a thin renderer (Q24).
   **Acceptance:** `action/apps/list` returns local XDG `.desktop` + flatpak apps, mesh peers' published apps (PD-2 directory descriptors, Q17), workloads (podman + libvirt, local+peer), and published services — each tagged with kind/source/node/health; cached + refresh-on-open; unit-tested aggregation.
 - [ ] **APPS-2: launcher dropdown in `mde-cosmic-applet` (grid glyph + tabbed body).**

@@ -23,6 +23,10 @@
 // rest of the crate's missing_docs hygiene stays loud.
 #![allow(missing_docs)]
 
+// APPS-1 — the apps_aggregator: action/apps/list for the Applications Panel
+// launcher (docs/design/apps-launcher.md). Thin applet; this worker is the
+// single source of truth (local XDG+flatpak, mesh peers, workloads, services).
+pub mod apps;
 pub mod bus_bridge;
 pub mod directory;
 pub mod files;
