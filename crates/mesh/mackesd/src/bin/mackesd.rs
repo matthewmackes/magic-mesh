@@ -5911,6 +5911,20 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("firewall_monitor".into());
 
+        // NOTIFY-SRC — SELinux AVC denials → the security alert lane. Without
+        // this the Alert Center never showed SELinux alerts (no source published
+        // them). auditd captures AVCs to audit.log, so the worker scrapes them
+        // via `ausearch --checkpoint` and publishes distinct denials to
+        // fleet/sec/selinux/<host>; the NOTIFY-DIST-2 mirror federates them.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::selinux_monitor::SelinuxMonitorWorker::new(fw_host.clone()),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("selinux_monitor".into());
+
         // VIRT-1 (v5.0.0) — unified KVM + Podman compute inventory.
         // Polls virsh + podman every 10 s and publishes the per-peer
         // inventory to `compute/inventory/<peer-nebula-addr>` per

@@ -233,6 +233,8 @@ pub mod meshfs_worker;
 // trims 7-day window, and fires Bus alert on threshold.
 // Separate from `firewall_preset` (port-open convergence).
 pub mod firewall_monitor;
+/// NOTIFY-SRC — SELinux AVC denials → the `fleet/sec/selinux/<host>` alert lane.
+pub mod selinux_monitor;
 // VIRT-1 (v5.0.0) — unified KVM + Podman compute inventory.
 // Polls `virsh list --all --uuid` + `virsh dominfo`/`domblklist`/
 // `domstats` for KVM guests and `podman ps`/`podman stats` for
