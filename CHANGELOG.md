@@ -38,10 +38,28 @@ starts at the first packaged release line.
 - **Lighthouse `/tmp` shrink (HA-6):** both lighthouse `/tmp` tmpfs sized down to
   128 MB so a heavy transient can't OOM the master (pairs with the netdata gate).
 
+- **Mesh-shared cover art (MUSIC-ART-SYNC):** cover art is now pulled down once
+  and shared across the whole mesh. `mackesd` provisions a communal
+  `<mesh-storage>/music/artwork` cache (0777) on QNM-Shared; `mde-musicd`
+  reads-through / writes-through it, so art fetched by any node is reused
+  mesh-wide and keeps rendering even when a node can't reach the Airsonic
+  server. Falls back to a direct fetch when the mount is absent.
+
 ### Fixed
 - **Notification CLI fan-out (NOTIFY-DIST-3):** `mde-bus publish` now flattens
   hierarchical topics (slashes → `_`) before the ntfy POST, so CLI-published
   alerts reach the broker on the same topic the subscribers watch.
+- **Music: silent playback + missing artwork (MUSIC-RAWVER):** the Airsonic API
+  version negotiation ran only on the JSON path; the raw-byte fetches (the
+  playback stream + cover art) hit the server at the version ceiling and got an
+  error-30 JSON body in place of media (played but silent, no art) against a
+  server that caps below the ceiling. The negotiated version is now persisted and
+  every client — including the playback engine's stream URL — seeds from it;
+  cover-art fetches also self-heal on an error envelope.
+- **Music: window locks up browsing folders (MUSIC-ARTGATE):** the album/folder
+  grid fanned out one cover-art request per item, so a 200+-item folder
+  stampeded the single-threaded music daemon + the shared bus and froze the
+  window. Concurrent art fetches are now bounded by a semaphore.
 
 ## [10.0.13] - 2026-06-17
 
