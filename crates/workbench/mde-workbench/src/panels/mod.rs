@@ -56,6 +56,8 @@ pub mod resources;
 pub mod routing;
 pub mod run_history;
 pub mod service_publishing;
+/// VOIP-GW-1 — the mesh-wide SIP outbound gateway settings panel.
+pub mod sip_gateway;
 pub mod snapshots;
 pub mod sparkline;
 pub mod sync_status;

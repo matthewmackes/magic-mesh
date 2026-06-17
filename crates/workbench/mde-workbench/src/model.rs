@@ -224,6 +224,7 @@ pub fn nav_model() -> Vec<NavEntry> {
                 // Mesh-relevant peer/device services kept here (Q2 exception).
                 Panel::new("connect", "Connected Devices"),
                 Panel::new("music", "Music"),
+                Panel::new("sip_gateway", "SIP Gateway"),
             ],
         },
         // ── MESH: PROVISIONING — enrollment + federation (operator 2026-06-16):

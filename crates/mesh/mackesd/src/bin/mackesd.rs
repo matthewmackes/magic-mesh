@@ -6752,6 +6752,44 @@ fn run_serve(
                 );
             }
         }
+        // VOIP-GW-1 — the mesh-wide SIP outbound gateway responder
+        // (action/voip/{set-gateway,get-gateway,clear-gateway}). The root
+        // daemon is the only writer with access to the QNM-Shared mount, so the
+        // Workbench panel sets the gateway through here; it lands at
+        // <workgroup_root>/voip/gateway.toml in the voice agent's account.toml
+        // shape and replicates to every node. Own OS thread (Persist isn't Send).
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let voip_svc = mackesd_core::ipc::voip::VoipService::new(&workgroup_root);
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("voip-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::voip::serve_bus(&persist, &voip_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "VOIP gateway Bus responder spawned; serving \
+                             action/voip/{{set-gateway,get-gateway,clear-gateway}}"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "VOIP gateway Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("voip_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "VOIP gateway Bus responder: bus persist open failed; skipped");
+            }
+        }
         // E0.3.1.b — the Nebula signal dispatcher drains worker
         // NebulaSignal events onto the Bus event topic
         // (event/nebula/signals) + fills nebula_signal_slot so the

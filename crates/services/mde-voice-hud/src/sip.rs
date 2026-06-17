@@ -60,9 +60,25 @@ impl SipAccount {
             .join("account.toml")
     }
 
-    /// Load the account, or `None` when no account file is present (the honest
-    /// single-node state → the HUD shows "Not registered").
+    /// The mesh-wide gateway file on QNM-Shared (`<workgroup_root>/voip/gateway.toml`),
+    /// written by the Workbench SIP Gateway panel via mackesd (VOIP-GW-1). Same
+    /// `account.toml` shape, so it parses with [`from_toml`](Self::from_toml).
+    #[must_use]
+    pub fn mesh_gateway_path() -> std::path::PathBuf {
+        mackes_mesh_types::peers::default_workgroup_root()
+            .join("voip")
+            .join("gateway.toml")
+    }
+
+    /// Load the account: the **mesh-wide** gateway (QNM-Shared, set once in the
+    /// Workbench for all clients) wins, then a node-local `account.toml`, else
+    /// `None` (P2P-only — the HUD shows "Not registered"). VOIP-GW-1.
     pub fn load() -> Option<SipAccount> {
+        if let Ok(text) = std::fs::read_to_string(Self::mesh_gateway_path()) {
+            if let Ok(acct) = Self::from_toml(&text) {
+                return Some(acct);
+            }
+        }
         let text = std::fs::read_to_string(Self::config_path()).ok()?;
         Self::from_toml(&text).ok()
     }

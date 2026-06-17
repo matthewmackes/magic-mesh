@@ -42,6 +42,7 @@ pub mod nebula;
 // name + `/org/mackes/Session` path were removed with it.
 pub mod settings;
 pub mod shell;
+pub mod voip;
 
 /// EFF-23 — maximum inbound RPC body size a Bus responder will hand to
 /// `serde_json::from_str`. Bodies above this are answered with an error

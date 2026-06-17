@@ -38,9 +38,9 @@ use crate::panels::{
     registration as registration_panel, remote_desktop as remote_desktop_panel,
     repair as repair_panel, resources as resources_panel, routing as routing_panel,
     run_history as run_history_panel, service_publishing as service_publishing_panel,
-    snapshots as snapshots_panel, sync_status as sync_status_panel,
-    system_update as system_update_panel, tags as tags_panel, vpn as vpn_panel,
-    wallpaper as wallpaper_panel, wifi as wifi_panel,
+    sip_gateway as sip_gateway_panel, snapshots as snapshots_panel,
+    sync_status as sync_status_panel, system_update as system_update_panel, tags as tags_panel,
+    vpn as vpn_panel, wallpaper as wallpaper_panel, wifi as wifi_panel,
 };
 use crate::patternfly::{breadcrumb, page_subtitle, page_title};
 use crate::sidebar::SidebarState;
@@ -132,6 +132,7 @@ pub enum Message {
     LaunchApp(&'static str),
     /// AIR-20 — Devices → Music settings panel sub-message.
     Music(music_panel::Message),
+    VoipGateway(sip_gateway_panel::Message),
     /// CB-1.5.a — Fleet inventory panel sub-message.
     Inventory(inventory_panel::Message),
     /// PLANES-5 — hardware inventory (replicated PeerProbe) sub-message.
@@ -241,6 +242,7 @@ pub struct App {
     backend: Arc<dyn Backend>,
     notifications: notifications_panel::NotificationsPanel,
     music: music_panel::MusicPanel,
+    sip_gateway: sip_gateway_panel::SipGatewayPanel,
     /// v4.0.1 WB-1 — Connected Devices panel state. Hosts the
     /// paired-peer list + per-row action handlers.
     connect: connect_panel::ConnectPanel,
@@ -351,6 +353,7 @@ impl App {
             backend,
             notifications: notifications_panel::NotificationsPanel::new(),
             music: music_panel::MusicPanel::new(),
+            sip_gateway: sip_gateway_panel::SipGatewayPanel::new(),
             connect: connect_panel::ConnectPanel::new(),
             home: home_panel::HomePanel::new(),
             hub: hub_panel::HubPanel::new(),
@@ -730,6 +733,7 @@ impl App {
                 Task::none()
             }
             Message::Music(msg) => self.music.update(msg),
+            Message::VoipGateway(msg) => self.sip_gateway.update(msg),
             Message::Inventory(msg) => self.inventory.update(msg),
             Message::Hardware(msg) => self.hardware.update(msg),
             Message::Jobs(msg) => self.jobs.update(msg),
@@ -819,6 +823,7 @@ impl App {
             "wallpaper" => wallpaper_panel::WallpaperPanel::load(self.backend()),
             "notifications" => notifications_panel::NotificationsPanel::load(self.backend()),
             "music" => music_panel::MusicPanel::load(),
+            "sip_gateway" => sip_gateway_panel::SipGatewayPanel::load(),
             // v4.0.1 WB-1 (Phase 0.7 rescue): Connected Devices
             // panel. Real D-Bus subscription wiring chains on
             // KDC2-3.9 signals; the panel.load() returns
@@ -1078,6 +1083,10 @@ impl App {
                 ..
             } => self.notifications.view(),
             View::Panel { panel: "music", .. } => self.music.view(),
+            View::Panel {
+                panel: "sip_gateway",
+                ..
+            } => self.sip_gateway.view(),
             View::Panel {
                 panel: "connect", ..
             } => self.connect.view(),
