@@ -175,6 +175,12 @@ enum Message {
     OpenCard(HubCard),
     /// Jump to a breadcrumb segment (0 = Library root).
     Ascend(usize),
+    /// MUSIC-NAV — go up one breadcrumb level (Back).
+    Back,
+    /// MUSIC-NAV — jump to the Library root (Home).
+    Home,
+    /// MUSIC-NAV — quit the app (the window has no title-bar chrome).
+    Exit,
     /// A category fetch resolved.
     ItemsLoaded(Vec<LibraryItem>),
     /// A category fetch failed (daemon down / no server).
@@ -433,6 +439,19 @@ impl State {
                 self.nav.ascend_to(index);
                 Task::none()
             }
+            Message::Back => {
+                // Up one breadcrumb level; at root this is a no-op.
+                let depth = self.nav.breadcrumb().len();
+                if depth > 1 {
+                    self.nav.ascend_to(depth - 2);
+                }
+                Task::none()
+            }
+            Message::Home => {
+                self.nav.ascend_to(0);
+                Task::none()
+            }
+            Message::Exit => std::process::exit(0),
             Message::UrlChanged(s) => {
                 if let Some(f) = &mut self.form {
                     f.url = s;
@@ -949,12 +968,31 @@ impl State {
             .on_input(Message::SearchInput)
             .padding(8)
             .width(Length::Fixed(340.0));
+        // MUSIC-NAV — the window has no title-bar chrome, so the header carries
+        // explicit Back / Home controls (left) and an Exit control (right) the
+        // operator asked for, alongside the connection line + search.
+        let at_root = self.nav.breadcrumb().len() <= 1;
+        let nav_btn = |glyph: &str| button(text(glyph.to_string()).size(13)).padding([4, 8]);
+        let back: Element<'_, Message> = if at_root {
+            nav_btn("‹ Back").into()
+        } else {
+            nav_btn("‹ Back").on_press(Message::Back).into()
+        };
+        let home: Element<'_, Message> = if at_root {
+            nav_btn("⌂ Home").into()
+        } else {
+            nav_btn("⌂ Home").on_press(Message::Home).into()
+        };
         let header = row![
+            back,
+            home,
             text(&self.connection).size(13),
             Space::new().width(Length::Fill),
             search_field,
+            nav_btn("✕ Exit").on_press(Message::Exit),
         ]
-        .spacing(12);
+        .spacing(12)
+        .align_y(cosmic::iced::Alignment::Center);
 
         let mut page_col = column![
             header,
