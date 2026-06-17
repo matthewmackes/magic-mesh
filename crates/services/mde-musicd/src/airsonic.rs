@@ -43,6 +43,73 @@ const ERR_INCOMPATIBLE_VERSION: i64 = 30;
 /// essentially every Subsonic-era server (Subsonic 5.3+).
 const FALLBACK_API_VERSION: &str = "1.13.0";
 
+/// AIR — persisted negotiated `v=`. The negotiation in [`Client::get`] only runs
+/// on the JSON path; the RAW-byte fetches (the playback `stream` URL + cover-art
+/// bytes) build URLs from [`Client::api_version`] and never self-negotiate, and
+/// the serve loop builds a FRESH `Client` (version reset to the ceiling) on every
+/// poll sweep. So a server that caps below our ceiling would serve error-30 JSON
+/// in place of audio/image bytes forever — "plays but silent, no artwork" (live
+/// 2026-06-17). Persisting the negotiated version to this file (sibling of the
+/// creds) lets every freshly-built client — including the engine's stream URL —
+/// SEED at the last-known-good version, so audio + art work on the first try and
+/// across daemon restarts.
+const VERSION_REL_PATH: &str = ".local/share/mde/airsonic-api-version";
+
+/// Path of the persisted negotiated API version (`$HOME/<VERSION_REL_PATH>`,
+/// `/root` when `$HOME` is unset — matching [`crate::creds::default_path`]).
+fn version_file_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    std::path::Path::new(&home).join(VERSION_REL_PATH)
+}
+
+/// Read the persisted negotiated version, if a valid one was written. Returns
+/// `None` (→ seed at the ceiling) when absent/empty/malformed.
+fn read_persisted_version() -> Option<String> {
+    let raw = std::fs::read_to_string(version_file_path()).ok()?;
+    let v = raw.trim();
+    // Guard against junk: must look like a dotted version no newer than our ceiling.
+    if v.is_empty() || cmp_version(v, API_VERSION) == std::cmp::Ordering::Greater {
+        return None;
+    }
+    Some(v.to_string())
+}
+
+/// Persist the negotiated version (best-effort; a write failure just means the
+/// next client re-negotiates). Creates the parent dir if needed.
+fn write_persisted_version(v: &str) {
+    let path = version_file_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, v);
+}
+
+/// If `bytes` is a Subsonic error-30 envelope (a capped server answering a
+/// raw-byte endpoint with JSON instead of media), return the server's reported
+/// `version` (falling back to the conservative version when omitted). `None`
+/// when the bytes are real media (not JSON) or a different/no error.
+fn error30_server_version(bytes: &[u8]) -> Option<String> {
+    // Cheap guard: media bytes won't start with a JSON object brace.
+    let first = bytes.iter().find(|b| !b.is_ascii_whitespace())?;
+    if *first != b'{' {
+        return None;
+    }
+    let v: Value = serde_json::from_slice(bytes).ok()?;
+    let resp = v.get("subsonic-response")?;
+    let code = resp
+        .get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(Value::as_i64);
+    if code != Some(ERR_INCOMPATIBLE_VERSION) {
+        return None;
+    }
+    Some(
+        resp.get("version")
+            .and_then(Value::as_str)
+            .map_or_else(|| FALLBACK_API_VERSION.to_string(), str::to_string),
+    )
+}
+
 /// Compare two dotted Subsonic versions (`"1.16.1"`); returns `Ordering` on the
 /// numeric components (missing components count as 0). Non-numeric components sort
 /// as 0 so a malformed version never panics.
@@ -284,7 +351,12 @@ impl Client {
             token: auth_token(password, salt),
             salt: salt.to_string(),
             http: Self::build_http_client(),
-            version: std::sync::Mutex::new(API_VERSION.to_string()),
+            // Seed at the last-known-good negotiated version so the RAW-byte
+            // fetches (stream/cover-art) hit a working `v=` immediately, not the
+            // ceiling that a capped server would reject with error 30.
+            version: std::sync::Mutex::new(
+                read_persisted_version().unwrap_or_else(|| API_VERSION.to_string()),
+            ),
         }
     }
 
@@ -397,6 +469,12 @@ impl Client {
                         }
                     })
                     .unwrap_or(false);
+                if changed {
+                    // Persist so the next freshly-built client (and the engine's
+                    // stream URL) seeds at this version — fixes silent audio /
+                    // missing art that the JSON-only retry never reached.
+                    write_persisted_version(&server_v);
+                }
                 if changed {
                     // Retry with the negotiated version (it sticks for later calls).
                     let body2 = self.fetch_body(view, extra).await?;
@@ -547,6 +625,36 @@ impl Client {
     /// # Errors
     /// Transport / HTTP-status failures.
     pub async fn get_cover_art_bytes(&self, cover_id: &str) -> Result<Vec<u8>, AirsonicError> {
+        let bytes = self.fetch_cover_bytes(cover_id).await?;
+        // A capped server answers getCoverArt with HTTP 200 but an error-30 JSON
+        // envelope INSTEAD of image bytes (no art renders). The byte path skips
+        // the JSON negotiation in `get`, so detect that envelope here, negotiate
+        // the version down from it (persisting for the stream path too), and
+        // refetch ONCE at the working version.
+        if let Some(server_v) = error30_server_version(&bytes) {
+            let target = min_version(&server_v, API_VERSION);
+            let changed = self
+                .version
+                .lock()
+                .map(|mut cur| {
+                    if *cur != target {
+                        *cur = target.clone();
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            if changed {
+                write_persisted_version(&target);
+                return self.fetch_cover_bytes(cover_id).await;
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// Raw GET of the cover-art URL at the current `v=` (no envelope handling).
+    async fn fetch_cover_bytes(&self, cover_id: &str) -> Result<Vec<u8>, AirsonicError> {
         let url = self.cover_art_url(cover_id);
         let resp = self
             .http
@@ -948,6 +1056,51 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error30_envelope_detected_in_raw_bytes() {
+        // A capped server answers a raw-byte endpoint (cover art / stream) with
+        // an error-30 JSON envelope instead of media — detect it + read the
+        // server's version so the byte path can negotiate down.
+        let env = br#"{"subsonic-response":{"status":"failed","version":"1.15.0",
+            "error":{"code":30,"message":"Server must upgrade."}}}"#;
+        assert_eq!(error30_server_version(env), Some("1.15.0".to_string()));
+        // Omitted version → conservative fallback.
+        let no_ver = br#"{"subsonic-response":{"status":"failed",
+            "error":{"code":30}}}"#;
+        assert_eq!(
+            error30_server_version(no_ver),
+            Some(FALLBACK_API_VERSION.to_string())
+        );
+    }
+
+    #[test]
+    fn error30_detector_passes_through_real_media() {
+        // Real image bytes (PNG magic) are not a JSON envelope → no negotiation.
+        let png = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 1, 2, 3];
+        assert_eq!(error30_server_version(&png), None);
+        // A *successful* JSON envelope (different endpoint) must not trigger it.
+        let ok = br#"{"subsonic-response":{"status":"ok","version":"1.15.0"}}"#;
+        assert_eq!(error30_server_version(ok), None);
+        // A non-30 error (e.g. wrong password, code 40) must not trigger it.
+        let other = br#"{"subsonic-response":{"status":"failed","version":"1.16.1",
+            "error":{"code":40,"message":"Wrong username or password."}}}"#;
+        assert_eq!(error30_server_version(other), None);
+    }
+
+    #[test]
+    fn persisted_version_roundtrip_rejects_too_new() {
+        // read_persisted_version refuses a value newer than our ceiling (junk
+        // guard): cmp against API_VERSION.
+        assert_eq!(
+            cmp_version("1.99.0", API_VERSION),
+            std::cmp::Ordering::Greater
+        );
+        assert_ne!(
+            cmp_version(FALLBACK_API_VERSION, API_VERSION),
+            std::cmp::Ordering::Greater
+        );
+    }
 
     #[test]
     fn parse_lyrics_structured_and_classic() {
