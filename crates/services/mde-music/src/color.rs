@@ -14,6 +14,16 @@ use base64::Engine;
 
 use crate::album::{req, with_bus};
 
+/// MUSIC-ARTGATE — bound concurrent cover-art bus round-trips. The album/folder
+/// grid fans out ONE `fetch_cover_art` per visible item; a 200+-item folder
+/// would otherwise fire 200+ simultaneous `spawn_blocking` tasks, each opening a
+/// SQLite handle on the shared `/run/mde-bus` index and waiting up to 5 s on the
+/// single-threaded daemon — exhausting the blocking pool + stampeding the bus,
+/// which froze the window while browsing (live 2026-06-17). Acquiring a permit
+/// before each round-trip caps in-flight fetches; the rest await cheaply (no
+/// blocking thread held) and complete as permits free.
+static ART_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
 /// The fallback accent when extraction fails / can't meet contrast —
 /// the canonical MDE indigo accent, single-sourced from the design
 /// palette (`mde_theme::Palette::dark().accent`) so there is no
@@ -89,6 +99,13 @@ pub fn extract(bytes: &[u8]) -> Option<((u8, u8, u8), (u8, u8, u8))> {
 /// # Errors
 /// Bus-store / request / timeout failures.
 pub async fn fetch_cover_art(cover_id: String) -> Result<Vec<u8>, String> {
+    // MUSIC-ARTGATE — hold a permit for the whole round-trip so no more than
+    // ART_GATE permits of cover-art fetches hit the bus/daemon at once. The
+    // permit drops when `_permit` goes out of scope at the end of the fn.
+    let _permit = ART_GATE
+        .acquire()
+        .await
+        .map_err(|e| format!("art gate closed: {e}"))?;
     with_bus(move |p, rt| {
         let reply = req(p, rt, "action/music/get-cover-art", Some(&cover_id))?;
         let v: serde_json::Value = serde_json::from_str(&reply).map_err(|e| e.to_string())?;

@@ -23,6 +23,71 @@ use serde::{Deserialize, Serialize};
 /// Default cache cap: 10 GiB (Q27 — settings-adjustable).
 pub const DEFAULT_CAP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
+/// MUSIC-ART-SYNC — the communal cover-art cache on the QNM-Shared mount. mackesd
+/// (root) provisions `<mount>/music/artwork` 0777; musicd reads-through /
+/// writes-through it so cover art pulled by ANY node is reused mesh-wide (one
+/// Airsonic fetch, every node references the same image — and art keeps working
+/// when a node can't reach the server). Overridable for tests / non-standard
+/// mounts via `MDE_MESH_ARTWORK_DIR`.
+const ARTWORK_DIR_ENV: &str = "MDE_MESH_ARTWORK_DIR";
+const DEFAULT_ARTWORK_DIR: &str = "/mnt/mesh-storage/music/artwork";
+
+/// The communal artwork dir IF it currently exists (the mount is up + mackesd
+/// provisioned it). `None` → fall back to a direct Airsonic fetch (no sharing).
+#[must_use]
+pub fn artwork_dir() -> Option<PathBuf> {
+    let dir = std::env::var(ARTWORK_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_ARTWORK_DIR));
+    dir.is_dir().then_some(dir)
+}
+
+/// Sanitize a Subsonic coverArt id into a safe single-path-component filename
+/// (ids look like `al-12017` / `12017` / `pl-3`; never trust them as paths).
+#[must_use]
+pub fn artwork_filename(cover_id: &str) -> String {
+    let safe: String = cover_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe.is_empty() {
+        "_".to_string()
+    } else {
+        safe
+    }
+}
+
+/// Read cached cover-art bytes from the communal mesh cache, if present + the
+/// file is non-empty. `None` → not cached (or no mount) → caller fetches.
+#[must_use]
+pub fn read_shared_artwork(cover_id: &str) -> Option<Vec<u8>> {
+    let path = artwork_dir()?.join(artwork_filename(cover_id));
+    let bytes = std::fs::read(path).ok()?;
+    (!bytes.is_empty()).then_some(bytes)
+}
+
+/// Write pulled-down cover-art bytes to the communal mesh cache (best-effort; a
+/// failure — no mount, read-only, race — just means no sharing this time).
+/// Writes to a temp sibling + renames so a concurrent reader never sees a
+/// half-written image.
+pub fn write_shared_artwork(cover_id: &str, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let Some(dir) = artwork_dir() else { return };
+    let name = artwork_filename(cover_id);
+    let tmp = dir.join(format!(".{name}.tmp"));
+    if std::fs::write(&tmp, bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, dir.join(name));
+    }
+}
+
 /// One cached track.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheEntry {
@@ -184,6 +249,38 @@ pub fn human_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn artwork_filename_sanitizes_unsafe_chars() {
+        assert_eq!(artwork_filename("al-12017"), "al-12017");
+        assert_eq!(artwork_filename("12017"), "12017");
+        // Path separators / traversal collapse to underscores (no escape).
+        assert_eq!(artwork_filename("../../etc/passwd"), "______etc_passwd");
+        assert_eq!(artwork_filename("a b/c"), "a_b_c");
+        assert_eq!(artwork_filename(""), "_");
+    }
+
+    #[test]
+    fn shared_artwork_round_trip_and_absent_dir() {
+        // ONE test owns the process-global env override (no parallel race).
+        // Absent dir → no cache.
+        std::env::set_var(super::ARTWORK_DIR_ENV, "/nonexistent-artwork-dir-xyz-123");
+        assert!(artwork_dir().is_none());
+        assert!(read_shared_artwork("any").is_none());
+        write_shared_artwork("any", b"bytes"); // best-effort no-op, must not panic
+
+        // Real dir → write-through then read-through round-trips.
+        let dir = tempdir().expect("tmp");
+        std::env::set_var(super::ARTWORK_DIR_ENV, dir.path());
+        let bytes = b"\xff\xd8\xff\xe0JFIF-ish-bytes".to_vec();
+        write_shared_artwork("al-99", &bytes);
+        assert_eq!(read_shared_artwork("al-99"), Some(bytes));
+        // A miss returns None; empty writes never poison the cache.
+        assert_eq!(read_shared_artwork("al-missing"), None);
+        write_shared_artwork("al-empty", &[]);
+        assert_eq!(read_shared_artwork("al-empty"), None);
+        std::env::remove_var(super::ARTWORK_DIR_ENV);
+    }
 
     fn idx(rows: &[(&str, u64, u64, bool)]) -> CacheIndex {
         let mut i = CacheIndex::default();

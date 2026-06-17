@@ -174,6 +174,35 @@ pub fn desktop_user_homes() -> Vec<PathBuf> {
 /// human-readable failure lines (empty ⇒ all binds satisfied) so the
 /// caller can surface them **loudly** — a silent debug log is exactly
 /// how AUDIT-MESH-15 hid (the ONBOARD-6 failure class).
+/// MUSIC-ART-SYNC — provision the communal cover-art cache dir on the mesh
+/// mount (`<mount>/music/artwork`, mode 0777). `mde-musicd` runs as the desktop
+/// user, but the LizardFS mount is root-owned; this root-side worker creates a
+/// world-writable cache dir there so any node's musicd can WRITE pulled-down art
+/// and every node READS the same cached images (one Airsonic pull, mesh-wide
+/// reuse, and art works even when a node can't reach the server). Returns a loud
+/// failure line on error (never silently no-ops — the ONBOARD-6 lesson), `None`
+/// on success. Pure path math + fs; the mount-writable gate is the caller's.
+#[must_use]
+pub fn ensure_music_artwork_dir(mount_path: &Path) -> Option<String> {
+    if !mount_path.is_dir() {
+        return Some(format!(
+            "MUSIC-ART-SYNC: mesh mount {} is not a directory — artwork cache skipped",
+            mount_path.display()
+        ));
+    }
+    let dir = mount_path.join("music").join("artwork");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return Some(format!(
+            "MUSIC-ART-SYNC: cannot create communal artwork dir {} — {e}",
+            dir.display()
+        ));
+    }
+    // Communal: any desktop uid (this node or a peer) must write. Best-effort —
+    // a non-root dev run can't chmod a foreign dir.
+    let _ = std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o777));
+    None
+}
+
 pub fn ensure_xdg_binds(mount_path: &Path, home: &Path) -> Vec<String> {
     let mut failures = Vec::new();
     if !mount_path.is_dir() {
@@ -726,6 +755,10 @@ impl MeshFsWorker {
             for line in ensure_xdg_binds(&mount, &home) {
                 tracing::warn!(target: "mackesd::meshfs_worker", "{line}");
             }
+        }
+        // MUSIC-ART-SYNC — communal cover-art cache (read/write by every node).
+        if let Some(line) = ensure_music_artwork_dir(&mount) {
+            tracing::warn!(target: "mackesd::meshfs_worker", "{line}");
         }
     }
 
@@ -2165,6 +2198,18 @@ mod tests {
         assert!(plan
             .iter()
             .all(|(s, _)| s.starts_with("/mnt/mesh-storage/home")));
+    }
+
+    #[test]
+    fn ensure_music_artwork_dir_creates_communal_cache() {
+        // MUSIC-ART-SYNC: a real (temp) mount → the communal artwork dir is
+        // created (success → None).
+        let tmp = tempfile::tempdir().expect("tmp");
+        assert!(ensure_music_artwork_dir(tmp.path()).is_none());
+        assert!(tmp.path().join("music").join("artwork").is_dir());
+        // Absent mount → loud failure, never a silent no-op (ONBOARD-6 lesson).
+        let line = ensure_music_artwork_dir(Path::new("/nonexistent-mesh-mount-xyz"));
+        assert!(line.is_some_and(|l| l.contains("is not a directory")));
     }
 
     #[test]

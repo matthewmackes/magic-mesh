@@ -43,8 +43,11 @@ serde      = { version = "1", features = ["derive"] }
 # AIR-10.b — the Bus round-trip runs in spawn_blocking (Persist/rusqlite
 # isn't Send, so it can't cross Iced's multi-thread Task executor).
 # AIR-14 — `time` powers the 250 ms search debounce (tokio::time::sleep,
-# which runs on Iced's tokio executor).
-tokio      = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
+# which runs on Iced's tokio executor). `sync` powers the AIR-16 cover-art
+# fan-out gate (a Semaphore bounds concurrent get-cover-art bus round-trips so
+# a 200+-item folder can't stampede the single-threaded daemon + shared bus
+# SQLite and freeze the UI — MUSIC-ARTGATE).
+tokio      = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync"] }
 # AIR-16 — decode the cover art (base64 over the Bus → JPEG/PNG bytes) and
 # downscale it to run the dominant-colour pass; no codecs beyond the
 # defaults the workspace already builds.

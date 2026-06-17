@@ -245,15 +245,27 @@ fn dispatch_browse(
                     .map_err(|e| e.to_string())
             }
             "get-cover-art" => {
+                use base64::Engine;
                 let id = song_id_from(body).unwrap_or_default();
-                client
-                    .get_cover_art_bytes(&id)
-                    .await
-                    .map(|bytes| {
-                        use base64::Engine;
-                        json!({ "art": base64::engine::general_purpose::STANDARD.encode(&bytes) })
-                    })
-                    .map_err(|e| e.to_string())
+                // MUSIC-ART-SYNC — serve from the communal mesh cache first (art
+                // pulled by any node, reused mesh-wide + offline); on a miss,
+                // fetch from Airsonic and write it through for every other node.
+                if let Some(bytes) = crate::cache::read_shared_artwork(&id) {
+                    Ok(json!({
+                        "art": base64::engine::general_purpose::STANDARD.encode(&bytes)
+                    }))
+                } else {
+                    client
+                        .get_cover_art_bytes(&id)
+                        .await
+                        .map(|bytes| {
+                            crate::cache::write_shared_artwork(&id, &bytes);
+                            json!({
+                                "art": base64::engine::general_purpose::STANDARD.encode(&bytes)
+                            })
+                        })
+                        .map_err(|e| e.to_string())
+                }
             }
             "list-podcasts" => client
                 .get_podcast_channels()
