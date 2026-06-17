@@ -1,0 +1,13 @@
+[Unit]
+Description=Magic Mesh — install the netdata live-metrics agent (NETDATA-1)
+After=network-online.target nebula.service
+Wants=network-online.target
+ConditionPathExists=!/opt/netdata/bin/netdata
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/mackesd/mesh-install-netdata
+
+[Install]
+WantedBy=multi-user.target

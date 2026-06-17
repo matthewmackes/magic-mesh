@@ -240,6 +240,37 @@ impl NetdataAggregator {
             }
         }
         self.last_aggregator_ip = desired_ip;
+
+        // NETDATA-1 (2026-06-17) — confine + expose the dashboard's [web] bind on
+        // EVERY tick, independent of the [stream] aggregator state. The PD-7 map
+        // fetches each peer's `<overlay-ip>:19999`, so every node must bind its
+        // own overlay IP (plus loopback) — and must NEVER bind 0.0.0.0 on a public
+        // lighthouse. Previously this was bundled into refresh_stream_block, which
+        // only ran when the aggregator IP changed, so a node with no aggregator
+        // pointer kept netdata on loopback-only (unreachable to peers) or, worse,
+        // on the stock 0.0.0.0. Idempotent: only writes + reloads when it changes.
+        if let Err(e) = self.refresh_web_block() {
+            tracing::warn!(error = %e, "netdata-aggregator: web-block confine failed");
+        }
+    }
+
+    /// Confine netdata's dashboard to loopback + this node's overlay IP (so peers
+    /// can fetch metrics over nebula but the underlay/public never can). Runs
+    /// every tick; idempotent (only rewrites + reloads when the block changes).
+    fn refresh_web_block(&self) -> Result<(), String> {
+        // No conf yet (netdata not installed) → nothing to confine.
+        let existing = match std::fs::read_to_string(&self.netdata_conf_path) {
+            Ok(s) => s,
+            Err(_) => return Ok(()),
+        };
+        let overlay_ip = read_overlay_ip(&self.overlay_ip_source).ok();
+        let web_block = build_web_block(overlay_ip.as_deref());
+        let rewritten = rewrite_named_section(&existing, "[web]", Some(&web_block));
+        if rewritten != existing {
+            atomic_write(&self.netdata_conf_path, rewritten.as_bytes())?;
+            let _ = systemctl_reload("netdata.service");
+        }
+        Ok(())
     }
 
     fn publish_self_pointer(&mut self) -> Result<(), String> {

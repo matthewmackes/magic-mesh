@@ -451,6 +451,10 @@ assets = [
     { source = "data/ntfy/server.yml.tmpl",             dest = "/usr/share/mde/ntfy/server.yml.tmpl",      mode = "644" },
     { source = "install-helpers/mesh-install-ntfy.sh",  dest = "/usr/libexec/mackesd/mesh-install-ntfy",   mode = "755" },
     { source = "packaging/systemd/mesh-broker-setup.service", dest = "/usr/lib/systemd/system/mesh-broker-setup.service", mode = "644" },
+    # NETDATA-1 — the live-metrics agent fetch installer + its first-boot unit
+    # (netdata isn't in the Fedora repos; fetch-only birthright, ~181 MB).
+    { source = "install-helpers/mesh-install-netdata.sh", dest = "/usr/libexec/mackesd/mesh-install-netdata", mode = "755" },
+    { source = "packaging/systemd/mesh-netdata-setup.service", dest = "/usr/lib/systemd/system/mesh-netdata-setup.service", mode = "644" },
     # BIRTHRIGHT-2 — bundled air-gapped first-boot blobs. The mesh-install-*
     # helpers prefer these over a network fetch, so an offline install still
     # provisions ntfy + starship. NOT in git — fetched + sha256-verified at
@@ -499,6 +503,11 @@ systemctl enable mesh-shell-setup.service >/dev/null 2>&1 || :
 # Fedora repos; self-skips once /usr/bin/ntfy exists). All roles → mesh-wide
 # notification distribution.
 systemctl enable mesh-broker-setup.service >/dev/null 2>&1 || :
+# NETDATA-1 — fetch the netdata live-metrics agent on first boot (not in the
+# Fedora repos; self-skips once /opt/netdata/bin/netdata exists). All roles →
+# the PD-7 flow map + peer health tiers get live data. The aggregator confines
+# the dashboard to loopback + overlay.
+systemctl enable mesh-netdata-setup.service >/dev/null 2>&1 || :
 # SETUP-6 — first-run console wizard. Self-gates on an unconfigured node
 # (ConditionPathExists=!/var/lib/mde/role.toml) + takes tty1 only, so enabling
 # it everywhere is safe: a configured node skips it and getty owns tty1.
