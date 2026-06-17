@@ -13,9 +13,24 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
-## [10.0.10] - 2026-06-16
+## [10.0.11] - 2026-06-17
+
+This roll bundles everything since `v10.0.9`: the SETUP wizard, the LizardFS/ntfy/
+starship birthrights, the notification distribution + sources work, the BULLETPROOF
+node self-bounding, and the 2026-06-17 SELinux + Action Center fixes. Install+join
+with zero manual steps is verified on a clean node on both XCP and local KVM.
 
 ### Added
+- **Cross-node alert federation (NOTIFY-DIST-2):** each node mirrors its alert
+  lanes into QNM-Shared and the Action Center reads every peer's mirror, so the
+  panel is mesh-wide (`alert-mirror` worker + `AlertTail::poll_shared`).
+- **Alert sources (NOTIFY-SRC-1/2/3):** SELinux AVC denials → the security lane,
+  desktop-app (`fdo/*`) notifications captured off the session bus, and KDE
+  Connect device events folded into the global Alert Center.
+- **Node self-bounding (BULLETPROOF-1/2):** the bus retention GC runs inside
+  mackesd with a tmpfs-safe, fs-relative cap + hard-cap eviction (a flooded lane
+  can no longer fill `/run`), and the daemon runs under a systemd watchdog
+  (`Type=notify` + `WatchdogSec` + `sd_notify`) so a wedged runtime auto-restarts.
 - **`magic-setup` wizard (SETUP):** a full-screen TUI that takes a fresh node
   from install to running mesh member — Create a mesh, Join one, list peers, and
   check service Status — narrating each step. Runs on the console at first boot
@@ -43,6 +58,23 @@ starts at the first packaged release line.
   provisioned; the network fetch remains a fallback.
 
 ### Fixed
+- **Notification Center wouldn't open (NOTIFY-UI-4):** its startup read of the
+  QNM-Shared (FUSE) dir ran inline on the iced update loop, so a wedged mount hung
+  the loop and the layer surface never mapped. The shared read now runs on a helper
+  thread and is picked up non-blockingly, so the panel opens regardless of mount
+  health. The applet also launches the center detached (`setsid --fork`) so it no
+  longer leaks a zombie per toggle.
+- **SELinux denial flood (SELINUX-1):** mackesd's podman transition,
+  libvirt `/proc` scans, and a logind check tripped tens of thousands of AVC
+  denials per boot under Enforcing (audit-log flood + repeating "SELinux security
+  alert" toasts). A shipped local CIL policy (`magicmesh-{base,podman,libvirt}`,
+  loaded by the RPM `%post`) grants exactly those legitimate accesses — the node
+  stays **Enforcing** and runs clean. SELinux denials are also recorded in the
+  Action Center but no longer toast below Critical.
+- **Shell responder hang (SHELL-RPC-1):** `healthz` mount-enrichment is now
+  time-bounded, so a wedged FUSE read can't hang the shell bus responder.
+- **Notification distribution (NOTIFY-DIST-3):** ntfy publish topics are flattened
+  so hierarchical bus topics no longer 404 on the broker.
 - **`~/Documents` mesh sync (AUDIT-MESH-15):** the FPG-7 XDG bind-mount now
   targets the real desktop user's home (not the daemon's `/root`), creates the
   communal mesh source tree, and logs bind failures loudly instead of swallowing
