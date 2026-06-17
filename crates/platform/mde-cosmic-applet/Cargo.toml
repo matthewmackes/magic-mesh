@@ -16,7 +16,15 @@ path = "src/lib.rs"
 name = "mde-cosmic-applet"
 path = "src/bin/mde-cosmic-applet.rs"
 
+# APPS-2 — the Applications Panel launcher applet (grid glyph + tabbed dropdown).
+# Thin libcosmic shell over the lib's launcher model; renders the action/apps/list
+# feed from the mackesd apps_aggregator (APPS-1).
+[[bin]]
+name = "mde-apps-applet"
+path = "src/bin/mde-apps-applet.rs"
+
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 mde-bus = { path = "../mde-bus" }
 # NOTIFY-7 / AC — the bell tints by the highest-severity unread alert tailed off

@@ -894,7 +894,7 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
 - [✓] **APPS-1: mackesd `apps_aggregator` worker + `action/apps/list`.**
   **As** an operator, **I want** one bus verb that returns the unified launchable-entry list, **so that** the applet stays a thin renderer (Q24).
   **Acceptance:** `action/apps/list` returns local XDG `.desktop` + flatpak apps, mesh peers' published apps (PD-2 directory descriptors, Q17), workloads (podman + libvirt, local+peer), and published services — each tagged with kind/source/node/health; cached + refresh-on-open; unit-tested aggregation.
-- [ ] **APPS-2: launcher dropdown in `mde-cosmic-applet` (grid glyph + tabbed body).**
+- [✓] **APPS-2: launcher dropdown in `mde-cosmic-applet` (grid glyph + tabbed body).**
   **As** an operator, **I want** a panel grid-glyph button that drops a tabbed launcher (Favorites/Apps/Mesh/Workloads/Services) with a persistent header, **so that** I launch anything from one place (Q3/Q7/Q16).
   **Acceptance:** clicking the panel grid glyph drops the menu; opens to the **Favorites** tab (Q6); tabs switch; renders through Carbon tokens at the Carbon-standard density (Q13); XDG-theme icons (Q14); fuzzy search filters across tabs.
 - [ ] **APPS-3: header — QNM-Shared disk + quick links.**
