@@ -15,7 +15,7 @@
 //! Bus persistence store.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use mde_bus::hooks::config::Priority;
@@ -577,7 +577,22 @@ fn write_periodic_state(engine: Option<&Engine>, queue_path: &Path) {
 /// # Panics
 /// If the internal tokio runtime (for the async browse proxy) can't be
 /// built — an environment fault, not a runtime condition.
-pub fn serve<F: Fn() -> bool>(persist: &Persist, queue_path: &Path, should_stop: F) {
+pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop: F) {
+    let mut persist = match Persist::open(bus_root.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "opening Bus store failed");
+            return;
+        }
+    };
+    // MUSIC-WEDGE-2 — track the index.sqlite inode so we can detect a swap.
+    // Another process hitting a read-only DB triggers the BOOT-REC-3 self-heal
+    // recreate (unlink + new file); that strands every OTHER process on the now-
+    // DELETED inode, so the daemon keeps reading/writing a dead file and stops
+    // seeing new requests — the "daemon not responding" wedge after long uptime
+    // (live: the daemon's fd pointed at `index.sqlite (deleted)`). We follow the
+    // live DB by reopening when the inode changes.
+    let mut seen_inode = index_inode(&bus_root);
     // MUSIC-WEDGE — seed every poll cursor at the topic's CURRENT tail so a
     // restart skips the historical backlog. Without this, the first sweep's
     // `list_since(None)` returns every request ever made on each action topic
@@ -586,7 +601,7 @@ pub fn serve<F: Fn() -> bool>(persist: &Persist, queue_path: &Path, should_stop:
     // live as the daemon "not responding" after a restart, and a stale `play`
     // could even replay. New (post-start) requests have a larger ULID and are
     // still picked up normally.
-    let mut cursors: HashMap<String, String> = seed_cursors_at_tail(persist);
+    let mut cursors: HashMap<String, String> = seed_cursors_at_tail(&persist);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -609,6 +624,20 @@ pub fn serve<F: Fn() -> bool>(persist: &Persist, queue_path: &Path, should_stop:
         .map(|e| crate::mpris::spawn(e.handle(), queue_path.to_path_buf(), state::data_dir()));
     let mut last_state_write = Instant::now();
     while !should_stop() {
+        // MUSIC-WEDGE-2 — if the index inode swapped under us (another process
+        // recreated it), reopen so we follow the live DB instead of a deleted
+        // one. Cheap stat per sweep; reopen only on an actual change. Cursors
+        // carry over — new requests have larger ULIDs and are still picked up.
+        let now_inode = index_inode(&bus_root);
+        if now_inode.is_some() && now_inode != seen_inode {
+            if let Ok(p) = Persist::open(bus_root.clone()) {
+                tracing::warn!(
+                    "bus index inode changed under us — reopened the store (MUSIC-WEDGE-2)"
+                );
+                persist = p;
+                seen_inode = now_inode;
+            }
+        }
         // AUDIT-MESH-14 — run the FAST, local-only responders (queue control,
         // transport/get-state, peer roster) BEFORE the network-bound browse
         // proxy. `poll_browse` does blocking Airsonic REST calls; if it ran
@@ -618,16 +647,26 @@ pub fn serve<F: Fn() -> bool>(persist: &Persist, queue_path: &Path, should_stop:
         // get-state is answered within POLL_INTERVAL of the request regardless
         // of browse latency. (The Airsonic client also has connect/total
         // timeouts now so browse itself can't hang forever.)
-        poll_once(persist, queue_path, &mut cursors);
-        poll_transport(persist, queue_path, engine.as_ref(), &mut cursors);
-        poll_peers(persist, &mut cursors);
-        poll_browse(persist, &rt, &mut cursors);
+        poll_once(&persist, queue_path, &mut cursors);
+        poll_transport(&persist, queue_path, engine.as_ref(), &mut cursors);
+        poll_peers(&persist, &mut cursors);
+        poll_browse(&persist, &rt, &mut cursors);
         if last_state_write.elapsed() >= STATE_WRITE_INTERVAL {
             write_periodic_state(engine.as_ref(), queue_path);
             last_state_write = Instant::now();
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// The inode of the bus `index.sqlite`, or `None` if it can't be stat'd. Used to
+/// detect a BOOT-REC-3 recreate (unlink + new file = new inode) so the serve
+/// loop can reopen instead of being stranded on the deleted file (MUSIC-WEDGE-2).
+fn index_inode(bus_root: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(bus_root.join("index.sqlite"))
+        .ok()
+        .map(|m| m.ino())
 }
 
 /// MUSIC-WEDGE — build the initial cursor map seeded at each polled topic's

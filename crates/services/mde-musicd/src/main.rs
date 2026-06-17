@@ -168,18 +168,12 @@ fn serve() -> ExitCode {
         tracing::error!("no Bus data dir (XDG) — cannot serve");
         return ExitCode::FAILURE;
     };
-    let persist = match mde_bus::persist::Persist::open(bus_root) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!(error = %e, "opening Bus store failed");
-            return ExitCode::FAILURE;
-        }
-    };
     tracing::info!("serving action/music/* on the Bus");
     // Runs until SIGTERM (the AIR-1 systemd unit manages the lifecycle);
     // `serve`'s stop predicate is exercised by the unit tests' one-shot
-    // poll path.
-    bus_responder::serve(&persist, &queue::queue_path(), || false);
+    // poll path. serve owns the Bus store so it can reopen on an index inode
+    // swap (MUSIC-WEDGE-2).
+    bus_responder::serve(bus_root, &queue::queue_path(), || false);
     ExitCode::SUCCESS
 }
 
