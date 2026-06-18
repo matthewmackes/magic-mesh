@@ -39,6 +39,10 @@ pub struct NowState {
     /// AUDIT-MESH-4 — `true` when no Airsonic server is configured yet, so the
     /// panel can prompt the operator to configure one instead of looking idle.
     pub needs_airsonic: bool,
+    /// MUSIC-RFX-2/4 — `true` when the current track is seekable (a finite
+    /// track). `false` for a live/radio stream, so the maxi view shows an
+    /// interactive scrub slider only when it can actually seek.
+    pub seekable: bool,
 }
 
 impl NowState {
@@ -92,6 +96,9 @@ pub fn parse_state(reply_json: &str) -> NowState {
             .get("needs_airsonic")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        // MUSIC-RFX-2/4 — older daemons omit `seekable`; absence means "not
+        // seekable" (hide the scrub slider) rather than a false-positive drag.
+        seekable: v.get("seekable").and_then(Value::as_bool).unwrap_or(false),
     }
 }
 
@@ -329,6 +336,20 @@ pub async fn set_volume(v: f32) -> Result<(), String> {
     .await
 }
 
+/// MUSIC-RFX-2/4 — seek the current (finite) track to `position_ms` via
+/// `action/music/seek` (the daemon accepts a bare-number body). A no-op for a
+/// live stream daemon-side; the maxi view only offers the slider when seekable.
+///
+/// # Errors
+/// Bus-store / request / timeout failures.
+pub async fn seek(position_ms: u64) -> Result<(), String> {
+    with_bus(move |p, rt| {
+        req(p, rt, "action/music/seek", Some(&position_ms.to_string()))?;
+        Ok(())
+    })
+    .await
+}
+
 /// Toggle play/pause based on the current state (`pause` when playing,
 /// `resume` otherwise).
 ///
@@ -445,6 +466,9 @@ mod tests {
         assert_eq!(r.song_id, "s7");
         assert_eq!(r.position_ms, 42_000);
         assert!(r.has_track());
+        // MUSIC-RFX-2/4 — seekable defaults off, reads through when present.
+        assert!(!r.seekable);
+        assert!(parse_state(r#"{"ok":true,"song_id":"s","seekable":true}"#).seekable);
         // ok:false / malformed → idle default.
         assert_eq!(parse_state(r#"{"ok":false}"#), NowState::default());
         assert_eq!(parse_state("not json"), NowState::default());

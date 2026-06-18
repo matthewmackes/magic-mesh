@@ -134,6 +134,9 @@ struct State {
     /// (Indigo until the cover art resolves).
     album_color: (u8, u8, u8),
     album_text_color: (u8, u8, u8),
+    /// MUSIC-RFX-4 — the now-playing track's dominant cover colour, for the maxi
+    /// art tint (distinct from `album_color`, which tracks the opened album view).
+    now_color: (u8, u8, u8),
     /// AIR-12/AIR-16 — the open album's decoded cover art (None until it
     /// resolves; the source for both the rendered image + the tint colour).
     album_art: Option<image::Handle>,
@@ -256,9 +259,11 @@ enum Message {
     /// AIR-15.b.2 — the current track's coverArt token resolved.
     NowMetaResolved(Option<String>, u64),
     /// AIR-15.b.2 — the current track's cover art decoded.
-    NowArtReady(Option<image::Handle>),
+    NowArtReady(Option<image::Handle>, (u8, u8, u8)),
     /// AIR-15.b.3 — the maxi volume slider changed.
     SetVolume(f32),
+    /// MUSIC-RFX-4 — the maxi scrub slider moved (target position, ms).
+    Seek(u64),
     PlayPause,
     SkipNext,
     SkipPrev,
@@ -298,6 +303,7 @@ impl State {
             now_duration_ms: 0,
             album_color: color::accent_rgb(),
             album_text_color: (255, 255, 255),
+            now_color: color::accent_rgb(),
             album_art: None,
             sort: prefs::load().sort,
             grid_width: 1100.0,
@@ -723,19 +729,34 @@ impl State {
             Message::NowMetaResolved(cover, duration) => {
                 self.now_duration_ms = duration;
                 match cover {
-                    Some(c) => Task::perform(color::fetch_cover_art(c), |r| {
-                        Message::NowArtReady(r.ok().map(|b| image::Handle::from_bytes(b)))
+                    // MUSIC-RFX-4 — fetch the cover + extract its dominant colour
+                    // for the maxi art tint (same path as the album view's art).
+                    Some(c) => Task::perform(color::fetch_cover_art(c), |r| match r {
+                        Ok(bytes) if !bytes.is_empty() => {
+                            let handle = image::Handle::from_bytes(bytes.clone());
+                            let (d, _t) = color::extract(&bytes)
+                                .unwrap_or((color::accent_rgb(), (255, 255, 255)));
+                            Message::NowArtReady(Some(handle), d)
+                        }
+                        _ => Message::NowArtReady(None, color::accent_rgb()),
                     }),
                     None => Task::none(),
                 }
             }
-            Message::NowArtReady(handle) => {
+            Message::NowArtReady(handle, dominant) => {
                 self.now_art = handle;
+                self.now_color = dominant;
                 Task::none()
             }
             Message::SetVolume(v) => {
                 self.now_state.volume = v;
                 Task::perform(nowplaying::set_volume(v), |_| Message::TransportDone)
+            }
+            // MUSIC-RFX-4 — scrub: jump the playhead optimistically so the slider
+            // tracks the drag, then tell the daemon to seek (RFX-2).
+            Message::Seek(ms) => {
+                self.now_state.position_ms = ms;
+                Task::perform(nowplaying::seek(ms), |_| Message::TransportDone)
             }
             Message::PlayPause => {
                 Task::perform(nowplaying::play_pause(self.now_state.playing), |_| {
@@ -1209,29 +1230,68 @@ impl State {
         } else {
             "Play"
         };
+        // MUSIC-RFX-4 — large cover art on a dominant-colour tint band (the
+        // colour extracted from the now-playing cover, not the opened album).
+        let (nr, ng, nb) = self.now_color;
         let art: Element<'_, Message> = match &self.now_art {
-            Some(h) => image(h.clone())
-                .width(Length::Fixed(240.0))
-                .height(Length::Fixed(240.0))
-                .into(),
+            Some(h) => container(
+                image(h.clone())
+                    .width(Length::Fixed(240.0))
+                    .height(Length::Fixed(240.0)),
+            )
+            .padding(12)
+            .style(move |_| cosmic::iced::widget::container::Style {
+                background: Some(cosmic::iced::Color::from_rgb8(nr, ng, nb).into()), // carbon-ok: dynamic cover-art colour, not a UI token
+                ..Default::default()
+            })
+            .into(),
             None => Space::new().height(Length::Fixed(0.0)).into(),
         };
-        let ratio = (self.now_state.position_ms as f32 / self.now_duration_ms.max(1) as f32)
-            .clamp(0.0, 1.0);
-        let scrub: Element<'_, Message> = column![
-            // EFF-34 — the fork renamed the bar's cross-axis setter to `girth`.
-            cosmic::iced::widget::progress_bar(0.0..=1.0, ratio).girth(Length::Fixed(6.0)),
+        // MUSIC-RFX-4 — the scrub bar. For a seekable (finite) track with a known
+        // duration, render an interactive slider that jumps the playhead on drag
+        // (RFX-2 `seek`); a live/radio stream (not seekable / unknown duration)
+        // shows only the elapsed time — the scrubber is hidden.
+        let time_label = text(format!(
+            "{}:{:02} / {}:{:02}",
+            self.now_state.position_ms / 60000,
+            (self.now_state.position_ms / 1000) % 60,
+            self.now_duration_ms / 60000,
+            (self.now_duration_ms / 1000) % 60,
+        ))
+        .size(11);
+        let scrub: Element<'_, Message> = if self.now_state.seekable && self.now_duration_ms > 0 {
+            column![
+                cosmic::iced::widget::slider(
+                    0.0..=(self.now_duration_ms as f32),
+                    self.now_state.position_ms as f32,
+                    |v| Message::Seek(v as u64),
+                )
+                .step(1000.0_f32)
+                .width(Length::Fixed(240.0)),
+                time_label,
+            ]
+            .spacing(2)
+            .into()
+        } else if self.now_duration_ms > 0 {
+            let ratio = (self.now_state.position_ms as f32 / self.now_duration_ms.max(1) as f32)
+                .clamp(0.0, 1.0);
+            column![
+                // EFF-34 — the fork renamed the bar's cross-axis setter to `girth`.
+                cosmic::iced::widget::progress_bar(0.0..=1.0, ratio).girth(Length::Fixed(6.0)),
+                time_label,
+            ]
+            .spacing(2)
+            .into()
+        } else {
+            // Live stream: no duration to scrub against — show elapsed only.
             text(format!(
-                "{}:{:02} / {}:{:02}",
+                "{}:{:02} • live",
                 self.now_state.position_ms / 60000,
                 (self.now_state.position_ms / 1000) % 60,
-                self.now_duration_ms / 60000,
-                (self.now_duration_ms / 1000) % 60,
             ))
-            .size(11),
-        ]
-        .spacing(2)
-        .into();
+            .size(11)
+            .into()
+        };
         let volume_slider: Element<'_, Message> =
             cosmic::iced::widget::slider(0.0..=1.0, self.now_state.volume, Message::SetVolume)
                 .step(0.01_f32)

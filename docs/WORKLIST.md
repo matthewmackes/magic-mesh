@@ -1010,9 +1010,10 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
   **As** a listener, **I want** to create/rename/delete/modify playlists, **so that** I can curate.
   **Acceptance:** airsonic.rs create_playlist/update_playlist(add/remove/rename)/delete_playlist; bus verbs `playlist-create`/`playlist-update`/`playlist-delete` reply ok; a re-query of getPlaylists reflects the change on the server.
   **Done:** `Client::{create_playlist,update_playlist,delete_playlist}` build createPlaylist/updatePlaylist/deletePlaylist with repeated `songId`/`songIdToAdd`/`songIndexToRemove` params (`endpoint_url` test asserts the repeats); browse verbs `playlist-create`/`playlist-update`/`playlist-delete` parse `{name,song_ids}` / `{id,name?,add?,remove_indices?}` / `{id}` via the new `str_array` helper and reply `{ok:true,…}`. GUI editor is MUSIC-RFX-6.
-- [ ] **MUSIC-RFX-4: maxi now-playing view (art + scrubber + up-next)**
+- [✓] **MUSIC-RFX-4: maxi now-playing view (art + scrubber + up-next)**
   **As** a listener, **I want** a full now-playing screen, **so that** I see art, scrub, and what's next.
   **Acceptance:** large cover art (dominant-colour tint), a seek scrubber wired to MUSIC-RFX-2 (position jumps on drag), prev/next, and an up-next list reflecting the real queue; live streams hide the scrubber.
+  **Done:** the maxi view's read-only progress bar is now an interactive `slider` (0..=duration) that optimistically jumps the playhead and calls `nowplaying::seek` → `action/music/seek` (RFX-2); shown only when `now_state.seekable && duration>0` — a live/radio stream hides the scrubber and shows elapsed-only "m:ss • live". The 240px cover art now sits on a dominant-colour tint band extracted from the *now-playing* cover (`now_color` via `color::extract`, distinct from the album-view colour). Prev/Play-Pause/Next + the Queue-tab up-next list (current track marked) already existed. `NowState.seekable` parsed from get-state; `parse_state` test covers it.
 - [ ] **MUSIC-RFX-5: queue panel — drag-reorder + multi-select + remove**
   **As** a listener, **I want** to manage the queue visually, **so that** I can curate playback.
   **Acceptance:** drag a row to reorder (persists + playback follows), select multiple rows, remove one/selected, "play next"; all via MUSIC-RFX-1 verbs.
