@@ -13,6 +13,38 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
+## [10.0.15] - 2026-06-17
+
+### Changed
+- **Rebrand → MCNF (Mackes Cosmic Nebula Fedora).** The product display name is
+  now **MCNF**; **"Magic Mesh" is the 10.0.x series codename** (shown as
+  `MCNF 10.0 "Magic Mesh"` in About/greeter). The `magic-mesh` package, repo, dnf
+  channels, release tags, icon name, and `org.magicmesh.*` IDs are **unchanged**
+  (upgrade-safe; renames to `mcnf` at the 11.0 boundary) — only display strings
+  changed across ~105 files.
+- **New default app icon** (penguin-on-mesh, `Icon-MCNF`) regenerated to all 9
+  hicolor sizes + brand masters; every app uses `Icon=magic-mesh`, so all apps
+  re-brand at once.
+
+### Added
+- **APPS — the mesh-wide Applications Panel launcher** (replaces Cosmic's
+  app-library; design `docs/design/apps-launcher.md`):
+  - **APPS-1** mackesd `apps_aggregator` → `action/apps/list` (local XDG+Flatpak,
+    mesh peers, workloads, services, each tagged kind/source/node/health).
+  - **APPS-2** `mde-apps-applet` panel applet: grid glyph → tabbed dropdown
+    (Favorites/Apps/Mesh/Workloads/Services), bus-fed, Carbon-styled, fuzzy search.
+  - **APPS-3** header: live QNM-Shared disk + quick links (Workbench/Files/Settings).
+  - **APPS-4** mesh-synced per-user Favorites (QNM-Shared) with a ★ pin toggle.
+  - **APPS-5** launch paths: local exec + peer remote-desktop (`action/apps/launch`
+    resolves the target; opens remmina).
+  - **APPS-6** Workloads: inline Start/Stop/Attach (virsh/podman).
+  - **APPS-7** Services: open the published endpoint over the overlay.
+  - **APPS-8** right-click context strip (pin/unpin, primary, run-on-peer,
+    flatpak uninstall).
+  - **APPS-9** baked-layout swap: the MCNF launcher replaces Cosmic's app-library
+    button in the panel + dock; applet packaged.
+  - (Follow-ons: APPS-8b run-containerized + details; APPS-9b Super-key bind.)
+
 ## [10.0.14] - 2026-06-17
 
 ### Added
