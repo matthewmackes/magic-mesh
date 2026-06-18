@@ -1001,6 +1001,11 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
   **Fix (one line):** add `"instances" => compute_panel::ComputePanel::load(),` to the nav-load match. **Workaround now:** click **Refresh** on the panel.
   **Acceptance:** opening Instances auto-populates within a load cycle; MDE-KVM-1 shows attributed to `fedora` from .13 without clicking Refresh. *(Lesson: WORKLOAD-FLEET-1's data path was verified end-to-end but not the live panel on a peer node — add a nav-load smoke check.)*
 
+## BOOT-WARMUP-RETRY — GUI shows hard "mackesd unreachable" during cold-boot warm-up (2026-06-18)
+- [ ] **BOOT-WARMUP-RETRY-1: Workbench panels should auto-retry during the mackesd warm-up, not show a hard error.**
+  **As** an operator, **I want** the Overview/Peers/etc. to settle automatically after a reboot, **so that** I don't see "mackesd is not responding / mesh service isn't answering" and have to click Refresh. (Verified 2026-06-18: after a .13 reboot the GUI opened before mackesd's bus responder answered; env was correct, mackesd came up fine seconds later.)
+  **Acceptance:** when a panel's mackesd query fails, it auto-retries on a short backoff for ~30s (the cold-boot warm-up window) before showing the hard "unreachable" state — reuse the BOOT-PEERS-1 "settling" idea fleet-wide; once healthz answers, the panels populate without a manual Refresh.
+
 ## SSH-MESH-NOCREDS — passwordless SSH peer→peer (operator feature, 2026-06-18)
 - [ ] **SSH-MESH-NOCREDS-1: SSH between mesh peers must not prompt for credentials.**
   **As** an operator, **I want** `ssh <peer>.mesh` (and Workbench remote actions) to authenticate automatically between enrolled peers, **so that** I'm never asked for a password or host-key confirmation inside the trust domain.
