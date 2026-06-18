@@ -56,6 +56,23 @@ fn reload_queue_after(
     )
 }
 
+/// MUSIC-RFX-6 — run a playlist edit (an RFX-3 daemon verb) then re-fetch the
+/// playlists list so the Playlists hub card reflects the change live.
+fn reload_playlists_after(
+    op: impl std::future::Future<Output = Result<(), String>> + Send + 'static,
+) -> cosmic::iced::Task<Message> {
+    cosmic::iced::Task::perform(
+        async move {
+            let _ = op.await;
+            library::fetch("list-playlists").await
+        },
+        |r| match r {
+            Ok(items) => Message::ItemsLoaded(items),
+            Err(e) => Message::ItemsFailed(e),
+        },
+    )
+}
+
 /// Convert an mde-theme Carbon token (`Rgba`, u8 channels) to this crate's
 /// `iced::Color` at alpha `a`. mde-music's iced version skews from the one
 /// `mde_theme::into_iced_color()` targets, so the conversion is by hand — the
@@ -178,6 +195,12 @@ struct State {
     /// MUSIC-RFX-5 — the multi-selected queue row indices (for "remove selected").
     /// Cleared on any structural mutation since indices shift after a reorder/remove.
     queue_selected: std::collections::HashSet<usize>,
+    /// MUSIC-RFX-6 — the "new playlist" name input on the Playlists page.
+    new_playlist_name: String,
+    /// MUSIC-RFX-6 — the playlist id currently being renamed inline (+ its buffer);
+    /// `None` when no rename is open.
+    renaming_playlist: Option<String>,
+    rename_buffer: String,
     /// AIR-15.b.4 — maxi tab + the current track's lyrics lines.
     maxi_tab: MaxiTab,
     maxi_lyrics: Vec<String>,
@@ -263,6 +286,14 @@ enum Message {
     PlayEpisode(String),
     /// AIR-4.b — play a whole playlist by id (fetch its songs → clear+enqueue+play).
     PlayPlaylist(String),
+    /// MUSIC-RFX-6 — playlist editor (create / rename / delete).
+    NewPlaylistNameChanged(String),
+    CreatePlaylist,
+    StartRenamePlaylist(String, String),
+    RenameBufferChanged(String),
+    CommitRenamePlaylist,
+    CancelRenamePlaylist,
+    DeletePlaylist(String),
     /// Add a song result to the queue; the reply closes the sheet.
     EnqueueSong(String),
     SearchEnqueued(Result<(), String>),
@@ -342,6 +373,9 @@ impl State {
             queue_current: 0,
             queue_titles: std::collections::HashMap::new(),
             queue_selected: std::collections::HashSet::new(),
+            new_playlist_name: String::new(),
+            renaming_playlist: None,
+            rename_buffer: String::new(),
             maxi_tab: MaxiTab::Queue,
             maxi_lyrics: Vec::new(),
             maxi_peers: Vec::new(),
@@ -664,6 +698,49 @@ impl State {
             }
             Message::PlayPlaylist(id) => {
                 Task::perform(album::play_playlist(id), Message::AlbumActionDone)
+            }
+            // MUSIC-RFX-6 — playlist editor. Each op drives the RFX-3 verb then
+            // re-fetches the playlists list so the hub card reflects it live.
+            Message::NewPlaylistNameChanged(s) => {
+                self.new_playlist_name = s;
+                Task::none()
+            }
+            Message::CreatePlaylist => {
+                let name = self.new_playlist_name.trim().to_string();
+                if name.is_empty() {
+                    Task::none()
+                } else {
+                    self.new_playlist_name.clear();
+                    reload_playlists_after(album::playlist_create(name))
+                }
+            }
+            Message::StartRenamePlaylist(id, current) => {
+                self.renaming_playlist = Some(id);
+                self.rename_buffer = current;
+                Task::none()
+            }
+            Message::RenameBufferChanged(s) => {
+                self.rename_buffer = s;
+                Task::none()
+            }
+            Message::CommitRenamePlaylist => {
+                let name = self.rename_buffer.trim().to_string();
+                match self.renaming_playlist.take() {
+                    Some(id) if !name.is_empty() => {
+                        reload_playlists_after(album::playlist_rename(id, name))
+                    }
+                    _ => Task::none(),
+                }
+            }
+            Message::CancelRenamePlaylist => {
+                self.renaming_playlist = None;
+                Task::none()
+            }
+            Message::DeletePlaylist(id) => {
+                if self.renaming_playlist.as_deref() == Some(id.as_str()) {
+                    self.renaming_playlist = None;
+                }
+                reload_playlists_after(album::playlist_delete(id))
             }
             Message::WindowResized(w) => {
                 self.grid_width = w;
@@ -1036,9 +1113,64 @@ impl State {
                                 }
                                 _ => btn,
                             };
-                            r = r.push(btn);
+                            // MUSIC-RFX-6 — on the Playlists page each card gets
+                            // Rename / Delete controls beneath it (inline rename
+                            // when this playlist is the active edit target).
+                            if matches!(route, Route::Category(HubCard::Playlists)) {
+                                let controls: Element<'_, Message> = if self
+                                    .renaming_playlist
+                                    .as_deref()
+                                    == Some(item.id.as_str())
+                                {
+                                    row![
+                                        text_input("name", &self.rename_buffer)
+                                            .on_input(Message::RenameBufferChanged)
+                                            .on_submit(Message::CommitRenamePlaylist)
+                                            .width(Length::Fixed(100.0)),
+                                        button(text("✓").size(12))
+                                            .on_press(Message::CommitRenamePlaylist),
+                                        button(text("✕").size(12))
+                                            .on_press(Message::CancelRenamePlaylist),
+                                    ]
+                                    .spacing(4)
+                                    .into()
+                                } else {
+                                    row![
+                                        button(text("Rename").size(11)).on_press(
+                                            Message::StartRenamePlaylist(
+                                                item.id.clone(),
+                                                item.label.clone(),
+                                            ),
+                                        ),
+                                        button(text("Delete").size(11))
+                                            .on_press(Message::DeletePlaylist(item.id.clone())),
+                                    ]
+                                    .spacing(4)
+                                    .into()
+                                };
+                                r = r.push(
+                                    column![btn, controls]
+                                        .spacing(4)
+                                        .width(Length::Fixed(160.0)),
+                                );
+                            } else {
+                                r = r.push(btn);
+                            }
                         }
                         grid = grid.push(r);
+                    }
+                    // MUSIC-RFX-6 — the Playlists page gets a "new playlist" form.
+                    if matches!(route, Route::Category(HubCard::Playlists)) {
+                        col = col.push(
+                            row![
+                                text_input("New playlist name…", &self.new_playlist_name)
+                                    .on_input(Message::NewPlaylistNameChanged)
+                                    .on_submit(Message::CreatePlaylist)
+                                    .width(Length::Fixed(280.0)),
+                                button(text("Create").size(13)).on_press(Message::CreatePlaylist),
+                            ]
+                            .spacing(8),
+                        );
                     }
                     col = col.push(
                         scrollable(grid)

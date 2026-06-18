@@ -252,6 +252,49 @@ pub async fn play_playlist(id: String) -> Result<(), String> {
     .await
 }
 
+/// MUSIC-RFX-6 — create a new (empty) playlist by name
+/// (`action/music/playlist-create`, body `{"name":}`). Tracks are added via
+/// RFX-7's add-to-playlist; reorder is RFX-6b.
+///
+/// # Errors
+/// Bus-store / request / timeout failures.
+pub async fn playlist_create(name: String) -> Result<(), String> {
+    let body = serde_json::json!({ "name": name }).to_string();
+    with_bus(move |persist, rt| {
+        req(persist, rt, "action/music/playlist-create", Some(&body))?;
+        Ok(())
+    })
+    .await
+}
+
+/// MUSIC-RFX-6 — rename a playlist (`action/music/playlist-update`, body
+/// `{"id":,"name":}`).
+///
+/// # Errors
+/// Bus-store / request / timeout failures.
+pub async fn playlist_rename(id: String, name: String) -> Result<(), String> {
+    let body = serde_json::json!({ "id": id, "name": name }).to_string();
+    with_bus(move |persist, rt| {
+        req(persist, rt, "action/music/playlist-update", Some(&body))?;
+        Ok(())
+    })
+    .await
+}
+
+/// MUSIC-RFX-6 — delete a playlist (`action/music/playlist-delete`, body
+/// `{"id":}`).
+///
+/// # Errors
+/// Bus-store / request / timeout failures.
+pub async fn playlist_delete(id: String) -> Result<(), String> {
+    let body = serde_json::json!({ "id": id }).to_string();
+    with_bus(move |persist, rt| {
+        req(persist, rt, "action/music/playlist-delete", Some(&body))?;
+        Ok(())
+    })
+    .await
+}
+
 /// Append `ids` to the queue without disrupting playback (Add to Queue).
 ///
 /// # Errors
