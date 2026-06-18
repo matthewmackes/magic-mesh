@@ -1001,6 +1001,11 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
   **Fix (one line):** add `"instances" => compute_panel::ComputePanel::load(),` to the nav-load match. **Workaround now:** click **Refresh** on the panel.
   **Acceptance:** opening Instances auto-populates within a load cycle; MDE-KVM-1 shows attributed to `fedora` from .13 without clicking Refresh. *(Lesson: WORKLOAD-FLEET-1's data path was verified end-to-end but not the live panel on a peer node — add a nav-load smoke check.)*
 
+## NOTIFY-PREFS — This Node ▸ Notifications panel clarity (operator bug-testing, 2026-06-18)
+> Operator: "What does this panel control?" — it sets per-node toast behavior (DND, placement, default-expire, per-category sounds), distinct from the Action Center. It IS wired, but two clarity issues:
+- [ ] **NOTIFY-PREFS-1: the "Default expire (ms)" field is locked to 5000 (Phase C.5) but looks editable.** **Acceptance:** either make the field actually apply the entered value (toast daemon honors `notification.default_expire_ms`) OR mark it read-only/disabled with a note, so an editable-looking field isn't silently ignored.
+- [ ] **NOTIFY-PREFS-2: clarify panel scope vs the Notification Hub.** The operator had to ask what it controls. **Acceptance:** add a one-line panel subtitle ("Toast popups + sounds for this machine — the alert list lives in the Notification Hub") so the distinction is self-evident; consider linking the two.
+
 ## KDC-NOISE — KDE Connect floods the event stream (operator bug-testing, 2026-06-18)
 - [ ] **KDC-NOISE-1: KDE Connect emits too many information-level events.**
   **As** an operator, **I want** KDE Connect to surface only meaningful device events, **so that** the Alert Center / notifications aren't flooded with low-value info.
