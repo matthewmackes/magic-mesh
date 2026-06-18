@@ -1041,3 +1041,11 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
     - [ ] a fresh lighthouse install + reboot brings mackesd up with no manual drop-in (bake the fix into the package for the lighthouse role, or make the unit not hard-depend on a masked-but-mounted /var).
     - [ ] the fix keeps /var/lib/mackesd created with correct perms (don't silently lose StateDirectory's dir setup).
     - [ ] verify on a rebooted droplet: mackesd active without intervention.
+
+### PKG-SIZE — RPM near GitHub's 100 MiB file limit (hit live, v10.0.15)
+- [ ] **PKG-SIZE-1: keep the dnf-channel RPM well under 100 MiB durably**
+  **As** a release operator, **I want** headroom under GitHub's 100 MiB per-file limit, **so that** the gh-pages dnf-channel push never bounces as the platform grows.
+  **Context:** v10.0.15 (the APPS launcher + the new mde-apps-applet GUI) pushed the monolithic RPM past 100 MiB; the gh-pages push was rejected. Stop-gaps applied: payload zstd→xz, carbon-icons.zip→tar.xz (4.4 MiB saved) → 99.5 MiB. That headroom is thin (~0.5 MiB).
+  **Acceptance** (pick one, runtime-observable):
+    - [ ] a `magic-mesh-server` subpackage that DROPS the GUI binaries (~90 MiB of statically-linked libcosmic across 5 GUIs) for headless Server/Lighthouse roles (XPA-6) — the GUIs ship only in the Workstation package; OR
+    - [ ] host RPMs as GitHub **Release assets** (2 GiB limit) with the gh-pages repodata pointing at them via `createrepo_c --location-prefix`, so the dnf channel is no longer bound by the git file limit.
