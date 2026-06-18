@@ -179,13 +179,17 @@ pub struct HomeSnapshot {
     pub boot_ready: bool,
     /// BOOT-STATUS-4 — the bring-up step chain (empty = unknown/mid-boot).
     pub boot_steps: Vec<BootStep>,
+    /// BOOT-STATUS-2 — supplementary app daemons (musicd / netdata / KDE Connect).
+    pub boot_services: Vec<BootService>,
+    /// BOOT-STATUS-2/3 — per-peer ping roll-up (reachability + RTT).
+    pub boot_pings: Vec<BootPing>,
 }
 
 impl HomeSnapshot {
     /// Synchronous filesystem-only load. Cheap; no async.
     #[must_use]
     pub fn load_sync() -> Self {
-        let (boot_ready, boot_steps) = read_boot_readiness();
+        let boot = read_boot_readiness();
         Self {
             mde_version: env!("CARGO_PKG_VERSION").to_string(),
             fedora_release: read_fedora_release().unwrap_or_else(|| "44".into()),
@@ -196,8 +200,10 @@ impl HomeSnapshot {
             drift_count: None,
             capabilities: Vec::new(),
             mackesd_reachable: true,
-            boot_ready,
-            boot_steps,
+            boot_ready: boot.ready,
+            boot_steps: boot.steps,
+            boot_services: boot.services,
+            boot_pings: boot.pings,
         }
     }
 }
@@ -263,12 +269,47 @@ pub struct BootStep {
     pub detail: String,
 }
 
-/// Parse the `state/boot-readiness` snapshot body into `(ready, steps)`. A
-/// missing/garbage body → `(false, [])` (the section then shows "unknown").
+/// BOOT-STATUS-2 — one app-daemon row decoded from the snapshot `services`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootService {
+    /// Display label (e.g. "Music daemon").
+    pub label: String,
+    /// `ok` | `down`.
+    pub status: String,
+}
+
+/// BOOT-STATUS-2/3 — one per-peer ping row decoded from the snapshot `pings`
+/// (the roll-up rows: who's reachable + RTT).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BootPing {
+    /// Peer hostname.
+    pub peer: String,
+    /// Peer role (`lighthouse` / `peer`).
+    pub role: String,
+    /// Round-trip ms, or `None` when unreachable.
+    pub rtt_ms: Option<f64>,
+}
+
+/// The decoded `state/boot-readiness` snapshot (BOOT-STATUS-2/4). A
+/// missing/garbage body → an all-empty value (the section shows "unknown").
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BootReadiness {
+    /// Whether every fabric chain step is `ok`.
+    pub ready: bool,
+    /// The bring-up dependency chain.
+    pub steps: Vec<BootStep>,
+    /// BOOT-STATUS-2 — supplementary app daemons.
+    pub services: Vec<BootService>,
+    /// BOOT-STATUS-2/3 — per-peer ping roll-up.
+    pub pings: Vec<BootPing>,
+}
+
+/// Parse the `state/boot-readiness` snapshot body. A missing/garbage body →
+/// [`BootReadiness::default`] (the section then shows "unknown").
 #[must_use]
-pub fn parse_boot_readiness(reply: &str) -> (bool, Vec<BootStep>) {
+pub fn parse_boot_readiness(reply: &str) -> BootReadiness {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(reply) else {
-        return (false, Vec::new());
+        return BootReadiness::default();
     };
     let ready = v
         .get("ready")
@@ -297,22 +338,64 @@ pub fn parse_boot_readiness(reply: &str) -> (bool, Vec<BootStep>) {
                 .collect()
         })
         .unwrap_or_default();
-    (ready, steps)
+    let services = v
+        .get("services")
+        .and_then(|s| s.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    Some(BootService {
+                        label: s.get("label")?.as_str()?.to_string(),
+                        status: s
+                            .get("status")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("down")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let pings = v
+        .get("pings")
+        .and_then(|s| s.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    Some(BootPing {
+                        peer: s.get("peer")?.as_str()?.to_string(),
+                        role: s
+                            .get("role")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("peer")
+                            .to_string(),
+                        rtt_ms: s.get("rtt_ms").and_then(serde_json::Value::as_f64),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    BootReadiness {
+        ready,
+        steps,
+        services,
+        pings,
+    }
 }
 
-/// Read the latest `state/boot-readiness` snapshot off the bus. `(false, [])`
-/// when the bus/topic isn't available yet (e.g. mid-boot).
+/// Read the latest `state/boot-readiness` snapshot off the bus.
+/// [`BootReadiness::default`] when the bus/topic isn't available yet (mid-boot).
 #[must_use]
-pub fn read_boot_readiness() -> (bool, Vec<BootStep>) {
+pub fn read_boot_readiness() -> BootReadiness {
     let Some(dir) = mde_bus::default_data_dir() else {
-        return (false, Vec::new());
+        return BootReadiness::default();
     };
     let Ok(persist) = mde_bus::persist::Persist::open(dir) else {
-        return (false, Vec::new());
+        return BootReadiness::default();
     };
     let topic = "state/boot-readiness";
     let Ok(Some(latest)) = persist.latest_ulid(topic) else {
-        return (false, Vec::new());
+        return BootReadiness::default();
     };
     persist
         .list_since(topic, None)
@@ -320,7 +403,7 @@ pub fn read_boot_readiness() -> (bool, Vec<BootStep>) {
         .and_then(|msgs| msgs.into_iter().rev().find(|m| m.ulid == latest))
         .and_then(|m| m.body)
         .map(|b| parse_boot_readiness(&b))
-        .unwrap_or((false, Vec::new()))
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -581,42 +664,105 @@ impl HomePanel {
 
         // BOOT-STATUS-4 — the mesh bring-up chain. Collapses to a one-line
         // "Mesh ready" when all-green; otherwise lists each step with a status
-        // glyph (✓ ok / ◷ pending / ⊘ blocked) + its detail. Hidden until the
-        // first snapshot arrives (empty = mid-boot/unknown).
+        // glyph (✓ ok / ◷ pending / ⊘ blocked) + its detail. BOOT-STATUS-2/3
+        // append the app-daemon rows + the per-peer ping roll-up beneath it
+        // (always shown when present, both before and after the chain is ready).
+        // Hidden entirely until the first snapshot arrives (mid-boot/unknown).
+        let body_sz = TypeRole::Body.size_in(sizes);
+        let cap_sz = TypeRole::Caption.size_in(sizes);
         let boot_status: Element<'_, crate::Message, Theme> = if self.snapshot.boot_steps.is_empty()
+            && self.snapshot.boot_services.is_empty()
+            && self.snapshot.boot_pings.is_empty()
         {
             Space::new().height(Length::Fixed(0.0)).into()
-        } else if self.snapshot.boot_ready {
-            text("✓ Mesh ready — all fabric services up")
-                .size(TypeRole::Body.size_in(sizes))
-                .colr(palette.success.into_cosmic_color())
-                .into()
         } else {
-            let mut col = column![text("Mesh bring-up")
-                .size(TypeRole::Heading.size_in(sizes))
-                .colr(palette.text.into_cosmic_color())]
-            .spacing(6);
-            for st in &self.snapshot.boot_steps {
-                let (glyph, color) = match st.status.as_str() {
-                    "ok" => ("✓", palette.success),
-                    "blocked" => ("⊘", palette.text_muted),
-                    _ => ("◷", palette.warning),
-                };
+            let mut col = column![].spacing(6);
+            // The fabric chain (collapses to the green chip when ready).
+            if self.snapshot.boot_ready {
                 col = col.push(
-                    row![
-                        text(glyph)
-                            .size(TypeRole::Body.size_in(sizes))
-                            .colr(color.into_cosmic_color()),
-                        text(st.label.clone())
-                            .size(TypeRole::Body.size_in(sizes))
-                            .colr(palette.text.into_cosmic_color()),
-                        text(st.detail.clone())
-                            .size(TypeRole::Caption.size_in(sizes))
-                            .colr(palette.text_muted.into_cosmic_color()),
-                    ]
-                    .spacing(8)
-                    .align_y(cosmic::iced::alignment::Vertical::Center),
+                    text("✓ Mesh ready — all fabric services up")
+                        .size(body_sz)
+                        .colr(palette.success.into_cosmic_color()),
                 );
+            } else if !self.snapshot.boot_steps.is_empty() {
+                col = col.push(
+                    text("Mesh bring-up")
+                        .size(TypeRole::Heading.size_in(sizes))
+                        .colr(palette.text.into_cosmic_color()),
+                );
+                for st in &self.snapshot.boot_steps {
+                    let (glyph, color) = match st.status.as_str() {
+                        "ok" => ("✓", palette.success),
+                        "blocked" => ("⊘", palette.text_muted),
+                        _ => ("◷", palette.warning),
+                    };
+                    col = col.push(
+                        row![
+                            text(glyph).size(body_sz).colr(color.into_cosmic_color()),
+                            text(st.label.clone())
+                                .size(body_sz)
+                                .colr(palette.text.into_cosmic_color()),
+                            text(st.detail.clone())
+                                .size(cap_sz)
+                                .colr(palette.text_muted.into_cosmic_color()),
+                        ]
+                        .spacing(8)
+                        .align_y(cosmic::iced::alignment::Vertical::Center),
+                    );
+                }
+            }
+            // BOOT-STATUS-2 — app daemons (musicd / netdata / KDE Connect).
+            if !self.snapshot.boot_services.is_empty() {
+                let mut svc = row![text("Services:")
+                    .size(cap_sz)
+                    .colr(palette.text_muted.into_cosmic_color())]
+                .spacing(10)
+                .align_y(cosmic::iced::alignment::Vertical::Center);
+                for s in &self.snapshot.boot_services {
+                    let (glyph, color) = if s.status == "ok" {
+                        ("✓", palette.success)
+                    } else {
+                        ("✕", palette.warning)
+                    };
+                    svc = svc.push(
+                        text(format!("{glyph} {}", s.label))
+                            .size(cap_sz)
+                            .colr(color.into_cosmic_color()),
+                    );
+                }
+                col = col.push(svc);
+            }
+            // BOOT-STATUS-2/3 — per-peer ping roll-up (reachability + RTT).
+            if !self.snapshot.boot_pings.is_empty() {
+                col = col.push(
+                    text("Peers")
+                        .size(cap_sz)
+                        .colr(palette.text_muted.into_cosmic_color()),
+                );
+                for pg in &self.snapshot.boot_pings {
+                    let (glyph, color, rtt) = match pg.rtt_ms {
+                        Some(ms) => ("✓", palette.success, format!("{ms:.1} ms")),
+                        None => ("✕", palette.text_muted, "unreachable".to_string()),
+                    };
+                    let tag = if pg.role == "lighthouse" {
+                        format!("{} (lighthouse)", pg.peer)
+                    } else {
+                        pg.peer.clone()
+                    };
+                    col = col.push(
+                        row![
+                            text(glyph).size(cap_sz).colr(color.into_cosmic_color()),
+                            text(tag)
+                                .size(cap_sz)
+                                .colr(palette.text.into_cosmic_color()),
+                            text(rtt)
+                                .size(cap_sz)
+                                .colr(palette.text_muted.into_cosmic_color()),
+                        ]
+                        .spacing(8)
+                        .align_y(cosmic::iced::alignment::Vertical::Center),
+                    );
+                }
             }
             col.into()
         };
@@ -2064,17 +2210,33 @@ mod tests {
             {"id":"nebula","label":"Nebula overlay","status":"ok","detail":"up"},
             {"id":"qnm","label":"QNM-Shared mounted","status":"pending","detail":"not mounted"},
             {"id":"directory","label":"Peer directory replicated","status":"blocked","detail":"0 peer(s)","blocked_by":"qnm"}
+        ],
+        "services":[
+            {"id":"musicd","label":"Music daemon","active":true,"reachable":null,"status":"ok"},
+            {"id":"netdata","label":"Live metrics","active":false,"reachable":false,"status":"down"}
+        ],
+        "pings":[
+            {"peer":"lh-01","overlay_ip":"10.42.0.1","role":"lighthouse","rtt_ms":3.2,"reachable":true},
+            {"peer":"anvil","overlay_ip":"","role":"peer","rtt_ms":null,"reachable":false}
         ]}"#;
-        let (ready, steps) = parse_boot_readiness(snap);
-        assert!(!ready);
-        assert_eq!(steps.len(), 3);
-        assert_eq!(steps[0].label, "Nebula overlay");
-        assert_eq!(steps[0].status, "ok");
-        assert_eq!(steps[1].status, "pending");
-        assert_eq!(steps[2].detail, "0 peer(s)");
+        let r = parse_boot_readiness(snap);
+        assert!(!r.ready);
+        assert_eq!(r.steps.len(), 3);
+        assert_eq!(r.steps[0].label, "Nebula overlay");
+        assert_eq!(r.steps[0].status, "ok");
+        assert_eq!(r.steps[1].status, "pending");
+        assert_eq!(r.steps[2].detail, "0 peer(s)");
+        // BOOT-STATUS-2 — services + pings decode too.
+        assert_eq!(r.services.len(), 2);
+        assert_eq!(r.services[0].status, "ok");
+        assert_eq!(r.services[1].status, "down");
+        assert_eq!(r.pings.len(), 2);
+        assert_eq!(r.pings[0].role, "lighthouse");
+        assert_eq!(r.pings[0].rtt_ms, Some(3.2));
+        assert_eq!(r.pings[1].rtt_ms, None);
         // ready snapshot + garbage.
-        assert!(parse_boot_readiness(r#"{"ready":true,"steps":[]}"#).0);
-        assert_eq!(parse_boot_readiness("nope"), (false, Vec::new()));
+        assert!(parse_boot_readiness(r#"{"ready":true,"steps":[]}"#).ready);
+        assert_eq!(parse_boot_readiness("nope"), BootReadiness::default());
     }
 
     #[test]

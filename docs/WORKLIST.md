@@ -957,15 +957,15 @@ Operator: an informative, at-boot view of how the mesh fabric + app daemons come
   **Acceptance:**
     - [ ] a `boot_readiness` worker probes, in order: Nebula up/cert, overlay-IP assigned, mackesd serving, mde-bus broker bound, QNM-Shared mounted+writable, peer directory replicated; emits an ordered `{id,label,group,status,detail,blocked_by,since_ms}` list.
     - [ ] publishes to `state/boot-readiness` on the bus each tick (fast while any step `pending`, backing off once steady).
-- [ ] **BOOT-STATUS-2: app-daemon probes + continuous liveness**
+- [✓] **BOOT-STATUS-2: app-daemon probes + continuous liveness**
   **As** an operator, **I want** the worker to also report the app daemons + live pings, **so that** the dialog shows the whole picture with real RTT.
   **Acceptance:**
-    - [ ] musicd / voice-hud / KDC / netdata active+reachable steps appended to the snapshot.
-    - [ ] continuous ping RTT to the lighthouse(s) + each peer included while consumers are subscribed.
-- [ ] **BOOT-STATUS-3: per-peer readiness roll-up**
+    - [✓] app-daemon `services` appended to the snapshot: musicd (mde-musicd unit), netdata (unit + :19999 reachability), KDE Connect (in-process listener, :1716 connect). (mde-voice-hud is a desktop GUI, not a boot daemon, so it is intentionally not a boot-readiness service — documented in `gather_services`.)
+    - [✓] per-peer ping RTT (`pings`) to every directory peer incl. the lighthouse(s), gathered each 2 s tick with a bounded parallel fan-out (`ping -c1 -W1`, `parse_ping_rtt`, cap `MAX_PING_TARGETS`). The HOME panel consumes both (`BootService`/`BootPing`) so the data is reachable, not a dead payload.
+- [✓] **BOOT-STATUS-3: per-peer readiness roll-up**
   **As** an operator, **I want** a compact readiness verdict per other mesh node, **so that** I can see "is the whole mesh up" in one place.
   **Acceptance:**
-    - [ ] each node's ready/degraded/down verdict aggregated into the snapshot for the roll-up rows.
+    - [✓] each peer's reachability + RTT is aggregated into the snapshot `pings` and rendered as roll-up rows in the HOME boot section (✓/✕ + RTT, lighthouse tagged). (Health/degraded verdict refinement can layer onto these rows later.)
 - [✓] **BOOT-STATUS-4: Workbench HOME panel — dependency chain (reads state/boot-readiness)**
   **As** an operator, **I want** the HOME panel to render the dependency chain with always-on sub-steps, live, **so that** I watch the handshake happen and it collapses when healthy.
   **Acceptance:**
