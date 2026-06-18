@@ -932,7 +932,7 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
     - [✓] lighthouse set = directory rows with `role == lighthouse` (Q1)
     - [✓] binary health → green iff has-data AND online AND overlay up AND (master ⇒ master service healthy); else red (Q2/Q3/Q15); no-data folds to red
     - [✓] unit-tested over healthy / offline / overlay-down / master-SPOF / no-data fixtures
-- [ ] **LIGHTHOUSE-3: Notification Hub pinned Lighthouses footer (animated beacons).**
+- [✓] **LIGHTHOUSE-3: Notification Hub pinned Lighthouses footer (animated beacons).** DONE 2026-06-18: `mde-notify-center` gained a pinned footer (below Now-Playing/Voice, hidden when no lighthouse exists) — header `◉ Lighthouses N/M healthy` over a horizontally-scrollable strip of square beacon cards. Each card: a 54px square (border in `beacon_healthy`/`danger`) with a discrete 8-position rotating beam (`beam_frame`, slow sweep healthy / fast strobe unhealthy) + hostname/overlay-IP/status-word. Beam tick (150ms) armed only when lighthouses present (no idle CPU). Beacons from `lighthouse::beacons` over the replicated roster + leader-lease master detection. Whole-card press → `mde-workbench --focus mesh.lighthouses:<host>` (lands fully once LIGHTHOUSE-5 registers the tab). `beam_frame` unit-tested. Carbon tokens only.
   **As** an operator, **I want** an always-visible lighthouse-health footer in the Notification Hub, **so that** I see anchor-node health at a glance.
   **Acceptance** (each runtime-observable):
     - [ ] a **pinned footer** (below Music/SIP, stays visible on scroll, Q5) with header = beacon hero glyph + "Lighthouses" + live `N/M healthy` (Q8)

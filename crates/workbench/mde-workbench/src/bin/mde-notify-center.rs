@@ -20,6 +20,7 @@ use cosmic::iced::platform_specific::shell::commands::layer_surface::{
 };
 use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
 use cosmic::iced::{window, Element, Length, Padding, Subscription, Task, Theme};
+use mackes_mesh_types::lighthouse::{self, Beacon};
 use mde_notify::{severity_token, AlertItem, AlertTail, Severity, Source};
 use mde_theme::Palette;
 // World-2 (raw `cosmic::iced`) layer-shell daemon — use the iced widgets +
@@ -33,6 +34,20 @@ const CENTER_WIDTH: f32 = 420.0;
 const POLL_SECS: u64 = 8;
 /// Cap on retained rows in the center (oldest dropped) — bounds a long uptime.
 const MAX_ROWS: usize = 500;
+/// LIGHTHOUSE-3 — the beam-animation tick. The conic beam is a discrete stepped
+/// rotation through [`BEAM_ARROWS`]; healthy lighthouses advance one position
+/// every [`BEAM_HEALTHY_DIVISOR`] ticks (a slow sweep), unhealthy ones every
+/// tick (a fast strobe-like spin). The subscription is only armed when at least
+/// one lighthouse is present, so an idle/empty Hub costs nothing.
+const BEAM_TICK_MS: u64 = 150;
+/// Healthy beacons advance one beam step per this many ticks (slow sweep);
+/// unhealthy beacons advance every tick (Q11 — fast strobe).
+const BEAM_HEALTHY_DIVISOR: u16 = 4;
+/// The 8-position discrete beam, read as a beam of light circling the beacon
+/// (Q9/Q10/Q12). Compass arrows ↑↗→↘↓↙←↖.
+const BEAM_ARROWS: [&str; 8] = [
+    "\u{2191}", "\u{2197}", "\u{2192}", "\u{2198}", "\u{2193}", "\u{2199}", "\u{2190}", "\u{2196}",
+];
 
 /// Single-instance guard — dep-free pidfile so re-launching the Action Center
 /// (e.g. the applet bell pressed twice) never STACKS a second full-height
@@ -186,6 +201,13 @@ struct Center {
     /// the result is picked up here non-blockingly — at most one read is ever in
     /// flight, so a permanently-wedged mount leaks a single thread, never the UI.
     shared_rx: Option<std::sync::mpsc::Receiver<Vec<AlertItem>>>,
+    /// LIGHTHOUSE-3 — the pinned-footer beacons (one per `role==lighthouse`
+    /// node), refreshed each poll from the replicated peer directory. Empty
+    /// when no lighthouse is enrolled (the footer then hides itself).
+    lighthouses: Vec<Beacon>,
+    /// LIGHTHOUSE-3 — the beam-animation phase, advanced by the beam tick. Per-
+    /// beacon position derives from this (healthy slow / unhealthy fast).
+    beam_step: u16,
 }
 
 impl Center {
@@ -198,6 +220,8 @@ impl Center {
             voice: None,
             dnd_active: false,
             shared_rx: None,
+            lighthouses: Vec::new(),
+            beam_step: 0,
         }
     }
 }
@@ -223,6 +247,11 @@ enum Message {
     MusicPrev,
     MusicToggle,
     MusicNext,
+    /// LIGHTHOUSE-3 — advance the beacon beam animation one step.
+    BeamTick,
+    /// LIGHTHOUSE-3/4 — a lighthouse card was pressed: open the Workbench
+    /// Lighthouses tab focused on this lighthouse (by hostname).
+    OpenLighthouse(String),
 }
 
 /// NOTIFY-AC — fetch the Now-Playing snapshot over the bus (best-effort, short
@@ -327,7 +356,40 @@ fn fetch_voice() -> Option<VoiceStatus> {
     })
 }
 
-fn subscription(_s: &Center) -> Subscription<Message> {
+/// LIGHTHOUSE-3 — build the pinned-footer beacons from the replicated peer
+/// directory (the same QNM-Shared roster the other panels read). One beacon per
+/// `role==lighthouse` row, binary health per [`lighthouse::beacon_for`], with
+/// the current lizardfs master (the leader-lease holder) held to the stricter
+/// service check (Q3).
+fn fetch_lighthouses() -> Vec<Beacon> {
+    let root = mackes_mesh_types::peers::default_workgroup_root();
+    let peers =
+        mackes_mesh_types::peers::read_peers(&mackes_mesh_types::peers::peers_dir(&root));
+    let master = fetch_master_hostname(&root);
+    let now = u64::try_from(now_ms()).unwrap_or(0);
+    lighthouse::beacons(&peers, master.as_deref(), now, lighthouse::DEFAULT_STALE_MS)
+}
+
+/// LIGHTHOUSE-3 — the current lizardfs-master hostname, read best-effort from
+/// the QNM leader lease (`<workgroup>/.mackesd-leader.lock`). The lease line is
+/// `node_id\trenewed_at_s\tepoch`; the holder's `peer:<host>` node id maps to
+/// `<host>`. Returns `None` when the lease is missing or expired (>60 s old),
+/// in which case no lighthouse is treated as master (all use the lenient check).
+fn fetch_master_hostname(workgroup_root: &std::path::Path) -> Option<String> {
+    const LEASE_DURATION_S: u64 = 60;
+    let text = std::fs::read_to_string(workgroup_root.join(".mackesd-leader.lock")).ok()?;
+    let line = text.lines().next()?.trim();
+    let mut parts = line.split('\t');
+    let node_id = parts.next()?;
+    let renewed_at_s: u64 = parts.next()?.parse().ok()?;
+    let now_s = u64::try_from(now_ms() / 1000).unwrap_or(0);
+    if now_s.saturating_sub(renewed_at_s) >= LEASE_DURATION_S {
+        return None; // stale lease — failover in progress / leader gone
+    }
+    Some(node_id.strip_prefix("peer:").unwrap_or(node_id).to_string())
+}
+
+fn subscription(s: &Center) -> Subscription<Message> {
     let poll = cosmic::iced::time::every(std::time::Duration::from_secs(POLL_SECS))
         .map(|_| Message::Refresh);
     // Esc closes the panel (W10 Action Center dismiss).
@@ -340,7 +402,16 @@ fn subscription(_s: &Center) -> Subscription<Message> {
         }
         None
     });
-    Subscription::batch([poll, esc])
+    // LIGHTHOUSE-3 — only animate the beacons when at least one lighthouse is
+    // shown; an empty/idle Hub footer costs no CPU (Q12 "inactive when hidden").
+    let mut subs = vec![poll, esc];
+    if !s.lighthouses.is_empty() {
+        subs.push(
+            cosmic::iced::time::every(std::time::Duration::from_millis(BEAM_TICK_MS))
+                .map(|_| Message::BeamTick),
+        );
+    }
+    Subscription::batch(subs)
 }
 
 /// Boot: spawn the right-anchored Overlay slide-out + first poll.
@@ -429,6 +500,23 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
             if let Some(dir) = mde_bus::client_data_dir() {
                 state.dnd_active = mde_bus::dnd::load_default(&dir).active;
             }
+            // LIGHTHOUSE-3 — refresh the pinned lighthouse footer beacons.
+            state.lighthouses = fetch_lighthouses();
+        }
+        Message::BeamTick => {
+            state.beam_step = state.beam_step.wrapping_add(1);
+        }
+        Message::OpenLighthouse(host) => {
+            // LIGHTHOUSE-3/4 — deep-link to the Workbench Lighthouses tab,
+            // focused on this lighthouse. `mde-workbench` is single-instance:
+            // a running primary picks up the focus over the Bus, otherwise this
+            // launch becomes the primary and opens at the panel (spawn-if-
+            // needed, no duplicate window). Then close the Hub.
+            let focus = format!("mesh.lighthouses:{host}");
+            let _ = std::process::Command::new("mde-workbench")
+                .args(["--focus", &focus])
+                .spawn();
+            std::process::exit(0);
         }
         Message::ToggleDnd => {
             // AC-5 — flip + persist DND to the same store the toast/sound paths
@@ -663,22 +751,29 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
     .padding(Padding::from([6u16, 14u16]))
     .width(Length::Fill);
 
-    container(
-        column![
-            container(scroll).height(Length::Fill),
-            section_divider(p),
-            now_playing_section(state.music.as_ref(), p),
-            section_divider(p),
-            voice_section(state.voice.as_ref(), p),
-            section_divider(p),
-            quick_actions,
-            launch_bar,
-        ]
-        .spacing(0),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .into()
+    // Pinned bottom sections, top-to-bottom: Now-Playing, Voice/SIP, then the
+    // LIGHTHOUSE-3 lighthouses footer (only when lighthouses exist), then the
+    // quick-actions + app launchers. Built as a vec so the footer + its divider
+    // appear only when there is something to show.
+    let mut sections: Vec<Element<'_, Message>> = vec![
+        container(scroll).height(Length::Fill).into(),
+        section_divider(p),
+        now_playing_section(state.music.as_ref(), p),
+        section_divider(p),
+        voice_section(state.voice.as_ref(), p),
+    ];
+    if !state.lighthouses.is_empty() {
+        sections.push(section_divider(p));
+        sections.push(lighthouses_footer(&state.lighthouses, state.beam_step, p));
+    }
+    sections.push(section_divider(p));
+    sections.push(quick_actions.into());
+    sections.push(launch_bar.into());
+
+    container(cosmic::iced::widget::column(sections).spacing(0))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
 
 /// A thin horizontal divider between the pinned bottom sections.
@@ -792,6 +887,114 @@ fn voice_section(voice: Option<&VoiceStatus>, p: Palette) -> Element<'static, Me
 }
 
 /// A compact transport control button.
+/// LIGHTHOUSE-3 — the current beam glyph for a beacon (Q10/Q11/Q12). Pure +
+/// testable. Healthy beacons sweep slowly through the 8 discrete positions
+/// (one step per [`BEAM_HEALTHY_DIVISOR`] ticks); unhealthy beacons spin a step
+/// every tick AND strobe (blank on the even phase) for an at-a-glance alarm.
+#[must_use]
+fn beam_frame(healthy: bool, beam_step: u16) -> &'static str {
+    let n = BEAM_ARROWS.len() as u16;
+    if healthy {
+        BEAM_ARROWS[((beam_step / BEAM_HEALTHY_DIVISOR) % n) as usize]
+    } else if beam_step % 2 == 0 {
+        " " // strobe off-phase
+    } else {
+        BEAM_ARROWS[(beam_step % n) as usize]
+    }
+}
+
+/// LIGHTHOUSE-3 — the pinned Lighthouses footer (Q5): a header (beacon glyph +
+/// "Lighthouses" + live `N/M healthy`, Q8) over a horizontally-scrollable strip
+/// of square beacon cards (Q6/Q7). Colors come only from `mde-theme` tokens
+/// (`beacon_healthy` / `danger`, §4).
+fn lighthouses_footer(beacons: &[Beacon], beam_step: u16, p: Palette) -> Element<'static, Message> {
+    let (healthy, total) = lighthouse::health_counts(beacons);
+    let count_color = if healthy == total {
+        p.beacon_healthy
+    } else {
+        p.danger
+    };
+    let header = row![
+        text("\u{25C9}") // ◉ fisheye — an abstract light source (BMP, not emoji)
+            .size(13)
+            .color(count_color.into_cosmic_color()),
+        Space::new().width(Length::Fixed(8.0)),
+        text("Lighthouses")
+            .size(13)
+            .color(p.text.into_cosmic_color())
+            .width(Length::Fill),
+        text(format!("{healthy}/{total} healthy"))
+            .size(12)
+            .color(count_color.into_cosmic_color()),
+    ]
+    .align_y(cosmic::iced::Alignment::Center);
+
+    let cards: Vec<Element<'static, Message>> = beacons
+        .iter()
+        .map(|b| beacon_card(b, beam_step, p))
+        .collect();
+    let strip = scrollable(row(cards).spacing(10)).direction(
+        cosmic::iced::widget::scrollable::Direction::Horizontal(
+            cosmic::iced::widget::scrollable::Scrollbar::new().width(4).scroller_width(4),
+        ),
+    );
+
+    container(
+        column![
+            header,
+            Space::new().height(Length::Fixed(8.0)),
+            strip,
+        ]
+        .spacing(0),
+    )
+    .padding(Padding::from([10u16, 14u16]))
+    .width(Length::Fill)
+    .into()
+}
+
+/// LIGHTHOUSE-3 — one square beacon card: the animated beam square (border in
+/// the status color) over name / overlay IP / status word (Q16). The whole card
+/// presses through to the Workbench Lighthouses tab (Q19).
+fn beacon_card(b: &Beacon, beam_step: u16, p: Palette) -> Element<'static, Message> {
+    let healthy = b.healthy();
+    let color = if healthy { p.beacon_healthy } else { p.danger };
+    let glyph = beam_frame(healthy, beam_step);
+    let square = container(text(glyph).size(22).color(color.into_cosmic_color()))
+        .center_x(Length::Fixed(54.0))
+        .center_y(Length::Fixed(54.0))
+        .style(move |_| container::Style {
+            background: Some(cosmic::iced::Background::Color(p.surface.into_cosmic_color())),
+            border: cosmic::iced::Border {
+                color: color.into_cosmic_color(),
+                width: 2.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        });
+    let ip = b.overlay_ip.clone().unwrap_or_else(|| "—".to_string());
+    let body = column![
+        square,
+        text(b.hostname.clone())
+            .size(11)
+            .color(p.text.into_cosmic_color()),
+        text(ip).size(10).color(p.text_muted.into_cosmic_color()),
+        text(b.status.word())
+            .size(10)
+            .color(color.into_cosmic_color()),
+    ]
+    .spacing(2)
+    .align_x(cosmic::iced::Alignment::Center)
+    .width(Length::Fixed(78.0));
+    button(body)
+        .on_press(Message::OpenLighthouse(b.hostname.clone()))
+        .style(|_, _| button::Style {
+            background: None,
+            ..Default::default()
+        })
+        .padding(0)
+        .into()
+}
+
 fn transport_button(glyph: &str, msg: Message, p: Palette) -> Element<'_, Message> {
     button(
         text(glyph.to_string())
@@ -886,6 +1089,23 @@ mod tests {
             body: String::new(),
             read: false,
         }
+    }
+
+    #[test]
+    fn beam_frame_sweeps_slow_when_healthy_and_strobes_when_not() {
+        // Healthy: same position held for BEAM_HEALTHY_DIVISOR ticks (slow), and
+        // it never blanks.
+        assert_eq!(beam_frame(true, 0), BEAM_ARROWS[0]);
+        assert_eq!(beam_frame(true, BEAM_HEALTHY_DIVISOR - 1), BEAM_ARROWS[0]);
+        assert_eq!(beam_frame(true, BEAM_HEALTHY_DIVISOR), BEAM_ARROWS[1]);
+        for step in 0..64u16 {
+            assert_ne!(beam_frame(true, step), " ", "healthy never strobes off");
+        }
+        // Unhealthy: strobes off on the even phase, on (rotating fast) on the odd.
+        assert_eq!(beam_frame(false, 0), " ");
+        assert_eq!(beam_frame(false, 1), BEAM_ARROWS[1]);
+        assert_eq!(beam_frame(false, 2), " ");
+        assert_eq!(beam_frame(false, 3), BEAM_ARROWS[3]);
     }
 
     #[test]
