@@ -34,20 +34,11 @@ const CENTER_WIDTH: f32 = 420.0;
 const POLL_SECS: u64 = 8;
 /// Cap on retained rows in the center (oldest dropped) — bounds a long uptime.
 const MAX_ROWS: usize = 500;
-/// LIGHTHOUSE-3 — the beam-animation tick. The conic beam is a discrete stepped
-/// rotation through [`BEAM_ARROWS`]; healthy lighthouses advance one position
-/// every [`BEAM_HEALTHY_DIVISOR`] ticks (a slow sweep), unhealthy ones every
-/// tick (a fast strobe-like spin). The subscription is only armed when at least
-/// one lighthouse is present, so an idle/empty Hub costs nothing.
+/// LIGHTHOUSE-3 — the beam-animation tick cadence. The beam glyph itself comes
+/// from the shared `lighthouse::beam_frame` (so the Hub footer and the Workbench
+/// tab animate identically). The subscription is only armed when at least one
+/// lighthouse is present, so an idle/empty Hub costs nothing.
 const BEAM_TICK_MS: u64 = 150;
-/// Healthy beacons advance one beam step per this many ticks (slow sweep);
-/// unhealthy beacons advance every tick (Q11 — fast strobe).
-const BEAM_HEALTHY_DIVISOR: u16 = 4;
-/// The 8-position discrete beam, read as a beam of light circling the beacon
-/// (Q9/Q10/Q12). Compass arrows ↑↗→↘↓↙←↖.
-const BEAM_ARROWS: [&str; 8] = [
-    "\u{2191}", "\u{2197}", "\u{2192}", "\u{2198}", "\u{2193}", "\u{2199}", "\u{2190}", "\u{2196}",
-];
 
 /// Single-instance guard — dep-free pidfile so re-launching the Action Center
 /// (e.g. the applet bell pressed twice) never STACKS a second full-height
@@ -887,22 +878,6 @@ fn voice_section(voice: Option<&VoiceStatus>, p: Palette) -> Element<'static, Me
 }
 
 /// A compact transport control button.
-/// LIGHTHOUSE-3 — the current beam glyph for a beacon (Q10/Q11/Q12). Pure +
-/// testable. Healthy beacons sweep slowly through the 8 discrete positions
-/// (one step per [`BEAM_HEALTHY_DIVISOR`] ticks); unhealthy beacons spin a step
-/// every tick AND strobe (blank on the even phase) for an at-a-glance alarm.
-#[must_use]
-fn beam_frame(healthy: bool, beam_step: u16) -> &'static str {
-    let n = BEAM_ARROWS.len() as u16;
-    if healthy {
-        BEAM_ARROWS[((beam_step / BEAM_HEALTHY_DIVISOR) % n) as usize]
-    } else if beam_step % 2 == 0 {
-        " " // strobe off-phase
-    } else {
-        BEAM_ARROWS[(beam_step % n) as usize]
-    }
-}
-
 /// LIGHTHOUSE-3 — the pinned Lighthouses footer (Q5): a header (beacon glyph +
 /// "Lighthouses" + live `N/M healthy`, Q8) over a horizontally-scrollable strip
 /// of square beacon cards (Q6/Q7). Colors come only from `mde-theme` tokens
@@ -958,7 +933,7 @@ fn lighthouses_footer(beacons: &[Beacon], beam_step: u16, p: Palette) -> Element
 fn beacon_card(b: &Beacon, beam_step: u16, p: Palette) -> Element<'static, Message> {
     let healthy = b.healthy();
     let color = if healthy { p.beacon_healthy } else { p.danger };
-    let glyph = beam_frame(healthy, beam_step);
+    let glyph = lighthouse::beam_frame(healthy, beam_step);
     let square = container(text(glyph).size(22).color(color.into_cosmic_color()))
         .center_x(Length::Fixed(54.0))
         .center_y(Length::Fixed(54.0))
@@ -1089,23 +1064,6 @@ mod tests {
             body: String::new(),
             read: false,
         }
-    }
-
-    #[test]
-    fn beam_frame_sweeps_slow_when_healthy_and_strobes_when_not() {
-        // Healthy: same position held for BEAM_HEALTHY_DIVISOR ticks (slow), and
-        // it never blanks.
-        assert_eq!(beam_frame(true, 0), BEAM_ARROWS[0]);
-        assert_eq!(beam_frame(true, BEAM_HEALTHY_DIVISOR - 1), BEAM_ARROWS[0]);
-        assert_eq!(beam_frame(true, BEAM_HEALTHY_DIVISOR), BEAM_ARROWS[1]);
-        for step in 0..64u16 {
-            assert_ne!(beam_frame(true, step), " ", "healthy never strobes off");
-        }
-        // Unhealthy: strobes off on the even phase, on (rotating fast) on the odd.
-        assert_eq!(beam_frame(false, 0), " ");
-        assert_eq!(beam_frame(false, 1), BEAM_ARROWS[1]);
-        assert_eq!(beam_frame(false, 2), " ");
-        assert_eq!(beam_frame(false, 3), BEAM_ARROWS[3]);
     }
 
     #[test]

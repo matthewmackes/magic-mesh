@@ -30,6 +30,33 @@ pub const DEFAULT_STALE_MS: u64 = 90_000;
 /// The directory `role` value that marks a lighthouse (design Q1).
 pub const LIGHTHOUSE_ROLE: &str = "lighthouse";
 
+/// The 8-position discrete beam, read as a beam of light circling the beacon
+/// (Q9/Q10/Q12). Compass arrows ↑↗→↘↓↙←↖. Shared by the Hub footer and the
+/// Workbench Lighthouses tab so both animate identically.
+pub const BEAM_ARROWS: [&str; 8] = [
+    "\u{2191}", "\u{2197}", "\u{2192}", "\u{2198}", "\u{2193}", "\u{2199}", "\u{2190}", "\u{2196}",
+];
+
+/// Healthy beacons advance one beam step per this many ticks (slow sweep);
+/// unhealthy beacons advance every tick and strobe (Q11).
+pub const BEAM_HEALTHY_DIVISOR: u16 = 4;
+
+/// The current beam glyph for a beacon at animation phase `beam_step` (Q10/Q11/
+/// Q12). Pure + testable. Healthy beacons sweep slowly through the 8 discrete
+/// positions; unhealthy beacons spin a step every tick AND strobe (blank on the
+/// even phase) for an at-a-glance alarm.
+#[must_use]
+pub fn beam_frame(healthy: bool, beam_step: u16) -> &'static str {
+    let n = BEAM_ARROWS.len() as u16;
+    if healthy {
+        BEAM_ARROWS[((beam_step / BEAM_HEALTHY_DIVISOR) % n) as usize]
+    } else if beam_step % 2 == 0 {
+        " " // strobe off-phase
+    } else {
+        BEAM_ARROWS[(beam_step % n) as usize]
+    }
+}
+
 /// The binary beacon state, with the reason it is red (for the status word).
 /// All non-`Healthy` variants render red (Q15); the variant only chooses the
 /// label.
@@ -304,6 +331,23 @@ mod tests {
         let b = beacon_for(&p, false, now, DEFAULT_STALE_MS);
         assert!(!b.healthy());
         assert_eq!(b.status, BeaconStatus::NoData);
+    }
+
+    #[test]
+    fn beam_frame_sweeps_slow_when_healthy_and_strobes_when_not() {
+        // Healthy: a position is held for BEAM_HEALTHY_DIVISOR ticks (slow), and
+        // it never blanks.
+        assert_eq!(beam_frame(true, 0), BEAM_ARROWS[0]);
+        assert_eq!(beam_frame(true, BEAM_HEALTHY_DIVISOR - 1), BEAM_ARROWS[0]);
+        assert_eq!(beam_frame(true, BEAM_HEALTHY_DIVISOR), BEAM_ARROWS[1]);
+        for step in 0..64u16 {
+            assert_ne!(beam_frame(true, step), " ", "healthy never strobes off");
+        }
+        // Unhealthy: strobes off on the even phase, on (rotating fast) on the odd.
+        assert_eq!(beam_frame(false, 0), " ");
+        assert_eq!(beam_frame(false, 1), BEAM_ARROWS[1]);
+        assert_eq!(beam_frame(false, 2), " ");
+        assert_eq!(beam_frame(false, 3), BEAM_ARROWS[3]);
     }
 
     #[test]
