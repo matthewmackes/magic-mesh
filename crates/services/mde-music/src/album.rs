@@ -267,6 +267,20 @@ pub async fn playlist_create(name: String) -> Result<(), String> {
     .await
 }
 
+/// MUSIC-RFX-7 — add a track to a playlist (`action/music/playlist-update`,
+/// body `{"id":,"add":[song_id]}`). The reusable "Add to playlist" primitive.
+///
+/// # Errors
+/// Bus-store / request / timeout failures.
+pub async fn playlist_add_track(playlist_id: String, song_id: String) -> Result<(), String> {
+    let body = serde_json::json!({ "id": playlist_id, "add": [song_id] }).to_string();
+    with_bus(move |persist, rt| {
+        req(persist, rt, "action/music/playlist-update", Some(&body))?;
+        Ok(())
+    })
+    .await
+}
+
 /// MUSIC-RFX-6 — rename a playlist (`action/music/playlist-update`, body
 /// `{"id":,"name":}`).
 ///

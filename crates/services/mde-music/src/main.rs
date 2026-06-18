@@ -195,6 +195,10 @@ struct State {
     /// MUSIC-RFX-5 — the multi-selected queue row indices (for "remove selected").
     /// Cleared on any structural mutation since indices shift after a reorder/remove.
     queue_selected: std::collections::HashSet<usize>,
+    /// MUSIC-RFX-7 — the "add to playlist" picker: the song id pending add
+    /// (`Some` = the picker sheet is open) + the playlist choices loaded for it.
+    add_to_playlist_song: Option<String>,
+    add_to_playlist_choices: Vec<(String, String)>,
     /// MUSIC-RFX-6 — the "new playlist" name input on the Playlists page.
     new_playlist_name: String,
     /// MUSIC-RFX-6 — the playlist id currently being renamed inline (+ its buffer);
@@ -286,6 +290,11 @@ enum Message {
     PlayEpisode(String),
     /// AIR-4.b — play a whole playlist by id (fetch its songs → clear+enqueue+play).
     PlayPlaylist(String),
+    /// MUSIC-RFX-7 — add-to-playlist picker.
+    OpenAddToPlaylist(String),
+    AddPlaylistChoicesLoaded(Vec<(String, String)>),
+    AddSongToPlaylist(String),
+    CloseAddToPlaylist,
     /// MUSIC-RFX-6 — playlist editor (create / rename / delete).
     NewPlaylistNameChanged(String),
     CreatePlaylist,
@@ -373,6 +382,8 @@ impl State {
             queue_current: 0,
             queue_titles: std::collections::HashMap::new(),
             queue_selected: std::collections::HashSet::new(),
+            add_to_playlist_song: None,
+            add_to_playlist_choices: Vec::new(),
             new_playlist_name: String::new(),
             renaming_playlist: None,
             rename_buffer: String::new(),
@@ -698,6 +709,37 @@ impl State {
             }
             Message::PlayPlaylist(id) => {
                 Task::perform(album::play_playlist(id), Message::AlbumActionDone)
+            }
+            // MUSIC-RFX-7 — add-to-playlist picker (reachable from any track row).
+            Message::OpenAddToPlaylist(song_id) => {
+                self.add_to_playlist_song = Some(song_id);
+                self.add_to_playlist_choices.clear();
+                Task::perform(library::fetch("list-playlists"), |r| match r {
+                    Ok(items) => Message::AddPlaylistChoicesLoaded(
+                        items.into_iter().map(|i| (i.id, i.label)).collect(),
+                    ),
+                    Err(_) => Message::AddPlaylistChoicesLoaded(Vec::new()),
+                })
+            }
+            Message::AddPlaylistChoicesLoaded(choices) => {
+                self.add_to_playlist_choices = choices;
+                Task::none()
+            }
+            Message::AddSongToPlaylist(playlist_id) => {
+                let song = self.add_to_playlist_song.take();
+                self.add_to_playlist_choices.clear();
+                match song {
+                    Some(s) => Task::perform(
+                        album::playlist_add_track(playlist_id, s),
+                        Message::AlbumActionDone,
+                    ),
+                    None => Task::none(),
+                }
+            }
+            Message::CloseAddToPlaylist => {
+                self.add_to_playlist_song = None;
+                self.add_to_playlist_choices.clear();
+                Task::none()
             }
             // MUSIC-RFX-6 — playlist editor. Each op drives the RFX-3 verb then
             // re-fetches the playlists list so the hub card reflects it live.
@@ -1228,12 +1270,47 @@ impl State {
         }
         let page = container(page_col).width(Length::Fill).height(Length::Fill);
 
-        // AIR-14 — overlay the results sheet while a search is active.
-        if self.search_open {
+        // AIR-14 — overlay the search results sheet; MUSIC-RFX-7 — overlay the
+        // add-to-playlist picker (it takes priority when both could be open).
+        if self.add_to_playlist_song.is_some() {
+            stack![page, self.add_to_playlist_sheet()].into()
+        } else if self.search_open {
             stack![page, self.search_sheet()].into()
         } else {
             page.into()
         }
+    }
+
+    /// MUSIC-RFX-7 — the add-to-playlist picker sheet: the operator's playlists
+    /// as buttons (click adds the pending track via `playlist-update`), plus a
+    /// Cancel. An empty roster hints to create one on the Playlists page.
+    fn add_to_playlist_sheet(&self) -> Element<'_, Message> {
+        let mut col = column![
+            row![
+                text("Add to playlist").size(18).width(Length::Fill),
+                button(text("Cancel").size(13)).on_press(Message::CloseAddToPlaylist),
+            ]
+            .align_y(cosmic::iced::Alignment::Center),
+            Space::new().height(Length::Fixed(8.0)),
+        ]
+        .spacing(8)
+        .padding(20)
+        .width(Length::Fixed(360.0));
+        if self.add_to_playlist_choices.is_empty() {
+            col = col.push(text("No playlists yet — create one on the Playlists page.").size(13));
+        } else {
+            for (id, name) in &self.add_to_playlist_choices {
+                col = col.push(
+                    button(text(name.clone()).size(14))
+                        .width(Length::Fill)
+                        .on_press(Message::AddSongToPlaylist(id.clone())),
+                );
+            }
+        }
+        container(scrollable(col))
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into()
     }
 
     /// The AIR-14 results sheet: Artists / Albums / Songs sections over the
@@ -1324,6 +1401,9 @@ impl State {
                     .width(Length::Fixed(56.0)),
                 button(text("Play Next").size(11)).on_press(Message::PlayTrackNext(t.id.clone())),
                 button(text("+ Queue").size(11)).on_press(Message::AddTrackToQueue(t.id.clone())),
+                // MUSIC-RFX-7 — add this track to a playlist.
+                button(text("+ Playlist").size(11))
+                    .on_press(Message::OpenAddToPlaylist(t.id.clone())),
             ]
             .spacing(8);
             list = list.push(track_row);
@@ -1510,6 +1590,11 @@ impl State {
                 button(text("Prev").size(13)).on_press(Message::SkipPrev),
                 button(text(play_pause).size(13)).on_press(Message::PlayPause),
                 button(text("Next").size(13)).on_press(Message::SkipNext),
+                // MUSIC-RFX-7 — add the current track to a playlist.
+                button(text("+ Playlist").size(13)).on_press_maybe(
+                    (!self.now_state.song_id.is_empty())
+                        .then(|| Message::OpenAddToPlaylist(self.now_state.song_id.clone())),
+                ),
             ]
             .spacing(10),
         ]

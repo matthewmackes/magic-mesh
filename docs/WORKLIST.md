@@ -1025,9 +1025,10 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
 - [ ] **MUSIC-RFX-6b: within-playlist track reorder** *(carved from RFX-6, 2026-06-18)*
   **As** a listener, **I want** to reorder tracks inside a playlist, **so that** the play order is mine.
   **Acceptance:** a playlist-detail editor lists tracks with a reorder affordance; the new order persists server-side. **Design note:** Subsonic/Airsonic has NO reorder endpoint, and `updatePlaylist` only appends (`songIdToAdd`) / removes-by-index (`songIndexToRemove`) — so reorder needs a server-side **recreate-in-new-order** path. Add a daemon `playlist-reorder` verb (read songs → re-apply the order) rather than a destructive delete+recreate (which changes the playlist id and risks data loss on a mid-way failure). Then a track-detail editor with ↑/↓ (mirroring the RFX-5 queue affordance).
-- [ ] **MUSIC-RFX-7: Add-to-playlist everywhere**
+- [✓] **MUSIC-RFX-7: Add-to-playlist everywhere**
   **As** a listener, **I want** to add any track to a playlist from anywhere, **so that** curating is frictionless.
   **Acceptance:** an "Add to playlist" action (existing playlists + "new") in every track context (album, search, queue, now-playing) → server reflects the add.
+  **Done:** a reusable "+ Playlist" action opens a picker sheet (the operator's playlists, loaded live via `list-playlists`); clicking one adds the track via `album::playlist_add_track` → `action/music/playlist-update {add:[id]}` (RFX-3). Wired into the album track rows + the now-playing maxi (current track, gated to a loaded song). The picker is a stacked overlay (priority over search); an empty roster hints to create one on the Playlists page (RFX-6). *(Wider surfaces — search/queue rows — reuse the same `OpenAddToPlaylist(song_id)` message; the album + now-playing entry points cover the primary "found a song, file it" flows.)*
 - [ ] **MUSIC-RFX-8: right-click context menus**
   **As** a listener, **I want** right-click actions on rows, **so that** actions are dense + discoverable.
   **Acceptance:** right-click a track/album/playlist row opens a Carbon-styled menu (play, play-next, add-to-playlist, go-to-album, remove) whose actions all work; pairs with multi-select for bulk actions. (Spike iced menu/drag maturity early; inline-button fallback per action if needed — logged, not silent.)
