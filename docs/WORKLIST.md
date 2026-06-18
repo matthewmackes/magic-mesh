@@ -926,6 +926,16 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
   **Code done (2026-06-18):** `workers/xcp_host.rs` — spawned on all roles, self-gates on the dom0 marker (`/etc/xensource-inventory`) so it's a no-op off-hypervisor; on a dom0 it queries `mackes_xcp` locally (`HostTarget::Local`, no SSH) and publishes a capacity doc to `compute/xcp-host/<node>` every 15s. Pure `xcp_host_doc` builder + test; this is what makes **XCP-1's `host_capacity` reachable**. **Still [>]:** "shows in the directory" + "spawning places the VM" need the consumer (XCP-4 `action/provision/hosts` + panel) and a live joined dom0 (XCP-5/3) — verified once a host is enrolled.
 - [ ] **XCP-7: XAPI creds as a mesh secret** — encrypted `<QNM-Shared>/secrets/xcp/<host>.age`, leader-managed; never in `ps`/logs. **Acceptance:** any authorized node drives any enrolled host; creds absent from process listing.
 
+## NEB-CRYPTO-LABEL — show Nebula encryption strength next to the applet (operator-reported live 2026-06-18)
+> Operator: "Add the Current Encryption Strength of the Nebula Design in Text next to the Applet." Surface the live overlay cipher strength as text adjacent to the panel applet. Nebula tunnel cipher is AES-256-GCM (or ChaCha20-Poly1305) with Ed25519 identities (§3 crypto locks); read the **actual** negotiated/configured cipher, don't hardcode.
+- [ ] **NEB-CRYPTO-LABEL-1: live encryption-strength text beside the applet.**
+  **As** an operator, **I want** the current Nebula encryption strength shown as text next to the panel applet, **so that** I can see the overlay's crypto at a glance.
+  **Acceptance** (each runtime-observable):
+    - [ ] the cipher is read from real state (nebula `config.yml` `cipher:` and/or the running tunnel), not a hardcoded literal — e.g. "AES-256-GCM" / "ChaCha20-Poly1305"
+    - [ ] rendered as text immediately adjacent to the applet (Carbon tokens, §4; readable in dark + light)
+    - [ ] **CONFIRM WITH OPERATOR which applet** (bell/notification applet vs apps/Start-menu applet vs a network/overlay status applet) before wiring — default to the network/overlay status surface if one exists
+    - [ ] degrades to "overlay down" / blank when nebula isn't running; no panic on a missing config
+
 ## APPS-LIVE — Applications menu running-state awareness (operator-reported live 2026-06-18)
 > Operator (screenshot): the Applications/Start menu does not indicate which apps are **already running** or **on what host** — e.g. Firefox and other live apps showed no running badge. Only the `fedora (remote desktop)` peer entry showed an online dot. **Make the launcher aware of live application state, mesh-wide.** Same aggregation pattern as [[WORKLOAD-FLEET]] (read live state off the bus, attribute to a node), applied to ordinary XDG/flatpak apps + peer-published apps, not just VMs/containers.
 - [ ] **APPS-LIVE-1: launcher shows running state + host for every entry.**
