@@ -1006,6 +1006,17 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
   **As** an operator, **I want** the Overview/Peers/etc. to settle automatically after a reboot, **so that** I don't see "mackesd is not responding / mesh service isn't answering" and have to click Refresh. (Verified 2026-06-18: after a .13 reboot the GUI opened before mackesd's bus responder answered; env was correct, mackesd came up fine seconds later.)
   **Acceptance:** when a panel's mackesd query fails, it auto-retries on a short backoff for ~30s (the cold-boot warm-up window) before showing the hard "unreachable" state — reuse the BOOT-PEERS-1 "settling" idea fleet-wide; once healthz answers, the panels populate without a manual Refresh.
 
+## OVERVIEW-MESHCARD — "Mesh Network: Setup needed" false negative (operator bug-testing, 2026-06-18)
+- [ ] **OVERVIEW-MESHCARD-1: the Overview "Mesh Network" capability reads not-connected while the overlay is up.**
+  **As** an operator, **I want** Mesh Network to show Active when the overlay is working, **so that** the Overview isn't self-contradictory (Peer Reachability shows 10/10 online + File Sharing + SSH Active, yet Mesh Network says "fabric not connected").
+  **Root cause (confirmed on .13):** `probe_nebula` reads `action/nebula/status` → `active_transport`, but that responder returns `{"active_transport":"offline","peer_count":0}` on a **non-CA peer** (the nebula roster + transport state live in the signer/CA's local sqlite; peers report empty — the same PD-2 gap that put overlay IPs only in the signer's roster). So the card false-negatives on every peer.
+  **Acceptance:** Mesh Network shows Active when the overlay is actually up — derive connectivity from real reachability (healthz node_count/reachable peers, or the `nebula1` interface being up) rather than the unreliable `active_transport` field, OR fix the nebula-status responder to report the real transport on peer nodes.
+
+## MESH-CONNECT-DIALOG — expected connect dialog doesn't fire (operator bug-testing, 2026-06-18)
+- [ ] **MESH-CONNECT-DIALOG-1: a dialog should open when connecting to mesh services, but didn't.**
+  **As** an operator, **I want** the expected connect dialog/progress to appear when connecting to a mesh service, **so that** the action gives feedback. Operator: "I did not see that fire."
+  **Acceptance:** identify the flow (likely a capability **Configure** click on the Overview, or a Mesh Services connect) and confirm the dialog/progress modal opens; if a `Configure`/connect message is a no-op or the modal isn't wired, wire it. *(Needs a one-line clarification from the operator on which click was expected to open the dialog — Overview Configure vs Mesh Services vs Music connect.)*
+
 ## SSH-MESH-NOCREDS — passwordless SSH peer→peer (operator feature, 2026-06-18)
 - [ ] **SSH-MESH-NOCREDS-1: SSH between mesh peers must not prompt for credentials.**
   **As** an operator, **I want** `ssh <peer>.mesh` (and Workbench remote actions) to authenticate automatically between enrolled peers, **so that** I'm never asked for a password or host-key confirmation inside the trust domain.
