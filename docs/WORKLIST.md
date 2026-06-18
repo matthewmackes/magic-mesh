@@ -978,7 +978,7 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
 
 ## BUS-RUN-FULL — mde-bus spool fills the /run tmpfs on small nodes (found during the v10.0.17 roll, 2026-06-18)
 > During the v10.0.17 fleet roll, **7 of 9 nodes** had `/run` (tmpfs) at **100%** — `/run/mde-bus` had grown to ~389 MB (**91k+ message files** + a 50 MB `index.sqlite`), which blocked `dnf` from even writing its lock file (`/run/dnf/rpmtransaction.lock: No space left on device`). Stopgap during the roll: `find /run/mde-bus -type f -name '*.json' -mmin +20 -delete` (freed 100%→15%, all nodes then upgraded). This is a **latent stability bug**, not release-specific: a full `/run` breaks far more than dnf (systemd, ssh, the bus itself) and violates [[boot-recovery-hard-requirement]] on a small node.
-- [ ] **BUS-RUN-FULL-1: bound the mde-bus spool so it can't fill /run.**
+- [✓] **BUS-RUN-FULL-1: bound the mde-bus spool so it can't fill /run.**
   **As** an operator, **I want** the bus to cap its on-disk footprint, **so that** small nodes (DO lighthouses ~947 MB, 4.9 GB VMs with a 391 MB /run) never wedge on a full `/run`.
   **Acceptance** (each runtime-observable):
     - [ ] a retention policy prunes delivered/old messages (by age and/or total bytes) on a periodic worker — `/run/mde-bus` stays under a hard cap (e.g. ≤64 MB) indefinitely

@@ -58,10 +58,14 @@ pub const DEFAULT_TTL_EPHEMERAL_SECS: u64 = 60 * 60;
 pub const DEFAULT_QUOTA_SOFT_BYTES: u64 = 96 * 1024 * 1024;
 pub const DEFAULT_QUOTA_HARD_BYTES: u64 = 144 * 1024 * 1024;
 
-/// Default GC pass cadence — one pass per hour. Faster than
-/// the shortest TTL (24h for `min`) so messages don't linger
-/// too long past expiry.
-pub const DEFAULT_PASS_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Default GC pass cadence. BUS-RUN-FULL-1 (2026-06-18): the old hourly pass let
+/// high-ingest nodes refill `/run` (tmpfs) from the quota cap to 100% between
+/// passes — a live .13 spool reached 389 MB (double the ~195 MB cap) and blocked
+/// dnf. The quota eviction (BULLETPROOF-1, oldest-first) only bounds the spool if
+/// it runs often enough to keep pace with ingest, so the pass is now every 2 min:
+/// ingest per window (a few MB) stays far under the cap headroom, so `/run` never
+/// fills. Still far faster than the shortest TTL.
+pub const DEFAULT_PASS_INTERVAL: Duration = Duration::from_secs(120);
 
 /// Resolved retention policy. Construct via [`RetentionPolicy::default()`]
 /// for the design-locked defaults.
