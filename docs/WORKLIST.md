@@ -976,6 +976,18 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
     - [ ] **CONFIRM WITH OPERATOR which applet** (bell/notification applet vs apps/Start-menu applet vs a network/overlay status applet) before wiring — default to the network/overlay status surface if one exists
     - [ ] degrades to "overlay down" / blank when nebula isn't running; no panic on a missing config
 
+## SVC-VIEW — service visibility gaps (operator bug-testing, 2026-06-18)
+> Operator looked at **Workbench ▸ Mesh ▸ Published Services**, saw "No service rows available", and asked why Airsonic / any services on MDE-KVM-1 aren't listed. Two distinct issues:
+- [ ] **SVC-VIEW-1: Published Services panel is empty on .13 (canonical-7 not populating).**
+  **As** an operator, **I want** the Published Services panel to actually list the 7 canonical mesh services (SSH/NATS/Mesh FS/Media/rsync/WoL/AV) for this peer, **so that** it isn't a dead panel.
+  **Acceptance:** root-cause the empty result — the panel auto-loads on nav (`load()` wired, app.rs:892) and mackesd answers `action/nebula/published-services` (`ipc::nebula::build_published_services`), so empty means the responder returns no rows (likely overlay-IP gating, a GUI/daemon bus-root split, or the stale v10.0.16 mackesd on .13 — note .13's mackesd was NOT rolled with the new writer). After fix, Refresh/open shows the 7 rows with publishable/not-enrolled pills.
+- [ ] **SVC-VIEW-2: no discovery of third-party (Airsonic) or VM-internal services anywhere.**
+  **As** an operator, **I want** to see real services like Airsonic and whatever runs inside MDE-KVM-1, **so that** "services" surfaces reflect reality, not just the canonical mesh daemons.
+  **Acceptance** (each runtime-observable): Published Services is by-design the canonical-7 only — it will never show Airsonic. The discovery paths are gaps:
+    - [ ] **Discovered Hosts** (nmap probe) does NOT scan the Airsonic host `172.20.0.2:4040` (absent from every node's `probe-inventory.json`) — widen the probe scan range / add the LAN host so its open ports (incl. 4040) appear.
+    - [ ] **VM-internal services** (a service running *inside* MDE-KVM-1) are introspected by nothing — the Instances panel lists the VM, not its services. Decide + build a path (guest-agent query, or probe the VM's overlay IP once it's enrolled) so a VM's services are discoverable.
+    - [ ] consider a single "Services across the mesh" view that unions canonical-published + probe-discovered + VM-internal, so the operator has one truthful place to look.
+
 ## APPS-LIVE — Applications menu running-state awareness (operator-reported live 2026-06-18)
 > Operator (screenshot): the Applications/Start menu does not indicate which apps are **already running** or **on what host** — e.g. Firefox and other live apps showed no running badge. Only the `fedora (remote desktop)` peer entry showed an online dot. **Make the launcher aware of live application state, mesh-wide.** Same aggregation pattern as [[WORKLOAD-FLEET]] (read live state off the bus, attribute to a node), applied to ordinary XDG/flatpak apps + peer-published apps, not just VMs/containers.
 - [ ] **APPS-LIVE-1: launcher shows running state + host for every entry.**
