@@ -783,7 +783,7 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
     // The engine grabs the default output device; on a headless peer (no
     // audio) it's absent and transport verbs reply with an error while
     // queue + browse keep working.
-    let engine = Engine::new()
+    let mut engine = Engine::new()
         .map_err(|e| {
             tracing::warn!(error = %e, "no audio output — playback disabled; queue + browse still served");
         })
@@ -793,11 +793,30 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
     // playback the Bus does. Held for the serve loop's lifetime; dropping
     // it (when serve returns) stops the surface thread. A headless peer
     // with no audio engine — or no session bus — simply skips it.
-    let _mpris = engine
+    let mut _mpris = engine
         .as_ref()
         .map(|e| crate::mpris::spawn(e.handle(), queue_path.to_path_buf(), state::data_dir()));
     let mut last_state_write = Instant::now();
+    // MUSIC-AUDIO-BOOTRACE-1 — re-acquire the output device if it wasn't
+    // available at startup. On a cold boot mde-musicd can start before the
+    // PipeWire user session is ready, leaving `engine = None` (audio_available
+    // false) so Play silently no-ops until a manual restart. Retry on a cadence
+    // so playback comes up on its own once the session is.
+    const AUDIO_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+    let mut last_audio_retry = Instant::now();
     while !should_stop() {
+        if engine.is_none() && last_audio_retry.elapsed() >= AUDIO_RETRY_INTERVAL {
+            last_audio_retry = Instant::now();
+            if let Ok(e) = Engine::new() {
+                tracing::info!("audio output acquired on retry — playback enabled");
+                _mpris = Some(crate::mpris::spawn(
+                    e.handle(),
+                    queue_path.to_path_buf(),
+                    state::data_dir(),
+                ));
+                engine = Some(e);
+            }
+        }
         // BUS-INODE-ORPHAN-1 — if the index inode swapped under us (another
         // process recreated it), reopen so we follow the live DB instead of a
         // deleted one. Cheap stat per sweep; reopen only on an actual change.

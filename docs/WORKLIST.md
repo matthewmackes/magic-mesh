@@ -1036,7 +1036,7 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
   **Acceptance:** mde-musicd re-acquires the audio device when it wasn't available at startup — either retry on a backoff / re-check on each play, or order the user unit `After=pipewire.service pipewire-session-manager` (+ a settle wait); after a reboot, Play works with no manual restart; `audio_available` flips true once the session is up. (boot-recovery class, cf. BOOT-WARMUP-RETRY.) *(immediate: restarted on .13.)*
 
 ## KDC-NOISE — KDE Connect floods the event stream (operator bug-testing, 2026-06-18)
-- [ ] **KDC-NOISE-1: KDE Connect emits too many information-level events.**
+- [✓] **KDC-NOISE-1: KDE Connect emits too many information-level events.**
   **As** an operator, **I want** KDE Connect to surface only meaningful device events, **so that** the Alert Center / notifications aren't flooded with low-value info.
   **Acceptance** (each runtime-observable): identify the high-frequency KDC source (battery %, connectivity/ping, periodic presence) and **throttle/suppress** it to Info-or-below that records-without-toasting (like the SELINUX-1 + fdo policy), while keeping the genuinely notable events (paired/unpaired, file received, low-battery threshold, find-my-phone) at their normal severity. Net effect: a paired phone no longer produces a stream of info events; the event count drops to notable-only. Tie into NOTIFY-SRC-3 (KDC→events) so the classification lives in one place.
 

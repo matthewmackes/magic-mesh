@@ -1,6 +1,9 @@
 [Unit]
 Description=MCNF music daemon (Airsonic bridge) — Workstation surfaces only (SVC-7/Q70)
-After=network-online.target
+After=network-online.target pipewire.service pipewire-session-manager.service wireplumber.service
+# MUSIC-AUDIO-BOOTRACE-1 — start after the PipeWire user session so the audio
+# output device exists at first launch (the daemon also retries acquiring it).
+Wants=pipewire.service
 
 [Service]
 Type=simple
