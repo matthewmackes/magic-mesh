@@ -1038,9 +1038,10 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
 - [ ] **MUSIC-RFX-10: Carbon density/row polish**
   **As** a user, **I want** sonixd-class density, **so that** the UI feels like a real music app.
   **Acceptance:** denser rows/grid tuned to sonixd's information density but sourced entirely from `mde-theme` tokens (no raw hex/metrics, §4); mde-theme tests cover any new metric.
-- [ ] **MUSIC-RFX-11: preserve mesh hand-off + shared caches through the refactor**
+- [✓] **MUSIC-RFX-11: preserve mesh hand-off + shared caches through the refactor**
   **As** an operator, **I want** the mesh features intact, **so that** the refactor is non-regressive.
   **Acceptance:** peer playback hand-off (`take-over`), the QNM-Shared artwork cache (MUSIC-ART-SYNC), the audio cache, and MPRIS all still work after the refactor (re-verified live).
+  **Done (verified live on the v10.0.16 fleet, 2026-06-18):** the RFX-4..7 changes were purely additive — `PEER_VERBS` (`peer-states`/`take-over`), `dispatch_peer`/`poll_peers`, the shared-artwork read/write in `get-cover-art`, and the MPRIS `spawn` in `serve()` are all still wired (and still covered by `dispatch_peer_roster_and_take_over` + `read/write_shared_artwork` tests). Live on .13: `peer-states` returned the live roster (UNIT-EAGLE); QNM-Shared `/mnt/mesh-storage/music/artwork` holds **89 shared covers** (MUSIC-ART-SYNC active mesh-wide); after a `mde-musicd` restart `get-state` carries the new `seekable` field (the RFX-2/4/5/6/7 daemon verbs are live). **Deployment note:** `mde-musicd` + the GUI apps are user-scoped, so a system RPM upgrade does NOT restart them — the new music backend activates on next login or `systemctl --user restart mde-musicd` (done on the two active GUI nodes during this roll).
 
 ### LIGHTHOUSE-VARMOUNT — mackesd StateDirectory dep breaks on btrfs-subvol /var (live 2026-06-17 v10.0.14 roll)
 - [✓] **LIGHTHOUSE-VARMOUNT-1: mackesd must start when var.mount is generator-masked**
