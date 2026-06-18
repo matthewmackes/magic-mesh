@@ -3984,6 +3984,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mackes-xcp"
+version = "10.0.16"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "mackesd"
 version = "10.0.16"
 dependencies = [

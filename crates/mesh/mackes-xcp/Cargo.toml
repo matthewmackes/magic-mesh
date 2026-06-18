@@ -1,0 +1,19 @@
+[package]
+name        = "mackes-xcp"
+description = "XCP-ng hypervisor-access layer — drive a dom0 via xe (local or over SSH)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# XCP-1 (A1) — xe-over-SSH is the access path; the executor shells out to
+# `ssh`/`xe`. The crate is deliberately dependency-light (glue, not
+# reimplementation, §6) — std::process drives the commands; the xe-argv
+# construction + output parsing are pure + unit-tested.
+thiserror = "1"

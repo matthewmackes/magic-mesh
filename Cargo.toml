@@ -32,6 +32,7 @@ members = [
     "crates/mesh/mackes-mesh-types",
     "crates/mesh/mackes-nebula-https-tunnel",
     "crates/mesh/mackes-transport",
+    "crates/mesh/mackes-xcp",
     "crates/mesh/mackesd",
     "crates/mesh/mde-enroll",
     "crates/mesh/magic-fleet",
