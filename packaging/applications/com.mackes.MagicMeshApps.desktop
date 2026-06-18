@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=MCNF Applications
+Comment=Mesh-wide app launcher — local apps, peers, workloads, services (APPS)
+Exec=mde-apps-applet
+Icon=magic-mesh
+Terminal=false
+Categories=COSMIC;System;
+# APPS-9 — cosmic-panel discovers applets by this key; the baked layout lists
+# "com.mackes.MagicMeshApps" in plugins_wings/plugins_center in place of Cosmic's
+# CosmicPanelAppButton (app-library). NoDisplay keeps it out of the app launcher
+# (it only ever runs inside the panel).
+X-CosmicApplet=true
+NoDisplay=true

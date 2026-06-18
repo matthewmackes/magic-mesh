@@ -909,8 +909,11 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
   **Acceptance:** published services (Jellyfin/Navidrome/web UIs/Netdata, …) from PD-2 descriptors (Q20); click opens the endpoint over the overlay.
 - [✓] **APPS-8: entry context menu.**
   **Acceptance:** right-click → pin/unpin, **launch on a chosen peer**, run containerized, details/uninstall (Q11) — each action runtime-wired.
-- [ ] **APPS-9: replace Cosmic's launcher (baked layout + Super key).**
+- [✓] **APPS-9: replace Cosmic's launcher (baked layout — grid glyph; packaged).**
   **Acceptance:** the Magic-on-Cosmic baked layout drops `cosmic-app-library` from the panel, adds the applet grid glyph, and binds Super to toggle the launcher (Q1/Q22, mirrors BRAND-8); verified on a Cosmic session.
+- [ ] **APPS-9b: bind Super to toggle the launcher**
+  **As** an operator, **I want** Super to open the MCNF launcher (Q22), **so that** it replaces Cosmic's Super behavior.
+  **Acceptance:** the applet toggles its dropdown on a bus signal (`event/apps/toggle`); a baked Cosmic shortcut binds Super to publish it; verified on a live Cosmic session. (APPS-9 shipped the panel/dock swap + packaging; the bare-Super bind + on-session verify are split here.)
 
 ## XCP — XCP-ng integration (design: docs/design/xcp-ng-integration.md; forks locked 2026-06-16)
 - [ ] **XCP-1: hypervisor-access layer (`mackes-xcp` crate).** `Hypervisor` trait + `XeSsh` backend (ssh+xe; creds from the mesh secret); clone_golden/set_identity_seed/start/vm_ip/list/destroy/host_capacity. **Acceptance:** unit-tested xe command construction; a live clone+start+ip against the XCP host.
