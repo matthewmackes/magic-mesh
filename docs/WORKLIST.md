@@ -1013,9 +1013,9 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
   **Acceptance:** Mesh Network shows Active when the overlay is actually up — derive connectivity from real reachability (healthz node_count/reachable peers, or the `nebula1` interface being up) rather than the unreliable `active_transport` field, OR fix the nebula-status responder to report the real transport on peer nodes.
 
 ## MESH-CONNECT-DIALOG — expected connect dialog doesn't fire (operator bug-testing, 2026-06-18)
-- [ ] **MESH-CONNECT-DIALOG-1: a dialog should open when connecting to mesh services, but didn't.**
-  **As** an operator, **I want** the expected connect dialog/progress to appear when connecting to a mesh service, **so that** the action gives feedback. Operator: "I did not see that fire."
-  **Acceptance:** identify the flow (likely a capability **Configure** click on the Overview, or a Mesh Services connect) and confirm the dialog/progress modal opens; if a `Configure`/connect message is a no-op or the modal isn't wired, wire it. *(Needs a one-line clarification from the operator on which click was expected to open the dialog — Overview Configure vs Mesh Services vs Music connect.)*
+- [ ] **MESH-CONNECT-DIALOG-1: connect/Configure actions must give immediate feedback (best-practice, operator-locked 2026-06-18).**
+  **As** an operator, **I want** every "connect to a mesh service" / Configure action to open a progress-or-confirmation modal with a clear success/failure result, **so that** no action ever silently no-ops. Operator: "Best Practice" — apply it across the board, not one flow.
+  **Acceptance** (each runtime-observable): audit every connect/Configure entry point — Overview capability **Configure** buttons, the **Mesh Services** connect/start, and the **Music** connect — and ensure each (a) opens a modal/progress on click, (b) shows a terminal **success or error** outcome (not a silent close), (c) any button whose handler is currently a no-op is either wired or removed (no dead Configure). Consistent feedback pattern (one shared confirm/progress component) across the flows.
 
 ## SSH-MESH-NOCREDS — passwordless SSH peer→peer (operator feature, 2026-06-18)
 - [ ] **SSH-MESH-NOCREDS-1: SSH between mesh peers must not prompt for credentials.**
