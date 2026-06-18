@@ -307,6 +307,16 @@ pub struct BootReadiness {
     pub pings: Vec<BootPing>,
 }
 
+/// BOOT-STATUS-5 — should the boot-status auto-popup suppress itself? True only
+/// when launched as the autostart popup (`--boot-popup`) AND the mesh is already
+/// all-green: then the persistent applet chip / HOME glance suffices and we don't
+/// pop the window. During the cold-boot warm-up (`ready == false`) the popup opens
+/// so boot status is front-and-centre at login.
+#[must_use]
+pub fn boot_popup_should_suppress(boot_popup: bool, ready: bool) -> bool {
+    boot_popup && ready
+}
+
 impl BootReadiness {
     /// BOOT-PEERS-1 — is the mesh fabric still coming up? True when a snapshot
     /// exists and any *fabric* step (everything but the final peer `directory`
@@ -2264,6 +2274,16 @@ mod tests {
         // ready snapshot + garbage.
         assert!(parse_boot_readiness(r#"{"ready":true,"steps":[]}"#).ready);
         assert_eq!(parse_boot_readiness("nope"), BootReadiness::default());
+    }
+
+    #[test]
+    fn boot_popup_suppresses_only_when_ready() {
+        // BOOT-STATUS-5 — suppress the auto-popup iff it's the boot-popup launch
+        // AND the mesh is already all-green.
+        assert!(boot_popup_should_suppress(true, true)); // ready → no window
+        assert!(!boot_popup_should_suppress(true, false)); // converging → open
+        assert!(!boot_popup_should_suppress(false, true)); // normal launch → open
+        assert!(!boot_popup_should_suppress(false, false));
     }
 
     #[test]

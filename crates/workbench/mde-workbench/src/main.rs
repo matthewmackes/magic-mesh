@@ -39,6 +39,13 @@ struct Cli {
     /// are given `--focus` (the more specific panel target) wins.
     #[arg(long)]
     page: Option<String>,
+    /// BOOT-STATUS-5 — launched as the desktop-session boot-status popup
+    /// (the `org.magicmesh.BootStatus` autostart). Opens at HOME so the
+    /// mesh bring-up is front-and-centre at login, but exits immediately
+    /// (no window) when the mesh is already all-green — the persistent
+    /// applet chip suffices, so it "minimizes to the chip on all-green".
+    #[arg(long)]
+    boot_popup: bool,
 }
 
 impl Cli {
@@ -59,6 +66,18 @@ fn main() -> ExitCode {
         .init();
 
     let cli = Cli::parse();
+
+    // BOOT-STATUS-5 — the boot-status autostart popup: if the mesh is already
+    // all-green at login, don't pop a window (the applet chip / HOME glance is
+    // enough). During the cold-boot warm-up it falls through and opens at HOME.
+    if mde_workbench::panels::home::boot_popup_should_suppress(
+        cli.boot_popup,
+        mde_workbench::panels::home::read_boot_readiness().ready,
+    ) {
+        info!("boot-popup: mesh already ready — not opening the workbench window");
+        return ExitCode::SUCCESS;
+    }
+
     let target = cli.target();
     let initial_focus = target.clone().unwrap_or_default();
 

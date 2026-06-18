@@ -972,10 +972,10 @@ Operator: an informative, at-boot view of how the mesh fabric + app daemons come
     - [ ] subscribes to `state/boot-readiness`, repaints sub-second as steps transition pending→ok.
     - [ ] renders the boot-sequence dependency chain with always-shown sub-steps + per-peer roll-up rows.
     - [ ] collapses to a glanceable green "mesh ready" chip once all-green; re-expands on regression.
-- [ ] **BOOT-STATUS-5: auto-popup at desktop session start**
+- [✓] **BOOT-STATUS-5: auto-popup at desktop session start**
   **As** an operator, **I want** the dialog to auto-open at login, **so that** boot status is front-and-center without me opening it.
   **Acceptance:**
-    - [ ] a `.desktop` autostart opens the dialog at session start; it minimizes to the chip on all-green.
+    - [✓] `packaging/autostart/org.magicmesh.BootStatus.desktop` (shipped via the existing autostart glob → `/etc/xdg/autostart/`; headless roles have no desktop session so it's naturally Workstation-only) runs `mde-workbench --boot-popup`, which opens at HOME (the default landing — the boot dependency chain renders there per BOOT-STATUS-4). It "minimizes to the chip on all-green" two ways: the `--boot-popup` guard (`boot_popup_should_suppress`) exits with NO window when the snapshot is already `ready`, and the HOME boot section itself collapses to the green "✓ Mesh ready" chip when all-green.
 - [ ] **BOOT-STATUS-6: inline remediation actions**
   **As** an operator, **I want** Retry / Restart / View-journal per failed step, **so that** I can fix a stuck service without leaving HOME.
   **Acceptance:**
