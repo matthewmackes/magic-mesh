@@ -32,6 +32,10 @@ use crate::cosmic_compat::prelude::*;
 /// into this struct.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ServiceRow {
+    /// Hostname of the peer publishing this service. Empty for the legacy
+    /// local-only mackesd reply (back-compat); set for every fleet row.
+    #[serde(default)]
+    pub node: String,
     /// Stable service id — matches one of the 7 canonical
     /// entries in mackes.mesh_nebula.CANONICAL_SERVICES.
     pub id: String,
@@ -87,8 +91,15 @@ impl ServicePublishingPanel {
                 self.rows = rows;
                 self.busy = false;
                 self.last_run_at = Some(SystemTime::now());
-                self.last_op = error
-                    .unwrap_or_else(|| format!("{} canonical services loaded", self.rows.len()));
+                self.last_op = error.unwrap_or_else(|| {
+                    let nodes = self
+                        .rows
+                        .iter()
+                        .map(|r| r.node.as_str())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len();
+                    format!("{} services across {nodes} node(s)", self.rows.len())
+                });
                 Task::none()
             }
             Message::RefreshClicked => {
@@ -192,10 +203,11 @@ fn empty_state<'a>(palette: Palette) -> Element<'a, crate::Message> {
                 .colr(palette.text.into_cosmic_color()),
             Space::new().height(Length::Fixed(6.0)),
             text(
-                "Run Refresh after mackesd starts (it answers the \
-                 published-services query over the mesh Bus). The 7 \
-                 canonical services (SSH / NATS / Mesh FS / Media / \
-                 rsync / WoL / AV) will populate from the overlay state."
+                "The 7 canonical services (SSH / NATS / Mesh FS / Media / \
+                 rsync / WoL / AV) are listed for every enrolled peer, read \
+                 from the replicated peer roster on QNM-Shared. Empty means no \
+                 peers are enrolled yet (or QNM-Shared isn't mounted) — click \
+                 Refresh once the mesh is up."
             )
             .size(12)
             .colr(palette.text_muted.into_cosmic_color()),
@@ -253,6 +265,15 @@ fn service_row_view<'a>(r: &ServiceRow, palette: Palette) -> Element<'a, crate::
             ]
             .spacing(2)
             .width(Length::FillPortion(3)),
+            // Which node publishes this service (fleet-wide view).
+            text(if r.node.is_empty() {
+                "this node".to_string()
+            } else {
+                r.node.clone()
+            })
+            .size(12)
+            .colr(palette.text.into_cosmic_color())
+            .width(Length::FillPortion(2)),
             // Monospace-ish numeric column for port/protocol per
             // the Ableton content-zone influence.
             text(port_proto)
@@ -285,20 +306,73 @@ fn service_row_view<'a>(r: &ServiceRow, palette: Palette) -> Element<'a, crate::
 
 // ---- I/O ------------------------------------------------------
 
-/// Read the published-services summary over the mesh Bus (RETIRE-PY.7 — was a
-/// `python3 -c mackes.mesh_nebula` shell-out). Queries
-/// `action/nebula/published-services`, which `mackesd` answers with the same
-/// JSON list-of-rows shape [`parse_summary`] expects. Returns `(rows, error)` —
-/// on any failure the rows are empty and the error carries the operator hint.
+/// The canonical Nebula-published services: `(id, display, default-port, proto)`.
+/// Mirrors `mackesd::ipc::nebula::CANONICAL_SERVICES` (kept in sync by hand — the
+/// workbench can't depend on the mesh daemon crate). Every full mesh node offers
+/// this same fabric set; the only per-node variable is the overlay IP.
+const CANONICAL_SERVICES: [(&str, &str, u16, &str); 7] = [
+    ("ssh", "SSH", 22, "tcp"),
+    ("nats", "NATS broker", 4222, "tcp"),
+    ("fs", "Mesh FS (SSHFS)", 22, "tcp"),
+    ("media", "Media library", 8080, "tcp"),
+    ("sync", "rsync", 873, "tcp"),
+    ("wol", "Wake-on-LAN relay", 9, "udp"),
+    ("av", "Audio/video transport", 5004, "udp"),
+];
+
+/// Build the **fleet-wide** published-services summary: the 7 canonical services
+/// for every enrolled peer in the mesh (operator directive 2026-06-18 — "if it's
+/// responsible to show those 7 service types, show them from all over the
+/// network"). Reads the replicated peer roster (`<workgroup>/peers/*.json`) — the
+/// same cross-node source the Peers panel uses — so it needs no per-node daemon
+/// query. Falls back to the legacy local-only mackesd reply when the roster is
+/// empty (QNM-Shared not mounted yet) so a standalone node still shows its own.
 #[must_use]
 pub fn fetch_summary() -> (Vec<ServiceRow>, Option<String>) {
+    let peers_dir = mackes_mesh_types::peers::default_workgroup_root().join("peers");
+    let peers = mackes_mesh_types::peers::read_peers(&peers_dir);
+    let rows = fleet_rows_from_peers(&peers);
+    if !rows.is_empty() {
+        return (rows, None);
+    }
+    // Fallback: no replicated roster — show at least this node's services.
     match crate::dbus::nebula_request("published-services") {
         Some(json) => parse_summary(&json),
         None => (
             Vec::new(),
-            Some("mackesd not reachable over the Bus — service summary unavailable".into()),
+            Some("no peer roster on QNM-Shared and mackesd not reachable — service summary unavailable".into()),
         ),
     }
+}
+
+/// Pure fleet builder (unit-tested): 7 canonical services × every peer that has
+/// an overlay IP, attributed to the peer's hostname. `is_publishable` = the peer
+/// is enrolled (has an overlay IP) and currently reachable (`healthy`/`degraded`)
+/// — an offline/unreachable peer's services aren't actually serving. Sorted by
+/// node, then canonical service order.
+#[must_use]
+pub fn fleet_rows_from_peers(peers: &[mackes_mesh_types::peers::PeerRecord]) -> Vec<ServiceRow> {
+    let mut enrolled: Vec<&mackes_mesh_types::peers::PeerRecord> = peers
+        .iter()
+        .filter(|p| p.overlay_ip.as_deref().is_some_and(|ip| !ip.is_empty()))
+        .collect();
+    enrolled.sort_by(|a, b| a.hostname.cmp(&b.hostname));
+    let mut rows = Vec::with_capacity(enrolled.len() * CANONICAL_SERVICES.len());
+    for p in enrolled {
+        let reachable = matches!(p.health.as_str(), "healthy" | "degraded");
+        for (id, name, port, proto) in CANONICAL_SERVICES {
+            rows.push(ServiceRow {
+                node: p.hostname.clone(),
+                id: id.to_string(),
+                name: name.to_string(),
+                port,
+                proto: proto.to_string(),
+                overlay_ip: p.overlay_ip.clone(),
+                is_publishable: reachable,
+            });
+        }
+    }
+    rows
 }
 
 /// Pure parser — accepts the JSON string the Python helper
@@ -341,6 +415,59 @@ fn fmt_age(t: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mackes_mesh_types::peers::PeerRecord;
+
+    fn enrolled(host: &str, ip: &str, health: &str) -> PeerRecord {
+        let mut p = PeerRecord::now(host, None, health);
+        p.overlay_ip = Some(ip.to_string());
+        p
+    }
+
+    #[test]
+    fn fleet_rows_seven_services_per_enrolled_peer_sorted_by_node() {
+        let peers = vec![
+            enrolled("node-b", "10.42.0.3", "unreachable"),
+            enrolled("node-a", "10.42.0.2", "healthy"),
+            PeerRecord::now("node-c", None, "healthy"), // no overlay IP → excluded
+        ];
+        let rows = fleet_rows_from_peers(&peers);
+        // 2 enrolled peers × 7 canonical services.
+        assert_eq!(rows.len(), 14);
+        // Sorted by node — node-a first.
+        assert_eq!(rows[0].node, "node-a");
+        // Reachable peer publishes; unreachable peer does not.
+        assert!(rows
+            .iter()
+            .filter(|r| r.node == "node-a")
+            .all(|r| r.is_publishable));
+        assert!(rows
+            .iter()
+            .filter(|r| r.node == "node-b")
+            .all(|r| !r.is_publishable));
+        // Each peer carries the full canonical set + its overlay IP.
+        let a_ids: Vec<_> = rows
+            .iter()
+            .filter(|r| r.node == "node-a")
+            .map(|r| r.id.as_str())
+            .collect();
+        for id in ["ssh", "nats", "fs", "media", "sync", "wol", "av"] {
+            assert!(a_ids.contains(&id), "missing {id}");
+        }
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.node == "node-a")
+                .unwrap()
+                .overlay_ip
+                .as_deref(),
+            Some("10.42.0.2")
+        );
+    }
+
+    #[test]
+    fn fleet_rows_empty_when_no_peer_has_overlay_ip() {
+        let peers = vec![PeerRecord::now("node-c", None, "healthy")];
+        assert!(fleet_rows_from_peers(&peers).is_empty());
+    }
 
     #[test]
     fn parse_summary_returns_empty_with_error_for_empty_input() {
@@ -400,6 +527,7 @@ mod tests {
         let mut p = ServicePublishingPanel::new();
         p.rows = vec![
             ServiceRow {
+                node: "node-a".into(),
                 id: "ssh".into(),
                 name: "SSH".into(),
                 port: 22,
@@ -408,6 +536,7 @@ mod tests {
                 is_publishable: true,
             },
             ServiceRow {
+                node: "node-b".into(),
                 id: "wol".into(),
                 name: "Wake-on-LAN relay".into(),
                 port: 9,
@@ -425,6 +554,7 @@ mod tests {
         p.busy = true;
         let _ = p.update(Message::Loaded {
             rows: vec![ServiceRow {
+                node: "node-a".into(),
                 id: "ssh".into(),
                 name: "SSH".into(),
                 port: 22,
@@ -435,7 +565,7 @@ mod tests {
             error: None,
         });
         assert!(!p.busy);
-        assert!(p.last_op.contains("1 canonical"));
+        assert!(p.last_op.contains("1 service"));
         assert!(p.last_run_at.is_some());
     }
 
