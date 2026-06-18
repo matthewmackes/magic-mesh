@@ -69,6 +69,8 @@ enum Message {
     LaunchMesh(String),
     /// Control a local workload (start/stop/attach) — `(source, name, action)` (APPS-6).
     Workload(String, String, WorkloadAction),
+    /// Open a published mesh service's endpoint over the overlay (APPS-7).
+    OpenService(String),
     /// Re-fetch the entry list.
     Refresh,
 }
@@ -370,6 +372,20 @@ impl Application for AppsApplet {
                 // Reload so the state pill reflects the start/stop.
                 return load_task();
             }
+            Message::OpenService(endpoint) => {
+                // Open the published endpoint over the overlay (APPS-7) in the
+                // default handler (browser for http(s), etc.), detached.
+                if !endpoint.is_empty() {
+                    let _ = std::process::Command::new("setsid")
+                        .args(["--fork", "xdg-open", &endpoint])
+                        .status();
+                }
+                if let Some(id) = self.popup.take() {
+                    return cosmic::task::message(cosmic::Action::Cosmic(
+                        cosmic::app::Action::Surface(destroy_popup(id)),
+                    ));
+                }
+            }
             Message::Refresh => return load_task(),
         }
         Task::none()
@@ -535,6 +551,10 @@ impl AppsApplet {
             "app" if !e.exec.is_empty() => launch.on_press(Message::LaunchLocal(e.exec.clone())),
             "mesh-app" if !e.node.is_empty() => {
                 launch.on_press(Message::LaunchMesh(e.node.clone()))
+            }
+            // Services open their endpoint over the overlay (APPS-7).
+            "service" if !e.endpoint.is_empty() => {
+                launch.on_press(Message::OpenService(e.endpoint.clone()))
             }
             _ => launch,
         };

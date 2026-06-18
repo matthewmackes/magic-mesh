@@ -905,7 +905,7 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
   **Acceptance:** local apps exec directly; a peer app → `action/apps/launch` → mackesd opens a remote-desktop session to that peer (Q9/Q23); peer entries show a presence/health badge but remain launchable when degraded (Q18).
 - [✓] **APPS-6: Workloads tab — inline start/stop/attach.**
   **Acceptance:** containers (podman) + VMs (libvirt) listed (local + peer descriptors); start/stop/attach work inline via `action/compute/*`+`action/provision/*` (Q19).
-- [ ] **APPS-7: Services tab — published mesh services.**
+- [✓] **APPS-7: Services tab — published mesh services.**
   **Acceptance:** published services (Jellyfin/Navidrome/web UIs/Netdata, …) from PD-2 descriptors (Q20); click opens the endpoint over the overlay.
 - [ ] **APPS-8: entry context menu.**
   **Acceptance:** right-click → pin/unpin, **launch on a chosen peer**, run containerized, details/uninstall (Q11) — each action runtime-wired.
