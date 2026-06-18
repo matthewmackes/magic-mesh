@@ -986,6 +986,22 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
     - [ ] consider whether `compute/inventory` (now also mirrored to QNM-Shared for WORKLOAD-FLEET-1) still needs a 10 s bus publish, or can publish less often / not at all (reduce churn)
     - [ ] a `df`-based guard: if `/run` crosses ~85%, the bus emergency-prunes + logs an alert rather than wedging the node
     - [ ] verified on a 391 MB-/run VM: steady-state `/run/mde-bus` stays bounded over a multi-hour soak
+  **Decision space (5 options, operator-requested 2026-06-18; ranked):**
+    1. **Bounded retention worker (recommended).** Periodic prune by age + total-bytes cap, consumer-cursor-safe, + WAL checkpoint/`VACUUM` on `index.sqlite`. Bounds `/run/mde-bus` forever. Most code; the real fix.
+    2. **`/run` df-guard + emergency prune (recommended, as backstop).** Watchdog prunes oldest + alerts when `/run` >~85%. Durable version of the roll stopgap; reactive — pair with #1.
+    3. **Reduce churn at source (recommended quick win).** Drop/slow the biggest producers — esp. `compute/inventory` (now redundant with the QNM-Shared mirror), `meshfs`, `state`. Slows growth, doesn't bound it.
+    4. **Move spool off tmpfs → disk (`/var/lib/mde-bus`) (caution).** Removes `/run` pressure but changes the bus's ephemeral/wiped-on-reboot semantics → persists stale state across reboots (inode/cursor staleness risk) + disk I/O.
+    5. **Enlarge `/run` tmpfs (band-aid).** Headroom only; can't spare much RAM on a 947 MB lighthouse; delays, doesn't fix.
+  **Operator-leaning plan:** #1 + #2 + the #3 quick win.
+
+## WB-OVERVIEW — Workbench Overview/Home accuracy + stub (operator bug-testing, 2026-06-18)
+> Operator on UNIT-EAGLE (.13): the Overview landing's summary tiles are wrong, and the **Home** nav item is a "not ready yet" placeholder.
+- [ ] **WB-OVERVIEW-1: Overview summary tiles show "—" while the data exists.**
+  **As** an operator, **I want** the Overview tiles (Mesh peers / Snapshots / Drift events) to show real counts, **so that** the landing page is trustworthy.
+  **Acceptance** (each runtime-observable): the **Mesh peers** tile shows the live peer count (the Peers list right below already renders ~10 peers from the roster — the tile reads "—"); **Snapshots** + **Drift events** show real counts or an honest "0"/"none" (not a bare "—"); **Updates pending** stays correct (showed 0 post-roll). Source the counts from the same roster/state the lower sections already use.
+- [ ] **WB-OVERVIEW-2: the "Home" panel is a stub ("Home isn't ready yet") — must hold real information (§7).**
+  **As** an operator, **I want** the Overview ▸ Home panel to show real content, **so that** it isn't a dead placeholder (violates the no-stubs DoD, §7).
+  **Acceptance:** Home renders a real dashboard (e.g. this-node identity + health, mesh readiness, peer/online counts, pending updates, quick links) sourced from live state — no "next workbench rollout" placeholder/"Back to Overview" dead-end. Decide whether Home and the Overview landing should merge (they overlap) or Home becomes the personalized this-node summary.
 
 ## SVC-VIEW — service visibility gaps (operator bug-testing, 2026-06-18)
 > Operator looked at **Workbench ▸ Mesh ▸ Published Services**, saw "No service rows available", and asked why Airsonic / any services on MDE-KVM-1 aren't listed. Two distinct issues:
