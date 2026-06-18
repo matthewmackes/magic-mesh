@@ -115,9 +115,17 @@ fn bell_color(severity: Option<Severity>) -> cosmic::iced::Color {
 
 /// NEB-CRYPTO-LABEL — the live Nebula tunnel cipher as a short strength label
 /// ("AES-256-GCM" / "ChaCha20-Poly1305"), or `None` when the overlay is down.
+///
+/// Primary source is the **world-readable** mesh-status snapshot
+/// (`/run/mde/mesh-status.json` → `network.cipher`), written by the root
+/// snapshot timer — the applet runs as the user and cannot read the root-only
+/// `/etc/nebula/config.yml`, and a sandboxed panel may not see `pgrep`. Falls
+/// back to a direct config read where the snapshot isn't present yet.
 fn nebula_cipher() -> Option<String> {
-    // Only report a cipher when the tunnel is actually up — otherwise the label
-    // would imply a live overlay that isn't there.
+    if let Some(c) = cipher_from_snapshot() {
+        return Some(c);
+    }
+    // Fallback: a running tunnel + a readable config (older nodes / no snapshot).
     let running = std::process::Command::new("pgrep")
         .args(["-x", "nebula"])
         .output()
@@ -133,6 +141,20 @@ fn nebula_cipher() -> Option<String> {
     // ChaCha20-Poly1305. Map the config token to its strength label.
     let token = cfg.as_deref().and_then(parse_cipher).unwrap_or("aes");
     Some(cipher_label(token).to_string())
+}
+
+/// Read the friendly cipher label from the world-readable mesh-status snapshot
+/// (`network.cipher`). `None` when the file/field is absent or empty (overlay
+/// down → the snapshot writes an empty cipher).
+fn cipher_from_snapshot() -> Option<String> {
+    let body = std::fs::read_to_string("/run/mde/mesh-status.json").ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let c = v.get("network")?.get("cipher")?.as_str()?.trim();
+    if c.is_empty() {
+        None
+    } else {
+        Some(c.to_string())
+    }
 }
 
 /// Extract the top-level `cipher:` value from a Nebula config, ignoring

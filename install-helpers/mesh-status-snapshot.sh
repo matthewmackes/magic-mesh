@@ -60,11 +60,23 @@ fi
 NET_DEFGW="$(ip route show default 2>/dev/null | awk '{print $3; exit}')"
 # Nebula lighthouse public endpoints (external gateways) from static_host_map.
 NET_GWEPS="$(grep -hoE '([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]+' /etc/nebula/config.yml /etc/nebula/config.yaml 2>/dev/null | sort -u | head -8 | paste -sd, -)"
+# Nebula tunnel cipher strength (NEB-CRYPTO-LABEL). The snapshot runs as root so
+# it can read the root-only config; the bell applet reads the friendly label here
+# (world-readable /run/mde/mesh-status.json) instead of the unreadable config.
+# Only reported when nebula is actually up; unset/`aes` = AES-256-GCM default.
+NET_CIPHER=""
+if systemctl is-active --quiet nebula 2>/dev/null; then
+    NET_CIPHER_TOKEN="$(grep -hoE '^[[:space:]]*cipher:[[:space:]]*[A-Za-z0-9]+' /etc/nebula/config.yml /etc/nebula/config.yaml 2>/dev/null | awk -F: '{gsub(/[[:space:]]/,"",$2); print $2}' | head -1)"
+    case "$NET_CIPHER_TOKEN" in
+        chachapoly|ChaChaPoly|chacha20*) NET_CIPHER="ChaCha20-Poly1305" ;;
+        *)                                NET_CIPHER="AES-256-GCM" ;;
+    esac
+fi
 
 # ── 2. aggregate the directory + every node's shell-status → snapshot ────────
 WG="$WG" SELF="$SELF" SELF_VER="$VER" \
 NET_IF="$NET_IF" NET_IP="$NET_IP" NET_CIDR="$NET_CIDR" NET_ROUTES="$NET_ROUTES" \
-NET_DEFGW="$NET_DEFGW" NET_GWEPS="$NET_GWEPS" \
+NET_DEFGW="$NET_DEFGW" NET_GWEPS="$NET_GWEPS" NET_CIPHER="$NET_CIPHER" \
 python3 - "$OUT" <<'PY' || true
 import json, os, sys, glob, time
 wg=os.environ.get("WG","/mnt/mesh-storage"); self_host=os.environ.get("SELF","")
@@ -106,7 +118,8 @@ network={"overlay_if":os.environ.get("NET_IF","") or "",
          "overlay_cidr":os.environ.get("NET_CIDR","") or "",
          "routes":_split("NET_ROUTES"),
          "default_gw":os.environ.get("NET_DEFGW","") or "",
-         "gateway_endpoints":_split("NET_GWEPS")}
+         "gateway_endpoints":_split("NET_GWEPS"),
+         "cipher":os.environ.get("NET_CIPHER","") or ""}
 snap={"generated_ms":int(time.time()*1000),"self":self_host,"latest_version":latest,
       "online":sum(1 for n in nodes if n["presence"]=="online"),"total":len(nodes),
       "nodes":nodes,"network":network}
