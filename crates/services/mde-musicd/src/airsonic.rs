@@ -731,6 +731,55 @@ impl Client {
         Ok(parse_playlist_entries(&inner))
     }
 
+    /// MUSIC-RFX-3 — `createPlaylist?name=&songId=…` — create a playlist with an
+    /// optional initial track set (repeated `songId`). Returns once the server
+    /// acks `status: ok`.
+    ///
+    /// # Errors
+    /// Transport / API / parse failures.
+    pub async fn create_playlist(
+        &self,
+        name: &str,
+        song_ids: &[String],
+    ) -> Result<(), AirsonicError> {
+        let mut extra: Vec<(&str, &str)> = vec![("name", name)];
+        extra.extend(song_ids.iter().map(|s| ("songId", s.as_str())));
+        self.get("createPlaylist", &extra).await.map(|_| ())
+    }
+
+    /// MUSIC-RFX-3 — `updatePlaylist?playlistId=` — rename (`name`), add tracks
+    /// (`songIdToAdd`), and/or remove tracks by position (`songIndexToRemove`).
+    ///
+    /// # Errors
+    /// Transport / API / parse failures.
+    pub async fn update_playlist(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        add: &[String],
+        remove_indices: &[String],
+    ) -> Result<(), AirsonicError> {
+        let mut extra: Vec<(&str, &str)> = vec![("playlistId", id)];
+        if let Some(n) = name {
+            extra.push(("name", n));
+        }
+        extra.extend(add.iter().map(|s| ("songIdToAdd", s.as_str())));
+        extra.extend(
+            remove_indices
+                .iter()
+                .map(|s| ("songIndexToRemove", s.as_str())),
+        );
+        self.get("updatePlaylist", &extra).await.map(|_| ())
+    }
+
+    /// MUSIC-RFX-3 — `deletePlaylist?id=` — delete a playlist.
+    ///
+    /// # Errors
+    /// Transport / API / parse failures.
+    pub async fn delete_playlist(&self, id: &str) -> Result<(), AirsonicError> {
+        self.get("deletePlaylist", &[("id", id)]).await.map(|_| ())
+    }
+
     /// `getLyricsBySongId` (OpenSubsonic) — lyrics for a song, flattened to
     /// plain lines. Empty when the server has none or lacks the extension
     /// (the GUI shows a fallback). AIR-4.b endpoint, lands with AIR-15.b.4.
@@ -1179,6 +1228,37 @@ mod tests {
         assert!(u.starts_with("http://h:4040/rest/getArtists?"));
         // No double slash from the trimmed base.
         assert!(!u.contains(":4040//rest"));
+    }
+
+    #[test]
+    fn playlist_write_endpoints_repeat_params() {
+        // MUSIC-RFX-3 — createPlaylist carries name + every songId; updatePlaylist
+        // carries playlistId + songIdToAdd/songIndexToRemove; deletePlaylist the id.
+        let c = Client::with_salt("http://h:4040", "alice", "pw", "abc");
+        let create = c.endpoint_url(
+            "createPlaylist",
+            &[("name", "Roadtrip"), ("songId", "s1"), ("songId", "s2")],
+        );
+        assert!(create.starts_with("http://h:4040/rest/createPlaylist?"));
+        assert!(create.contains("name=Roadtrip"));
+        assert_eq!(create.matches("songId=").count(), 2);
+        assert!(create.contains("songId=s1") && create.contains("songId=s2"));
+
+        let update = c.endpoint_url(
+            "updatePlaylist",
+            &[
+                ("playlistId", "pl-9"),
+                ("songIdToAdd", "s3"),
+                ("songIndexToRemove", "0"),
+            ],
+        );
+        assert!(update.contains("playlistId=pl-9"));
+        assert!(update.contains("songIdToAdd=s3"));
+        assert!(update.contains("songIndexToRemove=0"));
+
+        let del = c.endpoint_url("deletePlaylist", &[("id", "pl-9")]);
+        assert!(del.starts_with("http://h:4040/rest/deletePlaylist?"));
+        assert!(del.contains("id=pl-9"));
     }
 
     #[test]

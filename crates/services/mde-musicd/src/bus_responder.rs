@@ -50,7 +50,7 @@ pub const ACTION_VERBS: [&str; 10] = [
 
 /// The library-browse verbs served on `action/music/<verb>`
 /// (asynchronous — each proxies an Airsonic REST call).
-pub const BROWSE_VERBS: [&str; 15] = [
+pub const BROWSE_VERBS: [&str; 18] = [
     "list-albums",
     "list-artists",
     "search",
@@ -66,6 +66,11 @@ pub const BROWSE_VERBS: [&str; 15] = [
     "list-playlists",
     "get-playlist",
     "get-lyrics",
+    // MUSIC-RFX-3 — playlist write verbs (proxy the Subsonic create/update/delete
+    // endpoints; a re-query of list-playlists reflects the change).
+    "playlist-create",
+    "playlist-update",
+    "playlist-delete",
 ];
 
 /// The transport verbs served on `action/music/<verb>` (AIR-2.d — drive
@@ -232,6 +237,25 @@ pub fn dispatch_queue_action(verb: &str, body: &str, q: &mut Queue) -> Dispatch 
     }
 }
 
+/// Extract a `Vec<String>` from a JSON object field that's an array of strings
+/// (e.g. `song_ids`, `add`, `remove_indices`). Numbers are stringified so a
+/// caller can send `remove_indices: [0,2]` as numbers or strings. Missing /
+/// non-array → empty.
+fn str_array(v: &serde_json::Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| {
+                    x.as_str()
+                        .map(str::to_string)
+                        .or_else(|| x.as_u64().map(|n| n.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Parse a queue index from a request body: `{"index":N}` or a bare number.
 fn index_from(body: &str) -> Option<usize> {
     let v: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
@@ -371,6 +395,56 @@ fn dispatch_browse(
                     .await
                     .map(|lines| json!({ "lyrics": lines }))
                     .map_err(|e| e.to_string())
+            }
+            // MUSIC-RFX-3 — playlist write verbs. Body is a JSON object:
+            //   playlist-create {"name":..,"song_ids":[..]?}
+            //   playlist-update {"id":..,"name":..?,"add":[..]?,"remove_indices":[..]?}
+            //   playlist-delete {"id":..} | "<id>"
+            "playlist-create" => {
+                let v: serde_json::Value = serde_json::from_str(body.trim()).unwrap_or(json!({}));
+                let name = v.get("name").and_then(serde_json::Value::as_str);
+                match name {
+                    Some(name) if !name.is_empty() => {
+                        let song_ids = str_array(&v, "song_ids");
+                        client
+                            .create_playlist(name, &song_ids)
+                            .await
+                            .map(|()| json!({ "created": name }))
+                            .map_err(|e| e.to_string())
+                    }
+                    _ => Err("playlist-create: need {name}".to_string()),
+                }
+            }
+            "playlist-update" => {
+                let v: serde_json::Value = serde_json::from_str(body.trim()).unwrap_or(json!({}));
+                match v.get("id").and_then(serde_json::Value::as_str) {
+                    Some(id) if !id.is_empty() => {
+                        let name = v
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|s| !s.is_empty());
+                        let add = str_array(&v, "add");
+                        let remove = str_array(&v, "remove_indices");
+                        client
+                            .update_playlist(id, name, &add, &remove)
+                            .await
+                            .map(|()| json!({ "updated": id }))
+                            .map_err(|e| e.to_string())
+                    }
+                    _ => Err("playlist-update: need {id}".to_string()),
+                }
+            }
+            "playlist-delete" => {
+                let id = song_id_from(body).unwrap_or_default();
+                if id.is_empty() {
+                    Err("playlist-delete: need {id}".to_string())
+                } else {
+                    client
+                        .delete_playlist(&id)
+                        .await
+                        .map(|()| json!({ "deleted": id }))
+                        .map_err(|e| e.to_string())
+                }
             }
             other => Err(format!("unknown browse verb: {other}")),
         }
@@ -809,6 +883,30 @@ mod tests {
         assert!(t.contains("\"ok\":true") && t.contains("intent_id"));
         assert_eq!(state::read_intents(dir.path()).len(), 1);
         assert!(dispatch_peer("bogus", "", dir.path()).contains("\"ok\":false"));
+    }
+
+    #[test]
+    fn str_array_reads_strings_and_numbers() {
+        // MUSIC-RFX-3 — playlist write bodies carry string id arrays and numeric
+        // index arrays; both flatten to Vec<String>.
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"song_ids":["s1","s2"],"remove_indices":[0,2]}"#).unwrap();
+        assert_eq!(str_array(&v, "song_ids"), vec!["s1", "s2"]);
+        assert_eq!(str_array(&v, "remove_indices"), vec!["0", "2"]);
+        // Missing / non-array → empty.
+        assert!(str_array(&v, "absent").is_empty());
+        assert!(str_array(&json!({"x": "scalar"}), "x").is_empty());
+    }
+
+    #[test]
+    fn playlist_write_verbs_are_browse_verbs() {
+        // MUSIC-RFX-3 — the three write verbs are served on the browse poll.
+        for verb in ["playlist-create", "playlist-update", "playlist-delete"] {
+            assert!(
+                BROWSE_VERBS.contains(&verb),
+                "{verb} missing from BROWSE_VERBS"
+            );
+        }
     }
 
     #[test]

@@ -1005,9 +1005,10 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
 - [ ] **MUSIC-RFX-2: engine seek + `seek` transport verb**
   **As** a listener, **I want** to scrub within a track, **so that** I can jump to a position.
   **Acceptance:** engine.rs repositions a *finite* track's decode to a target ms; `action/music/seek` applies it and get-state's position reflects the jump; seek is a no-op (disabled) for live/radio streams.
-- [ ] **MUSIC-RFX-3: playlist write verbs (Subsonic)**
+- [✓] **MUSIC-RFX-3: playlist write verbs (Subsonic)**
   **As** a listener, **I want** to create/rename/delete/modify playlists, **so that** I can curate.
   **Acceptance:** airsonic.rs create_playlist/update_playlist(add/remove/rename)/delete_playlist; bus verbs `playlist-create`/`playlist-update`/`playlist-delete` reply ok; a re-query of getPlaylists reflects the change on the server.
+  **Done:** `Client::{create_playlist,update_playlist,delete_playlist}` build createPlaylist/updatePlaylist/deletePlaylist with repeated `songId`/`songIdToAdd`/`songIndexToRemove` params (`endpoint_url` test asserts the repeats); browse verbs `playlist-create`/`playlist-update`/`playlist-delete` parse `{name,song_ids}` / `{id,name?,add?,remove_indices?}` / `{id}` via the new `str_array` helper and reply `{ok:true,…}`. GUI editor is MUSIC-RFX-6.
 - [ ] **MUSIC-RFX-4: maxi now-playing view (art + scrubber + up-next)**
   **As** a listener, **I want** a full now-playing screen, **so that** I see art, scrub, and what's next.
   **Acceptance:** large cover art (dominant-colour tint), a seek scrubber wired to MUSIC-RFX-2 (position jumps on drag), prev/next, and an up-next list reflecting the real queue; live streams hide the scrubber.
