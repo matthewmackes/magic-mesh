@@ -12,11 +12,12 @@
 #     e.g.  ./install-helpers/sign-release.sh \
 #             target/generate-rpm/magic-mesh-*.rpm magic-mesh-cosmic.iso
 #
-# Requires: gpg with the "MCNF Release Signing" secret key;
+# Requires: gpg with the "Magic Mesh Release Signing" secret key (the key uid is
+# an infra id — UNCHANGED by the MCNF rebrand, like the magic-mesh package id);
 # rpm-sign (for rpmsign) when an .rpm is among the artifacts.
 set -euo pipefail
 
-KEY_ID="${MAGIC_MESH_SIGN_KEY:-MCNF Release Signing}"
+KEY_ID="${MAGIC_MESH_SIGN_KEY:-Magic Mesh Release Signing}"
 
 if [ "$#" -lt 1 ]; then
   echo "usage: $0 <artifact>...  (RPMs are rpmsign'd; everything lands in SHA256SUMS + .asc)" >&2
