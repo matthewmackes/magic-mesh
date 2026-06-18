@@ -1001,6 +1001,11 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
   **Fix (one line):** add `"instances" => compute_panel::ComputePanel::load(),` to the nav-load match. **Workaround now:** click **Refresh** on the panel.
   **Acceptance:** opening Instances auto-populates within a load cycle; MDE-KVM-1 shows attributed to `fedora` from .13 without clicking Refresh. *(Lesson: WORKLOAD-FLEET-1's data path was verified end-to-end but not the live panel on a peer node — add a nav-load smoke check.)*
 
+## KDC-NOISE — KDE Connect floods the event stream (operator bug-testing, 2026-06-18)
+- [ ] **KDC-NOISE-1: KDE Connect emits too many information-level events.**
+  **As** an operator, **I want** KDE Connect to surface only meaningful device events, **so that** the Alert Center / notifications aren't flooded with low-value info.
+  **Acceptance** (each runtime-observable): identify the high-frequency KDC source (battery %, connectivity/ping, periodic presence) and **throttle/suppress** it to Info-or-below that records-without-toasting (like the SELINUX-1 + fdo policy), while keeping the genuinely notable events (paired/unpaired, file received, low-battery threshold, find-my-phone) at their normal severity. Net effect: a paired phone no longer produces a stream of info events; the event count drops to notable-only. Tie into NOTIFY-SRC-3 (KDC→events) so the classification lives in one place.
+
 ## MUSIC-ALBUMS — Music app redesign (Claude Design import, design: docs/design/music-albums.md, 2026-06-18)
 > Operator: "Update the GUI for the Music Application with [Albums.dc.html] … Implement." Imported via the Claude Design connector. A full Carbon-Gray-100 rebuild of the mde-music view: 48px header / 256px sidebar / album grid / 80px persistent player. View rebuild over the existing music backend (§6 glue-not-reimpl).
 - [ ] **MUSIC-ALBUMS-1: Carbon grid shell** (48/1fr/80 rows × 256/1fr cols: header + sidebar + content + player), dark+light via mde-theme.
