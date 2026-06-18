@@ -158,6 +158,63 @@ pub async fn fetch_queue() -> Result<(Vec<String>, usize), String> {
     with_bus(|p, rt| Ok(parse_queue(&req(p, rt, "action/music/get-queue", None)?))).await
 }
 
+/// MUSIC-RFX-5 — move the queue track at `from` to index `to`
+/// (`action/music/queue-move`, body `{"from":,"to":}`). Reorders + persists
+/// daemon-side, keeping the cursor on the playing track (RFX-1).
+///
+/// # Errors
+/// Bus-store / request / timeout failures.
+pub async fn queue_move(from: usize, to: usize) -> Result<(), String> {
+    let body = serde_json::json!({ "from": from, "to": to }).to_string();
+    with_bus(move |p, rt| {
+        req(p, rt, "action/music/queue-move", Some(&body))?;
+        Ok(())
+    })
+    .await
+}
+
+/// MUSIC-RFX-5 — remove the queue track at `idx`
+/// (`action/music/queue-remove`, body `{"index":}`).
+///
+/// # Errors
+/// Bus-store / request / timeout failures.
+pub async fn queue_remove(idx: usize) -> Result<(), String> {
+    let body = serde_json::json!({ "index": idx }).to_string();
+    with_bus(move |p, rt| {
+        req(p, rt, "action/music/queue-remove", Some(&body))?;
+        Ok(())
+    })
+    .await
+}
+
+/// MUSIC-RFX-5 — remove a multi-selected set of queue indices
+/// (`action/music/queue-remove-many`, body `{"indices":[…]}`).
+///
+/// # Errors
+/// Bus-store / request / timeout failures.
+pub async fn queue_remove_many(indices: Vec<usize>) -> Result<(), String> {
+    let body = serde_json::json!({ "indices": indices }).to_string();
+    with_bus(move |p, rt| {
+        req(p, rt, "action/music/queue-remove-many", Some(&body))?;
+        Ok(())
+    })
+    .await
+}
+
+/// MUSIC-RFX-5 — move the queue track at `idx` to play immediately after the
+/// current one (`action/music/queue-move-to-next`, body `{"index":}`).
+///
+/// # Errors
+/// Bus-store / request / timeout failures.
+pub async fn queue_move_to_next(idx: usize) -> Result<(), String> {
+    let body = serde_json::json!({ "index": idx }).to_string();
+    with_bus(move |p, rt| {
+        req(p, rt, "action/music/queue-move-to-next", Some(&body))?;
+        Ok(())
+    })
+    .await
+}
+
 /// Parse a `get-lyrics` reply (`{ok, result:{lyrics:[line]}}`) into lines.
 #[must_use]
 pub fn parse_lyrics_reply(reply_json: &str) -> Vec<String> {

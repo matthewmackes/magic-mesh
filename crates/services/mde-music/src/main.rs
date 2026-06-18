@@ -38,6 +38,24 @@ fn main() -> cosmic::iced::Result {
     cosmic::app::run::<State>(cosmic::app::Settings::default(), ())
 }
 
+/// MUSIC-RFX-5 — run a queue-mutation (an RFX-1 daemon verb) then re-fetch the
+/// queue so the maxi Queue tab reflects the new order/contents. The mutation's
+/// result is ignored (a failed verb just leaves the queue unchanged on reload).
+fn reload_queue_after(
+    mutation: impl std::future::Future<Output = Result<(), String>> + Send + 'static,
+) -> cosmic::iced::Task<Message> {
+    cosmic::iced::Task::perform(
+        async move {
+            let _ = mutation.await;
+            nowplaying::fetch_queue().await
+        },
+        |r| match r {
+            Ok((songs, current)) => Message::QueueLoaded(songs, current),
+            Err(_) => Message::QueueLoaded(Vec::new(), 0),
+        },
+    )
+}
+
 /// Convert an mde-theme Carbon token (`Rgba`, u8 channels) to this crate's
 /// `iced::Color` at alpha `a`. mde-music's iced version skews from the one
 /// `mde_theme::into_iced_color()` targets, so the conversion is by hand — the
@@ -157,6 +175,9 @@ struct State {
     queue_current: usize,
     /// Resolved queue song-id -> title (fan-out via get-song).
     queue_titles: std::collections::HashMap<String, String>,
+    /// MUSIC-RFX-5 — the multi-selected queue row indices (for "remove selected").
+    /// Cleared on any structural mutation since indices shift after a reorder/remove.
+    queue_selected: std::collections::HashSet<usize>,
     /// AIR-15.b.4 — maxi tab + the current track's lyrics lines.
     maxi_tab: MaxiTab,
     maxi_lyrics: Vec<String>,
@@ -206,6 +227,13 @@ enum Message {
     TakeOver(String),
     /// AIR-15.b — the play queue snapshot loaded (song-ids, current index).
     QueueLoaded(Vec<String>, usize),
+    /// MUSIC-RFX-5 — queue management (all via the RFX-1 daemon verbs).
+    QueueRemove(usize),
+    QueuePlayNext(usize),
+    QueueMoveUp(usize),
+    QueueMoveDown(usize),
+    QueueToggleSelect(usize),
+    QueueRemoveSelected,
     /// AIR-15.b — a queue song-id resolved to a title.
     QueueTitle(String, String),
     /// First-run form field edits.
@@ -313,6 +341,7 @@ impl State {
             queue_songs: Vec::new(),
             queue_current: 0,
             queue_titles: std::collections::HashMap::new(),
+            queue_selected: std::collections::HashSet::new(),
             maxi_tab: MaxiTab::Queue,
             maxi_lyrics: Vec::new(),
             maxi_peers: Vec::new(),
@@ -412,6 +441,43 @@ impl State {
             Message::QueueTitle(id, title) => {
                 self.queue_titles.insert(id, title);
                 Task::none()
+            }
+            // MUSIC-RFX-5 — each mutation drives the RFX-1 daemon verb then
+            // re-fetches the queue (indices shift, so the selection is cleared).
+            Message::QueueRemove(idx) => {
+                self.queue_selected.clear();
+                reload_queue_after(nowplaying::queue_remove(idx))
+            }
+            Message::QueuePlayNext(idx) => {
+                self.queue_selected.clear();
+                reload_queue_after(nowplaying::queue_move_to_next(idx))
+            }
+            Message::QueueMoveUp(idx) => {
+                self.queue_selected.clear();
+                if idx == 0 {
+                    Task::none()
+                } else {
+                    reload_queue_after(nowplaying::queue_move(idx, idx - 1))
+                }
+            }
+            Message::QueueMoveDown(idx) => {
+                self.queue_selected.clear();
+                reload_queue_after(nowplaying::queue_move(idx, idx + 1))
+            }
+            Message::QueueToggleSelect(idx) => {
+                if !self.queue_selected.remove(&idx) {
+                    self.queue_selected.insert(idx);
+                }
+                Task::none()
+            }
+            Message::QueueRemoveSelected => {
+                let mut idxs: Vec<usize> = self.queue_selected.drain().collect();
+                idxs.sort_unstable();
+                if idxs.is_empty() {
+                    Task::none()
+                } else {
+                    reload_queue_after(nowplaying::queue_remove_many(idxs))
+                }
             }
             Message::MaxiTabSelected(t) => {
                 self.maxi_tab = t;
@@ -1317,8 +1383,20 @@ impl State {
         ]
         .spacing(8);
 
-        let mut queue =
-            column![text(format!("Queue ({} tracks)", self.queue_songs.len())).size(15)].spacing(4);
+        // MUSIC-RFX-5 — the queue tab is now editable: per-row select / move /
+        // play-next / remove, plus a "Remove selected" action. iced has no
+        // native drag-drop list, so reorder is the accessible ↑/↓ affordance
+        // (the same RFX-1 `queue-move` verb a drag would call).
+        let last = self.queue_songs.len().saturating_sub(1);
+        let header_row = row![
+            text(format!("Queue ({} tracks)", self.queue_songs.len()))
+                .size(15)
+                .width(Length::Fill),
+            button(text(format!("Remove selected ({})", self.queue_selected.len())).size(12))
+                .on_press(Message::QueueRemoveSelected),
+        ]
+        .align_y(cosmic::iced::Alignment::Center);
+        let mut queue = column![header_row].spacing(4);
         for (i, sid) in self.queue_songs.iter().enumerate() {
             let label = self
                 .queue_titles
@@ -1331,7 +1409,30 @@ impl State {
             } else {
                 "   "
             };
-            queue = queue.push(text(format!("{marker}{label}")).size(13));
+            let selected = self.queue_selected.contains(&i);
+            let sel_glyph = if selected { "☑" } else { "☐" };
+            let mut row_el = row![
+                button(text(sel_glyph).size(13)).on_press(Message::QueueToggleSelect(i)),
+                text(format!("{marker}{label}"))
+                    .size(13)
+                    .width(Length::Fill),
+            ]
+            .spacing(6)
+            .align_y(cosmic::iced::Alignment::Center);
+            if i > 0 {
+                row_el = row_el.push(button(text("↑").size(12)).on_press(Message::QueueMoveUp(i)));
+            }
+            if i < last {
+                row_el =
+                    row_el.push(button(text("↓").size(12)).on_press(Message::QueueMoveDown(i)));
+            }
+            // "Play next" is meaningless for the already-current track.
+            if i != self.queue_current {
+                row_el = row_el
+                    .push(button(text("Play next").size(11)).on_press(Message::QueuePlayNext(i)));
+            }
+            row_el = row_el.push(button(text("✕").size(12)).on_press(Message::QueueRemove(i)));
+            queue = queue.push(row_el);
         }
 
         let lyrics: Element<'_, Message> = if self.maxi_lyrics.is_empty() {
