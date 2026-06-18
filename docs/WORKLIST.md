@@ -1001,6 +1001,16 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
   **Fix (one line):** add `"instances" => compute_panel::ComputePanel::load(),` to the nav-load match. **Workaround now:** click **Refresh** on the panel.
   **Acceptance:** opening Instances auto-populates within a load cycle; MDE-KVM-1 shows attributed to `fedora` from .13 without clicking Refresh. *(Lesson: WORKLOAD-FLEET-1's data path was verified end-to-end but not the live panel on a peer node — add a nav-load smoke check.)*
 
+## MUSIC-ALBUMS — Music app redesign (Claude Design import, design: docs/design/music-albums.md, 2026-06-18)
+> Operator: "Update the GUI for the Music Application with [Albums.dc.html] … Implement." Imported via the Claude Design connector. A full Carbon-Gray-100 rebuild of the mde-music view: 48px header / 256px sidebar / album grid / 80px persistent player. View rebuild over the existing music backend (§6 glue-not-reimpl).
+- [ ] **MUSIC-ALBUMS-1: Carbon grid shell** (48/1fr/80 rows × 256/1fr cols: header + sidebar + content + player), dark+light via mde-theme.
+- [ ] **MUSIC-ALBUMS-2: sidebar nav** (Home, Internet Radio, LIBRARY{Albums,Artists,Songs,Playlists}, Recently Added, Settings) with the active blue accent rail; each routes to existing mde-music views.
+- [ ] **MUSIC-ALBUMS-3: Albums grid** (auto-fill 168px cards — square art + 2-line title + artist, hover accent outline) bound to the real library via the windowed art loader (no large-library stall).
+- [ ] **MUSIC-ALBUMS-4: header search + Sort** (filter artists/albums/songs).
+- [ ] **MUSIC-ALBUMS-5: 80px persistent player** (mini-art + shuffle/prev/play/next/repeat + scrubber + volume) reusing the existing playback-bar state, on every view.
+- [ ] **MUSIC-ALBUMS-6: account/avatar + Settings routing** (mesh routing prefs).
+- [ ] **MUSIC-ALBUMS-7: mde-theme Carbon Blue-50 accent token** (`#4589ff`) if absent, palette-tested (§4) — active-nav rail + hover outline read it.
+
 ## ROUTING-VALIDATE — Routing overlay-reachability never returns a result (operator bug-testing, 2026-06-18)
 - [✓] **ROUTING-VALIDATE-1: "Run validation now" requests a run but the result never comes back.** DONE 2026-06-18: poll the verdict on a 3s cadence (bounded MAX_POLLS) after requesting a run; tests updated.
   **As** an operator, **I want** the Routing panel to show overlay-reachability results after a run, **so that** it isn't a permanently-empty panel ("No validation run yet" persists after clicking Run, which confirms "requested a fresh overlay-reachability run (the leader mints it)").
