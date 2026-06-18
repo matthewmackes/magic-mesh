@@ -11,6 +11,15 @@ use std::time::Duration;
 
 use crate::hub::HubCard;
 
+/// MUSIC-RESPONSIVE-1 — browse RPC timeout. The daemon answers local-DB verbs in
+/// well under a second, but the first cold call that reaches out to Airsonic
+/// (notably `list-radio`, which fetches the external station list) can take
+/// several seconds; the old flat 5 s dead-ended that view with a scary
+/// "daemon not responding". 10 s gives the cold path headroom while still
+/// surfacing a genuinely-down daemon. The GUI also auto-retries once on a
+/// timeout (cold-boot race), so this is the ceiling, not the common wait.
+pub const BROWSE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// One row in a library grid: a stable id + a display label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryItem {
@@ -147,7 +156,7 @@ pub async fn fetch(verb: &'static str) -> Result<Vec<LibraryItem>, String> {
                 mde_bus::hooks::config::Priority::Default,
                 None,
                 None,
-                Duration::from_secs(5),
+                BROWSE_TIMEOUT,
             ))
             .map_err(|e| format!("daemon not responding ({e})"))?;
         Ok(parse_items(reply.body.as_deref().unwrap_or("")))
@@ -178,7 +187,7 @@ pub async fn fetch_albums_by_genre(genre: String) -> Result<Vec<LibraryItem>, St
                 mde_bus::hooks::config::Priority::Default,
                 None,
                 Some(&genre),
-                Duration::from_secs(5),
+                BROWSE_TIMEOUT,
             ))
             .map_err(|e| format!("daemon not responding ({e})"))?;
         Ok(parse_items(reply.body.as_deref().unwrap_or("")))
@@ -209,7 +218,7 @@ pub async fn fetch_albums_by_artist(artist_id: String) -> Result<Vec<LibraryItem
                 mde_bus::hooks::config::Priority::Default,
                 None,
                 Some(&artist_id),
-                Duration::from_secs(5),
+                BROWSE_TIMEOUT,
             ))
             .map_err(|e| format!("daemon not responding ({e})"))?;
         Ok(parse_items(reply.body.as_deref().unwrap_or("")))
@@ -240,7 +249,7 @@ pub async fn fetch_podcast_episodes(channel_id: String) -> Result<Vec<LibraryIte
                 mde_bus::hooks::config::Priority::Default,
                 None,
                 Some(&channel_id),
-                Duration::from_secs(5),
+                BROWSE_TIMEOUT,
             ))
             .map_err(|e| format!("daemon not responding ({e})"))?;
         Ok(parse_items(reply.body.as_deref().unwrap_or("")))

@@ -145,6 +145,12 @@ struct State {
     loading: bool,
     /// Last fetch error (e.g. "daemon not responding"), shown in-pane.
     load_error: Option<String>,
+    /// MUSIC-RESPONSIVE-1 — guards the one-shot auto-retry: a browse fetch that
+    /// times out (the daemon briefly busy / not yet warm after launch) retries
+    /// itself once before surfacing the error, so a cold-boot race or a slow
+    /// first Airsonic call recovers instead of dead-ending the view. Reset on
+    /// every fresh navigation + on a successful load.
+    load_retried: bool,
     /// AIR-14 — the live search query, its debounce generation, and the
     /// last results. `search_open` gates the results sheet over the page.
     search_query: String,
@@ -240,6 +246,9 @@ enum Message {
     ItemsLoaded(Vec<LibraryItem>),
     /// A category fetch failed (daemon down / no server).
     ItemsFailed(String),
+    /// MUSIC-RESPONSIVE-1 — re-issue the current route's grid fetch (the
+    /// one-shot auto-retry after a timeout).
+    RetryLoad,
     /// AIR-11.c — the window resized; updates the adaptive-grid column count.
     WindowResized(f32),
     /// AIR-11.c.2 — the library grid scrolled; record the offset per route.
@@ -361,6 +370,7 @@ impl State {
             items: Vec::new(),
             loading: false,
             load_error: None,
+            load_retried: false,
             search_query: String::new(),
             search_seq: 0,
             search_results: None,
@@ -400,12 +410,38 @@ impl State {
         }
     }
 
+    /// MUSIC-RESPONSIVE-1 — re-issue the grid fetch for the current route (used
+    /// by the one-shot timeout auto-retry). Mirrors the per-route fetch the
+    /// Open* handlers dispatch; non-grid routes (Hub/Album/Search) have nothing
+    /// to reload.
+    fn reload_current(&self) -> Task<Message> {
+        let to_msg = |r: Result<Vec<library::LibraryItem>, String>| match r {
+            Ok(items) => Message::ItemsLoaded(items),
+            Err(e) => Message::ItemsFailed(e),
+        };
+        match self.nav.current() {
+            Route::Category(card) => match library::verb_for(*card) {
+                Some(verb) => Task::perform(library::fetch(verb), to_msg),
+                None => Task::none(),
+            },
+            Route::Artist(id, _) => {
+                Task::perform(library::fetch_albums_by_artist(id.clone()), to_msg)
+            }
+            Route::Genre(g) => Task::perform(library::fetch_albums_by_genre(g.clone()), to_msg),
+            Route::Podcast(id, _) => {
+                Task::perform(library::fetch_podcast_episodes(id.clone()), to_msg)
+            }
+            _ => Task::none(),
+        }
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::OpenCard(card) => {
                 self.nav.push(Route::Category(card));
                 self.items.clear();
                 self.load_error = None;
+                self.load_retried = false;
                 // Fetch the category from the daemon over the Bus (AIR-10.b)
                 // when it's backed by a verb; the rest are AIR-4.b endpoints.
                 if let Some(verb) = library::verb_for(card) {
@@ -421,6 +457,7 @@ impl State {
             Message::ItemsLoaded(items) => {
                 self.items = items;
                 self.loading = false;
+                self.load_retried = false;
                 // AIR-11.c.2 — restore this category's saved scroll offset.
                 let y = self
                     .grid_scroll
@@ -446,10 +483,31 @@ impl State {
                 Task::batch([restore, art])
             }
             Message::ItemsFailed(e) => {
+                // MUSIC-RESPONSIVE-1 — a timeout ("daemon not responding") right
+                // after launch is usually the daemon not yet warm / briefly busy,
+                // not a real outage (the daemon answers in <1s once ready). Retry
+                // the current route's fetch once before surfacing the error, so
+                // the cold-boot race recovers silently instead of dead-ending.
+                let timed_out = e.contains("daemon not responding");
+                if timed_out && !self.load_retried {
+                    self.load_retried = true;
+                    // Stay in the loading state; retry after a short settle.
+                    return Task::perform(
+                        async {
+                            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                        },
+                        |()| Message::RetryLoad,
+                    );
+                }
                 self.items.clear();
                 self.loading = false;
                 self.load_error = Some(e);
                 Task::none()
+            }
+            Message::RetryLoad => {
+                self.load_error = None;
+                self.loading = true;
+                self.reload_current()
             }
             Message::ArtLoaded(id, handle) => {
                 if let Some(h) = handle {
@@ -694,6 +752,7 @@ impl State {
                 self.dismiss_search();
                 self.items.clear();
                 self.load_error = None;
+                self.load_retried = false;
                 self.loading = true;
                 Task::perform(library::fetch_albums_by_artist(id), |r| match r {
                     Ok(items) => Message::ItemsLoaded(items),
@@ -705,6 +764,7 @@ impl State {
                 self.dismiss_search();
                 self.items.clear();
                 self.load_error = None;
+                self.load_retried = false;
                 self.loading = true;
                 Task::perform(library::fetch_albums_by_genre(genre), |r| match r {
                     Ok(items) => Message::ItemsLoaded(items),
@@ -716,6 +776,7 @@ impl State {
                 self.dismiss_search();
                 self.items.clear();
                 self.load_error = None;
+                self.load_retried = false;
                 self.loading = true;
                 Task::perform(library::fetch_podcast_episodes(id), |r| match r {
                     Ok(items) => Message::ItemsLoaded(items),
