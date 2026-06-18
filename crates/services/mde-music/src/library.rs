@@ -187,6 +187,37 @@ pub async fn fetch_albums_by_genre(genre: String) -> Result<Vec<LibraryItem>, St
     .map_err(|e| format!("fetch task join error: {e}"))?
 }
 
+/// Fetch one artist's albums over the Bus (`action/music/albums-by-artist`, the
+/// artist id in the body). Rows render like the album grid (click → album page).
+/// Fixes the dead "click an artist" path (breadcrumb updated, no content loaded).
+///
+/// # Errors
+/// Bus-store / request / timeout failures (daemon not running).
+pub async fn fetch_albums_by_artist(artist_id: String) -> Result<Vec<LibraryItem>, String> {
+    tokio::task::spawn_blocking(move || -> Result<Vec<LibraryItem>, String> {
+        let bus_root = mde_bus::default_data_dir().ok_or_else(|| "no Bus data dir".to_string())?;
+        let persist =
+            mde_bus::persist::Persist::open(bus_root).map_err(|e| format!("Bus store: {e}"))?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        let reply = rt
+            .block_on(mde_bus::rpc::request(
+                &persist,
+                "action/music/albums-by-artist",
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&artist_id),
+                Duration::from_secs(5),
+            ))
+            .map_err(|e| format!("daemon not responding ({e})"))?;
+        Ok(parse_items(reply.body.as_deref().unwrap_or("")))
+    })
+    .await
+    .map_err(|e| format!("fetch task join error: {e}"))?
+}
+
 /// Fetch a podcast channel's episodes over the Bus
 /// (`action/music/podcast-episodes`, the channel id in the body). The rows
 /// render like any grid (each episode's id is its playable `streamId`).

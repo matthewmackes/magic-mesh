@@ -598,6 +598,16 @@ impl Client {
         Ok(parse_genres(&inner))
     }
 
+    /// `getArtist` — one artist's albums (the artist browse page). Fixes the
+    /// dead "click an artist" path that pushed a breadcrumb but loaded nothing.
+    ///
+    /// # Errors
+    /// Transport / API / parse failures.
+    pub async fn get_artist(&self, id: &str) -> Result<Vec<Album>, AirsonicError> {
+        let inner = self.get("getArtist", &[("id", id)]).await?;
+        Ok(parse_artist_albums(&inner))
+    }
+
     /// `getAlbumList2?type=byGenre&genre=<g>` — the albums in one genre
     /// (the AIR-13 genre page).
     ///
@@ -845,6 +855,22 @@ pub fn parse_artists(inner: &Value) -> Vec<Artist> {
 pub fn parse_album_list2(inner: &Value) -> Vec<Album> {
     inner
         .get("albumList2")
+        .and_then(|a| a.get("album"))
+        .and_then(Value::as_array)
+        .map(|albums| {
+            albums
+                .iter()
+                .filter_map(|a| serde_json::from_value(a.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse a `getArtist` reply's `artist.album[]` into [`Album`] rows.
+#[must_use]
+pub fn parse_artist_albums(inner: &Value) -> Vec<Album> {
+    inner
+        .get("artist")
         .and_then(|a| a.get("album"))
         .and_then(Value::as_array)
         .map(|albums| {
@@ -1401,6 +1427,21 @@ mod tests {
         assert_eq!(albums[0].name, "Moon Safari");
         assert_eq!(albums[0].year, Some(1998));
         assert_eq!(albums[0].cover_art, "al-a1");
+    }
+
+    #[test]
+    fn parse_artist_albums_reads_the_artist_album_list() {
+        // getArtist reply shape: {artist: {id, name, album: [...]}}.
+        let inner = json!({"artist": {"id": "2", "name": "Air", "album": [
+            {"id": "a1", "name": "Moon Safari", "artist": "Air", "artistId": "2"},
+            {"id": "a2", "name": "Talkie Walkie", "artist": "Air", "artistId": "2"}
+        ]}});
+        let albums = parse_artist_albums(&inner);
+        assert_eq!(albums.len(), 2);
+        assert_eq!(albums[0].name, "Moon Safari");
+        assert_eq!(albums[1].name, "Talkie Walkie");
+        // empty / missing artist → no albums, no panic.
+        assert!(parse_artist_albums(&json!({})).is_empty());
     }
 
     #[test]

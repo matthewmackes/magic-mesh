@@ -688,9 +688,17 @@ impl State {
                 })
             }
             Message::OpenArtist(id, name) => {
-                self.nav.push(Route::Artist(id, name));
+                // Artist browse — load the artist's albums into the grid (was a
+                // no-op: it pushed the breadcrumb but never loaded the next layer).
+                self.nav.push(Route::Artist(id.clone(), name));
                 self.dismiss_search();
-                Task::none()
+                self.items.clear();
+                self.load_error = None;
+                self.loading = true;
+                Task::perform(library::fetch_albums_by_artist(id), |r| match r {
+                    Ok(items) => Message::ItemsLoaded(items),
+                    Err(e) => Message::ItemsFailed(e),
+                })
             }
             Message::OpenGenre(genre) => {
                 self.nav.push(Route::Genre(genre.clone()));
@@ -1317,6 +1325,7 @@ impl State {
                             btn = match route {
                                 Route::Category(HubCard::Albums)
                                 | Route::Genre(_)
+                                | Route::Artist(..)
                                 | Route::Category(HubCard::Recents) => btn.on_press(
                                     Message::OpenAlbum(item.id.clone(), item.label.clone()),
                                 ),

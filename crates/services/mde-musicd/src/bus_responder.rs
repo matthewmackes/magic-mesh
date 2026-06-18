@@ -50,13 +50,14 @@ pub const ACTION_VERBS: [&str; 10] = [
 
 /// The library-browse verbs served on `action/music/<verb>`
 /// (asynchronous — each proxies an Airsonic REST call).
-pub const BROWSE_VERBS: [&str; 18] = [
+pub const BROWSE_VERBS: [&str; 19] = [
     "list-albums",
     "list-artists",
     "search",
     "get-album",
     "list-genres",
     "albums-by-genre",
+    "albums-by-artist",
     "get-song",
     "get-cover-art",
     "list-podcasts",
@@ -328,6 +329,16 @@ fn dispatch_browse(
                 let genre = song_id_from(body).unwrap_or_default();
                 client
                     .get_albums_by_genre(&genre, 200)
+                    .await
+                    .map(|a| json!({ "albums": a }))
+                    .map_err(|e| e.to_string())
+            }
+            // Artist browse — one artist's albums (the dead "click an artist"
+            // path now loads its next layer).
+            "albums-by-artist" => {
+                let id = song_id_from(body).unwrap_or_default();
+                client
+                    .get_artist(&id)
                     .await
                     .map(|a| json!({ "albums": a }))
                     .map_err(|e| e.to_string())
