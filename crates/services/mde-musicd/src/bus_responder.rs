@@ -75,8 +75,16 @@ pub const BROWSE_VERBS: [&str; 18] = [
 
 /// The transport verbs served on `action/music/<verb>` (AIR-2.d — drive
 /// the AIR-5 playback engine).
-pub const TRANSPORT_VERBS: [&str; 6] =
-    ["play", "pause", "resume", "stop", "set-volume", "get-state"];
+pub const TRANSPORT_VERBS: [&str; 7] = [
+    "play",
+    "pause",
+    "resume",
+    "stop",
+    "set-volume",
+    "get-state",
+    // MUSIC-RFX-2 — scrub within the current (finite) track.
+    "seek",
+];
 
 /// AIR-15.b.5 — peer-roster + take-over verbs. They read/write the AIR-8
 /// state files (`music-state-by-peer/`, handoff intents) and need neither
@@ -508,6 +516,8 @@ pub enum TransportCommand {
     Stop,
     /// Set the volume multiplier (`0.0..=1.0`, clamped by the engine).
     SetVolume(f32),
+    /// MUSIC-RFX-2 — seek the current finite track to a position (ms).
+    Seek(u64),
     /// Report the current playback state (no side effect).
     GetState,
 }
@@ -524,8 +534,28 @@ pub fn parse_transport(verb: &str, body: &str) -> Option<TransportCommand> {
         "stop" => Some(TransportCommand::Stop),
         "get-state" => Some(TransportCommand::GetState),
         "set-volume" => parse_volume(body).map(TransportCommand::SetVolume),
+        "seek" => parse_position_ms(body).map(TransportCommand::Seek),
         _ => None,
     }
+}
+
+/// MUSIC-RFX-2 — seek target in ms from a bare number (`"42000"`) or
+/// `{"position_ms": 42000}` / `{"ms": 42000}`.
+fn parse_position_ms(body: &str) -> Option<u64> {
+    let trimmed = body.trim();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(n) = v
+            .get("position_ms")
+            .or_else(|| v.get("ms"))
+            .and_then(serde_json::Value::as_u64)
+        {
+            return Some(n);
+        }
+        if let Some(n) = v.as_u64() {
+            return Some(n);
+        }
+    }
+    trimmed.parse::<u64>().ok()
 }
 
 /// Volume from a bare number (`"0.6"`) or `{"volume": 0.6}`.
@@ -588,6 +618,8 @@ fn apply_transport(
             "song_id": queue.current(),
             "audio_available": engine.is_some(),
             "needs_airsonic": client.is_none(),
+            // MUSIC-RFX-2 — the GUI shows the scrubber only for a seekable track.
+            "seekable": engine.map_or(false, |e| e.is_seekable()),
         })
         .to_string(),
         TransportCommand::Play => {
@@ -643,6 +675,20 @@ fn apply_transport(
             };
             engine.set_volume(v);
             json!({ "ok": true, "volume": engine.volume() }).to_string()
+        }
+        TransportCommand::Seek(target_ms) => {
+            let Some(engine) = engine else {
+                return no_audio();
+            };
+            // No-op for a live/radio stream (engine.seek returns false); the GUI
+            // hides the scrubber off get-state's `seekable`, so this is defensive.
+            let accepted = engine.seek(target_ms);
+            write_playback_state(
+                engine.is_playing(),
+                queue.current().unwrap_or(""),
+                target_ms,
+            );
+            json!({ "ok": true, "seeked": accepted, "position_ms": target_ms }).to_string()
         }
     }
 }
@@ -1041,6 +1087,39 @@ mod tests {
             Some(TransportCommand::GetState)
         );
         assert_eq!(parse_transport("teleport", ""), None);
+    }
+
+    #[test]
+    fn parse_transport_seek_forms() {
+        // MUSIC-RFX-2 — bare ms, {"position_ms":N}, {"ms":N}.
+        assert_eq!(
+            parse_transport("seek", "42000"),
+            Some(TransportCommand::Seek(42_000))
+        );
+        assert_eq!(
+            parse_transport("seek", r#"{"position_ms":1500}"#),
+            Some(TransportCommand::Seek(1_500))
+        );
+        assert_eq!(
+            parse_transport("seek", r#"{"ms":250}"#),
+            Some(TransportCommand::Seek(250))
+        );
+        // Non-numeric body → no command.
+        assert_eq!(parse_transport("seek", "middle"), None);
+    }
+
+    #[test]
+    fn get_state_reports_seekable_and_seek_needs_engine() {
+        // MUSIC-RFX-2 — get-state carries a `seekable` flag (false with no
+        // engine), and a seek without an engine is refused like other mutators.
+        let queue = queue::Queue::default();
+        let state = apply_transport("get-state", "", None, None, &queue);
+        let sv: serde_json::Value = serde_json::from_str(&state).unwrap();
+        assert_eq!(sv["seekable"], false);
+
+        let seek = apply_transport("seek", "1000", None, None, &queue);
+        let kv: serde_json::Value = serde_json::from_str(&seek).unwrap();
+        assert_eq!(kv["ok"], false);
     }
 
     #[test]

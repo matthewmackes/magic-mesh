@@ -1002,9 +1002,10 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
 - [✓] **MUSIC-RFX-1: daemon queue model — reorder / remove / play-next**
   **As** a listener, **I want** to reorder and prune the play queue, **so that** I control what plays next.
   **Acceptance:** queue.rs gains move(from,to)/remove(idx)/remove_many(idxs)/move_to_next(idx) with the current-cursor kept correct; new bus verbs `queue-move`/`queue-remove`/`queue-remove-many`/`queue-move-to-next` reply ok + persist; unit tests for cursor math under each op.
-- [ ] **MUSIC-RFX-2: engine seek + `seek` transport verb**
+- [✓] **MUSIC-RFX-2: engine seek + `seek` transport verb**
   **As** a listener, **I want** to scrub within a track, **so that** I can jump to a position.
   **Acceptance:** engine.rs repositions a *finite* track's decode to a target ms; `action/music/seek` applies it and get-state's position reflects the jump; seek is a no-op (disabled) for live/radio streams.
+  **Done:** `Shared.{seek_ms,seekable}` atomics; the decode loop (FLAC/MP3/AAC/Vorbis/WAV + the libopus path) calls `apply_pending_seek` → `format.seek(Coarse, Time)`, clears the ring, resets `frames_played` to `ms_to_frames(target)` (so `position_ms` jumps) and resets the decoder. `EngineHandle::{seek,is_seekable}`; only a finite (`Cursor`-backed) source is seekable — a live stream's `seek` returns false. Transport verb `seek` (`{position_ms}`/`{ms}`/bare) → `engine.seek`; get-state now carries `seekable` for the scrubber (MUSIC-RFX-4).
 - [✓] **MUSIC-RFX-3: playlist write verbs (Subsonic)**
   **As** a listener, **I want** to create/rename/delete/modify playlists, **so that** I can curate.
   **Acceptance:** airsonic.rs create_playlist/update_playlist(add/remove/rename)/delete_playlist; bus verbs `playlist-create`/`playlist-update`/`playlist-delete` reply ok; a re-query of getPlaylists reflects the change on the server.

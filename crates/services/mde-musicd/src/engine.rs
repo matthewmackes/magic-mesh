@@ -42,7 +42,7 @@
 
 use std::collections::VecDeque;
 use std::io::Cursor;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -51,10 +51,11 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use symphonia::core::audio::{SampleBuffer, SignalSpec};
 use symphonia::core::codecs::{CodecParameters, DecoderOptions, CODEC_TYPE_NULL, CODEC_TYPE_OPUS};
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::{FormatOptions, FormatReader};
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
 use symphonia::core::io::{MediaSourceStream, ReadOnlySource};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+use symphonia::core::units::Time;
 
 /// Gapless pre-buffer lead (ms): the higher-level queue driver (AIR-2.c)
 /// starts resolving the next track's stream URL once the current track
@@ -135,6 +136,18 @@ pub fn should_prebuffer_next(position_ms: u64, duration_ms: u64, lead_ms: u64) -
 #[must_use]
 pub fn clamp_volume(v: f32) -> f32 {
     v.clamp(0.0, 1.0)
+}
+
+/// MUSIC-RFX-2 — convert a millisecond position to a device-frame count (the
+/// playhead unit), so a seek can reset `frames_played` to make `position_ms`
+/// report the jump. `rate == 0` (no device) yields 0.
+#[must_use]
+pub fn ms_to_frames(ms: u64, device_rate: u32) -> u64 {
+    if device_rate == 0 {
+        0
+    } else {
+        ms.saturating_mul(u64::from(device_rate)) / 1000
+    }
 }
 
 /// One output sample for the cpal callback: the next ring sample scaled
@@ -226,6 +239,14 @@ struct Shared {
     decode_done: AtomicBool,
     /// Device frames actually emitted (drives the playhead).
     frames_played: AtomicU64,
+    /// MUSIC-RFX-2 — pending seek target in ms; `-1` = no request. The decode
+    /// thread checks this each loop, repositions the format, clears the ring, and
+    /// resets the playhead. Only honoured for a seekable (finite) source.
+    seek_ms: AtomicI64,
+    /// MUSIC-RFX-2 — whether the currently-decoding track is seekable (finite +
+    /// buffered into a `Cursor`). A live/radio stream sets this false so a seek
+    /// request is a no-op (the GUI hides the scrubber).
+    seekable: AtomicBool,
     device_rate: u32,
     device_channels: u16,
     /// Back-pressure target: the decode thread throttles once the ring
@@ -291,6 +312,8 @@ impl Engine {
             stop: AtomicBool::new(false),
             decode_done: AtomicBool::new(true),
             frames_played: AtomicU64::new(0),
+            seek_ms: AtomicI64::new(-1),
+            seekable: AtomicBool::new(false),
             device_rate,
             device_channels,
             target_ring,
@@ -336,6 +359,7 @@ impl EngineHandle {
         self.shared.stop.store(false, Ordering::Relaxed);
         self.shared.playing.store(true, Ordering::Relaxed);
         self.shared.frames_played.store(0, Ordering::Relaxed);
+        self.shared.seek_ms.store(-1, Ordering::Relaxed);
         self.shared.decode_done.store(false, Ordering::Relaxed);
 
         let shared = self.shared.clone();
@@ -397,6 +421,8 @@ impl EngineHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
         self.shared.decode_done.store(true, Ordering::Relaxed);
+        self.shared.seekable.store(false, Ordering::Relaxed);
+        self.shared.seek_ms.store(-1, Ordering::Relaxed);
     }
 
     /// Set the volume multiplier (clamped to `0.0..=1.0`).
@@ -410,6 +436,28 @@ impl EngineHandle {
     #[must_use]
     pub fn volume(&self) -> f32 {
         f32::from_bits(self.shared.volume.load(Ordering::Relaxed))
+    }
+
+    /// MUSIC-RFX-2 — request a seek to `target_ms` within the current track.
+    /// Returns `false` immediately if the current source isn't seekable
+    /// (live/radio); otherwise the decode thread performs the reposition on its
+    /// next loop iteration and the playhead jumps. The reply is best-effort: a
+    /// format that refuses the seek leaves playback where it was.
+    pub fn seek(&self, target_ms: u64) -> bool {
+        if !self.shared.seekable.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.shared
+            .seek_ms
+            .store(target_ms.min(i64::MAX as u64) as i64, Ordering::Relaxed);
+        true
+    }
+
+    /// MUSIC-RFX-2 — whether the current track supports seeking (finite +
+    /// buffered source). The GUI shows/hides the scrubber off this.
+    #[must_use]
+    pub fn is_seekable(&self) -> bool {
+        self.shared.seekable.load(Ordering::Relaxed)
     }
 
     /// Playhead position (ms), derived from device frames emitted.
@@ -502,6 +550,42 @@ where
     )
 }
 
+/// MUSIC-RFX-2 — apply a pending seek (if any) to a seekable `format`. Consumes
+/// the request (swaps it back to `-1`); on a successful reposition it clears the
+/// ring and resets the playhead so [`EngineHandle::position_ms`] reflects the
+/// jump, and returns `true` so the caller resets its decoder. A format that
+/// refuses the seek leaves playback untouched.
+fn apply_pending_seek(format: &mut dyn FormatReader, track_id: u32, shared: &Shared) -> bool {
+    let req = shared.seek_ms.swap(-1, Ordering::Relaxed);
+    if req < 0 {
+        return false;
+    }
+    let target_ms = req as u64;
+    let time = Time::new(target_ms / 1000, (target_ms % 1000) as f64 / 1000.0);
+    if format
+        .seek(
+            SeekMode::Coarse,
+            SeekTo::Time {
+                time,
+                track_id: Some(track_id),
+            },
+        )
+        .is_err()
+    {
+        return false;
+    }
+    shared
+        .ring
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    shared.frames_played.store(
+        ms_to_frames(target_ms, shared.device_rate),
+        Ordering::Relaxed,
+    );
+    true
+}
+
 /// Fetch, decode, resample, channel-map, and enqueue one track's samples
 /// into the shared ring. Returns when the track is exhausted or `stop` is
 /// signalled.
@@ -517,6 +601,9 @@ fn decode_track(url: &str, codec: SourceCodec, shared: &Shared) -> Result<(), St
     // from the Airsonic `stream` endpoint, which sends Content-Length) is still
     // buffered into a seekable Cursor so format decoders that seek keep working.
     let finite = resp.content_length().is_some_and(|n| n > 0);
+    // MUSIC-RFX-2 — only a finite (Cursor-backed) track is seekable; a live
+    // stream stays false so the scrubber is hidden + a seek request no-ops.
+    shared.seekable.store(finite, Ordering::Relaxed);
     let source: Box<dyn symphonia::core::io::MediaSource> = if finite {
         let bytes = resp
             .bytes()
@@ -582,6 +669,10 @@ fn decode_track(url: &str, codec: SourceCodec, shared: &Shared) -> Result<(), St
     loop {
         if shared.stop.load(Ordering::Relaxed) {
             break;
+        }
+        // MUSIC-RFX-2 — honour a pending seek before pulling the next packet.
+        if apply_pending_seek(format.as_mut(), track_id, shared) {
+            decoder.reset();
         }
         // End of stream (UnexpectedEof) or a fatal reset — this track is
         // done; the caller advances to the next one gaplessly.
@@ -684,6 +775,14 @@ fn decode_opus(
         if shared.stop.load(Ordering::Relaxed) {
             break;
         }
+        // MUSIC-RFX-2 — honour a pending seek; reset the opus decoder so it
+        // doesn't carry inter-frame state across the discontinuity.
+        if apply_pending_seek(format, track_id, shared) {
+            let _ = decoder.reset_state();
+            // The encoder pre-skip belongs to the stream start; past a seek there
+            // is nothing more to discard.
+            to_skip = 0;
+        }
         let Ok(packet) = format.next_packet() else {
             break;
         };
@@ -733,6 +832,17 @@ mod tests {
         assert_eq!(SourceCodec::from_suffix("wav"), SourceCodec::Wav);
         assert_eq!(SourceCodec::from_suffix("opus"), SourceCodec::Opus);
         assert_eq!(SourceCodec::from_suffix("xyz"), SourceCodec::Unknown);
+    }
+
+    #[test]
+    fn ms_to_frames_converts_playhead_units() {
+        // MUSIC-RFX-2 — a seek resets frames_played = ms_to_frames(target).
+        assert_eq!(ms_to_frames(0, 48_000), 0);
+        assert_eq!(ms_to_frames(1_000, 48_000), 48_000); // 1s @ 48k = 48k frames
+        assert_eq!(ms_to_frames(500, 44_100), 22_050); // 0.5s @ 44.1k
+        assert_eq!(ms_to_frames(1_000, 0), 0); // no device → 0, no panic
+                                               // A huge target saturates rather than wrapping.
+        assert_eq!(ms_to_frames(u64::MAX, 48_000), u64::MAX / 1000);
     }
 
     #[test]
