@@ -968,7 +968,7 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
 
 ## NEB-CRYPTO-LABEL — show Nebula encryption strength next to the applet (operator-reported live 2026-06-18)
 > Operator: "Add the Current Encryption Strength of the Nebula Design in Text next to the Applet." Surface the live overlay cipher strength as text adjacent to the panel applet. Nebula tunnel cipher is AES-256-GCM (or ChaCha20-Poly1305) with Ed25519 identities (§3 crypto locks); read the **actual** negotiated/configured cipher, don't hardcode.
-- [ ] **NEB-CRYPTO-LABEL-1: live encryption-strength text beside the applet.**
+- [✓] **NEB-CRYPTO-LABEL-1: live encryption-strength text beside the applet.** DONE 2026-06-18: operator chose the **Notification bell** applet. `mde-cosmic-applet` now reads the live Nebula cipher (`parse_cipher` over `/etc/nebula/config.yml`, comments ignored; unset/`aes`→"AES-256-GCM", `chachapoly`→"ChaCha20-Poly1305"), gated on a running `nebula` process (shows nothing when the overlay is down), and renders it as muted Carbon text beside the bell glyph. Pure parse/label unit-tested; colors via mde-theme tokens (§4, shared `to_color`). Built release + hot-patched .13 (panel respawned; nebula up, cipher unset → shows "AES-256-GCM"). *(durable rollout = next RPM cut.)*
   **As** an operator, **I want** the current Nebula encryption strength shown as text next to the panel applet, **so that** I can see the overlay's crypto at a glance.
   **Acceptance** (each runtime-observable):
     - [ ] the cipher is read from real state (nebula `config.yml` `cipher:` and/or the running tunnel), not a hardcoded literal — e.g. "AES-256-GCM" / "ChaCha20-Poly1305"
