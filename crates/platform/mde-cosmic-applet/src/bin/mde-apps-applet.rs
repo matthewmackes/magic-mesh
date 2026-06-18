@@ -419,16 +419,16 @@ impl Application for AppsApplet {
         let glyph = cosmic::widget::text("\u{25A6}\u{FE0E}") // ▦ apps grid
             .size(16)
             .class(cosmic::theme::Text::Color(carbon(Palette::dark().text)));
+        // APPS-MOUSE-FIX (operator bug 2026-06-18) — the panel button is plain
+        // click-to-toggle: `on_press` opens the dropdown, a second press closes
+        // it, and a launch closes it (the LaunchLocal/LaunchMesh/OpenService
+        // handlers destroy the popup). The old `applet_tooltip` wrapper added a
+        // hover subsurface ("mouseover pop up") that interfered with the click —
+        // removed; the label lives in the dropdown header instead.
         let btn = cosmic::widget::button::custom(glyph)
             .on_press(Message::TogglePopup)
             .class(cosmic::theme::Button::AppletIcon);
-        Element::from(self.core.applet.applet_tooltip::<Message>(
-            btn,
-            "Applications — launch anything in the mesh".to_string(),
-            self.popup.is_some(),
-            |_| Message::TogglePopup,
-            None,
-        ))
+        Element::from(btn)
     }
 
     fn view_window(&self, _id: Id) -> Element<'_, Message> {
@@ -467,7 +467,12 @@ impl AppsApplet {
             quick("Settings", "cosmic-settings"),
         ])
         .spacing(4);
-        let header = column(vec![disk.into(), links.into()]).spacing(2);
+        // APPS-MOUSE-FIX — title in the dropdown (replaces the removed hover
+        // tooltip), so the surface still names itself without any mouseover popup.
+        let title = text("Applications")
+            .size(body_sz)
+            .class(cosmic::theme::Text::Color(carbon(p.text)));
+        let header = column(vec![title.into(), disk.into(), links.into()]).spacing(2);
 
         // Tab row (Favorites first — Q6). The active tab is accented.
         let tabs: Vec<Element<Message>> = LauncherTab::all()
