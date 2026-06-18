@@ -25,6 +25,19 @@ use mde_theme::{FontSize, Palette, Preferences, Rgba, TypeRole};
 
 const ID: &str = "com.mackes.MagicMeshApps";
 
+/// APPS-WIDE (operator 2026-06-18) — the launcher dropdown is a golden
+/// rectangle. The operator doubled the width (2 × the original 460); to keep it
+/// golden the rectangle is now landscape: height = width / φ (920 / 1.618 ≈
+/// 569). Single-sourced here so the body container + any future hint agree.
+const GOLDEN_RATIO: f32 = 1.618;
+/// Dropdown width — twice the original 460 (operator ask).
+const MENU_WIDTH: f32 = 920.0;
+/// Dropdown height — the golden complement of the width (landscape φ).
+const MENU_HEIGHT: f32 = MENU_WIDTH / GOLDEN_RATIO;
+/// APPS-WIDE — Favorites icon-grid column count (Carbon tile grid). The wider
+/// 920 px body comfortably fits 6 icon tiles per row with Carbon gutters.
+const FAVORITES_COLUMNS: usize = 6;
+
 /// APPS-STYLE — resolve the active palette from the user's MDE theme preference
 /// (`~/.config/mde/preferences.toml`), so the launcher honors **both dark and
 /// light** themes (Carbon Gray 100 / Gray 90 / Gray 10) instead of a hardcoded
@@ -678,7 +691,10 @@ impl AppsApplet {
 
         // ── Result rows (or an empty state). ──
         let shown = filter_entries(&self.entries, self.tab, &self.query, &self.favorites);
-        let list: Vec<Element<Message>> = if shown.is_empty() {
+        // APPS-WIDE — Favorites renders as a Carbon icon grid (not a row list)
+        // when it's the active tab and not in a search.
+        let fav_grid = self.tab == LauncherTab::Favorites && self.query.trim().is_empty();
+        let body: Element<Message> = if shown.is_empty() {
             let (t_msg, sub) = if let Some(e) = &self.error {
                 ("Couldn't reach the apps service".to_string(), e.clone())
             } else if self.tab == LauncherTab::Favorites && self.query.trim().is_empty() {
@@ -692,7 +708,7 @@ impl AppsApplet {
                     "Try a different tab or search term.".to_string(),
                 )
             };
-            vec![cosmic::iced::widget::container(
+            cosmic::iced::widget::container(
                 column(vec![
                     text(t_msg)
                         .size(body_sz)
@@ -709,24 +725,30 @@ impl AppsApplet {
             .padding(40)
             .width(Length::Fill)
             .center_x(Length::Fill)
-            .into()]
+            .into()
+        } else if fav_grid {
+            // APPS-WIDE — Carbon icon grid for Favorites.
+            self.favorites_grid(&shown)
         } else {
-            shown
-                .into_iter()
-                .enumerate()
-                .map(|(i, e)| self.entry_row(i, e))
-                .collect()
+            column(
+                shown
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, e)| self.entry_row(i, e))
+                    .collect::<Vec<_>>(),
+            )
+            .spacing(0)
+            .width(Length::Fill)
+            .into()
         };
 
-        // ── Assemble: header → links → tabs → search → list (flex) → toast → footer. ──
+        // ── Assemble: header → links → tabs → search → body (flex) → toast → footer. ──
         let mut col = column(vec![
             header.into(),
             links.into(),
             row(tabs).spacing(0).into(),
             search.into(),
-            scrollable(column(list).spacing(0).width(Length::Fill))
-                .height(Length::Fill)
-                .into(),
+            scrollable(body).height(Length::Fill).into(),
         ])
         .spacing(10);
         if let Some(t) = &self.toast {
@@ -734,11 +756,101 @@ impl AppsApplet {
         }
         col = col.push(self.footer());
 
-        // Golden-ratio portrait: height = width × φ (460 × 1.618 ≈ 744).
+        // APPS-WIDE — golden-ratio landscape: width doubled to 920, height its
+        // golden complement (920 / φ ≈ 569). See MENU_WIDTH/MENU_HEIGHT.
         cosmic::iced::widget::container(col)
             .padding(12)
-            .width(Length::Fixed(460.0))
-            .height(Length::Fixed(744.0))
+            .width(Length::Fixed(MENU_WIDTH))
+            .height(Length::Fixed(MENU_HEIGHT))
+            .into()
+    }
+
+    /// APPS-WIDE — the primary action for a Favorites tile press: launch apps /
+    /// mesh-apps directly (favorites are normally pinned apps), else fall back to
+    /// selecting the entry (opens its detail in the list view).
+    fn entry_primary_msg(e: &Entry) -> Message {
+        match e.kind.as_str() {
+            "app" if !e.exec.is_empty() => Message::LaunchLocal(e.exec.clone()),
+            "mesh-app" if !e.node.is_empty() => Message::LaunchMesh(e.node.clone()),
+            _ => Message::SelectEntry(e.id.clone()),
+        }
+    }
+
+    /// APPS-WIDE — the Favorites tab rendered as a Carbon icon grid: rows of
+    /// [`FAVORITES_COLUMNS`] square icon tiles (icon over name), evenly spaced
+    /// with Carbon gutters. The last partial row is padded so tiles keep a
+    /// uniform width.
+    fn favorites_grid(&self, shown: &[&Entry]) -> Element<'static, Message> {
+        use cosmic::widget::{column, row, Space};
+        let rows: Vec<Element<Message>> = shown
+            .chunks(FAVORITES_COLUMNS)
+            .map(|chunk| {
+                let mut tiles: Vec<Element<Message>> =
+                    chunk.iter().map(|e| self.favorite_tile(e)).collect();
+                while tiles.len() < FAVORITES_COLUMNS {
+                    tiles.push(Space::new().width(Length::FillPortion(1)).into());
+                }
+                row(tiles).spacing(12).width(Length::Fill).into()
+            })
+            .collect();
+        column(rows)
+            .spacing(12)
+            .padding([4, 0])
+            .width(Length::Fill)
+            .into()
+    }
+
+    /// APPS-WIDE — one Favorites grid tile: a square Carbon icon tile (letter
+    /// avatar on a raised layer) over a centred, truncated name. The whole tile
+    /// presses through to [`Self::entry_primary_msg`]. Owns its strings so the
+    /// tile is `'static` (mixes freely with the borrowed row list).
+    fn favorite_tile(&self, e: &Entry) -> Element<'static, Message> {
+        use cosmic::widget::{button, column, container, text};
+        let p = self.palette;
+        let sizes = FontSize::defaults();
+        let cap_sz = TypeRole::Caption.size_in(sizes);
+        let letter = e
+            .name
+            .chars()
+            .next()
+            .map_or_else(String::new, |c| c.to_uppercase().to_string());
+        let icon_bg = p.raised;
+        let icon = container(
+            text(letter)
+                .size(TypeRole::Display.size_in(sizes))
+                .class(cosmic::theme::Text::Color(carbon(p.text))),
+        )
+        .center_x(Length::Fixed(64.0))
+        .center_y(Length::Fixed(64.0))
+        .style(move |_| cosmic::iced::widget::container::Style {
+            background: Some(carbon(icon_bg).into()),
+            border: cosmic::iced::Border {
+                radius: 8.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        // Truncate long names so tiles stay aligned.
+        let name = if e.name.chars().count() > 14 {
+            format!("{}…", e.name.chars().take(13).collect::<String>())
+        } else {
+            e.name.clone()
+        };
+        let tile = column(vec![
+            icon.into(),
+            text(name)
+                .size(cap_sz)
+                .center()
+                .class(cosmic::theme::Text::Color(carbon(p.text)))
+                .into(),
+        ])
+        .spacing(6)
+        .align_x(cosmic::iced::Alignment::Center)
+        .width(Length::Fill);
+        button::custom(tile)
+            .on_press(Self::entry_primary_msg(e))
+            .class(cosmic::theme::Button::Text)
+            .width(Length::FillPortion(1))
             .into()
     }
 
