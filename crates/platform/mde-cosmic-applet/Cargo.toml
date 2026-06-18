@@ -30,7 +30,9 @@ mde-bus = { path = "../mde-bus" }
 # NOTIFY-7 / AC — the bell tints by the highest-severity unread alert tailed off
 # the bus, and shares the severity→Carbon-token map with the Action Center.
 mde-notify = { path = "../../services/mde-notify" }
-mde-theme = { path = "../../shared/mde-theme" }
+# `serde` feature: APPS-STYLE reads the user's theme preference
+# (`Preferences::load`) so the launcher honors light + dark themes.
+mde-theme = { path = "../../shared/mde-theme", features = ["serde"] }
 tokio = { version = "1", features = ["process", "rt"] }
 
 [dependencies.libcosmic]

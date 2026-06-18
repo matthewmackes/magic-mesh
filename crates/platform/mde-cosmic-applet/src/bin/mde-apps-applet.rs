@@ -21,9 +21,17 @@ use mde_bus::hooks::config::Priority;
 use mde_cosmic_applet::{
     filter_entries, parse_entries, workload_argv, Entry, LauncherTab, WorkloadAction,
 };
-use mde_theme::{FontSize, Palette, Rgba, TypeRole};
+use mde_theme::{FontSize, Palette, Preferences, Rgba, TypeRole};
 
 const ID: &str = "com.mackes.MagicMeshApps";
+
+/// APPS-STYLE — resolve the active palette from the user's MDE theme preference
+/// (`~/.config/mde/preferences.toml`), so the launcher honors **both dark and
+/// light** themes (Carbon Gray 100 / Gray 90 / Gray 10) instead of a hardcoded
+/// dark palette. Cheap file read; called at init + on each open.
+fn resolve_palette() -> Palette {
+    Palette::for_theme(Preferences::load().theme)
+}
 
 struct AppsApplet {
     core: Core,
@@ -43,6 +51,9 @@ struct AppsApplet {
     open_menu: Option<String>,
     /// Last load error, shown in the dropdown's empty state.
     error: Option<String>,
+    /// APPS-STYLE — the active Carbon palette (dark/light, from the user's MDE
+    /// theme preference); refreshed on each open so a theme switch is picked up.
+    palette: Palette,
 }
 
 #[derive(Clone, Debug)]
@@ -263,6 +274,7 @@ impl Application for AppsApplet {
                 qnm: None,
                 open_menu: None,
                 error: None,
+                palette: resolve_palette(),
             },
             // Prime the list so the first open is instant.
             load_task(),
@@ -295,6 +307,8 @@ impl Application for AppsApplet {
                         cosmic::app::Action::Surface(destroy_popup(id)),
                     ));
                 }
+                // Refresh the palette so a theme switch reflects on open.
+                self.palette = resolve_palette();
                 // Open the dropdown + refresh-on-open (Q: cached + refresh-on-open).
                 let open = cosmic::task::message(cosmic::Action::Cosmic(
                     cosmic::app::Action::Surface(app_popup::<AppsApplet>(
@@ -418,7 +432,7 @@ impl Application for AppsApplet {
         // Grid/apps glyph (U+FE0E forces monochrome so it honors the Carbon tint).
         let glyph = cosmic::widget::text("\u{25A6}\u{FE0E}") // ▦ apps grid
             .size(16)
-            .class(cosmic::theme::Text::Color(carbon(Palette::dark().text)));
+            .class(cosmic::theme::Text::Color(carbon(self.palette.text)));
         // APPS-MOUSE-FIX (operator bug 2026-06-18) — the panel button is plain
         // click-to-toggle: `on_press` opens the dropdown, a second press closes
         // it, and a launch closes it (the LaunchLocal/LaunchMesh/OpenService
@@ -445,7 +459,7 @@ impl AppsApplet {
     /// Render the dropdown body: tab row → search → filtered entry list.
     fn dropdown(&self) -> Element<'_, Message> {
         use cosmic::widget::{button, column, row, scrollable, text, text_input};
-        let p = Palette::dark();
+        let p = self.palette;
         let sizes = FontSize::defaults();
         let body_sz = TypeRole::Body.size_in(sizes);
         let cap_sz = TypeRole::Caption.size_in(sizes);
@@ -516,27 +530,37 @@ impl AppsApplet {
                 .class(cosmic::theme::Text::Color(carbon(p.text_muted)))
                 .into()]
         } else {
-            shown.into_iter().map(|e| self.entry_row(e)).collect()
+            shown
+                .into_iter()
+                .enumerate()
+                .map(|(i, e)| self.entry_row(i, e))
+                .collect()
         };
 
         column(vec![
             header.into(),
             row(tabs).spacing(4).into(),
             search.into(),
-            scrollable(column(list).spacing(2).width(Length::Fill))
-                .height(Length::Fixed(420.0))
+            // APPS-STYLE — contiguous zebra rows (spacing 0); the list is 50%
+            // wider (340→510) and the scroll area 25% taller (420→525).
+            scrollable(column(list).spacing(0).width(Length::Fill))
+                .height(Length::Fixed(525.0))
                 .into(),
         ])
         .spacing(8)
-        .width(Length::Fixed(340.0))
+        .width(Length::Fixed(510.0))
         .into()
     }
 
-    /// One entry row — a pin toggle (APPS-4) + name/hint launch button. Local
-    /// apps launch on click; other kinds render (launch paths land in APPS-5/6/7).
-    fn entry_row<'a>(&self, e: &'a Entry) -> Element<'a, Message> {
+    /// One entry row (APPS-STYLE — Music-app idiom): the name/hint launch target
+    /// fills the **left**, the action buttons cluster on the **right** (workload
+    /// Start/Stop + Attach, then the pin star). The whole row sits on a
+    /// zebra-shaded Carbon layer (alternating by `idx`) for easier reading, in
+    /// both dark and light themes. Local apps launch on click; mesh/service open
+    /// their session/endpoint (APPS-5/7).
+    fn entry_row<'a>(&self, idx: usize, e: &'a Entry) -> Element<'a, Message> {
         use cosmic::widget::{button, column, row, text};
-        let p = Palette::dark();
+        let p = self.palette;
         let sizes = FontSize::defaults();
         let cap_sz = TypeRole::Caption.size_in(sizes);
         let sub = match e.kind.as_str() {
@@ -545,20 +569,7 @@ impl AppsApplet {
             "service" => format!("service · {}", e.node),
             _ => e.source.clone(),
         };
-        // Pin toggle (★ pinned / ☆ not) — persists mesh-wide (APPS-4).
-        let pinned = self.favorites.contains(&e.id);
-        let star = button::custom(
-            text(if pinned { "\u{2605}" } else { "\u{2606}" })
-                .size(cap_sz)
-                .class(cosmic::theme::Text::Color(carbon(if pinned {
-                    p.accent
-                } else {
-                    p.text_muted
-                }))),
-        )
-        .on_press(Message::ToggleFavorite(e.id.clone()))
-        .class(cosmic::theme::Button::Text);
-
+        // The launch target (left, fills): name over a muted sub-line.
         let body = column(vec![
             text(e.name.clone())
                 .size(TypeRole::Body.size_in(sizes))
@@ -586,7 +597,10 @@ impl AppsApplet {
             }
             _ => launch,
         };
-        let mut cells: Vec<Element<Message>> = vec![star.into(), launch.into()];
+
+        // Right-clustered action buttons (Music idiom — buttons to the right of
+        // the object): workload controls, then the pin star.
+        let mut cells: Vec<Element<Message>> = vec![launch.into()];
         // APPS-6 — workloads get inline Start/Stop + Attach.
         if e.kind == "workload" {
             let action_btn = |label: &'static str, action: WorkloadAction| -> Element<Message> {
@@ -602,16 +616,51 @@ impl AppsApplet {
             }
             cells.push(action_btn("Attach", WorkloadAction::Attach));
         }
+        // Pin toggle (★ pinned / ☆ not) — persists mesh-wide (APPS-4); far right.
+        let pinned = self.favorites.contains(&e.id);
+        cells.push(
+            button::custom(
+                text(if pinned { "\u{2605}" } else { "\u{2606}" })
+                    .size(cap_sz)
+                    .class(cosmic::theme::Text::Color(carbon(if pinned {
+                        p.accent
+                    } else {
+                        p.text_muted
+                    }))),
+            )
+            .on_press(Message::ToggleFavorite(e.id.clone()))
+            .class(cosmic::theme::Button::Text)
+            .into(),
+        );
         // APPS-8 — right-click the row to toggle a context action strip.
-        let main = cosmic::widget::mouse_area(row(cells).spacing(4))
-            .on_right_press(Message::EntryMenu(e.id.clone()));
-        if self.open_menu.as_deref() == Some(&e.id) {
+        let main = cosmic::widget::mouse_area(
+            row(cells)
+                .spacing(6)
+                .align_y(cosmic::iced::Alignment::Center),
+        )
+        .on_right_press(Message::EntryMenu(e.id.clone()));
+        let inner: Element<Message> = if self.open_menu.as_deref() == Some(&e.id) {
             column(vec![main.into(), self.context_strip(e)])
                 .spacing(2)
                 .into()
         } else {
             main.into()
-        }
+        };
+        // Zebra shading: alternate two adjacent Carbon layers so rows read as
+        // shaded stripes in both themes (dark: Gray 100/90; light: Gray 10/White).
+        let shade = if idx % 2 == 1 {
+            p.surface
+        } else {
+            p.background
+        };
+        cosmic::iced::widget::container(inner)
+            .padding([4, 8])
+            .width(Length::Fill)
+            .style(move |_| cosmic::iced::widget::container::Style {
+                background: Some(carbon(shade).into()),
+                ..Default::default()
+            })
+            .into()
     }
 
     /// APPS-8 — the right-click context strip for one entry: pin/unpin, the
