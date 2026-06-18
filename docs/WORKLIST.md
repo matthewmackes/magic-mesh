@@ -926,6 +926,46 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
   **Code done (2026-06-18):** `workers/xcp_host.rs` — spawned on all roles, self-gates on the dom0 marker (`/etc/xensource-inventory`) so it's a no-op off-hypervisor; on a dom0 it queries `mackes_xcp` locally (`HostTarget::Local`, no SSH) and publishes a capacity doc to `compute/xcp-host/<node>` every 15s. Pure `xcp_host_doc` builder + test; this is what makes **XCP-1's `host_capacity` reachable**. **Still [>]:** "shows in the directory" + "spawning places the VM" need the consumer (XCP-4 `action/provision/hosts` + panel) and a live joined dom0 (XCP-5/3) — verified once a host is enrolled.
 - [ ] **XCP-7: XAPI creds as a mesh secret** — encrypted `<QNM-Shared>/secrets/xcp/<host>.age`, leader-managed; never in `ps`/logs. **Acceptance:** any authorized node drives any enrolled host; creds absent from process listing.
 
+## LIGHTHOUSE — Hero focus on lighthouses (design: docs/design/lighthouse-hero.md; 25-Q survey locked 2026-06-18)
+- [ ] **LIGHTHOUSE-1: `mde-theme` — Carbon Green 50 beacon token.**
+  **As** a designer, **I want** the healthy-beacon green single-sourced as a Carbon token, **so that** §4 holds (no raw hex in the applet/panel).
+  **Acceptance:** add `green_50` (Carbon Green 50) to the `mde-theme` palette + a palette test asserting its RGBA; the beacon healthy color reads it, unhealthy reads `danger`.
+- [ ] **LIGHTHOUSE-2: shared lighthouse discovery + health helper.**
+  **As** a developer, **I want** one pure helper that lists `role==lighthouse` nodes (from directory descriptors) and computes binary health from the mesh-status snapshot, **so that** the Hub footer, applet, shell, and tab agree.
+  **Acceptance** (each runtime-observable):
+    - [ ] lighthouse set = directory descriptors with `role == lighthouse` (Q1)
+    - [ ] `lighthouse_health(node)` → green iff online AND nebula up AND (master ⇒ lizardfs-master up); else red (Q2/Q3/Q15); no-data treated neutral until first snapshot, then red
+    - [ ] unit-tested over healthy / offline / core-service-down / master-SPOF / no-data fixtures
+- [ ] **LIGHTHOUSE-3: Notification Hub pinned Lighthouses footer (animated beacons).**
+  **As** an operator, **I want** an always-visible lighthouse-health footer in the Notification Hub, **so that** I see anchor-node health at a glance.
+  **Acceptance** (each runtime-observable):
+    - [ ] a **pinned footer** (below Music/SIP, stays visible on scroll, Q5) with header = beacon hero glyph + "Lighthouses" + live `N/M healthy` (Q8)
+    - [ ] one **square card per lighthouse** (beacon + name + overlay IP + status, Q6/Q16), in a **horizontally-scrollable** strip showing all (Q7)
+    - [ ] each square is an **abstract beacon with a rotating conic beam** (Q9/Q10), **discrete stepped** rotation via an iced `time` subscription (Q12), **slow when healthy / fast strobe when unhealthy** (Q11)
+    - [ ] the subscription is inactive when the Hub/footer isn't shown (no idle CPU); verify cheap on the ~948 MB shadow lighthouse
+    - [ ] green = `green_50`, red = `danger` (Q13/Q14); no raw hex outside `mde-theme` (§4)
+- [ ] **LIGHTHOUSE-4: deep-link from Hub → Workbench Lighthouses tab.**
+  **As** an operator, **I want** clicking a lighthouse to open the Workbench Lighthouses tab focused on it, **so that** the footer is actionable.
+  **Acceptance:** whole-row press (Q19) publishes `event/workbench/open {panel:"lighthouses", focus:<id>}`; a running Workbench switches to the tab and focuses that lighthouse (Q17/Q20); if none is running, the Hub spawns `mde-workbench --panel lighthouses --focus <id>`; no duplicate windows.
+- [ ] **LIGHTHOUSE-5: Workbench "Lighthouses" tab (Mesh group, after Peers).**
+  **As** an operator, **I want** a dedicated Lighthouses tab, **so that** I can inspect and operate the anchor nodes.
+  **Acceptance** (each runtime-observable):
+    - [ ] `Panel::new("lighthouses", "Lighthouses")` registered in the **Mesh** group **right after `peers`** (Q18)
+    - [ ] top = PLANES Nebula/Lighthouse **hero band** + a row of the **animated beacons** summarizing fleet health (Q25)
+    - [ ] one **full card per lighthouse**: overlay+public IP, handshake state, peers-connected count, uptime, CA/cert expiry, **master/shadow badge + failover readiness** (Q21/Q22)
+    - [ ] **bus-subscription** push refresh (Q24)
+    - [ ] honors the deep-link `focus` (scroll/highlight the clicked lighthouse)
+    - [ ] Carbon tokens only (§4)
+- [ ] **LIGHTHOUSE-6: tab full-ops actions (confirmed).**
+  **As** an operator, **I want** to act on a lighthouse from its tab, **so that** I can recover it without leaving the Workbench.
+  **Acceptance:** restart core services on the lighthouse (over the overlay), open SSH/remote, and **promote shadow → master** — each behind a confirm; the destructive promote is guarded/idempotent; actions are runtime-wired (not stubs) (Q23).
+- [ ] **LIGHTHOUSE-7: hero-scope follow-ons (shell / applet / wallpaper).**
+  **As** an operator, **I want** lighthouses surfaced beyond the Hub+tab (Q4 — broad), **so that** the hero focus is system-wide.
+  **Acceptance** (each its own runtime-observable surface):
+    - [ ] **shell** — `mesh-welcome.py` Network Overview marks lighthouses distinctly (beacon marker + master/shadow + health)
+    - [ ] **applet** — a Cosmic panel lighthouse-health indicator (worst-of green/red across lighthouses), click → the Lighthouses tab
+    - [ ] **wallpaper** — a lighthouse hero motif in the mesh wallpaper
+
 ## NEB-CRYPTO-LABEL — show Nebula encryption strength next to the applet (operator-reported live 2026-06-18)
 > Operator: "Add the Current Encryption Strength of the Nebula Design in Text next to the Applet." Surface the live overlay cipher strength as text adjacent to the panel applet. Nebula tunnel cipher is AES-256-GCM (or ChaCha20-Poly1305) with Ed25519 identities (§3 crypto locks); read the **actual** negotiated/configured cipher, don't hardcode.
 - [ ] **NEB-CRYPTO-LABEL-1: live encryption-strength text beside the applet.**
