@@ -247,8 +247,11 @@ type Roster = Arc<Mutex<HashMap<String, DeviceInfo>>>;
 /// low battery, connect/disconnect) reach the global Alert Center + federate.
 fn kdc_event_alert(ev: &HostEvent) -> Option<(String, &'static str)> {
     match ev {
-        HostEvent::Connected(p) => Some((format!("{} connected", p.as_str()), "info")),
-        HostEvent::Disconnected(p) => Some((format!("{} disconnected", p.as_str()), "info")),
+        // KDC-NOISE-1 — connect/disconnect is presence churn (it flaps with the
+        // KDE-Connect handshake), already reflected in the device roster; don't
+        // flood the Alert Center with an info event per flap. Only genuinely
+        // notable device events below reach the Alert Center.
+        HostEvent::Connected(_) | HostEvent::Disconnected(_) => None,
         HostEvent::Packet { peer, packet } => {
             let who = peer.as_str();
             match packet.kind.as_str() {
@@ -259,7 +262,8 @@ fn kdc_event_alert(ev: &HostEvent) -> Option<(String, &'static str)> {
                 "kdeconnect.findmyphone.request" => {
                     Some((format!("Find-my-device from {who}"), "warn"))
                 }
-                "kdeconnect.ping" => Some((format!("Ping from {who}"), "info")),
+                // KDC-NOISE-1 — a bare ping isn't a notable device event.
+                "kdeconnect.ping" => None,
                 "kdeconnect.notification" => {
                     if packet.body.get("isCancel").and_then(Value::as_bool) == Some(true) {
                         return None;
@@ -553,14 +557,16 @@ async fn run_host(
         tokio::select! {
             ev = stream.recv() => {
                 let Some(ev) = ev else { break };
-                // KDC-INTEROP diagnostics — surface every host event so the
-                // pairing handshake is observable in the journal.
+                // KDC-NOISE-1 — these fire on every packet / failed handshake
+                // (identity_eof repeats ~every 3s as clients probe), so they're
+                // debug-level diagnostics, not info/warn journal spam. Notable
+                // device events still reach the Alert Center via kdc_event_alert.
                 match &ev {
                     HostEvent::Packet { peer, packet } => {
-                        info!(peer = %peer.as_str(), kind = %packet.kind, body = %packet.body, "kdc-host: rx packet");
+                        debug!(peer = %peer.as_str(), kind = %packet.kind, body = %packet.body, "kdc-host: rx packet");
                     }
                     HostEvent::TransportError(e) => {
-                        warn!(error = %e, "kdc-host: transport error");
+                        debug!(error = %e, "kdc-host: transport error");
                     }
                     HostEvent::Connected(p) => info!(peer = %p.as_str(), "kdc-host: connected"),
                     HostEvent::Disconnected(p) => info!(peer = %p.as_str(), "kdc-host: disconnected"),
@@ -1689,8 +1695,11 @@ mod tests {
             packet: serde_json::from_value::<Packet>(json!({"id":0,"type":kind,"body":body}))
                 .expect("packet"),
         };
-        // connect/disconnect surface.
-        assert!(kdc_event_alert(&HostEvent::Connected(PeerId::from("moto"))).is_some());
+        // KDC-NOISE-1 — connect/disconnect presence churn + bare pings are NOT
+        // surfaced to the Alert Center (too noisy; presence lives in the roster).
+        assert!(kdc_event_alert(&HostEvent::Connected(PeerId::from("moto"))).is_none());
+        assert!(kdc_event_alert(&HostEvent::Disconnected(PeerId::from("moto"))).is_none());
+        assert!(kdc_event_alert(&pkt("kdeconnect.ping", json!({}))).is_none());
         // a phone notification mirrors app + text.
         let (s, sev) = kdc_event_alert(&pkt(
             "kdeconnect.notification",

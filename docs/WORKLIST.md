@@ -1007,7 +1007,7 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
   **Acceptance:** when a panel's mackesd query fails, it auto-retries on a short backoff for ~30s (the cold-boot warm-up window) before showing the hard "unreachable" state — reuse the BOOT-PEERS-1 "settling" idea fleet-wide; once healthz answers, the panels populate without a manual Refresh.
 
 ## OVERVIEW-MESHCARD — "Mesh Network: Setup needed" false negative (operator bug-testing, 2026-06-18)
-- [ ] **OVERVIEW-MESHCARD-1: the Overview "Mesh Network" capability reads not-connected while the overlay is up.**
+- [✓] **OVERVIEW-MESHCARD-1: the Overview "Mesh Network" capability reads not-connected while the overlay is up.**
   **As** an operator, **I want** Mesh Network to show Active when the overlay is working, **so that** the Overview isn't self-contradictory (Peer Reachability shows 10/10 online + File Sharing + SSH Active, yet Mesh Network says "fabric not connected").
   **Root cause (confirmed on .13):** `probe_nebula` reads `action/nebula/status` → `active_transport`, but that responder returns `{"active_transport":"offline","peer_count":0}` on a **non-CA peer** (the nebula roster + transport state live in the signer/CA's local sqlite; peers report empty — the same PD-2 gap that put overlay IPs only in the signer's roster). So the card false-negatives on every peer.
   **Acceptance:** Mesh Network shows Active when the overlay is actually up — derive connectivity from real reachability (healthz node_count/reachable peers, or the `nebula1` interface being up) rather than the unreliable `active_transport` field, OR fix the nebula-status responder to report the real transport on peer nodes.
@@ -1029,6 +1029,11 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
 
 ## REMMINA-ICON — Carbon tray icon for Remmina (operator bug-testing, 2026-06-18)
 - [✓] **REMMINA-ICON-1: Remmina tray widget used a non-Carbon icon.** DONE 2026-06-18: the Mackes-Carbon theme overrode Remmina's *app* icon but had no *status* icon, so the tray fell back to Remmina's stock `org.remmina.Remmina-status`. Added a Carbon `scalable/status/org.remmina.Remmina-status.svg` (currentColor symbolic, tints dark+light) to both Mackes-Carbon + Mackes-Carbon-Light in `mackes-carbon-icons.tar.xz` (the RPM asset installed by `magic-mesh-brand.sh`) → lands in every platform install; live-applied to .13 (icon cache refreshed, panel respawned). *(asset-only → next cut bumps the packaging release field.)*
+
+## MUSIC-AUDIO-BOOTRACE — mde-musicd caches no-audio after reboot (operator bug-testing, 2026-06-18)
+- [ ] **MUSIC-AUDIO-BOOTRACE-1: Music doesn't play after a reboot until mde-musicd is restarted.**
+  **As** an operator, **I want** Music to play after a reboot with no manual steps, **so that** "click Play" always works. Verified 2026-06-18 (.13): post-reboot `get-state` returned `audio_available:false` (no output device) even though PipeWire had a sink; clicking Play did nothing. `systemctl --user restart mde-musicd` → `audio_available:true`, play works. Cold-boot race: mde-musicd opened its audio backend before the PipeWire user session was ready and cached the failure.
+  **Acceptance:** mde-musicd re-acquires the audio device when it wasn't available at startup — either retry on a backoff / re-check on each play, or order the user unit `After=pipewire.service pipewire-session-manager` (+ a settle wait); after a reboot, Play works with no manual restart; `audio_available` flips true once the session is up. (boot-recovery class, cf. BOOT-WARMUP-RETRY.) *(immediate: restarted on .13.)*
 
 ## KDC-NOISE — KDE Connect floods the event stream (operator bug-testing, 2026-06-18)
 - [ ] **KDC-NOISE-1: KDE Connect emits too many information-level events.**
