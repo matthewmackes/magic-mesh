@@ -315,6 +315,12 @@ workspace = true
 # Workstation, one artifact). RPM GPG signing + the ISO stay operator-gated.
 [package.metadata.generate-rpm]
 name = "magic-mesh"
+# PKG — payload codec. The monolithic RPM bundles every workspace binary
+# (~186 MiB raw); default zstd lands ~103 MiB, over GitHub's 100 MiB file limit
+# for the gh-pages dnf channel. xz packs the same payload under 100 MiB so the
+# RPM can be hosted on GitHub. (A -server subpackage that drops the GUIs — XPA-6 —
+# is the durable fix; this is the size lever until then.)
+payload_compress = "xz"
 # EFF-40 — the NEVRA release field: bump THIS (not the workspace
 # version) for asset-only/packaging-only changes so `dnf upgrade`
 # sees a newer NEVRA; reset to "1" on every workspace version bump.
@@ -421,7 +427,7 @@ assets = [
     # a Workstation-role node by magic-mesh-brand.service (operator lock 2026-06-16).
     { source = "install-helpers/magic-mesh-brand.sh", dest = "/usr/libexec/mackesd/magic-mesh-brand", mode = "755" },
     { source = "packaging/systemd/magic-mesh-brand.service", dest = "/usr/lib/systemd/system/magic-mesh-brand.service", mode = "644" },
-    { source = "assets/brand/mackes-carbon-icons.zip", dest = "/usr/share/magic-mesh/brand/mackes-carbon-icons.zip", mode = "644" },
+    { source = "assets/brand/mackes-carbon-icons.tar.xz", dest = "/usr/share/magic-mesh/brand/mackes-carbon-icons.tar.xz", mode = "644" },
     { source = "assets/brand/cosmic-layout/**/*",  dest = "/usr/share/magic-mesh/brand/cosmic-layout/", mode = "644" },
     { source = "assets/brand/monogram.png",        dest = "/usr/share/magic-mesh/brand/monogram.png",   mode = "644" },
     { source = "assets/brand/greeter-hero.png",    dest = "/usr/share/magic-mesh/brand/greeter-hero.png", mode = "644" },

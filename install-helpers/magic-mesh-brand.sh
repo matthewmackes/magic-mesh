@@ -16,7 +16,7 @@ set -u
 
 # ── asset + token config ────────────────────────────────────────────────────
 BRAND_ASSETS="${BRAND_ASSETS:-/usr/share/magic-mesh/brand}"   # RPM install path
-ICONS_ZIP="${BRAND_ASSETS}/mackes-carbon-icons.zip"
+ICONS_ZIP="${BRAND_ASSETS}/mackes-carbon-icons.tar.xz"
 LAYOUT_SRC="${BRAND_ASSETS}/cosmic-layout"
 ICON_THEME="Mackes-Carbon"            # the dark variant is the system default
 GTK_DARK="Adwaita-dark"               # Carbon-aligned dark base for GTK widgets
@@ -50,9 +50,10 @@ as_user() {
 # ── 1. icons (BRAND-2) ──────────────────────────────────────────────────────
 brand_icons() {
     [ -f "$ICONS_ZIP" ] || { warn "icon set $ICONS_ZIP missing — skipping icons"; return; }
-    have unzip || { warn "unzip missing — skipping icons"; return; }
+    have tar || { warn "tar missing — skipping icons"; return; }
     log "installing Carbon icon themes → /usr/share/icons"
-    unzip -oq "$ICONS_ZIP" -d /usr/share/icons/
+    mkdir -p /usr/share/icons/
+    tar -xJf "$ICONS_ZIP" -C /usr/share/icons/
     for t in Mackes-Carbon Mackes-Carbon-Light; do
         [ -d "/usr/share/icons/$t" ] && have gtk-update-icon-cache && \
             gtk-update-icon-cache -qtf "/usr/share/icons/$t" 2>/dev/null || true
