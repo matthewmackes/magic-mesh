@@ -145,10 +145,7 @@ mod tests {
     #[test]
     fn split_extracts_title_and_body() {
         let (title, body) = split();
-        assert_eq!(
-            title,
-            "MCNF — Warning, Disclaimer, and Mission Statement"
-        );
+        assert_eq!(title, "MCNF — Warning, Disclaimer, and Mission Statement");
         assert!(body.starts_with("MCNF is an open-source"));
     }
 }

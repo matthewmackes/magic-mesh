@@ -13,6 +13,37 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
+## [10.0.16] - 2026-06-18
+
+### Added
+- **Boot-status dialog (BOOT-STATUS epic, complete).** A `boot_readiness` mackesd
+  worker publishes one ordered `state/boot-readiness` snapshot: the fabric
+  dependency chain (Nebula → overlay-IP → mackesd → bus → QNM-Shared → peer
+  directory), the app daemons (musicd / netdata / KDE Connect, active + port
+  reachability), and a per-peer ping roll-up (RTT, lighthouse tagged). The
+  Workbench HOME panel renders all three, collapsing to a green "Mesh ready" chip
+  when all-green. A login autostart (`mde-workbench --boot-popup`) opens it at
+  session start and stays silent once the mesh is up. A down app daemon shows an
+  inline **Restart** (user-unit `systemctl --user` for musicd, pkexec for system
+  units).
+- **Peers "settling…" state (BOOT-PEERS-1).** During the cold-boot warm-up the
+  Peers panel distinguishes "still converging" from a genuinely empty mesh.
+- **Music client refactor (MUSIC-RFX-1..7).** Daemon queue model (reorder / remove
+  / play-next) + bus verbs; engine **seek** + `seek` transport verb; Subsonic
+  **playlist write** verbs (create / update / delete); a maxi now-playing view
+  with an interactive scrub slider (hidden for live streams) on a dominant-colour
+  art tint; an **editable queue** panel (select / reorder / play-next / remove);
+  a **playlist editor** (create / rename / delete); and an **add-to-playlist**
+  picker from album rows + now-playing.
+
+### Fixed
+- **Bus consumer stranding (BUS-INODE-ORPHAN-1).** A read-only `index.sqlite` is
+  now self-healed by an in-place permission fix before any destructive recreate,
+  the recreate is gated on ownership (a non-owner GUI can't unlink the root
+  daemon's live index), and every long-running consumer reopens on an inode swap
+  (`Persist::reopen_if_index_changed`) — fixing the "daemon not responding after
+  long uptime" wedge.
+
 ## [10.0.15] - 2026-06-17
 
 ### Changed
