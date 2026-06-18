@@ -46,6 +46,14 @@ pub struct PeerRecord {
     /// pre-overlay-IP writers / pre-enrollment; readers tolerate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_ip: Option<String>,
+    /// This peer's pinned deployment role (`lighthouse` | `server` |
+    /// `workstation`), recorded by the node itself each heartbeat so the
+    /// replicated directory carries it mesh-wide. Lets any node identify the
+    /// lighthouse set (LIGHTHOUSE-1/Q1) without a separate probe. `None` from
+    /// pre-role writers / unpinned boxes; readers tolerate (treated as a
+    /// non-lighthouse peer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 /// PD-2 (L10–L15) — a peer's locally-probed service inventory,
@@ -152,6 +160,7 @@ impl PeerRecord {
             health: health.into(),
             descriptors: None,
             overlay_ip: None,
+            role: None,
         }
     }
 

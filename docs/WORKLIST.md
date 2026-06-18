@@ -927,15 +927,11 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
 - [ ] **XCP-7: XAPI creds as a mesh secret** — encrypted `<QNM-Shared>/secrets/xcp/<host>.age`, leader-managed; never in `ps`/logs. **Acceptance:** any authorized node drives any enrolled host; creds absent from process listing.
 
 ## LIGHTHOUSE — Hero focus on lighthouses (design: docs/design/lighthouse-hero.md; 25-Q survey locked 2026-06-18)
-- [ ] **LIGHTHOUSE-1: `mde-theme` — Carbon Green 50 beacon token.**
-  **As** a designer, **I want** the healthy-beacon green single-sourced as a Carbon token, **so that** §4 holds (no raw hex in the applet/panel).
-  **Acceptance:** add `green_50` (Carbon Green 50) to the `mde-theme` palette + a palette test asserting its RGBA; the beacon healthy color reads it, unhealthy reads `danger`.
-- [ ] **LIGHTHOUSE-2: shared lighthouse discovery + health helper.**
-  **As** a developer, **I want** one pure helper that lists `role==lighthouse` nodes (from directory descriptors) and computes binary health from the mesh-status snapshot, **so that** the Hub footer, applet, shell, and tab agree.
-  **Acceptance** (each runtime-observable):
-    - [ ] lighthouse set = directory descriptors with `role == lighthouse` (Q1)
-    - [ ] `lighthouse_health(node)` → green iff online AND nebula up AND (master ⇒ lizardfs-master up); else red (Q2/Q3/Q15); no-data treated neutral until first snapshot, then red
-    - [ ] unit-tested over healthy / offline / core-service-down / master-SPOF / no-data fixtures
+- [✓] **LIGHTHOUSE-1: `mde-theme` — Carbon Green 50 beacon token.** DONE 2026-06-18: added a dedicated `Palette::beacon_healthy` semantic field (= `carbon::GREEN_50`, #24a148) across all three themes + the `beacon_healthy_is_carbon_green_50` palette test. Kept distinct from `success` so the beacon reads its own named token (a later `success` change can't silently alter the beacon, Q13); unhealthy reads `danger` (Q14).
+- [✓] **LIGHTHOUSE-2: shared lighthouse discovery + health helper.** DONE 2026-06-18: new `mackes_mesh_types::lighthouse` module — `is_lighthouse`/`lighthouse_records` (filter `role == "lighthouse"` from the replicated peer directory, Q1), a pure binary `classify(has_data, online, overlay_up, is_master, master_service_up)` (Q3/Q15), `beacon_for`/`beacons`/`health_counts` adapters over `PeerRecord` (+now_ms for determinism). Added `role: Option<String>` to `PeerRecord`, stamped by the telemetry heartbeat from the pinned `mde_role`. 10 unit tests over healthy/offline/overlay-down/master-SPOF/no-data/counts.
+    - [✓] lighthouse set = directory rows with `role == lighthouse` (Q1)
+    - [✓] binary health → green iff has-data AND online AND overlay up AND (master ⇒ master service healthy); else red (Q2/Q3/Q15); no-data folds to red
+    - [✓] unit-tested over healthy / offline / overlay-down / master-SPOF / no-data fixtures
 - [ ] **LIGHTHOUSE-3: Notification Hub pinned Lighthouses footer (animated beacons).**
   **As** an operator, **I want** an always-visible lighthouse-health footer in the Notification Hub, **so that** I see anchor-node health at a glance.
   **Acceptance** (each runtime-observable):

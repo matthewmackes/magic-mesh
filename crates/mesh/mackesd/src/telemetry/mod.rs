@@ -187,6 +187,10 @@ pub fn spawn_heartbeat_worker(
                 // every node (not just the signer) can resolve <host>.mesh,
                 // publish overlay services, and validate routing edges.
                 rec.overlay_ip = crate::voip_rtt::own_nebula_ip();
+                // LIGHTHOUSE-1/Q1 — stamp our pinned deployment role into the
+                // replicated directory so any node can identify the lighthouse
+                // set from the QNM-Shared peer JSON (no separate probe).
+                rec.role = mde_role::load().ok().map(|r| r.as_str().to_string());
                 match mackes_mesh_types::peers::write_peer_record(&peers_dir, &rec) {
                     Ok(_) => last_peer_write = Some(std::time::Instant::now()),
                     Err(e) => tracing::warn!(error = %e, "peer-record: write failed"),

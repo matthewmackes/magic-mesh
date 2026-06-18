@@ -539,6 +539,7 @@ mod tests {
                 health: "healthy".into(),
                 descriptors: None,
                 overlay_ip: None,
+                role: None,
             },
         )
         .unwrap();
@@ -598,6 +599,7 @@ mod tests {
                 health: "healthy".into(),
                 descriptors: None,
                 overlay_ip: None,
+                role: None,
             },
         )
         .unwrap();
@@ -631,6 +633,7 @@ mod tests {
                 health: "unknown".into(),
                 descriptors: None,
                 overlay_ip: None,
+                role: None,
             },
         )
         .unwrap();
@@ -711,6 +714,7 @@ mod tests {
             health: "healthy".into(),
             descriptors: None,
             overlay_ip: None,
+            role: None,
         };
         write_peer_record(&pdir, &rec).unwrap();
 

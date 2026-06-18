@@ -40,6 +40,12 @@ pub struct Palette {
     pub danger: Rgba,
     /// Semantic warning (amber) — cautions, pending / at-risk status.
     pub warning: Rgba,
+    /// Beacon-healthy (Carbon Green 50) — the dedicated lighthouse-beacon
+    /// "healthy" hue (LIGHTHOUSE-1 / Q13). Kept distinct from [`Self::success`]
+    /// so the animated beacon reads its own named token: a future change to
+    /// the generic success role won't silently alter the beacon, and vice
+    /// versa. Unhealthy beacons read [`Self::danger`] (Q14/Q15).
+    pub beacon_healthy: Rgba,
 }
 
 impl Palette {
@@ -80,6 +86,8 @@ impl Palette {
             success: carbon::GREEN_50,
             danger: carbon::RED_60,
             warning: carbon::YELLOW_30,
+            // Lighthouse beacon healthy hue — Carbon Green 50 (Q13).
+            beacon_healthy: carbon::GREEN_50,
         }
     }
 
@@ -108,6 +116,8 @@ impl Palette {
             success: carbon::GREEN_50,
             danger: carbon::RED_60,
             warning: carbon::YELLOW_30,
+            // Lighthouse beacon healthy hue — Carbon Green 50 (Q13).
+            beacon_healthy: carbon::GREEN_50,
         }
     }
 
@@ -136,6 +146,8 @@ impl Palette {
             success: carbon::GREEN_50,
             danger: carbon::RED_60,
             warning: carbon::YELLOW_30,
+            // Lighthouse beacon healthy hue — Carbon Green 50 (Q13).
+            beacon_healthy: carbon::GREEN_50,
         }
     }
 
@@ -214,6 +226,22 @@ mod tests {
         assert_eq!((l.border.r, l.border.g, l.border.b), (0xe0, 0xe0, 0xe0));
         assert!(d.border.a >= 0.95);
         assert!(l.border.a >= 0.95);
+    }
+
+    #[test]
+    fn beacon_healthy_is_carbon_green_50() {
+        // LIGHTHOUSE-1 / Q13 — the dedicated lighthouse-beacon healthy token
+        // is Carbon Green 50 (#24a148), uniform across themes, and currently
+        // co-equal with `success` (carbondesignsystem.com support ramp). The
+        // separate field exists so the beacon can diverge from `success`
+        // later without a search-and-replace.
+        for p in [Palette::dark(), Palette::gray_90(), Palette::light()] {
+            assert_eq!(
+                (p.beacon_healthy.r, p.beacon_healthy.g, p.beacon_healthy.b),
+                (0x24, 0xa1, 0x48)
+            );
+            assert!(p.beacon_healthy.a >= 0.99);
+        }
     }
 
     #[test]

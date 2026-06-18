@@ -233,6 +233,7 @@ mod tests {
                 health: "healthy".into(),
                 descriptors: None,
                 overlay_ip: None,
+                role: None,
             },
         )
         .unwrap();

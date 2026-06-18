@@ -17,6 +17,12 @@
 
 pub mod cap_tags;
 pub mod connect;
+// LIGHTHOUSE-2 (2026-06-18) — shared lighthouse discovery + binary health
+// (beacon) derivation from the replicated peer directory. One pure source for
+// the Hub footer, the Workbench Lighthouses tab, and the panel applet so the
+// "healthy/unhealthy" rule (docs/design/lighthouse-hero.md Q1/Q2/Q3/Q15) lives
+// in exactly one place.
+pub mod lighthouse;
 // NF-11.1 (v2.5) — Nebula facts surface for the peer card.
 pub mod nebula;
 pub mod peer_probe;

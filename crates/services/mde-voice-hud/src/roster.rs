@@ -222,6 +222,7 @@ mod tests {
             health: "healthy".into(),
             descriptors: None,
             overlay_ip: Some("10.42.0.7".into()),
+            role: None,
         };
         let p = record_to_peer(rec);
         assert_eq!(p.name, "pine");
@@ -236,6 +237,7 @@ mod tests {
             health: "unreachable".into(),
             descriptors: None,
             overlay_ip: None,
+            role: None,
         };
         assert_eq!(record_to_peer(unreachable).presence, "offline");
     }
