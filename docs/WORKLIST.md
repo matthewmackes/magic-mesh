@@ -1092,7 +1092,7 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
     - [ ] with `MDE-KVM-1` running on the dev host, opening the Instances panel **on .13** (a different node) shows `MDE-KVM-1` attributed to host `fedora`
     - [ ] local rows still resolve live (the local probe is not regressed); peer rows refresh as new inventory records land
     - [ ] no raw hex / scattered metrics outside `mde-theme` (§4); unit-tested aggregation (merge local probe + peer inventory, newest-per-peer, dedup by uuid)
-- [>] **WORKLOAD-FLEET-2: apps-applet Workloads tab is LOCAL-ONLY — wire it to the fleet inventory.** CONFIRMED 2026-06-18: the apps aggregator (`mackesd::ipc::apps::read_local_inventory`) reads only `compute/inventory/<this-node>` off the local bus, so the Start-menu Workloads tab shows local workloads only — APPS-6's "local + peer descriptors" acceptance was never true (audit-gap; APPS-6 re-cued below).
+- [✓] **WORKLOAD-FLEET-2: apps-applet Workloads tab is LOCAL-ONLY — wire it to the fleet inventory.** CONFIRMED 2026-06-18: the apps aggregator (`mackesd::ipc::apps::read_local_inventory`) reads only `compute/inventory/<this-node>` off the local bus, so the Start-menu Workloads tab shows local workloads only — APPS-6's "local + peer descriptors" acceptance was never true (audit-gap; APPS-6 re-cued below).
   **As** an operator, **I want** the Start-menu Workloads tab to show the same fleet-wide list as the Workbench Instances panel, **so that** "all panels showing workloads" is truthful.
   **Acceptance** (each runtime-observable):
     - [ ] the aggregator folds every peer's `<QNM-Shared>/<host>/compute-inventory.json` (the WORKLOAD-FLEET-1 files), attributed to each host, self-skipped + deduped (reuse the same pattern)
