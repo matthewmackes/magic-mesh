@@ -982,11 +982,11 @@ Operator: an informative, at-boot view of how the mesh fabric + app daemons come
     - [ ] a failed step renders its `remediation` verb as a button wired to the existing service-control + journal paths (e.g. `systemctl --user stop mde-musicd` → a working Restart).
 
 ### BOOT-PEERS — peer-list settling indicator (operator-reported 2026-06-17)
-- [ ] **BOOT-PEERS-1: peer list "settling" state after a cold reboot**
+- [✓] **BOOT-PEERS-1: peer list "settling" state after a cold reboot**
   **As** an operator, **I want** the Peers panel to distinguish "still converging" from "empty mesh" after a reboot, **so that** the multi-minute cold-boot warm-up (Nebula overlay-IP → bus broker bind → QNM directory replication → first 30s peer sweep) doesn't look broken.
   **Acceptance:**
-    - [ ] while the boot chain is incomplete the panel shows a "peers settling…" state (not an empty/"no hosts" state).
-    - [ ] it resolves to the live roster once the directory has replicated + the first sweep completes. (Subsumed by BOOT-STATUS once that lands; keep until then.)
+    - [✓] while the fabric chain is incomplete the Peers panel shows a "Peers settling…" state (not the "empty mesh" guidance) — gated on `BootReadiness::fabric_converging()` (any non-`directory` boot step not yet ok), captured at load only when the roster is empty.
+    - [✓] resolves to the live roster once peers appear; a lone healthy node (fabric up, no peers) still shows the genuine empty state (`fabric_converging` is false then). Builds on the BOOT-STATUS-2/3/4 snapshot; `BootStep` gained a stable `id` for robust keying.
 
 ### BUS-INODE-ORPHAN — the index.sqlite self-heal recreate strands live consumers (live root cause 2026-06-17)
 - [✓] **BUS-INODE-ORPHAN-1: the BOOT-REC-3 recreate must not orphan open consumers**

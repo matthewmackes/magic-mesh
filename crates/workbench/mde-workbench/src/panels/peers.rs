@@ -167,6 +167,12 @@ pub struct PeersPanel {
     /// PD-7/L18 — the flow-particle animation phase (0.0..=1.0), advanced
     /// by the animation tick (registered only while real traffic flows).
     pub flow_phase: f32,
+    /// BOOT-PEERS-1 — captured at load: the mesh fabric is still coming up
+    /// (Nebula/overlay-IP/bus/QNM not all converged). When true AND the roster
+    /// is empty, the panel shows a "peers settling…" state instead of the
+    /// "empty mesh" guidance, so the multi-minute cold-boot warm-up doesn't look
+    /// broken. Read from `state/boot-readiness` only when the roster is empty.
+    pub boot_converging: bool,
 }
 
 /// PD-8 — the four L14 series, oldest→newest over the last ~60 s.
@@ -950,6 +956,12 @@ impl PeersPanel {
                     Ok(rows) => {
                         self.rows = rows;
                         self.loaded = Some(Ok(()));
+                        // BOOT-PEERS-1 — only when the roster is empty do we read
+                        // the boot snapshot (cheap, and avoids a per-poll sqlite
+                        // open on a populated mesh) to tell "still settling" from
+                        // a genuinely empty mesh.
+                        self.boot_converging = self.rows.is_empty()
+                            && crate::panels::home::read_boot_readiness().fabric_converging();
                         // PEERS-DT — the table opens with every row collapsed (no
                         // auto-expand); a stale selection that's no longer in the
                         // roster is cleared so it can't expand a missing row.
@@ -1491,6 +1503,23 @@ impl PeersPanel {
                         .size(12)
                         .colr(palette.text_muted.into_cosmic_color()),
                     text("Start it from Network → Mesh Services, then refresh.")
+                        .size(13)
+                        .colr(palette.text_muted.into_cosmic_color()),
+                    refresh_btn(palette),
+                ]
+                .spacing(8);
+                return shell(title, body.into(), palette);
+            }
+            // BOOT-PEERS-1 — a cold reboot's multi-minute warm-up (Nebula
+            // overlay-IP → bus → QNM directory replication → first peer sweep)
+            // leaves the roster transiently empty. Show a "settling" state, not
+            // the "empty mesh" guidance, so it doesn't look broken.
+            Some(Ok(())) if self.rows.is_empty() && self.boot_converging => {
+                let body = column![
+                    text("Peers settling…")
+                        .size(16)
+                        .colr(palette.text.into_cosmic_color()),
+                    text("The mesh fabric is still coming up (overlay network, message bus, shared-storage directory). Peers appear here as the directory replicates — usually within a minute or two of boot.")
                         .size(13)
                         .colr(palette.text_muted.into_cosmic_color()),
                     refresh_btn(palette),

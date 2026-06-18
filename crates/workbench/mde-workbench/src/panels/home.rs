@@ -261,6 +261,9 @@ fn count_snapshots() -> Option<u32> {
 /// (BOOT-STATUS-1). `status` is `ok` / `pending` / `blocked`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootStep {
+    /// Stable step id (`nebula` / `overlay-ip` / `mackesd` / `bus` / `qnm` /
+    /// `directory`) — robust to render across panels (BOOT-PEERS-1 keys on it).
+    pub id: String,
     /// Display label (e.g. "QNM-Shared mounted").
     pub label: String,
     /// `ok` | `pending` | `blocked`.
@@ -304,6 +307,23 @@ pub struct BootReadiness {
     pub pings: Vec<BootPing>,
 }
 
+impl BootReadiness {
+    /// BOOT-PEERS-1 — is the mesh fabric still coming up? True when a snapshot
+    /// exists and any *fabric* step (everything but the final peer `directory`
+    /// step) isn't `ok` yet — i.e. Nebula / overlay-IP / bus / QNM haven't all
+    /// converged. An empty roster during this window is "settling", not "empty
+    /// mesh". A lone healthy node (fabric up, just no peers) returns `false`, so
+    /// the genuine empty state still shows.
+    #[must_use]
+    pub fn fabric_converging(&self) -> bool {
+        !self.steps.is_empty()
+            && self
+                .steps
+                .iter()
+                .any(|s| s.id != "directory" && s.status != "ok")
+    }
+}
+
 /// Parse the `state/boot-readiness` snapshot body. A missing/garbage body →
 /// [`BootReadiness::default`] (the section then shows "unknown").
 #[must_use]
@@ -322,6 +342,11 @@ pub fn parse_boot_readiness(reply: &str) -> BootReadiness {
             arr.iter()
                 .filter_map(|s| {
                     Some(BootStep {
+                        id: s
+                            .get("id")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
                         label: s.get("label")?.as_str()?.to_string(),
                         status: s
                             .get("status")
@@ -2234,9 +2259,28 @@ mod tests {
         assert_eq!(r.pings[0].role, "lighthouse");
         assert_eq!(r.pings[0].rtt_ms, Some(3.2));
         assert_eq!(r.pings[1].rtt_ms, None);
+        // BOOT-PEERS-1 — fabric still converging (a non-directory step pending).
+        assert!(r.fabric_converging());
         // ready snapshot + garbage.
         assert!(parse_boot_readiness(r#"{"ready":true,"steps":[]}"#).ready);
         assert_eq!(parse_boot_readiness("nope"), BootReadiness::default());
+    }
+
+    #[test]
+    fn fabric_converging_distinguishes_settling_from_lone_node() {
+        // BOOT-PEERS-1 — fabric up but no peers (lone healthy node) is NOT
+        // converging (the genuine empty state should show).
+        let lone = r#"{"ready":false,"steps":[
+            {"id":"nebula","label":"Nebula overlay","status":"ok"},
+            {"id":"overlay-ip","label":"Overlay IP assigned","status":"ok"},
+            {"id":"mackesd","label":"mackesd serving","status":"ok"},
+            {"id":"bus","label":"Message bus broker","status":"ok"},
+            {"id":"qnm","label":"QNM-Shared mounted","status":"ok"},
+            {"id":"directory","label":"Peer directory replicated","status":"pending"}
+        ]}"#;
+        assert!(!parse_boot_readiness(lone).fabric_converging());
+        // No snapshot at all → not converging (we have no evidence of mid-boot).
+        assert!(!BootReadiness::default().fabric_converging());
     }
 
     #[test]
