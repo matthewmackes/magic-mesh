@@ -11,7 +11,7 @@
 //! closures bridge to cosmic's class-based theming via [`cosmic_compat`].
 
 mod cosmic_compat;
-use cosmic_compat::TextSty;
+use cosmic_compat::{ButtonSty, TextSty};
 
 use cosmic::iced::widget::{
     button, column, container, image, row, scrollable, stack, text, text_input, Space,
@@ -1085,6 +1085,107 @@ impl State {
         Task::batch(tasks)
     }
 
+    /// MUSIC-ALBUMS-2 — the Carbon left sidebar (256px): Home · Internet Radio ·
+    /// LIBRARY (Albums/Artists/Genres/Playlists/Podcasts) · Recently Added ·
+    /// Settings. The active item carries the accent rail + raised fill. Routes
+    /// through the existing nav messages — no new backend.
+    fn carbon_sidebar(&self) -> Element<'_, Message> {
+        let p = mde_theme::Palette::dark();
+        let cur = self.nav.current();
+        let cat_active = |c: HubCard| match c {
+            HubCard::Albums => matches!(cur, Route::Category(HubCard::Albums) | Route::Album(..)),
+            HubCard::Artists => {
+                matches!(cur, Route::Category(HubCard::Artists) | Route::Artist(..))
+            }
+            HubCard::Genres => matches!(cur, Route::Category(HubCard::Genres) | Route::Genre(..)),
+            HubCard::Podcasts => {
+                matches!(cur, Route::Category(HubCard::Podcasts) | Route::Podcast(..))
+            }
+            other => matches!(cur, Route::Category(x) if *x == other),
+        };
+        let mut col = column![]
+            .spacing(2)
+            .width(Length::Fixed(256.0))
+            .padding([8, 0]);
+        col = col.push(self.sidebar_item("Home", Message::Home, matches!(cur, Route::Hub)));
+        col = col.push(self.sidebar_item(
+            "Internet Radio",
+            Message::OpenCard(HubCard::Radio),
+            cat_active(HubCard::Radio),
+        ));
+        col = col.push(
+            container(text("LIBRARY").size(11).colr(carbon(p.text_muted, 1.0))).padding([12, 16]),
+        );
+        for (label, card) in [
+            ("Albums", HubCard::Albums),
+            ("Artists", HubCard::Artists),
+            ("Genres", HubCard::Genres),
+            ("Playlists", HubCard::Playlists),
+            ("Podcasts", HubCard::Podcasts),
+            ("Recently Added", HubCard::Recents),
+        ] {
+            col = col.push(self.sidebar_item(label, Message::OpenCard(card), cat_active(card)));
+        }
+        col = col.push(Space::new().height(Length::Fixed(12.0)));
+        col = col.push(self.sidebar_item("Settings", Message::OpenRouting, false));
+        let bg = carbon(p.background, 1.0);
+        container(col)
+            .height(Length::Fill)
+            .style(move |_| cosmic::iced::widget::container::Style {
+                background: Some(bg.into()),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    /// One sidebar nav row — flat (transparent idle / raised when active or
+    /// hovered) with a 3px accent rail + brighter text when active.
+    fn sidebar_item(&self, label: &str, msg: Message, active: bool) -> Element<'_, Message> {
+        let p = mde_theme::Palette::dark();
+        let raised = carbon(p.raised, 1.0);
+        let accent = carbon(p.accent, 1.0);
+        let text_c = if active {
+            carbon(p.text, 1.0)
+        } else {
+            carbon(p.text_muted, 1.0)
+        };
+        let rail_c = if active {
+            accent
+        } else {
+            cosmic::iced::Color::TRANSPARENT
+        };
+        let rail = container(
+            Space::new()
+                .width(Length::Fixed(3.0))
+                .height(Length::Fixed(40.0)),
+        )
+        .style(move |_| cosmic::iced::widget::container::Style {
+            background: Some(rail_c.into()),
+            ..Default::default()
+        });
+        let content = row![rail, text(label.to_string()).size(14).colr(text_c)]
+            .spacing(13)
+            .align_y(cosmic::iced::Alignment::Center);
+        button(content)
+            .width(Length::Fill)
+            .padding(0)
+            .on_press(msg)
+            .sty(move |_t, status| {
+                let bg =
+                    if active || matches!(status, cosmic::iced::widget::button::Status::Hovered) {
+                        Some(raised.into())
+                    } else {
+                        None
+                    };
+                cosmic::iced::widget::button::Style {
+                    background: bg,
+                    text_color: text_c,
+                    ..cosmic::iced::widget::button::Style::default()
+                }
+            })
+            .into()
+    }
+
     /// The library shell (hub + breadcrumb).
     fn library_view(&self) -> Element<'_, Message> {
         // Breadcrumb — each segment is a button that ascends to it.
@@ -1287,29 +1388,51 @@ impl State {
         } else {
             nav_btn("⌂ Home").on_press(Message::Home).into()
         };
-        let header = row![
-            back,
-            home,
-            text(&self.connection).size(13),
-            Space::new().width(Length::Fill),
-            search_field,
-            nav_btn("✕ Exit").on_press(Message::Exit),
-        ]
-        .spacing(12)
-        .align_y(cosmic::iced::Alignment::Center);
+        // MUSIC-ALBUMS-1 — Carbon header (48px): Back/Home + "MCNF Music"
+        // wordmark, centered search, Exit. Surface background + bottom inset.
+        let pal = mde_theme::Palette::dark();
+        let header = container(
+            row![
+                back,
+                home,
+                text("MCNF Music").size(14).colr(carbon(pal.text, 1.0)),
+                Space::new().width(Length::Fill),
+                search_field,
+                Space::new().width(Length::Fill),
+                nav_btn("✕ Exit").on_press(Message::Exit),
+            ]
+            .spacing(12)
+            .align_y(cosmic::iced::Alignment::Center),
+        )
+        .height(Length::Fixed(48.0))
+        .width(Length::Fill)
+        .padding([0, 16])
+        .style({
+            let bg = carbon(pal.background, 1.0);
+            move |_| cosmic::iced::widget::container::Style {
+                background: Some(bg.into()),
+                ..Default::default()
+            }
+        });
 
-        let mut page_col = column![
-            header,
-            Space::new().height(Length::Fixed(12.0)),
-            crumbs,
-            Space::new().height(Length::Fixed(16.0)),
-            body,
-        ]
-        .padding(20)
+        // Content area — breadcrumb + the body grid (the album grid etc.).
+        let content = container(
+            column![crumbs, Space::new().height(Length::Fixed(16.0)), body]
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .padding(24)
         .width(Length::Fill)
         .height(Length::Fill);
-        // MUSIC-PLAYBAR — the persistent playback bar, static at the bottom of
-        // every browse interface (library / album / search).
+
+        // MUSIC-ALBUMS-1/2 — the Carbon grid: header / [sidebar | content] /
+        // player. The persistent playback bar stays pinned at the bottom.
+        let mut page_col = column![
+            header,
+            row![self.carbon_sidebar(), content].height(Length::Fill),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill);
         if let Some(bar) = self.playback_bar() {
             page_col = page_col.push(bar);
         }
