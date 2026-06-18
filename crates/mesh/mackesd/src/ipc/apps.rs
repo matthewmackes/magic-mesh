@@ -321,6 +321,75 @@ pub fn build_list(local: Vec<AppEntry>, mesh: Vec<AppEntry>, workloads: Vec<AppE
     .to_string()
 }
 
+// ───────────────────────── favorites (APPS-4) ─────────────────────────
+
+/// Sanitize a username into a safe single filename component.
+fn sanitize_user(user: &str) -> String {
+    let s: String = user
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if s.is_empty() {
+        "_".to_string()
+    } else {
+        s
+    }
+}
+
+/// Per-user favorites file on QNM-Shared (Q10): a JSON array of entry ids at
+/// `<workgroup_root>/apps-favorites/<user>.json`, so a user's pins follow them to
+/// any node. mackesd (root) is the only writer with mount access; the applet
+/// reads/sets via the bus verbs.
+#[must_use]
+pub fn favorites_path(workgroup_root: &Path, user: &str) -> PathBuf {
+    workgroup_root
+        .join("apps-favorites")
+        .join(format!("{}.json", sanitize_user(user)))
+}
+
+/// Read a user's pinned entry ids (empty when none/absent — never an error).
+#[must_use]
+pub fn read_favorites(workgroup_root: &Path, user: &str) -> Vec<String> {
+    std::fs::read_to_string(favorites_path(workgroup_root, user))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Pin (`pinned=true`) or unpin an entry id for a user; returns the new set.
+/// Writes via temp+rename so a concurrent reader never sees a half-written file.
+pub fn set_favorite(workgroup_root: &Path, user: &str, id: &str, pinned: bool) -> Vec<String> {
+    let mut favs = read_favorites(workgroup_root, user);
+    favs.retain(|f| f != id);
+    if pinned {
+        favs.push(id.to_string());
+    }
+    let path = favorites_path(workgroup_root, user);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string(&favs) {
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+    favs
+}
+
+/// Extract `user` from a request body (`{"user":"…"}`); `_` when absent.
+fn user_from_body(body: Option<&str>) -> String {
+    body.and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+        .and_then(|v| v.get("user").and_then(|u| u.as_str()).map(str::to_string))
+        .unwrap_or_else(|| "_".to_string())
+}
+
 /// Responder handle — the QNM-Shared root (peers/descriptors live under it) +
 /// this node's hostname (so its own peer row isn't listed as a mesh target).
 #[derive(Debug, Clone)]
@@ -343,7 +412,7 @@ impl AppsService {
 }
 
 /// Action verbs served on `action/apps/<verb>`.
-pub const ACTION_VERBS: [&str; 1] = ["list"];
+pub const ACTION_VERBS: [&str; 3] = ["list", "favorites", "set-favorite"];
 
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -359,7 +428,13 @@ pub fn action_topic(verb: &str) -> String {
 /// provided closures so the heavy mackesd context isn't a hard dependency of the
 /// pure aggregation (and tests inject fixtures).
 #[must_use]
-pub fn build_reply<D, I>(svc: &AppsService, verb: &str, dir_doc: D, inv_doc: I) -> String
+pub fn build_reply<D, I>(
+    svc: &AppsService,
+    verb: &str,
+    body: Option<&str>,
+    dir_doc: D,
+    inv_doc: I,
+) -> String
 where
     D: FnOnce() -> serde_json::Value,
     I: FnOnce() -> serde_json::Value,
@@ -370,6 +445,29 @@ where
             let mesh = mesh_entries_from_directory(&dir_doc(), &svc.node_id);
             let workloads = workload_entries_from_inventory(&inv_doc(), &svc.node_id);
             build_list(local, mesh, workloads)
+        }
+        // APPS-4 — per-user favorites on QNM-Shared (Q10).
+        "favorites" => {
+            let user = user_from_body(body);
+            json!({ "ok": true, "favorites": read_favorites(&svc.workgroup_root, &user) })
+                .to_string()
+        }
+        "set-favorite" => {
+            let v: serde_json::Value = body
+                .and_then(|b| serde_json::from_str(b).ok())
+                .unwrap_or(json!({}));
+            let user = v.get("user").and_then(|u| u.as_str()).unwrap_or("_");
+            let id = v.get("id").and_then(|i| i.as_str()).unwrap_or_default();
+            let pinned = v
+                .get("pinned")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            if id.is_empty() {
+                json!({ "ok": false, "error": "set-favorite: missing id" }).to_string()
+            } else {
+                let favs = set_favorite(&svc.workgroup_root, user, id, pinned);
+                json!({ "ok": true, "favorites": favs }).to_string()
+            }
         }
         other => json!({ "ok": false, "error": format!("unknown apps verb: {other}") }).to_string(),
     }
@@ -442,7 +540,7 @@ pub fn poll_once<D, I>(
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
             let reply = if crate::ipc::body_within_cap(msg.body.as_deref()) {
-                build_reply(svc, verb, dir_doc, inv_doc)
+                build_reply(svc, verb, msg.body.as_deref(), dir_doc, inv_doc)
             } else {
                 crate::ipc::body_too_large_reply(verb)
             };
@@ -586,6 +684,28 @@ mod tests {
         assert_eq!(vm.kind, "workload");
         let ct = e.iter().find(|x| x.source == "podman").unwrap();
         assert_eq!(ct.name, "nginx");
+    }
+
+    #[test]
+    fn favorites_round_trip_per_user() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Empty until pinned.
+        assert!(read_favorites(root, "mm").is_empty());
+        // Pin two; idempotent (no dupes); unpin one.
+        set_favorite(root, "mm", "firefox", true);
+        let after = set_favorite(root, "mm", "firefox", true); // dup pin
+        assert_eq!(after, vec!["firefox"]);
+        set_favorite(root, "mm", "gimp", true);
+        assert_eq!(read_favorites(root, "mm"), vec!["firefox", "gimp"]);
+        set_favorite(root, "mm", "firefox", false); // unpin
+        assert_eq!(read_favorites(root, "mm"), vec!["gimp"]);
+        // Per-user isolation: another user is unaffected.
+        assert!(read_favorites(root, "alice").is_empty());
+        // Username is sanitized into a single path component (no traversal).
+        assert!(favorites_path(root, "../etc/passwd")
+            .to_string_lossy()
+            .ends_with("apps-favorites/___etc_passwd.json"));
     }
 
     #[test]

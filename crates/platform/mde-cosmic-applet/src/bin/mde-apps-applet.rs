@@ -49,10 +49,14 @@ enum Message {
     PopupClosed(Id),
     /// Open-or-close the launcher dropdown.
     TogglePopup,
-    /// Fresh entries + QNM disk usage arrived from the load.
-    Loaded(Vec<Entry>, Option<(u64, u64)>),
+    /// Fresh entries + QNM disk usage + favorites arrived from the load.
+    Loaded(Vec<Entry>, Option<(u64, u64)>, HashSet<String>),
     /// A load failed.
     LoadFailed(String),
+    /// Pin/unpin an entry id (APPS-4).
+    ToggleFavorite(String),
+    /// Favorites changed (post-pin); update the set.
+    FavoritesChanged(HashSet<String>),
     /// Switch the active tab.
     SetTab(LauncherTab),
     /// Search box changed.
@@ -90,42 +94,69 @@ fn read_qnm_usage() -> Option<(u64, u64)> {
     }
 }
 
-/// Fetch `action/apps/list` off the shared bus + the QNM disk usage. `Persist`
-/// isn't `Send`, so the round-trip runs on a blocking thread with a local
-/// runtime; only the `Send` results cross back. An unreachable daemon → empty.
-async fn fetch_apps() -> Result<(Vec<Entry>, Option<(u64, u64)>), String> {
-    tokio::task::spawn_blocking(|| -> Result<(Vec<Entry>, Option<(u64, u64)>), String> {
-        let dir = mde_bus::default_data_dir().ok_or_else(|| "no Bus data dir".to_string())?;
-        let persist =
-            mde_bus::persist::Persist::open(dir).map_err(|e| format!("bus store: {e}"))?;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
-        let reply = rt
-            .block_on(mde_bus::rpc::request(
-                &persist,
-                "action/apps/list",
-                Priority::Default,
-                None,
-                None,
-                Duration::from_secs(5),
-            ))
-            .map_err(|e| format!("apps daemon not responding ({e})"))?;
-        Ok((
-            parse_entries(&reply.body.unwrap_or_default()),
-            read_qnm_usage(),
+/// The desktop user whose favorites we sync (Q10). Falls back to `_`.
+fn current_user() -> String {
+    std::env::var("USER").unwrap_or_else(|_| "_".to_string())
+}
+
+/// Round-trip one `action/apps/<verb>` request on the shared bus, returning the
+/// reply body. `Persist` isn't `Send`, so this is called from a blocking thread.
+fn bus_request(verb: &str, body: Option<&str>) -> Result<String, String> {
+    let dir = mde_bus::default_data_dir().ok_or_else(|| "no Bus data dir".to_string())?;
+    let persist = mde_bus::persist::Persist::open(dir).map_err(|e| format!("bus store: {e}"))?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let reply = rt
+        .block_on(mde_bus::rpc::request(
+            &persist,
+            &format!("action/apps/{verb}"),
+            Priority::Default,
+            None,
+            body,
+            Duration::from_secs(5),
         ))
-    })
+        .map_err(|e| format!("apps daemon not responding ({e})"))?;
+    Ok(reply.body.unwrap_or_default())
+}
+
+/// Fetch the entry list + QNM disk usage + this user's favorites in one
+/// blocking task; only the `Send` results cross back. Unreachable daemon → empty.
+async fn fetch_apps() -> Result<(Vec<Entry>, Option<(u64, u64)>, HashSet<String>), String> {
+    tokio::task::spawn_blocking(
+        || -> Result<(Vec<Entry>, Option<(u64, u64)>, HashSet<String>), String> {
+            let entries = parse_entries(&bus_request("list", None)?);
+            let user = current_user();
+            let favs_body = format!(r#"{{"user":"{user}"}}"#);
+            let favorites = bus_request("favorites", Some(&favs_body))
+                .map(|r| mde_cosmic_applet::parse_favorites(&r))
+                .unwrap_or_default();
+            Ok((entries, read_qnm_usage(), favorites))
+        },
+    )
     .await
     .map_err(|e| format!("fetch task join: {e}"))?
 }
 
-/// The `Task` that loads entries + disk usage, mapped into messages.
+/// Pin/unpin a favorite over the bus, returning the new set.
+async fn set_favorite(id: String, pinned: bool) -> HashSet<String> {
+    tokio::task::spawn_blocking(move || {
+        let user = current_user();
+        let body = serde_json::json!({ "user": user, "id": id, "pinned": pinned }).to_string();
+        bus_request("set-favorite", Some(&body))
+            .map(|r| mde_cosmic_applet::parse_favorites(&r))
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// The `Task` that loads entries + disk usage + favorites, mapped into messages.
 fn load_task() -> Task<Message> {
     Task::perform(fetch_apps(), |r| {
         cosmic::Action::App(match r {
-            Ok((entries, qnm)) => Message::Loaded(entries, qnm),
+            Ok((entries, qnm, favs)) => Message::Loaded(entries, qnm, favs),
             Err(e) => Message::LoadFailed(e),
         })
     })
@@ -242,11 +273,19 @@ impl Application for AppsApplet {
                 ));
                 return Task::batch([open, load_task()]);
             }
-            Message::Loaded(entries, qnm) => {
+            Message::Loaded(entries, qnm, favs) => {
                 self.entries = entries;
                 self.qnm = qnm;
+                self.favorites = favs;
                 self.error = None;
             }
+            Message::ToggleFavorite(id) => {
+                let pinned = !self.favorites.contains(&id);
+                return Task::perform(set_favorite(id, pinned), |favs| {
+                    cosmic::Action::App(Message::FavoritesChanged(favs))
+                });
+            }
+            Message::FavoritesChanged(favs) => self.favorites = favs,
             Message::LoadFailed(e) => {
                 self.error = Some(e);
             }
@@ -381,36 +420,51 @@ impl AppsApplet {
         .into()
     }
 
-    /// One entry row — name + a kind/node hint; local apps launch on click,
-    /// other kinds render (their launch paths land in APPS-5/6/7).
+    /// One entry row — a pin toggle (APPS-4) + name/hint launch button. Local
+    /// apps launch on click; other kinds render (launch paths land in APPS-5/6/7).
     fn entry_row<'a>(&self, e: &'a Entry) -> Element<'a, Message> {
-        use cosmic::widget::{button, column, text};
+        use cosmic::widget::{button, column, row, text};
         let p = Palette::dark();
         let sizes = FontSize::defaults();
+        let cap_sz = TypeRole::Caption.size_in(sizes);
         let sub = match e.kind.as_str() {
             "mesh-app" => format!("mesh · {} · {}", e.node, e.health),
             "workload" => format!("{} · {}", e.source, e.state),
             "service" => format!("service · {}", e.node),
             _ => e.source.clone(),
         };
+        // Pin toggle (★ pinned / ☆ not) — persists mesh-wide (APPS-4).
+        let pinned = self.favorites.contains(&e.id);
+        let star = button::custom(
+            text(if pinned { "\u{2605}" } else { "\u{2606}" })
+                .size(cap_sz)
+                .class(cosmic::theme::Text::Color(carbon(if pinned {
+                    p.accent
+                } else {
+                    p.text_muted
+                }))),
+        )
+        .on_press(Message::ToggleFavorite(e.id.clone()))
+        .class(cosmic::theme::Button::Text);
+
         let body = column(vec![
             text(e.name.clone())
                 .size(TypeRole::Body.size_in(sizes))
                 .into(),
             text(sub)
-                .size(TypeRole::Caption.size_in(sizes))
+                .size(cap_sz)
                 .class(cosmic::theme::Text::Color(carbon(p.text_muted)))
                 .into(),
         ])
         .spacing(1);
-        let btn = button::custom(body)
+        let launch = button::custom(body)
             .width(Length::Fill)
             .class(cosmic::theme::Button::Text);
-        // Local apps launch directly (Q23); other kinds are display-only here.
-        if e.kind == "app" && !e.exec.is_empty() {
-            btn.on_press(Message::LaunchLocal(e.exec.clone())).into()
+        let launch = if e.kind == "app" && !e.exec.is_empty() {
+            launch.on_press(Message::LaunchLocal(e.exec.clone()))
         } else {
-            btn.into()
-        }
+            launch
+        };
+        row(vec![star.into(), launch.into()]).spacing(4).into()
     }
 }

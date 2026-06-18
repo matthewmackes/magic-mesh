@@ -241,6 +241,20 @@ pub fn parse_entries(reply: &str) -> Vec<Entry> {
         .unwrap_or_default()
 }
 
+/// Parse the `favorites`/`set-favorite` reply (`{"favorites":[id,…]}`) into a
+/// pin set (APPS-4). An error/garbage reply → empty set.
+#[must_use]
+pub fn parse_favorites(reply: &str) -> std::collections::HashSet<String> {
+    serde_json::from_str::<serde_json::Value>(reply)
+        .ok()
+        .and_then(|v| {
+            v.get("favorites")
+                .and_then(|f| serde_json::from_value::<Vec<String>>(f.clone()).ok())
+        })
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default()
+}
+
 /// Filter entries for the dropdown: a non-empty `query` searches across ALL tabs
 /// (Q2 fuzzy-ish — case-insensitive substring on the name); an empty query shows
 /// the active `tab` (Favorites = ids in `favorites`, else by kind). Sorted by name.
@@ -301,6 +315,14 @@ pub fn qnm_usage_label(usage: Option<(u64, u64)>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_favorites_decodes_set() {
+        let f = parse_favorites(r#"{"ok":true,"favorites":["firefox","gimp"]}"#);
+        assert!(f.contains("firefox") && f.contains("gimp") && f.len() == 2);
+        assert!(parse_favorites(r#"{"ok":false}"#).is_empty());
+        assert!(parse_favorites("junk").is_empty());
+    }
 
     #[test]
     fn fmt_bytes_scales_units() {
