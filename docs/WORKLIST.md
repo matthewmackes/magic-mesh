@@ -926,6 +926,20 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
   **Code done (2026-06-18):** `workers/xcp_host.rs` — spawned on all roles, self-gates on the dom0 marker (`/etc/xensource-inventory`) so it's a no-op off-hypervisor; on a dom0 it queries `mackes_xcp` locally (`HostTarget::Local`, no SSH) and publishes a capacity doc to `compute/xcp-host/<node>` every 15s. Pure `xcp_host_doc` builder + test; this is what makes **XCP-1's `host_capacity` reachable**. **Still [>]:** "shows in the directory" + "spawning places the VM" need the consumer (XCP-4 `action/provision/hosts` + panel) and a live joined dom0 (XCP-5/3) — verified once a host is enrolled.
 - [ ] **XCP-7: XAPI creds as a mesh secret** — encrypted `<QNM-Shared>/secrets/xcp/<host>.age`, leader-managed; never in `ps`/logs. **Acceptance:** any authorized node drives any enrolled host; creds absent from process listing.
 
+## APPS-LIVE — Applications menu running-state awareness (operator-reported live 2026-06-18)
+> Operator (screenshot): the Applications/Start menu does not indicate which apps are **already running** or **on what host** — e.g. Firefox and other live apps showed no running badge. Only the `fedora (remote desktop)` peer entry showed an online dot. **Make the launcher aware of live application state, mesh-wide.** Same aggregation pattern as [[WORKLOAD-FLEET]] (read live state off the bus, attribute to a node), applied to ordinary XDG/flatpak apps + peer-published apps, not just VMs/containers.
+- [ ] **APPS-LIVE-1: launcher shows running state + host for every entry.**
+  **As** an operator, **I want** each app row in the Start menu to show whether it's currently running and on which node(s), **so that** I can tell what's live before launching (and jump to it instead of starting a duplicate).
+  **Acceptance** (each runtime-observable):
+    - [ ] each launchable entry (local XDG/flatpak app, peer-published app) carries a live **running** indicator (e.g. a Carbon running dot + "running on <host>") derived from real state, not a static flag
+    - [ ] local running apps are detected (process/`.desktop` ↔ running window/app match) and badged on this node
+    - [ ] a peer publishes its running-app set to the bus (e.g. `apps/running/<peer>` or folded into `action/apps/list`); the launcher shows "running on <peer-host>" for apps live elsewhere
+    - [ ] with Firefox open on the dev host, the Applications menu (on the dev host AND on a second node) shows Firefox flagged running, attributed to host `fedora`
+    - [ ] Carbon tokens only (§4); unit-tested running-state merge (local detect + peer bus state, dedup by app id + host)
+- [ ] **APPS-LIVE-2: clicking a running entry focuses/attaches instead of relaunching (where possible).**
+  **As** an operator, **I want** clicking an already-running app to raise it (local) or open a remote-desktop/attach path (peer), **so that** the running badge is actionable.
+  **Acceptance:** clicking a locally-running app raises its window rather than spawning a second instance; clicking an app running on a peer offers "open on <host>" (remote-desktop session) consistent with APPS-5.
+
 ## WORKLOAD-FLEET — fleet-wide workload visibility (operator-reported live 2026-06-18)
 > Operator: "Host Fedora has a KVM VM running. Is this correct? If so, it should be visible in all panels showing workloads." **Diagnosis:** `MDE-KVM-1` is the authorized on-host test VM ([[test-infra-authorization]]); the **data plane already works** — the `compute_registry` worker discovers it via `virsh` and publishes `compute/inventory/<peer>` every 10s (live: `compute/inventory/10.42.0.3` carries `MDE-KVM-1` running, 2 GB, meshfs_available). The **gap is the display side**: every "workloads" surface enumerates LOCAL `virsh`/`podman` only and never reads the bus inventory, so a VM on node A is invisible from node B even though its descriptor is on the bus.
 - [ ] **WORKLOAD-FLEET-1: workbench Instances panel must show fleet-wide workloads, not just local.**
