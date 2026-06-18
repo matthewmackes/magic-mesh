@@ -13,6 +13,39 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
+## [10.0.17] - 2026-06-18
+
+### Added
+- **Fleet-wide workloads (WORKLOAD-FLEET-1).** The Workbench ▸ Provisioning ▸
+  Instances panel now lists every node's VMs + containers, not just the local
+  box. `compute_registry` mirrors each node's inventory to the replicated
+  QNM-Shared plane (`<host>/compute-inventory.json`); the panel folds all peers'
+  files with a Node column, deduped, lifecycle actions gated to local rows.
+- **Fleet-wide Published Services (SVC-VIEW-1).** The Mesh ▸ Published Services
+  panel lists the 7 canonical services (SSH/NATS/Mesh FS/Media/rsync/WoL/AV) for
+  every enrolled peer (read from the replicated peer roster), each with a Node
+  column + reachability pill — was local-only and showed empty.
+- **Nebula encryption-strength label (NEB-CRYPTO-LABEL).** The notification-bell
+  applet shows the live overlay cipher (e.g. AES-256-GCM) next to the bell,
+  sourced from the world-readable mesh-status snapshot (`network.cipher`).
+
+### Fixed
+- **GLYPH-FIX — slow first-paint + black panel icon.** Emoji-presentation glyphs
+  routed through the color-emoji font ignored the Carbon tint (black-on-dark
+  bell) and stalled first paint for seconds. Replaced with text-presentation BMP
+  glyphs across the bell, apps applet, music, and notification center.
+- **Music browse lockup** on large libraries (windowed art load), **art-focused
+  Full View** scaling, and a **persistent playback bar** in every music view.
+
+### Changed
+- **Start menu / apps applet redesign** — click-to-toggle (no mouseover popup),
+  Music-style zebra Carbon rows with right-aligned actions, light + dark themes,
+  golden-ratio sizing, app names in primary text.
+- **Shell login banner** gains a Network Overview (ASCII topology + routable
+  subnets + external gateways).
+- **XCP foundation (XCP-1, XCP-6)** — `mackes-xcp` hypervisor-access layer and
+  the `xcp_host` capacity-advertising worker.
+
 ## [10.0.16] - 2026-06-18
 
 ### Added
