@@ -39,6 +39,8 @@ struct AppsApplet {
     favorites: HashSet<String>,
     /// QNM-Shared (used, total) bytes for the header (Q8); None = unavailable.
     qnm: Option<(u64, u64)>,
+    /// Entry id whose right-click context strip is open (APPS-8).
+    open_menu: Option<String>,
     /// Last load error, shown in the dropdown's empty state.
     error: Option<String>,
 }
@@ -71,6 +73,10 @@ enum Message {
     Workload(String, String, WorkloadAction),
     /// Open a published mesh service's endpoint over the overlay (APPS-7).
     OpenService(String),
+    /// Right-click an entry → toggle its context action strip (APPS-8).
+    EntryMenu(String),
+    /// Uninstall a flatpak app by its app id (APPS-8).
+    Uninstall(String),
     /// Re-fetch the entry list.
     Refresh,
 }
@@ -255,6 +261,7 @@ impl Application for AppsApplet {
                 query: String::new(),
                 favorites: HashSet::new(),
                 qnm: None,
+                open_menu: None,
                 error: None,
             },
             // Prime the list so the first open is instant.
@@ -385,6 +392,22 @@ impl Application for AppsApplet {
                         cosmic::app::Action::Surface(destroy_popup(id)),
                     ));
                 }
+            }
+            Message::EntryMenu(id) => {
+                // Toggle the right-click context strip for this entry (APPS-8).
+                self.open_menu = if self.open_menu.as_deref() == Some(&id) {
+                    None
+                } else {
+                    Some(id)
+                };
+            }
+            Message::Uninstall(id) => {
+                // Flatpak apps uninstall by app id (the .desktop id). Detached.
+                let _ = std::process::Command::new("setsid")
+                    .args(["--fork", "flatpak", "uninstall", "--user", "-y", &id])
+                    .status();
+                self.open_menu = None;
+                return load_task();
             }
             Message::Refresh => return load_task(),
         }
@@ -574,6 +597,74 @@ impl AppsApplet {
             }
             cells.push(action_btn("Attach", WorkloadAction::Attach));
         }
-        row(cells).spacing(4).into()
+        // APPS-8 — right-click the row to toggle a context action strip.
+        let main = cosmic::widget::mouse_area(row(cells).spacing(4))
+            .on_right_press(Message::EntryMenu(e.id.clone()));
+        if self.open_menu.as_deref() == Some(&e.id) {
+            column(vec![main.into(), self.context_strip(e)])
+                .spacing(2)
+                .into()
+        } else {
+            main.into()
+        }
+    }
+
+    /// APPS-8 — the right-click context strip for one entry: pin/unpin, the
+    /// primary action, "run on ▸ <peer>" (opens that peer's session — reuses
+    /// APPS-5), and Uninstall for flatpak apps. (run-containerized + a rich
+    /// details view are deferred to APPS-8b.)
+    fn context_strip<'a>(&self, e: &'a Entry) -> Element<'a, Message> {
+        use cosmic::widget::{button, row, text};
+        let cap_sz = TypeRole::Caption.size_in(FontSize::defaults());
+        let item = |label: String, msg: Message| -> Element<Message> {
+            button::custom(text(label).size(cap_sz))
+                .on_press(msg)
+                .class(cosmic::theme::Button::Text)
+                .into()
+        };
+        let mut items: Vec<Element<Message>> = Vec::new();
+        items.push(item(
+            if self.favorites.contains(&e.id) {
+                "Unpin".to_string()
+            } else {
+                "Pin".to_string()
+            },
+            Message::ToggleFavorite(e.id.clone()),
+        ));
+        // Primary action, by kind.
+        match e.kind.as_str() {
+            "app" if !e.exec.is_empty() => {
+                items.push(item("Launch".into(), Message::LaunchLocal(e.exec.clone())));
+            }
+            "service" if !e.endpoint.is_empty() => {
+                items.push(item(
+                    "Open".into(),
+                    Message::OpenService(e.endpoint.clone()),
+                ));
+            }
+            _ => {}
+        }
+        // "Run on ▸ <peer>" — open the chosen peer's session (Q11; reuses APPS-5).
+        for peer in self.peers() {
+            items.push(item(format!("▸ {peer}"), Message::LaunchMesh(peer.clone())));
+        }
+        // Uninstall — flatpak apps only (the id is the flatpak app id).
+        if e.source == "flatpak" {
+            items.push(item("Uninstall".into(), Message::Uninstall(e.id.clone())));
+        }
+        row(items).spacing(6).into()
+    }
+
+    /// Mesh peer hostnames (from the mesh-app entries) for the "run on ▸" menu.
+    fn peers(&self) -> Vec<String> {
+        let mut p: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| e.kind == "mesh-app" && !e.node.is_empty())
+            .map(|e| e.node.clone())
+            .collect();
+        p.sort();
+        p.dedup();
+        p
     }
 }

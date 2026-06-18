@@ -907,7 +907,7 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
   **Acceptance:** containers (podman) + VMs (libvirt) listed (local + peer descriptors); start/stop/attach work inline via `action/compute/*`+`action/provision/*` (Q19).
 - [✓] **APPS-7: Services tab — published mesh services.**
   **Acceptance:** published services (Jellyfin/Navidrome/web UIs/Netdata, …) from PD-2 descriptors (Q20); click opens the endpoint over the overlay.
-- [ ] **APPS-8: entry context menu.**
+- [✓] **APPS-8: entry context menu.**
   **Acceptance:** right-click → pin/unpin, **launch on a chosen peer**, run containerized, details/uninstall (Q11) — each action runtime-wired.
 - [ ] **APPS-9: replace Cosmic's launcher (baked layout + Super key).**
   **Acceptance:** the Magic-on-Cosmic baked layout drops `cosmic-app-library` from the panel, adds the applet grid glyph, and binds Super to toggle the launcher (Q1/Q22, mirrors BRAND-8); verified on a Cosmic session.
