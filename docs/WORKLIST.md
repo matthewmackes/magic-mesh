@@ -1001,6 +1001,11 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
   **Fix (one line):** add `"instances" => compute_panel::ComputePanel::load(),` to the nav-load match. **Workaround now:** click **Refresh** on the panel.
   **Acceptance:** opening Instances auto-populates within a load cycle; MDE-KVM-1 shows attributed to `fedora` from .13 without clicking Refresh. *(Lesson: WORKLOAD-FLEET-1's data path was verified end-to-end but not the live panel on a peer node — add a nav-load smoke check.)*
 
+## SSH-MESH-NOCREDS — passwordless SSH peer→peer (operator feature, 2026-06-18)
+- [ ] **SSH-MESH-NOCREDS-1: SSH between mesh peers must not prompt for credentials.**
+  **As** an operator, **I want** `ssh <peer>.mesh` (and Workbench remote actions) to authenticate automatically between enrolled peers, **so that** I'm never asked for a password or host-key confirmation inside the trust domain.
+  **Acceptance** (each runtime-observable): from any enrolled node, `ssh <peer>` over the overlay succeeds with **no password prompt** and **no host-key (TOFU) prompt**. Note `ssh_pubkey_gossip` (SVC-2) already distributes pubkeys to `authorized_keys` via QNM-Shared — so diagnose why creds are still asked: (a) is the gossip covering the **operator user** (mm) and not just root? (b) is `StrictHostKeyChecking`/`known_hosts` prompting (needs a managed known_hosts from the same gossip, or `accept-new`/CA-signed host keys)? (c) per-user key present on each node? Fix the gap so peer→peer SSH is key-only + host-key-trusted across the mesh, consistent with [[ssh-always-public]].
+
 ## NOTIFY-PREFS — This Node ▸ Notifications panel clarity (operator bug-testing, 2026-06-18)
 > Operator: "What does this panel control?" — it sets per-node toast behavior (DND, placement, default-expire, per-category sounds), distinct from the Action Center. It IS wired, but two clarity issues:
 - [ ] **NOTIFY-PREFS-1: the "Default expire (ms)" field is locked to 5000 (Phase C.5) but looks editable.** **Acceptance:** either make the field actually apply the entered value (toast daemon honors `notification.default_expire_ms`) OR mark it read-only/disabled with a note, so an editable-looking field isn't silently ignored.
