@@ -275,10 +275,28 @@ pub struct BootStep {
 /// BOOT-STATUS-2 — one app-daemon row decoded from the snapshot `services`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootService {
+    /// Stable id (`musicd` / `netdata` / `kdc`) — BOOT-STATUS-6 maps it to the
+    /// systemd unit + scope for the inline Restart action.
+    pub id: String,
     /// Display label (e.g. "Music daemon").
     pub label: String,
     /// `ok` | `down`.
     pub status: String,
+}
+
+/// BOOT-STATUS-6 — the remediation target for a down app-daemon service:
+/// `(unit, user_scope)`. `mde-musicd` is a per-user unit (so a plain
+/// `systemctl --user restart`, no pkexec); netdata + the in-process KDE Connect
+/// listener (hosted by `mackesd`) are system units (pkexec). `None` for an
+/// unknown id (no button rendered).
+#[must_use]
+pub fn service_remediation(id: &str) -> Option<(&'static str, bool)> {
+    match id {
+        "musicd" => Some(("mde-musicd", true)),
+        "netdata" => Some(("netdata", false)),
+        "kdc" => Some(("mackesd", false)),
+        _ => None,
+    }
 }
 
 /// BOOT-STATUS-2/3 — one per-peer ping row decoded from the snapshot `pings`
@@ -305,6 +323,36 @@ pub struct BootReadiness {
     pub services: Vec<BootService>,
     /// BOOT-STATUS-2/3 — per-peer ping roll-up.
     pub pings: Vec<BootPing>,
+}
+
+/// BOOT-STATUS-6 — restart a down app daemon from its boot-status row, returning
+/// a one-line result. A user unit (`mde-musicd`) restarts as the session user
+/// (`systemctl --user restart`, no privilege prompt); a system unit goes through
+/// `pkexec systemctl restart` (the same path the Mesh Services panel uses).
+pub async fn restart_service(unit: String, user_scope: bool) -> String {
+    let ok = if user_scope {
+        tokio::task::spawn_blocking(move || {
+            std::process::Command::new("systemctl")
+                .args(["--user", "restart", &unit])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
+    } else {
+        super::mesh_services::run_pkexec_systemctl(
+            &super::mesh_services::UnitScope::System,
+            "restart",
+            &unit,
+        )
+        .await
+    };
+    if ok {
+        "restart ok".to_string()
+    } else {
+        "restart FAILED — see journalctl".to_string()
+    }
 }
 
 /// BOOT-STATUS-5 — should the boot-status auto-popup suppress itself? True only
@@ -380,6 +428,11 @@ pub fn parse_boot_readiness(reply: &str) -> BootReadiness {
             arr.iter()
                 .filter_map(|s| {
                     Some(BootService {
+                        id: s
+                            .get("id")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
                         label: s.get("label")?.as_str()?.to_string(),
                         status: s
                             .get("status")
@@ -510,12 +563,21 @@ pub enum Message {
         mackesd_reachable: bool,
     },
     RefreshClicked,
+    /// BOOT-STATUS-6 — restart a down app daemon from its boot-status row.
+    RemediateService {
+        unit: String,
+        user_scope: bool,
+    },
+    /// BOOT-STATUS-6 — the restart finished; carries the result line.
+    RemediationDone(String),
     DbusEvent(DbusEvent),
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct HomePanel {
     pub snapshot: HomeSnapshot,
+    /// BOOT-STATUS-6 — the last inline-remediation result line (empty = none).
+    pub remediation: String,
 }
 
 impl HomePanel {
@@ -523,6 +585,7 @@ impl HomePanel {
     pub fn new() -> Self {
         Self {
             snapshot: HomeSnapshot::load_sync(),
+            remediation: String::new(),
         }
     }
 
@@ -575,6 +638,20 @@ impl HomePanel {
                 Task::none()
             }
             Message::RefreshClicked => Self::load(),
+            // BOOT-STATUS-6 — restart a down app daemon, then re-probe so the row
+            // flips to ✓ once it's back. A user unit (mde-musicd) restarts as the
+            // session user (no pkexec); a system unit goes through pkexec.
+            Message::RemediateService { unit, user_scope } => {
+                self.remediation = format!("restarting {unit}…");
+                Task::perform(restart_service(unit, user_scope), |line| {
+                    crate::Message::Home(Message::RemediationDone(line))
+                })
+            }
+            Message::RemediationDone(line) => {
+                self.remediation = line;
+                // Re-probe so the services row reflects the new state.
+                Self::load()
+            }
             Message::DbusEvent(ev) => Task::perform(reprobe_for_event(ev), |(rows, ok)| {
                 crate::Message::Home(Message::CapabilitiesRefreshed {
                     rows,
@@ -746,26 +823,53 @@ impl HomePanel {
                     );
                 }
             }
-            // BOOT-STATUS-2 — app daemons (musicd / netdata / KDE Connect).
+            // BOOT-STATUS-2 — app daemons (musicd / netdata / KDE Connect), each
+            // on its own row; BOOT-STATUS-6 adds an inline Restart button to a
+            // down daemon that has a known remediation (wired to the same
+            // service-control path the Mesh Services panel uses).
             if !self.snapshot.boot_services.is_empty() {
-                let mut svc = row![text("Services:")
-                    .size(cap_sz)
-                    .colr(palette.text_muted.into_cosmic_color())]
-                .spacing(10)
-                .align_y(cosmic::iced::alignment::Vertical::Center);
+                col = col.push(
+                    text("Services")
+                        .size(cap_sz)
+                        .colr(palette.text_muted.into_cosmic_color()),
+                );
                 for s in &self.snapshot.boot_services {
                     let (glyph, color) = if s.status == "ok" {
                         ("✓", palette.success)
                     } else {
                         ("✕", palette.warning)
                     };
-                    svc = svc.push(
-                        text(format!("{glyph} {}", s.label))
+                    let mut svc_row = row![
+                        text(glyph).size(cap_sz).colr(color.into_cosmic_color()),
+                        text(s.label.clone())
                             .size(cap_sz)
-                            .colr(color.into_cosmic_color()),
+                            .colr(palette.text.into_cosmic_color()),
+                    ]
+                    .spacing(8)
+                    .align_y(cosmic::iced::alignment::Vertical::Center);
+                    // BOOT-STATUS-6 — Restart for a down, remediable daemon.
+                    if s.status != "ok" {
+                        if let Some((unit, user_scope)) = service_remediation(&s.id) {
+                            svc_row = svc_row.push(
+                                button(text("Restart").size(cap_sz))
+                                    .padding(Padding::from([2u16, 8u16]))
+                                    .on_press(crate::Message::Home(Message::RemediateService {
+                                        unit: unit.to_string(),
+                                        user_scope,
+                                    })),
+                            );
+                        }
+                    }
+                    col = col.push(svc_row);
+                }
+                // BOOT-STATUS-6 — the last remediation result line.
+                if !self.remediation.is_empty() {
+                    col = col.push(
+                        text(self.remediation.clone())
+                            .size(cap_sz)
+                            .colr(palette.text_muted.into_cosmic_color()),
                     );
                 }
-                col = col.push(svc);
             }
             // BOOT-STATUS-2/3 — per-peer ping roll-up (reachability + RTT).
             if !self.snapshot.boot_pings.is_empty() {
@@ -2263,6 +2367,7 @@ mod tests {
         assert_eq!(r.steps[2].detail, "0 peer(s)");
         // BOOT-STATUS-2 — services + pings decode too.
         assert_eq!(r.services.len(), 2);
+        assert_eq!(r.services[0].id, "musicd");
         assert_eq!(r.services[0].status, "ok");
         assert_eq!(r.services[1].status, "down");
         assert_eq!(r.pings.len(), 2);
@@ -2274,6 +2379,16 @@ mod tests {
         // ready snapshot + garbage.
         assert!(parse_boot_readiness(r#"{"ready":true,"steps":[]}"#).ready);
         assert_eq!(parse_boot_readiness("nope"), BootReadiness::default());
+    }
+
+    #[test]
+    fn service_remediation_maps_known_daemons() {
+        // BOOT-STATUS-6 — musicd is a per-user unit (no pkexec); netdata + the
+        // in-process KDE Connect listener (mackesd) are system units.
+        assert_eq!(service_remediation("musicd"), Some(("mde-musicd", true)));
+        assert_eq!(service_remediation("netdata"), Some(("netdata", false)));
+        assert_eq!(service_remediation("kdc"), Some(("mackesd", false)));
+        assert_eq!(service_remediation("nope"), None);
     }
 
     #[test]

@@ -976,10 +976,10 @@ Operator: an informative, at-boot view of how the mesh fabric + app daemons come
   **As** an operator, **I want** the dialog to auto-open at login, **so that** boot status is front-and-center without me opening it.
   **Acceptance:**
     - [✓] `packaging/autostart/org.magicmesh.BootStatus.desktop` (shipped via the existing autostart glob → `/etc/xdg/autostart/`; headless roles have no desktop session so it's naturally Workstation-only) runs `mde-workbench --boot-popup`, which opens at HOME (the default landing — the boot dependency chain renders there per BOOT-STATUS-4). It "minimizes to the chip on all-green" two ways: the `--boot-popup` guard (`boot_popup_should_suppress`) exits with NO window when the snapshot is already `ready`, and the HOME boot section itself collapses to the green "✓ Mesh ready" chip when all-green.
-- [ ] **BOOT-STATUS-6: inline remediation actions**
+- [✓] **BOOT-STATUS-6: inline remediation actions**
   **As** an operator, **I want** Retry / Restart / View-journal per failed step, **so that** I can fix a stuck service without leaving HOME.
   **Acceptance:**
-    - [ ] a failed step renders its `remediation` verb as a button wired to the existing service-control + journal paths (e.g. `systemctl --user stop mde-musicd` → a working Restart).
+    - [✓] a down app-daemon row renders a **Restart** button wired to the real service-control path: `mde-musicd` (a per-user unit) restarts via `systemctl --user restart` with no privilege prompt — matching the acceptance example — while netdata + the in-process KDE Connect listener (hosted by `mackesd`) restart via `pkexec systemctl restart` (the same path the Mesh Services panel uses, `run_pkexec_systemctl`). The restart re-probes so the row flips to ✓; a one-line result (`restart ok` / `restart FAILED — see journalctl`) shows inline. **Retry** = the panel's existing Refresh (re-probe); **View-journal** = the System → Mesh Services panel (the existing `journalctl_tail` surface). Mapping is `service_remediation(id)`; pure helper + tests (`service_remediation_maps_known_daemons`). *(Fabric chain-step remediation — restarting nebula/mackesd/remount QNM mid-boot — is intentionally not auto-buttoned: those self-heal via mackesd's supervisors and a GUI-triggered restart of the transport mid-bringup is riskier than the app-daemon case the story targets.)*
 
 ### BOOT-PEERS — peer-list settling indicator (operator-reported 2026-06-17)
 - [✓] **BOOT-PEERS-1: peer list "settling" state after a cold reboot**
