@@ -4009,6 +4009,7 @@ dependencies = [
  "mackes-mesh-types",
  "mackes-nebula-https-tunnel",
  "mackes-transport",
+ "mackes-xcp",
  "magic-fleet",
  "mde-bus",
  "mde-card",

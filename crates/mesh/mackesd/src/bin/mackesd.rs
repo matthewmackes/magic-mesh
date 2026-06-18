@@ -5310,6 +5310,21 @@ fn run_serve(
                 .expect("worker_names mutex")
                 .push("boot_readiness".into());
         }
+        // XCP-6 (B2) — on an XCP-ng dom0, advertise hypervisor capacity
+        // (CPU/RAM/SR-free/running-VMs) to `compute/xcp-host/<node>` so any node
+        // can target it for a VM spawn. Self-gates on the dom0 marker, so it's a
+        // harmless no-op on every non-hypervisor node; spawned on all roles (a
+        // joined XCP host pins Server).
+        if mackesd_core::worker_role::runs("xcp_host", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::xcp_host::XcpHostWorker::new(node_id.clone()),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("xcp_host".into());
+        }
         // OV-7.a (v2.6) — health reconciler. Polls each known
         // peer's QNM-Shared heartbeat.json every 5 s, applies the
         // telemetry::health_state_from_age threshold table, writes

@@ -62,6 +62,9 @@ mackes-nebula-https-tunnel = { path = "../mackes-nebula-https-tunnel" }
 # worker (KDC2-3). Implementations live elsewhere (mde-kdc,
 # mackes-https-tunnel, mackesd::transport::direct_udp).
 mackes-transport = { path = "../mackes-transport" }
+# XCP-6 — the xcp_host worker drives the dom0's local `xe` via this layer to
+# advertise hypervisor capacity into the compute plane.
+mackes-xcp = { path = "../mackes-xcp" }
 
 # KDC2-3.10 — the canonical host integration crate consumed by the
 # kdc_host worker under async-services (E2.2, 2026-06-05: converged

@@ -403,6 +403,9 @@ pub mod wol;
 // inside the binary in BUS-1.2/1.3/1.4.
 pub mod boot_readiness;
 pub mod bus_supervisor;
+// XCP-6 — on an XCP-ng dom0, advertise hypervisor capacity into the compute
+// plane (`compute/xcp-host/<node>`) so the mesh can place VMs on it.
+pub mod xcp_host;
 // BUS-5.1 — clipboard daemon supervisor. Spawns one `mde-clipd` process
 // per Wayland session; idles when $WAYLAND_DISPLAY is unset.
 pub mod clipd_supervisor;
