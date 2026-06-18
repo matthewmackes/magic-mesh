@@ -1052,9 +1052,7 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
     - [ ] verify on a rebooted droplet: mackesd active without intervention.
 
 ### PKG-SIZE — RPM near GitHub's 100 MiB file limit (hit live, v10.0.15)
-- [ ] **PKG-SIZE-1: keep the dnf-channel RPM well under 100 MiB durably**
+- [✓] **PKG-SIZE-1: keep the dnf-channel RPM well under 100 MiB durably**
   **As** a release operator, **I want** headroom under GitHub's 100 MiB per-file limit, **so that** the gh-pages dnf-channel push never bounces as the platform grows.
-  **Context:** v10.0.15 (the APPS launcher + the new mde-apps-applet GUI) pushed the monolithic RPM past 100 MiB; the gh-pages push was rejected. Stop-gaps applied: payload zstd→xz, carbon-icons.zip→tar.xz (4.4 MiB saved) → 99.5 MiB. That headroom is thin (~0.5 MiB).
-  **Acceptance** (pick one, runtime-observable):
-    - [ ] a `magic-mesh-server` subpackage that DROPS the GUI binaries (~90 MiB of statically-linked libcosmic across 5 GUIs) for headless Server/Lighthouse roles (XPA-6) — the GUIs ship only in the Workstation package; OR
-    - [ ] host RPMs as GitHub **Release assets** (2 GiB limit) with the gh-pages repodata pointing at them via `createrepo_c --location-prefix`, so the dnf channel is no longer bound by the git file limit.
+  **Context:** v10.0.15 (the APPS launcher + the new mde-apps-applet GUI) pushed the monolithic RPM past 100 MiB; the gh-pages push was rejected. Stop-gaps applied: payload zstd→xz, carbon-icons.zip→tar.xz (4.4 MiB saved) → 99.5 MiB. That headroom is thin (~0.5 MiB). v10.0.16 (the MUSIC-RFX GUI) crossed it (101.7 MiB) → blocked the cut.
+  **Done (2026-06-18, v10.0.16):** **GitHub Release-asset hosting** (option 2). The signed RPMs are uploaded as assets on the `magic-mesh-v<ver>` Release (2 GiB limit), and each gh-pages dnf channel's repodata is regenerated with `createrepo_c --location-prefix https://github.com/matthewmackes/magic-mesh/releases/download/<tag>/` so package `location href` points at the Release asset. Only the (tiny) repodata lives in git now; the old in-git RPMs were removed from the gh-pages tree. **F44/F43 collision:** both RPMs share the NEVRA filename, so Release assets are named `…-1.fc44.x86_64.rpm` / `…-1.fc43.x86_64.rpm` (the channel's repodata href + the uploaded asset name must match). The `magic-mesh-server` GUI-less subpackage (option 1 / XPA-6) is still worth doing to shrink headless installs, but is no longer release-gating.
