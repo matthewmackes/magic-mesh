@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Magic Mesh Notification Capture
+Name=MCNF Notification Capture
 Comment=Captures desktop-app freedesktop notifications (Firefox etc.) into the mesh bus so they show in the Alert Center + federate (NOTIFY-SRC-2); Workstation-rank gated
 Exec=sh -c "mackesd role-gate --min-rank 2 && exec mde-notify-capture"
 Icon=magic-mesh

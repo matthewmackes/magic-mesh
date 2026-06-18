@@ -1,5 +1,5 @@
 [Unit]
-Description=Magic Mesh — install the starship prompt binary (MESHSHELL SHELL-2)
+Description=MCNF — install the starship prompt binary (MESHSHELL SHELL-2)
 After=network-online.target
 Wants=network-online.target
 # Run only until starship is present; retries on later boots if a fetch fails.

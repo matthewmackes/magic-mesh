@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Magic Mesh Role Chooser
+Name=MCNF Role Chooser
 Comment=First-run deployment-role chooser (PKG-5/AUD-6); self-exits once a role is pinned, so this is a no-op after the first login.
 Exec=mde-role-chooser
 Icon=magic-mesh

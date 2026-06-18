@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Magic Mesh
+Name=MCNF
 Comment=Mesh health pip + quick actions in the Cosmic panel
 Exec=mde-cosmic-applet
 Icon=magic-mesh

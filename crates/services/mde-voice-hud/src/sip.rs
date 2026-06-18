@@ -310,7 +310,7 @@ fn build_register(
     let _ = write!(m, "CSeq: {} REGISTER\r\n", ids.cseq);
     let _ = write!(m, "Contact: <{contact}>\r\n");
     let _ = write!(m, "Expires: {}\r\n", account.expires);
-    let _ = write!(m, "User-Agent: Magic Mesh Voice/{version}\r\n");
+    let _ = write!(m, "User-Agent: MCNF Voice/{version}\r\n");
     if let Some((name, value)) = auth {
         let _ = write!(m, "{name}: {value}\r\n");
     }
@@ -642,7 +642,7 @@ fn build_sdp_offer(local_host: &str, rtp_port: u16) -> String {
     format!(
         "v=0\r\n\
          o=mwv 0 0 IN IP4 {local_host}\r\n\
-         s=Magic Mesh Voice\r\n\
+         s=MCNF Voice\r\n\
          c=IN IP4 {local_host}\r\n\
          t=0 0\r\n\
          m=audio {rtp_port} RTP/AVP 0 8\r\n\

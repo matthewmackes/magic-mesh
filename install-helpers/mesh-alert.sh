@@ -1,5 +1,5 @@
 #!/bin/bash
-# mesh-alert.sh <source> [severity] [summary] — emit a Magic Mesh alert when a
+# mesh-alert.sh <source> [severity] [summary] — emit a MCNF alert when a
 # core service goes offline (or any node-level event worth surfacing).
 #
 # Rides the platform's existing alert path: drops an AlertEvent JSON into the

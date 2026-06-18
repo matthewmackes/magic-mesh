@@ -1,6 +1,6 @@
 [package]
 name        = "mde-workbench"
-description = "Magic Mesh Workbench — the Carbon-look iced operator console (five-plane nav, Peers Front Door) for the mesh."
+description = "MCNF Workbench — the Carbon-look iced operator console (five-plane nav, Peers Front Door) for the mesh."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

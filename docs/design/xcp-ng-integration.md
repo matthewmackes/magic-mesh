@@ -3,7 +3,7 @@
 Status: **locked** (operator survey 2026-06-16). Owner epic prefix: `XCP`.
 Community/back-reference: <https://xcp-ng.org/#community>.
 
-Magic Mesh gains first-class XCP-ng integration in two halves that share one
+MCNF gains first-class XCP-ng integration in two halves that share one
 hypervisor-access layer:
 
 - **A — Provisioning:** the platform spins up headless **Server**-role MDE-VMs on

@@ -4,7 +4,7 @@
 # and self-skips once /var/lib/mde/role.toml exists. It takes over tty1 (the
 # Fedora initial-setup pattern) but never touches SSH/pts sessions, so a remote
 # operator's session is never hijacked.
-Description=Magic Mesh first-run setup wizard (console)
+Description=MCNF first-run setup wizard (console)
 Documentation=man:magic-setup
 ConditionPathExists=!/var/lib/mde/role.toml
 After=systemd-user-sessions.service plymouth-quit-wait.service

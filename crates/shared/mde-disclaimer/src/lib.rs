@@ -111,10 +111,10 @@ mod tests {
         // "as is" / "at your own risk" warranty waivers (so a surface always
         // shows the real disclaimer, not an empty/placeholder string).
         assert!(is_present());
-        assert!(TEXT.contains("Magic Mesh"));
+        assert!(TEXT.contains("MCNF"));
         assert!(TEXT.contains("no-fixed-center"));
         assert!(TEXT.contains(r#"provided "as is""#));
-        assert!(TEXT.contains("Use Magic Mesh at your own risk."));
+        assert!(TEXT.contains("Use MCNF at your own risk."));
         assert!(TEXT.len() > 1500, "disclaimer text looks truncated");
     }
 
@@ -147,8 +147,8 @@ mod tests {
         let (title, body) = split();
         assert_eq!(
             title,
-            "Magic Mesh — Warning, Disclaimer, and Mission Statement"
+            "MCNF — Warning, Disclaimer, and Mission Statement"
         );
-        assert!(body.starts_with("Magic Mesh is an open-source"));
+        assert!(body.starts_with("MCNF is an open-source"));
     }
 }

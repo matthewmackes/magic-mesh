@@ -1,5 +1,5 @@
 [Unit]
-Description=Magic Mesh control-plane daemon (mackesd)
+Description=MCNF control-plane daemon (mackesd)
 Documentation=https://github.com/matthewmackes/magic-mesh
 After=network-online.target
 Wants=network-online.target

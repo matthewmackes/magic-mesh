@@ -1,4 +1,4 @@
-//! MDE Files — mesh-first "Artifact Manager" for Magic Mesh.
+//! MDE Files — mesh-first "Artifact Manager" for MCNF.
 //!
 //! Implementation contract: `docs/design/v2.0.0-mde-files/design-spec.md`.
 //! Prototype: `docs/design/v2.0.0-mde-files/upstream-bundle/Artifact-Manager.html`.

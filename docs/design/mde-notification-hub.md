@@ -9,7 +9,7 @@
 
 ## 1. Why
 
-Today a "notification" in Magic Mesh is a forward-only path: mackesd workers
+Today a "notification" in MCNF is a forward-only path: mackesd workers
 (`alert_relay`, `presence_watch`, `firewall_monitor`, `compute_event_toast`,
 `metrics_exporter`, the `events.rs` hooks) drop alert JSON / publish to the bus,
 and the `bus_bridge` mirrors every `org.freedesktop.Notifications` call into

@@ -267,7 +267,7 @@ fn render(f: &mut Frame, app: &App) {
 
 fn render_title(f: &mut Frame, area: Rect) {
     let p = Paragraph::new(Line::from(vec![Span::styled(
-        " Magic Mesh — join a mesh ",
+        " MCNF — join a mesh ",
         Style::default()
             .fg(Color::Black)
             .bg(Color::Cyan)

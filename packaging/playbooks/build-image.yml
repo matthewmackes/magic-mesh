@@ -8,7 +8,7 @@
 #
 # Shipped in the RPM under the playbooks dir; the Images panel's "Build"
 # button targets the `execution` capability tag.
-- name: Build a Magic Mesh image
+- name: Build a MCNF image
   hosts: all
   become: true
   tasks:

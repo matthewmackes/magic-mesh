@@ -1,6 +1,6 @@
 # Support & Production Envelope
 
-Magic Mesh is **production workgroup-grade within a stated envelope** — not a
+MCNF is **production workgroup-grade within a stated envelope** — not a
 managed service. This document states what's supported, what isn't, and where to
 go for help.
 

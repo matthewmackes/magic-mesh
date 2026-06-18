@@ -1,5 +1,5 @@
 #!/bin/bash
-# do-lighthouse-up.sh — provision an on-demand Magic Mesh lighthouse on
+# do-lighthouse-up.sh — provision an on-demand MCNF lighthouse on
 # DigitalOcean (Option A: doctl + cloud-init). One command stands up a fresh
 # Fedora droplet that founds its own mesh (§8: one founding lighthouse per
 # mesh) and exposes a ready-to-paste join token.

@@ -1,4 +1,4 @@
-//! `magic-fleet` — the Magic Mesh Automation Mesh node CLI (E11.7).
+//! `magic-fleet` — the MCNF Automation Mesh node CLI (E11.7).
 //!
 //! EFF-19 (2026-06-12): ported to clap (real `--help`, typed flags,
 //! parity with `meshctl`) and grew `--json` on the converge-shaped
@@ -20,7 +20,7 @@ use magic_fleet::{ApplyReport, AuditRecord, BaselineSpec, DriftStatus};
 #[command(
     name = "magic-fleet",
     version,
-    about = "Magic Mesh Automation Mesh node engine — apply/heal/converge desired-state baselines, elect replicated revisions, reconcile to the fleet log"
+    about = "MCNF Automation Mesh node engine — apply/heal/converge desired-state baselines, elect replicated revisions, reconcile to the fleet log"
 )]
 struct Cli {
     #[command(subcommand)]

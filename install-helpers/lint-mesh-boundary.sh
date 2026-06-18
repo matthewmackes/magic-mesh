@@ -1,7 +1,7 @@
 #!/bin/sh
 # install-helpers/lint-mesh-boundary.sh — E11.2 mesh↔shell boundary gate.
 #
-# The Magic Mesh decoupling (docs/design/mesh-decoupling.md, Q6/Q49) requires the
+# The MCNF decoupling (docs/design/mesh-decoupling.md, Q6/Q49) requires the
 # mesh side to NEVER depend on the EOL-bound desktop shell. This gate fails if any
 # mesh-side crate declares a Cargo path-dependency into crates/shell/*.
 #

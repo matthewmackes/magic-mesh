@@ -1,4 +1,4 @@
-# Magic Mesh — Architecture
+# MCNF — Architecture
 
 A secure, **no-fixed-center** workgroup mesh (≤8 peers, §8 trust envelope) and
 the Cosmic-native apps that run on top of it. This is the system map; the

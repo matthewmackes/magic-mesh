@@ -238,7 +238,7 @@ pub fn update(state: &mut VoiceHud, message: Message) -> Task<Message> {
                 // system notification IS the call record (sweep-3 I1; no
                 // stored recents list). Best-effort, never fatal.
                 let _ = std::process::Command::new("notify-send")
-                    .args(["-a", "Magic Mesh Voice", "Incoming call", &from])
+                    .args(["-a", "MCNF Voice", "Incoming call", &from])
                     .spawn();
             }
             sip::AgentEvent::Established => {

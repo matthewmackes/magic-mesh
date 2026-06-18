@@ -141,7 +141,7 @@ impl ImageBuildRunner for SubprocessBuild {
                         "--resultdir",
                         &scratch.to_string_lossy(),
                         "--project",
-                        "Magic Mesh",
+                        "MCNF",
                     ],
                 )?;
                 // livemedia-creator writes the ISO at <resultdir>/images/boot.iso.

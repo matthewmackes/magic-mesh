@@ -329,7 +329,7 @@ pub fn notify_send_argv(binary: &str, event: &AlertEventPartial) -> Vec<String> 
 
 /// OBS-8 — build the `mde-bus publish` argv that delivers an alert
 /// through the cosmic-applet FDO Notifications path. Publishes on the
-/// `fdo/Magic Mesh Alerts` topic (the bridge `ipc::bus_bridge` renders),
+/// `fdo/MCNF Alerts` topic (the bridge `ipc::bus_bridge` renders),
 /// mapping severity → the Bus priority and `[host] alert` → the title.
 /// `--no-broker` lets the publish persist + reach even pre-enrollment.
 /// Pure so the argv shape is unit-tested without shelling.
@@ -349,7 +349,7 @@ pub fn bus_publish_argv(binary: &str, event: &AlertEventPartial) -> Vec<String> 
     let mut argv = vec![
         binary.to_owned(),
         "publish".to_owned(),
-        "fdo/Magic Mesh Alerts".to_owned(),
+        "fdo/MCNF Alerts".to_owned(),
         "--priority".to_owned(),
         priority.to_owned(),
         "--title".to_owned(),
@@ -500,7 +500,7 @@ mod tests {
         // Publishes on the FDO topic the cosmic-applet renders (OBS-8).
         assert_eq!(crit[0], "mde-bus");
         assert_eq!(crit[1], "publish");
-        assert_eq!(crit[2], "fdo/Magic Mesh Alerts");
+        assert_eq!(crit[2], "fdo/MCNF Alerts");
         assert!(crit
             .windows(2)
             .any(|w| w[0] == "--priority" && w[1] == "urgent"));

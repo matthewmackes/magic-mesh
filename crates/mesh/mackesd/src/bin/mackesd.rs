@@ -14,7 +14,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "mackesd",
     version,
-    about = "Magic Mesh control plane — secure no-fixed-center workgroup mesh on Fedora-Cosmic"
+    about = "MCNF control plane — secure no-fixed-center workgroup mesh on Fedora-Cosmic"
 )]
 struct Cli {
     /// Override the default `SQLite` store path (defaults to

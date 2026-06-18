@@ -1,6 +1,6 @@
 # Per-Node-Type Setup
 
-Every Magic Mesh node is one of three roles. They nest by capability:
+Every MCNF node is one of three roles. They nest by capability:
 **Lighthouse ⊂ Server ⊂ Workstation** — a Server runs everything a Lighthouse
 does plus more, and a Workstation runs everything a Server does plus the desktop.
 Pin a role with `meshctl install --role <role>` (or the ISO's install-time
@@ -51,7 +51,7 @@ KDC. Same enrollment flow:
 meshctl provision --role workstation --token <token>
 ```
 
-Log into Cosmic; the Magic Mesh applet shows the mesh-health pip and quick
+Log into Cosmic; the MCNF applet shows the mesh-health pip and quick
 actions, and the Workbench is the console for Peers, Health, Config, Jobs, and
 the network planes.
 

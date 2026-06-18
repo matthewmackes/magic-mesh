@@ -1,6 +1,6 @@
 #!/bin/bash
 # do-lighthouse-cloudinit.sh — DigitalOcean cloud-init user-data that turns a
-# fresh Fedora droplet into a Magic Mesh founding lighthouse on first boot
+# fresh Fedora droplet into a MCNF founding lighthouse on first boot
 # (Option A: doctl + cloud-init). Honors AI_GOVERNANCE §8: one founding
 # lighthouse per mesh (each droplet is its own complete, isolated mesh).
 #
@@ -45,7 +45,7 @@ else
     log "installing magic-mesh from $REPO_BASEURL (fedora-$RELEASEVER)"
     cat >/etc/yum.repos.d/magic-mesh.repo <<EOF
 [magic-mesh]
-name=Magic Mesh
+name=MCNF
 baseurl=$REPO_BASEURL/fedora-$RELEASEVER-x86_64/
 enabled=1
 gpgcheck=1

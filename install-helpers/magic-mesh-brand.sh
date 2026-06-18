@@ -131,7 +131,7 @@ brand_plymouth() {
     cat > "$dir/mackes-carbon.plymouth" <<EOF
 [Plymouth Theme]
 Name=Mackes Carbon
-Description=Magic Mesh — IBM Carbon boot splash
+Description=MCNF — IBM Carbon boot splash
 ModuleName=two-step
 
 [two-step]

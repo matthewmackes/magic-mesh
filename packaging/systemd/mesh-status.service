@@ -1,5 +1,5 @@
 [Unit]
-Description=Magic Mesh — refresh the mesh-status snapshot (prompt + greeting data plane)
+Description=MCNF — refresh the mesh-status snapshot (prompt + greeting data plane)
 Documentation=https://github.com/matthewmackes/magic-mesh
 After=mackesd.service
 

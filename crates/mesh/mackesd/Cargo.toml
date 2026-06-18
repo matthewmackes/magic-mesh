@@ -23,7 +23,7 @@ rust-version.workspace = true
 license.workspace      = true
 authors.workspace      = true
 repository.workspace   = true
-description  = "Magic Mesh control plane — the no-fixed-center workgroup mesh daemon (Nebula overlay, LizardFS storage, fleet reconcile, CA)"
+description  = "MCNF control plane — the no-fixed-center workgroup mesh daemon (Nebula overlay, LizardFS storage, fleet reconcile, CA)"
 
 [lib]
 name = "mackesd_core"
@@ -256,7 +256,7 @@ tempfile = "3"
 # the `/enroll` endpoint's self-signed identity, not just in tests.)
 
 [features]
-# Magic Mesh (E11.12 split): mackesd here is the daemon, and the only consumer
+# MCNF (E11.12 split): mackesd here is the daemon, and the only consumer
 # is the `mackesd` binary itself — there is no sync-read-only library consumer
 # left (the desktop `mde-session` that used to enable this via feature
 # unification was deleted in the cutover). So `async-services` (the worker pool +
@@ -305,7 +305,7 @@ no-default-features = true
 [lints]
 workspace = true
 
-# PKG-1/3/6 (W71/72/75/76/86) — the ONE monolithic Magic Mesh RPM.
+# PKG-1/3/6 (W71/72/75/76/86) — the ONE monolithic MCNF RPM.
 # `cargo generate-rpm -p mackesd` (operator-gated via /release) packages
 # all app/daemon binaries (incl. the ENT-15 meshctl facade) + the
 # packaging/ assets into a single
@@ -319,7 +319,7 @@ name = "magic-mesh"
 # version) for asset-only/packaging-only changes so `dnf upgrade`
 # sees a newer NEVRA; reset to "1" on every workspace version bump.
 release = "1"
-summary = "Magic Mesh — secure no-fixed-center workgroup mesh + native-Rust Carbon GUIs on Fedora-Cosmic"
+summary = "MCNF — secure no-fixed-center workgroup mesh + native-Rust Carbon GUIs on Fedora-Cosmic"
 # EFF-13 — matches the workspace license (GPL-3.0-or-later). Bundled deps add
 # MPL-2.0 (libcosmic/iced stack) + permissive (MIT/Apache-2.0/BSD); see NOTICE.
 license = "GPL-3.0-or-later AND MPL-2.0"

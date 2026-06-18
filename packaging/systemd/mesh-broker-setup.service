@@ -1,5 +1,5 @@
 [Unit]
-Description=Magic Mesh — install the ntfy notification broker binary (BUS)
+Description=MCNF — install the ntfy notification broker binary (BUS)
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=!/usr/bin/ntfy

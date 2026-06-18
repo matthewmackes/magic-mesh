@@ -1,7 +1,7 @@
-# Drive the Magic Mesh health watchdog ~every minute (first run 90s after boot,
+# Drive the MCNF health watchdog ~every minute (first run 90s after boot,
 # letting mackesd + nebula settle first).
 [Unit]
-Description=Periodic Magic Mesh node health watchdog
+Description=Periodic MCNF node health watchdog
 
 [Timer]
 OnBootSec=90s

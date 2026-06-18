@@ -1,7 +1,7 @@
 # Salvaged from the deleted `mde` desktop binary (E11.12 cutover)
 
 These two source files lived inside `crates/shell/mde` — the labwc/Win-era
-desktop shell binary that the E11 "Magic Mesh" pivot deletes. They are
+desktop shell binary that the E11 "MCNF" pivot deletes. They are
 **mesh-relevant surfaces** (not desktop chrome), so they were salvaged here
 rather than lost, pending re-homing onto Cosmic.
 

@@ -2,9 +2,9 @@
 ---
 galaxy_info:
   role_name: mackes
-  author: Magic Mesh
+  author: MCNF
   description: >-
-    Idempotently converge a Magic Mesh node to the steady state captured in
+    Idempotently converge a MCNF node to the steady state captured in
     /etc/mackesd/site.yml (pinned role, boot-durable service set, QNM-Shared
     mount assert). Mirrors the imperative found/join/setup-qnm-shared verbs.
   license: GPL-3.0-or-later

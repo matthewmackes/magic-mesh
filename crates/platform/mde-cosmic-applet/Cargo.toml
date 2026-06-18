@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 # EFF-16 — license metadata so cargo-deny's unlicensed gate passes.
 license.workspace = true
-description = "Magic Mesh cosmic-applet: mesh health pip + quick actions over mde-bus, deep-linking into the Workbench (GUI-6/Q46-47). Render-agnostic logic layer (lib) + the libcosmic panel shell (bin)."
+description = "MCNF cosmic-applet: mesh health pip + quick actions over mde-bus, deep-linking into the Workbench (GUI-6/Q46-47). Render-agnostic logic layer (lib) + the libcosmic panel shell (bin)."
 
 [lib]
 path = "src/lib.rs"

@@ -7,7 +7,7 @@ Interface."
 ## Investigation finding (why this is a reference, not a port)
 
 **sonixd is TypeScript + React + rsuite + Electron** (archived Aug 2024; author
-moved to "Feishin"). Its **code cannot be reused** in Magic Mesh — `AI_GOVERNANCE.md`
+moved to "Feishin"). Its **code cannot be reused** in MCNF — `AI_GOVERNANCE.md`
 §2/§4/§6 lock the stack to **Rust + iced/libcosmic + cosmic-text**, strictly **IBM
 Carbon** theming, Cosmic owns the shell, no web/Electron shells. So sonixd is a
 **UX/interaction reference**; we reimplement its strong patterns in the existing

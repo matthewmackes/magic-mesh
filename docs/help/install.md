@@ -1,6 +1,6 @@
 # Install Guide
 
-Magic Mesh ships as **one signed RPM** with an install-time role chooser. There is
+MCNF ships as **one signed RPM** with an install-time role chooser. There is
 no separate package per node type — the role you pick decides what runs.
 
 ## 1. Get the bits

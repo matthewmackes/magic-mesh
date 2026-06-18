@@ -22,8 +22,8 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "meshctl",
-    about = "Magic Mesh operator facade — the learnable lifecycle tool",
-    long_about = "meshctl is the operator's front door to a Magic Mesh node and its \
+    about = "MCNF operator facade — the learnable lifecycle tool",
+    long_about = "meshctl is the operator's front door to a MCNF node and its \
                   fleet. It wraps the mackesd daemon's lifecycle gestures behind one \
                   learnable command set: install, status, doctor, mesh init, \
                   provision/join, test, logs, fleet status, repair, leave/decommission.",

@@ -4,7 +4,7 @@
 # install-time role chooser (PKG-5) on first boot.
 #
 #   livemedia-creator --ks magic-on-cosmic.ks --no-virt \
-#     --resultdir /var/lmc --project "Magic Mesh" --make-iso
+#     --resultdir /var/lmc --project "MCNF" --make-iso
 #
 # RPM GPG signing + the actual ISO build are operator-gated (/release).
 
@@ -39,7 +39,7 @@ set -euo pipefail
 # Drop a first-boot hint so the operator sees the next step.
 install -d /etc/magic-mesh
 cat > /etc/magic-mesh/first-boot.txt <<'HINT'
-Magic Mesh is installed but UNPINNED — mackesd will refuse to start its
+MCNF is installed but UNPINNED — mackesd will refuse to start its
 worker pool until a deployment role is pinned (ENT-2 fail-closed).
 
   Workstation (desktop): pinned by the Cosmic first-run chooser.
@@ -84,7 +84,7 @@ if [ -f /etc/magic-mesh/join-token ]; then
   chmod 600 /etc/magic-mesh/join-token
   cat > /etc/systemd/system/mde-firstboot-join.service <<'UNIT'
 [Unit]
-Description=Magic Mesh firstboot auto-join (single-use bearer)
+Description=MCNF firstboot auto-join (single-use bearer)
 After=network-online.target mackesd.service
 Wants=network-online.target
 ConditionPathExists=/etc/magic-mesh/join-token

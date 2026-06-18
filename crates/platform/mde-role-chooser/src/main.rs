@@ -1,4 +1,4 @@
-//! Magic Mesh first-run deployment-role chooser (PKG-5 / AUD-6).
+//! MCNF first-run deployment-role chooser (PKG-5 / AUD-6).
 //!
 //! A libcosmic window shown once, at first boot, to pin this box's deployment
 //! role — `Lighthouse ⊂ Server ⊂ Workstation` (§5). Picking a role runs
@@ -29,7 +29,7 @@ struct RoleChooser {
     core: Core,
     /// Inline status line (e.g. a role-pin failure). Empty on launch.
     status: String,
-    /// AUD2-4 — Magic Mesh wordmark bytes, resolved once at init via
+    /// AUD2-4 — MCNF wordmark bytes, resolved once at init via
     /// the [`Brand`] loader ($MDE_BRAND_DIR → /usr/share/mde/brand →
     /// baked fallback; the baked SVG guarantees this is never empty).
     wordmark: svg::Handle,
@@ -121,7 +121,7 @@ impl Application for RoleChooser {
             .push(svg::Svg::new(self.wordmark.clone()).width(Length::Fixed(WORDMARK_WIDTH)))
             .push(widget::text::title2("Choose this machine's role"))
             .push(widget::text::body(
-                "Magic Mesh pins one deployment role per machine at install. You \
+                "MCNF pins one deployment role per machine at install. You \
                  can upgrade later (Lighthouse → Server → Workstation), never \
                  downgrade.",
             ));

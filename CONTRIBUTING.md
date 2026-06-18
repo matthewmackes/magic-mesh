@@ -1,4 +1,4 @@
-# Contributing to Magic Mesh
+# Contributing to MCNF
 
 The operational rulebook is [`AI_GOVERNANCE.md`](AI_GOVERNANCE.md) — read its
 locks (§1–§8) before changing anything load-bearing. The short version: the

@@ -1,4 +1,4 @@
-//! Magic Mesh Workbench — the operator console, an iced GUI in
+//! MCNF Workbench — the operator console, an iced GUI in
 //! the IBM Carbon look (§4, tokens single-sourced in `mde-theme`)
 //! running on the Cosmic desktop (E11 pivot).
 //!

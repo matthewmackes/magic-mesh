@@ -16,7 +16,7 @@ fn main() {
         }
         Ok(_) => panic!(
             "PKG-6 gate: DISCLAIMER.md is empty — refusing to build. \
-             A shipped Magic Mesh must carry its disclaimer."
+             A shipped MCNF must carry its disclaimer."
         ),
         Err(e) => panic!("PKG-6 gate: cannot read DISCLAIMER.md ({e}) — refusing to build."),
     }

@@ -1,5 +1,5 @@
 [Unit]
-Description=Magic Mesh music daemon (Airsonic bridge) — Workstation surfaces only (SVC-7/Q70)
+Description=MCNF music daemon (Airsonic bridge) — Workstation surfaces only (SVC-7/Q70)
 After=network-online.target
 
 [Service]

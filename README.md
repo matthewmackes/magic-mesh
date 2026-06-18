@@ -2,22 +2,22 @@
   <img src="assets/brand/logo-lockup.png" alt="MCNF — Mackes Cosmic Nebula Fedora, Network Mesh Platform" width="340">
 </p>
 
-# Magic Mesh
+# MCNF
 
 **A secure, no-fixed-center workgroup mesh — and its native-Rust IBM-Carbon
 GUIs — on stock Fedora-Cosmic.**
 
-Magic Mesh turns up to **eight machines** into one private, encrypted workgroup
+MCNF turns up to **eight machines** into one private, encrypted workgroup
 with no central server: any node can author fleet policy, every node enforces it
 itself, and the whole thing runs over a [Nebula](https://github.com/slackhq/nebula)
 overlay with [LizardFS](https://lizardfs.com/) as the shared disk. The desktop is
-[COSMIC](https://github.com/pop-os/cosmic-epoch) — Magic Mesh ships everything
+[COSMIC](https://github.com/pop-os/cosmic-epoch) — MCNF ships everything
 Cosmic *doesn't* give you (the mesh, fleet automation, storage, telephony, device
 sync, security scanning, observability) as Cosmic apps + applets.
 
 Split out of the [MackesWorkstation](https://github.com/matthewmackes/MackesWorkstation)
 monorepo (the labwc/Windows-era *MackesDE* desktop, now end-of-life) by the
-**E11 "Magic Mesh" pivot**.
+**E11 "MCNF" pivot**.
 
 ---
 

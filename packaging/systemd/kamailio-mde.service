@@ -12,7 +12,7 @@
 # installs cleanly on nodes that never enable voice.
 
 [Unit]
-Description=Kamailio SIP proxy (Magic Mesh voice instance)
+Description=Kamailio SIP proxy (MCNF voice instance)
 Documentation=man:kamailio(8)
 After=network-online.target mackesd.service
 Wants=network-online.target

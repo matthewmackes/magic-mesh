@@ -1,7 +1,7 @@
 ---
 name: audit
 description: >-
-  Integrity sweep of the Magic Mesh Rust mesh workspace: find dead/unreachable
+  Integrity sweep of the MCNF Rust mesh workspace: find dead/unreachable
   code, stubs, mockups passing as features, convention violations (raw hex,
   scattered metrics, mesh/desktop boundary breaks), and stale docs — each
   finding gets a FINISH-or-REMOVE verdict. TRIGGER when the user asks to
@@ -10,7 +10,7 @@ description: >-
   does NOT fix things unless asked.
 ---
 
-# audit — compliance & integrity sweep (Magic Mesh)
+# audit — compliance & integrity sweep (MCNF)
 
 Catches the gap between "marked done" and "actually reachable + correct", and
 checks compliance with the root `AI_GOVERNANCE.md` (the operational rulebook — this
@@ -47,7 +47,7 @@ the dead surface). Don't fix unless asked — report first.
      `org.freedesktop.*` interop is allowed, §2), or crypto below the pinned
      values (Ed25519 / AES-256-GCM / ChaCha20-Poly1305 / RSA-4096 KDC, §3).
 5. **Doc drift** — prose claiming facts the code contradicts. Check prose against
-   the *current* reality: the E11 "Magic Mesh" pivot — **Cosmic owns the desktop**,
+   the *current* reality: the E11 "MCNF" pivot — **Cosmic owns the desktop**,
    the GUI is **strictly IBM Carbon** (Gray 10 / 90 / 100, Gray 100 default dark),
    iced 0.14 + cosmic-text + rustls. Flag any prose still describing the labwc/Win-
    era desktop shell, a `mde <subcommand>` dispatcher, four era-themes

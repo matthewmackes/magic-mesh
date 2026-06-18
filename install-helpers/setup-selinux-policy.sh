@@ -1,5 +1,5 @@
 #!/bin/bash
-# setup-selinux-policy.sh — install the Magic Mesh local SELinux policy modules so
+# setup-selinux-policy.sh — install the MCNF local SELinux policy modules so
 # a node runs clean under Enforcing SELinux (no AVC flood, no repeating
 # "SELinux security alert" toasts). Idempotent: safe to re-run; `semodule -i`
 # replaces an already-loaded module.

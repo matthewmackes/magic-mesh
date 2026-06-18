@@ -1,4 +1,4 @@
-# Magic Mesh — Operator's Day-2 Guide
+# MCNF — Operator's Day-2 Guide
 
 The lifecycle of a running mesh, in the order you'll live it. Deep runbooks
 live in [`docs/help/`](docs/help/) (installed to `/usr/share/mde/help/`,

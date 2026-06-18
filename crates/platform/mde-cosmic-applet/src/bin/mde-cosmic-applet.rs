@@ -1,4 +1,4 @@
-//! mde-cosmic-applet — the Magic Mesh **notification bell** (NOTIFY-7 / Action
+//! mde-cosmic-applet — the MCNF **notification bell** (NOTIFY-7 / Action
 //! Center, operator direction 2026-06-15).
 //!
 //! A Cosmic panel applet that:

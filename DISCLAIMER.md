@@ -1,6 +1,6 @@
-# Magic Mesh — Warning, Disclaimer, and Mission Statement
+# MCNF — Warning, Disclaimer, and Mission Statement
 
-Magic Mesh is an open-source, secure, no-fixed-center **workgroup** platform: a
+MCNF is an open-source, secure, no-fixed-center **workgroup** platform: a
 small set of trusted machines (a household, a lab, a small team) joined into one
 encrypted Nebula overlay with replicated storage (LizardFS), peer-to-peer fleet
 automation (Ansible-on-each-node), and a Cosmic desktop. Its mission is to make a
@@ -10,7 +10,7 @@ or a fixed point of failure.
 
 ## Production envelope (what it IS for)
 
-Magic Mesh is **production workgroup-grade within a stated envelope**:
+MCNF is **production workgroup-grade within a stated envelope**:
 
 - **Scale:** up to **8 peers** in one trust envelope (the §8 lock). Beyond that,
   split into multiple workgroups.
@@ -41,12 +41,12 @@ every other peer on every port inside the overlay.** The mesh contains the blast
 radius by (a) keeping the envelope small (≤8 peers you actually trust), (b) gating
 membership on a per-node cert, (c) making revocation immediate and fleet-wide, and
 (d) keeping the underlay firewall tight so only the overlay is exposed. If you need
-peer-to-peer network isolation *within* the group, Magic Mesh is not the right
+peer-to-peer network isolation *within* the group, MCNF is not the right
 tool — run it only among machines you would trust on the same LAN.
 
 ## Data, replication, and recovery
 
-Magic Mesh replicates data across peers (LizardFS) and converges node
+MCNF replicates data across peers (LizardFS) and converges node
 configuration peer-to-peer. Misconfiguration can still cause data loss, service
 interruption, or unintended replication of sensitive files. You remain responsible
 for backups, for what you place on the mesh, and for recovery. The platform ships
@@ -55,14 +55,14 @@ an operator runbook for the one genuinely scary case — losing your lighthouse 
 
 ## Warranty and liability
 
-Magic Mesh is provided "as is" and "as available," without warranties of any kind,
+MCNF is provided "as is" and "as available," without warranties of any kind,
 express or implied — including security, reliability, availability, performance,
 legal compliance, fitness for a particular purpose, data integrity, or suitability
 for a given deployment. Support is community/best-effort as described in
 `SUPPORT.md`; no SLA, incident response, or recovery assistance is implied unless
 separately agreed in writing.
 
-By installing, using, modifying, distributing, or operating Magic Mesh you accept
+By installing, using, modifying, distributing, or operating MCNF you accept
 full responsibility for all risks and outcomes. Do not deploy it on systems,
 networks, data, or accounts you do not own or have explicit permission to manage.
 To the maximum extent permitted by law, the authors, maintainers, contributors,
@@ -70,9 +70,9 @@ and distributors are not liable for any direct, indirect, incidental,
 consequential, special, exemplary, or punitive damages arising from its use,
 misuse, configuration, modification, distribution, failure, or operation.
 
-Magic Mesh integrates third-party open-source components; each retains its own
+MCNF integrates third-party open-source components; each retains its own
 license, copyright, and notices. Nothing here supersedes those terms — review and
 comply with all applicable upstream licenses.
 
-Use Magic Mesh at your own risk. If you do not understand the risks, do not
+Use MCNF at your own risk. If you do not understand the risks, do not
 install or use it.

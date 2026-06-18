@@ -1,4 +1,4 @@
-# MESHSHELL SHELL-2 — Magic Mesh Carbon starship prompt (bash).
+# MESHSHELL SHELL-2 — MCNF Carbon starship prompt (bash).
 # Carbon tokens: Blue-60 #0f62fe accent · Gray-60 #6f6f6f muted · Red #da1e28.
 add_newline = true
 format = "$custom$username$hostname$directory$git_branch$git_status$character"

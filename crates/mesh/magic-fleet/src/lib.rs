@@ -1,4 +1,4 @@
-//! E11.7 — Magic Mesh "Automation Mesh" node engine.
+//! E11.7 — MCNF "Automation Mesh" node engine.
 //!
 //! The fleet-sync model (design `mesh-decoupling.md` §2a, Q121–Q124): each node
 //! converges its own OS desired-state locally by running an Ansible playbook via

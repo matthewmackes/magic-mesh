@@ -9,7 +9,7 @@
 # hard Requires so voice-less nodes install cleanly.
 
 [Unit]
-Description=RTPengine media relay (Magic Mesh voice instance)
+Description=RTPengine media relay (MCNF voice instance)
 After=network-online.target mackesd.service
 Wants=network-online.target
 

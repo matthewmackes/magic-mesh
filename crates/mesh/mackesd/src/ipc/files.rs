@@ -582,7 +582,7 @@ pub const FLEET_FILES_PREFIX: &str = "fleet-files";
 /// Verbs served on `action/fleet-files/<verb>`.
 pub const FLEET_FILES_VERBS: [&str; 3] = ["peers", "self-node", "list-peer"];
 
-/// The live mesh-roster surface for Magic Mesh Files' mesh-browse.
+/// The live mesh-roster surface for MCNF Files' mesh-browse.
 ///
 /// SUBAUDIT-A2 (2026-06-15): this read the mackesd SQLite `nodes` table
 /// (`crate::store::list_nodes`), which is **empty mesh-wide** (the nebula roster

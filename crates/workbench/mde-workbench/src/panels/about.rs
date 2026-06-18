@@ -58,10 +58,12 @@ impl AboutPanel {
         let palette = crate::live_theme::palette();
         let sizes = FontSize::defaults();
 
-        let title = text("About Mackes Workstation")
+        let title = text("About MCNF — Mackes Cosmic Nebula Fedora")
             .size(TypeRole::Display.size_in(sizes))
             .colr(palette.text.into_cosmic_color());
-        let version = text(format!("Magic Mesh · v{VERSION}"))
+        // 10.0.x is codenamed "Magic Mesh" (the package id `magic-mesh` = the
+        // codename); show it alongside the workspace version.
+        let version = text(format!("MCNF 10.0 \"Magic Mesh\" · v{VERSION}"))
             .size(TypeRole::Caption.size_in(sizes))
             .colr(palette.text_muted.into_cosmic_color());
 

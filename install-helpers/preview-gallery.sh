@@ -45,9 +45,9 @@ VIEWS=(
 INDEX="$OUT_DIR/index.html"
 {
   echo "<!doctype html><meta charset=utf-8>"
-  echo "<title>Magic Mesh — Workbench preview gallery</title>"
+  echo "<title>MCNF — Workbench preview gallery</title>"
   echo "<body style='background:#161616;color:#f4f4f4;font-family:sans-serif;margin:24px'>"
-  echo "<h1>Magic Mesh — Workbench preview gallery</h1>"
+  echo "<h1>MCNF — Workbench preview gallery</h1>"
   echo "<p style='color:#8d8d8d'>OBS-4 visual-regression contact sheet. Captured headlessly (sway + grim, software render). Each tile is one Workbench surface; eyeball against the IBM Carbon reference (Gray 100 dark).</p>"
 } > "$INDEX"
 

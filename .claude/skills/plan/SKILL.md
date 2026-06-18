@@ -1,6 +1,6 @@
 ---
 name: plan
-description: Design-thinking + survey + worklist-management skill for the Magic Mesh mesh workspace. Use when the user asks to scope an epic, run an N-Q AskUserQuestion survey, audit the worklist for drift, rescue dead crate-modules, lift design-doc actions into worklist tasks, draft a design document, or otherwise PLAN work before any code lands. Sister skills: `ship` (drains the queue), `release` (the operator-gated RPM cut), plus `audit` + `preview`.
+description: Design-thinking + survey + worklist-management skill for the MCNF mesh workspace. Use when the user asks to scope an epic, run an N-Q AskUserQuestion survey, audit the worklist for drift, rescue dead crate-modules, lift design-doc actions into worklist tasks, draft a design document, or otherwise PLAN work before any code lands. Sister skills: `ship` (drains the queue), `release` (the operator-gated RPM cut), plus `audit` + `preview`.
 ---
 
 # Plan
@@ -83,7 +83,7 @@ When two locks contradict (newest wins silently):
 1. **Memory** (`~/.claude/projects/-home-mm-magic-mesh/memory/*.md`)
    — operator live preferences, highest.
 2. **`AI_GOVERNANCE.md`** (repo root) — the platform identity +
-   architectural locks (the E11 "Magic Mesh" pivot). This is the
+   architectural locks (the E11 "MCNF" pivot). This is the
    operational rulebook; there is no `CLAUDE.md` in this repo.
 3. **`docs/design/*.md`** — the per-epic design locks.
 4. **`docs/WORKLIST.md`** body — actionable state.

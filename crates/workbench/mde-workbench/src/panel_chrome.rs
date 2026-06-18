@@ -637,10 +637,10 @@ pub fn hero_band<'a, Message: 'a>(
     .spacing(2)
     .align_x(alignment::Horizontal::Center);
     // H9 — hover reveals a small "stack card": the service's role in the
-    // Magic Mesh platform + its version line.
+    // MCNF platform + its version line.
     let card = tooltip(
         format!(
-            "{} — {caption}\npart of the Magic Mesh platform stack",
+            "{} — {caption}\npart of the MCNF platform stack",
             hero.name()
         ),
         palette,

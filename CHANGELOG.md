@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to Magic Mesh are documented here. The format follows
+All notable changes to MCNF (Mackes Cosmic Nebula Fedora) are documented here. The 10.0.x series is codenamed "Magic Mesh"; historical entries below predate the 2026-06-17 rebrand. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is the
 single workspace version (`[workspace.package] version`, every crate
 inherits). Release tags are **`magic-mesh-v<version>`**; the RPM NEVRA pairs

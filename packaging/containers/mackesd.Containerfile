@@ -11,7 +11,7 @@
 # file): `podman build -f packaging/containers/mackesd.Containerfile .`
 FROM fedora:42
 
-# The Magic Mesh dnf repo (PKG-8). gpgcheck stays on; dnf fetches the
+# The MCNF dnf repo (PKG-8). gpgcheck stays on; dnf fetches the
 # published project key from the repo's gpgkey URL at install time.
 COPY packaging/repo/magic-mesh.repo /etc/yum.repos.d/magic-mesh.repo
 

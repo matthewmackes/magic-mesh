@@ -1,7 +1,7 @@
 ---
 name: ship
 description: >-
-  Autonomously drain the Magic Mesh worklist: a rescue pass to catch
+  Autonomously drain the MCNF worklist: a rescue pass to catch
   dead/mock code, then implement open tasks fully (no stubs), building +
   verifying each, committing as you go. TRIGGER when the user says "ship it",
   "execute", "continue", "drain the worklist", or "work through the backlog" for
@@ -9,7 +9,7 @@ description: >-
   anything needing a release cut (use /release).
 ---
 
-# ship — autonomous worklist drain (Magic Mesh)
+# ship — autonomous worklist drain (MCNF)
 
 Drains the worklist to empty under operator direction. Heads-down: the commit body
 is the record, one short note per phase boundary, no marketing copy. The rulebook is
@@ -18,7 +18,7 @@ sections are §4 (Carbon look), §6 (the mesh boundary), and §7 (Definition of 
 
 > **Worklist may not exist yet.** There is no `docs/` directory in the repo today —
 > `docs/WORKLIST.md` is the intended single tracker, created when execution begins.
-> If it is absent, the durable plan is `AI_GOVERNANCE.md` (the E11 "Magic Mesh"
+> If it is absent, the durable plan is `AI_GOVERNANCE.md` (the E11 "MCNF"
 > pivot identity + architectural locks); pull the next actionable items from there
 > and from any `docs/design/*.md` once they exist, and create the worklist as the
 > durable record before draining.

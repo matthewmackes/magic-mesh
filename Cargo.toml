@@ -1,7 +1,7 @@
-# Magic Mesh — the mesh substrate + its Carbon GUIs, on stock Fedora-Cosmic.
+# MCNF — the mesh substrate + its Carbon GUIs, on stock Fedora-Cosmic.
 #
 # Split out of the MackesWorkstation monorepo (the labwc/Win-era MDE desktop,
-# now EOL'd) by the E11 "Magic Mesh" pivot: this repo carries only the mesh
+# now EOL'd) by the E11 "MCNF" pivot: this repo carries only the mesh
 # fabric + the iced-0.14 Carbon GUIs that run as apps/applets on Cosmic. The
 # desktop chrome (panel/menu/settings/themes/window-mgmt/lock/greeter) is gone —
 # Cosmic provides it.

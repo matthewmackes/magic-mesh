@@ -1,4 +1,4 @@
-# Magic Mesh — Enterprise-Readiness Verification
+# MCNF — Enterprise-Readiness Verification
 
 > **Objective.** Verify, without assumptions, whether this mesh platform deserves to be called
 > enterprise-grade; if it does not, produce the exact worklist required to make that claim true.
@@ -12,7 +12,7 @@ intent. Date: 2026-06-09. Workspace version 10.0.0.
 
 ## 1. Platform goal (verification statement)
 
-Magic Mesh is a **secure, no-fixed-center workgroup mesh** plus its native-Rust IBM-Carbon GUIs,
+MCNF is a **secure, no-fixed-center workgroup mesh** plus its native-Rust IBM-Carbon GUIs,
 running on stock Fedora-Cosmic (`AI_GOVERNANCE.md` §0). Technically:
 
 - **Problem solved.** Give a small workgroup (sized for ≤ 8 peers — `ca/sign.rs`) an encrypted overlay

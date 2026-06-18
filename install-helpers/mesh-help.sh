@@ -1,5 +1,5 @@
 #!/bin/bash
-# MESHSHELL SHELL-4 — the Magic Mesh command cheat sheet (`mesh-help`).
+# MESHSHELL SHELL-4 — the MCNF command cheat sheet (`mesh-help`).
 #
 # Task-grouped, curated for accuracy, with a LIVE appendix that enumerates each
 # installed mesh tool's actual subcommands (parsed from `--help`, so it never

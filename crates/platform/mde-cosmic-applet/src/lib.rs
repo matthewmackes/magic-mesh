@@ -1,4 +1,4 @@
-//! GUI-6 (Q46/47) — the Magic Mesh cosmic-applet's logic layer.
+//! GUI-6 (Q46/47) — the MCNF cosmic-applet's logic layer.
 //!
 //! The applet is a libcosmic panel widget that subscribes to
 //! `mde-bus`, shows a mesh-health pip, offers quick actions

@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Magic Mesh Live Wallpaper
+Name=MCNF Live Wallpaper
 Comment=Live mesh-overview map as the Cosmic desktop background (PD-10); Workstation-rank gated — Servers/Lighthouses are headless
 Exec=sh -c "mackesd role-gate --min-rank 2 && exec mde-mesh-wallpaper"
 Icon=magic-mesh

@@ -327,7 +327,7 @@ fn write_atomic(path: &Path, role: Role) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let body = format!(
-        "# Magic Mesh deployment role — pinned at install by the role chooser.\n\
+        "# MCNF deployment role — pinned at install by the role chooser.\n\
          # Upgrade-only: a lower rank is refused (E1.1).\n\
          # Rank: lighthouse 0  <  server 1  <  workstation 2.\n\
          role = \"{}\"\n",

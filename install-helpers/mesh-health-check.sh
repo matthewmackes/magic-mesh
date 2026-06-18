@@ -1,5 +1,5 @@
 #!/bin/bash
-# mesh-health-check.sh — the Magic Mesh node health watchdog + recovery.
+# mesh-health-check.sh — the MCNF node health watchdog + recovery.
 #
 # Driven by mesh-health.timer (~every 60s). systemd's own `Restart=on-failure`
 # already recovers a CRASHED mackesd/nebula; this catches the cases systemd

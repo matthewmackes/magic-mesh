@@ -1,4 +1,4 @@
-# rust-toolchain.toml — pins the Rust toolchain for Magic Mesh.
+# rust-toolchain.toml — pins the Rust toolchain for MCNF.
 #
 # EFF-33 (2026-06-12) — this pin and the workspace `rust-version` are
 # NOT in conflict; they bound opposite ends:

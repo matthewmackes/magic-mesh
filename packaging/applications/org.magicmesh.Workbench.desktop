@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Magic Mesh Workbench
+Name=MCNF Workbench
 Comment=The mesh control surface
 Exec=mde-workbench
 Icon=magic-mesh

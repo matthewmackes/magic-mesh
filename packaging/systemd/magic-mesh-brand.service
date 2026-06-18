@@ -1,5 +1,5 @@
 [Unit]
-Description=Magic Mesh — apply Carbon branding (one-way, first boot, Workstation only)
+Description=MCNF — apply Carbon branding (one-way, first boot, Workstation only)
 Documentation=https://github.com/matthewmackes/magic-mesh
 # Run after the system is up; the per-user/Cosmic + greeter bits take effect at
 # the next login, the system bits (Plymouth, GTK/Qt /etc, LightDM) at next boot.

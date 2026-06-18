@@ -37,7 +37,7 @@ pub enum PublisherError {
 
 /// NOTIFY-DIST — ntfy topics must be a single `[-_A-Za-z0-9]{1,64}` segment,
 /// but bus topics are hierarchical (`peer/<host>/alerts`) and may contain
-/// spaces (`fdo/Magic Mesh Alerts`). Posting the raw bus topic makes ntfy read
+/// spaces (`fdo/MCNF Alerts`). Posting the raw bus topic makes ntfy read
 /// only the first path segment and return **404 Not Found** for the rest, so
 /// every mesh-alert publish failed and nothing federated. Flatten any
 /// non-conforming character to `_` (capped at 64) so the publish returns 200;
@@ -214,7 +214,7 @@ mod tests {
             ntfy_topic("peer/UNIT-EAGLE/alerts"),
             "peer_UNIT-EAGLE_alerts"
         );
-        assert_eq!(ntfy_topic("fdo/Magic Mesh Alerts"), "fdo_Magic_Mesh_Alerts");
+        assert_eq!(ntfy_topic("fdo/MCNF Alerts"), "fdo_Magic_Mesh_Alerts");
         assert_eq!(ntfy_topic("fleet/sec"), "fleet_sec");
         assert_eq!(ntfy_topic("flat"), "flat");
         // valid ntfy class only, capped at 64, never empty.

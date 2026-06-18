@@ -1,6 +1,6 @@
 # On-demand DigitalOcean lighthouses (Option A: doctl + cloud-init)
 
-Stand up a Magic Mesh founding lighthouse on a fresh DO Fedora droplet with one
+Stand up a MCNF founding lighthouse on a fresh DO Fedora droplet with one
 command. Each droplet founds its **own** mesh — `AI_GOVERNANCE.md` §8 (one
 founding lighthouse per mesh, ≤8 flat-trust peers). "Replicate lighthouses on
 demand" = spin up the Nth independent mesh; it is **not** multiple lighthouses

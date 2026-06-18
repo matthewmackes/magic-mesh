@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""MESHSHELL SHELL-3 — the Magic Mesh welcome greeting.
+"""MESHSHELL SHELL-3 — the MCNF welcome greeting.
 
 Renders a Carbon-styled banner from the cached /run/mde/mesh-status.json
 (refreshed ~30s by mesh-status.timer — the read is instant, so a shell never

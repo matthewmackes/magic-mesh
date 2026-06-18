@@ -1,4 +1,4 @@
-# Magic Mesh — Platform Build-Out Survey (100 questions)
+# MCNF — Platform Build-Out Survey (100 questions)
 
 **Purpose.** The worklist holds *findings* ("this is incomplete"), not *specs* ("build exactly
 this"). This survey turns the open platform decisions — the under-specified worklist items (B1
@@ -316,7 +316,7 @@ lifecycle (Q87–100).
 *Two competing paths: the dead in-app `toast_chip` (H4) and mackesd's FDO `org.freedesktop.Notifications` server; §5 says notifications go "via Cosmic."*
 - A) Delete `toast_chip` — notifications render through Cosmic's daemon; mackesd only forwards to FDO/Cosmic
 - B) Keep `toast_chip` for *in-app* ephemeral feedback (op-complete, copy-done) only, wired into mde-files' operation drawer
-- C) Make `toast_chip` the canonical renderer and have the mackesd FDO host draw it (Magic Mesh owns its toasts)
+- C) Make `toast_chip` the canonical renderer and have the mackesd FDO host draw it (MCNF owns its toasts)
 
 ### Q44. What is `elevation_container`'s (H4) role?
 *The tiered shadow/radius surface (Inline/PopoverMenu/Floating/Modal) is dead; live surfaces (`object_card`, panel chrome) hand-roll shadows inline.*
@@ -363,7 +363,7 @@ lifecycle (Q87–100).
 ### Q51. Which surfaces are Cosmic-native vs in-app iced in the v1 cutover?
 *Workbench + mde-files are iced apps Cosmic decorates; notifications + applet are the contested boundary.*
 - A) Iced for Workbench + mde-files only; notifications + applet are Cosmic-native (Cosmic daemon + libcosmic applet)
-- B) Magic Mesh draws its own everywhere — keep the in-app FDO notification path + an iced status surface, minimizing Cosmic coupling
+- B) MCNF draws its own everywhere — keep the in-app FDO notification path + an iced status surface, minimizing Cosmic coupling
 - C) Maximize Cosmic-native: also reskin mde-files' chrome to libcosmic and host the panel via Cosmic
 
 ### Q52. How are `palette.rs`'s two hex sources reconciled with the new `carbon` ramp?
@@ -489,7 +489,7 @@ lifecycle (Q87–100).
 
 ## §5 — Deployment, Roles & Packaging
 
-### Q71. Which RPM build tooling produces the single Magic Mesh package?
+### Q71. Which RPM build tooling produces the single MCNF package?
 *No `.spec` and no `[package.metadata.generate-rpm]` exist anywhere; §5 calls for "one RPM" but nothing builds it.*
 - A) `cargo-generate-rpm` reading `[package.metadata.generate-rpm]` on a top-level packaging crate (pure-cargo, no spec)
 - B) A hand-written `.spec` driven by `rpmbuild`/`mock`, invoking `cargo build --release --workspace` in `%build`
@@ -615,7 +615,7 @@ lifecycle (Q87–100).
 - C) Run them in CI as a non-gating, allowed-to-fail informational job
 - D) Run them only on a nightly/scheduled CI job, not per-PR
 
-### Q90. Which CI provider/runner should Magic Mesh standardize on?
+### Q90. Which CI provider/runner should MCNF standardize on?
 *There is no `.github/workflows` or any CI config in the repo today.*
 - A) GitHub Actions on GitHub-hosted runners
 - B) GitHub Actions on a self-hosted Fedora-Cosmic runner (matches the target substrate + podman + a display for `/preview`)

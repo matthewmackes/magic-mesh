@@ -1,4 +1,4 @@
-# OBS-3 — Magic Mesh CI.
+# OBS-3 — MCNF CI.
 #
 # Enforces the AI_GOVERNANCE §7 Definition-of-Done gates on every push/PR:
 # build · test (incl. the async-services worker suite) · clippy --all-targets ·

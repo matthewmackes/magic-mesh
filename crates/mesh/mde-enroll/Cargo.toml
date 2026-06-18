@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Magic Mesh enrollment TUI (ONBOARD-5): a full-screen ratatui app where an operator pastes a join token (and optionally overrides the lighthouse IP), then watches the fingerprint-pinned network enroll progress live. Headless over SSH — lighthouses/servers have no display."
+description = "MCNF enrollment TUI (ONBOARD-5): a full-screen ratatui app where an operator pastes a join token (and optionally overrides the lighthouse IP), then watches the fingerprint-pinned network enroll progress live. Headless over SSH — lighthouses/servers have no display."
 
 [lib]
 name = "mde_enroll"

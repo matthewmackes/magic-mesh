@@ -1,6 +1,6 @@
 # Security Policy
 
-Magic Mesh is security-sensitive infrastructure — it stands up an encrypted
+MCNF is security-sensitive infrastructure — it stands up an encrypted
 overlay mesh (Nebula), a fleet control plane, and a workgroup KDC. We take
 vulnerability reports seriously and appreciate responsible disclosure.
 
@@ -32,7 +32,7 @@ a fix before any public write-up. We will keep you updated on progress.
 
 ## Supported versions
 
-Magic Mesh is pre-1.0 and ships as a rolling release from `master`. Security
+MCNF is pre-1.0 and ships as a rolling release from `master`. Security
 fixes land on `master` and in the next packaged release; there is no long-term
 support branch yet. Always run the latest release.
 

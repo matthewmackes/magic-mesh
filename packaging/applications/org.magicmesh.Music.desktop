@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Magic Mesh Music
+Name=MCNF Music
 Comment=Mesh music player (Airsonic/Subsonic)
 Exec=mde-music
 Icon=magic-mesh

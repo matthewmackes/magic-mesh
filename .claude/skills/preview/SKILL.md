@@ -1,17 +1,17 @@
 ---
 name: preview
 description: >-
-  Render and visually verify the Magic Mesh iced/Cosmic GUIs against the IBM
+  Render and visually verify the MCNF iced/Cosmic GUIs against the IBM
   Carbon reference. TRIGGER when the user wants to "preview", "screenshot the
   app", "verify the render", or confirm a visual change actually looks right
   (Carbon Gray 10 / 90 / 100). Use this instead of trusting a green `cargo test`
   for any UI change — launch the real app binary and inspect.
 ---
 
-# preview — render & accuracy verification (Magic Mesh)
+# preview — render & accuracy verification (MCNF)
 
 A green `cargo test` does **not** verify the render. The desktop shell is gone
-(Cosmic owns the desktop); what Magic Mesh draws are its **iced 0.14 client areas** —
+(Cosmic owns the desktop); what MCNF draws are its **iced 0.14 client areas** —
 the Cosmic apps + the cosmic-applet. This skill verifies those render correctly
 against the IBM-Carbon reference.
 
@@ -57,7 +57,7 @@ rehomed surfaces (`birthright`, `mesh_status`) pending re-home onto Cosmic.
 
 - No raw hex / scattered metric literal lives anywhere but the `mde-theme` token
   modules (`AI_GOVERNANCE.md` §4) — a lint gate enforces this. Cosmic draws the
-  panel/decorations; Magic Mesh only draws its client areas.
+  panel/decorations; MCNF only draws its client areas.
 - Pure-Rust toolkit: iced 0.14 (wgpu) + cosmic-text (no FreeType), rustls (no
   OpenSSL). A full build needs `gtk3-devel` + `alsa-lib-devel`.
 - Visual verification is the §7 Definition-of-Done gate for any UI change — do not

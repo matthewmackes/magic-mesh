@@ -1,6 +1,6 @@
-# Magic Mesh — Compliance & Integrity Sweep
+# MCNF — Compliance & Integrity Sweep
 
-**Date:** 2026-06-12 · **Scope:** 22 crates · **Rulebook:** `AI_GOVERNANCE.md` (E11 "Magic Mesh" pivot) · **Lens:** post-hardening integrity — does the code shipped by the AUD-1..21 + EFF drain hold to §7 "marked done = reachable + correct"?
+**Date:** 2026-06-12 · **Scope:** 22 crates · **Rulebook:** `AI_GOVERNANCE.md` (E11 "MCNF" pivot) · **Lens:** post-hardening integrity — does the code shipped by the AUD-1..21 + EFF drain hold to §7 "marked done = reachable + correct"?
 
 Verdicts are binary: **FINISH** (make it real / wire it / fix the doc) or **REMOVE** (delete the dead surface). Report-only — nothing was modified by this sweep. Three parallel sub-audits (unreachable+stubs · mockups+conventions · doc-drift+packaging).
 

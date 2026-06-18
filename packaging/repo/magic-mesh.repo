@@ -1,4 +1,4 @@
-# PKG-8 — the Magic Mesh dnf repo, hosted on GitHub (replaces COPR).
+# PKG-8 — the MCNF dnf repo, hosted on GitHub (replaces COPR).
 #
 # Published from the project's GitHub repository: `createrepo_c` metadata
 # + the signed RPMs land on the `gh-pages` branch (served at
@@ -13,7 +13,7 @@
 # /etc/pki/rpm-gpg/RPM-GPG-KEY-magic-mesh (EFF-17; also published at the
 # gpgkey URL below when the gh-pages repo is stood up).
 [magic-mesh]
-name=Magic Mesh (GitHub)
+name=MCNF (GitHub)
 baseurl=https://matthewmackes.github.io/magic-mesh/fedora-$releasever-$basearch/
 type=rpm-md
 skip_if_unavailable=True

@@ -1,4 +1,4 @@
-; magicmesh-base.cil — always-safe Magic Mesh SELinux allows (base-policy types
+; magicmesh-base.cil — always-safe MCNF SELinux allows (base-policy types
 ; only, so this module loads on every Fedora node regardless of which optional
 ; subsystems are installed). See setup-selinux-policy.sh for the install flow.
 ;

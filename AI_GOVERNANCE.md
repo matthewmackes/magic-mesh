@@ -1,15 +1,26 @@
-# Magic Mesh — Governance & Architectural Locks
+# MCNF — Mackes Cosmic Nebula Fedora — Governance & Architectural Locks
 
-> **Identity:** *Magic Mesh is a secure, no-fixed-center workgroup mesh and its
-> native-Rust Carbon GUIs, running on stock Fedora-Cosmic.* This document is the
-> platform's identity + the architectural locks. When a lock conflicts with prose
-> elsewhere, the **newer lock wins**; authority ranks **Memory > this file >
-> design docs > worklist body**.
+> **Identity:** *MCNF (Mackes Cosmic Nebula Fedora) is a secure, no-fixed-center
+> workgroup mesh and its native-Rust Carbon GUIs, running on stock Fedora-Cosmic.*
+> This document is the platform's identity + the architectural locks. When a lock
+> conflicts with prose elsewhere, the **newer lock wins**; authority ranks
+> **Memory > this file > design docs > worklist body**.
+>
+> **Naming (rebrand 2026-06-17):** the product is **MCNF — Mackes Cosmic Nebula
+> Fedora**. The **10.0.x series is codenamed "Magic Mesh"**, surfaced as
+> `MCNF 10.0 "Magic Mesh"` in the About/greeter. The package + infra id + GitHub
+> repo **stay `magic-mesh`** (which *is* the codename) so the live-node upgrade
+> path is unbroken; the package may rename to `mcnf` at the **11.0 series
+> boundary**, and future series get new codenames. Internal identifiers
+> (`mackesd`, `mde-*`, `org.magicmesh.*`, `magic-mesh.repo`, `magic-mesh-v*`
+> tags, the `magic-mesh` icon name) are unchanged — only the display/product name
+> changed from "Magic Mesh" to "MCNF".
 
-This rewrites the MackesWorkstation governance for the **E11 "Magic Mesh" pivot**.
-The labwc/Win-era desktop is end-of-life; Cosmic owns the desktop. The locks below
-are what survives the cutover, restated for the Cosmic context — the
-shell/compositor/era-theme/desktop-surface locks are **retired**.
+This rewrites the MackesWorkstation governance for the **E11 pivot** (the 10.0
+series, codenamed "Magic Mesh"). The labwc/Win-era desktop is end-of-life; Cosmic
+owns the desktop. The locks below are what survives the cutover, restated for the
+Cosmic context — the shell/compositor/era-theme/desktop-surface locks are
+**retired**.
 
 ## §0 — Master rule
 
@@ -77,11 +88,11 @@ MD5/SHA1 is a finding.
 - **Pure-Rust toolkit:** libcosmic's vendored iced fork (wgpu + cosmic-text, no
   FreeType; carries a11y/accesskit — the full-libcosmic cutover, 2026-06-13), rustls (no
   OpenSSL). GUIs ship as Cosmic apps + a native cosmic-applet; Cosmic draws the
-  panel/decorations, Magic Mesh draws its client areas.
+  panel/decorations, MCNF draws its client areas.
 
 ## §5 — Distribution & roles
 
-- **Cosmic provides the desktop.** Magic Mesh integrates *into* it: a cosmic-applet
+- **Cosmic provides the desktop.** MCNF integrates *into* it: a cosmic-applet
   (Bus→Cosmic bridge), notifications via Cosmic, Workbench as the control surface,
   `mde-files` as the default file manager.
 - **Deployment roles** (Lighthouse ⊂ Server ⊂ Workstation, each a strict superset)

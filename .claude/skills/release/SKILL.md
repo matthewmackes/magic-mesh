@@ -1,7 +1,7 @@
 ---
 name: release
 description: >-
-  Cut a Magic Mesh RPM (one spec, install-time role chooser): pre-flight gates
+  Cut a MCNF RPM (one spec, install-time role chooser): pre-flight gates
   incl. the DISCLAIMER.md gate, version check, build/test/lint gates, then
   commit/tag. TRIGGER ONLY when the operator explicitly types "cut release" /
   "build the RPM" / "release it" for this repo. NEVER auto-trigger from a /ship
@@ -9,7 +9,7 @@ description: >-
   feature is §7-complete.
 ---
 
-# release — RPM cut (Magic Mesh)
+# release — RPM cut (MCNF)
 
 Operator-triggered only. Pushing tags and publishing are outward-facing — confirm
 before anything leaves the machine. Push to a **single** remote `origin`, branch
@@ -29,7 +29,7 @@ repo).
 > committed (`packaging/repo/RPM-GPG-KEY-magic-mesh`); sign at cut time with
 > `./install-helpers/sign-release.sh <rpm> [iso…]` — rpmsign-embeds the RPM
 > signature and emits `SHA256SUMS` + a detached `.asc` (run on the operator's
-> machine holding the "Magic Mesh Release Signing" secret key). **Still
+> machine holding the "MCNF Release Signing" secret key). **Still
 > operator-gated/open:** the signed COPR and the Magic-on-Cosmic ISO build.
 
 > **The package is HELD.** Per §5/§7, it does not cut until **every feature is

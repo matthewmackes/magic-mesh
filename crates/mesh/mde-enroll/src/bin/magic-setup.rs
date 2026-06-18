@@ -276,7 +276,7 @@ fn draw(f: &mut Frame, wiz: &Wizard, role: SetupRole, input: &str, manage_removi
     };
     let title = Paragraph::new(Line::from(vec![
         Span::styled(
-            "Magic Mesh — Setup",
+            "MCNF — Setup",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
