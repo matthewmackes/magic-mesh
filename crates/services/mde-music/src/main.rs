@@ -1543,12 +1543,12 @@ impl State {
         let bar = row![
             mini,
             meta,
-            button(text("⏮").size(13)).on_press(Message::SkipPrev),
+            button(text("\u{25C0}").size(13)).on_press(Message::SkipPrev),
             button(text(play_pause).size(13)).on_press(Message::PlayPause),
-            button(text("⏭").size(13)).on_press(Message::SkipNext),
+            button(text("\u{25B6}").size(13)).on_press(Message::SkipNext),
             pos,
             // Audio routing — send playback to a mesh peer (AIR-8 take-over).
-            button(text("🔊\u{FE0E} Route").size(12)).on_press(Message::OpenRouting),
+            button(text("\u{21C6} Route").size(12)).on_press(Message::OpenRouting),
             button(text("Full").size(12)).on_press(Message::ToggleMaxi),
         ]
         .spacing(10)
@@ -1711,7 +1711,10 @@ impl State {
                 "   "
             };
             let selected = self.queue_selected.contains(&i);
-            let sel_glyph = if selected { "☑" } else { "☐" };
+            // GLYPH-FIX — ●/○ (text-presentation BMP), not ☑/☐: U+2611 ☑ is
+            // Emoji_Presentation=Yes, so it renders via the color-emoji font
+            // (ignores tint, stalls first paint). ● selected, ○ unselected.
+            let sel_glyph = if selected { "\u{25CF}" } else { "\u{25CB}" };
             let mut row_el = row![
                 button(text(sel_glyph).size(13)).on_press(Message::QueueToggleSelect(i)),
                 text(format!("{marker}{label}"))

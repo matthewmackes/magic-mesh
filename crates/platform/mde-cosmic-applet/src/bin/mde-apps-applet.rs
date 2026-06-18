@@ -617,7 +617,7 @@ impl AppsApplet {
             };
         let links = row(vec![
             tile("\u{2317}\u{FE0E}", "Workbench", "mde-workbench"),
-            tile("\u{1F5C0}\u{FE0E}", "Files", "mde-files"),
+            tile("\u{25A4}", "Files", "mde-files"),
             tile("\u{2699}\u{FE0E}", "Settings", "cosmic-settings"),
         ])
         .spacing(1);
@@ -655,7 +655,7 @@ impl AppsApplet {
 
         // ── Search (leading magnifier + clear when non-empty). ──
         let mut search_row = vec![
-            text("\u{1F50D}\u{FE0E}")
+            text("\u{2315}")
                 .size(cap_sz)
                 .class(cosmic::theme::Text::Color(carbon(p.text_muted)))
                 .into(),

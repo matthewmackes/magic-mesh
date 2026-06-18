@@ -647,9 +647,9 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
 
     // AC-5 — W10-style quick-actions row (toggles), above the app launchers.
     let dnd_label = if state.dnd_active {
-        "🔕 Do Not Disturb · on"
+        "\u{25CB} Do Not Disturb · on"
     } else {
-        "🔔 Do Not Disturb · off"
+        "\u{25CF} Do Not Disturb · off"
     };
     let quick_actions = container(
         row![quick_toggle(
@@ -704,7 +704,7 @@ fn now_playing_section(music: Option<&MusicNow>, p: Palette) -> Element<'static,
             } else {
                 format!("{} — {}", m.title, m.artist)
             };
-            let toggle_glyph = if m.playing { "⏸" } else { "▶" };
+            let toggle_glyph = if m.playing { "\u{2016}" } else { "\u{25B6}" };
             row![
                 text("♪").size(14).color(p.accent.into_cosmic_color()),
                 Space::new().width(Length::Fixed(8.0)),
@@ -712,9 +712,9 @@ fn now_playing_section(music: Option<&MusicNow>, p: Palette) -> Element<'static,
                     .size(12)
                     .color(p.text.into_cosmic_color())
                     .width(Length::Fill),
-                transport_button("⏮", Message::MusicPrev, p),
+                transport_button("\u{25C0}", Message::MusicPrev, p),
                 transport_button(toggle_glyph, Message::MusicToggle, p),
-                transport_button("⏭", Message::MusicNext, p),
+                transport_button("\u{25B6}", Message::MusicNext, p),
             ]
             .align_y(cosmic::iced::Alignment::Center)
             .into()
