@@ -603,7 +603,7 @@ impl AppsApplet {
                             .into(),
                         text(label)
                             .size(cap_sz)
-                            .class(cosmic::theme::Text::Color(carbon(p.text_muted)))
+                            .class(cosmic::theme::Text::Color(carbon(p.text)))
                             .into(),
                     ])
                     .spacing(6)
@@ -734,10 +734,11 @@ impl AppsApplet {
         }
         col = col.push(self.footer());
 
+        // Golden-ratio portrait: height = width × φ (460 × 1.618 ≈ 744).
         cosmic::iced::widget::container(col)
             .padding(12)
             .width(Length::Fixed(460.0))
-            .height(Length::Fixed(720.0))
+            .height(Length::Fixed(744.0))
             .into()
     }
 
@@ -781,11 +782,12 @@ impl AppsApplet {
             ..Default::default()
         });
 
-        // Title (accent blue) + mono subtitle.
+        // Title — the app name in primary text (white in dark, black in light;
+        // operator override of the design's blue), over a mono subtitle.
         let body = column(vec![
             text(e.name.clone())
                 .size(TypeRole::Body.size_in(sizes))
-                .class(cosmic::theme::Text::Color(carbon(p.accent)))
+                .class(cosmic::theme::Text::Color(carbon(p.text)))
                 .into(),
             text(sub)
                 .size(cap_sz)
