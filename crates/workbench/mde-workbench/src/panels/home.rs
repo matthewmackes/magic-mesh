@@ -1082,6 +1082,27 @@ pub async fn reprobe_for_event(event: DbusEvent) -> (Vec<CapabilityRow>, bool) {
 
 // --- Nebula ----------------------------------------------------------------
 
+/// OVERVIEW-MESHCARD-1 — `(overlay_ip, online_peer_count)` from the
+/// world-readable mesh-status snapshot, the reachability source of truth the
+/// shell + peers use. `None` when the snapshot is absent.
+fn overlay_from_snapshot() -> Option<(String, usize)> {
+    let body = std::fs::read_to_string("/run/mde/mesh-status.json").ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let ip = v
+        .get("network")
+        .and_then(|n| n.get("overlay_ip"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let online = usize::try_from(
+        v.get("online")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    )
+    .unwrap_or(0);
+    Some((ip, online))
+}
+
 async fn probe_nebula() -> ProbeOutcome {
     // action/nebula/status returns a JSON dictionary; we only need
     // active_transport for the pill. E0.3.1.a — read it over the
@@ -1095,6 +1116,18 @@ async fn probe_nebula() -> ProbeOutcome {
     };
     let transport = extract_json_string_field(&raw, "active_transport").unwrap_or_default();
     if transport.is_empty() || transport == "offline" {
+        // OVERVIEW-MESHCARD-1 — `active_transport` is unreliable on non-CA peer
+        // nodes (the roster/transport state lives in the signer/CA's local DB,
+        // so peers report "offline"/0 even with a healthy overlay). Fall back to
+        // real reachability from the world-readable mesh-status snapshot: an
+        // overlay IP + online peers means the fabric IS connected.
+        if let Some((ip, online)) = overlay_from_snapshot() {
+            if !ip.is_empty() && online > 0 {
+                return ProbeOutcome::active(Some(format!(
+                    "Overlay up — {online} peer(s) reachable"
+                )));
+            }
+        }
         ProbeOutcome::setup_needed(Some("Mesh fabric is not connected".into()))
     } else {
         ProbeOutcome::active(Some(format!(
