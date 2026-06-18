@@ -820,6 +820,9 @@ impl App {
     /// shipped yet) just no-op.
     fn on_panel_navigated(&self, _group: Group, panel: &'static str) -> Task<Message> {
         match panel {
+            // WB-OVERVIEW-2 — the Home/Overview panel fires its full load
+            // (sync snapshot + async capability fan-out) so it lands populated.
+            "home" => home_panel::HomePanel::load(),
             "wallpaper" => wallpaper_panel::WallpaperPanel::load(self.backend()),
             "notifications" => notifications_panel::NotificationsPanel::load(self.backend()),
             "music" => music_panel::MusicPanel::load(),
@@ -865,6 +868,10 @@ impl App {
             "mirrors" => mirrors_panel::MirrorsPanel::load(),
             // PLANES-22 — the image catalog.
             "images" => images_panel::ImagesPanel::load(),
+            // WORKLOAD-FLEET-3 — the Compute/Instances panel enumerates local
+            // VMs/pods + folds the fleet QNM inventory on nav (was the one
+            // panel missing here, so it sat at "Loading instances…" forever).
+            "instances" => compute_panel::ComputePanel::load(),
             "audit" => audit_panel::AuditPanel::load(),
             "mesh_logs" => mesh_logs_panel::MeshLogsPanel::load(),
             "fleet_logs" => fleet_logs_panel::FleetLogsPanel::load(),
@@ -1295,6 +1302,10 @@ impl App {
             View::Panel {
                 panel: "instances", ..
             } => self.compute.view(),
+            // WB-OVERVIEW-2 — the "Home" panel renders the real Overview
+            // dashboard (same as the group root), not the "isn't ready yet"
+            // stub it fell through to before.
+            View::Panel { panel: "home", .. } => self.home.view(),
             // E6.1 — any group-root view without a bespoke landing
             // (Apps / Devices / Fleet / Look & Feel / System, plus
             // Network when deep-linked) renders the "Manage Your Server"

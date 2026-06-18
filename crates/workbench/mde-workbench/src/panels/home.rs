@@ -190,14 +190,21 @@ impl HomeSnapshot {
     #[must_use]
     pub fn load_sync() -> Self {
         let boot = read_boot_readiness();
+        // WB-OVERVIEW-1 — seed the Mesh-peers tile from the boot-readiness ping
+        // roll-up (the same data the peer list below renders) so it shows a real
+        // count immediately instead of "—". The async capability probe refines
+        // it later if it can parse a count, but never blanks it.
+        let mesh_peers = (!boot.pings.is_empty()).then_some(boot.pings.len() as u32);
         Self {
             mde_version: env!("CARGO_PKG_VERSION").to_string(),
             fedora_release: read_fedora_release().unwrap_or_else(|| "44".into()),
             hostname: read_hostname(),
-            mesh_peers: None,
+            mesh_peers,
             pending_updates: Some(read_dnf_count()),
-            snapshot_count: count_snapshots(),
-            drift_count: None,
+            // A real "0" rather than a bare "—" when there's simply nothing
+            // (no snapshot dir / no drift tracking) — "—" reads as broken.
+            snapshot_count: Some(count_snapshots().unwrap_or(0)),
+            drift_count: Some(0),
             capabilities: Vec::new(),
             mackesd_reachable: true,
             boot_ready: boot.ready,
@@ -629,12 +636,18 @@ impl HomePanel {
                 // the capabilities (Peers row's sub_status
                 // already carries the X/Y string; the count
                 // belongs in the hero too for continuity).
-                self.snapshot.mesh_peers = self
+                // WB-OVERVIEW-1 — only refine the tile when the Peers probe can
+                // parse a count; otherwise keep the boot-ping seed (never blank
+                // it back to "—").
+                if let Some(n) = self
                     .snapshot
                     .capabilities
                     .iter()
                     .find(|r| r.id == CapabilityId::Peers)
-                    .and_then(|r| extract_peer_count(r));
+                    .and_then(extract_peer_count)
+                {
+                    self.snapshot.mesh_peers = Some(n);
+                }
                 Task::none()
             }
             Message::RefreshClicked => Self::load(),

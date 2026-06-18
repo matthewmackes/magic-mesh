@@ -9,10 +9,17 @@
 //! it). Routing itself stays display-only (W76) — what the operator acts
 //! on here is the reachability health.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
 use cosmic::iced::Task;
+
+/// ROUTING-VALIDATE-1 — after requesting a run, poll the verdict on this cadence
+/// until it lands (the FPG leader mints it + nodes report asynchronously, so the
+/// result isn't ready on the first immediate fetch).
+const POLL_DELAY: Duration = Duration::from_secs(3);
+/// Bounded so a leader that never completes can't poll forever.
+const MAX_POLLS: u8 = 12;
 use cosmic::iced::{Background, Border, Color, Length, Padding};
 use cosmic::{Element, Theme};
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
@@ -50,6 +57,9 @@ pub struct RoutingPanel {
     /// Routing shows live reachability without a manual click), but only once
     /// per panel session — a genuinely empty mesh won't re-probe on every load.
     pub auto_ran: bool,
+    /// ROUTING-VALIDATE-1 — how many times we've polled the verdict since the
+    /// last run request (bounded by `MAX_POLLS`).
+    pub poll_attempts: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -79,16 +89,32 @@ impl RoutingPanel {
                 self.status = status;
                 self.error = None;
                 self.last_run_at = Some(SystemTime::now());
+                // A verdict landed — stop polling.
+                if !never_run {
+                    self.busy = false;
+                    self.poll_attempts = 0;
+                    return Task::none();
+                }
                 // AUDIT-MESH-5 — no run has ever been minted: auto-request one
                 // (once) so the panel shows live reachability without the
                 // operator having to click "Run validation now".
-                if never_run && !self.auto_ran {
+                if !self.auto_ran {
                     self.auto_ran = true;
                     self.busy = true;
+                    self.poll_attempts = 0;
                     self.run_result = None;
                     return Task::perform(async { request_run() }, |result| {
                         crate::Message::Routing(Message::RunRequested(result))
                     });
+                }
+                // ROUTING-VALIDATE-1 — a run was requested but the verdict isn't
+                // ready yet (the leader mints it + nodes report async). Keep
+                // polling on a cadence until it lands or the budget is spent —
+                // before, the panel fetched once, saw nothing, and gave up
+                // ("No validation run yet" forever).
+                if self.busy && self.poll_attempts < MAX_POLLS {
+                    self.poll_attempts += 1;
+                    return poll_status_later();
                 }
                 self.busy = false;
                 Task::none()
@@ -107,14 +133,18 @@ impl RoutingPanel {
             }
             Message::RunNow => {
                 self.busy = true;
+                self.poll_attempts = 0;
                 Task::perform(async { request_run() }, |result| {
                     crate::Message::Routing(Message::RunRequested(result))
                 })
             }
             Message::RunRequested(result) => {
                 self.run_result = Some(result);
-                self.busy = false;
-                Self::load()
+                // Keep busy + poll for the freshly-minted verdict rather than
+                // fetching once immediately (it isn't ready yet).
+                self.busy = true;
+                self.poll_attempts = 0;
+                poll_status_later()
             }
         }
     }
@@ -398,6 +428,19 @@ fn card<'a>(
 
 // ---- I/O ------------------------------------------------------
 
+/// ROUTING-VALIDATE-1 — sleep `POLL_DELAY`, then re-fetch the verdict. Used to
+/// poll for a freshly-requested run's result (the leader mints it + nodes report
+/// asynchronously, so it isn't ready on the immediate fetch).
+fn poll_status_later() -> Task<crate::Message> {
+    Task::perform(
+        async {
+            tokio::time::sleep(POLL_DELAY).await;
+            fetch_status()
+        },
+        |result| crate::Message::Routing(Message::Loaded(result)),
+    )
+}
+
 /// Shell out to `mackesd validate status --json`.
 pub fn fetch_status() -> Result<ValidationStatus, String> {
     let out = std::process::Command::new("mackesd")
@@ -502,9 +545,11 @@ mod tests {
     }
 
     #[test]
-    fn no_prior_run_auto_runs_once() {
-        // AUDIT-MESH-5 — first load with run_id:null auto-requests a run (busy
-        // + auto_ran set); a second null load does NOT re-trigger (guarded).
+    fn no_prior_run_auto_runs_once_then_polls_bounded() {
+        // AUDIT-MESH-5 + ROUTING-VALIDATE-1 — first load with run_id:null
+        // auto-requests a run (busy + auto_ran set); subsequent empty loads do
+        // NOT re-request, but they DO keep polling for the verdict until the
+        // budget (MAX_POLLS) is spent, then stop.
         let mut p = RoutingPanel::new();
         assert!(!p.auto_ran);
         let none_status = parse_status(r#"{"run_id":null}"#);
@@ -512,9 +557,28 @@ mod tests {
         assert!(p.auto_ran, "auto-run armed on first empty load");
         assert!(p.busy, "auto-run is in flight");
 
-        // Simulate the load that follows another empty status: no re-trigger.
+        // Subsequent empty loads keep polling (busy stays) until the budget runs
+        // out — the verdict isn't ready instantly (leader mints it async).
+        for _ in 0..MAX_POLLS {
+            let _ = p.update(Message::Loaded(Ok(none_status.clone())));
+            assert!(p.auto_ran, "never re-arms a second request");
+        }
+        // One more empty load past the budget → polling stops.
         let _ = p.update(Message::Loaded(Ok(none_status)));
-        assert!(!p.busy, "second empty load does not re-run");
+        assert!(!p.busy, "polling stops after MAX_POLLS empty loads");
+    }
+
+    #[test]
+    fn verdict_arrival_stops_polling() {
+        // ROUTING-VALIDATE-1 — once a run_id lands, polling stops + resets.
+        let mut p = RoutingPanel::new();
+        let _ = p.update(Message::Loaded(Ok(parse_status(r#"{"run_id":null}"#))));
+        assert!(p.busy);
+        let verdict = parse_status(r#"{"run_id":"r1","passed":true,"reachable":9}"#);
+        let _ = p.update(Message::Loaded(Ok(verdict)));
+        assert!(!p.busy, "verdict stops the poll");
+        assert_eq!(p.poll_attempts, 0);
+        assert_eq!(p.status.run_id.as_deref(), Some("r1"));
     }
 
     #[test]
