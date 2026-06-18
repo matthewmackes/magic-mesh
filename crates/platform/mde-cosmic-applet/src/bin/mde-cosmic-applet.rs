@@ -21,7 +21,7 @@ use cosmic::iced::{time, Subscription};
 use cosmic::{Application, Element};
 
 use mde_notify::{severity_token, AlertTail, Severity};
-use mde_theme::Palette;
+use mde_theme::{Palette, Rgba};
 
 const ID: &str = "com.mackes.MagicMeshApplet";
 /// Bell refresh cadence — a new alert tints the bell within this window.
@@ -34,6 +34,9 @@ struct Applet {
     /// Highest-severity unread alert since the center was last opened
     /// (`None` = nothing unread → idle bell).
     severity: Option<Severity>,
+    /// NEB-CRYPTO-LABEL — the live Nebula overlay cipher strength shown beside
+    /// the bell (`None` = overlay down → no label).
+    cipher: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -86,7 +89,19 @@ fn toggle_center() {
     }
 }
 
-/// The bell's color for a severity (idle → muted text). Shared Carbon tokens.
+/// Convert an `mde-theme` Carbon `Rgba` token into an iced color. Single
+/// converter shared by the bell glyph + the cipher label (§4 — colors come
+/// from the palette tokens, never raw literals here).
+fn to_color(rgba: Rgba) -> cosmic::iced::Color {
+    cosmic::iced::Color {
+        r: f32::from(rgba.r) / 255.0,
+        g: f32::from(rgba.g) / 255.0,
+        b: f32::from(rgba.b) / 255.0,
+        a: rgba.a,
+    }
+}
+
+/// The bell's color for a severity (idle → primary text). Shared Carbon tokens.
 fn bell_color(severity: Option<Severity>) -> cosmic::iced::Color {
     let p = Palette::dark();
     let rgba = match severity {
@@ -95,11 +110,49 @@ fn bell_color(severity: Option<Severity>) -> cosmic::iced::Color {
         // dark panel), not muted gray, so it reads clearly (operator request).
         None => p.text,
     };
-    cosmic::iced::Color {
-        r: f32::from(rgba.r) / 255.0,
-        g: f32::from(rgba.g) / 255.0,
-        b: f32::from(rgba.b) / 255.0,
-        a: rgba.a,
+    to_color(rgba)
+}
+
+/// NEB-CRYPTO-LABEL — the live Nebula tunnel cipher as a short strength label
+/// ("AES-256-GCM" / "ChaCha20-Poly1305"), or `None` when the overlay is down.
+fn nebula_cipher() -> Option<String> {
+    // Only report a cipher when the tunnel is actually up — otherwise the label
+    // would imply a live overlay that isn't there.
+    let running = std::process::Command::new("pgrep")
+        .args(["-x", "nebula"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !running {
+        return None;
+    }
+    let cfg = ["/etc/nebula/config.yml", "/etc/nebula/config.yaml"]
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok());
+    // Nebula's default (unset) cipher is AES-256-GCM; `chachapoly` selects
+    // ChaCha20-Poly1305. Map the config token to its strength label.
+    let token = cfg.as_deref().and_then(parse_cipher).unwrap_or("aes");
+    Some(cipher_label(token).to_string())
+}
+
+/// Extract the top-level `cipher:` value from a Nebula config, ignoring
+/// commented lines. Returns `None` when absent/empty (→ caller uses the
+/// Nebula default).
+fn parse_cipher(cfg: &str) -> Option<&str> {
+    cfg.lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .find_map(|l| l.strip_prefix("cipher:"))
+        .map(|v| v.trim().trim_matches(['"', '\'']))
+        .filter(|v| !v.is_empty())
+}
+
+/// Map a Nebula cipher token to its human-readable strength label.
+fn cipher_label(token: &str) -> &'static str {
+    match token.to_ascii_lowercase().as_str() {
+        "chachapoly" => "ChaCha20-Poly1305",
+        // "aes" (and the unset default) is AES-256-GCM.
+        _ => "AES-256-GCM",
     }
 }
 
@@ -127,6 +180,7 @@ impl Application for Applet {
                 core,
                 tail: AlertTail::default(),
                 severity: None,
+                cipher: nebula_cipher(),
             },
             // Prime immediately so the bell reflects existing alerts at launch.
             Task::done(cosmic::Action::App(Message::Tick)),
@@ -142,6 +196,8 @@ impl Application for Applet {
             Message::Tick => {
                 let fresh = poll_new_severity(&mut self.tail);
                 self.severity = merge_severity(self.severity, fresh);
+                // Refresh the overlay cipher label (cheap file + pgrep read).
+                self.cipher = nebula_cipher();
             }
             Message::Toggle => {
                 toggle_center();
@@ -163,10 +219,25 @@ impl Application for Applet {
         // draw for seconds. ● filled = unread, ○ hollow = idle; the tint applies.
         let glyph = if unread { "\u{25CF}" } else { "\u{25CB}" }; // ● / ○
         let color = bell_color(self.severity);
-        let label = cosmic::widget::text(glyph)
+        let glyph_el = cosmic::widget::text(glyph)
             .size(14)
             .class(cosmic::theme::Text::Color(color));
-        let btn = cosmic::widget::button::custom(label)
+        // NEB-CRYPTO-LABEL — the live overlay cipher strength as text next to
+        // the bell (muted Carbon token; omitted when the overlay is down).
+        let mut children: Vec<Element<'_, Message>> = vec![glyph_el.into()];
+        if let Some(c) = &self.cipher {
+            let muted = to_color(Palette::dark().text_muted);
+            children.push(
+                cosmic::widget::text(c.clone())
+                    .size(10)
+                    .class(cosmic::theme::Text::Color(muted))
+                    .into(),
+            );
+        }
+        let content = cosmic::widget::row(children)
+            .spacing(6)
+            .align_y(cosmic::iced::Alignment::Center);
+        let btn = cosmic::widget::button::custom(content)
             .on_press(Message::Toggle)
             .class(cosmic::theme::Button::AppletIcon);
         Element::from(self.core.applet.applet_tooltip::<Message>(
@@ -184,5 +255,32 @@ impl Application for Applet {
 
     fn style(&self) -> Option<cosmic::iced::theme::Style> {
         Some(cosmic::applet::style())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cipher_label, parse_cipher};
+
+    #[test]
+    fn parses_explicit_cipher_value() {
+        assert_eq!(parse_cipher("cipher: chachapoly\n"), Some("chachapoly"));
+        assert_eq!(parse_cipher("  cipher: \"aes\"\n"), Some("aes"));
+    }
+
+    #[test]
+    fn ignores_commented_and_absent_cipher() {
+        assert_eq!(parse_cipher("# cipher: chachapoly\nlisten:\n"), None);
+        assert_eq!(parse_cipher("pki:\n  ca: /x\n"), None);
+        assert_eq!(parse_cipher("cipher:   \n"), None); // empty value
+    }
+
+    #[test]
+    fn labels_map_to_strength() {
+        assert_eq!(cipher_label("chachapoly"), "ChaCha20-Poly1305");
+        assert_eq!(cipher_label("AES"), "AES-256-GCM");
+        // Unknown/unset tokens fall back to the Nebula default (AES-256-GCM).
+        assert_eq!(cipher_label("aes"), "AES-256-GCM");
+        assert_eq!(cipher_label(""), "AES-256-GCM");
     }
 }
