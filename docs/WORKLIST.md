@@ -976,6 +976,17 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
     - [ ] **CONFIRM WITH OPERATOR which applet** (bell/notification applet vs apps/Start-menu applet vs a network/overlay status applet) before wiring — default to the network/overlay status surface if one exists
     - [ ] degrades to "overlay down" / blank when nebula isn't running; no panic on a missing config
 
+## BUS-RUN-FULL — mde-bus spool fills the /run tmpfs on small nodes (found during the v10.0.17 roll, 2026-06-18)
+> During the v10.0.17 fleet roll, **7 of 9 nodes** had `/run` (tmpfs) at **100%** — `/run/mde-bus` had grown to ~389 MB (**91k+ message files** + a 50 MB `index.sqlite`), which blocked `dnf` from even writing its lock file (`/run/dnf/rpmtransaction.lock: No space left on device`). Stopgap during the roll: `find /run/mde-bus -type f -name '*.json' -mmin +20 -delete` (freed 100%→15%, all nodes then upgraded). This is a **latent stability bug**, not release-specific: a full `/run` breaks far more than dnf (systemd, ssh, the bus itself) and violates [[boot-recovery-hard-requirement]] on a small node.
+- [ ] **BUS-RUN-FULL-1: bound the mde-bus spool so it can't fill /run.**
+  **As** an operator, **I want** the bus to cap its on-disk footprint, **so that** small nodes (DO lighthouses ~947 MB, 4.9 GB VMs with a 391 MB /run) never wedge on a full `/run`.
+  **Acceptance** (each runtime-observable):
+    - [ ] a retention policy prunes delivered/old messages (by age and/or total bytes) on a periodic worker — `/run/mde-bus` stays under a hard cap (e.g. ≤64 MB) indefinitely
+    - [ ] the prune is consumer-safe (respects the slowest live cursor; doesn't strand a consumer — cf. [[bus-inode-orphan-1]]) and `index.sqlite` is VACUUMed/checkpointed so it doesn't grow unbounded (was 50 MB)
+    - [ ] consider whether `compute/inventory` (now also mirrored to QNM-Shared for WORKLOAD-FLEET-1) still needs a 10 s bus publish, or can publish less often / not at all (reduce churn)
+    - [ ] a `df`-based guard: if `/run` crosses ~85%, the bus emergency-prunes + logs an alert rather than wedging the node
+    - [ ] verified on a 391 MB-/run VM: steady-state `/run/mde-bus` stays bounded over a multi-hour soak
+
 ## SVC-VIEW — service visibility gaps (operator bug-testing, 2026-06-18)
 > Operator looked at **Workbench ▸ Mesh ▸ Published Services**, saw "No service rows available", and asked why Airsonic / any services on MDE-KVM-1 aren't listed. Two distinct issues:
 - [✓] **SVC-VIEW-1: Published Services now shows the 7 canonical services FLEET-WIDE (operator directive).** DONE 2026-06-18: operator — "if it's responsible to show those 7 service types, show them from all over the network." Root cause of empty: the panel queried only the local `action/nebula/published-services` RPC and showed nothing when it returned empty. Rebuilt to read the **replicated peer roster** (`<workgroup>/peers/*.json`, the same cross-node source the Peers panel uses) and emit the 7 canonical services for **every enrolled peer**, attributed via a new **Node** column, publishable when the peer is reachable (healthy/degraded); legacy local-RPC fallback only when the roster is empty. Pure `fleet_rows_from_peers` builder + tests (10 panel tests green). Live: .13's roster has fedora + MDE-VM-2..5 + MDE-VM-KVM1 + UNIT-EAGLE (each overlay_ip+health) → 7×N rows. New mde-workbench hot-patched to .13 + dev host (relaunch the app to see it). *(durable rollout = next RPM cut.)*
