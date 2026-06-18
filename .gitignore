@@ -33,3 +33,4 @@ target-f43/
 # sha256-verified at build time by install-helpers/vendor-birthright-blobs.sh and
 # shipped in the RPM; third-party binaries, not source.
 /vendor/birthright/
+install-helpers/__pycache__/

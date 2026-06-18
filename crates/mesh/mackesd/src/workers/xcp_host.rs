@@ -46,7 +46,12 @@ pub fn is_xcp_dom0() -> bool {
 /// Build the `compute/xcp-host/<node>` capacity document from a probe. Pure so
 /// the published shape is testable without a live host. `now_ms` stamps it.
 #[must_use]
-pub fn xcp_host_doc(node_id: &str, hostname: &str, cap: &HostCapacity, now_ms: u64) -> serde_json::Value {
+pub fn xcp_host_doc(
+    node_id: &str,
+    hostname: &str,
+    cap: &HostCapacity,
+    now_ms: u64,
+) -> serde_json::Value {
     json!({
         "ok": true,
         "kind": "xcp-host",
