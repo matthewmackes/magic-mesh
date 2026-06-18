@@ -248,6 +248,8 @@ enum Message {
     ArtLoaded(String, Option<image::Handle>),
     /// AIR-15.b — toggle the maxi-player full-window surface.
     ToggleMaxi,
+    /// MUSIC-PLAYBAR — open the full view at the Peers tab (audio routing).
+    OpenRouting,
     /// AIR-15.b.4 — switch the maxi Queue/Lyrics tab.
     MaxiTabSelected(MaxiTab),
     /// AIR-15.b.4 — the current track's lyrics loaded.
@@ -465,6 +467,15 @@ impl State {
                 } else {
                     Task::none()
                 }
+            }
+            // MUSIC-PLAYBAR — the playback bar's audio-routing control: open the
+            // full view on the Peers tab (the AIR-8 take-over routing surface).
+            Message::OpenRouting => {
+                self.maxi_open = true;
+                self.maxi_tab = MaxiTab::Peers;
+                return Task::perform(nowplaying::fetch_peer_states(), |r| {
+                    Message::PeersLoaded(r.unwrap_or_default())
+                });
             }
             Message::QueueLoaded(songs, current) => {
                 self.queue_current = current;
@@ -1297,8 +1308,10 @@ impl State {
         .padding(20)
         .width(Length::Fill)
         .height(Length::Fill);
-        if let Some(footer) = self.now_playing_footer() {
-            page_col = page_col.push(footer);
+        // MUSIC-PLAYBAR — the persistent playback bar, static at the bottom of
+        // every browse interface (library / album / search).
+        if let Some(bar) = self.playback_bar() {
+            page_col = page_col.push(bar);
         }
         let page = container(page_col).width(Length::Fill).height(Length::Fill);
 
@@ -1476,49 +1489,72 @@ impl State {
         row![art, content].spacing(20).into()
     }
 
-    /// AIR-15 — the always-visible now-playing + transport footer (shown
-    /// once a track is loaded). The maxi-player's Queue / Lyrics / Peers
-    /// tabs + scrub + volume slider are follow-ons; this is the in-app
-    /// transport core (the first play/pause/skip after playback starts).
-    fn now_playing_footer(&self) -> Option<Element<'_, Message>> {
-        if !self.now_state.has_track() {
+    /// MUSIC-PLAYBAR (2026-06-18) — the persistent playback bar, static at the
+    /// bottom of every browse interface: mini cover art, title/artist, full
+    /// shuttle controls (prev / play-pause / next), position, an **audio routing**
+    /// control (route playback to a mesh peer — opens the Peers/take-over surface),
+    /// and a Full-view toggle. `None` until a track is loaded/active.
+    fn playback_bar(&self) -> Option<Element<'_, Message>> {
+        if !self.now_state.has_track() && !self.now_state.active {
             return None;
         }
+        let muted = carbon(mde_theme::Palette::dark().text_muted, 1.0);
         let title = if self.now_title.is_empty() {
             self.now_state.song_id.clone()
         } else {
             self.now_title.clone()
-        };
-        let label = if self.now_artist.is_empty() {
-            title
-        } else {
-            format!("{title} — {}", self.now_artist)
         };
         let play_pause = if self.now_state.playing {
             "Pause"
         } else {
             "Play"
         };
-        let status = if self.now_state.playing {
-            "Playing"
-        } else if self.now_state.active {
-            "Paused"
-        } else {
-            "Stopped"
+        // Mini artwork (currently-playing cover) on its dominant-colour tint.
+        let (nr, ng, nb) = self.now_color;
+        let mini_inner: Element<'_, Message> = match &self.now_art {
+            Some(h) => image(h.clone())
+                .width(Length::Fixed(40.0))
+                .height(Length::Fixed(40.0))
+                .into(),
+            None => Space::new()
+                .width(Length::Fixed(40.0))
+                .height(Length::Fixed(40.0))
+                .into(),
         };
-        Some(
-            row![
-                text(label).size(13).width(Length::Fill),
-                button(text("Prev").size(12)).on_press(Message::SkipPrev),
-                button(text(play_pause).size(12)).on_press(Message::PlayPause),
-                button(text("Next").size(12)).on_press(Message::SkipNext),
-                button(text("Maximize").size(12)).on_press(Message::ToggleMaxi),
-                text(status).size(12),
-            ]
-            .spacing(10)
-            .padding(10)
-            .into(),
-        )
+        let mini = container(mini_inner).style(move |_| cosmic::iced::widget::container::Style {
+            background: Some(cosmic::iced::Color::from_rgb8(nr, ng, nb).into()), // carbon-ok: cover colour
+            ..Default::default()
+        });
+        let meta = column![
+            text(title).size(13),
+            text(self.now_artist.clone()).size(11).colr(muted),
+        ]
+        .spacing(1)
+        .width(Length::Fill);
+        let pos = text(format!(
+            "{}:{:02} / {}:{:02}",
+            self.now_state.position_ms / 60000,
+            (self.now_state.position_ms / 1000) % 60,
+            self.now_duration_ms / 60000,
+            (self.now_duration_ms / 1000) % 60,
+        ))
+        .size(11)
+        .colr(muted);
+        let bar = row![
+            mini,
+            meta,
+            button(text("⏮").size(13)).on_press(Message::SkipPrev),
+            button(text(play_pause).size(13)).on_press(Message::PlayPause),
+            button(text("⏭").size(13)).on_press(Message::SkipNext),
+            pos,
+            // Audio routing — send playback to a mesh peer (AIR-8 take-over).
+            button(text("🔊\u{FE0E} Route").size(12)).on_press(Message::OpenRouting),
+            button(text("Full").size(12)).on_press(Message::ToggleMaxi),
+        ]
+        .spacing(10)
+        .padding(10)
+        .align_y(cosmic::iced::Alignment::Center);
+        Some(container(bar).width(Length::Fill).into())
     }
 
     /// AIR-15.b — the maxi-player full-window surface: now-playing header
@@ -1540,23 +1576,29 @@ impl State {
         } else {
             "Play"
         };
-        // MUSIC-RFX-4 — large cover art on a dominant-colour tint band (the
-        // colour extracted from the now-playing cover, not the opened album).
+        // MUSIC-MAXI-SCALE (2026-06-18) — the artwork is the focus and scales
+        // with the window: ~40% of the width, clamped to a sane hero range, on a
+        // dominant-colour tint band (extracted from the now-playing cover). Even
+        // with no art yet, the tint square holds the focal space (no collapse).
         let (nr, ng, nb) = self.now_color;
-        let art: Element<'_, Message> = match &self.now_art {
-            Some(h) => container(
-                image(h.clone())
-                    .width(Length::Fixed(240.0))
-                    .height(Length::Fixed(240.0)),
-            )
-            .padding(12)
+        let art_dim = (self.grid_width * 0.40).clamp(300.0, 560.0);
+        let art_inner: Element<'_, Message> = match &self.now_art {
+            Some(h) => image(h.clone())
+                .width(Length::Fixed(art_dim))
+                .height(Length::Fixed(art_dim))
+                .into(),
+            None => Space::new()
+                .width(Length::Fixed(art_dim))
+                .height(Length::Fixed(art_dim))
+                .into(),
+        };
+        let art: Element<'_, Message> = container(art_inner)
+            .padding(16)
             .style(move |_| cosmic::iced::widget::container::Style {
                 background: Some(cosmic::iced::Color::from_rgb8(nr, ng, nb).into()), // carbon-ok: dynamic cover-art colour, not a UI token
                 ..Default::default()
             })
-            .into(),
-            None => Space::new().height(Length::Fixed(0.0)).into(),
-        };
+            .into();
         // MUSIC-RFX-4 — the scrub bar. For a seekable (finite) track with a known
         // duration, render an interactive slider that jumps the playhead on drag
         // (RFX-2 `seek`); a live/radio stream (not seekable / unknown duration)
@@ -1577,7 +1619,7 @@ impl State {
                     |v| Message::Seek(v as u64),
                 )
                 .step(1000.0_f32)
-                .width(Length::Fixed(240.0)),
+                .width(Length::Fixed(art_dim)),
                 time_label,
             ]
             .spacing(2)
@@ -1605,32 +1647,42 @@ impl State {
         let volume_slider: Element<'_, Message> =
             cosmic::iced::widget::slider(0.0..=1.0, self.now_state.volume, Message::SetVolume)
                 .step(0.01_f32)
-                .width(Length::Fixed(200.0))
+                .width(Length::Fixed(art_dim))
                 .into();
-        let header = column![
-            row![
-                text("Now Playing").size(22).width(Length::Fill),
-                button(text("Close").size(13)).on_press(Message::ToggleMaxi),
-            ]
-            .align_y(cosmic::iced::Alignment::Center),
-            art,
-            text(title).size(28),
-            text(self.now_artist.clone()).size(16),
-            scrub,
-            volume_slider,
-            row![
-                button(text("Prev").size(13)).on_press(Message::SkipPrev),
-                button(text(play_pause).size(13)).on_press(Message::PlayPause),
-                button(text("Next").size(13)).on_press(Message::SkipNext),
-                // MUSIC-RFX-7 — add the current track to a playlist.
-                button(text("+ Playlist").size(13)).on_press_maybe(
-                    (!self.now_state.song_id.is_empty())
-                        .then(|| Message::OpenAddToPlaylist(self.now_state.song_id.clone())),
-                ),
-            ]
-            .spacing(10),
+        // MUSIC-MAXI-SCALE — a full-width top bar, then a horizontally-centered
+        // hero (art → title → artist → scrub → volume → transport) so the
+        // artwork is the focus and the view fills the window instead of crowding
+        // the top-left.
+        let top_bar = row![
+            text("Now Playing").size(22).width(Length::Fill),
+            button(text("Close").size(13)).on_press(Message::ToggleMaxi),
         ]
-        .spacing(8);
+        .align_y(cosmic::iced::Alignment::Center);
+        let hero = container(
+            column![
+                art,
+                text(title).size(32),
+                text(self.now_artist.clone()).size(18).colr(muted),
+                scrub,
+                volume_slider,
+                row![
+                    button(text("Prev").size(13)).on_press(Message::SkipPrev),
+                    button(text(play_pause).size(13)).on_press(Message::PlayPause),
+                    button(text("Next").size(13)).on_press(Message::SkipNext),
+                    // MUSIC-RFX-7 — add the current track to a playlist.
+                    button(text("+ Playlist").size(13)).on_press_maybe(
+                        (!self.now_state.song_id.is_empty())
+                            .then(|| Message::OpenAddToPlaylist(self.now_state.song_id.clone())),
+                    ),
+                ]
+                .spacing(10),
+            ]
+            .spacing(12)
+            .align_x(cosmic::iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .center_x(Length::Fill);
+        let header = column![top_bar, hero].spacing(12);
 
         // MUSIC-RFX-5 — the queue tab is now editable: per-row select / move /
         // play-next / remove, plus a "Remove selected" action. iced has no
