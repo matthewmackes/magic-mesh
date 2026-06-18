@@ -994,6 +994,11 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
     5. **Enlarge `/run` tmpfs (band-aid).** Headroom only; can't spare much RAM on a 947 MB lighthouse; delays, doesn't fix.
   **Operator-leaning plan:** #1 + #2 + the #3 quick win.
 
+## ROUTING-VALIDATE — Routing overlay-reachability never returns a result (operator bug-testing, 2026-06-18)
+- [ ] **ROUTING-VALIDATE-1: "Run validation now" requests a run but the result never comes back.**
+  **As** an operator, **I want** the Routing panel to show overlay-reachability results after a run, **so that** it isn't a permanently-empty panel ("No validation run yet" persists after clicking Run, which confirms "requested a fresh overlay-reachability run (the leader mints it)").
+  **Acceptance** (each runtime-observable): root-cause why the result never lands — the panel requests `mackesd validate run` (FPG leader mints), the `validation_suite` worker + `mesh_router` exist, so trace where it breaks: (a) does the **leader** actually run the suite + publish a result, (b) does every node report its reachability, (c) does the panel **poll/subscribe** the result and render it (it auto-requests once per AUDIT-MESH-5 but never displays). After fix: clicking Run (or opening Routing) shows the edge matrix + reachable count + any unreachable edges within a bounded window. *(Likely the same class as SVC-VIEW-1 — a per-node/leader result that isn't aggregated/surfaced; verify against the live 10-node mesh, not a single node.)*
+
 ## WB-OVERVIEW — Workbench Overview/Home accuracy + stub (operator bug-testing, 2026-06-18)
 > Operator on UNIT-EAGLE (.13): the Overview landing's summary tiles are wrong, and the **Home** nav item is a "not ready yet" placeholder.
 - [ ] **WB-OVERVIEW-1: Overview summary tiles show "—" while the data exists.**

@@ -29,6 +29,15 @@ SIP Phone status".)
   animation layer (per-item slide-in offset + blink phase; insert pushes others
   down; same-source collapse with a count).
 
+## Clipboard operational locks (survey round 1, 2026-06-18)
+| # | Decision | Lock |
+|---|----------|------|
+| O1 | Capture mechanism | **Cosmic clipboard-manager hook** (integrate the compositor's clipboard history); fall back to `wl-paste --watch` where no hook is exposed. |
+| O2 | Echo-loop prevention | **Debounce identical content** within a window (drop a copy matching a recent clip) — covers the click-to-load echo without origin-tagging. |
+| O3 | Duplicate handling | **Dedup — move the existing entry to the top** (one entry per unique text). |
+| O4 | Per-clip size cap | **No cap** — sync any text regardless of size. ⚠ Interacts with [[BUS-RUN-FULL]]: large clips inflate the bus + QNM history on small nodes — the bus retention worker (BUS-RUN-FULL-1) MUST bound this, and the QNM history stays at 50+pinned. |
+| O5 | (round 2 pending) | size-cap/clear-all-scope/origin-attribution/pin-cap/multi-user-scope still open. |
+
 ## Worklist
 - NOTIFY-HUB-1: Start-Menu-idiom restyle (Carbon, zebra, sections, light+dark).
 - NOTIFY-HUB-2: animations (slide-in + 2× severity blink + slide-down + same-source stack).
