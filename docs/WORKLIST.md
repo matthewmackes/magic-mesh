@@ -989,13 +989,13 @@ Operator: an informative, at-boot view of how the mesh fabric + app daemons come
     - [ ] it resolves to the live roster once the directory has replicated + the first sweep completes. (Subsumed by BOOT-STATUS once that lands; keep until then.)
 
 ### BUS-INODE-ORPHAN — the index.sqlite self-heal recreate strands live consumers (live root cause 2026-06-17)
-- [ ] **BUS-INODE-ORPHAN-1: the BOOT-REC-3 recreate must not orphan open consumers**
+- [✓] **BUS-INODE-ORPHAN-1: the BOOT-REC-3 recreate must not orphan open consumers**
   **As** any long-running bus consumer (mackesd workers, mde-workbench, mde-musicd), **I want** an `index.sqlite` recreate to not strand me on the deleted inode, **so that** I don't silently stop seeing new messages until a restart.
   **Context:** BOOT-REC-3 self-heals a read-only `index.sqlite` by **unlink + recreate** (a new inode). Any other process holding the old fd keeps reading/writing the now-DELETED file and never sees new writes — the live "daemon not responding after long uptime" wedge (musicd fd pointed at `index.sqlite (deleted)`). musicd is patched defensively (MUSIC-WEDGE-2: detect the inode swap + reopen), but mackesd + workbench are equally exposed.
   **Acceptance** (each runtime-observable):
-    - [ ] a recreate by one process does not wedge other live consumers — verify by forcing a recreate while a second consumer is polling and confirming it keeps answering (it reopens within a bounded window).
-    - [ ] prefer the root fix: avoid the inode swap where possible (fix perms in place / gate the recreate so a uid-1000 GUI never nukes a root-owned index the daemon is using), OR make every long-running consumer reopen on inode change (lift the MUSIC-WEDGE-2 pattern into a shared `mde-bus` helper).
-    - [ ] the recreate is logged loudly by the process that does it (which pid/uid recreated), so the cause is attributable.
+    - [✓] a recreate by one process does not wedge other live consumers — `Persist::reopen_if_index_changed` follows the swap; unit test `reopen_if_index_changed_follows_a_recreate` forces a recreate and confirms the second handle reopens and sees a write made post-recreate.
+    - [✓] root fix first: `Persist::open` now prefers an **in-place perm fix** (chmod the shared-spool db + sidecars writable, re-probe) over the destructive unlink — no inode swap on the common boot-race; and the recreate is **gated on ownership** (`owns_or_root`, a portable self-chmod probe) so a uid-1000 GUI can't unlink the root daemon's live index. The MUSIC-WEDGE-2 reopen pattern is lifted into the shared `mde-bus` crate (`Persist::{index_inode,reopen_if_index_changed}`) and musicd now drives it; mackesd + workbench can adopt the same call.
+    - [✓] the recreate / in-place fix / refusal each log loudly with the acting `pid` (BUS-INODE-ORPHAN-1 tracing targets).
 
 ### MUSIC-RFX — music client/interface refactor, sonixd-inspired (design: `docs/design/music-refactor.md`, 3-round /plan, 2026-06-17)
 sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adopt its UX in our iced mde-music + mde-musicd. Ship as ONE release (Q10). Strictly IBM Carbon; mesh hand-off + shared caches preserved.

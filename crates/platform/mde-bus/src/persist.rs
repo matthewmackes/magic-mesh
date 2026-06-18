@@ -138,6 +138,11 @@ pub enum PersistError {
 pub struct Persist {
     bus_root: PathBuf,
     conn: Connection,
+    /// BUS-INODE-ORPHAN-1 — the inode of `index.sqlite` at open time. A
+    /// background self-heal recreate (unlink + new file) changes it; a
+    /// long-running consumer detects the swap via [`Persist::reopen_if_index_changed`]
+    /// and reopens instead of being stranded on the deleted inode.
+    index_inode: Option<u64>,
 }
 
 impl Persist {
@@ -173,19 +178,89 @@ impl Persist {
         // busy_timeout, and recreating on it would delete the live DB out from
         // under everyone. So gate strictly on the ReadOnly error code.
         if matches!(Self::write_probe(&conn), Err(e) if is_readonly_err(&e)) {
-            drop(conn);
-            for suffix in ["", "-wal", "-shm"] {
-                let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
-            }
-            conn = Self::open_conn(&db_path)?;
+            // BUS-INODE-ORPHAN-1 — the index latched read-only (boot-race
+            // cross-uid create). Prefer an IN-PLACE perm fix over the destructive
+            // unlink+recreate: a recreate swaps the inode and strands every OTHER
+            // live consumer (mackesd workers, the workbench, musicd) on the
+            // now-deleted file, which is the "daemon not responding after long
+            // uptime" wedge. Chmod the shared spool's db + sidecars writable and
+            // re-probe; the latch usually clears with no swap.
             relax_db(&bus_root);
-            tracing::warn!(
-                target: "mde_bus::persist",
-                db = %db_path.display(),
-                "bus index was read-only on open (boot-race) — recreated it (BOOT-REC-3)",
-            );
+            conn = Self::open_conn(&db_path)?;
+            if matches!(Self::write_probe(&conn), Err(e) if is_readonly_err(&e)) {
+                // Still read-only. Only recreate if WE own the file (or are root):
+                // otherwise a lower-priv consumer (e.g. a uid-1000 GUI) would
+                // unlink the root daemon's live index out from under it (the
+                // shared spool dir is 0777, so the unlink would otherwise succeed
+                // and orphan the daemon). A non-owner logs loudly + carries on.
+                if owns_or_root(&db_path) {
+                    drop(conn);
+                    for suffix in ["", "-wal", "-shm"] {
+                        let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
+                    }
+                    conn = Self::open_conn(&db_path)?;
+                    relax_db(&bus_root);
+                    tracing::warn!(
+                        target: "mde_bus::persist",
+                        db = %db_path.display(),
+                        pid = std::process::id(),
+                        "bus index was read-only on open (boot-race) — recreated it (BOOT-REC-3 / BUS-INODE-ORPHAN-1; we own it)",
+                    );
+                } else {
+                    tracing::error!(
+                        target: "mde_bus::persist",
+                        db = %db_path.display(),
+                        pid = std::process::id(),
+                        "bus index is read-only and NOT owned by this process — refusing to recreate (would strand the owning daemon); fix the shared-spool perms instead",
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    target: "mde_bus::persist",
+                    db = %db_path.display(),
+                    pid = std::process::id(),
+                    "bus index was read-only on open — fixed perms in place, no inode swap (BUS-INODE-ORPHAN-1)",
+                );
+            }
         }
-        Ok(Self { bus_root, conn })
+        let index_inode = file_inode(&db_path);
+        Ok(Self {
+            bus_root,
+            conn,
+            index_inode,
+        })
+    }
+
+    /// BUS-INODE-ORPHAN-1 — the inode of the `index.sqlite` this handle has open
+    /// (captured at open / last reopen). `None` if it can't be stat'd.
+    #[must_use]
+    pub fn index_inode(&self) -> Option<u64> {
+        self.index_inode
+    }
+
+    /// BUS-INODE-ORPHAN-1 — if another process recreated `index.sqlite` (the
+    /// BOOT-REC-3 unlink + new file = a new inode), this handle is stranded on
+    /// the DELETED inode and stops seeing new writes — the "daemon not responding
+    /// after long uptime" wedge. Detect the swap (cheap stat) and reopen the
+    /// connection so a long-running consumer follows the live DB. Returns `true`
+    /// if it reopened. Lifts the MUSIC-WEDGE-2 pattern into the shared crate so
+    /// every consumer (mackesd workers, mde-workbench, mde-musicd) is covered.
+    pub fn reopen_if_index_changed(&mut self) -> bool {
+        let db_path = self.bus_root.join("index.sqlite");
+        let live = file_inode(&db_path);
+        if live.is_some() && live != self.index_inode {
+            if let Ok(conn) = Self::open_conn(&db_path) {
+                self.conn = conn;
+                self.index_inode = live;
+                tracing::warn!(
+                    target: "mde_bus::persist",
+                    db = %db_path.display(),
+                    "bus index inode changed under us — reopened the store (BUS-INODE-ORPHAN-1)",
+                );
+                return true;
+            }
+        }
+        false
     }
 
     /// Open the SQLite index with the standard busy-timeout + schema. Split out
@@ -593,6 +668,37 @@ fn relax_topic_chain(bus_root: &std::path::Path, topic: &str) {
     }
 }
 
+/// BUS-INODE-ORPHAN-1 — the inode of `path`, or `None` if it can't be stat'd.
+/// Used to detect a self-heal recreate (unlink + new file = new inode) so a live
+/// consumer can reopen rather than stay stranded on the deleted file.
+#[cfg(unix)]
+fn file_inode(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.ino())
+}
+#[cfg(not(unix))]
+fn file_inode(_path: &std::path::Path) -> Option<u64> {
+    None
+}
+
+/// BUS-INODE-ORPHAN-1 — whether this process may safely recreate `path`: true
+/// iff we own it (or are root). A self-chmod to the file's CURRENT mode succeeds
+/// only for the owner or a CAP_FOWNER (root) process — a portable ownership probe
+/// with no libc dependency. Gates the destructive recreate so a non-owner (e.g. a
+/// uid-1000 GUI) never unlinks a root-owned live index. A vanished file → true
+/// (a recreate is then safe / needed).
+#[cfg(unix)]
+fn owns_or_root(path: &std::path::Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(m) => std::fs::set_permissions(path, m.permissions()).is_ok(),
+        Err(_) => true,
+    }
+}
+#[cfg(not(unix))]
+fn owns_or_root(_path: &std::path::Path) -> bool {
+    true
+}
+
 /// Relax the sqlite index + its WAL/SHM sidecars (created lazily by sqlite) for
 /// the shared spool, so both uids can write the index.
 fn relax_db(bus_root: &std::path::Path) {
@@ -786,6 +892,46 @@ mod tests {
         // Must still accept writes after reopen (no false recreate / no latch).
         p2.write("test/b", Priority::Default, None, Some("y"))
             .unwrap();
+    }
+
+    #[test]
+    fn reopen_if_index_changed_follows_a_recreate() {
+        // BUS-INODE-ORPHAN-1 — a consumer stranded on a recreated (new-inode)
+        // index detects the swap and reopens, then sees writes made by the
+        // process that recreated it.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("bus");
+        let mut a = Persist::open(root.clone()).unwrap();
+        let first = a.index_inode();
+        assert!(first.is_some());
+        // Nothing changed yet → no reopen.
+        assert!(!a.reopen_if_index_changed());
+
+        // Another process recreates the index (unlink + fresh open = new inode).
+        let db = root.join("index.sqlite");
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+        }
+        let b = Persist::open(root.clone()).unwrap();
+
+        // `a` is now on the deleted inode; reopen detects + follows the live DB.
+        assert!(a.reopen_if_index_changed());
+        assert_ne!(a.index_inode(), first);
+        // After reopening, `a` sees a write `b` makes to the live index.
+        b.write("t/x", Priority::Default, None, Some("hi")).unwrap();
+        assert_eq!(a.list_since("t/x", None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn owns_or_root_true_for_our_own_file() {
+        // BUS-INODE-ORPHAN-1 — the ownership probe is true for a file we created
+        // (we own it), which is what gates the safe-to-recreate path.
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("mine.sqlite");
+        std::fs::write(&f, b"x").unwrap();
+        assert!(owns_or_root(&f));
+        // A missing file → true (a recreate is then safe / needed).
+        assert!(owns_or_root(&tmp.path().join("gone.sqlite")));
     }
 
     #[test]
