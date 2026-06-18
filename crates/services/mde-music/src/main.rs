@@ -186,6 +186,10 @@ struct State {
     /// AIR-11.c.3 — per-card cover-art cache (LibraryItem.id → decoded
     /// thumbnail handle), populated by the ItemsLoaded fan-out.
     art_cache: std::collections::HashMap<String, image::Handle>,
+    /// MUSIC-LOCK-FIX — ids whose cover-art fetch was already issued (so the
+    /// scroll-window loader doesn't re-fetch the same card per scroll event).
+    /// Reset when the item set changes (a new category load).
+    art_requested: std::collections::HashSet<String>,
     /// AIR-15.b — maxi-player (full-window) open flag + its queue snapshot.
     maxi_open: bool,
     queue_songs: Vec<String>,
@@ -377,6 +381,7 @@ impl State {
             grid_width: 1100.0,
             grid_scroll: prefs::load().scroll.into_iter().collect(),
             art_cache: std::collections::HashMap::new(),
+            art_requested: std::collections::HashSet::new(),
             maxi_open: false,
             queue_songs: Vec::new(),
             queue_current: 0,
@@ -429,19 +434,13 @@ impl State {
                         y: Some(y),
                     },
                 );
-                // AIR-11.c.3 — fan out per-card cover-art fetches (the AIR-7
-                // mesh cache makes re-fetches cheap; visible perf is §0.15 bench).
-                let art = Task::batch(self.items.iter().filter_map(|it| {
-                    it.art_id.clone().map(|aid| {
-                        let id = it.id.clone();
-                        Task::perform(color::fetch_cover_art(aid), move |r| {
-                            Message::ArtLoaded(
-                                id.clone(),
-                                r.ok().map(|b| image::Handle::from_bytes(b)),
-                            )
-                        })
-                    })
-                }));
+                // MUSIC-LOCK-FIX (2026-06-18) — a large library (hundreds of
+                // artists) used to fan out one cover-art fetch per card; each
+                // completion re-renders the WHOLE grid, so art loading was O(N²)
+                // re-renders and the UI locked. Now only the visible scroll window
+                // fetches art (bounded), restored to this category's saved offset.
+                self.art_requested.clear();
+                let art = self.art_window_task(y);
                 Task::batch([restore, art])
             }
             Message::ItemsFailed(e) => {
@@ -797,7 +796,8 @@ impl State {
                     sort: self.sort,
                     scroll: self.grid_scroll.clone().into_iter().collect(),
                 });
-                Task::none()
+                // MUSIC-LOCK-FIX — load cover art for the newly-visible window.
+                self.art_window_task(y)
             }
             Message::EnqueueSong(id) => Task::perform(search::enqueue(id), Message::SearchEnqueued),
             Message::SearchEnqueued(result) => {
@@ -1040,6 +1040,38 @@ impl State {
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+
+    /// MUSIC-LOCK-FIX — fetch cover art only for the grid window around scroll
+    /// offset `offset_y`, bounded so a large library can't fan out hundreds of
+    /// fetches (each of which re-renders the whole grid → the UI lock). Skips
+    /// already-cached + already-requested ids; marks the rest requested. The
+    /// row pitch (168) + column count mirror the grid in [`Self::library_view`].
+    fn art_window_task(&mut self, offset_y: f32) -> Task<Message> {
+        const ROW_PITCH: f32 = 168.0; // 160px card + 8px spacing
+        const WINDOW_ROWS: usize = 14; // ~2 screenfuls + buffer
+        let cols = ((self.grid_width + 8.0) / ROW_PITCH).floor().max(1.0) as usize;
+        let start_row = ((offset_y / ROW_PITCH).floor() as usize).saturating_sub(2);
+        let start = start_row.saturating_mul(cols);
+        let end = (start + WINDOW_ROWS * cols).min(self.items.len());
+        if start >= end {
+            return Task::none();
+        }
+        let mut tasks: Vec<Task<Message>> = Vec::new();
+        for it in &self.items[start..end] {
+            if self.art_cache.contains_key(&it.id) || self.art_requested.contains(&it.id) {
+                continue;
+            }
+            let Some(aid) = it.art_id.clone() else {
+                continue;
+            };
+            self.art_requested.insert(it.id.clone());
+            let id = it.id.clone();
+            tasks.push(Task::perform(color::fetch_cover_art(aid), move |r| {
+                Message::ArtLoaded(id.clone(), r.ok().map(|b| image::Handle::from_bytes(b)))
+            }));
+        }
+        Task::batch(tasks)
     }
 
     /// The library shell (hub + breadcrumb).
