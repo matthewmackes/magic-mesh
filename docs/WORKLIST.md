@@ -952,7 +952,7 @@ Live audit of the clone→boot→install→enroll flow on the XCP host; each bec
 
 ### BOOT-STATUS — desktop boot mesh-services status dialog (design: `docs/design/boot-status-dialog.md`, 10-Q, 2026-06-17)
 Operator: an informative, at-boot view of how the mesh fabric + app daemons come up (handshake/setup/pings), in the Workbench HOME tab. Locks in the design doc.
-- [ ] **BOOT-STATUS-1: mackesd `boot_readiness` worker — fabric steps + bus snapshot**
+- [✓] **BOOT-STATUS-1: mackesd `boot_readiness` worker — fabric steps + bus snapshot**
   **As** an operator, **I want** the daemon to probe the fabric bring-up steps in dependency order and publish one snapshot, **so that** every surface renders the same authoritative boot state (works headless).
   **Acceptance:**
     - [ ] a `boot_readiness` worker probes, in order: Nebula up/cert, overlay-IP assigned, mackesd serving, mde-bus broker bound, QNM-Shared mounted+writable, peer directory replicated; emits an ordered `{id,label,group,status,detail,blocked_by,since_ms}` list.

@@ -5292,6 +5292,24 @@ fn run_serve(
             ));
             worker_names.lock().expect("worker_names mutex").push("heartbeat".into());
         }
+        // BOOT-STATUS-1 — the boot_readiness worker: probes the fabric bring-up
+        // chain (Nebula → overlay IP → mackesd → bus → QNM mount → directory) and
+        // publishes an ordered snapshot to state/boot-readiness for the HOME
+        // boot-status dialog. All roles (headless nodes report the same chain).
+        if mackesd_core::worker_role::runs("boot_readiness", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::boot_readiness::BootReadinessWorker::new(
+                    workgroup_root.clone(),
+                    node_id.clone(),
+                    db_path.clone(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("boot_readiness".into());
+        }
         // OV-7.a (v2.6) — health reconciler. Polls each known
         // peer's QNM-Shared heartbeat.json every 5 s, applies the
         // telemetry::health_state_from_age threshold table, writes

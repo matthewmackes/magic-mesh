@@ -401,6 +401,7 @@ pub mod wol;
 // RestartPolicy::Always wraps this worker; inner respawn cooldown
 // paces clean-exit restarts. Broker + mDNS + persistence land
 // inside the binary in BUS-1.2/1.3/1.4.
+pub mod boot_readiness;
 pub mod bus_supervisor;
 // BUS-5.1 — clipboard daemon supervisor. Spawns one `mde-clipd` process
 // per Wayland session; idles when $WAYLAND_DISPLAY is unset.
