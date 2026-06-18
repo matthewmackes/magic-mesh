@@ -116,7 +116,14 @@ ProtectControlGroups=true
 LockPersonality=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
-StateDirectory=mackesd
+# LIGHTHOUSE-VARMOUNT — create the state dir WITHOUT StateDirectory=. On DO
+# droplets /var is a btrfs subvol mounted by initrd, so systemd's generator MASKS
+# var.mount; StateDirectory= then auto-adds RequiresMountsFor=/var/lib/mackesd → a
+# hard dep on the masked unit → "Failed to start: Unit var.mount is masked" (hit
+# live, broke boot-recovery on the lighthouses). An explicit mkdir creates the dir
+# (0700, same as StateDirectory) without pulling in any mount dependency, on every
+# role. The leading '-' tolerates a pre-existing dir.
+ExecStartPre=-/usr/bin/install -d -m 0700 /var/lib/mackesd
 TasksMax=4096
 MemoryAccounting=true
 

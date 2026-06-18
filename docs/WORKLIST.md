@@ -1034,7 +1034,7 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
   **Acceptance:** peer playback hand-off (`take-over`), the QNM-Shared artwork cache (MUSIC-ART-SYNC), the audio cache, and MPRIS all still work after the refactor (re-verified live).
 
 ### LIGHTHOUSE-VARMOUNT — mackesd StateDirectory dep breaks on btrfs-subvol /var (live 2026-06-17 v10.0.14 roll)
-- [ ] **LIGHTHOUSE-VARMOUNT-1: mackesd must start when var.mount is generator-masked**
+- [✓] **LIGHTHOUSE-VARMOUNT-1: mackesd must start when var.mount is generator-masked**
   **As** an operator of a DO-droplet lighthouse, **I want** mackesd to start after a (re)boot regardless of var.mount state, **so that** the node auto-recovers (boot-recovery hard requirement).
   **Context:** on the droplets /var is a btrfs subvol mounted by initrd; systemd's generator can MASK var.mount (0-byte unit). `StateDirectory=mackesd` then auto-adds `RequiresMountsFor=/var/lib/mackesd` → a hard dep on the masked var.mount → "Failed to start mackesd.service: Unit var.mount is masked." Hit live on the shadow (159) during the v10.0.14 roll; worked around with a node-local drop-in (`[Service] StateDirectory=`) on both lighthouses. The master's var.mount is currently "generated" but could mask on reboot — same latent risk.
   **Acceptance** (runtime-observable):
