@@ -966,7 +966,7 @@ Operator: an informative, at-boot view of how the mesh fabric + app daemons come
   **As** an operator, **I want** a compact readiness verdict per other mesh node, **so that** I can see "is the whole mesh up" in one place.
   **Acceptance:**
     - [ ] each node's ready/degraded/down verdict aggregated into the snapshot for the roll-up rows.
-- [ ] **BOOT-STATUS-4: Workbench HOME panel — dependency chain, streaming, ready-chip**
+- [✓] **BOOT-STATUS-4: Workbench HOME panel — dependency chain (reads state/boot-readiness)**
   **As** an operator, **I want** the HOME panel to render the dependency chain with always-on sub-steps, live, **so that** I watch the handshake happen and it collapses when healthy.
   **Acceptance:**
     - [ ] subscribes to `state/boot-readiness`, repaints sub-second as steps transition pending→ok.

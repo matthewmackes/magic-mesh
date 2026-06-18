@@ -175,12 +175,17 @@ pub struct HomeSnapshot {
     /// the last probe. False renders a top banner reminding the
     /// operator that D-Bus-sourced rows may be stale.
     pub mackesd_reachable: bool,
+    /// BOOT-STATUS-4 — `ready` from the boot_readiness snapshot.
+    pub boot_ready: bool,
+    /// BOOT-STATUS-4 — the bring-up step chain (empty = unknown/mid-boot).
+    pub boot_steps: Vec<BootStep>,
 }
 
 impl HomeSnapshot {
     /// Synchronous filesystem-only load. Cheap; no async.
     #[must_use]
     pub fn load_sync() -> Self {
+        let (boot_ready, boot_steps) = read_boot_readiness();
         Self {
             mde_version: env!("CARGO_PKG_VERSION").to_string(),
             fedora_release: read_fedora_release().unwrap_or_else(|| "44".into()),
@@ -191,6 +196,8 @@ impl HomeSnapshot {
             drift_count: None,
             capabilities: Vec::new(),
             mackesd_reachable: true,
+            boot_ready,
+            boot_steps,
         }
     }
 }
@@ -238,6 +245,82 @@ fn count_snapshots() -> Option<u32> {
         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .count();
     n.try_into().ok()
+}
+
+// ---------------------------------------------------------------------------
+// BOOT-STATUS-4 — mesh bring-up chain (reads the boot_readiness snapshot)
+// ---------------------------------------------------------------------------
+
+/// One bring-up step, decoded from the `state/boot-readiness` snapshot
+/// (BOOT-STATUS-1). `status` is `ok` / `pending` / `blocked`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootStep {
+    /// Display label (e.g. "QNM-Shared mounted").
+    pub label: String,
+    /// `ok` | `pending` | `blocked`.
+    pub status: String,
+    /// Short per-step detail (overlay IP, peer count, …).
+    pub detail: String,
+}
+
+/// Parse the `state/boot-readiness` snapshot body into `(ready, steps)`. A
+/// missing/garbage body → `(false, [])` (the section then shows "unknown").
+#[must_use]
+pub fn parse_boot_readiness(reply: &str) -> (bool, Vec<BootStep>) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(reply) else {
+        return (false, Vec::new());
+    };
+    let ready = v
+        .get("ready")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let steps = v
+        .get("steps")
+        .and_then(|s| s.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    Some(BootStep {
+                        label: s.get("label")?.as_str()?.to_string(),
+                        status: s
+                            .get("status")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("pending")
+                            .to_string(),
+                        detail: s
+                            .get("detail")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (ready, steps)
+}
+
+/// Read the latest `state/boot-readiness` snapshot off the bus. `(false, [])`
+/// when the bus/topic isn't available yet (e.g. mid-boot).
+#[must_use]
+pub fn read_boot_readiness() -> (bool, Vec<BootStep>) {
+    let Some(dir) = mde_bus::default_data_dir() else {
+        return (false, Vec::new());
+    };
+    let Ok(persist) = mde_bus::persist::Persist::open(dir) else {
+        return (false, Vec::new());
+    };
+    let topic = "state/boot-readiness";
+    let Ok(Some(latest)) = persist.latest_ulid(topic) else {
+        return (false, Vec::new());
+    };
+    persist
+        .list_since(topic, None)
+        .ok()
+        .and_then(|msgs| msgs.into_iter().rev().find(|m| m.ulid == latest))
+        .and_then(|m| m.body)
+        .map(|b| parse_boot_readiness(&b))
+        .unwrap_or((false, Vec::new()))
 }
 
 // ---------------------------------------------------------------------------
@@ -496,12 +579,56 @@ impl HomePanel {
         .spacing(8)
         .align_y(cosmic::iced::alignment::Vertical::Center);
 
+        // BOOT-STATUS-4 — the mesh bring-up chain. Collapses to a one-line
+        // "Mesh ready" when all-green; otherwise lists each step with a status
+        // glyph (✓ ok / ◷ pending / ⊘ blocked) + its detail. Hidden until the
+        // first snapshot arrives (empty = mid-boot/unknown).
+        let boot_status: Element<'_, crate::Message, Theme> = if self.snapshot.boot_steps.is_empty()
+        {
+            Space::new().height(Length::Fixed(0.0)).into()
+        } else if self.snapshot.boot_ready {
+            text("✓ Mesh ready — all fabric services up")
+                .size(TypeRole::Body.size_in(sizes))
+                .colr(palette.success.into_cosmic_color())
+                .into()
+        } else {
+            let mut col = column![text("Mesh bring-up")
+                .size(TypeRole::Heading.size_in(sizes))
+                .colr(palette.text.into_cosmic_color())]
+            .spacing(6);
+            for st in &self.snapshot.boot_steps {
+                let (glyph, color) = match st.status.as_str() {
+                    "ok" => ("✓", palette.success),
+                    "blocked" => ("⊘", palette.text_muted),
+                    _ => ("◷", palette.warning),
+                };
+                col = col.push(
+                    row![
+                        text(glyph)
+                            .size(TypeRole::Body.size_in(sizes))
+                            .colr(color.into_cosmic_color()),
+                        text(st.label.clone())
+                            .size(TypeRole::Body.size_in(sizes))
+                            .colr(palette.text.into_cosmic_color()),
+                        text(st.detail.clone())
+                            .size(TypeRole::Caption.size_in(sizes))
+                            .colr(palette.text_muted.into_cosmic_color()),
+                    ]
+                    .spacing(8)
+                    .align_y(cosmic::iced::alignment::Vertical::Center),
+                );
+            }
+            col.into()
+        };
+
         let body = column![
             title,
             Space::new().height(Length::Fixed(4.0)),
             identity,
             Space::new().height(Length::Fixed(24.0)),
             cards,
+            Space::new().height(Length::Fixed(16.0)),
+            boot_status,
             Space::new().height(Length::Fixed(24.0)),
             manage_label,
             Space::new().height(Length::Fixed(8.0)),
@@ -1930,6 +2057,25 @@ pub fn unit_name_from_path(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_boot_readiness_reads_ready_and_steps() {
+        let snap = r#"{"ok":true,"ready":false,"ts_ms":9,"steps":[
+            {"id":"nebula","label":"Nebula overlay","status":"ok","detail":"up"},
+            {"id":"qnm","label":"QNM-Shared mounted","status":"pending","detail":"not mounted"},
+            {"id":"directory","label":"Peer directory replicated","status":"blocked","detail":"0 peer(s)","blocked_by":"qnm"}
+        ]}"#;
+        let (ready, steps) = parse_boot_readiness(snap);
+        assert!(!ready);
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].label, "Nebula overlay");
+        assert_eq!(steps[0].status, "ok");
+        assert_eq!(steps[1].status, "pending");
+        assert_eq!(steps[2].detail, "0 peer(s)");
+        // ready snapshot + garbage.
+        assert!(parse_boot_readiness(r#"{"ready":true,"steps":[]}"#).0);
+        assert_eq!(parse_boot_readiness("nope"), (false, Vec::new()));
+    }
 
     #[test]
     fn snapshot_load_sync_populates_identity() {
