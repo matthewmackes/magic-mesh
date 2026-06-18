@@ -49,6 +49,86 @@ impl Queue {
         self.current = 0;
     }
 
+    /// MUSIC-RFX-1 — move the track at `from` to index `to` (clamped), keeping the
+    /// cursor on the same *playing* track. `false` if `from` is out of range.
+    pub fn move_track(&mut self, from: usize, to: usize) -> bool {
+        if from >= self.songs.len() {
+            return false;
+        }
+        let to = to.min(self.songs.len() - 1);
+        if from == to {
+            return true;
+        }
+        let el = self.songs.remove(from);
+        self.songs.insert(to, el);
+        // Cursor: if the moved track WAS current, it follows to `to`; else adjust
+        // for the removal-then-insertion around the cursor.
+        if self.current == from {
+            self.current = to;
+        } else {
+            let mut c = self.current;
+            if from < c {
+                c -= 1;
+            }
+            if to <= c {
+                c += 1;
+            }
+            self.current = c;
+        }
+        true
+    }
+
+    /// MUSIC-RFX-1 — remove the track at `idx`, keeping the cursor sensible
+    /// (shifts down if `idx` was before it; clamps if it removed the last/current).
+    /// `false` if out of range.
+    pub fn remove(&mut self, idx: usize) -> bool {
+        if idx >= self.songs.len() {
+            return false;
+        }
+        self.songs.remove(idx);
+        if idx < self.current {
+            self.current -= 1;
+        }
+        self.current = self.current.min(self.songs.len().saturating_sub(1));
+        true
+    }
+
+    /// MUSIC-RFX-1 — remove a set of indices (multi-select). De-duped + removed
+    /// high-to-low so earlier removals don't shift later ones. Returns the count
+    /// actually removed.
+    pub fn remove_many(&mut self, idxs: &[usize]) -> usize {
+        let mut v: Vec<usize> = idxs
+            .iter()
+            .copied()
+            .filter(|i| *i < self.songs.len())
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        let mut removed = 0;
+        for idx in v.into_iter().rev() {
+            if self.remove(idx) {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// MUSIC-RFX-1 — move the track at `idx` to immediately after the current one
+    /// ("Play next"). The cursor stays on the current track. `false` if `idx` is
+    /// out of range or is already the current track.
+    pub fn move_to_next(&mut self, idx: usize) -> bool {
+        if idx >= self.songs.len() || idx == self.current {
+            return false;
+        }
+        let el = self.songs.remove(idx);
+        if idx < self.current {
+            self.current -= 1;
+        }
+        let at = (self.current + 1).min(self.songs.len());
+        self.songs.insert(at, el);
+        true
+    }
+
     /// The current song-id, if any (clamps a stale cursor).
     #[must_use]
     pub fn current(&self) -> Option<&str> {
@@ -127,6 +207,54 @@ pub fn write_to(path: &Path, queue: &Queue) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn q(songs: &[&str], current: usize) -> Queue {
+        Queue {
+            songs: songs.iter().map(|s| (*s).to_string()).collect(),
+            current,
+        }
+    }
+
+    #[test]
+    fn move_track_keeps_cursor_on_playing_song() {
+        // current = c (idx 2). Move a (0) to end → cursor still on c.
+        let mut x = q(&["a", "b", "c", "d"], 2);
+        assert!(x.move_track(0, 3));
+        assert_eq!(x.songs, ["b", "c", "d", "a"]);
+        assert_eq!(x.current(), Some("c"));
+        // Moving the CURRENT track follows it.
+        let mut y = q(&["a", "b", "c"], 1);
+        assert!(y.move_track(1, 2));
+        assert_eq!(y.songs, ["a", "c", "b"]);
+        assert_eq!(y.current(), Some("b"));
+        assert!(!y.move_track(9, 0)); // out of range
+    }
+
+    #[test]
+    fn remove_and_remove_many_adjust_cursor() {
+        let mut x = q(&["a", "b", "c", "d"], 2); // on c
+        assert!(x.remove(0)); // remove a (before cursor)
+        assert_eq!(x.songs, ["b", "c", "d"]);
+        assert_eq!(x.current(), Some("c")); // cursor shifted down, still c
+                                            // remove the current → cursor lands on the next.
+        let mut y = q(&["a", "b", "c"], 1); // on b
+        assert!(y.remove(1));
+        assert_eq!(y.current(), Some("c"));
+        // multi-select removal (high+low) keeps the survivor cursor valid.
+        let mut z = q(&["a", "b", "c", "d", "e"], 4); // on e
+        assert_eq!(z.remove_many(&[0, 2, 0]), 2); // a + c (dedup)
+        assert_eq!(z.songs, ["b", "d", "e"]);
+        assert_eq!(z.current(), Some("e"));
+    }
+
+    #[test]
+    fn move_to_next_inserts_after_current() {
+        let mut x = q(&["a", "b", "c", "d"], 0); // on a
+        assert!(x.move_to_next(3)); // play d next
+        assert_eq!(x.songs, ["a", "d", "b", "c"]);
+        assert_eq!(x.current(), Some("a")); // cursor unchanged
+        assert!(!x.move_to_next(0)); // can't play-next the current
+    }
 
     #[test]
     fn enqueue_and_current() {

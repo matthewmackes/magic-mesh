@@ -34,13 +34,18 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// The queue-control verbs served on `action/music/<verb>` (synchronous
 /// — they only touch the local queue file).
-pub const ACTION_VERBS: [&str; 6] = [
+pub const ACTION_VERBS: [&str; 10] = [
     "enqueue",
     "enqueue-after",
     "clear",
     "next",
     "prev",
     "get-queue",
+    // MUSIC-RFX-1 — queue management.
+    "queue-move",
+    "queue-remove",
+    "queue-remove-many",
+    "queue-move-to-next",
 ];
 
 /// The library-browse verbs served on `action/music/<verb>`
@@ -181,8 +186,59 @@ pub fn dispatch_queue_action(verb: &str, body: &str, q: &mut Queue) -> Dispatch 
             queue_reply(q, true)
         }
         "get-queue" => queue_reply(q, false),
+        // MUSIC-RFX-1 — queue management. Indices come from the JSON body.
+        "queue-move" => {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap_or(json!({}));
+            match (
+                v.get("from").and_then(serde_json::Value::as_u64),
+                v.get("to").and_then(serde_json::Value::as_u64),
+            ) {
+                (Some(f), Some(t)) => {
+                    let ok = q.move_track(f as usize, t as usize);
+                    queue_reply(q, ok)
+                }
+                _ => error_reply("queue-move: need {from,to}"),
+            }
+        }
+        "queue-remove" => match index_from(body) {
+            Some(i) => {
+                let ok = q.remove(i);
+                queue_reply(q, ok)
+            }
+            None => error_reply("queue-remove: need {index}"),
+        },
+        "queue-remove-many" => {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap_or(json!({}));
+            let idxs: Vec<usize> = v
+                .get("indices")
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_u64().map(|n| n as usize))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let removed = q.remove_many(&idxs);
+            queue_reply(q, removed > 0)
+        }
+        "queue-move-to-next" => match index_from(body) {
+            Some(i) => {
+                let ok = q.move_to_next(i);
+                queue_reply(q, ok)
+            }
+            None => error_reply("queue-move-to-next: need {index}"),
+        },
         other => error_reply(&format!("unknown verb: {other}")),
     }
+}
+
+/// Parse a queue index from a request body: `{"index":N}` or a bare number.
+fn index_from(body: &str) -> Option<usize> {
+    let v: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    v.get("index")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| v.as_u64())
+        .map(|n| n as usize)
 }
 
 /// Reply JSON for a library-browse verb. Proxies the Airsonic REST call

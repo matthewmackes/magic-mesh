@@ -999,7 +999,7 @@ Operator: an informative, at-boot view of how the mesh fabric + app daemons come
 
 ### MUSIC-RFX — music client/interface refactor, sonixd-inspired (design: `docs/design/music-refactor.md`, 3-round /plan, 2026-06-17)
 sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adopt its UX in our iced mde-music + mde-musicd. Ship as ONE release (Q10). Strictly IBM Carbon; mesh hand-off + shared caches preserved.
-- [ ] **MUSIC-RFX-1: daemon queue model — reorder / remove / play-next**
+- [✓] **MUSIC-RFX-1: daemon queue model — reorder / remove / play-next**
   **As** a listener, **I want** to reorder and prune the play queue, **so that** I control what plays next.
   **Acceptance:** queue.rs gains move(from,to)/remove(idx)/remove_many(idxs)/move_to_next(idx) with the current-cursor kept correct; new bus verbs `queue-move`/`queue-remove`/`queue-remove-many`/`queue-move-to-next` reply ok + persist; unit tests for cursor math under each op.
 - [ ] **MUSIC-RFX-2: engine seek + `seek` transport verb**
