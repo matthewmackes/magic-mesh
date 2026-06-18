@@ -995,23 +995,23 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
   **Operator-leaning plan:** #1 + #2 + the #3 quick win.
 
 ## WORKLOAD-FLEET-3 — Instances panel never auto-loads (operator bug-testing, 2026-06-18)
-- [ ] **WORKLOAD-FLEET-3: the Instances/Compute panel sits at "Loading instances…" forever — never auto-loads on nav.**
+- [✓] **WORKLOAD-FLEET-3: the Instances/Compute panel sits at "Loading instances…" forever — never auto-loads on nav.** DONE 2026-06-18: added the `"instances"` nav-load arm (app.rs) — auto-loads on open.
   **As** an operator, **I want** the Instances panel to populate when I open it (showing at least MDE-KVM-1 on fedora), **so that** the fleet-workloads feature is actually visible.
   **Root cause (confirmed live on .13):** `app.rs`'s nav-load match wires `load()` for ~40 panels but **omits `"instances"`** — navigating to Compute never calls `ComputePanel::load()`, so it shows the initial `!loaded` "Loading instances…" state indefinitely. Pre-existing (predates WORKLOAD-FLEET-1) but it makes the shipped fleet feature look dead. Running binary is the new fleet build, `virsh` returns fast (empty), all 7 `compute-inventory.json` files (incl. `peer:fedora`=MDE-KVM-1) present + readable — the panel just never loads.
   **Fix (one line):** add `"instances" => compute_panel::ComputePanel::load(),` to the nav-load match. **Workaround now:** click **Refresh** on the panel.
   **Acceptance:** opening Instances auto-populates within a load cycle; MDE-KVM-1 shows attributed to `fedora` from .13 without clicking Refresh. *(Lesson: WORKLOAD-FLEET-1's data path was verified end-to-end but not the live panel on a peer node — add a nav-load smoke check.)*
 
 ## ROUTING-VALIDATE — Routing overlay-reachability never returns a result (operator bug-testing, 2026-06-18)
-- [ ] **ROUTING-VALIDATE-1: "Run validation now" requests a run but the result never comes back.**
+- [✓] **ROUTING-VALIDATE-1: "Run validation now" requests a run but the result never comes back.** DONE 2026-06-18: poll the verdict on a 3s cadence (bounded MAX_POLLS) after requesting a run; tests updated.
   **As** an operator, **I want** the Routing panel to show overlay-reachability results after a run, **so that** it isn't a permanently-empty panel ("No validation run yet" persists after clicking Run, which confirms "requested a fresh overlay-reachability run (the leader mints it)").
   **Acceptance** (each runtime-observable): root-cause why the result never lands — the panel requests `mackesd validate run` (FPG leader mints), the `validation_suite` worker + `mesh_router` exist, so trace where it breaks: (a) does the **leader** actually run the suite + publish a result, (b) does every node report its reachability, (c) does the panel **poll/subscribe** the result and render it (it auto-requests once per AUDIT-MESH-5 but never displays). After fix: clicking Run (or opening Routing) shows the edge matrix + reachable count + any unreachable edges within a bounded window. *(Likely the same class as SVC-VIEW-1 — a per-node/leader result that isn't aggregated/surfaced; verify against the live 10-node mesh, not a single node.)*
 
 ## WB-OVERVIEW — Workbench Overview/Home accuracy + stub (operator bug-testing, 2026-06-18)
 > Operator on UNIT-EAGLE (.13): the Overview landing's summary tiles are wrong, and the **Home** nav item is a "not ready yet" placeholder.
-- [ ] **WB-OVERVIEW-1: Overview summary tiles show "—" while the data exists.**
+- [✓] **WB-OVERVIEW-1: Overview summary tiles show "—" while the data exists.** DONE 2026-06-18: Mesh-peers tile seeds from the boot-ping roll-up; Snapshots/Drift show real 0; async probe only refines, never blanks.
   **As** an operator, **I want** the Overview tiles (Mesh peers / Snapshots / Drift events) to show real counts, **so that** the landing page is trustworthy.
   **Acceptance** (each runtime-observable): the **Mesh peers** tile shows the live peer count (the Peers list right below already renders ~10 peers from the roster — the tile reads "—"); **Snapshots** + **Drift events** show real counts or an honest "0"/"none" (not a bare "—"); **Updates pending** stays correct (showed 0 post-roll). Source the counts from the same roster/state the lower sections already use.
-- [ ] **WB-OVERVIEW-2: the "Home" panel is a stub ("Home isn't ready yet") — must hold real information (§7).**
+- [✓] **WB-OVERVIEW-2: the "Home" panel is a stub ("Home isn't ready yet") — must hold real information (§7).** DONE 2026-06-18: the "home" panel routes to home.view() (real Overview) + nav-load wired; no more stub.
   **As** an operator, **I want** the Overview ▸ Home panel to show real content, **so that** it isn't a dead placeholder (violates the no-stubs DoD, §7).
   **Acceptance:** Home renders a real dashboard (e.g. this-node identity + health, mesh readiness, peer/online counts, pending updates, quick links) sourced from live state — no "next workbench rollout" placeholder/"Back to Overview" dead-end. Decide whether Home and the Overview landing should merge (they overlap) or Home becomes the personalized this-node summary.
 
