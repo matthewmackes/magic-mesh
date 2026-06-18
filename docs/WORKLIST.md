@@ -903,7 +903,7 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
   **Acceptance:** pin/unpin persists to `<QNM-Shared>/<user>/apps-favorites.json` (Q10); the Favorites tab reflects it; the same set appears on a second node logged in as the same user; no usage/recents tracking (Q12).
 - [✓] **APPS-5: launch paths — local exec + peer remote-desktop.**
   **Acceptance:** local apps exec directly; a peer app → `action/apps/launch` → mackesd opens a remote-desktop session to that peer (Q9/Q23); peer entries show a presence/health badge but remain launchable when degraded (Q18).
-- [✓] **APPS-6: Workloads tab — inline start/stop/attach.**
+- [>] **APPS-6: Workloads tab — inline start/stop/attach.** RE-CUED 2026-06-18 (audit-gap): the "local + peer descriptors" claim is false — the aggregator reads only this node's `compute/inventory/<self>` (see [[WORKLOAD-FLEET-2]] for the fleet-fold fix). Local start/stop/attach work; the **peer** half is unbuilt.
   **Acceptance:** containers (podman) + VMs (libvirt) listed (local + peer descriptors); start/stop/attach work inline via `action/compute/*`+`action/provision/*` (Q19).
 - [✓] **APPS-7: Services tab — published mesh services.**
   **Acceptance:** published services (Jellyfin/Navidrome/web UIs/Netdata, …) from PD-2 descriptors (Q20); click opens the endpoint over the overlay.
@@ -999,9 +999,12 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
     - [ ] with `MDE-KVM-1` running on the dev host, opening the Instances panel **on .13** (a different node) shows `MDE-KVM-1` attributed to host `fedora`
     - [ ] local rows still resolve live (the local probe is not regressed); peer rows refresh as new inventory records land
     - [ ] no raw hex / scattered metrics outside `mde-theme` (§4); unit-tested aggregation (merge local probe + peer inventory, newest-per-peer, dedup by uuid)
-- [ ] **WORKLOAD-FLEET-2: re-cue APPS-6 (apps-applet Workloads tab) — verify it actually aggregates peers.**
-  **As** an operator, **I want** the Start-menu Workloads tab to show the same fleet-wide list, **so that** "all panels showing workloads" is truthful.
-  **Acceptance:** confirm whether the applet Workloads tab reads `compute/inventory/<peer>` (the APPS-6 acceptance claims "local + peer descriptors"); if it is local-only, flip APPS-6 back to `[>]` and wire it to the same aggregation as WORKLOAD-FLEET-1; `MDE-KVM-1` appears in the Workloads tab from a second node.
+- [>] **WORKLOAD-FLEET-2: apps-applet Workloads tab is LOCAL-ONLY — wire it to the fleet inventory.** CONFIRMED 2026-06-18: the apps aggregator (`mackesd::ipc::apps::read_local_inventory`) reads only `compute/inventory/<this-node>` off the local bus, so the Start-menu Workloads tab shows local workloads only — APPS-6's "local + peer descriptors" acceptance was never true (audit-gap; APPS-6 re-cued below).
+  **As** an operator, **I want** the Start-menu Workloads tab to show the same fleet-wide list as the Workbench Instances panel, **so that** "all panels showing workloads" is truthful.
+  **Acceptance** (each runtime-observable):
+    - [ ] the aggregator folds every peer's `<QNM-Shared>/<host>/compute-inventory.json` (the WORKLOAD-FLEET-1 files), attributed to each host, self-skipped + deduped (reuse the same pattern)
+    - [ ] each workload entry carries its node; `MDE-KVM-1` appears in the Workloads tab from a second node, attributed to `fedora`
+    - [ ] start/stop/attach stay gated to local workloads (remote ops are a later slice); unit-tested fleet fold in `ipc::apps`
 
 ## NOTIFY-UI — Alert Center / applet polish (operator-reported live 2026-06-16)
 - [✓] **NOTIFY-UI-1: Hub header cramped at the top.** Title "Notification Hub · N unread" collided with the Mark-all-read/Clear-all/✕ buttons (~390px panel). Restructured: title + ✕ on the top line, the bulk actions on their own line below; added 14/16px padding + spacing so nothing jams the edge.
