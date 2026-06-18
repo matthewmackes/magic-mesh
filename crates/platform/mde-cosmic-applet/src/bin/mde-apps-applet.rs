@@ -21,7 +21,7 @@ use mde_bus::hooks::config::Priority;
 use mde_cosmic_applet::{
     filter_entries, parse_entries, workload_argv, Entry, LauncherTab, WorkloadAction,
 };
-use mde_theme::{FontSize, Palette, Preferences, Rgba, TypeRole};
+use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, Preferences, Rgba, TypeRole};
 
 const ID: &str = "com.mackes.MagicMeshApps";
 
@@ -34,9 +34,12 @@ const GOLDEN_RATIO: f32 = 1.618;
 const MENU_WIDTH: f32 = 920.0;
 /// Dropdown height — the golden complement of the width (landscape φ).
 const MENU_HEIGHT: f32 = MENU_WIDTH / GOLDEN_RATIO;
-/// APPS-WIDE — Favorites icon-grid column count (Carbon tile grid). The wider
-/// 920 px body comfortably fits 6 icon tiles per row with Carbon gutters.
-const FAVORITES_COLUMNS: usize = 6;
+/// APPS-WIDE — Favorites icon-grid shape (operator 2026-06-18): exactly 3 tiles
+/// per row, capped at 9 (a 3×3 grid), mirroring the Workbench/Files/Settings
+/// quick-link tile row above.
+const FAVORITES_COLUMNS: usize = 3;
+/// Max favorites shown in the grid (3×3).
+const FAVORITES_MAX: usize = 9;
 
 /// APPS-STYLE — resolve the active palette from the user's MDE theme preference
 /// (`~/.config/mde/preferences.toml`), so the launcher honors **both dark and
@@ -44,6 +47,18 @@ const FAVORITES_COLUMNS: usize = 6;
 /// dark palette. Cheap file read; called at init + on each open.
 fn resolve_palette() -> Palette {
     Palette::for_theme(Preferences::load().theme)
+}
+
+/// APPS-WIDE — the Carbon icon (`mde_theme` icon set) for a Favorites tile,
+/// chosen by entry kind. Plain apps get the generic Apps glyph; mesh-apps /
+/// services / workloads get their scope's icon.
+fn favorite_icon(e: &Entry) -> Icon {
+    match e.kind.as_str() {
+        "mesh-app" => Icon::Fleet,
+        "service" => Icon::Network,
+        "workload" => Icon::Compute,
+        _ => Icon::Apps,
+    }
 }
 
 struct AppsApplet {
@@ -776,13 +791,17 @@ impl AppsApplet {
         }
     }
 
-    /// APPS-WIDE — the Favorites tab rendered as a Carbon icon grid: rows of
-    /// [`FAVORITES_COLUMNS`] square icon tiles (icon over name), evenly spaced
-    /// with Carbon gutters. The last partial row is padded so tiles keep a
-    /// uniform width.
+    /// APPS-WIDE — the Favorites tab as a Carbon icon grid: 3 tiles per row,
+    /// capped at [`FAVORITES_MAX`] (a 3×3 grid), mirroring the Workbench/Files/
+    /// Settings quick-link row (`tile` in [`Self::dropdown`]) — same icon-over-
+    /// label tiles, `Button::Standard`, equal-width, `spacing(1)`. The last
+    /// partial row is padded so tiles keep a uniform width.
     fn favorites_grid(&self, shown: &[&Entry]) -> Element<'static, Message> {
         use cosmic::widget::{column, row, Space};
         let rows: Vec<Element<Message>> = shown
+            .iter()
+            .take(FAVORITES_MAX)
+            .collect::<Vec<_>>()
             .chunks(FAVORITES_COLUMNS)
             .map(|chunk| {
                 let mut tiles: Vec<Element<Message>> =
@@ -790,68 +809,52 @@ impl AppsApplet {
                 while tiles.len() < FAVORITES_COLUMNS {
                     tiles.push(Space::new().width(Length::FillPortion(1)).into());
                 }
-                row(tiles).spacing(12).width(Length::Fill).into()
+                row(tiles).spacing(1).width(Length::Fill).into()
             })
             .collect();
-        column(rows)
-            .spacing(12)
-            .padding([4, 0])
-            .width(Length::Fill)
-            .into()
+        column(rows).spacing(1).padding([4, 0]).width(Length::Fill).into()
     }
 
-    /// APPS-WIDE — one Favorites grid tile: a square Carbon icon tile (letter
-    /// avatar on a raised layer) over a centred, truncated name. The whole tile
-    /// presses through to [`Self::entry_primary_msg`]. Owns its strings so the
-    /// tile is `'static` (mixes freely with the borrowed row list).
+    /// APPS-WIDE — one Favorites tile, mirroring the quick-link tiles: a Carbon
+    /// icon (`mde_theme` icon set) over a centred, truncated name in a
+    /// `Button::Standard`, equal-width. Whole-tile press launches the app/mesh-
+    /// app (else selects). Owns its strings so the tile is `'static`.
     fn favorite_tile(&self, e: &Entry) -> Element<'static, Message> {
-        use cosmic::widget::{button, column, container, text};
+        use cosmic::widget::{button, column, text};
         let p = self.palette;
         let sizes = FontSize::defaults();
         let cap_sz = TypeRole::Caption.size_in(sizes);
-        let letter = e
-            .name
-            .chars()
-            .next()
-            .map_or_else(String::new, |c| c.to_uppercase().to_string());
-        let icon_bg = p.raised;
-        let icon = container(
-            text(letter)
-                .size(TypeRole::Display.size_in(sizes))
-                .class(cosmic::theme::Text::Color(carbon(p.text))),
-        )
-        .center_x(Length::Fixed(64.0))
-        .center_y(Length::Fixed(64.0))
-        .style(move |_| cosmic::iced::widget::container::Style {
-            background: Some(carbon(icon_bg).into()),
-            border: cosmic::iced::Border {
-                radius: 8.0.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
+        // Carbon icon by entry kind (the mde_theme Carbon icon set), rendered as
+        // its glyph — mirroring the quick-link tiles above (which also draw a
+        // glyph over a label), not a letter avatar.
+        let icon_glyph = mde_icon(favorite_icon(e), IconSize::Nav).fallback_glyph;
+        let icon_widget: Element<'static, Message> = text(icon_glyph)
+            .size(20)
+            .class(cosmic::theme::Text::Color(carbon(p.text)))
+            .into();
         // Truncate long names so tiles stay aligned.
         let name = if e.name.chars().count() > 14 {
             format!("{}…", e.name.chars().take(13).collect::<String>())
         } else {
             e.name.clone()
         };
-        let tile = column(vec![
-            icon.into(),
-            text(name)
-                .size(cap_sz)
-                .center()
-                .class(cosmic::theme::Text::Color(carbon(p.text)))
-                .into(),
-        ])
-        .spacing(6)
-        .align_x(cosmic::iced::Alignment::Center)
-        .width(Length::Fill);
-        button::custom(tile)
-            .on_press(Self::entry_primary_msg(e))
-            .class(cosmic::theme::Button::Text)
-            .width(Length::FillPortion(1))
-            .into()
+        button::custom(
+            column(vec![
+                icon_widget,
+                text(name)
+                    .size(cap_sz)
+                    .center()
+                    .class(cosmic::theme::Text::Color(carbon(p.text)))
+                    .into(),
+            ])
+            .spacing(6)
+            .align_x(cosmic::iced::Alignment::Center)
+            .width(Length::Fill),
+        )
+        .on_press(Self::entry_primary_msg(e))
+        .width(Length::Fill)
+        .class(cosmic::theme::Button::Standard)
+        .into()
     }
 
     /// APPS-STYLE-2 — one result row: letter avatar + accent-blue title + mono
