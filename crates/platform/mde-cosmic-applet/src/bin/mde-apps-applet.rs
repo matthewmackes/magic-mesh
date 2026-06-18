@@ -63,6 +63,8 @@ enum Message {
     Search(String),
     /// Launch a local app by its exec line (Q23).
     LaunchLocal(String),
+    /// Open a remote-desktop session to a mesh peer by hostname (APPS-5).
+    LaunchMesh(String),
     /// Re-fetch the entry list.
     Refresh,
 }
@@ -150,6 +152,35 @@ async fn set_favorite(id: String, pinned: bool) -> HashSet<String> {
     })
     .await
     .unwrap_or_default()
+}
+
+/// Open a remote-desktop session to a peer (APPS-5): ask mackesd to resolve the
+/// peer's `{protocol, target}` from the PD-2 directory, then shell the local RD
+/// client `remmina -c <protocol>://<target>` (the same tool the Workbench Remote
+/// Desktop panel uses). Detached via `setsid --fork` (no zombie). Resolution +
+/// the client run locally — the RD window is on this display.
+async fn launch_mesh(node: String) {
+    tokio::task::spawn_blocking(move || {
+        let body = serde_json::json!({ "node": node }).to_string();
+        let Ok(reply) = bus_request("launch", Some(&body)) else {
+            return;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&reply) else {
+            return;
+        };
+        if v.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            return;
+        }
+        let protocol = v.get("protocol").and_then(|p| p.as_str()).unwrap_or("rdp");
+        let Some(target) = v.get("target").and_then(|t| t.as_str()) else {
+            return;
+        };
+        let _ = std::process::Command::new("setsid")
+            .args(["--fork", "remmina", "-c", &format!("{protocol}://{target}")])
+            .status();
+    })
+    .await
+    .ok();
 }
 
 /// The `Task` that loads entries + disk usage + favorites, mapped into messages.
@@ -301,6 +332,21 @@ impl Application for AppsApplet {
                         cosmic::app::Action::Surface(destroy_popup(id)),
                     ));
                 }
+            }
+            Message::LaunchMesh(node) => {
+                // Close the dropdown + open the remote-desktop session (APPS-5).
+                let close = self.popup.take().map(|id| {
+                    cosmic::task::message(cosmic::Action::Cosmic(cosmic::app::Action::Surface(
+                        destroy_popup(id),
+                    )))
+                });
+                let launch = Task::perform(launch_mesh(node), |()| {
+                    cosmic::Action::App(Message::Refresh)
+                });
+                return match close {
+                    Some(c) => Task::batch([c, launch]),
+                    None => launch,
+                };
             }
             Message::Refresh => return load_task(),
         }
@@ -460,10 +506,15 @@ impl AppsApplet {
         let launch = button::custom(body)
             .width(Length::Fill)
             .class(cosmic::theme::Button::Text);
-        let launch = if e.kind == "app" && !e.exec.is_empty() {
-            launch.on_press(Message::LaunchLocal(e.exec.clone()))
-        } else {
-            launch
+        let launch = match e.kind.as_str() {
+            // Local apps exec directly (Q23); mesh peers open a remote-desktop
+            // session (APPS-5) — launchable even when degraded (Q18). Workload +
+            // service launch land in APPS-6/7.
+            "app" if !e.exec.is_empty() => launch.on_press(Message::LaunchLocal(e.exec.clone())),
+            "mesh-app" if !e.node.is_empty() => {
+                launch.on_press(Message::LaunchMesh(e.node.clone()))
+            }
+            _ => launch,
         };
         row(vec![star.into(), launch.into()]).spacing(4).into()
     }

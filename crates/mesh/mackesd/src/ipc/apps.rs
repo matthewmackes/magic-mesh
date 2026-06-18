@@ -412,7 +412,7 @@ impl AppsService {
 }
 
 /// Action verbs served on `action/apps/<verb>`.
-pub const ACTION_VERBS: [&str; 3] = ["list", "favorites", "set-favorite"];
+pub const ACTION_VERBS: [&str; 4] = ["list", "favorites", "set-favorite", "launch"];
 
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -469,8 +469,62 @@ where
                 json!({ "ok": true, "favorites": favs }).to_string()
             }
         }
+        // APPS-5 — resolve a peer's remote-desktop connection target from the
+        // PD-2 directory (Q9/Q23/Q24: the thin applet asks; mackesd resolves). The
+        // applet then spawns the local RD client to `protocol://target`.
+        "launch" => {
+            let node = body
+                .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                .and_then(|v| v.get("node").and_then(|n| n.as_str()).map(str::to_string))
+                .unwrap_or_default();
+            match resolve_launch(&dir_doc(), &node) {
+                Some((protocol, target)) => {
+                    json!({ "ok": true, "protocol": protocol, "target": target }).to_string()
+                }
+                None => json!({
+                    "ok": false,
+                    "error": format!("no reachable remote-desktop target for peer '{node}'")
+                })
+                .to_string(),
+            }
+        }
         other => json!({ "ok": false, "error": format!("unknown apps verb: {other}") }).to_string(),
     }
+}
+
+/// Resolve a peer's remote-desktop `(protocol, target)` from the PD-2 directory
+/// (APPS-5). Prefers the peer's advertised remote-access descriptor; falls back to
+/// RDP at the peer's overlay IP. `None` when the peer/overlay isn't known.
+#[must_use]
+pub fn resolve_launch(dir: &serde_json::Value, node: &str) -> Option<(String, String)> {
+    let peers = dir.get("peers").and_then(|p| p.as_array())?;
+    let peer = peers.iter().find(|p| {
+        p.get("hostname")
+            .or_else(|| p.get("name"))
+            .and_then(|v| v.as_str())
+            == Some(node)
+    })?;
+    // An explicit remote-access descriptor wins (protocol + host/port).
+    if let Some(ra) = peer.get("descriptors").and_then(|d| d.get("remote_access")) {
+        if let Some(host) = ra.get("host").and_then(|h| h.as_str()) {
+            let proto = ra
+                .get("protocol")
+                .and_then(|p| p.as_str())
+                .unwrap_or("rdp")
+                .to_string();
+            let target = match ra.get("port").and_then(serde_json::Value::as_u64) {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_string(),
+            };
+            return Some((proto, target));
+        }
+    }
+    // Fallback: RDP to the overlay IP.
+    let overlay = peer.get("overlay_ip").and_then(|v| v.as_str())?;
+    if overlay.is_empty() {
+        return None;
+    }
+    Some(("rdp".to_string(), overlay.to_string()))
 }
 
 /// Read this node's latest published compute inventory (`compute/inventory/<node>`)
@@ -684,6 +738,29 @@ mod tests {
         assert_eq!(vm.kind, "workload");
         let ct = e.iter().find(|x| x.source == "podman").unwrap();
         assert_eq!(ct.name, "nginx");
+    }
+
+    #[test]
+    fn resolve_launch_prefers_descriptor_then_overlay() {
+        let dir = json!({"peers": [
+            {"hostname": "plain", "overlay_ip": "10.42.0.3"},
+            {"hostname": "rich", "overlay_ip": "10.42.0.4",
+             "descriptors": {"remote_access": {"protocol": "vnc", "host": "10.42.0.4", "port": 5900}}},
+            {"hostname": "noip", "overlay_ip": ""}
+        ]});
+        // Fallback: RDP to the overlay IP.
+        assert_eq!(
+            resolve_launch(&dir, "plain"),
+            Some(("rdp".into(), "10.42.0.3".into()))
+        );
+        // Descriptor wins (protocol + host:port).
+        assert_eq!(
+            resolve_launch(&dir, "rich"),
+            Some(("vnc".into(), "10.42.0.4:5900".into()))
+        );
+        // No overlay / unknown peer → None.
+        assert_eq!(resolve_launch(&dir, "noip"), None);
+        assert_eq!(resolve_launch(&dir, "ghost"), None);
     }
 
     #[test]
