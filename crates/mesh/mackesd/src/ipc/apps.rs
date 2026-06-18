@@ -298,6 +298,41 @@ pub fn workload_entries_from_inventory(inv: &serde_json::Value, node: &str) -> V
     out
 }
 
+/// WORKLOAD-FLEET-2 — fold EVERY peer's compute inventory off the replicated
+/// QNM-Shared plane (`<root>/<host>/compute-inventory.json`, written by each
+/// node's `compute_registry`) into workload entries attributed to that host, so
+/// the Start-menu Workloads tab shows fleet-wide VMs/containers, not just local.
+/// Empty when the share isn't mounted (caller falls back to the local doc).
+#[must_use]
+pub fn fleet_workload_entries() -> Vec<AppEntry> {
+    fleet_workload_entries_in(&crate::default_qnm_shared_root())
+}
+
+/// Pure variant (unit-tested): read every `<root>/<host>/compute-inventory.json`.
+#[must_use]
+pub fn fleet_workload_entries_in(root: &std::path::Path) -> Vec<AppEntry> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for ent in entries.flatten() {
+        let path = ent.path().join("compute-inventory.json");
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(inv) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        let node = inv
+            .get("hostname")
+            .and_then(|h| h.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.extend(workload_entries_from_inventory(&inv, &node));
+    }
+    out
+}
+
 // ───────────────────────── assembly + responder ─────────────────────────
 
 /// Merge all sources into the `action/apps/list` reply, with per-kind counts.
@@ -443,7 +478,12 @@ where
         "list" => {
             let local = scan_local_apps(&default_app_dirs(&svc.home));
             let mesh = mesh_entries_from_directory(&dir_doc(), &svc.node_id);
-            let workloads = workload_entries_from_inventory(&inv_doc(), &svc.node_id);
+            // WORKLOAD-FLEET-2 — fleet-wide workloads from the replicated plane;
+            // fall back to this node's own bus inventory when the share is absent.
+            let mut workloads = fleet_workload_entries();
+            if workloads.is_empty() {
+                workloads = workload_entries_from_inventory(&inv_doc(), &svc.node_id);
+            }
             build_list(local, mesh, workloads)
         }
         // APPS-4 — per-user favorites on QNM-Shared (Q10).
@@ -738,6 +778,33 @@ mod tests {
         assert_eq!(vm.kind, "workload");
         let ct = e.iter().find(|x| x.source == "podman").unwrap();
         assert_eq!(ct.name, "nginx");
+    }
+
+    #[test]
+    fn fleet_workload_entries_unions_every_peer_attributed_by_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (host, vm) in [("fedora", "MDE-KVM-1"), ("node-13", "web1")] {
+            let d = tmp.path().join(host);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("compute-inventory.json"),
+                json!({"hostname": host, "vms": [{"id": format!("{host}-uuid"), "name": vm, "state": "running"}], "containers": []}).to_string(),
+            )
+            .unwrap();
+        }
+        // A non-inventory dir + file must be tolerated.
+        std::fs::create_dir_all(tmp.path().join("peers")).unwrap();
+        let e = fleet_workload_entries_in(tmp.path());
+        assert_eq!(e.len(), 2, "one workload per peer file");
+        let f = e.iter().find(|x| x.name == "MDE-KVM-1").unwrap();
+        assert_eq!(f.node, "fedora");
+        assert_eq!(f.kind, "workload");
+        assert!(e.iter().any(|x| x.name == "web1" && x.node == "node-13"));
+    }
+
+    #[test]
+    fn fleet_workload_entries_empty_when_no_root() {
+        assert!(fleet_workload_entries_in(std::path::Path::new("/nonexistent-xyz")).is_empty());
     }
 
     #[test]
