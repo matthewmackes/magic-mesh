@@ -47,8 +47,13 @@ struct AppsApplet {
     favorites: HashSet<String>,
     /// QNM-Shared (used, total) bytes for the header (Q8); None = unavailable.
     qnm: Option<(u64, u64)>,
-    /// Entry id whose right-click context strip is open (APPS-8).
-    open_menu: Option<String>,
+    /// APPS-STYLE-2 — the entry id whose inline detail panel is expanded (click
+    /// a row to toggle). Replaces the old right-click context strip.
+    selected: Option<String>,
+    /// APPS-STYLE-2 — transient feedback line at the bottom (pin/unpin, power…).
+    toast: Option<String>,
+    /// APPS-STYLE-2 — whether the footer power menu is open.
+    power_open: bool,
     /// Last load error, shown in the dropdown's empty state.
     error: Option<String>,
     /// APPS-STYLE — the active Carbon palette (dark/light, from the user's MDE
@@ -84,12 +89,53 @@ enum Message {
     Workload(String, String, WorkloadAction),
     /// Open a published mesh service's endpoint over the overlay (APPS-7).
     OpenService(String),
-    /// Right-click an entry → toggle its context action strip (APPS-8).
-    EntryMenu(String),
-    /// Uninstall a flatpak app by its app id (APPS-8).
-    Uninstall(String),
+    /// APPS-STYLE-2 — click a row to toggle its inline detail panel.
+    SelectEntry(String),
+    /// APPS-STYLE-2 — open an app's desktop on a specific mesh host (RD chip).
+    OpenOnHost(String),
+    /// APPS-STYLE-2 — dismiss the toast.
+    DismissToast,
+    /// APPS-STYLE-2 — toggle the footer power menu.
+    TogglePower,
+    /// APPS-STYLE-2 — run a power/session action.
+    Power(PowerKind),
     /// Re-fetch the entry list.
     Refresh,
+}
+
+/// APPS-STYLE-2 — the footer power-menu actions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PowerKind {
+    Lock,
+    Logout,
+    Suspend,
+    Restart,
+    Shutdown,
+}
+
+impl PowerKind {
+    /// Menu label.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Lock => "Lock",
+            Self::Logout => "Log out",
+            Self::Suspend => "Suspend",
+            Self::Restart => "Restart",
+            Self::Shutdown => "Shut down",
+        }
+    }
+
+    /// The detached command (argv) that performs it.
+    fn argv(self) -> Vec<String> {
+        let s = |v: &str| v.to_string();
+        match self {
+            Self::Lock => vec![s("loginctl"), s("lock-session")],
+            Self::Logout => vec![s("loginctl"), s("terminate-user"), current_user()],
+            Self::Suspend => vec![s("systemctl"), s("suspend")],
+            Self::Restart => vec![s("systemctl"), s("reboot")],
+            Self::Shutdown => vec![s("systemctl"), s("poweroff")],
+        }
+    }
 }
 
 /// QNM-Shared mount the header reports on (Q8).
@@ -272,7 +318,9 @@ impl Application for AppsApplet {
                 query: String::new(),
                 favorites: HashSet::new(),
                 qnm: None,
-                open_menu: None,
+                selected: None,
+                toast: None,
+                power_open: false,
                 error: None,
                 palette: resolve_palette(),
             },
@@ -339,6 +387,15 @@ impl Application for AppsApplet {
             }
             Message::ToggleFavorite(id) => {
                 let pinned = !self.favorites.contains(&id);
+                let name = self
+                    .entries
+                    .iter()
+                    .find(|e| e.id == id)
+                    .map_or_else(|| id.clone(), |e| e.name.clone());
+                self.toast = Some(format!(
+                    "{} {name}",
+                    if pinned { "Pinned" } else { "Unpinned" }
+                ));
                 return Task::perform(set_favorite(id, pinned), |favs| {
                     cosmic::Action::App(Message::FavoritesChanged(favs))
                 });
@@ -407,21 +464,32 @@ impl Application for AppsApplet {
                     ));
                 }
             }
-            Message::EntryMenu(id) => {
-                // Toggle the right-click context strip for this entry (APPS-8).
-                self.open_menu = if self.open_menu.as_deref() == Some(&id) {
+            Message::SelectEntry(id) => {
+                // APPS-STYLE-2 — toggle the inline detail for this row.
+                self.power_open = false;
+                self.selected = if self.selected.as_deref() == Some(&id) {
                     None
                 } else {
                     Some(id)
                 };
             }
-            Message::Uninstall(id) => {
-                // Flatpak apps uninstall by app id (the .desktop id). Detached.
+            Message::OpenOnHost(host) => {
+                // APPS-STYLE-2 — open a remote-desktop session to the host (the
+                // detail's host chips); the menu stays open + a toast confirms.
+                self.toast = Some(format!("Opening desktop on {host}…"));
+                return Task::perform(launch_mesh(host), |()| {
+                    cosmic::Action::App(Message::Refresh)
+                });
+            }
+            Message::DismissToast => self.toast = None,
+            Message::TogglePower => self.power_open = !self.power_open,
+            Message::Power(kind) => {
                 let _ = std::process::Command::new("setsid")
-                    .args(["--fork", "flatpak", "uninstall", "--user", "-y", &id])
+                    .arg("--fork")
+                    .args(kind.argv())
                     .status();
-                self.open_menu = None;
-                return load_task();
+                self.power_open = false;
+                self.toast = Some(format!("{}…", kind.label()));
             }
             Message::Refresh => return load_task(),
         }
@@ -456,79 +524,192 @@ impl Application for AppsApplet {
 }
 
 impl AppsApplet {
-    /// Render the dropdown body: tab row → search → filtered entry list.
+    /// APPS-STYLE-2 — the redesigned Start Menu (design: `docs/design/start-menu-redesign.md`).
+    /// Header (title + QNM-Shared usage bar) → quick-link tiles → underline tabs →
+    /// search → result rows (zebra + selected blue-accent, click-to-expand detail)
+    /// → toast → operator/power footer. 460×720, all Carbon tokens (light + dark).
     fn dropdown(&self) -> Element<'_, Message> {
-        use cosmic::widget::{button, column, row, scrollable, text, text_input};
+        use cosmic::widget::{button, column, row, scrollable, text, text_input, Space};
         let p = self.palette;
         let sizes = FontSize::defaults();
         let body_sz = TypeRole::Body.size_in(sizes);
         let cap_sz = TypeRole::Caption.size_in(sizes);
+        let mono = cosmic::iced::Font::MONOSPACE;
 
-        // APPS-3 header: live QNM-Shared usage (Q8) + quick links (Q4). The links
-        // launch detached, like any local app.
-        let disk = text(mde_cosmic_applet::qnm_usage_label(self.qnm))
-            .size(cap_sz)
-            .class(cosmic::theme::Text::Color(carbon(p.text_muted)));
-        let quick = |label: &'static str, exec: &'static str| -> Element<Message> {
-            button::custom(text(label).size(cap_sz))
-                .on_press(Message::LaunchLocal(exec.to_string()))
-                .class(cosmic::theme::Button::Text)
-                .into()
-        };
-        let links = row(vec![
-            quick("Workbench", "mde-workbench"),
-            quick("Files", "mde-files"),
-            quick("Settings", "cosmic-settings"),
+        // ── Header: grid glyph + title, then the QNM-Shared usage line + bar. ──
+        let title_row = row(vec![
+            text("\u{25A6}\u{FE0E}")
+                .size(18)
+                .class(cosmic::theme::Text::Color(carbon(p.accent)))
+                .into(),
+            text("Applications")
+                .size(TypeRole::Heading.size_in(sizes))
+                .class(cosmic::theme::Text::Color(carbon(p.text)))
+                .into(),
         ])
-        .spacing(4);
-        // APPS-MOUSE-FIX — title in the dropdown (replaces the removed hover
-        // tooltip), so the surface still names itself without any mouseover popup.
-        let title = text("Applications")
-            .size(body_sz)
-            .class(cosmic::theme::Text::Color(carbon(p.text)));
-        let header = column(vec![title.into(), disk.into(), links.into()]).spacing(2);
+        .spacing(10)
+        .align_y(cosmic::iced::Alignment::Center);
+        let (used, total) = self.qnm.unwrap_or((0, 0));
+        let frac = if total > 0 {
+            (used as f64 / total as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let used_pp = ((frac * 1000.0) as u16).max(1);
+        let rest_pp = 1000u16.saturating_sub(used_pp).max(1);
+        let usage_line = row(vec![
+            text("QNM-Shared")
+                .size(cap_sz)
+                .font(mono)
+                .class(cosmic::theme::Text::Color(carbon(p.text_muted)))
+                .into(),
+            Space::new().width(Length::Fill).into(),
+            text(mde_cosmic_applet::qnm_usage_label(self.qnm))
+                .size(cap_sz)
+                .font(mono)
+                .class(cosmic::theme::Text::Color(carbon(p.text)))
+                .into(),
+        ]);
+        let fill_c = p.success;
+        let track_c = p.overlay;
+        let bar = row(vec![
+            cosmic::iced::widget::container(Space::new())
+                .width(Length::FillPortion(used_pp))
+                .height(Length::Fixed(4.0))
+                .style(move |_| cosmic::iced::widget::container::Style {
+                    background: Some(carbon(fill_c).into()),
+                    ..Default::default()
+                })
+                .into(),
+            cosmic::iced::widget::container(Space::new())
+                .width(Length::FillPortion(rest_pp))
+                .height(Length::Fixed(4.0))
+                .style(move |_| cosmic::iced::widget::container::Style {
+                    background: Some(carbon(track_c).into()),
+                    ..Default::default()
+                })
+                .into(),
+        ]);
+        let header = column(vec![title_row.into(), usage_line.into(), bar.into()]).spacing(8);
 
-        // Tab row (Favorites first — Q6). The active tab is accented.
+        // ── Quick-link tiles: glyph over label (Workbench / Files / Settings). ──
+        let tile =
+            |glyph: &'static str, label: &'static str, exec: &'static str| -> Element<Message> {
+                button::custom(
+                    column(vec![
+                        text(glyph)
+                            .size(18)
+                            .class(cosmic::theme::Text::Color(carbon(p.text)))
+                            .into(),
+                        text(label)
+                            .size(cap_sz)
+                            .class(cosmic::theme::Text::Color(carbon(p.text_muted)))
+                            .into(),
+                    ])
+                    .spacing(6)
+                    .align_x(cosmic::iced::Alignment::Center)
+                    .width(Length::Fill),
+                )
+                .on_press(Message::LaunchLocal(exec.to_string()))
+                .width(Length::Fill)
+                .class(cosmic::theme::Button::Standard)
+                .into()
+            };
+        let links = row(vec![
+            tile("\u{2317}\u{FE0E}", "Workbench", "mde-workbench"),
+            tile("\u{1F5C0}\u{FE0E}", "Files", "mde-files"),
+            tile("\u{2699}\u{FE0E}", "Settings", "cosmic-settings"),
+        ])
+        .spacing(1);
+
+        // ── Underline tabs (active = accent text + accent underline bar). ──
         let tabs: Vec<Element<Message>> = LauncherTab::all()
             .into_iter()
             .map(|t| {
                 let active = t == self.tab && self.query.trim().is_empty();
-                let lbl = text(t.label())
-                    .size(body_sz)
-                    .class(cosmic::theme::Text::Color(carbon(if active {
-                        p.accent
-                    } else {
-                        p.text_muted
-                    })));
-                button::custom(lbl)
+                let underline = if active { p.accent } else { p.overlay };
+                column(vec![
+                    button::custom(text(t.label()).size(body_sz).class(
+                        cosmic::theme::Text::Color(carbon(if active {
+                            p.text
+                        } else {
+                            p.text_muted
+                        })),
+                    ))
                     .on_press(Message::SetTab(t))
-                    .class(if active {
-                        cosmic::theme::Button::Suggested
-                    } else {
-                        cosmic::theme::Button::Text
-                    })
-                    .into()
+                    .class(cosmic::theme::Button::Text)
+                    .into(),
+                    cosmic::iced::widget::container(Space::new())
+                        .height(Length::Fixed(2.0))
+                        .width(Length::Fill)
+                        .style(move |_| cosmic::iced::widget::container::Style {
+                            background: Some(carbon(underline).into()),
+                            ..Default::default()
+                        })
+                        .into(),
+                ])
+                .spacing(4)
+                .into()
             })
             .collect();
 
-        let search = text_input("Search apps, mesh, services…", &self.query)
-            .on_input(Message::Search)
-            .width(Length::Fill);
-
-        // Filtered entries for the active tab (or the cross-tab search).
-        let shown = filter_entries(&self.entries, self.tab, &self.query, &self.favorites);
-        let list: Vec<Element<Message>> = if shown.is_empty() {
-            let msg = if let Some(e) = &self.error {
-                format!("Couldn't reach the apps service: {e}")
-            } else if self.tab == LauncherTab::Favorites && self.query.trim().is_empty() {
-                "No favorites yet — pin apps to see them here.".to_string()
-            } else {
-                "Nothing here.".to_string()
-            };
-            vec![text(msg)
+        // ── Search (leading magnifier + clear when non-empty). ──
+        let mut search_row = vec![
+            text("\u{1F50D}\u{FE0E}")
                 .size(cap_sz)
                 .class(cosmic::theme::Text::Color(carbon(p.text_muted)))
-                .into()]
+                .into(),
+            text_input("Search apps, mesh, services…", &self.query)
+                .on_input(Message::Search)
+                .width(Length::Fill)
+                .into(),
+        ];
+        if !self.query.is_empty() {
+            search_row.push(
+                button::custom(text("\u{2715}").size(cap_sz))
+                    .on_press(Message::Search(String::new()))
+                    .class(cosmic::theme::Button::Text)
+                    .into(),
+            );
+        }
+        let search = row(search_row)
+            .spacing(8)
+            .align_y(cosmic::iced::Alignment::Center);
+
+        // ── Result rows (or an empty state). ──
+        let shown = filter_entries(&self.entries, self.tab, &self.query, &self.favorites);
+        let list: Vec<Element<Message>> = if shown.is_empty() {
+            let (t_msg, sub) = if let Some(e) = &self.error {
+                ("Couldn't reach the apps service".to_string(), e.clone())
+            } else if self.tab == LauncherTab::Favorites && self.query.trim().is_empty() {
+                (
+                    "No favorites yet".to_string(),
+                    "Pin apps from any tab to see them here.".to_string(),
+                )
+            } else {
+                (
+                    "Nothing here".to_string(),
+                    "Try a different tab or search term.".to_string(),
+                )
+            };
+            vec![cosmic::iced::widget::container(
+                column(vec![
+                    text(t_msg)
+                        .size(body_sz)
+                        .class(cosmic::theme::Text::Color(carbon(p.text_muted)))
+                        .into(),
+                    text(sub)
+                        .size(cap_sz)
+                        .class(cosmic::theme::Text::Color(carbon(p.text_muted)))
+                        .into(),
+                ])
+                .spacing(6)
+                .align_x(cosmic::iced::Alignment::Center),
+            )
+            .padding(40)
+            .width(Length::Fill)
+            .center_x(Length::Fill)
+            .into()]
         } else {
             shown
                 .into_iter()
@@ -537,176 +718,382 @@ impl AppsApplet {
                 .collect()
         };
 
-        column(vec![
+        // ── Assemble: header → links → tabs → search → list (flex) → toast → footer. ──
+        let mut col = column(vec![
             header.into(),
-            row(tabs).spacing(4).into(),
+            links.into(),
+            row(tabs).spacing(0).into(),
             search.into(),
-            // APPS-STYLE — contiguous zebra rows (spacing 0); the list is 50%
-            // wider (340→510) and the scroll area 25% taller (420→525).
             scrollable(column(list).spacing(0).width(Length::Fill))
-                .height(Length::Fixed(525.0))
+                .height(Length::Fill)
                 .into(),
         ])
-        .spacing(8)
-        .width(Length::Fixed(510.0))
-        .into()
+        .spacing(10);
+        if let Some(t) = &self.toast {
+            col = col.push(self.toast_bar(t));
+        }
+        col = col.push(self.footer());
+
+        cosmic::iced::widget::container(col)
+            .padding(12)
+            .width(Length::Fixed(460.0))
+            .height(Length::Fixed(720.0))
+            .into()
     }
 
-    /// One entry row (APPS-STYLE — Music-app idiom): the name/hint launch target
-    /// fills the **left**, the action buttons cluster on the **right** (workload
-    /// Start/Stop + Attach, then the pin star). The whole row sits on a
-    /// zebra-shaded Carbon layer (alternating by `idx`) for easier reading, in
-    /// both dark and light themes. Local apps launch on click; mesh/service open
-    /// their session/endpoint (APPS-5/7).
+    /// APPS-STYLE-2 — one result row: letter avatar + accent-blue title + mono
+    /// subtitle + status dot, on a zebra layer; clicking toggles the inline
+    /// detail ([`Self::detail`]) and the selected row gets a blue left-accent +
+    /// raised bg. Theme-aware (all mde-theme tokens).
     fn entry_row<'a>(&self, idx: usize, e: &'a Entry) -> Element<'a, Message> {
-        use cosmic::widget::{button, column, row, text};
+        use cosmic::widget::{column, row, text};
         let p = self.palette;
         let sizes = FontSize::defaults();
         let cap_sz = TypeRole::Caption.size_in(sizes);
+        let mono = cosmic::iced::Font::MONOSPACE;
+        let selected = self.selected.as_deref() == Some(&e.id);
         let sub = match e.kind.as_str() {
             "mesh-app" => format!("mesh · {} · {}", e.node, e.health),
             "workload" => format!("{} · {}", e.source, e.state),
             "service" => format!("service · {}", e.node),
             _ => e.source.clone(),
         };
-        // The launch target (left, fills): name over a muted sub-line.
+
+        // Letter avatar.
+        let letter = e
+            .name
+            .chars()
+            .next()
+            .map_or_else(String::new, |c| c.to_uppercase().to_string());
+        let av_bg = p.raised;
+        let avatar = cosmic::iced::widget::container(
+            text(letter)
+                .size(cap_sz)
+                .font(mono)
+                .class(cosmic::theme::Text::Color(carbon(p.text_muted))),
+        )
+        .width(Length::Fixed(32.0))
+        .height(Length::Fixed(32.0))
+        .center_x(Length::Fixed(32.0))
+        .center_y(Length::Fixed(32.0))
+        .style(move |_| cosmic::iced::widget::container::Style {
+            background: Some(carbon(av_bg).into()),
+            ..Default::default()
+        });
+
+        // Title (accent blue) + mono subtitle.
         let body = column(vec![
             text(e.name.clone())
                 .size(TypeRole::Body.size_in(sizes))
+                .class(cosmic::theme::Text::Color(carbon(p.accent)))
                 .into(),
             text(sub)
                 .size(cap_sz)
+                .font(mono)
                 .class(cosmic::theme::Text::Color(carbon(p.text_muted)))
                 .into(),
         ])
-        .spacing(1);
-        let launch = button::custom(body)
-            .width(Length::Fill)
-            .class(cosmic::theme::Button::Text);
-        let launch = match e.kind.as_str() {
-            // Local apps exec directly (Q23); mesh peers open a remote-desktop
-            // session (APPS-5) — launchable even when degraded (Q18). Service
-            // launch lands in APPS-7.
-            "app" if !e.exec.is_empty() => launch.on_press(Message::LaunchLocal(e.exec.clone())),
-            "mesh-app" if !e.node.is_empty() => {
-                launch.on_press(Message::LaunchMesh(e.node.clone()))
-            }
-            // Services open their endpoint over the overlay (APPS-7).
-            "service" if !e.endpoint.is_empty() => {
-                launch.on_press(Message::OpenService(e.endpoint.clone()))
-            }
-            _ => launch,
-        };
+        .spacing(2)
+        .width(Length::Fill);
 
-        // Right-clustered action buttons (Music idiom — buttons to the right of
-        // the object): workload controls, then the pin star.
-        let mut cells: Vec<Element<Message>> = vec![launch.into()];
-        // APPS-6 — workloads get inline Start/Stop + Attach.
-        if e.kind == "workload" {
-            let action_btn = |label: &'static str, action: WorkloadAction| -> Element<Message> {
-                button::custom(text(label).size(cap_sz))
-                    .on_press(Message::Workload(e.source.clone(), e.name.clone(), action))
-                    .class(cosmic::theme::Button::Text)
-                    .into()
-            };
-            if mde_cosmic_applet::workload_running(&e.state) {
-                cells.push(action_btn("Stop", WorkloadAction::Stop));
-            } else {
-                cells.push(action_btn("Start", WorkloadAction::Start));
-            }
-            cells.push(action_btn("Attach", WorkloadAction::Attach));
+        // Status dot (where the entry carries health/state).
+        let mut cells: Vec<Element<Message>> = vec![avatar.into(), body.into()];
+        if let Some(dotc) = self.status_color(e) {
+            cells.push(
+                cosmic::iced::widget::container(cosmic::widget::Space::new())
+                    .width(Length::Fixed(8.0))
+                    .height(Length::Fixed(8.0))
+                    .style(move |_| cosmic::iced::widget::container::Style {
+                        background: Some(carbon(dotc).into()),
+                        border: cosmic::iced::Border {
+                            radius: 4.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })
+                    .into(),
+            );
         }
-        // Pin toggle (★ pinned / ☆ not) — persists mesh-wide (APPS-4); far right.
-        let pinned = self.favorites.contains(&e.id);
-        cells.push(
-            button::custom(
-                text(if pinned { "\u{2605}" } else { "\u{2606}" })
-                    .size(cap_sz)
-                    .class(cosmic::theme::Text::Color(carbon(if pinned {
-                        p.accent
-                    } else {
-                        p.text_muted
-                    }))),
-            )
-            .on_press(Message::ToggleFavorite(e.id.clone()))
-            .class(cosmic::theme::Button::Text)
-            .into(),
-        );
-        // APPS-8 — right-click the row to toggle a context action strip.
-        let main = cosmic::widget::mouse_area(
+
+        // The clickable row → toggle the inline detail.
+        let main = cosmic::widget::button::custom(
             row(cells)
-                .spacing(6)
+                .spacing(12)
                 .align_y(cosmic::iced::Alignment::Center),
         )
-        .on_right_press(Message::EntryMenu(e.id.clone()));
-        let inner: Element<Message> = if self.open_menu.as_deref() == Some(&e.id) {
-            column(vec![main.into(), self.context_strip(e)])
-                .spacing(2)
-                .into()
+        .on_press(Message::SelectEntry(e.id.clone()))
+        .width(Length::Fill)
+        .class(cosmic::theme::Button::Text);
+
+        let inner: Element<Message> = if selected {
+            column(vec![main.into(), self.detail(e)]).spacing(0).into()
         } else {
             main.into()
         };
-        // Zebra shading: alternate two adjacent Carbon layers so rows read as
-        // shaded stripes in both themes (dark: Gray 100/90; light: Gray 10/White).
-        let shade = if idx % 2 == 1 {
+
+        // Zebra shading + selected accent (Q8: both). Selected = raised bg + a
+        // blue left-accent bar; otherwise alternate two Carbon layers.
+        let shade = if selected {
+            p.raised
+        } else if idx % 2 == 1 {
             p.surface
         } else {
             p.background
         };
+        let accent = if selected { p.accent } else { shade };
         cosmic::iced::widget::container(inner)
-            .padding([4, 8])
+            .padding([6, 10])
             .width(Length::Fill)
             .style(move |_| cosmic::iced::widget::container::Style {
                 background: Some(carbon(shade).into()),
+                border: cosmic::iced::Border {
+                    color: carbon(accent),
+                    width: 0.0,
+                    radius: 0.0.into(),
+                },
                 ..Default::default()
             })
             .into()
     }
 
-    /// APPS-8 — the right-click context strip for one entry: pin/unpin, the
-    /// primary action, "run on ▸ <peer>" (opens that peer's session — reuses
-    /// APPS-5), and Uninstall for flatpak apps. (run-containerized + a rich
-    /// details view are deferred to APPS-8b.)
-    fn context_strip<'a>(&self, e: &'a Entry) -> Element<'a, Message> {
-        use cosmic::widget::{button, row, text};
+    /// APPS-STYLE-2 — status dot colour for an entry (online→success,
+    /// idle/degraded→warning, offline/unknown→muted). `None` = no dot.
+    fn status_color(&self, e: &Entry) -> Option<mde_theme::Rgba> {
+        let p = self.palette;
+        let s = match e.kind.as_str() {
+            "mesh-app" => e.health.as_str(),
+            "workload" => e.state.as_str(),
+            "service" => "running",
+            _ => return None,
+        };
+        let sl = s.to_lowercase();
+        if sl.contains("online")
+            || sl.contains("healthy")
+            || sl.contains("running")
+            || sl.contains("up")
+        {
+            Some(p.success)
+        } else if sl.contains("idle") || sl.contains("degraded") || sl.contains("pending") {
+            Some(p.warning)
+        } else if sl.is_empty() {
+            None
+        } else {
+            Some(p.text_muted)
+        }
+    }
+
+    /// APPS-STYLE-2 — the expanded detail panel for the selected row: primary
+    /// action (Launch/Connect/Open or workload Start/Stop + Attach), Pin/Unpin,
+    /// and for apps an "Open on host" chip row (remote desktop to each peer).
+    fn detail<'a>(&self, e: &'a Entry) -> Element<'a, Message> {
+        use cosmic::widget::{button, column, row, text};
+        let p = self.palette;
         let cap_sz = TypeRole::Caption.size_in(FontSize::defaults());
-        let item = |label: String, msg: Message| -> Element<Message> {
+        let primary = |label: &str, msg: Message| -> Element<Message> {
+            button::custom(text(label.to_string()).size(cap_sz))
+                .on_press(msg)
+                .class(cosmic::theme::Button::Suggested)
+                .into()
+        };
+        let secondary = |label: String, msg: Message| -> Element<Message> {
             button::custom(text(label).size(cap_sz))
                 .on_press(msg)
                 .class(cosmic::theme::Button::Text)
                 .into()
         };
-        let mut items: Vec<Element<Message>> = Vec::new();
-        items.push(item(
-            if self.favorites.contains(&e.id) {
-                "Unpin".to_string()
-            } else {
-                "Pin".to_string()
-            },
-            Message::ToggleFavorite(e.id.clone()),
-        ));
-        // Primary action, by kind.
+
+        let mut actions: Vec<Element<Message>> = Vec::new();
         match e.kind.as_str() {
             "app" if !e.exec.is_empty() => {
-                items.push(item("Launch".into(), Message::LaunchLocal(e.exec.clone())));
+                actions.push(primary("Launch", Message::LaunchLocal(e.exec.clone())));
+            }
+            "mesh-app" if !e.node.is_empty() => {
+                actions.push(primary("Connect", Message::LaunchMesh(e.node.clone())));
             }
             "service" if !e.endpoint.is_empty() => {
-                items.push(item(
-                    "Open".into(),
-                    Message::OpenService(e.endpoint.clone()),
+                actions.push(primary("Open", Message::OpenService(e.endpoint.clone())));
+            }
+            "workload" => {
+                if mde_cosmic_applet::workload_running(&e.state) {
+                    actions.push(primary(
+                        "Stop",
+                        Message::Workload(e.source.clone(), e.name.clone(), WorkloadAction::Stop),
+                    ));
+                } else {
+                    actions.push(primary(
+                        "Start",
+                        Message::Workload(e.source.clone(), e.name.clone(), WorkloadAction::Start),
+                    ));
+                }
+                actions.push(secondary(
+                    "Attach".into(),
+                    Message::Workload(e.source.clone(), e.name.clone(), WorkloadAction::Attach),
                 ));
             }
             _ => {}
         }
-        // "Run on ▸ <peer>" — open the chosen peer's session (Q11; reuses APPS-5).
-        for peer in self.peers() {
-            items.push(item(format!("▸ {peer}"), Message::LaunchMesh(peer.clone())));
+        // Pin/Unpin — universal secondary (Q6).
+        actions.push(secondary(
+            if self.favorites.contains(&e.id) {
+                "Unpin".into()
+            } else {
+                "Pin".into()
+            },
+            Message::ToggleFavorite(e.id.clone()),
+        ));
+
+        let mut col = column(vec![row(actions)
+            .spacing(8)
+            .align_y(cosmic::iced::Alignment::Center)
+            .into()])
+        .spacing(12);
+
+        // "Open on host" chips — apps only (Q3: RD to the peer).
+        if e.kind == "app" {
+            let peers = self.peers();
+            if !peers.is_empty() {
+                col = col.push(
+                    text("Open on host")
+                        .size(cap_sz)
+                        .font(cosmic::iced::Font::MONOSPACE)
+                        .class(cosmic::theme::Text::Color(carbon(p.text_muted))),
+                );
+                let chips: Vec<Element<Message>> = peers
+                    .into_iter()
+                    .map(|h| {
+                        button::custom(
+                            text(h.clone())
+                                .size(cap_sz)
+                                .font(cosmic::iced::Font::MONOSPACE),
+                        )
+                        .on_press(Message::OpenOnHost(h))
+                        .class(cosmic::theme::Button::Standard)
+                        .into()
+                    })
+                    .collect();
+                col = col.push(
+                    cosmic::widget::flex_row(chips)
+                        .column_spacing(6)
+                        .row_spacing(6),
+                );
+            }
         }
-        // Uninstall — flatpak apps only (the id is the flatpak app id).
-        if e.source == "flatpak" {
-            items.push(item("Uninstall".into(), Message::Uninstall(e.id.clone())));
+
+        let band = p.accent;
+        cosmic::iced::widget::container(col)
+            .padding(12)
+            .width(Length::Fill)
+            .style(move |_| cosmic::iced::widget::container::Style {
+                background: Some(carbon(p.overlay).into()),
+                border: cosmic::iced::Border {
+                    color: carbon(band),
+                    width: 0.0,
+                    radius: 0.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+
+    /// APPS-STYLE-2 — the bottom toast feedback bar.
+    fn toast_bar<'a>(&self, msg: &'a str) -> Element<'a, Message> {
+        use cosmic::widget::{button, row, text, Space};
+        let p = self.palette;
+        let cap_sz = TypeRole::Caption.size_in(FontSize::defaults());
+        let accent = p.success;
+        let bar = cosmic::iced::widget::container(Space::new())
+            .width(Length::Fixed(3.0))
+            .height(Length::Fixed(24.0))
+            .style(move |_| cosmic::iced::widget::container::Style {
+                background: Some(carbon(accent).into()),
+                ..Default::default()
+            });
+        let inner = row(vec![
+            bar.into(),
+            text(msg.to_string())
+                .size(cap_sz)
+                .width(Length::Fill)
+                .class(cosmic::theme::Text::Color(carbon(p.text)))
+                .into(),
+            button::custom(text("\u{2715}").size(cap_sz))
+                .on_press(Message::DismissToast)
+                .class(cosmic::theme::Button::Text)
+                .into(),
+        ])
+        .spacing(10)
+        .align_y(cosmic::iced::Alignment::Center);
+        cosmic::iced::widget::container(inner)
+            .padding([8, 4])
+            .width(Length::Fill)
+            .into()
+    }
+
+    /// APPS-STYLE-2 — the operator + power footer (and the power menu when open).
+    fn footer(&self) -> Element<'_, Message> {
+        use cosmic::widget::{button, column, row, text, Space};
+        let p = self.palette;
+        let cap_sz = TypeRole::Caption.size_in(FontSize::defaults());
+        let user = current_user();
+        let initial = user
+            .chars()
+            .next()
+            .map_or_else(String::new, |c| c.to_uppercase().to_string());
+        let ac = p.accent;
+        let avatar = cosmic::iced::widget::container(
+            text(initial)
+                .size(cap_sz)
+                .font(cosmic::iced::Font::MONOSPACE)
+                .class(cosmic::theme::Text::Color(carbon(p.background))),
+        )
+        .width(Length::Fixed(28.0))
+        .height(Length::Fixed(28.0))
+        .center_x(Length::Fixed(28.0))
+        .center_y(Length::Fixed(28.0))
+        .style(move |_| cosmic::iced::widget::container::Style {
+            background: Some(carbon(ac).into()),
+            ..Default::default()
+        });
+        let bar = row(vec![
+            avatar.into(),
+            text(user)
+                .size(cap_sz)
+                .width(Length::Fill)
+                .class(cosmic::theme::Text::Color(carbon(p.text)))
+                .into(),
+            button::custom(
+                text("\u{23FB}\u{FE0E}")
+                    .size(16)
+                    .class(cosmic::theme::Text::Color(carbon(p.text_muted))),
+            )
+            .on_press(Message::TogglePower)
+            .class(cosmic::theme::Button::Text)
+            .into(),
+        ])
+        .spacing(10)
+        .align_y(cosmic::iced::Alignment::Center);
+
+        if !self.power_open {
+            return bar.into();
         }
-        row(items).spacing(6).into()
+        // The power menu, stacked above the footer bar.
+        let action = |k: PowerKind| -> Element<Message> {
+            button::custom(text(k.label().to_string()).size(cap_sz))
+                .on_press(Message::Power(k))
+                .width(Length::Fill)
+                .class(cosmic::theme::Button::Text)
+                .into()
+        };
+        column(vec![
+            action(PowerKind::Lock),
+            action(PowerKind::Logout),
+            action(PowerKind::Suspend),
+            action(PowerKind::Restart),
+            action(PowerKind::Shutdown),
+            Space::new().height(Length::Fixed(4.0)).into(),
+            bar.into(),
+        ])
+        .spacing(2)
+        .into()
     }
 
     /// Mesh peer hostnames (from the mesh-app entries) for the "run on ▸" menu.
