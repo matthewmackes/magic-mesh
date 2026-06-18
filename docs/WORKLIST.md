@@ -994,6 +994,13 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
     5. **Enlarge `/run` tmpfs (band-aid).** Headroom only; can't spare much RAM on a 947 MB lighthouse; delays, doesn't fix.
   **Operator-leaning plan:** #1 + #2 + the #3 quick win.
 
+## WORKLOAD-FLEET-3 — Instances panel never auto-loads (operator bug-testing, 2026-06-18)
+- [ ] **WORKLOAD-FLEET-3: the Instances/Compute panel sits at "Loading instances…" forever — never auto-loads on nav.**
+  **As** an operator, **I want** the Instances panel to populate when I open it (showing at least MDE-KVM-1 on fedora), **so that** the fleet-workloads feature is actually visible.
+  **Root cause (confirmed live on .13):** `app.rs`'s nav-load match wires `load()` for ~40 panels but **omits `"instances"`** — navigating to Compute never calls `ComputePanel::load()`, so it shows the initial `!loaded` "Loading instances…" state indefinitely. Pre-existing (predates WORKLOAD-FLEET-1) but it makes the shipped fleet feature look dead. Running binary is the new fleet build, `virsh` returns fast (empty), all 7 `compute-inventory.json` files (incl. `peer:fedora`=MDE-KVM-1) present + readable — the panel just never loads.
+  **Fix (one line):** add `"instances" => compute_panel::ComputePanel::load(),` to the nav-load match. **Workaround now:** click **Refresh** on the panel.
+  **Acceptance:** opening Instances auto-populates within a load cycle; MDE-KVM-1 shows attributed to `fedora` from .13 without clicking Refresh. *(Lesson: WORKLOAD-FLEET-1's data path was verified end-to-end but not the live panel on a peer node — add a nav-load smoke check.)*
+
 ## ROUTING-VALIDATE — Routing overlay-reachability never returns a result (operator bug-testing, 2026-06-18)
 - [ ] **ROUTING-VALIDATE-1: "Run validation now" requests a run but the result never comes back.**
   **As** an operator, **I want** the Routing panel to show overlay-reachability results after a run, **so that** it isn't a permanently-empty panel ("No validation run yet" persists after clicking Run, which confirms "requested a fresh overlay-reachability run (the leader mints it)").
