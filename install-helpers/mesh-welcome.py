@@ -91,9 +91,68 @@ def main():
                 cells.append(c(" ? ", GRAY))
         print(f"  {c(host, BOLD)} " + " ".join(cell.center(4) for cell in cells))
 
+    network_overview(d)
+
     print()
     print(c("  type ", GRAY) + c("mesh-help", BOLD + BLUE)
           + c(" for the command cheat sheet", GRAY) + "\n")
+
+
+def network_overview(d):
+    """SHELL-NET — an ASCII diagram of the current network state + the subnets
+    routable within the mesh, including the external gateways. Fed by the
+    `network` block of /run/mde/mesh-status.json (this node's overlay view)."""
+    net = d.get("network") or {}
+    nodes = d.get("nodes", [])
+    self_host = d.get("self", "")
+    cidr = net.get("overlay_cidr") or "—"
+    routes = net.get("routes") or ([cidr] if cidr != "—" else [])
+    gw_eps = net.get("gateway_endpoints") or []
+    defgw = net.get("default_gw") or ""
+
+    print()
+    print(c("  Network Overview", BOLD + BLUE))
+
+    # ── ASCII diagram: internet → external gateways → overlay → nodes ──
+    print(c("    ☁  internet", GRAY)
+          + (c(f"  ─ gw {defgw}", GRAY) if defgw else ""))
+    print(c("    │", GRAY))
+    if gw_eps:
+        print(c("    ▲  external gateways", GRAY))
+        for ep in gw_eps:
+            print("       " + c(ep, BLUE))
+        print(c("    │", GRAY))
+    head = f"  ┌─ overlay {cidr} "
+    print(c(head + "─" * max(2, 50 - len(head)) + "┐", BLUE))
+    # A dot strip — one ● per node, coloured by presence, * = this node.
+    online = sum(1 for n in nodes if n.get("presence") == "online")
+    dots = " ".join(
+        (lambda cd: f"{cd[0]}{cd[1]}{RST}")(DOT.get(n.get("presence", "offline"), (RED, "○")))
+        for n in nodes
+    )
+    print("    " + dots + c(f"   {len(nodes)} nodes ({online} online)", GRAY))
+    if self_host:
+        print("    " + c(f"this node: {self_host} {net.get('overlay_ip','')}", GRAY))
+    print(c("  └" + "─" * 50 + "┘", BLUE))
+
+    # ── Routable subnets (within the mesh) ──
+    print(c("  Routable subnets:", GRAY))
+    if routes:
+        for r in routes:
+            tag = "  (overlay)" if r == cidr else ""
+            print("    " + c(r, GREEN) + c(tag, GRAY))
+    else:
+        print("    " + c("none — overlay down?", GRAY))
+
+    # ── External gateways ──
+    print(c("  External gateways:", GRAY))
+    if gw_eps:
+        for ep in gw_eps:
+            print("    " + c(ep, BLUE) + c("  lighthouse", GRAY))
+    if defgw:
+        print("    " + c(defgw, BLUE) + c("  internet (default route)", GRAY))
+    if not gw_eps and not defgw:
+        print("    " + c("none", GRAY))
 
 
 if __name__ == "__main__":

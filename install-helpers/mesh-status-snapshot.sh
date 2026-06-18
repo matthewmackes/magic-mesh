@@ -45,7 +45,27 @@ EOF
 fi
 
 # ── 2. aggregate the directory + every node's shell-status → snapshot ────────
-WG="$WG" SELF="$SELF" SELF_VER="$VER" python3 - "$OUT" <<'PY' || true
+# ── 1b. network overview data (SHELL-NET) — this node's overlay + routes +
+#        external gateways, for the welcome banner's Network Overview. All
+#        best-effort; empty fields render as "—". ────────────────────────────
+NET_IF="$(ip -o -4 addr show 2>/dev/null | awk '$2 ~ /nebula|mde-neb/{print $2; exit}')"
+NET_IP=""; NET_CIDR=""; NET_ROUTES=""
+if [ -n "$NET_IF" ]; then
+    NET_IP="$(ip -o -4 addr show dev "$NET_IF" 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}')"
+    # The connected (kernel) route on the overlay if IS the overlay subnet.
+    NET_CIDR="$(ip route show dev "$NET_IF" proto kernel 2>/dev/null | awk '{print $1; exit}')"
+    # Every subnet routable through the overlay (overlay subnet + unsafe_routes).
+    NET_ROUTES="$(ip route show dev "$NET_IF" 2>/dev/null | awk '$1 ~ /\//{print $1}' | sort -u | head -12 | paste -sd, -)"
+fi
+NET_DEFGW="$(ip route show default 2>/dev/null | awk '{print $3; exit}')"
+# Nebula lighthouse public endpoints (external gateways) from static_host_map.
+NET_GWEPS="$(grep -hoE '([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]+' /etc/nebula/config.yml /etc/nebula/config.yaml 2>/dev/null | sort -u | head -8 | paste -sd, -)"
+
+# ── 2. aggregate the directory + every node's shell-status → snapshot ────────
+WG="$WG" SELF="$SELF" SELF_VER="$VER" \
+NET_IF="$NET_IF" NET_IP="$NET_IP" NET_CIDR="$NET_CIDR" NET_ROUTES="$NET_ROUTES" \
+NET_DEFGW="$NET_DEFGW" NET_GWEPS="$NET_GWEPS" \
+python3 - "$OUT" <<'PY' || true
 import json, os, sys, glob, time
 wg=os.environ.get("WG","/mnt/mesh-storage"); self_host=os.environ.get("SELF","")
 out=sys.argv[1]
@@ -78,8 +98,18 @@ def vkey(v):
 latest=max(versions,key=vkey) if versions else None
 for n in nodes:
     n["update"]= bool(latest and n.get("version") and n["version"]!=latest)
+# SHELL-NET — this node's network overview (overlay + routable subnets + gateways).
+def _split(v):
+    return [x for x in (os.environ.get(v,"") or "").split(",") if x]
+network={"overlay_if":os.environ.get("NET_IF","") or "",
+         "overlay_ip":os.environ.get("NET_IP","") or "",
+         "overlay_cidr":os.environ.get("NET_CIDR","") or "",
+         "routes":_split("NET_ROUTES"),
+         "default_gw":os.environ.get("NET_DEFGW","") or "",
+         "gateway_endpoints":_split("NET_GWEPS")}
 snap={"generated_ms":int(time.time()*1000),"self":self_host,"latest_version":latest,
-      "online":sum(1 for n in nodes if n["presence"]=="online"),"total":len(nodes),"nodes":nodes}
+      "online":sum(1 for n in nodes if n["presence"]=="online"),"total":len(nodes),
+      "nodes":nodes,"network":network}
 tmp=out+".tmp"
 json.dump(snap,open(tmp,"w")); os.replace(tmp,out)
 try: os.chmod(out,0o644)
