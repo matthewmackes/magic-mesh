@@ -1027,6 +1027,9 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
 - [ ] **NOTIFY-PREFS-1: the "Default expire (ms)" field is locked to 5000 (Phase C.5) but looks editable.** **Acceptance:** either make the field actually apply the entered value (toast daemon honors `notification.default_expire_ms`) OR mark it read-only/disabled with a note, so an editable-looking field isn't silently ignored.
 - [ ] **NOTIFY-PREFS-2: clarify panel scope vs the Notification Hub.** The operator had to ask what it controls. **Acceptance:** add a one-line panel subtitle ("Toast popups + sounds for this machine — the alert list lives in the Notification Hub") so the distinction is self-evident; consider linking the two.
 
+## REMMINA-ICON — Carbon tray icon for Remmina (operator bug-testing, 2026-06-18)
+- [✓] **REMMINA-ICON-1: Remmina tray widget used a non-Carbon icon.** DONE 2026-06-18: the Mackes-Carbon theme overrode Remmina's *app* icon but had no *status* icon, so the tray fell back to Remmina's stock `org.remmina.Remmina-status`. Added a Carbon `scalable/status/org.remmina.Remmina-status.svg` (currentColor symbolic, tints dark+light) to both Mackes-Carbon + Mackes-Carbon-Light in `mackes-carbon-icons.tar.xz` (the RPM asset installed by `magic-mesh-brand.sh`) → lands in every platform install; live-applied to .13 (icon cache refreshed, panel respawned). *(asset-only → next cut bumps the packaging release field.)*
+
 ## KDC-NOISE — KDE Connect floods the event stream (operator bug-testing, 2026-06-18)
 - [ ] **KDC-NOISE-1: KDE Connect emits too many information-level events.**
   **As** an operator, **I want** KDE Connect to surface only meaningful device events, **so that** the Alert Center / notifications aren't flooded with low-value info.
