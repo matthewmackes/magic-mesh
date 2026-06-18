@@ -18,7 +18,9 @@ use cosmic::surface::action::{app_popup, destroy_popup};
 use cosmic::{Application, Element};
 
 use mde_bus::hooks::config::Priority;
-use mde_cosmic_applet::{filter_entries, parse_entries, Entry, LauncherTab};
+use mde_cosmic_applet::{
+    filter_entries, parse_entries, workload_argv, Entry, LauncherTab, WorkloadAction,
+};
 use mde_theme::{FontSize, Palette, Rgba, TypeRole};
 
 const ID: &str = "com.mackes.MagicMeshApps";
@@ -65,6 +67,8 @@ enum Message {
     LaunchLocal(String),
     /// Open a remote-desktop session to a mesh peer by hostname (APPS-5).
     LaunchMesh(String),
+    /// Control a local workload (start/stop/attach) — `(source, name, action)` (APPS-6).
+    Workload(String, String, WorkloadAction),
     /// Re-fetch the entry list.
     Refresh,
 }
@@ -348,6 +352,24 @@ impl Application for AppsApplet {
                     None => launch,
                 };
             }
+            Message::Workload(source, name, action) => {
+                if let Some(argv) = workload_argv(&source, &name, action) {
+                    // Start/Stop run the argv directly; Attach needs a terminal
+                    // (the VM console / container shell is interactive).
+                    if matches!(action, WorkloadAction::Attach) {
+                        let mut cmd = std::process::Command::new("setsid");
+                        cmd.args(["--fork", "cosmic-term", "--"]).args(&argv);
+                        let _ = cmd.status();
+                    } else {
+                        let _ = std::process::Command::new("setsid")
+                            .arg("--fork")
+                            .args(&argv)
+                            .status();
+                    }
+                }
+                // Reload so the state pill reflects the start/stop.
+                return load_task();
+            }
             Message::Refresh => return load_task(),
         }
         Task::none()
@@ -508,14 +530,30 @@ impl AppsApplet {
             .class(cosmic::theme::Button::Text);
         let launch = match e.kind.as_str() {
             // Local apps exec directly (Q23); mesh peers open a remote-desktop
-            // session (APPS-5) — launchable even when degraded (Q18). Workload +
-            // service launch land in APPS-6/7.
+            // session (APPS-5) — launchable even when degraded (Q18). Service
+            // launch lands in APPS-7.
             "app" if !e.exec.is_empty() => launch.on_press(Message::LaunchLocal(e.exec.clone())),
             "mesh-app" if !e.node.is_empty() => {
                 launch.on_press(Message::LaunchMesh(e.node.clone()))
             }
             _ => launch,
         };
-        row(vec![star.into(), launch.into()]).spacing(4).into()
+        let mut cells: Vec<Element<Message>> = vec![star.into(), launch.into()];
+        // APPS-6 — workloads get inline Start/Stop + Attach.
+        if e.kind == "workload" {
+            let action_btn = |label: &'static str, action: WorkloadAction| -> Element<Message> {
+                button::custom(text(label).size(cap_sz))
+                    .on_press(Message::Workload(e.source.clone(), e.name.clone(), action))
+                    .class(cosmic::theme::Button::Text)
+                    .into()
+            };
+            if mde_cosmic_applet::workload_running(&e.state) {
+                cells.push(action_btn("Stop", WorkloadAction::Stop));
+            } else {
+                cells.push(action_btn("Start", WorkloadAction::Start));
+            }
+            cells.push(action_btn("Attach", WorkloadAction::Attach));
+        }
+        row(cells).spacing(4).into()
     }
 }

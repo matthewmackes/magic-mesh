@@ -903,7 +903,7 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
   **Acceptance:** pin/unpin persists to `<QNM-Shared>/<user>/apps-favorites.json` (Q10); the Favorites tab reflects it; the same set appears on a second node logged in as the same user; no usage/recents tracking (Q12).
 - [✓] **APPS-5: launch paths — local exec + peer remote-desktop.**
   **Acceptance:** local apps exec directly; a peer app → `action/apps/launch` → mackesd opens a remote-desktop session to that peer (Q9/Q23); peer entries show a presence/health badge but remain launchable when degraded (Q18).
-- [ ] **APPS-6: Workloads tab — inline start/stop/attach.**
+- [✓] **APPS-6: Workloads tab — inline start/stop/attach.**
   **Acceptance:** containers (podman) + VMs (libvirt) listed (local + peer descriptors); start/stop/attach work inline via `action/compute/*`+`action/provision/*` (Q19).
 - [ ] **APPS-7: Services tab — published mesh services.**
   **Acceptance:** published services (Jellyfin/Navidrome/web UIs/Netdata, …) from PD-2 descriptors (Q20); click opens the endpoint over the overlay.

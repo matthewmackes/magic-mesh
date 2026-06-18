@@ -255,6 +255,52 @@ pub fn parse_favorites(reply: &str) -> std::collections::HashSet<String> {
         .unwrap_or_default()
 }
 
+/// A workload control action (APPS-6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkloadAction {
+    /// Start a stopped VM/container.
+    Start,
+    /// Stop a running VM/container.
+    Stop,
+    /// Attach to the VM console / container shell (run in a terminal).
+    Attach,
+}
+
+/// True when a libvirt/podman state string reads as actively running (so the row
+/// shows Stop rather than Start).
+#[must_use]
+pub fn workload_running(state: &str) -> bool {
+    matches!(state.trim().to_lowercase().as_str(), "running" | "up")
+        || state.to_lowercase().starts_with("up ")
+}
+
+/// The argv to control a local workload (APPS-6). VMs go through `virsh`
+/// (`qemu:///system`, the same connection the Workbench compute panel uses);
+/// containers through `podman`. `Attach` returns the inner console/shell argv
+/// (the caller wraps it in a terminal). `None` for an unknown source/empty name.
+#[must_use]
+pub fn workload_argv(source: &str, name: &str, action: WorkloadAction) -> Option<Vec<String>> {
+    if name.is_empty() {
+        return None;
+    }
+    let v = |parts: &[&str]| parts.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+    match (source, action) {
+        ("libvirt", WorkloadAction::Start) => {
+            Some(v(&["virsh", "-c", "qemu:///system", "start", name]))
+        }
+        ("libvirt", WorkloadAction::Stop) => {
+            Some(v(&["virsh", "-c", "qemu:///system", "shutdown", name]))
+        }
+        ("libvirt", WorkloadAction::Attach) => {
+            Some(v(&["virsh", "-c", "qemu:///system", "console", name]))
+        }
+        ("podman", WorkloadAction::Start) => Some(v(&["podman", "start", name])),
+        ("podman", WorkloadAction::Stop) => Some(v(&["podman", "stop", name])),
+        ("podman", WorkloadAction::Attach) => Some(v(&["podman", "exec", "-it", name, "/bin/sh"])),
+        _ => None,
+    }
+}
+
 /// Filter entries for the dropdown: a non-empty `query` searches across ALL tabs
 /// (Q2 fuzzy-ish — case-insensitive substring on the name); an empty query shows
 /// the active `tab` (Favorites = ids in `favorites`, else by kind). Sorted by name.
@@ -315,6 +361,36 @@ pub fn qnm_usage_label(usage: Option<(u64, u64)>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workload_argv_builds_virsh_and_podman() {
+        assert_eq!(
+            workload_argv("libvirt", "win10", WorkloadAction::Start).unwrap(),
+            ["virsh", "-c", "qemu:///system", "start", "win10"]
+        );
+        assert_eq!(
+            workload_argv("libvirt", "win10", WorkloadAction::Stop).unwrap(),
+            ["virsh", "-c", "qemu:///system", "shutdown", "win10"]
+        );
+        assert_eq!(
+            workload_argv("podman", "nginx", WorkloadAction::Start).unwrap(),
+            ["podman", "start", "nginx"]
+        );
+        assert_eq!(
+            workload_argv("podman", "nginx", WorkloadAction::Attach).unwrap(),
+            ["podman", "exec", "-it", "nginx", "/bin/sh"]
+        );
+        assert!(workload_argv("xdg", "x", WorkloadAction::Start).is_none());
+        assert!(workload_argv("podman", "", WorkloadAction::Start).is_none());
+    }
+
+    #[test]
+    fn workload_running_reads_state() {
+        assert!(workload_running("running"));
+        assert!(workload_running("Up 3 minutes"));
+        assert!(!workload_running("shut off"));
+        assert!(!workload_running("exited"));
+    }
 
     #[test]
     fn parse_favorites_decodes_set() {
