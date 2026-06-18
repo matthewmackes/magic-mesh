@@ -66,6 +66,15 @@ pub struct Instance {
     pub name: String,
     pub kind: InstanceKind,
     pub state: String,
+    /// Hostname of the node this instance runs on. The local `virsh`/`podman`
+    /// probe sets this node's hostname; rows merged from the mesh bus
+    /// (`compute/inventory/<peer>`, WORKLOAD-FLEET-1) carry that peer's
+    /// hostname, so a VM on any node is visible from any Workbench.
+    pub node: String,
+    /// True when this row came from THIS node's local probe. Lifecycle actions
+    /// (Start/Stop/Console/Migrate) shell local `virsh`/`podman`, so they only
+    /// apply to local rows; peer rows are read-only here.
+    pub local: bool,
 }
 
 /// The result of one enumeration pass. `sources` names the hypervisor
@@ -230,10 +239,13 @@ impl ComputePanel {
             }
             Message::Bulk(verb) => self.bulk(verb),
             Message::SampleTick => {
-                if self.instances.is_empty() {
+                // Only this node's instances can be sampled locally (virsh
+                // domstats / podman stats); peer rows are display-only.
+                let instances: Vec<Instance> =
+                    self.instances.iter().filter(|i| i.local).cloned().collect();
+                if instances.is_empty() {
                     return Task::none();
                 }
-                let instances = self.instances.clone();
                 Task::perform(sample_metrics(instances), |s| {
                     crate::Message::Compute(Message::Sampled(s))
                 })
@@ -354,7 +366,8 @@ impl ComputePanel {
         let cmds: Vec<(String, Vec<String>)> = self
             .instances
             .iter()
-            .filter(|i| verb_applies(verb, &i.state))
+            // Bulk verbs shell local virsh/podman — only act on local rows.
+            .filter(|i| i.local && verb_applies(verb, &i.state))
             .map(|i| {
                 let (program, args) = command_for(i.kind, verb, &i.name);
                 (program.to_string(), args)
@@ -472,7 +485,12 @@ impl ComputePanel {
         } else {
             let mut rows: Vec<Element<'_, crate::Message>> = vec![instance_header_row(palette)];
             for inst in &self.instances {
-                let m = self.metrics.get(&metric_key(inst.kind, &inst.name));
+                // Sparklines come from this node's local sampler, so peer rows
+                // have none (avoids cross-node name collisions in the key).
+                let m = inst
+                    .local
+                    .then(|| self.metrics.get(&metric_key(inst.kind, &inst.name)))
+                    .flatten();
                 rows.push(instance_row(inst, m, palette));
             }
             column(rows).spacing(f32::from(spacing::BASE[1])).into()
@@ -502,6 +520,10 @@ fn instance_header_row<'a>(palette: Palette) -> Element<'a, crate::Message> {
             .size(cap)
             .colr(muted)
             .width(Length::FillPortion(3)),
+        text("Node")
+            .size(cap)
+            .colr(muted)
+            .width(Length::FillPortion(2)),
         text("Kind")
             .size(cap)
             .colr(muted)
@@ -602,8 +624,10 @@ fn instance_row<'a>(
     } else {
         palette.text_muted
     };
+    // Lifecycle actions shell local virsh/podman, so only LOCAL rows get them;
+    // a peer's workload is read-only here (remote ops are a later slice).
     let mut actions = row![].spacing(f32::from(spacing::BASE[1]));
-    if let Some(verb) = row_action(&inst.state) {
+    if let Some(verb) = inst.local.then(|| row_action(&inst.state)).flatten() {
         actions = actions.push(variant_button(
             verb.label(),
             ButtonVariant::Ghost,
@@ -617,7 +641,7 @@ fn instance_row<'a>(
     }
     // Running VMs get a "Console" button (virt-viewer); containers don't
     // have a graphical console in this model.
-    if inst.kind == InstanceKind::Vm && state_is_running(&inst.state) {
+    if inst.local && inst.kind == InstanceKind::Vm && state_is_running(&inst.state) {
         actions = actions.push(variant_button(
             "Console",
             ButtonVariant::Ghost,
@@ -628,8 +652,9 @@ fn instance_row<'a>(
         ));
     }
     // Cold migration moves a *stopped* VM to another host (the disk rides
-    // shared mesh storage); offer it only for a powered-off VM.
-    if inst.kind == InstanceKind::Vm
+    // shared mesh storage); offer it only for a powered-off LOCAL VM.
+    if inst.local
+        && inst.kind == InstanceKind::Vm
         && !state_is_running(&inst.state)
         && !state_is_paused(&inst.state)
     {
@@ -643,11 +668,21 @@ fn instance_row<'a>(
         ));
     }
     let action_cell: Element<'a, crate::Message> = actions.into();
+    // Peer rows read in muted text; the local node's own rows in primary text.
+    let node_color = if inst.local {
+        palette.text
+    } else {
+        palette.text_muted
+    };
     row![
         text(inst.name.clone())
             .size(body)
             .colr(palette.text.into_cosmic_color())
             .width(Length::FillPortion(3)),
+        text(inst.node.clone())
+            .size(body)
+            .colr(node_color.into_cosmic_color())
+            .width(Length::FillPortion(2)),
         text(inst.kind.label())
             .size(body)
             .colr(palette.text_muted.into_cosmic_color())
@@ -1041,6 +1076,7 @@ async fn run_action(program: &str, args: &[String]) {
 async fn enumerate() -> Enumeration {
     let mut instances = Vec::new();
     let mut sources = Vec::new();
+    let local_host = local_hostname();
 
     if let Some(stdout) = run_query("virsh", &["-c", "qemu:///system", "list", "--all"]).await {
         sources.push("virsh");
@@ -1049,6 +1085,8 @@ async fn enumerate() -> Enumeration {
                 name,
                 kind: InstanceKind::Vm,
                 state,
+                node: local_host.clone(),
+                local: true,
             });
         }
     }
@@ -1059,11 +1097,136 @@ async fn enumerate() -> Enumeration {
                 name,
                 kind: InstanceKind::Container,
                 state,
+                node: local_host.clone(),
+                local: true,
             });
         }
     }
 
+    // WORKLOAD-FLEET-1 — merge fleet-wide workloads off the replicated
+    // QNM-Shared plane so a VM on any node is visible from any Workbench. Every
+    // node's `compute_registry` mirrors its inventory to
+    // `<workgroup>/<host>/compute-inventory.json`; fold in any row not already
+    // covered by the local probe (each node also writes its OWN file, so dedup
+    // by node+kind+name keeps self-rows single, local probe winning).
+    if merge_bus_inventory(&mut instances, &local_host) {
+        sources.push("mesh");
+    }
+
     Enumeration { instances, sources }
+}
+
+/// This node's hostname (`/etc/hostname`), trimmed; `"this node"` as a last
+/// resort so a row is never unattributed.
+fn local_hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "this node".to_string())
+}
+
+/// A peer's published compute inventory (subset of the `compute_registry`
+/// `Inventory` doc we need to render — extra fields are ignored).
+#[derive(Debug, Clone, serde::Deserialize)]
+struct BusInventory {
+    #[serde(default)]
+    hostname: String,
+    #[serde(default)]
+    vms: Vec<BusEntry>,
+    #[serde(default)]
+    containers: Vec<BusEntry>,
+}
+
+/// A VM or container row inside a [`BusInventory`].
+#[derive(Debug, Clone, serde::Deserialize)]
+struct BusEntry {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    state: String,
+}
+
+/// Read the newest `compute/inventory/<peer>` document for every peer off the
+/// mesh bus and fold its rows into `instances`, attributed to the peer's
+/// hostname. Returns `true` when at least one inventory document was read
+/// (so the caller can record the `mesh` source). Best-effort: a missing/locked
+/// bus is silently skipped (the panel still shows the local probe).
+fn merge_bus_inventory(instances: &mut Vec<Instance>, local_host: &str) -> bool {
+    let invs = read_shared_inventories();
+    fold_bus_inventories(instances, &invs, local_host)
+}
+
+/// Pure merge step (unit-tested): fold peer inventory docs into `instances`,
+/// attributed to each peer's hostname, skipping this node's own doc and any
+/// row already present (node+kind+name). Returns whether any doc was folded.
+fn fold_bus_inventories(
+    instances: &mut Vec<Instance>,
+    invs: &[BusInventory],
+    local_host: &str,
+) -> bool {
+    if invs.is_empty() {
+        return false;
+    }
+    for inv in invs {
+        let node = if inv.hostname.trim().is_empty() {
+            "unknown".to_string()
+        } else {
+            inv.hostname.trim().to_string()
+        };
+        // This node publishes its own inventory too — its rows duplicate the
+        // local probe, so skip the whole document when it's us.
+        if node == local_host {
+            continue;
+        }
+        let mut fold = |entries: &[BusEntry], kind: InstanceKind| {
+            for e in entries {
+                if e.name.trim().is_empty() {
+                    continue;
+                }
+                let dup = instances
+                    .iter()
+                    .any(|i| i.node == node && i.kind == kind && i.name == e.name);
+                if dup {
+                    continue;
+                }
+                instances.push(Instance {
+                    name: e.name.clone(),
+                    kind,
+                    state: e.state.clone(),
+                    node: node.clone(),
+                    local: false,
+                });
+            }
+        };
+        fold(&inv.vms, InstanceKind::Vm);
+        fold(&inv.containers, InstanceKind::Container);
+    }
+    true
+}
+
+/// Pull each peer's latest compute inventory from the replicated QNM-Shared
+/// plane: `<workgroup>/<host>/compute-inventory.json`, written every tick by
+/// every node's `compute_registry`. This is the cross-node transport — the
+/// `compute/inventory/<peer>` bus topic is per-node (no federation worker), so
+/// reading the local bus would only ever surface this node's own inventory.
+/// Best-effort: a missing/un-mounted share yields an empty list (the panel
+/// still shows the local probe).
+fn read_shared_inventories() -> Vec<BusInventory> {
+    let root = mackes_mesh_types::peers::default_workgroup_root();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for ent in entries.flatten() {
+        let path = ent.path().join("compute-inventory.json");
+        if let Ok(body) = std::fs::read_to_string(&path) {
+            if let Ok(inv) = serde_json::from_str::<BusInventory>(&body) {
+                out.push(inv);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1138,6 +1301,8 @@ mod tests {
                 name: "vm".into(),
                 kind: InstanceKind::Vm,
                 state: "running".into(),
+                node: "fedora".into(),
+                local: true,
             }],
             sources: vec!["virsh", "podman"],
         };
@@ -1154,6 +1319,8 @@ mod tests {
                 name: "fedora-vm".into(),
                 kind: InstanceKind::Vm,
                 state: "running".into(),
+                node: "fedora".into(),
+                local: true,
             }],
             sources: vec!["virsh"],
         }));
@@ -1173,6 +1340,8 @@ mod tests {
                 name: "web".into(),
                 kind: InstanceKind::Container,
                 state: "running".into(),
+                node: "fedora".into(),
+                local: true,
             }],
             sources: vec!["podman"],
         }));
@@ -1225,6 +1394,8 @@ mod tests {
                 name: "vm".into(),
                 kind: InstanceKind::Vm,
                 state: "shut off".into(),
+                node: "fedora".into(),
+                local: true,
             }],
             sources: vec!["virsh"],
         }));
@@ -1352,11 +1523,15 @@ mod tests {
             name: "vm".into(),
             kind: InstanceKind::Vm,
             state: "running".into(),
+            node: "fedora".into(),
+            local: true,
         };
         let container = Instance {
             name: "web".into(),
             kind: InstanceKind::Container,
             state: "running".into(),
+            node: "fedora".into(),
+            local: true,
         };
         let _: Element<'_, crate::Message> =
             instance_row(&running_vm, None, crate::live_theme::palette());
@@ -1416,8 +1591,66 @@ mod tests {
             name: "vm".into(),
             kind: InstanceKind::Vm,
             state: "shut off".into(),
+            node: "fedora".into(),
+            local: true,
         };
         let _: Element<'_, crate::Message> =
             instance_row(&stopped_vm, None, crate::live_theme::palette());
+    }
+
+    #[test]
+    fn fold_bus_inventories_attributes_peers_and_dedups_self() {
+        // The local probe already holds this host's own VM.
+        let mut instances = vec![Instance {
+            name: "MDE-KVM-1".into(),
+            kind: InstanceKind::Vm,
+            state: "running".into(),
+            node: "fedora".into(),
+            local: true,
+        }];
+        let invs = vec![
+            // This node's own published doc — must be skipped (no double row).
+            BusInventory {
+                hostname: "fedora".into(),
+                vms: vec![BusEntry {
+                    name: "MDE-KVM-1".into(),
+                    state: "running".into(),
+                }],
+                containers: vec![],
+            },
+            // A peer's doc — its workloads must appear, attributed to the peer.
+            BusInventory {
+                hostname: "node-13".into(),
+                vms: vec![BusEntry {
+                    name: "web1".into(),
+                    state: "running".into(),
+                }],
+                containers: vec![BusEntry {
+                    name: "db".into(),
+                    state: "exited".into(),
+                }],
+            },
+        ];
+        let folded = fold_bus_inventories(&mut instances, &invs, "fedora");
+        assert!(folded);
+        // 1 local + 2 peer rows; the self doc did NOT duplicate the local VM.
+        assert_eq!(instances.len(), 3);
+        assert_eq!(
+            instances.iter().filter(|i| i.name == "MDE-KVM-1").count(),
+            1
+        );
+        let web = instances.iter().find(|i| i.name == "web1").unwrap();
+        assert_eq!(web.node, "node-13");
+        assert!(!web.local);
+        assert!(instances
+            .iter()
+            .any(|i| i.name == "db" && i.kind == InstanceKind::Container && !i.local));
+    }
+
+    #[test]
+    fn fold_bus_inventories_empty_is_noop() {
+        let mut instances: Vec<Instance> = Vec::new();
+        assert!(!fold_bus_inventories(&mut instances, &[], "fedora"));
+        assert!(instances.is_empty());
     }
 }

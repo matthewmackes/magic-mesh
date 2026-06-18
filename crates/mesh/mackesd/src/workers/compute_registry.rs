@@ -436,6 +436,40 @@ pub fn publish_inventory(peer: &str, inv: &Inventory) {
     crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
 }
 
+/// File name this node's inventory is mirrored to under its QNM-Shared dir.
+pub const SHARED_INVENTORY_FILE: &str = "compute-inventory.json";
+
+/// WORKLOAD-FLEET-1 — mirror this node's inventory to the replicated
+/// QNM-Shared plane at `<mount>/<hostname>/compute-inventory.json`.
+///
+/// Every node's Workbench reads these files to render fleet-wide workloads. The
+/// bus publish is per-node (no federation worker); QNM-Shared is the cross-node
+/// plane, exactly like `shell-status.json`. Atomic (tmp + rename) so a reader
+/// never sees a half-written file. Best-effort: a missing mount / write error is
+/// logged, never fatal (the caller only calls this when the mount is available).
+pub fn write_shared_inventory(mount: &Path, hostname: &str, inv: &Inventory) {
+    if hostname.is_empty() {
+        return;
+    }
+    let dir = mount.join(hostname);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("compute_registry: mkdir {} failed: {e}", dir.display());
+        return;
+    }
+    let Ok(body) = serde_json::to_string(inv) else {
+        return;
+    };
+    let tmp = dir.join("compute-inventory.json.tmp");
+    let final_path = dir.join(SHARED_INVENTORY_FILE);
+    if let Err(e) = std::fs::write(&tmp, body.as_bytes()) {
+        tracing::warn!("compute_registry: write {} failed: {e}", tmp.display());
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &final_path) {
+        tracing::warn!("compute_registry: rename inventory failed: {e}");
+    }
+}
+
 /// One VM state-change event published to `compute/event/<peer>` when
 /// `compute_registry` detects a transition between ticks (VIRT-21).
 /// `hostname` is a superset of the design-doc §3 schema (`vm_id`,
@@ -650,6 +684,13 @@ impl ComputeRegistryWorker {
         // Publish even when peer is empty (Nebula not yet up) so the
         // topic-shape is consistent — subscribers can ignore peer=="".
         publish_inventory(&peer, &inventory);
+        // WORKLOAD-FLEET-1: also mirror to the replicated QNM-Shared plane so
+        // peers' Workbenches can show this node's workloads (the bus is
+        // per-node). Only when the mount is real — never write to a bare local
+        // dir masquerading as the share.
+        if meshfs_available {
+            write_shared_inventory(&self.meshfs_mount, &self.hostname, &inventory);
+        }
 
         // VIRT-21: detect VM state transitions against the prior tick and
         // publish `compute/event/<peer>` for each notable change, then
@@ -933,6 +974,43 @@ mod tests {
         let path = tmp.path().join("abc.nebula-ip");
         std::fs::write(&path, "  10.42.128.7\n").unwrap();
         assert_eq!(read_vm_nebula_ip(tmp.path(), "abc"), "10.42.128.7");
+    }
+
+    // --- write_shared_inventory (WORKLOAD-FLEET-1 cross-node plane) ---
+
+    #[test]
+    fn write_shared_inventory_lands_under_hostname_and_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inv = build_inventory(
+            "10.42.0.3",
+            "fedora",
+            vec![vm("MDE-KVM-1", "running")],
+            vec![],
+            true,
+        );
+        write_shared_inventory(tmp.path(), "fedora", &inv);
+        // Lands at <mount>/<hostname>/compute-inventory.json and parses back.
+        let path = tmp.path().join("fedora").join(SHARED_INVENTORY_FILE);
+        let body = std::fs::read_to_string(&path).expect("inventory file written");
+        let back: Inventory = serde_json::from_str(&body).unwrap();
+        assert_eq!(back.hostname, "fedora");
+        assert_eq!(back.vms.len(), 1);
+        assert_eq!(back.vms[0].name, "MDE-KVM-1");
+        // No stray temp file left behind after the atomic rename.
+        assert!(!tmp
+            .path()
+            .join("fedora")
+            .join("compute-inventory.json.tmp")
+            .exists());
+    }
+
+    #[test]
+    fn write_shared_inventory_skips_empty_hostname() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inv = build_inventory("", "", vec![], vec![], false);
+        write_shared_inventory(tmp.path(), "", &inv);
+        // Nothing created for an empty hostname.
+        assert!(std::fs::read_dir(tmp.path()).unwrap().next().is_none());
     }
 
     // --- build_inventory + the 6 required scenarios ---
