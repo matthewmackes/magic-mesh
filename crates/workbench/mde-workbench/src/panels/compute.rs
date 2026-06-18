@@ -1076,7 +1076,7 @@ async fn run_action(program: &str, args: &[String]) {
 async fn enumerate() -> Enumeration {
     let mut instances = Vec::new();
     let mut sources = Vec::new();
-    let local_host = local_hostname();
+    let (self_ip, local_host) = self_identity();
 
     if let Some(stdout) = run_query("virsh", &["-c", "qemu:///system", "list", "--all"]).await {
         sources.push("virsh");
@@ -1109,27 +1109,68 @@ async fn enumerate() -> Enumeration {
     // `<workgroup>/<host>/compute-inventory.json`; fold in any row not already
     // covered by the local probe (each node also writes its OWN file, so dedup
     // by node+kind+name keeps self-rows single, local probe winning).
-    if merge_bus_inventory(&mut instances, &local_host) {
+    if merge_bus_inventory(&mut instances, &self_ip, &local_host) {
         sources.push("mesh");
     }
 
     Enumeration { instances, sources }
 }
 
-/// This node's hostname (`/etc/hostname`), trimmed; `"this node"` as a last
-/// resort so a row is never unattributed.
-fn local_hostname() -> String {
-    std::fs::read_to_string("/etc/hostname")
+/// This node's `(overlay_ip, friendly_hostname)`. Read from the mesh-status
+/// snapshot (the same source the shell + peers panel use), falling back to
+/// `/proc/sys/kernel/hostname` for the name. The overlay IP is the robust
+/// self-key for the bus inventory (its `peer` field), since the inventory's
+/// `hostname` field is sourced inconsistently across nodes (`/etc/hostname`
+/// when set, else the nebula `node_id` like `peer:<host>`).
+fn self_identity() -> (String, String) {
+    let proc_host = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "this node".to_string())
+        .filter(|s| !s.is_empty());
+    if let Ok(body) = std::fs::read_to_string("/run/mde/mesh-status.json") {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+            let ip = v
+                .get("network")
+                .and_then(|n| n.get("overlay_ip"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let host = v
+                .get("self")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .filter(|s| !s.is_empty())
+                .or_else(|| proc_host.clone())
+                .unwrap_or_else(|| "this node".to_string());
+            return (ip, host);
+        }
+    }
+    (
+        String::new(),
+        proc_host.unwrap_or_else(|| "this node".to_string()),
+    )
+}
+
+/// A friendly node label for display: strip the nebula `peer:` prefix some
+/// nodes carry in their inventory `hostname`, so the Node column reads `fedora`
+/// not `peer:fedora`.
+fn display_host(hostname: &str) -> String {
+    let h = hostname.trim();
+    let h = h.strip_prefix("peer:").unwrap_or(h);
+    if h.is_empty() {
+        "unknown".to_string()
+    } else {
+        h.to_string()
+    }
 }
 
 /// A peer's published compute inventory (subset of the `compute_registry`
 /// `Inventory` doc we need to render — extra fields are ignored).
 #[derive(Debug, Clone, serde::Deserialize)]
 struct BusInventory {
+    /// Publishing node's Nebula overlay IP — the robust self-key.
+    #[serde(default)]
+    peer: String,
     #[serde(default)]
     hostname: String,
     #[serde(default)]
@@ -1152,31 +1193,32 @@ struct BusEntry {
 /// hostname. Returns `true` when at least one inventory document was read
 /// (so the caller can record the `mesh` source). Best-effort: a missing/locked
 /// bus is silently skipped (the panel still shows the local probe).
-fn merge_bus_inventory(instances: &mut Vec<Instance>, local_host: &str) -> bool {
+fn merge_bus_inventory(instances: &mut Vec<Instance>, self_ip: &str, local_host: &str) -> bool {
     let invs = read_shared_inventories();
-    fold_bus_inventories(instances, &invs, local_host)
+    fold_bus_inventories(instances, &invs, self_ip, local_host)
 }
 
 /// Pure merge step (unit-tested): fold peer inventory docs into `instances`,
-/// attributed to each peer's hostname, skipping this node's own doc and any
-/// row already present (node+kind+name). Returns whether any doc was folded.
+/// attributed to each peer's friendly hostname, skipping this node's own doc
+/// (matched by overlay IP, or by friendly hostname as a fallback) and any row
+/// already present (node+kind+name). Returns whether any doc was folded.
 fn fold_bus_inventories(
     instances: &mut Vec<Instance>,
     invs: &[BusInventory],
+    self_ip: &str,
     local_host: &str,
 ) -> bool {
     if invs.is_empty() {
         return false;
     }
     for inv in invs {
-        let node = if inv.hostname.trim().is_empty() {
-            "unknown".to_string()
-        } else {
-            inv.hostname.trim().to_string()
-        };
+        let node = display_host(&inv.hostname);
         // This node publishes its own inventory too — its rows duplicate the
-        // local probe, so skip the whole document when it's us.
-        if node == local_host {
+        // local probe, so skip the whole document when it's us. Match by overlay
+        // IP first (robust), then by friendly hostname (fallback when the
+        // snapshot/overlay IP is unavailable).
+        let is_self = (!self_ip.is_empty() && inv.peer.trim() == self_ip) || node == local_host;
+        if is_self {
             continue;
         }
         let mut fold = |entries: &[BusEntry], kind: InstanceKind| {
@@ -1609,9 +1651,11 @@ mod tests {
             local: true,
         }];
         let invs = vec![
-            // This node's own published doc — must be skipped (no double row).
+            // This node's own published doc — skipped by overlay-IP match (its
+            // hostname is the nebula node_id form, proving IP self-key wins).
             BusInventory {
-                hostname: "fedora".into(),
+                peer: "10.42.0.3".into(),
+                hostname: "peer:fedora".into(),
                 vms: vec![BusEntry {
                     name: "MDE-KVM-1".into(),
                     state: "running".into(),
@@ -1620,6 +1664,7 @@ mod tests {
             },
             // A peer's doc — its workloads must appear, attributed to the peer.
             BusInventory {
+                peer: "10.42.0.5".into(),
                 hostname: "node-13".into(),
                 vms: vec![BusEntry {
                     name: "web1".into(),
@@ -1631,7 +1676,7 @@ mod tests {
                 }],
             },
         ];
-        let folded = fold_bus_inventories(&mut instances, &invs, "fedora");
+        let folded = fold_bus_inventories(&mut instances, &invs, "10.42.0.3", "fedora");
         assert!(folded);
         // 1 local + 2 peer rows; the self doc did NOT duplicate the local VM.
         assert_eq!(instances.len(), 3);
@@ -1650,7 +1695,45 @@ mod tests {
     #[test]
     fn fold_bus_inventories_empty_is_noop() {
         let mut instances: Vec<Instance> = Vec::new();
-        assert!(!fold_bus_inventories(&mut instances, &[], "fedora"));
+        assert!(!fold_bus_inventories(
+            &mut instances,
+            &[],
+            "10.42.0.3",
+            "fedora"
+        ));
         assert!(instances.is_empty());
+    }
+
+    #[test]
+    fn fold_self_skipped_by_hostname_when_no_overlay_ip() {
+        // Fallback path: with no overlay IP known, the self doc is still
+        // skipped by its friendly hostname matching local_host.
+        let mut instances = vec![Instance {
+            name: "MDE-KVM-1".into(),
+            kind: InstanceKind::Vm,
+            state: "running".into(),
+            node: "fedora".into(),
+            local: true,
+        }];
+        let invs = vec![BusInventory {
+            peer: "10.42.0.3".into(),
+            hostname: "peer:fedora".into(),
+            vms: vec![BusEntry {
+                name: "MDE-KVM-1".into(),
+                state: "running".into(),
+            }],
+            containers: vec![],
+        }];
+        // self_ip empty → falls back to display_host("peer:fedora")=="fedora".
+        assert!(fold_bus_inventories(&mut instances, &invs, "", "fedora"));
+        assert_eq!(instances.len(), 1);
+    }
+
+    #[test]
+    fn display_host_strips_peer_prefix() {
+        assert_eq!(display_host("peer:fedora"), "fedora");
+        assert_eq!(display_host("node-13"), "node-13");
+        assert_eq!(display_host("  peer:lh-01 "), "lh-01");
+        assert_eq!(display_host(""), "unknown");
     }
 }
