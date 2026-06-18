@@ -30,6 +30,29 @@ pub const DEFAULT_STALE_MS: u64 = 90_000;
 /// The directory `role` value that marks a lighthouse (design Q1).
 pub const LIGHTHOUSE_ROLE: &str = "lighthouse";
 
+/// How long a leader lease is valid (mirrors `mackesd`'s `leader::LEASE_DURATION`).
+/// A lease older than this is treated as no leader (failover in progress).
+pub const LEASE_DURATION_S: u64 = 60;
+
+/// Parse the current lizardfs-master hostname from the QNM leader-lease file
+/// contents (`<workgroup>/.mackesd-leader.lock`). The lease line is
+/// `node_id\trenewed_at_s\tepoch`; the holder's `peer:<host>` node id maps to
+/// `<host>`. Returns `None` when the lease is empty, malformed, or expired
+/// (older than [`LEASE_DURATION_S`] at `now_s`) — then no lighthouse is the
+/// master and all use the lenient health check. Pure + testable; the file read
+/// lives at the call site so this stays unit-testable.
+#[must_use]
+pub fn master_from_lease(lease_text: &str, now_s: u64) -> Option<String> {
+    let line = lease_text.lines().next()?.trim();
+    let mut parts = line.split('\t');
+    let node_id = parts.next()?;
+    let renewed_at_s: u64 = parts.next()?.parse().ok()?;
+    if node_id.is_empty() || now_s.saturating_sub(renewed_at_s) >= LEASE_DURATION_S {
+        return None;
+    }
+    Some(node_id.strip_prefix("peer:").unwrap_or(node_id).to_string())
+}
+
 /// The 8-position discrete beam, read as a beam of light circling the beacon
 /// (Q9/Q10/Q12). Compass arrows ↑↗→↘↓↙←↖. Shared by the Hub footer and the
 /// Workbench Lighthouses tab so both animate identically.
@@ -331,6 +354,23 @@ mod tests {
         let b = beacon_for(&p, false, now, DEFAULT_STALE_MS);
         assert!(!b.healthy());
         assert_eq!(b.status, BeaconStatus::NoData);
+    }
+
+    #[test]
+    fn master_from_lease_parses_holder_and_honors_expiry() {
+        let now = 1_000_000u64;
+        // Fresh lease → holder with the peer: prefix stripped.
+        let lease = format!("peer:lighthouse-01\t{}\t3\n", now - 10);
+        assert_eq!(
+            master_from_lease(&lease, now),
+            Some("lighthouse-01".to_string())
+        );
+        // Expired lease (older than LEASE_DURATION_S) → no master.
+        let stale = format!("peer:lighthouse-01\t{}\t3\n", now - LEASE_DURATION_S - 5);
+        assert_eq!(master_from_lease(&stale, now), None);
+        // Malformed / empty → None.
+        assert_eq!(master_from_lease("", now), None);
+        assert_eq!(master_from_lease("garbage-only\n", now), None);
     }
 
     #[test]

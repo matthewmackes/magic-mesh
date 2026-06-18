@@ -367,17 +367,9 @@ fn fetch_lighthouses() -> Vec<Beacon> {
 /// `<host>`. Returns `None` when the lease is missing or expired (>60 s old),
 /// in which case no lighthouse is treated as master (all use the lenient check).
 fn fetch_master_hostname(workgroup_root: &std::path::Path) -> Option<String> {
-    const LEASE_DURATION_S: u64 = 60;
     let text = std::fs::read_to_string(workgroup_root.join(".mackesd-leader.lock")).ok()?;
-    let line = text.lines().next()?.trim();
-    let mut parts = line.split('\t');
-    let node_id = parts.next()?;
-    let renewed_at_s: u64 = parts.next()?.parse().ok()?;
     let now_s = u64::try_from(now_ms() / 1000).unwrap_or(0);
-    if now_s.saturating_sub(renewed_at_s) >= LEASE_DURATION_S {
-        return None; // stale lease — failover in progress / leader gone
-    }
-    Some(node_id.strip_prefix("peer:").unwrap_or(node_id).to_string())
+    lighthouse::master_from_lease(&text, now_s)
 }
 
 fn subscription(s: &Center) -> Subscription<Message> {

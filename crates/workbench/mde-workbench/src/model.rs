@@ -213,6 +213,8 @@ pub fn nav_model() -> Vec<NavEntry> {
             panels: vec![
                 // Peers directory first (Q9).
                 Panel::new("peers", "Peers"),
+                // LIGHTHOUSE-5 — the lighthouse ops tab, right after Peers (Q18).
+                Panel::new("lighthouses", "Lighthouses"),
                 Panel::new("mesh_control", "Mesh Control"),
                 Panel::new("mesh_storage", "Mesh Storage"),
                 Panel::new("dns", "Mesh DNS"),

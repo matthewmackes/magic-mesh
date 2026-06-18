@@ -26,6 +26,7 @@ pub mod interfaces;
 pub mod inventory;
 pub mod jobs;
 pub mod json_helpers;
+pub mod lighthouses;
 pub mod logs;
 pub mod mesh_bus;
 pub mod mesh_control;

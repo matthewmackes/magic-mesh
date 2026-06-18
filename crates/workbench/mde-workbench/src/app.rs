@@ -27,7 +27,8 @@ use crate::panels::{
     fleet_rollup as fleet_rollup_panel, fleet_settings as fleet_settings_panel,
     hardware as hardware_panel, health_check as health_check_panel, help_index as help_index_panel,
     home as home_panel, hub as hub_panel, images as images_panel, interfaces as interfaces_panel,
-    inventory as inventory_panel, jobs as jobs_panel, logs as logs_panel,
+    inventory as inventory_panel, jobs as jobs_panel, lighthouses as lighthouses_panel,
+    logs as logs_panel,
     mesh_bus as mesh_bus_panel, mesh_control as mesh_control_panel,
     mesh_federation as mesh_federation_panel, mesh_history as mesh_history_panel,
     mesh_join as mesh_join_panel, mesh_logs as mesh_logs_panel, mesh_pending as mesh_pending_panel,
@@ -175,6 +176,7 @@ pub enum Message {
     Interfaces(interfaces_panel::Message),
     Dns(dns_panel::Message),
     Routing(routing_panel::Message),
+    Lighthouses(lighthouses_panel::Message),
     Tags(tags_panel::Message),
     Profiles(profiles_panel::Message),
     Mirrors(mirrors_panel::Message),
@@ -276,6 +278,7 @@ pub struct App {
     interfaces: interfaces_panel::InterfacesPanel,
     dns: dns_panel::DnsPanel,
     routing: routing_panel::RoutingPanel,
+    lighthouses: lighthouses_panel::LighthousesPanel,
     tags: tags_panel::TagsPanel,
     profiles: profiles_panel::ProfilesPanel,
     mirrors: mirrors_panel::MirrorsPanel,
@@ -382,6 +385,7 @@ impl App {
             interfaces: interfaces_panel::InterfacesPanel::new(),
             dns: dns_panel::DnsPanel::new(),
             routing: routing_panel::RoutingPanel::new(),
+            lighthouses: lighthouses_panel::LighthousesPanel::new(),
             tags: tags_panel::TagsPanel::new(),
             profiles: profiles_panel::ProfilesPanel::new(),
             mirrors: mirrors_panel::MirrorsPanel::new(),
@@ -591,6 +595,19 @@ impl App {
         if self.view.panel_slug() == Some("instances") {
             subs.push(compute_panel::ComputePanel::sample_subscription());
         }
+        // LIGHTHOUSE-5 — only while the Lighthouses tab is open: advance the
+        // beacon beam (150ms) and refresh the cards from the replicated
+        // directory (5s push-ish). Idle elsewhere (no CPU when the tab is shut).
+        if self.view.panel_slug() == Some("lighthouses") {
+            subs.push(
+                cosmic::iced::time::every(Duration::from_millis(150))
+                    .map(|_| Message::Lighthouses(lighthouses_panel::Message::BeamTick)),
+            );
+            subs.push(
+                cosmic::iced::time::every(Duration::from_secs(5))
+                    .map(|_| Message::Lighthouses(lighthouses_panel::Message::Refresh)),
+            );
+        }
         // PD-8 (L14) / PLANES-1 — Netdata sampling only while the Peers
         // directory is the active view (the Compute pattern). The Front
         // Door is reachable as the Peers plane root/panel or the
@@ -758,6 +775,7 @@ impl App {
             Message::Interfaces(msg) => self.interfaces.update(msg),
             Message::Dns(msg) => self.dns.update(msg),
             Message::Routing(msg) => self.routing.update(msg),
+            Message::Lighthouses(msg) => self.lighthouses.update(msg),
             Message::Tags(msg) => self.tags.update(msg),
             Message::Profiles(msg) => self.profiles.update(msg),
             Message::Mirrors(msg) => self.mirrors.update(msg),
@@ -860,6 +878,8 @@ impl App {
             "dns" => dns_panel::DnsPanel::load(),
             // PLANES-19 — the overlay-reachability validation verdict.
             "routing" => routing_panel::RoutingPanel::load(),
+            // LIGHTHOUSE-5 — the lighthouse ops tab loads its cards on nav.
+            "lighthouses" => lighthouses_panel::LighthousesPanel::load(),
             // PLANES-3/W82 — the fleet capability-tag census.
             "tags" => tags_panel::TagsPanel::load(),
             // PLANES-21 — the install-profile catalog.
@@ -936,7 +956,15 @@ impl App {
             // 1.x taskbar click-through behaviour.
             return Task::none();
         }
-        let Some(view) = view_from_focus_slug(slug) else {
+        // LIGHTHOUSE-4 — a "<group>.<panel>:<focus>" slug carries a per-item
+        // focus target (the Hub footer presses `mesh.lighthouses:<host>`). Split
+        // the focus off: the left routes to the view, the right highlights the
+        // item. No existing slug contains a colon, so this is unambiguous.
+        let (route_slug, focus_id) = match slug.split_once(':') {
+            Some((r, f)) => (r, Some(f.to_string())),
+            None => (slug, None),
+        };
+        let Some(view) = view_from_focus_slug(route_slug) else {
             // Unknown slug silently ignored — matches the 1.x
             // `mackes --focus` Dashboard fallback for unmapped
             // surfaces (here we keep the current view since
@@ -946,6 +974,11 @@ impl App {
         };
         self.view = view;
         self.focused_pane = Pane::Main;
+        // Apply the per-item focus before the panel loads so the tab opens
+        // already highlighting + listing the clicked lighthouse first (Q20).
+        if let (Some(focus), View::Panel { panel: "lighthouses", .. }) = (&focus_id, view) {
+            self.lighthouses.set_focus(focus);
+        }
         if let View::Panel { group, panel } = view {
             self.on_panel_navigated(group, panel)
         } else {
@@ -1189,6 +1222,11 @@ impl App {
             View::Panel {
                 panel: "routing", ..
             } => self.routing.view(),
+            // LIGHTHOUSE-5 — the lighthouse ops tab.
+            View::Panel {
+                panel: "lighthouses",
+                ..
+            } => self.lighthouses.view(),
             // PLANES-3/W82 — the fleet capability-tag census.
             View::Panel { panel: "tags", .. } => self.tags.view(),
             // PLANES-21 — the install-profile catalog.

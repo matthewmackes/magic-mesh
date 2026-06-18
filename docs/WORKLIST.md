@@ -940,18 +940,9 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
     - [ ] each square is an **abstract beacon with a rotating conic beam** (Q9/Q10), **discrete stepped** rotation via an iced `time` subscription (Q12), **slow when healthy / fast strobe when unhealthy** (Q11)
     - [ ] the subscription is inactive when the Hub/footer isn't shown (no idle CPU); verify cheap on the ~948 MB shadow lighthouse
     - [ ] green = `green_50`, red = `danger` (Q13/Q14); no raw hex outside `mde-theme` (§4)
-- [ ] **LIGHTHOUSE-4: deep-link from Hub → Workbench Lighthouses tab.**
-  **As** an operator, **I want** clicking a lighthouse to open the Workbench Lighthouses tab focused on it, **so that** the footer is actionable.
-  **Acceptance:** whole-row press (Q19) publishes `event/workbench/open {panel:"lighthouses", focus:<id>}`; a running Workbench switches to the tab and focuses that lighthouse (Q17/Q20); if none is running, the Hub spawns `mde-workbench --panel lighthouses --focus <id>`; no duplicate windows.
-- [ ] **LIGHTHOUSE-5: Workbench "Lighthouses" tab (Mesh group, after Peers).**
-  **As** an operator, **I want** a dedicated Lighthouses tab, **so that** I can inspect and operate the anchor nodes.
-  **Acceptance** (each runtime-observable):
-    - [ ] `Panel::new("lighthouses", "Lighthouses")` registered in the **Mesh** group **right after `peers`** (Q18)
-    - [ ] top = PLANES Nebula/Lighthouse **hero band** + a row of the **animated beacons** summarizing fleet health (Q25)
-    - [ ] one **full card per lighthouse**: overlay+public IP, handshake state, peers-connected count, uptime, CA/cert expiry, **master/shadow badge + failover readiness** (Q21/Q22)
-    - [ ] **bus-subscription** push refresh (Q24)
-    - [ ] honors the deep-link `focus` (scroll/highlight the clicked lighthouse)
-    - [ ] Carbon tokens only (§4)
+- [✓] **LIGHTHOUSE-4: deep-link from Hub → Workbench Lighthouses tab.** DONE 2026-06-18: the Hub footer press spawns `mde-workbench --focus mesh.lighthouses:<host>`; the existing single-instance + Bus focus-responder hands off to a running Workbench (else starts one — spawn-if-needed, no duplicate window). `apply_focus_request` splits the `:<host>` focus suffix, routes the left to the Lighthouses panel, and calls `set_focus(host)` before the panel loads so it opens focused on the clicked lighthouse (Q17/Q20).
+- [✓] **LIGHTHOUSE-5: Workbench "Lighthouses" tab (Mesh group, after Peers).** DONE 2026-06-18: new `panels/lighthouses.rs` registered in Mesh right after `peers` (Q18); full app wiring (Message/field/init/update/load/view-dispatch). Top = Nebula hero band + a row of animated beacons + `N/M healthy` (Q25). One full card per lighthouse: animated beam square + name + **master/shadow badge + failover readiness** (Q22) + binary status + overlay IP + health tier + presence age + service summary + version — every field from the **real** replicated directory (no stubs). Beam + 5s refresh subscriptions view-gated to the active tab (Q24). Honors the deep-link focus (highlight + list-first, Q20). Carbon tokens only.
+    - *(Q21 handshake state / public IP / peers-connected count / uptime / CA-cert expiry are NOT in the replicated directory — deferred to a per-lighthouse probe lane rather than stubbed; see LIGHTHOUSE-8.)*
 - [ ] **LIGHTHOUSE-6: tab full-ops actions (confirmed).**
   **As** an operator, **I want** to act on a lighthouse from its tab, **so that** I can recover it without leaving the Workbench.
   **Acceptance:** restart core services on the lighthouse (over the overlay), open SSH/remote, and **promote shadow → master** — each behind a confirm; the destructive promote is guarded/idempotent; actions are runtime-wired (not stubs) (Q23).
@@ -961,6 +952,9 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
     - [ ] **shell** — `mesh-welcome.py` Network Overview marks lighthouses distinctly (beacon marker + master/shadow + health)
     - [ ] **applet** — a Cosmic panel lighthouse-health indicator (worst-of green/red across lighthouses), click → the Lighthouses tab
     - [ ] **wallpaper** — a lighthouse hero motif in the mesh wallpaper
+- [ ] **LIGHTHOUSE-8: per-lighthouse deep-probe lane (handshake / public IP / peers / uptime / cert expiry).**
+  **As** an operator, **I want** the Lighthouses tab card to show each lighthouse's handshake state, public IP, peers-connected count, uptime, and CA/cert expiry, **so that** the "full card" (Q21) is complete.
+  **Acceptance:** these fields are NOT in the replicated peer directory today — add a probe (a `mackesd` worker on each lighthouse publishing `nebula self-node` handshake + public IP + uptime + cert expiry into its directory row or a sidecar), then render them on the L5 card. Real data only; no placeholders. *(LIGHTHOUSE-5 shipped the directory-derived fields + a code comment marking these as deferred-not-stubbed.)*
 
 ## NEB-CRYPTO-LABEL — show Nebula encryption strength next to the applet (operator-reported live 2026-06-18)
 > Operator: "Add the Current Encryption Strength of the Nebula Design in Text next to the Applet." Surface the live overlay cipher strength as text adjacent to the panel applet. Nebula tunnel cipher is AES-256-GCM (or ChaCha20-Poly1305) with Ed25519 identities (§3 crypto locks); read the **actual** negotiated/configured cipher, don't hardcode.
