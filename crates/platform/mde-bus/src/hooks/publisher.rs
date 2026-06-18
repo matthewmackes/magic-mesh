@@ -214,7 +214,7 @@ mod tests {
             ntfy_topic("peer/UNIT-EAGLE/alerts"),
             "peer_UNIT-EAGLE_alerts"
         );
-        assert_eq!(ntfy_topic("fdo/MCNF Alerts"), "fdo_Magic_Mesh_Alerts");
+        assert_eq!(ntfy_topic("fdo/MCNF Alerts"), "fdo_MCNF_Alerts");
         assert_eq!(ntfy_topic("fleet/sec"), "fleet_sec");
         assert_eq!(ntfy_topic("flat"), "flat");
         // valid ntfy class only, capped at 64, never empty.

@@ -567,9 +567,11 @@ adapters:
         let raw = captured.lock().unwrap().clone();
         assert_eq!(raw.len(), 1, "expected exactly one publish: {raw:?}");
         let req = &raw[0];
+        // The ntfy topic is a single path segment, so `gh/push` flattens to
+        // `gh_push` in the URL (the real topic rides the `x-topic` header).
         assert!(
-            req.contains("POST /gh/push"),
-            "expected topic in path: {req}"
+            req.contains("POST /gh_push") && req.contains("x-topic: gh/push"),
+            "expected flattened topic in path + real topic header: {req}"
         );
         let title_ok = req.contains("matthewmackes/MDE-X push to main");
         assert!(title_ok, "title rendering wrong:\n{req}");
