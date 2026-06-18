@@ -1255,22 +1255,65 @@ impl State {
                     for chunk in items.chunks(cols) {
                         let mut r = row![].spacing(8);
                         for item in chunk {
-                            let card_content: Element<'_, Message> =
-                                if let Some(handle) = self.art_cache.get(&item.id) {
-                                    column![
-                                        image(handle.clone())
-                                            .width(Length::Fill)
-                                            .height(Length::Fixed(120.0)),
-                                        text(item.label.clone()).size(12),
-                                    ]
-                                    .spacing(4)
+                            // MUSIC-ALBUMS-3 — Carbon album card: square art tile
+                            // (raised fill + ♪ placeholder until art loads) over
+                            // a 2-line title.
+                            let cpal = mde_theme::Palette::dark();
+                            let art_inner: Element<'_, Message> = if let Some(handle) =
+                                self.art_cache.get(&item.id)
+                            {
+                                image(handle.clone())
+                                    .width(Length::Fill)
+                                    .height(Length::Fixed(150.0))
                                     .into()
-                                } else {
-                                    text(item.label.clone()).into()
-                                };
+                            } else {
+                                container(
+                                    text("\u{266A}").size(30).colr(carbon(cpal.text_muted, 1.0)),
+                                )
+                                .center_x(Length::Fill)
+                                .center_y(Length::Fixed(150.0))
+                                .into()
+                            };
+                            let art = container(art_inner)
+                                .width(Length::Fill)
+                                .height(Length::Fixed(150.0))
+                                .style({
+                                    let bg = carbon(cpal.raised, 1.0);
+                                    move |_| cosmic::iced::widget::container::Style {
+                                        background: Some(bg.into()),
+                                        ..Default::default()
+                                    }
+                                });
+                            let card_content: Element<'_, Message> = column![
+                                art,
+                                text(item.label.clone())
+                                    .size(13)
+                                    .colr(carbon(cpal.text, 1.0)),
+                            ]
+                            .spacing(8)
+                            .into();
                             let mut btn = button(card_content)
                                 .width(Length::Fixed(160.0))
-                                .height(Length::Fixed(160.0));
+                                .padding(0)
+                                .sty({
+                                    let accent = carbon(cpal.accent, 1.0);
+                                    move |_t, status| cosmic::iced::widget::button::Style {
+                                        background: None,
+                                        border: cosmic::iced::Border {
+                                            color: if matches!(
+                                                status,
+                                                cosmic::iced::widget::button::Status::Hovered
+                                            ) {
+                                                accent
+                                            } else {
+                                                cosmic::iced::Color::TRANSPARENT
+                                            },
+                                            width: 2.0,
+                                            radius: 0.0.into(),
+                                        },
+                                        ..cosmic::iced::widget::button::Style::default()
+                                    }
+                                });
                             btn = match route {
                                 Route::Category(HubCard::Albums)
                                 | Route::Genre(_)
