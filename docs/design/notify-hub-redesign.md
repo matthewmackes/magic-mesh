@@ -36,7 +36,10 @@ SIP Phone status".)
 | O2 | Echo-loop prevention | **Debounce identical content** within a window (drop a copy matching a recent clip) — covers the click-to-load echo without origin-tagging. |
 | O3 | Duplicate handling | **Dedup — move the existing entry to the top** (one entry per unique text). |
 | O4 | Per-clip size cap | **No cap** — sync any text regardless of size. ⚠ Interacts with [[BUS-RUN-FULL]]: large clips inflate the bus + QNM history on small nodes — the bus retention worker (BUS-RUN-FULL-1) MUST bound this, and the QNM history stays at 50+pinned. |
-| O5 | (round 2 pending) | size-cap/clear-all-scope/origin-attribution/pin-cap/multi-user-scope still open. |
+| O5 | Clear-all scope | **Mesh-wide, pinned survive** — clears all unpinned entries across every node; pinned stay everywhere. |
+| O6 | Origin attribution | **Show source node + relative time** per entry (e.g. "fedora · 2m ago"). |
+| O7 | Pin behavior | **Pins exempt from the 50-cap + unlimited** — pin as many as wanted; they always survive. |
+| O8 | Scope | **One mesh-global history** — a single shared clipboard for the whole mesh, regardless of user/node (single-operator model). |
 
 ## Worklist
 - NOTIFY-HUB-1: Start-Menu-idiom restyle (Carbon, zebra, sections, light+dark).
