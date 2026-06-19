@@ -578,6 +578,47 @@ fn publish_quota_warning(
     Ok(())
 }
 
+/// BUS-RETENTION-2 — publish a `/run`-low warning to the **`mackesd::alert`**
+/// lane so it surfaces in the Notification Hub (unlike `bus/sys/quota`, which is
+/// not an alert lane). The bus spool lives on a small `/run` tmpfs; a near-full
+/// `/run` breaks runtime locks (dnf, the bus's own WAL) — the failure class that
+/// blocked the v10.0.18 fleet roll. The caller (mackesd, which can `df`) detects
+/// the headroom and calls this on the transition into the low state.
+/// `Priority::High` → the Hub renders it as a Warning.
+///
+/// # Errors
+/// [`RetentionError::Io`] if the Persist open or write fails.
+pub fn publish_run_low_warning(
+    bus_root: &Path,
+    avail_mb: u64,
+    total_mb: u64,
+) -> Result<(), RetentionError> {
+    let p = Persist::open(bus_root.to_path_buf())
+        .map_err(|e| RetentionError::Io(format!("open persist: {e}")))?;
+    let pct = if total_mb > 0 {
+        avail_mb * 100 / total_mb
+    } else {
+        0
+    };
+    let title = format!("Low /run space — {avail_mb} MB free ({pct}%)");
+    let body = format!(
+        "The filesystem backing the message bus ({}) is nearly full: \
+         {avail_mb} MB free of {total_mb} MB ({pct}%).\n\n\
+         A full /run breaks runtime locks (dnf, the bus index WAL) and can wedge \
+         the node. The bus retention GC is shedding to recover; if this persists, \
+         free /run space or check for a runaway writer.",
+        bus_root.display(),
+    );
+    p.write(
+        "mackesd::alert",
+        crate::hooks::config::Priority::High,
+        Some(&title),
+        Some(&body),
+    )
+    .map_err(|e| RetentionError::Io(format!("publish run-low warning: {e}")))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1018,6 +1059,25 @@ mod tests {
             db_after < db_before / 2,
             "index DB must shrink after the reap: before={db_before} after={db_after}",
         );
+    }
+
+    #[test]
+    fn run_low_warning_lands_on_the_hub_alert_lane() {
+        // BUS-RETENTION-2 — the /run-low warning must publish to `mackesd::alert`
+        // (a Hub alert lane) so the operator actually sees it.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        publish_run_low_warning(&root, 24, 190).unwrap();
+        let p = Persist::open(root.clone()).unwrap();
+        let msgs = p.list_since("mackesd::alert", None).unwrap();
+        assert_eq!(msgs.len(), 1, "exactly one run-low alert published");
+        let m = &msgs[0];
+        assert!(
+            m.title.as_deref().unwrap_or("").contains("Low /run"),
+            "title names the condition"
+        );
+        // High priority → the Hub classifies it as a Warning.
+        assert_eq!(m.priority, "high");
     }
 
     #[test]

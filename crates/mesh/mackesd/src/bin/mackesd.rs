@@ -5054,6 +5054,29 @@ fn filesystem_total_bytes(path: &std::path::Path) -> Option<u64> {
         .ok()
 }
 
+/// BUS-RETENTION-2 — free (available) bytes on the filesystem backing `path`.
+/// Used to detect a near-full `/run` (the bus tmpfs) so mackesd can warn before
+/// it fills + breaks runtime locks. `df --output=avail` mirrors
+/// [`filesystem_total_bytes`]; `None` if `df` fails (degrade silently).
+#[cfg(feature = "async-services")]
+fn filesystem_avail_bytes(path: &std::path::Path) -> Option<u64> {
+    let out = std::process::Command::new("df")
+        .arg("-B1")
+        .arg("--output=avail")
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .nth(1)?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
 /// BULLETPROOF-1 — a filesystem-relative bus retention policy. The bus spool
 /// lives on `/run` (tmpfs), whose size ranges from ~190 MB (lighthouse) to
 /// multiple GB (workstation). Cap hard at ~50% of the hosting filesystem and
@@ -6533,6 +6556,9 @@ fn run_serve(
                     // Faster than the 1h library default — a small tmpfs needs
                     // tighter bounding; cheap (a SQLite scan + a dir walk).
                     let interval = std::time::Duration::from_secs(120);
+                    // BUS-RETENTION-2 — edge-triggered /run-low alert state, so we
+                    // warn once on the transition into low rather than every pass.
+                    let mut run_low = false;
                     while !resp_shutdown.load(Ordering::Relaxed) {
                         match mde_bus::retention::run_pass_at(
                             &policy,
@@ -6547,6 +6573,31 @@ fn run_serve(
                                 removed = r.removed, bytes_after = r.bytes_after, "bus retention pass"
                             ),
                             Err(e) => tracing::warn!(error = %e, "bus retention pass failed"),
+                        }
+                        // BUS-RETENTION-2 — headroom guard. A full /run breaks
+                        // dnf + the bus's own WAL (the v10.0.18 roll failure). The
+                        // pass above already compacts; here we warn the operator
+                        // (Hub) when free space drops below 15%, edge-triggered.
+                        if let (Some(avail), Some(total)) = (
+                            filesystem_avail_bytes(&bus_root),
+                            filesystem_total_bytes(&bus_root),
+                        ) {
+                            let low = total > 0 && avail * 100 / total < 15;
+                            if low && !run_low {
+                                match mde_bus::retention::publish_run_low_warning(
+                                    &bus_root,
+                                    avail / 1024 / 1024,
+                                    total / 1024 / 1024,
+                                ) {
+                                    Ok(()) => tracing::warn!(
+                                        avail_mb = avail / 1024 / 1024,
+                                        total_mb = total / 1024 / 1024,
+                                        "bus retention: /run low (<15% free) — raised mackesd::alert (BUS-RETENTION-2)"
+                                    ),
+                                    Err(e) => tracing::warn!(error = %e, "failed to publish /run-low alert"),
+                                }
+                            }
+                            run_low = low;
                         }
                         // Sleep in short slices so shutdown is responsive.
                         for _ in 0..interval.as_secs() {

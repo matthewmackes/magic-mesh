@@ -59,6 +59,21 @@ if systemctl list-unit-files qnm-shared.service >/dev/null 2>&1 && [ -d "$QNM" ]
     fi
 fi
 
+# 0b. BUS-RETENTION-2 — /run headroom guard. The message bus spool lives on /run
+#     (tmpfs); a full /run breaks runtime locks — dnf AND the bus index WAL (so
+#     the bus's own GC can no longer delete rows). This is the failure class that
+#     blocked the v10.0.18 fleet roll. mackesd's in-process GC also raises a Hub
+#     alert, but flag it here too since the watchdog runs even if mackesd is wedged.
+RUN_AVAIL=$(df -B1 --output=avail /run 2>/dev/null | tail -1 | tr -d ' ')
+RUN_TOTAL=$(df -B1 --output=size  /run 2>/dev/null | tail -1 | tr -d ' ')
+if [ -n "${RUN_AVAIL:-}" ] && [ -n "${RUN_TOTAL:-}" ] && [ "$RUN_TOTAL" -gt 0 ]; then
+    RUN_PCT=$(( RUN_AVAIL * 100 / RUN_TOTAL ))
+    if [ "$RUN_PCT" -lt 15 ]; then
+        log "WARN: /run low — ${RUN_PCT}% free ($(( RUN_AVAIL/1024/1024 ))MB of $(( RUN_TOTAL/1024/1024 ))MB); bus/dnf locks at risk"
+        alert "run-low" "/run at ${RUN_PCT}% free on $(hostname) — bus + dnf runtime locks at risk"
+    fi
+fi
+
 # 1. The worker daemon must be active. If it stopped (incl. StartLimit
 #    exhaustion → 'failed'), restart resets the counter and revives it.
 if ! systemctl is-active --quiet mackesd.service; then
