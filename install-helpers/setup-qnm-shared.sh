@@ -194,7 +194,7 @@ RemainAfterExit=yes
 # (/dev/tcp is unavailable under /bin/sh=dash, which made the old probe spin the
 # full timeout and block mackesd). Bounded ~2 min; on a genuinely-down master it
 # exits non-zero → Restart + the mesh-health watchdog keep retrying.
-ExecStart=/bin/sh -c 'i=0; while [ \$i -lt 30 ]; do mountpoint -q $QNM_PATH && exit 0; if [ -n "\$(ls -A $QNM_PATH 2>/dev/null)" ]; then d=/var/lib/mde/qnm-stray-\$(date +%s 2>/dev/null || echo bk); mkdir -p \$d; mv $QNM_PATH/* $QNM_PATH/.[!.]* \$d/ 2>/dev/null; fi; mfsmount $QNM_PATH -H $MASTER_IP -o allow_other,nonempty 2>/dev/null && exit 0; i=\$((i+1)); sleep 2; done; exit 1'
+ExecStart=/bin/sh -c 'i=0; while [ \$i -lt 30 ]; do mountpoint -q $QNM_PATH && exit 0; fusermount -u $QNM_PATH 2>/dev/null; pkill -f "mfsmount $QNM_PATH" 2>/dev/null; sleep 1; if [ -n "\$(ls -A $QNM_PATH 2>/dev/null)" ]; then d=/var/lib/mde/qnm-stray-\$(date +%s 2>/dev/null || echo bk); mkdir -p \$d; mv $QNM_PATH/* $QNM_PATH/.[!.]* \$d/ 2>/dev/null; fi; mfsmount $QNM_PATH -H $MASTER_IP -o allow_other,nonempty 2>/dev/null; sleep 3; mountpoint -q $QNM_PATH && exit 0; i=\$((i+1)); sleep 2; done; exit 1'
 ExecStop=/bin/sh -c 'fusermount -u $QNM_PATH 2>/dev/null || umount -l $QNM_PATH 2>/dev/null || true'
 Restart=on-failure
 # BOOT-XPA8-2 — a disconnected node (laptop off-mesh) can never mount, so don't
