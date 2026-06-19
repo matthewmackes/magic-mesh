@@ -28,6 +28,8 @@
 // single source of truth (local XDG+flatpak, mesh peers, workloads, services).
 pub mod apps;
 pub mod bus_bridge;
+// CONNECT-1 — action/connect/* exposure-policy responder.
+pub mod connect;
 pub mod directory;
 pub mod files;
 pub mod fleet;

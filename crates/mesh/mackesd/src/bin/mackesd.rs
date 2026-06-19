@@ -6719,6 +6719,43 @@ fn run_serve(
                 );
             }
         }
+        // CONNECT-1 — the connectivity/exposure responder: action/connect/*
+        // serves the per-service exposure policy (mesh-only vs public-via-ingress)
+        // from the shared-substrate TOML. Same dedicated-OS-thread shape.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let connect_svc =
+                    mackesd_core::ipc::connect::ConnectService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("connect-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::connect::serve_bus(&persist, &connect_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "Connect Bus responder spawned; serving \
+                             action/connect/{{list-services,set-policy,expose,unexpose,\
+                             list-templates,set-template}} (CONNECT-1)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Connect Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("connect_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Connect Bus responder: bus persist open failed; responder skipped");
+            }
+        }
         // PD-1 — the peer-directory responder: action/mesh/directory
         // answers with the joined per-peer record (presence tier,
         // health, version, overlay ip/role, revision currency). Same
