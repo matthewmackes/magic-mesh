@@ -168,6 +168,8 @@ struct MusicNow {
     audio_available: bool,
     /// AUDIT-MESH-4 — no Airsonic server configured yet (prompt to set one up).
     needs_airsonic: bool,
+    /// MUSIC-HUB-2 — the current track's `coverArt` token (for the art thumbnail).
+    cover_art: Option<String>,
 }
 
 /// NOTIFY-AC — the voice agent snapshot for the Voice section.
@@ -206,6 +208,10 @@ struct Center {
     /// LIGHTHOUSE-3 — the beam-animation phase, advanced by the beam tick. Per-
     /// beacon position derives from this (healthy slow / unhealthy fast).
     beam_step: u16,
+    /// MUSIC-HUB-2 — decoded cover art for the current track + the coverArt id it
+    /// was fetched for (so the art is re-fetched only when the track changes).
+    now_art: Option<cosmic::iced::widget::image::Handle>,
+    now_art_id: Option<String>,
 }
 
 impl Center {
@@ -220,6 +226,8 @@ impl Center {
             shared_rx: None,
             lighthouses: Vec::new(),
             beam_step: 0,
+            now_art: None,
+            now_art_id: None,
         }
     }
 }
@@ -295,7 +303,7 @@ fn fetch_music() -> Option<MusicNow> {
         .unwrap_or(false);
     // get-song: browse reply {ok, result:{song:{title, artist}}}.
     let body = serde_json::json!({ "id": song_id }).to_string();
-    let (title, artist) = mde_workbench::dbus::action_request_with_body(
+    let (title, artist, cover_art) = mde_workbench::dbus::action_request_with_body(
         "action/music/get-song",
         Some(&body),
         Duration::from_millis(700),
@@ -312,9 +320,14 @@ fn fetch_music() -> Option<MusicNow> {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .to_string();
-        Some((title, artist))
+        // MUSIC-HUB-2 — the coverArt token for the art thumbnail.
+        let cover_art = song
+            .get("coverArt")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        Some((title, artist, cover_art))
     })
-    .unwrap_or_else(|| ("Unknown track".to_string(), String::new()));
+    .unwrap_or_else(|| ("Unknown track".to_string(), String::new(), None));
     Some(MusicNow {
         active: true,
         playing,
@@ -322,7 +335,28 @@ fn fetch_music() -> Option<MusicNow> {
         artist,
         audio_available,
         needs_airsonic,
+        cover_art,
     })
+}
+
+/// MUSIC-HUB-2 — fetch + decode the current track's cover art over the Bus
+/// (`action/music/get-cover-art` with the coverArt token in the body → base64
+/// `result.art`). `None` when there's no art / the daemon is down.
+fn fetch_cover_art(cover_id: &str) -> Option<cosmic::iced::widget::image::Handle> {
+    use base64::Engine;
+    use std::time::Duration;
+    let reply = mde_workbench::dbus::action_request_with_body(
+        "action/music/get-cover-art",
+        Some(cover_id),
+        Duration::from_millis(1200),
+    )?;
+    let v: serde_json::Value = serde_json::from_str(&reply).ok()?;
+    let b64 = v.get("result")?.get("art")?.as_str()?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(cosmic::iced::widget::image::Handle::from_bytes(bytes))
 }
 
 /// NOTIFY-AC — read the latest `state/voice/status` snapshot from the bus.
@@ -496,6 +530,12 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
             }
             // LIGHTHOUSE-3 — refresh the pinned lighthouse footer beacons.
             state.lighthouses = fetch_lighthouses();
+            // MUSIC-HUB-2 — (re)fetch the cover art only when the track changes.
+            let cover = state.music.as_ref().and_then(|m| m.cover_art.clone());
+            if cover != state.now_art_id {
+                state.now_art = cover.as_deref().and_then(fetch_cover_art);
+                state.now_art_id = cover;
+            }
         }
         Message::BeamTick => {
             state.beam_step = state.beam_step.wrapping_add(1);
@@ -718,9 +758,9 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
     // Workbench, MDE-Files, or Cosmic Settings, then dismiss the panel.
     let launch_bar = container(
         row![
-            launch_tile("Workbench", "mde-workbench", p),
-            launch_tile("MDE-Files", "mde-files", p),
-            launch_tile("Settings", "cosmic-settings", p),
+            launch_tile("\u{2317}\u{FE0E}", "Workbench", "mde-workbench", p),
+            launch_tile("\u{25A4}", "Files", "mde-files", p),
+            launch_tile("\u{2699}\u{FE0E}", "Settings", "cosmic-settings", p),
         ]
         .spacing(8),
     )
@@ -752,7 +792,7 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
     let mut sections: Vec<Element<'_, Message>> = vec![
         container(scroll).height(Length::Fill).into(),
         section_divider(p),
-        now_playing_section(state.music.as_ref(), p),
+        now_playing_section(state.music.as_ref(), state.now_art.as_ref(), p),
         section_divider(p),
         voice_section(state.voice.as_ref(), p),
     ];
@@ -783,28 +823,56 @@ fn section_divider(p: Palette) -> Element<'static, Message> {
         .into()
 }
 
-/// NOTIFY-AC — the "Now Playing" media section: track line + transport controls.
-/// Honest idle state when nothing is playing / the music daemon is down.
-fn now_playing_section(music: Option<&MusicNow>, p: Palette) -> Element<'static, Message> {
+/// NOTIFY-AC / MUSIC-HUB-2 — the "Now Playing" media section, styled to match the
+/// Music app's mini playback bar: a square album-art tile + a title/artist stack
+/// + the transport controls. Honest idle state when nothing is playing.
+fn now_playing_section(
+    music: Option<&MusicNow>,
+    art: Option<&cosmic::iced::widget::image::Handle>,
+    p: Palette,
+) -> Element<'static, Message> {
     let body: Element<'static, Message> = match music {
         Some(m) if m.active => {
-            let track = if m.artist.is_empty() {
-                m.title.clone()
-            } else {
-                format!("{} — {}", m.title, m.artist)
-            };
             let toggle_glyph = if m.playing { "\u{2016}" } else { "\u{25B6}" };
+            // MUSIC-HUB-2 — 40×40 art tile (real cover when available, else a
+            // muted ♪ placeholder on the raised layer), mirroring the mini-player.
+            let art_tile: Element<'static, Message> = match art {
+                Some(h) => cosmic::iced::widget::image(h.clone())
+                    .width(Length::Fixed(40.0))
+                    .height(Length::Fixed(40.0))
+                    .into(),
+                None => container(text("♪").size(16).color(p.text_muted.into_cosmic_color()))
+                    .width(Length::Fixed(40.0))
+                    .height(Length::Fixed(40.0))
+                    .align_x(cosmic::iced::alignment::Horizontal::Center)
+                    .align_y(cosmic::iced::alignment::Vertical::Center)
+                    .style(move |_| container::Style {
+                        background: Some(cosmic::iced::Background::Color(
+                            p.raised.into_cosmic_color(),
+                        )),
+                        ..Default::default()
+                    })
+                    .into(),
+            };
+            let meta = column![
+                text(m.title.clone())
+                    .size(13)
+                    .color(p.text.into_cosmic_color()),
+                text(m.artist.clone())
+                    .size(11)
+                    .color(p.text_muted.into_cosmic_color()),
+            ]
+            .spacing(1)
+            .width(Length::Fill);
             row![
-                text("♪").size(14).color(p.accent.into_cosmic_color()),
-                Space::new().width(Length::Fixed(8.0)),
-                text(track)
-                    .size(12)
-                    .color(p.text.into_cosmic_color())
-                    .width(Length::Fill),
+                art_tile,
+                Space::new().width(Length::Fixed(10.0)),
+                meta,
                 transport_button("\u{25C0}", Message::MusicPrev, p),
                 transport_button(toggle_glyph, Message::MusicToggle, p),
                 transport_button("\u{25B6}", Message::MusicNext, p),
             ]
+            .spacing(4)
             .align_y(cosmic::iced::Alignment::Center)
             .into()
         }
@@ -985,13 +1053,28 @@ fn transport_button(glyph: &str, msg: Message, p: Palette) -> Element<'_, Messag
 }
 
 /// A bottom quick-launch tile: label + the binary it spawns (`OpenApp`).
-fn launch_tile<'a>(label: &'a str, cmd: &'static str, p: Palette) -> Element<'a, Message> {
+/// MUSIC-HUB-3 — a quick-launch tile matching the Application Menu's quick-link
+/// tiles: a glyph over a centred label, equal-width. (The applet uses the same
+/// ⌗ / ▤ / ⚙ glyphs for Workbench / Files / Settings.)
+fn launch_tile<'a>(
+    glyph: &'a str,
+    label: &'a str,
+    cmd: &'static str,
+    p: Palette,
+) -> Element<'a, Message> {
     button(
-        container(text(label).size(12).color(p.text.into_cosmic_color()))
-            .center_x(Length::Fill)
-            .padding(Padding::from([8u16, 6u16])),
+        cosmic::iced::widget::column![
+            text(glyph.to_string())
+                .size(18)
+                .color(p.text.into_cosmic_color()),
+            text(label).size(12).color(p.text.into_cosmic_color()),
+        ]
+        .spacing(6)
+        .align_x(cosmic::iced::Alignment::Center)
+        .width(Length::Fill),
     )
     .width(Length::Fill)
+    .padding(Padding::from([8u16, 6u16]))
     .on_press(Message::OpenApp(cmd))
     .into()
 }

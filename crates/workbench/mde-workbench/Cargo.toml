@@ -47,6 +47,8 @@ async-stream = "0.3"
 futures      = "0.3"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
+# MUSIC-HUB-2 — decode the Hub now-playing cover art (base64 over the Bus).
+base64     = "0.22"
 # BUS-7.6 — DND tab reads/writes subs.yaml + dnd.yaml; same version
 # mde-bus uses so the workspace resolves to one copy in the lock.
 serde_yaml = "0.9"
