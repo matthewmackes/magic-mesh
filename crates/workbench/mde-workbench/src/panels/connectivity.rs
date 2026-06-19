@@ -22,16 +22,32 @@
 
 use std::time::{Duration, SystemTime};
 
-use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
+use cosmic::iced::widget::{
+    button, column, container, pick_list, row, scrollable, text, text_input, Space,
+};
 use cosmic::iced::{Background, Border, Color, Length, Padding, Task};
 use cosmic::{Element, Theme};
 use mde_theme::{FontSize, Palette, TypeRole};
 use serde::Deserialize;
+use serde_json::json;
 
+use crate::controls::{variant_button, ButtonVariant};
 use crate::cosmic_compat::prelude::*;
 
 /// Read budget for the connect Bus probes — matches the other panels' 2 s.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Write budget for the expose/unexpose mutations — they only rewrite the
+/// policy TOML on the shared substrate (the worker reconciles Caddy/firewalld
+/// on its own tick), so the same 2 s read budget is generous.
+const APPLY_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Tier choices for the Expose wizard's pick_list (wire values).
+const TIER_CHOICES: [&str; 2] = ["mesh-only", "public-via-ingress"];
+/// Source-kind choices.
+const KIND_CHOICES: [&str; 3] = ["host", "vm", "container"];
+/// Protocol-mode choices (how the ingress carries a public service).
+const MODE_CHOICES: [&str; 3] = ["http", "tcp", "udp"];
 
 /// One configured exposure policy row (subset of `exposure::ExposurePolicy` —
 /// the fields the matrix renders). Decoded from `list-services`.
@@ -108,6 +124,27 @@ pub struct ConnectivityPanel {
     pub last_run_at: Option<SystemTime>,
     /// Last operator-facing line — a summary or the failure mode.
     pub last_op: String,
+    // ── CONNECT-7 — Expose wizard form state ───────────────────────
+    /// Service id to create/expose.
+    pub form_id: String,
+    /// Hosting node (defaults to the candidate's node on prefill).
+    pub form_node: String,
+    /// Service port (text input → parsed u16 on apply).
+    pub form_port: String,
+    /// L4 protocol the service listens on (`tcp`/`udp`).
+    pub form_proto: String,
+    /// host / vm / container.
+    pub form_kind: String,
+    /// mesh-only / public-via-ingress.
+    pub form_tier: String,
+    /// Ingress lighthouse (public only).
+    pub form_lighthouse: String,
+    /// Public DDNS hostname (public only).
+    pub form_hostname: String,
+    /// Ingress protocol mode (http/tcp/udp, public only).
+    pub form_mode: String,
+    /// True while an expose/unexpose mutation is in flight.
+    pub applying: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -118,12 +155,42 @@ pub enum Message {
         error: Option<String>,
     },
     RefreshClicked,
+    // ── CONNECT-7 — Expose wizard ──────────────────────────────────
+    FormIdChanged(String),
+    FormNodeChanged(String),
+    FormPortChanged(String),
+    FormKindSelected(String),
+    FormTierSelected(String),
+    FormLighthouseChanged(String),
+    FormHostnameChanged(String),
+    FormModeSelected(String),
+    /// Prefill the form from a discovered candidate or an existing row
+    /// (defaults the tier to public-via-ingress — the usual reason to prefill).
+    Prefill {
+        id: String,
+        node: String,
+        kind: String,
+        port: u16,
+        proto: String,
+    },
+    /// Validate + apply the form (set-policy, then expose when public).
+    ExposeClicked,
+    /// Revert a published service to mesh-only.
+    UnexposeClicked(String),
+    /// A mutation completed (Ok message or Err diagnostic) — triggers reload.
+    Applied(Result<String, String>),
 }
 
 impl ConnectivityPanel {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            form_kind: "host".into(),
+            form_proto: "tcp".into(),
+            form_tier: "mesh-only".into(),
+            form_mode: "http".into(),
+            ..Self::default()
+        }
     }
 
     pub fn load() -> Task<crate::Message> {
@@ -179,7 +246,150 @@ impl ConnectivityPanel {
                 self.last_op = "refreshing…".into();
                 Self::load()
             }
+            Message::FormIdChanged(v) => {
+                self.form_id = v;
+                Task::none()
+            }
+            Message::FormNodeChanged(v) => {
+                self.form_node = v;
+                Task::none()
+            }
+            Message::FormPortChanged(v) => {
+                // Keep digits only so the parse on apply can't surprise the operator.
+                self.form_port = v.chars().filter(char::is_ascii_digit).collect();
+                Task::none()
+            }
+            Message::FormKindSelected(v) => {
+                self.form_kind = v;
+                Task::none()
+            }
+            Message::FormTierSelected(v) => {
+                self.form_tier = v;
+                Task::none()
+            }
+            Message::FormLighthouseChanged(v) => {
+                self.form_lighthouse = v;
+                Task::none()
+            }
+            Message::FormHostnameChanged(v) => {
+                self.form_hostname = v;
+                Task::none()
+            }
+            Message::FormModeSelected(v) => {
+                self.form_mode = v;
+                Task::none()
+            }
+            Message::Prefill {
+                id,
+                node,
+                kind,
+                port,
+                proto,
+            } => {
+                self.form_id = id;
+                self.form_node = node;
+                self.form_kind = if kind.is_empty() { "host".into() } else { kind };
+                self.form_port = port.to_string();
+                self.form_proto = if proto.is_empty() {
+                    "tcp".into()
+                } else {
+                    proto
+                };
+                self.form_tier = "public-via-ingress".into();
+                self.last_op = format!(
+                    "form prefilled for '{}' — set the ingress + Expose",
+                    self.form_id
+                );
+                Task::none()
+            }
+            Message::ExposeClicked => {
+                if self.applying {
+                    return Task::none();
+                }
+                let form = match self.validated_form() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        self.last_op = e;
+                        return Task::none();
+                    }
+                };
+                self.applying = true;
+                self.last_op = format!("applying '{}'…", form.id);
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || apply_expose(&form))
+                            .await
+                            .unwrap_or_else(|_| Err("apply task panicked".into()))
+                    },
+                    |res| crate::Message::Connectivity(Message::Applied(res)),
+                )
+            }
+            Message::UnexposeClicked(id) => {
+                if self.applying {
+                    return Task::none();
+                }
+                self.applying = true;
+                self.last_op = format!("unexposing '{id}'…");
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || apply_unexpose(&id))
+                            .await
+                            .unwrap_or_else(|_| Err("unexpose task panicked".into()))
+                    },
+                    |res| crate::Message::Connectivity(Message::Applied(res)),
+                )
+            }
+            Message::Applied(res) => {
+                self.applying = false;
+                match res {
+                    Ok(msg) => {
+                        self.last_op = msg;
+                        // Reload the matrix so the new policy shows immediately.
+                        self.busy = true;
+                        Self::load()
+                    }
+                    Err(e) => {
+                        self.last_op = e;
+                        Task::none()
+                    }
+                }
+            }
         }
+    }
+
+    /// Validate the wizard form into an [`ExposeForm`] ready to apply, or a
+    /// human-readable reason. Pure (no I/O) so the update arm stays thin + it's
+    /// directly testable.
+    fn validated_form(&self) -> Result<ExposeForm, String> {
+        let id = self.form_id.trim();
+        if id.is_empty() {
+            return Err("Expose: a service id is required".into());
+        }
+        let node = self.form_node.trim();
+        if node.is_empty() {
+            return Err("Expose: a source node is required".into());
+        }
+        let port: u16 = match self.form_port.trim().parse() {
+            Ok(p) if p > 0 => p,
+            _ => return Err("Expose: port must be a number 1–65535".into()),
+        };
+        let public = self.form_tier == "public-via-ingress";
+        if public
+            && (self.form_lighthouse.trim().is_empty() || self.form_hostname.trim().is_empty())
+        {
+            return Err("Expose: a public service needs an ingress lighthouse + hostname".into());
+        }
+        Ok(ExposeForm {
+            id: id.to_string(),
+            node: node.to_string(),
+            kind: self.form_kind.clone(),
+            port,
+            proto: self.form_proto.clone(),
+            public,
+            lighthouse: self.form_lighthouse.trim().to_string(),
+            hostname: self.form_hostname.trim().to_string(),
+            mode: self.form_mode.clone(),
+        })
     }
 
     pub fn view(&self) -> Element<'_, crate::Message> {
@@ -266,14 +476,165 @@ impl ConnectivityPanel {
             col.into()
         };
 
-        let body = scrollable(column![services_section, candidates_section].spacing(2))
-            .height(Length::FillPortion(1));
+        let wizard = self.wizard_view(palette);
+
+        let body = scrollable(
+            column![
+                services_section,
+                candidates_section,
+                Space::new().height(Length::Fixed(18.0)),
+                wizard,
+            ]
+            .spacing(2),
+        )
+        .height(Length::FillPortion(1));
 
         container(column![header, Space::new().height(Length::Fixed(20.0)), body,].spacing(2))
             .padding(Padding::from([24u16, 32u16]))
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+
+    /// CONNECT-7 — the Expose wizard form (service id + source + tier → ingress
+    /// binding → Apply). The ingress fields only show when the tier is public.
+    fn wizard_view(&self, palette: Palette) -> Element<'_, crate::Message> {
+        let label = |t: &str| {
+            text(t.to_string())
+                .size(12)
+                .colr(palette.text_muted.into_cosmic_color())
+                .width(Length::Fixed(110.0))
+        };
+
+        let id_row = row![
+            label("Service id"),
+            text_input("e.g. grafana", &self.form_id)
+                .on_input(|v| crate::Message::Connectivity(Message::FormIdChanged(v))),
+        ]
+        .spacing(12)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+
+        let source_row = row![
+            label("Source"),
+            text_input("node", &self.form_node)
+                .on_input(|v| crate::Message::Connectivity(Message::FormNodeChanged(v)))
+                .width(Length::FillPortion(2)),
+            text_input("port", &self.form_port)
+                .on_input(|v| crate::Message::Connectivity(Message::FormPortChanged(v)))
+                .width(Length::FillPortion(1)),
+            pick_list(
+                KIND_CHOICES.map(String::from).to_vec(),
+                Some(self.form_kind.clone()),
+                |v| crate::Message::Connectivity(Message::FormKindSelected(v)),
+            ),
+        ]
+        .spacing(12)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+
+        let tier_row = row![
+            label("Tier"),
+            pick_list(
+                TIER_CHOICES.map(String::from).to_vec(),
+                Some(self.form_tier.clone()),
+                |v| crate::Message::Connectivity(Message::FormTierSelected(v)),
+            ),
+        ]
+        .spacing(12)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+
+        let is_public = self.form_tier == "public-via-ingress";
+        let mut form = column![id_row, source_row, tier_row].spacing(10);
+
+        if is_public {
+            let ingress_row = row![
+                label("Ingress"),
+                text_input("lighthouse (e.g. Lighthouse-01)", &self.form_lighthouse)
+                    .on_input(|v| crate::Message::Connectivity(Message::FormLighthouseChanged(v)))
+                    .width(Length::FillPortion(2)),
+                text_input("public hostname", &self.form_hostname)
+                    .on_input(|v| crate::Message::Connectivity(Message::FormHostnameChanged(v)))
+                    .width(Length::FillPortion(2)),
+                pick_list(
+                    MODE_CHOICES.map(String::from).to_vec(),
+                    Some(self.form_mode.clone()),
+                    |v| crate::Message::Connectivity(Message::FormModeSelected(v)),
+                ),
+            ]
+            .spacing(12)
+            .align_y(cosmic::iced::alignment::Vertical::Center);
+            form = form.push(ingress_row);
+        }
+
+        // Live preview of what applying will render (Caddy / firewall / overlay).
+        let preview = expose_preview(
+            &self.form_id,
+            &self.form_node,
+            &self.form_port,
+            is_public,
+            &self.form_lighthouse,
+            &self.form_hostname,
+            &self.form_mode,
+        );
+        let preview_box = container(
+            text(preview)
+                .size(12)
+                .colr(palette.text_muted.into_cosmic_color()),
+        )
+        .padding(Padding::from([10u16, 14u16]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            snap: false,
+            background: Some(Background::Color(palette.surface.into_cosmic_color())),
+            border: Border {
+                color: palette.border.into_cosmic_color(),
+                width: 1.0,
+                radius: 5.0.into(),
+            },
+            ..container::Style::default()
+        });
+
+        let apply_btn = variant_button(
+            if self.applying {
+                "Applying…"
+            } else {
+                "Apply"
+            },
+            ButtonVariant::Primary,
+            (!self.applying).then_some(crate::Message::Connectivity(Message::ExposeClicked)),
+            palette,
+        );
+
+        container(
+            column![
+                section_label("Expose a service", palette),
+                text(
+                    "Create or publish a service. Mesh-only keeps it on the overlay; \
+                     public-via-ingress renders a lighthouse reverse-proxy + firewall \
+                     opening. Writing the policy is the single action — the connectivity \
+                     worker reconciles Caddy + firewalld from it."
+                )
+                .size(11)
+                .colr(palette.text_muted.into_cosmic_color()),
+                Space::new().height(Length::Fixed(6.0)),
+                form,
+                preview_box,
+                row![Space::new().width(Length::Fill), apply_btn],
+            ]
+            .spacing(10),
+        )
+        .padding(Padding::from([16u16, 18u16]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            snap: false,
+            background: Some(Background::Color(palette.raised.into_cosmic_color())),
+            border: Border {
+                color: palette.border.into_cosmic_color(),
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
     }
 }
 
@@ -384,6 +745,40 @@ fn service_row_view<'a>(s: &ServiceRow, palette: Palette) -> Element<'a, crate::
         _ => format!("id: {}", s.id),
     };
 
+    // Public rows get an Unexpose (→ mesh-only); mesh-only rows get an Expose
+    // that prefills the wizard from this policy's source.
+    let action_btn = if is_public {
+        variant_button(
+            "Unexpose",
+            ButtonVariant::Secondary,
+            Some(crate::Message::Connectivity(Message::UnexposeClicked(
+                s.id.clone(),
+            ))),
+            palette,
+        )
+    } else {
+        variant_button(
+            "Expose",
+            ButtonVariant::Ghost,
+            Some(crate::Message::Connectivity(Message::Prefill {
+                id: s.id.clone(),
+                node: s.source.node.clone(),
+                kind: if s.source.kind.is_empty() {
+                    "host".into()
+                } else {
+                    s.source.kind.clone()
+                },
+                port: s.source.port,
+                proto: if s.source.proto.is_empty() {
+                    "tcp".into()
+                } else {
+                    s.source.proto.clone()
+                },
+            })),
+            palette,
+        )
+    };
+
     let bg = palette.raised.into_cosmic_color();
     let border = palette.border.into_cosmic_color();
     container(
@@ -411,6 +806,7 @@ fn service_row_view<'a>(s: &ServiceRow, palette: Palette) -> Element<'a, crate::
                 .colr(palette.text_muted.into_cosmic_color())
                 .width(Length::FillPortion(3)),
             pill(tier_label.to_string(), tier_color),
+            action_btn,
         ]
         .spacing(12)
         .align_y(cosmic::iced::alignment::Vertical::Center),
@@ -458,6 +854,20 @@ fn candidate_row_view<'a>(c: &CandidateRow, palette: Palette) -> Element<'a, cra
         format!("{} · {kind}", c.node)
     };
 
+    // An "Expose" button prefills the wizard from this candidate (id/node/port).
+    let expose_btn = variant_button(
+        "Expose",
+        ButtonVariant::Ghost,
+        Some(crate::Message::Connectivity(Message::Prefill {
+            id: c.id.clone(),
+            node: c.node.clone(),
+            kind: kind.to_string(),
+            port: c.port,
+            proto: proto.to_string(),
+        })),
+        palette,
+    );
+
     let bg = palette.surface.into_cosmic_color();
     let border = palette.border.into_cosmic_color();
     container(
@@ -478,7 +888,7 @@ fn candidate_row_view<'a>(c: &CandidateRow, palette: Palette) -> Element<'a, cra
                 .size(12)
                 .colr(palette.text.into_cosmic_color())
                 .width(Length::FillPortion(1)),
-            Space::new().width(Length::FillPortion(3)),
+            container(expose_btn).width(Length::FillPortion(3)),
             pill(pill_label.to_string(), pill_color),
         ]
         .spacing(12)
@@ -497,6 +907,150 @@ fn candidate_row_view<'a>(c: &CandidateRow, palette: Palette) -> Element<'a, cra
         ..container::Style::default()
     })
     .into()
+}
+
+// ---- Expose wizard (CONNECT-7) --------------------------------
+
+/// A validated Expose-wizard submission, ready to apply over the Bus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExposeForm {
+    pub id: String,
+    pub node: String,
+    pub kind: String,
+    pub port: u16,
+    pub proto: String,
+    pub public: bool,
+    pub lighthouse: String,
+    pub hostname: String,
+    pub mode: String,
+}
+
+/// A human-readable preview of what applying the form will render — the one-action
+/// "wires proxy + firewall + DNS" summary (CONNECT-7 acceptance). Pure + testable;
+/// mirrors `exposure::render_caddyfile` / `connect_firewall::desired_*` shapes.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn expose_preview(
+    id: &str,
+    node: &str,
+    port: &str,
+    public: bool,
+    lighthouse: &str,
+    hostname: &str,
+    mode: &str,
+) -> String {
+    let id = if id.trim().is_empty() {
+        "<id>"
+    } else {
+        id.trim()
+    };
+    let node = if node.trim().is_empty() {
+        "<node>"
+    } else {
+        node.trim()
+    };
+    let port = if port.trim().is_empty() {
+        "<port>"
+    } else {
+        port.trim()
+    };
+    if !public {
+        return format!(
+            "Mesh-only: '{id}' reachable at {node}.mesh:{port} over the Nebula \
+             overlay. No public surface, no firewall change."
+        );
+    }
+    let lh = if lighthouse.trim().is_empty() {
+        "<lighthouse>"
+    } else {
+        lighthouse.trim()
+    };
+    let host = if hostname.trim().is_empty() {
+        "<hostname>"
+    } else {
+        hostname.trim()
+    };
+    match mode {
+        "http" => format!(
+            "Public (HTTP) via {lh}: Caddy auto-HTTPS site `{host}` → reverse_proxy \
+             {node}.mesh:{port}; firewalld opens 80/443 on {lh}. Let's Encrypt issues \
+             the cert. No ingress auth — {id} handles its own."
+        ),
+        other => format!(
+            "Public ({other}) via {lh}: firewalld forwards {port}/{} on {lh} → \
+             {node} overlay IP:{port} (raw stream, no TLS). No ingress auth — {id} \
+             handles its own.",
+            if other == "udp" { "udp" } else { "tcp" }
+        ),
+    }
+}
+
+/// True when a connect reply is an `{"error": "..."}` envelope; returns the
+/// message. `None` for an `{"ok":true,...}` reply.
+fn reply_error(raw: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    v.get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+/// Apply the Expose wizard: `set-policy` to create/update the (mesh-only) service
+/// source, then — when public — `expose` to flip it public with the ingress
+/// binding. Writing the policy is the single durable action; the
+/// `connect_firewall` worker reconciles Caddy + firewalld from it. Blocking
+/// (Bus client builds its own runtime) — call from `spawn_blocking`.
+fn apply_expose(form: &ExposeForm) -> Result<String, String> {
+    // 1. set-policy — create/update the source as mesh-only first (a public
+    //    policy must already exist before `expose` can flip it).
+    let policy = json!({
+        "id": form.id,
+        "source": { "node": form.node, "kind": form.kind, "port": form.port, "proto": form.proto },
+        "tier": "mesh-only",
+    });
+    let r1 = crate::dbus::action_request_with_body(
+        "action/connect/set-policy",
+        Some(&policy.to_string()),
+        APPLY_TIMEOUT,
+    )
+    .ok_or("mackesd not reachable over the Bus (set-policy)")?;
+    if let Some(e) = reply_error(&r1) {
+        return Err(format!("set-policy failed: {e}"));
+    }
+    if !form.public {
+        return Ok(format!("Saved '{}' (mesh-only).", form.id));
+    }
+    // 2. expose — flip public with the ingress binding + mode.
+    let body = json!({
+        "id": form.id,
+        "lighthouse": form.lighthouse,
+        "hostname": form.hostname,
+        "mode": form.mode,
+    });
+    let r2 = crate::dbus::action_request_with_body(
+        "action/connect/expose",
+        Some(&body.to_string()),
+        APPLY_TIMEOUT,
+    )
+    .ok_or("mackesd not reachable over the Bus (expose)")?;
+    if let Some(e) = reply_error(&r2) {
+        return Err(format!("expose failed: {e}"));
+    }
+    Ok(format!(
+        "Exposed '{}' → {} via {} ({}).",
+        form.id, form.hostname, form.lighthouse, form.mode
+    ))
+}
+
+/// Revert a published service to mesh-only over the Bus (`unexpose`). Blocking —
+/// call from `spawn_blocking`.
+fn apply_unexpose(id: &str) -> Result<String, String> {
+    let r =
+        crate::dbus::action_request_with_body("action/connect/unexpose", Some(id), APPLY_TIMEOUT)
+            .ok_or("mackesd not reachable over the Bus (unexpose)")?;
+    if let Some(e) = reply_error(&r) {
+        return Err(format!("unexpose failed: {e}"));
+    }
+    Ok(format!("Unexposed '{id}' (back to mesh-only)."))
 }
 
 // ---- I/O ------------------------------------------------------
@@ -700,5 +1254,163 @@ mod tests {
             error: Some("mackesd not reachable over the Bus".into()),
         });
         assert_eq!(p.last_op, "mackesd not reachable over the Bus");
+    }
+
+    // ── CONNECT-7 — Expose wizard ──────────────────────────────────
+
+    #[test]
+    fn new_seeds_sensible_form_defaults() {
+        let p = ConnectivityPanel::new();
+        assert_eq!(p.form_kind, "host");
+        assert_eq!(p.form_proto, "tcp");
+        assert_eq!(p.form_tier, "mesh-only");
+        assert_eq!(p.form_mode, "http");
+    }
+
+    #[test]
+    fn port_input_keeps_digits_only() {
+        let mut p = ConnectivityPanel::new();
+        let _ = p.update(Message::FormPortChanged("3a0b0".into()));
+        assert_eq!(p.form_port, "300");
+    }
+
+    #[test]
+    fn prefill_populates_form_and_defaults_public() {
+        let mut p = ConnectivityPanel::new();
+        let _ = p.update(Message::Prefill {
+            id: "eagle-3000".into(),
+            node: "eagle".into(),
+            kind: "container".into(),
+            port: 3000,
+            proto: "tcp".into(),
+        });
+        assert_eq!(p.form_id, "eagle-3000");
+        assert_eq!(p.form_node, "eagle");
+        assert_eq!(p.form_kind, "container");
+        assert_eq!(p.form_port, "3000");
+        assert_eq!(p.form_tier, "public-via-ingress");
+    }
+
+    #[test]
+    fn validated_form_requires_id_node_and_port() {
+        let mut p = ConnectivityPanel::new();
+        assert!(p.validated_form().unwrap_err().contains("service id"));
+        p.form_id = "svc".into();
+        assert!(p.validated_form().unwrap_err().contains("source node"));
+        p.form_node = "eagle".into();
+        assert!(p.validated_form().unwrap_err().contains("port"));
+        p.form_port = "0".into();
+        assert!(p.validated_form().unwrap_err().contains("port"));
+        p.form_port = "8080".into();
+        // mesh-only now validates.
+        let f = p.validated_form().unwrap();
+        assert_eq!(f.id, "svc");
+        assert_eq!(f.port, 8080);
+        assert!(!f.public);
+    }
+
+    #[test]
+    fn validated_form_public_requires_ingress() {
+        let mut p = ConnectivityPanel::new();
+        p.form_id = "svc".into();
+        p.form_node = "eagle".into();
+        p.form_port = "3000".into();
+        p.form_tier = "public-via-ingress".into();
+        assert!(p
+            .validated_form()
+            .unwrap_err()
+            .contains("ingress lighthouse"));
+        p.form_lighthouse = "Lighthouse-01".into();
+        p.form_hostname = "g.example".into();
+        let f = p.validated_form().unwrap();
+        assert!(f.public);
+        assert_eq!(f.lighthouse, "Lighthouse-01");
+        assert_eq!(f.hostname, "g.example");
+    }
+
+    #[test]
+    fn expose_preview_mesh_only_has_no_public_surface() {
+        let s = expose_preview("grafana", "eagle", "3000", false, "", "", "http");
+        assert!(s.contains("Mesh-only"));
+        assert!(s.contains("eagle.mesh:3000"));
+        assert!(s.contains("No public surface"));
+    }
+
+    #[test]
+    fn expose_preview_public_http_describes_caddy_and_firewall() {
+        let s = expose_preview(
+            "grafana",
+            "eagle",
+            "3000",
+            true,
+            "Lighthouse-01",
+            "g.example",
+            "http",
+        );
+        assert!(s.contains("auto-HTTPS"));
+        assert!(s.contains("g.example"));
+        assert!(s.contains("eagle.mesh:3000"));
+        assert!(s.contains("80/443"));
+        assert!(s.contains("No ingress auth"));
+    }
+
+    #[test]
+    fn expose_preview_public_tcp_describes_stream_forward() {
+        let s = expose_preview(
+            "game",
+            "eagle",
+            "25565",
+            true,
+            "LH-01",
+            "game.example",
+            "tcp",
+        );
+        assert!(s.contains("firewalld forwards"));
+        assert!(s.contains("25565/tcp"));
+        assert!(s.contains("raw stream"));
+    }
+
+    #[test]
+    fn reply_error_detects_envelope() {
+        assert_eq!(reply_error(r#"{"error":"boom"}"#).as_deref(), Some("boom"));
+        assert!(reply_error(r#"{"ok":true}"#).is_none());
+        assert!(reply_error("garbage").is_none());
+    }
+
+    #[test]
+    fn expose_clicked_with_invalid_form_surfaces_error_no_apply() {
+        let mut p = ConnectivityPanel::new();
+        // empty id → validation error, applying stays false.
+        let _ = p.update(Message::ExposeClicked);
+        assert!(!p.applying);
+        assert!(p.last_op.contains("service id"));
+    }
+
+    #[test]
+    fn applied_ok_clears_applying_and_reloads() {
+        let mut p = ConnectivityPanel::new();
+        p.applying = true;
+        let _ = p.update(Message::Applied(Ok("Exposed 'x'.".into())));
+        assert!(!p.applying);
+        assert_eq!(p.last_op, "Exposed 'x'.");
+        assert!(p.busy, "reload kicked off");
+    }
+
+    #[test]
+    fn applied_err_clears_applying_keeps_state() {
+        let mut p = ConnectivityPanel::new();
+        p.applying = true;
+        let _ = p.update(Message::Applied(Err("expose failed: nope".into())));
+        assert!(!p.applying);
+        assert_eq!(p.last_op, "expose failed: nope");
+    }
+
+    #[test]
+    fn unexpose_while_applying_is_noop() {
+        let mut p = ConnectivityPanel::new();
+        p.applying = true;
+        p.last_op = "busy".into();
+        let _ = p.update(Message::UnexposeClicked("x".into()));
+        assert_eq!(p.last_op, "busy");
     }
 }
