@@ -90,6 +90,12 @@ pub trait Backend {
     fn self_node(&self) -> SelfNode;
     /// Mesh roster. Sidebar + Send-To picker iterate this.
     fn peers(&self) -> Vec<Peer>;
+    /// AFM-RECONNECT — re-attempt any mesh/bus connection that wasn't live at
+    /// startup and refresh the cached roster. Called periodically + before each
+    /// snapshot so a GUI launched before `mackesd`'s responders were ready (the
+    /// cold-boot race) populates its peers on its own instead of staying empty
+    /// until restart. Default no-op for the local/demo backends.
+    fn reconnect(&mut self) {}
     /// Files visible under a path. Empty path = the mesh overview.
     /// `peer:<id>` paths hit the mesh router; other paths hit the
     /// local FS.
@@ -655,11 +661,17 @@ pub struct RealBackend {
 }
 
 impl RealBackend {
+    /// AFM-RECONNECT — connect probe. Widened from 800 ms: at GUI launch right
+    /// after boot, `mackesd`'s Fleet.Files / mesh responders can take a beat to
+    /// come up, and an 800 ms miss left the Artifact Manager with no peers until
+    /// a restart. `reconnect` retries with this same budget on a later tick.
+    const CONNECT_TIMEOUT: Duration = Duration::from_millis(2500);
+
     #[must_use]
     pub fn new() -> Self {
         let local = LocalFsBackend::new();
-        let bus = BusBackend::connect_with_timeout(Duration::from_millis(800)).ok();
-        let mesh = MeshBackend::connect_with_timeout(Duration::from_millis(800)).ok();
+        let bus = BusBackend::connect_with_timeout(Self::CONNECT_TIMEOUT).ok();
+        let mesh = MeshBackend::connect_with_timeout(Self::CONNECT_TIMEOUT).ok();
 
         let cached_self_node = match mesh.as_ref().and_then(|m| m.nebula_self_node().ok()) {
             Some(n) => SelfNode {
@@ -705,6 +717,50 @@ impl RealBackend {
     pub fn has_mesh(&self) -> bool {
         self.mesh.is_some() || self.bus.is_some()
     }
+
+    /// AFM-RECONNECT — re-attempt the mesh/bus connections that weren't live at
+    /// construction and refresh the cached roster. Cheap + idempotent when fully
+    /// connected with peers (returns early); does real work only while a backend
+    /// is missing or the roster is still empty, so it's safe to call on a tick.
+    fn reconnect_now(&mut self) {
+        let fully_up = self.mesh.is_some() && self.bus.is_some() && !self.cached_peers.is_empty();
+        if fully_up {
+            return;
+        }
+        if self.bus.is_none() {
+            self.bus = BusBackend::connect_with_timeout(Self::CONNECT_TIMEOUT).ok();
+        }
+        if self.mesh.is_none() {
+            self.mesh = MeshBackend::connect_with_timeout(Self::CONNECT_TIMEOUT).ok();
+        }
+        // Refresh the cached roster + identity from whichever backend is live
+        // (prefer the Nebula mesh roster, fall back to Fleet.Files).
+        if let Some(rows) = self.mesh.as_ref().and_then(|m| m.mesh_peers().ok()) {
+            self.cached_peers = rows.into_iter().map(mesh_peer_to_peer).collect();
+        } else if let Some(rows) = self.bus.as_ref().and_then(|d| d.peers().ok()) {
+            self.cached_peers = rows;
+        }
+        if let Some(n) = self.mesh.as_ref().and_then(|m| m.nebula_self_node().ok()) {
+            self.cached_self_node = SelfNode {
+                id: n.node_id,
+                host: n.host,
+                label: "this node".into(),
+                addr: n.overlay_ip,
+                files: 0,
+                shared: 0,
+            };
+        } else if let Some(s) = self.bus.as_ref().and_then(|d| d.self_node().ok()) {
+            self.cached_self_node = s;
+        }
+        if let Some(badge) = self
+            .mesh
+            .as_ref()
+            .and_then(|m| m.nebula_status().ok())
+            .map(nebula_status_to_badge)
+        {
+            self.cached_mesh_overlay = Some(badge);
+        }
+    }
 }
 
 impl Default for RealBackend {
@@ -720,6 +776,10 @@ impl Backend for RealBackend {
 
     fn peers(&self) -> Vec<Peer> {
         self.cached_peers.clone()
+    }
+
+    fn reconnect(&mut self) {
+        self.reconnect_now();
     }
 
     fn list(&self, path: &str) -> Vec<FileRow> {

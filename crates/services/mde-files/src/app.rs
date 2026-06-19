@@ -956,6 +956,10 @@ impl MdeFiles {
     /// O(few backend calls); per-tick cost is acceptable since
     /// Iced only re-runs `update()` on Message arrival.
     fn refresh_snapshot(&mut self) {
+        // AFM-RECONNECT — re-attempt any mesh/bus connection that wasn't live at
+        // launch (the cold-boot race that left the roster empty) before
+        // capturing, so peers populate on their own.
+        self.backend.reconnect();
         self.snapshot = BackendSnapshot::capture(&*self.backend);
         let raw_files = match &self.view {
             View::Peer(id) => self.backend.list(&format!("peer:{id}")),
@@ -1141,7 +1145,13 @@ impl Application for MdeFiles {
     }
 
     fn subscription(&self) -> cosmic::iced::Subscription<Self::Message> {
-        Self::key_subscription()
+        // AFM-RECONNECT — a slow tick so a GUI launched before mackesd's
+        // responders were ready re-attempts the mesh/bus connection and
+        // populates its peers on its own (every `update` ends in
+        // `refresh_snapshot`, which now reconnects). No user interaction needed.
+        let reconnect = cosmic::iced::time::every(std::time::Duration::from_secs(5))
+            .map(|_| Message::Refresh);
+        cosmic::iced::Subscription::batch([Self::key_subscription(), reconnect])
     }
 
     fn update(&mut self, message: Self::Message) -> cosmic::app::Task<Self::Message> {

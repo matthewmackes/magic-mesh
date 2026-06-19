@@ -106,6 +106,7 @@ pub fn mde_files_palette() -> mde_theme::Palette {
         success: semantic.success,
         danger: semantic.danger,
         warning: semantic.warning,
+        beacon_healthy: semantic.beacon_healthy,
     }
 }
 pub const WINDOW_TITLEBAR: Color = PF_BG_200;
