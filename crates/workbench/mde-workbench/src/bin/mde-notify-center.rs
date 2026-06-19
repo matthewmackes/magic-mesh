@@ -135,8 +135,15 @@ fn namespace(_s: &Center, _id: window::Id) -> String {
     "mde-notify-center".to_string()
 }
 
+/// NOTIFY-HUB-1 — resolve the live palette from the user's MDE theme preference
+/// so the Hub honors light + dark (Carbon Gray 10 / 90 / 100), matching the
+/// Application Menu (which is already theme-aware) instead of a hardcoded dark.
+fn hub_palette() -> Palette {
+    Palette::for_theme(mde_theme::Preferences::load().theme)
+}
+
 fn theme(_s: &Center, _id: window::Id) -> Theme {
-    let p = Palette::dark();
+    let p = hub_palette();
     Theme::custom(
         "MDE Notification Hub".to_string(),
         cosmic::iced::theme::Palette {
@@ -634,7 +641,7 @@ fn now_ms() -> i64 {
 }
 
 fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
-    let p = Palette::dark();
+    let p = hub_palette();
     let now = now_ms();
 
     // Header: title + close on the top line, the bulk actions on their own
