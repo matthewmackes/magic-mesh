@@ -593,6 +593,12 @@ alsa-lib = "*"
 # its mount helper (both small, base Fedora repos).
 fuse-libs = "*"
 fuse = "*"
+# RCLICK-4 (2026-06-19) — the Win+X right-click power menu launches these: btop
+# (its "Task Manager", run in cosmic-term) + Midnight Commander (`mc`). Both are
+# small + in the base Fedora repos, and the menu entries dead-end without them,
+# so hard-Require them.
+btop = "*"
+mc = "*"
 
 # EFF-42 — ansible-core is a WEAK dep (Recommends): only the Server-tier
 # ansible_pull/job_exec workers shell to it, and they degrade gracefully
@@ -608,6 +614,10 @@ ansible-core = "*"
 # so a default install carries them, opt-out-able like ansible-core.
 kamailio = "*"
 rtpengine = "*"
+# RCLICK-4 — the power menu's "Disk Management (Admin)" launches cosmic-disks;
+# weak (may be absent from some repos) so a default install pulls it but its
+# absence never blocks the install (the entry just no-ops if missing).
+cosmic-disks = "*"
 # AUD6-14 — the kickstart enables libvirtd; back it with a weak dep so
 # a bare-Fedora spin actually has the daemon the services line names.
 libvirt-daemon-driver-qemu = "*"
