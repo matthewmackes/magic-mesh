@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
 Name=MCNF Live Wallpaper
-Comment=Live mesh-overview map as the Cosmic desktop background (PD-10); Workstation-rank gated — Servers/Lighthouses are headless
+Comment=Live mesh-overview map as the Cosmic desktop background (PD-10); Workstation-rank gated — Servers/Lighthouses are headless. BRAND-11: now OPT-IN (off by default) so the branded MCNF 11 wallpaper is the default visible background. Set X-GNOME-Autostart-enabled=true (or enable in Settings ▸ Startup Applications) to use the live mesh map instead.
 Exec=sh -c "mackesd role-gate --min-rank 2 && exec mde-mesh-wallpaper"
 Icon=magic-mesh
 Terminal=false
 NoDisplay=true
-X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-enabled=false

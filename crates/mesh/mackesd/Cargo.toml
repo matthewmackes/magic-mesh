@@ -438,6 +438,12 @@ assets = [
     { source = "assets/brand/cosmic-layout/**/*",  dest = "/usr/share/magic-mesh/brand/cosmic-layout/", mode = "644" },
     { source = "assets/brand/monogram.png",        dest = "/usr/share/magic-mesh/brand/monogram.png",   mode = "644" },
     { source = "assets/brand/greeter-hero.png",    dest = "/usr/share/magic-mesh/brand/greeter-hero.png", mode = "644" },
+    # BRAND-11 — the branded MCNF 11 desktop wallpaper + its first-login seeder.
+    # The image lands in /usr/share/backgrounds (free; cosmic-bg owns the
+    # /usr/share/cosmic default, so we can't ship that — the autostart seeder
+    # writes the per-user Cosmic wallpaper config instead, seed-if-absent).
+    { source = "assets/brand/wallpaper/mcnf-11-winter-4k.png", dest = "/usr/share/backgrounds/mcnf-11-winter.png", mode = "644" },
+    { source = "install-helpers/mde-seed-wallpaper.sh", dest = "/usr/libexec/mackesd/mde-seed-wallpaper", mode = "755" },
     # MESHSHELL SHELL-1 — the mesh-status snapshot data plane (all roles).
     { source = "install-helpers/mesh-status-snapshot.sh", dest = "/usr/libexec/mackesd/mesh-status-snapshot", mode = "755" },
     { source = "packaging/systemd/mesh-status.service", dest = "/usr/lib/systemd/system/mesh-status.service", mode = "644" },

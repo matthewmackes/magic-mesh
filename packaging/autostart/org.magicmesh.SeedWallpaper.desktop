@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=MCNF Wallpaper
+Comment=Seed the MCNF 11 branded image as the default Cosmic wallpaper on first login (BRAND-11); Workstation-rank gated; never overrides a user-set wallpaper
+Exec=sh -c "mackesd role-gate --min-rank 2 && exec /usr/libexec/mackesd/mde-seed-wallpaper"
+Icon=magic-mesh
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
