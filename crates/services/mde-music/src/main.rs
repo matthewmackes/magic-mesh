@@ -1590,8 +1590,43 @@ impl State {
                     // subscription) so the 160px cards reflow on resize, replacing
                     // the AIR-11.b fixed 5-column layout. Per-card cover art +
                     // scroll-position persistence remain the AIR-11.c.2 follow-on.
+                    // MUSIC-RESPONSIVE-9 — virtualize large grids: render only the
+                    // visible row window (+overscan) and reserve the off-window
+                    // height with spacers, so a multi-hundred-card library doesn't
+                    // build every card per frame. Skipped for the Playlists page
+                    // (variable-height cards + inline forms) and small grids (where
+                    // full render is cheaper than the windowing bookkeeping). Same
+                    // ROW_PITCH/window as `art_window_task`, and the live scroll
+                    // offset comes from `grid_scroll` (kept current by GridScrolled).
+                    const ROW_PITCH: f32 = 168.0;
+                    const WINDOW_ROWS: usize = 14;
+                    let total_rows = items.len().div_ceil(cols);
+                    let virtualize = !matches!(route, Route::Category(HubCard::Playlists))
+                        && total_rows > WINDOW_ROWS;
+                    let offset_y = self
+                        .grid_scroll
+                        .get(&route.segment())
+                        .copied()
+                        .unwrap_or(0.0);
+                    let start_row = if virtualize {
+                        ((offset_y / ROW_PITCH).floor() as usize).saturating_sub(2)
+                    } else {
+                        0
+                    };
+                    let end_row = if virtualize {
+                        (start_row + WINDOW_ROWS).min(total_rows)
+                    } else {
+                        total_rows
+                    };
                     let mut grid = column![].spacing(8);
-                    for chunk in items.chunks(cols) {
+                    if virtualize && start_row > 0 {
+                        grid = grid
+                            .push(Space::new().height(Length::Fixed(start_row as f32 * ROW_PITCH)));
+                    }
+                    for (row_idx, chunk) in items.chunks(cols).enumerate() {
+                        if virtualize && (row_idx < start_row || row_idx >= end_row) {
+                            continue;
+                        }
                         let mut r = row![].spacing(8);
                         for item in chunk {
                             // MUSIC-ALBUMS-3 — Carbon album card: square art tile
@@ -1729,6 +1764,12 @@ impl State {
                             }
                         }
                         grid = grid.push(r);
+                    }
+                    if virtualize && end_row < total_rows {
+                        grid = grid.push(
+                            Space::new()
+                                .height(Length::Fixed((total_rows - end_row) as f32 * ROW_PITCH)),
+                        );
                     }
                     // MUSIC-RFX-6 — the Playlists page gets a "new playlist" form.
                     if matches!(route, Route::Category(HubCard::Playlists)) {
