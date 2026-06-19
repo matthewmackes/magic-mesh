@@ -344,7 +344,36 @@ fn name_col<'a>(
 /// `mackesd` rolls everywhere — the directory record is the canonical source,
 /// this is just the back-fill. Shared by the Hub footer + this tab.
 pub fn enrich_roles(root: &std::path::Path, peers: &mut [mackes_mesh_types::peers::PeerRecord]) {
+    // LIGHTHOUSE-9 — the authoritative "is a lighthouse" signal is Nebula
+    // membership (the static_host_map / lighthouse-hosts overlay IPs), not the
+    // deployment role.toml: the anchor nodes run Server tier for storage, so
+    // role==lighthouse under-reports. The root snapshot publishes the real
+    // lighthouse overlay IPs at network.lighthouse_ips (world-readable
+    // /run/mde/mesh-status.json); a peer whose overlay_ip is in that set IS a
+    // lighthouse regardless of its role. Fall back to the shell-status sidecar
+    // role for the role string when the directory record predates role-stamping.
+    let lighthouse_ips: Vec<String> = std::fs::read_to_string("/run/mde/mesh-status.json")
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| {
+            v.get("network")?
+                .get("lighthouse_ips")?
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+        })
+        .unwrap_or_default();
     for p in peers.iter_mut() {
+        // Nebula membership wins: tag as lighthouse if the overlay IP matches.
+        if let Some(ip) = &p.overlay_ip {
+            if lighthouse_ips.iter().any(|lh| lh == ip) {
+                p.role = Some(lighthouse::LIGHTHOUSE_ROLE.to_string());
+                continue;
+            }
+        }
         if p.role.is_some() {
             continue;
         }
