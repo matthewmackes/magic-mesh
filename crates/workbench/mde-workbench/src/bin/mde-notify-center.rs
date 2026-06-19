@@ -738,7 +738,12 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
                 .align_y(cosmic::iced::Alignment::Center),
             )
             .on_press(Message::ToggleGroup(label.clone()))
-            .width(Length::Fill);
+            .width(Length::Fill)
+            // Flat: a section-header toggle, not a chrome button (no blue box).
+            .style(|_t, _s| cosmic::iced::widget::button::Style {
+                background: None,
+                ..Default::default()
+            });
             body = body.push(head);
             if !collapsed {
                 for item in &group {
@@ -1041,6 +1046,33 @@ fn beacon_card(b: &Beacon, beam_step: u16, p: Palette) -> Element<'static, Messa
         .into()
 }
 
+/// NOTIFY-HUB / coloring (operator 2026-06-18) — the subtle Carbon button look
+/// the Application Menu uses (`cosmic::theme::Button::Standard`): a muted layer
+/// fill (raised → overlay on hover) with a subtle border, NOT the default bright
+/// blue "suggested" style. Applied to every Hub button so the Hub matches the
+/// Application Menu's coloring pattern instead of being all-blue.
+fn carbon_btn(
+    p: Palette,
+) -> impl Fn(&Theme, cosmic::iced::widget::button::Status) -> cosmic::iced::widget::button::Style {
+    use cosmic::iced::widget::button::Status;
+    move |_t, status| {
+        let bg = match status {
+            Status::Hovered | Status::Pressed => p.overlay,
+            _ => p.raised,
+        };
+        cosmic::iced::widget::button::Style {
+            background: Some(cosmic::iced::Background::Color(bg.into_cosmic_color())),
+            text_color: p.text.into_cosmic_color(),
+            border: cosmic::iced::Border {
+                color: p.border.into_cosmic_color(),
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..Default::default()
+        }
+    }
+}
+
 fn transport_button(glyph: &str, msg: Message, p: Palette) -> Element<'_, Message> {
     button(
         text(glyph.to_string())
@@ -1049,6 +1081,7 @@ fn transport_button(glyph: &str, msg: Message, p: Palette) -> Element<'_, Messag
     )
     .padding(Padding::from([4u16, 8u16]))
     .on_press(msg)
+    .style(carbon_btn(p))
     .into()
 }
 
@@ -1076,6 +1109,7 @@ fn launch_tile<'a>(
     .width(Length::Fill)
     .padding(Padding::from([8u16, 6u16]))
     .on_press(Message::OpenApp(cmd))
+    .style(carbon_btn(p))
     .into()
 }
 
@@ -1091,6 +1125,7 @@ fn quick_toggle<'a>(label: &'a str, on: bool, msg: Message, p: Palette) -> Eleme
     )
     .width(Length::Fill)
     .on_press(msg)
+    .style(carbon_btn(p))
     .into()
 }
 
@@ -1131,6 +1166,7 @@ fn action_button<'a>(label: &'a str, msg: Message, p: Palette) -> Element<'a, Me
     button(text(label).size(12).color(p.text.into_cosmic_color()))
         .padding(Padding::from([4u16, 10u16]))
         .on_press(msg)
+        .style(carbon_btn(p))
         .into()
 }
 
