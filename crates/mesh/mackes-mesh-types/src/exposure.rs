@@ -227,6 +227,44 @@ impl ExposureConfig {
     }
 }
 
+/// Marker line so the Caddy ingress render is recognizably MCNF-owned.
+pub const CADDY_MANAGED_HEADER: &str =
+    "# Managed by MCNF CONNECT — do not edit (rendered from connect/policy.toml).";
+
+/// CONNECT-4 — render the Caddy ingress config for `lighthouse` from the policy:
+/// one auto-HTTPS site per public **HTTP** service bound to this lighthouse,
+/// reverse-proxying the public hostname to the hosting node over the mesh
+/// (`<node>.mesh:<port>`, resolved by the mesh DNS). Caddy obtains a Let's
+/// Encrypt cert for each hostname automatically. Raw TCP/UDP stream services are
+/// **not** emitted here — they need the `caddy-l4` layer-4 app (CONNECT-5).
+/// Deterministic (sorted by hostname) for stable writes/tests. Pure.
+#[must_use]
+pub fn render_caddyfile(cfg: &ExposureConfig, lighthouse: &str) -> String {
+    let mut sites: Vec<(&str, &str, u16)> = cfg
+        .public_services()
+        .into_iter()
+        .filter(|s| s.mode == ProtoMode::Http)
+        .filter_map(|s| {
+            let b = s.ingress.as_ref()?;
+            (b.lighthouse == lighthouse).then_some((
+                b.hostname.as_str(),
+                s.source.node.as_str(),
+                s.source.port,
+            ))
+        })
+        .collect();
+    sites.sort_unstable();
+    sites.dedup();
+    let mut out = String::from(CADDY_MANAGED_HEADER);
+    out.push('\n');
+    for (hostname, node, port) in sites {
+        out.push_str(&format!(
+            "{hostname} {{\n\treverse_proxy {node}.mesh:{port}\n}}\n"
+        ));
+    }
+    out
+}
+
 /// Durable path for the exposure config: `<workgroup_root>/connect/policy.toml`.
 #[must_use]
 pub fn config_path(workgroup_root: &Path) -> PathBuf {
@@ -357,6 +395,52 @@ mod tests {
         // A missing file → default empty.
         let empty = load(tmp.path().join("nope").as_path());
         assert_eq!(empty, ExposureConfig::default());
+    }
+
+    #[test]
+    fn caddyfile_render_emits_http_sites_for_this_lighthouse_only() {
+        let mut cfg = ExposureConfig::default();
+        cfg.upsert(web()); // grafana, http, LH-01, port 3000, node "eagle"
+                           // A second http service on a different lighthouse + a tcp service (skipped).
+        cfg.upsert(ExposurePolicy {
+            id: "other".into(),
+            source: ServiceSource {
+                node: "pine".into(),
+                port: 8080,
+                ..Default::default()
+            },
+            tier: Tier::PublicViaIngress,
+            ingress: Some(IngressBinding {
+                lighthouse: "LH-02".into(),
+                hostname: "other.example".into(),
+            }),
+            mode: ProtoMode::Http,
+            ..Default::default()
+        });
+        cfg.upsert(ExposurePolicy {
+            id: "game".into(),
+            source: ServiceSource {
+                node: "eagle".into(),
+                port: 25565,
+                ..Default::default()
+            },
+            tier: Tier::PublicViaIngress,
+            ingress: Some(IngressBinding {
+                lighthouse: "Lighthouse-01".into(),
+                hostname: "game.example".into(),
+            }),
+            mode: ProtoMode::Tcp, // raw stream — not in the Caddy HTTP render
+            ..Default::default()
+        });
+        let cf = render_caddyfile(&cfg, "Lighthouse-01");
+        assert!(cf.contains("grafana.services.matthewmackes.com {"), "{cf}");
+        assert!(cf.contains("reverse_proxy eagle.mesh:3000"), "{cf}");
+        assert!(!cf.contains("other.example"), "other lighthouse excluded");
+        assert!(
+            !cf.contains("game.example"),
+            "tcp stream not in HTTP render"
+        );
+        assert!(cf.starts_with(CADDY_MANAGED_HEADER));
     }
 
     #[test]

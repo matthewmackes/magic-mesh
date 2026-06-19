@@ -61,13 +61,22 @@ pub fn desired_ingress_ports(cfg: &exposure::ExposureConfig, hostname: &str) -> 
     ports
 }
 
-/// The exposure-driven firewall enforcement worker.
+/// CONNECT-4 — default dir for the rendered Caddy ingress fragment. The lighthouse
+/// Caddy setup `import`s `*.caddy` from here (the install/import wiring is the
+/// packaging follow-on); writing the fragment + reloading Caddy is this worker.
+pub const CADDY_FRAGMENT_DIR: &str = "/etc/caddy/Caddyfile.d";
+
+/// The exposure-driven enforcement worker: opens the policy's ingress firewall
+/// ports (CONNECT-3) AND renders/writes this node's Caddy ingress config
+/// (CONNECT-4) — one "apply this node's exposure" reconcile per tick.
 pub struct ConnectFirewallWorker {
     workgroup_root: PathBuf,
     hostname: String,
     tick_interval: Duration,
     /// `firewall-cmd` binary (empty disables the shell-out — for tests).
     firewall_cmd: &'static str,
+    /// Dir the Caddy ingress fragment is written to (overridable for tests).
+    caddy_dir: PathBuf,
 }
 
 impl ConnectFirewallWorker {
@@ -79,6 +88,7 @@ impl ConnectFirewallWorker {
             hostname,
             tick_interval: DEFAULT_TICK_INTERVAL,
             firewall_cmd: "firewall-cmd",
+            caddy_dir: PathBuf::from(CADDY_FRAGMENT_DIR),
         }
     }
 
@@ -89,11 +99,56 @@ impl ConnectFirewallWorker {
         self
     }
 
+    /// Override the Caddy fragment dir (tests).
+    #[must_use]
+    pub fn with_caddy_dir(mut self, dir: PathBuf) -> Self {
+        self.caddy_dir = dir;
+        self
+    }
+
+    /// CONNECT-4 — render this node's Caddy ingress fragment from the policy and
+    /// write it (on-change) to `<caddy_dir>/mcnf-ingress.caddy`, then reload Caddy
+    /// if it's installed + the fragment changed. Best-effort + safe: only writes
+    /// MCNF's own managed fragment, never the operator's Caddyfile. Returns `true`
+    /// if the fragment was (re)written. Skips entirely when the dir's parent
+    /// doesn't exist (no Caddy on this node).
+    fn apply_caddy(&self, cfg: &exposure::ExposureConfig) -> bool {
+        // Only manage Caddy where its config dir exists (i.e. Caddy is installed).
+        if self.caddy_dir.parent().is_some_and(|p| !p.exists()) && !self.caddy_dir.exists() {
+            return false;
+        }
+        let rendered = exposure::render_caddyfile(cfg, &self.hostname);
+        let path = self.caddy_dir.join("mcnf-ingress.caddy");
+        let current = std::fs::read_to_string(&path).unwrap_or_default();
+        if current == rendered {
+            return false; // unchanged
+        }
+        if std::fs::create_dir_all(&self.caddy_dir).is_err() {
+            return false;
+        }
+        if std::fs::write(&path, &rendered).is_err() {
+            return false;
+        }
+        // Reload Caddy if present (best-effort; bounded).
+        let mut reload = std::process::Command::new("systemctl");
+        reload.args(["reload", "caddy"]);
+        let _ = crate::workers::proc::status_with_timeout(
+            reload,
+            crate::workers::proc::DEFAULT_CMD_TIMEOUT,
+        );
+        tracing::info!(path = %path.display(), "connect_firewall: wrote Caddy ingress fragment (CONNECT-4)");
+        true
+    }
+
     /// One enforcement tick: load the policy, compute this node's desired ingress
     /// ports, and idempotently open them on the `public` zone. Returns how many
     /// `--add-port` invocations ran (0 when nothing is bound here / no firewalld).
     pub fn tick_once(&self) -> usize {
         let cfg = exposure::load(&self.workgroup_root);
+        // CONNECT-4 — render/write this node's Caddy ingress fragment (runs even
+        // when no firewall ports change, e.g. to clear the fragment after an
+        // unexpose). Best-effort + no-op when Caddy isn't installed here.
+        let _ = self.apply_caddy(&cfg);
         let desired = desired_ingress_ports(&cfg, &self.hostname);
         if desired.is_empty() || self.firewall_cmd.is_empty() {
             return 0;
@@ -222,6 +277,23 @@ mod tests {
         let empty = ExposureConfig::default();
         assert!(desired_ingress_ports(&empty, "LH-01").is_empty());
         assert!(desired_ingress_ports(&empty, "any-node").is_empty());
+    }
+
+    #[test]
+    fn apply_caddy_writes_fragment_for_bound_http_service() {
+        // CONNECT-4 — the worker renders + writes this node's Caddy fragment.
+        let tmp = tempfile::tempdir().unwrap();
+        let caddy = tempfile::tempdir().unwrap(); // exists ⇒ "Caddy installed"
+        let mut cfg = ExposureConfig::default();
+        cfg.upsert(public_svc("web", "LH-01", 3000, ProtoMode::Http));
+        exposure::save(tmp.path(), &cfg).unwrap();
+        let w = ConnectFirewallWorker::new(tmp.path().to_path_buf(), "LH-01".into())
+            .without_firewall_cmd()
+            .with_caddy_dir(caddy.path().to_path_buf());
+        let _ = w.tick_once();
+        let frag = std::fs::read_to_string(caddy.path().join("mcnf-ingress.caddy")).unwrap();
+        assert!(frag.contains("web.example {"), "{frag}");
+        assert!(frag.contains("reverse_proxy n.mesh:3000"), "{frag}");
     }
 
     #[test]
