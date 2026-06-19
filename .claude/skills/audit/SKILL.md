@@ -42,9 +42,10 @@ the dead surface). Don't fix unless asked — report first.
    - **mesh/desktop boundary break** (§6): a mesh-side crate depending on a
      deleted desktop-shell crate. Run `./install-helpers/lint-mesh-boundary.sh`;
      any hit is a finding.
-   - **substrate locks** (§1–§3): non-Nebula transport (Tailscale/Headscale/DERP),
-     Gluster instead of LizardFS, a new MDE-private D-Bus name (only FDO
-     `org.freedesktop.*` interop is allowed, §2), or crypto below the pinned
+   - **substrate locks** (§1–§3): non-Nebula transport (Tailscale/Headscale/DERP);
+     coordination off **etcd** or files off **Syncthing** (SUBSTRATE-V2 — LizardFS/
+     MooseFS/Gluster/Ceph are retired/forbidden); a new MDE-private D-Bus name (only
+     FDO `org.freedesktop.*` interop is allowed, §2); or crypto below the pinned
      values (Ed25519 / AES-256-GCM / ChaCha20-Poly1305 / RSA-4096 KDC, §3).
 5. **Doc drift** — prose claiming facts the code contradicts. Check prose against
    the *current* reality: the E11 "MCNF" pivot — **Cosmic owns the desktop**,

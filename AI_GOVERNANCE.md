@@ -47,7 +47,8 @@ node can leave, and the fabric heals.
   docs/design/substrate-v2.md.)*
 - **`mackesd`** is the supervised control-plane daemon — owns the worker pool, the
   mesh/CA state, the KDE-Connect host, and the SQLite store. One leader per the
-  shared lockfile; owns writes.
+  **etcd lease/election** (SUBSTRATE-V2; the `.mackesd-leader.lock` is retired at
+  the 11.0 cutover); owns writes.
 - **Public boundary — 3 tiers (CONNECT, lands 11.0+, design: docs/design/connect.md):**
   **Public** (the internet sees only **Nebula/4242 + SSH/22 + enroll/4243** — the
   foundational layer) · **Mesh** (everything reachable over the Nebula overlay) ·
@@ -157,7 +158,7 @@ feature on a headless host).
 - **Production workgroup-grade, not hyperscale.** The supported envelope is a **single workgroup of
   up to 3 lighthouses + 9 Headless/Full peers (12 nodes)** — operator directive 2026-06-14, raising
   the prior ≤ 8-peer / single-lighthouse cap; `ca/sign.rs` `MAX_PEER_CAP` follows. Up to 3 public
-  lighthouses give NAT relay/discovery + LizardFS/QNM-Shared redundancy (LH1 = founding CA holder;
+  lighthouses give NAT relay/discovery + etcd-quorum + Mesh-Sync (Syncthing) redundancy (LH1 = founding CA holder;
   LH2/LH3 = additional lighthouses, one CA on LH1 — see `docs/design/magic-setup-wizard.md`). Within
   this envelope the bar is **reliable + operable + documented**. Going beyond 3 LH + 9 peers /
   full multi-CA HA / multi-tenant is **out of scope** for this identity.
@@ -184,16 +185,18 @@ desktop-personal panels grouped below. Locks (full table: `docs/design/planes.md
 - **3 roles + capability tags.** §5's roles stay the install-time identity;
   **hop / execution / headless** are orthogonal, **gating** tags — untagged duty is
   refused. (W2/W82/W84)
-- **The Controller is a plane, not a place.** No-fixed-center holds: control state
-  lives on LizardFS, any node hosts the surfaces, the elected leader only
-  coordinates (schedules, sweeps). (W3)
+- **The Controller is a plane, not a place.** No-fixed-center holds: coordination
+  state lives in **etcd** + bulk files on **Mesh Sync (Syncthing)**, any node hosts
+  the surfaces, the elected leader (an etcd lease) only coordinates (schedules,
+  sweeps). (W3)
 - **Remote execution is typed verbs + signed job bundles only — no raw shell
   channel, ever.** Jobs are Ansible playbooks the *target* runs locally; no
   push-SSH. (W21/W32)
-- **One state doctrine:** every plane's durable state = TOML/YAML dirs on LizardFS +
-  typed `mackesd` Bus verbs; GUIs are renderers; every surface has CLI parity. (W88/W27)
+- **One state doctrine:** every plane's durable state = **etcd** (coordination) +
+  TOML/YAML dirs on **Mesh Sync (Syncthing)** (files) + typed `mackesd` Bus verbs;
+  GUIs are renderers; every surface has CLI parity. (W88/W27)
 - **Mesh tooling first, Red Hat best practices second** (standing directive D-W1):
-  FPG/Bus/LizardFS/Nebula before new components; Ansible/nmstate/firewalld/
+  FPG/Bus/etcd/Syncthing/Nebula before new components; Ansible/nmstate/firewalld/
   kickstart/createrepo where the mesh has no native tool. Greenfield — no legacy
   carried.
 - **Hero images:** sections backed by an external project carry a Carbon-compliant
