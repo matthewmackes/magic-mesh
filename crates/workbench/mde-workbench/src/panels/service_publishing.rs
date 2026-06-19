@@ -205,8 +205,8 @@ fn empty_state<'a>(palette: Palette) -> Element<'a, crate::Message> {
             text(
                 "The 7 canonical services (SSH / NATS / Mesh FS / Media / \
                  rsync / WoL / AV) are listed for every enrolled peer, read \
-                 from the replicated peer roster on QNM-Shared. Empty means no \
-                 peers are enrolled yet (or QNM-Shared isn't mounted) — click \
+                 from the replicated peer roster on Mesh Sync. Empty means no \
+                 peers are enrolled yet (or Mesh Sync isn't up) — click \
                  Refresh once the mesh is up."
             )
             .size(12)

@@ -1083,7 +1083,7 @@ impl AppsApplet {
         let used_pp = ((frac * 1000.0) as u16).max(1);
         let rest_pp = 1000u16.saturating_sub(used_pp).max(1);
         let usage_line = row(vec![
-            text("QNM-Shared")
+            text("Mesh Sync")
                 .size(cap_sz)
                 .font(mono)
                 .class(cosmic::theme::Text::Color(carbon(p.text_muted)))

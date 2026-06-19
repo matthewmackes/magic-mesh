@@ -346,15 +346,17 @@ pub fn fmt_bytes(n: u64) -> String {
     }
 }
 
-/// The header disk label, e.g. `"QNM-Shared: 1.2 GiB / 200.0 GiB"`. `None`
-/// total → an "unavailable" label (mount not up).
+/// The header disk label, e.g. `"Mesh Sync: 1.2 GiB / 200.0 GiB"`. `None`
+/// total → an "unavailable" label (share not up). SUBSTRATE-12 renamed the
+/// user-facing share from "QNM-Shared" to "Mesh Sync"; the `/mnt/mesh-storage`
+/// path + the fn name stay (back-compat).
 #[must_use]
 pub fn qnm_usage_label(usage: Option<(u64, u64)>) -> String {
     match usage {
         Some((used, total)) if total > 0 => {
-            format!("QNM-Shared: {} / {}", fmt_bytes(used), fmt_bytes(total))
+            format!("Mesh Sync: {} / {}", fmt_bytes(used), fmt_bytes(total))
         }
-        _ => "QNM-Shared: unavailable".to_string(),
+        _ => "Mesh Sync: unavailable".to_string(),
     }
 }
 
@@ -412,10 +414,10 @@ mod tests {
     fn qnm_label_handles_present_and_absent() {
         assert_eq!(
             qnm_usage_label(Some((1024 * 1024 * 1024, 200 * 1024 * 1024 * 1024))),
-            "QNM-Shared: 1.0 GiB / 200.0 GiB"
+            "Mesh Sync: 1.0 GiB / 200.0 GiB"
         );
-        assert_eq!(qnm_usage_label(None), "QNM-Shared: unavailable");
-        assert_eq!(qnm_usage_label(Some((5, 0))), "QNM-Shared: unavailable");
+        assert_eq!(qnm_usage_label(None), "Mesh Sync: unavailable");
+        assert_eq!(qnm_usage_label(Some((5, 0))), "Mesh Sync: unavailable");
     }
 
     #[test]
