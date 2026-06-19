@@ -70,6 +70,10 @@ pub const DURATION_SLOW_02: Duration = Duration::from_millis(700);
 /// `(x1, y1, x2, y2)` — the *productive* (functional-UI) set. `standard` for
 /// state changes that start + end on screen, `entrance` for elements appearing,
 /// `exit` for elements leaving. (E9.5.)
+/// MOTION-CORE-1 — the reduce-motion duration cap (Carbon/Q32: ≤80 ms crossfade).
+/// Single-sourced here + mirrored by `accessibility::A11y::transition_duration_ms`.
+pub const REDUCE_MOTION_CAP_MS: u64 = 80;
+
 pub const EASING_STANDARD: (f32, f32, f32, f32) = (0.2, 0.0, 0.38, 0.9);
 /// Carbon productive `entrance` curve — elements appearing on screen.
 pub const EASING_ENTRANCE: (f32, f32, f32, f32) = (0.0, 0.0, 0.38, 0.9);
@@ -133,6 +137,102 @@ impl Motion {
             duration: DURATION_FAST_02,
             easing: Easing::EaseOut,
             looping: false,
+        }
+    }
+
+    // MOTION-CORE-1 — the shell-wide interaction + state presets, so every GUI
+    // resolves its motion from this single source (no scattered literals). All
+    // single-shot except `loading`/`refresh` (looping activity indicators).
+
+    /// Hover lift / highlight — the fastest micro-interaction (Carbon `fast-01`,
+    /// 70 ms ease-out).
+    #[must_use]
+    pub const fn hover() -> Self {
+        Self {
+            duration: DURATION_FAST_01,
+            easing: Easing::EaseOut,
+            looping: false,
+        }
+    }
+
+    /// Press / depress feedback — the fastest tier (`fast-01`, 70 ms ease-out).
+    #[must_use]
+    pub const fn press() -> Self {
+        Self {
+            duration: DURATION_FAST_01,
+            easing: Easing::EaseOut,
+            looping: false,
+        }
+    }
+
+    /// Focus-ring appearance — `fast-02` (110 ms ease-out), the tooltip tier.
+    #[must_use]
+    pub const fn focus() -> Self {
+        Self {
+            duration: DURATION_FAST_02,
+            easing: Easing::EaseOut,
+            looping: false,
+        }
+    }
+
+    /// Loading indicator (skeleton shimmer / spinner) — a **looping** activity
+    /// cue, Carbon `slow-02` (700 ms) ease-in-out.
+    #[must_use]
+    pub const fn loading() -> Self {
+        Self {
+            duration: DURATION_SLOW_02,
+            easing: Easing::EaseInOut,
+            looping: true,
+        }
+    }
+
+    /// Background-refresh indicator — a **looping** `slow-01` (400 ms)
+    /// ease-in-out pulse, subtler/faster than `loading`.
+    #[must_use]
+    pub const fn refresh() -> Self {
+        Self {
+            duration: DURATION_SLOW_01,
+            easing: Easing::EaseInOut,
+            looping: true,
+        }
+    }
+
+    /// Success confirmation — a single-shot `moderate-01` (150 ms) ease-out.
+    #[must_use]
+    pub const fn success() -> Self {
+        Self {
+            duration: DURATION_MODERATE_01,
+            easing: Easing::EaseOut,
+            looping: false,
+        }
+    }
+
+    /// Error feedback — a single-shot `fast-02` (110 ms) ease-out (a subtle
+    /// flash/shake; never a long distracting motion).
+    #[must_use]
+    pub const fn error() -> Self {
+        Self {
+            duration: DURATION_FAST_02,
+            easing: Easing::EaseOut,
+            looping: false,
+        }
+    }
+
+    /// MOTION-CORE-1/-A11Y-1 — the **reduce-motion contract** (Q32): under
+    /// reduce-motion every transition collapses to a ≤80 ms linear crossfade and
+    /// loops are dropped (consumers render a static, non-motion indicator). Every
+    /// motion consumer must route through this so reduce-motion is guaranteed.
+    /// Mirrors [`crate::A11y::transition_duration_ms`]'s 80 ms cap.
+    #[must_use]
+    pub const fn resolved(self, reduce_motion: bool) -> Self {
+        if reduce_motion {
+            Self {
+                duration: Duration::from_millis(REDUCE_MOTION_CAP_MS),
+                easing: Easing::Linear,
+                looping: false,
+            }
+        } else {
+            self
         }
     }
 }
@@ -283,6 +383,43 @@ mod tests {
         assert_eq!(m.duration, Duration::from_millis(240));
         assert_eq!(m.easing, Easing::EaseOut);
         assert!(!m.looping);
+    }
+
+    #[test]
+    fn interaction_and_state_presets_pinned() {
+        // MOTION-CORE-1 — every interaction/state preset resolves from the Carbon
+        // grid; single-shot for feedback, looping for activity indicators.
+        assert_eq!(Motion::hover().duration, DURATION_FAST_01);
+        assert!(!Motion::hover().looping);
+        assert_eq!(Motion::press().duration, DURATION_FAST_01);
+        assert_eq!(Motion::focus().duration, DURATION_FAST_02);
+        assert_eq!(Motion::success().duration, DURATION_MODERATE_01);
+        assert!(!Motion::success().looping);
+        assert_eq!(Motion::error().duration, DURATION_FAST_02);
+        // Activity indicators loop.
+        assert_eq!(Motion::loading().duration, DURATION_SLOW_02);
+        assert!(Motion::loading().looping);
+        assert_eq!(Motion::refresh().duration, DURATION_SLOW_01);
+        assert!(Motion::refresh().looping);
+    }
+
+    #[test]
+    fn resolved_honors_reduce_motion_contract() {
+        // MOTION-CORE-1/-A11Y-1 — reduce-motion collapses to a ≤80 ms linear
+        // crossfade and drops looping; otherwise the preset is unchanged.
+        assert_eq!(REDUCE_MOTION_CAP_MS, 80);
+        let normal = Motion::loading();
+        assert_eq!(
+            normal.resolved(false),
+            normal,
+            "no change when motion is on"
+        );
+        let reduced = Motion::loading().resolved(true);
+        assert_eq!(reduced.duration, Duration::from_millis(80));
+        assert_eq!(reduced.easing, Easing::Linear);
+        assert!(!reduced.looping, "loops are dropped under reduce-motion");
+        // A short single-shot is also capped (never exceeds 80 ms).
+        assert!(Motion::panel_mount().resolved(true).duration <= Duration::from_millis(80));
     }
 
     #[test]
