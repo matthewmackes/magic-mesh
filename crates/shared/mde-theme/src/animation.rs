@@ -189,6 +189,73 @@ pub fn pulse_scale(phase: f32, max_scale: f32) -> f32 {
     lerp_f32(1.0, max_scale, smoothed)
 }
 
+/// MOTION-INFRA-2 — the standard shell transition kinds. Each maps an eased
+/// progress `t` (0→1, from [`Animator::value`]) to concrete [`RenderParams`] the
+/// consumer applies to its themed widget (alpha → a container/text color alpha,
+/// `translate_y` → padding/offset, `scale` → size). Centralizing the math here is
+/// the reusable-transition layer; the actual Element wrapping stays consumer-side
+/// (the iced 0.13 fork has no opacity/transform widget — interpolate color-alpha
+/// + size instead). Compositor-friendly: only alpha/translate/scale, never layout
+/// thrash.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Transition {
+    /// Opacity 0→1 (element appearing).
+    FadeIn,
+    /// Opacity 1→0 (element leaving).
+    FadeOut,
+    /// Fade in while sliding up from `distance` px below to rest.
+    SlideUp(f32),
+    /// Hover lift — rises `rise` px (negative `translate_y`) as `t` grows.
+    Lift(f32),
+    /// Press depress — scales down by `depth` (e.g. `0.04` ⇒ 0.96 at full press).
+    Press(f32),
+}
+
+/// MOTION-INFRA-2 — the render parameters a [`Transition`] yields at a given
+/// progress. Consumers apply what's relevant (most use one or two fields).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenderParams {
+    /// Opacity multiplier `0.0..=1.0`.
+    pub alpha: f32,
+    /// Vertical offset in px (negative = up).
+    pub translate_y: f32,
+    /// Scale multiplier (1.0 = natural size).
+    pub scale: f32,
+}
+
+impl Transition {
+    /// Resolve this transition at eased progress `t` (clamped to `0.0..=1.0`).
+    #[must_use]
+    pub fn params(self, t: f32) -> RenderParams {
+        let t = t.clamp(0.0, 1.0);
+        let base = RenderParams {
+            alpha: 1.0,
+            translate_y: 0.0,
+            scale: 1.0,
+        };
+        match self {
+            Self::FadeIn => RenderParams { alpha: t, ..base },
+            Self::FadeOut => RenderParams {
+                alpha: 1.0 - t,
+                ..base
+            },
+            Self::SlideUp(distance) => RenderParams {
+                alpha: t,
+                translate_y: (1.0 - t) * distance,
+                ..base
+            },
+            Self::Lift(rise) => RenderParams {
+                translate_y: -t * rise,
+                ..base
+            },
+            Self::Press(depth) => RenderParams {
+                scale: 1.0 - t * depth,
+                ..base
+            },
+        }
+    }
+}
+
 /// MOTION-INFRA-1 — a tiny animation registry. Holds the active tweens keyed by
 /// a caller id and is advanced by ONE subscription tick, so N concurrent
 /// animations across a surface share a single timer instead of each arming its
@@ -257,6 +324,27 @@ impl Animator {
 mod tests {
     use super::*;
     use crate::motion::PULSE_MAX_SCALE;
+
+    #[test]
+    fn transition_params_map_progress_correctly() {
+        // MOTION-INFRA-2 — each transition kind yields the right render params at
+        // the endpoints (consumers apply alpha/translate_y/scale to themed widgets).
+        assert_eq!(Transition::FadeIn.params(0.0).alpha, 0.0);
+        assert_eq!(Transition::FadeIn.params(1.0).alpha, 1.0);
+        assert_eq!(Transition::FadeOut.params(1.0).alpha, 0.0);
+        // SlideUp: starts `distance` below, rests at 0 + fully opaque.
+        let s0 = Transition::SlideUp(8.0).params(0.0);
+        assert_eq!(s0.translate_y, 8.0);
+        assert_eq!(s0.alpha, 0.0);
+        let s1 = Transition::SlideUp(8.0).params(1.0);
+        assert_eq!(s1.translate_y, 0.0);
+        assert_eq!(s1.alpha, 1.0);
+        // Lift rises (negative y); Press depresses scale.
+        assert_eq!(Transition::Lift(6.0).params(1.0).translate_y, -6.0);
+        assert!((Transition::Press(0.04).params(1.0).scale - 0.96).abs() < 1e-6);
+        // Clamped: out-of-range t doesn't overshoot.
+        assert_eq!(Transition::FadeIn.params(2.0).alpha, 1.0);
+    }
 
     #[test]
     fn animator_runs_many_off_one_clock_and_goes_idle() {
