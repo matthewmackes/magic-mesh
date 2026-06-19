@@ -255,6 +255,8 @@ enum Message {
     Ascend(usize),
     /// MUSIC-HOME-2 — the server library-stats snapshot returned.
     StatsLoaded(Result<library::LibraryStats, String>),
+    /// MUSIC-HOME-4 — periodic Home-page stats refresh tick.
+    PollStats,
     /// MUSIC-NAV — go up one breadcrumb level (Back).
     Back,
     /// MUSIC-NAV — jump to the Library root (Home).
@@ -662,6 +664,9 @@ impl State {
                     self.stats = Some(s);
                 }
                 Task::none()
+            }
+            Message::PollStats => {
+                Task::perform(library::fetch_library_stats(), Message::StatsLoaded)
             }
             Message::Exit => std::process::exit(0),
             Message::UrlChanged(s) => {
@@ -1103,11 +1108,25 @@ impl State {
         if self.form.is_some() {
             Subscription::batch([keys, resizes])
         } else {
-            Subscription::batch([
+            let mut subs = vec![
                 keys,
                 resizes,
                 cosmic::iced::time::every(nowplaying::POLL).map(|_| Message::PollState),
-            ])
+            ];
+            // MUSIC-HOME-4 — poll the server stats while the Home dashboard is
+            // shown (faster while a scan is running so progress stays live).
+            if matches!(self.nav.current(), Route::Hub) {
+                let secs = if self.stats.as_ref().is_some_and(|s| s.scanning) {
+                    5
+                } else {
+                    45
+                };
+                subs.push(
+                    cosmic::iced::time::every(std::time::Duration::from_secs(secs))
+                        .map(|_| Message::PollStats),
+                );
+            }
+            Subscription::batch(subs)
         }
     }
 
