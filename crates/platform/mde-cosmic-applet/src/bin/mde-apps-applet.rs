@@ -790,12 +790,13 @@ impl Application for AppsApplet {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        // APPS-ICON (operator 2026-06-19) — the panel launcher button uses the
-        // Start3 brand icon (baked in so it renders with no install-path
-        // dependency), sized to the panel's suggested icon size.
+        // BRAND-11 (operator 2026-06-19) — the panel launcher button uses the
+        // MCNF 11 brand logo (Start5, background flood-keyed to transparent;
+        // baked in so it renders with no install-path dependency), sized to the
+        // panel's suggested icon size.
         let icon_px = self.core.applet.suggested_size(true).0.max(16);
         let glyph = cosmic::iced::widget::image(cosmic::iced::widget::image::Handle::from_bytes(
-            include_bytes!("../../../../../assets/brand/Start3.png").to_vec(),
+            include_bytes!("../../../../../assets/brand/app-launcher.png").to_vec(),
         ))
         .width(Length::Fixed(f32::from(icon_px)))
         .height(Length::Fixed(f32::from(icon_px)));

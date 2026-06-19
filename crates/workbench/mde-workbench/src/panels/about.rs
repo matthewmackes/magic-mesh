@@ -58,12 +58,35 @@ impl AboutPanel {
         let palette = crate::live_theme::palette();
         let sizes = FontSize::defaults();
 
+        // BRAND-11 — the MCNF logo as the About hero (the predominant brand art),
+        // from the Brand loader's LogoLockup slot (baked SVG fallback → the new
+        // MCNF 11 mark). Square 1:1; rendered at a fixed hero height.
+        let hero: Element<'a, crate::Message, cosmic::Theme> = {
+            use cosmic::iced::widget::svg;
+            let brand = mde_theme::Brand::new();
+            let bytes = brand.bytes(mde_theme::BrandSlot::LogoLockup);
+            // LogoLockup has no baked default; fall back to the Monogram slot.
+            let bytes = if bytes.is_empty() {
+                brand.bytes(mde_theme::BrandSlot::Monogram)
+            } else {
+                bytes
+            };
+            svg(svg::Handle::from_memory(bytes))
+                .width(Length::Fixed(96.0))
+                .height(Length::Fixed(96.0))
+                .into()
+        };
         let title = text("About MCNF — Mackes Cosmic Nebula Fedora")
             .size(TypeRole::Display.size_in(sizes))
             .colr(palette.text.into_cosmic_color());
-        // 10.0.x is codenamed "Magic Mesh" (the package id `magic-mesh` = the
-        // codename); show it alongside the workspace version.
-        let version = text(format!("MCNF 10.0 \"Magic Mesh\" · v{VERSION}"))
+        // The series codename tracks the major version: 11.x = "Winter-Is-Coming",
+        // else 10.0.x = "Magic Mesh" (the package id `magic-mesh` = the codename).
+        let codename = if VERSION.starts_with("11.") {
+            "MCNF 11.0 \"Winter-Is-Coming\""
+        } else {
+            "MCNF 10.0 \"Magic Mesh\""
+        };
+        let version = text(format!("{codename} · v{VERSION}"))
             .size(TypeRole::Caption.size_in(sizes))
             .colr(palette.text_muted.into_cosmic_color());
 
@@ -98,6 +121,8 @@ impl AboutPanel {
         .spacing(0);
 
         let col = column![
+            hero,
+            Space::new().height(Length::Fixed(12.0)),
             title,
             Space::new().height(Length::Fixed(4.0)),
             version,

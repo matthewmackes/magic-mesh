@@ -28,8 +28,7 @@ use crate::panels::{
     hardware as hardware_panel, health_check as health_check_panel, help_index as help_index_panel,
     home as home_panel, hub as hub_panel, images as images_panel, interfaces as interfaces_panel,
     inventory as inventory_panel, jobs as jobs_panel, lighthouses as lighthouses_panel,
-    logs as logs_panel,
-    mesh_bus as mesh_bus_panel, mesh_control as mesh_control_panel,
+    logs as logs_panel, mesh_bus as mesh_bus_panel, mesh_control as mesh_control_panel,
     mesh_federation as mesh_federation_panel, mesh_history as mesh_history_panel,
     mesh_join as mesh_join_panel, mesh_logs as mesh_logs_panel, mesh_pending as mesh_pending_panel,
     mesh_services as mesh_services_panel, mesh_storage as mesh_storage_panel,
@@ -976,7 +975,14 @@ impl App {
         self.focused_pane = Pane::Main;
         // Apply the per-item focus before the panel loads so the tab opens
         // already highlighting + listing the clicked lighthouse first (Q20).
-        if let (Some(focus), View::Panel { panel: "lighthouses", .. }) = (&focus_id, view) {
+        if let (
+            Some(focus),
+            View::Panel {
+                panel: "lighthouses",
+                ..
+            },
+        ) = (&focus_id, view)
+        {
             self.lighthouses.set_focus(focus);
         }
         if let View::Panel { group, panel } = view {

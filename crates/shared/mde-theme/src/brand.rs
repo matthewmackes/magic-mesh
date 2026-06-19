@@ -200,20 +200,21 @@ impl BrandSlot {
         }
     }
 
-    /// Whether this slot is safe to tint at render time. The
-    /// tintable slots ship `currentColor`-friendly artwork in
-    /// their baked fallback; the fixed-palette slots
-    /// (`AppIcon`, `GreeterWordmark`, `GreeterHero`, `LogoLockup`)
-    /// must render as supplied so they look right outside any
-    /// particular host theme.
+    /// Whether this slot is safe to tint at render time.
     ///
-    /// Note: tintability is a property of the *baked default*. If
-    /// the user supplies a PNG at runtime for a tintable slot,
-    /// the PNG can't be tinted regardless. Consumers that need
-    /// to tint should check the resolved [`BrandFormat`].
+    /// BRAND-11 (2026-06-19): the MCNF 11 brand is a **fixed-palette** mark
+    /// (the blue windowed-constellation logo), so **no slot is tintable** — every
+    /// baked asset now embeds the full-color logo and must render as supplied so
+    /// it looks right outside any particular host theme (the same reason `AppIcon`
+    /// was always fixed-palette). Previously Wordmark/WordmarkHero/Monogram shipped
+    /// monochrome `currentColor` artwork; the rebrand replaced them with the logo.
+    ///
+    /// Note: tintability is a property of the *baked default*. A runtime PNG
+    /// override can't be tinted regardless; consumers that tint should check the
+    /// resolved [`BrandFormat`].
     #[must_use]
     pub const fn is_tintable(self) -> bool {
-        matches!(self, Self::Wordmark | Self::WordmarkHero | Self::Monogram)
+        false
     }
 }
 
@@ -457,8 +458,15 @@ mod tests {
 
     #[test]
     fn missing_override_falls_through_to_baked() {
-        let tmp = tempdir();
-        let brand = Brand::with_dir(tmp.path());
+        // Isolate BOTH dirs to empty temps so the result is the baked fallback
+        // regardless of whether this host has the RPM-installed
+        // /usr/share/mde/brand (which would otherwise intercept as `System`).
+        let over = tempdir();
+        let sys = tempdir();
+        let brand = Brand {
+            override_dir: Some(over.path().to_path_buf()),
+            system_dir: sys.path().to_path_buf(),
+        };
         let asset = brand.resolve(BrandSlot::Monogram);
         assert!(!asset.bytes.is_empty());
         assert_eq!(asset.source, BrandSource::Baked);
@@ -503,24 +511,39 @@ mod tests {
     }
 
     #[test]
-    fn tintable_baked_bytes_actually_use_currentcolor() {
+    fn brand_is_fixed_palette_not_tintable() {
+        // BRAND-11: the MCNF 11 logo is a fixed-palette mark — NO slot is
+        // tintable, and every baked fallback embeds the full-color logo (not a
+        // monochrome `currentColor` glyph).
         for slot in [
             BrandSlot::Wordmark,
             BrandSlot::WordmarkHero,
             BrandSlot::Monogram,
+            BrandSlot::AppIcon,
+            BrandSlot::GreeterWordmark,
+            BrandSlot::GreeterHero,
+            BrandSlot::LogoLockup,
         ] {
-            assert!(slot.is_tintable());
-            let bytes = slot.fallback_bytes();
-            let text = std::str::from_utf8(bytes).unwrap();
+            assert!(!slot.is_tintable(), "{slot:?} must be fixed-palette");
+        }
+        // The baked logo slots embed the raster mark (base64 PNG <image>), so
+        // they must NOT carry currentColor any more.
+        for slot in [
+            BrandSlot::Wordmark,
+            BrandSlot::WordmarkHero,
+            BrandSlot::Monogram,
+            BrandSlot::AppIcon,
+        ] {
+            let text = std::str::from_utf8(slot.fallback_bytes()).unwrap();
             assert!(
-                text.contains("currentColor"),
-                "{slot:?} marked tintable but baked bytes have no currentColor"
+                !text.contains("currentColor"),
+                "{slot:?} is fixed-palette but baked bytes still use currentColor"
+            );
+            assert!(
+                text.contains("image"),
+                "{slot:?} baked fallback should embed the logo image"
             );
         }
-        assert!(!BrandSlot::AppIcon.is_tintable());
-        assert!(!BrandSlot::GreeterWordmark.is_tintable());
-        assert!(!BrandSlot::GreeterHero.is_tintable());
-        assert!(!BrandSlot::LogoLockup.is_tintable());
     }
 
     #[test]

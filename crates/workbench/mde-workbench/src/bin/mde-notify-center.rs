@@ -697,7 +697,9 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
             .size(18)
             .color(p.accent.into_cosmic_color()),
         Space::new().width(Length::Fixed(10.0)),
-        text("Notifications").size(18).color(p.text.into_cosmic_color()),
+        text("Notifications")
+            .size(18)
+            .color(p.text.into_cosmic_color()),
         Space::new().width(Length::Fixed(8.0)),
         text(format!("· {unread} unread"))
             .size(12)
@@ -817,7 +819,29 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
     sections.push(quick_actions.into());
     sections.push(launch_bar.into());
 
-    container(cosmic::iced::widget::column(sections).spacing(0))
+    let content: Element<'_, Message> =
+        container(cosmic::iced::widget::column(sections).spacing(0))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+    // BRAND-11 (operator 2026-06-19) — a faint MCNF logo watermark pinned to the
+    // lower visible area of the Hub. The asset is pre-faded (~16% alpha) so it
+    // reads as a watermark without harming legibility; it carries no pointer
+    // handlers, so clicks pass through to the launch bar / quick actions beneath.
+    let watermark: Element<'_, Message> = container(
+        cosmic::iced::widget::image(cosmic::iced::widget::image::Handle::from_bytes(
+            include_bytes!("../../../../../assets/brand/watermark.png").to_vec(),
+        ))
+        .width(Length::Fixed(148.0))
+        .height(Length::Fixed(148.0)),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .align_x(cosmic::iced::alignment::Horizontal::Center)
+    .align_y(cosmic::iced::alignment::Vertical::Bottom)
+    .padding(Padding::from([0u16, 0u16, 6u16, 0u16]))
+    .into();
+    cosmic::iced::widget::Stack::with_children(vec![content, watermark])
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
@@ -994,21 +1018,16 @@ fn lighthouses_footer(beacons: &[Beacon], beam_step: u16, p: Palette) -> Element
         .collect();
     let strip = scrollable(row(cards).spacing(10)).direction(
         cosmic::iced::widget::scrollable::Direction::Horizontal(
-            cosmic::iced::widget::scrollable::Scrollbar::new().width(4).scroller_width(4),
+            cosmic::iced::widget::scrollable::Scrollbar::new()
+                .width(4)
+                .scroller_width(4),
         ),
     );
 
-    container(
-        column![
-            header,
-            Space::new().height(Length::Fixed(8.0)),
-            strip,
-        ]
-        .spacing(0),
-    )
-    .padding(Padding::from([10u16, 14u16]))
-    .width(Length::Fill)
-    .into()
+    container(column![header, Space::new().height(Length::Fixed(8.0)), strip,].spacing(0))
+        .padding(Padding::from([10u16, 14u16]))
+        .width(Length::Fill)
+        .into()
 }
 
 /// LIGHTHOUSE-3 — one square beacon card: the animated beam square (border in
@@ -1022,7 +1041,9 @@ fn beacon_card(b: &Beacon, beam_step: u16, p: Palette) -> Element<'static, Messa
         .center_x(Length::Fixed(54.0))
         .center_y(Length::Fixed(54.0))
         .style(move |_| container::Style {
-            background: Some(cosmic::iced::Background::Color(p.surface.into_cosmic_color())),
+            background: Some(cosmic::iced::Background::Color(
+                p.surface.into_cosmic_color(),
+            )),
             border: cosmic::iced::Border {
                 color: color.into_cosmic_color(),
                 width: 2.0,
@@ -1167,7 +1188,11 @@ fn alert_row(item: &AlertItem, idx: usize, now_ms: i64, p: Palette) -> Element<'
     // NOTIFY-HUB-1 — APPS-STYLE-2 zebra rows (the Application Menu's row idiom):
     // alternate the row layer so the alert list reads as banded rows. The
     // severity glyph already carries the severity colour.
-    let shade = if idx % 2 == 1 { p.surface } else { p.background };
+    let shade = if idx % 2 == 1 {
+        p.surface
+    } else {
+        p.background
+    };
     container(col)
         .padding(Padding::from([6u16, 8u16]))
         .width(Length::Fill)

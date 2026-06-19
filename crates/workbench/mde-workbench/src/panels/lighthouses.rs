@@ -233,15 +233,19 @@ fn lighthouse_card<'a>(
     )
     .center_x(Length::Fixed(64.0))
     .center_y(Length::Fixed(64.0))
-    .style(move |_t: &cosmic::Theme| cosmic::iced::widget::container::Style {
-        background: Some(cosmic::iced::Background::Color(p.surface.into_cosmic_color())),
-        border: cosmic::iced::Border {
-            color: color.into_cosmic_color(),
-            width: 2.0,
-            radius: 6.0.into(),
+    .style(
+        move |_t: &cosmic::Theme| cosmic::iced::widget::container::Style {
+            background: Some(cosmic::iced::Background::Color(
+                p.surface.into_cosmic_color(),
+            )),
+            border: cosmic::iced::Border {
+                color: color.into_cosmic_color(),
+                width: 2.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
         },
-        ..Default::default()
-    });
+    );
 
     let role_badge = if c.beacon.is_master {
         "MASTER"
@@ -253,13 +257,11 @@ fn lighthouse_card<'a>(
             .size(TypeRole::Heading.size_in(sizes))
             .colr(p.text.into_cosmic_color()),
         Space::new().width(Length::Fixed(10.0)),
-        text(role_badge)
-            .size(11)
-            .colr(if c.beacon.is_master {
-                p.accent.into_cosmic_color()
-            } else {
-                p.text_muted.into_cosmic_color()
-            }),
+        text(role_badge).size(11).colr(if c.beacon.is_master {
+            p.accent.into_cosmic_color()
+        } else {
+            p.text_muted.into_cosmic_color()
+        }),
     ]
     .align_y(cosmic::iced::alignment::Vertical::Center);
 
@@ -307,23 +309,31 @@ fn lighthouse_card<'a>(
     ]
     .spacing(3);
 
-    let inner = row![square, Space::new().width(Length::Fixed(16.0)), name_col(name_row, meta)]
-        .align_y(cosmic::iced::alignment::Vertical::Center);
+    let inner = row![
+        square,
+        Space::new().width(Length::Fixed(16.0)),
+        name_col(name_row, meta)
+    ]
+    .align_y(cosmic::iced::alignment::Vertical::Center);
 
     // Focused card gets an accent left border; others a subtle border.
     let border_color = if focused { p.accent } else { p.border };
     container(inner)
         .padding(Padding::from([14u16, 16u16]))
         .width(Length::Fill)
-        .style(move |_t: &cosmic::Theme| cosmic::iced::widget::container::Style {
-            background: Some(cosmic::iced::Background::Color(p.surface.into_cosmic_color())),
-            border: cosmic::iced::Border {
-                color: border_color.into_cosmic_color(),
-                width: if focused { 2.0 } else { 1.0 },
-                radius: 8.0.into(),
+        .style(
+            move |_t: &cosmic::Theme| cosmic::iced::widget::container::Style {
+                background: Some(cosmic::iced::Background::Color(
+                    p.surface.into_cosmic_color(),
+                )),
+                border: cosmic::iced::Border {
+                    color: border_color.into_cosmic_color(),
+                    width: if focused { 2.0 } else { 1.0 },
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
             },
-            ..Default::default()
-        })
+        )
         .into()
 }
 

@@ -15,6 +15,16 @@ starts at the first packaged release line.
 > Major version: the SUBSTRATE-V2 split (etcd coordination + Syncthing files,
 > LizardFS retired) + the MCNF rename. Planned — see docs/design/substrate-v2.md
 > (epic SUBSTRATE-1..14). **10.0.18 is the last 10.x cut; the next release is 11.0.**
+- **BRAND-11** — new 11.0 brand identity (the MCNF windowed-constellation logo,
+  `assets/icons/Start5.png`). The background is flood-keyed to transparency
+  (interior gridlines/nodes preserved) and regenerated across every brand
+  surface: the panel launcher icon, the hicolor app/window icons (16–512), the
+  brand-loader slots (app-icon / monogram / logo-lockup + the wordmark lockups,
+  baked SVGs embedding the logo), and the greeter hero (logo on Carbon Gray-100).
+  The brand is now **fixed-palette** (`is_tintable` → false). The logo is added
+  as a **watermark** on the Notification Hub's lower area and as the **About
+  panel hero**; the About codename auto-tracks the major version
+  (11.x → "Winter-Is-Coming").
 
 ## [10.0.18] - 2026-06-19
 > The final 10.x cut (operator: "10.0.18 can and will be the last cut").
