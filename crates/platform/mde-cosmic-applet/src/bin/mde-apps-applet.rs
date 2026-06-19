@@ -391,13 +391,25 @@ impl Application for AppsApplet {
                         move |state: &mut AppsApplet| {
                             let new_id = Id::unique();
                             state.popup = Some(new_id);
-                            state.core.applet.get_popup_settings(
+                            let mut settings = state.core.applet.get_popup_settings(
                                 state.core.main_window_id().unwrap(),
                                 new_id,
+                                Some((MENU_WIDTH as u32, MENU_HEIGHT as u32)),
                                 None,
                                 None,
-                                None,
-                            )
+                            );
+                            // APPS-WIDE — `get_popup_settings` hard-caps the
+                            // popup at max_width(360), so a wide content
+                            // container is clamped to 360px no matter what. Lift
+                            // the cap to our golden-rectangle size so the
+                            // launcher actually renders 2× wide.
+                            settings.positioner.size = Some((MENU_WIDTH as u32, MENU_HEIGHT as u32));
+                            settings.positioner.size_limits = cosmic::iced::Limits::NONE
+                                .min_width(MENU_WIDTH)
+                                .max_width(MENU_WIDTH)
+                                .min_height(1.0)
+                                .max_height(MENU_HEIGHT);
+                            settings
                         },
                         Some(Box::new(move |state: &AppsApplet| {
                             Element::from(state.core.applet.popup_container(state.dropdown()))
