@@ -20,6 +20,51 @@ use crate::hub::HubCard;
 /// timeout (cold-boot race), so this is the ceiling, not the common wait.
 pub const BROWSE_TIMEOUT: Duration = Duration::from_secs(10);
 
+thread_local! {
+    /// MUSIC-RESPONSIVE-5 — a per-blocking-thread pooled `(runtime, Persist)`.
+    /// `Persist` (rusqlite) is `!Send`, so it can't be shared across threads;
+    /// `spawn_blocking` reuses pool threads, so a thread-local lets repeated
+    /// browses on the same thread reuse the handle instead of re-opening SQLite +
+    /// rebuilding a current-thread runtime per call.
+    static BUS: std::cell::RefCell<
+        Option<(tokio::runtime::Runtime, mde_bus::persist::Persist)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// MUSIC-RESPONSIVE-5 — one Bus RPC reusing the thread-local runtime + Persist,
+/// returning the reply body. **Call only from inside `spawn_blocking`** (Persist
+/// is `!Send`). `reopen_if_index_changed` follows a [[BUS-INODE-ORPHAN]] index
+/// recreate so the pooled handle never serves a stale/deleted inode.
+fn bus_reply(topic: &str, body: Option<&str>) -> Result<String, String> {
+    BUS.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            let bus_root =
+                mde_bus::default_data_dir().ok_or_else(|| "no Bus data dir".to_string())?;
+            let persist =
+                mde_bus::persist::Persist::open(bus_root).map_err(|e| format!("Bus store: {e}"))?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            *slot = Some((rt, persist));
+        }
+        let (rt, persist) = slot.as_mut().expect("just initialized");
+        persist.reopen_if_index_changed();
+        let reply = rt
+            .block_on(mde_bus::rpc::request(
+                persist,
+                topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                body,
+                BROWSE_TIMEOUT,
+            ))
+            .map_err(|e| format!("daemon not responding ({e})"))?;
+        Ok(reply.body.unwrap_or_default())
+    })
+}
+
 /// One row in a library grid: a stable id + a display label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryItem {
@@ -141,25 +186,8 @@ pub async fn fetch(verb: &'static str) -> Result<Vec<LibraryItem>, String> {
     // Iced's multi-thread Task executor. Run it on a blocking thread with
     // a local current-thread runtime — only the `Send` `Vec` crosses back.
     tokio::task::spawn_blocking(move || -> Result<Vec<LibraryItem>, String> {
-        let bus_root = mde_bus::default_data_dir().ok_or_else(|| "no Bus data dir".to_string())?;
-        let persist =
-            mde_bus::persist::Persist::open(bus_root).map_err(|e| format!("Bus store: {e}"))?;
-        let topic = format!("action/music/{verb}");
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
-        let reply = rt
-            .block_on(mde_bus::rpc::request(
-                &persist,
-                &topic,
-                mde_bus::hooks::config::Priority::Default,
-                None,
-                None,
-                BROWSE_TIMEOUT,
-            ))
-            .map_err(|e| format!("daemon not responding ({e})"))?;
-        Ok(parse_items(reply.body.as_deref().unwrap_or("")))
+        let body = bus_reply(&format!("action/music/{verb}"), None)?;
+        Ok(parse_items(&body))
     })
     .await
     .map_err(|e| format!("fetch task join error: {e}"))?
@@ -210,25 +238,8 @@ pub fn parse_stats(reply_json: &str) -> Option<LibraryStats> {
 /// Bus-store / request / timeout failures (daemon not running).
 pub async fn fetch_library_stats() -> Result<LibraryStats, String> {
     tokio::task::spawn_blocking(move || -> Result<LibraryStats, String> {
-        let bus_root = mde_bus::default_data_dir().ok_or_else(|| "no Bus data dir".to_string())?;
-        let persist =
-            mde_bus::persist::Persist::open(bus_root).map_err(|e| format!("Bus store: {e}"))?;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
-        let reply = rt
-            .block_on(mde_bus::rpc::request(
-                &persist,
-                "action/music/library-stats",
-                mde_bus::hooks::config::Priority::Default,
-                None,
-                None,
-                BROWSE_TIMEOUT,
-            ))
-            .map_err(|e| format!("daemon not responding ({e})"))?;
-        parse_stats(reply.body.as_deref().unwrap_or(""))
-            .ok_or_else(|| "library-stats: bad reply".to_string())
+        let body = bus_reply("action/music/library-stats", None)?;
+        parse_stats(&body).ok_or_else(|| "library-stats: bad reply".to_string())
     })
     .await
     .map_err(|e| format!("stats task join error: {e}"))?
@@ -242,24 +253,8 @@ pub async fn fetch_library_stats() -> Result<LibraryStats, String> {
 /// Bus-store / request / timeout failures (daemon not running).
 pub async fn fetch_albums_by_genre(genre: String) -> Result<Vec<LibraryItem>, String> {
     tokio::task::spawn_blocking(move || -> Result<Vec<LibraryItem>, String> {
-        let bus_root = mde_bus::default_data_dir().ok_or_else(|| "no Bus data dir".to_string())?;
-        let persist =
-            mde_bus::persist::Persist::open(bus_root).map_err(|e| format!("Bus store: {e}"))?;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
-        let reply = rt
-            .block_on(mde_bus::rpc::request(
-                &persist,
-                "action/music/albums-by-genre",
-                mde_bus::hooks::config::Priority::Default,
-                None,
-                Some(&genre),
-                BROWSE_TIMEOUT,
-            ))
-            .map_err(|e| format!("daemon not responding ({e})"))?;
-        Ok(parse_items(reply.body.as_deref().unwrap_or("")))
+        let body = bus_reply("action/music/albums-by-genre", Some(&genre))?;
+        Ok(parse_items(&body))
     })
     .await
     .map_err(|e| format!("fetch task join error: {e}"))?
@@ -273,24 +268,8 @@ pub async fn fetch_albums_by_genre(genre: String) -> Result<Vec<LibraryItem>, St
 /// Bus-store / request / timeout failures (daemon not running).
 pub async fn fetch_albums_by_artist(artist_id: String) -> Result<Vec<LibraryItem>, String> {
     tokio::task::spawn_blocking(move || -> Result<Vec<LibraryItem>, String> {
-        let bus_root = mde_bus::default_data_dir().ok_or_else(|| "no Bus data dir".to_string())?;
-        let persist =
-            mde_bus::persist::Persist::open(bus_root).map_err(|e| format!("Bus store: {e}"))?;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
-        let reply = rt
-            .block_on(mde_bus::rpc::request(
-                &persist,
-                "action/music/albums-by-artist",
-                mde_bus::hooks::config::Priority::Default,
-                None,
-                Some(&artist_id),
-                BROWSE_TIMEOUT,
-            ))
-            .map_err(|e| format!("daemon not responding ({e})"))?;
-        Ok(parse_items(reply.body.as_deref().unwrap_or("")))
+        let body = bus_reply("action/music/albums-by-artist", Some(&artist_id))?;
+        Ok(parse_items(&body))
     })
     .await
     .map_err(|e| format!("fetch task join error: {e}"))?
@@ -304,24 +283,8 @@ pub async fn fetch_albums_by_artist(artist_id: String) -> Result<Vec<LibraryItem
 /// Bus-store / request / timeout failures (daemon not running).
 pub async fn fetch_podcast_episodes(channel_id: String) -> Result<Vec<LibraryItem>, String> {
     tokio::task::spawn_blocking(move || -> Result<Vec<LibraryItem>, String> {
-        let bus_root = mde_bus::default_data_dir().ok_or_else(|| "no Bus data dir".to_string())?;
-        let persist =
-            mde_bus::persist::Persist::open(bus_root).map_err(|e| format!("Bus store: {e}"))?;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
-        let reply = rt
-            .block_on(mde_bus::rpc::request(
-                &persist,
-                "action/music/podcast-episodes",
-                mde_bus::hooks::config::Priority::Default,
-                None,
-                Some(&channel_id),
-                BROWSE_TIMEOUT,
-            ))
-            .map_err(|e| format!("daemon not responding ({e})"))?;
-        Ok(parse_items(reply.body.as_deref().unwrap_or("")))
+        let body = bus_reply("action/music/podcast-episodes", Some(&channel_id))?;
+        Ok(parse_items(&body))
     })
     .await
     .map_err(|e| format!("fetch task join error: {e}"))?
