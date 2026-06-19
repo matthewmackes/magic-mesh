@@ -436,10 +436,10 @@ mod tests {
         let mut panel = NotificationsPanel::new();
         let _ = panel.update(Message::DndChanged(true), backend.clone());
         assert!(panel.dnd);
-        let _ = panel.update(Message::LocationChanged("top-left".into()), backend.clone());
+        let _ = panel.update(Message::LocationChanged("top-left".into()), backend);
         assert_eq!(panel.location, "top-left");
-        let _ = panel.update(Message::ExpireMsChanged("8000".into()), backend);
-        assert_eq!(panel.expire_ms_input, "8000");
+        // NOTIFY-PREFS-1 — the default-expire field is read-only now (fixed at
+        // the Phase C.5 lock), so there is no longer an ExpireMsChanged message.
     }
 
     #[tokio::test]

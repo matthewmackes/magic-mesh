@@ -222,6 +222,8 @@ pub fn nav_model() -> Vec<NavEntry> {
                 // Plain-language renames (Q13).
                 Panel::new("mesh_bus", "Message Bus"),
                 Panel::new("service_publishing", "Published Services"),
+                // CONNECT-6 — the unified exposure matrix (mesh-only vs public).
+                Panel::new("connectivity", "Connectivity"),
                 Panel::new("network_hosts", "Discovered Hosts"),
                 // Mesh-relevant peer/device services kept here (Q2 exception).
                 Panel::new("connect", "Connected Devices"),

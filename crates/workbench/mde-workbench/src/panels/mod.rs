@@ -9,6 +9,8 @@ pub mod audit;
 pub mod compute;
 pub mod config_apply;
 pub mod connect;
+/// CONNECT-6 — the unified connectivity / exposure matrix panel.
+pub mod connectivity;
 pub mod dns;
 pub mod drift;
 pub mod firewall;

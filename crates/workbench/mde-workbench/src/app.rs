@@ -22,11 +22,12 @@ use crate::keyboard::{KeyAction, Pane};
 use crate::model::{resolve_panel_label, view_from_focus_slug, Group, View};
 use crate::panels::{
     audit as audit_panel, compute as compute_panel, config_apply as config_apply_panel,
-    connect as connect_panel, dns as dns_panel, drift as drift_panel, firewall as firewall_panel,
-    fleet_logs as fleet_logs_panel, fleet_revisions as fleet_revisions_panel,
-    fleet_rollup as fleet_rollup_panel, fleet_settings as fleet_settings_panel,
-    hardware as hardware_panel, health_check as health_check_panel, help_index as help_index_panel,
-    home as home_panel, hub as hub_panel, images as images_panel, interfaces as interfaces_panel,
+    connect as connect_panel, connectivity as connectivity_panel, dns as dns_panel,
+    drift as drift_panel, firewall as firewall_panel, fleet_logs as fleet_logs_panel,
+    fleet_revisions as fleet_revisions_panel, fleet_rollup as fleet_rollup_panel,
+    fleet_settings as fleet_settings_panel, hardware as hardware_panel,
+    health_check as health_check_panel, help_index as help_index_panel, home as home_panel,
+    hub as hub_panel, images as images_panel, interfaces as interfaces_panel,
     inventory as inventory_panel, jobs as jobs_panel, lighthouses as lighthouses_panel,
     logs as logs_panel, mesh_bus as mesh_bus_panel, mesh_control as mesh_control_panel,
     mesh_federation as mesh_federation_panel, mesh_history as mesh_history_panel,
@@ -189,6 +190,8 @@ pub enum Message {
     MeshServices(mesh_services_panel::Message),
     /// NF-13.8 — Network → Service Publishing sub-message.
     ServicePublishing(service_publishing_panel::Message),
+    /// CONNECT-6 — Network → Connectivity (exposure matrix) sub-message.
+    Connectivity(connectivity_panel::Message),
     MeshStorage(mesh_storage_panel::Message),
     /// MESH-PROBE-9.a — Network → Network Hosts panel sub-message.
     NetworkHosts(network_hosts_panel::Message),
@@ -289,6 +292,8 @@ pub struct App {
     mesh_services: mesh_services_panel::MeshServicesPanel,
     /// NF-13.8 — Network → Service Publishing panel state.
     service_publishing: service_publishing_panel::ServicePublishingPanel,
+    /// CONNECT-6 — Network → Connectivity (exposure matrix) panel state.
+    connectivity: connectivity_panel::ConnectivityPanel,
     mesh_storage: mesh_storage_panel::MeshStoragePanel,
     /// MESH-PROBE-9.a — Network → Network Hosts panel state (the probe
     /// host/service inventory read off mesh-storage).
@@ -395,6 +400,7 @@ impl App {
             mesh_pending: mesh_pending_panel::MeshPendingPanel::new(),
             mesh_services: mesh_services_panel::MeshServicesPanel::new(),
             service_publishing: service_publishing_panel::ServicePublishingPanel::new(),
+            connectivity: connectivity_panel::ConnectivityPanel::new(),
             mesh_storage: mesh_storage_panel::MeshStoragePanel::new(),
             network_hosts: network_hosts_panel::NetworkHostsPanel::new(),
             remote_desktop: remote_desktop_panel::RemoteDesktopPanel::new(),
@@ -785,6 +791,7 @@ impl App {
             Message::MeshPending(msg) => self.mesh_pending.update(msg),
             Message::MeshServices(msg) => self.mesh_services.update(msg),
             Message::ServicePublishing(msg) => self.service_publishing.update(msg),
+            Message::Connectivity(msg) => self.connectivity.update(msg),
             Message::MeshStorage(msg) => self.mesh_storage.update(msg),
             Message::NetworkHosts(msg) => self.network_hosts.update(msg),
             Message::RemoteDesktop(msg) => self.remote_desktop.update(msg),
@@ -916,6 +923,9 @@ impl App {
             // for the 7 canonical services + per-row overlay
             // bind state.
             "service_publishing" => service_publishing_panel::ServicePublishingPanel::load(),
+            // CONNECT-6 — the exposure matrix: list-services + list-candidates
+            // over action/connect/* on first nav.
+            "connectivity" => connectivity_panel::ConnectivityPanel::load(),
             // v4.0.1 WB-2.l — load cached peer-macs.json on
             // first nav so the known-hosts table is populated.
             "remote_desktop" => remote_desktop_panel::RemoteDesktopPanel::load(),
@@ -1303,6 +1313,12 @@ impl App {
                 panel: "service_publishing",
                 ..
             } => self.service_publishing.view(),
+            // CONNECT-6 — Network → Connectivity renders the exposure matrix
+            // (configured policies) + auto-discovered candidates.
+            View::Panel {
+                panel: "connectivity",
+                ..
+            } => self.connectivity.view(),
             // v4.0.1 WB-2.l (2026-05-23) — Network → Remote
             // Desktop renders cached peer-macs.json hosts +
             // per-host RDP/VNC launch buttons + a manual-entry

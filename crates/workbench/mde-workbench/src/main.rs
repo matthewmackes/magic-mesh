@@ -195,6 +195,7 @@ mod tests {
         Cli {
             focus: focus.map(str::to_string),
             page: page.map(str::to_string),
+            boot_popup: false,
         }
     }
 
