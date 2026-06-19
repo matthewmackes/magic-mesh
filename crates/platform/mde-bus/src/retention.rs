@@ -126,7 +126,9 @@ pub struct PassReport {
     /// hard quota. Distinct from `removed` so the log shows when the bus
     /// is shedding live data to stay off ENOSPC.
     pub evicted: usize,
-    /// Total disk bytes used by remaining on-disk messages.
+    /// Total disk bytes the bus occupies after the pass — the remaining spool
+    /// `*.json` files PLUS the index DB itself (`index.sqlite{,-wal,-shm}`,
+    /// BUS-RETENTION-1). This is the true `/run` footprint the quota guards.
     pub bytes_after: u64,
     /// Quota state post-pass.
     pub quota: QuotaReport,
@@ -199,6 +201,51 @@ pub fn disk_usage_bytes(root: &Path) -> Result<u64, RetentionError> {
     let mut acc: u64 = 0;
     walk(root, &mut acc)?;
     Ok(acc)
+}
+
+/// BUS-RETENTION-1 — on-disk bytes of the index DB itself (`index.sqlite` plus
+/// its `-wal`/`-shm` sidecars). [`disk_usage_bytes`] deliberately excludes these
+/// (it sums only spool `*.json`), but the index is a real consumer of the tmpfs
+/// that backs the bus — it duplicates each message's title+body — so the quota
+/// footprint MUST include it. A 121 MB `index.sqlite` filled a 391 MB `/run`
+/// while the spool-only accounting reported "under budget" (found in the
+/// v10.0.18 fleet roll, 2026-06-19). Missing files contribute 0.
+#[must_use]
+pub fn index_db_bytes(root: &Path) -> u64 {
+    ["index.sqlite", "index.sqlite-wal", "index.sqlite-shm"]
+        .iter()
+        .filter_map(|n| std::fs::metadata(root.join(n)).ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// BUS-RETENTION-1 — return disk that the index DB freed (by the row deletes in
+/// a pass) to the OS. SQLite frees pages internally on `DELETE` but never shrinks
+/// the file on its own, so without this the index only ever grows — a live
+/// 121 MB `index.sqlite` (which duplicates message title+body) filled a 391 MB
+/// `/run` while the spool was capped (found in the v10.0.18 fleet roll). A full
+/// `VACUUM` is the only reliable reclaim: `incremental_vacuum` returns ~0 pages
+/// in WAL mode (verified). VACUUM rewrites the DB **in place** (same inode →
+/// never the [[BUS-INODE-ORPHAN]] unlink/recreate trap) and needs ~the DB size
+/// in temp space, which the preceding TTL-reap/eviction just freed on the tmpfs.
+///
+/// Guarded by `freelist_count` so idle passes (nothing deleted → nothing to
+/// reclaim) skip the VACUUM entirely; combined with the 120 s GC cadence the DB
+/// stays small, so each VACUUM is sub-second and safe alongside the live broker
+/// (own connection, 5 s `busy_timeout`). Every step is best-effort — a
+/// BUSY/ENOSPC failure is ignored and retried next pass.
+fn compact_index(conn: &Connection) {
+    // Return checkpointed WAL pages to the OS (no-op outside WAL mode).
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    // Only VACUUM when there's a non-trivial amount to reclaim (> 64 pages ≈
+    // 256 KiB), so idle passes don't rewrite the DB for nothing.
+    let freelist: i64 = conn
+        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+        .unwrap_or(0);
+    if freelist > 64 {
+        let _ = conn.execute_batch("VACUUM;");
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
 }
 
 /// Open the per-peer index that lives at `<bus_root>/index.sqlite`.
@@ -303,6 +350,12 @@ pub fn run_pass_at(
         removed += 1;
     }
 
+    // BUS-RETENTION-1 — reclaim the DB pages the deletes above freed BEFORE we
+    // measure/evict, so the footprint reflects a compacted index (not its stale
+    // high-water mark) and we don't over-evict spool to compensate for a bloated
+    // DB that's about to shrink.
+    compact_index(&conn);
+
     // BULLETPROOF-1 — hard-cap safety valve. The TTL reap above leaves
     // `audit/*` untouched (Q28: the audit trail is retention=forever). On the
     // tmpfs that backs the bus that is unbounded growth → a full `/run` that
@@ -310,11 +363,35 @@ pub fn run_pass_at(
     // reap, evict oldest-first until back under the SOFT cap. Non-audit goes
     // first; `audit/*` is shed only as a last resort (a full `/run` is strictly
     // worse than losing ephemeral tmpfs audit that does not survive reboot).
-    let mut bytes_after = disk_usage_bytes(bus_root)?;
+    //
+    // BUS-RETENTION-1 — the footprint counts the spool files AND the index DB
+    // itself (`index_db_bytes`): the DB is a real tmpfs consumer (it duplicates
+    // title+body), so excluding it let a 121 MB index fill a 391 MB `/run` while
+    // the cap reported "under budget". Eviction can only shed spool files, so it
+    // targets `soft - db` to bring spool + (compacted) DB back under the soft cap.
+    let mut bytes_after = disk_usage_bytes(bus_root)? + index_db_bytes(bus_root);
     let mut evicted = 0_usize;
     if bytes_after > policy.quota_hard_bytes {
-        evicted = evict_oldest_to_cap(&conn, bus_root, bytes_after, policy.quota_soft_bytes)?;
-        bytes_after = disk_usage_bytes(bus_root)?;
+        let spool = disk_usage_bytes(bus_root)?;
+        // The index duplicates each message's title+body, so evicting a message
+        // frees its spool file AND (after compaction) its DB rows — roughly
+        // (1 + db/spool)× the file size from the TOTAL footprint. eviction only
+        // tracks spool bytes, so target the spool level whose total lands at the
+        // soft cap: spool_target = spool * soft / total. (u128 to avoid overflow
+        // at multi-GB workstation tmpfs sizes.)
+        let spool_target = if bytes_after > 0 {
+            u64::try_from(
+                u128::from(spool) * u128::from(policy.quota_soft_bytes) / u128::from(bytes_after),
+            )
+            .unwrap_or(policy.quota_soft_bytes)
+        } else {
+            0
+        };
+        evicted = evict_oldest_to_cap(&conn, bus_root, spool, spool_target)?;
+        // Reclaim again — eviction deleted more rows; then re-measure the true
+        // footprint (spool + compacted DB).
+        compact_index(&conn);
+        bytes_after = disk_usage_bytes(bus_root)? + index_db_bytes(bus_root);
     }
     let quota = QuotaReport {
         soft_exceeded: bytes_after > policy.quota_soft_bytes,
@@ -790,9 +867,14 @@ mod tests {
             ));
         }
         purge_audit(&root);
+        // BUS-RETENTION-1 — the footprint counts the index DB too (it duplicates
+        // bodies, ~1 MB/msg here), so the total ≈ 2× the spool. Caps are sized so
+        // a few oldest messages are shed while the newest survives + the result
+        // lands under the hard cap (soft=2 MB would round to "shed everything"
+        // once the DB is counted).
         let policy = RetentionPolicy {
-            quota_soft_bytes: 2 * mb as u64,
-            quota_hard_bytes: 3 * mb as u64,
+            quota_soft_bytes: 5 * mb as u64,
+            quota_hard_bytes: 6 * mb as u64,
             ..RetentionPolicy::default()
         };
         let report = run_pass_at(&policy, &root, now).unwrap();
@@ -836,9 +918,13 @@ mod tests {
         }
         let audit_a = write_sized(&root, "audit/peerx", Priority::Min, now - 2000, mb);
         let audit_b = write_sized(&root, "audit/peerx", Priority::Min, now - 1000, mb);
+        // BUS-RETENTION-1 — the footprint now also counts the index DB (which
+        // duplicates bodies, ~1 MB/msg here), so the synthetic total ≈ 2× the
+        // spool. Caps are sized so shedding the 4 non-audit messages alone brings
+        // the total under the soft cap, leaving both audit records intact.
         let policy = RetentionPolicy {
-            quota_soft_bytes: 3 * mb as u64,
-            quota_hard_bytes: 4 * mb as u64,
+            quota_soft_bytes: 5 * mb as u64,
+            quota_hard_bytes: 6 * mb as u64,
             ..RetentionPolicy::default()
         };
         let report = run_pass_at(&policy, &root, now).unwrap();
@@ -871,6 +957,67 @@ mod tests {
         // Default tmpfs-safe policy (96/144 MB) is far above a 1 KB spool.
         let report = run_pass_at(&RetentionPolicy::default(), &root, 1_000_000_000_000).unwrap();
         assert_eq!(report.evicted, 0);
+    }
+
+    // BUS-RETENTION-1 — the index DB must count toward the footprint + shrink.
+
+    #[test]
+    fn footprint_includes_index_db() {
+        // A message with a sizable body bloats the index (it duplicates
+        // title+body), so `index_db_bytes` is non-trivial and `run_pass_at`'s
+        // `bytes_after` must exceed the spool-only `disk_usage_bytes`.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_sized(&root, "t/keep", Priority::Urgent, 1, 64 * 1024);
+        purge_audit(&root);
+        let db = index_db_bytes(&root);
+        assert!(
+            db > 0,
+            "index DB must contribute to the footprint, got {db}"
+        );
+        let report = run_pass_at(&RetentionPolicy::default(), &root, 100).unwrap();
+        let spool = disk_usage_bytes(&root).unwrap();
+        assert!(
+            report.bytes_after >= spool + index_db_bytes(&root),
+            "bytes_after ({}) must include the index DB on top of the spool ({spool})",
+            report.bytes_after,
+        );
+        assert!(report.bytes_after > spool, "DB bytes are counted");
+    }
+
+    #[test]
+    fn pass_reclaims_index_db_after_bulk_delete() {
+        // Born INCREMENTAL (the migration sets auto_vacuum) so a pass that
+        // deletes expired rows returns their pages to the OS — the index file
+        // must SHRINK, not just free pages internally (the v10.0.18 failure:
+        // a 121 MB index that never gave space back filled /run).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let now = 1_000_000_000_000_i64;
+        let long_ago = now - (10 * 24 * 60 * 60 * 1000); // 10 days — past min/default TTL
+                                                         // 40 expired min-priority messages with 32 KB bodies each → a fat index.
+        for i in 0..40 {
+            write_sized(
+                &root,
+                &format!("t/old{i}"),
+                Priority::Min,
+                long_ago,
+                32 * 1024,
+            );
+        }
+        purge_audit(&root);
+        let db_before = index_db_bytes(&root);
+        assert!(
+            db_before > 256 * 1024,
+            "index should be fat pre-reap, got {db_before}"
+        );
+        let report = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
+        assert_eq!(report.removed, 40, "all 40 expired messages reaped");
+        let db_after = index_db_bytes(&root);
+        assert!(
+            db_after < db_before / 2,
+            "index DB must shrink after the reap: before={db_before} after={db_after}",
+        );
     }
 
     #[test]
