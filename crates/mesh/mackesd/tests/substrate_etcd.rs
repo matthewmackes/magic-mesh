@@ -166,6 +166,17 @@ async fn etcd_leader_election_elects_one_renews_and_force_takes() {
         .expect("read leader");
     assert_eq!(cur.as_ref().map(|l| l.node_id.as_str()), Some("node-b"));
     assert_eq!(cur.as_ref().map(|l| l.epoch), Some(2));
+
+    // SUBSTRATE-4 — the healthz is_leader bridge (blocking wrapper) reads the
+    // same leader. Off the tokio worker via spawn_blocking, like the real
+    // healthz-enrich thread.
+    let eps = endpoints.clone();
+    let via_blocking = tokio::task::spawn_blocking(move || leader::current_leader_blocking(&eps))
+        .await
+        .unwrap()
+        .expect("blocking leader read");
+    assert_eq!(via_blocking.node_id, "node-b");
+    assert_eq!(via_blocking.epoch, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

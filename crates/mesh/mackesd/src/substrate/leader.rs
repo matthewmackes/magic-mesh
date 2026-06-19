@@ -135,6 +135,24 @@ async fn held_by(client: &mut Client) -> Result<AcquireResult, Error> {
     })
 }
 
+/// Blocking read of the current etcd leader (the healthz `is_leader` bridge).
+/// `None` on connect/read failure or no leader. MUST run OFF the tokio executor
+/// (the healthz enrichment helper thread qualifies) — it builds a private
+/// current-thread runtime.
+#[must_use]
+pub fn current_leader_blocking(endpoints: &[String]) -> Option<Lease> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?
+        .block_on(async {
+            match super::etcd::connect(endpoints).await {
+                Ok(mut c) => current_leader(&mut c).await.ok().flatten(),
+                Err(_) => None,
+            }
+        })
+}
+
 /// Force `node_id` into leadership: bump the epoch past the prior holder's and
 /// write unconditionally under a fresh lease. The operator's last resort
 /// (`mackesd take-leadership --force`), mirroring [`crate::leader::force_take`].

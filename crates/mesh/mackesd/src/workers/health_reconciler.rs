@@ -189,11 +189,29 @@ pub fn reconcile_with_conn(
         }
     };
     let now_ms = now_ms_override.unwrap_or_else(now_ms);
+    // SUBSTRATE-4 — when on the etcd coordination plane, peer liveness IS the
+    // keepalive lease: a host present in the `/mesh/peers/` range is alive (its
+    // record carries the health tier); an absent host's lease expired ⇒
+    // unreachable. No `last_seen_ms` heartbeat-age staleness guess. Empty
+    // endpoints (pre-cutover) ⇒ the fs heartbeat path, unchanged. The reconciler
+    // tick runs under spawn_blocking, so the blocking etcd read is safe.
+    let etcd_live: Option<std::collections::HashMap<String, String>> = {
+        let eps = crate::substrate::etcd::default_endpoints();
+        if eps.is_empty() {
+            None
+        } else {
+            crate::substrate::peers::read_peers_blocking(&eps)
+                .map(|peers| peers.into_iter().map(|p| (p.hostname, p.health)).collect())
+        }
+    };
     for node in nodes {
         if node.node_id == local_node_id {
             continue;
         }
-        let next = compute_health_for_peer(workgroup_root, &node.node_id, now_ms);
+        let next = match &etcd_live {
+            Some(live) => health_from_etcd(strip_peer(&node.node_id), live),
+            None => compute_health_for_peer(workgroup_root, &node.node_id, now_ms),
+        };
         let next_str = match next {
             HealthState::Healthy => "healthy",
             HealthState::Degraded => "degraded",
@@ -238,8 +256,19 @@ pub fn reconcile_with_conn(
 /// PEERVER-4 mirror: union the GFS `<workgroup_root>/peers/*.json` and write
 /// each peer's `mde_version` onto its `nodes` row (matched by name).
 fn mirror_peer_versions(conn: &rusqlite::Connection, workgroup_root: &std::path::Path) {
-    let dir = mackes_mesh_types::peers::peers_dir(workgroup_root);
-    for rec in mackes_mesh_types::peers::read_peers(&dir) {
+    // SUBSTRATE-4 — source the converged records from etcd when on the
+    // coordination plane, else the replicated fs dir.
+    let eps = crate::substrate::etcd::default_endpoints();
+    let records = if eps.is_empty() {
+        mackes_mesh_types::peers::read_peers(&mackes_mesh_types::peers::peers_dir(workgroup_root))
+    } else {
+        crate::substrate::peers::read_peers_blocking(&eps).unwrap_or_else(|| {
+            mackes_mesh_types::peers::read_peers(&mackes_mesh_types::peers::peers_dir(
+                workgroup_root,
+            ))
+        })
+    };
+    for rec in records {
         if let Err(e) = crate::store::set_node_mde_version_by_name(
             conn,
             &rec.hostname,
@@ -247,6 +276,29 @@ fn mirror_peer_versions(conn: &rusqlite::Connection, workgroup_root: &std::path:
         ) {
             tracing::warn!(error = %e, host = %rec.hostname, "health-reconciler: mde_version mirror failed");
         }
+    }
+}
+
+/// Strip the `peer:` node-id prefix to get the bare hostname (the etcd
+/// `/mesh/peers/` key + the telemetry writer's `peer_hostname`).
+fn strip_peer(node_id: &str) -> &str {
+    node_id.strip_prefix("peer:").unwrap_or(node_id)
+}
+
+/// SUBSTRATE-4 — reduce a peer's etcd-directory presence to a [`HealthState`].
+/// Present ⇒ its reported health tier (it's alive: the keepalive lease is
+/// liveness); absent ⇒ `Unreachable` (the lease expired and etcd deleted the
+/// row). Any present-but-non-`healthy` tier collapses to `Degraded` — present
+/// means reachable, never `Unreachable`. Pure + testable.
+#[must_use]
+pub fn health_from_etcd(
+    hostname: &str,
+    live: &std::collections::HashMap<String, String>,
+) -> HealthState {
+    match live.get(hostname).map(String::as_str) {
+        None => HealthState::Unreachable,
+        Some("healthy") => HealthState::Healthy,
+        Some(_) => HealthState::Degraded,
     }
 }
 
@@ -465,6 +517,27 @@ mod tests {
             TICK_INTERVAL.as_secs(),
             HEARTBEAT_INTERVAL_S,
         );
+    }
+
+    #[test]
+    fn health_from_etcd_presence_is_liveness() {
+        // SUBSTRATE-4 — present ⇒ tier (alive); absent ⇒ unreachable.
+        let mut live = std::collections::HashMap::new();
+        live.insert("node-a".to_string(), "healthy".to_string());
+        live.insert("node-b".to_string(), "degraded".to_string());
+        live.insert("node-c".to_string(), "critical".to_string());
+        assert_eq!(health_from_etcd("node-a", &live), HealthState::Healthy);
+        assert_eq!(health_from_etcd("node-b", &live), HealthState::Degraded);
+        // Present-but-critical is alive ⇒ Degraded, never Unreachable.
+        assert_eq!(health_from_etcd("node-c", &live), HealthState::Degraded);
+        // Absent ⇒ the keepalive lease expired ⇒ Unreachable.
+        assert_eq!(health_from_etcd("ghost", &live), HealthState::Unreachable);
+    }
+
+    #[test]
+    fn strip_peer_handles_prefixed_and_bare() {
+        assert_eq!(strip_peer("peer:eagle"), "eagle");
+        assert_eq!(strip_peer("eagle"), "eagle");
     }
 
     #[test]

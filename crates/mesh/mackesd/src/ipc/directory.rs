@@ -186,9 +186,17 @@ impl DirectoryService {
                 unreachable += 1;
             }
         }
-        let is_leader =
+        // SUBSTRATE-4 — leadership from the etcd lease when on the coordination
+        // plane, else the fs lockfile. (Runs on the off-tokio healthz-enrich
+        // thread, so the blocking etcd read is safe.)
+        let etcd_endpoints = crate::substrate::etcd::default_endpoints();
+        let is_leader = if etcd_endpoints.is_empty() {
             crate::leader::read_current_lease(&self.workgroup_root.join(".mackesd-leader.lock"))
-                .is_some_and(|l| l.node_id == node_id);
+                .is_some_and(|l| l.node_id == node_id)
+        } else {
+            crate::substrate::leader::current_leader_blocking(&etcd_endpoints)
+                .is_some_and(|l| l.node_id == node_id)
+        };
         (total, healthy, degraded, unreachable, is_leader)
     }
 
