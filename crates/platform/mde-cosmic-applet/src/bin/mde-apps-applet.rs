@@ -25,15 +25,121 @@ use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, Preferences, Rgba, 
 
 const ID: &str = "com.mackes.MagicMeshApps";
 
-/// APPS-WIDE (operator 2026-06-18) — the launcher dropdown is a golden
-/// rectangle. The operator doubled the width (2 × the original 460); to keep it
-/// golden the rectangle is now landscape: height = width / φ (920 / 1.618 ≈
-/// 569). Single-sourced here so the body container + any future hint agree.
+/// APPS-WIDE (operator 2026-06-18) — the launcher dropdown was a golden
+/// rectangle (920 × 920/φ). APPS-FIT (operator 2026-06-19) supersedes that: the
+/// dropdown now sizes to the desktop — **width = 33% of the output's logical
+/// width**, **height the same fraction of its height**, so the rectangle keeps
+/// the desktop's own aspect ratio ("matching the Ratio") and scales to any
+/// resolution. The golden rectangle below is only the fallback when the
+/// resolution can't be detected.
 const GOLDEN_RATIO: f32 = 1.618;
-/// Dropdown width — twice the original 460 (operator ask).
-const MENU_WIDTH: f32 = 920.0;
-/// Dropdown height — the golden complement of the width (landscape φ).
-const MENU_HEIGHT: f32 = MENU_WIDTH / GOLDEN_RATIO;
+/// APPS-FIT — the dropdown's width as a fraction of the desktop's logical width
+/// (and its height as the same fraction of the desktop height).
+const MENU_SCREEN_FRACTION: f32 = 0.33;
+/// APPS-FIT — fallback dropdown size (the prior APPS-WIDE golden rectangle) used
+/// when `cosmic-randr` can't report the output resolution.
+const FALLBACK_MENU_WIDTH: f32 = 920.0;
+const FALLBACK_MENU_HEIGHT: f32 = FALLBACK_MENU_WIDTH / GOLDEN_RATIO;
+
+/// APPS-FIT — detect the launcher size from the desktop resolution: 33% of the
+/// panel output's logical width × the same fraction of its height. Best-effort —
+/// shells `cosmic-randr list --kdl`, scoped to this panel's output
+/// (`COSMIC_PANEL_OUTPUT`); any failure falls back to the golden rectangle.
+fn detect_menu_size() -> (f32, f32) {
+    let target = std::env::var("COSMIC_PANEL_OUTPUT").unwrap_or_default();
+    std::process::Command::new("cosmic-randr")
+        .args(["list", "--kdl"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|kdl| parse_menu_size_from_kdl(&kdl, &target))
+        .unwrap_or((FALLBACK_MENU_WIDTH, FALLBACK_MENU_HEIGHT))
+}
+
+/// APPS-FIT — pure parser for `cosmic-randr list --kdl`. Returns the launcher
+/// size (`MENU_SCREEN_FRACTION` of the output's logical width × height) for the
+/// output named `target` (or the first enabled output with a current mode when
+/// `target` is empty / not found). The KDL shape (from cosmic-randr's
+/// `list_kdl`) is:
+/// ```text
+/// output "DP-1" enabled=#true {
+///   scale 1.50
+///   modes {
+///     mode 2560 1440 59951 current=#true preferred=#true
+///   }
+/// }
+/// ```
+/// Logical size = mode pixels ÷ scale. Returns `None` if no current mode is found.
+fn parse_menu_size_from_kdl(kdl: &str, target: &str) -> Option<(f32, f32)> {
+    // (name, enabled, scale, current_mode (w,h)) per output block, in order.
+    let mut cur_name = String::new();
+    let mut cur_enabled = false;
+    let mut cur_scale = 1.0_f32;
+    let mut best: Option<(f32, f32)> = None; // logical (w,h) of the chosen output
+    let mut fallback: Option<(f32, f32)> = None; // first enabled output's logical size
+
+    let finish = |name: &str,
+                  enabled: bool,
+                  mode: Option<(f32, f32)>,
+                  best: &mut Option<(f32, f32)>,
+                  fallback: &mut Option<(f32, f32)>| {
+        let Some(sz) = mode else { return };
+        if enabled {
+            if !target.is_empty() && name == target {
+                *best = Some(sz);
+            } else if fallback.is_none() {
+                *fallback = Some(sz);
+            }
+        }
+    };
+
+    let mut cur_mode: Option<(f32, f32)> = None;
+    for line in kdl.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("output \"") {
+            // Close the previous block.
+            finish(
+                &cur_name,
+                cur_enabled,
+                cur_mode.take(),
+                &mut best,
+                &mut fallback,
+            );
+            // output "NAME" enabled=#true {
+            let name = rest.split('"').next().unwrap_or("").to_string();
+            cur_name = name;
+            cur_enabled = t.contains("enabled=#true");
+            cur_scale = 1.0;
+        } else if let Some(rest) = t.strip_prefix("scale ") {
+            cur_scale = rest.trim().parse().unwrap_or(1.0);
+        } else if let Some(rest) = t.strip_prefix("mode ") {
+            if t.contains("current=#true") {
+                let mut it = rest.split_whitespace();
+                if let (Some(w), Some(h)) = (it.next(), it.next()) {
+                    if let (Ok(w), Ok(h)) = (w.parse::<f32>(), h.parse::<f32>()) {
+                        let scale = if cur_scale > 0.0 { cur_scale } else { 1.0 };
+                        cur_mode = Some((w / scale, h / scale));
+                    }
+                }
+            }
+        }
+    }
+    // Close the final block.
+    finish(
+        &cur_name,
+        cur_enabled,
+        cur_mode.take(),
+        &mut best,
+        &mut fallback,
+    );
+
+    let (lw, lh) = best.or(fallback)?;
+    if lw <= 0.0 || lh <= 0.0 {
+        return None;
+    }
+    Some((lw * MENU_SCREEN_FRACTION, lh * MENU_SCREEN_FRACTION))
+}
 /// APPS-WIDE — Favorites icon-grid shape (operator 2026-06-18): exactly 3 tiles
 /// per row, capped at 9 (a 3×3 grid), mirroring the Workbench/Files/Settings
 /// quick-link tile row above.
@@ -95,6 +201,12 @@ struct AppsApplet {
     /// APPS-STYLE — the active Carbon palette (dark/light, from the user's MDE
     /// theme preference); refreshed on each open so a theme switch is picked up.
     palette: Palette,
+    /// APPS-FIT — the launcher dropdown size (logical px): 33% of the desktop
+    /// width × the same fraction of its height. Detected once at init from
+    /// `cosmic-randr` (falls back to the golden rectangle); refreshed on open so
+    /// a resolution change is picked up without a re-login.
+    menu_w: f32,
+    menu_h: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -370,6 +482,7 @@ impl Application for AppsApplet {
     }
 
     fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Message>) {
+        let (menu_w, menu_h) = detect_menu_size();
         (
             AppsApplet {
                 core,
@@ -387,6 +500,8 @@ impl Application for AppsApplet {
                 run_text: String::new(),
                 error: None,
                 palette: resolve_palette(),
+                menu_w,
+                menu_h,
             },
             // Prime the list so the first open is instant.
             load_task(),
@@ -424,30 +539,36 @@ impl Application for AppsApplet {
                 self.rclick_open = false;
                 // Refresh the palette so a theme switch reflects on open.
                 self.palette = resolve_palette();
+                // APPS-FIT — re-detect the desktop size on open so a resolution
+                // change is picked up without a re-login.
+                let (mw, mh) = detect_menu_size();
+                self.menu_w = mw;
+                self.menu_h = mh;
                 // Open the dropdown + refresh-on-open (Q: cached + refresh-on-open).
                 let open = cosmic::task::message(cosmic::Action::Cosmic(
                     cosmic::app::Action::Surface(app_popup::<AppsApplet>(
                         move |state: &mut AppsApplet| {
                             let new_id = Id::unique();
                             state.popup = Some(new_id);
+                            let (menu_w, menu_h) = (state.menu_w, state.menu_h);
                             let mut settings = state.core.applet.get_popup_settings(
                                 state.core.main_window_id().unwrap(),
                                 new_id,
-                                Some((MENU_WIDTH as u32, MENU_HEIGHT as u32)),
+                                Some((menu_w as u32, menu_h as u32)),
                                 None,
                                 None,
                             );
-                            // APPS-WIDE — `get_popup_settings` hard-caps the
-                            // popup at max_width(360), so a wide content
+                            // APPS-WIDE/APPS-FIT — `get_popup_settings` hard-caps
+                            // the popup at max_width(360), so a wide content
                             // container is clamped to 360px no matter what. Lift
-                            // the cap to our golden-rectangle size so the
-                            // launcher actually renders 2× wide.
-                            settings.positioner.size = Some((MENU_WIDTH as u32, MENU_HEIGHT as u32));
+                            // the cap to the detected desktop-fraction size so the
+                            // launcher renders at 33% of the screen.
+                            settings.positioner.size = Some((menu_w as u32, menu_h as u32));
                             settings.positioner.size_limits = cosmic::iced::Limits::NONE
-                                .min_width(MENU_WIDTH)
-                                .max_width(MENU_WIDTH)
+                                .min_width(menu_w)
+                                .max_width(menu_w)
                                 .min_height(1.0)
-                                .max_height(MENU_HEIGHT);
+                                .max_height(menu_h);
                             settings
                         },
                         Some(Box::new(move |state: &AppsApplet| {
@@ -752,7 +873,8 @@ impl AppsApplet {
         let sizes = FontSize::defaults();
         let body_sz = TypeRole::Body.size_in(sizes);
         let cap_sz = TypeRole::Caption.size_in(sizes);
-        let la = |args: &[&str]| Message::LaunchArgs(args.iter().map(|s| (*s).to_string()).collect());
+        let la =
+            |args: &[&str]| Message::LaunchArgs(args.iter().map(|s| (*s).to_string()).collect());
 
         // One menu row: glyph + label, full-width subtle button.
         let row_item = |glyph: &str, label: &str, msg: Message| -> Element<'static, Message> {
@@ -777,37 +899,115 @@ impl AppsApplet {
             .into()
         };
         let divider = || -> Element<'static, Message> {
-            cosmic::iced::widget::container(Space::new().width(Length::Fill).height(Length::Fixed(1.0)))
-                .padding(cosmic::iced::Padding::from([4u16, 8u16]))
-                .into()
+            cosmic::iced::widget::container(
+                Space::new().width(Length::Fill).height(Length::Fixed(1.0)),
+            )
+            .padding(cosmic::iced::Padding::from([4u16, 8u16]))
+            .into()
         };
         let header = text("Power User Menu")
             .size(TypeRole::Heading.size_in(sizes))
             .class(cosmic::theme::Text::Color(carbon(p.text)));
 
         let items: Vec<Element<'static, Message>> = vec![
-            row_item("\u{25A4}", "File Explorer", Message::LaunchLocal("mde-files".into())),
-            row_item("\u{2699}\u{FE0E}", "Settings", Message::LaunchLocal("cosmic-settings".into())),
-            row_item("\u{2BC8}", "Terminal", Message::LaunchLocal("cosmic-term".into())),
-            row_item("\u{2BC8}", "Terminal (Admin)", la(&["pkexec", "cosmic-term"])),
-            row_item("\u{25A6}", "Task Manager", la(&["cosmic-term", "-e", "btop"])),
-            row_item("\u{2756}", "Midnight Commander", la(&["cosmic-term", "-e", "mc"])),
+            row_item(
+                "\u{25A4}",
+                "File Explorer",
+                Message::LaunchLocal("mde-files".into()),
+            ),
+            row_item(
+                "\u{2699}\u{FE0E}",
+                "Settings",
+                Message::LaunchLocal("cosmic-settings".into()),
+            ),
+            row_item(
+                "\u{2BC8}",
+                "Terminal",
+                Message::LaunchLocal("cosmic-term".into()),
+            ),
+            row_item(
+                "\u{2BC8}",
+                "Terminal (Admin)",
+                la(&["pkexec", "cosmic-term"]),
+            ),
+            row_item(
+                "\u{25A6}",
+                "Task Manager",
+                la(&["cosmic-term", "-e", "btop"]),
+            ),
+            row_item(
+                "\u{2756}",
+                "Midnight Commander",
+                la(&["cosmic-term", "-e", "mc"]),
+            ),
             divider(),
-            row_item("\u{25A3}", "Device Manager", Message::LaunchFocus("node.hardware")),
-            row_item("\u{2725}", "Network Connections", Message::LaunchFocus("node.interfaces")),
-            row_item("\u{25A4}", "Disk Management", Message::LaunchFocus("mesh.mesh_storage")),
-            row_item("\u{25A4}", "Disk Management (Admin)", la(&["pkexec", "cosmic-disks"])),
-            row_item("\u{2261}", "Event Viewer", Message::LaunchFocus("monitoring.mesh_logs")),
-            row_item("\u{25A6}", "Apps & Features", Message::LaunchFocus("provisioning.profiles")),
-            row_item("\u{23FB}\u{FE0E}", "Power Options", la(&["cosmic-settings", "power"])),
-            row_item("\u{24D8}", "System / About", Message::LaunchFocus("system.about")),
-            row_item("\u{2318}", "Computer Management", la(&["pkexec", "mde-workbench"])),
+            row_item(
+                "\u{25A3}",
+                "Device Manager",
+                Message::LaunchFocus("node.hardware"),
+            ),
+            row_item(
+                "\u{2725}",
+                "Network Connections",
+                Message::LaunchFocus("node.interfaces"),
+            ),
+            row_item(
+                "\u{25A4}",
+                "Disk Management",
+                Message::LaunchFocus("mesh.mesh_storage"),
+            ),
+            row_item(
+                "\u{25A4}",
+                "Disk Management (Admin)",
+                la(&["pkexec", "cosmic-disks"]),
+            ),
+            row_item(
+                "\u{2261}",
+                "Event Viewer",
+                Message::LaunchFocus("monitoring.mesh_logs"),
+            ),
+            row_item(
+                "\u{25A6}",
+                "Apps & Features",
+                Message::LaunchFocus("provisioning.profiles"),
+            ),
+            row_item(
+                "\u{23FB}\u{FE0E}",
+                "Power Options",
+                la(&["cosmic-settings", "power"]),
+            ),
+            row_item(
+                "\u{24D8}",
+                "System / About",
+                Message::LaunchFocus("system.about"),
+            ),
+            row_item(
+                "\u{2318}",
+                "Computer Management",
+                la(&["pkexec", "mde-workbench"]),
+            ),
             divider(),
             // MCNF-augmented entries.
-            row_item("\u{25C9}", "Mesh Control", Message::LaunchFocus("mesh.mesh_control")),
-            row_item("\u{25C9}", "Lighthouses", Message::LaunchFocus("mesh.lighthouses")),
-            row_item("\u{25D4}\u{FE0E}", "Notification Hub", Message::LaunchLocal("mde-notify-center".into())),
-            row_item("\u{2317}\u{FE0E}", "Join the Mesh", Message::LaunchLocal("mde-enroll".into())),
+            row_item(
+                "\u{25C9}",
+                "Mesh Control",
+                Message::LaunchFocus("mesh.mesh_control"),
+            ),
+            row_item(
+                "\u{25C9}",
+                "Lighthouses",
+                Message::LaunchFocus("mesh.lighthouses"),
+            ),
+            row_item(
+                "\u{25D4}\u{FE0E}",
+                "Notification Hub",
+                Message::LaunchLocal("mde-notify-center".into()),
+            ),
+            row_item(
+                "\u{2317}\u{FE0E}",
+                "Join the Mesh",
+                Message::LaunchLocal("mde-enroll".into()),
+            ),
             divider(),
             row_item("\u{2BC8}", "Run…", Message::OpenRun),
             row_item("\u{25A1}", "Show Desktop", Message::ShowDesktop),
@@ -822,7 +1022,11 @@ impl AppsApplet {
                 .class(cosmic::theme::Text::Color(carbon(p.text_muted))),
         );
         for kind in PowerKind::all() {
-            col = col.push(row_item("\u{23FB}\u{FE0E}", kind.label(), Message::Power(kind)));
+            col = col.push(row_item(
+                "\u{23FB}\u{FE0E}",
+                kind.label(),
+                Message::Power(kind),
+            ));
         }
 
         cosmic::iced::widget::container(
@@ -1063,12 +1267,13 @@ impl AppsApplet {
         }
         col = col.push(self.footer());
 
-        // APPS-WIDE — golden-ratio landscape: width doubled to 920, height its
-        // golden complement (920 / φ ≈ 569). See MENU_WIDTH/MENU_HEIGHT.
+        // APPS-FIT — the body fills the detected desktop-fraction size (33% of
+        // the screen width × height; falls back to the golden rectangle). Must
+        // match the popup positioner size set on open.
         cosmic::iced::widget::container(col)
             .padding(12)
-            .width(Length::Fixed(MENU_WIDTH))
-            .height(Length::Fixed(MENU_HEIGHT))
+            .width(Length::Fixed(self.menu_w))
+            .height(Length::Fixed(self.menu_h))
             .into()
     }
 
@@ -1104,7 +1309,11 @@ impl AppsApplet {
                 row(tiles).spacing(1).width(Length::Fill).into()
             })
             .collect();
-        column(rows).spacing(1).padding([4, 0]).width(Length::Fill).into()
+        column(rows)
+            .spacing(1)
+            .padding([4, 0])
+            .width(Length::Fill)
+            .into()
     }
 
     /// APPS-WIDE — one Favorites tile, mirroring the quick-link tiles: a Carbon
@@ -1116,14 +1325,28 @@ impl AppsApplet {
         let p = self.palette;
         let sizes = FontSize::defaults();
         let cap_sz = TypeRole::Caption.size_in(sizes);
-        // Carbon icon by entry kind (the mde_theme Carbon icon set), rendered as
-        // its glyph — mirroring the quick-link tiles above (which also draw a
-        // glyph over a label), not a letter avatar.
-        let icon_glyph = mde_icon(favorite_icon(e), IconSize::Nav).fallback_glyph;
-        let icon_widget: Element<'static, Message> = text(icon_glyph)
-            .size(20)
-            .class(cosmic::theme::Text::Color(carbon(p.text)))
-            .into();
+        // APPS-FAV-ICON (operator 2026-06-19) — render the actual Carbon icon
+        // SVG (the mde_theme icon set), tinted to the theme text color — the same
+        // icons used when docking an app — instead of the Unicode fallback glyph.
+        // Falls back to the glyph only if a variant ships no baked SVG.
+        let resolved = mde_icon(favorite_icon(e), IconSize::Nav);
+        let icon_px = resolved.size_px();
+        let icon_widget: Element<'static, Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
+            use cosmic::iced::widget::svg as widget_svg;
+            let tint = carbon(p.text);
+            widget_svg(widget_svg::Handle::from_memory(svg_bytes))
+                .width(Length::Fixed(icon_px))
+                .height(Length::Fixed(icon_px))
+                .class(cosmic::theme::Svg::custom(move |_t| widget_svg::Style {
+                    color: Some(tint),
+                }))
+                .into()
+        } else {
+            text(resolved.fallback_glyph)
+                .size(20)
+                .class(cosmic::theme::Text::Color(carbon(p.text)))
+                .into()
+        };
         // Truncate long names so tiles stay aligned.
         let name = if e.name.chars().count() > 14 {
             format!("{}…", e.name.chars().take(13).collect::<String>())
@@ -1516,5 +1739,80 @@ impl AppsApplet {
         p.sort();
         p.dedup();
         p
+    }
+}
+
+#[cfg(test)]
+mod apps_fit_tests {
+    use super::{parse_menu_size_from_kdl, MENU_SCREEN_FRACTION};
+
+    const SAMPLE: &str = r#"output "DP-1" enabled=#true {
+  description model="Test"
+  physical 600 340
+  position 0 0
+  scale 1.00
+  modes {
+    mode 2560 1440 59951 current=#true preferred=#true
+    mode 1920 1080 60000
+  }
+}
+output "HDMI-A-1" enabled=#false {
+  scale 1.00
+  modes {
+    mode 1920 1080 60000 current=#true
+  }
+}
+"#;
+
+    fn approx(a: f32, b: f32) {
+        assert!((a - b).abs() < 0.01, "expected {b}, got {a}");
+    }
+
+    #[test]
+    fn picks_named_output_current_mode_at_fraction() {
+        let (w, h) = parse_menu_size_from_kdl(SAMPLE, "DP-1").unwrap();
+        approx(w, 2560.0 * MENU_SCREEN_FRACTION);
+        approx(h, 1440.0 * MENU_SCREEN_FRACTION);
+    }
+
+    #[test]
+    fn divides_logical_size_by_scale() {
+        let kdl = r#"output "DP-1" enabled=#true {
+  scale 2.00
+  modes {
+    mode 2560 1440 59951 current=#true preferred=#true
+  }
+}
+"#;
+        let (w, h) = parse_menu_size_from_kdl(kdl, "DP-1").unwrap();
+        // logical = 1280x720, then 33%.
+        approx(w, 1280.0 * MENU_SCREEN_FRACTION);
+        approx(h, 720.0 * MENU_SCREEN_FRACTION);
+    }
+
+    #[test]
+    fn empty_target_uses_first_enabled_output() {
+        let (w, _h) = parse_menu_size_from_kdl(SAMPLE, "").unwrap();
+        approx(w, 2560.0 * MENU_SCREEN_FRACTION);
+    }
+
+    #[test]
+    fn skips_disabled_and_missing_target_falls_back_to_first_enabled() {
+        // Target a name that doesn't exist → first enabled output (DP-1), not the
+        // disabled HDMI-A-1.
+        let (w, _h) = parse_menu_size_from_kdl(SAMPLE, "NOPE").unwrap();
+        approx(w, 2560.0 * MENU_SCREEN_FRACTION);
+    }
+
+    #[test]
+    fn no_current_mode_returns_none() {
+        let kdl = r#"output "DP-1" enabled=#true {
+  scale 1.00
+  modes {
+    mode 1920 1080 60000
+  }
+}
+"#;
+        assert!(parse_menu_size_from_kdl(kdl, "DP-1").is_none());
     }
 }
