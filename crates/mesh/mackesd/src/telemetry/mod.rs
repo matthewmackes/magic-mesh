@@ -147,6 +147,11 @@ pub fn spawn_heartbeat_worker(
             .to_string();
         let mde_version = detect_mde_core_version();
         let peers_dir = mackes_mesh_types::peers::peers_dir(&workgroup_root);
+        // SUBSTRATE-3 — when this node is on the etcd coordination plane (the
+        // endpoints file exists), the peer directory lives in etcd under a
+        // keepalive lease; otherwise it's the replicated fs dir, unchanged.
+        // Empty on every pre-cutover node, so the live fleet keeps the fs path.
+        let etcd_endpoints = crate::substrate::etcd::default_endpoints();
         let peer_write_min = std::time::Duration::from_secs(60);
         let mut last_peer_write: Option<std::time::Instant> = None;
         // Check the shutdown flag every 100 ms instead of sleeping the
@@ -191,9 +196,15 @@ pub fn spawn_heartbeat_worker(
                 // replicated directory so any node can identify the lighthouse
                 // set from the QNM-Shared peer JSON (no separate probe).
                 rec.role = mde_role::load().ok().map(|r| r.as_str().to_string());
-                match mackes_mesh_types::peers::write_peer_record(&peers_dir, &rec) {
-                    Ok(_) => last_peer_write = Some(std::time::Instant::now()),
-                    Err(e) => tracing::warn!(error = %e, "peer-record: write failed"),
+                if etcd_endpoints.is_empty() {
+                    match mackes_mesh_types::peers::write_peer_record(&peers_dir, &rec) {
+                        Ok(_) => last_peer_write = Some(std::time::Instant::now()),
+                        Err(e) => tracing::warn!(error = %e, "peer-record: write failed"),
+                    }
+                } else if crate::substrate::peers::put_peer_blocking(&etcd_endpoints, &rec) {
+                    last_peer_write = Some(std::time::Instant::now());
+                } else {
+                    tracing::warn!("peer-record: etcd put failed; will retry next heartbeat");
                 }
             }
             // Interruptible interval sleep.

@@ -17,14 +17,17 @@
 
 use std::process::Command;
 
-use mackes_mesh_types as _; // keep the dev-graph honest
+use mackes_mesh_types::peers::PeerRecord;
 use mackesd_core::leader::AcquireResult;
 use mackesd_core::substrate::etcd as etcd_client_mod;
 use mackesd_core::substrate::leader;
+use mackesd_core::substrate::peers as etcd_peers;
 
 const IMAGE: &str = "quay.io/coreos/etcd:v3.5.17";
 const NAME: &str = "mcnf-substrate-etcd-test";
 const HOST_PORT: u16 = 23790;
+const PEERS_NAME: &str = "mcnf-substrate-etcd-peers-test";
+const PEERS_PORT: u16 = 23791;
 
 fn podman(args: &[&str]) -> (String, String, i32) {
     let out = Command::new("sudo")
@@ -48,14 +51,14 @@ fn podman_available() -> bool {
         .unwrap_or(false)
 }
 
-fn start_etcd() -> bool {
-    let _ = podman(&["rm", "-f", NAME]);
-    let port = format!("{HOST_PORT}:2379");
+fn start_etcd_named(name: &str, host_port: u16) -> bool {
+    let _ = podman(&["rm", "-f", name]);
+    let port = format!("{host_port}:2379");
     let (_o, e, code) = podman(&[
         "run",
         "-d",
         "--name",
-        NAME,
+        name,
         "-p",
         &port,
         "-e",
@@ -79,8 +82,17 @@ fn start_etcd() -> bool {
     true
 }
 
-fn stop_etcd() {
-    let _ = podman(&["rm", "-f", NAME]);
+/// Connect a client once the container is serving; `None` on timeout.
+async fn connect_ready(endpoints: &[String]) -> Option<etcd_client::Client> {
+    for _ in 0..60 {
+        if let Ok(mut c) = etcd_client_mod::connect(endpoints).await {
+            if c.get("__probe__", None).await.is_ok() {
+                return Some(c);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    None
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -89,31 +101,16 @@ async fn etcd_leader_election_elects_one_renews_and_force_takes() {
         eprintln!("[skip] sudo podman unavailable — etcd election test skipped");
         return;
     }
-    if !start_etcd() {
+    if !start_etcd_named(NAME, HOST_PORT) {
         return;
     }
     // Ensure teardown even on assert panic.
-    let _guard = scopeguard();
+    let _guard = Teardown(NAME);
 
     let endpoints = vec![format!("http://127.0.0.1:{HOST_PORT}")];
-
-    // Wait for the client port to accept connections (pull + boot can take a bit).
-    let mut client = None;
-    for _ in 0..60 {
-        if let Ok(c) = etcd_client_mod::connect(&endpoints).await {
-            client = Some(c);
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-    let mut client = client.expect("etcd client connect within 30s");
-    // A get confirms the cluster is actually serving.
-    for _ in 0..30 {
-        if client.get("__probe__", None).await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
+    let mut client = connect_ready(&endpoints)
+        .await
+        .expect("etcd serving within 30s");
 
     // node-a campaigns → becomes leader.
     let r = leader::campaign(&mut client, "node-a")
@@ -171,13 +168,77 @@ async fn etcd_leader_election_elects_one_renews_and_force_takes() {
     assert_eq!(cur.as_ref().map(|l| l.epoch), Some(2));
 }
 
-/// Minimal RAII teardown without pulling the `scopeguard` crate.
-fn scopeguard() -> Teardown {
-    Teardown
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn etcd_peer_directory_round_trips_and_deletes() {
+    if !podman_available() {
+        eprintln!("[skip] sudo podman unavailable — etcd peer-directory test skipped");
+        return;
+    }
+    if !start_etcd_named(PEERS_NAME, PEERS_PORT) {
+        return;
+    }
+    let _guard = Teardown(PEERS_NAME);
+
+    let endpoints = vec![format!("http://127.0.0.1:{PEERS_PORT}")];
+    let mut client = connect_ready(&endpoints)
+        .await
+        .expect("etcd serving within 30s");
+
+    // Empty directory to start.
+    let dir = etcd_peers::read_peers(&mut client)
+        .await
+        .expect("read empty");
+    assert!(dir.is_empty(), "fresh etcd has no peers");
+
+    // Two nodes publish their records (out of hostname order).
+    let mut b = PeerRecord::now("node-b", Some("11.0.0".to_string()), "healthy");
+    b.overlay_ip = Some("10.42.0.3".into());
+    let a = PeerRecord::now("node-a", Some("11.0.0".to_string()), "degraded");
+    etcd_peers::put_peer(&mut client, &b).await.expect("put b");
+    etcd_peers::put_peer(&mut client, &a).await.expect("put a");
+
+    // read_peers returns both, sorted by hostname, with fields intact.
+    let dir = etcd_peers::read_peers(&mut client).await.expect("read two");
+    assert_eq!(dir.len(), 2);
+    assert_eq!(dir[0].hostname, "node-a");
+    assert_eq!(dir[1].hostname, "node-b");
+    assert_eq!(dir[1].overlay_ip.as_deref(), Some("10.42.0.3"));
+    assert_eq!(dir[0].health, "degraded");
+
+    // An explicit leave removes just that row.
+    etcd_peers::delete_peer(&mut client, "node-a")
+        .await
+        .expect("delete a");
+    let dir = etcd_peers::read_peers(&mut client)
+        .await
+        .expect("read after delete");
+    assert_eq!(dir.len(), 1);
+    assert_eq!(dir[0].hostname, "node-b");
+
+    // The blocking wrappers (the heartbeat/directory bridges) work too. They
+    // build a private current-thread runtime, so they must run OFF the test's
+    // tokio worker — exactly how the real callers (the heartbeat std::thread +
+    // the directory responder thread) invoke them. spawn_blocking models that.
+    let c = PeerRecord::now("node-c", None, "healthy");
+    let eps = endpoints.clone();
+    let cc = c.clone();
+    let put_ok = tokio::task::spawn_blocking(move || etcd_peers::put_peer_blocking(&eps, &cc))
+        .await
+        .unwrap();
+    assert!(put_ok, "blocking put");
+    let eps = endpoints.clone();
+    let via_blocking = tokio::task::spawn_blocking(move || etcd_peers::read_peers_blocking(&eps))
+        .await
+        .unwrap()
+        .expect("blocking read");
+    assert!(via_blocking.iter().any(|p| p.hostname == "node-c"));
 }
-struct Teardown;
+
+/// Minimal RAII teardown (removes the named container) without the `scopeguard`
+/// crate.
+struct Teardown(&'static str);
 impl Drop for Teardown {
     fn drop(&mut self) {
-        stop_etcd();
+        let _ = podman(&["rm", "-f", self.0]);
     }
 }

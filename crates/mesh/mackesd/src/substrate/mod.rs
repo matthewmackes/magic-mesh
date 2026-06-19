@@ -9,3 +9,4 @@
 
 pub mod etcd;
 pub mod leader;
+pub mod peers;

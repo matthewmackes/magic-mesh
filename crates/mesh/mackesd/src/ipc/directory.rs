@@ -196,7 +196,20 @@ impl DirectoryService {
     /// call this).
     #[must_use]
     pub fn build_directory(&self, now_ms: u64) -> serde_json::Value {
-        let records = read_peers(&mackes_mesh_types::peers::peers_dir(&self.workgroup_root));
+        // SUBSTRATE-3 — read the peer directory from etcd when this node is on
+        // the coordination plane (endpoints file present), falling back to the
+        // replicated fs union on any etcd error. Empty endpoints (every
+        // pre-cutover node) ⇒ the fs path, unchanged. This responder runs on a
+        // dedicated thread (off the tokio executor), so the blocking etcd read
+        // is safe.
+        let etcd_endpoints = crate::substrate::etcd::default_endpoints();
+        let records = if etcd_endpoints.is_empty() {
+            read_peers(&mackes_mesh_types::peers::peers_dir(&self.workgroup_root))
+        } else {
+            crate::substrate::peers::read_peers_blocking(&etcd_endpoints).unwrap_or_else(|| {
+                read_peers(&mackes_mesh_types::peers::peers_dir(&self.workgroup_root))
+            })
+        };
         let roster = self.roster_index();
         let rev_dir = store::revisions_dir(&self.workgroup_root);
         let head = store::elect_head(&rev_dir).map(|r| r.version);
