@@ -236,6 +236,11 @@ struct State {
     /// scroll-window loader doesn't re-fetch the same card per scroll event).
     /// Reset when the item set changes (a new category load).
     art_requested: std::collections::HashSet<String>,
+    /// MUSIC-RESPONSIVE-2 — per-route item cache (route segment → items). A
+    /// re-visited Albums/Artists/etc. route paints instantly from here while a
+    /// background fetch reconciles, instead of clearing + refetching (the old
+    /// blank-then-flash). Bounded by the routes visited this session.
+    items_cache: std::collections::HashMap<String, Vec<LibraryItem>>,
     /// AIR-15.b — maxi-player (full-window) open flag + its queue snapshot.
     maxi_open: bool,
     queue_songs: Vec<String>,
@@ -445,6 +450,7 @@ impl State {
             grid_width: 1100.0,
             grid_scroll: prefs::load().scroll.into_iter().collect(),
             art_cache: std::collections::HashMap::new(),
+            items_cache: std::collections::HashMap::new(),
             art_requested: std::collections::HashSet::new(),
             maxi_open: false,
             queue_songs: Vec::new(),
@@ -466,6 +472,46 @@ impl State {
     /// by the one-shot timeout auto-retry). Mirrors the per-route fetch the
     /// Open* handlers dispatch; non-grid routes (Hub/Album/Search) have nothing
     /// to reload.
+    /// MUSIC-RESPONSIVE-2 — apply a freshly-loaded (or cached) item set: cache it
+    /// under the current route, render it, restore the saved scroll offset, and
+    /// kick the visible cover-art window. Shared by `ItemsLoaded` and the
+    /// instant-paint path in `enter_route`.
+    fn apply_items(&mut self, items: Vec<LibraryItem>) -> Task<Message> {
+        let key = self.nav.current().segment();
+        self.items_cache.insert(key.clone(), items.clone());
+        self.items = items;
+        self.loading = false;
+        self.load_retried = false;
+        let y = self.grid_scroll.get(&key).copied().unwrap_or(0.0);
+        let restore = cosmic::iced::widget::scrollable::scroll_to(
+            grid_scroll_id(),
+            cosmic::iced::widget::scrollable::AbsoluteOffset {
+                x: None,
+                y: Some(y),
+            },
+        );
+        self.art_requested.clear();
+        let art = self.art_window_task(y);
+        Task::batch([restore, art])
+    }
+
+    /// MUSIC-RESPONSIVE-2 — begin loading the just-pushed route. If we have its
+    /// items cached, paint them instantly (a silent background fetch still runs
+    /// to reconcile); otherwise clear the grid + show the loading state. Resets
+    /// the per-navigation error/retry guards. Returns the instant-paint task.
+    fn enter_route(&mut self) -> Task<Message> {
+        self.load_error = None;
+        self.load_retried = false;
+        let key = self.nav.current().segment();
+        if let Some(cached) = self.items_cache.get(&key).cloned() {
+            self.apply_items(cached)
+        } else {
+            self.items.clear();
+            self.loading = true;
+            Task::none()
+        }
+    }
+
     fn reload_current(&self) -> Task<Message> {
         let to_msg = |r: Result<Vec<library::LibraryItem>, String>| match r {
             Ok(items) => Message::ItemsLoaded(items),
@@ -491,48 +537,26 @@ impl State {
         match message {
             Message::OpenCard(card) => {
                 self.nav.push(Route::Category(card));
-                self.items.clear();
-                self.load_error = None;
-                self.load_retried = false;
+                // MUSIC-RESPONSIVE-2 — instant paint from cache (if any) + always
+                // fetch in the background to reconcile.
+                let seed = self.enter_route();
                 // Fetch the category from the daemon over the Bus (AIR-10.b)
                 // when it's backed by a verb; the rest are AIR-4.b endpoints.
                 if let Some(verb) = library::verb_for(card) {
-                    self.loading = true;
-                    Task::perform(library::fetch(verb), |r| match r {
+                    let fetch = Task::perform(library::fetch(verb), |r| match r {
                         Ok(items) => Message::ItemsLoaded(items),
                         Err(e) => Message::ItemsFailed(e),
-                    })
+                    });
+                    Task::batch([seed, fetch])
                 } else {
-                    Task::none()
+                    seed
                 }
             }
             Message::ItemsLoaded(items) => {
-                self.items = items;
-                self.loading = false;
-                self.load_retried = false;
-                // AIR-11.c.2 — restore this category's saved scroll offset.
-                let y = self
-                    .grid_scroll
-                    .get(&self.nav.current().segment())
-                    .copied()
-                    .unwrap_or(0.0);
-                let restore = cosmic::iced::widget::scrollable::scroll_to(
-                    grid_scroll_id(),
-                    // EFF-34 — the fork's `AbsoluteOffset` axes are `Option<f32>`
-                    // (a per-axis "leave as-is" None); pin y, leave x untouched.
-                    cosmic::iced::widget::scrollable::AbsoluteOffset {
-                        x: None,
-                        y: Some(y),
-                    },
-                );
-                // MUSIC-LOCK-FIX (2026-06-18) — a large library (hundreds of
-                // artists) used to fan out one cover-art fetch per card; each
-                // completion re-renders the WHOLE grid, so art loading was O(N²)
-                // re-renders and the UI locked. Now only the visible scroll window
-                // fetches art (bounded), restored to this category's saved offset.
-                self.art_requested.clear();
-                let art = self.art_window_task(y);
-                Task::batch([restore, art])
+                // MUSIC-LOCK-FIX (2026-06-18) — only the visible scroll window
+                // fetches art (bounded); MUSIC-RESPONSIVE-2 caches the set so a
+                // re-visit paints instantly. Both live in `apply_items`.
+                self.apply_items(items)
             }
             Message::ItemsFailed(e) => {
                 // MUSIC-RESPONSIVE-1 — a timeout ("daemon not responding") right
@@ -551,7 +575,13 @@ impl State {
                         |()| Message::RetryLoad,
                     );
                 }
-                self.items.clear();
+                // MUSIC-RESPONSIVE-2 — stale-while-error: if the grid already shows
+                // (cached) items, a background-reconcile failure must not blank it.
+                // Keep the stale set; only surface the error on an empty grid.
+                if !self.items.is_empty() {
+                    self.loading = false;
+                    return Task::none();
+                }
                 self.loading = false;
                 self.load_error = Some(e);
                 Task::none()
@@ -821,38 +851,32 @@ impl State {
                 // no-op: it pushed the breadcrumb but never loaded the next layer).
                 self.nav.push(Route::Artist(id.clone(), name));
                 self.dismiss_search();
-                self.items.clear();
-                self.load_error = None;
-                self.load_retried = false;
-                self.loading = true;
-                Task::perform(library::fetch_albums_by_artist(id), |r| match r {
+                let seed = self.enter_route(); // MUSIC-RESPONSIVE-2 — instant on re-visit
+                let fetch = Task::perform(library::fetch_albums_by_artist(id), |r| match r {
                     Ok(items) => Message::ItemsLoaded(items),
                     Err(e) => Message::ItemsFailed(e),
-                })
+                });
+                Task::batch([seed, fetch])
             }
             Message::OpenGenre(genre) => {
                 self.nav.push(Route::Genre(genre.clone()));
                 self.dismiss_search();
-                self.items.clear();
-                self.load_error = None;
-                self.load_retried = false;
-                self.loading = true;
-                Task::perform(library::fetch_albums_by_genre(genre), |r| match r {
+                let seed = self.enter_route();
+                let fetch = Task::perform(library::fetch_albums_by_genre(genre), |r| match r {
                     Ok(items) => Message::ItemsLoaded(items),
                     Err(e) => Message::ItemsFailed(e),
-                })
+                });
+                Task::batch([seed, fetch])
             }
             Message::OpenPodcast(id, name) => {
                 self.nav.push(Route::Podcast(id.clone(), name));
                 self.dismiss_search();
-                self.items.clear();
-                self.load_error = None;
-                self.load_retried = false;
-                self.loading = true;
-                Task::perform(library::fetch_podcast_episodes(id), |r| match r {
+                let seed = self.enter_route();
+                let fetch = Task::perform(library::fetch_podcast_episodes(id), |r| match r {
                     Ok(items) => Message::ItemsLoaded(items),
                     Err(e) => Message::ItemsFailed(e),
-                })
+                });
+                Task::batch([seed, fetch])
             }
             Message::PlayEpisode(stream_id) => {
                 Task::perform(album::play_ids(vec![stream_id]), Message::AlbumActionDone)
@@ -1433,7 +1457,9 @@ impl State {
                 text(title.to_string()).size(15).colr(text_c),
                 cosmic::iced::widget::scrollable(row(tiles).spacing(8)).direction(
                     cosmic::iced::widget::scrollable::Direction::Horizontal(
-                        cosmic::iced::widget::scrollable::Scrollbar::new().width(4).scroller_width(4),
+                        cosmic::iced::widget::scrollable::Scrollbar::new()
+                            .width(4)
+                            .scroller_width(4),
                     ),
                 ),
             ]
