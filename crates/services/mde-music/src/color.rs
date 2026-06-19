@@ -99,6 +99,17 @@ pub fn extract(bytes: &[u8]) -> Option<((u8, u8, u8), (u8, u8, u8))> {
 /// # Errors
 /// Bus-store / request / timeout failures.
 pub async fn fetch_cover_art(cover_id: String) -> Result<Vec<u8>, String> {
+    // MUSIC-RESPONSIVE-3 — serve from the persistent on-disk thumbnail cache
+    // first: a cache hit skips the bus round-trip (and its ART_GATE permit)
+    // entirely, so a relaunch paints grid art immediately instead of re-fetching
+    // every cover. Only a miss hits the daemon, and the result is written back.
+    if let Some(path) = art_cache_path(&cover_id) {
+        if let Ok(bytes) = std::fs::read(&path) {
+            if !bytes.is_empty() {
+                return Ok(bytes);
+            }
+        }
+    }
     // MUSIC-ARTGATE — hold a permit for the whole round-trip so no more than
     // ART_GATE permits of cover-art fetches hit the bus/daemon at once. The
     // permit drops when `_permit` goes out of scope at the end of the fn.
@@ -106,8 +117,9 @@ pub async fn fetch_cover_art(cover_id: String) -> Result<Vec<u8>, String> {
         .acquire()
         .await
         .map_err(|e| format!("art gate closed: {e}"))?;
-    with_bus(move |p, rt| {
-        let reply = req(p, rt, "action/music/get-cover-art", Some(&cover_id))?;
+    let id_for_fetch = cover_id.clone();
+    let bytes = with_bus(move |p, rt| {
+        let reply = req(p, rt, "action/music/get-cover-art", Some(&id_for_fetch))?;
         let v: serde_json::Value = serde_json::from_str(&reply).map_err(|e| e.to_string())?;
         let b64 = v
             .get("result")
@@ -118,7 +130,41 @@ pub async fn fetch_cover_art(cover_id: String) -> Result<Vec<u8>, String> {
             .decode(b64)
             .unwrap_or_default())
     })
-    .await
+    .await?;
+    // Populate the cache on a successful, non-empty fetch (best-effort).
+    if !bytes.is_empty() {
+        if let Some(path) = art_cache_path(&cover_id) {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&path, &bytes);
+        }
+    }
+    Ok(bytes)
+}
+
+/// MUSIC-RESPONSIVE-3 — on-disk path for a cached cover thumbnail
+/// (`$XDG_CACHE_HOME|~/.cache/mde-music/art/<sanitized coverArt>`). The id is
+/// sanitized to a safe filename (Airsonic ids like `al-123` pass through; any
+/// other char → `_`). `None` if no cache home / an empty id.
+fn art_cache_path(cover_id: &str) -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?;
+    let safe: String = cover_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe.is_empty() {
+        return None;
+    }
+    Some(base.join("mde-music").join("art").join(safe))
 }
 
 #[cfg(test)]
