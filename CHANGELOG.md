@@ -13,13 +13,11 @@ starts at the first packaged release line.
 
 ## [11.0.0] "Winter-Is-Coming" — Unreleased
 > Major version: the SUBSTRATE-V2 split (etcd coordination + Syncthing files,
-> LizardFS retired) + the MCNF rename land here. **No release rolls until 11.0 is
-> complete** (operator, 2026-06-19) — all 10.0.x-era session work below ships in
-> 11.0; the running fleet stays on the live-patched 10.0.17 until then.
-### Headline (planned — see docs/design/substrate-v2.md)
-- **SUBSTRATE-V2** — replace LizardFS with **etcd** (leader/directory/health) +
-  **Syncthing** (full-mesh files on /mnt/mesh-storage); mesh liveness no longer
-  depends on a filesystem mount; "Mesh Sync" rename.
+> LizardFS retired) + the MCNF rename. Planned — see docs/design/substrate-v2.md
+> (epic SUBSTRATE-1..14). **10.0.18 is the last 10.x cut; the next release is 11.0.**
+
+## [10.0.18] - 2026-06-19
+> The final 10.x cut (operator: "10.0.18 can and will be the last cut").
 ### Added
 - **RCLICK** — Win+X-style right-click power menu on the panel launcher (File
   Explorer/Settings/Terminal/Terminal-Admin/Task-Manager(btop)/Midnight-Commander/
