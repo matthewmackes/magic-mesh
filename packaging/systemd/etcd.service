@@ -1,0 +1,27 @@
+[Unit]
+# SUBSTRATE-1 (SUBSTRATE-V2) — the overlay-bound etcd coordination cluster.
+# etcd is the strong-consistency home for leader election + the peer directory +
+# health (it replaces the LizardFS QNM-Shared coordination plane). It MUST come
+# up after the Nebula overlay (it binds the overlay IP) and BEFORE mackesd —
+# mackesd is ordered After=etcd, never after any filesystem mount, so a file-sync
+# hiccup can never stall mesh liveness (SUBSTRATE-7/8 boot model).
+Description=MCNF mesh coordination (etcd) — leader/directory/health over Nebula
+Documentation=https://github.com/matthewmackes/magic-mesh docs/design/substrate-v2.md
+After=network-online.target nebula.service
+Wants=network-online.target
+# Only run where setup-etcd.sh provisioned a local member (workstations are
+# clients only and carry no env file).
+ConditionPathExists=/etc/etcd/etcd.env
+
+[Service]
+Type=notify
+EnvironmentFile=/etc/etcd/etcd.env
+ExecStart=/usr/bin/etcd
+Restart=always
+RestartSec=5
+# etcd is light, but bound its footprint on the thin 947 MB shadow lighthouse.
+LimitNOFILE=65536
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

@@ -386,6 +386,13 @@ assets = [
     # shared-state volume over the overlay, boot-durable. Run per-node with
     # --master/--chunkserver/--client (see the script header).
     { source = "install-helpers/setup-qnm-shared.sh",    dest = "/usr/libexec/mackesd/setup-qnm-shared",        mode = "755" },
+    # SUBSTRATE-1 (SUBSTRATE-V2) — the etcd coordination cluster: overlay-bound
+    # leader/directory/health. Run per-node with --init/--join/--client-only.
+    # The unit only starts where setup-etcd.sh wrote /etc/etcd/etcd.env (members).
+    { source = "install-helpers/setup-etcd.sh",          dest = "/usr/libexec/mackesd/setup-etcd",              mode = "755" },
+    # Install to /etc (admin precedence) — overrides the Fedora etcd package's
+    # vendor unit without an RPM file-conflict, and pins our overlay-bound config.
+    { source = "packaging/systemd/etcd.service",         dest = "/etc/systemd/system/etcd.service",             mode = "644" },
     # BOOT-REC-4 — the reboot-recovery verification gate (run after a reboot).
     { source = "install-helpers/verify-boot-recovery.sh", dest = "/usr/libexec/mackesd/verify-boot-recovery",   mode = "755" },
     # SETUP-fix — SHARED bus spool so the root mackesd daemon + the uid-1000
