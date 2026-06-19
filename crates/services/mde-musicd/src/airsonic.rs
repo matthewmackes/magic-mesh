@@ -315,6 +315,24 @@ pub struct AlbumDetail {
 }
 
 /// An authenticated Airsonic client.
+/// MUSIC-HOME-1 — a snapshot of the server's library for the Music Home page.
+/// All counts are live Airsonic data; `reachable` is false when the server can't
+/// be reached (the GUI then shows a connection-down server card).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct LibraryStats {
+    pub reachable: bool,
+    pub host: String,
+    pub version: String,
+    pub songs: u64,
+    pub scanning: bool,
+    pub artists: u64,
+    pub albums: u64,
+    pub genres: u64,
+    pub playlists: u64,
+    pub radio: u64,
+    pub podcasts: u64,
+}
+
 pub struct Client {
     base_url: String,
     user: String,
@@ -728,6 +746,77 @@ impl Client {
     pub async fn get_playlists(&self) -> Result<Vec<Playlist>, AirsonicError> {
         let inner = self.get("getPlaylists", &[]).await?;
         Ok(parse_playlists(&inner))
+    }
+
+    /// The configured server base URL (host) — for the Home server card.
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// MUSIC-HOME-1 — `getScanStatus` → `(scanning, indexed_song_count)`.
+    ///
+    /// # Errors
+    /// Transport / API / parse failures.
+    pub async fn get_scan_status(&self) -> Result<(bool, u64), AirsonicError> {
+        let inner = self.get("getScanStatus", &[]).await?;
+        let s = inner.get("scanStatus");
+        let scanning = s
+            .and_then(|v| v.get("scanning"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let count = s
+            .and_then(|v| v.get("count"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        Ok((scanning, count))
+    }
+
+    /// MUSIC-HOME-1 — gather the library snapshot for the Music Home page. Each
+    /// sub-call is best-effort: a single failure leaves that count 0 rather than
+    /// failing the whole snapshot, but if the server is unreachable (`ping`
+    /// fails) `reachable` is false and the rest is skipped. Real Airsonic data
+    /// only — no placeholders.
+    pub async fn library_stats(&self) -> LibraryStats {
+        let mut st = LibraryStats {
+            host: self.base_url.clone(),
+            version: self.api_version(),
+            ..LibraryStats::default()
+        };
+        match self.ping().await {
+            Ok(v) => {
+                st.reachable = true;
+                if !v.is_empty() {
+                    st.version = v;
+                }
+            }
+            Err(_) => return st, // server down → connection-down card
+        }
+        if let Ok((scanning, songs)) = self.get_scan_status().await {
+            st.scanning = scanning;
+            st.songs = songs;
+        }
+        if let Ok(artists) = self.get_artists().await {
+            st.artists = artists.len() as u64;
+            st.albums = artists.iter().map(|a| u64::from(a.album_count)).sum();
+        }
+        st.genres = self.get_genres().await.map(|g| g.len() as u64).unwrap_or(0);
+        st.playlists = self
+            .get_playlists()
+            .await
+            .map(|p| p.len() as u64)
+            .unwrap_or(0);
+        st.radio = self
+            .get_internet_radio_stations()
+            .await
+            .map(|r| r.len() as u64)
+            .unwrap_or(0);
+        st.podcasts = self
+            .get_podcast_channels()
+            .await
+            .map(|p| p.len() as u64)
+            .unwrap_or(0);
+        st
     }
 
     /// `getPlaylist?id=` — one playlist's ordered songs. The GUI enqueues

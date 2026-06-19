@@ -50,7 +50,7 @@ pub const ACTION_VERBS: [&str; 10] = [
 
 /// The library-browse verbs served on `action/music/<verb>`
 /// (asynchronous — each proxies an Airsonic REST call).
-pub const BROWSE_VERBS: [&str; 19] = [
+pub const BROWSE_VERBS: [&str; 20] = [
     "list-albums",
     "list-artists",
     "search",
@@ -72,6 +72,8 @@ pub const BROWSE_VERBS: [&str; 19] = [
     "playlist-create",
     "playlist-update",
     "playlist-delete",
+    // MUSIC-HOME-1 — the Music Home page's server-stats snapshot.
+    "library-stats",
 ];
 
 /// The transport verbs served on `action/music/<verb>` (AIR-2.d — drive
@@ -328,6 +330,10 @@ fn dispatch_browse(
                 .await
                 .map(|g| json!({ "genres": g }))
                 .map_err(|e| e.to_string()),
+            // MUSIC-HOME-1 — the Home page's library snapshot (counts + scan +
+            // server identity). Infallible (best-effort per sub-call); a down
+            // server yields `reachable:false`.
+            "library-stats" => Ok(json!({ "stats": client.library_stats().await })),
             "get-song" => {
                 let id = song_id_from(body).unwrap_or_default();
                 client
