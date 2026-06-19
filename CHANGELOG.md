@@ -13,6 +13,38 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
+## [10.0.18] - 2026-06-19
+### Added
+- **RCLICK** — Win+X-style right-click power menu on the panel launcher (File
+  Explorer/Settings/Terminal/Terminal-Admin/Task-Manager(btop)/Midnight-Commander/
+  Device-Manager/Network/Disk/Event-Viewer/Apps&Features/About/Computer-Management/
+  Mesh-Control/Lighthouses/Notification-Hub/Join-Mesh/Show-Desktop/Power), a Run
+  (Win+R) box, and the bundled deps (btop, mc, cosmic-disks).
+- **MUSIC-HOME** — the Music Home page is now a live Airsonic server-stats
+  dashboard: hero Songs/Artists/Albums + a server card (host/version/scan/library/
+  health) + Most-Played/Starred/mesh-Now-Playing strips, polled live
+  (`action/music/library-stats` + `list-frequent`/`list-starred`).
+- **LIGHTHOUSE** epic — Carbon beacon token, shared discovery/health module, an
+  animated Notification-Hub footer, a Workbench Mesh▸Lighthouses tab, Hub→tab
+  deep-link, and bash-login Network-Overview markers; lighthouses identified by
+  Nebula `static_host_map` membership.
+- **MESH-LAYOUT** — the canonical Cosmic panel layout is baked + enforced on every
+  desktop each session (`mde-enforce-layout`).
+- **APPS-ICON** — the Start3 brand icon on the panel launcher; the launcher is 2×
+  wider (golden landscape) with a 3×3 Carbon-icon Favorites grid.
+### Fixed
+- **Boot recovery** — a reboot no longer stalls the mesh ~2 min (mackesd was
+  queued behind the QNM-Shared mount loop); an idempotent RPM migration strips the
+  stale ordering on every node, and a disconnected laptop now boots fast to a
+  usable local desktop.
+- **Music** — "Unknown Track" in the Hub (get-song `{"id":…}` parse), the Radio
+  "daemon not responding" timeout (10s + auto-retry), and artist browse.
+- **Notification Hub** — theme-aware (light/dark) + Carbon header + zebra rows +
+  button coloring matched to the Application Menu + a mini-player with album art.
+- **Artifact Manager** — peers populate after a cold boot (backend reconnect).
+- **Data accuracy** — the mesh-status snapshot no longer leaks the unedited
+  example nebula config into the cipher/gateway/lighthouse fields.
+
 ## [10.0.17] - 2026-06-18
 
 ### Added
