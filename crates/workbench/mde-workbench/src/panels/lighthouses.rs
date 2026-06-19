@@ -337,10 +337,34 @@ fn name_col<'a>(
         .into()
 }
 
+/// Fill in `role` from each node's `shell-status.json` sidecar for any peer
+/// whose replicated record predates the role-stamping heartbeat. The sidecar
+/// (written by every node's `mesh-status` snapshot timer) already carries the
+/// pinned role, so the lighthouse surfaces work mesh-wide before the new
+/// `mackesd` rolls everywhere — the directory record is the canonical source,
+/// this is just the back-fill. Shared by the Hub footer + this tab.
+pub fn enrich_roles(root: &std::path::Path, peers: &mut [mackes_mesh_types::peers::PeerRecord]) {
+    for p in peers.iter_mut() {
+        if p.role.is_some() {
+            continue;
+        }
+        let sf = root.join(&p.hostname).join("shell-status.json");
+        if let Ok(text) = std::fs::read_to_string(&sf) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(r) = v.get("role").and_then(serde_json::Value::as_str) {
+                    p.role = Some(r.to_string());
+                }
+            }
+        }
+    }
+}
+
 /// Build the lighthouse cards from the replicated directory + the leader lease.
 fn load_cards() -> Vec<LighthouseCard> {
     let root = mackes_mesh_types::peers::default_workgroup_root();
-    let peers = mackes_mesh_types::peers::read_peers(&mackes_mesh_types::peers::peers_dir(&root));
+    let mut peers =
+        mackes_mesh_types::peers::read_peers(&mackes_mesh_types::peers::peers_dir(&root));
+    enrich_roles(&root, &mut peers);
     let now_ms = now_ms();
     let master = std::fs::read_to_string(root.join(".mackesd-leader.lock"))
         .ok()

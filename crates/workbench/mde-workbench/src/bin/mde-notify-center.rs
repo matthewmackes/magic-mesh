@@ -354,8 +354,12 @@ fn fetch_voice() -> Option<VoiceStatus> {
 /// service check (Q3).
 fn fetch_lighthouses() -> Vec<Beacon> {
     let root = mackes_mesh_types::peers::default_workgroup_root();
-    let peers =
+    let mut peers =
         mackes_mesh_types::peers::read_peers(&mackes_mesh_types::peers::peers_dir(&root));
+    // Back-fill role from the shell-status sidecar for records that predate the
+    // role-stamping heartbeat (so the footer shows lighthouses before mackesd
+    // rolls everywhere). Shared with the Workbench tab.
+    mde_workbench::panels::lighthouses::enrich_roles(&root, &mut peers);
     let master = fetch_master_hostname(&root);
     let now = u64::try_from(now_ms()).unwrap_or(0);
     lighthouse::beacons(&peers, master.as_deref(), now, lighthouse::DEFAULT_STALE_MS)
