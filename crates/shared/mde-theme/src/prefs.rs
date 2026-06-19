@@ -23,6 +23,9 @@ pub struct Preferences {
     /// Accessibility variants — all off by default per UX-22.
     #[cfg_attr(feature = "serde", serde(default))]
     pub a11y: A11y,
+    /// MOTION-CORE-3 — global motion controls (kill switch + speed scale).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub motion: MotionPrefs,
 }
 
 impl Default for Preferences {
@@ -31,6 +34,61 @@ impl Default for Preferences {
             theme: Theme::Dark,
             density: Density::Comfortable,
             a11y: A11y::default(),
+            motion: MotionPrefs::default(),
+        }
+    }
+}
+
+/// MOTION-CORE-3 — global motion configuration (`preferences.toml [motion]`): a
+/// master kill switch + a speed multiplier. Single place to disable/scale all
+/// shell animation; env vars `MDE_MOTION_DISABLED` / `MDE_MOTION_SCALE` override
+/// the file (CI / headless / quick toggles).
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MotionPrefs {
+    /// Master switch — `false` disables all animation; surfaces render the
+    /// terminal (final) frame with no interpolation.
+    #[cfg_attr(feature = "serde", serde(default = "default_motion_enabled"))]
+    pub enabled: bool,
+    /// Global speed multiplier: `2.0` = twice as fast (half duration), `0.5` =
+    /// half speed (double duration). Clamped to a sane range on apply.
+    #[cfg_attr(feature = "serde", serde(default = "default_motion_scale"))]
+    pub speed_scale: f32,
+}
+
+impl Default for MotionPrefs {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            speed_scale: 1.0,
+        }
+    }
+}
+
+impl MotionPrefs {
+    /// MOTION-CORE-3 — resolve a [`crate::motion::Motion`] preset against the
+    /// global controls + reduce-motion. Disabled → a zero-duration terminal
+    /// frame; reduce-motion → the Q32 ≤80 ms crossfade (via
+    /// [`crate::motion::Motion::resolved`]); otherwise the duration is scaled by
+    /// `speed_scale` (clamped to `0.1..=10.0`).
+    #[must_use]
+    pub fn apply(self, m: crate::motion::Motion, reduce_motion: bool) -> crate::motion::Motion {
+        use crate::motion::{Easing, Motion};
+        if !self.enabled {
+            return Motion {
+                duration: std::time::Duration::ZERO,
+                easing: Easing::Linear,
+                looping: false,
+            };
+        }
+        let m = m.resolved(reduce_motion);
+        if reduce_motion {
+            return m; // already capped + de-looped
+        }
+        let scale = self.speed_scale.clamp(0.1, 10.0);
+        Motion {
+            duration: std::time::Duration::from_secs_f32(m.duration.as_secs_f32() / scale),
+            ..m
         }
     }
 }
@@ -38,6 +96,16 @@ impl Default for Preferences {
 #[cfg(feature = "serde")]
 fn default_theme() -> Theme {
     Theme::Dark
+}
+
+#[cfg(feature = "serde")]
+fn default_motion_enabled() -> bool {
+    true
+}
+
+#[cfg(feature = "serde")]
+fn default_motion_scale() -> f32 {
+    1.0
 }
 
 impl Preferences {
@@ -67,6 +135,17 @@ impl Preferences {
             .unwrap_or_default();
         if std::env::var_os("MDE_REDUCE_MOTION").map_or(false, |v| v != "0") {
             prefs.a11y.reduce_motion = true;
+        }
+        // MOTION-CORE-3 — env overrides for the global motion controls.
+        if std::env::var_os("MDE_MOTION_DISABLED").map_or(false, |v| v != "0") {
+            prefs.motion.enabled = false;
+        }
+        if let Ok(s) = std::env::var("MDE_MOTION_SCALE") {
+            if let Ok(f) = s.parse::<f32>() {
+                if f > 0.0 {
+                    prefs.motion.speed_scale = f;
+                }
+            }
         }
         prefs
     }
@@ -186,6 +265,55 @@ impl<'de> serde::Deserialize<'de> for A11y {
 #[cfg(all(test, feature = "serde"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn motion_prefs_default_enabled_unity_scale() {
+        let m = MotionPrefs::default();
+        assert!(m.enabled);
+        assert!((m.speed_scale - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn motion_prefs_apply_disabled_is_terminal_frame() {
+        // MOTION-CORE-3 — disabled ⇒ zero-duration (terminal frame), no loop.
+        let off = MotionPrefs {
+            enabled: false,
+            speed_scale: 1.0,
+        };
+        let r = off.apply(crate::motion::Motion::loading(), false);
+        assert_eq!(r.duration, std::time::Duration::ZERO);
+        assert!(!r.looping);
+    }
+
+    #[test]
+    fn motion_prefs_apply_scales_duration() {
+        // speed 2.0 ⇒ half duration; 0.5 ⇒ double.
+        let base = crate::motion::Motion::panel_mount().duration.as_secs_f32();
+        let fast = MotionPrefs {
+            enabled: true,
+            speed_scale: 2.0,
+        }
+        .apply(crate::motion::Motion::panel_mount(), false);
+        assert!((fast.duration.as_secs_f32() - base / 2.0).abs() < 1e-4);
+        let slow = MotionPrefs {
+            enabled: true,
+            speed_scale: 0.5,
+        }
+        .apply(crate::motion::Motion::panel_mount(), false);
+        assert!((slow.duration.as_secs_f32() - base * 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn motion_prefs_apply_reduce_motion_caps() {
+        // reduce-motion wins over the speed scale — caps to the 80 ms crossfade.
+        let r = MotionPrefs {
+            enabled: true,
+            speed_scale: 2.0,
+        }
+        .apply(crate::motion::Motion::loading(), true);
+        assert_eq!(r.duration, std::time::Duration::from_millis(80));
+        assert!(!r.looping);
+    }
 
     #[test]
     fn default_serializes_to_minimal_toml() {
