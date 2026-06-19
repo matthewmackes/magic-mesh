@@ -83,6 +83,21 @@ impl Tween {
             duration: Duration::ZERO,
         }
     }
+
+    /// MOTION-CORE-2 — the single reduce-motion-aware tween constructor every
+    /// consumer should call. With `reduce_motion`, the duration is capped to the
+    /// Q32 ≤80 ms crossfade ([`crate::motion::REDUCE_MOTION_CAP_MS`]); otherwise
+    /// it's the requested duration. Routing all tweens through this guarantees the
+    /// reduce-motion contract (mirrors [`crate::motion::Motion::resolved`]).
+    #[must_use]
+    pub fn resolved(start: Instant, duration: Duration, reduce_motion: bool) -> Self {
+        let duration = if reduce_motion {
+            duration.min(Duration::from_millis(crate::motion::REDUCE_MOTION_CAP_MS))
+        } else {
+            duration
+        };
+        Self::starting_at(start, duration)
+    }
 }
 
 /// Looping tween — the timeline restarts every `duration`.
@@ -138,6 +153,19 @@ pub fn ease(t: f32, easing: Easing) -> f32 {
     }
 }
 
+/// MOTION-CORE-2 — critically-damped spring position at normalized time `t`
+/// (`[0.0, 1.0]`), settling **monotonically** to ~1.0 with **no overshoot** — a
+/// spring *feel* for press/hover without the distracting bounce. Uses the
+/// critical-damping closed form `1 - (1 + k·t)·e^(−k·t)` (k chosen so it's ~98%
+/// settled at `t = 1`). Output is clamped to `[0.0, 1.0]`.
+#[must_use]
+pub fn spring(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    // Critical-damping rate: higher = snappier. k=6 settles to ~0.98 at t=1.
+    const K: f32 = 6.0;
+    (1.0 - (1.0 + K * t) * (-K * t).exp()).clamp(0.0, 1.0)
+}
+
 /// Linear interpolation between two f32 values. `t` is
 /// clamped to `[0.0, 1.0]`.
 #[must_use]
@@ -164,6 +192,43 @@ pub fn pulse_scale(phase: f32, max_scale: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::motion::{Motion, PULSE_MAX_SCALE};
+
+    #[test]
+    fn spring_is_monotonic_and_never_overshoots() {
+        // MOTION-CORE-2 — critically-damped spring: starts at 0, rises
+        // monotonically, settles near (and never above) 1.0 — no bounce.
+        assert!(spring(0.0).abs() < 1e-6, "spring(0) must be 0");
+        let mut prev = spring(0.0);
+        for i in 1..=20 {
+            let t = i as f32 / 20.0;
+            let v = spring(t);
+            assert!(
+                v >= prev - 1e-6,
+                "must be monotonic non-decreasing at t={t}"
+            );
+            assert!(v <= 1.0 + 1e-6, "must never overshoot 1.0 at t={t}");
+            prev = v;
+        }
+        assert!(
+            spring(1.0) > 0.95,
+            "must be ~settled by t=1, got {}",
+            spring(1.0)
+        );
+    }
+
+    #[test]
+    fn resolved_caps_duration_under_reduce_motion() {
+        // MOTION-CORE-2 — the single reduce-motion-aware tween constructor caps to
+        // the Q32 80 ms crossfade; full motion keeps the requested duration.
+        let now = Instant::now();
+        let full = Tween::resolved(now, Duration::from_millis(400), false);
+        assert_eq!(full.duration(), Duration::from_millis(400));
+        let reduced = Tween::resolved(now, Duration::from_millis(400), true);
+        assert_eq!(reduced.duration(), Duration::from_millis(80));
+        // A short tween already under the cap is left as-is.
+        let short = Tween::resolved(now, Duration::from_millis(40), true);
+        assert_eq!(short.duration(), Duration::from_millis(40));
+    }
 
     #[test]
     fn tween_progress_starts_at_zero_and_ends_at_one() {
