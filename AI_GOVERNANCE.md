@@ -48,6 +48,18 @@ node can leave, and the fabric heals.
 - **`mackesd`** is the supervised control-plane daemon — owns the worker pool, the
   mesh/CA state, the KDE-Connect host, and the SQLite store. One leader per the
   shared lockfile; owns writes.
+- **Public boundary — 3 tiers (CONNECT, lands 11.0+, design: docs/design/connect.md):**
+  **Public** (the internet sees only **Nebula/4242 + SSH/22 + enroll/4243** — the
+  foundational layer) · **Mesh** (everything reachable over the Nebula overlay) ·
+  **Ingress-exposed** (services published to the public **only** through the
+  **lighthouse reverse-proxy ingress** — Caddy auto-HTTPS + allowlisted TCP/UDP
+  streams, rendered from a per-service exposure policy). The posture is
+  **mesh-allow / public-deny**, enforced by a drift-corrected **firewalld** profile
+  on every node. The unified control surface is a **mesh-native Connectivity
+  Manager** (Workbench + a `mackesd` worker orchestrating firewalld/nmstate/Nebula
+  fw/VPN-GW/DDNS/ingress) — **no external NMS/SDN** (D-W1). This governs the
+  **public boundary only**; intra-mesh trust stays **flat / open-mesh** (§8
+  unchanged — a valid mesh cert still reaches every peer).
 
 ## §2 — The Bus (not D-Bus)
 
