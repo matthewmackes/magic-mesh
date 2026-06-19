@@ -400,6 +400,11 @@ assets = [
     # Install to /etc (admin precedence) — overrides the Fedora etcd package's
     # vendor unit without an RPM file-conflict, and pins our overlay-bound config.
     { source = "packaging/systemd/etcd.service",         dest = "/etc/systemd/system/etcd.service",             mode = "644" },
+    # SUBSTRATE-5 (SUBSTRATE-V2) — the Syncthing file plane: replicates the plain
+    # /mnt/mesh-storage dir full-mesh (overlay-only, discovery off, trash-can
+    # versioning); device IDs wired from the etcd /mesh/syncthing/<host> registry.
+    { source = "install-helpers/setup-syncthing.sh",     dest = "/usr/libexec/mackesd/setup-syncthing",         mode = "755" },
+    { source = "packaging/systemd/syncthing.service",    dest = "/etc/systemd/system/syncthing.service",        mode = "644" },
     # BOOT-REC-4 — the reboot-recovery verification gate (run after a reboot).
     { source = "install-helpers/verify-boot-recovery.sh", dest = "/usr/libexec/mackesd/verify-boot-recovery",   mode = "755" },
     # SETUP-fix — SHARED bus spool so the root mackesd daemon + the uid-1000

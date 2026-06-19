@@ -1,0 +1,25 @@
+[Unit]
+# SUBSTRATE-5 (SUBSTRATE-V2) — the Syncthing file plane. Replicates the plain
+# /mnt/mesh-storage directory full-mesh over the Nebula overlay (NO FUSE), so the
+# file readers keep their paths. NON-critical to mesh liveness: mackesd is
+# ordered After=etcd, never after this — a slow/down Syncthing degrades only file
+# access, never leader/directory/health (SUBSTRATE-7 boot model).
+Description=MCNF Mesh Sync (Syncthing) — overlay file replication
+Documentation=https://github.com/matthewmackes/magic-mesh docs/design/substrate-v2.md
+After=network-online.target nebula.service
+Wants=network-online.target
+# Provisioned by setup-syncthing.sh (writes the home + this drop-in's env).
+ConditionPathExists=/etc/systemd/system/syncthing.service.d/10-home.conf
+
+[Service]
+Type=simple
+# Home is pinned by setup-syncthing.sh's 10-home.conf drop-in.
+Environment=MCNF_SYNCTHING_HOME=/var/lib/mcnf-syncthing
+ExecStart=/usr/bin/syncthing serve --home=${MCNF_SYNCTHING_HOME} --no-browser --no-restart
+Restart=always
+RestartSec=10
+SuccessExitStatus=3 4
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
