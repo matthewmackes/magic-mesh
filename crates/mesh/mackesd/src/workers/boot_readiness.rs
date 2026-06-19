@@ -39,8 +39,14 @@ pub struct BootProbe {
     pub overlay_ip: String,
     /// The mde-bus broker is reachable (we could open the spool to publish).
     pub bus_ok: bool,
-    /// QNM-Shared is a real, writable FUSE mount.
+    /// The shared-state plane is up. Pre-cutover: QNM-Shared is a writable FUSE
+    /// mount. SUBSTRATE-10: when on the etcd coordination plane, this is "etcd
+    /// reachable" instead (the file plane / Syncthing is non-critical to liveness).
     pub qnm_mounted: bool,
+    /// SUBSTRATE-10 — true when shared-state liveness is sourced from etcd (the
+    /// endpoints file is present), so the step renders as "Mesh coordination
+    /// (etcd)" / "etcd reachable" rather than the FUSE-mount wording.
+    pub on_etcd: bool,
     /// Joined peer count in the replicated directory (>0 ⇒ replicated).
     pub peer_count: u32,
 }
@@ -149,7 +155,13 @@ fn step_detail(p: &BootProbe, idx: usize) -> String {
             }
         }
         4 => {
-            if p.qnm_mounted {
+            if p.on_etcd {
+                if p.qnm_mounted {
+                    "etcd reachable".into()
+                } else {
+                    "etcd unreachable".into()
+                }
+            } else if p.qnm_mounted {
                 "/mnt/mesh-storage".into()
             } else {
                 "not mounted".into()
@@ -184,9 +196,16 @@ pub fn build_readiness(
         } else {
             "pending"
         };
+        // SUBSTRATE-10 — the shared-state step renders by substrate: etcd
+        // coordination post-cutover, the FUSE mount before.
+        let label = if def.id == "qnm" && p.on_etcd {
+            "Mesh coordination (etcd)"
+        } else {
+            def.label
+        };
         steps.push(json!({
             "id": def.id,
-            "label": def.label,
+            "label": label,
             "status": status,
             "detail": step_detail(p, i),
             "blocked_by": if status == "blocked" { first_unmet } else { None },
@@ -267,7 +286,17 @@ impl BootReadinessWorker {
         let overlay_ip = std::fs::read_to_string(super::nebula_supervisor::DEFAULT_OVERLAY_IP_PATH)
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
-        let qnm_mounted = crate::shared_root_writable(&self.workgroup_root);
+        // SUBSTRATE-10 — shared-state liveness by substrate: when on the etcd
+        // coordination plane (endpoints file present) it's "is etcd reachable"
+        // (a cheap TCP connect to the client port — no async runtime needed in
+        // this on-executor probe); pre-cutover it's the writable FUSE mount.
+        let etcd_endpoints = crate::substrate::etcd::default_endpoints();
+        let on_etcd = !etcd_endpoints.is_empty();
+        let qnm_mounted = if on_etcd {
+            etcd_first_reachable(&etcd_endpoints)
+        } else {
+            crate::shared_root_writable(&self.workgroup_root)
+        };
         let now = now_ms();
         let peer_count = crate::ipc::directory::DirectoryService::new(
             &self.workgroup_root,
@@ -280,6 +309,7 @@ impl BootReadinessWorker {
             overlay_ip,
             bus_ok: true, // set false on a publish failure below
             qnm_mounted,
+            on_etcd,
             peer_count,
         }
     }
@@ -387,6 +417,30 @@ fn tcp_open(addr: &str) -> bool {
         .is_some()
 }
 
+/// SUBSTRATE-10 — `true` if any etcd client endpoint accepts a TCP connection.
+/// A cheap liveness check (no async etcd client / runtime) for the on-executor
+/// boot probe: strips the `http://`/`https://` scheme off each endpoint and
+/// `tcp_open`s the `host:port`. Pure-ish (network I/O only); [`endpoint_authority`]
+/// is the testable parse.
+fn etcd_first_reachable(endpoints: &[String]) -> bool {
+    endpoints
+        .iter()
+        .filter_map(|e| endpoint_authority(e))
+        .any(|hostport| tcp_open(&hostport))
+}
+
+/// Strip the URL scheme off an etcd endpoint, yielding `host:port`. Pure.
+#[must_use]
+fn endpoint_authority(endpoint: &str) -> Option<String> {
+    let s = endpoint.trim();
+    let s = s
+        .strip_prefix("http://")
+        .or_else(|| s.strip_prefix("https://"))
+        .unwrap_or(s);
+    let authority = s.split('/').next().unwrap_or(s).trim();
+    (!authority.is_empty()).then(|| authority.to_string())
+}
+
 /// `ping -c1 -W1 <ip>` → RTT ms, or `None` when unreachable. The system `ping`
 /// avoids needing CAP_NET_RAW in-process; the parse is [`parse_ping_rtt`].
 fn ping_rtt(ip: &str) -> Option<f64> {
@@ -456,6 +510,7 @@ mod tests {
             overlay_ip: "10.42.0.5".into(),
             bus_ok: true,
             qnm_mounted: true,
+            on_etcd: false,
             peer_count: 4,
         };
         let v = build_readiness(&p, &[], &[], 123);
@@ -465,6 +520,48 @@ mod tests {
             assert_eq!(val(&v, i, "status"), "ok", "step {i}");
         }
         assert_eq!(val(&v, 1, "detail"), "10.42.0.5");
+    }
+
+    #[test]
+    fn endpoint_authority_strips_scheme_and_path() {
+        assert_eq!(
+            endpoint_authority("http://10.42.0.1:2379").as_deref(),
+            Some("10.42.0.1:2379")
+        );
+        assert_eq!(
+            endpoint_authority("https://lh:2379/").as_deref(),
+            Some("lh:2379")
+        );
+        assert_eq!(
+            endpoint_authority("10.42.0.2:2379").as_deref(),
+            Some("10.42.0.2:2379")
+        );
+        assert!(endpoint_authority("").is_none());
+        assert!(endpoint_authority("http://").is_none());
+    }
+
+    #[test]
+    fn etcd_mode_renders_coordination_step() {
+        // SUBSTRATE-10 — on the etcd plane the shared-state step reads as etcd,
+        // not the FUSE mount.
+        let p = BootProbe {
+            nebula_up: true,
+            overlay_ip: "10.42.0.5".into(),
+            bus_ok: true,
+            qnm_mounted: true,
+            on_etcd: true,
+            peer_count: 2,
+        };
+        let v = build_readiness(&p, &[], &[], 0);
+        assert_eq!(val(&v, 4, "label"), "Mesh coordination (etcd)");
+        assert_eq!(val(&v, 4, "detail"), "etcd reachable");
+        // etcd down → "etcd unreachable".
+        let p2 = BootProbe {
+            qnm_mounted: false,
+            ..p
+        };
+        let v2 = build_readiness(&p2, &[], &[], 0);
+        assert_eq!(val(&v2, 4, "detail"), "etcd unreachable");
     }
 
     #[test]
@@ -487,6 +584,7 @@ mod tests {
             overlay_ip: "10.42.0.5".into(),
             bus_ok: true,
             qnm_mounted: false,
+            on_etcd: false,
             peer_count: 0,
         };
         let v = build_readiness(&p, &[], &[], 0);
@@ -505,6 +603,7 @@ mod tests {
             overlay_ip: "10.42.0.5".into(),
             bus_ok: true,
             qnm_mounted: true,
+            on_etcd: false,
             peer_count: 1,
         };
         let services = [
