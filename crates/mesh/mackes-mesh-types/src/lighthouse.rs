@@ -301,7 +301,10 @@ mod tests {
             BeaconStatus::Healthy
         );
         // Master fully up → Healthy.
-        assert_eq!(classify(true, true, true, true, true), BeaconStatus::Healthy);
+        assert_eq!(
+            classify(true, true, true, true, true),
+            BeaconStatus::Healthy
+        );
     }
 
     #[test]
@@ -339,11 +342,18 @@ mod tests {
         // lizardfs-master SPOF is unhealthy (Q3).
         let p = lh("master", "degraded", Some("10.42.0.1"), now);
         let master = beacon_for(&p, true, now, DEFAULT_STALE_MS);
-        assert_eq!(master.status, BeaconStatus::ServiceDown, "master held strict");
+        assert_eq!(
+            master.status,
+            BeaconStatus::ServiceDown,
+            "master held strict"
+        );
         // The very same row, were it merely a shadow, would be green (the
         // strict master-service check only applies to the master).
         let shadow = beacon_for(&p, false, now, DEFAULT_STALE_MS);
-        assert!(shadow.healthy(), "shadow not bound by the master service check");
+        assert!(
+            shadow.healthy(),
+            "shadow not bound by the master service check"
+        );
     }
 
     #[test]
