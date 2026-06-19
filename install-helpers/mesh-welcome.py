@@ -66,7 +66,9 @@ def main():
     print("  " + c(f"{online}/{total} nodes online", BOLD + hcol)
           + c(f"   · self {d.get('self','?')} · latest {latest} · data {age}s old", GRAY))
 
-    # Per-node health + version/update.
+    # Per-node health + version/update. LIGHTHOUSE-7 — lighthouses get a beacon
+    # marker (◉) + master/shadow tag, the beacon coloured by the node's health.
+    leader = (d.get("network") or {}).get("leader") or ""
     print()
     for n in nodes:
         col, dot = DOT.get(n.get("presence", "offline"), (RED, "○"))
@@ -74,7 +76,12 @@ def main():
         ip = (n.get("overlay_ip") or "").ljust(13)
         ver = n.get("version") or "—"
         upd = c("update→%s" % latest, AMBER) if n.get("update") else c("up to date", GRAY)
-        print(f"  {col}{dot}{RST} {c(host, BOLD)} {c(ip, GRAY)} {ver:<9} {upd}")
+        if n.get("role") == "lighthouse":
+            role = "master" if n.get("hostname") == leader else "shadow"
+            tag = c(" ◉ lighthouse·%s" % role, col)
+        else:
+            tag = ""
+        print(f"  {col}{dot}{RST} {c(host, BOLD)} {c(ip, GRAY)} {ver:<9} {upd}{tag}")
 
     # Service matrix.
     print()
@@ -124,13 +131,19 @@ def network_overview(d):
         print(c("    │", GRAY))
     head = f"  ┌─ overlay {cidr} "
     print(c(head + "─" * max(2, 50 - len(head)) + "┐", BLUE))
-    # A dot strip — one ● per node, coloured by presence, * = this node.
+    # A dot strip — one mark per node, coloured by presence. LIGHTHOUSE-7 —
+    # lighthouses render as a beacon (◉) instead of the plain ● so the anchor
+    # nodes stand out at a glance.
     online = sum(1 for n in nodes if n.get("presence") == "online")
-    dots = " ".join(
-        (lambda cd: f"{cd[0]}{cd[1]}{RST}")(DOT.get(n.get("presence", "offline"), (RED, "○")))
-        for n in nodes
-    )
-    print("    " + dots + c(f"   {len(nodes)} nodes ({online} online)", GRAY))
+    lh = sum(1 for n in nodes if n.get("role") == "lighthouse")
+
+    def _mark(n):
+        col, dot = DOT.get(n.get("presence", "offline"), (RED, "○"))
+        glyph = "◉" if n.get("role") == "lighthouse" else dot
+        return f"{col}{glyph}{RST}"
+    dots = " ".join(_mark(n) for n in nodes)
+    tail = f"   {len(nodes)} nodes ({online} online)" + (f" · {lh} ◉ lighthouse" if lh else "")
+    print("    " + dots + c(tail, GRAY))
     if self_host:
         print("    " + c(f"this node: {self_host} {net.get('overlay_ip','')}", GRAY))
     print(c("  └" + "─" * 50 + "┘", BLUE))

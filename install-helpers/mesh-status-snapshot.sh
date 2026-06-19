@@ -91,7 +91,7 @@ for pf in peers:
     host=d.get("hostname") or os.path.splitext(os.path.basename(pf))[0]
     node={"hostname":host,"overlay_ip":d.get("overlay_ip") or "",
           "presence":presence(d.get("health")),"last_seen_ms":d.get("last_seen_ms") or 0,
-          "version":None,"services":{}}
+          "version":None,"services":{},"role":d.get("role")}
     sf=os.path.join(wg,host,"shell-status.json")
     try:
         s=json.load(open(sf)); node["version"]=s.get("version"); node["services"]=s.get("services",{})
@@ -113,7 +113,19 @@ for n in nodes:
 # SHELL-NET — this node's network overview (overlay + routable subnets + gateways).
 def _split(v):
     return [x for x in (os.environ.get(v,"") or "").split(",") if x]
+def _leader():
+    # LIGHTHOUSE-7 — the current lizardfs-master = the QNM leader-lease holder
+    # (node_id\trenewed_at_s\tepoch); empty when missing/expired (>60s).
+    try:
+        line=open(os.path.join(wg,".mackesd-leader.lock")).readline().strip()
+        parts=line.split("\t")
+        if len(parts)>=2 and (time.time()-float(parts[1]))<60:
+            nid=parts[0]
+            return nid[5:] if nid.startswith("peer:") else nid
+    except Exception: pass
+    return ""
 network={"overlay_if":os.environ.get("NET_IF","") or "",
+         "leader":_leader(),
          "overlay_ip":os.environ.get("NET_IP","") or "",
          "overlay_cidr":os.environ.get("NET_CIDR","") or "",
          "routes":_split("NET_ROUTES"),

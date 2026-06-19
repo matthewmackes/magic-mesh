@@ -949,7 +949,7 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
 - [ ] **LIGHTHOUSE-7: hero-scope follow-ons (shell / applet / wallpaper).**
   **As** an operator, **I want** lighthouses surfaced beyond the Hub+tab (Q4 — broad), **so that** the hero focus is system-wide.
   **Acceptance** (each its own runtime-observable surface):
-    - [ ] **shell** — `mesh-welcome.py` Network Overview marks lighthouses distinctly (beacon marker + master/shadow + health)
+    - [✓] **shell** — DONE 2026-06-18: `mesh-welcome.py` marks lighthouse nodes with a ◉ beacon + `lighthouse·master`/`lighthouse·shadow` tag (health-coloured) in the per-node list, and renders lighthouses as ◉ (not ●) in the overlay dot strip with a `N ◉ lighthouse` count. Master/shadow from the new `network.leader` in the snapshot (leader-lease holder); per-node `role` now also read straight from the replicated peer file. Verified live (Lighthouse-02 → "◉ lighthouse·shadow").
     - [ ] **applet** — a Cosmic panel lighthouse-health indicator (worst-of green/red across lighthouses), click → the Lighthouses tab
     - [ ] **wallpaper** — a lighthouse hero motif in the mesh wallpaper
 - [ ] **LIGHTHOUSE-8: per-lighthouse deep-probe lane (handshake / public IP / peers / uptime / cert expiry).**
