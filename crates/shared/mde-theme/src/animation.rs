@@ -23,9 +23,10 @@
 //! can interpolate any visible property (opacity, translate,
 //! background tint, scale).
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::motion::Easing;
+use crate::motion::{Easing, Motion};
 
 /// Single-shot tween over a fixed duration. Stateless w.r.t.
 /// `Instant`: the consumer asks "what fraction am I at NOW"
@@ -188,10 +189,104 @@ pub fn pulse_scale(phase: f32, max_scale: f32) -> f32 {
     lerp_f32(1.0, max_scale, smoothed)
 }
 
+/// MOTION-INFRA-1 — a tiny animation registry. Holds the active tweens keyed by
+/// a caller id and is advanced by ONE subscription tick, so N concurrent
+/// animations across a surface share a single timer instead of each arming its
+/// own. [`Animator::is_idle`] reports when nothing is in flight, so the consumer
+/// can stop ticking at rest (no idle/offscreen CPU — MOTION-PERF-1). Pure state
+/// (no toolkit dep); the consumer reads [`Animator::value`] in its `view`.
+#[derive(Debug, Default, Clone)]
+pub struct Animator {
+    tweens: HashMap<String, Tween>,
+}
+
+impl Animator {
+    /// An empty animator (nothing animating).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Start (or restart) the animation under `id` from `start`, using the
+    /// preset's duration resolved against `reduce_motion`
+    /// ([`Tween::resolved`]).
+    pub fn start(
+        &mut self,
+        id: impl Into<String>,
+        start: Instant,
+        motion: Motion,
+        reduce_motion: bool,
+    ) {
+        self.tweens.insert(
+            id.into(),
+            Tween::resolved(start, motion.duration, reduce_motion),
+        );
+    }
+
+    /// The eased value `0.0..=1.0` for `id` at `now`, or `1.0` when there is no
+    /// such animation (treat "not animating" as "at the final frame").
+    #[must_use]
+    pub fn value(&self, id: &str, now: Instant, easing: Easing) -> f32 {
+        self.tweens
+            .get(id)
+            .map_or(1.0, |tw| ease(tw.progress(now), easing))
+    }
+
+    /// Whether `id` currently has an in-flight (incomplete) animation.
+    #[must_use]
+    pub fn is_animating(&self, id: &str, now: Instant) -> bool {
+        self.tweens.get(id).is_some_and(|tw| !tw.is_complete(now))
+    }
+
+    /// Drop every completed tween (call once per tick). Returns the count still
+    /// in flight — pair with the subscription so it stops when this hits 0.
+    pub fn gc(&mut self, now: Instant) -> usize {
+        self.tweens.retain(|_, tw| !tw.is_complete(now));
+        self.tweens.len()
+    }
+
+    /// True when nothing is animating — the subscription should stop ticking
+    /// (MOTION-PERF-1: zero idle wakeups).
+    #[must_use]
+    pub fn is_idle(&self, now: Instant) -> bool {
+        self.tweens.values().all(|tw| tw.is_complete(now))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::motion::{Motion, PULSE_MAX_SCALE};
+    use crate::motion::PULSE_MAX_SCALE;
+
+    #[test]
+    fn animator_runs_many_off_one_clock_and_goes_idle() {
+        // MOTION-INFRA-1 — N animations share one animator; is_idle reports when
+        // all settle (so the consumer's single subscription can stop).
+        let t0 = Instant::now();
+        let mut a = Animator::new();
+        assert!(a.is_idle(t0), "empty animator is idle");
+        a.start("fade", t0, Motion::panel_mount(), false); // 240 ms
+        a.start("hover", t0, Motion::hover(), false); // 70 ms
+        assert!(!a.is_idle(t0), "two in-flight ⇒ not idle");
+        assert!(a.is_animating("fade", t0));
+        // Midway: value is between 0 and 1, still animating.
+        let mid = t0 + Duration::from_millis(35);
+        let v = a.value("fade", mid, Easing::Linear);
+        assert!(v > 0.0 && v < 1.0, "fade interpolating, got {v}");
+        // After the longest duration everything settles + gc clears it.
+        let done = t0 + Duration::from_millis(300);
+        assert!(a.is_idle(done), "all settled ⇒ idle");
+        assert_eq!(a.gc(done), 0, "gc drops completed tweens");
+        assert!((a.value("missing", done, Easing::Linear) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn animator_reduce_motion_settles_fast() {
+        let t0 = Instant::now();
+        let mut a = Animator::new();
+        a.start("x", t0, Motion::loading(), true); // capped to 80 ms
+        assert!(a.is_idle(t0 + Duration::from_millis(80)));
+    }
 
     #[test]
     fn spring_is_monotonic_and_never_overshoots() {
