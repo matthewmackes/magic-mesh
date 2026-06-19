@@ -504,6 +504,9 @@ post_install_script = """
 # the ordering here, idempotently, on every upgrade. Keeps the Wants= pull.
 if [ -f /etc/systemd/system/qnm-shared.service ]; then
   sed -i '/^Before=mackesd.service/d' /etc/systemd/system/qnm-shared.service || :
+  # BOOT-XPA8-2 — back off the mount-retry so a disconnected node doesn't spin
+  # the loop every 5s (it can never mount off-mesh; mackesd self-heals it).
+  sed -i 's/^RestartSec=5$/RestartSec=30/' /etc/systemd/system/qnm-shared.service || :
 fi
 if [ -f /etc/systemd/system/mackesd.service.d/20-qnm.conf ]; then
   sed -i '/^After=qnm-shared.service/d' /etc/systemd/system/mackesd.service.d/20-qnm.conf || :
