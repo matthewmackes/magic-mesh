@@ -82,6 +82,10 @@ struct AppsApplet {
     toast: Option<String>,
     /// APPS-STYLE-2 — whether the footer power menu is open.
     power_open: bool,
+    /// RCLICK — whether the popup is showing the Win+X-style right-click power
+    /// menu (vs the normal launcher). Set when the launcher button is
+    /// right-clicked; the same popup surface renders the power menu instead.
+    rclick_open: bool,
     /// Last load error, shown in the dropdown's empty state.
     error: Option<String>,
     /// APPS-STYLE — the active Carbon palette (dark/light, from the user's MDE
@@ -127,6 +131,16 @@ enum Message {
     TogglePower,
     /// APPS-STYLE-2 — run a power/session action.
     Power(PowerKind),
+    /// RCLICK — open the Win+X-style right-click power menu (launcher button
+    /// secondary-press).
+    OpenPowerMenu,
+    /// RCLICK — launch a command with args (e.g. `cosmic-term -e btop`, an
+    /// elevated `pkexec …`), then close the menu.
+    LaunchArgs(Vec<String>),
+    /// RCLICK — deep-link into the Workbench at a focus slug, then close.
+    LaunchFocus(&'static str),
+    /// RCLICK — minimize-all / show the desktop.
+    ShowDesktop,
     /// Re-fetch the entry list.
     Refresh,
 }
@@ -151,6 +165,17 @@ impl PowerKind {
             Self::Restart => "Restart",
             Self::Shutdown => "Shut down",
         }
+    }
+
+    /// All session actions, in menu order (RCLICK Power submenu).
+    fn all() -> [Self; 5] {
+        [
+            Self::Lock,
+            Self::Logout,
+            Self::Suspend,
+            Self::Restart,
+            Self::Shutdown,
+        ]
     }
 
     /// The detached command (argv) that performs it.
@@ -349,6 +374,7 @@ impl Application for AppsApplet {
                 selected: None,
                 toast: None,
                 power_open: false,
+                rclick_open: false,
                 error: None,
                 palette: resolve_palette(),
             },
@@ -375,6 +401,7 @@ impl Application for AppsApplet {
             Message::PopupClosed(id) => {
                 if self.popup.as_ref() == Some(&id) {
                     self.popup = None;
+                    self.rclick_open = false;
                 }
             }
             Message::TogglePopup => {
@@ -383,6 +410,8 @@ impl Application for AppsApplet {
                         cosmic::app::Action::Surface(destroy_popup(id)),
                     ));
                 }
+                // Left-click → the launcher (not the right-click power menu).
+                self.rclick_open = false;
                 // Refresh the palette so a theme switch reflects on open.
                 self.palette = resolve_palette();
                 // Open the dropdown + refresh-on-open (Q: cached + refresh-on-open).
@@ -418,6 +447,79 @@ impl Application for AppsApplet {
                     )),
                 ));
                 return Task::batch([open, load_task()]);
+            }
+            Message::OpenPowerMenu => {
+                // RCLICK — secondary-click opens the Win+X power menu in the
+                // popup (a compact 360-wide surface), replacing the launcher
+                // content via the rclick_open flag.
+                if let Some(id) = self.popup.take() {
+                    return cosmic::task::message(cosmic::Action::Cosmic(
+                        cosmic::app::Action::Surface(destroy_popup(id)),
+                    ));
+                }
+                self.rclick_open = true;
+                self.power_open = false;
+                self.palette = resolve_palette();
+                return cosmic::task::message(cosmic::Action::Cosmic(
+                    cosmic::app::Action::Surface(app_popup::<AppsApplet>(
+                        move |state: &mut AppsApplet| {
+                            let new_id = Id::unique();
+                            state.popup = Some(new_id);
+                            let mut settings = state.core.applet.get_popup_settings(
+                                state.core.main_window_id().unwrap(),
+                                new_id,
+                                Some((360, 600)),
+                                None,
+                                None,
+                            );
+                            settings.positioner.size = Some((360, 600));
+                            settings.positioner.size_limits = cosmic::iced::Limits::NONE
+                                .min_width(360.0)
+                                .max_width(360.0)
+                                .min_height(1.0)
+                                .max_height(640.0);
+                            settings
+                        },
+                        Some(Box::new(move |state: &AppsApplet| {
+                            Element::from(state.core.applet.popup_container(state.dropdown()))
+                                .map(cosmic::Action::App)
+                        })),
+                    )),
+                ));
+            }
+            Message::LaunchArgs(argv) => {
+                if let Some((cmd, rest)) = argv.split_first() {
+                    let _ = std::process::Command::new(cmd).args(rest).spawn();
+                }
+                self.rclick_open = false;
+                if let Some(id) = self.popup.take() {
+                    return cosmic::task::message(cosmic::Action::Cosmic(
+                        cosmic::app::Action::Surface(destroy_popup(id)),
+                    ));
+                }
+            }
+            Message::LaunchFocus(slug) => {
+                let _ = std::process::Command::new("mde-workbench")
+                    .args(["--focus", slug])
+                    .spawn();
+                self.rclick_open = false;
+                if let Some(id) = self.popup.take() {
+                    return cosmic::task::message(cosmic::Action::Cosmic(
+                        cosmic::app::Action::Surface(destroy_popup(id)),
+                    ));
+                }
+            }
+            Message::ShowDesktop => {
+                // Best-effort minimize-all via the Cosmic shortcut helper, then close.
+                let _ = std::process::Command::new("cosmic-osd")
+                    .arg("show-desktop")
+                    .spawn();
+                self.rclick_open = false;
+                if let Some(id) = self.popup.take() {
+                    return cosmic::task::message(cosmic::Action::Cosmic(
+                        cosmic::app::Action::Surface(destroy_popup(id)),
+                    ));
+                }
             }
             Message::Loaded(entries, qnm, favs) => {
                 self.entries = entries;
@@ -550,7 +652,9 @@ impl Application for AppsApplet {
         let btn = cosmic::widget::button::custom(glyph)
             .on_press(Message::TogglePopup)
             .class(cosmic::theme::Button::AppletIcon);
-        Element::from(btn)
+        // RCLICK — secondary-click opens the Win+X-style power menu; left-click
+        // still opens the launcher (the button's own on_press).
+        Element::from(cosmic::widget::mouse_area(btn).on_right_press(Message::OpenPowerMenu))
     }
 
     fn view_window(&self, _id: Id) -> Element<'_, Message> {
@@ -568,7 +672,108 @@ impl AppsApplet {
     /// Header (title + QNM-Shared usage bar) → quick-link tiles → underline tabs →
     /// search → result rows (zebra + selected blue-accent, click-to-expand detail)
     /// → toast → operator/power footer. 460×720, all Carbon tokens (light + dark).
+    /// RCLICK — the Win+X-style right-click power menu (functional parity with
+    /// the Windows 10 Start right-click menu, MCNF-augmented). Each row launches
+    /// a real target (app spawn / elevated `pkexec` / `mde-workbench --focus`
+    /// deep-link); the Power section runs the session actions directly.
+    fn power_menu(&self) -> Element<'_, Message> {
+        use cosmic::widget::{button, column, scrollable, text, Space};
+        let p = self.palette;
+        let sizes = FontSize::defaults();
+        let body_sz = TypeRole::Body.size_in(sizes);
+        let cap_sz = TypeRole::Caption.size_in(sizes);
+        let la = |args: &[&str]| Message::LaunchArgs(args.iter().map(|s| (*s).to_string()).collect());
+
+        // One menu row: glyph + label, full-width subtle button.
+        let row_item = |glyph: &str, label: &str, msg: Message| -> Element<'static, Message> {
+            button::custom(
+                cosmic::widget::row(vec![
+                    text(glyph.to_string())
+                        .size(14)
+                        .class(cosmic::theme::Text::Color(carbon(p.text_muted)))
+                        .into(),
+                    Space::new().width(Length::Fixed(12.0)).into(),
+                    text(label.to_string())
+                        .size(body_sz)
+                        .class(cosmic::theme::Text::Color(carbon(p.text)))
+                        .into(),
+                ])
+                .align_y(cosmic::iced::Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding(cosmic::iced::Padding::from([7u16, 12u16]))
+            .on_press(msg)
+            .class(cosmic::theme::Button::Text)
+            .into()
+        };
+        let divider = || -> Element<'static, Message> {
+            cosmic::iced::widget::container(Space::new().width(Length::Fill).height(Length::Fixed(1.0)))
+                .padding(cosmic::iced::Padding::from([4u16, 8u16]))
+                .into()
+        };
+        let header = text("Power User Menu")
+            .size(TypeRole::Heading.size_in(sizes))
+            .class(cosmic::theme::Text::Color(carbon(p.text)));
+
+        let items: Vec<Element<'static, Message>> = vec![
+            row_item("\u{25A4}", "File Explorer", Message::LaunchLocal("mde-files".into())),
+            row_item("\u{2699}\u{FE0E}", "Settings", Message::LaunchLocal("cosmic-settings".into())),
+            row_item("\u{2BC8}", "Terminal", Message::LaunchLocal("cosmic-term".into())),
+            row_item("\u{2BC8}", "Terminal (Admin)", la(&["pkexec", "cosmic-term"])),
+            row_item("\u{25A6}", "Task Manager", la(&["cosmic-term", "-e", "btop"])),
+            row_item("\u{2756}", "Midnight Commander", la(&["cosmic-term", "-e", "mc"])),
+            divider(),
+            row_item("\u{25A3}", "Device Manager", Message::LaunchFocus("node.hardware")),
+            row_item("\u{2725}", "Network Connections", Message::LaunchFocus("node.interfaces")),
+            row_item("\u{25A4}", "Disk Management", Message::LaunchFocus("mesh.mesh_storage")),
+            row_item("\u{25A4}", "Disk Management (Admin)", la(&["pkexec", "cosmic-disks"])),
+            row_item("\u{2261}", "Event Viewer", Message::LaunchFocus("monitoring.mesh_logs")),
+            row_item("\u{25A6}", "Apps & Features", Message::LaunchFocus("provisioning.profiles")),
+            row_item("\u{23FB}\u{FE0E}", "Power Options", la(&["cosmic-settings", "power"])),
+            row_item("\u{24D8}", "System / About", Message::LaunchFocus("system.about")),
+            row_item("\u{2318}", "Computer Management", la(&["pkexec", "mde-workbench"])),
+            divider(),
+            // MCNF-augmented entries.
+            row_item("\u{25C9}", "Mesh Control", Message::LaunchFocus("mesh.mesh_control")),
+            row_item("\u{25C9}", "Lighthouses", Message::LaunchFocus("mesh.lighthouses")),
+            row_item("\u{25D4}\u{FE0E}", "Notification Hub", Message::LaunchLocal("mde-notify-center".into())),
+            row_item("\u{2317}\u{FE0E}", "Join the Mesh", Message::LaunchLocal("mde-enroll".into())),
+            divider(),
+            row_item("\u{25A1}", "Show Desktop", Message::ShowDesktop),
+        ];
+        let mut col = column(items).spacing(0).width(Length::Fill);
+        // Power submenu (Lock / Sign out / Suspend / Restart / Shut down) — the
+        // existing session actions, listed inline.
+        col = col.push(divider());
+        col = col.push(
+            text("Power")
+                .size(cap_sz)
+                .class(cosmic::theme::Text::Color(carbon(p.text_muted))),
+        );
+        for kind in PowerKind::all() {
+            col = col.push(row_item("\u{23FB}\u{FE0E}", kind.label(), Message::Power(kind)));
+        }
+
+        cosmic::iced::widget::container(
+            column(vec![
+                header.into(),
+                Space::new().height(Length::Fixed(8.0)).into(),
+                scrollable(col).height(Length::Fill).into(),
+            ])
+            .spacing(0),
+        )
+        .padding(12)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
     fn dropdown(&self) -> Element<'_, Message> {
+        // RCLICK — the same popup surface renders the Win+X power menu when it
+        // was opened by a secondary-click.
+        if self.rclick_open {
+            return self.power_menu();
+        }
         use cosmic::widget::{button, column, row, scrollable, text, text_input, Space};
         let p = self.palette;
         let sizes = FontSize::defaults();
