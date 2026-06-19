@@ -77,6 +77,68 @@ pub fn fetch_peers() -> Vec<PeerRecord> {
     }
 }
 
+/// Parse the leader hostname from an `action/mesh/directory` reply (`{ ok, …,
+/// leader }`). `None` when there's no live leader / the reply is non-ok /
+/// unparseable. Pure + testable (SUBSTRATE-8 — replaces the panels' direct
+/// `.mackesd-leader.lock` reads).
+#[must_use]
+pub fn parse_directory_leader(reply: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(reply.trim()).ok()?;
+    if v.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    v.get("leader")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Fetch the current mesh leader's hostname over the Bus. `None` on daemon-down
+/// / no live leader. Blocking — same contract as [`fetch_peers`].
+#[must_use]
+pub fn fetch_leader() -> Option<String> {
+    parse_directory_leader(&crate::dbus::action_request(
+        "action/mesh/directory",
+        DIRECTORY_TIMEOUT,
+    )?)
+}
+
+/// Fetch peers + leader in one directory round-trip (the panels that render both
+/// — lighthouses, the notify-center footer — want a single RPC, not two).
+#[must_use]
+pub fn fetch_peers_and_leader() -> (Vec<PeerRecord>, Option<String>) {
+    match crate::dbus::action_request("action/mesh/directory", DIRECTORY_TIMEOUT) {
+        Some(reply) => (
+            parse_directory_peers(&reply),
+            parse_directory_leader(&reply),
+        ),
+        None => (Vec::new(), None),
+    }
+}
+
+/// Parse the raw encoded leader lease (`node_id\trenewed_at_s\tepoch`) from a
+/// directory reply — for Mesh Control, which renders the epoch/age. Pure.
+#[must_use]
+pub fn parse_directory_leader_lease(reply: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(reply.trim()).ok()?;
+    if v.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    v.get("leader_lease")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+}
+
+/// Fetch the raw leader lease over the Bus. `None` on daemon-down / no leader.
+#[must_use]
+pub fn fetch_leader_lease() -> Option<String> {
+    parse_directory_leader_lease(&crate::dbus::action_request(
+        "action/mesh/directory",
+        DIRECTORY_TIMEOUT,
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +183,25 @@ mod tests {
         let peers = parse_directory_peers(reply);
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].hostname, "x");
+    }
+
+    #[test]
+    fn parse_directory_leader_reads_hostname() {
+        let reply = r#"{"ok":true,"leader":"node-b","leader_lease":"peer:node-b\t1750000000\t3","peers":[]}"#;
+        assert_eq!(parse_directory_leader(reply).as_deref(), Some("node-b"));
+        // No leader / empty / not-ok → None.
+        assert!(parse_directory_leader(r#"{"ok":true,"leader":null,"peers":[]}"#).is_none());
+        assert!(parse_directory_leader(r#"{"ok":true,"leader":"","peers":[]}"#).is_none());
+        assert!(parse_directory_leader(r#"{"ok":false}"#).is_none());
+    }
+
+    #[test]
+    fn parse_directory_leader_lease_reads_raw_lease() {
+        let reply = r#"{"ok":true,"leader":"node-b","leader_lease":"peer:node-b\t1750000000\t3","peers":[]}"#;
+        assert_eq!(
+            parse_directory_leader_lease(reply).as_deref(),
+            Some("peer:node-b\t1750000000\t3")
+        );
+        assert!(parse_directory_leader_lease(r#"{"ok":true,"peers":[]}"#).is_none());
     }
 }

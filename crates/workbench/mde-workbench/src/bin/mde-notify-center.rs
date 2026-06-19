@@ -395,26 +395,16 @@ fn fetch_voice() -> Option<VoiceStatus> {
 /// service check (Q3).
 fn fetch_lighthouses() -> Vec<Beacon> {
     let root = mackes_mesh_types::peers::default_workgroup_root();
-    let mut peers =
-        mackes_mesh_types::peers::read_peers(&mackes_mesh_types::peers::peers_dir(&root));
+    // SUBSTRATE-8 — peers + leader from the directory RPC (etcd-or-fs), not a
+    // direct roster glob + `.mackesd-leader.lock` read, so the footer survives
+    // the substrate cutover.
+    let (mut peers, master) = mde_workbench::mesh_directory::fetch_peers_and_leader();
     // Back-fill role from the shell-status sidecar for records that predate the
     // role-stamping heartbeat (so the footer shows lighthouses before mackesd
     // rolls everywhere). Shared with the Workbench tab.
     mde_workbench::panels::lighthouses::enrich_roles(&root, &mut peers);
-    let master = fetch_master_hostname(&root);
     let now = u64::try_from(now_ms()).unwrap_or(0);
     lighthouse::beacons(&peers, master.as_deref(), now, lighthouse::DEFAULT_STALE_MS)
-}
-
-/// LIGHTHOUSE-3 — the current lizardfs-master hostname, read best-effort from
-/// the QNM leader lease (`<workgroup>/.mackesd-leader.lock`). The lease line is
-/// `node_id\trenewed_at_s\tepoch`; the holder's `peer:<host>` node id maps to
-/// `<host>`. Returns `None` when the lease is missing or expired (>60 s old),
-/// in which case no lighthouse is treated as master (all use the lenient check).
-fn fetch_master_hostname(workgroup_root: &std::path::Path) -> Option<String> {
-    let text = std::fs::read_to_string(workgroup_root.join(".mackesd-leader.lock")).ok()?;
-    let now_s = u64::try_from(now_ms() / 1000).unwrap_or(0);
-    lighthouse::master_from_lease(&text, now_s)
 }
 
 fn subscription(s: &Center) -> Subscription<Message> {

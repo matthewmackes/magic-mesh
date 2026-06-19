@@ -186,17 +186,11 @@ impl DirectoryService {
                 unreachable += 1;
             }
         }
-        // SUBSTRATE-4 — leadership from the etcd lease when on the coordination
-        // plane, else the fs lockfile. (Runs on the off-tokio healthz-enrich
-        // thread, so the blocking etcd read is safe.)
-        let etcd_endpoints = crate::substrate::etcd::default_endpoints();
-        let is_leader = if etcd_endpoints.is_empty() {
-            crate::leader::read_current_lease(&self.workgroup_root.join(".mackesd-leader.lock"))
-                .is_some_and(|l| l.node_id == node_id)
-        } else {
-            crate::substrate::leader::current_leader_blocking(&etcd_endpoints)
-                .is_some_and(|l| l.node_id == node_id)
-        };
+        // SUBSTRATE-4/8 — leadership from the shared leader read (etcd lease when
+        // on the coordination plane, else the fs lockfile). `node_id` may carry
+        // the `peer:` prefix; `leader_name` returns the bare hostname.
+        let bare = node_id.strip_prefix("peer:").unwrap_or(node_id);
+        let is_leader = self.leader_name().is_some_and(|l| l == bare);
         (total, healthy, degraded, unreachable, is_leader)
     }
 
@@ -253,7 +247,51 @@ impl DirectoryService {
                 )
             })
             .collect();
-        json!({ "ok": true, "head": head, "peers": rows })
+        json!({
+            "ok": true,
+            "head": head,
+            "leader": self.leader_name(),
+            "leader_lease": self.leader_lease(),
+            "peers": rows,
+        })
+    }
+
+    /// SUBSTRATE-8 — the raw encoded leader lease (`node_id\trenewed_at_s\tepoch`)
+    /// for surfaces that show the epoch/age (Mesh Control), or `None` when there's
+    /// no live leader. etcd lease (re-encoded) when on the coordination plane,
+    /// else the fs lockfile body. Off-tokio responder thread ⇒ blocking read safe.
+    #[must_use]
+    pub fn leader_lease(&self) -> Option<String> {
+        let etcd_endpoints = crate::substrate::etcd::default_endpoints();
+        if etcd_endpoints.is_empty() {
+            std::fs::read_to_string(self.workgroup_root.join(".mackesd-leader.lock"))
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        } else {
+            crate::substrate::leader::current_leader_blocking(&etcd_endpoints).map(|l| l.encode())
+        }
+    }
+
+    /// SUBSTRATE-4/8 — the current mesh leader's bare hostname (the leader-lease
+    /// holder), or `None` when there's no live leader. Reads the etcd leader when
+    /// on the coordination plane (endpoints present), else the fs lockfile lease.
+    /// Runs on the off-tokio directory responder thread, so the blocking etcd
+    /// read is safe. The `peer:` node-id prefix is stripped to match hostnames.
+    #[must_use]
+    pub fn leader_name(&self) -> Option<String> {
+        let etcd_endpoints = crate::substrate::etcd::default_endpoints();
+        let node_id = if etcd_endpoints.is_empty() {
+            crate::leader::read_current_lease(&self.workgroup_root.join(".mackesd-leader.lock"))
+                .map(|l| l.node_id)
+        } else {
+            crate::substrate::leader::current_leader_blocking(&etcd_endpoints).map(|l| l.node_id)
+        }?;
+        Some(
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
     }
 }
 

@@ -398,16 +398,17 @@ pub fn enrich_roles(root: &std::path::Path, peers: &mut [mackes_mesh_types::peer
     }
 }
 
-/// Build the lighthouse cards from the replicated directory + the leader lease.
+/// Build the lighthouse cards from the mesh directory + the leader.
+/// SUBSTRATE-8 — peers + leader both come from `action/mesh/directory` (etcd-or-fs
+/// behind the RPC) instead of a direct `/mnt/mesh-storage` read of the roster +
+/// `.mackesd-leader.lock`, so the panel survives the substrate cutover.
 fn load_cards() -> Vec<LighthouseCard> {
     let root = mackes_mesh_types::peers::default_workgroup_root();
-    let mut peers =
-        mackes_mesh_types::peers::read_peers(&mackes_mesh_types::peers::peers_dir(&root));
+    let (mut peers, master) = crate::mesh_directory::fetch_peers_and_leader();
+    // Back-fill role from the shell-status sidecar (still on the replicated share)
+    // for any record that predates role-stamping.
     enrich_roles(&root, &mut peers);
     let now_ms = now_ms();
-    let master = std::fs::read_to_string(root.join(".mackesd-leader.lock"))
-        .ok()
-        .and_then(|t| lighthouse::master_from_lease(&t, now_ms / 1000));
     lighthouse::lighthouse_records(&peers)
         .iter()
         .map(|p| {

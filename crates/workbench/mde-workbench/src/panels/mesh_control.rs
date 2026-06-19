@@ -16,7 +16,6 @@
 //! Server Manager landing — single hero card + per-property
 //! list + action button row.
 
-use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
@@ -345,7 +344,7 @@ fn leader_card_view<'a>(
             Icon::StatusWarning,
             palette.warning.into_cosmic_color(),
             "NO LEADER",
-            "no .mackesd-leader.lock found — QNM-Shared not mounted, or no node has taken leadership".into(),
+            "the mesh directory reports no leader — mackesd unreachable, or no node has taken leadership".into(),
         ),
     };
     let resolved = mde_icon(status_icon, IconSize::PanelHeader);
@@ -563,37 +562,14 @@ fn read_self_node_id() -> String {
     format!("peer:{host}")
 }
 
-fn leader_lock_paths() -> Vec<PathBuf> {
-    let home = std::env::var("HOME")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"));
-    // AUDIT-MESH-10 — the daemon writes the lock to its workgroup root
-    // (`$MDE_WORKGROUP_ROOT/.mackesd-leader.lock`, i.e. /mnt/mesh-storage in the
-    // deployed mesh), but the GUI session usually doesn't inherit that env, so
-    // `default_workgroup_root()` resolved to ~/QNM-Shared and the panel showed
-    // NO LEADER even with a live lock. Check the canonical resolver FIRST, then
-    // the deployed mount explicitly, then the legacy fallbacks. De-dup so an
-    // env that already points at /mnt/mesh-storage isn't probed twice.
-    let mut paths = vec![
-        mackes_mesh_types::peers::default_workgroup_root().join(".mackesd-leader.lock"),
-        PathBuf::from("/mnt/mesh-storage/.mackesd-leader.lock"),
-        home.join("QNM-Shared/.mackesd-leader.lock"),
-        PathBuf::from("/var/lib/mackesd/qnm-shared/.mackesd-leader.lock"),
-    ];
-    paths.dedup();
-    paths
-}
-
 fn read_leader_lock() -> Option<LeaseInfo> {
-    for path in leader_lock_paths() {
-        if let Ok(raw) = std::fs::read_to_string(&path) {
-            if let Some(info) = parse_lease(&raw) {
-                return Some(info);
-            }
-        }
-    }
-    None
+    // SUBSTRATE-8 — the leader lease comes from `action/mesh/directory`
+    // (etcd-or-fs behind the RPC), not a direct `.mackesd-leader.lock` read. This
+    // also fixes the long-standing AUDIT-MESH-10 path-guessing (the GUI session
+    // didn't inherit `$MDE_WORKGROUP_ROOT`): the daemon owns the read now, so the
+    // panel no longer probes a handful of candidate mount paths.
+    let raw = crate::mesh_directory::fetch_leader_lease()?;
+    parse_lease(&raw)
 }
 
 /// Pure parser for the lease file format
