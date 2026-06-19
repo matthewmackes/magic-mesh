@@ -405,6 +405,9 @@ assets = [
     # versioning); device IDs wired from the etcd /mesh/syncthing/<host> registry.
     { source = "install-helpers/setup-syncthing.sh",     dest = "/usr/libexec/mackesd/setup-syncthing",         mode = "755" },
     { source = "packaging/systemd/syncthing.service",    dest = "/etc/systemd/system/syncthing.service",        mode = "644" },
+    # SUBSTRATE-14 — the etcd+Syncthing cutover entry point (operator runs it on
+    # the VM bed to rehearse, then per fleet node at the 11.0 roll).
+    { source = "install-helpers/cutover-substrate-v2.sh", dest = "/usr/libexec/mackesd/cutover-substrate-v2",    mode = "755" },
     # BOOT-REC-4 — the reboot-recovery verification gate (run after a reboot).
     { source = "install-helpers/verify-boot-recovery.sh", dest = "/usr/libexec/mackesd/verify-boot-recovery",   mode = "755" },
     # SETUP-fix — SHARED bus spool so the root mackesd daemon + the uid-1000

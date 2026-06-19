@@ -173,6 +173,32 @@ overlay mount — is removed.
 - **etcd auth deferred** — overlay-only is the security boundary initially; add
   client-cert TLS as a follow-on before any non-overlay exposure.
 
+## Cutover runbook (SUBSTRATE-14)
+
+The substrate code (SUBSTRATE-1..13) ships as **dormant bridges**: every reader is
+`etcd-when-/etc/mackesd/etcd-endpoints-present, else the LizardFS fs path`, so the
+live fleet is byte-for-byte unchanged until a node is provisioned onto etcd. The
+cutover is the operator running `cutover-substrate-v2.sh` per node — writing the
+endpoints file is what flips that node's coordination onto etcd.
+
+1. **Rehearse on the VM bed first.** On the founding anchor:
+   `cutover-substrate-v2 --init --listen <ip>`; each other anchor:
+   `--join <founder-ip> --listen <ip>`; workstations: `--client-only --anchors <csv>`.
+   Then drill: `etcdctl … endpoint health` shows quorum; `… get --prefix /mesh/peers/`
+   shows the directory; a file written on A appears on B; **reboot a node** + a
+   **disconnect** drill — the mesh must re-elect/rejoin in seconds, independent of
+   any mount.
+2. **Roll the fleet** at the 11.0 version (anchors first, then workstations).
+3. **Then** land SUBSTRATE-6 (remove LizardFS) in the *next* release once the bed +
+   fleet are proven on etcd+Syncthing — never before, so the fs fallback stays as
+   the safety net through the transition.
+
+**Rollback (one release):** `rm /etc/mackesd/etcd-endpoints` (bridges fall back to
+the LizardFS fs path) + `systemctl disable --now etcd syncthing`; or reinstall the
+prior NEVRA (still carries `setup-qnm-shared` + the LizardFS Requires until
+SUBSTRATE-6 lands). This is why SUBSTRATE-6 is **held until after** the cutover is
+proven — removing LizardFS removes the rollback path.
+
 ## Out of scope
 - Moving revisions/acks/tags/compute/favorites/alert-mirror to etcd (they ride
   Syncthing per the lock; a later epic can promote any that need stronger
