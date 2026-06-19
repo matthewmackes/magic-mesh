@@ -67,6 +67,34 @@ pub fn parse_listening_ports(ss_out: &str) -> Vec<u16> {
     ports
 }
 
+/// CONNECT-2 — a friendly label for a well-known service port (the PD-2 canonical
+/// mesh services + common app ports), so a discovered candidate reads as e.g.
+/// "SSH" / "PostgreSQL" rather than a bare number. `None` ⇒ the UI shows the port.
+#[must_use]
+pub fn well_known_label(port: u16) -> Option<&'static str> {
+    Some(match port {
+        22 => "SSH",
+        53 => "DNS",
+        80 => "HTTP",
+        443 => "HTTPS",
+        // PD-2 canonical mesh services.
+        4222 => "NATS",
+        4243 => "Mesh enrollment",
+        9418 => "Mesh FS",
+        // Common app/server ports operators publish.
+        3000 => "Grafana / Node",
+        3306 => "MySQL",
+        4040 => "Airsonic",
+        5432 => "PostgreSQL",
+        6379 => "Redis",
+        8000 | 8080 | 8888 => "HTTP (alt)",
+        8443 => "HTTPS (alt)",
+        9090 => "Prometheus",
+        19999 => "Netdata",
+        _ => return None,
+    })
+}
+
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
@@ -121,6 +149,7 @@ pub fn build_reply(svc: &ConnectService, verb: &str, req_body: Option<&str>) -> 
                         "kind": "host",
                         "port": port,
                         "proto": "tcp",
+                        "label": well_known_label(port),
                         "configured": configured,
                     })
                 })
@@ -312,6 +341,15 @@ mod tests {
         let ports = parse_listening_ports(out);
         assert_eq!(ports, vec![22, 53, 443, 8443]); // sorted + deduped
         assert!(parse_listening_ports("").is_empty());
+    }
+
+    #[test]
+    fn well_known_labels_cover_canonical_and_common() {
+        assert_eq!(well_known_label(22), Some("SSH"));
+        assert_eq!(well_known_label(4222), Some("NATS"));
+        assert_eq!(well_known_label(5432), Some("PostgreSQL"));
+        assert_eq!(well_known_label(19999), Some("Netdata"));
+        assert_eq!(well_known_label(12345), None); // unknown → UI shows the port
     }
 
     #[test]
