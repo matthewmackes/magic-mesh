@@ -494,6 +494,20 @@ assets = [
 # the config dir, refresh icon/desktop caches; clean up on removal. Guards keep
 # them no-fatal in minimal/container roots.
 post_install_script = """
+# XPA-8 migration (BOOT-REC, 2026-06-18): nodes enrolled before XPA-8 wrote
+# qnm-shared.service with `Before=mackesd.service` + a 20-qnm.conf drop-in with
+# `After=qnm-shared.service`, which made mackesd QUEUE behind the QNM-Shared
+# mount-retry loop (up to ~2 min). Result: after a reboot the mesh + the apps
+# service are DOWN for ~2 min (and on a disconnected laptop, the full ~2 min
+# every boot since the master is never reachable). setup-qnm-shared.sh already
+# writes the decoupled form, but an RPM upgrade doesn't re-run it — so refresh
+# the ordering here, idempotently, on every upgrade. Keeps the Wants= pull.
+if [ -f /etc/systemd/system/qnm-shared.service ]; then
+  sed -i '/^Before=mackesd.service/d' /etc/systemd/system/qnm-shared.service || :
+fi
+if [ -f /etc/systemd/system/mackesd.service.d/20-qnm.conf ]; then
+  sed -i '/^After=qnm-shared.service/d' /etc/systemd/system/mackesd.service.d/20-qnm.conf || :
+fi
 systemctl daemon-reload >/dev/null 2>&1 || :
 # Service manager (ONBOARD-9): the daemon, the overlay, and the health
 # watchdog all start at boot. nebula.service ships disabled by the stock
