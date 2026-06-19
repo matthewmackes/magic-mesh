@@ -22,18 +22,25 @@ set -eu
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 fail=0
 
-# 1. The fail-loud mount assertion in the watchdog.
+# 1. The fail-loud shared-state assertion in the watchdog. SUBSTRATE-11/V2: the
+#    plane is etcd (coordination) + Syncthing (files), so the watchdog must assert
+#    etcd quorum health; the legacy LizardFS-mount assertion is kept for the
+#    pre-cutover branch until the fleet cuts over.
 hc="$REPO/install-helpers/mesh-health-check.sh"
-if ! grep -q 'QNM-Shared not mounted' "$hc" 2>/dev/null; then
-    echo "lint-shared-substrate: FAIL — mesh-health-check.sh lost its QNM-Shared mount assertion (OB6-FIX-3)" >&2
+if ! grep -q 'etcd unreachable' "$hc" 2>/dev/null; then
+    echo "lint-shared-substrate: FAIL — mesh-health-check.sh lost its etcd-quorum readiness guard (SUBSTRATE-11)" >&2
     fail=1
 fi
+if ! grep -q 'QNM-Shared not mounted' "$hc" 2>/dev/null; then
+    echo "lint-shared-substrate: WARN — mesh-health-check.sh dropped the legacy QNM mount assertion (OK once the fleet has cut over)" >&2
+fi
 
-# 2. The multi-node shared-state gate.
-t="$REPO/crates/mesh/mackesd/tests/mesh_shared_state.rs"
-if ! grep -q 'exactly_one_leader_is_elected_across_nodes_on_a_shared_volume' "$t" 2>/dev/null \
-   || ! grep -q 'healthz_counts_reflect_the_shared_mesh' "$t" 2>/dev/null; then
-    echo "lint-shared-substrate: FAIL — the multi-node shared-state test (OB6-FIX-1) is missing/gutted" >&2
+# 2. The etcd multi-node gate — exactly-one-leader + the peer directory exercised
+#    against a REAL etcd container (SUBSTRATE-11, replaces the tempdir gate).
+t="$REPO/crates/mesh/mackesd/tests/substrate_etcd.rs"
+if ! grep -q 'etcd_leader_election_elects_one_renews_and_force_takes' "$t" 2>/dev/null \
+   || ! grep -q 'etcd_peer_directory_round_trips_and_deletes' "$t" 2>/dev/null; then
+    echo "lint-shared-substrate: FAIL — the etcd multi-node gate (SUBSTRATE-2/3) is missing/gutted" >&2
     fail=1
 fi
 

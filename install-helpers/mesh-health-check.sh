@@ -43,17 +43,31 @@ restart() {
     systemctl restart "$1" >/dev/null 2>&1 || log "  restart $1 failed"
 }
 
-# 0. QNM-Shared must be a REAL mount, not a silently-local directory (ONBOARD-6
-#    process fix #3 — the exact failure that hid for the whole project: the
-#    shared-state code works identically against a local dir, so a missing mount
-#    no-ops silently → NO LEADER / empty directory). If qnm-shared.service exists
-#    but the volume isn't a fuse mount, recover it + alert loudly.
-# AUDIT-MESH-1 — assert the SAME root the daemon uses. mackesd runs with
-# MDE_WORKGROUP_ROOT=/mnt/mesh-storage (systemd unit + env.d drop-in), and
-# setup-qnm-shared.sh mounts there; the old /root/QNM-Shared default checked the
-# wrong path, so a failed /mnt/mesh-storage mount slipped past the watchdog.
+# 0. Shared-state plane health. SUBSTRATE-11/V2: the plane is now etcd
+#    (coordination) + Syncthing (files). When this node is on the etcd
+#    coordination plane (setup-etcd wrote the endpoints file), assert etcd quorum
+#    health + the Syncthing daemon — NOT a FUSE mount. Pre-cutover (no endpoints
+#    file) it keeps the LizardFS QNM-Shared mount assertion so the running fleet's
+#    watchdog is unchanged (ONBOARD-6 process fix #3: a silently-local dir no-ops
+#    → NO LEADER / empty directory).
+ETCD_ENDPOINTS_FILE=/etc/mackesd/etcd-endpoints
 QNM="${MDE_WORKGROUP_ROOT:-${QNM_PATH:-/mnt/mesh-storage}}"
-if systemctl list-unit-files qnm-shared.service >/dev/null 2>&1 && [ -d "$QNM" ]; then
+if [ -s "$ETCD_ENDPOINTS_FILE" ]; then
+    # etcd coordination plane: quorum health (any reachable client endpoint).
+    EPS="$(tr '\n' ',' < "$ETCD_ENDPOINTS_FILE" | sed 's/,$//')"
+    if command -v etcdctl >/dev/null 2>&1; then
+        if ! ETCDCTL_API=3 etcdctl --endpoints="$EPS" endpoint health >/dev/null 2>&1; then
+            restart etcd.service "etcd unreachable (coordination plane down)"
+        fi
+    fi
+    # Syncthing file plane (non-critical to liveness, but recover + note it).
+    if systemctl list-unit-files syncthing.service >/dev/null 2>&1 \
+       && ! systemctl is-active --quiet syncthing.service 2>/dev/null; then
+        restart syncthing.service "Syncthing down (Mesh Sync file plane out of sync)"
+    fi
+elif systemctl list-unit-files qnm-shared.service >/dev/null 2>&1 && [ -d "$QNM" ]; then
+    # Pre-cutover: assert the LizardFS QNM-Shared FUSE mount (AUDIT-MESH-1 — the
+    # same /mnt/mesh-storage root the daemon uses).
     if ! mount 2>/dev/null | grep -q " $QNM type fuse"; then
         restart qnm-shared.service "QNM-Shared not mounted (shared-state plane down)"
     fi
