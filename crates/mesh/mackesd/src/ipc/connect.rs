@@ -38,7 +38,7 @@ impl ConnectService {
 }
 
 /// Action verbs served on `action/connect/<verb>`.
-pub const ACTION_VERBS: [&str; 7] = [
+pub const ACTION_VERBS: [&str; 8] = [
     "list-services",
     "list-candidates",
     "set-policy",
@@ -46,6 +46,7 @@ pub const ACTION_VERBS: [&str; 7] = [
     "unexpose",
     "list-templates",
     "set-template",
+    "apply-template",
 ];
 
 /// CONNECT-2 — parse the local-address column of `ss -H -tln` (one socket per
@@ -264,6 +265,75 @@ pub fn build_reply(svc: &ConnectService, verb: &str, req_body: Option<&str>) -> 
                 Err(e) => err(format!("set-template: save: {e}")),
             }
         }
+        "apply-template" => {
+            // CONNECT-8 — apply a named template's tier+mode(+ingress lighthouse)
+            // to a set of services at once. Body: `{ "template": "<name>",
+            // "ids": ["a","b"] }`. A public template needs each target to already
+            // carry an ingress hostname (expose it first) — surfaced per-service.
+            let Some(body) = req_body else {
+                return err("apply-template: missing request body".into());
+            };
+            let req: serde_json::Value = match serde_json::from_str(body) {
+                Ok(v) => v,
+                Err(e) => return err(format!("apply-template: bad json: {e}")),
+            };
+            let tname = req
+                .get("template")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let ids: Vec<String> = req
+                .get("ids")
+                .and_then(serde_json::Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if tname.is_empty() || ids.is_empty() {
+                return err("apply-template: 'template' and a non-empty 'ids' are required".into());
+            }
+            let mut cfg = exposure::load(root);
+            let Some(tpl) = cfg.template.iter().find(|t| t.name == tname).cloned() else {
+                return err(format!("apply-template: no such template '{tname}'"));
+            };
+            let mut applied = 0usize;
+            let mut skipped: Vec<String> = Vec::new();
+            for id in &ids {
+                let Some(mut svc_policy) = cfg.get(id).cloned() else {
+                    skipped.push(format!("{id} (no such service)"));
+                    continue;
+                };
+                svc_policy.tier = tpl.tier;
+                svc_policy.mode = tpl.mode;
+                svc_policy.template = Some(tpl.name.clone());
+                if tpl.tier == Tier::PublicViaIngress {
+                    // Keep the service's existing hostname; set the template's
+                    // lighthouse. A target with no hostname can't go public yet.
+                    match (&svc_policy.ingress, &tpl.lighthouse) {
+                        (Some(b), Some(lh)) => {
+                            svc_policy.ingress = Some(exposure::IngressBinding {
+                                lighthouse: lh.clone(),
+                                hostname: b.hostname.clone(),
+                            });
+                        }
+                        (Some(_), None) => { /* keep existing binding */ }
+                        (None, _) => {
+                            skipped.push(format!(
+                                "{id} (public template needs a hostname — expose it first)"
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                cfg.upsert(svc_policy);
+                applied += 1;
+            }
+            match exposure::save(root, &cfg) {
+                Ok(_) => json!({ "ok": true, "applied": applied, "skipped": skipped }).to_string(),
+                Err(e) => err(format!("apply-template: save: {e}")),
+            }
+        }
         other => err(format!("unknown connect verb: {other}")),
     }
 }
@@ -421,6 +491,35 @@ mod tests {
             .get("x")
             .unwrap()
             .is_public());
+    }
+
+    #[test]
+    fn apply_template_sets_tier_mode_across_services() {
+        let (_t, s) = svc();
+        // Two mesh-only services + a mesh-only template, applied to both.
+        for id in ["a", "b"] {
+            let _ = build_reply(
+                &s,
+                "set-policy",
+                Some(&json!({"id":id,"source":{"node":"n","kind":"host","port":80},"tier":"mesh-only"}).to_string()),
+            );
+        }
+        let _ = build_reply(
+            &s,
+            "set-template",
+            Some(&json!({"name":"internal","tier":"mesh-only","mode":"http"}).to_string()),
+        );
+        let r = build_reply(
+            &s,
+            "apply-template",
+            Some(&json!({"template":"internal","ids":["a","b","missing"]}).to_string()),
+        );
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{r}");
+        assert_eq!(v["applied"], serde_json::json!(2));
+        assert_eq!(v["skipped"].as_array().unwrap().len(), 1); // "missing"
+        let cfg = exposure::load(s.workgroup_root.as_path());
+        assert_eq!(cfg.get("a").unwrap().template.as_deref(), Some("internal"));
     }
 
     #[test]
