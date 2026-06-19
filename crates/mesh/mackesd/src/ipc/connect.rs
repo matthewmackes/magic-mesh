@@ -18,29 +18,54 @@ use serde_json::json;
 use mackes_mesh_types::exposure::{self, ExposurePolicy, ExposureTemplate, Tier};
 
 /// The connectivity responder service — holds the shared-substrate root where
-/// the exposure config (`<root>/connect/policy.toml`) lives.
+/// the exposure config (`<root>/connect/policy.toml`) lives + this node's
+/// hostname (CONNECT-2 candidate discovery tags candidates with their host).
 #[derive(Debug, Clone)]
 pub struct ConnectService {
     workgroup_root: PathBuf,
+    hostname: String,
 }
 
 impl ConnectService {
-    /// Build the service rooted at the shared workgroup root.
+    /// Build the service rooted at the shared workgroup root, for `hostname`.
     #[must_use]
-    pub fn new(workgroup_root: PathBuf) -> Self {
-        Self { workgroup_root }
+    pub fn new(workgroup_root: PathBuf, hostname: String) -> Self {
+        Self {
+            workgroup_root,
+            hostname,
+        }
     }
 }
 
 /// Action verbs served on `action/connect/<verb>`.
-pub const ACTION_VERBS: [&str; 6] = [
+pub const ACTION_VERBS: [&str; 7] = [
     "list-services",
+    "list-candidates",
     "set-policy",
     "expose",
     "unexpose",
     "list-templates",
     "set-template",
 ];
+
+/// CONNECT-2 — parse the local-address column of `ss -H -tln` (one socket per
+/// line) into the set of listening TCP ports. The local address is the 4th
+/// whitespace field; the port is the text after its last `:` (handles IPv4,
+/// `addr%iface`, and `[::]`-style IPv6). Pure + testable.
+#[must_use]
+pub fn parse_listening_ports(ss_out: &str) -> Vec<u16> {
+    let mut ports: Vec<u16> = ss_out
+        .lines()
+        .filter_map(|line| {
+            let local = line.split_whitespace().nth(3)?;
+            let port = local.rsplit(':').next()?;
+            port.parse::<u16>().ok()
+        })
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
 
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -74,6 +99,33 @@ pub fn build_reply(svc: &ConnectService, verb: &str, req_body: Option<&str>) -> 
         "list-templates" => {
             let cfg = exposure::load(root);
             json!({ "ok": true, "templates": cfg.template }).to_string()
+        }
+        "list-candidates" => {
+            // CONNECT-2 — auto-discover exposable services from this node's
+            // listening TCP ports; tag each with whether it's already in the
+            // exposure config (the UI opts a candidate in to expose it). The
+            // compute-registry (VM/container) + descriptor sources layer on later.
+            let cfg = exposure::load(root);
+            let ports = local_listening_ports();
+            let candidates: Vec<serde_json::Value> = ports
+                .iter()
+                .map(|&port| {
+                    let id = format!("{}-{port}", svc.hostname);
+                    let configured = cfg
+                        .service
+                        .iter()
+                        .any(|s| s.source.node == svc.hostname && s.source.port == port);
+                    json!({
+                        "id": id,
+                        "node": svc.hostname,
+                        "kind": "host",
+                        "port": port,
+                        "proto": "tcp",
+                        "configured": configured,
+                    })
+                })
+                .collect();
+            json!({ "ok": true, "candidates": candidates }).to_string()
         }
         "set-policy" => {
             let Some(body) = req_body else {
@@ -187,6 +239,19 @@ pub fn build_reply(svc: &ConnectService, verb: &str, req_body: Option<&str>) -> 
     }
 }
 
+/// CONNECT-2 — this node's listening TCP ports via `ss -H -tln` (best-effort:
+/// an empty list if `ss` is absent/fails). Parsed by [`parse_listening_ports`].
+fn local_listening_ports() -> Vec<u16> {
+    std::process::Command::new("ss")
+        .args(["-H", "-tln"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|out| parse_listening_ports(&out))
+        .unwrap_or_default()
+}
+
 /// Run the connect Bus responder loop on the current thread until `should_stop`.
 pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &ConnectService, should_stop: F) {
     let mut cursors: HashMap<String, String> = HashMap::new();
@@ -233,8 +298,31 @@ mod tests {
 
     fn svc() -> (tempfile::TempDir, ConnectService) {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = ConnectService::new(tmp.path().to_path_buf());
+        let svc = ConnectService::new(tmp.path().to_path_buf(), "testhost".into());
         (tmp, svc)
+    }
+
+    #[test]
+    fn parse_listening_ports_handles_ipv4_v6_iface() {
+        // CONNECT-2 — real `ss -H -tln` shapes incl. %iface + [::] IPv6.
+        let out = "LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*\n\
+                   LISTEN 0 128 10.42.0.3:8443 0.0.0.0:*\n\
+                   LISTEN 0 4096 [::]:443 [::]:*\n\
+                   LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n";
+        let ports = parse_listening_ports(out);
+        assert_eq!(ports, vec![22, 53, 443, 8443]); // sorted + deduped
+        assert!(parse_listening_ports("").is_empty());
+    }
+
+    #[test]
+    fn list_candidates_marks_configured() {
+        let (_t, s) = svc();
+        // list-candidates returns an ok envelope (ports depend on the host, so
+        // just assert the shape + that it doesn't error).
+        let r = build_reply(&s, "list-candidates", None);
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true));
+        assert!(v["candidates"].is_array());
     }
 
     #[test]

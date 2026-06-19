@@ -6727,8 +6727,10 @@ fn run_serve(
             .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
         {
             Ok(persist) => {
-                let connect_svc =
-                    mackesd_core::ipc::connect::ConnectService::new(workgroup_root.clone());
+                let connect_svc = mackesd_core::ipc::connect::ConnectService::new(
+                    workgroup_root.clone(),
+                    node_id.clone(),
+                );
                 let resp_shutdown = Arc::clone(&shutdown);
                 std::thread::Builder::new()
                     .name("connect-bus-responder".into())
