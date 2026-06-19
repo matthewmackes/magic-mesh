@@ -48,11 +48,16 @@ pub struct Lease {
 }
 
 impl Lease {
-    fn encode(&self) -> String {
+    /// Serialize to the tab-delimited record (also used as the etcd
+    /// `LEADER_KEY` value by [`crate::substrate::leader`]).
+    #[must_use]
+    pub fn encode(&self) -> String {
         format!("{}\t{}\t{}\n", self.node_id, self.renewed_at_s, self.epoch)
     }
 
-    fn decode(text: &str) -> Option<Self> {
+    /// Parse the tab-delimited record (the lockfile body or the etcd value).
+    #[must_use]
+    pub fn decode(text: &str) -> Option<Self> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return None;
