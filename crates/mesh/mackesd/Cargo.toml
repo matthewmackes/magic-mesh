@@ -430,6 +430,10 @@ assets = [
     # a Workstation-role node by magic-mesh-brand.service (operator lock 2026-06-16).
     { source = "install-helpers/magic-mesh-brand.sh", dest = "/usr/libexec/mackesd/magic-mesh-brand", mode = "755" },
     { source = "packaging/systemd/magic-mesh-brand.service", dest = "/usr/lib/systemd/system/magic-mesh-brand.service", mode = "644" },
+    # MESH-LAYOUT (2026-06-19) — enforce the canonical Cosmic panel layout every
+    # session (operator: the .13 layout is the stock default for all desktops).
+    { source = "install-helpers/mde-enforce-layout.sh", dest = "/usr/libexec/mackesd/mde-enforce-layout", mode = "755" },
+    { source = "packaging/xdg/mde-enforce-layout.desktop", dest = "/etc/xdg/autostart/mde-enforce-layout.desktop", mode = "644" },
     { source = "assets/brand/mackes-carbon-icons.tar.xz", dest = "/usr/share/magic-mesh/brand/mackes-carbon-icons.tar.xz", mode = "644" },
     { source = "assets/brand/cosmic-layout/**/*",  dest = "/usr/share/magic-mesh/brand/cosmic-layout/", mode = "644" },
     { source = "assets/brand/monogram.png",        dest = "/usr/share/magic-mesh/brand/monogram.png",   mode = "644" },

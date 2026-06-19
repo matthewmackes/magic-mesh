@@ -1,12 +1,12 @@
 Some(([
     "com.mackes.MagicMeshApps",
-    "com.system76.CosmicAppletTime",
+    "com.system76.CosmicAppList",
 ], [
+    "com.mackes.MagicMeshApplet",
     "com.system76.CosmicAppletStatusArea",
     "com.system76.CosmicAppletAudio",
     "com.system76.CosmicAppletBluetooth",
     "com.system76.CosmicAppletNetwork",
     "com.system76.CosmicAppletBattery",
-    "com.mackes.MagicMeshApplet",
-    "com.system76.CosmicAppletPower",
+    "com.system76.CosmicAppletTime",
 ]))
