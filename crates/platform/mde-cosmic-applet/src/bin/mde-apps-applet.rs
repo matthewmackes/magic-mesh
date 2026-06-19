@@ -86,6 +86,10 @@ struct AppsApplet {
     /// menu (vs the normal launcher). Set when the launcher button is
     /// right-clicked; the same popup surface renders the power menu instead.
     rclick_open: bool,
+    /// RCLICK-5 — whether the power-menu popup is showing the Run (Win+R) box,
+    /// and its current command text.
+    run_open: bool,
+    run_text: String,
     /// Last load error, shown in the dropdown's empty state.
     error: Option<String>,
     /// APPS-STYLE — the active Carbon palette (dark/light, from the user's MDE
@@ -141,6 +145,10 @@ enum Message {
     LaunchFocus(&'static str),
     /// RCLICK — minimize-all / show the desktop.
     ShowDesktop,
+    /// RCLICK-5 — show the Run (Win+R) box / its input changed / run it.
+    OpenRun,
+    RunInput(String),
+    RunSubmit,
     /// Re-fetch the entry list.
     Refresh,
 }
@@ -375,6 +383,8 @@ impl Application for AppsApplet {
                 toast: None,
                 power_open: false,
                 rclick_open: false,
+                run_open: false,
+                run_text: String::new(),
                 error: None,
                 palette: resolve_palette(),
             },
@@ -514,6 +524,26 @@ impl Application for AppsApplet {
                 let _ = std::process::Command::new("cosmic-osd")
                     .arg("show-desktop")
                     .spawn();
+                self.rclick_open = false;
+                if let Some(id) = self.popup.take() {
+                    return cosmic::task::message(cosmic::Action::Cosmic(
+                        cosmic::app::Action::Surface(destroy_popup(id)),
+                    ));
+                }
+            }
+            Message::OpenRun => {
+                // RCLICK-5 — swap the power menu for the Run box (same popup).
+                self.run_open = true;
+                self.run_text.clear();
+            }
+            Message::RunInput(s) => self.run_text = s,
+            Message::RunSubmit => {
+                let cmd = self.run_text.trim().to_string();
+                if !cmd.is_empty() {
+                    // Win+R parity: run the line through a shell so args/pipes work.
+                    let _ = std::process::Command::new("sh").arg("-c").arg(&cmd).spawn();
+                }
+                self.run_open = false;
                 self.rclick_open = false;
                 if let Some(id) = self.popup.take() {
                     return cosmic::task::message(cosmic::Action::Cosmic(
@@ -672,6 +702,41 @@ impl AppsApplet {
     /// Header (title + QNM-Shared usage bar) → quick-link tiles → underline tabs →
     /// search → result rows (zebra + selected blue-accent, click-to-expand detail)
     /// → toast → operator/power footer. 460×720, all Carbon tokens (light + dark).
+    /// RCLICK-5 — the Run (Win+R) box: a single command line that runs through a
+    /// shell on submit. Lives in the power-menu popup (no separate window).
+    fn run_view(&self) -> Element<'_, Message> {
+        use cosmic::widget::{button, column, text, text_input, Space};
+        let p = self.palette;
+        let sizes = FontSize::defaults();
+        let input = text_input("Type a command, then Enter…", &self.run_text)
+            .on_input(Message::RunInput)
+            .on_submit(|_| Message::RunSubmit)
+            .width(Length::Fill);
+        cosmic::iced::widget::container(
+            column(vec![
+                text("Run")
+                    .size(TypeRole::Heading.size_in(sizes))
+                    .class(cosmic::theme::Text::Color(carbon(p.text)))
+                    .into(),
+                Space::new().height(Length::Fixed(10.0)).into(),
+                input.into(),
+                Space::new().height(Length::Fixed(10.0)).into(),
+                button::custom(
+                    text("Run")
+                        .size(TypeRole::Body.size_in(sizes))
+                        .class(cosmic::theme::Text::Color(carbon(p.text))),
+                )
+                .on_press(Message::RunSubmit)
+                .class(cosmic::theme::Button::Standard)
+                .into(),
+            ])
+            .spacing(0),
+        )
+        .padding(12)
+        .width(Length::Fill)
+        .into()
+    }
+
     /// RCLICK — the Win+X-style right-click power menu (functional parity with
     /// the Windows 10 Start right-click menu, MCNF-augmented). Each row launches
     /// a real target (app spawn / elevated `pkexec` / `mde-workbench --focus`
@@ -739,6 +804,7 @@ impl AppsApplet {
             row_item("\u{25D4}\u{FE0E}", "Notification Hub", Message::LaunchLocal("mde-notify-center".into())),
             row_item("\u{2317}\u{FE0E}", "Join the Mesh", Message::LaunchLocal("mde-enroll".into())),
             divider(),
+            row_item("\u{2BC8}", "Run…", Message::OpenRun),
             row_item("\u{25A1}", "Show Desktop", Message::ShowDesktop),
         ];
         let mut col = column(items).spacing(0).width(Length::Fill);
@@ -770,9 +836,13 @@ impl AppsApplet {
 
     fn dropdown(&self) -> Element<'_, Message> {
         // RCLICK — the same popup surface renders the Win+X power menu when it
-        // was opened by a secondary-click.
+        // was opened by a secondary-click (or the Run box within it).
         if self.rclick_open {
-            return self.power_menu();
+            return if self.run_open {
+                self.run_view()
+            } else {
+                self.power_menu()
+            };
         }
         use cosmic::widget::{button, column, row, scrollable, text, text_input, Space};
         let p = self.palette;
