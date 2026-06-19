@@ -66,9 +66,46 @@ pub fn desired_ingress_ports(cfg: &exposure::ExposureConfig, hostname: &str) -> 
 /// packaging follow-on); writing the fragment + reloading Caddy is this worker.
 pub const CADDY_FRAGMENT_DIR: &str = "/etc/caddy/Caddyfile.d";
 
+/// CONNECT-5 — raw TCP/UDP stream forwards for this lighthouse: `(public_port,
+/// proto, service_overlay_ip)` for every public **tcp/udp** service bound here,
+/// resolving the hosting node's overlay IP via `resolve`. Streams are forwarded
+/// at the firewall (firewalld `forward-port` → the overlay endpoint) rather than
+/// through Caddy — no `caddy-l4` plugin needed. A node whose overlay IP can't be
+/// resolved yet is skipped (it reconciles on a later tick). Deterministic. Pure.
+#[must_use]
+pub fn desired_forwards(
+    cfg: &exposure::ExposureConfig,
+    lighthouse: &str,
+    resolve: impl Fn(&str) -> Option<String>,
+) -> Vec<(u16, String, String)> {
+    let mut fwds: Vec<(u16, String, String)> = cfg
+        .public_services()
+        .into_iter()
+        .filter(|s| matches!(s.mode, ProtoMode::Tcp | ProtoMode::Udp))
+        .filter(|s| {
+            s.ingress
+                .as_ref()
+                .is_some_and(|b| b.lighthouse == lighthouse)
+        })
+        .filter_map(|s| {
+            let proto = if s.mode == ProtoMode::Udp {
+                "udp"
+            } else {
+                "tcp"
+            };
+            let ip = resolve(&s.source.node)?;
+            Some((s.source.port, proto.to_string(), ip))
+        })
+        .collect();
+    fwds.sort();
+    fwds.dedup();
+    fwds
+}
+
 /// The exposure-driven enforcement worker: opens the policy's ingress firewall
-/// ports (CONNECT-3) AND renders/writes this node's Caddy ingress config
-/// (CONNECT-4) — one "apply this node's exposure" reconcile per tick.
+/// ports (CONNECT-3), forwards raw TCP/UDP streams to the overlay (CONNECT-5),
+/// AND renders/writes this node's Caddy ingress config (CONNECT-4) — one "apply
+/// this node's exposure" reconcile per tick.
 pub struct ConnectFirewallWorker {
     workgroup_root: PathBuf,
     hostname: String,
@@ -104,6 +141,59 @@ impl ConnectFirewallWorker {
     pub fn with_caddy_dir(mut self, dir: PathBuf) -> Self {
         self.caddy_dir = dir;
         self
+    }
+
+    /// CONNECT-5 — apply raw TCP/UDP stream forwards (public port → the service's
+    /// overlay endpoint) via firewalld `forward-port` (+ masquerade so replies
+    /// route back). Additive + idempotent; resolves node→overlay-IP from the peer
+    /// directory. Returns the number of forward rules applied (0 when none bound
+    /// here / no firewalld / unresolved). Best-effort.
+    fn apply_forwards(&self, cfg: &exposure::ExposureConfig) -> usize {
+        if self.firewall_cmd.is_empty() {
+            return 0;
+        }
+        let peers = mackes_mesh_types::peers::read_peers(&mackes_mesh_types::peers::peers_dir(
+            &self.workgroup_root,
+        ));
+        let resolve = |node: &str| -> Option<String> {
+            peers
+                .iter()
+                .find(|p| p.hostname == node)
+                .and_then(|p| p.overlay_ip.clone())
+        };
+        let fwds = desired_forwards(cfg, &self.hostname, resolve);
+        if fwds.is_empty() {
+            return 0;
+        }
+        // forward-port to a remote (overlay) addr needs masquerade for the return path.
+        let mut masq = std::process::Command::new(self.firewall_cmd);
+        masq.args(["--permanent", "--zone", PUBLIC_ZONE, "--add-masquerade"]);
+        let _ = crate::workers::proc::status_with_timeout(
+            masq,
+            crate::workers::proc::DEFAULT_CMD_TIMEOUT,
+        );
+        let mut applied = 0usize;
+        for (port, proto, ip) in &fwds {
+            let spec = format!("port={port}:proto={proto}:toaddr={ip}:toport={port}");
+            let mut cmd = std::process::Command::new(self.firewall_cmd);
+            cmd.args([
+                "--permanent",
+                "--zone",
+                PUBLIC_ZONE,
+                "--add-forward-port",
+                &spec,
+            ]);
+            if crate::workers::proc::status_with_timeout(
+                cmd,
+                crate::workers::proc::DEFAULT_CMD_TIMEOUT,
+            )
+            .map(|s| s.success())
+            .unwrap_or(false)
+            {
+                applied += 1;
+            }
+        }
+        applied
     }
 
     /// CONNECT-4 — render this node's Caddy ingress fragment from the policy and
@@ -149,6 +239,8 @@ impl ConnectFirewallWorker {
         // when no firewall ports change, e.g. to clear the fragment after an
         // unexpose). Best-effort + no-op when Caddy isn't installed here.
         let _ = self.apply_caddy(&cfg);
+        // CONNECT-5 — raw TCP/UDP stream forwards (firewalld forward-port).
+        let _ = self.apply_forwards(&cfg);
         let desired = desired_ingress_ports(&cfg, &self.hostname);
         if desired.is_empty() || self.firewall_cmd.is_empty() {
             return 0;
@@ -265,6 +357,21 @@ mod tests {
             ..Default::default()
         });
         assert!(desired_ingress_ports(&cfg, "LH-01").is_empty());
+    }
+
+    #[test]
+    fn desired_forwards_resolves_overlay_ip_for_streams_only() {
+        // CONNECT-5 — tcp/udp public services bound here get a forward to the
+        // node's overlay IP; http services + unresolved nodes are excluded.
+        let mut cfg = ExposureConfig::default();
+        cfg.upsert(public_svc("game", "LH-01", 25565, ProtoMode::Tcp)); // node "n"
+        cfg.upsert(public_svc("web", "LH-01", 3000, ProtoMode::Http)); // http → not a forward
+        let resolve = |node: &str| (node == "n").then(|| "10.42.0.9".to_string());
+        let fwds = desired_forwards(&cfg, "LH-01", resolve);
+        assert_eq!(fwds, vec![(25565, "tcp".into(), "10.42.0.9".into())]);
+        // Unresolvable node → skipped (reconciles later).
+        let none = desired_forwards(&cfg, "LH-01", |_| None);
+        assert!(none.is_empty());
     }
 
     #[test]
