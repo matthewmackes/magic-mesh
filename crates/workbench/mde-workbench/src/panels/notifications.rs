@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use cosmic::iced::widget::{checkbox, column, pick_list, row, text, text_input};
+use cosmic::iced::widget::{checkbox, column, pick_list, row, text};
 use cosmic::iced::{Element, Length, Task};
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -82,7 +82,6 @@ pub enum Message {
     Saved,
     DndChanged(bool),
     LocationChanged(String),
-    ExpireMsChanged(String),
     SaveClicked,
     /// NOTIFY-6 — master sound switch toggled (persists immediately).
     SoundMasterChanged(bool),
@@ -178,13 +177,6 @@ impl NotificationsPanel {
                 self.location = v;
                 Task::none()
             }
-            Message::ExpireMsChanged(v) => {
-                // Accept any input — validate on Save so the
-                // user can type a multi-digit number without
-                // intermediate state errors.
-                self.expire_ms_input = v;
-                Task::none()
-            }
             Message::SaveClicked => {
                 if self.busy {
                     return Task::none();
@@ -248,7 +240,7 @@ impl NotificationsPanel {
         let apply_btn = variant_button(
             apply_label,
             ButtonVariant::Primary,
-            (!self.busy).then(|| crate::Message::Notifications(Message::SaveClicked)),
+            (!self.busy).then_some(crate::Message::Notifications(Message::SaveClicked)),
             crate::live_theme::palette(),
         );
         let location_pick: pick_list::PickList<
@@ -290,14 +282,21 @@ impl NotificationsPanel {
         }
 
         column![
+            // NOTIFY-PREFS-2 — make the panel scope self-evident (the operator
+            // had to ask what it controls vs the Notification Hub).
+            text("Toast popups + sounds for this machine — the alert list lives in the Notification Hub.")
+                .size(12),
             checkbox(self.dnd)
                 .label("Do Not Disturb")
                 .on_toggle(|v| { crate::Message::Notifications(Message::DndChanged(v)) }),
             row![text("Placement").width(Length::Fixed(160.0)), location_pick,].spacing(12),
+            // NOTIFY-PREFS-1 — the default expire is fixed at 5000 ms (Phase C.5)
+            // and the toast daemon doesn't read a per-machine override, so this is
+            // shown read-only rather than as an editable field that's silently
+            // ignored.
             row![
-                text("Default expire (ms)").width(Length::Fixed(160.0)),
-                text_input("5000", &self.expire_ms_input)
-                    .on_input(|v| { crate::Message::Notifications(Message::ExpireMsChanged(v)) }),
+                text("Default expire").width(Length::Fixed(160.0)),
+                text(format!("{DEFAULT_EXPIRE_MS} ms — fixed")).size(13),
             ]
             .spacing(12),
             row![apply_btn, text(&self.status).size(13)].spacing(12),
