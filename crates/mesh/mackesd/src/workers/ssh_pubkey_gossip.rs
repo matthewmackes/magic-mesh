@@ -128,17 +128,38 @@ impl SshPubkeyGossipWorker {
         self.workgroup_root.join("ssh-keys")
     }
 
-    /// One gossip pass. Every step is best-effort + logged; a missing
-    /// share (mesh storage not mounted yet) is a quiet no-op so the
-    /// worker degrades gracefully pre-enrollment (§2 posture).
+    /// One gossip pass across every relevant user. SSH-MESH-NOCREDS-1: gossip
+    /// for the service user (`self.home`, typically root — the flat back-compat
+    /// lane) AND every regular desktop user (uid 1000–60000 under `/home`, e.g.
+    /// the operator `mm`), each in its own share lane, so `ssh <operator>@<peer>`
+    /// is key-only too — not just `ssh root@<peer>` (the live gap: keys only
+    /// reached root's `authorized_keys`). Best-effort + logged.
     async fn tick(&self) {
-        let ssh_dir = self.home.join(".ssh");
+        // Service user — flat lane (`ssh-keys/<host>.pub`), back-compat.
+        self.gossip_one(&self.home, &self.share_dir(), None).await;
+        // Operator accounts — per-user lane (`ssh-keys/<user>/<host>.pub`); the
+        // keypair + files are chowned to the user so the SSH client (running as
+        // that user) can read its own private key.
+        for (user, uid, gid, home) in operator_users() {
+            let lane = self.share_dir().join(&user);
+            self.gossip_one(&home, &lane, Some((uid, gid))).await;
+        }
+    }
+
+    /// One gossip pass for a single user's `home` + share `lane`. Every step is
+    /// best-effort + logged; a missing share (mesh storage not mounted yet) is a
+    /// quiet no-op so the worker degrades gracefully pre-enrollment (§2 posture).
+    /// `owner` chowns the generated keypair + `authorized_keys` to that user
+    /// (None = leave as the running user, i.e. root for the service lane).
+    async fn gossip_one(&self, home: &Path, lane: &Path, owner: Option<(u32, u32)>) {
+        let ssh_dir = home.join(".ssh");
         let key_path = ssh_dir.join("id_ed25519");
         let pub_path = ssh_dir.join("id_ed25519.pub");
 
         // 1. Ensure the user keypair exists.
         if !pub_path.exists() {
             let _ = tokio::fs::create_dir_all(&ssh_dir).await;
+            chown_to(&ssh_dir, owner);
             let comment = format!("mde-mesh@{}", self.hostname);
             let mut keygen = tokio::process::Command::new("ssh-keygen");
             keygen
@@ -152,6 +173,10 @@ impl SshPubkeyGossipWorker {
             .await
             {
                 Ok(st) if st.success() => {
+                    // The private key must be readable by the user whose SSH
+                    // client offers it — chown it (+ the pub) to them.
+                    chown_to(&key_path, owner);
+                    chown_to(&pub_path, owner);
                     tracing::info!("ssh_pubkey_gossip: generated {}", key_path.display());
                 }
                 Ok(st) => {
@@ -173,13 +198,12 @@ impl SshPubkeyGossipWorker {
             return;
         }
 
-        // 2. Publish into the replicated share (write-on-change).
-        let share = self.share_dir();
-        if tokio::fs::create_dir_all(&share).await.is_err() {
+        // 2. Publish into the replicated share lane (write-on-change).
+        if tokio::fs::create_dir_all(lane).await.is_err() {
             // Mesh storage not mounted — quiet no-op this tick.
             return;
         }
-        let mine = share.join(format!("{}.pub", self.hostname));
+        let mine = lane.join(format!("{}.pub", self.hostname));
         let current = tokio::fs::read_to_string(&mine).await.unwrap_or_default();
         if current.trim() != pubkey {
             if let Err(e) = tokio::fs::write(&mine, format!("{pubkey}\n")).await {
@@ -187,9 +211,9 @@ impl SshPubkeyGossipWorker {
             }
         }
 
-        // 3. Collect every peer's published key (sorted for stability).
+        // 3. Collect every peer's published key in this lane (sorted, stable).
         let mut keys: Vec<String> = Vec::new();
-        if let Ok(mut rd) = tokio::fs::read_dir(&share).await {
+        if let Ok(mut rd) = tokio::fs::read_dir(lane).await {
             while let Ok(Some(entry)) = rd.next_entry().await {
                 let p = entry.path();
                 if p.extension().is_some_and(|e| e == "pub") {
@@ -214,13 +238,55 @@ impl SshPubkeyGossipWorker {
         if merged != existing {
             if tokio::fs::write(&ak_path, &merged).await.is_ok() {
                 set_private_perms(&ak_path).await;
+                chown_to(&ak_path, owner);
                 tracing::info!(
                     keys = keys.len(),
+                    home = %ssh_dir.display(),
                     "ssh_pubkey_gossip: authorized_keys managed block updated"
                 );
             }
         }
     }
+}
+
+/// SSH-MESH-NOCREDS-1 — chown a path to `(uid, gid)` when an owner is given
+/// (the operator-user lanes; the service lane passes `None` to leave it root).
+/// Best-effort: mackesd runs as root, so this succeeds for real users + is a
+/// harmless no-op otherwise.
+fn chown_to(path: &Path, owner: Option<(u32, u32)>) {
+    #[cfg(unix)]
+    if let Some((uid, gid)) = owner {
+        let _ = std::os::unix::fs::chown(path, Some(uid), Some(gid));
+    }
+    #[cfg(not(unix))]
+    let _ = (path, owner);
+}
+
+/// SSH-MESH-NOCREDS-1 — the regular desktop/operator accounts (uid 1000–60000
+/// with a home under `/home`) that need passwordless peer→peer SSH, parsed from
+/// `/etc/passwd` (no extra dep). Returns `(user, uid, gid, home)`.
+fn operator_users() -> Vec<(String, u32, u32, std::path::PathBuf)> {
+    let Ok(contents) = std::fs::read_to_string("/etc/passwd") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in contents.lines() {
+        let f: Vec<&str> = line.split(':').collect();
+        if f.len() < 7 {
+            continue;
+        }
+        let (Ok(uid), Ok(gid)) = (f[2].parse::<u32>(), f[3].parse::<u32>()) else {
+            continue;
+        };
+        if !(1000..60000).contains(&uid) {
+            continue;
+        }
+        let home = std::path::PathBuf::from(f[5]);
+        if home.starts_with("/home") && home.is_dir() {
+            out.push((f[0].to_string(), uid, gid, home));
+        }
+    }
+    out
 }
 
 /// chmod 600 — sshd refuses group/world-readable authorized_keys
@@ -319,7 +385,9 @@ mod tests {
 
         let w = SshPubkeyGossipWorker::new(root.path().to_path_buf(), "pine".into())
             .with_home(home.path().to_path_buf());
-        w.tick().await;
+        // Exercise the single-user pass directly (the service/root lane) — never
+        // `tick()`, which enumerates real /home users + would touch their ~/.ssh.
+        w.gossip_one(home.path(), &w.share_dir(), None).await;
 
         // Published our key…
         let published = std::fs::read_to_string(share.join("pine.pub")).unwrap();
