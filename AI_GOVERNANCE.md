@@ -125,6 +125,17 @@ gated** (`lint-mesh-boundary.sh`): the dependency graph must stay clean of the
 EOL'd desktop. New code is **glue, not reimplementation** — reuse the existing
 crates.
 
+**Public network boundary (CONNECT, 11.0+).** The internet-facing surface is
+**default-deny**: firewalld's `public` zone drops everything not explicitly
+allowed, and MCNF code only ever **widens** that surface for a service the
+operator **explicitly exposed** (the `connect_firewall` worker is *additive* —
+it opens a policy-declared ingress port, never a blanket allow, and never removes
+the foundational SSH/Nebula/enroll rules). The only always-public layer is the
+foundational one (§1 tier-1: Nebula/4242 + SSH/22 + enroll/4243); everything else
+reaches the public **only** through the lighthouse reverse-proxy ingress per the
+per-service exposure policy. This governs the public boundary only — intra-mesh
+trust stays flat / open-mesh (§8).
+
 ## §7 — Definition of Done
 
 A change is done only when it is **runtime-reachable and observably works** — no

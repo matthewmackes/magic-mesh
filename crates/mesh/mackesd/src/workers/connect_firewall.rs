@@ -213,6 +213,18 @@ mod tests {
     }
 
     #[test]
+    fn default_deny_no_public_surface_without_explicit_policy() {
+        // CONNECT-10 — the public-boundary default-deny invariant FROM OUR CODE:
+        // with no exposure policy at all, this worker opens ZERO public ports on
+        // any node. The internet surface only widens for an explicitly-exposed
+        // service; the foundational SSH/Nebula/enroll allows are owned by
+        // firewall_preset + firewalld's public-zone default, never removed here.
+        let empty = ExposureConfig::default();
+        assert!(desired_ingress_ports(&empty, "LH-01").is_empty());
+        assert!(desired_ingress_ports(&empty, "any-node").is_empty());
+    }
+
+    #[test]
     fn tick_is_noop_without_firewall_cmd() {
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = ExposureConfig::default();
