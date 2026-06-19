@@ -20,6 +20,8 @@ pub mod header;
 pub mod keyboard;
 pub mod launcher;
 pub mod live_theme;
+/// SUBSTRATE-8 — read the mesh peer directory over `action/mesh/directory`.
+pub mod mesh_directory;
 pub mod model;
 pub mod panel_chrome;
 pub mod panels;

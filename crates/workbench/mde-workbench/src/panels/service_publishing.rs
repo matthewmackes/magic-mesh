@@ -323,24 +323,25 @@ const CANONICAL_SERVICES: [(&str, &str, u16, &str); 7] = [
 /// Build the **fleet-wide** published-services summary: the 7 canonical services
 /// for every enrolled peer in the mesh (operator directive 2026-06-18 — "if it's
 /// responsible to show those 7 service types, show them from all over the
-/// network"). Reads the replicated peer roster (`<workgroup>/peers/*.json`) — the
-/// same cross-node source the Peers panel uses — so it needs no per-node daemon
-/// query. Falls back to the legacy local-only mackesd reply when the roster is
-/// empty (QNM-Shared not mounted yet) so a standalone node still shows its own.
+/// network"). SUBSTRATE-8 — reads the peer directory over `action/mesh/directory`
+/// (etcd-or-fs behind the RPC) rather than a direct `/mnt/mesh-storage` read, so
+/// it survives the substrate cutover. Falls back to the legacy local-only mackesd
+/// reply when the directory is empty so a standalone node still shows its own.
 #[must_use]
 pub fn fetch_summary() -> (Vec<ServiceRow>, Option<String>) {
-    let peers_dir = mackes_mesh_types::peers::default_workgroup_root().join("peers");
-    let peers = mackes_mesh_types::peers::read_peers(&peers_dir);
+    let peers = crate::mesh_directory::fetch_peers();
     let rows = fleet_rows_from_peers(&peers);
     if !rows.is_empty() {
         return (rows, None);
     }
-    // Fallback: no replicated roster — show at least this node's services.
+    // Fallback: empty directory — show at least this node's services.
     match crate::dbus::nebula_request("published-services") {
         Some(json) => parse_summary(&json),
         None => (
             Vec::new(),
-            Some("no peer roster on QNM-Shared and mackesd not reachable — service summary unavailable".into()),
+            Some(
+                "no peer directory and mackesd not reachable — service summary unavailable".into(),
+            ),
         ),
     }
 }
