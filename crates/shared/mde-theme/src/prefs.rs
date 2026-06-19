@@ -333,6 +333,7 @@ mod tests {
                 colorblind_safe: false,
                 reduce_motion: true,
             },
+            motion: MotionPrefs::default(),
         };
         let s = prefs.to_toml_string().unwrap();
         let parsed: Preferences = toml::from_str(&s).unwrap();
