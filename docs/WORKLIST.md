@@ -1043,7 +1043,7 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
 - [ ] **MUSIC-ALBUMS-4: header search + Sort** (filter artists/albums/songs).
 - [✓] **MUSIC-ALBUMS-5: 80px persistent player** (mini-art + shuffle/prev/play/next/repeat + scrubber + volume) reusing the existing playback-bar state, on every view. DONE 2026-06-18: existing persistent playback bar reused as the player region.
 - [ ] **MUSIC-ALBUMS-6: account/avatar + Settings routing** (mesh routing prefs).
-- [ ] **MUSIC-ALBUMS-7: mde-theme Carbon Blue-50 accent token** (`#4589ff`) if absent, palette-tested (§4) — active-nav rail + hover outline read it.
+- [✓] **MUSIC-ALBUMS-7: mde-theme Carbon Blue-50 accent token** (`#4589ff`) if absent, palette-tested (§4) — active-nav rail + hover outline read it.
 
 ## ROUTING-VALIDATE — Routing overlay-reachability never returns a result (operator bug-testing, 2026-06-18)
 - [✓] **ROUTING-VALIDATE-1: "Run validation now" requests a run but the result never comes back.** DONE 2026-06-18: poll the verdict on a 3s cadence (bounded MAX_POLLS) after requesting a run; tests updated.
@@ -1249,7 +1249,7 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
 - [✓] **MUSIC-RESPONSIVE-7: cache the radio station list daemon-side.** Short-TTL cache of `getInternetRadioStations` so only the first call is slow. **Acceptance:** second Internet-Radio open is instant.
 - [✓] **MUSIC-RESPONSIVE-8: optimistic transport controls.** Flip play/pause/next state immediately, reconcile from the async reply. **Acceptance:** transport buttons respond with no round-trip lag.
 - [ ] **MUSIC-RESPONSIVE-9: virtualize large grids.** Render only the visible window (+overscan) of cards for multi-hundred-card libraries. **Acceptance:** a 500-card grid scrolls smoothly.
-- [ ] **MUSIC-RESPONSIVE-10: warm the daemon + readiness gate.** Daemon pre-opens Airsonic + primes the library cache on start; GUI gates the first fetch on a cheap healthz/ready ping (retry from -1 as fallback). **Acceptance:** launch-time cold path no longer produces a timeout.
+- [ ] **MUSIC-RESPONSIVE-10: warm the daemon + readiness gate.** *(in progress note 2026-06-19: the substantive fix is a persistent Airsonic `Client` in `bus_responder::serve` reused across handlers — today each browse handler does `creds::load()+Client::new` per request, so there's no connection reuse to warm. Deferred behind that refactor; MUSIC-RESPONSIVE-1's retry-once remains the cold-boot fallback. MUSIC-RESPONSIVE-7 already primes the radio cache on first call.)* Daemon pre-opens Airsonic + primes the library cache on start; GUI gates the first fetch on a cheap healthz/ready ping (retry from -1 as fallback). **Acceptance:** launch-time cold path no longer produces a timeout.
 
 ### APPS-WIDE — wider Applications launcher + Favorites icon grid (operator 2026-06-18)
 - [✓] **APPS-WIDE-1: double the launcher width, keep the golden ratio.** DONE 2026-06-18: the dropdown was a 460×744 portrait golden rectangle; doubled width to 920 and set height to its golden complement (920/φ ≈ 569) so it stays a golden rectangle, now landscape. Single-sourced as `MENU_WIDTH`/`MENU_HEIGHT`/`GOLDEN_RATIO`; the auto-sized popup follows the body container.

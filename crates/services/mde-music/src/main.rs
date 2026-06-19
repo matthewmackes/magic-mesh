@@ -1635,7 +1635,9 @@ impl State {
                                 .width(Length::Fixed(160.0))
                                 .padding(0)
                                 .sty({
-                                    let accent = carbon(cpal.accent, 1.0);
+                                    // MUSIC-ALBUMS-7 — card hover outline reads
+                                    // the Carbon Blue-50 accent token (#4589ff).
+                                    let accent = carbon(mde_theme::carbon::BLUE_50, 1.0);
                                     move |_t, status| cosmic::iced::widget::button::Style {
                                         background: None,
                                         border: cosmic::iced::Border {
