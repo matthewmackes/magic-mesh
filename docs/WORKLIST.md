@@ -1042,7 +1042,7 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
 - [✓] **MUSIC-ALBUMS-3: Albums grid** (auto-fill 168px cards — square art + 2-line title + artist, hover accent outline) bound to the real library via the windowed art loader (no large-library stall). DONE 2026-06-18: square art tile + 2-line title + hover accent on album cards.
 - [✓] **MUSIC-ALBUMS-4: header search + Sort** (filter artists/albums/songs).
 - [✓] **MUSIC-ALBUMS-5: 80px persistent player** (mini-art + shuffle/prev/play/next/repeat + scrubber + volume) reusing the existing playback-bar state, on every view. DONE 2026-06-18: existing persistent playback bar reused as the player region.
-- [ ] **MUSIC-ALBUMS-6: account/avatar + Settings routing** (mesh routing prefs).
+- [✓] **MUSIC-ALBUMS-6: account/avatar + Settings routing** (mesh routing prefs).
 - [✓] **MUSIC-ALBUMS-7: mde-theme Carbon Blue-50 accent token** (`#4589ff`) if absent, palette-tested (§4) — active-nav rail + hover outline read it.
 
 ## ROUTING-VALIDATE — Routing overlay-reachability never returns a result (operator bug-testing, 2026-06-18)

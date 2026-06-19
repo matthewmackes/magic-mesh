@@ -1328,6 +1328,27 @@ impl State {
         }
         col = col.push(Space::new().height(Length::Fixed(12.0)));
         col = col.push(self.sidebar_item("Settings", Message::OpenRouting, false));
+        // MUSIC-ALBUMS-6 — account/avatar chip pinned to the sidebar bottom: an
+        // accent avatar + the live Airsonic connection line; clicking routes to
+        // Settings (mesh routing prefs).
+        col = col.push(Space::new().height(Length::Fill));
+        let conn = if self.connection.is_empty() {
+            "Not connected".to_string()
+        } else {
+            self.connection.clone()
+        };
+        let avatar = container(text("\u{25CF}").size(14).colr(carbon(p.accent, 1.0)))
+            .width(Length::Fixed(28.0))
+            .center_x(Length::Fixed(28.0));
+        let account = button(
+            row![avatar, text(conn).size(12).colr(carbon(p.text_muted, 1.0))]
+                .spacing(8)
+                .align_y(cosmic::iced::Alignment::Center),
+        )
+        .on_press(Message::OpenRouting)
+        .width(Length::Fill)
+        .padding([8, 16]);
+        col = col.push(account);
         let bg = carbon(p.background, 1.0);
         container(col)
             .height(Length::Fill)
