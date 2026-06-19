@@ -1246,8 +1246,8 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
 - [ ] **MUSIC-RESPONSIVE-4: serve cover art by file path, not base64-over-bus.** Daemon writes the image to a cache file and returns the path; GUI loads directly. **Acceptance:** cover RPCs carry a path not bytes; bus spool no longer grows with art.
 - [ ] **MUSIC-RESPONSIVE-5: reuse the daemon SQLite handle + runtime per browse.** Pool the `Persist` connection/runtime instead of open+build per `library::fetch`. **Acceptance:** browse latency drops the per-request open overhead.
 - [ ] **MUSIC-RESPONSIVE-6: skeleton placeholders while loading.** Render greyed Carbon skeleton tiles (known column count) instead of a blank pane. **Acceptance:** navigation shows skeletons within one frame.
-- [ ] **MUSIC-RESPONSIVE-7: cache the radio station list daemon-side.** Short-TTL cache of `getInternetRadioStations` so only the first call is slow. **Acceptance:** second Internet-Radio open is instant.
-- [ ] **MUSIC-RESPONSIVE-8: optimistic transport controls.** Flip play/pause/next state immediately, reconcile from the async reply. **Acceptance:** transport buttons respond with no round-trip lag.
+- [✓] **MUSIC-RESPONSIVE-7: cache the radio station list daemon-side.** Short-TTL cache of `getInternetRadioStations` so only the first call is slow. **Acceptance:** second Internet-Radio open is instant.
+- [✓] **MUSIC-RESPONSIVE-8: optimistic transport controls.** Flip play/pause/next state immediately, reconcile from the async reply. **Acceptance:** transport buttons respond with no round-trip lag.
 - [ ] **MUSIC-RESPONSIVE-9: virtualize large grids.** Render only the visible window (+overscan) of cards for multi-hundred-card libraries. **Acceptance:** a 500-card grid scrolls smoothly.
 - [ ] **MUSIC-RESPONSIVE-10: warm the daemon + readiness gate.** Daemon pre-opens Airsonic + primes the library cache on start; GUI gates the first fetch on a cheap healthz/ready ping (retry from -1 as fallback). **Acceptance:** launch-time cold path no longer produces a timeout.
 

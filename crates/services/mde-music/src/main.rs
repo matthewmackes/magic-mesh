@@ -1119,12 +1119,23 @@ impl State {
                 Task::perform(nowplaying::seek(ms), |_| Message::TransportDone)
             }
             Message::PlayPause => {
-                Task::perform(nowplaying::play_pause(self.now_state.playing), |_| {
-                    Message::TransportDone
-                })
+                // MUSIC-RESPONSIVE-8 — optimistic: flip the play icon immediately,
+                // then reconcile from the real state on TransportDone. `play_pause`
+                // takes the PRE-flip state to decide the action.
+                let was = self.now_state.playing;
+                self.now_state.playing = !was;
+                Task::perform(nowplaying::play_pause(was), |_| Message::TransportDone)
             }
-            Message::SkipNext => Task::perform(nowplaying::skip_next(), |_| Message::TransportDone),
-            Message::SkipPrev => Task::perform(nowplaying::skip_prev(), |_| Message::TransportDone),
+            Message::SkipNext => {
+                // MUSIC-RESPONSIVE-8 — a skip keeps playing; show that immediately,
+                // the new track title reconciles on TransportDone.
+                self.now_state.playing = true;
+                Task::perform(nowplaying::skip_next(), |_| Message::TransportDone)
+            }
+            Message::SkipPrev => {
+                self.now_state.playing = true;
+                Task::perform(nowplaying::skip_prev(), |_| Message::TransportDone)
+            }
             Message::TransportDone => Task::perform(nowplaying::fetch_state(), |r| {
                 Message::StateLoaded(r.unwrap_or_default())
             }),

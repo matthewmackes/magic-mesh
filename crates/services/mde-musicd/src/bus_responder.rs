@@ -26,6 +26,13 @@ use serde_json::json;
 use crate::airsonic::Client;
 use crate::creds;
 use crate::engine::{Engine, SourceCodec};
+
+/// MUSIC-RESPONSIVE-7 — short-TTL cache of the Internet-radio station list so
+/// only the first `list-radio` open pays the upstream round-trip (the saved
+/// station list rarely changes). 5-minute TTL; in-process (per daemon).
+static RADIO_CACHE: std::sync::Mutex<Option<(Instant, serde_json::Value)>> =
+    std::sync::Mutex::new(None);
+const RADIO_CACHE_TTL: Duration = Duration::from_secs(300);
 use crate::queue::{self, Queue};
 use crate::state::{self, MusicState};
 
@@ -392,11 +399,29 @@ fn dispatch_browse(
                 .map(|c| json!({ "podcasts": c }))
                 .map_err(|e| e.to_string()),
             // SVC-3 — the Radio hub card: the server's saved stations.
-            "list-radio" => client
-                .get_internet_radio_stations()
-                .await
-                .map(|r| json!({ "radio": r }))
-                .map_err(|e| e.to_string()),
+            // MUSIC-RESPONSIVE-7 — serve a fresh cached list (no upstream call);
+            // only the first open (or a stale cache) hits the server.
+            "list-radio" => {
+                let cached = RADIO_CACHE.lock().ok().and_then(|g| {
+                    g.as_ref()
+                        .filter(|(at, _)| at.elapsed() < RADIO_CACHE_TTL)
+                        .map(|(_, v)| v.clone())
+                });
+                if let Some(v) = cached {
+                    Ok(v)
+                } else {
+                    match client.get_internet_radio_stations().await {
+                        Ok(r) => {
+                            let v = json!({ "radio": r });
+                            if let Ok(mut g) = RADIO_CACHE.lock() {
+                                *g = Some((Instant::now(), v.clone()));
+                            }
+                            Ok(v)
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+            }
             "podcast-episodes" => {
                 let id = song_id_from(body).unwrap_or_default();
                 client
