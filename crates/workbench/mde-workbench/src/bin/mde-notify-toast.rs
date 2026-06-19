@@ -248,49 +248,12 @@ fn update(state: &mut Toaster, message: Message) -> Task<Message> {
     Task::none()
 }
 
-/// NOTIFY-DUCK — "music goes around the alert": when `mde-musicd` is actively
-/// playing, duck its volume under the alert chime, play the chime, then restore
-/// the prior volume. The whole dance runs on a detached thread so the layer-
-/// shell UI never blocks, and it's fully best-effort — no musicd / nothing
-/// playing / no audio player all degrade to just the chime (or silence).
-///
-/// The duck/restore ride `action/music/{get-state,set-volume}` over the Bus; the
-/// chime itself is the freedesktop theme sound via `canberra-gtk-play` (falling
-/// back to `paplay` of the matching `.oga`).
+/// NOTIFY-5 — play a freedesktop XDG sound-theme sound by name. Prefers
+/// `canberra-gtk-play` (theme-aware); falls back to `paplay` of the matching
+/// `/usr/share/sounds/freedesktop/stereo/<name>.oga`. Fire-and-forget +
+/// best-effort: a missing player or sound is a silent no-op (never blocks the
+/// UI thread — the child is detached and not awaited).
 fn play_sound(name: &str) {
-    let name = name.to_string();
-    std::thread::spawn(move || {
-        // Read the player's live state; only duck when it's actually playing
-        // (don't poke a paused/idle player or clobber a zero volume).
-        let prior = music_get_state();
-        let restore = match prior {
-            Some((true, vol)) if vol > 0.0 => Some(vol),
-            _ => None,
-        };
-        if let Some(vol) = restore {
-            music_set_volume(duck_volume(vol));
-        }
-        // Play the chime AND WAIT for it, so the music stays ducked only for the
-        // chime's duration.
-        play_sound_blocking(&name);
-        if let Some(vol) = restore {
-            music_set_volume(vol);
-        }
-    });
-}
-
-/// How far to duck the player under the chime — to a quarter of the prior
-/// volume (audible-but-under, the "go around" feel), floored so it never fully
-/// mutes. Pure + testable.
-#[must_use]
-fn duck_volume(prior: f32) -> f32 {
-    (prior * 0.25).clamp(0.0, 1.0)
-}
-
-/// Play the freedesktop sound `name` and BLOCK until it finishes (theme-aware
-/// `canberra-gtk-play`, else `paplay` of the `.oga`). Silent no-op when neither
-/// player nor sound is available.
-fn play_sound_blocking(name: &str) {
     use std::process::{Command, Stdio};
     let quiet = |c: &mut Command| {
         c.stdin(Stdio::null())
@@ -300,70 +263,16 @@ fn play_sound_blocking(name: &str) {
     let mut canberra = Command::new("canberra-gtk-play");
     canberra.args(["-i", name]);
     quiet(&mut canberra);
-    if let Ok(status) = canberra.status() {
-        if status.success() {
-            return;
-        }
+    if canberra.spawn().is_ok() {
+        return;
     }
     let oga = format!("/usr/share/sounds/freedesktop/stereo/{name}.oga");
     if std::path::Path::new(&oga).exists() {
         let mut paplay = Command::new("paplay");
         paplay.arg(&oga);
         quiet(&mut paplay);
-        let _ = paplay.status();
+        let _ = paplay.spawn();
     }
-}
-
-/// One synchronous `action/music/<verb>` Bus request (own current-thread
-/// runtime; the caller is the detached duck thread, off any executor). `None`
-/// on no Bus / timeout / no musicd responder.
-fn music_request(verb: &str, body: Option<&str>) -> Option<String> {
-    let dir = mde_bus::client_data_dir()?;
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .ok()?;
-    rt.block_on(async {
-        let persist = mde_bus::persist::Persist::open(dir).ok()?;
-        mde_bus::rpc::request(
-            &persist,
-            &format!("action/music/{verb}"),
-            mde_bus::hooks::config::Priority::Default,
-            None,
-            body,
-            std::time::Duration::from_millis(800),
-        )
-        .await
-        .ok()?
-        .body
-    })
-}
-
-/// `(playing, volume)` from `action/music/get-state`; `None` when musicd is
-/// unreachable. Pure decode split into [`parse_music_state`] for testing.
-fn music_get_state() -> Option<(bool, f32)> {
-    music_request("get-state", None).and_then(|r| parse_music_state(&r))
-}
-
-/// Set the player volume (0.0..=1.0) via `action/music/set-volume`.
-fn music_set_volume(vol: f32) {
-    let _ = music_request("set-volume", Some(&vol.to_string()));
-}
-
-/// Decode `(playing, volume)` from a `get-state` reply (`{ok, playing, …,
-/// volume}`). `None` on a non-ok / unparseable reply. Pure + testable.
-#[must_use]
-fn parse_music_state(reply: &str) -> Option<(bool, f32)> {
-    let v: serde_json::Value = serde_json::from_str(reply.trim()).ok()?;
-    if v.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-        return None;
-    }
-    let playing = v.get("playing").and_then(serde_json::Value::as_bool)?;
-    let volume = v
-        .get("volume")
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(1.0) as f32;
-    Some((playing, volume))
 }
 
 /// One-glyph severity marker (matches the center).
@@ -445,38 +354,6 @@ fn toast_card(item: &AlertItem, alpha: f32, p: Palette) -> Element<'static, Mess
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn duck_volume_quarters_and_clamps() {
-        // Ducks to a quarter of the prior volume (the "go around" level).
-        assert!((duck_volume(0.8) - 0.2).abs() < 1e-6);
-        assert!((duck_volume(1.0) - 0.25).abs() < 1e-6);
-        // Never panics / escapes [0,1] on odd input.
-        assert_eq!(duck_volume(0.0), 0.0);
-        assert!(duck_volume(10.0) <= 1.0);
-    }
-
-    #[test]
-    fn parse_music_state_reads_playing_and_volume() {
-        let (playing, vol) =
-            parse_music_state(r#"{"ok":true,"playing":true,"active":true,"volume":0.6}"#).unwrap();
-        assert!(playing);
-        assert!((vol - 0.6).abs() < 1e-6);
-        // Paused player.
-        let (playing, _) =
-            parse_music_state(r#"{"ok":true,"playing":false,"volume":0.6}"#).unwrap();
-        assert!(!playing);
-        // Missing volume defaults to full.
-        let (_, vol) = parse_music_state(r#"{"ok":true,"playing":true}"#).unwrap();
-        assert!((vol - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn parse_music_state_rejects_not_ok_and_garbage() {
-        assert!(parse_music_state(r#"{"ok":false,"playing":true,"volume":1.0}"#).is_none());
-        assert!(parse_music_state("not json").is_none());
-        assert!(parse_music_state(r#"{"ok":true}"#).is_none()); // no playing field
-    }
 
     fn item(src: Source, sev: Severity) -> AlertItem {
         AlertItem {
