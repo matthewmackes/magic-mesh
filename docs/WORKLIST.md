@@ -1207,7 +1207,7 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
 - [ ] **MUSIC-RFX-8: right-click context menus**
   **As** a listener, **I want** right-click actions on rows, **so that** actions are dense + discoverable.
   **Acceptance:** right-click a track/album/playlist row opens a Carbon-styled menu (play, play-next, add-to-playlist, go-to-album, remove) whose actions all work; pairs with multi-select for bulk actions. (Spike iced menu/drag maturity early; inline-button fallback per action if needed — logged, not silent.)
-- [ ] **MUSIC-RFX-9: virtualize long lists**
+- [ ] **MUSIC-RFX-9: virtualize long lists** *(2026-06-19: the real perf case — multi-hundred-card library GRIDS — is virtualized via MUSIC-RESPONSIVE-9 (windowed rows + spacers). The remaining lists (album track list = one album, search results, queue) are bounded in practice; virtualizing them is low-ROI vs the grid. Left open for the queue if a very long queue ever shows lag, but deprioritized.)*
   **As** a listener with a large library, **I want** smooth scrolling, **so that** thousands of items don't lag.
   **Acceptance:** album grid / artist list / queue render only visible rows; a multi-thousand-item library scrolls smoothly (observable: no per-row cost blow-up).
 - [ ] **MUSIC-RFX-10: Carbon density/row polish**
