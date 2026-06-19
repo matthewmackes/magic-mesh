@@ -5582,6 +5582,18 @@ fn run_serve(
             RestartPolicy::OnFailure,
         ));
         worker_names.lock().expect("worker_names mutex").push("firewall_preset".into());
+        // CONNECT-3 — exposure-driven firewall enforcement (additive): opens the
+        // policy's ingress ports on the public zone for services bound to this
+        // node, so `expose` actually accepts public traffic. Never removes a rule
+        // (can't lock out SSH/Nebula). Same supervised shape as the preset worker.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::connect_firewall::ConnectFirewallWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names.lock().expect("worker_names mutex").push("connect_firewall".into());
         // mesh_router bootstraps with the per-transport
         // registry. Phase 12.18 D.2 (2026-05-23) — the NebulaHttps443
         // transport is registered at startup so the per-peer

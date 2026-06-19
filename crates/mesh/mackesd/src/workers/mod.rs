@@ -380,6 +380,8 @@ pub mod lifecycle_exec;
 // mesh_nebula.py::apply_nebula_firewall_preset so the Python
 // helper can retire (DEAD-2.14 plan).
 pub mod firewall_preset;
+// CONNECT-3 — exposure-driven (additive) firewall enforcement.
+pub mod connect_firewall;
 pub mod stun_gather;
 pub mod subprocess_tick;
 // thumbnailer retired 2026-05-26 (TUNE-3.b): the worker module
