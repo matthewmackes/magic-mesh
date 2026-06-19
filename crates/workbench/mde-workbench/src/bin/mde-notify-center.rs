@@ -689,11 +689,19 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
     // (the panel is only ~390px wide). Generous top/side padding so nothing is
     // jammed against the window edge.
     let unread = state.items.iter().filter(|i| !i.read).count();
-    let title = text(format!("Notification Hub · {unread} unread"))
-        .size(16)
-        .color(p.text.into_cosmic_color());
+    // NOTIFY-HUB-1 — a Carbon header matching the Application Menu's "▦ Applications"
+    // header: an accent glyph + the title in heading size, with the unread count
+    // as a muted suffix.
     let title_row = row![
-        title,
+        text("\u{25D4}\u{FE0E}") // ◔ — a notification/bell-ish BMP glyph (not emoji)
+            .size(18)
+            .color(p.accent.into_cosmic_color()),
+        Space::new().width(Length::Fixed(10.0)),
+        text("Notifications").size(18).color(p.text.into_cosmic_color()),
+        Space::new().width(Length::Fixed(8.0)),
+        text(format!("· {unread} unread"))
+            .size(12)
+            .color(p.text_muted.into_cosmic_color()),
         Space::new().width(Length::Fill),
         // Close (✕) — also bound to Esc + click-away.
         action_button("✕", Message::Close, p),
@@ -746,8 +754,8 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
             });
             body = body.push(head);
             if !collapsed {
-                for item in &group {
-                    body = body.push(alert_row(item, now, p));
+                for (i, item) in group.iter().enumerate() {
+                    body = body.push(alert_row(item, i, now, p));
                 }
             }
         }
@@ -1132,7 +1140,7 @@ fn quick_toggle<'a>(label: &'a str, on: bool, msg: Message, p: Palette) -> Eleme
 /// One alert row: severity glyph (colored) · age · host · title / body. Takes the
 /// item by value so the returned element owns its text (no borrow of the caller's
 /// loop-local group).
-fn alert_row(item: &AlertItem, now_ms: i64, p: Palette) -> Element<'static, Message> {
+fn alert_row(item: &AlertItem, idx: usize, now_ms: i64, p: Palette) -> Element<'static, Message> {
     let sev_color = severity_token(item.severity, &p).into_cosmic_color();
     let title_color = if item.read { p.text_muted } else { p.text }.into_cosmic_color();
     let host = item.host.clone().unwrap_or_default();
@@ -1156,9 +1164,17 @@ fn alert_row(item: &AlertItem, now_ms: i64, p: Palette) -> Element<'static, Mess
         let body: String = item.body.chars().take(200).collect();
         col = col.push(text(body).size(11).color(p.text_muted.into_cosmic_color()));
     }
+    // NOTIFY-HUB-1 — APPS-STYLE-2 zebra rows (the Application Menu's row idiom):
+    // alternate the row layer so the alert list reads as banded rows. The
+    // severity glyph already carries the severity colour.
+    let shade = if idx % 2 == 1 { p.surface } else { p.background };
     container(col)
         .padding(Padding::from([6u16, 8u16]))
         .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(cosmic::iced::Background::Color(shade.into_cosmic_color())),
+            ..Default::default()
+        })
         .into()
 }
 
