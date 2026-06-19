@@ -115,14 +115,25 @@ fn song_id_from(body: &str) -> Option<String> {
         return None;
     }
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        if let Some(s) = v.get("song_id").and_then(serde_json::Value::as_str) {
-            return Some(s.to_string());
+        // Accept both `song_id` and `id` (the Hub's get-song / the GUI's
+        // browse-by-id callers use `id`; older callers use `song_id`). Reading
+        // only `song_id` made `{"id":"14119"}` fall through to the raw-body
+        // branch below, which passed the WHOLE JSON string as the Airsonic id →
+        // HTTP 400 → the Notification Hub showed "Unknown Track" for every song.
+        for key in ["song_id", "id"] {
+            if let Some(s) = v.get(key).and_then(serde_json::Value::as_str) {
+                return Some(s.to_string());
+            }
         }
         if let Some(s) = v.as_str() {
             return Some(s.to_string());
         }
+        // A JSON object we didn't recognise — don't feed it raw to Airsonic.
+        if v.is_object() {
+            return None;
+        }
     }
-    // Fall back to the raw body as the id.
+    // Fall back to the raw body as the id (a bare, unquoted id string).
     Some(trimmed.trim_matches('"').to_string())
 }
 
@@ -930,6 +941,20 @@ pub fn poll_once(persist: &Persist, queue_path: &Path, cursors: &mut HashMap<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn song_id_from_accepts_id_and_song_id_keys_and_rejects_raw_objects() {
+        // The Notification Hub sends {"id":...}; older callers send {"song_id":...}.
+        assert_eq!(song_id_from(r#"{"id":"14119"}"#).as_deref(), Some("14119"));
+        assert_eq!(song_id_from(r#"{"song_id":"22"}"#).as_deref(), Some("22"));
+        // A bare (possibly quoted) id string still works.
+        assert_eq!(song_id_from("14119").as_deref(), Some("14119"));
+        assert_eq!(song_id_from(r#""14119""#).as_deref(), Some("14119"));
+        // An unrecognised JSON object must NOT be fed raw to Airsonic (the bug:
+        // {"id":...} used to reach getSong as the literal id → HTTP 400).
+        assert_eq!(song_id_from(r#"{"foo":"bar"}"#), None);
+        assert_eq!(song_id_from(""), None);
+    }
 
     #[test]
     fn dispatch_peer_roster_and_take_over() {
