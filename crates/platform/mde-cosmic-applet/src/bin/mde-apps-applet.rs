@@ -669,10 +669,15 @@ impl Application for AppsApplet {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        // Grid/apps glyph (U+FE0E forces monochrome so it honors the Carbon tint).
-        let glyph = cosmic::widget::text("\u{25A6}\u{FE0E}") // ▦ apps grid
-            .size(16)
-            .class(cosmic::theme::Text::Color(carbon(self.palette.text)));
+        // APPS-ICON (operator 2026-06-19) — the panel launcher button uses the
+        // Start3 brand icon (baked in so it renders with no install-path
+        // dependency), sized to the panel's suggested icon size.
+        let icon_px = self.core.applet.suggested_size(true).0.max(16);
+        let glyph = cosmic::iced::widget::image(cosmic::iced::widget::image::Handle::from_bytes(
+            include_bytes!("../../../../../assets/brand/Start3.png").to_vec(),
+        ))
+        .width(Length::Fixed(f32::from(icon_px)))
+        .height(Length::Fixed(f32::from(icon_px)));
         // APPS-MOUSE-FIX (operator bug 2026-06-18) — the panel button is plain
         // click-to-toggle: `on_press` opens the dropdown, a second press closes
         // it, and a launch closes it (the LaunchLocal/LaunchMesh/OpenService

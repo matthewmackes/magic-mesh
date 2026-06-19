@@ -1293,3 +1293,6 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
 - [✓] **MUSIC-HOME-2: Home view = hero numbers + sections.** DONE 2026-06-18: Rebuild `Route::Hub` Home in `mde-music`: hero counts (Songs/Artists/Albums) + the server card (host/version · last scan + library size · live scan progress · connection health) + counts for Playlists/Radio/Podcasts. Carbon tokens. **Acceptance:** the Home page shows the live stats dashboard, not the old 7-card hub.
 - [✓] **MUSIC-HOME-3: discovery strips.** DONE 2026-06-19: Most-Played (`getAlbumList2 frequent`), Starred (`getStarred2`), and Now-Playing-across-the-mesh strips on the Home page. **Acceptance:** each strip shows real data; clicking an album opens it.
 - [✓] **MUSIC-HOME-4: poll refresh.** DONE 2026-06-19: Load on open + a ~30–60 s poll (fast during an active scan) so counts/now-playing/scan stay live. **Acceptance:** stats update without reopening; scan progress advances live.
+
+### APPS-ICON — Start3 launcher icon (operator 2026-06-19)
+- [✓] **APPS-ICON-1: panel launcher uses the Start3 brand icon.** DONE 2026-06-19: replaced the ▦ glyph on the apps-applet panel button with `assets/brand/Start3.png` (baked via `include_bytes!`, sized to the panel's suggested icon size). Operator-provided icon fetched from origin/master.
