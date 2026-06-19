@@ -86,8 +86,23 @@ if systemctl is-active --quiet nebula 2>/dev/null; then
     esac
 fi
 
+# ── SUBSTRATE-9 — peers + leader from etcd when on the coordination plane ────
+# The peer directory + leader lease live in etcd post-cutover (the fs
+# peers/*.json glob + .mackesd-leader.lock are retired); per-node shell-status
+# still rides the Syncthing-replicated share. Best-effort: needs etcdctl + the
+# endpoints file; absent ⇒ ETCD_MODE empty ⇒ the python falls back to the fs glob.
+ETCD_PEERS=""; ETCD_LEADER=""; ETCD_MODE=""
+ENDPOINTS_FILE=/etc/mackesd/etcd-endpoints
+if command -v etcdctl >/dev/null 2>&1 && [ -s "$ENDPOINTS_FILE" ]; then
+    EPS="$(tr '\n' ',' < "$ENDPOINTS_FILE" | sed 's/,$//')"
+    ETCD_PEERS="$(ETCDCTL_API=3 etcdctl --endpoints="$EPS" get --prefix /mesh/peers/ --print-value-only 2>/dev/null)"
+    ETCD_LEADER="$(ETCDCTL_API=3 etcdctl --endpoints="$EPS" get /mesh/leader --print-value-only 2>/dev/null)"
+    [ -n "$ETCD_PEERS$ETCD_LEADER" ] && ETCD_MODE=1
+fi
+
 # ── 2. aggregate the directory + every node's shell-status → snapshot ────────
 WG="$WG" SELF="$SELF" SELF_VER="$VER" \
+ETCD_MODE="$ETCD_MODE" ETCD_PEERS="$ETCD_PEERS" ETCD_LEADER="$ETCD_LEADER" \
 NET_IF="$NET_IF" NET_IP="$NET_IP" NET_CIDR="$NET_CIDR" NET_ROUTES="$NET_ROUTES" \
 NET_DEFGW="$NET_DEFGW" NET_GWEPS="$NET_GWEPS" NET_CIPHER="$NET_CIPHER" NET_LHIPS="$NET_LHIPS" \
 python3 - "$OUT" <<'PY' || true
@@ -97,14 +112,26 @@ out=sys.argv[1]
 def presence(h):
     return {"healthy":"online","degraded":"idle"}.get(h or "","offline")
 nodes=[]; versions=set()
-peers=sorted(glob.glob(os.path.join(wg,"peers","*.json")))
-for pf in peers:
-    try: d=json.load(open(pf))
-    except Exception: continue
-    host=d.get("hostname") or os.path.splitext(os.path.basename(pf))[0]
+# SUBSTRATE-9 — peer records from etcd (one compact PeerRecord JSON per line)
+# when on the coordination plane, else the replicated fs peers/*.json glob.
+records=[]
+if os.environ.get("ETCD_MODE"):
+    for line in os.environ.get("ETCD_PEERS","").splitlines():
+        line=line.strip()
+        if not line: continue
+        try: records.append(json.loads(line))
+        except Exception: continue
+else:
+    for pf in sorted(glob.glob(os.path.join(wg,"peers","*.json"))):
+        try: records.append(json.load(open(pf)))
+        except Exception: continue
+for d in records:
+    host=d.get("hostname") or ""
+    if not host: continue
     node={"hostname":host,"overlay_ip":d.get("overlay_ip") or "",
           "presence":presence(d.get("health")),"last_seen_ms":d.get("last_seen_ms") or 0,
           "version":None,"services":{},"role":d.get("role")}
+    # Per-node shell-status still rides the Syncthing-replicated share.
     sf=os.path.join(wg,host,"shell-status.json")
     try:
         s=json.load(open(sf)); node["version"]=s.get("version"); node["services"]=s.get("services",{})
@@ -127,9 +154,16 @@ for n in nodes:
 def _split(v):
     return [x for x in (os.environ.get(v,"") or "").split(",") if x]
 def _leader():
-    # LIGHTHOUSE-7 — the current lizardfs-master = the QNM leader-lease holder
-    # (node_id\trenewed_at_s\tepoch); empty when missing/expired (>60s).
+    # The mesh leader = the leader-lease holder (node_id\trenewed_at_s\tepoch).
+    # SUBSTRATE-9: from the etcd /mesh/leader value when on the coordination
+    # plane (etcd auto-expires the key, so any value present = a live leader),
+    # else the fs .mackesd-leader.lock with the 60s freshness check.
     try:
+        if os.environ.get("ETCD_MODE"):
+            line=(os.environ.get("ETCD_LEADER","") or "").strip()
+            if not line: return ""
+            nid=line.split("\t")[0]
+            return nid[5:] if nid.startswith("peer:") else nid
         line=open(os.path.join(wg,".mackesd-leader.lock")).readline().strip()
         parts=line.split("\t")
         if len(parts)>=2 and (time.time()-float(parts[1]))<60:
