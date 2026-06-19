@@ -1562,8 +1562,14 @@ impl State {
                 ]
                 .spacing(8);
                 let mut col = column![title_row].spacing(10);
+                // AIR-11.c — width-adaptive column count (shared by the skeleton +
+                // the real grid so the loading placeholder matches the layout).
+                let cols = ((self.grid_width + 8.0) / 168.0).floor().max(1.0) as usize;
                 if self.loading {
-                    col = col.push(text("Loading…").size(13));
+                    // MUSIC-RESPONSIVE-6 — greyed Carbon skeleton tiles (matching
+                    // the card geometry) instead of a blank "Loading…" line, so a
+                    // navigation paints structure within one frame.
+                    col = col.push(skeleton_grid(cols));
                 } else if let Some(err) = &self.load_error {
                     col = col.push(text(err.clone()).size(13));
                 } else if self.items.is_empty() {
@@ -1584,7 +1590,6 @@ impl State {
                     // subscription) so the 160px cards reflow on resize, replacing
                     // the AIR-11.b fixed 5-column layout. Per-card cover art +
                     // scroll-position persistence remain the AIR-11.c.2 follow-on.
-                    let cols = ((self.grid_width + 8.0) / 168.0).floor().max(1.0) as usize;
                     let mut grid = column![].spacing(8);
                     for chunk in items.chunks(cols) {
                         let mut r = row![].spacing(8);
@@ -2348,6 +2353,43 @@ fn search_id() -> cosmic::iced::widget::Id {
 /// scroll position can be saved on scroll + restored on category re-entry.
 fn grid_scroll_id() -> cosmic::iced::widget::Id {
     cosmic::iced::widget::Id::new("mde-music-grid")
+}
+
+/// MUSIC-RESPONSIVE-6 — a grid of greyed Carbon skeleton tiles shown while a
+/// category loads, matching the real card geometry (160px col, 150px art tile +
+/// a short label bar) so navigation paints structure within one frame instead of
+/// a blank pane. Static (no shimmer — that's the MOTION epic); `cols` mirrors the
+/// real grid's width-adaptive column count.
+fn skeleton_grid(cols: usize) -> Element<'static, Message> {
+    let cpal = mde_theme::Palette::dark();
+    let fill = carbon(cpal.raised, 1.0);
+    let block = move |w: Length, h: f32| -> Element<'static, Message> {
+        container(Space::new().width(w).height(Length::Fixed(h)))
+            .style(move |_| cosmic::iced::widget::container::Style {
+                background: Some(fill.into()),
+                ..Default::default()
+            })
+            .into()
+    };
+    let tile = move || -> Element<'static, Message> {
+        column![
+            block(Length::Fill, 150.0),
+            block(Length::Fixed(110.0), 12.0),
+        ]
+        .spacing(8)
+        .width(Length::Fixed(160.0))
+        .into()
+    };
+    // Two rows of placeholders — enough to fill the typical viewport.
+    let mut grid = column![].spacing(8);
+    for _ in 0..2 {
+        let mut r = row![].spacing(8);
+        for _ in 0..cols {
+            r = r.push(tile());
+        }
+        grid = grid.push(r);
+    }
+    grid.into()
 }
 
 /// Render one search section: a heading + a clickable row per item. An
