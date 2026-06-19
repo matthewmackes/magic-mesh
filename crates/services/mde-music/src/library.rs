@@ -165,6 +165,75 @@ pub async fn fetch(verb: &'static str) -> Result<Vec<LibraryItem>, String> {
     .map_err(|e| format!("fetch task join error: {e}"))?
 }
 
+/// MUSIC-HOME-2 — the server library snapshot for the Home page, parsed from
+/// `action/music/library-stats` → `{ok, result:{stats:{...}}}`. Mirrors the
+/// daemon's `LibraryStats`; tolerant of missing fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct LibraryStats {
+    #[serde(default)]
+    pub reachable: bool,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub songs: u64,
+    #[serde(default)]
+    pub scanning: bool,
+    #[serde(default)]
+    pub artists: u64,
+    #[serde(default)]
+    pub albums: u64,
+    #[serde(default)]
+    pub genres: u64,
+    #[serde(default)]
+    pub playlists: u64,
+    #[serde(default)]
+    pub radio: u64,
+    #[serde(default)]
+    pub podcasts: u64,
+}
+
+/// Parse the `library-stats` reply body into [`LibraryStats`]. Pure + testable.
+#[must_use]
+pub fn parse_stats(reply_json: &str) -> Option<LibraryStats> {
+    let v: serde_json::Value = serde_json::from_str(reply_json).ok()?;
+    if v.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    serde_json::from_value(v.get("result")?.get("stats")?.clone()).ok()
+}
+
+/// MUSIC-HOME-2 — fetch the server library stats over the Bus.
+///
+/// # Errors
+/// Bus-store / request / timeout failures (daemon not running).
+pub async fn fetch_library_stats() -> Result<LibraryStats, String> {
+    tokio::task::spawn_blocking(move || -> Result<LibraryStats, String> {
+        let bus_root = mde_bus::default_data_dir().ok_or_else(|| "no Bus data dir".to_string())?;
+        let persist =
+            mde_bus::persist::Persist::open(bus_root).map_err(|e| format!("Bus store: {e}"))?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        let reply = rt
+            .block_on(mde_bus::rpc::request(
+                &persist,
+                "action/music/library-stats",
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                None,
+                BROWSE_TIMEOUT,
+            ))
+            .map_err(|e| format!("daemon not responding ({e})"))?;
+        parse_stats(reply.body.as_deref().unwrap_or(""))
+            .ok_or_else(|| "library-stats: bad reply".to_string())
+    })
+    .await
+    .map_err(|e| format!("stats task join error: {e}"))?
+}
+
 /// Fetch the albums in a genre over the Bus (`action/music/albums-by-genre`,
 /// the genre name in the body). The rows render like the album grid
 /// (click → album page).
@@ -261,6 +330,21 @@ pub async fn fetch_podcast_episodes(channel_id: String) -> Result<Vec<LibraryIte
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_stats_reads_the_library_snapshot() {
+        let reply = r#"{"ok":true,"result":{"stats":{"reachable":true,"host":"http://h:4040",
+            "version":"1.15.0","songs":23126,"scanning":false,"artists":240,"albums":1675,
+            "genres":926,"playlists":1,"radio":4,"podcasts":0}}}"#;
+        let s = parse_stats(reply).expect("parse");
+        assert_eq!(s.songs, 23126);
+        assert_eq!(s.artists, 240);
+        assert_eq!(s.albums, 1675);
+        assert!(s.reachable && !s.scanning);
+        // ok:false / malformed → None.
+        assert!(parse_stats(r#"{"ok":false}"#).is_none());
+        assert!(parse_stats("nonsense").is_none());
+    }
 
     #[test]
     fn verb_mapping() {

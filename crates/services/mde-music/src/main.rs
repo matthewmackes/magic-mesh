@@ -87,6 +87,20 @@ fn carbon(rgba: mde_theme::Rgba, a: f32) -> cosmic::iced::Color {
     }
 }
 
+/// MUSIC-HOME-2 — group a count with thousands separators (23126 → "23,126").
+fn commafy(n: u64) -> String {
+    let s = n.to_string();
+    let len = s.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Build a Carbon `cosmic::iced::Theme` from the canonical `mde_theme::Palette`
 /// (E5.3) — the Q2 indigo accent, Apple-charcoal background, and the semantic
 /// tokens, single-sourced from the design palette.
@@ -163,6 +177,9 @@ struct State {
     album: Option<AlbumView>,
     album_loading: bool,
     album_error: Option<String>,
+    /// MUSIC-HOME-2 — the server library stats shown on the Home page (`None`
+    /// until the first `library-stats` fetch returns).
+    stats: Option<library::LibraryStats>,
     /// AIR-15 — the now-playing footer's live snapshot + resolved title.
     now_state: NowState,
     now_title: String,
@@ -236,6 +253,8 @@ enum Message {
     OpenCard(HubCard),
     /// Jump to a breadcrumb segment (0 = Library root).
     Ascend(usize),
+    /// MUSIC-HOME-2 — the server library-stats snapshot returned.
+    StatsLoaded(Result<library::LibraryStats, String>),
     /// MUSIC-NAV — go up one breadcrumb level (Back).
     Back,
     /// MUSIC-NAV — jump to the Library root (Home).
@@ -380,6 +399,7 @@ impl State {
             album: None,
             album_loading: false,
             album_error: None,
+            stats: None,
             now_state: NowState::default(),
             now_title: String::new(),
             now_artist: String::new(),
@@ -634,6 +654,13 @@ impl State {
             }
             Message::Home => {
                 self.nav.ascend_to(0);
+                // MUSIC-HOME-2 — (re)load the server stats for the Home dashboard.
+                Task::perform(library::fetch_library_stats(), Message::StatsLoaded)
+            }
+            Message::StatsLoaded(r) => {
+                if let Ok(s) = r {
+                    self.stats = Some(s);
+                }
                 Task::none()
             }
             Message::Exit => std::process::exit(0),
@@ -1255,6 +1282,87 @@ impl State {
             .into()
     }
 
+    /// MUSIC-HOME-2 — the Home page: a server-stats dashboard (hero counts +
+    /// server card + count chips) fed by `action/music/library-stats`. Replaces
+    /// the old 7-card hub (navigation now lives in the Carbon sidebar).
+    fn home_dashboard(&self) -> Element<'_, Message> {
+        let p = mde_theme::Palette::dark();
+        let text_c = carbon(p.text, 1.0);
+        let muted = carbon(p.text_muted, 1.0);
+        let Some(s) = &self.stats else {
+            return column![text("Loading library stats…").size(14).colr(muted)]
+                .padding(8)
+                .into();
+        };
+        // Hero counts (Songs / Artists / Albums).
+        let stat_block = |n: u64, label: &str| -> Element<'_, Message> {
+            column![
+                text(commafy(n)).size(34).colr(text_c),
+                text(label.to_string()).size(12).colr(muted),
+            ]
+            .spacing(2)
+            .into()
+        };
+        let hero = row![
+            stat_block(s.songs, "Songs"),
+            stat_block(s.artists, "Artists"),
+            stat_block(s.albums, "Albums"),
+        ]
+        .spacing(40);
+        // Server card.
+        let (dotc, health) = if s.reachable {
+            (carbon(p.success, 1.0), "connected")
+        } else {
+            (carbon(p.danger, 1.0), "unreachable")
+        };
+        let scan = if s.scanning {
+            "scanning…".to_string()
+        } else {
+            format!("{} songs indexed", commafy(s.songs))
+        };
+        let server = column![
+            row![
+                text("●").size(12).colr(dotc),
+                Space::new().width(Length::Fixed(8.0)),
+                text(format!("Airsonic · {}", s.host)).size(14).colr(text_c),
+            ]
+            .align_y(cosmic::iced::Alignment::Center),
+            text(format!("API {} · {scan} · {health}", s.version))
+                .size(12)
+                .colr(muted),
+        ]
+        .spacing(4);
+        // Count chips (Playlists / Radio / Podcasts / Genres).
+        let chip = |n: u64, label: &str| -> Element<'_, Message> {
+            row![
+                text(commafy(n)).size(14).colr(text_c),
+                Space::new().width(Length::Fixed(6.0)),
+                text(label.to_string()).size(12).colr(muted),
+            ]
+            .align_y(cosmic::iced::Alignment::Center)
+            .into()
+        };
+        let chips = row![
+            chip(s.playlists, "Playlists"),
+            chip(s.radio, "Radio"),
+            chip(s.podcasts, "Podcasts"),
+            chip(s.genres, "Genres"),
+        ]
+        .spacing(24);
+        column![
+            text("Your Library").size(24).colr(text_c),
+            Space::new().height(Length::Fixed(18.0)),
+            hero,
+            Space::new().height(Length::Fixed(22.0)),
+            server,
+            Space::new().height(Length::Fixed(16.0)),
+            chips,
+        ]
+        .spacing(0)
+        .padding(8)
+        .into()
+    }
+
     /// The library shell (hub + breadcrumb).
     fn library_view(&self) -> Element<'_, Message> {
         // Breadcrumb — each segment is a button that ascends to it.
@@ -1277,14 +1385,7 @@ impl State {
         // Body — the hub renders its seven cards; a category page renders
         // an honest empty state until the daemon data path lands.
         let body: Element<'_, Message> = match self.nav.current() {
-            Route::Hub => {
-                let mut cards = column![].spacing(8);
-                for card in HubCard::all() {
-                    cards =
-                        cards.push(button(text(card.label())).on_press(Message::OpenCard(card)));
-                }
-                cards.into()
-            }
+            Route::Hub => self.home_dashboard(),
             Route::Album(..) => self.album_page(),
             route => {
                 // AIR-11.b — title + a sort toggle; items lay out in a
@@ -2053,7 +2154,14 @@ impl Application for State {
         // breadcrumb/connection header reads as the only top bar.
         s.core.window.show_headerbar = false;
         s.set_header_title("MDE Music".to_string());
-        (s, cosmic::app::Task::none())
+        // MUSIC-HOME-2 — load the server stats at launch so the Home dashboard
+        // is populated on first paint.
+        let boot = cosmic::iced::Task::perform(
+            library::fetch_library_stats(),
+            Message::StatsLoaded,
+        )
+        .map(cosmic::Action::App);
+        (s, boot)
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
