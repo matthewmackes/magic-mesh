@@ -50,7 +50,7 @@ pub const ACTION_VERBS: [&str; 10] = [
 
 /// The library-browse verbs served on `action/music/<verb>`
 /// (asynchronous — each proxies an Airsonic REST call).
-pub const BROWSE_VERBS: [&str; 20] = [
+pub const BROWSE_VERBS: [&str; 22] = [
     "list-albums",
     "list-artists",
     "search",
@@ -74,6 +74,9 @@ pub const BROWSE_VERBS: [&str; 20] = [
     "playlist-delete",
     // MUSIC-HOME-1 — the Music Home page's server-stats snapshot.
     "library-stats",
+    // MUSIC-HOME-3 — Home discovery strips: most-played + starred albums.
+    "list-frequent",
+    "list-starred",
 ];
 
 /// The transport verbs served on `action/music/<verb>` (AIR-2.d — drive
@@ -406,6 +409,17 @@ fn dispatch_browse(
             // getAlbumList2 with type=recent).
             "list-recents" => client
                 .get_album_list2("recent", 100)
+                .await
+                .map(|a| json!({ "albums": a }))
+                .map_err(|e| e.to_string()),
+            // MUSIC-HOME-3 — most-played (getAlbumList2 frequent) + starred.
+            "list-frequent" => client
+                .get_album_list2("frequent", 24)
+                .await
+                .map(|a| json!({ "albums": a }))
+                .map_err(|e| e.to_string()),
+            "list-starred" => client
+                .get_starred2()
                 .await
                 .map(|a| json!({ "albums": a }))
                 .map_err(|e| e.to_string()),

@@ -87,6 +87,24 @@ fn carbon(rgba: mde_theme::Rgba, a: f32) -> cosmic::iced::Color {
     }
 }
 
+/// MUSIC-HOME — load everything the Home dashboard shows (stats + the
+/// most-played / starred / mesh-now-playing strips) in one batch. Used on Home
+/// nav, at init, and by the poll tick.
+fn load_home_tasks() -> Task<Message> {
+    Task::batch([
+        Task::perform(library::fetch_library_stats(), Message::StatsLoaded),
+        Task::perform(library::fetch("list-frequent"), |r| {
+            Message::MostPlayedLoaded(r.unwrap_or_default())
+        }),
+        Task::perform(library::fetch("list-starred"), |r| {
+            Message::StarredLoaded(r.unwrap_or_default())
+        }),
+        Task::perform(nowplaying::fetch_peer_states(), |r| {
+            Message::HomePeersLoaded(r.unwrap_or_default())
+        }),
+    ])
+}
+
 /// MUSIC-HOME-2 — group a count with thousands separators (23126 → "23,126").
 fn commafy(n: u64) -> String {
     let s = n.to_string();
@@ -180,6 +198,11 @@ struct State {
     /// MUSIC-HOME-2 — the server library stats shown on the Home page (`None`
     /// until the first `library-stats` fetch returns).
     stats: Option<library::LibraryStats>,
+    /// MUSIC-HOME-3 — Home discovery strips: most-played + starred albums + the
+    /// mesh now-playing roster.
+    most_played: Vec<library::LibraryItem>,
+    starred: Vec<library::LibraryItem>,
+    home_peers: Vec<nowplaying::PeerState>,
     /// AIR-15 — the now-playing footer's live snapshot + resolved title.
     now_state: NowState,
     now_title: String,
@@ -257,6 +280,10 @@ enum Message {
     StatsLoaded(Result<library::LibraryStats, String>),
     /// MUSIC-HOME-4 — periodic Home-page stats refresh tick.
     PollStats,
+    /// MUSIC-HOME-3 — Home discovery strips loaded.
+    MostPlayedLoaded(Vec<library::LibraryItem>),
+    StarredLoaded(Vec<library::LibraryItem>),
+    HomePeersLoaded(Vec<nowplaying::PeerState>),
     /// MUSIC-NAV — go up one breadcrumb level (Back).
     Back,
     /// MUSIC-NAV — jump to the Library root (Home).
@@ -402,6 +429,9 @@ impl State {
             album_loading: false,
             album_error: None,
             stats: None,
+            most_played: Vec::new(),
+            starred: Vec::new(),
+            home_peers: Vec::new(),
             now_state: NowState::default(),
             now_title: String::new(),
             now_artist: String::new(),
@@ -656,8 +686,7 @@ impl State {
             }
             Message::Home => {
                 self.nav.ascend_to(0);
-                // MUSIC-HOME-2 — (re)load the server stats for the Home dashboard.
-                Task::perform(library::fetch_library_stats(), Message::StatsLoaded)
+                load_home_tasks()
             }
             Message::StatsLoaded(r) => {
                 if let Ok(s) = r {
@@ -665,8 +694,18 @@ impl State {
                 }
                 Task::none()
             }
-            Message::PollStats => {
-                Task::perform(library::fetch_library_stats(), Message::StatsLoaded)
+            Message::PollStats => load_home_tasks(),
+            Message::MostPlayedLoaded(items) => {
+                self.most_played = items;
+                Task::none()
+            }
+            Message::StarredLoaded(items) => {
+                self.starred = items;
+                Task::none()
+            }
+            Message::HomePeersLoaded(peers) => {
+                self.home_peers = peers;
+                Task::none()
             }
             Message::Exit => std::process::exit(0),
             Message::UrlChanged(s) => {
@@ -1368,7 +1407,70 @@ impl State {
             chip(s.genres, "Genres"),
         ]
         .spacing(24);
-        column![
+
+        // MUSIC-HOME-3 — discovery strips: a horizontal row of clickable album
+        // tiles for Most Played + Starred, then the mesh now-playing roster.
+        let album_strip = |title: &str, items: &[library::LibraryItem]| -> Element<'_, Message> {
+            if items.is_empty() {
+                return Space::new().height(Length::Fixed(0.0)).into();
+            }
+            let tiles: Vec<Element<'_, Message>> = items
+                .iter()
+                .take(12)
+                .map(|it| {
+                    button(
+                        text(it.label.clone())
+                            .size(12)
+                            .colr(text_c)
+                            .width(Length::Fixed(150.0)),
+                    )
+                    .padding(8)
+                    .on_press(Message::OpenAlbum(it.id.clone(), it.label.clone()))
+                    .into()
+                })
+                .collect();
+            column![
+                text(title.to_string()).size(15).colr(text_c),
+                cosmic::iced::widget::scrollable(row(tiles).spacing(8)).direction(
+                    cosmic::iced::widget::scrollable::Direction::Horizontal(
+                        cosmic::iced::widget::scrollable::Scrollbar::new().width(4).scroller_width(4),
+                    ),
+                ),
+            ]
+            .spacing(8)
+            .into()
+        };
+        // Mesh now-playing: which peers are actively listening.
+        let mesh_rows: Vec<Element<'_, Message>> = self
+            .home_peers
+            .iter()
+            .map(|pr| {
+                let (glyph, c) = if pr.playing {
+                    ("♪", carbon(p.accent, 1.0))
+                } else {
+                    ("○", muted)
+                };
+                row![
+                    text(glyph.to_string()).size(12).colr(c),
+                    Space::new().width(Length::Fixed(8.0)),
+                    text(pr.host.clone()).size(12).colr(text_c),
+                ]
+                .align_y(cosmic::iced::Alignment::Center)
+                .into()
+            })
+            .collect();
+        let mesh_section: Element<'_, Message> = if mesh_rows.is_empty() {
+            Space::new().height(Length::Fixed(0.0)).into()
+        } else {
+            column![
+                text("Now Playing across the mesh").size(15).colr(text_c),
+                column(mesh_rows).spacing(4),
+            ]
+            .spacing(8)
+            .into()
+        };
+
+        let body = column![
             text("Your Library").size(24).colr(text_c),
             Space::new().height(Length::Fixed(18.0)),
             hero,
@@ -1376,10 +1478,16 @@ impl State {
             server,
             Space::new().height(Length::Fixed(16.0)),
             chips,
+            Space::new().height(Length::Fixed(24.0)),
+            album_strip("Most Played", &self.most_played),
+            Space::new().height(Length::Fixed(20.0)),
+            album_strip("Starred", &self.starred),
+            Space::new().height(Length::Fixed(20.0)),
+            mesh_section,
         ]
         .spacing(0)
-        .padding(8)
-        .into()
+        .padding(8);
+        cosmic::iced::widget::scrollable(body).into()
     }
 
     /// The library shell (hub + breadcrumb).
@@ -2173,13 +2281,9 @@ impl Application for State {
         // breadcrumb/connection header reads as the only top bar.
         s.core.window.show_headerbar = false;
         s.set_header_title("MDE Music".to_string());
-        // MUSIC-HOME-2 — load the server stats at launch so the Home dashboard
-        // is populated on first paint.
-        let boot = cosmic::iced::Task::perform(
-            library::fetch_library_stats(),
-            Message::StatsLoaded,
-        )
-        .map(cosmic::Action::App);
+        // MUSIC-HOME — load the server stats + discovery strips at launch so the
+        // Home dashboard is populated on first paint.
+        let boot = load_home_tasks().map(cosmic::Action::App);
         (s, boot)
     }
 

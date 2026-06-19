@@ -565,6 +565,16 @@ impl Client {
         Ok(parse_album_list2(&inner))
     }
 
+    /// MUSIC-HOME-3 — `getStarred2` → the user's starred albums (the Home
+    /// "Starred" strip).
+    ///
+    /// # Errors
+    /// Transport / API / parse failures.
+    pub async fn get_starred2(&self) -> Result<Vec<Album>, AirsonicError> {
+        let inner = self.get("getStarred2", &[]).await?;
+        Ok(parse_starred_albums(&inner))
+    }
+
     /// `search3` — three-section search across artists/albums/songs.
     ///
     /// # Errors
@@ -945,6 +955,22 @@ pub fn parse_album_list2(inner: &Value) -> Vec<Album> {
     inner
         .get("albumList2")
         .and_then(|a| a.get("album"))
+        .and_then(Value::as_array)
+        .map(|albums| {
+            albums
+                .iter()
+                .filter_map(|a| serde_json::from_value(a.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// MUSIC-HOME-3 — parse `getStarred2` → `starred2.album[]` into [`Album`] rows.
+#[must_use]
+pub fn parse_starred_albums(inner: &Value) -> Vec<Album> {
+    inner
+        .get("starred2")
+        .and_then(|s| s.get("album"))
         .and_then(Value::as_array)
         .map(|albums| {
             albums
