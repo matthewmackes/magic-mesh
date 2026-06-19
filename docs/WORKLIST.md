@@ -1040,7 +1040,7 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
 - [✓] **MUSIC-ALBUMS-1: Carbon grid shell** (48/1fr/80 rows × 256/1fr cols: header + sidebar + content + player), dark+light via mde-theme. DONE 2026-06-18: Carbon grid shell (header/[sidebar|content]/player) built + deployed .13.
 - [✓] **MUSIC-ALBUMS-2: sidebar nav** (Home, Internet Radio, LIBRARY{Albums,Artists,Songs,Playlists}, Recently Added, Settings) with the active blue accent rail; each routes to existing mde-music views. DONE 2026-06-18: Carbon sidebar nav with active accent rail, routed to existing nav msgs.
 - [✓] **MUSIC-ALBUMS-3: Albums grid** (auto-fill 168px cards — square art + 2-line title + artist, hover accent outline) bound to the real library via the windowed art loader (no large-library stall). DONE 2026-06-18: square art tile + 2-line title + hover accent on album cards.
-- [ ] **MUSIC-ALBUMS-4: header search + Sort** (filter artists/albums/songs).
+- [✓] **MUSIC-ALBUMS-4: header search + Sort** (filter artists/albums/songs).
 - [✓] **MUSIC-ALBUMS-5: 80px persistent player** (mini-art + shuffle/prev/play/next/repeat + scrubber + volume) reusing the existing playback-bar state, on every view. DONE 2026-06-18: existing persistent playback bar reused as the player region.
 - [ ] **MUSIC-ALBUMS-6: account/avatar + Settings routing** (mesh routing prefs).
 - [✓] **MUSIC-ALBUMS-7: mde-theme Carbon Blue-50 accent token** (`#4589ff`) if absent, palette-tested (§4) — active-nav rail + hover outline read it.

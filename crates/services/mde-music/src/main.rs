@@ -223,6 +223,10 @@ struct State {
     album_art: Option<image::Handle>,
     /// AIR-11.b — the persisted library-grid sort order.
     sort: SortKey,
+    /// MUSIC-ALBUMS-4 — in-header live filter: narrows the CURRENT grid by a
+    /// case-insensitive label substring (distinct from the global search sheet,
+    /// which searches the whole library over the bus). Empty = no filter.
+    grid_filter: String,
     /// AIR-11.c — last-known window width (tracked via the WindowResized
     /// subscription); the library grid derives its column count from it.
     grid_width: f32,
@@ -388,6 +392,8 @@ enum Message {
     ArtReady(Option<image::Handle>, (u8, u8, u8), (u8, u8, u8)),
     /// AIR-11.b — flip the library-grid sort order (+ persist it).
     ToggleSort,
+    /// MUSIC-ALBUMS-4 — the in-header grid filter text changed.
+    GridFilterChanged(String),
     /// AIR-15 — now-playing footer: poll the live snapshot + transport.
     PollState,
     StateLoaded(NowState),
@@ -447,6 +453,7 @@ impl State {
             now_color: color::accent_rgb(),
             album_art: None,
             sort: prefs::load().sort,
+            grid_filter: String::new(),
             grid_width: 1100.0,
             grid_scroll: prefs::load().scroll.into_iter().collect(),
             art_cache: std::collections::HashMap::new(),
@@ -1015,6 +1022,10 @@ impl State {
                 });
                 Task::none()
             }
+            Message::GridFilterChanged(q) => {
+                self.grid_filter = q;
+                Task::none()
+            }
             Message::AlbumFailed(e) => {
                 self.album = None;
                 self.album_loading = false;
@@ -1554,9 +1565,14 @@ impl State {
             route => {
                 // AIR-11.b — title + a sort toggle; items lay out in a
                 // wrapping 160×160 card grid, ordered by the persisted sort.
+                // MUSIC-ALBUMS-4 — header: title · in-grid filter · sort toggle.
                 let title_row = row![
                     text(route.segment()).size(20),
                     Space::new().width(Length::Fill),
+                    text_input("Filter…", &self.grid_filter)
+                        .on_input(Message::GridFilterChanged)
+                        .size(13)
+                        .width(Length::Fixed(180.0)),
                     button(text(format!("Sort: {}", self.sort.label())).size(12))
                         .on_press(Message::ToggleSort),
                 ]
@@ -1578,6 +1594,18 @@ impl State {
                     );
                 } else {
                     let mut items = self.items.clone();
+                    // MUSIC-ALBUMS-4 — apply the in-header filter (case-insensitive
+                    // label substring) before sort + layout.
+                    let needle = self.grid_filter.trim().to_lowercase();
+                    if !needle.is_empty() {
+                        items.retain(|it| it.label.to_lowercase().contains(&needle));
+                        if items.is_empty() {
+                            col = col.push(
+                                text(format!("No matches for \u{201c}{}\u{201d}.", needle))
+                                    .size(13),
+                            );
+                        }
+                    }
                     prefs::apply_sort(&mut items, self.sort);
                     // AIR-11.c — width-adaptive grid: the column count is
                     // derived from the live viewport width via iced
