@@ -251,6 +251,12 @@ rustls-native-certs = { version = "0.8", optional = true }
 # worker bodies (event-stream `.next()`, `try_join`, etc.).
 futures-util = { version = "0.3", optional = true }
 
+# SUBSTRATE-2 (SUBSTRATE-V2) — the etcd v3 client for the coordination plane
+# (leader election + peer directory + health). Default features only (no TLS:
+# lock #11 — etcd is bound to the Nebula overlay which already encrypts; client-
+# cert TLS is a deferred follow-on). Async ⇒ rides the `async-services` gate.
+etcd-client = { version = "0.19", optional = true }
+
 [dev-dependencies]
 # Deterministic snapshot diffs for library-contract tests (12.11.5).
 insta    = { version = "1", features = ["json", "redactions"] }
@@ -296,6 +302,7 @@ async-services = [
     "dep:tokio-rustls",
     "dep:rustls-native-certs",
     "dep:futures-util",
+    "dep:etcd-client",
     "dep:mde-bus",
     "dep:mde-notify",
 ]

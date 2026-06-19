@@ -178,6 +178,9 @@ pub mod worker_role;
 // that need DBus / async workers enable the feature.
 #[cfg(feature = "async-services")]
 pub mod ipc;
+/// SUBSTRATE-V2 — the etcd (coordination) + Syncthing (files) substrate clients.
+#[cfg(feature = "async-services")]
+pub mod substrate;
 #[cfg(feature = "async-services")]
 pub mod workers;
 

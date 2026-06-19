@@ -5295,6 +5295,23 @@ fn run_serve(
             mesh_latency_sweep_secs = daemon_cfg.mesh_latency_sweep_secs,
             "E1.3: loaded /etc/mackesd/mackesd.toml daemon config",
         );
+        // SUBSTRATE-2 — when the etcd coordination plane is provisioned on this
+        // node (setup-etcd.sh wrote the endpoints file; absent on pre-cutover
+        // nodes ⇒ no-op), probe it at startup so the substrate's reachability is
+        // observable. The full leader/directory/health move onto these endpoints
+        // is the rest of SUBSTRATE-V2; this proves the client + endpoints contract.
+        {
+            let eps = mackesd_core::substrate::etcd::default_endpoints();
+            if !eps.is_empty() {
+                tokio::spawn(async move {
+                    if mackesd_core::substrate::etcd::probe(&eps).await {
+                        tracing::info!(endpoints = ?eps, "SUBSTRATE-2: etcd coordination plane reachable");
+                    } else {
+                        tracing::warn!(endpoints = ?eps, "SUBSTRATE-2: etcd endpoints configured but unreachable");
+                    }
+                });
+            }
+        }
         // MESH-MDNS-RELAY — native cross-segment mDNS service relay (browses
         // the local LAN, publishes services to the mesh Bus). Rank 0: a relay
         // control-plane worker, runs on every role.
