@@ -11,9 +11,15 @@ Pre-release history (the E1–E11 epochs, the MackesWorkstation split, and the
 v2.x–v6.x phase plans) lives in the git log and `docs/design/` — this file
 starts at the first packaged release line.
 
-## [Unreleased]
-
-## [10.0.18] - 2026-06-19
+## [11.0.0] "Winter-Is-Coming" — Unreleased
+> Major version: the SUBSTRATE-V2 split (etcd coordination + Syncthing files,
+> LizardFS retired) + the MCNF rename land here. **No release rolls until 11.0 is
+> complete** (operator, 2026-06-19) — all 10.0.x-era session work below ships in
+> 11.0; the running fleet stays on the live-patched 10.0.17 until then.
+### Headline (planned — see docs/design/substrate-v2.md)
+- **SUBSTRATE-V2** — replace LizardFS with **etcd** (leader/directory/health) +
+  **Syncthing** (full-mesh files on /mnt/mesh-storage); mesh liveness no longer
+  depends on a filesystem mount; "Mesh Sync" rename.
 ### Added
 - **RCLICK** — Win+X-style right-click power menu on the panel launcher (File
   Explorer/Settings/Terminal/Terminal-Admin/Task-Manager(btop)/Midnight-Commander/
