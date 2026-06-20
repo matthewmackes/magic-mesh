@@ -14,7 +14,7 @@ mod cosmic_compat;
 use cosmic_compat::{ButtonSty, TextSty};
 
 use cosmic::iced::widget::{
-    button, column, container, image, row, scrollable, stack, text, text_input, Space,
+    button, column, container, image, mouse_area, row, scrollable, stack, text, text_input, Space,
 };
 use cosmic::iced::{Length, Subscription};
 use cosmic::{Application, ApplicationExt, Element};
@@ -272,6 +272,20 @@ struct State {
     maxi_lyrics: Vec<String>,
     /// AIR-15.b.5 — the mesh peer roster (Peers tab).
     maxi_peers: Vec<nowplaying::PeerState>,
+    /// MUSIC-RFX-8 — the open right-click context menu (`None` = closed). Carries
+    /// what was right-clicked so the sheet renders the applicable actions.
+    context_menu: Option<TrackContext>,
+}
+
+/// MUSIC-RFX-8 — the target of a right-click track context menu. A track row
+/// knows its song id + title; playlist removal ("Remove from playlist") is
+/// offered only when the row is inside the open playlist editor.
+#[derive(Debug, Clone)]
+struct TrackContext {
+    song_id: String,
+    title: String,
+    /// `Some(index)` when this row is inside the open playlist editor → "Remove".
+    playlist_index: Option<usize>,
 }
 
 /// AIR-15.b.4 — which maxi-player tab is showing.
@@ -385,6 +399,13 @@ enum Message {
     /// MUSIC-RFX-6b — move a track up / down one slot; persists the new order.
     PlaylistMoveUp(usize),
     PlaylistMoveDown(usize),
+    /// MUSIC-RFX-8 — open / close the right-click track context menu.
+    OpenTrackMenu(TrackContext),
+    CloseContextMenu,
+    /// MUSIC-RFX-8 — play this song now (clear queue → enqueue → play).
+    PlaySongNow(String),
+    /// MUSIC-RFX-8 — remove the track at this index from the open playlist.
+    RemoveFromPlaylist(usize),
     /// Add a song result to the queue; the reply closes the sheet.
     EnqueueSong(String),
     SearchEnqueued(Result<(), String>),
@@ -479,6 +500,7 @@ impl State {
             new_playlist_name: String::new(),
             renaming_playlist: None,
             playlist_tracks: Vec::new(),
+            context_menu: None,
             rename_buffer: String::new(),
             maxi_tab: MaxiTab::Queue,
             maxi_lyrics: Vec::new(),
@@ -851,6 +873,7 @@ impl State {
                 Task::none()
             }
             Message::OpenAlbum(id, name) => {
+                self.context_menu = None;
                 self.nav.push(Route::Album(id.clone(), name));
                 self.dismiss_search();
                 self.album = None;
@@ -904,6 +927,7 @@ impl State {
             }
             // MUSIC-RFX-7 — add-to-playlist picker (reachable from any track row).
             Message::OpenAddToPlaylist(song_id) => {
+                self.context_menu = None;
                 self.add_to_playlist_song = Some(song_id);
                 self.add_to_playlist_choices.clear();
                 Task::perform(library::fetch("list-playlists"), |r| match r {
@@ -995,6 +1019,30 @@ impl State {
                 }
             }
             Message::PlaylistMoveDown(idx) => self.move_playlist_track(idx, idx + 1),
+            Message::OpenTrackMenu(ctx) => {
+                self.context_menu = Some(ctx);
+                Task::none()
+            }
+            Message::CloseContextMenu => {
+                self.context_menu = None;
+                Task::none()
+            }
+            Message::PlaySongNow(id) => {
+                self.context_menu = None;
+                Task::perform(album::play_ids(vec![id]), Message::AlbumActionDone)
+            }
+            Message::RemoveFromPlaylist(idx) => {
+                self.context_menu = None;
+                if idx >= self.playlist_tracks.len() {
+                    return Task::none();
+                }
+                let Route::Playlist(id, _) = self.nav.current() else {
+                    return Task::none();
+                };
+                let id = id.clone();
+                self.playlist_tracks.remove(idx);
+                Task::perform(album::playlist_remove(id, idx), Message::AlbumActionDone)
+            }
             Message::WindowResized(w) => {
                 self.grid_width = w;
                 Task::none()
@@ -1080,9 +1128,11 @@ impl State {
                 None => Task::none(),
             },
             Message::PlayTrackNext(id) => {
+                self.context_menu = None;
                 Task::perform(album::play_next(id), Message::AlbumActionDone)
             }
             Message::AddTrackToQueue(id) => {
+                self.context_menu = None;
                 Task::perform(album::enqueue_ids(vec![id]), Message::AlbumActionDone)
             }
             Message::AlbumActionDone(result) => {
@@ -1961,6 +2011,10 @@ impl State {
         // add-to-playlist picker (it takes priority when both could be open).
         if self.add_to_playlist_song.is_some() {
             stack![page, self.add_to_playlist_sheet()].into()
+        } else if self.context_menu.is_some() {
+            // MUSIC-RFX-8 — right-click menu (add-to-playlist, opened from it,
+            // takes priority since it clears the menu).
+            stack![page, self.context_menu_sheet()].into()
         } else if self.search_open {
             stack![page, self.search_sheet()].into()
         } else {
@@ -1998,6 +2052,57 @@ impl State {
             .center_x(Length::Fill)
             .center_y(Length::Fill)
             .into()
+    }
+
+    /// MUSIC-RFX-8 — the right-click track context menu: an action list over a
+    /// full-screen dismiss backdrop. Actions reuse the existing track messages;
+    /// "Remove from playlist" appears only when the row is in the playlist
+    /// editor. iced has no native cursor-anchored popup, so the menu centers
+    /// (a cursor-anchored position is a polish follow-on).
+    fn context_menu_sheet(&self) -> Element<'_, Message> {
+        let Some(ctx) = &self.context_menu else {
+            return Space::new().into();
+        };
+        let item = |label: &str, msg: Message| {
+            button(text(label.to_string()).size(13))
+                .width(Length::Fill)
+                .on_press(msg)
+        };
+        let mut col = column![
+            text(ctx.title.clone()).size(14),
+            Space::new().height(Length::Fixed(6.0)),
+            item("Play", Message::PlaySongNow(ctx.song_id.clone())),
+            item("Play next", Message::PlayTrackNext(ctx.song_id.clone())),
+            item(
+                "Add to queue",
+                Message::AddTrackToQueue(ctx.song_id.clone())
+            ),
+            item(
+                "Add to playlist…",
+                Message::OpenAddToPlaylist(ctx.song_id.clone())
+            ),
+        ]
+        .spacing(2)
+        .padding(12)
+        .width(Length::Fixed(240.0));
+        if let Some(idx) = ctx.playlist_index {
+            col = col.push(item(
+                "Remove from playlist",
+                Message::RemoveFromPlaylist(idx),
+            ));
+        }
+        col = col.push(Space::new().height(Length::Fixed(6.0)));
+        col = col.push(item("Cancel", Message::CloseContextMenu));
+
+        // Full-screen dismiss backdrop beneath the centered menu box.
+        let backdrop = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::CloseContextMenu);
+        let menu = container(col).center_x(Length::Fill).center_y(Length::Fill);
+        stack![backdrop, menu].into()
     }
 
     /// The AIR-14 results sheet: Artists / Albums / Songs sections over the
@@ -2098,7 +2203,13 @@ impl State {
                 row_el =
                     row_el.push(button(text("↓").size(12)).on_press(Message::PlaylistMoveDown(i)));
             }
-            list = list.push(row_el);
+            // MUSIC-RFX-8 — right-click for the action menu (incl. Remove).
+            let menu_ctx = TrackContext {
+                song_id: t.id.clone(),
+                title: t.label.clone(),
+                playlist_index: Some(i),
+            };
+            list = list.push(mouse_area(row_el).on_right_press(Message::OpenTrackMenu(menu_ctx)));
         }
 
         column![header, Space::new().height(Length::Fixed(12.0)), list]
@@ -2161,7 +2272,14 @@ impl State {
                     .on_press(Message::OpenAddToPlaylist(t.id.clone())),
             ]
             .spacing(8);
-            list = list.push(track_row);
+            // MUSIC-RFX-8 — right-click the row for the dense action menu.
+            let menu_ctx = TrackContext {
+                song_id: t.id.clone(),
+                title: t.title.clone(),
+                playlist_index: None,
+            };
+            list =
+                list.push(mouse_area(track_row).on_right_press(Message::OpenTrackMenu(menu_ctx)));
         }
 
         // Art placeholder (left) + header/tracks (right). The art-over-Bus

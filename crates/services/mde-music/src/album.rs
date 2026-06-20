@@ -310,6 +310,21 @@ pub async fn playlist_add_track(playlist_id: String, song_id: String) -> Result<
     .await
 }
 
+/// MUSIC-RFX-8 — remove the track at `index` from a playlist
+/// (`action/music/playlist-update`, body `{"id":,"remove_indices":[index]}`).
+/// The daemon's `songIndexToRemove` is 0-based against the current order.
+///
+/// # Errors
+/// Bus-store / request / timeout failures.
+pub async fn playlist_remove(id: String, index: usize) -> Result<(), String> {
+    let body = serde_json::json!({ "id": id, "remove_indices": [index.to_string()] }).to_string();
+    with_bus(move |persist, rt| {
+        req(persist, rt, "action/music/playlist-update", Some(&body))?;
+        Ok(())
+    })
+    .await
+}
+
 /// MUSIC-RFX-6 — rename a playlist (`action/music/playlist-update`, body
 /// `{"id":,"name":}`).
 ///
