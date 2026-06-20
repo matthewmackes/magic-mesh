@@ -82,6 +82,22 @@ enum Cmd {
         mac: String,
     },
 
+    /// ROUTE-TRACE-1 — assemble + print the logical path (a PathGraph) between
+    /// two endpoints, the CLI parity for `action/route/trace`. Built from the
+    /// CONNECT exposure policy + the peer directory on the shared substrate.
+    RouteTrace {
+        /// Destination: a published service id (ingress) or an external host/IP
+        /// (egress).
+        #[arg(long = "to", value_name = "DEST")]
+        to: String,
+        /// Source mesh node (egress direction).
+        #[arg(long = "from", value_name = "NODE", default_value = "")]
+        from: String,
+        /// `ingress` (default) or `egress`.
+        #[arg(long = "direction", value_name = "DIR", default_value = "ingress")]
+        direction: String,
+    },
+
     /// MESH-A-4.b.1 (v5.0.0) — browse the LAN for mDNS services
     /// (`avahi-browse -aprt`), group them by host, classify each, and
     /// print one `SurroundingHost` JSON line per discovered host.
@@ -2448,6 +2464,21 @@ fn main() -> anyhow::Result<()> {
             magic_fleet::structured_log::append(&root, &record)
                 .map_err(|e| anyhow::anyhow!("log-emit append: {e}"))?;
             return Ok(());
+        }
+        Cmd::RouteTrace {
+            to,
+            from,
+            direction,
+        } => {
+            // ROUTE-TRACE-1 — run the assembler locally against the shared
+            // substrate state + print the PathGraph (CLI parity with the
+            // action/route/trace responder).
+            let root = mackesd_core::default_qnm_shared_root();
+            let svc = mackesd_core::ipc::route::RouteService::new(root);
+            let body =
+                serde_json::json!({ "to": to, "from": from, "direction": direction }).to_string();
+            let reply = mackesd_core::ipc::route::build_reply(&svc, "trace", Some(&body));
+            println!("{reply}");
         }
         Cmd::FleetStatus { json } => {
             // Roster source is the replicated directory, not the local
