@@ -252,9 +252,152 @@ impl PathGraph {
     }
 }
 
+// ---- Assembly from real mesh state (ROUTE-TRACE-1) -------------------------
+//
+// Pure assemblers: given the already-resolved state (an exposure policy + the
+// hosting peer's overlay IP + the ingress lighthouse's public IP), build the
+// PathGraph. The `mackesd` responder gathers that state (exposure::load,
+// read_peers, the nebula roster) and calls these; keeping the assembly here
+// makes it unit-testable without the daemon + lets the GUI reason about the same
+// shapes. VPN-GW segments layer in once that epic exists (no placeholder now).
+
+use crate::exposure::ExposurePolicy;
+
+/// Build the **ingress** path for a published service from its CONNECT exposure
+/// policy: `Internet → Ingress(lighthouse) → <hosting node> → Service`. The
+/// control point on the internet→ingress edge is the public boundary: a
+/// public-via-ingress service is `Allow` (the firewalld profile + Caddy open it),
+/// a mesh-only service is `Block` ("not published — mesh-only"), so a trace to an
+/// unexposed service shows exactly where it's refused. `peer_overlay_ip` /
+/// `lighthouse_public_ip` are looked up by the caller (the peer directory /
+/// nebula roster); `None` is rendered as an unknown address, never a guess.
+#[must_use]
+pub fn assemble_ingress(
+    svc: &ExposurePolicy,
+    peer_overlay_ip: Option<&str>,
+    lighthouse_public_ip: Option<&str>,
+) -> PathGraph {
+    let public = svc.is_public();
+    let (lh_label, hostname) = match &svc.ingress {
+        Some(b) => (b.lighthouse.clone(), Some(b.hostname.clone())),
+        None => ("(no ingress)".to_string(), None),
+    };
+    let host_node = &svc.source.node;
+
+    let net = PathNode {
+        id: "internet".into(),
+        kind: NodeKind::Internet,
+        label: "Internet".into(),
+        ..Default::default()
+    };
+    let ingress = PathNode {
+        id: "ingress".into(),
+        kind: NodeKind::Ingress,
+        label: lh_label,
+        public_ip: lighthouse_public_ip.map(str::to_string),
+        dns_name: hostname,
+        ..Default::default()
+    };
+    let host = PathNode {
+        id: "host".into(),
+        kind: NodeKind::OverlayPeer,
+        label: host_node.clone(),
+        overlay_ip: peer_overlay_ip.map(str::to_string),
+        ..Default::default()
+    };
+    let service = PathNode {
+        id: "service".into(),
+        kind: NodeKind::Service,
+        label: format!("{} ({}/{})", svc.id, svc.source.port, svc.source.proto),
+        hosting_node: Some(host_node.clone()),
+        ..Default::default()
+    };
+
+    let boundary = ControlPoint {
+        firewall: "firewalld:public + caddy".into(),
+        verdict: if public {
+            Verdict::Allow
+        } else {
+            Verdict::Block
+        },
+        rule: if public {
+            format!("published via {} (CONNECT exposure)", svc.source.proto)
+        } else {
+            "not published — mesh-only (no CONNECT exposure)".into()
+        },
+    };
+
+    let mut g = PathGraph::new(Direction::Ingress)
+        .with_node(net)
+        .with_node(ingress)
+        .with_node(host)
+        .with_node(service)
+        .with_edge(PathEdge {
+            from: "internet".into(),
+            to: "ingress".into(),
+            layer: Layer::Public,
+            transport: Transport::Public,
+            control: Some(boundary),
+            ..Default::default()
+        })
+        .with_edge(PathEdge {
+            from: "ingress".into(),
+            to: "host".into(),
+            layer: Layer::Mesh,
+            transport: Transport::DirectOverlay,
+            ..Default::default()
+        })
+        .with_edge(PathEdge {
+            from: "host".into(),
+            to: "service".into(),
+            layer: Layer::Host,
+            transport: Transport::Loopback,
+            ..Default::default()
+        });
+    g.recompute_blocked_at();
+    g
+}
+
+/// Build the **egress** path from a mesh node to an external destination. Without
+/// VPN-GW this is the plain WAN egress: `Host(source) → Internet(dest)`; once
+/// VPN-GW exists the gateway + tunnel + exit nodes splice between them. `source`
+/// is the originating node's label + overlay IP; `dest_label` is the destination
+/// (a hostname/IP). Pure — no VPN placeholder is invented.
+#[must_use]
+pub fn assemble_egress(
+    source_label: &str,
+    source_overlay_ip: Option<&str>,
+    dest_label: &str,
+) -> PathGraph {
+    let mut g = PathGraph::new(Direction::Egress)
+        .with_node(PathNode {
+            id: "source".into(),
+            kind: NodeKind::Host,
+            label: source_label.to_string(),
+            overlay_ip: source_overlay_ip.map(str::to_string),
+            ..Default::default()
+        })
+        .with_node(PathNode {
+            id: "internet".into(),
+            kind: NodeKind::Internet,
+            label: dest_label.to_string(),
+            ..Default::default()
+        })
+        .with_edge(PathEdge {
+            from: "source".into(),
+            to: "internet".into(),
+            layer: Layer::Public,
+            transport: Transport::Public,
+            ..Default::default()
+        });
+    g.recompute_blocked_at();
+    g
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exposure::{IngressBinding, ServiceSource, Tier};
 
     fn node(id: &str, kind: NodeKind) -> PathNode {
         PathNode {
@@ -350,6 +493,70 @@ mod tests {
             .with_node(node("b", NodeKind::Host))
             .with_edge(edge("a", "b", Layer::Mesh, Transport::DirectOverlay));
         assert!(ok.validate().is_ok());
+    }
+
+    fn web_policy(public: bool) -> ExposurePolicy {
+        ExposurePolicy {
+            id: "grafana".into(),
+            source: ServiceSource {
+                node: "eagle".into(),
+                port: 3000,
+                proto: "tcp".into(),
+                ..Default::default()
+            },
+            tier: if public {
+                Tier::PublicViaIngress
+            } else {
+                Tier::MeshOnly
+            },
+            ingress: public.then(|| IngressBinding {
+                lighthouse: "Lighthouse-01".into(),
+                hostname: "grafana.services.example".into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn assemble_ingress_public_service_is_reachable() {
+        let g = assemble_ingress(&web_policy(true), Some("10.42.0.2"), Some("45.55.33.179"));
+        assert_eq!(g.direction, Direction::Ingress);
+        // Internet → Ingress → host(overlay peer) → Service.
+        assert_eq!(g.nodes.len(), 4);
+        assert_eq!(g.nodes[1].kind, NodeKind::Ingress);
+        assert_eq!(
+            g.nodes[1].dns_name.as_deref(),
+            Some("grafana.services.example")
+        );
+        assert_eq!(g.nodes[1].public_ip.as_deref(), Some("45.55.33.179"));
+        assert_eq!(g.nodes[2].overlay_ip.as_deref(), Some("10.42.0.2"));
+        assert_eq!(g.nodes[3].hosting_node.as_deref(), Some("eagle"));
+        // The public boundary allows it → reachable.
+        assert!(g.is_reachable());
+        assert_eq!(g.edges[0].control.as_ref().unwrap().verdict, Verdict::Allow);
+        assert!(g.validate().is_ok());
+    }
+
+    #[test]
+    fn assemble_ingress_mesh_only_service_is_blocked_at_the_boundary() {
+        let g = assemble_ingress(&web_policy(false), Some("10.42.0.2"), None);
+        // mesh-only ⇒ the internet→ingress edge blocks.
+        assert!(!g.is_reachable());
+        assert_eq!(g.blocked_at.as_deref(), Some("internet->ingress"));
+        let ctrl = g.edges[0].control.as_ref().unwrap();
+        assert_eq!(ctrl.verdict, Verdict::Block);
+        assert!(ctrl.rule.contains("mesh-only"));
+    }
+
+    #[test]
+    fn assemble_egress_is_host_to_internet() {
+        let g = assemble_egress("eagle", Some("10.42.0.2"), "1.1.1.1");
+        assert_eq!(g.direction, Direction::Egress);
+        assert_eq!(g.nodes.len(), 2);
+        assert_eq!(g.nodes[0].kind, NodeKind::Host);
+        assert_eq!(g.nodes[1].label, "1.1.1.1");
+        assert!(g.is_reachable());
+        assert!(g.validate().is_ok());
     }
 
     #[test]
