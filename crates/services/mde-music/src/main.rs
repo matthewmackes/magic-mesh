@@ -264,6 +264,9 @@ struct State {
     /// `None` when no rename is open.
     renaming_playlist: Option<String>,
     rename_buffer: String,
+    /// MUSIC-RFX-6b — the open playlist editor's tracks in current order
+    /// (the [`Route::Playlist`] detail page). Empty until loaded / off-route.
+    playlist_tracks: Vec<library::LibraryItem>,
     /// AIR-15.b.4 — maxi tab + the current track's lyrics lines.
     maxi_tab: MaxiTab,
     maxi_lyrics: Vec<String>,
@@ -375,6 +378,13 @@ enum Message {
     CommitRenamePlaylist,
     CancelRenamePlaylist,
     DeletePlaylist(String),
+    /// MUSIC-RFX-6b — open the playlist reorder editor (id, name).
+    OpenPlaylist(String, String),
+    /// MUSIC-RFX-6b — the editor's tracks finished loading (in current order).
+    PlaylistTracksLoaded(Vec<library::LibraryItem>),
+    /// MUSIC-RFX-6b — move a track up / down one slot; persists the new order.
+    PlaylistMoveUp(usize),
+    PlaylistMoveDown(usize),
     /// Add a song result to the queue; the reply closes the sheet.
     EnqueueSong(String),
     SearchEnqueued(Result<(), String>),
@@ -468,6 +478,7 @@ impl State {
             add_to_playlist_choices: Vec::new(),
             new_playlist_name: String::new(),
             renaming_playlist: None,
+            playlist_tracks: Vec::new(),
             rename_buffer: String::new(),
             maxi_tab: MaxiTab::Queue,
             maxi_lyrics: Vec::new(),
@@ -965,6 +976,25 @@ impl State {
                 }
                 reload_playlists_after(album::playlist_delete(id))
             }
+            Message::OpenPlaylist(id, name) => {
+                self.nav.push(Route::Playlist(id.clone(), name));
+                self.playlist_tracks.clear();
+                Task::perform(album::playlist_songs(id), |r| {
+                    Message::PlaylistTracksLoaded(r.unwrap_or_default())
+                })
+            }
+            Message::PlaylistTracksLoaded(tracks) => {
+                self.playlist_tracks = tracks;
+                Task::none()
+            }
+            Message::PlaylistMoveUp(idx) => {
+                if idx == 0 {
+                    Task::none()
+                } else {
+                    self.move_playlist_track(idx, idx - 1)
+                }
+            }
+            Message::PlaylistMoveDown(idx) => self.move_playlist_track(idx, idx + 1),
             Message::WindowResized(w) => {
                 self.grid_width = w;
                 Task::none()
@@ -1301,6 +1331,12 @@ impl State {
             HubCard::Podcasts => {
                 matches!(cur, Route::Category(HubCard::Podcasts) | Route::Podcast(..))
             }
+            HubCard::Playlists => {
+                matches!(
+                    cur,
+                    Route::Category(HubCard::Playlists) | Route::Playlist(..)
+                )
+            }
             other => matches!(cur, Route::Category(x) if *x == other),
         };
         let mut col = column![]
@@ -1583,6 +1619,7 @@ impl State {
         let body: Element<'_, Message> = match self.nav.current() {
             Route::Hub => self.home_dashboard(),
             Route::Album(..) => self.album_page(),
+            Route::Playlist(..) => self.playlist_page(),
             route => {
                 // AIR-11.b — title + a sort toggle; items lay out in a
                 // wrapping 160×160 card grid, ordered by the persisted sort.
@@ -1791,6 +1828,13 @@ impl State {
                                     .into()
                                 } else {
                                     row![
+                                        // MUSIC-RFX-6b — open the reorder editor.
+                                        button(text("Edit").size(11)).on_press(
+                                            Message::OpenPlaylist(
+                                                item.id.clone(),
+                                                item.label.clone(),
+                                            ),
+                                        ),
                                         button(text("Rename").size(11)).on_press(
                                             Message::StartRenamePlaylist(
                                                 item.id.clone(),
@@ -1995,6 +2039,74 @@ impl State {
     /// album header (Play / Shuffle / Add) + the numbered track list (each
     /// row can Play-Next or Add-to-Queue). Cover-art *image* rendering is a
     /// follow-on (art-over-Bus); the layout uses a glyph placeholder.
+    /// MUSIC-RFX-6b — move the playlist track at `from` to `to` (an adjacent
+    /// swap), then persist the whole new order to the daemon. Out-of-range or
+    /// no-op moves do nothing.
+    fn move_playlist_track(&mut self, from: usize, to: usize) -> Task<Message> {
+        let n = self.playlist_tracks.len();
+        if from >= n || to >= n || from == to {
+            return Task::none();
+        }
+        self.playlist_tracks.swap(from, to);
+        let Route::Playlist(id, _) = self.nav.current() else {
+            return Task::none();
+        };
+        let id = id.clone();
+        let order: Vec<String> = self.playlist_tracks.iter().map(|t| t.id.clone()).collect();
+        Task::perform(album::playlist_reorder(id, order), Message::AlbumActionDone)
+    }
+
+    /// MUSIC-RFX-6b — the playlist reorder editor: the tracks in order, each
+    /// with ↑/↓ controls (the accessible reorder affordance — iced has no
+    /// native drag-drop list, mirroring the RFX-5 queue rows). A reorder
+    /// persists in place via `playlist-reorder`, preserving the playlist id.
+    fn playlist_page(&self) -> Element<'_, Message> {
+        let Route::Playlist(id, name) = self.nav.current() else {
+            return text("No playlist.").size(13).into();
+        };
+        let header = column![
+            text(name.clone()).size(24),
+            text(format!(
+                "{} track(s) · reorder with ↑/↓",
+                self.playlist_tracks.len()
+            ))
+            .size(12),
+            Space::new().height(Length::Fixed(10.0)),
+            button(text("Play all")).on_press(Message::PlayPlaylist(id.clone())),
+        ]
+        .spacing(4);
+
+        let mut list = column![].spacing(4);
+        if self.playlist_tracks.is_empty() {
+            list = list.push(text("This playlist is empty.").size(13));
+        }
+        let last = self.playlist_tracks.len().saturating_sub(1);
+        for (i, t) in self.playlist_tracks.iter().enumerate() {
+            let mut row_el = row![
+                text(format!("{}.", i + 1))
+                    .size(13)
+                    .width(Length::Fixed(32.0)),
+                text(t.label.clone()).size(13).width(Length::Fill),
+            ]
+            .spacing(8)
+            .align_y(cosmic::iced::Alignment::Center);
+            if i > 0 {
+                row_el =
+                    row_el.push(button(text("↑").size(12)).on_press(Message::PlaylistMoveUp(i)));
+            }
+            if i < last {
+                row_el =
+                    row_el.push(button(text("↓").size(12)).on_press(Message::PlaylistMoveDown(i)));
+            }
+            list = list.push(row_el);
+        }
+
+        column![header, Space::new().height(Length::Fixed(12.0)), list]
+            .spacing(6)
+            .padding(8)
+            .into()
+    }
+
     fn album_page(&self) -> Element<'_, Message> {
         if self.album_loading {
             return text("Loading album…").size(13).into();

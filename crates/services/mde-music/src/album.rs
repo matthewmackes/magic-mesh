@@ -252,6 +252,35 @@ pub async fn play_playlist(id: String) -> Result<(), String> {
     .await
 }
 
+/// MUSIC-RFX-6b — load a playlist's tracks (id + title) in their current
+/// order (`action/music/get-playlist`). Powers the reorder editor.
+///
+/// # Errors
+/// Bus-store / request / timeout failures.
+pub async fn playlist_songs(id: String) -> Result<Vec<crate::library::LibraryItem>, String> {
+    with_bus(move |persist, rt| {
+        let reply = req(persist, rt, "action/music/get-playlist", Some(&id))?;
+        Ok(crate::library::parse_items(&reply))
+    })
+    .await
+}
+
+/// MUSIC-RFX-6b — persist a new track order for a playlist
+/// (`action/music/playlist-reorder`, body `{"id":,"order":[song_id,…]}`). The
+/// daemon re-applies the order in place, preserving the playlist id. `order`
+/// is the full track set rearranged.
+///
+/// # Errors
+/// Bus-store / request / timeout failures.
+pub async fn playlist_reorder(id: String, order: Vec<String>) -> Result<(), String> {
+    let body = serde_json::json!({ "id": id, "order": order }).to_string();
+    with_bus(move |persist, rt| {
+        req(persist, rt, "action/music/playlist-reorder", Some(&body))?;
+        Ok(())
+    })
+    .await
+}
+
 /// MUSIC-RFX-6 — create a new (empty) playlist by name
 /// (`action/music/playlist-create`, body `{"name":}`). Tracks are added via
 /// RFX-7's add-to-playlist; reorder is RFX-6b.

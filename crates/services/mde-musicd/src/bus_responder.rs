@@ -57,7 +57,7 @@ pub const ACTION_VERBS: [&str; 10] = [
 
 /// The library-browse verbs served on `action/music/<verb>`
 /// (asynchronous — each proxies an Airsonic REST call).
-pub const BROWSE_VERBS: [&str; 22] = [
+pub const BROWSE_VERBS: [&str; 23] = [
     "list-albums",
     "list-artists",
     "search",
@@ -79,6 +79,8 @@ pub const BROWSE_VERBS: [&str; 22] = [
     "playlist-create",
     "playlist-update",
     "playlist-delete",
+    // MUSIC-RFX-6b — reorder a playlist in place (preserves its id).
+    "playlist-reorder",
     // MUSIC-HOME-1 — the Music Home page's server-stats snapshot.
     "library-stats",
     // MUSIC-HOME-3 — Home discovery strips: most-played + starred albums.
@@ -519,6 +521,28 @@ fn dispatch_browse(
                         .await
                         .map(|()| json!({ "deleted": id }))
                         .map_err(|e| e.to_string())
+                }
+            }
+            // MUSIC-RFX-6b — reorder a playlist in place. Body:
+            //   playlist-reorder {"id":..,"order":[song_id,…]}
+            // `order` is the full track set rearranged; the daemon re-applies it
+            // via one updatePlaylist (remove-all + re-add) so the id survives.
+            "playlist-reorder" => {
+                let v: serde_json::Value = serde_json::from_str(body.trim()).unwrap_or(json!({}));
+                match v.get("id").and_then(serde_json::Value::as_str) {
+                    Some(id) if !id.is_empty() => {
+                        let order = str_array(&v, "order");
+                        if order.is_empty() {
+                            Err("playlist-reorder: need {order:[song_id,…]}".to_string())
+                        } else {
+                            client
+                                .reorder_playlist(id, &order)
+                                .await
+                                .map(|()| json!({ "reordered": id, "len": order.len() }))
+                                .map_err(|e| e.to_string())
+                        }
+                    }
+                    _ => Err("playlist-reorder: need {id}".to_string()),
                 }
             }
             other => Err(format!("unknown browse verb: {other}")),
@@ -1026,8 +1050,13 @@ mod tests {
 
     #[test]
     fn playlist_write_verbs_are_browse_verbs() {
-        // MUSIC-RFX-3 — the three write verbs are served on the browse poll.
-        for verb in ["playlist-create", "playlist-update", "playlist-delete"] {
+        // MUSIC-RFX-3/6b — the write + reorder verbs are served on the browse poll.
+        for verb in [
+            "playlist-create",
+            "playlist-update",
+            "playlist-delete",
+            "playlist-reorder",
+        ] {
             assert!(
                 BROWSE_VERBS.contains(&verb),
                 "{verb} missing from BROWSE_VERBS"

@@ -881,6 +881,32 @@ impl Client {
         self.get("updatePlaylist", &extra).await.map(|_| ())
     }
 
+    /// MUSIC-RFX-6b — reorder a playlist **in place**, preserving its id.
+    /// Subsonic/Airsonic has no reorder endpoint and `updatePlaylist` only
+    /// appends (`songIdToAdd`) / removes-by-index (`songIndexToRemove`), so a
+    /// reorder is one `updatePlaylist` that removes every current index and
+    /// re-adds the tracks in `ordered_ids` order. Airsonic + Navidrome both
+    /// apply removals before additions, so the net result is exactly
+    /// `ordered_ids`. Done in a single request so a mid-way failure leaves the
+    /// playlist untouched — no destructive delete+recreate (which would mint a
+    /// new id and risk loss on partial failure). The current length is read
+    /// live so the remove set matches the server, not a stale client count.
+    ///
+    /// `ordered_ids` is the full track set rearranged; any id it omits is
+    /// dropped (the caller sends the complete reordered list).
+    ///
+    /// # Errors
+    /// Transport / API / parse failures.
+    pub async fn reorder_playlist(
+        &self,
+        id: &str,
+        ordered_ids: &[String],
+    ) -> Result<(), AirsonicError> {
+        let current = self.get_playlist(id).await?;
+        let remove: Vec<String> = (0..current.len()).map(|i| i.to_string()).collect();
+        self.update_playlist(id, None, ordered_ids, &remove).await
+    }
+
     /// MUSIC-RFX-3 — `deletePlaylist?id=` — delete a playlist.
     ///
     /// # Errors

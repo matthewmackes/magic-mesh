@@ -29,6 +29,8 @@ pub enum Route {
     Genre(String),
     /// A podcast channel page — its episodes (channel id, title).
     Podcast(String, String),
+    /// MUSIC-RFX-6b — a playlist detail/reorder editor (playlist id, name).
+    Playlist(String, String),
     /// A search-results page for a query.
     Search(String),
 }
@@ -42,7 +44,7 @@ impl Route {
             Self::Category(c) => c.label().to_string(),
             Self::Artist(_, name) | Self::Album(_, name) => name.clone(),
             Self::Genre(g) => g.clone(),
-            Self::Podcast(_, name) => name.clone(),
+            Self::Podcast(_, name) | Self::Playlist(_, name) => name.clone(),
             Self::Search(q) => format!("Search: {q}"),
         }
     }
