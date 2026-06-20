@@ -11,10 +11,34 @@ Pre-release history (the E1–E11 epochs, the MackesWorkstation split, and the
 v2.x–v6.x phase plans) lives in the git log and `docs/design/` — this file
 starts at the first packaged release line.
 
-## [11.0.0] "Winter-Is-Coming" — Unreleased
+## [11.0.0] "Winter-Is-Coming" - 2026-06-20
 > Major version: the SUBSTRATE-V2 split (etcd coordination + Syncthing files,
-> LizardFS retired) + the MCNF rename. Planned — see docs/design/substrate-v2.md
-> (epic SUBSTRATE-1..14). **10.0.18 is the last 10.x cut; the next release is 11.0.**
+> LizardFS retiring) + the MCNF rename. See docs/design/substrate-v2.md
+> (epic SUBSTRATE-1..14). **10.0.18 was the last 10.x cut.**
+### Added
+- **SUBSTRATE-V2** — the new mesh substrate ships in the binary: etcd-backed
+  coordination (leader election / peer directory / health) and Syncthing-backed
+  file replication of `/mnt/mesh-storage` (no FUSE), replacing the LizardFS
+  "QNM-Shared" plane. The coordination bridges (`SUBSTRATE-1..10`) go etcd-only
+  once `/etc/mackesd/etcd-endpoints` exists; the cutover is deliberately
+  operator-driven (`install-helpers/cutover-substrate-v2.sh`, with `--no-flip`/
+  `--no-files` for a fleet-safe staged roll) and additive until LizardFS is
+  removed in a follow-up (SUBSTRATE-6). Validated by two live DO rehearsals
+  (etcd quorum + Syncthing file sync + reboot drill all green).
+- **MEDIA-LIGHTHOUSE** epic — Airsonic Podman container on every lighthouse as a
+  hot-redundant, published "Auto Configuration host" for the Music System over a
+  shared 100 GB object store (docs/design/media-lighthouse.md).
+- **MUSIC** — playlist editor (`Route::Playlist`) with drag-reorder + remove via
+  a track context menu, backed by the `playlist-reorder` musicd verb and a
+  persistent warm Airsonic client (`refresh_airsonic_client`).
+### Changed
+- **OPROG-6 / SELinux** — `SELINUX=disabled` is the new platform standard;
+  `install-helpers/setup-selinux-policy.sh` now disables SELinux (was: install a
+  CIL policy for Enforcing).
+- **Applet labels** — the panel Applications-menu applet now reads **`Start>`**
+  and the Notification-Hub applet reads **`Activity`** (text labels, not icons).
+- **mde-bus** — persisted events now use a monotonic ULID generator
+  (`static ULID_GEN`) so same-millisecond writes stay ordered.
 - **BRAND-11** — new 11.0 brand identity (the MCNF windowed-constellation logo,
   `assets/icons/Start5.png`). The background is flood-keyed to transparency
   (interior gridlines/nodes preserved) and regenerated across every brand
