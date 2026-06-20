@@ -195,12 +195,14 @@ RemainAfterExit=yes
 # full timeout and block mackesd). Bounded ~2 min; on a genuinely-down master it
 # exits non-zero → Restart + the mesh-health watchdog keep retrying.
 # LH-JOIN-QNM-1 (2026-06-20): wedge-proof. Every check that touches the mount is
-# `timeout`-guarded so a half-formed/stale FUSE mount in uninterruptible D-state
+# timeout-guarded so a half-formed/stale FUSE mount in uninterruptible D-state
 # (mfsmount daemon gone, kernel entry lingering) can NEVER hang the loop; the
-# recovery uses `fusermount -uz` + `umount -l` (LAZY) so it actually detaches a
-# wedged mount (plain `-u` can't). A fresh remote lighthouse join hit exactly this
-# (mackesd, started Wants-only per XPA-8, writes stray into the unmounted path →
-# mfsmount over non-empty half-succeeds-then-dies → wedge that survives reboot).
+# recovery uses lazy fusermount-uz + umount-l so it actually detaches a wedged
+# mount (plain -u cannot). A fresh remote lighthouse join hit exactly this
+# (mackesd, started Wants-only per XPA-8, writes stray into the unmounted path,
+# mfsmount over non-empty half-succeeds-then-dies, wedge that survives reboot).
+# NOTE: no backticks in these heredoc comments — this is an unquoted heredoc, so
+# a backticked command would be run at write-time (it broke the first attempt).
 ExecStart=/bin/sh -c 'i=0; while [ \$i -lt 15 ]; do timeout 6 mountpoint -q $QNM_PATH && exit 0; fusermount -uz $QNM_PATH 2>/dev/null; umount -l $QNM_PATH 2>/dev/null; pkill -f "mfsmount $QNM_PATH" 2>/dev/null; sleep 1; if [ -n "\$(timeout 6 ls -A $QNM_PATH 2>/dev/null)" ]; then d=/var/lib/mde/qnm-stray-\$(date +%s 2>/dev/null || echo bk); mkdir -p \$d; mv $QNM_PATH/* $QNM_PATH/.[!.]* \$d/ 2>/dev/null; fi; mfsmount $QNM_PATH -H $MASTER_IP -o allow_other,nonempty 2>/dev/null; sleep 3; timeout 6 mountpoint -q $QNM_PATH && exit 0; i=\$((i+1)); sleep 2; done; exit 1'
 ExecStop=/bin/sh -c 'fusermount -uz $QNM_PATH 2>/dev/null; umount -l $QNM_PATH 2>/dev/null; true'
 # LH-JOIN-QNM-1: bound the start job ABOVE the loop's worst case. WITHOUT this,
