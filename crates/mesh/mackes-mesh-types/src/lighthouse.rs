@@ -315,7 +315,10 @@ mod tests {
         // Only the three fully-addressed lighthouses, sorted by hostname.
         assert_eq!(roster.len(), 3, "half-known LH + the server are excluded");
         assert_eq!(
-            roster.iter().map(|e| e.node_id.as_str()).collect::<Vec<_>>(),
+            roster
+                .iter()
+                .map(|e| e.node_id.as_str())
+                .collect::<Vec<_>>(),
             ["lh-01", "lh-02", "lh-03"]
         );
         assert_eq!(roster[0].overlay_ip, "10.42.0.1");

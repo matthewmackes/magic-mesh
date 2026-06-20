@@ -68,7 +68,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("external-addr");
         write_external_addr_to(&p, "  203.0.113.7:4242 \n").unwrap();
-        assert_eq!(read_external_addr_from(&p).as_deref(), Some("203.0.113.7:4242"));
+        assert_eq!(
+            read_external_addr_from(&p).as_deref(),
+            Some("203.0.113.7:4242")
+        );
     }
 
     #[test]

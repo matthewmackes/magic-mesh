@@ -93,19 +93,21 @@ impl EnrollContext {
         let peers = mackes_mesh_types::peers::read_peers(&mackes_mesh_types::peers::peers_dir(
             &self.workgroup_root,
         ));
-        let mut entries: Vec<LighthouseEntry> = mackes_mesh_types::lighthouse::roster_from_directory(
-            &peers,
-        )
-        .into_iter()
-        .map(|a| LighthouseEntry {
-            node_id: a.node_id,
-            overlay_ip: a.overlay_ip,
-            external_addr: a.external_addr,
-        })
-        .collect();
+        let mut entries: Vec<LighthouseEntry> =
+            mackes_mesh_types::lighthouse::roster_from_directory(&peers)
+                .into_iter()
+                .map(|a| LighthouseEntry {
+                    node_id: a.node_id,
+                    overlay_ip: a.overlay_ip,
+                    external_addr: a.external_addr,
+                })
+                .collect();
         // Guarantee self is present — deduped by external_addr so we don't
         // double-list when this LH's own directory row is already included.
-        if !entries.iter().any(|e| e.external_addr == self.external_addr) {
+        if !entries
+            .iter()
+            .any(|e| e.external_addr == self.external_addr)
+        {
             entries.push(LighthouseEntry {
                 node_id: self.local_node_id.clone(),
                 overlay_ip: self.self_overlay.clone(),

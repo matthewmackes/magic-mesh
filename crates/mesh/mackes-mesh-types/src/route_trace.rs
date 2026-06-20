@@ -476,24 +476,22 @@ impl FirewallProfile {
                 name,
                 rules,
                 default,
-            } => {
-                rules.iter().find(|r| r.matches(port, proto)).map_or_else(
-                    || ControlPoint {
-                        firewall: name.clone(),
-                        verdict: *default,
-                        rule: match default {
-                            Verdict::Block => "default deny (no matching rule)".into(),
-                            Verdict::Allow => "default allow (no matching rule)".into(),
-                            Verdict::Indeterminate => "default indeterminate".into(),
-                        },
+            } => rules.iter().find(|r| r.matches(port, proto)).map_or_else(
+                || ControlPoint {
+                    firewall: name.clone(),
+                    verdict: *default,
+                    rule: match default {
+                        Verdict::Block => "default deny (no matching rule)".into(),
+                        Verdict::Allow => "default allow (no matching rule)".into(),
+                        Verdict::Indeterminate => "default indeterminate".into(),
                     },
-                    |r| ControlPoint {
-                        firewall: name.clone(),
-                        verdict: r.action,
-                        rule: r.cite.clone(),
-                    },
-                )
-            }
+                },
+                |r| ControlPoint {
+                    firewall: name.clone(),
+                    verdict: r.action,
+                    rule: r.cite.clone(),
+                },
+            ),
             Self::Indeterminate { name } => ControlPoint {
                 firewall: name.clone(),
                 verdict: Verdict::Indeterminate,
