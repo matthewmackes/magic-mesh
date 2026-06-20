@@ -95,11 +95,31 @@ EOF
 }
 
 enable_member() {
-  # The RPM ships our unit at /etc/systemd/system/etcd.service already; when run
-  # from a git checkout, copy it from the repo. Either way, end up with our unit.
-  local unit=/etc/systemd/system/etcd.service
-  local src="$(dirname "$0")/../packaging/systemd/etcd.service"
-  [ -f "$unit" ] || { [ -f "$src" ] && cp "$src" "$unit"; }
+  # Install OUR overlay-binding unit to /etc/systemd/system (admin precedence
+  # over Fedora's vendor /usr/lib/systemd/system/etcd.service, which reads
+  # /etc/etcd/etcd.conf and binds LOCALHOST → no cross-node quorum). Written
+  # INLINE so it works identically from a git checkout, the RPM, or
+  # /usr/libexec/mackesd — the old `cp $(dirname $0)/../packaging/...` resolved
+  # to a non-existent path when run installed, so Fedora's vendor unit won and
+  # etcd bound 127.0.0.1 (the SUBSTRATE-14 rehearsal caught exactly this).
+  # EnvironmentFile is /etc/etcd/etcd.env (the overlay IPs), never etcd.conf.
+  cat > /etc/systemd/system/etcd.service <<'UNIT'
+[Unit]
+Description=MCNF mesh coordination (etcd) — leader/directory/health over Nebula
+After=network-online.target nebula.service
+Wants=network-online.target
+ConditionPathExists=/etc/etcd/etcd.env
+[Service]
+Type=notify
+EnvironmentFile=/etc/etcd/etcd.env
+ExecStart=/usr/bin/etcd
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+TimeoutStartSec=0
+[Install]
+WantedBy=multi-user.target
+UNIT
   mkdir -p "$DATA_DIR"
   chown -R etcd:etcd "$DATA_DIR" 2>/dev/null || true
   # mackesd is ordered after etcd (never after a mount) — SUBSTRATE-7.

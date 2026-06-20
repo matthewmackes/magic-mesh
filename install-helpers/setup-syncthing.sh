@@ -59,8 +59,13 @@ if [ ! -f "$HOME_DIR/config.xml" ]; then
   log "generating syncthing identity in $HOME_DIR"
   syncthing generate --home "$HOME_DIR" >/dev/null 2>&1 || true
 fi
-# Device ID is printed by `generate`; re-derive deterministically from the cert.
-DEVICE_ID="$(syncthing generate --home "$HOME_DIR" 2>&1 | grep -oE 'device=[A-Z0-9-]{50,}' | head -1 | cut -d= -f2)"
+# Device ID is printed by `generate`. Match the ID PATTERN (8 dash-separated
+# 7-char groups), NOT a version-specific prefix — syncthing v1.30.0 (Fedora 43)
+# prints "Device ID: <ID>" while v2.x prints "device=<ID>"; the old `device=`
+# grep matched only v2 → empty → exit 1 on the live F43 build (SUBSTRATE-14
+# rehearsal caught the version skew). The deterministic id is derived from the
+# cert, so a second `generate` re-prints the same value.
+DEVICE_ID="$(syncthing generate --home "$HOME_DIR" 2>&1 | grep -oE '[A-Z0-9]{7}(-[A-Z0-9]{7}){7}' | head -1)"
 [ -z "$DEVICE_ID" ] && { echo "could not determine syncthing device id" >&2; exit 1; }
 log "device id: $DEVICE_ID"
 
@@ -167,9 +172,28 @@ print(f'configured folder {folder_id} at {folder} with {len(peers)} peer device(
 PY
 
 # ---- boot-durable unit ----------------------------------------------------
-UNIT=/etc/systemd/system/syncthing.service
-SRC="$(dirname "$0")/../packaging/systemd/syncthing.service"
-[ -f "$UNIT" ] || { [ -f "$SRC" ] && cp "$SRC" "$UNIT"; }
+# Write OUR unit INLINE (same fix as setup-etcd.sh — the old path-relative
+# `cp $(dirname $0)/../packaging/...` resolved to a non-existent path when run
+# from /usr/libexec/mackesd, so the unit was never installed and syncthing never
+# started; the SUBSTRATE-14 rehearsal caught it). Works identically from a git
+# checkout, the RPM, or the installed libexec path.
+cat > /etc/systemd/system/syncthing.service <<'UNIT'
+[Unit]
+Description=MCNF Mesh Sync (Syncthing) — overlay file replication
+After=network-online.target nebula.service
+Wants=network-online.target
+ConditionPathExists=/etc/systemd/system/syncthing.service.d/10-home.conf
+[Service]
+Type=simple
+Environment=MCNF_SYNCTHING_HOME=/var/lib/mcnf-syncthing
+ExecStart=/usr/bin/syncthing serve --home=${MCNF_SYNCTHING_HOME} --no-browser --no-restart
+Restart=always
+RestartSec=10
+SuccessExitStatus=3 4
+LimitNOFILE=65536
+[Install]
+WantedBy=multi-user.target
+UNIT
 # The unit runs `syncthing serve --home <HOME_DIR>`; pin the home via a drop-in
 # so a custom --home survives.
 mkdir -p /etc/systemd/system/syncthing.service.d
