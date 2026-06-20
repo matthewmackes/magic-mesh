@@ -345,6 +345,19 @@ pub fn materialize_config(
         &config_dir.join("config.yaml"),
         format!("{yaml}{sshd}").as_bytes(),
     )?;
+    // FOUND-NEBULA (2026-06-20): the `nebula` Fedora package ships an EXAMPLE
+    // `/etc/nebula/config.yml` (am_lighthouse:false, pki.cert=host.crt with a
+    // bogus 192.168.100.1 static_host_map). The nebula unit runs
+    // `-config /etc/nebula` (the whole DIRECTORY), so nebula MERGES that stale
+    // example with our `config.yaml` — the example's am_lighthouse:false +
+    // garbage static_host_map win, the overlay never forms, and (since it's a
+    // hard config error) the unit fails on a fresh node. Found bringing up a
+    // clean v11 lighthouse on F43. Remove the stock `.yml` so only our
+    // `.yaml` (+ `lighthouse-config.yaml`) drive nebula. Best-effort.
+    let stock = config_dir.join("config.yml");
+    if stock.exists() {
+        let _ = std::fs::remove_file(&stock);
+    }
     if role == ConfigRole::Host {
         let lh_yaml = render_lighthouse_config_yaml_with_routes(bundle, &routes);
         write_atomic(
@@ -666,6 +679,22 @@ mod tests {
         assert!(tmp.path().join("host.key").exists());
         assert!(tmp.path().join("config.yaml").exists());
         assert!(!tmp.path().join("lighthouse-config.yaml").exists());
+    }
+
+    #[test]
+    fn materialize_removes_stock_nebula_config_yml() {
+        // FOUND-NEBULA: the nebula package's stale example /etc/nebula/config.yml
+        // must be removed so the `-config /etc/nebula` directory load doesn't
+        // merge it with our config.yaml (which broke a fresh v11 lighthouse).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("config.yml"), b"am_lighthouse: false\n").expect("seed stock");
+        materialize_config(tmp.path(), &sample_bundle(), ConfigRole::Host, &[], tmp.path())
+            .expect("write");
+        assert!(
+            !tmp.path().join("config.yml").exists(),
+            "stock config.yml must be removed"
+        );
+        assert!(tmp.path().join("config.yaml").exists());
     }
 
     #[test]

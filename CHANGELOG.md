@@ -11,6 +11,14 @@ Pre-release history (the E1–E11 epochs, the MackesWorkstation split, and the
 v2.x–v6.x phase plans) lives in the git log and `docs/design/` — this file
 starts at the first packaged release line.
 
+## [11.0.1] "Winter-Is-Coming" - 2026-06-20
+### Fixed
+- **FOUND-NEBULA-1** — a fresh-node founding/join failed to bring up the Nebula
+  overlay: the `nebula` package's stale example `/etc/nebula/config.yml` got
+  merged with mackesd's materialized `config.yaml` (the unit loads the whole
+  `-config /etc/nebula` dir), so `am_lighthouse:false` + a bogus static_host_map
+  won and the unit failed. `materialize_config` now removes the stock `config.yml`.
+
 ## [11.0.0] "Winter-Is-Coming" - 2026-06-20
 > Major version: the SUBSTRATE-V2 split (etcd coordination + Syncthing files,
 > LizardFS retiring) + the MCNF rename. See docs/design/substrate-v2.md
