@@ -73,15 +73,46 @@ struct EnrollContext {
     paths: SignCsrPaths,
     local_node_id: String,
     external_addr: String,
+    /// This lighthouse's own overlay IP, used only for the self-fallback entry
+    /// when its directory row hasn't replicated yet (founding LH). Resolved from
+    /// the live `nebula1` at construction, falling back to the conventional
+    /// first-host IP; overridable in tests for determinism.
+    self_overlay: String,
 }
 
 impl EnrollContext {
+    /// LIGHTHOUSE-10 — build the bundle's lighthouse roster from the replicated
+    /// peer directory so a joining node learns the FULL set of lighthouses, not
+    /// just the one it enrolled through (that single-entry roster was the bug
+    /// that made multiple lighthouses non-redundant). Reads every
+    /// `role=="lighthouse"` directory record carrying an overlay + external
+    /// address. Always includes THIS lighthouse from its own config — the
+    /// founding lighthouse (or any LH before its heartbeat replicates) must hand
+    /// out at least itself, and self may not be in the directory yet.
     fn roster(&self) -> Vec<LighthouseEntry> {
-        vec![LighthouseEntry {
-            node_id: self.local_node_id.clone(),
-            overlay_ip: LIGHTHOUSE_OVERLAY_IP.to_string(),
-            external_addr: self.external_addr.clone(),
-        }]
+        let peers = mackes_mesh_types::peers::read_peers(&mackes_mesh_types::peers::peers_dir(
+            &self.workgroup_root,
+        ));
+        let mut entries: Vec<LighthouseEntry> = mackes_mesh_types::lighthouse::roster_from_directory(
+            &peers,
+        )
+        .into_iter()
+        .map(|a| LighthouseEntry {
+            node_id: a.node_id,
+            overlay_ip: a.overlay_ip,
+            external_addr: a.external_addr,
+        })
+        .collect();
+        // Guarantee self is present — deduped by external_addr so we don't
+        // double-list when this LH's own directory row is already included.
+        if !entries.iter().any(|e| e.external_addr == self.external_addr) {
+            entries.push(LighthouseEntry {
+                node_id: self.local_node_id.clone(),
+                overlay_ip: self.self_overlay.clone(),
+                external_addr: self.external_addr.clone(),
+            });
+        }
+        entries
     }
 }
 
@@ -119,8 +150,18 @@ impl NebulaEnrollListener {
                 paths,
                 local_node_id,
                 external_addr,
+                self_overlay: crate::voip_rtt::own_nebula_ip()
+                    .unwrap_or_else(|| LIGHTHOUSE_OVERLAY_IP.to_string()),
             },
         }
+    }
+
+    /// Override this lighthouse's self-fallback overlay IP (tests — keeps the
+    /// roster deterministic regardless of the host's live `nebula1`).
+    #[must_use]
+    pub fn with_self_overlay(mut self, overlay: impl Into<String>) -> Self {
+        self.ctx.self_overlay = overlay.into();
+        self
     }
 
     /// Override the bind address (tests bind `127.0.0.1:0`).
@@ -382,6 +423,7 @@ mod tests {
             "peer:lighthouse-1".into(),
             "203.0.113.7:4242".into(),
         )
+        .with_self_overlay(LIGHTHOUSE_OVERLAY_IP)
     }
 
     #[test]
@@ -448,11 +490,58 @@ mod tests {
 
     #[test]
     fn roster_advertises_the_public_external_addr() {
+        // Empty directory (founding LH before its heartbeat replicates): the
+        // roster is exactly the self entry from the listener's own config.
         let tmp = tempfile::tempdir().unwrap();
         let r = roster_ctx(tmp.path()).roster();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].external_addr, "203.0.113.7:4242");
         assert_eq!(r[0].overlay_ip, LIGHTHOUSE_OVERLAY_IP);
+    }
+
+    #[test]
+    fn roster_includes_every_lighthouse_from_the_directory() {
+        // LIGHTHOUSE-10: with two OTHER lighthouses in the replicated directory,
+        // a peer enrolling through this one gets all three — the redundancy fix.
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = roster_ctx(tmp.path());
+        let dir = mackes_mesh_types::peers::peers_dir(&ctx.workgroup_root);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (host, overlay, ext) in [
+            ("lh-alpha", "10.42.0.1", "203.0.113.1:4242"),
+            ("lh-beta", "10.42.0.2", "203.0.113.2:4242"),
+        ] {
+            let mut p = mackes_mesh_types::peers::PeerRecord::now(host, None, "healthy");
+            p.role = Some("lighthouse".into());
+            p.overlay_ip = Some(overlay.into());
+            p.external_addr = Some(ext.into());
+            mackes_mesh_types::peers::write_peer_record(&dir, &p).unwrap();
+        }
+        let r = ctx.roster();
+        // The two directory lighthouses + this listener's own self entry.
+        assert_eq!(r.len(), 3, "two from directory + self");
+        let addrs: Vec<&str> = r.iter().map(|e| e.external_addr.as_str()).collect();
+        assert!(addrs.contains(&"203.0.113.1:4242"));
+        assert!(addrs.contains(&"203.0.113.2:4242"));
+        assert!(addrs.contains(&"203.0.113.7:4242"), "self present");
+    }
+
+    #[test]
+    fn roster_dedups_self_when_already_in_the_directory() {
+        // Once this lighthouse's own heartbeat has landed, its directory row
+        // carries its external_addr — the self-fallback must not double-list it.
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = roster_ctx(tmp.path());
+        let dir = mackes_mesh_types::peers::peers_dir(&ctx.workgroup_root);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut me = mackes_mesh_types::peers::PeerRecord::now("self-lh", None, "healthy");
+        me.role = Some("lighthouse".into());
+        me.overlay_ip = Some("10.42.0.1".into());
+        me.external_addr = Some("203.0.113.7:4242".into()); // same as ctx.external_addr
+        mackes_mesh_types::peers::write_peer_record(&dir, &me).unwrap();
+        let r = ctx.roster();
+        assert_eq!(r.len(), 1, "self not double-listed");
+        assert_eq!(r[0].external_addr, "203.0.113.7:4242");
     }
 
     #[tokio::test]

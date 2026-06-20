@@ -196,6 +196,13 @@ pub fn spawn_heartbeat_worker(
                 // replicated directory so any node can identify the lighthouse
                 // set from the QNM-Shared peer JSON (no separate probe).
                 rec.role = mde_role::load().ok().map(|r| r.as_str().to_string());
+                // LIGHTHOUSE-10 — a lighthouse stamps its PUBLIC underlay address
+                // into the directory so the enroll roster can hand joining nodes
+                // the FULL lighthouse set (redundancy). Only lighthouses carry it;
+                // others leave it None (skipped from any built roster).
+                if rec.role.as_deref() == Some(mackes_mesh_types::lighthouse::LIGHTHOUSE_ROLE) {
+                    rec.external_addr = crate::lighthouse_addr::read_external_addr();
+                }
                 if etcd_endpoints.is_empty() {
                     match mackes_mesh_types::peers::write_peer_record(&peers_dir, &rec) {
                         Ok(_) => last_peer_write = Some(std::time::Instant::now()),

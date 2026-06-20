@@ -164,6 +164,16 @@ enum Cmd {
         role: String,
     },
 
+    /// LIGHTHOUSE-10 — set this lighthouse's PUBLIC underlay address
+    /// (`ip` or `ip:port`, port defaults to 4242). Persisted so the
+    /// heartbeat publishes it to the directory and every node's enroll
+    /// roster includes this lighthouse (full redundancy). `found`/`join`
+    /// auto-detect it; use this to correct a misdetected/NAT'd address.
+    SetExternalAddr {
+        /// The public `ip` or `ip:port` peers dial (e.g. `203.0.113.7` or `203.0.113.7:4242`).
+        addr: String,
+    },
+
     /// PLANES-3 (W82/83) — view or set a node's capability tags
     /// (hop|execution|headless). Any enrolled box may set any
     /// target's tags; the change is audit-logged. With no `--set`,
@@ -1967,6 +1977,22 @@ fn main() -> anyhow::Result<()> {
                 }
                 Err(e) => anyhow::bail!("role pin refused: {e}"),
             }
+        }
+        Cmd::SetExternalAddr { addr } => {
+            // Normalize to ip:port (default 4242) so the directory + roster carry
+            // a dialable underlay address.
+            let normalized = if addr.contains(':') {
+                addr.clone()
+            } else {
+                format!("{addr}:4242")
+            };
+            mackesd_core::lighthouse_addr::write_external_addr(&normalized)
+                .with_context(|| format!("persisting external-addr {normalized}"))?;
+            println!(
+                "external address set to {normalized} (published on the next heartbeat; \
+                 every node's enroll roster will include this lighthouse)"
+            );
+            return Ok(());
         }
         Cmd::RoleWorkers { role } => {
             let show = |r: mde_role::Role| {
@@ -7852,6 +7878,17 @@ fn cmd_found(
             .with_context(|| format!("chmod 600 {DEFAULT_KEY_PATH}"))?;
     }
 
+    // LIGHTHOUSE-10 — persist this lighthouse's PUBLIC underlay address so the
+    // telemetry heartbeat can stamp it into the replicated peer directory; the
+    // enroll roster reads every lighthouse's external_addr to hand a joining node
+    // the FULL (redundant) lighthouse set. Best-effort: a miss only delays the
+    // self entry appearing in others' rosters until set-external-addr/refresh.
+    if let Err(e) =
+        mackesd_core::lighthouse_addr::write_external_addr(&format!("{ip}:{}", 4242_u16))
+    {
+        eprintln!("found: could not persist external-addr ({e}) — set it with `mackesd set-external-addr`");
+    }
+
     // mesh-init: pin role, mint CA, self-sign, write the founding bundle,
     // and mint the first single-use bearer.
     let report = mackesd_core::mesh_init::mesh_init(
@@ -8016,6 +8053,25 @@ fn cmd_join(
 
     // CONNECT-4 — if this peer joined as a Lighthouse, it's an ingress node too.
     provision_caddy_if_lighthouse(parsed);
+
+    // LIGHTHOUSE-10 — an ADDITIONAL lighthouse (the 2nd–5th) persists its own
+    // public underlay address so its heartbeat publishes it to the directory and
+    // every node's enroll roster includes it (full redundancy). Auto-detect the
+    // primary public IPv4 (override later with `mackesd set-external-addr`).
+    if parsed == mde_role::Role::Lighthouse {
+        match detect_primary_ipv4() {
+            Ok(ip) => {
+                if let Err(e) =
+                    mackesd_core::lighthouse_addr::write_external_addr(&format!("{ip}:4242"))
+                {
+                    eprintln!("join: could not persist external-addr ({e}) — set it with `mackesd set-external-addr`");
+                }
+            }
+            Err(e) => eprintln!(
+                "join: could not auto-detect public IP ({e}) — run `mackesd set-external-addr <ip:4242>` so this lighthouse is reachable"
+            ),
+        }
+    }
 
     // SETUP-7 — capture the joined facts (mesh-id + lighthouse roster from the
     // signed bundle) for idempotent re-convergence.

@@ -155,6 +155,52 @@ pub fn lighthouse_records(peers: &[PeerRecord]) -> Vec<PeerRecord> {
     out
 }
 
+/// One lighthouse's dialable coordinates for the enroll roster (LIGHTHOUSE-10):
+/// the bundle a joining node receives lists ALL of these so it can reach the
+/// whole lighthouse set — losing any one leaves the rest reachable (the point of
+/// "fully redundant"). Maps 1:1 to the `ca::bundle::LighthouseEntry` the daemon
+/// emits; kept here (pure, in mesh-types) so the build is unit-testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LighthouseAddr {
+    /// The lighthouse's directory id (hostname) — informational in the bundle.
+    pub node_id: String,
+    /// Its Nebula overlay IP (the `static_host_map` key + a `lighthouse.hosts` entry).
+    pub overlay_ip: String,
+    /// Its PUBLIC `ip:port` underlay address (the `static_host_map` value peers dial).
+    pub external_addr: String,
+}
+
+/// Build the enroll roster from the replicated peer directory (LIGHTHOUSE-10): every
+/// `role=="lighthouse"` record that carries BOTH an `overlay_ip` and an
+/// `external_addr` becomes a roster entry, so a joining node learns the FULL
+/// lighthouse set rather than only the one it enrolled through. A lighthouse
+/// missing either address is skipped — never advertised without a dialable
+/// address (a half-known lighthouse would poison `static_host_map`). Sorted by
+/// hostname for a stable bundle; deduped by hostname (the directory is
+/// one-row-per-host, but a caller may prepend a self entry).
+#[must_use]
+pub fn roster_from_directory(peers: &[PeerRecord]) -> Vec<LighthouseAddr> {
+    let mut out: Vec<LighthouseAddr> = Vec::new();
+    for p in peers.iter().filter(|p| is_lighthouse(p)) {
+        let (Some(overlay_ip), Some(external_addr)) = (&p.overlay_ip, &p.external_addr) else {
+            continue;
+        };
+        if overlay_ip.is_empty() || external_addr.is_empty() {
+            continue;
+        }
+        if out.iter().any(|e| e.node_id == p.hostname) {
+            continue;
+        }
+        out.push(LighthouseAddr {
+            node_id: p.hostname.clone(),
+            overlay_ip: overlay_ip.clone(),
+            external_addr: external_addr.clone(),
+        });
+    }
+    out.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    out
+}
+
 /// The pure binary-health classifier (Q3/Q15). Green requires data AND
 /// presence AND overlay AND — only when this is the master — a healthy master
 /// service. The first failing condition (checked in escalation order) picks the
@@ -241,6 +287,47 @@ mod tests {
         p.overlay_ip = overlay.map(str::to_string);
         p.role = Some(LIGHTHOUSE_ROLE.to_string());
         p
+    }
+
+    fn lh_full(host: &str, overlay: &str, external: &str) -> PeerRecord {
+        let mut p = lh(host, "healthy", Some(overlay), 1_000_000);
+        p.external_addr = Some(external.to_string());
+        p
+    }
+
+    #[test]
+    fn roster_from_directory_collects_every_addressable_lighthouse() {
+        // Three lighthouses + a server + a lighthouse missing its external addr.
+        let mut half = lh("lh-half", "healthy", Some("10.42.0.9"), 1_000_000); // no external_addr
+        half.external_addr = None;
+        let mut srv = PeerRecord::now("server-1", None, "healthy");
+        srv.role = Some("server".into());
+        srv.overlay_ip = Some("10.42.0.50".into());
+        srv.external_addr = Some("198.51.100.1:4242".into()); // a server, not a LH
+        let peers = vec![
+            lh_full("lh-03", "10.42.0.3", "203.0.113.3:4242"),
+            lh_full("lh-01", "10.42.0.1", "203.0.113.1:4242"),
+            lh_full("lh-02", "10.42.0.2", "203.0.113.2:4242"),
+            half,
+            srv,
+        ];
+        let roster = roster_from_directory(&peers);
+        // Only the three fully-addressed lighthouses, sorted by hostname.
+        assert_eq!(roster.len(), 3, "half-known LH + the server are excluded");
+        assert_eq!(
+            roster.iter().map(|e| e.node_id.as_str()).collect::<Vec<_>>(),
+            ["lh-01", "lh-02", "lh-03"]
+        );
+        assert_eq!(roster[0].overlay_ip, "10.42.0.1");
+        assert_eq!(roster[2].external_addr, "203.0.113.3:4242");
+    }
+
+    #[test]
+    fn roster_skips_lighthouse_with_blank_addresses() {
+        let mut blank = lh_full("lh-blank", "", "");
+        blank.overlay_ip = Some(String::new());
+        blank.external_addr = Some(String::new());
+        assert!(roster_from_directory(&[blank]).is_empty());
     }
 
     #[test]

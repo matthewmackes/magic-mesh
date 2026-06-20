@@ -599,6 +599,7 @@ mod tests {
                 descriptors: None,
                 overlay_ip: None,
                 role: None,
+                external_addr: None,
             },
         )
         .unwrap();
@@ -659,6 +660,7 @@ mod tests {
                 descriptors: None,
                 overlay_ip: None,
                 role: None,
+                external_addr: None,
             },
         )
         .unwrap();
@@ -693,6 +695,7 @@ mod tests {
                 descriptors: None,
                 overlay_ip: None,
                 role: None,
+                external_addr: None,
             },
         )
         .unwrap();
@@ -774,6 +777,7 @@ mod tests {
             descriptors: None,
             overlay_ip: None,
             role: None,
+            external_addr: None,
         };
         write_peer_record(&pdir, &rec).unwrap();
 

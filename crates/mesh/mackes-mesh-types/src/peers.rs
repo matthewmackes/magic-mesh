@@ -54,6 +54,17 @@ pub struct PeerRecord {
     /// non-lighthouse peer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// LIGHTHOUSE-10 — a lighthouse's PUBLIC-internet `ip:port` (the Nebula
+    /// underlay address peers dial), recorded by the lighthouse itself each
+    /// heartbeat so the replicated directory carries the FULL lighthouse set
+    /// with reachable addresses. This is what makes up-to-5 lighthouses
+    /// *redundant*: the enroll roster reads every `role=="lighthouse"` record's
+    /// `external_addr` so a joining node learns ALL lighthouses, not just the
+    /// one it enrolled through. `None` on non-lighthouses / pre-LIGHTHOUSE-10
+    /// writers (such a lighthouse is skipped from a built roster — never
+    /// advertised without a dialable address).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_addr: Option<String>,
 }
 
 /// PD-2 (L10–L15) — a peer's locally-probed service inventory,
@@ -161,6 +172,7 @@ impl PeerRecord {
             descriptors: None,
             overlay_ip: None,
             role: None,
+            external_addr: None,
         }
     }
 

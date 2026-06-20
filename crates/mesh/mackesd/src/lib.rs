@@ -41,6 +41,7 @@ pub mod health;
 pub mod identity;
 pub mod leader;
 pub mod legacy_inventory;
+pub mod lighthouse_addr;
 pub mod logging;
 pub mod meshfs;
 // EPIC-SYNC-APP-CONFIG (Q26) — native-Rust mesh media-server

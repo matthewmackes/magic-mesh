@@ -234,6 +234,7 @@ mod tests {
                 descriptors: None,
                 overlay_ip: None,
                 role: None,
+                external_addr: None,
             },
         )
         .unwrap();
