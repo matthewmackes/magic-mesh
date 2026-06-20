@@ -13,8 +13,11 @@ ConditionPathExists=/etc/systemd/system/syncthing.service.d/10-home.conf
 
 [Service]
 Type=simple
-# Home is pinned by setup-syncthing.sh's 10-home.conf drop-in.
+# Home is pinned by setup-syncthing.sh's 10-home.conf drop-in. HOME MUST be set:
+# systemd services have no $HOME and syncthing v1.30.0 panics ("Failed to get
+# user home dir") at startup without it (SUBSTRATE-14 rehearsal caught it).
 Environment=MCNF_SYNCTHING_HOME=/var/lib/mcnf-syncthing
+Environment=HOME=/var/lib/mcnf-syncthing
 ExecStart=/usr/bin/syncthing serve --home=${MCNF_SYNCTHING_HOME} --no-browser --no-restart
 Restart=always
 RestartSec=10

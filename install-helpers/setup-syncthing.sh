@@ -186,6 +186,12 @@ ConditionPathExists=/etc/systemd/system/syncthing.service.d/10-home.conf
 [Service]
 Type=simple
 Environment=MCNF_SYNCTHING_HOME=/var/lib/mcnf-syncthing
+# HOME MUST be set: systemd services start with no $HOME, and syncthing v1.30.0
+# calls os.UserHomeDir() at startup (even with --home) → "panic: Failed to get
+# user home dir" + SIGABRT. A manual run inherits $HOME so it "works"; only the
+# service crashes (the SUBSTRATE-14 rehearsal caught this). The 10-home.conf
+# drop-in below overrides both to the real --home dir.
+Environment=HOME=/var/lib/mcnf-syncthing
 ExecStart=/usr/bin/syncthing serve --home=${MCNF_SYNCTHING_HOME} --no-browser --no-restart
 Restart=always
 RestartSec=10
@@ -200,6 +206,8 @@ mkdir -p /etc/systemd/system/syncthing.service.d
 cat > /etc/systemd/system/syncthing.service.d/10-home.conf <<EOF
 [Service]
 Environment=MCNF_SYNCTHING_HOME=$HOME_DIR
+# HOME too — syncthing v1.30.0 panics without it under systemd (see the unit).
+Environment=HOME=$HOME_DIR
 EOF
 systemctl daemon-reload 2>/dev/null || true
 systemctl enable syncthing.service >/dev/null 2>&1 || true
