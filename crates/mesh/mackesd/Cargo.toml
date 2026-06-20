@@ -405,6 +405,9 @@ assets = [
     # versioning); device IDs wired from the etcd /mesh/syncthing/<host> registry.
     { source = "install-helpers/setup-syncthing.sh",     dest = "/usr/libexec/mackesd/setup-syncthing",         mode = "755" },
     { source = "packaging/systemd/syncthing.service",    dest = "/etc/systemd/system/syncthing.service",        mode = "644" },
+    # CONNECT-4 — install Caddy + wire `import Caddyfile.d/*.caddy` on the ingress
+    # lighthouse; the connect_firewall worker renders mcnf-ingress.caddy into it.
+    { source = "install-helpers/setup-caddy.sh",         dest = "/usr/libexec/mackesd/setup-caddy",             mode = "755" },
     # SUBSTRATE-14 — the etcd+Syncthing cutover entry point (operator runs it on
     # the VM bed to rehearse, then per fleet node at the 11.0 roll).
     { source = "install-helpers/cutover-substrate-v2.sh", dest = "/usr/libexec/mackesd/cutover-substrate-v2",    mode = "755" },

@@ -7894,6 +7894,9 @@ fn cmd_found(
     // overlay IP. Best-effort: a miss logs loudly, the overlay still comes up.
     provision_qnm_shared(parsed, true, &report.overlay_ip, &report.overlay_ip);
 
+    // CONNECT-4 — the founding lighthouse is an ingress node: stand up Caddy.
+    provision_caddy_if_lighthouse(parsed);
+
     // SETUP-7 — capture the founding facts for idempotent re-convergence.
     emit_site_yml_best_effort(parsed.as_str(), mesh_id, vec![report.overlay_ip.clone()]);
 
@@ -8011,6 +8014,9 @@ fn cmd_join(
         &bundle.overlay_ip,
     );
 
+    // CONNECT-4 — if this peer joined as a Lighthouse, it's an ingress node too.
+    provision_caddy_if_lighthouse(parsed);
+
     // SETUP-7 — capture the joined facts (mesh-id + lighthouse roster from the
     // signed bundle) for idempotent re-convergence.
     let roster: Vec<String> = bundle
@@ -8093,6 +8099,30 @@ fn provision_qnm_shared(role: mde_role::Role, is_founder: bool, master_ip: &str,
         Err(e) => eprintln!(
             "provision: setup-qnm-shared not run ({e}) — is the RPM installed? \
              shared-state plane is DOWN until provisioned"
+        ),
+    }
+}
+
+/// CONNECT-4 — on a Lighthouse (the public ingress role) install + wire Caddy so
+/// the `connect_firewall` worker's rendered ingress fragment takes effect. No-op
+/// for non-lighthouse roles. Best-effort + idempotent: a miss logs but never
+/// fails the enroll (the lighthouse still joins; only public web ingress is
+/// deferred until Caddy is present).
+fn provision_caddy_if_lighthouse(role: mde_role::Role) {
+    if role != mde_role::Role::Lighthouse {
+        return;
+    }
+    println!("CONNECT-4: provisioning Caddy public ingress (lighthouse role)");
+    match std::process::Command::new("/usr/libexec/mackesd/setup-caddy").status() {
+        Ok(s) if s.success() => println!("CONNECT-4: Caddy ingress ready"),
+        Ok(s) => eprintln!(
+            "provision: setup-caddy exited {:?} — public web ingress deferred; \
+             check `systemctl status caddy`",
+            s.code()
+        ),
+        Err(e) => eprintln!(
+            "provision: setup-caddy not run ({e}) — is the RPM installed? \
+             public web ingress is unavailable until Caddy is set up"
         ),
     }
 }
