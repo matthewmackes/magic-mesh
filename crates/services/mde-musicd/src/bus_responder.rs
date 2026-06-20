@@ -555,16 +555,19 @@ fn dispatch_browse(
 }
 
 /// One browse-poll sweep: for each browse verb, dispatch new requests
-/// against a freshly-built Airsonic client. A missing-creds state replies
-/// with an error (the GUI prompts the operator to connect).
+/// against the shared Airsonic client. A missing-creds state (`client: None`)
+/// replies with an error (the GUI prompts the operator to connect).
+///
+/// MUSIC-RESPONSIVE-10 — the client is owned by [`serve`] and reused across
+/// sweeps (rather than rebuilt here per sweep) so reqwest's keep-alive pool
+/// stays warm; the launch-time cold connect happens once at startup, not on
+/// the operator's first browse.
 pub fn poll_browse(
     persist: &Persist,
     rt: &tokio::runtime::Runtime,
     cursors: &mut HashMap<String, String>,
+    client: Option<&Client>,
 ) {
-    let client = creds::load()
-        .ok()
-        .map(|c| Client::new(&c.server_url, &c.username, &c.password));
     for verb in BROWSE_VERBS {
         let topic = format!("action/music/{verb}");
         let since = cursors.get(&topic).map(String::as_str);
@@ -574,7 +577,7 @@ pub fn poll_browse(
         };
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
-            let reply = match &client {
+            let reply = match client {
                 Some(c) => dispatch_browse(verb, msg.body.as_deref().unwrap_or(""), c, rt),
                 None => {
                     json!({ "ok": false, "error": "no Airsonic server configured" }).to_string()
@@ -785,17 +788,16 @@ fn apply_transport(
 }
 
 /// One transport-poll sweep: dispatch new `action/music/{play,pause,…}`
-/// requests to the engine. A fresh Airsonic client is loaded per sweep so
-/// a mid-session connect is picked up.
+/// requests to the engine. MUSIC-RESPONSIVE-10 — the shared Airsonic client
+/// (owned by [`serve`], refreshed on a creds change) is passed in so a
+/// mid-session connect is still picked up without a per-sweep rebuild.
 pub fn poll_transport(
     persist: &Persist,
     queue_path: &Path,
     engine: Option<&Engine>,
     cursors: &mut HashMap<String, String>,
+    client: Option<&Client>,
 ) {
-    let client = creds::load()
-        .ok()
-        .map(|c| Client::new(&c.server_url, &c.username, &c.password));
     let queue = queue::read_from(queue_path);
     for verb in TRANSPORT_VERBS {
         let topic = format!("action/music/{verb}");
@@ -810,7 +812,7 @@ pub fn poll_transport(
                 verb,
                 msg.body.as_deref().unwrap_or(""),
                 engine,
-                client.as_ref(),
+                client,
                 &queue,
             );
             let _ = persist.write(
@@ -844,6 +846,34 @@ fn write_periodic_state(engine: Option<&Engine>, queue_path: &Path) {
 /// # Panics
 /// If the internal tokio runtime (for the async browse proxy) can't be
 /// built — an environment fault, not a runtime condition.
+/// MUSIC-RESPONSIVE-10 — whether the cached client must be rebuilt for the
+/// freshly-loaded creds. A `None` cache (first build) or different creds are
+/// stale; identical creds reuse the warm client.
+#[must_use]
+pub fn airsonic_creds_changed(cached: Option<&creds::Creds>, current: &creds::Creds) -> bool {
+    cached != Some(current)
+}
+
+/// MUSIC-RESPONSIVE-10 — reload the stored creds and return the shared Airsonic
+/// client, rebuilding it ONLY when the creds changed since the cached build (a
+/// mid-session connect/disconnect). Reusing the client keeps reqwest's
+/// connection pool warm across sweeps. `None` = no creds configured.
+fn refresh_airsonic_client(cache: &mut Option<(creds::Creds, Client)>) -> Option<&Client> {
+    match creds::load().ok() {
+        Some(current) => {
+            if airsonic_creds_changed(cache.as_ref().map(|(c, _)| c), &current) {
+                let client = Client::new(&current.server_url, &current.username, &current.password);
+                *cache = Some((current, client));
+            }
+            cache.as_ref().map(|(_, c)| c)
+        }
+        None => {
+            *cache = None;
+            None
+        }
+    }
+}
+
 pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop: F) {
     let mut persist = match Persist::open(bus_root.clone()) {
         Ok(p) => p,
@@ -895,6 +925,21 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
     // so playback comes up on its own once the session is.
     const AUDIO_RETRY_INTERVAL: Duration = Duration::from_secs(10);
     let mut last_audio_retry = Instant::now();
+    // MUSIC-RESPONSIVE-10 — the Airsonic client persists across sweeps so
+    // reqwest's keep-alive pool stays warm (it was rebuilt per sweep, so every
+    // browse was a cold connect). Pre-open it at startup and warm the socket
+    // with a cheap `ping` so the operator's first browse rides an established
+    // connection instead of the launch-time cold-connect timeout. Rebuilt only
+    // on a creds change (refresh_airsonic_client).
+    let mut airsonic: Option<(creds::Creds, Client)> = None;
+    if let Some(client) = refresh_airsonic_client(&mut airsonic) {
+        match rt.block_on(client.ping()) {
+            Ok(_) => tracing::info!("airsonic connection warmed at startup"),
+            Err(e) => {
+                tracing::debug!(error = %e, "startup airsonic warm-ping failed (cold first browse)")
+            }
+        }
+    }
     while !should_stop() {
         if engine.is_none() && last_audio_retry.elapsed() >= AUDIO_RETRY_INTERVAL {
             last_audio_retry = Instant::now();
@@ -924,9 +969,12 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
         // of browse latency. (The Airsonic client also has connect/total
         // timeouts now so browse itself can't hang forever.)
         poll_once(&persist, queue_path, &mut cursors);
-        poll_transport(&persist, queue_path, engine.as_ref(), &mut cursors);
+        // MUSIC-RESPONSIVE-10 — refresh the shared client once per sweep (cheap;
+        // rebuilds only on a creds change) and hand it to both network pollers.
+        let client = refresh_airsonic_client(&mut airsonic);
+        poll_transport(&persist, queue_path, engine.as_ref(), &mut cursors, client);
         poll_peers(&persist, &mut cursors);
-        poll_browse(&persist, &rt, &mut cursors);
+        poll_browse(&persist, &rt, &mut cursors, client);
         if last_state_write.elapsed() >= STATE_WRITE_INTERVAL {
             write_periodic_state(engine.as_ref(), queue_path);
             last_state_write = Instant::now();
@@ -1010,6 +1058,32 @@ pub fn poll_once(persist: &Persist, queue_path: &Path, cursors: &mut HashMap<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn airsonic_creds_changed_detects_first_build_and_changes() {
+        // MUSIC-RESPONSIVE-10 — the warm-client cache rebuilds only when the
+        // creds actually change; an empty cache or different creds are stale,
+        // identical creds reuse the warm client.
+        let a = creds::Creds {
+            server_url: "http://a:4040".into(),
+            username: "u".into(),
+            password: "p".into(),
+        };
+        let same = a.clone();
+        let other = creds::Creds {
+            server_url: "http://b:4040".into(),
+            ..a.clone()
+        };
+        assert!(airsonic_creds_changed(None, &a), "no cache → must build");
+        assert!(
+            !airsonic_creds_changed(Some(&a), &same),
+            "identical creds → reuse the warm client"
+        );
+        assert!(
+            airsonic_creds_changed(Some(&a), &other),
+            "changed server → rebuild"
+        );
+    }
 
     #[test]
     fn song_id_from_accepts_id_and_song_id_keys_and_rejects_raw_objects() {
