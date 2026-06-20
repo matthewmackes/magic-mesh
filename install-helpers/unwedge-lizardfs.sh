@@ -59,6 +59,16 @@ if [ "$MASK_MACKESD" -eq 1 ]; then
 fi
 systemctl daemon-reload 2>/dev/null &
 
+# 4. Remove the dead LizardFS-hosted dnf mirror. It points at
+#    file:///mnt/mesh-storage/mirrors/magic-mesh (a QNM-Shared path that's gone
+#    once LizardFS is down), and `dnf` errors on it: "Curl error (37): Could not
+#    read a file:// file …repomd.xml". Drop it so dnf falls back to the gh-pages
+#    channel / a direct release-RPM URL.
+if [ -f /etc/yum.repos.d/mackes-mirror-magic-mesh.repo ]; then
+  rm -f /etc/yum.repos.d/mackes-mirror-magic-mesh.repo
+  echo "==> removed dead LizardFS dnf mirror repo (mackes-mirror-magic-mesh)"
+fi
+
 echo "==> load after (settles over ~30-60s as I/O drains): $(cut -d' ' -f1-3 /proc/loadavg)"
 echo "==> remaining D-state mackesd: $(ps -eo stat,cmd | grep -c '^D.*[m]ackesd serve')"
 echo "Stragglers that won't drain need a reboot (reboot -f — a graceful reboot"
