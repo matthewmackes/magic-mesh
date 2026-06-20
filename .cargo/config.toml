@@ -10,3 +10,10 @@
 # Follow-up: update opus/audiopus_sys off the ancient vendored CMake (see the E0.2
 # note in docs/PROJECT_WORKLIST.md) so this workaround can be dropped.
 CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+
+# Dev-loop speed (2026-06-19): link with `mold` — the cosmic/iced GUI crates spend
+# most of a rebuild in the linker; mold cuts that from minutes to seconds so GUI
+# iteration (edit→build→verify) stops being a wall. gcc's `-fuse-ld=mold` works on
+# the F44 toolchain; `dnf install mold` is the only prereq (CI installs it too).
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

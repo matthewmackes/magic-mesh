@@ -50,7 +50,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libasound2-dev libgtk-3-dev cmake pkg-config protobuf-compiler
+            libasound2-dev libgtk-3-dev cmake pkg-config protobuf-compiler mold
 
       - name: Rust toolchain (pinned)
         uses: dtolnay/rust-toolchain@stable
@@ -139,7 +139,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libasound2-dev libgtk-3-dev cmake pkg-config protobuf-compiler sway grim
+            libasound2-dev libgtk-3-dev cmake pkg-config protobuf-compiler mold sway grim
 
       - name: Rust toolchain (pinned)
         uses: dtolnay/rust-toolchain@stable
@@ -197,7 +197,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libasound2-dev libgtk-3-dev cmake pkg-config protobuf-compiler
+            libasound2-dev libgtk-3-dev cmake pkg-config protobuf-compiler mold
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -247,7 +247,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libasound2-dev libgtk-3-dev cmake pkg-config protobuf-compiler
+            libasound2-dev libgtk-3-dev cmake pkg-config protobuf-compiler mold
 
       - name: Rust toolchain (pinned)
         uses: dtolnay/rust-toolchain@stable
@@ -327,7 +327,7 @@ jobs:
       - name: System dev libraries (dnf)
         run: |
           dnf install -y --setopt=install_weak_deps=False \
-            gcc gcc-c++ cmake pkg-config git protobuf-compiler \
+            gcc gcc-c++ cmake pkg-config git protobuf-compiler mold \
             gtk3-devel alsa-lib-devel openssl-devel \
             rust cargo nebula ansible-core
 
