@@ -40,6 +40,8 @@ pub mod route_trace;
 // consumer of tags (Peer / Workspace / Container members reference
 // mesh-domain identifiers).
 pub mod tags;
+/// VPN-GW-1 — the VPN tunnel definition model + pure wg-quick/openvpn helpers.
+pub mod vpn;
 
 pub use connect::{BatterySnapshot, ConnectFacts, PairingState, PeerKind};
 pub use nebula::{NebulaFacts, NebulaRole};
