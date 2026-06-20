@@ -49,6 +49,78 @@ pub fn action_topic(verb: &str) -> String {
     format!("action/route/{verb}")
 }
 
+/// This node's hostname (best-effort) — used to decide whether a traced host's
+/// firewall is locally readable. Mirrors the daemon's `local_hostname`.
+fn local_hostname() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
+}
+
+/// Read the LOCAL node's inbound public firewall as ROUTE-TRACE rules from live
+/// `firewall-cmd`, or `None` when it can't be read (no firewalld / not permitted).
+/// `firewall-cmd --list-ports` → `4242/udp 443/tcp`; `--list-services` maps the
+/// foundational service names (ssh→22/tcp). Anything not listed falls to the
+/// public-zone default deny.
+fn read_local_firewalld() -> Option<Vec<route_trace::FirewallRule>> {
+    let run = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("firewall-cmd")
+            .args(args)
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let ports = run(&["--list-ports"])?;
+    let services = run(&["--list-services"]).unwrap_or_default();
+    let mut rules = Vec::new();
+    for spec in ports.split_whitespace() {
+        if let Some((p, proto)) = spec.split_once('/') {
+            if let Ok(port) = p.parse::<u16>() {
+                rules.push(route_trace::FirewallRule {
+                    port: Some(port),
+                    proto: Some(proto.to_string()),
+                    action: route_trace::Verdict::Allow,
+                    cite: format!("--add-port {spec}"),
+                });
+            }
+        }
+    }
+    if services.split_whitespace().any(|s| s == "ssh") {
+        rules.push(route_trace::FirewallRule {
+            port: Some(22),
+            proto: Some("tcp".into()),
+            action: route_trace::Verdict::Allow,
+            cite: "--add-service ssh (22/tcp)".into(),
+        });
+    }
+    Some(rules)
+}
+
+/// The inbound firewall ROUTE-TRACE should evaluate for `node_label`: the live
+/// local firewalld when `node_label` is THIS node, else `Indeterminate` — a remote
+/// host's rules can't be read, and ROUTE-TRACE never guesses a verdict.
+fn host_inbound_firewall(node_label: &str) -> route_trace::FirewallProfile {
+    let me = local_hostname();
+    if !me.is_empty() && node_label.eq_ignore_ascii_case(&me) {
+        if let Some(rules) = read_local_firewalld() {
+            return route_trace::FirewallProfile::Rules {
+                name: "firewalld:public".into(),
+                rules,
+                default: route_trace::Verdict::Block,
+            };
+        }
+    }
+    route_trace::FirewallProfile::Indeterminate {
+        name: format!("firewalld:public@{node_label} (remote/unreadable)"),
+    }
+}
+
 /// This node's overlay IP for `hostname` from the replicated peer directory
 /// (etcd-or-fs is abstracted by the directory RPC elsewhere; the trace gatherer
 /// reads the roster directly for the bare overlay-IP lookup). `None` when the
@@ -102,7 +174,25 @@ pub fn build_reply(svc: &RouteService, verb: &str, req_body: Option<&str>) -> St
             let overlay = overlay_ip_of(root, &policy.source.node);
             // Lighthouse public IP isn't resolved here (it lives in the nebula
             // static_host_map, root-only) — None renders as unknown, never guessed.
-            route_trace::assemble_ingress(&policy, overlay.as_deref(), None)
+            let mut g = route_trace::assemble_ingress(&policy, overlay.as_deref(), None);
+            // ROUTE-TRACE-2: annotate the control points the path crosses with real
+            // verdicts. The overlay hop is the Nebula firewall (open-mesh §8 → Allow);
+            // the host→service hop crosses the hosting node's inbound firewall — its
+            // live firewalld when local, else Indeterminate (never guessed remotely).
+            let (port, proto) = (policy.source.port, policy.source.proto.as_str());
+            g.evaluate_edge(
+                "ingress->host",
+                &route_trace::FirewallProfile::nebula_open_mesh(),
+                port,
+                proto,
+            );
+            g.evaluate_edge(
+                "host->service",
+                &host_inbound_firewall(&policy.source.node),
+                port,
+                proto,
+            );
+            g
         }
         "egress" => {
             if from.is_empty() {
@@ -212,6 +302,35 @@ mod tests {
         assert_eq!(v["graph"]["direction"], "ingress");
         // 4 nodes: internet, ingress, host, service; public ⇒ no blocked_at.
         assert_eq!(v["graph"]["nodes"].as_array().unwrap().len(), 4);
+        assert!(v["graph"].get("blocked_at").is_none() || v["graph"]["blocked_at"].is_null());
+    }
+
+    #[test]
+    fn ingress_trace_annotates_real_control_points() {
+        // ROUTE-TRACE-2: the overlay hop carries the Nebula open-mesh verdict; the
+        // host→service hop is Indeterminate (the hosting node "eagle" is remote from
+        // the test runner, so its firewalld can't be read — never guessed).
+        let (_t, s) = svc();
+        save_public_service(s.workgroup_root.as_path());
+        let r = build_reply(
+            &s,
+            "trace",
+            Some(&json!({"direction":"ingress","to":"grafana"}).to_string()),
+        );
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        let edges = v["graph"]["edges"].as_array().unwrap();
+        let overlay = edges
+            .iter()
+            .find(|e| e["from"] == "ingress" && e["to"] == "host")
+            .unwrap();
+        assert_eq!(overlay["control"]["verdict"], "allow");
+        assert_eq!(overlay["control"]["firewall"], "nebula:overlay");
+        let host_svc = edges
+            .iter()
+            .find(|e| e["from"] == "host" && e["to"] == "service")
+            .unwrap();
+        assert_eq!(host_svc["control"]["verdict"], "indeterminate");
+        // Indeterminate must NOT mark the path blocked.
         assert!(v["graph"].get("blocked_at").is_none() || v["graph"]["blocked_at"].is_null());
     }
 

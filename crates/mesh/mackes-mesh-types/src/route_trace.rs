@@ -93,6 +93,10 @@ pub enum Verdict {
     Allow,
     /// The control point denies this segment (the path is blocked here).
     Block,
+    /// The control point's rule set could not be statically resolved (e.g. a
+    /// remote host's firewalld we can't read) — the verdict is unknown and is
+    /// **never guessed**. An indeterminate edge does NOT set `blocked_at`.
+    Indeterminate,
 }
 
 /// A control point an edge crosses (a firewall / kill-switch) + its verdict.
@@ -394,6 +398,195 @@ pub fn assemble_egress(
     g
 }
 
+// ---------------------------------------------------------------------------
+// ROUTE-TRACE-2: control-point evaluation.
+//
+// Given the assembled PathGraph and the actual firewall rule sets each segment
+// crosses, decide Allow / Block / Indeterminate per edge — citing the matching
+// rule — and let `recompute_blocked_at` find the FIRST denying point. The rule
+// sets are gathered by the `mackesd` responder (the destination host's firewalld
+// public zone, the Nebula overlay firewall, a VPN kill-switch) and fed in here so
+// the decision is pure + unit-testable and the GUI reasons about the same shapes.
+// A rule set we can't read is `Indeterminate` — never guessed (the §7 no-fake rule
+// applied to verdicts).
+// ---------------------------------------------------------------------------
+
+/// One ordered firewall rule: match a `(port, proto)` flow, take an action.
+///
+/// Evaluated **first-match-wins** (nftables/iptables order; firewalld allows are
+/// modelled as leading `Allow` rules over the zone's default `Block`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FirewallRule {
+    /// The port this rule matches, or `None` for "any port".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// The protocol this rule matches (`tcp`/`udp`), or `None` for "any proto".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proto: Option<String>,
+    /// What this rule does when it matches (`Allow` or `Block`).
+    pub action: Verdict,
+    /// Human-cited form of the rule (e.g. `--add-port 4242/udp`, `default deny`).
+    pub cite: String,
+}
+
+impl FirewallRule {
+    /// True when this rule matches the given flow (`None` fields are wildcards).
+    #[must_use]
+    pub fn matches(&self, port: u16, proto: &str) -> bool {
+        self.port.is_none_or(|p| p == port)
+            && self
+                .proto
+                .as_deref()
+                .is_none_or(|pr| pr.eq_ignore_ascii_case(proto))
+    }
+}
+
+/// A firewall as ROUTE-TRACE evaluates it.
+///
+/// Either an ordered, readable rule set (with a default verdict for "no rule
+/// matched"), or `Indeterminate` when the real rules could not be resolved (a
+/// remote host we can't read) — in which case every flow is `Indeterminate`,
+/// never guessed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FirewallProfile {
+    /// A resolved, ordered rule set evaluated first-match-wins.
+    Rules {
+        /// The control's name (e.g. `firewalld:public`).
+        name: String,
+        /// Ordered rules; the first to match decides.
+        rules: Vec<FirewallRule>,
+        /// The verdict when no rule matches (firewalld public zone = `Block`).
+        default: Verdict,
+    },
+    /// The rule set could not be read — every flow is `Indeterminate`.
+    Indeterminate {
+        /// The control's name + why it's unresolved (e.g. `firewalld:public (remote, unread)`).
+        name: String,
+    },
+}
+
+impl FirewallProfile {
+    /// Evaluate a `(port, proto)` flow into a [`ControlPoint`], first-match-wins.
+    /// An `Indeterminate` profile always yields an `Indeterminate` verdict.
+    #[must_use]
+    pub fn evaluate(&self, port: u16, proto: &str) -> ControlPoint {
+        match self {
+            Self::Rules {
+                name,
+                rules,
+                default,
+            } => {
+                rules.iter().find(|r| r.matches(port, proto)).map_or_else(
+                    || ControlPoint {
+                        firewall: name.clone(),
+                        verdict: *default,
+                        rule: match default {
+                            Verdict::Block => "default deny (no matching rule)".into(),
+                            Verdict::Allow => "default allow (no matching rule)".into(),
+                            Verdict::Indeterminate => "default indeterminate".into(),
+                        },
+                    },
+                    |r| ControlPoint {
+                        firewall: name.clone(),
+                        verdict: r.action,
+                        rule: r.cite.clone(),
+                    },
+                )
+            }
+            Self::Indeterminate { name } => ControlPoint {
+                firewall: name.clone(),
+                verdict: Verdict::Indeterminate,
+                rule: "host firewall not statically resolvable — not guessed".into(),
+            },
+        }
+    }
+
+    /// The platform **public-boundary baseline** (CONNECT §3 lock): the public
+    /// zone denies all inbound except the foundational ports — Nebula UDP/4242,
+    /// SSH/22, enroll TCP/4243 — plus the covert TCP/443 fallback on lighthouses.
+    /// This is the rule set every non-ingress node enforces; ROUTE-TRACE evaluates
+    /// an inbound public flow against it to show why a port is or isn't reachable.
+    #[must_use]
+    pub fn public_baseline(is_lighthouse: bool) -> Self {
+        let mut rules = vec![
+            FirewallRule {
+                port: Some(4242),
+                proto: Some("udp".into()),
+                action: Verdict::Allow,
+                cite: "--add-port 4242/udp (Nebula)".into(),
+            },
+            FirewallRule {
+                port: Some(22),
+                proto: Some("tcp".into()),
+                action: Verdict::Allow,
+                cite: "--add-service ssh (22/tcp)".into(),
+            },
+            FirewallRule {
+                port: Some(4243),
+                proto: Some("tcp".into()),
+                action: Verdict::Allow,
+                cite: "--add-port 4243/tcp (enroll)".into(),
+            },
+        ];
+        if is_lighthouse {
+            rules.push(FirewallRule {
+                port: Some(443),
+                proto: Some("tcp".into()),
+                action: Verdict::Allow,
+                cite: "--add-port 443/tcp (covert fallback, lighthouse)".into(),
+            });
+        }
+        Self::Rules {
+            name: "firewalld:public".into(),
+            rules,
+            default: Verdict::Block,
+        }
+    }
+
+    /// The **Nebula overlay firewall** as the platform pins it: hard-coded
+    /// open-mesh (any peer with a valid mesh cert reaches any other — §8 flat-trust
+    /// lock). Every overlay segment crosses this control point and is `Allow`d; the
+    /// rule is cited so a trace shows the intra-mesh trust is intentional, not absent.
+    #[must_use]
+    pub fn nebula_open_mesh() -> Self {
+        Self::Rules {
+            name: "nebula:overlay".into(),
+            rules: vec![FirewallRule {
+                port: None,
+                proto: None,
+                action: Verdict::Allow,
+                cite: "open-mesh: valid cert ⇒ any-to-any (§8 flat-trust)".into(),
+            }],
+            default: Verdict::Allow,
+        }
+    }
+}
+
+impl PathGraph {
+    /// Evaluate the firewall a single edge crosses, write its [`ControlPoint`],
+    /// and re-derive [`Self::blocked_at`]. The first `Block` edge (source→dest
+    /// order) wins; `Indeterminate` never blocks. No-op if the edge id is absent.
+    pub fn evaluate_edge(&mut self, edge_id: &str, fw: &FirewallProfile, port: u16, proto: &str) {
+        if let Some(e) = self.edges.iter_mut().find(|e| e.id() == edge_id) {
+            e.control = Some(fw.evaluate(port, proto));
+        }
+        self.recompute_blocked_at();
+    }
+
+    /// True when any edge's verdict is [`Verdict::Indeterminate`] — the trace is
+    /// reachable-so-far but a control point couldn't be resolved, so the caller
+    /// should surface "indeterminate" rather than a confident "reachable".
+    #[must_use]
+    pub fn has_indeterminate(&self) -> bool {
+        self.edges.iter().any(|e| {
+            e.control
+                .as_ref()
+                .is_some_and(|c| c.verdict == Verdict::Indeterminate)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,5 +765,109 @@ mod tests {
         assert!(!e.is_blocked());
         e.control.as_mut().unwrap().verdict = Verdict::Block;
         assert!(e.is_blocked());
+    }
+
+    // --- ROUTE-TRACE-2: control-point evaluation -------------------------------
+
+    #[test]
+    fn public_baseline_allows_foundation_ports_denies_the_rest() {
+        let fw = FirewallProfile::public_baseline(false);
+        // Nebula, SSH, enroll are allowed, citing the real rule.
+        let neb = fw.evaluate(4242, "udp");
+        assert_eq!(neb.verdict, Verdict::Allow);
+        assert!(neb.rule.contains("4242/udp"));
+        assert_eq!(fw.evaluate(22, "tcp").verdict, Verdict::Allow);
+        assert_eq!(fw.evaluate(4243, "tcp").verdict, Verdict::Allow);
+        // An arbitrary service port is denied by the default.
+        let web = fw.evaluate(8080, "tcp");
+        assert_eq!(web.verdict, Verdict::Block);
+        assert_eq!(web.rule, "default deny (no matching rule)");
+        // 443/tcp is NOT open on a non-lighthouse...
+        assert_eq!(fw.evaluate(443, "tcp").verdict, Verdict::Block);
+        // ...but IS on a lighthouse (covert fallback).
+        let lh = FirewallProfile::public_baseline(true);
+        let covert = lh.evaluate(443, "tcp");
+        assert_eq!(covert.verdict, Verdict::Allow);
+        assert!(covert.rule.contains("443/tcp"));
+    }
+
+    #[test]
+    fn proto_must_match_not_just_port() {
+        let fw = FirewallProfile::public_baseline(false);
+        // 4242 is open for UDP only — the same port over TCP falls through to deny.
+        assert_eq!(fw.evaluate(4242, "udp").verdict, Verdict::Allow);
+        assert_eq!(fw.evaluate(4242, "tcp").verdict, Verdict::Block);
+    }
+
+    #[test]
+    fn first_matching_rule_wins() {
+        let fw = FirewallProfile::Rules {
+            name: "ordered".into(),
+            rules: vec![
+                FirewallRule {
+                    port: Some(8080),
+                    proto: Some("tcp".into()),
+                    action: Verdict::Block,
+                    cite: "drop 8080/tcp (explicit)".into(),
+                },
+                FirewallRule {
+                    port: None,
+                    proto: None,
+                    action: Verdict::Allow,
+                    cite: "allow any".into(),
+                },
+            ],
+            default: Verdict::Block,
+        };
+        // The earlier explicit Block wins over the later allow-any.
+        let v = fw.evaluate(8080, "tcp");
+        assert_eq!(v.verdict, Verdict::Block);
+        assert_eq!(v.rule, "drop 8080/tcp (explicit)");
+        // A different port hits the allow-any rule.
+        assert_eq!(fw.evaluate(9090, "tcp").verdict, Verdict::Allow);
+    }
+
+    #[test]
+    fn indeterminate_profile_never_guesses() {
+        let fw = FirewallProfile::Indeterminate {
+            name: "firewalld:public (remote, unread)".into(),
+        };
+        let cp = fw.evaluate(8080, "tcp");
+        assert_eq!(cp.verdict, Verdict::Indeterminate);
+        assert!(cp.rule.contains("not guessed"));
+    }
+
+    #[test]
+    fn evaluate_edge_blocks_at_the_destination_host_firewall() {
+        // ingress: internet -> host -> service; the host's public firewall denies
+        // an unexposed service port, so blocked_at lands on host->service.
+        let mut g = PathGraph::new(Direction::Ingress)
+            .with_node(node("internet", NodeKind::Internet))
+            .with_node(node("host", NodeKind::OverlayPeer))
+            .with_node(node("service", NodeKind::Service))
+            .with_edge(edge("internet", "host", Layer::Public, Transport::Public))
+            .with_edge(edge("host", "service", Layer::Host, Transport::Loopback));
+        let fw = FirewallProfile::public_baseline(false);
+        g.evaluate_edge("host->service", &fw, 8080, "tcp");
+        assert_eq!(g.blocked_at.as_deref(), Some("host->service"));
+        assert!(!g.is_reachable());
+        let cp = g.edges[1].control.as_ref().unwrap();
+        assert_eq!(cp.verdict, Verdict::Block);
+    }
+
+    #[test]
+    fn evaluate_edge_indeterminate_does_not_set_blocked_at() {
+        let mut g = PathGraph::new(Direction::Ingress)
+            .with_node(node("host", NodeKind::OverlayPeer))
+            .with_node(node("service", NodeKind::Service))
+            .with_edge(edge("host", "service", Layer::Host, Transport::Loopback));
+        let fw = FirewallProfile::Indeterminate {
+            name: "firewalld:public (remote, unread)".into(),
+        };
+        g.evaluate_edge("host->service", &fw, 8080, "tcp");
+        // Not guessed → not blocked, but surfaced as indeterminate.
+        assert_eq!(g.blocked_at, None);
+        assert!(g.is_reachable());
+        assert!(g.has_indeterminate());
     }
 }
