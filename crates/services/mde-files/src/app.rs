@@ -1149,8 +1149,8 @@ impl Application for MdeFiles {
         // responders were ready re-attempts the mesh/bus connection and
         // populates its peers on its own (every `update` ends in
         // `refresh_snapshot`, which now reconnects). No user interaction needed.
-        let reconnect = cosmic::iced::time::every(std::time::Duration::from_secs(5))
-            .map(|_| Message::Refresh);
+        let reconnect =
+            cosmic::iced::time::every(std::time::Duration::from_secs(5)).map(|_| Message::Refresh);
         cosmic::iced::Subscription::batch([Self::key_subscription(), reconnect])
     }
 
