@@ -28,6 +28,7 @@
 set -euo pipefail
 
 MODE=""; JOIN_ANCHOR=""; LISTEN=""; ANCHORS=""; FOLDER=/mnt/mesh-storage
+NO_FLIP=0; NO_FILES=0
 HELPERS="$(dirname "$0")"
 
 while [ $# -gt 0 ]; do case "$1" in
@@ -37,6 +38,9 @@ while [ $# -gt 0 ]; do case "$1" in
   --listen) LISTEN="$2"; shift 2;;
   --anchors) ANCHORS="$2"; shift 2;;
   --folder) FOLDER="$2"; shift 2;;
+  # Fleet-safe orchestration (an EXISTING LizardFS mesh, not greenfield):
+  --no-flip)  NO_FLIP=1; shift;;   # stand up etcd but do NOT restart mackesd
+  --no-files) NO_FILES=1; shift;;  # coordination only — skip Syncthing (Phase A)
   *) echo "unknown arg: $1" >&2; exit 1;;
 esac; done
 [ -z "$MODE" ] && { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
@@ -55,17 +59,32 @@ log "etcd: setup-etcd ${ETCD_ARGS[*]}"
 "$HELPERS/setup-etcd.sh" "${ETCD_ARGS[@]}"
 
 # 2. File plane (Syncthing) — replicates /mnt/mesh-storage full-mesh (no FUSE).
-SYNC_ARGS=(--folder "$FOLDER")
-[ -n "$LISTEN" ]  && SYNC_ARGS+=(--listen "$LISTEN")
-[ -n "$ANCHORS" ] && SYNC_ARGS+=(--anchors "$ANCHORS")
-log "syncthing: setup-syncthing ${SYNC_ARGS[*]}"
-"$HELPERS/setup-syncthing.sh" "${SYNC_ARGS[@]}"
+#    Phase A (--no-files) skips this: on an EXISTING mesh /mnt/mesh-storage is a
+#    live LizardFS FUSE mount, so running Syncthing on it = double-replication.
+#    The file swap is Phase B (LizardFS unmount → plain dir → Syncthing), SUBSTRATE-6.
+if [ "$NO_FILES" -eq 0 ]; then
+  SYNC_ARGS=(--folder "$FOLDER")
+  [ -n "$LISTEN" ]  && SYNC_ARGS+=(--listen "$LISTEN")
+  [ -n "$ANCHORS" ] && SYNC_ARGS+=(--anchors "$ANCHORS")
+  log "syncthing: setup-syncthing ${SYNC_ARGS[*]}"
+  "$HELPERS/setup-syncthing.sh" "${SYNC_ARGS[@]}"
+else
+  log "syncthing: SKIPPED (--no-files; files stay on LizardFS until Phase B)"
+fi
 
 # 3. mackesd now coordinates via etcd (the 20-etcd.conf drop-in setup-etcd wrote
-#    orders mackesd After=etcd). Restart it so it picks up the etcd endpoints +
-#    re-elects/joins on the new substrate.
-log "restarting mackesd onto the etcd substrate"
-systemctl restart mackesd.service 2>/dev/null || true
+#    orders mackesd After=etcd). The flip happens on the next mackesd START
+#    (run_serve's startup probe reads /etc/mackesd/etcd-endpoints). --no-flip
+#    leaves the running mackesd on its current (LizardFS) plane so the fleet can
+#    be STAGED (etcd up everywhere) and then flipped together in one fast pass —
+#    a node-by-node flip would split the directory (etcd nodes vs fs nodes).
+if [ "$NO_FLIP" -eq 0 ]; then
+  log "restarting mackesd onto the etcd substrate"
+  systemctl restart mackesd.service 2>/dev/null || true
+else
+  log "mackesd flip DEFERRED (--no-flip; etcd staged, mackesd still on LizardFS)"
+  log "  flip the whole fleet together with: systemctl restart mackesd"
+fi
 
 log "done — node is on etcd (coordination) + Syncthing (files). Verify:"
 echo "    etcdctl --endpoints=http://${LISTEN:-<overlay-ip>}:2379 endpoint health"
