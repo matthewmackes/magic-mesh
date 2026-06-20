@@ -151,6 +151,41 @@ impl VpnConfig {
     }
 }
 
+/// Durable path for the VPN config: `<workgroup_root>/vpn/tunnels.toml`.
+#[must_use]
+pub fn config_path(workgroup_root: &std::path::Path) -> std::path::PathBuf {
+    workgroup_root.join("vpn").join("tunnels.toml")
+}
+
+/// Load the VPN config (missing/malformed → default empty).
+#[must_use]
+pub fn load(workgroup_root: &std::path::Path) -> VpnConfig {
+    std::fs::read_to_string(config_path(workgroup_root))
+        .ok()
+        .and_then(|raw| VpnConfig::from_toml_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the VPN config (validate → atomic temp+rename).
+///
+/// # Errors
+/// Validation failure, or an I/O / serialize error.
+pub fn save(
+    workgroup_root: &std::path::Path,
+    cfg: &VpnConfig,
+) -> Result<std::path::PathBuf, String> {
+    cfg.validate()?;
+    let path = config_path(workgroup_root);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    let toml = cfg.to_toml_string().map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename {}: {e}", path.display()))?;
+    Ok(path)
+}
+
 /// The `wg-quick up <ifname>` argv (the config is written to
 /// `/etc/wireguard/<ifname>.conf` by the worker from the decrypted creds).
 #[must_use]
@@ -232,6 +267,20 @@ mod tests {
         assert_eq!(cfg.get("a").unwrap().method, Method::Ovpn);
         assert!(cfg.remove("a"));
         assert!(!cfg.remove("a"));
+    }
+
+    #[test]
+    fn load_save_round_trip_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = VpnConfig::default();
+        cfg.upsert(tun("mullvad1", Method::Wg));
+        save(tmp.path(), &cfg).unwrap();
+        assert_eq!(load(tmp.path()), cfg);
+        // Missing → default empty.
+        assert_eq!(
+            load(tmp.path().join("nope").as_path()),
+            VpnConfig::default()
+        );
     }
 
     #[test]

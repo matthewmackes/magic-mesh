@@ -36,6 +36,8 @@ pub mod files;
 pub mod fleet;
 pub mod jobs;
 pub mod route;
+// VPN-GW-1 — action/vpn/* tunnel CRUD + wg-quick/openvpn bring-up responder.
+pub mod vpn_gw;
 // NF-Bundle-0 (v2.5) — dev.mackes.MDE.Nebula.Status surface.
 // Foundation that NF-10..NF-18 desktop consumers chain on.
 // Reachable from run_serve at boot.

@@ -6853,6 +6853,40 @@ fn run_serve(
                 tracing::warn!(error = %e, "Route Bus responder: bus persist open failed; responder skipped");
             }
         }
+        // VPN-GW-1 — the VPN responder: action/vpn/* tunnel CRUD + wg-quick/
+        // openvpn bring-up over the per-node tunnel config. Same OS-thread shape.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let vpn_svc = mackesd_core::ipc::vpn_gw::VpnService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("vpn-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::vpn_gw::serve_bus(&persist, &vpn_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "VPN Bus responder spawned; serving action/vpn/{{list-tunnels,\
+                             add-tunnel,remove-tunnel,tunnel-up,tunnel-down,tunnel-status}} (VPN-GW-1)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "VPN Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("vpn_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "VPN Bus responder: bus persist open failed; responder skipped");
+            }
+        }
         // PD-1 — the peer-directory responder: action/mesh/directory
         // answers with the joined per-peer record (presence tier,
         // health, version, overlay ip/role, revision currency). Same
