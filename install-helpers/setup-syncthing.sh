@@ -74,8 +74,8 @@ log "device id: $DEVICE_ID"
 PEER_DEVICES=""
 if command -v etcdctl >/dev/null 2>&1 && [ -s "$ENDPOINTS_FILE" ]; then
   EPS="$(tr '\n' ',' < "$ENDPOINTS_FILE" | sed 's/,$//')"
-  # Publish our own ID first so other nodes can find us.
-  ETCDCTL_API=3 etcdctl --endpoints="$EPS" put "/mesh/syncthing/$HOST" "$DEVICE_ID" >/dev/null 2>&1 || true
+  # Publish our ID + overlay IP so peers can dial us explicitly (discovery is off).
+  ETCDCTL_API=3 etcdctl --endpoints="$EPS" put "/mesh/syncthing/$HOST" "$DEVICE_ID@$LISTEN" >/dev/null 2>&1 || true
   # The default etcdctl output is clean alternating key\nvalue lines:
   #   /mesh/syncthing/<host>\n<device-id>\n...  → pair them into host=device-id.
   # (The old `--print-value-only -w fields` combo returned NOTHING — --print-value-only
@@ -128,15 +128,23 @@ for la in opts.findall('listenAddress'):
     opts.remove(la)
 ET.SubElement(opts, 'listenAddress').text = f'tcp://{listen}:22000'
 
-# Devices: ensure ourselves + every registry peer is present.
-def ensure_device(dev_id, name):
-    for d in root.findall('device'):
-        if d.get('id') == dev_id:
-            return d
-    d = ET.SubElement(root, 'device', {'id': dev_id, 'name': name,
-                                       'compression': 'metadata',
-                                       'introducer': 'false'})
-    ET.SubElement(d, 'address').text = 'dynamic'
+# Devices: ensure ourselves + every registry peer is present. Discovery is OFF
+# (overlay-only), so a peer's address MUST be explicit (tcp://<overlay-ip>:22000)
+# — the default 'dynamic' relies on global/local discovery and never connects on
+# the overlay (the SUBSTRATE-14 rehearsal showed syncthing up + peered in config
+# but never CONNECTING, so no file sync). Self stays 'dynamic'.
+def ensure_device(dev_id, name, addr='dynamic'):
+    d = None
+    for e in root.findall('device'):
+        if e.get('id') == dev_id:
+            d = e; break
+    if d is None:
+        d = ET.SubElement(root, 'device', {'id': dev_id, 'name': name,
+                                           'compression': 'metadata',
+                                           'introducer': 'false'})
+    for a in d.findall('address'):
+        d.remove(a)
+    ET.SubElement(d, 'address').text = addr
     return d
 
 ensure_device(my_id, my_host)
@@ -144,12 +152,16 @@ peers = []
 for line in os.environ.get('PEER_DEVICES','').splitlines():
     line = line.strip()
     if '=' not in line: continue
-    host, dev = line.split('=', 1)
-    host, dev = host.strip(), dev.strip()
+    host, val = line.split('=', 1)
+    host, val = host.strip(), val.strip()
+    # Registry value is "<device-id>@<overlay-ip>" (the ip is for the explicit
+    # peer address); tolerate a bare id (no @) by falling back to dynamic.
+    dev, _, ip = val.partition('@')
+    dev, ip = dev.strip(), ip.strip()
     if not dev or dev == my_id: continue
     if not DEV_RE.match(dev):
         sys.stderr.write(f'skipping malformed device id for {host!r}\n'); continue
-    ensure_device(dev, host)
+    ensure_device(dev, host, f'tcp://{ip}:22000' if ip else 'dynamic')
     peers.append(dev)
 
 # The shared folder at <folder>, full-mesh to every known device, with
