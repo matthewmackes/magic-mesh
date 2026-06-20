@@ -1,44 +1,37 @@
 #!/bin/bash
-# setup-selinux-policy.sh — install the MCNF local SELinux policy modules so
-# a node runs clean under Enforcing SELinux (no AVC flood, no repeating
-# "SELinux security alert" toasts). Idempotent: safe to re-run; `semodule -i`
-# replaces an already-loaded module.
+# setup-selinux-policy.sh — OPERATOR PLATFORM STANDARD (2026-06-20):
+# **SELinux is DISABLED platform-wide.** The operator set "SELinux Disabled" as
+# the new platform standard, superseding SELINUX-1 (the run-clean-under-Enforcing
+# CIL policy — now retired; the magicmesh-*.cil modules are no longer loaded).
 #
-# Self-skips when SELinux is disabled or the tooling is absent. NEVER weakens the
-# node — it does not set permissive or disable SELinux; it grants exactly the
-# legitimate accesses the platform daemon stack needs (rationale per rule in each
-# .cil). The modules are split by precondition so a missing optional type (podman
-# not installed, libvirt not installed) only skips that one module:
-#   magicmesh-base     base-policy types — always loads
-#   magicmesh-podman   container_runtime_t — needs container-selinux (podman)
-#   magicmesh-libvirt  virtqemud_t — needs the libvirt SELinux policy
-#
-# Called from the RPM %post (all roles) and can be run by hand:
-#   /usr/libexec/mackesd/setup-selinux-policy
+# This writes SELINUX=disabled to /etc/selinux/config (fully effective after the
+# next reboot, when the kernel skips SELinux init entirely) and drops the running
+# system to permissive immediately so enforcement stops without waiting for a
+# reboot. Idempotent — safe to re-run. Called from the RPM %post (all roles) and
+# runnable by hand:  /usr/libexec/mackesd/setup-selinux-policy
 set -uo pipefail
 
-# Locate the shipped CIL dir: next to this script in the tree, or the RPM asset.
-DIR=""
-for d in "$(dirname "$0")/selinux" /usr/share/magic-mesh/selinux; do
-  [ -d "$d" ] && DIR="$d" && break
-done
-[ -n "$DIR" ] || { echo "magicmesh CIL dir not found; skipping"; exit 0; }
+CONFIG=/etc/selinux/config
+cur="$(getenforce 2>/dev/null || echo Disabled)"
 
-command -v getenforce >/dev/null 2>&1 || { echo "SELinux tooling absent; skipping"; exit 0; }
-[ "$(getenforce 2>/dev/null || echo Disabled)" = "Disabled" ] && { echo "SELinux disabled; skipping"; exit 0; }
-command -v semodule >/dev/null 2>&1 || { echo "semodule absent; skipping"; exit 0; }
+# Already at the standard (kernel disabled + config persisted)? nothing to do.
+if [ "$cur" = "Disabled" ] && grep -q '^SELINUX=disabled' "$CONFIG" 2>/dev/null; then
+  echo "SELinux already disabled (platform standard)"
+  exit 0
+fi
 
-rc=0
-for m in magicmesh-base magicmesh-podman magicmesh-libvirt; do
-  cil="$DIR/$m.cil"
-  [ -f "$cil" ] || continue
-  if semodule -i "$cil" 2>/dev/null; then
-    echo "==> loaded $m"
-  else
-    # Best-effort: a missing optional type (no podman / no libvirt) is expected
-    # and harmless — that node never trips the denial. Warn, do not fail.
-    echo "WARN: skipped $m (optional type absent or load failed)"
-  fi
-done
-echo "==> magicmesh SELinux policy applied; SELinux mode: $(getenforce)"
-exit $rc
+# Persist disabled for the next boot.
+if [ -f "$CONFIG" ]; then
+  sed -i 's/^SELINUX=.*/SELINUX=disabled/' "$CONFIG"
+  echo "==> set SELINUX=disabled in $CONFIG (kernel-disabled after reboot)"
+else
+  echo "WARN: $CONFIG absent — SELinux likely already disabled at build"
+fi
+
+# Stop enforcing NOW (permissive until the reboot makes it fully disabled).
+if command -v setenforce >/dev/null 2>&1 && [ "$cur" = "Enforcing" ]; then
+  setenforce 0 2>/dev/null && echo "==> setenforce 0 (permissive until reboot)"
+fi
+
+echo "==> SELinux mode now: $(getenforce 2>/dev/null || echo Disabled); platform standard = disabled (reboot to finalize)"
+exit 0
