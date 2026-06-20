@@ -1483,24 +1483,27 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
     - [ ] a `Lighthouse_Media` role exists in the role tier (`mde-role` + `worker_role` rank) and is selectable at install/enroll like other roles
     - [ ] a node's class is identifiable at runtime (role marker / Nebula membership per LIGHTHOUSE-9) and surfaces in the snapshot
     - [ ] media-only workers gate to this class; stock Lighthouse / Server / peer nodes skip them (verified: container absent on a non-media node)
-- [ ] **MEDIA-2: DO Spaces 100 GB bucket + S3 creds as a leader-managed mesh secret.**
+- [!] **MEDIA-2: DO Spaces 100 GB bucket + S3 creds as a leader-managed mesh secret.** BLOCKED on operator-provided Spaces access keys.
   **As** the mesh, **I want** one shared S3 bucket and its credentials held securely, **so that** every instance reads the same library and the keys never leak.
+  **Blocker (2026-06-20):** DO **Spaces access keys are console-minted** — `doctl` has no `spaces`/key-gen verb (only `cdn`), and no S3 keys / `rclone` config exist on the dev host. The bucket + keys need the operator to generate a Spaces key-pair in the DO console (API/Tokens → Spaces Keys); then the bucket can be created via the S3 API (`s3cmd`/`rclone mkdir`) and the key-pair sealed as the leader-managed secret. `setup-media-navidrome.sh` already consumes them from a root-only env file — so the moment keys exist, MEDIA-3/4 provision + live-verify (MEDIA-10) unblock. *Surfaced to the operator.*
   **Acceptance:**
     - [ ] a 100 GB DO Spaces bucket is provisioned (DO API / `s3cmd`); region + name recorded in config
     - [ ] the S3 access/secret keys live encrypted on Mesh-Sync as a leader-managed secret (XCP-7 / EFF-21 pattern), absent from `ps`/logs/env
     - [ ] a node reads the secret only via the leader-managed path; rotation re-distributes without a redeploy
-- [ ] **MEDIA-3: Navidrome container worker on `Lighthouse_Media`.**
+- [>] **MEDIA-3: Navidrome container worker on `Lighthouse_Media`.** DEPLOY SUBSTRATE LANDED (2026-06-20); worker + live-verify pending.
   **As** a `Lighthouse_Media` node, **I want** to run a capped Navidrome container, **so that** it serves music without starving the host.
+  **Substrate (`install-helpers/setup-media-navidrome.sh`):** stands up `mcnf-navidrome.service` — rootless-podman Navidrome (`docker.io/deluan/navidrome`, the Subsonic API `mde-musicd` speaks), per-instance local SQLite scan (lock #3, `$STATE/data`), bound to the overlay `:4533` (host-net, `ND_ADDRESS`/`ND_PORT`), with hard `MemoryMax=768M`/`CPUQuota=75%` host-protection caps (lock #9) + `Restart=always` breaker. Secrets via a root-only env file (never argv — design security lock). `bash -n` clean; refuses early without creds.
   **Acceptance:**
-    - [ ] a `mackesd` worker (reusing the `compute_*`/lifecycle Podman plumbing) runs `navidrome` on Lighthouse_Media, gated off MEDIA-1
-    - [ ] the container has hard `MemoryMax`/`CPUQuota` caps and restarts on failure (supervisor/breaker)
-    - [ ] Navidrome serves the Subsonic API on `:4533` over the overlay; `ping.view` succeeds from another node
-- [ ] **MEDIA-4: mount the Spaces bucket into the container as `/music`.**
+    - [>] a `mackesd` worker (reusing the `compute_*`/lifecycle Podman plumbing) runs `navidrome` on Lighthouse_Media, gated off MEDIA-1 — *today the standalone unit is the runtime; the self-healing mackesd worker that ADOPTS/supervises it is the next-release follow-on (the 11.0 RPM is already packaged). The unit + caps + breaker satisfy the run-and-survive half now.*
+    - [✓] the container has hard `MemoryMax`/`CPUQuota` caps and restarts on failure (supervisor/breaker) — in the unit
+    - [ ] Navidrome serves the Subsonic API on `:4533` over the overlay; `ping.view` succeeds from another node — *needs a live Lighthouse_Media + the MEDIA-2 bucket/keys*
+- [>] **MEDIA-4: mount the Spaces bucket into the container as `/music`.** DEPLOY SUBSTRATE LANDED (2026-06-20); live-verify pending.
   **As** the service, **I want** the S3 bucket presented as a POSIX path, **so that** Navidrome (which needs a filesystem) can scan it.
+  **Substrate (`setup-media-navidrome.sh`):** `mcnf-music-store.service` rclone-mounts `spaces:<bucket>` at `$STATE/library` `--read-only` with `--vfs-cache-mode full --vfs-cache-max-size 4G` (bounds the design's S3-scan-latency risk), bind-mounted into the container at `/music:ro`; `Restart=always` + `ExecStop` lazy-unmount re-establishes on boot/restart; the Navidrome unit `Requires=`/`After=` it.
   **Acceptance:**
-    - [ ] `rclone mount` (or `s3fs`) presents the bucket read-mostly at `/music` inside the container, with a bounded local VFS cache
-    - [ ] a scan indexes the bucket's tracks; cover-art + stream reads work from the mounted path
-    - [ ] the mount survives container restart and re-establishes on boot
+    - [✓] `rclone mount` presents the bucket read-mostly at `/music` inside the container, with a bounded local VFS cache — in the units
+    - [ ] a scan indexes the bucket's tracks; cover-art + stream reads work from the mounted path — *needs the live bucket (MEDIA-2)*
+    - [✓] the mount survives container restart and re-establishes on boot — `Restart=always` + boot-`WantedBy=multi-user.target`; live-confirm with MEDIA-10
 - [ ] **MEDIA-5: active-active + `music.mesh` mesh-DNS.**
   **As** a client node, **I want** one stable name that reaches any live instance, **so that** losing a media lighthouse doesn't break music.
   **Acceptance:**
