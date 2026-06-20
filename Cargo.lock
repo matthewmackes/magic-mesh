@@ -4043,7 +4043,7 @@ dependencies = [
 
 [[package]]
 name = "mackes-config"
-version = "10.0.18"
+version = "11.0.0"
 dependencies = [
  "mackes-mesh-types",
  "serde",
@@ -4052,7 +4052,7 @@ dependencies = [
 
 [[package]]
 name = "mackes-mesh-types"
-version = "10.0.18"
+version = "11.0.0"
 dependencies = [
  "dirs 5.0.1",
  "serde",
@@ -4063,7 +4063,7 @@ dependencies = [
 
 [[package]]
 name = "mackes-nebula-https-tunnel"
-version = "10.0.18"
+version = "11.0.0"
 dependencies = [
  "bytes",
  "mackes-transport",
@@ -4085,14 +4085,14 @@ dependencies = [
 
 [[package]]
 name = "mackes-xcp"
-version = "10.0.18"
+version = "11.0.0"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "mackesd"
-version = "10.0.18"
+version = "11.0.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4203,7 +4203,7 @@ checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
 
 [[package]]
 name = "mde-bus"
-version = "10.0.18"
+version = "11.0.0"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -4228,7 +4228,7 @@ dependencies = [
 
 [[package]]
 name = "mde-card"
-version = "10.0.18"
+version = "11.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4251,11 +4251,11 @@ dependencies = [
 
 [[package]]
 name = "mde-disclaimer"
-version = "10.0.18"
+version = "11.0.0"
 
 [[package]]
 name = "mde-enroll"
-version = "10.0.18"
+version = "11.0.0"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -4268,7 +4268,7 @@ dependencies = [
 
 [[package]]
 name = "mde-files"
-version = "10.0.18"
+version = "11.0.0"
 dependencies = [
  "chrono",
  "flate2",
@@ -4321,7 +4321,7 @@ dependencies = [
 
 [[package]]
 name = "mde-music"
-version = "10.0.18"
+version = "11.0.0"
 dependencies = [
  "base64",
  "image",
@@ -4336,7 +4336,7 @@ dependencies = [
 
 [[package]]
 name = "mde-musicd"
-version = "10.0.18"
+version = "11.0.0"
 dependencies = [
  "base64",
  "clap",
@@ -4358,7 +4358,7 @@ dependencies = [
 
 [[package]]
 name = "mde-notify"
-version = "10.0.18"
+version = "11.0.0"
 dependencies = [
  "mde-bus",
  "mde-theme",
@@ -4370,7 +4370,7 @@ dependencies = [
 
 [[package]]
 name = "mde-role"
-version = "10.0.18"
+version = "11.0.0"
 
 [[package]]
 name = "mde-role-chooser"
@@ -4383,7 +4383,7 @@ dependencies = [
 
 [[package]]
 name = "mde-theme"
-version = "10.0.18"
+version = "11.0.0"
 dependencies = [
  "serde",
  "toml 0.8.23",
@@ -4391,7 +4391,7 @@ dependencies = [
 
 [[package]]
 name = "mde-voice-config"
-version = "10.0.18"
+version = "11.0.0"
 dependencies = [
  "insta",
  "serde",
@@ -4400,7 +4400,7 @@ dependencies = [
 
 [[package]]
 name = "mde-voice-hud"
-version = "10.0.18"
+version = "11.0.0"
 dependencies = [
  "clap",
  "cpal",
@@ -4420,7 +4420,7 @@ dependencies = [
 
 [[package]]
 name = "mde-workbench"
-version = "10.0.18"
+version = "11.0.0"
 dependencies = [
  "async-stream",
  "async-trait",
