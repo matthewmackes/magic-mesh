@@ -1473,3 +1473,67 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
 - [✓] **BRAND-11-3: Notification Hub watermark.** DONE: a pre-faded (~16% alpha) transparent logo (assets/brand/watermark.png) is pinned to the Hub's lower visible area via a `Stack` overlay (bottom-center, 148px, no pointer handlers so clicks pass through to the launch bar). mde-notify-center builds clean.
 - [✓] **BRAND-11-4: hero everywhere branding/info appears.** DONE: the About panel renders the logo as its hero (Brand LogoLockup→Monogram fallback) and its codename auto-tracks the major version (11.x → "Winter-Is-Coming", else 10.0 "Magic Mesh"). About drift tests green. *(Other info surfaces — greeter, role-chooser — already pull the brand-loader slots, so they pick up the new logo automatically.)*
 - [✓] **BRAND-11-5: ship the branded wallpaper as the 11.0 default desktop background.** DONE (operator "yes"): the 4K wallpaper ships via the RPM to `/usr/share/backgrounds/mcnf-11-winter.png`; a Workstation-gated autostart (`org.magicmesh.SeedWallpaper.desktop` → `mde-seed-wallpaper`) seeds the per-user Cosmic `CosmicBackground` config to it on first login (seed-if-absent — never stomps a user-chosen wallpaper; the cosmic-bg-owned `/usr/share/cosmic` default can't be shipped without an RPM file conflict, hence the per-user seed). The live mesh-map wallpaper (PD-10) is now **opt-in** (`MeshWallpaper.desktop` autostart disabled by default) so the branded image is the visible default; re-enable it in Settings ▸ Startup Applications. Downloadable 4K + 1080p under `assets/brand/wallpaper/`.
+
+### MEDIA-LIGHTHOUSE — hot-redundant Navidrome music service + auto-config host (operator 2026-06-20, 10-Q survey locked)
+> Design: `docs/design/media-lighthouse.md`. Navidrome in Podman on a new **`Lighthouse_Media`** role class; each reads one shared **100 GB DigitalOcean Spaces** bucket; active-active behind **`music.mesh`** mesh-DNS; published in the service registry; **birthright auto-config** writes every node's `airsonic-creds.json` at enroll → the Music System's new Auto-Configuration host. RAM-tiny stock lighthouses (the 947 MB master) never host it. Locks: Navidrome · DO Spaces · per-instance SQLite scan · active-active · `music.mesh` · enroll-birthright + registry · one shared service account · registry+DNS publish · `Lighthouse_Media` class · operator-upload (bucket = source of truth).
+
+- [ ] **MEDIA-1: the `Lighthouse_Media` role class.**
+  **As** an operator, **I want** a dedicated lighthouse subclass that hosts the media service, **so that** the music container only runs on adequately-resourced nodes and never on the tiny master.
+  **Acceptance** (each runtime-observable):
+    - [ ] a `Lighthouse_Media` role exists in the role tier (`mde-role` + `worker_role` rank) and is selectable at install/enroll like other roles
+    - [ ] a node's class is identifiable at runtime (role marker / Nebula membership per LIGHTHOUSE-9) and surfaces in the snapshot
+    - [ ] media-only workers gate to this class; stock Lighthouse / Server / peer nodes skip them (verified: container absent on a non-media node)
+- [ ] **MEDIA-2: DO Spaces 100 GB bucket + S3 creds as a leader-managed mesh secret.**
+  **As** the mesh, **I want** one shared S3 bucket and its credentials held securely, **so that** every instance reads the same library and the keys never leak.
+  **Acceptance:**
+    - [ ] a 100 GB DO Spaces bucket is provisioned (DO API / `s3cmd`); region + name recorded in config
+    - [ ] the S3 access/secret keys live encrypted on Mesh-Sync as a leader-managed secret (XCP-7 / EFF-21 pattern), absent from `ps`/logs/env
+    - [ ] a node reads the secret only via the leader-managed path; rotation re-distributes without a redeploy
+- [ ] **MEDIA-3: Navidrome container worker on `Lighthouse_Media`.**
+  **As** a `Lighthouse_Media` node, **I want** to run a capped Navidrome container, **so that** it serves music without starving the host.
+  **Acceptance:**
+    - [ ] a `mackesd` worker (reusing the `compute_*`/lifecycle Podman plumbing) runs `navidrome` on Lighthouse_Media, gated off MEDIA-1
+    - [ ] the container has hard `MemoryMax`/`CPUQuota` caps and restarts on failure (supervisor/breaker)
+    - [ ] Navidrome serves the Subsonic API on `:4533` over the overlay; `ping.view` succeeds from another node
+- [ ] **MEDIA-4: mount the Spaces bucket into the container as `/music`.**
+  **As** the service, **I want** the S3 bucket presented as a POSIX path, **so that** Navidrome (which needs a filesystem) can scan it.
+  **Acceptance:**
+    - [ ] `rclone mount` (or `s3fs`) presents the bucket read-mostly at `/music` inside the container, with a bounded local VFS cache
+    - [ ] a scan indexes the bucket's tracks; cover-art + stream reads work from the mounted path
+    - [ ] the mount survives container restart and re-establishes on boot
+- [ ] **MEDIA-5: active-active + `music.mesh` mesh-DNS.**
+  **As** a client node, **I want** one stable name that reaches any live instance, **so that** losing a media lighthouse doesn't break music.
+  **Acceptance:**
+    - [ ] `mesh_dns` resolves `music.mesh` to an A-record set of every live Lighthouse_Media overlay IP
+    - [ ] powering off one media lighthouse leaves `music.mesh` resolving + streaming from the rest (client retry/reconnect covers the gap)
+    - [ ] a newly-added Lighthouse_Media joins the record set automatically
+- [ ] **MEDIA-6: shared service account auto-provisioning.**
+  **As** the mesh, **I want** one music account provisioned automatically, **so that** every node authenticates without manual user setup.
+  **Acceptance:**
+    - [ ] a single shared Navidrome account is created on first start (idempotent), its password a leader-managed secret
+    - [ ] playlist writes from any instance land on shared/durable state so they're visible mesh-wide (resolve the per-instance-SQLite write path)
+    - [ ] the account streams + browses from a client node end-to-end
+- [ ] **MEDIA-7: register as a published mesh service.**
+  **As** an operator, **I want** the music service in the published-services surface, **so that** it's discoverable and its health is visible.
+  **Acceptance:**
+    - [ ] the service registers in the mesh service registry (the Workbench published-services surface lists it) + `music.mesh`
+    - [ ] the entry shows per-instance health (which Lighthouse_Media nodes are serving)
+    - [ ] de-registration on teardown leaves no stale entry
+- [ ] **MEDIA-8: birthright auto-config — the Auto-Configuration host.**
+  **As** a fresh node, **I want** my music client pre-configured at enroll, **so that** music works with zero manual connect.
+  **Acceptance:**
+    - [ ] on enroll, `mackesd` writes `airsonic-creds.json` → `http://music.mesh:4533` + the shared account
+    - [ ] already-enrolled nodes pick up the service from the registry (no re-enroll needed)
+    - [ ] opening `mde-music` on a fresh node browses the library with no manual connect; the connect form becomes an override
+- [ ] **MEDIA-9: content ingestion — operator upload to the bucket.**
+  **As** an operator, **I want** to add music to the shared bucket, **so that** it's the canonical library every instance serves.
+  **Acceptance:**
+    - [ ] a documented path uploads music to the Spaces bucket (`rclone` / a mesh Files surface)
+    - [ ] a rescan trigger refreshes every instance's index after an upload
+    - [ ] uploaded tracks appear in `mde-music` on a client after the rescan
+- [ ] **MEDIA-10: redundancy + live verification on DO.**
+  **As** an operator, **I want** the hot-redundancy proven on real infrastructure, **so that** the published service is trustworthy.
+  **Acceptance:**
+    - [ ] ≥2 Lighthouse_Media nodes serve the same bucket concurrently (live on DO)
+    - [ ] killing one instance: `music.mesh` keeps streaming on a client within the retry window (measured user-visible gap recorded)
+    - [ ] a fresh enrolled node auto-configures + plays, end-to-end, on the live mesh
