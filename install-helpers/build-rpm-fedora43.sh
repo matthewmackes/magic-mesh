@@ -39,8 +39,14 @@ podman pull "$IMAGE" >/dev/null
 IN_CONTAINER='
 set -euo pipefail
 echo "[f43] installing build deps"
+# mold is REQUIRED: .cargo/config.toml forces `-C link-arg=-fuse-ld=mold` for
+# x86_64-unknown-linux-gnu, so a container without mold dies at the first link
+# with `collect2: fatal error: cannot find 'ld'` / mold not found (hit on the
+# 2026-06-20 11.0 fc43 build). binutils gives the `ld` fallback; protobuf-compiler
+# is the etcd-client (SUBSTRATE-V2) build-time protoc dep.
 dnf install -y --setopt=install_weak_deps=False \
     gcc gcc-c++ cmake pkg-config git curl findutils which gzip tar xz \
+    mold binutils protobuf-compiler \
     gtk3-devel alsa-lib-devel openssl-devel opus-devel >/tmp/dnf.log 2>&1 || { tail -20 /tmp/dnf.log; exit 1; }
 
 echo "[f43] installing rustup + the pinned toolchain"
