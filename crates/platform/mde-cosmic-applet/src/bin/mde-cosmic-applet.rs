@@ -231,18 +231,14 @@ impl Application for Applet {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        // A bell glyph tinted by the highest unread severity (filled ● when
-        // unread, hollow ○ when idle). The whole button toggles the center.
-        let unread = self.severity.is_some();
-        // GLYPH-FIX (2026-06-18) — use a PURE-SYMBOL BMP glyph (●/○), not an
-        // emoji. The 🔔/🔕 emoji (even with U+FE0E) render via the color-emoji
-        // font: they ignore our Carbon `Text::Color` tint (→ black/invisible on
-        // the dark panel) AND loading the emoji font on first paint stalls the
-        // draw for seconds. ● filled = unread, ○ hollow = idle; the tint applies.
-        let glyph = if unread { "\u{25CF}" } else { "\u{25CB}" }; // ● / ○
+        // APPLET-LABEL (operator 2026-06-20) — the panel button shows the word
+        // "Activity" instead of the bell glyph. The highest-unread-severity tint
+        // still colors the word (the unread cue: Carbon danger/warn/accent when
+        // unread, muted/idle otherwise), and the tint applies to text reliably
+        // (unlike the 🔔 emoji, which ignored Text::Color — GLYPH-FIX 2026-06-18).
         let color = bell_color(self.severity);
-        let glyph_el = cosmic::widget::text(glyph)
-            .size(14)
+        let glyph_el = cosmic::widget::text("Activity")
+            .size(13)
             .class(cosmic::theme::Text::Color(color));
         // NEB-CRYPTO-LABEL — the live overlay cipher strength as text next to
         // the bell (muted Carbon token; omitted when the overlay is down).

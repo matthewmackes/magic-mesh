@@ -790,16 +790,13 @@ impl Application for AppsApplet {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        // BRAND-11 (operator 2026-06-19) — the panel launcher button uses the
-        // MCNF 11 brand logo (Start5, background flood-keyed to transparent;
-        // baked in so it renders with no install-path dependency), sized to the
-        // panel's suggested icon size.
+        // APPLET-LABEL (operator 2026-06-20) — the panel launcher button shows the
+        // word "Start>" instead of the brand logo, sized to the panel's height.
         let icon_px = self.core.applet.suggested_size(true).0.max(16);
-        let glyph = cosmic::iced::widget::image(cosmic::iced::widget::image::Handle::from_bytes(
-            include_bytes!("../../../../../assets/brand/app-launcher.png").to_vec(),
-        ))
-        .width(Length::Fixed(f32::from(icon_px)))
-        .height(Length::Fixed(f32::from(icon_px)));
+        let glyph = cosmic::widget::text("Start>")
+            .size(f32::from(icon_px) * 0.6)
+            .height(Length::Fixed(f32::from(icon_px)))
+            .align_y(cosmic::iced::alignment::Vertical::Center);
         // APPS-MOUSE-FIX (operator bug 2026-06-18) — the panel button is plain
         // click-to-toggle: `on_press` opens the dropdown, a second press closes
         // it, and a launch closes it (the LaunchLocal/LaunchMesh/OpenService
