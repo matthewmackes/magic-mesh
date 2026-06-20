@@ -6887,6 +6887,40 @@ fn run_serve(
                 tracing::warn!(error = %e, "VPN Bus responder: bus persist open failed; responder skipped");
             }
         }
+        // DDNS-EGRESS-3 — the DDNS config responder: action/ddns/* over the
+        // [ddns] config. Same OS-thread shape.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let ddns_svc = mackesd_core::ipc::ddns::DdnsService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("ddns-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::ddns::serve_bus(&persist, &ddns_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "DDNS Bus responder spawned; serving action/ddns/{{get-config,\
+                             set-config,add-record,remove-record}} (DDNS-EGRESS-3)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "DDNS Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("ddns_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "DDNS Bus responder: bus persist open failed; responder skipped");
+            }
+        }
         // PD-1 — the peer-directory responder: action/mesh/directory
         // answers with the joined per-peer record (presence tier,
         // health, version, overlay ip/role, revision currency). Same

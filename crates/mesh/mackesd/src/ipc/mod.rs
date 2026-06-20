@@ -30,7 +30,8 @@ pub mod apps;
 pub mod bus_bridge;
 // CONNECT-1 — action/connect/* exposure-policy responder.
 pub mod connect;
-// ROUTE-TRACE-1 — action/route/trace PathGraph responder.
+// DDNS-EGRESS-3 — action/ddns/* config responder.
+pub mod ddns;
 pub mod directory;
 pub mod files;
 pub mod fleet;

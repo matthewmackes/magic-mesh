@@ -198,6 +198,25 @@ pub fn load(workgroup_root: &std::path::Path) -> DdnsConfig {
         .unwrap_or_default()
 }
 
+/// Persist the DDNS config (atomic temp+rename).
+///
+/// # Errors
+/// An I/O / serialize error.
+pub fn save(
+    workgroup_root: &std::path::Path,
+    cfg: &DdnsConfig,
+) -> Result<std::path::PathBuf, String> {
+    let path = config_path(workgroup_root);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    let toml = cfg.to_toml_string().map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename {}: {e}", path.display()))?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
