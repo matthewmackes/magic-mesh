@@ -41,6 +41,27 @@ use crate::hooks::config::Priority;
 /// need a separate file at runtime.
 const SCHEMA: &str = include_str!("../migrations/0001_init.sql");
 
+/// Process-global MONOTONIC ULID generator for message ids. The `(topic,
+/// ulid)` cursor scan (`list_since`, `latest_ulid`, the music daemon's
+/// `seed_cursors_at_tail`) relies on ULID order reflecting WRITE order, but
+/// `Ulid::new()` is timestamp + random — two writes in the same millisecond
+/// can invert, so a consumer could skip or reorder same-ms messages. This
+/// generator guarantees strictly increasing ULIDs across all topics in the
+/// process (same-ms ties increment the random tail; a backwards clock reuses
+/// the higher previous timestamp). `Generator::new()` is `const`, so no lazy
+/// init is needed.
+static ULID_GEN: std::sync::Mutex<ulid::Generator> = std::sync::Mutex::new(ulid::Generator::new());
+
+/// Mint the next monotonic ULID. Falls back to `Ulid::new()` only on the
+/// astronomically-unlikely same-millisecond 2^80 overflow.
+fn next_ulid() -> Ulid {
+    ULID_GEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .generate()
+        .unwrap_or_else(|_| Ulid::new())
+}
+
 /// BOOT-REC-3 — true only for a definitive SQLite **read-only** failure (the
 /// boot-race latch), NOT busy/locked contention. Gates the self-heal recreate
 /// so transient concurrency never deletes the live index.
@@ -341,9 +362,9 @@ impl Persist {
     ) -> Result<StoredMessage, PersistError> {
         validate_topic(topic)?;
 
-        // ULID carries the timestamp + a random tail; monotonic
-        // within a single `Ulid::new()` call sequence.
-        let ulid = Ulid::new().to_string();
+        // Monotonic ULID (see ULID_GEN) so the (topic, ulid) cursor scan
+        // reflects write order even for same-millisecond writes.
+        let ulid = next_ulid().to_string();
 
         let topic_dir = self.bus_root.join(topic);
         std::fs::create_dir_all(&topic_dir)
