@@ -6787,6 +6787,41 @@ fn run_serve(
                 tracing::warn!(error = %e, "Connect Bus responder: bus persist open failed; responder skipped");
             }
         }
+        // ROUTE-TRACE-1 — the route-trace responder: action/route/trace assembles
+        // the typed PathGraph between two endpoints from the CONNECT exposure +
+        // peer directory. Same dedicated-OS-thread shape.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let route_svc =
+                    mackesd_core::ipc::route::RouteService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("route-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::route::serve_bus(&persist, &route_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "Route Bus responder spawned; serving action/route/trace (ROUTE-TRACE-1)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Route Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("route_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Route Bus responder: bus persist open failed; responder skipped");
+            }
+        }
         // PD-1 — the peer-directory responder: action/mesh/directory
         // answers with the joined per-peer record (presence tier,
         // health, version, overlay ip/role, revision currency). Same

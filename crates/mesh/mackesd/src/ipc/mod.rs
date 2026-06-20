@@ -30,10 +30,12 @@ pub mod apps;
 pub mod bus_bridge;
 // CONNECT-1 — action/connect/* exposure-policy responder.
 pub mod connect;
+// ROUTE-TRACE-1 — action/route/trace PathGraph responder.
 pub mod directory;
 pub mod files;
 pub mod fleet;
 pub mod jobs;
+pub mod route;
 // NF-Bundle-0 (v2.5) — dev.mackes.MDE.Nebula.Status surface.
 // Foundation that NF-10..NF-18 desktop consumers chain on.
 // Reachable from run_serve at boot.
