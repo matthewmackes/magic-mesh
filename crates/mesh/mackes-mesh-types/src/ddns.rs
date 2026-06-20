@@ -141,6 +141,48 @@ pub fn needs_update(last: Option<&str>, current: &str) -> bool {
     last != Some(current)
 }
 
+/// The A/AAAA record type for an IP literal — `AAAA` for IPv6 (contains `:`),
+/// else `A`. Pure helper for the DigitalOcean writer.
+#[must_use]
+pub fn record_type(ip: &str) -> &'static str {
+    if ip.contains(':') {
+        "AAAA"
+    } else {
+        "A"
+    }
+}
+
+/// DDNS-EGRESS-2 — the DigitalOcean DNS API request to **upsert** a record: a
+/// `PUT …/records/{id}` when `existing_id` is known, else a `POST …/records` to
+/// create. Returns `(method, path, json_body)`; the daemon adapter attaches the
+/// bearer token + executes. `name` is the bare label (the part before the zone).
+/// Pure + testable — no HTTP here (keeps this lightweight crate dep-free).
+#[must_use]
+pub fn do_upsert_request(
+    domain: &str,
+    name: &str,
+    ip: &str,
+    ttl: u32,
+    existing_id: Option<&str>,
+) -> (&'static str, String, String) {
+    let rtype = record_type(ip);
+    let body = serde_json::json!({
+        "type": rtype, "name": name, "data": ip, "ttl": ttl
+    })
+    .to_string();
+    match existing_id {
+        Some(id) => ("PUT", format!("/v2/domains/{domain}/records/{id}"), body),
+        None => ("POST", format!("/v2/domains/{domain}/records"), body),
+    }
+}
+
+/// DDNS-EGRESS-2 — the DigitalOcean request to **delete** a record by id
+/// (`on_down = remove`). Returns `(method, path)`. Pure.
+#[must_use]
+pub fn do_delete_request(domain: &str, id: &str) -> (&'static str, String) {
+    ("DELETE", format!("/v2/domains/{domain}/records/{id}"))
+}
+
 /// Durable path for the DDNS config: `<workgroup_root>/ddns/config.toml`.
 #[must_use]
 pub fn config_path(workgroup_root: &std::path::Path) -> std::path::PathBuf {
@@ -207,6 +249,43 @@ mod tests {
         });
         let s = c2.to_toml_string().unwrap();
         assert_eq!(DdnsConfig::from_toml_str(&s).unwrap(), c2);
+    }
+
+    #[test]
+    fn do_requests_create_update_delete() {
+        // No existing id → POST create.
+        let (m, p, b) =
+            do_upsert_request("matthewmackes.com", "eagle-mullvad", "1.2.3.4", 60, None);
+        assert_eq!(m, "POST");
+        assert_eq!(p, "/v2/domains/matthewmackes.com/records");
+        assert!(b.contains("\"type\":\"A\"") && b.contains("\"data\":\"1.2.3.4\""));
+        // Existing id → PUT update.
+        let (m, p, _) = do_upsert_request(
+            "matthewmackes.com",
+            "eagle-mullvad",
+            "1.2.3.4",
+            60,
+            Some("99"),
+        );
+        assert_eq!(m, "PUT");
+        assert_eq!(p, "/v2/domains/matthewmackes.com/records/99");
+        // IPv6 → AAAA.
+        let (_, _, b6) = do_upsert_request("z", "n", "2001:db8::1", 60, None);
+        assert!(b6.contains("\"type\":\"AAAA\""));
+        // Delete.
+        assert_eq!(
+            do_delete_request("matthewmackes.com", "99"),
+            (
+                "DELETE",
+                "/v2/domains/matthewmackes.com/records/99".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn record_type_picks_a_or_aaaa() {
+        assert_eq!(record_type("1.2.3.4"), "A");
+        assert_eq!(record_type("2001:db8::1"), "AAAA");
     }
 
     #[test]
