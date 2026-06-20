@@ -32,6 +32,8 @@ pub mod peer_probe;
 // Shared home so mackesd (writer, heartbeat tick) + mde-installer
 // (reader) use one path; docs/design/v2.7-peer-data-convergence.md.
 pub mod peers;
+/// ROUTE-TRACE-1 — the typed PathGraph model for `action/route/trace`.
+pub mod route_trace;
 // Portal-18.a (v6.0 R12 lock 2026-05-26) — universal tag schema +
 // per-peer storage layer. Lands here (rather than in a fresh crate)
 // because every existing consumer of `mackes-mesh-types` is also a
