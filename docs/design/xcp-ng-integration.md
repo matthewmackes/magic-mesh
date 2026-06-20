@@ -83,9 +83,49 @@ install:
 - Re-run safety: a second `xcp-host-join` is a no-op; an XCP host reboot
   re-asserts the dom0 platform bits.
 
+## Tested onboarding method (2026-06-19) — and a B1 correction
+
+Designed + tested end-to-end against a real XCP-ng 8.3.0 dom0 (`172.20.0.4`) via a
+**self-contained throwaway CA + test lighthouse** on the dev box (overlay `10.99.0.0/24`,
+port 4299, tun `nebula9` — isolated from the production `nebula1`/`10.42` mesh).
+Script: `install-helpers/onboard-xcp-host.sh`. **Result: dom0 joined the test
+overlay as `10.99.0.20` with 0% loss bidirectional to the lighthouse over Nebula,
+then fully torn down; production mesh untouched.**
+
+**The method (proven):** mint a node cert on the CA → push a **statically-linked**
+`nebula` + ca/host certs + a `config.yml` (static_host_map → lighthouse public IP,
+non-lighthouse, open-mesh fw) to dom0 → install `nebula.service` (systemd, the right
+persistence — a detached `nohup`/`setsid` over SSH does **not** survive) → verify
+overlay ping.
+
+**B1 CORRECTION (load-bearing).** The original B1 lock — "native nebula +
+**lizardfs-client + mackesd** on dom0" — is **only partly viable**. An XCP-ng dom0
+is CentOS-7-based (**glibc 2.17**); the Fedora-packaged `nebula`, `mackesd`, and the
+lizardfs client are **dynamically linked against glibc ≥2.32/2.34** and die on dom0
+with `version 'GLIBC_2.34' not found` (verified). Therefore:
+- **Nebula on dom0: YES**, but ONLY the **official SlackHQ static** release
+  (`nebula-linux-amd64.tar.gz`, statically linked Go) — NOT the Fedora `/usr/bin/nebula`.
+  The script now downloads/uses the static binary and **refuses to push a dynamic one**.
+- **mackesd / lizardfs-client on dom0: NO** (glibc). The dom0 does **not** run
+  mackesd. Drive it instead via the **A1 `XeSsh` path** (`HostTarget::Ssh` over the
+  overlay) from a real mesh node, and run the **`xcp_host` capacity worker on a
+  designated Server node (or the leader)** pointed at the dom0 over SSH — NOT on dom0
+  locally. (This supersedes the XCP-6 "xcp_host self-gates on the dom0 marker and runs
+  *on* dom0" assumption — mackesd can't run there.) The 11.0 substrate move to
+  **etcd + Syncthing** (both shippable as static binaries) is what could later let a
+  dom0 carry a real coordination/file agent without the glibc wall.
+
+So a dom0's mesh membership = **overlay reachability + SSH-over-mesh + XAPI control
+target**, which is exactly enough for compute-provider duty (A-plane spawns target it
+via `xe`). "Full native mackesd member" is retired for dom0.
+
 ## Risks / out of scope
-- **dom0 fragility (B1):** native installs on a locked appliance can break on
-  host upgrades — mitigated by the idempotent re-assert boot unit; revisit a
-  per-host agent VM if it proves unstable.
+- **dom0 fragility (B1):** the static `nebula` + its `nebula.service` are the only
+  dom0-resident bits; an XCP host upgrade clobbering them self-heals via the
+  idempotent re-assert (a boot unit / re-run is a no-op). Far smaller surface than the
+  original native-mackesd plan.
+- **dom0 glibc wall:** no Fedora RPM (mackesd/lizardfs) runs on dom0 — drive via
+  `XeSsh`; only static binaries (nebula today; etcd/Syncthing under SUBSTRATE-V2) are
+  dom0-resident candidates.
 - Native rustls XAPI backend (replacing xe-over-SSH) — deferred behind the trait.
 - Windows/other guest images, live-migration orchestration — out of scope.
