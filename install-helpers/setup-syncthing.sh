@@ -76,8 +76,14 @@ if command -v etcdctl >/dev/null 2>&1 && [ -s "$ENDPOINTS_FILE" ]; then
   EPS="$(tr '\n' ',' < "$ENDPOINTS_FILE" | sed 's/,$//')"
   # Publish our own ID first so other nodes can find us.
   ETCDCTL_API=3 etcdctl --endpoints="$EPS" put "/mesh/syncthing/$HOST" "$DEVICE_ID" >/dev/null 2>&1 || true
-  PEER_DEVICES="$(ETCDCTL_API=3 etcdctl --endpoints="$EPS" get --prefix /mesh/syncthing/ --print-value-only -w fields 2>/dev/null \
-    | awk -F'"' '/"Key"/{k=$2} /"Value"/{print k"="$2}' | sed 's#.*/mesh/syncthing/##' || true)"
+  # The default etcdctl output is clean alternating key\nvalue lines:
+  #   /mesh/syncthing/<host>\n<device-id>\n...  → pair them into host=device-id.
+  # (The old `--print-value-only -w fields` combo returned NOTHING — --print-value-only
+  # suppresses the keys the awk needed, and -w fields base64-encodes; the
+  # SUBSTRATE-14 rehearsal caught the registry yielding 0 peers despite both
+  # devices being present.)
+  PEER_DEVICES="$(ETCDCTL_API=3 etcdctl --endpoints="$EPS" get --prefix /mesh/syncthing/ 2>/dev/null \
+    | awk 'NR%2==1{sub(/.*\/mesh\/syncthing\//,"",$0); k=$0; next} {print k"="$0}' || true)"
 fi
 
 # ---- apply overlay-only config + the shared folder + peers (XML edit) ------
