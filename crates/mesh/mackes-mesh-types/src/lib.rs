@@ -18,6 +18,7 @@
 pub mod cap_tags;
 pub mod connect;
 // CONNECT-1 (2026-06-19) — unified connectivity / exposure policy model + state.
+pub mod ddns;
 pub mod exposure;
 // LIGHTHOUSE-2 (2026-06-18) — shared lighthouse discovery + binary health
 // (beacon) derivation from the replicated peer directory. One pure source for
