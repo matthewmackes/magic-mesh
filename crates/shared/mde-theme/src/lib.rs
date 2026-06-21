@@ -61,7 +61,7 @@ pub mod typography;
 
 pub use accessibility::A11y;
 pub use animation::{
-    crossfade, ease, fade_in, fade_out, lerp_f32, lift_on_hover, pulse_scale, route,
+    crossfade, ease, fade_in, fade_out, lerp_f32, lift_on_hover, popup, pulse_scale, route,
     shimmer_highlight, shimmer_lift, slide_in, stagger, Animator, Crossfade, LoopingTween,
     RenderParams, RowState, RowStyle, Transition, Tween, SELECTION_RAIL_PX,
     SHIMMER_BAND_HALF_WIDTH, SHIMMER_PEAK_LIFT,
@@ -83,7 +83,7 @@ pub use icons::{
     MATERIAL_LINE_WEIGHT_PX,
 };
 pub use load_state::{LoadState, StatusSeverity};
-pub use motion::{Easing, Motion, PANEL_MOUNT_TRANSLATE_Y_PX, PULSE_MAX_SCALE};
+pub use motion::{Easing, Motion, PANEL_MOUNT_TRANSLATE_Y_PX, POPUP_SCALE_DELTA, PULSE_MAX_SCALE};
 pub use palette::Palette;
 pub use prefs::Preferences;
 pub use radii::Radii;

@@ -713,6 +713,17 @@ impl App {
         if self.switching() {
             subs.push(Self::transition_subscription());
         }
+        // MOTION-FEEDBACK-3 — the snapshots restore-confirm modal's shared popup
+        // enter/exit tick. Armed ONLY while the Snapshots panel is the active view
+        // AND its modal is mid-transition; it stops the instant the fade-scale
+        // settles (no idle animation — MOTION-PERF-1); reduce-motion still ticks
+        // briefly but the tween caps at ≤80 ms so it settles immediately.
+        if self.view.panel_slug() == Some("snapshots") && self.snapshots.modal_animating() {
+            subs.push(
+                cosmic::iced::time::every(Duration::from_millis(60))
+                    .map(|_| Message::Snapshots(snapshots_panel::Message::ModalTick)),
+            );
+        }
         // PD-8 (L14) / PLANES-1 — Netdata sampling only while the Peers
         // directory is the active view (the Compute pattern). The Front
         // Door is reachable as the Peers plane root/panel or the

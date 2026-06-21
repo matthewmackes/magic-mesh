@@ -135,6 +135,24 @@ impl Motion {
         }
     }
 
+    /// MOTION-FEEDBACK-3 — the shared **popup / menu / drawer / Hub** enter-exit
+    /// timing. Every transient overlay surface (the Application Menu launcher, the
+    /// power menu, the Notification Hub, Workbench dialogs/drawers) opens + closes
+    /// on this one preset, so the whole shell shares one popup vocabulary. A
+    /// popover is a quick state change, so Carbon `moderate-01` (150 ms) ease-out —
+    /// snappier than a full `panel_mount`/route reveal (240 ms) but long enough to
+    /// read as an intentional fade-scale. Single-shot; reduce-motion collapses it
+    /// through [`Motion::resolved`] / [`crate::Tween::resolved`] to the ≤80 ms
+    /// crossfade (and the scale is dropped — see [`crate::animation::popup`]).
+    #[must_use]
+    pub const fn popup() -> Self {
+        Self {
+            duration: DURATION_MODERATE_01,
+            easing: Easing::EaseOut,
+            looping: false,
+        }
+    }
+
     /// UX-9 (b) — notification bell pulse. 2 s ease-in-out,
     /// looping. Max scale 1.15 (see [`PULSE_MAX_SCALE`]).
     #[must_use]
@@ -261,6 +279,16 @@ pub const PULSE_MAX_SCALE: f32 = 1.15;
 /// UX-9 (a) — panel mount translate-Y start offset (px).
 /// Component dimension, not density-scaled.
 pub const PANEL_MOUNT_TRANSLATE_Y_PX: f32 = 4.0;
+
+/// MOTION-FEEDBACK-3 — the popup enter/exit **scale delta**: the subtle amount a
+/// popup/menu/drawer/Hub is scaled *down* at the start of its open (and back
+/// down to at the end of its close), e.g. `0.04` ⇒ the surface enters at 0.96×
+/// and grows to 1.0×. Kept small so the surface reads as a gentle fade-scale,
+/// never a distracting zoom (matches the Carbon "grow from origin" micro-scale).
+/// The single source for the shell-wide popup vocabulary; dropped entirely under
+/// reduce-motion (see [`crate::animation::popup`]). Component dimension, not
+/// density-scaled.
+pub const POPUP_SCALE_DELTA: f32 = 0.04;
 
 /// UX-9 (c) + CR-10 — dialog spec constants.
 /// Locked component dimensions, not density-scaled per UX-24.
@@ -459,6 +487,29 @@ mod tests {
         assert_eq!(Easing::EaseOut.carbon_bezier(), EASING_ENTRANCE);
         assert_eq!(Easing::EaseIn.carbon_bezier(), EASING_EXIT);
         assert_eq!(Easing::EaseInOut.carbon_bezier(), EASING_STANDARD);
+    }
+
+    #[test]
+    fn popup_is_carbon_moderate_01_ease_out_single_shot() {
+        // MOTION-FEEDBACK-3 — the shared popup/menu/drawer/Hub enter-exit preset:
+        // a quick Carbon moderate-01 (150 ms) ease-out, single-shot.
+        let m = Motion::popup();
+        assert_eq!(m.duration, DURATION_MODERATE_01);
+        assert_eq!(m.duration, Duration::from_millis(150));
+        assert_eq!(m.easing, Easing::EaseOut);
+        assert!(!m.looping);
+        // Reduce-motion collapses it to the ≤80 ms linear crossfade.
+        let r = m.resolved(true);
+        assert_eq!(r.duration, Duration::from_millis(REDUCE_MOTION_CAP_MS));
+        assert_eq!(r.easing, Easing::Linear);
+    }
+
+    #[test]
+    fn popup_scale_delta_is_a_subtle_micro_scale() {
+        // MOTION-FEEDBACK-3 — the popup grows from 0.96× (1.0 − delta) to 1.0×:
+        // small enough to read as a gentle fade-scale, never a zoom.
+        assert!((POPUP_SCALE_DELTA - 0.04).abs() < f32::EPSILON);
+        assert!(POPUP_SCALE_DELTA > 0.0 && POPUP_SCALE_DELTA < 0.1);
     }
 
     #[test]

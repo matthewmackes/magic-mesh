@@ -48,6 +48,10 @@ pub struct SnapshotRow {
     pub path: String,
 }
 
+/// MOTION-FEEDBACK-3 — the id the snapshots confirm-modal's enter/exit tween is
+/// registered under in the shared [`mde_theme::Animator`].
+const MODAL_ANIM_ID: &str = "snapshots.restore-modal";
+
 #[derive(Debug, Clone, Default)]
 pub struct SnapshotsPanel {
     pub rows: Vec<SnapshotRow>,
@@ -61,6 +65,15 @@ pub struct SnapshotsPanel {
     /// Path of the snapshot pending restore confirmation;
     /// `None` = no confirmation modal up.
     pub pending_restore: Option<String>,
+    /// MOTION-FEEDBACK-3 — the popup enter/exit animator for the restore-confirm
+    /// modal. Started on open (enter) + on dismiss (exit) with `Motion::popup`,
+    /// read by `view_confirm` for the shared fade-scale. Idle at rest (the app
+    /// only ticks `ModalTick` while `modal_animating()` is true — MOTION-PERF-1).
+    modal: mde_theme::Animator,
+    /// MOTION-FEEDBACK-3 — the path being dismissed: while the close tween runs we
+    /// keep rendering the modal (faded out) even though `pending_restore` is
+    /// already cleared, so the exit motion plays instead of the modal vanishing.
+    closing_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,12 +87,25 @@ pub enum Message {
     RestoreConfirmed,
     RestoreCancelled,
     OperationFinished(Result<String, String>),
+    /// MOTION-FEEDBACK-3 — advance the confirm-modal enter/exit clock. Fired by
+    /// the app's idle-gated tick ONLY while `modal_animating()` is true.
+    ModalTick,
 }
 
 impl SnapshotsPanel {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// MOTION-FEEDBACK-3 — true while the confirm-modal's shared popup enter/exit
+    /// tween is still in flight, so the app gates its `ModalTick` subscription on
+    /// it (zero idle redraw at rest — MOTION-PERF-1). Always settles within
+    /// `Motion::popup` (≤80 ms under reduce-motion).
+    #[must_use]
+    pub fn modal_animating(&self) -> bool {
+        self.modal
+            .is_animating(MODAL_ANIM_ID, std::time::Instant::now())
     }
 
     pub fn load() -> Task<crate::Message> {
@@ -152,7 +178,27 @@ impl SnapshotsPanel {
                 )
             }
             Message::RestoreClicked(path) => {
+                // MOTION-FEEDBACK-3 — arm the modal + start the shared popup
+                // ENTER tween (fade-scale in; reduce-motion ⇒ crossfade only).
                 self.pending_restore = Some(path);
+                self.closing_path = None;
+                self.modal.start(
+                    MODAL_ANIM_ID,
+                    std::time::Instant::now(),
+                    mde_theme::Motion::popup(),
+                    crate::live_theme::reduce_motion(),
+                );
+                Task::none()
+            }
+            Message::ModalTick => {
+                // MOTION-FEEDBACK-3 — advance + GC the modal tween; when the EXIT
+                // tween finishes, drop the lingering closing modal so it stops
+                // rendering. The app gates this tick on `modal_animating()`.
+                let now = std::time::Instant::now();
+                self.modal.gc(now);
+                if self.closing_path.is_some() && self.modal.is_idle(now) {
+                    self.closing_path = None;
+                }
                 Task::none()
             }
             Message::RestoreConfirmed => {
@@ -160,6 +206,8 @@ impl SnapshotsPanel {
                     return Task::none();
                 };
                 if self.busy {
+                    // Re-arm so a no-op (busy) confirm doesn't drop the modal.
+                    self.pending_restore = Some(path);
                     return Task::none();
                 }
                 self.busy = true;
@@ -170,7 +218,18 @@ impl SnapshotsPanel {
                 )
             }
             Message::RestoreCancelled => {
-                self.pending_restore = None;
+                // MOTION-FEEDBACK-3 — start the shared popup EXIT tween (fade-scale
+                // out; reduce-motion ⇒ crossfade only). Keep the modal rendering
+                // (faded out) under `closing_path` until the tween settles.
+                self.closing_path = self.pending_restore.take();
+                if self.closing_path.is_some() {
+                    self.modal.start(
+                        MODAL_ANIM_ID,
+                        std::time::Instant::now(),
+                        mde_theme::Motion::popup(),
+                        crate::live_theme::reduce_motion(),
+                    );
+                }
                 Task::none()
             }
             Message::OperationFinished(result) => {
@@ -187,7 +246,9 @@ impl SnapshotsPanel {
     }
 
     pub fn view(&self) -> Element<'_, crate::Message> {
-        if let Some(path) = &self.pending_restore {
+        // MOTION-FEEDBACK-3 — render the confirm modal while it's open (entering)
+        // OR while it's closing (the EXIT tween fades it out before it vanishes).
+        if let Some(path) = self.pending_restore.as_ref().or(self.closing_path.as_ref()) {
             return self.view_confirm(path);
         }
 
@@ -298,12 +359,39 @@ impl SnapshotsPanel {
     }
 
     fn view_confirm(&self, path: &str) -> Element<'_, crate::Message> {
+        use crate::cosmic_compat::IntoIcedColor;
+        use cosmic::iced::Color;
+
         // UX-9 (c) — confirm dialog uses the shared dialog
         // chrome. UX-7 — buttons route through the variant
         // helpers (Primary for the destructive confirm, Ghost
         // for cancel) so hover/focus states stay consistent
         // with the rest of the app.
         let palette = crate::live_theme::palette();
+
+        // MOTION-FEEDBACK-3 — the shared popup enter/exit alpha. The opening modal
+        // fades in (`enter_params`); the closing one fades out (`exit_params`).
+        // Alpha is the iced-0.13 renderable channel (the fork has no opacity/scale
+        // widget — same limitation TRANS-1 records); the shared preset's scale
+        // channel is computed in mde-theme + reduce-motion-collapsed there, so the
+        // runtime here is the crossfade exactly as the Q32 contract specifies.
+        let reduce_motion = crate::live_theme::reduce_motion();
+        let t = self.modal.value(
+            MODAL_ANIM_ID,
+            std::time::Instant::now(),
+            mde_theme::Easing::EaseOut,
+        );
+        let alpha = if self.closing_path.is_some() && self.pending_restore.is_none() {
+            mde_theme::popup::exit_params(t, reduce_motion).alpha
+        } else {
+            mde_theme::popup::enter_params(t, reduce_motion).alpha
+        };
+        let fade = move |c: Color| Color {
+            a: c.a * alpha,
+            ..c
+        };
+        let txt = fade(palette.text.into_cosmic_color());
+
         let confirm_btn = variant_button(
             "Apply restore",
             ButtonVariant::Primary,
@@ -316,18 +404,21 @@ impl SnapshotsPanel {
             Some(crate::Message::Snapshots(Message::RestoreCancelled)),
             palette,
         );
+        let tcol = cosmic::theme::Text::Color(txt);
         let body: Element<'_, crate::Message> = column![
-            text("Restore snapshot?").size(20),
+            text("Restore snapshot?").size(20).class(tcol.clone()),
             text(format!(
                 "This will overwrite ~/.config/mde/ with the contents of:\n{path}",
             ))
-            .size(13),
+            .size(13)
+            .class(tcol.clone()),
             text(
                 "Existing files not present in the snapshot will be left in \
                  place; files present in the snapshot will replace the live \
                  copies.",
             )
-            .size(13),
+            .size(13)
+            .class(tcol),
             row![confirm_btn, cancel_btn].spacing(12),
         ]
         .spacing(12)
@@ -693,6 +784,51 @@ mod tests {
         let mut panel = SnapshotsPanel::new();
         let _ = panel.update(Message::RestoreConfirmed);
         assert!(!panel.busy);
+    }
+
+    #[test]
+    fn restore_open_arms_the_popup_enter_animation() {
+        // MOTION-FEEDBACK-3 — opening the confirm modal starts the shared popup
+        // ENTER tween, so the app's idle-gated tick is armed.
+        let mut panel = SnapshotsPanel::new();
+        assert!(!panel.modal_animating(), "idle at rest");
+        let _ = panel.update(Message::RestoreClicked("/snaps/x".into()));
+        assert!(panel.modal_animating(), "open ⇒ enter tween in flight");
+    }
+
+    #[test]
+    fn restore_cancel_plays_the_exit_then_drops_the_modal() {
+        // MOTION-FEEDBACK-3 — cancelling clears `pending_restore` but keeps the
+        // modal rendering (faded out) under `closing_path` while the EXIT tween
+        // runs; once the tween settles, ModalTick drops it.
+        let mut panel = SnapshotsPanel::new();
+        let _ = panel.update(Message::RestoreClicked("/snaps/x".into()));
+        let _ = panel.update(Message::RestoreCancelled);
+        assert!(panel.pending_restore.is_none(), "pending cleared on cancel");
+        assert_eq!(
+            panel.closing_path.as_deref(),
+            Some("/snaps/x"),
+            "modal lingers (faded out) while the exit plays"
+        );
+        assert!(panel.modal_animating(), "exit tween in flight");
+        // Let the tween elapse, then a tick drops the lingering modal.
+        std::thread::sleep(
+            mde_theme::Motion::popup().duration + std::time::Duration::from_millis(20),
+        );
+        let _ = panel.update(Message::ModalTick);
+        assert!(panel.closing_path.is_none(), "settled ⇒ modal gone");
+        assert!(!panel.modal_animating(), "settled ⇒ idle (no idle tick)");
+    }
+
+    #[test]
+    fn busy_confirm_keeps_the_modal_armed() {
+        // MOTION-FEEDBACK-3 — a confirm that no-ops because we're busy must not
+        // silently drop the modal (it would vanish with no exit motion).
+        let mut panel = SnapshotsPanel::new();
+        let _ = panel.update(Message::RestoreClicked("/snaps/x".into()));
+        panel.busy = true;
+        let _ = panel.update(Message::RestoreConfirmed);
+        assert_eq!(panel.pending_restore.as_deref(), Some("/snaps/x"));
     }
 
     #[test]

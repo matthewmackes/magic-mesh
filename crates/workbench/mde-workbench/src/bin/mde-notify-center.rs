@@ -212,10 +212,37 @@ struct Center {
     /// was fetched for (so the art is re-fetched only when the track changes).
     now_art: Option<cosmic::iced::widget::image::Handle>,
     now_art_id: Option<String>,
+    /// MOTION-FEEDBACK-3 / NOTIFY-FX-1 — the shared popup enter animator. Holds the
+    /// Hub's OPEN fade-in tween (id [`HUB_OPEN_ID`], armed at boot) and one
+    /// fade-in tween per freshly-arrived alert (keyed by ULID), so a new item
+    /// fades in with the SAME popup vocabulary as the launcher. Idle-parked: the
+    /// `OpenTick` subscription is armed only while a tween is in flight and stops
+    /// the instant the last one settles (MOTION-PERF-1).
+    anim: mde_theme::Animator,
+    /// MOTION-FEEDBACK-3 — the live reduce-motion flag, read once at boot from the
+    /// env override + COSMIC signal + local prefs. Under reduce-motion every
+    /// entrance collapses to the ≤80 ms crossfade (and the scale channel is
+    /// dropped by the shared preset).
+    reduce_motion: bool,
 }
+
+/// MOTION-FEEDBACK-3 — the id the Hub's OPEN enter tween is registered under in
+/// the shared [`mde_theme::Animator`] (distinct from the per-item ULID keys).
+const HUB_OPEN_ID: &str = "hub.open";
 
 impl Center {
     fn new() -> Self {
+        // MOTION-FEEDBACK-3 — read reduce-motion once at boot (env > COSMIC > local
+        // pref) and arm the Hub OPEN fade-in so the panel fades in as it maps,
+        // sharing the launcher/popup vocabulary.
+        let reduce_motion = mde_workbench::live_theme::reduce_motion();
+        let mut anim = mde_theme::Animator::new();
+        anim.start(
+            HUB_OPEN_ID,
+            std::time::Instant::now(),
+            mde_theme::Motion::popup(),
+            reduce_motion,
+        );
         Self {
             items: Vec::new(),
             tail: AlertTail::default(),
@@ -228,7 +255,28 @@ impl Center {
             beam_step: 0,
             now_art: None,
             now_art_id: None,
+            anim,
+            reduce_motion,
         }
+    }
+
+    /// MOTION-FEEDBACK-3 — true while any popup enter tween (the Hub open fade or a
+    /// fresh-alert fade) is still in flight, so `subscription` gates the `OpenTick`
+    /// on it and stops the instant the last one settles (no idle redraw —
+    /// MOTION-PERF-1).
+    fn anim_active(&self) -> bool {
+        !self.anim.is_idle(std::time::Instant::now())
+    }
+
+    /// MOTION-FEEDBACK-3 / NOTIFY-FX-1 — the popup enter alpha for a row keyed by
+    /// `id` (the Hub open tween or a per-alert fade). Returns the eased
+    /// [`mde_theme::popup::enter_params`] alpha; `1.0` once settled (no such tween)
+    /// so a rendered-at-rest row is fully opaque.
+    fn enter_alpha(&self, id: &str) -> f32 {
+        let t = self
+            .anim
+            .value(id, std::time::Instant::now(), mde_theme::Easing::EaseOut);
+        mde_theme::popup::enter_params(t, self.reduce_motion).alpha
     }
 }
 
@@ -258,6 +306,10 @@ enum Message {
     /// LIGHTHOUSE-3/4 — a lighthouse card was pressed: open the Workbench
     /// Lighthouses tab focused on this lighthouse (by hostname).
     OpenLighthouse(String),
+    /// MOTION-FEEDBACK-3 / NOTIFY-FX-1 — advance the popup enter clock (Hub open
+    /// fade + fresh-alert fades). Fired by the idle-gated tick ONLY while a tween
+    /// is in flight; it GCs settled tweens so the loop stops at rest.
+    OpenTick,
 }
 
 /// NOTIFY-AC — fetch the Now-Playing snapshot over the bus (best-effort, short
@@ -429,6 +481,15 @@ fn subscription(s: &Center) -> Subscription<Message> {
                 .map(|_| Message::BeamTick),
         );
     }
+    // MOTION-FEEDBACK-3 / NOTIFY-FX-1 — the popup enter tick (Hub open fade +
+    // fresh-alert fades) runs ONLY while a tween is in flight; it stops the
+    // instant the last one settles (no idle redraw — MOTION-PERF-1). ~60 ms frame.
+    if s.anim_active() {
+        subs.push(
+            cosmic::iced::time::every(std::time::Duration::from_millis(60))
+                .map(|_| Message::OpenTick),
+        );
+    }
     Subscription::batch(subs)
 }
 
@@ -462,7 +523,16 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
                 if let Ok(persist) = mde_bus::persist::Persist::open(dir) {
                     let fresh = state.tail.poll(&persist);
                     // Newest first; cap the retained set.
+                    let now = std::time::Instant::now();
                     for item in fresh {
+                        // MOTION-FEEDBACK-3 / NOTIFY-FX-1 — a fresh alert fades in
+                        // with the shared popup vocabulary (the launcher idiom).
+                        state.anim.start(
+                            item.id.clone(),
+                            now,
+                            mde_theme::Motion::popup(),
+                            state.reduce_motion,
+                        );
                         state.items.insert(0, item);
                     }
                     state.items.truncate(MAX_ROWS);
@@ -490,7 +560,16 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
                         Ok(items) => {
                             state.shared_rx = None;
                             let fresh = state.tail.dedup_fresh(items);
+                            let now = std::time::Instant::now();
                             for item in fresh {
+                                // MOTION-FEEDBACK-3 / NOTIFY-FX-1 — mesh-wide fresh
+                                // alerts fade in with the same popup vocabulary.
+                                state.anim.start(
+                                    item.id.clone(),
+                                    now,
+                                    mde_theme::Motion::popup(),
+                                    state.reduce_motion,
+                                );
                                 state.items.insert(0, item);
                             }
                             state.items.sort_by(|a, b| b.ts_unix_ms.cmp(&a.ts_unix_ms));
@@ -529,6 +608,12 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
         }
         Message::BeamTick => {
             state.beam_step = state.beam_step.wrapping_add(1);
+        }
+        Message::OpenTick => {
+            // MOTION-FEEDBACK-3 — advance the popup enter clock by GC-ing settled
+            // tweens; once all are done `anim_active()` is false and the
+            // subscription stops arming this tick (no idle redraw — MOTION-PERF-1).
+            state.anim.gc(std::time::Instant::now());
         }
         Message::OpenLighthouse(host) => {
             // LIGHTHOUSE-3/4 — deep-link to the Workbench Lighthouses tab,
@@ -679,21 +764,28 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
     // (the panel is only ~390px wide). Generous top/side padding so nothing is
     // jammed against the window edge.
     let unread = state.items.iter().filter(|i| !i.read).count();
+    // MOTION-FEEDBACK-3 — the Hub OPEN enter fade: the header fades in (sharing the
+    // launcher/popup vocabulary) as the panel maps. `1.0` once settled.
+    let open_alpha = state.enter_alpha(HUB_OPEN_ID);
+    let fade = move |c: cosmic::iced::Color| cosmic::iced::Color {
+        a: c.a * open_alpha,
+        ..c
+    };
     // NOTIFY-HUB-1 — a Carbon header matching the Application Menu's "▦ Applications"
     // header: an accent glyph + the title in heading size, with the unread count
     // as a muted suffix.
     let title_row = row![
         text("\u{25D4}\u{FE0E}") // ◔ — a notification/bell-ish BMP glyph (not emoji)
             .size(18)
-            .color(p.accent.into_cosmic_color()),
+            .color(fade(p.accent.into_cosmic_color())),
         Space::new().width(Length::Fixed(10.0)),
         text("Notifications")
             .size(18)
-            .color(p.text.into_cosmic_color()),
+            .color(fade(p.text.into_cosmic_color())),
         Space::new().width(Length::Fixed(8.0)),
         text(format!("· {unread} unread"))
             .size(12)
-            .color(p.text_muted.into_cosmic_color()),
+            .color(fade(p.text_muted.into_cosmic_color())),
         Space::new().width(Length::Fill),
         // Close (✕) — also bound to Esc + click-away.
         action_button("✕", Message::Close, p),
@@ -747,7 +839,7 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
             body = body.push(head);
             if !collapsed {
                 for (i, item) in group.iter().enumerate() {
-                    body = body.push(alert_row(item, i, now, p));
+                    body = body.push(alert_row(item, i, now, p, state.enter_alpha(&item.id)));
                 }
             }
         }
@@ -1150,10 +1242,23 @@ fn quick_toggle<'a>(label: &'a str, on: bool, msg: Message, p: Palette) -> Eleme
 
 /// One alert row: severity glyph (colored) · age · host · title / body. Takes the
 /// item by value so the returned element owns its text (no borrow of the caller's
-/// loop-local group).
-fn alert_row(item: &AlertItem, idx: usize, now_ms: i64, p: Palette) -> Element<'static, Message> {
-    let sev_color = severity_token(item.severity, &p).into_cosmic_color();
-    let title_color = if item.read { p.text_muted } else { p.text }.into_cosmic_color();
+/// loop-local group). `alpha` is the MOTION-FEEDBACK-3 / NOTIFY-FX-1 popup enter
+/// fade for a freshly-arrived alert (`1.0` once settled) — applied to every colour
+/// so the row fades in with the shared popup vocabulary (the launcher idiom).
+fn alert_row(
+    item: &AlertItem,
+    idx: usize,
+    now_ms: i64,
+    p: Palette,
+    alpha: f32,
+) -> Element<'static, Message> {
+    let fade = move |c: cosmic::iced::Color| cosmic::iced::Color {
+        a: c.a * alpha,
+        ..c
+    };
+    let sev_color = fade(severity_token(item.severity, &p).into_cosmic_color());
+    let title_color = fade(if item.read { p.text_muted } else { p.text }.into_cosmic_color());
+    let muted = fade(p.text_muted.into_cosmic_color());
     let host = item.host.clone().unwrap_or_default();
     let meta = if host.is_empty() {
         format_age(item.ts_unix_ms, now_ms)
@@ -1167,13 +1272,13 @@ fn alert_row(item: &AlertItem, idx: usize, now_ms: i64, p: Palette) -> Element<'
         Space::new().width(Length::Fixed(8.0)),
         text(item.title.clone()).size(13).color(title_color),
         Space::new().width(Length::Fill),
-        text(meta).size(11).color(p.text_muted.into_cosmic_color()),
+        text(meta).size(11).color(muted),
     ]
     .align_y(cosmic::iced::Alignment::Center);
     let mut col = column![head].spacing(2);
     if !item.body.is_empty() {
         let body: String = item.body.chars().take(200).collect();
-        col = col.push(text(body).size(11).color(p.text_muted.into_cosmic_color()));
+        col = col.push(text(body).size(11).color(muted));
     }
     // NOTIFY-HUB-1 — APPS-STYLE-2 zebra rows (the Application Menu's row idiom):
     // alternate the row layer so the alert list reads as banded rows. The

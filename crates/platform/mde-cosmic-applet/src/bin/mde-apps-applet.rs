@@ -172,6 +172,29 @@ fn favorite_icon(e: &Entry) -> Icon {
     }
 }
 
+/// MOTION-FEEDBACK-3 / APPS-FX-1 — does the `MDE_REDUCE_MOTION` env override force
+/// reduce-motion on? `true` for any value other than `"0"` (the documented
+/// opt-out). Split out (the value is passed in) so the priority logic is pure +
+/// unit-testable without mutating the process environment — mirroring the
+/// Workbench's `live_theme::env_override_on`.
+fn env_override_on(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v != "0")
+}
+
+/// MOTION-FEEDBACK-3 / APPS-FX-1 — resolve the live reduce-motion flag from the
+/// two sources this surface owns: the `MDE_REDUCE_MOTION` env override (`!= "0"`
+/// ⇒ on, the CI / headless toggle) and the local `~/.config/mde/preferences.toml`
+/// `[a11y] reduce_motion`. The COSMIC system signal is read by the Workbench's
+/// `live_theme` (which this applet must NOT depend on — §6 boundary), so it
+/// degrades to the local pref here; the env override + local pref keep the
+/// launcher's popup motion honoring reduce-motion on its own.
+fn resolve_reduce_motion() -> bool {
+    if env_override_on(std::env::var_os("MDE_REDUCE_MOTION").as_deref()) {
+        return true;
+    }
+    Preferences::load().a11y.reduce_motion
+}
+
 struct AppsApplet {
     core: Core,
     /// The open dropdown popup, if any.
@@ -212,7 +235,21 @@ struct AppsApplet {
     /// a resolution change is picked up without a re-login.
     menu_w: f32,
     menu_h: f32,
+    /// MOTION-FEEDBACK-3 / APPS-FX-1 — the shared popup enter/exit animator for the
+    /// launcher + power-menu surface. The OPEN enter tween (id [`POPUP_ANIM_ID`])
+    /// is armed on every open (TogglePopup / OpenPowerMenu) with `Motion::popup`,
+    /// read by the dropdown header for the shared fade-scale. Idle-parked: the
+    /// `PopupTick` subscription is armed only while it's in flight (MOTION-PERF-1).
+    popup_anim: mde_theme::Animator,
+    /// MOTION-FEEDBACK-3 — the live reduce-motion flag, refreshed on each open. Under
+    /// reduce-motion the popup entrance collapses to the ≤80 ms crossfade (the
+    /// shared preset drops the scale channel).
+    reduce_motion: bool,
 }
+
+/// MOTION-FEEDBACK-3 / APPS-FX-1 — the id the launcher/power-menu popup enter tween
+/// is registered under in the shared [`mde_theme::Animator`].
+const POPUP_ANIM_ID: &str = "launcher.popup";
 
 #[derive(Clone, Debug)]
 enum Message {
@@ -268,6 +305,10 @@ enum Message {
     RunSubmit,
     /// Re-fetch the entry list.
     Refresh,
+    /// MOTION-FEEDBACK-3 / APPS-FX-1 — advance the popup open enter-fade clock.
+    /// Fired by the idle-gated tick ONLY while the enter tween is in flight; it
+    /// GCs the settled tween so the loop stops at rest (MOTION-PERF-1).
+    PopupTick,
 }
 
 /// APPS-STYLE-2 — the footer power-menu actions.
@@ -507,6 +548,8 @@ impl Application for AppsApplet {
                 palette: resolve_palette(),
                 menu_w,
                 menu_h,
+                popup_anim: mde_theme::Animator::new(),
+                reduce_motion: resolve_reduce_motion(),
             },
             // Prime the list so the first open is instant.
             load_task(),
@@ -518,7 +561,15 @@ impl Application for AppsApplet {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::none()
+        // MOTION-FEEDBACK-3 / APPS-FX-1 — the popup open enter-fade tick runs ONLY
+        // while the enter tween is in flight (just after an open); it stops the
+        // instant the fade settles, so a resting/closed applet costs zero redraw
+        // (MOTION-PERF-1). ~60 ms frame.
+        if self.popup_animating() {
+            cosmic::iced::time::every(Duration::from_millis(60)).map(|_| Message::PopupTick)
+        } else {
+            Subscription::none()
+        }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -544,6 +595,8 @@ impl Application for AppsApplet {
                 self.rclick_open = false;
                 // Refresh the palette so a theme switch reflects on open.
                 self.palette = resolve_palette();
+                // MOTION-FEEDBACK-3 / APPS-FX-1 — arm the shared popup ENTER fade.
+                self.arm_popup_enter();
                 // APPS-FIT — re-detect the desktop size on open so a resolution
                 // change is picked up without a re-login.
                 let (mw, mh) = detect_menu_size();
@@ -596,6 +649,8 @@ impl Application for AppsApplet {
                 self.rclick_open = true;
                 self.power_open = false;
                 self.palette = resolve_palette();
+                // MOTION-FEEDBACK-3 — the power menu shares the launcher's ENTER fade.
+                self.arm_popup_enter();
                 return cosmic::task::message(cosmic::Action::Cosmic(
                     cosmic::app::Action::Surface(app_popup::<AppsApplet>(
                         move |state: &mut AppsApplet| {
@@ -790,6 +845,12 @@ impl Application for AppsApplet {
                 self.toast = Some(format!("{}…", kind.label()));
             }
             Message::Refresh => return load_task(),
+            Message::PopupTick => {
+                // MOTION-FEEDBACK-3 — advance + GC the popup enter tween; once it
+                // settles `popup_animating()` is false and the subscription stops
+                // arming this tick (no idle redraw — MOTION-PERF-1).
+                self.popup_anim.gc(std::time::Instant::now());
+            }
         }
         Task::none()
     }
@@ -827,6 +888,41 @@ impl Application for AppsApplet {
 }
 
 impl AppsApplet {
+    /// MOTION-FEEDBACK-3 / APPS-FX-1 — arm the shared popup OPEN enter tween. Called
+    /// on every open (launcher TogglePopup + power-menu OpenPowerMenu) so both
+    /// surfaces share the one fade-scale vocabulary. Refreshes the live
+    /// reduce-motion flag first so a system change is honored without a re-login.
+    fn arm_popup_enter(&mut self) {
+        self.reduce_motion = resolve_reduce_motion();
+        self.popup_anim.start(
+            POPUP_ANIM_ID,
+            std::time::Instant::now(),
+            mde_theme::Motion::popup(),
+            self.reduce_motion,
+        );
+    }
+
+    /// MOTION-FEEDBACK-3 — true while the popup open enter tween is in flight, so
+    /// `subscription` gates the `PopupTick` on it (stops the instant it settles —
+    /// MOTION-PERF-1).
+    fn popup_animating(&self) -> bool {
+        self.popup_anim
+            .is_animating(POPUP_ANIM_ID, std::time::Instant::now())
+    }
+
+    /// MOTION-FEEDBACK-3 — the popup OPEN enter alpha for the dropdown/power-menu
+    /// header (`1.0` once settled). The eased [`mde_theme::popup::enter_params`]
+    /// alpha; reduce-motion still ramps the alpha but the shared preset drops the
+    /// scale (crossfade only).
+    fn popup_enter_alpha(&self) -> f32 {
+        let t = self.popup_anim.value(
+            POPUP_ANIM_ID,
+            std::time::Instant::now(),
+            mde_theme::Easing::EaseOut,
+        );
+        mde_theme::popup::enter_params(t, self.reduce_motion).alpha
+    }
+
     /// APPS-STYLE-2 — the redesigned Start Menu (design: `docs/design/start-menu-redesign.md`).
     /// Header (title + QNM-Shared usage bar) → quick-link tiles → underline tabs →
     /// search → result rows (zebra + selected blue-accent, click-to-expand detail)
@@ -908,9 +1004,15 @@ impl AppsApplet {
             .padding(cosmic::iced::Padding::from([4u16, 8u16]))
             .into()
         };
+        // MOTION-FEEDBACK-3 — the power menu shares the launcher's popup OPEN fade.
+        let open_a = self.popup_enter_alpha();
+        let header_color = cosmic::iced::Color {
+            a: carbon(p.text).a * open_a,
+            ..carbon(p.text)
+        };
         let header = text("Power User Menu")
             .size(TypeRole::Heading.size_in(sizes))
-            .class(cosmic::theme::Text::Color(carbon(p.text)));
+            .class(cosmic::theme::Text::Color(header_color));
 
         let items: Vec<Element<'static, Message>> = vec![
             row_item(
@@ -1064,14 +1166,25 @@ impl AppsApplet {
         let mono = cosmic::iced::Font::MONOSPACE;
 
         // ── Header: grid glyph + title, then the QNM-Shared usage line + bar. ──
+        // MOTION-FEEDBACK-3 / APPS-FX-1 — the shared popup OPEN enter fade: the
+        // header fades in as the launcher opens (the one popup vocabulary). The
+        // alpha is the renderable iced-0.13 channel (the fork has no opacity/scale
+        // widget — same limitation TRANS-1 records); the preset's scale channel is
+        // computed + reduce-motion-collapsed in mde-theme, so the runtime here is
+        // exactly the Q32 crossfade.
+        let open_a = self.popup_enter_alpha();
+        let fade = |c: cosmic::iced::Color| cosmic::iced::Color {
+            a: c.a * open_a,
+            ..c
+        };
         let title_row = row(vec![
             text("\u{25A6}\u{FE0E}")
                 .size(18)
-                .class(cosmic::theme::Text::Color(carbon(p.accent)))
+                .class(cosmic::theme::Text::Color(fade(carbon(p.accent))))
                 .into(),
             text("Applications")
                 .size(TypeRole::Heading.size_in(sizes))
-                .class(cosmic::theme::Text::Color(carbon(p.text)))
+                .class(cosmic::theme::Text::Color(fade(carbon(p.text))))
                 .into(),
         ])
         .spacing(10)
@@ -1356,6 +1469,15 @@ impl AppsApplet {
         } else {
             e.name.clone()
         };
+        // MOTION-FEEDBACK-3 / APPS-FX-1 — a Favorites tile lifts on hover with a
+        // Carbon accent wash (the renderable hover channel in the iced-0.13 fork —
+        // `lift_on_hover`'s transform isn't applicable without a transform widget,
+        // so the hover cue is the accent `hover_tint` wash + accent-tinted border,
+        // matching the FEEDBACK-2 row hover vocabulary). The wash alpha is the
+        // single-source `Palette::hover_tint`; no raw literals (§4).
+        let hover_wash = carbon(p.hover_tint());
+        let accent = carbon(p.accent);
+        let radii = mde_theme::Radii::defaults();
         button::custom(
             column(vec![
                 icon_widget,
@@ -1371,7 +1493,24 @@ impl AppsApplet {
         )
         .on_press(Self::entry_primary_msg(e))
         .width(Length::Fill)
-        .class(cosmic::theme::Button::Standard)
+        .class(cosmic::theme::Button::Custom {
+            active: Box::new(|_focused, _theme| cosmic::widget::button::Style::default()),
+            disabled: Box::new(|_theme| cosmic::widget::button::Style::default()),
+            hovered: Box::new(move |_focused, _theme| cosmic::widget::button::Style {
+                background: Some(cosmic::iced::Background::Color(hover_wash)),
+                border_color: accent,
+                border_width: 1.0,
+                border_radius: f32::from(radii.sm).into(),
+                ..cosmic::widget::button::Style::default()
+            }),
+            pressed: Box::new(move |_focused, _theme| cosmic::widget::button::Style {
+                background: Some(cosmic::iced::Background::Color(hover_wash)),
+                border_color: accent,
+                border_width: 1.0,
+                border_radius: f32::from(radii.sm).into(),
+                ..cosmic::widget::button::Style::default()
+            }),
+        })
         .into()
     }
 
@@ -1819,5 +1958,61 @@ output "HDMI-A-1" enabled=#false {
 }
 "#;
         assert!(parse_menu_size_from_kdl(kdl, "DP-1").is_none());
+    }
+}
+
+// ── MOTION-FEEDBACK-3 / APPS-FX-1 — launcher + power-menu popup enter-exit ──
+//
+// The launcher dropdown can't be headless-rendered (it needs a panel host), so —
+// per the lifted visual gate + the task's `parse_menu_size_from_kdl` precedent —
+// the popup motion is verified via UNIT TESTS over the shared mde-theme preset
+// the surface wires (not a faked render): the open enter-fade resolves the same
+// fade-scale every other surface uses, and reduce-motion collapses it to a
+// crossfade (scale dropped). `resolve_reduce_motion` is also asserted.
+#[cfg(test)]
+mod popup_motion_tests {
+    use super::env_override_on;
+    use mde_theme::{popup, Easing, Motion, POPUP_SCALE_DELTA};
+
+    #[test]
+    fn launcher_open_uses_the_shared_popup_preset() {
+        // The launcher/power-menu open is armed with `Motion::popup` (Carbon
+        // moderate-01, 150 ms ease-out) — the single shell-wide popup vocabulary.
+        let m = Motion::popup();
+        assert_eq!(m.duration, std::time::Duration::from_millis(150));
+        assert_eq!(m.easing, Easing::EaseOut);
+        assert!(!m.looping);
+    }
+
+    #[test]
+    fn open_enter_fades_in_and_grows_then_crossfades_under_reduce_motion() {
+        // Full motion: the header opens at alpha 0 + 0.96× scale, rests at alpha 1
+        // + 1.0× — the same fade-scale the Hub + dialog use.
+        let start = popup::enter_params(0.0, false);
+        assert_eq!(start.alpha, 0.0);
+        assert!((start.scale - (1.0 - POPUP_SCALE_DELTA)).abs() < 1e-6);
+        let end = popup::enter_params(1.0, false);
+        assert_eq!(end.alpha, 1.0);
+        assert!((end.scale - 1.0).abs() < 1e-6);
+        // Reduce-motion ⇒ crossfade only: alpha still ramps, scale flat 1.0 (no
+        // movement) at every progress — the Q32 contract the launcher must honor.
+        for i in 0..=10 {
+            let t = i as f32 / 10.0;
+            let p = popup::enter_params(t, true);
+            assert!((p.alpha - t).abs() < 1e-6);
+            assert_eq!(p.scale, 1.0, "no scale under reduce_motion");
+        }
+    }
+
+    #[test]
+    fn reduce_motion_env_override_is_on_for_non_zero_and_off_for_zero() {
+        // The env override forces reduce-motion on for any non-"0" value (the
+        // headless/CI toggle the launcher reads); "0" is the opt-out (a no-op that
+        // defers to the local pref); absent ⇒ defer. Pure — no env mutation.
+        use std::ffi::OsStr;
+        assert!(env_override_on(Some(OsStr::new("1"))), "env=1 ⇒ on");
+        assert!(env_override_on(Some(OsStr::new("yes"))), "any non-0 ⇒ on");
+        assert!(!env_override_on(Some(OsStr::new("0"))), "env=0 ⇒ defer");
+        assert!(!env_override_on(None), "unset ⇒ defer");
     }
 }

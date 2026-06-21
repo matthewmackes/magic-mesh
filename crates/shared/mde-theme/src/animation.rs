@@ -637,6 +637,83 @@ pub mod route {
     }
 }
 
+/// MOTION-FEEDBACK-3 — the **one** popup / menu / drawer / Hub enter-exit
+/// vocabulary. The launcher (Application Menu), the power menu, the Notification
+/// Hub, and Workbench dialogs/drawers all open + close on this single preset so
+/// the whole shell shares one motion idiom (folds in APPS-FX-1 + NOTIFY-FX-1).
+///
+/// **Open** (enter): fade in (alpha 0→1) while the surface grows from
+/// `1 − POPUP_SCALE_DELTA` (≈0.96×) to 1.0× — a gentle Carbon "grow from origin"
+/// fade-scale over [`Motion::popup`] (Carbon `moderate-01`, 150 ms ease-out).
+/// **Close** (exit): the reverse — fade out (alpha 1→0) while it shrinks back to
+/// `1 − POPUP_SCALE_DELTA`.
+///
+/// **Reduce-motion ⇒ crossfade only.** Under reduce-motion the scale channel is
+/// dropped (the surface never moves/scales — `scale == 1.0` at every progress);
+/// only the alpha crossfade survives, capped to the ≤80 ms cap by the consumer
+/// routing its clock through [`Tween::resolved`] / [`Animator`]. This re-uses the
+/// INFRA-2 [`fade_in`]/[`fade_out`] alpha math + the [`lerp_f32`] scale lerp; it
+/// authors no new easing or motion math of its own (it mirrors [`route`]).
+///
+/// The consumer holds an [`Animator`] (started on open/close with
+/// [`Motion::popup`]) and reads [`Animator::value`] for the eased progress, then
+/// calls [`enter_params`](popup::enter_params) / [`exit_params`](popup::exit_params)
+/// to get the [`RenderParams`] it applies to the popup wrapper (alpha → a
+/// container/text color alpha, scale → widget size). The tick subscription is
+/// idle-parked via [`Animator::is_idle`] (zero redraw at rest — MOTION-PERF-1).
+pub mod popup {
+    use super::{fade_in, fade_out, lerp_f32, RenderParams};
+    use crate::motion::POPUP_SCALE_DELTA;
+
+    /// The scale a popup starts at when opening (and ends at when closing):
+    /// `1.0 − POPUP_SCALE_DELTA` (≈0.96×). The single source for the open/close
+    /// scale endpoints so every popup surface grows/shrinks by the same amount.
+    #[must_use]
+    pub fn start_scale() -> f32 {
+        1.0 - POPUP_SCALE_DELTA
+    }
+
+    /// MOTION-FEEDBACK-3 — the **open / enter** render params at eased progress
+    /// `t` (`0.0` = just opened, `1.0` = fully open). Fade in (alpha 0→1) while
+    /// scaling from [`start_scale`] up to 1.0. Under `reduce_motion` the scale is
+    /// dropped (the surface stays at 1.0× — crossfade only, no movement), leaving
+    /// just the alpha ramp.
+    #[must_use]
+    pub fn enter_params(t: f32, reduce_motion: bool) -> RenderParams {
+        let alpha = fade_in(t).alpha;
+        let scale = if reduce_motion {
+            1.0
+        } else {
+            lerp_f32(start_scale(), 1.0, t)
+        };
+        RenderParams {
+            alpha,
+            translate_y: 0.0,
+            scale,
+        }
+    }
+
+    /// MOTION-FEEDBACK-3 — the **close / exit** render params at eased progress
+    /// `t` (`0.0` = fully open, `1.0` = fully closed). The reverse of
+    /// [`enter_params`]: fade out (alpha 1→0) while scaling from 1.0 back down to
+    /// [`start_scale`]. Under `reduce_motion` the scale is dropped (crossfade
+    /// only).
+    #[must_use]
+    pub fn exit_params(t: f32, reduce_motion: bool) -> RenderParams {
+        let alpha = fade_out(t).alpha;
+        let scale = if reduce_motion {
+            1.0
+        } else {
+            lerp_f32(1.0, start_scale(), t)
+        };
+        RenderParams {
+            alpha,
+            translate_y: 0.0,
+            scale,
+        }
+    }
+}
+
 /// MOTION-INFRA-1 — a tiny animation registry. Holds the active tweens keyed by
 /// a caller id and is advanced by ONE subscription tick, so N concurrent
 /// animations across a surface share a single timer instead of each arming its
@@ -1273,6 +1350,73 @@ mod tests {
                 "reduce_motion ⇒ no movement"
             );
         }
+    }
+
+    // ── MOTION-FEEDBACK-3 — shared popup/menu/drawer/Hub enter-exit ────────
+
+    #[test]
+    fn popup_enter_fades_in_and_grows_then_drops_scale_under_reduce_motion() {
+        use crate::motion::POPUP_SCALE_DELTA;
+        // Full motion: opens at alpha 0 + start_scale (≈0.96×), rests at alpha 1 +
+        // 1.0× — a gentle grow-from-origin fade-scale.
+        let start = popup::enter_params(0.0, false);
+        assert_eq!(start.alpha, 0.0);
+        assert!((start.scale - (1.0 - POPUP_SCALE_DELTA)).abs() < 1e-6);
+        assert_eq!(start.translate_y, 0.0, "popup never translates");
+        let end = popup::enter_params(1.0, false);
+        assert_eq!(end.alpha, 1.0);
+        assert!((end.scale - 1.0).abs() < 1e-6);
+        // Monotone: alpha + scale both only ever grow toward the open frame.
+        let (mut pa, mut ps) = (-1.0, 0.0);
+        for i in 0..=10 {
+            let t = i as f32 / 10.0;
+            let p = popup::enter_params(t, false);
+            assert!(p.alpha >= pa - 1e-4, "alpha must grow monotonically");
+            assert!(p.scale >= ps - 1e-4, "scale must grow monotonically");
+            assert!((1.0 - POPUP_SCALE_DELTA..=1.0).contains(&p.scale));
+            pa = p.alpha;
+            ps = p.scale;
+        }
+        // Reduce-motion: crossfade only — alpha still ramps, scale is flat 1.0 at
+        // every progress (no movement, the Q32 contract).
+        for i in 0..=10 {
+            let t = i as f32 / 10.0;
+            let p = popup::enter_params(t, true);
+            assert!((p.alpha - t).abs() < 1e-6, "alpha still ramps under RM");
+            assert_eq!(p.scale, 1.0, "no scale under reduce_motion");
+            assert_eq!(p.translate_y, 0.0);
+        }
+    }
+
+    #[test]
+    fn popup_exit_is_the_reverse_of_enter_and_collapses_under_reduce_motion() {
+        use crate::motion::POPUP_SCALE_DELTA;
+        // Close: starts open (alpha 1, 1.0×), ends closed (alpha 0, start_scale).
+        let start = popup::exit_params(0.0, false);
+        assert_eq!(start.alpha, 1.0);
+        assert!((start.scale - 1.0).abs() < 1e-6);
+        let end = popup::exit_params(1.0, false);
+        assert_eq!(end.alpha, 0.0);
+        assert!((end.scale - (1.0 - POPUP_SCALE_DELTA)).abs() < 1e-6);
+        // Enter(t) and exit(t) alphas are complementary (one fades in as the other
+        // fades out) — the shared crossfade vocabulary.
+        for i in 0..=10 {
+            let t = i as f32 / 10.0;
+            let a = popup::enter_params(t, false).alpha;
+            let b = popup::exit_params(t, false).alpha;
+            assert!((a + b - 1.0).abs() < 1e-6, "enter+exit alpha must sum to 1");
+        }
+        // Reduce-motion: scale flat at 1.0 (crossfade only) for the exit too.
+        for i in 0..=10 {
+            let t = i as f32 / 10.0;
+            assert_eq!(popup::exit_params(t, true).scale, 1.0);
+        }
+    }
+
+    #[test]
+    fn popup_start_scale_matches_the_token() {
+        use crate::motion::POPUP_SCALE_DELTA;
+        assert!((popup::start_scale() - (1.0 - POPUP_SCALE_DELTA)).abs() < 1e-6);
     }
 
     #[test]
