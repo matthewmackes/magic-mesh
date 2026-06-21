@@ -39,10 +39,6 @@ pub const NAV_ICON_SIZE: f32 = 20.0;
 /// UX-5 (c) — accent stripe on the selected row's left edge.
 const SELECTED_STRIPE_WIDTH: f32 = 2.0;
 
-/// UX-5 (f) — focus-ring border width on the active row when the
-/// sidebar pane holds keyboard focus.
-const FOCUS_RING_WIDTH: f32 = 2.0;
-
 /// UX-5 (b) — nav-row label point size. Locked at 14 sp (not
 /// density-scaled per UX-24).
 const NAV_LABEL_SIZE: f32 = 14.0;
@@ -206,23 +202,24 @@ fn section_label<'a>(
         .colr(text_color)
         .align_y(alignment::Vertical::Center);
 
+    let accent = palette.accent.into_cosmic_color();
+    let reduce_motion = crate::live_theme::reduce_motion();
     let style = move |_theme: &cosmic::Theme, status: ButtonStatus| {
-        let bg = match status {
-            ButtonStatus::Hovered => Background::Color(palette.raised.into_cosmic_color()),
-            ButtonStatus::Pressed => Background::Color(palette.overlay.into_cosmic_color()),
-            _ => Background::Color(Color::TRANSPARENT),
-        };
+        use crate::controls::{Feedback, FeedbackStyle};
+        // MOTION-FEEDBACK-1 — shared hover/press wash (was `raised`/`overlay`).
+        let fx = FeedbackStyle::resolve(Feedback::from_status(status), reduce_motion);
+        let bg = fx.tinted_bg(Color::TRANSPARENT, accent);
         let border = Border::default();
         button::Style {
             snap: false,
             icon_color: None,
-            background: Some(bg),
+            background: Some(Background::Color(bg)),
             text_color,
             border,
             border_color: border.color,
             border_width: border.width,
             border_radius: border.radius,
-            shadow: Shadow::default(),
+            shadow: fx.iced_shadow(),
         }
     };
 
@@ -292,35 +289,35 @@ fn nav_row<'a>(
     .align_y(alignment::Vertical::Center)
     .height(Length::Fixed(NAV_ROW_HEIGHT));
 
+    let accent = palette.accent.into_cosmic_color();
+    let reduce_motion = crate::live_theme::reduce_motion();
     let style = move |_theme: &cosmic::Theme, status: ButtonStatus| {
-        let bg = if is_active {
-            Background::Color(palette.hover_tint().into_cosmic_color())
+        use crate::controls::{focus_ring, Feedback, FeedbackStyle};
+        // MOTION-FEEDBACK-1 — the SAME hover-lift / press wash every shared
+        // control uses (was divergent `raised`/`overlay` here). The active
+        // row carries the persistent Carbon selection wash as its base; the
+        // interaction feedback layers on top.
+        let base = if is_active {
+            palette.hover_tint().into_cosmic_color()
         } else {
-            match status {
-                ButtonStatus::Hovered => Background::Color(palette.raised.into_cosmic_color()),
-                ButtonStatus::Pressed => Background::Color(palette.overlay.into_cosmic_color()),
-                _ => Background::Color(Color::TRANSPARENT),
-            }
+            Color::TRANSPARENT
         };
-        let border = if is_active && sidebar_focused {
-            Border {
-                color: palette.accent.into_cosmic_color(),
-                width: FOCUS_RING_WIDTH,
-                radius: 0.0.into(),
-            }
-        } else {
-            Border::default()
-        };
+        let fx = FeedbackStyle::resolve(Feedback::from_status(status), reduce_motion);
+        let bg = fx.tinted_bg(base, accent);
+        // UX-5 (f) — animated 2 px Carbon focus ring on the active+focused row,
+        // now from the shared `focus_ring` so the affordance is identical to
+        // any other focusable control.
+        let border = focus_ring(is_active && sidebar_focused, Border::default(), palette);
         button::Style {
             snap: false,
             icon_color: None,
-            background: Some(bg),
+            background: Some(Background::Color(bg)),
             text_color,
             border,
             border_color: border.color,
             border_width: border.width,
             border_radius: border.radius,
-            shadow: Shadow::default(),
+            shadow: fx.iced_shadow(),
         }
     };
 
@@ -416,9 +413,10 @@ mod tests {
 
     #[test]
     fn focus_ring_locked_to_two_px() {
-        // UX-5 (f) — 2 px accent focus ring when keyboard
-        // navigation is in the sidebar pane.
-        assert!((FOCUS_RING_WIDTH - 2.0).abs() < f32::EPSILON);
+        // UX-5 (f) / MOTION-FEEDBACK-1 — the 2 px accent focus ring is now the
+        // shared `controls::FOCUS_RING_WIDTH` so the affordance is identical
+        // across every focusable control.
+        assert!((crate::controls::FOCUS_RING_WIDTH - 2.0).abs() < f32::EPSILON);
     }
 
     #[test]

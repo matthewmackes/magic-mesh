@@ -12,6 +12,13 @@ use mde_theme::{Density, Palette, Preferences, Theme, Tokens};
 
 static TOKENS: RwLock<Option<Tokens>> = RwLock::new(None);
 
+/// MOTION-FEEDBACK-1 — process-wide reduce-motion flag, resolved once from the
+/// persisted [`Preferences`] (or the `MDE_REDUCE_MOTION` env in `load()`).
+/// Lets the shared control builders honor the reduce-motion contract from a
+/// single source — the same "read a global in `view()`" pattern as
+/// [`palette()`], so no per-call-site threading through 100+ button sites.
+static REDUCE_MOTION: RwLock<Option<bool>> = RwLock::new(None);
+
 /// Resolve from the persisted preferences (first read only).
 fn resolve_from_prefs() -> Tokens {
     let p = Preferences::load();
@@ -37,6 +44,31 @@ pub fn tokens() -> Tokens {
 /// The live palette — what every `view()` reads (GUI-2).
 pub fn palette() -> Palette {
     tokens().palette
+}
+
+/// MOTION-FEEDBACK-1 — the live reduce-motion flag the shared control builders
+/// read to honor the Q32 contract (state changes without movement). Lazily
+/// resolved from the persisted [`Preferences`]; never panics (a poisoned lock
+/// falls back to the preference-resolved value).
+pub fn reduce_motion() -> bool {
+    if let Ok(guard) = REDUCE_MOTION.read() {
+        if let Some(v) = *guard {
+            return v;
+        }
+    }
+    let v = Preferences::load().a11y.reduce_motion;
+    if let Ok(mut guard) = REDUCE_MOTION.write() {
+        *guard = Some(v);
+    }
+    v
+}
+
+/// MOTION-FEEDBACK-1 — override the live reduce-motion flag (the a11y panel
+/// applies it; tests flip it freely). Persistence is the caller's job.
+pub fn set_reduce_motion(value: bool) {
+    if let Ok(mut guard) = REDUCE_MOTION.write() {
+        *guard = Some(value);
+    }
 }
 
 /// Swap the live theme/density. The next render pass repaints with
