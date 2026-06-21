@@ -5668,6 +5668,20 @@ fn run_serve(
             RestartPolicy::OnFailure,
         ));
         worker_names.lock().expect("worker_names mutex").push("connect_firewall".into());
+        // CONNECT-3 — managed firewalld public-deny baseline enforcement. On
+        // EVERY node (the public boundary is universal, AI_GOVERNANCE §1/§6): each
+        // tick reads the live `public` zone and, if it has drifted to a blanket
+        // ACCEPT or lost a foundational allow (Nebula/4242 + SSH/22 + enroll/4243,
+        // + covert 443 on lighthouses), re-asserts default-deny + re-adds the
+        // missing allows ADDITIVELY (never removes a foundational rule, never
+        // blanket-opens) and fires a Bus drift alert. Graceful no-op without
+        // firewalld. Distinct from firewall_preset (port-open on role flip) +
+        // connect_firewall (exposure-policy ingress).
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::public_deny::PublicDenyWorker::new(node_id.clone()),
+            RestartPolicy::OnFailure,
+        ));
+        worker_names.lock().expect("worker_names mutex").push("public_deny".into());
         // mesh_router bootstraps with the per-transport
         // registry. Phase 12.18 D.2 (2026-05-23) — the NebulaHttps443
         // transport is registered at startup so the per-peer

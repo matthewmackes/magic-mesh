@@ -382,6 +382,14 @@ pub mod lifecycle_exec;
 pub mod firewall_preset;
 // CONNECT-3 — exposure-driven (additive) firewall enforcement.
 pub mod connect_firewall;
+// CONNECT-3 — managed firewalld public-deny baseline enforcement: asserts the
+// `public` zone is default-deny + re-asserts the foundational always-public
+// allows (Nebula/4242 + SSH/22 + enroll/4243, + covert 443 on lighthouses) on
+// every tick, correcting drift additively (never blanket-allows, never removes a
+// foundational rule). Distinct from `firewall_preset` (one-shot port-open on
+// role flip) + `connect_firewall` (exposure-policy ingress). Graceful no-op
+// without firewalld. Runs on every node (the public boundary is universal).
+pub mod public_deny;
 pub mod stun_gather;
 pub mod subprocess_tick;
 // thumbnailer retired 2026-05-26 (TUNE-3.b): the worker module
