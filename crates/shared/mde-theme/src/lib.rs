@@ -61,9 +61,10 @@ pub mod typography;
 
 pub use accessibility::A11y;
 pub use animation::{
-    crossfade, ease, fade_in, fade_out, lerp_f32, lift_on_hover, pulse_scale, shimmer_highlight,
-    shimmer_lift, slide_in, stagger, Animator, Crossfade, LoopingTween, RenderParams, RowState,
-    RowStyle, Transition, Tween, SELECTION_RAIL_PX, SHIMMER_BAND_HALF_WIDTH, SHIMMER_PEAK_LIFT,
+    crossfade, ease, fade_in, fade_out, lerp_f32, lift_on_hover, pulse_scale, route,
+    shimmer_highlight, shimmer_lift, slide_in, stagger, Animator, Crossfade, LoopingTween,
+    RenderParams, RowState, RowStyle, Transition, Tween, SELECTION_RAIL_PX,
+    SHIMMER_BAND_HALF_WIDTH, SHIMMER_PEAK_LIFT,
 };
 pub use brand::{Brand, BrandAsset, BrandFormat, BrandSlot, BrandSource};
 pub use color::Rgba;

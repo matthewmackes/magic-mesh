@@ -118,6 +118,23 @@ impl Motion {
         }
     }
 
+    /// MOTION-TRANS-1 — route/panel switch entrance. When the operator switches
+    /// Workbench panels/views the incoming body crosses in over a Carbon
+    /// `moderate-02` (240 ms) entrance — the same "expansion / reveal" tier as
+    /// `panel_mount`, so a route switch reads as one motion vocabulary with the
+    /// sidebar mount it accompanies. The design's "productive entrance ~150–240
+    /// ms" lands at the top of that band (a full view change deserves the longer
+    /// reveal); single-shot ease-out. Reduce-motion collapses it through
+    /// [`Motion::resolved`] / [`crate::Tween::resolved`] to the ≤80 ms cap.
+    #[must_use]
+    pub const fn route_switch() -> Self {
+        Self {
+            duration: DURATION_MODERATE_02,
+            easing: Easing::EaseOut,
+            looping: false,
+        }
+    }
+
     /// UX-9 (b) — notification bell pulse. 2 s ease-in-out,
     /// looping. Max scale 1.15 (see [`PULSE_MAX_SCALE`]).
     #[must_use]

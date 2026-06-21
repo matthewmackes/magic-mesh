@@ -420,6 +420,56 @@ pub fn staggered_reveal<'a, Message: 'a>(
 /// cascade reads as a gentle settle, never a long fly-in.
 pub const REVEAL_SLIDE_PX: f32 = 8.0;
 
+/// MOTION-TRANS-1 — wrap the panel/route `body` in the route-switch transition
+/// so a freshly-switched view crosses in (instead of an instant cut) over the
+/// Carbon `moderate-02` ([`mde_theme::route::total_ms`]) entrance. `elapsed_ms`
+/// is the wall-clock time since the operator switched views; the App advances it
+/// from an idle-gated tick that only runs while the switch is in flight
+/// (MOTION-PERF-1).
+///
+/// The transition is rendered on the transform channel only: the incoming body
+/// slides up from [`mde_theme::route::SWITCH_SLIDE_PX`] below to rest, via a
+/// transform-only top-padding offset whose matching bottom compensator holds the
+/// wrapper height constant so no sibling reflows (acceptance: no layout thrash).
+/// As with FEEDBACK-2's staggered reveal, the INFRA-2 `slide_in` *fade* channel
+/// is unavailable in the iced-0.13 libcosmic fork (no per-element opacity widget)
+/// and is **recorded as deferred** until the 0.14 opacity widget lands — so the
+/// runtime crossfade is the achievable transform settle, not a true opacity
+/// blend. Under `reduce_motion` the transition collapses to an instant switch
+/// (no movement) per the Q32 contract.
+pub fn switch_transition<'a, Message: 'a>(
+    body: Element<'a, Message>,
+    elapsed_ms: u32,
+    reduce_motion: bool,
+) -> Element<'a, Message> {
+    use mde_theme::route;
+
+    // Settled (or reduce-motion / instant switch): render the body at rest with
+    // no wrapper cost.
+    if !route::is_animating(elapsed_ms, reduce_motion) {
+        return body;
+    }
+    // INFRA-2 slide_in (eased via the route-switch curve in `body_params`): the
+    // remaining offset (px below rest), clamped to the slide travel.
+    let slide = route::body_params(elapsed_ms, reduce_motion)
+        .translate_y
+        .clamp(0.0, route::SWITCH_SLIDE_PX);
+
+    container(body)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        // Transform-only: top offset shrinks SWITCH_SLIDE_PX→0 as the body
+        // arrives; the bottom compensator holds the wrapper height fixed so the
+        // surrounding layout never reflows during the switch.
+        .padding(Padding {
+            top: slide,
+            right: 0.0,
+            bottom: route::SWITCH_SLIDE_PX - slide,
+            left: 0.0,
+        })
+        .into()
+}
+
 /// EFF-45 — error-state renderer: the load-FAILED counterpart to
 /// [`empty_state`], so a panel whose data source errored never
 /// masquerades as "nothing to show yet". Same layout family
@@ -1355,6 +1405,21 @@ mod tests {
         let mid: Element<'_, ()> = staggered_reveal(text("y").into(), 3, 10, false);
         let _ = mid;
         let reduced: Element<'_, ()> = staggered_reveal(text("z").into(), 3, 0, true);
+        let _ = reduced;
+    }
+
+    #[test]
+    fn switch_transition_passes_through_when_settled_and_wraps_mid_switch() {
+        use mde_theme::route;
+        // MOTION-TRANS-1 — settled (or reduce-motion / instant) returns the body
+        // at rest; mid-switch it's wrapped with the transform offset. All
+        // construct (the build is the assertion that the wrapper composes).
+        let settled: Element<'_, ()> =
+            switch_transition(text("x").into(), route::total_ms(), false);
+        let _ = settled;
+        let mid: Element<'_, ()> = switch_transition(text("y").into(), 10, false);
+        let _ = mid;
+        let reduced: Element<'_, ()> = switch_transition(text("z").into(), 0, true);
         let _ = reduced;
     }
 
