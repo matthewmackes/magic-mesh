@@ -5560,6 +5560,27 @@ fn run_serve(
             RestartPolicy::OnFailure,
         ));
         worker_names.lock().expect("worker_names mutex").push("sshd_overlay_bind".into());
+        // VPN-GW-2 — node-side decrypt of leader-pushed encrypted tunnel
+        // secrets. Reconciles this node's <root>/secrets/vpn/<self>/*.age blobs
+        // into /etc/wireguard|openvpn cleartext (0600) before VPN-GW-1's
+        // bring-up spawns wg-quick/openvpn. The mesh key is the EFF-21
+        // boot-captured passphrase (the env is already scrubbed above); a node
+        // without it idles honestly (can't decrypt). Runs on every role rank —
+        // any node can be assigned a gateway tunnel.
+        if mackesd_core::worker_role::runs("vpn_secret_distributor", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::vpn_secret_distributor::VpnSecretDistributor::new(
+                    workgroup_root.clone(),
+                    node_id.clone(),
+                )
+                .with_mesh_key(backup_passphrase.clone()),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("vpn_secret_distributor".into());
+        }
         // SVC-2 (Q60) — SSH pubkey gossip: publish this box's user
         // ed25519 pubkey into <root>/ssh-keys/ and merge every peer's
         // published key into ~/.ssh/authorized_keys (managed block,
@@ -6933,7 +6954,11 @@ fn run_serve(
             .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
         {
             Ok(persist) => {
-                let vpn_svc = mackesd_core::ipc::vpn_gw::VpnService::new(workgroup_root.clone());
+                // VPN-GW-2 — hand the IPC responder the EFF-21 boot-captured
+                // mesh key (the env is scrubbed by now) so `set-secret` can seal
+                // tunnel creds; absent → `set-secret` reports "no mesh key".
+                let vpn_svc = mackesd_core::ipc::vpn_gw::VpnService::new(workgroup_root.clone())
+                    .with_mesh_key(backup_passphrase.clone());
                 let resp_shutdown = Arc::clone(&shutdown);
                 std::thread::Builder::new()
                     .name("vpn-bus-responder".into())

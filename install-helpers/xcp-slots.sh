@@ -169,7 +169,7 @@ cmd_bootstrap() { # <slot-name> — install the BUILD-FARM-2 toolchain on a keye
   ssh -i "$key" "${SSHO[@]}" "$user@$host" 'bash -s' <<'BOOT'
 set -e
 sudo dnf install -y mold binutils protobuf-compiler gtk3-devel alsa-lib-devel \
-  openssl-devel cmake gcc gcc-c++ make git rsync podman rpm-build createrepo_c cloud-utils-growpart 2>&1 | tail -3
+  opus-devel openssl-devel cmake gcc gcc-c++ make git rsync podman rpm-build createrepo_c cloud-utils-growpart 2>&1 | tail -3
 # GUI render/test stack (APPS-FIT etc): headless sway + grim + software Mesa
 # (no GPU needed — preview-capture.sh uses WLR_RENDERER=pixman) + fonts for
 # cosmic-text, so this slot can both BUILD and RENDER/screenshot the GUIs.

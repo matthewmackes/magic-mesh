@@ -170,25 +170,8 @@ impl From<BackupError> for CaError {
 ///
 /// Per [`BackupError`].
 pub fn seal(passphrase: &str, plaintext: &BundlePlaintext) -> Result<Vec<u8>, BackupError> {
-    if passphrase.is_empty() {
-        return Err(BackupError::EmptyPassphrase);
-    }
-    let mut salt = [0u8; SALT_LEN];
-    let mut nonce = [0u8; NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut salt);
-    rand::thread_rng().fill_bytes(&mut nonce);
-
-    let key = derive_key(passphrase.as_bytes(), &salt)?;
     let json = serde_json::to_vec(plaintext).map_err(|e| BackupError::Json(e.to_string()))?;
-    let ciphertext = aead_seal(&key, &nonce, &json)?;
-
-    let mut out = Vec::with_capacity(HEADER_LEN + ciphertext.len());
-    out.extend_from_slice(BUNDLE_MAGIC);
-    out.push(BUNDLE_VERSION);
-    out.extend_from_slice(&salt);
-    out.extend_from_slice(&nonce);
-    out.extend_from_slice(&ciphertext);
-    Ok(out)
+    seal_bytes(BUNDLE_MAGIC, passphrase, &json)
 }
 
 /// Decrypt + deserialize. Inverse of [`seal`]. Accepts the
@@ -202,19 +185,74 @@ pub fn seal(passphrase: &str, plaintext: &BundlePlaintext) -> Result<Vec<u8>, Ba
 /// error is indistinguishable, and exposing the distinction
 /// would help an attacker confirm a tamper attempt).
 pub fn unseal(passphrase: &str, sealed: &[u8]) -> Result<BundlePlaintext, BackupError> {
+    let plain_bytes = unseal_bytes(BUNDLE_MAGIC, passphrase, sealed)?;
+    serde_json::from_slice(&plain_bytes).map_err(|e| BackupError::Json(e.to_string()))
+}
+
+/// VPN-GW-2 — the generic byte-envelope primitive. Seals arbitrary `plaintext`
+/// under `passphrase` with the same Argon2id + XChaCha20-Poly1305 envelope the
+/// CA backup uses, parameterized by a 4-byte `magic` so a different secret
+/// domain (e.g. VPN tunnel secrets) can't be confused with a CA bundle. The
+/// envelope is `magic || version || salt(16) || nonce(24) || ciphertext`.
+/// [`seal`] is this with [`BUNDLE_MAGIC`] over serialized JSON.
+///
+/// Reused — DO NOT re-implement the crypto elsewhere (§6 crypto-floor: one
+/// vetted Argon2id/XChaCha20-Poly1305 path for every encrypted mesh secret).
+///
+/// # Errors
+///
+/// Per [`BackupError`] (empty passphrase, KDF/AEAD failure).
+pub fn seal_bytes(
+    magic: &[u8; 4],
+    passphrase: &str,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, BackupError> {
+    if passphrase.is_empty() {
+        return Err(BackupError::EmptyPassphrase);
+    }
+    let mut salt = [0u8; SALT_LEN];
+    let mut nonce = [0u8; NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut salt);
+    rand::thread_rng().fill_bytes(&mut nonce);
+
+    let key = derive_key(passphrase.as_bytes(), &salt)?;
+    let ciphertext = aead_seal(&key, &nonce, plaintext)?;
+
+    let mut out = Vec::with_capacity(HEADER_LEN + ciphertext.len());
+    out.extend_from_slice(magic);
+    out.push(BUNDLE_VERSION);
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+/// VPN-GW-2 — inverse of [`seal_bytes`]. Verifies the 4-byte `magic` + version,
+/// derives the key, and AEAD-decrypts. Wrong passphrase / tampered bytes both
+/// surface as [`BackupError::Aead`] (indistinguishable by design).
+///
+/// # Errors
+///
+/// Per [`BackupError`] (empty passphrase, truncated/mismatched envelope,
+/// KDF/AEAD failure).
+pub fn unseal_bytes(
+    magic: &[u8; 4],
+    passphrase: &str,
+    sealed: &[u8],
+) -> Result<Vec<u8>, BackupError> {
     if passphrase.is_empty() {
         return Err(BackupError::EmptyPassphrase);
     }
     if sealed.len() < HEADER_LEN {
         return Err(BackupError::Format(format!(
-            "bundle too short: {} bytes (header alone needs {})",
+            "envelope too short: {} bytes (header alone needs {})",
             sealed.len(),
             HEADER_LEN
         )));
     }
-    if &sealed[..4] != BUNDLE_MAGIC {
+    if &sealed[..4] != magic {
         return Err(BackupError::Format(
-            "magic mismatch — not a Mackes Nebula CA bundle".to_string(),
+            "magic mismatch — not the expected sealed envelope".to_string(),
         ));
     }
     let version = sealed[4];
@@ -228,8 +266,7 @@ pub fn unseal(passphrase: &str, sealed: &[u8]) -> Result<BundlePlaintext, Backup
     let ciphertext = &sealed[HEADER_LEN..];
 
     let key = derive_key(passphrase.as_bytes(), &salt)?;
-    let plain_bytes = aead_unseal(&key, &nonce, ciphertext)?;
-    serde_json::from_slice(&plain_bytes).map_err(|e| BackupError::Json(e.to_string()))
+    aead_unseal(&key, &nonce, ciphertext)
 }
 
 /// ASCII-armor a binary bundle for sneakernet-friendly transport
