@@ -226,6 +226,13 @@ pub enum Message {
     /// every `get_latest()` so a `--focus` hand-off and a normal
     /// startup go through the same code path.
     WindowControl(HeaderAction),
+    /// MOTION-A11Y-1 — the COSMIC toolkit config (`com.system76.CosmicTk`)
+    /// changed. The Workbench subscribes to it so a live change to the system
+    /// reduced-motion accessibility preference re-resolves
+    /// [`crate::live_theme::reduce_motion`] without a restart (every animated
+    /// surface reads that one source). Carries nothing — the handler re-reads the
+    /// authoritative flag from env + COSMIC + local prefs.
+    CosmicConfigChanged,
     /// No-op — the inert default for declaratively-wired fallbacks
     /// (focus-drain misses, lazy widget message slots). Not a stub:
     /// every live use is a functional "nothing to do" value.
@@ -636,7 +643,10 @@ impl App {
     ///    Nebula + Fleet signals mackesd emits so the Overview's
     ///    capability cards refresh without polling
     ///    (see `panels::home::dbus_subscription`).
-    #[allow(clippy::unused_self)]
+    /// 3. **MOTION-A11Y-1 COSMIC config watch** — subscribes to the COSMIC
+    ///    toolkit config so a live change to the system reduced-motion
+    ///    accessibility preference re-resolves
+    ///    [`crate::live_theme::reduce_motion`] without a restart.
     fn subscription(&self) -> Subscription<Message> {
         let mut subs = vec![
             cosmic::iced::time::every(Duration::from_millis(200))
@@ -651,6 +661,17 @@ impl App {
             // showing a stale "mesh service isn't answering" until a
             // manual refresh.
             cosmic::iced::time::every(Duration::from_secs(10)).map(|_| Message::ReconnectTick),
+            // MOTION-A11Y-1 — watch the COSMIC toolkit config
+            // (`com.system76.CosmicTk`). Any change re-resolves the live
+            // reduce-motion flag from env + COSMIC + local prefs, so when the
+            // system reduced-motion accessibility preference flips, every
+            // animated surface collapses/restores on the next frame with no
+            // restart. cosmic-config notifies via inotify (no polling); the day
+            // COSMIC publishes a reduce-motion key under this config the wiring
+            // already carries it.
+            self.core
+                .watch_config::<cosmic::config::CosmicTk>(crate::live_theme::COSMIC_TK_CONFIG_ID)
+                .map(|_update| Message::CosmicConfigChanged),
         ];
         // E6.10 — sample Compute instance CPU/mem only while that view is
         // active, so virsh/podman stats aren't polled when the operator is
@@ -905,6 +926,15 @@ impl App {
             // (MOTION-PERF-1). Presentation only — never affects navigation.
             Message::BodyTransitionTick => {
                 self.switch_now = std::time::Instant::now();
+                Task::none()
+            }
+            // MOTION-A11Y-1 — the COSMIC toolkit config changed: re-resolve the
+            // live reduce-motion flag (env override > COSMIC signal > local
+            // pref). The next render pass resolves all motion against the new
+            // value — collapses/restores movement with no restart. Presentation
+            // only — never gates anything.
+            Message::CosmicConfigChanged => {
+                let _ = crate::live_theme::refresh_reduce_motion();
                 Task::none()
             }
             Message::Noop => Task::none(),
@@ -1541,6 +1571,12 @@ impl Application for App {
             _ => (App::new(), crate::panels::peers::PeersPanel::load()),
         };
         app.core = core;
+        // MOTION-A11Y-1 — prime the live reduce-motion flag at boot from the
+        // env override + COSMIC system signal + local prefs, so the very first
+        // frame already honors reduced-motion (the config subscription then
+        // keeps it live). Priming up front also avoids the first per-frame read
+        // re-resolving on the render thread.
+        let _ = crate::live_theme::refresh_reduce_motion();
         // UX-4 (d) — keep the workbench's custom `crate::header` bar; suppress
         // Cosmic's headerbar so it's the only title strip the user sees.
         app.core.window.show_headerbar = false;
