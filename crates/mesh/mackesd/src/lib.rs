@@ -170,6 +170,9 @@ pub mod voip_rtt;
 // `ca::backup` Argon2id/XChaCha20-Poly1305 envelope) + the materialize path that
 // lays the decrypted config down for VPN-GW-1's `wg-quick`/`openvpn` bring-up.
 pub mod vpn_secret;
+// VPN-GW-5 — local WireGuard x25519 keypair generation (dalek, no OpenSSL §3);
+// the §3 crypto boundary the pure `vpn_provider` adapters mint keys through.
+pub mod vpn_keypair;
 // Fire-and-forget subprocess reaping — prevents the `mde-bus publish` zombie
 // pile (the live-mesh wedge). Non-gated so the always-compiled `ca::revoke` +
 // `voip_rtt` callers can use it in a no-default-features build.

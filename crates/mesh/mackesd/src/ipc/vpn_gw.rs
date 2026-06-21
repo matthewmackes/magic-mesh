@@ -15,6 +15,15 @@
 //! VPN-GW-1's bring-up spawns `wg-quick`/`openvpn`. Material never hits
 //! `ps`/argv/logs.
 //!
+//! VPN-GW-5 adds two creation paths on top of GW-1/2: `add-from-provider`
+//! (a named provider — Mullvad/Proton/IVPN/Nord/Surfshark — params → a WG
+//! [`TunnelDef`] with a locally-minted x25519 keypair) and `import-config`
+//! (a pasted `wg-quick` `.conf` or an imported `.ovpn` → a [`TunnelDef`]).
+//! Both reuse the GW-2 seal path: the generated/imported key material is sealed
+//! into the assigned node's `secrets/vpn/<node>/<tunnel>.age` blob and only a
+//! log-safe `creds_ref` is recorded — the private key never touches argv/logs.
+//! A tunnel created this way is then brought up by GW-1 and verified by GW-6.
+//!
 //! Same dedicated-OS-thread shape as the Connect/Route responders.
 
 use std::collections::HashMap;
@@ -26,6 +35,9 @@ use mde_bus::rpc::reply_topic;
 use serde_json::json;
 
 use mackes_mesh_types::vpn::{self, EgressRoute, Method, TunnelDef};
+use mackes_mesh_types::vpn_provider::{
+    self, PeerParams, ProviderKind, ProviderParams, ProvisionedTunnel,
+};
 
 /// The VPN responder — rooted at the shared workgroup root (the config home).
 #[derive(Debug, Clone)]
@@ -80,7 +92,7 @@ impl VpnService {
 ///
 /// VPN-GW-6 adds `tunnel-health` — the gateway's published per-tunnel verified
 /// health (verdict + exit IP) — and enriches `route-status` with the same.
-pub const ACTION_VERBS: [&str; 13] = [
+pub const ACTION_VERBS: [&str; 15] = [
     "list-tunnels",
     "add-tunnel",
     "remove-tunnel",
@@ -94,6 +106,9 @@ pub const ACTION_VERBS: [&str; 13] = [
     "list-routes",
     "route-status",
     "tunnel-health",
+    // VPN-GW-5 — first-class provider setup + generic config import.
+    "add-from-provider",
+    "import-config",
 ];
 
 /// Responder poll interval.
@@ -227,6 +242,12 @@ pub fn build_reply(svc: &VpnService, verb: &str, req_body: Option<&str>) -> Stri
         // VPN-GW-6 — the gateway's published per-tunnel verified health (verdict
         // + exit IP). Pure read of the worker's published state.
         "tunnel-health" => build_tunnel_health_reply(svc),
+        // VPN-GW-5 — provider params → a WG TunnelDef (local x25519 keypair) +
+        // sealed secret, in one reachable action.
+        "add-from-provider" => build_add_from_provider_reply(svc, req_body),
+        // VPN-GW-5 — a pasted wg-quick .conf / imported .ovpn → a TunnelDef +
+        // sealed secret.
+        "import-config" => build_import_config_reply(svc, req_body),
         other => err(format!("unknown vpn verb: {other}")),
     }
 }
@@ -456,6 +477,205 @@ fn build_tunnel_health_reply(svc: &VpnService) -> String {
     json!({ "ok": true, "tunnels": tunnels }).to_string()
 }
 
+// ── VPN-GW-5 — provider setup + generic config import ───────────────────────
+
+/// Parsed body of an `add-from-provider` request. The provider is named; the
+/// chosen server + (optional) statically-known peer come from the operator; the
+/// `account_token` is a SECRET (sealed via GW-2, NEVER echoed back / logged).
+/// `node_id` is the gateway the sealed secret is distributed to (as for
+/// `set-secret`).
+#[derive(serde::Deserialize)]
+struct AddFromProviderReq {
+    provider: String,
+    tunnel_id: String,
+    node_id: String,
+    #[serde(default)]
+    server: String,
+    /// SECRET — the provider account/session token, sealed alongside the key
+    /// material. Never returned in the reply or logged.
+    #[serde(default)]
+    account_token: String,
+    #[serde(default)]
+    dns: Option<String>,
+    // The statically-known WG peer (when the operator pasted it from the portal
+    // rather than relying on the provider API at runtime).
+    #[serde(default)]
+    server_pubkey: String,
+    #[serde(default)]
+    endpoint: String,
+    #[serde(default)]
+    assigned_address: String,
+    #[serde(default)]
+    preshared_key: Option<String>,
+}
+
+/// Parsed body of an `import-config` request: a pasted `wg-quick` `.conf`
+/// (`kind = "wg"`) or an imported `.ovpn` (`kind = "ovpn"`). The whole config
+/// is the SECRET (it carries the private key / inline certs) — sealed via GW-2,
+/// never logged.
+#[derive(serde::Deserialize)]
+struct ImportConfigReq {
+    /// `"wg"` (paste a wg-quick conf) or `"ovpn"` (import an OpenVPN config).
+    kind: String,
+    tunnel_id: String,
+    node_id: String,
+    /// The raw config text. SECRET. Never returned / logged.
+    config: String,
+}
+
+/// VPN-GW-5 — `add-from-provider`: a named provider's params → a WG
+/// [`TunnelDef`] (with a locally-generated x25519 keypair) + the sealed secret,
+/// in one reachable action. The account token + generated private key are
+/// sealed via the GW-2 path (`vpn_secret::seal_for`) into the assigned node's
+/// blob — never on argv/logs. Honest when the mesh key is absent or the params
+/// can't form a usable tunnel.
+fn build_add_from_provider_reply(svc: &VpnService, req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let root = svc.workgroup_root.as_path();
+    let Some(body) = req_body else {
+        return err("add-from-provider: missing body".into());
+    };
+    let req: AddFromProviderReq = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => return err(format!("add-from-provider: bad json: {e}")),
+    };
+    let Some(kind) = ProviderKind::from_label(&req.provider) else {
+        return err(format!(
+            "add-from-provider: unknown provider '{}'",
+            req.provider
+        ));
+    };
+    // Need the mesh key up front — fail before minting a keypair we can't seal.
+    let Some(mesh_key) = svc.mesh_key.as_deref() else {
+        return err(format!(
+            "add-from-provider: no mesh key ({}); can't seal provider secret",
+            crate::vpn_secret::MESH_KEY_ENV
+        ));
+    };
+    // Mint the WG keypair locally (§3 — x25519 via the workspace crypto, never
+    // OpenSSL). The private key lives only in the sealed secret below.
+    let keypair = crate::vpn_keypair::generate();
+    let params = ProviderParams {
+        tunnel_id: req.tunnel_id.clone(),
+        server: req.server.clone(),
+        account_token: req.account_token.clone(),
+        dns: req.dns.clone(),
+        peer: PeerParams {
+            server_pubkey: req.server_pubkey.clone(),
+            endpoint: req.endpoint.clone(),
+            assigned_address: req.assigned_address.clone(),
+            preshared_key: req.preshared_key.clone(),
+        },
+    };
+    let adapter = kind.adapter();
+    let provisioned = match adapter.provision(&params, &keypair) {
+        Ok(p) => p,
+        Err(e) => return err(format!("add-from-provider: {e}")),
+    };
+    // Whether a key-register/credentials API exists for this provider (the
+    // daemon's API executor would run it with the token off-argv; live calls
+    // are deferred — no creds here). Surfaced so the caller knows whether the
+    // pasted peer was required.
+    let has_api = adapter.key_register_request(&params, &keypair).is_some();
+    let public_key = keypair.public_b64.clone();
+    match persist_provisioned(root, mesh_key, &req.node_id, provisioned) {
+        Ok(bytes) => json!({
+            "ok": true,
+            "provider": kind.label(),
+            "tunnel_id": req.tunnel_id,
+            "node_id": req.node_id,
+            // The PUBLIC key is publishable (the operator registers it with the
+            // provider when there's no live API call); the private key + token
+            // stay sealed and are never returned.
+            "public_key": public_key,
+            "has_provider_api": has_api,
+            "sealed_bytes": bytes,
+        })
+        .to_string(),
+        Err(e) => err(format!("add-from-provider: {e}")),
+    }
+}
+
+/// VPN-GW-5 — `import-config`: a pasted `wg-quick` `.conf` or an imported
+/// `.ovpn` → a [`TunnelDef`] + the sealed secret. The raw config (which carries
+/// the private key / inline certs) is sealed via GW-2 — never logged.
+fn build_import_config_reply(svc: &VpnService, req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let root = svc.workgroup_root.as_path();
+    let Some(body) = req_body else {
+        return err("import-config: missing body".into());
+    };
+    let req: ImportConfigReq = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => return err(format!("import-config: bad json: {e}")),
+    };
+    let Some(mesh_key) = svc.mesh_key.as_deref() else {
+        return err(format!(
+            "import-config: no mesh key ({}); can't seal imported config",
+            crate::vpn_secret::MESH_KEY_ENV
+        ));
+    };
+    let provisioned = match req.kind.trim().to_ascii_lowercase().as_str() {
+        "wg" | "wireguard" | "paste-wg" => {
+            match vpn_provider::parse_wg_conf(&req.tunnel_id, &req.config) {
+                Ok(p) => p,
+                Err(e) => return err(format!("import-config: {e}")),
+            }
+        }
+        "ovpn" | "openvpn" => match vpn_provider::parse_ovpn(&req.tunnel_id, &req.config) {
+            Ok(p) => p,
+            Err(e) => return err(format!("import-config: {e}")),
+        },
+        other => {
+            return err(format!(
+                "import-config: unknown kind '{other}' (want 'wg' or 'ovpn')"
+            ))
+        }
+    };
+    let method = provisioned.def.method;
+    match persist_provisioned(root, mesh_key, &req.node_id, provisioned) {
+        Ok(bytes) => json!({
+            "ok": true,
+            "kind": req.kind,
+            "method": match method { Method::Ovpn => "ovpn", _ => "wg" },
+            "tunnel_id": req.tunnel_id,
+            "node_id": req.node_id,
+            "sealed_bytes": bytes,
+        })
+        .to_string(),
+        Err(e) => err(format!("import-config: {e}")),
+    }
+}
+
+/// VPN-GW-5 — persist a freshly [`ProvisionedTunnel`]: seal its secret to the
+/// assigned node's blob (GW-2 `seal_for` → 0600 `.age`), stamp the log-safe
+/// `creds_ref` on the def, and save `tunnels.toml`. The exact same secret path
+/// `set-secret` uses, so a provider/imported tunnel is then brought up by GW-1
+/// + verified by GW-6. Returns the sealed byte count on success. The cleartext
+/// secret stays in memory only for the seal call — never on argv/logs.
+fn persist_provisioned(
+    root: &std::path::Path,
+    mesh_key: &str,
+    node_id: &str,
+    provisioned: ProvisionedTunnel,
+) -> Result<usize, String> {
+    let ProvisionedTunnel { mut def, secret } = provisioned;
+    // Seal (validates the payload matches the method) before touching disk.
+    let sealed =
+        crate::vpn_secret::seal_for(mesh_key, &def, &secret).map_err(|e| format!("seal: {e}"))?;
+    let path = vpn::secret_path(root, node_id, &def.id);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    }
+    write_blob_0600(&path, &sealed).map_err(|e| format!("write blob: {e}"))?;
+    // Record the log-safe creds_ref on the def, then upsert into the config.
+    def.creds_ref = vpn::creds_ref(&def.id);
+    let mut cfg = vpn::load(root);
+    cfg.upsert(def);
+    vpn::save(root, &cfg).map_err(|e| format!("save cfg: {e}"))?;
+    Ok(sealed.len())
+}
+
 /// Write a sealed blob at mode 0600 (atomic temp+rename). The `.age` blob is
 /// already ciphertext, but 0600 keeps a stolen-bytes window from a co-tenant.
 fn write_blob_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -590,7 +810,7 @@ mod tests {
     #[test]
     fn topic_and_verbs_lock() {
         assert_eq!(action_topic("tunnel-up"), "action/vpn/tunnel-up");
-        assert_eq!(ACTION_VERBS.len(), 13);
+        assert_eq!(ACTION_VERBS.len(), 15);
         assert!(ACTION_VERBS.contains(&"set-secret"));
         assert!(ACTION_VERBS.contains(&"secret-status"));
         // VPN-GW-4 routing surface.
@@ -600,6 +820,9 @@ mod tests {
         assert!(ACTION_VERBS.contains(&"route-status"));
         // VPN-GW-6 health surface.
         assert!(ACTION_VERBS.contains(&"tunnel-health"));
+        // VPN-GW-5 provider setup + config import.
+        assert!(ACTION_VERBS.contains(&"add-from-provider"));
+        assert!(ACTION_VERBS.contains(&"import-config"));
     }
 
     #[test]
@@ -957,5 +1180,148 @@ mod tests {
         assert_eq!(v["routes"][0]["health"][0]["verdict"], "leaking");
         assert_eq!(v["routes"][0]["health"][1]["verdict"], "healthy");
         assert_eq!(v["routes"][0]["health"][1]["exit_ip"], "185.65.1.1");
+    }
+
+    // ── VPN-GW-5 — add-from-provider / import-config ────────────────────────
+
+    #[test]
+    fn add_from_provider_seals_secret_records_def_and_never_leaks() {
+        let (tmp, s) = svc();
+        // A provider with a statically-known peer (no live API call needed).
+        let body = json!({
+            "provider": "mullvad",
+            "tunnel_id": "exit1",
+            "node_id": "peer:gw",
+            "server": "us-nyc-wg-001",
+            "account_token": "SECRET-MULLVAD-ACCOUNT",
+            "server_pubkey": "SERVERpubkey00000000000000000000000000000000=",
+            "endpoint": "198.51.100.10:51820",
+            "assigned_address": "10.64.0.2/32",
+        })
+        .to_string();
+        let r = build_reply(&s, "add-from-provider", Some(&body));
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{r}");
+        assert_eq!(v["provider"], "mullvad");
+        assert_eq!(v["tunnel_id"], "exit1");
+        assert_eq!(v["has_provider_api"], serde_json::Value::Bool(true));
+        // The PUBLIC key is returned (publishable); 32-byte WG b64.
+        let pub_b64 = v["public_key"].as_str().unwrap();
+        assert_eq!(pub_b64.len(), 44);
+        // The account token + private key NEVER appear in the reply.
+        assert!(
+            !r.contains("SECRET-MULLVAD-ACCOUNT"),
+            "token leaked in reply"
+        );
+        // The def is recorded with a log-safe creds_ref, as a WG tunnel.
+        let cfg = vpn::load(tmp.path());
+        let def = cfg.get("exit1").expect("def recorded");
+        assert_eq!(def.method, Method::Wg);
+        assert_eq!(def.provider, "mullvad");
+        assert_eq!(def.creds_ref, "secret://vpn/exit1");
+        // tunnels.toml carries NO key material + NO token.
+        let toml = std::fs::read_to_string(vpn::config_path(tmp.path())).unwrap();
+        assert!(!toml.contains("SECRET-MULLVAD-ACCOUNT"));
+        assert!(!toml.contains("PrivateKey"));
+        // The sealed blob is real ciphertext (MVPS magic), not the cleartext key.
+        let blob = std::fs::read(vpn::secret_path(tmp.path(), "peer:gw", "exit1")).unwrap();
+        assert_eq!(&blob[..4], b"MVPS");
+        assert!(!blob.windows(7).any(|w| w == b"Private"));
+        // Round-trip: the sealed secret unseals to a populated WG config.
+        let secret = crate::vpn_secret::unseal("test-mesh-key", &blob).unwrap();
+        assert!(secret.wg_conf.contains("PublicKey = SERVERpubkey"));
+        assert!(secret.wg_conf.contains("Endpoint = 198.51.100.10:51820"));
+        // The conf holds the [Interface] PRIVATE key — not the public one we
+        // returned to the caller (the public key is the publishable handle).
+        assert!(!secret.wg_conf.contains(pub_b64));
+    }
+
+    #[test]
+    fn add_from_provider_is_honest_about_bad_input() {
+        let (_t, s) = svc();
+        // Unknown provider.
+        let bad = json!({"provider":"acme","tunnel_id":"x","node_id":"n"}).to_string();
+        assert!(build_reply(&s, "add-from-provider", Some(&bad)).contains("unknown provider"));
+        // Known provider but no peer → loud error (not a silent fake tunnel).
+        let no_peer = json!({"provider":"ivpn","tunnel_id":"x","node_id":"n"}).to_string();
+        assert!(build_reply(&s, "add-from-provider", Some(&no_peer)).contains("server public key"));
+        // No mesh key → honest, no keypair minted.
+        let nokey = VpnService::new(tempfile::tempdir().unwrap().path().to_path_buf())
+            .without_spawn()
+            .with_mesh_key(None);
+        let full = json!({
+            "provider":"mullvad","tunnel_id":"x","node_id":"n",
+            "server_pubkey":"p=","endpoint":"a:1","assigned_address":"10.0.0.2/32",
+        })
+        .to_string();
+        assert!(build_reply(&nokey, "add-from-provider", Some(&full)).contains("no mesh key"));
+    }
+
+    #[test]
+    fn import_config_wg_seals_pasted_conf() {
+        let (tmp, s) = svc();
+        let conf = "[Interface]\nPrivateKey = aAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaA0=\n\
+                    Address = 10.0.0.2/32\nDNS = 1.1.1.1\n[Peer]\n\
+                    PublicKey = bBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbB0=\n\
+                    Endpoint = 203.0.113.7:51820\nAllowedIPs = 0.0.0.0/0\n";
+        let body = json!({
+            "kind": "wg", "tunnel_id": "pasted1", "node_id": "peer:gw", "config": conf,
+        })
+        .to_string();
+        let r = build_reply(&s, "import-config", Some(&body));
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{r}");
+        assert_eq!(v["method"], "wg");
+        // No key material in the reply or tunnels.toml.
+        assert!(!r.contains("aAaAaAa"), "private key leaked in reply");
+        let cfg = vpn::load(tmp.path());
+        assert_eq!(cfg.get("pasted1").unwrap().provider, "generic-wg");
+        let toml = std::fs::read_to_string(vpn::config_path(tmp.path())).unwrap();
+        assert!(!toml.contains("aAaAaAa"));
+        // Sealed blob round-trips to the pasted conf.
+        let blob = std::fs::read(vpn::secret_path(tmp.path(), "peer:gw", "pasted1")).unwrap();
+        let secret = crate::vpn_secret::unseal("test-mesh-key", &blob).unwrap();
+        assert!(secret.wg_conf.contains("PrivateKey = aAaAaAa"));
+    }
+
+    #[test]
+    fn import_config_ovpn_seals_imported_config() {
+        let (tmp, s) = svc();
+        let ovpn = "client\nproto udp\nremote vpn.example.com 1194\n\
+                    <key>\n-----BEGIN PRIVATE KEY-----\nSECRETKEYMATERIAL\n-----END PRIVATE KEY-----\n</key>\n";
+        let body = json!({
+            "kind": "ovpn", "tunnel_id": "ovpn1", "node_id": "peer:gw", "config": ovpn,
+        })
+        .to_string();
+        let r = build_reply(&s, "import-config", Some(&body));
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{r}");
+        assert_eq!(v["method"], "ovpn");
+        assert!(
+            !r.contains("SECRETKEYMATERIAL"),
+            "key material leaked in reply"
+        );
+        let cfg = vpn::load(tmp.path());
+        let def = cfg.get("ovpn1").unwrap();
+        assert_eq!(def.method, Method::Ovpn);
+        assert_eq!(def.server, "vpn.example.com:1194");
+        // tunnels.toml never carries the inline key.
+        let toml = std::fs::read_to_string(vpn::config_path(tmp.path())).unwrap();
+        assert!(!toml.contains("SECRETKEYMATERIAL"));
+        // Sealed blob round-trips to the imported .ovpn.
+        let blob = std::fs::read(vpn::secret_path(tmp.path(), "peer:gw", "ovpn1")).unwrap();
+        let secret = crate::vpn_secret::unseal("test-mesh-key", &blob).unwrap();
+        assert!(secret.ovpn_conf.contains("SECRETKEYMATERIAL"));
+    }
+
+    #[test]
+    fn import_config_rejects_unknown_kind_and_malformed() {
+        let (_t, s) = svc();
+        let bad_kind =
+            json!({"kind":"pptp","tunnel_id":"x","node_id":"n","config":"x"}).to_string();
+        assert!(build_reply(&s, "import-config", Some(&bad_kind)).contains("unknown kind"));
+        let malformed =
+            json!({"kind":"wg","tunnel_id":"x","node_id":"n","config":"garbage"}).to_string();
+        assert!(build_reply(&s, "import-config", Some(&malformed)).contains("error"));
     }
 }

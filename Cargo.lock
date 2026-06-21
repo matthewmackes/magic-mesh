@@ -4043,7 +4043,7 @@ dependencies = [
 
 [[package]]
 name = "mackes-config"
-version = "11.0.0"
+version = "11.0.1"
 dependencies = [
  "mackes-mesh-types",
  "serde",
@@ -4052,7 +4052,7 @@ dependencies = [
 
 [[package]]
 name = "mackes-mesh-types"
-version = "11.0.0"
+version = "11.0.1"
 dependencies = [
  "dirs 5.0.1",
  "serde",
@@ -4063,7 +4063,7 @@ dependencies = [
 
 [[package]]
 name = "mackes-nebula-https-tunnel"
-version = "11.0.0"
+version = "11.0.1"
 dependencies = [
  "bytes",
  "mackes-transport",
@@ -4085,14 +4085,14 @@ dependencies = [
 
 [[package]]
 name = "mackes-xcp"
-version = "11.0.0"
+version = "11.0.1"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "mackesd"
-version = "11.0.0"
+version = "11.0.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4139,6 +4139,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "x25519-dalek",
  "zbus",
  "zeroize",
 ]
@@ -4203,7 +4204,7 @@ checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
 
 [[package]]
 name = "mde-bus"
-version = "11.0.0"
+version = "11.0.1"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -4228,7 +4229,7 @@ dependencies = [
 
 [[package]]
 name = "mde-card"
-version = "11.0.0"
+version = "11.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4251,11 +4252,11 @@ dependencies = [
 
 [[package]]
 name = "mde-disclaimer"
-version = "11.0.0"
+version = "11.0.1"
 
 [[package]]
 name = "mde-enroll"
-version = "11.0.0"
+version = "11.0.1"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -4268,7 +4269,7 @@ dependencies = [
 
 [[package]]
 name = "mde-files"
-version = "11.0.0"
+version = "11.0.1"
 dependencies = [
  "chrono",
  "flate2",
@@ -4321,7 +4322,7 @@ dependencies = [
 
 [[package]]
 name = "mde-music"
-version = "11.0.0"
+version = "11.0.1"
 dependencies = [
  "base64",
  "image",
@@ -4336,7 +4337,7 @@ dependencies = [
 
 [[package]]
 name = "mde-musicd"
-version = "11.0.0"
+version = "11.0.1"
 dependencies = [
  "base64",
  "clap",
@@ -4358,7 +4359,7 @@ dependencies = [
 
 [[package]]
 name = "mde-notify"
-version = "11.0.0"
+version = "11.0.1"
 dependencies = [
  "mde-bus",
  "mde-theme",
@@ -4370,7 +4371,7 @@ dependencies = [
 
 [[package]]
 name = "mde-role"
-version = "11.0.0"
+version = "11.0.1"
 
 [[package]]
 name = "mde-role-chooser"
@@ -4383,7 +4384,7 @@ dependencies = [
 
 [[package]]
 name = "mde-theme"
-version = "11.0.0"
+version = "11.0.1"
 dependencies = [
  "serde",
  "toml 0.8.23",
@@ -4391,7 +4392,7 @@ dependencies = [
 
 [[package]]
 name = "mde-voice-config"
-version = "11.0.0"
+version = "11.0.1"
 dependencies = [
  "insta",
  "serde",
@@ -4400,7 +4401,7 @@ dependencies = [
 
 [[package]]
 name = "mde-voice-hud"
-version = "11.0.0"
+version = "11.0.1"
 dependencies = [
  "clap",
  "cpal",
@@ -4420,7 +4421,7 @@ dependencies = [
 
 [[package]]
 name = "mde-workbench"
-version = "11.0.0"
+version = "11.0.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -9326,6 +9327,18 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+
+[[package]]
+name = "x25519-dalek"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
+dependencies = [
+ "curve25519-dalek",
+ "rand_core 0.6.4",
+ "serde",
+ "zeroize",
+]
 
 [[package]]
 name = "xattr"

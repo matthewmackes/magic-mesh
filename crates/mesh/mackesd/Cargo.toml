@@ -163,6 +163,13 @@ zeroize = { version = "1.7", features = ["zeroize_derive"] }
 # row signing).
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 
+# VPN-GW-5 — x25519 (Curve25519) keypair generation for WireGuard provider
+# tunnels. Pure-Rust dalek ecosystem (shares curve25519-dalek with
+# ed25519-dalek above) — NO OpenSSL (§3). Used by `vpn_keypair` to mint the
+# local WG private key whose cleartext only ever lands in the GW-2-sealed
+# TunnelSecret, never on argv/logs.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
 # Filesystem locking for the leader-election lockfile (12.A.5).
 fs2 = "0.4"
 
