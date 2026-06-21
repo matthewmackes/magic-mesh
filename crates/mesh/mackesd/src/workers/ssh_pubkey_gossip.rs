@@ -430,10 +430,8 @@ mod tests {
         // unmounted node the gossip publish is a no-op and the bare mountpoint
         // stays empty (LizardFS can then mfsmount over it on the first try,
         // instead of looping forever on "mountpoint is not empty").
-        let canonical = SshPubkeyGossipWorker::new(
-            PathBuf::from(crate::CANONICAL_QNM_MOUNT),
-            "pine".into(),
-        );
+        let canonical =
+            SshPubkeyGossipWorker::new(PathBuf::from(crate::CANONICAL_QNM_MOUNT), "pine".into());
         let mounted = std::fs::read_to_string("/proc/mounts")
             .map(|c| {
                 c.lines()
