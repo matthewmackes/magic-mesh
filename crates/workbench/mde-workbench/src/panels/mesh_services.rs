@@ -245,11 +245,28 @@ impl MeshServicesPanel {
         })
         .on_press(crate::Message::MeshServices(Message::RefreshClicked));
 
+        // MOTION-NET-1 — surface the probe state through the canonical
+        // LoadState indicator instead of only the button's "Working…" label, so
+        // this panel reads async state the same way every other surface will.
+        let load = if self.busy {
+            if self.units.is_empty() {
+                mde_theme::LoadState::Loading
+            } else {
+                mde_theme::LoadState::Refreshing { stale: true }
+            }
+        } else if self.units.is_empty() && self.last_run_at.is_none() {
+            mde_theme::LoadState::Idle
+        } else {
+            mde_theme::LoadState::Loaded
+        };
+
         let header = row![
             column![title, subtitle].spacing(2),
             Space::new().width(Length::Fill),
+            crate::panel_chrome::load_state_indicator(load, palette),
             refresh_btn,
         ]
+        .spacing(8)
         .align_y(cosmic::iced::alignment::Vertical::Center);
 
         let mut units_col = column![].spacing(10);

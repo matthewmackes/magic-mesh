@@ -34,8 +34,8 @@ use mde_theme::{
     components::empty_state::{BODY_CTA_GAP, EMPTY_ICON_SIZE, HEADING_BODY_GAP, VERTICAL_PADDING},
     mde_icon,
     motion::dialog as dialog_tokens,
-    Density, EmptyState, FontSize, Icon, IconSize, Palette, Radii, Shadow as MdeShadow,
-    Space as MdeSpace, TypeRole,
+    Density, EmptyState, FontSize, Icon, IconSize, LoadState, Palette, Radii, Shadow as MdeShadow,
+    Space as MdeSpace, StateTone, TypeRole,
 };
 
 // CR-3.b — `object_card` extracted to `mde-iced-components` so
@@ -218,6 +218,37 @@ pub fn status_badge<'a, Message: 'a>(
         text_color: Some(fg),
     })
     .into()
+}
+
+/// MOTION-NET-1 — map the semantic [`StateTone`] onto the panel-chrome
+/// [`BadgeSeverity`] fill. Both are the shared Carbon severity ramp, so the
+/// mapping is 1:1.
+#[must_use]
+pub const fn badge_severity_for(tone: StateTone) -> BadgeSeverity {
+    match tone {
+        StateTone::Neutral => BadgeSeverity::Neutral,
+        StateTone::Info => BadgeSeverity::Info,
+        StateTone::Warning => BadgeSeverity::Warning,
+        StateTone::Danger => BadgeSeverity::Danger,
+        StateTone::Success => BadgeSeverity::Success,
+    }
+}
+
+/// MOTION-NET-1 — the canonical async-state indicator: a pill badge showing a
+/// [`LoadState`]'s distinct icon glyph + label, severity-tinted from its
+/// [`StateTone`]. The glyph + text carry the state (legible without motion and
+/// without relying on colour); the tint is a secondary cue. This is the shared
+/// renderer panels use instead of ad-hoc "Working…" strings, so every surface
+/// reads async state the same way.
+pub fn load_state_indicator<'a, Message: 'a>(
+    state: LoadState,
+    palette: Palette,
+) -> Element<'a, Message> {
+    status_badge(
+        format!("{} {}", state.icon(), state.label()),
+        badge_severity_for(state.tone()),
+        palette,
+    )
 }
 
 /// UX-6 — card surface. Wraps any content in a raised surface
@@ -737,6 +768,35 @@ mod tests {
     // (mesh_topology and future CR-4..CR-8 consumers reaching
     // through panel_chrome) keep working. This test asserts the
     // re-export path resolves.
+
+    #[test]
+    fn load_state_indicator_renders_every_state() {
+        // MOTION-NET-1 — the renderer constructs for all 7 states (the badge's
+        // glyph + label carry the distinction; the tone-mapped fill is secondary).
+        let palette = crate::live_theme::palette();
+        for s in [
+            LoadState::Idle,
+            LoadState::Loading,
+            LoadState::Refreshing { stale: true },
+            LoadState::Refreshing { stale: false },
+            LoadState::Degraded,
+            LoadState::Offline,
+            LoadState::Failed,
+            LoadState::Loaded,
+        ] {
+            let _: Element<'_, ()> = load_state_indicator(s, palette);
+        }
+        // The tone→severity map is total (a missing arm would fail to compile).
+        for t in [
+            StateTone::Neutral,
+            StateTone::Info,
+            StateTone::Warning,
+            StateTone::Danger,
+            StateTone::Success,
+        ] {
+            let _ = badge_severity_for(t);
+        }
+    }
 
     #[test]
     fn object_card_reexport_resolves() {
