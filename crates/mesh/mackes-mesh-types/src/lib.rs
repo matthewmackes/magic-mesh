@@ -43,6 +43,9 @@ pub mod route_trace;
 pub mod tags;
 /// VPN-GW-1 — the VPN tunnel definition model + pure wg-quick/openvpn helpers.
 pub mod vpn;
+/// VPN-GW-5 — provider adapters (5 named + generic paste-WG / import-.ovpn):
+/// pure TunnelDef/TunnelSecret construction + the API request-builders.
+pub mod vpn_provider;
 
 pub use connect::{BatterySnapshot, ConnectFacts, PairingState, PeerKind};
 pub use nebula::{NebulaFacts, NebulaRole};
