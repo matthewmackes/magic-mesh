@@ -503,29 +503,39 @@ pub fn load_state_pill<'a, Message: 'a>(
 /// `Refreshing{stale:true}`) — the panel renders its real data in those cases
 /// (optionally topped with a [`load_state_pill`]). `on_retry` wires the CTA for
 /// the recoverable states.
+///
+/// MOTION-NET-2 — the first-load `Loading` (and contentless `Refreshing`) arm
+/// renders the shared [`skeleton`] placeholder (greyed Carbon blocks + shimmer
+/// sweep) topped with the non-motion status pill, so a slow load shows
+/// layout-shaped structure instead of a blank panel. `now` drives the shimmer
+/// (advance it from a per-frame tick gated on the load being busy);
+/// `reduce_motion` collapses the sweep to static grey.
 pub fn load_state_chrome<'a, Message: Clone + 'a>(
     state: &LoadState,
     palette: Palette,
+    density: Density,
+    now: std::time::Instant,
+    reduce_motion: bool,
     on_retry: impl Fn() -> Message + 'a,
 ) -> Option<Element<'a, Message>> {
     match state {
         // Content-bearing — the caller renders its data, not chrome.
         LoadState::Loaded | LoadState::Degraded | LoadState::Refreshing { stale: true } => None,
         LoadState::Refreshing { stale: false } | LoadState::Loading => {
-            // First load with nothing to show yet — a centered activity row.
-            // The non-motion label keeps it legible; MOTION-NET-2's skeletons
-            // are the motion layer that lands over this.
+            // MOTION-NET-2 — first load with nothing to show yet: the shared
+            // skeleton + shimmer placeholder, topped with the non-motion status
+            // pill (legible with animation disabled). The skeleton is the motion
+            // layer over the MOTION-NET-1 pill.
+            let pill = container(load_state_pill::<Message>(state, palette))
+                .width(Length::Fill)
+                .align_x(alignment::Horizontal::Center);
             Some(
-                container(load_state_pill::<Message>(state, palette))
-                    .width(Length::Fill)
-                    .padding(Padding {
-                        top: VERTICAL_PADDING,
-                        right: 24.0,
-                        bottom: VERTICAL_PADDING,
-                        left: 24.0,
-                    })
-                    .align_x(alignment::Horizontal::Center)
-                    .into(),
+                column![
+                    pill,
+                    skeleton::<Message>(now, reduce_motion, palette, density),
+                ]
+                .spacing(f32::from(MdeSpace::for_density(density).md))
+                .into(),
             )
         }
         LoadState::Idle => {
@@ -548,6 +558,140 @@ pub fn load_state_chrome<'a, Message: Clone + 'a>(
         }
         LoadState::Failed(err) => Some(error_state(err.clone(), palette, on_retry)),
     }
+}
+
+// ---- MOTION-NET-2 — shared skeleton + shimmer placeholders --------------
+
+/// MOTION-NET-2 — number of placeholder rows the default skeleton paints. Enough
+/// to fill a typical panel viewport so a slow load never shows blank space.
+pub const SKELETON_ROW_COUNT: usize = 6;
+/// MOTION-NET-2 — height of one skeleton block (px). Reads as a data row.
+pub const SKELETON_BLOCK_HEIGHT: f32 = 16.0;
+/// MOTION-NET-2 — vertical gap between skeleton rows (px).
+pub const SKELETON_ROW_GAP: f32 = 12.0;
+
+/// Channel-wise lerp between two themed colors (`t` clamped to `0.0..=1.0`).
+/// Stays on palette tokens — no raw color constructor (§4).
+fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    Color {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: a.a + (b.a - a.a) * t,
+    }
+}
+
+/// MOTION-NET-2 — one greyed skeleton block with an animated shimmer sweep.
+/// The block's fill is the `palette.raised` base lerped toward the lighter
+/// `palette.overlay` highlight by the shimmer lift for its horizontal position
+/// `pos` (`0.0..=1.0`) at cycle `phase`. Under `reduce_motion` the lift is a flat
+/// `0.0` (static grey, no shimmer — the Q32 contract). `width`/`height` size the
+/// block.
+fn skeleton_block<'a, Message: 'a>(
+    width: Length,
+    height: f32,
+    pos: f32,
+    phase: f32,
+    reduce_motion: bool,
+    palette: Palette,
+) -> Element<'a, Message> {
+    let radii = Radii::defaults();
+    let base = palette.raised.into_cosmic_color();
+    let highlight = palette.overlay.into_cosmic_color();
+    let lift = mde_theme::animation::shimmer_lift(phase, pos, reduce_motion);
+    let fill = lerp_color(base, highlight, lift);
+    container(Space::new().width(width).height(Length::Fixed(height)))
+        .width(width)
+        .height(Length::Fixed(height))
+        .style(move |_theme| container::Style {
+            snap: false,
+            icon_color: None,
+            background: Some(Background::Color(fill)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: f32::from(radii.sm).into(),
+            },
+            shadow: IcedShadow::default(),
+            text_color: None,
+        })
+        .into()
+}
+
+/// MOTION-NET-2 — the shared **skeleton + shimmer** placeholder: a column of
+/// greyed Carbon blocks with a shimmer highlight sweeping across each row, so a
+/// slow first load shows layout-shaped structure instead of a blank panel or a
+/// bare "Loading…" string. `now` drives the sweep via a
+/// [`LoopingTween`](mde_theme::LoopingTween) over
+/// [`SHIMMER_PERIOD_MS`](mde_theme::motion::list::SHIMMER_PERIOD_MS); under
+/// `reduce_motion` the sweep is dropped and every block renders flat grey.
+///
+/// Each row's blocks are positioned along the placeholder width so the shimmer
+/// reads as one continuous diagonal-free left→right sheen. The caller feeds a
+/// `now` it advances from a per-frame tick (gated on the load being in flight,
+/// so an idle panel runs no animation — MOTION-PERF-1).
+pub fn skeleton<'a, Message: 'a>(
+    now: std::time::Instant,
+    reduce_motion: bool,
+    palette: Palette,
+    density: Density,
+) -> Element<'a, Message> {
+    use mde_theme::LoopingTween;
+    let space = MdeSpace::for_density(density);
+    // Anchor the looping clock to the process start so the phase is a pure
+    // function of `now` (the consumer needn't store a start Instant).
+    let period = std::time::Duration::from_millis(mde_theme::motion::list::SHIMMER_PERIOD_MS);
+    let phase = LoopingTween::starting_at(shimmer_epoch(), period).phase(now);
+
+    let mut col: Column<'a, Message, cosmic::Theme> = column![].spacing(SKELETON_ROW_GAP);
+    for i in 0..SKELETON_ROW_COUNT {
+        // A two-block row: a short "label" block + a longer "value" block,
+        // mirroring `data_row`'s 40/60 rhythm so the skeleton matches the
+        // eventual layout. Alternate the trailing width slightly so the rows
+        // don't look like a perfect rectangle grid.
+        let value_portion = if i % 2 == 0 { 50 } else { 35 };
+        let row_el = row![
+            skeleton_block(
+                Length::Fixed(96.0),
+                SKELETON_BLOCK_HEIGHT,
+                0.12,
+                phase,
+                reduce_motion,
+                palette,
+            ),
+            skeleton_block(
+                Length::FillPortion(value_portion),
+                SKELETON_BLOCK_HEIGHT,
+                0.7,
+                phase,
+                reduce_motion,
+                palette,
+            ),
+            Space::new().width(Length::FillPortion(100 - value_portion)),
+        ]
+        .spacing(f32::from(space.md))
+        .align_y(alignment::Vertical::Center);
+        col = col.push(row_el);
+    }
+    container(col)
+        .width(Length::Fill)
+        .padding(Padding {
+            top: VERTICAL_PADDING,
+            right: 24.0,
+            bottom: VERTICAL_PADDING,
+            left: 24.0,
+        })
+        .into()
+}
+
+/// Process-lifetime anchor for the shimmer's looping clock, so
+/// [`skeleton`]'s phase depends only on the `now` the caller passes (no
+/// per-panel start `Instant` to thread).
+fn shimmer_epoch() -> std::time::Instant {
+    use std::sync::OnceLock;
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    *EPOCH.get_or_init(std::time::Instant::now)
 }
 
 fn mde_shadow_to_iced(s: MdeShadow) -> IcedShadow {
@@ -937,21 +1081,49 @@ mod tests {
         // MOTION-NET-1 acceptance: each non-content state paints distinct
         // chrome; content-bearing states defer to the panel's own data view.
         let palette = crate::live_theme::palette();
+        let density = Density::Comfortable;
+        let now = std::time::Instant::now();
         let retry = || ();
+        let chrome =
+            |s: &LoadState| load_state_chrome::<()>(s, palette, density, now, false, retry);
 
         // Content-bearing → no chrome (panel renders its data).
-        assert!(load_state_chrome::<()>(&LoadState::Loaded, palette, retry).is_none());
-        assert!(load_state_chrome::<()>(&LoadState::Degraded, palette, retry).is_none());
-        assert!(
-            load_state_chrome::<()>(&LoadState::Refreshing { stale: true }, palette, retry)
-                .is_none()
-        );
+        assert!(chrome(&LoadState::Loaded).is_none());
+        assert!(chrome(&LoadState::Degraded).is_none());
+        assert!(chrome(&LoadState::Refreshing { stale: true }).is_none());
 
         // Non-content → chrome.
-        assert!(load_state_chrome::<()>(&LoadState::Idle, palette, retry).is_some());
-        assert!(load_state_chrome::<()>(&LoadState::Loading, palette, retry).is_some());
-        assert!(load_state_chrome::<()>(&LoadState::Offline, palette, retry).is_some());
-        assert!(load_state_chrome::<()>(&LoadState::Failed("io".into()), palette, retry).is_some());
+        assert!(chrome(&LoadState::Idle).is_some());
+        assert!(chrome(&LoadState::Loading).is_some());
+        assert!(chrome(&LoadState::Offline).is_some());
+        assert!(chrome(&LoadState::Failed("io".into())).is_some());
+    }
+
+    #[test]
+    fn skeleton_renders_with_and_without_reduce_motion() {
+        // MOTION-NET-2 — the shared skeleton constructs in both motion modes
+        // (the pure shimmer-phase math is unit-tested in mde-theme::animation).
+        let palette = crate::live_theme::palette();
+        let now = std::time::Instant::now();
+        let _: Element<'_, ()> = skeleton(now, false, palette, Density::Comfortable);
+        let _: Element<'_, ()> = skeleton(now, true, palette, Density::Comfortable);
+    }
+
+    #[test]
+    fn loading_chrome_carries_a_skeleton() {
+        // MOTION-NET-2 acceptance — the Loading arm returns chrome (the
+        // skeleton+pill), not None, so a slow load is never blank.
+        let palette = crate::live_theme::palette();
+        let now = std::time::Instant::now();
+        let c = load_state_chrome::<()>(
+            &LoadState::Loading,
+            palette,
+            Density::Comfortable,
+            now,
+            false,
+            || (),
+        );
+        assert!(c.is_some(), "Loading must paint skeleton chrome");
     }
 
     #[test]

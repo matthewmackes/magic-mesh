@@ -189,6 +189,63 @@ pub fn pulse_scale(phase: f32, max_scale: f32) -> f32 {
     lerp_f32(1.0, max_scale, smoothed)
 }
 
+/// MOTION-NET-2 — the shimmer **highlight intensity** `0.0..=1.0` for a point at
+/// normalized position `pos` (`0.0` = leftmost edge of the placeholder, `1.0` =
+/// rightmost) given the current cycle `phase` (`0.0..=1.0`, from a
+/// [`LoopingTween::phase`] over [`crate::motion::list::SHIMMER_PERIOD_MS`]).
+///
+/// The highlight is a soft band that sweeps left→right once per cycle: it peaks
+/// (`1.0`) where the band center coincides with `pos`, falling off smoothly to
+/// `0.0` for points more than [`SHIMMER_BAND_HALF_WIDTH`] away. The band center
+/// travels from before the left edge to past the right edge so every column
+/// gets swept exactly once per cycle (no abrupt wrap discontinuity).
+///
+/// Pure math — no toolkit dep; the consumer maps the returned intensity to a
+/// lightened tint over the skeleton's base grey ([`lerp_f32`] / a color lerp).
+#[must_use]
+pub fn shimmer_highlight(phase: f32, pos: f32) -> f32 {
+    let phase = phase.clamp(0.0, 1.0);
+    let pos = pos.clamp(0.0, 1.0);
+    // Sweep the band center across `[-half, 1 + half]` so the band enters from
+    // off the left edge and fully exits past the right edge within one cycle.
+    let span = 1.0 + 2.0 * SHIMMER_BAND_HALF_WIDTH;
+    let center = -SHIMMER_BAND_HALF_WIDTH + phase * span;
+    let dist = (pos - center).abs();
+    if dist >= SHIMMER_BAND_HALF_WIDTH {
+        0.0
+    } else {
+        // Smooth cosine falloff: 1.0 at the center → 0.0 at the band edge.
+        let x = dist / SHIMMER_BAND_HALF_WIDTH; // 0..1
+        let intensity = 0.5 * (1.0 + (std::f32::consts::PI * x).cos());
+        intensity.clamp(0.0, 1.0)
+    }
+}
+
+/// MOTION-NET-2 — half-width of the shimmer highlight band in normalized
+/// placeholder-width units. A point further than this from the band center gets
+/// no highlight. ~0.35 gives a band ~70 % of the placeholder width — broad
+/// enough to read as a soft sheen rather than a hard line.
+pub const SHIMMER_BAND_HALF_WIDTH: f32 = 0.35;
+
+/// MOTION-NET-2 — peak extra lightness the shimmer adds over the skeleton's base
+/// grey, as a `0.0..=1.0` lerp factor toward the highlight color. Kept subtle
+/// (Carbon skeleton shimmer is a gentle sheen, not a flash).
+pub const SHIMMER_PEAK_LIFT: f32 = 0.45;
+
+/// MOTION-NET-2 — the per-column lift factor (`0.0..=1.0`) to lerp the skeleton
+/// base toward its highlight color, for a column at normalized position `pos`.
+/// With `reduce_motion` the sweep is dropped entirely and a flat `0.0` is
+/// returned (static grey, no shimmer — the Q32/reduce-motion contract). `phase`
+/// is the current cycle phase from a [`LoopingTween`].
+#[must_use]
+pub fn shimmer_lift(phase: f32, pos: f32, reduce_motion: bool) -> f32 {
+    if reduce_motion {
+        0.0
+    } else {
+        shimmer_highlight(phase, pos) * SHIMMER_PEAK_LIFT
+    }
+}
+
 /// MOTION-INFRA-2 — the standard shell transition kinds. Each maps an eased
 /// progress `t` (0→1, from [`Animator::value`]) to concrete [`RenderParams`] the
 /// consumer applies to its themed widget (alpha → a container/text color alpha,
@@ -624,6 +681,81 @@ mod tests {
         let peak = pulse_scale(0.5, PULSE_MAX_SCALE);
         assert!(peak > 1.10, "peak should be near 1.15 max, got {peak}");
         assert!(peak <= PULSE_MAX_SCALE + 1e-4);
+    }
+
+    // ── MOTION-NET-2 — shimmer-phase math ─────────────────────────────────
+
+    #[test]
+    fn shimmer_highlight_is_bounded_and_zero_far_from_band() {
+        // Intensity is always in [0,1]; a column far from the sweeping band
+        // gets no highlight.
+        for i in 0..=10 {
+            let phase = i as f32 / 10.0;
+            for j in 0..=10 {
+                let pos = j as f32 / 10.0;
+                let h = shimmer_highlight(phase, pos);
+                assert!((0.0..=1.0).contains(&h), "h={h} out of range");
+            }
+        }
+        // At phase 0 the band center sits at -half (off the left edge), so the
+        // far-right column is well outside the band → no highlight.
+        assert_eq!(shimmer_highlight(0.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn shimmer_highlight_sweeps_left_to_right() {
+        // Early in the cycle the left edge is brighter than the right; late in
+        // the cycle the right edge is brighter than the left — i.e. the band
+        // moves left→right across the placeholder.
+        let early = (shimmer_highlight(0.2, 0.0), shimmer_highlight(0.2, 1.0));
+        assert!(
+            early.0 > early.1,
+            "early sweep should favor the left: {early:?}"
+        );
+        let late = (shimmer_highlight(0.8, 0.0), shimmer_highlight(0.8, 1.0));
+        assert!(
+            late.1 > late.0,
+            "late sweep should favor the right: {late:?}"
+        );
+    }
+
+    #[test]
+    fn shimmer_highlight_peaks_when_band_center_hits_the_column() {
+        // The band center travels [-half, 1+half] across phase 0..1, so for a
+        // mid column (pos=0.5) the center coincides at phase 0.5 → near-peak.
+        let peak = shimmer_highlight(0.5, 0.5);
+        assert!(peak > 0.9, "center hit should be ~1.0, got {peak}");
+        // Off to either side of that phase the same column is dimmer.
+        assert!(shimmer_highlight(0.3, 0.5) < peak);
+        assert!(shimmer_highlight(0.7, 0.5) < peak);
+    }
+
+    #[test]
+    fn shimmer_lift_drops_to_static_under_reduce_motion() {
+        // Reduce-motion contract: no sweep at all — a flat 0 lift (static grey)
+        // at every phase/position.
+        for i in 0..=10 {
+            let phase = i as f32 / 10.0;
+            for j in 0..=10 {
+                let pos = j as f32 / 10.0;
+                assert_eq!(
+                    shimmer_lift(phase, pos, true),
+                    0.0,
+                    "reduce_motion must be flat grey"
+                );
+            }
+        }
+        // With motion on, the peak lift never exceeds the SHIMMER_PEAK_LIFT cap.
+        let lift = shimmer_lift(0.5, 0.5, false);
+        assert!(lift > 0.0, "motion-on must shimmer");
+        assert!(lift <= SHIMMER_PEAK_LIFT + 1e-6, "lift {lift} exceeds cap");
+    }
+
+    #[test]
+    fn shimmer_clamps_out_of_range_inputs() {
+        // Defensive: out-of-range phase/pos never panics or escapes [0,1].
+        assert!((0.0..=1.0).contains(&shimmer_highlight(-1.0, 2.0)));
+        assert!((0.0..=1.0).contains(&shimmer_highlight(2.0, -1.0)));
     }
 
     #[test]

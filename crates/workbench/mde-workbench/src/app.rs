@@ -613,6 +613,13 @@ impl App {
                     .map(|_| Message::Lighthouses(lighthouses_panel::Message::Refresh)),
             );
         }
+        // MOTION-NET-2 — the first-load skeleton shimmer ticks ONLY while the
+        // Fleet rollup is the active view AND its skeleton is on screen (a first
+        // load with nothing to show yet). At rest / once data lands the loop
+        // stops (no idle animation — MOTION-PERF-1).
+        if self.view.panel_slug() == Some("fleet_rollup") && self.fleet_rollup.skeleton_visible() {
+            subs.push(fleet_rollup_panel::FleetRollupPanel::shimmer_subscription());
+        }
         // PD-8 (L14) / PLANES-1 — Netdata sampling only while the Peers
         // directory is the active view (the Compute pattern). The Front
         // Door is reachable as the Peers plane root/panel or the

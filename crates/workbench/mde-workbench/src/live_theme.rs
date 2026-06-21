@@ -11,12 +11,9 @@ use std::sync::RwLock;
 use mde_theme::{Density, Palette, Preferences, Theme, Tokens};
 
 static TOKENS: RwLock<Option<Tokens>> = RwLock::new(None);
-
-/// MOTION-FEEDBACK-1 — process-wide reduce-motion flag, resolved once from the
-/// persisted [`Preferences`] (or the `MDE_REDUCE_MOTION` env in `load()`).
-/// Lets the shared control builders honor the reduce-motion contract from a
-/// single source — the same "read a global in `view()`" pattern as
-/// [`palette()`], so no per-call-site threading through 100+ button sites.
+/// MOTION-* — the live reduce-motion flag, resolved once from the persisted
+/// preferences (same lazy-init contract as [`TOKENS`]), so a `view()` reading it
+/// every frame never hits the filesystem.
 static REDUCE_MOTION: RwLock<Option<bool>> = RwLock::new(None);
 
 /// Resolve from the persisted preferences (first read only).
@@ -46,29 +43,22 @@ pub fn palette() -> Palette {
     tokens().palette
 }
 
-/// MOTION-FEEDBACK-1 — the live reduce-motion flag the shared control builders
-/// read to honor the Q32 contract (state changes without movement). Lazily
-/// resolved from the persisted [`Preferences`]; never panics (a poisoned lock
-/// falls back to the preference-resolved value).
+/// MOTION-* — the live reduce-motion preference. Lazily resolved from
+/// `~/.config/mde/preferences.toml` (first read), cached process-wide so motion
+/// consumers (the MOTION-NET-2 skeleton shimmer, etc.) can read it per frame
+/// without a filesystem hit. Never panics (a poisoned lock falls back to the
+/// preference-resolved value).
 pub fn reduce_motion() -> bool {
     if let Ok(guard) = REDUCE_MOTION.read() {
-        if let Some(v) = *guard {
-            return v;
+        if let Some(rm) = *guard {
+            return rm;
         }
     }
-    let v = Preferences::load().a11y.reduce_motion;
+    let rm = Preferences::load().a11y.reduce_motion;
     if let Ok(mut guard) = REDUCE_MOTION.write() {
-        *guard = Some(v);
+        *guard = Some(rm);
     }
-    v
-}
-
-/// MOTION-FEEDBACK-1 — override the live reduce-motion flag (the a11y panel
-/// applies it; tests flip it freely). Persistence is the caller's job.
-pub fn set_reduce_motion(value: bool) {
-    if let Ok(mut guard) = REDUCE_MOTION.write() {
-        *guard = Some(value);
-    }
+    rm
 }
 
 /// Swap the live theme/density. The next render pass repaints with

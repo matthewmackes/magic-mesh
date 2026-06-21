@@ -77,7 +77,7 @@ pub fn health_severity(worst: &str) -> BadgeSeverity {
 }
 
 /// The Fleet-rollup panel state.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FleetRollupPanel {
     pub rollup: Rollup,
     /// W81 — peer rows feeding the live-map centerpiece.
@@ -93,6 +93,25 @@ pub struct FleetRollupPanel {
     /// `Failed` (never the misleading "No enrolled nodes yet" empty state).
     pub load: LoadState,
     pub status: String,
+    /// MOTION-NET-2 — the clock the first-load skeleton shimmer reads. A
+    /// `ShimmerTick` (registered only while the load is busy) refreshes it each
+    /// frame so the shimmer sweep advances; at rest it's never ticked (no idle
+    /// animation — MOTION-PERF-1).
+    pub shimmer_now: std::time::Instant,
+}
+
+impl Default for FleetRollupPanel {
+    fn default() -> Self {
+        Self {
+            rollup: Rollup::default(),
+            rows: Vec::new(),
+            rtt: HashMap::new(),
+            self_hostname: String::new(),
+            load: LoadState::default(),
+            status: String::new(),
+            shimmer_now: std::time::Instant::now(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +126,9 @@ pub enum Message {
     /// non-zero exit / parse error) so the view can render the error state.
     LoadError(String),
     RefreshClicked,
+    /// MOTION-NET-2 — per-frame tick that advances the first-load skeleton
+    /// shimmer. Registered only while the load is busy ([`subscription`]).
+    ShimmerTick,
 }
 
 impl FleetRollupPanel {
@@ -192,7 +214,31 @@ impl FleetRollupPanel {
                 self.status = "Refreshing…".into();
                 Self::load()
             }
+            Message::ShimmerTick => {
+                // MOTION-NET-2 — advance the first-load skeleton's shimmer clock.
+                self.shimmer_now = std::time::Instant::now();
+                Task::none()
+            }
         }
+    }
+
+    /// MOTION-NET-2 — the skeleton-shimmer animation tick, registered by
+    /// `App::subscription` ONLY while a first load is in flight with no content
+    /// to show (so the shimmer animates exactly when the skeleton is visible;
+    /// an idle or content-bearing panel runs no loop — MOTION-PERF-1). One tick
+    /// per ~60 ms frame keeps the sweep smooth.
+    #[must_use]
+    pub fn shimmer_subscription() -> cosmic::iced::Subscription<crate::Message> {
+        cosmic::iced::time::every(std::time::Duration::from_millis(60))
+            .map(|_| crate::Message::FleetRollup(Message::ShimmerTick))
+    }
+
+    /// MOTION-NET-2 — true while the first-load skeleton is on screen (a load is
+    /// in flight and there's nothing to show yet), so the App can gate the
+    /// shimmer tick on it.
+    #[must_use]
+    pub fn skeleton_visible(&self) -> bool {
+        self.load.is_busy() && !self.load.has_content()
     }
 
     pub fn view(&self) -> Element<'_, crate::Message> {
@@ -210,9 +256,18 @@ impl FleetRollupPanel {
         // non-content state (Failed → error+retry, never the misleading "No
         // enrolled nodes yet" empty state). Content-bearing states (Loaded /
         // Degraded / Refreshing-over-stale) fall through to the data view.
-        if let Some(chrome) = load_state_chrome(&self.load, palette, || {
-            crate::Message::FleetRollup(Message::RefreshClicked)
-        }) {
+        // MOTION-NET-2 — a first `Loading` (nothing to show yet) paints the
+        // shared skeleton + shimmer placeholder, so a slow fleet-status run shows
+        // layout-shaped structure instead of a blank panel. `shimmer_now` is
+        // advanced by `ShimmerTick` while busy; `reduce_motion` ⇒ static grey.
+        if let Some(chrome) = load_state_chrome(
+            &self.load,
+            palette,
+            density,
+            self.shimmer_now,
+            crate::live_theme::reduce_motion(),
+            || crate::Message::FleetRollup(Message::RefreshClicked),
+        ) {
             return panel_container(chrome, density);
         }
 
@@ -415,5 +470,37 @@ mod tests {
         let _ = p.update(Message::LoadError("fleet-status exit 1".into()));
         assert!(p.load.is_failed());
         assert_eq!(p.load.error(), Some("fleet-status exit 1"));
+    }
+
+    #[test]
+    fn skeleton_visible_only_during_a_first_load() {
+        // MOTION-NET-2 — the shimmer tick is gated on this: the skeleton shows
+        // exactly when a load is in flight with nothing to display yet.
+        let mut p = FleetRollupPanel::new();
+        assert!(!p.skeleton_visible(), "idle ⇒ no skeleton");
+        let _ = p.update(Message::RefreshClicked); // Idle → Loading
+        assert!(p.skeleton_visible(), "first load ⇒ skeleton");
+        // A refresh over existing data keeps the cards (stale), not a skeleton.
+        p.load = LoadState::Loaded;
+        let _ = p.update(Message::RefreshClicked); // Loaded → Refreshing{stale}
+        assert_eq!(p.load, LoadState::Refreshing { stale: true });
+        assert!(
+            !p.skeleton_visible(),
+            "stale-refresh keeps content, no skeleton"
+        );
+        // Settled.
+        p.load = LoadState::Loaded;
+        assert!(!p.skeleton_visible());
+    }
+
+    #[test]
+    fn shimmer_tick_advances_the_clock() {
+        // MOTION-NET-2 — a ShimmerTick refreshes the skeleton's animation clock
+        // so the sweep progresses frame to frame.
+        let mut p = FleetRollupPanel::new();
+        let before = p.shimmer_now;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _ = p.update(Message::ShimmerTick);
+        assert!(p.shimmer_now > before, "tick must advance the clock");
     }
 }
