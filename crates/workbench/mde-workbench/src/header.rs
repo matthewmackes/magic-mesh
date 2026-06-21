@@ -215,19 +215,27 @@ fn control_button<'a, Message: Clone + 'a>(
         .align_x(alignment::Horizontal::Center)
         .align_y(alignment::Vertical::Center);
 
+    let accent = palette.accent.into_cosmic_color();
+    let reduce_motion = crate::live_theme::reduce_motion();
     let style = move |_theme: &cosmic::Theme, status: ButtonStatus| {
-        let bg: Color = match status {
-            ButtonStatus::Hovered if accent_close => Color {
+        use crate::controls::{Feedback, FeedbackStyle};
+        // MOTION-FEEDBACK-1 — toolbar/window controls share the same hover-lift
+        // / press wash as every other control (the previous bespoke
+        // hover_tint/active_tint match is exactly what the shared resolver
+        // produces over a transparent base). The destructive "close" button
+        // keeps its danger-red hover override.
+        let fx = FeedbackStyle::resolve(Feedback::from_status(status), reduce_motion);
+        let bg: Color = if accent_close && matches!(status, ButtonStatus::Hovered) {
+            Color {
                 a: 0.85,
                 ..palette.danger.into_cosmic_color()
-            },
-            ButtonStatus::Hovered => palette.hover_tint().into_cosmic_color(),
-            ButtonStatus::Pressed => palette.active_tint().into_cosmic_color(),
-            _ => Color::TRANSPARENT,
+            }
+        } else {
+            fx.tinted_bg(Color::TRANSPARENT, accent)
         };
         let text_color = match (status, accent_close) {
             (ButtonStatus::Hovered, true) => Color::WHITE,
-            (ButtonStatus::Hovered, false) => palette.accent.into_cosmic_color(),
+            (ButtonStatus::Hovered, false) => accent,
             _ => palette.text_muted.into_cosmic_color(),
         };
         let border = Border {
@@ -244,7 +252,7 @@ fn control_button<'a, Message: Clone + 'a>(
             border_width: border.width,
             border_radius: border.radius,
             border,
-            shadow: Shadow::default(),
+            shadow: fx.iced_shadow(),
         }
     };
 
