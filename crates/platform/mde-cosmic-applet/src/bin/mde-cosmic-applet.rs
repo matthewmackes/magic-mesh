@@ -258,13 +258,12 @@ impl Application for Applet {
         let btn = cosmic::widget::button::custom(content)
             .on_press(Message::Toggle)
             .class(cosmic::theme::Button::AppletIcon);
-        Element::from(self.core.applet.applet_tooltip::<Message>(
-            btn,
-            "Notifications — click to open the Action Center".to_string(),
-            false,
-            |_| Message::Toggle,
-            None,
-        ))
+        // NOTIFY-CLICK (operator 2026-06-20) — mirror APPS-MOUSE-FIX on the Apps
+        // menu: the bell is plain click-to-toggle. The old `applet_tooltip`
+        // wrapper added a hover subsurface whose `|_| Message::Toggle` callback
+        // OPENED the Action Center on mouseover; dropped so the bell (like the
+        // Apps menu) opens only on click — never on hover.
+        Element::from(btn)
     }
 
     fn view_window(&self, _id: Id) -> Element<'_, Message> {

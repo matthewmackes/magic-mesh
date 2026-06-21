@@ -26,16 +26,16 @@ use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, Preferences, Rgba, 
 const ID: &str = "com.mackes.MagicMeshApps";
 
 /// APPS-WIDE (operator 2026-06-18) — the launcher dropdown was a golden
-/// rectangle (920 × 920/φ). APPS-FIT (operator 2026-06-19) supersedes that: the
-/// dropdown now sizes to the desktop — **width = 33% of the output's logical
-/// width**, **height the same fraction of its height**, so the rectangle keeps
-/// the desktop's own aspect ratio ("matching the Ratio") and scales to any
-/// resolution. The golden rectangle below is only the fallback when the
-/// resolution can't be detected.
+/// rectangle (920 × 920/φ). APPS-FIT-2 (operator 2026-06-20) supersedes the
+/// earlier APPS-FIT: **width = 33.3% of the output's logical width** (a third of
+/// the resolution) and **height = the Magic ratio (golden ratio) off that width**
+/// — so the dropdown is a golden rectangle scaled to any resolution, rather than
+/// matching the desktop's own aspect. The fallback below is the same golden
+/// rectangle used when the resolution can't be detected.
 const GOLDEN_RATIO: f32 = 1.618;
-/// APPS-FIT — the dropdown's width as a fraction of the desktop's logical width
-/// (and its height as the same fraction of the desktop height).
-const MENU_SCREEN_FRACTION: f32 = 0.33;
+/// APPS-FIT-2 — the dropdown's width as a fraction of the desktop's logical
+/// width (a third of the resolution); the height follows from GOLDEN_RATIO.
+const MENU_SCREEN_FRACTION: f32 = 0.333;
 /// APPS-FIT — fallback dropdown size (the prior APPS-WIDE golden rectangle) used
 /// when `cosmic-randr` can't report the output resolution.
 const FALLBACK_MENU_WIDTH: f32 = 920.0;
@@ -57,10 +57,11 @@ fn detect_menu_size() -> (f32, f32) {
         .unwrap_or((FALLBACK_MENU_WIDTH, FALLBACK_MENU_HEIGHT))
 }
 
-/// APPS-FIT — pure parser for `cosmic-randr list --kdl`. Returns the launcher
-/// size (`MENU_SCREEN_FRACTION` of the output's logical width × height) for the
-/// output named `target` (or the first enabled output with a current mode when
-/// `target` is empty / not found). The KDL shape (from cosmic-randr's
+/// APPS-FIT-2 — pure parser for `cosmic-randr list --kdl`. Returns the launcher
+/// size (width = `MENU_SCREEN_FRACTION` of the output's logical width; height =
+/// that width ÷ `GOLDEN_RATIO`) for the output named `target` (or the first
+/// enabled output with a current mode when `target` is empty / not found). The
+/// KDL shape (from cosmic-randr's
 /// `list_kdl`) is:
 /// ```text
 /// output "DP-1" enabled=#true {
@@ -138,7 +139,11 @@ fn parse_menu_size_from_kdl(kdl: &str, target: &str) -> Option<(f32, f32)> {
     if lw <= 0.0 || lh <= 0.0 {
         return None;
     }
-    Some((lw * MENU_SCREEN_FRACTION, lh * MENU_SCREEN_FRACTION))
+    // APPS-FIT-2 — width = a third of the resolution; height = the Magic
+    // (golden) ratio off that width, so the dropdown is a golden rectangle at
+    // any resolution. (`lh` is parsed only to validate a real current mode.)
+    let w = lw * MENU_SCREEN_FRACTION;
+    Some((w, w / GOLDEN_RATIO))
 }
 /// APPS-WIDE — Favorites icon-grid shape (operator 2026-06-18): exactly 3 tiles
 /// per row, capped at 9 (a 3×3 grid), mirroring the Workbench/Files/Settings
@@ -1742,7 +1747,7 @@ impl AppsApplet {
 
 #[cfg(test)]
 mod apps_fit_tests {
-    use super::{parse_menu_size_from_kdl, MENU_SCREEN_FRACTION};
+    use super::{parse_menu_size_from_kdl, GOLDEN_RATIO, MENU_SCREEN_FRACTION};
 
     const SAMPLE: &str = r#"output "DP-1" enabled=#true {
   description model="Test"
@@ -1768,9 +1773,11 @@ output "HDMI-A-1" enabled=#false {
 
     #[test]
     fn picks_named_output_current_mode_at_fraction() {
+        // APPS-FIT-2: width = a third of the resolution; height = the Magic
+        // (golden) ratio off that width — independent of the screen height.
         let (w, h) = parse_menu_size_from_kdl(SAMPLE, "DP-1").unwrap();
         approx(w, 2560.0 * MENU_SCREEN_FRACTION);
-        approx(h, 1440.0 * MENU_SCREEN_FRACTION);
+        approx(h, (2560.0 * MENU_SCREEN_FRACTION) / GOLDEN_RATIO);
     }
 
     #[test]
@@ -1783,9 +1790,9 @@ output "HDMI-A-1" enabled=#false {
 }
 "#;
         let (w, h) = parse_menu_size_from_kdl(kdl, "DP-1").unwrap();
-        // logical = 1280x720, then 33%.
+        // logical = 1280x720, then width = 33.3%, height = width / φ.
         approx(w, 1280.0 * MENU_SCREEN_FRACTION);
-        approx(h, 720.0 * MENU_SCREEN_FRACTION);
+        approx(h, (1280.0 * MENU_SCREEN_FRACTION) / GOLDEN_RATIO);
     }
 
     #[test]
