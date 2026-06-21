@@ -12,8 +12,8 @@
 
 use std::collections::HashMap;
 
-use cosmic::iced::widget::{column, container, row, scrollable, text};
-use cosmic::iced::{Length, Padding, Task};
+use cosmic::iced::widget::{column, row, scrollable, text};
+use cosmic::iced::{Length, Task};
 use cosmic::Element;
 use mde_theme::{EmptyState, Icon};
 use serde::Deserialize;
@@ -22,7 +22,8 @@ use mde_theme::LoadState;
 
 use crate::controls::{variant_button, ButtonVariant};
 use crate::panel_chrome::{
-    empty_state, load_state_chrome, load_state_pill, panel_container, status_badge, BadgeSeverity,
+    empty_state, load_state_chrome, load_state_pill, panel_container, selectable_card,
+    staggered_reveal, status_badge, BadgeSeverity,
 };
 use crate::panels::fleet_settings::run_mackesd;
 use crate::panels::peers::{parse_directory, PeerRow};
@@ -98,6 +99,16 @@ pub struct FleetRollupPanel {
     /// frame so the shimmer sweep advances; at rest it's never ticked (no idle
     /// animation — MOTION-PERF-1).
     pub shimmer_now: std::time::Instant,
+    /// MOTION-FEEDBACK-2 — the role card the operator has selected (its `role`
+    /// token), painted with the Carbon -selected accent wash + selection rail.
+    /// `None` = nothing selected. A click toggles it.
+    pub selected_role: Option<String>,
+    /// MOTION-FEEDBACK-2 — when the staggered card-reveal cascade began (set on
+    /// each `Loaded`). `reveal_now - reveal_start` is the cascade's elapsed time;
+    /// the `RevealTick` advances `reveal_now` only while the cascade is in flight
+    /// (idle-gated — MOTION-PERF-1), then stops.
+    pub reveal_start: std::time::Instant,
+    pub reveal_now: std::time::Instant,
 }
 
 impl Default for FleetRollupPanel {
@@ -110,6 +121,9 @@ impl Default for FleetRollupPanel {
             load: LoadState::default(),
             status: String::new(),
             shimmer_now: std::time::Instant::now(),
+            selected_role: None,
+            reveal_start: std::time::Instant::now(),
+            reveal_now: std::time::Instant::now(),
         }
     }
 }
@@ -129,6 +143,12 @@ pub enum Message {
     /// MOTION-NET-2 — per-frame tick that advances the first-load skeleton
     /// shimmer. Registered only while the load is busy ([`subscription`]).
     ShimmerTick,
+    /// MOTION-FEEDBACK-2 — select (or toggle off) a role card. Paints the
+    /// Carbon -selected accent wash + rail on the matching card.
+    SelectRole(String),
+    /// MOTION-FEEDBACK-2 — per-frame tick advancing the staggered card-reveal
+    /// cascade. Registered only while the cascade is in flight (idle-gated).
+    RevealTick,
 }
 
 impl FleetRollupPanel {
@@ -196,6 +216,19 @@ impl FleetRollupPanel {
                 self.self_hostname = self_hostname;
                 self.load = self.load.clone().on_loaded();
                 self.status.clear();
+                // MOTION-FEEDBACK-2 — kick off the staggered card reveal: the
+                // cards cascade in over the next ≤500ms. App::subscription gates
+                // the `RevealTick` on `revealing()`, so the loop stops the moment
+                // the last card settles (no idle animation — MOTION-PERF-1).
+                let now = std::time::Instant::now();
+                self.reveal_start = now;
+                self.reveal_now = now;
+                // Drop a selection that no longer maps to a present role.
+                if let Some(sel) = &self.selected_role {
+                    if !self.rollup.groups.iter().any(|g| &g.role == sel) {
+                        self.selected_role = None;
+                    }
+                }
                 Task::none()
             }
             Message::LoadError(e) => {
@@ -219,6 +252,21 @@ impl FleetRollupPanel {
                 self.shimmer_now = std::time::Instant::now();
                 Task::none()
             }
+            Message::SelectRole(role) => {
+                // MOTION-FEEDBACK-2 — toggle selection: re-clicking the selected
+                // card clears it. Selection is local view state (no reload).
+                self.selected_role = if self.selected_role.as_deref() == Some(role.as_str()) {
+                    None
+                } else {
+                    Some(role)
+                };
+                Task::none()
+            }
+            Message::RevealTick => {
+                // MOTION-FEEDBACK-2 — advance the staggered reveal clock.
+                self.reveal_now = std::time::Instant::now();
+                Task::none()
+            }
         }
     }
 
@@ -239,6 +287,41 @@ impl FleetRollupPanel {
     #[must_use]
     pub fn skeleton_visible(&self) -> bool {
         self.load.is_busy() && !self.load.has_content()
+    }
+
+    /// MOTION-FEEDBACK-2 — elapsed ms since the staggered reveal cascade began.
+    #[must_use]
+    fn reveal_elapsed_ms(&self) -> u32 {
+        u32::try_from(
+            self.reveal_now
+                .saturating_duration_since(self.reveal_start)
+                .as_millis(),
+        )
+        .unwrap_or(u32::MAX)
+    }
+
+    /// MOTION-FEEDBACK-2 — the staggered card-reveal tick, registered by
+    /// `App::subscription` ONLY while [`revealing`](Self::revealing) is true, so
+    /// the cascade animates exactly while cards are arriving and the loop stops
+    /// the instant the last card settles (no idle animation — MOTION-PERF-1).
+    #[must_use]
+    pub fn reveal_subscription() -> cosmic::iced::Subscription<crate::Message> {
+        cosmic::iced::time::every(std::time::Duration::from_millis(60))
+            .map(|_| crate::Message::FleetRollup(Message::RevealTick))
+    }
+
+    /// MOTION-FEEDBACK-2 — true while the card-reveal cascade is still in flight
+    /// (some card hasn't finished revealing), so the App can gate the reveal
+    /// tick on it. Always false under reduce-motion (the cascade collapses).
+    #[must_use]
+    pub fn revealing(&self) -> bool {
+        // Only meaningful when content is actually on screen (not during the
+        // skeleton/loading chrome).
+        self.load.has_content()
+            && mde_theme::stagger::is_animating(
+                self.reveal_elapsed_ms(),
+                crate::live_theme::reduce_motion(),
+            )
     }
 
     pub fn view(&self) -> Element<'_, crate::Message> {
@@ -287,8 +370,16 @@ impl FleetRollupPanel {
             );
         }
 
+        // MOTION-FEEDBACK-2 — selection + staggered reveal for the role-card
+        // list. Each card is a `selectable_card` (Carbon -selected/-hover accent
+        // wash + selection rail), wrapped in `staggered_reveal` so a freshly
+        // loaded fleet cascades its cards in (capped, ≤500ms total) instead of
+        // snapping. `reveal_elapsed_ms` drives the cascade; `reduce_motion` ⇒ the
+        // whole list reveals at once (selection still works).
+        let reveal_ms = self.reveal_elapsed_ms();
+        let reduce_motion = crate::live_theme::reduce_motion();
         let mut cards = column![].spacing(10);
-        for g in &self.rollup.groups {
+        for (i, g) in self.rollup.groups.iter().enumerate() {
             let breakdown = text(format!(
                 "{} healthy · {} degraded · {} unreachable · {} unknown",
                 g.healthy, g.degraded, g.unreachable, g.unknown
@@ -302,33 +393,38 @@ impl FleetRollupPanel {
                 Some(crate::Message::DrillToPeers(g.role.clone())),
                 palette,
             );
-            cards = cards.push(
-                container(
-                    row![
-                        column![
-                            text(format!(
-                                "{}  ({} member{})",
-                                g.role,
-                                g.total,
-                                if g.total == 1 { "" } else { "s" }
-                            ))
-                            .size(16),
-                            breakdown,
-                        ]
-                        .spacing(2),
-                        status_badge(
-                            g.worst_health.clone(),
-                            health_severity(&g.worst_health),
-                            palette
-                        ),
-                        cosmic::iced::widget::Space::new().width(Length::Fill),
-                        drill,
-                    ]
-                    .spacing(12)
-                    .align_y(cosmic::iced::Alignment::Center),
-                )
-                .padding(Padding::from(12)),
+            let body: Element<'_, crate::Message> = row![
+                column![
+                    text(format!(
+                        "{}  ({} member{})",
+                        g.role,
+                        g.total,
+                        if g.total == 1 { "" } else { "s" }
+                    ))
+                    .size(16),
+                    breakdown,
+                ]
+                .spacing(2),
+                status_badge(
+                    g.worst_health.clone(),
+                    health_severity(&g.worst_health),
+                    palette
+                ),
+                cosmic::iced::widget::Space::new().width(Length::Fill),
+                drill,
+            ]
+            .spacing(12)
+            .align_y(cosmic::iced::Alignment::Center)
+            .into();
+            let selected = self.selected_role.as_deref() == Some(g.role.as_str());
+            let card = selectable_card(
+                body,
+                selected,
+                crate::Message::FleetRollup(Message::SelectRole(g.role.clone())),
+                palette,
+                density,
             );
+            cards = cards.push(staggered_reveal(card, i, reveal_ms, reduce_motion));
         }
 
         // W81 — the live-map centerpiece: the same PD-7 force-graph the
@@ -502,5 +598,93 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         let _ = p.update(Message::ShimmerTick);
         assert!(p.shimmer_now > before, "tick must advance the clock");
+    }
+
+    #[test]
+    fn select_role_toggles_and_clears_on_reselect() {
+        // MOTION-FEEDBACK-2 — clicking a role card selects it; re-clicking the
+        // same card clears the selection; clicking another switches.
+        let mut p = FleetRollupPanel::new();
+        assert_eq!(p.selected_role, None);
+        let _ = p.update(Message::SelectRole("host".into()));
+        assert_eq!(p.selected_role.as_deref(), Some("host"));
+        let _ = p.update(Message::SelectRole("lighthouse".into()));
+        assert_eq!(p.selected_role.as_deref(), Some("lighthouse"));
+        let _ = p.update(Message::SelectRole("lighthouse".into()));
+        assert_eq!(p.selected_role, None, "re-click clears");
+    }
+
+    #[test]
+    fn loaded_drops_a_selection_no_longer_present() {
+        // MOTION-FEEDBACK-2 — a reload that no longer contains the selected role
+        // must drop the stale selection (it can't paint a card that's gone).
+        let mut p = FleetRollupPanel::new();
+        p.selected_role = Some("gone".into());
+        let _ = p.update(Message::Loaded {
+            rollup: parse_rollup(
+                r#"{"total":1,"groups":[{"role":"host","total":1,"worst_health":"healthy"}]}"#,
+            ),
+            rows: Vec::new(),
+            rtt: HashMap::new(),
+            self_hostname: "pine".into(),
+        });
+        assert_eq!(p.selected_role, None, "stale selection dropped");
+        // A selection that still maps survives.
+        p.selected_role = Some("host".into());
+        let _ = p.update(Message::Loaded {
+            rollup: parse_rollup(
+                r#"{"total":1,"groups":[{"role":"host","total":1,"worst_health":"healthy"}]}"#,
+            ),
+            rows: Vec::new(),
+            rtt: HashMap::new(),
+            self_hostname: "pine".into(),
+        });
+        assert_eq!(p.selected_role.as_deref(), Some("host"));
+    }
+
+    #[test]
+    fn loaded_arms_the_reveal_cascade_and_tick_advances_it() {
+        // MOTION-FEEDBACK-2 — `Loaded` restarts the staggered-reveal clock so the
+        // cards cascade in; the RevealTick advances the clock frame to frame.
+        let mut p = FleetRollupPanel::new();
+        let _ = p.update(Message::Loaded {
+            rollup: parse_rollup(
+                r#"{"total":1,"groups":[{"role":"host","total":1,"worst_health":"healthy"}]}"#,
+            ),
+            rows: Vec::new(),
+            rtt: HashMap::new(),
+            self_hostname: "pine".into(),
+        });
+        // Fresh cascade: reveal_now == reveal_start (≈0 elapsed).
+        assert!(p.reveal_elapsed_ms() < 50, "cascade just started");
+        let before = p.reveal_now;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _ = p.update(Message::RevealTick);
+        assert!(p.reveal_now > before, "reveal tick advances the clock");
+    }
+
+    #[test]
+    fn revealing_gates_on_cascade_in_flight_and_content() {
+        // MOTION-FEEDBACK-2 / MOTION-PERF-1 — the reveal tick is gated on
+        // `revealing()`: true only while content is on screen AND the cascade
+        // hasn't finished, so the loop stops at rest (no idle animation).
+        let mut p = FleetRollupPanel::new();
+        // No content yet ⇒ never revealing (the skeleton owns the screen).
+        assert!(!p.revealing(), "idle/loading ⇒ not revealing");
+        let _ = p.update(Message::Loaded {
+            rollup: parse_rollup(
+                r#"{"total":1,"groups":[{"role":"host","total":1,"worst_health":"healthy"}]}"#,
+            ),
+            rows: Vec::new(),
+            rtt: HashMap::new(),
+            self_hostname: "pine".into(),
+        });
+        // Fresh load with content ⇒ cascade in flight (unless reduce-motion).
+        if !crate::live_theme::reduce_motion() {
+            assert!(p.revealing(), "fresh load ⇒ cascade animating");
+        }
+        // Past the whole cascade window ⇒ settled, tick stops.
+        p.reveal_now = p.reveal_start + std::time::Duration::from_millis(1000);
+        assert!(!p.revealing(), "cascade done ⇒ not revealing");
     }
 }

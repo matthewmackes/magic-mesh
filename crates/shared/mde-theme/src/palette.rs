@@ -161,6 +161,24 @@ impl Palette {
     pub fn active_tint(&self) -> Rgba {
         self.accent.with_alpha(0.12)
     }
+
+    /// MOTION-FEEDBACK-2 — the Carbon `layer-selected` row/cell wash: the accent
+    /// at 16% opacity. The selected-state companion to [`hover_tint`](Self::hover_tint)
+    /// (8%) and [`active_tint`](Self::active_tint) (12%), one ramp step stronger so a
+    /// selected list/table row reads as a persistent accent fill that sits above a
+    /// transient hover. Single-sourced here so every selectable surface (cards,
+    /// lists, tables) washes selection identically.
+    pub fn selected_tint(&self) -> Rgba {
+        self.accent.with_alpha(0.16)
+    }
+
+    /// MOTION-FEEDBACK-2 — the Carbon `layer-selected-hover` wash: a selected row
+    /// the pointer is also over. The accent at 20% opacity — one step above
+    /// [`selected_tint`](Self::selected_tint) so hovering a selected row still
+    /// gives feedback without losing the selection read.
+    pub fn selected_hover_tint(&self) -> Rgba {
+        self.accent.with_alpha(0.20)
+    }
 }
 
 #[cfg(test)]
@@ -250,5 +268,28 @@ mod tests {
         let h = p.hover_tint();
         assert_eq!(h.r, p.accent.r);
         assert!((h.a - 0.08).abs() < 0.001);
+    }
+
+    #[test]
+    fn selection_tints_are_accent_and_ramp_above_hover_and_active() {
+        // MOTION-FEEDBACK-2 — the Carbon -selected washes are the accent hue at
+        // a strictly increasing alpha ramp above hover (8%) and active (12%):
+        // selected (16%) < selected-hover (20%). Same hue so selection reads as
+        // an accent fill, never a different colour.
+        let p = Palette::dark();
+        let hover = p.hover_tint();
+        let active = p.active_tint();
+        let sel = p.selected_tint();
+        let sel_hover = p.selected_hover_tint();
+        // Same accent hue across the whole ramp.
+        for t in [hover, active, sel, sel_hover] {
+            assert_eq!((t.r, t.g, t.b), (p.accent.r, p.accent.g, p.accent.b));
+        }
+        // Strictly increasing presence: hover < active < selected < selected+hover.
+        assert!(hover.a < active.a);
+        assert!(active.a < sel.a);
+        assert!(sel.a < sel_hover.a);
+        assert!((sel.a - 0.16).abs() < 0.001);
+        assert!((sel_hover.a - 0.20).abs() < 0.001);
     }
 }
