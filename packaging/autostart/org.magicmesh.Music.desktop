@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=MCNF Music
+Comment=Mesh music player (Airsonic/Subsonic) — running + docked after login (MUSIC-DOCK-4); Workstation-rank gated, so Servers/Lighthouses (headless) skip it. Closing the dock minimizes it to the bottom-center handle (it never quits), so Music stays one click away.
+Exec=sh -c "mackesd role-gate --min-rank 2 && exec mde-music"
+Icon=magic-mesh
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

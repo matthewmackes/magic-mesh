@@ -38,6 +38,15 @@ const DOCK_NAMESPACE: &str = "mde-music";
 /// maps/unmaps on Docked⟷Minimized; the handle stays mapped the whole time).
 const HANDLE_NAMESPACE: &str = "mde-music-handle";
 
+/// MUSIC-DOCK-5 — the wlr-layer-shell **exclusive zone** for BOTH the dock and the
+/// always-mapped handle surface. `0` means the surface reserves NO screen real
+/// estate, so the compositor does not shrink the work area / reshape other
+/// windows when the dock (or handle) maps: it overlays the desktop instead of
+/// docking like a panel. Single-sourced here (referenced by both
+/// [`dock_surface`] and [`handle_surface`]) so the overlay-not-reserve contract
+/// is one named value, locked against regression by [`dock_surface_tests`].
+const DOCK_EXCLUSIVE_ZONE: i32 = 0;
+
 use mde_music::album::{self, AlbumView};
 use mde_music::color;
 use mde_music::hub::HubCard;
@@ -142,14 +151,25 @@ fn carbon(rgba: mde_theme::Rgba, a: f32) -> cosmic::iced::Color {
 /// Returns the surface's [`window::Id`] so `init` can stash it for hide-on-Esc.
 fn dock_surface() -> (window::Id, Task<Message>) {
     let id = window::Id::unique();
-    let task = get_layer_surface(SctkLayerSurfaceSettings {
+    let task = get_layer_surface(dock_surface_settings(id));
+    (id, task)
+}
+
+/// MUSIC-DOCK-1/-5 — the dock surface's [`SctkLayerSurfaceSettings`], split out
+/// from [`dock_surface`] so the live settings the runtime maps are the exact
+/// struct [`dock_surface_tests`] asserts on (Overlay layer, zero exclusive zone),
+/// locking the overlay-not-reserve contract against regression.
+fn dock_surface_settings(id: window::Id) -> SctkLayerSurfaceSettings {
+    SctkLayerSurfaceSettings {
         id,
         namespace: DOCK_NAMESPACE.to_string(),
         // Four-edge anchor → the compositor stretches the surface to fill, so the
         // dock is full-height + full-width (anchored to the bottom as asked).
         size: Some((None, None)),
-        // Not a panel reserving screen real estate; the dock floats over windows.
-        exclusive_zone: 0,
+        // MUSIC-DOCK-5 — not a panel reserving screen real estate; the dock floats
+        // over windows (zero exclusive zone → the compositor never shrinks the work
+        // area / reshapes other windows when the dock maps).
+        exclusive_zone: DOCK_EXCLUSIVE_ZONE,
         anchor: Anchor::BOTTOM
             .union(Anchor::LEFT)
             .union(Anchor::RIGHT)
@@ -157,8 +177,7 @@ fn dock_surface() -> (window::Id, Task<Message>) {
         layer: Layer::Overlay,
         keyboard_interactivity: KeyboardInteractivity::OnDemand,
         ..Default::default()
-    });
-    (id, task)
+    }
 }
 
 /// MUSIC-DOCK-3 — map the always-mapped **minimize-to-handle** tab: a second,
@@ -176,7 +195,16 @@ fn dock_surface() -> (window::Id, Task<Message>) {
 /// can dispatch the handle body for it.
 fn handle_surface() -> (window::Id, Task<Message>) {
     let id = window::Id::unique();
-    let task = get_layer_surface(SctkLayerSurfaceSettings {
+    let task = get_layer_surface(handle_surface_settings(id));
+    (id, task)
+}
+
+/// MUSIC-DOCK-3/-5 — the handle surface's [`SctkLayerSurfaceSettings`], split out
+/// from [`handle_surface`] so the live settings the runtime maps are the exact
+/// struct [`dock_surface_tests`] asserts on (Overlay layer, zero exclusive zone):
+/// the always-mapped tab overlays too and never reserves space.
+fn handle_surface_settings(id: window::Id) -> SctkLayerSurfaceSettings {
+    SctkLayerSurfaceSettings {
         id,
         namespace: HANDLE_NAMESPACE.to_string(),
         // A fixed-size pill (not edge-stretched), sized from the Carbon tokens.
@@ -185,14 +213,15 @@ fn handle_surface() -> (window::Id, Task<Message>) {
             Some(mde_theme::dock_handle::WIDTH as u32),
             Some(mde_theme::dock_handle::HEIGHT as u32),
         )),
-        exclusive_zone: 0,
+        // MUSIC-DOCK-5 — the handle overlays too: zero exclusive zone so the
+        // always-mapped tab never reserves space / reshapes other windows either.
+        exclusive_zone: DOCK_EXCLUSIVE_ZONE,
         // Bottom-only anchor → the compositor centers it on the bottom edge.
         anchor: Anchor::BOTTOM,
         layer: Layer::Overlay,
         keyboard_interactivity: KeyboardInteractivity::None,
         ..Default::default()
-    });
-    (id, task)
+    }
 }
 
 /// MUSIC-HOME — load everything the Home dashboard shows (stats + the
@@ -3275,5 +3304,64 @@ mod theme_tests {
         assert!((bg.r - f32::from(p.background.r) / 255.0).abs() < 0.01);
         assert!((bg.g - f32::from(p.background.g) / 255.0).abs() < 0.01);
         assert!((bg.b - f32::from(p.background.b) / 255.0).abs() < 0.01);
+    }
+}
+
+/// MUSIC-DOCK-5 — the overlay-not-reserve regression lock. The dock + handle
+/// surfaces must overlay the desktop WITHOUT reserving screen real estate, so
+/// opening the dock never reshapes/resizes other windows. These tests assert on
+/// the exact [`SctkLayerSurfaceSettings`] the runtime maps (via the extracted
+/// `*_settings` builders), so any future edit that gives either surface a
+/// non-zero exclusive zone — or moves it off the Overlay layer — fails the build.
+#[cfg(test)]
+mod dock_surface_tests {
+    use super::{
+        dock_surface_settings, handle_surface_settings, DOCK_EXCLUSIVE_ZONE, DOCK_NAMESPACE,
+        HANDLE_NAMESPACE,
+    };
+    use cosmic::iced::platform_specific::shell::commands::layer_surface::Layer;
+    use cosmic::iced::window;
+
+    /// The contract value itself: zero. A panel-style dock would set a positive
+    /// exclusive zone (px reserved off the edge); `0` is the "overlay, reserve
+    /// nothing" wlr-layer-shell setting this item locks in.
+    #[test]
+    fn dock_exclusive_zone_is_zero() {
+        assert_eq!(
+            DOCK_EXCLUSIVE_ZONE, 0,
+            "the Music dock must reserve no space (overlay, not a panel)"
+        );
+    }
+
+    /// The full dock surface overlays + reserves nothing.
+    #[test]
+    fn dock_surface_overlays_and_reserves_no_space() {
+        let s = dock_surface_settings(window::Id::unique());
+        assert_eq!(
+            s.exclusive_zone, 0,
+            "the dock surface must not reserve space / reshape other windows"
+        );
+        assert_eq!(s.exclusive_zone, DOCK_EXCLUSIVE_ZONE);
+        assert!(
+            matches!(s.layer, Layer::Overlay),
+            "the dock must sit on the Overlay layer (above normal windows)"
+        );
+        assert_eq!(s.namespace, DOCK_NAMESPACE);
+    }
+
+    /// The always-mapped handle tab overlays + reserves nothing too.
+    #[test]
+    fn handle_surface_overlays_and_reserves_no_space() {
+        let s = handle_surface_settings(window::Id::unique());
+        assert_eq!(
+            s.exclusive_zone, 0,
+            "the handle surface must not reserve space / reshape other windows"
+        );
+        assert_eq!(s.exclusive_zone, DOCK_EXCLUSIVE_ZONE);
+        assert!(
+            matches!(s.layer, Layer::Overlay),
+            "the handle must sit on the Overlay layer"
+        );
+        assert_eq!(s.namespace, HANDLE_NAMESPACE);
     }
 }
