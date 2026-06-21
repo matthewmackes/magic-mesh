@@ -41,6 +41,21 @@ pub const CONNECT_STATE_DIR: &str = "/var/lib/mackesd/connect";
 /// worth a flap). Service-specific raw stream ports ARE reclaimed on unexpose.
 const SHARED_HTTP_PORTS: [(u16, &str); 2] = [(80, "tcp"), (443, "tcp")];
 
+/// CONNECT-3 — the public-zone ports that are legitimately open but are NOT
+/// CONNECT's to manage: the foundational always-public layer (§1/§6 — SSH/22,
+/// Nebula/4242, enroll/4243, owned by [`super::firewall_preset`] + firewalld's
+/// public-zone default) plus the shared HTTP ingress (80/443, owned by Caddy +
+/// shared services). A port open on the public zone that is outside this set
+/// **and** outside CONNECT's own openings is *unexpected* — a rogue or forgotten
+/// public opening the operator should be alerted to.
+const EXPECTED_FOUNDATIONAL_PORTS: [(u16, &str); 5] = [
+    (22, "tcp"),
+    (4242, "udp"),
+    (4243, "tcp"),
+    (80, "tcp"),
+    (443, "tcp"),
+];
+
 /// Tick cadence — exposure policy changes are rare; a minute keeps a freshly
 /// exposed service reachable quickly without polling storms.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60);
@@ -129,6 +144,11 @@ pub struct AppliedState {
     /// `(port, proto, toaddr)` stream forwards this worker added.
     #[serde(default)]
     pub forwards: Vec<(u16, String, String)>,
+    /// CONNECT-3 — the unexpected public-zone openings last alerted on, so the
+    /// alert is **edge-triggered**: it fires when the set changes and clears when
+    /// the rogue port is removed, instead of spamming every tick.
+    #[serde(default)]
+    pub alerted_unexpected: Vec<(u16, String)>,
 }
 
 /// Ports CONNECT previously opened that the policy no longer wants — the unexpose
@@ -159,6 +179,70 @@ pub fn forwards_to_remove(
         .filter(|f| !desired.contains(f))
         .cloned()
         .collect()
+}
+
+/// CONNECT-3 — parse `firewall-cmd --zone=<z> --list-ports` output: a
+/// whitespace-separated list of `port/proto` tokens (e.g. `"80/tcp 443/tcp
+/// 4242/udp"`). Malformed tokens are skipped. Pure + testable.
+#[must_use]
+pub fn parse_open_ports(list_output: &str) -> Vec<(u16, String)> {
+    list_output
+        .split_whitespace()
+        .filter_map(|tok| {
+            let (port, proto) = tok.split_once('/')?;
+            let port: u16 = port.parse().ok()?;
+            if proto.is_empty() {
+                return None;
+            }
+            Some((port, proto.to_string()))
+        })
+        .collect()
+}
+
+/// CONNECT-3 — the public-zone ports that are open but neither foundational
+/// ([`EXPECTED_FOUNDATIONAL_PORTS`]) nor opened by CONNECT itself (`connect_owned`,
+/// this node's desired ingress). These are *unexpected* — a rogue or forgotten
+/// public opening the operator should see. Detection only — this never mutates
+/// the firewall (closing a port stays bounded to CONNECT's own [`AppliedState`]).
+/// Pure + testable; the result is sorted for a stable edge-trigger comparison.
+#[must_use]
+pub fn unexpected_open_ports(
+    open: &[(u16, String)],
+    connect_owned: &[(u16, String)],
+) -> Vec<(u16, String)> {
+    let mut out: Vec<(u16, String)> = open
+        .iter()
+        .filter(|(port, proto)| {
+            let foundational = EXPECTED_FOUNDATIONAL_PORTS
+                .iter()
+                .any(|(p, pr)| *p == *port && *pr == proto.as_str());
+            let owned = connect_owned.iter().any(|(p, pr)| p == port && pr == proto);
+            !foundational && !owned
+        })
+        .cloned()
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// CONNECT-3 — publish a Hub alert naming unexpected public-zone openings, on the
+/// same `event/firewall/<host>` alert lane the firewall monitor uses (so it
+/// surfaces in the Notification Hub). Best-effort fire-and-reap.
+fn publish_unexpected_ports_alert(host: &str, unexpected: &[(u16, String)]) {
+    let topic = format!("event/firewall/{host}");
+    let list = unexpected
+        .iter()
+        .map(|(p, pr)| format!("{p}/{pr}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let body = format!(
+        r#"{{"host":"{host}","unexpected_public_ports":"{list}","count":{},"alert":true}}"#,
+        unexpected.len()
+    );
+    let mut cmd = std::process::Command::new("mde-bus");
+    cmd.args(["publish", &topic, "--body-flag", &body]);
+    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
 }
 
 /// The exposure-driven enforcement worker: opens the policy's ingress firewall
@@ -263,6 +347,26 @@ impl ConnectFirewallWorker {
             .unwrap_or(false)
     }
 
+    /// CONNECT-3 — list the `public` zone's **runtime** open ports via
+    /// `firewall-cmd --zone <z> --list-ports`. Returns `[]` when firewall-cmd is
+    /// disabled (tests) or the call fails. Detection-only — never mutates.
+    fn list_public_ports(&self) -> Vec<(u16, String)> {
+        if self.firewall_cmd.is_empty() {
+            return Vec::new();
+        }
+        let mut cmd = std::process::Command::new(self.firewall_cmd);
+        cmd.args(["--zone", PUBLIC_ZONE, "--list-ports"]);
+        match crate::workers::proc::output_with_timeout(
+            cmd,
+            crate::workers::proc::DEFAULT_CMD_TIMEOUT,
+        ) {
+            Ok(out) if out.status.success() => {
+                parse_open_ports(&String::from_utf8_lossy(&out.stdout))
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// CONNECT-4 — render this node's Caddy ingress fragment from the policy and
     /// write it (on-change) to `<caddy_dir>/mcnf-ingress.caddy`, then reload Caddy
     /// if it's installed + the fragment changed. Best-effort + safe: only writes
@@ -356,10 +460,26 @@ impl ConnectFirewallWorker {
             }
         }
 
+        // CONNECT-3 — detect + alert on UNEXPECTED public openings: anything open
+        // on the public zone that is neither foundational (SSH/Nebula/enroll/HTTP)
+        // nor CONNECT's own ingress. Edge-triggered off the persisted set so it
+        // fires on change + clears when resolved (no per-tick spam). Detection
+        // only — it never closes a port (removal stays bounded to CONNECT's own
+        // state, so it can't fight firewall_preset or lock out the foundation).
+        let unexpected = unexpected_open_ports(&self.list_public_ports(), &desired_ports);
+        if !unexpected.is_empty() && unexpected != prev.alerted_unexpected {
+            publish_unexpected_ports_alert(&self.hostname, &unexpected);
+            tracing::warn!(
+                ports = ?unexpected,
+                "connect_firewall: UNEXPECTED public-zone openings — raised event/firewall alert (CONNECT-3)"
+            );
+        }
+
         // Persist what we now intend to own so the next tick can reclaim drift.
         self.save_applied(&AppliedState {
             ports: desired_ports.clone(),
             forwards: desired_fwds.clone(),
+            alerted_unexpected: unexpected,
         });
 
         if changed > 0 || !rm_fwds.is_empty() || !rm_ports.is_empty() {
@@ -557,9 +677,63 @@ mod tests {
         let s = AppliedState {
             ports: vec![(25565, "tcp".into())],
             forwards: vec![(25565, "tcp".into(), "10.42.0.9".into())],
+            ..Default::default()
         };
         w.save_applied(&s);
         assert_eq!(w.load_applied(), s);
+    }
+
+    #[test]
+    fn parse_open_ports_parses_tokens_and_skips_garbage() {
+        // firewall-cmd --list-ports emits space-separated `port/proto` tokens.
+        let got = parse_open_ports("80/tcp 443/tcp 4242/udp\n");
+        assert_eq!(
+            got,
+            vec![
+                (80, "tcp".to_string()),
+                (443, "tcp".to_string()),
+                (4242, "udp".to_string()),
+            ]
+        );
+        // Malformed tokens (no proto / non-numeric / bare) are skipped.
+        let messy = parse_open_ports("8080/tcp garbage 99999/tcp 70000/tcp /tcp");
+        // 8080 ok; "garbage" skipped; 99999 > u16::MAX skipped; 70000 > u16 skipped.
+        assert_eq!(messy, vec![(8080, "tcp".to_string())]);
+        assert!(parse_open_ports("").is_empty());
+    }
+
+    #[test]
+    fn unexpected_excludes_foundational_and_connect_owned() {
+        // Open: the whole foundational layer + a CONNECT-owned service + two rogue
+        // ports. Only the rogue ports are unexpected.
+        let open = vec![
+            (22, "tcp".to_string()),   // ssh — foundational
+            (4242, "udp".to_string()), // nebula — foundational
+            (4243, "tcp".to_string()), // enroll — foundational
+            (80, "tcp".to_string()),   // shared http
+            (443, "tcp".to_string()),  // shared http
+            (8080, "tcp".to_string()), // CONNECT-owned (exposed service)
+            (9090, "tcp".to_string()), // ROGUE
+            (3000, "udp".to_string()), // ROGUE
+        ];
+        let connect_owned = vec![(8080, "tcp".to_string())];
+        let unexpected = unexpected_open_ports(&open, &connect_owned);
+        // Sorted: (3000,udp) then (9090,tcp).
+        assert_eq!(
+            unexpected,
+            vec![(3000, "udp".to_string()), (9090, "tcp".to_string())]
+        );
+    }
+
+    #[test]
+    fn unexpected_is_empty_when_everything_is_accounted_for() {
+        let open = vec![
+            (4242, "udp".to_string()),
+            (443, "tcp".to_string()),
+            (25565, "tcp".to_string()),
+        ];
+        let connect_owned = vec![(25565, "tcp".to_string())];
+        assert!(unexpected_open_ports(&open, &connect_owned).is_empty());
     }
 
     #[test]
