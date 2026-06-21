@@ -1087,4 +1087,72 @@ mod tests {
         assert!(DEFAULT_QUOTA_HARD_BYTES < 190 * 1024 * 1024);
         assert!(DEFAULT_QUOTA_SOFT_BYTES < DEFAULT_QUOTA_HARD_BYTES);
     }
+
+    #[test]
+    fn soak_steady_state_footprint_stays_flat_under_sustained_traffic() {
+        // BUS-RETENTION-1 acceptance ("a soak test shows steady-state size flat
+        // under sustained traffic"): under repeated publish bursts that each
+        // exceed the cap, the post-GC footprint (spool + index.sqlite) must reach
+        // a FLAT plateau — it must NOT ratchet upward as cumulative writes grow.
+        // That ratchet was the live v10.0.18 failure: a 121 MB index that never
+        // returned freed pages to the OS filled a 391 MB /run. The decisive check
+        // is plateau, not an exact cap: with working reclaim the footprint at a
+        // late round ≈ a mid round; if the DB never reclaimed, the footprint would
+        // grow roughly with total writes (late round ≈ 2× the mid round here), so
+        // the < 1.5× band below fails closed on a reclaim regression.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        // Caps with headroom over SQLite's working-set floor so the run is about
+        // steady-state behavior, not the evictor's exact landing point (that is
+        // covered by `hard_cap_evicts_oldest_first_until_under_soft`).
+        let policy = RetentionPolicy {
+            quota_soft_bytes: 256 * 1024,
+            quota_hard_bytes: 384 * 1024,
+            ..RetentionPolicy::default()
+        };
+
+        let now = 1_000_000_000_000_i64;
+        let rounds = 12_i64;
+        let mut footprints = Vec::new();
+        for round in 0..rounds {
+            // A burst of sized Urgent messages each round. Urgent never
+            // TTL-expires, so ONLY the hard-cap evictor + DB reclaim bound the
+            // footprint — exactly the steady-state mechanism under test. `ts =
+            // now + round` makes earlier rounds the oldest, so eviction sheds them
+            // first (oldest-traffic-out, like a real spool under load).
+            for i in 0..60 {
+                write_sized(
+                    &root,
+                    &format!("soak/r{round}/m{i}"),
+                    Priority::Urgent,
+                    now + round,
+                    2 * 1024,
+                );
+            }
+            purge_audit(&root);
+            let report = run_pass_at(&policy, &root, now + round).unwrap();
+            assert!(report.bytes_after > 0, "round {round}: empty footprint");
+            footprints.push(report.bytes_after);
+        }
+
+        // By the mid rounds the cumulative writes far exceed the cap, so eviction
+        // + reclaim are fully engaged and the footprint has plateaued. Compare a
+        // mid round to the last: a flat steady state stays within a tight band; a
+        // reclaim regression would have crept upward with total writes.
+        let mid = footprints[(rounds / 2) as usize];
+        let last = *footprints.last().unwrap();
+        assert!(
+            last <= mid + mid / 2,
+            "footprint ratcheted upward across the soak (DB reclaim regressed): \
+             mid={mid} last={last} series={footprints:?}",
+        );
+        // And the plateau is in the neighborhood of the cap, not a runaway — this
+        // catches "eviction never engaged" (footprint would track total writes).
+        assert!(
+            last <= policy.quota_hard_bytes * 2,
+            "plateau {last} is far above the cap {} — eviction did not bound the bus",
+            policy.quota_hard_bytes,
+        );
+    }
 }
