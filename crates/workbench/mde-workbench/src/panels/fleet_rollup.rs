@@ -18,8 +18,12 @@ use cosmic::Element;
 use mde_theme::{EmptyState, Icon};
 use serde::Deserialize;
 
+use mde_theme::LoadState;
+
 use crate::controls::{variant_button, ButtonVariant};
-use crate::panel_chrome::{empty_state, panel_container, status_badge, BadgeSeverity};
+use crate::panel_chrome::{
+    empty_state, load_state_chrome, load_state_pill, panel_container, status_badge, BadgeSeverity,
+};
 use crate::panels::fleet_settings::run_mackesd;
 use crate::panels::peers::{parse_directory, PeerRow};
 use crate::panels::peers_map::{layout, read_latency_cache, MapNode, MapProgram};
@@ -82,13 +86,13 @@ pub struct FleetRollupPanel {
     pub rtt: HashMap<String, Option<f64>>,
     /// W81 — this node, anchored at the map's center.
     pub self_hostname: String,
-    pub loaded: bool,
+    /// MOTION-NET-1 — the canonical async lifecycle state, replacing the old
+    /// `loaded`/`load_error`/`busy` flag triple. A first load shows the
+    /// `Loading` chrome; a refresh keeps the existing cards visible
+    /// (`Refreshing{stale}`); a `mackesd fleet-status --json` failure renders
+    /// `Failed` (never the misleading "No enrolled nodes yet" empty state).
+    pub load: LoadState,
     pub status: String,
-    /// EFF-45 — set when `mackesd fleet-status --json` failed (I/O, non-zero
-    /// exit). The view renders the error state instead of the misleading "No
-    /// enrolled nodes yet" empty state.
-    pub load_error: Option<String>,
-    pub busy: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -168,24 +172,23 @@ impl FleetRollupPanel {
                 self.rows = rows;
                 self.rtt = rtt;
                 self.self_hostname = self_hostname;
-                self.loaded = true;
-                self.load_error = None;
-                self.busy = false;
+                self.load = self.load.clone().on_loaded();
                 self.status.clear();
                 Task::none()
             }
             Message::LoadError(e) => {
-                // EFF-45 — fleet-status failure is an error, not an empty
-                // fleet.
-                self.load_error = Some(e);
-                self.busy = false;
+                // EFF-45 / MOTION-NET-1 — fleet-status failure is a `Failed`
+                // load, not an empty fleet.
+                self.load = self.load.clone().on_error(e);
                 Task::none()
             }
             Message::RefreshClicked => {
-                if self.busy {
+                if self.load.is_busy() {
                     return Task::none();
                 }
-                self.busy = true;
+                // MOTION-NET-1 — a reload over existing cards is a refresh
+                // (keeps them visible); a first load shows the Loading chrome.
+                self.load = self.load.clone().begin_load();
                 self.status = "Refreshing…".into();
                 Self::load()
             }
@@ -198,19 +201,19 @@ impl FleetRollupPanel {
         let refresh = variant_button(
             "Refresh",
             ButtonVariant::Ghost,
-            (!self.busy).then_some(crate::Message::FleetRollup(Message::RefreshClicked)),
+            (!self.load.is_busy()).then_some(crate::Message::FleetRollup(Message::RefreshClicked)),
             palette,
         );
 
-        // EFF-45 — a failed fleet-status run renders as failure, never as the
-        // "No enrolled nodes yet" empty state.
-        if let Some(err) = &self.load_error {
-            return panel_container(
-                crate::panel_chrome::error_state(err.clone(), palette, || {
-                    crate::Message::FleetRollup(Message::RefreshClicked)
-                }),
-                density,
-            );
+        // MOTION-NET-1 — the canonical async chrome: a first `Loading`, an
+        // `Offline`, and a `Failed` fleet-status run each render their distinct
+        // non-content state (Failed → error+retry, never the misleading "No
+        // enrolled nodes yet" empty state). Content-bearing states (Loaded /
+        // Degraded / Refreshing-over-stale) fall through to the data view.
+        if let Some(chrome) = load_state_chrome(&self.load, palette, || {
+            crate::Message::FleetRollup(Message::RefreshClicked)
+        }) {
+            return panel_container(chrome, density);
         }
 
         if self.rollup.groups.is_empty() {
@@ -314,10 +317,18 @@ impl FleetRollupPanel {
             cosmic::iced::widget::themer(None, canvas).into()
         };
 
+        // MOTION-NET-1 — the non-motion status affordance: a refresh over
+        // existing cards reads as a "Refreshing…" pill in the header, legible
+        // with animation disabled. (`load_state_pill` covers every state; the
+        // settled `Loaded` pill confirms the data is current.)
+        let status_pill = load_state_pill(&self.load, palette);
+
         panel_container(
             column![
                 row![
                     text(format!("Fleet — {} node(s)", self.rollup.total)).size(20),
+                    status_pill,
+                    cosmic::iced::widget::Space::new().width(Length::Fill),
                     refresh
                 ]
                 .spacing(12)
@@ -368,9 +379,17 @@ mod tests {
     }
 
     #[test]
-    fn loaded_sets_rollup_and_clears_busy() {
+    fn loaded_sets_rollup_and_settles_load_state() {
+        // MOTION-NET-1 — a refresh keeps the prior data visible
+        // (Refreshing{stale}), then `Loaded` settles it back to current.
         let mut p = FleetRollupPanel::new();
-        p.busy = true;
+        p.load = LoadState::Loaded; // already had data
+        let _ = p.update(Message::RefreshClicked);
+        assert_eq!(
+            p.load,
+            LoadState::Refreshing { stale: true },
+            "refresh keeps cards visible"
+        );
         let _ = p.update(Message::Loaded {
             rollup: parse_rollup(
                 r#"{"total":1,"groups":[{"role":"host","total":1,"worst_health":"healthy"}]}"#,
@@ -379,9 +398,22 @@ mod tests {
             rtt: HashMap::new(),
             self_hostname: "pine".into(),
         });
-        assert!(p.loaded);
-        assert!(!p.busy);
+        assert_eq!(p.load, LoadState::Loaded);
+        assert!(!p.load.is_busy());
         assert_eq!(p.rollup.total, 1);
         assert_eq!(p.self_hostname, "pine");
+    }
+
+    #[test]
+    fn first_load_then_error_renders_failed_not_empty() {
+        // MOTION-NET-1 / EFF-45 — a fleet-status failure is a Failed load, so
+        // the view paints the error+retry chrome instead of "No nodes yet".
+        let mut p = FleetRollupPanel::new();
+        assert_eq!(p.load, LoadState::Idle);
+        let _ = p.update(Message::RefreshClicked);
+        assert_eq!(p.load, LoadState::Loading, "first load with no prior data");
+        let _ = p.update(Message::LoadError("fleet-status exit 1".into()));
+        assert!(p.load.is_failed());
+        assert_eq!(p.load.error(), Some("fleet-status exit 1"));
     }
 }

@@ -34,8 +34,8 @@ use mde_theme::{
     components::empty_state::{BODY_CTA_GAP, EMPTY_ICON_SIZE, HEADING_BODY_GAP, VERTICAL_PADDING},
     mde_icon,
     motion::dialog as dialog_tokens,
-    Density, EmptyState, FontSize, Icon, IconSize, Palette, Radii, Shadow as MdeShadow,
-    Space as MdeSpace, TypeRole,
+    Density, EmptyState, FontSize, Icon, IconSize, LoadState, Palette, Radii, Shadow as MdeShadow,
+    Space as MdeSpace, StatusSeverity, TypeRole,
 };
 
 // CR-3.b — `object_card` extracted to `mde-iced-components` so
@@ -386,6 +386,168 @@ pub fn empty_state<'a, Message: Clone + 'a>(
         })
         .align_x(alignment::Horizontal::Center)
         .into()
+}
+
+/// MOTION-NET-1 — map the dependency-free [`StatusSeverity`] tier (which the
+/// canonical [`LoadState`] reports) onto the workbench's [`BadgeSeverity`], so
+/// `status_badge` is the single badge renderer for both. Keeps the severity
+/// decision in `mde-theme` (next to the state machine) while the toolkit dep
+/// stays here.
+#[must_use]
+pub fn badge_severity(sev: StatusSeverity) -> BadgeSeverity {
+    match sev {
+        StatusSeverity::Neutral => BadgeSeverity::Neutral,
+        StatusSeverity::Info => BadgeSeverity::Info,
+        StatusSeverity::Success => BadgeSeverity::Success,
+        StatusSeverity::Warning => BadgeSeverity::Warning,
+        StatusSeverity::Danger => BadgeSeverity::Danger,
+    }
+}
+
+/// MOTION-NET-1 — a compact, non-blocking **status pill** for a [`LoadState`]:
+/// the state's status icon + its non-motion text [`label`](LoadState::label),
+/// severity-tinted. This is the always-legible-without-motion affordance the
+/// design doc's a11y acceptance requires — drop it in a panel header so the
+/// async state is readable even with animation disabled (the spinner/shimmer
+/// from later MOTION-NET items is the *motion* layer over this).
+pub fn load_state_pill<'a, Message: 'a>(
+    state: &LoadState,
+    palette: Palette,
+) -> Element<'a, Message> {
+    let sizes = FontSize::defaults();
+    let resolved = mde_icon(state.icon(), IconSize::Inline);
+    let severity = badge_severity(state.severity());
+    let fg = match severity {
+        BadgeSeverity::Neutral => palette.text,
+        BadgeSeverity::Success => palette.success,
+        BadgeSeverity::Warning => palette.warning,
+        BadgeSeverity::Danger => palette.danger,
+        BadgeSeverity::Info => palette.accent,
+    }
+    .into_cosmic_color();
+
+    let icon_el: Element<'a, Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
+        use cosmic::iced::widget::svg as widget_svg;
+        widget_svg(widget_svg::Handle::from_memory(svg_bytes))
+            .width(Length::Fixed(resolved.size_px()))
+            .height(Length::Fixed(resolved.size_px()))
+            .sty(move |_t: &cosmic::Theme| widget_svg::Style { color: Some(fg) })
+            .into()
+    } else {
+        text(resolved.fallback_glyph)
+            .size(resolved.size_px())
+            .colr(fg)
+            .into()
+    };
+
+    let label = text(state.label())
+        .size(TypeRole::Caption.size_in(sizes))
+        .colr(fg)
+        .align_y(alignment::Vertical::Center);
+
+    let radii = Radii::defaults();
+    let bg = match severity {
+        BadgeSeverity::Neutral => palette.raised.into_cosmic_color(),
+        BadgeSeverity::Info => palette.hover_tint().into_cosmic_color(),
+        BadgeSeverity::Success => Color {
+            a: 0.20,
+            ..palette.success.into_cosmic_color()
+        },
+        BadgeSeverity::Warning => Color {
+            a: 0.20,
+            ..palette.warning.into_cosmic_color()
+        },
+        BadgeSeverity::Danger => Color {
+            a: 0.20,
+            ..palette.danger.into_cosmic_color()
+        },
+    };
+
+    container(
+        row![icon_el, label]
+            .spacing(6)
+            .align_y(alignment::Vertical::Center),
+    )
+    .padding(Padding {
+        top: 4.0,
+        right: 10.0,
+        bottom: 4.0,
+        left: 10.0,
+    })
+    .style(move |_theme| container::Style {
+        snap: false,
+        icon_color: Some(fg),
+        background: Some(Background::Color(bg)),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: f32::from(radii.full).into(),
+        },
+        shadow: IcedShadow::default(),
+        text_color: Some(fg),
+    })
+    .into()
+}
+
+/// MOTION-NET-1 — the canonical **non-content chrome** for a [`LoadState`]:
+/// the renderer a panel calls when [`LoadState::has_content`] is `false`, so
+/// every surface paints the same distinct visual per state instead of
+/// re-deriving the is-error-then-is-empty branch by hand:
+///
+///   * `Idle`     → a neutral "Nothing loaded yet" empty state.
+///   * `Loading`  → a centered activity row (icon + "Loading…").
+///   * `Offline`  → a warning empty state with a Retry CTA.
+///   * `Failed`   → the danger [`error_state`] with the error detail + Retry.
+///
+/// Returns `None` for the content-bearing states (`Loaded` / `Degraded` /
+/// `Refreshing{stale:true}`) — the panel renders its real data in those cases
+/// (optionally topped with a [`load_state_pill`]). `on_retry` wires the CTA for
+/// the recoverable states.
+pub fn load_state_chrome<'a, Message: Clone + 'a>(
+    state: &LoadState,
+    palette: Palette,
+    on_retry: impl Fn() -> Message + 'a,
+) -> Option<Element<'a, Message>> {
+    match state {
+        // Content-bearing — the caller renders its data, not chrome.
+        LoadState::Loaded | LoadState::Degraded | LoadState::Refreshing { stale: true } => None,
+        LoadState::Refreshing { stale: false } | LoadState::Loading => {
+            // First load with nothing to show yet — a centered activity row.
+            // The non-motion label keeps it legible; MOTION-NET-2's skeletons
+            // are the motion layer that lands over this.
+            Some(
+                container(load_state_pill::<Message>(state, palette))
+                    .width(Length::Fill)
+                    .padding(Padding {
+                        top: VERTICAL_PADDING,
+                        right: 24.0,
+                        bottom: VERTICAL_PADDING,
+                        left: 24.0,
+                    })
+                    .align_x(alignment::Horizontal::Center)
+                    .into(),
+            )
+        }
+        LoadState::Idle => {
+            let es = EmptyState::info(
+                "Nothing loaded yet",
+                "This panel hasn't loaded its data. Refresh to fetch it.",
+            )
+            .with_icon(Icon::StatusUnknown);
+            Some(empty_state(es, palette, on_retry))
+        }
+        LoadState::Offline => {
+            let es = EmptyState::with_cta(
+                "Offline",
+                "Can't reach the mesh right now. The panel will recover when \
+                 connectivity returns — or retry now.",
+                "Retry",
+            )
+            .with_icon(Icon::Wifi);
+            Some(empty_state(es, palette, on_retry))
+        }
+        LoadState::Failed(err) => Some(error_state(err.clone(), palette, on_retry)),
+    }
 }
 
 fn mde_shadow_to_iced(s: MdeShadow) -> IcedShadow {
@@ -743,5 +905,68 @@ mod tests {
         let palette = crate::live_theme::palette();
         let card = mde_theme::ObjectCard::small(mde_theme::Icon::Fleet, "smoke");
         let _: Element<'_, ()> = object_card(card, palette);
+    }
+
+    // ---- MOTION-NET-1 — LoadState chrome -----------------------------
+
+    #[test]
+    fn badge_severity_maps_every_status_severity() {
+        // Non-exhaustive match here fails to compile if a StatusSeverity
+        // variant is dropped — the same compile-time guard the badge test uses.
+        assert_eq!(
+            badge_severity(StatusSeverity::Neutral),
+            BadgeSeverity::Neutral
+        );
+        assert_eq!(badge_severity(StatusSeverity::Info), BadgeSeverity::Info);
+        assert_eq!(
+            badge_severity(StatusSeverity::Success),
+            BadgeSeverity::Success
+        );
+        assert_eq!(
+            badge_severity(StatusSeverity::Warning),
+            BadgeSeverity::Warning
+        );
+        assert_eq!(
+            badge_severity(StatusSeverity::Danger),
+            BadgeSeverity::Danger
+        );
+    }
+
+    #[test]
+    fn load_state_chrome_renders_only_the_non_content_states() {
+        // MOTION-NET-1 acceptance: each non-content state paints distinct
+        // chrome; content-bearing states defer to the panel's own data view.
+        let palette = crate::live_theme::palette();
+        let retry = || ();
+
+        // Content-bearing → no chrome (panel renders its data).
+        assert!(load_state_chrome::<()>(&LoadState::Loaded, palette, retry).is_none());
+        assert!(load_state_chrome::<()>(&LoadState::Degraded, palette, retry).is_none());
+        assert!(
+            load_state_chrome::<()>(&LoadState::Refreshing { stale: true }, palette, retry)
+                .is_none()
+        );
+
+        // Non-content → chrome.
+        assert!(load_state_chrome::<()>(&LoadState::Idle, palette, retry).is_some());
+        assert!(load_state_chrome::<()>(&LoadState::Loading, palette, retry).is_some());
+        assert!(load_state_chrome::<()>(&LoadState::Offline, palette, retry).is_some());
+        assert!(load_state_chrome::<()>(&LoadState::Failed("io".into()), palette, retry).is_some());
+    }
+
+    #[test]
+    fn load_state_pill_constructs_for_every_state() {
+        let palette = crate::live_theme::palette();
+        for s in [
+            LoadState::Idle,
+            LoadState::Loading,
+            LoadState::Refreshing { stale: true },
+            LoadState::Loaded,
+            LoadState::Degraded,
+            LoadState::Offline,
+            LoadState::Failed("x".into()),
+        ] {
+            let _: Element<'_, ()> = load_state_pill(&s, palette);
+        }
     }
 }
