@@ -20,6 +20,19 @@
 //! container-stripped peer), the worker logs once and idles — never panics.
 //! Provider `Cli`/`Api` methods aren't process-driven here (later VPN-GW
 //! provider-integration tasks); the planner skips them.
+//!
+//! VPN-GW-3 — selective egress. After bring-up, the same tick reconciles the
+//! per-tunnel **egress policy** (policy-routing + NAT + kill-switch). The pure
+//! plan is built in [`mackes_mesh_types::vpn`] ([`plan_egress_apply`] /
+//! [`plan_egress_teardown`]); here a pure planner ([`plan_egress`]) folds the
+//! config + the set of present interfaces into the ordered `ip`/`nft` plan, and
+//! a thin executor ([`run_egress_cmd`]) runs each with the bounded proc helpers.
+//! A tunnel whose egress is enabled AND whose interface is up gets its routing +
+//! NAT applied (idempotent — `ip rule add` / `ip route replace` / `nft add`); a
+//! tunnel that is enabled but DOWN gets its egress torn down so marked traffic
+//! is dropped by the kill-switch instead of leaking to the plaintext WAN. If
+//! `ip`/`nft` are absent the egress reconcile is skipped (logged once) — no
+//! panic, exactly like the bring-up degradation.
 
 #![cfg(feature = "async-services")]
 
@@ -27,7 +40,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use mackes_mesh_types::vpn::{self, Method, TunnelDef, VpnConfig};
+use mackes_mesh_types::vpn::{self, EgressCmd, Method, TunnelDef, VpnConfig};
 
 use super::{ShutdownToken, Worker};
 
@@ -78,7 +91,31 @@ impl VpnGatewayWorker {
         for argv in plan_bring_up(&cfg, &present_ifaces) {
             run_argv(&argv);
         }
+        // VPN-GW-3 — reconcile selective egress after bring-up. Skip entirely
+        // when neither policy-routing tool is present (degrade gracefully).
+        if egress_tools_present() {
+            for cmd in plan_egress(&cfg, &present_ifaces) {
+                run_egress_cmd(&cmd);
+            }
+        } else if cfg.tunnel.iter().any(|t| t.egress.enabled) {
+            tracing::debug!("vpn_gateway: ip/nft absent; skipping selective-egress reconcile");
+        }
     }
+}
+
+/// Are the selective-egress tools (`ip` + `nft`) present? Egress needs both
+/// (policy routing AND nftables NAT/kill-switch), so require both.
+fn egress_tools_present() -> bool {
+    binary_present("ip") && nft_present()
+}
+
+/// `nft --version` probe. (`nft` may be absent on a container-stripped peer.)
+fn nft_present() -> bool {
+    let mut cmd = Command::new("nft");
+    cmd.arg("--version");
+    crate::workers::proc::status_with_timeout(cmd, crate::workers::proc::DEFAULT_CMD_TIMEOUT)
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Is `ifname` a present network interface? (`ip -o link show <ifname>`.) The
@@ -151,6 +188,69 @@ where
     plan_bring_up_with(cfg, iface_present, |t| {
         std::path::Path::new(&openvpn_config_path(t)).exists()
     })
+}
+
+/// PURE egress planner — fold the desired config + a present-interface predicate
+/// into the ordered `ip`/`nft` plan that reconciles selective egress for every
+/// tunnel that opts in (`egress.enabled`).
+///
+/// * If any tunnel has egress enabled, the plan starts with the idempotent
+///   nftables scaffolding ([`vpn::egress_nft_table_setup_argv`]) so the NAT +
+///   kill-switch chains exist.
+/// * An enabled tunnel whose interface is **up** gets its apply plan
+///   ([`vpn::plan_egress_apply`]): carve-out + fwmark rule + per-table default
+///   route + masquerade (+ kill-switch drop when configured). Idempotent
+///   (`ip rule add` is a quiet no-op if present; `ip route replace`; `nft add`).
+/// * An enabled tunnel whose interface is **down** gets its teardown
+///   ([`vpn::plan_egress_teardown`]) so its routing entries are removed and the
+///   kill-switch drop (already in the nft table) blocks the marked traffic — no
+///   plaintext leak while the tunnel is down.
+///
+/// Disabled tunnels contribute nothing. The plan is pure data — it performs no
+/// I/O and is fully unit-testable without `ip`/`nft`.
+#[must_use]
+pub fn plan_egress<P>(cfg: &VpnConfig, iface_present: P) -> Vec<EgressCmd>
+where
+    P: Fn(&str) -> bool,
+{
+    let any_egress = cfg.tunnel.iter().any(|t| t.egress.enabled);
+    if !any_egress {
+        return Vec::new();
+    }
+    let mut plan = vpn::egress_nft_table_setup_argv();
+    for t in &cfg.tunnel {
+        if !t.egress.enabled {
+            continue;
+        }
+        if iface_present(&t.ifname()) {
+            plan.extend(vpn::plan_egress_apply(t));
+        } else {
+            // Enabled but down → tear the routing down (kill-switch drop in the
+            // nft table keeps the marked traffic from leaking).
+            plan.extend(vpn::plan_egress_teardown(t));
+        }
+    }
+    plan
+}
+
+/// Run one egress `ip`/`nft` command with a bounded timeout. Honest: a nonzero
+/// exit is logged at debug (many are benign — `ip rule add` of an existing rule,
+/// a teardown of an absent table), a spawn failure at warn. Never panics.
+fn run_egress_cmd(cmd: &EgressCmd) {
+    let mut c = Command::new(cmd.prog);
+    c.args(&cmd.args);
+    match crate::workers::proc::status_with_timeout(c, crate::workers::proc::DEFAULT_CMD_TIMEOUT) {
+        Ok(s) if s.success() => {
+            tracing::debug!(argv = ?cmd.argv(), "vpn_gateway: egress rule applied");
+        }
+        Ok(s) => {
+            // Benign-on-reapply (rule already present / table already gone).
+            tracing::debug!(argv = ?cmd.argv(), code = ?s.code(), "vpn_gateway: egress rule nonzero (often idempotent no-op)");
+        }
+        Err(e) => {
+            tracing::warn!(argv = ?cmd.argv(), error = %e, "vpn_gateway: egress rule did not run");
+        }
+    }
 }
 
 /// Run one bring-up argv with a bounded timeout. Honest on failure (logs at
@@ -299,6 +399,74 @@ mod tests {
     fn name_matches_the_module_and_census() {
         let w = VpnGatewayWorker::new(PathBuf::from("/tmp"));
         assert_eq!(w.name(), "vpn_gateway");
+    }
+
+    // ── VPN-GW-3 — selective-egress planner ─────────────────────────────────
+
+    fn egress_tun(id: &str, enabled: bool, kill_switch: bool) -> TunnelDef {
+        let mut t = tun(id, Method::Wg);
+        t.egress = mackes_mesh_types::vpn::EgressPolicy {
+            enabled,
+            kill_switch,
+            mark: None,
+        };
+        t
+    }
+
+    #[test]
+    fn no_egress_tunnels_plans_nothing() {
+        // No tunnel opts into egress → no nft scaffolding, no rules.
+        let c = cfg(&[tun("plain", Method::Wg)]);
+        assert!(plan_egress(&c, |_| true).is_empty());
+    }
+
+    #[test]
+    fn up_egress_tunnel_gets_scaffold_then_apply() {
+        let c = cfg(&[egress_tun("mullvad1", true, true)]);
+        // Interface up → scaffold (3) + apply (5 w/ kill-switch).
+        let plan = plan_egress(&c, |_| true);
+        assert_eq!(plan.len(), 3 + 5);
+        // First three are the idempotent nft scaffold.
+        assert_eq!(&plan[..3], &vpn::egress_nft_table_setup_argv()[..]);
+        // The per-tunnel apply follows.
+        assert_eq!(
+            &plan[3..],
+            &vpn::plan_egress_apply(&egress_tun("mullvad1", true, true))[..]
+        );
+    }
+
+    #[test]
+    fn down_egress_tunnel_is_torn_down_not_applied() {
+        let c = cfg(&[egress_tun("mullvad1", true, true)]);
+        // Interface DOWN → scaffold (3) + teardown (2), no apply.
+        let plan = plan_egress(&c, |_| false);
+        assert_eq!(plan.len(), 3 + 2);
+        assert_eq!(
+            &plan[3..],
+            &vpn::plan_egress_teardown(&egress_tun("mullvad1", true, true))[..]
+        );
+        // None of the teardown commands install a route (no leak path opened).
+        for cmd in &plan[3..] {
+            let joined = cmd.argv().join(" ");
+            assert!(!joined.contains("replace default"));
+        }
+    }
+
+    #[test]
+    fn disabled_tunnel_contributes_nothing_even_when_up() {
+        // One enabled (to trigger scaffolding) + one disabled; the disabled one
+        // adds no rules of its own.
+        let c = cfg(&[
+            egress_tun("on", true, false),
+            egress_tun("off", false, true),
+        ]);
+        let plan = plan_egress(&c, |_| true);
+        // scaffold(3) + apply for "on" only (4, no kill-switch).
+        assert_eq!(plan.len(), 3 + 4);
+        let off_if = egress_tun("off", false, true).ifname();
+        for cmd in &plan {
+            assert!(!cmd.argv().join(" ").contains(&off_if));
+        }
     }
 
     #[tokio::test]
