@@ -120,6 +120,13 @@ xe vbd-create vm-uuid="$VM" vdi-uuid="$SVDI" device=1 bootable=false type=Disk m
 xe vif-create vm-uuid="$VM" network-uuid="$NET" device=0 >/dev/null
 xe vm-param-set uuid="$VM" HVM-boot-policy="BIOS order"
 xe vm-param-set uuid="$VM" HVM-boot-params:order=c
+# BUILD-FARM — survive a host reboot. Without auto_poweron the build VM stays
+# halted after any dom0 reboot/shutdown (the live "build VM down" outage that
+# blocked every GUI/farm build). XCP-ng gates per-VM auto-start on BOTH the VM
+# flag AND the pool flag, so set both (idempotent).
+xe vm-param-set uuid="$VM" other-config:auto_poweron=true
+POOL="$(xe pool-list params=uuid --minimal | tr -d '\r')"
+[ -n "$POOL" ] && xe pool-param-set uuid="$POOL" other-config:auto_poweron=true
 xe vm-start uuid="$VM"
 sshpass -e ssh $SSHOPTS "$XCP_USER@$XCP_HOST" "rm -f /tmp/disk.raw /tmp/seed.iso" || true
 
