@@ -34,3 +34,9 @@ target-f43/
 # shipped in the RPM; third-party binaries, not source.
 /vendor/birthright/
 install-helpers/__pycache__/
+
+# XCP build farm — the local slot registry (per-host IPs/keys) + structured gate
+# results written by install-helpers/xcp-build.sh + xcp-slots.sh; machine-local,
+# not source.
+/.xcp-slots.conf
+/.xcp-build/

@@ -1,10 +1,22 @@
 # On-demand DigitalOcean lighthouses (Option A: doctl + cloud-init)
 
-Stand up a MCNF founding lighthouse on a fresh DO Fedora droplet with one
-command. Each droplet founds its **own** mesh — `AI_GOVERNANCE.md` §8 (one
-founding lighthouse per mesh, ≤8 flat-trust peers). "Replicate lighthouses on
-demand" = spin up the Nth independent mesh; it is **not** multiple lighthouses
-for one mesh (that needs the out-of-scope multi-lighthouse roster work).
+Stand up MCNF lighthouses on fresh DO Fedora droplets with one command. Two
+shapes:
+
+- **One founding lighthouse** (`do-lighthouse-up.sh`) — the droplet founds its
+  **own** isolated mesh. Use it to spin up the Nth independent mesh.
+- **A single mesh with up to 3 lighthouses** (`do-mesh-lighthouses.sh`) —
+  `AI_GOVERNANCE.md` §8 (2026-06-14): a workgroup of **up to 3 lighthouses + 9
+  peers (12 nodes)**. LH1 founds + holds the CA; LH2/LH3 join as additional
+  lighthouses (etcd-quorum + NAT-relay/discovery + Mesh-Sync redundancy).
+
+> **Frontier (verify after standing up):** LH2/LH3 join as the lighthouse *tier*
+> and the CA signs them, but distributing their public IPs to every peer as
+> additional Nebula anchors/relays (and the etcd quorum) is the
+> **SUBSTRATE-V2/HA multi-anchor roster** work — `mackesd ca sign-csr` currently
+> builds a single-entry lighthouse roster. Confirm with `mackesd peers` on LH1
+> that LH2/LH3 appear as `role=lighthouse` and that peers relay through them
+> before relying on them as redundant public anchors.
 
 ## Pieces
 
@@ -17,8 +29,14 @@ for one mesh (that needs the out-of-scope multi-lighthouse roster work).
 - **`install-helpers/do-lighthouse-up.sh`** — the operator-side `doctl` wrapper:
   render the cloud-init, ensure a DO Cloud Firewall for the ports, create the
   droplet with the user-data, wait for bootstrap, and print the IP + join token.
+- **`install-helpers/do-lighthouse-join-cloudinit.sh`** — the join counterpart of
+  the cloud-init: installs `magic-mesh` then `mackesd join '<token>' --role
+  lighthouse` into an existing mesh (LH2/LH3) and starts the services.
+- **`install-helpers/do-mesh-lighthouses.sh`** — the multi-lighthouse orchestrator:
+  founds LH1, then mints a `add-peer --role lighthouse` token on LH1 and boots
+  LH2/LH3 droplets that join the SAME mesh. `--count 1..3`.
 
-## Use
+## Use — one founding lighthouse (own mesh)
 
 ```sh
 doctl auth init                       # once
@@ -36,6 +54,19 @@ Run that on any joining box (with the new build), or `mde-enroll` and paste it.
 
 Options: `--region --size --image --ssh-key --repo-baseurl --rpm-url
 --enroll-port --role --tag --keep-on-fail` (see `--help`).
+
+## Use — three lighthouses, one mesh (§8)
+
+```sh
+doctl auth init                       # once
+./install-helpers/do-mesh-lighthouses.sh home-mesh --count 3 \
+    --region nyc3 --size s-1vcpu-1gb --image fedora-42-x64
+```
+
+Founds LH1 (CA holder), then stands up LH2 + LH3 joining the same mesh. Ends
+with the 3 lighthouse IPs and the `mackesd peers` verification command. See the
+**Frontier** note above — confirm LH2/LH3 are distributed as public anchors
+before relying on them for redundancy.
 
 ## The glibc / image prerequisite (important)
 
