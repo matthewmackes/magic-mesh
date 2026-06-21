@@ -609,6 +609,241 @@ pub fn save_routes(
     Ok(path)
 }
 
+// ── VPN-GW-6 — tunnel health + exit-IP/leak verification + verdict ──────────
+//
+// VPN-GW-4's selector treats a tunnel as "up" iff its interface is present. That
+// catches a HARD-down tunnel but not a SILENTLY-leaking one: an interface that
+// is up while traffic exits the plaintext WAN (the exit IP equals the box's WAN
+// IP) or while DNS bypasses the tunnel is *worse* than down — it looks healthy
+// but isn't private. VPN-GW-6 adds a real health verdict that the worker feeds
+// back into GW-4's selector as the `is_up` input, so an unhealthy primary fails
+// over (or the kill-switch blocks) and a `vpn/tunnel-down` alert fires.
+//
+// This module holds the dep-free, pure half: the typed [`TunnelHealth`] result,
+// the [`HealthVerdict`], and the PURE decision function [`verdict_for`] that maps
+// probe outputs → verdict (unit-tested without a live tunnel). The probe I/O
+// (liveness reachability, the tunnel-bound exit-IP echo, the DNS-leak probe) and
+// the WAN-IP discovery sit in the `mackesd` `vpn_gateway` worker behind a small
+// trait seam so the verdict logic is testable with mocked probe outputs. The
+// LIVE end-to-end exit-IP/leak check needs a real provider tunnel + creds (not
+// available here) and is deferred — the seam, verdict, failover wiring, alert-
+// on-transition, and exit-IP publish are all built + unit-tested without one.
+
+/// VPN-GW-6 — the health verdict for one tunnel, derived purely from the probe
+/// outputs by [`verdict_for`]. Only [`HealthVerdict::Healthy`] is treated as
+/// "up" by the failover selector ([`health_is_up`]); `Down` and `Leaking` are
+/// both NOT-up so the worker fails over (or the kill-switch blocks).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HealthVerdict {
+    /// Live, exit IP is the provider's (≠ the box WAN), no DNS leak — trustworthy.
+    Healthy,
+    /// Not live: the interface is absent or the through-tunnel reachability probe
+    /// failed. Egress can't flow — fail over / block. The default (a tunnel with
+    /// no observation yet is treated as down, never silently "healthy").
+    #[default]
+    Down,
+    /// Live, but egress is NOT private: the verified exit IP equals the box's WAN
+    /// IP (traffic is leaking past the tunnel) OR a DNS-leak probe shows the
+    /// resolver path bypasses the tunnel. Worse than down — must fail over.
+    Leaking,
+}
+
+impl HealthVerdict {
+    /// Is this verdict "up" for the [`select_active`] failover selector? Only
+    /// [`HealthVerdict::Healthy`] counts as up — `Down`/`Leaking` are not-up so
+    /// the selector skips to the next chain tunnel (and all-not-up → kill-switch).
+    #[must_use]
+    pub fn is_up(&self) -> bool {
+        matches!(self, HealthVerdict::Healthy)
+    }
+
+    /// The serialized token used in the published status + the alert
+    /// (`"healthy"`/`"down"`/`"leaking"`). Stable for the UI (GW-7) + the relay.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HealthVerdict::Healthy => "healthy",
+            HealthVerdict::Down => "down",
+            HealthVerdict::Leaking => "leaking",
+        }
+    }
+}
+
+/// VPN-GW-6 — the typed result of checking one tunnel's health. Carries the raw
+/// probe observations (`live`, `exit_ip`, `exit_ip_is_provider`, `dns_leak`) the
+/// verdict was derived from, plus the [`verdict`](Self::verdict) itself, so the
+/// published `route-status`/`tunnel-health` read can surface the verified exit IP
+/// for the UI (GW-7) and a human can see *why* a tunnel was failed over.
+///
+/// Built by the worker's pure `check_tunnel` from a [`HealthProbe`]'s outputs;
+/// the verdict is [`verdict_for`] over the three booleans, so the decision logic
+/// is unit-tested independently of any I/O.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelHealth {
+    /// The tunnel id this health is for (`mvpn-<id>` derives from it).
+    pub tunnel_id: String,
+    /// Liveness: the interface is present AND a reachability probe THROUGH the
+    /// tunnel succeeded. `false` → the verdict is [`HealthVerdict::Down`].
+    pub live: bool,
+    /// The verified public exit IP observed via a tunnel-bound IP echo, if the
+    /// echo returned one. `None` when the tunnel is down / the echo failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_ip: Option<String>,
+    /// Does the exit IP look like the provider's, NOT the box's plaintext WAN?
+    /// `false` when the exit IP equals the WAN IP (a leak) or no exit IP was
+    /// observed — either way egress is not confirmed private.
+    pub exit_ip_is_provider: bool,
+    /// Did the DNS-leak probe detect the resolver path bypassing the tunnel?
+    /// `true` → leaking even if the exit IP looked right.
+    pub dns_leak: bool,
+    /// The derived verdict ([`verdict_for`] over `live`/`exit_ip_is_provider`/
+    /// `dns_leak`). The single field the failover selector + alert key on.
+    pub verdict: HealthVerdict,
+}
+
+impl TunnelHealth {
+    /// Construct from the raw probe observations, deriving the verdict purely via
+    /// [`verdict_for`]. The one constructor so the stored `verdict` can never
+    /// disagree with the booleans it was derived from.
+    #[must_use]
+    pub fn from_probes(
+        tunnel_id: impl Into<String>,
+        live: bool,
+        exit_ip: Option<String>,
+        exit_ip_is_provider: bool,
+        dns_leak: bool,
+    ) -> Self {
+        Self {
+            tunnel_id: tunnel_id.into(),
+            live,
+            exit_ip,
+            exit_ip_is_provider,
+            dns_leak,
+            verdict: verdict_for(live, exit_ip_is_provider, dns_leak),
+        }
+    }
+
+    /// Is this tunnel up for the failover selector? Delegates to the verdict —
+    /// only [`HealthVerdict::Healthy`] is up.
+    #[must_use]
+    pub fn is_up(&self) -> bool {
+        self.verdict.is_up()
+    }
+}
+
+/// VPN-GW-6 — the PURE health-verdict decision logic. Given the three probe
+/// outputs, return the [`HealthVerdict`]:
+///
+/// * not `live` → [`HealthVerdict::Down`] (no egress can flow; the exit-IP /
+///   DNS observations are moot when the interface/reachability is gone).
+/// * live but `dns_leak` OR not `exit_ip_is_provider` → [`HealthVerdict::Leaking`]
+///   (the tunnel is up but egress is NOT private — the exit IP equals the box
+///   WAN, or DNS bypasses the tunnel). This is the silent-leak case GW-6 exists
+///   to catch.
+/// * live AND exit IP is the provider's AND no DNS leak → [`HealthVerdict::Healthy`].
+///
+/// Pure — no I/O. This is the whole health policy; the worker just feeds it the
+/// probe booleans, so it's unit-tested exhaustively without a live tunnel.
+#[must_use]
+pub fn verdict_for(live: bool, exit_ip_is_provider: bool, dns_leak: bool) -> HealthVerdict {
+    if !live {
+        return HealthVerdict::Down;
+    }
+    if dns_leak || !exit_ip_is_provider {
+        return HealthVerdict::Leaking;
+    }
+    HealthVerdict::Healthy
+}
+
+/// VPN-GW-6 — adapt a per-tunnel health map into the `is_up` predicate
+/// [`select_active`] / [`should_fail_over`] consume, so the SAME GW-4 selector
+/// drives failover off the health verdict instead of the bare interface check.
+/// A tunnel with no health entry is treated as NOT up (fail closed — never route
+/// egress through a tunnel we haven't confirmed healthy). Pure.
+///
+/// The worker calls `select_active(route, |id| health_is_up(&health_by_id, id))`
+/// — no duplication of the selector; the verdict simply replaces "interface
+/// present" as the up-ness input.
+#[must_use]
+pub fn health_is_up(
+    health_by_id: &std::collections::BTreeMap<String, TunnelHealth>,
+    tunnel_id: &str,
+) -> bool {
+    health_by_id.get(tunnel_id).is_some_and(TunnelHealth::is_up)
+}
+
+/// VPN-GW-6 — the deterministic alert id for a tunnel's `vpn/tunnel-down` alert.
+/// Keys only on the gateway host + tunnel id so a re-fire of the SAME unhealthy
+/// tunnel de-dupes (the relay de-dupes by id) — the worker only WRITES the alert
+/// on a state transition, but a stable id also keeps a double-tick from toasting
+/// twice. Sanitizes `/`/`.`/space/`:` so the id is a safe filename component.
+#[must_use]
+pub fn tunnel_down_alert_id(host: &str, tunnel_id: &str) -> String {
+    let safe = |s: &str| s.replace(['/', '.', ' ', ':'], "-");
+    format!("vpn-tunnel-down-{}-{}", safe(host), safe(tunnel_id))
+}
+
+/// VPN-GW-6 — build the `vpn/tunnel-down` alert JSON for an unhealthy tunnel on
+/// `host`. Pure + testable; the panel/relay read `id`/`severity`/`alert`/`host`/
+/// `tunnel`/`verdict`/`summary` (same shape as the DDNS `ddns/auth` alert the
+/// MON-3 file-drop path surfaces). Severity is `crit` — a leaking/down egress
+/// tunnel means traffic is either blocked or exposed.
+#[must_use]
+pub fn tunnel_down_alert_event(host: &str, health: &TunnelHealth) -> serde_json::Value {
+    let summary = match health.verdict {
+        HealthVerdict::Down => format!(
+            "VPN tunnel '{}' on {host} is DOWN — egress failed over (or the \
+             kill-switch is blocking).",
+            health.tunnel_id
+        ),
+        HealthVerdict::Leaking => format!(
+            "VPN tunnel '{}' on {host} is LEAKING — the exit IP is not the \
+             provider's (matches the WAN) or DNS bypasses the tunnel; egress is \
+             NOT private. Failed over.",
+            health.tunnel_id
+        ),
+        // verdict==Healthy never reaches the alert path (only a transition INTO
+        // an unhealthy state alerts), but keep the message honest if it does.
+        HealthVerdict::Healthy => format!("VPN tunnel '{}' on {host} recovered.", health.tunnel_id),
+    };
+    serde_json::json!({
+        "id": tunnel_down_alert_id(host, &health.tunnel_id),
+        "severity": "crit",
+        "category": "vpn.tunnel-down",
+        "alert": "vpn/tunnel-down",
+        "host": host,
+        "tunnel": health.tunnel_id,
+        "verdict": health.verdict.as_str(),
+        "exit_ip": health.exit_ip,
+        "summary": summary,
+        "fired_by": "vpn_gateway",
+    })
+}
+
+/// VPN-GW-6 — should the `vpn/tunnel-down` alert FIRE for `tunnel_id` given the
+/// previous + current verdicts? Fire ONLY on a transition INTO an unhealthy
+/// state (healthy/unknown → down|leaking, or one unhealthy verdict to a
+/// DIFFERENT unhealthy verdict), so a tunnel that stays down does not re-toast
+/// every tick. A recovery (→ healthy) does not fire (the relay clears stale
+/// alerts). Pure — the worker tracks `prev` in its persisted health state.
+///
+/// `prev = None` means "no prior observation": a first-ever observation that is
+/// already unhealthy DOES alert (the operator must learn a never-healthy tunnel
+/// is leaking, not silently swallow it).
+#[must_use]
+pub fn should_alert_transition(prev: Option<HealthVerdict>, current: HealthVerdict) -> bool {
+    if current.is_up() {
+        // A healthy current state never alerts (it may clear, handled elsewhere).
+        return false;
+    }
+    match prev {
+        // Never seen before, or previously healthy → entering unhealthy: alert.
+        None => true,
+        Some(p) => p != current,
+    }
+}
+
 /// The `wg-quick up <ifname>` argv (the config is written to
 /// `/etc/wireguard/<ifname>.conf` by the worker from the decrypted creds).
 #[must_use]
@@ -1633,5 +1868,130 @@ mod tests {
                     [route.scope]\nkind = \"any-mesh\"\n";
         let parsed = RouteConfig::from_toml_str(toml).unwrap();
         assert!(parsed.route[0].kill_switch, "kill_switch defaults to true");
+    }
+
+    // ── VPN-GW-6 — health verdict + failover wiring + alert transition ───────
+
+    #[test]
+    fn verdict_down_when_not_live_regardless_of_other_probes() {
+        // A dead interface/reachability is Down even if the (stale) exit-IP /
+        // dns observations would otherwise look fine — no egress can flow.
+        assert_eq!(verdict_for(false, true, false), HealthVerdict::Down);
+        assert_eq!(verdict_for(false, false, true), HealthVerdict::Down);
+    }
+
+    #[test]
+    fn verdict_leaking_when_live_but_exit_ip_is_wan_or_dns_leaks() {
+        // Live but the exit IP isn't the provider's (== the WAN) → leaking.
+        assert_eq!(verdict_for(true, false, false), HealthVerdict::Leaking);
+        // Live, exit IP looks right, but DNS bypasses the tunnel → leaking.
+        assert_eq!(verdict_for(true, true, true), HealthVerdict::Leaking);
+        // Both wrong → still leaking.
+        assert_eq!(verdict_for(true, false, true), HealthVerdict::Leaking);
+    }
+
+    #[test]
+    fn verdict_healthy_only_when_live_provider_exit_and_no_dns_leak() {
+        assert_eq!(verdict_for(true, true, false), HealthVerdict::Healthy);
+        assert!(HealthVerdict::Healthy.is_up());
+        assert!(!HealthVerdict::Down.is_up());
+        assert!(!HealthVerdict::Leaking.is_up());
+    }
+
+    #[test]
+    fn tunnel_health_from_probes_keeps_verdict_consistent() {
+        let h = TunnelHealth::from_probes("m1", true, Some("185.65.1.1".into()), true, false);
+        assert_eq!(h.verdict, HealthVerdict::Healthy);
+        assert!(h.is_up());
+        assert_eq!(h.exit_ip.as_deref(), Some("185.65.1.1"));
+        // A live tunnel whose exit IP is the WAN is leaking, not healthy.
+        let leak = TunnelHealth::from_probes("m1", true, Some("9.9.9.9".into()), false, false);
+        assert_eq!(leak.verdict, HealthVerdict::Leaking);
+        assert!(!leak.is_up());
+        // Down carries no exit IP.
+        let down = TunnelHealth::from_probes("m1", false, None, false, false);
+        assert_eq!(down.verdict, HealthVerdict::Down);
+    }
+
+    #[test]
+    fn health_drives_the_gw4_selector_for_failover() {
+        // The SAME GW-4 selector, driven off the health verdict via health_is_up.
+        let r = route(RouteScope::AnyMesh, "g", &["primary", "fallback"], true);
+        let mut health = std::collections::BTreeMap::new();
+        // primary leaking, fallback healthy → the selector fails over to fallback.
+        health.insert(
+            "primary".to_string(),
+            TunnelHealth::from_probes("primary", true, Some("9.9.9.9".into()), false, false),
+        );
+        health.insert(
+            "fallback".to_string(),
+            TunnelHealth::from_probes("fallback", true, Some("185.65.1.1".into()), true, false),
+        );
+        let active = select_active(&r, |id| health_is_up(&health, id));
+        assert_eq!(active.tunnel_id(), Some("fallback"));
+        // A leaking primary is "not up" → should_fail_over agrees.
+        assert!(should_fail_over(&r, "primary", |id| health_is_up(
+            &health, id
+        )));
+    }
+
+    #[test]
+    fn all_unhealthy_yields_all_down_so_killswitch_decides() {
+        let r = route(RouteScope::AnyMesh, "g", &["a", "b"], true);
+        let mut health = std::collections::BTreeMap::new();
+        health.insert(
+            "a".to_string(),
+            TunnelHealth::from_probes("a", false, None, false, false), // down
+        );
+        health.insert(
+            "b".to_string(),
+            TunnelHealth::from_probes("b", true, Some("9.9.9.9".into()), false, false), // leaking
+        );
+        match select_active(&r, |id| health_is_up(&health, id)) {
+            ActiveTunnel::AllDown { kill_switch } => assert!(kill_switch),
+            other => panic!("expected AllDown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_health_entry_is_treated_as_not_up_fail_closed() {
+        let health: std::collections::BTreeMap<String, TunnelHealth> =
+            std::collections::BTreeMap::new();
+        // No observation → fail closed (never route through an unverified tunnel).
+        assert!(!health_is_up(&health, "ghost"));
+    }
+
+    #[test]
+    fn alert_fires_only_on_transition_into_unhealthy_not_every_tick() {
+        use HealthVerdict::{Down, Healthy, Leaking};
+        // healthy → down: alert.
+        assert!(should_alert_transition(Some(Healthy), Down));
+        // down → down: NO re-alert (don't spam a steady-down tunnel).
+        assert!(!should_alert_transition(Some(Down), Down));
+        // down → leaking: alert (the failure MODE changed — operator should know).
+        assert!(should_alert_transition(Some(Down), Leaking));
+        // leaking → leaking: no re-alert.
+        assert!(!should_alert_transition(Some(Leaking), Leaking));
+        // anything → healthy: never alerts (recovery clears, doesn't toast).
+        assert!(!should_alert_transition(Some(Down), Healthy));
+        assert!(!should_alert_transition(None, Healthy));
+        // first-ever observation already unhealthy → alert (don't swallow it).
+        assert!(should_alert_transition(None, Down));
+        assert!(should_alert_transition(None, Leaking));
+    }
+
+    #[test]
+    fn tunnel_down_alert_event_is_relayable_and_id_is_stable() {
+        let h = TunnelHealth::from_probes("mullvad1", true, Some("9.9.9.9".into()), false, false);
+        let ev = tunnel_down_alert_event("eagle", &h);
+        assert_eq!(ev["alert"], "vpn/tunnel-down");
+        assert_eq!(ev["severity"], "crit");
+        assert_eq!(ev["host"], "eagle");
+        assert_eq!(ev["tunnel"], "mullvad1");
+        assert_eq!(ev["verdict"], "leaking");
+        assert_eq!(ev["id"], "vpn-tunnel-down-eagle-mullvad1");
+        // The id is filesystem-safe even for a peer:host id with dots/colons.
+        let id = tunnel_down_alert_id("peer:eagle.lan", "mvpn/odd");
+        assert!(!id.contains([':', '.', '/', ' ']), "{id}");
     }
 }

@@ -77,7 +77,10 @@ impl VpnService {
 /// assignment), `list-routes` (the durable assignments), and `route-status`
 /// (each scope's gateway + chain + the currently-active tunnel from the
 /// failover selector run against live tunnel status).
-pub const ACTION_VERBS: [&str; 12] = [
+///
+/// VPN-GW-6 adds `tunnel-health` — the gateway's published per-tunnel verified
+/// health (verdict + exit IP) — and enriches `route-status` with the same.
+pub const ACTION_VERBS: [&str; 13] = [
     "list-tunnels",
     "add-tunnel",
     "remove-tunnel",
@@ -90,6 +93,7 @@ pub const ACTION_VERBS: [&str; 12] = [
     "clear-route",
     "list-routes",
     "route-status",
+    "tunnel-health",
 ];
 
 /// Responder poll interval.
@@ -220,6 +224,9 @@ pub fn build_reply(svc: &VpnService, verb: &str, req_body: Option<&str>) -> Stri
         // runs on — best-effort visibility; the gateway node's own worker is the
         // authority that actually applies the egress.
         "route-status" => build_route_status_reply(svc),
+        // VPN-GW-6 — the gateway's published per-tunnel verified health (verdict
+        // + exit IP). Pure read of the worker's published state.
+        "tunnel-health" => build_tunnel_health_reply(svc),
         other => err(format!("unknown vpn verb: {other}")),
     }
 }
@@ -361,36 +368,92 @@ fn build_clear_route_reply(svc: &VpnService, req_body: Option<&str>) -> String {
     }
 }
 
-/// VPN-GW-4 — report, per assigned scope, the gateway + the ordered chain + the
-/// currently-active tunnel (the failover selector run against live tunnel
-/// status, seen from this box) + the kill-switch flag. Pure visibility — it does
-/// not apply anything (the gateway node's `vpn_gateway` worker does that).
+/// VPN-GW-4/6 — report, per assigned scope, the gateway + the ordered chain + the
+/// currently-active tunnel (the failover selector) + the kill-switch flag, plus
+/// (VPN-GW-6) the per-chain-tunnel **verified health**: verdict + the verified
+/// exit IP the gateway's `vpn_gateway` worker published. The active tunnel is
+/// preferentially derived from the published health verdict (the same input the
+/// worker fails over on) so the panel sees the SAME pick the worker applied;
+/// when no health has been published yet (the worker hasn't ticked, or this
+/// responder runs on a non-gateway box) it falls back to the bare interface check
+/// seen from this box. Pure visibility — it applies nothing.
 fn build_route_status_reply(svc: &VpnService) -> String {
     let root = svc.workgroup_root.as_path();
     let routes = vpn::load_routes(root);
     let tunnels = vpn::load(root);
+    // VPN-GW-6 — the verified health the gateway worker published (verdict +
+    // exit IP per tunnel id). Absent/empty when no worker has run yet.
+    let health = crate::workers::vpn_gateway::HealthState::load(
+        &crate::workers::vpn_gateway::default_health_path(root),
+    );
     let statuses: Vec<serde_json::Value> = routes
         .route
         .iter()
         .map(|r| {
-            // The selector decides the active tunnel from the chain + each
-            // tunnel's live interface presence. A chain entry with no def is
-            // treated as down (can't be up if it isn't configured).
-            let active = vpn::select_active(r, |tunnel_id| {
-                tunnels
-                    .get(tunnel_id)
-                    .is_some_and(|t| iface_up(svc.spawn, &t.ifname()))
-            });
+            // Prefer the published health verdict (what the worker fails over on);
+            // fall back to the bare interface check when no health is published.
+            let active = if health.tunnel.is_empty() {
+                vpn::select_active(r, |tunnel_id| {
+                    tunnels
+                        .get(tunnel_id)
+                        .is_some_and(|t| iface_up(svc.spawn, &t.ifname()))
+                })
+            } else {
+                vpn::select_active(r, |tunnel_id| vpn::health_is_up(&health.tunnel, tunnel_id))
+            };
+            // Per-chain-tunnel verified health for the UI (GW-7): verdict + exit IP.
+            let chain_health: Vec<serde_json::Value> = r
+                .chain
+                .iter()
+                .map(|tid| match health.tunnel.get(tid) {
+                    Some(h) => json!({
+                        "tunnel": tid,
+                        "verdict": h.verdict.as_str(),
+                        "exit_ip": h.exit_ip,
+                        "live": h.live,
+                        "exit_ip_is_provider": h.exit_ip_is_provider,
+                        "dns_leak": h.dns_leak,
+                    }),
+                    None => json!({ "tunnel": tid, "verdict": "down", "exit_ip": null }),
+                })
+                .collect();
             json!({
                 "scope": r.scope_key(),
                 "gateway": r.gateway,
                 "chain": r.chain,
                 "kill_switch": r.kill_switch,
                 "active": active.tunnel_id(),
+                "health": chain_health,
             })
         })
         .collect();
     json!({ "ok": true, "routes": statuses }).to_string()
+}
+
+/// VPN-GW-6 — a dedicated read of the gateway's published per-tunnel verified
+/// health: verdict + exit IP for every tunnel the worker last checked. Distinct
+/// from `route-status` (which is per-route) so a UI/operator can poll the raw
+/// health map directly. Reports `{}` when no worker has published yet.
+fn build_tunnel_health_reply(svc: &VpnService) -> String {
+    let root = svc.workgroup_root.as_path();
+    let state = crate::workers::vpn_gateway::HealthState::load(
+        &crate::workers::vpn_gateway::default_health_path(root),
+    );
+    let tunnels: Vec<serde_json::Value> = state
+        .tunnel
+        .values()
+        .map(|h| {
+            json!({
+                "tunnel": h.tunnel_id,
+                "verdict": h.verdict.as_str(),
+                "exit_ip": h.exit_ip,
+                "live": h.live,
+                "exit_ip_is_provider": h.exit_ip_is_provider,
+                "dns_leak": h.dns_leak,
+            })
+        })
+        .collect();
+    json!({ "ok": true, "tunnels": tunnels }).to_string()
 }
 
 /// Write a sealed blob at mode 0600 (atomic temp+rename). The `.age` blob is
@@ -527,7 +590,7 @@ mod tests {
     #[test]
     fn topic_and_verbs_lock() {
         assert_eq!(action_topic("tunnel-up"), "action/vpn/tunnel-up");
-        assert_eq!(ACTION_VERBS.len(), 12);
+        assert_eq!(ACTION_VERBS.len(), 13);
         assert!(ACTION_VERBS.contains(&"set-secret"));
         assert!(ACTION_VERBS.contains(&"secret-status"));
         // VPN-GW-4 routing surface.
@@ -535,6 +598,8 @@ mod tests {
         assert!(ACTION_VERBS.contains(&"clear-route"));
         assert!(ACTION_VERBS.contains(&"list-routes"));
         assert!(ACTION_VERBS.contains(&"route-status"));
+        // VPN-GW-6 health surface.
+        assert!(ACTION_VERBS.contains(&"tunnel-health"));
     }
 
     #[test]
@@ -789,5 +854,108 @@ mod tests {
         assert_eq!(routes[0]["kill_switch"], serde_json::Value::Bool(true));
         // Spawn disabled → every tunnel reads down → no active tunnel.
         assert_eq!(routes[0]["active"], serde_json::Value::Null);
+        // VPN-GW-6 — route-status carries a per-chain-tunnel health array even
+        // before any worker has published (defaulting each to "down").
+        let h = routes[0]["health"].as_array().unwrap();
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0]["tunnel"], "mullvad1");
+        assert_eq!(h[0]["verdict"], "down");
+    }
+
+    // ── VPN-GW-6 — tunnel-health read + route-status health enrichment ───────
+
+    #[test]
+    fn tunnel_health_reads_published_worker_state() {
+        let (tmp, s) = svc();
+        // Simulate the worker publishing health: a healthy tunnel + a leaking one.
+        let mut state = crate::workers::vpn_gateway::HealthState::default();
+        state.tunnel.insert(
+            "mullvad1".into(),
+            mackes_mesh_types::vpn::TunnelHealth::from_probes(
+                "mullvad1",
+                true,
+                Some("185.65.1.1".into()),
+                true,
+                false,
+            ),
+        );
+        state.tunnel.insert(
+            "proton2".into(),
+            mackes_mesh_types::vpn::TunnelHealth::from_probes(
+                "proton2",
+                true,
+                Some("9.9.9.9".into()),
+                false, // exit IP == WAN → leaking
+                false,
+            ),
+        );
+        state
+            .store(&crate::workers::vpn_gateway::default_health_path(
+                tmp.path(),
+            ))
+            .unwrap();
+
+        let r = build_reply(&s, "tunnel-health", None);
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true));
+        let tunnels = v["tunnels"].as_array().unwrap();
+        assert_eq!(tunnels.len(), 2);
+        // BTreeMap order: mullvad1 then proton2.
+        assert_eq!(tunnels[0]["tunnel"], "mullvad1");
+        assert_eq!(tunnels[0]["verdict"], "healthy");
+        assert_eq!(tunnels[0]["exit_ip"], "185.65.1.1");
+        assert_eq!(tunnels[1]["tunnel"], "proton2");
+        assert_eq!(tunnels[1]["verdict"], "leaking");
+    }
+
+    #[test]
+    fn route_status_uses_published_health_for_active_pick() {
+        let (tmp, s) = svc();
+        let _ = add(&s, "primary", "wg");
+        let _ = add(&s, "fallback", "wg");
+        let body = json!({
+            "scope": { "kind": "any-mesh" },
+            "gateway": "peer:gw",
+            "chain": ["primary", "fallback"],
+            "kill_switch": true,
+        })
+        .to_string();
+        assert!(build_reply(&s, "set-route", Some(&body)).contains("\"ok\":true"));
+        // Publish health: primary leaking, fallback healthy → active = fallback.
+        let mut state = crate::workers::vpn_gateway::HealthState::default();
+        state.tunnel.insert(
+            "primary".into(),
+            mackes_mesh_types::vpn::TunnelHealth::from_probes(
+                "primary",
+                true,
+                Some("9.9.9.9".into()),
+                false,
+                false,
+            ),
+        );
+        state.tunnel.insert(
+            "fallback".into(),
+            mackes_mesh_types::vpn::TunnelHealth::from_probes(
+                "fallback",
+                true,
+                Some("185.65.1.1".into()),
+                true,
+                false,
+            ),
+        );
+        state
+            .store(&crate::workers::vpn_gateway::default_health_path(
+                tmp.path(),
+            ))
+            .unwrap();
+
+        let st = build_reply(&s, "route-status", None);
+        let v: serde_json::Value = serde_json::from_str(&st).unwrap();
+        // The active pick comes from the HEALTH verdict (fallback), not the
+        // interface check (which would say all-down under without_spawn).
+        assert_eq!(v["routes"][0]["active"], "fallback");
+        assert_eq!(v["routes"][0]["health"][0]["verdict"], "leaking");
+        assert_eq!(v["routes"][0]["health"][1]["verdict"], "healthy");
+        assert_eq!(v["routes"][0]["health"][1]["exit_ip"], "185.65.1.1");
     }
 }
