@@ -13,11 +13,24 @@
 mod cosmic_compat;
 use cosmic_compat::{ButtonSty, TextSty};
 
+// MUSIC-DOCK-1 — the layer-shell vocabulary reused verbatim from the
+// `mde-notify-center` pattern (the same `cosmic::iced` fork these paths resolve
+// against): a layer surface created with anchors / layer / keyboard-interactivity
+// on the `SctkLayerSurfaceSettings`.
+use cosmic::iced::platform_specific::runtime::wayland::layer_surface::SctkLayerSurfaceSettings;
+use cosmic::iced::platform_specific::shell::commands::layer_surface::{
+    get_layer_surface, Anchor, KeyboardInteractivity, Layer,
+};
 use cosmic::iced::widget::{
     button, column, container, image, mouse_area, row, scrollable, stack, text, text_input, Space,
 };
-use cosmic::iced::{Length, Subscription};
+use cosmic::iced::{window, Length, Subscription};
 use cosmic::{Application, ApplicationExt, Element};
+
+/// MUSIC-DOCK-1 — the wlr-layer-shell namespace for the Music dock surface (the
+/// compositor keys dock/overlay rules off this, matching how each sibling names
+/// its surface, e.g. `mde-notify-center`).
+const DOCK_NAMESPACE: &str = "mde-music";
 
 use mde_music::album::{self, AlbumView};
 use mde_music::color;
@@ -35,7 +48,13 @@ use mde_musicd::creds::{self, Creds};
 type Task<M> = cosmic::iced::Task<M>;
 
 fn main() -> cosmic::iced::Result {
-    cosmic::app::run::<State>(cosmic::app::Settings::default(), ())
+    // MUSIC-DOCK-1 — the Music shell is a layer-shell **Overlay** dock, not a
+    // floating toplevel. Suppress Cosmic's auto-created main window so the only
+    // surface is the bottom dock we map in `init` (`get_layer_surface`); the
+    // `multi-window` feature routes `cosmic::app::run` through `iced::daemon`,
+    // which is what the four sibling layer surfaces (`mde-notify-center`,
+    // `mde-mesh-wallpaper`, `mde-voice-hud`, `mde-notify-toast`) run on.
+    cosmic::app::run::<State>(cosmic::app::Settings::default().no_main_window(true), ())
 }
 
 /// MUSIC-RFX-5 — run a queue-mutation (an RFX-1 daemon verb) then re-fetch the
@@ -85,6 +104,40 @@ fn carbon(rgba: mde_theme::Rgba, a: f32) -> cosmic::iced::Color {
         b: f32::from(rgba.b) / 255.0,
         a,
     }
+}
+
+/// MUSIC-DOCK-1 — map the Music shell as a layer-shell **Overlay** dock, reusing
+/// the `mde-notify-center` `boot_task` recipe verbatim:
+///   * **Layer::Overlay** — above normal windows, like the Action Center.
+///   * **Anchored bottom + left + right** — stretched across the bottom edge.
+///   * **full height** — anchoring also TOP stretches it edge-to-edge, so the
+///     dock is full-height (the bottom-docked surface this item asks for).
+///   * **`KeyboardInteractivity::OnDemand`** — its buttons click + it takes focus
+///     on demand (search field, transport), not a passive wallpaper.
+///   * **no titlebar** — a layer surface is server-side-decoration-free by
+///     construction (no toplevel chrome), so the in-app Carbon header is the only
+///     top bar; `show_headerbar=false` (set in `init`) suppresses Cosmic's too.
+/// `size: (None, None)` lets the compositor size it from the four-edge anchor.
+/// Returns the surface's [`window::Id`] so `init` can stash it for hide-on-Esc.
+fn dock_surface() -> (window::Id, Task<Message>) {
+    let id = window::Id::unique();
+    let task = get_layer_surface(SctkLayerSurfaceSettings {
+        id,
+        namespace: DOCK_NAMESPACE.to_string(),
+        // Four-edge anchor → the compositor stretches the surface to fill, so the
+        // dock is full-height + full-width (anchored to the bottom as asked).
+        size: Some((None, None)),
+        // Not a panel reserving screen real estate; the dock floats over windows.
+        exclusive_zone: 0,
+        anchor: Anchor::BOTTOM
+            .union(Anchor::LEFT)
+            .union(Anchor::RIGHT)
+            .union(Anchor::TOP),
+        layer: Layer::Overlay,
+        keyboard_interactivity: KeyboardInteractivity::OnDemand,
+        ..Default::default()
+    });
+    (id, task)
 }
 
 /// MUSIC-HOME — load everything the Home dashboard shows (stats + the
@@ -165,6 +218,10 @@ struct FirstRunForm {
 struct State {
     /// EFF-34 — the `cosmic::Application` shell state (window/theme/a11y).
     core: cosmic::app::Core,
+    /// MUSIC-DOCK-1 — the layer-shell dock surface's window id (set in `init`).
+    /// `cosmic::Application` routes rendering for a non-main-window id through
+    /// [`Application::view_window`], so the view dispatches on this id.
+    dock_id: window::Id,
     nav: NavState,
     /// `Some` until the operator connects a server (first run); `None`
     /// once creds exist and the library shell is shown.
@@ -316,6 +373,13 @@ enum Message {
     Home,
     /// MUSIC-NAV — quit the app (the window has no title-bar chrome).
     Exit,
+    /// MUSIC-DOCK-1 — Esc: close any open overlay sheet first (search / maxi /
+    /// context menu / add-to-playlist); with nothing open, HIDE the dock. For a
+    /// single-surface layer-shell daemon, "hide" == release the surface + exit
+    /// (the `mde-notify-center` idiom — playback keeps running in `mde-musicd`,
+    /// and a re-launch re-maps the dock). The keep-running minimize-to-handle is
+    /// the separate MUSIC-DOCK-3.
+    EscPressed,
     /// A category fetch resolved.
     ItemsLoaded(Vec<LibraryItem>),
     /// A category fetch failed (daemon down / no server).
@@ -447,13 +511,14 @@ enum Message {
 }
 
 impl State {
-    fn new(core: cosmic::app::Core) -> Self {
+    fn new(core: cosmic::app::Core, dock_id: window::Id) -> Self {
         let (form, connection) = match creds::load() {
             Ok(c) => (None, format!("Connected to {}", c.server_url)),
             Err(_) => (Some(FirstRunForm::default()), String::new()),
         };
         Self {
             core,
+            dock_id,
             nav: NavState::new(),
             form,
             connection,
@@ -778,6 +843,32 @@ impl State {
                 Task::none()
             }
             Message::Exit => std::process::exit(0),
+            Message::EscPressed => {
+                // MUSIC-DOCK-1 — Esc peels back one layer of UI before hiding the
+                // dock: an open add-to-playlist picker / context menu / maxi
+                // player / search sheet closes first; only with the bare dock
+                // showing does Esc HIDE it. Hiding a single-surface layer-shell
+                // daemon == releasing the surface + exiting (the
+                // `mde-notify-center` idiom): the daemon keeps playing and a
+                // re-launch re-maps the dock. (Keep-running minimize-to-handle is
+                // MUSIC-DOCK-3, deliberately not done here.)
+                if self.add_to_playlist_song.is_some() {
+                    self.add_to_playlist_song = None;
+                    self.add_to_playlist_choices.clear();
+                    Task::none()
+                } else if self.context_menu.is_some() {
+                    self.context_menu = None;
+                    Task::none()
+                } else if self.search_open {
+                    self.dismiss_search();
+                    Task::none()
+                } else if self.maxi_open {
+                    self.maxi_open = false;
+                    Task::none()
+                } else {
+                    std::process::exit(0)
+                }
+            }
             Message::UrlChanged(s) => {
                 if let Some(f) = &mut self.form {
                     f.url = s;
@@ -1255,7 +1346,8 @@ impl State {
             };
             match key.as_ref() {
                 Key::Character("f") if modifiers.command() => Some(Message::FocusSearch),
-                Key::Named(Named::Escape) => Some(Message::DismissSearch),
+                // MUSIC-DOCK-1 — Esc closes an open overlay, else hides the dock.
+                Key::Named(Named::Escape) => Some(Message::EscPressed),
                 _ => None,
             }
         });
@@ -2639,16 +2731,35 @@ impl Application for State {
         &mut self.core
     }
 
-    fn init(core: cosmic::app::Core, _flags: ()) -> (Self, cosmic::app::Task<Self::Message>) {
-        let mut s = Self::new(core);
-        // Keep mde-music's in-app chrome; suppress Cosmic's headerbar so the
-        // breadcrumb/connection header reads as the only top bar.
+    fn init(mut core: cosmic::app::Core, _flags: ()) -> (Self, cosmic::app::Task<Self::Message>) {
+        // MUSIC-DOCK-1 — convert the Music shell into a layer-shell **Overlay**
+        // dock instead of a floating toplevel. `cosmic::app::Settings` keeps
+        // `no_main_window` crate-private, so we can't suppress the auto-created
+        // toplevel up front; instead, at boot we (a) detach the main-window id so
+        // the close below isn't treated as "main window closed" (which would exit
+        // the app — `exit_on_main_window_closed`), (b) close that toplevel, and
+        // (c) map our layer surface. With no main-window id, `Cosmic::view`
+        // routes *every* surface (our dock) through `view_window`, which we
+        // implement. This reuses the `mde-notify-center` `get_layer_surface`
+        // recipe (layer/anchors/keyboard/namespace) without dropping the
+        // `cosmic::Application` theming the shell is built on.
+        let reserved = core.set_main_window_id(None);
+        let close = reserved
+            .map(|id| window::close::<Message>(id).map(cosmic::Action::App))
+            .unwrap_or_else(Task::none);
+        let (dock_id, dock) = dock_surface();
+        let mut s = Self::new(core, dock_id);
+        // Keep mde-music's in-app chrome; the layer surface is decoration-free by
+        // construction (no server-side titlebar), so the in-app Carbon header is
+        // the only top bar — suppress Cosmic's headerbar to match.
         s.core.window.show_headerbar = false;
         s.set_header_title("MDE Music".to_string());
         // MUSIC-HOME — load the server stats + discovery strips at launch so the
-        // Home dashboard is populated on first paint.
-        let boot = load_home_tasks().map(cosmic::Action::App);
-        (s, boot)
+        // Home dashboard is populated on first paint. The `get_layer_surface`
+        // command yields no message (typed over `Message`), so it lifts into the
+        // cosmic `Action` space the same way as the home batch.
+        let boot = Task::batch([dock, load_home_tasks()]).map(cosmic::Action::App);
+        (s, Task::batch([close, boot]))
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
@@ -2663,6 +2774,19 @@ impl Application for State {
 
     fn view(&self) -> Element<'_, Self::Message> {
         State::view(self)
+    }
+
+    /// MUSIC-DOCK-1 — `init` detached the main-window id, so `Cosmic::view`
+    /// routes the dock (a non-main window id) through `view_window` (which
+    /// defaults to a panic) rather than `view`. Render the Music shell for our
+    /// dock id; any other id (none is expected — the dock is the only surface)
+    /// degrades to an empty element rather than panicking the daemon.
+    fn view_window(&self, id: window::Id) -> Element<'_, Self::Message> {
+        if id == self.dock_id {
+            State::view(self)
+        } else {
+            Space::new().into()
+        }
     }
 }
 
