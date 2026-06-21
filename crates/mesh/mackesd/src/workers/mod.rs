@@ -382,6 +382,10 @@ pub mod lifecycle_exec;
 pub mod firewall_preset;
 // CONNECT-3 — exposure-driven (additive) firewall enforcement.
 pub mod connect_firewall;
+// DDNS-EGRESS-1 — egress-IP discovery + change detection (WAN now;
+// the per-VPN-tunnel exit-IP source plugs into the same
+// `EgressIpSource` trait under DDNS-EGRESS-3, deferred on VPN-GW).
+pub mod ddns;
 pub mod stun_gather;
 pub mod subprocess_tick;
 // thumbnailer retired 2026-05-26 (TUNE-3.b): the worker module
