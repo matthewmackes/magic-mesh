@@ -1,0 +1,10 @@
+# Never commit state (resource ids; treat as sensitive) or real var files (may hold keys).
+# NOTE: .terraform.lock.hcl IS committed (pins provider versions for reproducibility).
+*.tfstate
+*.tfstate.*
+.terraform/
+terraform.tfvars
+*.auto.tfvars
+# Ansible runtime
+*.retry
+infra/ansible/inventory.generated

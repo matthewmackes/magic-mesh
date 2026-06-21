@@ -1,0 +1,9 @@
+# Copy to terraform.tfvars (gitignored) and fill in. Secrets (XOA_URL/XOA_TOKEN) go in the
+# ENVIRONMENT, never here — see docs/ops/environment-rebuild.md §10/§11 (DS-8).
+pool_name          = "KVM-XCP1"
+template_name      = "mcnf-golden"
+lighthouse_count   = 3
+peer_count         = 3 # release gate: override with -var=peer_count=9
+vcpus              = 1
+memory_gb          = 2
+ssh_authorized_key = "ssh-ed25519 AAAA... control-host"

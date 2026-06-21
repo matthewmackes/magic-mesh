@@ -85,7 +85,7 @@ For each of the **two hypervisor machines**:
 > management GUI yet — that's Xen Orchestra, which we self-host on the control host so a
 > single XO drives **both** pools.
 
-## 4. Phase 1 — control host bootstrap  🔧 (Rocky 9 base + podman/sshpass/jq/git present)
+## 4. Phase 1 — control host bootstrap  ✅ (tofu 1.12.3 + ansible-core 2.14.18 installed 2026-06-21)
 
 On `172.20.145.192` (`root`):
 
@@ -121,35 +121,48 @@ for h in 172.20.0.9 172.20.145.193; do
 done
 ```
 
-## 5. Phase 2 — Xen Orchestra CE (the XAPI/IaC bridge)  🔲 DS-1 prerequisite
+## 5. Phase 2 — Xen Orchestra CE (the XAPI/IaC bridge)  ✅ verified 2026-06-21
 
 The OpenTofu provider talks to **Xen Orchestra**, not bare XAPI — so XO must run first.
-Self-host **XO Community Edition** in podman on the control host (≈3 GB RAM; needs Redis):
+Self-host **XO Community Edition** in podman on the control host (≈3 GB RAM; needs Redis).
+Use the reproducible helper **`install-helpers/xo-up.sh`** (idempotent):
 
 ```bash
-# Pod with redis + xen-orchestra-ce (community image built from source)
-podman network create xo 2>/dev/null || true
-podman run -d --name xo-redis --network xo redis:7-alpine
-podman run -d --name xo-ce --network xo -p 8080:80 \
-  -e REDIS_URI=redis://xo-redis:6379 \
-  --restart unless-stopped \
-  docker.io/ezka77/xen-orchestra-ce:latest
-# XO UI/API now on http://172.20.145.192:8080  (ws:// for the provider)
+./install-helpers/xo-up.sh        # redis (aliased 'redis') + xen-orchestra-ce
+# XO UI/API → http://172.20.145.192:8080
 ```
 
-Then, in the XO web UI (`http://172.20.145.192:8080`, first-run creates the admin user):
+**Verified gotchas (baked into the helper):**
+- The `ezka77/xen-orchestra-ce` image hardcodes the Redis host as `redis` → the redis
+  container gets `--network-alias redis` (a custom `REDIS_URI` is ignored).
+- XO listens on **container port 8000**, not 80 → map `-p 8080:8000`.
+- The image ships **no default admin**. Create one inside the container:
+  ```bash
+  podman exec xo-ce sh -c "cd /home/node/xen-orchestra && \
+    node_modules/.bin/xo-server-recover-account admin@mcnf.local '<PW>'"
+  ```
 
-1. **Settings → Servers → add** both pools:
-   `172.20.0.9` and `172.20.145.193`, user `root`, the dom0 password, *allowUnauthorized=true*
-   (self-signed XAPI certs). Both should connect (green).
-2. **Settings → Users → your admin → New token** → record it. This is `XOA_TOKEN`.
+**Mint a token + add both pools** (via the bundled `xo-cli`, inside the container):
+```bash
+podman exec xo-ce sh -c "cd /home/node/xen-orchestra && \
+  node packages/xo-cli/index.mjs register --au http://localhost:8000 admin@mcnf.local '<PW>'"
+# token → ~/.config/xo-cli/config.json (.token, 43 chars) → store as XOA_TOKEN (DS-8)
+for h in 172.20.0.9 172.20.145.193; do
+  podman exec xo-ce sh -c "cd /home/node/xen-orchestra && node packages/xo-cli/index.mjs \
+    server.add host=$h username=root password='<DOM0_PW>' allowUnauthorized=true"
+done
+# verify: both servers report status=connected; pools XEN-HOME-SERVICES + KVM-XCP1 visible
+```
 
 > Provider choice (DS-10): the **official `vatesfr/xenorchestra`** provider takes a
-> **token** + `wss/ws` URL (`XOA_TOKEN`/`XOA_URL`) — preferred (token, not password; aligns
-> with mesh-native secrets). The older `terra-farm/xenorchestra` takes url+user+password
-> (`XOA_URL`/`XOA_USER`/`XOA_PASSWORD`). Pin whichever in `required_providers`.
+> **token** + `ws/wss` URL (`XOA_TOKEN`/`XOA_URL`) — preferred (token, not password; aligns
+> with mesh-native secrets). Verified live: `tofu plan` authenticates and resolves the real
+> `KVM-XCP1` pool/network/SR; a full `apply` additionally needs the golden template (DS-5).
 
-## 6. Phase 3 — IaC: OpenTofu VM lifecycle  🔲 DS-1
+## 6. Phase 3 — IaC: OpenTofu VM lifecycle  🔧 DS-1 (provider+XO+pool proven; apply needs DS-5 golden)
+
+The real config lives in `infra/tofu/` (committed; `tofu validate` clean, `tofu plan`
+authenticates to live XO and resolves the `KVM-XCP1` pool/network/SR). Layout:
 
 Layout under `infra/tofu/` in the repo:
 
@@ -250,7 +263,7 @@ the control host, swapped for the etcd backend once the mesh is up.
 | DS task | Phase | What | Status |
 |---|---|---|---|
 | DS-10 | §1–§12 (this doc) | Research + runbook (XO needed, provider choice, layout) | ✅ this doc |
-| DS-1 | 5–6 | OpenTofu + XO provider VM lifecycle | 🔲 (XO prereq in Phase 2) |
+| DS-1 | 5–6 | OpenTofu + XO provider VM lifecycle | 🔧 XO up, both pools connected, `tofu plan` proven; full `apply` blocked on DS-5 golden |
 | DS-2 | 7 | Ansible node config | 🔲 |
 | DS-3 | 8 | Forgejo + runners, pull-mirror | 🔲 |
 | DS-4 | 8 | Port `ci.yml` → Forgejo Actions | 🔲 |
