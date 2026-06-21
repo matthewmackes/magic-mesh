@@ -87,6 +87,11 @@ pub enum Message {
     },
     /// GUI-RECONNECT — periodic Bus liveness tick (fires the probe).
     ReconnectTick,
+    /// MOTION-TRANS-1 — advance the route/panel-switch transition clock. Fired
+    /// by `App::transition_subscription`, registered ONLY while a switch is in
+    /// flight (the body is crossing in); the loop stops the instant it settles
+    /// (no idle animation — MOTION-PERF-1).
+    BodyTransitionTick,
     /// GUI-RECONNECT — Bus liveness probe result. A `false→true`
     /// transition re-loads the active panel so it recovers after a
     /// `systemctl restart mackesd` without a manual refresh.
@@ -243,6 +248,13 @@ pub struct App {
     /// the active panel's load so its data recovers without a manual
     /// refresh. Starts optimistic (`true`).
     bus_reachable: bool,
+    /// MOTION-TRANS-1 — when the operator last switched views (a `View::Panel`/
+    /// `View::Group` change). The body crosses in over `Motion::route_switch`
+    /// from this instant; `switch_now` is advanced by the idle-gated
+    /// `BodyTransitionTick` while the switch is in flight, then the tick stops
+    /// (MOTION-PERF-1). Boot starts settled (`switch_now == switch_start`).
+    switch_start: std::time::Instant,
+    switch_now: std::time::Instant,
     backend: Arc<dyn Backend>,
     notifications: notifications_panel::NotificationsPanel,
     music: music_panel::MusicPanel,
@@ -357,6 +369,11 @@ impl App {
             sidebar: SidebarState::new(),
             focused_pane: Pane::Sidebar,
             bus_reachable: true,
+            // MOTION-TRANS-1 — boot lands settled (no spurious entrance on the
+            // initial view): seed the clock a full route-switch span in the past
+            // so `route::is_animating` is false until the first real switch.
+            switch_start: std::time::Instant::now() - mde_theme::Motion::route_switch().duration,
+            switch_now: std::time::Instant::now(),
             backend,
             notifications: notifications_panel::NotificationsPanel::new(),
             music: music_panel::MusicPanel::new(),
@@ -430,6 +447,47 @@ impl App {
             app.focused_pane = Pane::Main;
         }
         app
+    }
+
+    /// MOTION-TRANS-1 — kick off the route/panel-switch transition: reset the
+    /// switch clock so the incoming body crosses in from now. Called from every
+    /// view-change handler (group/panel select, deep-link focus) so the
+    /// transition is runtime-reachable on the real switch path. Presentation
+    /// only — never gates the navigation or its data load.
+    fn begin_switch(&mut self) {
+        let now = std::time::Instant::now();
+        self.switch_start = now;
+        self.switch_now = now;
+    }
+
+    /// MOTION-TRANS-1 — elapsed ms since the active view switch began.
+    #[must_use]
+    fn switch_elapsed_ms(&self) -> u32 {
+        u32::try_from(
+            self.switch_now
+                .saturating_duration_since(self.switch_start)
+                .as_millis(),
+        )
+        .unwrap_or(u32::MAX)
+    }
+
+    /// MOTION-TRANS-1 — true while the body switch transition is still crossing
+    /// in, so `subscription` can gate the transition tick on it (stops the
+    /// instant it settles — MOTION-PERF-1). Always false under reduce-motion (the
+    /// switch is instant).
+    #[must_use]
+    fn switching(&self) -> bool {
+        mde_theme::route::is_animating(self.switch_elapsed_ms(), crate::live_theme::reduce_motion())
+    }
+
+    /// MOTION-TRANS-1 — the route/panel-switch transition tick, registered by
+    /// `App::subscription` ONLY while [`switching`](Self::switching) is true, so
+    /// the body animates exactly while it's crossing in and the loop stops the
+    /// instant it settles (no idle animation — MOTION-PERF-1); reduce-motion
+    /// never schedules it. One tick per ~60 ms frame keeps the settle smooth.
+    #[must_use]
+    fn transition_subscription() -> Subscription<Message> {
+        cosmic::iced::time::every(Duration::from_millis(60)).map(|_| Message::BodyTransitionTick)
     }
 
     /// Clone of the backend handle — `Task::perform` futures
@@ -627,6 +685,13 @@ impl App {
         if self.view.panel_slug() == Some("fleet_rollup") && self.fleet_rollup.revealing() {
             subs.push(fleet_rollup_panel::FleetRollupPanel::reveal_subscription());
         }
+        // MOTION-TRANS-1 — the route/panel-switch body transition ticks ONLY
+        // while a switch is in flight (the body is crossing in). Once it settles
+        // the loop stops (no idle animation — MOTION-PERF-1); reduce-motion never
+        // schedules it (the switch is instant).
+        if self.switching() {
+            subs.push(Self::transition_subscription());
+        }
         // PD-8 (L14) / PLANES-1 — Netdata sampling only while the Peers
         // directory is the active view (the Compute pattern). The Front
         // Door is reachable as the Peers plane root/panel or the
@@ -672,6 +737,11 @@ impl App {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::SelectGroup(group) => {
+                // MOTION-TRANS-1 — only cross-fade in when the view actually
+                // changes (re-clicking the active group is a no-op switch).
+                if self.view != View::Group(group) {
+                    self.begin_switch();
+                }
                 self.view = View::Group(group);
                 self.focused_pane = Pane::Main;
                 self.on_group_navigated(group)
@@ -680,16 +750,25 @@ impl App {
             // role the operator drilled into. The filter is set before the
             // load resolves; the Peers Loaded handler preserves it.
             Message::DrillToPeers(role) => {
-                self.view = View::Panel {
+                let target = View::Panel {
                     group: Group::Mesh,
                     panel: "peers",
                 };
+                // MOTION-TRANS-1 — cross in only on a real view change.
+                if self.view != target {
+                    self.begin_switch();
+                }
+                self.view = target;
                 self.focused_pane = Pane::Main;
                 let task = self.on_panel_navigated(Group::Mesh, "peers");
                 self.peers.filter = role;
                 task
             }
             Message::SelectPanel { group, panel } => {
+                // MOTION-TRANS-1 — cross in only on a real view change.
+                if self.view != (View::Panel { group, panel }) {
+                    self.begin_switch();
+                }
                 self.view = View::Panel { group, panel };
                 self.focused_pane = Pane::Main;
                 self.on_panel_navigated(group, panel)
@@ -820,6 +899,14 @@ impl App {
             Message::FleetRevisions(msg) => self.fleet_revisions.update(msg),
             Message::Wallpaper(msg) => self.wallpaper.update(msg, self.backend()),
             Message::WindowControl(action) => Self::dispatch_window_action(action),
+            // MOTION-TRANS-1 — advance the route-switch transition clock. The
+            // subscription is gated on `switching()`, so this fires only while
+            // the body is crossing in and stops the instant it settles
+            // (MOTION-PERF-1). Presentation only — never affects navigation.
+            Message::BodyTransitionTick => {
+                self.switch_now = std::time::Instant::now();
+                Task::none()
+            }
             Message::Noop => Task::none(),
             // GUI-RECONNECT — fire the cheap Bus liveness probe.
             Message::ReconnectTick => {
@@ -995,6 +1082,11 @@ impl App {
             // surprise the user mid-task).
             return Task::none();
         };
+        // MOTION-TRANS-1 — a deep-link focus that lands on a different view
+        // crosses the body in too (same runtime switch path as a sidebar click).
+        if self.view != view {
+            self.begin_switch();
+        }
         self.view = view;
         self.focused_pane = Pane::Main;
         // Apply the per-item focus before the panel loads so the tab opens
@@ -1022,11 +1114,16 @@ impl App {
                 self.focused_pane = pane;
             }
             KeyAction::JumpToGroup(group) => {
+                // MOTION-TRANS-1 — keyboard nav crosses the body in too.
+                if self.view != View::Group(group) {
+                    self.begin_switch();
+                }
                 self.view = View::Group(group);
                 self.focused_pane = Pane::Sidebar;
             }
             KeyAction::CloseDetail => {
                 if let View::Panel { group, .. } = self.view {
+                    self.begin_switch();
                     self.view = View::Group(group);
                     self.focused_pane = Pane::Sidebar;
                 }
@@ -1093,7 +1190,17 @@ impl App {
         ]
         .spacing(6);
 
-        let body = self.panel_body();
+        // MOTION-TRANS-1 — on a panel/view switch the incoming body crosses in
+        // (transform settle; the opacity blend is deferred — the iced-0.13 fork
+        // has no per-element opacity widget) instead of an instant cut. Wraps the
+        // body content area only, so the page heading/breadcrumb stays put (no
+        // layout reflow). Settled / reduce-motion ⇒ the body renders at rest with
+        // no wrapper cost.
+        let body = crate::panel_chrome::switch_transition(
+            self.panel_body(),
+            self.switch_elapsed_ms(),
+            crate::live_theme::reduce_motion(),
+        );
 
         // UX-6.a — outer panel padding (SPACE_24) is supplied
         // here once for every panel, replacing the per-panel
@@ -1881,6 +1988,62 @@ mod tests {
         let _ = App::dispatch_window_action(HeaderAction::Minimize);
         let _ = App::dispatch_window_action(HeaderAction::ToggleMaximize);
         let _ = App::dispatch_window_action(HeaderAction::Close);
+    }
+
+    #[test]
+    fn switching_to_a_new_view_arms_the_transition_only_on_a_real_change() {
+        // MOTION-TRANS-1 — the transition trigger: switching to a *different*
+        // view resets the switch clock (the body crosses in); re-selecting the
+        // already-active view is a no-op switch that must NOT re-arm it.
+        let mut app = App::new();
+        // Boot seeds the clock a full route-switch span in the past so the
+        // initial view is settled (no spurious entrance on launch).
+        assert!(
+            app.switch_elapsed_ms() >= mde_theme::route::total_ms(),
+            "boot view starts settled"
+        );
+        // A real switch arms it: elapsed collapses back toward 0.
+        let _ = app.update(Message::SelectGroup(Group::ThisNode));
+        assert!(
+            app.switch_elapsed_ms() < mde_theme::route::total_ms(),
+            "a real view change re-arms the transition clock"
+        );
+        // Re-selecting the SAME view is a no-op switch — it must not reset the
+        // clock (so a stray re-click doesn't restart an entrance mid-task). Push
+        // the clock past the span first, then assert it stays settled.
+        app.switch_start = std::time::Instant::now() - mde_theme::Motion::route_switch().duration;
+        app.switch_now = std::time::Instant::now();
+        let _ = app.update(Message::SelectGroup(Group::ThisNode));
+        assert!(
+            app.switch_elapsed_ms() >= mde_theme::route::total_ms(),
+            "re-selecting the active view must not re-arm the transition"
+        );
+    }
+
+    #[test]
+    fn body_transition_tick_advances_the_switch_clock() {
+        // MOTION-TRANS-1 — the idle-gated tick advances `switch_now` so the
+        // body's eased offset progresses toward rest. Presentation only: it
+        // never mutates the view.
+        let mut app = App::new();
+        let _ = app.update(Message::SelectPanel {
+            group: Group::ThisNode,
+            panel: "remote_desktop",
+        });
+        let view_before = app.current_view();
+        let elapsed_before = app.switch_elapsed_ms();
+        // A tick (real wall-clock passes between the switch and here) advances
+        // the clock without re-routing the user.
+        let _ = app.update(Message::BodyTransitionTick);
+        assert!(
+            app.switch_elapsed_ms() >= elapsed_before,
+            "tick advances the switch clock"
+        );
+        assert_eq!(
+            app.current_view(),
+            view_before,
+            "the transition tick is presentation-only — never changes the view"
+        );
     }
 
     #[test]

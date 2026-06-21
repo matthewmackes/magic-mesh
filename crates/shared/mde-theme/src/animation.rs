@@ -557,6 +557,86 @@ pub mod stagger {
     }
 }
 
+/// MOTION-TRANS-1 — route/panel switch transition phase. When the operator
+/// switches Workbench views (a `View::Panel`/`View::Group` change) the incoming
+/// body crosses in over the [`Motion::route_switch`] duration (Carbon
+/// `moderate-02` 240 ms, productive entrance). This is the *pure* phase math —
+/// "how far into the switch am I, what render params does the body take, has it
+/// settled" — composed from the existing INFRA-2 helpers ([`crate::crossfade`] /
+/// [`crate::slide_in`]) and the [`Motion::route_switch`] token; it re-implements
+/// no motion math of its own (it reuses [`ease`] + [`slide_in`] like
+/// [`stagger`]). The consumer holds a start [`Instant`] (set on the switch) and a
+/// now [`Instant`] (advanced by its idle-gated tick), passes the elapsed ms here,
+/// and applies the returned params to the body wrapper.
+///
+/// Reduce-motion: the contract collapses every transition to a ≤80 ms crossfade
+/// (opacity only, no movement). Because the iced-0.13 libcosmic fork has no
+/// per-element opacity widget (the same limitation FEEDBACK-2's reveal recorded),
+/// the *runtime* body transition is rendered on the transform channel only and
+/// the true opacity blend is deferred; under reduce-motion that transform is
+/// dropped, leaving an instant switch — exactly the reduce-motion intent.
+pub mod route {
+    use super::{ease, slide_in, RenderParams};
+    use crate::motion::Easing;
+    use crate::motion::Motion;
+
+    /// The distance (px) the incoming body slides up into place during a route
+    /// switch — a short Carbon micro-interaction rise so the switch reads as an
+    /// intentional settle, never a long fly-in. Matches the FEEDBACK-2 row-reveal
+    /// slide so the shell's enter motions share one travel.
+    pub const SWITCH_SLIDE_PX: f32 = 8.0;
+
+    /// Total wall-clock span (ms) of a route-switch transition: the
+    /// [`Motion::route_switch`] duration. The consumer's idle-gated tick runs
+    /// for exactly this long, then stops (no idle animation — MOTION-PERF-1).
+    #[must_use]
+    pub fn total_ms() -> u32 {
+        u32::try_from(Motion::route_switch().duration.as_millis()).unwrap_or(u32::MAX)
+    }
+
+    /// Linear switch progress `0.0..=1.0` at `elapsed_ms` since the switch began:
+    /// `0.0` at the instant of the switch, ramping to `1.0` over [`total_ms`].
+    /// Under `reduce_motion` the switch is instant (`1.0` immediately) — the body
+    /// appears at rest with no transition (the Q32 collapse, made concrete by the
+    /// fork's missing opacity widget; see the module note).
+    #[must_use]
+    pub fn progress(elapsed_ms: u32, reduce_motion: bool) -> f32 {
+        if reduce_motion {
+            return 1.0;
+        }
+        let total = total_ms();
+        if total == 0 || elapsed_ms >= total {
+            1.0
+        } else {
+            elapsed_ms as f32 / total as f32
+        }
+    }
+
+    /// The render params for the incoming body at `elapsed_ms` since the switch:
+    /// the INFRA-2 [`slide_in`] entrance (fade ramp + slide up from
+    /// [`SWITCH_SLIDE_PX`] below) eased with the [`Motion::route_switch`] curve
+    /// (Carbon productive ease-out, so the body decelerates into place). The
+    /// `alpha` channel is computed but unused by the fork-limited runtime wrapper
+    /// (deferred until an opacity widget lands); `translate_y` is the live
+    /// transform channel. Under `reduce_motion` the slide is dropped (no
+    /// movement), leaving the body at rest.
+    #[must_use]
+    pub fn body_params(elapsed_ms: u32, reduce_motion: bool) -> RenderParams {
+        let t = ease(progress(elapsed_ms, reduce_motion), Easing::EaseOut);
+        slide_in(t, SWITCH_SLIDE_PX, reduce_motion)
+    }
+
+    /// Whether the switch transition is still animating at `elapsed_ms` (the
+    /// body hasn't finished crossing in). The consumer gates its transition tick
+    /// on this so the subscription stops the instant the body settles — no idle
+    /// animation (MOTION-PERF-1). Always `false` under `reduce_motion` (the
+    /// switch is instant, nothing animates).
+    #[must_use]
+    pub fn is_animating(elapsed_ms: u32, reduce_motion: bool) -> bool {
+        !reduce_motion && elapsed_ms < total_ms()
+    }
+}
+
 /// MOTION-INFRA-1 — a tiny animation registry. Holds the active tweens keyed by
 /// a caller id and is advanced by ONE subscription tick, so N concurrent
 /// animations across a surface share a single timer instead of each arming its
@@ -1131,5 +1211,81 @@ mod tests {
         );
         // Reduce-motion never schedules a reveal tick.
         assert!(!stagger::is_animating(0, true));
+    }
+
+    // ── MOTION-TRANS-1 — route/panel switch transition-phase math ─────────
+
+    #[test]
+    fn route_total_is_the_carbon_route_switch_duration() {
+        // The transition span equals the Motion::route_switch token (Carbon
+        // moderate-02 = 240 ms) — single-sourced, no literal.
+        assert_eq!(route::total_ms(), 240);
+        assert_eq!(
+            route::total_ms() as u128,
+            Motion::route_switch().duration.as_millis()
+        );
+    }
+
+    #[test]
+    fn route_progress_ramps_zero_to_one_and_collapses_under_reduce_motion() {
+        let total = route::total_ms();
+        // 0 at the switch instant, 1.0 once the span elapses, monotone between.
+        assert_eq!(route::progress(0, false), 0.0);
+        let mid = route::progress(total / 2, false);
+        assert!((mid - 0.5).abs() < 0.05, "half-way ≈ 0.5, got {mid}");
+        assert_eq!(route::progress(total, false), 1.0);
+        // Past the span clamps at 1.0 (never overshoots).
+        assert_eq!(route::progress(total + 1_000, false), 1.0);
+        // Reduce-motion: instant — fully settled immediately at any elapsed.
+        assert_eq!(route::progress(0, true), 1.0);
+        assert_eq!(route::progress(total / 2, true), 1.0);
+    }
+
+    #[test]
+    fn route_body_params_slide_in_then_settle_and_drop_movement_under_reduce_motion() {
+        // Full motion: the incoming body starts SWITCH_SLIDE_PX below + transparent
+        // (the deferred fade channel), and rests at offset 0 + fully opaque. The
+        // ease-out curve means it's already past the linear midpoint by half-time.
+        let start = route::body_params(0, false);
+        assert_eq!(start.translate_y, route::SWITCH_SLIDE_PX);
+        assert_eq!(start.alpha, 0.0);
+        assert_eq!(start.scale, 1.0, "transition is transform/opacity only");
+        let end = route::body_params(route::total_ms(), false);
+        assert_eq!(end.translate_y, 0.0);
+        assert_eq!(end.alpha, 1.0);
+        // Monotone settle: the offset only ever shrinks toward rest.
+        let mut prev = route::SWITCH_SLIDE_PX + 1.0;
+        for i in 0..=10 {
+            let e = (route::total_ms() as f32 * (i as f32 / 10.0)) as u32;
+            let off = route::body_params(e, false).translate_y;
+            assert!(off <= prev + 1e-4, "offset must shrink monotonically");
+            assert!((0.0..=route::SWITCH_SLIDE_PX).contains(&off));
+            prev = off;
+        }
+        // Reduce-motion: no movement at all (instant switch — the body is at rest
+        // at every elapsed), the Q32 collapse made concrete by the fork's missing
+        // opacity widget.
+        for i in 0..=10 {
+            let e = (route::total_ms() as f32 * (i as f32 / 10.0)) as u32;
+            assert_eq!(
+                route::body_params(e, true).translate_y,
+                0.0,
+                "reduce_motion ⇒ no movement"
+            );
+        }
+    }
+
+    #[test]
+    fn route_is_animating_stops_at_total_and_is_inert_under_reduce_motion() {
+        // The transition tick runs until the body settles, then stops (no idle
+        // animation — MOTION-PERF-1).
+        assert!(route::is_animating(0, false));
+        assert!(route::is_animating(route::total_ms() - 1, false));
+        assert!(
+            !route::is_animating(route::total_ms(), false),
+            "switch done ⇒ tick stops"
+        );
+        // Reduce-motion never schedules a transition tick (instant switch).
+        assert!(!route::is_animating(0, true));
     }
 }
