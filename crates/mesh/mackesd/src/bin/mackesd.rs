@@ -1674,9 +1674,10 @@ fn main() -> anyhow::Result<()> {
                 .map_or(0, |d| d.as_millis() as u64);
             let svc =
                 mackesd_core::ipc::directory::DirectoryService::new(&root, Some(db_path.clone()));
-            let (n, healthy, degraded, unreachable, is_leader) =
+            let (n, healthy, degraded, unreachable, is_leader, lighthouses) =
                 svc.mesh_health_counts(&default_node_id(), now_ms);
-            let report = report.with_mesh(n, healthy, degraded, unreachable, is_leader);
+            let report =
+                report.with_mesh(n, healthy, degraded, unreachable, is_leader, lighthouses);
             println!("{}", report.to_json_line()?);
         }
         Cmd::Connect { ip, port } => match mackesd_core::connect_actions::connect_argv(&ip, port) {

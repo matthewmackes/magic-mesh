@@ -166,16 +166,25 @@ impl DirectoryService {
     }
 
     /// ONBOARD-6 (OB6-FIX-4) — `(node_count, healthy, degraded, unreachable,
-    /// is_leader)` for the healthz surfaces, from the LIVE directory + the
-    /// leader lease rather than the store's enrolled-nodes table. This is the
-    /// same peer set `mackesd peers` shows, so the Mesh-Control healthz card
-    /// now matches the Inventory + reflects the elected leader.
+    /// is_leader, lighthouse_count)` for the healthz surfaces, from the LIVE
+    /// directory + the leader lease rather than the store's enrolled-nodes table.
+    /// This is the same peer set `mackesd peers` shows, so the Mesh-Control
+    /// healthz card now matches the Inventory + reflects the elected leader. The
+    /// trailing `lighthouse_count` drives HA-4's `degraded: no HA` posture.
     #[must_use]
-    pub fn mesh_health_counts(&self, node_id: &str, now_ms: u64) -> (u32, u32, u32, u32, bool) {
+    pub fn mesh_health_counts(
+        &self,
+        node_id: &str,
+        now_ms: u64,
+    ) -> (u32, u32, u32, u32, bool, u32) {
         let dir = self.build_directory(now_ms);
         let peers = dir["peers"].as_array().cloned().unwrap_or_default();
         let total = u32::try_from(peers.len()).unwrap_or(u32::MAX);
         let (mut healthy, mut degraded, mut unreachable) = (0u32, 0u32, 0u32);
+        // HA-4 — count the lighthouses in the live directory so healthz can flag
+        // `degraded: no HA` below the 2-lighthouse floor. The directory's `role`
+        // is "lighthouse" for tagged peers (see `build_directory`).
+        let mut lighthouses = 0u32;
         for p in &peers {
             match p["health"].as_str() {
                 Some("healthy") => healthy += 1,
@@ -185,13 +194,23 @@ impl DirectoryService {
             if p["presence"].as_str() == Some("offline") {
                 unreachable += 1;
             }
+            if p["role"].as_str() == Some("lighthouse") {
+                lighthouses += 1;
+            }
         }
         // SUBSTRATE-4/8 — leadership from the shared leader read (etcd lease when
         // on the coordination plane, else the fs lockfile). `node_id` may carry
         // the `peer:` prefix; `leader_name` returns the bare hostname.
         let bare = node_id.strip_prefix("peer:").unwrap_or(node_id);
         let is_leader = self.leader_name().is_some_and(|l| l == bare);
-        (total, healthy, degraded, unreachable, is_leader)
+        (
+            total,
+            healthy,
+            degraded,
+            unreachable,
+            is_leader,
+            lighthouses,
+        )
     }
 
     /// Build the full directory reply (the verb body + the CLI both

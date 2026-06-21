@@ -89,7 +89,7 @@ fn a_heartbeat_on_one_node_is_visible_in_another_nodes_directory() {
 
     // Node "beta" builds its directory view off the shared dir and sees BOTH.
     let svc = DirectoryService::new(shared.path(), None);
-    let (count, healthy, _deg, _unreach, _leader) = svc.mesh_health_counts("peer:beta", now);
+    let (count, healthy, _deg, _unreach, _leader, _lh) = svc.mesh_health_counts("peer:beta", now);
     assert_eq!(
         count, 2,
         "both peers' heartbeats visible across the shared volume"
@@ -113,11 +113,11 @@ fn healthz_counts_reflect_the_shared_mesh_and_elected_leader() {
 
     let svc = DirectoryService::new(shared.path(), None);
     // From the leader's vantage: 3 nodes, leader true.
-    let (count, _h, _d, _u, is_leader) = svc.mesh_health_counts("peer:n1", now);
+    let (count, _h, _d, _u, is_leader, _lh) = svc.mesh_health_counts("peer:n1", now);
     assert_eq!(count, 3, "healthz node_count == shared mesh size, not 0");
     assert!(is_leader, "the lease holder reports is_leader=true");
     // From a follower's vantage: same count, leader false.
-    let (count_f, _h, _d, _u, is_leader_f) = svc.mesh_health_counts("peer:n2", now);
+    let (count_f, _h, _d, _u, is_leader_f, _lh) = svc.mesh_health_counts("peer:n2", now);
     assert_eq!(count_f, 3);
     assert!(!is_leader_f, "a non-holder reports is_leader=false");
 }
