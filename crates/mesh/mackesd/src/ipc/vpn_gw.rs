@@ -25,7 +25,7 @@ use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use serde_json::json;
 
-use mackes_mesh_types::vpn::{self, Method, TunnelDef};
+use mackes_mesh_types::vpn::{self, EgressRoute, Method, TunnelDef};
 
 /// The VPN responder — rooted at the shared workgroup root (the config home).
 #[derive(Debug, Clone)]
@@ -72,7 +72,12 @@ impl VpnService {
 /// Action verbs served on `action/vpn/<verb>`. VPN-GW-2 adds `set-secret`
 /// (seal a tunnel's creds to an assigned node's blob) + `secret-status`
 /// (does the assigned node have a blob? — never reveals the material).
-pub const ACTION_VERBS: [&str; 8] = [
+/// VPN-GW-4 adds the egress-routing surface: `set-route` (assign a scope →
+/// gateway + ordered tunnel chain + kill-switch), `clear-route` (drop a scope's
+/// assignment), `list-routes` (the durable assignments), and `route-status`
+/// (each scope's gateway + chain + the currently-active tunnel from the
+/// failover selector run against live tunnel status).
+pub const ACTION_VERBS: [&str; 12] = [
     "list-tunnels",
     "add-tunnel",
     "remove-tunnel",
@@ -81,6 +86,10 @@ pub const ACTION_VERBS: [&str; 8] = [
     "tunnel-status",
     "set-secret",
     "secret-status",
+    "set-route",
+    "clear-route",
+    "list-routes",
+    "route-status",
 ];
 
 /// Responder poll interval.
@@ -191,6 +200,26 @@ pub fn build_reply(svc: &VpnService, verb: &str, req_body: Option<&str>) -> Stri
         // size only — never the secret. Useful for the panel's "creds present"
         // badge + a sanity check that distribution landed.
         "secret-status" => build_secret_status_reply(svc, req_body),
+        // VPN-GW-4 — assign a scope's internet egress to a gateway + an ordered
+        // tunnel chain. Body is an `EgressRoute`
+        // (`{ "scope": {...}, "gateway": "...", "chain": [...], "kill_switch": .. }`).
+        // Persists into `routes.toml`; the `vpn_gateway` worker on the gateway
+        // node selects the active tunnel from the chain + applies its egress.
+        "set-route" => build_set_route_reply(svc, req_body),
+        // VPN-GW-4 — drop a scope's assignment. Body: the scope key
+        // (`node:<id>` / `group:<name>` / `any`).
+        "clear-route" => build_clear_route_reply(svc, req_body),
+        // VPN-GW-4 — the durable egress-route assignments.
+        "list-routes" => {
+            let cfg = vpn::load_routes(root);
+            json!({ "ok": true, "routes": cfg.route }).to_string()
+        }
+        // VPN-GW-4 — each scope's gateway + chain + the currently-active tunnel.
+        // The active tunnel is the failover selector run against live per-tunnel
+        // up/down status (VPN-GW-1's interface check) on the box this responder
+        // runs on — best-effort visibility; the gateway node's own worker is the
+        // authority that actually applies the egress.
+        "route-status" => build_route_status_reply(svc),
         other => err(format!("unknown vpn verb: {other}")),
     }
 }
@@ -287,6 +316,81 @@ fn build_secret_status_reply(svc: &VpnService, req_body: Option<&str>) -> String
         "bytes": bytes,
     })
     .to_string()
+}
+
+/// VPN-GW-4 — persist an egress-route assignment. Body is an `EgressRoute`. The
+/// route is validated (non-empty gateway + chain + scope key) before save so a
+/// route that can never carry egress is refused loud, not at reconcile time.
+fn build_set_route_reply(svc: &VpnService, req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let root = svc.workgroup_root.as_path();
+    let Some(body) = req_body else {
+        return err("set-route: missing EgressRoute body".into());
+    };
+    let r: EgressRoute = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => return err(format!("set-route: bad json: {e}")),
+    };
+    if let Err(e) = r.validate() {
+        return err(format!("set-route: {e}"));
+    }
+    let scope_key = r.scope_key();
+    let mut cfg = vpn::load_routes(root);
+    cfg.upsert(r);
+    match vpn::save_routes(root, &cfg) {
+        Ok(_) => json!({ "ok": true, "scope": scope_key }).to_string(),
+        Err(e) => err(format!("set-route: save: {e}")),
+    }
+}
+
+/// VPN-GW-4 — drop a scope's egress assignment. Body is the scope key
+/// (`node:<id>` / `group:<name>` / `any`).
+fn build_clear_route_reply(svc: &VpnService, req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let root = svc.workgroup_root.as_path();
+    let Some(key) = req_body.map(str::trim).filter(|s| !s.is_empty()) else {
+        return err("clear-route: missing scope key".into());
+    };
+    let mut cfg = vpn::load_routes(root);
+    if !cfg.remove(key) {
+        return err(format!("clear-route: no route for scope '{key}'"));
+    }
+    match vpn::save_routes(root, &cfg) {
+        Ok(_) => json!({ "ok": true, "scope": key }).to_string(),
+        Err(e) => err(format!("clear-route: save: {e}")),
+    }
+}
+
+/// VPN-GW-4 — report, per assigned scope, the gateway + the ordered chain + the
+/// currently-active tunnel (the failover selector run against live tunnel
+/// status, seen from this box) + the kill-switch flag. Pure visibility — it does
+/// not apply anything (the gateway node's `vpn_gateway` worker does that).
+fn build_route_status_reply(svc: &VpnService) -> String {
+    let root = svc.workgroup_root.as_path();
+    let routes = vpn::load_routes(root);
+    let tunnels = vpn::load(root);
+    let statuses: Vec<serde_json::Value> = routes
+        .route
+        .iter()
+        .map(|r| {
+            // The selector decides the active tunnel from the chain + each
+            // tunnel's live interface presence. A chain entry with no def is
+            // treated as down (can't be up if it isn't configured).
+            let active = vpn::select_active(r, |tunnel_id| {
+                tunnels
+                    .get(tunnel_id)
+                    .is_some_and(|t| iface_up(svc.spawn, &t.ifname()))
+            });
+            json!({
+                "scope": r.scope_key(),
+                "gateway": r.gateway,
+                "chain": r.chain,
+                "kill_switch": r.kill_switch,
+                "active": active.tunnel_id(),
+            })
+        })
+        .collect();
+    json!({ "ok": true, "routes": statuses }).to_string()
 }
 
 /// Write a sealed blob at mode 0600 (atomic temp+rename). The `.age` blob is
@@ -423,9 +527,14 @@ mod tests {
     #[test]
     fn topic_and_verbs_lock() {
         assert_eq!(action_topic("tunnel-up"), "action/vpn/tunnel-up");
-        assert_eq!(ACTION_VERBS.len(), 8);
+        assert_eq!(ACTION_VERBS.len(), 12);
         assert!(ACTION_VERBS.contains(&"set-secret"));
         assert!(ACTION_VERBS.contains(&"secret-status"));
+        // VPN-GW-4 routing surface.
+        assert!(ACTION_VERBS.contains(&"set-route"));
+        assert!(ACTION_VERBS.contains(&"clear-route"));
+        assert!(ACTION_VERBS.contains(&"list-routes"));
+        assert!(ACTION_VERBS.contains(&"route-status"));
     }
 
     #[test]
@@ -589,5 +698,96 @@ mod tests {
         // Removing the tunnel purges the blob (rotate-on-delete).
         assert!(build_reply(&s, "remove-tunnel", Some("mullvad1")).contains("\"ok\":true"));
         assert!(!blob_path.exists(), "secret blob survived tunnel removal");
+    }
+
+    // ── VPN-GW-4 — set-route / clear-route / list-routes / route-status ──────
+
+    #[test]
+    fn set_route_persists_and_list_routes_round_trips() {
+        let (_t, s) = svc();
+        let body = json!({
+            "scope": { "kind": "node", "id": "peer:anvil" },
+            "gateway": "peer:gw",
+            "chain": ["mullvad1", "proton2"],
+            "kill_switch": true,
+        })
+        .to_string();
+        let r = build_reply(&s, "set-route", Some(&body));
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{r}");
+        assert_eq!(v["scope"], "node:peer:anvil");
+        // list-routes returns the persisted assignment.
+        let list = build_reply(&s, "list-routes", None);
+        let lv: serde_json::Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(lv["routes"].as_array().unwrap().len(), 1);
+        assert_eq!(lv["routes"][0]["gateway"], "peer:gw");
+        assert_eq!(lv["routes"][0]["chain"][0], "mullvad1");
+    }
+
+    #[test]
+    fn set_route_rejects_empty_chain() {
+        let (_t, s) = svc();
+        let body = json!({
+            "scope": { "kind": "any-mesh" },
+            "gateway": "peer:gw",
+            "chain": [],
+        })
+        .to_string();
+        assert!(build_reply(&s, "set-route", Some(&body)).contains("chain is empty"));
+    }
+
+    #[test]
+    fn set_route_replaces_per_scope() {
+        let (_t, s) = svc();
+        let any = |gw: &str| {
+            json!({ "scope": { "kind": "any-mesh" }, "gateway": gw, "chain": ["t"] }).to_string()
+        };
+        assert!(build_reply(&s, "set-route", Some(&any("peer:gw1"))).contains("\"ok\":true"));
+        assert!(build_reply(&s, "set-route", Some(&any("peer:gw2"))).contains("\"ok\":true"));
+        let lv: serde_json::Value =
+            serde_json::from_str(&build_reply(&s, "list-routes", None)).unwrap();
+        // One assignment per scope — the second replaced the first.
+        assert_eq!(lv["routes"].as_array().unwrap().len(), 1);
+        assert_eq!(lv["routes"][0]["gateway"], "peer:gw2");
+    }
+
+    #[test]
+    fn clear_route_drops_a_scope_and_errors_on_a_ghost() {
+        let (_t, s) = svc();
+        let body = json!({ "scope": { "kind": "any-mesh" }, "gateway": "peer:gw", "chain": ["t"] })
+            .to_string();
+        assert!(build_reply(&s, "set-route", Some(&body)).contains("\"ok\":true"));
+        assert!(build_reply(&s, "clear-route", Some("any")).contains("\"ok\":true"));
+        let lv: serde_json::Value =
+            serde_json::from_str(&build_reply(&s, "list-routes", None)).unwrap();
+        assert!(lv["routes"].as_array().unwrap().is_empty());
+        // Clearing a ghost scope errors honestly.
+        assert!(build_reply(&s, "clear-route", Some("any")).contains("no route for scope"));
+    }
+
+    #[test]
+    fn route_status_reports_chain_and_active_tunnel() {
+        let (_t, s) = svc();
+        // No interfaces are up under `without_spawn` → the selector returns no
+        // active tunnel (all down), exercising the failover/kill-switch path.
+        let _ = add(&s, "mullvad1", "wg");
+        let body = json!({
+            "scope": { "kind": "any-mesh" },
+            "gateway": "peer:gw",
+            "chain": ["mullvad1", "proton2"],
+            "kill_switch": true,
+        })
+        .to_string();
+        assert!(build_reply(&s, "set-route", Some(&body)).contains("\"ok\":true"));
+        let st = build_reply(&s, "route-status", None);
+        let v: serde_json::Value = serde_json::from_str(&st).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true));
+        let routes = v["routes"].as_array().unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0]["scope"], "any");
+        assert_eq!(routes[0]["chain"][0], "mullvad1");
+        assert_eq!(routes[0]["kill_switch"], serde_json::Value::Bool(true));
+        // Spawn disabled → every tunnel reads down → no active tunnel.
+        assert_eq!(routes[0]["active"], serde_json::Value::Null);
     }
 }

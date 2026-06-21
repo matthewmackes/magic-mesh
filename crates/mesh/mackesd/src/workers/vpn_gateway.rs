@@ -40,7 +40,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use mackes_mesh_types::vpn::{self, EgressCmd, Method, TunnelDef, VpnConfig};
+use mackes_mesh_types::vpn::{
+    self, ActiveTunnel, EgressCmd, EgressPolicy, Method, RouteConfig, TunnelDef, VpnConfig,
+};
 
 use super::{ShutdownToken, Worker};
 
@@ -61,16 +63,41 @@ pub fn openvpn_config_path(t: &TunnelDef) -> String {
 pub struct VpnGatewayWorker {
     workgroup_root: PathBuf,
     tick: Duration,
+    /// VPN-GW-4 — this node's id (`peer:host`), so the worker can resolve which
+    /// egress route applies to it (the `Node` scope) when it's a gateway. Empty
+    /// when unset (a `Node`-scoped route then never matches; `Group`/`AnyMesh`
+    /// still do).
+    node_id: String,
+    /// VPN-GW-4 — this node's group memberships, so a `Group`-scoped route can
+    /// match. Resolved at the wiring layer from the mesh's group config; empty
+    /// when the node belongs to no routing group.
+    groups: Vec<String>,
 }
 
 impl VpnGatewayWorker {
     /// Construct with production defaults, rooted at the shared workgroup root.
+    /// VPN-GW-4: the node id + group memberships drive route scope matching;
+    /// they're supplied via [`Self::with_identity`] (the bare `new` leaves them
+    /// empty so existing call sites and tests compile — a node with no identity
+    /// only ever matches an `AnyMesh` route).
     #[must_use]
     pub fn new(workgroup_root: PathBuf) -> Self {
         Self {
             workgroup_root,
             tick: DEFAULT_TICK_INTERVAL,
+            node_id: String::new(),
+            groups: Vec::new(),
         }
+    }
+
+    /// VPN-GW-4 — set this node's id + routing-group memberships (the wiring
+    /// layer supplies the live identity). Drives `Node`/`Group` scope matching
+    /// in [`plan_route_egress`].
+    #[must_use]
+    pub fn with_identity(mut self, node_id: String, groups: Vec<String>) -> Self {
+        self.node_id = node_id;
+        self.groups = groups;
+        self
     }
 
     /// Override the reconcile cadence (tests).
@@ -91,13 +118,32 @@ impl VpnGatewayWorker {
         for argv in plan_bring_up(&cfg, &present_ifaces) {
             run_argv(&argv);
         }
-        // VPN-GW-3 — reconcile selective egress after bring-up. Skip entirely
-        // when neither policy-routing tool is present (degrade gracefully).
+        // VPN-GW-4 — the route-driven egress plan: resolve which route applies
+        // to this node, run the failover selector against live tunnel status,
+        // and apply the SELECTED tunnel's egress (GW-3's mechanism) while
+        // tearing down the chain's non-selected tunnels. A route that fails
+        // selection (all down) tears every chain tunnel down — the kill-switch
+        // (when set) then blocks the marked traffic. Skipped entirely when
+        // ip/nft are absent (degrade gracefully).
+        let routes = vpn::load_routes(&self.workgroup_root);
+        if let Err(e) = routes.validate() {
+            tracing::warn!(error = %e, "vpn_gateway: route config invalid; skipping egress routing");
+            return;
+        }
+        let has_route = vpn::resolve_route(&routes, &self.node_id, &self.groups).is_some();
         if egress_tools_present() {
-            for cmd in plan_egress(&cfg, &present_ifaces) {
+            // The route engine (GW-4) is the egress driver when a route applies
+            // to this node; otherwise fall back to GW-3's per-tunnel
+            // `egress.enabled` plan so a manually-flagged tunnel still works.
+            let plan = if has_route {
+                plan_route_egress(&routes, &cfg, &self.node_id, &self.groups, &present_ifaces)
+            } else {
+                plan_egress(&cfg, &present_ifaces)
+            };
+            for cmd in plan {
                 run_egress_cmd(&cmd);
             }
-        } else if cfg.tunnel.iter().any(|t| t.egress.enabled) {
+        } else if has_route || cfg.tunnel.iter().any(|t| t.egress.enabled) {
             tracing::debug!("vpn_gateway: ip/nft absent; skipping selective-egress reconcile");
         }
     }
@@ -231,6 +277,95 @@ where
         }
     }
     plan
+}
+
+/// VPN-GW-4 — the PURE route-driven egress planner. This is the assignment
+/// engine that DRIVES VPN-GW-3's per-tunnel mechanism:
+///
+/// 1. Resolve which egress route applies to this node by scope precedence
+///    (`Node` > `Group` > `AnyMesh`) via [`vpn::resolve_route`]. No route → the
+///    plan is empty (egress routing is opt-in per node).
+/// 2. Run the failover selector ([`vpn::select_active`]) over the route's ordered
+///    tunnel chain against `iface_present` (live tunnel up/down — VPN-GW-1's
+///    `tunnel-status` mechanism): the active tunnel is the first chain entry that
+///    is up.
+/// 3. **Apply** that one tunnel's egress (GW-3's [`vpn::plan_egress_apply`], with
+///    an `EgressPolicy` synthesized from the route — enabled + the route's
+///    kill-switch) so the assigned node's traffic exits through the selected
+///    provider, and **tear down** every OTHER tunnel in the chain
+///    ([`vpn::plan_egress_teardown`]) so a previously-active tunnel's routing is
+///    removed on failover (no two chain tunnels carry egress at once).
+/// 4. All chain tunnels down → no apply; every chain tunnel is torn down. The
+///    kill-switch drop (installed with the apply when the route opts in) is the
+///    block-on-drop guard; without it the marked traffic falls through.
+///
+/// The plan starts with the idempotent nftables scaffolding so the NAT +
+/// kill-switch chains exist. Pure data — no I/O, fully unit-testable without a
+/// live mesh (the live multi-provider failover *verification* is VPN-GW-6).
+///
+/// A chain tunnel id with no matching [`TunnelDef`] is skipped for apply (we
+/// can't route an interface that doesn't exist) but still counts as "down" in
+/// the selector — so a typo'd chain entry fails over to the next real tunnel.
+#[must_use]
+pub fn plan_route_egress<P>(
+    routes: &RouteConfig,
+    cfg: &VpnConfig,
+    node_id: &str,
+    groups: &[String],
+    iface_present: P,
+) -> Vec<EgressCmd>
+where
+    P: Fn(&str) -> bool,
+{
+    let Some(route) = vpn::resolve_route(routes, node_id, groups) else {
+        return Vec::new();
+    };
+    // The selector treats a chain entry as up only when its tunnel is configured
+    // AND its interface is present.
+    let is_up = |tunnel_id: &str| {
+        cfg.get(tunnel_id)
+            .is_some_and(|t| iface_present(&t.ifname()))
+    };
+    let active = vpn::select_active(route, is_up);
+    let selected = match &active {
+        ActiveTunnel::Up { tunnel_id } => Some(tunnel_id.clone()),
+        ActiveTunnel::AllDown { .. } => None,
+    };
+
+    let mut plan = vpn::egress_nft_table_setup_argv();
+    for tunnel_id in &route.chain {
+        let Some(def) = cfg.get(tunnel_id) else {
+            // Unconfigured chain entry — nothing to route/teardown for it.
+            continue;
+        };
+        if selected.as_deref() == Some(tunnel_id.as_str()) {
+            // The active tunnel: apply egress via GW-3's mechanism. Synthesize
+            // the policy from the ROUTE (enabled + the route's kill-switch) so
+            // the route is the authority — we don't reimplement the ip/nft layer.
+            let applied = with_route_policy(def, route.kill_switch);
+            plan.extend(vpn::plan_egress_apply(&applied));
+        } else {
+            // A non-selected chain tunnel: tear its routing down so a prior
+            // active tunnel's egress is removed on failover (idempotent — a
+            // never-applied tunnel's teardown is a benign no-op).
+            plan.extend(vpn::plan_egress_teardown(def));
+        }
+    }
+    plan
+}
+
+/// VPN-GW-4 — clone a tunnel def with an [`EgressPolicy`] synthesized from the
+/// route's selection: egress enabled + the route's kill-switch, mark left
+/// derived (or the def's operator pin, if any). Lets the route drive GW-3's
+/// `plan_egress_apply` without mutating the durable tunnel config.
+fn with_route_policy(def: &TunnelDef, kill_switch: bool) -> TunnelDef {
+    let mut t = def.clone();
+    t.egress = EgressPolicy {
+        enabled: true,
+        kill_switch,
+        mark: def.egress.mark,
+    };
+    t
 }
 
 /// Run one egress `ip`/`nft` command with a bounded timeout. Honest: a nonzero
@@ -467,6 +602,177 @@ mod tests {
         for cmd in &plan {
             assert!(!cmd.argv().join(" ").contains(&off_if));
         }
+    }
+
+    // ── VPN-GW-4 — route-driven egress planner ──────────────────────────────
+    // (RouteConfig is already in scope via `use super::*`; only the route value
+    // types need importing here.)
+
+    use mackes_mesh_types::vpn::{EgressRoute, RouteScope};
+
+    fn rcfg(routes: &[EgressRoute]) -> RouteConfig {
+        RouteConfig {
+            route: routes.to_vec(),
+        }
+    }
+
+    fn rt(scope: RouteScope, gw: &str, chain: &[&str], ks: bool) -> EgressRoute {
+        EgressRoute {
+            scope,
+            gateway: gw.into(),
+            chain: chain.iter().map(|s| (*s).to_string()).collect(),
+            kill_switch: ks,
+        }
+    }
+
+    #[test]
+    fn route_egress_empty_when_no_route_applies() {
+        // A route for a DIFFERENT node + no AnyMesh fallback → nothing for us.
+        let routes = rcfg(&[rt(
+            RouteScope::Node {
+                id: "peer:other".into(),
+            },
+            "peer:gw",
+            &["mullvad1"],
+            true,
+        )]);
+        let c = cfg(&[tun("mullvad1", Method::Wg)]);
+        assert!(plan_route_egress(&routes, &c, "peer:me", &[], |_| true).is_empty());
+    }
+
+    #[test]
+    fn route_egress_applies_only_the_selected_active_tunnel() {
+        // AnyMesh route, chain primary→fallback; both interfaces present.
+        let routes = rcfg(&[rt(
+            RouteScope::AnyMesh,
+            "peer:gw",
+            &["primary", "fallback"],
+            true,
+        )]);
+        let c = cfg(&[tun("primary", Method::Wg), tun("fallback", Method::Wg)]);
+        let plan = plan_route_egress(&routes, &c, "peer:me", &[], |_| true);
+        // scaffold(3) + apply for "primary" (the selector's pick) + teardown(2)
+        // for "fallback".
+        let primary = with_route_policy(&tun("primary", Method::Wg), true);
+        let fallback = tun("fallback", Method::Wg);
+        let expected_apply = vpn::plan_egress_apply(&primary);
+        let expected_teardown = vpn::plan_egress_teardown(&fallback);
+        assert_eq!(
+            plan.len(),
+            3 + expected_apply.len() + expected_teardown.len()
+        );
+        assert_eq!(&plan[..3], &vpn::egress_nft_table_setup_argv()[..]);
+        // The selected primary is applied (its ifname is routed).
+        assert!(plan
+            .iter()
+            .any(|c| c.argv().join(" ").contains("mvpn-primary")
+                && c.argv().join(" ").contains("replace default")));
+        // The non-selected fallback is NOT applied (no default route for it).
+        assert!(!plan
+            .iter()
+            .any(|c| c.argv().join(" ").contains("mvpn-fallback")
+                && c.argv().join(" ").contains("replace default")));
+    }
+
+    #[test]
+    fn route_egress_fails_over_when_primary_is_down() {
+        let routes = rcfg(&[rt(
+            RouteScope::AnyMesh,
+            "peer:gw",
+            &["primary", "fallback"],
+            true,
+        )]);
+        let c = cfg(&[tun("primary", Method::Wg), tun("fallback", Method::Wg)]);
+        // primary's interface DOWN, fallback UP → fallback becomes active.
+        let plan = plan_route_egress(&routes, &c, "peer:me", &[], |ifn| ifn == "mvpn-fallback");
+        // The fallback is applied (routed), the primary torn down.
+        assert!(plan
+            .iter()
+            .any(|c| c.argv().join(" ").contains("mvpn-fallback")
+                && c.argv().join(" ").contains("replace default")));
+        assert!(!plan
+            .iter()
+            .any(|c| c.argv().join(" ").contains("mvpn-primary")
+                && c.argv().join(" ").contains("replace default")));
+    }
+
+    #[test]
+    fn route_egress_all_down_applies_nothing_only_scaffold_and_teardown() {
+        let routes = rcfg(&[rt(
+            RouteScope::AnyMesh,
+            "peer:gw",
+            &["primary", "fallback"],
+            true,
+        )]);
+        let c = cfg(&[tun("primary", Method::Wg), tun("fallback", Method::Wg)]);
+        // Every interface down → no active tunnel; both chain entries torn down.
+        let plan = plan_route_egress(&routes, &c, "peer:me", &[], |_| false);
+        // No default route is installed for any tunnel (no leak path opened).
+        for c in &plan {
+            assert!(
+                !c.argv().join(" ").contains("replace default"),
+                "all-down must apply no default route"
+            );
+        }
+        // scaffold(3) + teardown(2) for each of the two chain tunnels.
+        let td = vpn::plan_egress_teardown(&tun("primary", Method::Wg));
+        assert_eq!(plan.len(), 3 + 2 * td.len());
+    }
+
+    #[test]
+    fn route_egress_honors_scope_precedence_node_over_group() {
+        // A Node route + a Group route both match; the Node route's chain wins.
+        let routes = rcfg(&[
+            rt(
+                RouteScope::Group { name: "lab".into() },
+                "gw",
+                &["grp_tun"],
+                true,
+            ),
+            rt(
+                RouteScope::Node {
+                    id: "peer:me".into(),
+                },
+                "gw",
+                &["node_tun"],
+                true,
+            ),
+        ]);
+        let c = cfg(&[tun("grp_tun", Method::Wg), tun("node_tun", Method::Wg)]);
+        let plan = plan_route_egress(&routes, &c, "peer:me", &["lab".into()], |_| true);
+        // The Node route applies node_tun, never grp_tun.
+        assert!(plan
+            .iter()
+            .any(|c| c.argv().join(" ").contains("mvpn-nodetun")
+                && c.argv().join(" ").contains("replace default")));
+        assert!(!plan
+            .iter()
+            .any(|c| c.argv().join(" ").contains("mvpn-grptun")));
+    }
+
+    #[test]
+    fn route_egress_skips_a_chain_entry_with_no_tunnel_def() {
+        // The primary chain entry has no def (typo) → treated as down; the real
+        // fallback becomes active.
+        let routes = rcfg(&[rt(RouteScope::AnyMesh, "peer:gw", &["ghost", "real"], true)]);
+        let c = cfg(&[tun("real", Method::Wg)]);
+        let plan = plan_route_egress(&routes, &c, "peer:me", &[], |_| true);
+        assert!(plan.iter().any(|c| c.argv().join(" ").contains("mvpn-real")
+            && c.argv().join(" ").contains("replace default")));
+    }
+
+    #[test]
+    fn with_route_policy_enables_egress_and_carries_killswitch() {
+        let base = tun("t", Method::Wg);
+        assert!(!base.egress.enabled);
+        let on = with_route_policy(&base, true);
+        assert!(on.egress.enabled);
+        assert!(on.egress.kill_switch);
+        let off = with_route_policy(&base, false);
+        assert!(off.egress.enabled);
+        assert!(!off.egress.kill_switch);
+        // The mark is derived (or the def's pin) — same tunnel id → same mark.
+        assert_eq!(on.egress_mark(), base.egress_mark());
     }
 
     #[tokio::test]

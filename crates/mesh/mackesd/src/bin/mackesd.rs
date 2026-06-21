@@ -5716,8 +5716,21 @@ fn run_serve(
         // config is the desired state and this worker re-converges to it on boot.
         // Idles gracefully when neither wg-quick nor openvpn is present.
         if mackesd_core::worker_role::runs("vpn_gateway", role_rank) {
+            // VPN-GW-4 — supply the live identity so the worker can resolve which
+            // egress route applies to this node by scope precedence. `Node` keys
+            // on the node id; `Group` keys on this node's capability tags
+            // (node-tags/<host>.json — the existing per-node membership set any
+            // surface can write), so a group-scoped route matches a tagged node.
+            let vpn_host = node_id.strip_prefix("peer:").unwrap_or(&node_id);
+            let vpn_groups: Vec<String> =
+                mackes_mesh_types::cap_tags::read_tags(&workgroup_root, vpn_host)
+                    .tags
+                    .iter()
+                    .map(|t| t.as_str().to_string())
+                    .collect();
             sup.spawn(Spawn::new(
-                mackesd_core::workers::vpn_gateway::VpnGatewayWorker::new(workgroup_root.clone()),
+                mackesd_core::workers::vpn_gateway::VpnGatewayWorker::new(workgroup_root.clone())
+                    .with_identity(node_id.clone(), vpn_groups),
                 RestartPolicy::OnFailure,
             ));
             worker_names.lock().expect("worker_names mutex").push("vpn_gateway".into());
@@ -6970,7 +6983,9 @@ fn run_serve(
                     .map(|_handle| {
                         tracing::info!(
                             "VPN Bus responder spawned; serving action/vpn/{{list-tunnels,\
-                             add-tunnel,remove-tunnel,tunnel-up,tunnel-down,tunnel-status}} (VPN-GW-1)"
+                             add-tunnel,remove-tunnel,tunnel-up,tunnel-down,tunnel-status,\
+                             set-secret,secret-status,set-route,clear-route,list-routes,\
+                             route-status}} (VPN-GW-1/2/4)"
                         );
                     })
                     .unwrap_or_else(|e| {

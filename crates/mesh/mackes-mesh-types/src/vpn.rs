@@ -276,6 +276,339 @@ pub fn save(
     Ok(path)
 }
 
+// ── VPN-GW-4 — mesh egress routing (per-node / group / ANY) + failover chain ──
+//
+// VPN-GW-3 built the per-TUNNEL mechanism (mark→table→NAT→kill-switch). This is
+// the ROUTING/assignment engine that *drives* it: an operator assigns a scope
+// (one node, a node-group, or the whole mesh) to a gateway node + an ordered
+// **tunnel chain** (primary first, then failover fallbacks). On the gateway, the
+// `vpn_gateway` worker runs the pure **selector** below against live per-tunnel
+// up/down status (VPN-GW-1's `tunnel-status`) to pick the active tunnel — the
+// first chain entry that is up — and applies *that* tunnel's egress via GW-3's
+// `plan_egress_apply`. On a drop it re-selects (fails over down the chain); when
+// nothing is up the kill-switch flag decides leak-vs-block.
+//
+// Everything here is dep-free + pure: the model round-trips through TOML, and the
+// selector/resolver are unit-tested without a live mesh. The cross-node, real-
+// multi-provider live failover verification (and the silent-leak / exit-IP probe
+// that *detects* a down tunnel beyond the interface check) is VPN-GW-6.
+
+/// VPN-GW-4 — the scope an [`EgressRoute`] assigns. Precedence on a given node is
+/// **`Node` > `Group` > `AnyMesh`** (the most specific assignment wins), resolved
+/// by [`resolve_route`]. The `#[default]` is `AnyMesh` — a route with no explicit
+/// scope is the mesh-wide default egress.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum RouteScope {
+    /// Exactly one node, keyed by its node id (`peer:host`).
+    Node {
+        /// The assigned node's id.
+        id: String,
+    },
+    /// A named node-group; a node matches when the group is in its membership
+    /// set (resolved at the worker from the mesh's group config — kept out of
+    /// this dep-free model).
+    Group {
+        /// The group name.
+        name: String,
+    },
+    /// The whole mesh (the default egress for any node not covered by a more
+    /// specific `Node`/`Group` route).
+    #[default]
+    AnyMesh,
+}
+
+impl RouteScope {
+    /// Specificity rank for precedence: `Node`(2) > `Group`(1) > `AnyMesh`(0).
+    /// A higher rank wins in [`resolve_route`].
+    #[must_use]
+    pub fn specificity(&self) -> u8 {
+        match self {
+            RouteScope::Node { .. } => 2,
+            RouteScope::Group { .. } => 1,
+            RouteScope::AnyMesh => 0,
+        }
+    }
+
+    /// Does this scope apply to the node `node_id` whose group memberships are
+    /// `groups`? Pure — the worker supplies the live identity + membership.
+    #[must_use]
+    pub fn matches(&self, node_id: &str, groups: &[String]) -> bool {
+        match self {
+            RouteScope::Node { id } => id == node_id,
+            RouteScope::Group { name } => groups.iter().any(|g| g == name),
+            RouteScope::AnyMesh => true,
+        }
+    }
+}
+
+/// VPN-GW-4 — one egress-route assignment: a [`RouteScope`] → a **gateway node**
+/// + an **ordered tunnel chain** (primary first, failover fallbacks after) + the
+/// kill-switch flag (block-on-all-down vs. leak). The chain entries are tunnel
+/// ids on the gateway (the gateway's `tunnels.toml` defines them).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressRoute {
+    /// What this route covers (node / group / whole mesh).
+    #[serde(default)]
+    pub scope: RouteScope,
+    /// The gateway node id (`peer:host`) whose tunnels carry the egress. The
+    /// assigned node's traffic exits via this node's selected tunnel.
+    #[serde(default)]
+    pub gateway: String,
+    /// Ordered tunnel-id chain: index 0 is the primary, the rest are failover
+    /// fallbacks tried in order. The first entry whose tunnel is **up** is the
+    /// active tunnel ([`select_active`]).
+    #[serde(default)]
+    pub chain: Vec<String>,
+    /// Block egress when every chain tunnel is down (no plaintext leak). The
+    /// design default is "block on drop" (Q8); failover is tried first.
+    #[serde(default = "default_true")]
+    pub kill_switch: bool,
+}
+
+/// serde default for [`EgressRoute::kill_switch`] — the design's block-on-drop
+/// default (Q8). A route omitting the flag still blocks rather than leaks.
+fn default_true() -> bool {
+    true
+}
+
+impl Default for EgressRoute {
+    /// The block-on-drop default (`kill_switch = true`), consistent with the
+    /// serde default so a TOML-omitted flag and `EgressRoute::default()` agree.
+    fn default() -> Self {
+        Self {
+            scope: RouteScope::default(),
+            gateway: String::new(),
+            chain: Vec::new(),
+            kill_switch: true,
+        }
+    }
+}
+
+impl EgressRoute {
+    /// Validate the route is usable: a non-empty gateway, a non-empty chain
+    /// (a route with no tunnels can never carry egress), and — for a `Node`/
+    /// `Group` scope — a non-empty key. Pure.
+    ///
+    /// # Errors
+    /// A human-readable reason.
+    pub fn validate(&self) -> Result<(), String> {
+        match &self.scope {
+            RouteScope::Node { id } if id.trim().is_empty() => {
+                return Err("route scope Node has an empty id".into());
+            }
+            RouteScope::Group { name } if name.trim().is_empty() => {
+                return Err("route scope Group has an empty name".into());
+            }
+            _ => {}
+        }
+        if self.gateway.trim().is_empty() {
+            return Err("route gateway is empty".into());
+        }
+        if self.chain.is_empty() {
+            return Err("route tunnel chain is empty".into());
+        }
+        if self.chain.iter().any(|t| t.trim().is_empty()) {
+            return Err("route tunnel chain has an empty entry".into());
+        }
+        Ok(())
+    }
+
+    /// A stable key for upsert/remove keyed on the scope (one assignment per
+    /// scope — re-assigning a node/group/ANY replaces its route).
+    #[must_use]
+    pub fn scope_key(&self) -> String {
+        match &self.scope {
+            RouteScope::Node { id } => format!("node:{id}"),
+            RouteScope::Group { name } => format!("group:{name}"),
+            RouteScope::AnyMesh => "any".to_string(),
+        }
+    }
+}
+
+/// VPN-GW-4 — the outcome of running the failover selector over a route's chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActiveTunnel {
+    /// The first up tunnel in the chain (the one to apply egress for).
+    Up {
+        /// The selected tunnel id.
+        tunnel_id: String,
+    },
+    /// Every chain tunnel is down. `kill_switch` carries the route's flag so the
+    /// worker knows whether to BLOCK (no leak) or fall through to the WAN.
+    AllDown {
+        /// The route's kill-switch flag at the time of selection.
+        kill_switch: bool,
+    },
+}
+
+impl ActiveTunnel {
+    /// The selected tunnel id, if any is up.
+    #[must_use]
+    pub fn tunnel_id(&self) -> Option<&str> {
+        match self {
+            ActiveTunnel::Up { tunnel_id } => Some(tunnel_id),
+            ActiveTunnel::AllDown { .. } => None,
+        }
+    }
+}
+
+/// VPN-GW-4 — the PURE failover selector. Given a route's ordered chain and a
+/// predicate reporting whether a tunnel id is currently **up** (fed by VPN-GW-1's
+/// `tunnel-status` in the worker), pick the active tunnel = the **first chain
+/// entry that is up**. When none is up, return [`ActiveTunnel::AllDown`] carrying
+/// the route's kill-switch flag.
+///
+/// This is the whole failover policy: primary-up → primary; primary-down → the
+/// next up entry; all-down → none (kill-switch decides leak-vs-block). No I/O.
+#[must_use]
+pub fn select_active<F>(route: &EgressRoute, is_up: F) -> ActiveTunnel
+where
+    F: Fn(&str) -> bool,
+{
+    for tunnel_id in &route.chain {
+        if is_up(tunnel_id.as_str()) {
+            return ActiveTunnel::Up {
+                tunnel_id: tunnel_id.clone(),
+            };
+        }
+    }
+    ActiveTunnel::AllDown {
+        kill_switch: route.kill_switch,
+    }
+}
+
+/// VPN-GW-4 — "should this route fail over?": the currently-active tunnel
+/// (`current`, e.g. the one egress is applied for) is no longer the selector's
+/// choice. Pure helper over [`select_active`] for the worker's switch decision.
+#[must_use]
+pub fn should_fail_over<F>(route: &EgressRoute, current: &str, is_up: F) -> bool
+where
+    F: Fn(&str) -> bool,
+{
+    match select_active(route, is_up).tunnel_id() {
+        Some(active) => active != current,
+        // All down → there's no active tunnel; the worker tears the current one
+        // down (kill-switch / leak per the flag), which is itself a change.
+        None => true,
+    }
+}
+
+/// VPN-GW-4 — the durable set of egress-route assignments (TOML on the shared
+/// substrate, leader-edited, every gateway reads it). One assignment per scope.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteConfig {
+    /// The egress-route assignments.
+    #[serde(default)]
+    pub route: Vec<EgressRoute>,
+}
+
+impl RouteConfig {
+    /// Parse from TOML (missing sections → empty).
+    ///
+    /// # Errors
+    /// A TOML parse error.
+    pub fn from_toml_str(s: &str) -> Result<Self, toml::de::Error> {
+        toml::from_str(s)
+    }
+
+    /// Serialize to TOML.
+    ///
+    /// # Errors
+    /// A TOML serialize error.
+    pub fn to_toml_string(&self) -> Result<String, toml::ser::Error> {
+        toml::to_string_pretty(self)
+    }
+
+    /// Insert or replace a route (keyed by its [`EgressRoute::scope_key`] — one
+    /// assignment per scope, so re-assigning a node/group/ANY replaces it).
+    pub fn upsert(&mut self, r: EgressRoute) {
+        let key = r.scope_key();
+        if let Some(e) = self.route.iter_mut().find(|x| x.scope_key() == key) {
+            *e = r;
+        } else {
+            self.route.push(r);
+        }
+    }
+
+    /// Remove the route for a scope key; `true` if one was removed.
+    pub fn remove(&mut self, scope_key: &str) -> bool {
+        let before = self.route.len();
+        self.route.retain(|r| r.scope_key() != scope_key);
+        self.route.len() != before
+    }
+
+    /// Validate every route + that no two share a scope key (one assignment per
+    /// scope).
+    ///
+    /// # Errors
+    /// The first inconsistency's reason.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for r in &self.route {
+            r.validate()?;
+            let key = r.scope_key();
+            if !seen.insert(key.clone()) {
+                return Err(format!("duplicate route for scope: {key}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// VPN-GW-4 — resolve **which route applies** to the node `node_id` (with group
+/// memberships `groups`) by **scope precedence**: among the routes whose scope
+/// matches, the most specific wins — `Node` > `Group` > `AnyMesh`
+/// ([`RouteScope::specificity`]). Pure; the worker supplies the live identity +
+/// membership. Returns `None` when no route covers the node.
+#[must_use]
+pub fn resolve_route<'a>(
+    cfg: &'a RouteConfig,
+    node_id: &str,
+    groups: &[String],
+) -> Option<&'a EgressRoute> {
+    cfg.route
+        .iter()
+        .filter(|r| r.scope.matches(node_id, groups))
+        .max_by_key(|r| r.scope.specificity())
+}
+
+/// Durable path for the egress-route config: `<workgroup_root>/vpn/routes.toml`
+/// (beside `tunnels.toml`).
+#[must_use]
+pub fn routes_path(workgroup_root: &std::path::Path) -> std::path::PathBuf {
+    workgroup_root.join("vpn").join("routes.toml")
+}
+
+/// Load the egress-route config (missing/malformed → default empty).
+#[must_use]
+pub fn load_routes(workgroup_root: &std::path::Path) -> RouteConfig {
+    std::fs::read_to_string(routes_path(workgroup_root))
+        .ok()
+        .and_then(|raw| RouteConfig::from_toml_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the egress-route config (validate → atomic temp+rename).
+///
+/// # Errors
+/// Validation failure, or an I/O / serialize error.
+pub fn save_routes(
+    workgroup_root: &std::path::Path,
+    cfg: &RouteConfig,
+) -> Result<std::path::PathBuf, String> {
+    cfg.validate()?;
+    let path = routes_path(workgroup_root);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    let toml = cfg.to_toml_string().map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename {}: {e}", path.display()))?;
+    Ok(path)
+}
+
 /// The `wg-quick up <ifname>` argv (the config is written to
 /// `/etc/wireguard/<ifname>.conf` by the worker from the decrypted creds).
 #[must_use]
@@ -1049,5 +1382,256 @@ mod tests {
         // A tunnel with default (off) egress omits the pinned mark.
         let plain = cfg.to_toml_string().unwrap();
         assert!(!plain.contains("mark ="), "unpinned mark is not serialized");
+    }
+
+    // ── VPN-GW-4 — route model + failover selector + scope precedence ────────
+
+    fn route(scope: RouteScope, gateway: &str, chain: &[&str], ks: bool) -> EgressRoute {
+        EgressRoute {
+            scope,
+            gateway: gateway.into(),
+            chain: chain.iter().map(|s| (*s).to_string()).collect(),
+            kill_switch: ks,
+        }
+    }
+
+    #[test]
+    fn route_round_trips_through_toml_with_all_three_scopes() {
+        let mut cfg = RouteConfig::default();
+        cfg.upsert(route(
+            RouteScope::Node {
+                id: "peer:anvil".into(),
+            },
+            "peer:gw",
+            &["mullvad1", "proton2"],
+            true,
+        ));
+        cfg.upsert(route(
+            RouteScope::Group { name: "lab".into() },
+            "peer:gw",
+            &["proton2"],
+            false,
+        ));
+        cfg.upsert(route(RouteScope::AnyMesh, "peer:gw", &["mullvad1"], true));
+        let s = cfg.to_toml_string().unwrap();
+        assert_eq!(RouteConfig::from_toml_str(&s).unwrap(), cfg);
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.route.len(), 3);
+    }
+
+    #[test]
+    fn route_validate_rejects_empty_gateway_chain_and_scope_key() {
+        // Empty chain.
+        assert!(route(RouteScope::AnyMesh, "peer:gw", &[], true)
+            .validate()
+            .is_err());
+        // Empty gateway.
+        assert!(route(RouteScope::AnyMesh, "", &["t"], true)
+            .validate()
+            .is_err());
+        // Empty Node id / Group name.
+        assert!(
+            route(RouteScope::Node { id: " ".into() }, "peer:gw", &["t"], true)
+                .validate()
+                .is_err()
+        );
+        assert!(route(
+            RouteScope::Group { name: "".into() },
+            "peer:gw",
+            &["t"],
+            true
+        )
+        .validate()
+        .is_err());
+        // A whitespace chain entry.
+        assert!(route(RouteScope::AnyMesh, "peer:gw", &["ok", "  "], true)
+            .validate()
+            .is_err());
+        // A well-formed route validates.
+        assert!(route(RouteScope::AnyMesh, "peer:gw", &["t"], true)
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn upsert_replaces_per_scope_and_remove_works() {
+        let mut cfg = RouteConfig::default();
+        cfg.upsert(route(RouteScope::AnyMesh, "peer:gw", &["a"], true));
+        // Same scope → replaced, not appended.
+        cfg.upsert(route(RouteScope::AnyMesh, "peer:gw2", &["b"], false));
+        assert_eq!(cfg.route.len(), 1);
+        assert_eq!(cfg.route[0].gateway, "peer:gw2");
+        assert!(!cfg.route[0].kill_switch);
+        assert!(cfg.remove("any"));
+        assert!(!cfg.remove("any"));
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_scope_keys() {
+        // Two routes that share a scope key can't both be active (constructed
+        // directly to bypass upsert's de-dup).
+        let cfg = RouteConfig {
+            route: vec![
+                route(
+                    RouteScope::Node {
+                        id: "peer:a".into(),
+                    },
+                    "g1",
+                    &["t"],
+                    true,
+                ),
+                route(
+                    RouteScope::Node {
+                        id: "peer:a".into(),
+                    },
+                    "g2",
+                    &["t"],
+                    true,
+                ),
+            ],
+        };
+        assert!(cfg.validate().unwrap_err().contains("duplicate route"));
+    }
+
+    #[test]
+    fn selector_primary_up_picks_primary() {
+        let r = route(RouteScope::AnyMesh, "g", &["primary", "fallback"], true);
+        // Everything up → the primary (index 0) wins.
+        let active = select_active(&r, |_| true);
+        assert_eq!(active.tunnel_id(), Some("primary"));
+    }
+
+    #[test]
+    fn selector_primary_down_picks_next_up_in_chain() {
+        let r = route(
+            RouteScope::AnyMesh,
+            "g",
+            &["primary", "second", "third"],
+            true,
+        );
+        // primary down, second up → second; primary down, second down → third.
+        assert_eq!(
+            select_active(&r, |t| t != "primary").tunnel_id(),
+            Some("second")
+        );
+        assert_eq!(
+            select_active(&r, |t| t == "third").tunnel_id(),
+            Some("third")
+        );
+    }
+
+    #[test]
+    fn selector_all_down_yields_none_carrying_killswitch() {
+        let blocked = route(RouteScope::AnyMesh, "g", &["a", "b"], true);
+        match select_active(&blocked, |_| false) {
+            ActiveTunnel::AllDown { kill_switch } => assert!(kill_switch),
+            other => panic!("expected AllDown, got {other:?}"),
+        }
+        assert_eq!(select_active(&blocked, |_| false).tunnel_id(), None);
+        // kill_switch=false is carried through so the worker can leak-vs-block.
+        let leaky = route(RouteScope::AnyMesh, "g", &["a"], false);
+        assert_eq!(
+            select_active(&leaky, |_| false),
+            ActiveTunnel::AllDown { kill_switch: false }
+        );
+    }
+
+    #[test]
+    fn should_fail_over_when_current_is_no_longer_the_pick() {
+        let r = route(RouteScope::AnyMesh, "g", &["primary", "fallback"], true);
+        // Current = primary, primary up → no failover.
+        assert!(!should_fail_over(&r, "primary", |_| true));
+        // Current = primary, primary down but fallback up → fail over.
+        assert!(should_fail_over(&r, "primary", |t| t == "fallback"));
+        // Current = primary, all down → switch (tear down).
+        assert!(should_fail_over(&r, "primary", |_| false));
+        // Current = fallback while primary is back up → switch back to primary.
+        assert!(should_fail_over(&r, "fallback", |_| true));
+    }
+
+    #[test]
+    fn resolve_precedence_node_beats_group_beats_anymesh() {
+        let mut cfg = RouteConfig::default();
+        cfg.upsert(route(RouteScope::AnyMesh, "gw-any", &["any"], true));
+        cfg.upsert(route(
+            RouteScope::Group { name: "lab".into() },
+            "gw-grp",
+            &["grp"],
+            true,
+        ));
+        cfg.upsert(route(
+            RouteScope::Node {
+                id: "peer:anvil".into(),
+            },
+            "gw-node",
+            &["node"],
+            true,
+        ));
+        let groups = vec!["lab".to_string()];
+        // The node has all three matching → Node wins.
+        let r = resolve_route(&cfg, "peer:anvil", &groups).unwrap();
+        assert_eq!(r.gateway, "gw-node");
+        // A different node in the group → Group beats AnyMesh.
+        let r = resolve_route(&cfg, "peer:other", &groups).unwrap();
+        assert_eq!(r.gateway, "gw-grp");
+        // A node outside the group → only AnyMesh matches.
+        let r = resolve_route(&cfg, "peer:other", &[]).unwrap();
+        assert_eq!(r.gateway, "gw-any");
+    }
+
+    #[test]
+    fn resolve_returns_none_when_no_route_covers_the_node() {
+        let mut cfg = RouteConfig::default();
+        cfg.upsert(route(
+            RouteScope::Node {
+                id: "peer:a".into(),
+            },
+            "gw",
+            &["t"],
+            true,
+        ));
+        cfg.upsert(route(
+            RouteScope::Group { name: "lab".into() },
+            "gw",
+            &["t"],
+            true,
+        ));
+        // Not the node, not in the group, no AnyMesh route → None.
+        assert!(resolve_route(&cfg, "peer:b", &["prod".to_string()]).is_none());
+    }
+
+    #[test]
+    fn scope_matches_and_specificity_rank() {
+        let n = RouteScope::Node {
+            id: "peer:a".into(),
+        };
+        let g = RouteScope::Group { name: "lab".into() };
+        let a = RouteScope::AnyMesh;
+        assert!(n.matches("peer:a", &[]));
+        assert!(!n.matches("peer:b", &[]));
+        assert!(g.matches("peer:b", &["lab".to_string()]));
+        assert!(!g.matches("peer:b", &["prod".to_string()]));
+        assert!(a.matches("anything", &[]));
+        assert!(n.specificity() > g.specificity());
+        assert!(g.specificity() > a.specificity());
+    }
+
+    #[test]
+    fn routes_load_save_round_trip_on_disk_and_default_killswitch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = RouteConfig::default();
+        cfg.upsert(route(RouteScope::AnyMesh, "peer:gw", &["mullvad1"], true));
+        save_routes(tmp.path(), &cfg).unwrap();
+        assert_eq!(load_routes(tmp.path()), cfg);
+        // Missing → default empty.
+        assert_eq!(
+            load_routes(tmp.path().join("nope").as_path()),
+            RouteConfig::default()
+        );
+        // A route omitting kill_switch in TOML defaults to true (block-on-drop).
+        let toml = "[[route]]\ngateway = \"peer:gw\"\nchain = [\"t\"]\n\
+                    [route.scope]\nkind = \"any-mesh\"\n";
+        let parsed = RouteConfig::from_toml_str(toml).unwrap();
+        assert!(parsed.route[0].kill_switch, "kill_switch defaults to true");
     }
 }
