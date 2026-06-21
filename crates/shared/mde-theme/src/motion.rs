@@ -327,6 +327,30 @@ pub mod dock_handle {
 /// density-scaled.
 pub const POPUP_SCALE_DELTA: f32 = 0.04;
 
+/// NOTIFY-HUB-2 — the Notification-Hub entrance-motion tokens (the slide-in-from-
+/// the-right travel, the bounded blink-cycle count, and the blink wash peak alpha)
+/// — single-sourced here so the Hub's `crate::animation::hub` math + the binary's
+/// render read one set of Carbon-grid component dimensions (no off-scale literals
+/// in the GUI, §4). Component dimensions, not density-scaled (UX-24).
+pub mod hub {
+    /// The distance (px) a fresh alert travels in from the right edge as it
+    /// enters — a Carbon micro-interaction slide (a touch larger than the 8 px
+    /// row-reveal since the Hub is anchored to the right edge and the item arrives
+    /// from off the panel's leading side, in the same family as the 48 px dock
+    /// slide but much shorter — a single row, not a whole surface).
+    pub const ENTER_SLIDE_PX: f32 = 16.0;
+
+    /// The number of blink cycles a fresh alert flashes in its severity colour —
+    /// **bounded to exactly 2** then settles (never an infinite pulse, so it burns
+    /// no CPU at rest — MOTION-PERF-1 / DoD).
+    pub const BLINK_CYCLES: f32 = 2.0;
+
+    /// Peak alpha of the severity-tinted blink wash at a flash crest. Kept a
+    /// gentle Carbon support-colour wash (a 2-flash attention cue, not a strobe),
+    /// in the same family as the selection/hover tint ramp.
+    pub const BLINK_PEAK_ALPHA: f32 = 0.45;
+}
+
 /// UX-9 (c) + CR-10 — dialog spec constants.
 /// Locked component dimensions, not density-scaled per UX-24.
 pub mod dialog {

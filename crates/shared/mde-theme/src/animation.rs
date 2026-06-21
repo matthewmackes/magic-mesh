@@ -714,6 +714,92 @@ pub mod popup {
     }
 }
 
+/// NOTIFY-HUB-2 — the Notification-Hub entrance motion: a fresh alert **slides in
+/// from the right** while **blinking twice** in its severity colour, and the rows
+/// it pushes down **settle** into their new position. Pure math over the existing
+/// INFRA-2 [`fade_in`] alpha ramp + [`ease`]; it authors no new easing of its own
+/// (it mirrors [`popup`] / [`route`]). The Hub holds an [`Animator`] entrance
+/// tween per fresh-alert ULID (started with [`Motion::popup`]) and reads
+/// [`Animator::value`] for the eased progress `t`, then calls these helpers to get
+/// the render channels it can actually apply on the iced-0.13 fork (which has no
+/// per-element opacity/transform widget): a leading **padding offset** (the slide,
+/// [`slide_in_x`]), a **severity-tinted background wash alpha** (the blink,
+/// [`blink_wash_alpha`]), and a settling **top offset** for the rows below
+/// ([`push_down_px`]). Idle-parked via [`Animator::is_idle`] (zero redraw at rest
+/// — MOTION-PERF-1). Reduce-motion drops the slide + blink + push-down entirely
+/// (the alpha still ramps via the shared [`popup::enter_params`]) so a new item
+/// appears in place (the Q32 contract).
+pub mod hub {
+    use super::ease;
+    pub use crate::motion::hub::{BLINK_CYCLES, BLINK_PEAK_ALPHA, ENTER_SLIDE_PX};
+    use crate::motion::Easing;
+
+    /// NOTIFY-HUB-2 — the leading **padding offset** (px, >=0) a fresh alert
+    /// carries at eased progress `t` (`0.0` = just arrived, `1.0` = settled): it
+    /// starts [`ENTER_SLIDE_PX`] in from the right and eases to `0.0` at rest, so
+    /// the row reads as sliding in from the panel's leading edge. Under
+    /// `reduce_motion` the slide is dropped (`0.0` at every `t` — the item appears
+    /// in place; the alpha ramp still runs via [`super::popup::enter_params`]).
+    #[must_use]
+    pub fn slide_in_x(t: f32, reduce_motion: bool) -> f32 {
+        if reduce_motion {
+            0.0
+        } else {
+            // Decelerate into place (ease-out): far -> 0.
+            (1.0 - ease(t.clamp(0.0, 1.0), Easing::EaseOut)) * ENTER_SLIDE_PX
+        }
+    }
+
+    /// NOTIFY-HUB-2 — the **bounded 2x blink** intensity `0.0..=1.0` at LINEAR
+    /// entrance progress `t` (`0.0` = just arrived, `1.0` = entrance over): a
+    /// raised-sine over exactly [`BLINK_CYCLES`] cycles, so the wash flashes
+    /// up->down twice and then **settles at `0.0`** (no residual pulse). Pass the
+    /// linear tween progress (not the eased value) so the two flashes are evenly
+    /// spaced across the entrance. Under `reduce_motion` it is a flat `0.0` (no
+    /// blink — the Q32 contract; the item still fades in).
+    #[must_use]
+    pub fn blink_intensity(t: f32, reduce_motion: bool) -> f32 {
+        if reduce_motion {
+            return 0.0;
+        }
+        let t = t.clamp(0.0, 1.0);
+        // `sin^2(pi * cycles * t)` is 0 at the endpoints and crests `cycles` times
+        // in between — a clean bounded N-flash that settles to 0 once `t` reaches
+        // 1.0 (sin(pi*cycles) == 0 for integer cycles).
+        let phase = std::f32::consts::PI * BLINK_CYCLES * t;
+        let s = phase.sin();
+        (s * s).clamp(0.0, 1.0)
+    }
+
+    /// NOTIFY-HUB-2 — the alpha to apply to a fresh alert's **severity-tinted
+    /// background wash** at linear entrance progress `t`: the [`blink_intensity`]
+    /// scaled by [`BLINK_PEAK_ALPHA`]. The consumer composites its severity
+    /// `Rgba` token at this alpha over the row background (no raw colour minted —
+    /// the hue comes from `mde_notify::severity_token`). `0.0` under
+    /// `reduce_motion` (no wash) and `0.0` once the entrance settles.
+    #[must_use]
+    pub fn blink_wash_alpha(t: f32, reduce_motion: bool) -> f32 {
+        blink_intensity(t, reduce_motion) * BLINK_PEAK_ALPHA
+    }
+
+    /// NOTIFY-HUB-2 — the settling **top offset** (px, >=0) a row *below* a freshly
+    /// inserted item carries while that item is entering, so the existing items
+    /// **slide down** into their new position instead of jumping. Driven by the
+    /// newest item's eased entrance progress `t`: it starts a full
+    /// [`ENTER_SLIDE_PX`] lower and eases to `0.0` as the new item settles. Under
+    /// `reduce_motion` it is `0.0` at every `t` (the rows do not move). This is a
+    /// transform-style offset (applied as leading top padding), never a layout
+    /// change of the rows themselves.
+    #[must_use]
+    pub fn push_down_px(t: f32, reduce_motion: bool) -> f32 {
+        if reduce_motion {
+            0.0
+        } else {
+            (1.0 - ease(t.clamp(0.0, 1.0), Easing::EaseOut)) * ENTER_SLIDE_PX
+        }
+    }
+}
+
 /// MOTION-INFRA-1 — a tiny animation registry. Holds the active tweens keyed by
 /// a caller id and is advanced by ONE subscription tick, so N concurrent
 /// animations across a surface share a single timer instead of each arming its
@@ -1431,5 +1517,119 @@ mod tests {
         );
         // Reduce-motion never schedules a transition tick (instant switch).
         assert!(!route::is_animating(0, true));
+    }
+
+    // ── NOTIFY-HUB-2 — Hub entrance motion (slide-in-from-right + 2x blink) ──
+
+    #[test]
+    fn hub_slide_in_x_starts_off_right_and_settles_to_zero() {
+        // Full motion: starts ENTER_SLIDE_PX in from the right, eases to 0 at rest,
+        // monotonically shrinking (decelerating in).
+        let start = hub::slide_in_x(0.0, false);
+        assert!(
+            (start - hub::ENTER_SLIDE_PX).abs() < 1e-4,
+            "starts off-edge"
+        );
+        assert!((hub::slide_in_x(1.0, false)).abs() < 1e-4, "settles to 0");
+        let mut prev = hub::ENTER_SLIDE_PX + 1.0;
+        for i in 0..=10 {
+            let off = hub::slide_in_x(i as f32 / 10.0, false);
+            assert!(off <= prev + 1e-4, "offset must shrink monotonically");
+            assert!((0.0..=hub::ENTER_SLIDE_PX).contains(&off));
+            prev = off;
+        }
+        // Reduce-motion: no slide at any progress (item appears in place).
+        for i in 0..=10 {
+            assert_eq!(hub::slide_in_x(i as f32 / 10.0, true), 0.0);
+        }
+    }
+
+    #[test]
+    fn hub_blink_is_bounded_two_cycles_and_settles() {
+        // The blink is zero at both endpoints and crests exactly BLINK_CYCLES (2)
+        // times in between — a bounded 2-flash, NOT an infinite pulse: it is 0 at
+        // t=1.0 so once the entrance settles there is no residual wash (no idle CPU).
+        assert!(
+            (hub::blink_intensity(0.0, false)).abs() < 1e-4,
+            "0 at start"
+        );
+        assert!(
+            (hub::blink_intensity(1.0, false)).abs() < 1e-4,
+            "settles to 0"
+        );
+        // Two crests at the sin^2 peaks: t = 0.25 and t = 0.75 (for 2 cycles).
+        assert!(
+            hub::blink_intensity(0.25, false) > 0.99,
+            "first flash crest"
+        );
+        assert!(
+            hub::blink_intensity(0.75, false) > 0.99,
+            "second flash crest"
+        );
+        // Two troughs between the crests: t = 0.5 dips back to ~0 (the gap between
+        // the two flashes), confirming it is two DISTINCT flashes, not one.
+        assert!(
+            hub::blink_intensity(0.5, false) < 1e-3,
+            "trough between flashes"
+        );
+        // Count the local maxima over a fine sweep to assert exactly 2 flashes.
+        let n = 400;
+        let mut vals = Vec::with_capacity(n + 1);
+        for i in 0..=n {
+            vals.push(hub::blink_intensity(i as f32 / n as f32, false));
+        }
+        let crests = (1..n)
+            .filter(|&i| vals[i] > vals[i - 1] && vals[i] >= vals[i + 1] && vals[i] > 0.5)
+            .count();
+        assert_eq!(
+            crests, 2,
+            "blink must crest exactly twice (bounded 2x), got {crests}"
+        );
+        // Always in [0,1]; reduce-motion is a flat 0 (no blink).
+        for i in 0..=n {
+            let t = i as f32 / n as f32;
+            assert!((0.0..=1.0).contains(&hub::blink_intensity(t, false)));
+            assert_eq!(
+                hub::blink_intensity(t, true),
+                0.0,
+                "reduce_motion ⇒ no blink"
+            );
+        }
+    }
+
+    #[test]
+    fn hub_blink_wash_alpha_caps_at_peak_and_is_zero_under_reduce_motion() {
+        // The wash alpha never exceeds the BLINK_PEAK_ALPHA token, peaks at a flash
+        // crest, and is a flat 0 under reduce-motion.
+        let peak = hub::blink_wash_alpha(0.25, false);
+        assert!(
+            (peak - hub::BLINK_PEAK_ALPHA).abs() < 1e-3,
+            "crest hits peak alpha"
+        );
+        for i in 0..=20 {
+            let t = i as f32 / 20.0;
+            let a = hub::blink_wash_alpha(t, false);
+            assert!(a <= hub::BLINK_PEAK_ALPHA + 1e-6, "alpha {a} exceeds peak");
+            assert_eq!(hub::blink_wash_alpha(t, true), 0.0);
+        }
+        // Settles to 0 once the entrance is over (no residual wash at rest).
+        assert!(hub::blink_wash_alpha(1.0, false).abs() < 1e-4);
+    }
+
+    #[test]
+    fn hub_push_down_settles_and_drops_under_reduce_motion() {
+        // Rows below a fresh insert start ENTER_SLIDE_PX lower and ease to 0, so
+        // existing items slide DOWN into place; reduce-motion drops the movement.
+        assert!((hub::push_down_px(0.0, false) - hub::ENTER_SLIDE_PX).abs() < 1e-4);
+        assert!(hub::push_down_px(1.0, false).abs() < 1e-4, "settles to 0");
+        let mut prev = hub::ENTER_SLIDE_PX + 1.0;
+        for i in 0..=10 {
+            let off = hub::push_down_px(i as f32 / 10.0, false);
+            assert!(off <= prev + 1e-4, "monotonic settle");
+            prev = off;
+        }
+        for i in 0..=10 {
+            assert_eq!(hub::push_down_px(i as f32 / 10.0, true), 0.0);
+        }
     }
 }
