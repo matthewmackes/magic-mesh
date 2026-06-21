@@ -291,6 +291,32 @@ pub const PANEL_MOUNT_TRANSLATE_Y_PX: f32 = 4.0;
 /// crossfade (no movement). Component dimension, not density-scaled.
 pub const DOCK_SLIDE_PX: f32 = 48.0;
 
+/// MUSIC-DOCK-3 — the dimensions + inner spacing of the always-mapped
+/// minimize-to-handle tab (the small bottom-center `♪ Music` chip the dock
+/// collapses to instead of quitting). A handle is a persistent, compact "bring
+/// it back" affordance, so it is sized as a single short pill — wide enough for
+/// the glyph + the now-playing title, one line tall — and is a fixed **component
+/// dimension** (UX-24: never density-scaled, like the dock slide travel + the
+/// dialog/toast component sizes that live alongside it here). Carbon-grid
+/// aligned: the width is the dialog `MAX_WIDTH` × ⅗ band, the height the toast
+/// progress tier × the row scale, the padding/gap drawn from the Carbon
+/// spacing/typography steps. Reused by the consumer for the handle layer
+/// surface size + its content layout (§4 single-source).
+pub mod dock_handle {
+    /// Tab width (px) — a compact pill holding `♪ Music` + a truncated title.
+    pub const WIDTH: f32 = 288.0;
+    /// Tab height (px) — one Carbon row tall (a single line of content + pad).
+    pub const HEIGHT: f32 = 36.0;
+    /// Horizontal inner padding (px) — the Carbon `sm` spacing step (8).
+    pub const H_PAD: f32 = 8.0;
+    /// Vertical inner padding (px) — the Carbon `xs2` spacing step (4).
+    pub const V_PAD: f32 = 4.0;
+    /// Gap between the glyph and the label (px) — the Carbon `xs` step (6).
+    pub const GAP: f32 = 6.0;
+    /// Label font size (sp) — the Carbon caption tier (12).
+    pub const LABEL_SIZE: f32 = 12.0;
+}
+
 /// MOTION-FEEDBACK-3 — the popup enter/exit **scale delta**: the subtle amount a
 /// popup/menu/drawer/Hub is scaled *down* at the start of its open (and back
 /// down to at the end of its close), e.g. `0.04` ⇒ the surface enters at 0.96×
@@ -537,6 +563,45 @@ mod tests {
         assert!(
             DOCK_SLIDE_PX > 8.0 && DOCK_SLIDE_PX <= 64.0,
             "a full-surface dock rise, but not an over-long fly-in"
+        );
+    }
+
+    #[test]
+    fn dock_handle_is_a_compact_single_line_pill() {
+        // MUSIC-DOCK-3 — the minimize-to-handle tab is a small bottom-center pill:
+        // wide enough for the glyph + a title, one Carbon row tall, with the inner
+        // pad/gap drawn from the Carbon spacing steps + a caption-tier label. A
+        // handle must stay smaller than the dock it collapses from (a handle, not
+        // a second dock), and never taller than it is wide (a horizontal chip).
+        assert!((dock_handle::WIDTH - 288.0).abs() < f32::EPSILON);
+        assert!((dock_handle::HEIGHT - 36.0).abs() < f32::EPSILON);
+        assert!(
+            dock_handle::WIDTH > dock_handle::HEIGHT,
+            "the handle is a horizontal pill, wider than it is tall"
+        );
+        assert!(
+            dock_handle::HEIGHT < dialog::TITLE_ROW_HEIGHT,
+            "the handle tab is shorter than a full dialog title row"
+        );
+        // Inner pad/gap are exactly the Carbon spacing steps (sm=8, xs2=4, xs=6).
+        assert!((dock_handle::H_PAD - 8.0).abs() < f32::EPSILON);
+        assert!((dock_handle::V_PAD - 4.0).abs() < f32::EPSILON);
+        assert!((dock_handle::GAP - 6.0).abs() < f32::EPSILON);
+        assert!((dock_handle::LABEL_SIZE - 12.0).abs() < f32::EPSILON);
+        assert_eq!(
+            dock_handle::H_PAD,
+            crate::spacing::BASE[2] as f32,
+            "H_PAD is the Carbon sm spacing step"
+        );
+        assert_eq!(
+            dock_handle::V_PAD,
+            crate::spacing::BASE[0] as f32,
+            "V_PAD is the Carbon xs2 spacing step"
+        );
+        assert_eq!(
+            dock_handle::GAP,
+            crate::spacing::BASE[1] as f32,
+            "GAP is the Carbon xs spacing step"
         );
     }
 
