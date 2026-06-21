@@ -6,6 +6,119 @@ Ordered by priority — security lock first, then largest structural debt, then 
 
 **Operator decisions (2026-06-09):** A1/A2 → **DELETE** the labwc/sway surface · B1/H6/H3/H4 → **BUILD/WIRE** them · C1 → **implement Phase-G** · E1 → **retarget tests to Nebula**.
 
+## PROCESS — §10 process-governance tooling (2026-06-21, design: docs/design/process-governance.md)
+
+Lifts the §10 Process Locks into executable form. Design + full Q-lock map:
+`docs/design/process-governance.md`; supersede rationale: `docs/DECISIONS.md`
+(ADR-0001/0003). These are the **no-new-infra** gates (active immediately); the
+infra-dependent gates live under `### DEVOPS-SUBSTRATE`. Prefix `PROCESS-#`.
+
+- [ ] **PROCESS-1: §10 — single executable gate + pre-commit hook**
+  **As** the operator, **I want** one `install-helpers/verify-gates.sh` that *is* the
+  gate, **so that** CONTRIBUTING, the pre-commit hook, and CI can never drift (Q8/Q23/Q9).
+  **Acceptance** (each runtime-observable):
+    - [ ] `verify-gates.sh` runs B1–B6 (build/clippy/fmt+shell/tests/lints/deny) and exits non-zero on any failure
+    - [ ] a committed git pre-commit hook invokes it and **blocks** a red commit (shown on a deliberate red)
+    - [ ] CONTRIBUTING.md + ci.yml invoke the script rather than re-listing gates
+- [ ] **PROCESS-2: §10 D3 — design↔worklist link lint**
+  **As** a maintainer, **I want** `install-helpers/lint-design-worklist-link.sh`,
+  **so that** every design-doc action row maps to a task and vice-versa (Q6).
+  **Acceptance:**
+    - [ ] fails when a `docs/design/*.md` action row carries no task ID
+    - [ ] fails when a worklist task back-links a non-existent design doc
+    - [ ] added to `verify-gates.sh` (B5)
+- [ ] **PROCESS-3: §10 B4 — fix EFF-18 at the root (reopened, ADR-0003)**
+  **As** a committer, **I want** mackesd tests to run in parallel, **so that** the
+  per-commit blocking gate stays fast (Q24).
+  **Acceptance:**
+    - [ ] mackesd test config is injected, not read from process-global env (no `set_var` in the hot path)
+    - [ ] `cargo test -p mackesd` passes **without** `--test-threads=1`
+    - [ ] CI drops the serial flag
+- [ ] **PROCESS-4: §10 B7 — diff-coverage floor on changed lines (supersedes EFF-31, ADR-0003)**
+  **As** a maintainer, **I want** a 90% coverage floor on changed lines, **so that**
+  new code is tested without chasing legacy gaps (Q55).
+  **Acceptance:**
+    - [ ] `cargo-llvm-cov` diff mode gates changed lines at ≥90%
+    - [ ] the gate runs in `verify-gates.sh` / CI and blocks below floor
+- [ ] **PROCESS-5: §10 visibility — status dashboard**
+  **As** the operator, **I want** a script that renders worklist `[ ]/[>]/[✓]/[!]`
+  counts, **so that** process state is visible at a glance (Q14).
+  **Acceptance:**
+    - [ ] `install-helpers/worklist-dashboard.sh` prints per-epic open/in-progress/blocked/done counts from the live worklist
+- [ ] **PROCESS-6: §10 hygiene — archive done epics**
+  **As** a maintainer, **I want** completed epics moved to `docs/WORKLIST-archive.md`,
+  **so that** the live worklist stays legible (Q15).
+  **Acceptance:**
+    - [ ] fully-`[✓]` epics relocated to `docs/WORKLIST-archive.md`; live file holds only open/in-progress/blocked + recently-done
+    - [ ] the dashboard (PROCESS-5) reads the live file only
+
+## DEVOPS-SUBSTRATE — the first §10 epic: build the dev/test/CI infra (2026-06-21)
+
+The process **dogfoods itself** (Q41): this epic stands up the substrate the
+infra-dependent §10 gates need. Airgapped dev, full machine control (Q31): one agent
+host + two XCP-ng hosts (100% usable). Design: `docs/design/process-governance.md`.
+Prefix `DS-#`. Until a DS gate's substrate exists, that §10 gate is *phased-out* (rollout lock).
+
+- [ ] **DS-1: IaC VM lifecycle (OpenTofu + Xen Orchestra)**
+  **As** the operator, **I want** VMs declared as code on the two XCP-ng hosts, **so that**
+  the test fleet is reproducible spin-up/teardown (Q33).
+  **Acceptance:**
+    - [ ] `tofu apply` provisions a named VM on XCP-ng via the Xen Orchestra provider; `tofu destroy` removes it
+    - [ ] VM definitions live in-repo and `tofu validate`/`fmt` clean
+- [ ] **DS-2: Ansible node configuration**
+  **As** the operator, **I want** provisioned VMs configured by Ansible, **so that** a node
+  reaches a known-good mesh state declaratively (Q33, D-W1).
+  **Acceptance:**
+    - [ ] an Ansible play brings a fresh VM to an enrolled mesh node; re-run is idempotent
+    - [ ] `ansible-lint` clean
+- [ ] **DS-3: self-hosted Forgejo + CI runners**
+  **As** the operator, **I want** Forgejo on the fleet pull-mirroring GitHub with Actions
+  runners, **so that** CI runs self-hosted (Q34/Q35/Q36).
+  **Acceptance:**
+    - [ ] Forgejo pull-mirrors the GitHub `master` automatically
+    - [ ] a registered runner executes a trivial workflow to green
+    - [ ] GitHub stays canonical (release pipeline untouched)
+- [ ] **DS-4: port ci.yml to Forgejo Actions**
+  **As** a maintainer, **I want** the existing gate workflow running on Forgejo Actions,
+  **so that** every push is gated self-hosted (Q35).
+  **Acceptance:**
+    - [ ] `verify-gates.sh` (PROCESS-1) runs as a Forgejo Actions job to green on a real commit
+- [ ] **DS-5: real-VM multi-node gate (V4)**
+  **As** a maintainer, **I want** mesh features verified on a real 3 LH + 3 peer VM mesh,
+  **so that** multi-node behavior is proven, not mocked (Q37/Q40/Q48).
+  **Acceptance:**
+    - [ ] a snapshot-reset VM pool spins a 3 LH + 3 peer mesh and runs a mesh acceptance test to green
+    - [ ] the release gate spins the full 3 LH + 9 peer envelope from a golden-image rebuild
+    - [ ] a mesh task cannot reach `[✓]` without a passing real-VM run
+- [ ] **DS-6: ephemeral container mesh harness**
+  **As** a developer, **I want** a quick N-node container mesh (the `nebula-test-node.Containerfile`),
+  **so that** multi-node logic can be exercised locally before the VM gate (Q32).
+  **Acceptance:**
+    - [ ] one command brings up an N-node container mesh and tears it down clean
+- [ ] **DS-7: pixel-diff visual regression harness (B8, ADR-0002)**
+  **As** a maintainer, **I want** deterministic headless capture + golden pixel-diff of the
+  preview gallery, **so that** UI regressions are gated automatically (Q52/Q53).
+  **Acceptance:**
+    - [ ] the gallery renders deterministically (pinned fonts + software rasterizer + fixed resolution)
+    - [ ] an unintended pixel change fails the gate; a golden re-blessed in-commit passes
+    - [ ] wired into CI (DS-4)
+- [ ] **DS-8: mesh-native secrets (etcd + age over Nebula)**
+  **As** the operator, **I want** CI/IaC secrets served from etcd + age over Nebula, **so that**
+  the pipeline holds XCP-ng creds + the signing key without a new external service (Q42, D-W1).
+  **Acceptance:**
+    - [ ] a runner fetches a secret (e.g. XCP-ng API token) decrypted via age over the overlay; the plaintext never lands in repo or argv
+- [ ] **DS-9: IaC/non-Rust linters into the gate (B3)**
+  **As** a maintainer, **I want** ansible-lint + `tofu validate/fmt` + yamllint in
+  `verify-gates.sh`, **so that** infra code is gated like Rust (Q45).
+  **Acceptance:**
+    - [ ] the three linters run in the gate and block on failure
+- [ ] **DS-10: research spike — DevOps management layer**
+  **As** the operator, **I want** a short written evaluation of the OpenTofu+Ansible+Forgejo
+  integration patterns (state backend, runner topology, XO provider maturity), **so that**
+  DS-1..4 are built on a vetted approach (Q32 directive).
+  **Acceptance:**
+    - [ ] a findings note (recommended layout + risks) committed under `docs/design/` and lifted into any follow-up DS tasks
+
 ## ENTERPRISE FIT-AND-FINISH (2026-06-11) — toward an enterprise-class deliverable
 
 Lifted from a 5-pass parallel fit-and-finish evaluation (reliability · security · observability · packaging/release · quality/UX) for an enterprise deliverable **within the stated ≤8-peer flat-trust envelope** (§8 — NOT a zero-trust/hyperscale product). `EFF-#` ids. P1 = blocks a credible enterprise/production cut.

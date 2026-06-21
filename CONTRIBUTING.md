@@ -1,7 +1,11 @@
 # Contributing to MCNF
 
 The operational rulebook is [`AI_GOVERNANCE.md`](AI_GOVERNANCE.md) — read its
-locks (§1–§8) before changing anything load-bearing. The short version: the
+architectural locks (§1–§9) **and the process locks (§10 — Design → Build → Verify →
+Remediate gates)** before changing anything load-bearing. §10 is the repeatable process;
+the gates below are its Build phase. The single executable gate (`verify-gates.sh`) +
+self-hosted CI are being consolidated under the `PROCESS` / `DEVOPS-SUBSTRATE` worklist
+epics — until then the gate list here is authoritative. The short version: the
 substrate (Nebula / LizardFS / Bus / max-crypto) and the look (IBM Carbon,
 single-sourced in `mde-theme`) are **locked**; new code is glue over the
 existing crates, and a feature isn't done until it's runtime-reachable with

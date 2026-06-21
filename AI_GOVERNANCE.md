@@ -2,9 +2,11 @@
 
 > **Identity:** *MCNF (Mackes Cosmic Nebula Fedora) is a secure, no-fixed-center
 > workgroup mesh and its native-Rust Carbon GUIs, running on stock Fedora-Cosmic.*
-> This document is the platform's identity + the architectural locks. When a lock
+> This document is the platform's identity + the architectural locks (§0–§9) and the
+> **process locks** (§10 — repeatable design → build → verify → remediate). When a lock
 > conflicts with prose elsewhere, the **newer lock wins**; authority ranks
-> **Memory > this file > design docs > worklist body**.
+> **Memory > this file > design docs > worklist body**. A lock reopens only on a
+> concrete new symptom + a dated superseding entry in `docs/DECISIONS.md` (§10).
 >
 > **Naming (rebrand 2026-06-17):** the product is **MCNF — Mackes Cosmic Nebula
 > Fedora**. The **10.0.x series is codenamed "Magic Mesh"**, surfaced as
@@ -144,14 +146,13 @@ A change is done only when it is **runtime-reachable and observably works** — 
 refs, no mockups/`demo_data` passing as features. Builds clean, tests green, clippy
 + fmt clean.
 
-**Visual-confirmation gate lifted (2026-06-11, operator directive).** Render
-correctness now rests on the `mde-theme` Carbon tokens (§4 — still enforced: no raw
-hex / scattered metric literals) plus palette/component tests and render-agnostic
-logic. Operator or on-session (`/preview`) visual confirmation is **no longer a
-condition of Done** — a GUI change that builds, tests green, and renders through the
-Carbon tokens is §7-complete. A `/preview` check remains available but is
-optional/best-effort, never a blocker (it stays hardware-gated and so cannot hold a
-feature on a headless host).
+**Visual-confirmation gate lifted (2026-06-11) — RE-INSTATED as an automated gate
+(2026-06-21, §10 B8).** The 2026-06-11 lift was conditioned on visual confirmation
+being hardware-gated + manual. Self-hosted CI now makes **deterministic headless
+capture** feasible, so render correctness is gated again by an **automated pixel-diff
+visual regression** (§10 B8) — not by manual `/preview`. The token discipline (§4) and
+palette/component tests still stand underneath it. See `docs/DECISIONS.md` for the
+superseding rationale.
 
 ## §8 — Positioning & trust envelope (2026-06-09, enterprise-readiness verification)
 
@@ -201,6 +202,99 @@ desktop-personal panels grouped below. Locks (full table: `docs/design/planes.md
   carried.
 - **Hero images:** sections backed by an external project carry a Carbon-compliant
   line-art hero (original homages, `mde-theme`-compiled, `hero_stroke` token). (H1–H10)
+
+## §10 — Process Locks: repeatable Design → Build → Verify → Remediate (2026-06-21, PROCESS survey Q1–Q57)
+
+The platform's **process** is locked the same way its architecture is. Every change
+runs through the gates below; each is **binary pass/fail** and cited by ID (`D1`,
+`B2`, `V3`, `R4`). The gate is **executable, not prose** — a single
+`install-helpers/verify-gates.sh` *is* the gate; the pre-commit hook and CI both run
+it verbatim, so the three can't drift (design + full Q-lock map:
+`docs/design/process-governance.md`). The goal is to stop effort going to problems
+that didn't need solving: nothing speculative, nothing untracked, nothing re-litigated.
+
+**Entry (before any work).** **E1 — tracked:** a worklist task exists. **E2 —
+symptom-backed:** a concrete observed trigger, or (for preventive work) an existing
+**§3/§8 control** it enforces — no speculative work. *Trivial fixes* (typos, dead
+imports, fmt/clippy nits) skip E1/E2 but still pass the gate.
+
+**Design (D)** — required when a change **adds a crate, crosses ≥2 crates, or adds a
+surface** (localized changes go straight to a task):
+- **D1** A `docs/design/<epic>.md` exists with all mandatory sections: Locks table ·
+  Architecture · Acceptance (each runtime-observable) · Risks · Out-of-scope ·
+  **Non-Goals** (what we pre-commit *not* to build).
+- **D2** Every ≥3-option fork is decided + locked by the agent as **source of truth**,
+  rationale recorded.
+- **D3** Every actionable row carries a worklist **task ID** and every task back-links
+  the doc; `lint-design-worklist-link.sh` proves the map is total.
+- **D4** Decomposition: an **epic = a releasable capability**; a **task = the smallest
+  unit that independently passes the full gate**; tasks carry `depends-on: <task-id>`.
+
+**Build + Test (B)** — **every commit** is green via a **blocking pre-commit hook**
+running the full gate (no red commit ever exists):
+- **B1** `cargo build --workspace --locked` clean.
+- **B2** `cargo clippy --workspace --all-targets` clean (crypto/unwrap deny-level).
+- **B3** `cargo fmt --all -- --check` + shell lint (shellcheck/shfmt); IaC linters
+  (ansible-lint, `tofu validate/fmt`, yamllint) phase in with the infra epic.
+- **B4** Tests green; **test-first** — the failing acceptance/integration test predates
+  the implementation (features as well as fixes). mackesd runs parallel once **EFF-18**
+  (the env-race) is fixed at the root.
+- **B5** Lint gates: mesh-boundary (§6), carbon-tokens (§4), bus-names (§2),
+  libcosmic-rev, no-crates.io-iced, **design-worklist-link** (D3).
+- **B6** `cargo deny check` (advisories/licenses/bans/sources).
+- **B7** **Diff-coverage ≥ 90 %** on changed lines (not whole-repo).
+- **B8** **Pixel-diff visual regression** on the headless preview gallery (deterministic:
+  pinned fonts + software rasterizer + fixed resolution); golden images **re-blessed in
+  the same commit**, diff visible in git. *(Supersedes the §7 visual-confirmation lift —
+  see `docs/DECISIONS.md`.)*
+- **B9** Operator-visible behavior change updates its **docs in the same commit**
+  (ADMIN / `docs/help` / CHANGELOG).
+- **B10** Commit message carries **task ID + the entrypoint made reachable + why-not-what**.
+
+**Verify (V)** — before a task flips to `[✓]`:
+- **V1** Runtime-reachable: the **concrete entrypoint is named AND a test drives that
+  path** (not merely claimed).
+- **V2** Cross-crate / new-surface features carry an **integration test across the real
+  path**.
+- **V3** A new surface has **CLI parity + a CLI test** (GUIs are renderers; headless-operable).
+- **V4** Mesh-level features pass the **multi-node gate on real XCP-ng VMs at 3 LH + 3
+  peers** (snapshot-reset pool); the full **3 LH + 9 peer** envelope + a golden-image
+  rebuild run at release.
+- **V5** No stubs: no `todo!()`/`unimplemented!()`, no stub match arms, no `pub mod`
+  with zero external refs, no `demo_data`/mockups (§7).
+
+**Remediate (R)**:
+- **R1** Defects follow **reproduce → failing test → fix → gate**; the regression test stays.
+- **R2** Dead/mock/incomplete code defaults to **REMOVE** unless a worklist task commits
+  to finishing it on a date.
+- **R3** **No in-flight detours** — an unrelated defect Y is filed as its own
+  symptom-backed task; X finishes. A blocking Y marks X `[!] Blocked`.
+- **R4** Transitional **dual-path code is allowed only with a tracked cutover task + a
+  removal date**.
+- **R5** Rollback is **fix-forward only** (never revert; the new fix rides R1).
+- **R6** Each **incident** yields a regression guard **and** a one-line governance lock
+  capturing the invariant.
+- **R7** **Stop-and-escalate** when the approach has been substantially rethought twice
+  without passing; the escalation is **the symptom + an `AskUserQuestion` choice**.
+
+**Process meta.**
+- **Authority / reopen:** every lock (§0–§10) reopens **only** on a concrete new symptom
+  + a **dated superseding entry in `docs/DECISIONS.md`**; agents may edit this file under
+  that same rule. Newest lock wins.
+- **Integration:** **direct commits to master**; parallel work runs in **per-agent git
+  worktrees**, merges serialized (one fast-forward at a time, re-gated on conflict).
+- **Visibility:** the worklist status legend (`[ ] [>] [✓] [!]`) is the state signal; a
+  generated **dashboard** surfaces it; **done epics archive** to `docs/WORKLIST-archive.md`.
+- **Notifications:** push only **escalations + release-ready**; all else is pull (dashboard).
+- **Releases:** **milestone-based** — an epic reaching full §7-completion is a release
+  candidate; the RPM cut stays **operator-gated** (`/release`).
+- **Environment:** airgapped **dev** — no production; full machine control. CI is
+  **self-hosted Forgejo Actions** on the XCP-ng fleet (GitHub stays canonical for the
+  release pipeline, Forgejo pull-mirrors); infra is **OpenTofu/Terraform (Xen Orchestra)
+  + Ansible**; secrets ride **etcd + age over Nebula** (D-W1).
+- **Rollout:** §10 is active now; the infra-dependent gates (self-hosted CI, B8 visual,
+  V4 real-VM) **phase in as the infra epic lands** — and **building that infra is the
+  first §10 epic** (the process dogfoods itself).
 
 ---
 
