@@ -111,6 +111,22 @@ impl Default for DdnsConfig {
     }
 }
 
+/// DDNS-EGRESS-3 — the default name template auto-population stamps on a record
+/// it creates for a VPN-GW tunnel: `{node}-{provider}` resolves (via
+/// [`RecordDef::fqdn`]) to `<node>-<tunnel>.<zone>`, the design's
+/// `eagle-mullvad.services.matthewmackes.com` shape. Single-sourced so the
+/// vpn_gw responder + the ddns responder agree on what an auto-added record
+/// looks like.
+pub const AUTO_RECORD_NAME_TEMPLATE: &str = "{node}-{provider}";
+
+/// DDNS-EGRESS-3 — the `source` key for a record that tracks VPN-GW tunnel
+/// `tunnel_id`: `tunnel:<id>`, matching [`crate::ddns`]'s `tunnel:<id>` egress
+/// key + the worker's `EgressKind::Tunnel` persisted key. Pure.
+#[must_use]
+pub fn tunnel_source_key(tunnel_id: &str) -> String {
+    format!("tunnel:{tunnel_id}")
+}
+
 impl DdnsConfig {
     /// Parse from TOML.
     ///
@@ -118,6 +134,31 @@ impl DdnsConfig {
     /// A TOML parse error.
     pub fn from_toml_str(s: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(s)
+    }
+
+    /// DDNS-EGRESS-3 auto-population — ensure a templated record exists for the
+    /// VPN-GW tunnel `tunnel_id`, so creating a tunnel/route yields a subdomain
+    /// with zero extra steps. **Idempotent:** keyed on the `tunnel:<id>` source,
+    /// so re-creating a tunnel (or a route that references it again) does NOT
+    /// duplicate the record. Returns `true` when a record was added (a real
+    /// change to persist), `false` when one already tracked this source.
+    ///
+    /// The added record uses the design's default name template
+    /// ([`AUTO_RECORD_NAME_TEMPLATE`]) + a sensible default `on_down`
+    /// ([`OnDown::default`] = `Remove`, the no-stale/leaking-record policy);
+    /// DDNS-EGRESS-4 owns the full reconnect-rewrite + on-down behavior. This is
+    /// only the auto-ADD on create.
+    pub fn auto_add_tunnel_record(&mut self, tunnel_id: &str) -> bool {
+        let source = tunnel_source_key(tunnel_id);
+        if self.record.iter().any(|r| r.source == source) {
+            return false; // already tracked — no duplicate (idempotent)
+        }
+        self.record.push(RecordDef {
+            name: AUTO_RECORD_NAME_TEMPLATE.to_string(),
+            source,
+            on_down: OnDown::default(),
+        });
+        true
     }
 
     /// Serialize to TOML.
@@ -311,5 +352,63 @@ mod tests {
     fn load_missing_is_default() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(load(tmp.path()), DdnsConfig::default());
+    }
+
+    // ── DDNS-EGRESS-3 — auto-population from VPN-GW (idempotent) ──────────────
+
+    #[test]
+    fn auto_add_tunnel_record_adds_a_templated_entry() {
+        let mut cfg = DdnsConfig::default();
+        assert!(
+            cfg.auto_add_tunnel_record("mullvad-1"),
+            "first add reports a real change"
+        );
+        assert_eq!(cfg.record.len(), 1);
+        let rec = &cfg.record[0];
+        assert_eq!(rec.name, AUTO_RECORD_NAME_TEMPLATE);
+        assert_eq!(rec.source, "tunnel:mullvad-1");
+        // Default on_down is the no-stale-record policy (Remove).
+        assert_eq!(rec.on_down, OnDown::Remove);
+        // The templated record resolves to the design's hostname shape.
+        assert_eq!(
+            rec.fqdn("eagle", "mullvad-1", 1, "services.matthewmackes.com"),
+            "eagle-mullvad-1.services.matthewmackes.com"
+        );
+    }
+
+    #[test]
+    fn auto_add_tunnel_record_is_idempotent_by_source() {
+        let mut cfg = DdnsConfig::default();
+        assert!(cfg.auto_add_tunnel_record("mullvad-1"));
+        // Re-creating the same tunnel does NOT duplicate the record.
+        assert!(
+            !cfg.auto_add_tunnel_record("mullvad-1"),
+            "re-add reports no change"
+        );
+        assert_eq!(cfg.record.len(), 1, "no duplicate for the same source");
+        // A different tunnel does add a second record.
+        assert!(cfg.auto_add_tunnel_record("proton-2"));
+        assert_eq!(cfg.record.len(), 2);
+    }
+
+    #[test]
+    fn auto_add_does_not_clobber_an_operator_edited_record() {
+        // An operator already added a record for this tunnel with a custom
+        // name + on_down. Auto-add must leave it untouched (matched by source).
+        let mut cfg = DdnsConfig::default();
+        cfg.record.push(RecordDef {
+            name: "my-custom-name".into(),
+            source: "tunnel:mullvad-1".into(),
+            on_down: OnDown::Keep,
+        });
+        assert!(!cfg.auto_add_tunnel_record("mullvad-1"));
+        assert_eq!(cfg.record.len(), 1);
+        assert_eq!(cfg.record[0].name, "my-custom-name");
+        assert_eq!(cfg.record[0].on_down, OnDown::Keep);
+    }
+
+    #[test]
+    fn tunnel_source_key_shape() {
+        assert_eq!(tunnel_source_key("mullvad-1"), "tunnel:mullvad-1");
     }
 }

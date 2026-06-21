@@ -7007,7 +7007,10 @@ fn run_serve(
             .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
         {
             Ok(persist) => {
-                let ddns_svc = mackesd_core::ipc::ddns::DdnsService::new(workgroup_root.clone());
+                let ddns_svc = mackesd_core::ipc::ddns::DdnsService::new(
+                    workgroup_root.clone(),
+                    node_id.clone(),
+                );
                 let resp_shutdown = Arc::clone(&shutdown);
                 std::thread::Builder::new()
                     .name("ddns-bus-responder".into())
@@ -7019,7 +7022,8 @@ fn run_serve(
                     .map(|_handle| {
                         tracing::info!(
                             "DDNS Bus responder spawned; serving action/ddns/{{get-config,\
-                             set-config,add-record,remove-record}} (DDNS-EGRESS-3)"
+                             set-config,add-record,remove-record,list-records,record-status,\
+                             sync-now}} (DDNS-EGRESS-3)"
                         );
                     })
                     .unwrap_or_else(|e| {
