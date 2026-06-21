@@ -5182,9 +5182,9 @@ fn run_serve(
     db_path: PathBuf,
 ) -> anyhow::Result<()> {
     use mackesd_core::workers::{
-        firewall_preset::FirewallPresetWorker, fleet_reconcile, heartbeat::HeartbeatWorker,
-        job_exec, lifecycle_exec, mdns_relay::MdnsRelayWorker, mesh_dns,
-        mesh_router::MeshRouterWorker, netstate_apply, presence_watch, ssh_pubkey_gossip,
+        ddns::DdnsWorker, firewall_preset::FirewallPresetWorker, fleet_reconcile,
+        heartbeat::HeartbeatWorker, job_exec, lifecycle_exec, mdns_relay::MdnsRelayWorker,
+        mesh_dns, mesh_router::MeshRouterWorker, netstate_apply, presence_watch, ssh_pubkey_gossip,
         sshd_overlay_bind::SshdOverlayBindWorker, validation_suite,
         voice_config::VoiceConfigWorker, RestartPolicy, Spawn, Supervisor,
     };
@@ -5485,6 +5485,25 @@ fn run_serve(
                 RestartPolicy::OnFailure,
             ));
             worker_names.lock().expect("worker_names mutex").push("metrics_exporter".into());
+        }
+        // DDNS-EGRESS-1 — egress-IP discovery + change detection. On each
+        // tick it learns this node's current WAN/public egress IP (default-
+        // route source address + public IP echo, degrading to "offline" when
+        // unreachable) and, on a real change vs the persisted last-seen value
+        // (caught even across a restart), publishes `event/egress-ip/<host>`
+        // for the DDNS writer (DDNS-EGRESS-2) to reconcile. Rank 0: every
+        // node has a dynamic WAN worth tracking. The per-VPN-tunnel exit-IP
+        // source plugs into the same `EgressIpSource` trait under
+        // DDNS-EGRESS-3 (deferred on VPN-GW; not in this build).
+        if mackesd_core::worker_role::runs("ddns", role_rank) {
+            sup.spawn(Spawn::new(
+                DdnsWorker::new(node_id.clone()),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("ddns".into());
         }
         // VV-2 (v4.1.0) — voice_config worker. Seeds the
         // /var/lib/mackesd/voice-desired.json document on first

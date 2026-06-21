@@ -390,6 +390,10 @@ pub mod connect_firewall;
 // role flip) + `connect_firewall` (exposure-policy ingress). Graceful no-op
 // without firewalld. Runs on every node (the public boundary is universal).
 pub mod public_deny;
+// DDNS-EGRESS-1 — egress-IP discovery + change detection (WAN now;
+// the per-VPN-tunnel exit-IP source plugs into the same
+// `EgressIpSource` trait under DDNS-EGRESS-3, deferred on VPN-GW).
+pub mod ddns;
 pub mod stun_gather;
 pub mod subprocess_tick;
 // thumbnailer retired 2026-05-26 (TUNE-3.b): the worker module
