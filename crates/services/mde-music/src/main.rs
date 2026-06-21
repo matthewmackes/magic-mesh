@@ -32,6 +32,12 @@ use cosmic::{Application, ApplicationExt, Element};
 /// its surface, e.g. `mde-notify-center`).
 const DOCK_NAMESPACE: &str = "mde-music";
 
+/// MUSIC-DOCK-3 — the wlr-layer-shell namespace for the always-mapped
+/// minimize-to-handle tab. A second, distinct namespace so the compositor keys
+/// the small persistent handle independently of the full dock surface (the dock
+/// maps/unmaps on Docked⟷Minimized; the handle stays mapped the whole time).
+const HANDLE_NAMESPACE: &str = "mde-music-handle";
+
 use mde_music::album::{self, AlbumView};
 use mde_music::color;
 use mde_music::hub::HubCard;
@@ -155,6 +161,40 @@ fn dock_surface() -> (window::Id, Task<Message>) {
     (id, task)
 }
 
+/// MUSIC-DOCK-3 — map the always-mapped **minimize-to-handle** tab: a second,
+/// small wlr layer surface (the `♪ Music` chip the dock collapses to instead of
+/// quitting). Same Overlay layer + `get_layer_surface` recipe as the dock, but:
+///   * **anchored BOTTOM only** (no left/right/top) — the compositor centers the
+///     surface on the bottom edge rather than stretching it, so it sits
+///     bottom-center as the item asks.
+///   * **explicitly sized** to the Carbon [`mde_theme::dock_handle`] tab tokens
+///     (a fixed pill, not a stretched edge), since it isn't four-edge anchored.
+///   * **`KeyboardInteractivity::None`** — it's a click target only (clicking it
+///     restores the dock), never a keyboard-focus surface.
+/// Always mapped for the life of the process — it is what keeps Music "one click
+/// away" while the dock is minimized. Returns its [`window::Id`] so `view_window`
+/// can dispatch the handle body for it.
+fn handle_surface() -> (window::Id, Task<Message>) {
+    let id = window::Id::unique();
+    let task = get_layer_surface(SctkLayerSurfaceSettings {
+        id,
+        namespace: HANDLE_NAMESPACE.to_string(),
+        // A fixed-size pill (not edge-stretched), sized from the Carbon tokens.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        size: Some((
+            Some(mde_theme::dock_handle::WIDTH as u32),
+            Some(mde_theme::dock_handle::HEIGHT as u32),
+        )),
+        exclusive_zone: 0,
+        // Bottom-only anchor → the compositor centers it on the bottom edge.
+        anchor: Anchor::BOTTOM,
+        layer: Layer::Overlay,
+        keyboard_interactivity: KeyboardInteractivity::None,
+        ..Default::default()
+    });
+    (id, task)
+}
+
 /// MUSIC-HOME — load everything the Home dashboard shows (stats + the
 /// most-played / starred / mesh-now-playing strips) in one batch. Used on Home
 /// nav, at init, and by the poll tick.
@@ -236,7 +276,17 @@ struct State {
     /// MUSIC-DOCK-1 — the layer-shell dock surface's window id (set in `init`).
     /// `cosmic::Application` routes rendering for a non-main-window id through
     /// [`Application::view_window`], so the view dispatches on this id.
+    /// MUSIC-DOCK-3 — the dock surface unmaps on minimize, so a restore mints a
+    /// **fresh** id (a wlr layer surface is gone once closed); this field is
+    /// updated to the new id on each restore so `view_window` keeps dispatching.
     dock_id: window::Id,
+    /// MUSIC-DOCK-3 — the always-mapped bottom-center handle surface's window id
+    /// (set in `init`). `view_window` renders the handle body for this id; it
+    /// stays mapped for the life of the process so Music is always one click away.
+    handle_id: window::Id,
+    /// MUSIC-DOCK-3 — the Docked⟷Minimized state machine: which surface(s) are
+    /// mapped + the slide direction (see [`DockVisibility`]).
+    dock_vis: DockVisibility,
     nav: NavState,
     /// `Some` until the operator connects a server (first run); `None`
     /// once creds exist and the library shell is shown.
@@ -361,7 +411,29 @@ struct State {
 }
 
 /// MUSIC-DOCK-2 — the [`mde_theme::Animator`] key for the dock OPEN slide-up.
+/// Reused by MUSIC-DOCK-3 for the **restore** slide-up (handle → dock): the same
+/// "dock rises into place" entrance plays at boot AND on a restore.
 const DOCK_OPEN_ANIM: &str = "dock_open";
+
+/// MUSIC-DOCK-3 — the [`mde_theme::Animator`] key for the dock MINIMIZE
+/// slide-down (the DOCK-2 entrance run in reverse: the dock sinks toward the
+/// bottom edge before it unmaps, leaving the handle).
+const DOCK_MINIMIZE_ANIM: &str = "dock_minimize";
+
+/// MUSIC-DOCK-3 — whether the Music dock surface is currently shown or collapsed
+/// to the always-mapped bottom-center handle. The state machine that drives which
+/// surface(s) are mapped and the slide direction:
+///   * [`DockVisibility::Docked`] — the full dock surface is mapped; closing it
+///     (the title-bar ✕ / Esc) plays the MINIMIZE slide-down then unmaps it,
+///     transitioning to `Minimized`. The **process stays alive** (no exit).
+///   * [`DockVisibility::Minimized`] — the dock surface is unmapped; only the
+///     small handle tab remains. Clicking the handle re-maps the dock + plays the
+///     RESTORE slide-up, transitioning back to `Docked`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockVisibility {
+    Docked,
+    Minimized,
+}
 
 /// MUSIC-RFX-8 — the target of a right-click track context menu. A track row
 /// knows its song id + title; playlist removal ("Remove from playlist") is
@@ -542,10 +614,21 @@ enum Message {
     /// subscription returns [`Subscription::none()`] once the tween settles, so a
     /// settled dock schedules zero ticks (MOTION-PERF-1).
     DockTick,
+    /// MUSIC-DOCK-3 — minimize the dock to the handle: play the DOCK-2 slide in
+    /// REVERSE (the dock sinks toward the bottom edge), then unmap the dock
+    /// surface, leaving the always-mapped handle. The process keeps running — this
+    /// replaces the old close/Esc `std::process::exit`.
+    MinimizeDock,
+    /// MUSIC-DOCK-3 — the minimize slide-down finished; unmap the dock surface
+    /// (the deferred close, scheduled to fire after the slide settles).
+    MinimizeFinished,
+    /// MUSIC-DOCK-3 — restore the dock from the handle: re-map a fresh dock
+    /// surface + play the DOCK-2 slide-up. Emitted by clicking the handle tab.
+    RestoreDock,
 }
 
 impl State {
-    fn new(core: cosmic::app::Core, dock_id: window::Id) -> Self {
+    fn new(core: cosmic::app::Core, dock_id: window::Id, handle_id: window::Id) -> Self {
         let (form, connection) = match creds::load() {
             Ok(c) => (None, format!("Connected to {}", c.server_url)),
             Err(_) => (Some(FirstRunForm::default()), String::new()),
@@ -555,6 +638,9 @@ impl State {
         let mut s = Self {
             core,
             dock_id,
+            handle_id,
+            // MUSIC-DOCK-3 — boot Docked (the dock maps + slides up on launch).
+            dock_vis: DockVisibility::Docked,
             nav: NavState::new(),
             form,
             connection,
@@ -624,14 +710,24 @@ impl State {
         s
     }
 
-    /// MUSIC-DOCK-2 — true while the dock OPEN slide-up is still in flight, so
-    /// `subscription` arms the tick ONLY while it animates and drops to
-    /// `Subscription::none()` the instant it settles (MOTION-PERF-1 — a settled
-    /// dock schedules zero ticks). Always false once the tween completes (and,
-    /// under reduce-motion, after the ≤80 ms cap).
+    /// MUSIC-DOCK-2/-3 — true while EITHER the dock OPEN/restore slide-up OR the
+    /// MINIMIZE slide-down is still in flight, so `subscription` arms the tick ONLY
+    /// while a dock transition animates and drops to `Subscription::none()` the
+    /// instant both settle (MOTION-PERF-1 — a settled dock schedules zero ticks).
+    /// Always false once the tweens complete (and, under reduce-motion, after the
+    /// ≤80 ms cap).
     #[must_use]
     fn dock_animating(&self) -> bool {
         self.anim.is_animating(DOCK_OPEN_ANIM, self.anim_now)
+            || self.anim.is_animating(DOCK_MINIMIZE_ANIM, self.anim_now)
+    }
+
+    /// MUSIC-DOCK-3 — true while the MINIMIZE slide-down is in flight: the dock is
+    /// sinking toward the bottom edge and must NOT be unmapped yet. Used to gate
+    /// the slide-down wrapper + the deferred unmap.
+    #[must_use]
+    fn dock_minimizing(&self) -> bool {
+        self.anim.is_animating(DOCK_MINIMIZE_ANIM, self.anim_now)
     }
 
     /// MUSIC-DOCK-2 — the dock OPEN slide-up [`mde_theme::RenderParams`] for the
@@ -650,9 +746,31 @@ impl State {
         mde_theme::slide_in(t, mde_theme::DOCK_SLIDE_PX, reduce_motion())
     }
 
-    /// MUSIC-DOCK-2 — wrap the dock's root `body` in the OPEN slide-up: the whole
-    /// surface rises from [`mde_theme::DOCK_SLIDE_PX`] below the bottom edge to
-    /// rest as it maps. Once settled (or under reduce-motion / instant) the body is
+    /// MUSIC-DOCK-3 — the dock MINIMIZE slide-down offset (px) for the current
+    /// frame: the DOCK-2 entrance run in REVERSE. The minimize tween progresses
+    /// `t: 0→1`; feeding `1.0 - t` into the same [`mde_theme::slide_in`] entrance
+    /// makes its `translate_y` ramp 0→[`mde_theme::DOCK_SLIDE_PX`] — i.e. the dock
+    /// sinks toward the bottom edge (the open rise played backwards) before it
+    /// unmaps. Under reduce-motion `slide_in` drops the movement (the Q32
+    /// crossfade), so the offset stays 0 and the minimize is instant — the same
+    /// reduce-motion-safe branch the open uses.
+    #[must_use]
+    fn dock_minimize_offset(&self) -> f32 {
+        let t = self.anim.value(
+            DOCK_MINIMIZE_ANIM,
+            self.anim_now,
+            mde_theme::Easing::EaseOut,
+        );
+        mde_theme::slide_in(1.0 - t, mde_theme::DOCK_SLIDE_PX, reduce_motion())
+            .translate_y
+            .clamp(0.0, mde_theme::DOCK_SLIDE_PX)
+    }
+
+    /// MUSIC-DOCK-2/-3 — wrap the dock's root `body` in the active slide: the OPEN/
+    /// restore slide-up (the whole surface rises from [`mde_theme::DOCK_SLIDE_PX`]
+    /// below the bottom edge to rest as it maps) OR, when minimizing, the MINIMIZE
+    /// slide-down (the reverse — the surface sinks toward the bottom edge before it
+    /// unmaps). Once both settle (or under reduce-motion / instant) the body is
     /// returned at rest with no wrapper cost.
     ///
     /// As with the workbench TRANS-1/FEEDBACK-2 reveals, the slide is rendered on
@@ -661,15 +779,22 @@ impl State {
     /// until the 0.14 opacity widget lands; the live entrance is the achievable
     /// transform settle. The remaining offset becomes a top-padding inset with a
     /// matching bottom compensator so the surface height stays fixed (no reflow):
-    /// the dock content visibly rises into place from the bottom.
+    /// the dock content visibly rises into / sinks out of place at the bottom.
     fn dock_slide_up<'a>(&self, body: Element<'a, Message>) -> Element<'a, Message> {
         if !self.dock_animating() {
             return body;
         }
-        let offset = self
-            .dock_open_params()
-            .translate_y
-            .clamp(0.0, mde_theme::DOCK_SLIDE_PX);
+        // MUSIC-DOCK-3 — the minimize slide-down wins only while actually
+        // minimizing (Minimized + the tween in flight); a restore flips back to
+        // Docked, so even a stale minimize tween yields to the open/restore
+        // slide-up offset.
+        let offset = if self.dock_vis == DockVisibility::Minimized && self.dock_minimizing() {
+            self.dock_minimize_offset()
+        } else {
+            self.dock_open_params()
+                .translate_y
+                .clamp(0.0, mde_theme::DOCK_SLIDE_PX)
+        };
         container(body)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -679,6 +804,72 @@ impl State {
                 bottom: mde_theme::DOCK_SLIDE_PX - offset,
                 left: 0.0,
             })
+            .into()
+    }
+
+    /// MUSIC-DOCK-3 — the live now-playing title for the handle tab, sourced from
+    /// the app's existing player state (the same `now_title` / `now_state.song_id`
+    /// the playback bar + maxi player read — not invented). Falls back to the
+    /// song id, then to nothing when idle (the handle then shows just `♪ Music`).
+    #[must_use]
+    fn now_label(&self) -> String {
+        if !self.now_title.is_empty() {
+            self.now_title.clone()
+        } else if !self.now_state.song_id.is_empty() {
+            self.now_state.song_id.clone()
+        } else {
+            String::new()
+        }
+    }
+
+    /// MUSIC-DOCK-3 — the always-mapped bottom-center handle tab body: `♪ Music` +
+    /// the current now-playing title, as one click target that restores the dock
+    /// ([`Message::RestoreDock`]). All sizing/spacing/colour from the Carbon
+    /// [`mde_theme::dock_handle`] tokens + the dark `Palette` (§4): a raised pill
+    /// on the surface background, accent glyph, muted title. The whole tab is a
+    /// borderless `button` so the entire chip is clickable.
+    fn handle_view(&self) -> Element<'_, Message> {
+        use mde_theme::dock_handle as h;
+        let p = mde_theme::Palette::dark();
+        let accent = carbon(p.accent, 1.0);
+        let text_c = carbon(p.text, 1.0);
+        let muted = carbon(p.text_muted, 1.0);
+        let raised = carbon(p.raised, 1.0);
+        let title = self.now_label();
+        let mut content = row![
+            text("\u{266A}").size(h::LABEL_SIZE).colr(accent),
+            text("Music").size(h::LABEL_SIZE).colr(text_c),
+        ]
+        .spacing(h::GAP)
+        .align_y(cosmic::iced::Alignment::Center);
+        if !title.is_empty() {
+            content = content.push(
+                text(title)
+                    .size(h::LABEL_SIZE)
+                    .colr(muted)
+                    .width(Length::Fill),
+            );
+        }
+        let chip = button(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding([h::V_PAD, h::H_PAD])
+            .on_press(Message::RestoreDock)
+            .sty(move |_t, status| {
+                let bg = if matches!(status, cosmic::iced::widget::button::Status::Hovered) {
+                    carbon(p.accent, 0.18)
+                } else {
+                    raised
+                };
+                cosmic::iced::widget::button::Style {
+                    background: Some(bg.into()),
+                    text_color: text_c,
+                    ..cosmic::iced::widget::button::Style::default()
+                }
+            });
+        container(chip)
+            .width(Length::Fixed(h::WIDTH))
+            .height(Length::Fixed(h::HEIGHT))
             .into()
     }
 
@@ -951,16 +1142,20 @@ impl State {
                 self.home_peers = peers;
                 Task::none()
             }
+            // MUSIC-DOCK-3 — the explicit, real QUIT affordance (deliberately kept
+            // available, but no longer the default close): genuinely exits the GUI
+            // process. The DEFAULT close (the header ✕ / Esc with nothing open) is
+            // now `MinimizeDock`, which keeps the process alive — this `Exit` is the
+            // only path that still ends it.
             Message::Exit => std::process::exit(0),
             Message::EscPressed => {
-                // MUSIC-DOCK-1 — Esc peels back one layer of UI before hiding the
-                // dock: an open add-to-playlist picker / context menu / maxi
+                // MUSIC-DOCK-1/-3 — Esc peels back one layer of UI before closing
+                // the dock: an open add-to-playlist picker / context menu / maxi
                 // player / search sheet closes first; only with the bare dock
-                // showing does Esc HIDE it. Hiding a single-surface layer-shell
-                // daemon == releasing the surface + exiting (the
-                // `mde-notify-center` idiom): the daemon keeps playing and a
-                // re-launch re-maps the dock. (Keep-running minimize-to-handle is
-                // MUSIC-DOCK-3, deliberately not done here.)
+                // showing does Esc CLOSE it. MUSIC-DOCK-3 makes "close" a
+                // MINIMIZE-to-handle (slide down + unmap the dock, keep the handle +
+                // the process), NOT an exit — Music is always one click away and
+                // never quits on close. (The real quit is the explicit `Exit`.)
                 if self.add_to_playlist_song.is_some() {
                     self.add_to_playlist_song = None;
                     self.add_to_playlist_choices.clear();
@@ -975,7 +1170,7 @@ impl State {
                     self.maxi_open = false;
                     Task::none()
                 } else {
-                    std::process::exit(0)
+                    self.update(Message::MinimizeDock)
                 }
             }
             Message::UrlChanged(s) => {
@@ -1439,6 +1634,69 @@ impl State {
                 self.anim_now = std::time::Instant::now();
                 let _ = self.anim.gc(self.anim_now);
                 Task::none()
+            }
+            // MUSIC-DOCK-3 — minimize-to-handle: the close/Esc path. Already
+            // minimized → no-op (the handle is the only surface). Otherwise arm
+            // the MINIMIZE slide-down (the DOCK-2 entrance in reverse), then defer
+            // the unmap until it settles so the dock visibly sinks before it
+            // disappears. The process keeps running (no exit); the handle stays
+            // mapped, and mde-musicd keeps playback regardless.
+            Message::MinimizeDock => {
+                if self.dock_vis == DockVisibility::Minimized {
+                    return Task::none();
+                }
+                self.dock_vis = DockVisibility::Minimized;
+                let now = std::time::Instant::now();
+                self.anim_now = now;
+                self.anim.start(
+                    DOCK_MINIMIZE_ANIM,
+                    now,
+                    mde_theme::Motion::panel_mount(),
+                    reduce_motion(),
+                );
+                // Defer the surface unmap until the slide-down has played out (the
+                // resolved tween duration — already ≤80 ms under reduce-motion, so
+                // a reduce-motion minimize unmaps almost immediately).
+                let settle = mde_theme::Motion::panel_mount()
+                    .resolved(reduce_motion())
+                    .duration;
+                Task::perform(
+                    async move {
+                        tokio::time::sleep(settle).await;
+                    },
+                    |()| Message::MinimizeFinished,
+                )
+            }
+            Message::MinimizeFinished => {
+                // MUSIC-DOCK-3 — the slide-down settled; unmap the dock surface,
+                // leaving only the always-mapped handle. A late finish after a
+                // re-Docked (the operator clicked the handle mid-slide) must NOT
+                // close the freshly-restored dock.
+                if self.dock_vis == DockVisibility::Minimized {
+                    window::close::<Message>(self.dock_id)
+                } else {
+                    Task::none()
+                }
+            }
+            // MUSIC-DOCK-3 — restore from the handle: re-map a FRESH dock surface
+            // (the old one was closed on minimize — a wlr layer surface is gone
+            // once closed) and play the DOCK-2 slide-up. Already docked → no-op.
+            Message::RestoreDock => {
+                if self.dock_vis == DockVisibility::Docked {
+                    return Task::none();
+                }
+                self.dock_vis = DockVisibility::Docked;
+                let now = std::time::Instant::now();
+                self.anim_now = now;
+                let (dock_id, dock) = dock_surface();
+                self.dock_id = dock_id;
+                self.anim.start(
+                    DOCK_OPEN_ANIM,
+                    now,
+                    mde_theme::Motion::panel_mount(),
+                    reduce_motion(),
+                );
+                dock
             }
         }
     }
@@ -2177,7 +2435,12 @@ impl State {
             nav_btn("⌂ Home").on_press(Message::Home).into()
         };
         // MUSIC-ALBUMS-1 — Carbon header (48px): Back/Home + "MCNF Music"
-        // wordmark, centered search, Exit. Surface background + bottom inset.
+        // wordmark, centered search, then the close controls. Surface background +
+        // bottom inset.
+        // MUSIC-DOCK-3 — the DEFAULT close is now MINIMIZE-to-handle (`▾`): it
+        // slides the dock down + leaves the bottom-center handle, keeping the
+        // process alive (Music never quits on close). A separate explicit `✕ Quit`
+        // is kept as the real exit affordance.
         let pal = mde_theme::Palette::dark();
         let header = container(
             row![
@@ -2187,7 +2450,8 @@ impl State {
                 Space::new().width(Length::Fill),
                 search_field,
                 Space::new().width(Length::Fill),
-                nav_btn("✕ Exit").on_press(Message::Exit),
+                nav_btn("▾ Close").on_press(Message::MinimizeDock),
+                nav_btn("✕ Quit").on_press(Message::Exit),
             ]
             .spacing(12)
             .align_y(cosmic::iced::Alignment::Center),
@@ -2875,7 +3139,11 @@ impl Application for State {
             .map(|id| window::close::<Message>(id).map(cosmic::Action::App))
             .unwrap_or_else(Task::none);
         let (dock_id, dock) = dock_surface();
-        let mut s = Self::new(core, dock_id);
+        // MUSIC-DOCK-3 — also map the always-mapped bottom-center handle tab at
+        // boot (it stays mapped for the life of the process; the dock maps/unmaps
+        // on Docked⟷Minimized over the top of it).
+        let (handle_id, handle) = handle_surface();
+        let mut s = Self::new(core, dock_id, handle_id);
         // Keep mde-music's in-app chrome; the layer surface is decoration-free by
         // construction (no server-side titlebar), so the in-app Carbon header is
         // the only top bar — suppress Cosmic's headerbar to match.
@@ -2885,7 +3153,7 @@ impl Application for State {
         // Home dashboard is populated on first paint. The `get_layer_surface`
         // command yields no message (typed over `Message`), so it lifts into the
         // cosmic `Action` space the same way as the home batch.
-        let boot = Task::batch([dock, load_home_tasks()]).map(cosmic::Action::App);
+        let boot = Task::batch([dock, handle, load_home_tasks()]).map(cosmic::Action::App);
         (s, Task::batch([close, boot]))
     }
 
@@ -2910,10 +3178,15 @@ impl Application for State {
     /// degrades to an empty element rather than panicking the daemon.
     fn view_window(&self, id: window::Id) -> Element<'_, Self::Message> {
         if id == self.dock_id {
-            // MUSIC-DOCK-2 — wrap the whole dock surface in the OPEN slide-up so the
-            // dock rises from below the bottom edge as it maps (settled / instant
-            // under reduce-motion: the body is returned at rest, no wrapper cost).
+            // MUSIC-DOCK-2/-3 — wrap the whole dock surface in the active slide so
+            // it rises from below the bottom edge as it maps (open/restore) or sinks
+            // toward it before unmapping (minimize); settled / instant under
+            // reduce-motion the body is returned at rest, no wrapper cost.
             self.dock_slide_up(State::view(self))
+        } else if id == self.handle_id {
+            // MUSIC-DOCK-3 — the always-mapped bottom-center handle tab (`♪ Music` +
+            // the now-playing title); clicking it restores the dock.
+            self.handle_view()
         } else {
             Space::new().into()
         }
