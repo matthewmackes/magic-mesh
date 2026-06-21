@@ -280,6 +280,17 @@ pub const PULSE_MAX_SCALE: f32 = 1.15;
 /// Component dimension, not density-scaled.
 pub const PANEL_MOUNT_TRANSLATE_Y_PX: f32 = 4.0;
 
+/// MUSIC-DOCK-2 — the distance (px) a shell **dock** slides up from below the
+/// bottom screen edge when it maps. A dock open is a full-surface entrance (the
+/// whole dock arrives from off-screen), so its travel is larger than the in-view
+/// micro-interaction rises (the 8 px row-reveal / route-switch slide) — a
+/// deliberate "rises into place from the bottom" gesture. Paired with
+/// [`Motion::panel_mount`] (Carbon `moderate-02` 240 ms entrance, the
+/// expansion/reveal tier) for its duration + ease-out curve, and fed through
+/// [`crate::animation::slide_in`] so reduce-motion collapses the slide to a
+/// crossfade (no movement). Component dimension, not density-scaled.
+pub const DOCK_SLIDE_PX: f32 = 48.0;
+
 /// MOTION-FEEDBACK-3 — the popup enter/exit **scale delta**: the subtle amount a
 /// popup/menu/drawer/Hub is scaled *down* at the start of its open (and back
 /// down to at the end of its close), e.g. `0.04` ⇒ the surface enters at 0.96×
@@ -510,6 +521,23 @@ mod tests {
         // small enough to read as a gentle fade-scale, never a zoom.
         assert!((POPUP_SCALE_DELTA - 0.04).abs() < f32::EPSILON);
         assert!(POPUP_SCALE_DELTA > 0.0 && POPUP_SCALE_DELTA < 0.1);
+    }
+
+    #[test]
+    fn dock_slide_px_is_a_full_surface_entrance_travel() {
+        // MUSIC-DOCK-2 — a dock rises from off-screen below the bottom edge, so its
+        // slide travel is a larger, full-surface entrance — distinctly bigger than
+        // the 8 px in-view micro-interaction rises (row reveal / route switch),
+        // but bounded so the dock settles within its `panel_mount` (240 ms) window.
+        assert!((DOCK_SLIDE_PX - 48.0).abs() < f32::EPSILON);
+        assert!(
+            DOCK_SLIDE_PX > PANEL_MOUNT_TRANSLATE_Y_PX,
+            "a dock entrance travels further than an in-place panel mount"
+        );
+        assert!(
+            DOCK_SLIDE_PX > 8.0 && DOCK_SLIDE_PX <= 64.0,
+            "a full-surface dock rise, but not an over-long fly-in"
+        );
     }
 
     #[test]
