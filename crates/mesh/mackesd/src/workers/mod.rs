@@ -385,7 +385,6 @@ pub mod connect_firewall;
 // VPN-GW-1 — per-node commercial-VPN tunnel engine (WireGuard/OpenVPN baseline).
 pub mod stun_gather;
 pub mod subprocess_tick;
-pub mod vpn_gateway;
 // thumbnailer retired 2026-05-26 (TUNE-3.b): the worker module
 // shelled out to `mackes/mesh_thumbnailer.py` which already
 // retired with EPIC-RETIRE-PY-WORKBENCH; Thunar / GTK thumbnail
