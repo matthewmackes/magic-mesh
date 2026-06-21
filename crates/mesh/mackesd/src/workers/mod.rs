@@ -394,6 +394,10 @@ pub mod public_deny;
 // the per-VPN-tunnel exit-IP source plugs into the same
 // `EgressIpSource` trait under DDNS-EGRESS-3, deferred on VPN-GW).
 pub mod ddns;
+// DDNS-EGRESS-2 — the daemon-side DigitalOcean DNS writer the `ddns`
+// worker drives on an egress-IP change (executes the pure
+// `mackes_mesh_types::ddns` request builders against the DO API).
+pub mod ddns_writer;
 pub mod stun_gather;
 pub mod subprocess_tick;
 // thumbnailer retired 2026-05-26 (TUNE-3.b): the worker module

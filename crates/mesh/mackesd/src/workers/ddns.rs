@@ -459,20 +459,68 @@ pub struct DdnsWorker {
     state_path: PathBuf,
     tick: Duration,
     sources: Vec<Box<dyn EgressIpSource>>,
+    /// DDNS-EGRESS-2 — the DNS reconciler driven on a real egress change.
+    /// The production reconciler builds the DigitalOcean [`DnsWriter`]
+    /// from the persisted `[ddns]` config + the encrypted token; a test
+    /// injects a capturing reconciler. `None` only in legacy discovery-
+    /// only tests; production always wires one (see [`DdnsWorker::new`]).
+    /// An `Arc` so it can be cloned into the `spawn_blocking` hop the
+    /// curl-shelling writer must run on.
+    reconciler: Option<std::sync::Arc<dyn DnsReconciler>>,
+}
+
+/// The seam DDNS-EGRESS-2 plugs the DNS write into. On a real egress
+/// change the worker hands the changed source key + the new reading (or
+/// "down") to a reconciler, which loads the `[ddns]` config, resolves the
+/// records bound to that source, and drives the DigitalOcean
+/// [`DnsWriter`](crate::workers::ddns_writer::DnsWriter). Behind a trait
+/// so the worker's wiring is unit-tested without a live DO token (the
+/// production [`DoDnsReconciler`] needs the secret store + the network).
+pub trait DnsReconciler: Send + Sync {
+    /// Reconcile every configured record whose `source` matches `key`
+    /// (`"wan"` / `"tunnel:<id>"`) against the fresh `reading`. An empty
+    /// `reading` (source down) drives each record's `on_down` policy.
+    /// Errors are logged inside the impl (one bad record must not wedge
+    /// the others), so this returns the count of records reconciled.
+    fn reconcile(&self, key: &str, reading: &EgressReading) -> usize;
 }
 
 impl DdnsWorker {
     /// Construct the WAN-only worker for `host`, persisting to
     /// [`DEFAULT_STATE_PATH`] at the [`DEFAULT_TICK`] cadence. The VPN
-    /// source (DDNS-EGRESS-3) appends to `sources` when it lands.
+    /// source (DDNS-EGRESS-3) appends to `sources` when it lands. Wires
+    /// the production [`DoDnsReconciler`] rooted at the default workgroup
+    /// so a detected change actually writes DNS (DDNS-EGRESS-2).
     #[must_use]
     pub fn new(host: impl Into<String>) -> Self {
+        let host = host.into();
+        let workgroup_root = crate::default_qnm_shared_root();
+        let reconciler: std::sync::Arc<dyn DnsReconciler> =
+            std::sync::Arc::new(DoDnsReconciler::new(workgroup_root, host.clone()));
         Self {
-            host: host.into(),
+            host,
             state_path: PathBuf::from(DEFAULT_STATE_PATH),
             tick: DEFAULT_TICK,
             sources: vec![Box::new(WanEgressSource::new())],
+            reconciler: Some(reconciler),
         }
+    }
+
+    /// Override the reconciler (DDNS-EGRESS-2 wiring tests inject a
+    /// capturing one; discovery-only tests drop it via
+    /// [`without_reconciler`](DdnsWorker::without_reconciler)).
+    #[must_use]
+    pub fn with_reconciler(mut self, reconciler: std::sync::Arc<dyn DnsReconciler>) -> Self {
+        self.reconciler = Some(reconciler);
+        self
+    }
+
+    /// Drop the reconciler — for the legacy discovery-only tests that
+    /// assert change-detection without a DO write.
+    #[must_use]
+    pub fn without_reconciler(mut self) -> Self {
+        self.reconciler = None;
+        self
     }
 
     /// Override the persisted-state path (tests use a tempdir).
@@ -527,11 +575,24 @@ impl DdnsWorker {
                         "ddns: egress IP changed; publishing event/egress-ip",
                     );
                     publish_change(&self.host, &kind, &reading, first_seen);
+                    // DDNS-EGRESS-2 — drive the DigitalOcean DnsWriter for
+                    // every record bound to this source so the change
+                    // actually lands as a DNS upsert (the writer runs on a
+                    // blocking hop — its curl shell-out must not pin the
+                    // tokio worker).
+                    self.reconcile(&key, &reading).await;
                     state.last.insert(key, reading);
                     changed += 1;
                 }
                 ChangeOutcome::WentOffline => {
-                    debug!(source = %key, "ddns: source offline; retaining last-seen IP");
+                    // The source has no address now (offline / tunnel down).
+                    // We retain the last-seen value in state (no churn) but
+                    // DO hand it to the writer so the per-record `on_down`
+                    // policy (remove / sentinel / keep) applies — a down
+                    // exit must not leave a stale record silently pointing
+                    // at a dead/leaking address (design acceptance).
+                    debug!(source = %key, "ddns: source offline; applying on_down policy");
+                    self.reconcile(&key, &reading).await;
                 }
                 ChangeOutcome::Unchanged => {
                     debug!(source = %key, "ddns: egress IP unchanged");
@@ -548,6 +609,137 @@ impl DdnsWorker {
             }
         }
         changed
+    }
+
+    /// Drive the DNS reconciler for one changed source on a blocking hop.
+    /// The production reconciler shells to `curl` (DO API) + touches the
+    /// filesystem (secret blob, config), so it must not run on the tokio
+    /// scheduler thread — `spawn_blocking` keeps the runtime responsive.
+    /// A no-op when no reconciler is wired (discovery-only tests).
+    async fn reconcile(&self, key: &str, reading: &EgressReading) {
+        let Some(reconciler) = self.reconciler.clone() else {
+            return;
+        };
+        // Clone the small owned inputs into the blocking task; the
+        // reconciler is `Arc<dyn …>` so it crosses the hop cheaply.
+        let key = key.to_owned();
+        let reading = reading.clone();
+        let n = tokio::task::spawn_blocking(move || reconciler.reconcile(&key, &reading))
+            .await
+            .unwrap_or(0);
+        if n > 0 {
+            debug!(records = n, "ddns: reconciled records via DnsWriter");
+        }
+    }
+}
+
+/// DDNS-EGRESS-2 — the production [`DnsReconciler`]: on a changed source,
+/// load the persisted `[ddns]` config, find every record bound to that
+/// source, and drive the DigitalOcean [`DnsWriter`] (create/update on a
+/// present IP, `on_down` policy when down). Holds the workgroup root (to
+/// load the config + resolve the encrypted token) + this node's id/host
+/// (for record templating + the `ddns/auth` alert).
+pub struct DoDnsReconciler {
+    workgroup_root: PathBuf,
+    host: String,
+}
+
+impl DoDnsReconciler {
+    /// Build rooted at the shared workgroup (config + secret home) for
+    /// `host` (this node's id, used for templating + the alert host).
+    #[must_use]
+    pub fn new(workgroup_root: PathBuf, host: impl Into<String>) -> Self {
+        Self {
+            workgroup_root,
+            host: host.into(),
+        }
+    }
+
+    /// Build the DigitalOcean writer from `cfg` with the production seams:
+    /// `curl` transport (token off argv), the age-sealed token resolved
+    /// from `cfg.token_ref`, and the file alert sink. Split out so the
+    /// per-record loop (`reconcile`) is the same whether the writer is
+    /// real or (in a test of [`DoDnsReconciler`]) constructed differently.
+    fn build_writer(
+        &self,
+        cfg: &mackes_mesh_types::ddns::DdnsConfig,
+    ) -> impl crate::workers::ddns_writer::DnsWriter {
+        use crate::workers::ddns_writer::{
+            CurlExec, DigitalOceanWriter, FileAlertSink, SealedTokenSource,
+        };
+        let tokens = SealedTokenSource::new(&self.workgroup_root, &self.host, &cfg.token_ref);
+        DigitalOceanWriter::new(
+            &cfg.zone,
+            self.host.clone(),
+            CurlExec::new(),
+            tokens,
+            FileAlertSink::new(),
+        )
+    }
+}
+
+/// Derive the `{provider}` templating value for a record `source` key:
+/// `tunnel:mullvad-1` → `mullvad-1`; `wan` → `wan`. Pure. The `{node}`
+/// value is the host; `{n}` is fixed at 1 (multi-instance indexing is a
+/// later refinement — single instance per (node, source) for now).
+#[must_use]
+fn provider_for_source(source: &str) -> &str {
+    source.strip_prefix("tunnel:").unwrap_or(source)
+}
+
+impl DnsReconciler for DoDnsReconciler {
+    fn reconcile(&self, key: &str, reading: &EgressReading) -> usize {
+        let cfg = mackes_mesh_types::ddns::load(&self.workgroup_root);
+        if !cfg.enabled {
+            debug!("ddns: writer disabled in config; skipping reconcile");
+            return 0;
+        }
+        // Only the DigitalOcean adapter exists in v1.
+        if cfg.provider != "digitalocean" {
+            warn!(provider = %cfg.provider, "ddns: unknown DnsWriter provider; skipping");
+            return 0;
+        }
+        let matching: Vec<_> = cfg.record.iter().filter(|r| r.source == key).collect();
+        if matching.is_empty() {
+            return 0;
+        }
+        let writer = self.build_writer(&cfg);
+        let provider = provider_for_source(key);
+        let mut done = 0usize;
+        for rec in matching {
+            let fqdn = rec.fqdn(&self.host, provider, 1, &cfg.zone);
+            // Reconcile each present family; for a down source the policy
+            // is family-agnostic (remove/sentinel/keep handled inside).
+            let ips: Vec<Option<&str>> = if reading.is_empty() {
+                vec![None]
+            } else {
+                let mut v = Vec::new();
+                if let Some(ip) = reading.v4.as_deref() {
+                    v.push(Some(ip));
+                }
+                if let Some(ip) = reading.v6.as_deref() {
+                    v.push(Some(ip));
+                }
+                v
+            };
+            for ip in ips {
+                if let Err(e) = crate::workers::ddns_writer::reconcile_record(
+                    &writer,
+                    &fqdn,
+                    ip,
+                    cfg.ttl,
+                    rec.on_down,
+                    "", // sentinel address — operator-config seam (unset → keep)
+                ) {
+                    // One record's failure (incl. an auth alert already
+                    // raised inside the writer) must not wedge the others.
+                    warn!(record = %rec.name, fqdn = %fqdn, error = %e, "ddns: record reconcile failed");
+                } else {
+                    done += 1;
+                }
+            }
+        }
+        done
     }
 }
 
@@ -851,6 +1043,7 @@ mod tests {
                 }
             }
             DdnsWorker::new("eagle")
+                .without_reconciler() // discovery-only assertions here
                 .with_state_path(path.clone())
                 .with_sources(vec![Box::new(Fwd(f))])
         };
@@ -895,6 +1088,7 @@ mod tests {
             reading: std::sync::Mutex::new(reading(Some("198.51.100.9"), None)),
         };
         let w = DdnsWorker::new("eagle")
+            .without_reconciler()
             .with_state_path(path.clone())
             .with_sources(vec![Box::new(fake)]);
         assert_eq!(
@@ -902,5 +1096,77 @@ mod tests {
             1,
             "a change while down is caught on the next boot"
         );
+    }
+
+    // ── DDNS-EGRESS-2 wiring: the worker actually drives the writer ──
+
+    /// A capturing reconciler that records every (key, reading) the
+    /// worker hands it — proving the writer is runtime-reachable (§7),
+    /// not a dangling trait. Returns a fixed count so `reconcile`'s log
+    /// branch is exercised.
+    #[derive(Default)]
+    struct SpyReconciler {
+        seen: std::sync::Mutex<Vec<(String, EgressReading)>>,
+    }
+    impl DnsReconciler for SpyReconciler {
+        fn reconcile(&self, key: &str, reading: &EgressReading) -> usize {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((key.to_owned(), reading.clone()));
+            1
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tick_drives_the_reconciler_on_change_and_on_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("egress-ip.json");
+        let spy = std::sync::Arc::new(SpyReconciler::default());
+        let cur = std::sync::Arc::new(std::sync::Mutex::new(reading(Some("203.0.113.7"), None)));
+
+        let mk = || {
+            let c = std::sync::Arc::clone(&cur);
+            struct Fwd(std::sync::Arc<std::sync::Mutex<EgressReading>>);
+            #[async_trait::async_trait]
+            impl EgressIpSource for Fwd {
+                fn kind(&self) -> EgressKind {
+                    EgressKind::Wan
+                }
+                async fn current(&self) -> anyhow::Result<EgressReading> {
+                    Ok(self.0.lock().unwrap().clone())
+                }
+            }
+            DdnsWorker::new("eagle")
+                .with_reconciler(spy.clone())
+                .with_state_path(path.clone())
+                .with_sources(vec![Box::new(Fwd(c))])
+        };
+
+        // First-seen → the worker drives the reconciler with the WAN key.
+        mk().tick_once().await;
+        // Address change → drives it again with the new reading.
+        *cur.lock().unwrap() = reading(Some("198.51.100.9"), None);
+        mk().tick_once().await;
+        // Goes offline → drives the reconciler with an empty reading so
+        // the `on_down` policy fires (NOT a silent skip).
+        *cur.lock().unwrap() = reading(None, None);
+        mk().tick_once().await;
+
+        let seen = spy.seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "first-seen + change + down all reconcile");
+        assert_eq!(seen[0].0, "wan");
+        assert_eq!(seen[0].1, reading(Some("203.0.113.7"), None));
+        assert_eq!(seen[1].1, reading(Some("198.51.100.9"), None));
+        assert!(
+            seen[2].1.is_empty(),
+            "the down reading reaches on_down handling"
+        );
+    }
+
+    #[test]
+    fn provider_for_source_strips_tunnel_prefix() {
+        assert_eq!(provider_for_source("tunnel:mullvad-1"), "mullvad-1");
+        assert_eq!(provider_for_source("wan"), "wan");
     }
 }
