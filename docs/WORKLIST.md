@@ -89,9 +89,14 @@ Prefix `DS-#`. Until a DS gate's substrate exists, that §10 gate is *phased-out
   **so that** every push is gated self-hosted (Q35).
   **Acceptance:**
     - [ ] `verify-gates.sh` (PROCESS-1) runs as a Forgejo Actions job to green on a real commit
-- [ ] **DS-5: real-VM multi-node gate (V4)**
+- [>] **DS-5: real-VM multi-node gate (V4)** *(session=bright-ray-ybcd)*
   **As** a maintainer, **I want** mesh features verified on a real 3 LH + 3 peer VM mesh,
-  **so that** multi-node behavior is proven, not mocked (Q37/Q40/Q48).
+  **so that** multi-node behavior is proven, not mocked (Q37/Q40/Q48). — IN PROGRESS
+  (2026-06-21): golden-image pipeline scaffolded (`install-helpers/build-golden-fedora.sh`,
+  shellcheck clean); **Fedora 44 Cloud base image downloaded + integrity-verified** on the
+  control host (`/var/tmp/golden-build/`, 5 GiB virtual / 557 MiB, `qemu-img check` clean).
+  Next: convert→VDI-import→VM-boot→cloud-init seed→Ansible MCNF install (DS-2)→generalize
+  (`build-mde-vm-golden.sh`)→mark `mcnf-golden` template — which unblocks DS-1's full apply.
   **Acceptance:**
     - [ ] a snapshot-reset VM pool spins a 3 LH + 3 peer mesh and runs a mesh acceptance test to green
     - [ ] the release gate spins the full 3 LH + 9 peer envelope from a golden-image rebuild
