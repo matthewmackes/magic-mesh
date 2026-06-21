@@ -224,6 +224,12 @@ struct Center {
     /// entrance collapses to the ≤80 ms crossfade (and the scale channel is
     /// dropped by the shared preset).
     reduce_motion: bool,
+    /// NOTIFY-HUB-2 — the same-source stack keys (`source_label::title`) the
+    /// operator has EXPANDED. A stack of repeats from the same source collapses to
+    /// one card with a count by default; clicking it adds its key here so the
+    /// individual items render, clicking again removes it (collapse). Empty = every
+    /// stack collapsed.
+    expanded: std::collections::HashSet<String>,
 }
 
 /// MOTION-FEEDBACK-3 — the id the Hub's OPEN enter tween is registered under in
@@ -257,6 +263,7 @@ impl Center {
             now_art_id: None,
             anim,
             reduce_motion,
+            expanded: std::collections::HashSet::new(),
         }
     }
 
@@ -277,6 +284,48 @@ impl Center {
             .anim
             .value(id, std::time::Instant::now(), mde_theme::Easing::EaseOut);
         mde_theme::popup::enter_params(t, self.reduce_motion).alpha
+    }
+
+    /// NOTIFY-HUB-2 — the entrance render channels for a fresh alert keyed by `id`:
+    /// the **slide-in-from-the-right** leading padding offset (eased progress) and
+    /// the **2x severity-blink wash alpha** (LINEAR progress, so the two flashes
+    /// are evenly spaced). Both come from the shared `mde_theme::animation::hub`
+    /// math and are neutralized under reduce-motion (slide 0, blink 0 — the item
+    /// appears in place). Once the tween settles (or there is none) both are `0.0`,
+    /// so a row at rest carries no offset/wash.
+    fn enter_slide_blink(&self, id: &str) -> (f32, f32) {
+        let now = std::time::Instant::now();
+        // Eased progress drives the slide (decelerate into place); LINEAR progress
+        // drives the blink so the two crests land at t=0.25 / t=0.75.
+        let eased = self.anim.value(id, now, mde_theme::Easing::EaseOut);
+        let linear = self.anim.value(id, now, mde_theme::Easing::Linear);
+        let slide = mde_theme::animation::hub::slide_in_x(eased, self.reduce_motion);
+        let blink = mde_theme::animation::hub::blink_wash_alpha(linear, self.reduce_motion);
+        (slide, blink)
+    }
+
+    /// NOTIFY-HUB-2 — the settling **push-down** offset (px) the rows BELOW a
+    /// freshly inserted item carry while it enters, so existing items slide down
+    /// into place rather than jumping. Driven by the largest in-flight per-alert
+    /// entrance progress (the most-recently-arrived item), excluding the Hub OPEN
+    /// fade (which is the whole-panel entrance, not a row insert). `0.0` when no
+    /// alert is entering or under reduce-motion (the shared `hub::push_down_px`
+    /// returns 0 for a settled/at-rest progress).
+    fn push_down(&self) -> f32 {
+        let now = std::time::Instant::now();
+        // The newest insert has the SMALLEST eased value (just started). Take the
+        // min eased progress over the in-flight alert tweens → the freshest insert.
+        let lead = self
+            .items
+            .iter()
+            .filter(|it| self.anim.is_animating(&it.id, now))
+            .map(|it| self.anim.value(&it.id, now, mde_theme::Easing::EaseOut))
+            .fold(f32::INFINITY, f32::min);
+        if lead.is_finite() {
+            mde_theme::animation::hub::push_down_px(lead, self.reduce_motion)
+        } else {
+            0.0
+        }
     }
 }
 
@@ -310,6 +359,10 @@ enum Message {
     /// fade + fresh-alert fades). Fired by the idle-gated tick ONLY while a tween
     /// is in flight; it GCs settled tweens so the loop stops at rest.
     OpenTick,
+    /// NOTIFY-HUB-2 — expand/collapse a same-source stack by its key
+    /// (`source_label::title`). A collapsed stack shows one card with an `xN`
+    /// count badge; expanded, it shows the individual items.
+    ToggleStack(String),
 }
 
 /// NOTIFY-AC — fetch the Now-Playing snapshot over the bus (best-effort, short
@@ -661,6 +714,12 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
                 state.collapsed.insert(label);
             }
         }
+        Message::ToggleStack(key) => {
+            // NOTIFY-HUB-2 — flip the expanded state for this same-source stack.
+            if !state.expanded.remove(&key) {
+                state.expanded.insert(key);
+            }
+        }
         Message::MarkAllRead => {
             for it in &mut state.items {
                 it.read = true;
@@ -722,6 +781,74 @@ pub fn group_severity(items: &[AlertItem]) -> Severity {
         .map(|i| i.severity)
         .min()
         .unwrap_or(Severity::Info)
+}
+
+/// NOTIFY-HUB-2 — a same-source **stack**: one or more alerts from the same source
+/// that share a title (e.g. repeated "Backups" notifications) collapsed into one
+/// card. The representative is the newest member (its ULID keys the entrance
+/// animation + the dedup); `count` is how many were folded in. A stack of `1` is
+/// a plain row; `>1` renders one card with an `xN` count badge, expandable.
+#[derive(Debug, Clone)]
+pub struct Stack {
+    /// Stable key for the expanded/collapsed set + the entrance tween lookups:
+    /// `"<source label>::<title>"`. Reuses the alert's existing source + title
+    /// (no invented field).
+    pub key: String,
+    /// The newest member — drives the row's render (severity, age, body) and its
+    /// entrance animation (its `id` is the tween key).
+    pub rep: AlertItem,
+    /// Every member, newest-first (shown when the stack is expanded).
+    pub members: Vec<AlertItem>,
+}
+
+impl Stack {
+    /// How many alerts this stack folds in (`>1` ⇒ render the count badge).
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.members.len()
+    }
+}
+
+/// NOTIFY-HUB-2 — the stable stack key for an alert: its source label + title.
+/// "Source" reuses the alert's existing [`Source`] grouping (its `label()`), title
+/// reuses the existing `title` field — no new field invented. Two alerts collapse
+/// iff they share BOTH (so "Backups completed" and "Backups failed" stay distinct
+/// even from the same source, but three identical "Backups" repeats fold to one).
+#[must_use]
+pub fn stack_key(item: &AlertItem) -> String {
+    format!("{}::{}", item.source.label(), item.title)
+}
+
+/// NOTIFY-HUB-2 — collapse a Source group's items (already newest-first) into
+/// same-source/same-title **stacks**, preserving order by each stack's newest
+/// member. Pure + testable: repeats from the same source fold into one [`Stack`]
+/// with a `count`; distinct titles stay separate. The representative is the newest
+/// member so the card shows the latest age/body and animates on the newest ULID.
+#[must_use]
+pub fn stack_group(group: &[AlertItem]) -> Vec<Stack> {
+    let mut stacks: Vec<Stack> = Vec::new();
+    for it in group {
+        let key = stack_key(it);
+        if let Some(st) = stacks.iter_mut().find(|s| s.key == key) {
+            st.members.push(it.clone());
+            // Keep the newest member as the representative (group is newest-first,
+            // so the first-seen is already newest, but guard against unordered input).
+            if it.ts_unix_ms > st.rep.ts_unix_ms {
+                st.rep = it.clone();
+            }
+        } else {
+            stacks.push(Stack {
+                key,
+                rep: it.clone(),
+                members: vec![it.clone()],
+            });
+        }
+    }
+    // Each stack's members newest-first (the group is already, but be explicit).
+    for st in &mut stacks {
+        st.members.sort_by(|a, b| b.ts_unix_ms.cmp(&a.ts_unix_ms));
+    }
+    stacks
 }
 
 /// One-glyph severity marker.
@@ -838,8 +965,45 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
             });
             body = body.push(head);
             if !collapsed {
-                for (i, item) in group.iter().enumerate() {
-                    body = body.push(alert_row(item, i, now, p, state.enter_alpha(&item.id)));
+                // NOTIFY-HUB-2 — collapse same-source repeats into stacks; a stack
+                // of 1 renders as a plain row, a stack of >1 as one count-badge
+                // card (expandable). `push_down` (rows below a fresh insert slide
+                // down) is computed once per render from the freshest in-flight
+                // entrance and applied to every row/card except the entering one.
+                let push_down = state.push_down();
+                let mut idx = 0usize;
+                for st in stack_group(&group) {
+                    let expanded = state.expanded.contains(&st.key);
+                    // The representative's per-alert entrance (slide-in + 2x blink).
+                    let (slide_x, blink) = state.enter_slide_blink(&st.rep.id);
+                    let rep_entering = slide_x > 0.0 || blink > 0.0;
+                    if st.count() > 1 && !expanded {
+                        // Collapsed stack → one card with the count badge. The card
+                        // itself slides/blinks if its newest member is fresh; if it
+                        // is NOT the entering row it carries the push-down offset.
+                        let enter = Entrance {
+                            alpha: state.enter_alpha(&st.rep.id),
+                            slide_x,
+                            blink,
+                            push_down: if rep_entering { 0.0 } else { push_down },
+                        };
+                        body = body.push(stack_card(&st, idx, now, p, enter));
+                        idx += 1;
+                    } else {
+                        // Singleton or expanded stack → render each member as a row.
+                        for item in &st.members {
+                            let (s_x, blk) = state.enter_slide_blink(&item.id);
+                            let entering = s_x > 0.0 || blk > 0.0;
+                            let enter = Entrance {
+                                alpha: state.enter_alpha(&item.id),
+                                slide_x: s_x,
+                                blink: blk,
+                                push_down: if entering { 0.0 } else { push_down },
+                            };
+                            body = body.push(alert_row(item, idx, now, p, enter));
+                            idx += 1;
+                        }
+                    }
                 }
             }
         }
@@ -1245,13 +1409,43 @@ fn quick_toggle<'a>(label: &'a str, on: bool, msg: Message, p: Palette) -> Eleme
 /// loop-local group). `alpha` is the MOTION-FEEDBACK-3 / NOTIFY-FX-1 popup enter
 /// fade for a freshly-arrived alert (`1.0` once settled) — applied to every colour
 /// so the row fades in with the shared popup vocabulary (the launcher idiom).
+/// NOTIFY-HUB-2 — the entrance render channels a row carries while a fresh alert
+/// is animating in: the popup fade `alpha`, the slide-in-from-the-right leading
+/// `slide_x` padding offset, the 2x severity-blink wash `blink` alpha, and the
+/// `push_down` top offset rows below an insert carry. All are `0` (slide/blink/
+/// push) or `1.0` (alpha) at rest, so a settled row renders flat. Built from the
+/// shared `mde_theme::animation::hub` math (reduce-motion already neutralized).
+#[derive(Clone, Copy)]
+struct Entrance {
+    alpha: f32,
+    slide_x: f32,
+    blink: f32,
+    push_down: f32,
+}
+
+/// NOTIFY-HUB-2 — composite a severity `Rgba` token at `wash_a` over a base
+/// `Rgba`, returning the blended cosmic `Color` (the blink wash). No raw colour is
+/// minted — both inputs are `mde-theme` tokens; this is a straight alpha blend of
+/// two existing tokens, so the §4 single-source lock holds.
+fn blink_blend(base: mde_theme::Rgba, sev: mde_theme::Rgba, wash_a: f32) -> cosmic::iced::Color {
+    let a = wash_a.clamp(0.0, 1.0);
+    let blend = |b: u8, s: u8| (f32::from(b) * (1.0 - a) + f32::from(s) * a) / 255.0;
+    cosmic::iced::Color {
+        r: blend(base.r, sev.r),
+        g: blend(base.g, sev.g),
+        b: blend(base.b, sev.b),
+        a: 1.0,
+    }
+}
+
 fn alert_row(
     item: &AlertItem,
     idx: usize,
     now_ms: i64,
     p: Palette,
-    alpha: f32,
+    enter: Entrance,
 ) -> Element<'static, Message> {
+    let alpha = enter.alpha;
     let fade = move |c: cosmic::iced::Color| cosmic::iced::Color {
         a: c.a * alpha,
         ..c
@@ -1288,11 +1482,116 @@ fn alert_row(
     } else {
         p.background
     };
+    // NOTIFY-HUB-2 — the 2x severity blink: while a fresh alert enters, composite
+    // its severity token over the zebra shade at the bounded blink alpha (crests
+    // twice, then settles to 0 ⇒ flat shade at rest). The slide-in-from-the-right
+    // is a settling LEFT padding offset (transform-style, never a layout reflow of
+    // the siblings); `push_down` is a settling TOP offset so rows below an insert
+    // slide down into place.
+    let sev = severity_token(item.severity, &p);
+    let bg = if enter.blink > 0.0 {
+        cosmic::iced::Background::Color(blink_blend(shade, sev, enter.blink))
+    } else {
+        cosmic::iced::Background::Color(shade.into_cosmic_color())
+    };
+    // Round the transform offsets to whole px (Padding is u16).
+    let left = enter.slide_x.round().clamp(0.0, 64.0) as u16;
+    let top = enter.push_down.round().clamp(0.0, 64.0) as u16;
     container(col)
-        .padding(Padding::from([6u16, 8u16]))
+        // 6px base vertical / 8px base horizontal + the entrance transform offsets
+        // folded into the leading edge (left = slide-in travel, top = push-down).
+        .padding(Padding {
+            top: 6.0 + f32::from(top),
+            right: 8.0,
+            bottom: 6.0,
+            left: 8.0 + f32::from(left),
+        })
         .width(Length::Fill)
         .style(move |_| container::Style {
-            background: Some(cosmic::iced::Background::Color(shade.into_cosmic_color())),
+            background: Some(bg),
+            ..Default::default()
+        })
+        .into()
+}
+
+/// NOTIFY-HUB-2 — a COLLAPSED same-source stack (count > 1): one card showing the
+/// representative's title + an `xN` count badge, pressable to expand. Carries the
+/// same entrance channels as a row (the newest member's slide-in + 2x blink) so a
+/// fresh repeat animates in as one card. Expanding it (the caller renders the
+/// members as rows instead) is handled in `view`.
+fn stack_card(
+    st: &Stack,
+    idx: usize,
+    now_ms: i64,
+    p: Palette,
+    enter: Entrance,
+) -> Element<'static, Message> {
+    let item = &st.rep;
+    let alpha = enter.alpha;
+    let fade = move |c: cosmic::iced::Color| cosmic::iced::Color {
+        a: c.a * alpha,
+        ..c
+    };
+    let sev = severity_token(item.severity, &p);
+    let sev_color = fade(sev.into_cosmic_color());
+    let title_color = fade(if item.read { p.text_muted } else { p.text }.into_cosmic_color());
+    let muted = fade(p.text_muted.into_cosmic_color());
+    let badge_bg = fade(p.raised.into_cosmic_color());
+    let head = row![
+        text(severity_glyph(item.severity))
+            .size(13)
+            .color(sev_color),
+        Space::new().width(Length::Fixed(8.0)),
+        text(item.title.clone()).size(13).color(title_color),
+        Space::new().width(Length::Fixed(8.0)),
+        // The count badge — "xN" of folded repeats, in a muted pill.
+        container(
+            text(format!("\u{00d7}{}", st.count()))
+                .size(11)
+                .color(fade(p.text.into_cosmic_color())),
+        )
+        .padding(Padding::from([1u16, 6u16]))
+        .style(move |_| container::Style {
+            background: Some(cosmic::iced::Background::Color(badge_bg)),
+            border: cosmic::iced::Border {
+                radius: 8.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        Space::new().width(Length::Fill),
+        // Expand caret + the newest member's age.
+        text(format_age(item.ts_unix_ms, now_ms))
+            .size(11)
+            .color(muted),
+        Space::new().width(Length::Fixed(6.0)),
+        text("\u{25b8}").size(11).color(muted), // ▸ expand
+    ]
+    .align_y(cosmic::iced::Alignment::Center);
+    let shade = if idx % 2 == 1 {
+        p.surface
+    } else {
+        p.background
+    };
+    let bg = if enter.blink > 0.0 {
+        cosmic::iced::Background::Color(blink_blend(shade, sev, enter.blink))
+    } else {
+        cosmic::iced::Background::Color(shade.into_cosmic_color())
+    };
+    let left = enter.slide_x.round().clamp(0.0, 64.0) as u16;
+    let top = enter.push_down.round().clamp(0.0, 64.0) as u16;
+    button(head)
+        .on_press(Message::ToggleStack(st.key.clone()))
+        .width(Length::Fill)
+        .padding(Padding {
+            top: 6.0 + f32::from(top),
+            right: 8.0,
+            bottom: 6.0,
+            left: 8.0 + f32::from(left),
+        })
+        .style(move |_t, _s| cosmic::iced::widget::button::Style {
+            background: Some(bg),
+            text_color: p.text.into_cosmic_color(),
             ..Default::default()
         })
         .into()
@@ -1358,5 +1657,79 @@ mod tests {
         assert_eq!(format_age(0, 172_800_000), "2d");
         // Clock skew (future ts) clamps to 0s, never negative.
         assert_eq!(format_age(10_000, 0), "0s");
+    }
+
+    // ── NOTIFY-HUB-2 — same-source stack/collapse data model ──────────────
+
+    fn titled(id: &str, src: Source, title: &str, ts: i64) -> AlertItem {
+        AlertItem {
+            id: id.into(),
+            ts_unix_ms: ts,
+            severity: Severity::Info,
+            source: src,
+            topic: "t".into(),
+            host: None,
+            title: title.into(),
+            body: String::new(),
+            read: false,
+        }
+    }
+
+    #[test]
+    fn stack_key_is_source_label_plus_title() {
+        // The collapse key reuses the alert's EXISTING source label + title (no
+        // invented field), so two alerts collapse iff they share both.
+        let a = titled("a", Source::System, "Backups", 1);
+        assert_eq!(stack_key(&a), "System::Backups");
+        // Same title, different source ⇒ different key (won't collapse together).
+        let b = titled("b", Source::Security, "Backups", 1);
+        assert_ne!(stack_key(&a), stack_key(&b));
+    }
+
+    #[test]
+    fn stack_group_collapses_same_source_repeats_with_a_count() {
+        // Three "Backups" from System fold into ONE stack with count 3; a distinct
+        // title stays its own stack. The representative is the NEWEST member.
+        let group = vec![
+            titled("b3", Source::System, "Backups", 30),
+            titled("b2", Source::System, "Backups", 20),
+            titled("b1", Source::System, "Backups", 10),
+            titled("o1", Source::System, "Other", 25),
+        ];
+        let stacks = stack_group(&group);
+        // First stack (newest rep ts=30) is the Backups x3 collapse.
+        let backups = stacks.iter().find(|s| s.rep.title == "Backups").unwrap();
+        assert_eq!(
+            backups.count(),
+            3,
+            "three repeats fold to one card with count 3"
+        );
+        assert_eq!(backups.rep.id, "b3", "representative is the newest member");
+        assert_eq!(backups.key, "System::Backups");
+        // Members are newest-first.
+        assert_eq!(
+            backups
+                .members
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b3", "b2", "b1"]
+        );
+        // The distinct-title alert is its own singleton stack (renders as a row).
+        let other = stacks.iter().find(|s| s.rep.title == "Other").unwrap();
+        assert_eq!(other.count(), 1);
+    }
+
+    #[test]
+    fn stack_group_singletons_stay_separate() {
+        // Distinct titles never collapse — three different kinds ⇒ three stacks.
+        let group = vec![
+            titled("a", Source::System, "Disk", 3),
+            titled("b", Source::System, "Net", 2),
+            titled("c", Source::System, "Cpu", 1),
+        ];
+        let stacks = stack_group(&group);
+        assert_eq!(stacks.len(), 3);
+        assert!(stacks.iter().all(|s| s.count() == 1));
     }
 }
