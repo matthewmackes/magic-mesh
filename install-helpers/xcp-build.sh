@@ -42,7 +42,18 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-SLOTS_CONF="${MCNF_SLOTS_CONF:-$REPO/.xcp-slots.conf}"
+# Slot registry config: explicit env override, else the repo-root file, else a
+# stable per-user fallback ($HOME/.xcp-slots.conf). The fallback matters for
+# ISOLATED git worktrees (parallel drain agents): a fresh worktree does NOT
+# carry the gitignored repo-root .xcp-slots.conf, so without this it would drop
+# to the stale "main" default below and fail with "no route to host".
+SLOTS_CONF="${MCNF_SLOTS_CONF:-}"
+if [ -z "$SLOTS_CONF" ]; then
+  for _c in "$REPO/.xcp-slots.conf" "$HOME/.xcp-slots.conf"; do
+    [ -f "$_c" ] && { SLOTS_CONF="$_c"; break; }
+  done
+  SLOTS_CONF="${SLOTS_CONF:-$REPO/.xcp-slots.conf}"
+fi
 RESULTS_DIR="$REPO/.xcp-build/results"
 SSH_BASE=(ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o BatchMode=yes)
 log() { echo "==> xcp-build: $*" >&2; }
