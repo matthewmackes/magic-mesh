@@ -387,6 +387,176 @@ pub fn lift_on_hover(t: f32, rise: f32, reduce_motion: bool) -> RenderParams {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// MOTION-FEEDBACK-2 — cards / lists / tables: selection + row-state feedback.
+//
+// Selection and row hover share ONE pure decision (mirroring the FEEDBACK-1
+// `Feedback`/`FeedbackStyle` vocabulary for buttons): a row is `Rest`,
+// `Hover`ed, `Selected`, or `Selected`+hovered, and that maps to a single
+// Carbon accent-wash alpha + an optional accent selection rail. Centralizing
+// it here (pure, toolkit-free) is the whole point — every selectable surface
+// resolves selection identically, and the math is unit-testable without a GUI.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// MOTION-FEEDBACK-2 — the interaction state of a *row/card/cell* in a
+/// selectable list/table/grid, distilled the same way FEEDBACK-1's `Feedback`
+/// distills a button. Selection is a persistent state that composes with the
+/// transient hover (a selected row can also be hovered).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowState {
+    /// Not selected, pointer away.
+    Rest,
+    /// Not selected, pointer over the row.
+    Hover,
+    /// Selected, pointer away.
+    Selected,
+    /// Selected and the pointer is also over it.
+    SelectedHover,
+}
+
+impl RowState {
+    /// Build a row state from the two orthogonal inputs every list view already
+    /// tracks: whether this row is the selected one, and whether it's hovered.
+    #[must_use]
+    pub fn new(selected: bool, hovered: bool) -> Self {
+        match (selected, hovered) {
+            (true, true) => Self::SelectedHover,
+            (true, false) => Self::Selected,
+            (false, true) => Self::Hover,
+            (false, false) => Self::Rest,
+        }
+    }
+
+    /// Is this row selected (in either selected variant)?
+    #[must_use]
+    pub fn is_selected(self) -> bool {
+        matches!(self, Self::Selected | Self::SelectedHover)
+    }
+
+    /// The Carbon accent-wash alpha for this state, picking the matching
+    /// `Palette` tint token's alpha so the row wash mirrors the palette:
+    /// rest 0.0, hover [`Palette::hover_tint`] (0.08), selected
+    /// [`Palette::selected_tint`] (0.16), selected+hover
+    /// [`Palette::selected_hover_tint`] (0.20). The caller composites the accent
+    /// at this alpha over the row's base background.
+    #[must_use]
+    pub fn wash_alpha(self) -> f32 {
+        match self {
+            Self::Rest => 0.0,
+            Self::Hover => 0.08,
+            Self::Selected => 0.16,
+            Self::SelectedHover => 0.20,
+        }
+    }
+}
+
+/// MOTION-FEEDBACK-2 — the resolved visual deltas for a selectable row: the
+/// Carbon accent-wash alpha laid over the row background, and the width (px) of
+/// the leading accent selection rail (Carbon's selected-row indicator). Pure
+/// data — list/table builders fold it into their themed `container::Style`, so
+/// every selectable surface paints selection the same way.
+///
+/// Reduce-motion does not change the *state* read (the wash + rail still flip on
+/// selection — selection is information, not decoration); the FEEDBACK-2
+/// movement that reduce-motion collapses is the staggered *reveal* (see
+/// [`stagger`]) and the selection-slide *animation*, not this resting style.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RowStyle {
+    /// Alpha of the Carbon accent wash over the row's base background
+    /// (`0.0` at rest). From [`RowState::wash_alpha`].
+    pub wash_alpha: f32,
+    /// Width in px of the leading accent selection rail; `0.0` when unselected.
+    /// Carbon marks a selected row with a 2 px accent bar on its leading edge.
+    pub rail_px: f32,
+}
+
+/// MOTION-FEEDBACK-2 — width (px) of the accent selection rail Carbon draws on a
+/// selected row's leading edge. Matches the FEEDBACK-1 focus-ring width so the
+/// shell's accent indicators read at one consistent weight.
+pub const SELECTION_RAIL_PX: f32 = 2.0;
+
+impl RowStyle {
+    /// Resolve the resting selection/row style for `state`.
+    #[must_use]
+    pub fn resolve(state: RowState) -> Self {
+        Self {
+            wash_alpha: state.wash_alpha(),
+            rail_px: if state.is_selected() {
+                SELECTION_RAIL_PX
+            } else {
+                0.0
+            },
+        }
+    }
+}
+
+/// MOTION-FEEDBACK-2 — staggered list/table reveal timing. Pure math over the
+/// existing `mde-theme::motion::list` tokens (`STAGGER_STEP_MS`, `STAGGER_CAP`,
+/// `STAGGER_REVEAL_MS`): item `i` starts revealing after a capped per-item
+/// delay and fades/slides in over `STAGGER_REVEAL_MS`, so a freshly-loaded list
+/// cascades in rather than snapping. Capped at `STAGGER_CAP` items so a long
+/// list never crawls, and the whole cascade is bounded ≤500 ms.
+///
+/// Consumers feed each row's eased reveal `progress` into the INFRA-2
+/// [`slide_in`]/[`fade_in`] helpers (opacity/transform only). Under
+/// reduce-motion the stagger collapses (every row reveals at once, progress
+/// `1.0`) per the Q32 contract — selection still works, the cascade does not.
+pub mod stagger {
+    use crate::motion::list::{STAGGER_CAP, STAGGER_REVEAL_MS, STAGGER_STEP_MS};
+
+    /// The start delay (ms) before row `index` begins its reveal. Capped at
+    /// `STAGGER_CAP - 1` steps so rows at/after the cap all start together — the
+    /// tail of a long list reveals as one block instead of crawling. With the
+    /// default tokens (step 20 ms, cap 8) the last per-item delay is 140 ms.
+    #[must_use]
+    pub fn delay_ms(index: usize) -> u32 {
+        let capped = index.min(STAGGER_CAP.saturating_sub(1));
+        (capped as u32) * STAGGER_STEP_MS
+    }
+
+    /// Total wall-clock span (ms) of the whole cascade: the last-starting row's
+    /// delay plus one reveal duration. This is what the consumer's tick must run
+    /// for; the design caps it ≤500 ms (asserted in tests).
+    #[must_use]
+    pub fn total_ms() -> u32 {
+        delay_ms(STAGGER_CAP.saturating_sub(1)) + STAGGER_REVEAL_MS
+    }
+
+    /// Linear reveal progress `0.0..=1.0` for row `index` at `elapsed_ms` since
+    /// the cascade began. `0.0` before the row's delay, ramping to `1.0` over
+    /// `STAGGER_REVEAL_MS`. Under `reduce_motion` every row is fully revealed
+    /// immediately (`1.0`) — the cascade collapses but the content still appears.
+    ///
+    /// The returned value is *linear*; the consumer eases it (e.g.
+    /// [`crate::animation::ease`] with `EaseOut`) before feeding
+    /// [`crate::animation::slide_in`]/[`fade_in`].
+    #[must_use]
+    pub fn reveal_progress(index: usize, elapsed_ms: u32, reduce_motion: bool) -> f32 {
+        if reduce_motion {
+            return 1.0;
+        }
+        let start = delay_ms(index);
+        if elapsed_ms <= start {
+            return 0.0;
+        }
+        let into = elapsed_ms - start;
+        if into >= STAGGER_REVEAL_MS {
+            1.0
+        } else {
+            into as f32 / STAGGER_REVEAL_MS as f32
+        }
+    }
+
+    /// Whether the cascade is still animating at `elapsed_ms` (some row hasn't
+    /// finished revealing). The consumer gates its reveal tick on this so the
+    /// subscription stops the instant the last row settles — no idle animation
+    /// (MOTION-PERF-1). Always `false` under `reduce_motion` (nothing animates).
+    #[must_use]
+    pub fn is_animating(elapsed_ms: u32, reduce_motion: bool) -> bool {
+        !reduce_motion && elapsed_ms < total_ms()
+    }
+}
+
 /// MOTION-INFRA-1 — a tiny animation registry. Holds the active tweens keyed by
 /// a caller id and is advanced by ONE subscription tick, so N concurrent
 /// animations across a surface share a single timer instead of each arming its
@@ -845,5 +1015,121 @@ mod tests {
             cap_ms, 180,
             "reduce_motion=false must preserve standard duration"
         );
+    }
+
+    // ── MOTION-FEEDBACK-2 — selection / row-state math ────────────────────
+
+    #[test]
+    fn row_state_composes_selection_and_hover() {
+        // The two orthogonal inputs every list view tracks → the four states.
+        assert_eq!(RowState::new(false, false), RowState::Rest);
+        assert_eq!(RowState::new(false, true), RowState::Hover);
+        assert_eq!(RowState::new(true, false), RowState::Selected);
+        assert_eq!(RowState::new(true, true), RowState::SelectedHover);
+        // is_selected tracks the selection axis regardless of hover.
+        assert!(!RowState::Rest.is_selected());
+        assert!(!RowState::Hover.is_selected());
+        assert!(RowState::Selected.is_selected());
+        assert!(RowState::SelectedHover.is_selected());
+    }
+
+    #[test]
+    fn row_wash_alpha_ramps_with_state_and_mirrors_palette_tokens() {
+        // Rest never washes; the ramp strictly increases hover < selected <
+        // selected+hover, mirroring the Palette tint-token alphas so the row
+        // wash matches the §4 single-source tokens.
+        let p = crate::Palette::dark();
+        assert_eq!(RowState::Rest.wash_alpha(), 0.0);
+        assert!((RowState::Hover.wash_alpha() - p.hover_tint().a).abs() < 1e-6);
+        assert!((RowState::Selected.wash_alpha() - p.selected_tint().a).abs() < 1e-6);
+        assert!((RowState::SelectedHover.wash_alpha() - p.selected_hover_tint().a).abs() < 1e-6);
+        assert!(RowState::Hover.wash_alpha() < RowState::Selected.wash_alpha());
+        assert!(RowState::Selected.wash_alpha() < RowState::SelectedHover.wash_alpha());
+    }
+
+    #[test]
+    fn row_style_draws_rail_only_when_selected() {
+        // The accent selection rail appears iff the row is selected, at the
+        // shared SELECTION_RAIL_PX weight; the wash tracks RowState::wash_alpha.
+        for st in [RowState::Rest, RowState::Hover] {
+            let s = RowStyle::resolve(st);
+            assert_eq!(s.rail_px, 0.0, "unselected ⇒ no rail");
+            assert_eq!(s.wash_alpha, st.wash_alpha());
+        }
+        for st in [RowState::Selected, RowState::SelectedHover] {
+            let s = RowStyle::resolve(st);
+            assert!((s.rail_px - SELECTION_RAIL_PX).abs() < f32::EPSILON);
+            assert_eq!(s.wash_alpha, st.wash_alpha());
+        }
+    }
+
+    // ── MOTION-FEEDBACK-2 — staggered reveal timing ───────────────────────
+
+    #[test]
+    fn stagger_delay_steps_then_caps() {
+        use crate::motion::list::{STAGGER_CAP, STAGGER_STEP_MS};
+        // Item i is delayed i*step until the cap, then every later item shares
+        // the cap delay (the tail reveals as one block, no crawl).
+        assert_eq!(stagger::delay_ms(0), 0);
+        assert_eq!(stagger::delay_ms(1), STAGGER_STEP_MS);
+        assert_eq!(stagger::delay_ms(3), 3 * STAGGER_STEP_MS);
+        let cap_delay = (STAGGER_CAP as u32 - 1) * STAGGER_STEP_MS;
+        assert_eq!(stagger::delay_ms(STAGGER_CAP - 1), cap_delay);
+        // At and beyond the cap: clamped, never larger.
+        assert_eq!(stagger::delay_ms(STAGGER_CAP), cap_delay);
+        assert_eq!(stagger::delay_ms(10_000), cap_delay);
+    }
+
+    #[test]
+    fn stagger_total_is_bounded_under_500ms() {
+        use crate::motion::list::STAGGER_REVEAL_MS;
+        // The whole cascade = last delay + one reveal, and the design caps it at
+        // ≤500 ms so even the worst case never feels slow.
+        let total = stagger::total_ms();
+        assert_eq!(total, stagger::delay_ms(usize::MAX) + STAGGER_REVEAL_MS);
+        assert!(total <= 500, "cascade must be ≤500ms, got {total}");
+        // Default tokens: 140ms last delay + 120ms reveal = 260ms.
+        assert_eq!(total, 260);
+    }
+
+    #[test]
+    fn stagger_reveal_progress_ramps_per_row_and_collapses_under_reduce_motion() {
+        use crate::motion::list::STAGGER_REVEAL_MS;
+        // Row 0 starts immediately; row 2 waits for its delay before ramping.
+        assert_eq!(stagger::reveal_progress(0, 0, false), 0.0);
+        assert_eq!(
+            stagger::reveal_progress(0, STAGGER_REVEAL_MS, false),
+            1.0,
+            "row 0 fully revealed after one reveal duration"
+        );
+        // Row 2 (delay 40ms) hasn't started at 40ms, is partway at +half reveal.
+        let d2 = stagger::delay_ms(2);
+        assert_eq!(stagger::reveal_progress(2, d2, false), 0.0);
+        let mid = d2 + STAGGER_REVEAL_MS / 2;
+        let p = stagger::reveal_progress(2, mid, false);
+        assert!(p > 0.0 && p < 1.0, "row 2 mid-reveal, got {p}");
+        assert!((p - 0.5).abs() < 0.05, "linear half-way ≈ 0.5, got {p}");
+        // Past its window: fully revealed.
+        assert_eq!(
+            stagger::reveal_progress(2, d2 + STAGGER_REVEAL_MS, false),
+            1.0
+        );
+        // Reduce-motion collapses the cascade: every row instantly at 1.0.
+        assert_eq!(stagger::reveal_progress(0, 0, true), 1.0);
+        assert_eq!(stagger::reveal_progress(99, 0, true), 1.0);
+    }
+
+    #[test]
+    fn stagger_is_animating_stops_at_total_and_is_inert_under_reduce_motion() {
+        // The reveal tick must run until the last row settles, then stop (no
+        // idle animation — MOTION-PERF-1).
+        assert!(stagger::is_animating(0, false));
+        assert!(stagger::is_animating(stagger::total_ms() - 1, false));
+        assert!(
+            !stagger::is_animating(stagger::total_ms(), false),
+            "cascade done ⇒ tick stops"
+        );
+        // Reduce-motion never schedules a reveal tick.
+        assert!(!stagger::is_animating(0, true));
     }
 }

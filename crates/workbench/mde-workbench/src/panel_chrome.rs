@@ -255,6 +255,171 @@ pub fn card<'a, Message: 'a>(
         .into()
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// MOTION-FEEDBACK-2 — cards / lists / tables: selection + row-state + staggered
+// reveal.
+//
+// The shared selectable surface every list/table/card panel renders rows
+// through, so selection + row hover read identically everywhere. The visual
+// decision is the pure `mde_theme::RowState`/`RowStyle` math (the FEEDBACK-1
+// vocabulary, extended for selection); this module is just the iced glue that
+// paints it (the Carbon -selected/-hover wash + the accent selection rail) and
+// wraps a freshly-loaded list in a capped staggered reveal driven by the
+// existing `motion::list` tokens + the INFRA-2 slide/fade helpers.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// MOTION-FEEDBACK-2 — a selectable card/row. Renders `body` in a clickable
+/// surface that washes with the Carbon `-selected`/`-hover` accent tint (from
+/// [`RowState`]/[`RowStyle`](mde_theme::RowStyle)) and draws the accent
+/// selection rail on its leading edge when `selected`. Pointer hover/press
+/// compose with the persistent selection (a selected row still gives hover
+/// feedback). Single source so every list/table/grid paints selection the same.
+///
+/// `on_select` fires on click. Selection is *information*, so the wash + rail
+/// flip regardless of reduce-motion — the FEEDBACK-2 motion that reduce-motion
+/// collapses is the staggered *reveal* ([`staggered_reveal`]), not this resting
+/// selection style.
+pub fn selectable_card<'a, Message: Clone + 'a>(
+    body: Element<'a, Message>,
+    selected: bool,
+    on_select: Message,
+    palette: Palette,
+    density: Density,
+) -> Element<'a, Message> {
+    use mde_theme::{RowState, RowStyle, SELECTION_RAIL_PX};
+    let radii = Radii::defaults();
+    let space = MdeSpace::for_density(density);
+    let accent = palette.accent.into_cosmic_color();
+    let base_bg = palette.surface.into_cosmic_color();
+    let base_border = palette.border.into_cosmic_color();
+    let text_color = palette.text.into_cosmic_color();
+
+    // One styling closure for every interaction status (the same pattern
+    // `variant_button` uses via `.sty`): map the toolkit status + the panel's
+    // `selected` flag into the pure `RowState`, then paint the Carbon
+    // -selected/-hover wash + the accent selection rail it resolves to.
+    let style = move |_theme: &cosmic::Theme, status: ButtonStatus| {
+        let hovered = matches!(status, ButtonStatus::Hovered | ButtonStatus::Pressed);
+        let state = RowState::new(selected, hovered);
+        let fx = RowStyle::resolve(state);
+        // Composite the accent wash over the card's base surface at the
+        // RowStyle alpha (the §4 Carbon -selected/-hover tint). At rest the
+        // base surface is returned unchanged.
+        let bg = wash(base_bg, accent, fx.wash_alpha);
+        // Carbon's selected-row indicator is a leading accent bar. The iced
+        // 0.13 fork has no per-side border, so a selected card reads as
+        // accent-outlined at the rail weight (the same width the focus ring
+        // uses); a hovered-but-unselected row gets a 1 px accent hint.
+        let (border_color, border_width) = if fx.rail_px > 0.0 {
+            (accent, SELECTION_RAIL_PX)
+        } else if hovered {
+            (accent, 1.0)
+        } else {
+            (base_border, 1.0)
+        };
+        button::Style {
+            snap: false,
+            background: Some(Background::Color(bg)),
+            text_color,
+            border: Border {
+                color: border_color,
+                width: border_width,
+                radius: f32::from(radii.md).into(),
+            },
+            shadow: mde_shadow_to_iced(if selected {
+                MdeShadow::lift()
+            } else {
+                MdeShadow::none()
+            }),
+            ..button::Style::default()
+        }
+    };
+
+    button(body)
+        .width(Length::Fill)
+        .padding(Padding {
+            top: f32::from(space.md),
+            right: f32::from(space.lg),
+            bottom: f32::from(space.md),
+            left: f32::from(space.lg),
+        })
+        .on_press(on_select)
+        .sty(style)
+        .into()
+}
+
+/// MOTION-FEEDBACK-2 — composite an accent `wash` over `base` at `alpha` (the
+/// Carbon -selected/-hover row tint). At `alpha == 0.0` the base is returned
+/// untouched. Alpha-composites so a transparent base still shows the wash.
+fn wash(base: Color, accent: Color, alpha: f32) -> Color {
+    if alpha <= f32::EPSILON {
+        return base;
+    }
+    let over = |b: f32, w: f32| w * alpha + b * (1.0 - alpha);
+    Color {
+        r: over(base.r, accent.r),
+        g: over(base.g, accent.g),
+        b: over(base.b, accent.b),
+        a: base.a.max(alpha),
+    }
+}
+
+/// MOTION-FEEDBACK-2 — wrap a list/table row `body` in a capped staggered reveal
+/// for a freshly-loaded list: row `index` slides up into place over its share of
+/// the cascade, driven purely by the `mde_theme::stagger` timing math over the
+/// `motion::list` tokens and the INFRA-2 [`slide_in`](mde_theme::slide_in)
+/// helper. `elapsed_ms` is the wall-clock time since the cascade began.
+///
+/// The slide is a transform-only top-padding offset that shrinks to `0` as the
+/// row settles; a matching bottom-padding compensator keeps the wrapper's total
+/// height constant across the whole reveal, so the slide is a pure transform and
+/// siblings never reflow (acceptance: no layout thrash). The iced 0.13 libcosmic
+/// fork has no per-element opacity widget — so, exactly as FEEDBACK-1 expressed
+/// its hover lift as a Carbon shadow rather than a transform, FEEDBACK-2's
+/// reveal renders the INFRA-2 `slide_in` as the transform channel only (the
+/// fade channel is unavailable in the fork and is *recorded as deferred* until
+/// the 0.14 opacity widget lands). Under `reduce_motion` the cascade collapses
+/// (every row at full reveal immediately, no offset) per the Q32 contract.
+pub fn staggered_reveal<'a, Message: 'a>(
+    body: Element<'a, Message>,
+    index: usize,
+    elapsed_ms: u32,
+    reduce_motion: bool,
+) -> Element<'a, Message> {
+    use mde_theme::{ease, slide_in, stagger, Easing};
+
+    // Eased reveal progress for this row (linear → ease-out so rows decelerate
+    // into place, matching the shell's standard enter curve).
+    let linear = stagger::reveal_progress(index, elapsed_ms, reduce_motion);
+    if linear >= 1.0 {
+        // Settled (or reduce-motion): render the row at rest, no wrapper cost.
+        return body;
+    }
+    let t = ease(linear, Easing::EaseOut);
+    // INFRA-2 slide_in: slide up from `REVEAL_SLIDE_PX` below toward rest. The
+    // returned `translate_y` is the remaining offset (px below rest).
+    let slide = slide_in(t, REVEAL_SLIDE_PX, reduce_motion)
+        .translate_y
+        .clamp(0.0, REVEAL_SLIDE_PX);
+
+    container(body)
+        .width(Length::Fill)
+        // Transform-only: top offset shrinks 8→0 as the row arrives; the bottom
+        // compensator holds the wrapper height fixed so no sibling reflows.
+        .padding(Padding {
+            top: slide,
+            right: 0.0,
+            bottom: REVEAL_SLIDE_PX - slide,
+            left: 0.0,
+        })
+        .into()
+}
+
+/// MOTION-FEEDBACK-2 — the slide distance (px) a row travels up during its
+/// staggered reveal. A short rise (Carbon micro-interaction scale) so the
+/// cascade reads as a gentle settle, never a long fly-in.
+pub const REVEAL_SLIDE_PX: f32 = 8.0;
+
 /// EFF-45 — error-state renderer: the load-FAILED counterpart to
 /// [`empty_state`], so a panel whose data source errored never
 /// masquerades as "nothing to show yet". Same layout family
@@ -1140,5 +1305,63 @@ mod tests {
         ] {
             let _: Element<'_, ()> = load_state_pill(&s, palette);
         }
+    }
+
+    // ── MOTION-FEEDBACK-2 — selection wash + staggered reveal glue ─────────
+
+    #[test]
+    fn wash_is_identity_at_zero_and_pulls_toward_accent() {
+        // The selection wash leaves the base untouched at alpha 0, and shifts it
+        // toward the accent as alpha grows (a selected row reads as accent-fill).
+        let base = palette_surface();
+        let accent = palette_accent();
+        assert_eq!(wash(base, accent, 0.0), base);
+        let hover = wash(base, accent, 0.08);
+        let selected = wash(base, accent, 0.16);
+        // Stronger alpha ⇒ closer to the accent (blue channel rises toward it).
+        let toward = |c: Color| (c.b - accent.b).abs();
+        assert!(
+            toward(selected) < toward(hover),
+            "deeper wash sits closer to the accent"
+        );
+    }
+
+    #[test]
+    fn wash_reveals_over_a_transparent_base() {
+        // A transparent row base must still show the wash (alpha rises to the
+        // wash alpha) — ghost rows get selection feedback too.
+        let accent = palette_accent();
+        let w = wash(Color::TRANSPARENT, accent, 0.16);
+        assert!((w.a - 0.16).abs() < 1e-6);
+    }
+
+    #[test]
+    fn selectable_card_constructs_selected_and_unselected() {
+        let palette = crate::live_theme::palette();
+        let density = Density::Comfortable;
+        let _sel: Element<'_, ()> = selectable_card(text("a").into(), true, (), palette, density);
+        let _unsel: Element<'_, ()> =
+            selectable_card(text("b").into(), false, (), palette, density);
+    }
+
+    #[test]
+    fn staggered_reveal_passes_through_when_settled_and_wraps_mid_reveal() {
+        use mde_theme::stagger;
+        // Past the cascade (or under reduce-motion) the row is returned at rest;
+        // mid-reveal it's wrapped with the slide offset. Both must construct.
+        let settled: Element<'_, ()> =
+            staggered_reveal(text("x").into(), 0, stagger::total_ms(), false);
+        let _ = settled;
+        let mid: Element<'_, ()> = staggered_reveal(text("y").into(), 3, 10, false);
+        let _ = mid;
+        let reduced: Element<'_, ()> = staggered_reveal(text("z").into(), 3, 0, true);
+        let _ = reduced;
+    }
+
+    fn palette_surface() -> Color {
+        crate::live_theme::palette().surface.into_cosmic_color()
+    }
+    fn palette_accent() -> Color {
+        crate::live_theme::palette().accent.into_cosmic_color()
     }
 }

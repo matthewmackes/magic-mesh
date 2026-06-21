@@ -620,6 +620,13 @@ impl App {
         if self.view.panel_slug() == Some("fleet_rollup") && self.fleet_rollup.skeleton_visible() {
             subs.push(fleet_rollup_panel::FleetRollupPanel::shimmer_subscription());
         }
+        // MOTION-FEEDBACK-2 — the role-card staggered reveal ticks ONLY while the
+        // Fleet rollup is active AND the cascade is still in flight (a fresh load
+        // settling in). Once every card has revealed the loop stops (no idle
+        // animation — MOTION-PERF-1); reduce-motion never schedules it.
+        if self.view.panel_slug() == Some("fleet_rollup") && self.fleet_rollup.revealing() {
+            subs.push(fleet_rollup_panel::FleetRollupPanel::reveal_subscription());
+        }
         // PD-8 (L14) / PLANES-1 — Netdata sampling only while the Peers
         // directory is the active view (the Compute pattern). The Front
         // Door is reachable as the Peers plane root/panel or the
