@@ -59,12 +59,18 @@ infra-dependent §10 gates need. Airgapped dev, full machine control (Q31): one 
 host + two XCP-ng hosts (100% usable). Design: `docs/design/process-governance.md`.
 Prefix `DS-#`. Until a DS gate's substrate exists, that §10 gate is *phased-out* (rollout lock).
 
-- [ ] **DS-1: IaC VM lifecycle (OpenTofu + Xen Orchestra)**
+- [>] **DS-1: IaC VM lifecycle (OpenTofu + Xen Orchestra)** *(session=bright-ray-ybcd)*
   **As** the operator, **I want** VMs declared as code on the two XCP-ng hosts, **so that**
-  the test fleet is reproducible spin-up/teardown (Q33).
+  the test fleet is reproducible spin-up/teardown (Q33). — IN PROGRESS (2026-06-21): XO CE
+  stood up in podman on the control host (`install-helpers/xo-up.sh`); both pools
+  (XEN-HOME-SERVICES + KVM-XCP1) status=connected; `infra/tofu/` committed, `tofu validate`
+  clean, `tofu plan` authenticates to live XO and resolves the real KVM-XCP1 pool/network/SR
+  (3LH+3p plan computes). Remaining for `[✓]`: a full `apply`+`destroy`, blocked only on the
+  **DS-5 golden template** (`mcnf-golden`) — that's the next unblocker.
   **Acceptance:**
-    - [ ] `tofu apply` provisions a named VM on XCP-ng via the Xen Orchestra provider; `tofu destroy` removes it
-    - [ ] VM definitions live in-repo and `tofu validate`/`fmt` clean
+    - [✓] VM definitions live in-repo and `tofu validate`/`fmt` clean
+    - [✓] provider authenticates to XO; real pool/network/SR resolve via `tofu plan`
+    - [ ] `tofu apply` provisions named VMs and `tofu destroy` removes them (needs DS-5)
 - [ ] **DS-2: Ansible node configuration**
   **As** the operator, **I want** provisioned VMs configured by Ansible, **so that** a node
   reaches a known-good mesh state declaratively (Q33, D-W1).
