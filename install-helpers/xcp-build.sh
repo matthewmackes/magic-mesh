@@ -117,7 +117,7 @@ gate_cmd() {
   case "$1" in
     fmt)       echo "cargo fmt --all --check";;
     clippy)    echo "cargo clippy --all-targets";;
-    test)      echo "cargo test --workspace";;
+    test)      echo "cargo test --workspace --exclude mackesd && cargo test -p mackesd -- --test-threads=1";;
     check)     echo "cargo check --workspace";;
     build)     echo "cargo build --workspace";;
     boundary)  echo "./install-helpers/lint-mesh-boundary.sh";;
