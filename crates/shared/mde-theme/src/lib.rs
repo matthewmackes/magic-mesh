@@ -59,7 +59,10 @@ pub mod theme;
 pub mod typography;
 
 pub use accessibility::A11y;
-pub use animation::{ease, lerp_f32, pulse_scale, LoopingTween, Tween};
+pub use animation::{
+    crossfade, ease, fade_in, fade_out, lerp_f32, lift_on_hover, pulse_scale, slide_in, Animator,
+    Crossfade, LoopingTween, RenderParams, Transition, Tween,
+};
 pub use brand::{Brand, BrandAsset, BrandFormat, BrandSlot, BrandSource};
 pub use color::Rgba;
 pub use components::{
