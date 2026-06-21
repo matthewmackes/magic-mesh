@@ -929,6 +929,48 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
   **REVISION (2026-06-19, from the XCP-5 onboarding test):** the `HostTarget::Local`-on-dom0 path is **not viable** — mackesd cannot run on the CentOS-7 dom0 (glibc 2.17, see XCP-5 B1 correction). `xcp_host` must run on a **designated Server node (or the leader)** driving the dom0 via `HostTarget::Ssh` over the overlay, not locally on dom0. Rework: keep the dom0-marker self-gate for the rare F-based hypervisor, but the primary path is SSH-from-a-mesh-node; the `xcp_host` worker takes a host list (the onboarded dom0 overlay IPs) and polls each via `XeSsh`.
 - [ ] **XCP-7: XAPI creds as a mesh secret** — encrypted `<QNM-Shared>/secrets/xcp/<host>.age`, leader-managed; never in `ps`/logs. **Acceptance:** any authorized node drives any enrolled host; creds absent from process listing.
 
+### XCP-DOM0-PEER — dom0 as a full mesh peer + native XAPI provisioning (design: docs/design/xcp-dom0-peer.md; survey locked 2026-06-20)
+> Supersedes the XCP-5/6 "dom0 = overlay-only, mackesd can't run on dom0" limit: a purpose-built static (musl) agent runs ON the el7 dom0 (network + monitoring + alerting + provisioning), shipped as an RPM the Workbench installs remotely. The Provisioning tab re-backs on a native rustls XAPI client; xo-server runs as a complementary mesh service.
+
+- [ ] **XCP-8: `mde-xcp-agent` — the static dom0 peer agent.**
+  **As** an operator, **I want** a minimal static agent running on an xcp-ng dom0, **so that** the dom0 is a full mesh peer despite its el7/glibc-2.17 lockdown.
+  **Acceptance** (each runtime-observable):
+    - [ ] new `crates/mesh/mde-xcp-agent` builds `x86_64-unknown-linux-musl` as a fully static binary (`ldd` → "not a dynamic executable")
+    - [ ] runs on a CentOS-7 dom0 (no glibc dep); reuses XCP-5's proven static-nebula method for the network half
+    - [ ] no dependency on mackesd/lizardfs Fedora binaries; talks the mesh over the overlay
+    - [ ] unit-tested pure cores (capacity/health/alert/verb parsing); `cargo build -p mde-xcp-agent --target x86_64-unknown-linux-musl` green
+- [ ] **XCP-9: el7 RPM + remote install from the Workbench.**
+  **As** an operator, **I want** to install the dom0 agent on a host with one Workbench action, **so that** onboarding a hypervisor is one click, not a manual SSH dance.
+  **Acceptance:**
+    - [ ] `packaging/xcp-agent/` builds an el7 RPM bundling the musl agent + static nebula + systemd units (file-drop + scriptlets, no compiled el7 deps)
+    - [ ] `install-helpers/xcp-agent-install.sh` (and a `mackesd`/Workbench verb) push the `.rpm` over Nebula+SSH and run `rpm -Uvh` + enable the units
+    - [ ] a dom0 with the RPM installed appears in the mesh **directory** as a peer with role/capability tags
+    - [ ] the agent re-asserts after a dom0 reboot (units enabled, boot-durable)
+- [ ] **XCP-10: native rustls XAPI backend (`mackes-xcp::Xapi`).**
+  **As** the platform, **I want** to drive xcp-ng hosts via native XAPI over rustls, **so that** provisioning is fast + OpenSSL-free (§3) with no `xe` subprocess in the hot path.
+  **Acceptance:**
+    - [ ] `mackes-xcp` gains a `Xapi` impl of `Hypervisor`: rustls session login (shared service account) + VM/host/pool/SR/network calls to host `:443`
+    - [ ] unit-tested request/response codec; a live VM list+clone+start against a host via XAPI (no `xe`)
+    - [ ] `XeSsh` retained only for first-contact bootstrap + the agent-install push
+- [ ] **XCP-11: Provisioning tab — full XAPI ops.**
+  **As** an operator, **I want** the Provisioning tab to manage the XCP fleet at scale, **so that** I run VM/host/SR/network lifecycle from the Workbench.
+  **Acceptance:**
+    - [ ] the Workbench Provisioning-plane panel performs VM lifecycle (create/clone/snapshot/start/stop/migrate/destroy) + host/pool view + SR + network ops via the `Xapi` backend
+    - [ ] `action/provision/*` routes over XAPI; live ops succeed against a test host
+    - [ ] Carbon tokens only (§4); no raw hex/off-scale; `cargo test -p mde-workbench` green
+- [ ] **XCP-12: xo-server mesh service + shared service-account secret.**
+  **As** an operator, **I want** Xen Orchestra available as a mesh service, **so that** heavyweight ops (backups/replication/console) exist without reimplementing them.
+  **Acceptance:**
+    - [ ] `install-helpers/setup-xo-server.sh` deploys community `xo-server` on a lighthouse (container/VM) reachable over the overlay
+    - [ ] a shared XAPI/XO service credential lives encrypted on the mesh secret plane (leader-managed, XCP-7 pattern); absent from `ps`/logs
+    - [ ] the native backend (XCP-10) + XO both authenticate with the shared account
+- [ ] **XCP-13: nested-virt xcp-ng test harness.**
+  **As** a developer, **I want** a disposable xcp-ng "dom0" in a VM, **so that** I test the dom0 RPM + agent without risking a production host.
+  **Acceptance:**
+    - [ ] a documented/scripted nested-virt xcp-ng VM (real xcp-ng ISO install, nested virtualization on) stands up as a fake dom0 on a build slot
+    - [ ] the full XCP-8..11 flow (install RPM → peer in directory → health in rollup → forced-alert → Workbench provision verb spawns a VM) verified end-to-end on it
+    - [ ] destroy/recreate is a single command; production hosts untouched
+
 ## LIGHTHOUSE — Hero focus on lighthouses (design: docs/design/lighthouse-hero.md; 25-Q survey locked 2026-06-18)
 - [✓] **LIGHTHOUSE-1: `mde-theme` — Carbon Green 50 beacon token.** DONE 2026-06-18: added a dedicated `Palette::beacon_healthy` semantic field (= `carbon::GREEN_50`, #24a148) across all three themes + the `beacon_healthy_is_carbon_green_50` palette test. Kept distinct from `success` so the beacon reads its own named token (a later `success` change can't silently alter the beacon, Q13); unhealthy reads `danger` (Q14).
 - [✓] **LIGHTHOUSE-2: shared lighthouse discovery + health helper.** DONE 2026-06-18: new `mackes_mesh_types::lighthouse` module — `is_lighthouse`/`lighthouse_records` (filter `role == "lighthouse"` from the replicated peer directory, Q1), a pure binary `classify(has_data, online, overlay_up, is_master, master_service_up)` (Q3/Q15), `beacon_for`/`beacons`/`health_counts` adapters over `PeerRecord` (+now_ms for determinism). Added `role: Option<String>` to `PeerRecord`, stamped by the telemetry heartbeat from the pinned `mde_role`. 10 unit tests over healthy/offline/overlay-down/master-SPOF/no-data/counts.
