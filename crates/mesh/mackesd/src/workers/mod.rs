@@ -417,6 +417,14 @@ pub mod clipd_supervisor;
 // ~/.cache/mde/peer-cap.json every 30 s; publishes to
 // mesh/peer-cap/updated Bus topic for real-time UI consumers.
 pub mod peer_cap;
+// VPN-GW-1 — the vpn_gateway tunnel engine. Reconciles the per-node VPN
+// tunnel config (mackes_mesh_types::vpn) to running interfaces: on a 60s
+// tick it brings up any configured wg/ovpn tunnel whose mvpn-<id> interface
+// is down, via the pure wg-quick/openvpn argv builders. This is what makes a
+// configured tunnel survive a daemon restart. Idles gracefully when neither
+// wg-quick nor openvpn is present. The action/vpn/* on-demand CRUD lives in
+// ipc::vpn_gw.
+pub mod vpn_gateway;
 
 /// Every worker registered with the supervisor implements this
 /// trait. The trait is `async_trait` because the supervisor stores

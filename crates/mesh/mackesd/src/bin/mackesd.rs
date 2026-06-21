@@ -5668,6 +5668,20 @@ fn run_serve(
             RestartPolicy::OnFailure,
         ));
         worker_names.lock().expect("worker_names mutex").push("connect_firewall".into());
+        // VPN-GW-1 — the vpn_gateway tunnel engine. Reconciles the per-node VPN
+        // tunnel config (action/vpn/* CRUD writes it; ipc::vpn_gw serves the
+        // on-demand verbs) to running interfaces on a 60s tick: brings up any
+        // configured wg/ovpn tunnel whose mvpn-<id> interface is down. This is
+        // what makes a configured tunnel survive a daemon restart — the durable
+        // config is the desired state and this worker re-converges to it on boot.
+        // Idles gracefully when neither wg-quick nor openvpn is present.
+        if mackesd_core::worker_role::runs("vpn_gateway", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::vpn_gateway::VpnGatewayWorker::new(workgroup_root.clone()),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names.lock().expect("worker_names mutex").push("vpn_gateway".into());
+        }
         // mesh_router bootstraps with the per-transport
         // registry. Phase 12.18 D.2 (2026-05-23) — the NebulaHttps443
         // transport is registered at startup so the per-peer
