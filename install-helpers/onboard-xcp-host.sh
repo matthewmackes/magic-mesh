@@ -179,3 +179,21 @@ else
   echo "onboard-xcp: nebula started but overlay ping to $CA_OVERLAY failed — check UDP 4242 egress from dom0 + the lighthouse static_host_map" >&2
   exit 1
 fi
+
+# 6. Install the build-farm SSH key so `xe` / xcp-build.sh reach this dom0
+# PASSWORDLESSLY from here on — no more hand-pasting the key into authorized_keys
+# (the manual step that bit us recovering the build VM). Idempotent; we already
+# have the dom0 password in $XCP_PW for this onboarding session, so reuse it.
+FARM_PUB="${MCNF_BUILD_KEY:-$HOME/.ssh/mackes_mesh_ed25519}.pub"
+if [ -f "$FARM_PUB" ]; then
+  log "installing the build-farm key ($(basename "$FARM_PUB")) for passwordless xe access"
+  if XCP_PW="${XCP_PW:-}" "$(dirname "$0")/xcp-authorize-farm-key.sh" \
+       --host "$XCP_HOST" --user "$XCP_USER" --key "$FARM_PUB"; then
+    log "dom0 is keyed — future onboarding + farm builds need no password"
+  else
+    # Non-fatal: the host is already on the mesh; the key is a convenience.
+    echo "onboard-xcp: WARN — farm-key install didn't verify; run install-helpers/xcp-authorize-farm-key.sh --host $XCP_HOST by hand" >&2
+  fi
+else
+  log "no farm pubkey at $FARM_PUB — skipping passwordless-key install (run xcp-authorize-farm-key.sh later)"
+fi
