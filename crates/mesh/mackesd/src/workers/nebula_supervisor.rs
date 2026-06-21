@@ -456,7 +456,17 @@ fn render_config_yaml_inner(
         }
         out.push('\n');
     }
-    out.push_str("static_host_map:\n");
+    // FOUND-NEBULA-2 (2026-06-21) — group lighthouse underlay addresses by
+    // overlay IP. nebula's `static_host_map` value is a LIST of underlay
+    // addresses for ONE overlay IP, so a lighthouse advertised under more than
+    // one external address (its public IP *and* a `<hostname>:4242` fallback, or
+    // a split directory record) MUST collapse to a single key carrying every
+    // address. Emitting the key twice is a duplicate YAML mapping key, which
+    // nebula rejects outright ("mapping key already defined") — the config never
+    // loads and the overlay crash-loops. Found live wedging a fresh .13
+    // (UNIT-EAGLE) join, whose roster carried 10.42.0.1 under both
+    // 174.138.68.216:4242 and lighthouse-01:4242.
+    let mut mapped: Vec<(String, Vec<String>)> = Vec::new();
     for lh in &bundle.lighthouses {
         // Never map ourselves — a lighthouse that lists its own overlay
         // IP here tries to handshake itself ("Refusing to handshake with
@@ -464,10 +474,22 @@ fn render_config_yaml_inner(
         if lh.overlay_ip == bundle.overlay_ip {
             continue;
         }
-        out.push_str(&format!(
-            "  \"{}\": [\"{}\"]\n",
-            lh.overlay_ip, lh.external_addr,
-        ));
+        match mapped.iter_mut().find(|(ip, _)| *ip == lh.overlay_ip) {
+            Some((_, addrs)) if !addrs.contains(&lh.external_addr) => {
+                addrs.push(lh.external_addr.clone());
+            }
+            Some(_) => {}
+            None => mapped.push((lh.overlay_ip.clone(), vec![lh.external_addr.clone()])),
+        }
+    }
+    out.push_str("static_host_map:\n");
+    for (ip, addrs) in &mapped {
+        let list = addrs
+            .iter()
+            .map(|a| format!("\"{a}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("  \"{ip}\": [{list}]\n"));
     }
     out.push_str("\nlighthouse:\n");
     match role {
@@ -477,8 +499,10 @@ fn render_config_yaml_inner(
         ConfigRole::Peer => {
             out.push_str("  am_lighthouse: false\n");
             out.push_str("  hosts:\n");
-            for lh in &bundle.lighthouses {
-                out.push_str(&format!("    - \"{}\"\n", lh.overlay_ip));
+            // One `hosts` entry per overlay IP, reusing the grouped map so a
+            // multi-address lighthouse isn't listed twice.
+            for (ip, _) in &mapped {
+                out.push_str(&format!("    - \"{ip}\"\n"));
             }
         }
     }
@@ -687,9 +711,16 @@ mod tests {
         // must be removed so the `-config /etc/nebula` directory load doesn't
         // merge it with our config.yaml (which broke a fresh v11 lighthouse).
         let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(tmp.path().join("config.yml"), b"am_lighthouse: false\n").expect("seed stock");
-        materialize_config(tmp.path(), &sample_bundle(), ConfigRole::Host, &[], tmp.path())
-            .expect("write");
+        std::fs::write(tmp.path().join("config.yml"), b"am_lighthouse: false\n")
+            .expect("seed stock");
+        materialize_config(
+            tmp.path(),
+            &sample_bundle(),
+            ConfigRole::Host,
+            &[],
+            tmp.path(),
+        )
+        .expect("write");
         assert!(
             !tmp.path().join("config.yml").exists(),
             "stock config.yml must be removed"
@@ -709,6 +740,40 @@ mod tests {
         )
         .expect("write");
         assert!(tmp.path().join("lighthouse-config.yaml").exists());
+    }
+
+    #[test]
+    fn static_host_map_merges_duplicate_overlay_into_one_key() {
+        // FOUND-NEBULA-2 — a lighthouse advertised under two external addresses
+        // for the SAME overlay IP (the live .13 wedge: 174.138.68.216:4242 +
+        // lighthouse-01:4242 both for 10.42.0.1) must render a SINGLE
+        // static_host_map key with both addresses in the list, never two keys
+        // (a duplicate YAML mapping key nebula refuses to load).
+        let mut b = sample_bundle();
+        b.lighthouses = vec![
+            LighthouseEntry {
+                node_id: "peer:lh1".into(),
+                overlay_ip: "10.42.0.1".into(),
+                external_addr: "174.138.68.216:4242".into(),
+            },
+            LighthouseEntry {
+                node_id: "peer:lh1".into(),
+                overlay_ip: "10.42.0.1".into(),
+                external_addr: "lighthouse-01:4242".into(),
+            },
+        ];
+        let cfg = render_config_yaml(&b, ConfigRole::Peer);
+        // Exactly one mapping key for the overlay IP (duplicate keys = the bug).
+        assert_eq!(
+            cfg.matches("\"10.42.0.1\":").count(),
+            1,
+            "duplicate static_host_map key would crash-loop nebula:\n{cfg}"
+        );
+        // Both underlay addresses are carried in the single key's list.
+        assert!(cfg.contains("174.138.68.216:4242"));
+        assert!(cfg.contains("lighthouse-01:4242"));
+        // The peer `hosts:` list is likewise deduped to one entry.
+        assert_eq!(cfg.matches("- \"10.42.0.1\"").count(), 1);
     }
 
     #[test]

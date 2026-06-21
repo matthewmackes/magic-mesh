@@ -102,12 +102,17 @@ impl EnrollContext {
                     external_addr: a.external_addr,
                 })
                 .collect();
-        // Guarantee self is present — deduped by external_addr so we don't
-        // double-list when this LH's own directory row is already included.
-        if !entries
-            .iter()
-            .any(|e| e.external_addr == self.external_addr)
-        {
+        // FOUND-NEBULA-3 (2026-06-21) — guarantee self is present, deduped by
+        // OVERLAY IP (not external address). This LH's own directory row already
+        // carries its authoritative external address; deduping by external_addr
+        // double-lists the overlay whenever the self-fallback address differs
+        // from the directory row — e.g. a `<hostname>:4242` fallback emitted when
+        // the founding bundle isn't readable under the daemon's workgroup root.
+        // The config renderer then writes a duplicate `static_host_map` YAML key
+        // and nebula refuses to load, crash-looping the overlay. Found live
+        // wedging a fresh .13 (UNIT-EAGLE) join — two 10.42.0.1 entries
+        // (174.138.68.216:4242 + lighthouse-01:4242).
+        if !entries.iter().any(|e| e.overlay_ip == self.self_overlay) {
             entries.push(LighthouseEntry {
                 node_id: self.local_node_id.clone(),
                 overlay_ip: self.self_overlay.clone(),
@@ -510,8 +515,11 @@ mod tests {
         let dir = mackes_mesh_types::peers::peers_dir(&ctx.workgroup_root);
         std::fs::create_dir_all(&dir).unwrap();
         for (host, overlay, ext) in [
-            ("lh-alpha", "10.42.0.1", "203.0.113.1:4242"),
-            ("lh-beta", "10.42.0.2", "203.0.113.2:4242"),
+            // Distinct overlays from this listener's self (10.42.0.1) so all
+            // three lighthouses appear; two lighthouses never share an overlay
+            // IP (that collision is the FOUND-NEBULA-3 dedup case below).
+            ("lh-alpha", "10.42.0.11", "203.0.113.1:4242"),
+            ("lh-beta", "10.42.0.12", "203.0.113.2:4242"),
         ] {
             let mut p = mackes_mesh_types::peers::PeerRecord::now(host, None, "healthy");
             p.role = Some("lighthouse".into());
@@ -544,6 +552,31 @@ mod tests {
         let r = ctx.roster();
         assert_eq!(r.len(), 1, "self not double-listed");
         assert_eq!(r[0].external_addr, "203.0.113.7:4242");
+    }
+
+    #[test]
+    fn roster_dedups_self_by_overlay_even_when_addr_differs() {
+        // FOUND-NEBULA-3 — the live .13 (UNIT-EAGLE) wedge: the directory row
+        // for this lighthouse carries its authoritative public addr while the
+        // listener's self-fallback addr is a DIFFERENT string (a `<hostname>:4242`
+        // form, emitted when the founding bundle isn't readable under the daemon's
+        // workgroup root). Deduping by external_addr pushed a SECOND entry for the
+        // same overlay IP, which the renderer turned into a duplicate
+        // `static_host_map` YAML key → nebula crash-loop. Dedup by overlay IP
+        // keeps exactly one entry per overlay.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = roster_ctx(tmp.path());
+        ctx.external_addr = "lighthouse-01:4242".into(); // hostname-form self fallback
+        let dir = mackes_mesh_types::peers::peers_dir(&ctx.workgroup_root);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut me = mackes_mesh_types::peers::PeerRecord::now("self-lh", None, "healthy");
+        me.role = Some("lighthouse".into());
+        me.overlay_ip = Some(LIGHTHOUSE_OVERLAY_IP.into()); // same overlay as self
+        me.external_addr = Some("203.0.113.7:4242".into()); // authoritative public addr
+        mackes_mesh_types::peers::write_peer_record(&dir, &me).unwrap();
+        let r = ctx.roster();
+        assert_eq!(r.len(), 1, "one entry per overlay IP, never duplicated");
+        assert_eq!(r[0].overlay_ip, LIGHTHOUSE_OVERLAY_IP);
     }
 
     #[tokio::test]
