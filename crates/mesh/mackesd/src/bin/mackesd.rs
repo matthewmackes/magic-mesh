@@ -7954,6 +7954,16 @@ fn cmd_found(
     );
     println!("bundle: {}", report.bundle_path.display());
     println!("services: nebula + mackesd + mesh-health enabled (boot-durable) and running");
+    // HA-4 — a freshly-founded mesh has exactly one lighthouse, so it is below
+    // the HA floor: a single lighthouse is a SPOF for relay/discovery and (under
+    // SUBSTRATE-V2) the etcd quorum + Mesh-Sync redundancy. Warn, non-blocking —
+    // the mesh works with one; healthz reports `degraded: no HA` until a 2nd is
+    // enrolled, then clears (the matching half of HA-4).
+    println!(
+        "\n⚠ HA needs a 2nd lighthouse — this mesh has 1 of {} for failover. \
+         Add one with `mackesd join '<token>' --role lighthouse` on another box.",
+        mackes_mesh_types::lighthouse::HA_MIN_LIGHTHOUSES
+    );
     println!("\nAdd a peer — run this on the joining box:\n  mackesd join '{join_token}'");
     Ok(())
 }
