@@ -49,6 +49,7 @@ pub mod density;
 // shadow specs live on in `shadows` (consumed via `Theme::modal_shadow`).
 pub mod hero;
 pub mod icons;
+pub mod load_state;
 pub mod motion;
 pub mod palette;
 pub mod prefs;
@@ -76,6 +77,7 @@ pub use icons::{
     icon_for_device_type, mde_icon, FillMode, Icon, IconSize, IconState, ResolvedIcon,
     MATERIAL_LINE_WEIGHT_PX,
 };
+pub use load_state::{LoadState, StateTone};
 pub use motion::{Easing, Motion, PANEL_MOUNT_TRANSLATE_Y_PX, PULSE_MAX_SCALE};
 pub use palette::Palette;
 pub use prefs::Preferences;
