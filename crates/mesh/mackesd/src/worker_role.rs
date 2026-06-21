@@ -45,6 +45,9 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     ("netstate_apply", 0),
     ("validation_suite", 0),
     ("metrics_exporter", 0),
+    // VPN-GW-2 — every node can be assigned a gateway tunnel, so the secret
+    // decrypt/materialize reconcile runs at every rank (Lighthouse incl.).
+    ("vpn_secret_distributor", 0),
     // ── Server (rank 1) — adds fleet + mesh storage.
     ("ansible-pull", 1),
     ("app-sync", 1),
@@ -141,8 +144,10 @@ mod tests {
         // +1 lifecycle_exec (PD-11), +1 job_exec (PLANES-9),
         // +1 mesh_dns (PLANES-18), +1 netstate_apply (PLANES-15),
         // +1 validation_suite (PLANES-19), +1 metrics_exporter (EFF-9),
-        // +1 hardware_probe (SUBAUDIT-D2 — the PeerProbe producer).
-        assert_eq!(WORKER_TIERS.len(), 27);
+        // +1 hardware_probe (SUBAUDIT-D2 — the PeerProbe producer),
+        // +1 vpn_secret_distributor (VPN-GW-2 — decrypt+materialize the
+        // leader-pushed tunnel secrets; rank 0, any node can be a gateway).
+        assert_eq!(WORKER_TIERS.len(), 28);
     }
 
     #[test]
@@ -165,8 +170,8 @@ mod tests {
         let count = |rank: u8| WORKER_TIERS.iter().filter(|(_, r)| *r == rank).count();
         assert_eq!(
             count(0),
-            20,
-            "Lighthouse control plane (+gossip/reconcile/presence/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe)"
+            21,
+            "Lighthouse control plane (+gossip/reconcile/presence/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/vpn_secret_distributor)"
         );
         assert_eq!(
             count(1),
@@ -224,10 +229,11 @@ mod tests {
         let lh = workers_for_rank(Role::Lighthouse.rank());
         let srv = workers_for_rank(Role::Server.rank());
         let ws = workers_for_rank(Role::Workstation.rank());
-        // +1 each (hardware_probe, rank 0 → present in every tier).
-        assert_eq!(lh.len(), 20);
-        assert_eq!(srv.len(), 23);
-        assert_eq!(ws.len(), 27);
+        // +1 each (hardware_probe + vpn_secret_distributor, rank 0 → present in
+        // every tier).
+        assert_eq!(lh.len(), 21);
+        assert_eq!(srv.len(), 24);
+        assert_eq!(ws.len(), 28);
         // Strict superset: every lower-tier worker is in the higher tier.
         assert!(lh.iter().all(|w| srv.contains(w)));
         assert!(srv.iter().all(|w| ws.contains(w)));

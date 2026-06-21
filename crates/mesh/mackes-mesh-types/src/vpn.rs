@@ -211,6 +211,167 @@ pub fn openvpn_argv(t: &TunnelDef, config_path: &str) -> Vec<String> {
     ]
 }
 
+// ── VPN-GW-2 — encrypted, leader-managed tunnel secrets ─────────────────────
+//
+// The cleartext key material (a WireGuard `[Interface]/[Peer]` config or an
+// OpenVPN `.ovpn` + creds) never lives in `tunnels.toml` — only `creds_ref`
+// does. The leader seals each tunnel's [`TunnelSecret`] under the mesh CA key
+// and drops the `.age` blob under `secrets/vpn/<node>/` on the shared substrate
+// (the XCP-7 / EFF-21 pattern); the assigned node decrypts it and materializes
+// the cleartext to the bring-up path VPN-GW-1 already spawns against. The
+// payload + path derivation are pure (here); the crypto lives in `mackesd`
+// (`vpn_secret`) so this types crate stays dependency-light. Secret material
+// never touches `ps`/logs/argv.
+
+/// The cleartext payload sealed into a tunnel's `.age` blob. Exactly one of the
+/// two config bodies is populated per the tunnel's [`Method`]; `extra` carries
+/// any side files an `.ovpn` references inline-or-not (e.g. an `auth-user-pass`
+/// credential file) keyed by basename so the node can lay them down beside the
+/// config. Serialized as JSON inside the encrypted envelope — never on disk in
+/// the clear, never logged.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelSecret {
+    /// The full `wg-quick`-compatible WireGuard config (`[Interface]` private
+    /// key + `[Peer]`). Set for [`Method::Wg`]; empty otherwise.
+    #[serde(default)]
+    pub wg_conf: String,
+    /// The full OpenVPN `.ovpn` body (inline certs/keys, or `--config` lines).
+    /// Set for [`Method::Ovpn`]; empty otherwise.
+    #[serde(default)]
+    pub ovpn_conf: String,
+    /// Optional side files keyed by basename (e.g. `auth.txt` for an
+    /// `auth-user-pass auth.txt` directive). Written 0600 beside the `.ovpn`.
+    #[serde(default)]
+    pub extra: std::collections::BTreeMap<String, String>,
+}
+
+impl TunnelSecret {
+    /// A WireGuard secret from a `wg-quick` config body.
+    #[must_use]
+    pub fn wireguard(wg_conf: impl Into<String>) -> Self {
+        Self {
+            wg_conf: wg_conf.into(),
+            ..Default::default()
+        }
+    }
+
+    /// An OpenVPN secret from an `.ovpn` body.
+    #[must_use]
+    pub fn openvpn(ovpn_conf: impl Into<String>) -> Self {
+        Self {
+            ovpn_conf: ovpn_conf.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Is this secret populated for the given method? Used to reject an
+    /// empty/mismatched payload before sealing (a `Wg` tunnel with no
+    /// `wg_conf` would never come up — fail loud at save, not at bring-up).
+    #[must_use]
+    pub fn is_populated_for(&self, method: Method) -> bool {
+        match method {
+            Method::Wg => !self.wg_conf.trim().is_empty(),
+            Method::Ovpn => !self.ovpn_conf.trim().is_empty(),
+            // CLI/API tunnels mint their own config at bring-up; the stored
+            // secret carries the provider auth, so either body (or neither,
+            // when the auth rides `extra`) is acceptable.
+            Method::Cli | Method::Api => true,
+        }
+    }
+}
+
+/// The shared-substrate secret root: `<workgroup_root>/secrets/vpn`. The leader
+/// owns this subtree; per-node subdirs hold only that node's assigned `.age`
+/// blobs (the leader pushes a tunnel's secret only to its assigned gateways).
+#[must_use]
+pub fn secret_root(workgroup_root: &std::path::Path) -> std::path::PathBuf {
+    workgroup_root.join("secrets").join("vpn")
+}
+
+/// The encrypted blob path for one tunnel assigned to one node:
+/// `<workgroup_root>/secrets/vpn/<node_id>/<tunnel_id>.age`. `node_id` is
+/// sanitized so a `peer:host` id can't escape the subtree via `/` or `..`.
+#[must_use]
+pub fn secret_path(
+    workgroup_root: &std::path::Path,
+    node_id: &str,
+    tunnel_id: &str,
+) -> std::path::PathBuf {
+    secret_root(workgroup_root)
+        .join(sanitize_path_segment(node_id))
+        .join(format!("{}.age", sanitize_path_segment(tunnel_id)))
+}
+
+/// The `creds_ref` token recorded in `tunnels.toml` for a tunnel — a stable,
+/// log-safe handle (`secret://vpn/<tunnel_id>`), never the material itself.
+#[must_use]
+pub fn creds_ref(tunnel_id: &str) -> String {
+    format!("secret://vpn/{}", sanitize_path_segment(tunnel_id))
+}
+
+/// Where the decrypted WireGuard config is materialized for `wg-quick up`:
+/// `/etc/wireguard/<ifname>.conf` (the path VPN-GW-1's bring-up expects).
+#[must_use]
+pub fn wg_conf_path(t: &TunnelDef) -> std::path::PathBuf {
+    std::path::Path::new("/etc/wireguard").join(format!("{}.conf", t.ifname()))
+}
+
+/// Where the decrypted `.ovpn` is materialized for `openvpn --config`:
+/// `/etc/openvpn/client/<ifname>.ovpn` (the path VPN-GW-1's bring-up expects).
+#[must_use]
+pub fn ovpn_conf_path(t: &TunnelDef) -> std::path::PathBuf {
+    std::path::Path::new("/etc/openvpn/client").join(format!("{}.ovpn", t.ifname()))
+}
+
+/// Sanitize one path segment to a safe `[A-Za-z0-9._-]` token: any other char
+/// (incl. `/`, `:`) collapses to `_`, and any run of 2+ dots collapses to a
+/// single `_` so no `.`/`..` traversal component survives. Keeps a `peer:host`
+/// node-id or an operator-typed tunnel-id inside the secret subtree — no path
+/// traversal off the shared root, no literal `..` left in a filename. Pure +
+/// idempotent on already-clean input.
+#[must_use]
+fn sanitize_path_segment(s: &str) -> String {
+    // First map every disallowed char to `_` (collapses `/`, `:`, etc.).
+    let mapped: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // Collapse any run of 2+ dots (the `..` / `...` traversal shapes) to a
+    // single `_`; a lone `.` between other chars (e.g. a file extension) stays.
+    let mut out = String::with_capacity(mapped.len());
+    let mut dot_run = 0usize;
+    let flush = |out: &mut String, run: usize| {
+        if run == 1 {
+            out.push('.');
+        } else if run >= 2 {
+            out.push('_');
+        }
+    };
+    for c in mapped.chars() {
+        if c == '.' {
+            dot_run += 1;
+        } else {
+            flush(&mut out, dot_run);
+            dot_run = 0;
+            out.push(c);
+        }
+    }
+    flush(&mut out, dot_run);
+    // A segment that is empty or reduced to a single `.` is unusable as a
+    // directory/file name — fall back to a fixed placeholder.
+    if out.is_empty() || out == "." {
+        "_".to_string()
+    } else {
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +463,72 @@ mod tests {
                 "--daemon"
             ]
         );
+    }
+
+    // ── VPN-GW-2 — secret payload + path logic ──────────────────────────────
+
+    #[test]
+    fn secret_is_populated_per_method() {
+        let wg = TunnelSecret::wireguard("[Interface]\nPrivateKey=abc\n");
+        assert!(wg.is_populated_for(Method::Wg));
+        assert!(!wg.is_populated_for(Method::Ovpn));
+        let ov = TunnelSecret::openvpn("client\nremote vpn.example 1194\n");
+        assert!(ov.is_populated_for(Method::Ovpn));
+        assert!(!ov.is_populated_for(Method::Wg));
+        // Whitespace-only body is not populated.
+        assert!(!TunnelSecret::wireguard("   \n").is_populated_for(Method::Wg));
+        // CLI/API tunnels mint config later → either body is acceptable.
+        assert!(TunnelSecret::default().is_populated_for(Method::Cli));
+        assert!(TunnelSecret::default().is_populated_for(Method::Api));
+    }
+
+    #[test]
+    fn secret_path_is_under_node_subtree_and_traversal_safe() {
+        let root = std::path::Path::new("/srv/share");
+        let p = secret_path(root, "peer:anvil", "mullvad1");
+        assert_eq!(
+            p,
+            std::path::Path::new("/srv/share/secrets/vpn/peer_anvil/mullvad1.age")
+        );
+        // A malicious id can't escape the node subtree.
+        let evil = secret_path(root, "../../etc", "../../../passwd");
+        assert!(evil.starts_with("/srv/share/secrets/vpn/"));
+        assert!(!evil.to_string_lossy().contains(".."));
+        // The secret_root anchors the subtree.
+        assert_eq!(
+            secret_root(root),
+            std::path::Path::new("/srv/share/secrets/vpn")
+        );
+    }
+
+    #[test]
+    fn creds_ref_is_log_safe_and_stable() {
+        assert_eq!(creds_ref("mullvad1"), "secret://vpn/mullvad1");
+        // No raw material, no traversal.
+        let r = creds_ref("../oops");
+        assert!(r.starts_with("secret://vpn/"));
+        assert!(!r.contains(".."));
+    }
+
+    #[test]
+    fn materialize_paths_match_bringup_expectations() {
+        let t = tun("mullvad1", Method::Wg);
+        assert_eq!(
+            wg_conf_path(&t),
+            std::path::Path::new("/etc/wireguard/mvpn-mullvad1.conf")
+        );
+        assert_eq!(
+            ovpn_conf_path(&t),
+            std::path::Path::new("/etc/openvpn/client/mvpn-mullvad1.ovpn")
+        );
+    }
+
+    #[test]
+    fn secret_json_round_trips_through_serde() {
+        let mut s = TunnelSecret::openvpn("client\nauth-user-pass auth.txt\n");
+        s.extra.insert("auth.txt".into(), "user\npass\n".into());
+        let json = serde_json::to_string(&s).unwrap();
+        let back: TunnelSecret = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
     }
 }

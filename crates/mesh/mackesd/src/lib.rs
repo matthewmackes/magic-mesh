@@ -165,6 +165,11 @@ pub mod voice;
 // Vitelity SIP edge + publishes `voip/link-rtt/<peer>`. Consumed by the
 // `mackesd voip-rtt` CLI (VOIP-4.a) + the 60s broadcast worker (VOIP-4.b).
 pub mod voip_rtt;
+// VPN-GW-2 — encrypted, leader-managed VPN tunnel secrets. Pure seal/unseal of
+// a `mackes_mesh_types::vpn::TunnelSecret` under the mesh CA key (reusing the
+// `ca::backup` Argon2id/XChaCha20-Poly1305 envelope) + the materialize path that
+// lays the decrypted config down for VPN-GW-1's `wg-quick`/`openvpn` bring-up.
+pub mod vpn_secret;
 // Fire-and-forget subprocess reaping — prevents the `mde-bus publish` zombie
 // pile (the live-mesh wedge). Non-gated so the always-compiled `ca::revoke` +
 // `voip_rtt` callers can use it in a no-default-features build.

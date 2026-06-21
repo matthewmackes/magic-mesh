@@ -395,6 +395,12 @@ pub mod subprocess_tick;
 // `systemctl try-reload-or-restart` on kamailio-mde +
 // rtpengine-mde when it changes.
 pub mod voice_config;
+// VPN-GW-2 — node-side reconcile of leader-pushed encrypted VPN tunnel secrets.
+// Reads this node's `<root>/secrets/vpn/<self>/*.age` blobs, decrypts under the
+// mesh key, and materializes the cleartext config to the path VPN-GW-1's
+// `wg-quick`/`openvpn` bring-up expects — so an assigned tunnel is ready to come
+// up without the operator re-pasting creds.
+pub mod vpn_secret_distributor;
 pub mod wol;
 // BUS-1.1 (v6.x Mackes Bus) — `mde-bus` subprocess supervisor.
 // Spawns `mde-bus daemon`, restarts on exit, gracefully degrades
