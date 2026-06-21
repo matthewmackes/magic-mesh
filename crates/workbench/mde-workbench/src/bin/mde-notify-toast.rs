@@ -24,7 +24,8 @@ use cosmic::iced::{
 use mde_notify::{
     severity_token, sound_for_alert, AlertItem, AlertTail, Severity, SoundSettings, Source,
 };
-use mde_theme::Palette;
+use mde_theme::animation::fade_in;
+use mde_theme::{motion::REDUCE_MOTION_CAP_MS, Palette, Preferences};
 use mde_workbench::cosmic_compat::IntoIcedColor;
 
 /// Toast column width (px).
@@ -83,6 +84,9 @@ struct Toast {
 struct Toaster {
     tail: AlertTail,
     toasts: Vec<Toast>,
+    /// MOTION-A11Y contract: when set, the entrance collapses to a ≤80 ms
+    /// crossfade (sourced once from `MDE_REDUCE_MOTION` / preferences.toml).
+    reduce_motion: bool,
 }
 
 impl Toaster {
@@ -90,6 +94,7 @@ impl Toaster {
         Self {
             tail: AlertTail::default(),
             toasts: Vec::new(),
+            reduce_motion: Preferences::load().a11y.reduce_motion,
         }
     }
 }
@@ -176,15 +181,27 @@ fn prune_expired(toasts: Vec<Toast>, now_ms: i64) -> Vec<Toast> {
         .collect()
 }
 
-/// Opacity (0.0..=1.0) for a toast at `age_ms` into its TTL: ramp up over
-/// `FADE_IN_MS`, hold, ramp down over the final `FADE_OUT_MS`. Pure + testable.
+/// Opacity (0.0..=1.0) for a toast at `age_ms` into its TTL: fade in via the
+/// shared [`fade_in`] entrance helper (MOTION-INFRA-2 — opacity only, no layout
+/// reflow), hold, then ramp down over the final `FADE_OUT_MS`. Under
+/// `reduce_motion` the entrance collapses to the ≤80 ms crossfade cap (Q32).
+/// Pure + testable.
 #[must_use]
-pub fn toast_alpha(age_ms: i64, ttl_ms: i64) -> f32 {
+pub fn toast_alpha(age_ms: i64, ttl_ms: i64, reduce_motion: bool) -> f32 {
     if age_ms <= 0 {
         return 0.0;
     }
-    if age_ms < FADE_IN_MS {
-        return age_ms as f32 / FADE_IN_MS as f32;
+    // Entrance window: the standard fade-in, capped to the reduce-motion crossfade.
+    let fade_in_ms = if reduce_motion {
+        FADE_IN_MS.min(REDUCE_MOTION_CAP_MS as i64)
+    } else {
+        FADE_IN_MS
+    };
+    if age_ms < fade_in_ms {
+        // Drive the entrance through the shared MOTION-INFRA-2 helper so the toast
+        // shares the one motion vocabulary (no bespoke fade literal).
+        let progress = age_ms as f32 / fade_in_ms as f32;
+        return fade_in(progress).alpha;
     }
     let fade_out_start = ttl_ms - FADE_OUT_MS;
     if age_ms >= fade_out_start && fade_out_start > 0 {
@@ -292,7 +309,7 @@ fn view(state: &Toaster, _id: window::Id) -> Element<'_, Message> {
     // Newest at the top.
     for t in state.toasts.iter().rev() {
         let age = now - t.shown_at_ms;
-        let alpha = toast_alpha(age, TOAST_TTL_MS);
+        let alpha = toast_alpha(age, TOAST_TTL_MS, state.reduce_motion);
         col = col.push(toast_card(&t.item, alpha, p));
     }
     container(col)
@@ -437,12 +454,25 @@ mod tests {
 
     #[test]
     fn alpha_fades_in_holds_and_out() {
-        assert_eq!(toast_alpha(0, TOAST_TTL_MS), 0.0);
-        assert!(toast_alpha(FADE_IN_MS / 2, TOAST_TTL_MS) > 0.0);
-        assert!(toast_alpha(FADE_IN_MS / 2, TOAST_TTL_MS) < 1.0);
-        assert_eq!(toast_alpha(2_000, TOAST_TTL_MS), 1.0); // hold
-                                                           // Near the end it fades back toward 0.
-        assert!(toast_alpha(TOAST_TTL_MS - 100, TOAST_TTL_MS) < 1.0);
-        assert!(toast_alpha(TOAST_TTL_MS, TOAST_TTL_MS) <= 0.01);
+        assert_eq!(toast_alpha(0, TOAST_TTL_MS, false), 0.0);
+        assert!(toast_alpha(FADE_IN_MS / 2, TOAST_TTL_MS, false) > 0.0);
+        assert!(toast_alpha(FADE_IN_MS / 2, TOAST_TTL_MS, false) < 1.0);
+        assert_eq!(toast_alpha(2_000, TOAST_TTL_MS, false), 1.0); // hold
+                                                                  // Near the end it fades back toward 0.
+        assert!(toast_alpha(TOAST_TTL_MS - 100, TOAST_TTL_MS, false) < 1.0);
+        assert!(toast_alpha(TOAST_TTL_MS, TOAST_TTL_MS, false) <= 0.01);
+    }
+
+    #[test]
+    fn reduce_motion_caps_the_toast_entrance() {
+        // MOTION-INFRA-2 / Q32: under reduce-motion the fade-in collapses to the
+        // ≤80 ms crossfade cap — the toast is already fully opaque past the cap,
+        // where a full-motion toast is still ramping in.
+        let cap = REDUCE_MOTION_CAP_MS as i64;
+        assert_eq!(toast_alpha(cap, TOAST_TTL_MS, true), 1.0);
+        // Full motion is still mid-fade at the same age (FADE_IN_MS is longer).
+        assert!(toast_alpha(cap, TOAST_TTL_MS, false) < 1.0);
+        // Both still start fully transparent.
+        assert_eq!(toast_alpha(0, TOAST_TTL_MS, true), 0.0);
     }
 }

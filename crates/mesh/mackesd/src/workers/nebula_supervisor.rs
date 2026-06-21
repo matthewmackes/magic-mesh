@@ -687,9 +687,16 @@ mod tests {
         // must be removed so the `-config /etc/nebula` directory load doesn't
         // merge it with our config.yaml (which broke a fresh v11 lighthouse).
         let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(tmp.path().join("config.yml"), b"am_lighthouse: false\n").expect("seed stock");
-        materialize_config(tmp.path(), &sample_bundle(), ConfigRole::Host, &[], tmp.path())
-            .expect("write");
+        std::fs::write(tmp.path().join("config.yml"), b"am_lighthouse: false\n")
+            .expect("seed stock");
+        materialize_config(
+            tmp.path(),
+            &sample_bundle(),
+            ConfigRole::Host,
+            &[],
+            tmp.path(),
+        )
+        .expect("write");
         assert!(
             !tmp.path().join("config.yml").exists(),
             "stock config.yml must be removed"

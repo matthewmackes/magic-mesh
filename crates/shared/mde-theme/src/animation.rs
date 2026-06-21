@@ -256,6 +256,80 @@ impl Transition {
     }
 }
 
+/// MOTION-INFRA-2 — the crossfade pair: the [`RenderParams`] for the *outgoing*
+/// and *incoming* content during a content swap. Both share the same eased
+/// progress so the alphas always sum to ~1.0 (no flash of empty/overlapping
+/// fully-opaque content). Consumers render both stacked and apply each alpha.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Crossfade {
+    /// The content leaving (alpha 1→0).
+    pub out: RenderParams,
+    /// The content arriving (alpha 0→1).
+    pub incoming: RenderParams,
+}
+
+/// MOTION-INFRA-2 — fade an element **in** (opacity 0→1) at eased progress
+/// `t`. Pure presentation: opacity only, never layout — Wayland/compositor
+/// friendly. `reduce_motion` is honored by the caller routing `t` through a
+/// [`Tween::resolved`]/[`Animator`] (whose duration is already capped to the
+/// ≤80 ms crossfade), so this helper just maps the resolved progress to alpha.
+#[must_use]
+pub fn fade_in(t: f32) -> RenderParams {
+    Transition::FadeIn.params(t)
+}
+
+/// MOTION-INFRA-2 — fade an element **out** (opacity 1→0) at eased progress `t`.
+/// Opacity only.
+#[must_use]
+pub fn fade_out(t: f32) -> RenderParams {
+    Transition::FadeOut.params(t)
+}
+
+/// MOTION-INFRA-2 — slide an element **in**: fade (0→1) while translating up from
+/// `distance` px below to rest. Under `reduce_motion` the slide is dropped (the
+/// Q32 contract: collapse to a crossfade — opacity only, no movement) so the
+/// element still fades but never moves. `t` is the eased progress.
+///
+/// `translate_y` is a transform offset, NOT a layout property — apply it as the
+/// element's own offset so sibling layout never reflows (acceptance: no layout
+/// reflow during the transition).
+#[must_use]
+pub fn slide_in(t: f32, distance: f32, reduce_motion: bool) -> RenderParams {
+    if reduce_motion {
+        // Crossfade-only: keep the alpha ramp, drop the movement.
+        Transition::FadeIn.params(t)
+    } else {
+        Transition::SlideUp(distance).params(t)
+    }
+}
+
+/// MOTION-INFRA-2 — crossfade old→new content at eased progress `t`: the outgoing
+/// content fades 1→0 while the incoming fades 0→1, sharing one clock. This is the
+/// reduce-motion-safe swap primitive (it is *already* opacity-only, so it is
+/// identical with or without reduce-motion — the Q32 contract collapses every
+/// transition to exactly this crossfade).
+#[must_use]
+pub fn crossfade(t: f32) -> Crossfade {
+    Crossfade {
+        out: Transition::FadeOut.params(t),
+        incoming: Transition::FadeIn.params(t),
+    }
+}
+
+/// MOTION-INFRA-2 — hover lift: raise an element `rise` px (a transform offset,
+/// never a layout change) as the hover tween progresses `t` (0=rest → 1=lifted).
+/// Under `reduce_motion` the lift is dropped (no movement) — hover is decorative
+/// motion, so reduce-motion renders the resting frame. `t` is the eased progress
+/// of a [`Motion::hover`]-driven tween.
+#[must_use]
+pub fn lift_on_hover(t: f32, rise: f32, reduce_motion: bool) -> RenderParams {
+    if reduce_motion {
+        Transition::Lift(rise).params(0.0)
+    } else {
+        Transition::Lift(rise).params(t)
+    }
+}
+
 /// MOTION-INFRA-1 — a tiny animation registry. Holds the active tweens keyed by
 /// a caller id and is advanced by ONE subscription tick, so N concurrent
 /// animations across a surface share a single timer instead of each arming its
@@ -344,6 +418,71 @@ mod tests {
         assert!((Transition::Press(0.04).params(1.0).scale - 0.96).abs() < 1e-6);
         // Clamped: out-of-range t doesn't overshoot.
         assert_eq!(Transition::FadeIn.params(2.0).alpha, 1.0);
+    }
+
+    #[test]
+    fn fade_in_out_are_opacity_only_and_complementary() {
+        // MOTION-INFRA-2 — enter/exit helpers touch alpha only (never translate /
+        // scale), so they can never cause a layout reflow.
+        let fin = fade_in(0.3);
+        assert!((fin.alpha - 0.3).abs() < 1e-6);
+        assert_eq!(fin.translate_y, 0.0);
+        assert_eq!(fin.scale, 1.0);
+        // At every progress fade_in + fade_out alphas sum to 1.0.
+        for i in 0..=10 {
+            let t = i as f32 / 10.0;
+            assert!((fade_in(t).alpha + fade_out(t).alpha - 1.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn slide_in_fades_and_slides_then_collapses_under_reduce_motion() {
+        // MOTION-INFRA-2 — full motion: starts `distance` below + transparent,
+        // rests at offset 0 + opaque.
+        let start = slide_in(0.0, 8.0, false);
+        assert_eq!(start.alpha, 0.0);
+        assert_eq!(start.translate_y, 8.0);
+        let end = slide_in(1.0, 8.0, false);
+        assert_eq!(end.alpha, 1.0);
+        assert_eq!(end.translate_y, 0.0);
+        // reduce_motion: crossfade-only — alpha still ramps, but NO movement at any
+        // progress (Q32 contract: collapse to a crossfade, never move).
+        for i in 0..=10 {
+            let t = i as f32 / 10.0;
+            let p = slide_in(t, 8.0, true);
+            assert!((p.alpha - t).abs() < 1e-6, "alpha must still ramp at t={t}");
+            assert_eq!(p.translate_y, 0.0, "no movement under reduce_motion");
+        }
+    }
+
+    #[test]
+    fn crossfade_alphas_sum_to_one_at_every_progress() {
+        // MOTION-INFRA-2 — old→new swap: outgoing 1→0, incoming 0→1, sharing one
+        // clock so the alphas always sum to ~1.0 (no flash / double-opaque frame).
+        let mid = crossfade(0.5);
+        assert!((mid.out.alpha - 0.5).abs() < 1e-6);
+        assert!((mid.incoming.alpha - 0.5).abs() < 1e-6);
+        for i in 0..=10 {
+            let t = i as f32 / 10.0;
+            let c = crossfade(t);
+            assert!((c.out.alpha + c.incoming.alpha - 1.0).abs() < 1e-6);
+            // Crossfade is opacity-only — safe under reduce-motion unchanged.
+            assert_eq!(c.out.translate_y, 0.0);
+            assert_eq!(c.incoming.scale, 1.0);
+        }
+    }
+
+    #[test]
+    fn lift_on_hover_rises_and_drops_under_reduce_motion() {
+        // MOTION-INFRA-2 — hover lift raises by `rise` px (negative y) as t grows.
+        assert_eq!(lift_on_hover(0.0, 6.0, false).translate_y, 0.0);
+        assert_eq!(lift_on_hover(1.0, 6.0, false).translate_y, -6.0);
+        // Decorative motion: reduce_motion renders the resting frame (no lift) at
+        // any progress.
+        assert_eq!(lift_on_hover(1.0, 6.0, true).translate_y, 0.0);
+        // Lift is transform-only (never alpha/scale change).
+        assert_eq!(lift_on_hover(1.0, 6.0, false).alpha, 1.0);
+        assert_eq!(lift_on_hover(1.0, 6.0, false).scale, 1.0);
     }
 
     #[test]
