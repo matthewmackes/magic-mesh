@@ -83,7 +83,9 @@ pub use icons::{
     MATERIAL_LINE_WEIGHT_PX,
 };
 pub use load_state::{LoadState, StatusSeverity};
-pub use motion::{Easing, Motion, PANEL_MOUNT_TRANSLATE_Y_PX, POPUP_SCALE_DELTA, PULSE_MAX_SCALE};
+pub use motion::{
+    Easing, Motion, DOCK_SLIDE_PX, PANEL_MOUNT_TRANSLATE_Y_PX, POPUP_SCALE_DELTA, PULSE_MAX_SCALE,
+};
 pub use palette::Palette;
 pub use prefs::Preferences;
 pub use radii::Radii;

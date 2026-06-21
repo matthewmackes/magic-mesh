@@ -47,6 +47,21 @@ use mde_musicd::creds::{self, Creds};
 /// space). Aliased to keep the AIR-* call sites reading as plain `Task`.
 type Task<M> = cosmic::iced::Task<M>;
 
+/// MUSIC-DOCK-2 — the live reduce-motion preference for the dock slide-up.
+///
+/// mde-workbench's `live_theme::reduce_motion()` is its own crate-private cache;
+/// the authoritative shared source it (and every motion consumer) ultimately
+/// resolves from is [`mde_theme::Preferences`], whose `load()` already folds in
+/// the `MDE_REDUCE_MOTION` env override on top of the persisted
+/// `[a11y] reduce_motion` preference. Reading it here keeps mde-music on the same
+/// single-sourced reduce-motion contract (§6) without reaching into the workbench
+/// crate. Under reduce-motion the slide collapses to an instant crossfade (the
+/// [`mde_theme::slide_in`] reduce-motion branch + the ≤80 ms tween cap).
+#[must_use]
+fn reduce_motion() -> bool {
+    mde_theme::Preferences::load().a11y.reduce_motion
+}
+
 fn main() -> cosmic::iced::Result {
     // MUSIC-DOCK-1 — the Music shell is a layer-shell **Overlay** dock, not a
     // floating toplevel. Suppress Cosmic's auto-created main window so the only
@@ -332,7 +347,21 @@ struct State {
     /// MUSIC-RFX-8 — the open right-click context menu (`None` = closed). Carries
     /// what was right-clicked so the sheet renders the applicable actions.
     context_menu: Option<TrackContext>,
+    /// MUSIC-DOCK-2 — the shell-wide animation registry (the INFRA-1
+    /// [`mde_theme::Animator`]). Holds the dock OPEN slide-up tween (keyed
+    /// [`DOCK_OPEN_ANIM`]), armed on boot; advanced by the idle-parked
+    /// [`Message::DockTick`] subscription that only runs while it's in flight
+    /// (MOTION-PERF-1) and goes [`Subscription::none()`] once it settles.
+    anim: mde_theme::Animator,
+    /// MUSIC-DOCK-2 — the "now" clock the dock slide-up reads in `view`. The
+    /// Animator owns each tween's start [`std::time::Instant`]; `view` asks it for
+    /// the eased value AT `anim_now`, which the idle-parked [`Message::DockTick`]
+    /// advances each frame while the slide is in flight.
+    anim_now: std::time::Instant,
 }
+
+/// MUSIC-DOCK-2 — the [`mde_theme::Animator`] key for the dock OPEN slide-up.
+const DOCK_OPEN_ANIM: &str = "dock_open";
 
 /// MUSIC-RFX-8 — the target of a right-click track context menu. A track row
 /// knows its song id + title; playlist removal ("Remove from playlist") is
@@ -508,6 +537,11 @@ enum Message {
     /// irrelevant; the follow-up state fetch is the truth (sweep-3 I8
     /// dropped the never-read `Result` payload).
     TransportDone,
+    /// MUSIC-DOCK-2 — advance the dock OPEN slide-up clock one frame. Scheduled
+    /// by the idle-parked tick subscription ONLY while the slide is in flight; the
+    /// subscription returns [`Subscription::none()`] once the tween settles, so a
+    /// settled dock schedules zero ticks (MOTION-PERF-1).
+    DockTick,
 }
 
 impl State {
@@ -516,7 +550,9 @@ impl State {
             Ok(c) => (None, format!("Connected to {}", c.server_url)),
             Err(_) => (Some(FirstRunForm::default()), String::new()),
         };
-        Self {
+        // MUSIC-DOCK-2 — one boot clock for the dock slide-up tween.
+        let now = std::time::Instant::now();
+        let mut s = Self {
             core,
             dock_id,
             nav: NavState::new(),
@@ -570,7 +606,80 @@ impl State {
             maxi_tab: MaxiTab::Queue,
             maxi_lyrics: Vec::new(),
             maxi_peers: Vec::new(),
+            anim: mde_theme::Animator::new(),
+            anim_now: now,
+        };
+        // MUSIC-DOCK-2 — arm the dock OPEN slide-up at boot (the dock maps on
+        // launch, so this plays as the surface appears). The INFRA-1 Animator
+        // resolves the `panel_mount` (Carbon `moderate-02`) duration against the
+        // live reduce-motion flag — under reduce-motion the tween is capped to the
+        // ≤80 ms crossfade so it settles immediately + the slide is dropped in
+        // `view` (the `slide_in` reduce-motion branch).
+        s.anim.start(
+            DOCK_OPEN_ANIM,
+            now,
+            mde_theme::Motion::panel_mount(),
+            reduce_motion(),
+        );
+        s
+    }
+
+    /// MUSIC-DOCK-2 — true while the dock OPEN slide-up is still in flight, so
+    /// `subscription` arms the tick ONLY while it animates and drops to
+    /// `Subscription::none()` the instant it settles (MOTION-PERF-1 — a settled
+    /// dock schedules zero ticks). Always false once the tween completes (and,
+    /// under reduce-motion, after the ≤80 ms cap).
+    #[must_use]
+    fn dock_animating(&self) -> bool {
+        self.anim.is_animating(DOCK_OPEN_ANIM, self.anim_now)
+    }
+
+    /// MUSIC-DOCK-2 — the dock OPEN slide-up [`mde_theme::RenderParams`] for the
+    /// current frame: the INFRA-2 [`mde_theme::slide_in`] entrance (fade ramp +
+    /// slide up from [`mde_theme::DOCK_SLIDE_PX`] below the bottom edge) eased with
+    /// the Carbon entrance curve. The eased progress is read from the INFRA-1
+    /// Animator's tween (`1.0` once settled / when absent — the dock at rest).
+    /// Under reduce-motion the slide channel is dropped (`translate_y == 0` at every
+    /// progress) so the dock appears instantly at offset 0 — the `slide_in`
+    /// reduce-motion branch.
+    #[must_use]
+    fn dock_open_params(&self) -> mde_theme::RenderParams {
+        let t = self
+            .anim
+            .value(DOCK_OPEN_ANIM, self.anim_now, mde_theme::Easing::EaseOut);
+        mde_theme::slide_in(t, mde_theme::DOCK_SLIDE_PX, reduce_motion())
+    }
+
+    /// MUSIC-DOCK-2 — wrap the dock's root `body` in the OPEN slide-up: the whole
+    /// surface rises from [`mde_theme::DOCK_SLIDE_PX`] below the bottom edge to
+    /// rest as it maps. Once settled (or under reduce-motion / instant) the body is
+    /// returned at rest with no wrapper cost.
+    ///
+    /// As with the workbench TRANS-1/FEEDBACK-2 reveals, the slide is rendered on
+    /// the transform channel only — the iced-0.13 libcosmic fork has no per-element
+    /// opacity widget, so the `slide_in` *fade* channel is recorded as deferred
+    /// until the 0.14 opacity widget lands; the live entrance is the achievable
+    /// transform settle. The remaining offset becomes a top-padding inset with a
+    /// matching bottom compensator so the surface height stays fixed (no reflow):
+    /// the dock content visibly rises into place from the bottom.
+    fn dock_slide_up<'a>(&self, body: Element<'a, Message>) -> Element<'a, Message> {
+        if !self.dock_animating() {
+            return body;
         }
+        let offset = self
+            .dock_open_params()
+            .translate_y
+            .clamp(0.0, mde_theme::DOCK_SLIDE_PX);
+        container(body)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(cosmic::iced::Padding {
+                top: offset,
+                right: 0.0,
+                bottom: mde_theme::DOCK_SLIDE_PX - offset,
+                left: 0.0,
+            })
+            .into()
     }
 
     /// MUSIC-RESPONSIVE-1 — re-issue the grid fetch for the current route (used
@@ -1321,6 +1430,16 @@ impl State {
             Message::TransportDone => Task::perform(nowplaying::fetch_state(), |r| {
                 Message::StateLoaded(r.unwrap_or_default())
             }),
+            Message::DockTick => {
+                // MUSIC-DOCK-2 — advance the dock slide-up clock one frame, then
+                // drop any settled tween. Once the open tween completes `gc`
+                // empties the Animator, `dock_animating()` goes false, and the
+                // subscription stops scheduling ticks (MOTION-PERF-1). Presentation
+                // only — no Task.
+                self.anim_now = std::time::Instant::now();
+                let _ = self.anim.gc(self.anim_now);
+                Task::none()
+            }
         }
     }
 
@@ -1360,16 +1479,24 @@ impl State {
             }
             _ => None,
         });
+        let mut subs = vec![keys, resizes];
+        // MUSIC-DOCK-2 — the dock OPEN slide-up tick, idle-parked: armed ONLY
+        // while the slide is in flight (the dock is rising into place), and dropped
+        // to nothing the instant it settles, so a settled dock schedules zero ticks
+        // (MOTION-PERF-1). Plays whether the first-run form or the library is
+        // showing (the whole dock surface slides up on map); reduce-motion settles
+        // it within the ≤80 ms cap so it stops almost immediately. ~60 ms/frame
+        // keeps the settle smooth.
+        if self.dock_animating() {
+            subs.push(
+                cosmic::iced::time::every(std::time::Duration::from_millis(60))
+                    .map(|_| Message::DockTick),
+            );
+        }
         // Poll the now-playing snapshot once the library is shown (there's
         // no daemon to ask on the first-run connect form).
-        if self.form.is_some() {
-            Subscription::batch([keys, resizes])
-        } else {
-            let mut subs = vec![
-                keys,
-                resizes,
-                cosmic::iced::time::every(nowplaying::POLL).map(|_| Message::PollState),
-            ];
+        if self.form.is_none() {
+            subs.push(cosmic::iced::time::every(nowplaying::POLL).map(|_| Message::PollState));
             // MUSIC-HOME-4 — poll the server stats while the Home dashboard is
             // shown (faster while a scan is running so progress stays live).
             if matches!(self.nav.current(), Route::Hub) {
@@ -1383,8 +1510,8 @@ impl State {
                         .map(|_| Message::PollStats),
                 );
             }
-            Subscription::batch(subs)
         }
+        Subscription::batch(subs)
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -2783,7 +2910,10 @@ impl Application for State {
     /// degrades to an empty element rather than panicking the daemon.
     fn view_window(&self, id: window::Id) -> Element<'_, Self::Message> {
         if id == self.dock_id {
-            State::view(self)
+            // MUSIC-DOCK-2 — wrap the whole dock surface in the OPEN slide-up so the
+            // dock rises from below the bottom edge as it maps (settled / instant
+            // under reduce-motion: the body is returned at rest, no wrapper cost).
+            self.dock_slide_up(State::view(self))
         } else {
             Space::new().into()
         }
