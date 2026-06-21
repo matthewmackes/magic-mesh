@@ -112,12 +112,18 @@ Prefix `DS-#`. Until a DS gate's substrate exists, that §10 gate is *phased-out
   `verify-gates.sh`, **so that** infra code is gated like Rust (Q45).
   **Acceptance:**
     - [ ] the three linters run in the gate and block on failure
-- [ ] **DS-10: research spike — DevOps management layer**
-  **As** the operator, **I want** a short written evaluation of the OpenTofu+Ansible+Forgejo
-  integration patterns (state backend, runner topology, XO provider maturity), **so that**
-  DS-1..4 are built on a vetted approach (Q32 directive).
+- [✓] **DS-10: research spike — DevOps management layer + rebuild runbook**
+  **As** the operator, **I want** a written evaluation of the OpenTofu+Ansible+Forgejo
+  integration patterns AND a from-bare-metal rebuild runbook, **so that** DS-1..9 are built
+  on a vetted approach and the whole environment is reproducible on 3 stock-XCP-ng machines
+  (Q32 directive). — DONE (2026-06-21): `docs/ops/environment-rebuild.md` — full 13-section
+  runbook (topology, inventory of record, stock-XCP-ng install, control-host bootstrap, XO
+  CE in podman, OpenTofu+`vatesfr/xenorchestra`, Ansible+golden image, Forgejo CI, container
+  mesh, etcd+age secrets, hardening, DS-task→phase map, verification checklist). Key finding:
+  both hosts are **bare XAPI — no Xen Orchestra** — so standing up XO is a DS-1 prerequisite
+  (Phase 2). Provider decision: official `vatesfr/xenorchestra` (token, not password).
   **Acceptance:**
-    - [ ] a findings note (recommended layout + risks) committed under `docs/design/` and lifted into any follow-up DS tasks
+    - [✓] findings note + rebuild runbook committed under `docs/ops/`; DS-task→phase map lifts the approach into DS-1..9
 
 ## ENTERPRISE FIT-AND-FINISH (2026-06-11) — toward an enterprise-class deliverable
 
