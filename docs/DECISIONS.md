@@ -24,6 +24,19 @@ it with a newer one.
 - **Scope:** GUI crates (`mde-*` surfaces). Phases in with the infra epic (the gate
   activates once self-hosted CI + the capture harness land).
 
+## ADR-0004 — `no-flinch` made standing posture for all operations (2026-06-21)
+
+- **Supersedes:** the scoping of `no-flinch` as guidance for autonomous `/ship`/`/loop`
+  drains only.
+- **Symptom:** Operator directive — the flinch failure mode (routing around
+  slow/fuzzy/gated/expensive work, deferring it as a "tail") applies to *every* operation,
+  not just drains; e.g. deferring "stand up Xen Orchestra" because it's infra rather than a
+  fast cargo-test green.
+- **Decision:** `no-flinch` is **standard guidance for all §10 operations** — folded into
+  the §10 standing operating posture. A gate/precondition is a task to complete, not a stop
+  point; pace + priority are the operator's; finish over pile.
+- **Scope:** Platform-wide, all phases.
+
 ## ADR-0003 — EFF-18 reopened + coverage model changed (2026-06-21)
 
 - **Supersedes:** EFF-18 "keep the serial mackesd suite" (WON'T-DO, 2026-06-12) and

@@ -213,6 +213,20 @@ it verbatim, so the three can't drift (design + full Q-lock map:
 `docs/design/process-governance.md`). The goal is to stop effort going to problems
 that didn't need solving: nothing speculative, nothing untracked, nothing re-litigated.
 
+**Standing operating posture — `no-flinch` (operator directive 2026-06-21).** This skill
+is **standard guidance for every operation** under §10, not just autonomous drains. The
+failure mode it counters: gravitating to work with a fast/clean success signal and routing
+around work whose feedback is **slow, fuzzy, gated, or expensive** — then dressing it up as
+"efficiency." Nothing here is genuinely *hard*: "hard" is a dishonest word for slow or fuzzy
+feedback. The rules bind every gate above: **(1)** pace + priority are the operator's — never
+slow the loop or reclassify work as "lower-value tail" on your own judgment; **(2)** "harder
+for me" ≠ "less urgent for them"; **(3)** *a gate is a task, not an excuse* — "XO isn't up" /
+"needs a token" → stand it up / wire it (provisioning is pre-authorized, §10 environment);
+**(4)** fix the feedback loop (slow build, missing harness) instead of avoiding it; **(5)**
+**finish `[✓]` over pile `[>]`**; **(6)** accept slower/fuzzier verification when the work
+needs it. The tell: if you're about to defer the gated/slow/infra unit for an easy one —
+that's the flinch; do the avoided thing instead. (Skill: `.claude/skills/no-flinch`.)
+
 **Entry (before any work).** **E1 — tracked:** a worklist task exists. **E2 —
 symptom-backed:** a concrete observed trigger, or (for preventive work) an existing
 **§3/§8 control** it enforces — no speculative work. *Trivial fixes* (typos, dead
