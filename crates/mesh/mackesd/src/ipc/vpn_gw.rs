@@ -363,10 +363,18 @@ fn build_set_route_reply(svc: &VpnService, req_body: Option<&str>) -> String {
         return err(format!("set-route: {e}"));
     }
     let scope_key = r.scope_key();
+    // DDNS-EGRESS-3 — capture the chain before the move so we can auto-add a
+    // DDNS record per tunnel the route references (idempotent).
+    let chain = r.chain.clone();
     let mut cfg = vpn::load_routes(root);
     cfg.upsert(r);
     match vpn::save_routes(root, &cfg) {
-        Ok(_) => json!({ "ok": true, "scope": scope_key }).to_string(),
+        Ok(_) => {
+            for tunnel_id in &chain {
+                ddns_auto_add_tunnel_record(root, tunnel_id);
+            }
+            json!({ "ok": true, "scope": scope_key }).to_string()
+        }
         Err(e) => err(format!("set-route: save: {e}")),
     }
 }
@@ -579,7 +587,12 @@ fn build_add_from_provider_reply(svc: &VpnService, req_body: Option<&str>) -> St
     let has_api = adapter.key_register_request(&params, &keypair).is_some();
     let public_key = keypair.public_b64.clone();
     match persist_provisioned(root, mesh_key, &req.node_id, provisioned) {
-        Ok(bytes) => json!({
+        Ok(bytes) => {
+            // DDNS-EGRESS-3 — auto-add a templated DDNS record for the new
+            // tunnel (idempotent): assigning a VPN exit yields a subdomain with
+            // zero extra steps.
+            ddns_auto_add_tunnel_record(root, &req.tunnel_id);
+            json!({
             "ok": true,
             "provider": kind.label(),
             "tunnel_id": req.tunnel_id,
@@ -590,8 +603,9 @@ fn build_add_from_provider_reply(svc: &VpnService, req_body: Option<&str>) -> St
             "public_key": public_key,
             "has_provider_api": has_api,
             "sealed_bytes": bytes,
-        })
-        .to_string(),
+            })
+            .to_string()
+        }
         Err(e) => err(format!("add-from-provider: {e}")),
     }
 }
@@ -634,15 +648,20 @@ fn build_import_config_reply(svc: &VpnService, req_body: Option<&str>) -> String
     };
     let method = provisioned.def.method;
     match persist_provisioned(root, mesh_key, &req.node_id, provisioned) {
-        Ok(bytes) => json!({
+        Ok(bytes) => {
+            // DDNS-EGRESS-3 — auto-add a templated DDNS record for the imported
+            // tunnel (idempotent).
+            ddns_auto_add_tunnel_record(root, &req.tunnel_id);
+            json!({
             "ok": true,
             "kind": req.kind,
             "method": match method { Method::Ovpn => "ovpn", _ => "wg" },
             "tunnel_id": req.tunnel_id,
             "node_id": req.node_id,
             "sealed_bytes": bytes,
-        })
-        .to_string(),
+            })
+            .to_string()
+        }
         Err(e) => err(format!("import-config: {e}")),
     }
 }
@@ -674,6 +693,32 @@ fn persist_provisioned(
     cfg.upsert(def);
     vpn::save(root, &cfg).map_err(|e| format!("save cfg: {e}"))?;
     Ok(sealed.len())
+}
+
+/// DDNS-EGRESS-3 auto-population — when a VPN-GW tunnel/route is created, ensure
+/// the `[ddns]` config has a templated record for `tunnel_id` so assigning a VPN
+/// exit yields a subdomain with zero extra steps. **Idempotent** (keyed on the
+/// `tunnel:<id>` source via [`DdnsConfig::auto_add_tunnel_record`]): re-creating
+/// a tunnel/route doesn't duplicate, and an operator-edited record for the same
+/// source is left untouched. Best-effort + non-fatal — a DDNS save failure must
+/// never wedge the tunnel/route create (the operator can still add the record by
+/// hand over `action/ddns/*`), so it only logs. Removing the tunnel can leave
+/// the record per `on_down` (full on-down/reconnect behavior is DDNS-EGRESS-4).
+fn ddns_auto_add_tunnel_record(root: &std::path::Path, tunnel_id: &str) {
+    let mut cfg = mackes_mesh_types::ddns::load(root);
+    if !cfg.auto_add_tunnel_record(tunnel_id) {
+        return; // already tracked — nothing to persist (idempotent)
+    }
+    match mackes_mesh_types::ddns::save(root, &cfg) {
+        Ok(_) => tracing::info!(
+            tunnel = %tunnel_id,
+            "ddns: auto-added a record for the new VPN tunnel (DDNS-EGRESS-3)"
+        ),
+        Err(e) => tracing::warn!(
+            tunnel = %tunnel_id, error = %e,
+            "ddns: auto-add record failed; tunnel create still succeeded"
+        ),
+    }
 }
 
 /// Write a sealed blob at mode 0600 (atomic temp+rename). The `.age` blob is
@@ -1312,6 +1357,75 @@ mod tests {
         let blob = std::fs::read(vpn::secret_path(tmp.path(), "peer:gw", "ovpn1")).unwrap();
         let secret = crate::vpn_secret::unseal("test-mesh-key", &blob).unwrap();
         assert!(secret.ovpn_conf.contains("SECRETKEYMATERIAL"));
+    }
+
+    // ── DDNS-EGRESS-3 — auto-population on tunnel/route create ───────────────
+
+    #[test]
+    fn add_from_provider_auto_adds_a_ddns_record() {
+        let (tmp, s) = svc();
+        let body = json!({
+            "provider": "mullvad",
+            "tunnel_id": "exit1",
+            "node_id": "peer:gw",
+            "server_pubkey": "SERVERpubkey00000000000000000000000000000000=",
+            "endpoint": "198.51.100.10:51820",
+            "assigned_address": "10.64.0.2/32",
+        })
+        .to_string();
+        assert!(build_reply(&s, "add-from-provider", Some(&body)).contains("\"ok\":true"));
+        // The [ddns] config gained a templated record for tunnel:exit1.
+        let cfg = mackes_mesh_types::ddns::load(tmp.path());
+        assert_eq!(cfg.record.len(), 1);
+        assert_eq!(cfg.record[0].source, "tunnel:exit1");
+        assert_eq!(
+            cfg.record[0].name,
+            mackes_mesh_types::ddns::AUTO_RECORD_NAME_TEMPLATE
+        );
+    }
+
+    #[test]
+    fn auto_add_ddns_record_is_idempotent_across_recreate() {
+        let (tmp, s) = svc();
+        let body = json!({
+            "kind": "wg", "tunnel_id": "pasted1", "node_id": "peer:gw",
+            "config": "[Interface]\nPrivateKey = aAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaA0=\n\
+                       Address = 10.0.0.2/32\n[Peer]\n\
+                       PublicKey = bBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbB0=\n\
+                       Endpoint = 203.0.113.7:51820\nAllowedIPs = 0.0.0.0/0\n",
+        })
+        .to_string();
+        // Import the same tunnel twice (re-create) → exactly one DDNS record.
+        assert!(build_reply(&s, "import-config", Some(&body)).contains("\"ok\":true"));
+        assert!(build_reply(&s, "import-config", Some(&body)).contains("\"ok\":true"));
+        let cfg = mackes_mesh_types::ddns::load(tmp.path());
+        assert_eq!(
+            cfg.record.len(),
+            1,
+            "re-create must not duplicate the record"
+        );
+        assert_eq!(cfg.record[0].source, "tunnel:pasted1");
+    }
+
+    #[test]
+    fn set_route_auto_adds_a_record_per_chain_tunnel() {
+        let (tmp, s) = svc();
+        let body = json!({
+            "scope": { "kind": "any-mesh" },
+            "gateway": "peer:gw",
+            "chain": ["mullvad1", "proton2"],
+            "kill_switch": true,
+        })
+        .to_string();
+        assert!(build_reply(&s, "set-route", Some(&body)).contains("\"ok\":true"));
+        let cfg = mackes_mesh_types::ddns::load(tmp.path());
+        let sources: Vec<&str> = cfg.record.iter().map(|r| r.source.as_str()).collect();
+        assert_eq!(cfg.record.len(), 2);
+        assert!(sources.contains(&"tunnel:mullvad1"));
+        assert!(sources.contains(&"tunnel:proton2"));
+        // Re-setting the same route does not duplicate.
+        assert!(build_reply(&s, "set-route", Some(&body)).contains("\"ok\":true"));
+        assert_eq!(mackes_mesh_types::ddns::load(tmp.path()).record.len(), 2);
     }
 
     #[test]

@@ -306,6 +306,117 @@ pub fn local_egress_addr(target: &str) -> Option<IpAddr> {
     Some(local)
 }
 
+// ── VPN-tunnel source (DDNS-EGRESS-3) ───────────────────────────────
+
+/// DDNS-EGRESS-3 — the per-VPN-tunnel exit-IP source. Reads VPN-GW-6's
+/// published `vpn/tunnel-health.json` (the `vpn_gateway` worker's
+/// [`HealthState`](crate::workers::vpn_gateway::HealthState)) and yields the
+/// **verified** exit IP for one tunnel under the existing
+/// [`EgressKind::Tunnel`] / `tunnel:<id>` key — so a tunnel's verified exit IP
+/// flows into the SAME change-detect → publish → DnsWriter path the WAN IP
+/// uses. Adding this to the worker's `Vec<Box<dyn EgressIpSource>>` is purely
+/// additive (DDNS-EGRESS-1 designed the seam for exactly this) — no worker
+/// rewrite.
+///
+/// Only a **healthy** tunnel's exit IP is published: VPN-GW-6's verdict already
+/// folds in liveness + "the exit IP is the provider's, not the plaintext WAN" +
+/// the DNS-leak probe, so a `Leaking`/`Down` tunnel yields an *empty* reading
+/// (the source is "down" for DDNS) rather than a stale/leaking address. That
+/// keeps DDNS from ever publishing a record that points at a dead or leaking
+/// exit — the same no-stale-record guarantee the WAN source has for an outage.
+pub struct TunnelEgressSource {
+    tunnel_id: String,
+    health_path: PathBuf,
+}
+
+impl TunnelEgressSource {
+    /// Build a source for `tunnel_id`, reading the gateway worker's published
+    /// health under `workgroup_root` (`<root>/vpn/tunnel-health.json`).
+    #[must_use]
+    pub fn new(tunnel_id: impl Into<String>, workgroup_root: &Path) -> Self {
+        Self {
+            tunnel_id: tunnel_id.into(),
+            health_path: crate::workers::vpn_gateway::default_health_path(workgroup_root),
+        }
+    }
+
+    /// Override the health-state path (tests use a tempdir fixture).
+    #[must_use]
+    pub fn with_health_path(mut self, path: PathBuf) -> Self {
+        self.health_path = path;
+        self
+    }
+
+    /// Resolve the verified exit-IP reading from a loaded health state. Pure
+    /// over the state so it is unit-tested from a fixture: an empty reading
+    /// when the tunnel is absent / not `Healthy` / has no observed exit IP
+    /// (each of which means "no address to publish right now"), else the
+    /// verified exit IP routed into the matching v4/v6 family.
+    #[must_use]
+    pub fn reading_from(&self, state: &crate::workers::vpn_gateway::HealthState) -> EgressReading {
+        let Some(health) = state.tunnel.get(&self.tunnel_id) else {
+            return EgressReading::default();
+        };
+        // Only a Healthy verdict yields a publishable IP — Leaking/Down are
+        // "down" for DDNS so we never publish a stale/leaking exit.
+        if !health.verdict.is_up() {
+            return EgressReading::default();
+        }
+        let Some(exit_ip) = health.exit_ip.as_deref().and_then(parse_ip) else {
+            return EgressReading::default();
+        };
+        match exit_ip {
+            IpAddr::V4(v4) => EgressReading {
+                v4: Some(v4.to_string()),
+                v6: None,
+            },
+            IpAddr::V6(v6) => EgressReading {
+                v4: None,
+                v6: Some(v6.to_string()),
+            },
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl EgressIpSource for TunnelEgressSource {
+    fn kind(&self) -> EgressKind {
+        EgressKind::Tunnel {
+            id: self.tunnel_id.clone(),
+        }
+    }
+
+    async fn current(&self) -> anyhow::Result<EgressReading> {
+        // A plain JSON read; hop onto a blocking task so a slow fs read never
+        // pins the tokio scheduler (mirrors the WAN source's blocking hops).
+        let path = self.health_path.clone();
+        let state = tokio::task::spawn_blocking(move || {
+            crate::workers::vpn_gateway::HealthState::load(&path)
+        })
+        .await
+        .unwrap_or_default();
+        Ok(self.reading_from(&state))
+    }
+}
+
+/// DDNS-EGRESS-3 — build one [`TunnelEgressSource`] per tunnel the gateway
+/// worker has published health for, so every tracked tunnel's verified exit IP
+/// flows through the worker. Reads `<workgroup_root>/vpn/tunnel-health.json`;
+/// an absent file (no VPN-GW worker has run yet) yields no sources — additive
+/// and graceful. Returned boxed so the worker appends them to its source `Vec`.
+#[must_use]
+pub fn tunnel_sources(workgroup_root: &Path) -> Vec<Box<dyn EgressIpSource>> {
+    let health_path = crate::workers::vpn_gateway::default_health_path(workgroup_root);
+    let state = crate::workers::vpn_gateway::HealthState::load(&health_path);
+    state
+        .tunnel
+        .keys()
+        .map(|id| {
+            Box::new(TunnelEgressSource::new(id.clone(), workgroup_root)) as Box<dyn EgressIpSource>
+        })
+        .collect()
+}
+
 // ── Persisted state + change detection (pure) ───────────────────────
 
 /// The persisted last-seen egress map: record-key → last reading. Stored
@@ -496,12 +607,19 @@ impl DdnsWorker {
         let host = host.into();
         let workgroup_root = crate::default_qnm_shared_root();
         let reconciler: std::sync::Arc<dyn DnsReconciler> =
-            std::sync::Arc::new(DoDnsReconciler::new(workgroup_root, host.clone()));
+            std::sync::Arc::new(DoDnsReconciler::new(workgroup_root.clone(), host.clone()));
+        // DDNS-EGRESS-3 — the WAN source ships always; the per-VPN-tunnel
+        // verified-exit-IP sources (one per tunnel VPN-GW-6 has published
+        // health for) plug into the SAME `Vec<Box<dyn EgressIpSource>>` — no
+        // worker rewrite. Absent any VPN-GW health, `tunnel_sources` is empty
+        // and the worker is WAN-only, exactly as before.
+        let mut sources: Vec<Box<dyn EgressIpSource>> = vec![Box::new(WanEgressSource::new())];
+        sources.extend(tunnel_sources(&workgroup_root));
         Self {
             host,
             state_path: PathBuf::from(DEFAULT_STATE_PATH),
             tick: DEFAULT_TICK,
-            sources: vec![Box::new(WanEgressSource::new())],
+            sources,
             reconciler: Some(reconciler),
         }
     }
@@ -683,7 +801,7 @@ impl DoDnsReconciler {
 /// value is the host; `{n}` is fixed at 1 (multi-instance indexing is a
 /// later refinement — single instance per (node, source) for now).
 #[must_use]
-fn provider_for_source(source: &str) -> &str {
+pub(crate) fn provider_for_source(source: &str) -> &str {
     source.strip_prefix("tunnel:").unwrap_or(source)
 }
 
@@ -1013,10 +1131,154 @@ mod tests {
     }
 
     #[test]
-    fn worker_ships_wan_source_only_vpn_deferred() {
+    fn worker_always_ships_the_wan_source_first() {
+        // DDNS-EGRESS-3: WAN is always source[0]; the per-tunnel sources (one
+        // per VPN-GW-published tunnel) append after it. On a box with no VPN-GW
+        // health published, that's WAN-only — but the test only pins the
+        // invariant that survives a build host that DOES have a health file:
+        // the WAN source is present + first.
         let w = DdnsWorker::new("eagle");
-        assert_eq!(w.sources.len(), 1, "WAN only; VPN source is DDNS-EGRESS-3");
+        assert!(!w.sources.is_empty());
         assert_eq!(w.sources[0].kind(), EgressKind::Wan);
+    }
+
+    // ── DDNS-EGRESS-3 — TunnelEgressSource (verified exit IP per tunnel) ──────
+
+    fn health_with(
+        tunnel: &str,
+        exit_ip: Option<&str>,
+        is_provider: bool,
+        dns_leak: bool,
+    ) -> crate::workers::vpn_gateway::HealthState {
+        let mut st = crate::workers::vpn_gateway::HealthState::default();
+        st.tunnel.insert(
+            tunnel.to_owned(),
+            mackes_mesh_types::vpn::TunnelHealth::from_probes(
+                tunnel,
+                exit_ip.is_some(),
+                exit_ip.map(str::to_owned),
+                is_provider,
+                dns_leak,
+            ),
+        );
+        st
+    }
+
+    #[test]
+    fn tunnel_source_kind_is_the_tunnel_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = TunnelEgressSource::new("mullvad-1", dir.path());
+        assert_eq!(
+            src.kind(),
+            EgressKind::Tunnel {
+                id: "mullvad-1".into()
+            }
+        );
+        assert_eq!(src.kind().key(), "tunnel:mullvad-1");
+    }
+
+    #[test]
+    fn tunnel_source_yields_the_verified_exit_ip_when_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = TunnelEgressSource::new("mullvad-1", dir.path());
+        // Healthy: live + provider exit IP + no DNS leak → verdict Healthy.
+        let st = health_with("mullvad-1", Some("185.65.1.1"), true, false);
+        assert_eq!(src.reading_from(&st), reading(Some("185.65.1.1"), None));
+        // An IPv6 exit IP routes into the v6 family.
+        let st6 = health_with("mullvad-1", Some("2001:db8::9"), true, false);
+        assert_eq!(src.reading_from(&st6), reading(None, Some("2001:db8::9")));
+    }
+
+    #[test]
+    fn tunnel_source_is_empty_when_leaking_or_down_or_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = TunnelEgressSource::new("mullvad-1", dir.path());
+        // Leaking (exit IP == WAN → not provider) → no publishable IP.
+        let leaking = health_with("mullvad-1", Some("9.9.9.9"), false, false);
+        assert!(
+            src.reading_from(&leaking).is_empty(),
+            "leaking → no publish"
+        );
+        // DNS leak even with a provider exit IP → Leaking → no publish.
+        let dns_leak = health_with("mullvad-1", Some("185.65.1.1"), true, true);
+        assert!(
+            src.reading_from(&dns_leak).is_empty(),
+            "dns-leak → no publish"
+        );
+        // Down (no exit IP / not live) → no publish.
+        let down = health_with("mullvad-1", None, false, false);
+        assert!(src.reading_from(&down).is_empty(), "down → no publish");
+        // A different/absent tunnel → empty.
+        let other = health_with("proton-2", Some("185.65.1.1"), true, false);
+        assert!(src.reading_from(&other).is_empty(), "absent tunnel → empty");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tunnel_source_reads_the_health_fixture_from_disk() {
+        // The full path: a tunnel-health.json fixture → TunnelEgressSource
+        // yields the IP through the async `current()` (the worker's call path).
+        let dir = tempfile::tempdir().unwrap();
+        let health_path = crate::workers::vpn_gateway::default_health_path(dir.path());
+        health_with("mullvad-1", Some("185.65.1.1"), true, false)
+            .store(&health_path)
+            .unwrap();
+        let src = TunnelEgressSource::new("mullvad-1", dir.path());
+        assert_eq!(
+            src.current().await.unwrap(),
+            reading(Some("185.65.1.1"), None)
+        );
+    }
+
+    #[test]
+    fn tunnel_sources_builds_one_per_published_tunnel() {
+        let dir = tempfile::tempdir().unwrap();
+        // No health file → no tunnel sources (graceful, additive).
+        assert!(tunnel_sources(dir.path()).is_empty());
+        // Publish health for two tunnels → one source each, keyed correctly.
+        let mut st = health_with("mullvad-1", Some("185.65.1.1"), true, false);
+        st.tunnel.insert(
+            "proton-2".into(),
+            mackes_mesh_types::vpn::TunnelHealth::from_probes(
+                "proton-2",
+                true,
+                Some("146.70.1.1".into()),
+                true,
+                false,
+            ),
+        );
+        st.store(&crate::workers::vpn_gateway::default_health_path(
+            dir.path(),
+        ))
+        .unwrap();
+        let srcs = tunnel_sources(dir.path());
+        assert_eq!(srcs.len(), 2);
+        // BTreeMap order: mullvad-1 then proton-2.
+        assert_eq!(srcs[0].kind().key(), "tunnel:mullvad-1");
+        assert_eq!(srcs[1].kind().key(), "tunnel:proton-2");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tunnel_exit_ip_flows_through_the_same_change_detect_publish_path() {
+        // End-to-end through the worker: a tunnel's verified exit IP is detected
+        // as a change + handed to the reconciler under the tunnel:<id> key —
+        // the SAME path the WAN IP uses (DDNS-EGRESS-3 acceptance).
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("egress-ip.json");
+        let spy = std::sync::Arc::new(SpyReconciler::default());
+        let src = TunnelEgressSource::new("mullvad-1", dir.path())
+            .with_health_path(dir.path().join("health.json"));
+        health_with("mullvad-1", Some("185.65.1.1"), true, false)
+            .store(&dir.path().join("health.json"))
+            .unwrap();
+        let w = DdnsWorker::new("eagle")
+            .with_reconciler(spy.clone())
+            .with_state_path(state_path)
+            .with_sources(vec![Box::new(src)]);
+        assert_eq!(w.tick_once().await, 1, "first-seen tunnel exit IP changes");
+        let seen = spy.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "tunnel:mullvad-1");
+        assert_eq!(seen[0].1, reading(Some("185.65.1.1"), None));
     }
 
     #[tokio::test(flavor = "current_thread")]
