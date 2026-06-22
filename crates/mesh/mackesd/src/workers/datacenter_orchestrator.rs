@@ -214,10 +214,99 @@ fn gather_do() -> Vec<DcResource> {
     }
 }
 
-/// Seam: the Xen zone via XAPI. Lights up with DATACENTER-1 (XAPI provider) +
-/// DATACENTER-4 (XAPI-over-overlay) + DATACENTER-3 (mesh secrets). Empty until then.
+/// dom0s to sample the Xen (dev) zone from — `MCNF_XEN_DOM0S` (comma-separated
+/// IPs). Empty by default, so the Xen source is a safe no-op until a node is
+/// explicitly configured with dom0 reach (keeps generic mesh nodes unaffected).
+fn xen_dom0s() -> Vec<String> {
+    std::env::var("MCNF_XEN_DOM0S")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// SSH key used to reach the dom0s (passwordless root via the mesh key).
+fn xen_ssh_key() -> String {
+    std::env::var("MCNF_XEN_SSH_KEY").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        format!("{home}/.ssh/mackes_mesh_ed25519")
+    })
+}
+
+/// Parse the remote `xe` helper's pipe-delimited `uuid|name|power-state` lines
+/// into `(uuid, name, power)` triples. Pure — fed the raw stdout.
+#[must_use]
+pub fn parse_xe_vms(output: &str) -> Vec<(String, String, String)> {
+    output
+        .lines()
+        .filter_map(|l| {
+            let mut p = l.splitn(3, '|');
+            let u = p.next()?.trim();
+            if u.is_empty() {
+                return None;
+            }
+            let n = p.next().unwrap_or("").trim();
+            let s = p.next().unwrap_or("").trim();
+            Some((u.to_string(), n.to_string(), s.to_string()))
+        })
+        .collect()
+}
+
+/// Run a remote `xe` command on a dom0 over SSH (best-effort).
+fn ssh_xe(key: &str, dom0: &str, remote: &str) -> Option<String> {
+    let o = std::process::Command::new("ssh")
+        .args([
+            "-i",
+            key,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            &format!("root@{dom0}"),
+            remote,
+        ])
+        .output()
+        .ok()?;
+    o.status
+        .success()
+        .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// Sample the Xen (dev) zone: each configured dom0 becomes a `host` resource and
+/// each of its non-control VMs a `vm` resource. Reads XAPI via `xe` over the
+/// mesh-key SSH (the no-XO read path proven by DATACENTER-1) — best-effort. This
+/// is interim glue; it swaps to XAPI-over-overlay (DATACENTER-4) without changing
+/// the brain or the Bus contract.
 fn gather_xen() -> Vec<DcResource> {
-    Vec::new()
+    let key = xen_ssh_key();
+    let mut out = Vec::new();
+    for dom0 in xen_dom0s() {
+        if let Some(hn) = ssh_xe(&key, &dom0, "xe host-list params=name-label --minimal") {
+            let hn = hn.trim();
+            if !hn.is_empty() {
+                let sig = serde_json::json!({
+                    "kind": "host", "id": dom0, "name": hn, "status": "up", "zone": "dev"
+                })
+                .to_string();
+                out.push(DcResource::new("host", dom0.clone(), sig));
+            }
+        }
+        let script = "for u in $(xe vm-list is-control-domain=false params=uuid --minimal | tr , ' '); \
+             do echo \"$u|$(xe vm-param-get uuid=$u param-name=name-label)|$(xe vm-param-get uuid=$u param-name=power-state)\"; done";
+        if let Some(vmout) = ssh_xe(&key, &dom0, script) {
+            for (u, n, s) in parse_xe_vms(&vmout) {
+                let sig = serde_json::json!({
+                    "kind": "vm", "id": u, "name": n, "status": s, "host": dom0, "zone": "dev"
+                })
+                .to_string();
+                out.push(DcResource::new("vm", u, sig));
+            }
+        }
+    }
+    out
 }
 
 /// Seam: the UniFi gateway (DATACENTER-14, cred from the mesh store). Empty until then.
@@ -350,5 +439,18 @@ mod tests {
         assert!(parse_droplets("not json").is_empty());
         assert!(parse_droplets("{}").is_empty());
         assert!(parse_droplets("[]").is_empty());
+    }
+
+    #[test]
+    fn parse_xe_vms_reads_pipe_lines() {
+        let out = "abc-1|mcnf-build-51|running\ndef-2|mcnf-golden|halted\n|skip-empty-uuid|x\n";
+        let vms = parse_xe_vms(out);
+        assert_eq!(vms.len(), 2); // the empty-uuid line is skipped
+        assert_eq!(
+            vms[0],
+            ("abc-1".into(), "mcnf-build-51".into(), "running".into())
+        );
+        assert_eq!(vms[1].1, "mcnf-golden");
+        assert_eq!(vms[1].2, "halted");
     }
 }
