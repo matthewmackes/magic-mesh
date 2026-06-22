@@ -1630,6 +1630,7 @@ snapshot-reset VM pool from MDE-VM-golden.
     - [ ] runs isolated from the build VMs (.50/.51/.52) and the live fleet; a failed run still cleans up
 - [>] **BUILD-PLATFORM-4: L1 install (e2e) acceptance — nightly RPM cut → clean-VM install.**
   *Runner built + wired (`automation/testbed/test-install.sh`); first green run pending the release RPM (building) + a clean-node install.*
+    - [ ] **RPM-cut gap found by the L1 attempt (2026-06-22):** the release build succeeds (7m54s, sccache-accelerated) but `cargo generate-rpm` fails — `Asset file not found: vendor/birthright/ntfy_2.24.0_linux_amd64.tar.gz`. The RPM bundles a vendored `ntfy` binary the build VMs don't have. Fix: sync/fetch the vendored asset onto the build node before `generate-rpm` (extend the toolchain/asset step), then L1 can run.
   **As** an operator, **I want** the real RPM installed on a clean node nightly, **so that** install regressions are caught off the critical path.
   **Acceptance**:
     - [ ] a nightly job cuts the RPM, installs it on a snapshot-reset VM, and asserts: services up, role chooser runs, `found`/`join` enrol succeeds, overlay forms
