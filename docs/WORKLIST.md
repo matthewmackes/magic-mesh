@@ -1726,7 +1726,10 @@ the plane and it **survives killing the current zone leader**.
   reloads and concurrent writes don't corrupt state.
   **Acceptance**:
     - [ ] apply/migrate/boot/backup run as `event/dc/*` jobs with live progress + cancel; a second mutation on a locked resource is rejected/queued with a clear reason
-- [ ] **DATACENTER-7: RBAC (mesh identity + role map) + append-only audit.**
+- [>] **DATACENTER-7: RBAC (mesh identity + role map) + append-only audit.** *(session=calm-ray-dcr8)*
+  *AUDIT half done (3-agent parallel fan-out): a passive `dc_auditor` leader-gated worker watches the
+  `action/dc/*` Bus lanes and emits append-only `event/dc/audit/<ulid>` records (no handler changes); the
+  panel has an Audit view rendering them newest-first. Remaining: RBAC roles + per-action enforcement.*
   **As** the operator, **I want** mesh-identity roles + a tamper-evident audit, **so that** who-did-what is provable.
   **Acceptance**:
     - [ ] principal = Nebula cert/peer; viewer=read, operator=do-all enforced on actions (admin reserved)
@@ -1770,9 +1773,12 @@ the plane and it **survives killing the current zone leader**.
 - [ ] **DATACENTER-14: Gateway tab (UniFi full control).**
   **Acceptance**:
     - [ ] status + DHCP leases (fleet discovery) + firewall/port-forward edits + reboot, via the worker over SSH + the UniFi API; cred from the mesh store (was `/root/.mcnf-unifi-cred`)
-- [ ] **DATACENTER-15: Tofu tab (plan/apply/destroy + state + drift + gate).**
+- [>] **DATACENTER-15: Tofu tab (plan/apply/destroy + state + drift + gate).** *(session=calm-ray-dcr8)*
+  *Plan + apply + destroy all wired: `action/dc/tofu-{plan,apply,destroy}` RPCs (apply/destroy confirm-gated
+  + workspace allow-listed against path-traversal); the Tofu tab has Plan + typed-confirm Apply buttons per
+  workspace. Remaining: a state browser + drift view, and the prod-arm master switch.*
   **Acceptance**:
-    - [ ] per-zone workspace cards; streamed plan/apply/destroy; state browser + drift vs live; **plan→review-diff→explicit Apply** (typed confirm for prod); persisted run-log on `event/dc/tofu/*`
+    - [>] per-zone workspace cards; streamed plan/apply/destroy; state browser + drift vs live; **plan→review-diff→explicit Apply** (typed confirm for prod); persisted run-log on `event/dc/tofu/*` — *plan/apply/destroy + typed-confirm Apply done; state-browser/drift/run-log pending*
 
 ### Phase 3 — Power orchestration
 - [ ] **DATACENTER-16: energy-aware host power (WOL/IPMI + idle-shutdown + learned ETAs).**
