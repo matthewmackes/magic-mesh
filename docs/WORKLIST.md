@@ -1654,3 +1654,128 @@ snapshot-reset VM pool from MDE-VM-golden.
   **Acceptance**:
     - [ ] a nightly summary (pass/fail per tier) written to a known location + published to the Bus
     - [ ] the Workbench Build panel (FARM-AUTO-5) surfaces the latest install/feature/stability status (extends its `event/farm/*` read to `event/test/*`)
+
+## DATACENTER — full Xen + Tofu + DO control plane from Workbench (design: `docs/design/datacenter-control.md`, 100-Q survey 2026-06-22)
+
+Big-bang epic, **foundations sequenced first** (Phase 0 is real, blocking work). No-fixed-center
+throughout (AI_GOVERNANCE §0): no single control host whose loss is fatal. Worker =
+`datacenter_orchestrator`; topics `event/dc/*`. Pairs with `infra/tofu/` (Xen) + `infra/tofu/zone1-do/`
+(DO, already imported + plan-clean). Success bar (§7): the operator drives the **full lifecycle** from
+the plane and it **survives killing the current zone leader**.
+
+### Phase 0 — Foundations (prerequisite; blocks the plane)
+- [ ] **DATACENTER-1: XAPI-native Tofu provider (drop XO).**
+  **As** the platform, **I want** the Xen IaC to manage hosts/VMs over XAPI directly, **so that** there is
+  no central XO box to lose (no-fixed-center).
+  **Acceptance** (runtime-observable):
+    - [ ] `infra/tofu/` migrated off `vatesfr/xenorchestra` to a XAPI-native provider; `tofu plan` clean against the live farm after import
+    - [ ] the `.50/.51/.52` build VMs + golden template are managed with no XO process running
+- [ ] **DATACENTER-2: mesh-replicated Tofu remote state (SUBSTRATE-V2).**
+  **As** an operator, **I want** Tofu state + lock in the mesh-replicated substrate, **so that** any elected
+  leader plans/applies against the same state.
+  **Acceptance**:
+    - [ ] both states (Xen + DO) live on the SUBSTRATE-V2 backend with working state-locking
+    - [ ] a `plan` run from two different eligible nodes sees identical state; concurrent apply is lock-blocked
+- [ ] **DATACENTER-3: DS-8 mesh secret store holds DC creds.**
+  **As** the control plane, **I want** XAPI/DO/UniFi creds in the etcd+age mesh store, **so that** no host-local
+  secret pins the leader.
+  **Acceptance**:
+    - [ ] XAPI host creds, the DO token, and the UniFi cred resolve from the etcd+age store (replicated to eligible nodes); the `/root/.mcnf-*` files are no longer the source of truth
+- [ ] **DATACENTER-4: XAPI-over-overlay routing.**
+  **As** a non-LAN leader, **I want** XAPI reachable over the Nebula overlay, **so that** an eligible node off the
+  `172.20` LAN can still drive Xen.
+  **Acceptance**:
+    - [ ] XAPI calls succeed from an eligible node via an on-LAN relay peer; the path is observable + falls back cleanly when the relay is down
+
+### Phase 1 — The worker
+- [ ] **DATACENTER-5: `datacenter_orchestrator` mackesd worker (leader-gated, per-zone).**
+  **As** the platform, **I want** a leader-gated worker that proxies XAPI/DO/UniFi and publishes `event/dc/*`,
+  **so that** the panel has a no-center engine.
+  **Acceptance**:
+    - [ ] leader-gated (`crate::leader`) Xen-control leader (on-LAN eligible) + DO/global leader (any eligible node)
+    - [ ] publishes `event/dc/{hosts,vms,storage,net,tofu,power,audit,promote}`; killing the leader → a survivor re-assumes within the election window (observable on the Bus)
+- [ ] **DATACENTER-6: async job model + per-resource op-locks.**
+  **As** an operator, **I want** long ops tracked as resumable Bus jobs with locks, **so that** progress survives
+  reloads and concurrent writes don't corrupt state.
+  **Acceptance**:
+    - [ ] apply/migrate/boot/backup run as `event/dc/*` jobs with live progress + cancel; a second mutation on a locked resource is rejected/queued with a clear reason
+- [ ] **DATACENTER-7: RBAC (mesh identity + role map) + append-only audit.**
+  **As** the operator, **I want** mesh-identity roles + a tamper-evident audit, **so that** who-did-what is provable.
+  **Acceptance**:
+    - [ ] principal = Nebula cert/peer; viewer=read, operator=do-all enforced on actions (admin reserved)
+    - [ ] every action appends to `event/dc/audit/*` (actor/action/target/result) with an in-panel viewer
+
+### Phase 2 — The Datacenter plane + tabs
+- [ ] **DATACENTER-8: plane skeleton (per-zone tabs, card grid, search, graceful-degrade).**
+  **As** an operator, **I want** the Datacenter plane wired into Workbench, **so that** the tabs have a home.
+  **Acceptance**:
+    - [ ] Dev/Prod/Gateway top tabs; per-zone sub-tabs; card-grid layout; color-dot status via `mde-theme` tokens (+glyph/label, §4-clean); global search + per-tab filters + saved views; unreachable → last-known + stale badge + retry; reads via the mesh-replicated Bus, routes actions to the zone leader
+- [ ] **DATACENTER-9: Overview tab (single pane + promotion strip + version matrix).**
+  **Acceptance**:
+    - [ ] cross-zone capacity/health rollup, active alerts, recent Tofu runs, Build→Eagle→DO strip, and a version matrix (farm/Eagle/each lighthouse) — all live; sparklines from short rolling Bus history
+- [ ] **DATACENTER-10: Hosts tab (full host lifecycle + pools).**
+  **Acceptance**:
+    - [ ] per-host capacity+health; pools (membership/master/join); maintenance/reboot/shutdown/**evacuate**/patch with impact preview; copy/launch-ssh console
+- [ ] **DATACENTER-11: VMs tab (full lifecycle, Tofu-backed create, noVNC, bulk).**
+  **Acceptance**:
+    - [ ] power/suspend/migrate/clone/snapshot/resize/delete; create via golden-template wizard that writes a Tofu resource + applies (structural changes go through Tofu — no drift); embedded noVNC; multi-select bulk power/snapshot/tag with per-item progress
+- [ ] **DATACENTER-12: Storage tab (SR/VDI/create + scheduled snapshots + image library).**
+  **Acceptance**:
+    - [ ] SRs + VDIs (attach/detach/create); scheduled snapshots w/ retention + backup target; ISO + template library (absorbs `images`); SR capacity threshold alerts → Bus/Hub
+- [ ] **DATACENTER-13: Network tab (L2 + overlay + topology + unified IP/DNS).**
+  **Acceptance**:
+    - [ ] networks/PIFs/VLANs/NIC mgmt/create; overlay peer/route management; an interactive topology map (hosts↔networks↔VMs↔gateway); a unified IP/DNS view correlating UniFi leases ↔ DO DNS ↔ overlay IPs
+- [ ] **DATACENTER-14: Gateway tab (UniFi full control).**
+  **Acceptance**:
+    - [ ] status + DHCP leases (fleet discovery) + firewall/port-forward edits + reboot, via the worker over SSH + the UniFi API; cred from the mesh store (was `/root/.mcnf-unifi-cred`)
+- [ ] **DATACENTER-15: Tofu tab (plan/apply/destroy + state + drift + gate).**
+  **Acceptance**:
+    - [ ] per-zone workspace cards; streamed plan/apply/destroy; state browser + drift vs live; **plan→review-diff→explicit Apply** (typed confirm for prod); persisted run-log on `event/dc/tofu/*`
+
+### Phase 3 — Power orchestration
+- [ ] **DATACENTER-16: energy-aware host power (WOL/IPMI + idle-shutdown + learned ETAs).**
+  **As** an operator, **I want** hosts powered by demand with honest progress, **so that** the fleet saves energy
+  and I can see wakes happening.
+  **Acceptance**:
+    - [ ] host with zero running VMs auto-shuts-down (graceful host-disable); a workload assignment wakes the target (IPMI primary, WOL fallback) then polls XAPI to ready
+    - [ ] each wake timed → rolling per-host average drives a phased progress bar (POST→XCP→toolstack) with a live ETA
+
+### Phase 4 — Rollout, genesis, DO & promotion
+- [ ] **DATACENTER-17: XCP host rollout as a first-class Hypervisor role.**
+  **As** the platform, **I want** XCP-ng hosts deployed + cared-for like any node role, **so that** new hypervisors
+  are part of setup/onboarding/care, not hand-built.
+  **Acceptance**:
+    - [ ] USB/ISO installer with a prebaked answerfile installs XCP-ng unattended; the host joins the overlay as a static-Nebula member with a "Hypervisor" role in `node_roles`
+    - [ ] day-2: rolling patch (evacuate-first), health/care alerts, Nebula cert rotation, and auto-replace on host death
+- [ ] **DATACENTER-18: New-Mesh genesis wizard ("give birth to a new Nebula").**
+  **Acceptance**:
+    - [ ] wizard: generate CA → provision+found first lighthouse → seed → register DNS → emit first join token; genesis secrets sourced from the mesh store (optional private repo = templates + age-encrypted only, no plaintext); a brand-new working mesh results
+- [ ] **DATACENTER-19: DO provisioning (region picker + guided new-lighthouse).**
+  **Acceptance**:
+    - [ ] full region picker (geo + latency/price hints) with a multi-region-spread recommendation; fixed lighthouse profile (region the only knob); guided new-lighthouse: droplet (Tofu) → bootstrap mackesd → found/join prod mesh → add DNS record
+- [ ] **DATACENTER-20: Build→Eagle→DO promotion pipeline.**
+  **Acceptance**:
+    - [ ] auto-promote on green L1–L3 Build→Eagle; DO step gated by the prod-arm switch (armed=auto, disarmed=queued); version matrix reflects each stage
+- [ ] **DATACENTER-21: ephemeral test-mesh + build-farm scaling flows.**
+  **Acceptance**:
+    - [ ] one-click spin/teardown of an N-node test mesh from the golden template (hermetic, wraps `farm-testbed.sh`); a scale control adjusts build-VM count via Tofu
+
+### Phase 5 — Workstation, DR & observability
+- [ ] **DATACENTER-22: Enhanced Workstation profile (passthrough Primary Desktop VM).**
+  **As** a user, **I want** the Primary Desktop VM to own the hardware with dom0 hidden, **so that** the VM feels
+  like the local desktop.
+  **Acceptance**:
+    - [ ] GPU/USB/audio PCI-passthrough to a Primary Desktop VM that auto-launches at boot and owns the console; dom0 hidden; a management VM can reclaim the console for recovery if the desktop VM fails
+- [ ] **DATACENTER-23: control-plane DR (encrypted backup + one-click restore).**
+  **Acceptance**:
+    - [ ] periodic encrypted backup of Tofu state + Nebula CA + secret store to an off-fleet target; a guided restore rebirths the control plane and re-elects a leader
+- [ ] **DATACENTER-24: logs aggregation + periodic health checks.**
+  **Acceptance**:
+    - [ ] host/VM/worker logs aggregate into fleet_logs/Bus with a per-resource view; periodic checks (host/VM/overlay/cert) feed `health_check` + raise alerts (host down, VM crash, pool degraded, drift, token/cert expiry)
+
+### Phase 6 — Consolidation
+- [ ] **DATACENTER-25: absorb/deprecate overlapping panels into Datacenter tabs.**
+  **As** the project, **I want** the duplicated panels folded in, **so that** there's one coherent surface + less
+  dead nav (§7 reachability).
+  **Acceptance**:
+    - [ ] `compute`, `vm_wizard`, `snapshots`, `images`, `lighthouses`, `build_farm` logic reused as Datacenter tabs; the now-duplicate nav entries removed; no unreachable `pub mod` left behind
