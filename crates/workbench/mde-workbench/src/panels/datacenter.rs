@@ -12,6 +12,7 @@
 //! VMs/Storage/Network/Tofu/Gateway) layer on top in later DATACENTER tasks; the
 //! load + projection here are pure and unit-tested.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use cosmic::iced::widget::{column, container, row, scrollable, text};
@@ -20,6 +21,9 @@ use cosmic::Element;
 use mde_theme::{spacing, Palette};
 
 use crate::controls::{variant_button, ButtonVariant};
+// Brings the `.colr(..)` text extension + `Rgba::into_cosmic_color()` into scope
+// (same import the other token-styled panels use). mde-theme tokens only.
+use crate::cosmic_compat::prelude::*;
 
 /// One datacenter resource as last seen on the Bus.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +258,62 @@ pub fn project_rows(events: &[(String, String)]) -> Vec<DcRow> {
     rows
 }
 
+/// Group projected rows into the topology map the `Topology` view renders: one
+/// `(header, children)` tuple per Dev host (`kind == "host"`), with that host's
+/// VMs / SRs / networks (any non-host row whose `r.host` equals the host `id`)
+/// nested underneath. Everything left over — the Prod droplets, the gateway, and
+/// any orphan whose `host` names no known host — lands in a single synthetic
+/// trailing group whose header carries `kind == ""` and `id == ""` (a sentinel
+/// the view recognizes to label it "Prod / Gateway / unattached" rather than as a
+/// host). Hosts come first in `id` order (stable); the synthetic group, when it
+/// has children, is always last. Pure + testable.
+#[must_use]
+pub fn group_by_host(rows: &[DcRow]) -> Vec<(DcRow, Vec<DcRow>)> {
+    // The host headers, in stable `id` order.
+    let mut hosts: Vec<&DcRow> = rows.iter().filter(|r| r.kind == "host").collect();
+    hosts.sort_by(|a, b| a.id.cmp(&b.id));
+    let host_ids: BTreeSet<&str> = hosts.iter().map(|h| h.id.as_str()).collect();
+
+    let mut groups: Vec<(DcRow, Vec<DcRow>)> = Vec::with_capacity(hosts.len() + 1);
+    for host in &hosts {
+        let children: Vec<DcRow> = rows
+            .iter()
+            .filter(|r| r.kind != "host" && r.host == host.id)
+            .cloned()
+            .collect();
+        groups.push(((*host).clone(), children));
+    }
+
+    // Orphans: non-host rows that no known host claims (Prod droplets carry no
+    // `host`; the gateway / any dangling resource lands here too).
+    let orphans: Vec<DcRow> = rows
+        .iter()
+        .filter(|r| r.kind != "host" && !host_ids.contains(r.host.as_str()))
+        .cloned()
+        .collect();
+    if !orphans.is_empty() {
+        // Synthetic header — the empty `kind`/`id` is the sentinel the view keys
+        // on to render the "Prod · DO / Gateway / unattached" label.
+        let synthetic = DcRow {
+            kind: String::new(),
+            id: String::new(),
+            name: "Prod · DO / Gateway".to_string(),
+            status: String::new(),
+            zone: String::new(),
+            host: String::new(),
+            size: String::new(),
+            used: String::new(),
+            bridge: String::new(),
+            cpu: String::new(),
+            mem_total_mb: String::new(),
+            mem_free_mb: String::new(),
+            load: String::new(),
+        };
+        groups.push((synthetic, orphans));
+    }
+    groups
+}
+
 /// A cross-zone capacity rollup computed from the projected rows — counts per
 /// kind, per-zone resource counts, and the summed host CPU + total/free memory.
 /// Pure + testable; the Overview view renders it.
@@ -351,6 +411,17 @@ pub struct DatacenterPanel {
     /// confirm button fires the `action/dc/tofu-apply` RPC. Cleared once the
     /// apply is fired or cancelled.
     pub tofu_confirm: Option<String>,
+    /// Which `Topology`-view group headers are currently expanded — a set of host
+    /// `id`s (the synthetic Prod/Gateway group uses the empty-string key). A host
+    /// header is rendered expanded (children shown) iff its id is present; the
+    /// `HeaderClicked` message toggles membership. Defaults expanded (the set is
+    /// seeded on the first Topology render via [`Self::ensure_topology_seeded`]),
+    /// so the v1 map opens fully drilled-down.
+    pub expanded: BTreeSet<String>,
+    /// Tracks whether [`Self::expanded`] has been seeded for the current row set —
+    /// so a fresh load re-seeds (all groups open) but a manual collapse sticks
+    /// across re-renders. Reset to `false` on every `Loaded`.
+    pub topology_seeded: bool,
 }
 
 /// Top-level view selector for the datacenter panel.
@@ -364,6 +435,9 @@ pub enum ViewMode {
     Tofu,
     /// The datacenter audit log (`event/dc/audit/*`), newest-first.
     Audit,
+    /// The structured infrastructure map: resources grouped by their owning
+    /// host/zone, with collapsible host group headers (DATACENTER-13).
+    Topology,
 }
 
 impl Default for DatacenterPanel {
@@ -379,6 +453,8 @@ impl Default for DatacenterPanel {
             confirm_delete: None,
             audit: Vec::new(),
             tofu_confirm: None,
+            expanded: BTreeSet::new(),
+            topology_seeded: false,
         }
     }
 }
@@ -468,6 +544,10 @@ pub enum Message {
     /// The `action/dc/vm-delete` RPC came back — `Ok` carries a status line,
     /// `Err` the error text. Routes here as a panel-scoped message.
     DeleteDone(Result<String, String>),
+    /// A `Topology`-view group header was clicked — toggle that group's
+    /// expanded/collapsed state. The payload is the group key (a host `id`, or
+    /// the empty string for the synthetic Prod/Gateway group).
+    HeaderClicked(String),
 }
 
 impl DatacenterPanel {
@@ -497,6 +577,14 @@ impl DatacenterPanel {
                 self.confirm_delete = None;
                 // Likewise drop a stale tofu-apply confirm on a refresh.
                 self.tofu_confirm = None;
+                // A fresh row set: re-seed the Topology expansion so newly-arrived
+                // host groups open by default. If we're already on the Topology
+                // view, seed eagerly (the view borrows `&self` and can't); other-
+                // wise it seeds when the view is next selected.
+                self.topology_seeded = false;
+                if self.view_mode == ViewMode::Topology {
+                    self.ensure_topology_seeded();
+                }
                 Task::none()
             }
             Message::Loaded(Err(e)) => {
@@ -564,6 +652,9 @@ impl DatacenterPanel {
             }
             Message::ViewMode(mode) => {
                 self.view_mode = mode;
+                if mode == ViewMode::Topology {
+                    self.ensure_topology_seeded();
+                }
                 Task::none()
             }
             Message::TofuPlan(ws) => {
@@ -690,7 +781,28 @@ impl DatacenterPanel {
                 self.status = e;
                 Task::none()
             }
+            Message::HeaderClicked(key) => {
+                // Toggle the group's expanded state. Membership = expanded.
+                if !self.expanded.remove(&key) {
+                    self.expanded.insert(key);
+                }
+                Task::none()
+            }
         }
+    }
+
+    /// Seed [`Self::expanded`] so every current Topology group starts expanded —
+    /// run once per row set (guarded by [`Self::topology_seeded`]) the first time
+    /// the Topology view renders. A manual collapse afterwards sticks because the
+    /// guard stays set until the next `Loaded`.
+    fn ensure_topology_seeded(&mut self) {
+        if self.topology_seeded {
+            return;
+        }
+        for (header, _) in group_by_host(&self.rows) {
+            self.expanded.insert(header.id.clone());
+        }
+        self.topology_seeded = true;
     }
 
     pub fn view(&self) -> Element<'_, crate::Message> {
@@ -730,6 +842,7 @@ impl DatacenterPanel {
         );
         let mode_tabs = row![
             mode_btn("Overview", ViewMode::Overview),
+            mode_btn("Topology", ViewMode::Topology),
             mode_btn("Resources", ViewMode::Zone),
             mode_btn("Tofu", ViewMode::Tofu),
             mode_btn("Audit", ViewMode::Audit),
@@ -849,6 +962,40 @@ impl DatacenterPanel {
                     // Already projected newest-first; render each as a row.
                     for entry in &self.audit {
                         col = col.push(audit_row_view(entry));
+                    }
+                }
+            }
+            ViewMode::Topology => {
+                col = col.push(text("Topology").size(f32::from(spacing::BASE[5])));
+                let groups = group_by_host(&self.rows);
+                if groups.is_empty() {
+                    col = col.push(
+                        text(
+                            "No datacenter topology yet. Hosts, their VMs / storage \
+                             / networks, and the Prod zone appear here as the \
+                             orchestrator publishes them.",
+                        )
+                        .colr(palette.text_muted.into_cosmic_color()),
+                    );
+                } else {
+                    for (header, children) in &groups {
+                        // The synthetic Prod/Gateway group is keyed on the empty
+                        // host id; real host groups key on the host's id.
+                        let key = header.id.clone();
+                        let is_open = self.expanded.contains(&key);
+                        col = col.push(topology_header_view(
+                            header,
+                            children.len(),
+                            is_open,
+                            palette,
+                        ));
+                        if is_open {
+                            let n = children.len();
+                            for (i, child) in children.iter().enumerate() {
+                                let last = i + 1 == n;
+                                col = col.push(topology_child_view(child, last, palette));
+                            }
+                        }
                     }
                 }
             }
@@ -1010,6 +1157,100 @@ fn dc_row_view(r: &DcRow, palette: Palette, confirming: bool) -> Element<'_, cra
 
     container(line)
         .padding(f32::from(spacing::BASE[3]))
+        .width(Length::Fill)
+        .into()
+}
+
+/// Render one `Topology`-view group header — a clickable collapse/expand toggle.
+/// Real host groups (`header.kind == "host"`) show the host label, its dom0 IP,
+/// and a compact CPU/mem readout; the synthetic Prod/Gateway group (empty
+/// `kind`/`id`) shows its name. The whole header is a button carrying the
+/// `HeaderClicked(key)` message (key = the host id, or "" for the synthetic
+/// group). The leading glyph (`▾` open / `▸` collapsed) signals state. mde-theme
+/// tokens only — color comes from the button variant, sizes from `spacing::*`.
+fn topology_header_view(
+    header: &DcRow,
+    child_count: usize,
+    is_open: bool,
+    palette: Palette,
+) -> Element<'static, crate::Message> {
+    let glyph = if is_open { "▾" } else { "▸" };
+    let label = if header.kind == "host" {
+        let name = if header.name.is_empty() {
+            header.id.clone()
+        } else {
+            header.name.clone()
+        };
+        // Compact host metric readout, when the host reported any.
+        let mut meta = String::new();
+        if !header.cpu.is_empty() {
+            meta.push_str(&format!(" · {} vCPU", header.cpu));
+        }
+        if !header.mem_total_mb.is_empty() {
+            meta.push_str(&format!(" · {} MB", header.mem_total_mb));
+        }
+        format!(
+            "{glyph} Host {name} ({})  [{}]{}",
+            header.id, child_count, meta
+        )
+    } else {
+        // Synthetic Prod / Gateway group.
+        let name = if header.name.is_empty() {
+            "Prod · DO / Gateway".to_string()
+        } else {
+            header.name.clone()
+        };
+        format!("{glyph} {name}  [{child_count}]")
+    };
+    let key = header.id.clone();
+    variant_button(
+        label,
+        ButtonVariant::Secondary,
+        Some(crate::Message::Datacenter(Message::HeaderClicked(key))),
+        palette,
+    )
+}
+
+/// Render one nested child row under a `Topology` group header — indented with a
+/// connector glyph (`└─` for the last child, `├─` otherwise) so the tree reads
+/// as a map. Shows the resource kind, its label, and a kind-appropriate readout
+/// (sr capacity / net bridge / bare status), matching `dc_row_view`'s logic but
+/// read-only (no power/delete controls in the map). mde-theme tokens only.
+fn topology_child_view(
+    r: &DcRow,
+    last: bool,
+    palette: Palette,
+) -> Element<'static, crate::Message> {
+    let connector = if last { "  └─" } else { "  ├─" };
+    let label = if r.name.is_empty() {
+        r.id.clone()
+    } else {
+        r.name.clone()
+    };
+    let status_or_capacity = if r.kind == "sr" {
+        r.capacity_readout().unwrap_or_else(|| r.status.clone())
+    } else if r.kind == "net" && !r.bridge.is_empty() {
+        format!("{} · {}", r.status, r.bridge)
+    } else {
+        r.status.clone()
+    };
+    let line = row![
+        text(connector.to_string())
+            .colr(palette.text_muted.into_cosmic_color())
+            .width(Length::FillPortion(1)),
+        text(r.kind.clone())
+            .colr(palette.text_muted.into_cosmic_color())
+            .width(Length::FillPortion(1)),
+        text(label)
+            .colr(palette.text.into_cosmic_color())
+            .width(Length::FillPortion(3)),
+        text(status_or_capacity)
+            .colr(palette.text_muted.into_cosmic_color())
+            .width(Length::FillPortion(2)),
+    ]
+    .spacing(f32::from(spacing::BASE[3]));
+    container(line)
+        .padding(f32::from(spacing::BASE[2]))
         .width(Length::Fill)
         .into()
 }
@@ -1914,5 +2155,158 @@ mod tests {
         let mut p = DatacenterPanel::new();
         let _ = p.update(Message::ViewMode(ViewMode::Audit));
         assert_eq!(p.view_mode, ViewMode::Audit);
+    }
+
+    // ---- DATACENTER-13: Topology view (host-grouped, collapsible) ----------
+
+    /// A representative cross-zone row set: two Dev hosts (one with a VM + SR +
+    /// net child, one childless), plus a Prod droplet and a gateway-ish orphan.
+    fn topology_fixture() -> Vec<DcRow> {
+        project_rows(&[
+            (
+                "event/dc/host/a".into(),
+                r#"{"kind":"host","id":"172.20.0.9","name":"dom0-a","status":"up","zone":"dev","cpu":"8","mem_total_mb":"16000","mem_free_mb":"9000","load":"0.4"}"#.into(),
+            ),
+            (
+                "event/dc/host/b".into(),
+                r#"{"kind":"host","id":"172.20.145.193","name":"dom0-b","status":"up","zone":"dev","cpu":"16","mem_total_mb":"32000","mem_free_mb":"20000","load":"1.0"}"#.into(),
+            ),
+            (
+                "event/dc/vm/9".into(),
+                r#"{"kind":"vm","id":"9","name":"builder","status":"running","zone":"dev","host":"172.20.0.9"}"#.into(),
+            ),
+            (
+                "event/dc/sr/1".into(),
+                r#"{"kind":"sr","id":"sr-1","name":"local-ext","size":"222330230784","used":"42949672960","host":"172.20.0.9","zone":"dev"}"#.into(),
+            ),
+            (
+                "event/dc/net/0".into(),
+                r#"{"kind":"net","id":"net-0","name":"Pool-wide network","status":"up","zone":"dev","bridge":"xenbr0","host":"172.20.0.9"}"#.into(),
+            ),
+            (
+                "event/dc/droplet/2".into(),
+                r#"{"kind":"droplet","id":"2","name":"lighthouse-01","status":"active","zone":"prod"}"#.into(),
+            ),
+            (
+                "event/dc/gw/gw0".into(),
+                r#"{"kind":"gateway","id":"gw0","name":"nebula-gw","status":"up","zone":"prod"}"#.into(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn group_by_host_nests_children_under_their_host() {
+        let groups = group_by_host(&topology_fixture());
+        // Two host groups (id-sorted) + one synthetic Prod/Gateway group.
+        assert_eq!(groups.len(), 3);
+        // Host groups come first, in `id` order: "172.20.0.9" < "172.20.145.193".
+        assert_eq!(groups[0].0.kind, "host");
+        assert_eq!(groups[0].0.id, "172.20.0.9");
+        // Its three children: vm, sr, net (all carry host == that dom0).
+        assert_eq!(groups[0].1.len(), 3);
+        assert!(groups[0].1.iter().all(|c| c.host == "172.20.0.9"));
+        assert!(groups[0].1.iter().any(|c| c.kind == "vm"));
+        assert!(groups[0].1.iter().any(|c| c.kind == "sr"));
+        assert!(groups[0].1.iter().any(|c| c.kind == "net"));
+        // Second host is childless.
+        assert_eq!(groups[1].0.id, "172.20.145.193");
+        assert!(groups[1].1.is_empty());
+        // Trailing synthetic group: empty kind/id sentinel, holds the orphans
+        // (the Prod droplet + the gateway).
+        let (synth, orphans) = &groups[2];
+        assert_eq!(synth.kind, "");
+        assert_eq!(synth.id, "");
+        assert_eq!(orphans.len(), 2);
+        assert!(orphans.iter().any(|c| c.kind == "droplet"));
+        assert!(orphans.iter().any(|c| c.kind == "gateway"));
+    }
+
+    #[test]
+    fn group_by_host_orphan_with_unknown_host_lands_in_synthetic_group() {
+        // A vm naming a host that doesn't exist must not vanish — it falls into
+        // the synthetic group rather than being dropped.
+        let rows = project_rows(&[(
+            "event/dc/vm/x".into(),
+            r#"{"kind":"vm","id":"x","name":"stray","status":"running","zone":"dev","host":"10.0.0.99"}"#.into(),
+        )]);
+        let groups = group_by_host(&rows);
+        assert_eq!(groups.len(), 1); // no host header, just the synthetic group
+        assert_eq!(groups[0].0.kind, "");
+        assert_eq!(groups[0].1.len(), 1);
+        assert_eq!(groups[0].1[0].id, "x");
+    }
+
+    #[test]
+    fn group_by_host_empty_is_empty() {
+        assert!(group_by_host(&[]).is_empty());
+    }
+
+    #[test]
+    fn topology_view_mode_seeds_all_groups_expanded() {
+        let mut p = DatacenterPanel::new();
+        p.rows = topology_fixture();
+        let _ = p.update(Message::ViewMode(ViewMode::Topology));
+        assert_eq!(p.view_mode, ViewMode::Topology);
+        // Every group (both host ids + the synthetic "" key) starts expanded.
+        assert!(p.expanded.contains("172.20.0.9"));
+        assert!(p.expanded.contains("172.20.145.193"));
+        assert!(p.expanded.contains("")); // synthetic Prod/Gateway group
+    }
+
+    #[test]
+    fn topology_view_renders_open_and_collapsed() {
+        let mut p = DatacenterPanel::new();
+        p.rows = topology_fixture();
+        let _ = p.update(Message::ViewMode(ViewMode::Topology));
+        // Fully expanded render — exercises header + nested child rows.
+        let _ = p.view();
+        // Collapse the first host group, then render the collapsed branch.
+        let _ = p.update(Message::HeaderClicked("172.20.0.9".to_string()));
+        assert!(!p.expanded.contains("172.20.0.9"));
+        let _ = p.view();
+    }
+
+    #[test]
+    fn topology_view_renders_empty_state() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::ViewMode(ViewMode::Topology));
+        // No rows → group_by_host empty → the empty-state copy renders.
+        let _ = p.view();
+    }
+
+    #[test]
+    fn header_clicked_toggles_expanded_membership() {
+        let mut p = DatacenterPanel::new();
+        // Toggle on, then off — membership tracks expanded state.
+        let _ = p.update(Message::HeaderClicked("172.20.0.9".to_string()));
+        assert!(p.expanded.contains("172.20.0.9"));
+        let _ = p.update(Message::HeaderClicked("172.20.0.9".to_string()));
+        assert!(!p.expanded.contains("172.20.0.9"));
+    }
+
+    #[test]
+    fn topology_collapse_sticks_across_a_re_render_but_load_re_seeds() {
+        let mut p = DatacenterPanel::new();
+        p.rows = topology_fixture();
+        let _ = p.update(Message::ViewMode(ViewMode::Topology));
+        // Manual collapse of a host group sticks (guard stays set).
+        let _ = p.update(Message::HeaderClicked("172.20.0.9".to_string()));
+        assert!(!p.expanded.contains("172.20.0.9"));
+        p.ensure_topology_seeded(); // a re-render: already seeded → no-op
+        assert!(!p.expanded.contains("172.20.0.9"));
+        // A fresh Loaded re-seeds: the collapsed group re-opens.
+        let load = DcLoad {
+            rows: topology_fixture(),
+            audit: Vec::new(),
+        };
+        let _ = p.update(Message::Loaded(Ok(load)));
+        assert!(p.expanded.contains("172.20.0.9"));
+    }
+
+    #[test]
+    fn topology_view_mode_is_selectable() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::ViewMode(ViewMode::Topology));
+        assert_eq!(p.view_mode, ViewMode::Topology);
     }
 }
