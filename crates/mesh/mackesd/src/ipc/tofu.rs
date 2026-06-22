@@ -19,6 +19,12 @@
 //!   * `action/dc/tofu-destroy` → `tofu destroy -auto-approve`.
 //! Both share the same `tofu_workspace_dir` allow-list as the injection guard
 //! and refuse to run unless `confirm == true`.
+//!
+//! DC-15 also exposes a read-only **state browser** verb (DATACENTER-15):
+//!   * `action/dc/tofu-state` → the managed-resource addresses from
+//!     `tofu state list` plus a `drift` flag derived from a detailed-exit-code
+//!     `tofu plan`. Request `{ "workspace": ... }`, reply
+//!     `{"ok":true,"resources":[<addr>...],"drift":<bool>}`. Read-only.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -44,7 +50,7 @@ impl TofuService {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 3] = ["tofu-plan", "tofu-apply", "tofu-destroy"];
+pub const ACTION_VERBS: [&str; 4] = ["tofu-plan", "tofu-apply", "tofu-destroy", "tofu-state"];
 
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -82,12 +88,34 @@ pub fn is_confirmed(req: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Parse `tofu state list` stdout into one address per managed resource. PURE.
+///
+/// Keeps non-empty trimmed lines, in order. Blank lines (and surrounding
+/// whitespace) are dropped, so an empty / whitespace-only output yields `[]`.
+#[must_use]
+pub fn parse_state_list(out: &str) -> Vec<String> {
+    out.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Whether a `tofu plan -detailed-exitcode` exit code signals drift. PURE.
+///
+/// Detailed exit codes: `0` = no changes, `2` = changes (drift), anything else
+/// (notably `1` = error) is treated as *not drift* — the flag fails closed.
+#[must_use]
+pub fn drift_from_exit(code: i32) -> bool {
+    code == 2
+}
+
 /// Build the reply for one `action/dc/<verb>` request.
 #[must_use]
 pub fn build_reply(svc: &TofuService, verb: &str, req_body: Option<&str>) -> String {
     let err = |m: String| json!({ "error": m }).to_string();
     match verb {
-        "tofu-plan" | "tofu-apply" | "tofu-destroy" => {}
+        "tofu-plan" | "tofu-apply" | "tofu-destroy" | "tofu-state" => {}
         _ => return err("unknown dc verb".into()),
     }
     let Some(body) = req_body else {
@@ -112,6 +140,44 @@ pub fn build_reply(svc: &TofuService, verb: &str, req_body: Option<&str>) -> Str
         return err("apply requires confirm:true".into());
     }
 
+    let repo = svc.workgroup_root.display();
+
+    // The state browser has its own (read-only) two-command shape and reply.
+    if verb == "tofu-state" {
+        // 1. Managed-resource addresses. `dir` / `repo` are allow-listed /
+        //    process-owned, so this is not an injection surface.
+        let list_script = format!("cd {repo}/{dir} && tofu state list 2>/dev/null");
+        let resources = match std::process::Command::new("bash")
+            .args(["-lc", &list_script])
+            .output()
+        {
+            Ok(o) => parse_state_list(&String::from_utf8_lossy(&o.stdout)),
+            Err(e) => return err(format!("tofu-state exec failed: {e}")),
+        };
+
+        // 2. Drift via a detailed-exit-code plan. We echo the exit code so the
+        //    exec only "fails" if bash itself cannot launch.
+        let drift_script = format!(
+            "cd {repo}/{dir} && source ./env.sh 2>/dev/null && \
+             tofu plan -detailed-exitcode -no-color >/dev/null 2>&1; echo $?"
+        );
+        let drift = match std::process::Command::new("bash")
+            .args(["-lc", &drift_script])
+            .output()
+        {
+            Ok(o) => {
+                let code = String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .parse::<i32>()
+                    .unwrap_or(-1);
+                drift_from_exit(code)
+            }
+            Err(e) => return err(format!("tofu-state exec failed: {e}")),
+        };
+
+        return json!({ "ok": true, "resources": resources, "drift": drift }).to_string();
+    }
+
     // The per-verb tofu invocation. `dir` and `repo` are allow-listed /
     // process-owned, so this is not an injection surface.
     let tofu_cmd = match verb {
@@ -121,7 +187,6 @@ pub fn build_reply(svc: &TofuService, verb: &str, req_body: Option<&str>) -> Str
         _ => "tofu destroy -auto-approve -no-color 2>&1 | tail -30",
     };
 
-    let repo = svc.workgroup_root.display();
     let script = format!("cd {repo}/{dir} && source ./env.sh 2>/dev/null && {tofu_cmd}");
     match std::process::Command::new("bash")
         .args(["-lc", &script])
@@ -194,9 +259,53 @@ mod tests {
         assert_eq!(action_topic("tofu-plan"), "action/dc/tofu-plan");
         assert_eq!(action_topic("tofu-apply"), "action/dc/tofu-apply");
         assert_eq!(action_topic("tofu-destroy"), "action/dc/tofu-destroy");
+        assert_eq!(action_topic("tofu-state"), "action/dc/tofu-state");
         assert!(ACTION_VERBS.contains(&"tofu-plan"));
         assert!(ACTION_VERBS.contains(&"tofu-apply"));
         assert!(ACTION_VERBS.contains(&"tofu-destroy"));
+        assert!(ACTION_VERBS.contains(&"tofu-state"));
+    }
+
+    #[test]
+    fn parse_state_list_keeps_nonempty_trimmed_lines() {
+        assert_eq!(parse_state_list(""), Vec::<String>::new());
+        assert_eq!(parse_state_list("   \n\n\t\n"), Vec::<String>::new());
+        assert_eq!(
+            parse_state_list("xenorchestra_vm.a\n\n  module.net.do_droplet.b  \nlocal_file.c\n"),
+            vec![
+                "xenorchestra_vm.a".to_string(),
+                "module.net.do_droplet.b".to_string(),
+                "local_file.c".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn drift_from_exit_true_only_for_two() {
+        assert!(drift_from_exit(2));
+        assert!(!drift_from_exit(0)); // no changes
+        assert!(!drift_from_exit(1)); // error → fail closed
+        assert!(!drift_from_exit(-1)); // unparseable → fail closed
+        assert!(!drift_from_exit(127));
+    }
+
+    #[test]
+    fn tofu_state_rejects_unknown_workspace() {
+        let s = TofuService::new(PathBuf::from("/tmp"));
+        let body = json!({ "workspace": "prod" }).to_string();
+        let r = build_reply(&s, "tofu-state", Some(&body));
+        assert!(r.contains("unknown tofu workspace"), "{r}");
+    }
+
+    #[test]
+    fn tofu_state_does_not_require_confirm() {
+        // Read-only: the confirm gate never applies, so a bad workspace (not the
+        // confirm error) is what we get back.
+        let s = TofuService::new(PathBuf::from("/tmp"));
+        let body = json!({ "workspace": "../../etc" }).to_string();
+        let r = build_reply(&s, "tofu-state", Some(&body));
+        assert!(!r.contains("apply requires confirm:true"), "{r}");
+        assert!(r.contains("unknown tofu workspace"), "{r}");
     }
 
     #[test]
