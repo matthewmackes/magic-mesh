@@ -37,7 +37,7 @@ KEY="${MCNF_FARM_KEY:-$HOME/.ssh/mackes_mesh_ed25519}"
 CONF="${MCNF_FARM_CONF:-$HOME/.config/mcnf-farm.conf}"
 
 # Default fleet; a conf file (one `dom0_ip|label|buildvm_ip` per line) overrides.
-FLEET_DEFAULT=$'172.20.0.9|XEN-HOME-SERVICES|172.20.0.50\n172.20.145.193|KVM-XCP1|172.20.0.51'
+FLEET_DEFAULT=$'172.20.0.9|XEN-HOME-SERVICES|172.20.0.50\n172.20.145.193|KVM-XCP1|172.20.0.51\n172.20.145.165|XEN-BIGBOY|172.20.0.52'
 fleet() { [ -f "$CONF" ] && grep -vE '^\s*(#|$)' "$CONF" || printf '%s\n' "$FLEET_DEFAULT"; }
 
 SSHK=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=12)

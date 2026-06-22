@@ -19,8 +19,9 @@ it is, how it's automated, and how to recover it.
 | Host | IP | Role | Notes |
 |---|---|---|---|
 | `rocky9-kvm2` (dev) | `172.20.145.192` | Orchestration + local builds + podman | Rocky 9.8; full GUI toolchain installed (below); runs XO + tofu/ansible/packer |
-| `XEN-HOME-SERVICES` | `172.20.0.9` | XCP-ng 8.3 dom0 — build host | local SR is **`ext`** (not "Local storage"); build VM → `172.20.0.50` |
-| `KVM-XCP1` | `172.20.145.193` | XCP-ng 8.3 dom0 — test bed | build VM → `172.20.0.51`; spin throwaway test nodes here |
+| `XEN-HOME-SERVICES` | `172.20.0.9` | XCP-ng 8.3 dom0 — build host (4c/24G) | local SR is **`ext`** (not "Local storage"); build VM → `172.20.0.50` |
+| `KVM-XCP1` | `172.20.145.193` | XCP-ng 8.3 dom0 — test bed (4c/23G) | build VM → `172.20.0.51`; spin throwaway test nodes here |
+| `XEN-BIGBOY` | `172.20.145.165` | XCP-ng 8.3 dom0 — high-capacity (**12c/32G**, 398G SR) | build VM → `172.20.0.52` (8 vCPU/24G); room for several more build VMs |
 
 **Access:** management is SSH-key (`~/.ssh/mackes_mesh_ed25519`, authorized on both
 dom0s + the build VMs' `mm` user). First-time dom0 provisioning needs the XCP root

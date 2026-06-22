@@ -85,11 +85,12 @@ LAN `172.20.0.0/16`. Management is the **mesh SSH key**
 `~/.ssh/mackes_mesh_ed25519` (authorized on both dom0s + the build VMs' `mm`
 user). Secrets are **off-repo** — see "Credentials" below.
 
-| Host | IP | OS | Role |
-|---|---|---|---|
-| `rocky9-kvm2` (dev) | `172.20.145.192` | Rocky 9.8 | Orchestration + **local builds** + podman; runs XO + tofu/ansible/packer; this is where Claude Code + `/root/magic-mesh` live |
-| `XEN-HOME-SERVICES` | `172.20.0.9` | XCP-ng 8.3 dom0 | hypervisor — pool of build VM `mcnf-build-50` (172.20.0.50); local SR is `ext` ("Local storage") |
-| `KVM-XCP1` | `172.20.145.193` | XCP-ng 8.3 dom0 | hypervisor — pool of build VM `mcnf-build-51` (172.20.0.51); spare capacity for throwaway test nodes |
+| Host | IP | OS | Cores / RAM | Role |
+|---|---|---|---|---|
+| `rocky9-kvm2` (dev) | `172.20.145.192` | Rocky 9.8 | — | Orchestration + **local builds** + podman; runs XO + tofu/ansible/packer; this is where Claude Code + `/root/magic-mesh` live |
+| `XEN-HOME-SERVICES` | `172.20.0.9` | XCP-ng 8.3 dom0 | 4c / 24 GiB | hypervisor — build VM `mcnf-build-50` (172.20.0.50, 4 vCPU/16 GiB); local SR is `ext` ("Local storage") |
+| `KVM-XCP1` | `172.20.145.193` | XCP-ng 8.3 dom0 | 4c / 23 GiB | hypervisor — build VM `mcnf-build-51` (172.20.0.51, 4 vCPU/16 GiB) |
+| `XEN-BIGBOY` | `172.20.145.165` | XCP-ng 8.3 dom0 | **12c / 32 GiB** | hypervisor — build VM `mcnf-build-52` (172.20.0.52, **8 vCPU/24 GiB**); 398 GiB SR; the high-capacity node (room for several more build VMs) |
 
 ### Credentials (locations only — never in-repo)
 - **Mesh SSH key:** `~/.ssh/mackes_mesh_ed25519` (+ `.pub`) — dom0s + build-VM `mm`.

@@ -20,8 +20,8 @@ resource "xenorchestra_vm" "build" {
   hvm_boot_firmware = "uefi"
   secure_boot       = false
 
-  cpus       = var.build_vcpus
-  memory_max = var.build_memory_gib * 1024 * 1024 * 1024
+  cpus       = try(each.value.vcpus, var.build_vcpus)
+  memory_max = try(each.value.mem_gib, var.build_memory_gib) * 1024 * 1024 * 1024
 
   cloud_config = templatefile("${path.module}/cloud-init/build-vm.yaml.tftpl", {
     hostname   = each.value.name

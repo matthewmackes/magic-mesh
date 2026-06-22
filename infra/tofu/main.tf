@@ -2,16 +2,25 @@
 # install-helpers/xcp-build.sh always reaches it. Mirrors the fleet that the
 # stopgap farm.sh drives — now declared as code.
 locals {
+  # Per-VM `vcpus`/`mem_gib` are OPTIONAL overrides of the global var defaults —
+  # bigger hosts get bigger build nodes ("optimum use of available hardware").
   build_vms = {
     "xen-home-services" = {
-      pool_name = "XEN-HOME-SERVICES" # 172.20.0.9
+      pool_name = "XEN-HOME-SERVICES" # 172.20.0.9 — 4c / 24 GiB
       ip_cidr   = "172.20.0.50/16"
-      name      = "mcnf-build-50" # MUST be unique across pools: XO sees both,
+      name      = "mcnf-build-50" # MUST be unique across pools: XO sees all,
     }                             # and the provider looks VMs up by name_label.
     "kvm-xcp1" = {
-      pool_name = "KVM-XCP1" # 172.20.145.193
+      pool_name = "KVM-XCP1" # 172.20.145.193 — 4c / 23 GiB
       ip_cidr   = "172.20.0.51/16"
       name      = "mcnf-build-51"
+    }
+    "xen-bigboy" = {
+      pool_name = "XEN-BIGBOY" # 172.20.145.165 — 12c / 32 GiB / 398 GiB SR
+      ip_cidr   = "172.20.0.52/16"
+      name      = "mcnf-build-52"
+      vcpus     = 8  # leverage the 12 cores (leaves headroom for more nodes)
+      mem_gib   = 24
     }
   }
 
