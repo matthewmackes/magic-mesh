@@ -1,0 +1,2 @@
+# runtime job state (results/logs/locks) — not source
+.state/

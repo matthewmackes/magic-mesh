@@ -1591,3 +1591,17 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
 ### INCIDENT-WEDGE — destroying old lighthouses wedged every node's LizardFS mounts (2026-06-20)
 - [✓] **INCIDENT-WEDGE-1: fleet-wide LizardFS FUSE wedge + recovery runbook.** During the v11 rebuild, destroying the old DO lighthouses removed the LizardFS master, so EVERY old-mesh node's QNM-Shared mounts (`/mnt/mesh-storage`, `/root/QNM-Shared`, XDG bind-mounts) wedged at once — `mfs#<gone-master>:9421` mounts pinning each box at load 80+ with uninterruptible D-state procs that `kill -9` can't touch and that block sudo/rpm/systemd. **Key finding:** `fusermount -uz` does NOT release the blocked I/O; aborting the FUSE connection via `/sys/fs/fuse/connections/*/abort` does (drops load 82→10 in seconds). Packaged as `install-helpers/unwedge-lizardfs.sh` (abort → lazy-unmount → mask qnm-shared; stragglers need `reboot -f`). **This is the SUBSTRATE-V2 motivation in one incident:** with etcd+Syncthing there is no FUSE master to disappear. Reinforces OPROG-2 (etcd cutover) urgency: a node rejoining the new mesh must keep `qnm-shared` masked.
 - [ ] **INCIDENT-WEDGE-2: the new v11 mesh must not re-introduce the single-master FUSE dependency.** The new founding lighthouse currently coordinates via the QNM-plain-dir path; run the etcd+Syncthing cutover (`cutover-substrate-v2.sh --init` on the lighthouse) so the new mesh never has a wedgeable LizardFS master. **Acceptance:** lighthouse-01 coordinates via etcd; new joins set up Syncthing (no FUSE mount); destroying/replacing a lighthouse never wedges peers.
+
+## FARM-AUTO — build-farm automation (worklist-driven, fleet-side, no AI) (2026-06-22)
+The 5 capabilities designed for on-demand build orchestration over the 3-node IaC
+farm. Shared substrate: `automation/lib/farm-jobs.sh` (the worklist `@farm:` job parser)
++ `automation/lib/farm-dispatch.sh` (claim a free node → build there → record JSON).
+Each capability is a distinct trigger/brain over that substrate; all run on the
+fleet/host machines, not via an AI.
+- [✓] **FARM-AUTO-0: shared substrate — worklist job parser + fleet dispatch.** Jobs come from an `@farm:` tag (command in braces) on worklist tasks; dispatch claims a free ready node (per-node flock, big-iron-first), rsyncs the tree, runs the command on the VM, records a JSON result. **Acceptance:** `farm-jobs.sh active` lists tagged jobs; `farm-dispatch.sh run <id> "<cmd>"` builds on a node + writes pass/fail.
+- [ ] **FARM-AUTO-1: mackesd `farm-orchestrator` worker** — Bus/etcd-triggered, signed-Ansible job bundles, leader-elected. **Acceptance:** an `@farm` job dispatched + reaped via Bus verbs, no AI.
+- [ ] **FARM-AUTO-2: Forgejo Actions + ephemeral XCP runners.** **Acceptance:** a push/schedule runs the farm gate on an auto-spawned VM runner; tears down.
+- [ ] **FARM-AUTO-3: etcd work-queue + builder agents (pull) + pool autoscaler.** **Acceptance:** agents lease jobs from etcd, build, ack; the pool-manager scales VMs to queue depth.
+- [ ] **FARM-AUTO-4: declarative GitOps reconciler.** **Acceptance:** a systemd-timer converges the worklist's active `@farm` jobs onto the farm idempotently; results committed back.
+- [ ] **FARM-AUTO-5: Provisioning-plane controller + Workbench Build panel.** **Acceptance:** the panel queues worklist tasks to the farm + streams live status off the Bus.
+- [ ] **FARM-AUTO-SMOKE: live job inputs for the substrate.** @farm:{cargo build -p mde-bus} @farm:{cargo test -p mde-theme}
