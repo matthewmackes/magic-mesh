@@ -1628,23 +1628,27 @@ snapshot-reset VM pool from MDE-VM-golden.
   **Acceptance**:
     - [ ] a harness (tofu workspace or a `farm-testbed.sh`) provisions N clean VMs from the golden template, returns their IPs, and tears them down on completion (reusing the proven NM-keyfile path)
     - [ ] runs isolated from the build VMs (.50/.51/.52) and the live fleet; a failed run still cleans up
-- [ ] **BUILD-PLATFORM-4: L1 install (e2e) acceptance — nightly RPM cut → clean-VM install.**
+- [>] **BUILD-PLATFORM-4: L1 install (e2e) acceptance — nightly RPM cut → clean-VM install.**
+  *Runner built + wired (`automation/testbed/test-install.sh`); first green run pending the release RPM (building) + a clean-node install.*
   **As** an operator, **I want** the real RPM installed on a clean node nightly, **so that** install regressions are caught off the critical path.
   **Acceptance**:
     - [ ] a nightly job cuts the RPM, installs it on a snapshot-reset VM, and asserts: services up, role chooser runs, `found`/`join` enrol succeeds, overlay forms
     - [ ] result published to the Bus (`event/test/install`); a failure raises an alert; never blocks an L0 build
-- [ ] **BUILD-PLATFORM-5: L2 feature acceptance on the VM pool (nightly).**
+- [>] **BUILD-PLATFORM-5: L2 feature acceptance on the VM pool (nightly).**
+  *Runner built (`test-feature.sh`, 2-node found+join mesh); first green run pending the RPM + the onboarding flow on clean nodes.*
   **As** the project, **I want** per-feature runtime-observable acceptance run on real nodes, **so that** features are proven, not just compiled.
   **Acceptance**:
     - [ ] a nightly suite runs each feature's §7 acceptance bullets on the VM pool / a small ephemeral mesh (a service exposes + is reachable, mesh-DNS resolves, a GUI binary launches)
     - [ ] per-feature pass/fail on the Bus (`event/test/feature/<id>`); a red feature is named in the nightly report
-- [ ] **BUILD-PLATFORM-6: L3 stability — soak + chaos + reboot-recovery (nightly/weekly).**
+- [>] **BUILD-PLATFORM-6: L3 stability — soak + chaos + reboot-recovery (nightly/weekly).**
+  *Runner built (`test-stability.sh`: soak+chaos+reboot); first green run pending the RPM + a live mesh.*
   **As** an operator, **I want** stability proven over time + under failure, **so that** the build is trustworthy.
   **Acceptance**:
     - [ ] **soak**: a daemon runs under sustained traffic with footprint flat (the BUS-RETENTION soak pattern)
     - [ ] **chaos**: destroying a lighthouse causes no fleet-wide FUSE wedge + failover holds (the INCIDENT-WEDGE lesson)
     - [ ] **reboot-recovery**: a node reboots and mounts/overlay self-heal (BOOT-REC); each result on the Bus
-- [ ] **BUILD-PLATFORM-7: test visibility — Bus events + nightly report + panel badge.**
+- [>] **BUILD-PLATFORM-7: test visibility — Bus events + nightly report + panel badge.**
+  *Built + PARTLY verified: nightly orchestrator + report + Bus summary (`nightly.sh` + timer); the Build panel now reads `event/test/*` (mde-workbench builds + tests pass on the farm). First real nightly summary pending the tiers running.*
   **As** an operator, **I want** test outcomes visible without asking an AI, **so that** a rotting safety net is obvious.
   **Acceptance**:
     - [ ] a nightly summary (pass/fail per tier) written to a known location + published to the Bus

@@ -1,0 +1,13 @@
+# BUILD-PLATFORM-7 — the nightly internal test pyramid (L1 install + L2 feature +
+# L3 stability) on the snapshot-reset VM pool. Off the critical path; results→Bus.
+[Unit]
+Description=MCNF nightly internal tests (install + feature + stability)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+Environment=HOME=/root
+WorkingDirectory=/root/magic-mesh
+ExecStart=/bin/bash -lc '/root/magic-mesh/automation/testbed/nightly.sh'
+TimeoutStartSec=10800
+Nice=15

@@ -58,14 +58,46 @@ pub fn parse_farm_event(body: &str) -> Option<FarmJobRow> {
     })
 }
 
-/// Project a set of `(topic, latest-body)` Bus reads into sorted job rows
-/// (failed first, then queued, then passed — most actionable on top). Pure.
+/// Parse an `event/test/<tier>` nightly-test summary into a row (BUILD-PLATFORM-7:
+/// L1 install / L2 feature / L3 stability / nightly). The body carries
+/// `outcome`/`overall` (pass|fail|green|RED) rather than a job phase. Pure.
+#[must_use]
+pub fn parse_test_event(topic: &str, body: &str) -> Option<FarmJobRow> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let jobid = topic.strip_prefix("event/").unwrap_or(topic).to_string(); // e.g. "test/install"
+    let raw = v
+        .get("outcome")
+        .or_else(|| v.get("overall"))
+        .and_then(|o| o.as_str())
+        .unwrap_or("");
+    let outcome = match raw {
+        "pass" | "green" => "pass",
+        "" => "",
+        _ => "fail",
+    }
+    .to_string();
+    Some(FarmJobRow {
+        jobid,
+        phase: "done".into(),
+        outcome,
+    })
+}
+
+/// Project a set of `(topic, latest-body)` Bus reads into sorted rows — farm jobs
+/// (`event/farm/*`) AND nightly test summaries (`event/test/*`), failures first.
 #[must_use]
 pub fn project_rows(events: &[(String, String)]) -> Vec<FarmJobRow> {
     let mut rows: Vec<FarmJobRow> = events
         .iter()
-        .filter(|(topic, _)| topic.starts_with("event/farm/"))
-        .filter_map(|(_, body)| parse_farm_event(body))
+        .filter_map(|(topic, body)| {
+            if topic.starts_with("event/farm/") {
+                parse_farm_event(body)
+            } else if topic.starts_with("event/test/") {
+                parse_test_event(topic, body)
+            } else {
+                None
+            }
+        })
         .collect();
     rows.sort_by_key(|r| match (r.phase.as_str(), r.outcome.as_str()) {
         ("done", "fail") => 0,
@@ -180,7 +212,10 @@ fn read_farm_events() -> Result<Vec<FarmJobRow>, String> {
     let persist = mde_bus::persist::Persist::open(dir).map_err(|e| e.to_string())?;
     let topics = persist.list_topics().map_err(|e| e.to_string())?;
     let mut events = Vec::new();
-    for topic in topics.into_iter().filter(|t| t.starts_with("event/farm/")) {
+    for topic in topics
+        .into_iter()
+        .filter(|t| t.starts_with("event/farm/") || t.starts_with("event/test/"))
+    {
         if let Ok(msgs) = persist.list_since(&topic, None) {
             if let Some(body) = msgs.last().and_then(|m| m.body.clone()) {
                 events.push((topic, body));
@@ -205,6 +240,15 @@ mod tests {
         let q = parse_farm_event(r#"{"jobid":"x","phase":"queued"}"#).unwrap();
         assert_eq!(q.status_label(), "… queued");
         assert!(parse_farm_event("not json").is_none());
+    }
+
+    #[test]
+    fn parse_test_event_maps_outcome_to_pass_fail() {
+        let ok = parse_test_event("event/test/install", r#"{"outcome":"pass"}"#).unwrap();
+        assert_eq!(ok.jobid, "test/install");
+        assert_eq!(ok.status_label(), "✓ passed");
+        let red = parse_test_event("event/test/nightly", r#"{"overall":"RED"}"#).unwrap();
+        assert_eq!(red.status_label(), "✗ failed");
     }
 
     #[test]
