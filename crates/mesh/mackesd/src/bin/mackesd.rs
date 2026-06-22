@@ -6021,6 +6021,22 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("datacenter_orchestrator".into());
 
+        // DATACENTER-7 (audit half) — passive datacenter audit subscriber.
+        // Leader-gated; watches the `action/dc/*` Bus lanes and emits one
+        // append-only `event/dc/audit/<ulid>` record per request (deduped on
+        // ulid), without touching the action handlers — a pure side-observer.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::dc_auditor::DcAuditorWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("dc_auditor".into());
+
         // ONBOARD-6 — continuous leader election. Renews the
         // <QNM-Shared>/.mackesd-leader.lock lease every 20s so exactly one
         // node always holds leadership (previously only the upgrade watcher

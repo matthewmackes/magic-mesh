@@ -387,6 +387,10 @@ pub mod farm_orchestrator;
 // DATACENTER-5 — datacenter orchestrator: samples the DC substrate (DO/Xen/gateway)
 // onto the Bus as `event/dc/<kind>/<id>` for the Workbench Datacenter plane.
 pub mod datacenter_orchestrator;
+// DATACENTER-7 (audit half) — passive audit subscriber: watches the `action/dc/*`
+// Bus lanes and emits one append-only `event/dc/audit/<ulid>` record per request,
+// without touching the action handlers. Leader-gated; dedups on request ulid.
+pub mod dc_auditor;
 // VPN-GW-1 — per-node commercial-VPN tunnel engine (WireGuard/OpenVPN baseline).
 pub mod stun_gather;
 pub mod subprocess_tick;
