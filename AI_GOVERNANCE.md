@@ -221,6 +221,15 @@ memory. The load-bearing facts (full detail + the gotchas index live in the doc)
   Xen Orchestra) builds the VMs from the `MDE-VM-golden` template; `infra/ansible/`
   installs the toolchain. `tofu apply` rebuilds the farm from code. Secrets
   (`/root/.mcnf-xo-token`, the mesh key) are off-repo.
+- **Build PLATFORM direction** (`docs/design/build-platform.md`, locked 2026-06-22):
+  the **GitOps reconciler on a timer** is the canonical build lane — builds happen
+  because the worklist changed (an `@farm:{…}` tag on a task), **no AI in the build
+  loop**; AI spends tokens only on design + failure-triage. **Shared `sccache`** is
+  the build-speed lever. Correctness is proven by an **internal** test pyramid — L0
+  build+unit on every change (blocks green), L1 install + L2 feature + L3 stability
+  (soak/chaos/reboot) **nightly + on-demand, never blocking** — run on a
+  **snapshot-reset VM pool** from `MDE-VM-golden`. The 5 FARM-AUTO capabilities are
+  the substrate; the reconciler is the default.
 
 ---
 

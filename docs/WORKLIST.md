@@ -1604,4 +1604,48 @@ fleet/host machines, not via an AI.
 - [✓] **FARM-AUTO-3: etcd work-queue + builder agents (pull) + pool autoscaler.** **Acceptance:** agents lease jobs from etcd, build, ack; the pool-manager scales VMs to queue depth.
 - [✓] **FARM-AUTO-4: declarative GitOps reconciler.** **Acceptance:** a systemd-timer converges the worklist's active `@farm` jobs onto the farm idempotently; results committed back.
 - [✓] **FARM-AUTO-5: Provisioning-plane controller + Workbench Build panel.** **Acceptance:** the panel queues worklist tasks to the farm + streams live status off the Bus.
-- [ ] **FARM-AUTO-SMOKE: live job inputs for the substrate.** @farm:{cargo build -p mde-bus} @farm:{cargo test -p mde-theme}
+- [>] **FARM-AUTO-PROD: production build jobs (real crates, fleet-driven).** @farm:{cargo build -p mackesd --features async-services} @farm:{cargo build -p mde-workbench} @farm:{cargo test -p mde-bus} @farm:{cargo test -p mde-theme} @farm:{cargo build -p mde-files}
+
+## BUILD-PLATFORM — fast builds, least AI tokens, internal e2e/feature/stability (design: docs/design/build-platform.md; locked 2026-06-22)
+The platform to turn worklist → signed RPM fast + cheap: reconciler-on-timer is the
+canonical lane (no AI in the build loop), shared sccache for speed, and an internal
+test pyramid (build+unit on change; install/feature/stability nightly) on a
+snapshot-reset VM pool from MDE-VM-golden.
+
+- [ ] **BUILD-PLATFORM-1: shared sccache across the fleet.**
+  **As** the build platform, **I want** a compiler cache shared across all build VMs, **so that** a crate compiled on any node is reused everywhere and cold-target latency disappears.
+  **Acceptance** (each runtime-observable):
+    - [ ] `sccache` installed on every build VM (via `infra/ansible`), `RUSTC_WRAPPER=sccache` in the toolchain + dispatch env
+    - [ ] a shared backend (sccache server on the control host, or a Mesh-Sync/NFS dir) all nodes use; scoped by rustc version + target
+    - [ ] a crate built on node A then dispatched to node B shows a cache hit (`sccache --show-stats`); a fresh-VM `mackesd` build is materially faster than its cold time
+- [ ] **BUILD-PLATFORM-2: reconciler is the canonical lane (timer enabled + the @farm convention documented).**
+  **As** the project, **I want** builds to happen because the worklist changed, **so that** no AI triggers a build.
+  **Acceptance**:
+    - [ ] `mcnf-farm-reconcile.timer` enabled on the control host (FARM-AUTO-4); a worklist `@farm:{…}` tag yields a fleet build within one interval with no AI call
+    - [ ] the `@farm` tagging workflow is documented in `docs/BUILD-ENVIRONMENT.md` (how to request a build from a task)
+- [ ] **BUILD-PLATFORM-3: snapshot-reset VM-pool test harness.**
+  **As** the test platform, **I want** to spin clean VMs from `MDE-VM-golden`, run a test, and destroy them, **so that** every e2e run is hermetic.
+  **Acceptance**:
+    - [ ] a harness (tofu workspace or a `farm-testbed.sh`) provisions N clean VMs from the golden template, returns their IPs, and tears them down on completion (reusing the proven NM-keyfile path)
+    - [ ] runs isolated from the build VMs (.50/.51/.52) and the live fleet; a failed run still cleans up
+- [ ] **BUILD-PLATFORM-4: L1 install (e2e) acceptance — nightly RPM cut → clean-VM install.**
+  **As** an operator, **I want** the real RPM installed on a clean node nightly, **so that** install regressions are caught off the critical path.
+  **Acceptance**:
+    - [ ] a nightly job cuts the RPM, installs it on a snapshot-reset VM, and asserts: services up, role chooser runs, `found`/`join` enrol succeeds, overlay forms
+    - [ ] result published to the Bus (`event/test/install`); a failure raises an alert; never blocks an L0 build
+- [ ] **BUILD-PLATFORM-5: L2 feature acceptance on the VM pool (nightly).**
+  **As** the project, **I want** per-feature runtime-observable acceptance run on real nodes, **so that** features are proven, not just compiled.
+  **Acceptance**:
+    - [ ] a nightly suite runs each feature's §7 acceptance bullets on the VM pool / a small ephemeral mesh (a service exposes + is reachable, mesh-DNS resolves, a GUI binary launches)
+    - [ ] per-feature pass/fail on the Bus (`event/test/feature/<id>`); a red feature is named in the nightly report
+- [ ] **BUILD-PLATFORM-6: L3 stability — soak + chaos + reboot-recovery (nightly/weekly).**
+  **As** an operator, **I want** stability proven over time + under failure, **so that** the build is trustworthy.
+  **Acceptance**:
+    - [ ] **soak**: a daemon runs under sustained traffic with footprint flat (the BUS-RETENTION soak pattern)
+    - [ ] **chaos**: destroying a lighthouse causes no fleet-wide FUSE wedge + failover holds (the INCIDENT-WEDGE lesson)
+    - [ ] **reboot-recovery**: a node reboots and mounts/overlay self-heal (BOOT-REC); each result on the Bus
+- [ ] **BUILD-PLATFORM-7: test visibility — Bus events + nightly report + panel badge.**
+  **As** an operator, **I want** test outcomes visible without asking an AI, **so that** a rotting safety net is obvious.
+  **Acceptance**:
+    - [ ] a nightly summary (pass/fail per tier) written to a known location + published to the Bus
+    - [ ] the Workbench Build panel (FARM-AUTO-5) surfaces the latest install/feature/stability status (extends its `event/farm/*` read to `event/test/*`)
