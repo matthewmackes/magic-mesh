@@ -6,6 +6,7 @@
 
 pub mod about;
 pub mod audit;
+pub mod build_farm;
 pub mod compute;
 pub mod config_apply;
 pub mod connect;

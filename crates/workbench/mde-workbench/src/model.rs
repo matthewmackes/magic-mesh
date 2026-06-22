@@ -266,6 +266,8 @@ pub fn nav_model() -> Vec<NavEntry> {
                 Panel::new("mirrors", "Mirrors"),
                 // Compute folded into Provisioning.
                 Panel::new("instances", "Instances"),
+                // FARM-AUTO-5 — build-farm activity (jobs queued/passed/failed).
+                Panel::new("build-farm", "Build Farm"),
             ],
         },
         // ── Monitoring — all observability across scopes (Q11) ──────

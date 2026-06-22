@@ -21,9 +21,10 @@ use crate::header::HeaderAction;
 use crate::keyboard::{KeyAction, Pane};
 use crate::model::{resolve_panel_label, view_from_focus_slug, Group, View};
 use crate::panels::{
-    audit as audit_panel, compute as compute_panel, config_apply as config_apply_panel,
-    connect as connect_panel, connectivity as connectivity_panel, dns as dns_panel,
-    drift as drift_panel, firewall as firewall_panel, fleet_logs as fleet_logs_panel,
+    audit as audit_panel, build_farm as build_farm_panel, compute as compute_panel,
+    config_apply as config_apply_panel, connect as connect_panel,
+    connectivity as connectivity_panel, dns as dns_panel, drift as drift_panel,
+    firewall as firewall_panel, fleet_logs as fleet_logs_panel,
     fleet_revisions as fleet_revisions_panel, fleet_rollup as fleet_rollup_panel,
     fleet_settings as fleet_settings_panel, hardware as hardware_panel,
     health_check as health_check_panel, help_index as help_index_panel, home as home_panel,
@@ -140,6 +141,7 @@ pub enum Message {
     Hardware(hardware_panel::Message),
     /// PLANES-10 — Jobs panel (templates + run history) sub-message.
     Jobs(jobs_panel::Message),
+    BuildFarm(build_farm_panel::Message),
     /// PLANES-12 — Audit panel (hash-chain timeline + verify) sub-message.
     Audit(audit_panel::Message),
     /// PLANES-8 — Mesh Logs panel (journald mesh-unit view) sub-message.
@@ -259,6 +261,7 @@ pub struct App {
     inventory: inventory_panel::InventoryPanel,
     hardware: hardware_panel::HardwarePanel,
     jobs: jobs_panel::JobsPanel,
+    build_farm: build_farm_panel::BuildFarmPanel,
     audit: audit_panel::AuditPanel,
     mesh_logs: mesh_logs_panel::MeshLogsPanel,
     config_apply: config_apply_panel::ConfigApplyPanel,
@@ -368,6 +371,7 @@ impl App {
             inventory: inventory_panel::InventoryPanel::new(),
             hardware: hardware_panel::HardwarePanel::new(),
             jobs: jobs_panel::JobsPanel::new(),
+            build_farm: build_farm_panel::BuildFarmPanel::new(),
             audit: audit_panel::AuditPanel::new(),
             mesh_logs: mesh_logs_panel::MeshLogsPanel::new(),
             config_apply: config_apply_panel::ConfigApplyPanel::new(),
@@ -759,6 +763,7 @@ impl App {
             Message::Inventory(msg) => self.inventory.update(msg),
             Message::Hardware(msg) => self.hardware.update(msg),
             Message::Jobs(msg) => self.jobs.update(msg),
+            Message::BuildFarm(msg) => self.build_farm.update(msg),
             Message::Audit(msg) => self.audit.update(msg),
             Message::MeshLogs(msg) => self.mesh_logs.update(msg),
             Message::ConfigApply(msg) => self.config_apply.update(msg),
@@ -864,6 +869,7 @@ impl App {
             "config_apply" => config_apply_panel::ConfigApplyPanel::load(),
             "registration" => registration_panel::RegistrationPanel::load(),
             "jobs" => jobs_panel::JobsPanel::load(),
+            "build-farm" => build_farm_panel::BuildFarmPanel::load(),
             "node_roles" => node_roles_panel::NodeRolesPanel::load(),
             "playbooks" => playbooks_panel::PlaybooksPanel::load(),
             "run_history" => run_history_panel::RunHistoryPanel::load(),
@@ -1168,6 +1174,10 @@ impl App {
             } => self.registration.view(),
             // Controller plane — jobs / playbooks / run history.
             View::Panel { panel: "jobs", .. } => self.jobs.view(),
+            View::Panel {
+                panel: "build-farm",
+                ..
+            } => self.build_farm.view(),
             View::Panel {
                 panel: "playbooks", ..
             } => self.playbooks.view(),
