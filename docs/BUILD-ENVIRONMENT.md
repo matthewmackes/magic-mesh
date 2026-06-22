@@ -125,6 +125,26 @@ golden template (XCP-2) ──tofu (clone via XO)──▶ cloud-init NM-fix ─
 it from `/root/.mcnf-xo-token`). Farm internals + the recovery playbook live in
 [`docs/farm.md`](farm.md).
 
+### Requesting a build — the `@farm` convention (the canonical lane)
+
+The default way to get something built is **declarative, no AI, no manual dispatch**:
+tag a worklist task with `@farm:{<command>}` and the **reconciler timer**
+(`mcnf-farm-reconcile.timer`, FARM-AUTO-4) runs it on the fleet within one interval,
+idempotently (it skips a job whose result already matches a clean HEAD).
+
+```text
+- [>] **SOME-TASK: …**  @farm:{cargo test -p mde-bus}  @farm:{cargo clippy -p mackesd}
+```
+
+- Jobs are parsed by `automation/lib/farm-jobs.sh` (only open/in-progress tasks are
+  active); dispatched by `automation/lib/farm-dispatch.sh` to a free node
+  (per-node flock, big-iron-first), built **with shared sccache** (BUILD-PLATFORM-1),
+  result recorded as JSON + (via the `farm_orchestrator` worker) published to the
+  Bus → the Workbench **Build Farm** panel.
+- The reconciler is the *canonical* lane; the other FARM-AUTO capabilities (Forgejo
+  on push, etcd pull-agents, the mackesd worker) are alternates over the same substrate.
+- Design + rationale: [`docs/design/build-platform.md`](design/build-platform.md).
+
 ---
 
 ## 5. Reproduce the build environment from scratch

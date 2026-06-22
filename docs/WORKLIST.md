@@ -1618,7 +1618,7 @@ snapshot-reset VM pool from MDE-VM-golden.
     - [ ] `sccache` installed on every build VM (via `infra/ansible`), `RUSTC_WRAPPER=sccache` in the toolchain + dispatch env
     - [ ] a shared backend (sccache server on the control host, or a Mesh-Sync/NFS dir) all nodes use; scoped by rustc version + target
     - [ ] a crate built on node A then dispatched to node B shows a cache hit (`sccache --show-stats`); a fresh-VM `mackesd` build is materially faster than its cold time
-- [ ] **BUILD-PLATFORM-2: reconciler is the canonical lane (timer enabled + the @farm convention documented).**
+- [✓] **BUILD-PLATFORM-2: reconciler is the canonical lane (timer enabled + the @farm convention documented).**
   **As** the project, **I want** builds to happen because the worklist changed, **so that** no AI triggers a build.
   **Acceptance**:
     - [ ] `mcnf-farm-reconcile.timer` enabled on the control host (FARM-AUTO-4); a worklist `@farm:{…}` tag yields a fleet build within one interval with no AI call
