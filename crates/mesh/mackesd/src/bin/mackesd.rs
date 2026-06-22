@@ -6946,6 +6946,42 @@ fn run_serve(
                 tracing::warn!(error = %e, "Datacenter Bus responder: bus persist open failed; responder skipped");
             }
         }
+        // DATACENTER-10 (action layer) — the host power-control responder:
+        // action/dc/host-power runs `xe host-{disable,enable,reboot}` over the
+        // mesh-key SSH against an allowed dom0 (maintenance on/off + reboot).
+        // Same dedicated-OS-thread shape.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let host_svc =
+                    mackesd_core::ipc::host_ops::HostOpsService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("host-ops-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::host_ops::serve_bus(&persist, &host_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "Host-ops Bus responder spawned; serving action/dc/host-power (DATACENTER-10)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Host-ops Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("host_ops_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Host-ops Bus responder: bus persist open failed; responder skipped");
+            }
+        }
         // DC-15 (action layer) — the Tofu-plan responder: action/dc/tofu-plan
         // runs a read-only `tofu plan` of an allow-listed workspace under
         // infra/tofu/<ws> with its env sourced. Same dedicated-OS-thread shape.
