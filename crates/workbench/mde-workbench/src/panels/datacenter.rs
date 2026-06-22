@@ -239,6 +239,80 @@ pub fn project_audit(events: &[(String, String)]) -> Vec<AuditRow> {
     rows
 }
 
+/// One stage of the **Build → Eagle → DO** promotion pipeline as last seen on the
+/// Bus (`event/dc/promote/<stage>`). The Overview view renders these three stages
+/// as a horizontal version matrix so the operator can see, at a glance, which
+/// version each promotion target is pinned to and whether it's ready or pending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromoteStage {
+    /// The pipeline stage — "build" | "eagle" | "do" (canonical order).
+    pub stage: String,
+    /// The version pinned at this stage — e.g. "11.0.1". "—" for an absent stage.
+    pub version: String,
+    /// The stage's readiness — "ready" | "pending" (or "unknown" for a filled
+    /// placeholder). Drives the status chip's color token.
+    pub status: String,
+}
+
+/// Parse one `event/dc/promote/<stage>` message body into a [`PromoteStage`].
+/// Returns `None` for unparseable JSON or a body missing the `stage` field. Pure +
+/// testable. Mirrors [`parse_audit_event`]'s tolerant string extraction: `version`
+/// and `status` default when absent.
+#[must_use]
+pub fn parse_promote_event(body: &str) -> Option<PromoteStage> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let stage = v.get("stage")?.as_str()?.to_string();
+    let version = v
+        .get("version")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let status = v
+        .get("status")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(PromoteStage {
+        stage,
+        version,
+        status,
+    })
+}
+
+/// Project a set of `(topic, latest-body)` Bus reads into promotion stages —
+/// `event/dc/promote/*` topics only. Order/fill is left to [`promote_matrix`]; this
+/// just parses the matching topics. Pure + testable.
+#[must_use]
+pub fn project_promote(events: &[(String, String)]) -> Vec<PromoteStage> {
+    events
+        .iter()
+        .filter(|(topic, _)| topic.starts_with("event/dc/promote/"))
+        .filter_map(|(_, body)| parse_promote_event(body))
+        .collect()
+}
+
+/// Return the three promotion stages in canonical order — **build, eagle, do** —
+/// filling any absent stage with a placeholder (`version: "—"`, `status:
+/// "unknown"`) so the Overview strip always renders exactly three cards. A
+/// duplicate stage in the input keeps the first seen. Pure + testable.
+#[must_use]
+pub fn promote_matrix(stages: &[PromoteStage]) -> Vec<PromoteStage> {
+    ["build", "eagle", "do"]
+        .iter()
+        .map(|canon| {
+            stages
+                .iter()
+                .find(|s| s.stage == *canon)
+                .cloned()
+                .unwrap_or_else(|| PromoteStage {
+                    stage: (*canon).to_string(),
+                    version: "—".to_string(),
+                    status: "unknown".to_string(),
+                })
+        })
+        .collect()
+}
+
 /// Project a set of `(topic, latest-body)` Bus reads into sorted rows — datacenter
 /// resources (`event/dc/*`), grouped by zone (prod first) then kind then name.
 #[must_use]
@@ -416,6 +490,10 @@ pub struct DatacenterPanel {
     /// The audit-log rows read off `event/dc/audit/*`, newest-first. Rendered by
     /// the `Audit` view. Refreshed alongside `rows` on every load.
     pub audit: Vec<AuditRow>,
+    /// The Build → Eagle → DO promotion stages read off `event/dc/promote/*`.
+    /// Rendered by the `Overview` view as a version matrix. Refreshed alongside
+    /// `rows` on every load.
+    pub promote: Vec<PromoteStage>,
     /// When `Some(workspace)`, a Tofu apply is awaiting typed confirmation — the
     /// workspace's row renders a "Type APPLY to confirm" prompt and only the
     /// confirm button fires the `action/dc/tofu-apply` RPC. Cleared once the
@@ -465,6 +543,7 @@ impl Default for DatacenterPanel {
             tofu_state_ws: String::new(),
             confirm_delete: None,
             audit: Vec::new(),
+            promote: Vec::new(),
             tofu_confirm: None,
             expanded: BTreeSet::new(),
             topology_seeded: false,
@@ -478,6 +557,10 @@ impl Default for DatacenterPanel {
 pub struct DcLoad {
     pub rows: Vec<DcRow>,
     pub audit: Vec<AuditRow>,
+    /// The Build → Eagle → DO promotion stages read off `event/dc/promote/*`.
+    /// Rendered as a version matrix on the Overview view. Refreshed alongside
+    /// `rows` on every load.
+    pub promote: Vec<PromoteStage>,
 }
 
 #[derive(Debug, Clone)]
@@ -590,6 +673,7 @@ impl DatacenterPanel {
             Message::Loaded(Ok(load)) => {
                 self.rows = load.rows;
                 self.audit = load.audit;
+                self.promote = load.promote;
                 self.busy = false;
                 self.load_error = None;
                 self.status.clear();
@@ -940,6 +1024,11 @@ impl DatacenterPanel {
                 } else {
                     col = col.push(text("Memory: no host metrics reported yet."));
                 }
+                // Build → Eagle → DO promotion strip — a version matrix fed by
+                // `event/dc/promote/*`. Always renders all three stages (absent
+                // ones show "—") so the pipeline reads left-to-right.
+                col = col.push(text("Promotion").size(f32::from(spacing::BASE[5])));
+                col = col.push(promote_strip_view(&self.promote, palette));
             }
             ViewMode::Tofu => {
                 // A Plan + Apply control pair per workspace. Apply arms a typed
@@ -1348,6 +1437,88 @@ fn topology_child_view(
         .into()
 }
 
+/// Render the **Build → Eagle → DO** promotion strip: a horizontal version matrix
+/// of the three canonical stages (in that order), each a small card showing the
+/// stage name, its version, and a readiness chip, with `→` glyphs between. Fed by
+/// [`promote_matrix`] so absent stages render as "—" placeholders rather than
+/// vanishing. mde-theme tokens only — card surface / border / chip color all come
+/// from the palette, never raw hex.
+fn promote_strip_view(
+    stages: &[PromoteStage],
+    palette: Palette,
+) -> Element<'static, crate::Message> {
+    let matrix = promote_matrix(stages);
+    let mut strip = row![].spacing(f32::from(spacing::BASE[2]));
+    let n = matrix.len();
+    for (i, stage) in matrix.iter().enumerate() {
+        strip = strip.push(promote_card_view(stage, palette));
+        if i + 1 < n {
+            // Arrow glyph between cards — muted so the cards lead the eye.
+            strip = strip.push(
+                container(text("→").colr(palette.text_muted.into_cosmic_color()))
+                    .padding(f32::from(spacing::BASE[2])),
+            );
+        }
+    }
+    strip.into()
+}
+
+/// Render one promotion-stage card: the stage label, its version, and a readiness
+/// chip whose color comes from a mde-theme token (`success` for ready, `warning`
+/// for pending, `text_muted` for an unknown/absent placeholder). mde-theme tokens
+/// only.
+fn promote_card_view(stage: &PromoteStage, palette: Palette) -> Element<'static, crate::Message> {
+    // Human stage label.
+    let label = match stage.stage.as_str() {
+        "build" => "Build",
+        "eagle" => "Eagle",
+        "do" => "DO",
+        other => other,
+    }
+    .to_string();
+    // The chip color tracks readiness; the text is the raw status (or "—" when
+    // the stage is an unknown placeholder, so the chip reads cleanly).
+    let (chip_color, chip_text) = match stage.status.as_str() {
+        "ready" => (palette.success, "ready".to_string()),
+        "pending" => (palette.warning, "pending".to_string()),
+        other => (
+            palette.text_muted,
+            if other.is_empty() {
+                "—".to_string()
+            } else {
+                other.to_string()
+            },
+        ),
+    };
+    let version = if stage.version.is_empty() {
+        "—".to_string()
+    } else {
+        stage.version.clone()
+    };
+    let card = column![
+        text(label)
+            .colr(palette.text.into_cosmic_color())
+            .size(f32::from(spacing::BASE[4])),
+        text(version).colr(palette.accent.into_cosmic_color()),
+        text(chip_text).colr(chip_color.into_cosmic_color()),
+    ]
+    .spacing(f32::from(spacing::BASE[1]));
+    container(card)
+        .padding(f32::from(spacing::BASE[3]))
+        .style(move |_theme| container::Style {
+            background: Some(cosmic::iced::Background::Color(
+                palette.surface.into_cosmic_color(),
+            )),
+            border: cosmic::iced::Border {
+                color: palette.border.into_cosmic_color(),
+                width: 1.0,
+                radius: f32::from(spacing::BASE[1]).into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
 /// Render one audit-log row: `action`, `target`, and the timestamp. mde-theme
 /// tokens only.
 fn audit_row_view(entry: &AuditRow) -> Element<'_, crate::Message> {
@@ -1393,6 +1564,7 @@ fn read_dc_events() -> Result<DcLoad, String> {
     Ok(DcLoad {
         rows: project_rows(&events),
         audit: project_audit(&events),
+        promote: project_promote(&events),
     })
 }
 
@@ -2260,6 +2432,7 @@ mod tests {
                 target: "xen-xapi".into(),
                 ts: "2026-06-22T11:00:00Z".into(),
             }],
+            promote: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert_eq!(p.audit.len(), 1);
@@ -2445,6 +2618,7 @@ mod tests {
         let load = DcLoad {
             rows: topology_fixture(),
             audit: Vec::new(),
+            promote: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert!(p.expanded.contains("172.20.0.9"));
@@ -2517,5 +2691,164 @@ mod tests {
         // "no managed resources" branch.
         let _ = p.update(Message::TofuStateDone(Ok((Vec::new(), false))));
         let _ = p.view();
+    }
+
+    // ---- DATACENTER-20/9: Build → Eagle → DO promotion strip ---------------
+
+    #[test]
+    fn parse_promote_event_reads_a_stage() {
+        let s = parse_promote_event(r#"{"stage":"eagle","version":"11.0.1","status":"ready"}"#)
+            .unwrap();
+        assert_eq!(s.stage, "eagle");
+        assert_eq!(s.version, "11.0.1");
+        assert_eq!(s.status, "ready");
+    }
+
+    #[test]
+    fn parse_promote_event_defaults_missing_fields_and_drops_garbage() {
+        // Missing version/status default to empty.
+        let s = parse_promote_event(r#"{"stage":"do"}"#).unwrap();
+        assert_eq!(s.stage, "do");
+        assert_eq!(s.version, "");
+        assert_eq!(s.status, "");
+        // Unparseable / missing stage → None.
+        assert!(parse_promote_event("not json").is_none());
+        assert!(parse_promote_event(r#"{"version":"11.0.1"}"#).is_none());
+    }
+
+    #[test]
+    fn project_promote_filters_to_promote_topics() {
+        let events = vec![
+            // Not a promote topic → dropped.
+            (
+                "event/dc/vm/9".into(),
+                r#"{"kind":"vm","id":"9","name":"b","status":"running","zone":"dev"}"#.into(),
+            ),
+            (
+                "event/dc/promote/build".into(),
+                r#"{"stage":"build","version":"11.0.2","status":"ready"}"#.into(),
+            ),
+            (
+                "event/dc/promote/do".into(),
+                r#"{"stage":"do","version":"11.0.1","status":"pending"}"#.into(),
+            ),
+        ];
+        let stages = project_promote(&events);
+        assert_eq!(stages.len(), 2); // non-promote dropped
+        assert!(stages.iter().any(|s| s.stage == "build"));
+        assert!(stages.iter().any(|s| s.stage == "do"));
+    }
+
+    #[test]
+    fn promote_event_is_dropped_by_project_rows() {
+        // A promote body has no `kind`/`id`, so it must NOT leak into resource
+        // rows even though its topic starts with `event/dc/`.
+        let rows = project_rows(&[(
+            "event/dc/promote/build".into(),
+            r#"{"stage":"build","version":"11.0.2","status":"ready"}"#.into(),
+        )]);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn promote_matrix_orders_build_eagle_do() {
+        // Supplied out of order — the matrix returns canonical build→eagle→do.
+        let stages = vec![
+            PromoteStage {
+                stage: "do".into(),
+                version: "11.0.0".into(),
+                status: "ready".into(),
+            },
+            PromoteStage {
+                stage: "build".into(),
+                version: "11.0.2".into(),
+                status: "ready".into(),
+            },
+            PromoteStage {
+                stage: "eagle".into(),
+                version: "11.0.1".into(),
+                status: "pending".into(),
+            },
+        ];
+        let m = promote_matrix(&stages);
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[0].stage, "build");
+        assert_eq!(m[0].version, "11.0.2");
+        assert_eq!(m[1].stage, "eagle");
+        assert_eq!(m[1].version, "11.0.1");
+        assert_eq!(m[2].stage, "do");
+        assert_eq!(m[2].version, "11.0.0");
+    }
+
+    #[test]
+    fn promote_matrix_fills_absent_stages_with_placeholder() {
+        // Only "build" present → eagle + do are filled with the "—"/"unknown"
+        // placeholder, still in canonical order.
+        let stages = vec![PromoteStage {
+            stage: "build".into(),
+            version: "11.0.2".into(),
+            status: "ready".into(),
+        }];
+        let m = promote_matrix(&stages);
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[0].stage, "build");
+        assert_eq!(m[0].version, "11.0.2");
+        // Absent eagle + do → placeholder.
+        assert_eq!(m[1].stage, "eagle");
+        assert_eq!(m[1].version, "—");
+        assert_eq!(m[1].status, "unknown");
+        assert_eq!(m[2].stage, "do");
+        assert_eq!(m[2].version, "—");
+        assert_eq!(m[2].status, "unknown");
+    }
+
+    #[test]
+    fn promote_matrix_empty_is_all_placeholders() {
+        let m = promote_matrix(&[]);
+        assert_eq!(m.len(), 3);
+        assert!(m.iter().all(|s| s.version == "—" && s.status == "unknown"));
+        assert_eq!(m[0].stage, "build");
+        assert_eq!(m[1].stage, "eagle");
+        assert_eq!(m[2].stage, "do");
+    }
+
+    #[test]
+    fn loaded_populates_promote_stages() {
+        let mut p = DatacenterPanel::new();
+        let load = DcLoad {
+            rows: Vec::new(),
+            audit: Vec::new(),
+            promote: vec![PromoteStage {
+                stage: "build".into(),
+                version: "11.0.2".into(),
+                status: "ready".into(),
+            }],
+        };
+        let _ = p.update(Message::Loaded(Ok(load)));
+        assert_eq!(p.promote.len(), 1);
+        assert_eq!(p.promote[0].stage, "build");
+    }
+
+    #[test]
+    fn overview_renders_the_promotion_strip() {
+        let mut p = DatacenterPanel::new();
+        // Default view is Overview. Populate a partial promote set so the strip
+        // renders both real cards (ready/pending chips) and a "—" placeholder.
+        p.promote = project_promote(&[
+            (
+                "event/dc/promote/build".into(),
+                r#"{"stage":"build","version":"11.0.2","status":"ready"}"#.into(),
+            ),
+            (
+                "event/dc/promote/eagle".into(),
+                r#"{"stage":"eagle","version":"11.0.1","status":"pending"}"#.into(),
+            ),
+        ]);
+        // Exercises promote_strip_view → promote_card_view for ready, pending,
+        // and the absent "do" placeholder branch.
+        let _ = p.view();
+        // And it stays reachable with no promote events at all (all placeholders).
+        let empty = DatacenterPanel::new();
+        let _ = empty.view();
     }
 }
