@@ -1664,11 +1664,16 @@ throughout (AI_GOVERNANCE §0): no single control host whose loss is fatal. Work
 the plane and it **survives killing the current zone leader**.
 
 ### Phase 0 — Foundations (prerequisite; blocks the plane)
-- [ ] **DATACENTER-1: XAPI-native Tofu provider (drop XO).**
+- [>] **DATACENTER-1: XAPI-native Tofu provider (drop XO).** *(session=calm-ray-dcr8)*
+  *Connectivity PROVEN (test-bed-first, no live-farm risk): the `xenserver/xenserver` provider (0.2.2)
+  authenticated over XAPI directly to the `.193` (KVM-XCP1) dom0 and read the live pool — 1 host, 4 SRs,
+  **no XO**. Prototype isolated in `infra/tofu/xen-xapi/` (own dir + state). Risk finding: the only
+  XAPI-native provider is early-stage 0.2.x. Remaining: throwaway VM create/destroy via `xenserver_vm`,
+  import-parity of `.50/.51/.52`, then the `infra/tofu/` cutover.*
   **As** the platform, **I want** the Xen IaC to manage hosts/VMs over XAPI directly, **so that** there is
   no central XO box to lose (no-fixed-center).
   **Acceptance** (runtime-observable):
-    - [ ] `infra/tofu/` migrated off `vatesfr/xenorchestra` to a XAPI-native provider; `tofu plan` clean against the live farm after import
+    - [>] `infra/tofu/` migrated off `vatesfr/xenorchestra` to a XAPI-native provider; `tofu plan` clean against the live farm after import — *XAPI-native provider proven to read the live pool; migration/import of `infra/tofu/` pending*
     - [ ] the `.50/.51/.52` build VMs + golden template are managed with no XO process running
 - [ ] **DATACENTER-2: mesh-replicated Tofu remote state (SUBSTRATE-V2).**
   **As** an operator, **I want** Tofu state + lock in the mesh-replicated substrate, **so that** any elected

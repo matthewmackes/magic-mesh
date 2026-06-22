@@ -1,0 +1,5 @@
+env.sh
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.tfstate.lock.info
