@@ -6982,6 +6982,42 @@ fn run_serve(
                 tracing::warn!(error = %e, "Host-ops Bus responder: bus persist open failed; responder skipped");
             }
         }
+        // DATACENTER-16 (action layer) — the Wake-on-LAN responder:
+        // action/dc/wol broadcasts the 102-byte magic packet to
+        // 255.255.255.255:9 to power on a sleeping/off machine by MAC.
+        // Same dedicated-OS-thread shape.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let dc_power_svc =
+                    mackesd_core::ipc::dc_power::DcPowerService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("dc-power-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::dc_power::serve_bus(&persist, &dc_power_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "DC-power Bus responder spawned; serving action/dc/wol (DATACENTER-16)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "DC-power Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("dc_power_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "DC-power Bus responder: bus persist open failed; responder skipped");
+            }
+        }
         // DC-15 (action layer) — the Tofu-plan responder: action/dc/tofu-plan
         // runs a read-only `tofu plan` of an allow-listed workspace under
         // infra/tofu/<ws> with its env sourced. Same dedicated-OS-thread shape.
