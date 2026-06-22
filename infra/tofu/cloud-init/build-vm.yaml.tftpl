@@ -40,3 +40,6 @@ write_files:
 runcmd:
   - [ nmcli, connection, reload ]
   - [ sh, -c, "nmcli connection up static-primary || systemctl restart NetworkManager" ]
+  # The provider's generated meta-data can leave the hostname at the cloud-image
+  # default (localhost); set it explicitly so logs/inventory read cleanly.
+  - [ hostnamectl, set-hostname, "${hostname}" ]

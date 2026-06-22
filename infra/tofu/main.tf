@@ -6,10 +6,12 @@ locals {
     "xen-home-services" = {
       pool_name = "XEN-HOME-SERVICES" # 172.20.0.9
       ip_cidr   = "172.20.0.50/16"
-    }
+      name      = "mcnf-build-50" # MUST be unique across pools: XO sees both,
+    }                             # and the provider looks VMs up by name_label.
     "kvm-xcp1" = {
       pool_name = "KVM-XCP1" # 172.20.145.193
       ip_cidr   = "172.20.0.51/16"
+      name      = "mcnf-build-51"
     }
   }
 

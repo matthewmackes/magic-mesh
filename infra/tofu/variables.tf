@@ -12,14 +12,12 @@ variable "xo_insecure" {
 
 variable "golden_template_name" {
   description = <<-EOT
-    The XCP-2 golden template (e.g. "MDE-VM-golden") the build VMs clone from.
-    Empty by default: until the golden template exists, the build-VM resources
-    are INERT (count 0) so `tofu plan` proves XO connectivity + validates config
-    without trying to clone a template that isn't there yet. Set this once XCP-2
-    lands to enable `tofu apply`.
+    The XCP-2 golden template the build VMs clone from. Built on both pools
+    (UEFI) by install-helpers/setup-xcp-golden-template.sh. Set to "" to make the
+    build-VM resources inert (count 0) — useful for a connectivity-only plan.
   EOT
   type        = string
-  default     = ""
+  default     = "MDE-VM-golden"
 }
 
 variable "build_vcpus" {
