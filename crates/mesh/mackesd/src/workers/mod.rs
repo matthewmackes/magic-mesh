@@ -382,6 +382,8 @@ pub mod lifecycle_exec;
 pub mod firewall_preset;
 // CONNECT-3 — exposure-driven (additive) firewall enforcement.
 pub mod connect_firewall;
+// FARM-AUTO-1 — build-farm orchestrator: bridges the farm job lifecycle onto the Bus.
+pub mod farm_orchestrator;
 // VPN-GW-1 — per-node commercial-VPN tunnel engine (WireGuard/OpenVPN baseline).
 pub mod stun_gather;
 pub mod subprocess_tick;

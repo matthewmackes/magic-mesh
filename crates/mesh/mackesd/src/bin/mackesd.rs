@@ -5990,6 +5990,21 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("upgrade_intent_watcher".into());
 
+        // FARM-AUTO-1 — build-farm orchestrator. Leader-gated; bridges the farm's
+        // etcd job lifecycle (FARM-AUTO-3 queue/results) onto the Bus as
+        // `event/farm/<jobid>` events so farm activity is visible mesh-wide.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::farm_orchestrator::FarmOrchestratorWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("farm_orchestrator".into());
+
         // ONBOARD-6 — continuous leader election. Renews the
         // <QNM-Shared>/.mackesd-leader.lock lease every 20s so exactly one
         // node always holds leadership (previously only the upgrade watcher
