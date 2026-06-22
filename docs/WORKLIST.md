@@ -1678,12 +1678,18 @@ the plane and it **survives killing the current zone leader**.
   **Acceptance** (runtime-observable):
     - [✓] `infra/tofu/` migrated off `vatesfr/xenorchestra` to a XAPI-native provider; `tofu plan` clean against the live farm after import — *DONE: `xen-xapi/` (3 aliased providers) imported all 3 build VMs, farm-wide plan `0 add/0 destroy` (only benign metadata residual)*
     - [✓] the `.50/.51/.52` build VMs + golden template are managed with no XO process running — *DONE: XO containers stopped; xen-xapi config plans `0-destroy` with XO down; farm runs on pure XAPI*
-- [ ] **DATACENTER-2: mesh-replicated Tofu remote state (SUBSTRATE-V2).**
+- [>] **DATACENTER-2: mesh-replicated Tofu remote state (SUBSTRATE-V2).** *(session=calm-ray-dcr8)*
+  *Built: an OpenTofu `http`-backend service (`automation/state-backend/`, containerized via
+  `state-backend-up.sh`) that stores state + lock in **etcd** (the SUBSTRATE-V2 store). Both farm states
+  migrated off local files into etcd (`/tofu/state/xen-xapi` + `/tofu/state/zone1-do`) — both plan clean
+  from etcd. Locking PROVEN: a held lock blocked a real `tofu plan` (`HTTP remote state already locked:
+  ID=node-B`), released on UNLOCK. Backend on the LAN (`:8390`) → any node can use it. Remaining for true
+  no-center: cluster etcd across nodes (single etcd node today = soft-center) + a literal two-node run.*
   **As** an operator, **I want** Tofu state + lock in the mesh-replicated substrate, **so that** any elected
   leader plans/applies against the same state.
   **Acceptance**:
-    - [ ] both states (Xen + DO) live on the SUBSTRATE-V2 backend with working state-locking
-    - [ ] a `plan` run from two different eligible nodes sees identical state; concurrent apply is lock-blocked
+    - [✓] both states (Xen + DO) live on the SUBSTRATE-V2 (etcd) backend with working state-locking
+    - [>] a `plan` run from two different eligible nodes sees identical state; concurrent apply is lock-blocked — *concurrent-apply lock-block PROVEN; multi-node-identical is architectural (LAN backend + etcd) — literal 2nd-node run + etcd clustering pending*
 - [ ] **DATACENTER-3: DS-8 mesh secret store holds DC creds.**
   **As** the control plane, **I want** XAPI/DO/UniFi creds in the etcd+age mesh store, **so that** no host-local
   secret pins the leader.
