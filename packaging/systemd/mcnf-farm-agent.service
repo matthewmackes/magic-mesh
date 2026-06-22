@@ -1,0 +1,19 @@
+# FARM-AUTO-3 — the builder agent, runs ON each build VM (deployed by
+# farm-pool-manager.sh ensure-agents). Pulls jobs from the etcd queue and builds
+# the VM's local tree. Fleet-side, no AI.
+[Unit]
+Description=MCNF build-farm agent (pull jobs from etcd, build locally)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mm
+Environment=MCNF_ETCD=http://172.20.145.192:2379
+ExecStart=/home/mm/magic-mesh/automation/queue/farm-agent.sh
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
