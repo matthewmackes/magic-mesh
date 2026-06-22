@@ -1663,6 +1663,15 @@ throughout (AI_GOVERNANCE §0): no single control host whose loss is fatal. Work
 (DO, already imported + plan-clean). Success bar (§7): the operator drives the **full lifecycle** from
 the plane and it **survives killing the current zone leader**.
 
+> **Integration verified 2026-06-22:** both full binaries LINK on the farm — `mackesd` daemon (with the
+> `datacenter_orchestrator`/`dc_auditor`/`dc_jobs`/`dc_promote` workers + the `datacenter`/`host_ops`/`tofu`/
+> `dc_power` ipc responders) and the `mde-workbench` GUI (with the Datacenter panel). All live data sources
+> confirmed end-to-end: doctl regions (16) + droplets (2), `xe` host+VMs over the mesh key, `tofu state list`
+> + drift, and creds decrypting from the age/etcd store. Open follow-up: drift over-reports (the 0.2.x
+> xenserver provider can't round-trip 2 benign metadata fields → `plan -detailed-exitcode` always returns 2);
+> filter those before trusting the drift badge. Not yet done: a LIVE run of the daemon publishing to a real
+> Bus + the panel rendering on a Cosmic session (needs a running mackesd + display).
+
 ### Phase 0 — Foundations (prerequisite; blocks the plane)
 - [✓] **DATACENTER-1: XAPI-native Tofu provider (drop XO).** *(session=calm-ray-dcr8)*
   *FULLY CLOSED (2026-06-22). `infra/tofu/xen-xapi/` (the `xenserver` provider, 3 aliased providers — farm
