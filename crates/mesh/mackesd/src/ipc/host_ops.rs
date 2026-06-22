@@ -46,7 +46,7 @@ impl HostOpsService {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 1] = ["host-power"];
+pub const ACTION_VERBS: [&str; 2] = ["host-power", "gateway-reboot"];
 
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -96,12 +96,118 @@ fn ssh_xe_status(key: &str, dom0: &str, remote: &str) -> std::io::Result<std::pr
         .output()
 }
 
+/// Validate that `s` is a plain dotted-quad IPv4 address: only ASCII digits and
+/// dots, exactly four octets, each parsing as `0..=255`. PURE.
+///
+/// Rejects anything with non-`[0-9.]` characters (so it can never carry shell
+/// metacharacters into an SSH argument), the wrong number of octets, empty
+/// octets, or an octet out of range.
+#[must_use]
+pub fn valid_ipv4(s: &str) -> bool {
+    if !s.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return false;
+    }
+    let octets: Vec<&str> = s.split('.').collect();
+    if octets.len() != 4 {
+        return false;
+    }
+    octets
+        .iter()
+        .all(|o| !o.is_empty() && o.parse::<u8>().is_ok())
+}
+
+/// Read the UniFi SSH credential best-effort from the mesh secret store by
+/// shelling out to `automation/secrets/mcnf-secret.sh get unifi-cred` from the
+/// repo root. Returns `(user, password)` parsed like the orchestrator's
+/// `gather_gateway` path (`user:pass`, default user `"ubnt"`), or `None` if the
+/// helper is missing, the secret is absent, or the command exits non-zero/empty.
+fn unifi_cred() -> Option<(String, String)> {
+    let o = std::process::Command::new("bash")
+        .args(["-lc", "automation/secrets/mcnf-secret.sh get unifi-cred"])
+        .output()
+        .ok()?;
+    if !o.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&o.stdout);
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(crate::workers::datacenter_orchestrator::parse_unifi_cred(
+        raw,
+    ))
+}
+
+/// Reboot the UniFi gateway over `sshpass` (the router has no mesh key, so this
+/// uses password auth). `host` must already be validated as a plain IPv4.
+/// Returns `Ok(())` on a zero exit, `Err(<message>)` otherwise.
+fn gateway_reboot(req_body: Option<&str>) -> Result<(), String> {
+    let Some(body) = req_body else {
+        return Err("gateway-reboot: missing request body".into());
+    };
+    let req: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("gateway-reboot: bad json: {e}"))?;
+
+    let confirm = req
+        .get("confirm")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !confirm {
+        return Err("reboot requires confirm:true".into());
+    }
+
+    let host = req
+        .get("host")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !valid_ipv4(host) {
+        return Err("host must be a plain IPv4 address".into());
+    }
+
+    let (user, pw) = unifi_cred().ok_or("no unifi cred in store")?;
+
+    let o = std::process::Command::new("sshpass")
+        .args([
+            "-p",
+            &pw,
+            "ssh",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "ConnectTimeout=8",
+            &format!("{user}@{host}"),
+            "reboot",
+        ])
+        .output()
+        .map_err(|e| format!("sshpass failed: {e}"))?;
+
+    if o.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        let msg = stderr.trim();
+        if msg.is_empty() {
+            Err("gateway reboot failed".into())
+        } else {
+            Err(msg.to_string())
+        }
+    }
+}
+
 /// Build the reply for one `action/dc/<verb>` request.
 #[must_use]
 pub fn build_reply(_svc: &HostOpsService, verb: &str, req_body: Option<&str>) -> String {
     let err = |m: String| json!({ "error": m }).to_string();
-    if verb != "host-power" {
-        return err("unknown dc verb".into());
+    match verb {
+        "host-power" => {}
+        "gateway-reboot" => {
+            return match gateway_reboot(req_body) {
+                Ok(()) => json!({ "ok": true }).to_string(),
+                Err(m) => err(m),
+            };
+        }
+        _ => return err("unknown dc verb".into()),
     }
     let Some(body) = req_body else {
         return err("host-power: missing request body".into());
@@ -234,7 +340,56 @@ mod tests {
     #[test]
     fn topic_and_verbs_lock() {
         assert_eq!(action_topic("host-power"), "action/dc/host-power");
+        assert_eq!(action_topic("gateway-reboot"), "action/dc/gateway-reboot");
         assert!(ACTION_VERBS.contains(&"host-power"));
+        assert!(ACTION_VERBS.contains(&"gateway-reboot"));
+    }
+
+    #[test]
+    fn valid_ipv4_accepts_and_rejects() {
+        // valid
+        assert!(valid_ipv4("172.20.0.1"));
+        assert!(valid_ipv4("0.0.0.0"));
+        assert!(valid_ipv4("255.255.255.255"));
+        // too few octets
+        assert!(!valid_ipv4("1.2.3"));
+        // injection / non-digit chars
+        assert!(!valid_ipv4("a;b"));
+        assert!(!valid_ipv4("1.2.3.4; reboot"));
+        // octet out of range
+        assert!(!valid_ipv4("1.2.3.999"));
+        // misc
+        assert!(!valid_ipv4(""));
+        assert!(!valid_ipv4("1.2.3.4.5"));
+        assert!(!valid_ipv4("1..3.4"));
+    }
+
+    #[test]
+    fn gateway_reboot_requires_confirm_true() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        // confirm omitted
+        let body = json!({ "host": "172.20.0.1" }).to_string();
+        let r = build_reply(&s, "gateway-reboot", Some(&body));
+        assert!(r.contains("reboot requires confirm:true"), "{r}");
+        // confirm:false
+        let body = json!({ "host": "172.20.0.1", "confirm": false }).to_string();
+        let r = build_reply(&s, "gateway-reboot", Some(&body));
+        assert!(r.contains("reboot requires confirm:true"), "{r}");
+    }
+
+    #[test]
+    fn gateway_reboot_rejects_bad_host_before_ssh() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        let body = json!({ "host": "1.2.3.4; reboot", "confirm": true }).to_string();
+        let r = build_reply(&s, "gateway-reboot", Some(&body));
+        assert!(r.contains("host must be a plain IPv4 address"), "{r}");
+    }
+
+    #[test]
+    fn gateway_reboot_missing_body_errors() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        let r = build_reply(&s, "gateway-reboot", None);
+        assert!(r.contains("missing request body"), "{r}");
     }
 
     #[test]
