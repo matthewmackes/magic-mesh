@@ -253,6 +253,30 @@ pub fn parse_xe_vms(output: &str) -> Vec<(String, String, String)> {
         .collect()
 }
 
+/// Parse `uuid|name|physical-size|physical-utilisation` lines into SR tuples. Pure.
+#[must_use]
+pub fn parse_xe_srs(output: &str) -> Vec<(String, String, String, String)> {
+    output
+        .lines()
+        .filter_map(|l| {
+            let mut p = l.splitn(4, '|');
+            let u = p.next()?.trim();
+            if u.is_empty() {
+                return None;
+            }
+            let n = p.next().unwrap_or("").trim();
+            let sz = p.next().unwrap_or("").trim();
+            let used = p.next().unwrap_or("").trim();
+            Some((
+                u.to_string(),
+                n.to_string(),
+                sz.to_string(),
+                used.to_string(),
+            ))
+        })
+        .collect()
+}
+
 /// Run a remote `xe` command on a dom0 over SSH (best-effort).
 fn ssh_xe(key: &str, dom0: &str, remote: &str) -> Option<String> {
     let o = std::process::Command::new("ssh")
@@ -303,6 +327,20 @@ fn gather_xen() -> Vec<DcResource> {
                 })
                 .to_string();
                 out.push(DcResource::new("vm", u, sig));
+            }
+        }
+        // SRs with real capacity (skip the empty/virtual ones) → storage visibility (DC-12).
+        let sr_script = "for u in $(xe sr-list params=uuid --minimal | tr , ' '); \
+             do ps=$(xe sr-param-get uuid=$u param-name=physical-size 2>/dev/null); \
+             [ \"${ps:-0}\" -gt 0 ] || continue; \
+             echo \"$u|$(xe sr-param-get uuid=$u param-name=name-label)|$ps|$(xe sr-param-get uuid=$u param-name=physical-utilisation)\"; done";
+        if let Some(srout) = ssh_xe(&key, &dom0, sr_script) {
+            for (u, n, size, used) in parse_xe_srs(&srout) {
+                let sig = serde_json::json!({
+                    "kind": "sr", "id": u, "name": n, "size": size, "used": used, "host": dom0, "zone": "dev"
+                })
+                .to_string();
+                out.push(DcResource::new("sr", u, sig));
             }
         }
     }
@@ -452,5 +490,16 @@ mod tests {
         );
         assert_eq!(vms[1].1, "mcnf-golden");
         assert_eq!(vms[1].2, "halted");
+    }
+
+    #[test]
+    fn parse_xe_srs_reads_capacity() {
+        let out = "s1|Local storage|207296921600|42949672960\n|skip||\n";
+        let srs = parse_xe_srs(out);
+        assert_eq!(srs.len(), 1); // empty-uuid line skipped
+        assert_eq!(srs[0].0, "s1");
+        assert_eq!(srs[0].1, "Local storage");
+        assert_eq!(srs[0].2, "207296921600");
+        assert_eq!(srs[0].3, "42949672960");
     }
 }
