@@ -297,6 +297,19 @@ pub fn parse_xe_nets(output: &str) -> Vec<(String, String, String)> {
         .collect()
 }
 
+/// Parse the host-metric helper's `cpu|mem_total_mb|mem_free_mb|load` line into
+/// its four fields (any missing field → empty string). Pure.
+#[must_use]
+pub fn parse_host_metrics(line: &str) -> (String, String, String, String) {
+    let mut p = line.splitn(4, '|');
+    (
+        p.next().unwrap_or("").trim().to_string(),
+        p.next().unwrap_or("").trim().to_string(),
+        p.next().unwrap_or("").trim().to_string(),
+        p.next().unwrap_or("").trim().to_string(),
+    )
+}
+
 /// Run a remote `xe` command on a dom0 over SSH (best-effort).
 fn ssh_xe(key: &str, dom0: &str, remote: &str) -> Option<String> {
     let o = std::process::Command::new("ssh")
@@ -331,8 +344,20 @@ fn gather_xen() -> Vec<DcResource> {
         if let Some(hn) = ssh_xe(&key, &dom0, "xe host-list params=name-label --minimal") {
             let hn = hn.trim();
             if !hn.is_empty() {
+                // Best-effort host metrics from the Xen toolstack: `xl info` gives
+                // the host's REAL physical cpu count + total/free memory (MB), not
+                // dom0's capped view; load from /proc/loadavg. One ssh round-trip.
+                let metric_script = "L=$(cut -d' ' -f1 /proc/loadavg); I=$(xl info 2>/dev/null); \
+                     C=$(echo \"$I\"|awk -F: '/nr_cpus/{gsub(/ /,\"\",$2);print $2}'); \
+                     T=$(echo \"$I\"|awk -F: '/total_memory/{gsub(/ /,\"\",$2);print $2}'); \
+                     F=$(echo \"$I\"|awk -F: '/free_memory/{gsub(/ /,\"\",$2);print $2}'); \
+                     echo \"$C|$T|$F|$L\"";
+                let (cpu, mem_total, mem_free, load) = ssh_xe(&key, &dom0, metric_script)
+                    .map(|o| parse_host_metrics(o.trim()))
+                    .unwrap_or_default();
                 let sig = serde_json::json!({
-                    "kind": "host", "id": dom0, "name": hn, "status": "up", "zone": "dev"
+                    "kind": "host", "id": dom0, "name": hn, "status": "up", "zone": "dev",
+                    "cpu": cpu, "mem_total_mb": mem_total, "mem_free_mb": mem_free, "load": load
                 })
                 .to_string();
                 out.push(DcResource::new("host", dom0.clone(), sig));
@@ -539,6 +564,21 @@ mod tests {
         );
         assert_eq!(nets[1].1, "Host internal management network");
         assert_eq!(nets[1].2, "xenapi");
+    }
+
+    #[test]
+    fn parse_host_metrics_splits_four_fields() {
+        let (c, t, f, l) = parse_host_metrics("4|23469|2171|0.15");
+        assert_eq!(
+            (c.as_str(), t.as_str(), f.as_str(), l.as_str()),
+            ("4", "23469", "2171", "0.15")
+        );
+        // missing fields (xl absent) → empty, load still present
+        let (c, t, f, l) = parse_host_metrics("||0.00");
+        assert_eq!(c, "");
+        assert_eq!(t, "");
+        assert_eq!(f, "0.00");
+        assert_eq!(l, "");
     }
 
     #[test]

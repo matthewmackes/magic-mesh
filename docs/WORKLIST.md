@@ -1746,9 +1746,13 @@ the plane and it **survives killing the current zone leader**.
 - [ ] **DATACENTER-9: Overview tab (single pane + promotion strip + version matrix).**
   **Acceptance**:
     - [ ] cross-zone capacity/health rollup, active alerts, recent Tofu runs, Build→Eagle→DO strip, and a version matrix (farm/Eagle/each lighthouse) — all live; sparklines from short rolling Bus history
-- [ ] **DATACENTER-10: Hosts tab (full host lifecycle + pools).**
+- [>] **DATACENTER-10: Hosts tab (full host lifecycle + pools).** *(session=calm-ray-dcr8)*
+  *Built in a 4-agent parallel fan-out: **host metrics** on the host source (`xl info` → cpu/mem-total/
+  mem-free/load in `event/dc/host/*`) + the **`action/dc/host-power` RPC** (`ipc/host_ops.rs`:
+  maintenance-on/off + reboot via `xe host-disable/enable/reboot`, dom0 allow-listed). Remaining: pools
+  (membership/master/join), evacuate/patch, impact preview, copy/launch-ssh console + the panel host actions.*
   **Acceptance**:
-    - [ ] per-host capacity+health; pools (membership/master/join); maintenance/reboot/shutdown/**evacuate**/patch with impact preview; copy/launch-ssh console
+    - [>] per-host capacity+health; pools (membership/master/join); maintenance/reboot/shutdown/**evacuate**/patch with impact preview; copy/launch-ssh console — *host capacity (cpu/mem/load) + maintenance/reboot RPC done; pools/evacuate/patch/console pending*
 - [>] **DATACENTER-11: VMs tab (full lifecycle, Tofu-backed create, noVNC, bulk).** *(session=calm-ray-dcr8)*
   *VM POWER landed end-to-end (built in PARALLEL on the farm — worker on `.50`, panel on `.51`): the
   `action/dc/vm-power` Bus-RPC (`ipc/datacenter.rs`, mirrors `ipc/route.rs`) runs `xe vm-start/shutdown/
