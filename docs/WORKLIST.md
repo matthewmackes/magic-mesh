@@ -1665,11 +1665,11 @@ the plane and it **survives killing the current zone leader**.
 
 ### Phase 0 — Foundations (prerequisite; blocks the plane)
 - [>] **DATACENTER-1: XAPI-native Tofu provider (drop XO).** *(session=calm-ray-dcr8)*
-  *Connectivity PROVEN (test-bed-first, no live-farm risk): the `xenserver/xenserver` provider (0.2.2)
-  authenticated over XAPI directly to the `.193` (KVM-XCP1) dom0 and read the live pool — 1 host, 4 SRs,
-  **no XO**. Prototype isolated in `infra/tofu/xen-xapi/` (own dir + state). Risk finding: the only
-  XAPI-native provider is early-stage 0.2.x. Remaining: throwaway VM create/destroy via `xenserver_vm`,
-  import-parity of `.50/.51/.52`, then the `infra/tofu/` cutover.*
+  *Read + write PROVEN end-to-end (test-bed-first, no live-farm risk): the `xenserver/xenserver` provider
+  (0.2.2) over pure XAPI to the `.193` (KVM-XCP1) dom0 — read the live pool (1 host, 4 SRs) AND applied a
+  full VM lifecycle (cloned `MDE-VM-golden` → uuid `57c7d644` → `tofu destroy`, host restored), **no XO**.
+  Prototype isolated in `infra/tofu/xen-xapi/` (own dir + state). Risk finding: the only XAPI-native
+  provider is early-stage 0.2.x. Remaining: import-parity of `.50/.51/.52`, then the `infra/tofu/` cutover.*
   **As** the platform, **I want** the Xen IaC to manage hosts/VMs over XAPI directly, **so that** there is
   no central XO box to lose (no-fixed-center).
   **Acceptance** (runtime-observable):
