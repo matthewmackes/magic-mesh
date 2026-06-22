@@ -30,6 +30,8 @@ pub mod apps;
 pub mod bus_bridge;
 // CONNECT-1 — action/connect/* exposure-policy responder.
 pub mod connect;
+// DATACENTER (action layer) — action/dc/vm-power Xen VM power control responder.
+pub mod datacenter;
 // DDNS-EGRESS-3 — action/ddns/* config responder.
 pub mod ddns;
 pub mod directory;

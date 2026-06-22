@@ -1749,9 +1749,14 @@ the plane and it **survives killing the current zone leader**.
 - [ ] **DATACENTER-10: Hosts tab (full host lifecycle + pools).**
   **Acceptance**:
     - [ ] per-host capacity+health; pools (membership/master/join); maintenance/reboot/shutdown/**evacuate**/patch with impact preview; copy/launch-ssh console
-- [ ] **DATACENTER-11: VMs tab (full lifecycle, Tofu-backed create, noVNC, bulk).**
+- [>] **DATACENTER-11: VMs tab (full lifecycle, Tofu-backed create, noVNC, bulk).** *(session=calm-ray-dcr8)*
+  *VM POWER landed end-to-end (built in PARALLEL on the farm — worker on `.50`, panel on `.51`): the
+  `action/dc/vm-power` Bus-RPC (`ipc/datacenter.rs`, mirrors `ipc/route.rs`) runs `xe vm-start/shutdown/
+  reboot` over the mesh-key SSH, with an injection-guard on uuid/op + a dom0 allow-list; the panel's VM
+  rows have Start/Stop/Reboot buttons firing it + per-zone tabs. 6/6 worker + 9/9 panel tests green.
+  Remaining: suspend/migrate/clone/snapshot/resize/delete, Tofu-backed create, noVNC, bulk.*
   **Acceptance**:
-    - [ ] power/suspend/migrate/clone/snapshot/resize/delete; create via golden-template wizard that writes a Tofu resource + applies (structural changes go through Tofu — no drift); embedded noVNC; multi-select bulk power/snapshot/tag with per-item progress
+    - [>] power/suspend/migrate/clone/snapshot/resize/delete; create via golden-template wizard that writes a Tofu resource + applies (structural changes go through Tofu — no drift); embedded noVNC; multi-select bulk power/snapshot/tag with per-item progress — *power (start/shutdown/reboot) done via `action/dc/vm-power`; the rest pending*
 - [ ] **DATACENTER-12: Storage tab (SR/VDI/create + scheduled snapshots + image library).**
   **Acceptance**:
     - [ ] SRs + VDIs (attach/detach/create); scheduled snapshots w/ retention + backup target; ISO + template library (absorbs `images`); SR capacity threshold alerts → Bus/Hub

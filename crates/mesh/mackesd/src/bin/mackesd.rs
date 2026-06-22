@@ -6911,6 +6911,41 @@ fn run_serve(
                 tracing::warn!(error = %e, "Route Bus responder: bus persist open failed; responder skipped");
             }
         }
+        // DATACENTER (action layer) — the VM power-control responder:
+        // action/dc/vm-power runs `xe vm-{start,shutdown,reboot}` over the
+        // mesh-key SSH against an allowed dom0. Same dedicated-OS-thread shape.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let dc_svc =
+                    mackesd_core::ipc::datacenter::DatacenterService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("dc-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::datacenter::serve_bus(&persist, &dc_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "Datacenter Bus responder spawned; serving action/dc/vm-power (DATACENTER)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Datacenter Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("dc_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Datacenter Bus responder: bus persist open failed; responder skipped");
+            }
+        }
         // VPN-GW-1 — the VPN responder: action/vpn/* tunnel CRUD + wg-quick/
         // openvpn bring-up over the per-node tunnel config. Same OS-thread shape.
         match mde_bus::default_data_dir()

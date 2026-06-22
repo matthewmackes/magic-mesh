@@ -217,7 +217,7 @@ fn gather_do() -> Vec<DcResource> {
 /// dom0s to sample the Xen (dev) zone from — `MCNF_XEN_DOM0S` (comma-separated
 /// IPs). Empty by default, so the Xen source is a safe no-op until a node is
 /// explicitly configured with dom0 reach (keeps generic mesh nodes unaffected).
-fn xen_dom0s() -> Vec<String> {
+pub(crate) fn xen_dom0s() -> Vec<String> {
     std::env::var("MCNF_XEN_DOM0S")
         .unwrap_or_default()
         .split(',')
@@ -227,7 +227,7 @@ fn xen_dom0s() -> Vec<String> {
 }
 
 /// SSH key used to reach the dom0s (passwordless root via the mesh key).
-fn xen_ssh_key() -> String {
+pub(crate) fn xen_ssh_key() -> String {
     std::env::var("MCNF_XEN_SSH_KEY").unwrap_or_else(|_| {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
         format!("{home}/.ssh/mackes_mesh_ed25519")
