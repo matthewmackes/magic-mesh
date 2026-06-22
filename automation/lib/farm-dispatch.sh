@@ -54,7 +54,7 @@ cmd_run() {
     --exclude '/target' --exclude '/target-f43' --exclude '/target-f44' \
     --exclude '/.git/objects/pack/tmp_*' --exclude '/automation/.state' \
     "$REPO/" "mm@$node:magic-mesh/" >>"$log_file" 2>&1
-  "${SSH[@]}" "mm@$node" ". \"\$HOME/.cargo/env\"; cd magic-mesh && $command" >>"$log_file" 2>&1
+  "${SSH[@]}" "mm@$node" ". \"\$HOME/.cargo/env\"; . \"\$HOME/.sccache.env\" 2>/dev/null || true; cd magic-mesh && $command" >>"$log_file" 2>&1
   local exit_code=$?
   local ended; ended="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   flock -u "$lockfd"; exec {lockfd}>&-

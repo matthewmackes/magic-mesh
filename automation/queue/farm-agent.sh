@@ -24,7 +24,7 @@ process_one() {
       cmd="$(etcd_get "$key")"
       if [ -z "$cmd" ]; then etcd_del "/farm/lock/$jid"; continue; fi   # raced away
       log "claimed $jid : $cmd"
-      ( cd "$REPO" && . "$HOME/.cargo/env" 2>/dev/null; eval "$cmd" ) >"/tmp/farm-$jid.log" 2>&1
+      ( cd "$REPO" && . "$HOME/.cargo/env" 2>/dev/null; . "$HOME/.sccache.env" 2>/dev/null || true; eval "$cmd" ) >"/tmp/farm-$jid.log" 2>&1
       rc=$?
       local outcome=pass; [ $rc -eq 0 ] || outcome=fail
       etcd_put "/farm/result/$jid" "{\"outcome\":\"$outcome\",\"exit\":$rc,\"agent\":\"$AGENT\",\"ended\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"

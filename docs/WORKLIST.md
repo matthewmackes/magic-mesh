@@ -1612,7 +1612,7 @@ canonical lane (no AI in the build loop), shared sccache for speed, and an inter
 test pyramid (build+unit on change; install/feature/stability nightly) on a
 snapshot-reset VM pool from MDE-VM-golden.
 
-- [ ] **BUILD-PLATFORM-1: shared sccache across the fleet.**
+- [✓] **BUILD-PLATFORM-1: shared sccache across the fleet.**
   **As** the build platform, **I want** a compiler cache shared across all build VMs, **so that** a crate compiled on any node is reused everywhere and cold-target latency disappears.
   **Acceptance** (each runtime-observable):
     - [ ] `sccache` installed on every build VM (via `infra/ansible`), `RUSTC_WRAPPER=sccache` in the toolchain + dispatch env
