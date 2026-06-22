@@ -168,11 +168,24 @@ impl DatacenterPanel {
             .padding(16)
             .into();
         }
-        let mut col =
-            column![text(format!("Datacenter — {} resource(s)", self.rows.len())).size(18)]
-                .spacing(8)
-                .padding(16);
+        let prod = self.rows.iter().filter(|r| r.zone == "prod").count();
+        let dev = self.rows.iter().filter(|r| r.zone == "dev").count();
+        let mut col = column![text(format!(
+            "Datacenter — {} resource(s)  ·  Prod {prod} / Dev {dev}",
+            self.rows.len()
+        ))
+        .size(18)]
+        .spacing(8)
+        .padding(16);
+        // Rows are pre-sorted prod-first then by kind/name; emit a zone section
+        // header each time the zone changes (a step toward the per-zone tabs).
+        let mut cur_zone = "";
         for r in &self.rows {
+            if r.zone != cur_zone {
+                cur_zone = r.zone.as_str();
+                let n = self.rows.iter().filter(|x| x.zone == r.zone).count();
+                col = col.push(text(format!("{} ({n})", r.zone_label())).size(14));
+            }
             let label = if r.name.is_empty() {
                 r.id.clone()
             } else {
@@ -181,7 +194,6 @@ impl DatacenterPanel {
             col = col.push(
                 container(
                     row![
-                        text(r.zone_label().to_string()).width(Length::FillPortion(2)),
                         text(r.kind.clone()).width(Length::FillPortion(1)),
                         text(label).width(Length::FillPortion(3)),
                         text(r.status.clone()).width(Length::FillPortion(1)),
