@@ -251,6 +251,51 @@ pub fn load_state_indicator<'a, Message: 'a>(
     )
 }
 
+/// MOTION-NET-2 — a layout-matching skeleton placeholder: `rows` greyed Carbon
+/// bars (≈ a data row tall) shown while a panel is `LoadState::Loading`, so a
+/// slow first load never shows a blank area or a bare "Loading…" string. The
+/// grey shimmers via `animation::shimmer_alpha(phase, reduce_motion)`; under
+/// reduce-motion it renders a STATIC grey (no shimmer). Swap to the real content
+/// when data lands (shimmer stops). `rows` = the expected row count of the
+/// eventual layout.
+pub fn skeleton<'a, Message: 'a>(
+    rows: usize,
+    palette: Palette,
+    phase: f32,
+    reduce_motion: bool,
+) -> Element<'a, Message> {
+    let alpha = mde_theme::animation::shimmer_alpha(phase, reduce_motion);
+    let bar = Color {
+        a: alpha,
+        ..palette.text_muted.into_cosmic_color()
+    };
+    let radii = Radii::defaults();
+    let mut col: Column<'a, Message, cosmic::Theme> = column![].spacing(8);
+    for _ in 0..rows {
+        col = col.push(
+            container(
+                Space::new()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(DATA_ROW_MIN_HEIGHT - 12.0)),
+            )
+            .width(Length::Fill)
+            .style(move |_theme| container::Style {
+                snap: false,
+                icon_color: None,
+                background: Some(Background::Color(bar)),
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: f32::from(radii.sm).into(),
+                },
+                shadow: IcedShadow::default(),
+                text_color: None,
+            }),
+        );
+    }
+    col.into()
+}
+
 /// UX-6 — card surface. Wraps any content in a raised surface
 /// with `Shadow::lift()` elevation, `Radii::md` corners,
 /// `space.lg` inner padding. Use for fleet peer cards, snapshot
@@ -795,6 +840,17 @@ mod tests {
             StateTone::Success,
         ] {
             let _ = badge_severity_for(t);
+        }
+    }
+
+    #[test]
+    fn skeleton_constructs_for_any_row_count_and_reduce_motion() {
+        // MOTION-NET-2 — the skeleton renders for an empty, single, and
+        // multi-row layout, both shimmering and static (reduce-motion).
+        let palette = crate::live_theme::palette();
+        for rows in [0usize, 1, 5, 12] {
+            let _: Element<'_, ()> = skeleton(rows, palette, 0.3, false);
+            let _: Element<'_, ()> = skeleton(rows, palette, 0.3, true); // reduce-motion
         }
     }
 

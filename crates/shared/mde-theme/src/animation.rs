@@ -189,6 +189,28 @@ pub fn pulse_scale(phase: f32, max_scale: f32) -> f32 {
     lerp_f32(1.0, max_scale, smoothed)
 }
 
+/// MOTION-NET-2 — dim end of a skeleton placeholder's shimmer (alpha).
+pub const SKELETON_ALPHA_DIM: f32 = 0.10;
+/// MOTION-NET-2 — bright end of a skeleton placeholder's shimmer (alpha).
+pub const SKELETON_ALPHA_BRIGHT: f32 = 0.22;
+
+/// MOTION-NET-2 — the alpha for a greyed skeleton placeholder at `phase` (0→1).
+/// The tile "breathes" between [`SKELETON_ALPHA_DIM`] and
+/// [`SKELETON_ALPHA_BRIGHT`] (eased ping-pong, like [`pulse_scale`]) so a slow
+/// load reads as active. **Under reduce-motion it is STATIC** at the mid alpha —
+/// a plain grey block, no shimmer (the a11y contract: motion is never the only
+/// cue). Pure.
+#[must_use]
+pub fn shimmer_alpha(phase: f32, reduce_motion: bool) -> f32 {
+    if reduce_motion {
+        return (SKELETON_ALPHA_DIM + SKELETON_ALPHA_BRIGHT) / 2.0;
+    }
+    let p = phase.clamp(0.0, 1.0);
+    let triangle = if p < 0.5 { p * 2.0 } else { 2.0 - p * 2.0 };
+    let smoothed = ease(triangle, Easing::EaseInOut);
+    lerp_f32(SKELETON_ALPHA_DIM, SKELETON_ALPHA_BRIGHT, smoothed)
+}
+
 /// MOTION-INFRA-2 — the standard shell transition kinds. Each maps an eased
 /// progress `t` (0→1, from [`Animator::value`]) to concrete [`RenderParams`] the
 /// consumer applies to its themed widget (alpha → a container/text color alpha,
@@ -574,5 +596,33 @@ mod tests {
             cap_ms, 180,
             "reduce_motion=false must preserve standard duration"
         );
+    }
+
+    #[test]
+    fn shimmer_alpha_oscillates_with_motion_and_is_static_under_reduce_motion() {
+        // MOTION-NET-2: with motion ON the skeleton breathes between the dim and
+        // bright bounds across a phase cycle.
+        let lo = shimmer_alpha(0.0, false);
+        let mid = shimmer_alpha(0.5, false);
+        let hi_again = shimmer_alpha(1.0, false);
+        assert!((lo - SKELETON_ALPHA_DIM).abs() < 1e-3, "phase 0 = dim");
+        assert!(
+            (mid - SKELETON_ALPHA_BRIGHT).abs() < 1e-3,
+            "phase 0.5 = bright"
+        );
+        assert!(
+            (hi_again - SKELETON_ALPHA_DIM).abs() < 1e-3,
+            "phase 1 back to dim (ping-pong)"
+        );
+        // Every motion-on alpha stays within the bounds.
+        for i in 0..=10 {
+            let a = shimmer_alpha(i as f32 / 10.0, false);
+            assert!((SKELETON_ALPHA_DIM..=SKELETON_ALPHA_BRIGHT).contains(&a));
+        }
+        // reduce-motion → STATIC mid grey regardless of phase (the a11y contract).
+        let r0 = shimmer_alpha(0.0, true);
+        let r5 = shimmer_alpha(0.5, true);
+        assert_eq!(r0, r5, "reduce-motion alpha is phase-independent");
+        assert!((r0 - (SKELETON_ALPHA_DIM + SKELETON_ALPHA_BRIGHT) / 2.0).abs() < 1e-6);
     }
 }

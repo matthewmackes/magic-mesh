@@ -39,6 +39,15 @@ pub fn palette() -> Palette {
     tokens().palette
 }
 
+/// MOTION-A11Y-1 — the live reduce-motion preference, read the same way every
+/// `view()` reads the palette, so animated surfaces (skeletons, transitions,
+/// pulses) can gate motion without re-loading prefs at each call site. Defaults
+/// to `false` (motion on) when no preference is set.
+#[must_use]
+pub fn reduce_motion() -> bool {
+    Preferences::load().a11y.reduce_motion
+}
+
 /// Swap the live theme/density. The next render pass repaints with
 /// the new palette. Persistence is the caller's job
 /// ([`mde_theme::Preferences::save`]) so tests can swap freely.
