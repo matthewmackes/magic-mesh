@@ -55,6 +55,8 @@ pub mod nebula;
 // name + `/org/mackes/Session` path were removed with it.
 pub mod settings;
 pub mod shell;
+// DC-15 (action layer) — action/dc/tofu-plan read-only OpenTofu plan responder.
+pub mod tofu;
 pub mod voip;
 
 /// EFF-23 — maximum inbound RPC body size a Bus responder will hand to

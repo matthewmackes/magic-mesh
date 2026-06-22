@@ -6946,6 +6946,41 @@ fn run_serve(
                 tracing::warn!(error = %e, "Datacenter Bus responder: bus persist open failed; responder skipped");
             }
         }
+        // DC-15 (action layer) — the Tofu-plan responder: action/dc/tofu-plan
+        // runs a read-only `tofu plan` of an allow-listed workspace under
+        // infra/tofu/<ws> with its env sourced. Same dedicated-OS-thread shape.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let tofu_svc =
+                    mackesd_core::ipc::tofu::TofuService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("tofu-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::tofu::serve_bus(&persist, &tofu_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "Tofu Bus responder spawned; serving action/dc/tofu-plan (DC-15)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Tofu Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("tofu_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Tofu Bus responder: bus persist open failed; responder skipped");
+            }
+        }
         // VPN-GW-1 — the VPN responder: action/vpn/* tunnel CRUD + wg-quick/
         // openvpn bring-up over the per-node tunnel config. Same OS-thread shape.
         match mde_bus::default_data_dir()

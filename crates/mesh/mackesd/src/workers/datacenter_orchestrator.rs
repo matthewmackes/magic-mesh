@@ -277,6 +277,26 @@ pub fn parse_xe_srs(output: &str) -> Vec<(String, String, String, String)> {
         .collect()
 }
 
+/// Parse the remote `xe` network helper's pipe-delimited `uuid|name|bridge`
+/// lines into `(uuid, name, bridge)` triples. Pure — fed the raw stdout. Skips
+/// lines with an empty uuid (mirrors [`parse_xe_srs`]).
+#[must_use]
+pub fn parse_xe_nets(output: &str) -> Vec<(String, String, String)> {
+    output
+        .lines()
+        .filter_map(|l| {
+            let mut p = l.splitn(3, '|');
+            let u = p.next()?.trim();
+            if u.is_empty() {
+                return None;
+            }
+            let n = p.next().unwrap_or("").trim();
+            let b = p.next().unwrap_or("").trim();
+            Some((u.to_string(), n.to_string(), b.to_string()))
+        })
+        .collect()
+}
+
 /// Run a remote `xe` command on a dom0 over SSH (best-effort).
 fn ssh_xe(key: &str, dom0: &str, remote: &str) -> Option<String> {
     let o = std::process::Command::new("ssh")
@@ -341,6 +361,18 @@ fn gather_xen() -> Vec<DcResource> {
                 })
                 .to_string();
                 out.push(DcResource::new("sr", u, sig));
+            }
+        }
+        // Networks (bridges) → network visibility (DC-13).
+        let net_script = "for u in $(xe network-list params=uuid --minimal | tr , ' '); \
+             do echo \"$u|$(xe network-param-get uuid=$u param-name=name-label)|$(xe network-param-get uuid=$u param-name=bridge)\"; done";
+        if let Some(netout) = ssh_xe(&key, &dom0, net_script) {
+            for (u, n, b) in parse_xe_nets(&netout) {
+                let sig = serde_json::json!({
+                    "kind": "net", "id": u, "name": n, "bridge": b, "host": dom0, "zone": "dev"
+                })
+                .to_string();
+                out.push(DcResource::new("net", u, sig));
             }
         }
     }
@@ -490,6 +522,23 @@ mod tests {
         );
         assert_eq!(vms[1].1, "mcnf-golden");
         assert_eq!(vms[1].2, "halted");
+    }
+
+    #[test]
+    fn parse_xe_nets_reads_pipe_lines() {
+        let out = "n1|Pool-wide network associated with eth0|xenbr0\nn2|Host internal management network|xenapi\n|skip-empty-uuid|br0\n";
+        let nets = parse_xe_nets(out);
+        assert_eq!(nets.len(), 2); // the empty-uuid line is skipped
+        assert_eq!(
+            nets[0],
+            (
+                "n1".into(),
+                "Pool-wide network associated with eth0".into(),
+                "xenbr0".into()
+            )
+        );
+        assert_eq!(nets[1].1, "Host internal management network");
+        assert_eq!(nets[1].2, "xenapi");
     }
 
     #[test]

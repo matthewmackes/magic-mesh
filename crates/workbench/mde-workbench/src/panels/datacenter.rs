@@ -35,6 +35,12 @@ pub struct DcRow {
     /// `host` field). Empty when the event didn't name one. Used as the
     /// `dom0` argument for the `action/dc/vm-power` RPC.
     pub host: String,
+    /// Total capacity in bytes, as a string (sr events carry `size`). Empty for
+    /// non-storage resources. Rendered as a GiB capacity readout on sr rows.
+    pub size: String,
+    /// Used capacity in bytes, as a string (sr events carry `used`). Empty for
+    /// non-storage resources.
+    pub used: String,
 }
 
 impl DcRow {
@@ -46,6 +52,38 @@ impl DcRow {
             "dev" => "Dev · Xen",
             _ => "—",
         }
+    }
+
+    /// A human capacity readout for storage rows — e.g. `"40 / 207 GiB (19%)"`.
+    /// Returns `None` when `size`/`used` don't parse or `size` is 0, so callers
+    /// render nothing rather than a bogus "0 / 0 GiB (NaN%)".
+    #[must_use]
+    pub fn capacity_readout(&self) -> Option<String> {
+        let size: u64 = self.size.parse().ok()?;
+        let used: u64 = self.used.parse().ok()?;
+        if size == 0 {
+            return None;
+        }
+        const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let pct = ((used as f64 / size as f64) * 100.0).round() as u64;
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let used_gib = (used as f64 / GIB).round() as u64;
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let size_gib = (size as f64 / GIB).round() as u64;
+        Some(format!("{used_gib} / {size_gib} GiB ({pct}%)"))
     }
 }
 
@@ -79,6 +117,16 @@ pub fn parse_dc_event(body: &str) -> Option<DcRow> {
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
+    let size = v
+        .get("size")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let used = v
+        .get("used")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     Some(DcRow {
         kind,
         id,
@@ -86,6 +134,8 @@ pub fn parse_dc_event(body: &str) -> Option<DcRow> {
         status,
         zone,
         host,
+        size,
+        used,
     })
 }
 
@@ -119,6 +169,21 @@ pub struct DatacenterPanel {
     /// Which per-zone tab is selected — "prod" (DigitalOcean) or "dev" (Xen).
     /// Defaults to "prod". The view filters rendered rows to this zone.
     pub zone_tab: String,
+    /// Which top-level view is selected — `Zone` shows the per-zone resource
+    /// tabs; `Tofu` shows the OpenTofu workspaces with Plan buttons.
+    pub view_mode: ViewMode,
+    /// The latest `action/dc/tofu-plan` reply summary (or in-flight/error text),
+    /// rendered in the Tofu view.
+    pub tofu_output: String,
+}
+
+/// Top-level view selector for the datacenter panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    /// Per-zone resource tabs (Prod / Dev).
+    Zone,
+    /// OpenTofu workspaces + Plan buttons.
+    Tofu,
 }
 
 impl Default for DatacenterPanel {
@@ -129,6 +194,8 @@ impl Default for DatacenterPanel {
             busy: false,
             load_error: None,
             zone_tab: "prod".to_string(),
+            view_mode: ViewMode::Zone,
+            tofu_output: String::new(),
         }
     }
 }
@@ -149,6 +216,14 @@ pub enum Message {
     /// The `action/dc/vm-power` RPC came back — `Ok` carries a status line, `Err`
     /// the error text. Delivered as a panel-scoped message so it routes here.
     PowerDone(Result<String, String>),
+    /// Switch the top-level view (per-zone tabs vs the Tofu workspaces).
+    ViewMode(ViewMode),
+    /// A Tofu "Plan" button was clicked. The payload is the workspace name
+    /// ("xen-xapi" | "zone1-do"). Fires the `action/dc/tofu-plan` RPC.
+    TofuPlan(String),
+    /// The `action/dc/tofu-plan` RPC came back — `Ok` carries the plan summary,
+    /// `Err` the error text. Routes here as a panel-scoped message.
+    TofuDone(Result<String, String>),
 }
 
 impl DatacenterPanel {
@@ -214,6 +289,36 @@ impl DatacenterPanel {
                 self.status = e;
                 Task::none()
             }
+            Message::ViewMode(mode) => {
+                self.view_mode = mode;
+                Task::none()
+            }
+            Message::TofuPlan(ws) => {
+                self.status = format!("Planning {ws}…");
+                self.tofu_output = format!("Planning {ws}…");
+                Task::perform(
+                    async move {
+                        // Same shape as `vm_power`: the Bus RPC borrows a
+                        // non-Send Persist across its internal await, so run the
+                        // whole round trip on a blocking thread with a local
+                        // runtime.
+                        tokio::task::spawn_blocking(move || tofu_plan(&ws))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("tofu task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::TofuDone(result)),
+                )
+            }
+            Message::TofuDone(Ok(s)) => {
+                self.status = "Plan complete".into();
+                self.tofu_output = s;
+                Task::none()
+            }
+            Message::TofuDone(Err(e)) => {
+                self.status = e.clone();
+                self.tofu_output = e;
+                Task::none()
+            }
         }
     }
 
@@ -224,44 +329,29 @@ impl DatacenterPanel {
                 .padding(f32::from(spacing::BASE[5]))
                 .into();
         }
-        if self.rows.is_empty() {
-            return container(
-                column![
-                    text("No datacenter resources yet").size(f32::from(spacing::BASE[6])),
-                    text(
-                        "Hosts, VMs, and droplets appear here as the datacenter \
-                         orchestrator publishes them.",
-                    ),
-                ]
-                .spacing(f32::from(spacing::BASE[2])),
-            )
-            .padding(f32::from(spacing::BASE[5]))
-            .into();
-        }
 
         let prod = self.rows.iter().filter(|r| r.zone == "prod").count();
         let dev = self.rows.iter().filter(|r| r.zone == "dev").count();
 
-        // Per-zone tabs. The selected tab gets the Primary (filled) variant; the
-        // other a Secondary outline. Clicking either emits ZoneTab(..).
-        let tab = |label: String, zone: &str| -> Element<'_, crate::Message> {
-            let variant = if self.zone_tab == zone {
+        // Top-level view selector: per-zone resources vs the Tofu workspaces.
+        // The selected mode gets the Primary (filled) variant. Reachable even
+        // when there are no resource rows yet (Tofu has no row dependency).
+        let mode_btn = |label: &str, mode: ViewMode| -> Element<'_, crate::Message> {
+            let variant = if self.view_mode == mode {
                 ButtonVariant::Primary
             } else {
                 ButtonVariant::Secondary
             };
             variant_button(
-                label,
+                label.to_string(),
                 variant,
-                Some(crate::Message::Datacenter(Message::ZoneTab(
-                    zone.to_string(),
-                ))),
+                Some(crate::Message::Datacenter(Message::ViewMode(mode))),
                 palette,
             )
         };
-        let tabs = row![
-            tab(format!("Prod · DO ({prod})"), "prod"),
-            tab(format!("Dev · Xen ({dev})"), "dev"),
+        let mode_tabs = row![
+            mode_btn("Resources", ViewMode::Zone),
+            mode_btn("Tofu", ViewMode::Tofu),
         ]
         .spacing(f32::from(spacing::BASE[2]));
 
@@ -271,7 +361,7 @@ impl DatacenterPanel {
                 self.rows.len()
             ))
             .size(f32::from(spacing::BASE[6])),
-            tabs,
+            mode_tabs,
         ]
         .spacing(f32::from(spacing::BASE[2]))
         .padding(f32::from(spacing::BASE[5]));
@@ -280,17 +370,85 @@ impl DatacenterPanel {
             col = col.push(text(self.status.clone()));
         }
 
-        let visible: Vec<&DcRow> = self
-            .rows
-            .iter()
-            .filter(|r| r.zone == self.zone_tab)
-            .collect();
-        if visible.is_empty() {
-            col = col.push(text("No resources in this zone yet."));
+        match self.view_mode {
+            ViewMode::Tofu => {
+                // A Plan button per workspace + the latest plan output.
+                let plan_btn = |ws: &str| -> Element<'_, crate::Message> {
+                    variant_button(
+                        format!("Plan {ws}"),
+                        ButtonVariant::Secondary,
+                        Some(crate::Message::Datacenter(Message::TofuPlan(
+                            ws.to_string(),
+                        ))),
+                        palette,
+                    )
+                };
+                col = col.push(
+                    row![plan_btn("xen-xapi"), plan_btn("zone1-do")]
+                        .spacing(f32::from(spacing::BASE[2])),
+                );
+                if self.tofu_output.is_empty() {
+                    col = col.push(text(
+                        "Run a workspace plan to see the OpenTofu output here.",
+                    ));
+                } else {
+                    col = col.push(
+                        container(text(self.tofu_output.clone()))
+                            .padding(f32::from(spacing::BASE[3]))
+                            .width(Length::Fill),
+                    );
+                }
+            }
+            ViewMode::Zone => {
+                if self.rows.is_empty() {
+                    col = col.push(
+                        text("No datacenter resources yet").size(f32::from(spacing::BASE[6])),
+                    );
+                    col = col.push(text(
+                        "Hosts, VMs, and droplets appear here as the datacenter \
+                         orchestrator publishes them.",
+                    ));
+                } else {
+                    // Per-zone tabs. The selected tab gets the Primary (filled)
+                    // variant; the other a Secondary outline.
+                    let tab = |label: String, zone: &str| -> Element<'_, crate::Message> {
+                        let variant = if self.zone_tab == zone {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Secondary
+                        };
+                        variant_button(
+                            label,
+                            variant,
+                            Some(crate::Message::Datacenter(Message::ZoneTab(
+                                zone.to_string(),
+                            ))),
+                            palette,
+                        )
+                    };
+                    col = col.push(
+                        row![
+                            tab(format!("Prod · DO ({prod})"), "prod"),
+                            tab(format!("Dev · Xen ({dev})"), "dev"),
+                        ]
+                        .spacing(f32::from(spacing::BASE[2])),
+                    );
+
+                    let visible: Vec<&DcRow> = self
+                        .rows
+                        .iter()
+                        .filter(|r| r.zone == self.zone_tab)
+                        .collect();
+                    if visible.is_empty() {
+                        col = col.push(text("No resources in this zone yet."));
+                    }
+                    for r in visible {
+                        col = col.push(dc_row_view(r, palette));
+                    }
+                }
+            }
         }
-        for r in visible {
-            col = col.push(dc_row_view(r, palette));
-        }
+
         scrollable(col).into()
     }
 }
@@ -303,10 +461,17 @@ fn dc_row_view(r: &DcRow, palette: Palette) -> Element<'_, crate::Message> {
     } else {
         r.name.clone()
     };
+    // For storage rows, surface the capacity readout in place of the bare
+    // status; fall back to status when the capacity bytes don't parse.
+    let status_or_capacity = if r.kind == "sr" {
+        r.capacity_readout().unwrap_or_else(|| r.status.clone())
+    } else {
+        r.status.clone()
+    };
     let mut line = row![
         text(r.kind.clone()).width(Length::FillPortion(1)),
         text(label).width(Length::FillPortion(3)),
-        text(r.status.clone()).width(Length::FillPortion(1)),
+        text(status_or_capacity).width(Length::FillPortion(1)),
     ]
     .spacing(f32::from(spacing::BASE[3]));
 
@@ -399,6 +564,46 @@ fn vm_power(uuid: &str, op: &str, dom0: &str) -> Result<String, String> {
     Err(format!("unexpected vm-power reply: {raw}"))
 }
 
+/// Fire the `action/dc/tofu-plan` Bus RPC (blocking — runs on a `spawn_blocking`
+/// thread) and translate the reply into the plan output. Mirrors `vm_power`
+/// exactly: a Persist + `mde_bus::rpc::request` round trip wrapped in a local
+/// tokio runtime because `request` borrows a non-`Send` `Persist` across its
+/// internal await. The reply body is `{"ok":true,"summary":".."}` (→ the
+/// summary) or `{"error":".."}` (→ the error text).
+fn tofu_plan(workspace: &str) -> Result<String, String> {
+    let Some(dir) = mde_bus::default_data_dir() else {
+        return Err("no Bus data dir".to_string());
+    };
+    let body = serde_json::json!({ "workspace": workspace }).to_string();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    let reply = rt.block_on(async {
+        let persist = mde_bus::persist::Persist::open(dir).map_err(|e| e.to_string())?;
+        mde_bus::rpc::request(
+            &persist,
+            "action/dc/tofu-plan",
+            mde_bus::hooks::config::Priority::Default,
+            Some("tofu-plan"),
+            Some(&body),
+            Duration::from_secs(120),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+    let raw = reply.body.unwrap_or_default();
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("bad tofu-plan reply: {e}"))?;
+    if let Some(err) = v.get("error").and_then(serde_json::Value::as_str) {
+        return Err(err.to_string());
+    }
+    if let Some(summary) = v.get("summary").and_then(serde_json::Value::as_str) {
+        return Ok(summary.to_string());
+    }
+    Err(format!("unexpected tofu-plan reply: {raw}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,6 +632,42 @@ mod tests {
         assert_eq!(r.kind, "vm");
         assert_eq!(r.id, "uuid-9");
         assert_eq!(r.host, "172.20.0.9");
+        // A vm event carries no capacity → size/used default to empty.
+        assert_eq!(r.size, "");
+        assert_eq!(r.used, "");
+    }
+
+    #[test]
+    fn parse_dc_event_reads_sr_capacity() {
+        // 207 GiB total, ~40 GiB used.
+        let r = parse_dc_event(
+            r#"{"kind":"sr","id":"sr-1","name":"local-ext","size":"222330230784","used":"42949672960","host":"172.20.0.9","zone":"dev"}"#,
+        )
+        .unwrap();
+        assert_eq!(r.kind, "sr");
+        assert_eq!(r.size, "222330230784");
+        assert_eq!(r.used, "42949672960");
+        assert_eq!(r.capacity_readout().as_deref(), Some("40 / 207 GiB (19%)"));
+    }
+
+    #[test]
+    fn capacity_readout_guards_against_bad_or_zero_size() {
+        let zero = DcRow {
+            kind: "sr".into(),
+            id: "x".into(),
+            name: String::new(),
+            status: String::new(),
+            zone: "dev".into(),
+            host: String::new(),
+            size: "0".into(),
+            used: "0".into(),
+        };
+        assert_eq!(zero.capacity_readout(), None);
+        let garbage = DcRow {
+            size: "not-a-number".into(),
+            ..zero.clone()
+        };
+        assert_eq!(garbage.capacity_readout(), None);
     }
 
     #[test]
@@ -512,5 +753,54 @@ mod tests {
         let _ = p.view(); // prod tab (default)
         let _ = p.update(Message::ZoneTab("dev".to_string()));
         let _ = p.view(); // dev tab — exercises the VM power-button row
+        let _ = p.update(Message::ViewMode(ViewMode::Tofu));
+        let _ = p.view(); // Tofu view — exercises the Plan buttons
+    }
+
+    #[test]
+    fn view_renders_sr_capacity() {
+        let mut p = DatacenterPanel::new();
+        p.rows = project_rows(&[(
+            "event/dc/sr/1".into(),
+            r#"{"kind":"sr","id":"sr-1","name":"local-ext","size":"222330230784","used":"42949672960","host":"172.20.0.9","zone":"dev"}"#.into(),
+        )]);
+        let _ = p.update(Message::ZoneTab("dev".to_string()));
+        let _ = p.view(); // exercises the sr capacity readout render path
+    }
+
+    #[test]
+    fn view_mode_message_switches_the_view() {
+        let mut p = DatacenterPanel::new();
+        assert_eq!(p.view_mode, ViewMode::Zone);
+        let _ = p.update(Message::ViewMode(ViewMode::Tofu));
+        assert_eq!(p.view_mode, ViewMode::Tofu);
+        let _ = p.update(Message::ViewMode(ViewMode::Zone));
+        assert_eq!(p.view_mode, ViewMode::Zone);
+    }
+
+    #[test]
+    fn tofu_view_renders_with_empty_rows() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::ViewMode(ViewMode::Tofu));
+        let _ = p.view(); // Tofu reachable even with no resource rows
+    }
+
+    #[test]
+    fn tofu_plan_sets_in_flight_output() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::TofuPlan("xen-xapi".to_string()));
+        assert_eq!(p.status, "Planning xen-xapi…");
+        assert_eq!(p.tofu_output, "Planning xen-xapi…");
+    }
+
+    #[test]
+    fn tofu_done_writes_output() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::TofuDone(Ok("No changes. 0 to add.".to_string())));
+        assert_eq!(p.tofu_output, "No changes. 0 to add.");
+        assert_eq!(p.status, "Plan complete");
+        let _ = p.update(Message::TofuDone(Err("tofu missing".to_string())));
+        assert_eq!(p.tofu_output, "tofu missing");
+        assert_eq!(p.status, "tofu missing");
     }
 }
