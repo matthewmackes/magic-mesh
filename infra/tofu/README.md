@@ -1,5 +1,11 @@
 # infra/tofu — the build farm as code (DEVOPS-SUBSTRATE)
 
+> **⚠️ DEPRECATED (2026-06-22, DATACENTER-1) — do NOT `tofu apply` here.** The farm
+> was cut over to the **XAPI-native, no-XO** config in **`xen-xapi/`** (3 aliased
+> providers, all 3 build VMs imported, `0-destroy` plan). This `xenorchestra`
+> config still has state for the same VMs; applying it would conflict with the new
+> one. Kept for reference/rollback only until its state is removed. Use `xen-xapi/`.
+
 Declares the MCNF build farm against live **Xen Orchestra** via the
 `vatesfr/xenorchestra` OpenTofu provider. This is the durable replacement for
 the `install-helpers/*xcp*` bash provisioners: XO drives XAPI, so the whole

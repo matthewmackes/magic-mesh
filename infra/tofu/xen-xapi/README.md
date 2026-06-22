@@ -1,9 +1,15 @@
-# Xen XAPI-native Tofu (DATACENTER-1 — migration prototype)
+# Xen XAPI-native Tofu — the build-farm IaC (DATACENTER-1)
 
 The no-fixed-center replacement for the XO-backed Xen IaC: the `xenserver`
 provider talks **XAPI directly** to a pool master, so there is no central Xen
-Orchestra to lose. Isolated from `../` (the live `xenorchestra`-managed farm) —
-its own directory + state — so nothing here can disturb the working farm.
+Orchestra to lose. The farm spans **3 standalone pools**, so this uses **3 aliased
+providers** (one per dom0). **This supersedes the `xenorchestra` config in `../`**
+(now deprecated — do not `apply` it; both managing the same VMs would conflict).
+
+**CUTOVER DONE (2026-06-22):** all three live build VMs imported here —
+`mcnf-build-50` (.9), `-51` (.193), `-52` (.165) — farm-wide `tofu plan` =
+**`0 add / 0 destroy`** (only the benign per-VM metadata residual). The VMs stayed
+`running` throughout (import is non-mutating). The farm is now XAPI-managed, no XO.
 
 ## Status
 
