@@ -1664,18 +1664,20 @@ throughout (AI_GOVERNANCE §0): no single control host whose loss is fatal. Work
 the plane and it **survives killing the current zone leader**.
 
 ### Phase 0 — Foundations (prerequisite; blocks the plane)
-- [>] **DATACENTER-1: XAPI-native Tofu provider (drop XO).** *(session=calm-ray-dcr8)*
-  *CUTOVER DONE (2026-06-22): `infra/tofu/xen-xapi/` (the `xenserver` provider, 3 aliased providers — the
-  farm spans 3 standalone pools) now manages all three live build VMs (`.50/.51/.52`), imported, farm-wide
-  `tofu plan` = **0 add / 0 destroy** (only benign per-VM metadata), VMs stayed `running` throughout — **no
-  XO**. Read+write+destroy+import all proven over pure XAPI on XCP-ng 8.3. Old `infra/tofu/` (xenorchestra)
-  marked DEPRECATED. Remaining: remove old xenorchestra state + stop the XO process; move state to
-  SUBSTRATE-V2 (DATACENTER-2). Risk finding kept: the XAPI-native provider is early-stage 0.2.x.*
+- [✓] **DATACENTER-1: XAPI-native Tofu provider (drop XO).** *(session=calm-ray-dcr8)*
+  *FULLY CLOSED (2026-06-22). `infra/tofu/xen-xapi/` (the `xenserver` provider, 3 aliased providers — farm
+  spans 3 standalone pools) manages all three build VMs (`.50/.51/.52`), imported, farm-wide `tofu plan` =
+  **0 add / 0 destroy**. XO is **stopped** (xo-ce + xo-redis containers down, port 8080 dead) and the new
+  config was re-proven to plan `0-destroy` **with XO down** — no XO dependency. Old `infra/tofu/`
+  xenorchestra state neutralized (3 VMs `state rm`'d + archived to `terraform.tfstate.pre-cutover-backup`)
+  + DEPRECATED. Build VMs stayed `running` throughout. Read+write+destroy+import all proven over pure XAPI
+  on XCP-ng 8.3. Provider is early-stage 0.2.x (noted). Follow-on (separate task): move state to SUBSTRATE-V2
+  (DATACENTER-2) — today it's local, as before.*
   **As** the platform, **I want** the Xen IaC to manage hosts/VMs over XAPI directly, **so that** there is
   no central XO box to lose (no-fixed-center).
   **Acceptance** (runtime-observable):
     - [✓] `infra/tofu/` migrated off `vatesfr/xenorchestra` to a XAPI-native provider; `tofu plan` clean against the live farm after import — *DONE: `xen-xapi/` (3 aliased providers) imported all 3 build VMs, farm-wide plan `0 add/0 destroy` (only benign metadata residual)*
-    - [>] the `.50/.51/.52` build VMs + golden template are managed with no XO process running — *managed via XAPI with no XO needed; the XO process is still up for the now-DEPRECATED old config until its state is removed*
+    - [✓] the `.50/.51/.52` build VMs + golden template are managed with no XO process running — *DONE: XO containers stopped; xen-xapi config plans `0-destroy` with XO down; farm runs on pure XAPI*
 - [ ] **DATACENTER-2: mesh-replicated Tofu remote state (SUBSTRATE-V2).**
   **As** an operator, **I want** Tofu state + lock in the mesh-replicated substrate, **so that** any elected
   leader plans/applies against the same state.
