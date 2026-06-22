@@ -204,6 +204,24 @@ desktop-personal panels grouped below. Locks (full table: `docs/design/planes.md
 
 ## §10 — Build & development environment (canonical — do not rediscover)
 
+> **§10.0 — MANDATE: work the farm, scale out, never grind solo.** *(operator,
+> 2026-06-22, after a full session ran sequentially on one node while the farm sat
+> idle.)* Heavy or decomposable work **MUST** be offloaded to the build farm and run
+> **in parallel across the farm nodes** (`172.20.0.50/.51/.52`) — not serialized on one
+> node, and not done as a single sequential loop when the work splits.
+> 1. **Builds/tests/RPM cuts run on the farm** (`install-helpers/xcp-build.sh`), never
+>    blocking the orchestration loop on a local compile when the farm is reachable.
+> 2. **Decompose and fan out.** When work splits into file-disjoint pieces (a worker
+>    handler + its GUI panel; N independent tasks), spawn **concurrent subagents** —
+>    each owning disjoint files and building on a **different farm node** — instead of
+>    doing them one at a time. Distribute builds across `.50/.51/.52`.
+> 3. **A slow or fuzzy success signal is never a reason to defer, serialize, or
+>    reclassify work as "tail"** (see the `no-flinch` skill). "Harder/slower for me" ≠
+>    "lower priority for the operator." Fix the feedback loop (distribute the build);
+>    don't route around the work.
+> 4. The measure is **throughput on the operator's priorities**, not the cleanliness of
+>    a single sequential green checkmark. Verify you are actually parallelizing.
+
 The development toolchain and build environment are documented **once**, in
 [`docs/BUILD-ENVIRONMENT.md`](docs/BUILD-ENVIRONMENT.md) — **read it before building
 or provisioning; do not relearn it.** If it has drifted, fix that file, not your

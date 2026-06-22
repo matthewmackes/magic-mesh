@@ -23,7 +23,18 @@ sections are §4 (Carbon look), §6 (the mesh boundary), and §7 (Definition of 
 > and from any `docs/design/*.md` once they exist, and create the worklist as the
 > durable record before draining.
 
-## Phase 0 — Rescue pass (always first)
+## Phase 0a — Refresh governance (MANDATORY, every run, before anything else)
+
+**Re-read `AI_GOVERNANCE.md` into context at the start of every `/ship` run** — it is
+the rulebook and it changes; never drain from a stale memory of it. *(operator,
+2026-06-22.)* `Read` the whole file. Pay special attention to the load-bearing
+sections: **§10.0 (MANDATE: work the farm — offload builds + fan out concurrent
+subagents across `.50/.51/.52`, never grind solo or serialize decomposable work)**,
+§4 (Carbon look), §6 (the mesh boundary), and §7 (Definition of Done). If you catch
+yourself building locally/sequentially when the work could go to the farm in
+parallel, that's a §10.0 violation — fix it before continuing.
+
+## Phase 0 — Rescue pass (always first after the governance refresh)
 
 Before new work, catch the project's recurring failure mode (shipped-but-dead /
 mockup-only code). This is the single highest-value step.
