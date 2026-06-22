@@ -207,6 +207,11 @@ struct AppsApplet {
     /// a resolution change is picked up without a re-login.
     menu_w: f32,
     menu_h: f32,
+    /// APPS-9b — the last `event/apps/toggle` ULID acted on. Primed at init to
+    /// the current bus head so a stale pre-launch signal never auto-opens; a
+    /// newer ULID seen by the poll subscription flips the dropdown (so a baked
+    /// Super shortcut running `--toggle` opens/closes the launcher).
+    last_toggle_ulid: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -217,6 +222,9 @@ enum Message {
     PopupClosed(Id),
     /// Open-or-close the launcher dropdown.
     TogglePopup,
+    /// APPS-9b — poll tick: check the bus for a new `event/apps/toggle` signal
+    /// (published by a baked Super shortcut) and flip the dropdown if so.
+    PollToggleSignal,
     /// Fresh entries + QNM disk usage + favorites arrived from the load.
     Loaded(Vec<Entry>, Option<(u64, u64)>, HashSet<String>),
     /// A load failed.
@@ -343,6 +351,51 @@ fn current_user() -> String {
     std::env::var("USER").unwrap_or_else(|_| "_".to_string())
 }
 
+/// APPS-9b — the bus topic a baked Super shortcut publishes (via `--toggle`) to
+/// open/close the launcher. It's an `event/*` fire-and-forget signal, so it's
+/// written to the bus directly rather than via the `action/`-gated
+/// [`mde_bus::rpc::publish_request`] (which rejects non-`action/` topics).
+const TOGGLE_TOPIC: &str = "event/apps/toggle";
+
+/// APPS-9b — how often the panel applet polls the bus for a new toggle signal.
+/// One indexed `latest_ulid` SQLite read; 120 ms keeps Super feeling instant
+/// without measurable idle cost.
+const TOGGLE_POLL_MS: u64 = 120;
+
+/// Pure decision: should a freshly-read toggle ULID fire a toggle? Yes iff the
+/// bus carries a toggle event whose ULID differs from the last one acted on. The
+/// baseline is primed at startup so a stale pre-launch event never auto-opens.
+fn should_toggle(last_seen: Option<&str>, current: Option<&str>) -> bool {
+    matches!(current, Some(c) if last_seen != Some(c))
+}
+
+/// Append one `event/apps/toggle` signal to a bus store. Split from
+/// [`publish_toggle`] so the publish→read round-trip is unit-testable against a
+/// throwaway store.
+fn write_toggle(persist: &mde_bus::persist::Persist) -> Result<String, String> {
+    persist
+        .write(TOGGLE_TOPIC, Priority::Min, None, None)
+        .map(|m| m.ulid)
+        .map_err(|e| format!("bus write: {e}"))
+}
+
+/// `mde-apps-applet --toggle` entrypoint: publish one toggle signal to the shared
+/// bus and return. The long-running panel applet polls the topic and flips its
+/// dropdown — so a baked Super shortcut need only run this.
+fn publish_toggle() -> Result<String, String> {
+    let dir = mde_bus::default_data_dir().ok_or_else(|| "no Bus data dir".to_string())?;
+    let persist = mde_bus::persist::Persist::open(dir).map_err(|e| format!("bus store: {e}"))?;
+    write_toggle(&persist)
+}
+
+/// The latest `event/apps/toggle` ULID on the shared bus, if any (the applet's
+/// poll baseline). A missing bus / read error reads as "no signal".
+fn latest_toggle_ulid() -> Option<String> {
+    let dir = mde_bus::default_data_dir()?;
+    let persist = mde_bus::persist::Persist::open(dir).ok()?;
+    persist.latest_ulid(TOGGLE_TOPIC).ok().flatten()
+}
+
 /// Round-trip one `action/apps/<verb>` request on the shared bus, returning the
 /// reply body. `Persist` isn't `Send`, so this is called from a blocking thread.
 fn bus_request(verb: &str, body: Option<&str>) -> Result<String, String> {
@@ -464,6 +517,16 @@ fn carbon(c: Rgba) -> cosmic::iced::Color {
 }
 
 fn main() -> cosmic::iced::Result {
+    // APPS-9b — `mde-apps-applet --toggle` publishes one toggle signal to the bus
+    // and exits (what a baked Super shortcut runs). The long-running panel applet
+    // (no args) polls the topic and flips its dropdown.
+    if std::env::args().skip(1).any(|a| a == "--toggle") {
+        if let Err(e) = publish_toggle() {
+            eprintln!("mde-apps-applet --toggle: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     cosmic::applet::run::<AppsApplet>(())
 }
 
@@ -502,6 +565,9 @@ impl Application for AppsApplet {
                 palette: resolve_palette(),
                 menu_w,
                 menu_h,
+                // APPS-9b — baseline the toggle head so a stale pre-launch signal
+                // doesn't auto-open the launcher at login.
+                last_toggle_ulid: latest_toggle_ulid(),
             },
             // Prime the list so the first open is instant.
             load_task(),
@@ -513,7 +579,9 @@ impl Application for AppsApplet {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::none()
+        // APPS-9b — watch the bus for a Super-shortcut toggle signal.
+        cosmic::iced::time::every(Duration::from_millis(TOGGLE_POLL_MS))
+            .map(|_| Message::PollToggleSignal)
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -527,6 +595,16 @@ impl Application for AppsApplet {
                 if self.popup.as_ref() == Some(&id) {
                     self.popup = None;
                     self.rclick_open = false;
+                }
+            }
+            Message::PollToggleSignal => {
+                // APPS-9b — a new toggle ULID since the baseline means a baked
+                // Super shortcut fired `--toggle`; flip the dropdown and advance
+                // the baseline so the next press toggles again.
+                let current = latest_toggle_ulid();
+                if should_toggle(self.last_toggle_ulid.as_deref(), current.as_deref()) {
+                    self.last_toggle_ulid = current;
+                    return self.update(Message::TogglePopup);
                 }
             }
             Message::TogglePopup => {
@@ -1812,5 +1890,46 @@ output "HDMI-A-1" enabled=#false {
 }
 "#;
         assert!(parse_menu_size_from_kdl(kdl, "DP-1").is_none());
+    }
+}
+
+#[cfg(test)]
+mod toggle_tests {
+    //! APPS-9b — the Super→launcher toggle plumbing: a `--toggle` publish lands
+    //! one `event/apps/toggle` signal the panel applet's poll picks up.
+    use super::{should_toggle, write_toggle, TOGGLE_TOPIC};
+    use mde_bus::persist::Persist;
+
+    #[test]
+    fn should_toggle_only_on_a_new_ulid() {
+        // No signal on the bus → never toggles (idle login stays closed).
+        assert!(!should_toggle(None, None));
+        assert!(!should_toggle(Some("01ABC"), None));
+        // A signal newer than the baseline (first press, or a later press) → toggle.
+        assert!(should_toggle(None, Some("01ABC")));
+        assert!(should_toggle(Some("01ABC"), Some("01XYZ")));
+        // The same ULID we already acted on → no repeat toggle (poll is idempotent).
+        assert!(!should_toggle(Some("01ABC"), Some("01ABC")));
+    }
+
+    #[test]
+    fn write_toggle_publishes_a_readable_event_signal() {
+        // A fresh store has no toggle event; `--toggle` writes one to the topic,
+        // and `latest_ulid` (the applet's poll source) reads exactly it back.
+        let dir = std::env::temp_dir().join("mde-apps-toggle-rt-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let persist = Persist::open(dir.clone()).expect("open temp bus");
+        assert_eq!(persist.latest_ulid(TOGGLE_TOPIC).unwrap(), None);
+
+        let ulid = write_toggle(&persist).expect("publish toggle");
+        assert!(!ulid.is_empty());
+        assert_eq!(
+            persist.latest_ulid(TOGGLE_TOPIC).unwrap().as_deref(),
+            Some(ulid.as_str()),
+            "the published toggle is the topic head the applet polls"
+        );
+        // And the applet would flip from its primed baseline (None) to this ULID.
+        assert!(should_toggle(None, Some(&ulid)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
