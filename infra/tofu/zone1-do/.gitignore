@@ -1,0 +1,8 @@
+# Secrets + local state never go in the repo.
+env.sh
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+.terraform/
+.terraform.tfstate.lock.info
+crash.log
