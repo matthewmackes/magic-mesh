@@ -32,6 +32,9 @@ pub mod bus_bridge;
 pub mod connect;
 // DATACENTER (action layer) — action/dc/vm-power Xen VM power control responder.
 pub mod datacenter;
+// DATACENTER-16 (action layer) — action/dc/wol Wake-on-LAN power-orchestration
+// primitive (broadcasts the magic packet to wake a machine).
+pub mod dc_power;
 // DATACENTER-10 (action layer) — action/dc/host-power Xen host (dom0)
 // maintenance + reboot control responder.
 pub mod host_ops;
