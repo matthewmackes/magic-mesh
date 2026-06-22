@@ -6053,6 +6053,24 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("dc_jobs".into());
 
+        // DATACENTER-20 — passive promotion tracker. Leader-gated; publishes the
+        // version running at each promotion stage (Build→Eagle→DO) to
+        // `event/dc/promote/<stage>` so the Workbench Datacenter plane can render
+        // the promotion matrix. Build version = newest release RPM (else
+        // `git describe`); Eagle/DO are honest `"unknown"` placeholders until
+        // those hosts are reachable.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::dc_promote::DcPromoteWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("dc_promote".into());
+
         // ONBOARD-6 — continuous leader election. Renews the
         // <QNM-Shared>/.mackesd-leader.lock lease every 20s so exactly one
         // node always holds leadership (previously only the upgrade watcher

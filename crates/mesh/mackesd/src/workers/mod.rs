@@ -396,6 +396,13 @@ pub mod dc_auditor;
 // per status transition (pending→ok/error), without touching the action
 // handlers. Leader-gated; dedups on (ulid, status).
 pub mod dc_jobs;
+// DATACENTER-20 — passive promotion tracker: publishes the version running at
+// each promotion stage (Build→Eagle→DO) to `event/dc/promote/<stage>` so the
+// Workbench Datacenter plane can render the promotion matrix. Leader-gated;
+// dedups on (stage, version+status). Build version is the newest release RPM
+// (else `git describe`); Eagle/DO are honest `"unknown"` placeholders until
+// those hosts are reachable.
+pub mod dc_promote;
 // VPN-GW-1 — per-node commercial-VPN tunnel engine (WireGuard/OpenVPN baseline).
 pub mod stun_gather;
 pub mod subprocess_tick;
