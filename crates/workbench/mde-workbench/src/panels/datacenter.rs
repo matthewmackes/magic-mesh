@@ -398,6 +398,16 @@ pub struct DatacenterPanel {
     /// The latest `action/dc/tofu-plan` reply summary (or in-flight/error text),
     /// rendered in the Tofu view.
     pub tofu_output: String,
+    /// The managed-resource names from the latest `action/dc/tofu-state` reply,
+    /// rendered in the Tofu view as a "Managed resources (N)" list.
+    pub tofu_state_resources: Vec<String>,
+    /// Whether the latest `action/dc/tofu-state` reply reported drift (live infra
+    /// differs from recorded state). Renders a ⚠ DRIFT / ✓ in-sync badge.
+    pub tofu_state_drift: bool,
+    /// The workspace the latest `action/dc/tofu-state` reply describes — so the
+    /// rendered resource list / drift badge name which workspace they belong to.
+    /// Empty until a State button has been clicked and returned.
+    pub tofu_state_ws: String,
     /// When `Some(uuid)`, a VM delete is awaiting inline confirmation — its row
     /// renders a "Really delete?" prompt and only the confirm button fires the
     /// destructive `action/dc/vm-delete` RPC. Cleared once a delete is fired or
@@ -450,6 +460,9 @@ impl Default for DatacenterPanel {
             zone_tab: "prod".to_string(),
             view_mode: ViewMode::Overview,
             tofu_output: String::new(),
+            tofu_state_resources: Vec::new(),
+            tofu_state_drift: false,
+            tofu_state_ws: String::new(),
             confirm_delete: None,
             audit: Vec::new(),
             tofu_confirm: None,
@@ -548,6 +561,14 @@ pub enum Message {
     /// expanded/collapsed state. The payload is the group key (a host `id`, or
     /// the empty string for the synthetic Prod/Gateway group).
     HeaderClicked(String),
+    /// A Tofu "State" button was clicked. The payload is the workspace name
+    /// ("xen-xapi" | "zone1-do"). Fires the `action/dc/tofu-state` RPC, which
+    /// returns the workspace's managed resources + a drift flag.
+    TofuStateClicked(String),
+    /// The `action/dc/tofu-state` RPC came back — `Ok` carries the managed
+    /// resource names + the drift flag, `Err` the error text. Routes here as a
+    /// panel-scoped message.
+    TofuStateDone(Result<(Vec<String>, bool), String>),
 }
 
 impl DatacenterPanel {
@@ -788,6 +809,34 @@ impl DatacenterPanel {
                 }
                 Task::none()
             }
+            Message::TofuStateClicked(ws) => {
+                // Record which workspace the in-flight state read is for so the
+                // rendered list / drift badge can name it once the reply lands.
+                self.tofu_state_ws = ws.clone();
+                self.status = format!("Reading {ws} state…");
+                Task::perform(
+                    async move {
+                        // Same shape as `tofu_plan`: the Bus RPC borrows a
+                        // non-Send Persist across its internal await, so run the
+                        // whole round trip on a blocking thread with a local
+                        // runtime.
+                        tokio::task::spawn_blocking(move || tofu_state(&ws))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("tofu task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::TofuStateDone(result)),
+                )
+            }
+            Message::TofuStateDone(Ok((resources, drift))) => {
+                self.status = "State read complete".into();
+                self.tofu_state_resources = resources;
+                self.tofu_state_drift = drift;
+                Task::none()
+            }
+            Message::TofuStateDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
         }
     }
 
@@ -904,9 +953,20 @@ impl DatacenterPanel {
                         ))),
                         palette,
                     );
-                    let mut ws_row =
-                        row![text(ws.to_string()).width(Length::FillPortion(2)), plan_btn]
-                            .spacing(f32::from(spacing::BASE[2]));
+                    let state_btn = variant_button(
+                        format!("State {ws}"),
+                        ButtonVariant::Secondary,
+                        Some(crate::Message::Datacenter(Message::TofuStateClicked(
+                            ws.to_string(),
+                        ))),
+                        palette,
+                    );
+                    let mut ws_row = row![
+                        text(ws.to_string()).width(Length::FillPortion(2)),
+                        plan_btn,
+                        state_btn
+                    ]
+                    .spacing(f32::from(spacing::BASE[2]));
                     if self.tofu_confirm.as_deref() == Some(ws) {
                         // Armed: surface the typed-confirm — only the confirm
                         // button carries the destructive `TofuApply` message.
@@ -949,6 +1009,39 @@ impl DatacenterPanel {
                             .padding(f32::from(spacing::BASE[3]))
                             .width(Length::Fill),
                     );
+                }
+                // The managed-state browser: once a State read has returned for a
+                // workspace, list its managed resources + a drift badge.
+                if !self.tofu_state_ws.is_empty() {
+                    let header = format!(
+                        "Managed resources ({}) · {}",
+                        self.tofu_state_resources.len(),
+                        self.tofu_state_ws
+                    );
+                    col = col.push(text(header).size(f32::from(spacing::BASE[5])));
+                    // Drift badge — color from mde-theme tokens, never raw hex.
+                    if self.tofu_state_drift {
+                        col = col.push(
+                            text("⚠ DRIFT — live differs from state")
+                                .colr(palette.danger.into_cosmic_color()),
+                        );
+                    } else {
+                        col = col.push(text("✓ in sync").colr(palette.success.into_cosmic_color()));
+                    }
+                    if self.tofu_state_resources.is_empty() {
+                        col = col.push(
+                            text("No managed resources recorded for this workspace.")
+                                .colr(palette.text_muted.into_cosmic_color()),
+                        );
+                    } else {
+                        for res in &self.tofu_state_resources {
+                            col = col.push(
+                                container(text(res.clone()).colr(palette.text.into_cosmic_color()))
+                                    .padding(f32::from(spacing::BASE[2]))
+                                    .width(Length::Fill),
+                            );
+                        }
+                    }
                 }
             }
             ViewMode::Audit => {
@@ -1423,6 +1516,60 @@ fn tofu_plan(workspace: &str) -> Result<String, String> {
         return Ok(summary.to_string());
     }
     Err(format!("unexpected tofu-plan reply: {raw}"))
+}
+
+/// Fire the `action/dc/tofu-state` Bus RPC (blocking — runs on a `spawn_blocking`
+/// thread) and translate the reply into the workspace's managed resources + a
+/// drift flag. Mirrors `tofu_plan` exactly: a Persist + `mde_bus::rpc::request`
+/// round trip wrapped in a local tokio runtime because `request` borrows a
+/// non-`Send` `Persist` across its internal await. The reply body is
+/// `{"ok":true,"resources":[..],"drift":bool}` (→ the resource names + drift) or
+/// `{"error":".."}` (→ the error text).
+fn tofu_state(workspace: &str) -> Result<(Vec<String>, bool), String> {
+    let Some(dir) = mde_bus::default_data_dir() else {
+        return Err("no Bus data dir".to_string());
+    };
+    let body = serde_json::json!({ "workspace": workspace }).to_string();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    let reply = rt.block_on(async {
+        let persist = mde_bus::persist::Persist::open(dir).map_err(|e| e.to_string())?;
+        mde_bus::rpc::request(
+            &persist,
+            "action/dc/tofu-state",
+            mde_bus::hooks::config::Priority::Default,
+            Some("tofu-state"),
+            Some(&body),
+            Duration::from_secs(120),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+    let raw = reply.body.unwrap_or_default();
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("bad tofu-state reply: {e}"))?;
+    if let Some(err) = v.get("error").and_then(serde_json::Value::as_str) {
+        return Err(err.to_string());
+    }
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        let resources = v
+            .get("resources")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+        let drift = v
+            .get("drift")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        return Ok((resources, drift));
+    }
+    Err(format!("unexpected tofu-state reply: {raw}"))
 }
 
 /// Fire the destructive `action/dc/tofu-apply` Bus RPC (blocking — runs on a
@@ -2308,5 +2455,67 @@ mod tests {
         let mut p = DatacenterPanel::new();
         let _ = p.update(Message::ViewMode(ViewMode::Topology));
         assert_eq!(p.view_mode, ViewMode::Topology);
+    }
+
+    // ---- DATACENTER-15: Tofu state browser + drift badge -------------------
+
+    #[test]
+    fn tofu_state_clicked_sets_an_in_flight_status() {
+        let mut p = DatacenterPanel::new();
+        // First click records the workspace + sets the in-flight status (the
+        // real `action/dc/tofu-state` RPC then fires on the blocking thread).
+        let _ = p.update(Message::TofuStateClicked("xen-xapi".to_string()));
+        assert_eq!(p.status, "Reading xen-xapi state…");
+        assert_eq!(p.tofu_state_ws, "xen-xapi");
+    }
+
+    #[test]
+    fn tofu_state_done_populates_resources_and_drift() {
+        let mut p = DatacenterPanel::new();
+        // A drift reply: the resource list + drift flag land on the panel.
+        let _ = p.update(Message::TofuStateDone(Ok((
+            vec![
+                "xenorchestra_vm.builder".to_string(),
+                "xenorchestra_network.lan".to_string(),
+            ],
+            true,
+        ))));
+        assert_eq!(p.status, "State read complete");
+        assert_eq!(p.tofu_state_resources.len(), 2);
+        assert_eq!(p.tofu_state_resources[0], "xenorchestra_vm.builder");
+        assert!(p.tofu_state_drift);
+        // A subsequent in-sync reply clears the drift flag.
+        let _ = p.update(Message::TofuStateDone(Ok((
+            vec!["digitalocean_droplet.lighthouse".to_string()],
+            false,
+        ))));
+        assert_eq!(p.tofu_state_resources.len(), 1);
+        assert!(!p.tofu_state_drift);
+        // An error reply surfaces to the status without touching the list.
+        let _ = p.update(Message::TofuStateDone(Err("tofu state failed".to_string())));
+        assert_eq!(p.status, "tofu state failed");
+    }
+
+    #[test]
+    fn tofu_view_renders_the_managed_state_list_and_drift_badge() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::ViewMode(ViewMode::Tofu));
+        // No state read yet → the state browser block is skipped.
+        let _ = p.view();
+        // Drift reply with resources — exercises the drift badge + resource list
+        // render branch.
+        let _ = p.update(Message::TofuStateClicked("xen-xapi".to_string()));
+        let _ = p.update(Message::TofuStateDone(Ok((
+            vec![
+                "xenorchestra_vm.builder".to_string(),
+                "xenorchestra_network.lan".to_string(),
+            ],
+            true,
+        ))));
+        let _ = p.view();
+        // In-sync reply with an empty list — exercises the ✓ in-sync badge + the
+        // "no managed resources" branch.
+        let _ = p.update(Message::TofuStateDone(Ok((Vec::new(), false))));
+        let _ = p.view();
     }
 }
