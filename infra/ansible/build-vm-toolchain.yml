@@ -1,0 +1,84 @@
+# BUILD-FARM-2 as idempotent IaC — the durable replacement for the SSH-driven
+# install-helpers/setup-build-vm-toolchain.sh. Installs the full MCNF Rust build
+# toolchain on every build VM. Re-runnable; converges (no-op on a ready node).
+#
+#   ansible-playbook build-vm-toolchain.yml
+#   ansible-playbook build-vm-toolchain.yml -l build-50   # one node
+---
+- name: MCNF build VM Rust toolchain
+  hosts: build_vms
+  gather_facts: true
+  vars:
+    rust_version: "1.94.0"
+    cargo_generate_rpm_version: "0.21.0"
+
+  tasks:
+    # The system dev libs mirror what the workspace links: the cosmic/iced GUI
+    # (gtk3/xkbcommon), the audio chain (alsa + opus via audiopus_sys' vendored
+    # build needs cmake + a C++ compiler), etcd-client (protobuf), release
+    # packaging (rpm tooling). mold is the fast linker .cargo/config.toml selects.
+    - name: System dev libraries (dnf)
+      become: true
+      ansible.builtin.dnf:
+        name:
+          - gcc
+          - gcc-c++
+          - cmake
+          - mold
+          - git
+          - rsync
+          - pkgconf-pkg-config
+          - genisoimage
+          - cloud-utils
+          - protobuf-compiler
+          - openssl-devel
+          - alsa-lib-devel
+          - opus-devel
+          - gtk3-devel
+          - libxkbcommon-devel
+        state: present
+
+    - name: rustup present?
+      ansible.builtin.stat:
+        path: "{{ ansible_env.HOME }}/.cargo/bin/rustup"
+      register: rustup_bin
+
+    - name: Install rustup (pinned toolchain, minimal profile)
+      ansible.builtin.shell: >
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+        sh -s -- -y --profile minimal --default-toolchain {{ rust_version }}
+      args:
+        creates: "{{ ansible_env.HOME }}/.cargo/bin/rustup"
+      when: not rustup_bin.stat.exists
+
+    - name: Pin toolchain + add clippy & rustfmt
+      ansible.builtin.shell: |
+        . "$HOME/.cargo/env"
+        rustup toolchain install {{ rust_version }}
+        rustup default {{ rust_version }}
+        rustup component add clippy rustfmt
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: cargo-generate-rpm (release packaging)
+      ansible.builtin.shell: |
+        . "$HOME/.cargo/env"
+        cargo install cargo-generate-rpm --version {{ cargo_generate_rpm_version }}
+      args:
+        executable: /bin/bash
+        creates: "{{ ansible_env.HOME }}/.cargo/bin/cargo-generate-rpm"
+
+    - name: Verify the toolchain
+      ansible.builtin.shell: |
+        . "$HOME/.cargo/env"
+        rustc --version; g++ --version | head -1; cmake --version | head -1
+        mold --version; pkg-config --modversion opus
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: toolchain_versions
+
+    - name: Toolchain report
+      ansible.builtin.debug:
+        var: toolchain_versions.stdout_lines
