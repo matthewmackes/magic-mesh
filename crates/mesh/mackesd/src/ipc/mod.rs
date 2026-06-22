@@ -32,6 +32,9 @@ pub mod bus_bridge;
 pub mod connect;
 // DATACENTER (action layer) — action/dc/vm-power Xen VM power control responder.
 pub mod datacenter;
+// DATACENTER-10 (action layer) — action/dc/host-power Xen host (dom0)
+// maintenance + reboot control responder.
+pub mod host_ops;
 // DDNS-EGRESS-3 — action/ddns/* config responder.
 pub mod ddns;
 pub mod directory;
