@@ -1623,7 +1623,7 @@ snapshot-reset VM pool from MDE-VM-golden.
   **Acceptance**:
     - [ ] `mcnf-farm-reconcile.timer` enabled on the control host (FARM-AUTO-4); a worklist `@farm:{…}` tag yields a fleet build within one interval with no AI call
     - [ ] the `@farm` tagging workflow is documented in `docs/BUILD-ENVIRONMENT.md` (how to request a build from a task)
-- [ ] **BUILD-PLATFORM-3: snapshot-reset VM-pool test harness.**
+- [✓] **BUILD-PLATFORM-3: snapshot-reset VM-pool test harness.**
   **As** the test platform, **I want** to spin clean VMs from `MDE-VM-golden`, run a test, and destroy them, **so that** every e2e run is hermetic.
   **Acceptance**:
     - [ ] a harness (tofu workspace or a `farm-testbed.sh`) provisions N clean VMs from the golden template, returns their IPs, and tears them down on completion (reusing the proven NM-keyfile path)
