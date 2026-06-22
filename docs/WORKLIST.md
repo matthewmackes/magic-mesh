@@ -1770,15 +1770,20 @@ the plane and it **survives killing the current zone leader**.
 - [ ] **DATACENTER-13: Network tab (L2 + overlay + topology + unified IP/DNS).**
   **Acceptance**:
     - [ ] networks/PIFs/VLANs/NIC mgmt/create; overlay peer/route management; an interactive topology map (hosts↔networks↔VMs↔gateway); a unified IP/DNS view correlating UniFi leases ↔ DO DNS ↔ overlay IPs
-- [ ] **DATACENTER-14: Gateway tab (UniFi full control).**
+- [>] **DATACENTER-14: Gateway tab (UniFi full control).** *(session=calm-ray-dcr8)*
+  *Gateway SOURCE (`gather_gateway`: status + DHCP lease count → `event/dc/gateway/*`, env-gated, cred from
+  the mesh store) + a `action/dc/gateway-reboot` RPC (confirm-gated, IPv4-validated, cred from store). Remaining:
+  firewall/port-forward edits + a richer leases view + putting the UniFi cred in the store for live data.*
   **Acceptance**:
-    - [ ] status + DHCP leases (fleet discovery) + firewall/port-forward edits + reboot, via the worker over SSH + the UniFi API; cred from the mesh store (was `/root/.mcnf-unifi-cred`)
+    - [>] status + DHCP leases (fleet discovery) + firewall/port-forward edits + reboot, via the worker over SSH + the UniFi API; cred from the mesh store (was `/root/.mcnf-unifi-cred`) — *source (status+leases) + reboot done; firewall/port-forward edits + the cred-in-store pending*
 - [>] **DATACENTER-15: Tofu tab (plan/apply/destroy + state + drift + gate).** *(session=calm-ray-dcr8)*
-  *Plan + apply + destroy all wired: `action/dc/tofu-{plan,apply,destroy}` RPCs (apply/destroy confirm-gated
-  + workspace allow-listed against path-traversal); the Tofu tab has Plan + typed-confirm Apply buttons per
-  workspace. Remaining: a state browser + drift view, and the prod-arm master switch.*
+  *Plan + apply + destroy + STATE-BROWSER + DRIFT all wired: `action/dc/tofu-{plan,apply,destroy,state}` RPCs
+  (apply/destroy confirm-gated + workspace allow-listed against path-traversal; state = `tofu state list` +
+  drift via `plan -detailed-exitcode`); the Tofu tab has per-workspace Plan / typed-confirm Apply / State
+  buttons + a managed-resources list + a drift badge (⚠ DRIFT / ✓ in sync). Remaining: persisted run-log +
+  the prod-arm master switch.*
   **Acceptance**:
-    - [>] per-zone workspace cards; streamed plan/apply/destroy; state browser + drift vs live; **plan→review-diff→explicit Apply** (typed confirm for prod); persisted run-log on `event/dc/tofu/*` — *plan/apply/destroy + typed-confirm Apply done; state-browser/drift/run-log pending*
+    - [>] per-zone workspace cards; streamed plan/apply/destroy; state browser + drift vs live; **plan→review-diff→explicit Apply** (typed confirm for prod); persisted run-log on `event/dc/tofu/*` — *plan/apply/destroy + typed-confirm Apply + state-browser + drift badge done; run-log + prod-arm pending*
 
 ### Phase 3 — Power orchestration
 - [ ] **DATACENTER-16: energy-aware host power (WOL/IPMI + idle-shutdown + learned ETAs).**
