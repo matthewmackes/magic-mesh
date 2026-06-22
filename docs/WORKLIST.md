@@ -1673,7 +1673,7 @@ the plane and it **survives killing the current zone leader**.
   **As** the platform, **I want** the Xen IaC to manage hosts/VMs over XAPI directly, **so that** there is
   no central XO box to lose (no-fixed-center).
   **Acceptance** (runtime-observable):
-    - [>] `infra/tofu/` migrated off `vatesfr/xenorchestra` to a XAPI-native provider; `tofu plan` clean against the live farm after import — *XAPI-native provider proven to read the live pool; migration/import of `infra/tofu/` pending*
+    - [>] `infra/tofu/` migrated off `vatesfr/xenorchestra` to a XAPI-native provider; `tofu plan` clean against the live farm after import — *IMPORT-PARITY PROVEN: imported live `mcnf-build-51` → plan `0 add/0 destroy`, no disk/cpu/mem/boot change (only 2 benign metadata fields); recipe in `xen-xapi/README.md`. Remaining: 3-aliased-provider config (farm spans 3 single-pool dom0s), import all 3, promote over `infra/tofu/`.*
     - [ ] the `.50/.51/.52` build VMs + golden template are managed with no XO process running
 - [ ] **DATACENTER-2: mesh-replicated Tofu remote state (SUBSTRATE-V2).**
   **As** an operator, **I want** Tofu state + lock in the mesh-replicated substrate, **so that** any elected

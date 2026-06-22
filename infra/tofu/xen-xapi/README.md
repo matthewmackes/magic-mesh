@@ -38,9 +38,38 @@ tofu plan                         # read-only: lists hosts + SRs
 `env.sh`/state/`.terraform/` are gitignored. The XAPI password is **never** in the
 repo — only `TF_VAR_xapi_password` from the off-repo `0600` file.
 
+## Import-parity (PROVEN 2026-06-22 — the cutover gate)
+
+Imported the live `mcnf-build-51` (uuid `7a6753c7…`) into a throwaway
+`xenserver_vm` and planned: **`0 to add, 0 to destroy`** — no recreate, no disk/
+CPU/memory/boot/network change. The only residual is two metadata fields the 0.2.x
+provider can't round-trip (`check_ip_timeout`, computed `default_ip`); an apply is a
+**no-op on the actual VM**. (Probe was `state rm`'d after; the live VM stayed
+`running`, untouched.) **→ the cutover is safe.**
+
+The recipe for an adopted (already-provisioned) build VM to plan clean:
+
+```hcl
+resource "xenserver_vm" "build" {
+  name_label        = "mcnf-build-NN"
+  template_name     = "MDE-VM-golden"
+  static_mem_max    = <bytes>
+  vcpus             = <n>
+  network_interface = [{ device = "0", network_uuid = "<pool-network-uuid>" }]
+  lifecycle {
+    ignore_changes = [
+      hard_drive, template_name, boot_mode, boot_order, cores_per_socket,
+      dynamic_mem_max, dynamic_mem_min, static_mem_min, name_description, cdrom,
+    ]
+  }
+}
+# then: tofu import xenserver_vm.build <vm-uuid>
+```
+
 ## Next steps (DATACENTER-1)
 
-1. ~~Prove the resource path: create + destroy a throwaway test VM.~~ **DONE.**
-2. Import an existing VM (e.g. a `.50/.51/.52` build VM) → confirm a clean plan
-   (import parity). This is the real gate before cutting over the live farm.
-3. Only then plan the `infra/tofu/` cutover off `xenorchestra`.
+1. ~~Resource path (create/destroy).~~ **DONE.**  2. ~~Import-parity clean plan.~~ **DONE.**
+3. **Full cutover** (remaining): the live farm spans **3 standalone pools** (.9/.193/.165),
+   and the `xenserver` provider is **single-pool** — so the new config needs **3 aliased
+   providers** (one per dom0 XAPI endpoint), a `xenserver_vm` per pool (recipe above),
+   import all 3, confirm clean, then promote over `../` (retire `xenorchestra`).
