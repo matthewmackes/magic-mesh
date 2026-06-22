@@ -1,5 +1,5 @@
 //! DATACENTER (action layer) — `action/dc/vm-power` + `action/dc/vm-snapshot`
-//! → Xen VM control.
+//! + `action/dc/vm-clone` + `action/dc/vm-delete` → Xen VM control.
 //!
 //! The action side of the DATACENTER epic: the worker
 //! ([`crate::workers::datacenter_orchestrator`]) PUBLISHES VM state; this
@@ -20,6 +20,22 @@
 //!   * snapshots the VM via `xe vm-snapshot uuid=<uuid> new-name-label=…`.
 //! Reply `{"ok":true,"snapshot":"<new-snapshot-uuid>"}` on success (the new
 //! snapshot uuid `xe` prints on stdout), `{"error":"<message>"}` on failure.
+//!
+//! `vm-clone` request body `{ "uuid", "dom0", "name"? }`:
+//!   * `uuid` is validated to be hex+`-` only (same injection guard);
+//!   * an optional `name` is sanitized to `[A-Za-z0-9._-]` only; absent, the
+//!     clone defaults to name-label `dc-clone-<first 8 chars of uuid>`;
+//!   * `dom0` MUST be in the configured allowed set before any SSH;
+//!   * clones the VM via `xe vm-clone uuid=<uuid> new-name-label=…`.
+//! Reply `{"ok":true,"clone":"<new-vm-uuid>"}` on success (the new uuid `xe`
+//! prints on stdout), `{"error":"<message>"}` on failure.
+//!
+//! `vm-delete` request body `{ "uuid", "dom0", "confirm": true }`:
+//!   * `confirm` MUST be the boolean `true` — a destructive guard checked first;
+//!   * `uuid` is validated to be hex+`-` only (same injection guard);
+//!   * `dom0` MUST be in the configured allowed set before any SSH;
+//!   * deletes the VM via `xe vm-uninstall uuid=<uuid> force=true`.
+//! Reply `{"ok":true}` on success, `{"error":"<message>"}` on failure.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -50,7 +66,7 @@ impl DatacenterService {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 2] = ["vm-power", "vm-snapshot"];
+pub const ACTION_VERBS: [&str; 4] = ["vm-power", "vm-snapshot", "vm-clone", "vm-delete"];
 
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -112,6 +128,48 @@ pub fn vm_snapshot_command(uuid: &str) -> Result<String, String> {
     ))
 }
 
+/// Build the remote `xe` argument string for a VM clone. PURE.
+///
+/// Validates `uuid` is non-empty and contains only `[0-9a-fA-F-]` — the same
+/// command-injection guard as [`vm_power_command`], since the result is
+/// interpolated into a remote shell `xe …` string. The new clone's name-label is
+/// either the caller-supplied `name` (sanitized to `[A-Za-z0-9._-]` only — any
+/// other character is rejected) or, when absent, the stable default
+/// `dc-clone-<first 8 chars of uuid>`. Returns e.g.
+/// `"vm-clone uuid=<uuid> new-name-label=dc-clone-abcd1234"`.
+///
+/// # Errors
+/// Returns `Err` for an empty `uuid`, a `uuid` containing any character that is
+/// not an ASCII hex digit or `-`, or a supplied `name` that is empty or contains
+/// any character outside `[A-Za-z0-9._-]`.
+pub fn vm_clone_command(uuid: &str, name: Option<&str>) -> Result<String, String> {
+    if uuid.is_empty() {
+        return Err("empty uuid".into());
+    }
+    if !uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err("uuid contains invalid characters".into());
+    }
+    let label = match name {
+        Some(n) => {
+            if n.is_empty() {
+                return Err("empty name".into());
+            }
+            if !n
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            {
+                return Err("name contains invalid characters".into());
+            }
+            n.to_string()
+        }
+        None => {
+            let short: String = uuid.chars().take(8).collect();
+            format!("dc-clone-{short}")
+        }
+    };
+    Ok(format!("vm-clone uuid={uuid} new-name-label={label}"))
+}
+
 /// Run a remote `xe` command on a dom0 over SSH, returning the process result.
 /// Mirrors the exact ssh arg style of `ssh_xe` in the orchestrator.
 fn ssh_xe_status(key: &str, dom0: &str, remote: &str) -> std::io::Result<std::process::Output> {
@@ -138,6 +196,8 @@ pub fn build_reply(_svc: &DatacenterService, verb: &str, req_body: Option<&str>)
     match verb {
         "vm-power" => vm_power_reply(req_body),
         "vm-snapshot" => vm_snapshot_reply(req_body),
+        "vm-clone" => vm_clone_reply(req_body),
+        "vm-delete" => vm_delete_reply(req_body),
         _ => err("unknown dc verb".into()),
     }
 }
@@ -252,6 +312,139 @@ fn vm_snapshot_reply(req_body: Option<&str>) -> String {
     }
 }
 
+/// Handle a `vm-clone` request body: parse, allow-list the dom0, then run
+/// `xe vm-clone …` over SSH. On success `xe` prints the new clone's uuid on
+/// stdout, which is returned as `{"ok":true,"clone":"<uuid>"}`.
+fn vm_clone_reply(req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("vm-clone: missing request body".into());
+    };
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return err(format!("vm-clone: bad json: {e}")),
+    };
+    let uuid = req
+        .get("uuid")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let dom0 = req
+        .get("dom0")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let name = req.get("name").and_then(serde_json::Value::as_str);
+
+    // SECURITY: only act on a dom0 in the configured allowed set — never SSH an
+    // attacker-supplied host. Checked BEFORE building/running anything.
+    if !crate::workers::datacenter_orchestrator::xen_dom0s()
+        .iter()
+        .any(|d| d == dom0)
+    {
+        return err("dom0 not in allowed set".into());
+    }
+
+    let cmd = match vm_clone_command(uuid, name) {
+        Ok(c) => c,
+        Err(e) => return err(e),
+    };
+
+    let key = crate::workers::datacenter_orchestrator::xen_ssh_key();
+    let remote = format!("xe {cmd}");
+    match ssh_xe_status(&key, dom0, &remote) {
+        Ok(o) if o.status.success() => {
+            let clone = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            json!({ "ok": true, "clone": clone }).to_string()
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let msg = stderr.trim();
+            if msg.is_empty() {
+                err("xe failed".into())
+            } else {
+                err(msg.to_string())
+            }
+        }
+        Err(e) => err(format!("ssh failed: {e}")),
+    }
+}
+
+/// Handle a `vm-delete` request body: parse, REQUIRE `confirm == true`,
+/// allow-list the dom0, then run `xe vm-uninstall uuid=<uuid> force=true` over
+/// SSH. Reply `{"ok":true}` on success.
+fn vm_delete_reply(req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("vm-delete: missing request body".into());
+    };
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return err(format!("vm-delete: bad json: {e}")),
+    };
+    let uuid = req
+        .get("uuid")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let dom0 = req
+        .get("dom0")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+
+    // DESTRUCTIVE: refuse unless the caller explicitly confirms. Checked BEFORE
+    // the dom0 allow-list and before building/running anything.
+    if req.get("confirm").and_then(serde_json::Value::as_bool) != Some(true) {
+        return err("delete requires confirm:true".into());
+    }
+
+    // SECURITY: only act on a dom0 in the configured allowed set — never SSH an
+    // attacker-supplied host. Checked BEFORE building/running anything.
+    if !crate::workers::datacenter_orchestrator::xen_dom0s()
+        .iter()
+        .any(|d| d == dom0)
+    {
+        return err("dom0 not in allowed set".into());
+    }
+
+    let cmd = match vm_uninstall_command(uuid) {
+        Ok(c) => c,
+        Err(e) => return err(e),
+    };
+
+    let key = crate::workers::datacenter_orchestrator::xen_ssh_key();
+    let remote = format!("xe {cmd}");
+    match ssh_xe_status(&key, dom0, &remote) {
+        Ok(o) if o.status.success() => json!({ "ok": true }).to_string(),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let msg = stderr.trim();
+            if msg.is_empty() {
+                err("xe failed".into())
+            } else {
+                err(msg.to_string())
+            }
+        }
+        Err(e) => err(format!("ssh failed: {e}")),
+    }
+}
+
+/// Build the remote `xe` argument string for a VM uninstall (delete). PURE.
+///
+/// Validates `uuid` is non-empty and contains only `[0-9a-fA-F-]` — the same
+/// command-injection guard as [`vm_power_command`]. Returns
+/// `"vm-uninstall uuid=<uuid> force=true"`.
+///
+/// # Errors
+/// Returns `Err` for an empty `uuid`, or a `uuid` containing any character that
+/// is not an ASCII hex digit or `-`.
+pub fn vm_uninstall_command(uuid: &str) -> Result<String, String> {
+    if uuid.is_empty() {
+        return Err("empty uuid".into());
+    }
+    if !uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err("uuid contains invalid characters".into());
+    }
+    Ok(format!("vm-uninstall uuid={uuid} force=true"))
+}
+
 /// Run the datacenter Bus responder loop on the current thread until `should_stop`.
 pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &DatacenterService, should_stop: F) {
     let mut cursors: HashMap<String, String> = HashMap::new();
@@ -304,8 +497,12 @@ mod tests {
     fn topic_and_verbs_lock() {
         assert_eq!(action_topic("vm-power"), "action/dc/vm-power");
         assert_eq!(action_topic("vm-snapshot"), "action/dc/vm-snapshot");
+        assert_eq!(action_topic("vm-clone"), "action/dc/vm-clone");
+        assert_eq!(action_topic("vm-delete"), "action/dc/vm-delete");
         assert!(ACTION_VERBS.contains(&"vm-power"));
         assert!(ACTION_VERBS.contains(&"vm-snapshot"));
+        assert!(ACTION_VERBS.contains(&"vm-clone"));
+        assert!(ACTION_VERBS.contains(&"vm-delete"));
     }
 
     #[test]
@@ -376,11 +573,152 @@ mod tests {
     }
 
     #[test]
+    fn vm_clone_command_default_label_uses_uuid_prefix() {
+        let uuid = "abcd1234-5678-90ab-cdef-1234567890ab";
+        assert_eq!(
+            vm_clone_command(uuid, None).unwrap(),
+            // default name-label uses the first 8 chars of the uuid
+            format!("vm-clone uuid={uuid} new-name-label=dc-clone-abcd1234")
+        );
+        // a uuid shorter than 8 chars uses whatever is there (still hex+dash)
+        assert_eq!(
+            vm_clone_command("ab-12", None).unwrap(),
+            "vm-clone uuid=ab-12 new-name-label=dc-clone-ab-12"
+        );
+    }
+
+    #[test]
+    fn vm_clone_command_uses_sanitized_supplied_name() {
+        let uuid = "abcd1234-5678-90ab-cdef-1234567890ab";
+        assert_eq!(
+            vm_clone_command(uuid, Some("my.vm_clone-1")).unwrap(),
+            format!("vm-clone uuid={uuid} new-name-label=my.vm_clone-1")
+        );
+    }
+
+    #[test]
+    fn vm_clone_command_rejects_injection_in_uuid() {
+        // empty
+        assert!(vm_clone_command("", None).is_err());
+        // a `;` to chain a second command
+        assert!(vm_clone_command("abcd;rm -rf /", None).is_err());
+        // a space (would split into extra args)
+        assert!(vm_clone_command("abcd 1234", None).is_err());
+        // backtick / command substitution
+        assert!(vm_clone_command("abcd`whoami`", None).is_err());
+        // non-hex letters
+        assert!(vm_clone_command("ghij", None).is_err());
+    }
+
+    #[test]
+    fn vm_clone_command_rejects_unsafe_name() {
+        let uuid = "abcd1234-5678-90ab-cdef-1234567890ab";
+        // empty name
+        assert!(vm_clone_command(uuid, Some("")).is_err());
+        // space would split into extra xe args
+        assert!(vm_clone_command(uuid, Some("evil name")).is_err());
+        // `;` chains a command
+        assert!(vm_clone_command(uuid, Some("a;rm -rf /")).is_err());
+        // `=` could inject an extra xe arg
+        assert!(vm_clone_command(uuid, Some("a=b")).is_err());
+        // backtick / command substitution
+        assert!(vm_clone_command(uuid, Some("a`whoami`")).is_err());
+    }
+
+    #[test]
+    fn vm_uninstall_command_builds_forced_uninstall() {
+        let uuid = "abcd1234-5678-90ab-cdef-1234567890ab";
+        assert_eq!(
+            vm_uninstall_command(uuid).unwrap(),
+            format!("vm-uninstall uuid={uuid} force=true")
+        );
+    }
+
+    #[test]
+    fn vm_uninstall_command_rejects_injection_in_uuid() {
+        // empty
+        assert!(vm_uninstall_command("").is_err());
+        // a `;` to chain a second command
+        assert!(vm_uninstall_command("abcd;rm -rf /").is_err());
+        // a space (would split into extra args)
+        assert!(vm_uninstall_command("abcd 1234").is_err());
+        // backtick / command substitution
+        assert!(vm_uninstall_command("abcd`whoami`").is_err());
+        // non-hex letters
+        assert!(vm_uninstall_command("ghij").is_err());
+    }
+
+    #[test]
+    fn vm_delete_requires_confirm_true() {
+        // The confirm gate is checked BEFORE the dom0 allow-list, so even with an
+        // empty allowed set the missing/false confirm is what we observe.
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        // confirm missing
+        let body = json!({
+            "uuid": "abcd1234-5678-90ab-cdef-1234567890ab",
+            "dom0": "10.0.0.1"
+        })
+        .to_string();
+        let r = build_reply(&s, "vm-delete", Some(&body));
+        assert!(r.contains("delete requires confirm:true"), "{r}");
+        // confirm false
+        let body = json!({
+            "uuid": "abcd1234-5678-90ab-cdef-1234567890ab",
+            "dom0": "10.0.0.1",
+            "confirm": false
+        })
+        .to_string();
+        let r = build_reply(&s, "vm-delete", Some(&body));
+        assert!(r.contains("delete requires confirm:true"), "{r}");
+        // confirm as a non-bool ("true" string) does not satisfy the gate
+        let body = json!({
+            "uuid": "abcd1234-5678-90ab-cdef-1234567890ab",
+            "dom0": "10.0.0.1",
+            "confirm": "true"
+        })
+        .to_string();
+        let r = build_reply(&s, "vm-delete", Some(&body));
+        assert!(r.contains("delete requires confirm:true"), "{r}");
+    }
+
+    #[test]
+    fn vm_delete_confirmed_then_checks_dom0_allow_list() {
+        // With confirm:true the gate passes and the dom0 allow-list is the next
+        // guard — with MCNF_XEN_DOM0S unset the allowed set is empty, so the
+        // (unlisted) dom0 is rejected before any SSH is attempted.
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        let body = json!({
+            "uuid": "abcd1234-5678-90ab-cdef-1234567890ab",
+            "dom0": "10.0.0.1",
+            "confirm": true
+        })
+        .to_string();
+        let r = build_reply(&s, "vm-delete", Some(&body));
+        assert!(r.contains("dom0 not in allowed set"), "{r}");
+    }
+
+    #[test]
+    fn vm_clone_dom0_not_in_allowed_set_is_rejected() {
+        // With MCNF_XEN_DOM0S unset the allowed set is empty, so any dom0 is
+        // rejected before any SSH is attempted.
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        let body = json!({
+            "uuid": "abcd1234-5678-90ab-cdef-1234567890ab",
+            "dom0": "10.0.0.1"
+        })
+        .to_string();
+        let r = build_reply(&s, "vm-clone", Some(&body));
+        assert!(r.contains("dom0 not in allowed set"), "{r}");
+    }
+
+    #[test]
     fn unknown_verb_and_missing_body_error() {
         let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
         assert!(build_reply(&s, "bogus", None).contains("unknown dc verb"));
         assert!(build_reply(&s, "vm-power", None).contains("missing request body"));
         assert!(build_reply(&s, "vm-snapshot", None).contains("missing request body"));
+        assert!(build_reply(&s, "vm-clone", None).contains("missing request body"));
+        assert!(build_reply(&s, "vm-delete", None).contains("missing request body"));
     }
 
     #[test]
