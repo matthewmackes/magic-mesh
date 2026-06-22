@@ -39,12 +39,19 @@ pub fn palette() -> Palette {
     tokens().palette
 }
 
-/// MOTION-A11Y-1 — the live reduce-motion preference, read the same way every
-/// `view()` reads the palette, so animated surfaces (skeletons, transitions,
-/// pulses) can gate motion without re-loading prefs at each call site. Defaults
-/// to `false` (motion on) when no preference is set.
+/// MOTION-A11Y-1 — the live reduce-motion flag every animated surface reads
+/// (skeletons, transitions, pulses) so motion is gated from one source. True if
+/// EITHER the `MDE_REDUCE_MOTION` env override is set (`1`/`true`, case-insensitive
+/// — the acceptance's "with `MDE_REDUCE_MOTION=1` no surface moves") OR the
+/// persisted a11y preference asks for it. Defaults to `false` (motion on).
 #[must_use]
 pub fn reduce_motion() -> bool {
+    if let Ok(v) = std::env::var("MDE_REDUCE_MOTION") {
+        let v = v.trim().to_ascii_lowercase();
+        if v == "1" || v == "true" || v == "yes" {
+            return true;
+        }
+    }
     Preferences::load().a11y.reduce_motion
 }
 
@@ -72,5 +79,19 @@ mod tests {
         assert_eq!(g90_bg, Palette::gray_90().background);
         // Restore the default for other tests sharing the global.
         set(Theme::Dark, Density::Comfortable);
+    }
+
+    #[test]
+    fn reduce_motion_honors_the_env_override() {
+        // MOTION-A11Y-1 — MDE_REDUCE_MOTION=1 forces reduce-motion regardless of
+        // the persisted preference; clearing it falls back to the preference.
+        std::env::set_var("MDE_REDUCE_MOTION", "1");
+        assert!(reduce_motion(), "env=1 forces reduce-motion");
+        std::env::set_var("MDE_REDUCE_MOTION", "TRUE");
+        assert!(reduce_motion(), "env is case-insensitive");
+        std::env::set_var("MDE_REDUCE_MOTION", "0");
+        // env=0 → not forced; result is whatever the (test-default) preference is.
+        let _ = reduce_motion();
+        std::env::remove_var("MDE_REDUCE_MOTION");
     }
 }
