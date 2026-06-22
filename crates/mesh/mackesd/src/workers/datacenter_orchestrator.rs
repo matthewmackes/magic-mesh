@@ -341,9 +341,14 @@ fn gather_xen() -> Vec<DcResource> {
     let key = xen_ssh_key();
     let mut out = Vec::new();
     for dom0 in xen_dom0s() {
+        // Track this dom0's host name (for the power signal) and its running-VM
+        // count so we can emit the DATACENTER-16 idle signal after the gather.
+        let mut host_name: Option<String> = None;
+        let mut running_vms: usize = 0;
         if let Some(hn) = ssh_xe(&key, &dom0, "xe host-list params=name-label --minimal") {
             let hn = hn.trim();
             if !hn.is_empty() {
+                host_name = Some(hn.to_string());
                 // Best-effort host metrics from the Xen toolstack: `xl info` gives
                 // the host's REAL physical cpu count + total/free memory (MB), not
                 // dom0's capped view; load from /proc/loadavg. One ssh round-trip.
@@ -367,6 +372,9 @@ fn gather_xen() -> Vec<DcResource> {
              do echo \"$u|$(xe vm-param-get uuid=$u param-name=name-label)|$(xe vm-param-get uuid=$u param-name=power-state)\"; done";
         if let Some(vmout) = ssh_xe(&key, &dom0, script) {
             for (u, n, s) in parse_xe_vms(&vmout) {
+                if s == "running" {
+                    running_vms += 1;
+                }
                 let sig = serde_json::json!({
                     "kind": "vm", "id": u, "name": n, "status": s, "host": dom0, "zone": "dev"
                 })
@@ -400,8 +408,36 @@ fn gather_xen() -> Vec<DcResource> {
                 out.push(DcResource::new("net", u, sig));
             }
         }
+        // DATACENTER-16: idle-host (energy) signal — one `power` resource per dom0
+        // carrying its running-VM count + an idle hint. READ-ONLY (the panel/operator
+        // decides; no auto-shutdown). Emitted only for dom0s whose host was readable,
+        // so the name is real. Best-effort, same as the rest of the gather.
+        if let Some(hn) = host_name {
+            let sig = idle_power_signal(&dom0, &hn, running_vms);
+            out.push(DcResource::new("power", dom0.clone(), sig));
+        }
     }
     out
+}
+
+/// DATACENTER-16 — the idle-host (energy) signal. Build the `power` resource
+/// signature for one dom0 from its running-VM count: a READ-ONLY hint the panel
+/// (or the operator) can act on. A host with zero running VMs is a
+/// `candidate-for-shutdown`; anything running keeps it `in-use`. No auto-shutdown
+/// is implied — this only surfaces the signal. Pure.
+#[must_use]
+pub fn idle_power_signal(dom0: &str, host_name: &str, running_vms: usize) -> String {
+    let idle = running_vms == 0;
+    serde_json::json!({
+        "kind": "power",
+        "id": dom0,
+        "name": host_name,
+        "zone": "dev",
+        "running_vms": running_vms,
+        "idle": idle,
+        "hint": if idle { "candidate-for-shutdown" } else { "in-use" }
+    })
+    .to_string()
 }
 
 /// Host of the on-prem UniFi gateway (the router) to sample over SSH —
@@ -708,6 +744,28 @@ mod tests {
             parse_unifi_cred("  ubnt:pw  \n"),
             ("ubnt".to_string(), "pw".to_string())
         );
+    }
+
+    #[test]
+    fn idle_power_signal_marks_idle_when_no_running_vms() {
+        let sig = idle_power_signal("172.20.0.9", "xcp-host-a", 0);
+        let v: serde_json::Value = serde_json::from_str(&sig).unwrap();
+        assert_eq!(v["kind"], "power");
+        assert_eq!(v["id"], "172.20.0.9");
+        assert_eq!(v["name"], "xcp-host-a");
+        assert_eq!(v["zone"], "dev");
+        assert_eq!(v["running_vms"], 0);
+        assert_eq!(v["idle"], true);
+        assert_eq!(v["hint"], "candidate-for-shutdown");
+    }
+
+    #[test]
+    fn idle_power_signal_marks_in_use_when_vms_running() {
+        let sig = idle_power_signal("172.20.145.193", "xcp-host-b", 3);
+        let v: serde_json::Value = serde_json::from_str(&sig).unwrap();
+        assert_eq!(v["running_vms"], 3);
+        assert_eq!(v["idle"], false);
+        assert_eq!(v["hint"], "in-use");
     }
 
     #[test]
