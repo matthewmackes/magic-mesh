@@ -1,4 +1,5 @@
-//! DATACENTER (action layer) — `action/dc/vm-power` → Xen VM power control.
+//! DATACENTER (action layer) — `action/dc/vm-power` + `action/dc/vm-snapshot`
+//! → Xen VM control.
 //!
 //! The action side of the DATACENTER epic: the worker
 //! ([`crate::workers::datacenter_orchestrator`]) PUBLISHES VM state; this
@@ -6,12 +7,19 @@
 //! `action/<domain>/<verb>` Bus-RPC shape as the route-trace responder
 //! ([`crate::ipc::route`]) — the reads/exec are synchronous SSH calls.
 //!
-//! Request body `{ "uuid", "op": "start"|"shutdown"|"reboot", "dom0" }`:
+//! `vm-power` request body `{ "uuid", "op": "start"|"shutdown"|"reboot", "dom0" }`:
 //!   * `op` maps to an `xe` verb (`start`→`vm-start`, …);
 //!   * `uuid` is validated to be hex+`-` only (no command injection);
 //!   * `dom0` MUST be in the configured allowed set
 //!     ([`crate::workers::datacenter_orchestrator::xen_dom0s`]) before any SSH.
 //! Reply `{"ok":true}` on success, `{"error":"<message>"}` on failure.
+//!
+//! `vm-snapshot` request body `{ "uuid", "dom0" }`:
+//!   * `uuid` is validated to be hex+`-` only (same injection guard);
+//!   * `dom0` MUST be in the configured allowed set before any SSH;
+//!   * snapshots the VM via `xe vm-snapshot uuid=<uuid> new-name-label=…`.
+//! Reply `{"ok":true,"snapshot":"<new-snapshot-uuid>"}` on success (the new
+//! snapshot uuid `xe` prints on stdout), `{"error":"<message>"}` on failure.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -42,7 +50,7 @@ impl DatacenterService {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 1] = ["vm-power"];
+pub const ACTION_VERBS: [&str; 2] = ["vm-power", "vm-snapshot"];
 
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -80,6 +88,30 @@ pub fn vm_power_command(uuid: &str, op: &str) -> Result<String, String> {
     Ok(format!("{verb} uuid={uuid}"))
 }
 
+/// Build the remote `xe` argument string for a VM snapshot. PURE.
+///
+/// Validates `uuid` is non-empty and contains only `[0-9a-fA-F-]` — the same
+/// command-injection guard as [`vm_power_command`], since the result is
+/// interpolated into a remote shell `xe …` string. The new snapshot is given a
+/// stable name-label `dc-snap-<first 8 chars of uuid>`. Returns e.g.
+/// `"vm-snapshot uuid=<uuid> new-name-label=dc-snap-abcd1234"`.
+///
+/// # Errors
+/// Returns `Err` for an empty `uuid`, or a `uuid` containing any character that
+/// is not an ASCII hex digit or `-`.
+pub fn vm_snapshot_command(uuid: &str) -> Result<String, String> {
+    if uuid.is_empty() {
+        return Err("empty uuid".into());
+    }
+    if !uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err("uuid contains invalid characters".into());
+    }
+    let short: String = uuid.chars().take(8).collect();
+    Ok(format!(
+        "vm-snapshot uuid={uuid} new-name-label=dc-snap-{short}"
+    ))
+}
+
 /// Run a remote `xe` command on a dom0 over SSH, returning the process result.
 /// Mirrors the exact ssh arg style of `ssh_xe` in the orchestrator.
 fn ssh_xe_status(key: &str, dom0: &str, remote: &str) -> std::io::Result<std::process::Output> {
@@ -99,13 +131,21 @@ fn ssh_xe_status(key: &str, dom0: &str, remote: &str) -> std::io::Result<std::pr
         .output()
 }
 
-/// Build the reply for one `action/dc/<verb>` request.
+/// Build the reply for one `action/dc/<verb>` request, dispatching on `verb`.
 #[must_use]
 pub fn build_reply(_svc: &DatacenterService, verb: &str, req_body: Option<&str>) -> String {
     let err = |m: String| json!({ "error": m }).to_string();
-    if verb != "vm-power" {
-        return err("unknown dc verb".into());
+    match verb {
+        "vm-power" => vm_power_reply(req_body),
+        "vm-snapshot" => vm_snapshot_reply(req_body),
+        _ => err("unknown dc verb".into()),
     }
+}
+
+/// Handle a `vm-power` request body: parse, allow-list the dom0, then run the
+/// mapped `xe` power verb over SSH.
+fn vm_power_reply(req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
     let Some(body) = req_body else {
         return err("vm-power: missing request body".into());
     };
@@ -144,6 +184,61 @@ pub fn build_reply(_svc: &DatacenterService, verb: &str, req_body: Option<&str>)
     let remote = format!("xe {cmd}");
     match ssh_xe_status(&key, dom0, &remote) {
         Ok(o) if o.status.success() => json!({ "ok": true }).to_string(),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let msg = stderr.trim();
+            if msg.is_empty() {
+                err("xe failed".into())
+            } else {
+                err(msg.to_string())
+            }
+        }
+        Err(e) => err(format!("ssh failed: {e}")),
+    }
+}
+
+/// Handle a `vm-snapshot` request body: parse, allow-list the dom0, then run
+/// `xe vm-snapshot …` over SSH. On success `xe` prints the new snapshot uuid on
+/// stdout, which is returned as `{"ok":true,"snapshot":"<uuid>"}`.
+fn vm_snapshot_reply(req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("vm-snapshot: missing request body".into());
+    };
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return err(format!("vm-snapshot: bad json: {e}")),
+    };
+    let uuid = req
+        .get("uuid")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let dom0 = req
+        .get("dom0")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+
+    // SECURITY: only act on a dom0 in the configured allowed set — never SSH an
+    // attacker-supplied host. Checked BEFORE building/running anything.
+    if !crate::workers::datacenter_orchestrator::xen_dom0s()
+        .iter()
+        .any(|d| d == dom0)
+    {
+        return err("dom0 not in allowed set".into());
+    }
+
+    let cmd = match vm_snapshot_command(uuid) {
+        Ok(c) => c,
+        Err(e) => return err(e),
+    };
+
+    let key = crate::workers::datacenter_orchestrator::xen_ssh_key();
+    let remote = format!("xe {cmd}");
+    match ssh_xe_status(&key, dom0, &remote) {
+        Ok(o) if o.status.success() => {
+            let snapshot = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            json!({ "ok": true, "snapshot": snapshot }).to_string()
+        }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
             let msg = stderr.trim();
@@ -208,7 +303,9 @@ mod tests {
     #[test]
     fn topic_and_verbs_lock() {
         assert_eq!(action_topic("vm-power"), "action/dc/vm-power");
+        assert_eq!(action_topic("vm-snapshot"), "action/dc/vm-snapshot");
         assert!(ACTION_VERBS.contains(&"vm-power"));
+        assert!(ACTION_VERBS.contains(&"vm-snapshot"));
     }
 
     #[test]
@@ -248,10 +345,42 @@ mod tests {
     }
 
     #[test]
+    fn vm_snapshot_command_builds_labelled_snapshot() {
+        let uuid = "abcd1234-5678-90ab-cdef-1234567890ab";
+        assert_eq!(
+            vm_snapshot_command(uuid).unwrap(),
+            // name-label uses the first 8 chars of the uuid
+            format!("vm-snapshot uuid={uuid} new-name-label=dc-snap-abcd1234")
+        );
+        // a uuid shorter than 8 chars uses whatever is there (still hex+dash)
+        assert_eq!(
+            vm_snapshot_command("ab-12").unwrap(),
+            "vm-snapshot uuid=ab-12 new-name-label=dc-snap-ab-12"
+        );
+    }
+
+    #[test]
+    fn vm_snapshot_command_rejects_injection_in_uuid() {
+        // empty
+        assert!(vm_snapshot_command("").is_err());
+        // a `;` to chain a second command
+        assert!(vm_snapshot_command("abcd;rm -rf /").is_err());
+        // a space (would split into extra args)
+        assert!(vm_snapshot_command("abcd 1234").is_err());
+        // backtick / command substitution
+        assert!(vm_snapshot_command("abcd`whoami`").is_err());
+        // non-hex letters
+        assert!(vm_snapshot_command("ghij").is_err());
+        // a `=` that could inject an extra xe arg
+        assert!(vm_snapshot_command("abcd=evil").is_err());
+    }
+
+    #[test]
     fn unknown_verb_and_missing_body_error() {
         let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
         assert!(build_reply(&s, "bogus", None).contains("unknown dc verb"));
         assert!(build_reply(&s, "vm-power", None).contains("missing request body"));
+        assert!(build_reply(&s, "vm-snapshot", None).contains("missing request body"));
     }
 
     #[test]
@@ -266,6 +395,20 @@ mod tests {
         })
         .to_string();
         let r = build_reply(&s, "vm-power", Some(&body));
+        assert!(r.contains("dom0 not in allowed set"), "{r}");
+    }
+
+    #[test]
+    fn vm_snapshot_dom0_not_in_allowed_set_is_rejected() {
+        // With MCNF_XEN_DOM0S unset the allowed set is empty, so any dom0 is
+        // rejected before any SSH is attempted.
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        let body = json!({
+            "uuid": "abcd1234-5678-90ab-cdef-1234567890ab",
+            "dom0": "10.0.0.1"
+        })
+        .to_string();
+        let r = build_reply(&s, "vm-snapshot", Some(&body));
         assert!(r.contains("dom0 not in allowed set"), "{r}");
     }
 }
