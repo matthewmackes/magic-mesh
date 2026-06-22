@@ -60,8 +60,11 @@ cmd_run() {
   flock -u "$lockfd"; exec {lockfd}>&-
 
   local outcome="pass"; [ "$exit_code" -eq 0 ] || outcome="fail"
-  printf '{"jobid":"%s","outcome":"%s","exit":%d,"node":"%s","command":%s,"started":"%s","ended":"%s","log":"%s"}\n' \
-    "$jobid" "$outcome" "$exit_code" "$node" "$(printf '%s' "$command" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')" \
+  # Record the source rev (with -dirty marker) so a reconciler can tell stale from fresh.
+  local commit; commit="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  git -C "$REPO" diff --quiet 2>/dev/null || commit="${commit}-dirty"
+  printf '{"jobid":"%s","outcome":"%s","exit":%d,"node":"%s","commit":"%s","command":%s,"started":"%s","ended":"%s","log":"%s"}\n' \
+    "$jobid" "$outcome" "$exit_code" "$node" "$commit" "$(printf '%s' "$command" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')" \
     "$started" "$ended" "$log_file" > "$RESULTS/$jobid.json"
   log "job $jobid $outcome (exit $exit_code) on $node — result $RESULTS/$jobid.json"
   [ "$exit_code" -eq 0 ]
