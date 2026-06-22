@@ -6037,6 +6037,22 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("dc_auditor".into());
 
+        // DATACENTER-6 — passive async job-status tracker. Leader-gated; watches
+        // the `action/dc/*` Bus lanes + their `reply/<ulid>` replies and emits one
+        // `event/dc/job/<ulid>` event per status transition (pending→ok/error),
+        // without touching the action handlers — a pure side-observer.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::dc_jobs::DcJobsWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("dc_jobs".into());
+
         // ONBOARD-6 — continuous leader election. Renews the
         // <QNM-Shared>/.mackesd-leader.lock lease every 20s so exactly one
         // node always holds leadership (previously only the upgrade watcher

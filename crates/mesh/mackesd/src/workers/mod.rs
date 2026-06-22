@@ -391,6 +391,11 @@ pub mod datacenter_orchestrator;
 // Bus lanes and emits one append-only `event/dc/audit/<ulid>` record per request,
 // without touching the action handlers. Leader-gated; dedups on request ulid.
 pub mod dc_auditor;
+// DATACENTER-6 — passive async job-status tracker: watches the `action/dc/*` Bus
+// lanes + their `reply/<ulid>` replies and emits one `event/dc/job/<ulid>` event
+// per status transition (pending→ok/error), without touching the action
+// handlers. Leader-gated; dedups on (ulid, status).
+pub mod dc_jobs;
 // VPN-GW-1 — per-node commercial-VPN tunnel engine (WireGuard/OpenVPN baseline).
 pub mod stun_gather;
 pub mod subprocess_tick;
