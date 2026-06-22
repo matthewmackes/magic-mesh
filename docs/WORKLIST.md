@@ -1690,11 +1690,18 @@ the plane and it **survives killing the current zone leader**.
   **Acceptance**:
     - [✓] both states (Xen + DO) live on the SUBSTRATE-V2 (etcd) backend with working state-locking
     - [>] a `plan` run from two different eligible nodes sees identical state; concurrent apply is lock-blocked — *concurrent-apply lock-block PROVEN; multi-node-identical is architectural (LAN backend + etcd) — literal 2nd-node run + etcd clustering pending*
-- [ ] **DATACENTER-3: DS-8 mesh secret store holds DC creds.**
+- [>] **DATACENTER-3: DS-8 mesh secret store holds DC creds.** *(session=calm-ray-dcr8)*
+  *Built: `automation/secrets/mcnf-secret.sh` — age-encrypts secrets into etcd (`/mcnf/secret/<name>`),
+  decrypts with the mesh age identity (`/root/.mcnf-age-key`, the one host-local artifact, distributed
+  like the mesh SSH key). Migrated `do-token` + `xapi-password`; etcd verified to hold
+  `age-encryption.org/v1` ciphertext (no plaintext). Both Tofu workspaces wired to resolve creds from the
+  store; PROVEN — with the host cred file removed, `tofu plan` still resolved the XAPI password from the
+  store (`0-destroy`). Remaining: add UniFi cred (with the gateway, DC-14), distribute the age key to other
+  nodes, wire the worker, then retire the `/root/.mcnf-*` fallback files.*
   **As** the control plane, **I want** XAPI/DO/UniFi creds in the etcd+age mesh store, **so that** no host-local
   secret pins the leader.
   **Acceptance**:
-    - [ ] XAPI host creds, the DO token, and the UniFi cred resolve from the etcd+age store (replicated to eligible nodes); the `/root/.mcnf-*` files are no longer the source of truth
+    - [>] XAPI host creds, the DO token, and the UniFi cred resolve from the etcd+age store (replicated to eligible nodes); the `/root/.mcnf-*` files are no longer the source of truth — *XAPI + DO resolve from the store (proven); UniFi pending (DC-14); store is now the source for the wired consumers, old files retained as fallback*
 - [ ] **DATACENTER-4: XAPI-over-overlay routing.**
   **As** a non-LAN leader, **I want** XAPI reachable over the Nebula overlay, **so that** an eligible node off the
   `172.20` LAN can still drive Xen.
