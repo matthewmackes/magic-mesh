@@ -41,6 +41,10 @@ pub struct DcRow {
     /// Used capacity in bytes, as a string (sr events carry `used`). Empty for
     /// non-storage resources.
     pub used: String,
+    /// The bridge a network resource is attached to (`net` events carry
+    /// `bridge`, e.g. `"xenbr0"`). Empty for non-network resources. Appended to
+    /// the status readout on `net` rows.
+    pub bridge: String,
 }
 
 impl DcRow {
@@ -127,6 +131,11 @@ pub fn parse_dc_event(body: &str) -> Option<DcRow> {
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
+    let bridge = v
+        .get("bridge")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     Some(DcRow {
         kind,
         id,
@@ -136,6 +145,7 @@ pub fn parse_dc_event(body: &str) -> Option<DcRow> {
         host,
         size,
         used,
+        bridge,
     })
 }
 
@@ -216,6 +226,16 @@ pub enum Message {
     /// The `action/dc/vm-power` RPC came back — `Ok` carries a status line, `Err`
     /// the error text. Delivered as a panel-scoped message so it routes here.
     PowerDone(Result<String, String>),
+    /// A VM "Snapshot" button was clicked. `uuid` is the VM id (`DcRow::id`);
+    /// `dom0` is the owning dom0 IP (`DcRow::host`). Fires the
+    /// `action/dc/vm-snapshot` RPC.
+    SnapshotClicked {
+        uuid: String,
+        dom0: String,
+    },
+    /// The `action/dc/vm-snapshot` RPC came back — `Ok` carries a status line,
+    /// `Err` the error text. Routes here as a panel-scoped message.
+    SnapshotDone(Result<String, String>),
     /// Switch the top-level view (per-zone tabs vs the Tofu workspaces).
     ViewMode(ViewMode),
     /// A Tofu "Plan" button was clicked. The payload is the workspace name
@@ -289,6 +309,29 @@ impl DatacenterPanel {
                 self.status = e;
                 Task::none()
             }
+            Message::SnapshotClicked { uuid, dom0 } => {
+                self.status = "Snapshotting…".into();
+                Task::perform(
+                    async move {
+                        // Same shape as `vm_power`: the Bus RPC borrows a
+                        // non-Send Persist across its internal await, so run the
+                        // whole round trip on a blocking thread with a local
+                        // runtime.
+                        tokio::task::spawn_blocking(move || vm_snapshot(&uuid, &dom0))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("snapshot task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::SnapshotDone(result)),
+                )
+            }
+            Message::SnapshotDone(Ok(s)) => {
+                self.status = s;
+                Task::none()
+            }
+            Message::SnapshotDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
             Message::ViewMode(mode) => {
                 self.view_mode = mode;
                 Task::none()
@@ -349,9 +392,18 @@ impl DatacenterPanel {
                 palette,
             )
         };
+        // A top-of-panel Refresh button that re-reads the Bus `event/dc/*`
+        // topics (fires the existing `RefreshClicked` → `load()` path).
+        let refresh_btn = variant_button(
+            "Refresh".to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::RefreshClicked)),
+            palette,
+        );
         let mode_tabs = row![
             mode_btn("Resources", ViewMode::Zone),
             mode_btn("Tofu", ViewMode::Tofu),
+            refresh_btn,
         ]
         .spacing(f32::from(spacing::BASE[2]));
 
@@ -462,9 +514,11 @@ fn dc_row_view(r: &DcRow, palette: Palette) -> Element<'_, crate::Message> {
         r.name.clone()
     };
     // For storage rows, surface the capacity readout in place of the bare
-    // status; fall back to status when the capacity bytes don't parse.
+    // status; for network rows append the bridge; otherwise the bare status.
     let status_or_capacity = if r.kind == "sr" {
         r.capacity_readout().unwrap_or_else(|| r.status.clone())
+    } else if r.kind == "net" && !r.bridge.is_empty() {
+        format!("{} · {}", r.status, r.bridge)
     } else {
         r.status.clone()
     };
@@ -488,11 +542,21 @@ fn dc_row_view(r: &DcRow, palette: Palette) -> Element<'_, crate::Message> {
                 palette,
             )
         };
+        let snapshot = variant_button(
+            "Snapshot".to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::SnapshotClicked {
+                uuid: r.id.clone(),
+                dom0: r.host.clone(),
+            })),
+            palette,
+        );
         line = line.push(
             row![
                 power("Start", "start"),
                 power("Stop", "shutdown"),
                 power("Reboot", "reboot"),
+                snapshot,
             ]
             .spacing(f32::from(spacing::BASE[1])),
         );
@@ -562,6 +626,47 @@ fn vm_power(uuid: &str, op: &str, dom0: &str) -> Result<String, String> {
         return Ok("ok".to_string());
     }
     Err(format!("unexpected vm-power reply: {raw}"))
+}
+
+/// Fire the `action/dc/vm-snapshot` Bus RPC (blocking — runs on a
+/// `spawn_blocking` thread) and translate the reply into a status line. Mirrors
+/// `vm_power` exactly: a Persist + `mde_bus::rpc::request` round trip wrapped in
+/// a local tokio runtime because `request` borrows a non-`Send` `Persist` across
+/// its internal await. The reply body is `{"ok":true,"snapshot":".."}` (→
+/// `"snapshot <uuid>"`) or `{"error":".."}` (→ the error text); a Bus failure /
+/// missing data dir / bad reply is surfaced as an error.
+fn vm_snapshot(uuid: &str, dom0: &str) -> Result<String, String> {
+    let Some(dir) = mde_bus::default_data_dir() else {
+        return Err("no Bus data dir".to_string());
+    };
+    let body = serde_json::json!({ "uuid": uuid, "dom0": dom0 }).to_string();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    let reply = rt.block_on(async {
+        let persist = mde_bus::persist::Persist::open(dir).map_err(|e| e.to_string())?;
+        mde_bus::rpc::request(
+            &persist,
+            "action/dc/vm-snapshot",
+            mde_bus::hooks::config::Priority::Default,
+            Some("vm-snapshot"),
+            Some(&body),
+            Duration::from_secs(120),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+    let raw = reply.body.unwrap_or_default();
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("bad vm-snapshot reply: {e}"))?;
+    if let Some(err) = v.get("error").and_then(serde_json::Value::as_str) {
+        return Err(err.to_string());
+    }
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok(format!("snapshot {uuid}"));
+    }
+    Err(format!("unexpected vm-snapshot reply: {raw}"))
 }
 
 /// Fire the `action/dc/tofu-plan` Bus RPC (blocking — runs on a `spawn_blocking`
@@ -635,6 +740,18 @@ mod tests {
         // A vm event carries no capacity → size/used default to empty.
         assert_eq!(r.size, "");
         assert_eq!(r.used, "");
+        // A vm event carries no bridge → defaults to empty.
+        assert_eq!(r.bridge, "");
+    }
+
+    #[test]
+    fn parse_dc_event_reads_a_net_bridge() {
+        let r = parse_dc_event(
+            r#"{"kind":"net","id":"net-0","name":"Pool-wide network","status":"up","zone":"dev","bridge":"xenbr0"}"#,
+        )
+        .unwrap();
+        assert_eq!(r.kind, "net");
+        assert_eq!(r.bridge, "xenbr0");
     }
 
     #[test]
@@ -661,6 +778,7 @@ mod tests {
             host: String::new(),
             size: "0".into(),
             used: "0".into(),
+            bridge: String::new(),
         };
         assert_eq!(zero.capacity_readout(), None);
         let garbage = DcRow {
@@ -738,6 +856,25 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_clicked_sets_an_in_flight_status() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::SnapshotClicked {
+            uuid: "uuid-9".to_string(),
+            dom0: "172.20.0.9".to_string(),
+        });
+        assert_eq!(p.status, "Snapshotting…");
+    }
+
+    #[test]
+    fn snapshot_done_writes_outcome_to_status() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::SnapshotDone(Ok("snapshot uuid-9".to_string())));
+        assert_eq!(p.status, "snapshot uuid-9");
+        let _ = p.update(Message::SnapshotDone(Err("snapshot failed".to_string())));
+        assert_eq!(p.status, "snapshot failed");
+    }
+
+    #[test]
     fn view_renders_for_both_tabs_without_panicking() {
         let mut p = DatacenterPanel::new();
         p.rows = project_rows(&[
@@ -746,13 +883,17 @@ mod tests {
                 r#"{"kind":"vm","id":"9","name":"builder","status":"running","zone":"dev","host":"172.20.0.9"}"#.into(),
             ),
             (
+                "event/dc/net/0".into(),
+                r#"{"kind":"net","id":"net-0","name":"Pool-wide network","status":"up","zone":"dev","bridge":"xenbr0"}"#.into(),
+            ),
+            (
                 "event/dc/droplet/2".into(),
                 r#"{"kind":"droplet","id":"2","name":"lighthouse-01","status":"active","zone":"prod"}"#.into(),
             ),
         ]);
         let _ = p.view(); // prod tab (default)
         let _ = p.update(Message::ZoneTab("dev".to_string()));
-        let _ = p.view(); // dev tab — exercises the VM power-button row
+        let _ = p.view(); // dev tab — exercises the VM power+snapshot row + net bridge readout
         let _ = p.update(Message::ViewMode(ViewMode::Tofu));
         let _ = p.view(); // Tofu view — exercises the Plan buttons
     }
