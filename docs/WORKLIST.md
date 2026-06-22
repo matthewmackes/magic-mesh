@@ -1803,12 +1803,18 @@ the plane and it **survives killing the current zone leader**.
 - [ ] **DATACENTER-18: New-Mesh genesis wizard ("give birth to a new Nebula").**
   **Acceptance**:
     - [ ] wizard: generate CA → provision+found first lighthouse → seed → register DNS → emit first join token; genesis secrets sourced from the mesh store (optional private repo = templates + age-encrypted only, no plaintext); a brand-new working mesh results
-- [ ] **DATACENTER-19: DO provisioning (region picker + guided new-lighthouse).**
+- [>] **DATACENTER-19: DO provisioning (region picker + guided new-lighthouse).** *(session=calm-ray-dcr8)*
+  *`action/dc/do-regions` RPC (doctl region list → slug/name/available) feeds the region picker. Remaining:
+  the picker UI + multi-region-spread nudge + the guided new-lighthouse flow (droplet→bootstrap→found/join→DNS).*
   **Acceptance**:
-    - [ ] full region picker (geo + latency/price hints) with a multi-region-spread recommendation; fixed lighthouse profile (region the only knob); guided new-lighthouse: droplet (Tofu) → bootstrap mackesd → found/join prod mesh → add DNS record
-- [ ] **DATACENTER-20: Build→Eagle→DO promotion pipeline.**
+    - [>] full region picker (geo + latency/price hints) with a multi-region-spread recommendation; fixed lighthouse profile (region the only knob); guided new-lighthouse: droplet (Tofu) → bootstrap mackesd → found/join prod mesh → add DNS record — *region-list RPC done; picker UI + guided flow pending*
+- [>] **DATACENTER-20: Build→Eagle→DO promotion pipeline.** *(session=calm-ray-dcr8)*
+  *Version matrix done: a leader-gated `dc_promote` worker publishes the build version (RPM artifact / git
+  describe) + eagle/do stages to `event/dc/promote/*`; the Overview shows a Build→Eagle→DO strip with
+  per-stage version + readiness chip. Remaining: live eagle/lighthouse version reads, auto-promote-on-green,
+  the prod-arm gate.*
   **Acceptance**:
-    - [ ] auto-promote on green L1–L3 Build→Eagle; DO step gated by the prod-arm switch (armed=auto, disarmed=queued); version matrix reflects each stage
+    - [>] auto-promote on green L1–L3 Build→Eagle; DO step gated by the prod-arm switch (armed=auto, disarmed=queued); version matrix reflects each stage — *version matrix (strip + worker) done; auto-promote + prod-arm pending*
 - [ ] **DATACENTER-21: ephemeral test-mesh + build-farm scaling flows.**
   **Acceptance**:
     - [ ] one-click spin/teardown of an N-node test mesh from the golden template (hermetic, wraps `farm-testbed.sh`); a scale control adjusts build-VM count via Tofu
