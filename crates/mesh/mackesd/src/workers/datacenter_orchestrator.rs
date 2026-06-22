@@ -404,9 +404,114 @@ fn gather_xen() -> Vec<DcResource> {
     out
 }
 
-/// Seam: the UniFi gateway (DATACENTER-14, cred from the mesh store). Empty until then.
+/// Host of the on-prem UniFi gateway (the router) to sample over SSH —
+/// `MCNF_UNIFI_HOST` (e.g. "172.20.0.1"). Empty/unset by default, so the gateway
+/// source is a safe no-op until a node is explicitly configured with reach to the
+/// router (mirrors [`xen_dom0s`] keeping generic mesh nodes unaffected).
+pub(crate) fn unifi_host() -> String {
+    std::env::var("MCNF_UNIFI_HOST")
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// Parse the UniFi SSH credential as stored in the mesh secret store under
+/// `unifi-cred`. The stored value is either `"user:password"` (split once on the
+/// first `:`, so passwords containing `:` are preserved) or a bare password, in
+/// which case the UniFi factory default user `"ubnt"` is assumed. Returns
+/// `(user, password)`, both trimmed. Pure.
+#[must_use]
+pub fn parse_unifi_cred(raw: &str) -> (String, String) {
+    let raw = raw.trim();
+    match raw.split_once(':') {
+        Some((user, pass)) => (user.trim().to_string(), pass.trim().to_string()),
+        None => ("ubnt".to_string(), raw.to_string()),
+    }
+}
+
+/// Read the UniFi SSH credential from the mesh secret store best-effort by
+/// shelling out to `automation/secrets/mcnf-secret.sh get unifi-cred` from the
+/// repo root (the worker's current dir). `None` on any failure (helper missing,
+/// secret absent, non-zero exit) so the gateway source degrades to a no-op.
+fn unifi_cred() -> Option<(String, String)> {
+    let o = std::process::Command::new("bash")
+        .args(["-lc", "automation/secrets/mcnf-secret.sh get unifi-cred"])
+        .output()
+        .ok()?;
+    if !o.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&o.stdout);
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(parse_unifi_cred(raw))
+}
+
+/// Run a remote command on the UniFi gateway over `sshpass` (password auth — the
+/// router has no mesh key). Best-effort: `None` on any failure.
+fn ssh_unifi(pw: &str, user: &str, host: &str, remote: &str) -> Option<String> {
+    let o = std::process::Command::new("sshpass")
+        .args([
+            "-p",
+            pw,
+            "ssh",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "ConnectTimeout=8",
+            &format!("{user}@{host}"),
+            remote,
+        ])
+        .output()
+        .ok()?;
+    o.status
+        .success()
+        .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// Sample the on-prem UniFi gateway (the dev-zone router): one `gateway` resource
+/// carrying its live status and active DHCP lease count. Reads over `sshpass` SSH
+/// using the cred from the mesh secret store (DATACENTER-3) — best-effort, so a
+/// missing host/cred/sshpass or an unreachable router yields no resource, never an
+/// error. Mirrors [`gather_xen`]'s env-gated, fire-and-forget shape.
 fn gather_gateway() -> Vec<DcResource> {
-    Vec::new()
+    let host = unifi_host();
+    if host.is_empty() {
+        return Vec::new();
+    }
+    let Some((user, pw)) = unifi_cred() else {
+        return Vec::new();
+    };
+    // Confirm reach + liveness: the model/uptime banner (`mca-cli-op info`) or, on
+    // gateways without it, the kernel uptime. Either succeeding marks the router up.
+    let up = ssh_unifi(
+        &pw,
+        &user,
+        &host,
+        "mca-cli-op info 2>/dev/null || cat /proc/uptime 2>/dev/null",
+    );
+    let Some(up) = up.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+    let _ = up; // liveness probe; presence is what marks the gateway "up".
+                // Active DHCP leases — the dhcpd lease file when present, else the reachable
+                // neighbour count as a proxy. `0` when neither is readable.
+    let leases: u64 = ssh_unifi(
+        &pw,
+        &user,
+        &host,
+        "grep -c . /run/dhcpd.leases 2>/dev/null || ip neigh | grep -c REACHABLE",
+    )
+    .and_then(|s| s.trim().parse::<u64>().ok())
+    .unwrap_or(0);
+    let sig = serde_json::json!({
+        "kind": "gateway", "id": host, "name": "UniFi Gateway",
+        "status": "up", "leases": leases, "zone": "dev"
+    })
+    .to_string();
+    vec![DcResource::new("gateway", host, sig)]
 }
 
 /// Emit a datacenter event onto the Bus (best-effort, fire-and-reap — same lane
@@ -579,6 +684,30 @@ mod tests {
         assert_eq!(t, "");
         assert_eq!(f, "0.00");
         assert_eq!(l, "");
+    }
+
+    #[test]
+    fn parse_unifi_cred_handles_user_pass_and_bare() {
+        // "user:password" → split once on the first ':'.
+        assert_eq!(
+            parse_unifi_cred("admin:s3cret"),
+            ("admin".to_string(), "s3cret".to_string())
+        );
+        // Password containing ':' is preserved (split_once, not splitn-everywhere).
+        assert_eq!(
+            parse_unifi_cred("admin:a:b:c"),
+            ("admin".to_string(), "a:b:c".to_string())
+        );
+        // Bare password → factory-default "ubnt" user.
+        assert_eq!(
+            parse_unifi_cred("hunter2"),
+            ("ubnt".to_string(), "hunter2".to_string())
+        );
+        // Surrounding whitespace (trailing newline from the secret helper) is trimmed.
+        assert_eq!(
+            parse_unifi_cred("  ubnt:pw  \n"),
+            ("ubnt".to_string(), "pw".to_string())
+        );
     }
 
     #[test]
