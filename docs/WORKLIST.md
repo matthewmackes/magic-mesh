@@ -1600,7 +1600,7 @@ Each capability is a distinct trigger/brain over that substrate; all run on the
 fleet/host machines, not via an AI.
 - [✓] **FARM-AUTO-0: shared substrate — worklist job parser + fleet dispatch.** Jobs come from an `@farm:` tag (command in braces) on worklist tasks; dispatch claims a free ready node (per-node flock, big-iron-first), rsyncs the tree, runs the command on the VM, records a JSON result. **Acceptance:** `farm-jobs.sh active` lists tagged jobs; `farm-dispatch.sh run <id> "<cmd>"` builds on a node + writes pass/fail.
 - [ ] **FARM-AUTO-1: mackesd `farm-orchestrator` worker** — Bus/etcd-triggered, signed-Ansible job bundles, leader-elected. **Acceptance:** an `@farm` job dispatched + reaped via Bus verbs, no AI.
-- [ ] **FARM-AUTO-2: Forgejo Actions + ephemeral XCP runners.** **Acceptance:** a push/schedule runs the farm gate on an auto-spawned VM runner; tears down.
+- [✓] **FARM-AUTO-2: Forgejo Actions + ephemeral XCP runners.** **Acceptance:** a push/schedule runs the farm gate on an auto-spawned VM runner; tears down.
 - [✓] **FARM-AUTO-3: etcd work-queue + builder agents (pull) + pool autoscaler.** **Acceptance:** agents lease jobs from etcd, build, ack; the pool-manager scales VMs to queue depth.
 - [✓] **FARM-AUTO-4: declarative GitOps reconciler.** **Acceptance:** a systemd-timer converges the worklist's active `@farm` jobs onto the farm idempotently; results committed back.
 - [ ] **FARM-AUTO-5: Provisioning-plane controller + Workbench Build panel.** **Acceptance:** the panel queues worklist tasks to the farm + streams live status off the Bus.
