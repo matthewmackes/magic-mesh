@@ -43,7 +43,7 @@ while [ $# -gt 0 ]; do case "$1" in
   *) echo "unknown arg: $1" >&2; exit 1;;
 esac; done
 [ -n "$XCP_HOST" ] && [ -n "$XCP_PASS" ] || { sed -n '20,30p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
-for t in qemu-img cloud-localds sshpass; do command -v "$t" >/dev/null || { echo "missing $t" >&2; exit 1; }; done
+for t in qemu-img genisoimage sshpass; do command -v "$t" >/dev/null || { echo "missing $t" >&2; exit 1; }; done
 [ -s "$QCOW2" ] || { echo "missing qcow2: $QCOW2" >&2; exit 1; }
 [ -s "$PUBKEY" ] || { echo "missing pubkey: $PUBKEY" >&2; exit 1; }
 
@@ -71,7 +71,8 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     groups: [wheel]
-    ssh_authorized_keys: [ $PUB ]
+    ssh_authorized_keys:
+      - "$PUB"
 ssh_pwauth: false
 growpart: { mode: auto, devices: ['/'], ignore_growroot_disabled: false }
 UD
@@ -86,7 +87,11 @@ ethernets:
     routes: [ { to: default, via: $GW } ]
     nameservers: { addresses: [$(echo "$DNS" | sed 's/ /, /g')] }
 NC
-cloud-localds --network-config="$WORK/network-config" "$WORK/seed.iso" "$WORK/user-data" "$WORK/meta-data"
+# Build the NoCloud seed ISO directly with genisoimage (cloud-localds isn't
+# packaged on EL9; the seed is just a `cidata`-labelled ISO carrying
+# user-data + meta-data + network-config at the root — what NoCloud reads).
+( cd "$WORK" && genisoimage -quiet -output seed.iso -volid cidata -joliet -rock \
+    user-data meta-data network-config )
 sz="$(stat -c%s "$WORK/seed.iso")"; pad=$(( (sz + 1048575) / 1048576 * 1048576 )); truncate -s "$pad" "$WORK/seed.iso"
 SEED_BYTES="$(stat -c%s "$WORK/seed.iso")"
 
@@ -94,6 +99,11 @@ log "stage raw + seed onto dom0 /tmp"
 sshpass -e scp $SSHOPTS "$WORK/disk.raw" "$WORK/seed.iso" "$XCP_USER@$XCP_HOST:/tmp/"
 
 SR="$(xe sr-list name-label='Local storage' params=uuid --minimal | tr -d '\r')"
+# Portability: the local SR isn't always named "Local storage" (it's ext on some
+# hosts, lvm on others). Fall back to the first local user SR by type.
+[ -n "$SR" ] || SR="$(xe sr-list type=ext params=uuid --minimal | tr -d '\r' | tr ',' '\n' | head -1)"
+[ -n "$SR" ] || SR="$(xe sr-list type=lvm params=uuid --minimal | tr -d '\r' | tr ',' '\n' | head -1)"
+[ -n "$SR" ] || { echo "no local SR (Local storage / ext / lvm) found on $XCP_HOST" >&2; exit 1; }
 NET="$(xe pif-list management=true params=network-uuid --minimal | tr -d '\r')"
 log "SR=$SR NET=$NET"
 
