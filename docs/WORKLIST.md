@@ -1688,12 +1688,18 @@ the plane and it **survives killing the current zone leader**.
     - [ ] XAPI calls succeed from an eligible node via an on-LAN relay peer; the path is observable + falls back cleanly when the relay is down
 
 ### Phase 1 — The worker
-- [ ] **DATACENTER-5: `datacenter_orchestrator` mackesd worker (leader-gated, per-zone).**
+- [>] **DATACENTER-5: `datacenter_orchestrator` mackesd worker (leader-gated, per-zone).** *(session=calm-ray-dcr8)*
+  *Increment 1 built + farm-tested (`mcnf-build-52`, 4/4 unit tests green): the leader-gated worker +
+  pure deduped snapshot-differ brain (`DatacenterOrchestrator`) publishing `event/dc/<kind>/<id>` from
+  the **DigitalOcean** zone via `doctl` (live: lighthouse-01, ASTERISK). Xen/XAPI + gateway are explicit
+  seams (`gather_xen`/`gather_gateway`) awaiting their Phase-0 deps. Wired in `workers/mod.rs` +
+  spawned in `bin/mackesd.rs` (RestartPolicy::Always). Remaining: per-zone leaders + the XAPI/gateway
+  kinds + kill-leader-survives proof.*
   **As** the platform, **I want** a leader-gated worker that proxies XAPI/DO/UniFi and publishes `event/dc/*`,
   **so that** the panel has a no-center engine.
   **Acceptance**:
-    - [ ] leader-gated (`crate::leader`) Xen-control leader (on-LAN eligible) + DO/global leader (any eligible node)
-    - [ ] publishes `event/dc/{hosts,vms,storage,net,tofu,power,audit,promote}`; killing the leader → a survivor re-assumes within the election window (observable on the Bus)
+    - [>] leader-gated (`crate::leader`) Xen-control leader (on-LAN eligible) + DO/global leader (any eligible node) — *leader gate done (shared lock); per-zone split pending*
+    - [>] publishes `event/dc/{hosts,vms,storage,net,tofu,power,audit,promote}`; killing the leader → a survivor re-assumes within the election window (observable on the Bus) — *`event/dc/droplet/*` live now; other kinds pending their sources*
 - [ ] **DATACENTER-6: async job model + per-resource op-locks.**
   **As** an operator, **I want** long ops tracked as resumable Bus jobs with locks, **so that** progress survives
   reloads and concurrent writes don't corrupt state.

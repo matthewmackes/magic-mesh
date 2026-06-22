@@ -384,6 +384,9 @@ pub mod firewall_preset;
 pub mod connect_firewall;
 // FARM-AUTO-1 — build-farm orchestrator: bridges the farm job lifecycle onto the Bus.
 pub mod farm_orchestrator;
+// DATACENTER-5 — datacenter orchestrator: samples the DC substrate (DO/Xen/gateway)
+// onto the Bus as `event/dc/<kind>/<id>` for the Workbench Datacenter plane.
+pub mod datacenter_orchestrator;
 // VPN-GW-1 — per-node commercial-VPN tunnel engine (WireGuard/OpenVPN baseline).
 pub mod stun_gather;
 pub mod subprocess_tick;

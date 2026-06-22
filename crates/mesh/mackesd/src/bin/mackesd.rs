@@ -6005,6 +6005,22 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("farm_orchestrator".into());
 
+        // DATACENTER-5 — datacenter orchestrator. Leader-gated; samples the DC
+        // substrate (DigitalOcean now via doctl; Xen/XAPI + gateway as Phase-0
+        // deps land) and publishes `event/dc/<kind>/<id>` so the Workbench
+        // Datacenter plane sees hosts/VMs/droplets as first-class mesh state.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::datacenter_orchestrator::DatacenterOrchestratorWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("datacenter_orchestrator".into());
+
         // ONBOARD-6 — continuous leader election. Renews the
         // <QNM-Shared>/.mackesd-leader.lock lease every 20s so exactly one
         // node always holds leadership (previously only the upgrade watcher
