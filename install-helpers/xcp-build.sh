@@ -18,14 +18,18 @@
 #   xcp-build.sh pull <remote-glob>   rsync artifacts back (relative to the remote repo)
 #   xcp-build.sh shell                interactive ssh into the build VM
 #
-# Env overrides: MCNF_BUILD_HOST (172.20.0.50), MCNF_BUILD_USER (mm).
+# Env overrides: MCNF_BUILD_HOST (172.20.0.50), MCNF_BUILD_USER (mm),
+#   MCNF_BUILD_SLOT (unset) — an isolated remote workspace+target on the SAME host
+#   so multiple concurrent jobs run without colliding (scale workloads per node:
+#   e.g. BigBoy's 12c/24G hosts 2-3 parallel builds). slot "2" → ~/magic-mesh-2.
 set -euo pipefail
 
 BUILD_HOST="${MCNF_BUILD_HOST:-172.20.0.50}"
 BUILD_USER="${MCNF_BUILD_USER:-mm}"
 KEY="${MCNF_BUILD_KEY:-$HOME/.ssh/mackes_mesh_ed25519}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-REMOTE_DIR="magic-mesh"
+# Per-slot remote dir lets concurrent agents share one VM (each its own target/).
+REMOTE_DIR="magic-mesh${MCNF_BUILD_SLOT:+-$MCNF_BUILD_SLOT}"
 ARTIFACTS="${MCNF_BUILD_ARTIFACTS:-$HOME/mcnf-release-artifacts}"
 SSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o BatchMode=yes)
 DEST="$BUILD_USER@$BUILD_HOST"
