@@ -11,7 +11,14 @@
 //!     injection) → the relative dir `infra/tofu/<workspace>`;
 //!   * the plan runs in that dir with the workspace's `env.sh` sourced.
 //! Reply `{"ok":true,"summary":"<text>"}` on success, `{"error":"<msg>"}` on
-//! failure. This is **plan only** — read-only; it never runs `apply`.
+//! failure. The plan side is **read-only**; it never runs `apply`.
+//!
+//! DC-15 also exposes two **mutating** verbs gated behind an explicit
+//! `confirm:true` in the request body (DATACENTER-15):
+//!   * `action/dc/tofu-apply`   → `tofu apply -auto-approve`;
+//!   * `action/dc/tofu-destroy` → `tofu destroy -auto-approve`.
+//! Both share the same `tofu_workspace_dir` allow-list as the injection guard
+//! and refuse to run unless `confirm == true`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -37,7 +44,7 @@ impl TofuService {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 1] = ["tofu-plan"];
+pub const ACTION_VERBS: [&str; 3] = ["tofu-plan", "tofu-apply", "tofu-destroy"];
 
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -63,19 +70,32 @@ pub fn tofu_workspace_dir(ws: &str) -> Result<String, String> {
     }
 }
 
+/// Whether a parsed request body carries an explicit `confirm: true`. PURE.
+///
+/// The mutating verbs (`tofu-apply` / `tofu-destroy`) refuse to run unless this
+/// returns `true`. A missing field, `false`, or any non-boolean value all count
+/// as *not confirmed* — the gate fails closed.
+#[must_use]
+pub fn is_confirmed(req: &serde_json::Value) -> bool {
+    req.get("confirm")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Build the reply for one `action/dc/<verb>` request.
 #[must_use]
 pub fn build_reply(svc: &TofuService, verb: &str, req_body: Option<&str>) -> String {
     let err = |m: String| json!({ "error": m }).to_string();
-    if verb != "tofu-plan" {
-        return err("unknown dc verb".into());
+    match verb {
+        "tofu-plan" | "tofu-apply" | "tofu-destroy" => {}
+        _ => return err("unknown dc verb".into()),
     }
     let Some(body) = req_body else {
-        return err("tofu-plan: missing request body".into());
+        return err(format!("{verb}: missing request body"));
     };
     let req: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
-        Err(e) => return err(format!("tofu-plan: bad json: {e}")),
+        Err(e) => return err(format!("{verb}: bad json: {e}")),
     };
     let ws = req
         .get("workspace")
@@ -86,13 +106,23 @@ pub fn build_reply(svc: &TofuService, verb: &str, req_body: Option<&str>) -> Str
         Err(e) => return err(e),
     };
 
+    // The mutating verbs fail closed unless explicitly confirmed. The allow-list
+    // above remains the injection guard; this is the destructive-op guard.
+    if (verb == "tofu-apply" || verb == "tofu-destroy") && !is_confirmed(&req) {
+        return err("apply requires confirm:true".into());
+    }
+
+    // The per-verb tofu invocation. `dir` and `repo` are allow-listed /
+    // process-owned, so this is not an injection surface.
+    let tofu_cmd = match verb {
+        "tofu-plan" => "tofu plan -no-color 2>&1 | tail -25",
+        "tofu-apply" => "tofu apply -auto-approve -no-color 2>&1 | tail -30",
+        // tofu-destroy
+        _ => "tofu destroy -auto-approve -no-color 2>&1 | tail -30",
+    };
+
     let repo = svc.workgroup_root.display();
-    // Read-only: `tofu plan` (never apply), in the workspace dir with its env
-    // sourced. `dir` and `repo` are allow-listed / process-owned, so this is not
-    // an injection surface.
-    let script = format!(
-        "cd {repo}/{dir} && source ./env.sh 2>/dev/null && tofu plan -no-color 2>&1 | tail -25"
-    );
+    let script = format!("cd {repo}/{dir} && source ./env.sh 2>/dev/null && {tofu_cmd}");
     match std::process::Command::new("bash")
         .args(["-lc", &script])
         .output()
@@ -106,12 +136,12 @@ pub fn build_reply(svc: &TofuService, verb: &str, req_body: Option<&str>) -> Str
             out.push_str(&String::from_utf8_lossy(&o.stderr));
             let msg = out.trim();
             if msg.is_empty() {
-                err("tofu plan failed".into())
+                err(format!("{verb} failed"))
             } else {
                 err(msg.to_string())
             }
         }
-        Err(e) => err(format!("tofu plan exec failed: {e}")),
+        Err(e) => err(format!("{verb} exec failed: {e}")),
     }
 }
 
@@ -162,7 +192,51 @@ mod tests {
     #[test]
     fn topic_and_verbs_lock() {
         assert_eq!(action_topic("tofu-plan"), "action/dc/tofu-plan");
+        assert_eq!(action_topic("tofu-apply"), "action/dc/tofu-apply");
+        assert_eq!(action_topic("tofu-destroy"), "action/dc/tofu-destroy");
         assert!(ACTION_VERBS.contains(&"tofu-plan"));
+        assert!(ACTION_VERBS.contains(&"tofu-apply"));
+        assert!(ACTION_VERBS.contains(&"tofu-destroy"));
+    }
+
+    #[test]
+    fn confirm_gate_helper_fails_closed() {
+        // Missing / false / non-boolean → not confirmed.
+        assert!(!is_confirmed(&json!({ "workspace": "xen-xapi" })));
+        assert!(!is_confirmed(&json!({ "confirm": false })));
+        assert!(!is_confirmed(&json!({ "confirm": "true" })));
+        assert!(!is_confirmed(&json!({ "confirm": 1 })));
+        // Only an explicit boolean true confirms.
+        assert!(is_confirmed(&json!({ "confirm": true })));
+    }
+
+    #[test]
+    fn apply_and_destroy_refuse_without_confirm() {
+        let s = TofuService::new(PathBuf::from("/tmp"));
+        for verb in ["tofu-apply", "tofu-destroy"] {
+            // Missing confirm.
+            let body = json!({ "workspace": "xen-xapi" }).to_string();
+            let r = build_reply(&s, verb, Some(&body));
+            assert!(r.contains("apply requires confirm:true"), "{verb}: {r}");
+            // confirm:false.
+            let body = json!({ "workspace": "xen-xapi", "confirm": false }).to_string();
+            let r = build_reply(&s, verb, Some(&body));
+            assert!(r.contains("apply requires confirm:true"), "{verb}: {r}");
+        }
+    }
+
+    #[test]
+    fn apply_and_destroy_reject_traversal_before_confirm() {
+        // The allow-list stays the injection guard even with confirm:true.
+        let s = TofuService::new(PathBuf::from("/tmp"));
+        for verb in ["tofu-apply", "tofu-destroy"] {
+            let body = json!({ "workspace": "../../etc", "confirm": true }).to_string();
+            let r = build_reply(&s, verb, Some(&body));
+            assert!(r.contains("unknown tofu workspace"), "{verb}: {r}");
+            let body = json!({ "workspace": "xen-xapi; rm -rf /", "confirm": true }).to_string();
+            let r = build_reply(&s, verb, Some(&body));
+            assert!(r.contains("unknown tofu workspace"), "{verb}: {r}");
+        }
     }
 
     #[test]
