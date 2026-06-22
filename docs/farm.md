@@ -4,6 +4,11 @@ The build farm gives MCNF parallel Rust/GUI build capacity + a real multi-node
 mesh test bed, off the orchestration loop. This is the single reference for what
 it is, how it's automated, and how to recover it.
 
+> **Parent doc:** the canonical build environment (local dev host + this farm +
+> the toolchain + reproduce-from-scratch) is
+> [`docs/BUILD-ENVIRONMENT.md`](BUILD-ENVIRONMENT.md). This file is the farm
+> deep-dive it points to.
+
 > **TL;DR direction (DEVOPS-SUBSTRATE):** the durable Farm Automation Manager is
 > **Xen Orchestra + OpenTofu + Ansible + Packer + a CI runner**, *not* hand-rolled
 > bash. The `install-helpers/*xcp*`/`farm.sh` scripts are a working **stopgap**;

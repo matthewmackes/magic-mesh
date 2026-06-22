@@ -211,7 +211,13 @@ cargo clippy --all-targets
 cargo fmt --all
 ```
 
-Prerequisites, the serial-mackesd test rule, and the lint/deny/coverage gates:
+> On the EL9 dev host, gcc 11.5 rejects `mold`, so build with
+> `RUSTFLAGS="-C link-arg=-fuse-ld=gold"`, and `opus-devel` comes from CRB.
+
+The **canonical build environment** (the dev host, the IaC-managed build farm,
+reproduce-from-scratch, and every gotcha) is
+[`docs/BUILD-ENVIRONMENT.md`](docs/BUILD-ENVIRONMENT.md). Prerequisites, the
+serial-mackesd test rule, and the lint/deny/coverage gates:
 [`CONTRIBUTING.md`](CONTRIBUTING.md). Packaging is one signed `magic-mesh` RPM
 (`cargo generate-rpm`) with an install-time role chooser; cut via `/release`.
 
@@ -219,6 +225,8 @@ Prerequisites, the serial-mackesd test rule, and the lint/deny/coverage gates:
 
 | For | Read |
 |---|---|
+| Building / the dev environment | [`docs/BUILD-ENVIRONMENT.md`](docs/BUILD-ENVIRONMENT.md) |
+| The build farm + IaC | [`docs/farm.md`](docs/farm.md) · [`infra/`](infra/) |
 | Understanding the system | [`docs/architecture.md`](docs/architecture.md) |
 | Running a mesh, day-2 | [`ADMIN.md`](ADMIN.md) |
 | Installing | [`docs/help/install.md`](docs/help/install.md) |

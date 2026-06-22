@@ -202,6 +202,26 @@ desktop-personal panels grouped below. Locks (full table: `docs/design/planes.md
 - **Hero images:** sections backed by an external project carry a Carbon-compliant
   line-art hero (original homages, `mde-theme`-compiled, `hero_stroke` token). (H1–H10)
 
+## §10 — Build & development environment (canonical — do not rediscover)
+
+The development toolchain and build environment are documented **once**, in
+[`docs/BUILD-ENVIRONMENT.md`](docs/BUILD-ENVIRONMENT.md) — **read it before building
+or provisioning; do not relearn it.** If it has drifted, fix that file, not your
+memory. The load-bearing facts (full detail + the gotchas index live in the doc):
+
+- **Two build surfaces.** (1) The **local dev host** (`172.20.145.192`, Rocky 9.8)
+  builds the whole workspace incl. the GUI — but its **gcc 11.5 rejects `mold`**, so
+  build with `RUSTFLAGS="-C link-arg=-fuse-ld=gold"`. (2) The **build farm** (two
+  Fedora VMs `172.20.0.50`/`.51`, gcc 15 + mold) for offloaded/parallel builds, gates,
+  and RPM cuts — drive it with `install-helpers/xcp-build.sh` / `farm.sh`.
+- **Rust pin `1.94.0`** (`rust-toolchain.toml`); MSRV floor `1.85`. `rustup` required.
+- **EL9 prereq trap:** `opus-devel` is in **CRB** (`dnf --enablerepo=crb install opus-devel`),
+  not the default repos — the single most-rediscovered dependency.
+- **The farm is Infrastructure-as-Code** (DEVOPS-SUBSTRATE): `infra/tofu/` (OpenTofu +
+  Xen Orchestra) builds the VMs from the `MDE-VM-golden` template; `infra/ansible/`
+  installs the toolchain. `tofu apply` rebuilds the farm from code. Secrets
+  (`/root/.mcnf-xo-token`, the mesh key) are off-repo.
+
 ---
 
 *Heritage: the pre-pivot identity lives in the archived

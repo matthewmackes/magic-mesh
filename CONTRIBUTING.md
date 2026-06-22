@@ -9,12 +9,22 @@ no stubs (§7).
 
 ## Build prerequisites
 
-Fedora (the target platform):
+> **Canonical, full build environment + the build farm + every gotcha:**
+> [`docs/BUILD-ENVIRONMENT.md`](docs/BUILD-ENVIRONMENT.md). This is the short version.
+
+Fedora (the target platform + the build-farm VMs):
 
 ```bash
-sudo dnf install -y gcc gcc-c++ cmake pkg-config \
-  gtk3-devel alsa-lib-devel        # the GUI + audio chains link these
+sudo dnf install -y gcc gcc-c++ cmake mold pkg-config \
+  gtk3-devel alsa-lib-devel libxkbcommon-devel opus-devel protobuf-compiler
 ```
+
+**EL9 / Rocky 9 (the actual dev host `172.20.145.192`) — two things bite:**
+1. `opus-devel` is in **CRB**, not the default repos:
+   `sudo dnf --enablerepo=crb install -y opus-devel`.
+2. gcc 11.5 **rejects `mold`** (`.cargo/config.toml` selects it). Build with the
+   gold linker: `RUSTFLAGS="-C link-arg=-fuse-ld=gold" cargo build --workspace`.
+   (The farm VMs run gcc 15, so mold works there — no override.)
 
 - Rust: MSRV **1.85** (the floor, CI-enforced); `rust-toolchain.toml` pins
   **1.94** as the dev ceiling (softbuffer 0.4.8 breaks on 1.95 — see the
@@ -22,6 +32,8 @@ sudo dnf install -y gcc gcc-c++ cmake pkg-config \
 - The vendored Opus tree needs `CMAKE_POLICY_VERSION_MINIMUM=3.5`;
   `.cargo/config.toml` sets it, CI sets it explicitly.
 - All 22 crates are workspace members; nothing is excluded from the build.
+- **Offload heavy/parallel builds to the farm:** `install-helpers/xcp-build.sh
+  cargo …` (builds on `172.20.0.50`); status via `install-helpers/farm.sh status`.
 
 ## Test rules
 
@@ -83,6 +95,8 @@ automation; the RPM cut is `/release` only.
 
 | Area | Path |
 |---|---|
+| **Build & dev environment** (canonical) | [`docs/BUILD-ENVIRONMENT.md`](docs/BUILD-ENVIRONMENT.md) |
+| Build farm + IaC | [`docs/farm.md`](docs/farm.md) · [`infra/`](infra/) |
 | Architecture map | [`docs/architecture.md`](docs/architecture.md) |
 | Operator day-2 guide | [`ADMIN.md`](ADMIN.md) |
 | Operator runbooks | [`docs/help/`](docs/help/) |
