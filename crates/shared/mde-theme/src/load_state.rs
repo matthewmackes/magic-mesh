@@ -150,6 +150,19 @@ impl LoadState {
     pub const fn can_retry(self) -> bool {
         matches!(self, Self::Failed | Self::Degraded | Self::Offline)
     }
+
+    /// MOTION-NET-3 — the alpha to render kept-on-screen content at. Full (1.0)
+    /// normally; **dimmed** while `Refreshing { stale: true }` so a refresh keeps
+    /// the previous data visible-but-dimmed (stale-while-revalidate) instead of
+    /// blanking the panel, until fresh data lands. The other states don't show
+    /// content, so 1.0 is moot for them.
+    #[must_use]
+    pub const fn content_alpha(self) -> f32 {
+        match self {
+            Self::Refreshing { stale: true } => 0.55,
+            _ => 1.0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -262,5 +275,16 @@ mod tests {
         assert_eq!(LoadState::Offline.tone(), StateTone::Warning);
         assert_eq!(LoadState::Failed.tone(), StateTone::Danger);
         assert_eq!(LoadState::Loaded.tone(), StateTone::Success);
+    }
+
+    #[test]
+    fn content_alpha_dims_only_stale_refresh() {
+        // MOTION-NET-3: stale content kept-but-dimmed during a refresh; full
+        // opacity otherwise.
+        assert!(LoadState::Refreshing { stale: true }.content_alpha() < 1.0);
+        assert_eq!(LoadState::Refreshing { stale: false }.content_alpha(), 1.0);
+        assert_eq!(LoadState::Loaded.content_alpha(), 1.0);
+        assert_eq!(LoadState::Idle.content_alpha(), 1.0);
+        assert_eq!(LoadState::Failed.content_alpha(), 1.0);
     }
 }

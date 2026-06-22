@@ -269,9 +269,18 @@ impl MeshServicesPanel {
         .spacing(8)
         .align_y(cosmic::iced::alignment::Vertical::Center);
 
+        // MOTION-NET-3 — during a refresh the previous units stay on screen
+        // (never blank) but render DIMMED via the load state's content alpha, with
+        // the header's "Refreshing" indicator (MOTION-NET-1) showing it's live;
+        // they snap back to full opacity when fresh data lands.
+        let unit_palette = if load.is_busy() && !self.units.is_empty() {
+            palette.dimmed(load.content_alpha())
+        } else {
+            palette
+        };
         let mut units_col = column![].spacing(10);
         for u in &self.units {
-            units_col = units_col.push(unit_row(u, palette));
+            units_col = units_col.push(unit_row(u, unit_palette));
         }
         if self.units.is_empty() {
             if load.is_busy() {
