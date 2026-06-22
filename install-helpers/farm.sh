@@ -47,7 +47,9 @@ warn() { echo "==> farm: $*" >&2; }
 # reachable <ip> <port> — TCP probe.
 reachable() { timeout 4 bash -c "cat </dev/null >/dev/tcp/$1/${2:-22}" 2>/dev/null; }
 # toolchained <vm-ip> — does the build VM have rustc + a C++ compiler?
-toolchained() { "${SSHK[@]}" "mm@$1" '. "$HOME/.cargo/env" 2>/dev/null; command -v rustc >/dev/null && command -v g++ >/dev/null' 2>/dev/null; }
+# NOTE: -n (stdin from /dev/null) is REQUIRED — without it ssh slurps the rest of
+# the `while read … < <(fleet)` loop's stdin and only the first host is processed.
+toolchained() { "${SSHK[@]}" -n "mm@$1" '. "$HOME/.cargo/env" 2>/dev/null; command -v rustc >/dev/null && command -v g++ >/dev/null' 2>/dev/null; }
 
 cmd_status() {
   log "fleet status (key=$KEY)"
