@@ -1712,10 +1712,16 @@ the plane and it **survives killing the current zone leader**.
     - [ ] every action appends to `event/dc/audit/*` (actor/action/target/result) with an in-panel viewer
 
 ### Phase 2 — The Datacenter plane + tabs
-- [ ] **DATACENTER-8: plane skeleton (per-zone tabs, card grid, search, graceful-degrade).**
+- [>] **DATACENTER-8: plane skeleton (per-zone tabs, card grid, search, graceful-degrade).** *(session=calm-ray-dcr8)*
+  *Increment 1 built + farm-tested (`mde-workbench` compiles on `mcnf-build-52`, 3/3 panel tests green):
+  the `Datacenter` panel (`panels/datacenter.rs`) reads `event/dc/*` off the Bus and projects per-resource
+  rows grouped by zone (Prod·DO first), with graceful-degrade (load-error vs empty) — the same Bus-read
+  pattern as `build_farm`. Wired through all of app.rs (import/Message/field/init/update/load/view) + the
+  nav (`Panel::new("datacenter","Datacenter")`). Closes the loop doctl→worker→`event/dc/droplet/*`→panel.
+  Remaining: the per-zone TABS + card-grid + color-dots + search/saved-views + action-routing.*
   **As** an operator, **I want** the Datacenter plane wired into Workbench, **so that** the tabs have a home.
   **Acceptance**:
-    - [ ] Dev/Prod/Gateway top tabs; per-zone sub-tabs; card-grid layout; color-dot status via `mde-theme` tokens (+glyph/label, §4-clean); global search + per-tab filters + saved views; unreachable → last-known + stale badge + retry; reads via the mesh-replicated Bus, routes actions to the zone leader
+    - [>] Dev/Prod/Gateway top tabs; per-zone sub-tabs; card-grid layout; color-dot status via `mde-theme` tokens (+glyph/label, §4-clean); global search + per-tab filters + saved views; unreachable → last-known + stale badge + retry; reads via the mesh-replicated Bus, routes actions to the zone leader — *Bus-read + grouped rows + graceful-degrade live; tabs/grid/dots/search/routing pending*
 - [ ] **DATACENTER-9: Overview tab (single pane + promotion strip + version matrix).**
   **Acceptance**:
     - [ ] cross-zone capacity/health rollup, active alerts, recent Tofu runs, Build→Eagle→DO strip, and a version matrix (farm/Eagle/each lighthouse) — all live; sparklines from short rolling Bus history

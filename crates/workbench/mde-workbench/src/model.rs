@@ -268,6 +268,8 @@ pub fn nav_model() -> Vec<NavEntry> {
                 Panel::new("instances", "Instances"),
                 // FARM-AUTO-5 — build-farm activity (jobs queued/passed/failed).
                 Panel::new("build-farm", "Build Farm"),
+                // DATACENTER-8 — datacenter plane (DO/Xen resources via event/dc/*).
+                Panel::new("datacenter", "Datacenter"),
             ],
         },
         // ── Monitoring — all observability across scopes (Q11) ──────
