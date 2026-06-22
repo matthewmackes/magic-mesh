@@ -49,7 +49,15 @@ for t in qemu-img genisoimage sshpass; do command -v "$t" >/dev/null || { echo "
 
 export SSHPASS="$XCP_PASS"
 SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15"
-xe() { sshpass -e ssh $SSHOPTS "$XCP_USER@$XCP_HOST" xe "$@"; }
+# NOTE: ssh re-splits the remote command on spaces, so a value with spaces
+# (e.g. template='Other install media', name-label='Local storage') would arrive
+# at `xe` as separate words and never match. Shell-quote each arg with %q so the
+# remote shell reassembles them intact.
+xe() {
+  local _c="xe" _a
+  for _a in "$@"; do _c="$_c $(printf '%q' "$_a")"; done
+  sshpass -e ssh $SSHOPTS "$XCP_USER@$XCP_HOST" "$_c"
+}
 log() { echo "==> build-vm: $*"; }
 IP="${IPCIDR%%/*}"
 
@@ -63,6 +71,17 @@ RAW_BYTES="$(stat -c%s "$WORK/disk.raw")"
 
 log "build NoCloud seed (static $IPCIDR, dev SSH key)"
 PUB="$(cat "$PUBKEY")"
+DNS_SEMI="$(echo "$DNS" | tr ' ' ';');"   # NM keyfile wants `8.8.8.8;1.1.1.1;`
+# NETWORK — write the NetworkManager keyfile DIRECTLY, do not rely on cloud-init's
+# netplan-v2 → NM rendering. On Fedora-Cloud + Xen HVM, cloud-init *parses* a v2
+# network-config but renders NO keyfile (confirmed from a VM's own cloud-init.log:
+# "applying net config ... 172.20.0.50/16" yet /etc/NetworkManager/system-connections
+# stays empty), so the NIC falls back to DHCP — and a static-only LAN with no DHCP
+# server leaves the VM permanently unreachable. This dark-VMed the whole farm. The
+# keyfile has no interface-name so it binds the single ethernet NIC regardless of
+# its name (Xen calls it enX0, not eth0/ens3). We also disable cloud-init's net
+# management so nothing competes, and bring the connection up on first boot via
+# runcmd (the keyfile alone is picked up automatically on every later boot).
 cat > "$WORK/user-data" <<UD
 #cloud-config
 hostname: $NAME
@@ -75,23 +94,38 @@ users:
       - "$PUB"
 ssh_pwauth: false
 growpart: { mode: auto, devices: ['/'], ignore_growroot_disabled: false }
+write_files:
+  - path: /etc/NetworkManager/system-connections/static-primary.nmconnection
+    permissions: '0600'
+    owner: root:root
+    content: |
+      [connection]
+      id=static-primary
+      type=ethernet
+      autoconnect=true
+      autoconnect-priority=999
+
+      [ipv4]
+      method=manual
+      address1=$IPCIDR,$GW
+      dns=$DNS_SEMI
+
+      [ipv6]
+      method=ignore
+  - path: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+    permissions: '0644'
+    content: |
+      network: {config: disabled}
+runcmd:
+  - [ nmcli, connection, reload ]
+  - [ sh, -c, "nmcli connection up static-primary || systemctl restart NetworkManager" ]
 UD
 echo -e "instance-id: $NAME-001\nlocal-hostname: $NAME" > "$WORK/meta-data"
-cat > "$WORK/network-config" <<NC
-version: 2
-ethernets:
-  primary:
-    match: { name: "e*" }
-    dhcp4: false
-    addresses: [$IPCIDR]
-    routes: [ { to: default, via: $GW } ]
-    nameservers: { addresses: [$(echo "$DNS" | sed 's/ /, /g')] }
-NC
 # Build the NoCloud seed ISO directly with genisoimage (cloud-localds isn't
 # packaged on EL9; the seed is just a `cidata`-labelled ISO carrying
-# user-data + meta-data + network-config at the root — what NoCloud reads).
+# user-data + meta-data at the root — what NoCloud reads).
 ( cd "$WORK" && genisoimage -quiet -output seed.iso -volid cidata -joliet -rock \
-    user-data meta-data network-config )
+    user-data meta-data )
 sz="$(stat -c%s "$WORK/seed.iso")"; pad=$(( (sz + 1048575) / 1048576 * 1048576 )); truncate -s "$pad" "$WORK/seed.iso"
 SEED_BYTES="$(stat -c%s "$WORK/seed.iso")"
 
