@@ -36,6 +36,13 @@
 //!   * `dom0` MUST be in the configured allowed set before any SSH;
 //!   * deletes the VM via `xe vm-uninstall uuid=<uuid> force=true`.
 //! Reply `{"ok":true}` on success, `{"error":"<message>"}` on failure.
+//!
+//! `do-regions` request body ignored/empty (read-only):
+//!   * runs `doctl compute region list --context <ctx> -o json` locally, where
+//!     `<ctx>` is `MCNF_DOCTL_CONTEXT` (default `mackes`, the authed context);
+//!   * parses the JSON array (each entry `{"slug","name","available"}`).
+//! Reply `{"ok":true,"regions":[{"slug","name","available"}, …]}` on success,
+//! `{"error":"doctl region list failed"}` if doctl is missing/failed.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -66,7 +73,13 @@ impl DatacenterService {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 4] = ["vm-power", "vm-snapshot", "vm-clone", "vm-delete"];
+pub const ACTION_VERBS: [&str; 5] = [
+    "vm-power",
+    "vm-snapshot",
+    "vm-clone",
+    "vm-delete",
+    "do-regions",
+];
 
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -198,6 +211,7 @@ pub fn build_reply(_svc: &DatacenterService, verb: &str, req_body: Option<&str>)
         "vm-snapshot" => vm_snapshot_reply(req_body),
         "vm-clone" => vm_clone_reply(req_body),
         "vm-delete" => vm_delete_reply(req_body),
+        "do-regions" => do_regions_reply(),
         _ => err("unknown dc verb".into()),
     }
 }
@@ -445,6 +459,75 @@ pub fn vm_uninstall_command(uuid: &str) -> Result<String, String> {
     Ok(format!("vm-uninstall uuid={uuid} force=true"))
 }
 
+/// Parse a `doctl compute region list -o json` array into `(slug, name, available)`
+/// triples. PURE.
+///
+/// Each array element is expected to be an object with string `slug`/`name` and a
+/// boolean `available`. Missing string fields default to empty, a missing/non-bool
+/// `available` defaults to `false`. Non-array or unparsable input yields an empty
+/// vector (best-effort — the caller turns that into the doctl-failed error).
+#[must_use]
+pub fn parse_regions(json: &str) -> Vec<(String, String, bool)> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(arr) = value.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .map(|r| {
+            let slug = r
+                .get("slug")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let name = r
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let available = r
+                .get("available")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            (slug, name, available)
+        })
+        .collect()
+}
+
+/// Handle a `do-regions` request: run `doctl compute region list` (read-only) and
+/// reply with the parsed regions. The doctl context is `MCNF_DOCTL_CONTEXT`
+/// (default `mackes`). Best-effort: doctl missing/failed → the doctl-failed error.
+fn do_regions_reply() -> String {
+    let err = |m: &str| json!({ "error": m }).to_string();
+    let context = std::env::var("MCNF_DOCTL_CONTEXT").unwrap_or_else(|_| "mackes".to_string());
+    let output = std::process::Command::new("doctl")
+        .args([
+            "compute",
+            "region",
+            "list",
+            "--context",
+            &context,
+            "-o",
+            "json",
+        ])
+        .output();
+    let Ok(out) = output else {
+        return err("doctl region list failed");
+    };
+    if !out.status.success() {
+        return err("doctl region list failed");
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let regions: Vec<serde_json::Value> = parse_regions(&stdout)
+        .into_iter()
+        .map(
+            |(slug, name, available)| json!({ "slug": slug, "name": name, "available": available }),
+        )
+        .collect();
+    json!({ "ok": true, "regions": regions }).to_string()
+}
+
 /// Run the datacenter Bus responder loop on the current thread until `should_stop`.
 pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &DatacenterService, should_stop: F) {
     let mut cursors: HashMap<String, String> = HashMap::new();
@@ -499,10 +582,37 @@ mod tests {
         assert_eq!(action_topic("vm-snapshot"), "action/dc/vm-snapshot");
         assert_eq!(action_topic("vm-clone"), "action/dc/vm-clone");
         assert_eq!(action_topic("vm-delete"), "action/dc/vm-delete");
+        assert_eq!(action_topic("do-regions"), "action/dc/do-regions");
         assert!(ACTION_VERBS.contains(&"vm-power"));
         assert!(ACTION_VERBS.contains(&"vm-snapshot"));
         assert!(ACTION_VERBS.contains(&"vm-clone"));
         assert!(ACTION_VERBS.contains(&"vm-delete"));
+        assert!(ACTION_VERBS.contains(&"do-regions"));
+    }
+
+    #[test]
+    fn parse_regions_parses_doctl_json() {
+        let json = r#"[
+            {"slug":"nyc3","name":"New York 3","available":true,"sizes":["s-1vcpu-1gb"]},
+            {"slug":"ams2","name":"Amsterdam 2","available":false}
+        ]"#;
+        let regions = parse_regions(json);
+        assert_eq!(
+            regions,
+            vec![
+                ("nyc3".to_string(), "New York 3".to_string(), true),
+                ("ams2".to_string(), "Amsterdam 2".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_regions_garbage_is_empty() {
+        assert!(parse_regions("not json at all").is_empty());
+        // valid JSON but not an array
+        assert!(parse_regions(r#"{"slug":"nyc3"}"#).is_empty());
+        // empty array
+        assert!(parse_regions("[]").is_empty());
     }
 
     #[test]
