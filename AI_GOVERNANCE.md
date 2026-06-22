@@ -221,6 +221,18 @@ desktop-personal panels grouped below. Locks (full table: `docs/design/planes.md
 >    don't route around the work.
 > 4. The measure is **throughput on the operator's priorities**, not the cleanliness of
 >    a single sequential green checkmark. Verify you are actually parallelizing.
+>
+> **Mechanics (learned in practice):**
+> - **Concurrent jobs per node:** `MCNF_BUILD_SLOT=<n>` gives `xcp-build.sh` an isolated
+>   remote workspace+target on one VM, so several builds share a host without colliding
+>   (BigBoy `.52`, 12c/24G, runs 2-3 in parallel). Distribute agents across `.50/.51/.52`
+>   AND across slots.
+> - **Parallel mutating agents:** spawn with `isolation:"worktree"` (no code
+>   cross-contamination). They cut from the **master tip**, so tell each to
+>   `git reset --hard <current-work-tip-sha>` first; have each commit its **disjoint**
+>   files + report the SHA; then **cherry-pick** the SHAs onto the work branch (clean,
+>   since disjoint). **Clean up** the agent worktrees afterward (`git worktree remove`) —
+>   their `target/` dirs fill the dev-host disk fast.
 
 The development toolchain and build environment are documented **once**, in
 [`docs/BUILD-ENVIRONMENT.md`](docs/BUILD-ENVIRONMENT.md) — **read it before building
