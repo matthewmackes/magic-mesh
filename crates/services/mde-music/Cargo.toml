@@ -12,6 +12,13 @@ repository.workspace   = true
 name = "mde-music"
 path = "src/main.rs"
 
+# MUSIC-DOCK-1..3 — the layer-shell bottom dock (a second, standalone surface;
+# the windowed `mde-music` binary above is untouched). Glue over the same
+# `nowplaying` Bus client + `mde-theme` motion helpers.
+[[bin]]
+name = "mde-music-dock"
+path = "src/bin/mde-music-dock.rs"
+
 [lib]
 name = "mde_music"
 path = "src/lib.rs"
@@ -35,7 +42,10 @@ mde-bus    = { path = "../../platform/mde-bus" }
 # E5.3 — single-source colors from the canonical design palette (the Q2
 # indigo accent + semantic tokens) instead of hardcoded hex; the `iced`
 # feature enables `Rgba::into_iced_color()` for the app theme.
-mde-theme  = { path = "../../shared/mde-theme" }
+# MUSIC-DOCK-2 — the `serde` feature exposes `Preferences::load()` so the dock
+# reads the user's reduce-motion preference (file + MDE_REDUCE_MOTION) for the
+# slide-in (the animation helpers themselves carry no feature gate).
+mde-theme  = { path = "../../shared/mde-theme", features = ["serde"] }
 # AIR-10.b — parse the daemon's JSON Bus replies into display rows.
 serde_json = "1"
 # AIR-11.b — derive (de)serialize for the persisted MusicPrefs (sort).
@@ -53,6 +63,10 @@ tokio      = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync
 # defaults the workspace already builds.
 base64     = "0.22"
 image      = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# MUSIC-DOCK — structured logging for the dock binary (same shape as the other
+# layer-shell surfaces, e.g. mde-voice-hud).
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [lints]
 workspace = true
