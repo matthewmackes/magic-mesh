@@ -23,7 +23,7 @@
 
 use std::time::{Duration, Instant};
 
-use mde_theme::animation::{slide_in, RenderParams, Transition};
+use mde_theme::animation::{shimmer_alpha, slide_in, LoopingTween, RenderParams, Transition};
 use mde_theme::motion::Motion;
 
 /// Hover-lift travel for a transport/nav button (px the control rises on hover).
@@ -205,6 +205,128 @@ pub fn reveal_params(reveal: Option<Reveal>, now: Instant, row_idx: u32) -> Rend
     )
 }
 
+/// BEAUT-MUSIC — the per-frame cadence for the skeleton shimmer (~30 fps).
+///
+/// The breathe is slow (a ~1.5 s `loading` period — see [`Shimmer`]), so half
+/// the reveal rate keeps the placeholder lively at a fraction of the wakeups, and
+/// it is armed only while a skeleton is on screen (MOTION-PERF-1 — a settled,
+/// content-painted surface costs nothing).
+pub const SHIMMER_TICK: Duration = Duration::from_millis(33);
+
+/// BEAUT-MUSIC — the looping breathe driving the library/now-playing skeleton
+/// placeholders shown while the daemon state loads.
+///
+/// A single [`mde_theme::animation::LoopingTween`] on the shared
+/// [`Motion::loading`] preset; [`Shimmer::alpha`] is the
+/// [`mde_theme::animation::shimmer_alpha`] ping-pong (glue, not a
+/// reimplementation), which is **STATIC at the mid alpha under reduce-motion** —
+/// a plain grey block, no movement (Q32: motion is never the only cue; the
+/// structure itself is the placeholder).
+///
+/// Tick-gating: a skeleton arms [`SHIMMER_TICK`] only while it is on screen, and
+/// **never under reduce-motion** ([`Shimmer::animates`] is `false`), so the
+/// breathe costs zero idle wakeups once real content lands.
+#[derive(Clone, Copy, Debug)]
+pub struct Shimmer {
+    tween: LoopingTween,
+    reduce_motion: bool,
+}
+
+impl Shimmer {
+    /// Begin the shimmer breathe at `start`. One per surface; restarting is
+    /// harmless (the phase is derived from `start`, not accumulated).
+    #[must_use]
+    pub fn starting_at(start: Instant, reduce_motion: bool) -> Self {
+        Self {
+            tween: LoopingTween::starting_at(start, Motion::loading().duration),
+            reduce_motion,
+        }
+    }
+
+    /// The skeleton tile alpha `0.10..=0.22` at `now` — the breathing grey. A
+    /// pure delegate to [`mde_theme::animation::shimmer_alpha`] over this
+    /// shimmer's looping phase, so the reduce-motion contract (a static mid
+    /// grey) lives centrally in `mde-theme`.
+    #[must_use]
+    pub fn alpha(self, now: Instant) -> f32 {
+        shimmer_alpha(self.tween.phase(now), self.reduce_motion)
+    }
+
+    /// Whether this shimmer actually moves: `true` only when motion is on. Under
+    /// reduce-motion the alpha is phase-independent, so a caller arms **no tick**
+    /// (the static grey is correct on the first frame and never changes).
+    #[must_use]
+    pub const fn animates(self) -> bool {
+        !self.reduce_motion
+    }
+}
+
+/// BEAUT-MUSIC — the gentle first-paint reveal for a whole settling surface (the
+/// welcome card on first open, the Home dashboard once stats land).
+///
+/// Unlike [`Reveal`] (which staggers a list), this is a single fade-and-rise
+/// epoch with no per-row stagger; it shares the same [`Motion::panel_mount`]
+/// timing + the reduce-motion crossfade collapse via [`slide_in`]. A finished
+/// mount reads as fully settled, so a caller applies [`MountReveal::params`]
+/// unconditionally and disarms its tick once [`MountReveal::is_animating`] is
+/// `false`.
+#[derive(Clone, Copy, Debug)]
+pub struct MountReveal {
+    start: Instant,
+    reduce_motion: bool,
+}
+
+impl MountReveal {
+    /// Begin a mount reveal at `start` (call when the surface first appears).
+    #[must_use]
+    pub const fn starting_at(start: Instant, reduce_motion: bool) -> Self {
+        Self {
+            start,
+            reduce_motion,
+        }
+    }
+
+    /// The whole settle window: the shared `panel_mount` duration, capped to the
+    /// ≤80 ms reduce-motion crossfade so a settled frame is reached promptly.
+    #[must_use]
+    const fn window(self) -> Duration {
+        if self.reduce_motion {
+            Duration::from_millis(mde_theme::motion::REDUCE_MOTION_CAP_MS)
+        } else {
+            Motion::panel_mount().duration
+        }
+    }
+
+    /// `true` while the mount fade-and-rise is still in flight at `now`.
+    #[must_use]
+    pub fn is_animating(self, now: Instant) -> bool {
+        now.saturating_duration_since(self.start) < self.window()
+    }
+
+    /// The fade-and-rise [`RenderParams`] at `now` — a [`slide_in`] over a small
+    /// [`REVEAL_RISE_PX`] travel that collapses to a pure crossfade under
+    /// reduce-motion (no translate/scale).
+    #[must_use]
+    pub fn params(self, now: Instant) -> RenderParams {
+        slide_in(self.start, now, REVEAL_RISE_PX, self.reduce_motion)
+    }
+}
+
+/// BEAUT-MUSIC — the mount params for an optional [`MountReveal`]: an absent
+/// mount reads as fully settled (`alpha = 1`, no offset), so a caller applies
+/// this unconditionally in `view`.
+#[must_use]
+pub fn mount_params(mount: Option<MountReveal>, now: Instant) -> RenderParams {
+    mount.map_or(
+        RenderParams {
+            alpha: 1.0,
+            translate_y: 0.0,
+            scale: 1.0,
+        },
+        |m| m.params(now),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,7 +424,11 @@ mod tests {
             assert_eq!(p.scale, 1.0);
         }
         // No stagger under reduce-motion: every row shares the base start.
-        assert_eq!(r.row_start(0), r.row_start(7), "no stagger under reduce-motion");
+        assert_eq!(
+            r.row_start(0),
+            r.row_start(7),
+            "no stagger under reduce-motion"
+        );
         // The whole reveal is settled at the cap (no stagger tail).
         let cap = Duration::from_millis(mde_theme::motion::REDUCE_MOTION_CAP_MS);
         assert_eq!(r.window(), cap, "reduce-motion window is exactly the cap");
@@ -315,6 +441,73 @@ mod tests {
     #[test]
     fn absent_reveal_reads_as_settled() {
         let p = reveal_params(None, Instant::now(), 0);
+        assert_eq!(p.alpha, 1.0);
+        assert_eq!(p.translate_y, 0.0);
+        assert_eq!(p.scale, 1.0);
+    }
+
+    #[test]
+    fn shimmer_breathes_with_motion_and_is_static_under_reduce_motion() {
+        // BEAUT-MUSIC — with motion on the skeleton breathes within the
+        // mde-theme bounds and the alpha varies across the cycle; it animates so
+        // a caller arms the tick.
+        let t0 = Instant::now();
+        let s = Shimmer::starting_at(t0, false);
+        assert!(s.animates(), "motion-on shimmer arms a tick");
+        let period = mde_theme::motion::Motion::loading().duration;
+        let lo = s.alpha(t0);
+        let mid = s.alpha(t0 + period / 2);
+        assert!((mde_theme::animation::SKELETON_ALPHA_DIM
+            ..=mde_theme::animation::SKELETON_ALPHA_BRIGHT)
+            .contains(&lo));
+        assert!(
+            (mid - lo).abs() > 1e-3,
+            "the breathe actually moves across the cycle ({lo} vs {mid})"
+        );
+        // Reduce-motion: a static mid grey, phase-independent, and NO tick armed.
+        let r = Shimmer::starting_at(t0, true);
+        assert!(!r.animates(), "reduce-motion shimmer arms no tick");
+        assert_eq!(
+            r.alpha(t0),
+            r.alpha(t0 + period / 2),
+            "reduce-motion alpha is phase-independent (static grey)"
+        );
+    }
+
+    #[test]
+    fn mount_reveal_fades_and_rises_then_settles() {
+        let t0 = Instant::now();
+        let m = MountReveal::starting_at(t0, false);
+        let p0 = m.params(t0);
+        assert!(p0.alpha < 1e-3, "starts transparent");
+        assert!(p0.translate_y > 0.0, "starts risen below rest");
+        assert!(m.is_animating(t0));
+        let done = t0 + Motion::panel_mount().duration + Duration::from_millis(1);
+        let pe = mount_params(Some(m), done);
+        assert!((pe.alpha - 1.0).abs() < 1e-3, "ends opaque");
+        assert!(pe.translate_y.abs() < 1e-3, "rests at 0");
+        assert!(!m.is_animating(done), "settled ⇒ no tick armed");
+    }
+
+    #[test]
+    fn mount_reveal_collapses_to_crossfade_and_settles_fast_under_reduce_motion() {
+        let t0 = Instant::now();
+        let m = MountReveal::starting_at(t0, true);
+        for ms in [0, 20, 80] {
+            let p = m.params(t0 + Duration::from_millis(ms));
+            assert_eq!(p.translate_y, 0.0, "no slide under reduce-motion at {ms}ms");
+            assert_eq!(p.scale, 1.0);
+        }
+        let cap = Duration::from_millis(mde_theme::motion::REDUCE_MOTION_CAP_MS);
+        assert!(
+            !m.is_animating(t0 + cap + Duration::from_millis(1)),
+            "settled within the ≤80 ms cap — no idle ticks past it"
+        );
+    }
+
+    #[test]
+    fn absent_mount_reads_as_settled() {
+        let p = mount_params(None, Instant::now());
         assert_eq!(p.alpha, 1.0);
         assert_eq!(p.translate_y, 0.0);
         assert_eq!(p.scale, 1.0);

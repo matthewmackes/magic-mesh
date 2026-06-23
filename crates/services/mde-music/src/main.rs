@@ -181,6 +181,18 @@ fn carbon(rgba: mde_theme::Rgba, a: f32) -> cosmic::iced::Color {
     }
 }
 
+/// BEAUT-MUSIC — the single "is shell motion suppressed?" predicate, resolved
+/// once at launch. `true` when the user asked for reduced motion (a11y pref /
+/// `MDE_REDUCE_MOTION`) **or** the MOTION-CORE-3 master kill switch is off
+/// (`motion.enabled == false` / `MDE_MOTION_DISABLED`). Both collapse every
+/// shell animation to the static/final frame, so the welcome reveal, skeleton
+/// shimmer, hover-lift, and slide-up all gate on this one value — there is never
+/// a path where the kill switch is set but a surface still animates.
+fn motion_suppressed() -> bool {
+    let prefs = mde_theme::Preferences::load();
+    prefs.a11y.reduce_motion || !prefs.motion.enabled
+}
+
 /// MUSIC-HOME — load everything the Home dashboard shows (stats + the
 /// most-played / starred / mesh-now-playing strips) in one batch. Used on Home
 /// nav, at init, and by the poll tick.
@@ -386,6 +398,17 @@ struct State {
     /// on each (re)load so inserted/refreshed rows reveal top-down. `None` once
     /// settled.
     queue_reveal: Option<motion::Reveal>,
+    /// BEAUT-MUSIC — the first-paint mount reveal for the welcome card (first
+    /// open) and the Home dashboard (once stats land): a single fade-and-rise so
+    /// the surface settles in instead of snapping. `None` once settled (no mount
+    /// tick armed). Started at launch; restarted when the Home dashboard's
+    /// skeleton is first replaced by real content (staged reveal).
+    mount: Option<motion::MountReveal>,
+    /// BEAUT-MUSIC — the breathing skeleton placeholder phase, used while the
+    /// library grid / Home dashboard is still loading the daemon state. Static
+    /// (no tick) under reduce-motion; the shimmer subscription gates on
+    /// [`State::skeleton_visible`] so it costs nothing once content lands.
+    shimmer: motion::Shimmer,
 }
 
 /// MUSIC-RFX-8 — the target of a right-click track context menu. A track row
@@ -569,6 +592,12 @@ enum Message {
     /// MOTION-FEEDBACK — advance the in-flight now-playing / queue reveal one
     /// frame. Armed only while a reveal is animating (MOTION-PERF-1).
     RevealTick,
+    /// BEAUT-MUSIC — advance the first-paint mount reveal one frame; clears it
+    /// once settled so the tick disarms. Armed only while the mount is in flight.
+    MountTick,
+    /// BEAUT-MUSIC — repaint a breathing skeleton placeholder one frame. Armed
+    /// only while a skeleton is on screen AND motion is on (MOTION-PERF-1).
+    ShimmerTick,
 }
 
 impl State {
@@ -577,14 +606,21 @@ impl State {
             Ok(c) => (None, format!("Connected to {}", c.server_url)),
             Err(_) => (Some(FirstRunForm::default()), String::new()),
         };
+        // BEAUT-MUSIC — resolve the effective reduce-motion (a11y pref OR the
+        // MOTION-CORE-3 kill switch) once; the welcome/skeleton/feedback all gate
+        // on it. The launch instant seeds the first-paint mount + the shimmer.
+        let reduce_motion = motion_suppressed();
+        let now = std::time::Instant::now();
         Self {
             // MUSIC-DOCK — surfaces are mapped by the boot ShowDock handler.
             dock_surface: None,
             handle_surface: None,
             slide: None,
-            // MUSIC-DOCK-2 — resolve reduce-motion once (a11y pref or the
-            // MDE_REDUCE_MOTION/MDE_MOTION_DISABLED env overrides).
-            reduce_motion: mde_theme::Preferences::load().a11y.reduce_motion,
+            // MUSIC-DOCK-2 / BEAUT-MUSIC — the effective reduce-motion resolved
+            // above (a11y pref OR the MOTION-CORE-3 master kill switch). The kill
+            // switch collapses motion exactly like reduce-motion (Q32 contract),
+            // so one flag gates every animation.
+            reduce_motion,
             nav: NavState::new(),
             form,
             connection,
@@ -638,6 +674,11 @@ impl State {
             maxi_peers: Vec::new(),
             now_reveal: None,
             queue_reveal: None,
+            // BEAUT-MUSIC — the surface gently reveals on first open (the welcome
+            // card or, once creds exist, the dock chrome settling in over its
+            // skeleton). Restarted when the Home dashboard's stats land.
+            mount: Some(motion::MountReveal::starting_at(now, reduce_motion)),
+            shimmer: motion::Shimmer::starting_at(now, reduce_motion),
         }
     }
 
@@ -899,6 +940,16 @@ impl State {
             }
             Message::StatsLoaded(r) => {
                 if let Ok(s) = r {
+                    // BEAUT-MUSIC — staged reveal: the very first stats batch
+                    // replaces the Home skeleton with real content, so fade-and-
+                    // rise the dashboard in (a fresh mount epoch). Later refresh
+                    // ticks just update the numbers in place (no re-reveal).
+                    if self.stats.is_none() {
+                        self.mount = Some(motion::MountReveal::starting_at(
+                            std::time::Instant::now(),
+                            self.reduce_motion,
+                        ));
+                    }
                     self.stats = Some(s);
                 }
                 Task::none()
@@ -1458,6 +1509,43 @@ impl State {
                 }
                 Task::none()
             }
+            // BEAUT-MUSIC — clear the mount once it settles so its tick disarms
+            // (zero idle wakeups); the repaint this tick triggers re-reads the
+            // live `slide_in` params for an in-flight mount.
+            Message::MountTick => {
+                if self
+                    .mount
+                    .is_some_and(|m| !m.is_animating(std::time::Instant::now()))
+                {
+                    self.mount = None;
+                }
+                Task::none()
+            }
+            // BEAUT-MUSIC — a no-op state change whose sole purpose is to force a
+            // repaint so an on-screen breathing skeleton re-reads its live alpha.
+            // Armed only while a skeleton is visible and motion is on, so it
+            // self-disarms the instant content lands (the subscription gate).
+            Message::ShimmerTick => Task::none(),
+        }
+    }
+
+    /// BEAUT-MUSIC — is a breathing skeleton placeholder currently on screen?
+    /// True while the daemon state behind the active surface is still loading:
+    /// the Home dashboard before its first stats batch lands, or a library grid
+    /// mid-fetch. Gates the shimmer tick so the breathe costs nothing once real
+    /// content paints (MOTION-PERF-1). The first-run welcome card is NOT a
+    /// skeleton (it's the final content), so it never arms the shimmer.
+    fn skeleton_visible(&self) -> bool {
+        if self.form.is_some() || self.maxi_open {
+            return false;
+        }
+        match self.nav.current() {
+            // Home shows the stat/server/chip skeleton until the first batch.
+            Route::Hub => self.stats.is_none(),
+            // Album / Playlist pages have their own (text) loading lines.
+            Route::Album(..) | Route::Playlist(..) => false,
+            // A category grid shows the skeleton tiles while fetching.
+            _ => self.loading,
         }
     }
 
@@ -1517,16 +1605,34 @@ impl State {
         } else {
             Subscription::none()
         };
+        // BEAUT-MUSIC — the first-paint mount ticker, armed ONLY while the welcome
+        // / dashboard fade-and-rise is in flight. Disarms via `MountTick` the
+        // instant it settles (zero idle wakeups; reduce-motion settles in ≤80 ms).
+        let mount = if self.mount.is_some_and(|m| m.is_animating(now)) {
+            cosmic::iced::time::every(SLIDE_TICK).map(|_| Message::MountTick)
+        } else {
+            Subscription::none()
+        };
+        // BEAUT-MUSIC — the skeleton shimmer ticker, armed ONLY while a breathing
+        // placeholder is on screen AND motion is on (under reduce-motion the grey
+        // is static, so no tick). It self-disarms the instant real content lands.
+        let shimmer = if self.skeleton_visible() && self.shimmer.animates() {
+            cosmic::iced::time::every(motion::SHIMMER_TICK).map(|_| Message::ShimmerTick)
+        } else {
+            Subscription::none()
+        };
         // Poll the now-playing snapshot once the library is shown (there's
         // no daemon to ask on the first-run connect form).
         if self.form.is_some() {
-            Subscription::batch([keys, resizes, slide, reveal])
+            Subscription::batch([keys, resizes, slide, reveal, mount, shimmer])
         } else {
             let mut subs = vec![
                 keys,
                 resizes,
                 slide,
                 reveal,
+                mount,
+                shimmer,
                 cosmic::iced::time::every(nowplaying::POLL).map(|_| Message::PollState),
             ];
             // MUSIC-HOME-4 — poll the server stats while the Home dashboard is
@@ -1694,31 +1800,95 @@ impl State {
         self.library_view()
     }
 
-    /// The first-run connect form.
+    /// BEAUT-MUSIC — the first-open **welcome** view: a Carbon-styled connect
+    /// card (raised surface + 1px border + accent hero glyph), centered in the
+    /// dock instead of a bare top-left form, so the very first frame reads as a
+    /// designed onboarding pane rather than a blank one. Every colour is an
+    /// `mde-theme` token (§4); the whole card gently fades-and-rises in on the
+    /// first-paint [`motion::MountReveal`] (a pure crossfade under reduce-motion),
+    /// and the Connect CTA carries the shared hover/press feedback.
     fn first_run_view(&self, f: &FirstRunForm) -> Element<'_, Message> {
+        let p = mde_theme::Palette::dark();
+        let text_c = carbon(p.text, 1.0);
+        let muted = carbon(p.text_muted, 1.0);
+        let accent = carbon(p.accent, 1.0);
+
+        let hero = container(text("\u{266B}").size(40).colr(accent))
+            .width(Length::Fixed(72.0))
+            .height(Length::Fixed(72.0))
+            .center_x(Length::Fixed(72.0))
+            .center_y(Length::Fixed(72.0))
+            .style({
+                let bg = carbon(p.raised, 1.0);
+                move |_| cosmic::iced::widget::container::Style {
+                    background: Some(bg.into()),
+                    border: cosmic::iced::Border {
+                        color: cosmic::iced::Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 12.0.into(),
+                    },
+                    ..Default::default()
+                }
+            });
+
         let mut col = column![
-            text("Connect your music").size(22),
-            Space::new().height(Length::Fixed(8.0)),
-            text("Point MDE Music at your Airsonic / Navidrome server.").size(13),
+            hero,
             Space::new().height(Length::Fixed(16.0)),
+            text("Welcome to MCNF Music").size(22).colr(text_c),
+            Space::new().height(Length::Fixed(6.0)),
+            text("Connect your Airsonic / Navidrome server to start listening across the mesh.")
+                .size(13)
+                .colr(muted),
+            Space::new().height(Length::Fixed(20.0)),
             text_input("https://music.your-mesh:4040", &f.url).on_input(Message::UrlChanged),
             text_input("username", &f.user).on_input(Message::UserChanged),
             text_input("password", &f.pass)
                 .secure(true)
                 .on_input(Message::PassChanged),
-            Space::new().height(Length::Fixed(12.0)),
-            button(text("Connect")).on_press(Message::Connect),
+            Space::new().height(Length::Fixed(16.0)),
+            // The CTA carries the shared hover-lift / press-depress feedback.
+            primary_button("Connect", 14, Message::Connect, self.reduce_motion),
         ]
         .spacing(8)
-        .padding(28)
-        .max_width(440);
+        .padding(32)
+        .max_width(420)
+        .align_x(cosmic::iced::Alignment::Center);
         if let Some(err) = &f.error {
             col = col.push(Space::new().height(Length::Fixed(8.0)));
-            col = col.push(text(err.clone()).size(13));
+            col = col.push(text(err.clone()).size(13).colr(carbon(p.danger, 1.0)));
         }
-        container(col)
+
+        // Carbon card: raised surface + 1px border, centered in the dock.
+        let card = container(col).style({
+            let bg = carbon(p.surface, 1.0);
+            let border = carbon(p.border, 1.0);
+            move |_| cosmic::iced::widget::container::Style {
+                background: Some(bg.into()),
+                border: cosmic::iced::Border {
+                    color: border,
+                    width: 1.0,
+                    radius: 12.0.into(),
+                },
+                ..Default::default()
+            }
+        });
+        // BEAUT-MUSIC — gently rise the welcome card into place on first open:
+        // the mount's translate_y becomes a top-padding offset (the established
+        // translate→padding glue). The card stays fully opaque so the connect
+        // form is usable from the first frame; under reduce-motion `slide_in`
+        // yields no rise, so it simply maps in place.
+        let rv = motion::mount_params(self.mount, std::time::Instant::now());
+        container(card)
             .width(Length::Fill)
             .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .padding(cosmic::iced::Padding {
+                top: rv.translate_y.max(0.0),
+                right: 0.0,
+                bottom: 0.0,
+                left: 0.0,
+            })
             .into()
     }
 
@@ -1890,9 +2060,32 @@ impl State {
         let text_c = carbon(p.text, 1.0);
         let muted = carbon(p.text_muted, 1.0);
         let Some(s) = &self.stats else {
-            return column![text("Loading library stats…").size(14).colr(muted)]
-                .padding(8)
-                .into();
+            // BEAUT-MUSIC — a breathing Carbon skeleton (title bar · hero counts ·
+            // server line · count chips) while the first `library-stats` batch is
+            // in flight, so Home paints its structure within one frame instead of
+            // a bare "Loading…" line. Static grey under reduce-motion; the shimmer
+            // tick gates on `skeleton_visible`.
+            let a = self.shimmer.alpha(std::time::Instant::now());
+            let hero_block = row![
+                skeleton_bar(90.0, 40.0, a),
+                skeleton_bar(90.0, 40.0, a),
+                skeleton_bar(90.0, 40.0, a),
+            ]
+            .spacing(40);
+            return column![
+                skeleton_bar(180.0, 24.0, a),
+                Space::new().height(Length::Fixed(18.0)),
+                hero_block,
+                Space::new().height(Length::Fixed(22.0)),
+                skeleton_bar(260.0, 16.0, a),
+                Space::new().height(Length::Fixed(8.0)),
+                skeleton_bar(320.0, 12.0, a),
+                Space::new().height(Length::Fixed(20.0)),
+                skeleton_bar(360.0, 14.0, a),
+            ]
+            .spacing(0)
+            .padding(8)
+            .into();
         };
         // Hero counts (Songs / Artists / Albums).
         let stat_block = |n: u64, label: &str| -> Element<'_, Message> {
@@ -2031,6 +2224,17 @@ impl State {
         ]
         .spacing(0)
         .padding(8);
+        // BEAUT-MUSIC — staged reveal: when the first stats batch replaced the
+        // skeleton, the dashboard fades-and-rises into place (a fresh mount
+        // epoch set in `StatsLoaded`). The translate_y becomes a top-padding
+        // rise; under reduce-motion `slide_in` yields a pure crossfade (no rise).
+        let rv = motion::mount_params(self.mount, std::time::Instant::now());
+        let body = container(body).padding(cosmic::iced::Padding {
+            top: rv.translate_y.max(0.0),
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        });
         cosmic::iced::widget::scrollable(body).into()
     }
 
@@ -2060,6 +2264,7 @@ impl State {
             Route::Album(..) => self.album_page(),
             Route::Playlist(..) => self.playlist_page(),
             route => {
+                let route_pal = mde_theme::Palette::dark();
                 // AIR-11.b — title + a sort toggle; items lay out in a
                 // wrapping 160×160 card grid, ordered by the persisted sort.
                 // MUSIC-ALBUMS-4 — header: title · in-grid filter · sort toggle.
@@ -2079,16 +2284,26 @@ impl State {
                 // the real grid so the loading placeholder matches the layout).
                 let cols = ((self.grid_width + 8.0) / 168.0).floor().max(1.0) as usize;
                 if self.loading {
-                    // MUSIC-RESPONSIVE-6 — greyed Carbon skeleton tiles (matching
-                    // the card geometry) instead of a blank "Loading…" line, so a
-                    // navigation paints structure within one frame.
-                    col = col.push(skeleton_grid(cols));
+                    // MUSIC-RESPONSIVE-6 / BEAUT-MUSIC — breathing Carbon skeleton
+                    // tiles (matching the card geometry) instead of a blank
+                    // "Loading…" line, so a navigation paints structure within one
+                    // frame and the slow load reads as active (static under
+                    // reduce-motion).
+                    let alpha = self.shimmer.alpha(std::time::Instant::now());
+                    col = col.push(skeleton_grid(cols, alpha));
                 } else if let Some(err) = &self.load_error {
-                    col = col.push(text(err.clone()).size(13));
-                } else if self.items.is_empty() {
                     col = col.push(
-                        text("Nothing here yet — start mde-musicd to load your library.").size(13),
+                        text(err.clone())
+                            .size(13)
+                            .colr(carbon(route_pal.danger, 1.0)),
                     );
+                } else if self.items.is_empty() {
+                    // BEAUT-MUSIC — a tasteful Carbon empty state (hero glyph +
+                    // heading + body) instead of a bare one-liner.
+                    col = col.push(empty_state(
+                        "Nothing here yet",
+                        "Start mde-musicd to load your library across the mesh.",
+                    ));
                 } else {
                     let mut items = self.items.clone();
                     // MUSIC-ALBUMS-4 — apply the in-header filter (case-insensitive
@@ -2802,12 +3017,14 @@ impl State {
         // MOTION-FEEDBACK — the translate_y becomes a top-padding offset (the
         // established translate→padding glue), so the bar rises into place. Under
         // reduce-motion `slide_in` collapses to a pure crossfade (no rise).
-        let bar = container(bar).width(Length::Fill).padding(cosmic::iced::Padding {
-            top: rv.translate_y.max(0.0),
-            right: 0.0,
-            bottom: 0.0,
-            left: 0.0,
-        });
+        let bar = container(bar)
+            .width(Length::Fill)
+            .padding(cosmic::iced::Padding {
+                top: rv.translate_y.max(0.0),
+                right: 0.0,
+                bottom: 0.0,
+                left: 0.0,
+            });
         Some(bar.into())
     }
 
@@ -3153,6 +3370,70 @@ fn transport_button<'a>(
         .into()
 }
 
+/// BEAUT-MUSIC — a primary-fill CTA (the accent-on-text button used by the
+/// welcome card + empty-state actions) carrying the same shared motion
+/// vocabulary as [`transport_button`]: hover-**lift** (a brightened accent fill +
+/// a small drop-shadow) and press-**depress** (a darkened fill, elevation
+/// removed), with the movement-free tint depth from [`motion::feedback_tint_depth`]
+/// always reading. **Under reduce-motion the lift/depress transform is
+/// suppressed** so only the (movement-free) tint state change reads (Q32).
+fn primary_button<'a>(
+    label: impl Into<String>,
+    size: u16,
+    msg: Message,
+    reduce_motion: bool,
+) -> Element<'a, Message> {
+    let p = mde_theme::Palette::dark();
+    let accent = carbon(p.accent, 1.0);
+    // The WCAG-contrast text colour for the accent fill (white on the dark
+    // indigo accent), derived from the token via the crate's `contrast_text`
+    // helper — no hardcoded white literal (§4).
+    let (tr, tg, tb) = color::contrast_text(color::accent_rgb());
+    let on_accent = carbon(mde_theme::Rgba::rgb(tr, tg, tb), 1.0);
+    button(text(label.into()).size(size).colr(on_accent))
+        .on_press(msg)
+        .padding([8, 18])
+        .sty(move |_t, status| {
+            use cosmic::iced::widget::button::Status;
+            let hovered = matches!(status, Status::Hovered | Status::Pressed);
+            let pressed = matches!(status, Status::Pressed);
+            let lifted = motion::button_feedback(hovered, pressed, reduce_motion).translate_y < 0.0;
+            let depth = motion::feedback_tint_depth(hovered, pressed);
+            let fill = if pressed {
+                shade(accent, 1.0 - depth)
+            } else if hovered {
+                shade(accent, 1.0 + depth)
+            } else {
+                accent
+            };
+            let shadow = if lifted {
+                cosmic::iced::Shadow {
+                    color: carbon(p.background, 0.45),
+                    offset: cosmic::iced::Vector::new(0.0, motion::HOVER_RISE_PX),
+                    blur_radius: 4.0,
+                }
+            } else {
+                cosmic::iced::Shadow::default()
+            };
+            // A movement-free affordance ring (reduce-motion-safe): a subtle
+            // accent-tint outline that strengthens on hover/press, so the CTA's
+            // interactive state reads even when the lift transform is suppressed.
+            let ring_alpha = if hovered { 0.55 } else { 0.0 };
+            cosmic::iced::widget::button::Style {
+                background: Some(cosmic::iced::Background::Color(fill)),
+                text_color: on_accent,
+                border: cosmic::iced::Border {
+                    color: carbon(mde_theme::carbon::BLUE_40, ring_alpha),
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                shadow,
+                ..cosmic::iced::widget::button::Style::default()
+            }
+        })
+        .into()
+}
+
 /// The stable widget id for the AIR-14 search field (so Cmd-F can focus it).
 fn search_id() -> cosmic::iced::widget::Id {
     cosmic::iced::widget::Id::new("mde-music-search")
@@ -3164,18 +3445,27 @@ fn grid_scroll_id() -> cosmic::iced::widget::Id {
     cosmic::iced::widget::Id::new("mde-music-grid")
 }
 
-/// MUSIC-RESPONSIVE-6 — a grid of greyed Carbon skeleton tiles shown while a
-/// category loads, matching the real card geometry (160px col, 150px art tile +
-/// a short label bar) so navigation paints structure within one frame instead of
-/// a blank pane. Static (no shimmer — that's the MOTION epic); `cols` mirrors the
-/// real grid's width-adaptive column count.
-fn skeleton_grid(cols: usize) -> Element<'static, Message> {
+/// MUSIC-RESPONSIVE-6 / BEAUT-MUSIC — a grid of greyed Carbon skeleton tiles
+/// shown while a category loads, matching the real card geometry (160px col,
+/// 150px art tile + a short label bar) so navigation paints structure within one
+/// frame instead of a blank pane. The tiles **breathe** at `alpha`
+/// ([`motion::Shimmer::alpha`]) so a slow load reads as active; under
+/// reduce-motion that alpha is the static mid grey (no movement). `cols` mirrors
+/// the real grid's width-adaptive column count.
+fn skeleton_grid(cols: usize, alpha: f32) -> Element<'static, Message> {
     let cpal = mde_theme::Palette::dark();
-    let fill = carbon(cpal.raised, 1.0);
+    // The breathing fill: the muted-text token at the shimmer alpha, matching the
+    // shared `mde-theme` skeleton convention (panel_chrome::skeleton).
+    let fill = carbon(cpal.text_muted, alpha);
     let block = move |w: Length, h: f32| -> Element<'static, Message> {
         container(Space::new().width(w).height(Length::Fixed(h)))
             .style(move |_| cosmic::iced::widget::container::Style {
                 background: Some(fill.into()),
+                border: cosmic::iced::Border {
+                    color: cosmic::iced::Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 4.0.into(),
+                },
                 ..Default::default()
             })
             .into()
@@ -3201,6 +3491,57 @@ fn skeleton_grid(cols: usize) -> Element<'static, Message> {
     grid.into()
 }
 
+/// BEAUT-MUSIC — a single breathing Carbon skeleton bar at `alpha`, the
+/// building block for the Home dashboard's loading placeholder (hero counts /
+/// server line / chips). The muted-text token at the shimmer alpha, matching the
+/// shared `mde-theme` skeleton convention; under reduce-motion `alpha` is the
+/// static mid grey.
+fn skeleton_bar(w: f32, h: f32, alpha: f32) -> Element<'static, Message> {
+    let cpal = mde_theme::Palette::dark();
+    let fill = carbon(cpal.text_muted, alpha);
+    container(
+        Space::new()
+            .width(Length::Fixed(w))
+            .height(Length::Fixed(h)),
+    )
+    .style(move |_| cosmic::iced::widget::container::Style {
+        background: Some(fill.into()),
+        border: cosmic::iced::Border {
+            color: cosmic::iced::Color::TRANSPARENT,
+            width: 0.0,
+            radius: 4.0.into(),
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
+/// BEAUT-MUSIC — a tasteful Carbon empty state: a muted hero glyph over a
+/// heading + a one-line body, centered, instead of a bare one-liner. Mirrors the
+/// shared `mde_theme::EmptyState` data shape (icon · heading · body) — kept as a
+/// local renderer since mde-music builds `cosmic::Theme` widgets directly and the
+/// `mde-workbench` widget builder is shell-side. Every colour is an `mde-theme`
+/// token (§4).
+fn empty_state(heading: &str, body: &str) -> Element<'static, Message> {
+    let p = mde_theme::Palette::dark();
+    let muted = carbon(p.text_muted, 1.0);
+    container(
+        column![
+            text("\u{266A}").size(32).colr(muted),
+            Space::new().height(Length::Fixed(12.0)),
+            text(heading.to_string()).size(16).colr(carbon(p.text, 1.0)),
+            Space::new().height(Length::Fixed(6.0)),
+            text(body.to_string()).size(13).colr(muted),
+        ]
+        .spacing(0)
+        .align_x(cosmic::iced::Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding(48)
+    .center_x(Length::Fill)
+    .into()
+}
+
 /// Render one search section: a heading + a clickable row per item. An
 /// empty section renders nothing. `on_click` maps an item to its message.
 fn result_section<'a>(
@@ -3215,9 +3556,7 @@ fn result_section<'a>(
     }
     col = col.push(text(title).size(m.body));
     for item in items {
-        col = col.push(
-            button(text(item.label.clone()).size(m.body)).on_press(on_click(item)),
-        );
+        col = col.push(button(text(item.label.clone()).size(m.body)).on_press(on_click(item)));
     }
     col = col.push(Space::new().height(Length::Fixed(f32::from(m.header_gap))));
     col.into()
