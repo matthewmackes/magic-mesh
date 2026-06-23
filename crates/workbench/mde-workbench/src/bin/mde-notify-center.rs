@@ -14,6 +14,8 @@
 
 use std::collections::HashSet;
 
+mod motion;
+
 use cosmic::iced::platform_specific::runtime::wayland::layer_surface::SctkLayerSurfaceSettings;
 use cosmic::iced::platform_specific::shell::commands::layer_surface::{
     get_layer_surface, Anchor, KeyboardInteractivity, Layer,
@@ -23,6 +25,8 @@ use cosmic::iced::{window, Element, Length, Padding, Subscription, Task, Theme};
 use mackes_mesh_types::lighthouse::{self, Beacon};
 use mde_notify::{severity_token, AlertItem, AlertTail, Severity, Source};
 use mde_theme::Palette;
+
+use motion::{collapse_stacks, HubAnim, Stack};
 // World-2 (raw `cosmic::iced`) layer-shell daemon — use the iced widgets +
 // raw `.color()` directly; only borrow the Rgba→Color conversion shim (the
 // `.colr`/`.sty` extensions are world-1 `cosmic::Theme`-bound and don't apply).
@@ -39,6 +43,10 @@ const MAX_ROWS: usize = 500;
 /// tab animate identically). The subscription is only armed when at least one
 /// lighthouse is present, so an idle/empty Hub costs nothing.
 const BEAM_TICK_MS: u64 = 150;
+/// NOTIFY-HUB-2 — the new-item slide/blink animation tick cadence (~60 fps). The
+/// subscription is only armed while [`HubAnim::is_idle`] is `false`, so an idle
+/// Hub (no entrance in flight) costs nothing.
+const ANIM_TICK_MS: u64 = 16;
 
 /// Single-instance guard — dep-free pidfile so re-launching the Action Center
 /// (e.g. the applet bell pressed twice) never STACKS a second full-height
@@ -212,10 +220,21 @@ struct Center {
     /// was fetched for (so the art is re-fetched only when the track changes).
     now_art: Option<cosmic::iced::widget::image::Handle>,
     now_art_id: Option<String>,
+    /// NOTIFY-HUB-2 — the new-item motion state machine (slide-in + 2× severity
+    /// blink for fresh cards; slide-down for the items they push). Advanced by the
+    /// animation tick, which is only armed while it has an entrance in flight.
+    anim: HubAnim,
+    /// NOTIFY-HUB-2 — every item id ever surfaced, so a `Refresh` can tell which
+    /// rows are *new* (and thus animate in) vs. already on screen.
+    seen_ids: HashSet<String>,
+    /// NOTIFY-HUB-2 — collapsed same-source stacks the operator has expanded (by
+    /// [`Stack::key`]); a stack not in here renders folded with its count badge.
+    expanded_stacks: HashSet<String>,
 }
 
 impl Center {
     fn new() -> Self {
+        let reduce_motion = mde_theme::Preferences::load().a11y.reduce_motion;
         Self {
             items: Vec::new(),
             tail: AlertTail::default(),
@@ -228,6 +247,33 @@ impl Center {
             beam_step: 0,
             now_art: None,
             now_art_id: None,
+            anim: HubAnim::new(reduce_motion),
+            seen_ids: HashSet::new(),
+            expanded_stacks: HashSet::new(),
+        }
+    }
+
+    /// NOTIFY-HUB-2 — register any rows that are new since the last frame so they
+    /// animate in (slide + blink). On the very first poll the panel is just
+    /// opening, so the whole initial set is treated as already-present (no mass
+    /// strobe on open) — only adds *after* the first frame animate.
+    ///
+    /// `seen_ids` is afterward pruned to the ids still present in `items` so it
+    /// stays bounded by `MAX_ROWS` over a long uptime (no unbounded growth), and
+    /// so an id that was evicted by the `truncate` cap and later re-arrives
+    /// correctly animates in again as a fresh card.
+    fn note_new_items(&mut self, now: std::time::Instant) {
+        let first_frame = self.seen_ids.is_empty();
+        let fresh: Vec<String> = self
+            .items
+            .iter()
+            .filter(|i| !self.seen_ids.contains(&i.id))
+            .map(|i| i.id.clone())
+            .collect();
+        // Re-seed the seen-set to exactly the live rows (drops evicted ids).
+        self.seen_ids = self.items.iter().map(|i| i.id.clone()).collect();
+        if !first_frame && !fresh.is_empty() {
+            self.anim.on_new_items(fresh, now);
         }
     }
 }
@@ -238,6 +284,10 @@ enum Message {
     Refresh,
     /// Collapse/expand a source group by its label.
     ToggleGroup(String),
+    /// NOTIFY-HUB-2 — expand/collapse a same-source stack by its [`Stack::key`].
+    ToggleStack(String),
+    /// NOTIFY-HUB-2 — advance the new-item slide/blink animation one frame.
+    AnimTick,
     /// Acknowledge every alert.
     MarkAllRead,
     /// Drop every alert.
@@ -429,6 +479,14 @@ fn subscription(s: &Center) -> Subscription<Message> {
                 .map(|_| Message::BeamTick),
         );
     }
+    // NOTIFY-HUB-2 — only tick the new-item slide/blink while an entrance is
+    // actually in flight (MOTION-PERF-1: an idle Hub does no animation work).
+    if !s.anim.is_idle(std::time::Instant::now()) {
+        subs.push(
+            cosmic::iced::time::every(std::time::Duration::from_millis(ANIM_TICK_MS))
+                .map(|_| Message::AnimTick),
+        );
+    }
     Subscription::batch(subs)
 }
 
@@ -525,6 +583,19 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
             if cover != state.now_art_id {
                 state.now_art = cover.as_deref().and_then(fetch_cover_art);
                 state.now_art_id = cover;
+            }
+            // NOTIFY-HUB-2 — kick the slide-in + 2× severity blink for any rows
+            // that just appeared (skipped on the first poll so opening the panel
+            // doesn't strobe the whole backlog).
+            state.note_new_items(std::time::Instant::now());
+        }
+        Message::AnimTick => {
+            // Drop finished entrances; the subscription self-stops once idle.
+            state.anim.gc(std::time::Instant::now());
+        }
+        Message::ToggleStack(key) => {
+            if !state.expanded_stacks.remove(&key) {
+                state.expanded_stacks.insert(key);
             }
         }
         Message::BeamTick => {
@@ -673,6 +744,8 @@ fn now_ms() -> i64 {
 fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
     let p = hub_palette();
     let now = now_ms();
+    // NOTIFY-HUB-2 — single clock read for this frame's slide/blink sampling.
+    let anim_now = std::time::Instant::now();
 
     // Header: title + close on the top line, the bulk actions on their own
     // line below so a long "· N unread" title never collides with the buttons
@@ -746,8 +819,20 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
             });
             body = body.push(head);
             if !collapsed {
-                for (i, item) in group.iter().enumerate() {
-                    body = body.push(alert_row(item, i, now, p));
+                // NOTIFY-HUB-2 — fold same-source + same-title repeats into one
+                // card carrying a count (expandable), then render each stack with
+                // its slide/blink motion.
+                for (i, stack) in collapse_stacks(&group).into_iter().enumerate() {
+                    let expanded = state.expanded_stacks.contains(&stack.key);
+                    body = body.push(stack_card(&stack, expanded, i, now, anim_now, &state.anim, p));
+                    // Expanded stack: show the individual repeats beneath the head
+                    // (the head is items[0], so the rest start at index 1).
+                    if expanded && stack.is_stacked() {
+                        for (j, item) in stack.items.iter().enumerate().skip(1) {
+                            body =
+                                body.push(stack_child_row(item, i + j, now, anim_now, &state.anim, p));
+                        }
+                    }
                 }
             }
         }
@@ -1148,10 +1233,15 @@ fn quick_toggle<'a>(label: &'a str, on: bool, msg: Message, p: Palette) -> Eleme
     .into()
 }
 
-/// One alert row: severity glyph (colored) · age · host · title / body. Takes the
-/// item by value so the returned element owns its text (no borrow of the caller's
-/// loop-local group).
-fn alert_row(item: &AlertItem, idx: usize, now_ms: i64, p: Palette) -> Element<'static, Message> {
+/// The title/body column for one alert (severity glyph · title · age/host, plus
+/// an optional body line). `count_badge` adds a "×N" pill for a collapsed stack
+/// head. Shared by [`stack_card`] + [`stack_child_row`].
+fn alert_row_body(
+    item: &AlertItem,
+    now_ms: i64,
+    count_badge: Option<usize>,
+    p: Palette,
+) -> Element<'static, Message> {
     let sev_color = severity_token(item.severity, &p).into_cosmic_color();
     let title_color = if item.read { p.text_muted } else { p.text }.into_cosmic_color();
     let host = item.host.clone().unwrap_or_default();
@@ -1160,37 +1250,146 @@ fn alert_row(item: &AlertItem, idx: usize, now_ms: i64, p: Palette) -> Element<'
     } else {
         format!("{} · {host}", format_age(item.ts_unix_ms, now_ms))
     };
-    let head = row![
+    let mut head = row![
         text(severity_glyph(item.severity))
             .size(13)
             .color(sev_color),
         Space::new().width(Length::Fixed(8.0)),
         text(item.title.clone()).size(13).color(title_color),
-        Space::new().width(Length::Fill),
-        text(meta).size(11).color(p.text_muted.into_cosmic_color()),
     ]
     .align_y(cosmic::iced::Alignment::Center);
+    // NOTIFY-HUB-2 — a "×N" repeat badge in the severity colour when this card
+    // stands in for a collapsed same-source run.
+    if let Some(n) = count_badge {
+        if n > 1 {
+            head = head.push(Space::new().width(Length::Fixed(6.0)));
+            head = head.push(text(format!("\u{00d7}{n}")).size(11).color(sev_color));
+        }
+    }
+    head = head.push(Space::new().width(Length::Fill));
+    head = head.push(text(meta).size(11).color(p.text_muted.into_cosmic_color()));
     let mut col = column![head].spacing(2);
     if !item.body.is_empty() {
         let body: String = item.body.chars().take(200).collect();
         col = col.push(text(body).size(11).color(p.text_muted.into_cosmic_color()));
     }
-    // NOTIFY-HUB-1 — APPS-STYLE-2 zebra rows (the Application Menu's row idiom):
-    // alternate the row layer so the alert list reads as banded rows. The
-    // severity glyph already carries the severity colour.
-    let shade = if idx % 2 == 1 {
-        p.surface
-    } else {
-        p.background
+    col.into()
+}
+
+/// NOTIFY-HUB-2 — composite the severity-blink wash over a base zebra shade:
+/// alpha-over blend so the blink reads as a tint of the row, not an opaque flood.
+fn blink_shade(base: mde_theme::Rgba, blink: mde_theme::Rgba) -> cosmic::iced::Color {
+    let a = blink.a.clamp(0.0, 1.0);
+    let mix = |b: u8, t: u8| -> f32 {
+        let b = f32::from(b) / 255.0;
+        let t = f32::from(t) / 255.0;
+        b * (1.0 - a) + t * a
     };
-    container(col)
-        .padding(Padding::from([6u16, 8u16]))
+    cosmic::iced::Color {
+        r: mix(base.r, blink.r),
+        g: mix(base.g, blink.g),
+        b: mix(base.b, blink.b),
+        a: 1.0,
+    }
+}
+
+/// NOTIFY-HUB-2 — wrap an alert's body in its zebra-shaded card and apply the
+/// per-card motion: a slide offset (rendered as left/top padding so iced 0.13
+/// needs no transform widget) plus the severity-blink background wash. A card at
+/// rest renders exactly as the pre-animation zebra row.
+fn motioned_card(
+    inner: Element<'static, Message>,
+    idx: usize,
+    severity: Severity,
+    motion: motion::CardMotion,
+    p: Palette,
+) -> Element<'static, Message> {
+    // Zebra base layer (the Application Menu row idiom).
+    let base = if idx % 2 == 1 { p.surface } else { p.background };
+    // A settled card draws as the plain zebra row (no blink, no offset) — the
+    // common case once nothing is entering.
+    let (bg, left, top) = if motion.is_rest() {
+        (base.into_cosmic_color(), 0.0_f32, 0.0_f32)
+    } else {
+        // Severity-coloured blink wash over the base.
+        let blink = motion::blink_tint(severity, &p, motion.blink_alpha);
+        // Slide offsets → padding. left = still-to-the-right slide-in; top =
+        // still-below slide-down.
+        (
+            blink_shade(base, blink),
+            motion.translate_x.max(0.0),
+            motion.translate_y.max(0.0),
+        )
+    };
+    container(inner)
+        .padding(Padding {
+            top: top + 6.0,
+            right: 8.0,
+            bottom: 6.0,
+            left: left + 8.0,
+        })
         .width(Length::Fill)
         .style(move |_| container::Style {
-            background: Some(cosmic::iced::Background::Color(shade.into_cosmic_color())),
+            background: Some(cosmic::iced::Background::Color(bg)),
             ..Default::default()
         })
         .into()
+}
+
+/// NOTIFY-HUB-2 — a stack's head card: the representative alert with a count
+/// badge + the slide/blink entrance motion. When the stack folds repeats, the
+/// whole card is a toggle that expands/collapses the run.
+fn stack_card(
+    stack: &Stack,
+    expanded: bool,
+    idx: usize,
+    now_ms: i64,
+    anim_now: std::time::Instant,
+    anim: &HubAnim,
+    p: Palette,
+) -> Element<'static, Message> {
+    let m = anim.card_motion(&stack.head.id, anim_now);
+    let badge = stack.is_stacked().then_some(stack.count());
+    let mut body = alert_row_body(&stack.head, now_ms, badge, p);
+    // Expandable run → a flat full-width toggle wrapping the card body.
+    if stack.is_stacked() {
+        let caret = if expanded { "\u{25be}" } else { "\u{25b8}" }; // ▾ / ▸
+        let toggled = row![
+            text(caret).size(11).color(p.text_muted.into_cosmic_color()),
+            Space::new().width(Length::Fixed(6.0)),
+            body,
+        ]
+        .align_y(cosmic::iced::Alignment::Center);
+        body = button(toggled)
+            .on_press(Message::ToggleStack(stack.key.clone()))
+            .width(Length::Fill)
+            .padding(0)
+            .style(|_t, _s| cosmic::iced::widget::button::Style {
+                background: None,
+                ..Default::default()
+            })
+            .into();
+    }
+    motioned_card(body, idx, stack.head.severity, m, p)
+}
+
+/// NOTIFY-HUB-2 — one revealed repeat under an expanded stack head. Slightly
+/// indented; carries the same slide-down motion as the head's siblings (it is
+/// never itself the *new* item — the head is) so the reveal moves coherently.
+fn stack_child_row(
+    item: &AlertItem,
+    idx: usize,
+    now_ms: i64,
+    anim_now: std::time::Instant,
+    anim: &HubAnim,
+    p: Palette,
+) -> Element<'static, Message> {
+    let m = anim.card_motion(&item.id, anim_now);
+    let indented = row![
+        Space::new().width(Length::Fixed(16.0)),
+        alert_row_body(item, now_ms, None, p),
+    ];
+    motioned_card(indented.into(), idx, item.severity, m, p)
 }
 
 fn action_button<'a>(label: &'a str, msg: Message, p: Palette) -> Element<'a, Message> {
