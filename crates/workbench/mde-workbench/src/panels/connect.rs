@@ -314,6 +314,12 @@ pub struct ConnectPanel {
     /// state instead of the misleading "No paired devices" empty state.
     pub load_error: Option<String>,
     pub busy: bool,
+    /// MESH-CONNECT-DIALOG-1 — immediate-feedback line for an in-flight
+    /// per-row action. Set the instant the operator clicks Ring/Find/Unpair
+    /// ("Ringing Pixel-9…"), cleared when the reload resolves. Mirrors the
+    /// wifi panel's `status` idiom so a click never silently no-ops while the
+    /// Connect verb + roster reload are still on the Bus.
+    pub status: Option<String>,
 }
 
 /// Messages emitted by the Connected Devices panel. The
@@ -381,12 +387,16 @@ impl ConnectPanel {
                 self.peers = peers;
                 self.load_error = None;
                 self.busy = false;
+                // MESH-CONNECT-DIALOG-1 — the reload that closes a per-row
+                // action has landed: clear the pending feedback line.
+                self.status = None;
                 Task::none()
             }
             Message::Loaded(Err(e)) => {
                 // EFF-45 — Bus failure is an error, not an empty roster.
                 self.load_error = Some(e);
                 self.busy = false;
+                self.status = None;
                 Task::none()
             }
             Message::RefreshClicked => {
@@ -394,13 +404,31 @@ impl ConnectPanel {
                     return Task::none();
                 }
                 self.busy = true;
+                self.status = Some("Refreshing…".to_string());
                 Self::load()
             }
             Message::PeerAction { peer_id, action } => {
+                if self.busy {
+                    // Another action is already in flight — ignore the
+                    // re-click so we don't stack Bus RPCs (wifi idiom).
+                    return Task::none();
+                }
                 // AUD-3 — publish the Connect verb (delivered by the AUD-2
                 // outbound drainer), then reload the roster. Unpair removes a
                 // device; ring/find buzz it.
                 self.busy = true;
+                // MESH-CONNECT-DIALOG-1 — immediate feedback the instant the
+                // operator clicks, before the Bus round-trip resolves.
+                let name = self
+                    .peers
+                    .iter()
+                    .find(|p| p.id == peer_id)
+                    .map_or_else(|| peer_id.clone(), |p| p.name.clone());
+                self.status = Some(match action {
+                    PeerAction::Unpair => format!("Unpairing {name}…"),
+                    PeerAction::Ring => format!("Ringing {name}…"),
+                    PeerAction::Find => format!("Locating {name}…"),
+                });
                 let topic = match action {
                     PeerAction::Unpair => "action/connect/unpair",
                     PeerAction::Ring | PeerAction::Find => "action/connect/ring",
@@ -457,8 +485,11 @@ impl ConnectPanel {
             return self.empty_state_view(palette);
         }
         let mut col = column![].spacing(12);
+        // MESH-CONNECT-DIALOG-1 — a single in-flight action locks every row
+        // (one Bus RPC at a time), so pass `busy` down to disable the action
+        // buttons and `status` to surface the pending line on the active row.
         for peer in &self.peers {
-            col = col.push(peer_card_view(peer, palette));
+            col = col.push(peer_card_view(peer, palette, self.busy, self.status.as_deref()));
         }
         let body: Container<'_, crate::Message, cosmic::Theme> = container(col)
             .padding(Padding::from([16u16, 24u16]))
@@ -518,7 +549,12 @@ impl ConnectPanel {
 /// identity row + every section from `render_card(peer)` in the
 /// locked visibility order (Phone / Messaging / Share /
 /// CommonChrome).
-fn peer_card_view<'a>(peer: &'a ConnectPeer, palette: Palette) -> Element<'a, crate::Message> {
+fn peer_card_view<'a>(
+    peer: &'a ConnectPeer,
+    palette: Palette,
+    busy: bool,
+    status: Option<&str>,
+) -> Element<'a, crate::Message> {
     let kind_glyph = match peer.kind.as_str() {
         "phone" => Icon::Devices,
         "tablet" => Icon::Devices,
@@ -556,12 +592,71 @@ fn peer_card_view<'a>(peer: &'a ConnectPeer, palette: Palette) -> Element<'a, cr
     .align_y(cosmic::iced::Alignment::Center);
     let mut card = column![identity].spacing(8);
     for (_section, body_text) in render_card(peer) {
-        card = card.push(
-            text(body_text)
-                .size(12)
-                .colr(palette.text_muted.into_cosmic_color()),
-        );
+        // MESH-CONNECT-DIALOG-1 — the bracketed `[Ring] [Find] [Unpair]`
+        // tokens were never clickable; strip the action line and render the
+        // wired actions as real buttons below so a click actually fires
+        // (and shows pending state) instead of looking interactive but
+        // silently no-opping.
+        let info = strip_action_line(&body_text);
+        if !info.is_empty() {
+            card = card.push(
+                text(info)
+                    .size(12)
+                    .colr(palette.text_muted.into_cosmic_color()),
+            );
+        }
     }
+
+    // MESH-CONNECT-DIALOG-1 — real, runtime-reachable action buttons.
+    // While any action is in flight (`busy`) every button is disabled
+    // (on_press = None → the locked disabled chrome) for immediate
+    // feedback, and the pending status line + spinner surface on the row.
+    let action_msg = |action: PeerAction| {
+        (!busy).then(|| {
+            crate::Message::Connect(Message::PeerAction {
+                peer_id: peer.id.clone(),
+                action,
+            })
+        })
+    };
+    let mut actions = row![].spacing(8).align_y(cosmic::iced::Alignment::Center);
+    if peer.kind == "phone" {
+        actions = actions
+            .push(crate::controls::variant_button(
+                "Ring",
+                crate::controls::ButtonVariant::Secondary,
+                action_msg(PeerAction::Ring),
+                palette,
+            ))
+            .push(crate::controls::variant_button(
+                "Find",
+                crate::controls::ButtonVariant::Secondary,
+                action_msg(PeerAction::Find),
+                palette,
+            ));
+    }
+    actions = actions.push(crate::controls::variant_button(
+        "Unpair",
+        crate::controls::ButtonVariant::Ghost,
+        action_msg(PeerAction::Unpair),
+        palette,
+    ));
+    if busy {
+        // Pending treatment: spinner + the immediate-feedback line set in
+        // `update` ("Ringing Pixel-9…") so the row visibly responds.
+        actions = actions
+            .push(Space::new().width(Length::Fixed(4.0)))
+            .push(crate::controls::spinner(palette));
+        if let Some(line) = status {
+            actions = actions.push(
+                text(line.to_string())
+                    .size(12)
+                    .colr(palette.text_muted.into_cosmic_color()),
+            );
+        }
+    }
+    card = card.push(actions);
+
     container(card.padding(Padding::from([12u16, 16u16])))
         .width(Length::Fill)
         .sty(
@@ -581,6 +676,28 @@ fn peer_card_view<'a>(peer: &'a ConnectPeer, palette: Palette) -> Element<'a, cr
             },
         )
         .into()
+}
+
+/// MESH-CONNECT-DIALOG-1 — drop the legacy bracketed action line(s)
+/// (`[Ring] [Find]`, `[Mirror clipboard] [Mirror notifications] [Unpair]`)
+/// from a `render_card` text fragment so only the informational lines
+/// (battery / now-playing / fingerprint / last-seen) render as text; the
+/// actions are drawn as real buttons by `peer_card_view`. A line counts as
+/// an action line when, with whitespace removed, it is entirely `[...]`
+/// bracket tokens.
+fn strip_action_line(fragment: &str) -> String {
+    fragment
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !(trimmed.starts_with('[')
+                && trimmed.ends_with(']')
+                && trimmed.replace(char::is_whitespace, "").chars().all(|c| {
+                    c == '[' || c == ']' || c.is_alphanumeric()
+                }))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Render the first 8 hex bytes of a colon-separated
@@ -688,5 +805,81 @@ mod view_tests {
     fn short_fingerprint_takes_first_eight_octets() {
         let full = "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55";
         assert_eq!(short_fingerprint(full), "AA:BB:CC:DD:EE:FF:00:11");
+    }
+
+    #[test]
+    fn strip_action_line_drops_bracket_only_lines_keeps_info() {
+        // MESH-CONNECT-DIALOG-1 — the bracketed `[Ring] [Find]` action line
+        // is removed (it's now a real button), the info lines are kept.
+        let phone = render_phone_section(&ConnectPeer {
+            kind: "phone".into(),
+            battery_pct: Some(50),
+            now_playing: Some("song".into()),
+            ..Default::default()
+        });
+        let info = strip_action_line(&phone);
+        assert!(info.contains("Battery: 50%"));
+        assert!(info.contains("Now playing: song"));
+        assert!(!info.contains('['), "action brackets must be stripped: {info}");
+
+        // CommonChrome: the `[Mirror…] [Unpair]` line goes; fingerprint stays.
+        let chrome = render_common_chrome(&ConnectPeer {
+            fingerprint: "AB:CD".into(),
+            last_seen_at: 0,
+            ..Default::default()
+        });
+        let info = strip_action_line(&chrome);
+        assert!(info.contains("Fingerprint: AB:CD"));
+        assert!(info.contains("Never reached"));
+        assert!(!info.contains('['), "action brackets must be stripped: {info}");
+    }
+
+    #[test]
+    fn peer_action_sets_pending_status_and_busy() {
+        // MESH-CONNECT-DIALOG-1 — clicking an action immediately flips busy
+        // and sets a feedback line BEFORE the Bus round-trip resolves, so the
+        // click never looks like a no-op.
+        let mut panel = ConnectPanel::new();
+        panel.peers = vec![ConnectPeer {
+            id: "p1".into(),
+            name: "Pixel-9".into(),
+            kind: "phone".into(),
+            ..Default::default()
+        }];
+        let _ = panel.update(Message::PeerAction {
+            peer_id: "p1".into(),
+            action: PeerAction::Ring,
+        });
+        assert!(panel.busy);
+        assert_eq!(panel.status.as_deref(), Some("Ringing Pixel-9…"));
+
+        // A second click while busy is ignored (no stacked RPCs).
+        let mut p2 = panel.clone();
+        let _ = p2.update(Message::PeerAction {
+            peer_id: "p1".into(),
+            action: PeerAction::Unpair,
+        });
+        assert_eq!(p2.status.as_deref(), Some("Ringing Pixel-9…"));
+
+        // The reload that resolves the action clears busy + the pending line.
+        let _ = panel.update(Message::Loaded(Ok(vec![])));
+        assert!(!panel.busy);
+        assert!(panel.status.is_none());
+    }
+
+    #[test]
+    fn busy_panel_card_renders_without_panic() {
+        // The pending treatment (spinner + status line + disabled buttons)
+        // must build a valid Element.
+        let mut panel = ConnectPanel::new();
+        panel.peers = vec![ConnectPeer {
+            id: "p1".into(),
+            name: "Pixel-9".into(),
+            kind: "phone".into(),
+            ..Default::default()
+        }];
+        panel.busy = true;
+        panel.status = Some("Ringing Pixel-9…".into());
+        let _ = panel.view();
     }
 }
