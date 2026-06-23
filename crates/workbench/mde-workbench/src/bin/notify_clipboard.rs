@@ -196,6 +196,35 @@ mod tests {
         assert_eq!(rows[1].source, "n2");
     }
 
+    /// CLIP-VIEW-1 producer↔consumer contract lock (consumer end). This is the
+    /// EXACT compact envelope the daemon's `mackesd::ipc::clipboard::build_reply`
+    /// emits for `action/clipboard/list` — `serde_json::json!({"ok":true,
+    /// "entries": h.entries})` over a `ClipEntry{id,text,source,time,pinned}`.
+    /// If the worker's `ClipEntry` is renamed/reshaped, this row decode must
+    /// break here too (the sibling lock lives in mackesd's
+    /// `ipc::clipboard::tests::list_reply_shape_is_the_viewer_contract`), so the
+    /// Hub can never silently render empty against a drifted producer.
+    #[test]
+    fn parse_list_reply_matches_the_exact_daemon_envelope() {
+        // Byte-for-byte the responder's compact output (no pretty whitespace),
+        // every field present, pinned carried explicitly.
+        let body = r#"{"ok":true,"entries":[{"id":"a1b2c3d4e5f60718","text":"hello\nworld","source":"nodeA","time":"2026-06-23T15:04:05.123456789+00:00","pinned":true}]}"#;
+        let rows = parse_list_reply(body);
+        assert_eq!(rows.len(), 1, "the daemon envelope decodes to one row");
+        let r = &rows[0];
+        assert_eq!(r.id, "a1b2c3d4e5f60718");
+        assert_eq!(r.text, "hello\nworld", "verbatim multi-line text preserved");
+        assert_eq!(r.source, "nodeA");
+        assert_eq!(r.time, "2026-06-23T15:04:05.123456789+00:00");
+        assert!(r.pinned);
+        // And the nanosecond-fraction RFC3339 stamp the daemon's chrono emits
+        // parses (so the row's "from <node> · <age>" age is real, not "0s").
+        assert!(
+            rfc3339_to_epoch(&r.time).is_some(),
+            "the daemon's chrono to_rfc3339() stamp must parse"
+        );
+    }
+
     #[test]
     fn parse_list_reply_error_or_garbage_is_empty_not_panic() {
         assert!(parse_list_reply(r#"{"error":"boom"}"#).is_empty());
