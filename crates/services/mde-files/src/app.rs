@@ -176,6 +176,14 @@ pub enum Message {
     ArchiveConflictFile(String),
     /// MESHFS-11.1 — archive operation completed.
     ConflictArchived(Result<(), String>),
+    /// MOTION-FEEDBACK — cursor entered a file row/tile (key from
+    /// [`crate::widgets::row_hover_key`]). Arms its hover-lift tween.
+    RowHoverEnter(String),
+    /// MOTION-FEEDBACK — cursor left a file row/tile. Settles the hover-lift back.
+    RowHoverExit(String),
+    /// MOTION-FEEDBACK — one animation frame: advance/GC the [`Animator`] and the
+    /// reveal. Emitted by the tick subscription only while a tween is in flight.
+    AnimTick,
 }
 
 /// MESHFS-8.1 — one recoverable file from the LizardFS `.trash` directory.
@@ -313,6 +321,23 @@ pub struct MdeFiles {
     pub resolve_dialog: Option<(String, String)>,
     /// MESHFS-11.1 — error from the most recent archive operation.
     pub conflict_error: Option<String>,
+    /// MOTION-FEEDBACK — the shared `mde_theme::animation` registry driving the
+    /// file-row/tile hover-lift + selection-accent tweens off ONE subscription
+    /// tick. Idle at rest (no tweens) ⇒ the tick subscription isn't created.
+    pub anim: mde_theme::animation::Animator,
+    /// MOTION-FEEDBACK — the hover key ([`crate::widgets::row_hover_key`]) of the
+    /// currently-hovered row, if any.
+    pub hovered_row: Option<String>,
+    /// MOTION-FEEDBACK — the hover key of the row whose hover is settling back
+    /// (exit in flight). Cleared once its tween completes.
+    pub releasing_row: Option<String>,
+    /// MOTION-FEEDBACK — when the active listing was (re)loaded — the staggered
+    /// reveal origin. Set on every navigation (view/path change); cleared once
+    /// the reveal has fully settled so a settled listing costs no per-row work.
+    pub reveal_origin: Option<std::time::Instant>,
+    /// MOTION-FEEDBACK — the signature of the listing the current `reveal_origin`
+    /// belongs to (view + path + mesh path). A change ⇒ a fresh reveal.
+    pub listing_sig: String,
 }
 
 /// v2.0.0 Phase 5.1 — pane currently receiving keyboard input.
@@ -386,6 +411,11 @@ impl Default for MdeFiles {
             meshfs_healing: false,
             resolve_dialog: None,
             conflict_error: None,
+            anim: mde_theme::animation::Animator::new(),
+            hovered_row: None,
+            releasing_row: None,
+            reveal_origin: None,
+            listing_sig: String::new(),
         }
     }
 }
@@ -630,14 +660,17 @@ impl MdeFiles {
                 self.selection.click(key);
                 // Phase 1.4 — details panel tracks focus.
                 self.details.set_target(self.selection.focused());
+                self.arm_selection_accents();
             }
             Message::RowCtrlClick(key) => {
                 self.selection.ctrl_click(key);
                 self.details.set_target(self.selection.focused());
+                self.arm_selection_accents();
             }
             Message::RowShiftClick(key, rows) => {
                 self.selection.shift_click(key, &rows);
                 self.details.set_target(self.selection.focused());
+                self.arm_selection_accents();
             }
             Message::FocusNext(rows) => {
                 self.selection.focus_next(&rows);
@@ -647,7 +680,10 @@ impl MdeFiles {
                 self.selection.focus_prev(&rows);
                 self.details.set_target(self.selection.focused());
             }
-            Message::ToggleFocused => self.selection.toggle_focused(),
+            Message::ToggleFocused => {
+                self.selection.toggle_focused();
+                self.arm_selection_accents();
+            }
             Message::ClearSelection => {
                 self.selection.clear();
                 self.details.set_target(None);
@@ -840,6 +876,44 @@ impl MdeFiles {
                 Ok(()) => self.conflict_error = None,
                 Err(e) => self.conflict_error = Some(e),
             },
+            // MOTION-FEEDBACK — hover lift on a file row/tile: arm the eased
+            // rise, cancel any in-flight release of the same row.
+            Message::RowHoverEnter(key) => {
+                if self.releasing_row.as_deref() == Some(&key) {
+                    self.releasing_row = None;
+                }
+                if self.hovered_row.as_deref() != Some(&key) {
+                    self.hovered_row = Some(key.clone());
+                    self.start_row_anim(key);
+                }
+            }
+            // MOTION-FEEDBACK — settle the lift back (ignore a stale exit after a
+            // fast re-enter onto a different row).
+            Message::RowHoverExit(key) => {
+                if self.hovered_row.as_deref() == Some(&key) {
+                    self.hovered_row = None;
+                    self.releasing_row = Some(key.clone());
+                    self.start_row_anim(key);
+                }
+            }
+            // MOTION-FEEDBACK — one frame: GC settled tweens; clear a finished
+            // release marker so it isn't re-eased; drop the reveal origin once the
+            // whole staggered reveal has elapsed (so the listing goes fully idle).
+            Message::AnimTick => {
+                let now = std::time::Instant::now();
+                self.anim.gc(now);
+                if let Some(key) = self.releasing_row.clone() {
+                    if !self.anim.is_animating(&key, now) {
+                        self.releasing_row = None;
+                    }
+                }
+                if self.reveal_origin.is_some_and(|o| now >= o + Self::reveal_window()) {
+                    self.reveal_origin = None;
+                }
+                // An AnimTick mutates only animation state — skip the snapshot
+                // refresh + tab sync the data messages need.
+                return Task::none();
+            }
         }
         self.refresh_snapshot();
         // E10.5 — keep the active tab's stored nav state in lock-step with the
@@ -983,6 +1057,106 @@ impl MdeFiles {
         if matches!(self.view, View::CloudDevices) {
             self.cloud_files = self.backend.list("cloud:");
         }
+        // MOTION-FEEDBACK — arm a fresh staggered reveal whenever the active
+        // listing changed (navigated to a new view / dir / mesh path).
+        self.arm_reveal_if_changed();
+    }
+
+    /// MOTION-FEEDBACK — the listing identity (view + local path + mesh path). A
+    /// change between two `refresh_snapshot`s means a directory's entries (re)loaded.
+    fn current_listing_sig(&self) -> String {
+        format!(
+            "{:?}|{}|{}",
+            self.view,
+            self.local_path,
+            self.mesh_home_path.join("/")
+        )
+    }
+
+    /// MOTION-FEEDBACK — if the active listing changed since the last render, set
+    /// a fresh `reveal_origin` so the new entries stagger in (≤8 cap).
+    fn arm_reveal_if_changed(&mut self) {
+        let sig = self.current_listing_sig();
+        if sig != self.listing_sig {
+            self.listing_sig = sig;
+            self.reveal_origin = Some(std::time::Instant::now());
+        }
+    }
+
+    /// MOTION-FEEDBACK — the longest the whole staggered reveal can run: the
+    /// capped stagger delay (≤8 items) plus one item's reveal duration. After
+    /// this the reveal is done and `reveal_origin` is cleared so the listing idles.
+    fn reveal_window() -> std::time::Duration {
+        use mde_theme::motion::list;
+        let max_delay = (list::STAGGER_CAP as u64 - 1) * u64::from(list::STAGGER_STEP_MS);
+        std::time::Duration::from_millis(max_delay + u64::from(list::STAGGER_REVEAL_MS))
+    }
+
+    /// MOTION-FEEDBACK — start (or restart) the hover tween under `key` from now,
+    /// using the Carbon `hover` preset resolved against reduce-motion. Routing all
+    /// row tweens through here keeps the reduce-motion contract in one place and
+    /// also covers the selection-accent tween (same preset family).
+    fn start_row_anim(&mut self, key: impl Into<String>) {
+        let now = std::time::Instant::now();
+        self.anim.gc(now);
+        self.anim
+            .start(key, now, mde_theme::motion::Motion::hover(), self.reduce_motion());
+    }
+
+    /// MOTION-FEEDBACK — true when reduce-motion is active (instant state changes,
+    /// no movement). Reads the loaded accessibility prefs.
+    fn reduce_motion(&self) -> bool {
+        self.a11y.motion.is_reduced()
+    }
+
+    /// MOTION-FEEDBACK — arm the selection-accent tween for every currently-
+    /// selected row so the indigo accent eases in (the row keeps its accent under
+    /// reduce-motion — the tween simply settles in ≤80 ms). Called after any
+    /// selection-changing message. No-op under reduce-motion (the accent is shown
+    /// instantly by [`crate::widgets::RowMotionCtx::for_row`] without a tween).
+    fn arm_selection_accents(&mut self) {
+        if self.reduce_motion() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.anim.gc(now);
+        let preset = mde_theme::motion::Motion::hover();
+        let keys: Vec<String> = self
+            .selection
+            .iter_sorted()
+            .iter()
+            .map(|name| crate::widgets::accent_key(name))
+            .collect();
+        for key in keys {
+            // Only (re)start an accent that isn't already running, so dragging the
+            // focus across an existing selection doesn't restart settled accents.
+            if !self.anim.is_animating(&key, now) {
+                self.anim.start(key, now, preset, false);
+            }
+        }
+    }
+
+    /// MOTION-FEEDBACK — true while any file-row tween OR the staggered reveal is
+    /// still in flight, so the subscription ticks only while there's motion.
+    fn animating(&self) -> bool {
+        let now = std::time::Instant::now();
+        !self.anim.is_idle(now)
+            || self
+                .reveal_origin
+                .is_some_and(|o| now < o + Self::reveal_window())
+    }
+
+    /// MOTION-FEEDBACK — build the read-only [`RowMotionCtx`] the file views pass
+    /// down so every row derives its motion from this one animator + frame.
+    fn row_motion_ctx(&self) -> crate::widgets::RowMotionCtx<'_> {
+        crate::widgets::RowMotionCtx {
+            anim: &self.anim,
+            hovered: self.hovered_row.as_deref(),
+            releasing: self.releasing_row.as_deref(),
+            reveal_origin: self.reveal_origin,
+            now: std::time::Instant::now(),
+            reduce_motion: self.reduce_motion(),
+        }
     }
 
     /// Top-level view tree.
@@ -990,10 +1164,13 @@ impl MdeFiles {
         let crumbs = breadcrumbs_for_with_path(&self.view, &self.mesh_home_path);
         let snap = &self.snapshot;
 
+        // MOTION-FEEDBACK — one shared motion context for every file view this
+        // frame (hover + selection accent + staggered reveal off one animator).
+        let rm = self.row_motion_ctx();
         let main_body: Element<'_, Message> = match &self.view {
             View::MeshOverview => views::mesh_overview(snap),
-            View::Inbox => views::inbox(snap, self.layout, &self.selection),
-            View::Outbox => views::outbox(snap, self.layout, &self.selection),
+            View::Inbox => views::inbox(snap, self.layout, &self.selection, rm),
+            View::Outbox => views::outbox(snap, self.layout, &self.selection, rm),
             View::Peer(id) => {
                 if let Some(p) = snap.peers.iter().find(|p| &p.id == id) {
                     views::peer_folder(
@@ -1003,17 +1180,19 @@ impl MdeFiles {
                         &self.search,
                         self.layout,
                         &self.selection,
+                        rm,
                     )
                 } else {
                     empty_state("no peer").into()
                 }
             }
-            View::Downloads => views::downloads(snap, self.layout, &self.selection),
+            View::Downloads => views::downloads(snap, self.layout, &self.selection, rm),
             View::Local => views::local_browser(
                 &self.local_files,
                 &self.local_path,
                 self.layout,
                 &self.selection,
+                rm,
             ),
             View::MeshHome => views::mesh_home(snap),
             View::MeshHomeChild(slug) => views::mesh_home_child(
@@ -1023,13 +1202,14 @@ impl MdeFiles {
                 self.layout,
                 &self.mesh_home_path,
                 &self.selection,
+                rm,
             ),
             View::MeshUndelete => views::mesh_undelete(
                 &self.trash_items,
                 self.trash_busy,
                 self.trash_error.as_deref(),
             ),
-            View::CloudDevices => views::cloud_devices(&self.cloud_files, &self.selection),
+            View::CloudDevices => views::cloud_devices(&self.cloud_files, &self.selection, rm),
             View::Network => {
                 views::network(&self.net_host, &self.net_shares, self.net_status.as_deref())
             }
@@ -1151,7 +1331,17 @@ impl Application for MdeFiles {
         // `refresh_snapshot`, which now reconnects). No user interaction needed.
         let reconnect =
             cosmic::iced::time::every(std::time::Duration::from_secs(5)).map(|_| Message::Refresh);
-        cosmic::iced::Subscription::batch([Self::key_subscription(), reconnect])
+        // MOTION-FEEDBACK — a ~60 fps animation clock, but ONLY while a tween or
+        // the staggered reveal is in flight (MOTION-PERF-1 — a settled listing
+        // costs no idle wakeups). At rest `animating()` is false and this tick
+        // isn't created.
+        if self.animating() {
+            let tick = cosmic::iced::time::every(std::time::Duration::from_millis(16))
+                .map(|_| Message::AnimTick);
+            cosmic::iced::Subscription::batch([Self::key_subscription(), reconnect, tick])
+        } else {
+            cosmic::iced::Subscription::batch([Self::key_subscription(), reconnect])
+        }
     }
 
     fn update(&mut self, message: Self::Message) -> cosmic::app::Task<Self::Message> {
