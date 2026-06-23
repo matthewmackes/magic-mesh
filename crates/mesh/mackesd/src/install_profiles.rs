@@ -71,10 +71,18 @@ pub fn load_profiles(workgroup_root: &Path) -> Vec<InstallProfile> {
     by_name.into_values().collect()
 }
 
-/// The shipped profiles — one per deployment role (§5). Server and
-/// Workstation are execution-capable; the headless Server omits the
-/// desktop; the Workstation is the Cosmic desktop. All auto-join so a
-/// USB/ISO install enrols hands-free (W60).
+/// The shipped profiles — the three deployment roles (§5) plus the
+/// XCP-ng `hypervisor` profile (DATACENTER-17).
+///
+/// Server and Workstation are execution-capable; the headless Server
+/// omits the desktop; the Workstation is the Cosmic desktop. The
+/// `hypervisor` profile pins the Server tier (PeerRole flattens to
+/// Host/Peer, so the dom0 is surfaced via the `hypervisor` capability
+/// tag, not a 4th cert role) and joins as a static-Nebula member. The
+/// role profiles auto-join so a USB/ISO install enrols hands-free (W60);
+/// the hypervisor is provisioned by `onboard-xcp-host.sh` (static
+/// `nebula` on a locked-down dom0), so it does not bake the firstboot
+/// auto-join slot.
 #[must_use]
 pub fn core_pack() -> Vec<InstallProfile> {
     vec![
@@ -107,6 +115,19 @@ pub fn core_pack() -> Vec<InstallProfile> {
             ks_fragments: vec!["role-workstation".into(), "cosmic-desktop".into()],
             auto_join: true,
         },
+        InstallProfile {
+            name: "hypervisor".into(),
+            description: "XCP-ng dom0 joined as a static-Nebula mesh member".into(),
+            // PeerRole flattens to Host/Peer (open-mesh), so a dom0 maps to
+            // the Server/Host tier; `hypervisor` is the capability tag that
+            // makes it first-class in the roster (DATACENTER-17).
+            role: "server".into(),
+            tags: BTreeSet::from(["hypervisor".to_string()]),
+            ks_fragments: vec!["role-hypervisor".into(), "nebula-static".into()],
+            // Joined via onboard-xcp-host.sh on a locked-down dom0 (static
+            // `nebula`, not the Fedora firstboot auto-join flow).
+            auto_join: false,
+        },
     ]
 }
 
@@ -122,8 +143,11 @@ pub fn core_pack() -> Vec<InstallProfile> {
 /// Workstation).
 pub const VALID_ROLES: [&str; 3] = ["lighthouse", "server", "workstation"];
 
-/// The capability tags a profile may carry (W82).
-pub const VALID_TAGS: [&str; 3] = ["hop", "execution", "headless"];
+/// The capability tags a profile may carry (W82; `hypervisor` added by
+/// DATACENTER-17 for the XCP-ng dom0 profile). Kept in lock-step with
+/// [`mackes_mesh_types::cap_tags::CapabilityTag`] — a profile tag that the
+/// typed vocabulary can't parse would never gate.
+pub const VALID_TAGS: [&str; 4] = ["hop", "execution", "headless", "hypervisor"];
 
 /// Why a profile write was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,13 +246,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn core_pack_has_one_profile_per_role() {
+    fn core_pack_covers_every_deployment_role() {
         let pack = core_pack();
         let roles: BTreeSet<&str> = pack.iter().map(|p| p.role.as_str()).collect();
+        // hypervisor pins the server tier, so the role set is still the §5 three.
         assert_eq!(
             roles,
             BTreeSet::from(["lighthouse", "server", "workstation"])
         );
+        // Every core profile validates (role + tags + name).
+        for p in &pack {
+            validate_profile(p).unwrap_or_else(|e| panic!("core profile {} invalid: {e}", p.name));
+        }
+    }
+
+    #[test]
+    fn hypervisor_profile_is_a_server_tier_static_nebula_member() {
+        let pack = core_pack();
+        let hv = pack
+            .iter()
+            .find(|p| p.name == "hypervisor")
+            .expect("DATACENTER-17 — hypervisor profile present");
+        // Server tier + the hypervisor capability tag (not a 4th cert role).
+        assert_eq!(hv.role, "server");
+        assert!(hv.tags.contains("hypervisor"));
+        // Static-Nebula join on a locked-down dom0: no firstboot auto-join.
+        assert!(!hv.auto_join);
+        assert_eq!(hv.ks_fragments, vec!["role-hypervisor", "nebula-static"]);
+        // The tag round-trips through the typed vocabulary the writer gates on.
+        assert_eq!(
+            mackes_mesh_types::cap_tags::CapabilityTag::parse("hypervisor"),
+            Some(mackes_mesh_types::cap_tags::CapabilityTag::Hypervisor),
+        );
+    }
+
+    #[test]
+    fn valid_tags_match_the_typed_vocabulary() {
+        // A profile tag the typed CapabilityTag can't parse would validate
+        // here but never gate at runtime; keep the two lists in lock-step.
+        let typed: Vec<&str> = mackes_mesh_types::cap_tags::CapabilityTag::ALL
+            .iter()
+            .map(|t| t.as_str())
+            .collect();
+        assert_eq!(VALID_TAGS.to_vec(), typed);
     }
 
     #[test]
@@ -253,14 +313,14 @@ mod tests {
         let server = profiles.iter().find(|p| p.name == "server").unwrap();
         assert_eq!(server.description, "custom");
         assert!(!server.auto_join);
-        // Still exactly three (override, not duplicate).
-        assert_eq!(profiles.len(), 3);
+        // Still exactly the core count (override, not duplicate).
+        assert_eq!(profiles.len(), core_pack().len());
     }
 
     #[test]
     fn load_profiles_includes_core_pack_when_dir_absent() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(load_profiles(tmp.path()).len(), 3);
+        assert_eq!(load_profiles(tmp.path()).len(), core_pack().len());
     }
 
     // ---- W56 write side -----------------------------------------
@@ -285,7 +345,7 @@ mod tests {
             .find(|x| x.name == "edge-relay")
             .expect("loaded");
         assert_eq!(got, &p);
-        assert_eq!(loaded.len(), 4);
+        assert_eq!(loaded.len(), core_pack().len() + 1);
     }
 
     #[test]
@@ -298,7 +358,7 @@ mod tests {
         p.description = "house style".into();
         write_profile(&p, tmp.path()).expect("write");
         let loaded = load_profiles(tmp.path());
-        assert_eq!(loaded.len(), 3, "override, not duplicate");
+        assert_eq!(loaded.len(), core_pack().len(), "override, not duplicate");
         assert_eq!(
             loaded
                 .iter()
@@ -361,6 +421,6 @@ mod tests {
         );
         // A core profile has no TOML → delete is a clean no-op (false).
         assert!(!delete_profile("lighthouse", tmp.path()).unwrap());
-        assert_eq!(load_profiles(tmp.path()).len(), 3);
+        assert_eq!(load_profiles(tmp.path()).len(), core_pack().len());
     }
 }

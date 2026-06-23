@@ -19,6 +19,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use mackes_mesh_types::cap_tags::CapabilityTag;
 use mackes_xcp::{HostCapacity, HostTarget, Hypervisor, XeSsh};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -45,6 +46,13 @@ pub fn is_xcp_dom0() -> bool {
 
 /// Build the `compute/xcp-host/<node>` capacity document from a probe. Pure so
 /// the published shape is testable without a live host. `now_ms` stamps it.
+///
+/// The doc self-asserts the `hypervisor` capability-tag token (DATACENTER-17):
+/// a dom0 publishing capacity *is* a Hypervisor, so the spawn surfaces and the
+/// Node-roles roster read the same first-class role off the live advert that
+/// the tag model carries. The token is taken from the typed
+/// [`CapabilityTag::Hypervisor`] so it can never drift from the writer's
+/// vocabulary.
 #[must_use]
 pub fn xcp_host_doc(
     node_id: &str,
@@ -55,6 +63,7 @@ pub fn xcp_host_doc(
     json!({
         "ok": true,
         "kind": "xcp-host",
+        "role": CapabilityTag::Hypervisor.as_str(),
         "node_id": node_id,
         "hostname": hostname,
         "ts_ms": now_ms,
@@ -155,6 +164,10 @@ mod tests {
         };
         let v = xcp_host_doc("node-7", "xcp-1", &cap, 42);
         assert_eq!(v["kind"], "xcp-host");
+        // DATACENTER-17 — the dom0 self-asserts the hypervisor role, taken
+        // from the typed cap-tag so it stays in lock-step with the vocabulary.
+        assert_eq!(v["role"], "hypervisor");
+        assert_eq!(v["role"], CapabilityTag::Hypervisor.as_str());
         assert_eq!(v["node_id"], "node-7");
         assert_eq!(v["hostname"], "xcp-1");
         assert_eq!(v["ts_ms"], 42);

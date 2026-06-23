@@ -5,17 +5,22 @@
 //! enrolled operator surface may set (W83) and that decide what duty
 //! the node accepts (W84 — tags GATE, they don't merely prefer):
 //!
-//! - `hop`       — eligible to load relay / subnet-advertise / exit
+//! - `hop`        — eligible to load relay / subnet-advertise / exit
 //!   config (the Network plane).
-//! - `execution` — eligible to accept job bundles beyond
+//! - `execution`  — eligible to accept job bundles beyond
 //!   self-targeted ones (the Controller plane).
-//! - `headless`  — GUI app-surface units are disabled here; the
+//! - `headless`   — GUI app-surface units are disabled here; the
 //!   agent runs fully.
+//! - `hypervisor` — an XCP-ng dom0 joined as a static-Nebula member
+//!   that advertises compute capacity (DATACENTER-17). Orthogonal to
+//!   the §5 role: a `hypervisor` pins the Server tier (PeerRole flattens
+//!   to Host/Peer, so it is surfaced as a capability tag, not a 4th cert
+//!   role) and the `xcp_host` worker self-gates on the dom0 marker.
 //!
 //! Stored per-target on the replicated volume at
 //! `<root>/node-tags/<hostname>.json` (any node writes any target's
 //! file; the target reads its own to gate). v1 vocabulary is exactly
-//! these three (builder/mirror deferred — W82).
+//! these four (builder/mirror deferred — W82).
 
 use std::collections::BTreeSet;
 use std::io;
@@ -33,9 +38,24 @@ pub enum CapabilityTag {
     Execution,
     /// GUI app-surface units are disabled; agent runs fully headless.
     Headless,
+    /// XCP-ng dom0 joined as a static-Nebula member advertising compute
+    /// capacity (DATACENTER-17). Pins the Server tier; the `xcp_host`
+    /// worker self-gates on the dom0 marker.
+    Hypervisor,
 }
 
 impl CapabilityTag {
+    /// Every v1 capability tag, in wire order — the single source of truth
+    /// any surface should iterate (the fleet `tags --json` census, profile
+    /// validation, the Node-roles editor) instead of hand-maintaining a
+    /// parallel list that silently drops a tag (DATACENTER-17 added a 4th).
+    pub const ALL: [CapabilityTag; 4] = [
+        CapabilityTag::Hop,
+        CapabilityTag::Execution,
+        CapabilityTag::Headless,
+        CapabilityTag::Hypervisor,
+    ];
+
     /// Stable wire token.
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -43,6 +63,7 @@ impl CapabilityTag {
             CapabilityTag::Hop => "hop",
             CapabilityTag::Execution => "execution",
             CapabilityTag::Headless => "headless",
+            CapabilityTag::Hypervisor => "hypervisor",
         }
     }
 
@@ -54,6 +75,7 @@ impl CapabilityTag {
             "hop" => Some(CapabilityTag::Hop),
             "execution" => Some(CapabilityTag::Execution),
             "headless" => Some(CapabilityTag::Headless),
+            "hypervisor" => Some(CapabilityTag::Hypervisor),
             _ => None,
         }
     }
@@ -118,11 +140,28 @@ mod tests {
             CapabilityTag::Hop,
             CapabilityTag::Execution,
             CapabilityTag::Headless,
+            CapabilityTag::Hypervisor,
         ] {
             assert_eq!(CapabilityTag::parse(t.as_str()), Some(t));
         }
+        assert_eq!(
+            CapabilityTag::parse("hypervisor"),
+            Some(CapabilityTag::Hypervisor),
+            "DATACENTER-17 — XCP-ng dom0 is a first-class v1 tag"
+        );
         assert_eq!(CapabilityTag::parse("builder"), None, "deferred — not v1");
         assert_eq!(CapabilityTag::parse(""), None);
+    }
+
+    #[test]
+    fn all_is_the_complete_parseable_vocabulary() {
+        // ALL is the single source of truth: every entry round-trips, and
+        // there are no parseable tokens outside it (a 5th variant added
+        // without extending ALL trips this — the drift this guard prevents).
+        for t in CapabilityTag::ALL {
+            assert_eq!(CapabilityTag::parse(t.as_str()), Some(t));
+        }
+        assert!(CapabilityTag::ALL.contains(&CapabilityTag::Hypervisor));
     }
 
     #[test]
