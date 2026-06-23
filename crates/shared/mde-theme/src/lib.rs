@@ -43,6 +43,7 @@ pub mod carbon;
 pub mod color;
 pub mod components;
 pub mod density;
+pub mod frame_timer;
 // AUD2-3 (2026-06-12): `elevation` removed — the Q29/Q30 per-tier
 // radius+shadow bundles targeted the deleted shell's OSD/greeter/menu
 // surfaces, which Cosmic owns post-E11; zero workspace callers. The
@@ -65,6 +66,7 @@ pub use animation::{
     RenderParams, Tween,
 };
 pub use brand::{Brand, BrandAsset, BrandFormat, BrandSlot, BrandSource};
+pub use frame_timer::{ArmedTimer, FrameSample, FrameStats, FrameTimer, FRAME_DEBUG_ENV};
 pub use color::Rgba;
 pub use components::{
     CardSize, CardState, EmptyState, IconPlacement, ObjectCard, CARD_CORNER_RADIUS,
