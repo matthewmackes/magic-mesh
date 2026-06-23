@@ -13,11 +13,13 @@
 //! load + projection here are pure and unit-tested.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use cosmic::iced::widget::{column, container, row, scrollable, text, text_input};
+use cosmic::iced::widget::{column, container, mouse_area, row, scrollable, text, text_input};
 use cosmic::iced::{Length, Task};
 use cosmic::Element;
+use mde_theme::animation::{lerp_f32, slide_in, Animator};
+use mde_theme::motion::Motion;
 use mde_theme::{spacing, Palette};
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -714,6 +716,30 @@ pub struct DatacenterPanel {
     /// shows everything. Applied on top of the per-tab (zone / topology / card-
     /// grid) views so the search narrows whatever set is currently rendered.
     pub filter: String,
+    /// MOTION-FEEDBACK-2 — when the card grid last (re)loaded, driving the capped
+    /// staggered reveal. `Some(start)` while a reveal is animating; the view reads
+    /// each card's eased fade+slide off this origin and the per-card delay. Stamped
+    /// on `Loaded(Ok)`/`RefreshClicked`; once the reveal has elapsed the tick loop
+    /// clears it so a settled grid does no per-frame work.
+    pub reveal_start: Option<Instant>,
+    /// MOTION-FEEDBACK-2 — the id of the selected/focused card, or `None`. The
+    /// selected card draws an animated accent ring; clicking a card sets this and
+    /// arms the [`Self::selection`] tween.
+    pub selected_card: Option<String>,
+    /// MOTION-FEEDBACK-2 — the animated accent on the selected card. Keyed by the
+    /// card id; [`Animator::value`] gives the eased 0→1 grow-in of the ring, and
+    /// [`Animator::is_idle`] lets the tick loop stop once it settles.
+    pub selection: Animator,
+    /// MOTION-FEEDBACK-2 — the id of the currently hovered card (`None` = no hover),
+    /// plus when the hover last changed — drives the per-card hover-lift tween.
+    pub hovered_card: Option<String>,
+    /// When [`Self::hovered_card`] last toggled — the `start` for the hover-lift.
+    pub hover_since: Instant,
+    /// MOTION-FEEDBACK-2 — `true` while a self-re-arming [`Message::MotionTick`]
+    /// chain is running, so concurrent state changes don't spawn a second chain.
+    /// Cleared when the reveal + selection tweens have all settled (no idle
+    /// wakeups — the chain stops ticking at rest).
+    pub motion_ticking: bool,
 }
 
 /// Top-level view selector for the datacenter panel.
@@ -756,6 +782,12 @@ impl Default for DatacenterPanel {
             dr_status: String::new(),
             dr_confirm: false,
             filter: String::new(),
+            reveal_start: None,
+            selected_card: None,
+            selection: Animator::new(),
+            hovered_card: None,
+            hover_since: Instant::now(),
+            motion_ticking: false,
         }
     }
 }
@@ -886,6 +918,18 @@ pub enum Message {
     /// view applies as a case-insensitive name/id/kind filter across the rendered
     /// resources. Pure state update; fires no RPC.
     FilterChanged(String),
+    /// MOTION-FEEDBACK-2 — a resource card was clicked: select it (and re-arm its
+    /// animated accent ring). `String` is the card's resource id. Pure state +
+    /// motion update; fires no RPC.
+    CardSelected(String),
+    /// MOTION-FEEDBACK-2 — the pointer entered (`Some(id)`) or left (`None`) a card.
+    /// Drives the per-card hover-lift tween. Pure state + motion update.
+    CardHovered(Option<String>),
+    /// MOTION-FEEDBACK-2 — one frame of the card-grid reveal / selection tween. A
+    /// self-re-arming tick (see [`DatacenterPanel::tick_motion`]) that runs ONLY
+    /// while a reveal or the selection accent is in flight, then stops (no idle
+    /// wakeups). Pure: re-renders + advances/garbage-collects the tweens.
+    MotionTick,
 }
 
 impl DatacenterPanel {
@@ -926,7 +970,19 @@ impl DatacenterPanel {
                 if self.view_mode == ViewMode::Topology {
                     self.ensure_topology_seeded();
                 }
-                Task::none()
+                // MOTION-FEEDBACK-2 — a fresh row set re-reveals the card grid: stamp
+                // the reveal origin + arm the tick loop so the cards stagger in. A
+                // selection on a now-absent resource is dropped so a stale accent
+                // never lingers.
+                if self
+                    .selected_card
+                    .as_deref()
+                    .is_some_and(|id| !self.rows.iter().any(|r| r.id == id))
+                {
+                    self.selected_card = None;
+                    self.selection.gc(Instant::now());
+                }
+                self.begin_reveal()
             }
             Message::Loaded(Err(e)) => {
                 self.load_error = Some(e);
@@ -1197,7 +1253,117 @@ impl DatacenterPanel {
                 self.filter = needle;
                 Task::none()
             }
+            Message::CardSelected(id) => {
+                // Toggle the selection (a second click on the focused card clears
+                // it) and (re)arm its animated accent ring from now.
+                if self.selected_card.as_deref() == Some(id.as_str()) {
+                    self.selected_card = None;
+                    // Drop the accent tween for this card so the deselect is a clean
+                    // instant pop-out (the view already gates `ring_t` on
+                    // `selected`) and no stale tween lingers in the Animator.
+                    self.selection.gc(Instant::now());
+                    Task::none()
+                } else {
+                    let now = Instant::now();
+                    self.selection.start(
+                        id.clone(),
+                        now,
+                        Motion::focus(),
+                        crate::live_theme::reduce_motion(),
+                    );
+                    self.selected_card = Some(id);
+                    self.arm_motion()
+                }
+            }
+            Message::CardHovered(id) => {
+                if self.hovered_card != id {
+                    self.hovered_card = id;
+                    self.hover_since = Instant::now();
+                    // Animate the hover-lift in/out (a no-op tween under
+                    // reduce-motion, where the lift is dropped anyway).
+                    return self.arm_motion();
+                }
+                Task::none()
+            }
+            Message::MotionTick => self.tick_motion(),
         }
+    }
+
+    /// MOTION-FEEDBACK-2 — stamp the card-grid reveal origin and arm the motion
+    /// tick so the cards stagger in. Called when a fresh row set lands.
+    fn begin_reveal(&mut self) -> Task<crate::Message> {
+        self.reveal_start = Some(Instant::now());
+        self.arm_motion()
+    }
+
+    /// MOTION-FEEDBACK-2 — start the self-re-arming [`Message::MotionTick`] chain
+    /// if one isn't already running. Idempotent: concurrent state changes (select +
+    /// hover + reveal) share the single in-flight tick chain rather than each
+    /// spawning its own, and at rest no chain runs (zero idle wakeups).
+    fn arm_motion(&mut self) -> Task<crate::Message> {
+        if self.motion_ticking {
+            return Task::none();
+        }
+        self.motion_ticking = true;
+        tick_motion_later()
+    }
+
+    /// MOTION-FEEDBACK-2 — advance one motion frame: garbage-collect the settled
+    /// selection tween, retire an elapsed reveal, then either re-arm the tick (a
+    /// reveal/selection/hover is still in flight) or stop the chain (everything
+    /// settled). Pure state; the view reads the live tween values each frame.
+    fn tick_motion(&mut self) -> Task<crate::Message> {
+        let now = Instant::now();
+        let reduce_motion = crate::live_theme::reduce_motion();
+        self.selection.gc(now);
+        // Retire a reveal once its last *visible* card has finished sliding in (the
+        // duration is reduce-motion-aware, matching `slide_in`), so a settled grid
+        // renders statically with no per-frame easing — and a small grid doesn't
+        // keep ticking for the absent cap slots.
+        if self
+            .reveal_start
+            .is_some_and(|start| reveal_is_complete(start, now, self.visible_card_count(), reduce_motion))
+        {
+            self.reveal_start = None;
+        }
+        if self.motion_in_flight(now, reduce_motion) {
+            tick_motion_later()
+        } else {
+            self.motion_ticking = false;
+            Task::none()
+        }
+    }
+
+    /// MOTION-FEEDBACK-2 — is any card-grid motion (reveal, selection accent, or
+    /// hover-lift) still animating at `now`? Drives the tick-stop guard. Under
+    /// reduce-motion the hover-lift is dropped (no movement), so it's never counted
+    /// as in flight.
+    fn motion_in_flight(&self, now: Instant, reduce_motion: bool) -> bool {
+        let reveal = self.reveal_start.is_some_and(|start| {
+            !reveal_is_complete(start, now, self.visible_card_count(), reduce_motion)
+        });
+        // The hover-lift (enter rise / leave settle) runs over `Motion::hover()`
+        // from `hover_since`; it's in flight until that tween elapses. Skipped under
+        // reduce-motion, where there is no movement to settle.
+        let hover = !reduce_motion
+            && !mde_theme::animation::Tween::resolved(
+                self.hover_since,
+                Motion::hover().duration,
+                false,
+            )
+            .is_complete(now);
+        reveal || hover || !self.selection.is_idle(now)
+    }
+
+    /// MOTION-FEEDBACK-2 — the number of resource cards currently rendered in the
+    /// card grid (the active zone tab AND the global search needle). The reveal
+    /// completion check keys off the *last visible* card, not the stagger cap, so a
+    /// small grid stops ticking the moment its real cards have settled.
+    fn visible_card_count(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|r| r.zone == self.zone_tab && r.matches_filter(&self.filter))
+            .count()
     }
 
     /// Seed [`Self::expanded`] so every current Topology group starts expanded —
@@ -1591,14 +1757,33 @@ impl DatacenterPanel {
                             );
                         }
                     } else {
+                        // MOTION-FEEDBACK-2 — a single `now` for the whole grid so
+                        // every card's reveal/hover/selection tween reads one
+                        // coherent frame, plus the live reduce-motion preference.
+                        let now = Instant::now();
+                        let reduce_motion = crate::live_theme::reduce_motion();
                         // Responsive card grid — each resource is a card (status
-                        // dot + kind/label + readout + actions), wrapped N-per-row.
+                        // dot + kind/label + readout + actions), wrapped N-per-row,
+                        // with a capped staggered reveal + hover-lift + an animated
+                        // accent on the selected card.
                         let cards: Vec<Element<'_, crate::Message>> = visible
                             .into_iter()
-                            .map(|r| {
+                            .enumerate()
+                            .map(|(i, r)| {
                                 let confirming =
                                     self.confirm_delete.as_deref() == Some(r.id.as_str());
-                                dc_card_view(r, palette, confirming)
+                                let motion = CardMotion {
+                                    index: i,
+                                    reveal_start: self.reveal_start,
+                                    selected: self.selected_card.as_deref()
+                                        == Some(r.id.as_str()),
+                                    selection: &self.selection,
+                                    hovered: self.hovered_card.as_deref() == Some(r.id.as_str()),
+                                    hover_since: self.hover_since,
+                                    now,
+                                    reduce_motion,
+                                };
+                                dc_card_view(r, palette, confirming, motion)
                             })
                             .collect();
                         col = col.push(card_grid(cards));
@@ -1616,6 +1801,123 @@ impl DatacenterPanel {
 /// resource lists into a grid (vs one tall column of rows). Tuned so a card —
 /// status dot + label + actions — has room without crowding.
 const CARD_GRID_COLS: usize = 3;
+
+// ── MOTION-FEEDBACK-2 — card-grid reveal / hover / selection motion ───────────
+
+/// MOTION-FEEDBACK-2 — the staggered-reveal cap (Q acceptance: stagger ≤8). Cards
+/// past this index share the last delay slot, so a large zone reveals as one
+/// quick wave instead of a long crawl, and the reveal always finishes in a bounded
+/// time regardless of resource count.
+const REVEAL_STAGGER_CAP: usize = 8;
+
+/// MOTION-FEEDBACK-2 — the per-card stagger step. Each (capped) card index `i`
+/// delays its slide-in by `i * STAGGER_STEP`, so the grid fills top-left → bottom
+/// in a brisk cascade rather than all at once.
+const REVEAL_STAGGER_STEP: Duration = Duration::from_millis(40);
+
+/// MOTION-FEEDBACK-2 — how far a card rises into place on reveal (px, from below).
+/// A small slide, paired with the fade, reading as "settling in" without layout
+/// thrash. Dropped under reduce-motion (the slide collapses to a pure fade).
+const CARD_REVEAL_RISE_PX: f32 = 8.0;
+
+/// MOTION-FEEDBACK-2 — how far the selected card's animated accent ring widens at
+/// full grow-in (px). Sits on top of the card's existing 1px border.
+const CARD_SELECT_RING_PX: f32 = 2.0;
+
+/// MOTION-FEEDBACK-2 — the card's resting padding, also the budget for the
+/// vertical-offset nudge. The reveal slide (downward, `+CARD_REVEAL_RISE_PX`) and
+/// the hover-lift (upward, `-HOVER_LIFT_PX`) are applied by shifting padding from
+/// one side to the other; that only preserves the card's total height while the
+/// summed offset stays within this budget (otherwise a side clamps to 0 and the
+/// grid reflows). Both directions are individually bounded by this assert, so a
+/// future token/constant retune that would break height-preservation fails the
+/// build instead of silently thrashing layout.
+const CARD_PAD_PX: u16 = spacing::BASE[3];
+// Each offset direction is bounded by the padding budget independently: the reveal
+// slides the card *down* by up to `CARD_REVEAL_RISE_PX` (shrinks the bottom pad)
+// and the hover lifts it *up* by `HOVER_LIFT_PX` (shrinks the top pad). Asserting
+// each separately keeps both invariants visible to a future retune.
+const _: () = assert!(
+    CARD_REVEAL_RISE_PX <= CARD_PAD_PX as f32,
+    "reveal rise must stay within the padding budget so the bottom-pad nudge \
+     preserves card height (else the grid reflows mid-reveal)"
+);
+const _: () = assert!(
+    mde_theme::feedback::HOVER_LIFT_PX <= CARD_PAD_PX as f32,
+    "hover lift must stay within the padding budget so the top-pad nudge \
+     preserves card height (else the grid reflows on hover)"
+);
+
+/// MOTION-FEEDBACK-2 — the per-card slide-in `start` for card `index` off the
+/// grid's `reveal_start`: the reveal origin plus this card's (capped) stagger
+/// delay. Cards beyond [`REVEAL_STAGGER_CAP`] all use the cap's delay.
+fn reveal_card_start(reveal_start: Instant, index: usize) -> Instant {
+    let slot = index.min(REVEAL_STAGGER_CAP);
+    reveal_start + REVEAL_STAGGER_STEP * u32::try_from(slot).unwrap_or(u32::MAX)
+}
+
+/// MOTION-FEEDBACK-2 — has the whole reveal finished at `now`? The last card to
+/// animate is `card_count - 1` (its stagger slot capped at [`REVEAL_STAGGER_CAP`]);
+/// once that card's slide-in (its delay plus the reduce-motion-aware mount
+/// duration) has elapsed the reveal is done and the tick loop retires it. Keying
+/// off the real last card — not the fixed cap slot — means a small grid stops
+/// ticking the instant its cards have settled, and the `reduce_motion` duration
+/// matches `slide_in`'s ≤80 ms cap so a reduced-motion reveal doesn't over-tick.
+fn reveal_is_complete(
+    reveal_start: Instant,
+    now: Instant,
+    card_count: usize,
+    reduce_motion: bool,
+) -> bool {
+    // No cards ⇒ nothing to reveal ⇒ already complete.
+    let last_index = match card_count.checked_sub(1) {
+        Some(i) => i,
+        None => return true,
+    };
+    let last_start = reveal_card_start(reveal_start, last_index);
+    let mount = Motion::panel_mount().duration;
+    let dur = if reduce_motion {
+        mount.min(Duration::from_millis(mde_theme::motion::REDUCE_MOTION_CAP_MS))
+    } else {
+        mount
+    };
+    now.saturating_duration_since(last_start) >= dur
+}
+
+/// MOTION-FEEDBACK-2 — sleep one frame (~60 fps), then emit a [`Message::MotionTick`].
+/// Re-armed from [`DatacenterPanel::tick_motion`] only while a reveal/selection is
+/// in flight, so the chain stops itself at rest (MOTION-PERF-1 — no idle wakeups).
+fn tick_motion_later() -> Task<crate::Message> {
+    Task::perform(
+        async {
+            tokio::time::sleep(Duration::from_millis(16)).await;
+        },
+        |()| crate::Message::Datacenter(Message::MotionTick),
+    )
+}
+
+/// MOTION-FEEDBACK-2 — the per-card motion inputs the view passes to
+/// [`dc_card_view`]. Borrows the panel's selection [`Animator`] (read-only) so the
+/// accent ring reads its live eased value without cloning.
+struct CardMotion<'a> {
+    /// The card's index in the visible grid order (drives the stagger slot).
+    index: usize,
+    /// The grid's reveal origin, or `None` once the reveal has settled.
+    reveal_start: Option<Instant>,
+    /// Whether this card is the selected/focused one (draws the accent ring).
+    selected: bool,
+    /// The selection accent animator (keyed by card id) — read for the ring's
+    /// eased grow-in.
+    selection: &'a Animator,
+    /// Whether the pointer is currently over this card (drives the hover-lift).
+    hovered: bool,
+    /// When the hover state last changed — the hover-lift tween `start`.
+    hover_since: Instant,
+    /// One coherent frame timestamp shared across the whole grid.
+    now: Instant,
+    /// The live reduce-motion preference — collapses every movement to instant.
+    reduce_motion: bool,
+}
 
 /// Arrange a list of resource cards into a responsive grid: rows of
 /// [`CARD_GRID_COLS`] cards, each card claiming an equal portion so the grid
@@ -1666,7 +1968,19 @@ fn status_dot_view(r: &DcRow, palette: Palette) -> Element<'static, crate::Messa
 /// delete?" confirm + Cancel prompt — only the confirm fires the destructive
 /// `action/dc/vm-delete` RPC. mde-theme tokens only (surface / border / status
 /// dot all from the palette).
-fn dc_card_view(r: &DcRow, palette: Palette, confirming: bool) -> Element<'_, crate::Message> {
+///
+/// MOTION-FEEDBACK-2 — `motion` layers the card-grid micro-interactions on top of
+/// the static render: a capped staggered fade+slide reveal when the zone loads,
+/// a hover-lift while the pointer is over the card, and an animated accent ring on
+/// the selected card. All collapse to instant / no-movement under reduce-motion.
+/// The whole card is a `mouse_area` so clicking selects it and pointer enter/leave
+/// drives the hover state — runtime-reachable through the panel's update.
+fn dc_card_view<'a>(
+    r: &DcRow,
+    palette: Palette,
+    confirming: bool,
+    motion: CardMotion<'_>,
+) -> Element<'a, crate::Message> {
     let label = if r.name.is_empty() {
         r.id.clone()
     } else {
@@ -1771,20 +2085,107 @@ fn dc_card_view(r: &DcRow, palette: Palette, confirming: bool) -> Element<'_, cr
         card = card.push(actions);
     }
 
-    container(card)
-        .padding(f32::from(spacing::BASE[3]))
+    // ── MOTION-FEEDBACK-2 — resolve this frame's motion for the card ──────────
+    //
+    // Reveal: a capped staggered fade+slide-in off the grid's reveal origin. Under
+    // reduce-motion `slide_in` collapses to a pure fade (no movement); once the
+    // reveal has settled (or there is none) it returns the static, fully-opaque
+    // frame, so a settled grid renders without any transform.
+    let reveal = motion.reveal_start.map_or(
+        mde_theme::animation::RenderParams {
+            alpha: 1.0,
+            translate_y: 0.0,
+            scale: 1.0,
+        },
+        |start| {
+            slide_in(
+                reveal_card_start(start, motion.index),
+                motion.now,
+                CARD_REVEAL_RISE_PX,
+                motion.reduce_motion,
+            )
+        },
+    );
+    // Hover-lift: the card rises HOVER_LIFT_PX while hovered, animating in/out over
+    // Motion::hover(). Dropped under reduce-motion (hover stays a color/elevation
+    // cue, not motion) — that contract lives in `lift_on_hover`.
+    let lift = mde_theme::animation::lift_on_hover(
+        motion.hover_since,
+        motion.now,
+        mde_theme::feedback::HOVER_LIFT_PX,
+        motion.hovered,
+        motion.reduce_motion,
+    );
+    // The reveal slide and the hover-lift are both vertical offsets — sum them into
+    // one `translate_y`, applied as a top-padding nudge (the fork has no transform
+    // widget; offsetting padding moves the surface without layout thrash).
+    let translate_y = reveal.translate_y + lift.translate_y;
+    let base_pad = f32::from(CARD_PAD_PX);
+    // translate_y is negative when lifted (up), positive while the reveal slides up
+    // from below; shift it from the top pad to the bottom (and vice-versa) so the
+    // card's total height is preserved. The `.max(0.0)` is a defensive floor that
+    // never triggers — `CARD_PAD_PX` is statically asserted to exceed both the
+    // reveal rise and the hover lift, so neither side can reach 0.
+    let top_pad = (base_pad + translate_y).max(0.0);
+    let bottom_pad = (base_pad - translate_y).max(0.0);
+    let alpha = reveal.alpha;
+
+    // Selection accent: the focused card draws an animated accent ring that grows
+    // in over Motion::focus() (instant under reduce-motion). The eased value comes
+    // from the shared selection Animator keyed by card id; an unselected card reads
+    // a zero-width ring (the base 1px border).
+    let ring_t = if motion.selected {
+        motion
+            .selection
+            .value(&r.id, motion.now, Motion::focus().easing)
+    } else {
+        0.0
+    };
+    let border_width = 1.0 + CARD_SELECT_RING_PX * ring_t;
+    // Blend the resting border toward the accent token by the ring's progress (in
+    // the fork's f32 Color space), so the selected card's outline reads as the
+    // accent. Never a raw hex — both ends are live palette tokens.
+    let base_border = palette.border.into_cosmic_color();
+    let accent = palette.accent.into_cosmic_color();
+    let border_color = cosmic::iced::Color {
+        r: lerp_f32(base_border.r, accent.r, ring_t),
+        g: lerp_f32(base_border.g, accent.g, ring_t),
+        b: lerp_f32(base_border.b, accent.b, ring_t),
+        a: lerp_f32(base_border.a, accent.a, ring_t),
+    };
+    let surface = palette.surface;
+    let radius = f32::from(spacing::BASE[1]);
+
+    let styled = container(card)
+        .padding(cosmic::iced::Padding {
+            top: top_pad,
+            right: base_pad,
+            bottom: bottom_pad,
+            left: base_pad,
+        })
         .width(Length::Fill)
         .style(move |_theme| container::Style {
             background: Some(cosmic::iced::Background::Color(
-                palette.surface.into_cosmic_color(),
+                crate::cosmic_compat::with_alpha(surface.into_cosmic_color(), alpha),
             )),
             border: cosmic::iced::Border {
-                color: palette.border.into_cosmic_color(),
-                width: 1.0,
-                radius: f32::from(spacing::BASE[1]).into(),
+                color: crate::cosmic_compat::with_alpha(border_color, alpha),
+                width: border_width,
+                radius: radius.into(),
             },
             ..container::Style::default()
-        })
+        });
+
+    // The whole card is clickable (select) + hover-tracked. Selection + hover are
+    // pure panel-state messages routed back through `update` — runtime-reachable.
+    let id = r.id.clone();
+    let enter_id = r.id.clone();
+    mouse_area(styled)
+        .on_press(crate::Message::Datacenter(Message::CardSelected(id)))
+        .on_enter(crate::Message::Datacenter(Message::CardHovered(Some(
+            enter_id,
+        ))))
+        .on_exit(crate::Message::Datacenter(Message::CardHovered(None)))
         .into()
 }
 
@@ -3939,11 +4340,185 @@ mod tests {
         let rows: Vec<DcRow> = (0..(CARD_GRID_COLS * 2 + 1))
             .map(|i| row_with("vm", &format!("v{i}"), &format!("vm{i}"), "running", "dev"))
             .collect();
+        let selection = Animator::new();
+        let now = Instant::now();
         let cards: Vec<Element<'_, crate::Message>> = rows
             .iter()
-            .map(|r| dc_card_view(r, palette, false))
+            .enumerate()
+            .map(|(i, r)| {
+                let motion = CardMotion {
+                    index: i,
+                    reveal_start: Some(now),
+                    selected: false,
+                    selection: &selection,
+                    hovered: false,
+                    hover_since: now,
+                    now,
+                    reduce_motion: false,
+                };
+                dc_card_view(r, palette, false, motion)
+            })
             .collect();
         // Building the grid must not panic for a short final row.
         let _ = card_grid(cards);
+    }
+
+    // ── MOTION-FEEDBACK-2 ─────────────────────────────────────────────────────
+
+    #[test]
+    fn reveal_stagger_is_capped_at_eight_slots() {
+        // MOTION-FEEDBACK-2 acceptance: the staggered reveal caps at ≤8 — cards
+        // past the cap share the cap's delay slot, so the reveal finishes in a
+        // bounded time regardless of resource count.
+        let start = Instant::now();
+        // Card 0 starts at the origin; each subsequent (capped) card adds one step.
+        assert_eq!(reveal_card_start(start, 0), start);
+        assert_eq!(
+            reveal_card_start(start, REVEAL_STAGGER_CAP),
+            start + REVEAL_STAGGER_STEP * REVEAL_STAGGER_CAP as u32
+        );
+        // Past the cap, the delay does NOT keep growing — card 8, 20, 200 all share
+        // the cap slot's start.
+        let capped = reveal_card_start(start, REVEAL_STAGGER_CAP);
+        assert_eq!(reveal_card_start(start, REVEAL_STAGGER_CAP + 12), capped);
+        assert_eq!(reveal_card_start(start, 200), capped);
+    }
+
+    #[test]
+    fn reveal_completes_after_the_last_visible_card_settles() {
+        // The reveal is "in flight" until the LAST VISIBLE card's slide-in (its
+        // delay plus the mount duration) has elapsed; after that the tick loop
+        // retires it. Keying off the real last card (not the fixed cap slot) means a
+        // small grid stops the instant its cards settle.
+        let start = Instant::now();
+        let dur = Motion::panel_mount().duration;
+        // A full (≥ cap) grid: the last card is the cap slot.
+        let big = REVEAL_STAGGER_CAP + 5;
+        let last = reveal_card_start(start, REVEAL_STAGGER_CAP);
+        assert!(
+            !reveal_is_complete(start, start, big, false),
+            "fresh reveal is animating"
+        );
+        assert!(
+            !reveal_is_complete(start, last + dur / 2, big, false),
+            "still animating mid-mount of the last card"
+        );
+        assert!(
+            reveal_is_complete(start, last + dur, big, false),
+            "settled once the last card's mount has elapsed"
+        );
+        // A small 3-card grid settles at card 2's slot — well before the cap slot,
+        // so it does NOT keep ticking for the absent slots 3..=8.
+        let small_last = reveal_card_start(start, 2);
+        assert!(
+            reveal_is_complete(start, small_last + dur, 3, false),
+            "a 3-card grid is done at card 2's slot, not the cap slot"
+        );
+        assert!(
+            !reveal_is_complete(start, small_last + dur, big, false),
+            "the SAME instant is NOT complete for a full grid (still on later slots)"
+        );
+        // Zero cards ⇒ nothing to reveal ⇒ immediately complete.
+        assert!(reveal_is_complete(start, start, 0, false));
+        // Reduce-motion caps the per-card duration to ≤80 ms (matching slide_in), so
+        // the reveal settles sooner than the 240 ms full-motion mount.
+        let cap = Duration::from_millis(mde_theme::motion::REDUCE_MOTION_CAP_MS);
+        assert!(
+            reveal_is_complete(start, last + cap, big, true),
+            "reduce-motion reveal is done at the ≤80 ms cap"
+        );
+        assert!(
+            !reveal_is_complete(start, last + cap, big, false),
+            "full motion still animating at the reduce-motion cap"
+        );
+    }
+
+    #[test]
+    fn hover_lift_keeps_the_tick_chain_alive_until_it_settles() {
+        // Regression: motion_in_flight must count the hover-lift tween, or a
+        // standalone hover (no reveal/selection) would freeze mid-lift when the tick
+        // chain self-stops after one frame.
+        let mut p = DatacenterPanel::new();
+        p.reveal_start = None;
+        let now = Instant::now();
+        // Hover just changed ⇒ the lift is mid-tween ⇒ motion is in flight.
+        p.hover_since = now;
+        assert!(
+            p.motion_in_flight(now, false),
+            "a fresh hover-lift is in flight under full motion"
+        );
+        // After the hover tween elapses, it's settled.
+        let after = now + Motion::hover().duration + Duration::from_millis(1);
+        assert!(
+            !p.motion_in_flight(after, false),
+            "the hover-lift settles after Motion::hover()"
+        );
+        // Under reduce-motion the lift is dropped (no movement) ⇒ never in flight.
+        assert!(
+            !p.motion_in_flight(now, true),
+            "no hover-lift to settle under reduce-motion"
+        );
+    }
+
+    #[test]
+    fn card_select_toggles_and_arms_then_settles_the_tick() {
+        // Clicking a card selects it + arms the motion tick; clicking the same card
+        // again clears the selection. A non-fresh tick is shared, not duplicated.
+        let mut p = DatacenterPanel::new();
+        assert!(!p.motion_ticking, "rest = no tick chain");
+        let _ = p.update(Message::CardSelected("vm-1".into()));
+        assert_eq!(p.selected_card.as_deref(), Some("vm-1"));
+        assert!(p.motion_ticking, "selecting arms the tick chain");
+        // A concurrent hover does not spawn a second chain (idempotent arm).
+        let _ = p.update(Message::CardHovered(Some("vm-1".into())));
+        assert!(p.motion_ticking);
+        // Toggle off.
+        let _ = p.update(Message::CardSelected("vm-1".into()));
+        assert!(p.selected_card.is_none(), "re-click clears the selection");
+        // Once every tween has settled, a tick stops the chain (no idle wakeups).
+        p.selection.gc(Instant::now() + Duration::from_secs(1));
+        p.reveal_start = None;
+        p.hovered_card = None;
+        p.hover_since = Instant::now() - Duration::from_secs(1);
+        let _ = p.tick_motion();
+        assert!(!p.motion_ticking, "settled motion stops the tick chain");
+    }
+
+    #[test]
+    fn loaded_arms_a_reveal_and_drops_a_stale_selection() {
+        // A fresh row set re-reveals the grid (stamps reveal_start + arms the tick)
+        // and drops a selection on a resource that's no longer present.
+        let mut p = DatacenterPanel::new();
+        p.selected_card = Some("gone".into());
+        let load = DcLoad {
+            rows: vec![row_with("vm", "v0", "vm0", "running", "dev")],
+            ..DcLoad::default()
+        };
+        let _ = p.update(Message::Loaded(Ok(load)));
+        assert!(p.reveal_start.is_some(), "a load arms the card-grid reveal");
+        assert!(p.motion_ticking, "the reveal arms the tick chain");
+        assert!(
+            p.selected_card.is_none(),
+            "a selection on an absent resource is dropped"
+        );
+    }
+
+    #[test]
+    fn view_renders_with_a_reveal_and_selection_in_flight() {
+        // The whole motion path is runtime-reachable through view(): a freshly
+        // loaded, selected, hovered grid renders without panicking.
+        let mut p = DatacenterPanel::new();
+        p.view_mode = ViewMode::Zone;
+        p.zone_tab = "dev".into();
+        let load = DcLoad {
+            rows: (0..10)
+                .map(|i| row_with("vm", &format!("v{i}"), &format!("vm{i}"), "running", "dev"))
+                .collect(),
+            ..DcLoad::default()
+        };
+        let _ = p.update(Message::Loaded(Ok(load)));
+        let _ = p.update(Message::CardSelected("v3".into()));
+        let _ = p.update(Message::CardHovered(Some("v5".into())));
+        let _ = p.view();
     }
 }
