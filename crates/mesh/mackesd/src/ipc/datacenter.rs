@@ -53,17 +53,29 @@
 //! Reply `{"ok":true,"regions":[{"slug","name","available"}, …]}` on success,
 //! `{"error":"doctl region list failed"}` if doctl is missing/failed.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use serde_json::json;
 
-/// The VM power-control responder — rooted at the shared workgroup root (carried
-/// for parity with the other action services; the allowed-dom0 set + ssh key come
-/// from the orchestrator's env-driven config).
+/// The VM power-control responder.
+///
+/// Rooted at the shared workgroup root (carried for parity with the other action
+/// services; the allowed-dom0 set + ssh key come from the orchestrator's
+/// env-driven config).
+///
+/// DATACENTER-6 (op-lock half): the service also carries an in-flight op-lock —
+/// a shared set of the resource keys currently being mutated (the VM `uuid` for
+/// the `vm-*` mutating verbs). [`build_reply`] try-inserts the key before
+/// dispatching a mutating verb and rejects a second concurrent mutation on the
+/// same resource with a clear `busy` reason; a [`OpLockGuard`] removes the key
+/// when the op completes (RAII). `Clone` shares the same lock (the spawn in
+/// `bin/mackesd.rs` clones the service into the responder thread), so two
+/// in-flight requests — even across `Clone`d handles — see one set.
 #[derive(Debug, Clone)]
 pub struct DatacenterService {
     // Carried for parity with the other action services and the
@@ -71,13 +83,61 @@ pub struct DatacenterService {
     // read from the orchestrator's env config, so this isn't read here yet.
     #[allow(dead_code)]
     workgroup_root: PathBuf,
+    /// In-flight resource keys currently being mutated. `Arc<Mutex<…>>` so a
+    /// `Clone` of the service (the responder-thread handle) shares ONE set, and
+    /// so concurrent `build_reply` calls serialize on insert/remove.
+    in_flight: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl DatacenterService {
-    /// Build the service rooted at the shared workgroup root.
+    /// Build the service rooted at the shared workgroup root, with an empty
+    /// in-flight op-lock set.
     #[must_use]
     pub fn new(workgroup_root: PathBuf) -> Self {
-        Self { workgroup_root }
+        Self {
+            workgroup_root,
+            in_flight: Arc::new(Mutex::new(BTreeSet::new())),
+        }
+    }
+
+    /// Try to claim `key` in the in-flight set. Returns a [`OpLockGuard`] (which
+    /// releases the key on drop) when the key was free, or `None` when a mutation
+    /// on the same resource is already in flight — the caller turns that into the
+    /// `busy` reject. A poisoned lock is recovered (the set is plain data; a panic
+    /// mid-mutation cannot leave it inconsistent), so the op-lock never wedges the
+    /// responder.
+    #[must_use]
+    fn try_lock(&self, key: String) -> Option<OpLockGuard<'_>> {
+        let mut set = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if set.insert(key.clone()) {
+            Some(OpLockGuard {
+                in_flight: &self.in_flight,
+                key,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// RAII release for one claimed in-flight resource key: dropping it removes the
+/// key from the service's in-flight set, so a panic or early return in
+/// [`build_reply`] still frees the lock (the resource never gets stuck `busy`).
+struct OpLockGuard<'a> {
+    in_flight: &'a Arc<Mutex<BTreeSet<String>>>,
+    key: String,
+}
+
+impl Drop for OpLockGuard<'_> {
+    fn drop(&mut self) {
+        let mut set = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set.remove(&self.key);
     }
 }
 
@@ -212,10 +272,71 @@ fn ssh_xe_status(key: &str, dom0: &str, remote: &str) -> std::io::Result<std::pr
         .output()
 }
 
-/// Build the reply for one `action/dc/<verb>` request, dispatching on `verb`.
+/// The resource key a mutating `verb` op-locks, or `None` for a read-only verb
+/// that needs no lock. PURE (used by [`build_reply`]'s op-lock and unit-testable
+/// on its own).
+///
+/// DATACENTER-6 (op-lock half): a second concurrent mutation on the same resource
+/// is rejected, so the lock is keyed on the resource the verb targets — every
+/// mutating verb THIS responder dispatches targets a single VM, so the key is the
+/// VM `uuid`, namespaced `vm:<uuid>`:
+/// * `vm-power` / `vm-snapshot` / `vm-clone` / `vm-delete` → `vm:<uuid>`;
+/// * the read-only verbs `do-regions` and `vm-console` return `None` — they read,
+///   never mutate, so concurrent reads are allowed.
+///
+/// (The `host-power` host op runs on its own separate responder
+/// [`crate::ipc::host_ops`] and is not dispatched here, so it is intentionally
+/// not in this key space — the `vm:` namespace prefix leaves room for a future
+/// `host:<dom0>` key without collision.)
+///
+/// A verb whose body is missing/unparseable, or whose `uuid` is empty, also
+/// returns `None`: there is no resource to lock, and the per-verb handler will
+/// produce the real validation error. The key is NOT validated for injection here
+/// (that is the per-verb command builder's job); it is only ever used as a set
+/// member, never interpolated into a shell command.
 #[must_use]
-pub fn build_reply(_svc: &DatacenterService, verb: &str, req_body: Option<&str>) -> String {
+pub fn lock_key(verb: &str, req_body: Option<&str>) -> Option<String> {
+    // Only the mutating vm-* verbs lock; read-only verbs hold no lock.
+    match verb {
+        "vm-power" | "vm-snapshot" | "vm-clone" | "vm-delete" => {}
+        _ => return None,
+    }
+    let uuid = serde_json::from_str::<serde_json::Value>(req_body?)
+        .ok()?
+        .get("uuid")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)?;
+    if uuid.is_empty() {
+        return None;
+    }
+    Some(format!("vm:{uuid}"))
+}
+
+/// Build the reply for one `action/dc/<verb>` request, dispatching on `verb`.
+///
+/// DATACENTER-6 (op-lock half): before dispatching a *mutating* verb, the resource
+/// key ([`lock_key`]) is claimed in the service's in-flight set. If a mutation on
+/// the same resource is already in flight, this returns the clear `busy` reject
+/// WITHOUT running the op; otherwise a [`OpLockGuard`] holds the key for the
+/// duration of the (synchronous) dispatch and releases it on return (RAII).
+/// Read-only verbs ([`lock_key`] → `None`) take no lock and never reject.
+#[must_use]
+pub fn build_reply(svc: &DatacenterService, verb: &str, req_body: Option<&str>) -> String {
     let err = |m: String| json!({ "error": m }).to_string();
+    // Op-lock: claim the resource for the duration of a mutating dispatch. The
+    // guard is dropped at the end of this function (after the reply is built),
+    // releasing the key. Read-only verbs (lock_key → None) are unguarded.
+    let _guard = match lock_key(verb, req_body) {
+        Some(key) => match svc.try_lock(key.clone()) {
+            Some(g) => Some(g),
+            None => {
+                return err(format!(
+                    "resource {key} busy: a {verb} is already in flight"
+                ));
+            }
+        },
+        None => None,
+    };
     match verb {
         "vm-power" => vm_power_reply(req_body),
         "vm-snapshot" => vm_snapshot_reply(req_body),
@@ -1000,6 +1121,142 @@ mod tests {
         })
         .to_string();
         let r = build_reply(&s, "vm-snapshot", Some(&body));
+        assert!(r.contains("dom0 not in allowed set"), "{r}");
+    }
+
+    // ---- DATACENTER-6: per-resource op-lock ----
+
+    #[test]
+    fn lock_key_maps_mutating_verbs_to_namespaced_resource() {
+        let body = json!({ "uuid": "abcd-1234", "op": "start", "dom0": "10.0.0.1" }).to_string();
+        // every vm-* mutating verb keys on the vm uuid (namespaced)
+        for verb in ["vm-power", "vm-snapshot", "vm-clone", "vm-delete"] {
+            assert_eq!(
+                lock_key(verb, Some(&body)),
+                Some("vm:abcd-1234".to_string()),
+                "verb {verb} should lock on the vm uuid"
+            );
+        }
+    }
+
+    #[test]
+    fn lock_key_read_only_and_unlockable_return_none() {
+        let body = json!({ "uuid": "abcd-1234", "dom0": "10.0.0.1" }).to_string();
+        // read-only verbs take no lock
+        assert_eq!(lock_key("vm-console", Some(&body)), None);
+        assert_eq!(lock_key("do-regions", Some(&body)), None);
+        // unknown verb → no lock
+        assert_eq!(lock_key("bogus", Some(&body)), None);
+        // mutating verb but nothing to lock on → no lock (the handler emits the
+        // real validation error instead of us inventing an empty key)
+        assert_eq!(lock_key("vm-power", None), None);
+        assert_eq!(lock_key("vm-power", Some("not json")), None);
+        assert_eq!(lock_key("vm-power", Some(r#"{"op":"start"}"#)), None);
+        assert_eq!(lock_key("vm-power", Some(r#"{"uuid":""}"#)), None);
+    }
+
+    #[test]
+    fn second_concurrent_mutation_on_same_uuid_is_busy_rejected() {
+        // Two concurrent vm-power on the SAME uuid: model the first being still
+        // in flight by holding its op-lock guard, then issue the second through
+        // build_reply. The second must be rejected with the clear busy reason,
+        // and crucially WITHOUT reaching the dom0 allow-list (the lock is the
+        // first gate). A different uuid is unaffected.
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        let uuid = "abcd1234-5678-90ab-cdef-1234567890ab";
+
+        // First op still running: hold the guard for vm:<uuid>.
+        let held = s
+            .try_lock(format!("vm:{uuid}"))
+            .expect("first claim succeeds on a free resource");
+
+        // Second vm-power on the same uuid → busy-reject, NOT the dom0 error.
+        let body = json!({ "uuid": uuid, "op": "start", "dom0": "10.0.0.1" }).to_string();
+        let r = build_reply(&s, "vm-power", Some(&body));
+        assert!(
+            r.contains(&format!("resource vm:{uuid} busy")),
+            "expected busy reject, got: {r}"
+        );
+        assert!(
+            r.contains("a vm-power is already in flight"),
+            "expected the clear reason, got: {r}"
+        );
+        assert!(
+            !r.contains("dom0 not in allowed set"),
+            "lock must gate BEFORE the dom0 check: {r}"
+        );
+
+        // A DIFFERENT uuid is not locked → it proceeds to the next gate (the
+        // empty dom0 allow-list), proving the lock is per-resource.
+        let other = json!({
+            "uuid": "ffff0000-1111-2222-3333-444455556666",
+            "op": "start",
+            "dom0": "10.0.0.1"
+        })
+        .to_string();
+        let r2 = build_reply(&s, "vm-power", Some(&other));
+        assert!(r2.contains("dom0 not in allowed set"), "{r2}");
+
+        // Release the first op; the same uuid is now claimable again.
+        drop(held);
+        assert!(
+            s.try_lock(format!("vm:{uuid}")).is_some(),
+            "the resource is free again after the first op completes"
+        );
+    }
+
+    #[test]
+    fn op_lock_releases_after_a_completed_dispatch() {
+        // build_reply's guard is dropped when it returns, so back-to-back (not
+        // overlapping) mutations on the same uuid both run — the lock only blocks
+        // CONCURRENT ones. With an empty dom0 set both hit the allow-list error,
+        // proving neither was spuriously busy-rejected.
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        let body = json!({
+            "uuid": "abcd1234-5678-90ab-cdef-1234567890ab",
+            "op": "start",
+            "dom0": "10.0.0.1"
+        })
+        .to_string();
+        let r1 = build_reply(&s, "vm-power", Some(&body));
+        assert!(r1.contains("dom0 not in allowed set"), "{r1}");
+        let r2 = build_reply(&s, "vm-power", Some(&body));
+        assert!(
+            r2.contains("dom0 not in allowed set"),
+            "lock must have released after the first call: {r2}"
+        );
+    }
+
+    #[test]
+    fn op_lock_is_shared_across_cloned_handles() {
+        // The responder thread gets a Clone of the service; the op-lock must be
+        // shared (Arc), so a resource claimed on one handle is busy on its clone.
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        let uuid = "abcd1234-5678-90ab-cdef-1234567890ab";
+        let _held = s.try_lock(format!("vm:{uuid}")).expect("claim on original");
+        let clone = s.clone();
+        let body = json!({ "uuid": uuid, "op": "reboot", "dom0": "10.0.0.1" }).to_string();
+        let r = build_reply(&clone, "vm-power", Some(&body));
+        assert!(
+            r.contains(&format!("resource vm:{uuid} busy")),
+            "a clone must see the same in-flight set: {r}"
+        );
+    }
+
+    #[test]
+    fn read_only_verb_is_never_busy_rejected() {
+        // vm-console is read-only: even with the same uuid "in flight" it is not
+        // gated by the lock (concurrent reads are fine). It falls through to its
+        // own dom0 allow-list check.
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        let uuid = "abcd1234-5678-90ab-cdef-1234567890ab";
+        let _held = s.try_lock(format!("vm:{uuid}")).expect("claim the uuid");
+        let body = json!({ "uuid": uuid, "dom0": "10.0.0.1" }).to_string();
+        let r = build_reply(&s, "vm-console", Some(&body));
+        assert!(
+            !r.contains("busy"),
+            "read-only verb must not be locked: {r}"
+        );
         assert!(r.contains("dom0 not in allowed set"), "{r}");
     }
 }
