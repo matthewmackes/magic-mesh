@@ -18,6 +18,15 @@
 //! - [`Density`] — Compact / Comfortable / Spacious enum
 //!   (UX-15). UX-24 sub-lock: density scales spacing tokens only,
 //!   never component dimensions.
+//! - [`DensityScale`] — per-surface presentation spacing scale
+//!   (Comfortable / Compact / Presentation, BEAUT-THEME), layered
+//!   over the metric tokens independently of the global
+//!   [`Density`] preference.
+//! - [`skeleton`] — the Carbon skeleton/placeholder primitive
+//!   ([`SkeletonBlock`] shape + [`SkeletonShimmer`] fill):
+//!   reduce-motion aware (static under reduce-motion or the motion
+//!   kill switch) and idle/visibility tick-gated. Pure glue over
+//!   [`animation`].
 //! - [`Tokens`] — resolved token set for a given (theme, density)
 //!   pair. The single struct every consumer reads.
 //! - [`Brand`] — runtime brand-asset loader. Maps logical slots
@@ -57,6 +66,7 @@ pub mod palette;
 pub mod prefs;
 pub mod radii;
 pub mod shadows;
+pub mod skeleton;
 pub mod spacing;
 pub mod theme;
 pub mod typography;
@@ -67,7 +77,6 @@ pub use animation::{
     RenderParams, Tween,
 };
 pub use brand::{Brand, BrandAsset, BrandFormat, BrandSlot, BrandSource};
-pub use frame_timer::{ArmedTimer, FrameSample, FrameStats, FrameTimer, FRAME_DEBUG_ENV};
 pub use color::Rgba;
 pub use components::{
     CardSize, CardState, EmptyState, IconPlacement, ObjectCard, CARD_CORNER_RADIUS,
@@ -78,11 +87,12 @@ pub use components::{
     CARD_SHADOW_HOVER_BLUR, CARD_SHADOW_HOVER_OFFSET_Y, CARD_SHADOW_PRESSED_ALPHA,
     CARD_SHADOW_PRESSED_BLUR, CARD_SHADOW_PRESSED_OFFSET_Y, CARD_SUBTITLE_SIZE, CARD_TITLE_SIZE,
 };
-pub use density::Density;
+pub use density::{Density, DensityScale};
 pub use feedback::{
     ControlFeedback, FeedbackParams, FocusRing, FOCUS_RING_OFFSET_PX, FOCUS_RING_WIDTH_PX,
     HOVER_LIFT_PX, PRESS_DEPTH,
 };
+pub use frame_timer::{ArmedTimer, FrameSample, FrameStats, FrameTimer, FRAME_DEBUG_ENV};
 pub use icons::{
     icon_for_device_type, mde_icon, FillMode, Icon, IconSize, IconState, ResolvedIcon,
     MATERIAL_LINE_WEIGHT_PX,
@@ -93,6 +103,7 @@ pub use palette::Palette;
 pub use prefs::Preferences;
 pub use radii::Radii;
 pub use shadows::Shadow;
+pub use skeleton::{SkeletonBlock, SkeletonShimmer, TEXT_LINE_HEIGHT_PX};
 pub use spacing::Space;
 pub use theme::{Theme, Tokens};
 pub use typography::{FontSize, FontWeight, LetterSpacing, TypeRole};

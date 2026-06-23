@@ -46,8 +46,18 @@ impl Space {
     /// Resolve the spacing token set for a given density mode.
     /// UX-24: density scales tokens, not component dimensions.
     pub fn for_density(d: Density) -> Self {
-        let mult = d.spacing_multiplier();
-        let scale = |i: usize| ((BASE[i] as f32) * mult).round() as u16;
+        Self::scaled(d.spacing_multiplier())
+    }
+
+    /// Resolve the spacing token set at an arbitrary multiplier over [`BASE`].
+    /// The single home for the scale math — both the global [`Density`] resolver
+    /// ([`Space::for_density`]) and the per-surface presentation scale
+    /// ([`crate::density::DensityScale::space`]) route through here so there is
+    /// exactly one copy. UX-24: scales tokens, never component dimensions. Each
+    /// token floors at 1 px so it never collapses to 0 under a sub-unity scale.
+    #[must_use]
+    pub fn scaled(mult: f32) -> Self {
+        let scale = |i: usize| (((BASE[i] as f32) * mult).round() as u16).max(1);
         Self {
             xs2: scale(0),
             xs: scale(1),
@@ -126,6 +136,27 @@ mod tests {
         let m = Space::for_density(Density::Comfortable);
         let s = Space::for_density(Density::Spacious);
         assert!(s.lg2 > m.lg2);
+    }
+
+    #[test]
+    fn scaled_is_the_single_home_for_density_scaling() {
+        // `for_density` must be exactly `scaled(multiplier)` — one copy of the math.
+        assert_eq!(
+            Space::for_density(Density::Compact),
+            Space::scaled(Density::Compact.spacing_multiplier())
+        );
+        assert_eq!(Space::for_density(Density::Comfortable), Space::scaled(1.0));
+    }
+
+    #[test]
+    fn scaled_floors_each_token_at_one_px() {
+        // A sub-unity scale must never collapse the smallest token to 0 px.
+        let tiny = Space::scaled(0.01);
+        assert!(
+            tiny.xs2 >= 1,
+            "smallest token floors at 1 px, got {}",
+            tiny.xs2
+        );
     }
 
     #[test]
