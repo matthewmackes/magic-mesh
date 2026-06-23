@@ -24,26 +24,40 @@ use mde_cosmic_applet::{
 };
 use mde_theme::animation::{Animator, Transition};
 use mde_theme::{
-    mde_icon, Easing, FontSize, Icon, IconSize, Motion, Palette, Preferences, Rgba, TypeRole,
+    mde_icon, Easing, FontSize, Icon, IconSize, Motion, Palette, Preferences, Radii, Rgba, Shadow,
+    TypeRole,
 };
 
 const ID: &str = "com.mackes.MagicMeshApps";
 
 /// APPS-WIDE (operator 2026-06-18) — the launcher dropdown was a golden
-/// rectangle (920 × 920/φ). APPS-FIT (operator 2026-06-19) supersedes that: the
-/// dropdown now sizes to the desktop — **width = 33% of the output's logical
-/// width**, **height the same fraction of its height**, so the rectangle keeps
-/// the desktop's own aspect ratio ("matching the Ratio") and scales to any
-/// resolution. The golden rectangle below is only the fallback when the
-/// resolution can't be detected.
-const GOLDEN_RATIO: f32 = 1.618;
-/// APPS-FIT — the dropdown's width as a fraction of the desktop's logical width
-/// (and its height as the same fraction of the desktop height).
-const MENU_SCREEN_FRACTION: f32 = 0.33;
-/// APPS-FIT — fallback dropdown size (the prior APPS-WIDE golden rectangle) used
-/// when `cosmic-randr` can't report the output resolution.
-const FALLBACK_MENU_WIDTH: f32 = 920.0;
-const FALLBACK_MENU_HEIGHT: f32 = FALLBACK_MENU_WIDTH / GOLDEN_RATIO;
+/// rectangle (920 × 920/φ). APPS-FIT (operator 2026-06-19) sized it to the
+/// desktop. APPS-FIT-3 (2026-06-23) fixes the *real* bug — `popup_container`'s
+/// `autosize` was clamping the menu back to 360px wide regardless of any of the
+/// sizes those revisions set (see [`AppsApplet::launcher_surface`]) — and, now
+/// that the size actually takes effect, gives the launcher a proper **portrait**
+/// shape: **width = [`MENU_WIDTH_FRACTION`] of the output's logical width**,
+/// **height = [`MENU_HEIGHT_FRACTION`] of its logical height** (taller than wide,
+/// like a Start menu's vertical app list). Both scale to any resolution; the
+/// fallback below keeps the same portrait proportions when the resolution can't
+/// be detected.
+///
+/// APPS-FIT-3 — the dropdown's width as a fraction of the desktop's logical
+/// width (about a third of the screen).
+const MENU_WIDTH_FRACTION: f32 = 0.33;
+/// APPS-FIT-3 — the dropdown's height as a fraction of the desktop's logical
+/// height. A launcher is a tall vertical list (header → quick links → tabs →
+/// search → scrolling results → footer), so it takes a larger share of the
+/// height than the width — a portrait rectangle, not the prior landscape blob.
+const MENU_HEIGHT_FRACTION: f32 = 0.66;
+/// APPS-FIT — fallback dropdown size used when `cosmic-randr` can't report the
+/// output resolution. Sized from a conservative 1080p baseline at the same
+/// fractions so the fallback keeps the portrait shape (≈ 633 × 712) instead of
+/// the old fixed golden landscape that ignored the screen entirely.
+const FALLBACK_OUTPUT_WIDTH: f32 = 1920.0;
+const FALLBACK_OUTPUT_HEIGHT: f32 = 1080.0;
+const FALLBACK_MENU_WIDTH: f32 = FALLBACK_OUTPUT_WIDTH * MENU_WIDTH_FRACTION;
+const FALLBACK_MENU_HEIGHT: f32 = FALLBACK_OUTPUT_HEIGHT * MENU_HEIGHT_FRACTION;
 
 /// APPS-FIT — detect the launcher size from the desktop resolution: 33% of the
 /// panel output's logical width × the same fraction of its height. Best-effort —
@@ -62,7 +76,8 @@ fn detect_menu_size() -> (f32, f32) {
 }
 
 /// APPS-FIT — pure parser for `cosmic-randr list --kdl`. Returns the launcher
-/// size (`MENU_SCREEN_FRACTION` of the output's logical width × height) for the
+/// size ([`MENU_WIDTH_FRACTION`] of the output's logical width ×
+/// [`MENU_HEIGHT_FRACTION`] of its logical height — a portrait rectangle) for the
 /// output named `target` (or the first enabled output with a current mode when
 /// `target` is empty / not found). The KDL shape (from cosmic-randr's
 /// `list_kdl`) is:
@@ -142,7 +157,7 @@ fn parse_menu_size_from_kdl(kdl: &str, target: &str) -> Option<(f32, f32)> {
     if lw <= 0.0 || lh <= 0.0 {
         return None;
     }
-    Some((lw * MENU_SCREEN_FRACTION, lh * MENU_SCREEN_FRACTION))
+    Some((lw * MENU_WIDTH_FRACTION, lh * MENU_HEIGHT_FRACTION))
 }
 /// APPS-WIDE — Favorites icon-grid shape (operator 2026-06-18): exactly 3 tiles
 /// per row, capped at 9 (a 3×3 grid), mirroring the Workbench/Files/Settings
@@ -150,6 +165,15 @@ fn parse_menu_size_from_kdl(kdl: &str, target: &str) -> Option<(f32, f32)> {
 const FAVORITES_COLUMNS: usize = 3;
 /// Max favorites shown in the grid (3×3).
 const FAVORITES_MAX: usize = 9;
+
+/// APPS-FIT-3 — the stable [`cosmic::widget::Id`] for the launcher's own
+/// `autosize` wrapper. The launcher does **not** use `core.applet.popup_container`
+/// (whose `autosize` hard-caps `max_width(360)` and would clamp the wide menu back
+/// to 360px); it wraps `dropdown()` in its own `autosize` with `menu_w×menu_h`
+/// limits, keyed by this id so the reactive popup-resize tracks the right size.
+fn launcher_autosize_id() -> cosmic::widget::Id {
+    cosmic::widget::Id::new("mde-apps-launcher-autosize")
+}
 
 /// APPS-FX-1 — animation tick period while motion is in flight (~60 fps). The
 /// applet only ticks at this rate while the [`Animator`] has a live tween;
@@ -653,6 +677,18 @@ fn carbon(c: Rgba) -> cosmic::iced::Color {
     }
 }
 
+/// APPS-FIT-3 — translate an `mde-theme` [`Shadow`] elevation token into an
+/// `iced::Shadow` (the toolkit's drop-shadow on a container `Style`). Mirrors the
+/// workbench's `mde_shadow_to_iced` so the launcher popover reads the same
+/// SHADOW_* token the rest of the desktop does (§4 — single-sourced metrics).
+fn carbon_shadow(s: Shadow) -> cosmic::iced::Shadow {
+    cosmic::iced::Shadow {
+        color: carbon(s.color),
+        offset: cosmic::iced::Vector::new(s.offset_x, s.offset_y),
+        blur_radius: s.blur,
+    }
+}
+
 /// APPS-FX-1 — blend two Carbon token colors by `t` (0 = `a`, 1 = `b`), clamped.
 /// Used to ease a row's background toward the raised highlight on hover (a
 /// subtle, jank-free accent — no layout shift). Channel-wise `lerp_f32`.
@@ -832,8 +868,15 @@ impl Application for AppsApplet {
                             settings
                         },
                         Some(Box::new(move |state: &AppsApplet| {
-                            Element::from(state.core.applet.popup_container(state.dropdown()))
-                                .map(cosmic::Action::App)
+                            // APPS-FIT-3 — render the launcher through our own
+                            // sized surface, NOT `core.applet.popup_container`:
+                            // that wraps content in an `autosize` hard-capped at
+                            // `max_width(360)`, which (a) clamps the content to
+                            // 360px wide and (b) drives a reactive popup resize
+                            // back down to that 360px on the first RequestResize —
+                            // overriding the wide positioner every prior fix set.
+                            // `launcher_surface` keeps the menu at `menu_w×menu_h`.
+                            state.launcher_surface().map(cosmic::Action::App)
                         })),
                     )),
                 ));
@@ -1207,6 +1250,64 @@ impl AppsApplet {
     fn hover_lift(&self, id: &str) -> f32 {
         let amt = self.hover_progress(&hover_key(HOVER_TILE, id));
         Transition::Lift(TILE_HOVER_RISE_PX).params(amt).translate_y
+    }
+
+    /// APPS-FIT-3 — the launcher popup body, wrapped in **our own** Carbon-styled
+    /// surface instead of `core.applet.popup_container`.
+    ///
+    /// The root cause of the long-running "launcher is the wrong size" bug:
+    /// `popup_container` wraps content in an `autosize` whose `Limits` are
+    /// `min_width(360) … max_width(360)` (see libcosmic `applet::Context::
+    /// popup_container`). Because `autosize` lays the content out under those
+    /// limits — and, on a Wayland `RequestResize`, requests the popup surface to
+    /// resize to *that clamped 360px content bounds* — the launcher was forced to
+    /// 360px wide no matter how wide the positioner was set. Every prior fix
+    /// (APPS-WIDE / APPS-FIT / APPS-FIT-2) only widened the positioner, so the
+    /// content wrapper kept clamping it straight back to 360.
+    ///
+    /// Here we build the same bordered/elevated popup chrome entirely from
+    /// shared mde-theme tokens ([`Palette::raised`] surface + [`Palette::border`]
+    /// hairline + [`Radii::md`] corners + the [`Shadow::raised`] popover
+    /// elevation, §4 — no raw hex, no inline metric literals) and wrap it in an
+    /// `autosize` whose limits are the detected `menu_w × menu_h`. The content
+    /// can now fill the full width, and the
+    /// reactive resize tracks `menu_w × menu_h` — matching the positioner the
+    /// open handler set. The right-click power menu still uses `popup_container`
+    /// (its 360px width is correct), so this is scoped to the launcher only.
+    fn launcher_surface(&self) -> Element<'_, Message> {
+        let p = self.palette;
+        let bg = carbon(p.raised);
+        let border_c = carbon(p.border);
+        // §4 — the popover chrome reads its metrics from the shared mde-theme
+        // tokens, not inline literals: the raised-surface drop shadow
+        // ([`Shadow::raised`] = SHADOW_2, "popovers over surface") + the Q41
+        // `Radii::md` corner (8 px) + the adaptive hairline border.
+        let radius = f32::from(Radii::defaults().md);
+        let shadow = carbon_shadow(Shadow::raised());
+        let chrome = cosmic::iced::widget::container(self.dropdown()).style(move |_| {
+            cosmic::iced::widget::container::Style {
+                background: Some(bg.into()),
+                border: cosmic::iced::Border {
+                    radius: radius.into(),
+                    width: 1.0,
+                    color: border_c,
+                },
+                shadow,
+                ..Default::default()
+            }
+        });
+        // `dropdown()` already fixes the body to `menu_w × menu_h`; the autosize
+        // limits permit exactly that (capping nothing the body sets) and drive
+        // the reactive popup-resize to the same size.
+        cosmic::widget::autosize::autosize(chrome, launcher_autosize_id())
+            .limits(
+                cosmic::iced::Limits::NONE
+                    .min_width(1.0)
+                    .max_width(self.menu_w)
+                    .min_height(1.0)
+                    .max_height(self.menu_h),
+            )
+            .into()
     }
 
     /// APPS-STYLE-2 — the redesigned Start Menu (design: `docs/design/start-menu-redesign.md`).
@@ -1923,7 +2024,11 @@ impl AppsApplet {
         // background blend — the row geometry is untouched, so the list never
         // reflows (no jank). A selected row keeps its own raised treatment.
         let key = hover_key(HOVER_ROW, &e.id);
-        let hv = if selected { 0.0 } else { self.hover_progress(&key) };
+        let hv = if selected {
+            0.0
+        } else {
+            self.hover_progress(&key)
+        };
         // Fast path: a resting/unhovered row keeps the plain zebra color (skip the
         // blend that would just reproduce `shade`) — the common case for a list
         // re-rendered each frame while *some other* row's tween is in flight.
@@ -2219,7 +2324,7 @@ impl AppsApplet {
 
 #[cfg(test)]
 mod apps_fit_tests {
-    use super::{parse_menu_size_from_kdl, MENU_SCREEN_FRACTION};
+    use super::{parse_menu_size_from_kdl, MENU_HEIGHT_FRACTION, MENU_WIDTH_FRACTION};
 
     const SAMPLE: &str = r#"output "DP-1" enabled=#true {
   description model="Test"
@@ -2245,9 +2350,23 @@ output "HDMI-A-1" enabled=#false {
 
     #[test]
     fn picks_named_output_current_mode_at_fraction() {
+        // APPS-FIT-3: width = a third of the logical width; height = the taller
+        // fraction of the logical height (a portrait launcher, not a landscape
+        // blob — distinct width/height fractions).
         let (w, h) = parse_menu_size_from_kdl(SAMPLE, "DP-1").unwrap();
-        approx(w, 2560.0 * MENU_SCREEN_FRACTION);
-        approx(h, 1440.0 * MENU_SCREEN_FRACTION);
+        approx(w, 2560.0 * MENU_WIDTH_FRACTION);
+        approx(h, 1440.0 * MENU_HEIGHT_FRACTION);
+    }
+
+    #[test]
+    fn launcher_is_portrait_taller_than_wide() {
+        // APPS-FIT-3 regression guard: the launcher must be taller than it is
+        // wide on a 16:9 desktop (the long-standing bug rendered it as a
+        // too-short landscape rectangle once the 360px content clamp also
+        // squashed it). With 0.33 × width vs 0.66 × height on 2560×1440 that's
+        // ~845 × ~950 — portrait.
+        let (w, h) = parse_menu_size_from_kdl(SAMPLE, "DP-1").unwrap();
+        assert!(h > w, "launcher should be portrait: got {w} × {h}");
     }
 
     #[test]
@@ -2260,15 +2379,15 @@ output "HDMI-A-1" enabled=#false {
 }
 "#;
         let (w, h) = parse_menu_size_from_kdl(kdl, "DP-1").unwrap();
-        // logical = 1280x720, then 33%.
-        approx(w, 1280.0 * MENU_SCREEN_FRACTION);
-        approx(h, 720.0 * MENU_SCREEN_FRACTION);
+        // logical = 1280x720, then width 33% / height 66%.
+        approx(w, 1280.0 * MENU_WIDTH_FRACTION);
+        approx(h, 720.0 * MENU_HEIGHT_FRACTION);
     }
 
     #[test]
     fn empty_target_uses_first_enabled_output() {
         let (w, _h) = parse_menu_size_from_kdl(SAMPLE, "").unwrap();
-        approx(w, 2560.0 * MENU_SCREEN_FRACTION);
+        approx(w, 2560.0 * MENU_WIDTH_FRACTION);
     }
 
     #[test]
@@ -2276,7 +2395,7 @@ output "HDMI-A-1" enabled=#false {
         // Target a name that doesn't exist → first enabled output (DP-1), not the
         // disabled HDMI-A-1.
         let (w, _h) = parse_menu_size_from_kdl(SAMPLE, "NOPE").unwrap();
-        approx(w, 2560.0 * MENU_SCREEN_FRACTION);
+        approx(w, 2560.0 * MENU_WIDTH_FRACTION);
     }
 
     #[test]
