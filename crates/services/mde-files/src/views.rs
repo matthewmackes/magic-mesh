@@ -19,7 +19,7 @@ use crate::selection::Selection;
 use crate::theme as t;
 use crate::widgets::{
     banner, breadcrumb_tag, disclosure_row, file_row, file_row_head, ghost_button_style, icon,
-    list_row, peer_card, section_h, side_row, side_section_header, tx_row, BannerStat,
+    list_row, peer_card, section_h, side_row, side_section_header, tx_row, BannerStat, RowMotionCtx,
     SideRowVariant,
 };
 
@@ -912,6 +912,7 @@ pub fn peer_folder<'a>(
     search_query: &'a str,
     layout: Layout,
     selection: &'a Selection,
+    motion: RowMotionCtx<'a>,
 ) -> Element<'a, Message> {
     let kind_icon = icons::svg_for_peer_kind(peer.kind);
     let lat_or_last = match peer.latency {
@@ -962,12 +963,13 @@ pub fn peer_folder<'a>(
         Layout::List => column![file_row_head("Origin")],
         Layout::Grid => column![],
     };
-    for f in &filtered_rows {
+    for (i, f) in filtered_rows.iter().enumerate() {
         let sel = selection.is_selected(&f.name);
         let foc = selection.is_focused(&f.name);
+        let rm = motion.for_row(&f.name, i, sel);
         let row_el = match layout {
-            Layout::List => list_row(f.clone(), true, sel, foc),
-            Layout::Grid => file_row(f.clone(), true, sel, foc),
+            Layout::List => list_row(f.clone(), true, sel, foc, rm),
+            Layout::Grid => file_row(f.clone(), true, sel, foc, rm),
         };
         list = list.push(row_el);
     }
@@ -1006,17 +1008,19 @@ fn file_listing(
     head_label: &str,
     layout: Layout,
     selection: &Selection,
+    motion: RowMotionCtx<'_>,
 ) -> Element<'static, Message> {
     let mut list = match layout {
         Layout::List => column![file_row_head(head_label)],
         Layout::Grid => column![].spacing(8),
     };
-    for f in rows {
+    for (i, f) in rows.iter().enumerate() {
         let sel = selection.is_selected(&f.name);
         let foc = selection.is_focused(&f.name);
+        let rm = motion.for_row(&f.name, i, sel);
         let el = match layout {
-            Layout::List => list_row(f.clone(), show_src, sel, foc),
-            Layout::Grid => file_row(f.clone(), show_src, sel, foc),
+            Layout::List => list_row(f.clone(), show_src, sel, foc, rm),
+            Layout::Grid => file_row(f.clone(), show_src, sel, foc, rm),
         };
         list = list.push(el);
     }
@@ -1029,6 +1033,7 @@ pub fn inbox<'a>(
     snap: &'a BackendSnapshot,
     layout: Layout,
     selection: &'a Selection,
+    motion: RowMotionCtx<'a>,
 ) -> Element<'a, Message> {
     let self_node = &snap.self_node;
     let unique_senders = {
@@ -1055,7 +1060,7 @@ pub fn inbox<'a>(
         ],
     );
 
-    let list = file_listing(&snap.inbox, true, "From", layout, selection);
+    let list = file_listing(&snap.inbox, true, "From", layout, selection, motion);
 
     column![
         banner_widget,
@@ -1074,6 +1079,7 @@ pub fn outbox<'a>(
     snap: &'a BackendSnapshot,
     layout: Layout,
     selection: &'a Selection,
+    motion: RowMotionCtx<'a>,
 ) -> Element<'a, Message> {
     let self_node = &snap.self_node;
     let unique_targets = {
@@ -1106,7 +1112,7 @@ pub fn outbox<'a>(
         .padding(Padding::from([8.0, 4.0]))
         .into()
     } else {
-        file_listing(&snap.outbox, true, "To", layout, selection)
+        file_listing(&snap.outbox, true, "To", layout, selection, motion)
     };
 
     column![
@@ -1124,6 +1130,7 @@ pub fn downloads<'a>(
     snap: &'a BackendSnapshot,
     layout: Layout,
     selection: &'a Selection,
+    motion: RowMotionCtx<'a>,
 ) -> Element<'a, Message> {
     let mesh_count = snap.downloads.iter().filter(|d| d.mesh.is_some()).count();
 
@@ -1140,7 +1147,7 @@ pub fn downloads<'a>(
         ],
     );
 
-    let list = file_listing(&snap.downloads, true, "Origin", layout, selection);
+    let list = file_listing(&snap.downloads, true, "Origin", layout, selection, motion);
 
     column![
         banner_widget,
@@ -1161,6 +1168,7 @@ pub fn local_browser<'a>(
     path: &'a str,
     layout: Layout,
     selection: &'a Selection,
+    motion: RowMotionCtx<'a>,
 ) -> Element<'a, Message> {
     let up = button(icon(icons::ARROW_LEFT, 16.0, t::FG))
         .on_press(Message::LocalUp)
@@ -1183,16 +1191,17 @@ pub fn local_browser<'a>(
                 .padding(Padding::from([8.0, 4.0])),
         );
     } else {
-        for f in files {
+        for (i, f) in files.iter().enumerate() {
             let sel = selection.is_selected(&f.name);
             let foc = selection.is_focused(&f.name);
+            let rm = motion.for_row(&f.name, i, sel);
             // AFM-4 — every local row is now actionable: clicking descends a
             // directory or opens a file (LocalActivate resolves the path in the
             // reducer). Was an inert card that no click reached. AFM-7 — the
             // row shape honors the toolbar list/grid toggle.
             let row_el = match layout {
-                Layout::List => list_row(f.clone(), true, sel, foc),
-                Layout::Grid => file_row(f.clone(), true, sel, foc),
+                Layout::List => list_row(f.clone(), true, sel, foc, rm),
+                Layout::Grid => file_row(f.clone(), true, sel, foc, rm),
             };
             list = list.push(
                 button(row_el)
@@ -1215,6 +1224,7 @@ pub fn local_browser<'a>(
 pub fn cloud_devices<'a>(
     files: &'a [crate::model::FileRow],
     selection: &'a Selection,
+    motion: RowMotionCtx<'a>,
 ) -> Element<'a, Message> {
     let header = row![
         icon(icons::HDD, 18.0, t::FG),
@@ -1234,10 +1244,11 @@ pub fn cloud_devices<'a>(
             .padding(Padding::from([8.0, 4.0])),
         );
     } else {
-        for f in files {
+        for (i, f) in files.iter().enumerate() {
             let sel = selection.is_selected(&f.name);
             let foc = selection.is_focused(&f.name);
-            list = list.push(file_row(f.clone(), true, sel, foc));
+            let rm = motion.for_row(&f.name, i, sel);
+            list = list.push(file_row(f.clone(), true, sel, foc, rm));
         }
     }
 
@@ -1376,6 +1387,7 @@ pub fn mesh_home_child<'a>(
     layout: Layout,
     path: &'a [String],
     selection: &'a Selection,
+    motion: RowMotionCtx<'a>,
 ) -> Element<'a, Message> {
     let label = crate::app::mesh_home_label(slug);
     let filtered: Vec<FileRow> = if search::is_active(search) {
@@ -1418,6 +1430,10 @@ pub fn mesh_home_child<'a>(
     if !path.is_empty() {
         list = list.push(parent_link_row());
     }
+    // MOTION-FEEDBACK — stagger index counts only the rendered *file* rows
+    // (folder rows take the non-animated `folder_row_button` path), so the
+    // reveal cascade stays contiguous even in a folder-heavy directory.
+    let mut row_idx = 0usize;
     for f in filtered {
         let is_folder = f.name.ends_with('/') || matches!(f.mime, crate::model::Mime::Folder);
         if is_folder {
@@ -1428,10 +1444,12 @@ pub fn mesh_home_child<'a>(
         } else {
             let sel = selection.is_selected(&f.name);
             let foc = selection.is_focused(&f.name);
+            let rm = motion.for_row(&f.name, row_idx, sel);
+            row_idx += 1;
             // AFM-7 — honor the list/grid toggle for file rows.
             let row_el = match layout {
-                Layout::List => list_row(f, false, sel, foc),
-                Layout::Grid => file_row(f, false, sel, foc),
+                Layout::List => list_row(f, false, sel, foc, rm),
+                Layout::Grid => file_row(f, false, sel, foc, rm),
             };
             list = list.push(row_el);
         }
