@@ -163,9 +163,17 @@ pub fn spawn_heartbeat_worker(
         // sleep makes shutdown responsive within ~100 ms.
         const CHECK_CHUNK: std::time::Duration = std::time::Duration::from_millis(100);
         while !shutdown.load(Ordering::Relaxed) {
-            let hb = build_heartbeat(&node_id, None);
-            if let Err(e) = write_heartbeat(&workgroup_root, &hb) {
-                tracing::warn!(error = %e, "heartbeat: write failed");
+            // SUBSTRATE-3 — the legacy fs heartbeat file is redundant once this node
+            // is on the etcd plane: the peer-record (below) + the etcd keepalive lease
+            // carry liveness. Writing it on an etcd node only fails noisily every
+            // interval on an unmounted QNM-Shared ("would poison the mountpoint" — seen
+            // in the SUBSTRATE-14 reboot drill). Skip it when etcd is active; keep it as
+            // the liveness signal on every pre-cutover (fs) node, so the fallback is intact.
+            if etcd_endpoints.is_empty() {
+                let hb = build_heartbeat(&node_id, None);
+                if let Err(e) = write_heartbeat(&workgroup_root, &hb) {
+                    tracing::warn!(error = %e, "heartbeat: write failed");
+                }
             }
             // PEERVER-2 — refresh the peer-convergence record at most
             // once/min (own-row authority: we are the sole writer of
