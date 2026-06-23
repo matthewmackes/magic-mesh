@@ -1837,9 +1837,13 @@ the plane and it **survives killing the current zone leader**.
 - [ ] **DATACENTER-23: control-plane DR (encrypted backup + one-click restore).**
   **Acceptance**:
     - [ ] periodic encrypted backup of Tofu state + Nebula CA + secret store to an off-fleet target; a guided restore rebirths the control plane and re-elects a leader
-- [ ] **DATACENTER-24: logs aggregation + periodic health checks.**
+- [>] **DATACENTER-24: logs aggregation + periodic health checks.** *(session=calm-ray-dcr8)*
+  *HEALTH half done: a leader-gated `dc_health` worker runs periodic best-effort checks (each dom0 reachable,
+  etcd store, secret-store) → `event/dc/health/*` with ok/warn/fail + dedup; the Overview shows a health
+  summary (N ok · M warn · K fail) + an alert list. Remaining: cert/token-expiry + VM-crash/pool-degraded
+  checks, and the logs-aggregation half (host/VM/worker logs → fleet_logs).*
   **Acceptance**:
-    - [ ] host/VM/worker logs aggregate into fleet_logs/Bus with a per-resource view; periodic checks (host/VM/overlay/cert) feed `health_check` + raise alerts (host down, VM crash, pool degraded, drift, token/cert expiry)
+    - [>] host/VM/worker logs aggregate into fleet_logs/Bus with a per-resource view; periodic checks (host/VM/overlay/cert) feed `health_check` + raise alerts (host down, VM crash, pool degraded, drift, token/cert expiry) — *health checks (dom0/etcd/secret-store) + Overview summary done; cert/expiry + crash/pool checks + logs aggregation pending*
 
 ### Phase 6 — Consolidation
 - [ ] **DATACENTER-25: absorb/deprecate overlapping panels into Datacenter tabs.**
