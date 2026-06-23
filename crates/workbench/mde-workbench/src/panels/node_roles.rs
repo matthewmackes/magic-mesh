@@ -8,9 +8,11 @@
 //! profile bakes).
 //!
 //! The interactive **tag editor** (W26 write side) lands here: each
-//! node's v1 tags (hop / execution / headless, W82) render as toggle
-//! buttons that shell `mackesd tag --host <h> --set <new-set>` (any
-//! enrolled surface may set any target's tags, W83) and reload.
+//! node's v1 tags (hop / execution / headless / hypervisor, W82 +
+//! DATACENTER-17) render as toggle buttons that shell `mackesd tag
+//! --host <h> --set <new-set>` (any enrolled surface may set any
+//! target's tags, W83) and reload. The `hypervisor` tag is how an
+//! XCP-ng dom0 shows as a Hypervisor in the roster.
 
 use std::collections::BTreeMap;
 
@@ -43,8 +45,11 @@ pub struct NodeRoleRow {
     pub tags: Vec<String>,
 }
 
-/// The v1 capability-tag vocabulary the editor toggles (W82).
-pub const V1_TAGS: [&str; 3] = ["hop", "execution", "headless"];
+/// The v1 capability-tag vocabulary the editor toggles (W82; `hypervisor`
+/// added by DATACENTER-17 so an XCP-ng dom0 shows as a Hypervisor). Mirrors
+/// `mackes_mesh_types::cap_tags::CapabilityTag` — the set `mackesd tag --set`
+/// gates on; a toggle the writer can't parse would be a dead button.
+pub const V1_TAGS: [&str; 4] = ["hop", "execution", "headless", "hypervisor"];
 
 /// The tag set after toggling `tag` on a node currently carrying
 /// `current` — the comma-joined value handed to `mackesd tag --set`
@@ -312,6 +317,16 @@ mod tests {
         assert_eq!(rows[1].role, "workstation");
         // tags sorted alphabetically.
         assert_eq!(rows[1].tags, vec!["execution", "hop"]);
+    }
+
+    #[test]
+    fn v1_tags_match_the_typed_vocabulary() {
+        // The editor toggles must be exactly the tags `mackesd tag --set`
+        // can persist; a toggle outside CapabilityTag would be a dead button
+        // (the write would bail "unknown capability tag"). DATACENTER-17.
+        use mackes_mesh_types::cap_tags::CapabilityTag;
+        let typed: Vec<&str> = CapabilityTag::ALL.iter().map(|t| t.as_str()).collect();
+        assert_eq!(V1_TAGS.to_vec(), typed);
     }
 
     #[test]
