@@ -242,6 +242,13 @@ pub mod selinux_monitor;
 // `compute/inventory/<peer-nebula-addr>` per docs/design/v5.0.0-
 // compute.md §3. Silent no-op when virsh/podman are absent.
 pub mod compute_registry;
+// APPS-LIVE-1 — the apps_running worker: mirror this node's set of
+// currently-running launchable apps to <QNM-Shared>/<host>/running-
+// apps.json so the launcher can badge every entry "running on <host>"
+// mesh-wide (same replicated plane as compute-inventory.json; the bus
+// is per-node). Process ↔ .desktop match, reachable from the root
+// daemon without a per-seat compositor probe.
+pub mod apps_running;
 // VIRT-5 (v5.0.0) — VM Nebula cert signing via Bus. Every peer
 // drains `action/compute/cert-sign-request`; on the CA peer
 // (detected by ~/.config/mde/nebula/ca.key) calls `nebula-cert

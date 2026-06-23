@@ -333,6 +333,64 @@ pub fn fleet_workload_entries_in(root: &std::path::Path) -> Vec<AppEntry> {
     out
 }
 
+// ───────────────────────── running apps (APPS-LIVE-1) ─────────────────────────
+
+/// APPS-LIVE-1 — fold every peer's running-app set off the replicated QNM-Shared
+/// plane (`<root>/<host>/running-apps.json`, written by each node's `apps_running`
+/// worker) into a map `desktop-id → sorted unique hosts running it`. Empty when
+/// the share isn't mounted. The launcher uses this to badge each local app entry
+/// with a live "running on <host>" indicator, mesh-wide.
+#[must_use]
+pub fn fleet_running_hosts_in(root: &std::path::Path) -> HashMap<String, Vec<String>> {
+    let mut by_id: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return HashMap::new();
+    };
+    for ent in entries.flatten() {
+        let path = ent.path().join("running-apps.json");
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(doc) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        let host = doc
+            .get("hostname")
+            .and_then(|h| h.as_str())
+            .unwrap_or("")
+            .to_string();
+        if host.is_empty() {
+            continue;
+        }
+        if let Some(ids) = doc.get("ids").and_then(|i| i.as_array()) {
+            for id in ids.iter().filter_map(|v| v.as_str()) {
+                by_id.entry(id.to_string()).or_default().insert(host.clone());
+            }
+        }
+    }
+    by_id
+        .into_iter()
+        .map(|(id, hosts)| (id, hosts.into_iter().collect()))
+        .collect()
+}
+
+/// APPS-LIVE-1 — stamp running state onto the local app entries: for each entry
+/// whose desktop id appears in `running` (the [`fleet_running_hosts_in`] map), set
+/// `state="running"` and `node` to the comma-joined hosts it's live on. Pure +
+/// unit-tested; `apps` is consumed and returned so the merge is a simple map.
+#[must_use]
+pub fn apply_running_state(mut apps: Vec<AppEntry>, running: &HashMap<String, Vec<String>>) -> Vec<AppEntry> {
+    for app in &mut apps {
+        if let Some(hosts) = running.get(&app.id) {
+            if !hosts.is_empty() {
+                app.state = "running".into();
+                app.node = hosts.join(", ");
+            }
+        }
+    }
+    apps
+}
+
 // ───────────────────────── assembly + responder ─────────────────────────
 
 /// Merge all sources into the `action/apps/list` reply, with per-kind counts.
@@ -476,7 +534,13 @@ where
 {
     match verb {
         "list" => {
-            let local = scan_local_apps(&default_app_dirs(&svc.home));
+            // APPS-LIVE-1 — stamp each local app entry with live running state +
+            // the host(s) it runs on, folded off the replicated running-apps plane
+            // (each node's apps_running worker). An unmounted share = no badges.
+            let local = apply_running_state(
+                scan_local_apps(&default_app_dirs(&svc.home)),
+                &fleet_running_hosts_in(&svc.workgroup_root),
+            );
             let mesh = mesh_entries_from_directory(&dir_doc(), &svc.node_id);
             // WORKLOAD-FLEET-2 — fleet-wide workloads from the replicated plane;
             // fall back to this node's own bus inventory when the share is absent.
@@ -805,6 +869,79 @@ mod tests {
     #[test]
     fn fleet_workload_entries_empty_when_no_root() {
         assert!(fleet_workload_entries_in(std::path::Path::new("/nonexistent-xyz")).is_empty());
+    }
+
+    #[test]
+    fn fleet_running_hosts_unions_peers_and_dedups_by_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        // fedora runs firefox + gimp; node-13 also runs firefox.
+        for (host, ids) in [
+            ("fedora", vec!["firefox", "gimp"]),
+            ("node-13", vec!["firefox"]),
+        ] {
+            let d = tmp.path().join(host);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("running-apps.json"),
+                json!({"hostname": host, "ids": ids}).to_string(),
+            )
+            .unwrap();
+        }
+        // A non-running-apps dir is tolerated.
+        std::fs::create_dir_all(tmp.path().join("peers")).unwrap();
+        let map = fleet_running_hosts_in(tmp.path());
+        let mut ff = map.get("firefox").cloned().unwrap();
+        ff.sort();
+        assert_eq!(ff, vec!["fedora".to_string(), "node-13".to_string()]);
+        assert_eq!(map.get("gimp").cloned().unwrap(), vec!["fedora".to_string()]);
+    }
+
+    #[test]
+    fn fleet_running_hosts_empty_when_no_root() {
+        assert!(fleet_running_hosts_in(std::path::Path::new("/nonexistent-xyz")).is_empty());
+    }
+
+    #[test]
+    fn apply_running_state_badges_matching_apps_only() {
+        let apps = vec![
+            AppEntry {
+                id: "firefox".into(),
+                name: "Firefox".into(),
+                kind: "app".into(),
+                source: "xdg".into(),
+                node: String::new(),
+                exec: "firefox %u".into(),
+                endpoint: String::new(),
+                icon: String::new(),
+                health: String::new(),
+                state: String::new(),
+            },
+            AppEntry {
+                id: "gimp".into(),
+                name: "GIMP".into(),
+                kind: "app".into(),
+                source: "flatpak".into(),
+                node: String::new(),
+                exec: "gimp".into(),
+                endpoint: String::new(),
+                icon: String::new(),
+                health: String::new(),
+                state: String::new(),
+            },
+        ];
+        let mut running = HashMap::new();
+        running.insert(
+            "firefox".to_string(),
+            vec!["fedora".to_string(), "node-13".to_string()],
+        );
+        let out = apply_running_state(apps, &running);
+        let ff = out.iter().find(|a| a.id == "firefox").unwrap();
+        assert_eq!(ff.state, "running");
+        assert_eq!(ff.node, "fedora, node-13");
+        // Unmatched app is untouched.
+        let g = out.iter().find(|a| a.id == "gimp").unwrap();
+        assert!(g.state.is_empty());
+        assert!(g.node.is_empty());
     }
 
     #[test]

@@ -274,6 +274,40 @@ pub fn workload_running(state: &str) -> bool {
         || state.to_lowercase().starts_with("up ")
 }
 
+/// APPS-LIVE-1 — true when a local app entry has been stamped live by the
+/// aggregator (`state=="running"`, with the host(s) in `node`). The launcher
+/// badges these with a running dot + "running on <host>".
+#[must_use]
+pub fn app_running(e: &Entry) -> bool {
+    e.kind == "app" && e.state.eq_ignore_ascii_case("running")
+}
+
+/// APPS-LIVE-1/2 — the hosts a running app entry is live on (the aggregator
+/// comma-joins them into `node`). Empty when the entry isn't running.
+#[must_use]
+pub fn app_running_hosts(e: &Entry) -> Vec<String> {
+    if !app_running(e) {
+        return Vec::new();
+    }
+    e.node
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// APPS-LIVE-2 — true when a running app is live on THIS node (`this_host`), so a
+/// click should raise its window locally rather than relaunch. Case-insensitive
+/// host match against the comma-joined host list.
+#[must_use]
+pub fn app_running_local(e: &Entry, this_host: &str) -> bool {
+    !this_host.is_empty()
+        && app_running_hosts(e)
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(this_host))
+}
+
 /// The argv to control a local workload (APPS-6). VMs go through `virsh`
 /// (`qemu:///system`, the same connection the Workbench compute panel uses);
 /// containers through `podman`. `Attach` returns the inner console/shell argv
@@ -392,6 +426,37 @@ mod tests {
         assert!(workload_running("Up 3 minutes"));
         assert!(!workload_running("shut off"));
         assert!(!workload_running("exited"));
+    }
+
+    #[test]
+    fn app_running_helpers_read_state_and_hosts() {
+        // A local app stamped running on two hosts (one of them this node).
+        let running = parse_entries(
+            r#"{"entries":[{"id":"firefox","name":"Firefox","kind":"app","source":"xdg","exec":"firefox %u","state":"running","node":"fedora, node-13"}]}"#,
+        );
+        let ff = &running[0];
+        assert!(app_running(ff));
+        assert_eq!(app_running_hosts(ff), vec!["fedora", "node-13"]);
+        // Live here → raise; live only on a peer → not local.
+        assert!(app_running_local(ff, "fedora"));
+        assert!(app_running_local(ff, "FEDORA")); // case-insensitive
+        assert!(!app_running_local(ff, "other-node"));
+        assert!(!app_running_local(ff, "")); // unknown this-host
+
+        // A non-running app: no badge, no hosts, never local.
+        let idle = parse_entries(
+            r#"{"entries":[{"id":"gimp","name":"GIMP","kind":"app","source":"flatpak","exec":"gimp"}]}"#,
+        );
+        let g = &idle[0];
+        assert!(!app_running(g));
+        assert!(app_running_hosts(g).is_empty());
+        assert!(!app_running_local(g, "fedora"));
+
+        // app_running is app-kind only (a workload's "running" state isn't an app).
+        let wl = parse_entries(
+            r#"{"entries":[{"id":"workload:podman:c1","name":"nginx","kind":"workload","source":"podman","state":"running"}]}"#,
+        );
+        assert!(!app_running(&wl[0]));
     }
 
     #[test]

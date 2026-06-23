@@ -19,7 +19,8 @@ use cosmic::{Application, Element};
 
 use mde_bus::hooks::config::Priority;
 use mde_cosmic_applet::{
-    filter_entries, parse_entries, workload_argv, Entry, LauncherTab, WorkloadAction,
+    app_running, app_running_local, filter_entries, parse_entries, workload_argv, Entry,
+    LauncherTab, WorkloadAction,
 };
 use mde_theme::animation::{Animator, Transition};
 use mde_theme::{
@@ -263,6 +264,10 @@ struct AppsApplet {
     /// [`mde_theme::prefs::MotionPrefs::apply`] so a disabled/scaled preference is
     /// honored; refreshed with the palette on open.
     motion: mde_theme::prefs::MotionPrefs,
+    /// APPS-LIVE-2 — this node's hostname (cached at init), so a click on a
+    /// running app entry can tell "running here" (raise the window) from "running
+    /// on a peer" (relaunch / remote-desktop).
+    this_host: String,
 }
 
 #[derive(Clone, Debug)]
@@ -290,6 +295,11 @@ enum Message {
     Search(String),
     /// Launch a local app by its exec line (Q23).
     LaunchLocal(String),
+    /// APPS-LIVE-2 — a running-on-this-node app was clicked: try to raise its
+    /// existing window instead of relaunching, falling back to `exec` when focus
+    /// isn't possible. Carries `(focus_hint, exec)` — the hint is the app's launch
+    /// binary basename (its likely window class).
+    FocusOrLaunchLocal(String, String),
     /// Open a remote-desktop session to a mesh peer by hostname (APPS-5).
     LaunchMesh(String),
     /// Control a local workload (start/stop/attach) — `(source, name, action)` (APPS-6).
@@ -409,6 +419,19 @@ fn read_qnm_usage() -> Option<(u64, u64)> {
 /// The desktop user whose favorites we sync (Q10). Falls back to `_`.
 fn current_user() -> String {
     std::env::var("USER").unwrap_or_else(|_| "_".to_string())
+}
+
+/// APPS-LIVE-2 — this node's hostname (matches the `hostname` mackesd's
+/// `apps_running` worker stamps into `running-apps.json`), used to decide whether
+/// a running app is live *here* (raise it) or on a peer (relaunch / remote). Reads
+/// `/etc/hostname` (trimmed); falls back to the `HOSTNAME` env then `localhost`.
+fn local_hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "localhost".to_string())
 }
 
 /// APPS-9b — the bus topic a baked Super shortcut publishes (via `--toggle`) to
@@ -567,6 +590,60 @@ fn launch_local(exec: &str) {
         .status();
 }
 
+/// APPS-LIVE-2 — the launch-binary basename of a `.desktop` exec line (the app's
+/// likely window class / `app_id`), used as the focus hint when raising a running
+/// instance. Strips XDG field codes + a path; `None` for an empty exec. Mirrors
+/// the mackesd-side `apps_running::exec_basename` so the hint a click sends back
+/// is the same token mackesd matched against `/proc`.
+fn exec_focus_hint(exec: &str) -> Option<String> {
+    for tok in exec.split_whitespace() {
+        if tok.starts_with('%') || tok == "env" || tok.contains('=') {
+            continue;
+        }
+        let base = std::path::Path::new(tok)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(tok);
+        if !base.is_empty() {
+            return Some(base.to_string());
+        }
+    }
+    None
+}
+
+/// APPS-LIVE-2 — raise an already-running app's window, returning `true` when a
+/// focus tool actually activated a matching window.
+///
+/// Native Wayland has no portable raise, but apps running under XWayland (the
+/// common case for Firefox/GIMP/etc.) are reachable via `wmctrl`: `wmctrl -x -a
+/// <class>` activates the first window whose WM class contains the token
+/// (case-insensitive) — the `.desktop` launch binary is the usual class token.
+///
+/// Returns `false` when no tool is present or no window matched, so the caller
+/// falls back to relaunch (the acceptance's "fall back to relaunch" path).
+fn focus_local_window(hint: &str) -> bool {
+    if hint.is_empty() {
+        return false;
+    }
+    // `wmctrl -x -a <class>` raises the first window whose WM class contains the
+    // token (case-insensitive). Exit status 0 = a window was activated.
+    std::process::Command::new("wmctrl")
+        .args(["-x", "-a", hint])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// APPS-LIVE-2 — try to focus a running local app by `hint`; relaunch via `exec`
+/// when focus isn't possible (no tool / no matching window). Detached spawn for
+/// the fallback (the NOTIFY-UI-4 no-zombie rule), same as [`launch_local`].
+fn focus_or_launch_local(hint: &str, exec: &str) {
+    if focus_local_window(hint) {
+        return;
+    }
+    launch_local(exec);
+}
+
 fn carbon(c: Rgba) -> cosmic::iced::Color {
     cosmic::iced::Color {
         r: f32::from(c.r) / 255.0,
@@ -649,6 +726,7 @@ impl Application for AppsApplet {
                 releasing: None,
                 reduce_motion,
                 motion: prefs.motion,
+                this_host: local_hostname(),
             },
             // Prime the list so the first open is instant.
             load_task(),
@@ -895,6 +973,16 @@ impl Application for AppsApplet {
             Message::Search(q) => self.query = q,
             Message::LaunchLocal(exec) => {
                 launch_local(&exec);
+                if let Some(id) = self.popup.take() {
+                    return cosmic::task::message(cosmic::Action::Cosmic(
+                        cosmic::app::Action::Surface(destroy_popup(id)),
+                    ));
+                }
+            }
+            Message::FocusOrLaunchLocal(hint, exec) => {
+                // APPS-LIVE-2 — raise the running window instead of relaunching
+                // (falls back to relaunch when focus isn't possible), then close.
+                focus_or_launch_local(&hint, &exec);
                 if let Some(id) = self.popup.take() {
                     return cosmic::task::message(cosmic::Action::Cosmic(
                         cosmic::app::Action::Surface(destroy_popup(id)),
@@ -1603,8 +1691,16 @@ impl AppsApplet {
     /// APPS-WIDE — the primary action for a Favorites tile press: launch apps /
     /// mesh-apps directly (favorites are normally pinned apps), else fall back to
     /// selecting the entry (opens its detail in the list view).
-    fn entry_primary_msg(e: &Entry) -> Message {
+    fn entry_primary_msg(e: &Entry, this_host: &str) -> Message {
         match e.kind.as_str() {
+            // APPS-LIVE-2 — a running-here app raises its window instead of
+            // relaunching (falls back to relaunch in the handler).
+            "app" if !e.exec.is_empty() && app_running_local(e, this_host) => {
+                Message::FocusOrLaunchLocal(
+                    exec_focus_hint(&e.exec).unwrap_or_default(),
+                    e.exec.clone(),
+                )
+            }
             "app" if !e.exec.is_empty() => Message::LaunchLocal(e.exec.clone()),
             "mesh-app" if !e.node.is_empty() => Message::LaunchMesh(e.node.clone()),
             _ => Message::SelectEntry(e.id.clone()),
@@ -1696,7 +1792,7 @@ impl AppsApplet {
             .align_x(cosmic::iced::Alignment::Center)
             .width(Length::Fill),
         )
-        .on_press(Self::entry_primary_msg(e))
+        .on_press(Self::entry_primary_msg(e, &self.this_host))
         .width(Length::Fill)
         .class(cosmic::theme::Button::Standard);
         // APPS-FX-1 — render the lift as padding: top reserves `TILE_HOVER_RISE_PX`
@@ -1733,6 +1829,9 @@ impl AppsApplet {
             "mesh-app" => format!("mesh · {} · {}", e.node, e.health),
             "workload" => format!("{} · {}", e.source, e.state),
             "service" => format!("service · {}", e.node),
+            // APPS-LIVE-1 — a local app stamped running (state="running", node=the
+            // host(s) it's live on) reads "<source> · running on <host>".
+            "app" if app_running(e) => format!("{} · running on {}", e.source, e.node),
             _ => e.source.clone(),
         };
 
@@ -1859,6 +1958,8 @@ impl AppsApplet {
             "mesh-app" => e.health.as_str(),
             "workload" => e.state.as_str(),
             "service" => "running",
+            // APPS-LIVE-1 — a local app gets a running dot only when stamped live.
+            "app" if app_running(e) => "running",
             _ => return None,
         };
         let sl = s.to_lowercase();
@@ -1899,6 +2000,17 @@ impl AppsApplet {
 
         let mut actions: Vec<Element<Message>> = Vec::new();
         match e.kind.as_str() {
+            "app" if !e.exec.is_empty() && app_running_local(e, &self.this_host) => {
+                // APPS-LIVE-2 — running here: the primary action raises the
+                // existing window (relaunch is the in-handler fallback).
+                actions.push(primary(
+                    "Raise",
+                    Message::FocusOrLaunchLocal(
+                        exec_focus_hint(&e.exec).unwrap_or_default(),
+                        e.exec.clone(),
+                    ),
+                ));
+            }
             "app" if !e.exec.is_empty() => {
                 actions.push(primary("Launch", Message::LaunchLocal(e.exec.clone())));
             }
