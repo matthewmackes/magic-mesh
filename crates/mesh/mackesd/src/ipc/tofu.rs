@@ -22,8 +22,8 @@
 //!
 //! DC-15 also exposes a read-only **state browser** verb (DATACENTER-15):
 //!   * `action/dc/tofu-state` → the managed-resource addresses from
-//!     `tofu state list` plus a `drift` flag derived from a detailed-exit-code
-//!     `tofu plan`. Request `{ "workspace": ... }`, reply
+//!     `tofu state list` plus a `drift` flag from parsing a `tofu plan` (ignoring
+//!     the 0.2.x provider's benign phantom fields). Request `{ "workspace": ... }`, reply
 //!     `{"ok":true,"resources":[<addr>...],"drift":<bool>}`. Read-only.
 
 use std::collections::HashMap;
@@ -101,13 +101,53 @@ pub fn parse_state_list(out: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether a `tofu plan -detailed-exitcode` exit code signals drift. PURE.
+/// Whether a `tofu plan -no-color` output signals REAL drift. PURE.
 ///
-/// Detailed exit codes: `0` = no changes, `2` = changes (drift), anything else
-/// (notably `1` = error) is treated as *not drift* — the flag fails closed.
+/// `tofu plan -detailed-exitcode` returns 2 for ANY diff, but the early-stage
+/// (0.2.x) `xenserver` provider can't round-trip two benign fields
+/// (`check_ip_timeout`, `default_ip`), so it reports a phantom change on every
+/// plan. This parses the plan text and returns true only when a resource is
+/// added/destroyed or an attribute OUTSIDE that benign set changes. "No changes"
+/// or only-benign → false; unrecognized output → false (fails closed).
 #[must_use]
-pub fn drift_from_exit(code: i32) -> bool {
-    code == 2
+pub fn plan_has_real_drift(plan: &str) -> bool {
+    const BENIGN: [&str; 2] = ["check_ip_timeout", "default_ip"];
+    if plan.contains("No changes.") {
+        return false;
+    }
+    for line in plan.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("Plan:") {
+            // "Plan: A to add, B to change, C to destroy" — add/destroy = real.
+            let count = |needle: &str| -> u32 {
+                rest.split(',')
+                    .find(|seg| seg.contains(needle))
+                    .and_then(|seg| seg.split_whitespace().next())
+                    .and_then(|num| num.parse().ok())
+                    .unwrap_or(0)
+            };
+            if count("to add") > 0 || count("to destroy") > 0 {
+                return true;
+            }
+        }
+        // A diff line is "<+|~|-> <attr> = …"; the resource header is
+        // "~ resource \"…\"". Any changed attr outside the benign set = drift.
+        for sym in ['+', '~', '-'] {
+            if let Some(rest) = t.strip_prefix(sym).map(str::trim_start) {
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if name.is_empty() || name == "resource" {
+                    continue;
+                }
+                if !BENIGN.contains(&name.as_str()) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Build the reply for one `action/dc/<verb>` request.
@@ -155,23 +195,15 @@ pub fn build_reply(svc: &TofuService, verb: &str, req_body: Option<&str>) -> Str
             Err(e) => return err(format!("tofu-state exec failed: {e}")),
         };
 
-        // 2. Drift via a detailed-exit-code plan. We echo the exit code so the
-        //    exec only "fails" if bash itself cannot launch.
-        let drift_script = format!(
-            "cd {repo}/{dir} && source ./env.sh 2>/dev/null && \
-             tofu plan -detailed-exitcode -no-color >/dev/null 2>&1; echo $?"
-        );
+        // 2. Drift: parse a plain plan, ignoring the provider's benign phantom
+        //    fields (see `plan_has_real_drift`).
+        let drift_script =
+            format!("cd {repo}/{dir} && source ./env.sh 2>/dev/null && tofu plan -no-color 2>&1");
         let drift = match std::process::Command::new("bash")
             .args(["-lc", &drift_script])
             .output()
         {
-            Ok(o) => {
-                let code = String::from_utf8_lossy(&o.stdout)
-                    .trim()
-                    .parse::<i32>()
-                    .unwrap_or(-1);
-                drift_from_exit(code)
-            }
+            Ok(o) => plan_has_real_drift(&String::from_utf8_lossy(&o.stdout)),
             Err(e) => return err(format!("tofu-state exec failed: {e}")),
         };
 
@@ -281,12 +313,29 @@ mod tests {
     }
 
     #[test]
-    fn drift_from_exit_true_only_for_two() {
-        assert!(drift_from_exit(2));
-        assert!(!drift_from_exit(0)); // no changes
-        assert!(!drift_from_exit(1)); // error → fail closed
-        assert!(!drift_from_exit(-1)); // unparseable → fail closed
-        assert!(!drift_from_exit(127));
+    fn plan_drift_ignores_benign_provider_fields() {
+        // "No changes" → no drift.
+        assert!(!plan_has_real_drift(
+            "No changes. Your infrastructure matches."
+        ));
+        // The xenserver-provider phantom: only check_ip_timeout + default_ip → NOT drift.
+        let benign = "  # xenserver_vm.build_50 will be updated in-place\n  \
+            ~ resource \"xenserver_vm\" \"build_50\" {\n      \
+            + check_ip_timeout  = 0\n      + default_ip        = (known after apply)\n        \
+            id                = \"1119\"\n    }\nPlan: 0 to add, 1 to change, 0 to destroy.";
+        assert!(!plan_has_real_drift(benign));
+        // A real attribute change → drift.
+        let real = "  ~ resource \"xenserver_vm\" \"build_50\" {\n      \
+            ~ static_mem_max = 25769803776 -> 17179869184\n    }\n\
+            Plan: 0 to add, 1 to change, 0 to destroy.";
+        assert!(plan_has_real_drift(real));
+        // An add or destroy is always real drift.
+        assert!(plan_has_real_drift(
+            "Plan: 1 to add, 0 to change, 0 to destroy."
+        ));
+        assert!(plan_has_real_drift(
+            "Plan: 0 to add, 0 to change, 1 to destroy."
+        ));
     }
 
     #[test]
