@@ -22,6 +22,11 @@ use serde_json::json;
 
 use mackes_mesh_types::{exposure, peers, route_trace};
 
+/// Hard cap on a single best-effort `traceroute` run so a wedged tool / a
+/// black-holed target can't pin the responder thread (the bounded subprocess
+/// helper kills the child at this deadline). 20 hops × ~2 s wait fits inside it.
+const TRACEROUTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
 /// The route-trace responder — rooted at the shared workgroup root (where the
 /// exposure policy + peer directory live).
 #[derive(Debug, Clone)]
@@ -38,7 +43,14 @@ impl RouteService {
 }
 
 /// Action verbs served on `action/route/<verb>`.
-pub const ACTION_VERBS: [&str; 1] = ["trace"];
+///
+/// * `trace` — assemble the typed `PathGraph` (modeled + enriched with live
+///   overlay RTT/loss where measurable).
+/// * `traceroute` — a best-effort live public hop list (RTT) from THIS node to a
+///   target, beyond the VPN exit (ROUTE-TRACE-3). Always returns a typed
+///   [`route_trace::PublicTrace`]; an absent tool / a filtered path degrades to
+///   `available:false` with no error.
+pub const ACTION_VERBS: [&str; 2] = ["trace", "traceroute"];
 
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -132,13 +144,102 @@ fn overlay_ip_of(root: &std::path::Path, hostname: &str) -> Option<String> {
         .and_then(|p| p.overlay_ip)
 }
 
+// --- ROUTE-TRACE-3: live, best-effort measurement --------------------------
+
+/// Read the local node's per-peer overlay link measurements from the existing
+/// path classifier / netstate — the `mesh-latency` worker's snapshot
+/// (`~/.cache/mde/mesh-latency.json`), keyed by peer name. Returns an empty map
+/// (never an error, never a panic — §2) when the cache is missing or unparseable,
+/// which the pure [`route_trace::PathGraph::apply_overlay_latency`] then treats
+/// as "every overlay edge stays modeled".
+fn read_overlay_latency() -> HashMap<String, route_trace::LinkMeasurement> {
+    let path = crate::workers::mesh_latency::default_cache_path();
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    let Ok(snap) = serde_json::from_str::<crate::workers::mesh_latency::LatencySnapshot>(&raw)
+    else {
+        return HashMap::new();
+    };
+    snap.peers
+        .into_iter()
+        // The classifier times an RTT through the overlay; it doesn't sample
+        // loss yet, so loss stays `None` (modeled), never invented.
+        .map(|(peer, lat)| (peer, route_trace::LinkMeasurement::from_rtt(lat.rtt_ms)))
+        .collect()
+}
+
+/// True when the egress `from` source label is THIS node — the only node whose
+/// public egress path this responder can honestly traceroute. A blank `from`, or
+/// a different node's name, is not local (so we leave its public hop modeled
+/// rather than mis-attributing our own measurement). Matches the locality test
+/// [`host_inbound_firewall`] uses for the firewall read.
+fn from_is_local(from: &str) -> bool {
+    let me = local_hostname();
+    !from.is_empty() && !me.is_empty() && from.eq_ignore_ascii_case(&me)
+}
+
+/// Run a best-effort public `traceroute` from THIS node to `target` and return
+/// the typed hop list. `traceroute -n -w 2 -q 1 -m 20` (numeric, 2 s/hop, one
+/// query, 20-hop cap) — bounded by [`TRACEROUTE_TIMEOUT`] so a wedged tool can't
+/// pin the thread. The binary being absent, the run failing, or every hop being
+/// ICMP-filtered all degrade to an `available:false` / gap-only result — never a
+/// panic, never an error (§2). Reuses the netassess traceroute parser so the hop
+/// shapes match the rest of the daemon.
+fn run_public_traceroute(target: &str) -> route_trace::PublicTrace {
+    let tool = "traceroute";
+    // Reject a malformed target up front: empty, or a flag-looking string
+    // (leading `-`) that traceroute would parse as an option, not a host. The
+    // body is mesh-cert-gated, but we never feed an arbitrary `-…` to the tool;
+    // an unusable target degrades to modeled, never errors (§2).
+    if target.is_empty() || target.starts_with('-') {
+        return route_trace::PublicTrace::unavailable(target, tool);
+    }
+    let mut cmd = std::process::Command::new(tool);
+    // `--` ends option parsing so the target is always taken positionally.
+    cmd.args(["-n", "-w", "2", "-q", "1", "-m", "20", "--", target]);
+    let Ok(out) = crate::workers::proc::output_with_timeout(cmd, TRACEROUTE_TIMEOUT) else {
+        // No binary / spawn failure / timed out ⇒ degrade to modeled.
+        return route_trace::PublicTrace::unavailable(target, tool);
+    };
+    if !out.status.success() {
+        return route_trace::PublicTrace::unavailable(target, tool);
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let hops: Vec<route_trace::PublicHop> = crate::workers::netassess::parse_traceroute(&stdout)
+        .into_iter()
+        .map(|h| route_trace::PublicHop {
+            ttl: h.ttl,
+            ip: h.ip,
+            rtt_ms: h.rtt_ms,
+        })
+        .collect();
+    route_trace::PublicTrace {
+        target: target.to_string(),
+        tool: tool.to_string(),
+        available: true,
+        hops,
+    }
+}
+
 /// Build the reply for one `action/route/<verb>` request.
 #[must_use]
 pub fn build_reply(svc: &RouteService, verb: &str, req_body: Option<&str>) -> String {
     let err = |m: String| json!({ "error": m }).to_string();
-    if verb != "trace" {
-        return err(format!("unknown route verb: {verb}"));
+    match verb {
+        "trace" => build_trace_reply(svc, req_body),
+        "traceroute" => build_traceroute_reply(req_body),
+        other => err(format!("unknown route verb: {other}")),
     }
+}
+
+/// `action/route/trace` — assemble the typed `PathGraph` and enrich it with live,
+/// best-effort measurement (ROUTE-TRACE-3): per-overlay-link RTT from the path
+/// classifier / netstate onto the Mesh edges, and a real public hop RTT (for an
+/// egress trace) onto the Public edge. Every measurement is best-effort — an
+/// unmeasurable segment is left modeled, never errors the reply (§2).
+fn build_trace_reply(svc: &RouteService, req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
     let Some(body) = req_body else {
         return err("trace: missing request body".into());
     };
@@ -160,7 +261,7 @@ pub fn build_reply(svc: &RouteService, verb: &str, req_body: Option<&str>) -> St
         .unwrap_or("");
     let root = svc.workgroup_root.as_path();
 
-    let graph = match direction {
+    let mut graph = match direction {
         "ingress" => {
             if to.is_empty() {
                 return err("trace: ingress needs a 'to' service id".into());
@@ -205,9 +306,53 @@ pub fn build_reply(svc: &RouteService, verb: &str, req_body: Option<&str>) -> St
         other => return err(format!("trace: unknown direction '{other}'")),
     };
 
+    // ROUTE-TRACE-3: enrich the modeled graph with live measurement (best-effort).
+    // (1) Per-overlay-link RTT from the path classifier / netstate snapshot onto
+    //     the Mesh edges — an edge with no reading stays modeled (no panic, §2).
+    graph.apply_overlay_latency(&read_overlay_latency());
+    // (2) For an egress trace, splice a real public hop RTT onto the Public edge
+    //     by running a best-effort traceroute to the destination. The design runs
+    //     this *from the source node*, so we only measure when `from` IS this
+    //     node — measuring some other node's egress from here would mis-attribute
+    //     the RTT. A non-local source (or an absent tool / filtered path) leaves
+    //     the modeled hop untouched, no error (§2).
+    if direction == "egress" && !to.is_empty() && from_is_local(from) {
+        let trace = run_public_traceroute(to);
+        graph.apply_public_trace(&trace);
+    }
+
     match graph.to_json() {
         Ok(g) => format!("{{\"ok\":true,\"graph\":{g}}}"),
         Err(e) => err(format!("trace: encode: {e}")),
+    }
+}
+
+/// `action/route/traceroute` — a standalone best-effort public hop list from
+/// THIS node to a target (the same measurement the egress trace splices in,
+/// exposed as its own verb for CLI parity / on-demand re-measure). Body
+/// `{ "target": "<ip|host>" }`. Always returns a typed
+/// [`route_trace::PublicTrace`]; an absent tool / a filtered path is reported as
+/// `available:false`, not an error (§2).
+fn build_traceroute_reply(req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("traceroute: missing request body".into());
+    };
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return err(format!("traceroute: bad json: {e}")),
+    };
+    let target = req
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if target.is_empty() {
+        return err("traceroute: needs a 'target' ip/host".into());
+    }
+    let trace = run_public_traceroute(target);
+    match serde_json::to_string(&trace) {
+        Ok(t) => format!("{{\"ok\":true,\"trace\":{t}}}"),
+        Err(e) => err(format!("traceroute: encode: {e}")),
     }
 }
 
@@ -364,5 +509,64 @@ mod tests {
         let (_t, s) = svc();
         assert!(build_reply(&s, "trace", None).contains("missing request body"));
         assert!(build_reply(&s, "bogus", None).contains("unknown route verb"));
+    }
+
+    // --- ROUTE-TRACE-3: live measurement reachable through the responder -------
+
+    #[test]
+    fn traceroute_verb_is_registered() {
+        // The new verb is served + topic-addressable beside `trace`.
+        assert!(ACTION_VERBS.contains(&"traceroute"));
+        assert_eq!(action_topic("traceroute"), "action/route/traceroute");
+    }
+
+    #[test]
+    fn traceroute_verb_reachable_and_returns_typed_trace() {
+        // Reachable through the registered responder dispatch — and best-effort:
+        // whether or not the test bed has a `traceroute` binary / network, it
+        // returns a typed PublicTrace (never an error, never a panic — §2).
+        let (_t, s) = svc();
+        let r = build_reply(
+            &s,
+            "traceroute",
+            Some(&json!({ "target": "1.1.1.1" }).to_string()),
+        );
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{r}");
+        assert_eq!(v["trace"]["target"], "1.1.1.1");
+        assert_eq!(v["trace"]["tool"], "traceroute");
+        // `available` is a bool either way; `hops` is always an array.
+        assert!(v["trace"]["available"].is_boolean());
+        assert!(v["trace"]["hops"].is_array());
+    }
+
+    #[test]
+    fn traceroute_verb_validates_its_body() {
+        let (_t, s) = svc();
+        assert!(build_reply(&s, "traceroute", None).contains("missing request body"));
+        assert!(build_reply(&s, "traceroute", Some("{ not json")).contains("bad json"));
+        assert!(build_reply(&s, "traceroute", Some(&json!({}).to_string()))
+            .contains("needs a 'target'"));
+    }
+
+    #[test]
+    fn egress_trace_runs_best_effort_measurement_without_failing() {
+        // ROUTE-TRACE-3: the egress trace path now reads the overlay-latency cache
+        // and runs a best-effort traceroute. On a host with neither a populated
+        // cache nor a reachable `1.1.1.1`, it must still return a valid graph
+        // (the segments stay modeled — degrade, never error/panic — §2).
+        let (_t, s) = svc();
+        let r = build_reply(
+            &s,
+            "trace",
+            Some(&json!({"direction":"egress","from":"eagle","to":"1.1.1.1"}).to_string()),
+        );
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{r}");
+        assert_eq!(v["graph"]["direction"], "egress");
+        // The public edge exists; its rtt_ms is either a measured number or absent
+        // (modeled) — both are valid, but it must never be a panic/error reply.
+        let edges = v["graph"]["edges"].as_array().unwrap();
+        assert!(!edges.is_empty());
     }
 }
