@@ -1780,9 +1780,9 @@ the plane and it **survives killing the current zone leader**.
   **Acceptance**:
     - [ ] networks/PIFs/VLANs/NIC mgmt/create; overlay peer/route management; an interactive topology map (hosts↔networks↔VMs↔gateway); a unified IP/DNS view correlating UniFi leases ↔ DO DNS ↔ overlay IPs
 - [>] **DATACENTER-14: Gateway tab (UniFi full control).** *(session=calm-ray-dcr8)*
-  *Gateway SOURCE (`gather_gateway`: status + DHCP lease count → `event/dc/gateway/*`, env-gated, cred from
-  the mesh store) + a `action/dc/gateway-reboot` RPC (confirm-gated, IPv4-validated, cred from store). Remaining:
-  firewall/port-forward edits + a richer leases view + putting the UniFi cred in the store for live data.*
+  *Gateway SOURCE (`gather_gateway` → `event/dc/gateway/*`) + `action/dc/gateway-reboot` (confirm-gated) +
+  `action/dc/gateway-status` (leases/uptime/model read) RPCs, all IPv4-validated + cred-from-store. Remaining:
+  firewall/port-forward EDITS + putting the UniFi cred in the store for live data.*
   **Acceptance**:
     - [>] status + DHCP leases (fleet discovery) + firewall/port-forward edits + reboot, via the worker over SSH + the UniFi API; cred from the mesh store (was `/root/.mcnf-unifi-cred`) — *source (status+leases) + reboot done; firewall/port-forward edits + the cred-in-store pending*
 - [>] **DATACENTER-15: Tofu tab (plan/apply/destroy + state + drift + gate).** *(session=calm-ray-dcr8)*
