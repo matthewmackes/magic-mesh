@@ -588,6 +588,16 @@ pub struct DatacenterPanel {
     /// so a fresh load re-seeds (all groups open) but a manual collapse sticks
     /// across re-renders. Reset to `false` on every `Loaded`.
     pub topology_seeded: bool,
+    /// The latest DR / backup status line, rendered under the "Back up now"
+    /// button on the Overview view — the in-flight text, the returned
+    /// `"backed up: <path>"` on success, or the error text. Empty until a backup
+    /// has been run.
+    pub dr_status: String,
+    /// When `true`, a DR backup is awaiting typed confirmation — the Overview
+    /// renders a "Backup state + secrets? [Confirm]" prompt and only the confirm
+    /// button fires the `action/dc/dr-backup` RPC. Cleared once the backup is
+    /// fired.
+    pub dr_confirm: bool,
 }
 
 /// Top-level view selector for the datacenter panel.
@@ -626,6 +636,8 @@ impl Default for DatacenterPanel {
             tofu_confirm: None,
             expanded: BTreeSet::new(),
             topology_seeded: false,
+            dr_status: String::new(),
+            dr_confirm: false,
         }
     }
 }
@@ -735,6 +747,19 @@ pub enum Message {
     /// resource names + the drift flag, `Err` the error text. Routes here as a
     /// panel-scoped message.
     TofuStateDone(Result<(Vec<String>, bool), String>),
+    /// The Overview "Back up now" button was clicked. This only *arms* the
+    /// typed-confirm (`dr_confirm = true`); no RPC fires until the inline
+    /// "Backup state + secrets? [Confirm]" button is pressed.
+    DrBackupClicked,
+    /// The inline confirm for a DR backup was pressed — only this fires the
+    /// `action/dc/dr-backup` RPC (with `"confirm":true`).
+    DrBackup,
+    /// The pending DR-backup confirmation was dismissed (the "Cancel" button) —
+    /// clears `dr_confirm` without firing any RPC.
+    DrBackupCancelled,
+    /// The `action/dc/dr-backup` RPC came back — `Ok` carries the backup path,
+    /// `Err` the error text. Routes here as a panel-scoped message.
+    DrBackupDone(Result<String, String>),
 }
 
 impl DatacenterPanel {
@@ -1005,6 +1030,42 @@ impl DatacenterPanel {
                 self.status = e;
                 Task::none()
             }
+            Message::DrBackupClicked => {
+                // First click only arms the typed-confirm — no RPC fires until
+                // the operator confirms.
+                self.dr_confirm = true;
+                self.dr_status = "Confirm backup below.".into();
+                Task::none()
+            }
+            Message::DrBackup => {
+                self.dr_confirm = false;
+                self.dr_status = "Backing up…".into();
+                Task::perform(
+                    async move {
+                        // Same shape as `tofu_apply`: the Bus RPC borrows a
+                        // non-Send Persist across its internal await, so run the
+                        // whole round trip on a blocking thread with a local
+                        // runtime.
+                        tokio::task::spawn_blocking(dr_backup)
+                            .await
+                            .unwrap_or_else(|e| Err(format!("dr-backup task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::DrBackupDone(result)),
+                )
+            }
+            Message::DrBackupCancelled => {
+                self.dr_confirm = false;
+                self.dr_status.clear();
+                Task::none()
+            }
+            Message::DrBackupDone(Ok(path)) => {
+                self.dr_status = format!("backed up: {path}");
+                Task::none()
+            }
+            Message::DrBackupDone(Err(e)) => {
+                self.dr_status = e;
+                Task::none()
+            }
         }
     }
 
@@ -1118,6 +1179,45 @@ impl DatacenterPanel {
                 col = col.push(text("Health").size(f32::from(spacing::BASE[5])));
                 for el in health_section_view(&self.health, palette) {
                     col = col.push(el);
+                }
+                // DR / Backup control — "Back up now" arms a typed-confirm before
+                // firing the `action/dc/dr-backup` RPC, which snapshots the Tofu
+                // state + secrets. dr_status renders under the button.
+                col = col.push(text("DR / Backup").size(f32::from(spacing::BASE[5])));
+                if self.dr_confirm {
+                    // Armed: surface the typed-confirm — only the confirm button
+                    // carries the `DrBackup` message that fires the RPC.
+                    col = col.push(
+                        row![
+                            text("Backup state + secrets?").colr(palette.text.into_cosmic_color()),
+                            variant_button(
+                                "Confirm".to_string(),
+                                ButtonVariant::Primary,
+                                Some(crate::Message::Datacenter(Message::DrBackup)),
+                                palette,
+                            ),
+                            variant_button(
+                                "Cancel".to_string(),
+                                ButtonVariant::Secondary,
+                                Some(crate::Message::Datacenter(Message::DrBackupCancelled)),
+                                palette,
+                            ),
+                        ]
+                        .spacing(f32::from(spacing::BASE[2])),
+                    );
+                } else {
+                    // Unarmed: the first click only arms the confirm (no RPC).
+                    col = col.push(variant_button(
+                        "Back up now".to_string(),
+                        ButtonVariant::Primary,
+                        Some(crate::Message::Datacenter(Message::DrBackupClicked)),
+                        palette,
+                    ));
+                }
+                if !self.dr_status.is_empty() {
+                    col = col.push(
+                        text(self.dr_status.clone()).colr(palette.text_muted.into_cosmic_color()),
+                    );
                 }
             }
             ViewMode::Tofu => {
@@ -1947,6 +2047,47 @@ fn tofu_apply(workspace: &str) -> Result<String, String> {
     Err(format!("unexpected tofu-apply reply: {raw}"))
 }
 
+/// Fire the `action/dc/dr-backup` Bus RPC (blocking — runs on a `spawn_blocking`
+/// thread) and translate the reply into the backup path. Only reached after the
+/// typed confirm, so it always sends `"confirm":true`. Mirrors `tofu_apply`
+/// exactly: a Persist + `mde_bus::rpc::request` round trip wrapped in a local
+/// tokio runtime because `request` borrows a non-`Send` `Persist` across its
+/// internal await. The reply body is `{"ok":true,"path":".."}` (→ the path) or
+/// `{"error":".."}` (→ the error text).
+fn dr_backup() -> Result<String, String> {
+    let Some(dir) = mde_bus::default_data_dir() else {
+        return Err("no Bus data dir".to_string());
+    };
+    let body = serde_json::json!({ "confirm": true }).to_string();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    let reply = rt.block_on(async {
+        let persist = mde_bus::persist::Persist::open(dir).map_err(|e| e.to_string())?;
+        mde_bus::rpc::request(
+            &persist,
+            "action/dc/dr-backup",
+            mde_bus::hooks::config::Priority::Default,
+            Some("dr-backup"),
+            Some(&body),
+            Duration::from_secs(600),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+    let raw = reply.body.unwrap_or_default();
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("bad dr-backup reply: {e}"))?;
+    if let Some(err) = v.get("error").and_then(serde_json::Value::as_str) {
+        return Err(err.to_string());
+    }
+    if let Some(path) = v.get("path").and_then(serde_json::Value::as_str) {
+        return Ok(path.to_string());
+    }
+    Err(format!("unexpected dr-backup reply: {raw}"))
+}
+
 /// Fire the `action/dc/vm-clone` Bus RPC (blocking — runs on a `spawn_blocking`
 /// thread) and translate the reply into a status line. Mirrors `vm_snapshot`
 /// exactly: a Persist + `mde_bus::rpc::request` round trip wrapped in a local
@@ -2582,6 +2723,42 @@ mod tests {
         let _ = p.update(Message::TofuApplyDone(Err("apply failed".to_string())));
         assert_eq!(p.tofu_output, "apply failed");
         assert_eq!(p.status, "apply failed");
+    }
+
+    #[test]
+    fn dr_backup_requires_typed_confirm_before_firing() {
+        let mut p = DatacenterPanel::new();
+        assert!(!p.dr_confirm);
+        // First click only arms the typed-confirm — it must NOT fire the RPC.
+        let _ = p.update(Message::DrBackupClicked);
+        assert!(p.dr_confirm);
+        assert_eq!(p.dr_status, "Confirm backup below.");
+        // Only the explicit confirm clears the pending state + moves the status
+        // to the in-flight "Backing up…" (the RPC then fires).
+        let _ = p.update(Message::DrBackup);
+        assert!(!p.dr_confirm);
+        assert_eq!(p.dr_status, "Backing up…");
+    }
+
+    #[test]
+    fn dr_backup_cancel_clears_the_pending_confirm() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::DrBackupClicked);
+        assert!(p.dr_confirm);
+        let _ = p.update(Message::DrBackupCancelled);
+        assert!(!p.dr_confirm);
+        assert!(p.dr_status.is_empty());
+    }
+
+    #[test]
+    fn dr_backup_done_writes_status() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::DrBackupDone(Ok(
+            "/var/backups/dc/2026-06-22.tar".to_string()
+        )));
+        assert_eq!(p.dr_status, "backed up: /var/backups/dc/2026-06-22.tar");
+        let _ = p.update(Message::DrBackupDone(Err("backup failed".to_string())));
+        assert_eq!(p.dr_status, "backup failed");
     }
 
     #[test]
