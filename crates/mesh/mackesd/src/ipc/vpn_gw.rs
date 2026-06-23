@@ -18,6 +18,9 @@ use mde_bus::rpc::reply_topic;
 use serde_json::json;
 
 use mackes_mesh_types::vpn::{self, Method, TunnelDef};
+use mackes_mesh_types::vpn_providers::{
+    self, AdapterError, ProducedTunnel, Provider, SecretKind, WgSetup,
+};
 
 /// The VPN responder — rooted at the shared workgroup root (the config home).
 #[derive(Debug, Clone)]
@@ -47,14 +50,29 @@ impl VpnService {
 }
 
 /// Action verbs served on `action/vpn/<verb>`.
-pub const ACTION_VERBS: [&str; 6] = [
+pub const ACTION_VERBS: [&str; 8] = [
     "list-tunnels",
     "add-tunnel",
     "remove-tunnel",
     "tunnel-up",
     "tunnel-down",
     "tunnel-status",
+    // VPN-GW-5 — provider adapters (5 named + generic WG paste / .ovpn import).
+    "list-providers",
+    "setup-provider",
 ];
+
+/// Where a produced tunnel's secret material lands on the node before bring-up.
+/// VPN-GW-2/3 will age-encrypt + leader-distribute this; until then it's written
+/// locally so a single-node setup works end-to-end. WireGuard configs go to the
+/// `wg-quick` config dir; `.ovpn` to the openvpn client dir.
+#[must_use]
+fn secret_path(kind: SecretKind, ifname: &str) -> PathBuf {
+    match kind {
+        SecretKind::WgQuick => PathBuf::from(format!("/etc/wireguard/{ifname}.conf")),
+        SecretKind::Ovpn => PathBuf::from(format!("/etc/openvpn/client/{ifname}.ovpn")),
+    }
+}
 
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -145,6 +163,8 @@ pub fn build_reply(svc: &VpnService, verb: &str, req_body: Option<&str>) -> Stri
             let ifname = t.ifname();
             json!({ "ok": true, "ifname": ifname, "up": iface_up(svc.spawn, &ifname) }).to_string()
         }
+        "list-providers" => list_providers_reply(),
+        "setup-provider" => setup_provider(svc, req_body),
         other => err(format!("unknown vpn verb: {other}")),
     }
 }
@@ -188,6 +208,183 @@ fn bring(svc: &VpnService, t: &TunnelDef, up: bool) -> (bool, String) {
         Ok(s) => (false, format!("{cmd} exited {:?}", s.code())),
         Err(e) => (false, format!("{cmd} not run: {e}")),
     }
+}
+
+/// The first-class providers + the two generic paths, with the per-provider
+/// facts the add-tunnel wizard needs (method, CLI, multi-instance, the WG port).
+/// Pure catalog — derived from the [`Provider`] enum.
+const PROVIDER_CATALOG: [Provider; 7] = [
+    Provider::Mullvad,
+    Provider::Proton,
+    Provider::Ivpn,
+    Provider::Nord,
+    Provider::Surfshark,
+    Provider::GenericWg,
+    Provider::GenericOvpn,
+];
+
+/// `list-providers` — the static provider catalog for the add-tunnel wizard.
+fn list_providers_reply() -> String {
+    let providers: Vec<serde_json::Value> = PROVIDER_CATALOG
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.label(),
+                "method": match p.method() {
+                    Method::Wg => "wg",
+                    Method::Ovpn => "ovpn",
+                    Method::Cli => "cli",
+                    Method::Api => "api",
+                },
+                "cli": p.cli(),
+                "wg_port": p.default_wg_port(),
+                "multi_instance": p.allows_multi_instance(),
+                "exit_check": vpn_providers::exit_check_target(*p),
+            })
+        })
+        .collect();
+    json!({ "ok": true, "providers": providers }).to_string()
+}
+
+/// `setup-provider` — run a provider adapter (VPN-GW-5) end-to-end: build the
+/// verifiable tunnel config from the operator's inputs, write the secret
+/// material to where the existing bring-up machinery reads it, persist the
+/// [`TunnelDef`] into the durable config, and report the produced tunnel + its
+/// exit-IP check target. The body is `{provider, id, server?, ...}` where the
+/// remaining fields depend on the provider:
+///   - WireGuard providers / `generic-wg` (non-paste): a flat [`WgSetup`].
+///   - `generic-wg` paste path: `{provider:"generic-wg", id, server?, wg_config}`.
+///   - `generic-ovpn`: `{provider:"generic-ovpn", id, server?, ovpn}`.
+///
+/// Reachable from the already-spawned vpn responder (no new serve registration).
+fn setup_provider(svc: &VpnService, req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("setup-provider: missing body".into());
+    };
+    let v: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return err(format!("setup-provider: bad json: {e}")),
+    };
+    let Some(provider_label) = v.get("provider").and_then(serde_json::Value::as_str) else {
+        return err("setup-provider: missing 'provider'".into());
+    };
+    let Some(provider) = Provider::from_label(provider_label) else {
+        return err(format!(
+            "setup-provider: unknown provider '{provider_label}'"
+        ));
+    };
+    let id = v
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let server = v
+        .get("server")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+
+    // A usable pasted `wg_config` blob (a non-empty string — not a present-but-
+    // null/non-string key) routes through the paste importer for ANY WireGuard
+    // provider, so a dashboard-exported `.conf` keeps that provider's label.
+    let wg_config = v
+        .get("wg_config")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    // Dispatch to the right adapter. The generic .ovpn / WG-paste paths take a
+    // raw config blob; otherwise a structured WgSetup from flat fields.
+    let produced: Result<ProducedTunnel, AdapterError> = if provider == Provider::GenericOvpn {
+        match v.get("ovpn").and_then(serde_json::Value::as_str) {
+            Some(o) => vpn_providers::import_ovpn(id, server, o),
+            None => return err("setup-provider: generic-ovpn needs an 'ovpn' body".into()),
+        }
+    } else if let Some(conf) = wg_config {
+        vpn_providers::import_wg_paste(provider, id, server, conf)
+    } else {
+        let setup = WgSetup {
+            id: id.to_string(),
+            private_key: str_field(&v, "private_key"),
+            address: str_field(&v, "address"),
+            peer_public_key: str_field(&v, "peer_public_key"),
+            endpoint: str_field(&v, "endpoint"),
+            dns: str_field(&v, "dns"),
+            server: server.to_string(),
+            preshared_key: str_field(&v, "preshared_key"),
+        };
+        vpn_providers::build_wg(provider, &setup)
+    };
+
+    let produced = match produced {
+        Ok(p) => p,
+        Err(e) => return err(format!("setup-provider: {e}")),
+    };
+
+    let ifname = produced.def.ifname();
+    // Write the secret material where bring-up reads it (single-node path; the
+    // leader-managed age distribution is VPN-GW-2/3). Best-effort — honest on a
+    // write failure rather than silently claiming success.
+    let mut wrote_secret = false;
+    let mut secret_note = String::new();
+    if svc.spawn {
+        let path = secret_path(produced.secret_kind, &ifname);
+        match write_secret(&path, &produced.secret) {
+            Ok(()) => wrote_secret = true,
+            Err(e) => secret_note = format!("secret not written ({}): {e}", path.display()),
+        }
+    } else {
+        secret_note = "spawn disabled — secret not written".into();
+    }
+
+    // Persist the durable def (no secret material) into the node's VPN config.
+    let root = svc.workgroup_root.as_path();
+    let mut cfg = vpn::load(root);
+    cfg.upsert(produced.def.clone());
+    if let Err(e) = vpn::save(root, &cfg) {
+        return err(format!("setup-provider: save tunnel: {e}"));
+    }
+
+    json!({
+        "ok": true,
+        "id": produced.def.id,
+        "provider": produced.def.provider,
+        "ifname": ifname,
+        "method": match produced.def.method {
+            Method::Wg => "wg",
+            Method::Ovpn => "ovpn",
+            Method::Cli => "cli",
+            Method::Api => "api",
+        },
+        "secret_written": wrote_secret,
+        "secret_note": secret_note,
+        // The daemon-side verifier curls this THROUGH the tunnel to confirm the
+        // exit IP is the provider's (live verification needs a real account).
+        "exit_check": vpn_providers::exit_check_target(provider),
+    })
+    .to_string()
+}
+
+/// Read a string field from the request body (empty if absent/non-string).
+fn str_field(v: &serde_json::Value, key: &str) -> String {
+    v.get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Write the produced secret material with owner-only perms (it carries the
+/// private key). Creates the parent dir. Best-effort 0600.
+fn write_secret(path: &std::path::Path, body: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 /// Run the VPN Bus responder loop until `should_stop`.
@@ -251,7 +448,9 @@ mod tests {
     #[test]
     fn topic_and_verbs_lock() {
         assert_eq!(action_topic("tunnel-up"), "action/vpn/tunnel-up");
-        assert_eq!(ACTION_VERBS.len(), 6);
+        assert_eq!(ACTION_VERBS.len(), 8);
+        assert!(ACTION_VERBS.contains(&"list-providers"));
+        assert!(ACTION_VERBS.contains(&"setup-provider"));
     }
 
     #[test]
@@ -300,5 +499,179 @@ mod tests {
         let (_t, s) = svc();
         assert!(build_reply(&s, "bogus", None).contains("unknown vpn verb"));
         assert!(build_reply(&s, "tunnel-up", None).contains("missing tunnel id"));
+    }
+
+    // ── VPN-GW-5: provider adapters reachable from the vpn responder ──
+
+    // 44-char base64-looking WG keys for the setup-provider tests.
+    const PK: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const PUB: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=";
+
+    #[test]
+    fn list_providers_returns_the_seven() {
+        let (_t, s) = svc();
+        let r = build_reply(&s, "list-providers", None);
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true));
+        let provs = v["providers"].as_array().unwrap();
+        assert_eq!(provs.len(), 7);
+        let ids: Vec<&str> = provs.iter().filter_map(|p| p["id"].as_str()).collect();
+        for want in [
+            "mullvad",
+            "proton",
+            "ivpn",
+            "nord",
+            "surfshark",
+            "generic-wg",
+            "generic-ovpn",
+        ] {
+            assert!(ids.contains(&want), "missing {want} in {ids:?}");
+        }
+        // Mullvad surfaces its first-party exit-check reflector.
+        let mullvad = provs.iter().find(|p| p["id"] == "mullvad").unwrap();
+        assert_eq!(mullvad["exit_check"], "https://am.i.mullvad.net/json");
+        assert_eq!(mullvad["cli"], "mullvad");
+    }
+
+    #[test]
+    fn setup_provider_wg_persists_tunnel_and_reports_exit_check() {
+        let (_t, s) = svc(); // spawn disabled → no secret write attempted
+        let body = json!({
+            "provider": "mullvad",
+            "id": "mullvad1",
+            "server": "us-nyc",
+            "private_key": PK,
+            "peer_public_key": PUB,
+            "address": "10.64.0.2/32",
+            "endpoint": "us-nyc-wg-301.relays.example",
+            "dns": "10.64.0.1",
+        })
+        .to_string();
+        let r = build_reply(&s, "setup-provider", Some(&body));
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{r}");
+        assert_eq!(v["provider"], "mullvad");
+        assert_eq!(v["ifname"], "mvpn-mullvad1");
+        assert_eq!(v["method"], "wg");
+        assert_eq!(v["exit_check"], "https://am.i.mullvad.net/json");
+        // spawn disabled → secret intentionally not written, reported honestly.
+        assert_eq!(v["secret_written"], serde_json::Value::Bool(false));
+        // The durable def landed in the config (and carries NO secret).
+        let list = build_reply(&s, "list-tunnels", None);
+        assert!(list.contains("mullvad1"), "{list}");
+        assert!(
+            !list.contains(PK),
+            "private key must not be in the durable config: {list}"
+        );
+    }
+
+    #[test]
+    fn setup_provider_generic_wg_paste_path() {
+        let (_t, s) = svc();
+        let conf = format!(
+            "[Interface]\nPrivateKey = {PK}\nAddress = 10.2.0.2/32\nDNS = 1.1.1.1\n[Peer]\nPublicKey = {PUB}\nAllowedIPs = 0.0.0.0/0\nEndpoint = paste.example.net:51820\n"
+        );
+        let body = json!({
+            "provider": "generic-wg",
+            "id": "paste1",
+            "server": "fra",
+            "wg_config": conf,
+        })
+        .to_string();
+        let r = build_reply(&s, "setup-provider", Some(&body));
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{r}");
+        assert_eq!(v["provider"], "generic-wg");
+        assert_eq!(v["ifname"], "mvpn-paste1");
+        // No first-party reflector → neutral.
+        assert_eq!(v["exit_check"], "https://ipinfo.io/json");
+    }
+
+    #[test]
+    fn setup_provider_named_provider_paste_keeps_label() {
+        // A Mullvad-exported .conf pasted into wg_config keeps the mullvad
+        // label (and its exit-check host), not generic-wg.
+        let (_t, s) = svc();
+        let conf = format!(
+            "[Interface]\nPrivateKey = {PK}\nAddress = 10.64.0.2/32\n[Peer]\nPublicKey = {PUB}\nEndpoint = m.example.net:51820\n"
+        );
+        let body = json!({"provider":"mullvad","id":"m1","wg_config":conf}).to_string();
+        let r = build_reply(&s, "setup-provider", Some(&body));
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{r}");
+        assert_eq!(v["provider"], "mullvad");
+        assert_eq!(v["exit_check"], "https://am.i.mullvad.net/json");
+    }
+
+    #[test]
+    fn setup_provider_null_wg_config_falls_through_to_flat_fields() {
+        // wg_config present as JSON null must NOT hijack the paste path; the
+        // flat WgSetup fields drive the structured build.
+        let (_t, s) = svc();
+        let body = json!({
+            "provider": "ivpn",
+            "id": "i1",
+            "wg_config": serde_json::Value::Null,
+            "private_key": PK,
+            "peer_public_key": PUB,
+            "address": "10.0.0.2/32",
+            "endpoint": "ivpn.example:51820",
+        })
+        .to_string();
+        let r = build_reply(&s, "setup-provider", Some(&body));
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{r}");
+        assert_eq!(v["provider"], "ivpn");
+        assert_eq!(v["ifname"], "mvpn-i1");
+    }
+
+    #[test]
+    fn setup_provider_generic_ovpn_import_path() {
+        let (_t, s) = svc();
+        let body = json!({
+            "provider": "generic-ovpn",
+            "id": "ovpn1",
+            "ovpn": "client\nremote nl-ams.example.com 1194 udp\nauth-user-pass\n",
+        })
+        .to_string();
+        let r = build_reply(&s, "setup-provider", Some(&body));
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{r}");
+        assert_eq!(v["provider"], "generic-ovpn");
+        assert_eq!(v["method"], "ovpn");
+        assert_eq!(v["ifname"], "mvpn-ovpn1");
+    }
+
+    #[test]
+    fn setup_provider_rejects_bad_input() {
+        let (_t, s) = svc();
+        // Missing provider.
+        assert!(build_reply(&s, "setup-provider", Some("{}")).contains("missing 'provider'"));
+        // Unknown provider.
+        let r = build_reply(
+            &s,
+            "setup-provider",
+            Some(&json!({"provider":"nope","id":"x"}).to_string()),
+        );
+        assert!(r.contains("unknown provider"), "{r}");
+        // Malformed WG key surfaces the adapter error.
+        let body = json!({
+            "provider": "ivpn",
+            "id": "i1",
+            "private_key": "not-a-key",
+            "peer_public_key": PUB,
+            "address": "10.0.0.2/32",
+            "endpoint": "h.example",
+        })
+        .to_string();
+        let r = build_reply(&s, "setup-provider", Some(&body));
+        assert!(r.contains("invalid private_key"), "{r}");
+        // generic-ovpn without an ovpn body.
+        let r = build_reply(
+            &s,
+            "setup-provider",
+            Some(&json!({"provider":"generic-ovpn","id":"o"}).to_string()),
+        );
+        assert!(r.contains("needs an 'ovpn' body"), "{r}");
     }
 }
