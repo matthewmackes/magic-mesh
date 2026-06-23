@@ -33,13 +33,20 @@ for ip in "$A" "$B"; do
   on "$ip" "sudo dnf install -y /tmp/mm.rpm" >/dev/null 2>&1
 done
 
-# Found on A, mint an add-peer token (XPA-7 v3), join from B.
-feat "found a mesh on node A (lighthouse)"        on "$A" "sudo mackesd found --mesh-id l2test --external-addr ${A}:4242 --role lighthouse"
-TOKEN="$(on "$A" "sudo mackesd add-peer --name l2peer 2>/dev/null" | tr -d '\r' | tail -1)"
+# Onboarding sequence: found/add-peer/join are one-shot CLIs; `mackesd serve`
+# (mackesd.service, ExecStart=mackesd serve) is the daemon that raises the Nebula
+# overlay + the /enroll listener — both nodes must run it. mesh-id is POSITIONAL;
+# add-peer takes --lighthouse (not --name) + prints the bare v3 token to stdout;
+# join takes the token POSITIONALLY. A's /enroll listener must be up before B joins.
+feat "found a mesh on node A (lighthouse)"        on "$A" "sudo mackesd found l2test --external-addr ${A}:4242 --role lighthouse"
+TOKEN="$(on "$A" "sudo mackesd add-peer --lighthouse ${A} --role server 2>/dev/null" | tr -d '\r' | grep -E '^mesh:' | tail -1)"
 feat "add-peer minted a join token"               test -n "$TOKEN"
-feat "node B joins the mesh"                       on "$B" "sudo mackesd join --token '$TOKEN'"
-sleep 8
-feat "node A overlay is up (10.42.0.1)"           on "$A" "ip -4 addr show | grep -q 10.42"
+on "$A" "sudo systemctl enable --now mackesd" >/dev/null 2>&1
+for t in $(seq 1 15); do on "$A" "ip -4 addr show | grep -q 10.42" && break; sleep 3; done
+feat "node A serve raised the overlay (10.42.x)"  on "$A" "ip -4 addr show | grep -q 10.42"
+feat "node B joins the mesh"                       on "$B" "sudo mackesd join '$TOKEN' --role server"
+on "$B" "sudo systemctl enable --now mackesd" >/dev/null 2>&1
+for t in $(seq 1 15); do on "$B" "ip -4 addr show | grep -q 10.42" && break; sleep 3; done
 feat "node B overlay is up"                        on "$B" "ip -4 addr show | grep -q 10.42"
 feat "A reaches B over the overlay"                on "$A" "ping -c2 -W2 \$(mackesd peers 2>/dev/null | grep -oE '10\\.42\\.[0-9.]+' | grep -v 10.42.0.1 | head -1)"
 feat "the directory sees both nodes"               on "$A" "test \$(mackesd peers 2>/dev/null | grep -cE '10\\.42') -ge 2"
