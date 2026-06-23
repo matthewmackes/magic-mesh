@@ -10,6 +10,7 @@ pub mod color;
 pub mod density;
 pub mod hub;
 pub mod library;
+pub mod motion;
 pub mod nav;
 pub mod nowplaying;
 pub mod prefs;

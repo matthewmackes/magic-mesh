@@ -39,6 +39,7 @@ use mde_music::color;
 use mde_music::density::ListMetrics;
 use mde_music::hub::HubCard;
 use mde_music::library::{self, LibraryItem};
+use mde_music::motion;
 use mde_music::nav::{NavState, Route};
 use mde_music::nowplaying::{self, NowState};
 use mde_music::prefs::{self, SortKey};
@@ -378,6 +379,13 @@ struct State {
     /// MUSIC-RFX-8 — the open right-click context menu (`None` = closed). Carries
     /// what was right-clicked so the sheet renders the applicable actions.
     context_menu: Option<TrackContext>,
+    /// MOTION-FEEDBACK — the now-playing footer's gentle reveal tween (a fresh
+    /// track fades-and-rises in). `None` once settled (no reveal tick armed).
+    now_reveal: Option<motion::Reveal>,
+    /// MOTION-FEEDBACK — the maxi Queue list's staggered reveal tween, restarted
+    /// on each (re)load so inserted/refreshed rows reveal top-down. `None` once
+    /// settled.
+    queue_reveal: Option<motion::Reveal>,
 }
 
 /// MUSIC-RFX-8 — the target of a right-click track context menu. A track row
@@ -558,6 +566,9 @@ enum Message {
     /// irrelevant; the follow-up state fetch is the truth (sweep-3 I8
     /// dropped the never-read `Result` payload).
     TransportDone,
+    /// MOTION-FEEDBACK — advance the in-flight now-playing / queue reveal one
+    /// frame. Armed only while a reveal is animating (MOTION-PERF-1).
+    RevealTick,
 }
 
 impl State {
@@ -625,6 +636,8 @@ impl State {
             maxi_tab: MaxiTab::Queue,
             maxi_lyrics: Vec::new(),
             maxi_peers: Vec::new(),
+            now_reveal: None,
+            queue_reveal: None,
         }
     }
 
@@ -779,6 +792,12 @@ impl State {
             }
             Message::QueueLoaded(songs, current) => {
                 self.queue_current = current;
+                // MOTION-FEEDBACK — a (re)loaded queue reveals its rows top-down
+                // (staggered slide-in), so a refresh isn't abrupt. Only when the
+                // list is non-empty (an empty reveal would just arm a no-op tick).
+                self.queue_reveal = (!songs.is_empty()).then(|| {
+                    motion::Reveal::starting_at(std::time::Instant::now(), self.reduce_motion)
+                });
                 self.queue_songs = songs;
                 let tasks: Vec<Task<Message>> = self
                     .queue_songs
@@ -1336,6 +1355,14 @@ impl State {
                 let changed = s.song_id != self.now_state.song_id;
                 self.now_state = s;
                 if changed {
+                    // MOTION-FEEDBACK — a fresh now-playing track gently reveals
+                    // the footer (fade-and-rise; crossfade under reduce-motion).
+                    if self.now_state.has_track() || self.now_state.active {
+                        self.now_reveal = Some(motion::Reveal::starting_at(
+                            std::time::Instant::now(),
+                            self.reduce_motion,
+                        ));
+                    }
                     self.now_title.clear();
                     self.now_artist.clear();
                     self.now_art = None;
@@ -1418,6 +1445,19 @@ impl State {
             Message::TransportDone => Task::perform(nowplaying::fetch_state(), |r| {
                 Message::StateLoaded(r.unwrap_or_default())
             }),
+            // MOTION-FEEDBACK — clear any reveal that has finished so the tick
+            // subscription disarms (zero idle wakeups). The repaint this tick
+            // triggers re-reads the live `slide_in` params for in-flight reveals.
+            Message::RevealTick => {
+                let now = std::time::Instant::now();
+                if self.now_reveal.is_some_and(|r| !r.is_animating(now)) {
+                    self.now_reveal = None;
+                }
+                if self.queue_reveal.is_some_and(|r| !r.is_animating(now)) {
+                    self.queue_reveal = None;
+                }
+                Task::none()
+            }
         }
     }
 
@@ -1466,15 +1506,27 @@ impl State {
         } else {
             Subscription::none()
         };
+        // MOTION-FEEDBACK — the now-playing / queue reveal ticker, armed ONLY
+        // while a reveal is in flight (MOTION-PERF-1 — a settled surface costs no
+        // idle wakeups). Disarms when `RevealTick` clears the finished reveals.
+        let now = std::time::Instant::now();
+        let revealing = self.now_reveal.is_some_and(|r| r.is_animating(now))
+            || self.queue_reveal.is_some_and(|r| r.is_animating(now));
+        let reveal = if revealing {
+            cosmic::iced::time::every(motion::REVEAL_TICK).map(|_| Message::RevealTick)
+        } else {
+            Subscription::none()
+        };
         // Poll the now-playing snapshot once the library is shown (there's
         // no daemon to ask on the first-run connect form).
         if self.form.is_some() {
-            Subscription::batch([keys, resizes, slide])
+            Subscription::batch([keys, resizes, slide, reveal])
         } else {
             let mut subs = vec![
                 keys,
                 resizes,
                 slide,
+                reveal,
                 cosmic::iced::time::every(nowplaying::POLL).map(|_| Message::PollState),
             ];
             // MUSIC-HOME-4 — poll the server stats while the Home dashboard is
@@ -2682,7 +2734,12 @@ impl State {
         if !self.now_state.has_track() && !self.now_state.active {
             return None;
         }
-        let muted = carbon(mde_theme::Palette::dark().text_muted, 1.0);
+        // MOTION-FEEDBACK — the footer's gentle reveal (fade-and-rise) when a
+        // fresh track loads. The alpha tints the metadata text; the translate_y
+        // becomes a top-padding offset on the bar container below.
+        let rv = motion::reveal_params(self.now_reveal, std::time::Instant::now(), 0);
+        let p = mde_theme::Palette::dark();
+        let muted = carbon(p.text_muted, rv.alpha);
         let title = if self.now_title.is_empty() {
             self.now_state.song_id.clone()
         } else {
@@ -2710,7 +2767,7 @@ impl State {
             ..Default::default()
         });
         let meta = column![
-            text(title).size(13),
+            text(title).size(13).colr(carbon(p.text, rv.alpha)),
             text(self.now_artist.clone()).size(11).colr(muted),
         ]
         .spacing(1)
@@ -2724,21 +2781,34 @@ impl State {
         ))
         .size(11)
         .colr(muted);
+        let rm = self.reduce_motion;
         let bar = row![
             mini,
             meta,
-            button(text("\u{25C0}").size(13)).on_press(Message::SkipPrev),
-            button(text(play_pause).size(13)).on_press(Message::PlayPause),
-            button(text("\u{25B6}").size(13)).on_press(Message::SkipNext),
+            // MOTION-FEEDBACK — the shuttle controls carry the shared hover-lift /
+            // press-depress (press fires on down, no delay; reduce-motion keeps the
+            // state change without movement).
+            transport_button("\u{25C0}", 13, Message::SkipPrev, rm),
+            transport_button(play_pause, 13, Message::PlayPause, rm),
+            transport_button("\u{25B6}", 13, Message::SkipNext, rm),
             pos,
             // Audio routing — send playback to a mesh peer (AIR-8 take-over).
-            button(text("\u{21C6} Route").size(12)).on_press(Message::OpenRouting),
-            button(text("Full").size(12)).on_press(Message::ToggleMaxi),
+            transport_button("\u{21C6} Route", 12, Message::OpenRouting, rm),
+            transport_button("Full", 12, Message::ToggleMaxi, rm),
         ]
         .spacing(10)
         .padding(10)
         .align_y(cosmic::iced::Alignment::Center);
-        Some(container(bar).width(Length::Fill).into())
+        // MOTION-FEEDBACK — the translate_y becomes a top-padding offset (the
+        // established translate→padding glue), so the bar rises into place. Under
+        // reduce-motion `slide_in` collapses to a pure crossfade (no rise).
+        let bar = container(bar).width(Length::Fill).padding(cosmic::iced::Padding {
+            top: rv.translate_y.max(0.0),
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        });
+        Some(bar.into())
     }
 
     /// AIR-15.b — the maxi-player full-window surface: now-playing header
@@ -2850,9 +2920,12 @@ impl State {
                 scrub,
                 volume_slider,
                 row![
-                    button(text("Prev").size(13)).on_press(Message::SkipPrev),
-                    button(text(play_pause).size(13)).on_press(Message::PlayPause),
-                    button(text("Next").size(13)).on_press(Message::SkipNext),
+                    // MOTION-FEEDBACK — the maxi shuttle controls share the
+                    // hover-lift / press-depress vocabulary (press on down, no
+                    // delay; reduce-motion keeps the state change without movement).
+                    transport_button("Prev", 13, Message::SkipPrev, self.reduce_motion),
+                    transport_button(play_pause, 13, Message::PlayPause, self.reduce_motion),
+                    transport_button("Next", 13, Message::SkipNext, self.reduce_motion),
                     // MUSIC-RFX-7 — add the current track to a playlist.
                     button(text("+ Playlist").size(13)).on_press_maybe(
                         (!self.now_state.song_id.is_empty())
@@ -2882,6 +2955,10 @@ impl State {
         ]
         .align_y(cosmic::iced::Alignment::Center);
         let mut queue = column![header_row].spacing(4);
+        // MOTION-FEEDBACK — a (re)loaded queue reveals its rows top-down: each
+        // row's staggered slide-in (queue_reveal) gives a leading-padding rise +
+        // a label fade. Settled (or absent) reveals read at rest.
+        let reveal_now = std::time::Instant::now();
         for (i, sid) in self.queue_songs.iter().enumerate() {
             let label = self
                 .queue_titles
@@ -2895,6 +2972,11 @@ impl State {
                 "   "
             };
             let selected = self.queue_selected.contains(&i);
+            let rv = motion::reveal_params(
+                self.queue_reveal,
+                reveal_now,
+                u32::try_from(i).unwrap_or(motion::STAGGER_ROW_CAP),
+            );
             // GLYPH-FIX — ●/○ (text-presentation BMP), not ☑/☐: U+2611 ☑ is
             // Emoji_Presentation=Yes, so it renders via the color-emoji font
             // (ignores tint, stalls first paint). ● selected, ○ unselected.
@@ -2903,6 +2985,7 @@ impl State {
                 button(text(sel_glyph).size(13)).on_press(Message::QueueToggleSelect(i)),
                 text(format!("{marker}{label}"))
                     .size(13)
+                    .colr(carbon(p.text, rv.alpha))
                     .width(Length::Fill),
             ]
             .spacing(6)
@@ -2920,7 +3003,15 @@ impl State {
                     .push(button(text("Play next").size(11)).on_press(Message::QueuePlayNext(i)));
             }
             row_el = row_el.push(button(text("✕").size(12)).on_press(Message::QueueRemove(i)));
-            queue = queue.push(row_el);
+            // MOTION-FEEDBACK — the reveal's rise becomes a leading-padding offset
+            // (translate→padding glue); under reduce-motion `slide_in` yields no
+            // rise, so the row only crossfades into place.
+            queue = queue.push(container(row_el).padding(cosmic::iced::Padding {
+                top: 0.0,
+                right: 0.0,
+                bottom: 0.0,
+                left: rv.translate_y.max(0.0),
+            }));
         }
 
         let lyrics: Element<'_, Message> = if self.maxi_lyrics.is_empty() {
@@ -2975,6 +3066,91 @@ impl State {
             .height(Length::Fill)
             .into()
     }
+}
+
+/// MOTION-FEEDBACK — adjust an iced `Color`'s luminance by `factor` (>1 lighter,
+/// <1 darker), clamped, alpha preserved. The single spot for the feedback
+/// tint-depth channel math (mirrors the `carbon` channel-math sanction, §4).
+fn shade(c: cosmic::iced::Color, factor: f32) -> cosmic::iced::Color {
+    cosmic::iced::Color {
+        r: (c.r * factor).clamp(0.0, 1.0),
+        g: (c.g * factor).clamp(0.0, 1.0),
+        b: (c.b * factor).clamp(0.0, 1.0),
+        a: c.a,
+    }
+}
+
+/// MOTION-FEEDBACK — a transport / shuttle button carrying the shared motion
+/// vocabulary: hover-**lift** + press-**depress** (the press fires on `down`, no
+/// delay — iced re-styles the instant the status flips). The button widget can't
+/// translate its own content (the iced 0.13 fork has no transform widget, and
+/// `button::Style` carries no padding), so the shared
+/// [`motion::button_feedback`] params drive the styleable proxies for the same
+/// reads: a hover **lift** shows as a raised fill + a small drop-shadow
+/// (elevation), and a press **depress** shows as a darkened fill with the
+/// elevation removed (sinking). `feedback_tint_depth` sets the fill-tint depth.
+/// **Under reduce-motion the lift/depress transform is suppressed**
+/// ([`motion::button_feedback`] returns rest) — so the shadow/elevation cue is
+/// dropped and only the (movement-free) tint state change reads (Q32).
+fn transport_button<'a>(
+    glyph: impl Into<String>,
+    size: u16,
+    msg: Message,
+    reduce_motion: bool,
+) -> Element<'a, Message> {
+    let p = mde_theme::Palette::dark();
+    let raised = carbon(p.raised, 1.0);
+    let text_c = carbon(p.text, 1.0);
+    button(text(glyph.into()).size(size).colr(text_c))
+        .on_press(msg)
+        .padding([6, 10])
+        .sty(move |_t, status| {
+            use cosmic::iced::widget::button::Status;
+            let hovered = matches!(status, Status::Hovered | Status::Pressed);
+            let pressed = matches!(status, Status::Pressed);
+            // The shared motion params gate the *movement* reads (the lift
+            // elevation / press sink); the tint depth is the movement-free cue.
+            // `lifted` ⇒ the shared params rose the control (hover, motion on);
+            // `Press` produces scale<1 with translate_y==0, so a lifted control is
+            // never also depressed — gate the elevation on `lifted` alone.
+            let lifted = motion::button_feedback(hovered, pressed, reduce_motion).translate_y < 0.0;
+            let depth = motion::feedback_tint_depth(hovered, pressed);
+            let fill = if pressed {
+                // Press read: darken the raised fill toward the depressed tone.
+                shade(raised, 1.0 - depth)
+            } else if hovered {
+                // Hover read: the full raised fill brightened by the tint depth.
+                shade(raised, 1.0 + depth)
+            } else {
+                // Idle: the plain raised fill, so a transport glyph still reads as
+                // a tappable control (the hover/press deltas ride on top of it).
+                raised
+            };
+            // Lift → a small drop-shadow (elevation); press/idle → none. Dropped
+            // under reduce-motion (no `lifted`), so the control never appears to
+            // rise off the surface.
+            let shadow = if lifted {
+                cosmic::iced::Shadow {
+                    color: carbon(p.background, 0.45),
+                    offset: cosmic::iced::Vector::new(0.0, motion::HOVER_RISE_PX),
+                    blur_radius: 4.0,
+                }
+            } else {
+                cosmic::iced::Shadow::default()
+            };
+            cosmic::iced::widget::button::Style {
+                background: Some(cosmic::iced::Background::Color(fill)),
+                text_color: text_c,
+                border: cosmic::iced::Border {
+                    color: cosmic::iced::Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 4.0.into(),
+                },
+                shadow,
+                ..cosmic::iced::widget::button::Style::default()
+            }
+        })
+        .into()
 }
 
 /// The stable widget id for the AIR-14 search field (so Cmd-F can focus it).
