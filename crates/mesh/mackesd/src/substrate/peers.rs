@@ -67,15 +67,49 @@ pub async fn delete_peer(client: &mut Client, hostname: &str) -> anyhow::Result<
     Ok(())
 }
 
-/// Build a private current-thread runtime and drive `fut`. Returns `None` when a
-/// runtime can't be built. MUST be called OFF the tokio executor (the heartbeat
-/// std::thread + the directory responder thread both qualify).
-fn block_on<F: std::future::Future>(fut: F) -> Option<F::Output> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .ok()
-        .map(|rt| rt.block_on(fut))
+/// Drive `fut` to completion from a synchronous context. Off the tokio executor
+/// (the heartbeat std::thread / directory responder thread) it spins a private
+/// current-thread runtime; ON the executor (a worker like `mesh_dns` that reached
+/// a blocking bridge) it must NOT build a nested runtime — that panics ("Cannot
+/// start a runtime from within a runtime") and on an etcd node crash-loops the
+/// worker until ENT-6 circuit-breaks it. Returns `None` only when a private
+/// runtime can't be built.
+/// Shared substrate blocking bridge — runtime-aware so it is safe from BOTH a
+/// plain std::thread (heartbeat/responder) and an async worker on the executor
+/// (`mesh_dns`, health_reconciler). Used by `peers` and `leader`.
+pub(super) fn block_on<F>(fut: F) -> Option<F::Output>
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    if tokio::runtime::Handle::try_current().is_err() {
+        // Off the tokio executor (heartbeat / responder std::thread): a private
+        // current-thread runtime drives `fut` directly.
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()
+            .map(|rt| rt.block_on(fut));
+    }
+    // ON the executor (a worker like `mesh_dns` reached a blocking bridge):
+    // building OR entering a runtime here panics ("Cannot start a runtime from
+    // within a runtime"). Drive `fut` on a FRESH OS thread that owns its own
+    // current-thread runtime — that thread has no ambient runtime, so no nesting.
+    // `block_in_place` yields this worker to the pool while we join the thread.
+    tokio::task::block_in_place(|| {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()
+                    .map(|rt| rt.block_on(fut))
+            })
+            .join()
+            .ok()
+            .flatten()
+        })
+    })
 }
 
 /// Blocking peer-record write to etcd (the heartbeat thread's bridge). `true` on

@@ -7,35 +7,129 @@
 //! entry point that makes the [`hub`]/[`nav`] models live.
 //!
 //! EFF-34 — ported off iced 0.13 onto libcosmic's vendored iced. `cosmic::iced`
-//! is the fork; the shell is a `cosmic::Application`, and the per-widget style
-//! closures bridge to cosmic's class-based theming via [`cosmic_compat`].
+//! is the fork; the per-widget style closures bridge to cosmic's class-based
+//! theming via [`cosmic_compat`].
+//!
+//! MUSIC-DOCK-1..5 — the player is a **layer-shell bottom dock**, not a normal
+//! window: the shell is now a `cosmic::iced::daemon` (the `mde-notify-center` /
+//! `mde-mesh-wallpaper` pattern) that maps an Overlay layer surface anchored
+//! bottom+left+right, full height, with `OnDemand` keyboard and **no exclusive
+//! zone** (DOCK-5 — it overlays the desktop, never reserving space). The dock
+//! slides up from the bottom edge on map (DOCK-2, `set_margin`-driven, honoring
+//! reduce-motion), and "closing" slides it back down to a small always-mapped
+//! bottom-center handle (DOCK-3) — the process never exits on close. The
+//! `view`/`update`/`subscription` reducers below carry the AIR-* logic unchanged;
+//! the daemon free fns dispatch per surface and wrap the dock chrome around them.
 
 mod cosmic_compat;
 use cosmic_compat::{ButtonSty, TextSty};
 
+use cosmic::iced::platform_specific::runtime::wayland::layer_surface::SctkLayerSurfaceSettings;
+use cosmic::iced::platform_specific::shell::commands::layer_surface::{
+    destroy_layer_surface, get_layer_surface, set_margin, Anchor, KeyboardInteractivity, Layer,
+};
 use cosmic::iced::widget::{
     button, column, container, image, mouse_area, row, scrollable, stack, text, text_input, Space,
 };
-use cosmic::iced::{Length, Subscription};
-use cosmic::{Application, ApplicationExt, Element};
+use cosmic::iced::{window, Length, Subscription};
+use cosmic::Element;
 
 use mde_music::album::{self, AlbumView};
 use mde_music::color;
+use mde_music::density::ListMetrics;
 use mde_music::hub::HubCard;
 use mde_music::library::{self, LibraryItem};
+use mde_music::motion;
 use mde_music::nav::{NavState, Route};
 use mde_music::nowplaying::{self, NowState};
 use mde_music::prefs::{self, SortKey};
 use mde_music::search::{self, SearchResults};
 use mde_musicd::creds::{self, Creds};
 
-/// The reducer's iced-space [`Task`] (the inherent `update`/subscription build
-/// these; the `cosmic::Application` trait lifts them into the cosmic Action
-/// space). Aliased to keep the AIR-* call sites reading as plain `Task`.
+/// The reducer's iced-space [`Task`]. Aliased to keep the AIR-* call sites
+/// reading as plain `Task`. Under the layer-shell daemon (MUSIC-DOCK-1) the
+/// runtime's message Task *is* `cosmic::iced::Task<Message>`, so the inherent
+/// `update` no longer needs the cosmic-Action lift the old `Application` shell
+/// required.
 type Task<M> = cosmic::iced::Task<M>;
 
+/// MUSIC-DOCK-2 — the bottom-dock slide-up: a Carbon `panel_mount` entrance
+/// (`moderate-02`, 240 ms ease-out), single-sourced from `mde-theme` motion
+/// tokens. The dock starts pushed [`DOCK_SLIDE_PX`] below the bottom edge (a
+/// negative bottom margin) and rises to rest; under reduce-motion the tween
+/// collapses to the ≤80 ms cap and the dock effectively maps in place.
+const DOCK_SLIDE: mde_theme::motion::Motion = mde_theme::motion::Motion::panel_mount();
+/// MUSIC-DOCK-2 — the slide-up travel distance (px): a fixed reveal offset, NOT
+/// the dock's full height. A bottom-anchored full-height surface is translated by
+/// a negative bottom margin; a modest fixed travel reads as a rise from the edge
+/// (translating a full-height surface by its whole height would just fling it
+/// entirely off-screen). Carbon's expansion tier (`moderate-02` reveals ~48px).
+const DOCK_SLIDE_PX: f32 = 48.0;
+/// MUSIC-DOCK-2 — the per-frame cadence for the slide tween (~60 fps). Armed
+/// only while the slide is in flight (MOTION-PERF-1 — zero idle wakeups).
+const SLIDE_TICK: std::time::Duration = std::time::Duration::from_millis(16);
+/// MUSIC-DOCK-3 — the minimized handle's height (px): a small bottom-center tab.
+const HANDLE_HEIGHT: u32 = 36;
+/// MUSIC-DOCK-3 — the minimized handle's width (px).
+const HANDLE_WIDTH: u32 = 280;
+
 fn main() -> cosmic::iced::Result {
-    cosmic::app::run::<State>(cosmic::app::Settings::default(), ())
+    // MUSIC-DOCK-1 — the layer-shell daemon (the notify-center / wallpaper
+    // pattern): `daemon(boot, update, view)` with the title/subscription
+    // builders, run to completion. The boot fn maps the dock surface.
+    cosmic::iced::daemon(|| (State::new(), boot_task()), update, view)
+        .title(namespace)
+        .subscription(subscription)
+        .theme(theme)
+        .run()
+}
+
+/// MUSIC-DOCK-1 — the daemon namespace (the layer-surface namespaces are set on
+/// the per-surface settings in [`boot_task`] / [`State::show_dock`]).
+fn namespace(_state: &State, _id: window::Id) -> String {
+    "mde-music".to_string()
+}
+
+/// MUSIC-DOCK-1 — the global theme for the dock surfaces. mde-music's whole view
+/// tree builds widgets with `cosmic::Theme` (the `cosmic_compat` `.colr`/`.sty`
+/// world-1 extensions), so the daemon is parameterized on `cosmic::Theme` and
+/// this returns the cosmic dark theme — the player is dark-themed throughout
+/// (every panel reads `mde_theme::Palette::dark()`). The per-widget Carbon
+/// colours still come from the `mde-theme` tokens via [`carbon`] (§4); the
+/// global theme only seeds the cosmic chrome defaults the layer surface needs.
+fn theme(_state: &State, _id: window::Id) -> cosmic::Theme {
+    cosmic::Theme::dark()
+}
+
+/// MUSIC-DOCK-1 — boot the dock: map the full-height bottom Overlay surface
+/// (sliding up — DOCK-2) and kick the AIR-* Home load so the dock paints
+/// populated on first frame.
+fn boot_task() -> Task<Message> {
+    Task::done(Message::ShowDock)
+}
+
+/// MUSIC-DOCK-1/3 — the daemon's free `update`: delegate to the inherent
+/// reducer (which carries every AIR-* handler). No cosmic-Action lift is needed
+/// under the daemon — the runtime's message Task is the inherent `Task<Message>`.
+fn update(state: &mut State, message: Message) -> Task<Message> {
+    state.update(message)
+}
+
+/// MUSIC-DOCK-1/3 — the daemon's free `view`: dispatch per surface. The dock
+/// surface renders the full player ([`State::view`]); the minimized handle
+/// surface renders the small bottom-center tab ([`State::handle_view`]).
+fn view(state: &State, id: window::Id) -> Element<'_, Message> {
+    if Some(id) == state.handle_surface {
+        state.handle_view()
+    } else {
+        state.view()
+    }
+}
+
+/// MUSIC-DOCK-1 — the daemon's free `subscription` delegates to the inherent one
+/// (keyboard shortcuts + now-playing poll + the DOCK-2 slide tick).
+fn subscription(state: &State) -> Subscription<Message> {
+    State::subscription(state)
 }
 
 /// MUSIC-RFX-5 — run a queue-mutation (an RFX-1 daemon verb) then re-fetch the
@@ -123,11 +217,11 @@ fn commafy(n: u64) -> String {
 /// (E5.3) — the Q2 indigo accent, Apple-charcoal background, and the semantic
 /// tokens, single-sourced from the design palette.
 ///
-/// EFF-34 — under the `cosmic::Application` shell the global theme is cosmic's
-/// (the `.theme(..)` builder of the old `iced::application` is gone), so this is
-/// no longer wired into the runtime; it's retained as the **§4 token-derivation
-/// guard** exercised by [`theme_tests`] (a future per-widget Carbon pass, à la
-/// mde-files, would consume the same palette). Hence `dead_code` outside tests.
+/// The §4 token-derivation guard: the canonical `mde_theme::Palette::dark()`
+/// mapped into an iced `Theme`, exercised by [`theme_tests`]. The live dock
+/// theme is the cosmic dark theme (see [`theme`]) since the view tree is
+/// `cosmic::Theme`-bound; this stays the assertion that the palette wiring is
+/// intact (a future per-widget Carbon pass à la mde-files would consume it).
 #[must_use]
 #[cfg_attr(not(test), allow(dead_code))]
 fn mde_music_iced_theme() -> cosmic::iced::Theme {
@@ -163,8 +257,18 @@ struct FirstRunForm {
 }
 
 struct State {
-    /// EFF-34 — the `cosmic::Application` shell state (window/theme/a11y).
-    core: cosmic::app::Core,
+    /// MUSIC-DOCK-1 — the dock's layer surface id (the full-height bottom
+    /// Overlay). `None` until the first map / while minimized to the handle.
+    dock_surface: Option<window::Id>,
+    /// MUSIC-DOCK-3 — the minimized-handle surface id (the small bottom-center
+    /// tab). `None` while the dock is open.
+    handle_surface: Option<window::Id>,
+    /// MUSIC-DOCK-2 — the in-flight slide-up tween + its start instant. `None`
+    /// when the dock is fully mapped at rest (no tick armed, no idle CPU).
+    slide: Option<(mde_theme::animation::Tween, std::time::Instant)>,
+    /// MUSIC-DOCK-2 — the desktop preference for reduced motion (resolved once
+    /// at launch); the slide collapses to the ≤80 ms cap when set.
+    reduce_motion: bool,
     nav: NavState,
     /// `Some` until the operator connects a server (first run); `None`
     /// once creds exist and the library shell is shown.
@@ -275,6 +379,13 @@ struct State {
     /// MUSIC-RFX-8 — the open right-click context menu (`None` = closed). Carries
     /// what was right-clicked so the sheet renders the applicable actions.
     context_menu: Option<TrackContext>,
+    /// MOTION-FEEDBACK — the now-playing footer's gentle reveal tween (a fresh
+    /// track fades-and-rises in). `None` once settled (no reveal tick armed).
+    now_reveal: Option<motion::Reveal>,
+    /// MOTION-FEEDBACK — the maxi Queue list's staggered reveal tween, restarted
+    /// on each (re)load so inserted/refreshed rows reveal top-down. `None` once
+    /// settled.
+    queue_reveal: Option<motion::Reveal>,
 }
 
 /// MUSIC-RFX-8 — the target of a right-click track context menu. A track row
@@ -314,8 +425,17 @@ enum Message {
     Back,
     /// MUSIC-NAV — jump to the Library root (Home).
     Home,
-    /// MUSIC-NAV — quit the app (the window has no title-bar chrome).
-    Exit,
+    /// MUSIC-DOCK-1 — map the dock surface + start the slide-up (DOCK-2).
+    ShowDock,
+    /// MUSIC-DOCK-2 — advance the slide-up tween one frame.
+    SlideTick,
+    /// MUSIC-DOCK-3 — "close" the dock: slide it down to the bottom-center
+    /// handle. The process keeps running (the dock has no titlebar chrome; this
+    /// replaces the old hard `Exit`).
+    Minimize,
+    /// MUSIC-DOCK-3 — the minimized handle was clicked: re-map + slide the dock
+    /// back up.
+    RestoreDock,
     /// A category fetch resolved.
     ItemsLoaded(Vec<LibraryItem>),
     /// A category fetch failed (daemon down / no server).
@@ -368,6 +488,8 @@ enum Message {
     /// Focus the search field (Cmd-F) / dismiss the sheet (Esc).
     FocusSearch,
     DismissSearch,
+    /// MUSIC-DOCK-1/3 — Esc: dismiss any open sheet, else minimize the dock.
+    EscapePressed,
     /// Open an album / artist result (navigates the breadcrumb).
     OpenAlbum(String, String),
     OpenArtist(String, String),
@@ -444,16 +566,25 @@ enum Message {
     /// irrelevant; the follow-up state fetch is the truth (sweep-3 I8
     /// dropped the never-read `Result` payload).
     TransportDone,
+    /// MOTION-FEEDBACK — advance the in-flight now-playing / queue reveal one
+    /// frame. Armed only while a reveal is animating (MOTION-PERF-1).
+    RevealTick,
 }
 
 impl State {
-    fn new(core: cosmic::app::Core) -> Self {
+    fn new() -> Self {
         let (form, connection) = match creds::load() {
             Ok(c) => (None, format!("Connected to {}", c.server_url)),
             Err(_) => (Some(FirstRunForm::default()), String::new()),
         };
         Self {
-            core,
+            // MUSIC-DOCK — surfaces are mapped by the boot ShowDock handler.
+            dock_surface: None,
+            handle_surface: None,
+            slide: None,
+            // MUSIC-DOCK-2 — resolve reduce-motion once (a11y pref or the
+            // MDE_REDUCE_MOTION/MDE_MOTION_DISABLED env overrides).
+            reduce_motion: mde_theme::Preferences::load().a11y.reduce_motion,
             nav: NavState::new(),
             form,
             connection,
@@ -505,6 +636,8 @@ impl State {
             maxi_tab: MaxiTab::Queue,
             maxi_lyrics: Vec::new(),
             maxi_peers: Vec::new(),
+            now_reveal: None,
+            queue_reveal: None,
         }
     }
 
@@ -659,6 +792,12 @@ impl State {
             }
             Message::QueueLoaded(songs, current) => {
                 self.queue_current = current;
+                // MOTION-FEEDBACK — a (re)loaded queue reveals its rows top-down
+                // (staggered slide-in), so a refresh isn't abrupt. Only when the
+                // list is non-empty (an empty reveal would just arm a no-op tick).
+                self.queue_reveal = (!songs.is_empty()).then(|| {
+                    motion::Reveal::starting_at(std::time::Instant::now(), self.reduce_motion)
+                });
                 self.queue_songs = songs;
                 let tasks: Vec<Task<Message>> = self
                     .queue_songs
@@ -777,7 +916,52 @@ impl State {
                 self.home_peers = peers;
                 Task::none()
             }
-            Message::Exit => std::process::exit(0),
+            // MUSIC-DOCK-1/2 — map the dock surface + start the slide-up, and
+            // load the Home dashboard so the dock paints populated.
+            Message::ShowDock => {
+                let map = self.show_dock();
+                Task::batch([map, load_home_tasks()])
+            }
+            // MUSIC-DOCK-2 — drive the slide tween. While in flight, raise the
+            // dock's bottom margin from -DOCK_SLIDE_PX toward 0 (at rest) along
+            // the eased curve; when complete, clear the tween (the tick
+            // subscription then disarms — no idle wakeups).
+            Message::SlideTick => {
+                let Some((tween, _)) = self.slide else {
+                    return Task::none();
+                };
+                let Some(id) = self.dock_surface else {
+                    self.slide = None;
+                    return Task::none();
+                };
+                let now = std::time::Instant::now();
+                let t = mde_theme::animation::ease(tween.progress(now), DOCK_SLIDE.easing);
+                // SlideUp(distance): translate_y = (1 - t) * distance, i.e. the
+                // dock starts DOCK_SLIDE_PX below the bottom edge and rises to 0
+                // (single-sourced slide math from mde-theme's Transition).
+                let offset = mde_theme::animation::Transition::SlideUp(DOCK_SLIDE_PX)
+                    .params(t)
+                    .translate_y;
+                if tween.is_complete(now) {
+                    self.slide = None;
+                    set_margin(id, 0, 0, 0, 0)
+                } else {
+                    set_margin(id, 0, 0, -(offset.round() as i32), 0)
+                }
+            }
+            // MUSIC-DOCK-3 — "close" slides the dock down to the handle. Destroy
+            // the dock surface + map the always-present bottom-center tab. The
+            // process never exits (the AIR-* poll keeps the now-playing line live
+            // so the handle title stays current).
+            Message::Minimize => self.minimize_to_handle(),
+            // MUSIC-DOCK-3 — restore: drop the handle, re-map the dock, slide up.
+            Message::RestoreDock => {
+                let drop = self
+                    .handle_surface
+                    .take()
+                    .map_or_else(Task::none, destroy_layer_surface);
+                Task::batch([drop, self.show_dock()])
+            }
             Message::UrlChanged(s) => {
                 if let Some(f) = &mut self.form {
                     f.url = s;
@@ -866,11 +1050,34 @@ impl State {
             }
             Message::FocusSearch => {
                 self.search_open = true;
-                cosmic::widget::text_input::focus(search_id())
+                // MUSIC-DOCK-1 — under the layer-shell daemon the message Task is
+                // the iced (not cosmic-Action) Task, so focus via the iced-level
+                // widget operation (the cosmic helper returns an Action Task).
+                cosmic::iced::widget::operation::focus(search_id())
             }
             Message::DismissSearch => {
                 self.dismiss_search();
                 Task::none()
+            }
+            // MUSIC-DOCK-1/3 — Esc closes the topmost thing: an open sheet
+            // (search / picker / context menu / maxi view) first, otherwise it
+            // minimizes the dock to the handle (never exits).
+            Message::EscapePressed => {
+                if self.search_open
+                    || self.add_to_playlist_song.is_some()
+                    || self.context_menu.is_some()
+                {
+                    self.dismiss_search();
+                    self.add_to_playlist_song = None;
+                    self.add_to_playlist_choices.clear();
+                    self.context_menu = None;
+                    Task::none()
+                } else if self.maxi_open {
+                    self.maxi_open = false;
+                    Task::none()
+                } else {
+                    self.minimize_to_handle()
+                }
             }
             Message::OpenAlbum(id, name) => {
                 self.context_menu = None;
@@ -1148,6 +1355,14 @@ impl State {
                 let changed = s.song_id != self.now_state.song_id;
                 self.now_state = s;
                 if changed {
+                    // MOTION-FEEDBACK — a fresh now-playing track gently reveals
+                    // the footer (fade-and-rise; crossfade under reduce-motion).
+                    if self.now_state.has_track() || self.now_state.active {
+                        self.now_reveal = Some(motion::Reveal::starting_at(
+                            std::time::Instant::now(),
+                            self.reduce_motion,
+                        ));
+                    }
                     self.now_title.clear();
                     self.now_artist.clear();
                     self.now_art = None;
@@ -1230,6 +1445,19 @@ impl State {
             Message::TransportDone => Task::perform(nowplaying::fetch_state(), |r| {
                 Message::StateLoaded(r.unwrap_or_default())
             }),
+            // MOTION-FEEDBACK — clear any reveal that has finished so the tick
+            // subscription disarms (zero idle wakeups). The repaint this tick
+            // triggers re-reads the live `slide_in` params for in-flight reveals.
+            Message::RevealTick => {
+                let now = std::time::Instant::now();
+                if self.now_reveal.is_some_and(|r| !r.is_animating(now)) {
+                    self.now_reveal = None;
+                }
+                if self.queue_reveal.is_some_and(|r| !r.is_animating(now)) {
+                    self.queue_reveal = None;
+                }
+                Task::none()
+            }
         }
     }
 
@@ -1255,7 +1483,9 @@ impl State {
             };
             match key.as_ref() {
                 Key::Character("f") if modifiers.command() => Some(Message::FocusSearch),
-                Key::Named(Named::Escape) => Some(Message::DismissSearch),
+                // Esc dismisses an open sheet, else minimizes the dock to the
+                // handle (MUSIC-DOCK-1/3 — "Esc/close hides it", never exits).
+                Key::Named(Named::Escape) => Some(Message::EscapePressed),
                 _ => None,
             }
         });
@@ -1268,14 +1498,35 @@ impl State {
             }
             _ => None,
         });
+        // MUSIC-DOCK-2 — the slide-up frame ticker, armed ONLY while a slide is
+        // in flight (MOTION-PERF-1 — a settled dock costs no idle wakeups). The
+        // keyboard + resize subs run regardless so the dock stays responsive.
+        let slide = if self.slide.is_some() {
+            cosmic::iced::time::every(SLIDE_TICK).map(|_| Message::SlideTick)
+        } else {
+            Subscription::none()
+        };
+        // MOTION-FEEDBACK — the now-playing / queue reveal ticker, armed ONLY
+        // while a reveal is in flight (MOTION-PERF-1 — a settled surface costs no
+        // idle wakeups). Disarms when `RevealTick` clears the finished reveals.
+        let now = std::time::Instant::now();
+        let revealing = self.now_reveal.is_some_and(|r| r.is_animating(now))
+            || self.queue_reveal.is_some_and(|r| r.is_animating(now));
+        let reveal = if revealing {
+            cosmic::iced::time::every(motion::REVEAL_TICK).map(|_| Message::RevealTick)
+        } else {
+            Subscription::none()
+        };
         // Poll the now-playing snapshot once the library is shown (there's
         // no daemon to ask on the first-run connect form).
         if self.form.is_some() {
-            Subscription::batch([keys, resizes])
+            Subscription::batch([keys, resizes, slide, reveal])
         } else {
             let mut subs = vec![
                 keys,
                 resizes,
+                slide,
+                reveal,
                 cosmic::iced::time::every(nowplaying::POLL).map(|_| Message::PollState),
             ];
             // MUSIC-HOME-4 — poll the server stats while the Home dashboard is
@@ -1293,6 +1544,144 @@ impl State {
             }
             Subscription::batch(subs)
         }
+    }
+
+    /// MUSIC-DOCK-1/2/5 — map the dock as a full-height bottom Overlay surface
+    /// (anchored bottom+left+right) and start the slide-up. **No exclusive zone**
+    /// (DOCK-5 — it overlays the desktop and never reserves space / reshapes
+    /// other windows). `OnDemand` keyboard so its buttons + search field take
+    /// focus on click; no titlebar (a layer surface has none). The surface is
+    /// created already pushed below the bottom edge (the negative bottom margin)
+    /// so the first slide tick reveals it.
+    fn show_dock(&mut self) -> Task<Message> {
+        // Already open → nothing to map (idempotent: a stray RestoreDock while
+        // open shouldn't stack a second surface).
+        if self.dock_surface.is_some() {
+            return Task::none();
+        }
+        let id = window::Id::unique();
+        self.dock_surface = Some(id);
+        // MUSIC-DOCK-2 — arm the slide tween (reduce-motion → ≤80 ms cap).
+        let now = std::time::Instant::now();
+        let tween =
+            mde_theme::animation::Tween::resolved(now, DOCK_SLIDE.duration, self.reduce_motion);
+        self.slide = Some((tween, now));
+        // Start DOCK_SLIDE_PX below the edge so the entrance reads (under
+        // reduce-motion the tween is ~instant, so it snaps to 0 on the first
+        // tick — the dock effectively maps in place, honoring reduce-motion).
+        let start_bottom = -(DOCK_SLIDE_PX.round() as i32);
+        get_layer_surface(SctkLayerSurfaceSettings {
+            id,
+            namespace: "mde-music".to_string(),
+            // Full-height bottom dock: anchor all but the top is what reserves a
+            // panel; anchoring bottom+left+right + no fixed height fills the
+            // output vertically (the wallpaper anchors all four for full-screen;
+            // the dock leaves the height free so the compositor sizes it to the
+            // output, while the slide margin animates it up from the bottom).
+            anchor: Anchor::BOTTOM.union(Anchor::LEFT).union(Anchor::RIGHT),
+            // No fixed size → fill the anchored axes.
+            size: Some((None, None)),
+            // MUSIC-DOCK-5 — overlay only; reserve NO space (0 = don't push other
+            // surfaces). Distinct from the notify-center, which DOES reserve.
+            exclusive_zone: 0,
+            layer: Layer::Overlay,
+            // Interactive: buttons + the search field need clicks/focus.
+            keyboard_interactivity: KeyboardInteractivity::OnDemand,
+            margin: cosmic::iced::platform_specific::runtime::wayland::layer_surface::IcedMargin {
+                top: 0,
+                right: 0,
+                bottom: start_bottom,
+                left: 0,
+            },
+            ..Default::default()
+        })
+    }
+
+    /// MUSIC-DOCK-3 — minimize: destroy the dock surface and map (if not already)
+    /// the small always-present bottom-center handle. The process keeps running,
+    /// so the now-playing poll continues and the handle title stays live; a click
+    /// on the handle restores the dock.
+    fn minimize_to_handle(&mut self) -> Task<Message> {
+        self.slide = None;
+        let drop = self
+            .dock_surface
+            .take()
+            .map_or_else(Task::none, destroy_layer_surface);
+        // Map the handle if it isn't already up (idempotent).
+        let handle = if self.handle_surface.is_some() {
+            Task::none()
+        } else {
+            let id = window::Id::unique();
+            self.handle_surface = Some(id);
+            get_layer_surface(SctkLayerSurfaceSettings {
+                id,
+                namespace: "mde-music-handle".to_string(),
+                // Bottom-center: anchor BOTTOM only → centered horizontally.
+                anchor: Anchor::BOTTOM,
+                size: Some((Some(HANDLE_WIDTH), Some(HANDLE_HEIGHT))),
+                // MUSIC-DOCK-5 — the handle reserves no space either.
+                exclusive_zone: 0,
+                layer: Layer::Overlay,
+                keyboard_interactivity: KeyboardInteractivity::OnDemand,
+                ..Default::default()
+            })
+        };
+        Task::batch([drop, handle])
+    }
+
+    /// MUSIC-DOCK-3 — the minimized handle surface: a small bottom-center tab
+    /// showing `♪ Music` + the now-playing title; clicking it restores the dock.
+    fn handle_view(&self) -> Element<'_, Message> {
+        let p = mde_theme::Palette::dark();
+        let title = if !self.now_title.is_empty() {
+            self.now_title.clone()
+        } else if !self.now_state.song_id.is_empty() {
+            self.now_state.song_id.clone()
+        } else {
+            "Music".to_string()
+        };
+        let label = row![
+            text("\u{266A}").size(14).colr(carbon(p.accent, 1.0)),
+            text(title).size(13).colr(carbon(p.text, 1.0)),
+        ]
+        .spacing(8)
+        .align_y(cosmic::iced::Alignment::Center);
+        let tab = button(
+            container(label)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .padding([6, 14]),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .on_press(Message::RestoreDock)
+        .sty({
+            let raised = carbon(p.raised, 1.0);
+            let overlay = carbon(p.overlay, 1.0);
+            let border = carbon(p.border, 1.0);
+            let text_c = carbon(p.text, 1.0);
+            move |_t, status| {
+                let bg = if matches!(status, cosmic::iced::widget::button::Status::Hovered) {
+                    overlay
+                } else {
+                    raised
+                };
+                cosmic::iced::widget::button::Style {
+                    background: Some(bg.into()),
+                    text_color: text_c,
+                    border: cosmic::iced::Border {
+                        color: border,
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    ..cosmic::iced::widget::button::Style::default()
+                }
+            }
+        });
+        container(tab)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -1958,7 +2347,8 @@ impl State {
             nav_btn("⌂ Home").on_press(Message::Home).into()
         };
         // MUSIC-ALBUMS-1 — Carbon header (48px): Back/Home + "MCNF Music"
-        // wordmark, centered search, Exit. Surface background + bottom inset.
+        // wordmark, centered search, and the MUSIC-DOCK-3 minimize control.
+        // Surface background + bottom inset.
         let pal = mde_theme::Palette::dark();
         let header = container(
             row![
@@ -1968,7 +2358,9 @@ impl State {
                 Space::new().width(Length::Fill),
                 search_field,
                 Space::new().width(Length::Fill),
-                nav_btn("✕ Exit").on_press(Message::Exit),
+                // MUSIC-DOCK-3 — "close" minimizes the dock to the bottom-center
+                // handle (the process keeps running); it never exits.
+                nav_btn("⌄ Minimize").on_press(Message::Minimize),
             ]
             .spacing(12)
             .align_y(cosmic::iced::Alignment::Center),
@@ -2108,30 +2500,32 @@ impl State {
     /// The AIR-14 results sheet: Artists / Albums / Songs sections over the
     /// page. Artist + album rows navigate the breadcrumb; song rows enqueue.
     fn search_sheet(&self) -> Element<'_, Message> {
-        let mut col = column![text("Search").size(18)]
-            .spacing(10)
-            .padding(20)
+        // MUSIC-RFX-10 — Carbon dense result rows from mde-theme tokens.
+        let m = ListMetrics::carbon_dense();
+        let mut col = column![text("Search").size(m.heading)]
+            .spacing(m.header_gap)
+            .padding(m.pad)
             .max_width(720);
         if self.searching {
-            col = col.push(text("Searching…").size(13));
+            col = col.push(text("Searching…").size(m.body));
         } else if let Some(err) = &self.search_error {
-            col = col.push(text(err.clone()).size(13));
+            col = col.push(text(err.clone()).size(m.body));
         } else if let Some(results) = &self.search_results {
             if results.is_empty() {
-                col = col.push(text("No results.").size(13));
+                col = col.push(text("No results.").size(m.body));
             } else {
-                col = col.push(result_section("Artists", &results.artists, |it| {
+                col = col.push(result_section("Artists", &results.artists, m, |it| {
                     Message::OpenArtist(it.id.clone(), it.label.clone())
                 }));
-                col = col.push(result_section("Albums", &results.albums, |it| {
+                col = col.push(result_section("Albums", &results.albums, m, |it| {
                     Message::OpenAlbum(it.id.clone(), it.label.clone())
                 }));
-                col = col.push(result_section("Songs", &results.songs, |it| {
+                col = col.push(result_section("Songs", &results.songs, m, |it| {
                     Message::EnqueueSong(it.id.clone())
                 }));
             }
         }
-        col = col.push(Space::new().height(Length::Fixed(8.0)));
+        col = col.push(Space::new().height(Length::Fixed(f32::from(m.pad))));
         col = col.push(button(text("Close")).on_press(Message::DismissSearch));
         container(scrollable(col))
             .width(Length::Fill)
@@ -2169,39 +2563,41 @@ impl State {
         let Route::Playlist(id, name) = self.nav.current() else {
             return text("No playlist.").size(13).into();
         };
+        // MUSIC-RFX-10 — shared Carbon dense list metrics.
+        let m = ListMetrics::carbon_dense();
         let header = column![
-            text(name.clone()).size(24),
+            text(name.clone()).size(m.heading),
             text(format!(
                 "{} track(s) · reorder with ↑/↓",
                 self.playlist_tracks.len()
             ))
-            .size(12),
-            Space::new().height(Length::Fixed(10.0)),
+            .size(m.mono),
+            Space::new().height(Length::Fixed(f32::from(m.header_gap))),
             button(text("Play all")).on_press(Message::PlayPlaylist(id.clone())),
         ]
-        .spacing(4);
+        .spacing(m.row_gap);
 
-        let mut list = column![].spacing(4);
+        let mut list = column![].spacing(m.row_gap);
         if self.playlist_tracks.is_empty() {
-            list = list.push(text("This playlist is empty.").size(13));
+            list = list.push(text("This playlist is empty.").size(m.body));
         }
         let last = self.playlist_tracks.len().saturating_sub(1);
         for (i, t) in self.playlist_tracks.iter().enumerate() {
             let mut row_el = row![
                 text(format!("{}.", i + 1))
-                    .size(13)
-                    .width(Length::Fixed(32.0)),
-                text(t.label.clone()).size(13).width(Length::Fill),
+                    .size(m.body)
+                    .width(Length::Fixed(m.number_col)),
+                text(t.label.clone()).size(m.body).width(Length::Fill),
             ]
-            .spacing(8)
+            .spacing(m.col_gap)
             .align_y(cosmic::iced::Alignment::Center);
             if i > 0 {
-                row_el =
-                    row_el.push(button(text("↑").size(12)).on_press(Message::PlaylistMoveUp(i)));
+                row_el = row_el
+                    .push(button(text("↑").size(m.mono)).on_press(Message::PlaylistMoveUp(i)));
             }
             if i < last {
-                row_el =
-                    row_el.push(button(text("↓").size(12)).on_press(Message::PlaylistMoveDown(i)));
+                row_el = row_el
+                    .push(button(text("↓").size(m.mono)).on_press(Message::PlaylistMoveDown(i)));
             }
             // MUSIC-RFX-8 — right-click for the action menu (incl. Remove).
             let menu_ctx = TrackContext {
@@ -2212,10 +2608,14 @@ impl State {
             list = list.push(mouse_area(row_el).on_right_press(Message::OpenTrackMenu(menu_ctx)));
         }
 
-        column![header, Space::new().height(Length::Fixed(12.0)), list]
-            .spacing(6)
-            .padding(8)
-            .into()
+        column![
+            header,
+            Space::new().height(Length::Fixed(f32::from(m.header_gap))),
+            list
+        ]
+        .spacing(m.row_gap)
+        .padding(m.pad)
+        .into()
     }
 
     fn album_page(&self) -> Element<'_, Message> {
@@ -2244,34 +2644,42 @@ impl State {
             button(text("Add to Queue")).on_press(Message::AddAlbumToQueue),
         ]
         .spacing(8);
+        // MUSIC-RFX-10 — Carbon dense list metrics (gaps/widths/sizes from
+        // mde-theme tokens, no scattered literals).
+        let m = ListMetrics::carbon_dense();
         let header = column![
-            text(a.name.clone()).size(24),
-            text(a.artist.clone()).size(15),
-            text(meta).size(12),
-            Space::new().height(Length::Fixed(10.0)),
+            text(a.name.clone()).size(m.heading),
+            text(a.artist.clone()).size(m.body),
+            text(meta).size(m.mono),
+            Space::new().height(Length::Fixed(f32::from(m.header_gap))),
             actions,
         ]
-        .spacing(4);
+        .spacing(m.row_gap);
 
         // Numbered track rows with per-track Play-Next / Add-to-Queue.
-        let mut list = column![].spacing(4);
+        let mut list = column![].spacing(m.row_gap);
         for (i, t) in a.tracks.iter().enumerate() {
             let no = t
                 .track_no
                 .unwrap_or_else(|| u32::try_from(i + 1).unwrap_or(0));
             let track_row = row![
-                text(format!("{no}.")).size(13).width(Length::Fixed(32.0)),
-                text(t.title.clone()).size(13).width(Length::Fill),
+                text(format!("{no}."))
+                    .size(m.body)
+                    .width(Length::Fixed(m.number_col)),
+                text(t.title.clone()).size(m.body).width(Length::Fill),
                 text(album::fmt_duration(t.duration))
-                    .size(12)
-                    .width(Length::Fixed(56.0)),
-                button(text("Play Next").size(11)).on_press(Message::PlayTrackNext(t.id.clone())),
-                button(text("+ Queue").size(11)).on_press(Message::AddTrackToQueue(t.id.clone())),
+                    .size(m.mono)
+                    .width(Length::Fixed(m.duration_col)),
+                button(text("Play Next").size(m.caption))
+                    .on_press(Message::PlayTrackNext(t.id.clone())),
+                button(text("+ Queue").size(m.caption))
+                    .on_press(Message::AddTrackToQueue(t.id.clone())),
                 // MUSIC-RFX-7 — add this track to a playlist.
-                button(text("+ Playlist").size(11))
+                button(text("+ Playlist").size(m.caption))
                     .on_press(Message::OpenAddToPlaylist(t.id.clone())),
             ]
-            .spacing(8);
+            .spacing(m.col_gap)
+            .align_y(cosmic::iced::Alignment::Center);
             // MUSIC-RFX-8 — right-click the row for the dense action menu.
             let menu_ctx = TrackContext {
                 song_id: t.id.clone(),
@@ -2309,12 +2717,12 @@ impl State {
             });
         let content = column![
             header_band,
-            Space::new().height(Length::Fixed(16.0)),
+            Space::new().height(Length::Fixed(f32::from(m.header_gap))),
             scrollable(list)
         ]
-        .spacing(8)
+        .spacing(m.pad)
         .width(Length::Fill);
-        row![art, content].spacing(20).into()
+        row![art, content].spacing(m.col_gap).into()
     }
 
     /// MUSIC-PLAYBAR (2026-06-18) — the persistent playback bar, static at the
@@ -2326,7 +2734,12 @@ impl State {
         if !self.now_state.has_track() && !self.now_state.active {
             return None;
         }
-        let muted = carbon(mde_theme::Palette::dark().text_muted, 1.0);
+        // MOTION-FEEDBACK — the footer's gentle reveal (fade-and-rise) when a
+        // fresh track loads. The alpha tints the metadata text; the translate_y
+        // becomes a top-padding offset on the bar container below.
+        let rv = motion::reveal_params(self.now_reveal, std::time::Instant::now(), 0);
+        let p = mde_theme::Palette::dark();
+        let muted = carbon(p.text_muted, rv.alpha);
         let title = if self.now_title.is_empty() {
             self.now_state.song_id.clone()
         } else {
@@ -2354,7 +2767,7 @@ impl State {
             ..Default::default()
         });
         let meta = column![
-            text(title).size(13),
+            text(title).size(13).colr(carbon(p.text, rv.alpha)),
             text(self.now_artist.clone()).size(11).colr(muted),
         ]
         .spacing(1)
@@ -2368,21 +2781,34 @@ impl State {
         ))
         .size(11)
         .colr(muted);
+        let rm = self.reduce_motion;
         let bar = row![
             mini,
             meta,
-            button(text("\u{25C0}").size(13)).on_press(Message::SkipPrev),
-            button(text(play_pause).size(13)).on_press(Message::PlayPause),
-            button(text("\u{25B6}").size(13)).on_press(Message::SkipNext),
+            // MOTION-FEEDBACK — the shuttle controls carry the shared hover-lift /
+            // press-depress (press fires on down, no delay; reduce-motion keeps the
+            // state change without movement).
+            transport_button("\u{25C0}", 13, Message::SkipPrev, rm),
+            transport_button(play_pause, 13, Message::PlayPause, rm),
+            transport_button("\u{25B6}", 13, Message::SkipNext, rm),
             pos,
             // Audio routing — send playback to a mesh peer (AIR-8 take-over).
-            button(text("\u{21C6} Route").size(12)).on_press(Message::OpenRouting),
-            button(text("Full").size(12)).on_press(Message::ToggleMaxi),
+            transport_button("\u{21C6} Route", 12, Message::OpenRouting, rm),
+            transport_button("Full", 12, Message::ToggleMaxi, rm),
         ]
         .spacing(10)
         .padding(10)
         .align_y(cosmic::iced::Alignment::Center);
-        Some(container(bar).width(Length::Fill).into())
+        // MOTION-FEEDBACK — the translate_y becomes a top-padding offset (the
+        // established translate→padding glue), so the bar rises into place. Under
+        // reduce-motion `slide_in` collapses to a pure crossfade (no rise).
+        let bar = container(bar).width(Length::Fill).padding(cosmic::iced::Padding {
+            top: rv.translate_y.max(0.0),
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        });
+        Some(bar.into())
     }
 
     /// AIR-15.b — the maxi-player full-window surface: now-playing header
@@ -2494,9 +2920,12 @@ impl State {
                 scrub,
                 volume_slider,
                 row![
-                    button(text("Prev").size(13)).on_press(Message::SkipPrev),
-                    button(text(play_pause).size(13)).on_press(Message::PlayPause),
-                    button(text("Next").size(13)).on_press(Message::SkipNext),
+                    // MOTION-FEEDBACK — the maxi shuttle controls share the
+                    // hover-lift / press-depress vocabulary (press on down, no
+                    // delay; reduce-motion keeps the state change without movement).
+                    transport_button("Prev", 13, Message::SkipPrev, self.reduce_motion),
+                    transport_button(play_pause, 13, Message::PlayPause, self.reduce_motion),
+                    transport_button("Next", 13, Message::SkipNext, self.reduce_motion),
                     // MUSIC-RFX-7 — add the current track to a playlist.
                     button(text("+ Playlist").size(13)).on_press_maybe(
                         (!self.now_state.song_id.is_empty())
@@ -2526,6 +2955,10 @@ impl State {
         ]
         .align_y(cosmic::iced::Alignment::Center);
         let mut queue = column![header_row].spacing(4);
+        // MOTION-FEEDBACK — a (re)loaded queue reveals its rows top-down: each
+        // row's staggered slide-in (queue_reveal) gives a leading-padding rise +
+        // a label fade. Settled (or absent) reveals read at rest.
+        let reveal_now = std::time::Instant::now();
         for (i, sid) in self.queue_songs.iter().enumerate() {
             let label = self
                 .queue_titles
@@ -2539,6 +2972,11 @@ impl State {
                 "   "
             };
             let selected = self.queue_selected.contains(&i);
+            let rv = motion::reveal_params(
+                self.queue_reveal,
+                reveal_now,
+                u32::try_from(i).unwrap_or(motion::STAGGER_ROW_CAP),
+            );
             // GLYPH-FIX — ●/○ (text-presentation BMP), not ☑/☐: U+2611 ☑ is
             // Emoji_Presentation=Yes, so it renders via the color-emoji font
             // (ignores tint, stalls first paint). ● selected, ○ unselected.
@@ -2547,6 +2985,7 @@ impl State {
                 button(text(sel_glyph).size(13)).on_press(Message::QueueToggleSelect(i)),
                 text(format!("{marker}{label}"))
                     .size(13)
+                    .colr(carbon(p.text, rv.alpha))
                     .width(Length::Fill),
             ]
             .spacing(6)
@@ -2564,7 +3003,15 @@ impl State {
                     .push(button(text("Play next").size(11)).on_press(Message::QueuePlayNext(i)));
             }
             row_el = row_el.push(button(text("✕").size(12)).on_press(Message::QueueRemove(i)));
-            queue = queue.push(row_el);
+            // MOTION-FEEDBACK — the reveal's rise becomes a leading-padding offset
+            // (translate→padding glue); under reduce-motion `slide_in` yields no
+            // rise, so the row only crossfades into place.
+            queue = queue.push(container(row_el).padding(cosmic::iced::Padding {
+                top: 0.0,
+                right: 0.0,
+                bottom: 0.0,
+                left: rv.translate_y.max(0.0),
+            }));
         }
 
         let lyrics: Element<'_, Message> = if self.maxi_lyrics.is_empty() {
@@ -2621,49 +3068,89 @@ impl State {
     }
 }
 
-/// EFF-34 — the `cosmic::Application` shell. The inherent `update`/`view`/
-/// `subscription` carry the real AIR-* logic (inherent methods win direct
-/// calls, so these trait methods delegate without recursion); the trait wraps
-/// the reducer's iced `Task` into the cosmic `Action` space.
-impl Application for State {
-    type Executor = cosmic::executor::Default;
-    type Flags = ();
-    type Message = Message;
-    const APP_ID: &'static str = "com.mackes.MdeMusic";
-
-    fn core(&self) -> &cosmic::app::Core {
-        &self.core
+/// MOTION-FEEDBACK — adjust an iced `Color`'s luminance by `factor` (>1 lighter,
+/// <1 darker), clamped, alpha preserved. The single spot for the feedback
+/// tint-depth channel math (mirrors the `carbon` channel-math sanction, §4).
+fn shade(c: cosmic::iced::Color, factor: f32) -> cosmic::iced::Color {
+    cosmic::iced::Color {
+        r: (c.r * factor).clamp(0.0, 1.0),
+        g: (c.g * factor).clamp(0.0, 1.0),
+        b: (c.b * factor).clamp(0.0, 1.0),
+        a: c.a,
     }
+}
 
-    fn core_mut(&mut self) -> &mut cosmic::app::Core {
-        &mut self.core
-    }
-
-    fn init(core: cosmic::app::Core, _flags: ()) -> (Self, cosmic::app::Task<Self::Message>) {
-        let mut s = Self::new(core);
-        // Keep mde-music's in-app chrome; suppress Cosmic's headerbar so the
-        // breadcrumb/connection header reads as the only top bar.
-        s.core.window.show_headerbar = false;
-        s.set_header_title("MDE Music".to_string());
-        // MUSIC-HOME — load the server stats + discovery strips at launch so the
-        // Home dashboard is populated on first paint.
-        let boot = load_home_tasks().map(cosmic::Action::App);
-        (s, boot)
-    }
-
-    fn subscription(&self) -> Subscription<Self::Message> {
-        State::subscription(self)
-    }
-
-    fn update(&mut self, message: Self::Message) -> cosmic::app::Task<Self::Message> {
-        // Delegate to the inherent reducer (inherent resolution wins), then lift
-        // the iced Task into the cosmic Action space the runtime expects.
-        State::update(self, message).map(cosmic::Action::App)
-    }
-
-    fn view(&self) -> Element<'_, Self::Message> {
-        State::view(self)
-    }
+/// MOTION-FEEDBACK — a transport / shuttle button carrying the shared motion
+/// vocabulary: hover-**lift** + press-**depress** (the press fires on `down`, no
+/// delay — iced re-styles the instant the status flips). The button widget can't
+/// translate its own content (the iced 0.13 fork has no transform widget, and
+/// `button::Style` carries no padding), so the shared
+/// [`motion::button_feedback`] params drive the styleable proxies for the same
+/// reads: a hover **lift** shows as a raised fill + a small drop-shadow
+/// (elevation), and a press **depress** shows as a darkened fill with the
+/// elevation removed (sinking). `feedback_tint_depth` sets the fill-tint depth.
+/// **Under reduce-motion the lift/depress transform is suppressed**
+/// ([`motion::button_feedback`] returns rest) — so the shadow/elevation cue is
+/// dropped and only the (movement-free) tint state change reads (Q32).
+fn transport_button<'a>(
+    glyph: impl Into<String>,
+    size: u16,
+    msg: Message,
+    reduce_motion: bool,
+) -> Element<'a, Message> {
+    let p = mde_theme::Palette::dark();
+    let raised = carbon(p.raised, 1.0);
+    let text_c = carbon(p.text, 1.0);
+    button(text(glyph.into()).size(size).colr(text_c))
+        .on_press(msg)
+        .padding([6, 10])
+        .sty(move |_t, status| {
+            use cosmic::iced::widget::button::Status;
+            let hovered = matches!(status, Status::Hovered | Status::Pressed);
+            let pressed = matches!(status, Status::Pressed);
+            // The shared motion params gate the *movement* reads (the lift
+            // elevation / press sink); the tint depth is the movement-free cue.
+            // `lifted` ⇒ the shared params rose the control (hover, motion on);
+            // `Press` produces scale<1 with translate_y==0, so a lifted control is
+            // never also depressed — gate the elevation on `lifted` alone.
+            let lifted = motion::button_feedback(hovered, pressed, reduce_motion).translate_y < 0.0;
+            let depth = motion::feedback_tint_depth(hovered, pressed);
+            let fill = if pressed {
+                // Press read: darken the raised fill toward the depressed tone.
+                shade(raised, 1.0 - depth)
+            } else if hovered {
+                // Hover read: the full raised fill brightened by the tint depth.
+                shade(raised, 1.0 + depth)
+            } else {
+                // Idle: the plain raised fill, so a transport glyph still reads as
+                // a tappable control (the hover/press deltas ride on top of it).
+                raised
+            };
+            // Lift → a small drop-shadow (elevation); press/idle → none. Dropped
+            // under reduce-motion (no `lifted`), so the control never appears to
+            // rise off the surface.
+            let shadow = if lifted {
+                cosmic::iced::Shadow {
+                    color: carbon(p.background, 0.45),
+                    offset: cosmic::iced::Vector::new(0.0, motion::HOVER_RISE_PX),
+                    blur_radius: 4.0,
+                }
+            } else {
+                cosmic::iced::Shadow::default()
+            };
+            cosmic::iced::widget::button::Style {
+                background: Some(cosmic::iced::Background::Color(fill)),
+                text_color: text_c,
+                border: cosmic::iced::Border {
+                    color: cosmic::iced::Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 4.0.into(),
+                },
+                shadow,
+                ..cosmic::iced::widget::button::Style::default()
+            }
+        })
+        .into()
 }
 
 /// The stable widget id for the AIR-14 search field (so Cmd-F can focus it).
@@ -2719,17 +3206,20 @@ fn skeleton_grid(cols: usize) -> Element<'static, Message> {
 fn result_section<'a>(
     title: &'a str,
     items: &'a [LibraryItem],
+    m: ListMetrics,
     on_click: impl Fn(&LibraryItem) -> Message,
 ) -> Element<'a, Message> {
-    let mut col = column![].spacing(4);
+    let mut col = column![].spacing(m.row_gap);
     if items.is_empty() {
         return col.into();
     }
-    col = col.push(text(title).size(14));
+    col = col.push(text(title).size(m.body));
     for item in items {
-        col = col.push(button(text(item.label.clone())).on_press(on_click(item)));
+        col = col.push(
+            button(text(item.label.clone()).size(m.body)).on_press(on_click(item)),
+        );
     }
-    col = col.push(Space::new().height(Length::Fixed(10.0)));
+    col = col.push(Space::new().height(Length::Fixed(f32::from(m.header_gap))));
     col.into()
 }
 

@@ -18,14 +18,21 @@
 #   xcp-build.sh pull <remote-glob>   rsync artifacts back (relative to the remote repo)
 #   xcp-build.sh shell                interactive ssh into the build VM
 #
-# Env overrides: MCNF_BUILD_HOST (172.20.0.50), MCNF_BUILD_USER (mm).
+# Env overrides: MCNF_BUILD_HOST (172.20.0.50), MCNF_BUILD_USER (mm),
+#   MCNF_BUILD_SLOT (unset) — an isolated remote workspace+target on the SAME host
+#   so multiple concurrent jobs run without colliding (scale workloads per node:
+#   e.g. BigBoy's 12c/24G hosts 2-3 parallel builds). slot "2" → ~/magic-mesh-2.
 set -euo pipefail
 
-BUILD_HOST="${MCNF_BUILD_HOST:-172.20.0.50}"
+# Default build node is XEN-BIGBOY's VM mcnf-build-52 (172.20.0.52, 8 vCPU /
+# 23 GB — the biggest node), per the operator directive "worklist work → BIGBOY,
+# testing → the two other Xen hosts" (2026-06-22). Override with MCNF_BUILD_HOST.
+BUILD_HOST="${MCNF_BUILD_HOST:-172.20.0.52}"
 BUILD_USER="${MCNF_BUILD_USER:-mm}"
 KEY="${MCNF_BUILD_KEY:-$HOME/.ssh/mackes_mesh_ed25519}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-REMOTE_DIR="magic-mesh"
+# Per-slot remote dir lets concurrent agents share one VM (each its own target/).
+REMOTE_DIR="magic-mesh${MCNF_BUILD_SLOT:+-$MCNF_BUILD_SLOT}"
 ARTIFACTS="${MCNF_BUILD_ARTIFACTS:-$HOME/mcnf-release-artifacts}"
 SSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o BatchMode=yes)
 DEST="$BUILD_USER@$BUILD_HOST"
@@ -60,6 +67,17 @@ case "${1:-}" in
 
   rpm)
     do_sync
+    # Stage the air-gapped vendored assets the generate-rpm `assets` array ships
+    # — without these the VM has no vendor/birthright/ and generate-rpm dies
+    # "Asset file not found" (BUILD-PLATFORM-4 RPM-cut gap, 2026-06-22). Mirror
+    # build-rpm-fedora43.sh exactly so the farm RPM is byte-faithful to the
+    # canonical cut: birthright blobs (ntfy/starship, fetched + sha256-verified)
+    # AND the fc43 lizardfs RPM set (resolved in a fedora:43 podman container —
+    # still shipped until the SUBSTRATE-V2 cutover retires LizardFS fleet-wide).
+    # Runs on the VM (it has network egress + podman) so the fetch stays off the
+    # local host; both steps are idempotent.
+    log "vendoring birthright blobs + lizardfs RPM set on the VM (off the local host)"
+    remote "./install-helpers/vendor-birthright-blobs.sh && ./install-helpers/vendor-lizardfs-rpms.sh 43"
     log "release build + generate-rpm on the VM (heavy — runs on XCP, not local)"
     remote "cargo build --workspace --release && cargo generate-rpm -p crates/mesh/mackesd"
     mkdir -p "$ARTIFACTS"

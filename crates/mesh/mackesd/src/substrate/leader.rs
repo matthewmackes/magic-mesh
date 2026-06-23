@@ -141,16 +141,18 @@ async fn held_by(client: &mut Client) -> Result<AcquireResult, Error> {
 /// current-thread runtime.
 #[must_use]
 pub fn current_leader_blocking(endpoints: &[String]) -> Option<Lease> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .ok()?
-        .block_on(async {
-            match super::etcd::connect(endpoints).await {
-                Ok(mut c) => current_leader(&mut c).await.ok().flatten(),
-                Err(_) => None,
-            }
-        })
+    // Route through the shared runtime-aware bridge: a bare
+    // `new_current_thread().block_on()` here panicked ("runtime within a runtime")
+    // when called from the async `mesh_dns` worker and crash-looped it on every
+    // etcd node. `super::peers::block_on` is safe from both a std::thread and an
+    // async executor.
+    super::peers::block_on(async {
+        match super::etcd::connect(endpoints).await {
+            Ok(mut c) => current_leader(&mut c).await.ok().flatten(),
+            Err(_) => None,
+        }
+    })
+    .flatten()
 }
 
 /// Force `node_id` into leadership: bump the epoch past the prior holder's and

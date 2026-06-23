@@ -30,6 +30,9 @@ set -euo pipefail
 MODE=""; JOIN_ANCHOR=""; LISTEN=""; ANCHORS=""; FOLDER=/mnt/mesh-storage
 NO_FLIP=0; NO_FILES=0
 HELPERS="$(dirname "$0")"
+# Resolve a sibling helper whether INSTALLED (RPM strips the .sh:
+# /usr/libexec/mackesd/setup-etcd) or run from the SOURCE tree (setup-etcd.sh).
+helper() { if [ -x "$HELPERS/$1" ]; then echo "$HELPERS/$1"; else echo "$HELPERS/$1.sh"; fi; }
 
 while [ $# -gt 0 ]; do case "$1" in
   --init) MODE="init"; shift;;
@@ -56,7 +59,7 @@ esac
 [ -n "$LISTEN" ]  && ETCD_ARGS+=(--listen "$LISTEN")
 [ -n "$ANCHORS" ] && ETCD_ARGS+=(--anchors "$ANCHORS")
 log "etcd: setup-etcd ${ETCD_ARGS[*]}"
-"$HELPERS/setup-etcd.sh" "${ETCD_ARGS[@]}"
+"$(helper setup-etcd)" "${ETCD_ARGS[@]}"
 
 # 2. File plane (Syncthing) — replicates /mnt/mesh-storage full-mesh (no FUSE).
 #    Phase A (--no-files) skips this: on an EXISTING mesh /mnt/mesh-storage is a
@@ -67,7 +70,7 @@ if [ "$NO_FILES" -eq 0 ]; then
   [ -n "$LISTEN" ]  && SYNC_ARGS+=(--listen "$LISTEN")
   [ -n "$ANCHORS" ] && SYNC_ARGS+=(--anchors "$ANCHORS")
   log "syncthing: setup-syncthing ${SYNC_ARGS[*]}"
-  "$HELPERS/setup-syncthing.sh" "${SYNC_ARGS[@]}"
+  "$(helper setup-syncthing)" "${SYNC_ARGS[@]}"
 else
   log "syncthing: SKIPPED (--no-files; files stay on LizardFS until Phase B)"
 fi

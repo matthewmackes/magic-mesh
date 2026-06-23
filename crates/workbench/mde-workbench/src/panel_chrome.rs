@@ -34,8 +34,8 @@ use mde_theme::{
     components::empty_state::{BODY_CTA_GAP, EMPTY_ICON_SIZE, HEADING_BODY_GAP, VERTICAL_PADDING},
     mde_icon,
     motion::dialog as dialog_tokens,
-    Density, EmptyState, FontSize, Icon, IconSize, Palette, Radii, Shadow as MdeShadow,
-    Space as MdeSpace, TypeRole,
+    Density, EmptyState, FontSize, Icon, IconSize, LoadState, Palette, Radii, Shadow as MdeShadow,
+    Space as MdeSpace, StateTone, TypeRole,
 };
 
 // CR-3.b — `object_card` extracted to `mde-iced-components` so
@@ -218,6 +218,82 @@ pub fn status_badge<'a, Message: 'a>(
         text_color: Some(fg),
     })
     .into()
+}
+
+/// MOTION-NET-1 — map the semantic [`StateTone`] onto the panel-chrome
+/// [`BadgeSeverity`] fill. Both are the shared Carbon severity ramp, so the
+/// mapping is 1:1.
+#[must_use]
+pub const fn badge_severity_for(tone: StateTone) -> BadgeSeverity {
+    match tone {
+        StateTone::Neutral => BadgeSeverity::Neutral,
+        StateTone::Info => BadgeSeverity::Info,
+        StateTone::Warning => BadgeSeverity::Warning,
+        StateTone::Danger => BadgeSeverity::Danger,
+        StateTone::Success => BadgeSeverity::Success,
+    }
+}
+
+/// MOTION-NET-1 — the canonical async-state indicator: a pill badge showing a
+/// [`LoadState`]'s distinct icon glyph + label, severity-tinted from its
+/// [`StateTone`]. The glyph + text carry the state (legible without motion and
+/// without relying on colour); the tint is a secondary cue. This is the shared
+/// renderer panels use instead of ad-hoc "Working…" strings, so every surface
+/// reads async state the same way.
+pub fn load_state_indicator<'a, Message: 'a>(
+    state: LoadState,
+    palette: Palette,
+) -> Element<'a, Message> {
+    status_badge(
+        format!("{} {}", state.icon(), state.label()),
+        badge_severity_for(state.tone()),
+        palette,
+    )
+}
+
+/// MOTION-NET-2 — a layout-matching skeleton placeholder: `rows` greyed Carbon
+/// bars (≈ a data row tall) shown while a panel is `LoadState::Loading`, so a
+/// slow first load never shows a blank area or a bare "Loading…" string. The
+/// grey shimmers via `animation::shimmer_alpha(phase, reduce_motion)`; under
+/// reduce-motion it renders a STATIC grey (no shimmer). Swap to the real content
+/// when data lands (shimmer stops). `rows` = the expected row count of the
+/// eventual layout.
+pub fn skeleton<'a, Message: 'a>(
+    rows: usize,
+    palette: Palette,
+    phase: f32,
+    reduce_motion: bool,
+) -> Element<'a, Message> {
+    let alpha = mde_theme::animation::shimmer_alpha(phase, reduce_motion);
+    let bar = Color {
+        a: alpha,
+        ..palette.text_muted.into_cosmic_color()
+    };
+    let radii = Radii::defaults();
+    let mut col: Column<'a, Message, cosmic::Theme> = column![].spacing(8);
+    for _ in 0..rows {
+        col = col.push(
+            container(
+                Space::new()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(DATA_ROW_MIN_HEIGHT - 12.0)),
+            )
+            .width(Length::Fill)
+            .style(move |_theme| container::Style {
+                snap: false,
+                icon_color: None,
+                background: Some(Background::Color(bar)),
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: f32::from(radii.sm).into(),
+                },
+                shadow: IcedShadow::default(),
+                text_color: None,
+            }),
+        );
+    }
+    col.into()
 }
 
 /// UX-6 — card surface. Wraps any content in a raised surface
@@ -737,6 +813,46 @@ mod tests {
     // (mesh_topology and future CR-4..CR-8 consumers reaching
     // through panel_chrome) keep working. This test asserts the
     // re-export path resolves.
+
+    #[test]
+    fn load_state_indicator_renders_every_state() {
+        // MOTION-NET-1 — the renderer constructs for all 7 states (the badge's
+        // glyph + label carry the distinction; the tone-mapped fill is secondary).
+        let palette = crate::live_theme::palette();
+        for s in [
+            LoadState::Idle,
+            LoadState::Loading,
+            LoadState::Refreshing { stale: true },
+            LoadState::Refreshing { stale: false },
+            LoadState::Degraded,
+            LoadState::Offline,
+            LoadState::Failed,
+            LoadState::Loaded,
+        ] {
+            let _: Element<'_, ()> = load_state_indicator(s, palette);
+        }
+        // The tone→severity map is total (a missing arm would fail to compile).
+        for t in [
+            StateTone::Neutral,
+            StateTone::Info,
+            StateTone::Warning,
+            StateTone::Danger,
+            StateTone::Success,
+        ] {
+            let _ = badge_severity_for(t);
+        }
+    }
+
+    #[test]
+    fn skeleton_constructs_for_any_row_count_and_reduce_motion() {
+        // MOTION-NET-2 — the skeleton renders for an empty, single, and
+        // multi-row layout, both shimmering and static (reduce-motion).
+        let palette = crate::live_theme::palette();
+        for rows in [0usize, 1, 5, 12] {
+            let _: Element<'_, ()> = skeleton(rows, palette, 0.3, false);
+            let _: Element<'_, ()> = skeleton(rows, palette, 0.3, true); // reduce-motion
+        }
+    }
 
     #[test]
     fn object_card_reexport_resolves() {

@@ -1,0 +1,12 @@
+# State can contain sensitive values + is environment-specific.
+# (.terraform.lock.hcl IS committed — it pins provider versions for reproducibility.)
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+# Never commit the real token/env.
+env.sh
+*.auto.tfvars
+override.tf
+override.tf.json

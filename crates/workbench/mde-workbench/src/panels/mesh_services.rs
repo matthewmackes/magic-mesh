@@ -245,26 +245,71 @@ impl MeshServicesPanel {
         })
         .on_press(crate::Message::MeshServices(Message::RefreshClicked));
 
+        // MOTION-NET-1 — surface the probe state through the canonical
+        // LoadState indicator instead of only the button's "Working…" label, so
+        // this panel reads async state the same way every other surface will.
+        let load = if self.busy {
+            if self.units.is_empty() {
+                mde_theme::LoadState::Loading
+            } else {
+                mde_theme::LoadState::Refreshing { stale: true }
+            }
+        } else if self.units.is_empty() && self.last_run_at.is_none() {
+            mde_theme::LoadState::Idle
+        } else {
+            mde_theme::LoadState::Loaded
+        };
+
         let header = row![
             column![title, subtitle].spacing(2),
             Space::new().width(Length::Fill),
+            crate::panel_chrome::load_state_indicator(load, palette),
             refresh_btn,
         ]
+        .spacing(8)
         .align_y(cosmic::iced::alignment::Vertical::Center);
 
+        // MOTION-NET-3 — during a refresh the previous units stay on screen
+        // (never blank) but render DIMMED via the load state's content alpha, with
+        // the header's "Refreshing" indicator (MOTION-NET-1) showing it's live;
+        // they snap back to full opacity when fresh data lands.
+        let unit_palette = if load.is_busy() && !self.units.is_empty() {
+            palette.dimmed(load.content_alpha())
+        } else {
+            palette
+        };
         let mut units_col = column![].spacing(10);
         for u in &self.units {
-            units_col = units_col.push(unit_row(u, palette));
+            units_col = units_col.push(unit_row(u, unit_palette));
         }
-        if self.units.is_empty() && !self.busy {
-            units_col = units_col.push(
-                container(
-                    text("Click \"Refresh\" to probe the mesh-fabric daemons.")
-                        .size(TypeRole::Body.size_in(sizes))
-                        .colr(palette.text_muted.into_cosmic_color()),
-                )
-                .padding(Padding::from([24u16, 0u16])),
-            );
+        if self.units.is_empty() {
+            if load.is_busy() {
+                // MOTION-NET-2 — a slow first probe shows layout-matching skeleton
+                // rows (shimmering, or static grey under reduce-motion) instead of
+                // a blank panel; they vanish the moment real units land.
+                let phase = {
+                    use std::time::{SystemTime, UNIX_EPOCH};
+                    let ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis());
+                    (ms % 1200) as f32 / 1200.0
+                };
+                units_col = units_col.push(crate::panel_chrome::skeleton(
+                    5,
+                    palette,
+                    phase,
+                    crate::live_theme::reduce_motion(),
+                ));
+            } else {
+                units_col = units_col.push(
+                    container(
+                        text("Click \"Refresh\" to probe the mesh-fabric daemons.")
+                            .size(TypeRole::Body.size_in(sizes))
+                            .colr(palette.text_muted.into_cosmic_color()),
+                    )
+                    .padding(Padding::from([24u16, 0u16])),
+                );
+            }
         }
 
         container(

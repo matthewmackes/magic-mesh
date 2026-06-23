@@ -6,7 +6,7 @@
 
 use std::time::SystemTime;
 
-use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
+use cosmic::iced::widget::{button, column, container, row, scrollable, svg, text, Space};
 use cosmic::iced::{Background, Border, Color, Length, Padding, Task};
 use cosmic::{Element, Theme};
 use mde_theme::hero::Hero;
@@ -14,6 +14,32 @@ use mde_theme::{FontSize, Palette, TypeRole};
 
 use crate::cosmic_compat::prelude::*;
 use crate::panel_chrome::{hero_band, pkg_version_cached};
+
+/// NOTIFY-UI-3 / ICON-MESH — the `folder-remote` network glyph for the
+/// mesh-storage surface. Mesh Storage is the LizardFS / QNM-Shared mesh file
+/// service, *not* a local mounted volume, so its title takes the network folder
+/// icon (the freedesktop `folder-remote` equivalent) the same as the mde-files
+/// mesh-storage representation. Same lucide path as `mde_files::icons::FOLDER_REMOTE`.
+const FOLDER_REMOTE_NAME: &str = "folder-remote";
+const FOLDER_REMOTE_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="square" stroke-linejoin="miter"><path d="M3 6a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6z"/><circle cx="9" cy="14" r="1.3"/><circle cx="16" cy="11" r="1.3"/><circle cx="16" cy="17" r="1.3"/><line x1="10.1" y1="13.4" x2="14.9" y2="11.4"/><line x1="10.1" y1="14.6" x2="14.9" y2="16.6"/></svg>"##;
+
+/// Canonical freedesktop icon name the mesh-storage surface renders — the
+/// network folder (`folder-remote`), since Mesh Storage is a mesh file service,
+/// not a local volume. NOTIFY-UI-3 / ICON-MESH.
+#[must_use]
+pub const fn mesh_storage_icon_name() -> &'static str {
+    FOLDER_REMOTE_NAME
+}
+
+/// The `folder-remote` network icon for the mesh-storage surface, tinted to the
+/// supplied colour. NOTIFY-UI-3 / ICON-MESH.
+fn mesh_storage_icon<'a>(color: Color) -> Element<'a, crate::Message> {
+    svg(svg::Handle::from_memory(FOLDER_REMOTE_SVG))
+        .width(Length::Fixed(22.0))
+        .height(Length::Fixed(22.0))
+        .sty(move |_t: &Theme| svg::Style { color: Some(color) })
+        .into()
+}
 
 fn human_bytes(b: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
@@ -97,6 +123,10 @@ impl MeshStoragePanel {
         let palette = crate::live_theme::palette();
         let sizes = FontSize::defaults();
 
+        // NOTIFY-UI-3 / ICON-MESH — Mesh Storage is the mesh file-service
+        // (LizardFS / QNM-Shared) surface, so its title leads with the
+        // `folder-remote` network icon rather than a local-volume glyph.
+        let title_icon = mesh_storage_icon(palette.text.into_cosmic_color());
         let title = text("Mesh Storage")
             .size(TypeRole::Display.size_in(sizes))
             .colr(palette.text.into_cosmic_color());
@@ -162,6 +192,7 @@ impl MeshStoragePanel {
             palette,
         );
         let header = row![
+            title_icon,
             title,
             Space::new().width(Length::Fill),
             refresh_btn,
@@ -347,6 +378,41 @@ mod tests {
         // Either Ok (mackesd installed + responding) or Err (absent/offline).
         // Both are valid outcomes; we just assert the function completes.
         let _ = result;
+    }
+
+    #[test]
+    fn mesh_storage_surface_uses_the_network_folder_icon() {
+        // NOTIFY-UI-3 / ICON-MESH: Mesh Storage is a mesh file service
+        // (LizardFS / QNM-Shared), not a local volume, so its surface renders
+        // the `folder-remote` network icon — matching the mde-files
+        // mesh-storage representation. Guard the SVG envelope too so the glyph
+        // can't silently rot into something un-renderable.
+        assert_eq!(mesh_storage_icon_name(), "folder-remote");
+        assert_eq!(mesh_storage_icon_name(), FOLDER_REMOTE_NAME);
+        let s = std::str::from_utf8(FOLDER_REMOTE_SVG).expect("icon bytes utf8");
+        assert!(s.starts_with("<svg "), "mesh-storage icon must be an <svg>");
+        assert!(s.ends_with("</svg>"), "mesh-storage icon must close </svg>");
+    }
+
+    #[test]
+    fn mesh_storage_view_renders_without_panicking() {
+        // Reachability: the panel's view() builds (incl. the title icon) for
+        // both the empty and the populated state.
+        let empty = MeshStoragePanel::new();
+        let _ = empty.view();
+
+        let mut populated = MeshStoragePanel::new();
+        let _ = populated.update(Message::Loaded(Ok(StorageStatus {
+            peers: vec![PeerRow {
+                addr: "10.42.0.5".to_string(),
+                used_bytes: 1_000_000,
+                avail_bytes: 9_000_000,
+            }],
+            goal: 1,
+            quota_cap_bytes: Some(7_200_000),
+            limiting_peer_addr: Some("10.42.0.5".to_string()),
+        })));
+        let _ = populated.view();
     }
 
     #[test]

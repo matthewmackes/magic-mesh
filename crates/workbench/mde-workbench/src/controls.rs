@@ -28,7 +28,11 @@ use cosmic::iced::widget::{button, container, row, text, text_input, Space};
 use cosmic::iced::{alignment, Background, Border, Color, Element, Length, Padding, Shadow};
 
 use crate::cosmic_compat::prelude::*;
-use mde_theme::{FontSize, Palette, Radii, TypeRole};
+use mde_theme::animation::lerp_f32;
+use mde_theme::{
+    FontSize, Palette, Radii, TypeRole, CARD_HOVER_OVERLAY_ALPHA, CARD_SELECTED_OVERLAY_ALPHA,
+    CARD_SHADOW_HOVER_ALPHA, CARD_SHADOW_HOVER_BLUR, CARD_SHADOW_HOVER_OFFSET_Y,
+};
 
 /// CR-9 — button height. 32 px per Classic ChromeOS spec.
 pub const BUTTON_HEIGHT: f32 = 32.0;
@@ -88,27 +92,15 @@ pub fn variant_button<'a, Message: Clone + 'a>(
         .align_y(alignment::Vertical::Center);
 
     let style = move |_theme: &cosmic::Theme, status: ButtonStatus| {
-        let mut bg = base_bg_for_variant(variant, accent, palette);
-        let mut fg = text_color_for_variant(variant, palette);
-        let mut border = border_for_variant(variant, accent, palette);
-        match status {
-            ButtonStatus::Hovered => bg = brighten(bg, 1.08), // +8% luminance
-            ButtonStatus::Pressed => bg = brighten(bg, 0.92), // -8% luminance
-            ButtonStatus::Disabled => {
-                fg = with_alpha(fg, DISABLED_OPACITY);
-                bg = with_alpha(bg, DISABLED_OPACITY * bg.a.max(0.1));
-                border.color = with_alpha(border.color, DISABLED_OPACITY);
-            }
-            ButtonStatus::Active => {}
-        }
-        button::Style {
-            snap: false,
-            background: Some(Background::Color(bg)),
-            text_color: fg,
-            border,
-            shadow: Shadow::default(),
-            ..button::Style::default()
-        }
+        // Only the hovered button consults reduce-motion (for the lift-shadow
+        // movement — §Q32), so read the live flag lazily on the Hovered arm
+        // alone. `variant_button` is a shared helper on 100+ call sites and the
+        // accessor loads the prefs file; reading it for every button every
+        // frame would be a per-render disk-I/O storm. At most one button is
+        // hovered per frame, matching the established once-per-view cost.
+        let reduce_motion = matches!(status, ButtonStatus::Hovered)
+            && crate::live_theme::reduce_motion();
+        variant_button_style(variant, accent, palette, reduce_motion, status)
     };
 
     let mut btn = button(label_text)
@@ -124,6 +116,59 @@ pub fn variant_button<'a, Message: Clone + 'a>(
         btn = btn.on_press(msg);
     }
     btn.into()
+}
+
+/// MOTION-FEEDBACK-1 — the pure status→[`button::Style`] mapping behind
+/// [`variant_button`]'s render closure. Keyed off the widget's
+/// [`ButtonStatus`], it applies the shared hover/press feedback over the locked
+/// Carbon chrome:
+///
+///   * **Hovered** — a subtle accent tint ([`hover_tint`], always applied) plus
+///     an upward hover-lift drawn as a drop shadow ([`hover_lift_shadow`],
+///     dropped under `reduce_motion`). Height, padding, and border weight are
+///     untouched — the size lock and the structural border are preserved.
+///   * **Pressed** — a press-down darken ([`press_tint`]), applied on the press
+///     status with no input delay.
+///   * **Disabled** — fades fg/bg/border by [`DISABLED_OPACITY`] (the const).
+///
+/// Extracted so the status→style mapping is unit-testable (the closure itself
+/// can't be reached from a test).
+fn variant_button_style(
+    variant: ButtonVariant,
+    accent: Color,
+    palette: Palette,
+    reduce_motion: bool,
+    status: ButtonStatus,
+) -> button::Style {
+    let base_bg = base_bg_for_variant(variant, accent, palette);
+    let mut bg = base_bg;
+    let mut fg = text_color_for_variant(variant, palette);
+    let mut border = border_for_variant(variant, accent, palette);
+    // Resting: no lift, no press-tint. Hovered/Pressed override below.
+    let mut shadow = Shadow::default();
+    match status {
+        ButtonStatus::Hovered => {
+            bg = hover_tint(base_bg, accent);
+            shadow = hover_lift_shadow(reduce_motion);
+        }
+        ButtonStatus::Pressed => {
+            bg = press_tint(base_bg);
+        }
+        ButtonStatus::Disabled => {
+            fg = with_alpha(fg, DISABLED_OPACITY);
+            bg = with_alpha(bg, DISABLED_OPACITY * bg.a.max(0.1));
+            border.color = with_alpha(border.color, DISABLED_OPACITY);
+        }
+        ButtonStatus::Active => {}
+    }
+    button::Style {
+        snap: false,
+        background: Some(Background::Color(bg)),
+        text_color: fg,
+        border,
+        shadow,
+        ..button::Style::default()
+    }
 }
 
 fn base_bg_for_variant(variant: ButtonVariant, accent: Color, _palette: Palette) -> Color {
@@ -454,6 +499,79 @@ pub fn spinner<'a, Message: 'a>(palette: Palette) -> Element<'a, Message, cosmic
     .into()
 }
 
+/// MOTION-FEEDBACK-1 — opacity above which a button's resting fill is treated as
+/// "already filled" (lighten on hover) vs. transparent (wash toward accent).
+/// The button variants rest at exactly 1.0 (Primary) or 0.0 (Secondary/Ghost),
+/// so a mid-point cutoff classifies them unambiguously and keeps the rule sane
+/// for any future translucent fill.
+const OPAQUE_FILL_CUTOFF: f32 = 0.5;
+
+/// MOTION-FEEDBACK-1 — the hover tint (the state cue, kept even under
+/// reduce-motion), applied without touching height, padding, or border weight.
+/// Single-sources its strength on the Carbon hover-overlay token
+/// ([`CARD_HOVER_OVERLAY_ALPHA`]) — the same 8% the Object Card uses — so the
+/// button's hover reads at the platform-standard strength, not a re-derived
+/// literal.
+///
+/// The tint *direction* depends on the variant's resting fill so every variant
+/// reads a hover change:
+///   * an **accent-filled** button (Primary) would show no shift blending toward
+///     its own accent, so it **lightens toward white** — a hover highlight.
+///   * a **transparent** button (Secondary/Ghost) gains an **accent wash**
+///     (blends toward accent, alpha lifting off zero) — a visible accent fill
+///     appearing under the pointer.
+fn hover_tint(base: Color, accent: Color) -> Color {
+    if base.a > OPAQUE_FILL_CUTOFF {
+        blend(base, Color::WHITE, CARD_HOVER_OVERLAY_ALPHA)
+    } else {
+        blend(base, accent, CARD_HOVER_OVERLAY_ALPHA)
+    }
+}
+
+/// MOTION-FEEDBACK-1 — the press darken (the press-down state cue). Darkens the
+/// resting background toward black at the Carbon selected/engaged-overlay
+/// strength ([`CARD_SELECTED_OVERLAY_ALPHA`], 15% — deeper than the 8% hover so
+/// the press reads as a firmer depress). Applied on the `Pressed` status with
+/// no input delay (it is keyed off the status, not a warm-up tween).
+fn press_tint(base: Color) -> Color {
+    blend(base, Color::BLACK, CARD_SELECTED_OVERLAY_ALPHA)
+}
+
+/// MOTION-FEEDBACK-1 — the hover-lift, expressed at render time as a drop shadow
+/// (the widget itself can't translate from a style closure, so the shadow casts
+/// the "raised above the surface" cue). Single-sources its offset/blur/alpha on
+/// the Carbon hover-shadow tokens — the same raised shadow the Object Card lifts
+/// to on hover — rather than re-deriving shadow metrics.
+///
+/// This is *movement*: under reduce-motion it collapses to no shadow (§Q32 — the
+/// accent tint still carries the hover state), so motion drops while the state
+/// stays.
+fn hover_lift_shadow(reduce_motion: bool) -> Shadow {
+    if reduce_motion {
+        return Shadow::default();
+    }
+    Shadow {
+        color: with_alpha(Color::BLACK, CARD_SHADOW_HOVER_ALPHA),
+        offset: cosmic::iced::Vector::new(0.0, CARD_SHADOW_HOVER_OFFSET_Y),
+        blur_radius: CARD_SHADOW_HOVER_BLUR,
+    }
+}
+
+/// Blend `from` toward `to` by `t` (0.0 = `from`, 1.0 = `to`), per channel
+/// including alpha. Reuses the shared [`lerp_f32`] so the interpolation math
+/// lives in one place. Interpolating alpha means a transparent fill (the
+/// secondary/ghost variants) gains a faint accent/press wash on
+/// hover/press — a consistent cue for every variant — while an opaque fill
+/// (primary) stays opaque.
+fn blend(from: Color, to: Color, t: f32) -> Color {
+    Color {
+        r: lerp_f32(from.r, to.r, t),
+        g: lerp_f32(from.g, to.g, t),
+        b: lerp_f32(from.b, to.b, t),
+        a: lerp_f32(from.a, to.a, t),
+    }
+}
+
 fn brighten(c: Color, factor: f32) -> Color {
     Color {
         r: (c.r * factor).clamp(0.0, 1.0),
@@ -528,5 +646,125 @@ mod tests {
         let _ = checkbox_style(palette);
         let _ = radio_style(palette);
         let _ = scrollbar_style(palette);
+    }
+
+    // MOTION-FEEDBACK-1 — status→style mapping for the shared variant_button.
+
+    fn style_for(variant: ButtonVariant, reduce_motion: bool, status: ButtonStatus) -> button::Style {
+        let palette = crate::live_theme::palette();
+        let accent = palette.accent.into_cosmic_color();
+        variant_button_style(variant, accent, palette, reduce_motion, status)
+    }
+
+    fn bg_color(style: &button::Style) -> Color {
+        match style.background {
+            Some(Background::Color(c)) => c,
+            other => panic!("expected a solid background color, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hover_tints_toward_accent_and_lifts_with_a_shadow() {
+        // Hovered: bg shifts toward accent (the always-on color cue) AND a lift
+        // shadow appears (the movement) when motion is on.
+        let active = style_for(ButtonVariant::Primary, false, ButtonStatus::Active);
+        let hovered = style_for(ButtonVariant::Primary, false, ButtonStatus::Hovered);
+        assert_ne!(
+            bg_color(&active),
+            bg_color(&hovered),
+            "hover must change the background (accent tint)"
+        );
+        // Movement: a raised lift shadow at the Carbon hover-shadow strength.
+        assert!(active.shadow.offset.y.abs() < f32::EPSILON, "resting button has no lift");
+        assert!(
+            (hovered.shadow.offset.y - CARD_SHADOW_HOVER_OFFSET_Y).abs() < f32::EPSILON,
+            "hover lift uses the Carbon hover-shadow offset"
+        );
+        assert!(
+            (hovered.shadow.color.a - CARD_SHADOW_HOVER_ALPHA).abs() < f32::EPSILON,
+            "lift shadow is visible at the Carbon hover-shadow alpha"
+        );
+    }
+
+    #[test]
+    fn hover_keeps_the_size_lock_and_border_weight() {
+        // The hover feedback must not touch the structural chrome: border width
+        // is unchanged from the resting (Active) border, and the helper never
+        // sets a height/padding (those live on the widget, not the style).
+        for variant in [ButtonVariant::Primary, ButtonVariant::Secondary, ButtonVariant::Ghost] {
+            let active = style_for(variant, false, ButtonStatus::Active);
+            let hovered = style_for(variant, false, ButtonStatus::Hovered);
+            assert!(
+                (active.border.width - hovered.border.width).abs() < f32::EPSILON,
+                "{variant:?}: hover must preserve the border weight (no focus-ring repurposing)"
+            );
+        }
+    }
+
+    #[test]
+    fn reduce_motion_keeps_the_hover_tint_but_drops_the_lift() {
+        // §Q32: under reduce-motion the hover *state* (the accent tint) is kept,
+        // but the *movement* (the lift shadow) is dropped.
+        let full = style_for(ButtonVariant::Primary, false, ButtonStatus::Hovered);
+        let reduced = style_for(ButtonVariant::Primary, true, ButtonStatus::Hovered);
+        // Tint kept: the hovered background is identical with/without motion.
+        assert_eq!(
+            bg_color(&full),
+            bg_color(&reduced),
+            "the hover accent tint stays under reduce-motion"
+        );
+        // Movement dropped: no lift shadow.
+        assert!(
+            reduced.shadow.offset.y.abs() < f32::EPSILON && reduced.shadow.color.a < f32::EPSILON,
+            "no lift shadow under reduce-motion"
+        );
+    }
+
+    #[test]
+    fn press_darkens_relative_to_hover_with_no_lift() {
+        // Pressed: a press-down darken, deeper than hover, and no lift shadow
+        // (the depress is a sink, not a rise).
+        let hovered = style_for(ButtonVariant::Primary, false, ButtonStatus::Hovered);
+        let pressed = style_for(ButtonVariant::Primary, false, ButtonStatus::Pressed);
+        let h = bg_color(&hovered);
+        let p = bg_color(&pressed);
+        // Darken: each RGB channel of pressed is <= hovered (toward black).
+        assert!(
+            p.r <= h.r && p.g <= h.g && p.b <= h.b && (p.r < h.r || p.g < h.g || p.b < h.b),
+            "press darkens the background relative to hover"
+        );
+        assert!(pressed.shadow.offset.y.abs() < f32::EPSILON, "no lift on press");
+    }
+
+    #[test]
+    fn disabled_uses_the_disabled_opacity_const() {
+        // Disabled fades fg/bg/border by DISABLED_OPACITY (the const, not 0.40).
+        let primary = style_for(ButtonVariant::Primary, false, ButtonStatus::Disabled);
+        // Primary's white text faded to DISABLED_OPACITY alpha.
+        assert!(
+            (primary.text_color.a - DISABLED_OPACITY).abs() < f32::EPSILON,
+            "disabled text alpha == DISABLED_OPACITY"
+        );
+        // Secondary's accent border faded to DISABLED_OPACITY alpha.
+        let secondary = style_for(ButtonVariant::Secondary, false, ButtonStatus::Disabled);
+        assert!(
+            (secondary.border.color.a - DISABLED_OPACITY).abs() < f32::EPSILON,
+            "disabled border alpha == DISABLED_OPACITY"
+        );
+    }
+
+    #[test]
+    fn transparent_variants_gain_a_visible_hover_wash() {
+        // Secondary/Ghost rest on a transparent fill; the accent tint must still
+        // read on hover (alpha lifts off zero) so every variant gets feedback.
+        for variant in [ButtonVariant::Secondary, ButtonVariant::Ghost] {
+            let active = style_for(variant, false, ButtonStatus::Active);
+            let hovered = style_for(variant, false, ButtonStatus::Hovered);
+            assert!(bg_color(&active).a < f32::EPSILON, "{variant:?} rests transparent");
+            assert!(
+                bg_color(&hovered).a > f32::EPSILON,
+                "{variant:?} gains a visible hover wash"
+            );
+        }
     }
 }

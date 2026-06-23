@@ -1,0 +1,45 @@
+#cloud-config
+hostname: ${hostname}
+users:
+  - name: mm
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    groups: [wheel]
+    ssh_authorized_keys:
+      - "${ssh_pubkey}"
+ssh_pwauth: false
+growpart: { mode: auto, devices: ['/'], ignore_growroot_disabled: false }
+# NETWORK — write the NetworkManager keyfile DIRECTLY (the BUILD-FARM root cause
+# fix proven in setup-xcp-build-vm.sh): on Fedora-Cloud + Xen HVM cloud-init
+# parses a netplan-v2 network-config but renders NO NM keyfile, so the NIC falls
+# back to DHCP and a static-only LAN leaves the VM dark. Generic type=ethernet
+# (no interface-name) binds whatever the NIC is called (Xen: enX0). Disable
+# cloud-init's net management so nothing competes; bring it up on first boot.
+write_files:
+  - path: /etc/NetworkManager/system-connections/static-primary.nmconnection
+    permissions: '0600'
+    owner: root:root
+    content: |
+      [connection]
+      id=static-primary
+      type=ethernet
+      autoconnect=true
+      autoconnect-priority=999
+
+      [ipv4]
+      method=manual
+      address1=${ip_cidr},${gateway}
+      dns=${dns}
+
+      [ipv6]
+      method=ignore
+  - path: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+    permissions: '0644'
+    content: |
+      network: {config: disabled}
+runcmd:
+  - [ nmcli, connection, reload ]
+  - [ sh, -c, "nmcli connection up static-primary || systemctl restart NetworkManager" ]
+  # The provider's generated meta-data can leave the hostname at the cloud-image
+  # default (localhost); set it explicitly so logs/inventory read cleanly.
+  - [ hostnamectl, set-hostname, "${hostname}" ]

@@ -11,7 +11,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
+use cosmic::iced::widget::{button, column, container, pick_list, row, scrollable, text, Space};
 use cosmic::iced::Task;
 
 /// ROUTING-VALIDATE-1 — after requesting a run, poll the verdict on this cadence
@@ -20,8 +20,13 @@ use cosmic::iced::Task;
 const POLL_DELAY: Duration = Duration::from_secs(3);
 /// Bounded so a leader that never completes can't poll forever.
 const MAX_POLLS: u8 = 12;
+/// ROUTE-TRACE-4 — read budget for the `action/route/trace` Bus probe. Matches
+/// the other panels' interactive 2 s read window (the responder assembles the
+/// graph from local exposure/peer state — no network round-trips).
+const TRACE_TIMEOUT: Duration = Duration::from_secs(2);
 use cosmic::iced::{Background, Border, Color, Length, Padding};
 use cosmic::{Element, Theme};
+use mackes_mesh_types::route_trace::{Direction, Layer, NodeKind, PathGraph, Verdict};
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
 
 use crate::cosmic_compat::prelude::*;
@@ -45,6 +50,10 @@ pub struct ValidationStatus {
     pub missing_reporters: Vec<String>,
 }
 
+/// ROUTE-TRACE-4 — wire values for the Egress/Ingress direction toggle, in the
+/// kebab-case the `action/route/trace` IPC + `route_trace::Direction` expect.
+const DIRECTION_CHOICES: [&str; 2] = ["egress", "ingress"];
+
 #[derive(Debug, Clone, Default)]
 pub struct RoutingPanel {
     pub status: ValidationStatus,
@@ -60,6 +69,87 @@ pub struct RoutingPanel {
     /// ROUTING-VALIDATE-1 — how many times we've polled the verdict since the
     /// last run request (bounded by `MAX_POLLS`).
     pub poll_attempts: u8,
+    /// ROUTE-TRACE-4 — the path-trace toolbar state machine.
+    pub trace: TraceState,
+}
+
+/// ROUTE-TRACE-4 — the trace toolbar's selection state + last result.
+///
+/// The toolbar lets the operator pick a **source node**, a **destination
+/// service/host**, and an **Egress/Ingress direction**, then run a trace. The
+/// pure [`TraceState::request_body`] turns that selection into the exact
+/// `action/route/trace` request shape the responder (`mackesd/src/ipc/route.rs`)
+/// expects; [`TraceState::can_trace`] is the button's enable gate. The rendered
+/// [`PathGraph`] (or an error) lands in `result`.
+#[derive(Debug, Clone, Default)]
+pub struct TraceState {
+    /// Source-node label (the egress originator). Egress requires it; ingress
+    /// ignores it (the responder resolves the host from the service's policy).
+    pub source: String,
+    /// Destination — a service id (ingress) or an external host/IP (egress).
+    pub dest: String,
+    /// `"egress"` | `"ingress"` (the toggle's wire value; default egress).
+    pub direction: String,
+    /// True while an `action/route/trace` request is in flight.
+    pub busy: bool,
+    /// The most recent trace result: the rendered `PathGraph`, or an error.
+    pub result: Option<Result<PathGraph, String>>,
+}
+
+impl TraceState {
+    /// Which direction the toggle currently selects (defaults to Egress for a
+    /// blank/unknown wire value, matching `route_trace::Direction::default`).
+    #[must_use]
+    pub fn dir(&self) -> Direction {
+        match self.direction.as_str() {
+            "ingress" => Direction::Ingress,
+            _ => Direction::Egress,
+        }
+    }
+
+    /// True when the current selection is complete enough to trace. Egress needs
+    /// a source node (the responder errors without a `from`); ingress needs a
+    /// destination service id (the responder errors without a `to`). Never busy.
+    #[must_use]
+    pub fn can_trace(&self) -> bool {
+        if self.busy {
+            return false;
+        }
+        match self.dir() {
+            Direction::Egress => !self.source.trim().is_empty(),
+            Direction::Ingress => !self.dest.trim().is_empty(),
+        }
+    }
+
+    /// Build the exact `action/route/trace` request body for the current
+    /// selection (pure — the toolbar state machine's core, unit-tested). The
+    /// responder reads `{ direction, from, to }`:
+    ///
+    /// * egress — `from` = source node, `to` = external dest (blank ⇒ the
+    ///   responder defaults it to "Internet");
+    /// * ingress — `to` = the service id (`from` is unused).
+    ///
+    /// Returns `None` when the selection isn't traceable yet
+    /// ([`Self::can_trace`] is false), so the caller never publishes an
+    /// under-specified request.
+    #[must_use]
+    pub fn request_body(&self) -> Option<String> {
+        if !self.can_trace() {
+            return None;
+        }
+        let body = match self.dir() {
+            Direction::Egress => serde_json::json!({
+                "direction": "egress",
+                "from": self.source.trim(),
+                "to": self.dest.trim(),
+            }),
+            Direction::Ingress => serde_json::json!({
+                "direction": "ingress",
+                "to": self.dest.trim(),
+            }),
+        };
+        Some(body.to_string())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +158,14 @@ pub enum Message {
     RefreshClicked,
     RunNow,
     RunRequested(Result<String, String>),
+    /// ROUTE-TRACE-4 — trace toolbar edits.
+    TraceSourceChanged(String),
+    TraceDestChanged(String),
+    TraceDirectionSelected(String),
+    TraceClicked,
+    /// ROUTE-TRACE-4 — an `action/route/trace` reply landed (the `PathGraph` or
+    /// an error message).
+    TraceLoaded(Result<PathGraph, String>),
 }
 
 impl RoutingPanel {
@@ -146,6 +244,39 @@ impl RoutingPanel {
                 self.poll_attempts = 0;
                 poll_status_later()
             }
+            Message::TraceSourceChanged(v) => {
+                self.trace.source = v;
+                Task::none()
+            }
+            Message::TraceDestChanged(v) => {
+                self.trace.dest = v;
+                Task::none()
+            }
+            Message::TraceDirectionSelected(v) => {
+                self.trace.direction = v;
+                Task::none()
+            }
+            Message::TraceClicked => {
+                // Build the request body from the toolbar state; a noop if the
+                // selection isn't traceable yet (the button is disabled in that
+                // case, but guard regardless).
+                let Some(body) = self.trace.request_body() else {
+                    return Task::none();
+                };
+                self.trace.busy = true;
+                Task::perform(
+                    async move { tokio::task::spawn_blocking(move || request_trace(&body)).await },
+                    |joined| {
+                        let result = joined.unwrap_or_else(|e| Err(format!("trace task: {e}")));
+                        crate::Message::Routing(Message::TraceLoaded(result))
+                    },
+                )
+            }
+            Message::TraceLoaded(result) => {
+                self.trace.busy = false;
+                self.trace.result = Some(result);
+                Task::none()
+            }
         }
     }
 
@@ -207,6 +338,11 @@ impl RoutingPanel {
         .align_y(cosmic::iced::alignment::Vertical::Center);
 
         let mut body_col = column![].spacing(6);
+        // ROUTE-TRACE-4 — the path-trace toolbar + topology graph sit atop the
+        // reachability verdict (the trace is the interactive "why is this path
+        // (un)reachable" lens over the same overlay state).
+        body_col = body_col.push(trace_toolbar(&self.trace, palette));
+        body_col = body_col.push(trace_graph(&self.trace, palette));
         if let Some(res) = &self.run_result {
             body_col = body_col.push(result_strip(res, palette));
         }
@@ -426,7 +562,420 @@ fn card<'a>(
         .into()
 }
 
+// ---- ROUTE-TRACE-4: trace toolbar + topology graph ------------------------
+
+/// ROUTE-TRACE-4 — the trace toolbar: a source-node picker, a destination
+/// service/host field, an Egress/Ingress direction toggle, and a Trace button.
+/// The direction toggle re-labels the fields' meaning (egress traces a node's
+/// WAN path to a host; ingress traces an external client's path to a published
+/// service) and flips which field gates the Trace button.
+fn trace_toolbar<'a>(state: &'a TraceState, palette: Palette) -> Element<'a, crate::Message> {
+    let sizes = FontSize::defaults();
+    let dir = state.dir();
+    let label = move |s: &str| {
+        text(s.to_string())
+            .size(11)
+            .colr(palette.text_muted.into_cosmic_color())
+            .width(Length::Fixed(70.0))
+    };
+
+    // Source node — meaningful for egress (the originating mesh node); ingress
+    // resolves the host from the service policy, so it's shown as a muted note
+    // (not an editable field) in that direction. The editable fields use the
+    // shared Carbon-token input chrome (`controls::styled_text_input`) so they
+    // match every other panel's inputs (§4).
+    let dest_hint = match dir {
+        Direction::Egress => "destination host/IP (e.g. 1.1.1.1)",
+        Direction::Ingress => "service id (e.g. grafana)",
+    };
+    // `controls::styled_text_input` returns a `cosmic::Theme` element (the same
+    // theme as the surrounding panel tree), so it drops straight in — no `themer`
+    // bridge needed (unlike the stock-iced-themed canvas).
+    let source_widget: Element<'a, crate::Message> = match dir {
+        Direction::Egress => crate::controls::styled_text_input(
+            "source node (e.g. eagle)",
+            &state.source,
+            |v| crate::Message::Routing(Message::TraceSourceChanged(v)),
+            palette,
+        ),
+        Direction::Ingress => text("(resolved from the service's policy)")
+            .size(13)
+            .colr(palette.text_muted.into_cosmic_color())
+            .into(),
+    };
+    let dest_widget = crate::controls::styled_text_input(
+        dest_hint,
+        &state.dest,
+        |v| crate::Message::Routing(Message::TraceDestChanged(v)),
+        palette,
+    );
+
+    let direction_picker = pick_list(
+        DIRECTION_CHOICES.map(String::from).to_vec(),
+        Some(if state.direction.is_empty() {
+            "egress".to_string()
+        } else {
+            state.direction.clone()
+        }),
+        |v| crate::Message::Routing(Message::TraceDirectionSelected(v)),
+    )
+    .text_size(13);
+
+    let trace_msg = state
+        .can_trace()
+        .then_some(crate::Message::Routing(Message::TraceClicked));
+    let trace_btn = crate::controls::variant_button(
+        if state.busy { "Tracing…" } else { "Trace" },
+        crate::controls::ButtonVariant::Primary,
+        trace_msg,
+        palette,
+    );
+
+    let title = text("Trace a path")
+        .size(TypeRole::Body.size_in(sizes))
+        .colr(palette.text.into_cosmic_color());
+
+    let source_row = row![label("From"), source_widget]
+        .spacing(10)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+    let dest_row = row![label("To"), dest_widget]
+        .spacing(10)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+    let controls_row = row![
+        label("Direction"),
+        direction_picker,
+        Space::new().width(Length::Fill),
+        trace_btn,
+    ]
+    .spacing(10)
+    .align_y(cosmic::iced::alignment::Vertical::Center);
+
+    card(
+        column![title, source_row, dest_row, controls_row].spacing(8),
+        palette,
+    )
+}
+
+/// ROUTE-TRACE-4 — the topology-graph card: renders the most recent trace's
+/// `PathGraph` on a canvas (node glyphs by kind, edge color by layer, RTT/loss
+/// labels), or a hint / error when nothing has been traced yet. Reuses the
+/// canvas drawing approach from the Peers map (`peers_map::MapProgram`).
+fn trace_graph<'a>(state: &TraceState, palette: Palette) -> Element<'a, crate::Message> {
+    match &state.result {
+        Some(Ok(graph)) => {
+            // The canvas program paints from `palette` (it ignores the passed
+            // stock theme), so `themer(None, ...)` bridges the stock-themed
+            // canvas into the surrounding cosmic theme — same pattern as Peers.
+            let program = PathGraphProgram {
+                graph: graph.clone(),
+                palette,
+            };
+            let canvas_stock: cosmic::iced::Element<'_, crate::Message, cosmic::iced::Theme> =
+                cosmic::iced::widget::canvas(program)
+                    .width(Length::Fill)
+                    .height(Length::Fixed(280.0))
+                    .into();
+            let canvas: Element<'_, crate::Message> =
+                cosmic::iced::widget::themer(None, canvas_stock).into();
+            let verdict = path_verdict_line(graph, palette);
+            card(
+                column![verdict, container(canvas).width(Length::Fill)].spacing(8),
+                palette,
+            )
+        }
+        Some(Err(e)) => card(
+            text(format!("Trace failed — {e}"))
+                .size(12)
+                .colr(palette.danger.into_cosmic_color()),
+            palette,
+        ),
+        None => card(
+            text(
+                "Pick a source + destination and a direction, then Trace to render the path \
+                 graph — node glyphs by kind, edges colored by layer with RTT/loss labels, the \
+                 first blocking control point highlighted.",
+            )
+            .size(12)
+            .colr(palette.text_muted.into_cosmic_color()),
+            palette,
+        ),
+    }
+}
+
+/// ROUTE-TRACE-4 — a one-line verdict over the rendered path: reachable, blocked
+/// (citing where), or indeterminate (a control point couldn't be resolved).
+fn path_verdict_line<'a>(graph: &PathGraph, palette: Palette) -> Element<'a, crate::Message> {
+    let (color, label) = if let Some(at) = &graph.blocked_at {
+        (
+            palette.danger.into_cosmic_color(),
+            format!("BLOCKED at {}", blocked_edge_label(graph, at)),
+        )
+    } else if graph.has_indeterminate() {
+        (
+            palette.warning.into_cosmic_color(),
+            "INDETERMINATE — a control point couldn't be resolved".to_string(),
+        )
+    } else {
+        (
+            palette.success.into_cosmic_color(),
+            "REACHABLE — the path reaches its destination unblocked".to_string(),
+        )
+    };
+    let dir = match graph.direction {
+        Direction::Egress => "egress",
+        Direction::Ingress => "ingress",
+    };
+    row![
+        text(label).size(12).colr(color),
+        Space::new().width(Length::Fill),
+        text(format!("{dir} · {} hops", graph.edges.len()))
+            .size(11)
+            .colr(palette.text_muted.into_cosmic_color()),
+    ]
+    .spacing(8)
+    .align_y(cosmic::iced::alignment::Vertical::Center)
+    .into()
+}
+
+/// ROUTE-TRACE-4 — render the blocked edge id (`<from-id>-><to-id>`) as a human
+/// `<from-label> → <to-label>` using the graph's node labels, so the verdict
+/// reads like the graph (hostnames/service names) rather than the internal wire
+/// ids. Falls back to the raw edge id if the edge isn't found.
+fn blocked_edge_label(graph: &PathGraph, edge_id: &str) -> String {
+    let label_of = |id: &str| -> String {
+        graph
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .map_or_else(|| id.to_string(), |n| n.label.clone())
+    };
+    graph.edges.iter().find(|e| e.id() == edge_id).map_or_else(
+        || edge_id.to_string(),
+        |e| format!("{} → {}", label_of(&e.from), label_of(&e.to)),
+    )
+}
+
+/// ROUTE-TRACE-4 — the topology-graph canvas program. Lays the path out as a
+/// horizontal chain (source→dest order — a path is linear), draws each edge
+/// colored by its [`Layer`] with an RTT/loss label, highlights the active path
+/// (and the first blocking edge in danger), and paints each node as a glyph
+/// sized/colored by its [`NodeKind`]. Paints from `palette` (Carbon tokens) — no
+/// raw hex.
+struct PathGraphProgram {
+    graph: PathGraph,
+    palette: Palette,
+}
+
+impl PathGraphProgram {
+    /// Project the path's nodes onto a horizontal chain across `bounds`, in
+    /// source→dest order (a [`PathGraph`] is a linear path). Returns id→point.
+    fn projected(
+        &self,
+        bounds: &cosmic::iced::Rectangle,
+    ) -> std::collections::HashMap<String, cosmic::iced::Point> {
+        use cosmic::iced::Point;
+        let n = self.graph.nodes.len().max(1);
+        let pad = 60.0_f32;
+        let usable = (bounds.width - pad * 2.0).max(1.0);
+        let step = if n > 1 { usable / (n - 1) as f32 } else { 0.0 };
+        let y = bounds.height / 2.0;
+        self.graph
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| (node.id.clone(), Point::new(pad + step * i as f32, y)))
+            .collect()
+    }
+}
+
+/// ROUTE-TRACE-4 — the Carbon token an edge's [`Layer`] colors to. Host=muted
+/// (local), Mesh=accent (the overlay), Vpn=warning (a tunnel boundary),
+/// Public=success-but-it's-really-just-"open" — we use `text` for public so the
+/// four layers read distinctly against the canvas. A blocked edge overrides this
+/// with `danger` at the draw site.
+fn layer_color(layer: Layer, palette: Palette) -> Color {
+    match layer {
+        Layer::Host => palette.text_muted.into_cosmic_color(),
+        Layer::Mesh => palette.accent.into_cosmic_color(),
+        Layer::Vpn => palette.warning.into_cosmic_color(),
+        Layer::Public => palette.text.into_cosmic_color(),
+    }
+}
+
+/// ROUTE-TRACE-4 — a short glyph for a node [`NodeKind`] (drawn inside the node
+/// disc). Plain ASCII so it renders without an icon font on the canvas.
+fn node_glyph(kind: NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Host => "H",
+        NodeKind::Vm => "V",
+        NodeKind::Container => "C",
+        NodeKind::OverlayPeer => "P",
+        NodeKind::Gateway => "G",
+        NodeKind::VpnExit => "X",
+        NodeKind::Ingress => "I",
+        NodeKind::Internet => "@",
+        NodeKind::Service => "S",
+    }
+}
+
+impl cosmic::iced::widget::canvas::Program<crate::Message> for PathGraphProgram {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &cosmic::iced::Renderer,
+        _theme: &cosmic::iced::Theme,
+        bounds: cosmic::iced::Rectangle,
+        _cursor: cosmic::iced::mouse::Cursor,
+    ) -> Vec<cosmic::iced::widget::canvas::Geometry> {
+        use cosmic::iced::alignment::Vertical;
+        use cosmic::iced::widget::canvas::{Frame, Path, Stroke, Text};
+        use cosmic::iced::widget::text::Alignment;
+        use cosmic::iced::{Pixels, Point, Rectangle};
+        let mut frame = Frame::new(renderer, bounds.size());
+        let rect = Rectangle::with_size(bounds.size());
+        let proj = self.projected(&rect);
+        let p = &self.palette;
+
+        // Edges first (under the nodes), colored by layer; the blocking edge is
+        // drawn in danger + thicker to highlight where the path stops.
+        for edge in &self.graph.edges {
+            let (Some(&from), Some(&to)) = (proj.get(&edge.from), proj.get(&edge.to)) else {
+                continue;
+            };
+            let blocked = self
+                .graph
+                .blocked_at
+                .as_deref()
+                .is_some_and(|b| b == edge.id());
+            let indeterminate = edge
+                .control
+                .as_ref()
+                .is_some_and(|c| c.verdict == Verdict::Indeterminate);
+            let (color, width) = if blocked {
+                (p.danger.into_cosmic_color(), 3.0)
+            } else if indeterminate {
+                (p.warning.into_cosmic_color(), 2.0)
+            } else {
+                (layer_color(edge.layer, *p), 2.0)
+            };
+            frame.stroke(
+                &Path::line(from, to),
+                Stroke::default().with_color(color).with_width(width),
+            );
+            // RTT/loss label above the segment midpoint; layer name below it so
+            // the operator can read the edge's layer at a glance.
+            let mid = Point::new((from.x + to.x) / 2.0, (from.y + to.y) / 2.0);
+            // Only render finite measurements; a non-finite probe value is
+            // dropped rather than shown as "NaN% loss". Loss is a 0.0..=1.0
+            // fraction (the route_trace model contract) → clamp before %.
+            let rtt = edge.rtt_ms.filter(|v| v.is_finite());
+            let loss = edge
+                .loss
+                .filter(|v| v.is_finite())
+                .map(|v| (v.clamp(0.0, 1.0)) * 100.0);
+            let metric = match (rtt, loss) {
+                (Some(rtt), Some(loss)) => format!("{rtt:.0} ms · {loss:.0}% loss"),
+                (Some(rtt), None) => format!("{rtt:.0} ms"),
+                (None, Some(loss)) => format!("{loss:.0}% loss"),
+                (None, None) => String::new(),
+            };
+            if !metric.is_empty() {
+                frame.fill_text(Text {
+                    content: metric,
+                    position: Point::new(mid.x, mid.y - 16.0),
+                    color: p.text.into_cosmic_color(),
+                    size: Pixels(10.0),
+                    align_x: Alignment::Center,
+                    ..Text::default()
+                });
+            }
+            frame.fill_text(Text {
+                content: layer_label(edge.layer).to_string(),
+                position: Point::new(mid.x, mid.y + 6.0),
+                color,
+                size: Pixels(9.0),
+                align_x: Alignment::Center,
+                ..Text::default()
+            });
+        }
+
+        // Nodes: a disc with the kind glyph, the label below.
+        for node in &self.graph.nodes {
+            let Some(&at) = proj.get(&node.id) else {
+                continue;
+            };
+            let r = 14.0;
+            frame.fill(&Path::circle(at, r), p.surface.into_cosmic_color());
+            frame.stroke(
+                &Path::circle(at, r),
+                Stroke::default()
+                    .with_color(p.accent.into_cosmic_color())
+                    .with_width(1.5),
+            );
+            frame.fill_text(Text {
+                content: node_glyph(node.kind).to_string(),
+                position: at,
+                color: p.text.into_cosmic_color(),
+                size: Pixels(13.0),
+                align_x: Alignment::Center,
+                align_y: Vertical::Center,
+                ..Text::default()
+            });
+            frame.fill_text(Text {
+                content: node.label.clone(),
+                position: Point::new(at.x, at.y + r + 6.0),
+                color: p.text_muted.into_cosmic_color(),
+                size: Pixels(11.0),
+                align_x: Alignment::Center,
+                ..Text::default()
+            });
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
+/// ROUTE-TRACE-4 — the short layer name drawn under each edge.
+fn layer_label(layer: Layer) -> &'static str {
+    match layer {
+        Layer::Host => "host",
+        Layer::Mesh => "mesh",
+        Layer::Vpn => "vpn",
+        Layer::Public => "public",
+    }
+}
+
 // ---- I/O ------------------------------------------------------
+
+/// ROUTE-TRACE-4 — request a path trace over the Bus (`action/route/trace`) and
+/// decode the reply into a [`PathGraph`]. The responder replies
+/// `{"ok":true,"graph":<PathGraph>}` on success or `{"error":...}` on failure.
+/// Blocking (the Bus client builds its own current-thread runtime) — call from
+/// `spawn_blocking`, never on the iced executor.
+fn request_trace(body: &str) -> Result<PathGraph, String> {
+    let raw =
+        crate::dbus::action_request_with_body("action/route/trace", Some(body), TRACE_TIMEOUT)
+            .ok_or_else(|| "mackesd not reachable over the Bus (route/trace)".to_string())?;
+    parse_trace_reply(&raw)
+}
+
+/// ROUTE-TRACE-4 — pure decoder for the `action/route/trace` reply envelope:
+/// `{"ok":true,"graph":<PathGraph>}` → the graph; `{"error":m}` → `Err(m)`;
+/// anything else → a "bad reply" error. Split out so the wire contract is
+/// unit-testable without the Bus.
+fn parse_trace_reply(raw: &str) -> Result<PathGraph, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(raw.trim()).map_err(|e| format!("bad trace reply: {e}"))?;
+    if let Some(err) = v.get("error").and_then(serde_json::Value::as_str) {
+        return Err(err.to_string());
+    }
+    let graph = v
+        .get("graph")
+        .ok_or_else(|| "trace reply missing 'graph'".to_string())?;
+    serde_json::from_value::<PathGraph>(graph.clone())
+        .map_err(|e| format!("trace reply decode: {e}"))
+}
 
 /// ROUTING-VALIDATE-1 — sleep `POLL_DELAY`, then re-fetch the verdict. Used to
 /// poll for a freshly-requested run's result (the leader mints it + nodes report
@@ -604,5 +1153,146 @@ mod tests {
         );
         p.run_result = Some(Ok("requested".into()));
         let _ = p.view(); // fail verdict + strip
+    }
+
+    // --- ROUTE-TRACE-4: trace toolbar state machine ----------------------------
+
+    #[test]
+    fn trace_egress_needs_a_source_node_to_be_traceable() {
+        // Default direction is egress; a blank source can't trace; once a source
+        // is set it can, and the request body is the exact egress shape.
+        let mut t = TraceState::default();
+        assert_eq!(t.dir(), Direction::Egress, "default direction is egress");
+        assert!(!t.can_trace(), "blank egress source is not traceable");
+        assert!(t.request_body().is_none());
+
+        t.source = "eagle".into();
+        t.dest = "1.1.1.1".into();
+        assert!(t.can_trace());
+        let body: serde_json::Value =
+            serde_json::from_str(&t.request_body().expect("traceable")).unwrap();
+        assert_eq!(body["direction"], "egress");
+        assert_eq!(body["from"], "eagle");
+        assert_eq!(body["to"], "1.1.1.1");
+    }
+
+    #[test]
+    fn trace_ingress_needs_a_dest_service_and_drops_the_source() {
+        // Ingress gates on the destination service id (the responder resolves the
+        // host from the service policy), and the body carries no `from`.
+        let mut t = TraceState {
+            direction: "ingress".into(),
+            source: "eagle".into(), // present but irrelevant for ingress
+            ..Default::default()
+        };
+        assert_eq!(t.dir(), Direction::Ingress);
+        assert!(!t.can_trace(), "blank ingress dest is not traceable");
+        assert!(t.request_body().is_none());
+
+        t.dest = "grafana".into();
+        assert!(t.can_trace());
+        let body: serde_json::Value =
+            serde_json::from_str(&t.request_body().expect("traceable")).unwrap();
+        assert_eq!(body["direction"], "ingress");
+        assert_eq!(body["to"], "grafana");
+        assert!(body.get("from").is_none(), "ingress carries no 'from'");
+    }
+
+    #[test]
+    fn switching_direction_reuses_the_endpoints() {
+        // The direction toggle flips which field gates Trace without clearing the
+        // other — the same endpoints serve both perspectives (ROUTE-TRACE-4
+        // "switches egress↔ingress for the same endpoints").
+        let mut t = TraceState {
+            source: "eagle".into(),
+            dest: "grafana".into(),
+            ..Default::default()
+        };
+        // Egress: traceable, egress body shape.
+        assert_eq!(t.dir(), Direction::Egress);
+        assert!(t.can_trace());
+        // Flip to ingress: still traceable (dest is set), ingress body shape.
+        t.direction = "ingress".into();
+        assert_eq!(t.dir(), Direction::Ingress);
+        assert!(t.can_trace());
+        let body: serde_json::Value = serde_json::from_str(&t.request_body().unwrap()).unwrap();
+        assert_eq!(body["direction"], "ingress");
+        assert_eq!(body["to"], "grafana");
+    }
+
+    #[test]
+    fn a_busy_trace_is_not_re_triggerable() {
+        let t = TraceState {
+            source: "eagle".into(),
+            busy: true,
+            ..Default::default()
+        };
+        assert!(!t.can_trace(), "an in-flight trace gates the button");
+        assert!(t.request_body().is_none());
+    }
+
+    #[test]
+    fn update_drives_the_toolbar_then_renders_the_graph() {
+        // The toolbar messages mutate the state machine and TraceClicked only
+        // fires when traceable; a returned PathGraph renders without panic.
+        let mut p = RoutingPanel::new();
+        let _ = p.update(Message::TraceSourceChanged("eagle".into()));
+        let _ = p.update(Message::TraceDestChanged("1.1.1.1".into()));
+        assert_eq!(p.trace.source, "eagle");
+        assert!(p.trace.can_trace());
+        // A blocked ingress graph (mesh-only service) renders the blocked path.
+        let g =
+            mackes_mesh_types::route_trace::assemble_egress("eagle", Some("10.42.0.2"), "1.1.1.1");
+        let _ = p.update(Message::TraceLoaded(Ok(g)));
+        assert!(p.trace.result.is_some());
+        let _ = p.view(); // graph card reachable from the real view
+    }
+
+    #[test]
+    fn blocked_edge_label_uses_human_node_labels() {
+        // A blocked ingress trace to a mesh-only service: the verdict should read
+        // the node labels (Internet → the lighthouse), not the raw wire edge id.
+        let g = mackes_mesh_types::route_trace::assemble_ingress(
+            &mackes_mesh_types::exposure::ExposurePolicy {
+                id: "grafana".into(),
+                source: mackes_mesh_types::exposure::ServiceSource {
+                    node: "eagle".into(),
+                    port: 3000,
+                    proto: "tcp".into(),
+                    ..Default::default()
+                },
+                tier: mackes_mesh_types::exposure::Tier::MeshOnly,
+                ..Default::default()
+            },
+            Some("10.42.0.2"),
+            None,
+        );
+        let at = g.blocked_at.as_deref().expect("mesh-only blocks");
+        let label = blocked_edge_label(&g, at);
+        // internet->ingress edge → "Internet → (no ingress)" (the labels), no
+        // raw "internet->ingress" wire id.
+        assert!(label.contains('→'), "{label}");
+        assert!(label.starts_with("Internet"), "{label}");
+        assert!(!label.contains("->"), "no raw wire id: {label}");
+        // An unknown edge id falls back to the raw id.
+        assert_eq!(blocked_edge_label(&g, "ghost->void"), "ghost->void");
+    }
+
+    #[test]
+    fn parse_trace_reply_decodes_ok_and_error_envelopes() {
+        // The ok envelope yields a PathGraph; the error envelope an Err.
+        let g = mackes_mesh_types::route_trace::assemble_egress("eagle", None, "1.1.1.1");
+        let ok = format!("{{\"ok\":true,\"graph\":{}}}", g.to_json().unwrap());
+        let decoded = parse_trace_reply(&ok).expect("ok envelope decodes");
+        assert_eq!(decoded.direction, Direction::Egress);
+        assert_eq!(decoded.nodes.len(), 2);
+
+        let err = parse_trace_reply(r#"{"error":"no such service 'nope'"}"#).unwrap_err();
+        assert!(err.contains("no such service"));
+        assert!(parse_trace_reply("garbage").is_err());
+        assert!(
+            parse_trace_reply(r#"{"ok":true}"#).is_err(),
+            "missing graph"
+        );
     }
 }

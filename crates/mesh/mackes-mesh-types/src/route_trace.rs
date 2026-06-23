@@ -585,6 +585,237 @@ impl PathGraph {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ROUTE-TRACE-3: live, best-effort measurement.
+//
+// The model so far is the *modeled* path; this layer enriches it with real
+// numbers where they're measurable, and falls back to the modeled segment with
+// no number (and never a panic — §2) where they aren't:
+//
+//   * per-overlay-link RTT/loss from the existing path classifier / netstate
+//     (the `mesh-latency` snapshot keyed by peer name) onto the Mesh edges;
+//   * a real public hop list (RTT) from a `traceroute`/`mtr` run beyond the exit
+//     onto the Public edge.
+//
+// The *gathering* (reading the latency cache, shelling out to traceroute) lives
+// in `mackesd`; here we keep the typed shapes + the pure application logic so
+// both the daemon and the GUI agree on them and it's unit-testable. An
+// unmeasured segment is left exactly as the model built it (`rtt_ms`/`loss`
+// stay `None`) — a missing measurement is never invented.
+// ---------------------------------------------------------------------------
+
+/// True when an RTT reading is a real measurement worth rendering: finite and
+/// strictly positive. A `0.0` (the traceroute parser's fallback for an answered
+/// hop whose `… ms` token it couldn't read), a negative, or a NaN/inf is **not**
+/// a measurement — the segment degrades to modeled rather than showing "0 ms".
+#[must_use]
+fn is_usable_rtt(rtt_ms: f64) -> bool {
+    rtt_ms.is_finite() && rtt_ms > 0.0
+}
+
+/// True when a loss reading is a real measurement: finite and in `0.0..=1.0`.
+#[must_use]
+fn is_usable_loss(loss: f64) -> bool {
+    loss.is_finite() && (0.0..=1.0).contains(&loss)
+}
+
+impl Layer {
+    /// True for the Nebula overlay layer — the one whose per-link RTT/loss the
+    /// path classifier / netstate measures.
+    #[must_use]
+    pub const fn is_overlay(self) -> bool {
+        matches!(self, Self::Mesh)
+    }
+}
+
+impl PathEdge {
+    /// True when this edge rides the Nebula overlay (a `Mesh`-layer link) — the
+    /// segment whose RTT/loss the per-link path classifier can fill in.
+    #[must_use]
+    pub const fn is_overlay(&self) -> bool {
+        self.layer.is_overlay()
+    }
+}
+
+/// One overlay peer's live link measurement from the path classifier / netstate.
+///
+/// As the `mesh-latency` snapshot's per-peer reading reports it. `rtt_ms`/`loss`
+/// are `None` when the probe didn't land — an unmeasurable link, never guessed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LinkMeasurement {
+    /// Measured round-trip time (ms), `None` when the probe timed out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<f64>,
+    /// Measured loss fraction 0.0..=1.0, `None` when unmeasured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss: Option<f64>,
+}
+
+impl LinkMeasurement {
+    /// A reading with just an RTT (the common path-classifier case — the
+    /// transport probe times an RTT but doesn't sample loss).
+    #[must_use]
+    pub const fn from_rtt(rtt_ms: Option<f64>) -> Self {
+        Self { rtt_ms, loss: None }
+    }
+}
+
+impl PathGraph {
+    /// Populate per-overlay-link **RTT/loss** onto the Mesh edges from the path
+    /// classifier / netstate, keyed by the **peer-node label** at the overlay end
+    /// of the edge (the peer name the `mesh-latency` snapshot uses). For each
+    /// overlay edge the measurement is looked up by the label of the endpoint
+    /// that is an actual overlay **peer node** ([`NodeKind::OverlayPeer`] /
+    /// [`NodeKind::Host`]) — never the lighthouse/internet end, so a lighthouse
+    /// label can't collide with a real peer name and apply the wrong reading.
+    /// When both ends are peer nodes, either matching reading applies. An edge
+    /// with no reading — or only a non-finite/zero RTT and out-of-range loss — is
+    /// **left modeled** (`rtt_ms`/`loss` untouched): the degrade-to-modeled path,
+    /// no panic.
+    ///
+    /// Returns the number of overlay edges that got at least one measured value.
+    pub fn apply_overlay_latency(
+        &mut self,
+        by_peer: &std::collections::HashMap<String, LinkMeasurement>,
+    ) -> usize {
+        // id -> (label, is the endpoint an overlay peer node?), so we resolve an
+        // edge's *peer* endpoint to its mesh-latency key and skip the lighthouse /
+        // internet ends (whose labels could otherwise shadow a real peer name).
+        let node_of: std::collections::HashMap<&str, (&str, bool)> = self
+            .nodes
+            .iter()
+            .map(|n| {
+                let is_peer = matches!(n.kind, NodeKind::OverlayPeer | NodeKind::Host);
+                (n.id.as_str(), (n.label.as_str(), is_peer))
+            })
+            .collect();
+        let mut applied = 0usize;
+        for e in &mut self.edges {
+            if !e.is_overlay() {
+                continue;
+            }
+            // Look the reading up by the peer-node end's label only.
+            let peer_label = |id: &str| -> Option<&str> {
+                node_of
+                    .get(id)
+                    .and_then(|(label, is_peer)| is_peer.then_some(*label))
+            };
+            let m = peer_label(e.from.as_str())
+                .and_then(|l| by_peer.get(l))
+                .or_else(|| peer_label(e.to.as_str()).and_then(|l| by_peer.get(l)));
+            if let Some(m) = m {
+                // Apply only the *usable* fields; an all-`None` (probe timed out)
+                // or junk reading touches nothing — degrade to modeled.
+                let rtt = m.rtt_ms.filter(|v| is_usable_rtt(*v));
+                let loss = m.loss.filter(|v| is_usable_loss(*v));
+                if rtt.is_some() {
+                    e.rtt_ms = rtt;
+                }
+                if loss.is_some() {
+                    e.loss = loss;
+                }
+                if rtt.is_some() || loss.is_some() {
+                    applied += 1;
+                }
+            }
+            // No reading ⇒ leave the modeled edge as-is.
+        }
+        applied
+    }
+}
+
+/// One hop of a live public-internet `traceroute`/`mtr` run (beyond the exit).
+///
+/// `ip` is `*` for an unanswered hop (ICMP-filtered / rate-limited); its
+/// `rtt_ms` is then meaningless and the gap is shown, never filled.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PublicHop {
+    /// Hop number (TTL, 1-based).
+    pub ttl: u8,
+    /// Hop IP, or `*` when the hop didn't answer.
+    pub ip: String,
+    /// Round-trip ms for the hop; `0.0` (and `ip == "*"`) when unanswered.
+    pub rtt_ms: f64,
+}
+
+impl PublicHop {
+    /// True when this hop answered (has a real IP, not the `*` gap marker).
+    #[must_use]
+    pub fn answered(&self) -> bool {
+        self.ip != "*"
+    }
+}
+
+/// The typed result of the `action/route/traceroute` verb.
+///
+/// The best-effort public hop list from the relevant node to `target`.
+/// `available` is `false` when the trace couldn't run at all (no
+/// `traceroute`/`mtr` binary, or it failed) — the caller then degrades to the
+/// modeled public hop, no error.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PublicTrace {
+    /// The destination the hops lead to.
+    pub target: String,
+    /// The tool that produced the hops (`traceroute` / `mtr`), for provenance.
+    pub tool: String,
+    /// Whether a live trace ran (a tool was present and produced output).
+    pub available: bool,
+    /// The hops, TTL order. Empty when `!available`.
+    pub hops: Vec<PublicHop>,
+}
+
+impl PublicTrace {
+    /// An empty, unavailable result — the degrade-to-modeled case (no tool / no
+    /// output). Carries the target + the tool that *would* have run, never errors.
+    #[must_use]
+    pub fn unavailable(target: &str, tool: &str) -> Self {
+        Self {
+            target: target.to_string(),
+            tool: tool.to_string(),
+            available: false,
+            hops: Vec::new(),
+        }
+    }
+
+    /// The RTT to attribute to the modeled public edge: the last *answered* hop
+    /// with a **usable** RTT (the closest-to-destination measurement we got).
+    /// `None` when no hop answered with a real RTT — the public segment then
+    /// stays modeled (no number). A hop that answered but whose RTT the tool
+    /// didn't report (parsed as a non-positive `0.0` fallback) is **not** treated
+    /// as a measurement — a missing number is never rendered as "0 ms".
+    #[must_use]
+    pub fn edge_rtt_ms(&self) -> Option<f64> {
+        self.hops
+            .iter()
+            .rev()
+            .find(|h| h.answered() && is_usable_rtt(h.rtt_ms))
+            .map(|h| h.rtt_ms)
+    }
+}
+
+impl PathGraph {
+    /// Splice a best-effort public `traceroute` result onto the **Public** edge
+    /// (the segment beyond the exit). The edge's `rtt_ms` becomes the last
+    /// answered hop's RTT; an unavailable trace (or one where no hop answered)
+    /// leaves the modeled edge untouched. No-op when there's no Public edge.
+    ///
+    /// Returns `true` when a measured RTT was applied to a Public edge.
+    pub fn apply_public_trace(&mut self, trace: &PublicTrace) -> bool {
+        let Some(rtt) = trace.edge_rtt_ms() else {
+            return false; // unmeasurable ⇒ degrade to the modeled hop.
+        };
+        if let Some(e) = self
+            .edges
+            .iter_mut()
+            .find(|e| matches!(e.layer, Layer::Public))
+        {
+            e.rtt_ms = Some(rtt);
+            return true;
+        }
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,5 +1098,312 @@ mod tests {
         assert_eq!(g.blocked_at, None);
         assert!(g.is_reachable());
         assert!(g.has_indeterminate());
+    }
+
+    // --- ROUTE-TRACE-3: live, best-effort measurement --------------------------
+
+    /// A node whose id and human label differ (the label is the peer name the
+    /// path classifier keys its measurements by).
+    fn labeled(id: &str, label: &str, kind: NodeKind) -> PathNode {
+        PathNode {
+            id: id.into(),
+            kind,
+            label: label.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn overlay_edge_helpers_only_match_the_mesh_layer() {
+        assert!(Layer::Mesh.is_overlay());
+        assert!(!Layer::Public.is_overlay());
+        assert!(!Layer::Vpn.is_overlay());
+        assert!(!Layer::Host.is_overlay());
+        assert!(edge("a", "b", Layer::Mesh, Transport::DirectOverlay).is_overlay());
+        assert!(!edge("a", "b", Layer::Public, Transport::Public).is_overlay());
+    }
+
+    #[test]
+    fn apply_overlay_latency_populates_rtt_and_loss_on_the_mesh_edge() {
+        // ingress: internet -> ingress -> host(peer "eagle") -> service.
+        let mut g = PathGraph::new(Direction::Ingress)
+            .with_node(node("internet", NodeKind::Internet))
+            .with_node(labeled("ingress", "Lighthouse-01", NodeKind::Ingress))
+            .with_node(labeled("host", "eagle", NodeKind::OverlayPeer))
+            .with_node(labeled("service", "grafana", NodeKind::Service))
+            .with_edge(edge(
+                "internet",
+                "ingress",
+                Layer::Public,
+                Transport::Public,
+            ))
+            .with_edge(edge(
+                "ingress",
+                "host",
+                Layer::Mesh,
+                Transport::DirectOverlay,
+            ))
+            .with_edge(edge("host", "service", Layer::Host, Transport::Loopback));
+        let mut by_peer = std::collections::HashMap::new();
+        by_peer.insert(
+            "eagle".to_string(),
+            LinkMeasurement {
+                rtt_ms: Some(14.3),
+                loss: Some(0.02),
+            },
+        );
+        let applied = g.apply_overlay_latency(&by_peer);
+        assert_eq!(applied, 1);
+        // Only the overlay (Mesh) edge picked up the numbers.
+        let mesh = &g.edges[1];
+        assert_eq!(mesh.rtt_ms, Some(14.3));
+        assert_eq!(mesh.loss, Some(0.02));
+        // The Public + Host edges stay modeled (no number).
+        assert_eq!(g.edges[0].rtt_ms, None);
+        assert_eq!(g.edges[2].rtt_ms, None);
+    }
+
+    #[test]
+    fn apply_overlay_latency_degrades_to_modeled_when_unmeasurable() {
+        // No reading for "eagle" at all ⇒ the overlay edge stays exactly modeled,
+        // no panic, no invented number (§2 graceful degrade).
+        let mut g = PathGraph::new(Direction::Ingress)
+            .with_node(labeled("ingress", "Lighthouse-01", NodeKind::Ingress))
+            .with_node(labeled("host", "eagle", NodeKind::OverlayPeer))
+            .with_edge(edge(
+                "ingress",
+                "host",
+                Layer::Mesh,
+                Transport::DirectOverlay,
+            ));
+        // (a) empty snapshot.
+        let empty = std::collections::HashMap::new();
+        assert_eq!(g.apply_overlay_latency(&empty), 0);
+        assert_eq!(g.edges[0].rtt_ms, None);
+        assert_eq!(g.edges[0].loss, None);
+        // (b) a reading exists for the peer but it's an all-`None` (probe timed
+        // out) measurement — still leaves the edge modeled, no panic.
+        let mut by_peer = std::collections::HashMap::new();
+        by_peer.insert("eagle".to_string(), LinkMeasurement::from_rtt(None));
+        assert_eq!(g.apply_overlay_latency(&by_peer), 0);
+        assert_eq!(g.edges[0].rtt_ms, None);
+        assert_eq!(g.edges[0].loss, None);
+    }
+
+    #[test]
+    fn apply_overlay_latency_matches_either_endpoint_label() {
+        // The measurement is keyed on the `to` end here (the `from` end is the
+        // lighthouse, which the classifier has no peer reading for).
+        let mut g = PathGraph::new(Direction::Ingress)
+            .with_node(labeled("ingress", "Lighthouse-01", NodeKind::Ingress))
+            .with_node(labeled("host", "anvil", NodeKind::OverlayPeer))
+            .with_edge(edge(
+                "ingress",
+                "host",
+                Layer::Mesh,
+                Transport::RelayOverlay,
+            ));
+        let mut by_peer = std::collections::HashMap::new();
+        by_peer.insert("anvil".to_string(), LinkMeasurement::from_rtt(Some(31.7)));
+        assert_eq!(g.apply_overlay_latency(&by_peer), 1);
+        assert_eq!(g.edges[0].rtt_ms, Some(31.7));
+        assert_eq!(g.edges[0].loss, None);
+    }
+
+    #[test]
+    fn public_trace_edge_rtt_is_the_last_answered_hop() {
+        let trace = PublicTrace {
+            target: "1.1.1.1".into(),
+            tool: "traceroute".into(),
+            available: true,
+            hops: vec![
+                PublicHop {
+                    ttl: 1,
+                    ip: "10.0.0.1".into(),
+                    rtt_ms: 1.2,
+                },
+                PublicHop {
+                    ttl: 2,
+                    ip: "*".into(),
+                    rtt_ms: 0.0,
+                },
+                PublicHop {
+                    ttl: 3,
+                    ip: "1.1.1.1".into(),
+                    rtt_ms: 18.9,
+                },
+            ],
+        };
+        // The last *answered* hop (ttl 3), not the trailing gap.
+        assert_eq!(trace.edge_rtt_ms(), Some(18.9));
+    }
+
+    #[test]
+    fn apply_public_trace_splices_rtt_onto_the_public_edge() {
+        let mut g = assemble_egress("eagle", Some("10.42.0.2"), "1.1.1.1");
+        // egress is source -> internet over a Public edge.
+        assert!(matches!(g.edges[0].layer, Layer::Public));
+        let trace = PublicTrace {
+            target: "1.1.1.1".into(),
+            tool: "traceroute".into(),
+            available: true,
+            hops: vec![PublicHop {
+                ttl: 1,
+                ip: "1.1.1.1".into(),
+                rtt_ms: 9.4,
+            }],
+        };
+        assert!(g.apply_public_trace(&trace));
+        assert_eq!(g.edges[0].rtt_ms, Some(9.4));
+    }
+
+    #[test]
+    fn apply_public_trace_unavailable_leaves_the_modeled_edge() {
+        let mut g = assemble_egress("eagle", Some("10.42.0.2"), "1.1.1.1");
+        // (a) an explicitly unavailable trace (no tool).
+        let none = PublicTrace::unavailable("1.1.1.1", "traceroute");
+        assert!(!none.available);
+        assert!(!g.apply_public_trace(&none));
+        assert_eq!(g.edges[0].rtt_ms, None);
+        // (b) a trace that ran but every hop was an ICMP-filtered gap.
+        let all_gaps = PublicTrace {
+            target: "1.1.1.1".into(),
+            tool: "traceroute".into(),
+            available: true,
+            hops: vec![
+                PublicHop {
+                    ttl: 1,
+                    ip: "*".into(),
+                    rtt_ms: 0.0,
+                },
+                PublicHop {
+                    ttl: 2,
+                    ip: "*".into(),
+                    rtt_ms: 0.0,
+                },
+            ],
+        };
+        assert_eq!(all_gaps.edge_rtt_ms(), None);
+        assert!(!g.apply_public_trace(&all_gaps));
+        assert_eq!(g.edges[0].rtt_ms, None);
+    }
+
+    #[test]
+    fn public_trace_round_trips_through_json() {
+        let trace = PublicTrace {
+            target: "1.1.1.1".into(),
+            tool: "traceroute".into(),
+            available: true,
+            hops: vec![PublicHop {
+                ttl: 1,
+                ip: "10.0.0.1".into(),
+                rtt_ms: 1.2,
+            }],
+        };
+        let json = serde_json::to_string(&trace).unwrap();
+        let back: PublicTrace = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, trace);
+    }
+
+    #[test]
+    fn edge_rtt_ms_rejects_an_answered_hop_with_a_bogus_zero_rtt() {
+        // The traceroute parser falls back to rtt 0.0 for an answered hop whose
+        // `… ms` token it couldn't read — that's "RTT unknown", not "0 ms". The
+        // edge then degrades to modeled rather than rendering an impossible 0 ms.
+        let trace = PublicTrace {
+            target: "1.1.1.1".into(),
+            tool: "traceroute".into(),
+            available: true,
+            hops: vec![
+                PublicHop {
+                    ttl: 1,
+                    ip: "10.0.0.1".into(),
+                    rtt_ms: 2.1,
+                },
+                // last *answered* hop, but no usable RTT (0.0 fallback).
+                PublicHop {
+                    ttl: 2,
+                    ip: "1.1.1.1".into(),
+                    rtt_ms: 0.0,
+                },
+            ],
+        };
+        // Falls back to the earlier hop that DID have a real RTT, not the 0.0 one.
+        assert_eq!(trace.edge_rtt_ms(), Some(2.1));
+        // And when the ONLY answered hop has a 0.0 fallback ⇒ no measurement.
+        let only_zero = PublicTrace {
+            target: "1.1.1.1".into(),
+            tool: "traceroute".into(),
+            available: true,
+            hops: vec![PublicHop {
+                ttl: 1,
+                ip: "1.1.1.1".into(),
+                rtt_ms: 0.0,
+            }],
+        };
+        assert_eq!(only_zero.edge_rtt_ms(), None);
+    }
+
+    #[test]
+    fn apply_overlay_latency_keys_on_the_peer_node_not_the_lighthouse() {
+        // The lighthouse/ingress label could collide with a real peer name; the
+        // overlay reading must come from the PEER end ("eagle"), never the
+        // lighthouse end — even if a (wrong) reading exists under the lighthouse
+        // label, it must not be applied.
+        let mut g = PathGraph::new(Direction::Ingress)
+            .with_node(labeled("ingress", "anvil", NodeKind::Ingress)) // collides!
+            .with_node(labeled("host", "eagle", NodeKind::OverlayPeer))
+            .with_edge(edge(
+                "ingress",
+                "host",
+                Layer::Mesh,
+                Transport::DirectOverlay,
+            ));
+        let mut by_peer = std::collections::HashMap::new();
+        // A bogus reading under the lighthouse-collision label + the real one.
+        by_peer.insert("anvil".to_string(), LinkMeasurement::from_rtt(Some(999.0)));
+        by_peer.insert("eagle".to_string(), LinkMeasurement::from_rtt(Some(12.0)));
+        assert_eq!(g.apply_overlay_latency(&by_peer), 1);
+        // The PEER end ("eagle") wins, never the colliding lighthouse label.
+        assert_eq!(g.edges[0].rtt_ms, Some(12.0));
+    }
+
+    #[test]
+    fn apply_overlay_latency_ignores_zero_and_out_of_range_readings() {
+        let mut g = PathGraph::new(Direction::Ingress)
+            .with_node(labeled("ingress", "Lighthouse-01", NodeKind::Ingress))
+            .with_node(labeled("host", "eagle", NodeKind::OverlayPeer))
+            .with_edge(edge(
+                "ingress",
+                "host",
+                Layer::Mesh,
+                Transport::DirectOverlay,
+            ));
+        let mut by_peer = std::collections::HashMap::new();
+        // rtt 0.0 (not a real measurement) + loss 1.5 (out of 0..=1 range).
+        by_peer.insert(
+            "eagle".to_string(),
+            LinkMeasurement {
+                rtt_ms: Some(0.0),
+                loss: Some(1.5),
+            },
+        );
+        assert_eq!(g.apply_overlay_latency(&by_peer), 0);
+        assert_eq!(g.edges[0].rtt_ms, None);
+        assert_eq!(g.edges[0].loss, None);
+    }
+
+    #[test]
+    fn usable_rtt_and_loss_predicates() {
+        assert!(is_usable_rtt(0.1));
+        assert!(!is_usable_rtt(0.0));
+        assert!(!is_usable_rtt(-1.0));
+        assert!(!is_usable_rtt(f64::NAN));
+        assert!(!is_usable_rtt(f64::INFINITY));
+        assert!(is_usable_loss(0.0));
+        assert!(is_usable_loss(1.0));
+        assert!(!is_usable_loss(-0.1));
+        assert!(!is_usable_loss(1.01));
+        assert!(!is_usable_loss(f64::NAN));
     }
 }

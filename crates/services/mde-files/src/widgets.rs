@@ -507,6 +507,189 @@ fn mime_to_icon(mime: Mime) -> mde_theme::Icon {
     }
 }
 
+// ─── MOTION-FEEDBACK — file-row/tile motion (shared mde_theme vocabulary) ────
+
+/// MOTION-FEEDBACK — the `mde_theme::animation` key prefix for a hovered file
+/// row/tile, namespaced by the row's stable name so each row eases independently.
+pub const HOVER_KEY_PREFIX: &str = "fm-hover:";
+
+/// MOTION-FEEDBACK — per-row hover-lift rise (px). A small Carbon-scale lift so
+/// a row/tile reads as interactive without the list jumping around. Mirrors the
+/// applet's tile lift; rendered as compensating padding so neighbours never
+/// reflow.
+pub const ROW_HOVER_RISE_PX: f32 = 2.0;
+
+/// MOTION-FEEDBACK — the per-item stagger slide distance (px). Each revealed row
+/// slides up this far → 0 as its reveal tween completes (iced 0.13 has no opacity
+/// widget, so a short slide reads as the fade-in — same idea the applet uses).
+pub const ROW_REVEAL_SLIDE_PX: f32 = 6.0;
+
+/// MOTION-FEEDBACK — the `mde_theme::animation` hover key for a row by name.
+#[must_use]
+pub fn row_hover_key(name: &str) -> String {
+    format!("{HOVER_KEY_PREFIX}{name}")
+}
+
+/// MOTION-FEEDBACK — the resolved motion state for ONE file row/tile at the
+/// current frame, derived from the shared `mde_theme::animation` helpers by
+/// [`RowMotionCtx::for_row`]. All fields collapse to "rest" under reduce-motion
+/// (no movement; the state change is instant — the selection accent is still
+/// shown, just not animated).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RowMotion {
+    /// Hover-lift offset (px, ≤ 0 = up); 0 at rest.
+    pub lift_px: f32,
+    /// Selection-accent strength `0.0..=1.0`: 0 = no accent, 1 = full selection
+    /// tint. Eases in on select; instant (0 or 1) under reduce-motion.
+    pub accent_t: f32,
+    /// Staggered-reveal slide offset (px, ≥ 0 = starts below, settles to 0).
+    pub reveal_y: f32,
+}
+
+impl RowMotion {
+    /// MOTION-FEEDBACK — the eased selection background for this row: the
+    /// `LIST_SELECTION_BG` token scaled by [`Self::accent_t`] so the accent
+    /// animates in (`hovered`/`focused` fallback handled by the caller). Returns
+    /// the resting `base` when there's no accent.
+    /// MOTION-FEEDBACK — the `(top, bottom)` compensating padding (px) that
+    /// renders this row's hover-lift + reveal-slide WITHOUT reflowing neighbours.
+    /// `lift_px` is ≤ 0 (up), `reveal_y` is ≥ 0 (starts below), so the net offset
+    /// spans `[-ROW_HOVER_RISE_PX, +ROW_REVEAL_SLIDE_PX]`. The full span
+    /// (`RESERVE`) is reserved and split top/bottom so `top + bottom == RESERVE`
+    /// at EVERY frame — the cell height is constant. Pure; the renderer just
+    /// applies it as `Padding`.
+    #[must_use]
+    fn vertical_padding(self) -> (f32, f32) {
+        const RESERVE: f32 = ROW_HOVER_RISE_PX + ROW_REVEAL_SLIDE_PX;
+        let offset = self.lift_px + self.reveal_y;
+        let top = (ROW_HOVER_RISE_PX + offset).clamp(0.0, RESERVE);
+        (top, RESERVE - top)
+    }
+
+    #[must_use]
+    fn selection_bg(self, base: Color) -> Color {
+        use mde_theme::animation::lerp_f32;
+        if self.accent_t <= f32::EPSILON {
+            return base;
+        }
+        // Crossfade every channel from the resting bg (transparent, or the
+        // focused `ROW_HOVER` wash) toward the full selection tint, so a focused
+        // row that becomes selected blends — rather than hue-snapping — into the
+        // indigo accent. At `accent_t == 1.0` this is exactly `LIST_SELECTION_BG`.
+        let t = self.accent_t.clamp(0.0, 1.0);
+        let to = t::LIST_SELECTION_BG;
+        Color {
+            r: lerp_f32(base.r, to.r, t),
+            g: lerp_f32(base.g, to.g, t),
+            b: lerp_f32(base.b, to.b, t),
+            a: lerp_f32(base.a, to.a, t),
+        }
+    }
+}
+
+/// MOTION-FEEDBACK — the shared motion context a file-view passes down so every
+/// row/tile derives its [`RowMotion`] from ONE `mde_theme::animation::Animator`
+/// off a single subscription tick. Borrows the animator + the live hover keys;
+/// pure read-only (the view never mutates animation state).
+#[derive(Clone, Copy)]
+pub struct RowMotionCtx<'a> {
+    /// The shared animator (hover + selection-accent tweens live here).
+    pub anim: &'a mde_theme::animation::Animator,
+    /// The currently-hovered row's hover key, if any.
+    pub hovered: Option<&'a str>,
+    /// The releasing (hover-exit, settling-back) row's hover key, if any.
+    pub releasing: Option<&'a str>,
+    /// When the active listing was (re)loaded — the stagger reveal origin. `None`
+    /// once the reveal has fully settled (no per-row work at rest).
+    pub reveal_origin: Option<std::time::Instant>,
+    /// The frame instant every tween is sampled at.
+    pub now: std::time::Instant,
+    /// Reduce-motion: instant state changes, no movement.
+    pub reduce_motion: bool,
+}
+
+impl RowMotionCtx<'_> {
+    /// MOTION-FEEDBACK — resolve [`RowMotion`] for the row `name` at visible
+    /// `index`. Hover-lift + selection accent come from the [`Animator`]; the
+    /// reveal comes from `reveal_origin` + the row's capped (≤8) stagger delay.
+    /// Under reduce-motion everything collapses to rest (accent snaps to
+    /// `selected`, no movement).
+    #[must_use]
+    pub fn for_row(self, name: &str, index: usize, selected: bool) -> RowMotion {
+        use mde_theme::animation::{ease, Transition};
+        use mde_theme::motion::{list, Easing};
+
+        // Selection accent: under reduce-motion it's an instant 0/1; otherwise it
+        // eases in as a tween keyed on the row name lives in the animator.
+        let accent_t = if !selected {
+            0.0
+        } else if self.reduce_motion {
+            1.0
+        } else {
+            // The accent shares the row's hover key namespace but its own suffix
+            // so a hover doesn't disturb the selection tween and vice-versa.
+            self.anim
+                .value(&accent_key(name), self.now, Easing::EaseOut)
+        };
+
+        if self.reduce_motion {
+            // No movement at all — instant state change (a11y contract).
+            return RowMotion {
+                lift_px: 0.0,
+                accent_t,
+                reveal_y: 0.0,
+            };
+        }
+
+        // Hover-lift: eased in while hovered, out while releasing, 0 at rest.
+        let key = row_hover_key(name);
+        let hover_amt = if self.hovered == Some(key.as_str()) {
+            self.anim.value(&key, self.now, Easing::EaseOut)
+        } else if self.releasing == Some(key.as_str()) {
+            1.0 - self.anim.value(&key, self.now, Easing::EaseOut)
+        } else {
+            0.0
+        };
+        let lift_px = Transition::Lift(ROW_HOVER_RISE_PX).params(hover_amt).translate_y;
+
+        // Staggered reveal: row `index` (capped at STAGGER_CAP-1) gets a delayed
+        // SlideUp that settles to 0. Past the cap every row shares the cap delay
+        // so a long listing doesn't crawl.
+        let reveal_y = match self.reveal_origin {
+            Some(origin) => {
+                let step = u64::from(list::STAGGER_STEP_MS);
+                let capped = index.min(list::STAGGER_CAP - 1) as u64;
+                let delay = std::time::Duration::from_millis(capped * step);
+                let reveal_start = origin + delay;
+                if self.now < reveal_start {
+                    // Not yet begun — start fully slid-down (hidden-ish).
+                    ROW_REVEAL_SLIDE_PX
+                } else {
+                    let reveal_dur =
+                        std::time::Duration::from_millis(u64::from(list::STAGGER_REVEAL_MS));
+                    let tw = mde_theme::animation::Tween::starting_at(reveal_start, reveal_dur);
+                    let t = ease(tw.progress(self.now), Easing::EaseOut);
+                    Transition::SlideUp(ROW_REVEAL_SLIDE_PX).params(t).translate_y
+                }
+            }
+            None => 0.0,
+        };
+
+        RowMotion {
+            lift_px,
+            accent_t,
+            reveal_y,
+        }
+    }
+}
+
+/// MOTION-FEEDBACK — the selection-accent tween key for a row (sibling to its
+/// hover key so the two tweens never collide).
+#[must_use]
+pub fn accent_key(name: &str) -> String {
+    format!("fm-accent:{name}")
+}
+
 /// File-row Object Card (CR-4.b). Renders each file entry as a
 /// `CardSize::Small` Object Card so it shares the same grid grammar
 /// as folder rows (CR-4.a). Selection and focus state are reflected
@@ -519,6 +702,7 @@ pub fn file_row(
     show_src: bool,
     selected: bool,
     focused: bool,
+    motion: RowMotion,
 ) -> Element<'static, Message> {
     let has_conflict = row_data.has_conflict;
     let syncing = row_data.syncing;
@@ -619,7 +803,7 @@ pub fn file_row(
         None
     };
 
-    if conflict_chip.is_none() && sync_badge.is_none() {
+    let body: Element<'static, Message> = if conflict_chip.is_none() && sync_badge.is_none() {
         card_el
     } else {
         let mut col = column![card_el].spacing(2);
@@ -630,7 +814,36 @@ pub fn file_row(
             col = col.push(badge);
         }
         col.into()
-    }
+    };
+    // MOTION-FEEDBACK — hover-lift + staggered reveal as compensating padding
+    // (no neighbour reflow), wrapped in a `mouse_area` so enter/exit drive the
+    // hover tween. The selection accent rides the card's `CardState` tint above.
+    with_row_motion(body, &name, motion)
+}
+
+/// MOTION-FEEDBACK — wrap a row/tile body with its [`RowMotion`]: render the
+/// hover-lift + reveal-slide as compensating top/bottom padding so the grid
+/// never reflows, and attach the `mouse_area` enter/exit that arm the hover
+/// tween. At rest (no offset) this is a no-op padding of zero. Shared by both
+/// the grid tile ([`file_row`]) and the list row ([`list_row`]).
+fn with_row_motion(
+    body: Element<'static, Message>,
+    name: &str,
+    motion: RowMotion,
+) -> Element<'static, Message> {
+    use cosmic::iced::widget::mouse_area;
+    let (top, bottom) = motion.vertical_padding();
+    let padded = container(body).padding(Padding {
+        top,
+        right: 0.0,
+        bottom,
+        left: 0.0,
+    });
+    let key = row_hover_key(name);
+    mouse_area(padded)
+        .on_enter(Message::RowHoverEnter(key.clone()))
+        .on_exit(Message::RowHoverExit(key))
+        .into()
 }
 
 /// File-list head row (caps, dim).
@@ -677,6 +890,7 @@ pub fn list_row(
     show_src: bool,
     selected: bool,
     focused: bool,
+    motion: RowMotion,
 ) -> Element<'static, Message> {
     let has_conflict = row_data.has_conflict;
     let syncing = row_data.syncing;
@@ -691,12 +905,18 @@ pub fn list_row(
     } = row_data;
     let sibling = conflict_sibling.unwrap_or_default();
 
-    let bg = if selected {
-        t::LIST_SELECTION_BG
-    } else if focused {
+    // MOTION-FEEDBACK — the selection accent animates in: the resting bg is the
+    // focus/transparent layer; when selected, `RowMotion::selection_bg` eases the
+    // `LIST_SELECTION_BG` tint over it (instant under reduce-motion).
+    let rest_bg = if focused {
         t::ROW_HOVER
     } else {
         Color::TRANSPARENT
+    };
+    let bg = if selected {
+        motion.selection_bg(rest_bg)
+    } else {
+        rest_bg
     };
 
     let resolved = mde_theme::mde_icon(mime_to_icon(mime), mde_theme::IconSize::Nav);
@@ -803,7 +1023,7 @@ pub fn list_row(
         None
     };
 
-    if conflict_chip.is_none() && sync_badge.is_none() {
+    let body: Element<'static, Message> = if conflict_chip.is_none() && sync_badge.is_none() {
         row_with_divider
     } else {
         let mut col = column![row_with_divider].spacing(2);
@@ -814,7 +1034,8 @@ pub fn list_row(
             col = col.push(badge);
         }
         col.into()
-    }
+    };
+    with_row_motion(body, &name, motion)
 }
 
 // ─── Transfer-log row (`.fm-tx`) ───────────────────────────────────────────
@@ -1064,5 +1285,191 @@ pub const fn peer_kind_label(kind: PeerKind) -> &'static str {
         PeerKind::Server => "server",
         PeerKind::Phone => "phone",
         PeerKind::Ci => "ci",
+    }
+}
+
+#[cfg(test)]
+mod motion_tests {
+    //! MOTION-FEEDBACK — the file-row/tile motion math (hover-lift + selection
+    //! accent + capped staggered reveal) derived from the shared
+    //! `mde_theme::animation` helpers.
+    use super::*;
+    use mde_theme::animation::Animator;
+    use mde_theme::motion::{list, Motion};
+    use std::time::{Duration, Instant};
+
+    fn ctx<'a>(
+        anim: &'a Animator,
+        hovered: Option<&'a str>,
+        releasing: Option<&'a str>,
+        reveal_origin: Option<Instant>,
+        now: Instant,
+        reduce_motion: bool,
+    ) -> RowMotionCtx<'a> {
+        RowMotionCtx {
+            anim,
+            hovered,
+            releasing,
+            reveal_origin,
+            now,
+            reduce_motion,
+        }
+    }
+
+    #[test]
+    fn vertical_padding_is_height_constant_across_the_whole_offset_range() {
+        // The reserved span is split top/bottom so the cell height never changes
+        // — no neighbour reflow on hover or reveal. Sweep the full offset range.
+        let reserve = ROW_HOVER_RISE_PX + ROW_REVEAL_SLIDE_PX;
+        for lift in [0.0, -ROW_HOVER_RISE_PX * 0.5, -ROW_HOVER_RISE_PX] {
+            for reveal in [0.0, ROW_REVEAL_SLIDE_PX * 0.5, ROW_REVEAL_SLIDE_PX] {
+                let m = RowMotion {
+                    lift_px: lift,
+                    accent_t: 0.0,
+                    reveal_y: reveal,
+                };
+                let (top, bottom) = m.vertical_padding();
+                assert!(top >= 0.0 && bottom >= 0.0, "padding never negative");
+                assert!(
+                    (top + bottom - reserve).abs() < 1e-4,
+                    "top+bottom must equal RESERVE at lift={lift} reveal={reveal}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vertical_padding_lifts_up_on_hover_and_drops_down_on_reveal() {
+        // Full hover (lift = -rise) sits higher (smaller top) than rest; the
+        // reveal start (reveal = +slide) sits lower (larger top) than rest.
+        let rest = RowMotion::default().vertical_padding().0;
+        let hovered = RowMotion {
+            lift_px: -ROW_HOVER_RISE_PX,
+            ..RowMotion::default()
+        }
+        .vertical_padding()
+        .0;
+        let revealing = RowMotion {
+            reveal_y: ROW_REVEAL_SLIDE_PX,
+            ..RowMotion::default()
+        }
+        .vertical_padding()
+        .0;
+        assert!(hovered < rest, "hover raises the row (less top padding)");
+        assert!(revealing > rest, "reveal starts the row lower (more top padding)");
+    }
+
+    #[test]
+    fn reduce_motion_collapses_to_rest_but_keeps_selection_accent() {
+        // Q32 / a11y: under reduce-motion there is NO movement (lift + reveal are
+        // 0), but a selected row still shows its full accent instantly.
+        let anim = Animator::new();
+        let now = Instant::now();
+        let c = ctx(&anim, None, None, Some(now), now, true);
+        let m = c.for_row("a.txt", 3, true);
+        assert_eq!(m.lift_px, 0.0, "no hover lift under reduce-motion");
+        assert_eq!(m.reveal_y, 0.0, "no reveal slide under reduce-motion");
+        assert!((m.accent_t - 1.0).abs() < 1e-6, "selected ⇒ full accent instantly");
+        // Unselected row: no accent.
+        assert_eq!(c.for_row("b.txt", 0, false).accent_t, 0.0);
+    }
+
+    #[test]
+    fn reveal_stagger_is_capped_at_eight_items() {
+        // Items past STAGGER_CAP share the cap delay, so a long listing doesn't
+        // crawl: the row AT the cap and the row well past it begin together.
+        let anim = Animator::new();
+        let origin = Instant::now();
+        // Sample just after the cap delay so the capped rows have begun revealing
+        // (reveal_y < full slide) while earlier rows have already settled.
+        let cap_delay_ms = (list::STAGGER_CAP as u64 - 1) * u64::from(list::STAGGER_STEP_MS);
+        let now = origin + Duration::from_millis(cap_delay_ms);
+        let c = ctx(&anim, None, None, Some(origin), now, false);
+        let at_cap = c.for_row("x", list::STAGGER_CAP - 1, false).reveal_y;
+        let past_cap = c.for_row("y", list::STAGGER_CAP + 50, false).reveal_y;
+        assert!(
+            (at_cap - past_cap).abs() < 1e-4,
+            "rows at/past the cap reveal together (capped delay)"
+        );
+        // The very first row has already fully settled (reveal_y == 0) by now.
+        assert!(c.for_row("first", 0, false).reveal_y.abs() < 1e-4);
+    }
+
+    #[test]
+    fn reveal_slides_up_to_rest_over_its_window() {
+        // A row's reveal starts at the full slide distance and settles to 0.
+        let anim = Animator::new();
+        let origin = Instant::now();
+        let c0 = ctx(&anim, None, None, Some(origin), origin, false);
+        assert!(
+            (c0.for_row("r", 0, false).reveal_y - ROW_REVEAL_SLIDE_PX).abs() < 1e-3,
+            "row 0 starts at the full slide distance"
+        );
+        let done = origin + Duration::from_millis(u64::from(list::STAGGER_REVEAL_MS) + 5);
+        let c1 = ctx(&anim, None, None, Some(origin), done, false);
+        assert!(
+            c1.for_row("r", 0, false).reveal_y.abs() < 1e-3,
+            "row 0 has settled to rest after its reveal window"
+        );
+        // No reveal origin ⇒ no slide at all.
+        let c2 = ctx(&anim, None, None, None, done, false);
+        assert_eq!(c2.for_row("r", 0, false).reveal_y, 0.0);
+    }
+
+    #[test]
+    fn hover_lift_eases_in_while_hovered_and_out_while_releasing() {
+        let now = Instant::now();
+        let key = row_hover_key("file");
+        let mut anim = Animator::new();
+        anim.start(key.clone(), now, Motion::hover(), false);
+        let dur = Motion::hover().duration;
+        // Mid-hover: lifted (negative translate), magnitude below the full rise.
+        let mid = now + dur / 2;
+        let c = ctx(&anim, Some(key.as_str()), None, None, mid, false);
+        let lift = c.for_row("file", 0, false).lift_px;
+        assert!(lift < 0.0 && lift > -ROW_HOVER_RISE_PX, "easing up, got {lift}");
+        // Releasing at the same instant: settling back, so a smaller magnitude.
+        let cr = ctx(&anim, None, Some(key.as_str()), None, mid, false);
+        let rel = cr.for_row("file", 0, false).lift_px;
+        assert!(rel < 0.0 && rel > lift, "release settles toward rest, got {rel}");
+        // A row that is neither hovered nor releasing sits at rest.
+        let cn = ctx(&anim, None, None, None, mid, false);
+        assert_eq!(cn.for_row("file", 0, false).lift_px, 0.0);
+    }
+
+    #[test]
+    fn selection_bg_crossfades_from_base_to_full_tint() {
+        // accent_t 0 ⇒ base unchanged; accent_t 1 ⇒ exactly LIST_SELECTION_BG.
+        let base = Color::TRANSPARENT;
+        let none = RowMotion {
+            accent_t: 0.0,
+            ..RowMotion::default()
+        };
+        assert_eq!(none.selection_bg(base), base);
+        let full = RowMotion {
+            accent_t: 1.0,
+            ..RowMotion::default()
+        };
+        let got = full.selection_bg(base);
+        let want = t::LIST_SELECTION_BG;
+        assert!((got.r - want.r).abs() < 1e-4);
+        assert!((got.g - want.g).abs() < 1e-4);
+        assert!((got.b - want.b).abs() < 1e-4);
+        assert!((got.a - want.a).abs() < 1e-4);
+        // Midway: alpha strictly between base and full (the accent is fading in).
+        let mid = RowMotion {
+            accent_t: 0.5,
+            ..RowMotion::default()
+        }
+        .selection_bg(base);
+        assert!(mid.a > base.a && mid.a < want.a);
+    }
+
+    #[test]
+    fn hover_and_accent_keys_are_distinct_namespaces() {
+        // A hover tween and a selection-accent tween for the same row must not
+        // collide (different keys) so one never disturbs the other.
+        assert_ne!(row_hover_key("a"), accent_key("a"));
+        assert!(row_hover_key("a").starts_with(HOVER_KEY_PREFIX));
     }
 }

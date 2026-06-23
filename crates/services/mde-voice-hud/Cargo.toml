@@ -20,10 +20,12 @@ path = "src/main.rs"
 libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "cca48bc29ef7a9f22160c0ab6ba117ab22d1ae87", default-features = false, features = ["tokio", "winit", "wgpu", "a11y", "wayland", "multi-window"] }
 
 # §4 — the HUD's Carbon hex is single-sourced from the mde-theme ramp, not
-# re-typed here. Default features only (no `iced`): we take the `Rgba` ramp
-# constants and convert to this crate's `iced::Color` locally, sidestepping the
-# cross-crate iced-version skew of `Rgba::into_iced_color()`.
-mde-theme = { path = "../../shared/mde-theme" }
+# re-typed here. We take the `Rgba` ramp constants and convert to this crate's
+# `iced::Color` locally, sidestepping the cross-crate iced-version skew of
+# `Rgba::into_iced_color()`. MOTION-FEEDBACK-1 — `serde` is on so the HUD reads
+# the user's `reduce_motion` preference (`Preferences::load`) to honor the
+# reduce-motion contract on its appear/state/feedback motion.
+mde-theme = { path = "../../shared/mde-theme", features = ["serde"] }
 # Single-source the QNM-Shared mount resolution (default_workgroup_root)
 # shared with mackesd + the workbench, so the VOIP roster reads the same
 # mount the daemon writes (not the phantom /mnt/mesh-storage).

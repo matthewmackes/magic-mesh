@@ -228,10 +228,16 @@ pub fn default_workgroup_root() -> PathBuf {
     if let Ok(root) = std::env::var("QNM_SHARED_ROOT") {
         return PathBuf::from(root);
     }
-    if let Some(home) = dirs::home_dir() {
-        return home.join("QNM-Shared");
-    }
-    PathBuf::from("/var/lib/mackesd/qnm-shared")
+    // FOUND-NEBULA-5 (2026-06-23): the env-less fallback is the CANONICAL mount, NOT
+    // ~/QNM-Shared. The daemon runs with MDE_WORKGROUP_ROOT=/mnt/mesh-storage (its
+    // systemd unit + environment.d), but `sudo mackesd <cmd>` strips that env — so a
+    // CLI `add-peer` wrote the issued-bearer ledger to /root/QNM-Shared/ca/issued-bearers
+    // while the serve process's /enroll listener validated against
+    // /mnt/mesh-storage/ca/issued-bearers → every fresh `join` 401'd "bearer not
+    // issued-and-unredeemed". Resolving the env-less default to the canonical mount keeps
+    // the CLI and daemon byte-for-byte consistent whether or not the volume is mounted.
+    // Confirmed live: B joined the moment the roots agreed.
+    PathBuf::from("/mnt/mesh-storage")
 }
 
 /// Write `rec` to `<dir>/<hostname>.json` atomically (temp + rename),

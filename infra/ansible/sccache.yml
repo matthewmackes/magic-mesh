@@ -1,0 +1,72 @@
+# BUILD-PLATFORM-1 — shared sccache on every build VM, backed by the control-host
+# minio (S3). Any node reuses any node's compiled crates → cold-target latency gone.
+#
+# Creds are NOT in the repo — pass them at runtime:
+#   ansible-playbook sccache.yml -e minio_access_key=… -e minio_secret_key=…
+---
+- name: Shared sccache (S3/minio) on build VMs
+  hosts: build_vms
+  vars:
+    sccache_version: "0.8.2"
+    minio_endpoint: "http://172.20.145.192:9000"
+    sccache_bucket: "sccache"
+    # minio_access_key / minio_secret_key come from -e (no default — fail loudly).
+  tasks:
+    - name: Require the minio creds (passed via -e, never committed)
+      ansible.builtin.assert:
+        that:
+          - minio_access_key is defined
+          - minio_secret_key is defined
+        fail_msg: "pass -e minio_access_key=… -e minio_secret_key=…"
+
+    - name: sccache binary present?
+      ansible.builtin.stat:
+        path: /usr/local/bin/sccache
+      register: sccache_bin
+
+    - name: Install the sccache binary
+      become: true
+      ansible.builtin.shell: |
+        set -e
+        cd /tmp
+        f="sccache-v{{ sccache_version }}-x86_64-unknown-linux-musl"
+        curl -fsSL -o sccache.tgz "https://github.com/mozilla/sccache/releases/download/v{{ sccache_version }}/${f}.tar.gz"
+        tar xzf sccache.tgz
+        install -m 0755 "${f}/sccache" /usr/local/bin/sccache
+      args:
+        creates: /usr/local/bin/sccache
+      when: not sccache_bin.stat.exists
+
+    - name: Write the sccache env (RUSTC_WRAPPER + S3 backend), 0600
+      ansible.builtin.copy:
+        dest: "{{ ansible_env.HOME }}/.sccache.env"
+        owner: mm
+        mode: "0600"
+        content: |
+          # BUILD-PLATFORM-1 — shared sccache via the control-host minio (S3).
+          export RUSTC_WRAPPER=sccache
+          # sccache cannot cache incremental compilation (cargo dev default) — off.
+          export CARGO_INCREMENTAL=0
+          export SCCACHE_BUCKET={{ sccache_bucket }}
+          export SCCACHE_ENDPOINT={{ minio_endpoint }}
+          export SCCACHE_REGION=us-east-1
+          export SCCACHE_S3_USE_SSL=off
+          export AWS_ACCESS_KEY_ID={{ minio_access_key }}
+          export AWS_SECRET_ACCESS_KEY={{ minio_secret_key }}
+
+    - name: Source sccache.env from .bashrc (so all build paths pick it up)
+      ansible.builtin.lineinfile:
+        path: "{{ ansible_env.HOME }}/.bashrc"
+        line: "[ -f ~/.sccache.env ] && . ~/.sccache.env"
+        create: true
+
+    - name: Verify sccache reaches the shared cache
+      ansible.builtin.shell: ". ~/.sccache.env; sccache --version && sccache --show-stats | head -3"
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: scc_check
+
+    - name: sccache status
+      ansible.builtin.debug:
+        var: scc_check.stdout_lines

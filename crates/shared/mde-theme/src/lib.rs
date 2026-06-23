@@ -43,12 +43,15 @@ pub mod carbon;
 pub mod color;
 pub mod components;
 pub mod density;
+pub mod feedback;
+pub mod frame_timer;
 // AUD2-3 (2026-06-12): `elevation` removed — the Q29/Q30 per-tier
 // radius+shadow bundles targeted the deleted shell's OSD/greeter/menu
 // surfaces, which Cosmic owns post-E11; zero workspace callers. The
 // shadow specs live on in `shadows` (consumed via `Theme::modal_shadow`).
 pub mod hero;
 pub mod icons;
+pub mod load_state;
 pub mod motion;
 pub mod palette;
 pub mod prefs;
@@ -59,8 +62,12 @@ pub mod theme;
 pub mod typography;
 
 pub use accessibility::A11y;
-pub use animation::{ease, lerp_f32, pulse_scale, LoopingTween, Tween};
+pub use animation::{
+    crossfade, ease, fade_in, lerp_f32, lift_on_hover, pulse_scale, slide_in, LoopingTween,
+    RenderParams, Tween,
+};
 pub use brand::{Brand, BrandAsset, BrandFormat, BrandSlot, BrandSource};
+pub use frame_timer::{ArmedTimer, FrameSample, FrameStats, FrameTimer, FRAME_DEBUG_ENV};
 pub use color::Rgba;
 pub use components::{
     CardSize, CardState, EmptyState, IconPlacement, ObjectCard, CARD_CORNER_RADIUS,
@@ -72,10 +79,15 @@ pub use components::{
     CARD_SHADOW_PRESSED_BLUR, CARD_SHADOW_PRESSED_OFFSET_Y, CARD_SUBTITLE_SIZE, CARD_TITLE_SIZE,
 };
 pub use density::Density;
+pub use feedback::{
+    ControlFeedback, FeedbackParams, FocusRing, FOCUS_RING_OFFSET_PX, FOCUS_RING_WIDTH_PX,
+    HOVER_LIFT_PX, PRESS_DEPTH,
+};
 pub use icons::{
     icon_for_device_type, mde_icon, FillMode, Icon, IconSize, IconState, ResolvedIcon,
     MATERIAL_LINE_WEIGHT_PX,
 };
+pub use load_state::{LoadState, StateTone};
 pub use motion::{Easing, Motion, PANEL_MOUNT_TRANSLATE_Y_PX, PULSE_MAX_SCALE};
 pub use palette::Palette;
 pub use prefs::Preferences;

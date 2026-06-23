@@ -15,5 +15,7 @@ expression: report
   "workers_alive": 0,
   "workers_total": 0,
   "breaker_tripped": 0,
-  "ready": false
+  "ready": false,
+  "lighthouse_count": 0,
+  "ha_ok": false
 }

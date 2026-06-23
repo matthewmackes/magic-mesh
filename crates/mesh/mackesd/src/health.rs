@@ -55,6 +55,14 @@ pub struct HealthReport {
     /// breaker tripped.
     #[serde(default)]
     pub ready: bool,
+    /// HA-4 — number of lighthouses in the live mesh directory.
+    #[serde(default)]
+    pub lighthouse_count: u32,
+    /// HA-4 — `true` when the mesh meets the HA floor (≥2 lighthouses). `false`
+    /// surfaces the non-blocking `degraded: no HA` posture in the Mesh Control
+    /// card / CLI without failing readiness (a 1-lighthouse mesh still works).
+    #[serde(default)]
+    pub ha_ok: bool,
 }
 
 impl HealthReport {
@@ -83,6 +91,9 @@ impl HealthReport {
             breaker_tripped: 0,
             // A bare baseline report has verified nothing — not ready.
             ready: false,
+            // HA-4 — a fresh node sees no directory yet: 0 lighthouses, no HA.
+            lighthouse_count: 0,
+            ha_ok: false,
         }
     }
 
@@ -151,12 +162,16 @@ impl HealthReport {
         degraded: u32,
         unreachable: u32,
         is_leader: bool,
+        lighthouse_count: u32,
     ) -> Self {
         self.node_count = node_count;
         self.healthy_nodes = healthy;
         self.degraded_nodes = degraded;
         self.unreachable_nodes = unreachable;
         self.is_leader = is_leader;
+        // HA-4 — the non-blocking HA posture from the live lighthouse count.
+        self.lighthouse_count = lighthouse_count;
+        self.ha_ok = !mackes_mesh_types::lighthouse::ha_degraded(lighthouse_count as usize);
         self
     }
 
@@ -214,6 +229,20 @@ mod tests {
         assert!(!dead_worker.ready, "a dead worker breaks readiness");
         let tripped = base.with_worker_status(5, 5, 1);
         assert!(!tripped.ready, "a breaker trip breaks readiness");
+    }
+
+    #[test]
+    fn with_mesh_sets_ha_ok_from_the_lighthouse_count() {
+        // HA-4 — <2 lighthouses ⇒ ha_ok=false (the "degraded: no HA" posture);
+        // ≥2 ⇒ ha_ok=true. Non-blocking: it never touches `ready`.
+        let r1 = HealthReport::empty().with_mesh(3, 3, 0, 0, true, 1);
+        assert_eq!(r1.lighthouse_count, 1);
+        assert!(!r1.ha_ok, "a single lighthouse is no-HA");
+        let r2 = HealthReport::empty().with_mesh(4, 4, 0, 0, true, 2);
+        assert_eq!(r2.lighthouse_count, 2);
+        assert!(r2.ha_ok, "two lighthouses meet the HA floor");
+        // The HA posture is independent of readiness.
+        assert_eq!(r1.ready, r2.ready);
     }
 
     #[test]

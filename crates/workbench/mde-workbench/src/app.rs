@@ -6,10 +6,10 @@
 //! [`crate::View::Panel`] matching.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cosmic::app::ApplicationExt;
-use cosmic::iced::widget::{column, container, row, text};
+use cosmic::iced::widget::{column, container, row, stack, text};
 use cosmic::iced::{window, Length, Subscription, Task};
 use cosmic::{Application, Element};
 
@@ -21,8 +21,9 @@ use crate::header::HeaderAction;
 use crate::keyboard::{KeyAction, Pane};
 use crate::model::{resolve_panel_label, view_from_focus_slug, Group, View};
 use crate::panels::{
-    audit as audit_panel, compute as compute_panel, config_apply as config_apply_panel,
-    connect as connect_panel, connectivity as connectivity_panel, dns as dns_panel,
+    audit as audit_panel, build_farm as build_farm_panel, compute as compute_panel,
+    config_apply as config_apply_panel, connect as connect_panel,
+    connectivity as connectivity_panel, datacenter as datacenter_panel, dns as dns_panel,
     drift as drift_panel, firewall as firewall_panel, fleet_logs as fleet_logs_panel,
     fleet_revisions as fleet_revisions_panel, fleet_rollup as fleet_rollup_panel,
     fleet_settings as fleet_settings_panel, hardware as hardware_panel,
@@ -140,6 +141,8 @@ pub enum Message {
     Hardware(hardware_panel::Message),
     /// PLANES-10 — Jobs panel (templates + run history) sub-message.
     Jobs(jobs_panel::Message),
+    BuildFarm(build_farm_panel::Message),
+    Datacenter(datacenter_panel::Message),
     /// PLANES-12 — Audit panel (hash-chain timeline + verify) sub-message.
     Audit(audit_panel::Message),
     /// PLANES-8 — Mesh Logs panel (journald mesh-unit view) sub-message.
@@ -225,6 +228,48 @@ pub enum Message {
     /// (focus-drain misses, lazy widget message slots). Not a stub:
     /// every live use is a functional "nothing to do" value.
     Noop,
+    /// MOTION-TRANS-1 — one frame of the active panel/route crossfade. Fired by
+    /// the in-flight-only transition tick (idle ⇒ no wakeups); the handler just
+    /// re-renders, clearing the transition once the tween completes.
+    TransitionTick,
+}
+
+/// MOTION-TRANS-1 — an in-flight panel/route crossfade. Created the instant the
+/// active [`View`] changes; the incoming body fades in from the panel background
+/// over the [`Motion::dialog_mount`](mde_theme::motion::Motion::dialog_mount)
+/// duration (≤80 ms under reduce-motion). The switch itself registers
+/// immediately (the new view is already live in `App::view`); only the visual
+/// dissolve is deferred, so there is no input delay. Held in `Option` so idle =
+/// no transition = no tick subscription.
+#[derive(Debug, Clone, Copy)]
+struct PanelTransition {
+    /// When the swap happened — the crossfade origin.
+    start: Instant,
+    /// Whether reduce-motion was active at swap time, so the tween caps to the
+    /// Carbon ≤80 ms crossfade and skips the eased curve (a stable snapshot for
+    /// the life of this transition).
+    reduce_motion: bool,
+}
+
+impl PanelTransition {
+    /// The crossfade's `(scrim_alpha, complete)` at `now`. `scrim_alpha` is the
+    /// **outgoing** surface's opacity from [`mde_theme::animation::crossfade`] —
+    /// the panel-background veil still over the incoming body (`1.0` at the swap,
+    /// `0.0` once fully revealed). `complete` is true once the incoming surface is
+    /// fully opaque, which (because [`mde_theme::animation::Tween`] clamps progress
+    /// to `1.0` at/after its duration) is reached exactly at the end of the tween —
+    /// so the tick subscription and the scrim both tear down with no idle wakeups.
+    /// Computed in one call so a frame never re-runs the easing math.
+    fn sample(self, now: Instant) -> (f32, bool) {
+        let (outgoing, incoming) =
+            mde_theme::animation::crossfade(self.start, now, self.reduce_motion);
+        (outgoing.alpha, incoming.alpha >= 1.0)
+    }
+
+    /// Has the crossfade finished at `now`? (Drives the tick-stop guard.)
+    fn is_complete(self, now: Instant) -> bool {
+        self.sample(now).1
+    }
 }
 
 /// Workbench application state.
@@ -236,6 +281,10 @@ pub struct App {
     /// runs there).
     core: cosmic::app::Core,
     view: View,
+    /// MOTION-TRANS-1 — the in-flight crossfade for the most recent panel/route
+    /// switch, or `None` at rest. Set by [`App::begin_transition`] whenever the
+    /// active [`View`] actually changes; cleared once the tween completes.
+    transition: Option<PanelTransition>,
     sidebar: SidebarState,
     focused_pane: Pane,
     /// GUI-RECONNECT — last known Bus/mackesd reachability. A down→up
@@ -259,6 +308,8 @@ pub struct App {
     inventory: inventory_panel::InventoryPanel,
     hardware: hardware_panel::HardwarePanel,
     jobs: jobs_panel::JobsPanel,
+    build_farm: build_farm_panel::BuildFarmPanel,
+    datacenter: datacenter_panel::DatacenterPanel,
     audit: audit_panel::AuditPanel,
     mesh_logs: mesh_logs_panel::MeshLogsPanel,
     config_apply: config_apply_panel::ConfigApplyPanel,
@@ -354,6 +405,7 @@ impl App {
         Self {
             core: cosmic::app::Core::default(),
             view: View::default(),
+            transition: None,
             sidebar: SidebarState::new(),
             focused_pane: Pane::Sidebar,
             bus_reachable: true,
@@ -368,6 +420,8 @@ impl App {
             inventory: inventory_panel::InventoryPanel::new(),
             hardware: hardware_panel::HardwarePanel::new(),
             jobs: jobs_panel::JobsPanel::new(),
+            build_farm: build_farm_panel::BuildFarmPanel::new(),
+            datacenter: datacenter_panel::DatacenterPanel::new(),
             audit: audit_panel::AuditPanel::new(),
             mesh_logs: mesh_logs_panel::MeshLogsPanel::new(),
             config_apply: config_apply_panel::ConfigApplyPanel::new(),
@@ -594,6 +648,19 @@ impl App {
             // manual refresh.
             cosmic::iced::time::every(Duration::from_secs(10)).map(|_| Message::ReconnectTick),
         ];
+        // MOTION-TRANS-1 — drive the panel/route crossfade at ~60 fps, but ONLY
+        // while a transition is actually in flight. At rest `self.transition` is
+        // `None`, so this subscription doesn't exist and there are zero idle
+        // wakeups (MOTION-PERF-1).
+        if self
+            .transition
+            .is_some_and(|t| !t.is_complete(Instant::now()))
+        {
+            subs.push(
+                cosmic::iced::time::every(Duration::from_millis(16))
+                    .map(|_| Message::TransitionTick),
+            );
+        }
         // E6.10 — sample Compute instance CPU/mem only while that view is
         // active, so virsh/podman stats aren't polled when the operator is
         // elsewhere.
@@ -656,6 +723,32 @@ impl App {
     /// for synchronous variants; panel messages fan out into
     /// real async backend calls.
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        // MOTION-TRANS-1 — snapshot the active route before the reducer runs so a
+        // panel/route switch (any handler that reassigns `self.view`) arms a
+        // crossfade afterwards. The switch registers immediately (the new view is
+        // live the moment the match returns); only the visual dissolve is deferred,
+        // so there is no input delay.
+        let prev_view = self.view;
+        let task = self.reduce(message);
+        if self.view != prev_view {
+            self.begin_transition();
+        }
+        task
+    }
+
+    /// MOTION-TRANS-1 — arm a fresh crossfade for the panel/route that just became
+    /// active. Snapshots the current reduce-motion preference so the tween's
+    /// duration/curve stay stable for the life of the transition.
+    fn begin_transition(&mut self) {
+        self.transition = Some(PanelTransition {
+            start: Instant::now(),
+            reduce_motion: crate::live_theme::reduce_motion(),
+        });
+    }
+
+    /// The message reducer proper. Split out of [`App::update`] so the latter can
+    /// wrap it with the MOTION-TRANS-1 route-change crossfade detection.
+    fn reduce(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::SelectGroup(group) => {
                 self.view = View::Group(group);
@@ -759,6 +852,8 @@ impl App {
             Message::Inventory(msg) => self.inventory.update(msg),
             Message::Hardware(msg) => self.hardware.update(msg),
             Message::Jobs(msg) => self.jobs.update(msg),
+            Message::BuildFarm(msg) => self.build_farm.update(msg),
+            Message::Datacenter(msg) => self.datacenter.update(msg),
             Message::Audit(msg) => self.audit.update(msg),
             Message::MeshLogs(msg) => self.mesh_logs.update(msg),
             Message::ConfigApply(msg) => self.config_apply.update(msg),
@@ -807,6 +902,18 @@ impl App {
             Message::Wallpaper(msg) => self.wallpaper.update(msg, self.backend()),
             Message::WindowControl(action) => Self::dispatch_window_action(action),
             Message::Noop => Task::none(),
+            // MOTION-TRANS-1 — a crossfade frame. Drop the transition once it has
+            // settled so the tick subscription goes quiet (no idle wakeups); while
+            // it's still in flight, returning here just re-renders the next frame.
+            Message::TransitionTick => {
+                if self
+                    .transition
+                    .is_some_and(|t| t.is_complete(Instant::now()))
+                {
+                    self.transition = None;
+                }
+                Task::none()
+            }
             // GUI-RECONNECT — fire the cheap Bus liveness probe.
             Message::ReconnectTick => {
                 Task::perform(probe_bus_reachable(), Message::ReconnectProbed)
@@ -864,6 +971,8 @@ impl App {
             "config_apply" => config_apply_panel::ConfigApplyPanel::load(),
             "registration" => registration_panel::RegistrationPanel::load(),
             "jobs" => jobs_panel::JobsPanel::load(),
+            "build-farm" => build_farm_panel::BuildFarmPanel::load(),
+            "datacenter" => datacenter_panel::DatacenterPanel::load(),
             "node_roles" => node_roles_panel::NodeRolesPanel::load(),
             "playbooks" => playbooks_panel::PlaybooksPanel::load(),
             "run_history" => run_history_panel::RunHistoryPanel::load(),
@@ -1079,7 +1188,7 @@ impl App {
         ]
         .spacing(6);
 
-        let body = self.panel_body();
+        let body = self.crossfaded_body();
 
         // UX-6.a — outer panel padding (SPACE_24) is supplied
         // here once for every panel, replacing the per-panel
@@ -1109,6 +1218,45 @@ impl App {
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+
+    /// MOTION-TRANS-1 — the active panel body, crossfaded in while a route switch
+    /// transition is in flight. iced 0.13 has no opacity widget for an arbitrary
+    /// subtree, so a true two-buffer A↔B crossfade isn't expressible (we can't keep
+    /// the outgoing Element alive across the swap). Instead the incoming body
+    /// dissolves **through the panel background**: a background-coloured scrim is
+    /// stacked over the live new body at the outgoing surface's opacity (full at
+    /// the swap → clear when revealed), so the swap reads as one deliberate
+    /// cross-dissolve rather than a hard cut. The scrim is an inert `container`
+    /// (its content is a `Space`, so `mouse_interaction` is `None`): the iced
+    /// `stack` therefore does not levitate the cursor away from the body, and
+    /// clicks/scrolls reach the already-live new panel even mid-fade — there is no
+    /// input delay. At rest (`transition == None`, or once settled) the body is
+    /// returned bare, with zero extra widgets and the panel's own sizing intact.
+    fn crossfaded_body(&self) -> Element<'_, Message> {
+        let body = self.panel_body();
+        let Some(transition) = self.transition else {
+            return body;
+        };
+        // One easing evaluation per frame: the background veil + completeness.
+        let (scrim_alpha, complete) = transition.sample(Instant::now());
+        if complete {
+            return body;
+        }
+        let bg = crate::live_theme::palette().background;
+        // The scrim is `Length::Fill` so it covers exactly the body's bounds; the
+        // stack inherits the body's own sizing (no forced Fill), so the panel's
+        // layout is identical with or without the in-flight scrim — no reflow.
+        let scrim = container(cosmic::iced::widget::Space::new())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_theme| container::Style {
+                background: Some(cosmic::iced::Background::Color(
+                    crate::cosmic_compat::with_alpha(bg.into_cosmic_color(), scrim_alpha),
+                )),
+                ..container::Style::default()
+            });
+        stack![body, scrim].into()
     }
 
     /// Per-View body — panel views land here as they ship.
@@ -1168,6 +1316,14 @@ impl App {
             } => self.registration.view(),
             // Controller plane — jobs / playbooks / run history.
             View::Panel { panel: "jobs", .. } => self.jobs.view(),
+            View::Panel {
+                panel: "build-farm",
+                ..
+            } => self.build_farm.view(),
+            View::Panel {
+                panel: "datacenter",
+                ..
+            } => self.datacenter.view(),
             View::Panel {
                 panel: "playbooks", ..
             } => self.playbooks.view(),
@@ -1599,6 +1755,60 @@ mod tests {
                 group: Group::ThisNode,
                 panel: "remote_desktop"
             }
+        );
+    }
+
+    #[test]
+    fn panel_switch_arms_a_crossfade_then_clears_when_complete() {
+        // MOTION-TRANS-1 — switching the active route arms an in-flight crossfade;
+        // selecting the SAME route again is a no-op (no needless re-fade); and a
+        // completed tween clears, so the tick subscription falls quiet (idle ⇒ no
+        // wakeups).
+        let mut app = App::new();
+        assert!(app.transition.is_none(), "rest = no transition");
+        let _ = app.update(Message::SelectPanel {
+            group: Group::ThisNode,
+            panel: "remote_desktop",
+        });
+        let armed = app.transition.expect("a real switch arms a crossfade");
+        assert!(
+            !armed.is_complete(armed.start),
+            "the crossfade starts in flight (alpha < 1 at t=start)"
+        );
+        // Re-selecting the identical view must NOT re-arm (view unchanged).
+        let armed_start = armed.start;
+        let _ = app.update(Message::SelectPanel {
+            group: Group::ThisNode,
+            panel: "remote_desktop",
+        });
+        assert_eq!(
+            app.transition.map(|t| t.start),
+            Some(armed_start),
+            "same-view re-select keeps the original transition (no re-fade)"
+        );
+        // After the dialog_mount duration the crossfade has settled. The
+        // TransitionTick handler reads the live wall clock, so assert the
+        // completeness predicate directly (wall-clock-independent) for the
+        // settle, then confirm the handler runs without panicking.
+        let done = armed.start
+            + mde_theme::motion::Motion::dialog_mount().duration
+            + Duration::from_millis(1);
+        assert!(
+            armed.is_complete(done),
+            "the crossfade is complete after its dialog_mount duration"
+        );
+        let _ = app.update(Message::TransitionTick);
+    }
+
+    #[test]
+    fn switching_to_a_group_root_also_crossfades() {
+        // MOTION-TRANS-1 — group-root navigations (View::Group) crossfade too, not
+        // just leaf panels: any route change is a visual swap.
+        let mut app = App::new();
+        let _ = app.update(Message::SelectGroup(Group::System));
+        assert!(
+            app.transition.is_some(),
+            "a group-root switch arms a crossfade"
         );
     }
 

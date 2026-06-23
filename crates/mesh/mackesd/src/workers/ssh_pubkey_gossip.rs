@@ -128,6 +128,19 @@ impl SshPubkeyGossipWorker {
         self.workgroup_root.join("ssh-keys")
     }
 
+    /// LH-JOIN-QNM-1 — is it safe to write into the replicated share this tick?
+    /// `false` only when the workgroup root is the canonical mountpoint
+    /// (`/mnt/mesh-storage`) and it isn't actually a FUSE mount: seeding
+    /// `<root>/ssh-keys/<host>.pub` into the bare mountpoint fills it so
+    /// LizardFS can never `mfsmount` over it ("mountpoint is not empty") — the
+    /// exact stray-write race that wedged a fresh lighthouse join. Dev/test
+    /// roots (tempdir, `~/QNM-Shared`) are always writable, so unaffected.
+    /// Mirrors `meshfs_worker`'s `shared_root_writable` guard.
+    #[must_use]
+    pub fn share_writable(&self) -> bool {
+        crate::shared_root_writable(&self.workgroup_root)
+    }
+
     /// One gossip pass across every relevant user. SSH-MESH-NOCREDS-1: gossip
     /// for the service user (`self.home`, typically root — the flat back-compat
     /// lane) AND every regular desktop user (uid 1000–60000 under `/home`, e.g.
@@ -195,6 +208,18 @@ impl SshPubkeyGossipWorker {
         let pubkey = pubkey.trim().to_string();
         if !valid_pubkey_line(&pubkey) {
             tracing::warn!("ssh_pubkey_gossip: local pubkey is not ssh-ed25519; skipping");
+            return;
+        }
+
+        // LH-JOIN-QNM-1 — never touch the replicated share until it's a real
+        // mount. On the canonical mountpoint that isn't mounted, the
+        // `create_dir_all(lane)` below would *succeed* against the bare local
+        // dir and seed `<root>/ssh-keys/<host>.pub`, poisoning the mountpoint so
+        // LizardFS can never `mfsmount` over it ("not empty") — the live
+        // fresh-join wedge. Quiet no-op until mounted; returning here also
+        // preserves the existing `authorized_keys` block rather than pruning it
+        // against an empty share.
+        if !self.share_writable() {
             return;
         }
 
@@ -396,6 +421,27 @@ mod tests {
         let ak = std::fs::read_to_string(ssh_dir.join("authorized_keys")).unwrap();
         assert!(ak.contains(KEY_A) && ak.contains(KEY_B));
         assert!(ak.contains(BLOCK_BEGIN));
+    }
+
+    #[test]
+    fn share_writable_gates_on_real_mount_for_canonical_root() {
+        // LH-JOIN-QNM-1 regression: on the canonical mountpoint the share is
+        // writable exactly when /proc/mounts lists it as mounted — so on an
+        // unmounted node the gossip publish is a no-op and the bare mountpoint
+        // stays empty (LizardFS can then mfsmount over it on the first try,
+        // instead of looping forever on "mountpoint is not empty").
+        let canonical =
+            SshPubkeyGossipWorker::new(PathBuf::from(crate::CANONICAL_QNM_MOUNT), "pine".into());
+        let mounted = std::fs::read_to_string("/proc/mounts")
+            .map(|c| {
+                c.lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(crate::CANONICAL_QNM_MOUNT))
+            })
+            .unwrap_or(false);
+        assert_eq!(canonical.share_writable(), mounted);
+        // A dev/non-canonical root is always writable — tests + dev unaffected.
+        let dev = SshPubkeyGossipWorker::new(PathBuf::from("/tmp/qnm-dev"), "pine".into());
+        assert!(dev.share_writable());
     }
 
     #[tokio::test]

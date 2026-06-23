@@ -154,8 +154,8 @@ impl ShellService {
             report
         } else {
             match self.mesh_enrichment_bounded(MESH_ENRICH_TIMEOUT) {
-                Some((n, healthy, degraded, unreachable, is_leader)) => {
-                    report.with_mesh(n, healthy, degraded, unreachable, is_leader)
+                Some((n, healthy, degraded, unreachable, is_leader, lighthouses)) => {
+                    report.with_mesh(n, healthy, degraded, unreachable, is_leader, lighthouses)
                 }
                 None => {
                     tracing::warn!(
@@ -179,7 +179,7 @@ impl ShellService {
     fn mesh_enrichment_bounded(
         &self,
         timeout: std::time::Duration,
-    ) -> Option<(u32, u32, u32, u32, bool)> {
+    ) -> Option<(u32, u32, u32, u32, bool, u32)> {
         let root = self.state.workgroup_root.clone();
         let db_path = self.state.db_path.clone();
         let node_id = self.state.node_id.clone();

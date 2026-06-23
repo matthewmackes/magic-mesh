@@ -1,0 +1,24 @@
+# FARM-AUTO-2 — Forgejo Actions drives the build farm. On push / schedule /
+# manual, converge the worklist's active @farm jobs onto the fleet via the shared
+# substrate (the runner uses label `farm` and runs on the control host, so it
+# inherits the mesh key + LAN to reach the build VMs / etcd / XO).
+name: farm-gate
+on:
+  push:
+    branches: [ master ]
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+jobs:
+  reconcile:
+    runs-on: farm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show farm node state
+        run: ./automation/lib/farm-dispatch.sh nodes
+      - name: Converge @farm jobs onto the build farm
+        run: ./automation/reconciler/farm-reconcile.sh
+      - name: Publish farm status
+        if: always()
+        run: cat automation/.state/farm-status.txt || true

@@ -14,6 +14,10 @@
 
 use std::collections::HashSet;
 
+mod motion;
+mod notify_clipboard;
+use notify_clipboard::ClipRow;
+
 use cosmic::iced::platform_specific::runtime::wayland::layer_surface::SctkLayerSurfaceSettings;
 use cosmic::iced::platform_specific::shell::commands::layer_surface::{
     get_layer_surface, Anchor, KeyboardInteractivity, Layer,
@@ -23,6 +27,8 @@ use cosmic::iced::{window, Element, Length, Padding, Subscription, Task, Theme};
 use mackes_mesh_types::lighthouse::{self, Beacon};
 use mde_notify::{severity_token, AlertItem, AlertTail, Severity, Source};
 use mde_theme::Palette;
+
+use motion::{collapse_stacks, HubAnim, Stack};
 // World-2 (raw `cosmic::iced`) layer-shell daemon — use the iced widgets +
 // raw `.color()` directly; only borrow the Rgba→Color conversion shim (the
 // `.colr`/`.sty` extensions are world-1 `cosmic::Theme`-bound and don't apply).
@@ -39,6 +45,10 @@ const MAX_ROWS: usize = 500;
 /// tab animate identically). The subscription is only armed when at least one
 /// lighthouse is present, so an idle/empty Hub costs nothing.
 const BEAM_TICK_MS: u64 = 150;
+/// NOTIFY-HUB-2 — the new-item slide/blink animation tick cadence (~60 fps). The
+/// subscription is only armed while [`HubAnim::is_idle`] is `false`, so an idle
+/// Hub (no entrance in flight) costs nothing.
+const ANIM_TICK_MS: u64 = 16;
 
 /// Single-instance guard — dep-free pidfile so re-launching the Action Center
 /// (e.g. the applet bell pressed twice) never STACKS a second full-height
@@ -212,10 +222,26 @@ struct Center {
     /// was fetched for (so the art is re-fetched only when the track changes).
     now_art: Option<cosmic::iced::widget::image::Handle>,
     now_art_id: Option<String>,
+    /// NOTIFY-HUB-2 — the new-item motion state machine (slide-in + 2× severity
+    /// blink for fresh cards; slide-down for the items they push). Advanced by the
+    /// animation tick, which is only armed while it has an entrance in flight.
+    anim: HubAnim,
+    /// NOTIFY-HUB-2 — every item id ever surfaced, so a `Refresh` can tell which
+    /// rows are *new* (and thus animate in) vs. already on screen.
+    seen_ids: HashSet<String>,
+    /// NOTIFY-HUB-2 — collapsed same-source stacks the operator has expanded (by
+    /// [`Stack::key`]); a stack not in here renders folded with its count badge.
+    expanded_stacks: HashSet<String>,
+    /// CLIP-VIEW-1 — the mesh-global clipboard history (newest first), refreshed
+    /// each poll from `action/clipboard/list`. Empty until the first list reply /
+    /// when the daemon is down. Each row renders as text + source-node + age, is
+    /// click-to-copy onto THIS node, and carries per-entry pin + delete.
+    clips: Vec<ClipRow>,
 }
 
 impl Center {
     fn new() -> Self {
+        let reduce_motion = mde_theme::Preferences::load().a11y.reduce_motion;
         Self {
             items: Vec::new(),
             tail: AlertTail::default(),
@@ -228,6 +254,34 @@ impl Center {
             beam_step: 0,
             now_art: None,
             now_art_id: None,
+            anim: HubAnim::new(reduce_motion),
+            seen_ids: HashSet::new(),
+            expanded_stacks: HashSet::new(),
+            clips: Vec::new(),
+        }
+    }
+
+    /// NOTIFY-HUB-2 — register any rows that are new since the last frame so they
+    /// animate in (slide + blink). On the very first poll the panel is just
+    /// opening, so the whole initial set is treated as already-present (no mass
+    /// strobe on open) — only adds *after* the first frame animate.
+    ///
+    /// `seen_ids` is afterward pruned to the ids still present in `items` so it
+    /// stays bounded by `MAX_ROWS` over a long uptime (no unbounded growth), and
+    /// so an id that was evicted by the `truncate` cap and later re-arrives
+    /// correctly animates in again as a fresh card.
+    fn note_new_items(&mut self, now: std::time::Instant) {
+        let first_frame = self.seen_ids.is_empty();
+        let fresh: Vec<String> = self
+            .items
+            .iter()
+            .filter(|i| !self.seen_ids.contains(&i.id))
+            .map(|i| i.id.clone())
+            .collect();
+        // Re-seed the seen-set to exactly the live rows (drops evicted ids).
+        self.seen_ids = self.items.iter().map(|i| i.id.clone()).collect();
+        if !first_frame && !fresh.is_empty() {
+            self.anim.on_new_items(fresh, now);
         }
     }
 }
@@ -238,6 +292,10 @@ enum Message {
     Refresh,
     /// Collapse/expand a source group by its label.
     ToggleGroup(String),
+    /// NOTIFY-HUB-2 — expand/collapse a same-source stack by its [`Stack::key`].
+    ToggleStack(String),
+    /// NOTIFY-HUB-2 — advance the new-item slide/blink animation one frame.
+    AnimTick,
     /// Acknowledge every alert.
     MarkAllRead,
     /// Drop every alert.
@@ -258,6 +316,17 @@ enum Message {
     /// LIGHTHOUSE-3/4 — a lighthouse card was pressed: open the Workbench
     /// Lighthouses tab focused on this lighthouse (by hostname).
     OpenLighthouse(String),
+    /// CLIP-VIEW-1 — load a clip row's text into THIS node's Wayland clipboard
+    /// (`wl-copy`). The carried text is the verbatim clip, not the preview.
+    ClipCopy(String),
+    /// CLIP-VIEW-1 — toggle an entry's pin mesh-wide (`action/clipboard/{pin,
+    /// unpin}`). Carries the entry id + its current pinned state.
+    ClipTogglePin(String, bool),
+    /// CLIP-VIEW-1 — drop one entry mesh-wide (`action/clipboard/delete`).
+    ClipDelete(String),
+    /// CLIP-VIEW-1 — clear every UNPINNED entry mesh-wide; pinned survive
+    /// (`action/clipboard/clear`).
+    ClipClearAll,
 }
 
 /// NOTIFY-AC — fetch the Now-Playing snapshot over the bus (best-effort, short
@@ -388,6 +457,55 @@ fn fetch_voice() -> Option<VoiceStatus> {
     })
 }
 
+/// CLIP-VIEW-1 — list the mesh-global clipboard history over the Bus
+/// (`action/clipboard/list`, CLIP-SYNC-1). Best-effort with a short timeout;
+/// an empty Vec on no daemon / no reply / a decode failure so the section
+/// shows its honest empty state instead of stalling the poll.
+fn fetch_clips() -> Vec<ClipRow> {
+    use std::time::Duration;
+    match mde_workbench::dbus::action_request("action/clipboard/list", Duration::from_millis(700)) {
+        Some(reply) => notify_clipboard::parse_list_reply(&reply),
+        None => Vec::new(),
+    }
+}
+
+/// CLIP-VIEW-1 — fire one `action/clipboard/{verb}` mutation with `body` (an
+/// entry id, or `None` for `clear`) and return the freshly-listed history so
+/// the section reflects the mesh-wide edit immediately. The verbs hit the same
+/// shared `clipboard/history.json` the capture worker appends to, so the change
+/// is mesh-wide; we re-list rather than mutate `state.clips` locally so the
+/// rendered set always matches the authoritative shared document.
+fn clip_mutate(verb: &str, body: Option<&str>) -> Vec<ClipRow> {
+    use std::time::Duration;
+    let topic = format!("action/clipboard/{verb}");
+    let _ = mde_workbench::dbus::action_request_with_body(&topic, body, Duration::from_millis(700));
+    fetch_clips()
+}
+
+/// CLIP-VIEW-1 — load `text` onto THIS node's Wayland clipboard via `wl-copy`,
+/// piping over stdin (no shell-quoting hazard) and detaching. Best-effort: a
+/// host without `wl-clipboard` / no Wayland session simply no-ops. The capture
+/// worker's O2 debounce drops the resulting `wl-paste --watch` echo so a
+/// click-to-load never duplicates the entry it loaded. Mirrors the daemon's
+/// `kdc_host::apply_clipboard` idiom.
+fn load_into_clipboard(text: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let child = Command::new("wl-copy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else {
+        return; // wl-copy absent / no Wayland — skip cleanly.
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    // Don't block the update loop waiting on wl-copy; it exits promptly.
+    drop(child);
+}
+
 /// LIGHTHOUSE-3 — build the pinned-footer beacons from the replicated peer
 /// directory (the same QNM-Shared roster the other panels read). One beacon per
 /// `role==lighthouse` row, binary health per [`lighthouse::beacon_for`], with
@@ -427,6 +545,14 @@ fn subscription(s: &Center) -> Subscription<Message> {
         subs.push(
             cosmic::iced::time::every(std::time::Duration::from_millis(BEAM_TICK_MS))
                 .map(|_| Message::BeamTick),
+        );
+    }
+    // NOTIFY-HUB-2 — only tick the new-item slide/blink while an entrance is
+    // actually in flight (MOTION-PERF-1: an idle Hub does no animation work).
+    if !s.anim.is_idle(std::time::Instant::now()) {
+        subs.push(
+            cosmic::iced::time::every(std::time::Duration::from_millis(ANIM_TICK_MS))
+                .map(|_| Message::AnimTick),
         );
     }
     Subscription::batch(subs)
@@ -514,6 +640,8 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
             // NOTIFY-AC — refresh the Music + Voice section snapshots.
             state.music = fetch_music();
             state.voice = fetch_voice();
+            // CLIP-VIEW-1 — refresh the mesh-global clipboard history.
+            state.clips = fetch_clips();
             // AC-5 — reflect the live DND state in the quick-toggle.
             if let Some(dir) = mde_bus::client_data_dir() {
                 state.dnd_active = mde_bus::dnd::load_default(&dir).active;
@@ -525,6 +653,19 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
             if cover != state.now_art_id {
                 state.now_art = cover.as_deref().and_then(fetch_cover_art);
                 state.now_art_id = cover;
+            }
+            // NOTIFY-HUB-2 — kick the slide-in + 2× severity blink for any rows
+            // that just appeared (skipped on the first poll so opening the panel
+            // doesn't strobe the whole backlog).
+            state.note_new_items(std::time::Instant::now());
+        }
+        Message::AnimTick => {
+            // Drop finished entrances; the subscription self-stops once idle.
+            state.anim.gc(std::time::Instant::now());
+        }
+        Message::ToggleStack(key) => {
+            if !state.expanded_stacks.remove(&key) {
+                state.expanded_stacks.insert(key);
             }
         }
         Message::BeamTick => {
@@ -570,6 +711,24 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
             let _ = mde_workbench::dbus::action_request(verb, Duration::from_millis(700));
             // Reflect the new transport state immediately.
             state.music = fetch_music();
+        }
+        Message::ClipCopy(text) => {
+            // CLIP-VIEW-1 — load the entry onto THIS node's clipboard. No re-list:
+            // the capture worker re-syncs/debounces it, and the entry is already
+            // at/near the top of the shared history.
+            load_into_clipboard(&text);
+        }
+        Message::ClipTogglePin(id, pinned) => {
+            // Currently pinned → unpin; else pin. Re-list reflects the mesh edit.
+            let verb = if pinned { "unpin" } else { "pin" };
+            state.clips = clip_mutate(verb, Some(&id));
+        }
+        Message::ClipDelete(id) => {
+            state.clips = clip_mutate("delete", Some(&id));
+        }
+        Message::ClipClearAll => {
+            // Mesh-wide clear of unpinned entries; pinned survive everywhere.
+            state.clips = clip_mutate("clear", None);
         }
         Message::ToggleGroup(label) => {
             if !state.collapsed.remove(&label) {
@@ -673,6 +832,8 @@ fn now_ms() -> i64 {
 fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
     let p = hub_palette();
     let now = now_ms();
+    // NOTIFY-HUB-2 — single clock read for this frame's slide/blink sampling.
+    let anim_now = std::time::Instant::now();
 
     // Header: title + close on the top line, the bulk actions on their own
     // line below so a long "· N unread" title never collides with the buttons
@@ -746,8 +907,20 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
             });
             body = body.push(head);
             if !collapsed {
-                for (i, item) in group.iter().enumerate() {
-                    body = body.push(alert_row(item, i, now, p));
+                // NOTIFY-HUB-2 — fold same-source + same-title repeats into one
+                // card carrying a count (expandable), then render each stack with
+                // its slide/blink motion.
+                for (i, stack) in collapse_stacks(&group).into_iter().enumerate() {
+                    let expanded = state.expanded_stacks.contains(&stack.key);
+                    body = body.push(stack_card(&stack, expanded, i, now, anim_now, &state.anim, p));
+                    // Expanded stack: show the individual repeats beneath the head
+                    // (the head is items[0], so the rest start at index 1).
+                    if expanded && stack.is_stacked() {
+                        for (j, item) in stack.items.iter().enumerate().skip(1) {
+                            body =
+                                body.push(stack_child_row(item, i + j, now, anim_now, &state.anim, p));
+                        }
+                    }
                 }
             }
         }
@@ -796,6 +969,9 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
     // appear only when there is something to show.
     let mut sections: Vec<Element<'_, Message>> = vec![
         container(scroll).height(Length::Fill).into(),
+        section_divider(p),
+        // CLIP-VIEW-1 — Clipboard Viewer, locked above Music + SIP.
+        clipboard_section(&state.clips, now, p),
         section_divider(p),
         now_playing_section(state.music.as_ref(), state.now_art.as_ref(), p),
         section_divider(p),
@@ -975,6 +1151,134 @@ fn voice_section(voice: Option<&VoiceStatus>, p: Palette) -> Element<'static, Me
     .into()
 }
 
+/// CLIP-VIEW-1 — the Clipboard Viewer section: a header (clipboard glyph +
+/// "Clipboard" + a mesh-wide "Clear all" that wipes unpinned entries) over the
+/// mesh-global history rows. Each row is click-to-copy onto THIS node, with a
+/// per-entry pin (★ toggle, exempt from the 50-cap) + delete (✕). Capped to a
+/// handful of visible rows so the section stays compact in the Hub column; the
+/// full history lives in the shared file. Empty state is honest.
+///
+/// `now_ms` is the frame clock in milliseconds — the same epoch-ms clock the
+/// notifications list passes to [`format_age`], so the clipboard ages read off
+/// the same bucket ladder.
+fn clipboard_section(clips: &[ClipRow], now_ms: i64, p: Palette) -> Element<'static, Message> {
+    /// Rows shown inline in the Hub (the rest stay in the shared history).
+    const VISIBLE_ROWS: usize = 6;
+
+    let mut header = row![
+        text("\u{2398}") // ⎘ next-page / clipboard-ish glyph (BMP, not emoji)
+            .size(13)
+            .color(p.accent.into_cosmic_color()),
+        Space::new().width(Length::Fixed(8.0)),
+        text("Clipboard")
+            .size(13)
+            .color(p.text.into_cosmic_color())
+            .width(Length::Fill),
+    ]
+    .align_y(cosmic::iced::Alignment::Center);
+    // Clear-all only when there is at least one unpinned entry to wipe (pinned
+    // survive a clear, so an all-pinned history has nothing to clear).
+    if clips.iter().any(|c| !c.pinned) {
+        header = header.push(action_button("Clear all", Message::ClipClearAll, p));
+    }
+
+    let mut col = column![header].spacing(6);
+    if clips.is_empty() {
+        col = col.push(
+            text("Clipboard history is empty.")
+                .size(12)
+                .color(p.text_muted.into_cosmic_color()),
+        );
+    } else {
+        // Pinned first (they're the operator's kept clips), then the rest in
+        // the daemon's newest-first order; cap the inline view.
+        let mut ordered: Vec<&ClipRow> = clips.iter().filter(|c| c.pinned).collect();
+        ordered.extend(clips.iter().filter(|c| !c.pinned));
+        for (i, c) in ordered.iter().take(VISIBLE_ROWS).enumerate() {
+            col = col.push(clip_row(c, i, now_ms, p));
+        }
+        if ordered.len() > VISIBLE_ROWS {
+            col = col.push(
+                text(format!("+{} more in history", ordered.len() - VISIBLE_ROWS))
+                    .size(11)
+                    .color(p.text_muted.into_cosmic_color()),
+            );
+        }
+    }
+
+    container(col)
+        .padding(Padding::from([10u16, 14u16]))
+        .width(Length::Fill)
+        .into()
+}
+
+/// CLIP-VIEW-1 — one clipboard row: a click-to-copy body (single-line preview +
+/// "from <node> · <age>" sub-label) trailed by the pin + delete controls. Zebra
+/// shaded to match the notification rows' idiom.
+fn clip_row(c: &ClipRow, idx: usize, now_ms: i64, p: Palette) -> Element<'static, Message> {
+    let base = if idx % 2 == 1 { p.surface } else { p.background };
+    let preview = notify_clipboard::preview(&c.text, 44);
+    // Age off the SAME format_age ladder as the notifications list: parse the
+    // RFC3339 stamp → epoch-ms → format_age. An unparseable stamp falls back to
+    // the current instant (renders "0s") rather than a panic.
+    let then_ms = notify_clipboard::rfc3339_to_epoch(&c.time).map_or(now_ms, |s| s * 1000);
+    let meta = notify_clipboard::meta_label(&c.source, &format_age(then_ms, now_ms));
+
+    // The text + meta stack — the whole thing is a flat click-to-copy button so
+    // a click loads the verbatim clip onto this node (ClipCopy carries the full
+    // text, not the truncated preview).
+    let body = column![
+        text(preview).size(12).color(p.text.into_cosmic_color()),
+        text(meta)
+            .size(10)
+            .color(p.text_muted.into_cosmic_color()),
+    ]
+    .spacing(1)
+    .width(Length::Fill);
+    let copy = button(body)
+        .on_press(Message::ClipCopy(c.text.clone()))
+        .width(Length::Fill)
+        .padding(0)
+        .style(|_t, _s| cosmic::iced::widget::button::Style {
+            background: None,
+            ..Default::default()
+        });
+
+    // Pin toggle: filled ★ (accent) when pinned, hollow ☆ (muted) when not.
+    let (pin_glyph, pin_color) = if c.pinned {
+        ("\u{2605}", p.accent) // ★
+    } else {
+        ("\u{2606}", p.text_muted) // ☆
+    };
+    let pin_btn = button(text(pin_glyph).size(13).color(pin_color.into_cosmic_color()))
+        .padding(Padding::from([2u16, 6u16]))
+        .on_press(Message::ClipTogglePin(c.id.clone(), c.pinned))
+        .style(|_t, _s| cosmic::iced::widget::button::Style {
+            background: None,
+            ..Default::default()
+        });
+    let del_btn = button(text("\u{2715}").size(12).color(p.text_muted.into_cosmic_color())) // ✕
+        .padding(Padding::from([2u16, 6u16]))
+        .on_press(Message::ClipDelete(c.id.clone()))
+        .style(|_t, _s| cosmic::iced::widget::button::Style {
+            background: None,
+            ..Default::default()
+        });
+
+    container(
+        row![copy, pin_btn, del_btn]
+            .spacing(2)
+            .align_y(cosmic::iced::Alignment::Center),
+    )
+    .padding(Padding::from([5u16, 8u16]))
+    .width(Length::Fill)
+    .style(move |_| container::Style {
+        background: Some(cosmic::iced::Background::Color(base.into_cosmic_color())),
+        ..Default::default()
+    })
+    .into()
+}
+
 /// A compact transport control button.
 /// LIGHTHOUSE-3 — the pinned Lighthouses footer (Q5): a header (beacon glyph +
 /// "Lighthouses" + live `N/M healthy`, Q8) over a horizontally-scrollable strip
@@ -1148,10 +1452,15 @@ fn quick_toggle<'a>(label: &'a str, on: bool, msg: Message, p: Palette) -> Eleme
     .into()
 }
 
-/// One alert row: severity glyph (colored) · age · host · title / body. Takes the
-/// item by value so the returned element owns its text (no borrow of the caller's
-/// loop-local group).
-fn alert_row(item: &AlertItem, idx: usize, now_ms: i64, p: Palette) -> Element<'static, Message> {
+/// The title/body column for one alert (severity glyph · title · age/host, plus
+/// an optional body line). `count_badge` adds a "×N" pill for a collapsed stack
+/// head. Shared by [`stack_card`] + [`stack_child_row`].
+fn alert_row_body(
+    item: &AlertItem,
+    now_ms: i64,
+    count_badge: Option<usize>,
+    p: Palette,
+) -> Element<'static, Message> {
     let sev_color = severity_token(item.severity, &p).into_cosmic_color();
     let title_color = if item.read { p.text_muted } else { p.text }.into_cosmic_color();
     let host = item.host.clone().unwrap_or_default();
@@ -1160,37 +1469,146 @@ fn alert_row(item: &AlertItem, idx: usize, now_ms: i64, p: Palette) -> Element<'
     } else {
         format!("{} · {host}", format_age(item.ts_unix_ms, now_ms))
     };
-    let head = row![
+    let mut head = row![
         text(severity_glyph(item.severity))
             .size(13)
             .color(sev_color),
         Space::new().width(Length::Fixed(8.0)),
         text(item.title.clone()).size(13).color(title_color),
-        Space::new().width(Length::Fill),
-        text(meta).size(11).color(p.text_muted.into_cosmic_color()),
     ]
     .align_y(cosmic::iced::Alignment::Center);
+    // NOTIFY-HUB-2 — a "×N" repeat badge in the severity colour when this card
+    // stands in for a collapsed same-source run.
+    if let Some(n) = count_badge {
+        if n > 1 {
+            head = head.push(Space::new().width(Length::Fixed(6.0)));
+            head = head.push(text(format!("\u{00d7}{n}")).size(11).color(sev_color));
+        }
+    }
+    head = head.push(Space::new().width(Length::Fill));
+    head = head.push(text(meta).size(11).color(p.text_muted.into_cosmic_color()));
     let mut col = column![head].spacing(2);
     if !item.body.is_empty() {
         let body: String = item.body.chars().take(200).collect();
         col = col.push(text(body).size(11).color(p.text_muted.into_cosmic_color()));
     }
-    // NOTIFY-HUB-1 — APPS-STYLE-2 zebra rows (the Application Menu's row idiom):
-    // alternate the row layer so the alert list reads as banded rows. The
-    // severity glyph already carries the severity colour.
-    let shade = if idx % 2 == 1 {
-        p.surface
-    } else {
-        p.background
+    col.into()
+}
+
+/// NOTIFY-HUB-2 — composite the severity-blink wash over a base zebra shade:
+/// alpha-over blend so the blink reads as a tint of the row, not an opaque flood.
+fn blink_shade(base: mde_theme::Rgba, blink: mde_theme::Rgba) -> cosmic::iced::Color {
+    let a = blink.a.clamp(0.0, 1.0);
+    let mix = |b: u8, t: u8| -> f32 {
+        let b = f32::from(b) / 255.0;
+        let t = f32::from(t) / 255.0;
+        b * (1.0 - a) + t * a
     };
-    container(col)
-        .padding(Padding::from([6u16, 8u16]))
+    cosmic::iced::Color {
+        r: mix(base.r, blink.r),
+        g: mix(base.g, blink.g),
+        b: mix(base.b, blink.b),
+        a: 1.0,
+    }
+}
+
+/// NOTIFY-HUB-2 — wrap an alert's body in its zebra-shaded card and apply the
+/// per-card motion: a slide offset (rendered as left/top padding so iced 0.13
+/// needs no transform widget) plus the severity-blink background wash. A card at
+/// rest renders exactly as the pre-animation zebra row.
+fn motioned_card(
+    inner: Element<'static, Message>,
+    idx: usize,
+    severity: Severity,
+    motion: motion::CardMotion,
+    p: Palette,
+) -> Element<'static, Message> {
+    // Zebra base layer (the Application Menu row idiom).
+    let base = if idx % 2 == 1 { p.surface } else { p.background };
+    // A settled card draws as the plain zebra row (no blink, no offset) — the
+    // common case once nothing is entering.
+    let (bg, left, top) = if motion.is_rest() {
+        (base.into_cosmic_color(), 0.0_f32, 0.0_f32)
+    } else {
+        // Severity-coloured blink wash over the base.
+        let blink = motion::blink_tint(severity, &p, motion.blink_alpha);
+        // Slide offsets → padding. left = still-to-the-right slide-in; top =
+        // still-below slide-down.
+        (
+            blink_shade(base, blink),
+            motion.translate_x.max(0.0),
+            motion.translate_y.max(0.0),
+        )
+    };
+    container(inner)
+        .padding(Padding {
+            top: top + 6.0,
+            right: 8.0,
+            bottom: 6.0,
+            left: left + 8.0,
+        })
         .width(Length::Fill)
         .style(move |_| container::Style {
-            background: Some(cosmic::iced::Background::Color(shade.into_cosmic_color())),
+            background: Some(cosmic::iced::Background::Color(bg)),
             ..Default::default()
         })
         .into()
+}
+
+/// NOTIFY-HUB-2 — a stack's head card: the representative alert with a count
+/// badge + the slide/blink entrance motion. When the stack folds repeats, the
+/// whole card is a toggle that expands/collapses the run.
+fn stack_card(
+    stack: &Stack,
+    expanded: bool,
+    idx: usize,
+    now_ms: i64,
+    anim_now: std::time::Instant,
+    anim: &HubAnim,
+    p: Palette,
+) -> Element<'static, Message> {
+    let m = anim.card_motion(&stack.head.id, anim_now);
+    let badge = stack.is_stacked().then_some(stack.count());
+    let mut body = alert_row_body(&stack.head, now_ms, badge, p);
+    // Expandable run → a flat full-width toggle wrapping the card body.
+    if stack.is_stacked() {
+        let caret = if expanded { "\u{25be}" } else { "\u{25b8}" }; // ▾ / ▸
+        let toggled = row![
+            text(caret).size(11).color(p.text_muted.into_cosmic_color()),
+            Space::new().width(Length::Fixed(6.0)),
+            body,
+        ]
+        .align_y(cosmic::iced::Alignment::Center);
+        body = button(toggled)
+            .on_press(Message::ToggleStack(stack.key.clone()))
+            .width(Length::Fill)
+            .padding(0)
+            .style(|_t, _s| cosmic::iced::widget::button::Style {
+                background: None,
+                ..Default::default()
+            })
+            .into();
+    }
+    motioned_card(body, idx, stack.head.severity, m, p)
+}
+
+/// NOTIFY-HUB-2 — one revealed repeat under an expanded stack head. Slightly
+/// indented; carries the same slide-down motion as the head's siblings (it is
+/// never itself the *new* item — the head is) so the reveal moves coherently.
+fn stack_child_row(
+    item: &AlertItem,
+    idx: usize,
+    now_ms: i64,
+    anim_now: std::time::Instant,
+    anim: &HubAnim,
+    p: Palette,
+) -> Element<'static, Message> {
+    let m = anim.card_motion(&item.id, anim_now);
+    let indented = row![
+        Space::new().width(Length::Fixed(16.0)),
+        alert_row_body(item, now_ms, None, p),
+    ];
+    motioned_card(indented.into(), idx, item.severity, m, p)
 }
 
 fn action_button<'a>(label: &'a str, msg: Message, p: Palette) -> Element<'a, Message> {

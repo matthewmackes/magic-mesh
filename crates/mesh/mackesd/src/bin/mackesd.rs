@@ -1674,9 +1674,10 @@ fn main() -> anyhow::Result<()> {
                 .map_or(0, |d| d.as_millis() as u64);
             let svc =
                 mackesd_core::ipc::directory::DirectoryService::new(&root, Some(db_path.clone()));
-            let (n, healthy, degraded, unreachable, is_leader) =
+            let (n, healthy, degraded, unreachable, is_leader, lighthouses) =
                 svc.mesh_health_counts(&default_node_id(), now_ms);
-            let report = report.with_mesh(n, healthy, degraded, unreachable, is_leader);
+            let report =
+                report.with_mesh(n, healthy, degraded, unreachable, is_leader, lighthouses);
             println!("{}", report.to_json_line()?);
         }
         Cmd::Connect { ip, port } => match mackesd_core::connect_actions::connect_argv(&ip, port) {
@@ -5989,6 +5990,122 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("upgrade_intent_watcher".into());
 
+        // FARM-AUTO-1 — build-farm orchestrator. Leader-gated; bridges the farm's
+        // etcd job lifecycle (FARM-AUTO-3 queue/results) onto the Bus as
+        // `event/farm/<jobid>` events so farm activity is visible mesh-wide.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::farm_orchestrator::FarmOrchestratorWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("farm_orchestrator".into());
+
+        // DATACENTER-5 — datacenter orchestrator. Leader-gated; samples the DC
+        // substrate (DigitalOcean now via doctl; Xen/XAPI + gateway as Phase-0
+        // deps land) and publishes `event/dc/<kind>/<id>` so the Workbench
+        // Datacenter plane sees hosts/VMs/droplets as first-class mesh state.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::datacenter_orchestrator::DatacenterOrchestratorWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("datacenter_orchestrator".into());
+
+        // DATACENTER-7 (audit half) — passive datacenter audit subscriber.
+        // Leader-gated; watches the `action/dc/*` Bus lanes and emits one
+        // append-only `event/dc/audit/<ulid>` record per request (deduped on
+        // ulid), without touching the action handlers — a pure side-observer.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::dc_auditor::DcAuditorWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("dc_auditor".into());
+
+        // DATACENTER-6 — passive async job-status tracker. Leader-gated; watches
+        // the `action/dc/*` Bus lanes + their `reply/<ulid>` replies and emits one
+        // `event/dc/job/<ulid>` event per status transition (pending→ok/error),
+        // without touching the action handlers — a pure side-observer.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::dc_jobs::DcJobsWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("dc_jobs".into());
+
+        // DATACENTER-24 — passive care-and-feeding health checker. Leader-gated;
+        // on a 30 s tick probes each configured Xen dom0's SSH reachability, the
+        // SUBSTRATE-V2 etcd `/health`, and the mesh secret-store helper, and emits
+        // one `event/dc/health/<check>` per check (deduped on status), without
+        // touching the substrate it watches — a pure side-observer.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::dc_health::DcHealthWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("dc_health".into());
+
+        // DATACENTER-23 — scheduled DR backups. Leader-gated; on a coarse (~5 min)
+        // tick decides via the pure `due` helper whether at least
+        // `MCNF_DR_INTERVAL_SECS` (default daily) have elapsed since the last run,
+        // and if so runs `automation/dr/dr-backup.sh` and publishes the outcome to
+        // `event/dc/dr/last` ({"status":"ok","path":…} | {"status":"fail",…}). The
+        // leader runs exactly one backup per interval mesh-wide.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::dr_scheduler::DrSchedulerWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("dr_scheduler".into());
+
+        // DATACENTER-20 — passive promotion tracker. Leader-gated; publishes the
+        // version running at each promotion stage (Build→Eagle→DO) to
+        // `event/dc/promote/<stage>` so the Workbench Datacenter plane can render
+        // the promotion matrix. Build version = newest release RPM (else
+        // `git describe`); Eagle/DO are honest `"unknown"` placeholders until
+        // those hosts are reachable.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::dc_promote::DcPromoteWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("dc_promote".into());
+
         // ONBOARD-6 — continuous leader election. Renews the
         // <QNM-Shared>/.mackesd-leader.lock lease every 20s so exactly one
         // node always holds leadership (previously only the upgrade watcher
@@ -6085,6 +6202,33 @@ fn run_serve(
             .lock()
             .expect("worker_names mutex")
             .push("compute_registry".into());
+
+        // APPS-LIVE-1 — apps_running: mirror this node's set of currently-
+        // running launchable apps to <QNM-Shared>/<host>/running-apps.json
+        // every 10 s so every node's Applications-menu launcher can badge each
+        // entry with a live "running on <host>" indicator (same replicated
+        // plane as compute-inventory.json; the bus is per-node). Detects via
+        // process ↔ .desktop match — root reads every /proc/<pid>/cmdline, so
+        // no per-seat compositor probe is needed. The `.desktop` scan root
+        // mirrors the apps aggregator's home.
+        let apps_running_home = std::env::var_os("HOME")
+            .map_or_else(|| PathBuf::from("/root"), PathBuf::from);
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::apps_running::AppsRunningWorker::new(
+                fw_host.clone(),
+                apps_running_home,
+            )
+            // Write to the SAME resolved root the apps responder reads from
+            // (honors a `--workgroup-root` override) — otherwise the worker would
+            // publish under the default root while the reader looked elsewhere and
+            // no app ever got badged.
+            .with_mount(workgroup_root.clone()),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("apps_running".into());
 
         // VIRT-5 (v5.0.0) — VM Nebula cert signing via Bus. Every peer
         // spawns the worker; only the CA peer (presence of
@@ -6879,6 +7023,185 @@ fn run_serve(
                 tracing::warn!(error = %e, "Route Bus responder: bus persist open failed; responder skipped");
             }
         }
+        // CLIP-SYNC-1 (action layer) — the clipboard responder:
+        // action/clipboard/{list,pin,unpin,delete,clear} edits the mesh-global
+        // history the clipboard_sync worker maintains, for the Clipboard Viewer
+        // (CLIP-VIEW-1). Same dedicated-OS-thread shape as Connect/Route.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let clip_svc =
+                    mackesd_core::ipc::clipboard::ClipboardService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("clipboard-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::clipboard::serve_bus(&persist, &clip_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "Clipboard Bus responder spawned; serving \
+                             action/clipboard/{{list,pin,unpin,delete,clear}} (CLIP-SYNC-1)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Clipboard Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("clipboard_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Clipboard Bus responder: bus persist open failed; responder skipped");
+            }
+        }
+        // DATACENTER (action layer) — the VM power-control responder:
+        // action/dc/vm-power runs `xe vm-{start,shutdown,reboot}` over the
+        // mesh-key SSH against an allowed dom0. Same dedicated-OS-thread shape.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let dc_svc =
+                    mackesd_core::ipc::datacenter::DatacenterService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("dc-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::datacenter::serve_bus(&persist, &dc_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "Datacenter Bus responder spawned; serving action/dc/vm-power (DATACENTER)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Datacenter Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("dc_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Datacenter Bus responder: bus persist open failed; responder skipped");
+            }
+        }
+        // DATACENTER-10 (action layer) — the host power-control responder:
+        // action/dc/host-power runs `xe host-{disable,enable,reboot}` over the
+        // mesh-key SSH against an allowed dom0 (maintenance on/off + reboot).
+        // Same dedicated-OS-thread shape.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let host_svc =
+                    mackesd_core::ipc::host_ops::HostOpsService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("host-ops-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::host_ops::serve_bus(&persist, &host_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "Host-ops Bus responder spawned; serving action/dc/host-power (DATACENTER-10)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Host-ops Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("host_ops_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Host-ops Bus responder: bus persist open failed; responder skipped");
+            }
+        }
+        // DATACENTER-16 (action layer) — the Wake-on-LAN responder:
+        // action/dc/wol broadcasts the 102-byte magic packet to
+        // 255.255.255.255:9 to power on a sleeping/off machine by MAC.
+        // Same dedicated-OS-thread shape.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let dc_power_svc =
+                    mackesd_core::ipc::dc_power::DcPowerService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("dc-power-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::dc_power::serve_bus(&persist, &dc_power_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "DC-power Bus responder spawned; serving action/dc/wol (DATACENTER-16)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "DC-power Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("dc_power_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "DC-power Bus responder: bus persist open failed; responder skipped");
+            }
+        }
+        // DC-15 (action layer) — the Tofu-plan responder: action/dc/tofu-plan
+        // runs a read-only `tofu plan` of an allow-listed workspace under
+        // infra/tofu/<ws> with its env sourced. Same dedicated-OS-thread shape.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let tofu_svc =
+                    mackesd_core::ipc::tofu::TofuService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("tofu-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::tofu::serve_bus(&persist, &tofu_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "Tofu Bus responder spawned; serving action/dc/tofu-plan (DC-15)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Tofu Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("tofu_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Tofu Bus responder: bus persist open failed; responder skipped");
+            }
+        }
         // VPN-GW-1 — the VPN responder: action/vpn/* tunnel CRUD + wg-quick/
         // openvpn bring-up over the per-node tunnel config. Same OS-thread shape.
         match mde_bus::default_data_dir()
@@ -7327,6 +7650,20 @@ fn run_serve(
                 RestartPolicy::Always,
             ));
             worker_names.lock().expect("worker_names mutex").push("clipd_supervisor".into());
+        }
+
+        // CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
+        // (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every
+        // text clip on the bus + appends to the mesh-global `clipboard/history.json`
+        // (last 50 unpinned + unlimited pinned). Idles gracefully without a display
+        // (the worker self-gates on $WAYLAND_DISPLAY), so it's cheap on a headless
+        // peer. Workstation-tier alongside clipd_supervisor.
+        if mackesd_core::worker_role::runs("clipboard_sync", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::clipboard_sync::build(workgroup_root.clone()),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names.lock().expect("worker_names mutex").push("clipboard_sync".into());
         }
 
         // TUNE-3.b (2026-05-26) — wire the v1.3.0 Fleet ansible-pull
@@ -7917,6 +8254,33 @@ fn cmd_found(
     };
     let join_token = v3.encode();
 
+    // FOUND-NEBULA-4 — materialize THIS lighthouse's /etc/nebula config INLINE,
+    // before starting nebula.service. The nebula_supervisor worker only
+    // materializes on LEADER-promotion, but a freshly-founded lighthouse cannot
+    // take leadership: the legacy leader lock lives on QNM-Shared
+    // (/mnt/mesh-storage/.mackesd-leader.lock), which the founder hasn't mounted
+    // yet (and which SUBSTRATE-V2 is removing). So the supervisor never runs and
+    // nebula starts against the STOCK example config.yml (pki → host.crt/ca.crt
+    // that don't exist) → crash-loop → no overlay. The join path already
+    // materializes inline (persist_bundle → materialize_config); found must do
+    // the same with its founding bundle. ConfigRole::Host → am_lighthouse: true;
+    // materialize_config writes ca.crt/host.crt/host.key + the rendered config
+    // and removes the stock config.yml. Idempotent: the supervisor re-renders
+    // identically once leadership is later taken. (Diagnosed live via the
+    // BUILD-PLATFORM-5 L2 mini-mesh, 2026-06-22.)
+    let founding_bundle =
+        mackesd_core::ca::bundle::read_bundle(&report.bundle_path).map_err(|e| {
+            anyhow::anyhow!("reading the founding bundle to materialize /etc/nebula: {e}")
+        })?;
+    mackesd_core::workers::nebula_supervisor::materialize_config(
+        std::path::Path::new("/etc/nebula"),
+        &founding_bundle,
+        mackesd_core::workers::nebula_supervisor::ConfigRole::Host,
+        &[],
+        &root,
+    )
+    .map_err(|e| anyhow::anyhow!("materializing /etc/nebula for the founding lighthouse: {e}"))?;
+
     // Bring the node fully live + boot-durable: enable+start the overlay, the
     // worker daemon (activates the /enroll listener), and the health watchdog.
     // `enable` makes each start at boot independently — nebula.service ships
@@ -7953,6 +8317,16 @@ fn cmd_found(
     );
     println!("bundle: {}", report.bundle_path.display());
     println!("services: nebula + mackesd + mesh-health enabled (boot-durable) and running");
+    // HA-4 — a freshly-founded mesh has exactly one lighthouse, so it is below
+    // the HA floor: a single lighthouse is a SPOF for relay/discovery and (under
+    // SUBSTRATE-V2) the etcd quorum + Mesh-Sync redundancy. Warn, non-blocking —
+    // the mesh works with one; healthz reports `degraded: no HA` until a 2nd is
+    // enrolled, then clears (the matching half of HA-4).
+    println!(
+        "\n⚠ HA needs a 2nd lighthouse — this mesh has 1 of {} for failover. \
+         Add one with `mackesd join '<token>' --role lighthouse` on another box.",
+        mackes_mesh_types::lighthouse::HA_MIN_LIGHTHOUSES
+    );
     println!("\nAdd a peer — run this on the joining box:\n  mackesd join '{join_token}'");
     Ok(())
 }

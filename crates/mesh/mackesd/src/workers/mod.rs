@@ -242,6 +242,13 @@ pub mod selinux_monitor;
 // `compute/inventory/<peer-nebula-addr>` per docs/design/v5.0.0-
 // compute.md §3. Silent no-op when virsh/podman are absent.
 pub mod compute_registry;
+// APPS-LIVE-1 — the apps_running worker: mirror this node's set of
+// currently-running launchable apps to <QNM-Shared>/<host>/running-
+// apps.json so the launcher can badge every entry "running on <host>"
+// mesh-wide (same replicated plane as compute-inventory.json; the bus
+// is per-node). Process ↔ .desktop match, reachable from the root
+// daemon without a per-seat compositor probe.
+pub mod apps_running;
 // VIRT-5 (v5.0.0) — VM Nebula cert signing via Bus. Every peer
 // drains `action/compute/cert-sign-request`; on the CA peer
 // (detected by ~/.config/mde/nebula/ca.key) calls `nebula-cert
@@ -382,6 +389,40 @@ pub mod lifecycle_exec;
 pub mod firewall_preset;
 // CONNECT-3 — exposure-driven (additive) firewall enforcement.
 pub mod connect_firewall;
+// FARM-AUTO-1 — build-farm orchestrator: bridges the farm job lifecycle onto the Bus.
+pub mod farm_orchestrator;
+// DATACENTER-5 — datacenter orchestrator: samples the DC substrate (DO/Xen/gateway)
+// onto the Bus as `event/dc/<kind>/<id>` for the Workbench Datacenter plane.
+pub mod datacenter_orchestrator;
+// DATACENTER-7 (audit half) — passive audit subscriber: watches the `action/dc/*`
+// Bus lanes and emits one append-only `event/dc/audit/<ulid>` record per request,
+// without touching the action handlers. Leader-gated; dedups on request ulid.
+pub mod dc_auditor;
+// DATACENTER-6 — passive async job-status tracker: watches the `action/dc/*` Bus
+// lanes + their `reply/<ulid>` replies and emits one `event/dc/job/<ulid>` event
+// per status transition (pending→ok/error), without touching the action
+// handlers. Leader-gated; dedups on (ulid, status).
+pub mod dc_jobs;
+// DATACENTER-24 — passive care-and-feeding health checker: on a 30 s tick probes
+// each configured Xen dom0's SSH reachability, the SUBSTRATE-V2 etcd `/health`,
+// and the mesh secret-store helper, and emits one `event/dc/health/<check>` per
+// check (deduped on status), without touching the substrate it watches.
+// Leader-gated; a pure side-observer.
+pub mod dc_health;
+// DATACENTER-23 — scheduled DR backups: a leader-gated periodic worker that runs
+// `automation/dr/dr-backup.sh` at most once per `MCNF_DR_INTERVAL_SECS` (default
+// daily) and publishes the outcome to `event/dc/dr/last`
+// ({"status":"ok"|"fail",…}). Coarse tick (~5 min) decides via the pure `due`
+// helper; the leader runs exactly one backup per interval mesh-wide.
+pub mod dr_scheduler;
+// DATACENTER-20 — passive promotion tracker: publishes the version running at
+// each promotion stage (Build→Eagle→DO) to `event/dc/promote/<stage>` so the
+// Workbench Datacenter plane can render the promotion matrix. Leader-gated;
+// dedups on (stage, version+status). Build version is the newest release RPM
+// (else `git describe`); Eagle/DO are honest `"unknown"` placeholders until
+// those hosts are reachable.
+pub mod dc_promote;
+// VPN-GW-1 — per-node commercial-VPN tunnel engine (WireGuard/OpenVPN baseline).
 pub mod stun_gather;
 pub mod subprocess_tick;
 // thumbnailer retired 2026-05-26 (TUNE-3.b): the worker module
@@ -411,6 +452,11 @@ pub mod xcp_host;
 // BUS-5.1 — clipboard daemon supervisor. Spawns one `mde-clipd` process
 // per Wayland session; idles when $WAYLAND_DISPLAY is unset.
 pub mod clipd_supervisor;
+// CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
+// (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every
+// text clip on the bus + appends to ONE mesh-global `clipboard/history.json`
+// (last 50 unpinned + unlimited pinned). All nodes tail it.
+pub mod clipboard_sync;
 // TUNE-16.d (2026-05-30) — Q22 8-peer cap counter. Counts enrolled
 // `role = 'peer'` nodes (phones count, federated external-mesh peers
 // are excluded by virtue of not appearing in the local store). Writes

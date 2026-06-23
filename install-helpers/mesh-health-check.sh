@@ -65,6 +65,21 @@ if [ -s "$ETCD_ENDPOINTS_FILE" ]; then
        && ! systemctl is-active --quiet syncthing.service 2>/dev/null; then
         restart syncthing.service "Syncthing down (Mesh Sync file plane out of sync)"
     fi
+    # SUBSTRATE-10: a syncthing that is UP but not actually CONNECTED to its
+    # configured peers is silently OUT OF SYNC — service-active isn't enough.
+    # This is the exact failure the reconciler addresses (a peer device-id not
+    # yet wired → "unknown device" rejection, syncthing up but no connection) and
+    # also catches an overlay partition. Compare configured peer devices (minus
+    # self) to live connections and alert if short, so a stuck file plane is
+    # visible instead of silently diverging.
+    if systemctl is-active --quiet syncthing.service 2>/dev/null && command -v syncthing >/dev/null 2>&1; then
+        ST_HOME="${MCNF_SYNCTHING_HOME:-/var/lib/mcnf-syncthing}"
+        st_peers=$(( $(HOME="$ST_HOME" syncthing cli --home="$ST_HOME" config devices list 2>/dev/null | grep -c .) - 1 ))
+        st_conn=$(HOME="$ST_HOME" syncthing cli --home="$ST_HOME" show connections 2>/dev/null | grep -c '"connected": true')
+        if [ "${st_peers:-0}" -gt 0 ] && [ "${st_conn:-0}" -lt "$st_peers" ]; then
+            alert "syncthing-out-of-sync" "Mesh Sync OUT OF SYNC on $(hostname): ${st_conn}/${st_peers} peer device(s) connected (reconcile pending or overlay partition)"
+        fi
+    fi
 elif systemctl list-unit-files qnm-shared.service >/dev/null 2>&1 && [ -d "$QNM" ]; then
     # Pre-cutover: assert the LizardFS QNM-Shared FUSE mount (AUDIT-MESH-1 — the
     # same /mnt/mesh-storage root the daemon uses).

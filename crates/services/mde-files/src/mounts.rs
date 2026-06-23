@@ -72,6 +72,25 @@ impl MountPoint {
             "nfs" | "nfs4" | "cifs" | "smb3" | "smbfs" | "9p"
         ) || self.fstype.starts_with("fuse.")
     }
+
+    /// Whether this mount is the mesh-storage / QNM-Shared store specifically —
+    /// the LizardFS FUSE plane that backs the shared workgroup tree, as opposed
+    /// to an arbitrary network share (a CIFS/NFS mount or some other sshfs).
+    #[must_use]
+    pub fn is_mesh_storage(&self) -> bool {
+        self.fstype == "fuse.lizardfs" || self.source.starts_with("lizardfs#")
+    }
+
+    /// Canonical freedesktop icon name for this mount's "This PC" row.
+    /// NOTIFY-UI-3 / ICON-MESH: network/mesh mounts (the mesh-storage /
+    /// QNM-Shared store + any other network share) read as *network* locations
+    /// and take `folder-remote`; a plain local block device takes
+    /// `drive-harddisk`. Delegates to the shared selector in [`crate::icons`] so
+    /// the name and the rendered SVG can never drift apart.
+    #[must_use]
+    pub fn icon_name(&self) -> &'static str {
+        crate::icons::icon_name_for_mount(self.is_network())
+    }
 }
 
 /// Parse the content of `/proc/mounts` (or `/etc/mtab`) into rows, decoding the
@@ -142,16 +161,21 @@ fn unescape_octal(field: &str) -> String {
 }
 
 /// Render the user volumes as the `mde-files --mounts` report (one
-/// `target\tfstype\tsource[\t(network)]` per line).
+/// `target\tfstype\tsource\ticon=<name>[\t(network)]` per line). The `icon=`
+/// field is the freedesktop icon name a file manager should paint for the row
+/// ([`MountPoint::icon_name`]) — `folder-remote` for the mesh-storage /
+/// QNM-Shared store and other network shares, `drive-harddisk` for local disks
+/// (NOTIFY-UI-3 / ICON-MESH), so the chosen icon is observable at runtime.
 #[must_use]
 pub fn report(mounts: &[MountPoint]) -> String {
     let mut out = String::new();
     for m in mounts {
         out.push_str(&format!(
-            "{}\t{}\t{}{}\n",
+            "{}\t{}\t{}\ticon={}{}\n",
             m.target.display(),
             m.fstype,
             m.source,
+            m.icon_name(),
             if m.is_network() { "\t(network)" } else { "" }
         ));
     }
@@ -239,6 +263,28 @@ fusectl /sys/fs/fuse/connections fusectl rw,nosuid,nodev,noexec,relatime 0 0\n";
     }
 
     #[test]
+    fn mesh_mount_icon_is_the_network_folder() {
+        // NOTIFY-UI-3 / ICON-MESH: the mesh-storage (QNM-Shared) FUSE plane is a
+        // mesh file service, so its "This PC" row must take the `folder-remote`
+        // network icon, not a local mounted-volume icon.
+        let m = parse_proc_mounts(FIXTURE);
+        let by_target = |t: &str| m.iter().find(|x| x.target == PathBuf::from(t)).unwrap();
+
+        let mesh = by_target("/mnt/mesh store");
+        assert!(mesh.is_mesh_storage(), "fuse.lizardfs is the mesh store");
+        assert_eq!(mesh.icon_name(), "folder-remote");
+
+        // Other network shares (CIFS) are remote too → folder-remote, but are
+        // not the mesh store specifically.
+        let cifs = by_target("/mnt/media");
+        assert!(!cifs.is_mesh_storage());
+        assert_eq!(cifs.icon_name(), "folder-remote");
+
+        // A local ext4 disk keeps the local disk icon.
+        assert_eq!(by_target("/").icon_name(), "drive-harddisk");
+    }
+
+    #[test]
     fn report_marks_network_volumes() {
         let vols: Vec<_> = parse_proc_mounts(FIXTURE)
             .into_iter()
@@ -252,5 +298,19 @@ fusectl /sys/fs/fuse/connections fusectl rw,nosuid,nodev,noexec,relatime 0 0\n";
         assert!(r
             .lines()
             .any(|l| l.starts_with("/\text4") && !l.contains("(network)")));
+
+        // NOTIFY-UI-3 / ICON-MESH: the report carries the per-row icon name so
+        // the chosen glyph is observable at runtime (the `--mounts` surface).
+        // The mesh-storage (fuse.lizardfs) + CIFS rows take `folder-remote`;
+        // the local ext4 root takes `drive-harddisk`.
+        assert!(r
+            .lines()
+            .any(|l| l.contains("fuse.lizardfs") && l.contains("\ticon=folder-remote")));
+        assert!(r
+            .lines()
+            .any(|l| l.contains("\tcifs\t") && l.contains("\ticon=folder-remote")));
+        assert!(r
+            .lines()
+            .any(|l| l.starts_with("/\text4") && l.contains("\ticon=drive-harddisk")));
     }
 }

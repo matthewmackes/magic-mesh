@@ -1,0 +1,16 @@
+# FARM-AUTO-4 — the GitOps reconciler, run on the control host (fleet-side, no AI).
+# Install: copy automation/ + this unit to /root/magic-mesh, then
+#   systemctl enable --now mcnf-farm-reconcile.timer
+[Unit]
+Description=MCNF build-farm reconciler (worklist @farm jobs -> fleet builds)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+WorkingDirectory=/root/magic-mesh
+# MCNF_REPO lets the unit point at the deployed tree; defaults to WorkingDirectory.
+ExecStart=/bin/bash -lc '/root/magic-mesh/automation/reconciler/farm-reconcile.sh'
+TimeoutStartSec=3600
+Nice=10

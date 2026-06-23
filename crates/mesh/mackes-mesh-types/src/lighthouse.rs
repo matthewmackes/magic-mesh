@@ -155,6 +155,27 @@ pub fn lighthouse_records(peers: &[PeerRecord]) -> Vec<PeerRecord> {
     out
 }
 
+/// HA-4 — the minimum lighthouse count for a highly-available mesh. Below this
+/// there is no failover headroom: a single lighthouse is a SPOF for relay/
+/// discovery, the etcd quorum (SUBSTRATE-V2), and Mesh-Sync redundancy (§8 — up
+/// to 3 lighthouses give exactly those). Two is the floor; the supported
+/// envelope tops out at 3.
+pub const HA_MIN_LIGHTHOUSES: usize = 2;
+
+/// HA-4 — `true` when the mesh has too few lighthouses for HA (`< `[`HA_MIN_LIGHTHOUSES`]).
+/// Drives the non-blocking `degraded: no HA` health flag + the founding warning;
+/// it is a posture signal, never a hard gate (a 1-lighthouse mesh still works).
+#[must_use]
+pub fn ha_degraded(lighthouse_count: usize) -> bool {
+    lighthouse_count < HA_MIN_LIGHTHOUSES
+}
+
+/// HA-4 — the operator-facing reason string when HA is degraded, else `None`.
+#[must_use]
+pub fn ha_degraded_reason(lighthouse_count: usize) -> Option<&'static str> {
+    ha_degraded(lighthouse_count).then_some("no HA: needs a 2nd lighthouse")
+}
+
 /// One lighthouse's dialable coordinates for the enroll roster (LIGHTHOUSE-10):
 /// the bundle a joining node receives lists ALL of these so it can reach the
 /// whole lighthouse set — losing any one leaves the rest reachable (the point of
@@ -361,6 +382,32 @@ mod tests {
             vec!["alpha", "zeta"],
             "only lighthouses, sorted by hostname"
         );
+    }
+
+    #[test]
+    fn ha_degraded_below_the_two_lighthouse_floor() {
+        // HA-4: 0 or 1 lighthouse = degraded (no failover headroom); 2+ = HA OK.
+        assert!(ha_degraded(0));
+        assert!(ha_degraded(1));
+        assert!(!ha_degraded(2));
+        assert!(!ha_degraded(3));
+        assert_eq!(HA_MIN_LIGHTHOUSES, 2);
+        // The reason string is present iff degraded.
+        assert_eq!(ha_degraded_reason(1), Some("no HA: needs a 2nd lighthouse"));
+        assert_eq!(ha_degraded_reason(2), None);
+    }
+
+    #[test]
+    fn ha_degraded_counts_real_lighthouse_records() {
+        // End-to-end with the directory counter: one lighthouse = degraded.
+        let now = 1_000_000;
+        let one = vec![lh("alpha", "healthy", Some("10.42.0.1"), now)];
+        assert!(ha_degraded(lighthouse_records(&one).len()));
+        let two = vec![
+            lh("alpha", "healthy", Some("10.42.0.1"), now),
+            lh("beta", "healthy", Some("10.42.0.2"), now),
+        ];
+        assert!(!ha_degraded(lighthouse_records(&two).len()));
     }
 
     #[test]

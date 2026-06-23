@@ -202,6 +202,77 @@ desktop-personal panels grouped below. Locks (full table: `docs/design/planes.md
 - **Hero images:** sections backed by an external project carry a Carbon-compliant
   line-art hero (original homages, `mde-theme`-compiled, `hero_stroke` token). (H1–H10)
 
+## §10 — Build & development environment (canonical — do not rediscover)
+
+> **§10.0 — MANDATE: work the farm, scale out, never grind solo.** *(operator,
+> 2026-06-22, after a full session ran sequentially on one node while the farm sat
+> idle.)* Heavy or decomposable work **MUST** be offloaded to the build farm and run
+> **in parallel across the farm nodes** (`172.20.0.50/.51/.52`) — not serialized on one
+> node, and not done as a single sequential loop when the work splits.
+> 1. **Builds/tests/RPM cuts run on the farm** (`install-helpers/xcp-build.sh`), never
+>    blocking the orchestration loop on a local compile when the farm is reachable.
+> 2. **Decompose and fan out.** When work splits into file-disjoint pieces (a worker
+>    handler + its GUI panel; N independent tasks), spawn **concurrent subagents** —
+>    each owning disjoint files and building on a **different farm node** — instead of
+>    doing them one at a time. Distribute builds across `.50/.51/.52`.
+> 3. **A slow or fuzzy success signal is never a reason to defer, serialize, or
+>    reclassify work as "tail"** (see the `no-flinch` skill). "Harder/slower for me" ≠
+>    "lower priority for the operator." Fix the feedback loop (distribute the build);
+>    don't route around the work.
+> 4. The measure is **throughput on the operator's priorities**, not the cleanliness of
+>    a single sequential green checkmark. Verify you are actually parallelizing.
+>
+> **Mechanics (learned in practice):**
+> - **Concurrent jobs per node:** `MCNF_BUILD_SLOT=<n>` gives `xcp-build.sh` an isolated
+>   remote workspace+target on one VM, so several builds share a host without colliding
+>   (BigBoy `.52`, 12c/24G, runs 2-3 in parallel). Distribute agents across `.50/.51/.52`
+>   AND across slots.
+> - **Cap concurrency per node — learned the hard way (2026-06-22).** Pointing ALL
+>   builds at one node (BigBoy) and running **6 concurrent heavy `mde-workbench`
+>   (libcosmic GUI) builds** drove `.52` to **load 49 + disk → 3.6 GB free**; builds
+>   stalled, agents hung waiting on builds that never finished, and several otherwise-good
+>   units became "duds" purely from host exhaustion (their code compiled — only the host
+>   couldn't link/test under contention). A heavy GUI build wants ~1 core + GBs of `target`;
+>   keep **≤2–3 heavy builds per node** and genuinely spread across `.50/.51/.52`. When a
+>   node is saturated, salvage a stuck agent's uncommitted code by building it on a FREE
+>   node (`MCNF_BUILD_HOST=172.20.0.51`), then commit + cherry-pick. Killing a farm agent
+>   leaves its remote `cargo`/`rustc` orphaned (the SSH child keeps building) — they
+>   self-clear on completion; a blanket remote `pkill` is (correctly) classifier-blocked on
+>   shared infra, so prefer not to over-spawn in the first place.
+> - **Parallel mutating agents:** spawn with `isolation:"worktree"` (no code
+>   cross-contamination). They cut from the **master tip**, so tell each to
+>   `git reset --hard <current-work-tip-sha>` first; have each commit its **disjoint**
+>   files + report the SHA; then **cherry-pick** the SHAs onto the work branch (clean,
+>   since disjoint). **Clean up** the agent worktrees afterward (`git worktree remove`) —
+>   their `target/` dirs fill the dev-host disk fast.
+
+The development toolchain and build environment are documented **once**, in
+[`docs/BUILD-ENVIRONMENT.md`](docs/BUILD-ENVIRONMENT.md) — **read it before building
+or provisioning; do not relearn it.** If it has drifted, fix that file, not your
+memory. The load-bearing facts (full detail + the gotchas index live in the doc):
+
+- **Two build surfaces.** (1) The **local dev host** (`172.20.145.192`, Rocky 9.8)
+  builds the whole workspace incl. the GUI — but its **gcc 11.5 rejects `mold`**, so
+  build with `RUSTFLAGS="-C link-arg=-fuse-ld=gold"`. (2) The **build farm** (two
+  Fedora VMs `172.20.0.50`/`.51`, gcc 15 + mold) for offloaded/parallel builds, gates,
+  and RPM cuts — drive it with `install-helpers/xcp-build.sh` / `farm.sh`.
+- **Rust pin `1.94.0`** (`rust-toolchain.toml`); MSRV floor `1.85`. `rustup` required.
+- **EL9 prereq trap:** `opus-devel` is in **CRB** (`dnf --enablerepo=crb install opus-devel`),
+  not the default repos — the single most-rediscovered dependency.
+- **The farm is Infrastructure-as-Code** (DEVOPS-SUBSTRATE): `infra/tofu/` (OpenTofu +
+  Xen Orchestra) builds the VMs from the `MDE-VM-golden` template; `infra/ansible/`
+  installs the toolchain. `tofu apply` rebuilds the farm from code. Secrets
+  (`/root/.mcnf-xo-token`, the mesh key) are off-repo.
+- **Build PLATFORM direction** (`docs/design/build-platform.md`, locked 2026-06-22):
+  the **GitOps reconciler on a timer** is the canonical build lane — builds happen
+  because the worklist changed (an `@farm:{…}` tag on a task), **no AI in the build
+  loop**; AI spends tokens only on design + failure-triage. **Shared `sccache`** is
+  the build-speed lever. Correctness is proven by an **internal** test pyramid — L0
+  build+unit on every change (blocks green), L1 install + L2 feature + L3 stability
+  (soak/chaos/reboot) **nightly + on-demand, never blocking** — run on a
+  **snapshot-reset VM pool** from `MDE-VM-golden`. The 5 FARM-AUTO capabilities are
+  the substrate; the reconciler is the default.
+
 ---
 
 *Heritage: the pre-pivot identity lives in the archived

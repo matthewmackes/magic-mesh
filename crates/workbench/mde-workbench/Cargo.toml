@@ -7,6 +7,14 @@ rust-version.workspace = true
 license.workspace      = true
 authors.workspace      = true
 repository.workspace   = true
+# NOTIFY-HUB-2 / CLIP-VIEW-1 — the layer-shell bins share sibling helper
+# modules that live beside them in `src/bin/` (`motion.rs`,
+# `notify_clipboard.rs`), pulled in via `mod motion;` / `mod notify_clipboard;`.
+# Those helpers carry no `fn main`, so auto-bin discovery would try to build
+# them as standalone binaries and fail. Disable autobins + declare the real
+# binaries explicitly so the shared modules compile only as part of the bins
+# that include them.
+autobins = false
 
 [lib]
 name = "mde_workbench"
@@ -15,6 +23,22 @@ path = "src/lib.rs"
 [[bin]]
 name = "mde-workbench"
 path = "src/main.rs"
+
+[[bin]]
+name = "mde-mesh-wallpaper"
+path = "src/bin/mde-mesh-wallpaper.rs"
+
+[[bin]]
+name = "mde-notify-capture"
+path = "src/bin/mde-notify-capture.rs"
+
+[[bin]]
+name = "mde-notify-center"
+path = "src/bin/mde-notify-center.rs"
+
+[[bin]]
+name = "mde-notify-toast"
+path = "src/bin/mde-notify-toast.rs"
 
 [dependencies]
 # v2.0.0 Phase E + CB-1 lock: Iced 0.13 is the Wayland-only UI

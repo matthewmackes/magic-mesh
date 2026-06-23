@@ -230,4 +230,32 @@ EOF
 systemctl daemon-reload 2>/dev/null || true
 systemctl enable syncthing.service >/dev/null 2>&1 || true
 systemctl restart syncthing.service 2>/dev/null || true
-log "done — folder $FOLDER shared full-mesh (overlay-only)"
+
+# ---- SUBSTRATE-5 self-heal: reconcile the device list on a timer -----------
+# This script wires only the peers in the registry NOW; a node that joins LATER
+# would never be learned by this one (and vice-versa). Ship a oneshot + timer that
+# runs syncthing-reconcile every 2 min — it adds any newly-registered peer device
+# to the RUNNING daemon LIVE (no restart; idempotent no-op at steady state), so the
+# file plane self-heals like the etcd peer directory. Units written inline (same
+# reason as syncthing.service above — a path-relative cp from /usr/libexec fails).
+cat > /etc/systemd/system/syncthing-reconcile.service <<UNIT
+[Unit]
+Description=MCNF Mesh Sync — reconcile Syncthing peer devices from the etcd registry
+After=syncthing.service etcd.service
+[Service]
+Type=oneshot
+Environment=MCNF_SYNCTHING_HOME=$HOME_DIR
+ExecStart=/usr/libexec/mackesd/syncthing-reconcile
+UNIT
+cat > /etc/systemd/system/syncthing-reconcile.timer <<'UNIT'
+[Unit]
+Description=MCNF Mesh Sync — periodic Syncthing device reconcile (SUBSTRATE-5)
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=120
+[Install]
+WantedBy=timers.target
+UNIT
+systemctl daemon-reload 2>/dev/null || true
+systemctl enable --now syncthing-reconcile.timer >/dev/null 2>&1 || true
+log "done — folder $FOLDER shared full-mesh (overlay-only); reconcile timer armed"

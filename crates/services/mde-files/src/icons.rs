@@ -55,6 +55,21 @@ pub const CHEVRON_DOWN: &[u8] = lucide!(r#"<polyline points="6 9 12 15 18 9"/>"#
 pub const FOLDER: &[u8] = lucide!(
     r#"<path d="M3 6a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6z"/>"#
 );
+/// A folder with a network/remote badge — the freedesktop `folder-remote`
+/// equivalent. Used for mesh file services (the QNM-Shared / Mesh-Sync store)
+/// so they read as *network* locations, not local mounted volumes.
+pub const FOLDER_REMOTE: &[u8] = lucide!(
+    r#"<path d="M3 6a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6z"/><circle cx="9" cy="14" r="1.3"/><circle cx="16" cy="11" r="1.3"/><circle cx="16" cy="17" r="1.3"/><line x1="10.1" y1="13.4" x2="14.9" y2="11.4"/><line x1="10.1" y1="14.6" x2="14.9" y2="16.6"/>"#
+);
+
+/// Canonical freedesktop icon name for the [`FOLDER_REMOTE`] glyph — the network
+/// file-service representation (mesh-storage / QNM-Shared). This is the stable
+/// identifier the mount-icon plumbing reports so callers (and tests) can assert
+/// on a name rather than the opaque SVG bytes.
+pub const FOLDER_REMOTE_NAME: &str = "folder-remote";
+
+/// Canonical freedesktop icon name for a plain local volume / [`HDD`] mount.
+pub const DRIVE_HARDDISK_NAME: &str = "drive-harddisk";
 pub const DOC2: &[u8] = lucide!(
     r#"<path d="M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8z"/><polyline points="14 3 14 8 19 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/>"#
 );
@@ -175,6 +190,31 @@ pub fn svg_for_peer_kind(kind: crate::model::PeerKind) -> &'static [u8] {
     }
 }
 
+/// SVG bytes for a mounted volume's "This PC" row icon. Network/mesh mounts
+/// (the mesh-storage / QNM-Shared store and any CIFS/NFS/sshfs share) read as
+/// *network* locations and take the [`FOLDER_REMOTE`] (`folder-remote`) glyph;
+/// a plain local block device takes the [`HDD`] disk glyph. NOTIFY-UI-3 / ICON-MESH.
+#[must_use]
+pub fn svg_for_mount(is_network: bool) -> &'static [u8] {
+    if is_network {
+        FOLDER_REMOTE
+    } else {
+        HDD
+    }
+}
+
+/// Canonical freedesktop icon *name* for a mounted volume — the stable
+/// counterpart to [`svg_for_mount`]. `"folder-remote"` for a network/mesh
+/// mount, `"drive-harddisk"` for a local one. NOTIFY-UI-3 / ICON-MESH.
+#[must_use]
+pub const fn icon_name_for_mount(is_network: bool) -> &'static str {
+    if is_network {
+        FOLDER_REMOTE_NAME
+    } else {
+        DRIVE_HARDDISK_NAME
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +234,7 @@ mod tests {
             CHEVRON_RIGHT,
             CHEVRON_DOWN,
             FOLDER,
+            FOLDER_REMOTE,
             DOC2,
             IMAGE_FILE,
             PDF,
@@ -222,5 +263,19 @@ mod tests {
             assert!(s.starts_with("<svg "), "icon must start with <svg : {s}");
             assert!(s.ends_with("</svg>"), "icon must close with </svg>: {s}");
         }
+    }
+
+    #[test]
+    fn mesh_mount_takes_the_network_folder_icon() {
+        // NOTIFY-UI-3 / ICON-MESH: a network/mesh mount (mesh-storage /
+        // QNM-Shared) reads as a *network* location, so it must take the
+        // freedesktop `folder-remote` glyph + name — not the local disk icon.
+        assert_eq!(icon_name_for_mount(true), "folder-remote");
+        assert_eq!(icon_name_for_mount(true), FOLDER_REMOTE_NAME);
+        assert_eq!(svg_for_mount(true), FOLDER_REMOTE);
+
+        // A plain local block device keeps the local disk icon.
+        assert_eq!(icon_name_for_mount(false), "drive-harddisk");
+        assert_eq!(svg_for_mount(false), HDD);
     }
 }

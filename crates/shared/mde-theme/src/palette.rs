@@ -161,11 +161,49 @@ impl Palette {
     pub fn active_tint(&self) -> Rgba {
         self.accent.with_alpha(0.12)
     }
+
+    /// MOTION-NET-3 — a copy of this palette with the **foreground/content**
+    /// colors' alpha scaled by `factor` (clamped 0..1), for rendering
+    /// stale-while-refreshing content dimmed. Surfaces (background/surface/raised)
+    /// stay opaque so only the content fades, never the panel itself. `factor`
+    /// = the state's [`crate::LoadState::content_alpha`].
+    #[must_use]
+    pub fn dimmed(self, factor: f32) -> Self {
+        let f = factor.clamp(0.0, 1.0);
+        let scale = |c: Rgba| c.with_alpha((c.a * f).clamp(0.0, 1.0));
+        Self {
+            text: scale(self.text),
+            text_muted: scale(self.text_muted),
+            accent: scale(self.accent),
+            success: scale(self.success),
+            danger: scale(self.danger),
+            warning: scale(self.warning),
+            border: scale(self.border),
+            ..self
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dimmed_scales_foreground_alpha_but_not_surfaces() {
+        // MOTION-NET-3 — content fades, the panel surface does not.
+        let p = Palette::gray_90();
+        let d = p.dimmed(0.5);
+        assert!(
+            (d.text.a - p.text.a * 0.5).abs() < 1e-6,
+            "text alpha halved"
+        );
+        assert!((d.text_muted.a - p.text_muted.a * 0.5).abs() < 1e-6);
+        assert_eq!(d.background, p.background, "surface stays opaque");
+        assert_eq!(d.surface, p.surface);
+        // factor 1.0 is a no-op; clamped below 0.
+        assert_eq!(p.dimmed(1.0).text.a, p.text.a);
+        assert_eq!(p.dimmed(-3.0).text.a, 0.0);
+    }
 
     #[test]
     fn gray_90_palette_is_published_carbon_g90() {

@@ -16,7 +16,8 @@
 # Options (defaults in []):
 #   --region <r>        DO region            [nyc3]
 #   --size <s>          droplet size slug    [s-1vcpu-1gb]
-#   --image <img>       DO image slug        [fedora-42-x64]
+#   --image <img>       DO image slug        [fedora-43-x64] (must have a live
+#                       dnf channel for its releasever — fedora-42 has none)
 #   --ssh-key <id>      DO ssh-key id/fingerprint (repeatable; default: all)
 #   --repo-baseurl <u>  dnf channel base     [https://matthewmackes.github.io/magic-mesh]
 #   --rpm-url <u>       direct RPM URL (overrides the channel)
@@ -31,7 +32,7 @@ TEMPLATE="$HERE/do-lighthouse-cloudinit.sh"
 [ -f "$TEMPLATE" ] || { echo "missing $TEMPLATE" >&2; exit 1; }
 
 # ---- defaults -------------------------------------------------------------
-REGION="nyc3"; SIZE="s-1vcpu-1gb"; IMAGE="fedora-42-x64"
+REGION="nyc3"; SIZE="s-1vcpu-1gb"; IMAGE="fedora-43-x64"
 REPO_BASEURL="https://matthewmackes.github.io/magic-mesh"; RPM_URL=""
 ENROLL_PORT="4243"; ROLE="lighthouse"; TAG="magic-lighthouse"
 SSH_KEYS=(); KEEP_ON_FAIL=0
@@ -88,6 +89,32 @@ if [ ${#SSH_KEYS[@]} -eq 0 ]; then
     [ ${#SSH_KEYS[@]} -gt 0 ] || { echo "no DO ssh-keys found — register one or pass --ssh-key" >&2; exit 1; }
 fi
 SSH_KEY_ARG="$(IFS=,; echo "${SSH_KEYS[*]}")"
+
+# 3b. INVARIANT: at least one selected DO key must have its private half on THIS
+#     box. The droplet authorizes exactly the keys injected here; if none is local
+#     we can neither fetch the join token below nor ever SSH in again — the box is
+#     born locked-out. This is the recurring lighthouse-lockout (3× observed): the
+#     account's DO keys had no matching private key on the build host, so every
+#     fresh lighthouse was unreachable. Fail fast with the one-line remedy.
+# Only consider files we actually hold the PRIVATE half of: ssh-keygen -y derives a
+# pubkey from a private key and fails on pubkey-only files (known_hosts /
+# authorized_keys / *.pub), so it cleanly excludes keys we can't authenticate with.
+local_fps="$(for k in "$HOME"/.ssh/*; do
+        case "$k" in *.pub|*known_hosts*|*authorized_keys|*config) continue;; esac
+        [ -f "$k" ] || continue
+        ssh-keygen -y -P "" -f "$k" >/dev/null 2>&1 || continue   # private key we can read
+        ssh-keygen -lf "$k" -E md5 2>/dev/null | awk '{print $2}' | sed 's/^MD5://'
+    done | sort -u)"
+sel_fps="$(doctl compute ssh-key list --format ID,FingerPrint --no-header 2>/dev/null \
+    | awk -v ids="$SSH_KEY_ARG" 'BEGIN{n=split(ids,a,","); for(i=1;i<=n;i++) want[a[i]]=1} want[$1]{print $2}')"
+if ! comm -12 <(printf '%s\n' "$local_fps") <(printf '%s\n' "$sel_fps" | sort -u) | grep -q .; then
+    echo "!! none of the selected DO ssh-keys has a private half on this host." >&2
+    echo "   the new lighthouse would be UNREACHABLE (the recurring lockout)." >&2
+    echo "   register this host's key first, then re-run:" >&2
+    echo "     doctl compute ssh-key import mcnf-buildhost-ops --public-key-file ~/.ssh/id_ed25519.pub" >&2
+    echo "   (or pass --ssh-key <id> for a DO key whose private half is local)" >&2
+    exit 1
+fi
 
 # 4. Create the droplet with the cloud-init + tag, and wait for it active.
 log "creating droplet '$DROPLET' ($SIZE, $IMAGE, $REGION)"

@@ -23,12 +23,16 @@ users:
   - name: mm
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
-    ssh_authorized_keys: [ $PUB ]
+    ssh_authorized_keys:
+      - "$PUB"
 ssh_pwauth: false
 packages: [ nebula ]
 UD
 echo "instance-id: $NAME; local-hostname: $NAME" > "$SEED/meta-data"
-cloud-localds "$VMDIR/seed-$NAME.iso" "$SEED/user-data" "$SEED/meta-data"
+# NoCloud seed via genisoimage (cloud-localds isn't packaged on EL9) — a
+# `cidata`-labelled ISO of user-data + meta-data, what NoCloud reads.
+( cd "$SEED" && genisoimage -quiet -output "$VMDIR/seed-$NAME.iso" -volid cidata \
+    -joliet -rock user-data meta-data )
 sudo cp "$IMG" "/var/lib/libvirt/images/$NAME.qcow2"
 sudo qemu-img resize "/var/lib/libvirt/images/$NAME.qcow2" 12G
 sudo cp "$VMDIR/seed-$NAME.iso" "/var/lib/libvirt/images/seed-$NAME.iso"

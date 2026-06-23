@@ -43,13 +43,21 @@ while [ $# -gt 0 ]; do case "$1" in
   *) echo "unknown arg: $1" >&2; exit 1;;
 esac; done
 [ -n "$XCP_HOST" ] && [ -n "$XCP_PASS" ] || { sed -n '20,30p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
-for t in qemu-img cloud-localds sshpass; do command -v "$t" >/dev/null || { echo "missing $t" >&2; exit 1; }; done
+for t in qemu-img genisoimage sshpass; do command -v "$t" >/dev/null || { echo "missing $t" >&2; exit 1; }; done
 [ -s "$QCOW2" ] || { echo "missing qcow2: $QCOW2" >&2; exit 1; }
 [ -s "$PUBKEY" ] || { echo "missing pubkey: $PUBKEY" >&2; exit 1; }
 
 export SSHPASS="$XCP_PASS"
 SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15"
-xe() { sshpass -e ssh $SSHOPTS "$XCP_USER@$XCP_HOST" xe "$@"; }
+# NOTE: ssh re-splits the remote command on spaces, so a value with spaces
+# (e.g. template='Other install media', name-label='Local storage') would arrive
+# at `xe` as separate words and never match. Shell-quote each arg with %q so the
+# remote shell reassembles them intact.
+xe() {
+  local _c="xe" _a
+  for _a in "$@"; do _c="$_c $(printf '%q' "$_a")"; done
+  sshpass -e ssh $SSHOPTS "$XCP_USER@$XCP_HOST" "$_c"
+}
 log() { echo "==> build-vm: $*"; }
 IP="${IPCIDR%%/*}"
 
@@ -63,6 +71,17 @@ RAW_BYTES="$(stat -c%s "$WORK/disk.raw")"
 
 log "build NoCloud seed (static $IPCIDR, dev SSH key)"
 PUB="$(cat "$PUBKEY")"
+DNS_SEMI="$(echo "$DNS" | tr ' ' ';');"   # NM keyfile wants `8.8.8.8;1.1.1.1;`
+# NETWORK — write the NetworkManager keyfile DIRECTLY, do not rely on cloud-init's
+# netplan-v2 → NM rendering. On Fedora-Cloud + Xen HVM, cloud-init *parses* a v2
+# network-config but renders NO keyfile (confirmed from a VM's own cloud-init.log:
+# "applying net config ... 172.20.0.50/16" yet /etc/NetworkManager/system-connections
+# stays empty), so the NIC falls back to DHCP — and a static-only LAN with no DHCP
+# server leaves the VM permanently unreachable. This dark-VMed the whole farm. The
+# keyfile has no interface-name so it binds the single ethernet NIC regardless of
+# its name (Xen calls it enX0, not eth0/ens3). We also disable cloud-init's net
+# management so nothing competes, and bring the connection up on first boot via
+# runcmd (the keyfile alone is picked up automatically on every later boot).
 cat > "$WORK/user-data" <<UD
 #cloud-config
 hostname: $NAME
@@ -71,22 +90,42 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     groups: [wheel]
-    ssh_authorized_keys: [ $PUB ]
+    ssh_authorized_keys:
+      - "$PUB"
 ssh_pwauth: false
 growpart: { mode: auto, devices: ['/'], ignore_growroot_disabled: false }
+write_files:
+  - path: /etc/NetworkManager/system-connections/static-primary.nmconnection
+    permissions: '0600'
+    owner: root:root
+    content: |
+      [connection]
+      id=static-primary
+      type=ethernet
+      autoconnect=true
+      autoconnect-priority=999
+
+      [ipv4]
+      method=manual
+      address1=$IPCIDR,$GW
+      dns=$DNS_SEMI
+
+      [ipv6]
+      method=ignore
+  - path: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+    permissions: '0644'
+    content: |
+      network: {config: disabled}
+runcmd:
+  - [ nmcli, connection, reload ]
+  - [ sh, -c, "nmcli connection up static-primary || systemctl restart NetworkManager" ]
 UD
 echo -e "instance-id: $NAME-001\nlocal-hostname: $NAME" > "$WORK/meta-data"
-cat > "$WORK/network-config" <<NC
-version: 2
-ethernets:
-  primary:
-    match: { name: "e*" }
-    dhcp4: false
-    addresses: [$IPCIDR]
-    routes: [ { to: default, via: $GW } ]
-    nameservers: { addresses: [$(echo "$DNS" | sed 's/ /, /g')] }
-NC
-cloud-localds --network-config="$WORK/network-config" "$WORK/seed.iso" "$WORK/user-data" "$WORK/meta-data"
+# Build the NoCloud seed ISO directly with genisoimage (cloud-localds isn't
+# packaged on EL9; the seed is just a `cidata`-labelled ISO carrying
+# user-data + meta-data at the root — what NoCloud reads).
+( cd "$WORK" && genisoimage -quiet -output seed.iso -volid cidata -joliet -rock \
+    user-data meta-data )
 sz="$(stat -c%s "$WORK/seed.iso")"; pad=$(( (sz + 1048575) / 1048576 * 1048576 )); truncate -s "$pad" "$WORK/seed.iso"
 SEED_BYTES="$(stat -c%s "$WORK/seed.iso")"
 
@@ -94,6 +133,11 @@ log "stage raw + seed onto dom0 /tmp"
 sshpass -e scp $SSHOPTS "$WORK/disk.raw" "$WORK/seed.iso" "$XCP_USER@$XCP_HOST:/tmp/"
 
 SR="$(xe sr-list name-label='Local storage' params=uuid --minimal | tr -d '\r')"
+# Portability: the local SR isn't always named "Local storage" (it's ext on some
+# hosts, lvm on others). Fall back to the first local user SR by type.
+[ -n "$SR" ] || SR="$(xe sr-list type=ext params=uuid --minimal | tr -d '\r' | tr ',' '\n' | head -1)"
+[ -n "$SR" ] || SR="$(xe sr-list type=lvm params=uuid --minimal | tr -d '\r' | tr ',' '\n' | head -1)"
+[ -n "$SR" ] || { echo "no local SR (Local storage / ext / lvm) found on $XCP_HOST" >&2; exit 1; }
 NET="$(xe pif-list management=true params=network-uuid --minimal | tr -d '\r')"
 log "SR=$SR NET=$NET"
 
@@ -120,6 +164,13 @@ xe vbd-create vm-uuid="$VM" vdi-uuid="$SVDI" device=1 bootable=false type=Disk m
 xe vif-create vm-uuid="$VM" network-uuid="$NET" device=0 >/dev/null
 xe vm-param-set uuid="$VM" HVM-boot-policy="BIOS order"
 xe vm-param-set uuid="$VM" HVM-boot-params:order=c
+# BUILD-FARM — survive a host reboot. Without auto_poweron the build VM stays
+# halted after any dom0 reboot/shutdown (the live "build VM down" outage that
+# blocked every GUI/farm build). XCP-ng gates per-VM auto-start on BOTH the VM
+# flag AND the pool flag, so set both (idempotent).
+xe vm-param-set uuid="$VM" other-config:auto_poweron=true
+POOL="$(xe pool-list params=uuid --minimal | tr -d '\r')"
+[ -n "$POOL" ] && xe pool-param-set uuid="$POOL" other-config:auto_poweron=true
 xe vm-start uuid="$VM"
 sshpass -e ssh $SSHOPTS "$XCP_USER@$XCP_HOST" "rm -f /tmp/disk.raw /tmp/seed.iso" || true
 

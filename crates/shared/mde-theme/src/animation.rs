@@ -26,6 +26,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use crate::frame_timer::{FrameSample, FrameTimer};
 use crate::motion::{Easing, Motion};
 
 /// Single-shot tween over a fixed duration. Stateless w.r.t.
@@ -189,6 +190,28 @@ pub fn pulse_scale(phase: f32, max_scale: f32) -> f32 {
     lerp_f32(1.0, max_scale, smoothed)
 }
 
+/// MOTION-NET-2 — dim end of a skeleton placeholder's shimmer (alpha).
+pub const SKELETON_ALPHA_DIM: f32 = 0.10;
+/// MOTION-NET-2 — bright end of a skeleton placeholder's shimmer (alpha).
+pub const SKELETON_ALPHA_BRIGHT: f32 = 0.22;
+
+/// MOTION-NET-2 — the alpha for a greyed skeleton placeholder at `phase` (0→1).
+/// The tile "breathes" between [`SKELETON_ALPHA_DIM`] and
+/// [`SKELETON_ALPHA_BRIGHT`] (eased ping-pong, like [`pulse_scale`]) so a slow
+/// load reads as active. **Under reduce-motion it is STATIC** at the mid alpha —
+/// a plain grey block, no shimmer (the a11y contract: motion is never the only
+/// cue). Pure.
+#[must_use]
+pub fn shimmer_alpha(phase: f32, reduce_motion: bool) -> f32 {
+    if reduce_motion {
+        return (SKELETON_ALPHA_DIM + SKELETON_ALPHA_BRIGHT) / 2.0;
+    }
+    let p = phase.clamp(0.0, 1.0);
+    let triangle = if p < 0.5 { p * 2.0 } else { 2.0 - p * 2.0 };
+    let smoothed = ease(triangle, Easing::EaseInOut);
+    lerp_f32(SKELETON_ALPHA_DIM, SKELETON_ALPHA_BRIGHT, smoothed)
+}
+
 /// MOTION-INFRA-2 — the standard shell transition kinds. Each maps an eased
 /// progress `t` (0→1, from [`Animator::value`]) to concrete [`RenderParams`] the
 /// consumer applies to its themed widget (alpha → a container/text color alpha,
@@ -262,16 +285,72 @@ impl Transition {
 /// own. [`Animator::is_idle`] reports when nothing is in flight, so the consumer
 /// can stop ticking at rest (no idle/offscreen CPU — MOTION-PERF-1). Pure state
 /// (no toolkit dep); the consumer reads [`Animator::value`] in its `view`.
-#[derive(Debug, Default, Clone)]
+///
+/// ## MOTION-INFRA-3 — idle/visibility-hardened tick gating
+///
+/// A subscription must arm a per-frame tick **only while an animation is
+/// actually in flight AND the surface is visible**. The animator therefore
+/// tracks the surface's visibility ([`Animator::set_visible`]) and exposes
+/// [`Animator::needs_tick`] — the single predicate a consumer's `subscription()`
+/// gates on. The contract this enforces:
+///
+/// * **At rest, zero ticks.** No tween in flight ⇒ `needs_tick` is `false`.
+/// * **Hidden/closed surface animates nothing.** Even with a stale in-flight
+///   tween, a surface marked not-visible reports `needs_tick == false`: a
+///   collapsed popup or a closed window arms no animation clock at all.
+///
+/// ## MOTION-INFRA-3 — opt-in per-frame timing
+///
+/// When `MDE_FRAME_DEBUG` is set ([`crate::frame_timer::FRAME_DEBUG_ENV`]), the
+/// animator's [`Animator::frame_tick`] yields a [`FrameSample`] carrying the
+/// per-frame milliseconds for the surface, so a slow/stuttering motion is
+/// loggable. The flag is read **once** at [`Animator::new`]/`Default` (via
+/// [`FrameTimer::from_env`]); when unset the timer is the zero-cost
+/// [`FrameTimer::Off`] variant and `frame_tick` never reads the clock or
+/// allocates — default OFF, zero cost.
+#[derive(Debug, Clone)]
 pub struct Animator {
     tweens: HashMap<String, Tween>,
+    /// Whether the surface this animator drives is on-screen. A not-visible
+    /// surface arms no tick regardless of in-flight tweens (hidden popup,
+    /// collapsed panel, closed window). Visible by default — most surfaces are.
+    visible: bool,
+    /// Opt-in per-frame instrumentation. Armed iff `MDE_FRAME_DEBUG` is set when
+    /// the animator is built; [`FrameTimer::Off`] (zero cost) otherwise.
+    frame_timer: FrameTimer,
+}
+
+impl Default for Animator {
+    fn default() -> Self {
+        Self {
+            tweens: HashMap::new(),
+            visible: true,
+            // Read the env flag exactly once, here. `tick()`/`frame_tick()`
+            // never touch the environment again.
+            frame_timer: FrameTimer::from_env("animator"),
+        }
+    }
 }
 
 impl Animator {
-    /// An empty animator (nothing animating).
+    /// An empty animator (nothing animating), visible by default. Reads the
+    /// `MDE_FRAME_DEBUG` gate once (see the type docs).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build an animator with an explicit frame-debug decision, bypassing the
+    /// `MDE_FRAME_DEBUG` env probe. Lets a test (or a GUI's own debug toggle)
+    /// arm per-frame timing without mutating process env — which is `unsafe`
+    /// and racy under a test harness. Starts empty + visible.
+    #[must_use]
+    pub fn with_frame_debug(enabled: bool) -> Self {
+        Self {
+            tweens: HashMap::new(),
+            visible: true,
+            frame_timer: FrameTimer::with_enabled("animator", enabled),
+        }
     }
 
     /// Start (or restart) the animation under `id` from `start`, using the
@@ -313,17 +392,183 @@ impl Animator {
     }
 
     /// True when nothing is animating — the subscription should stop ticking
-    /// (MOTION-PERF-1: zero idle wakeups).
+    /// (MOTION-PERF-1: zero idle wakeups). This is in-flight state only; it does
+    /// **not** consider visibility. Gate a subscription on [`Animator::needs_tick`]
+    /// instead, which also folds in whether the surface is on-screen.
     #[must_use]
     pub fn is_idle(&self, now: Instant) -> bool {
         self.tweens.values().all(|tw| tw.is_complete(now))
+    }
+
+    /// MOTION-INFRA-3 — mark whether the surface this animator drives is
+    /// on-screen. A hidden/closed surface (collapsed popup, closed window) arms
+    /// no tick even mid-animation, so [`Animator::needs_tick`] returns `false`
+    /// while not visible. Returns `&mut self` so a consumer can chain it from a
+    /// visibility/focus message handler.
+    pub fn set_visible(&mut self, visible: bool) -> &mut Self {
+        self.visible = visible;
+        self
+    }
+
+    /// MOTION-INFRA-3 — is the surface currently considered on-screen?
+    #[must_use]
+    pub const fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    /// MOTION-INFRA-3 — **the** tick predicate a `subscription()` gates on: an
+    /// animation tick is needed only when something is in flight **and** the
+    /// surface is visible. At rest, or while hidden/closed, this is `false`, so
+    /// the per-frame clock is never armed (MOTION-PERF-1: zero idle/offscreen
+    /// wakeups). Equivalent to `self.is_visible() && !self.is_idle(now)`.
+    #[must_use]
+    pub fn needs_tick(&self, now: Instant) -> bool {
+        self.visible && !self.is_idle(now)
+    }
+
+    /// MOTION-INFRA-3 — is per-frame debug instrumentation armed
+    /// (`MDE_FRAME_DEBUG` was set at construction)? Lets a consumer skip building
+    /// a log line entirely when off.
+    #[must_use]
+    pub const fn frame_debug_enabled(&self) -> bool {
+        self.frame_timer.is_enabled()
+    }
+
+    /// MOTION-INFRA-3 — record one animation frame at `now` for the optional
+    /// `MDE_FRAME_DEBUG` instrumentation, returning the inter-frame
+    /// [`FrameSample`] (per-frame milliseconds) when the gate is armed and a
+    /// prior frame exists to diff against. When the flag is unset this is the
+    /// zero-cost path: a single discriminant check returning `None`, with no
+    /// clock read and no allocation. Call once per tick alongside [`Animator::gc`].
+    pub fn frame_tick(&mut self, now: Instant) -> Option<FrameSample> {
+        self.frame_timer.tick_at(now)
+    }
+}
+
+// ── MOTION-INFRA-2 — reusable enter/exit/crossfade/hover helpers ──────────────
+//
+// One-call, token-driven, reduce-motion-aware bridges from "a panel mounted at
+// `start`, it's now `now`" to the concrete [`RenderParams`] a themed widget
+// applies (alpha / translate_y / scale). They are pure glue over the existing
+// primitives — a [`Motion`] preset for the duration+easing, [`Tween::resolved`]
+// for the reduce-motion duration cap, [`ease`] for the curve, and a
+// [`Transition`] for the property mapping — so a panel never hand-rolls timing
+// or re-implements the reduce-motion contract.
+//
+// The reduce-motion contract (Q32, mirrors [`Motion::resolved`]): every transform
+// that would *move* a surface (slide, hover-lift) collapses to a pure opacity
+// crossfade with NO translate/scale — motion is never the only cue and there is
+// no positional thrash — and the ≤80 ms linear cap from [`Tween::resolved`]
+// applies, so the static/final frame is reached almost immediately.
+
+/// MOTION-INFRA-2 — opacity-only enter; returns the [`RenderParams`] at `now`.
+///
+/// The surface fades 0→1 over the [`Motion::panel_mount`] duration (Carbon
+/// `moderate-02`, 240 ms; ≤80 ms under reduce-motion). No transform, so it's
+/// identical with or without reduce-motion — a fade is already the
+/// reduce-motion-safe primitive every other helper collapses to.
+#[must_use]
+pub fn fade_in(start: Instant, now: Instant, reduce_motion: bool) -> RenderParams {
+    let motion = Motion::panel_mount();
+    let tw = Tween::resolved(start, motion.duration, reduce_motion);
+    let t = ease(tw.progress(now), motion_easing(motion, reduce_motion));
+    Transition::FadeIn.params(t)
+}
+
+/// MOTION-INFRA-2 — fade-and-rise enter; returns the [`RenderParams`] at `now`.
+///
+/// The surface fades 0→1 while sliding up from `distance` px below to rest, over
+/// the [`Motion::panel_mount`] duration. **Under reduce-motion the slide is
+/// dropped** — it collapses to a pure [`fade_in`] crossfade (no `translate_y`, so
+/// zero layout reflow / positional motion). `distance` defaults sensibly to
+/// [`PANEL_MOUNT_TRANSLATE_Y_PX`] at the call site.
+#[must_use]
+pub fn slide_in(start: Instant, now: Instant, distance: f32, reduce_motion: bool) -> RenderParams {
+    if reduce_motion {
+        // Collapse the transform to a crossfade — opacity only, no movement.
+        return fade_in(start, now, true);
+    }
+    let motion = Motion::panel_mount();
+    let tw = Tween::resolved(start, motion.duration, false);
+    let t = ease(tw.progress(now), motion.easing);
+    Transition::SlideUp(distance).params(t)
+}
+
+/// MOTION-INFRA-2 — crossfade two surfaces; returns `(outgoing, incoming)`.
+///
+/// Both share the same `start`: the outgoing fades 1→0 and the incoming 0→1 over
+/// the same [`Motion::dialog_mount`] duration (so a swap reads as one motion).
+/// Both are opacity-only — the reduce-motion-safe primitive — so the ≤80 ms cap
+/// is the only change under reduce-motion. This is the helper every other
+/// transform collapses to under reduce-motion.
+#[must_use]
+pub fn crossfade(
+    start: Instant,
+    now: Instant,
+    reduce_motion: bool,
+) -> (RenderParams, RenderParams) {
+    let motion = Motion::dialog_mount();
+    let tw = Tween::resolved(start, motion.duration, reduce_motion);
+    let t = ease(tw.progress(now), motion_easing(motion, reduce_motion));
+    (Transition::FadeOut.params(t), Transition::FadeIn.params(t))
+}
+
+/// MOTION-INFRA-2 — hover lift; returns the [`RenderParams`] for `now`.
+///
+/// As `hovered` toggles, the surface rises `rise` px (negative `translate_y`) over
+/// the [`Motion::hover`] duration (Carbon `fast-01`, 70 ms). `start` is when the
+/// hover state last changed; `hovered` is the *target* (rising on enter, settling
+/// back on leave). **Under reduce-motion the lift is dropped** — the surface stays
+/// at rest with no transform (hover is conveyed by color/elevation tokens, not
+/// motion).
+#[must_use]
+pub fn lift_on_hover(
+    start: Instant,
+    now: Instant,
+    rise: f32,
+    hovered: bool,
+    reduce_motion: bool,
+) -> RenderParams {
+    let rest = RenderParams {
+        alpha: 1.0,
+        translate_y: 0.0,
+        scale: 1.0,
+    };
+    if reduce_motion {
+        // No positional motion under reduce-motion — stay at rest.
+        return rest;
+    }
+    let motion = Motion::hover();
+    let tw = Tween::resolved(start, motion.duration, false);
+    let t = ease(tw.progress(now), motion.easing);
+    // `hovered` drives the direction. On enter the offset runs rest → -rise as the
+    // tween progresses; on leave it runs -rise → rest (the same tween, reversed).
+    let translate_y = if hovered {
+        lerp_f32(0.0, -rise, t)
+    } else {
+        lerp_f32(-rise, 0.0, t)
+    };
+    RenderParams {
+        translate_y,
+        ..rest
+    }
+}
+
+/// MOTION-INFRA-2 — the easing a helper should use given `reduce_motion`. Mirrors
+/// [`Motion::resolved`], which forces a linear crossfade under reduce-motion; full
+/// motion keeps the preset's curve.
+const fn motion_easing(motion: Motion, reduce_motion: bool) -> Easing {
+    if reduce_motion {
+        Easing::Linear
+    } else {
+        motion.easing
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::motion::PULSE_MAX_SCALE;
+    use crate::motion::{PANEL_MOUNT_TRANSLATE_Y_PX, PULSE_MAX_SCALE};
 
     #[test]
     fn transition_params_map_progress_correctly() {
@@ -374,6 +619,111 @@ mod tests {
         let mut a = Animator::new();
         a.start("x", t0, Motion::loading(), true); // capped to 80 ms
         assert!(a.is_idle(t0 + Duration::from_millis(80)));
+    }
+
+    #[test]
+    fn animator_needs_no_tick_at_rest() {
+        // MOTION-INFRA-3 — the core idle-hardening contract: with nothing in
+        // flight the animator reports "no ticks needed", so the subscription
+        // never arms a per-frame clock (MOTION-PERF-1: zero idle wakeups).
+        let t0 = Instant::now();
+        let a = Animator::new();
+        assert!(a.is_idle(t0), "empty animator is idle");
+        assert!(a.is_visible(), "a fresh animator is visible by default");
+        assert!(
+            !a.needs_tick(t0),
+            "at rest (no tween) ⇒ no tick needed even while visible"
+        );
+    }
+
+    #[test]
+    fn animator_needs_tick_only_while_in_flight_and_visible() {
+        // MOTION-INFRA-3 — needs_tick == (visible AND in-flight). A tick arms
+        // only when both hold; it stops the instant either drops out.
+        let t0 = Instant::now();
+        let mut a = Animator::new();
+        a.start("fade", t0, Motion::panel_mount(), false); // 240 ms
+        assert!(a.needs_tick(t0), "visible + in-flight ⇒ tick needed");
+        // Once the tween settles, the tick stops even though still visible.
+        let done = t0 + Duration::from_millis(300);
+        assert!(a.is_idle(done));
+        assert!(
+            !a.needs_tick(done),
+            "settled ⇒ no tick needed (visible but idle)"
+        );
+    }
+
+    #[test]
+    fn hidden_surface_arms_no_tick_even_mid_animation() {
+        // MOTION-INFRA-3 — a hidden/closed popup animates nothing: with an
+        // in-flight tween but the surface marked not-visible, needs_tick is
+        // false, so a collapsed popup / closed window arms zero animation ticks.
+        let t0 = Instant::now();
+        let mut a = Animator::new();
+        a.start("open", t0, Motion::panel_mount(), false); // in flight
+        assert!(
+            !a.is_idle(t0),
+            "tween is in flight (idle-state is independent of visibility)"
+        );
+        assert!(a.needs_tick(t0), "visible + in-flight ⇒ tick needed");
+        // Hide the surface: the in-flight tween is unchanged but no tick arms.
+        a.set_visible(false);
+        assert!(!a.is_visible());
+        assert!(
+            !a.needs_tick(t0),
+            "hidden surface ⇒ zero ticks even mid-animation"
+        );
+        assert!(
+            !a.is_idle(t0),
+            "hiding does not retroactively complete the tween"
+        );
+        // Re-showing it resumes ticking while still in flight.
+        a.set_visible(true);
+        assert!(
+            a.needs_tick(t0),
+            "re-shown + still in-flight ⇒ tick resumes"
+        );
+    }
+
+    #[test]
+    fn frame_debug_flag_default_off_is_zero_cost() {
+        // MOTION-INFRA-3 — the MDE_FRAME_DEBUG gate is read once at construction
+        // and OFF by default: frame_tick yields no samples and reads no clock.
+        let t0 = Instant::now();
+        let mut a = Animator::with_frame_debug(false);
+        assert!(
+            !a.frame_debug_enabled(),
+            "debug must be OFF unless explicitly armed"
+        );
+        for i in 0..5 {
+            assert_eq!(
+                a.frame_tick(t0 + Duration::from_millis(i * 16)),
+                None,
+                "OFF frame_tick yields nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_debug_flag_when_armed_reports_per_frame_ms() {
+        // MOTION-INFRA-3 — armed, frame_tick reports the per-frame interval so a
+        // developer can log per-frame milliseconds. The flag is gated (only the
+        // armed animator samples) — proving it's an opt-in switch, not always-on.
+        let t0 = Instant::now();
+        let mut a = Animator::with_frame_debug(true);
+        assert!(a.frame_debug_enabled(), "explicitly armed");
+        // First frame: counted, but no predecessor to diff against.
+        assert_eq!(a.frame_tick(t0), None, "first frame has no interval");
+        // Second frame, 16 ms later → a sample carrying the per-frame ms.
+        let s = a
+            .frame_tick(t0 + Duration::from_millis(16))
+            .expect("armed timer yields a sample after the first frame");
+        assert_eq!(s.surface, "animator");
+        assert_eq!(s.interval, Duration::from_millis(16));
+        assert!(
+            (s.interval.as_secs_f64() * 1000.0 - 16.0).abs() < 1e-6,
+            "interval is the per-frame milliseconds"
+        );
     }
 
     #[test]
@@ -574,5 +924,136 @@ mod tests {
             cap_ms, 180,
             "reduce_motion=false must preserve standard duration"
         );
+    }
+
+    #[test]
+    fn shimmer_alpha_oscillates_with_motion_and_is_static_under_reduce_motion() {
+        // MOTION-NET-2: with motion ON the skeleton breathes between the dim and
+        // bright bounds across a phase cycle.
+        let lo = shimmer_alpha(0.0, false);
+        let mid = shimmer_alpha(0.5, false);
+        let hi_again = shimmer_alpha(1.0, false);
+        assert!((lo - SKELETON_ALPHA_DIM).abs() < 1e-3, "phase 0 = dim");
+        assert!(
+            (mid - SKELETON_ALPHA_BRIGHT).abs() < 1e-3,
+            "phase 0.5 = bright"
+        );
+        assert!(
+            (hi_again - SKELETON_ALPHA_DIM).abs() < 1e-3,
+            "phase 1 back to dim (ping-pong)"
+        );
+        // Every motion-on alpha stays within the bounds.
+        for i in 0..=10 {
+            let a = shimmer_alpha(i as f32 / 10.0, false);
+            assert!((SKELETON_ALPHA_DIM..=SKELETON_ALPHA_BRIGHT).contains(&a));
+        }
+        // reduce-motion → STATIC mid grey regardless of phase (the a11y contract).
+        let r0 = shimmer_alpha(0.0, true);
+        let r5 = shimmer_alpha(0.5, true);
+        assert_eq!(r0, r5, "reduce-motion alpha is phase-independent");
+        assert!((r0 - (SKELETON_ALPHA_DIM + SKELETON_ALPHA_BRIGHT) / 2.0).abs() < 1e-6);
+    }
+
+    // ── MOTION-INFRA-2 — fade_in / slide_in / crossfade / lift_on_hover ────────
+
+    #[test]
+    fn fade_in_runs_zero_to_one_over_panel_mount_duration() {
+        let t0 = Instant::now();
+        let full = Motion::panel_mount().duration; // 240 ms
+        assert!(fade_in(t0, t0, false).alpha < 1e-4, "starts transparent");
+        let end = fade_in(t0, t0 + full, false);
+        assert!((end.alpha - 1.0).abs() < 1e-4, "ends opaque");
+        // A fade never moves or scales the surface.
+        assert_eq!(end.translate_y, 0.0);
+        assert_eq!(end.scale, 1.0);
+    }
+
+    #[test]
+    fn fade_in_reduce_motion_caps_at_80ms() {
+        let t0 = Instant::now();
+        let cap = Duration::from_millis(crate::motion::REDUCE_MOTION_CAP_MS);
+        // At the 80 ms cap the fade is already complete under reduce-motion.
+        assert!((fade_in(t0, t0 + cap, true).alpha - 1.0).abs() < 1e-4);
+        // Past the panel_mount duration it is obviously done either way.
+        assert!((fade_in(t0, t0 + Motion::panel_mount().duration, true).alpha - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn slide_in_rises_and_fades_with_motion_on() {
+        let t0 = Instant::now();
+        let dist = PANEL_MOUNT_TRANSLATE_Y_PX;
+        let s0 = slide_in(t0, t0, dist, false);
+        assert_eq!(s0.translate_y, dist, "starts `distance` px below");
+        assert!(s0.alpha < 1e-4, "starts transparent");
+        let s1 = slide_in(t0, t0 + Motion::panel_mount().duration, dist, false);
+        assert!((s1.translate_y).abs() < 1e-4, "rests at 0");
+        assert!((s1.alpha - 1.0).abs() < 1e-4, "ends opaque");
+    }
+
+    #[test]
+    fn slide_in_collapses_to_crossfade_under_reduce_motion() {
+        // Reduce-motion drops the slide → no positional motion (zero translate_y)
+        // at every sampled frame; only opacity changes (== fade_in).
+        let t0 = Instant::now();
+        let dist = 12.0;
+        for ms in [0, 20, 40, 80, 240] {
+            let now = t0 + Duration::from_millis(ms);
+            let r = slide_in(t0, now, dist, true);
+            assert_eq!(r.translate_y, 0.0, "no slide under reduce-motion at {ms}ms");
+            assert_eq!(r.scale, 1.0);
+            // Identical to the pure fade path.
+            assert!((r.alpha - fade_in(t0, now, true).alpha).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn crossfade_is_complementary_and_opacity_only() {
+        let t0 = Instant::now();
+        let dur = Motion::dialog_mount().duration;
+        // Start: outgoing fully visible, incoming hidden.
+        let (out0, in0) = crossfade(t0, t0, false);
+        assert!((out0.alpha - 1.0).abs() < 1e-4);
+        assert!(in0.alpha < 1e-4);
+        // Mid: the two alphas sum to ~1 (a true crossfade, no flicker/black).
+        let (outm, inm) = crossfade(t0, t0 + dur / 2, false);
+        assert!(
+            (outm.alpha + inm.alpha - 1.0).abs() < 1e-3,
+            "alphas sum to 1"
+        );
+        // End: outgoing gone, incoming full.
+        let (out1, in1) = crossfade(t0, t0 + dur, false);
+        assert!(out1.alpha < 1e-4);
+        assert!((in1.alpha - 1.0).abs() < 1e-4);
+        // Never any transform on either side.
+        assert_eq!(out0.translate_y, 0.0);
+        assert_eq!(in0.scale, 1.0);
+    }
+
+    #[test]
+    fn lift_on_hover_rises_then_settles_and_is_static_under_reduce_motion() {
+        let t0 = Instant::now();
+        let rise = 6.0;
+        let dur = Motion::hover().duration; // 70 ms
+                                            // Enter: at rest at t=0, lifted by -rise at the end.
+        assert!(lift_on_hover(t0, t0, rise, true, false).translate_y.abs() < 1e-4);
+        let lifted = lift_on_hover(t0, t0 + dur, rise, true, false);
+        assert!((lifted.translate_y + rise).abs() < 1e-4, "lifts to -rise");
+        // Leave: starts at the lifted offset, returns to rest.
+        let leaving0 = lift_on_hover(t0, t0, rise, false, false);
+        assert!(
+            (leaving0.translate_y + rise).abs() < 1e-4,
+            "leave starts lifted"
+        );
+        let settled = lift_on_hover(t0, t0 + dur, rise, false, false);
+        assert!(settled.translate_y.abs() < 1e-4, "leave settles to rest");
+        // Reduce-motion: never any vertical motion, regardless of hovered/time.
+        for hovered in [true, false] {
+            for ms in [0, 35, 70, 200] {
+                let r = lift_on_hover(t0, t0 + Duration::from_millis(ms), rise, hovered, true);
+                assert_eq!(r.translate_y, 0.0, "no lift under reduce-motion");
+                assert_eq!(r.alpha, 1.0);
+                assert_eq!(r.scale, 1.0);
+            }
+        }
     }
 }

@@ -28,8 +28,19 @@
 // single source of truth (local XDG+flatpak, mesh peers, workloads, services).
 pub mod apps;
 pub mod bus_bridge;
+// CLIP-SYNC-1 — action/clipboard/* responder (list/pin/unpin/delete/clear)
+// for the mesh-global clipboard history the clipboard_sync worker maintains.
+pub mod clipboard;
 // CONNECT-1 — action/connect/* exposure-policy responder.
 pub mod connect;
+// DATACENTER (action layer) — action/dc/vm-power Xen VM power control responder.
+pub mod datacenter;
+// DATACENTER-16 (action layer) — action/dc/wol Wake-on-LAN power-orchestration
+// primitive (broadcasts the magic packet to wake a machine).
+pub mod dc_power;
+// DATACENTER-10 (action layer) — action/dc/host-power Xen host (dom0)
+// maintenance + reboot control responder.
+pub mod host_ops;
 // DDNS-EGRESS-3 — action/ddns/* config responder.
 pub mod ddns;
 pub mod directory;
@@ -53,6 +64,8 @@ pub mod nebula;
 // name + `/org/mackes/Session` path were removed with it.
 pub mod settings;
 pub mod shell;
+// DC-15 (action layer) — action/dc/tofu-plan read-only OpenTofu plan responder.
+pub mod tofu;
 pub mod voip;
 
 /// EFF-23 — maximum inbound RPC body size a Bus responder will hand to

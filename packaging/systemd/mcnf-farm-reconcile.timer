@@ -1,0 +1,12 @@
+# Drives mcnf-farm-reconcile.service — converge the worklist's @farm jobs onto the
+# farm every 15 min (and shortly after boot). Idempotent, so quiet when nothing changed.
+[Unit]
+Description=MCNF build-farm reconciler timer
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
