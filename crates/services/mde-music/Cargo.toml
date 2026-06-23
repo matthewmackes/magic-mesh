@@ -33,9 +33,11 @@ mde-musicd = { path = "../mde-musicd" }
 # (action/music/<verb> → reply) per the Q96 Bus-canonical lock.
 mde-bus    = { path = "../../platform/mde-bus" }
 # E5.3 — single-source colors from the canonical design palette (the Q2
-# indigo accent + semantic tokens) instead of hardcoded hex; the `iced`
-# feature enables `Rgba::into_iced_color()` for the app theme.
-mde-theme  = { path = "../../shared/mde-theme" }
+# indigo accent + semantic tokens) instead of hardcoded hex; the `carbon`
+# helper converts an `Rgba` to the fork's Color locally.
+# MUSIC-DOCK-2 — the `serde` feature exposes `mde_theme::Preferences::load()`
+# (reduce-motion) + the `animation`/`motion` tween math driving the slide-up.
+mde-theme  = { path = "../../shared/mde-theme", features = ["serde"] }
 # AIR-10.b — parse the daemon's JSON Bus replies into display rows.
 serde_json = "1"
 # AIR-11.b — derive (de)serialize for the persisted MusicPrefs (sort).
