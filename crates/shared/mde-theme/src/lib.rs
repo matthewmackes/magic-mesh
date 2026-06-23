@@ -43,6 +43,7 @@ pub mod carbon;
 pub mod color;
 pub mod components;
 pub mod density;
+pub mod feedback;
 pub mod frame_timer;
 // AUD2-3 (2026-06-12): `elevation` removed — the Q29/Q30 per-tier
 // radius+shadow bundles targeted the deleted shell's OSD/greeter/menu
@@ -78,6 +79,10 @@ pub use components::{
     CARD_SHADOW_PRESSED_BLUR, CARD_SHADOW_PRESSED_OFFSET_Y, CARD_SUBTITLE_SIZE, CARD_TITLE_SIZE,
 };
 pub use density::Density;
+pub use feedback::{
+    ControlFeedback, FeedbackParams, FocusRing, FOCUS_RING_OFFSET_PX, FOCUS_RING_WIDTH_PX,
+    HOVER_LIFT_PX, PRESS_DEPTH,
+};
 pub use icons::{
     icon_for_device_type, mde_icon, FillMode, Icon, IconSize, IconState, ResolvedIcon,
     MATERIAL_LINE_WEIGHT_PX,
