@@ -15,6 +15,8 @@
 use std::collections::HashSet;
 
 mod motion;
+mod notify_clipboard;
+use notify_clipboard::ClipRow;
 
 use cosmic::iced::platform_specific::runtime::wayland::layer_surface::SctkLayerSurfaceSettings;
 use cosmic::iced::platform_specific::shell::commands::layer_surface::{
@@ -230,6 +232,11 @@ struct Center {
     /// NOTIFY-HUB-2 — collapsed same-source stacks the operator has expanded (by
     /// [`Stack::key`]); a stack not in here renders folded with its count badge.
     expanded_stacks: HashSet<String>,
+    /// CLIP-VIEW-1 — the mesh-global clipboard history (newest first), refreshed
+    /// each poll from `action/clipboard/list`. Empty until the first list reply /
+    /// when the daemon is down. Each row renders as text + source-node + age, is
+    /// click-to-copy onto THIS node, and carries per-entry pin + delete.
+    clips: Vec<ClipRow>,
 }
 
 impl Center {
@@ -250,6 +257,7 @@ impl Center {
             anim: HubAnim::new(reduce_motion),
             seen_ids: HashSet::new(),
             expanded_stacks: HashSet::new(),
+            clips: Vec::new(),
         }
     }
 
@@ -308,6 +316,17 @@ enum Message {
     /// LIGHTHOUSE-3/4 — a lighthouse card was pressed: open the Workbench
     /// Lighthouses tab focused on this lighthouse (by hostname).
     OpenLighthouse(String),
+    /// CLIP-VIEW-1 — load a clip row's text into THIS node's Wayland clipboard
+    /// (`wl-copy`). The carried text is the verbatim clip, not the preview.
+    ClipCopy(String),
+    /// CLIP-VIEW-1 — toggle an entry's pin mesh-wide (`action/clipboard/{pin,
+    /// unpin}`). Carries the entry id + its current pinned state.
+    ClipTogglePin(String, bool),
+    /// CLIP-VIEW-1 — drop one entry mesh-wide (`action/clipboard/delete`).
+    ClipDelete(String),
+    /// CLIP-VIEW-1 — clear every UNPINNED entry mesh-wide; pinned survive
+    /// (`action/clipboard/clear`).
+    ClipClearAll,
 }
 
 /// NOTIFY-AC — fetch the Now-Playing snapshot over the bus (best-effort, short
@@ -436,6 +455,55 @@ fn fetch_voice() -> Option<VoiceStatus> {
             .to_string(),
         fresh: now.saturating_sub(ts) <= 45,
     })
+}
+
+/// CLIP-VIEW-1 — list the mesh-global clipboard history over the Bus
+/// (`action/clipboard/list`, CLIP-SYNC-1). Best-effort with a short timeout;
+/// an empty Vec on no daemon / no reply / a decode failure so the section
+/// shows its honest empty state instead of stalling the poll.
+fn fetch_clips() -> Vec<ClipRow> {
+    use std::time::Duration;
+    match mde_workbench::dbus::action_request("action/clipboard/list", Duration::from_millis(700)) {
+        Some(reply) => notify_clipboard::parse_list_reply(&reply),
+        None => Vec::new(),
+    }
+}
+
+/// CLIP-VIEW-1 — fire one `action/clipboard/{verb}` mutation with `body` (an
+/// entry id, or `None` for `clear`) and return the freshly-listed history so
+/// the section reflects the mesh-wide edit immediately. The verbs hit the same
+/// shared `clipboard/history.json` the capture worker appends to, so the change
+/// is mesh-wide; we re-list rather than mutate `state.clips` locally so the
+/// rendered set always matches the authoritative shared document.
+fn clip_mutate(verb: &str, body: Option<&str>) -> Vec<ClipRow> {
+    use std::time::Duration;
+    let topic = format!("action/clipboard/{verb}");
+    let _ = mde_workbench::dbus::action_request_with_body(&topic, body, Duration::from_millis(700));
+    fetch_clips()
+}
+
+/// CLIP-VIEW-1 — load `text` onto THIS node's Wayland clipboard via `wl-copy`,
+/// piping over stdin (no shell-quoting hazard) and detaching. Best-effort: a
+/// host without `wl-clipboard` / no Wayland session simply no-ops. The capture
+/// worker's O2 debounce drops the resulting `wl-paste --watch` echo so a
+/// click-to-load never duplicates the entry it loaded. Mirrors the daemon's
+/// `kdc_host::apply_clipboard` idiom.
+fn load_into_clipboard(text: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let child = Command::new("wl-copy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else {
+        return; // wl-copy absent / no Wayland — skip cleanly.
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    // Don't block the update loop waiting on wl-copy; it exits promptly.
+    drop(child);
 }
 
 /// LIGHTHOUSE-3 — build the pinned-footer beacons from the replicated peer
@@ -572,6 +640,8 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
             // NOTIFY-AC — refresh the Music + Voice section snapshots.
             state.music = fetch_music();
             state.voice = fetch_voice();
+            // CLIP-VIEW-1 — refresh the mesh-global clipboard history.
+            state.clips = fetch_clips();
             // AC-5 — reflect the live DND state in the quick-toggle.
             if let Some(dir) = mde_bus::client_data_dir() {
                 state.dnd_active = mde_bus::dnd::load_default(&dir).active;
@@ -641,6 +711,24 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
             let _ = mde_workbench::dbus::action_request(verb, Duration::from_millis(700));
             // Reflect the new transport state immediately.
             state.music = fetch_music();
+        }
+        Message::ClipCopy(text) => {
+            // CLIP-VIEW-1 — load the entry onto THIS node's clipboard. No re-list:
+            // the capture worker re-syncs/debounces it, and the entry is already
+            // at/near the top of the shared history.
+            load_into_clipboard(&text);
+        }
+        Message::ClipTogglePin(id, pinned) => {
+            // Currently pinned → unpin; else pin. Re-list reflects the mesh edit.
+            let verb = if pinned { "unpin" } else { "pin" };
+            state.clips = clip_mutate(verb, Some(&id));
+        }
+        Message::ClipDelete(id) => {
+            state.clips = clip_mutate("delete", Some(&id));
+        }
+        Message::ClipClearAll => {
+            // Mesh-wide clear of unpinned entries; pinned survive everywhere.
+            state.clips = clip_mutate("clear", None);
         }
         Message::ToggleGroup(label) => {
             if !state.collapsed.remove(&label) {
@@ -882,6 +970,9 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
     let mut sections: Vec<Element<'_, Message>> = vec![
         container(scroll).height(Length::Fill).into(),
         section_divider(p),
+        // CLIP-VIEW-1 — Clipboard Viewer, locked above Music + SIP.
+        clipboard_section(&state.clips, now, p),
+        section_divider(p),
         now_playing_section(state.music.as_ref(), state.now_art.as_ref(), p),
         section_divider(p),
         voice_section(state.voice.as_ref(), p),
@@ -1057,6 +1148,134 @@ fn voice_section(voice: Option<&VoiceStatus>, p: Palette) -> Element<'static, Me
     )
     .padding(Padding::from([10u16, 14u16]))
     .width(Length::Fill)
+    .into()
+}
+
+/// CLIP-VIEW-1 — the Clipboard Viewer section: a header (clipboard glyph +
+/// "Clipboard" + a mesh-wide "Clear all" that wipes unpinned entries) over the
+/// mesh-global history rows. Each row is click-to-copy onto THIS node, with a
+/// per-entry pin (★ toggle, exempt from the 50-cap) + delete (✕). Capped to a
+/// handful of visible rows so the section stays compact in the Hub column; the
+/// full history lives in the shared file. Empty state is honest.
+///
+/// `now_ms` is the frame clock in milliseconds — the same epoch-ms clock the
+/// notifications list passes to [`format_age`], so the clipboard ages read off
+/// the same bucket ladder.
+fn clipboard_section(clips: &[ClipRow], now_ms: i64, p: Palette) -> Element<'static, Message> {
+    /// Rows shown inline in the Hub (the rest stay in the shared history).
+    const VISIBLE_ROWS: usize = 6;
+
+    let mut header = row![
+        text("\u{2398}") // ⎘ next-page / clipboard-ish glyph (BMP, not emoji)
+            .size(13)
+            .color(p.accent.into_cosmic_color()),
+        Space::new().width(Length::Fixed(8.0)),
+        text("Clipboard")
+            .size(13)
+            .color(p.text.into_cosmic_color())
+            .width(Length::Fill),
+    ]
+    .align_y(cosmic::iced::Alignment::Center);
+    // Clear-all only when there is at least one unpinned entry to wipe (pinned
+    // survive a clear, so an all-pinned history has nothing to clear).
+    if clips.iter().any(|c| !c.pinned) {
+        header = header.push(action_button("Clear all", Message::ClipClearAll, p));
+    }
+
+    let mut col = column![header].spacing(6);
+    if clips.is_empty() {
+        col = col.push(
+            text("Clipboard history is empty.")
+                .size(12)
+                .color(p.text_muted.into_cosmic_color()),
+        );
+    } else {
+        // Pinned first (they're the operator's kept clips), then the rest in
+        // the daemon's newest-first order; cap the inline view.
+        let mut ordered: Vec<&ClipRow> = clips.iter().filter(|c| c.pinned).collect();
+        ordered.extend(clips.iter().filter(|c| !c.pinned));
+        for (i, c) in ordered.iter().take(VISIBLE_ROWS).enumerate() {
+            col = col.push(clip_row(c, i, now_ms, p));
+        }
+        if ordered.len() > VISIBLE_ROWS {
+            col = col.push(
+                text(format!("+{} more in history", ordered.len() - VISIBLE_ROWS))
+                    .size(11)
+                    .color(p.text_muted.into_cosmic_color()),
+            );
+        }
+    }
+
+    container(col)
+        .padding(Padding::from([10u16, 14u16]))
+        .width(Length::Fill)
+        .into()
+}
+
+/// CLIP-VIEW-1 — one clipboard row: a click-to-copy body (single-line preview +
+/// "from <node> · <age>" sub-label) trailed by the pin + delete controls. Zebra
+/// shaded to match the notification rows' idiom.
+fn clip_row(c: &ClipRow, idx: usize, now_ms: i64, p: Palette) -> Element<'static, Message> {
+    let base = if idx % 2 == 1 { p.surface } else { p.background };
+    let preview = notify_clipboard::preview(&c.text, 44);
+    // Age off the SAME format_age ladder as the notifications list: parse the
+    // RFC3339 stamp → epoch-ms → format_age. An unparseable stamp falls back to
+    // the current instant (renders "0s") rather than a panic.
+    let then_ms = notify_clipboard::rfc3339_to_epoch(&c.time).map_or(now_ms, |s| s * 1000);
+    let meta = notify_clipboard::meta_label(&c.source, &format_age(then_ms, now_ms));
+
+    // The text + meta stack — the whole thing is a flat click-to-copy button so
+    // a click loads the verbatim clip onto this node (ClipCopy carries the full
+    // text, not the truncated preview).
+    let body = column![
+        text(preview).size(12).color(p.text.into_cosmic_color()),
+        text(meta)
+            .size(10)
+            .color(p.text_muted.into_cosmic_color()),
+    ]
+    .spacing(1)
+    .width(Length::Fill);
+    let copy = button(body)
+        .on_press(Message::ClipCopy(c.text.clone()))
+        .width(Length::Fill)
+        .padding(0)
+        .style(|_t, _s| cosmic::iced::widget::button::Style {
+            background: None,
+            ..Default::default()
+        });
+
+    // Pin toggle: filled ★ (accent) when pinned, hollow ☆ (muted) when not.
+    let (pin_glyph, pin_color) = if c.pinned {
+        ("\u{2605}", p.accent) // ★
+    } else {
+        ("\u{2606}", p.text_muted) // ☆
+    };
+    let pin_btn = button(text(pin_glyph).size(13).color(pin_color.into_cosmic_color()))
+        .padding(Padding::from([2u16, 6u16]))
+        .on_press(Message::ClipTogglePin(c.id.clone(), c.pinned))
+        .style(|_t, _s| cosmic::iced::widget::button::Style {
+            background: None,
+            ..Default::default()
+        });
+    let del_btn = button(text("\u{2715}").size(12).color(p.text_muted.into_cosmic_color())) // ✕
+        .padding(Padding::from([2u16, 6u16]))
+        .on_press(Message::ClipDelete(c.id.clone()))
+        .style(|_t, _s| cosmic::iced::widget::button::Style {
+            background: None,
+            ..Default::default()
+        });
+
+    container(
+        row![copy, pin_btn, del_btn]
+            .spacing(2)
+            .align_y(cosmic::iced::Alignment::Center),
+    )
+    .padding(Padding::from([5u16, 8u16]))
+    .width(Length::Fill)
+    .style(move |_| container::Style {
+        background: Some(cosmic::iced::Background::Color(base.into_cosmic_color())),
+        ..Default::default()
+    })
     .into()
 }
 
