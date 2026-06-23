@@ -37,6 +37,15 @@
 //!   * deletes the VM via `xe vm-uninstall uuid=<uuid> force=true`.
 //! Reply `{"ok":true}` on success, `{"error":"<message>"}` on failure.
 //!
+//! `vm-console` request body `{ "uuid", "dom0" }` (read-only):
+//!   * `uuid` is validated to be hex+`-` only (same injection guard);
+//!   * `dom0` MUST be in the configured allowed set before any SSH;
+//!   * reads the XAPI console object's `location` (the connection URL the noVNC
+//!     viewer uses) via `xe console-list vm-uuid=<uuid> params=location --minimal`.
+//! Reply `{"ok":true,"location":"<console URL>"}` on success; if the VM has no
+//! console (halted / not running) the trimmed output is empty →
+//! `{"error":"no console (vm not running?)"}`; `{"error":"<message>"}` on failure.
+//!
 //! `do-regions` request body ignored/empty (read-only):
 //!   * runs `doctl compute region list --context <ctx> -o json` locally, where
 //!     `<ctx>` is `MCNF_DOCTL_CONTEXT` (default `mackes`, the authed context);
@@ -73,11 +82,12 @@ impl DatacenterService {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 5] = [
+pub const ACTION_VERBS: [&str; 6] = [
     "vm-power",
     "vm-snapshot",
     "vm-clone",
     "vm-delete",
+    "vm-console",
     "do-regions",
 ];
 
@@ -211,6 +221,7 @@ pub fn build_reply(_svc: &DatacenterService, verb: &str, req_body: Option<&str>)
         "vm-snapshot" => vm_snapshot_reply(req_body),
         "vm-clone" => vm_clone_reply(req_body),
         "vm-delete" => vm_delete_reply(req_body),
+        "vm-console" => vm_console_reply(req_body),
         "do-regions" => do_regions_reply(),
         _ => err("unknown dc verb".into()),
     }
@@ -459,6 +470,90 @@ pub fn vm_uninstall_command(uuid: &str) -> Result<String, String> {
     Ok(format!("vm-uninstall uuid={uuid} force=true"))
 }
 
+/// Build the remote `xe` argument string for reading a VM's console location. PURE.
+///
+/// Validates `uuid` is non-empty and contains only `[0-9a-fA-F-]` — the same
+/// command-injection guard as [`vm_power_command`], since the result is
+/// interpolated into a remote shell `xe …` string. Returns
+/// `"console-list vm-uuid=<uuid> params=location --minimal"` — `--minimal` prints
+/// just the console object's `location` (the connection URL the noVNC viewer uses).
+///
+/// # Errors
+/// Returns `Err` for an empty `uuid`, or a `uuid` containing any character that is
+/// not an ASCII hex digit or `-`.
+pub fn vm_console_command(uuid: &str) -> Result<String, String> {
+    if uuid.is_empty() {
+        return Err("empty uuid".into());
+    }
+    if !uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err("uuid contains invalid characters".into());
+    }
+    Ok(format!(
+        "console-list vm-uuid={uuid} params=location --minimal"
+    ))
+}
+
+/// Handle a `vm-console` request body: parse, allow-list the dom0, then read the
+/// XAPI console `location` over SSH (read-only). On success the trimmed stdout is
+/// the connection URL; an empty result means the VM has no console (halted / not
+/// running), reported as `{"error":"no console (vm not running?)"}`.
+fn vm_console_reply(req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("vm-console: missing request body".into());
+    };
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return err(format!("vm-console: bad json: {e}")),
+    };
+    let uuid = req
+        .get("uuid")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let dom0 = req
+        .get("dom0")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+
+    // SECURITY: only act on a dom0 in the configured allowed set — never SSH an
+    // attacker-supplied host. Checked BEFORE building/running anything. Read-only,
+    // so there is no confirm gate, but we still SSH there → keep the allow-list.
+    if !crate::workers::datacenter_orchestrator::xen_dom0s()
+        .iter()
+        .any(|d| d == dom0)
+    {
+        return err("dom0 not in allowed set".into());
+    }
+
+    let cmd = match vm_console_command(uuid) {
+        Ok(c) => c,
+        Err(e) => return err(e),
+    };
+
+    let key = crate::workers::datacenter_orchestrator::xen_ssh_key();
+    let remote = format!("xe {cmd}");
+    match ssh_xe_status(&key, dom0, &remote) {
+        Ok(o) if o.status.success() => {
+            let location = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if location.is_empty() {
+                err("no console (vm not running?)".into())
+            } else {
+                json!({ "ok": true, "location": location }).to_string()
+            }
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let msg = stderr.trim();
+            if msg.is_empty() {
+                err("xe failed".into())
+            } else {
+                err(msg.to_string())
+            }
+        }
+        Err(e) => err(format!("ssh failed: {e}")),
+    }
+}
+
 /// Parse a `doctl compute region list -o json` array into `(slug, name, available)`
 /// triples. PURE.
 ///
@@ -582,11 +677,13 @@ mod tests {
         assert_eq!(action_topic("vm-snapshot"), "action/dc/vm-snapshot");
         assert_eq!(action_topic("vm-clone"), "action/dc/vm-clone");
         assert_eq!(action_topic("vm-delete"), "action/dc/vm-delete");
+        assert_eq!(action_topic("vm-console"), "action/dc/vm-console");
         assert_eq!(action_topic("do-regions"), "action/dc/do-regions");
         assert!(ACTION_VERBS.contains(&"vm-power"));
         assert!(ACTION_VERBS.contains(&"vm-snapshot"));
         assert!(ACTION_VERBS.contains(&"vm-clone"));
         assert!(ACTION_VERBS.contains(&"vm-delete"));
+        assert!(ACTION_VERBS.contains(&"vm-console"));
         assert!(ACTION_VERBS.contains(&"do-regions"));
     }
 
@@ -759,6 +856,51 @@ mod tests {
     }
 
     #[test]
+    fn vm_console_command_builds_location_query() {
+        let uuid = "abcd1234-5678-90ab-cdef-1234567890ab";
+        assert_eq!(
+            vm_console_command(uuid).unwrap(),
+            format!("console-list vm-uuid={uuid} params=location --minimal")
+        );
+        // a uuid shorter than 8 chars still works (hex+dash only)
+        assert_eq!(
+            vm_console_command("ab-12").unwrap(),
+            "console-list vm-uuid=ab-12 params=location --minimal"
+        );
+    }
+
+    #[test]
+    fn vm_console_command_rejects_injection_in_uuid() {
+        // empty
+        assert!(vm_console_command("").is_err());
+        // a `;` to chain a second command
+        assert!(vm_console_command("abcd;rm -rf /").is_err());
+        // a space (would split into extra args)
+        assert!(vm_console_command("abcd 1234").is_err());
+        // backtick / command substitution
+        assert!(vm_console_command("abcd`whoami`").is_err());
+        // non-hex letters
+        assert!(vm_console_command("ghij").is_err());
+        // a `=` that could inject an extra xe arg
+        assert!(vm_console_command("abcd=evil").is_err());
+    }
+
+    #[test]
+    fn vm_console_dom0_not_in_allowed_set_is_rejected() {
+        // Read-only, but still SSHes → the dom0 allow-list guard applies. With
+        // MCNF_XEN_DOM0S unset the allowed set is empty, so the dom0 is rejected
+        // before any SSH is attempted.
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        let body = json!({
+            "uuid": "abcd1234-5678-90ab-cdef-1234567890ab",
+            "dom0": "10.0.0.1"
+        })
+        .to_string();
+        let r = build_reply(&s, "vm-console", Some(&body));
+        assert!(r.contains("dom0 not in allowed set"), "{r}");
+    }
+
+    #[test]
     fn vm_delete_requires_confirm_true() {
         // The confirm gate is checked BEFORE the dom0 allow-list, so even with an
         // empty allowed set the missing/false confirm is what we observe.
@@ -829,6 +971,7 @@ mod tests {
         assert!(build_reply(&s, "vm-snapshot", None).contains("missing request body"));
         assert!(build_reply(&s, "vm-clone", None).contains("missing request body"));
         assert!(build_reply(&s, "vm-delete", None).contains("missing request body"));
+        assert!(build_reply(&s, "vm-console", None).contains("missing request body"));
     }
 
     #[test]
