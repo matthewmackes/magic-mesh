@@ -9,7 +9,7 @@
 //! workload / service launch lands in APPS-5/6/7.
 
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cosmic::app::{Core, Task};
 use cosmic::iced::window::Id;
@@ -21,7 +21,10 @@ use mde_bus::hooks::config::Priority;
 use mde_cosmic_applet::{
     filter_entries, parse_entries, workload_argv, Entry, LauncherTab, WorkloadAction,
 };
-use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, Preferences, Rgba, TypeRole};
+use mde_theme::animation::{Animator, Transition};
+use mde_theme::{
+    mde_icon, Easing, FontSize, Icon, IconSize, Motion, Palette, Preferences, Rgba, TypeRole,
+};
 
 const ID: &str = "com.mackes.MagicMeshApps";
 
@@ -147,13 +150,39 @@ const FAVORITES_COLUMNS: usize = 3;
 /// Max favorites shown in the grid (3×3).
 const FAVORITES_MAX: usize = 9;
 
-/// APPS-STYLE — resolve the active palette from the user's MDE theme preference
-/// (`~/.config/mde/preferences.toml`), so the launcher honors **both dark and
-/// light** themes (Carbon Gray 100 / Gray 90 / Gray 10) instead of a hardcoded
-/// dark palette. Cheap file read; called at init + on each open.
-fn resolve_palette() -> Palette {
-    Palette::for_theme(Preferences::load().theme)
+/// APPS-FX-1 — animation tick period while motion is in flight (~60 fps). The
+/// applet only ticks at this rate while the [`Animator`] has a live tween;
+/// otherwise it falls back to the idle toggle poll (no busy loop — §7).
+const ANIM_TICK_MS: u64 = 16;
+
+/// APPS-FX-1 — the [`Animator`] key for the dropdown's open fade/scale-in.
+const ANIM_MENU: &str = "menu";
+/// APPS-FX-1 — the [`Animator`] key for the tab-switch crossfade (the result body
+/// fades back in when the active tab changes).
+const ANIM_TAB: &str = "tab";
+/// APPS-FX-1 — prefix for a per-tile hover tween key (`hover:<surface>:<entry id>`).
+const ANIM_HOVER_PREFIX: &str = "hover:";
+
+/// APPS-FX-1 — the hover-lift rise (px). A tasteful Carbon micro-interaction:
+/// the tile rises a hair on hover. Component dimension (not density-scaled), in
+/// the same spirit as the shared `PANEL_MOUNT_TRANSLATE_Y_PX` token.
+const TILE_HOVER_RISE_PX: f32 = 3.0;
+
+/// APPS-FX-1 — the open animation's slide-up distance (px): the dropdown body
+/// rises this far as it fades in. Mirrors the shared panel-mount translate token.
+const MENU_SLIDE_PX: f32 = mde_theme::PANEL_MOUNT_TRANSLATE_Y_PX;
+
+/// APPS-FX-1 — the [`Animator`] key for one hovered element, namespaced by its
+/// `surface` (`"tile"` for the Favorites grid, `"row"` for the result list) so
+/// the same entry id appearing as both a favorite tile and a list row drives two
+/// independent tweens (no cross-talk).
+fn hover_key(surface: &str, id: &str) -> String {
+    format!("{ANIM_HOVER_PREFIX}{surface}:{id}")
 }
+
+/// APPS-FX-1 — hover surface discriminators (see [`hover_key`]).
+const HOVER_TILE: &str = "tile";
+const HOVER_ROW: &str = "row";
 
 /// APPS-WIDE — the Carbon icon (`mde_theme` icon set) for a Favorites tile,
 /// chosen by entry kind. Plain apps get the generic Apps glyph; mesh-apps /
@@ -212,6 +241,28 @@ struct AppsApplet {
     /// newer ULID seen by the poll subscription flips the dropdown (so a baked
     /// Super shortcut running `--toggle` opens/closes the launcher).
     last_toggle_ulid: Option<String>,
+    /// APPS-FX-1 — the shared animation registry (one clock drives every in-flight
+    /// tween: menu open-in, tab crossfade, per-tile hover lift). Tick-driven only
+    /// while non-idle, so there's no idle CPU cost (§7 / MOTION-PERF-1).
+    anim: Animator,
+    /// APPS-FX-1 — the [`hover_key`] of the element currently hovered (its tween
+    /// rises 0→1), or `None`. Set from `mouse_area` enter/exit events. The key is
+    /// surface-namespaced so a favorite tile and a list row never collide.
+    hovered: Option<String>,
+    /// APPS-FX-1 — the [`hover_key`] of the element that just lost hover, so it can
+    /// ease *down* (1→0) over the same tween instead of snapping. Cleared when the
+    /// tween settles. Only the most-recently-exited element eases down (you hover
+    /// one at a time), others are already at rest.
+    releasing: Option<String>,
+    /// APPS-FX-1 — `a11y.reduce_motion` resolved from the user's preferences
+    /// (refreshed with the palette on open); tweens collapse to the ≤80 ms Carbon
+    /// crossfade when set (the reduce-motion contract).
+    reduce_motion: bool,
+    /// APPS-FX-1 — the global motion controls (kill switch + speed scale,
+    /// MOTION-CORE-3). Every tween's duration is resolved through
+    /// [`mde_theme::prefs::MotionPrefs::apply`] so a disabled/scaled preference is
+    /// honored; refreshed with the palette on open.
+    motion: mde_theme::prefs::MotionPrefs,
 }
 
 #[derive(Clone, Debug)]
@@ -271,6 +322,15 @@ enum Message {
     RunSubmit,
     /// Re-fetch the entry list.
     Refresh,
+    /// APPS-FX-1 — one animation frame: advance/GC the [`Animator`]. Emitted by
+    /// the tick subscription only while a tween is in flight.
+    AnimTick,
+    /// APPS-FX-1 — an element gained pointer hover (start its lift/highlight),
+    /// carrying its surface-namespaced [`hover_key`].
+    HoverEnter(String),
+    /// APPS-FX-1 — an element lost pointer hover (settle its lift/highlight back),
+    /// carrying its [`hover_key`].
+    HoverExit(String),
 }
 
 /// APPS-STYLE-2 — the footer power-menu actions.
@@ -516,6 +576,19 @@ fn carbon(c: Rgba) -> cosmic::iced::Color {
     }
 }
 
+/// APPS-FX-1 — blend two Carbon token colors by `t` (0 = `a`, 1 = `b`), clamped.
+/// Used to ease a row's background toward the raised highlight on hover (a
+/// subtle, jank-free accent — no layout shift). Channel-wise `lerp_f32`.
+fn carbon_mix(a: Rgba, b: Rgba, t: f32) -> cosmic::iced::Color {
+    let (ca, cb) = (carbon(a), carbon(b));
+    cosmic::iced::Color {
+        r: mde_theme::lerp_f32(ca.r, cb.r, t),
+        g: mde_theme::lerp_f32(ca.g, cb.g, t),
+        b: mde_theme::lerp_f32(ca.b, cb.b, t),
+        a: mde_theme::lerp_f32(ca.a, cb.a, t),
+    }
+}
+
 fn main() -> cosmic::iced::Result {
     // APPS-9b — `mde-apps-applet --toggle` publishes one toggle signal to the bus
     // and exits (what a baked Super shortcut runs). The long-running panel applet
@@ -546,6 +619,8 @@ impl Application for AppsApplet {
 
     fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Message>) {
         let (menu_w, menu_h) = detect_menu_size();
+        let prefs = Preferences::load();
+        let reduce_motion = prefs.a11y.reduce_motion;
         (
             AppsApplet {
                 core,
@@ -562,12 +637,18 @@ impl Application for AppsApplet {
                 run_open: false,
                 run_text: String::new(),
                 error: None,
-                palette: resolve_palette(),
+                palette: Palette::for_theme(prefs.theme),
                 menu_w,
                 menu_h,
                 // APPS-9b — baseline the toggle head so a stale pre-launch signal
                 // doesn't auto-open the launcher at login.
                 last_toggle_ulid: latest_toggle_ulid(),
+                // APPS-FX-1 — motion state (idle until an open/hover/tab event).
+                anim: Animator::new(),
+                hovered: None,
+                releasing: None,
+                reduce_motion,
+                motion: prefs.motion,
             },
             // Prime the list so the first open is instant.
             load_task(),
@@ -580,8 +661,21 @@ impl Application for AppsApplet {
 
     fn subscription(&self) -> Subscription<Message> {
         // APPS-9b — watch the bus for a Super-shortcut toggle signal.
-        cosmic::iced::time::every(Duration::from_millis(TOGGLE_POLL_MS))
-            .map(|_| Message::PollToggleSignal)
+        let toggle = cosmic::iced::time::every(Duration::from_millis(TOGGLE_POLL_MS))
+            .map(|_| Message::PollToggleSignal);
+        // APPS-FX-1 — a ~60 fps animation clock, but **only while a tween is in
+        // flight** (open-in / tab crossfade / hover lift). At rest the animator is
+        // idle and this subscription isn't created, so there's no idle CPU cost
+        // (§7 / MOTION-PERF-1) — motion is strictly event/tick-driven.
+        if self.anim.is_idle(Instant::now()) {
+            toggle
+        } else {
+            Subscription::batch([
+                toggle,
+                cosmic::iced::time::every(Duration::from_millis(ANIM_TICK_MS))
+                    .map(|_| Message::AnimTick),
+            ])
+        }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -595,6 +689,10 @@ impl Application for AppsApplet {
                 if self.popup.as_ref() == Some(&id) {
                     self.popup = None;
                     self.rclick_open = false;
+                    // APPS-FX-1 — the popup's surfaces are gone, so no `on_exit`
+                    // will arrive for a tile that was hovered at close; clear the
+                    // hover state so it doesn't render pre-lifted on the next open.
+                    self.reset_hover();
                 }
             }
             Message::PollToggleSignal => {
@@ -615,8 +713,14 @@ impl Application for AppsApplet {
                 }
                 // Left-click → the launcher (not the right-click power menu).
                 self.rclick_open = false;
-                // Refresh the palette so a theme switch reflects on open.
-                self.palette = resolve_palette();
+                // APPS-FX-1 — start from a clean hover slate (a prior close may
+                // have skipped `on_exit`), refresh the motion prefs, then start the
+                // open-in tween so the dropdown slides up as it appears. A pref
+                // change (e.g. reduce-motion toggled) is picked up here, same as
+                // the palette refresh below.
+                self.reset_hover();
+                self.apply_prefs();
+                self.start_anim(ANIM_MENU, Motion::panel_mount());
                 // APPS-FIT — re-detect the desktop size on open so a resolution
                 // change is picked up without a re-login.
                 let (mw, mh) = detect_menu_size();
@@ -668,7 +772,11 @@ impl Application for AppsApplet {
                 }
                 self.rclick_open = true;
                 self.power_open = false;
-                self.palette = resolve_palette();
+                // APPS-FX-1 — refresh prefs (one read) + a clean hover slate, then
+                // the power menu slides in like the launcher.
+                self.reset_hover();
+                self.apply_prefs();
+                self.start_anim(ANIM_MENU, Motion::panel_mount());
                 return cosmic::task::message(cosmic::Action::Cosmic(
                     cosmic::app::Action::Surface(app_popup::<AppsApplet>(
                         move |state: &mut AppsApplet| {
@@ -776,6 +884,11 @@ impl Application for AppsApplet {
                 self.error = Some(e);
             }
             Message::SetTab(t) => {
+                // APPS-FX-1 — crossfade the result body when the tab actually
+                // changes (re-tapping the active tab is a no-op, no flicker).
+                if self.tab != t {
+                    self.start_anim(ANIM_TAB, Motion::tooltip_fade());
+                }
                 self.tab = t;
                 self.query.clear();
             }
@@ -863,6 +976,37 @@ impl Application for AppsApplet {
                 self.toast = Some(format!("{}…", kind.label()));
             }
             Message::Refresh => return load_task(),
+            Message::AnimTick => {
+                // APPS-FX-1 — one frame: drop settled tweens. When the released
+                // element's fall has settled, clear the marker so it's not re-eased.
+                let now = Instant::now();
+                self.anim.gc(now);
+                if let Some(key) = self.releasing.clone() {
+                    if !self.anim.is_animating(&key, now) {
+                        self.releasing = None;
+                    }
+                }
+            }
+            Message::HoverEnter(key) => {
+                // APPS-FX-1 — lift/highlight this element; cancel any in-flight
+                // release of it.
+                if self.releasing.as_deref() == Some(&key) {
+                    self.releasing = None;
+                }
+                if self.hovered.as_deref() != Some(&key) {
+                    self.hovered = Some(key.clone());
+                    self.start_anim(key, Motion::hover());
+                }
+            }
+            Message::HoverExit(key) => {
+                // APPS-FX-1 — settle this element back (only if it's still the
+                // hovered one; a stale exit after a fast re-enter is ignored).
+                if self.hovered.as_deref() == Some(&key) {
+                    self.hovered = None;
+                    self.releasing = Some(key.clone());
+                    self.start_anim(key, Motion::hover());
+                }
+            }
         }
         Task::none()
     }
@@ -900,6 +1044,83 @@ impl Application for AppsApplet {
 }
 
 impl AppsApplet {
+    /// APPS-FX-1 — re-read the user preferences **once** and refresh everything
+    /// derived from them: the active palette (theme), reduce-motion, and the
+    /// MOTION-CORE-3 motion controls. One file read per open (the prior code read
+    /// `preferences.toml` twice — `resolve_palette` + a separate motion refresh).
+    fn apply_prefs(&mut self) {
+        let prefs = Preferences::load();
+        self.palette = Palette::for_theme(prefs.theme);
+        self.reduce_motion = prefs.a11y.reduce_motion;
+        self.motion = prefs.motion;
+    }
+
+    /// APPS-FX-1 — clear all hover state + its tweens. Called when the popup closes
+    /// (no `on_exit` arrives for destroyed surfaces) and on open (so a close path
+    /// that bypassed `PopupClosed`, e.g. a launch's `destroy_popup`, can't leave a
+    /// tile rendering pre-lifted). Idempotent.
+    fn reset_hover(&mut self) {
+        self.hovered = None;
+        self.releasing = None;
+        self.anim.gc(Instant::now());
+    }
+
+    /// APPS-FX-1 — start (or restart) the tween under `id` from now, with the
+    /// Carbon `preset` resolved against the global motion controls (kill switch +
+    /// speed scale) and reduce-motion. Routing every tween through here keeps the
+    /// reduce-motion contract + the MOTION-CORE-3 prefs honored in one place.
+    /// Also sweeps any settled tweens so the registry can't accumulate a stale
+    /// entry once the tick subscription has gone idle.
+    fn start_anim(&mut self, id: impl Into<String>, preset: Motion) {
+        let now = Instant::now();
+        self.anim.gc(now);
+        let resolved = self.motion.apply(preset, self.reduce_motion);
+        // `apply` already capped/scaled the duration; pass `false` so the
+        // animator doesn't re-cap it.
+        self.anim.start(id, now, resolved, false);
+    }
+
+    /// APPS-FX-1 — the eased open-in transition params (alpha + slide) for the
+    /// whole dropdown body at the current frame. A no-op (fully shown) once the
+    /// open tween has settled or was never started.
+    fn menu_in(&self) -> mde_theme::animation::RenderParams {
+        let t = self.anim.value(ANIM_MENU, Instant::now(), Easing::EaseOut);
+        Transition::SlideUp(MENU_SLIDE_PX).params(t)
+    }
+
+    /// APPS-FX-1 — the tab-switch transition offset (px) for the result body: on a
+    /// tab change the body slides up a few px into place (`MENU_SLIDE_PX` → 0),
+    /// reading as a crossfade-in without iced 0.13 opacity. `0.0` once settled.
+    fn tab_slide(&self) -> f32 {
+        Transition::SlideUp(MENU_SLIDE_PX)
+            .params(self.anim.value(ANIM_TAB, Instant::now(), Easing::EaseOut))
+            .translate_y
+    }
+
+    /// APPS-FX-1 — the directional hover "amount" `0.0..=1.0` for the element
+    /// `key` ([`hover_key`]) at the current frame: eases **in** (0→1) while
+    /// hovered, **out** (1→0) on exit, and is 0 at rest. The single source the
+    /// hover-lift (tiles) + hover-highlight (rows) both derive from, so the eased
+    /// progress + direction logic lives in one place.
+    fn hover_progress(&self, key: &str) -> f32 {
+        let t = self.anim.value(key, Instant::now(), Easing::EaseOut);
+        if self.hovered.as_deref() == Some(key) {
+            t
+        } else if self.releasing.as_deref() == Some(key) {
+            1.0 - t
+        } else {
+            0.0
+        }
+    }
+
+    /// APPS-FX-1 — the hover-lift offset (px, ≤ 0 = up) for a Favorites tile at the
+    /// current frame: rises while hovered, settles back on exit. No layout reflow
+    /// (rendered as compensating padding — see [`Self::favorite_tile`]).
+    fn hover_lift(&self, id: &str) -> f32 {
+        let amt = self.hover_progress(&hover_key(HOVER_TILE, id));
+        Transition::Lift(TILE_HOVER_RISE_PX).params(amt).translate_y
+    }
+
     /// APPS-STYLE-2 — the redesigned Start Menu (design: `docs/design/start-menu-redesign.md`).
     /// Header (title + QNM-Shared usage bar) → quick-link tiles → underline tabs →
     /// search → result rows (zebra + selected blue-accent, click-to-expand detail)
@@ -1329,6 +1550,19 @@ impl AppsApplet {
             .into()
         };
 
+        // APPS-FX-1 — tab-switch transition: nudge the result body down a few px
+        // and let it settle (top padding `tab_slide` → 0). The offset is applied
+        // to the body **inside** the scrollable's content, so it scrolls with the
+        // content and never shrinks the viewport — the scroll region keeps its
+        // full `Length::Fill` height (no transient clip of the last row).
+        let tab_off = self.tab_slide().max(0.0);
+        let body = cosmic::iced::widget::container(body).padding(cosmic::iced::Padding {
+            top: tab_off,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        });
+
         // ── Assemble: header → links → tabs → search → body (flex) → toast → footer. ──
         let mut col = column(vec![
             header.into(),
@@ -1343,11 +1577,24 @@ impl AppsApplet {
         }
         col = col.push(self.footer());
 
+        // APPS-FX-1 — open-in slide: the body starts a few px low and rises to
+        // rest (Carbon panel-mount). Rendered as extra top padding that decays to
+        // 0 — iced 0.13 has no transform widget, so we offset layout instead
+        // (MOTION-INFRA-2's translate-as-padding approach). Bottom padding shrinks
+        // by the same amount so the overall height stays put (no jank / reflow of
+        // the fixed popup surface).
+        let slide = self.menu_in().translate_y.max(0.0);
+        let pad = cosmic::iced::Padding {
+            top: 12.0 + slide,
+            right: 12.0,
+            bottom: (12.0 - slide).max(0.0),
+            left: 12.0,
+        };
         // APPS-FIT — the body fills the detected desktop-fraction size (33% of
         // the screen width × height; falls back to the golden rectangle). Must
         // match the popup positioner size set on open.
         cosmic::iced::widget::container(col)
-            .padding(12)
+            .padding(pad)
             .width(Length::Fixed(self.menu_w))
             .height(Length::Fixed(self.menu_h))
             .into()
@@ -1397,10 +1644,17 @@ impl AppsApplet {
     /// `Button::Standard`, equal-width. Whole-tile press launches the app/mesh-
     /// app (else selects). Owns its strings so the tile is `'static`.
     fn favorite_tile(&self, e: &Entry) -> Element<'static, Message> {
-        use cosmic::widget::{button, column, text};
+        use cosmic::widget::{button, column, mouse_area, text};
         let p = self.palette;
         let sizes = FontSize::defaults();
         let cap_sz = TypeRole::Caption.size_in(sizes);
+        // APPS-FX-1 — hover lift (px up) + accent tint for this tile. The icon +
+        // label warm to the Carbon accent while hovered (and through the eased
+        // settle-back) — a tasteful "this is interactive" cue, not just a colour
+        // pop. `lift` is ≤ 0 (up); 0 at rest.
+        let lift = self.hover_lift(&e.id);
+        let lifting = lift < 0.0;
+        let label_c = if lifting { p.accent } else { p.text };
         // APPS-FAV-ICON (operator 2026-06-19) — render the actual Carbon icon
         // SVG (the mde_theme icon set), tinted to the theme text color — the same
         // icons used when docking an app — instead of the Unicode fallback glyph.
@@ -1409,7 +1663,7 @@ impl AppsApplet {
         let icon_px = resolved.size_px();
         let icon_widget: Element<'static, Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
             use cosmic::iced::widget::svg as widget_svg;
-            let tint = carbon(p.text);
+            let tint = carbon(label_c);
             widget_svg(widget_svg::Handle::from_memory(svg_bytes))
                 .width(Length::Fixed(icon_px))
                 .height(Length::Fixed(icon_px))
@@ -1420,7 +1674,7 @@ impl AppsApplet {
         } else {
             text(resolved.fallback_glyph)
                 .size(20)
-                .class(cosmic::theme::Text::Color(carbon(p.text)))
+                .class(cosmic::theme::Text::Color(carbon(label_c)))
                 .into()
         };
         // Truncate long names so tiles stay aligned.
@@ -1429,13 +1683,13 @@ impl AppsApplet {
         } else {
             e.name.clone()
         };
-        button::custom(
+        let tile = button::custom(
             column(vec![
                 icon_widget,
                 text(name)
                     .size(cap_sz)
                     .center()
-                    .class(cosmic::theme::Text::Color(carbon(p.text)))
+                    .class(cosmic::theme::Text::Color(carbon(label_c)))
                     .into(),
             ])
             .spacing(6)
@@ -1444,8 +1698,24 @@ impl AppsApplet {
         )
         .on_press(Self::entry_primary_msg(e))
         .width(Length::Fill)
-        .class(cosmic::theme::Button::Standard)
-        .into()
+        .class(cosmic::theme::Button::Standard);
+        // APPS-FX-1 — render the lift as padding: top reserves `TILE_HOVER_RISE_PX`
+        // and is consumed (→0) as the tile rises; bottom grows by the same amount,
+        // so the grid cell's height is constant (no neighbour reflow / jank). The
+        // `mouse_area` enter/exit events drive the lift tween.
+        let top = (TILE_HOVER_RISE_PX + lift).max(0.0);
+        let bottom = (-lift).max(0.0);
+        let lifted = cosmic::iced::widget::container(tile).padding(cosmic::iced::Padding {
+            top,
+            right: 0.0,
+            bottom,
+            left: 0.0,
+        });
+        let key = hover_key(HOVER_TILE, &e.id);
+        mouse_area(lifted)
+            .on_enter(Message::HoverEnter(key.clone()))
+            .on_exit(Message::HoverExit(key))
+            .into()
     }
 
     /// APPS-STYLE-2 — one result row: letter avatar + accent-blue title + mono
@@ -1549,18 +1819,35 @@ impl AppsApplet {
             p.background
         };
         let accent = if selected { p.accent } else { shade };
-        cosmic::iced::widget::container(inner)
+        // APPS-FX-1 — hover highlight: an unselected row eases its background
+        // toward the raised layer while pointed at (and back out on exit). Pure
+        // background blend — the row geometry is untouched, so the list never
+        // reflows (no jank). A selected row keeps its own raised treatment.
+        let key = hover_key(HOVER_ROW, &e.id);
+        let hv = if selected { 0.0 } else { self.hover_progress(&key) };
+        // Fast path: a resting/unhovered row keeps the plain zebra color (skip the
+        // blend that would just reproduce `shade`) — the common case for a list
+        // re-rendered each frame while *some other* row's tween is in flight.
+        let bg = if hv == 0.0 {
+            carbon(shade)
+        } else {
+            carbon_mix(shade, p.raised, hv)
+        };
+        let row_el = cosmic::iced::widget::container(inner)
             .padding([6, 10])
             .width(Length::Fill)
             .style(move |_| cosmic::iced::widget::container::Style {
-                background: Some(carbon(shade).into()),
+                background: Some(bg.into()),
                 border: cosmic::iced::Border {
                     color: carbon(accent),
                     width: 0.0,
                     radius: 0.0.into(),
                 },
                 ..Default::default()
-            })
+            });
+        cosmic::widget::mouse_area(row_el)
+            .on_enter(Message::HoverEnter(key.clone()))
+            .on_exit(Message::HoverExit(key))
             .into()
     }
 
@@ -1931,5 +2218,104 @@ mod toggle_tests {
         // And the applet would flip from its primed baseline (None) to this ULID.
         assert!(should_toggle(None, Some(&ulid)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod motion_tests {
+    //! APPS-FX-1 — the launcher's adaptive-budget motion: the pure helpers + the
+    //! Carbon-token wiring. The eased interpolation itself is covered by
+    //! `mde_theme::animation`; here we pin the launcher-side glue.
+    use super::{
+        carbon_mix, hover_key, ANIM_HOVER_PREFIX, HOVER_ROW, HOVER_TILE, MENU_SLIDE_PX,
+        TILE_HOVER_RISE_PX,
+    };
+    use mde_theme::animation::{Animator, Transition};
+    use mde_theme::{Easing, Motion, Rgba, PANEL_MOUNT_TRANSLATE_Y_PX};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn hover_key_is_prefixed_and_namespaced_per_surface() {
+        assert_eq!(
+            hover_key(HOVER_TILE, "abc"),
+            format!("{ANIM_HOVER_PREFIX}{HOVER_TILE}:abc")
+        );
+        // Distinct entries differ; the SAME entry on different surfaces also
+        // differs — so a favorite tile and a list row never share a tween.
+        assert_ne!(hover_key(HOVER_TILE, "a"), hover_key(HOVER_TILE, "b"));
+        assert_ne!(hover_key(HOVER_TILE, "a"), hover_key(HOVER_ROW, "a"));
+    }
+
+    #[test]
+    fn carbon_mix_interpolates_and_clamps() {
+        let a = Rgba::rgb(0, 0, 0);
+        let b = Rgba::rgb(255, 255, 255);
+        // Endpoints return the pure colors.
+        let lo = carbon_mix(a, b, 0.0);
+        assert!(lo.r.abs() < 1e-6 && lo.g.abs() < 1e-6 && lo.b.abs() < 1e-6);
+        let hi = carbon_mix(a, b, 1.0);
+        assert!((hi.r - 1.0).abs() < 1e-6);
+        // Midpoint blends halfway; out-of-range t is clamped (no overshoot).
+        let mid = carbon_mix(a, b, 0.5);
+        assert!((mid.r - 0.5).abs() < 1e-3);
+        let over = carbon_mix(a, b, 2.0);
+        assert!((over.r - 1.0).abs() < 1e-6, "t>1 clamps to b");
+    }
+
+    #[test]
+    fn slide_tokens_come_from_carbon_panel_mount() {
+        // The open-in + tab slide reuse the shared panel-mount translate token —
+        // no scattered metric literal (§4).
+        assert!((MENU_SLIDE_PX - PANEL_MOUNT_TRANSLATE_Y_PX).abs() < f32::EPSILON);
+        // The hover rise is a small, positive component dimension.
+        assert!(TILE_HOVER_RISE_PX > 0.0 && TILE_HOVER_RISE_PX <= 8.0);
+    }
+
+    #[test]
+    fn open_in_slides_from_offset_to_rest() {
+        // The dropdown body starts MENU_SLIDE_PX low (extra top padding) and rises
+        // to 0 over the panel-mount tween — the visible "appears" motion.
+        let t0 = Instant::now();
+        let mut a = Animator::new();
+        a.start("menu", t0, Motion::panel_mount(), false);
+        let at_start = Transition::SlideUp(MENU_SLIDE_PX)
+            .params(a.value("menu", t0, Easing::EaseOut))
+            .translate_y;
+        assert!(at_start > 0.0, "starts below rest, got {at_start}");
+        let done = t0 + Motion::panel_mount().duration + Duration::from_millis(1);
+        let at_end = Transition::SlideUp(MENU_SLIDE_PX)
+            .params(a.value("menu", done, Easing::EaseOut))
+            .translate_y;
+        assert!(at_end.abs() < 1e-4, "settles at rest, got {at_end}");
+    }
+
+    #[test]
+    fn animator_goes_idle_so_the_tick_can_stop() {
+        // §7 / MOTION-PERF-1 — motion is event/tick-driven: once every tween
+        // settles the animator is idle and the applet stops arming the 60fps tick.
+        let t0 = Instant::now();
+        let mut a = Animator::new();
+        a.start(hover_key(HOVER_TILE, "x"), t0, Motion::hover(), false);
+        assert!(!a.is_idle(t0), "an in-flight hover ⇒ not idle");
+        let done = t0 + Motion::hover().duration + Duration::from_millis(1);
+        assert!(a.is_idle(done), "settled ⇒ idle (tick stops)");
+    }
+
+    #[test]
+    fn reduce_motion_collapses_the_open_tween() {
+        // The reduce-motion contract: a disabled-motion / reduce-motion budget
+        // caps the open tween to the ≤80 ms Carbon crossfade.
+        let prefs = mde_theme::prefs::MotionPrefs::default();
+        let resolved = prefs.apply(Motion::panel_mount(), true);
+        assert!(resolved.duration <= Duration::from_millis(80));
+        // The global kill switch collapses it to a terminal (zero-duration) frame.
+        let off = mde_theme::prefs::MotionPrefs {
+            enabled: false,
+            speed_scale: 1.0,
+        };
+        assert_eq!(
+            off.apply(Motion::panel_mount(), false).duration,
+            Duration::ZERO
+        );
     }
 }
