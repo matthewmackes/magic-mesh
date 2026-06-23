@@ -48,7 +48,17 @@ feat "node B joins the mesh"                       on "$B" "sudo mackesd join '$
 on "$B" "sudo systemctl enable --now mackesd" >/dev/null 2>&1
 for t in $(seq 1 15); do on "$B" "ip -4 addr show | grep -q 10.42" && break; sleep 3; done
 feat "node B overlay is up"                        on "$B" "ip -4 addr show | grep -q 10.42"
-feat "A reaches B over the overlay"                on "$A" "ping -c2 -W2 \$(mackesd peers 2>/dev/null | grep -oE '10\\.42\\.[0-9.]+' | grep -v 10.42.0.1 | head -1)"
+# Reachability targets B's deterministic overlay IP (first lighthouse=.1, first
+# join=.2) and RETRIES — the Nebula tunnel takes a few seconds to handshake after
+# both peers serve, and we must NOT source B's IP from `mackesd peers` here: the
+# peer directory only federates over the shared substrate (QNM-Shared/etcd), which
+# isn't up on a bare 2-node bed, so it lists only A (that gap is the directory
+# check below). FOUND-NEBULA-6 (2026-06-23): reachability itself works (ping 0%
+# loss once handshaken); the old one-shot-via-directory ping conflated the two.
+feat "A reaches B over the overlay"                on "$A" "for i in \$(seq 1 12); do ping -c1 -W2 10.42.0.2 >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1"
+# Directory federation rides the shared substrate (SUBSTRATE-3 = peers on etcd),
+# which a bare bed lacks — so this stays RED until SUBSTRATE-V2; it is the honest
+# remaining gap (FOUND-NEBULA-6), not an onboarding failure.
 feat "the directory sees both nodes"               on "$A" "test \$(mackesd peers 2>/dev/null | grep -cE '10\\.42') -ge 2"
 
 outcome="pass"; [ "$FAIL" -eq 0 ] || outcome="fail"
