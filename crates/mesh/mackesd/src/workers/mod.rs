@@ -396,6 +396,12 @@ pub mod dc_auditor;
 // per status transition (pending→ok/error), without touching the action
 // handlers. Leader-gated; dedups on (ulid, status).
 pub mod dc_jobs;
+// DATACENTER-24 — passive care-and-feeding health checker: on a 30 s tick probes
+// each configured Xen dom0's SSH reachability, the SUBSTRATE-V2 etcd `/health`,
+// and the mesh secret-store helper, and emits one `event/dc/health/<check>` per
+// check (deduped on status), without touching the substrate it watches.
+// Leader-gated; a pure side-observer.
+pub mod dc_health;
 // DATACENTER-20 — passive promotion tracker: publishes the version running at
 // each promotion stage (Build→Eagle→DO) to `event/dc/promote/<stage>` so the
 // Workbench Datacenter plane can render the promotion matrix. Leader-gated;

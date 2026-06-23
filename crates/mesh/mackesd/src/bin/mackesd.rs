@@ -6053,6 +6053,23 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("dc_jobs".into());
 
+        // DATACENTER-24 — passive care-and-feeding health checker. Leader-gated;
+        // on a 30 s tick probes each configured Xen dom0's SSH reachability, the
+        // SUBSTRATE-V2 etcd `/health`, and the mesh secret-store helper, and emits
+        // one `event/dc/health/<check>` per check (deduped on status), without
+        // touching the substrate it watches — a pure side-observer.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::dc_health::DcHealthWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("dc_health".into());
+
         // DATACENTER-20 — passive promotion tracker. Leader-gated; publishes the
         // version running at each promotion stage (Build→Eagle→DO) to
         // `event/dc/promote/<stage>` so the Workbench Datacenter plane can render
