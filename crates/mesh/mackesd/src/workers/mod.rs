@@ -449,6 +449,11 @@ pub mod bus_supervisor;
 // XCP-6 — on an XCP-ng dom0, advertise hypervisor capacity into the compute
 // plane (`compute/xcp-host/<node>`) so the mesh can place VMs on it.
 pub mod xcp_host;
+// XCP-3 — the A-plane provision flow: drains `action/provision/spawn`, then
+// clones MDE-VM-golden → attaches the fresh identity seed → starts → resolves
+// the IP over the mackes-xcp Hypervisor layer (the runtime caller of
+// set_identity_seed, so a provisioned VM actually gets its identity seed).
+pub mod xcp_provision;
 // BUS-5.1 — clipboard daemon supervisor. Spawns one `mde-clipd` process
 // per Wayland session; idles when $WAYLAND_DISPLAY is unset.
 pub mod clipd_supervisor;
