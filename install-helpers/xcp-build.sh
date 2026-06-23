@@ -64,13 +64,17 @@ case "${1:-}" in
 
   rpm)
     do_sync
-    # Stage the air-gapped birthright blobs (ntfy/starship) the generate-rpm
-    # `assets` array ships — without this the VM has no vendor/birthright/ and
-    # generate-rpm dies "Asset file not found" (BUILD-PLATFORM-4 RPM-cut gap,
-    # 2026-06-22). Runs on the VM (it has network egress) so the fetch stays off
-    # the local host; idempotent + sha256-verified, mirroring build-rpm-fedora43.sh.
-    log "vendoring birthright blobs on the VM (off the local host)"
-    remote "./install-helpers/vendor-birthright-blobs.sh"
+    # Stage the air-gapped vendored assets the generate-rpm `assets` array ships
+    # — without these the VM has no vendor/birthright/ and generate-rpm dies
+    # "Asset file not found" (BUILD-PLATFORM-4 RPM-cut gap, 2026-06-22). Mirror
+    # build-rpm-fedora43.sh exactly so the farm RPM is byte-faithful to the
+    # canonical cut: birthright blobs (ntfy/starship, fetched + sha256-verified)
+    # AND the fc43 lizardfs RPM set (resolved in a fedora:43 podman container —
+    # still shipped until the SUBSTRATE-V2 cutover retires LizardFS fleet-wide).
+    # Runs on the VM (it has network egress + podman) so the fetch stays off the
+    # local host; both steps are idempotent.
+    log "vendoring birthright blobs + lizardfs RPM set on the VM (off the local host)"
+    remote "./install-helpers/vendor-birthright-blobs.sh && ./install-helpers/vendor-lizardfs-rpms.sh 43"
     log "release build + generate-rpm on the VM (heavy — runs on XCP, not local)"
     remote "cargo build --workspace --release && cargo generate-rpm -p crates/mesh/mackesd"
     mkdir -p "$ARTIFACTS"
