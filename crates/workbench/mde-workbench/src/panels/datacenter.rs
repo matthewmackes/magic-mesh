@@ -15,7 +15,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use cosmic::iced::widget::{column, container, row, scrollable, text};
+use cosmic::iced::widget::{column, container, row, scrollable, text, text_input};
 use cosmic::iced::{Length, Task};
 use cosmic::Element;
 use mde_theme::{spacing, Palette};
@@ -104,6 +104,39 @@ impl DcRow {
         )]
         let size_gib = (size as f64 / GIB).round() as u64;
         Some(format!("{used_gib} / {size_gib} GiB ({pct}%)"))
+    }
+
+    /// The mde-theme palette token for this row's status dot. Maps the raw status
+    /// string (across DO droplets and Xen VMs/hosts) onto one of the three
+    /// semantic color roles — `success` (up/running), `danger` (off/halted), or
+    /// `warning` (transitional / unknown). Never a raw hex — the caller reads the
+    /// concrete `Rgba` off the live palette. Pure + testable.
+    #[must_use]
+    pub fn status_dot(&self, palette: Palette) -> mde_theme::Rgba {
+        // Lower-cased so "Running" / "RUNNING" / "running" all match; the worker
+        // emits DO ("active"/"off") + Xen ("running"/"halted") vocabularies.
+        match self.status.to_ascii_lowercase().as_str() {
+            "running" | "active" | "up" | "online" | "ready" => palette.success,
+            "halted" | "off" | "stopped" | "shutoff" | "down" | "error" => palette.danger,
+            "paused" | "suspended" | "rebooting" | "starting" | "pending"
+            | "provisioning" => palette.warning,
+            // Unknown / empty — a muted dot rather than a misleading green/red.
+            _ => palette.text_muted,
+        }
+    }
+
+    /// Whether this row matches a free-text filter `needle` (case-insensitive
+    /// substring over name / id / kind). An empty/whitespace needle matches every
+    /// row, so an empty search box never hides anything. Pure + testable.
+    #[must_use]
+    pub fn matches_filter(&self, needle: &str) -> bool {
+        let needle = needle.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return true;
+        }
+        self.name.to_ascii_lowercase().contains(&needle)
+            || self.id.to_ascii_lowercase().contains(&needle)
+            || self.kind.to_ascii_lowercase().contains(&needle)
     }
 }
 
@@ -676,6 +709,11 @@ pub struct DatacenterPanel {
     /// button fires the `action/dc/dr-backup` RPC. Cleared once the backup is
     /// fired.
     pub dr_confirm: bool,
+    /// The global resource filter — a free-text needle matched case-insensitively
+    /// against each row's name / id / kind (see [`DcRow::matches_filter`]). Empty
+    /// shows everything. Applied on top of the per-tab (zone / topology / card-
+    /// grid) views so the search narrows whatever set is currently rendered.
+    pub filter: String,
 }
 
 /// Top-level view selector for the datacenter panel.
@@ -717,6 +755,7 @@ impl Default for DatacenterPanel {
             topology_seeded: false,
             dr_status: String::new(),
             dr_confirm: false,
+            filter: String::new(),
         }
     }
 }
@@ -843,6 +882,10 @@ pub enum Message {
     /// The `action/dc/dr-backup` RPC came back — `Ok` carries the backup path,
     /// `Err` the error text. Routes here as a panel-scoped message.
     DrBackupDone(Result<String, String>),
+    /// The global search box's contents changed — store the new needle, which the
+    /// view applies as a case-insensitive name/id/kind filter across the rendered
+    /// resources. Pure state update; fires no RPC.
+    FilterChanged(String),
 }
 
 impl DatacenterPanel {
@@ -1150,6 +1193,10 @@ impl DatacenterPanel {
                 self.dr_status = e;
                 Task::none()
             }
+            Message::FilterChanged(needle) => {
+                self.filter = needle;
+                Task::none()
+            }
         }
     }
 
@@ -1226,6 +1273,20 @@ impl DatacenterPanel {
         if !self.status.is_empty() {
             col = col.push(text(self.status.clone()));
         }
+
+        // Global search — a free-text needle matched case-insensitively against
+        // each rendered resource's name / id / kind (see `DcRow::matches_filter`).
+        // Lives above the view body so it narrows whichever view (Resources /
+        // Topology) is showing. Empty box = no filtering.
+        let search = row![
+            text("Search").colr(palette.text_muted.into_cosmic_color()),
+            text_input("name / id / kind", &self.filter)
+                .on_input(|v| crate::Message::Datacenter(Message::FilterChanged(v)))
+                .width(Length::FillPortion(3)),
+        ]
+        .spacing(f32::from(spacing::BASE[2]))
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+        col = col.push(search);
 
         match self.view_mode {
             ViewMode::Overview => {
@@ -1431,7 +1492,16 @@ impl DatacenterPanel {
             }
             ViewMode::Topology => {
                 col = col.push(text("Topology").size(f32::from(spacing::BASE[5])));
-                let groups = group_by_host(&self.rows);
+                // Honor the global search: group only the rows that match the
+                // needle (a host header is itself a row, so a search by host
+                // name/id keeps its group; otherwise the children carry it).
+                let filtered: Vec<DcRow> = self
+                    .rows
+                    .iter()
+                    .filter(|r| r.matches_filter(&self.filter))
+                    .cloned()
+                    .collect();
+                let groups = group_by_host(&filtered);
                 if groups.is_empty() {
                     col = col.push(
                         text(
@@ -1498,17 +1568,40 @@ impl DatacenterPanel {
                         .spacing(f32::from(spacing::BASE[2])),
                     );
 
+                    // Per-tab filter = the active zone tab AND the global search
+                    // needle (name / id / kind). The search narrows the card grid
+                    // in place; an empty box shows the whole zone.
                     let visible: Vec<&DcRow> = self
                         .rows
                         .iter()
-                        .filter(|r| r.zone == self.zone_tab)
+                        .filter(|r| r.zone == self.zone_tab && r.matches_filter(&self.filter))
                         .collect();
                     if visible.is_empty() {
-                        col = col.push(text("No resources in this zone yet."));
-                    }
-                    for r in visible {
-                        let confirming = self.confirm_delete.as_deref() == Some(r.id.as_str());
-                        col = col.push(dc_row_view(r, palette, confirming));
+                        // Distinguish "nothing in this zone" from "the search hid
+                        // everything" so an empty grid never looks like a bug.
+                        if self.filter.trim().is_empty() {
+                            col = col.push(text("No resources in this zone yet."));
+                        } else {
+                            col = col.push(
+                                text(format!(
+                                    "No resources match \u{201c}{}\u{201d} in this zone.",
+                                    self.filter.trim()
+                                ))
+                                .colr(palette.text_muted.into_cosmic_color()),
+                            );
+                        }
+                    } else {
+                        // Responsive card grid — each resource is a card (status
+                        // dot + kind/label + readout + actions), wrapped N-per-row.
+                        let cards: Vec<Element<'_, crate::Message>> = visible
+                            .into_iter()
+                            .map(|r| {
+                                let confirming =
+                                    self.confirm_delete.as_deref() == Some(r.id.as_str());
+                                dc_card_view(r, palette, confirming)
+                            })
+                            .collect();
+                        col = col.push(card_grid(cards));
                     }
                 }
             }
@@ -1518,12 +1611,62 @@ impl DatacenterPanel {
     }
 }
 
-/// Render one datacenter row. VM rows additionally carry Start / Stop / Reboot
-/// power buttons that fire the `action/dc/vm-power` RPC for the row's dom0, plus
-/// Snapshot / Clone / Delete. When `confirming` is set, the Delete button is
-/// replaced by an inline "Really delete?" confirm + Cancel prompt — only the
-/// confirm fires the destructive `action/dc/vm-delete` RPC.
-fn dc_row_view(r: &DcRow, palette: Palette, confirming: bool) -> Element<'_, crate::Message> {
+/// The number of resource cards per row in the [`card_grid`]. A fixed column
+/// count keeps the layout deterministic for the tests while still wrapping long
+/// resource lists into a grid (vs one tall column of rows). Tuned so a card —
+/// status dot + label + actions — has room without crowding.
+const CARD_GRID_COLS: usize = 3;
+
+/// Arrange a list of resource cards into a responsive grid: rows of
+/// [`CARD_GRID_COLS`] cards, each card claiming an equal portion so the grid
+/// flexes with the panel width. A short final row is left-aligned (no phantom
+/// padding cards). Pure layout glue — mde-theme spacing tokens only.
+fn card_grid(mut cards: Vec<Element<'_, crate::Message>>) -> Element<'_, crate::Message> {
+    let mut grid = column![].spacing(f32::from(spacing::BASE[2]));
+    while !cards.is_empty() {
+        let take = cards.len().min(CARD_GRID_COLS);
+        // Drain the first `take` cards into this grid row, each an equal portion.
+        let chunk: Vec<Element<'_, crate::Message>> = cards.drain(..take).collect();
+        let mut line = row![].spacing(f32::from(spacing::BASE[2]));
+        for card in chunk {
+            line = line.push(container(card).width(Length::FillPortion(1)));
+        }
+        grid = grid.push(line);
+    }
+    grid.into()
+}
+
+/// A small colored status dot — the resource's liveness at a glance. The color is
+/// an mde-theme palette token resolved by [`DcRow::status_dot`] (success / danger
+/// / warning / muted), never a raw hex. Rendered as a filled bullet glyph in that
+/// token color, paired with the raw status word so the dot is labelled (§4-clean:
+/// color is reinforced by text, not the sole signal).
+fn status_dot_view(r: &DcRow, palette: Palette) -> Element<'static, crate::Message> {
+    let color = r.status_dot(palette);
+    let label = if r.status.is_empty() {
+        "unknown".to_string()
+    } else {
+        r.status.clone()
+    };
+    row![
+        text("\u{25cf}").colr(color.into_cosmic_color()),
+        text(label).colr(palette.text_muted.into_cosmic_color()),
+    ]
+    .spacing(f32::from(spacing::BASE[1]))
+    .align_y(cosmic::iced::alignment::Vertical::Center)
+    .into()
+}
+
+/// Render one datacenter resource as a **card**: a bordered surface with a
+/// status-dot header (kind + color-dot liveness), the resource label, and a
+/// kind-appropriate readout (sr capacity / net bridge / bare status). VM cards
+/// additionally carry Start / Stop / Reboot power buttons (the `action/dc/vm-
+/// power` RPC for the card's dom0) plus Snapshot / Clone / Delete. When
+/// `confirming` is set, the Delete button is replaced by an inline "Really
+/// delete?" confirm + Cancel prompt — only the confirm fires the destructive
+/// `action/dc/vm-delete` RPC. mde-theme tokens only (surface / border / status
+/// dot all from the palette).
+fn dc_card_view(r: &DcRow, palette: Palette, confirming: bool) -> Element<'_, crate::Message> {
     let label = if r.name.is_empty() {
         r.id.clone()
     } else {
@@ -1538,12 +1681,21 @@ fn dc_row_view(r: &DcRow, palette: Palette, confirming: bool) -> Element<'_, cra
     } else {
         r.status.clone()
     };
-    let mut line = row![
-        text(r.kind.clone()).width(Length::FillPortion(1)),
-        text(label).width(Length::FillPortion(3)),
-        text(status_or_capacity).width(Length::FillPortion(1)),
+    // Card header: kind label + the color-dot status indicator.
+    let header = row![
+        text(r.kind.clone())
+            .colr(palette.text_muted.into_cosmic_color())
+            .width(Length::FillPortion(1)),
+        status_dot_view(r, palette),
     ]
-    .spacing(f32::from(spacing::BASE[3]));
+    .spacing(f32::from(spacing::BASE[2]))
+    .align_y(cosmic::iced::alignment::Vertical::Center);
+    let mut card = column![
+        header,
+        text(label).colr(palette.text.into_cosmic_color()),
+        text(status_or_capacity).colr(palette.text_muted.into_cosmic_color()),
+    ]
+    .spacing(f32::from(spacing::BASE[2]));
 
     if r.kind == "vm" {
         let power = |btn_label: &str, op: &str| {
@@ -1616,12 +1768,23 @@ fn dc_row_view(r: &DcRow, palette: Palette, confirming: bool) -> Element<'_, cra
                 palette,
             ));
         }
-        line = line.push(actions);
+        card = card.push(actions);
     }
 
-    container(line)
+    container(card)
         .padding(f32::from(spacing::BASE[3]))
         .width(Length::Fill)
+        .style(move |_theme| container::Style {
+            background: Some(cosmic::iced::Background::Color(
+                palette.surface.into_cosmic_color(),
+            )),
+            border: cosmic::iced::Border {
+                color: palette.border.into_cosmic_color(),
+                width: 1.0,
+                radius: f32::from(spacing::BASE[1]).into(),
+            },
+            ..container::Style::default()
+        })
         .into()
 }
 
@@ -1678,7 +1841,7 @@ fn topology_header_view(
 /// Render one nested child row under a `Topology` group header — indented with a
 /// connector glyph (`└─` for the last child, `├─` otherwise) so the tree reads
 /// as a map. Shows the resource kind, its label, and a kind-appropriate readout
-/// (sr capacity / net bridge / bare status), matching `dc_row_view`'s logic but
+/// (sr capacity / net bridge / bare status), matching `dc_card_view`'s logic but
 /// read-only (no power/delete controls in the map). mde-theme tokens only.
 fn topology_child_view(
     r: &DcRow,
@@ -2746,7 +2909,7 @@ mod tests {
         let _ = p.update(Message::ViewMode(ViewMode::Zone));
         let _ = p.update(Message::ZoneTab("dev".to_string()));
         // Arm the delete confirm on the vm row, then render — exercises the
-        // inline confirm/cancel render branch in dc_row_view.
+        // inline confirm/cancel render branch in dc_card_view.
         let _ = p.update(Message::DeleteClicked {
             uuid: "9".to_string(),
             dom0: "172.20.0.9".to_string(),
@@ -3686,5 +3849,101 @@ mod tests {
         // No jobs at all → the "no recent Tofu runs" empty-state line renders.
         let p = DatacenterPanel::new();
         let _ = p.view();
+    }
+
+    fn row_with(kind: &str, id: &str, name: &str, status: &str, zone: &str) -> DcRow {
+        DcRow {
+            kind: kind.into(),
+            id: id.into(),
+            name: name.into(),
+            status: status.into(),
+            zone: zone.into(),
+            host: String::new(),
+            size: String::new(),
+            used: String::new(),
+            bridge: String::new(),
+            cpu: String::new(),
+            mem_total_mb: String::new(),
+            mem_free_mb: String::new(),
+            load: String::new(),
+        }
+    }
+
+    #[test]
+    fn status_dot_maps_liveness_onto_semantic_tokens() {
+        let p = Palette::dark();
+        // Up vocabularies (DO "active" / Xen "running" / "up") → success.
+        assert_eq!(row_with("vm", "1", "a", "running", "dev").status_dot(p), p.success);
+        assert_eq!(
+            row_with("droplet", "2", "b", "active", "prod").status_dot(p),
+            p.success
+        );
+        // Off vocabularies → danger.
+        assert_eq!(row_with("vm", "3", "c", "halted", "dev").status_dot(p), p.danger);
+        assert_eq!(row_with("droplet", "4", "d", "off", "prod").status_dot(p), p.danger);
+        // Transitional → warning.
+        assert_eq!(
+            row_with("vm", "5", "e", "rebooting", "dev").status_dot(p),
+            p.warning
+        );
+        // Case-insensitive.
+        assert_eq!(row_with("vm", "6", "f", "RUNNING", "dev").status_dot(p), p.success);
+        // Unknown / empty → muted (never a misleading green/red).
+        assert_eq!(row_with("vm", "7", "g", "", "dev").status_dot(p), p.text_muted);
+        assert_eq!(
+            row_with("vm", "8", "h", "weird", "dev").status_dot(p),
+            p.text_muted
+        );
+    }
+
+    #[test]
+    fn matches_filter_is_case_insensitive_over_name_id_kind() {
+        let r = row_with("droplet", "579112110", "lighthouse-01", "active", "prod");
+        // Empty / whitespace needle matches everything.
+        assert!(r.matches_filter(""));
+        assert!(r.matches_filter("   "));
+        // Name substring, case-insensitive.
+        assert!(r.matches_filter("LIGHTHOUSE"));
+        assert!(r.matches_filter("house-01"));
+        // Id substring.
+        assert!(r.matches_filter("5791"));
+        // Kind substring.
+        assert!(r.matches_filter("drop"));
+        // Non-match.
+        assert!(!r.matches_filter("xenbr0"));
+    }
+
+    #[test]
+    fn filter_changed_message_narrows_the_zone_grid() {
+        let mut p = DatacenterPanel::new();
+        p.rows = vec![
+            row_with("vm", "v1", "builder", "running", "dev"),
+            row_with("vm", "v2", "tester", "halted", "dev"),
+        ];
+        let _ = p.update(Message::ViewMode(ViewMode::Zone));
+        let _ = p.update(Message::ZoneTab("dev".to_string()));
+        // A needle that matches only one row updates state and renders without
+        // panicking (the grid renders just the matching card + its status dot).
+        let _ = p.update(Message::FilterChanged("builder".to_string()));
+        assert_eq!(p.filter, "builder");
+        let _ = p.view();
+        // A needle that matches nothing → the "no resources match" empty state.
+        let _ = p.update(Message::FilterChanged("zzz-none".to_string()));
+        let _ = p.view();
+    }
+
+    #[test]
+    fn card_grid_chunks_into_rows_without_panicking() {
+        // More cards than one grid row → exercises the wrap path.
+        let palette = Palette::dark();
+        let rows: Vec<DcRow> = (0..(CARD_GRID_COLS * 2 + 1))
+            .map(|i| row_with("vm", &format!("v{i}"), &format!("vm{i}"), "running", "dev"))
+            .collect();
+        let cards: Vec<Element<'_, crate::Message>> = rows
+            .iter()
+            .map(|r| dc_card_view(r, palette, false))
+            .collect();
+        // Building the grid must not panic for a short final row.
+        let _ = card_grid(cards);
     }
 }
