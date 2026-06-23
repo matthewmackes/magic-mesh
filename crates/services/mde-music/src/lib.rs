@@ -7,6 +7,7 @@
 
 pub mod album;
 pub mod color;
+pub mod density;
 pub mod hub;
 pub mod library;
 pub mod nav;
