@@ -27,6 +27,8 @@ pub mod bus_backend;
 /// GUI-7 — libcosmic `.sty()` styling shims (see module docs).
 pub mod cosmic_compat;
 pub mod demo_data;
+/// DENSITY-SYMMETRY — density-resolving Carbon metrics for the file listing.
+pub mod density;
 pub mod desktop;
 pub mod fileops;
 pub mod grid;

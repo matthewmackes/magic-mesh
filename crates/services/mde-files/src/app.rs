@@ -61,6 +61,9 @@ pub enum Message {
     /// enrollment / peer registration lives).
     OpenRegistration,
     SetLayout(Layout),
+    /// DENSITY-SYMMETRY — set the listing density (Compact / Comfortable /
+    /// Spacious). Re-rhythms the file-list chrome via `FileListMetrics`.
+    SetDensity(mde_theme::Density),
     SearchChanged(String),
     Refresh,
     TitlebarMinimize,
@@ -274,6 +277,11 @@ pub struct MdeFiles {
     /// the panel-toggle still reachable to expand it again.
     pub sidebar_collapsed: bool,
     pub layout: Layout,
+    /// DENSITY-SYMMETRY — the listing density (Compact / Comfortable /
+    /// Spacious). The view resolves `density::FileListMetrics::for_density`
+    /// against this each frame, so flipping it re-rhythms the file-list chrome
+    /// (gaps / paddings density-scaled; column widths held). Default per Q26.
+    pub density: mde_theme::Density,
     pub search: String,
     /// AF-mesh.3 — path stack inside `View::MeshHomeChild(slug)`.
     /// Empty = top of the XDG dir. Each entry is a single
@@ -399,6 +407,7 @@ impl Default for MdeFiles {
             local_open: false,
             sidebar_collapsed: false,
             layout: Layout::default(),
+            density: mde_theme::Density::default(),
             search: String::new(),
             mesh_home_path: Vec::new(),
             selection: Selection::default(),
@@ -656,6 +665,10 @@ impl MdeFiles {
                 let _ = std::process::Command::new("mde-workbench").spawn();
             }
             Message::SetLayout(l) => self.layout = l,
+            // DENSITY-SYMMETRY — re-rhythm the listing: the next `view()` resolves
+            // `FileListMetrics::for_density(self.density)`, so the gaps / paddings
+            // re-scale while the column widths hold.
+            Message::SetDensity(d) => self.density = d,
             Message::SearchChanged(s) => self.search = s,
             Message::PeerCardBrowse(id) => {
                 self.view = View::Peer(id);
@@ -1222,10 +1235,14 @@ impl MdeFiles {
         // MOTION-FEEDBACK — one shared motion context for every file view this
         // frame (hover + selection accent + staggered reveal off one animator).
         let rm = self.row_motion_ctx();
+        // DENSITY-SYMMETRY — resolve the file-list metrics from the live density
+        // once per frame; every listing view reads the same token-derived rhythm,
+        // so flipping the density re-rhythms the whole chrome at once.
+        let metrics = crate::density::FileListMetrics::for_density(self.density);
         let main_body: Element<'_, Message> = match &self.view {
             View::MeshOverview => views::mesh_overview(snap),
-            View::Inbox => views::inbox(snap, self.layout, &self.selection, rm),
-            View::Outbox => views::outbox(snap, self.layout, &self.selection, rm),
+            View::Inbox => views::inbox(snap, self.layout, metrics, &self.selection, rm),
+            View::Outbox => views::outbox(snap, self.layout, metrics, &self.selection, rm),
             View::Peer(id) => {
                 if let Some(p) = snap.peers.iter().find(|p| &p.id == id) {
                     views::peer_folder(
@@ -1234,6 +1251,7 @@ impl MdeFiles {
                         self.peer_files.clone(),
                         &self.search,
                         self.layout,
+                        metrics,
                         &self.selection,
                         rm,
                     )
@@ -1241,11 +1259,12 @@ impl MdeFiles {
                     empty_state("no peer").into()
                 }
             }
-            View::Downloads => views::downloads(snap, self.layout, &self.selection, rm),
+            View::Downloads => views::downloads(snap, self.layout, metrics, &self.selection, rm),
             View::Local => views::local_browser(
                 &self.local_files,
                 &self.local_path,
                 self.layout,
+                metrics,
                 &self.selection,
                 rm,
             ),
@@ -1255,6 +1274,7 @@ impl MdeFiles {
                 self.peer_files.clone(),
                 &self.search,
                 self.layout,
+                metrics,
                 &self.mesh_home_path,
                 &self.selection,
                 rm,
@@ -1264,10 +1284,15 @@ impl MdeFiles {
                 self.trash_busy,
                 self.trash_error.as_deref(),
             ),
-            View::CloudDevices => views::cloud_devices(&self.cloud_files, &self.selection, rm),
-            View::Network => {
-                views::network(&self.net_host, &self.net_shares, self.net_status.as_deref())
+            View::CloudDevices => {
+                views::cloud_devices(&self.cloud_files, metrics, &self.selection, rm)
             }
+            View::Network => views::network(
+                &self.net_host,
+                &self.net_shares,
+                self.net_status.as_deref(),
+                metrics,
+            ),
         };
 
         let content = container(scrollable(container(main_body).padding(Padding {
@@ -1291,7 +1316,7 @@ impl MdeFiles {
 
         let main = column![
             views::tab_strip(&self.tabs, self.active_tab),
-            views::toolbar(&self.view, self.layout, &self.search, crumbs),
+            views::toolbar(&self.view, self.layout, self.density, &self.search, crumbs),
             content,
         ]
         .spacing(0);

@@ -8,6 +8,7 @@ use cosmic::iced::{Background, Border, Color, Length, Padding};
 use cosmic::{Element, Theme};
 
 use crate::app::Message;
+use crate::density::FileListMetrics;
 use crate::icons;
 use crate::model::{
     fmt_count, latency_bucket, FileRow, LatencyBucket, Mime, Peer, PeerKind, PeerStatus, Transfer,
@@ -882,23 +883,35 @@ fn with_row_motion(
         .into()
 }
 
-/// File-list head row (caps, dim).
-pub fn file_row_head(src_label: &str) -> Element<'static, Message> {
+/// File-list head row (caps, dim). DENSITY-SYMMETRY — every metric (column
+/// widths, inter-cell gap, header padding, caption size) traces to the
+/// density-resolved [`FileListMetrics`] tokens, so the header re-rhythms with
+/// the listing when the user's Density changes.
+pub fn file_row_head(src_label: &str, m: FileListMetrics) -> Element<'static, Message> {
     let layout = row![
-        Space::new().width(Length::Fixed(22.0)),
-        container(text("Name".to_string()).size(10).colr(t::FG_FAINT)).width(Length::Fill),
-        container(text(src_label.to_string()).size(10).colr(t::FG_FAINT)).width(Length::Shrink),
-        container(text("Size".to_string()).size(10).colr(t::FG_FAINT))
-            .width(Length::Fixed(120.0))
+        Space::new().width(Length::Fixed(m.icon_col)),
+        container(text("Name".to_string()).size(m.caption).colr(t::FG_FAINT)).width(Length::Fill),
+        container(
+            text(src_label.to_string())
+                .size(m.caption)
+                .colr(t::FG_FAINT)
+        )
+        .width(Length::Shrink),
+        container(text("Size".to_string()).size(m.caption).colr(t::FG_FAINT))
+            .width(Length::Fixed(m.size_col))
             .align_x(cosmic::iced::alignment::Horizontal::Right),
-        container(text("Modified".to_string()).size(10).colr(t::FG_FAINT))
-            .width(Length::Fixed(100.0))
-            .align_x(cosmic::iced::alignment::Horizontal::Right),
+        container(
+            text("Modified".to_string())
+                .size(m.caption)
+                .colr(t::FG_FAINT)
+        )
+        .width(Length::Fixed(m.modified_col))
+        .align_x(cosmic::iced::alignment::Horizontal::Right),
     ]
-    .spacing(12);
+    .spacing(m.col_gap);
 
     container(layout)
-        .padding(Padding::from([6.0, 8.0]))
+        .padding(Padding::from([f32::from(m.pad_y), f32::from(m.pad_x)]))
         .sty(|_| container::Style {
             snap: false,
             background: Some(Background::Color(Color {
@@ -917,15 +930,19 @@ pub fn file_row_head(src_label: &str) -> Element<'static, Message> {
 
 // ─── List-view file row (`.fm-list-row`) — CR-4.d ─────────────────────────
 
-/// List-view file row — CR-4.d. Classic ChromeOS density: 28 px height,
-/// Roboto 13 px, 1 px `LIST_ROW_DIVIDER` bottom divider, indigo 15 %
-/// selection overlay. Column layout mirrors `file_row_head`: 22 px icon ·
-/// name (fill) · origin (shrink, when `show_src`) · size (120 px) · age (100 px).
+/// List-view file row — CR-4.d. Classic ChromeOS density. DENSITY-SYMMETRY —
+/// the row height, column widths, inter-cell gap, row padding, and the body /
+/// caption text sizes all trace to the density-resolved [`FileListMetrics`]
+/// tokens (passed in `m`), so the row re-rhythms with the listing when the
+/// user's Density changes. 1 px `LIST_ROW_DIVIDER` bottom divider, indigo 15 %
+/// selection overlay. Column layout mirrors `file_row_head`: icon · name (fill)
+/// · origin (shrink, when `show_src`) · size · modified.
 pub fn list_row(
     row_data: FileRow,
     show_src: bool,
     selected: bool,
     focused: bool,
+    m: FileListMetrics,
     motion: RowMotion,
 ) -> Element<'static, Message> {
     let has_conflict = row_data.has_conflict;
@@ -963,35 +980,41 @@ pub fn list_row(
 
     let mut inner = row![
         container(icon_el)
-            .width(Length::Fixed(22.0))
+            .width(Length::Fixed(m.icon_col))
             .align_x(cosmic::iced::alignment::Horizontal::Center),
-        container(text(name.clone()).size(13).font(roboto).colr(t::FG)).width(Length::Fill),
+        container(text(name.clone()).size(m.body).font(roboto).colr(t::FG)).width(Length::Fill),
     ]
-    .spacing(12)
+    .spacing(m.col_gap)
     .align_y(cosmic::iced::alignment::Vertical::Center);
 
     if show_src {
         let origin_str = origin_host.as_deref().unwrap_or("local").to_owned();
         inner = inner.push(
-            container(text(origin_str).size(11).font(roboto).colr(t::FG_DIM)).width(Length::Shrink),
+            container(
+                text(origin_str)
+                    .size(m.caption)
+                    .font(roboto)
+                    .colr(t::FG_DIM),
+            )
+            .width(Length::Shrink),
         );
     }
 
     inner = inner
         .push(
-            container(text(size).size(11).font(roboto).colr(t::FG_DIM))
-                .width(Length::Fixed(120.0))
+            container(text(size).size(m.caption).font(roboto).colr(t::FG_DIM))
+                .width(Length::Fixed(m.size_col))
                 .align_x(cosmic::iced::alignment::Horizontal::Right),
         )
         .push(
-            container(text(age).size(11).font(roboto).colr(t::FG_DIM))
-                .width(Length::Fixed(100.0))
+            container(text(age).size(m.caption).font(roboto).colr(t::FG_DIM))
+                .width(Length::Fixed(m.modified_col))
                 .align_x(cosmic::iced::alignment::Horizontal::Right),
         );
 
     let row_el: Element<'static, Message> = container(inner)
-        .padding(Padding::from([0.0, 8.0]))
-        .height(Length::Fixed(28.0))
+        .padding(Padding::from([0.0, f32::from(m.pad_x)]))
+        .height(Length::Fixed(m.row_h))
         .sty(move |_| container::Style {
             snap: false,
             background: Some(Background::Color(bg)),

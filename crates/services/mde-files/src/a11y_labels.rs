@@ -29,6 +29,7 @@ pub enum A11yAction {
     ToolbarRefresh,
     ToolbarSetLayoutList,
     ToolbarSetLayoutGrid,
+    ToolbarCycleDensity,
     ToolbarBack,
     ToolbarForward,
     ToolbarUp,
@@ -66,6 +67,7 @@ pub fn label_for(action: A11yAction) -> &'static str {
         A11yAction::ToolbarRefresh => "Refresh file list",
         A11yAction::ToolbarSetLayoutList => "Switch to list layout",
         A11yAction::ToolbarSetLayoutGrid => "Switch to grid layout",
+        A11yAction::ToolbarCycleDensity => "Cycle list density",
         A11yAction::ToolbarBack => "Go back",
         A11yAction::ToolbarForward => "Go forward",
         A11yAction::ToolbarUp => "Go up one folder",
@@ -97,6 +99,7 @@ pub fn all_actions() -> &'static [A11yAction] {
         A11yAction::ToolbarRefresh,
         A11yAction::ToolbarSetLayoutList,
         A11yAction::ToolbarSetLayoutGrid,
+        A11yAction::ToolbarCycleDensity,
         A11yAction::ToolbarBack,
         A11yAction::ToolbarForward,
         A11yAction::ToolbarUp,
@@ -189,7 +192,7 @@ mod tests {
         // Compile-time variant set — manually enumerated below so
         // adding a variant without a matching all_actions entry
         // fails the test immediately.
-        let expected = 23usize;
+        let expected = 24usize;
         assert_eq!(
             all_actions().len(),
             expected,
