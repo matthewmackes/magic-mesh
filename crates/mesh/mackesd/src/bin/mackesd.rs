@@ -6315,6 +6315,26 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("compute_provision".into());
 
+        // XCP-3 — the A-plane provision flow. Drains
+        // `action/provision/spawn` and, for each request, drives the
+        // mackes-xcp Hypervisor layer over xe-over-SSH:
+        // `clone MDE-VM-golden → set_identity_seed (the fresh cloud-init
+        // seed: MDE-VM-<name> hostname, op key, regen host keys +
+        // machine-id) → start → resolve IP`, acking on
+        // `action/provision/spawn-ack/<ulid>`. This is the runtime caller
+        // that makes set_identity_seed reachable — a provisioned VM
+        // actually gets its identity seed. Idles cleanly on a node with no
+        // dom0 configured (MCNF_XEN_DOM0S empty → a clean error-ack); the
+        // dom0 allow-list is single-sourced from the datacenter env config.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::xcp_provision::XcpProvisionWorker::new(),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("xcp_provision".into());
+
         // MESH-A-1 (v5.0.0) — per-peer network assessment. Collects
         // the 9 items (docs/design/v6.0-mde-portal.md §7.1) hourly +
         // writes ~/.local/share/mde/netassess/<host>/<iso>-<hash>.json

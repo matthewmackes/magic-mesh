@@ -145,6 +145,128 @@ pub fn argv_uninstall(uuid: &str) -> Vec<String> {
     ]
 }
 
+/// The cloud-init NoCloud seed for one MDE-VM: the rendered `user-data` and
+/// `meta-data` documents plus the `instance-id` they pin (XCP-3 / A2).
+///
+/// Built once per spawn by [`build_identity_seed`] and attached to the freshly
+/// cloned VM by [`Hypervisor::set_identity_seed`]. The new `instance-id` is what
+/// makes cloud-init treat the clone as a *first boot* — so it regenerates SSH
+/// host keys + `machine-id` and applies the new hostname (the A2 "fresh identity
+/// per clone" rule), even though the golden template was cloned with the old
+/// instance's state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentitySeed {
+    /// cloud-init `user-data` (a `#cloud-config` document).
+    pub user_data: String,
+    /// cloud-init `meta-data` (carries `instance-id` + `local-hostname`).
+    pub meta_data: String,
+    /// The unique `instance-id` this seed pins (also returned for the directory
+    /// record so a spawn is traceable to its seed).
+    pub instance_id: String,
+}
+
+/// Render the cloud-init NoCloud seed for an MDE-VM clone (XCP-3 / A2). Pure so
+/// the rendered documents are testable without a host.
+///
+/// `name` is the spawn's short name; the guest hostname is forced to the
+/// `MDE-VM-<name>` convention (operator rule 2026-06-16) — if `name` already
+/// carries the `MDE-VM-` prefix it is not doubled. `op_ssh_key` is the operator's
+/// authorized public key (OpenSSH `ssh-… ` line). `instance_id` is the
+/// per-clone unique id (e.g. a uuid) that triggers cloud-init's first-boot path.
+///
+/// The `user-data` instructs cloud-init to:
+/// - set the hostname (`hostname` + `fqdn`, `preserve_hostname: false`);
+/// - install the operator key for the default user;
+/// - **regenerate SSH host keys** (`ssh_deletekeys: true` + `ssh_genkeytypes`);
+/// - **reset `machine-id`** on first boot (truncate `/etc/machine-id` so
+///   systemd re-seeds it), per the A2 "fresh identity per clone" rule.
+#[must_use]
+pub fn build_identity_seed(name: &str, op_ssh_key: &str, instance_id: &str) -> IdentitySeed {
+    let hostname = mde_vm_hostname(name);
+    let key = op_ssh_key.trim();
+    let user_data = format!(
+        "#cloud-config\n\
+         preserve_hostname: false\n\
+         hostname: {hostname}\n\
+         fqdn: {hostname}\n\
+         ssh_deletekeys: true\n\
+         ssh_genkeytypes: [rsa, ecdsa, ed25519]\n\
+         ssh_authorized_keys:\n\
+         \x20\x20- {key}\n\
+         runcmd:\n\
+         \x20\x20- [ cloud-init-per, once, reset-machine-id, sh, -c, 'truncate -s 0 /etc/machine-id && rm -f /var/lib/dbus/machine-id' ]\n"
+    );
+    let meta_data = format!("instance-id: {instance_id}\nlocal-hostname: {hostname}\n");
+    IdentitySeed {
+        user_data,
+        meta_data,
+        instance_id: instance_id.to_string(),
+    }
+}
+
+/// Force the `MDE-VM-<name>` hostname convention (operator rule 2026-06-16),
+/// without doubling an already-prefixed `name`.
+#[must_use]
+pub fn mde_vm_hostname(name: &str) -> String {
+    let n = name.trim();
+    if n.starts_with("MDE-VM-") || n == "MDE-VM" {
+        n.to_string()
+    } else if let Some(rest) = n.strip_prefix("MDE-VM") {
+        // e.g. "MDE-VM_web1" / "MDE-VMweb1" — normalize to a single dashed prefix.
+        format!("MDE-VM-{}", rest.trim_start_matches(['-', '_']))
+    } else {
+        format!("MDE-VM-{n}")
+    }
+}
+
+/// Minimal, dependency-free base64 (standard alphabet, `=` padded). The seed
+/// documents are pushed into `xenstore-data` where XCP's cloud-init NoCloud
+/// datasource (`vm-data/…`) expects base64-encoded `user-data`/`meta-data`;
+/// keeping it pure avoids pulling a base64 crate into this glue layer (§6).
+#[must_use]
+pub fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied();
+        let b2 = chunk.get(2).copied();
+        let n =
+            (u32::from(b0) << 16) | (u32::from(b1.unwrap_or(0)) << 8) | u32::from(b2.unwrap_or(0));
+        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        out.push(if b1.is_some() {
+            ALPHABET[((n >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if b2.is_some() {
+            ALPHABET[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// `xe vm-param-set uuid=<uuid> xenstore-data:vm-data/user-data=<b64> …` — push
+/// the cloud-init NoCloud seed into the cloned VM's `xenstore-data` so the guest
+/// agent's NoCloud datasource picks it up on first boot (XCP-3 / A2). One `xe`
+/// invocation sets the three map keys (`user-data`, `meta-data`, and the
+/// `instance-id` mirror) that the datasource reads. Pure + tested.
+#[must_use]
+pub fn argv_set_identity_seed(uuid: &str, seed: &IdentitySeed) -> Vec<String> {
+    let ud = base64_encode(seed.user_data.as_bytes());
+    let md = base64_encode(seed.meta_data.as_bytes());
+    vec![
+        "vm-param-set".into(),
+        format!("uuid={uuid}"),
+        format!("xenstore-data:vm-data/user-data={ud}"),
+        format!("xenstore-data:vm-data/meta-data={md}"),
+        format!("xenstore-data:vm-data/instance-id={}", seed.instance_id),
+    ]
+}
+
 /// `xe vm-list params=uuid,name-label,power-state --minimal` — the roster.
 /// `--minimal` makes `xe` emit one CSV record per VM (semicolon-separated rows),
 /// which [`parse_vm_list`] decodes.
@@ -335,6 +457,14 @@ pub trait Hypervisor {
     /// # Errors
     /// Spawn / non-zero `xe` / parse failures.
     fn clone_golden(&self, golden: &str, new_name: &str) -> Result<String, XcpError>;
+    /// Attach the cloud-init NoCloud identity seed to a (freshly cloned, still
+    /// halted) VM so it boots with a fresh identity: `MDE-VM-<name>` hostname,
+    /// the operator's key, regenerated SSH host keys + `machine-id` (A2). Called
+    /// between [`Hypervisor::clone_golden`] and [`Hypervisor::start`].
+    ///
+    /// # Errors
+    /// Spawn / non-zero `xe` failures.
+    fn set_identity_seed(&self, uuid: &str, seed: &IdentitySeed) -> Result<(), XcpError>;
     /// Start a VM by uuid.
     ///
     /// # Errors
@@ -405,6 +535,10 @@ impl Hypervisor for XeSsh {
             return Err(XcpError::Parse("vm-clone returned no uuid".into()));
         }
         Ok(uuid)
+    }
+
+    fn set_identity_seed(&self, uuid: &str, seed: &IdentitySeed) -> Result<(), XcpError> {
+        self.run(&argv_set_identity_seed(uuid, seed)).map(|_| ())
     }
 
     fn start(&self, uuid: &str) -> Result<(), XcpError> {
@@ -540,6 +674,71 @@ uuid ( RO)        : bbbb-2
         assert_eq!(cap.mem_free_kib, 2 * 1024 * 1024);
         assert_eq!(cap.sr_free_bytes, 700); // max(1000-300, 5000-4900)=700
         assert_eq!(cap.running_vms, 3);
+    }
+
+    #[test]
+    fn mde_vm_hostname_enforces_prefix() {
+        assert_eq!(mde_vm_hostname("web1"), "MDE-VM-web1");
+        // Already prefixed — not doubled.
+        assert_eq!(mde_vm_hostname("MDE-VM-web1"), "MDE-VM-web1");
+        assert_eq!(mde_vm_hostname("  db  "), "MDE-VM-db");
+        // Odd separators after the prefix are normalized to a single dash.
+        assert_eq!(mde_vm_hostname("MDE-VM_db"), "MDE-VM-db");
+        assert_eq!(mde_vm_hostname("MDE-VM"), "MDE-VM");
+    }
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        // RFC 4648 §10 test vectors.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn build_identity_seed_renders_a_first_boot_cloud_config() {
+        let seed = build_identity_seed("web1", "ssh-ed25519 AAAAkey op@host", "iid-123");
+        // user-data is a cloud-config that sets the MDE-VM hostname…
+        assert!(seed.user_data.starts_with("#cloud-config\n"));
+        assert!(seed.user_data.contains("hostname: MDE-VM-web1"));
+        // …injects the operator key…
+        assert!(seed.user_data.contains("- ssh-ed25519 AAAAkey op@host"));
+        // …regenerates host keys + resets machine-id (the A2 fresh-identity rule)…
+        assert!(seed.user_data.contains("ssh_deletekeys: true"));
+        assert!(seed.user_data.contains("/etc/machine-id"));
+        assert!(seed.user_data.contains("/var/lib/dbus/machine-id"));
+        // …and meta-data pins the per-clone instance-id + hostname.
+        assert_eq!(
+            seed.meta_data,
+            "instance-id: iid-123\nlocal-hostname: MDE-VM-web1\n"
+        );
+        assert_eq!(seed.instance_id, "iid-123");
+    }
+
+    #[test]
+    fn argv_set_identity_seed_shape_and_roundtrip() {
+        let seed = build_identity_seed("web1", "ssh-ed25519 KEY op@host", "iid-9");
+        let argv = argv_set_identity_seed("u-7", &seed);
+        assert_eq!(argv[0], "vm-param-set");
+        assert_eq!(argv[1], "uuid=u-7");
+        // Three xenstore-data map keys, base64-encoded payloads.
+        let ud = argv[2]
+            .strip_prefix("xenstore-data:vm-data/user-data=")
+            .unwrap();
+        let md = argv[3]
+            .strip_prefix("xenstore-data:vm-data/meta-data=")
+            .unwrap();
+        assert_eq!(argv[4], "xenstore-data:vm-data/instance-id=iid-9");
+        // The encoded payloads decode back to the rendered seed documents.
+        assert_eq!(ud, base64_encode(seed.user_data.as_bytes()));
+        assert_eq!(md, base64_encode(seed.meta_data.as_bytes()));
+        // No raw newlines leaked into argv (base64 keeps it one xe-safe token).
+        assert!(!argv[2].contains('\n'));
+        assert!(!argv[3].contains('\n'));
     }
 
     #[test]
