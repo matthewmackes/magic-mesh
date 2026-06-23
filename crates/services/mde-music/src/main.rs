@@ -36,6 +36,7 @@ use cosmic::Element;
 
 use mde_music::album::{self, AlbumView};
 use mde_music::color;
+use mde_music::density::ListMetrics;
 use mde_music::hub::HubCard;
 use mde_music::library::{self, LibraryItem};
 use mde_music::nav::{NavState, Route};
@@ -2447,30 +2448,32 @@ impl State {
     /// The AIR-14 results sheet: Artists / Albums / Songs sections over the
     /// page. Artist + album rows navigate the breadcrumb; song rows enqueue.
     fn search_sheet(&self) -> Element<'_, Message> {
-        let mut col = column![text("Search").size(18)]
-            .spacing(10)
-            .padding(20)
+        // MUSIC-RFX-10 — Carbon dense result rows from mde-theme tokens.
+        let m = ListMetrics::carbon_dense();
+        let mut col = column![text("Search").size(m.heading)]
+            .spacing(m.header_gap)
+            .padding(m.pad)
             .max_width(720);
         if self.searching {
-            col = col.push(text("Searching…").size(13));
+            col = col.push(text("Searching…").size(m.body));
         } else if let Some(err) = &self.search_error {
-            col = col.push(text(err.clone()).size(13));
+            col = col.push(text(err.clone()).size(m.body));
         } else if let Some(results) = &self.search_results {
             if results.is_empty() {
-                col = col.push(text("No results.").size(13));
+                col = col.push(text("No results.").size(m.body));
             } else {
-                col = col.push(result_section("Artists", &results.artists, |it| {
+                col = col.push(result_section("Artists", &results.artists, m, |it| {
                     Message::OpenArtist(it.id.clone(), it.label.clone())
                 }));
-                col = col.push(result_section("Albums", &results.albums, |it| {
+                col = col.push(result_section("Albums", &results.albums, m, |it| {
                     Message::OpenAlbum(it.id.clone(), it.label.clone())
                 }));
-                col = col.push(result_section("Songs", &results.songs, |it| {
+                col = col.push(result_section("Songs", &results.songs, m, |it| {
                     Message::EnqueueSong(it.id.clone())
                 }));
             }
         }
-        col = col.push(Space::new().height(Length::Fixed(8.0)));
+        col = col.push(Space::new().height(Length::Fixed(f32::from(m.pad))));
         col = col.push(button(text("Close")).on_press(Message::DismissSearch));
         container(scrollable(col))
             .width(Length::Fill)
@@ -2508,39 +2511,41 @@ impl State {
         let Route::Playlist(id, name) = self.nav.current() else {
             return text("No playlist.").size(13).into();
         };
+        // MUSIC-RFX-10 — shared Carbon dense list metrics.
+        let m = ListMetrics::carbon_dense();
         let header = column![
-            text(name.clone()).size(24),
+            text(name.clone()).size(m.heading),
             text(format!(
                 "{} track(s) · reorder with ↑/↓",
                 self.playlist_tracks.len()
             ))
-            .size(12),
-            Space::new().height(Length::Fixed(10.0)),
+            .size(m.mono),
+            Space::new().height(Length::Fixed(f32::from(m.header_gap))),
             button(text("Play all")).on_press(Message::PlayPlaylist(id.clone())),
         ]
-        .spacing(4);
+        .spacing(m.row_gap);
 
-        let mut list = column![].spacing(4);
+        let mut list = column![].spacing(m.row_gap);
         if self.playlist_tracks.is_empty() {
-            list = list.push(text("This playlist is empty.").size(13));
+            list = list.push(text("This playlist is empty.").size(m.body));
         }
         let last = self.playlist_tracks.len().saturating_sub(1);
         for (i, t) in self.playlist_tracks.iter().enumerate() {
             let mut row_el = row![
                 text(format!("{}.", i + 1))
-                    .size(13)
-                    .width(Length::Fixed(32.0)),
-                text(t.label.clone()).size(13).width(Length::Fill),
+                    .size(m.body)
+                    .width(Length::Fixed(m.number_col)),
+                text(t.label.clone()).size(m.body).width(Length::Fill),
             ]
-            .spacing(8)
+            .spacing(m.col_gap)
             .align_y(cosmic::iced::Alignment::Center);
             if i > 0 {
-                row_el =
-                    row_el.push(button(text("↑").size(12)).on_press(Message::PlaylistMoveUp(i)));
+                row_el = row_el
+                    .push(button(text("↑").size(m.mono)).on_press(Message::PlaylistMoveUp(i)));
             }
             if i < last {
-                row_el =
-                    row_el.push(button(text("↓").size(12)).on_press(Message::PlaylistMoveDown(i)));
+                row_el = row_el
+                    .push(button(text("↓").size(m.mono)).on_press(Message::PlaylistMoveDown(i)));
             }
             // MUSIC-RFX-8 — right-click for the action menu (incl. Remove).
             let menu_ctx = TrackContext {
@@ -2551,10 +2556,14 @@ impl State {
             list = list.push(mouse_area(row_el).on_right_press(Message::OpenTrackMenu(menu_ctx)));
         }
 
-        column![header, Space::new().height(Length::Fixed(12.0)), list]
-            .spacing(6)
-            .padding(8)
-            .into()
+        column![
+            header,
+            Space::new().height(Length::Fixed(f32::from(m.header_gap))),
+            list
+        ]
+        .spacing(m.row_gap)
+        .padding(m.pad)
+        .into()
     }
 
     fn album_page(&self) -> Element<'_, Message> {
@@ -2583,34 +2592,42 @@ impl State {
             button(text("Add to Queue")).on_press(Message::AddAlbumToQueue),
         ]
         .spacing(8);
+        // MUSIC-RFX-10 — Carbon dense list metrics (gaps/widths/sizes from
+        // mde-theme tokens, no scattered literals).
+        let m = ListMetrics::carbon_dense();
         let header = column![
-            text(a.name.clone()).size(24),
-            text(a.artist.clone()).size(15),
-            text(meta).size(12),
-            Space::new().height(Length::Fixed(10.0)),
+            text(a.name.clone()).size(m.heading),
+            text(a.artist.clone()).size(m.body),
+            text(meta).size(m.mono),
+            Space::new().height(Length::Fixed(f32::from(m.header_gap))),
             actions,
         ]
-        .spacing(4);
+        .spacing(m.row_gap);
 
         // Numbered track rows with per-track Play-Next / Add-to-Queue.
-        let mut list = column![].spacing(4);
+        let mut list = column![].spacing(m.row_gap);
         for (i, t) in a.tracks.iter().enumerate() {
             let no = t
                 .track_no
                 .unwrap_or_else(|| u32::try_from(i + 1).unwrap_or(0));
             let track_row = row![
-                text(format!("{no}.")).size(13).width(Length::Fixed(32.0)),
-                text(t.title.clone()).size(13).width(Length::Fill),
+                text(format!("{no}."))
+                    .size(m.body)
+                    .width(Length::Fixed(m.number_col)),
+                text(t.title.clone()).size(m.body).width(Length::Fill),
                 text(album::fmt_duration(t.duration))
-                    .size(12)
-                    .width(Length::Fixed(56.0)),
-                button(text("Play Next").size(11)).on_press(Message::PlayTrackNext(t.id.clone())),
-                button(text("+ Queue").size(11)).on_press(Message::AddTrackToQueue(t.id.clone())),
+                    .size(m.mono)
+                    .width(Length::Fixed(m.duration_col)),
+                button(text("Play Next").size(m.caption))
+                    .on_press(Message::PlayTrackNext(t.id.clone())),
+                button(text("+ Queue").size(m.caption))
+                    .on_press(Message::AddTrackToQueue(t.id.clone())),
                 // MUSIC-RFX-7 — add this track to a playlist.
-                button(text("+ Playlist").size(11))
+                button(text("+ Playlist").size(m.caption))
                     .on_press(Message::OpenAddToPlaylist(t.id.clone())),
             ]
-            .spacing(8);
+            .spacing(m.col_gap)
+            .align_y(cosmic::iced::Alignment::Center);
             // MUSIC-RFX-8 — right-click the row for the dense action menu.
             let menu_ctx = TrackContext {
                 song_id: t.id.clone(),
@@ -2648,12 +2665,12 @@ impl State {
             });
         let content = column![
             header_band,
-            Space::new().height(Length::Fixed(16.0)),
+            Space::new().height(Length::Fixed(f32::from(m.header_gap))),
             scrollable(list)
         ]
-        .spacing(8)
+        .spacing(m.pad)
         .width(Length::Fill);
-        row![art, content].spacing(20).into()
+        row![art, content].spacing(m.col_gap).into()
     }
 
     /// MUSIC-PLAYBAR (2026-06-18) — the persistent playback bar, static at the
@@ -3013,17 +3030,20 @@ fn skeleton_grid(cols: usize) -> Element<'static, Message> {
 fn result_section<'a>(
     title: &'a str,
     items: &'a [LibraryItem],
+    m: ListMetrics,
     on_click: impl Fn(&LibraryItem) -> Message,
 ) -> Element<'a, Message> {
-    let mut col = column![].spacing(4);
+    let mut col = column![].spacing(m.row_gap);
     if items.is_empty() {
         return col.into();
     }
-    col = col.push(text(title).size(14));
+    col = col.push(text(title).size(m.body));
     for item in items {
-        col = col.push(button(text(item.label.clone())).on_press(on_click(item)));
+        col = col.push(
+            button(text(item.label.clone()).size(m.body)).on_press(on_click(item)),
+        );
     }
-    col = col.push(Space::new().height(Length::Fixed(10.0)));
+    col = col.push(Space::new().height(Length::Fixed(f32::from(m.header_gap))));
     col.into()
 }
 
