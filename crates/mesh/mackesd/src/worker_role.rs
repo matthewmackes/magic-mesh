@@ -52,6 +52,7 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // ── Workstation (rank 2) — adds voice + media + kdc + remmina.
     ("voice_config", 2),
     ("clipd_supervisor", 2),
+    ("clipboard_sync", 2),
     ("kdc_host", 2),
     ("remmina-sync", 2),
 ];
@@ -142,7 +143,8 @@ mod tests {
         // +1 mesh_dns (PLANES-18), +1 netstate_apply (PLANES-15),
         // +1 validation_suite (PLANES-19), +1 metrics_exporter (EFF-9),
         // +1 hardware_probe (SUBAUDIT-D2 — the PeerProbe producer).
-        assert_eq!(WORKER_TIERS.len(), 27);
+        // +1 clipboard_sync (CLIP-SYNC-1 — the mesh clipboard watcher).
+        assert_eq!(WORKER_TIERS.len(), 28);
     }
 
     #[test]
@@ -174,7 +176,11 @@ mod tests {
             "Server rank-1 = fleet workers + job_exec (PLANES-9); the LizardFS \
              meshfs_worker spawns unconditionally (binary-self-gated)"
         );
-        assert_eq!(count(2), 4, "Workstation adds voice/media/kdc/remmina");
+        assert_eq!(
+            count(2),
+            5,
+            "Workstation adds voice/clipd/clipboard_sync/kdc/remmina"
+        );
     }
 
     #[test]
@@ -227,7 +233,7 @@ mod tests {
         // +1 each (hardware_probe, rank 0 → present in every tier).
         assert_eq!(lh.len(), 20);
         assert_eq!(srv.len(), 23);
-        assert_eq!(ws.len(), 27);
+        assert_eq!(ws.len(), 28); // +clipboard_sync (CLIP-SYNC-1)
         // Strict superset: every lower-tier worker is in the higher tier.
         assert!(lh.iter().all(|w| srv.contains(w)));
         assert!(srv.iter().all(|w| ws.contains(w)));

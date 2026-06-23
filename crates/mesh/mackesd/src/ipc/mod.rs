@@ -28,6 +28,9 @@
 // single source of truth (local XDG+flatpak, mesh peers, workloads, services).
 pub mod apps;
 pub mod bus_bridge;
+// CLIP-SYNC-1 — action/clipboard/* responder (list/pin/unpin/delete/clear)
+// for the mesh-global clipboard history the clipboard_sync worker maintains.
+pub mod clipboard;
 // CONNECT-1 — action/connect/* exposure-policy responder.
 pub mod connect;
 // DATACENTER (action layer) — action/dc/vm-power Xen VM power control responder.

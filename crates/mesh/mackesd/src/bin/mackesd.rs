@@ -6996,6 +6996,43 @@ fn run_serve(
                 tracing::warn!(error = %e, "Route Bus responder: bus persist open failed; responder skipped");
             }
         }
+        // CLIP-SYNC-1 (action layer) — the clipboard responder:
+        // action/clipboard/{list,pin,unpin,delete,clear} edits the mesh-global
+        // history the clipboard_sync worker maintains, for the Clipboard Viewer
+        // (CLIP-VIEW-1). Same dedicated-OS-thread shape as Connect/Route.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let clip_svc =
+                    mackesd_core::ipc::clipboard::ClipboardService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("clipboard-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::clipboard::serve_bus(&persist, &clip_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "Clipboard Bus responder spawned; serving \
+                             action/clipboard/{{list,pin,unpin,delete,clear}} (CLIP-SYNC-1)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Clipboard Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("clipboard_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Clipboard Bus responder: bus persist open failed; responder skipped");
+            }
+        }
         // DATACENTER (action layer) — the VM power-control responder:
         // action/dc/vm-power runs `xe vm-{start,shutdown,reboot}` over the
         // mesh-key SSH against an allowed dom0. Same dedicated-OS-thread shape.
@@ -7586,6 +7623,20 @@ fn run_serve(
                 RestartPolicy::Always,
             ));
             worker_names.lock().expect("worker_names mutex").push("clipd_supervisor".into());
+        }
+
+        // CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
+        // (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every
+        // text clip on the bus + appends to the mesh-global `clipboard/history.json`
+        // (last 50 unpinned + unlimited pinned). Idles gracefully without a display
+        // (the worker self-gates on $WAYLAND_DISPLAY), so it's cheap on a headless
+        // peer. Workstation-tier alongside clipd_supervisor.
+        if mackesd_core::worker_role::runs("clipboard_sync", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::clipboard_sync::build(workgroup_root.clone()),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names.lock().expect("worker_names mutex").push("clipboard_sync".into());
         }
 
         // TUNE-3.b (2026-05-26) — wire the v1.3.0 Fleet ansible-pull

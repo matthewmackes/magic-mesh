@@ -445,6 +445,11 @@ pub mod xcp_host;
 // BUS-5.1 — clipboard daemon supervisor. Spawns one `mde-clipd` process
 // per Wayland session; idles when $WAYLAND_DISPLAY is unset.
 pub mod clipd_supervisor;
+// CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
+// (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every
+// text clip on the bus + appends to ONE mesh-global `clipboard/history.json`
+// (last 50 unpinned + unlimited pinned). All nodes tail it.
+pub mod clipboard_sync;
 // TUNE-16.d (2026-05-30) — Q22 8-peer cap counter. Counts enrolled
 // `role = 'peer'` nodes (phones count, federated external-mesh peers
 // are excluded by virtue of not appearing in the local store). Writes
