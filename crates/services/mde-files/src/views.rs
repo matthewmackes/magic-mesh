@@ -19,8 +19,8 @@ use crate::selection::Selection;
 use crate::theme as t;
 use crate::widgets::{
     banner, breadcrumb_tag, disclosure_row, file_row, file_row_head, ghost_button_style, icon,
-    list_row, peer_card, section_h, side_row, side_section_header, tx_row, BannerStat, RowMotionCtx,
-    SideRowVariant,
+    list_row, peer_card, section_h, side_row, side_section_header, tx_row, BannerStat,
+    RowMotionCtx, SideRowVariant,
 };
 
 // ─── Titlebar ──────────────────────────────────────────────────────────────
@@ -959,20 +959,31 @@ pub fn peer_folder<'a>(
     let _tile_meta = grid::tile_metadata_for(&filtered_rows);
 
     // CR-4.d: List → 28 px tabular rows; Grid → Object Cards (CR-4.b).
-    let mut list = match layout {
-        Layout::List => column![file_row_head("Origin")],
-        Layout::Grid => column![],
-    };
-    for (i, f) in filtered_rows.iter().enumerate() {
-        let sel = selection.is_selected(&f.name);
-        let foc = selection.is_focused(&f.name);
-        let rm = motion.for_row(&f.name, i, sel);
-        let row_el = match layout {
-            Layout::List => list_row(f.clone(), true, sel, foc, rm),
-            Layout::Grid => file_row(f.clone(), true, sel, foc, rm),
+    // BEAUT-FILES — skeleton-first paint while the listing loads with nothing to
+    // keep; stale-dim the kept rows on a refresh.
+    let list: Element<'_, Message> = if motion.show_skeleton() {
+        let head: Element<'_, Message> = match layout {
+            Layout::List => file_row_head("Origin"),
+            Layout::Grid => Space::new().height(Length::Fixed(0.0)).into(),
         };
-        list = list.push(row_el);
-    }
+        column![head, motion.skeleton()].spacing(0).into()
+    } else {
+        let mut list = match layout {
+            Layout::List => column![file_row_head("Origin")],
+            Layout::Grid => column![],
+        };
+        for (i, f) in filtered_rows.iter().enumerate() {
+            let sel = selection.is_selected(&f.name);
+            let foc = selection.is_focused(&f.name);
+            let rm = motion.for_row(&f.name, i, sel);
+            let row_el = match layout {
+                Layout::List => list_row(f.clone(), true, sel, foc, rm),
+                Layout::Grid => file_row(f.clone(), true, sel, foc, rm),
+            };
+            list = list.push(row_el);
+        }
+        crate::loading::dim(list.into(), motion.content_alpha())
+    };
 
     let count_label = if search::is_active(search_query) {
         format!(
@@ -1010,6 +1021,17 @@ fn file_listing(
     selection: &Selection,
     motion: RowMotionCtx<'_>,
 ) -> Element<'static, Message> {
+    // BEAUT-FILES — skeleton-first paint: a first load with no prior rows shows
+    // shimmering layout-matching placeholders instead of an empty pane. Keep the
+    // column header so the listing's chrome lands instantly too.
+    if motion.show_skeleton() {
+        let head: Element<'static, Message> = match layout {
+            Layout::List => file_row_head(head_label),
+            Layout::Grid => Space::new().height(Length::Fixed(0.0)).into(),
+        };
+        return column![head, motion.skeleton()].spacing(0).into();
+    }
+
     let mut list = match layout {
         Layout::List => column![file_row_head(head_label)],
         Layout::Grid => column![].spacing(8),
@@ -1024,7 +1046,9 @@ fn file_listing(
         };
         list = list.push(el);
     }
-    list.into()
+    // BEAUT-FILES — stale-while-refreshing: dim the kept-on-screen rows during a
+    // background refresh (full opacity otherwise — a zero-cost pass-through).
+    crate::loading::dim(list.into(), motion.content_alpha())
 }
 
 // ─── Inbox ─────────────────────────────────────────────────────────────────
@@ -1422,43 +1446,55 @@ pub fn mesh_home_child<'a>(
         vec![BannerStat::new(count.to_string(), "Items")],
     );
 
-    let mut list = match layout {
-        Layout::List => column![file_row_head("Modified")],
-        Layout::Grid => column![].spacing(8),
-    };
-    // Parent-link row when descended at least one level.
-    if !path.is_empty() {
-        list = list.push(parent_link_row());
-    }
-    // MOTION-FEEDBACK — stagger index counts only the rendered *file* rows
-    // (folder rows take the non-animated `folder_row_button` path), so the
-    // reveal cascade stays contiguous even in a folder-heavy directory.
-    let mut row_idx = 0usize;
-    for f in filtered {
-        let is_folder = f.name.ends_with('/') || matches!(f.mime, crate::model::Mime::Folder);
-        if is_folder {
-            // Clickable folder row. Strip trailing `/` for the
-            // message payload so the reducer compares clean
-            // names against the path stack.
-            list = list.push(folder_row_button(f));
-        } else {
-            let sel = selection.is_selected(&f.name);
-            let foc = selection.is_focused(&f.name);
-            let rm = motion.for_row(&f.name, row_idx, sel);
-            row_idx += 1;
-            // AFM-7 — honor the list/grid toggle for file rows.
-            let row_el = match layout {
-                Layout::List => list_row(f, false, sel, foc, rm),
-                Layout::Grid => file_row(f, false, sel, foc, rm),
-            };
-            list = list.push(row_el);
+    // BEAUT-FILES — skeleton-first paint while the directory loads with nothing to
+    // keep (the column header lands instantly underneath the placeholders).
+    let list_el: Element<'_, Message> = if motion.show_skeleton() {
+        let head: Element<'_, Message> = match layout {
+            Layout::List => file_row_head("Modified"),
+            Layout::Grid => Space::new().height(Length::Fixed(0.0)).into(),
+        };
+        column![head, motion.skeleton()].spacing(0).into()
+    } else {
+        let mut list = match layout {
+            Layout::List => column![file_row_head("Modified")],
+            Layout::Grid => column![].spacing(8),
+        };
+        // Parent-link row when descended at least one level.
+        if !path.is_empty() {
+            list = list.push(parent_link_row());
         }
-    }
+        // MOTION-FEEDBACK — stagger index counts only the rendered *file* rows
+        // (folder rows take the non-animated `folder_row_button` path), so the
+        // reveal cascade stays contiguous even in a folder-heavy directory.
+        let mut row_idx = 0usize;
+        for f in filtered {
+            let is_folder = f.name.ends_with('/') || matches!(f.mime, crate::model::Mime::Folder);
+            if is_folder {
+                // Clickable folder row. Strip trailing `/` for the
+                // message payload so the reducer compares clean
+                // names against the path stack.
+                list = list.push(folder_row_button(f));
+            } else {
+                let sel = selection.is_selected(&f.name);
+                let foc = selection.is_focused(&f.name);
+                let rm = motion.for_row(&f.name, row_idx, sel);
+                row_idx += 1;
+                // AFM-7 — honor the list/grid toggle for file rows.
+                let row_el = match layout {
+                    Layout::List => list_row(f, false, sel, foc, rm),
+                    Layout::Grid => file_row(f, false, sel, foc, rm),
+                };
+                list = list.push(row_el);
+            }
+        }
+        // BEAUT-FILES — stale-while-refreshing dim of the kept rows on a refresh.
+        crate::loading::dim(list.spacing(0).into(), motion.content_alpha())
+    };
 
     column![
         banner_widget,
         Space::new().height(Length::Fixed(22.0)),
-        list.spacing(0),
+        list_el,
     ]
     .spacing(0)
     .into()

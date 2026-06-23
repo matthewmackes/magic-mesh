@@ -31,6 +31,7 @@ pub mod desktop;
 pub mod fileops;
 pub mod grid;
 pub mod icons;
+pub mod loading;
 #[cfg(feature = "dbus")]
 pub mod mesh_backend;
 pub mod mime;

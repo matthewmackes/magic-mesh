@@ -606,6 +606,38 @@ pub struct RowMotionCtx<'a> {
     pub now: std::time::Instant,
     /// Reduce-motion: instant state changes, no movement.
     pub reduce_motion: bool,
+    /// BEAUT-FILES — the perceived-performance load state of this listing. Drives
+    /// the skeleton-first paint + the stale-while-refreshing dim/crossfade the
+    /// file views apply around their row list.
+    pub load: crate::loading::ListingLoad,
+}
+
+impl RowMotionCtx<'_> {
+    /// BEAUT-FILES — render the skeleton placeholder instead of the row list?
+    /// (First load with no prior content.)
+    #[must_use]
+    pub fn show_skeleton(&self) -> bool {
+        self.load.show_skeleton()
+    }
+
+    /// BEAUT-FILES — the skeleton placeholder element for a loading listing,
+    /// shimmering at the current frame's phase (static under reduce-motion).
+    #[must_use]
+    pub fn skeleton(&self) -> Element<'static, Message> {
+        crate::loading::skeleton_rows(
+            crate::loading::SKELETON_ROW_COUNT,
+            self.load.skeleton_phase(self.now),
+            self.reduce_motion,
+        )
+    }
+
+    /// BEAUT-FILES — the opacity to render kept-on-screen rows at: full normally,
+    /// dimmed during a stale refresh (stale-while-revalidate). The view multiplies
+    /// its row text/background tints by this so a refresh dims rather than blanks.
+    #[must_use]
+    pub fn content_alpha(&self) -> f32 {
+        self.load.content_alpha()
+    }
 }
 
 impl RowMotionCtx<'_> {
@@ -650,7 +682,9 @@ impl RowMotionCtx<'_> {
         } else {
             0.0
         };
-        let lift_px = Transition::Lift(ROW_HOVER_RISE_PX).params(hover_amt).translate_y;
+        let lift_px = Transition::Lift(ROW_HOVER_RISE_PX)
+            .params(hover_amt)
+            .translate_y;
 
         // Staggered reveal: row `index` (capped at STAGGER_CAP-1) gets a delayed
         // SlideUp that settles to 0. Past the cap every row shares the cap delay
@@ -669,7 +703,9 @@ impl RowMotionCtx<'_> {
                         std::time::Duration::from_millis(u64::from(list::STAGGER_REVEAL_MS));
                     let tw = mde_theme::animation::Tween::starting_at(reveal_start, reveal_dur);
                     let t = ease(tw.progress(self.now), Easing::EaseOut);
-                    Transition::SlideUp(ROW_REVEAL_SLIDE_PX).params(t).translate_y
+                    Transition::SlideUp(ROW_REVEAL_SLIDE_PX)
+                        .params(t)
+                        .translate_y
                 }
             }
             None => 0.0,
@@ -1313,6 +1349,7 @@ mod motion_tests {
             reveal_origin,
             now,
             reduce_motion,
+            load: crate::loading::ListingLoad::default(),
         }
     }
 
@@ -1356,7 +1393,10 @@ mod motion_tests {
         .vertical_padding()
         .0;
         assert!(hovered < rest, "hover raises the row (less top padding)");
-        assert!(revealing > rest, "reveal starts the row lower (more top padding)");
+        assert!(
+            revealing > rest,
+            "reveal starts the row lower (more top padding)"
+        );
     }
 
     #[test]
@@ -1369,7 +1409,10 @@ mod motion_tests {
         let m = c.for_row("a.txt", 3, true);
         assert_eq!(m.lift_px, 0.0, "no hover lift under reduce-motion");
         assert_eq!(m.reveal_y, 0.0, "no reveal slide under reduce-motion");
-        assert!((m.accent_t - 1.0).abs() < 1e-6, "selected ⇒ full accent instantly");
+        assert!(
+            (m.accent_t - 1.0).abs() < 1e-6,
+            "selected ⇒ full accent instantly"
+        );
         // Unselected row: no accent.
         assert_eq!(c.for_row("b.txt", 0, false).accent_t, 0.0);
     }
@@ -1427,11 +1470,17 @@ mod motion_tests {
         let mid = now + dur / 2;
         let c = ctx(&anim, Some(key.as_str()), None, None, mid, false);
         let lift = c.for_row("file", 0, false).lift_px;
-        assert!(lift < 0.0 && lift > -ROW_HOVER_RISE_PX, "easing up, got {lift}");
+        assert!(
+            lift < 0.0 && lift > -ROW_HOVER_RISE_PX,
+            "easing up, got {lift}"
+        );
         // Releasing at the same instant: settling back, so a smaller magnitude.
         let cr = ctx(&anim, None, Some(key.as_str()), None, mid, false);
         let rel = cr.for_row("file", 0, false).lift_px;
-        assert!(rel < 0.0 && rel > lift, "release settles toward rest, got {rel}");
+        assert!(
+            rel < 0.0 && rel > lift,
+            "release settles toward rest, got {rel}"
+        );
         // A row that is neither hovered nor releasing sits at rest.
         let cn = ctx(&anim, None, None, None, mid, false);
         assert_eq!(cn.for_row("file", 0, false).lift_px, 0.0);
