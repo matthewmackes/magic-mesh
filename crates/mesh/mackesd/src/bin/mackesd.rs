@@ -6203,6 +6203,33 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("compute_registry".into());
 
+        // APPS-LIVE-1 — apps_running: mirror this node's set of currently-
+        // running launchable apps to <QNM-Shared>/<host>/running-apps.json
+        // every 10 s so every node's Applications-menu launcher can badge each
+        // entry with a live "running on <host>" indicator (same replicated
+        // plane as compute-inventory.json; the bus is per-node). Detects via
+        // process ↔ .desktop match — root reads every /proc/<pid>/cmdline, so
+        // no per-seat compositor probe is needed. The `.desktop` scan root
+        // mirrors the apps aggregator's home.
+        let apps_running_home = std::env::var_os("HOME")
+            .map_or_else(|| PathBuf::from("/root"), PathBuf::from);
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::apps_running::AppsRunningWorker::new(
+                fw_host.clone(),
+                apps_running_home,
+            )
+            // Write to the SAME resolved root the apps responder reads from
+            // (honors a `--workgroup-root` override) — otherwise the worker would
+            // publish under the default root while the reader looked elsewhere and
+            // no app ever got badged.
+            .with_mount(workgroup_root.clone()),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("apps_running".into());
+
         // VIRT-5 (v5.0.0) — VM Nebula cert signing via Bus. Every peer
         // spawns the worker; only the CA peer (presence of
         // ~/.config/mde/nebula/ca.key) actually signs + replies, the
