@@ -321,6 +321,69 @@ pub fn mesh_targets(workgroup_root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Filename the `compute_registry` worker mirrors each host's VM/container
+/// inventory to under its QNM-Shared dir (`<root>/<host>/<file>`). Mirror of
+/// [`crate::workers::compute_registry::SHARED_INVENTORY_FILE`], named here so
+/// this resolver doesn't depend on the `async-services`-gated worker module.
+const COMPUTE_INVENTORY_FILE: &str = "compute-inventory.json";
+
+/// SVC-VIEW-2 — harvest the overlay IPs of enrolled VMs so the probe scans a
+/// VM's services (e.g. whatever runs *inside* MDE-KVM-1), not just full mesh
+/// peers + the LAN.
+///
+/// A VM's Nebula overlay IP lives only in the per-host
+/// `<root>/<host>/compute-inventory.json` files (the WORKLOAD-FLEET plane,
+/// written by every node's `compute_registry`); it is **not** in the per-peer
+/// `nebula-bundle.json` that [`mesh_targets`] reads, so an enrolled VM's
+/// overlay IP is otherwise never a probe target and its services never reach
+/// `probe-inventory.json` → the Services view. This reads those inventory
+/// files and returns each VM's non-empty `nebula_ip`. Fail-open per file: a
+/// missing / malformed / unreadable inventory is skipped (debug-logged), and a
+/// missing `workgroup_root` → empty. Pure (only reads the replicated plane);
+/// `merge_targets` dedupes the result against the mesh + LAN targets.
+#[must_use]
+pub fn vm_overlay_targets(workgroup_root: &Path) -> Vec<String> {
+    // Deserialize just the field we need — decoupled from the full
+    // `compute_registry::Inventory` so a future schema change there can't break
+    // the probe, and so this stays usable without the `async-services` feature.
+    #[derive(serde::Deserialize)]
+    struct InvVms {
+        #[serde(default)]
+        vms: Vec<InvVm>,
+    }
+    #[derive(serde::Deserialize)]
+    struct InvVm {
+        #[serde(default)]
+        nebula_ip: String,
+    }
+    let Ok(entries) = std::fs::read_dir(workgroup_root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path().join(COMPUTE_INVENTORY_FILE);
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        match serde_json::from_str::<InvVms>(&body) {
+            Ok(inv) => {
+                for vm in inv.vms {
+                    if !vm.nebula_ip.is_empty() && !out.contains(&vm.nebula_ip) {
+                        out.push(vm.nebula_ip);
+                    }
+                }
+            }
+            Err(e) => tracing::debug!(
+                target: "mackesd::probe_nmap",
+                path = %path.display(),
+                error = %e,
+                "skipping malformed compute inventory for VM scan targets (fail-open)",
+            ),
+        }
+    }
+    out
+}
+
 // ── Read API (MESH-PROBE-6) ──────────────────────────────────────────
 //
 // The consumer-facing side: merge every peer's GFS-replicated
@@ -608,13 +671,24 @@ pub fn merge_targets(mesh: &[String], lan: &[String], arbitrary: &[String]) -> V
 }
 
 /// Resolve the full scan scope (Q5): mesh peers (from `workgroup_root`) ∪
-/// detected LAN CIDRs ∪ operator-arbitrary targets (from
+/// enrolled-VM overlay IPs (SVC-VIEW-2, from the replicated compute-inventory
+/// plane) ∪ detected LAN CIDRs ∪ operator-arbitrary targets (from
 /// `~/.config/mde/probe-targets.toml`), minus the do-not-scan list
 /// (`~/.config/mde/probe-do-not-scan.toml`, passed to nmap
 /// `--exclude`). `home` locates the config files (injected for tests).
 #[must_use]
 pub fn resolve_targets(workgroup_root: &Path, home: &Path) -> TargetSet {
-    let mesh = mesh_targets(workgroup_root);
+    // Mesh peers (per-peer nebula bundles) ∪ enrolled-VM overlay IPs (from the
+    // replicated compute-inventory files). Both are overlay-IP targets, so they
+    // share the first-class "mesh" ordering ahead of LAN + arbitrary; the VM
+    // IPs are appended so a VM that also happens to be a full peer dedupes to
+    // the peer entry (SVC-VIEW-2).
+    let mut mesh = mesh_targets(workgroup_root);
+    for vm_ip in vm_overlay_targets(workgroup_root) {
+        if !mesh.contains(&vm_ip) {
+            mesh.push(vm_ip);
+        }
+    }
     let lan = detect_lan_cidrs();
     let cfg = home.join(".config").join("mde");
     // SVC-VIEW-2 — known single-IP LAN service hosts (e.g. Airsonic on
@@ -962,6 +1036,73 @@ mod tests {
         assert_eq!(t, vec!["10.42.0.5".to_string(), "10.42.0.6".to_string()]);
     }
 
+    // SVC-VIEW-2 — seed `<root>/<host>/compute-inventory.json` with the given
+    // VMs (name, overlay_ip) for the VM-target-resolution tests. Mirrors the
+    // doc `compute_registry::write_shared_inventory` writes.
+    fn seed_compute_inventory(root: &Path, host: &str, vms: &[(&str, &str)]) {
+        let dir = root.join(host);
+        std::fs::create_dir_all(&dir).unwrap();
+        let vm_json: Vec<String> = vms
+            .iter()
+            .map(|(name, ip)| {
+                format!(
+                    r#"{{"id":"u-{name}","name":"{name}","state":"running","cpu_pct":0.0,"ram_mb":2048,"disk_path":"","nebula_ip":"{ip}","meshfs_available":false}}"#
+                )
+            })
+            .collect();
+        let body = format!(
+            r#"{{"peer":"10.42.0.3","hostname":"{host}","vms":[{}],"containers":[]}}"#,
+            vm_json.join(",")
+        );
+        std::fs::write(dir.join("compute-inventory.json"), body).unwrap();
+    }
+
+    #[test]
+    fn vm_overlay_targets_harvests_enrolled_vm_ips() {
+        // The VM-internal-services path: an enrolled VM's overlay IP lives only
+        // in the per-host compute inventory, not the nebula bundles, so it must
+        // come from `vm_overlay_targets` to ever be scanned.
+        let root = tmp_root("vm-targets");
+        seed_compute_inventory(
+            &root,
+            "fedora",
+            &[("MDE-KVM-1", "10.42.1.20"), ("MDE-VM-2", "10.42.1.21")],
+        );
+        // A VM with no overlay IP yet (no sidecar) must be skipped.
+        seed_compute_inventory(&root, "host-b", &[("unenrolled", "")]);
+        // A malformed inventory must be skipped (fail-open), not abort.
+        let bad = root.join("host-c");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("compute-inventory.json"), "{ not json").unwrap();
+        let mut got = vm_overlay_targets(&root);
+        got.sort();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            got,
+            vec!["10.42.1.20".to_string(), "10.42.1.21".to_string()],
+            "both enrolled VM overlay IPs harvested; empty + malformed skipped"
+        );
+    }
+
+    #[test]
+    fn vm_overlay_targets_empty_for_missing_root() {
+        assert!(vm_overlay_targets(Path::new("/nonexistent/qnm/xyz")).is_empty());
+    }
+
+    #[test]
+    fn vm_overlay_targets_dedupes_same_ip_across_hosts() {
+        let root = tmp_root("vm-dedup");
+        seed_compute_inventory(&root, "host-a", &[("vmX", "10.42.1.30")]);
+        seed_compute_inventory(&root, "host-b", &[("vmX-dup", "10.42.1.30")]);
+        let got = vm_overlay_targets(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            got,
+            vec!["10.42.1.30".to_string()],
+            "duplicate IP collapsed"
+        );
+    }
+
     #[test]
     fn write_inventory_detects_change_then_noop() {
         let root = tmp_root("write");
@@ -1243,6 +1384,27 @@ mod tests {
         assert!(
             KNOWN_LAN_SERVICE_HOSTS.contains(&"172.20.0.2"),
             "Airsonic host is a built-in known LAN service host"
+        );
+    }
+
+    #[test]
+    fn resolve_targets_includes_enrolled_vm_overlay_ip() {
+        // SVC-VIEW-2 — an enrolled VM's overlay IP (from the replicated
+        // compute-inventory plane) must reach the resolved scan scope so the
+        // probe scans the VM's services. Hermetic: the VM IP `10.42.1.20` is in
+        // the 10.x overlay range and seeded ONLY via the compute inventory —
+        // `detect_lan_cidrs`/mesh bundles can't produce it — so its presence
+        // proves the `vm_overlay_targets` wiring.
+        let root = tmp_root("resolve-vm");
+        let qnm = root.join("qnm");
+        std::fs::create_dir_all(&qnm).unwrap();
+        seed_compute_inventory(&qnm, "fedora", &[("MDE-KVM-1", "10.42.1.20")]);
+        let home = root.join("home"); // no operator config
+        let ts = resolve_targets(&qnm, &home);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            ts.targets.contains(&"10.42.1.20".to_string()),
+            "enrolled VM overlay IP scanned for its internal services"
         );
     }
 }
