@@ -67,10 +67,19 @@ pub async fn delete_peer(client: &mut Client, hostname: &str) -> anyhow::Result<
     Ok(())
 }
 
-/// Build a private current-thread runtime and drive `fut`. Returns `None` when a
-/// runtime can't be built. MUST be called OFF the tokio executor (the heartbeat
-/// std::thread + the directory responder thread both qualify).
+/// Drive `fut` to completion from a synchronous context. Off the tokio executor
+/// (the heartbeat std::thread / directory responder thread) it spins a private
+/// current-thread runtime; ON the executor (a worker like `mesh_dns` that reached
+/// a blocking bridge) it must NOT build a nested runtime — that panics ("Cannot
+/// start a runtime from within a runtime") and on an etcd node crash-loops the
+/// worker until ENT-6 circuit-breaks it. Returns `None` only when a private
+/// runtime can't be built.
 fn block_on<F: std::future::Future>(fut: F) -> Option<F::Output> {
+    // Already inside a runtime → move off the async worker with `block_in_place`
+    // and drive on the existing multi-thread handle instead of nesting.
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return Some(tokio::task::block_in_place(|| handle.block_on(fut)));
+    }
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
