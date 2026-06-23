@@ -26,6 +26,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use crate::frame_timer::{FrameSample, FrameTimer};
 use crate::motion::{Easing, Motion};
 
 /// Single-shot tween over a fixed duration. Stateless w.r.t.
@@ -284,16 +285,72 @@ impl Transition {
 /// own. [`Animator::is_idle`] reports when nothing is in flight, so the consumer
 /// can stop ticking at rest (no idle/offscreen CPU — MOTION-PERF-1). Pure state
 /// (no toolkit dep); the consumer reads [`Animator::value`] in its `view`.
-#[derive(Debug, Default, Clone)]
+///
+/// ## MOTION-INFRA-3 — idle/visibility-hardened tick gating
+///
+/// A subscription must arm a per-frame tick **only while an animation is
+/// actually in flight AND the surface is visible**. The animator therefore
+/// tracks the surface's visibility ([`Animator::set_visible`]) and exposes
+/// [`Animator::needs_tick`] — the single predicate a consumer's `subscription()`
+/// gates on. The contract this enforces:
+///
+/// * **At rest, zero ticks.** No tween in flight ⇒ `needs_tick` is `false`.
+/// * **Hidden/closed surface animates nothing.** Even with a stale in-flight
+///   tween, a surface marked not-visible reports `needs_tick == false`: a
+///   collapsed popup or a closed window arms no animation clock at all.
+///
+/// ## MOTION-INFRA-3 — opt-in per-frame timing
+///
+/// When `MDE_FRAME_DEBUG` is set ([`crate::frame_timer::FRAME_DEBUG_ENV`]), the
+/// animator's [`Animator::frame_tick`] yields a [`FrameSample`] carrying the
+/// per-frame milliseconds for the surface, so a slow/stuttering motion is
+/// loggable. The flag is read **once** at [`Animator::new`]/`Default` (via
+/// [`FrameTimer::from_env`]); when unset the timer is the zero-cost
+/// [`FrameTimer::Off`] variant and `frame_tick` never reads the clock or
+/// allocates — default OFF, zero cost.
+#[derive(Debug, Clone)]
 pub struct Animator {
     tweens: HashMap<String, Tween>,
+    /// Whether the surface this animator drives is on-screen. A not-visible
+    /// surface arms no tick regardless of in-flight tweens (hidden popup,
+    /// collapsed panel, closed window). Visible by default — most surfaces are.
+    visible: bool,
+    /// Opt-in per-frame instrumentation. Armed iff `MDE_FRAME_DEBUG` is set when
+    /// the animator is built; [`FrameTimer::Off`] (zero cost) otherwise.
+    frame_timer: FrameTimer,
+}
+
+impl Default for Animator {
+    fn default() -> Self {
+        Self {
+            tweens: HashMap::new(),
+            visible: true,
+            // Read the env flag exactly once, here. `tick()`/`frame_tick()`
+            // never touch the environment again.
+            frame_timer: FrameTimer::from_env("animator"),
+        }
+    }
 }
 
 impl Animator {
-    /// An empty animator (nothing animating).
+    /// An empty animator (nothing animating), visible by default. Reads the
+    /// `MDE_FRAME_DEBUG` gate once (see the type docs).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build an animator with an explicit frame-debug decision, bypassing the
+    /// `MDE_FRAME_DEBUG` env probe. Lets a test (or a GUI's own debug toggle)
+    /// arm per-frame timing without mutating process env — which is `unsafe`
+    /// and racy under a test harness. Starts empty + visible.
+    #[must_use]
+    pub fn with_frame_debug(enabled: bool) -> Self {
+        Self {
+            tweens: HashMap::new(),
+            visible: true,
+            frame_timer: FrameTimer::with_enabled("animator", enabled),
+        }
     }
 
     /// Start (or restart) the animation under `id` from `start`, using the
@@ -335,10 +392,56 @@ impl Animator {
     }
 
     /// True when nothing is animating — the subscription should stop ticking
-    /// (MOTION-PERF-1: zero idle wakeups).
+    /// (MOTION-PERF-1: zero idle wakeups). This is in-flight state only; it does
+    /// **not** consider visibility. Gate a subscription on [`Animator::needs_tick`]
+    /// instead, which also folds in whether the surface is on-screen.
     #[must_use]
     pub fn is_idle(&self, now: Instant) -> bool {
         self.tweens.values().all(|tw| tw.is_complete(now))
+    }
+
+    /// MOTION-INFRA-3 — mark whether the surface this animator drives is
+    /// on-screen. A hidden/closed surface (collapsed popup, closed window) arms
+    /// no tick even mid-animation, so [`Animator::needs_tick`] returns `false`
+    /// while not visible. Returns `&mut self` so a consumer can chain it from a
+    /// visibility/focus message handler.
+    pub fn set_visible(&mut self, visible: bool) -> &mut Self {
+        self.visible = visible;
+        self
+    }
+
+    /// MOTION-INFRA-3 — is the surface currently considered on-screen?
+    #[must_use]
+    pub const fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    /// MOTION-INFRA-3 — **the** tick predicate a `subscription()` gates on: an
+    /// animation tick is needed only when something is in flight **and** the
+    /// surface is visible. At rest, or while hidden/closed, this is `false`, so
+    /// the per-frame clock is never armed (MOTION-PERF-1: zero idle/offscreen
+    /// wakeups). Equivalent to `self.is_visible() && !self.is_idle(now)`.
+    #[must_use]
+    pub fn needs_tick(&self, now: Instant) -> bool {
+        self.visible && !self.is_idle(now)
+    }
+
+    /// MOTION-INFRA-3 — is per-frame debug instrumentation armed
+    /// (`MDE_FRAME_DEBUG` was set at construction)? Lets a consumer skip building
+    /// a log line entirely when off.
+    #[must_use]
+    pub const fn frame_debug_enabled(&self) -> bool {
+        self.frame_timer.is_enabled()
+    }
+
+    /// MOTION-INFRA-3 — record one animation frame at `now` for the optional
+    /// `MDE_FRAME_DEBUG` instrumentation, returning the inter-frame
+    /// [`FrameSample`] (per-frame milliseconds) when the gate is armed and a
+    /// prior frame exists to diff against. When the flag is unset this is the
+    /// zero-cost path: a single discriminant check returning `None`, with no
+    /// clock read and no allocation. Call once per tick alongside [`Animator::gc`].
+    pub fn frame_tick(&mut self, now: Instant) -> Option<FrameSample> {
+        self.frame_timer.tick_at(now)
     }
 }
 
@@ -516,6 +619,111 @@ mod tests {
         let mut a = Animator::new();
         a.start("x", t0, Motion::loading(), true); // capped to 80 ms
         assert!(a.is_idle(t0 + Duration::from_millis(80)));
+    }
+
+    #[test]
+    fn animator_needs_no_tick_at_rest() {
+        // MOTION-INFRA-3 — the core idle-hardening contract: with nothing in
+        // flight the animator reports "no ticks needed", so the subscription
+        // never arms a per-frame clock (MOTION-PERF-1: zero idle wakeups).
+        let t0 = Instant::now();
+        let a = Animator::new();
+        assert!(a.is_idle(t0), "empty animator is idle");
+        assert!(a.is_visible(), "a fresh animator is visible by default");
+        assert!(
+            !a.needs_tick(t0),
+            "at rest (no tween) ⇒ no tick needed even while visible"
+        );
+    }
+
+    #[test]
+    fn animator_needs_tick_only_while_in_flight_and_visible() {
+        // MOTION-INFRA-3 — needs_tick == (visible AND in-flight). A tick arms
+        // only when both hold; it stops the instant either drops out.
+        let t0 = Instant::now();
+        let mut a = Animator::new();
+        a.start("fade", t0, Motion::panel_mount(), false); // 240 ms
+        assert!(a.needs_tick(t0), "visible + in-flight ⇒ tick needed");
+        // Once the tween settles, the tick stops even though still visible.
+        let done = t0 + Duration::from_millis(300);
+        assert!(a.is_idle(done));
+        assert!(
+            !a.needs_tick(done),
+            "settled ⇒ no tick needed (visible but idle)"
+        );
+    }
+
+    #[test]
+    fn hidden_surface_arms_no_tick_even_mid_animation() {
+        // MOTION-INFRA-3 — a hidden/closed popup animates nothing: with an
+        // in-flight tween but the surface marked not-visible, needs_tick is
+        // false, so a collapsed popup / closed window arms zero animation ticks.
+        let t0 = Instant::now();
+        let mut a = Animator::new();
+        a.start("open", t0, Motion::panel_mount(), false); // in flight
+        assert!(
+            !a.is_idle(t0),
+            "tween is in flight (idle-state is independent of visibility)"
+        );
+        assert!(a.needs_tick(t0), "visible + in-flight ⇒ tick needed");
+        // Hide the surface: the in-flight tween is unchanged but no tick arms.
+        a.set_visible(false);
+        assert!(!a.is_visible());
+        assert!(
+            !a.needs_tick(t0),
+            "hidden surface ⇒ zero ticks even mid-animation"
+        );
+        assert!(
+            !a.is_idle(t0),
+            "hiding does not retroactively complete the tween"
+        );
+        // Re-showing it resumes ticking while still in flight.
+        a.set_visible(true);
+        assert!(
+            a.needs_tick(t0),
+            "re-shown + still in-flight ⇒ tick resumes"
+        );
+    }
+
+    #[test]
+    fn frame_debug_flag_default_off_is_zero_cost() {
+        // MOTION-INFRA-3 — the MDE_FRAME_DEBUG gate is read once at construction
+        // and OFF by default: frame_tick yields no samples and reads no clock.
+        let t0 = Instant::now();
+        let mut a = Animator::with_frame_debug(false);
+        assert!(
+            !a.frame_debug_enabled(),
+            "debug must be OFF unless explicitly armed"
+        );
+        for i in 0..5 {
+            assert_eq!(
+                a.frame_tick(t0 + Duration::from_millis(i * 16)),
+                None,
+                "OFF frame_tick yields nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_debug_flag_when_armed_reports_per_frame_ms() {
+        // MOTION-INFRA-3 — armed, frame_tick reports the per-frame interval so a
+        // developer can log per-frame milliseconds. The flag is gated (only the
+        // armed animator samples) — proving it's an opt-in switch, not always-on.
+        let t0 = Instant::now();
+        let mut a = Animator::with_frame_debug(true);
+        assert!(a.frame_debug_enabled(), "explicitly armed");
+        // First frame: counted, but no predecessor to diff against.
+        assert_eq!(a.frame_tick(t0), None, "first frame has no interval");
+        // Second frame, 16 ms later → a sample carrying the per-frame ms.
+        let s = a
+            .frame_tick(t0 + Duration::from_millis(16))
+            .expect("armed timer yields a sample after the first frame");
+        assert_eq!(s.surface, "animator");
+        assert_eq!(s.interval, Duration::from_millis(16));
+        assert!(
+            (s.interval.as_secs_f64() * 1000.0 - 16.0).abs() < 1e-6,
+            "interval is the per-frame milliseconds"
+        );
     }
 
     #[test]
