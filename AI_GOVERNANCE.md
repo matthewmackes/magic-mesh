@@ -227,6 +227,18 @@ desktop-personal panels grouped below. Locks (full table: `docs/design/planes.md
 >   remote workspace+target on one VM, so several builds share a host without colliding
 >   (BigBoy `.52`, 12c/24G, runs 2-3 in parallel). Distribute agents across `.50/.51/.52`
 >   AND across slots.
+> - **Cap concurrency per node — learned the hard way (2026-06-22).** Pointing ALL
+>   builds at one node (BigBoy) and running **6 concurrent heavy `mde-workbench`
+>   (libcosmic GUI) builds** drove `.52` to **load 49 + disk → 3.6 GB free**; builds
+>   stalled, agents hung waiting on builds that never finished, and several otherwise-good
+>   units became "duds" purely from host exhaustion (their code compiled — only the host
+>   couldn't link/test under contention). A heavy GUI build wants ~1 core + GBs of `target`;
+>   keep **≤2–3 heavy builds per node** and genuinely spread across `.50/.51/.52`. When a
+>   node is saturated, salvage a stuck agent's uncommitted code by building it on a FREE
+>   node (`MCNF_BUILD_HOST=172.20.0.51`), then commit + cherry-pick. Killing a farm agent
+>   leaves its remote `cargo`/`rustc` orphaned (the SSH child keeps building) — they
+>   self-clear on completion; a blanket remote `pkill` is (correctly) classifier-blocked on
+>   shared infra, so prefer not to over-spawn in the first place.
 > - **Parallel mutating agents:** spawn with `isolation:"worktree"` (no code
 >   cross-contamination). They cut from the **master tip**, so tell each to
 >   `git reset --hard <current-work-tip-sha>` first; have each commit its **disjoint**
