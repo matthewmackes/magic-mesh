@@ -46,7 +46,7 @@ impl HostOpsService {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 2] = ["host-power", "gateway-reboot"];
+pub const ACTION_VERBS: [&str; 3] = ["host-power", "gateway-reboot", "dr-backup"];
 
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -195,6 +195,56 @@ fn gateway_reboot(req_body: Option<&str>) -> Result<(), String> {
     }
 }
 
+/// Run the DATACENTER-23 disaster-recovery backup (confirm-gated): shells out to
+/// `automation/dr/dr-backup.sh` from the repo root, which dumps the recoverable
+/// etcd state (`/tofu/state/*`, `/mcnf/secret/*`, `/mcnf/age-recipient`) into an
+/// age-encrypted manifest and prints the output path on stdout.
+///
+/// Requires `{"confirm":true}`. On success returns the trimmed path the script
+/// printed; on failure returns the script's stderr (or a generic message).
+fn dr_backup(req_body: Option<&str>) -> Result<String, String> {
+    let Some(body) = req_body else {
+        return Err("dr-backup: missing request body".into());
+    };
+    let req: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("dr-backup: bad json: {e}"))?;
+
+    let confirm = req
+        .get("confirm")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !confirm {
+        return Err("dr-backup requires confirm:true".into());
+    }
+
+    // Repo-root-relative like the unifi-cred helper; the responder runs from the
+    // repo root, and the script is read-only on etcd.
+    let o = std::process::Command::new("bash")
+        .args(["-lc", "automation/dr/dr-backup.sh"])
+        .output()
+        .map_err(|e| format!("dr-backup: spawn failed: {e}"))?;
+
+    if o.status.success() {
+        // The script prints ONLY the artifact path on stdout (the separate-key
+        // reminder goes to stderr), so the trimmed stdout is the path.
+        let path = String::from_utf8_lossy(&o.stdout);
+        let path = path.trim();
+        if path.is_empty() {
+            Err("dr-backup: produced no output path".into())
+        } else {
+            Ok(path.to_string())
+        }
+    } else {
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        let msg = stderr.trim();
+        if msg.is_empty() {
+            Err("dr-backup failed".into())
+        } else {
+            Err(msg.to_string())
+        }
+    }
+}
+
 /// Build the reply for one `action/dc/<verb>` request.
 #[must_use]
 pub fn build_reply(_svc: &HostOpsService, verb: &str, req_body: Option<&str>) -> String {
@@ -204,6 +254,12 @@ pub fn build_reply(_svc: &HostOpsService, verb: &str, req_body: Option<&str>) ->
         "gateway-reboot" => {
             return match gateway_reboot(req_body) {
                 Ok(()) => json!({ "ok": true }).to_string(),
+                Err(m) => err(m),
+            };
+        }
+        "dr-backup" => {
+            return match dr_backup(req_body) {
+                Ok(path) => json!({ "ok": true, "path": path }).to_string(),
                 Err(m) => err(m),
             };
         }
@@ -341,8 +397,30 @@ mod tests {
     fn topic_and_verbs_lock() {
         assert_eq!(action_topic("host-power"), "action/dc/host-power");
         assert_eq!(action_topic("gateway-reboot"), "action/dc/gateway-reboot");
+        assert_eq!(action_topic("dr-backup"), "action/dc/dr-backup");
         assert!(ACTION_VERBS.contains(&"host-power"));
         assert!(ACTION_VERBS.contains(&"gateway-reboot"));
+        assert!(ACTION_VERBS.contains(&"dr-backup"));
+    }
+
+    #[test]
+    fn dr_backup_requires_confirm_true() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        // confirm omitted — must be rejected BEFORE any backup is attempted.
+        let body = json!({}).to_string();
+        let r = build_reply(&s, "dr-backup", Some(&body));
+        assert!(r.contains("dr-backup requires confirm:true"), "{r}");
+        // confirm:false — same gate.
+        let body = json!({ "confirm": false }).to_string();
+        let r = build_reply(&s, "dr-backup", Some(&body));
+        assert!(r.contains("dr-backup requires confirm:true"), "{r}");
+    }
+
+    #[test]
+    fn dr_backup_missing_body_errors() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        let r = build_reply(&s, "dr-backup", None);
+        assert!(r.contains("missing request body"), "{r}");
     }
 
     #[test]
