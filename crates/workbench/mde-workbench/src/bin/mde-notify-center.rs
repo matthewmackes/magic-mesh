@@ -14,6 +14,10 @@
 
 use std::collections::HashSet;
 
+// motion.rs lives in a non-bin subdir: a flat src/bin/motion.rs is auto-treated
+// as its own (main-less) binary target and breaks the crate build. The #[path]
+// keeps it a module of this bin without cargo discovering it as a binary.
+#[path = "notify_center/motion.rs"]
 mod motion;
 
 use cosmic::iced::platform_specific::runtime::wayland::layer_surface::SctkLayerSurfaceSettings;
