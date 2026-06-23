@@ -387,6 +387,80 @@ pub fn health_summary(checks: &[HealthCheck]) -> (usize, usize, usize) {
     (ok, warn, fail)
 }
 
+/// One datacenter-action **job** as last seen on the Bus (`event/dc/job/<ulid>`).
+/// The `dc_jobs` worker publishes one of these for every datacenter action RPC —
+/// `{"action":"dc/<verb>","ulid":..,"status":"pending|ok|error"}`. The Overview's
+/// "Recent Tofu runs" section filters these to the tofu verbs and renders a
+/// run-log (DATACENTER-9/15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobRow {
+    /// The action performed — e.g. "dc/tofu-plan" | "dc/tofu-apply" | "dc/vm-power".
+    pub action: String,
+    /// The job's ULID (the `<ulid>` of the `event/dc/job/<ulid>` topic, echoed in
+    /// the body). Time-ordered, so a descending sort is newest-first.
+    pub ulid: String,
+    /// The job's outcome — "pending" | "ok" | "error". Drives the status chip's
+    /// color token. Empty when the event didn't name one.
+    pub status: String,
+}
+
+/// Parse one `event/dc/job/<ulid>` message body into a [`JobRow`]. Returns `None`
+/// for unparseable JSON or a body missing the `action` field. Pure + testable.
+/// Mirrors [`parse_audit_event`]'s tolerant string extraction: `ulid` and `status`
+/// default to empty when absent.
+#[must_use]
+pub fn parse_job_event(body: &str) -> Option<JobRow> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let action = v.get("action")?.as_str()?.to_string();
+    let ulid = v
+        .get("ulid")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let status = v
+        .get("status")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(JobRow {
+        action,
+        ulid,
+        status,
+    })
+}
+
+/// Maximum number of recent Tofu runs the Overview shows.
+const RECENT_TOFU_CAP: usize = 8;
+
+/// Filter a set of job rows to the **Tofu** runs (action contains "tofu" —
+/// tofu-plan / tofu-apply / tofu-destroy / tofu-state), newest-first (descending
+/// `ulid`, which is time-ordered), capped at [`RECENT_TOFU_CAP`]. Pure + testable.
+#[must_use]
+pub fn recent_tofu_runs(jobs: &[JobRow]) -> Vec<JobRow> {
+    let mut runs: Vec<JobRow> = jobs
+        .iter()
+        .filter(|j| j.action.contains("tofu"))
+        .cloned()
+        .collect();
+    // Newest-first: ULIDs are lexicographically time-ordered, so descending by
+    // `ulid` is newest-first. Stable order for ties.
+    runs.sort_by(|a, b| b.ulid.cmp(&a.ulid));
+    runs.truncate(RECENT_TOFU_CAP);
+    runs
+}
+
+/// Project a set of `(topic, latest-body)` Bus reads into job rows —
+/// `event/dc/job/*` topics only. Order/filter/cap is left to [`recent_tofu_runs`];
+/// this just parses the matching topics. Pure + testable.
+#[must_use]
+pub fn project_jobs(events: &[(String, String)]) -> Vec<JobRow> {
+    events
+        .iter()
+        .filter(|(topic, _)| topic.starts_with("event/dc/job/"))
+        .filter_map(|(_, body)| parse_job_event(body))
+        .collect()
+}
+
 /// Project a set of `(topic, latest-body)` Bus reads into sorted rows — datacenter
 /// resources (`event/dc/*`), grouped by zone (prod first) then kind then name.
 #[must_use]
@@ -572,6 +646,10 @@ pub struct DatacenterPanel {
     /// `Overview` view as an ok/warn/fail summary + alert list. Refreshed
     /// alongside `rows` on every load.
     pub health: Vec<HealthCheck>,
+    /// The datacenter action jobs read off `event/dc/job/*`. The `Overview` view
+    /// filters these to the Tofu verbs (via [`recent_tofu_runs`]) for the "Recent
+    /// Tofu runs" run-log. Refreshed alongside `rows` on every load.
+    pub jobs: Vec<JobRow>,
     /// When `Some(workspace)`, a Tofu apply is awaiting typed confirmation — the
     /// workspace's row renders a "Type APPLY to confirm" prompt and only the
     /// confirm button fires the `action/dc/tofu-apply` RPC. Cleared once the
@@ -633,6 +711,7 @@ impl Default for DatacenterPanel {
             audit: Vec::new(),
             promote: Vec::new(),
             health: Vec::new(),
+            jobs: Vec::new(),
             tofu_confirm: None,
             expanded: BTreeSet::new(),
             topology_seeded: false,
@@ -656,6 +735,10 @@ pub struct DcLoad {
     /// ok/warn/fail summary + alert list on the Overview view. Refreshed
     /// alongside `rows` on every load.
     pub health: Vec<HealthCheck>,
+    /// The datacenter action jobs read off `event/dc/job/*`. Filtered to the Tofu
+    /// verbs for the "Recent Tofu runs" run-log on the Overview view. Refreshed
+    /// alongside `rows` on every load.
+    pub jobs: Vec<JobRow>,
 }
 
 #[derive(Debug, Clone)]
@@ -783,6 +866,7 @@ impl DatacenterPanel {
                 self.audit = load.audit;
                 self.promote = load.promote;
                 self.health = load.health;
+                self.jobs = load.jobs;
                 self.busy = false;
                 self.load_error = None;
                 self.status.clear();
@@ -1178,6 +1262,14 @@ impl DatacenterPanel {
                 // `event/dc/health/*`, plus an alert list of any non-ok checks.
                 col = col.push(text("Health").size(f32::from(spacing::BASE[5])));
                 for el in health_section_view(&self.health, palette) {
+                    col = col.push(el);
+                }
+                // Recent Tofu runs — a newest-first run-log fed by
+                // `event/dc/job/*`, filtered to the tofu verbs (plan/apply/
+                // destroy/state) and capped. Each row = the verb + a status chip
+                // (ok = success / error = danger / pending = warning).
+                col = col.push(text("Recent Tofu runs").size(f32::from(spacing::BASE[5])));
+                for el in recent_tofu_runs_view(&self.jobs, palette) {
                     col = col.push(el);
                 }
                 // DR / Backup control — "Back up now" arms a typed-confirm before
@@ -1724,6 +1816,62 @@ fn health_section_view(
     out
 }
 
+/// Render the **Recent Tofu runs** section of the Overview: a newest-first
+/// run-log of the datacenter action jobs (`event/dc/job/*`) filtered to the Tofu
+/// verbs via [`recent_tofu_runs`]. Each row pairs the verb (the `dc/tofu-` prefix
+/// stripped → plan / apply / destroy / state) with a status chip whose color comes
+/// from a mde-theme token (`success` for ok, `danger` for error, `warning` for
+/// pending/anything else). When there are no Tofu runs, a single "no recent Tofu
+/// runs" empty-state line. Returns a list of elements so the Overview column can
+/// push them in order. mde-theme tokens only — no raw hex.
+fn recent_tofu_runs_view(
+    jobs: &[JobRow],
+    palette: Palette,
+) -> Vec<Element<'static, crate::Message>> {
+    let mut out: Vec<Element<'static, crate::Message>> = Vec::new();
+    let runs = recent_tofu_runs(jobs);
+    if runs.is_empty() {
+        out.push(
+            text("no recent Tofu runs")
+                .colr(palette.text_muted.into_cosmic_color())
+                .into(),
+        );
+        return out;
+    }
+    for run in &runs {
+        // Strip the `dc/tofu-` prefix so the verb reads cleanly (plan / apply /
+        // destroy / state); fall back to the raw action if it doesn't match.
+        let verb = run
+            .action
+            .strip_prefix("dc/tofu-")
+            .unwrap_or(&run.action)
+            .to_string();
+        // Status chip color tracks the outcome.
+        let (chip_color, chip_text) = match run.status.as_str() {
+            "ok" => (palette.success, "ok".to_string()),
+            "error" => (palette.danger, "error".to_string()),
+            "" => (palette.warning, "pending".to_string()),
+            other => (palette.warning, other.to_string()),
+        };
+        let line = row![
+            text(verb)
+                .colr(palette.text.into_cosmic_color())
+                .width(Length::FillPortion(2)),
+            text(chip_text)
+                .colr(chip_color.into_cosmic_color())
+                .width(Length::FillPortion(1)),
+        ]
+        .spacing(f32::from(spacing::BASE[3]));
+        out.push(
+            container(line)
+                .padding(f32::from(spacing::BASE[2]))
+                .width(Length::Fill)
+                .into(),
+        );
+    }
+    out
+}
+
 /// Render one promotion-stage card: the stage label, its version, and a readiness
 /// chip whose color comes from a mde-theme token (`success` for ready, `warning`
 /// for pending, `text_muted` for an unknown/absent placeholder). mde-theme tokens
@@ -1827,6 +1975,7 @@ fn read_dc_events() -> Result<DcLoad, String> {
         audit: project_audit(&events),
         promote: project_promote(&events),
         health: project_health(&events),
+        jobs: project_jobs(&events),
     })
 }
 
@@ -2773,6 +2922,7 @@ mod tests {
             }],
             promote: Vec::new(),
             health: Vec::new(),
+            jobs: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert_eq!(p.audit.len(), 1);
@@ -2960,6 +3110,7 @@ mod tests {
             audit: Vec::new(),
             promote: Vec::new(),
             health: Vec::new(),
+            jobs: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert!(p.expanded.contains("172.20.0.9"));
@@ -3165,6 +3316,7 @@ mod tests {
                 status: "ready".into(),
             }],
             health: Vec::new(),
+            jobs: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert_eq!(p.promote.len(), 1);
@@ -3299,6 +3451,7 @@ mod tests {
                 status: "ok".into(),
                 detail: String::new(),
             }],
+            jobs: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert_eq!(p.health.len(), 1);
@@ -3351,6 +3504,187 @@ mod tests {
                 r#"{"check":"dom0-b","status":"fail"}"#.into(),
             ),
         ]);
+        let _ = p.view();
+    }
+
+    // ---- DATACENTER-9/15: Recent Tofu runs on Overview ---------------------
+
+    #[test]
+    fn parse_job_event_reads_a_job() {
+        let j = parse_job_event(
+            r#"{"action":"dc/tofu-apply","ulid":"01J0000000000000000000APPLY","status":"ok"}"#,
+        )
+        .unwrap();
+        assert_eq!(j.action, "dc/tofu-apply");
+        assert_eq!(j.ulid, "01J0000000000000000000APPLY");
+        assert_eq!(j.status, "ok");
+    }
+
+    #[test]
+    fn parse_job_event_defaults_missing_fields_and_drops_garbage() {
+        // Missing ulid/status default to empty.
+        let j = parse_job_event(r#"{"action":"dc/vm-power"}"#).unwrap();
+        assert_eq!(j.action, "dc/vm-power");
+        assert_eq!(j.ulid, "");
+        assert_eq!(j.status, "");
+        // Unparseable / missing action → None.
+        assert!(parse_job_event("not json").is_none());
+        assert!(parse_job_event(r#"{"ulid":"01J","status":"ok"}"#).is_none());
+    }
+
+    #[test]
+    fn project_jobs_filters_to_job_topics() {
+        let events = vec![
+            // Not a job topic → dropped.
+            (
+                "event/dc/vm/9".into(),
+                r#"{"kind":"vm","id":"9","name":"b","status":"running","zone":"dev"}"#.into(),
+            ),
+            (
+                "event/dc/job/01J0001".into(),
+                r#"{"action":"dc/tofu-plan","ulid":"01J0001","status":"ok"}"#.into(),
+            ),
+        ];
+        let jobs = project_jobs(&events);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].action, "dc/tofu-plan");
+    }
+
+    #[test]
+    fn job_event_is_dropped_by_project_rows() {
+        // A job body has no `kind`/`id`, so it must NOT leak into resource rows
+        // even though its topic starts with `event/dc/`.
+        let rows = project_rows(&[(
+            "event/dc/job/01J0001".into(),
+            r#"{"action":"dc/tofu-plan","ulid":"01J0001","status":"ok"}"#.into(),
+        )]);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn recent_tofu_runs_filters_to_tofu_verbs() {
+        let jobs = vec![
+            JobRow {
+                action: "dc/tofu-apply".into(),
+                ulid: "01J0002".into(),
+                status: "ok".into(),
+            },
+            JobRow {
+                action: "dc/vm-power".into(),
+                ulid: "01J0003".into(),
+                status: "ok".into(),
+            },
+            JobRow {
+                action: "dc/tofu-plan".into(),
+                ulid: "01J0001".into(),
+                status: "ok".into(),
+            },
+        ];
+        let runs = recent_tofu_runs(&jobs);
+        // vm-power filtered out; only the two tofu verbs survive.
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().all(|r| r.action.contains("tofu")));
+    }
+
+    #[test]
+    fn recent_tofu_runs_orders_newest_first_by_ulid() {
+        let jobs = vec![
+            JobRow {
+                action: "dc/tofu-plan".into(),
+                ulid: "01J0001".into(),
+                status: "ok".into(),
+            },
+            JobRow {
+                action: "dc/tofu-apply".into(),
+                ulid: "01J0003".into(),
+                status: "ok".into(),
+            },
+            JobRow {
+                action: "dc/tofu-state".into(),
+                ulid: "01J0002".into(),
+                status: "ok".into(),
+            },
+        ];
+        let runs = recent_tofu_runs(&jobs);
+        // Descending ULID = newest first.
+        assert_eq!(runs[0].ulid, "01J0003");
+        assert_eq!(runs[1].ulid, "01J0002");
+        assert_eq!(runs[2].ulid, "01J0001");
+    }
+
+    #[test]
+    fn recent_tofu_runs_caps_at_eight() {
+        let jobs: Vec<JobRow> = (0..20)
+            .map(|i| JobRow {
+                action: "dc/tofu-plan".into(),
+                // Zero-padded so lexical order matches numeric order.
+                ulid: format!("01J{i:05}"),
+                status: "ok".into(),
+            })
+            .collect();
+        let runs = recent_tofu_runs(&jobs);
+        assert_eq!(runs.len(), RECENT_TOFU_CAP);
+        // The cap keeps the newest (highest ulid) ones.
+        assert_eq!(runs[0].ulid, "01J00019");
+        assert_eq!(runs[RECENT_TOFU_CAP - 1].ulid, "01J00012");
+    }
+
+    #[test]
+    fn loaded_populates_jobs() {
+        let mut p = DatacenterPanel::new();
+        let load = DcLoad {
+            rows: Vec::new(),
+            audit: Vec::new(),
+            promote: Vec::new(),
+            health: Vec::new(),
+            jobs: vec![JobRow {
+                action: "dc/tofu-apply".into(),
+                ulid: "01J0001".into(),
+                status: "ok".into(),
+            }],
+        };
+        let _ = p.update(Message::Loaded(Ok(load)));
+        assert_eq!(p.jobs.len(), 1);
+        assert_eq!(p.jobs[0].action, "dc/tofu-apply");
+    }
+
+    #[test]
+    fn panel_defaults_have_no_jobs() {
+        let p = DatacenterPanel::new();
+        assert!(p.jobs.is_empty());
+    }
+
+    #[test]
+    fn overview_renders_the_recent_tofu_runs_with_runs() {
+        let mut p = DatacenterPanel::new();
+        // Default view is Overview. A mixed set exercises the ok / error /
+        // pending chip branches + the `dc/tofu-` prefix strip, and confirms a
+        // non-tofu job is filtered out of the rendered run-log.
+        p.jobs = project_jobs(&[
+            (
+                "event/dc/job/01J0003".into(),
+                r#"{"action":"dc/tofu-apply","ulid":"01J0003","status":"ok"}"#.into(),
+            ),
+            (
+                "event/dc/job/01J0002".into(),
+                r#"{"action":"dc/tofu-destroy","ulid":"01J0002","status":"error"}"#.into(),
+            ),
+            (
+                "event/dc/job/01J0001".into(),
+                r#"{"action":"dc/tofu-plan","ulid":"01J0001","status":"pending"}"#.into(),
+            ),
+            (
+                "event/dc/job/01J0000".into(),
+                r#"{"action":"dc/vm-power","ulid":"01J0000","status":"ok"}"#.into(),
+            ),
+        ]);
+        let _ = p.view();
+    }
+
+    #[test]
+    fn overview_renders_the_recent_tofu_runs_empty_state() {
+        // No jobs at all → the "no recent Tofu runs" empty-state line renders.
+        let p = DatacenterPanel::new();
         let _ = p.view();
     }
 }
