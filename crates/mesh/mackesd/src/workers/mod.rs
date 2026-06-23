@@ -402,6 +402,12 @@ pub mod dc_jobs;
 // check (deduped on status), without touching the substrate it watches.
 // Leader-gated; a pure side-observer.
 pub mod dc_health;
+// DATACENTER-23 — scheduled DR backups: a leader-gated periodic worker that runs
+// `automation/dr/dr-backup.sh` at most once per `MCNF_DR_INTERVAL_SECS` (default
+// daily) and publishes the outcome to `event/dc/dr/last`
+// ({"status":"ok"|"fail",…}). Coarse tick (~5 min) decides via the pure `due`
+// helper; the leader runs exactly one backup per interval mesh-wide.
+pub mod dr_scheduler;
 // DATACENTER-20 — passive promotion tracker: publishes the version running at
 // each promotion stage (Build→Eagle→DO) to `event/dc/promote/<stage>` so the
 // Workbench Datacenter plane can render the promotion matrix. Leader-gated;

@@ -6070,6 +6070,24 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("dc_health".into());
 
+        // DATACENTER-23 — scheduled DR backups. Leader-gated; on a coarse (~5 min)
+        // tick decides via the pure `due` helper whether at least
+        // `MCNF_DR_INTERVAL_SECS` (default daily) have elapsed since the last run,
+        // and if so runs `automation/dr/dr-backup.sh` and publishes the outcome to
+        // `event/dc/dr/last` ({"status":"ok","path":…} | {"status":"fail",…}). The
+        // leader runs exactly one backup per interval mesh-wide.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::dr_scheduler::DrSchedulerWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("dr_scheduler".into());
+
         // DATACENTER-20 — passive promotion tracker. Leader-gated; publishes the
         // version running at each promotion stage (Build→Eagle→DO) to
         // `event/dc/promote/<stage>` so the Workbench Datacenter plane can render
