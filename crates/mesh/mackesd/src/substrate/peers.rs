@@ -74,7 +74,10 @@ pub async fn delete_peer(client: &mut Client, hostname: &str) -> anyhow::Result<
 /// start a runtime from within a runtime") and on an etcd node crash-loops the
 /// worker until ENT-6 circuit-breaks it. Returns `None` only when a private
 /// runtime can't be built.
-fn block_on<F>(fut: F) -> Option<F::Output>
+/// Shared substrate blocking bridge — runtime-aware so it is safe from BOTH a
+/// plain std::thread (heartbeat/responder) and an async worker on the executor
+/// (`mesh_dns`, health_reconciler). Used by `peers` and `leader`.
+pub(super) fn block_on<F>(fut: F) -> Option<F::Output>
 where
     F: std::future::Future + Send,
     F::Output: Send,
