@@ -8176,6 +8176,33 @@ fn cmd_found(
     };
     let join_token = v3.encode();
 
+    // FOUND-NEBULA-4 — materialize THIS lighthouse's /etc/nebula config INLINE,
+    // before starting nebula.service. The nebula_supervisor worker only
+    // materializes on LEADER-promotion, but a freshly-founded lighthouse cannot
+    // take leadership: the legacy leader lock lives on QNM-Shared
+    // (/mnt/mesh-storage/.mackesd-leader.lock), which the founder hasn't mounted
+    // yet (and which SUBSTRATE-V2 is removing). So the supervisor never runs and
+    // nebula starts against the STOCK example config.yml (pki → host.crt/ca.crt
+    // that don't exist) → crash-loop → no overlay. The join path already
+    // materializes inline (persist_bundle → materialize_config); found must do
+    // the same with its founding bundle. ConfigRole::Host → am_lighthouse: true;
+    // materialize_config writes ca.crt/host.crt/host.key + the rendered config
+    // and removes the stock config.yml. Idempotent: the supervisor re-renders
+    // identically once leadership is later taken. (Diagnosed live via the
+    // BUILD-PLATFORM-5 L2 mini-mesh, 2026-06-22.)
+    let founding_bundle =
+        mackesd_core::ca::bundle::read_bundle(&report.bundle_path).map_err(|e| {
+            anyhow::anyhow!("reading the founding bundle to materialize /etc/nebula: {e}")
+        })?;
+    mackesd_core::workers::nebula_supervisor::materialize_config(
+        std::path::Path::new("/etc/nebula"),
+        &founding_bundle,
+        mackesd_core::workers::nebula_supervisor::ConfigRole::Host,
+        &[],
+        &root,
+    )
+    .map_err(|e| anyhow::anyhow!("materializing /etc/nebula for the founding lighthouse: {e}"))?;
+
     // Bring the node fully live + boot-durable: enable+start the overlay, the
     // worker daemon (activates the /enroll listener), and the health watchdog.
     // `enable` makes each start at boot independently — nebula.service ships
