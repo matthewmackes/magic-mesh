@@ -168,7 +168,12 @@ pub fn poll_once(persist: &Persist, svc: &ClipboardService, cursors: &mut HashMa
             } else {
                 crate::ipc::body_too_large_reply(verb)
             };
-            if let Err(e) = persist.write(&reply_topic(&msg.ulid), Priority::Default, None, Some(&reply)) {
+            if let Err(e) = persist.write(
+                &reply_topic(&msg.ulid),
+                Priority::Default,
+                None,
+                Some(&reply),
+            ) {
                 tracing::warn!(ulid = %msg.ulid, error = %e, "clipboard responder: reply write failed");
             }
         }
@@ -253,7 +258,10 @@ mod tests {
         assert!(r.contains("\"changed\":true"), "{r}");
         let h = read_history(&history_path(&s.workgroup_root));
         assert_eq!(
-            h.entries.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(),
+            h.entries
+                .iter()
+                .map(|e| e.text.as_str())
+                .collect::<Vec<_>>(),
             vec!["c", "a"]
         );
     }
@@ -297,5 +305,48 @@ mod tests {
     fn unknown_verb_errors() {
         let (_t, s) = svc();
         assert!(build_reply(&s, "bogus", None).contains("unknown clipboard verb"));
+    }
+
+    /// CLIP-VIEW-1 producer↔consumer contract lock. The Hub's
+    /// `notify_clipboard::parse_list_reply` (a separate crate that never links
+    /// mackesd) decodes EXACTLY this `action/clipboard/list` envelope — pin the
+    /// field names + shape so a producer-side rename can't silently empty the
+    /// Clipboard Viewer. Mirror of `notify_clipboard::tests::
+    /// parse_list_reply_decodes_entries_newest_first`.
+    #[test]
+    fn list_reply_shape_is_the_viewer_contract() {
+        let (_t, s) = svc();
+        // Seed one unpinned then pin it, so the entry carries every field a row
+        // renders (id, text, source, time, pinned=true).
+        seed(&s, &["contract"]);
+        let _ = build_reply(&s, "pin", Some(&clip_id("contract")));
+
+        let reply = build_reply(&s, "list", None);
+        let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+
+        // Envelope: `{ "ok": true, "entries": [ … ] }`.
+        assert_eq!(v["ok"], true, "envelope carries ok:true");
+        let entries = v["entries"]
+            .as_array()
+            .expect("entries is an array (the field the viewer reads)");
+        assert_eq!(entries.len(), 1);
+
+        // Exact entry field names the viewer's `ClipRow` deserializes — any
+        // rename here breaks the Hub silently, so lock them by name + type.
+        let e = &entries[0];
+        let obj = e.as_object().expect("entry is a JSON object");
+        let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["id", "pinned", "source", "text", "time"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the entry shape is the exact CLIP-VIEW-1 contract"
+        );
+        assert_eq!(e["id"], clip_id("contract"));
+        assert!(e["text"].is_string());
+        assert!(e["source"].is_string());
+        assert!(e["time"].is_string());
+        assert_eq!(e["pinned"], true);
     }
 }
