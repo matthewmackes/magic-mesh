@@ -18,6 +18,14 @@
 //! that light up with their Phase-0 dependencies (DATACENTER-1 XAPI provider,
 //! DATACENTER-4 XAPI-over-overlay, DATACENTER-3 mesh secrets) without touching the
 //! brain or the Bus contract.
+//!
+//! DATACENTER-4 (done): the Xen source now routes its `xe`-over-SSH per node —
+//! [`resolve_xe_route`] picks **Direct** when this node is on the `172.20.0.0/16`
+//! lab LAN (or no relay is set) and **ProxyJump** through an on-LAN relay peer
+//! (`MCNF_XEN_RELAY`, an overlay IP) when it's off-LAN, so an off-LAN node can
+//! still read XAPI over the overlay. The chosen path is published to
+//! `event/dc/route/xen/<dom0>`, and a failed relay hop degrades cleanly to a
+//! Direct attempt (published `relay down`).
 
 #![cfg(feature = "async-services")]
 
@@ -234,6 +242,157 @@ pub(crate) fn xen_ssh_key() -> String {
     })
 }
 
+// ---- DATACENTER-4: XAPI-over-overlay routing ----------------------------------
+//
+// The dom0s live on the on-prem lab LAN (`172.20.0.0/16`). A node that is
+// physically ON that LAN can `ssh root@<dom0>` directly. A node OFF the LAN (a
+// roaming laptop, a cloud lighthouse) has no route to a `172.20.x` address — it
+// has to hop through an on-LAN mesh peer that DOES, reaching the dom0 via that
+// peer's overlay IP with SSH `-J` (ProxyJump). `MCNF_XEN_RELAY` is that peer's
+// overlay IP. Route selection is pure (`resolve_xe_route`) and unit-tested against
+// every on_lan/relay combination, exactly like the `parse_*` helpers; the only
+// live part is the thin argv assembly + the reachability probe.
+
+/// The `/16` lab LAN the dom0s sit on. A node is "on-LAN" iff it holds a local
+/// IPv4 in this network (then it can reach a dom0 directly; otherwise it must
+/// relay through an on-LAN peer).
+pub(crate) const XEN_LAN_PREFIX: &str = "172.20.";
+
+/// Overlay IP of an on-LAN relay peer to ProxyJump XAPI/SSH through when this node
+/// is off-LAN — `MCNF_XEN_RELAY`. Empty/unset by default, so off-LAN nodes with no
+/// relay configured simply fall back to a (best-effort, likely-unreachable) direct
+/// attempt rather than erroring. Trimmed; empty ⇒ "no relay".
+pub(crate) fn xen_relay_peer() -> Option<String> {
+    std::env::var("MCNF_XEN_RELAY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The SSH route chosen for an `xe` call to a dom0: straight in, or hopped through
+/// a relay peer's overlay IP. Pure output of [`resolve_xe_route`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum SshRoute {
+    /// `ssh root@<dom0>` — this node is on the lab LAN (or no relay is configured,
+    /// so there's nothing better to try).
+    Direct,
+    /// `ssh -J root@<relay> root@<dom0>` — this node is off-LAN, so reach the dom0
+    /// through an on-LAN relay peer at the carried overlay IP.
+    ProxyJump(String),
+}
+
+impl SshRoute {
+    /// Stable path label for the `event/dc/route/xen` Bus signal + logs.
+    #[must_use]
+    pub const fn path(&self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::ProxyJump(_) => "relay",
+        }
+    }
+    /// The relay overlay IP, when this route hops through one.
+    #[must_use]
+    pub fn relay(&self) -> Option<&str> {
+        match self {
+            Self::Direct => None,
+            Self::ProxyJump(r) => Some(r.as_str()),
+        }
+    }
+}
+
+/// Pick the SSH route to a dom0. PURE — the whole point of DATACENTER-4 is that
+/// this is decidable from data, not I/O:
+/// * on-LAN (or no relay configured) ⇒ [`SshRoute::Direct`];
+/// * off-LAN **and** a relay is configured ⇒ [`SshRoute::ProxyJump`] through it.
+///
+/// The relay never carries the path to a relay reaching itself: if `relay` equals
+/// `dom0` (a misconfig) the hop would be pointless, so we go Direct.
+#[must_use]
+pub fn resolve_xe_route(dom0: &str, on_lan: bool, relay: Option<&str>) -> SshRoute {
+    match relay {
+        Some(r) if !on_lan && r != dom0 => SshRoute::ProxyJump(r.to_string()),
+        _ => SshRoute::Direct,
+    }
+}
+
+/// Pure: does this node hold a local IPv4 on the dom0 lab LAN? Fed the addresses
+/// parsed from `ip -j addr`; a single `172.20.x.y` is enough. Mirrors the pure
+/// `parse_*` shape so it's unit-testable without touching the network.
+#[must_use]
+pub fn node_on_lan_for(local_ipv4s: &[String]) -> bool {
+    local_ipv4s.iter().any(|ip| ip.starts_with(XEN_LAN_PREFIX))
+}
+
+/// Pull every local IPv4 string out of `ip -j addr` JSON (any interface). Pure —
+/// the live wrapper [`node_on_lan`] feeds it real output. Reuses the same JSON
+/// shape [`crate::probe_nmap::lan_cidrs_from_ip_json`] reads.
+#[must_use]
+pub fn local_ipv4s_from_ip_json(json: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(ifaces) = v.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for iface in ifaces {
+        let Some(addrs) = iface.get("addr_info").and_then(|a| a.as_array()) else {
+            continue;
+        };
+        for a in addrs {
+            if a.get("family").and_then(|f| f.as_str()) != Some("inet") {
+                continue;
+            }
+            if let Some(ip) = a.get("local").and_then(|l| l.as_str()) {
+                out.push(ip.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Is this node on the dom0 lab LAN? Best-effort live probe via `ip -j addr`;
+/// when `ip` is missing/errors we assume **on-LAN** (Direct) — the conservative
+/// default that keeps the existing on-prem behaviour for nodes that were reaching
+/// dom0s directly before DATACENTER-4 (those nodes ARE on-LAN). An explicit
+/// `MCNF_XEN_ON_LAN=0`/`1` overrides the probe for tests + odd topologies.
+fn node_on_lan() -> bool {
+    if let Ok(v) = std::env::var("MCNF_XEN_ON_LAN") {
+        let v = v.trim();
+        if v == "1" || v.eq_ignore_ascii_case("true") {
+            return true;
+        }
+        if v == "0" || v.eq_ignore_ascii_case("false") {
+            return false;
+        }
+    }
+    match std::process::Command::new("ip")
+        .args(["-j", "addr"])
+        .output()
+    {
+        Ok(o) if o.status.success() => node_on_lan_for(&local_ipv4s_from_ip_json(
+            &String::from_utf8_lossy(&o.stdout),
+        )),
+        // No `ip`/probe failed: keep the legacy direct-reach behaviour.
+        _ => true,
+    }
+}
+
+/// Publish the chosen XAPI route for a dom0 onto the Bus (`event/dc/route/xen`) so
+/// the path (direct vs relay) — and any relay-down fallback — is observable mesh
+/// state, the same fire-and-reap lane as the resource events.
+fn publish_route(dom0: &str, route: &SshRoute, note: &str) {
+    let body = serde_json::json!({
+        "kind": "route", "id": dom0, "target": "xen",
+        "path": route.path(), "relay": route.relay(), "note": note,
+    })
+    .to_string();
+    let topic = format!("event/dc/route/xen/{dom0}");
+    let mut cmd = std::process::Command::new("mde-bus");
+    cmd.args(["publish", &topic, "--body-flag", &body]);
+    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+}
+
 /// Parse the remote `xe` helper's pipe-delimited `uuid|name|power-state` lines
 /// into `(uuid, name, power)` triples. Pure — fed the raw stdout.
 #[must_use]
@@ -310,21 +469,36 @@ pub fn parse_host_metrics(line: &str) -> (String, String, String, String) {
     )
 }
 
-/// Run a remote `xe` command on a dom0 over SSH (best-effort).
-fn ssh_xe(key: &str, dom0: &str, remote: &str) -> Option<String> {
+/// Assemble the `ssh` argv for one `xe` call, inserting `-J root@<relay>`
+/// (ProxyJump) for the relay route. Pure — built from the resolved [`SshRoute`] so
+/// the argv shape is unit-testable without spawning ssh.
+#[must_use]
+pub fn ssh_xe_argv(key: &str, dom0: &str, route: &SshRoute, remote: &str) -> Vec<String> {
+    let mut argv: Vec<String> = vec![
+        "-i".into(),
+        key.into(),
+        "-o".into(),
+        "StrictHostKeyChecking=no".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=8".into(),
+    ];
+    if let SshRoute::ProxyJump(relay) = route {
+        argv.push("-J".into());
+        argv.push(format!("root@{relay}"));
+    }
+    argv.push(format!("root@{dom0}"));
+    argv.push(remote.into());
+    argv
+}
+
+/// Run a remote `xe` command on a dom0 over SSH along an explicit route
+/// (best-effort). The argv (incl. any `-J root@<relay>` ProxyJump) comes from
+/// [`ssh_xe_argv`], so this is the only spot that actually spawns ssh.
+fn ssh_xe(key: &str, dom0: &str, route: &SshRoute, remote: &str) -> Option<String> {
     let o = std::process::Command::new("ssh")
-        .args([
-            "-i",
-            key,
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=8",
-            &format!("root@{dom0}"),
-            remote,
-        ])
+        .args(ssh_xe_argv(key, dom0, route, remote))
         .output()
         .ok()?;
     o.status
@@ -332,20 +506,66 @@ fn ssh_xe(key: &str, dom0: &str, remote: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
+/// The per-dom0 XAPI route for one gather pass: the resolved [`SshRoute`] plus a
+/// latch so a relay hop that fails once degrades to Direct for the rest of the
+/// pass (and is published `relay down` exactly once, not per `xe` call).
+struct XenRoute {
+    dom0: String,
+    route: SshRoute,
+    /// Set once a relay hop has been observed down + the Direct fallback published.
+    relay_down: bool,
+}
+
+impl XenRoute {
+    /// Resolve + publish the chosen path for a dom0 at the top of its gather.
+    fn open(dom0: &str, on_lan: bool, relay: Option<&str>) -> Self {
+        let route = resolve_xe_route(dom0, on_lan, relay);
+        publish_route(dom0, &route, route.path());
+        Self {
+            dom0: dom0.to_string(),
+            route,
+            relay_down: false,
+        }
+    }
+
+    /// Run one `xe` call along the current route; if a relay hop fails, latch to
+    /// Direct (publishing a `relay down` note once) and retry directly.
+    fn run(&mut self, key: &str, remote: &str) -> Option<String> {
+        if let Some(out) = ssh_xe(key, &self.dom0, &self.route, remote) {
+            return Some(out);
+        }
+        if matches!(self.route, SshRoute::ProxyJump(_)) {
+            if !self.relay_down {
+                publish_route(&self.dom0, &SshRoute::Direct, "relay down");
+                self.relay_down = true;
+            }
+            self.route = SshRoute::Direct;
+            return ssh_xe(key, &self.dom0, &SshRoute::Direct, remote);
+        }
+        None
+    }
+}
+
 /// Sample the Xen (dev) zone: each configured dom0 becomes a `host` resource and
 /// each of its non-control VMs a `vm` resource. Reads XAPI via `xe` over the
-/// mesh-key SSH (the no-XO read path proven by DATACENTER-1) — best-effort. This
-/// is interim glue; it swaps to XAPI-over-overlay (DATACENTER-4) without changing
-/// the brain or the Bus contract.
+/// mesh-key SSH (the no-XO read path proven by DATACENTER-1) — best-effort. The SSH
+/// is routed per DATACENTER-4 ([`XenRoute`]): Direct on-LAN, ProxyJump through a
+/// relay peer off-LAN — without changing the brain or the Bus contract.
 fn gather_xen() -> Vec<DcResource> {
     let key = xen_ssh_key();
+    // DATACENTER-4: resolve the XAPI route once per pass — on-LAN nodes go Direct,
+    // off-LAN nodes ProxyJump through the configured relay peer. Resolved per dom0
+    // below (the path is published + can degrade to Direct independently).
+    let on_lan = node_on_lan();
+    let relay = xen_relay_peer();
     let mut out = Vec::new();
     for dom0 in xen_dom0s() {
+        let mut route = XenRoute::open(&dom0, on_lan, relay.as_deref());
         // Track this dom0's host name (for the power signal) and its running-VM
         // count so we can emit the DATACENTER-16 idle signal after the gather.
         let mut host_name: Option<String> = None;
         let mut running_vms: usize = 0;
-        if let Some(hn) = ssh_xe(&key, &dom0, "xe host-list params=name-label --minimal") {
+        if let Some(hn) = route.run(&key, "xe host-list params=name-label --minimal") {
             let hn = hn.trim();
             if !hn.is_empty() {
                 host_name = Some(hn.to_string());
@@ -357,7 +577,8 @@ fn gather_xen() -> Vec<DcResource> {
                      T=$(echo \"$I\"|awk -F: '/total_memory/{gsub(/ /,\"\",$2);print $2}'); \
                      F=$(echo \"$I\"|awk -F: '/free_memory/{gsub(/ /,\"\",$2);print $2}'); \
                      echo \"$C|$T|$F|$L\"";
-                let (cpu, mem_total, mem_free, load) = ssh_xe(&key, &dom0, metric_script)
+                let (cpu, mem_total, mem_free, load) = route
+                    .run(&key, metric_script)
                     .map(|o| parse_host_metrics(o.trim()))
                     .unwrap_or_default();
                 let sig = serde_json::json!({
@@ -370,7 +591,7 @@ fn gather_xen() -> Vec<DcResource> {
         }
         let script = "for u in $(xe vm-list is-control-domain=false params=uuid --minimal | tr , ' '); \
              do echo \"$u|$(xe vm-param-get uuid=$u param-name=name-label)|$(xe vm-param-get uuid=$u param-name=power-state)\"; done";
-        if let Some(vmout) = ssh_xe(&key, &dom0, script) {
+        if let Some(vmout) = route.run(&key, script) {
             for (u, n, s) in parse_xe_vms(&vmout) {
                 if s == "running" {
                     running_vms += 1;
@@ -387,7 +608,7 @@ fn gather_xen() -> Vec<DcResource> {
              do ps=$(xe sr-param-get uuid=$u param-name=physical-size 2>/dev/null); \
              [ \"${ps:-0}\" -gt 0 ] || continue; \
              echo \"$u|$(xe sr-param-get uuid=$u param-name=name-label)|$ps|$(xe sr-param-get uuid=$u param-name=physical-utilisation)\"; done";
-        if let Some(srout) = ssh_xe(&key, &dom0, sr_script) {
+        if let Some(srout) = route.run(&key, sr_script) {
             for (u, n, size, used) in parse_xe_srs(&srout) {
                 let sig = serde_json::json!({
                     "kind": "sr", "id": u, "name": n, "size": size, "used": used, "host": dom0, "zone": "dev"
@@ -399,7 +620,7 @@ fn gather_xen() -> Vec<DcResource> {
         // Networks (bridges) → network visibility (DC-13).
         let net_script = "for u in $(xe network-list params=uuid --minimal | tr , ' '); \
              do echo \"$u|$(xe network-param-get uuid=$u param-name=name-label)|$(xe network-param-get uuid=$u param-name=bridge)\"; done";
-        if let Some(netout) = ssh_xe(&key, &dom0, net_script) {
+        if let Some(netout) = route.run(&key, net_script) {
             for (u, n, b) in parse_xe_nets(&netout) {
                 let sig = serde_json::json!({
                     "kind": "net", "id": u, "name": n, "bridge": b, "host": dom0, "zone": "dev"
@@ -777,5 +998,109 @@ mod tests {
         assert_eq!(srs[0].1, "Local storage");
         assert_eq!(srs[0].2, "207296921600");
         assert_eq!(srs[0].3, "42949672960");
+    }
+
+    // ---- DATACENTER-4: XAPI-over-overlay route selection -----------------------
+
+    #[test]
+    fn resolve_xe_route_direct_when_on_lan() {
+        // On-LAN: always Direct, even with a relay configured (no need to hop).
+        assert_eq!(
+            resolve_xe_route("172.20.0.9", true, Some("10.42.0.7")),
+            SshRoute::Direct
+        );
+        assert_eq!(resolve_xe_route("172.20.0.9", true, None), SshRoute::Direct);
+    }
+
+    #[test]
+    fn resolve_xe_route_proxyjump_when_off_lan_with_relay() {
+        // Off-LAN + a relay ⇒ hop through the relay's overlay IP.
+        let r = resolve_xe_route("172.20.0.9", false, Some("10.42.0.7"));
+        assert_eq!(r, SshRoute::ProxyJump("10.42.0.7".to_string()));
+        assert_eq!(r.path(), "relay");
+        assert_eq!(r.relay(), Some("10.42.0.7"));
+    }
+
+    #[test]
+    fn resolve_xe_route_falls_back_direct_off_lan_no_relay() {
+        // Off-LAN but no relay configured ⇒ a (best-effort) Direct attempt, not an
+        // error — keeps a misconfigured off-LAN node degrading cleanly.
+        let r = resolve_xe_route("172.20.0.9", false, None);
+        assert_eq!(r, SshRoute::Direct);
+        assert_eq!(r.path(), "direct");
+        assert_eq!(r.relay(), None);
+    }
+
+    #[test]
+    fn resolve_xe_route_ignores_self_relay() {
+        // A relay equal to the dom0 is a pointless hop ⇒ Direct.
+        assert_eq!(
+            resolve_xe_route("172.20.0.9", false, Some("172.20.0.9")),
+            SshRoute::Direct
+        );
+    }
+
+    #[test]
+    fn ssh_xe_argv_inserts_proxyjump_only_for_relay() {
+        // Direct: no `-J`, ends with `root@<dom0>` then the remote command.
+        let direct = ssh_xe_argv("/k", "172.20.0.9", &SshRoute::Direct, "xe host-list");
+        assert!(!direct.iter().any(|a| a == "-J"));
+        assert_eq!(direct[0], "-i");
+        assert_eq!(direct[1], "/k");
+        assert_eq!(direct[direct.len() - 2], "root@172.20.0.9");
+        assert_eq!(direct[direct.len() - 1], "xe host-list");
+
+        // Relay: a `-J root@<relay>` pair sits before the `root@<dom0>` target.
+        let relayed = ssh_xe_argv(
+            "/k",
+            "172.20.0.9",
+            &SshRoute::ProxyJump("10.42.0.7".into()),
+            "xe host-list",
+        );
+        let j = relayed.iter().position(|a| a == "-J").expect("has -J");
+        assert_eq!(relayed[j + 1], "root@10.42.0.7");
+        let target = relayed
+            .iter()
+            .position(|a| a == "root@172.20.0.9")
+            .expect("has dom0 target");
+        assert!(j < target, "ProxyJump must precede the dom0 target");
+        assert_eq!(relayed[relayed.len() - 1], "xe host-list");
+    }
+
+    #[test]
+    fn node_on_lan_for_detects_lab_lan_ipv4() {
+        // A 172.20.x address ⇒ on-LAN.
+        assert!(node_on_lan_for(&[
+            "127.0.0.1".to_string(),
+            "172.20.145.192".to_string()
+        ]));
+        // Only an overlay + loopback ⇒ off-LAN.
+        assert!(!node_on_lan_for(&[
+            "127.0.0.1".to_string(),
+            "10.42.0.7".to_string()
+        ]));
+        // No addresses ⇒ off-LAN.
+        assert!(!node_on_lan_for(&[]));
+    }
+
+    #[test]
+    fn local_ipv4s_reads_inet_addrs_only() {
+        let json = r#"[
+          {"ifname":"lo","addr_info":[{"family":"inet","local":"127.0.0.1","prefixlen":8}]},
+          {"ifname":"eth0","addr_info":[
+             {"family":"inet","local":"172.20.145.192","prefixlen":16},
+             {"family":"inet6","local":"fe80::1","prefixlen":64}]},
+          {"ifname":"nebula1","addr_info":[{"family":"inet","local":"10.42.0.7","prefixlen":24}]}
+        ]"#;
+        let ips = local_ipv4s_from_ip_json(json);
+        assert_eq!(ips, vec!["127.0.0.1", "172.20.145.192", "10.42.0.7"]); // v6 skipped
+        assert!(node_on_lan_for(&ips));
+    }
+
+    #[test]
+    fn local_ipv4s_tolerates_garbage() {
+        assert!(local_ipv4s_from_ip_json("not json").is_empty());
+        assert!(local_ipv4s_from_ip_json("{}").is_empty());
+        assert!(local_ipv4s_from_ip_json("[]").is_empty());
     }
 }
