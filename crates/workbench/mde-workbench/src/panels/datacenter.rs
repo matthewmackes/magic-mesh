@@ -12,7 +12,7 @@
 //! VMs/Storage/Network/Tofu/Gateway) layer on top in later DATACENTER tasks; the
 //! load + projection here are pure and unit-tested.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use cosmic::iced::widget::{column, container, mouse_area, row, scrollable, text, text_input};
@@ -638,6 +638,198 @@ impl CapacityRollup {
     }
 }
 
+/// How many rolling samples the Overview keeps for its sparklines — one per Bus
+/// load. A short window so the sparkline reads "recent trend" rather than full
+/// history; the oldest sample is evicted when a fresh one would overflow.
+pub const HISTORY_CAP: usize = 24;
+
+/// One point of the Overview's short rolling history — a compact snapshot of the
+/// fleet taken on each Bus load. The ring buffer of these
+/// ([`DatacenterPanel::history`]) feeds the Overview's [`sparkline`]s so the
+/// operator can see, at a glance, whether resource / health counts are trending.
+/// Pure data; carries only the few scalars the sparklines plot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HistorySample {
+    /// Total datacenter resources at this sample (`rows.len()`). Plotted as the
+    /// "resources" trend line.
+    pub resources: usize,
+    /// Running VMs + active droplets at this sample — the compute footprint.
+    pub running: usize,
+    /// Health checks reporting `ok` at this sample. Plotted as the "ok" trend.
+    pub health_ok: usize,
+    /// Health checks reporting `warn`-or-`fail` at this sample. Plotted as the
+    /// "alerts" trend so a rising line flags a degrading fleet.
+    pub health_alerts: usize,
+}
+
+impl HistorySample {
+    /// Snapshot the current projected rows + health checks into one history
+    /// point. Pure — derives every field from the inputs, takes no clock (the
+    /// ring buffer is ordered by insertion, not timestamp). "Running" counts VMs
+    /// whose status is `running` plus droplets whose status is `active` (the two
+    /// live-compute vocabularies the worker emits).
+    #[must_use]
+    pub fn capture(rows: &[DcRow], health: &[HealthCheck]) -> Self {
+        let running = rows
+            .iter()
+            .filter(|r| {
+                (r.kind == "vm" && r.status.eq_ignore_ascii_case("running"))
+                    || (r.kind == "droplet" && r.status.eq_ignore_ascii_case("active"))
+            })
+            .count();
+        let (ok, warn, fail) = health_summary(health);
+        Self {
+            resources: rows.len(),
+            running,
+            health_ok: ok,
+            health_alerts: warn + fail,
+        }
+    }
+}
+
+/// The eight Unicode block-element glyphs, lowest (`▁`) to highest (`█`), used by
+/// [`sparkline`] to map a normalized sample onto a single-cell bar.
+const SPARK_GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// Project a series of sample values into a single-line block-glyph sparkline —
+/// each point becomes one of the eight `▁▂▃▄▅▆▇█` bars, scaled across the series'
+/// own min..max so the relative shape reads at a glance. An empty series yields an
+/// empty string; an all-equal series yields a flat mid-height line (no spurious
+/// slope). Pure and testable; the projection is value-only (no color/widget), so
+/// it composes into any text element. Used by the Overview to draw the rolling
+/// history of the resource / health counts beside their last-value readouts.
+#[must_use]
+pub fn sparkline(points: &[f32]) -> String {
+    if points.is_empty() {
+        return String::new();
+    }
+    let min = points.iter().copied().fold(f32::INFINITY, f32::min);
+    let max = points.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let span = max - min;
+    // A flat series (or a single point) has no slope to show — render a flat
+    // mid-height line rather than dividing by zero / pinning everything to the
+    // floor glyph.
+    if span <= f32::EPSILON {
+        return SPARK_GLYPHS[SPARK_GLYPHS.len() / 2]
+            .to_string()
+            .repeat(points.len());
+    }
+    points
+        .iter()
+        .map(|&p| {
+            // Normalize into 0..=1, then index the eight glyphs. The `min(7)`
+            // guards the exact-max point (norm == 1.0 → index 8) back into range.
+            let norm = (p - min) / span;
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            let idx = (norm * (SPARK_GLYPHS.len() as f32 - 1.0)).round() as usize;
+            SPARK_GLYPHS[idx.min(SPARK_GLYPHS.len() - 1)]
+        })
+        .collect()
+}
+
+/// One row of the Overview's **version matrix** — `farm / Eagle / each lighthouse`.
+/// Where the [`promote_matrix`] strip shows only the three *pipeline stages*, this
+/// projects a per-target row: the build farm, the Eagle staging host, and one row
+/// per live lighthouse (a Prod droplet), each pinned to the version it's expected
+/// to run and a readiness state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionRow {
+    /// The target's display label — "Farm (build)", "Eagle", or a lighthouse name.
+    pub target: String,
+    /// The version this target is pinned to (`"—"` when unknown / unobserved).
+    pub version: String,
+    /// Readiness — `"ready"` | `"pending"` | `"unknown"` (drives the chip color).
+    pub status: String,
+}
+
+/// The full version matrix: the farm + Eagle stage rows followed by one row per
+/// lighthouse. Built purely from the promote stages + the projected droplet rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VersionMatrix {
+    pub rows: Vec<VersionRow>,
+}
+
+impl VersionMatrix {
+    /// Project the `farm / Eagle / each-lighthouse` matrix off the promote stages
+    /// (`build`/`eagle`/`do`) + the resource rows. The **farm** row takes the
+    /// `build` stage; **Eagle** the `eagle` stage; and every Prod **droplet** row
+    /// becomes a lighthouse pinned to the `do` stage's version (the version DO is
+    /// being promoted to), its status the droplet's own readiness — `ready` for an
+    /// `active` droplet, else `pending`. Lighthouses are ordered by name for a
+    /// stable render. Pure and testable. An absent promote stage fills `"—"` /
+    /// `"unknown"` so the matrix always renders the farm + Eagle rows.
+    #[must_use]
+    pub fn project(stages: &[PromoteStage], rows: &[DcRow]) -> Self {
+        // Reuse the canonical build/eagle/do fill so absent stages already carry
+        // the "—" / "unknown" placeholders — no second copy of that logic here.
+        let canon = promote_matrix(stages);
+        let labelled = |stage: &str, label: &str| {
+            let s = canon
+                .iter()
+                .find(|s| s.stage == stage)
+                .expect("promote_matrix always yields build/eagle/do");
+            VersionRow {
+                target: label.to_string(),
+                version: if s.version.is_empty() {
+                    "—".to_string()
+                } else {
+                    s.version.clone()
+                },
+                status: s.status.clone(),
+            }
+        };
+
+        let mut out = vec![
+            labelled("build", "Farm (build)"),
+            labelled("eagle", "Eagle"),
+        ];
+
+        // The version DO is promoting toward — every lighthouse is expected to
+        // converge on it. The canonical fill substitutes "—" for an unobserved
+        // `do` stage; an observed-but-empty version maps to "—" too.
+        let do_version = canon
+            .iter()
+            .find(|s| s.stage == "do")
+            .map(|s| s.version.clone())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "—".to_string());
+
+        // One row per live lighthouse — the Prod droplets carry lighthouse
+        // identity. Sorted by name for a stable matrix.
+        let mut lighthouses: Vec<&DcRow> = rows
+            .iter()
+            .filter(|r| r.kind == "droplet" && r.zone == "prod")
+            .collect();
+        lighthouses.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+        for lh in lighthouses {
+            let name = if lh.name.is_empty() {
+                lh.id.clone()
+            } else {
+                lh.name.clone()
+            };
+            // A droplet that's `active` is up + reachable → it's running the DO
+            // target (ready); anything else is mid-flight (pending).
+            let status = if lh.status.eq_ignore_ascii_case("active") {
+                "ready"
+            } else {
+                "pending"
+            }
+            .to_string();
+            out.push(VersionRow {
+                target: name,
+                version: do_version.clone(),
+                status,
+            });
+        }
+
+        Self { rows: out }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DatacenterPanel {
     pub rows: Vec<DcRow>,
@@ -740,6 +932,13 @@ pub struct DatacenterPanel {
     /// Cleared when the reveal + selection tweens have all settled (no idle
     /// wakeups — the chain stops ticking at rest).
     pub motion_ticking: bool,
+    /// DATACENTER-9 — a short rolling history of the fleet, one [`HistorySample`]
+    /// per Bus load, capped at [`HISTORY_CAP`] (oldest evicted). Pushed on every
+    /// `Loaded(Ok)` via [`Self::push_sample`]; the Overview reads it back with
+    /// [`Self::history`] to draw the resource / health [`sparkline`]s. A ring
+    /// buffer so a long-running session keeps only the recent trend, not unbounded
+    /// growth.
+    pub history: VecDeque<HistorySample>,
 }
 
 /// Top-level view selector for the datacenter panel.
@@ -788,6 +987,7 @@ impl Default for DatacenterPanel {
             hovered_card: None,
             hover_since: Instant::now(),
             motion_ticking: false,
+            history: VecDeque::new(),
         }
     }
 }
@@ -938,6 +1138,23 @@ impl DatacenterPanel {
         Self::default()
     }
 
+    /// Push one rolling-history sample onto the capped ring buffer, evicting the
+    /// oldest when it would overflow [`HISTORY_CAP`]. Called on each Bus load so
+    /// the Overview's sparklines plot the recent trend. Pure state — no I/O.
+    pub fn push_sample(&mut self, sample: HistorySample) {
+        if self.history.len() >= HISTORY_CAP {
+            self.history.pop_front();
+        }
+        self.history.push_back(sample);
+    }
+
+    /// The rolling-history samples, oldest-first — the series the Overview's
+    /// sparklines plot. Borrowed read-only.
+    #[must_use]
+    pub fn history(&self) -> &VecDeque<HistorySample> {
+        &self.history
+    }
+
     /// Read the `event/dc/*` topics off the Bus + project them into rows.
     pub fn load() -> Task<crate::Message> {
         Task::perform(
@@ -957,6 +1174,10 @@ impl DatacenterPanel {
                 self.busy = false;
                 self.load_error = None;
                 self.status.clear();
+                // DATACENTER-9 — record this load as one rolling-history sample so
+                // the Overview's sparklines plot the recent resource / health
+                // trend. Captured off the just-assigned rows + health checks.
+                self.push_sample(HistorySample::capture(&self.rows, &self.health));
                 // A fresh projection may not include the row pending a delete —
                 // drop the stale confirm prompt rather than leave it dangling.
                 self.confirm_delete = None;
@@ -1480,11 +1701,30 @@ impl DatacenterPanel {
                 } else {
                     col = col.push(text("Memory: no host metrics reported yet."));
                 }
+                // DATACENTER-9 — rolling-history sparklines: a block-glyph trend
+                // line per tracked series (resources / running / health-ok /
+                // alerts) off the capped Bus-load history. Sits beside the
+                // last-value rollup/health readouts so the operator reads "now"
+                // and "trending" together.
+                col = col.push(text("Trend").size(f32::from(spacing::BASE[5])));
+                for el in sparklines_view(self.history(), palette) {
+                    col = col.push(el);
+                }
                 // Build → Eagle → DO promotion strip — a version matrix fed by
                 // `event/dc/promote/*`. Always renders all three stages (absent
                 // ones show "—") so the pipeline reads left-to-right.
                 col = col.push(text("Promotion").size(f32::from(spacing::BASE[5])));
                 col = col.push(promote_strip_view(&self.promote, palette));
+                // DATACENTER-9 — the per-target version matrix: farm / Eagle /
+                // each lighthouse. Where the strip above shows only the three
+                // pipeline stages, this adds a row per live lighthouse (a Prod
+                // droplet) so per-host version drift reads at a glance. Projected
+                // off the same `event/dc/promote/*` + the droplet rows.
+                col = col.push(text("Version matrix").size(f32::from(spacing::BASE[5])));
+                let vmatrix = VersionMatrix::project(&self.promote, &self.rows);
+                for el in version_matrix_view(&vmatrix, palette) {
+                    col = col.push(el);
+                }
                 // Health summary — a one-line ok/warn/fail tally fed by
                 // `event/dc/health/*`, plus an alert list of any non-ok checks.
                 col = col.push(text("Health").size(f32::from(spacing::BASE[5])));
@@ -2420,6 +2660,147 @@ fn recent_tofu_runs_view(
         let line = row![
             text(verb)
                 .colr(palette.text.into_cosmic_color())
+                .width(Length::FillPortion(2)),
+            text(chip_text)
+                .colr(chip_color.into_cosmic_color())
+                .width(Length::FillPortion(1)),
+        ]
+        .spacing(f32::from(spacing::BASE[3]));
+        out.push(
+            container(line)
+                .padding(f32::from(spacing::BASE[2]))
+                .width(Length::Fill)
+                .into(),
+        );
+    }
+    out
+}
+
+/// Render one labelled sparkline row: a muted `label`, the block-glyph
+/// [`sparkline`] of `points`, and the last value as a trailing readout. A series
+/// with fewer than two points has no trend to plot, so the line falls back to a
+/// muted "—". mde-theme tokens only — the label / line / value all read off the
+/// palette, never raw hex.
+fn sparkline_row(
+    label: &str,
+    points: &[f32],
+    palette: Palette,
+) -> Element<'static, crate::Message> {
+    let spark = sparkline(points);
+    let last = points.last().copied();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let last_text = last.map_or_else(|| "—".to_string(), |v| format!("{}", v.round() as i64));
+    // A single sample has no trend to plot — show just the value so the row reads
+    // honestly rather than drawing a one-cell "line".
+    let line_text = if spark.is_empty() || points.len() < 2 {
+        "—".to_string()
+    } else {
+        spark
+    };
+    row![
+        text(label.to_string())
+            .colr(palette.text_muted.into_cosmic_color())
+            .width(Length::FillPortion(2)),
+        text(line_text)
+            .colr(palette.accent.into_cosmic_color())
+            .width(Length::FillPortion(3)),
+        text(last_text)
+            .colr(palette.text.into_cosmic_color())
+            .width(Length::FillPortion(1)),
+    ]
+    .spacing(f32::from(spacing::BASE[2]))
+    .into()
+}
+
+/// Render the Overview's **rolling-history sparklines** — one labelled
+/// [`sparkline`] per tracked series (total resources, running compute, health-ok,
+/// health-alerts) computed off the panel's capped history ring buffer. With fewer
+/// than two samples there's no trend yet → a single muted hint line. Returns a
+/// list of elements so the Overview column can push them in order. mde-theme
+/// tokens only.
+fn sparklines_view(
+    history: &VecDeque<HistorySample>,
+    palette: Palette,
+) -> Vec<Element<'static, crate::Message>> {
+    let mut out: Vec<Element<'static, crate::Message>> = Vec::new();
+    if history.len() < 2 {
+        out.push(
+            text("Trend builds as the Bus is polled — refresh to add samples.")
+                .colr(palette.text_muted.into_cosmic_color())
+                .into(),
+        );
+        return out;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let series = |f: fn(&HistorySample) -> usize| -> Vec<f32> {
+        history.iter().map(|s| f(s) as f32).collect()
+    };
+    out.push(sparkline_row(
+        "Resources",
+        &series(|s| s.resources),
+        palette,
+    ));
+    out.push(sparkline_row("Running", &series(|s| s.running), palette));
+    out.push(sparkline_row(
+        "Health ok",
+        &series(|s| s.health_ok),
+        palette,
+    ));
+    out.push(sparkline_row(
+        "Alerts",
+        &series(|s| s.health_alerts),
+        palette,
+    ));
+    out
+}
+
+/// Render the Overview's **version matrix** — `farm / Eagle / each lighthouse` —
+/// off [`VersionMatrix::project`]. A header row plus one line per target: its
+/// label, the version it's pinned to, and a readiness chip whose color comes from
+/// a mde-theme token (`success` for ready, `warning` for pending, `text_muted` for
+/// unknown). Where the promote strip shows only the three pipeline stages, this
+/// adds a row per live lighthouse so the operator sees per-host version drift at a
+/// glance. mde-theme tokens only — no raw hex.
+fn version_matrix_view(
+    matrix: &VersionMatrix,
+    palette: Palette,
+) -> Vec<Element<'static, crate::Message>> {
+    let mut out: Vec<Element<'static, crate::Message>> = Vec::new();
+    // Column header so the version / status columns read.
+    out.push(
+        row![
+            text("Target")
+                .colr(palette.text_muted.into_cosmic_color())
+                .width(Length::FillPortion(2)),
+            text("Version")
+                .colr(palette.text_muted.into_cosmic_color())
+                .width(Length::FillPortion(2)),
+            text("State")
+                .colr(palette.text_muted.into_cosmic_color())
+                .width(Length::FillPortion(1)),
+        ]
+        .spacing(f32::from(spacing::BASE[3]))
+        .into(),
+    );
+    for vr in &matrix.rows {
+        let (chip_color, chip_text) = match vr.status.as_str() {
+            "ready" => (palette.success, "ready".to_string()),
+            "pending" => (palette.warning, "pending".to_string()),
+            other => (
+                palette.text_muted,
+                if other.is_empty() {
+                    "—".to_string()
+                } else {
+                    other.to_string()
+                },
+            ),
+        };
+        let line = row![
+            text(vr.target.clone())
+                .colr(palette.text.into_cosmic_color())
+                .width(Length::FillPortion(2)),
+            text(vr.version.clone())
+                .colr(palette.accent.into_cosmic_color())
                 .width(Length::FillPortion(2)),
             text(chip_text)
                 .colr(chip_color.into_cosmic_color())
@@ -4519,6 +4900,204 @@ mod tests {
         let _ = p.update(Message::Loaded(Ok(load)));
         let _ = p.update(Message::CardSelected("v3".into()));
         let _ = p.update(Message::CardHovered(Some("v5".into())));
+        let _ = p.view();
+    }
+
+    // ── DATACENTER-9: rolling-history sparklines ──────────────────────────────
+
+    #[test]
+    fn sparkline_maps_a_series_onto_block_glyphs() {
+        // An ascending ramp climbs the eight glyphs from floor to ceiling.
+        let s = sparkline(&[0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(s.chars().count(), 4, "one glyph per sample");
+        let chars: Vec<char> = s.chars().collect();
+        assert_eq!(chars[0], '▁', "the min sample pins to the floor glyph");
+        assert_eq!(chars[3], '█', "the max sample pins to the ceiling glyph");
+        // Monotone non-decreasing input → monotone non-decreasing glyph heights.
+        let heights: Vec<usize> = chars
+            .iter()
+            .map(|c| SPARK_GLYPHS.iter().position(|g| g == c).unwrap())
+            .collect();
+        assert!(heights.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn sparkline_handles_empty_and_flat_series() {
+        // Empty → empty (the view falls back to a hint).
+        assert_eq!(sparkline(&[]), "");
+        // A flat series has no slope → a flat mid-height line, not a div-by-zero.
+        let flat = sparkline(&[5.0, 5.0, 5.0]);
+        assert_eq!(flat.chars().count(), 3);
+        let mid = SPARK_GLYPHS[SPARK_GLYPHS.len() / 2];
+        assert!(flat.chars().all(|c| c == mid), "flat → all mid-height");
+        // A single sample is also "flat" (one mid glyph).
+        assert_eq!(sparkline(&[9.0]).chars().count(), 1);
+    }
+
+    #[test]
+    fn history_sample_captures_resources_running_and_health() {
+        let rows = vec![
+            row_with("vm", "v1", "a", "running", "dev"),
+            row_with("vm", "v2", "b", "halted", "dev"), // not running
+            row_with("droplet", "d1", "lh", "active", "prod"), // running compute
+            row_with("droplet", "d2", "lh2", "off", "prod"), // not running
+        ];
+        let health = vec![
+            HealthCheck {
+                check: "bus".into(),
+                status: "ok".into(),
+                detail: String::new(),
+            },
+            HealthCheck {
+                check: "dom0".into(),
+                status: "fail".into(),
+                detail: "ssh".into(),
+            },
+        ];
+        let s = HistorySample::capture(&rows, &health);
+        assert_eq!(s.resources, 4);
+        assert_eq!(s.running, 2, "one running vm + one active droplet");
+        assert_eq!(s.health_ok, 1);
+        assert_eq!(s.health_alerts, 1, "the fail counts as an alert");
+    }
+
+    #[test]
+    fn push_sample_rings_at_the_history_cap() {
+        let mut p = DatacenterPanel::new();
+        assert!(p.history().is_empty());
+        // Overfill the ring buffer by a few samples.
+        for i in 0..(HISTORY_CAP + 5) {
+            p.push_sample(HistorySample {
+                resources: i,
+                ..HistorySample::default()
+            });
+        }
+        // Capped — never grows past HISTORY_CAP.
+        assert_eq!(p.history().len(), HISTORY_CAP);
+        // Oldest evicted: the front is sample #5, the back is the newest.
+        assert_eq!(p.history().front().unwrap().resources, 5);
+        assert_eq!(p.history().back().unwrap().resources, HISTORY_CAP + 4);
+    }
+
+    #[test]
+    fn loaded_pushes_a_history_sample() {
+        let mut p = DatacenterPanel::new();
+        let load = DcLoad {
+            rows: vec![row_with("droplet", "d1", "lh", "active", "prod")],
+            health: vec![HealthCheck {
+                check: "bus".into(),
+                status: "ok".into(),
+                detail: String::new(),
+            }],
+            ..DcLoad::default()
+        };
+        let _ = p.update(Message::Loaded(Ok(load.clone())));
+        assert_eq!(p.history().len(), 1, "a load records one sample");
+        let _ = p.update(Message::Loaded(Ok(load)));
+        assert_eq!(p.history().len(), 2, "each load appends another");
+        let s = p.history().back().unwrap();
+        assert_eq!(s.resources, 1);
+        assert_eq!(s.running, 1);
+        assert_eq!(s.health_ok, 1);
+    }
+
+    #[test]
+    fn overview_renders_the_trend_sparklines() {
+        let mut p = DatacenterPanel::new();
+        // < 2 samples → the "trend builds" hint branch.
+        let _ = p.view();
+        // Two loads → real trend lines render.
+        let load = DcLoad {
+            rows: vec![row_with("droplet", "d1", "lh", "active", "prod")],
+            ..DcLoad::default()
+        };
+        let _ = p.update(Message::Loaded(Ok(load.clone())));
+        let _ = p.update(Message::Loaded(Ok(load)));
+        assert!(p.history().len() >= 2);
+        // Exercises sparklines_view → sparkline_row for every series.
+        let _ = p.view();
+    }
+
+    // ── DATACENTER-9: farm / Eagle / per-lighthouse version matrix ────────────
+
+    #[test]
+    fn version_matrix_projects_farm_eagle_and_lighthouses() {
+        let stages = vec![
+            PromoteStage {
+                stage: "build".into(),
+                version: "11.0.2-1".into(),
+                status: "ready".into(),
+            },
+            PromoteStage {
+                stage: "eagle".into(),
+                version: "11.0.1-1".into(),
+                status: "ready".into(),
+            },
+            PromoteStage {
+                stage: "do".into(),
+                version: "11.0.1-1".into(),
+                status: "pending".into(),
+            },
+        ];
+        let rows = vec![
+            // Two Prod lighthouses (unsorted by name) + a Dev VM that must NOT
+            // appear in the matrix.
+            row_with("droplet", "2", "lighthouse-02", "active", "prod"),
+            row_with("droplet", "1", "lighthouse-01", "off", "prod"),
+            row_with("vm", "v9", "builder", "running", "dev"),
+        ];
+        let m = VersionMatrix::project(&stages, &rows);
+        // Farm + Eagle + two lighthouses.
+        assert_eq!(m.rows.len(), 4);
+        assert_eq!(m.rows[0].target, "Farm (build)");
+        assert_eq!(m.rows[0].version, "11.0.2-1");
+        assert_eq!(m.rows[0].status, "ready");
+        assert_eq!(m.rows[1].target, "Eagle");
+        assert_eq!(m.rows[1].version, "11.0.1-1");
+        // Lighthouses, sorted by name; each pinned to the DO target version.
+        assert_eq!(m.rows[2].target, "lighthouse-01");
+        assert_eq!(m.rows[2].version, "11.0.1-1");
+        assert_eq!(m.rows[2].status, "pending", "an off droplet is mid-flight");
+        assert_eq!(m.rows[3].target, "lighthouse-02");
+        assert_eq!(m.rows[3].version, "11.0.1-1");
+        assert_eq!(m.rows[3].status, "ready", "an active droplet is converged");
+    }
+
+    #[test]
+    fn version_matrix_fills_absent_stages_and_handles_no_lighthouses() {
+        // No promote events + no droplets → farm + Eagle placeholder rows only.
+        let m = VersionMatrix::project(&[], &[]);
+        assert_eq!(m.rows.len(), 2);
+        assert_eq!(m.rows[0].target, "Farm (build)");
+        assert_eq!(m.rows[0].version, "—");
+        assert_eq!(m.rows[0].status, "unknown");
+        assert_eq!(m.rows[1].target, "Eagle");
+        assert_eq!(m.rows[1].version, "—");
+        // A lighthouse with no `do` stage observed → its version is "—".
+        let rows = vec![row_with("droplet", "1", "lh-01", "active", "prod")];
+        let m2 = VersionMatrix::project(&[], &rows);
+        assert_eq!(m2.rows.len(), 3);
+        assert_eq!(m2.rows[2].target, "lh-01");
+        assert_eq!(m2.rows[2].version, "—", "no DO target observed yet");
+    }
+
+    #[test]
+    fn version_matrix_falls_back_to_id_for_an_unnamed_lighthouse() {
+        let rows = vec![row_with("droplet", "579112110", "", "active", "prod")];
+        let m = VersionMatrix::project(&[], &rows);
+        assert_eq!(m.rows[2].target, "579112110", "unnamed droplet → its id");
+    }
+
+    #[test]
+    fn overview_renders_the_version_matrix() {
+        let mut p = DatacenterPanel::new();
+        p.promote = vec![PromoteStage {
+            stage: "build".into(),
+            version: "11.0.2-1".into(),
+            status: "ready".into(),
+        }];
+        p.rows = vec![row_with("droplet", "1", "lh-01", "active", "prod")];
+        // Exercises version_matrix_view → its header + lighthouse + chip branches.
         let _ = p.view();
     }
 }
