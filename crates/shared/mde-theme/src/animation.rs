@@ -342,10 +342,130 @@ impl Animator {
     }
 }
 
+// ── MOTION-INFRA-2 — reusable enter/exit/crossfade/hover helpers ──────────────
+//
+// One-call, token-driven, reduce-motion-aware bridges from "a panel mounted at
+// `start`, it's now `now`" to the concrete [`RenderParams`] a themed widget
+// applies (alpha / translate_y / scale). They are pure glue over the existing
+// primitives — a [`Motion`] preset for the duration+easing, [`Tween::resolved`]
+// for the reduce-motion duration cap, [`ease`] for the curve, and a
+// [`Transition`] for the property mapping — so a panel never hand-rolls timing
+// or re-implements the reduce-motion contract.
+//
+// The reduce-motion contract (Q32, mirrors [`Motion::resolved`]): every transform
+// that would *move* a surface (slide, hover-lift) collapses to a pure opacity
+// crossfade with NO translate/scale — motion is never the only cue and there is
+// no positional thrash — and the ≤80 ms linear cap from [`Tween::resolved`]
+// applies, so the static/final frame is reached almost immediately.
+
+/// MOTION-INFRA-2 — opacity-only enter; returns the [`RenderParams`] at `now`.
+///
+/// The surface fades 0→1 over the [`Motion::panel_mount`] duration (Carbon
+/// `moderate-02`, 240 ms; ≤80 ms under reduce-motion). No transform, so it's
+/// identical with or without reduce-motion — a fade is already the
+/// reduce-motion-safe primitive every other helper collapses to.
+#[must_use]
+pub fn fade_in(start: Instant, now: Instant, reduce_motion: bool) -> RenderParams {
+    let motion = Motion::panel_mount();
+    let tw = Tween::resolved(start, motion.duration, reduce_motion);
+    let t = ease(tw.progress(now), motion_easing(motion, reduce_motion));
+    Transition::FadeIn.params(t)
+}
+
+/// MOTION-INFRA-2 — fade-and-rise enter; returns the [`RenderParams`] at `now`.
+///
+/// The surface fades 0→1 while sliding up from `distance` px below to rest, over
+/// the [`Motion::panel_mount`] duration. **Under reduce-motion the slide is
+/// dropped** — it collapses to a pure [`fade_in`] crossfade (no `translate_y`, so
+/// zero layout reflow / positional motion). `distance` defaults sensibly to
+/// [`PANEL_MOUNT_TRANSLATE_Y_PX`] at the call site.
+#[must_use]
+pub fn slide_in(start: Instant, now: Instant, distance: f32, reduce_motion: bool) -> RenderParams {
+    if reduce_motion {
+        // Collapse the transform to a crossfade — opacity only, no movement.
+        return fade_in(start, now, true);
+    }
+    let motion = Motion::panel_mount();
+    let tw = Tween::resolved(start, motion.duration, false);
+    let t = ease(tw.progress(now), motion.easing);
+    Transition::SlideUp(distance).params(t)
+}
+
+/// MOTION-INFRA-2 — crossfade two surfaces; returns `(outgoing, incoming)`.
+///
+/// Both share the same `start`: the outgoing fades 1→0 and the incoming 0→1 over
+/// the same [`Motion::dialog_mount`] duration (so a swap reads as one motion).
+/// Both are opacity-only — the reduce-motion-safe primitive — so the ≤80 ms cap
+/// is the only change under reduce-motion. This is the helper every other
+/// transform collapses to under reduce-motion.
+#[must_use]
+pub fn crossfade(
+    start: Instant,
+    now: Instant,
+    reduce_motion: bool,
+) -> (RenderParams, RenderParams) {
+    let motion = Motion::dialog_mount();
+    let tw = Tween::resolved(start, motion.duration, reduce_motion);
+    let t = ease(tw.progress(now), motion_easing(motion, reduce_motion));
+    (Transition::FadeOut.params(t), Transition::FadeIn.params(t))
+}
+
+/// MOTION-INFRA-2 — hover lift; returns the [`RenderParams`] for `now`.
+///
+/// As `hovered` toggles, the surface rises `rise` px (negative `translate_y`) over
+/// the [`Motion::hover`] duration (Carbon `fast-01`, 70 ms). `start` is when the
+/// hover state last changed; `hovered` is the *target* (rising on enter, settling
+/// back on leave). **Under reduce-motion the lift is dropped** — the surface stays
+/// at rest with no transform (hover is conveyed by color/elevation tokens, not
+/// motion).
+#[must_use]
+pub fn lift_on_hover(
+    start: Instant,
+    now: Instant,
+    rise: f32,
+    hovered: bool,
+    reduce_motion: bool,
+) -> RenderParams {
+    let rest = RenderParams {
+        alpha: 1.0,
+        translate_y: 0.0,
+        scale: 1.0,
+    };
+    if reduce_motion {
+        // No positional motion under reduce-motion — stay at rest.
+        return rest;
+    }
+    let motion = Motion::hover();
+    let tw = Tween::resolved(start, motion.duration, false);
+    let t = ease(tw.progress(now), motion.easing);
+    // `hovered` drives the direction. On enter the offset runs rest → -rise as the
+    // tween progresses; on leave it runs -rise → rest (the same tween, reversed).
+    let translate_y = if hovered {
+        lerp_f32(0.0, -rise, t)
+    } else {
+        lerp_f32(-rise, 0.0, t)
+    };
+    RenderParams {
+        translate_y,
+        ..rest
+    }
+}
+
+/// MOTION-INFRA-2 — the easing a helper should use given `reduce_motion`. Mirrors
+/// [`Motion::resolved`], which forces a linear crossfade under reduce-motion; full
+/// motion keeps the preset's curve.
+const fn motion_easing(motion: Motion, reduce_motion: bool) -> Easing {
+    if reduce_motion {
+        Easing::Linear
+    } else {
+        motion.easing
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::motion::PULSE_MAX_SCALE;
+    use crate::motion::{PANEL_MOUNT_TRANSLATE_Y_PX, PULSE_MAX_SCALE};
 
     #[test]
     fn transition_params_map_progress_correctly() {
@@ -624,5 +744,108 @@ mod tests {
         let r5 = shimmer_alpha(0.5, true);
         assert_eq!(r0, r5, "reduce-motion alpha is phase-independent");
         assert!((r0 - (SKELETON_ALPHA_DIM + SKELETON_ALPHA_BRIGHT) / 2.0).abs() < 1e-6);
+    }
+
+    // ── MOTION-INFRA-2 — fade_in / slide_in / crossfade / lift_on_hover ────────
+
+    #[test]
+    fn fade_in_runs_zero_to_one_over_panel_mount_duration() {
+        let t0 = Instant::now();
+        let full = Motion::panel_mount().duration; // 240 ms
+        assert!(fade_in(t0, t0, false).alpha < 1e-4, "starts transparent");
+        let end = fade_in(t0, t0 + full, false);
+        assert!((end.alpha - 1.0).abs() < 1e-4, "ends opaque");
+        // A fade never moves or scales the surface.
+        assert_eq!(end.translate_y, 0.0);
+        assert_eq!(end.scale, 1.0);
+    }
+
+    #[test]
+    fn fade_in_reduce_motion_caps_at_80ms() {
+        let t0 = Instant::now();
+        let cap = Duration::from_millis(crate::motion::REDUCE_MOTION_CAP_MS);
+        // At the 80 ms cap the fade is already complete under reduce-motion.
+        assert!((fade_in(t0, t0 + cap, true).alpha - 1.0).abs() < 1e-4);
+        // Past the panel_mount duration it is obviously done either way.
+        assert!((fade_in(t0, t0 + Motion::panel_mount().duration, true).alpha - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn slide_in_rises_and_fades_with_motion_on() {
+        let t0 = Instant::now();
+        let dist = PANEL_MOUNT_TRANSLATE_Y_PX;
+        let s0 = slide_in(t0, t0, dist, false);
+        assert_eq!(s0.translate_y, dist, "starts `distance` px below");
+        assert!(s0.alpha < 1e-4, "starts transparent");
+        let s1 = slide_in(t0, t0 + Motion::panel_mount().duration, dist, false);
+        assert!((s1.translate_y).abs() < 1e-4, "rests at 0");
+        assert!((s1.alpha - 1.0).abs() < 1e-4, "ends opaque");
+    }
+
+    #[test]
+    fn slide_in_collapses_to_crossfade_under_reduce_motion() {
+        // Reduce-motion drops the slide → no positional motion (zero translate_y)
+        // at every sampled frame; only opacity changes (== fade_in).
+        let t0 = Instant::now();
+        let dist = 12.0;
+        for ms in [0, 20, 40, 80, 240] {
+            let now = t0 + Duration::from_millis(ms);
+            let r = slide_in(t0, now, dist, true);
+            assert_eq!(r.translate_y, 0.0, "no slide under reduce-motion at {ms}ms");
+            assert_eq!(r.scale, 1.0);
+            // Identical to the pure fade path.
+            assert!((r.alpha - fade_in(t0, now, true).alpha).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn crossfade_is_complementary_and_opacity_only() {
+        let t0 = Instant::now();
+        let dur = Motion::dialog_mount().duration;
+        // Start: outgoing fully visible, incoming hidden.
+        let (out0, in0) = crossfade(t0, t0, false);
+        assert!((out0.alpha - 1.0).abs() < 1e-4);
+        assert!(in0.alpha < 1e-4);
+        // Mid: the two alphas sum to ~1 (a true crossfade, no flicker/black).
+        let (outm, inm) = crossfade(t0, t0 + dur / 2, false);
+        assert!(
+            (outm.alpha + inm.alpha - 1.0).abs() < 1e-3,
+            "alphas sum to 1"
+        );
+        // End: outgoing gone, incoming full.
+        let (out1, in1) = crossfade(t0, t0 + dur, false);
+        assert!(out1.alpha < 1e-4);
+        assert!((in1.alpha - 1.0).abs() < 1e-4);
+        // Never any transform on either side.
+        assert_eq!(out0.translate_y, 0.0);
+        assert_eq!(in0.scale, 1.0);
+    }
+
+    #[test]
+    fn lift_on_hover_rises_then_settles_and_is_static_under_reduce_motion() {
+        let t0 = Instant::now();
+        let rise = 6.0;
+        let dur = Motion::hover().duration; // 70 ms
+                                            // Enter: at rest at t=0, lifted by -rise at the end.
+        assert!(lift_on_hover(t0, t0, rise, true, false).translate_y.abs() < 1e-4);
+        let lifted = lift_on_hover(t0, t0 + dur, rise, true, false);
+        assert!((lifted.translate_y + rise).abs() < 1e-4, "lifts to -rise");
+        // Leave: starts at the lifted offset, returns to rest.
+        let leaving0 = lift_on_hover(t0, t0, rise, false, false);
+        assert!(
+            (leaving0.translate_y + rise).abs() < 1e-4,
+            "leave starts lifted"
+        );
+        let settled = lift_on_hover(t0, t0 + dur, rise, false, false);
+        assert!(settled.translate_y.abs() < 1e-4, "leave settles to rest");
+        // Reduce-motion: never any vertical motion, regardless of hovered/time.
+        for hovered in [true, false] {
+            for ms in [0, 35, 70, 200] {
+                let r = lift_on_hover(t0, t0 + Duration::from_millis(ms), rise, hovered, true);
+                assert_eq!(r.translate_y, 0.0, "no lift under reduce-motion");
+                assert_eq!(r.alpha, 1.0);
+                assert_eq!(r.scale, 1.0);
+            }
+        }
     }
 }
