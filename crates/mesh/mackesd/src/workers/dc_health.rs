@@ -32,6 +32,12 @@ pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(30);
 /// Default SUBSTRATE-V2 etcd endpoint (overridable via `MCNF_ETCD`).
 pub const DEFAULT_ETCD: &str = "http://172.20.145.192:2379";
 
+/// Days-until-expiry at or below which the Nebula CA cert is flagged `warn`:
+/// a CA-cert turnover invalidates every peer cert under it at once, so operators
+/// need lead time to `mackesd ca rotate`. 30 days is a full ops cycle of warning
+/// (matches [`crate::ca::expiry::CERT_EXPIRY_WARN_DAYS`]).
+pub const CERT_WARN_DAYS: i64 = 30;
+
 /// Max characters of a check's `detail` string carried into the record. Keeps the
 /// health lane compact.
 pub const DETAIL_LEN: usize = 160;
@@ -115,6 +121,39 @@ impl DcHealth {
             detail: detail_summary(detail),
         })
     }
+}
+
+// ---- pure cert-expiry helpers (unit-tested without a subprocess) ----
+
+/// Map days-until-expiry to a health status: `"fail"` once the cert is past its
+/// `Not after` (negative days), `"warn"` inside the [`CERT_WARN_DAYS`] lead-time
+/// window, else `"ok"`.
+#[must_use]
+pub fn cert_status_from_days(days_until_expiry: i64) -> &'static str {
+    if days_until_expiry < 0 {
+        "fail"
+    } else if days_until_expiry < CERT_WARN_DAYS {
+        "warn"
+    } else {
+        "ok"
+    }
+}
+
+/// Extract the `Not after` date out of a `nebula-cert print -path <crt>` text
+/// document. The Go tool prints the cert as an indented block whose Details
+/// section carries a `Not after: <date> UTC` line; this returns the trimmed
+/// `<date>` portion (everything after the first `Not after:`), or `None` when no
+/// such line is present (garbage / unexpected output). Pure — the parse path is
+/// unit-tested against captured output.
+#[must_use]
+pub fn parse_not_after(nebula_cert_output: &str) -> Option<String> {
+    nebula_cert_output.lines().find_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("Not after:")
+            .map(|rest| rest.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
 }
 
 // ---- thin I/O: run the probes, emit health events via the Bus ----
@@ -260,11 +299,71 @@ fn probe_secret_store() -> Probe {
     }
 }
 
+/// Locate the Nebula CA cert to inspect: the first that exists of `$NEBULA_CA_CRT`,
+/// `<workgroup_root>/nebula/ca.crt`, `/etc/nebula/ca.crt`, then
+/// `~/.config/nebula/ca.crt`. `None` when none of those exist (a fresh/un-enrolled
+/// node) — the probe reports that honestly as `warn`, not `fail`.
+fn locate_ca_cert(workgroup_root: &std::path::Path) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var("NEBULA_CA_CRT") {
+        if !p.is_empty() {
+            candidates.push(PathBuf::from(p));
+        }
+    }
+    candidates.push(workgroup_root.join("nebula").join("ca.crt"));
+    candidates.push(PathBuf::from("/etc/nebula/ca.crt"));
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(
+            PathBuf::from(home)
+                .join(".config")
+                .join("nebula")
+                .join("ca.crt"),
+        );
+    }
+    candidates.into_iter().find(|p| p.exists())
+}
+
+/// Probe the Nebula CA cert's expiry. Locates the CA cert (see
+/// [`locate_ca_cert`]), runs `nebula-cert print -path <ca.crt>`, parses its
+/// `Not after` date and reduces it to days-remaining via
+/// [`cert_status_from_days`]. `warn` (honestly, not `fail`) when no CA cert is
+/// found or `nebula-cert` is missing/unparseable — there is nothing to alert on.
+fn probe_cert(workgroup_root: &std::path::Path) -> Probe {
+    let Some(ca_crt) = locate_ca_cert(workgroup_root) else {
+        return Probe::warn("no nebula CA cert found");
+    };
+    let out = std::process::Command::new("nebula-cert")
+        .args(["print", "-path"])
+        .arg(&ca_crt)
+        .output();
+    let stdout = match out {
+        Ok(o) if o.status.success() => o.stdout,
+        Ok(_) => return Probe::warn("nebula-cert print failed"),
+        Err(_) => return Probe::warn("no nebula CA cert found"),
+    };
+    let text = String::from_utf8_lossy(&stdout);
+    let Some(not_after) = parse_not_after(&text) else {
+        return Probe::warn("nebula-cert: no Not after line");
+    };
+    // The Go tool prints e.g. `2027-01-01 00:00:00 +0000 UTC`; chrono parses the
+    // `+0000` offset form. Drop the trailing ` UTC` label it appends.
+    let to_parse = not_after.trim_end_matches(" UTC").trim();
+    let Ok(expiry) = chrono::DateTime::parse_from_str(to_parse, "%Y-%m-%d %H:%M:%S %z") else {
+        return Probe::warn(format!("nebula-cert: unparseable Not after '{not_after}'"));
+    };
+    let days = (expiry.timestamp() - chrono::Utc::now().timestamp()) / 86_400;
+    match cert_status_from_days(days) {
+        "fail" => Probe::fail(format!("CA expired {not_after}")),
+        "warn" => Probe::warn(format!("CA expires {not_after}")),
+        _ => Probe::ok(format!("CA expires {not_after} ({days}d)")),
+    }
+}
+
 /// One health pass: run each best-effort probe, feed its `(check, status)`
 /// through the dedup core, and publish the records that survive (status
 /// transitions). Every probe is independent — a failed/absent tool degrades that
 /// one check to `fail`/`warn` and never aborts the pass.
-fn run_checks(core: &mut DcHealth) {
+fn run_checks(core: &mut DcHealth, workgroup_root: &std::path::Path) {
     let key = crate::workers::datacenter_orchestrator::xen_ssh_key();
     for dom0 in crate::workers::datacenter_orchestrator::xen_dom0s() {
         let check = format!("dom0:{dom0}");
@@ -283,6 +382,11 @@ fn run_checks(core: &mut DcHealth) {
     if let Some(rec) = core.observe("secret-store", p.status, &p.detail) {
         publish(&rec);
     }
+
+    let p = probe_cert(workgroup_root);
+    if let Some(rec) = core.observe("cert", p.status, &p.detail) {
+        publish(&rec);
+    }
 }
 
 /// The supervised worker. Leader-gated (only the elected node probes + publishes,
@@ -292,6 +396,7 @@ pub struct DcHealthWorker {
     tick_interval: Duration,
     node_id: String,
     leader_lock: PathBuf,
+    workgroup_root: PathBuf,
 }
 
 impl DcHealthWorker {
@@ -303,6 +408,7 @@ impl DcHealthWorker {
             core: DcHealth::new(),
             tick_interval: DEFAULT_TICK_INTERVAL,
             leader_lock: workgroup_root.join(".mackesd-leader.lock"),
+            workgroup_root,
             node_id,
         }
     }
@@ -326,7 +432,7 @@ impl Worker for DcHealthWorker {
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
         loop {
             if self.is_leader() {
-                run_checks(&mut self.core);
+                run_checks(&mut self.core, &self.workgroup_root);
             }
             tokio::select! {
                 () = shutdown.wait() => return Ok(()),
@@ -417,6 +523,67 @@ mod tests {
         assert_eq!(v["check"], "secret-store");
         assert_eq!(v["status"], "warn");
         assert_eq!(v["detail"], "secret helper spawn failed: nope");
+    }
+
+    // A representative `nebula-cert print -path <ca.crt>` text document — the
+    // indented block the Go tool emits. Only the `Not after` line is asserted;
+    // the rest mirrors the real shape so the line selector is exercised.
+    const SAMPLE_CERT_PRINT: &str = "NebulaCertificate {\n\
+        \tDetails {\n\
+        \t\tName: magic-mesh-ca\n\
+        \t\tIps: []\n\
+        \t\tSubnets: []\n\
+        \t\tGroups: []\n\
+        \t\tNot before: 2026-01-01 00:00:00 +0000 UTC\n\
+        \t\tNot after: 2027-01-01 00:00:00 +0000 UTC\n\
+        \t\tIs CA: true\n\
+        \t}\n\
+        \tFingerprint: deadbeef\n\
+        }\n";
+
+    #[test]
+    fn cert_status_thresholds_fail_warn_ok() {
+        // Already past Not after → fail.
+        assert_eq!(cert_status_from_days(-1), "fail");
+        assert_eq!(cert_status_from_days(-365), "fail");
+        // Inside the 30-day lead-time window → warn (incl. the 0-day boundary).
+        assert_eq!(cert_status_from_days(0), "warn");
+        assert_eq!(cert_status_from_days(29), "warn");
+        // 30 days and beyond → ok (boundary is exclusive of the warn window).
+        assert_eq!(cert_status_from_days(CERT_WARN_DAYS), "ok");
+        assert_eq!(cert_status_from_days(31), "ok");
+        assert_eq!(cert_status_from_days(400), "ok");
+    }
+
+    #[test]
+    fn parse_not_after_extracts_the_date_line() {
+        assert_eq!(
+            parse_not_after(SAMPLE_CERT_PRINT).as_deref(),
+            Some("2027-01-01 00:00:00 +0000 UTC")
+        );
+    }
+
+    #[test]
+    fn parse_not_after_rejects_garbage_output() {
+        // No `Not after:` line at all.
+        assert!(parse_not_after("total garbage, not a cert").is_none());
+        assert!(parse_not_after("").is_none());
+        // A `Not before:` line must NOT be mistaken for `Not after:`.
+        assert!(parse_not_after("\t\tNot before: 2026-01-01 00:00:00 +0000 UTC").is_none());
+        // Present but empty value → None (nothing to compare).
+        assert!(parse_not_after("Not after:   ").is_none());
+    }
+
+    #[test]
+    fn parse_not_after_date_is_chrono_parseable() {
+        // The extracted line (sans the trailing ` UTC` label) round-trips
+        // through the same parse the probe uses, so the threshold mapping is
+        // reachable end-to-end.
+        let raw = parse_not_after(SAMPLE_CERT_PRINT).unwrap();
+        let to_parse = raw.trim_end_matches(" UTC").trim();
+        let dt = chrono::DateTime::parse_from_str(to_parse, "%Y-%m-%d %H:%M:%S %z").unwrap();
+        // 2027-01-01T00:00:00Z == 1_798_761_600.
+        assert_eq!(dt.timestamp(), 1_798_761_600);
     }
 
     #[test]
