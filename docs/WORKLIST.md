@@ -1834,9 +1834,15 @@ the plane and it **survives killing the current zone leader**.
   like the local desktop.
   **Acceptance**:
     - [ ] GPU/USB/audio PCI-passthrough to a Primary Desktop VM that auto-launches at boot and owns the console; dom0 hidden; a management VM can reclaim the console for recovery if the desktop VM fails
-- [ ] **DATACENTER-23: control-plane DR (encrypted backup + one-click restore).**
+- [>] **DATACENTER-23: control-plane DR (encrypted backup + one-click restore).** *(session=calm-ray-dcr8)*
+  *Backup + restore BUILT + round-trip verified live: `automation/dr/dr-backup.sh` dumps the etcd Tofu state
+  + (already-age-encrypted) secret store + recipient → age-encrypted `dr-<ts>.age`; `dr-restore.sh` restores
+  (defaults to a SAFE temp prefix, `--prod` to go live). Round-trip proven (backup → restore → sha256 match).
+  A leader-gated `dr_scheduler` worker runs it daily → `event/dc/dr/last`; an `action/dc/dr-backup` RPC +
+  a typed-confirm "Back up now" button on Overview. Remaining: include the Nebula CA, push to an OFF-FLEET
+  target (today local `~/mcnf-dr-backups`), the guided restore-rebirth flow, and secure mesh-age-key backup.*
   **Acceptance**:
-    - [ ] periodic encrypted backup of Tofu state + Nebula CA + secret store to an off-fleet target; a guided restore rebirths the control plane and re-elects a leader
+    - [>] periodic encrypted backup of Tofu state + Nebula CA + secret store to an off-fleet target; a guided restore rebirths the control plane and re-elects a leader — *backup (state+secrets, age) + restore + daily scheduler + RPC + button done, round-trip verified; CA + off-fleet target + guided-rebirth pending*
 - [>] **DATACENTER-24: logs aggregation + periodic health checks.** *(session=calm-ray-dcr8)*
   *HEALTH half done: a leader-gated `dc_health` worker runs periodic best-effort checks (each dom0 reachable,
   etcd store, secret-store) → `event/dc/health/*` with ok/warn/fail + dedup; the Overview shows a health
