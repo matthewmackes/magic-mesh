@@ -74,17 +74,39 @@ pub async fn delete_peer(client: &mut Client, hostname: &str) -> anyhow::Result<
 /// start a runtime from within a runtime") and on an etcd node crash-loops the
 /// worker until ENT-6 circuit-breaks it. Returns `None` only when a private
 /// runtime can't be built.
-fn block_on<F: std::future::Future>(fut: F) -> Option<F::Output> {
-    // Already inside a runtime → move off the async worker with `block_in_place`
-    // and drive on the existing multi-thread handle instead of nesting.
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        return Some(tokio::task::block_in_place(|| handle.block_on(fut)));
+fn block_on<F>(fut: F) -> Option<F::Output>
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    if tokio::runtime::Handle::try_current().is_err() {
+        // Off the tokio executor (heartbeat / responder std::thread): a private
+        // current-thread runtime drives `fut` directly.
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()
+            .map(|rt| rt.block_on(fut));
     }
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .ok()
-        .map(|rt| rt.block_on(fut))
+    // ON the executor (a worker like `mesh_dns` reached a blocking bridge):
+    // building OR entering a runtime here panics ("Cannot start a runtime from
+    // within a runtime"). Drive `fut` on a FRESH OS thread that owns its own
+    // current-thread runtime — that thread has no ambient runtime, so no nesting.
+    // `block_in_place` yields this worker to the pool while we join the thread.
+    tokio::task::block_in_place(|| {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()
+                    .map(|rt| rt.block_on(fut))
+            })
+            .join()
+            .ok()
+            .flatten()
+        })
+    })
 }
 
 /// Blocking peer-record write to etcd (the heartbeat thread's bridge). `true` on
