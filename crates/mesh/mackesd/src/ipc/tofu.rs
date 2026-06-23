@@ -130,15 +130,18 @@ pub fn plan_has_real_drift(plan: &str) -> bool {
                 return true;
             }
         }
-        // A diff line is "<+|~|-> <attr> = …"; the resource header is
-        // "~ resource \"…\"". Any changed attr outside the benign set = drift.
+        // A real attribute diff line is "<+|~|-> <attr> = …". Require the `=` so
+        // the legend ("~ update in-place"), the resource header ("~ resource …"),
+        // and "->" arrows are all excluded. Any changed attr outside the benign
+        // set = drift.
         for sym in ['+', '~', '-'] {
             if let Some(rest) = t.strip_prefix(sym).map(str::trim_start) {
                 let name: String = rest
                     .chars()
                     .take_while(|c| c.is_alphanumeric() || *c == '_')
                     .collect();
-                if name.is_empty() || name == "resource" {
+                let is_attr = rest[name.len()..].trim_start().starts_with('=');
+                if name.is_empty() || !is_attr {
                     continue;
                 }
                 if !BENIGN.contains(&name.as_str()) {
@@ -318,8 +321,12 @@ mod tests {
         assert!(!plan_has_real_drift(
             "No changes. Your infrastructure matches."
         ));
-        // The xenserver-provider phantom: only check_ip_timeout + default_ip → NOT drift.
-        let benign = "  # xenserver_vm.build_50 will be updated in-place\n  \
+        // The xenserver-provider phantom: the legend + resource header + only
+        // check_ip_timeout + default_ip → NOT drift (the legend "~ update
+        // in-place" must not be mistaken for a changed attribute).
+        let benign = "Resource actions are indicated with the following symbols:\n  \
+            ~ update in-place (current -> planned)\n\n  \
+            # xenserver_vm.build_50 will be updated in-place\n  \
             ~ resource \"xenserver_vm\" \"build_50\" {\n      \
             + check_ip_timeout  = 0\n      + default_ip        = (known after apply)\n        \
             id                = \"1119\"\n    }\nPlan: 0 to add, 1 to change, 0 to destroy.";
