@@ -60,12 +60,7 @@ fn titlebar_inner(online: usize, total: usize) -> Element<'static, Message> {
     let make_btn = |svg_bytes: &'static [u8], msg: Message, is_close: bool| {
         let style_fn = move |_theme: &Theme, status: button::Status| {
             let bg = match status {
-                button::Status::Hovered if is_close => Color {
-                    r: 0.91,
-                    g: 0.07,
-                    b: 0.14,
-                    a: 1.0,
-                },
+                button::Status::Hovered if is_close => t::PF_DANGER,
                 button::Status::Hovered => Color {
                     a: 0.08,
                     ..Color::WHITE
@@ -1646,11 +1641,10 @@ pub fn resolve_conflict_dialog<'a>(original: &'a str, sibling: &'a str) -> Eleme
         .height(Length::Fill)
         .sty(|_, _| button::Style {
             snap: false,
+            // Modal scrim: the black scrim token, dimmed to 55 %.
             background: Some(Background::Color(Color {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
                 a: 0.55,
+                ..t::PF_SCRIM_BLACK
             })),
             text_color: Color::TRANSPARENT,
             border: Border {
@@ -1801,12 +1795,7 @@ pub fn mesh_undelete<'a>(
     let body: Element<'a, Message> = if let Some(err) = error {
         text(format!("Error: {err}"))
             .size(12)
-            .colr(Color {
-                r: 1.0,
-                g: 0.35,
-                b: 0.35,
-                a: 1.0,
-            })
+            .colr(t::PF_DANGER)
             .into()
     } else if items.is_empty() && !busy {
         text("Recycle Bin is empty — no files recoverable.")

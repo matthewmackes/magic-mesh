@@ -352,12 +352,8 @@ fn action_btn<'a>(
     .sty(
         move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
             let (bg, fg) = if ghost {
-                let hover_bg = Color {
-                    r: 0.20,
-                    g: 0.08,
-                    b: 0.08,
-                    a: 1.0,
-                };
+                // Faint danger tint on hover for the destructive ghost button.
+                let hover_bg = Color { a: 0.12, ..danger };
                 match status {
                     cosmic::iced::widget::button::Status::Hovered => (hover_bg, danger),
                     _ => (Color::TRANSPARENT, danger),

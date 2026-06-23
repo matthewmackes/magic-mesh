@@ -314,12 +314,8 @@ fn healthz_status_card<'a>(
 
     let bg = palette.raised.into_cosmic_color();
     let border = palette.border.into_cosmic_color();
-    let raw_bg = Color {
-        r: 0.06,
-        g: 0.06,
-        b: 0.07,
-        a: 1.0,
-    };
+    // Recessed raw-output inset: the darkest surface token (Carbon Gray 100).
+    let raw_bg = palette.background.into_cosmic_color();
     container(
         column![
             row![

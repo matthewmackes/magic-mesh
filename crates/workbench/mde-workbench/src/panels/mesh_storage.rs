@@ -205,12 +205,7 @@ impl MeshStoragePanel {
         let body: Element<'_, crate::Message> = if let Some(ref e) = self.error {
             text(format!("Error: {e}"))
                 .size(TypeRole::Body.size_in(sizes))
-                .colr(Color {
-                    r: 1.0,
-                    g: 0.35,
-                    b: 0.35,
-                    a: 1.0,
-                })
+                .colr(palette.danger.into_cosmic_color())
                 .into()
         } else if self.status.peers.is_empty() && self.last_run_at.is_some() {
             text("Master unreachable — mesh-storage not yet active.")
@@ -283,12 +278,7 @@ fn peer_row<'a>(
 ) -> Element<'a, crate::Message> {
     let is_limiting = limiting.as_deref() == Some(p.addr.as_str());
     let addr_color = if is_limiting {
-        Color {
-            r: 1.0,
-            g: 0.75,
-            b: 0.3,
-            a: 1.0,
-        }
+        palette.warning.into_cosmic_color()
     } else {
         palette.text.into_cosmic_color()
     };

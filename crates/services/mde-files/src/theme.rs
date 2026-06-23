@@ -67,6 +67,10 @@ pub const PF_INFO: Color = c(carbon::BLUE_50); // Blue 50
 pub const PF_SUCCESS: Color = c(carbon::GREEN_40); // Green 40
 pub const PF_DANGER: Color = c(carbon::RED_50); // Red 50
 
+/// Pure-black modal scrim token (Carbon BLACK). Call sites apply their own
+/// opacity via `Color { a: .., ..PF_SCRIM_BLACK }` — the hue stays single-sourced.
+pub const PF_SCRIM_BLACK: Color = c(carbon::BLACK);
+
 // ─── Common derived colours / surfaces ─────────────────────────────────────
 pub const BG: Color = PF_BG_100;
 pub const FG: Color = PF_TEXT_100;

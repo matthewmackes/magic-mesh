@@ -446,6 +446,7 @@ fn connect_btn<'a>(
     let accent = palette.accent.into_cosmic_color();
     let border = palette.border.into_cosmic_color();
     let text_main = palette.text.into_cosmic_color();
+    let hover = palette.overlay.into_cosmic_color();
     button(
         text(label)
             .size(11)
@@ -455,14 +456,8 @@ fn connect_btn<'a>(
     .sty(
         move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
             let (bg, fg) = if ghost {
-                let hover_bg = Color {
-                    r: 0.20,
-                    g: 0.20,
-                    b: 0.22,
-                    a: 1.0,
-                };
                 match status {
-                    cosmic::iced::widget::button::Status::Hovered => (hover_bg, text_main),
+                    cosmic::iced::widget::button::Status::Hovered => (hover, text_main),
                     _ => (Color::TRANSPARENT, text_main),
                 }
             } else {

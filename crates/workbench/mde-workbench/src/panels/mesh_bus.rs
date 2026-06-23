@@ -1164,6 +1164,7 @@ impl MeshBusPanel {
         let radii = Radii::defaults();
         let r = f32::from(radii.sm);
         let raised = palette.raised.into_cosmic_color();
+        let danger = palette.danger.into_cosmic_color();
 
         // Build the cascading topic list.
         let mut items: Vec<Element<'_, crate::Message>> = Vec::new();
@@ -1293,12 +1294,7 @@ impl MeshBusPanel {
             items.push(
                 text(format!("Error: {e}"))
                     .size(TypeRole::Caption.size_in(sizes))
-                    .colr(Color {
-                        r: 0.9,
-                        g: 0.2,
-                        b: 0.2,
-                        a: 1.0,
-                    })
+                    .colr(danger)
                     .into(),
             );
         }
@@ -1331,6 +1327,8 @@ impl MeshBusPanel {
         }
 
         let accent = palette.accent.into_cosmic_color();
+        let danger = palette.danger.into_cosmic_color();
+        let danger_fill = Color { a: 0.12, ..danger };
         let radii = Radii::defaults();
         let r = f32::from(radii.sm);
 
@@ -1375,18 +1373,8 @@ impl MeshBusPanel {
                     .padding([2u16, 8u16])
                     .sty(move |_t: &Theme, _s: ButtonStatus| button::Style {
                         snap: false,
-                        background: Some(Background::Color(Color {
-                            r: 0.8,
-                            g: 0.1,
-                            b: 0.1,
-                            a: 0.12,
-                        })),
-                        text_color: Color {
-                            r: 0.9,
-                            g: 0.2,
-                            b: 0.2,
-                            a: 1.0,
-                        },
+                        background: Some(Background::Color(danger_fill)),
+                        text_color: danger,
                         border: Border {
                             color: Color::TRANSPARENT,
                             width: 0.0,
@@ -1499,12 +1487,7 @@ impl MeshBusPanel {
         let error_row: Option<Element<'_, crate::Message>> = self.subs.error.as_deref().map(|e| {
             text(format!("Error: {e}"))
                 .size(TypeRole::Caption.size_in(sizes))
-                .colr(Color {
-                    r: 0.9,
-                    g: 0.2,
-                    b: 0.2,
-                    a: 1.0,
-                })
+                .colr(danger)
                 .into()
         });
 
@@ -1539,6 +1522,7 @@ impl MeshBusPanel {
         }
 
         let accent = palette.accent.into_cosmic_color();
+        let danger = palette.danger.into_cosmic_color();
         let radii = Radii::defaults();
         let r = f32::from(radii.sm);
 
@@ -1724,12 +1708,7 @@ impl MeshBusPanel {
         let error_row: Option<Element<'_, crate::Message>> = self.dnd.error.as_deref().map(|e| {
             text(format!("Error: {e}"))
                 .size(TypeRole::Caption.size_in(sizes))
-                .colr(Color {
-                    r: 0.9,
-                    g: 0.2,
-                    b: 0.2,
-                    a: 1.0,
-                })
+                .colr(danger)
                 .into()
         });
 
@@ -1764,6 +1743,7 @@ impl MeshBusPanel {
         }
 
         let accent = palette.accent.into_cosmic_color();
+        let danger = palette.danger.into_cosmic_color();
         let radii = Radii::defaults();
         let r = f32::from(radii.sm);
 
@@ -1878,12 +1858,7 @@ impl MeshBusPanel {
             items.push(
                 text(format!("⚠ {e}"))
                     .size(TypeRole::Caption.size_in(sizes))
-                    .colr(Color {
-                        r: 0.9,
-                        g: 0.2,
-                        b: 0.2,
-                        a: 1.0,
-                    })
+                    .colr(danger)
                     .into(),
             );
         }

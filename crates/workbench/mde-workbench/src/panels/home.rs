@@ -2941,10 +2941,10 @@ mod tests {
         // hit-test status onto hover-lift + press-depress + animated accent.
         use cosmic::iced::widget::button::Status as BtnStatus;
         let now = Instant::now();
-        let bg = Color::from_rgb(0.2, 0.2, 0.2);
-        let border = Color::from_rgb(0.4, 0.4, 0.4);
+        let bg = Color::from_rgb(0.2, 0.2, 0.2); // carbon-ok: test fixture (not a render-path token)
+        let border = Color::from_rgb(0.4, 0.4, 0.4); // carbon-ok: test fixture (not a render-path token)
         let fg = Color::WHITE;
-        let accent = Color::from_rgb(0.2, 0.4, 1.0);
+        let accent = Color::from_rgb(0.2, 0.4, 1.0); // carbon-ok: test fixture (not a render-path token)
         let style = FeedbackStyle {
             bg,
             border,
@@ -3003,9 +3003,9 @@ mod tests {
         // elevation shadow never lifts).
         use cosmic::iced::widget::button::Status as BtnStatus;
         let now = Instant::now();
-        let bg = Color::from_rgb(0.2, 0.2, 0.2);
-        let border = Color::from_rgb(0.4, 0.4, 0.4);
-        let accent = Color::from_rgb(0.2, 0.4, 1.0);
+        let bg = Color::from_rgb(0.2, 0.2, 0.2); // carbon-ok: test fixture (not a render-path token)
+        let border = Color::from_rgb(0.4, 0.4, 0.4); // carbon-ok: test fixture (not a render-path token)
+        let accent = Color::from_rgb(0.2, 0.4, 1.0); // carbon-ok: test fixture (not a render-path token)
         let style = FeedbackStyle {
             bg,
             border,

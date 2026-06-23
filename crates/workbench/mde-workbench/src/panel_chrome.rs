@@ -590,11 +590,10 @@ pub fn dialog_backdrop<'a, Message: 'a>() -> Element<'a, Message> {
         .height(Length::Fill)
         .style(|_theme| container::Style {
             snap: false,
+            // Pure-black backdrop scrim token; opacity is the dialog token.
             background: Some(Background::Color(Color {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
                 a: dialog_tokens::BACKDROP_OPACITY,
+                ..mde_theme::carbon::BLACK.into_cosmic_color()
             })),
             ..container::Style::default()
         })
