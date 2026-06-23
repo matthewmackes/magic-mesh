@@ -9,11 +9,11 @@
 //! workload / service launch lands in APPS-5/6/7.
 
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cosmic::app::{Core, Task};
 use cosmic::iced::window::Id;
-use cosmic::iced::{Length, Subscription};
+use cosmic::iced::{time, Length, Subscription};
 use cosmic::surface::action::{app_popup, destroy_popup};
 use cosmic::{Application, Element};
 
@@ -21,9 +21,24 @@ use mde_bus::hooks::config::Priority;
 use mde_cosmic_applet::{
     filter_entries, parse_entries, workload_argv, Entry, LauncherTab, WorkloadAction,
 };
+use mde_theme::animation::{Animator, Transition};
+use mde_theme::motion::{toast as toast_motion, Easing, Motion, PANEL_MOUNT_TRANSLATE_Y_PX};
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, Preferences, Rgba, TypeRole};
 
 const ID: &str = "com.mackes.MagicMeshApps";
+
+/// APPS-FX-1 — launcher motion. The animation registry ([`Animator`]) is driven
+/// by ONE subscription tick (~60 fps) that runs only while something is in
+/// flight (MOTION-PERF-1: no idle wakeups). All tweens resolve through
+/// `mde-theme::animation`/`motion`, honoring reduce-motion + the global motion
+/// kill switch — no parallel motion system, no re-derived easing/timing.
+const FRAME_TICK_MS: u64 = 16;
+/// Animator id for the open/close popup fade+slide (Q: panel mount).
+const ANIM_POPUP: &str = "popup";
+/// Animator id for the tab-switch crossfade.
+const ANIM_TAB: &str = "tab";
+/// Animator id prefix for a tile's hover lift (`hover:<entry-id>`).
+const ANIM_HOVER_PREFIX: &str = "hover:";
 
 /// APPS-WIDE (operator 2026-06-18) — the launcher dropdown was a golden
 /// rectangle (920 × 920/φ). APPS-FIT (operator 2026-06-19) supersedes that: the
@@ -155,6 +170,16 @@ fn resolve_palette() -> Palette {
     Palette::for_theme(Preferences::load().theme)
 }
 
+/// APPS-FX-1 — read the motion preferences the launcher's animations honor:
+/// `(reduce_motion, motion_enabled)`. Reduce-motion caps every tween to the
+/// ≤80 ms crossfade; the disabled kill switch (MOTION-CORE-3) suppresses tweens
+/// entirely (terminal frame, no interpolation). Cheap file read; called at init
+/// + on each open so a preference change is picked up without a re-login.
+fn resolve_motion_prefs() -> (bool, bool) {
+    let prefs = Preferences::load();
+    (prefs.a11y.reduce_motion, prefs.motion.enabled)
+}
+
 /// APPS-WIDE — the Carbon icon (`mde_theme` icon set) for a Favorites tile,
 /// chosen by entry kind. Plain apps get the generic Apps glyph; mesh-apps /
 /// services / workloads get their scope's icon.
@@ -207,6 +232,18 @@ struct AppsApplet {
     /// a resolution change is picked up without a re-login.
     menu_w: f32,
     menu_h: f32,
+    /// APPS-FX-1 — the shared animation registry (open/close fade+slide, tab
+    /// crossfade, tile hover lift). Advanced by one subscription tick.
+    anim: Animator,
+    /// APPS-FX-1 — reduce-motion preference (from `~/.config/mde/preferences.toml`);
+    /// caps every tween to the ≤80 ms crossfade. Refreshed on each open.
+    reduce_motion: bool,
+    /// APPS-FX-1 — global motion kill switch (MOTION-CORE-3). `false` → no tweens
+    /// are armed; surfaces render their terminal frame with no interpolation.
+    motion_enabled: bool,
+    /// APPS-FX-1 — the app tile currently under the pointer (drives the hover
+    /// lift + accent). `None` = nothing hovered.
+    hovered: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -263,6 +300,13 @@ enum Message {
     RunSubmit,
     /// Re-fetch the entry list.
     Refresh,
+    /// APPS-FX-1 — one animation frame tick (drives the shared `Animator`); only
+    /// subscribed while something is in flight.
+    AnimTick,
+    /// APPS-FX-1 — pointer entered an app tile (start its hover lift).
+    TileEnter(String),
+    /// APPS-FX-1 — pointer left an app tile (settle its hover lift).
+    TileExit(String),
 }
 
 /// APPS-STYLE-2 — the footer power-menu actions.
@@ -463,6 +507,28 @@ fn carbon(c: Rgba) -> cosmic::iced::Color {
     }
 }
 
+/// APPS-FX-1 — a Carbon token at a transition's opacity. The iced 0.13 fork ships
+/// no opacity widget, so a fade is applied by multiplying the token's alpha by the
+/// [`Transition`] params' `alpha` (the apply technique the animation module
+/// documents). Multiplies (never overwrites) so a token that is already
+/// translucent stays so.
+fn carbon_at(c: Rgba, alpha: f32) -> cosmic::iced::Color {
+    carbon(c.with_alpha(c.a * alpha.clamp(0.0, 1.0)))
+}
+
+/// APPS-FX-1 — blend two Carbon tokens by `t` (`0.0` = `a`, `1.0` = `b`), reusing
+/// `mde-theme`'s [`lerp_f32`] for each channel (no re-derived interpolation). Used
+/// by the hover lift to wash a row's surface toward the accent token.
+fn carbon_blend(a: Rgba, b: Rgba, t: f32) -> cosmic::iced::Color {
+    use mde_theme::animation::lerp_f32;
+    cosmic::iced::Color {
+        r: lerp_f32(f32::from(a.r), f32::from(b.r), t) / 255.0,
+        g: lerp_f32(f32::from(a.g), f32::from(b.g), t) / 255.0,
+        b: lerp_f32(f32::from(a.b), f32::from(b.b), t) / 255.0,
+        a: lerp_f32(a.a, b.a, t),
+    }
+}
+
 fn main() -> cosmic::iced::Result {
     cosmic::applet::run::<AppsApplet>(())
 }
@@ -483,6 +549,7 @@ impl Application for AppsApplet {
 
     fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Message>) {
         let (menu_w, menu_h) = detect_menu_size();
+        let (reduce_motion, motion_enabled) = resolve_motion_prefs();
         (
             AppsApplet {
                 core,
@@ -502,6 +569,10 @@ impl Application for AppsApplet {
                 palette: resolve_palette(),
                 menu_w,
                 menu_h,
+                anim: Animator::new(),
+                reduce_motion,
+                motion_enabled,
+                hovered: None,
             },
             // Prime the list so the first open is instant.
             load_task(),
@@ -513,7 +584,13 @@ impl Application for AppsApplet {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::none()
+        // APPS-FX-1 / MOTION-PERF-1 — the frame clock runs ONLY while a tween is
+        // in flight, so the launcher costs zero idle wakeups at rest.
+        if self.anim.is_idle(Instant::now()) {
+            Subscription::none()
+        } else {
+            time::every(Duration::from_millis(FRAME_TICK_MS)).map(|_| Message::AnimTick)
+        }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -544,6 +621,18 @@ impl Application for AppsApplet {
                 let (mw, mh) = detect_menu_size();
                 self.menu_w = mw;
                 self.menu_h = mh;
+                // APPS-FX-1 — refresh motion prefs + arm the open fade+slide so
+                // the launcher mounts with the Carbon panel-mount entrance.
+                let (rm, en) = resolve_motion_prefs();
+                self.reduce_motion = rm;
+                self.motion_enabled = en;
+                self.hovered = None;
+                // APPS-FX-1 — drop any settled tweens from the prior open so the
+                // map never carries stale entries (MOTION-PERF-1), then arm the
+                // panel fade+slide. The whole launcher content fades in via the
+                // popup alpha threaded through the header/tabs/search/body below.
+                self.anim.gc(Instant::now());
+                self.animate(ANIM_POPUP, Motion::panel_mount());
                 // Open the dropdown + refresh-on-open (Q: cached + refresh-on-open).
                 let open = cosmic::task::message(cosmic::Action::Cosmic(
                     cosmic::app::Action::Surface(app_popup::<AppsApplet>(
@@ -698,8 +787,15 @@ impl Application for AppsApplet {
                 self.error = Some(e);
             }
             Message::SetTab(t) => {
+                // APPS-FX-1 — crossfade the result body when the tab changes (a
+                // no-op fade if it's the same tab). The new tab's rows fade in.
+                if self.tab != t {
+                    self.animate(ANIM_TAB, Motion::panel_mount());
+                }
                 self.tab = t;
                 self.query.clear();
+                self.selected = None;
+                self.hovered = None;
             }
             Message::Search(q) => self.query = q,
             Message::LaunchLocal(exec) => {
@@ -785,6 +881,25 @@ impl Application for AppsApplet {
                 self.toast = Some(format!("{}…", kind.label()));
             }
             Message::Refresh => return load_task(),
+            Message::AnimTick => {
+                // APPS-FX-1 — advance the shared clock: drop finished tweens so
+                // the subscription can stop ticking once everything settles.
+                self.anim.gc(Instant::now());
+            }
+            Message::TileEnter(id) => {
+                // APPS-FX-1 — lift the tile under the pointer.
+                if self.hovered.as_deref() != Some(&id) {
+                    self.hovered = Some(id.clone());
+                    self.animate(format!("{ANIM_HOVER_PREFIX}{id}"), Motion::hover());
+                }
+            }
+            Message::TileExit(id) => {
+                // APPS-FX-1 — settle the lift when the pointer leaves (only if
+                // this tile is still the hovered one — guards stale exits).
+                if self.hovered.as_deref() == Some(&id) {
+                    self.hovered = None;
+                }
+            }
         }
         Task::none()
     }
@@ -822,6 +937,40 @@ impl Application for AppsApplet {
 }
 
 impl AppsApplet {
+    /// APPS-FX-1 — arm a launcher tween under `id` using a `mde-theme` motion
+    /// preset. Routes through [`Animator::start`] (which resolves the duration
+    /// against reduce-motion); the global kill switch (MOTION-CORE-3) suppresses
+    /// the tween entirely so the surface renders its terminal frame. The previous
+    /// tween under `id` is dropped so it never freezes mid-flight on re-arm.
+    fn animate(&mut self, id: impl Into<String>, motion: Motion) {
+        if !self.motion_enabled {
+            return;
+        }
+        let now = Instant::now();
+        // Drop any completed tweens first so the registry never accumulates stale
+        // entries once the subscription idles (MOTION-PERF-1 — the final settling
+        // tick can't gc its own tween, so re-arming / a new arm sweeps it).
+        self.anim.gc(now);
+        self.anim.start(id, now, motion, self.reduce_motion);
+    }
+
+    /// APPS-FX-1 — the hover highlight's eased progress `0.0..=1.0` for a tile, by
+    /// its entry id (1.0 = fully highlighted, 0.0 = at rest). `0.0` when this tile
+    /// isn't the hovered one. When it IS hovered, the value eases 0→1 over the
+    /// `hover` tween — or is `1.0` immediately when motion is disabled / the tween
+    /// already settled (the terminal highlighted frame, the correct reduce-motion
+    /// behavior: a hover affordance shows instantly, it just doesn't animate).
+    fn hover_t(&self, entry_id: &str) -> f32 {
+        if self.hovered.as_deref() != Some(entry_id) {
+            return 0.0;
+        }
+        self.anim.value(
+            &format!("{ANIM_HOVER_PREFIX}{entry_id}"),
+            Instant::now(),
+            Easing::EaseOut,
+        )
+    }
+
     /// APPS-STYLE-2 — the redesigned Start Menu (design: `docs/design/start-menu-redesign.md`).
     /// Header (title + QNM-Shared usage bar) → quick-link tiles → underline tabs →
     /// search → result rows (zebra + selected blue-accent, click-to-expand detail)
@@ -1057,16 +1206,23 @@ impl AppsApplet {
         let body_sz = TypeRole::Body.size_in(sizes);
         let cap_sz = TypeRole::Caption.size_in(sizes);
         let mono = cosmic::iced::Font::MONOSPACE;
+        let now = Instant::now();
+        // APPS-FX-1 — the open fade: the whole launcher content fades in (alpha
+        // 0→1) on mount (Carbon `panel_mount` `FadeIn`), threaded into every text/
+        // glyph color below. 1.0 at rest / under reduce-motion / the kill switch.
+        let pa = Transition::FadeIn
+            .params(self.anim.value(ANIM_POPUP, now, Easing::EaseOut))
+            .alpha;
 
         // ── Header: grid glyph + title, then the QNM-Shared usage line + bar. ──
         let title_row = row(vec![
             text("\u{25A6}\u{FE0E}")
                 .size(18)
-                .class(cosmic::theme::Text::Color(carbon(p.accent)))
+                .class(cosmic::theme::Text::Color(carbon_at(p.accent, pa)))
                 .into(),
             text("Applications")
                 .size(TypeRole::Heading.size_in(sizes))
-                .class(cosmic::theme::Text::Color(carbon(p.text)))
+                .class(cosmic::theme::Text::Color(carbon_at(p.text, pa)))
                 .into(),
         ])
         .spacing(10)
@@ -1083,13 +1239,13 @@ impl AppsApplet {
             text("Mesh Sync")
                 .size(cap_sz)
                 .font(mono)
-                .class(cosmic::theme::Text::Color(carbon(p.text_muted)))
+                .class(cosmic::theme::Text::Color(carbon_at(p.text_muted, pa)))
                 .into(),
             Space::new().width(Length::Fill).into(),
             text(mde_cosmic_applet::qnm_usage_label(self.qnm))
                 .size(cap_sz)
                 .font(mono)
-                .class(cosmic::theme::Text::Color(carbon(p.text)))
+                .class(cosmic::theme::Text::Color(carbon_at(p.text, pa)))
                 .into(),
         ]);
         let fill_c = p.success;
@@ -1121,11 +1277,11 @@ impl AppsApplet {
                     column(vec![
                         text(glyph)
                             .size(18)
-                            .class(cosmic::theme::Text::Color(carbon(p.text)))
+                            .class(cosmic::theme::Text::Color(carbon_at(p.text, pa)))
                             .into(),
                         text(label)
                             .size(cap_sz)
-                            .class(cosmic::theme::Text::Color(carbon(p.text)))
+                            .class(cosmic::theme::Text::Color(carbon_at(p.text, pa)))
                             .into(),
                     ])
                     .spacing(6)
@@ -1152,11 +1308,10 @@ impl AppsApplet {
                 let underline = if active { p.accent } else { p.overlay };
                 column(vec![
                     button::custom(text(t.label()).size(body_sz).class(
-                        cosmic::theme::Text::Color(carbon(if active {
-                            p.text
-                        } else {
-                            p.text_muted
-                        })),
+                        cosmic::theme::Text::Color(carbon_at(
+                            if active { p.text } else { p.text_muted },
+                            pa,
+                        )),
                     ))
                     .on_press(Message::SetTab(t))
                     .class(cosmic::theme::Button::Text)
@@ -1179,7 +1334,7 @@ impl AppsApplet {
         let mut search_row = vec![
             text("\u{2315}")
                 .size(cap_sz)
-                .class(cosmic::theme::Text::Color(carbon(p.text_muted)))
+                .class(cosmic::theme::Text::Color(carbon_at(p.text_muted, pa)))
                 .into(),
             text_input("Search apps, mesh, services…", &self.query)
                 .on_input(Message::Search)
@@ -1199,6 +1354,17 @@ impl AppsApplet {
             .align_y(cosmic::iced::Alignment::Center);
 
         // ── Result rows (or an empty state). ──
+        // APPS-FX-1 — tab crossfade: the result content fades in (alpha 0→1) on a
+        // tab switch (Carbon `FadeIn`, threaded into the row/tile colors below).
+        // Reduce-motion / the kill switch collapse this to the terminal frame
+        // (alpha 1.0) since the tween is already complete / never armed. The body
+        // also honors the open fade (`pa`), so it fades on both open and switch —
+        // `min` takes whichever is more transparent at this frame.
+        let tab_alpha = pa.min(
+            Transition::FadeIn
+                .params(self.anim.value(ANIM_TAB, now, Easing::EaseOut))
+                .alpha,
+        );
         let shown = filter_entries(&self.entries, self.tab, &self.query, &self.favorites);
         // APPS-WIDE — Favorites renders as a Carbon icon grid (not a row list)
         // when it's the active tab and not in a search.
@@ -1237,13 +1403,13 @@ impl AppsApplet {
             .into()
         } else if fav_grid {
             // APPS-WIDE — Carbon icon grid for Favorites.
-            self.favorites_grid(&shown)
+            self.favorites_grid(&shown, tab_alpha)
         } else {
             column(
                 shown
                     .into_iter()
                     .enumerate()
-                    .map(|(i, e)| self.entry_row(i, e))
+                    .map(|(i, e)| self.entry_row(i, e, tab_alpha))
                     .collect::<Vec<_>>(),
             )
             .spacing(0)
@@ -1265,10 +1431,25 @@ impl AppsApplet {
         }
         col = col.push(self.footer());
 
+        // ── APPS-FX-1 — open fade+slide: on mount the launcher slides up
+        // `PANEL_MOUNT_TRANSLATE_Y_PX` (a leading `Space` that shrinks to 0 as the
+        // tween eases in). The fade is carried by the content alpha threaded into
+        // the rows/header below (ANIM_TAB, armed alongside the slide on open) — the
+        // iced 0.13 fork has no opacity widget, so alpha is applied to colors, not
+        // the surface. The container keeps its `popup_container` surface/elevation
+        // styling (we do NOT overpaint it). Carbon `panel_mount` entrance;
+        // reduce-motion / the kill switch render the terminal frame.
+        let popup = Transition::SlideUp(PANEL_MOUNT_TRANSLATE_Y_PX)
+            .params(self.anim.value(ANIM_POPUP, now, Easing::EaseOut));
+        let slid = column(vec![
+            Space::new().height(Length::Fixed(popup.translate_y)).into(),
+            col.into(),
+        ]);
+
         // APPS-FIT — the body fills the detected desktop-fraction size (33% of
         // the screen width × height; falls back to the golden rectangle). Must
         // match the popup positioner size set on open.
-        cosmic::iced::widget::container(col)
+        cosmic::iced::widget::container(slid)
             .padding(12)
             .width(Length::Fixed(self.menu_w))
             .height(Length::Fixed(self.menu_h))
@@ -1291,7 +1472,7 @@ impl AppsApplet {
     /// Settings quick-link row (`tile` in [`Self::dropdown`]) — same icon-over-
     /// label tiles, `Button::Standard`, equal-width, `spacing(1)`. The last
     /// partial row is padded so tiles keep a uniform width.
-    fn favorites_grid(&self, shown: &[&Entry]) -> Element<'static, Message> {
+    fn favorites_grid(&self, shown: &[&Entry], alpha: f32) -> Element<'static, Message> {
         use cosmic::widget::{column, row, Space};
         let rows: Vec<Element<Message>> = shown
             .iter()
@@ -1299,8 +1480,10 @@ impl AppsApplet {
             .collect::<Vec<_>>()
             .chunks(FAVORITES_COLUMNS)
             .map(|chunk| {
-                let mut tiles: Vec<Element<Message>> =
-                    chunk.iter().map(|e| self.favorite_tile(e)).collect();
+                let mut tiles: Vec<Element<Message>> = chunk
+                    .iter()
+                    .map(|e| self.favorite_tile(e, alpha))
+                    .collect();
                 while tiles.len() < FAVORITES_COLUMNS {
                     tiles.push(Space::new().width(Length::FillPortion(1)).into());
                 }
@@ -1318,11 +1501,21 @@ impl AppsApplet {
     /// icon (`mde_theme` icon set) over a centred, truncated name in a
     /// `Button::Standard`, equal-width. Whole-tile press launches the app/mesh-
     /// app (else selects). Owns its strings so the tile is `'static`.
-    fn favorite_tile(&self, e: &Entry) -> Element<'static, Message> {
-        use cosmic::widget::{button, column, text};
+    fn favorite_tile(&self, e: &Entry, alpha: f32) -> Element<'static, Message> {
+        use cosmic::widget::{button, column, mouse_area, text};
         let p = self.palette;
         let sizes = FontSize::defaults();
         let cap_sz = TypeRole::Caption.size_in(sizes);
+        // APPS-FX-1 — hover accent: the hovered tile gains an accent-tinted wash
+        // that fades in as the hover tween eases in (Carbon `hover`, eased via the
+        // `Lift` transition's progress). Applied as a background alpha only — never
+        // a translate/`Space`, so it costs zero layout reflow (the animation
+        // module's "compositor-friendly, never layout thrash" contract). `h` is 0
+        // at rest; when hovered it eases 0→1 (instant under reduce-motion / the
+        // kill switch — the terminal highlighted frame).
+        let h = self.hover_t(&e.id);
+        let hover_lift = Transition::Lift(1.0).params(h).translate_y.abs();
+        let id = e.id.clone();
         // APPS-FAV-ICON (operator 2026-06-19) — render the actual Carbon icon
         // SVG (the mde_theme icon set), tinted to the theme text color — the same
         // icons used when docking an app — instead of the Unicode fallback glyph.
@@ -1331,7 +1524,7 @@ impl AppsApplet {
         let icon_px = resolved.size_px();
         let icon_widget: Element<'static, Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
             use cosmic::iced::widget::svg as widget_svg;
-            let tint = carbon(p.text);
+            let tint = carbon_at(p.text, alpha);
             widget_svg(widget_svg::Handle::from_memory(svg_bytes))
                 .width(Length::Fixed(icon_px))
                 .height(Length::Fixed(icon_px))
@@ -1342,7 +1535,7 @@ impl AppsApplet {
         } else {
             text(resolved.fallback_glyph)
                 .size(20)
-                .class(cosmic::theme::Text::Color(carbon(p.text)))
+                .class(cosmic::theme::Text::Color(carbon_at(p.text, alpha)))
                 .into()
         };
         // Truncate long names so tiles stay aligned.
@@ -1351,13 +1544,13 @@ impl AppsApplet {
         } else {
             e.name.clone()
         };
-        button::custom(
+        let tile = button::custom(
             column(vec![
                 icon_widget,
                 text(name)
                     .size(cap_sz)
                     .center()
-                    .class(cosmic::theme::Text::Color(carbon(p.text)))
+                    .class(cosmic::theme::Text::Color(carbon_at(p.text, alpha)))
                     .into(),
             ])
             .spacing(6)
@@ -1366,21 +1559,40 @@ impl AppsApplet {
         )
         .on_press(Self::entry_primary_msg(e))
         .width(Length::Fill)
-        .class(cosmic::theme::Button::Standard)
-        .into()
+        .class(cosmic::theme::Button::Standard);
+        // APPS-FX-1 — the accent wash beneath the tile, its alpha eased in with the
+        // hover (the Carbon `toast::ACTION_HOVER_BG_ALPHA` token at full hover,
+        // also multiplied by the open/tab fade so it never out-runs the content).
+        let accent = p.accent;
+        let wash = hover_lift * toast_motion::ACTION_HOVER_BG_ALPHA * alpha;
+        let washed =
+            cosmic::iced::widget::container(tile).style(move |_| {
+                cosmic::iced::widget::container::Style {
+                    background: Some(carbon_at(accent, wash).into()),
+                    ..Default::default()
+                }
+            });
+        mouse_area(washed)
+            .on_enter(Message::TileEnter(id.clone()))
+            .on_exit(Message::TileExit(id))
+            .into()
     }
 
     /// APPS-STYLE-2 — one result row: letter avatar + accent-blue title + mono
     /// subtitle + status dot, on a zebra layer; clicking toggles the inline
     /// detail ([`Self::detail`]) and the selected row gets a blue left-accent +
     /// raised bg. Theme-aware (all mde-theme tokens).
-    fn entry_row<'a>(&self, idx: usize, e: &'a Entry) -> Element<'a, Message> {
-        use cosmic::widget::{column, row, text};
+    fn entry_row<'a>(&self, idx: usize, e: &'a Entry, alpha: f32) -> Element<'a, Message> {
+        use cosmic::widget::{column, mouse_area, row, text};
         let p = self.palette;
         let sizes = FontSize::defaults();
         let cap_sz = TypeRole::Caption.size_in(sizes);
         let mono = cosmic::iced::Font::MONOSPACE;
         let selected = self.selected.as_deref() == Some(&e.id);
+        // APPS-FX-1 — hover lift + accent for this app tile/row: the hovered row's
+        // shade brightens toward the accent as the hover tween eases in (Carbon
+        // `hover`). 0 at rest / under reduce-motion / the kill switch.
+        let hover = self.hover_t(&e.id);
         let sub = match e.kind.as_str() {
             "mesh-app" => format!("mesh · {} · {}", e.node, e.health),
             "workload" => format!("{} · {}", e.source, e.state),
@@ -1399,7 +1611,7 @@ impl AppsApplet {
             text(letter)
                 .size(cap_sz)
                 .font(mono)
-                .class(cosmic::theme::Text::Color(carbon(p.text_muted))),
+                .class(cosmic::theme::Text::Color(carbon_at(p.text_muted, alpha))),
         )
         .width(Length::Fixed(32.0))
         .height(Length::Fixed(32.0))
@@ -1415,12 +1627,12 @@ impl AppsApplet {
         let body = column(vec![
             text(e.name.clone())
                 .size(TypeRole::Body.size_in(sizes))
-                .class(cosmic::theme::Text::Color(carbon(p.text)))
+                .class(cosmic::theme::Text::Color(carbon_at(p.text, alpha)))
                 .into(),
             text(sub)
                 .size(cap_sz)
                 .font(mono)
-                .class(cosmic::theme::Text::Color(carbon(p.text_muted)))
+                .class(cosmic::theme::Text::Color(carbon_at(p.text_muted, alpha)))
                 .into(),
         ])
         .spacing(2)
@@ -1471,18 +1683,28 @@ impl AppsApplet {
             p.background
         };
         let accent = if selected { p.accent } else { shade };
-        cosmic::iced::widget::container(inner)
+        // APPS-FX-1 — hover wash: brighten the row's shade toward the accent token
+        // as the hover eases in, capped at the Carbon `toast::ACTION_HOVER_BG_ALPHA`
+        // token (a subtle accent hint, never a full flood). 0 at rest; eased on
+        // hover (instant under reduce-motion / the kill switch — the terminal
+        // highlighted frame). Background alpha only → no layout reflow.
+        let accent_tok = p.accent;
+        let wash = hover * toast_motion::ACTION_HOVER_BG_ALPHA;
+        let row_box = cosmic::iced::widget::container(inner)
             .padding([6, 10])
             .width(Length::Fill)
             .style(move |_| cosmic::iced::widget::container::Style {
-                background: Some(carbon(shade).into()),
+                background: Some(carbon_blend(shade, accent_tok, wash).into()),
                 border: cosmic::iced::Border {
                     color: carbon(accent),
                     width: 0.0,
                     radius: 0.0.into(),
                 },
                 ..Default::default()
-            })
+            });
+        mouse_area(row_box)
+            .on_enter(Message::TileEnter(e.id.clone()))
+            .on_exit(Message::TileExit(e.id.clone()))
             .into()
     }
 
@@ -1812,5 +2034,75 @@ output "HDMI-A-1" enabled=#false {
 }
 "#;
         assert!(parse_menu_size_from_kdl(kdl, "DP-1").is_none());
+    }
+}
+
+#[cfg(test)]
+mod apps_fx_tests {
+    //! APPS-FX-1 — the launcher-motion glue: the color-alpha apply helpers (the
+    //! iced-0.13 fade technique) + that the animator is reduce-motion / kill-switch
+    //! aware end-to-end through this binary's `animate` path.
+    use super::{carbon_at, carbon_blend, ANIM_POPUP};
+    use mde_theme::animation::Animator;
+    use mde_theme::motion::Motion;
+    use mde_theme::Rgba;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn carbon_at_multiplies_token_alpha() {
+        // A fully-opaque token at alpha 0.5 → half opacity; alpha 1.0 → unchanged;
+        // alpha 0.0 → fully transparent. RGB is preserved (only alpha fades).
+        let tok = Rgba::rgba(0, 100, 200, 1.0);
+        assert!((carbon_at(tok, 0.5).a - 0.5).abs() < 1e-6);
+        assert!((carbon_at(tok, 1.0).a - 1.0).abs() < 1e-6);
+        assert!(carbon_at(tok, 0.0).a.abs() < 1e-6);
+        let c = carbon_at(tok, 0.5);
+        assert!((c.g - 100.0 / 255.0).abs() < 1e-4, "RGB preserved under fade");
+        // An already-translucent token stays multiplied, never reset to opaque.
+        let translucent = Rgba::rgba(255, 255, 255, 0.4);
+        assert!((carbon_at(translucent, 0.5).a - 0.2).abs() < 1e-6);
+        // Out-of-range alpha clamps (no overshoot past full opacity).
+        assert!((carbon_at(tok, 2.0).a - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn carbon_blend_lerps_between_tokens() {
+        let a = Rgba::rgba(0, 0, 0, 1.0);
+        let b = Rgba::rgba(255, 255, 255, 1.0);
+        // t=0 → a, t=1 → b, t=0.5 → midpoint.
+        assert!(carbon_blend(a, b, 0.0).r.abs() < 1e-4);
+        assert!((carbon_blend(a, b, 1.0).r - 1.0).abs() < 1e-4);
+        assert!((carbon_blend(a, b, 0.5).r - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn animate_path_is_reduce_motion_and_kill_switch_aware() {
+        // Mirror `AppsApplet::animate`: a popup tween armed with reduce_motion caps
+        // to the ≤80 ms crossfade and is settled by then; the kill switch (motion
+        // disabled) arms nothing, so the surface is at its terminal frame at once.
+        let t0 = Instant::now();
+
+        let mut reduced = Animator::new();
+        reduced.start(ANIM_POPUP, t0, Motion::panel_mount(), true);
+        assert!(
+            reduced.is_idle(t0 + Duration::from_millis(80)),
+            "reduce-motion popup must settle by the 80 ms cap"
+        );
+
+        // Kill switch: `animate` returns early, so nothing is started → idle now
+        // and the value is the terminal frame (1.0).
+        let disabled = Animator::new();
+        assert!(disabled.is_idle(t0), "kill switch arms no tween");
+        assert!(
+            (disabled.value(ANIM_POPUP, t0, mde_theme::motion::Easing::EaseOut) - 1.0).abs() < 1e-6,
+            "absent tween → terminal frame (alpha 1.0)"
+        );
+
+        // Full motion: a panel_mount tween is mid-flight at 30 ms, settled by 240.
+        let mut full = Animator::new();
+        full.start(ANIM_POPUP, t0, Motion::panel_mount(), false);
+        let mid = full.value(ANIM_POPUP, t0 + Duration::from_millis(30), mde_theme::motion::Easing::EaseOut);
+        assert!(mid > 0.0 && mid < 1.0, "popup interpolating mid-flight, got {mid}");
+        assert!(full.is_idle(t0 + Duration::from_millis(240)));
     }
 }
