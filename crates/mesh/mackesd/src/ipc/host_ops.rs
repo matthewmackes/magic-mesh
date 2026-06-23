@@ -46,7 +46,12 @@ impl HostOpsService {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 3] = ["host-power", "gateway-reboot", "dr-backup"];
+pub const ACTION_VERBS: [&str; 4] = [
+    "host-power",
+    "gateway-reboot",
+    "dr-backup",
+    "gateway-status",
+];
 
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -195,6 +200,93 @@ fn gateway_reboot(req_body: Option<&str>) -> Result<(), String> {
     }
 }
 
+/// Parse the three raw output lines from the gateway-status SSH probe into the
+/// `(leases, uptime, model)` reply triple. PURE.
+///
+/// * `leases_line` — the DHCP lease count; parsed as `u32`, defaulting to `0`
+///   when empty or unparseable (the probe falls back across two sources and may
+///   yield nothing);
+/// * `uptime_line` — the integer uptime-in-seconds string, trimmed;
+/// * `model_line`  — the gateway model string, trimmed.
+#[must_use]
+pub fn parse_gateway_status(
+    leases_line: &str,
+    uptime_line: &str,
+    model_line: &str,
+) -> (u32, String, String) {
+    let leases = leases_line.trim().parse::<u32>().unwrap_or(0);
+    (
+        leases,
+        uptime_line.trim().to_string(),
+        model_line.trim().to_string(),
+    )
+}
+
+/// Read-only live gateway status over `sshpass` (DATACENTER-14): the gateway has
+/// no mesh key, so this uses password auth like [`gateway_reboot`]. `host` must
+/// already be validated as a plain IPv4.
+///
+/// Over one SSH session it gathers three newline-separated lines — DHCP lease
+/// count, integer uptime seconds, and model — then [`parse_gateway_status`]
+/// turns them into the reply triple. Returns `Err(<message>)` on a missing cred,
+/// an SSH spawn/exit failure, or empty output.
+fn gateway_status(req_body: Option<&str>) -> Result<(u32, String, String), String> {
+    let Some(body) = req_body else {
+        return Err("gateway-status: missing request body".into());
+    };
+    let req: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("gateway-status: bad json: {e}"))?;
+
+    let host = req
+        .get("host")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !valid_ipv4(host) {
+        return Err("host must be a plain IPv4 address".into());
+    }
+
+    let (user, pw) = unifi_cred().ok_or("no unifi cred in store")?;
+
+    // One probe, three lines on stdout in a fixed order. Each sub-command is
+    // best-effort and falls back so a single missing tool can't blank the whole
+    // reply; the markers are literal so parsing stays positional.
+    let remote = "grep -c . /run/dhcpd.leases 2>/dev/null || ip neigh | grep -c REACHABLE; \
+         cat /proc/uptime | cut -d. -f1; \
+         mca-cli-op info 2>/dev/null | head -1 || echo UniFi";
+
+    let o = std::process::Command::new("sshpass")
+        .args([
+            "-p",
+            &pw,
+            "ssh",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "ConnectTimeout=8",
+            &format!("{user}@{host}"),
+            remote,
+        ])
+        .output()
+        .map_err(|e| format!("sshpass failed: {e}"))?;
+
+    if !o.status.success() {
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        let msg = stderr.trim();
+        return if msg.is_empty() {
+            Err("gateway status failed".into())
+        } else {
+            Err(msg.to_string())
+        };
+    }
+
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    let mut lines = stdout.lines();
+    let leases_line = lines.next().unwrap_or("");
+    let uptime_line = lines.next().unwrap_or("");
+    let model_line = lines.next().unwrap_or("");
+    Ok(parse_gateway_status(leases_line, uptime_line, model_line))
+}
+
 /// Run the DATACENTER-23 disaster-recovery backup (confirm-gated): shells out to
 /// `automation/dr/dr-backup.sh` from the repo root, which dumps the recoverable
 /// etcd state (`/tofu/state/*`, `/mcnf/secret/*`, `/mcnf/age-recipient`) into an
@@ -260,6 +352,18 @@ pub fn build_reply(_svc: &HostOpsService, verb: &str, req_body: Option<&str>) ->
         "dr-backup" => {
             return match dr_backup(req_body) {
                 Ok(path) => json!({ "ok": true, "path": path }).to_string(),
+                Err(m) => err(m),
+            };
+        }
+        "gateway-status" => {
+            return match gateway_status(req_body) {
+                Ok((leases, uptime, model)) => json!({
+                    "ok": true,
+                    "leases": leases,
+                    "uptime": uptime,
+                    "model": model,
+                })
+                .to_string(),
                 Err(m) => err(m),
             };
         }
@@ -398,9 +502,46 @@ mod tests {
         assert_eq!(action_topic("host-power"), "action/dc/host-power");
         assert_eq!(action_topic("gateway-reboot"), "action/dc/gateway-reboot");
         assert_eq!(action_topic("dr-backup"), "action/dc/dr-backup");
+        assert_eq!(action_topic("gateway-status"), "action/dc/gateway-status");
         assert!(ACTION_VERBS.contains(&"host-power"));
         assert!(ACTION_VERBS.contains(&"gateway-reboot"));
         assert!(ACTION_VERBS.contains(&"dr-backup"));
+        assert!(ACTION_VERBS.contains(&"gateway-status"));
+    }
+
+    #[test]
+    fn parse_gateway_status_parses_triple() {
+        let (leases, uptime, model) =
+            parse_gateway_status("42\n", " 99887 ", "  UniFi Dream Machine \n");
+        assert_eq!(leases, 42);
+        assert_eq!(uptime, "99887");
+        assert_eq!(model, "UniFi Dream Machine");
+    }
+
+    #[test]
+    fn parse_gateway_status_defaults_lease_count_to_zero() {
+        // empty / non-numeric lease line → 0, the other fields still trim.
+        let (leases, uptime, model) = parse_gateway_status("", "0", "UniFi");
+        assert_eq!(leases, 0);
+        assert_eq!(uptime, "0");
+        assert_eq!(model, "UniFi");
+        let (leases, _, _) = parse_gateway_status("not-a-number", "", "");
+        assert_eq!(leases, 0);
+    }
+
+    #[test]
+    fn gateway_status_rejects_bad_host_before_ssh() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        let body = json!({ "host": "1.2.3.4; reboot" }).to_string();
+        let r = build_reply(&s, "gateway-status", Some(&body));
+        assert!(r.contains("host must be a plain IPv4 address"), "{r}");
+    }
+
+    #[test]
+    fn gateway_status_missing_body_errors() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        let r = build_reply(&s, "gateway-status", None);
+        assert!(r.contains("missing request body"), "{r}");
     }
 
     #[test]
