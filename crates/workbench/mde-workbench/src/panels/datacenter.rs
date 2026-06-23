@@ -313,6 +313,80 @@ pub fn promote_matrix(stages: &[PromoteStage]) -> Vec<PromoteStage> {
         .collect()
 }
 
+/// One datacenter health check as last seen on the Bus (`event/dc/health/*`).
+/// The `datacenter_orchestrator` worker publishes a check per probe (Bus
+/// reachable, dom0 SSH, doctl auth, …); the Overview view rolls these into a
+/// one-line ok/warn/fail summary plus an alert list of any non-ok checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthCheck {
+    /// The check name — e.g. "bus" | "dom0-a" | "doctl". Identifies the probe.
+    pub check: String,
+    /// The check's outcome — "ok" | "warn" | "fail" (anything not ok/warn counts
+    /// as a failure in [`health_summary`]). Drives the alert's color token.
+    pub status: String,
+    /// A human detail line for a non-ok check — the reason it warned/failed.
+    /// Empty when the event didn't name one. Shown beside the check in the alert
+    /// list.
+    pub detail: String,
+}
+
+/// Parse one `event/dc/health/<check>` message body into a [`HealthCheck`].
+/// Returns `None` for unparseable JSON or a body missing the `check` field. Pure +
+/// testable. Mirrors [`parse_audit_event`]'s tolerant string extraction: `status`
+/// and `detail` default to empty when absent.
+#[must_use]
+pub fn parse_health_event(body: &str) -> Option<HealthCheck> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let check = v.get("check")?.as_str()?.to_string();
+    let status = v
+        .get("status")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let detail = v
+        .get("detail")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(HealthCheck {
+        check,
+        status,
+        detail,
+    })
+}
+
+/// Project a set of `(topic, latest-body)` Bus reads into health checks —
+/// `event/dc/health/*` topics only, sorted by check name for a stable render
+/// order. Pure + testable.
+#[must_use]
+pub fn project_health(events: &[(String, String)]) -> Vec<HealthCheck> {
+    let mut checks: Vec<HealthCheck> = events
+        .iter()
+        .filter(|(topic, _)| topic.starts_with("event/dc/health/"))
+        .filter_map(|(_, body)| parse_health_event(body))
+        .collect();
+    checks.sort_by(|a, b| a.check.cmp(&b.check));
+    checks
+}
+
+/// Tally a set of health checks into `(ok, warn, fail)` counts. A check counts as
+/// `ok` when its status is exactly "ok", `warn` when exactly "warn", and `fail`
+/// for anything else (incl. an empty/unknown status — fail-safe). Pure + testable.
+#[must_use]
+pub fn health_summary(checks: &[HealthCheck]) -> (usize, usize, usize) {
+    let mut ok = 0;
+    let mut warn = 0;
+    let mut fail = 0;
+    for c in checks {
+        match c.status.as_str() {
+            "ok" => ok += 1,
+            "warn" => warn += 1,
+            _ => fail += 1,
+        }
+    }
+    (ok, warn, fail)
+}
+
 /// Project a set of `(topic, latest-body)` Bus reads into sorted rows — datacenter
 /// resources (`event/dc/*`), grouped by zone (prod first) then kind then name.
 #[must_use]
@@ -494,6 +568,10 @@ pub struct DatacenterPanel {
     /// Rendered by the `Overview` view as a version matrix. Refreshed alongside
     /// `rows` on every load.
     pub promote: Vec<PromoteStage>,
+    /// The datacenter health checks read off `event/dc/health/*`. Rendered by the
+    /// `Overview` view as an ok/warn/fail summary + alert list. Refreshed
+    /// alongside `rows` on every load.
+    pub health: Vec<HealthCheck>,
     /// When `Some(workspace)`, a Tofu apply is awaiting typed confirmation — the
     /// workspace's row renders a "Type APPLY to confirm" prompt and only the
     /// confirm button fires the `action/dc/tofu-apply` RPC. Cleared once the
@@ -544,6 +622,7 @@ impl Default for DatacenterPanel {
             confirm_delete: None,
             audit: Vec::new(),
             promote: Vec::new(),
+            health: Vec::new(),
             tofu_confirm: None,
             expanded: BTreeSet::new(),
             topology_seeded: false,
@@ -561,6 +640,10 @@ pub struct DcLoad {
     /// Rendered as a version matrix on the Overview view. Refreshed alongside
     /// `rows` on every load.
     pub promote: Vec<PromoteStage>,
+    /// The datacenter health checks read off `event/dc/health/*`. Rendered as an
+    /// ok/warn/fail summary + alert list on the Overview view. Refreshed
+    /// alongside `rows` on every load.
+    pub health: Vec<HealthCheck>,
 }
 
 #[derive(Debug, Clone)]
@@ -674,6 +757,7 @@ impl DatacenterPanel {
                 self.rows = load.rows;
                 self.audit = load.audit;
                 self.promote = load.promote;
+                self.health = load.health;
                 self.busy = false;
                 self.load_error = None;
                 self.status.clear();
@@ -1029,6 +1113,12 @@ impl DatacenterPanel {
                 // ones show "—") so the pipeline reads left-to-right.
                 col = col.push(text("Promotion").size(f32::from(spacing::BASE[5])));
                 col = col.push(promote_strip_view(&self.promote, palette));
+                // Health summary — a one-line ok/warn/fail tally fed by
+                // `event/dc/health/*`, plus an alert list of any non-ok checks.
+                col = col.push(text("Health").size(f32::from(spacing::BASE[5])));
+                for el in health_section_view(&self.health, palette) {
+                    col = col.push(el);
+                }
             }
             ViewMode::Tofu => {
                 // A Plan + Apply control pair per workspace. Apply arms a typed
@@ -1463,6 +1553,77 @@ fn promote_strip_view(
     strip.into()
 }
 
+/// Render the **Health** section of the Overview: a one-line `N ok · M warn · K
+/// fail` summary (each count in its mde-theme token — `success` / `warning` /
+/// `danger`) followed by an alert row for every non-ok check (its name + detail).
+/// When every check is ok (and there's at least one), shows a single "✓ all
+/// systems healthy" line; with no checks at all, an empty-state hint. Returns a
+/// list of elements so the Overview column can push them in order. mde-theme
+/// tokens only — no raw hex.
+fn health_section_view(
+    checks: &[HealthCheck],
+    palette: Palette,
+) -> Vec<Element<'static, crate::Message>> {
+    let mut out: Vec<Element<'static, crate::Message>> = Vec::new();
+    if checks.is_empty() {
+        out.push(
+            text("No datacenter health checks reported yet.")
+                .colr(palette.text_muted.into_cosmic_color())
+                .into(),
+        );
+        return out;
+    }
+    let (ok, warn, fail) = health_summary(checks);
+    // One-line tally — each count colored by its severity token.
+    let summary = row![
+        text(format!("{ok} ok")).colr(palette.success.into_cosmic_color()),
+        text(" · ").colr(palette.text_muted.into_cosmic_color()),
+        text(format!("{warn} warn")).colr(palette.warning.into_cosmic_color()),
+        text(" · ").colr(palette.text_muted.into_cosmic_color()),
+        text(format!("{fail} fail")).colr(palette.danger.into_cosmic_color()),
+    ]
+    .spacing(f32::from(spacing::BASE[1]));
+    out.push(summary.into());
+
+    if warn == 0 && fail == 0 {
+        out.push(
+            text("✓ all systems healthy")
+                .colr(palette.success.into_cosmic_color())
+                .into(),
+        );
+        return out;
+    }
+    // Alert list — every non-ok check, name + detail, colored by severity.
+    for c in checks.iter().filter(|c| c.status != "ok") {
+        let color = if c.status == "warn" {
+            palette.warning
+        } else {
+            palette.danger
+        };
+        let detail = if c.detail.is_empty() {
+            c.status.clone()
+        } else {
+            c.detail.clone()
+        };
+        let line = row![
+            text(c.check.clone())
+                .colr(color.into_cosmic_color())
+                .width(Length::FillPortion(1)),
+            text(detail)
+                .colr(palette.text.into_cosmic_color())
+                .width(Length::FillPortion(3)),
+        ]
+        .spacing(f32::from(spacing::BASE[3]));
+        out.push(
+            container(line)
+                .padding(f32::from(spacing::BASE[2]))
+                .width(Length::Fill)
+                .into(),
+        );
+    }
+    out
+}
+
 /// Render one promotion-stage card: the stage label, its version, and a readiness
 /// chip whose color comes from a mde-theme token (`success` for ready, `warning`
 /// for pending, `text_muted` for an unknown/absent placeholder). mde-theme tokens
@@ -1565,6 +1726,7 @@ fn read_dc_events() -> Result<DcLoad, String> {
         rows: project_rows(&events),
         audit: project_audit(&events),
         promote: project_promote(&events),
+        health: project_health(&events),
     })
 }
 
@@ -2433,6 +2595,7 @@ mod tests {
                 ts: "2026-06-22T11:00:00Z".into(),
             }],
             promote: Vec::new(),
+            health: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert_eq!(p.audit.len(), 1);
@@ -2619,6 +2782,7 @@ mod tests {
             rows: topology_fixture(),
             audit: Vec::new(),
             promote: Vec::new(),
+            health: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert!(p.expanded.contains("172.20.0.9"));
@@ -2823,6 +2987,7 @@ mod tests {
                 version: "11.0.2".into(),
                 status: "ready".into(),
             }],
+            health: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert_eq!(p.promote.len(), 1);
@@ -2850,5 +3015,165 @@ mod tests {
         // And it stays reachable with no promote events at all (all placeholders).
         let empty = DatacenterPanel::new();
         let _ = empty.view();
+    }
+
+    // ---- DATACENTER-24: Health summary + alerts on Overview ----------------
+
+    #[test]
+    fn parse_health_event_reads_a_check() {
+        let c = parse_health_event(r#"{"check":"dom0-a","status":"fail","detail":"ssh timeout"}"#)
+            .unwrap();
+        assert_eq!(c.check, "dom0-a");
+        assert_eq!(c.status, "fail");
+        assert_eq!(c.detail, "ssh timeout");
+    }
+
+    #[test]
+    fn parse_health_event_defaults_missing_fields_and_drops_garbage() {
+        // Missing status/detail default to empty.
+        let c = parse_health_event(r#"{"check":"bus"}"#).unwrap();
+        assert_eq!(c.check, "bus");
+        assert_eq!(c.status, "");
+        assert_eq!(c.detail, "");
+        // Unparseable / missing check → None.
+        assert!(parse_health_event("not json").is_none());
+        assert!(parse_health_event(r#"{"status":"ok"}"#).is_none());
+    }
+
+    #[test]
+    fn project_health_filters_to_health_topics_and_sorts() {
+        let events = vec![
+            // Not a health topic → dropped.
+            (
+                "event/dc/vm/9".into(),
+                r#"{"kind":"vm","id":"9","name":"b","status":"running","zone":"dev"}"#.into(),
+            ),
+            (
+                "event/dc/health/dom0-a".into(),
+                r#"{"check":"dom0-a","status":"ok"}"#.into(),
+            ),
+            (
+                "event/dc/health/bus".into(),
+                r#"{"check":"bus","status":"warn","detail":"lagging"}"#.into(),
+            ),
+        ];
+        let checks = project_health(&events);
+        assert_eq!(checks.len(), 2); // non-health dropped
+                                     // Sorted by check name: "bus" < "dom0-a".
+        assert_eq!(checks[0].check, "bus");
+        assert_eq!(checks[1].check, "dom0-a");
+    }
+
+    #[test]
+    fn health_event_is_dropped_by_project_rows() {
+        // A health body has no `kind`/`id`, so it must NOT leak into resource
+        // rows even though its topic starts with `event/dc/`.
+        let rows = project_rows(&[(
+            "event/dc/health/bus".into(),
+            r#"{"check":"bus","status":"ok"}"#.into(),
+        )]);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn health_summary_counts_ok_warn_fail() {
+        let checks = vec![
+            HealthCheck {
+                check: "bus".into(),
+                status: "ok".into(),
+                detail: String::new(),
+            },
+            HealthCheck {
+                check: "doctl".into(),
+                status: "ok".into(),
+                detail: String::new(),
+            },
+            HealthCheck {
+                check: "dom0-a".into(),
+                status: "warn".into(),
+                detail: "load high".into(),
+            },
+            HealthCheck {
+                check: "dom0-b".into(),
+                status: "fail".into(),
+                detail: "ssh timeout".into(),
+            },
+            // An unknown/empty status is fail-safe → counts as a failure.
+            HealthCheck {
+                check: "mystery".into(),
+                status: String::new(),
+                detail: String::new(),
+            },
+        ];
+        assert_eq!(health_summary(&checks), (2, 1, 2));
+        // Empty input → all zeroes.
+        assert_eq!(health_summary(&[]), (0, 0, 0));
+    }
+
+    #[test]
+    fn loaded_populates_health_checks() {
+        let mut p = DatacenterPanel::new();
+        let load = DcLoad {
+            rows: Vec::new(),
+            audit: Vec::new(),
+            promote: Vec::new(),
+            health: vec![HealthCheck {
+                check: "bus".into(),
+                status: "ok".into(),
+                detail: String::new(),
+            }],
+        };
+        let _ = p.update(Message::Loaded(Ok(load)));
+        assert_eq!(p.health.len(), 1);
+        assert_eq!(p.health[0].check, "bus");
+    }
+
+    #[test]
+    fn panel_defaults_have_no_health_checks() {
+        let p = DatacenterPanel::new();
+        assert!(p.health.is_empty());
+    }
+
+    #[test]
+    fn overview_renders_the_health_section_all_ok() {
+        let mut p = DatacenterPanel::new();
+        // Default view is Overview. All-ok checks → the "✓ all systems healthy"
+        // branch renders (no alert rows).
+        p.health = project_health(&[
+            (
+                "event/dc/health/bus".into(),
+                r#"{"check":"bus","status":"ok"}"#.into(),
+            ),
+            (
+                "event/dc/health/doctl".into(),
+                r#"{"check":"doctl","status":"ok"}"#.into(),
+            ),
+        ]);
+        let _ = p.view();
+        // And it stays reachable with no health checks at all (empty-state hint).
+        let empty = DatacenterPanel::new();
+        let _ = empty.view();
+    }
+
+    #[test]
+    fn overview_renders_the_health_section_with_failures() {
+        let mut p = DatacenterPanel::new();
+        // A mixed set → the summary tally + the warn/fail alert rows render,
+        // incl. the empty-detail fallback (status used in place of detail).
+        p.health = project_health(&[
+            (
+                "event/dc/health/bus".into(),
+                r#"{"check":"bus","status":"ok"}"#.into(),
+            ),
+            (
+                "event/dc/health/dom0-a".into(),
+                r#"{"check":"dom0-a","status":"warn","detail":"load high"}"#.into(),
+            ),
+            (
+                "event/dc/health/dom0-b".into(),
+                r#"{"check":"dom0-b","status":"fail"}"#.into(),
+            ),
+        ]);
+        let _ = p.view();
     }
 }
