@@ -14,7 +14,12 @@
 #   farm-testbed.sh ssh <ip> ...  run a command on a test VM (as mm)
 set -uo pipefail
 
-DOM0="${MCNF_TESTBED_DOM0:-172.20.145.165}"        # XEN-BIGBOY
+# Testing runs on the two NON-BIGBOY hosts (operator directive 2026-06-22:
+# "worklist work → BIGBOY, testing → the two other Xen hosts"). Default to
+# XEN-HOME-SERVICES; KVM-XCP1 (172.20.145.193) is the second test host (set
+# MCNF_TESTBED_DOM0 to alternate L-tier runs across the two, keeping BIGBOY for
+# builds only). Both carry the MDE-VM-golden template.
+DOM0="${MCNF_TESTBED_DOM0:-172.20.0.9}"            # XEN-HOME-SERVICES (test host A)
 GOLDEN="${MCNF_TESTBED_GOLDEN:-MDE-VM-golden}"
 BASE3="${MCNF_TESTBED_BASE:-172.20.0.6}"           # IPs 172.20.0.60 .. .69
 GW="${MCNF_TESTBED_GW:-172.20.0.1}"

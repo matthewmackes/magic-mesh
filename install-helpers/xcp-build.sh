@@ -24,7 +24,10 @@
 #   e.g. BigBoy's 12c/24G hosts 2-3 parallel builds). slot "2" → ~/magic-mesh-2.
 set -euo pipefail
 
-BUILD_HOST="${MCNF_BUILD_HOST:-172.20.0.50}"
+# Default build node is XEN-BIGBOY's VM mcnf-build-52 (172.20.0.52, 8 vCPU /
+# 23 GB — the biggest node), per the operator directive "worklist work → BIGBOY,
+# testing → the two other Xen hosts" (2026-06-22). Override with MCNF_BUILD_HOST.
+BUILD_HOST="${MCNF_BUILD_HOST:-172.20.0.52}"
 BUILD_USER="${MCNF_BUILD_USER:-mm}"
 KEY="${MCNF_BUILD_KEY:-$HOME/.ssh/mackes_mesh_ed25519}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
