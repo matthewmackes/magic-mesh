@@ -338,6 +338,10 @@ pub struct MdeFiles {
     /// MOTION-FEEDBACK — the signature of the listing the current `reveal_origin`
     /// belongs to (view + path + mesh path). A change ⇒ a fresh reveal.
     pub listing_sig: String,
+    /// BEAUT-FILES — perceived-performance load state of the active file listing:
+    /// drives the skeleton-first paint (new listing, no prior content) and the
+    /// stale-while-refreshing dim + crossfade (refresh over existing content).
+    pub listing_load: crate::loading::ListingLoad,
 }
 
 /// v2.0.0 Phase 5.1 — pane currently receiving keyboard input.
@@ -416,6 +420,7 @@ impl Default for MdeFiles {
             releasing_row: None,
             reveal_origin: None,
             listing_sig: String::new(),
+            listing_load: crate::loading::ListingLoad::default(),
         }
     }
 }
@@ -907,9 +912,15 @@ impl MdeFiles {
                         self.releasing_row = None;
                     }
                 }
-                if self.reveal_origin.is_some_and(|o| now >= o + Self::reveal_window()) {
+                if self
+                    .reveal_origin
+                    .is_some_and(|o| now >= o + Self::reveal_window())
+                {
                     self.reveal_origin = None;
                 }
+                // BEAUT-FILES — advance the load state to Loaded once its window
+                // elapses so the skeleton/crossfade stops and the tick can idle.
+                self.listing_load.settle(now);
                 // An AnimTick mutates only animation state — skip the snapshot
                 // refresh + tab sync the data messages need.
                 return Task::none();
@@ -1030,6 +1041,11 @@ impl MdeFiles {
     /// O(few backend calls); per-tick cost is acceptable since
     /// Iced only re-runs `update()` on Message arrival.
     fn refresh_snapshot(&mut self) {
+        // BEAUT-FILES — remember the signature + whether the active listing had
+        // rows BEFORE re-listing, so the load-state transition below knows whether
+        // to skeleton (new + empty) or stale-dim (refresh / new-with-content).
+        let prev_sig = self.listing_sig.clone();
+        let had_content = self.active_listing_len() > 0;
         // AFM-RECONNECT — re-attempt any mesh/bus connection that wasn't live at
         // launch (the cold-boot race that left the roster empty) before
         // capturing, so peers populate on their own.
@@ -1060,6 +1076,36 @@ impl MdeFiles {
         // MOTION-FEEDBACK — arm a fresh staggered reveal whenever the active
         // listing changed (navigated to a new view / dir / mesh path).
         self.arm_reveal_if_changed();
+        // BEAUT-FILES — drive the perceived-performance load state. A changed
+        // signature ⇒ a fresh load (skeleton when there was nothing to keep, stale
+        // dim+crossfade when prior rows are carried over); an unchanged signature
+        // that still has rows ⇒ a quiet background refresh; then settle to Loaded
+        // once the window elapses so the listing idles.
+        let now = std::time::Instant::now();
+        let sig_changed = self.listing_sig != prev_sig;
+        if sig_changed {
+            self.listing_load.begin(now, had_content);
+        } else {
+            self.listing_load
+                .refresh_in_place(now, self.active_listing_len() > 0);
+        }
+        self.listing_load.settle(now);
+    }
+
+    /// BEAUT-FILES — the row count of whichever file listing the active view
+    /// renders, or `0` for non-listing views (overview / mesh-home cards /
+    /// network). Used to decide skeleton-vs-stale-dim and to gate the load
+    /// animation off an empty listing.
+    fn active_listing_len(&self) -> usize {
+        match &self.view {
+            View::Peer(_) | View::MeshHomeChild(_) => self.peer_files.len(),
+            View::Inbox => self.snapshot.inbox.len(),
+            View::Outbox => self.snapshot.outbox.len(),
+            View::Downloads => self.snapshot.downloads.len(),
+            View::Local => self.local_files.len(),
+            View::CloudDevices => self.cloud_files.len(),
+            View::MeshOverview | View::MeshHome | View::MeshUndelete | View::Network => 0,
+        }
     }
 
     /// MOTION-FEEDBACK — the listing identity (view + local path + mesh path). A
@@ -1099,8 +1145,12 @@ impl MdeFiles {
     fn start_row_anim(&mut self, key: impl Into<String>) {
         let now = std::time::Instant::now();
         self.anim.gc(now);
-        self.anim
-            .start(key, now, mde_theme::motion::Motion::hover(), self.reduce_motion());
+        self.anim.start(
+            key,
+            now,
+            mde_theme::motion::Motion::hover(),
+            self.reduce_motion(),
+        );
     }
 
     /// MOTION-FEEDBACK — true when reduce-motion is active (instant state changes,
@@ -1144,6 +1194,10 @@ impl MdeFiles {
             || self
                 .reveal_origin
                 .is_some_and(|o| now < o + Self::reveal_window())
+            // BEAUT-FILES — keep ticking while the skeleton shimmer / refresh
+            // crossfade is in flight, so the placeholder breathes + fresh content
+            // fades in; goes idle the instant it settles (MOTION-PERF-1).
+            || self.listing_load.is_animating(now)
     }
 
     /// MOTION-FEEDBACK — build the read-only [`RowMotionCtx`] the file views pass
@@ -1156,6 +1210,7 @@ impl MdeFiles {
             reveal_origin: self.reveal_origin,
             now: std::time::Instant::now(),
             reduce_motion: self.reduce_motion(),
+            load: self.listing_load,
         }
     }
 
