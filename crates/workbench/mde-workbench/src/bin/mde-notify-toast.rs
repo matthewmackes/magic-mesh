@@ -10,8 +10,18 @@
 //! emergencies still reach the operator. Desktop-app (`fdo/*`) notifications are
 //! shown in the center, never double-toasted.
 //!
-//! Adaptive motion budget: the fast fade tick only runs while toasts are on
-//! screen; an idle mesh runs just the 2 s bus poll.
+//! Adaptive motion budget (MOTION-PERF-1): the fast animation tick only runs
+//! while a toast is mid-transition (sliding/fading in or out); during the steady
+//! hold — and on an idle mesh — only the 2 s bus poll runs, so a settled toast
+//! costs no per-frame wakeups.
+//!
+//! NOTIFY-FX-1 / MOTION-FEEDBACK-3 — the enter/exit motion is glued onto the
+//! shared shell vocabulary in [`mde_theme::animation`] (`slide_in` +
+//! `Transition` over a reduce-motion-aware [`mde_theme::animation::Tween`]) and
+//! the Carbon [`mde_theme::motion`] duration grid, so the toast reads with the
+//! same idiom as the Notification Hub's NOTIFY-HUB-2 card entrance — never a
+//! hand-rolled fade. Reduce-motion collapses both directions to an instant
+//! crossfade (opacity only, no slide), the helpers' a11y contract.
 
 use cosmic::iced::platform_specific::runtime::wayland::layer_surface::SctkLayerSurfaceSettings;
 use cosmic::iced::platform_specific::shell::commands::layer_surface::{
@@ -24,6 +34,8 @@ use cosmic::iced::{
 use mde_notify::{
     severity_token, sound_for_alert, AlertItem, AlertTail, Severity, SoundSettings, Source,
 };
+use mde_theme::animation::{ease, lerp_f32, Transition, Tween};
+use mde_theme::motion::Motion;
 use mde_theme::Palette;
 use mde_workbench::cosmic_compat::IntoIcedColor;
 
@@ -31,13 +43,28 @@ use mde_workbench::cosmic_compat::IntoIcedColor;
 const TOAST_WIDTH: f32 = 380.0;
 /// Bus poll cadence — a new alert toasts within this window of a publish.
 const POLL_SECS: u64 = 2;
-/// Fade/animation tick — only registered while toasts are live (adaptive budget).
-const ANIM_MS: u64 = 80;
+/// Fast animation tick (~60 fps) — registered ONLY while a toast is mid-enter or
+/// mid-exit transition (MOTION-PERF-1: no idle wakeups during the hold).
+const ANIM_MS: u64 = 16;
 /// How long a toast stays on screen before it expires.
 const TOAST_TTL_MS: i64 = 6_000;
-/// Fade-in / fade-out ramp durations (ms) within the TTL.
-const FADE_IN_MS: i64 = 220;
-const FADE_OUT_MS: i64 = 500;
+/// NOTIFY-FX-1 — enter (slide/fade-in) duration: the Carbon `moderate-02` beat
+/// the shared `slide_in` helper + the Hub's NOTIFY-HUB-2 card entrance both use,
+/// so the toast and the Hub share one entrance feel.
+fn enter_ms() -> i64 {
+    Motion::panel_mount().duration.as_millis() as i64
+}
+/// NOTIFY-FX-1 — exit (slide/fade-out) duration: the Carbon `moderate-02` beat,
+/// kept symmetric with the entrance. The fade-out begins this long before the
+/// TTL elapses so the toast finishes leaving exactly as it's pruned.
+fn exit_ms() -> i64 {
+    Motion::dialog_mount().duration.as_millis() as i64
+}
+/// NOTIFY-HUB-2 idiom — a fresh toast slides in this many px from the right (and
+/// a leaving one slides back out the same way), echoing the Hub card's
+/// horizontal entrance. Component dimension (the toast column is 380 px wide),
+/// so a local constant, not a density-scaled metric. Reduce-motion drops it.
+const SLIDE_PX: f32 = 36.0;
 /// Max toasts stacked at once (newest kept; older dropped early).
 const MAX_TOASTS: usize = 4;
 
@@ -83,6 +110,10 @@ struct Toast {
 struct Toaster {
     tail: AlertTail,
     toasts: Vec<Toast>,
+    /// NOTIFY-FX-1 — honor the user's reduce-motion preference (read once at
+    /// boot, like the Hub): collapses every enter/exit to an instant crossfade
+    /// (opacity only, no slide) via the shared helpers' a11y contract.
+    reduce_motion: bool,
 }
 
 impl Toaster {
@@ -90,6 +121,7 @@ impl Toaster {
         Self {
             tail: AlertTail::default(),
             toasts: Vec::new(),
+            reduce_motion: mde_theme::Preferences::load().a11y.reduce_motion,
         }
     }
 }
@@ -105,15 +137,23 @@ enum Message {
 fn subscription(state: &Toaster) -> Subscription<Message> {
     let poll =
         cosmic::iced::time::every(std::time::Duration::from_secs(POLL_SECS)).map(|_| Message::Poll);
-    // Adaptive budget: the fade tick runs ONLY while toasts are on screen.
-    if state.toasts.is_empty() {
-        poll
-    } else {
+    // MOTION-PERF-1: the fast animation tick runs ONLY while at least one toast
+    // is actually mid-transition (entering or leaving). A toast sitting in its
+    // steady hold has no per-frame visual change, so it needs no wakeups — the
+    // 2 s poll re-arms the tick the moment a toast crosses into its fade-out.
+    let now = now_ms();
+    let in_flight = state
+        .toasts
+        .iter()
+        .any(|t| toast_in_transition(now - t.shown_at_ms, state.reduce_motion));
+    if in_flight {
         Subscription::batch([
             poll,
             cosmic::iced::time::every(std::time::Duration::from_millis(ANIM_MS))
                 .map(|_| Message::Anim),
         ])
+    } else {
+        poll
     }
 }
 
@@ -176,22 +216,97 @@ fn prune_expired(toasts: Vec<Toast>, now_ms: i64) -> Vec<Toast> {
         .collect()
 }
 
-/// Opacity (0.0..=1.0) for a toast at `age_ms` into its TTL: ramp up over
-/// `FADE_IN_MS`, hold, ramp down over the final `FADE_OUT_MS`. Pure + testable.
+/// NOTIFY-FX-1 — the render motion for a toast at `age_ms` into its TTL: a
+/// fade+slide-in entrance, a steady hold, then a fade+slide-out exit. Positive
+/// `translate_x` = still offset to the right of rest (slides to 0 on enter, back
+/// out on exit), matching the Hub's NOTIFY-HUB-2 "from the right" idiom.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ToastMotion {
+    /// Opacity multiplier `0.0..=1.0`.
+    pub alpha: f32,
+    /// Horizontal offset in px (positive = right of rest).
+    pub translate_x: f32,
+}
+
+/// `true` while a toast at `age_ms` needs the fast animation tick armed — i.e.
+/// it is entering, exiting, or about to exit. The fast tick is only re-evaluated
+/// when the 2 s poll fires, so it must be armed at least one poll interval BEFORE
+/// the exit window opens; otherwise a narrow exit window that opens and closes
+/// entirely between two polls would never be ticked and the toast would vanish
+/// abruptly instead of fading/sliding out. The steady mid-hold (well clear of
+/// both the entrance and the imminent exit) returns `false` so a settled toast
+/// costs no wakeups (MOTION-PERF-1).
 #[must_use]
-pub fn toast_alpha(age_ms: i64, ttl_ms: i64) -> f32 {
-    if age_ms <= 0 {
-        return 0.0;
+fn toast_in_transition(age_ms: i64, reduce_motion: bool) -> bool {
+    let enter = if reduce_motion {
+        mde_theme::motion::REDUCE_MOTION_CAP_MS as i64
+    } else {
+        enter_ms()
+    };
+    let exit = if reduce_motion {
+        mde_theme::motion::REDUCE_MOTION_CAP_MS as i64
+    } else {
+        exit_ms()
+    };
+    // Arm the tick one poll interval ahead of the exit window so the poll that
+    // re-evaluates the subscription always lands BEFORE the fade-out begins — the
+    // exit is never skipped, however the polls align with the TTL. A negative age
+    // (clock skew) counts as entering so the toast still animates in.
+    let exit_arm = TOAST_TTL_MS - exit - (POLL_SECS as i64 * 1_000);
+    age_ms < enter || age_ms >= exit_arm
+}
+
+/// NOTIFY-FX-1 — the toast's enter/exit motion at `age_ms`, glued onto the
+/// shared shell vocabulary: the entrance reuses [`mde_theme::animation::slide_in`]
+/// (fade 0→1 + slide in, reduce-motion ⇒ crossfade) and the exit drives
+/// [`Transition::FadeOut`] over a reduce-motion-aware [`Tween`] (the symmetric
+/// slide back out, reduce-motion ⇒ opacity-only). Both use the Carbon
+/// `moderate-02` beat. Pure + testable.
+#[must_use]
+pub fn toast_motion(age_ms: i64, reduce_motion: bool) -> ToastMotion {
+    // Synthetic shared clock: the helpers are `(start, now)`-relative, so a fixed
+    // epoch + an offset of `age_ms` samples them at the toast's current age.
+    let epoch = std::time::Instant::now();
+    let at = |ms: i64| epoch + std::time::Duration::from_millis(ms.max(0) as u64);
+
+    // Exit window first: once a toast is within `exit` of its TTL it fades + slides
+    // back out (right). This takes precedence so a very short TTL still exits.
+    let exit = if reduce_motion {
+        mde_theme::motion::REDUCE_MOTION_CAP_MS as i64
+    } else {
+        exit_ms()
+    };
+    let exit_start = TOAST_TTL_MS - exit;
+    if age_ms >= exit_start {
+        // Progress 0→1 across the exit window, eased like the entrance.
+        let tw = Tween::resolved(
+            at(exit_start),
+            std::time::Duration::from_millis(exit.max(1) as u64),
+            reduce_motion,
+        );
+        let t = ease(tw.progress(at(age_ms)), Motion::dialog_mount().resolved(reduce_motion).easing);
+        let p = Transition::FadeOut.params(t);
+        // Reduce-motion: crossfade only (no slide). Full motion: slide back out
+        // to +SLIDE_PX as it fades.
+        let translate_x = if reduce_motion {
+            0.0
+        } else {
+            lerp_f32(0.0, SLIDE_PX, t)
+        };
+        return ToastMotion {
+            alpha: p.alpha,
+            translate_x,
+        };
     }
-    if age_ms < FADE_IN_MS {
-        return age_ms as f32 / FADE_IN_MS as f32;
+
+    // Entrance: fade 0→1 + slide in from +SLIDE_PX → 0 over `moderate-02`. The
+    // shared `slide_in` helper carries the reduce-motion contract (it collapses
+    // to a pure crossfade, zero translate).
+    let p = mde_theme::animation::slide_in(at(0), at(age_ms), SLIDE_PX, reduce_motion);
+    ToastMotion {
+        alpha: p.alpha,
+        translate_x: p.translate_y, // `slide_in` yields the offset in translate_y; map to x.
     }
-    let fade_out_start = ttl_ms - FADE_OUT_MS;
-    if age_ms >= fade_out_start && fade_out_start > 0 {
-        let remaining = (ttl_ms - age_ms).max(0) as f32;
-        return (remaining / FADE_OUT_MS as f32).clamp(0.0, 1.0);
-    }
-    1.0
 }
 
 fn now_ms() -> i64 {
@@ -292,8 +407,8 @@ fn view(state: &Toaster, _id: window::Id) -> Element<'_, Message> {
     // Newest at the top.
     for t in state.toasts.iter().rev() {
         let age = now - t.shown_at_ms;
-        let alpha = toast_alpha(age, TOAST_TTL_MS);
-        col = col.push(toast_card(&t.item, alpha, p));
+        let motion = toast_motion(age, state.reduce_motion);
+        col = col.push(toast_card(&t.item, motion, p));
     }
     container(col)
         .padding(Padding::from([12u16, 12u16]))
@@ -301,9 +416,13 @@ fn view(state: &Toaster, _id: window::Id) -> Element<'_, Message> {
         .into()
 }
 
-/// Render one toast card at the given opacity. Severity accents the left border
-/// + glyph; the whole card fades via `alpha`.
-fn toast_card(item: &AlertItem, alpha: f32, p: Palette) -> Element<'static, Message> {
+/// Render one toast card with the given enter/exit [`ToastMotion`]. Severity
+/// accents the left border + glyph; the whole card fades via `motion.alpha`, and
+/// `motion.translate_x` slides it horizontally (applied as left padding — the
+/// iced 0.13 fork has no transform widget, so offset via padding, the same
+/// convention the shared motion helpers document).
+fn toast_card(item: &AlertItem, motion: ToastMotion, p: Palette) -> Element<'static, Message> {
+    let alpha = motion.alpha;
     let fade = |c: Color| Color {
         a: c.a * alpha,
         ..c
@@ -334,7 +453,7 @@ fn toast_card(item: &AlertItem, alpha: f32, p: Palette) -> Element<'static, Mess
     }
     let surface = fade(p.surface.into_cosmic_color());
     let border = fade(sev);
-    container(inner)
+    let card = container(inner)
         .padding(Padding::from([10u16, 12u16]))
         .width(Length::Fill)
         .style(move |_| container::Style {
@@ -347,8 +466,17 @@ fn toast_card(item: &AlertItem, alpha: f32, p: Palette) -> Element<'static, Mess
                 radius: 0.0.into(),
             },
             ..container::Style::default()
-        })
-        .into()
+        });
+    // Horizontal slide: leading spacer of `translate_x` px pushes the card right
+    // of rest while it enters/exits, settling to 0 at the hold (reduce-motion ⇒
+    // always 0). The card shrinks to fill the remainder so the column width is
+    // stable (no layout thrash — the helpers' compositor-friendly contract).
+    let offset = motion.translate_x.max(0.0);
+    if offset > f32::EPSILON {
+        row![Space::new().width(Length::Fixed(offset)), card].into()
+    } else {
+        card.into()
+    }
 }
 
 #[cfg(test)]
@@ -436,13 +564,78 @@ mod tests {
     }
 
     #[test]
-    fn alpha_fades_in_holds_and_out() {
-        assert_eq!(toast_alpha(0, TOAST_TTL_MS), 0.0);
-        assert!(toast_alpha(FADE_IN_MS / 2, TOAST_TTL_MS) > 0.0);
-        assert!(toast_alpha(FADE_IN_MS / 2, TOAST_TTL_MS) < 1.0);
-        assert_eq!(toast_alpha(2_000, TOAST_TTL_MS), 1.0); // hold
-                                                           // Near the end it fades back toward 0.
-        assert!(toast_alpha(TOAST_TTL_MS - 100, TOAST_TTL_MS) < 1.0);
-        assert!(toast_alpha(TOAST_TTL_MS, TOAST_TTL_MS) <= 0.01);
+    fn motion_slides_and_fades_in_holds_then_exits() {
+        // NOTIFY-FX-1 acceptance: a fresh toast starts transparent + offset to the
+        // right, slides/fades in, holds opaque + at rest, then fades/slides back
+        // out as it nears its TTL.
+        // Entrance start: invisible, fully offset right.
+        let m0 = toast_motion(0, false);
+        assert!(m0.alpha < 1e-3, "starts transparent, got {}", m0.alpha);
+        assert!(
+            (m0.translate_x - SLIDE_PX).abs() < 1e-3,
+            "starts at full right offset, got {}",
+            m0.translate_x
+        );
+        // Mid-entrance: interpolating in.
+        let mm = toast_motion(enter_ms() / 2, false);
+        assert!(mm.alpha > 0.0 && mm.alpha < 1.0, "fading in, got {}", mm.alpha);
+        assert!(
+            mm.translate_x > 0.0 && mm.translate_x < SLIDE_PX,
+            "sliding in, got {}",
+            mm.translate_x
+        );
+        // Hold: fully opaque + at rest (no offset).
+        let hold = toast_motion(2_000, false);
+        assert!((hold.alpha - 1.0).abs() < 1e-3, "holds opaque, got {}", hold.alpha);
+        assert!(hold.translate_x.abs() < 1e-3, "holds at rest, got {}", hold.translate_x);
+        // Exit window: fading + sliding back out toward 0 alpha / +SLIDE_PX.
+        let near_end = toast_motion(TOAST_TTL_MS - 100, false);
+        assert!(near_end.alpha < 1.0, "exit fades out, got {}", near_end.alpha);
+        assert!(near_end.translate_x > 0.0, "exit slides out, got {}", near_end.translate_x);
+        // At the TTL the toast is fully gone.
+        let gone = toast_motion(TOAST_TTL_MS, false);
+        assert!(gone.alpha <= 0.01, "fully faded at TTL, got {}", gone.alpha);
+    }
+
+    #[test]
+    fn reduce_motion_is_crossfade_only_no_slide() {
+        // The a11y contract: reduce-motion keeps the fade (the state cue) but drops
+        // every horizontal slide — translate_x is 0 across the whole lifecycle.
+        for age in [0, 20, 40, 80, 2_000, TOAST_TTL_MS - 40, TOAST_TTL_MS] {
+            let m = toast_motion(age, true);
+            assert_eq!(m.translate_x, 0.0, "no slide under reduce-motion @{age}ms");
+            assert!((0.0..=1.0).contains(&m.alpha), "alpha in range @{age}ms");
+        }
+        // It still fades: invisible at the start of the (capped) entrance, opaque
+        // once past the cap.
+        assert!(toast_motion(0, true).alpha < 1e-3);
+        let cap = mde_theme::motion::REDUCE_MOTION_CAP_MS as i64;
+        assert!((toast_motion(cap, true).alpha - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn transition_flag_arms_tick_only_while_moving() {
+        // MOTION-PERF-1: the fast tick is armed while entering, exiting, or within
+        // one poll interval of the exit window; the steady mid-hold reports no
+        // transition in flight (so the tick can stop).
+        assert!(toast_in_transition(0, false), "entering");
+        assert!(toast_in_transition(enter_ms() - 1, false), "still entering");
+        assert!(!toast_in_transition(2_000, false), "mid-hold has no transition");
+        assert!(
+            toast_in_transition(TOAST_TTL_MS - 1, false),
+            "exiting near TTL"
+        );
+        // Regression: the tick must be armed at least one poll interval BEFORE the
+        // exit window opens, so a fade-out that falls between two polls is never
+        // skipped. Sample just before the exit window opens.
+        let exit_open = TOAST_TTL_MS - exit_ms();
+        assert!(
+            toast_in_transition(exit_open - 1, false),
+            "armed ahead of the exit window so the poll catches it"
+        );
+        assert!(
+            toast_in_transition(exit_open - (POLL_SECS as i64 * 1_000), false),
+            "armed a full poll interval before the exit window opens"
+        );
     }
 }
