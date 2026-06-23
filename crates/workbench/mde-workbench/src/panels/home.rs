@@ -40,11 +40,14 @@
 
 use std::path::PathBuf;
 
+use std::time::{Duration, Instant};
+
 use cosmic::iced::widget::{
     button, column, container, row, scrollable, svg as widget_svg, text, Space,
 };
-use cosmic::iced::{Background, Border, Color, Element, Length, Padding, Task};
+use cosmic::iced::{Background, Border, Color, Element, Length, Padding, Shadow, Task, Vector};
 use cosmic::Theme;
+use mde_theme::feedback::{ControlFeedback, FeedbackParams};
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
 
 use crate::cosmic_compat::prelude::*;
@@ -863,9 +866,29 @@ impl HomePanel {
                     // BOOT-STATUS-6 — Restart for a down, remediable daemon.
                     if s.status != "ok" {
                         if let Some((unit, user_scope)) = service_remediation(&s.id) {
+                            let bg = palette.raised.into_cosmic_color();
+                            let border = palette.border.into_cosmic_color();
+                            let fg = palette.text.into_cosmic_color();
+                            let accent = palette.accent.into_cosmic_color();
+                            let reduce_motion = crate::live_theme::reduce_motion();
                             svc_row = svc_row.push(
                                 button(text("Restart").size(cap_sz))
                                     .padding(Padding::from([2u16, 8u16]))
+                                    .sty(move |_t: &Theme, status| {
+                                        feedback_button_style(
+                                            status,
+                                            FeedbackStyle {
+                                                bg,
+                                                border,
+                                                text_color: fg,
+                                                accent,
+                                                radius: 6.0,
+                                                hover_factor: 1.12,
+                                            },
+                                            Instant::now(),
+                                            reduce_motion,
+                                        )
+                                    })
                                     .on_press(crate::Message::Home(Message::RemediateService {
                                         unit: unit.to_string(),
                                         user_scope,
@@ -984,35 +1007,25 @@ fn nav_chip<'a>(
     let bg = palette.raised.into_cosmic_color();
     let border = palette.border.into_cosmic_color();
     let fg = palette.text.into_cosmic_color();
+    let accent = palette.accent.into_cosmic_color();
+    let reduce_motion = crate::live_theme::reduce_motion();
     button(text(label).size(13).colr(fg))
         .padding(Padding::from([6u16, 12u16]))
         .sty(
             move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
-                let hover_bg = Color {
-                    r: bg.r * 1.1,
-                    g: bg.g * 1.1,
-                    b: bg.b * 1.1,
-                    a: bg.a,
-                };
-                cosmic::iced::widget::button::Style {
-                    snap: false,
-                    background: Some(Background::Color(match status {
-                        cosmic::iced::widget::button::Status::Hovered
-                        | cosmic::iced::widget::button::Status::Pressed => hover_bg,
-                        _ => bg,
-                    })),
-                    text_color: fg,
-                    icon_color: None,
-                    border: Border {
-                        color: border,
-                        width: 1.0,
-                        radius: 6.0.into(),
+                feedback_button_style(
+                    status,
+                    FeedbackStyle {
+                        bg,
+                        border,
+                        text_color: fg,
+                        accent,
+                        radius: 6.0,
+                        hover_factor: 1.1,
                     },
-                    border_color: border,
-                    border_width: 1.0,
-                    border_radius: 6.0.into(),
-                    shadow: cosmic::iced::Shadow::default(),
-                }
+                    Instant::now(),
+                    reduce_motion,
+                )
             },
         )
         .on_press(msg)
@@ -1768,6 +1781,175 @@ pub fn build_all_rows_with_unknown_status() -> Vec<CapabilityRow> {
 // Widgets (OV-6 + OV-10)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// MOTION-FEEDBACK-1/2 — shared control feedback for the Overview's interactive
+// controls (stat cards, nav chips, Configure / Set up / Refresh buttons).
+//
+// Iced 0.13's `button::Status` delivers hover/press as discrete render-time
+// states (Pressed fires on pointer-DOWN with no delay — the no-input-delay
+// acceptance criterion is the toolkit's, we honor it). A `button::Style` closure
+// can only express color / border / shadow (it has no transform field — and a
+// geometric translate/scale would thrash layout anyway), so the hover-lift and
+// press-depress are conveyed the compositor-friendly, render-expressible way:
+//   * hover  → a faint brighter tint + a raised elevation shadow (rises),
+//   * press  → a darker tint + the elevation collapses to flat (the surface
+//     "sinks" — losing its shadow IS the depress cue) + an animated accent ring.
+//
+// The shared `mde_theme::feedback::ControlFeedback` vocabulary owns the two parts
+// it can: the **reduce-motion contract** (whether the elevation is allowed to
+// move at all — `FeedbackParams::is_at_rest()` is forced true under reduce-motion,
+// pinning the shadow flat) and the **animated accent ring** (`FocusRing` grows the
+// accent outline in; snaps to full under reduce-motion). These buttons have no
+// separate keyboard-focus style path in the iced 0.13 fork (`button::Status` has
+// no Focused variant), so the engaged/pressed control IS the "active item" the
+// ring marks (MOTION-FEEDBACK-2: selection animates the accent).
+//
+// Reduce-motion (Q32): the STATE change is kept (the hover/press color tokens
+// still swap; the accent ring is still present, at full) but the MOVEMENT is
+// dropped (the elevation shadow never rises/falls).
+// ---------------------------------------------------------------------------
+
+/// Scale a base background's RGB by `factor` (>1 brightens for hover, <1 darkens
+/// for press), preserving alpha. The color swap is the reduce-motion-safe state
+/// cue — applied with or without motion.
+fn tint(base: Color, factor: f32) -> Color {
+    Color {
+        r: (base.r * factor).clamp(0.0, 1.0),
+        g: (base.g * factor).clamp(0.0, 1.0),
+        b: (base.b * factor).clamp(0.0, 1.0),
+        a: base.a,
+    }
+}
+
+/// MOTION-FEEDBACK — the palette tokens + tunables one Overview control feeds the
+/// shared feedback styler. Grouping them keeps [`feedback_button_style`] to a
+/// single descriptor argument (and single-sources each control's colors §4).
+#[derive(Clone, Copy)]
+struct FeedbackStyle {
+    /// Resting background fill (a `palette.raised`-derived token).
+    bg: Color,
+    /// Resting border color (a `palette.border`-derived token).
+    border: Color,
+    /// Label text color.
+    text_color: Color,
+    /// The accent the animated press ring blends toward (`palette.accent`).
+    accent: Color,
+    /// Corner radius (px) — matches the control's resting radius.
+    radius: f32,
+    /// Hover brighten factor (e.g. `1.1`); press darkens by the same delta.
+    hover_factor: f32,
+}
+
+/// MOTION-FEEDBACK — translate the shared feedback vocabulary into a render-time
+/// `button::Style` for one Overview control. `status` is iced's hit-test state;
+/// `now`/`reduce_motion` resolve the motion; `s` carries the palette tokens that
+/// single-source the colors (§4 — the elevation comes from the `shadows` tokens,
+/// the accent ring from `palette.accent`).
+fn feedback_button_style(
+    status: cosmic::iced::widget::button::Status,
+    s: FeedbackStyle,
+    now: Instant,
+    reduce_motion: bool,
+) -> cosmic::iced::widget::button::Style {
+    use cosmic::iced::widget::button::Status as BtnStatus;
+    let FeedbackStyle {
+        bg,
+        border,
+        text_color,
+        accent,
+        radius,
+        hover_factor,
+    } = s;
+
+    // iced's discrete hit-test status is the render-time truth: Hovered = pointer
+    // over, Pressed = pointer down (fires on the DOWN edge, no input delay).
+    let pressed = matches!(status, BtnStatus::Pressed);
+    let hovered = matches!(status, BtnStatus::Hovered) || pressed;
+
+    // Drive the shared vocabulary so the reduce-motion contract + the animated
+    // accent ring resolve from ONE place. This is a render-time consumer (no panel
+    // tick re-renders), so each render shows the SETTLED endpoint of the state: we
+    // backdate an active state's `since` past its tween so it reads fully lifted /
+    // fully ringed at `now`; an inactive state keeps `ControlFeedback::new()`'s
+    // settled backdate so it is exactly at rest. The vocabulary still owns the one
+    // thing that varies with `reduce_motion`: whether the elevation may move
+    // (`is_at_rest`) and whether the ring animates or snaps.
+    let settled = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
+    let mut fb = ControlFeedback::new();
+    if hovered {
+        fb = fb.hovered(true, settled);
+    }
+    // The pressed control is the engaged/active item; with no keyboard-focus style
+    // path on these buttons, the accent ring marks the active item via the
+    // feedback module's focus-ring helper (MOTION-FEEDBACK-2).
+    if pressed {
+        fb = fb.focused(true, settled);
+    }
+    let geom: FeedbackParams = fb.params(now, reduce_motion);
+    let ring = fb.focus_ring(now, reduce_motion);
+
+    // Background tint: hover brightens (rises), press darkens (sinks). The color
+    // swap is the reduce-motion-safe cue, so it keys off the discrete status, not
+    // the (motion-gated) geometry.
+    let fill = if pressed {
+        tint(bg, (2.0 - hover_factor).max(0.0)) // darken by the hover delta
+    } else if hovered {
+        tint(bg, hover_factor)
+    } else {
+        bg
+    };
+
+    // Elevation conveys hover-lift / press-depress. `geom.is_at_rest()` is the
+    // vocabulary's reduce-motion gate: true under reduce-motion (movement dropped
+    // ⇒ shadow stays flat) OR when genuinely at rest. With motion on, a HOVERED
+    // (not pressed) control rises to the raised ambient shadow; a PRESSED control
+    // sinks — its elevation collapses to flat (losing the shadow is the depress).
+    let shadow = if hovered && !pressed && !geom.is_at_rest() {
+        let raised = mde_theme::shadows::Shadow::raised();
+        Shadow {
+            color: raised.color.into_cosmic_color(),
+            offset: Vector::new(raised.offset_x, raised.offset_y),
+            blur_radius: raised.blur,
+        }
+    } else {
+        // Rest, pressed (sunk), or reduce-motion: flat, no elevation.
+        cosmic::iced::Shadow::default()
+    };
+
+    // Animated accent ring on the engaged control: the border blends base→accent
+    // by the ring alpha (grows in with motion, snaps full under reduce-motion).
+    // Alpha is carried from the resting border token so a translucent border isn't
+    // forced opaque on press.
+    let (border_color, border_width) = if ring.is_visible() {
+        let a = ring.alpha.clamp(0.0, 1.0);
+        let blended = Color {
+            r: border.r + (accent.r - border.r) * a,
+            g: border.g + (accent.g - border.g) * a,
+            b: border.b + (accent.b - border.b) * a,
+            a: border.a + (accent.a - border.a) * a,
+        };
+        (blended, 1.0 + ring.width)
+    } else {
+        (border, 1.0)
+    };
+
+    cosmic::iced::widget::button::Style {
+        snap: false,
+        background: Some(Background::Color(fill)),
+        text_color,
+        icon_color: None,
+        border: Border {
+            color: border_color,
+            width: border_width,
+            radius: radius.into(),
+        },
+        border_color,
+        border_width,
+        border_radius: radius.into(),
+        shadow,
+    }
+}
+
 fn icon_widget<'a>(icon: Icon, size: IconSize, color: Color) -> Element<'a, crate::Message, Theme> {
     let resolved = mde_icon(icon, size);
     if let Some(svg_bytes) = resolved.svg_bytes() {
@@ -1864,31 +2046,22 @@ fn jump_button<'a>(
     let bg = palette.raised.into_cosmic_color();
     let border = palette.border.into_cosmic_color();
     let text_color = palette.text.into_cosmic_color();
+    let accent = palette.accent.into_cosmic_color();
+    let reduce_motion = crate::live_theme::reduce_motion();
     let style = move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
-        let hover_bg = Color {
-            r: bg.r * 1.12,
-            g: bg.g * 1.12,
-            b: bg.b * 1.12,
-            a: bg.a,
-        };
-        cosmic::iced::widget::button::Style {
-            snap: false,
-            background: Some(Background::Color(match status {
-                cosmic::iced::widget::button::Status::Hovered => hover_bg,
-                _ => bg,
-            })),
-            text_color,
-            icon_color: None,
-            border: Border {
-                color: border,
-                width: 1.0,
-                radius: 6.0.into(),
+        feedback_button_style(
+            status,
+            FeedbackStyle {
+                bg,
+                border,
+                text_color,
+                accent,
+                radius: 6.0,
+                hover_factor: 1.12,
             },
-            border_color: border,
-            border_width: 1.0,
-            border_radius: 6.0.into(),
-            shadow: cosmic::iced::Shadow::default(),
-        }
+            Instant::now(),
+            reduce_motion,
+        )
     };
 
     if let Some((group, panel)) = row_data.jump {
@@ -1912,34 +2085,25 @@ fn refresh_button<'a>(palette: Palette) -> Element<'a, crate::Message, Theme> {
     let bg = palette.raised.into_cosmic_color();
     let border = palette.border.into_cosmic_color();
     let text_color = palette.text.into_cosmic_color();
+    let accent = palette.accent.into_cosmic_color();
+    let reduce_motion = crate::live_theme::reduce_motion();
     button(text("Refresh").size(12))
         .padding(Padding::from([4u16, 12u16]))
         .sty(
             move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
-                let hover_bg = Color {
-                    r: bg.r * 1.12,
-                    g: bg.g * 1.12,
-                    b: bg.b * 1.12,
-                    a: bg.a,
-                };
-                cosmic::iced::widget::button::Style {
-                    snap: false,
-                    background: Some(Background::Color(match status {
-                        cosmic::iced::widget::button::Status::Hovered => hover_bg,
-                        _ => bg,
-                    })),
-                    text_color,
-                    icon_color: None,
-                    border: Border {
-                        color: border,
-                        width: 1.0,
-                        radius: 6.0.into(),
+                feedback_button_style(
+                    status,
+                    FeedbackStyle {
+                        bg,
+                        border,
+                        text_color,
+                        accent,
+                        radius: 6.0,
+                        hover_factor: 1.12,
                     },
-                    border_color: border,
-                    border_width: 1.0,
-                    border_radius: 6.0.into(),
-                    shadow: cosmic::iced::Shadow::default(),
-                }
+                    Instant::now(),
+                    reduce_motion,
+                )
             },
         )
         .on_press(crate::Message::Home(Message::RefreshClicked))
@@ -2020,35 +2184,26 @@ fn stat_card<'a>(
     let bg = palette.raised.into_cosmic_color();
     let border = palette.border.into_cosmic_color();
     let muted_text = palette.text_muted.into_cosmic_color();
+    let accent = palette.accent.into_cosmic_color();
+    let reduce_motion = crate::live_theme::reduce_motion();
     button(card)
         .width(Length::Fill)
         .padding(Padding::from([16u16, 16u16]))
         .sty(
             move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
-                let hover_bg = Color {
-                    r: bg.r * 1.08,
-                    g: bg.g * 1.08,
-                    b: bg.b * 1.08,
-                    a: bg.a,
-                };
-                cosmic::iced::widget::button::Style {
-                    snap: false,
-                    background: Some(Background::Color(match status {
-                        cosmic::iced::widget::button::Status::Hovered => hover_bg,
-                        _ => bg,
-                    })),
-                    text_color: muted_text,
-                    icon_color: None,
-                    border: Border {
-                        color: border,
-                        width: 1.0,
-                        radius: 8.0.into(),
+                feedback_button_style(
+                    status,
+                    FeedbackStyle {
+                        bg,
+                        border,
+                        text_color: muted_text,
+                        accent,
+                        radius: 8.0,
+                        hover_factor: 1.08,
                     },
-                    border_color: border,
-                    border_width: 1.0,
-                    border_radius: 8.0.into(),
-                    shadow: cosmic::iced::Shadow::default(),
-                }
+                    Instant::now(),
+                    reduce_motion,
+                )
             },
         )
         .on_press(crate::Message::SelectPanel {
@@ -2778,6 +2933,111 @@ mod tests {
         });
         assert_eq!(panel.snapshot.capabilities, rows);
         assert!(panel.snapshot.mackesd_reachable);
+    }
+
+    #[test]
+    fn feedback_button_style_lifts_on_hover_and_sinks_on_press() {
+        // MOTION-FEEDBACK-1/2 — the shared control feedback maps iced's discrete
+        // hit-test status onto hover-lift + press-depress + animated accent.
+        use cosmic::iced::widget::button::Status as BtnStatus;
+        let now = Instant::now();
+        let bg = Color::from_rgb(0.2, 0.2, 0.2);
+        let border = Color::from_rgb(0.4, 0.4, 0.4);
+        let fg = Color::WHITE;
+        let accent = Color::from_rgb(0.2, 0.4, 1.0);
+        let style = FeedbackStyle {
+            bg,
+            border,
+            text_color: fg,
+            accent,
+            radius: 6.0,
+            hover_factor: 1.1,
+        };
+        let mk = |status, reduce| feedback_button_style(status, style, now, reduce);
+
+        // At rest: flat (no elevation), base border, base fill.
+        let rest = mk(BtnStatus::Active, false);
+        assert_eq!(rest.shadow.offset, Vector::new(0.0, 0.0));
+        assert!((rest.border.width - 1.0).abs() < 1e-6, "no ring at rest");
+
+        // Hovered (full motion): raised elevation shadow + brighter fill. The
+        // shadow color is the `shadows::raised()` token (its real alpha), not a
+        // hardcoded literal (§4).
+        let hov = mk(BtnStatus::Hovered, false);
+        assert!(hov.shadow.offset.y > 0.0, "hover lifts → ambient shadow");
+        let raised = mde_theme::shadows::Shadow::raised();
+        assert!(
+            (hov.shadow.color.a - raised.color.a).abs() < 1e-6,
+            "hover shadow uses the raised token alpha"
+        );
+        if let Some(Background::Color(c)) = hov.background {
+            assert!(c.r > bg.r, "hover brightens the tint");
+        } else {
+            panic!("expected a solid hover fill");
+        }
+
+        // Pressed: the surface SINKS — the elevation collapses to flat (losing the
+        // shadow is the depress cue, NOT a bigger shadow), the fill darkens, and
+        // the animated accent ring grows onto the border (engaged/active item).
+        let pressed = mk(BtnStatus::Pressed, false);
+        assert_eq!(
+            pressed.shadow.offset,
+            Vector::new(0.0, 0.0),
+            "press sinks → elevation collapses to flat (no raised shadow)"
+        );
+        if let Some(Background::Color(c)) = pressed.background {
+            assert!(c.r < bg.r, "press darkens the tint (sinks)");
+        } else {
+            panic!("expected a solid press fill");
+        }
+        assert!(
+            pressed.border.width >= 1.0 && pressed.border.color.b > border.b,
+            "press grows an accent ring (border blends toward accent)"
+        );
+    }
+
+    #[test]
+    fn feedback_button_style_reduce_motion_keeps_state_drops_movement() {
+        // Q32: under reduce-motion the STATE change is kept (color tokens swap,
+        // the accent ring is present at full) but the MOVEMENT is dropped (the
+        // elevation shadow never lifts).
+        use cosmic::iced::widget::button::Status as BtnStatus;
+        let now = Instant::now();
+        let bg = Color::from_rgb(0.2, 0.2, 0.2);
+        let border = Color::from_rgb(0.4, 0.4, 0.4);
+        let accent = Color::from_rgb(0.2, 0.4, 1.0);
+        let style = FeedbackStyle {
+            bg,
+            border,
+            text_color: Color::WHITE,
+            accent,
+            radius: 6.0,
+            hover_factor: 1.1,
+        };
+
+        // Hover under reduce-motion: brighter fill (state kept) but NO elevation.
+        let hov = feedback_button_style(BtnStatus::Hovered, style, now, true);
+        assert_eq!(
+            hov.shadow.offset,
+            Vector::new(0.0, 0.0),
+            "no lift movement under reduce-motion"
+        );
+        if let Some(Background::Color(c)) = hov.background {
+            assert!(c.r > bg.r, "hover color state is still kept");
+        }
+
+        // Press under reduce-motion: accent ring present at FULL width immediately
+        // (snaps, doesn't grow) — state kept, animation dropped.
+        let pressed = feedback_button_style(BtnStatus::Pressed, style, now, true);
+        assert_eq!(
+            pressed.shadow.offset,
+            Vector::new(0.0, 0.0),
+            "no depress movement under reduce-motion"
+        );
+        assert!(
+            pressed.border.color.b > border.b,
+            "accent ring present (full) under reduce-motion"
+        );
     }
 
     #[test]
