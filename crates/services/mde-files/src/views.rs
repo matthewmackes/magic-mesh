@@ -224,9 +224,11 @@ pub fn sidebar<'a>(
 
     // AF-mesh.2 — Mesh Home entry. Routes to the XDG-dir card
     // grid; the shared XDG dirs are first-class mesh resources
-    // on the LizardFS mesh store, not local.
+    // on the LizardFS mesh store, not local. ICON-MESH — it's a
+    // network file service, so it takes the `folder-remote`-style
+    // network icon, not the plain local-folder one.
     mesh_col = mesh_col.push(side_row(
-        icons::FOLDER,
+        icons::FOLDER_REMOTE,
         "Mesh Home",
         None,
         Some(MESH_HOME_DIRS.len().to_string()),
@@ -1400,7 +1402,9 @@ pub fn mesh_home_child<'a>(
         format!("Mesh Home · {label}/{sub}")
     };
     let banner_widget = banner(
-        icons::FOLDER,
+        // ICON-MESH — this is the mesh-storage (QNM-Shared) plane, not a local
+        // folder, so the header takes the `folder-remote`-style network icon.
+        icons::FOLDER_REMOTE,
         banner_title,
         banner_subtitle,
         vec![BannerStat::new(count.to_string(), "Items")],
