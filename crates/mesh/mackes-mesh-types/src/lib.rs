@@ -43,6 +43,9 @@ pub mod route_trace;
 pub mod tags;
 /// VPN-GW-1 — the VPN tunnel definition model + pure wg-quick/openvpn helpers.
 pub mod vpn;
+/// VPN-GW-5 — first-class provider adapters (Mullvad/Proton/IVPN/Nord/Surfshark)
+/// + the generic "paste WG config" / "import .ovpn" config-generation paths.
+pub mod vpn_providers;
 
 pub use connect::{BatterySnapshot, ConnectFacts, PairingState, PeerKind};
 pub use nebula::{NebulaFacts, NebulaRole};
