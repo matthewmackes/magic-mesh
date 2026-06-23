@@ -404,6 +404,7 @@ assets = [
     # /mnt/mesh-storage dir full-mesh (overlay-only, discovery off, trash-can
     # versioning); device IDs wired from the etcd /mesh/syncthing/<host> registry.
     { source = "install-helpers/setup-syncthing.sh",     dest = "/usr/libexec/mackesd/setup-syncthing",         mode = "755" },
+    { source = "install-helpers/syncthing-reconcile.sh", dest = "/usr/libexec/mackesd/syncthing-reconcile",     mode = "755" },
     { source = "packaging/systemd/syncthing.service",    dest = "/etc/systemd/system/syncthing.service",        mode = "644" },
     # CONNECT-4 — install Caddy + wire `import Caddyfile.d/*.caddy` on the ingress
     # lighthouse; the connect_firewall worker renders mcnf-ingress.caddy into it.
