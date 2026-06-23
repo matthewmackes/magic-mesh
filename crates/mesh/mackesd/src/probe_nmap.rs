@@ -456,6 +456,23 @@ pub const DEFAULT_EXCLUDE_IFACE_PREFIXES: &[&str] = &[
 /// `probe-targets.toml`.
 pub const MIN_LAN_SCAN_PREFIX: u8 = 22;
 
+/// SVC-VIEW-2 — known LAN service hosts the probe always scans as
+/// single IPs, regardless of the [`MIN_LAN_SCAN_PREFIX`] auto-scan cap.
+///
+/// The auto-scan of a detected LAN is skipped when the prefix is wider
+/// than `/22` (e.g. the `172.20.0.0/16` lab LAN — enumerating it would
+/// hang the probe cycle), so service hosts on that LAN never get
+/// scanned and their open ports (e.g. the Airsonic web UI on
+/// `172.20.0.2:4040`) never reach `probe-inventory.json`. Listing those
+/// hosts as individual targets gets them scanned cheaply without
+/// re-enabling the oversized full-range scan. Operators can add more via
+/// `probe-targets.toml`; these are the built-in defaults so the feature
+/// works out of the box.
+pub const KNOWN_LAN_SERVICE_HOSTS: &[&str] = &[
+    // Airsonic / Subsonic media server (SVC-VIEW-2).
+    "172.20.0.2",
+];
+
 /// Config file (under `~/.config/mde/`) of operator-arbitrary scan
 /// targets — TOML `targets = ["host", "cidr", ...]`.
 pub const ARBITRARY_TARGETS_FILE: &str = "probe-targets.toml";
@@ -600,7 +617,17 @@ pub fn resolve_targets(workgroup_root: &Path, home: &Path) -> TargetSet {
     let mesh = mesh_targets(workgroup_root);
     let lan = detect_lan_cidrs();
     let cfg = home.join(".config").join("mde");
-    let arbitrary = read_toml_string_list(&cfg.join(ARBITRARY_TARGETS_FILE), "targets");
+    // SVC-VIEW-2 — known single-IP LAN service hosts (e.g. Airsonic on
+    // 172.20.0.2) are always scanned, ahead of operator-arbitrary
+    // targets; `merge_targets` dedupes, so an overlap is harmless.
+    let mut arbitrary: Vec<String> = KNOWN_LAN_SERVICE_HOSTS
+        .iter()
+        .map(|h| (*h).to_owned())
+        .collect();
+    arbitrary.extend(read_toml_string_list(
+        &cfg.join(ARBITRARY_TARGETS_FILE),
+        "targets",
+    ));
     let excludes = read_toml_string_list(&cfg.join(DO_NOT_SCAN_FILE), "exclude");
     TargetSet {
         targets: merge_targets(&mesh, &lan, &arbitrary),
@@ -1184,6 +1211,38 @@ mod tests {
             ts.excludes,
             vec!["10.42.0.99".to_string()],
             "do-not-scan loaded"
+        );
+        // SVC-VIEW-2 — built-in known LAN service host(s) are always in
+        // scope, even with no operator probe-targets.toml entry.
+        for host in KNOWN_LAN_SERVICE_HOSTS {
+            assert!(
+                ts.targets.contains(&(*host).to_string()),
+                "known LAN service host {host} included by default"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_targets_includes_known_hosts_without_arbitrary_config() {
+        // SVC-VIEW-2 — with no probe-targets.toml at all, the Airsonic
+        // host (172.20.0.2) is still scanned so its open ports surface.
+        // Hermetic: empty mesh + no operator config; `detect_lan_cidrs`
+        // emits network-CIDR strings (e.g. "172.20.0.0/22"), never a
+        // bare host IP, so a `172.20.0.2` target can ONLY come from the
+        // built-in `KNOWN_LAN_SERVICE_HOSTS` constant.
+        let root = tmp_root("resolve-known");
+        let qnm = root.join("qnm");
+        std::fs::create_dir_all(&qnm).unwrap();
+        let home = root.join("home"); // no .config/mde — nothing seeded
+        let ts = resolve_targets(&qnm, &home);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            ts.targets.contains(&"172.20.0.2".to_string()),
+            "Airsonic host scanned even with no operator config"
+        );
+        assert!(
+            KNOWN_LAN_SERVICE_HOSTS.contains(&"172.20.0.2"),
+            "Airsonic host is a built-in known LAN service host"
         );
     }
 }
