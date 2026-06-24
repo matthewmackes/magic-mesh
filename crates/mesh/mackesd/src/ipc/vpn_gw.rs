@@ -7,6 +7,12 @@
 //! VPN-GW-3; here `tunnel-up` spawns `wg-quick`/`openvpn` and reports the result,
 //! so it works once the config is present + is honest ("config missing") when not.
 //!
+//! VPN-GW-3 — selective egress: after a successful tunnel-up [`bring`] applies
+//! the [`EgressPlan`] (fwmark/ip-rule policy routing + an nftables masquerade,
+//! Nebula overlay carved out so mesh never tunnels) and clears the kill-switch;
+//! on tunnel-down — and on the down/failure path — it installs the kill-switch
+//! drop (leak-proof) and tears the egress rules back down.
+//!
 //! Same dedicated-OS-thread shape as the Connect/Route responders.
 
 use std::collections::HashMap;
@@ -18,6 +24,7 @@ use mde_bus::rpc::reply_topic;
 use serde_json::json;
 
 use mackes_mesh_types::vpn::{self, Method, TunnelDef};
+use mackes_mesh_types::vpn_egress::EgressPlan;
 use mackes_mesh_types::vpn_providers::{
     self, AdapterError, ProducedTunnel, Provider, SecretKind, WgSetup,
 };
@@ -131,9 +138,14 @@ pub fn build_reply(svc: &VpnService, verb: &str, req_body: Option<&str>) -> Stri
             if !cfg.remove(id) {
                 return err(format!("remove-tunnel: no such tunnel '{id}'"));
             }
-            // Best-effort: bring it down before forgetting it.
+            // Best-effort: bring it down, then clear its WHOLE egress footprint
+            // (rules + kill-switch) so a forgotten tunnel leaves no orphan DROP
+            // pinned to a mark that a surviving tunnel could later be assigned.
             if let Some(t) = vpn::load(root).get(id) {
                 let _ = bring(svc, t, false);
+                if svc.spawn {
+                    forget_egress(&egress_plan(svc, t));
+                }
             }
             match vpn::save(root, &cfg) {
                 Ok(_) => json!({ "ok": true }).to_string(),
@@ -203,11 +215,89 @@ fn bring(svc: &VpnService, t: &TunnelDef, up: bool) -> (bool, String) {
         }
     };
     let (cmd, rest) = argv.split_first().expect("argv non-empty");
-    match std::process::Command::new(cmd).args(rest).status() {
+    let tool = match std::process::Command::new(cmd).args(rest).status() {
         Ok(s) if s.success() => (true, format!("{} {}", cmd, if up { "up" } else { "down" })),
         Ok(s) => (false, format!("{cmd} exited {:?}", s.code())),
         Err(e) => (false, format!("{cmd} not run: {e}")),
+    };
+
+    // VPN-GW-3 — selective egress (policy-routing + NAT + kill-switch). Tie the
+    // egress rules to the tunnel's lifecycle: a clean up installs the fwmark /
+    // ip-rule / masquerade and clears the kill-switch; a down — or a failed
+    // up — installs the kill-switch DROP first (leak-proof on flap) and then
+    // tears the egress rules down. The overlay subnet is carved out in every
+    // case so mesh traffic never tunnels (design §-risk).
+    let plan = egress_plan(svc, t);
+    let (tool_ok, detail) = tool;
+    if up && tool_ok {
+        // Tunnel is up: route + NAT the marked traffic out it, then drop the
+        // kill-switch so the (now-routable) egress can flow.
+        apply_egress(&plan);
+    } else {
+        // Down, or a failed bring-up: block first (no WAN leak), then unwind.
+        engage_kill_switch(&plan);
     }
+    // The reported detail stays the tool's own up/down message; the egress
+    // rules are best-effort glue layered on top.
+    (tool_ok, detail)
+}
+
+/// The selective-egress plan for `t`, keyed on its **interface name** so the
+/// `fwmark`/routing-table numbers are a stable, distinct-per-tunnel function of
+/// the tunnel — not its mutable position in the config. A positional slot would
+/// silently remap a live tunnel's mark (and orphan its kill-switch onto another
+/// tunnel's mark) whenever a sibling is added or removed; the id-derived slot
+/// guarantees the teardown argv always reclaim exactly what the matching
+/// bring-up installed. `svc` is unused now but kept so the signature stays the
+/// `(svc, t)` shape the responder threads.
+fn egress_plan(_svc: &VpnService, t: &TunnelDef) -> EgressPlan {
+    EgressPlan::for_ifname_on_default_overlay(&t.ifname())
+}
+
+/// Run a batch of argv (one command per inner vec), best-effort. Each command's
+/// failure is logged but never aborts the batch — the rules are independent and
+/// a partially-present prior state must still converge. `nft`/`ip` not on PATH
+/// (a dev box without the tools) is logged, not fatal.
+fn run_argv_batch(label: &str, batch: &[Vec<String>]) {
+    for cmd in batch {
+        let Some((bin, rest)) = cmd.split_first() else {
+            continue;
+        };
+        match std::process::Command::new(bin).args(rest).status() {
+            Ok(s) if s.success() => {}
+            Ok(s) => tracing::debug!(label, cmd = ?cmd, code = ?s.code(), "egress argv non-zero"),
+            Err(e) => tracing::debug!(label, cmd = ?cmd, error = %e, "egress argv not run"),
+        }
+    }
+}
+
+/// Install the selective-egress rules for an up tunnel, then clear the
+/// kill-switch so the now-routable marked traffic can flow.
+fn apply_egress(plan: &EgressPlan) {
+    // Re-applying over a stale state can leave duplicate rules; tear down any
+    // prior egress for this tunnel first so `up` is idempotent on a re-up.
+    run_argv_batch("egress-reset", &plan.down_argv());
+    run_argv_batch("egress-up", &plan.up_argv());
+    run_argv_batch("kill-switch-clear", &plan.kill_switch_clear_argv());
+}
+
+/// Engage the kill-switch (DROP the marked egress — no WAN leak) and tear the
+/// egress routing/NAT rules down. Used on tunnel-down and on a failed bring-up.
+/// Ordering is leak-proof: the DROP is installed *before* the egress rules are
+/// removed, so there is never a window where marked traffic can escape direct.
+fn engage_kill_switch(plan: &EgressPlan) {
+    run_argv_batch("kill-switch", &plan.kill_switch_argv());
+    run_argv_batch("egress-down", &plan.down_argv());
+}
+
+/// Remove ALL of this tunnel's egress footprint — the routing/NAT rules AND the
+/// kill-switch DROP — when the tunnel is being forgotten (`remove-tunnel`).
+/// Unlike [`engage_kill_switch`], this clears the kill-switch too: a deleted
+/// tunnel must leave no orphan DROP behind (its mark is no longer protected, and
+/// a lingering DROP rule is dead state on the box).
+fn forget_egress(plan: &EgressPlan) {
+    run_argv_batch("egress-forget", &plan.down_argv());
+    run_argv_batch("kill-switch-forget", &plan.kill_switch_clear_argv());
 }
 
 /// The first-class providers + the two generic paths, with the per-provider
@@ -499,6 +589,89 @@ mod tests {
         let (_t, s) = svc();
         assert!(build_reply(&s, "bogus", None).contains("unknown vpn verb"));
         assert!(build_reply(&s, "tunnel-up", None).contains("missing tunnel id"));
+    }
+
+    // ── VPN-GW-3: selective egress wired to the tunnel lifecycle ──
+
+    #[test]
+    fn egress_plan_mark_is_iface_stable_not_config_position() {
+        let (_t, s) = svc();
+        let _ = add(&s, "first", "wg");
+        let _ = add(&s, "second", "wg");
+        let cfg = vpn::load(s.workgroup_root.as_path());
+        let p_first = egress_plan(&s, cfg.get("first").unwrap());
+        let p_second = egress_plan(&s, cfg.get("second").unwrap());
+        // Each tunnel gets its own interface, fwmark, and routing table.
+        assert_eq!(p_first.ifname, "mvpn-first");
+        assert_eq!(p_second.ifname, "mvpn-second");
+        assert_ne!(p_first.fwmark, p_second.fwmark, "tunnels must not share a mark");
+        assert_ne!(p_first.table, p_second.table, "tunnels must not share a table");
+
+        // The mark is a function of the interface, NOT the config position:
+        // remove the FIRST tunnel (so "second" shifts from index 1 → 0) and
+        // "second"'s mark must be unchanged. A positional slot would have
+        // remapped it (and orphaned a kill-switch onto the old mark).
+        let _ = build_reply(&s, "remove-tunnel", Some("first"));
+        let cfg2 = vpn::load(s.workgroup_root.as_path());
+        let p_second_after = egress_plan(&s, cfg2.get("second").unwrap());
+        assert_eq!(
+            p_second.fwmark, p_second_after.fwmark,
+            "a sibling removal must not remap a surviving tunnel's mark"
+        );
+    }
+
+    #[test]
+    fn egress_plan_carves_out_the_nebula_overlay_so_mesh_never_tunnels() {
+        let (_t, s) = svc();
+        let _ = add(&s, "mullvad1", "wg");
+        let cfg = vpn::load(s.workgroup_root.as_path());
+        let p = egress_plan(&s, cfg.get("mullvad1").unwrap());
+        // The default mesh overlay is carved out in both the up path and the
+        // kill-switch (mesh traffic is direct, never dropped/tunneled).
+        let overlay = mackes_mesh_types::vpn_egress::DEFAULT_OVERLAY_CIDR.to_string();
+        assert_eq!(p.overlay_cidr, overlay);
+        assert!(p.up_argv().iter().any(|c| c.contains(&overlay)));
+        assert!(p.kill_switch_argv().iter().any(|c| c.contains(&overlay)));
+        // The masquerade names the tunnel's real interface.
+        assert!(p
+            .up_argv()
+            .iter()
+            .any(|c| c.contains(&"masquerade".to_string())
+                && c.contains(&"\"mvpn-mullvad1\"".to_string())));
+    }
+
+    #[test]
+    fn egress_lifecycle_argv_is_complete_and_self_consistent() {
+        // The lifecycle argv (applied by `bring` on a real up/down) must cover
+        // the four pieces VPN-GW-3 locks: a route table, an fwmark ip-rule, an
+        // nft masquerade, and a kill-switch drop — all on this tunnel's iface.
+        // (We assert the argv here rather than spawn `ip`/`nft`, which would
+        // mutate the host's real routing; the spawn path is `bring`, gated on
+        // `svc.spawn` and reached at runtime by the responder.)
+        let (_t, s) = svc();
+        let _ = add(&s, "k", "wg");
+        let cfg = vpn::load(s.workgroup_root.as_path());
+        let p = egress_plan(&s, cfg.get("k").unwrap());
+        let up = p.up_argv();
+        assert!(up.iter().any(|c| c[0] == "ip" && c.contains(&"rule".to_string())));
+        assert!(up
+            .iter()
+            .any(|c| c[0] == "ip" && c.contains(&"route".to_string())));
+        assert!(up.iter().any(|c| c.contains(&"masquerade".to_string())));
+        assert!(p
+            .kill_switch_argv()
+            .iter()
+            .any(|c| c.contains(&"drop".to_string())));
+        // Down is the inverse: it deletes the nft table and the ip rules.
+        let down = p.down_argv();
+        assert!(down
+            .iter()
+            .any(|c| c[0] == "nft" && c.contains(&"delete".to_string())));
+        assert!(down
+            .iter()
+            .filter(|c| c[0] == "ip" && c.contains(&"del".to_string()))
+            .count()
+            >= 2);
     }
 
     // ── VPN-GW-5: provider adapters reachable from the vpn responder ──
