@@ -1340,17 +1340,25 @@ impl AppsApplet {
     /// content wrapper kept clamping it straight back to 360.
     ///
     /// Here we build the same bordered/elevated popup chrome entirely from
-    /// shared mde-theme tokens ([`Palette::raised`] surface + [`Palette::border`]
-    /// hairline + [`Radii::md`] corners + the [`Shadow::raised`] popover
-    /// elevation, §4 — no raw hex, no inline metric literals) and wrap it in an
-    /// `autosize` whose limits are the detected `menu_w × menu_h`. The content
-    /// can now fill the full width, and the
+    /// shared mde-theme tokens ([`Palette::background`] base layer +
+    /// [`Palette::border`] hairline + [`Radii::md`] corners + the
+    /// [`Shadow::raised`] popover elevation, §4 — no raw hex, no inline metric
+    /// literals) and wrap it in an `autosize` whose limits are the detected
+    /// `menu_w × menu_h`. The content can now fill the full width, and the
     /// reactive resize tracks `menu_w × menu_h` — matching the positioner the
     /// open handler set. The right-click power menu still uses `popup_container`
     /// (its 360px width is correct), so this is scoped to the launcher only.
+    ///
+    /// APPS-STYLE-3 (operator 2026-06-24) — the chrome background reads
+    /// [`Palette::background`] (the Carbon base layer), the **same** token the
+    /// Notification Hub roots its popup on, so both popups share one design
+    /// language: the zebra rows ([`Palette::surface`] / [`Palette::background`])
+    /// now sit on the identical base, instead of floating the whole menu on the
+    /// lighter Layer-02 [`Palette::raised`] surface (which made the Start Menu
+    /// read two ramp steps lighter than the Hub).
     fn launcher_surface(&self) -> Element<'_, Message> {
         let p = self.palette;
-        let bg = carbon(p.raised);
+        let bg = carbon(p.background);
         let border_c = carbon(p.border);
         // §4 — the popover chrome reads its metrics from the shared mde-theme
         // tokens, not inline literals: the raised-surface drop shadow
