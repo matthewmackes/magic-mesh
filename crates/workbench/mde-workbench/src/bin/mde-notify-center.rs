@@ -288,8 +288,27 @@ impl Center {
 
 #[derive(Debug, Clone)]
 enum Message {
-    /// Periodic bus poll.
+    /// Periodic bus poll. NOTIFY-RENDER-LAG-1 — this arm now ONLY dispatches the
+    /// off-thread fetch Tasks (and merges the cheap local shared-alert tail); the
+    /// blocking bus round-trips run on `spawn_blocking` workers and land back as
+    /// the `*Loaded` variants below, so the layer surface maps + paints its chrome
+    /// immediately instead of waiting on the ~5.3 s cumulative timeout budget.
     Refresh,
+    /// NOTIFY-RENDER-LAG-1 — the Now-Playing snapshot finished loading off-thread.
+    MusicLoaded(Option<MusicNow>),
+    /// NOTIFY-RENDER-LAG-1 — the voice-agent snapshot finished loading off-thread.
+    VoiceLoaded(Option<VoiceStatus>),
+    /// NOTIFY-RENDER-LAG-1 — the clipboard history finished loading off-thread.
+    ClipsLoaded(Vec<ClipRow>),
+    /// NOTIFY-RENDER-LAG-1 — the live DND state finished loading off-thread.
+    /// `None` (no Bus data dir) leaves the current toggle unchanged.
+    DndLoaded(Option<bool>),
+    /// NOTIFY-RENDER-LAG-1 — the lighthouse footer beacons finished loading
+    /// off-thread.
+    LighthousesLoaded(Vec<Beacon>),
+    /// NOTIFY-RENDER-LAG-1 — cover art for `cover_id` finished decoding off-thread
+    /// (gated: only fetched AFTER `MusicLoaded`, never on the first frame).
+    CoverArtLoaded(String, Option<cosmic::iced::widget::image::Handle>),
     /// Collapse/expand a source group by its label.
     ToggleGroup(String),
     /// NOTIFY-HUB-2 — expand/collapse a same-source stack by its [`Stack::key`].
@@ -525,6 +544,92 @@ fn fetch_lighthouses() -> Vec<Beacon> {
     lighthouse::beacons(&peers, master.as_deref(), now, lighthouse::DEFAULT_STALE_MS)
 }
 
+/// AC-5 — read the live Do-Not-Disturb `active` flag. Split out as a named fn so
+/// the off-thread [`refresh_tasks`] dispatch can `spawn_blocking` it: the DND
+/// store lives on the GFS-replicated `mesh-home`, so (like the shared-alerts
+/// read, NOTIFY-UI-4) a wedged mount must never block the iced update loop.
+///
+/// `None` when there's no Bus data dir — the caller then leaves the live toggle
+/// UNCHANGED rather than force-clearing it (preserving the pre-NOTIFY-RENDER-LAG-1
+/// inline behavior, which only assigned `dnd_active` inside `if let Some(dir)`).
+fn fetch_dnd() -> Option<bool> {
+    let dir = mde_bus::client_data_dir()?;
+    Some(mde_bus::dnd::load_default(&dir).active)
+}
+
+/// NOTIFY-RENDER-LAG-1 — the off-thread fetch dispatch the `Refresh` arm fires.
+///
+/// Each blocking bus round-trip (`fetch_music`/`fetch_voice`/`fetch_clips`/
+/// `fetch_dnd`/`fetch_lighthouses`) runs on its own `spawn_blocking` worker and
+/// lands back as a `*Loaded` message; NONE of them block the iced UI/event-loop
+/// thread, so the layer surface maps + `view()` paints its chrome and empty/
+/// skeleton sections immediately, each filling when its `Loaded` arrives.
+/// Mirrors the PR #50 applet idiom (`load_task` + `fetch_apps`). Cover art is NOT
+/// dispatched here — it's gated behind `MusicLoaded` (point 4) so it never fires
+/// on the first frame.
+fn refresh_tasks() -> Task<Message> {
+    Task::batch([
+        Task::perform(
+            async {
+                tokio::task::spawn_blocking(fetch_music)
+                    .await
+                    .ok()
+                    .flatten()
+            },
+            Message::MusicLoaded,
+        ),
+        Task::perform(
+            async {
+                tokio::task::spawn_blocking(fetch_voice)
+                    .await
+                    .ok()
+                    .flatten()
+            },
+            Message::VoiceLoaded,
+        ),
+        Task::perform(
+            async {
+                tokio::task::spawn_blocking(fetch_clips)
+                    .await
+                    .unwrap_or_default()
+            },
+            Message::ClipsLoaded,
+        ),
+        Task::perform(
+            async { tokio::task::spawn_blocking(fetch_dnd).await.ok().flatten() },
+            Message::DndLoaded,
+        ),
+        Task::perform(
+            async {
+                tokio::task::spawn_blocking(fetch_lighthouses)
+                    .await
+                    .unwrap_or_default()
+            },
+            Message::LighthousesLoaded,
+        ),
+    ])
+}
+
+/// NOTIFY-RENDER-LAG-1 — dispatch the cover-art fetch+decode off-thread for
+/// `cover_id`, landing back as `CoverArtLoaded`. Fired ONLY from the
+/// `MusicLoaded` arm once the track's `coverArt` token is known (point 4), so the
+/// ~1.2 s art round-trip never gates the first frame.
+fn cover_art_task(cover_id: String) -> Task<Message> {
+    Task::perform(
+        async move {
+            let handle = tokio::task::spawn_blocking({
+                let id = cover_id.clone();
+                move || fetch_cover_art(&id)
+            })
+            .await
+            .ok()
+            .flatten();
+            (cover_id, handle)
+        },
+        |(id, handle)| Message::CoverArtLoaded(id, handle),
+    )
+}
+
 fn subscription(s: &Center) -> Subscription<Message> {
     let poll = cosmic::iced::time::every(std::time::Duration::from_secs(POLL_SECS))
         .map(|_| Message::Refresh);
@@ -637,28 +742,59 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
                     state.shared_rx = Some(rx);
                 }
             }
-            // NOTIFY-AC — refresh the Music + Voice section snapshots.
-            state.music = fetch_music();
-            state.voice = fetch_voice();
-            // CLIP-VIEW-1 — refresh the mesh-global clipboard history.
-            state.clips = fetch_clips();
-            // AC-5 — reflect the live DND state in the quick-toggle.
-            if let Some(dir) = mde_bus::client_data_dir() {
-                state.dnd_active = mde_bus::dnd::load_default(&dir).active;
-            }
-            // LIGHTHOUSE-3 — refresh the pinned lighthouse footer beacons.
-            state.lighthouses = fetch_lighthouses();
-            // MUSIC-HUB-2 — (re)fetch the cover art only when the track changes.
-            let cover = state.music.as_ref().and_then(|m| m.cover_art.clone());
-            if cover != state.now_art_id {
-                state.now_art = cover.as_deref().and_then(fetch_cover_art);
-                state.now_art_id = cover;
-            }
             // NOTIFY-HUB-2 — kick the slide-in + 2× severity blink for any rows
             // that just appeared (skipped on the first poll so opening the panel
-            // doesn't strobe the whole backlog).
+            // doesn't strobe the whole backlog). Driven by the cheap local tail
+            // merge above, so it stays in the synchronous part of the arm.
             state.note_new_items(std::time::Instant::now());
+            // NOTIFY-RENDER-LAG-1 — the Music / Voice / Clipboard / DND /
+            // Lighthouse snapshots are the slow part (each a blocking bus
+            // round-trip, up to ~5.3 s of cumulative timeout budget). Dispatch
+            // them off the UI thread as `Task::perform(spawn_blocking(...))`; each
+            // lands back as its `*Loaded` message and fills its section then. The
+            // layer surface therefore maps + paints immediately on the first
+            // Refresh instead of stalling on these fetches. Cover art is NOT
+            // dispatched here — it's gated behind `MusicLoaded` so it never fires
+            // on the first frame.
+            return refresh_tasks();
         }
+        Message::MusicLoaded(music) => {
+            state.music = music;
+            // MUSIC-HUB-2 / point 4 — (re)fetch the cover art only AFTER music is
+            // known and only when the track's coverArt token changed (so the
+            // ~1.2 s art round-trip never gates the first frame, and re-fetches
+            // only on a track change). A track with no art clears the thumbnail.
+            let cover = state.music.as_ref().and_then(|m| m.cover_art.clone());
+            if cover != state.now_art_id {
+                state.now_art_id = cover.clone();
+                match cover {
+                    Some(id) => {
+                        // Drop the stale art now so the placeholder shows until the
+                        // new art lands; the off-thread decode fills it back in.
+                        state.now_art = None;
+                        return cover_art_task(id);
+                    }
+                    None => state.now_art = None,
+                }
+            }
+        }
+        Message::CoverArtLoaded(id, handle) => {
+            // Apply only if this is still the current track's art (a fast track
+            // change could land an older fetch after a newer one was dispatched).
+            if state.now_art_id.as_deref() == Some(id.as_str()) {
+                state.now_art = handle;
+            }
+        }
+        Message::VoiceLoaded(voice) => state.voice = voice,
+        Message::ClipsLoaded(clips) => state.clips = clips,
+        // `None` = no Bus data dir → leave the live toggle as-is (the old inline
+        // read only assigned `dnd_active` when `client_data_dir()` was `Some`).
+        Message::DndLoaded(active) => {
+            if let Some(active) = active {
+                state.dnd_active = active;
+            }
+        }
+        Message::LighthousesLoaded(beacons) => state.lighthouses = beacons,
         Message::AnimTick => {
             // Drop finished entrances; the subscription self-stops once idle.
             state.anim.gc(std::time::Instant::now());
@@ -695,7 +831,6 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
             }
         }
         Message::MusicPrev | Message::MusicToggle | Message::MusicNext => {
-            use std::time::Duration;
             // Resume vs pause depends on the live state; default to resume.
             let verb = match message {
                 Message::MusicPrev => "action/music/prev",
@@ -708,9 +843,25 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
                     }
                 }
             };
-            let _ = mde_workbench::dbus::action_request(verb, Duration::from_millis(700));
-            // Reflect the new transport state immediately.
-            state.music = fetch_music();
+            // NOTIFY-RENDER-LAG-1 — the transport command + its follow-up
+            // get-state are blocking bus round-trips (~1.4 s worst case), so run
+            // them off the UI thread and reflect the new state via `MusicLoaded`
+            // (which also re-resolves the cover art). The button stays responsive.
+            return Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        let _ = mde_workbench::dbus::action_request(
+                            verb,
+                            std::time::Duration::from_millis(700),
+                        );
+                        fetch_music()
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                },
+                Message::MusicLoaded,
+            );
         }
         Message::ClipCopy(text) => {
             // CLIP-VIEW-1 — load the entry onto THIS node's clipboard. No re-list:
@@ -912,13 +1063,27 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
                 // its slide/blink motion.
                 for (i, stack) in collapse_stacks(&group).into_iter().enumerate() {
                     let expanded = state.expanded_stacks.contains(&stack.key);
-                    body = body.push(stack_card(&stack, expanded, i, now, anim_now, &state.anim, p));
+                    body = body.push(stack_card(
+                        &stack,
+                        expanded,
+                        i,
+                        now,
+                        anim_now,
+                        &state.anim,
+                        p,
+                    ));
                     // Expanded stack: show the individual repeats beneath the head
                     // (the head is items[0], so the rest start at index 1).
                     if expanded && stack.is_stacked() {
                         for (j, item) in stack.items.iter().enumerate().skip(1) {
-                            body =
-                                body.push(stack_child_row(item, i + j, now, anim_now, &state.anim, p));
+                            body = body.push(stack_child_row(
+                                item,
+                                i + j,
+                                now,
+                                anim_now,
+                                &state.anim,
+                                p,
+                            ));
                         }
                     }
                 }
@@ -1216,7 +1381,11 @@ fn clipboard_section(clips: &[ClipRow], now_ms: i64, p: Palette) -> Element<'sta
 /// "from <node> · <age>" sub-label) trailed by the pin + delete controls. Zebra
 /// shaded to match the notification rows' idiom.
 fn clip_row(c: &ClipRow, idx: usize, now_ms: i64, p: Palette) -> Element<'static, Message> {
-    let base = if idx % 2 == 1 { p.surface } else { p.background };
+    let base = if idx % 2 == 1 {
+        p.surface
+    } else {
+        p.background
+    };
     let preview = notify_clipboard::preview(&c.text, 44);
     // Age off the SAME format_age ladder as the notifications list: parse the
     // RFC3339 stamp → epoch-ms → format_age. An unparseable stamp falls back to
@@ -1229,9 +1398,7 @@ fn clip_row(c: &ClipRow, idx: usize, now_ms: i64, p: Palette) -> Element<'static
     // text, not the truncated preview).
     let body = column![
         text(preview).size(12).color(p.text.into_cosmic_color()),
-        text(meta)
-            .size(10)
-            .color(p.text_muted.into_cosmic_color()),
+        text(meta).size(10).color(p.text_muted.into_cosmic_color()),
     ]
     .spacing(1)
     .width(Length::Fill);
@@ -1250,20 +1417,28 @@ fn clip_row(c: &ClipRow, idx: usize, now_ms: i64, p: Palette) -> Element<'static
     } else {
         ("\u{2606}", p.text_muted) // ☆
     };
-    let pin_btn = button(text(pin_glyph).size(13).color(pin_color.into_cosmic_color()))
-        .padding(Padding::from([2u16, 6u16]))
-        .on_press(Message::ClipTogglePin(c.id.clone(), c.pinned))
-        .style(|_t, _s| cosmic::iced::widget::button::Style {
-            background: None,
-            ..Default::default()
-        });
-    let del_btn = button(text("\u{2715}").size(12).color(p.text_muted.into_cosmic_color())) // ✕
-        .padding(Padding::from([2u16, 6u16]))
-        .on_press(Message::ClipDelete(c.id.clone()))
-        .style(|_t, _s| cosmic::iced::widget::button::Style {
-            background: None,
-            ..Default::default()
-        });
+    let pin_btn = button(
+        text(pin_glyph)
+            .size(13)
+            .color(pin_color.into_cosmic_color()),
+    )
+    .padding(Padding::from([2u16, 6u16]))
+    .on_press(Message::ClipTogglePin(c.id.clone(), c.pinned))
+    .style(|_t, _s| cosmic::iced::widget::button::Style {
+        background: None,
+        ..Default::default()
+    });
+    let del_btn = button(
+        text("\u{2715}")
+            .size(12)
+            .color(p.text_muted.into_cosmic_color()),
+    ) // ✕
+    .padding(Padding::from([2u16, 6u16]))
+    .on_press(Message::ClipDelete(c.id.clone()))
+    .style(|_t, _s| cosmic::iced::widget::button::Style {
+        background: None,
+        ..Default::default()
+    });
 
     container(
         row![copy, pin_btn, del_btn]
@@ -1524,7 +1699,11 @@ fn motioned_card(
     p: Palette,
 ) -> Element<'static, Message> {
     // Zebra base layer (the Application Menu row idiom).
-    let base = if idx % 2 == 1 { p.surface } else { p.background };
+    let base = if idx % 2 == 1 {
+        p.surface
+    } else {
+        p.background
+    };
     // A settled card draws as the plain zebra row (no blink, no offset) — the
     // common case once nothing is entering.
     let (bg, left, top) = if motion.is_rest() {
@@ -1661,6 +1840,182 @@ mod tests {
             item("c", Source::Security, Severity::Warning, 3),
         ];
         assert_eq!(group_severity(&g), Severity::Critical);
+    }
+
+    /// NOTIFY-RENDER-LAG-1 — a non-default `MusicNow` sentinel the snapshot
+    /// fields are pre-seeded with so a test can prove `Refresh` does NOT overwrite
+    /// them inline (the old blocking-fetch behavior).
+    fn music_sentinel() -> MusicNow {
+        MusicNow {
+            active: true,
+            playing: true,
+            title: "SENTINEL".into(),
+            artist: "SENTINEL".into(),
+            audio_available: true,
+            needs_airsonic: false,
+            cover_art: None,
+        }
+    }
+
+    /// A minimal healthy beacon for the snapshot-section tests (`Beacon` has no
+    /// `Default`).
+    fn beacon_sentinel() -> Beacon {
+        Beacon {
+            hostname: "lh-sentinel".into(),
+            overlay_ip: None,
+            is_master: false,
+            status: lighthouse::BeaconStatus::Healthy,
+        }
+    }
+
+    /// NOTIFY-RENDER-LAG-1 — the core render-lag regression guard: the `Refresh`
+    /// arm must ONLY dispatch the off-thread fetch Tasks, never run the blocking
+    /// bus fetches inline. We prove this behaviorally: pre-seed every snapshot
+    /// section with a sentinel, run `Refresh`, and assert the sentinels survive.
+    /// With the old inline `state.music = fetch_music()` (etc.) chain, `Refresh`
+    /// would have clobbered each section with the fetch result (empty/default in
+    /// the test env, no Bus daemon); now those fields only change via the matching
+    /// `*Loaded` arm, so a `Refresh` leaves them untouched and the slow round-trips
+    /// are entirely off the UI thread.
+    #[test]
+    fn refresh_does_not_fetch_sections_inline() {
+        let mut state = Center::new();
+        state.music = Some(music_sentinel());
+        state.voice = Some(VoiceStatus {
+            registered: true,
+            listening: true,
+            detail: "SENTINEL".into(),
+            fresh: true,
+        });
+        state.clips = vec![ClipRow {
+            id: "sentinel".into(),
+            text: "SENTINEL".into(),
+            source: "node".into(),
+            time: String::new(),
+            pinned: false,
+        }];
+        state.lighthouses = vec![beacon_sentinel()];
+        state.dnd_active = true;
+        state.now_art_id = Some("sentinel-art".into());
+
+        let _task = update(&mut state, Message::Refresh);
+
+        // None of the slow sections were touched inline — they still hold the
+        // pre-seeded sentinels (they would only change via a `*Loaded` message).
+        assert_eq!(
+            state.music.as_ref().map(|m| m.title.as_str()),
+            Some("SENTINEL")
+        );
+        assert_eq!(
+            state.voice.as_ref().map(|v| v.detail.as_str()),
+            Some("SENTINEL")
+        );
+        assert_eq!(
+            state.clips.len(),
+            1,
+            "clips not re-listed inline by Refresh"
+        );
+        assert_eq!(state.clips[0].text, "SENTINEL");
+        assert_eq!(
+            state.lighthouses.len(),
+            1,
+            "lighthouses not refetched inline"
+        );
+        assert!(state.dnd_active, "DND not re-read inline by Refresh");
+        // Cover art is gated behind MusicLoaded — Refresh never touches it.
+        assert_eq!(state.now_art_id.as_deref(), Some("sentinel-art"));
+    }
+
+    /// NOTIFY-RENDER-LAG-1 — a `*Loaded` arm stores its result into state without
+    /// blocking. `MusicLoaded` is the representative case (it also drives the
+    /// gated cover-art dispatch); the others are the same trivial store.
+    #[test]
+    fn loaded_arm_stores_state() {
+        let mut state = Center::new();
+        assert!(state.music.is_none());
+        let _ = update(&mut state, Message::MusicLoaded(Some(music_sentinel())));
+        assert_eq!(
+            state.music.as_ref().map(|m| m.title.as_str()),
+            Some("SENTINEL")
+        );
+
+        let _ = update(&mut state, Message::DndLoaded(Some(true)));
+        assert!(state.dnd_active);
+        // A `None` DND load (no Bus dir) leaves the toggle UNCHANGED, not cleared.
+        let _ = update(&mut state, Message::DndLoaded(None));
+        assert!(
+            state.dnd_active,
+            "DndLoaded(None) must not clear the toggle"
+        );
+
+        let _ = update(
+            &mut state,
+            Message::LighthousesLoaded(vec![beacon_sentinel()]),
+        );
+        assert_eq!(state.lighthouses.len(), 1);
+    }
+
+    /// NOTIFY-RENDER-LAG-1 / point 4 — cover art is fetched only AFTER music is
+    /// known and only when the track's coverArt token changes. A `MusicLoaded`
+    /// with no `cover_art` must NOT set `now_art_id` to a fetched token, and a
+    /// `CoverArtLoaded` only applies when it still matches the current track.
+    #[test]
+    fn cover_art_is_gated_on_music_and_track() {
+        let mut state = Center::new();
+        // Music with no art: now_art_id stays None (no first-frame art fetch).
+        let _ = update(&mut state, Message::MusicLoaded(Some(music_sentinel())));
+        assert_eq!(state.now_art_id, None);
+        assert!(state.now_art.is_none());
+
+        // Music with an art token: now_art_id advances to it (the fetch Task is
+        // dispatched off-thread, not awaited here).
+        let mut m = music_sentinel();
+        m.cover_art = Some("art-A".into());
+        let _ = update(&mut state, Message::MusicLoaded(Some(m)));
+        assert_eq!(state.now_art_id.as_deref(), Some("art-A"));
+
+        // A late CoverArtLoaded for a STALE token is ignored (track moved on).
+        let _ = update(
+            &mut state,
+            Message::CoverArtLoaded("art-OLD".into(), Some(stub_handle())),
+        );
+        assert!(
+            state.now_art.is_none(),
+            "stale cover art must not overwrite the current track's art slot"
+        );
+
+        // A CoverArtLoaded for the CURRENT token applies.
+        let _ = update(
+            &mut state,
+            Message::CoverArtLoaded("art-A".into(), Some(stub_handle())),
+        );
+        assert!(state.now_art.is_some());
+    }
+
+    /// A throwaway image handle for the cover-art gating test. The bytes are
+    /// never decoded — the test only checks the handle lands in the art slot — so
+    /// any non-empty buffer suffices (mirrors `fetch_cover_art`'s
+    /// `Handle::from_bytes`).
+    fn stub_handle() -> cosmic::iced::widget::image::Handle {
+        cosmic::iced::widget::image::Handle::from_bytes(vec![0u8, 1, 2, 3])
+    }
+
+    /// NOTIFY-RENDER-LAG-1 — the first frame paints immediately: `view()` on a
+    /// fresh `Center` (no fetch has completed — every section is empty/skeleton)
+    /// builds a renderable Element without panicking. This is the user-visible
+    /// payoff — the layer surface's chrome + empty sections render before any of
+    /// the off-thread fetches land.
+    #[test]
+    fn first_view_renders_without_any_fetch() {
+        let state = Center::new();
+        // No fetches have run, so the snapshot sections are all empty.
+        assert!(state.music.is_none());
+        assert!(state.voice.is_none());
+        assert!(state.clips.is_empty());
+        assert!(state.lighthouses.is_empty());
+        // Building the view must succeed (chrome + skeleton sections) — this is
+        // what the operator sees on the first frame, before any Loaded lands.
+        let _element = view(&state, window::Id::unique());
     }
 
     #[test]
