@@ -10,3 +10,7 @@ env.sh
 *.auto.tfvars
 override.tf
 override.tf.json
+# FARM-AUTOSCALE per-tick runtime state + lifecycle log (host/time-specific;
+# the autoscaler regenerates them — see install-helpers/farm-autoscale.sh).
+farm-autoscale.state
+farm-autoscale.log
