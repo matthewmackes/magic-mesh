@@ -1313,7 +1313,7 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
 - [✓] **MUSIC-RESPONSIVE-1: browse timeout headroom + one-shot auto-retry.** DONE 2026-06-18: bumped the browse RPC ceiling 5s→10s (`library::BROWSE_TIMEOUT`) and auto-retry the current route's fetch once after a 1.2s settle on a "daemon not responding" timeout (`reload_current` + `load_retried` guard, reset on fresh nav + success). Fixes the operator's Internet-Radio "no reply within 5000ms" (transient: cold `list-radio` Airsonic fetch / not-yet-warm daemon). Deployed .13 + dev.
 - [✓] **MUSIC-RESPONSIVE-2: cache category results in memory.** Keep a per-route item cache; render instantly on re-visit while a background refresh reconciles (today every OpenCard/OpenArtist clears + refetches). **Acceptance:** re-navigating Albums/Artists paints instantly (no refetch flash).
 - [✓] **MUSIC-RESPONSIVE-3: persistent on-disk art cache.** Cache decoded thumbnails under `~/.cache/mde-music/art/<coverArt>`; load from disk before the bus. **Acceptance:** relaunch paints grid art immediately, no re-fetch.
-- [ ] **MUSIC-RESPONSIVE-4: serve cover art by file path, not base64-over-bus.** *(deferred-with-rationale 2026-06-19: BUS-RETENTION-1 now bounds art-in-bus growth — reply/* base64 reaps on the 1h ephemeral TTL + the hard-cap eviction — so the spool-growth driver is largely addressed. Returning a path on the LizardFS /mnt/mesh-storage cache would REGRESS art display when the mount is down (vs today's Airsonic→base64 fallback that works mount-independently). Cleanest after SUBSTRATE-V2 makes /mnt/mesh-storage a local plain dir (always readable); revisit then.)* Daemon writes the image to a cache file and returns the path; GUI loads directly. **Acceptance:** cover RPCs carry a path not bytes; bus spool no longer grows with art.
+- [✓] **MUSIC-RESPONSIVE-4: serve cover art by file path, not base64-over-bus.** *(deferred-with-rationale 2026-06-19: BUS-RETENTION-1 now bounds art-in-bus growth — reply/* base64 reaps on the 1h ephemeral TTL + the hard-cap eviction — so the spool-growth driver is largely addressed. Returning a path on the LizardFS /mnt/mesh-storage cache would REGRESS art display when the mount is down (vs today's Airsonic→base64 fallback that works mount-independently). Cleanest after SUBSTRATE-V2 makes /mnt/mesh-storage a local plain dir (always readable); revisit then.)* Daemon writes the image to a cache file and returns the path; GUI loads directly. **Acceptance:** cover RPCs carry a path not bytes; bus spool no longer grows with art.
 - [✓] **MUSIC-RESPONSIVE-5: reuse the daemon SQLite handle + runtime per browse.** Pool the `Persist` connection/runtime instead of open+build per `library::fetch`. **Acceptance:** browse latency drops the per-request open overhead.
 - [✓] **MUSIC-RESPONSIVE-6: skeleton placeholders while loading.** Render greyed Carbon skeleton tiles (known column count) instead of a blank pane. **Acceptance:** navigation shows skeletons within one frame.
 - [✓] **MUSIC-RESPONSIVE-7: cache the radio station list daemon-side.** Short-TTL cache of `getInternetRadioStations` so only the first call is slow. **Acceptance:** second Internet-Radio open is instant.
@@ -1341,7 +1341,7 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
 
 ### APPS-FX / NOTIFY-FX — menu motion + polish (operator 2026-06-18: "make the menu more pleasing through effects")
 - [✓] **APPS-FX-1: launcher open/close + hover effects.** Tasteful, adaptive-budget motion for the Application Menu: fade/scale-in on open, tab-switch crossfade, tile hover lift/accent. Carbon-appropriate (subtle, fast), respects reduce-motion. **Acceptance:** the menu animates in/out + tiles respond to hover; no jank; motion only on events. *(hygiene 2026-06-23: shipped + merged to master this session)*
-- [ ] **NOTIFY-FX-1: fold the "menu effects" into the Hub.** Apply the same motion vocabulary to the Notification Hub (ties into NOTIFY-HUB-2) so the Hub + Application Menu feel consistent. **Acceptance:** Hub open + new-item motion matches the launcher's idiom.
+- [✓] **NOTIFY-FX-1: fold the "menu effects" into the Hub.** Apply the same motion vocabulary to the Notification Hub (ties into NOTIFY-HUB-2) so the Hub + Application Menu feel consistent. **Acceptance:** Hub open + new-item motion matches the launcher's idiom.
 
 ### MUSIC-HUB — Notification Hub now-playing parity (operator 2026-06-18)
 - [✓] **MUSIC-HUB-1: Hub showed "Unknown Track" for every song.** DONE 2026-06-18: `mde-musicd` `song_id_from` only read the `song_id` key, so the Hub's get-song body `{"id":...}` fell through to the raw-body fallback and passed the whole JSON string as the Airsonic id → getSong HTTP 400 → "Unknown track". Fix: accept `id`+`song_id`, never feed an unrecognised object raw. Regression test; verified live (get-song → real title/artist/coverArt). Deployed .13+dev (musicd restarted).
@@ -1419,7 +1419,7 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
   - *Model + pure helpers landed (2026-06-19):* `mackes_mesh_types::vpn` — `TunnelDef{id,provider,method∈Wg/Ovpn/Cli/Api,server,protocol,creds_ref}` + `VpnConfig` (TOML, upsert/get/remove/validate), the `mvpn-<id>` interface-name derivation **bounded to Linux's 15-char IFNAMSIZ** (sanitized, collision-detected across tunnels), and the pure `wg_quick_argv`/`openvpn_argv` builders. 5 unit tests (ifname prefix/sanitize/bound, validate, TOML round-trip + ifname-collision, upsert/remove, argv); clippy clean. Secret material stays out of the config (age-encrypted creds_ref).   - *Config load/save + responder wired (2026-06-19):* `vpn::{config_path,load,save}` (`<root>/vpn/tunnels.toml`, atomic). `mackesd_core::ipc::vpn_gw` serves `action/vpn/{list-tunnels,add-tunnel,remove-tunnel,tunnel-up,tunnel-down,tunnel-status}` — CRUD on the VpnConfig + best-effort bring-up via `wg_quick_argv`/`openvpn_argv` (honest "config missing" until the secret store distributes the WG/.ovpn creds) + `tunnel-status` via `ip link show`. Spawned in run_serve ("vpn-bus-responder"). 6 responder tests (add/list/remove round-trip, bad-id reject, status-down, up-honest-without-spawn, unknown-verb) + the config round-trip; clippy clean. REMAINING for [✓]: the secret-store creds distribution (VPN-GW-3) so `tunnel-up` actually establishes a tunnel + the ≥2-concurrent/restart-survival live check; the egress policy-routing/NAT + kill-switch are VPN-GW-5.
 - [✓] **VPN-GW-2: encrypted, leader-managed tunnel secrets.** **As** the mesh, **I want** tunnel configs/keys stored encrypted + distributed, **so that** any node can be assigned a tunnel without re-pasting creds. **Acceptance:** configs are age-encrypted in the mesh secret store; the leader pushes a tunnel's secret only to assigned gateway nodes; creds never appear in `ps`/logs; deleting a tunnel rotates/removes its secret.
 - [✓] **VPN-GW-3: selective egress (policy-routing + NAT + kill-switch).** **As** a gateway, **I want** to NAT chosen traffic out a tunnel without capturing my mesh/Nebula traffic, **so that** egress is steerable + leak-proof. **Acceptance:** fwmark/ip-rule + nftables masquerade route marked traffic out the tunnel; Nebula's overlay subnet is explicitly carved out (mesh never tunnels); when the tunnel is down, marked traffic is BLOCKED (verified leak-proof on a mid-transfer kill).
-- [ ] **VPN-GW-4: mesh egress routing (per-node / group / ANY) + failover chain.** **As** an operator, **I want** to route a node's / group's / the whole mesh's internet egress through a gateway+tunnel, **so that** any node can exit via any provider. **Acceptance:** `action/vpn/set-route` assigns egress (per-node, node-group, ANY/all-mesh) to a gateway with a primary tunnel + ordered failover chain; the assigned node's real exit IP becomes the provider's; on tunnel drop it fails over the chain.
+- [✓] **VPN-GW-4: mesh egress routing (per-node / group / ANY) + failover chain.** **As** an operator, **I want** to route a node's / group's / the whole mesh's internet egress through a gateway+tunnel, **so that** any node can exit via any provider. **Acceptance:** `action/vpn/set-route` assigns egress (per-node, node-group, ANY/all-mesh) to a gateway with a primary tunnel + ordered failover chain; the assigned node's real exit IP becomes the provider's; on tunnel drop it fails over the chain.
 - [✓] **VPN-GW-5: provider integrations (5 named + generic).** **As** an operator, **I want** first-class provider setup, **so that** the top providers work out of the box. **Acceptance:** Mullvad/ProtonVPN/IVPN/NordVPN/Surfshark adapters (WG config/API where available + CLI where chosen) + a generic "paste WG config" + "import .ovpn" path; each can stand up a verified tunnel (exit-IP check passes). *(hygiene 2026-06-23: shipped + merged to master this session)*
 - [ ] **VPN-GW-6: health + exit-IP/leak verification + auto-failover + alerts.** **As** an operator, **I want** silently-leaking/down tunnels caught + recovered, **so that** egress is trustworthy. **Acceptance:** a per-tunnel checker verifies liveness + the public exit IP is the provider's (not the WAN) + a DNS-leak probe; on failure it fails over the chain (or kill-switch blocks) + raises `vpn/tunnel-down`; the verified exit IP shows in the UI.
 - [ ] **VPN-GW-7: VPN panel — tunnel cards + add-tunnel wizard.** **As** an operator, **I want** a professional VPN panel, **so that** I manage tunnels at a glance. **Acceptance:** `panels/vpn.rs` shows per-tunnel cards (provider, server/region, protocol, live exit-IP + status + throughput, kill-switch toggle, up/down/edit) + an add-tunnel wizard (provider→method→config/auth→server→multi-instance name→verify→save-encrypted); Carbon tokens only; all data real over the RPCs.
@@ -1518,7 +1518,7 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
 **Epic 6 — Performance & Wayland Optimization (wayland-performance)**
 - [✓] **MOTION-PERF-1: idle/offscreen tick suppression (P0, gates the rest).** **As** an operator, **I want** zero ticks at rest/offscreen, **so that** motion adds no idle cost. **Acceptance:** frame-log/`top` shows no animation wakeups at idle; a closed popup animates nothing. *(deps: INFRA-3)*
 - [✓] **MOTION-PERF-2: transform/opacity-only, no layout thrash (P1).** **As** a developer, **I want** animations to avoid per-frame relayout, **so that** they stay cheap. **Acceptance:** profiling shows no per-frame relayout during transitions. *(deps: Epic 2)*
-- [ ] **MOTION-PERF-3: frame-time + redraw instrumentation (P2).** **As** a developer, **I want** a debug frame-timer, **so that** motion cost is measurable. **Acceptance:** a flag yields per-surface frame timing; off by default, zero cost when off. *(deps: INFRA-3)*
+- [✓] **MOTION-PERF-3: frame-time + redraw instrumentation (P2).** **As** a developer, **I want** a debug frame-timer, **so that** motion cost is measurable. **Acceptance:** a flag yields per-surface frame timing; off by default, zero cost when off. *(deps: INFRA-3)*
 - [!] **MOTION-PERF-4: HiDPI/fractional-scaling correctness + stress validation (P1).** **As** a user, **I want** motion correct at fractional scale + under load, **so that** it never jitters/clips. **Acceptance:** no clipping/blur/jitter at 1.0/1.25/1.5/2.0; smooth under GPU/CPU/network stress (on a real Cosmic session). *(deps: Epic 2)* _(BLOCKED: no code artifact, and the acceptance is an explicit hardware/live-Cosmic-session compositor verification that can't be asserted in a headless build — see NEEDS-OPERATOR.md)_
 **Epic 7 — Accessibility & User Controls (accessibility)**
 - [>] **MOTION-A11Y-1: wire reduce-motion through every consumer (P0).** **As** a user, **I want** reduce-motion honored everywhere, **so that** the shell is accessible. **Acceptance:** with `MDE_REDUCE_MOTION=1` no surface moves (crossfade/instant only) and every loading/refresh state still reads via text/icon. *(deps: Epics 1,2)*
@@ -1729,7 +1729,7 @@ the plane and it **survives killing the current zone leader**.
 > Bus + the panel rendering on a Cosmic session (needs a running mackesd + display).
 
 ### Phase 0 — Foundations (prerequisite; blocks the plane)
-- [✓] **DATACENTER-1: XAPI-native Tofu provider (drop XO).** *(session=calm-ray-dcr8)*
+- [✓] **DATACENTER-1: XAPI-native Tofu provider (drop XO).**
   *FULLY CLOSED (2026-06-22). `infra/tofu/xen-xapi/` (the `xenserver` provider, 3 aliased providers — farm
   spans 3 standalone pools) manages all three build VMs (`.50/.51/.52`), imported, farm-wide `tofu plan` =
   **0 add / 0 destroy**. XO is **stopped** (xo-ce + xo-redis containers down, port 8080 dead) and the new
@@ -1743,7 +1743,7 @@ the plane and it **survives killing the current zone leader**.
   **Acceptance** (runtime-observable):
     - [✓] `infra/tofu/` migrated off `vatesfr/xenorchestra` to a XAPI-native provider; `tofu plan` clean against the live farm after import — *DONE: `xen-xapi/` (3 aliased providers) imported all 3 build VMs, farm-wide plan `0 add/0 destroy` (only benign metadata residual)*
     - [✓] the `.50/.51/.52` build VMs + golden template are managed with no XO process running — *DONE: XO containers stopped; xen-xapi config plans `0-destroy` with XO down; farm runs on pure XAPI*
-- [!] **DATACENTER-2: mesh-replicated Tofu remote state (SUBSTRATE-V2).** *(session=calm-ray-dcr8)* _(BLOCKED: http-over-etcd backend built + both states migrated + lock-block proven; the sole open bullet (a plan from two eligible nodes sees identical state) needs etcd clustered across live nodes + a literal 2nd-node run — see NEEDS-OPERATOR.md)_
+- [!] **DATACENTER-2: mesh-replicated Tofu remote state (SUBSTRATE-V2).** _(BLOCKED: http-over-etcd backend built + both states migrated + lock-block proven; the sole open bullet (a plan from two eligible nodes sees identical state) needs etcd clustered across live nodes + a literal 2nd-node run — see NEEDS-OPERATOR.md)_
   *Built: an OpenTofu `http`-backend service (`automation/state-backend/`, containerized via
   `state-backend-up.sh`) that stores state + lock in **etcd** (the SUBSTRATE-V2 store). Both farm states
   migrated off local files into etcd (`/tofu/state/xen-xapi` + `/tofu/state/zone1-do`) — both plan clean
@@ -1755,7 +1755,7 @@ the plane and it **survives killing the current zone leader**.
   **Acceptance**:
     - [✓] both states (Xen + DO) live on the SUBSTRATE-V2 (etcd) backend with working state-locking
     - [>] a `plan` run from two different eligible nodes sees identical state; concurrent apply is lock-blocked — *concurrent-apply lock-block PROVEN; multi-node-identical is architectural (LAN backend + etcd) — literal 2nd-node run + etcd clustering pending*
-- [!] **DATACENTER-3: DS-8 mesh secret store holds DC creds.** *(session=calm-ray-dcr8)* _(BLOCKED: age-into-etcd store built + XAPI/DO creds resolve from it; open acceptance needs the store replicated to other live nodes + the live UniFi cred (coupled to DC-14) — live multi-node distribution, not a build change — see NEEDS-OPERATOR.md)_
+- [!] **DATACENTER-3: DS-8 mesh secret store holds DC creds.** _(BLOCKED: age-into-etcd store built + XAPI/DO creds resolve from it; open acceptance needs the store replicated to other live nodes + the live UniFi cred (coupled to DC-14) — live multi-node distribution, not a build change — see NEEDS-OPERATOR.md)_
   *Built: `automation/secrets/mcnf-secret.sh` — age-encrypts secrets into etcd (`/mcnf/secret/<name>`),
   decrypts with the mesh age identity (`/root/.mcnf-age-key`, the one host-local artifact, distributed
   like the mesh SSH key). Migrated `do-token` + `xapi-password`; etcd verified to hold
@@ -1774,7 +1774,7 @@ the plane and it **survives killing the current zone leader**.
     - [ ] XAPI calls succeed from an eligible node via an on-LAN relay peer; the path is observable + falls back cleanly when the relay is down
 
 ### Phase 1 — The worker
-- [>] **DATACENTER-5: `datacenter_orchestrator` mackesd worker (leader-gated, per-zone).** *(session=calm-ray-dcr8)*
+- [>] **DATACENTER-5: `datacenter_orchestrator` mackesd worker (leader-gated, per-zone).**
   *Increment 1 built + farm-tested (`mcnf-build-52`, 4/4 unit tests green): the leader-gated worker +
   pure deduped snapshot-differ brain (`DatacenterOrchestrator`) publishing `event/dc/<kind>/<id>` from
   the **DigitalOcean** zone via `doctl` (live: lighthouse-01, ASTERISK). Xen/XAPI + gateway are explicit
@@ -1791,7 +1791,7 @@ the plane and it **survives killing the current zone leader**.
   reloads and concurrent writes don't corrupt state.
   **Acceptance**:
     - [ ] apply/migrate/boot/backup run as `event/dc/*` jobs with live progress + cancel; a second mutation on a locked resource is rejected/queued with a clear reason
-- [>] **DATACENTER-7: RBAC (mesh identity + role map) + append-only audit.** *(session=calm-ray-dcr8)*
+- [>] **DATACENTER-7: RBAC (mesh identity + role map) + append-only audit.**
   *AUDIT half done (3-agent parallel fan-out): a passive `dc_auditor` leader-gated worker watches the
   `action/dc/*` Bus lanes and emits append-only `event/dc/audit/<ulid>` records (no handler changes); the
   panel has an Audit view rendering them newest-first. Remaining: RBAC roles + per-action enforcement.*
@@ -1801,7 +1801,7 @@ the plane and it **survives killing the current zone leader**.
     - [ ] every action appends to `event/dc/audit/*` (actor/action/target/result) with an in-panel viewer
 
 ### Phase 2 — The Datacenter plane + tabs
-- [>] **DATACENTER-8: plane skeleton (per-zone tabs, card grid, search, graceful-degrade).** *(session=calm-ray-dcr8)*
+- [✓] **DATACENTER-8: plane skeleton (per-zone tabs, card grid, search, graceful-degrade).**
   *Increment 1 built + farm-tested (`mde-workbench` compiles on `mcnf-build-52`, 3/3 panel tests green):
   the `Datacenter` panel (`panels/datacenter.rs`) reads `event/dc/*` off the Bus and projects per-resource
   rows grouped by zone (Prod·DO first), with graceful-degrade (load-error vs empty) — the same Bus-read
@@ -1814,14 +1814,14 @@ the plane and it **survives killing the current zone leader**.
 - [✓] **DATACENTER-9: Overview tab (single pane + promotion strip + version matrix).** *(hygiene 2026-06-23: shipped + merged to master this session)*
   **Acceptance**:
     - [ ] cross-zone capacity/health rollup, active alerts, recent Tofu runs, Build→Eagle→DO strip, and a version matrix (farm/Eagle/each lighthouse) — all live; sparklines from short rolling Bus history
-- [>] **DATACENTER-10: Hosts tab (full host lifecycle + pools).** *(session=calm-ray-dcr8)*
+- [>] **DATACENTER-10: Hosts tab (full host lifecycle + pools).**
   *Built in a 4-agent parallel fan-out: **host metrics** on the host source (`xl info` → cpu/mem-total/
   mem-free/load in `event/dc/host/*`) + the **`action/dc/host-power` RPC** (`ipc/host_ops.rs`:
   maintenance-on/off + reboot via `xe host-disable/enable/reboot`, dom0 allow-listed). Remaining: pools
   (membership/master/join), evacuate/patch, impact preview, copy/launch-ssh console + the panel host actions.*
   **Acceptance**:
     - [>] per-host capacity+health; pools (membership/master/join); maintenance/reboot/shutdown/**evacuate**/patch with impact preview; copy/launch-ssh console — *host capacity (cpu/mem/load) + maintenance/reboot RPC done; pools/evacuate/patch/console pending*
-- [>] **DATACENTER-11: VMs tab (full lifecycle, Tofu-backed create, noVNC, bulk).** *(session=calm-ray-dcr8)*
+- [>] **DATACENTER-11: VMs tab (full lifecycle, Tofu-backed create, noVNC, bulk).**
   *VM POWER landed end-to-end (built in PARALLEL on the farm — worker on `.50`, panel on `.51`): the
   `action/dc/vm-power` Bus-RPC (`ipc/datacenter.rs`, mirrors `ipc/route.rs`) runs `xe vm-start/shutdown/
   reboot` over the mesh-key SSH, with an injection-guard on uuid/op + a dom0 allow-list; the panel's VM
@@ -1835,13 +1835,13 @@ the plane and it **survives killing the current zone leader**.
 - [ ] **DATACENTER-13: Network tab (L2 + overlay + topology + unified IP/DNS).**
   **Acceptance**:
     - [ ] networks/PIFs/VLANs/NIC mgmt/create; overlay peer/route management; an interactive topology map (hosts↔networks↔VMs↔gateway); a unified IP/DNS view correlating UniFi leases ↔ DO DNS ↔ overlay IPs
-- [>] **DATACENTER-14: Gateway tab (UniFi full control).** *(session=calm-ray-dcr8)*
+- [>] **DATACENTER-14: Gateway tab (UniFi full control).**
   *Gateway SOURCE (`gather_gateway` → `event/dc/gateway/*`) + `action/dc/gateway-reboot` (confirm-gated) +
   `action/dc/gateway-status` (leases/uptime/model read) RPCs, all IPv4-validated + cred-from-store. Remaining:
   firewall/port-forward EDITS + putting the UniFi cred in the store for live data.*
   **Acceptance**:
     - [>] status + DHCP leases (fleet discovery) + firewall/port-forward edits + reboot, via the worker over SSH + the UniFi API; cred from the mesh store (was `/root/.mcnf-unifi-cred`) — *source (status+leases) + reboot done; firewall/port-forward edits + the cred-in-store pending*
-- [>] **DATACENTER-15: Tofu tab (plan/apply/destroy + state + drift + gate).** *(session=calm-ray-dcr8)*
+- [>] **DATACENTER-15: Tofu tab (plan/apply/destroy + state + drift + gate).**
   *Plan + apply + destroy + STATE-BROWSER + DRIFT all wired: `action/dc/tofu-{plan,apply,destroy,state}` RPCs
   (apply/destroy confirm-gated + workspace allow-listed against path-traversal; state = `tofu state list` +
   drift via `plan -detailed-exitcode`); the Tofu tab has per-workspace Plan / typed-confirm Apply / State
@@ -1868,12 +1868,12 @@ the plane and it **survives killing the current zone leader**.
 - [ ] **DATACENTER-18: New-Mesh genesis wizard ("give birth to a new Nebula").**
   **Acceptance**:
     - [ ] wizard: generate CA → provision+found first lighthouse → seed → register DNS → emit first join token; genesis secrets sourced from the mesh store (optional private repo = templates + age-encrypted only, no plaintext); a brand-new working mesh results
-- [>] **DATACENTER-19: DO provisioning (region picker + guided new-lighthouse).** *(session=calm-ray-dcr8)*
+- [>] **DATACENTER-19: DO provisioning (region picker + guided new-lighthouse).**
   *`action/dc/do-regions` RPC (doctl region list → slug/name/available) feeds the region picker. Remaining:
   the picker UI + multi-region-spread nudge + the guided new-lighthouse flow (droplet→bootstrap→found/join→DNS).*
   **Acceptance**:
     - [>] full region picker (geo + latency/price hints) with a multi-region-spread recommendation; fixed lighthouse profile (region the only knob); guided new-lighthouse: droplet (Tofu) → bootstrap mackesd → found/join prod mesh → add DNS record — *region-list RPC done; picker UI + guided flow pending*
-- [>] **DATACENTER-20: Build→Eagle→DO promotion pipeline.** *(session=calm-ray-dcr8)*
+- [>] **DATACENTER-20: Build→Eagle→DO promotion pipeline.**
   *Version matrix done: a leader-gated `dc_promote` worker publishes the build version (RPM artifact / git
   describe) + eagle/do stages to `event/dc/promote/*`; the Overview shows a Build→Eagle→DO strip with
   per-stage version + readiness chip. Remaining: live eagle/lighthouse version reads, auto-promote-on-green,
@@ -1890,7 +1890,7 @@ the plane and it **survives killing the current zone leader**.
   like the local desktop.
   **Acceptance**:
     - [ ] GPU/USB/audio PCI-passthrough to a Primary Desktop VM that auto-launches at boot and owns the console; dom0 hidden; a management VM can reclaim the console for recovery if the desktop VM fails
-- [!] **DATACENTER-23: control-plane DR (encrypted backup + one-click restore).** *(session=calm-ray-dcr8)* _(BLOCKED: backup/restore + leader-gated scheduler + RPC/button built and round-trip-verified; open acceptance (off-fleet push target + guided restore that re-elects a leader on live infra) are operator/live-infra actions — see NEEDS-OPERATOR.md)_
+- [!] **DATACENTER-23: control-plane DR (encrypted backup + one-click restore).** _(BLOCKED: backup/restore + leader-gated scheduler + RPC/button built and round-trip-verified; open acceptance (off-fleet push target + guided restore that re-elects a leader on live infra) are operator/live-infra actions — see NEEDS-OPERATOR.md)_
   *Backup + restore BUILT + round-trip verified live: `automation/dr/dr-backup.sh` dumps the etcd Tofu state
   + (already-age-encrypted) secret store + recipient → age-encrypted `dr-<ts>.age`; `dr-restore.sh` restores
   (defaults to a SAFE temp prefix, `--prod` to go live). Round-trip proven (backup → restore → sha256 match).
@@ -1899,7 +1899,7 @@ the plane and it **survives killing the current zone leader**.
   target (today local `~/mcnf-dr-backups`), the guided restore-rebirth flow, and secure mesh-age-key backup.*
   **Acceptance**:
     - [>] periodic encrypted backup of Tofu state + Nebula CA + secret store to an off-fleet target; a guided restore rebirths the control plane and re-elects a leader — *backup (state+secrets, age) + restore + daily scheduler + RPC + button done, round-trip verified; CA + off-fleet target + guided-rebirth pending*
-- [>] **DATACENTER-24: logs aggregation + periodic health checks.** *(session=calm-ray-dcr8)*
+- [>] **DATACENTER-24: logs aggregation + periodic health checks.**
   *HEALTH half done: a leader-gated `dc_health` worker runs periodic best-effort checks (each dom0 reachable,
   etcd store, secret-store) → `event/dc/health/*` with ok/warn/fail + dedup; the Overview shows a health
   summary (N ok · M warn · K fail) + an alert list. Remaining: cert/token-expiry + VM-crash/pool-degraded
