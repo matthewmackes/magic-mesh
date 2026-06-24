@@ -193,6 +193,10 @@ pub enum Message {
     ControlPressed(String),
     /// MOTION-FEEDBACK-1 — the pointer released a control (depress lifts).
     ControlReleased(String),
+    /// In-call control: toggle the microphone mute on the live media session.
+    /// No-op when no call is up. Stops/resumes mic transmission while the peer's
+    /// audio keeps playing.
+    ToggleMute,
 }
 
 /// Top-level HUD state.
@@ -232,6 +236,10 @@ pub struct VoiceHud {
     /// update handler can start the state-change crossfade only when the mode
     /// actually changes (not on every unrelated message).
     pub call_kind: CallKind,
+    /// In-call microphone mute. Mirrors the live [`media::MediaSession`] mute
+    /// flag so the in-call Mute pill renders the current state; reset to `false`
+    /// whenever a call ends (the next call starts un-muted).
+    pub muted: bool,
 }
 
 /// MOTION-TRANS — a coarse discriminant of [`sip::CallState`].
@@ -458,6 +466,13 @@ pub fn update(state: &mut VoiceHud, message: Message) -> Task<Message> {
             }
             sip::AgentEvent::RemoteHangup => {
                 state.call = sip::CallState::Ended;
+                state.muted = false;
+                // Tear down this call's media so a stale session can't back the
+                // mute pill into the next call (the inbound dialog's media also
+                // lives in the agent thread, which ends on the BYE).
+                if let Some(m) = state.media.take() {
+                    m.stop();
+                }
             }
         },
         Message::Answer => {
@@ -544,6 +559,9 @@ pub fn update(state: &mut VoiceHud, message: Message) -> Task<Message> {
                 rtp = session.rtp_port,
                 "voice-hud: call connected; starting media"
             );
+            // A fresh session always starts un-muted; clear any carried-over UI
+            // mute so the pill can never claim "muted" over a live new session.
+            state.muted = false;
             // Start the RTP/G.711 media path over the negotiated endpoint. A
             // failure (no audio devices) leaves the call up but silent — honest
             // degradation, not a panic.
@@ -563,6 +581,7 @@ pub fn update(state: &mut VoiceHud, message: Message) -> Task<Message> {
         }
         Message::HangUp => {
             state.call = sip::CallState::Ended;
+            state.muted = false;
             if let Some(m) = state.media.take() {
                 m.stop();
             }
@@ -600,6 +619,16 @@ pub fn update(state: &mut VoiceHud, message: Message) -> Task<Message> {
             if state.hovered.as_deref() == Some(&id) {
                 state.hovered = None;
                 state.start_hover(&id);
+            }
+        }
+        Message::ToggleMute => {
+            // Toggle the live media session's mic mute. Only meaningful while a
+            // call has media up; a no-op otherwise (the pill only renders then).
+            if let Some(media) = &state.media {
+                let next = !state.muted;
+                media.set_muted(next);
+                state.muted = next;
+                tracing::info!(muted = next, "voice-hud: mic mute toggled");
             }
         }
         Message::ControlPressed(id) => {
@@ -1066,21 +1095,23 @@ fn feedback_wrap<'a>(
         .into()
 }
 
-/// A full-width call-action pill in `fill` with a `SURF` label, carrying the
-/// shared hover-lift + press-depress feedback (MOTION-FEEDBACK-1). `alpha` is the
-/// call-bar state-crossfade opacity (the fill fades in on a mode change).
+/// A full-width call-action pill in `fill` with a `label_color` label, carrying
+/// the shared hover-lift + press-depress feedback (MOTION-FEEDBACK-1). The fill
+/// fades in on a call-mode change via the call-bar state crossfade. Every color
+/// is an `mde-theme` Carbon token (§4).
 fn call_pill<'a>(
     state: &VoiceHud,
     now: Instant,
     id: &str,
     label: &'a str,
     fill: Color,
+    label_color: Color,
     msg: Message,
 ) -> Element<'a, Message> {
     let fill = fade_color(fill, state.call_state_alpha(now));
     let fb = state.control_feedback(id, now);
     let pill = button(
-        container(text(label).size(16.0).colr(theme::SURF))
+        container(text(label).size(16.0).colr(label_color))
             .width(Length::Fill)
             .align_x(cosmic::iced::alignment::Horizontal::Center),
     )
@@ -1090,7 +1121,7 @@ fn call_pill<'a>(
     .sty(
         move |_: &Theme, _status| cosmic::iced::widget::button::Style {
             background: Some(cosmic::iced::Background::Color(fill)),
-            text_color: theme::SURF,
+            text_color: label_color,
             border: cosmic::iced::Border {
                 radius: cosmic::iced::border::Radius::from(8.0),
                 ..Default::default()
@@ -1101,6 +1132,27 @@ fn call_pill<'a>(
     feedback_wrap(pill, fb, id.to_string())
 }
 
+/// The in-call mic-mute toggle pill — a [`call_pill`] whose fill/label flip on
+/// `state.muted`: Carbon Blue-accent + light label when muted (the "active
+/// toggle" affordance), Gray-80 + primary text when live, so the state reads at
+/// a glance in dark + light. §4 — every color is an `mde-theme` Carbon token.
+fn mute_pill<'a>(state: &VoiceHud, now: Instant) -> Element<'a, Message> {
+    let (fill, label_color, label) = if state.muted {
+        (theme::PRIMARY, theme::ON_PRIMARY, "Unmute")
+    } else {
+        (theme::SURF_C, theme::ON_SURF, "Mute")
+    };
+    call_pill(
+        state,
+        now,
+        "call/mute",
+        label,
+        fill,
+        label_color,
+        Message::ToggleMute,
+    )
+}
+
 /// The call-action row (Answer/Decline · Hang-up · Call) + live call status.
 /// MOTION-TRANS — the action fill + status crossfade in on a call-mode change;
 /// MOTION-FEEDBACK-1 — each pill carries the hover-lift + press-depress feedback.
@@ -1108,13 +1160,45 @@ fn build_call_bar(state: &VoiceHud, now: Instant) -> Element<'_, Message> {
     let alpha = state.call_state_alpha(now);
     let action: Element<Message> = if matches!(state.call, sip::CallState::Incoming { .. }) {
         row![
-            call_pill(state, now, "call/answer", "Answer", theme::SUCCESS, Message::Answer),
-            call_pill(state, now, "call/decline", "Decline", theme::ERROR, Message::Decline),
+            call_pill(
+                state,
+                now,
+                "call/answer",
+                "Answer",
+                theme::SUCCESS,
+                theme::SURF,
+                Message::Answer
+            ),
+            call_pill(
+                state,
+                now,
+                "call/decline",
+                "Decline",
+                theme::ERROR,
+                theme::SURF,
+                Message::Decline
+            ),
         ]
         .spacing(8)
         .into()
     } else if state.call.is_active() {
-        call_pill(state, now, "call/hangup", "Hang up", theme::ERROR, Message::HangUp)
+        // An active call shows Hang up; once media is up, a Mute toggle sits
+        // beside it (muting stops mic transmit, peer audio keeps playing).
+        let hangup = call_pill(
+            state,
+            now,
+            "call/hangup",
+            "Hang up",
+            theme::ERROR,
+            theme::SURF,
+            Message::HangUp,
+        );
+        if state.media.is_some() {
+            let mute = mute_pill(state, now);
+            row![mute, hangup].spacing(8).into()
+        } else {
+            hangup
+        }
     } else {
         let enabled = !state.dialer_input.trim().is_empty();
         let fill = fade_color(
@@ -1316,6 +1400,7 @@ fn main() -> Result<(), cosmic::iced::Error> {
                     pressed: None,
                     hovered: None,
                     call_kind: CallKind::Idle,
+                    muted: false,
                 },
                 boot_surface(),
             )
@@ -1359,6 +1444,7 @@ mod tests {
             pressed: None,
             hovered: None,
             call_kind: CallKind::Idle,
+            muted: false,
         }
     }
 
@@ -1401,6 +1487,72 @@ mod tests {
         hud.dialer_input = "keep".into();
         let _ = update(&mut hud, Message::DialRequested("  ".into()));
         assert_eq!(hud.dialer_input, "keep");
+    }
+
+    #[test]
+    fn toggle_mute_is_noop_without_media() {
+        // The Mute pill only renders once media is up; a stray toggle with no
+        // session must not flip the flag (the pill isn't shown to click anyway).
+        let mut hud = make_hud();
+        hud.call = sip::CallState::InCall {
+            peer: "pine".into(),
+        };
+        assert!(hud.media.is_none());
+        let _ = update(&mut hud, Message::ToggleMute);
+        assert!(!hud.muted, "no media → mute flag stays false");
+    }
+
+    #[test]
+    fn hangup_clears_mute_so_next_call_starts_unmuted() {
+        // A muted call that hangs up must reset the flag — the next call's Mute
+        // pill should read "Mute", not inherit the prior call's muted state.
+        let mut hud = make_hud();
+        hud.call = sip::CallState::InCall {
+            peer: "pine".into(),
+        };
+        hud.muted = true;
+        let _ = update(&mut hud, Message::HangUp);
+        assert!(!hud.muted, "hang-up clears the mute flag");
+        assert!(matches!(hud.call, sip::CallState::Ended));
+    }
+
+    #[test]
+    fn remote_hangup_clears_mute() {
+        // A peer-initiated BYE must also reset mute (same next-call invariant).
+        let mut hud = make_hud();
+        hud.call = sip::CallState::InCall {
+            peer: "pine".into(),
+        };
+        hud.muted = true;
+        let _ = update(&mut hud, Message::Agent(sip::AgentEvent::RemoteHangup));
+        assert!(!hud.muted, "remote hang-up clears the mute flag");
+        assert!(matches!(hud.call, sip::CallState::Ended));
+    }
+
+    #[test]
+    fn remote_hangup_tears_down_media_so_no_stale_pill_next_call() {
+        // The mute pill is gated on `state.media.is_some()`. If a peer-initiated
+        // BYE left a stale MediaSession behind, the next call's Calling phase
+        // would render a Mute pill backed by a dead session (a mic-live-but-UI-
+        // muted divergence). RemoteHangup must take + stop the media, mirroring
+        // the local HangUp path.
+        let peer = std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("bind loopback peer");
+        let peer_addr = peer.local_addr().expect("peer addr");
+        let remote = sip::RemoteMedia {
+            addr: peer_addr.ip().to_string(),
+            port: peer_addr.port(),
+            payload_type: 0,
+        };
+        let mut hud = make_hud();
+        hud.call = sip::CallState::InCall {
+            peer: "pine".into(),
+        };
+        hud.media = Some(media::start_media(0, &remote).expect("media starts"));
+        let _ = update(&mut hud, Message::Agent(sip::AgentEvent::RemoteHangup));
+        assert!(
+            hud.media.is_none(),
+            "remote hang-up tears down the media session"
+        );
     }
 
     #[test]
