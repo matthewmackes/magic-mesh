@@ -124,8 +124,7 @@ impl FrameTimer {
     /// the hot `tick()` path never touches the environment.
     #[must_use]
     pub fn from_env(surface: &'static str) -> Self {
-        let armed = std::env::var_os(FRAME_DEBUG_ENV)
-            .is_some_and(|v| !v.is_empty() && v != "0");
+        let armed = std::env::var_os(FRAME_DEBUG_ENV).is_some_and(|v| !v.is_empty() && v != "0");
         Self::with_enabled(surface, armed)
     }
 
