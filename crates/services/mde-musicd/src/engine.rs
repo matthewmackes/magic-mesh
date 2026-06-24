@@ -42,7 +42,7 @@
 
 use std::collections::VecDeque;
 use std::io::Cursor;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -150,6 +150,19 @@ pub fn ms_to_frames(ms: u64, device_rate: u32) -> u64 {
     }
 }
 
+/// AIR-2.c — map the audible playhead (`played` device frames) to the track it
+/// falls in, given each track's cumulative start-frame offset (ascending). The
+/// current track is the last start `<= played`; returns `(index, start_frame)`,
+/// or `(0, 0)` when no track has been recorded. A pure function so the gapless
+/// boundary math is unit-tested independently of the audio device.
+#[must_use]
+pub fn track_at_frame(starts: &[u64], played: u64) -> (usize, u64) {
+    starts
+        .iter()
+        .rposition(|&s| s <= played)
+        .map_or((0, 0), |i| (i, starts[i]))
+}
+
 /// One output sample for the cpal callback: the next ring sample scaled
 /// by `volume` when playing, or `None` (→ the callback writes silence and
 /// does not advance the playhead) when paused or on a buffer underrun.
@@ -239,6 +252,16 @@ struct Shared {
     decode_done: AtomicBool,
     /// Device frames actually emitted (drives the playhead).
     frames_played: AtomicU64,
+    /// AIR-2.c — total device frames the decode thread has pushed into the ring
+    /// across the whole track list. Used (with [`track_starts`]) to map the
+    /// audible playhead back to a track index so the queue cursor auto-advances
+    /// at each gapless track boundary.
+    frames_enqueued: AtomicU64,
+    /// AIR-2.c — the device-frame offset at which each played track's first
+    /// sample sits in the continuous output stream (`track_starts[i]` = the
+    /// cumulative `frames_enqueued` recorded just before track `i` began
+    /// decoding). The currently-audible track is the last entry `<= frames_played`.
+    track_starts: Mutex<Vec<u64>>,
     /// MUSIC-RFX-2 — pending seek target in ms; `-1` = no request. The decode
     /// thread checks this each loop, repositions the format, clears the ring, and
     /// resets the playhead. Only honoured for a seekable (finite) source.
@@ -252,6 +275,47 @@ struct Shared {
     /// Back-pressure target: the decode thread throttles once the ring
     /// holds more than this many samples (≈2 s of audio).
     target_ring: usize,
+    /// AIR-2.c — the queue cursor that engine-track 0 corresponds to. The
+    /// transport `play` verb hands the engine `queue.current..end`, so the
+    /// audible queue index is `play_base + current_track_index()`. The serve
+    /// loop's auto-advance driver reads this to move the persisted queue cursor.
+    play_base: AtomicUsize,
+}
+
+impl Shared {
+    /// AIR-2.c — push decoded device samples into the ring and count the frames
+    /// toward [`frames_enqueued`], so the track-boundary map stays accurate.
+    fn push_samples(&self, samples: &[f32]) {
+        let channels = usize::from(self.device_channels.max(1));
+        self.ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(samples.iter().copied());
+        self.frames_enqueued
+            .fetch_add((samples.len() / channels) as u64, Ordering::Relaxed);
+    }
+
+    /// AIR-2.c — record the start of a new track at the current enqueued-frame
+    /// offset (called once per track, before its samples are pushed).
+    fn begin_track(&self) {
+        let at = self.frames_enqueued.load(Ordering::Relaxed);
+        self.track_starts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(at);
+    }
+
+    /// AIR-2.c — the device-frame offset at which the currently-audible track
+    /// began: the largest recorded track-start `<= frames_played`. Returns
+    /// `(index, start_frame)`; `(0, 0)` before any track has been recorded.
+    fn current_track(&self) -> (usize, u64) {
+        let played = self.frames_played.load(Ordering::Relaxed);
+        let starts = self
+            .track_starts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        track_at_frame(&starts, played)
+    }
 }
 
 /// A cheap-to-clone, `Send + Sync` control surface for the engine. All
@@ -312,11 +376,14 @@ impl Engine {
             stop: AtomicBool::new(false),
             decode_done: AtomicBool::new(true),
             frames_played: AtomicU64::new(0),
+            frames_enqueued: AtomicU64::new(0),
+            track_starts: Mutex::new(Vec::new()),
             seek_ms: AtomicI64::new(-1),
             seekable: AtomicBool::new(false),
             device_rate,
             device_channels,
             target_ring,
+            play_base: AtomicUsize::new(0),
         });
 
         let stream = match sample_format {
@@ -352,6 +419,14 @@ impl EngineHandle {
     /// Play the given tracks back-to-back, gaplessly. Each entry is a
     /// stream URL plus its (hinted) codec. Replaces any current playback.
     pub fn play(&self, tracks: Vec<(String, SourceCodec)>) {
+        self.play_from(tracks, 0);
+    }
+
+    /// AIR-2.c — like [`play`](EngineHandle::play) but records the queue cursor
+    /// that engine-track 0 corresponds to, so the serve loop's auto-advance
+    /// driver can map the audible track back to the right queue index as gapless
+    /// playback crosses track boundaries.
+    pub fn play_from(&self, tracks: Vec<(String, SourceCodec)>, base_cursor: usize) {
         self.stop();
         if tracks.is_empty() {
             return;
@@ -359,6 +434,13 @@ impl EngineHandle {
         self.shared.stop.store(false, Ordering::Relaxed);
         self.shared.playing.store(true, Ordering::Relaxed);
         self.shared.frames_played.store(0, Ordering::Relaxed);
+        self.shared.frames_enqueued.store(0, Ordering::Relaxed);
+        self.shared
+            .track_starts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.shared.play_base.store(base_cursor, Ordering::Relaxed);
         self.shared.seek_ms.store(-1, Ordering::Relaxed);
         self.shared.decode_done.store(false, Ordering::Relaxed);
 
@@ -370,6 +452,9 @@ impl EngineHandle {
                     if shared.stop.load(Ordering::Relaxed) {
                         break;
                     }
+                    // AIR-2.c — mark this track's start frame BEFORE feeding any
+                    // of its samples, so the boundary map stays accurate.
+                    shared.begin_track();
                     if let Err(e) = decode_track(&url, codec, &shared) {
                         tracing::warn!(error = %e, "decode_track failed");
                     }
@@ -420,6 +505,12 @@ impl EngineHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.shared
+            .track_starts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.shared.frames_enqueued.store(0, Ordering::Relaxed);
         self.shared.decode_done.store(true, Ordering::Relaxed);
         self.shared.seekable.store(false, Ordering::Relaxed);
         self.shared.seek_ms.store(-1, Ordering::Relaxed);
@@ -460,15 +551,36 @@ impl EngineHandle {
         self.shared.seekable.load(Ordering::Relaxed)
     }
 
-    /// Playhead position (ms), derived from device frames emitted.
+    /// Playhead position (ms) WITHIN the currently-audible track, derived from
+    /// device frames emitted since that track's gapless boundary. For a single
+    /// track (or the first track of an album) this equals the raw playhead; for
+    /// later album tracks it resets to zero at each boundary so the GUI scrubber
+    /// + the AIR-8 heartbeat report the right position. (AIR-2.c)
     #[must_use]
     pub fn position_ms(&self) -> u64 {
-        let frames = self.shared.frames_played.load(Ordering::Relaxed);
         if self.shared.device_rate == 0 {
-            0
-        } else {
-            frames * 1000 / u64::from(self.shared.device_rate)
+            return 0;
         }
+        let played = self.shared.frames_played.load(Ordering::Relaxed);
+        let (_, start) = self.shared.current_track();
+        let frames = played.saturating_sub(start);
+        frames * 1000 / u64::from(self.shared.device_rate)
+    }
+
+    /// AIR-2.c — the index, relative to the track list handed to
+    /// [`play_from`](EngineHandle::play_from), of the currently-audible track.
+    /// `0` while the first track plays; advances at each gapless boundary.
+    #[must_use]
+    pub fn current_track_index(&self) -> usize {
+        self.shared.current_track().0
+    }
+
+    /// AIR-2.c — the queue cursor that engine-track 0 corresponds to (the cursor
+    /// at the moment [`play_from`](EngineHandle::play_from) was called). The
+    /// audible queue index is `play_base() + current_track_index()`.
+    #[must_use]
+    pub fn play_base(&self) -> usize {
+        self.shared.play_base.load(Ordering::Relaxed)
     }
 
     /// Whether the engine is in the playing (not paused) state. Distinct
@@ -579,10 +691,22 @@ fn apply_pending_seek(format: &mut dyn FormatReader, track_id: u32, shared: &Sha
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
-    shared.frames_played.store(
-        ms_to_frames(target_ms, shared.device_rate),
-        Ordering::Relaxed,
-    );
+    // AIR-2.c — the playhead is cumulative across the gapless track list, so a
+    // within-track seek lands at the AUDIBLE track's start offset + the target.
+    // `current_track()` keys on `frames_played` (what the listener hears), which
+    // is the track the scrubber is scrubbing; the decode thread applying this
+    // seek is at most the ~2 s back-pressure buffer ahead, so for the seekable
+    // single-/finite-track case this base is the right one. (The previous code
+    // reset frames_played to ms_to_frames(target) with no track offset, which
+    // mis-mapped every album track past the first back onto track 0.)
+    let (_, track_start) = shared.current_track();
+    let new_played = track_start + ms_to_frames(target_ms, shared.device_rate);
+    shared.frames_played.store(new_played, Ordering::Relaxed);
+    // The ring we just cleared was already counted in `frames_enqueued`; those
+    // samples will never be emitted, so rewind the enqueued counter to the new
+    // playhead. Otherwise the NEXT track's recorded boundary would over-count by
+    // the discarded buffer and the boundary→track map would drift.
+    shared.frames_enqueued.store(new_played, Ordering::Relaxed);
     true
 }
 
@@ -710,11 +834,8 @@ fn decode_track(url: &str, codec: SourceCodec, shared: &Shared) -> Result<(), St
         {
             std::thread::sleep(Duration::from_millis(8));
         }
-        shared
-            .ring
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend(mapped);
+        // AIR-2.c — push + count frames so the track-boundary map stays accurate.
+        shared.push_samples(&mapped);
     }
     Ok(())
 }
@@ -810,11 +931,8 @@ fn decode_opus(
         {
             std::thread::sleep(Duration::from_millis(8));
         }
-        shared
-            .ring
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend(mapped);
+        // AIR-2.c — push + count frames so the track-boundary map stays accurate.
+        shared.push_samples(&mapped);
     }
     Ok(())
 }
@@ -843,6 +961,24 @@ mod tests {
         assert_eq!(ms_to_frames(1_000, 0), 0); // no device → 0, no panic
                                                // A huge target saturates rather than wrapping.
         assert_eq!(ms_to_frames(u64::MAX, 48_000), u64::MAX / 1000);
+    }
+
+    #[test]
+    fn track_at_frame_maps_the_playhead_to_a_gapless_track() {
+        // AIR-2.c — three tracks starting at frames 0, 100, 250 in the
+        // continuous output stream.
+        let starts = [0u64, 100, 250];
+        // Before the first boundary is even crossed → track 0.
+        assert_eq!(track_at_frame(&starts, 0), (0, 0));
+        assert_eq!(track_at_frame(&starts, 99), (0, 0));
+        // Exactly on a boundary belongs to the new track.
+        assert_eq!(track_at_frame(&starts, 100), (1, 100));
+        assert_eq!(track_at_frame(&starts, 249), (1, 100));
+        assert_eq!(track_at_frame(&starts, 250), (2, 250));
+        // Past the last start stays on the last track.
+        assert_eq!(track_at_frame(&starts, 9_999), (2, 250));
+        // No track recorded yet → track 0 at frame 0 (no panic).
+        assert_eq!(track_at_frame(&[], 42), (0, 0));
     }
 
     #[test]
