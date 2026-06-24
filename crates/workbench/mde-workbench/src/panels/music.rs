@@ -19,11 +19,15 @@ use mde_musicd::airsonic::Client;
 use mde_musicd::cache;
 use mde_musicd::creds::{self, Creds};
 
+use crate::components::connect_progress::{self, ConnectProgress};
 use crate::controls::{styled_text_input, variant_button, ButtonVariant};
 
 /// Cache cap slider bounds (GiB).
 const CAP_MIN_GB: u64 = 1;
 const CAP_MAX_GB: u64 = 50;
+
+/// MESH-CONNECT-DIALOG-1 — the connect modal's title for this panel.
+const CONNECT_TITLE: &str = "Test Airsonic connection";
 
 #[derive(Debug, Clone, Default)]
 pub struct MusicPanel {
@@ -36,6 +40,9 @@ pub struct MusicPanel {
     pub cache_cap_gb: u64,
     pub status: String,
     pub busy: bool,
+    /// MESH-CONNECT-DIALOG-1 — the connect/configure progress modal for
+    /// the "Test connection" daemon probe (pending → success / failure).
+    pub connect: ConnectProgress,
 }
 
 #[derive(Debug, Clone)]
@@ -49,7 +56,14 @@ pub enum Message {
     PassChanged(String),
     Save,
     TestConnection,
-    TestResult(String),
+    /// The async ping landed: `Ok(api_version)` connected, `Err(detail)`
+    /// failed — resolves the connect modal to success / failure.
+    TestResult(Result<String, String>),
+    /// MESH-CONNECT-DIALOG-1 — re-run the probe from the modal's failure
+    /// state.
+    ConnectRetry,
+    /// MESH-CONNECT-DIALOG-1 — close the connect modal (Dismiss / backdrop).
+    ConnectDismiss,
     CacheCapChanged(u64),
     ClearCache,
     SignOut,
@@ -123,12 +137,22 @@ impl MusicPanel {
                 }
                 Task::none()
             }
-            Message::TestConnection => {
+            Message::TestConnection | Message::ConnectRetry => {
                 if self.busy {
                     return Task::none();
                 }
+                // Don't probe a half-filled form — show the failure state
+                // immediately rather than spinning forever on a bad URL.
+                if !creds::is_valid(&self.server_url, &self.username) {
+                    self.connect = ConnectProgress::pending(CONNECT_TITLE, "")
+                        .failure("Enter an http(s):// URL and a username first.");
+                    return Task::none();
+                }
                 self.busy = true;
-                self.status = "Testing…".to_string();
+                self.connect = ConnectProgress::pending(
+                    CONNECT_TITLE,
+                    format!("Contacting {}…", self.server_url.trim()),
+                );
                 let (url, user, pass) = (
                     self.server_url.clone(),
                     self.username.clone(),
@@ -137,17 +161,34 @@ impl MusicPanel {
                 Task::perform(
                     async move {
                         let client = Client::new(&url, &user, &pass);
-                        let msg = match client.ping().await {
-                            Ok(v) => format!("Connected (API v{v})."),
-                            Err(e) => format!("Failed: {e}"),
+                        let result = match client.ping().await {
+                            Ok(v) => Ok(format!("Connected — Airsonic API v{v}.")),
+                            Err(e) => Err(format!("Could not connect: {e}")),
                         };
-                        Message::TestResult(msg)
+                        Message::TestResult(result)
                     },
                     crate::Message::Music,
                 )
             }
-            Message::TestResult(s) => {
-                self.status = s;
+            Message::TestResult(result) => {
+                self.busy = false;
+                // Only resolve a modal that's still in flight: if the operator
+                // dismissed the dialog while the ping was outstanding, the stale
+                // result must NOT resurrect a closed modal (it would pop back up
+                // with an empty title over an unrelated screen).
+                if self.connect.is_pending() {
+                    self.connect = match result {
+                        Ok(msg) => self.connect.success(msg),
+                        Err(err) => self.connect.failure(err),
+                    };
+                }
+                Task::none()
+            }
+            Message::ConnectDismiss => {
+                self.connect = ConnectProgress::Closed;
+                // Clear busy too: a dismiss during a pending probe must not leave
+                // the "Test connection" button disabled (it's gated on !busy) with
+                // no modal to re-trigger from.
                 self.busy = false;
                 Task::none()
             }
@@ -260,7 +301,7 @@ impl MusicPanel {
         ]
         .spacing(8);
 
-        container(
+        let body: Element<'_, crate::Message, cosmic::Theme> = container(
             column![
                 text("Music").size(20),
                 server,
@@ -274,6 +315,86 @@ impl MusicPanel {
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .into()
+        .into();
+
+        // MESH-CONNECT-DIALOG-1 — stack the connect/configure progress modal
+        // over the panel body when a "Test connection" probe is open.
+        connect_progress::overlay(
+            &self.connect,
+            body,
+            pal,
+            m(Message::ConnectRetry),
+            m(Message::ConnectDismiss),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn panel_pending() -> MusicPanel {
+        let mut p = MusicPanel::new();
+        // A valid form so TestConnection actually fires the probe (opens Pending).
+        p.server_url = "https://music.example".into();
+        p.username = "u".into();
+        let _ = p.update(Message::TestConnection);
+        p
+    }
+
+    #[test]
+    fn test_connection_opens_the_pending_modal_and_marks_busy() {
+        let p = panel_pending();
+        assert!(p.busy, "probe in flight => busy");
+        assert!(
+            p.connect.is_pending(),
+            "modal is pending while the probe runs"
+        );
+    }
+
+    #[test]
+    fn invalid_form_fails_fast_without_a_probe() {
+        let mut p = MusicPanel::new(); // empty url/user => invalid
+        let _ = p.update(Message::TestConnection);
+        assert!(!p.busy, "no probe fired for an invalid form");
+        assert!(
+            matches!(p.connect, ConnectProgress::Failure { .. }),
+            "invalid form resolves straight to the failure state"
+        );
+    }
+
+    #[test]
+    fn dismiss_during_pending_clears_busy_and_closes() {
+        let mut p = panel_pending();
+        let _ = p.update(Message::ConnectDismiss);
+        assert!(
+            !p.busy,
+            "dismiss must clear busy so Test connection re-enables"
+        );
+        assert!(!p.connect.is_open(), "dismissed modal is closed");
+    }
+
+    #[test]
+    fn stale_result_after_dismiss_does_not_resurrect_the_modal() {
+        let mut p = panel_pending();
+        let _ = p.update(Message::ConnectDismiss); // close while the ping is outstanding
+                                                   // The in-flight ping finally lands — it must NOT reopen the closed modal.
+        let _ = p.update(Message::TestResult(Ok(
+            "Connected — Airsonic API v1.16.1.".into()
+        )));
+        assert!(
+            !p.connect.is_open(),
+            "a stale result must not resurrect a dismissed modal"
+        );
+    }
+
+    #[test]
+    fn result_while_pending_resolves_the_modal() {
+        let mut p = panel_pending();
+        let _ = p.update(Message::TestResult(
+            Err("Could not connect: refused".into()),
+        ));
+        assert!(!p.busy);
+        assert!(matches!(p.connect, ConnectProgress::Failure { .. }));
     }
 }
