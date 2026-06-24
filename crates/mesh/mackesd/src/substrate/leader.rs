@@ -178,3 +178,26 @@ pub async fn force(client: &mut Client, node_id: &str) -> Result<Lease, Error> {
         .await?;
     Ok(next)
 }
+
+/// Blocking façade over [`force`] for synchronous callers off the tokio executor
+/// (the LIGHTHOUSE-6 `lighthouse-promote` responder, which runs on the off-tokio
+/// host-ops thread). Mirrors [`current_leader_blocking`]: routes through the
+/// runtime-aware `super::peers::block_on` bridge so it's safe from both a
+/// `std::thread` and an async executor (a bare `block_on` would panic with
+/// "runtime within a runtime").
+///
+/// # Errors
+/// `Err(<message>)` when the etcd runtime is unavailable or the connect / force
+/// round-trip fails — the same string-typed surface the responder returns to the
+/// Bus reply.
+pub fn force_blocking(endpoints: &[String], node_id: &str) -> Result<Lease, String> {
+    super::peers::block_on(async {
+        let mut client = super::etcd::connect(endpoints)
+            .await
+            .map_err(|e| format!("etcd connect: {e}"))?;
+        force(&mut client, node_id)
+            .await
+            .map_err(|e| format!("etcd force: {e}"))
+    })
+    .ok_or_else(|| "etcd runtime unavailable".to_string())?
+}

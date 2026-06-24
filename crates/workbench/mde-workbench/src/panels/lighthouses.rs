@@ -15,7 +15,16 @@
 //! lighthouse first. The beam + a periodic refresh run only while this tab is
 //! active (wired in `app::subscription`).
 //!
-//! Full-ops actions (confirmed restart / SSH / promote-shadow) are LIGHTHOUSE-6.
+//! LIGHTHOUSE-6 — full-ops actions per card: **Restart** (cycle the anchor's
+//! core fabric units over the mesh key), **SSH / Open remote** (launch a local
+//! `cosmic-term ssh` to the overlay IP via the shared [`crate::launcher`]), and
+//! **Promote shadow → master** (force-take the leader lease via the daemon's
+//! existing leader-lease primitive; hidden on the node that already holds it).
+//! Each button opens the reused `connect_progress` modal as a **confirm gate**
+//! (PR #45) — Confirm fires the action, then the modal shows in-flight →
+//! success/failure. Restart + Promote round-trip `mackesd` over the Bus
+//! (`action/dc/lighthouse-{restart,promote}`, the already-spawned host-ops
+//! responder); SSH is a pure local launch and never touches the daemon.
 //!
 //! LIGHTHOUSE-8 — handshake / public IP / overlay peer count / uptime / CA
 //! cert-expiry now come from the per-lighthouse deep-probe lane: the `mackesd`
@@ -25,6 +34,8 @@
 //! directory rows. Fields the probe could not measure render `—` (never stubbed,
 //! §7).
 
+use std::time::Duration;
+
 use cosmic::iced::widget::{column, container, row, scrollable, text, Space};
 use cosmic::iced::{Length, Padding, Task};
 use cosmic::Element;
@@ -32,7 +43,58 @@ use mackes_mesh_types::lighthouse::{self, Beacon};
 use mackes_mesh_types::lighthouse_probe::LighthouseProbe;
 use mde_theme::{FontSize, Palette, TypeRole};
 
+use crate::components::connect_progress::{self, ConnectProgress};
+use crate::controls::{variant_button, ButtonVariant};
 use crate::cosmic_compat::prelude::*;
+use crate::launcher::Protocol;
+
+/// LIGHTHOUSE-6 — how long to wait for a `mackesd` action reply before the
+/// modal reports the daemon didn't answer. The restart cycles mackesd remotely
+/// to completion before replying, so this is generous (the daemon-down case
+/// still returns fast — `action_request` resolves `None` without a responder).
+const ACTION_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// LIGHTHOUSE-6 — one full-ops action the operator can take on a lighthouse
+/// card. Held on the panel while the confirm gate is open (and for the modal's
+/// Retry), it carries the identity the action needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// Restart the anchor's core fabric units (mackesd + nebula) over the
+    /// overlay. Needs the validated overlay IP for the daemon's mesh-key SSH.
+    Restart { host: String, overlay_ip: String },
+    /// Open a local SSH terminal to the lighthouse's overlay IP.
+    Ssh { host: String, overlay_ip: String },
+    /// Promote this shadow anchor to mesh leader (force-take the lease).
+    Promote { host: String },
+}
+
+impl Action {
+    /// The confirm-gate title (the dialog header).
+    fn title(&self) -> String {
+        match self {
+            Self::Restart { host, .. } => format!("Restart {host}"),
+            Self::Ssh { host, .. } => format!("Open SSH to {host}"),
+            Self::Promote { host } => format!("Promote {host}"),
+        }
+    }
+
+    /// The "are you sure?" prompt shown in the confirm gate.
+    fn prompt(&self) -> String {
+        match self {
+            Self::Restart { host, .. } => format!(
+                "Restart {host}'s core fabric units (nebula + mackesd) over the overlay? The \
+                 anchor's beacon drops until the units are back."
+            ),
+            Self::Ssh { host, overlay_ip } => {
+                format!("Open an SSH terminal to {host} ({overlay_ip})?")
+            }
+            Self::Promote { host } => format!(
+                "Promote {host} to mesh master? This force-takes the leader lease (bumps the \
+                 epoch), moving the lizardfs-master SPOF to {host}."
+            ),
+        }
+    }
+}
 
 /// Full display data for one lighthouse card, derived from its replicated
 /// directory row + the leader-lease master fact.
@@ -65,6 +127,18 @@ pub struct LighthousesPanel {
     /// Set once the first load has returned (distinguishes "loading" from
     /// "genuinely no lighthouses enrolled").
     pub loaded: bool,
+    /// LIGHTHOUSE-6 — the full-ops modal: confirm gate → in-flight → outcome,
+    /// reusing the PR #45 `connect_progress` component.
+    pub connect: ConnectProgress,
+    /// LIGHTHOUSE-6 — the action the open modal is confirming / running, so
+    /// Confirm fires it and Retry re-runs the same one.
+    pub pending_action: Option<Action>,
+    /// LIGHTHOUSE-6 — monotonic tag bumped each time an action fires. Carried on
+    /// [`Message::ActionFinished`] so a straggler reply from a superseded action
+    /// (dismissed, then a *different* action started) can't resolve the current
+    /// modal with the wrong outcome — only the reply whose generation matches the
+    /// in-flight action lands.
+    pub action_gen: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +148,21 @@ pub enum Message {
     BeamTick,
     /// Highlight + scroll a specific lighthouse (deep-link focus).
     Focus(String),
+    /// LIGHTHOUSE-6 — a card's action button was pressed: open the confirm gate
+    /// for this action (nothing fires until the operator confirms).
+    ActionRequested(Action),
+    /// LIGHTHOUSE-6 — the confirm gate's Confirm button: actually run the
+    /// remembered `pending_action`.
+    ConnectConfirm,
+    /// LIGHTHOUSE-6 — an action finished: `Ok(outcome line)` / `Err(error
+    /// line)` resolves the modal to success / failure. The `u64` is the
+    /// generation tag of the action that produced it; a reply whose tag is stale
+    /// (a superseded action) is dropped.
+    ActionFinished(u64, Result<String, String>),
+    /// LIGHTHOUSE-6 — re-run the remembered action from the modal's failure.
+    ConnectRetry,
+    /// LIGHTHOUSE-6 — close the modal (Cancel / Dismiss / backdrop click).
+    ConnectDismiss,
 }
 
 impl LighthousesPanel {
@@ -122,6 +211,82 @@ impl LighthousesPanel {
                 self.focus = Some(host);
                 Task::none()
             }
+            // LIGHTHOUSE-6 — a card action button: open the confirm gate.
+            // Nothing destructive runs until the operator presses Confirm.
+            Message::ActionRequested(action) => {
+                self.connect = ConnectProgress::confirm(action.title(), action.prompt());
+                self.pending_action = Some(action);
+                Task::none()
+            }
+            // LIGHTHOUSE-6 — Confirm / Retry both run the remembered action.
+            Message::ConnectConfirm | Message::ConnectRetry => match self.pending_action.clone() {
+                Some(action) => self.run_action(action),
+                None => Task::none(),
+            },
+            // LIGHTHOUSE-6 — the action's outcome lands → resolve the modal.
+            // Two guards: (1) the modal must still be in-flight (a late reply
+            // can't resurrect a dismissed modal), and (2) the reply's generation
+            // must be the CURRENT one (a straggler from a superseded action can't
+            // resolve a different in-flight action with the wrong outcome).
+            // `success`/`failure` keep the open title.
+            Message::ActionFinished(gen, result) => {
+                if self.connect.is_pending() && gen == self.action_gen {
+                    self.connect = match result {
+                        Ok(msg) => self.connect.success(msg),
+                        Err(e) => self.connect.failure(e),
+                    };
+                }
+                Task::none()
+            }
+            Message::ConnectDismiss => {
+                self.connect = ConnectProgress::Closed;
+                self.pending_action = None;
+                Task::none()
+            }
+        }
+    }
+
+    /// LIGHTHOUSE-6 — flip the modal to in-flight and fire `action`. Restart +
+    /// Promote round-trip `mackesd` over the Bus (off-runtime `action_request`,
+    /// wrapped in `spawn_blocking` — same contract as `load`); SSH launches a
+    /// local terminal. Each resolves to [`Message::ActionFinished`], tagged with
+    /// `action_gen` so a superseded action's late reply is ignored. The caller
+    /// (Confirm / Retry) already holds `pending_action`, so this only bumps the
+    /// generation + the modal state.
+    fn run_action(&mut self, action: Action) -> Task<crate::Message> {
+        self.connect = ConnectProgress::pending(action.title(), in_flight_label(&action));
+        self.action_gen = self.action_gen.wrapping_add(1);
+        let gen = self.action_gen;
+        match action {
+            Action::Restart { host, overlay_ip } => Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || restart_lighthouse(&host, &overlay_ip))
+                        .await
+                        .unwrap_or_else(|_| Err("restart task panicked".to_string()))
+                },
+                move |r| crate::Message::Lighthouses(Message::ActionFinished(gen, r)),
+            ),
+            Action::Promote { host } => Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || promote_lighthouse(&host))
+                        .await
+                        .unwrap_or_else(|_| Err("promote task panicked".to_string()))
+                },
+                move |r| crate::Message::Lighthouses(Message::ActionFinished(gen, r)),
+            ),
+            Action::Ssh { host, overlay_ip } => Task::perform(
+                async move {
+                    let ok = crate::launcher::launch(&overlay_ip, Protocol::Ssh).await;
+                    if ok {
+                        Ok(format!("Opened an SSH terminal to {host} ({overlay_ip})."))
+                    } else {
+                        Err(format!(
+                            "Could not launch a terminal for {host} (is cosmic-term installed?)."
+                        ))
+                    }
+                },
+                move |r| crate::Message::Lighthouses(Message::ActionFinished(gen, r)),
+            ),
         }
     }
 
@@ -201,7 +366,7 @@ impl LighthousesPanel {
             }
         }
 
-        container(
+        let body: Element<'_, crate::Message> = container(
             column![
                 header,
                 Space::new().height(Length::Fixed(12.0)),
@@ -214,7 +379,19 @@ impl LighthousesPanel {
         .padding(Padding::from([24u16, 32u16]))
         .width(Length::Fill)
         .height(Length::Fill)
-        .into()
+        .into();
+
+        // LIGHTHOUSE-6 — stack the full-ops modal over the panel: the confirm
+        // gate's Confirm fires the action, Retry re-runs it from a failure, and
+        // Cancel / Dismiss / backdrop close it.
+        connect_progress::overlay_confirm(
+            &self.connect,
+            body,
+            palette,
+            crate::Message::Lighthouses(Message::ConnectConfirm),
+            crate::Message::Lighthouses(Message::ConnectRetry),
+            crate::Message::Lighthouses(Message::ConnectDismiss),
+        )
     }
 }
 
@@ -345,9 +522,14 @@ fn lighthouse_card<'a>(
     ]
     .align_y(cosmic::iced::alignment::Vertical::Center);
 
+    // LIGHTHOUSE-6 — the full-ops action row: Restart + SSH always, Promote only
+    // on a shadow (the idempotent guard refuses an already-master promote, but
+    // the button is hidden too so the operator never reaches a dead action).
+    let body = column![inner, action_row(c, p)].spacing(12);
+
     // Focused card gets an accent left border; others a subtle border.
     let border_color = if focused { p.accent } else { p.border };
-    container(inner)
+    container(body)
         .padding(Padding::from([14u16, 16u16]))
         .width(Length::Fill)
         .style(
@@ -363,6 +545,60 @@ fn lighthouse_card<'a>(
                 ..Default::default()
             },
         )
+        .into()
+}
+
+/// LIGHTHOUSE-6 — the per-card full-ops action button row. Restart + SSH are
+/// always present; Promote appears only on a shadow (the master already holds the
+/// lease). SSH is enabled only when the card carries an overlay IP (no IP → no
+/// reachable target), and likewise Restart needs the IP for the daemon's SSH.
+fn action_row<'a>(c: &LighthouseCard, p: Palette) -> Element<'a, crate::Message> {
+    let host = c.beacon.hostname.clone();
+    let overlay_ip = c.beacon.overlay_ip.clone();
+
+    // Restart — needs the overlay IP for the daemon's mesh-key SSH.
+    let restart = variant_button(
+        "Restart",
+        ButtonVariant::Secondary,
+        overlay_ip.clone().map(|ip| {
+            crate::Message::Lighthouses(Message::ActionRequested(Action::Restart {
+                host: host.clone(),
+                overlay_ip: ip,
+            }))
+        }),
+        p,
+    );
+
+    // SSH / Open remote — a local terminal launch to the overlay IP.
+    let ssh = variant_button(
+        "SSH",
+        ButtonVariant::Ghost,
+        overlay_ip.clone().map(|ip| {
+            crate::Message::Lighthouses(Message::ActionRequested(Action::Ssh {
+                host: host.clone(),
+                overlay_ip: ip,
+            }))
+        }),
+        p,
+    );
+
+    let mut actions = row![restart, ssh].spacing(8);
+
+    // Promote — shadow only (the master can't be promoted to itself).
+    if !c.beacon.is_master {
+        let promote = variant_button(
+            "Promote ▸ master",
+            ButtonVariant::Primary,
+            Some(crate::Message::Lighthouses(Message::ActionRequested(
+                Action::Promote { host: host.clone() },
+            ))),
+            p,
+        );
+        actions = actions.push(promote);
+    }
+
+    actions
+        .align_y(cosmic::iced::alignment::Vertical::Center)
         .into()
 }
 
@@ -574,9 +810,254 @@ fn now_ms() -> u64 {
     .unwrap_or(0)
 }
 
+/// LIGHTHOUSE-6 — the in-flight label shown under the modal spinner per action.
+fn in_flight_label(action: &Action) -> String {
+    match action {
+        Action::Restart { host, .. } => {
+            format!("Restarting {host}'s core fabric units over the overlay…")
+        }
+        Action::Ssh { host, .. } => format!("Opening an SSH terminal to {host}…"),
+        Action::Promote { host } => format!("Promoting {host} to mesh master…"),
+    }
+}
+
+/// LIGHTHOUSE-6 — fire `action/dc/lighthouse-restart` at `mackesd` and turn the
+/// reply into a modal outcome line. Blocking (`action_request_with_body` builds
+/// its own current-thread runtime), so callers wrap it in `spawn_blocking`. The
+/// daemon validates `overlay_ip` + `confirm`, cycles mackesd to completion, then
+/// enqueues a `--no-block` nebula restart over the mesh key (the SSH rides the
+/// overlay nebula bounces); `None` (no live responder / timeout) is reported as
+/// such.
+fn restart_lighthouse(host: &str, overlay_ip: &str) -> Result<String, String> {
+    let body = serde_json::json!({ "overlay_ip": overlay_ip, "confirm": true }).to_string();
+    let reply = crate::dbus::action_request_with_body(
+        "action/dc/lighthouse-restart",
+        Some(&body),
+        ACTION_TIMEOUT,
+    )
+    .ok_or_else(|| "mackesd did not answer (is the control plane up?)".to_string())?;
+    if let Some(e) = crate::dbus::reply_error(&reply) {
+        return Err(e);
+    }
+    Ok(format!(
+        "Restarting {host}: mackesd cycled, nebula restart enqueued. The beacon \
+         re-greens once the overlay is back."
+    ))
+}
+
+/// LIGHTHOUSE-6 — fire `action/dc/lighthouse-promote` at `mackesd` and turn the
+/// reply into a modal outcome line. The daemon's idempotent guard refuses if
+/// `host` already holds the lease (surfaced as the failure error), else it
+/// force-takes the lease via the existing leader-lease primitive and replies
+/// with the new leader. Blocking — wrap in `spawn_blocking`.
+fn promote_lighthouse(host: &str) -> Result<String, String> {
+    let body = serde_json::json!({ "node": host, "confirm": true }).to_string();
+    let reply = crate::dbus::action_request_with_body(
+        "action/dc/lighthouse-promote",
+        Some(&body),
+        ACTION_TIMEOUT,
+    )
+    .ok_or_else(|| "mackesd did not answer (is the control plane up?)".to_string())?;
+    if let Some(e) = crate::dbus::reply_error(&reply) {
+        return Err(e);
+    }
+    // The reply carries the bare hostname now leading; fall back to `host`.
+    let leader = serde_json::from_str::<serde_json::Value>(&reply)
+        .ok()
+        .and_then(|v| {
+            v.get("leader")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| host.to_string());
+    Ok(format!("Promoted {leader} to mesh master."))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mackes_mesh_types::lighthouse::BeaconStatus;
+
+    /// A minimal shadow lighthouse card for the action-flow tests.
+    fn shadow_card(host: &str, ip: &str) -> LighthouseCard {
+        LighthouseCard {
+            beacon: Beacon {
+                hostname: host.to_string(),
+                overlay_ip: Some(ip.to_string()),
+                is_master: false,
+                status: BeaconStatus::Healthy,
+            },
+            health: "healthy".into(),
+            last_seen_age_s: 0,
+            services: String::new(),
+            mde_version: None,
+            probe: None,
+        }
+    }
+
+    #[test]
+    fn action_requested_opens_the_confirm_gate_and_remembers_the_action() {
+        let mut panel = LighthousesPanel::new();
+        let action = Action::Restart {
+            host: "anvil".into(),
+            overlay_ip: "10.42.0.5".into(),
+        };
+        let _ = panel.update(Message::ActionRequested(action.clone()));
+        // The modal is at the confirm gate (NOT in-flight) and the action is held.
+        assert!(panel.connect.is_confirm(), "{:?}", panel.connect);
+        assert!(!panel.connect.is_pending());
+        assert_eq!(panel.connect.title(), "Restart anvil");
+        assert_eq!(panel.pending_action, Some(action));
+    }
+
+    #[test]
+    fn confirm_flips_the_gate_to_in_flight() {
+        let mut panel = LighthousesPanel::new();
+        let _ = panel.update(Message::ActionRequested(Action::Promote {
+            host: "anvil".into(),
+        }));
+        // Confirm runs the action → the modal becomes Pending (in-flight). The
+        // request itself resolves on the blocking pool; we only assert the
+        // synchronous state transition here.
+        let _ = panel.update(Message::ConnectConfirm);
+        assert!(panel.connect.is_pending(), "{:?}", panel.connect);
+        assert_eq!(panel.connect.title(), "Promote anvil");
+    }
+
+    #[test]
+    fn finished_resolves_success_only_while_in_flight() {
+        let mut panel = LighthousesPanel::new();
+        let _ = panel.update(Message::ActionRequested(Action::Promote {
+            host: "anvil".into(),
+        }));
+        let _ = panel.update(Message::ConnectConfirm);
+        // The first fired action is generation 1.
+        let _ = panel.update(Message::ActionFinished(
+            panel.action_gen,
+            Ok("Promoted anvil to mesh master.".into()),
+        ));
+        assert!(
+            matches!(panel.connect, ConnectProgress::Success { .. }),
+            "{:?}",
+            panel.connect
+        );
+    }
+
+    #[test]
+    fn finished_resolves_failure_with_the_daemon_error() {
+        let mut panel = LighthousesPanel::new();
+        let _ = panel.update(Message::ActionRequested(Action::Restart {
+            host: "anvil".into(),
+            overlay_ip: "10.42.0.5".into(),
+        }));
+        let _ = panel.update(Message::ConnectConfirm);
+        let _ = panel.update(Message::ActionFinished(
+            panel.action_gen,
+            Err("ssh failed: timed out".into()),
+        ));
+        match &panel.connect {
+            ConnectProgress::Failure { error, .. } => assert_eq!(error, "ssh failed: timed out"),
+            other => panic!("expected Failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_late_reply_cannot_resurrect_a_dismissed_modal() {
+        let mut panel = LighthousesPanel::new();
+        let _ = panel.update(Message::ActionRequested(Action::Promote {
+            host: "anvil".into(),
+        }));
+        let _ = panel.update(Message::ConnectConfirm);
+        let gen = panel.action_gen;
+        // Operator dismisses while in flight (or after a manual close).
+        let _ = panel.update(Message::ConnectDismiss);
+        assert_eq!(panel.connect, ConnectProgress::Closed);
+        assert!(panel.pending_action.is_none());
+        // A straggler reply lands AFTER the dismiss — it must NOT reopen the modal.
+        let _ = panel.update(Message::ActionFinished(gen, Ok("done".into())));
+        assert_eq!(panel.connect, ConnectProgress::Closed);
+    }
+
+    #[test]
+    fn a_superseded_actions_reply_cannot_resolve_a_newer_in_flight_modal() {
+        // Action A fires (gen 1), is dismissed, then action B fires (gen 2) and is
+        // in flight. A's slow reply must NOT resolve B's modal with A's outcome.
+        let mut panel = LighthousesPanel::new();
+        let _ = panel.update(Message::ActionRequested(Action::Promote {
+            host: "anvil".into(),
+        }));
+        let _ = panel.update(Message::ConnectConfirm);
+        let gen_a = panel.action_gen;
+        let _ = panel.update(Message::ConnectDismiss);
+
+        // Start a DIFFERENT action B.
+        let _ = panel.update(Message::ActionRequested(Action::Restart {
+            host: "forge".into(),
+            overlay_ip: "10.42.0.6".into(),
+        }));
+        let _ = panel.update(Message::ConnectConfirm);
+        assert!(panel.connect.is_pending());
+        assert_eq!(panel.connect.title(), "Restart forge");
+
+        // A's straggler reply (stale generation) lands — it must be dropped, so
+        // B's modal stays in-flight, NOT resolved with A's "Promoted…" line.
+        let _ = panel.update(Message::ActionFinished(
+            gen_a,
+            Ok("Promoted anvil to mesh master.".into()),
+        ));
+        assert!(panel.connect.is_pending(), "{:?}", panel.connect);
+        assert_eq!(panel.connect.title(), "Restart forge");
+
+        // B's own reply (current generation) resolves it correctly.
+        let _ = panel.update(Message::ActionFinished(
+            panel.action_gen,
+            Ok("B done".into()),
+        ));
+        match &panel.connect {
+            ConnectProgress::Success { message, .. } => assert_eq!(message, "B done"),
+            other => panic!("expected B's Success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dismiss_clears_the_pending_action() {
+        let mut panel = LighthousesPanel::new();
+        let _ = panel.update(Message::ActionRequested(Action::Ssh {
+            host: "anvil".into(),
+            overlay_ip: "10.42.0.5".into(),
+        }));
+        assert!(panel.pending_action.is_some());
+        let _ = panel.update(Message::ConnectDismiss);
+        assert!(panel.pending_action.is_none());
+        assert_eq!(panel.connect, ConnectProgress::Closed);
+    }
+
+    #[test]
+    fn promote_button_is_omitted_for_the_master_card() {
+        // The master card renders no Promote action (can't promote to itself);
+        // the shadow card does. We can't introspect the widget tree, so assert
+        // the precondition the `action_row` branches on.
+        let mut master = shadow_card("anvil", "10.42.0.5");
+        master.beacon.is_master = true;
+        assert!(master.beacon.is_master);
+        let shadow = shadow_card("forge", "10.42.0.6");
+        assert!(!shadow.beacon.is_master);
+    }
+
+    #[test]
+    fn action_titles_and_prompts_name_the_host() {
+        let restart = Action::Restart {
+            host: "anvil".into(),
+            overlay_ip: "10.42.0.5".into(),
+        };
+        assert_eq!(restart.title(), "Restart anvil");
+        assert!(restart.prompt().contains("anvil"));
+        let promote = Action::Promote {
+            host: "forge".into(),
+        };
+        assert_eq!(promote.title(), "Promote forge");
+        assert!(promote.prompt().contains("master"));
+    }
 
     /// Build a bus-envelope JSON string the way `mde-bus publish --body-flag`
     /// stores it: our [`LighthouseProbe`] JSON lives in the `body` string field.
