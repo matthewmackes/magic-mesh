@@ -1161,6 +1161,30 @@ pub struct DatacenterPanel {
     /// DATACENTER-13 (Network tab) — the in-progress "Read L2" target dom0 box. The
     /// "Read L2" button fires `action/dc/host-net` against it. Pure UI state.
     pub net_read_dom0: String,
+    /// DATACENTER-16 (Power tab) — the in-progress host-wake form (BMC / cred /
+    /// MAC / dom0). Edited on the Power tab; packed into the wake / idle-policy
+    /// RPCs. Pure local UI state.
+    pub power_form: PowerForm,
+    /// DATACENTER-16 (Power tab) — the live wake-in-progress (phase + progress +
+    /// ETA), or `None` when no wake is being tracked. Seeded on a Wake and
+    /// updated by the `action/dc/wake-eta` poll.
+    pub wake_progress: Option<WakeProgress>,
+    /// DATACENTER-16 (Power tab) — when the in-flight wake started, for the
+    /// elapsed-seconds the ETA poll measures against and the learned sample
+    /// recorded once the wake reaches ready. `None` when no wake is in flight.
+    pub wake_started: Option<Instant>,
+    /// DATACENTER-16 (Power tab) — the recorded per-target wake durations
+    /// (seconds), keyed by target label (BMC or MAC). The rolling average drives
+    /// the learned ETA. Hydrates as wakes complete.
+    pub wake_samples: BTreeMap<String, Vec<u64>>,
+    /// DATACENTER-16 (Power tab) — the latest idle-shutdown recommendation line
+    /// from `action/dc/idle-policy` (e.g. "0 running guests … — shut down"), or
+    /// empty until the policy has been checked.
+    pub idle_reason: String,
+    /// DATACENTER-16 (Power tab) — whether the latest idle-policy read recommends
+    /// a graceful shutdown. Drives the "Shut down (graceful)" button's enablement
+    /// so the operator only acts on a recommendation.
+    pub idle_shutdown_ok: bool,
 }
 
 /// Top-level view selector for the datacenter panel.
@@ -1197,6 +1221,11 @@ pub enum ViewMode {
     /// the interactive hosts↔networks↔VMs↔gateway topology map, and the unified
     /// IP/DNS view correlating droplet public IPs ↔ DO regions ↔ overlay IPs.
     Network,
+    /// DATACENTER-16 — the Power tab: energy-aware host power. Per-host wake (IPMI
+    /// primary, Wake-on-LAN fallback) with a phased POST→XCP→toolstack progress
+    /// bar driven by a learned per-host ETA, plus an idle-shutdown policy that
+    /// recommends powering down a host carrying zero running guests.
+    Power,
 }
 
 impl ViewMode {
@@ -1215,6 +1244,7 @@ impl ViewMode {
             ViewMode::Audit => "audit",
             ViewMode::Topology => "topology",
             ViewMode::Network => "network",
+            ViewMode::Power => "power",
         }
     }
 
@@ -1233,6 +1263,7 @@ impl ViewMode {
             "audit" => ViewMode::Audit,
             "topology" => ViewMode::Topology,
             "network" => ViewMode::Network,
+            "power" => ViewMode::Power,
             // "overview" and anything unknown.
             _ => ViewMode::Overview,
         }
@@ -1412,6 +1443,57 @@ pub enum NetField {
     VlanName,
     /// VLAN-create: destination dom0.
     VlanDom0,
+}
+
+/// DATACENTER-16 (Power tab) — the in-progress host-wake form. The "Wake" button
+/// packs it into the `action/dc/ipmi-power` request (IPMI primary, `mac` the WoL
+/// fallback); the "WoL only" button fires `action/dc/wol` straight off `mac`.
+/// Pure local UI state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PowerForm {
+    /// The target's BMC host (IPv4 / hostname) for the IPMI wake path.
+    pub bmc: String,
+    /// The BMC username.
+    pub user: String,
+    /// The BMC password.
+    pub pass: String,
+    /// The target's MAC — the Wake-on-LAN fallback (and the "WoL only" source).
+    pub mac: String,
+    /// The dom0 IP the idle-shutdown policy reads (running-guest count over SSH).
+    pub dom0: String,
+}
+
+/// DATACENTER-16 (Power tab) — a live wake-in-progress: the phased
+/// POST→XCP→toolstack progress bar + learned ETA the `action/dc/wake-eta` reply
+/// drives. Seeded when a Wake fires; updated each time the panel polls the ETA.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WakeProgress {
+    /// The wake target's label (BMC / MAC) shown above the bar.
+    pub target: String,
+    /// The current phase slug ("post" | "xcp" | "toolstack" | "ready").
+    pub phase: String,
+    /// The phased progress fraction (0.0..=1.0).
+    pub progress: f64,
+    /// The remaining-seconds ETA.
+    pub eta: u64,
+    /// Whether the wake has reached the Ready phase.
+    pub ready: bool,
+}
+
+/// DATACENTER-16 (Power tab) — which power-form field a `PowerFieldChanged`
+/// targets. Keeps every power form-edit a single message variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerField {
+    /// The BMC host box.
+    Bmc,
+    /// The BMC username box.
+    User,
+    /// The BMC password box.
+    Pass,
+    /// The MAC box.
+    Mac,
+    /// The idle-policy dom0 box.
+    Dom0,
 }
 
 /// DATACENTER-12 (Storage tab) — which storage form field a `StorageFieldChanged`
@@ -1757,6 +1839,14 @@ impl Default for DatacenterPanel {
             net_read: None,
             vlan_create: VlanCreateForm::default(),
             net_read_dom0: String::new(),
+            // DATACENTER-16 (Power tab) — the wake form + live progress + learned
+            // samples hydrate from operator gestures; the constructor stays pure.
+            power_form: PowerForm::default(),
+            wake_progress: None,
+            wake_started: None,
+            wake_samples: BTreeMap::new(),
+            idle_reason: String::new(),
+            idle_shutdown_ok: false,
         }
     }
 }
@@ -2168,6 +2258,42 @@ pub enum Message {
     /// DATACENTER-13 — the `action/dc/host-vlan-create` RPC came back. `Ok` carries
     /// the new network uuid; `Err` the error text.
     VlanCreateDone(Result<String, String>),
+
+    // ── DATACENTER-16 (Power tab) ────────────────────────────────────────────
+    /// DATACENTER-16 — a power-form field changed (BMC / user / pass / MAC / dom0).
+    /// Keeps every power form-edit one variant. Pure state.
+    PowerFieldChanged {
+        field: PowerField,
+        value: String,
+    },
+    /// DATACENTER-16 — the "Wake (IPMI)" button: fire `action/dc/ipmi-power` with
+    /// `op:"on"` (BMC primary, the form's MAC the WoL fallback) AND seed a live
+    /// wake-progress so the phased bar starts ticking off the learned ETA.
+    WakeClicked,
+    /// DATACENTER-16 — the "WoL only" button: fire `action/dc/wol` straight off the
+    /// form's MAC (no BMC). Also seeds the live wake-progress.
+    WolWakeClicked,
+    /// DATACENTER-16 — the `action/dc/ipmi-power` / `action/dc/wol` wake RPC came
+    /// back. `Ok` carries `(target, status_line)`; `Err` the error text.
+    WakeDone(Result<(String, String), String>),
+    /// DATACENTER-16 — re-read the learned ETA for the in-flight wake: fires
+    /// `action/dc/wake-eta` with the target's samples + elapsed seconds so the
+    /// phased bar advances. Triggered by the wake-progress timer tick.
+    WakeEtaPoll,
+    /// DATACENTER-16 — the `action/dc/wake-eta` reply came back with the updated
+    /// `WakeProgress` (phase + progress + ETA). `Err` carries the error text.
+    WakeEtaDone(Result<WakeProgress, String>),
+    /// DATACENTER-16 — the "Check idle" button: fire the read-only
+    /// `action/dc/idle-policy` against the form's dom0 to count running guests and
+    /// get the shutdown recommendation.
+    IdlePolicyClicked,
+    /// DATACENTER-16 — the `action/dc/idle-policy` reply: `Ok` carries
+    /// `(running, shutdown, reason)`; `Err` the error text.
+    IdlePolicyDone(Result<(usize, bool, String), String>),
+    /// DATACENTER-16 — the "Shut down (graceful)" button (enabled only when the
+    /// idle policy recommends it): fires the existing confirm-gated
+    /// `action/dc/host-power` `shutdown` op against the form's dom0.
+    IdleShutdownClicked,
 }
 
 /// DATACENTER-11 (VMs tab) — which create-wizard field a `CreateFieldChanged`
@@ -3252,7 +3378,211 @@ impl DatacenterPanel {
                 self.status = e;
                 Task::none()
             }
+
+            // ── DATACENTER-16 (Power tab) ────────────────────────────────────
+            Message::PowerFieldChanged { field, value } => {
+                match field {
+                    PowerField::Bmc => self.power_form.bmc = value,
+                    PowerField::User => self.power_form.user = value,
+                    PowerField::Pass => self.power_form.pass = value,
+                    PowerField::Mac => self.power_form.mac = value,
+                    PowerField::Dom0 => self.power_form.dom0 = value,
+                }
+                Task::none()
+            }
+            Message::WakeClicked => {
+                let form = self.power_form.clone();
+                let target = if form.bmc.trim().is_empty() {
+                    form.mac.trim().to_string()
+                } else {
+                    form.bmc.trim().to_string()
+                };
+                if target.is_empty() {
+                    self.status = "Wake needs a BMC host or a MAC.".into();
+                    return Task::none();
+                }
+                self.seed_wake_progress(&target);
+                self.status = format!("Waking {target} (IPMI, WoL fallback)…");
+                let poll = self.wake_eta_poll_task();
+                Task::batch([
+                    Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || ipmi_wake(&form))
+                                .await
+                                .unwrap_or_else(|e| Err(format!("wake task panicked: {e}")))
+                        },
+                        |result| crate::Message::Datacenter(Message::WakeDone(result)),
+                    ),
+                    poll,
+                ])
+            }
+            Message::WolWakeClicked => {
+                let mac = self.power_form.mac.trim().to_string();
+                if mac.is_empty() {
+                    self.status = "WoL needs a MAC.".into();
+                    return Task::none();
+                }
+                self.seed_wake_progress(&mac);
+                self.status = format!("Waking {mac} (Wake-on-LAN)…");
+                let poll = self.wake_eta_poll_task();
+                let mac_for_rpc = mac.clone();
+                Task::batch([
+                    Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || wol_wake_rpc(&mac_for_rpc))
+                                .await
+                                .unwrap_or_else(|e| Err(format!("wol task panicked: {e}")))
+                        },
+                        |result| crate::Message::Datacenter(Message::WakeDone(result)),
+                    ),
+                    poll,
+                ])
+            }
+            Message::WakeDone(Ok((target, line))) => {
+                self.status = format!("{target}: {line}");
+                Task::none()
+            }
+            Message::WakeDone(Err(e)) => {
+                self.status = format!("wake failed: {e}");
+                // A failed wake clears the in-flight progress so the bar doesn't
+                // keep ticking toward a host that never came up.
+                self.wake_progress = None;
+                Task::none()
+            }
+            Message::WakeEtaPoll => {
+                let Some(wp) = &self.wake_progress else {
+                    return Task::none();
+                };
+                if wp.ready {
+                    // The wake reached ready — record the duration as a learned
+                    // sample and stop polling.
+                    self.record_wake_sample();
+                    return Task::none();
+                }
+                let target = wp.target.clone();
+                let started = self.wake_started;
+                let samples = self.wake_samples.get(&target).cloned().unwrap_or_default();
+                Task::perform(
+                    async move {
+                        let elapsed = started.map(|s| s.elapsed().as_secs()).unwrap_or(0);
+                        tokio::task::spawn_blocking(move || {
+                            wake_eta_rpc(&samples, elapsed, &target)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("wake-eta task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::WakeEtaDone(result)),
+                )
+            }
+            Message::WakeEtaDone(Ok(wp)) => {
+                let ready = wp.ready;
+                self.wake_progress = Some(wp);
+                if ready {
+                    // Reached ready: record the sample, leave the (full) bar up.
+                    self.record_wake_sample();
+                    Task::none()
+                } else {
+                    // Still waking — re-arm the ~1s poll so the bar advances.
+                    self.wake_eta_poll_later()
+                }
+            }
+            Message::WakeEtaDone(Err(e)) => {
+                self.status = format!("wake-eta: {e}");
+                Task::none()
+            }
+            Message::IdlePolicyClicked => {
+                let dom0 = self.power_form.dom0.trim().to_string();
+                if dom0.is_empty() {
+                    self.status = "Idle check needs a dom0 IP.".into();
+                    return Task::none();
+                }
+                self.status = format!("Checking idle policy for {dom0}…");
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || idle_policy_rpc(&dom0))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("idle-policy task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::IdlePolicyDone(result)),
+                )
+            }
+            Message::IdlePolicyDone(Ok((running, shutdown, reason))) => {
+                self.idle_reason = reason.clone();
+                self.idle_shutdown_ok = shutdown;
+                self.status = format!("Idle policy: {running} running guest(s) — {reason}");
+                Task::none()
+            }
+            Message::IdlePolicyDone(Err(e)) => {
+                self.idle_reason = String::new();
+                self.idle_shutdown_ok = false;
+                self.status = format!("idle-policy: {e}");
+                Task::none()
+            }
+            Message::IdleShutdownClicked => {
+                // Only act on a live recommendation; the graceful shutdown runs
+                // through the existing confirm-gated host-power op.
+                if !self.idle_shutdown_ok {
+                    self.status = "No idle-shutdown recommendation — check idle first.".into();
+                    return Task::none();
+                }
+                let dom0 = self.power_form.dom0.trim().to_string();
+                if dom0.is_empty() {
+                    self.status = "Idle shutdown needs a dom0 IP.".into();
+                    return Task::none();
+                }
+                self.idle_shutdown_ok = false;
+                self.status = format!("Shutting down idle host {dom0} (graceful)…");
+                Self::host_power_task(dom0, "shutdown".to_string())
+            }
         }
+    }
+
+    /// DATACENTER-16 — seed a fresh wake-progress for `target` (phase POST, 0%)
+    /// and start the elapsed-time clock. Shared by the IPMI + WoL wake paths.
+    fn seed_wake_progress(&mut self, target: &str) {
+        self.wake_progress = Some(WakeProgress {
+            target: target.to_string(),
+            phase: "post".to_string(),
+            progress: 0.0,
+            eta: rolling_avg_local(self.wake_samples.get(target)),
+            ready: false,
+        });
+        self.wake_started = Some(Instant::now());
+    }
+
+    /// DATACENTER-16 — record the just-finished wake's duration as a learned
+    /// sample for its target (keeping the most recent `WAKE_SAMPLE_WINDOW`), so
+    /// the next wake's ETA is sharper. No-op if no clock is running.
+    fn record_wake_sample(&mut self) {
+        let (Some(wp), Some(started)) = (&self.wake_progress, self.wake_started) else {
+            return;
+        };
+        let secs = started.elapsed().as_secs().max(1);
+        let samples = self.wake_samples.entry(wp.target.clone()).or_default();
+        samples.push(secs);
+        // Keep only the most recent window (matches `rolling_avg_local`).
+        if samples.len() > WAKE_SAMPLE_WINDOW_LOCAL {
+            let drop = samples.len() - WAKE_SAMPLE_WINDOW_LOCAL;
+            samples.drain(0..drop);
+        }
+        self.wake_started = None;
+    }
+
+    /// DATACENTER-16 — fire the first `action/dc/wake-eta` poll immediately when a
+    /// wake starts (so the bar moves off 0 without waiting a full tick).
+    fn wake_eta_poll_task(&self) -> Task<crate::Message> {
+        Task::done(crate::Message::Datacenter(Message::WakeEtaPoll))
+    }
+
+    /// DATACENTER-16 — sleep ~1s, then emit another [`Message::WakeEtaPoll`]. The
+    /// chain self-stops once the wake reaches ready (no idle wakeups).
+    fn wake_eta_poll_later(&self) -> Task<crate::Message> {
+        Task::perform(
+            async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            },
+            |()| crate::Message::Datacenter(Message::WakeEtaPoll),
+        )
     }
 
     /// DATACENTER-10 — fire the `action/dc/host-power` RPC on a blocking thread
@@ -3829,6 +4159,207 @@ impl DatacenterPanel {
                 ..container::Style::default()
             })
             .into()
+    }
+
+    /// DATACENTER-16 (Power tab) — the whole energy-aware Power tab: a per-host
+    /// wake form (IPMI primary, Wake-on-LAN fallback) with a phased
+    /// POST→XCP→toolstack progress bar driven by a learned per-host ETA, and an
+    /// idle-shutdown policy that recommends powering down a host carrying zero
+    /// running guests (the graceful shutdown runs through the existing
+    /// confirm-gated host-power op). Returns one column the view dispatch pushes;
+    /// mde-theme tokens only (§4) — every control routes a panel-scoped message.
+    fn power_tab_view(&self, palette: Palette) -> Element<'_, crate::Message> {
+        let mut col = column![text("Power").size(f32::from(spacing::BASE[5]))]
+            .spacing(f32::from(spacing::BASE[2]));
+        col = col.push(
+            text("Energy-aware host power — wake by demand, shut down when idle.")
+                .colr(palette.text_muted.into_cosmic_color()),
+        );
+
+        // ── Section 1: wake a host (IPMI primary, WoL fallback) ──────────────
+        col = col.push(text("Wake a host").size(f32::from(spacing::BASE[5])));
+        let pf = &self.power_form;
+        let bmc_row = row![
+            text("BMC").colr(palette.text_muted.into_cosmic_color()),
+            text_input("BMC host (IPv4 / hostname)", &pf.bmc)
+                .on_input(|v| crate::Message::Datacenter(Message::PowerFieldChanged {
+                    field: PowerField::Bmc,
+                    value: v,
+                }))
+                .width(Length::FillPortion(2)),
+            text_input("user", &pf.user)
+                .on_input(|v| crate::Message::Datacenter(Message::PowerFieldChanged {
+                    field: PowerField::User,
+                    value: v,
+                }))
+                .width(Length::FillPortion(1)),
+            text_input("pass", &pf.pass)
+                .on_input(|v| crate::Message::Datacenter(Message::PowerFieldChanged {
+                    field: PowerField::Pass,
+                    value: v,
+                }))
+                .secure(true)
+                .width(Length::FillPortion(1)),
+        ]
+        .spacing(f32::from(spacing::BASE[2]))
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+        col = col.push(self.storage_card(bmc_row.into(), palette));
+
+        let mac_row = row![
+            text("MAC").colr(palette.text_muted.into_cosmic_color()),
+            text_input("aa:bb:cc:dd:ee:ff (WoL fallback / WoL-only)", &pf.mac)
+                .on_input(|v| crate::Message::Datacenter(Message::PowerFieldChanged {
+                    field: PowerField::Mac,
+                    value: v,
+                }))
+                .width(Length::FillPortion(2)),
+            variant_button(
+                "Wake (IPMI)".to_string(),
+                ButtonVariant::Primary,
+                Some(crate::Message::Datacenter(Message::WakeClicked)),
+                palette,
+            ),
+            variant_button(
+                "WoL only".to_string(),
+                ButtonVariant::Secondary,
+                Some(crate::Message::Datacenter(Message::WolWakeClicked)),
+                palette,
+            ),
+        ]
+        .spacing(f32::from(spacing::BASE[2]))
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+        col = col.push(self.storage_card(mac_row.into(), palette));
+
+        // The phased wake progress bar + learned ETA (only while a wake is live).
+        if let Some(wp) = &self.wake_progress {
+            col = col.push(self.wake_progress_view(wp, palette));
+        }
+
+        // ── Section 2: idle-shutdown policy ──────────────────────────────────
+        col = col.push(text("Idle-shutdown policy").size(f32::from(spacing::BASE[5])));
+        col = col.push(
+            text(
+                "A host with zero running guests is a graceful-shutdown candidate. \
+                 Check a dom0, then shut it down (the graceful host-disable runs \
+                 through the confirm-gated host op).",
+            )
+            .colr(palette.text_muted.into_cosmic_color()),
+        );
+        let idle_row = row![
+            text("dom0").colr(palette.text_muted.into_cosmic_color()),
+            text_input("dom0 IP (allow-listed Xen host)", &pf.dom0)
+                .on_input(|v| crate::Message::Datacenter(Message::PowerFieldChanged {
+                    field: PowerField::Dom0,
+                    value: v,
+                }))
+                .width(Length::FillPortion(2)),
+            variant_button(
+                "Check idle".to_string(),
+                ButtonVariant::Secondary,
+                Some(crate::Message::Datacenter(Message::IdlePolicyClicked)),
+                palette,
+            ),
+            // The shutdown button only carries its message when the last idle
+            // check recommended it — the gate is visible, not silent.
+            variant_button(
+                "Shut down (graceful)".to_string(),
+                ButtonVariant::Primary,
+                if self.idle_shutdown_ok {
+                    Some(crate::Message::Datacenter(Message::IdleShutdownClicked))
+                } else {
+                    None
+                },
+                palette,
+            ),
+        ]
+        .spacing(f32::from(spacing::BASE[2]))
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+        col = col.push(self.storage_card(idle_row.into(), palette));
+        if !self.idle_reason.is_empty() {
+            let tone = if self.idle_shutdown_ok {
+                palette.success
+            } else {
+                palette.text_muted
+            };
+            col = col.push(
+                self.storage_card(
+                    text(format!("Recommendation: {}", self.idle_reason))
+                        .colr(tone.into_cosmic_color())
+                        .into(),
+                    palette,
+                ),
+            );
+        }
+
+        col.into()
+    }
+
+    /// DATACENTER-16 (Power tab) — render the live wake-in-progress: the target
+    /// label, a phased POST→XCP→toolstack progress bar (a token-filled portion of
+    /// the track width, never a raw hex), the current phase, and the learned ETA.
+    /// The bar holds at 99% until the XAPI poll flips it to ready, so a full bar
+    /// always means the host actually answered. mde-theme tokens only (§4).
+    fn wake_progress_view<'a>(
+        &self,
+        wp: &WakeProgress,
+        palette: Palette,
+    ) -> Element<'a, crate::Message> {
+        // Phase label + ETA / ready line.
+        let phase_label = match wp.phase.as_str() {
+            "post" => "POST (firmware)",
+            "xcp" => "XCP-ng boot",
+            "toolstack" => "Toolstack (XAPI) coming up",
+            "ready" => "Ready",
+            other => other,
+        };
+        let head = if wp.ready {
+            text(format!("{} — ready", wp.target)).colr(palette.success.into_cosmic_color())
+        } else {
+            text(format!("{} — {phase_label} · ETA {}s", wp.target, wp.eta))
+                .colr(palette.text.into_cosmic_color())
+        };
+
+        // The bar: a filled portion + a remainder portion across the track. The
+        // filled portion is success-toned once ready, accent-toned while waking.
+        let filled = (wp.progress.clamp(0.0, 1.0) * 1000.0).round() as u16;
+        let remainder = 1000u16.saturating_sub(filled).max(1);
+        let fill_color = if wp.ready {
+            palette.success
+        } else {
+            palette.accent
+        };
+        let track = palette.raised;
+        let bar = container(
+            row![
+                container(text(""))
+                    .width(Length::FillPortion(filled.max(1)))
+                    .height(Length::Fixed(f32::from(spacing::BASE[3])))
+                    .style(move |_theme| container::Style {
+                        background: Some(cosmic::iced::Background::Color(
+                            fill_color.into_cosmic_color(),
+                        )),
+                        ..container::Style::default()
+                    }),
+                container(text(""))
+                    .width(Length::FillPortion(remainder))
+                    .height(Length::Fixed(f32::from(spacing::BASE[3])))
+                    .style(move |_theme| container::Style {
+                        background: Some(cosmic::iced::Background::Color(
+                            track.into_cosmic_color()
+                        )),
+                        ..container::Style::default()
+                    }),
+            ]
+            .spacing(0.0),
+        )
+        .width(Length::Fill);
+
+        self.storage_card(
+            column![head, bar]
+                .spacing(f32::from(spacing::BASE[2]))
+                .into(),
+            palette,
+        )
     }
 
     /// DATACENTER-13 (Network tab) — the whole Network tab: the L2 inventory
@@ -4846,6 +5377,7 @@ impl DatacenterPanel {
             mode_btn("VMs", ViewMode::Vms),
             mode_btn("Storage", ViewMode::Storage),
             mode_btn("Network", ViewMode::Network),
+            mode_btn("Power", ViewMode::Power),
             mode_btn("Topology", ViewMode::Topology),
             mode_btn("Resources", ViewMode::Zone),
             mode_btn("Tofu", ViewMode::Tofu),
@@ -5405,6 +5937,9 @@ impl DatacenterPanel {
             }
             ViewMode::Network => {
                 col = col.push(self.network_tab_view(palette));
+            }
+            ViewMode::Power => {
+                col = col.push(self.power_tab_view(palette));
             }
             ViewMode::Zone => {
                 if self.rows.is_empty() {
@@ -7249,6 +7784,126 @@ fn host_pool_rpc(dom0: &str) -> Result<(String, HostPool), String> {
     Err(format!("unexpected host-pool reply: {raw}"))
 }
 
+/// DATACENTER-16 (Power tab) — how many recent wake samples the panel windows the
+/// rolling average over. Mirrors the daemon's `dc_power::WAKE_SAMPLE_WINDOW`.
+const WAKE_SAMPLE_WINDOW_LOCAL: usize = 10;
+
+/// DATACENTER-16 (Power tab) — the default learned-wake estimate (seconds) before
+/// any sample exists. Mirrors the daemon's `dc_power::DEFAULT_WAKE_SECS`.
+const DEFAULT_WAKE_SECS_LOCAL: u64 = 180;
+
+/// DATACENTER-16 (Power tab) — the locally-computed rolling-average wake ETA
+/// (seconds) from a target's recorded samples, used to seed the progress bar's
+/// initial ETA before the first `wake-eta` poll returns. Mirrors the daemon's
+/// `rolling_avg_wake_secs` defaults: no samples → a conservative 180s.
+fn rolling_avg_local(samples: Option<&Vec<u64>>) -> u64 {
+    match samples {
+        Some(s) if !s.is_empty() => {
+            let window: &[u64] = if s.len() > WAKE_SAMPLE_WINDOW_LOCAL {
+                &s[s.len() - WAKE_SAMPLE_WINDOW_LOCAL..]
+            } else {
+                s
+            };
+            let sum: u64 = window.iter().sum();
+            ((sum + window.len() as u64 / 2) / window.len() as u64).max(1)
+        }
+        _ => DEFAULT_WAKE_SECS_LOCAL,
+    }
+}
+
+/// DATACENTER-16 (Power tab) — fire `action/dc/ipmi-power` with `op:"on"` to wake
+/// a host (IPMI primary; the form's MAC is the WoL fallback the daemon uses if the
+/// BMC is unreachable). Returns `(target, status_line)` — the target label echoed
+/// for the status line. The reply is `{"ok":true,"result":"..","via":"ipmi"|"wol"}`.
+fn ipmi_wake(form: &PowerForm) -> Result<(String, String), String> {
+    let bmc = form.bmc.trim();
+    let mac = form.mac.trim();
+    let target = if bmc.is_empty() {
+        mac.to_string()
+    } else {
+        bmc.to_string()
+    };
+    let mut body = serde_json::json!({
+        "op": "on",
+        "bmc": bmc,
+        "user": form.user.trim(),
+        "pass": form.pass,
+    });
+    if !mac.is_empty() {
+        body["mac"] = serde_json::Value::String(mac.to_string());
+    }
+    let v = dc_rpc("ipmi-power", &body.to_string(), Duration::from_secs(30))?;
+    let line = v
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("woke");
+    let via = v
+        .get("via")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    Ok((target, format!("{line} (via {via})")))
+}
+
+/// DATACENTER-16 (Power tab) — fire `action/dc/wol` to broadcast the Wake-on-LAN
+/// magic packet for `mac`. Returns `(mac, status_line)`. Reply `{"ok":true}`.
+fn wol_wake_rpc(mac: &str) -> Result<(String, String), String> {
+    let body = serde_json::json!({ "mac": mac }).to_string();
+    dc_rpc("wol", &body, Duration::from_secs(10))?;
+    Ok((mac.to_string(), "WoL magic packet sent".to_string()))
+}
+
+/// DATACENTER-16 (Power tab) — fire the PURE `action/dc/wake-eta` (no I/O on the
+/// daemon side) with the target's samples + elapsed seconds, decoding the phased
+/// progress + learned ETA into a [`WakeProgress`]. `target` is carried through for
+/// the bar label. Reply `{"ok":true,"avg":A,"phase":"..","progress":F,"eta":E,"ready":B}`.
+fn wake_eta_rpc(samples: &[u64], elapsed: u64, target: &str) -> Result<WakeProgress, String> {
+    let body = serde_json::json!({ "samples": samples, "elapsed": elapsed }).to_string();
+    let v = dc_rpc("wake-eta", &body, Duration::from_secs(5))?;
+    Ok(WakeProgress {
+        target: target.to_string(),
+        phase: v
+            .get("phase")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("post")
+            .to_string(),
+        progress: v
+            .get("progress")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0),
+        eta: v
+            .get("eta")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        ready: v
+            .get("ready")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+/// DATACENTER-16 (Power tab) — fire the read-only `action/dc/idle-policy` against a
+/// dom0 to count its running guests and get the idle-shutdown recommendation.
+/// Returns `(running, shutdown, reason)`. Reply
+/// `{"ok":true,"running":N,"shutdown":B,"reason":".."}`.
+fn idle_policy_rpc(dom0: &str) -> Result<(usize, bool, String), String> {
+    let body = serde_json::json!({ "dom0": dom0 }).to_string();
+    let v = dc_rpc("idle-policy", &body, Duration::from_secs(30))?;
+    let running = v
+        .get("running")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize;
+    let shutdown = v
+        .get("shutdown")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let reason = v
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Ok((running, shutdown, reason))
+}
+
 /// DATACENTER-13 (Network tab) — fire the read-only `action/dc/host-net` RPC for a
 /// dom0's L2 inventory (networks + PIFs/NICs + VLAN tags) and decode the reply into
 /// a [`NetRead`]. The reply is `{"ok":true,"nets":[..],"pifs":[..]}` (→ the decoded
@@ -7380,6 +8035,7 @@ mod tests {
             ViewMode::Audit,
             ViewMode::Topology,
             ViewMode::Network,
+            ViewMode::Power,
         ] {
             assert_eq!(
                 ViewMode::from_slug(mode.slug()),
@@ -7993,6 +8649,141 @@ mod tests {
             dom0: "172.20.0.9".to_string(),
         });
         assert_eq!(p.status, "Copied: ssh root@172.20.0.9");
+    }
+
+    // ── DATACENTER-16 (Power tab) ────────────────────────────────────────────
+
+    #[test]
+    fn power_field_edits_land_on_the_form() {
+        let mut p = DatacenterPanel::new();
+        for (field, val) in [
+            (PowerField::Bmc, "172.20.0.9"),
+            (PowerField::User, "ADMIN"),
+            (PowerField::Pass, "secret"),
+            (PowerField::Mac, "aa:bb:cc:dd:ee:ff"),
+            (PowerField::Dom0, "172.20.0.10"),
+        ] {
+            let _ = p.update(Message::PowerFieldChanged {
+                field,
+                value: val.to_string(),
+            });
+        }
+        assert_eq!(p.power_form.bmc, "172.20.0.9");
+        assert_eq!(p.power_form.user, "ADMIN");
+        assert_eq!(p.power_form.pass, "secret");
+        assert_eq!(p.power_form.mac, "aa:bb:cc:dd:ee:ff");
+        assert_eq!(p.power_form.dom0, "172.20.0.10");
+    }
+
+    #[test]
+    fn wake_clicked_needs_a_bmc_or_mac() {
+        let mut p = DatacenterPanel::new();
+        // Empty form → no wake seeded, just a hint.
+        let _ = p.update(Message::WakeClicked);
+        assert!(p.wake_progress.is_none());
+        assert!(p.status.contains("BMC host or a MAC"), "{}", p.status);
+    }
+
+    #[test]
+    fn wake_clicked_seeds_progress_off_the_bmc() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::PowerFieldChanged {
+            field: PowerField::Bmc,
+            value: "172.20.0.9".to_string(),
+        });
+        let _ = p.update(Message::WakeClicked);
+        let wp = p.wake_progress.expect("wake seeded");
+        assert_eq!(wp.target, "172.20.0.9");
+        assert_eq!(wp.phase, "post");
+        assert!(p.wake_started.is_some());
+        assert!(p.status.contains("Waking 172.20.0.9"), "{}", p.status);
+    }
+
+    #[test]
+    fn wol_only_needs_a_mac() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::WolWakeClicked);
+        assert!(p.wake_progress.is_none());
+        assert!(p.status.contains("WoL needs a MAC"), "{}", p.status);
+    }
+
+    #[test]
+    fn wake_eta_ready_records_a_learned_sample() {
+        let mut p = DatacenterPanel::new();
+        // Seed a wake, then deliver a ready ETA → the duration is recorded.
+        p.power_form.bmc = "172.20.0.9".to_string();
+        let _ = p.update(Message::WakeClicked);
+        assert!(!p.wake_samples.contains_key("172.20.0.9"));
+        let _ = p.update(Message::WakeEtaDone(Ok(WakeProgress {
+            target: "172.20.0.9".to_string(),
+            phase: "ready".to_string(),
+            progress: 0.99,
+            eta: 0,
+            ready: true,
+        })));
+        let samples = p.wake_samples.get("172.20.0.9").expect("sample recorded");
+        assert_eq!(samples.len(), 1);
+        assert!(samples[0] >= 1, "a recorded wake is at least 1s");
+        assert!(p.wake_started.is_none(), "clock cleared once ready");
+    }
+
+    #[test]
+    fn wake_done_err_clears_the_bar() {
+        let mut p = DatacenterPanel::new();
+        p.power_form.mac = "aa:bb:cc:dd:ee:ff".to_string();
+        let _ = p.update(Message::WolWakeClicked);
+        assert!(p.wake_progress.is_some());
+        let _ = p.update(Message::WakeDone(Err("no route".to_string())));
+        assert!(p.wake_progress.is_none(), "a failed wake stops the bar");
+        assert!(p.status.contains("wake failed"), "{}", p.status);
+    }
+
+    #[test]
+    fn idle_policy_done_gates_the_shutdown_button() {
+        let mut p = DatacenterPanel::new();
+        // A recommendation to shut down arms the button.
+        let _ = p.update(Message::IdlePolicyDone(Ok((
+            0,
+            true,
+            "0 running guests — shut down".to_string(),
+        ))));
+        assert!(p.idle_shutdown_ok);
+        assert!(p.idle_reason.contains("shut down"));
+        // A "keep powered" read disarms it.
+        let _ = p.update(Message::IdlePolicyDone(Ok((
+            2,
+            false,
+            "2 running guest(s) — keep powered".to_string(),
+        ))));
+        assert!(!p.idle_shutdown_ok);
+    }
+
+    #[test]
+    fn idle_shutdown_refuses_without_a_recommendation() {
+        let mut p = DatacenterPanel::new();
+        p.power_form.dom0 = "172.20.0.9".to_string();
+        // No idle check yet → the click is refused (idle_shutdown_ok is false).
+        let _ = p.update(Message::IdleShutdownClicked);
+        assert!(p.status.contains("check idle first"), "{}", p.status);
+    }
+
+    #[test]
+    fn idle_policy_needs_a_dom0() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::IdlePolicyClicked);
+        assert!(p.status.contains("needs a dom0"), "{}", p.status);
+    }
+
+    #[test]
+    fn rolling_avg_local_defaults_then_averages() {
+        assert_eq!(rolling_avg_local(None), DEFAULT_WAKE_SECS_LOCAL);
+        assert_eq!(rolling_avg_local(Some(&vec![])), DEFAULT_WAKE_SECS_LOCAL);
+        assert_eq!(rolling_avg_local(Some(&vec![100])), 100);
+        assert_eq!(rolling_avg_local(Some(&vec![100, 200])), 150);
+        // Windows to the most recent WAKE_SAMPLE_WINDOW_LOCAL samples.
+        let mut s = vec![1000, 1000];
+        s.extend(std::iter::repeat_n(100u64, WAKE_SAMPLE_WINDOW_LOCAL));
+        assert_eq!(rolling_avg_local(Some(&s)), 100);
     }
 
     #[test]
