@@ -34,12 +34,23 @@ use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
 use crate::cosmic_compat::prelude::*;
 
 /// The modal's lifecycle. `Closed` renders nothing (the panel shows its
-/// body bare); the other three are the live dialog states.
+/// body bare); the other states are the live dialog states.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ConnectProgress {
     /// No modal — the panel body renders bare.
     #[default]
     Closed,
+    /// LIGHTHOUSE-6 — a pre-action **confirm gate**: a question glyph +
+    /// a prompt, with Confirm (primary) + Cancel buttons, shown before
+    /// a destructive action fires. The host wires the Confirm button to
+    /// the message that actually launches the action (which then flips
+    /// the modal to [`Self::Pending`]). Rendered via [`overlay_confirm`].
+    Confirm {
+        /// Operator-readable title (what's about to happen).
+        title: String,
+        /// The "are you sure?" prompt under the question glyph.
+        prompt: String,
+    },
     /// In-flight: a spinner glyph + a label describing the probe
     /// (e.g. "Checking mesh service status…").
     Pending {
@@ -63,6 +74,17 @@ pub enum ConnectProgress {
 }
 
 impl ConnectProgress {
+    /// LIGHTHOUSE-6 — open the modal in its confirm-gate state for
+    /// `title`, with a `prompt` describing the destructive action the
+    /// operator is about to confirm.
+    #[must_use]
+    pub fn confirm(title: impl Into<String>, prompt: impl Into<String>) -> Self {
+        Self::Confirm {
+            title: title.into(),
+            prompt: prompt.into(),
+        }
+    }
+
     /// Open the modal in its pending state for `title`, with an initial
     /// `label` describing the probe that's about to run.
     #[must_use]
@@ -104,12 +126,20 @@ impl ConnectProgress {
         matches!(self, Self::Pending { .. })
     }
 
+    /// LIGHTHOUSE-6 — is the modal at the pre-action confirm gate (so the
+    /// host should still be waiting for a Confirm/Cancel, not polling)?
+    #[must_use]
+    pub fn is_confirm(&self) -> bool {
+        matches!(self, Self::Confirm { .. })
+    }
+
     /// The dialog title for the current state (empty for `Closed`).
     #[must_use]
     pub fn title(&self) -> &str {
         match self {
             Self::Closed => "",
-            Self::Pending { title, .. }
+            Self::Confirm { title, .. }
+            | Self::Pending { title, .. }
             | Self::Success { title, .. }
             | Self::Failure { title, .. } => title,
         }
@@ -159,7 +189,31 @@ where
     if !state.is_open() {
         return body;
     }
-    let modal = view(state, palette, on_retry, on_dismiss, primary);
+    let modal = view(state, palette, on_retry, on_dismiss, primary, None);
+    stack![body, modal].into()
+}
+
+/// LIGHTHOUSE-6 — as [`overlay`], but wires the [`ConnectProgress::Confirm`]
+/// gate's **Confirm** button to `on_confirm` (the message that actually fires the
+/// destructive action). The same `on_dismiss` drives the gate's Cancel button +
+/// a backdrop click-out. The non-Confirm states render exactly as [`overlay`]
+/// (Retry / Dismiss), so one `overlay_confirm` call covers the whole
+/// confirm → in-flight → outcome lifecycle for a panel.
+pub fn overlay_confirm<'a, Message>(
+    state: &ConnectProgress,
+    body: Element<'a, Message, cosmic::Theme>,
+    palette: Palette,
+    on_confirm: Message,
+    on_retry: Message,
+    on_dismiss: Message,
+) -> Element<'a, Message, cosmic::Theme>
+where
+    Message: Clone + 'a,
+{
+    if !state.is_open() {
+        return body;
+    }
+    let modal = view(state, palette, on_retry, on_dismiss, None, Some(on_confirm));
     stack![body, modal].into()
 }
 
@@ -171,23 +225,24 @@ fn view<'a, Message>(
     on_retry: Message,
     on_dismiss: Message,
     primary: Option<(&'a str, Message)>,
+    on_confirm: Option<Message>,
 ) -> Element<'a, Message, cosmic::Theme>
 where
     Message: Clone + 'a,
 {
-    let terminal = !state.is_pending();
-    // The backdrop intercepts clicks; in a terminal state a backdrop
-    // click dismisses (click-out), while a pending probe's backdrop is
-    // inert so it can't be dismissed mid-flight.
+    // The backdrop intercepts clicks; in a dismissable state (terminal outcome
+    // OR the pre-action confirm gate) a backdrop click dismisses/cancels, while
+    // a pending probe's backdrop is inert so it can't be dismissed mid-flight.
+    let dismissable = !state.is_pending();
     let backdrop = crate::panel_chrome::dialog_backdrop::<Message>();
-    let backdrop: Element<'a, Message, cosmic::Theme> = if terminal {
+    let backdrop: Element<'a, Message, cosmic::Theme> = if dismissable {
         mouse_area(backdrop).on_press(on_dismiss.clone()).into()
     } else {
         backdrop
     };
 
     let dialog = crate::panel_chrome::dialog(
-        dialog_body(state, palette, on_retry, on_dismiss, primary),
+        dialog_body(state, palette, on_retry, on_dismiss, primary, on_confirm),
         palette,
         mde_theme::Density::Comfortable,
     );
@@ -210,6 +265,7 @@ fn dialog_body<'a, Message>(
     on_retry: Message,
     on_dismiss: Message,
     primary: Option<(&'a str, Message)>,
+    on_confirm: Option<Message>,
 ) -> Element<'a, Message, cosmic::Theme>
 where
     Message: Clone + 'a,
@@ -223,6 +279,13 @@ where
             Icon::StatusUnknown,
             palette.text_muted.into_cosmic_color(),
             String::new(),
+        ),
+        // LIGHTHOUSE-6 — the pre-action confirm gate: a caution glyph + the
+        // "are you sure?" prompt, colored with the `warning` token.
+        ConnectProgress::Confirm { prompt, .. } => (
+            Icon::StatusWarning,
+            palette.warning.into_cosmic_color(),
+            prompt.clone(),
         ),
         ConnectProgress::Pending { label, .. } => (
             // The "pending" status dot stands in for an animated spinner —
@@ -261,7 +324,7 @@ where
         left: 16.0,
     });
 
-    let buttons = button_row(state, palette, on_retry, on_dismiss, primary);
+    let buttons = button_row(state, palette, on_retry, on_dismiss, primary, on_confirm);
 
     column![title_row, status_block, buttons]
         .spacing(4)
@@ -269,16 +332,18 @@ where
         .into()
 }
 
-/// The action row per state: Pending has none (the probe is running),
-/// Success has Dismiss (+ optional primary action), Failure has Retry +
-/// Dismiss (+ optional primary action). `dialog_button_row` lays them out
-/// right-aligned with the primary rightmost.
+/// The action row per state: Confirm has Cancel + Confirm (the pre-action
+/// gate), Pending has none (the probe is running), Success has Dismiss (+
+/// optional primary action), Failure has Retry + Dismiss (+ optional primary
+/// action). `dialog_button_row` lays them out right-aligned with the primary
+/// rightmost.
 fn button_row<'a, Message>(
     state: &ConnectProgress,
     palette: Palette,
     on_retry: Message,
     on_dismiss: Message,
     primary: Option<(&'a str, Message)>,
+    on_confirm: Option<Message>,
 ) -> Element<'a, Message, cosmic::Theme>
 where
     Message: Clone + 'a,
@@ -307,6 +372,27 @@ where
         // No buttons while the probe is in flight — the modal resolves
         // itself when the host's poll lands a terminal outcome.
         ConnectProgress::Closed | ConnectProgress::Pending { .. } => Vec::new(),
+        // LIGHTHOUSE-6 — the confirm gate: Cancel (ghost) + Confirm (primary).
+        // `on_confirm` is only `Some` via `overlay_confirm`; if a caller renders
+        // a Confirm state through the plain `overlay`, the Confirm button is
+        // omitted (no dead, unwired button) — Cancel still closes the gate.
+        ConnectProgress::Confirm { .. } => {
+            let mut a = vec![variant_button(
+                "Cancel",
+                ButtonVariant::Ghost,
+                Some(on_dismiss),
+                palette,
+            )];
+            if let Some(msg) = on_confirm {
+                a.push(variant_button(
+                    "Confirm",
+                    ButtonVariant::Primary,
+                    Some(msg),
+                    palette,
+                ));
+            }
+            a
+        }
         ConnectProgress::Success { .. } => {
             let mut a = vec![variant_button(
                 "Dismiss",
@@ -403,18 +489,44 @@ mod tests {
     }
 
     #[test]
+    fn confirm_is_open_and_is_confirm_keeps_title() {
+        let s = ConnectProgress::confirm("Restart anvil", "Restart the lighthouse core?");
+        assert!(s.is_open());
+        assert!(s.is_confirm());
+        assert!(!s.is_pending());
+        assert_eq!(s.title(), "Restart anvil");
+        assert!(matches!(s, ConnectProgress::Confirm { .. }));
+    }
+
+    #[test]
     fn view_renders_each_open_state_without_panic() {
         let palette = crate::live_theme::palette();
         for s in [
+            ConnectProgress::confirm("t", "sure?"),
             ConnectProgress::pending("t", "l"),
             ConnectProgress::pending("t", "l").success("ok"),
             ConnectProgress::pending("t", "l").failure("err"),
         ] {
-            // Both the plain (no primary action) and the primary-action forms.
-            let _: Element<'_, (), cosmic::Theme> = view(&s, palette, (), (), None);
+            // The plain form, the primary-action form, and the confirm form (a
+            // wired Confirm button) — none should panic.
+            let _: Element<'_, (), cosmic::Theme> = view(&s, palette, (), (), None, None);
             let _: Element<'_, (), cosmic::Theme> =
-                view(&s, palette, (), (), Some(("Open settings", ())));
+                view(&s, palette, (), (), Some(("Open settings", ())), None);
+            let _: Element<'_, (), cosmic::Theme> = view(&s, palette, (), (), None, Some(()));
         }
+    }
+
+    #[test]
+    fn overlay_confirm_passes_body_through_when_closed() {
+        let body: Element<'_, (), cosmic::Theme> = cosmic::iced::widget::text("body").into();
+        let _ = overlay_confirm(
+            &ConnectProgress::Closed,
+            body,
+            crate::live_theme::palette(),
+            (),
+            (),
+            (),
+        );
     }
 
     #[test]

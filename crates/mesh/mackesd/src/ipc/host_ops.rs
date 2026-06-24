@@ -1,5 +1,5 @@
 //! DATACENTER (action layer) — `action/dc/host-power` → Xen host (dom0)
-//! maintenance + reboot control.
+//! maintenance + reboot control, plus the LIGHTHOUSE-6 anchor-node ops.
 //!
 //! Companion to the VM power responder ([`crate::ipc::datacenter`]): where that
 //! acts on a guest VM, this acts on the host (pool member) itself. Same
@@ -16,6 +16,22 @@
 //! The host UUID is resolved remotely (`xe host-list params=uuid --minimal`),
 //! then each verb runs as `xe <verb> host=<uuid>` in sequence.
 //! Reply `{"ok":true}` when every step succeeds, `{"error":"<message>"}` otherwise.
+//!
+//! LIGHTHOUSE-6 — the Workbench Lighthouses tab's full-ops actions land here too
+//! (this is the already-spawned, mesh-key-SSH ops responder; the actions reuse
+//! its remote-exec + the daemon's leader-lease plumbing, no new transport):
+//!   * `lighthouse-restart` `{ "overlay_ip", "confirm": true }` — restart the
+//!     anchor's core fabric units (`mackesd` + `nebula`) over the mesh key
+//!     ([`lighthouse_restart`]). `overlay_ip` is validated as a plain IPv4
+//!     ([`valid_ipv4`]) before any SSH, so it can never carry shell metachars.
+//!   * `lighthouse-promote` `{ "node", "confirm": true }` — promote a shadow
+//!     anchor to mesh leader via the EXISTING leader-lease force-take (substrate-
+//!     aware: etcd `force` when on the coordination plane, else the fs lockfile
+//!     [`crate::leader::force_take`]). Idempotent: refuses if `node` already
+//!     holds the lease ([`lighthouse_promote`]).
+//! (The `lighthouse-ssh` action is a pure Workbench-side terminal launch — it
+//! opens a local `cosmic-term ssh` to the overlay IP and never round-trips the
+//! daemon, so there is no `lighthouse-ssh` responder verb here.)
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,10 +46,9 @@ use serde_json::json;
 /// from the orchestrator's env-driven config).
 #[derive(Debug, Clone)]
 pub struct HostOpsService {
-    // Carried for parity with the other action services and the
-    // `new(workgroup_root)` spawn contract; the allowed-dom0 set + ssh key are
-    // read from the orchestrator's env config, so this isn't read here yet.
-    #[allow(dead_code)]
+    // The shared workgroup root — read by the LIGHTHOUSE-6 promote verb to locate
+    // the `.mackesd-leader.lock` for the fs-lockfile leader path. (The dom0 SSH
+    // key + allowed-dom0 set come from the orchestrator's env config, not here.)
     workgroup_root: PathBuf,
 }
 
@@ -46,11 +61,14 @@ impl HostOpsService {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 4] = [
+pub const ACTION_VERBS: [&str; 6] = [
     "host-power",
     "gateway-reboot",
     "dr-backup",
     "gateway-status",
+    // LIGHTHOUSE-6 — the Workbench Lighthouses tab's full-ops actions.
+    "lighthouse-restart",
+    "lighthouse-promote",
 ];
 
 /// Responder poll interval.
@@ -83,22 +101,11 @@ pub fn host_power_commands(op: &str) -> Result<Vec<String>, String> {
 }
 
 /// Run a remote `xe` command on a dom0 over SSH, returning the process result.
-/// Mirrors the exact ssh arg style of `ssh_xe` in the orchestrator.
+/// Mirrors the exact ssh arg style of `ssh_xe` in the orchestrator. Thin alias
+/// over [`ssh_run`] (a dom0 IS just a `root@<host>` mesh-key target) so the two
+/// remote-exec paths can never drift on their SSH hardening flags.
 fn ssh_xe_status(key: &str, dom0: &str, remote: &str) -> std::io::Result<std::process::Output> {
-    std::process::Command::new("ssh")
-        .args([
-            "-i",
-            key,
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=8",
-            &format!("root@{dom0}"),
-            remote,
-        ])
-        .output()
+    ssh_run(key, dom0, remote)
 }
 
 /// Validate that `s` is a plain dotted-quad IPv4 address: only ASCII digits and
@@ -337,15 +344,216 @@ fn dr_backup(req_body: Option<&str>) -> Result<String, String> {
     }
 }
 
+/// LIGHTHOUSE-6 — run a remote command on a mesh node over the mesh key,
+/// returning the process result. The lighthouse counterpart of [`ssh_xe_status`]
+/// (same arg style + `BatchMode`/`ConnectTimeout` hardening), generalized off the
+/// fixed `xe` target so it can drive `systemctl` on an anchor node.
+fn ssh_run(key: &str, host: &str, remote: &str) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("ssh")
+        .args([
+            "-i",
+            key,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            &format!("root@{host}"),
+            remote,
+        ])
+        .output()
+}
+
+/// LIGHTHOUSE-6 — restart a lighthouse's core fabric units over the mesh key.
+///
+/// Body `{ "overlay_ip", "confirm": true }`. The `overlay_ip` MUST be a plain
+/// dotted-quad ([`valid_ipv4`]) — checked BEFORE any SSH so it can never carry a
+/// shell metacharacter into the remote command — and the destructive restart is
+/// `confirm:true`-gated like [`gateway_reboot`]/[`dr_backup`].
+///
+/// **Transport-aware ordering (CRITICAL):** this SSH rides the *overlay* IP, i.e.
+/// the Nebula tunnel that restarting `nebula` itself tears down — so the units
+/// can't both be restarted with a normal blocking `systemctl restart` (bouncing
+/// nebula would cut our own session and we'd misreport a healthy restart as a
+/// failure). Instead:
+///   1. `systemctl restart mackesd` runs **to completion** — it's the control
+///      plane, NOT our SSH transport, so we get its real exit.
+///   2. `nebula` is restarted with `systemctl --no-block`, which enqueues the
+///      restart and returns *before* the overlay bounces. The command exit is the
+///      honest "the restart was accepted" signal — we deliberately do not (and
+///      cannot) observe nebula's post-bounce state over a tunnel we just dropped;
+///      the card's live beacon re-greens on the next directory refresh once the
+///      overlay is back.
+/// Combining both into ONE remote shell keeps it to a single SSH round-trip on
+/// the responder thread. `Ok(())` once the command returns zero.
+fn lighthouse_restart(req_body: Option<&str>) -> Result<(), String> {
+    let Some(body) = req_body else {
+        return Err("lighthouse-restart: missing request body".into());
+    };
+    let req: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("lighthouse-restart: bad json: {e}"))?;
+
+    let confirm = req
+        .get("confirm")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !confirm {
+        return Err("lighthouse restart requires confirm:true".into());
+    }
+
+    let overlay_ip = req
+        .get("overlay_ip")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !valid_ipv4(overlay_ip) {
+        return Err("overlay_ip must be a plain IPv4 address".into());
+    }
+
+    let key = crate::workers::datacenter_orchestrator::xen_ssh_key();
+
+    // One round-trip: mackesd to completion (real exit), then nebula `--no-block`
+    // so the overlay only bounces AFTER the command has returned (see the
+    // transport-aware ordering note above). The literal verbs carry no
+    // operator/untrusted input, so there's nothing to escape.
+    let remote = "systemctl restart mackesd && systemctl --no-block restart nebula";
+    match ssh_run(&key, overlay_ip, remote) {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let msg = stderr.trim();
+            if msg.is_empty() {
+                Err("lighthouse restart failed".into())
+            } else {
+                Err(format!("restart failed: {msg}"))
+            }
+        }
+        Err(e) => Err(format!("ssh failed: {e}")),
+    }
+}
+
+/// LIGHTHOUSE-6 — promote a shadow anchor to mesh leader via the EXISTING
+/// leader-lease force-take (the same primitive `mackesd take-leadership --force`
+/// uses). Substrate-aware exactly like [`crate::ipc::directory::Directory`]'s
+/// leader read: the etcd lease `force` when the coordination plane is configured
+/// (endpoints present), else the fs lockfile [`crate::leader::force_take`].
+///
+/// Body `{ "node", "confirm": true }`. `confirm:true`-gated. **Idempotent guard
+/// (§ the task's "refuse if already master"):** reads the current leader first
+/// and refuses with an error if `node` already holds the lease, so a double-click
+/// can't needlessly bump the epoch. Returns the bare hostname now leading.
+///
+/// Thin wrapper over [`promote_with_endpoints`] that supplies the node's real
+/// configured etcd endpoints ([`crate::substrate::etcd::default_endpoints`]); the
+/// inner fn takes them explicitly so a test stays hermetic (passes `&[]` for the
+/// fs-lockfile path regardless of whether the host is provisioned onto etcd).
+fn lighthouse_promote(
+    workgroup_root: &std::path::Path,
+    req_body: Option<&str>,
+) -> Result<String, String> {
+    promote_with_endpoints(
+        workgroup_root,
+        &crate::substrate::etcd::default_endpoints(),
+        req_body,
+    )
+}
+
+/// LIGHTHOUSE-6 — the promote core, taking the etcd `endpoints` explicitly (empty
+/// = off the coordination plane, use the fs lockfile). See [`lighthouse_promote`].
+fn promote_with_endpoints(
+    workgroup_root: &std::path::Path,
+    etcd_endpoints: &[String],
+    req_body: Option<&str>,
+) -> Result<String, String> {
+    let Some(body) = req_body else {
+        return Err("lighthouse-promote: missing request body".into());
+    };
+    let req: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("lighthouse-promote: bad json: {e}"))?;
+
+    let confirm = req
+        .get("confirm")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !confirm {
+        return Err("lighthouse promote requires confirm:true".into());
+    }
+
+    // The Workbench passes the bare directory hostname; the cluster's lease
+    // node_id convention is `peer:<host>` (see `default_node_id`, the
+    // leader-election campaign, and `take-leadership --force`). Normalize to that
+    // canonical form so the force-taken lease is byte-identical to what the live
+    // election loop would next write — otherwise the lease diverges and the next
+    // renewal by the real leader churns it. Accept either spelling on the wire.
+    // `bare` drives the idempotent guard + the reply (readers strip `peer:`).
+    let node = req
+        .get("node")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let bare = node.strip_prefix("peer:").unwrap_or(node);
+    if bare.is_empty() {
+        return Err("lighthouse-promote: missing `node`".into());
+    }
+    let canonical = format!("peer:{bare}");
+
+    // Idempotent guard: who leads now? Compare on the bare hostname (the lease
+    // node_id may carry the `peer:` prefix), matching the directory responder.
+    let current = if etcd_endpoints.is_empty() {
+        crate::leader::read_current_lease(&workgroup_root.join(".mackesd-leader.lock"))
+            .map(|l| l.node_id)
+    } else {
+        crate::substrate::leader::current_leader_blocking(etcd_endpoints).map(|l| l.node_id)
+    };
+    if let Some(cur) = &current {
+        let cur_bare = cur.strip_prefix("peer:").unwrap_or(cur);
+        if cur_bare == bare {
+            return Err(format!("{bare} is already the master"));
+        }
+    }
+
+    // Force-take leadership for the named node via the EXISTING primitive (the
+    // same one `mackesd take-leadership --force` uses): the fs lockfile force-take
+    // off-substrate, else the substrate-aware blocking etcd `force`. Writes the
+    // canonical `peer:<host>` node_id.
+    let lease = if etcd_endpoints.is_empty() {
+        crate::leader::force_take(&workgroup_root.join(".mackesd-leader.lock"), &canonical)
+            .map_err(|e| format!("promote: {e}"))?
+    } else {
+        crate::substrate::leader::force_blocking(etcd_endpoints, &canonical)
+            .map_err(|e| format!("promote: {e}"))?
+    };
+
+    Ok(lease
+        .node_id
+        .strip_prefix("peer:")
+        .unwrap_or(&lease.node_id)
+        .to_string())
+}
+
 /// Build the reply for one `action/dc/<verb>` request.
 #[must_use]
-pub fn build_reply(_svc: &HostOpsService, verb: &str, req_body: Option<&str>) -> String {
+pub fn build_reply(svc: &HostOpsService, verb: &str, req_body: Option<&str>) -> String {
     let err = |m: String| json!({ "error": m }).to_string();
     match verb {
         "host-power" => {}
         "gateway-reboot" => {
             return match gateway_reboot(req_body) {
                 Ok(()) => json!({ "ok": true }).to_string(),
+                Err(m) => err(m),
+            };
+        }
+        // LIGHTHOUSE-6 — restart the anchor's core fabric units over the mesh key.
+        "lighthouse-restart" => {
+            return match lighthouse_restart(req_body) {
+                Ok(()) => json!({ "ok": true }).to_string(),
+                Err(m) => err(m),
+            };
+        }
+        // LIGHTHOUSE-6 — promote a shadow anchor to leader (idempotent).
+        "lighthouse-promote" => {
+            return match lighthouse_promote(&svc.workgroup_root, req_body) {
+                Ok(leader) => json!({ "ok": true, "leader": leader }).to_string(),
                 Err(m) => err(m),
             };
         }
@@ -503,10 +711,141 @@ mod tests {
         assert_eq!(action_topic("gateway-reboot"), "action/dc/gateway-reboot");
         assert_eq!(action_topic("dr-backup"), "action/dc/dr-backup");
         assert_eq!(action_topic("gateway-status"), "action/dc/gateway-status");
+        assert_eq!(
+            action_topic("lighthouse-restart"),
+            "action/dc/lighthouse-restart"
+        );
+        assert_eq!(
+            action_topic("lighthouse-promote"),
+            "action/dc/lighthouse-promote"
+        );
         assert!(ACTION_VERBS.contains(&"host-power"));
         assert!(ACTION_VERBS.contains(&"gateway-reboot"));
         assert!(ACTION_VERBS.contains(&"dr-backup"));
         assert!(ACTION_VERBS.contains(&"gateway-status"));
+        assert!(ACTION_VERBS.contains(&"lighthouse-restart"));
+        assert!(ACTION_VERBS.contains(&"lighthouse-promote"));
+    }
+
+    #[test]
+    fn lighthouse_restart_requires_confirm_true() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        // confirm omitted — must be rejected BEFORE any SSH.
+        let body = json!({ "overlay_ip": "10.42.0.5" }).to_string();
+        let r = build_reply(&s, "lighthouse-restart", Some(&body));
+        assert!(
+            r.contains("lighthouse restart requires confirm:true"),
+            "{r}"
+        );
+        // confirm:false — same gate.
+        let body = json!({ "overlay_ip": "10.42.0.5", "confirm": false }).to_string();
+        let r = build_reply(&s, "lighthouse-restart", Some(&body));
+        assert!(
+            r.contains("lighthouse restart requires confirm:true"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn lighthouse_restart_rejects_bad_overlay_ip_before_ssh() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        // A shell-metachar-bearing "ip" is rejected before any remote exec.
+        let body = json!({ "overlay_ip": "10.42.0.5; reboot", "confirm": true }).to_string();
+        let r = build_reply(&s, "lighthouse-restart", Some(&body));
+        assert!(r.contains("overlay_ip must be a plain IPv4 address"), "{r}");
+        // A hostname (non-IPv4) is rejected too.
+        let body = json!({ "overlay_ip": "anvil.mesh", "confirm": true }).to_string();
+        let r = build_reply(&s, "lighthouse-restart", Some(&body));
+        assert!(r.contains("overlay_ip must be a plain IPv4 address"), "{r}");
+    }
+
+    #[test]
+    fn lighthouse_restart_missing_body_errors() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        let r = build_reply(&s, "lighthouse-restart", None);
+        assert!(r.contains("missing request body"), "{r}");
+    }
+
+    #[test]
+    fn lighthouse_promote_requires_confirm_true() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        let body = json!({ "node": "anvil" }).to_string();
+        let r = build_reply(&s, "lighthouse-promote", Some(&body));
+        assert!(
+            r.contains("lighthouse promote requires confirm:true"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn lighthouse_promote_missing_node_errors() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        let body = json!({ "confirm": true }).to_string();
+        let r = build_reply(&s, "lighthouse-promote", Some(&body));
+        assert!(r.contains("missing `node`"), "{r}");
+    }
+
+    #[test]
+    fn lighthouse_promote_refuses_when_node_already_master() {
+        // Stand up an fs leader lockfile with `anvil` already holding the lease,
+        // then a promote of `anvil` must refuse idempotently. Drives the inner
+        // `promote_with_endpoints` with `&[]` so the fs path is taken regardless
+        // of whether the test host happens to be provisioned onto etcd (hermetic).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        crate::leader::force_take(&root.join(".mackesd-leader.lock"), "anvil")
+            .expect("seed leader lease");
+        let body = json!({ "node": "anvil", "confirm": true }).to_string();
+        let r = promote_with_endpoints(&root, &[], Some(&body));
+        assert_eq!(r, Err("anvil is already the master".to_string()), "{r:?}");
+    }
+
+    #[test]
+    fn lighthouse_promote_force_takes_for_a_shadow() {
+        // With `anvil` leading, promoting the shadow `forge` must succeed and
+        // report `forge` now leads (fs lockfile path; `&[]` endpoints, hermetic).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        crate::leader::force_take(&root.join(".mackesd-leader.lock"), "anvil")
+            .expect("seed leader lease");
+        let body = json!({ "node": "forge", "confirm": true }).to_string();
+        let leader = promote_with_endpoints(&root, &[], Some(&body)).expect("promote ok");
+        // The reply is the BARE hostname for display.
+        assert_eq!(leader, "forge");
+        // But the lockfile records the canonical `peer:forge` lease node_id, so
+        // it's byte-identical to what the live election loop next writes.
+        let lease = crate::leader::read_current_lease(&root.join(".mackesd-leader.lock"))
+            .expect("lease after promote");
+        assert_eq!(lease.node_id, "peer:forge");
+    }
+
+    #[test]
+    fn lighthouse_promote_accepts_a_prefixed_node_on_the_wire() {
+        // A caller that passes the already-`peer:`-prefixed node id gets the same
+        // canonical lease + bare reply (no double-prefix).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        crate::leader::force_take(&root.join(".mackesd-leader.lock"), "peer:anvil")
+            .expect("seed leader lease");
+        let body = json!({ "node": "peer:forge", "confirm": true }).to_string();
+        let leader = promote_with_endpoints(&root, &[], Some(&body)).expect("promote ok");
+        assert_eq!(leader, "forge");
+        let lease = crate::leader::read_current_lease(&root.join(".mackesd-leader.lock"))
+            .expect("lease after promote");
+        assert_eq!(lease.node_id, "peer:forge");
+    }
+
+    #[test]
+    fn lighthouse_promote_strips_peer_prefix_in_idempotent_guard() {
+        // The lease node_id may carry the `peer:` prefix; the guard compares bare
+        // hostnames, so promoting `anvil` when `peer:anvil` leads still refuses.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        crate::leader::force_take(&root.join(".mackesd-leader.lock"), "peer:anvil")
+            .expect("seed leader lease");
+        let body = json!({ "node": "anvil", "confirm": true }).to_string();
+        let r = promote_with_endpoints(&root, &[], Some(&body));
+        assert_eq!(r, Err("anvil is already the master".to_string()), "{r:?}");
     }
 
     #[test]
