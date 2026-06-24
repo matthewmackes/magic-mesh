@@ -14,6 +14,10 @@
 //! - Outbound calls are real: `PlaceCall`/`DialRequested` → INVITE, plus
 //!   `Answer`/`Decline`/`HangUp` (VOIP-29). PD-5 `action/voice/dial` lands a
 //!   call from the Peers panel.
+//! - In-call controls: a mic Mute toggle, and the keypad sends DTMF — pressing a
+//!   digit during an established call transmits an RFC 4733 telephone-event tone
+//!   to the peer/IVR (the SDP advertises `telephone-event/8000`) instead of
+//!   editing the dial buffer; the display chip flips to a "sends tones" hint.
 //! - The resolved chip classifies mesh / PSTN / partial / invalid via
 //!   `resolve_target` against the live roster.
 //!
@@ -93,6 +97,22 @@ fn agent_send(cmd: sip::AgentCommand) {
         if let Some(tx) = guard.as_ref() {
             let _ = tx.send(cmd);
         }
+    }
+}
+
+/// Send an in-call DTMF digit. Outbound calls own their [`media::MediaSession`]
+/// in `state.media`; inbound (answered) calls run their media in the agent
+/// thread, so route through [`sip::AgentCommand::Dtmf`]. Either way it's a tone,
+/// never a dial-buffer edit. No-op if neither path has a live media session.
+fn send_in_call_dtmf(state: &VoiceHud, c: char) {
+    if let Some(m) = state.media.as_ref() {
+        if m.send_dtmf(c) {
+            tracing::info!(digit = %c, "voice-hud: DTMF sent (local media)");
+        }
+    } else {
+        // Inbound/answered call — the media session lives in the agent thread.
+        agent_send(sip::AgentCommand::Dtmf(c));
+        tracing::info!(digit = %c, "voice-hud: DTMF sent (agent media)");
     }
 }
 
@@ -425,10 +445,32 @@ fn boot_surface() -> Task<Message> {
 pub fn update(state: &mut VoiceHud, message: Message) -> Task<Message> {
     match message {
         Message::DialerInputChanged(value) => {
-            state.dialer_input = filter_dialer_chars(&value);
+            // While a call is up the dialer field is frozen (it shows the peer,
+            // not an editable target): a focused text-input would otherwise
+            // CAPTURE typed digits before the keypad subscription sees them, so
+            // route any newly-typed dialer char to DTMF and leave the buffer
+            // unchanged — keyboard and on-screen keypad then behave identically.
+            if matches!(state.call, sip::CallState::InCall { .. }) {
+                // Compare the RAW new contents to the (possibly letter-bearing,
+                // e.g. a peer name) frozen buffer: a single appended dialer char
+                // is the keystroke to tone. Filtering first would drop the peer
+                // name's letters and break the prefix match.
+                if let Some(c) = appended_char(&state.dialer_input, &value) {
+                    send_in_call_dtmf(state, c);
+                }
+            } else {
+                state.dialer_input = filter_dialer_chars(&value);
+            }
         }
         Message::KeypadPressed(c) => {
-            if is_dialer_char(c) {
+            // In an established call the keypad sends DTMF (RFC 4733 tones to the
+            // peer/IVR) instead of editing the dial buffer. Otherwise it's the
+            // dialer — append the char.
+            if matches!(state.call, sip::CallState::InCall { .. }) {
+                if is_dialer_char(c) {
+                    send_in_call_dtmf(state, c);
+                }
+            } else if is_dialer_char(c) {
                 state.dialer_input.push(c);
             }
         }
@@ -696,9 +738,7 @@ fn subscription(state: &VoiceHud) -> cosmic::iced::Subscription<Message> {
     // flight. When the animator is idle this subscription isn't created, so the
     // HUD has zero idle wakeups (a voice HUD must not burn CPU at rest).
     if !state.anim.is_idle(Instant::now()) {
-        subs.push(
-            cosmic::iced::time::every(ANIM_TICK).map(|_| Message::AnimTick),
-        );
+        subs.push(cosmic::iced::time::every(ANIM_TICK).map(|_| Message::AnimTick));
     }
     cosmic::iced::Subscription::batch(subs)
 }
@@ -847,7 +887,10 @@ fn build_topbar(state: &VoiceHud, appear: f32) -> Element<'_, Message> {
             .colr(fade_color(theme::ON_PRIMARY, appear)),
     )
     .sty(move |_: &Theme| cosmic::iced::widget::container::Style {
-        background: Some(cosmic::iced::Background::Color(fade_color(theme::PRIMARY, appear))),
+        background: Some(cosmic::iced::Background::Color(fade_color(
+            theme::PRIMARY,
+            appear,
+        ))),
         border: cosmic::iced::Border {
             radius: cosmic::iced::border::Radius::from(16.0),
             ..Default::default()
@@ -908,8 +951,17 @@ fn build_display<'a>(state: &VoiceHud) -> Element<'a, Message> {
     .padding(Padding::from([10, 12]))
     .width(Length::Fill);
 
-    let resolved = resolve_target(&state.dialer_input, &state.roster);
-    let chip = build_resolved_chip(&resolved);
+    // In an established call the keypad sends DTMF tones rather than editing the
+    // dial buffer — surface that so the keypad reads correctly (a touch-tone pad,
+    // not a target editor). True for both outbound (local media) and inbound
+    // (agent-thread media) calls. Otherwise show the resolved-target chip.
+    let in_call = matches!(state.call, sip::CallState::InCall { .. });
+    let chip = if in_call {
+        build_dtmf_hint_chip()
+    } else {
+        let resolved = resolve_target(&state.dialer_input, &state.roster);
+        build_resolved_chip(&resolved)
+    };
 
     column![
         container(display).sty(|_: &Theme| cosmic::iced::widget::container::Style {
@@ -924,6 +976,26 @@ fn build_display<'a>(state: &VoiceHud) -> Element<'a, Message> {
         chip,
     ]
     .spacing(8)
+    .into()
+}
+
+/// The in-call keypad hint: tells the operator the keypad now sends DTMF touch-
+/// tones to the peer/IVR (RFC 4733), not dial-buffer edits. §4 — Carbon tokens.
+fn build_dtmf_hint_chip<'a>() -> Element<'a, Message> {
+    container(
+        text("keypad · sends tones")
+            .size(12.0)
+            .colr(theme::ON_PRIMARY),
+    )
+    .sty(|_: &Theme| cosmic::iced::widget::container::Style {
+        background: Some(cosmic::iced::Background::Color(theme::INFO)),
+        border: cosmic::iced::Border {
+            radius: cosmic::iced::border::Radius::from(12.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .padding(Padding::from([4, 10]))
     .into()
 }
 
@@ -1048,7 +1120,11 @@ fn keypad_button(state: &VoiceHud, now: Instant, c: char) -> Element<'_, Message
     let fb = state.control_feedback(&id, now);
     // Hover tint is the non-motion cue (kept under reduce-motion, where the lift
     // is dropped): a hovered key brightens to the high-elevation surface step.
-    let bg = if hovered { theme::SURF_C_HI } else { theme::SURF_C };
+    let bg = if hovered {
+        theme::SURF_C_HI
+    } else {
+        theme::SURF_C
+    };
     let key = button(
         container(text(c.to_string()).size(22.0).colr(theme::ON_SURF))
             .width(Length::Fill)
@@ -1059,15 +1135,17 @@ fn keypad_button(state: &VoiceHud, now: Instant, c: char) -> Element<'_, Message
     .on_press(Message::KeypadPressed(c))
     .width(Length::Fill)
     .height(Length::Fixed(56.0))
-    .sty(move |_: &Theme, _status| cosmic::iced::widget::button::Style {
-        background: Some(cosmic::iced::Background::Color(bg)),
-        text_color: theme::ON_SURF,
-        border: cosmic::iced::Border {
-            radius: cosmic::iced::border::Radius::from(8.0),
+    .sty(
+        move |_: &Theme, _status| cosmic::iced::widget::button::Style {
+            background: Some(cosmic::iced::Background::Color(bg)),
+            text_color: theme::ON_SURF,
+            border: cosmic::iced::Border {
+                radius: cosmic::iced::border::Radius::from(8.0),
+                ..Default::default()
+            },
             ..Default::default()
         },
-        ..Default::default()
-    });
+    );
     feedback_wrap(key, fb, id)
 }
 
@@ -1202,7 +1280,11 @@ fn build_call_bar(state: &VoiceHud, now: Instant) -> Element<'_, Message> {
     } else {
         let enabled = !state.dialer_input.trim().is_empty();
         let fill = fade_color(
-            if enabled { theme::SUCCESS } else { theme::SURF_C },
+            if enabled {
+                theme::SUCCESS
+            } else {
+                theme::SURF_C
+            },
             alpha,
         );
         let label_color = if enabled {
@@ -1233,7 +1315,11 @@ fn build_call_bar(state: &VoiceHud, now: Instant) -> Element<'_, Message> {
         }
         // The Call pill only takes feedback when it's actually pressable.
         if enabled {
-            feedback_wrap(b, state.control_feedback("call/place", now), "call/place".to_string())
+            feedback_wrap(
+                b,
+                state.control_feedback("call/place", now),
+                "call/place".to_string(),
+            )
         } else {
             b.into()
         }
@@ -1289,6 +1375,22 @@ pub fn peer_host_for(dialed: &str) -> String {
 #[must_use]
 pub fn filter_dialer_chars(s: &str) -> String {
     s.chars().filter(|c| is_dialer_char(*c)).collect()
+}
+
+/// If `new` is `old` with exactly one dialer char appended (a single keystroke
+/// into the focused dialer field), return that char. Used in-call to route a
+/// typed digit to DTMF while keeping the (frozen) buffer unchanged. `None` for
+/// any other edit (backspace, paste, multi-char) so only single keystrokes tone.
+#[must_use]
+pub fn appended_char(old: &str, new: &str) -> Option<char> {
+    let extra = new.strip_prefix(old)?;
+    let mut chars = extra.chars();
+    let c = chars.next()?;
+    if chars.next().is_none() && is_dialer_char(c) {
+        Some(c)
+    } else {
+        None
+    }
 }
 
 // ── Main ────────────────────────────────────────────────────────────────
@@ -1542,6 +1644,7 @@ mod tests {
             addr: peer_addr.ip().to_string(),
             port: peer_addr.port(),
             payload_type: 0,
+            telephone_event_pt: Some(101),
         };
         let mut hud = make_hud();
         hud.call = sip::CallState::InCall {
@@ -1552,6 +1655,84 @@ mod tests {
         assert!(
             hud.media.is_none(),
             "remote hang-up tears down the media session"
+        );
+    }
+
+    #[test]
+    fn keypad_sends_dtmf_in_call_not_appending_to_the_dialer() {
+        // While a call is up with media, a keypad digit is a DTMF tone — it must
+        // NOT mutate the dial buffer (the buffer holds the dialed peer, not the
+        // in-call tones). Stand up a real loopback media session so the in-call
+        // branch is exercised end-to-end (send_dtmf → the live MediaSession).
+        let peer = std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("bind loopback peer");
+        let peer_addr = peer.local_addr().expect("peer addr");
+        let remote = sip::RemoteMedia {
+            addr: peer_addr.ip().to_string(),
+            port: peer_addr.port(),
+            payload_type: 0,
+            telephone_event_pt: Some(101),
+        };
+        let mut hud = make_hud();
+        hud.call = sip::CallState::InCall {
+            peer: "pine".into(),
+        };
+        hud.dialer_input = "pine".into();
+        hud.media = Some(media::start_media(0, &remote).expect("media starts"));
+        let _ = update(&mut hud, Message::KeypadPressed('7'));
+        assert_eq!(
+            hud.dialer_input, "pine",
+            "an in-call keypad press is DTMF, not a dial-buffer edit"
+        );
+    }
+
+    #[test]
+    fn keypad_appends_to_the_dialer_when_idle() {
+        // Idle (no call): the keypad edits the dial buffer as before.
+        let mut hud = make_hud();
+        assert!(matches!(hud.call, sip::CallState::Idle));
+        let _ = update(&mut hud, Message::KeypadPressed('4'));
+        let _ = update(&mut hud, Message::KeypadPressed('2'));
+        assert_eq!(hud.dialer_input, "42", "idle keypad fills the dialer");
+    }
+
+    #[test]
+    fn in_call_typed_digit_does_not_edit_the_frozen_dial_buffer() {
+        // A focused text-input CAPTURES typed digits, so an in-call typed digit
+        // arrives as DialerInputChanged (the keypad subscription never sees it).
+        // It must route to DTMF and leave the (frozen) buffer untouched — the
+        // same behavior as an on-screen keypad press. (No media here → the agent
+        // path is taken; the buffer invariant is what we assert.)
+        let mut hud = make_hud();
+        hud.call = sip::CallState::InCall {
+            peer: "pine".into(),
+        };
+        hud.dialer_input = "pine".into();
+        // The text-input emits the full new contents = old + one digit.
+        let _ = update(&mut hud, Message::DialerInputChanged("pine7".into()));
+        assert_eq!(
+            hud.dialer_input, "pine",
+            "in-call typed digit is DTMF, not a frozen-buffer edit"
+        );
+    }
+
+    #[test]
+    fn appended_char_detects_single_keystroke_only() {
+        assert_eq!(appended_char("12", "123"), Some('3'));
+        assert_eq!(appended_char("", "5"), Some('5'));
+        // A letter-bearing frozen buffer (a dialed peer name) + one typed digit
+        // — the digit is the appended char (the common in-call case).
+        assert_eq!(appended_char("pine", "pine7"), Some('7'));
+        assert_eq!(appended_char("pine", "pine#"), Some('#'));
+        // Not a single appended dialer char:
+        assert_eq!(appended_char("12", "12"), None, "no change");
+        assert_eq!(appended_char("123", "12"), None, "backspace");
+        assert_eq!(appended_char("1", "199"), None, "two chars (paste)");
+        assert_eq!(appended_char("ab", "abc"), None, "non-dialer char");
+        assert_eq!(appended_char("12", "1x3"), None, "mid-edit, not a suffix");
+        assert_eq!(
+            appended_char("pine", "piney"),
+            None,
+            "appended letter, no tone"
         );
     }
 
@@ -1765,7 +1946,8 @@ mod tests {
         let now = Instant::now();
         let mut hud = make_hud();
         hud.reduce_motion = true;
-        hud.anim.start(ANIM_APPEAR, now, Motion::panel_mount(), true);
+        hud.anim
+            .start(ANIM_APPEAR, now, Motion::panel_mount(), true);
         for ms in [0, 20, 40, 80, 240] {
             let (_a, slide) = hud.appear_params(now + Duration::from_millis(ms));
             assert_eq!(slide, 0.0, "no slide under reduce-motion at {ms}ms");
@@ -1780,7 +1962,9 @@ mod tests {
         let mut hud = make_hud();
         // No animation pending at rest.
         hud.anim.gc(now);
-        hud.call = sip::CallState::Calling { peer: "pine".into() };
+        hud.call = sip::CallState::Calling {
+            peer: "pine".into(),
+        };
         hud.sync_call_state();
         assert_eq!(hud.call_kind, CallKind::Calling);
         assert!(
@@ -1792,7 +1976,9 @@ mod tests {
         // SAME coarse mode ⇒ no re-arm.
         let settled = Instant::now() + Motion::tooltip_fade().duration + Duration::from_millis(50);
         hud.anim.gc(settled);
-        hud.call = sip::CallState::Ringing { peer: "pine".into() };
+        hud.call = sip::CallState::Ringing {
+            peer: "pine".into(),
+        };
         hud.sync_call_state();
         assert!(
             !hud.anim.is_animating(ANIM_CALLSTATE, settled),
@@ -1822,7 +2008,10 @@ mod tests {
         hud.reduce_motion = true;
         for ms in [0, 35, 70, 200] {
             let g = hud.control_feedback(&id, now + Duration::from_millis(ms));
-            assert_eq!(g.translate_y, 0.0, "no hover-lift under reduce-motion @{ms}ms");
+            assert_eq!(
+                g.translate_y, 0.0,
+                "no hover-lift under reduce-motion @{ms}ms"
+            );
         }
     }
 
@@ -1848,7 +2037,10 @@ mod tests {
         let _ = update(&mut hud, Message::ControlReleased(id.clone()));
         assert_eq!(hud.pressed, None);
         let up = hud.control_feedback(&id, now);
-        assert!((up.scale - 1.0).abs() < 1e-6, "release restores natural size");
+        assert!(
+            (up.scale - 1.0).abs() < 1e-6,
+            "release restores natural size"
+        );
     }
 
     #[test]
@@ -1857,7 +2049,8 @@ mod tests {
         // settled the animator is idle so the subscription stops (no idle CPU).
         let now = Instant::now();
         let mut hud = make_hud();
-        hud.anim.start(ANIM_APPEAR, now, Motion::panel_mount(), false);
+        hud.anim
+            .start(ANIM_APPEAR, now, Motion::panel_mount(), false);
         assert!(!hud.anim.is_idle(now));
         // A tick well past the duration settles + GCs it.
         std::thread::sleep(Duration::from_millis(5));
@@ -1890,10 +2083,13 @@ mod tests {
         // reflow): top + bottom == 2 * base_pad for any feedback state.
         let base = 8.0;
         for (ty, scale) in [
-            (0.0, 1.0),                                          // at rest
-            (-mde_theme::feedback::HOVER_LIFT_PX, 1.0),          // hovered
-            (0.0, 1.0 - mde_theme::feedback::PRESS_DEPTH),       // pressed
-            (-mde_theme::feedback::HOVER_LIFT_PX, 1.0 - mde_theme::feedback::PRESS_DEPTH), // both
+            (0.0, 1.0),                                    // at rest
+            (-mde_theme::feedback::HOVER_LIFT_PX, 1.0),    // hovered
+            (0.0, 1.0 - mde_theme::feedback::PRESS_DEPTH), // pressed
+            (
+                -mde_theme::feedback::HOVER_LIFT_PX,
+                1.0 - mde_theme::feedback::PRESS_DEPTH,
+            ), // both
         ] {
             let (top, bottom) = feedback_padding(
                 FeedbackParams {
