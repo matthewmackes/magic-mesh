@@ -39,10 +39,47 @@ impl Default for Preferences {
     }
 }
 
-/// MOTION-CORE-3 — global motion configuration (`preferences.toml [motion]`): a
-/// master kill switch + a speed multiplier. Single place to disable/scale all
-/// shell animation; env vars `MDE_MOTION_DISABLED` / `MDE_MOTION_SCALE` override
-/// the file (CI / headless / quick toggles).
+/// MOTION-A11Y-2 — whether a given animation is *decorative* or *essential*.
+///
+/// Decorative motion is ornamental polish, safe to drop; essential motion is a
+/// loading/progress/state cue the user must still be able to read. The consumer
+/// tags each animation with its role so "decorative-off" and the system
+/// reduce-motion preference can drop the merely pretty motion while always
+/// preserving the state cues. Glue: the role is a hint the consumer already
+/// knows — `mde-theme` never guesses it from a preset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MotionRole {
+    /// Pure polish — hover lifts, skeleton shimmer, panel/dialog slide-ins,
+    /// pulses. Conveys *no* information that isn't also carried by a static
+    /// token (colour/elevation/text), so it can be dropped for comfort.
+    Decorative,
+    /// A state cue — a spinner/progress indicator, a loading/refresh activity
+    /// pulse, a focus ring, a success/error flash. Carries information, so it is
+    /// kept even with decorative motion off (still subject to the master
+    /// kill-switch + the reduce-motion ≤80 ms cap, which keep it legible).
+    Essential,
+}
+
+impl MotionRole {
+    /// `true` for [`MotionRole::Decorative`] — the motion that "decorative-off"
+    /// and the system reduce-motion preference are allowed to drop.
+    #[must_use]
+    pub const fn is_decorative(self) -> bool {
+        matches!(self, Self::Decorative)
+    }
+}
+
+/// MOTION-CORE-3 / MOTION-A11Y-2 — global motion configuration
+/// (`preferences.toml [motion]`).
+///
+/// A master kill switch, a speed multiplier, and a `decorative` comfort toggle —
+/// the single place to disable/scale/trim all shell animation. Env vars
+/// `MDE_MOTION_DISABLED` / `MDE_MOTION_SCALE` / `MDE_MOTION_DECORATIVE` override
+/// the file (CI / headless / quick toggles), and the read-only system
+/// reduce-motion hint (`MDE_SYSTEM_REDUCE_MOTION`, the OS/Cosmic preference
+/// surfaced by the platform layer) trims decorative motion **without** overwriting
+/// the user's authoritative local config (GUI-9: Cosmic exposes no such control,
+/// so the local file always wins).
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MotionPrefs {
@@ -54,6 +91,13 @@ pub struct MotionPrefs {
     /// half speed (double duration). Clamped to a sane range on apply.
     #[cfg_attr(feature = "serde", serde(default = "default_motion_scale"))]
     pub speed_scale: f32,
+    /// MOTION-A11Y-2 — keep *decorative* motion (hover lifts, shimmer,
+    /// slide-ins, pulses)? `false` drops it for comfort while keeping every
+    /// [`MotionRole::Essential`] loading/progress/state cue. Defaults `true`
+    /// (full polish); the system reduce-motion hint flips the *effective* value
+    /// to `false` without rewriting this persisted field.
+    #[cfg_attr(feature = "serde", serde(default = "default_motion_decorative"))]
+    pub decorative: bool,
 }
 
 impl Default for MotionPrefs {
@@ -61,6 +105,7 @@ impl Default for MotionPrefs {
         Self {
             enabled: true,
             speed_scale: 1.0,
+            decorative: true,
         }
     }
 }
@@ -91,6 +136,63 @@ impl MotionPrefs {
             ..m
         }
     }
+
+    /// MOTION-A11Y-2 — is *decorative* motion currently on, folding in the
+    /// read-only system reduce-motion hint? The persisted `decorative` field is
+    /// the user's local choice; the system preference (`system_reduce_motion` —
+    /// the OS/Cosmic signal surfaced by the platform layer) can only ever
+    /// *trim* decorative polish, never re-enable it. Local config stays
+    /// authoritative (GUI-9): turning decorative off in the file wins even if the
+    /// system asks for full motion. Returns `false` when either source asks to
+    /// drop the polish.
+    #[must_use]
+    pub const fn decorative_enabled(self, system_reduce_motion: bool) -> bool {
+        self.decorative && !system_reduce_motion
+    }
+
+    /// MOTION-A11Y-2 — resolve a [`crate::motion::Motion`] preset against the
+    /// global controls, the animation's [`MotionRole`], **and** the system
+    /// reduce-motion hint. The single entry point a consumer routes its motion
+    /// through so the acceptance holds:
+    ///
+    ///   * **decorative-off removes lifts/shimmer** — a [`MotionRole::Decorative`]
+    ///     animation collapses to a zero-duration terminal frame (the consumer
+    ///     renders the static end state; the standing colour/elevation token is
+    ///     the cue) whenever [`decorative_enabled`](Self::decorative_enabled) is
+    ///     `false` (local `decorative=false` **or** the system hint).
+    ///   * **but keeps loading/progress/state cues** — a [`MotionRole::Essential`]
+    ///     animation is *never* dropped by the decorative gate; it still resolves
+    ///     through [`apply`](Self::apply), so it honours the master kill-switch,
+    ///     the speed scale, and the reduce-motion ≤80 ms cap (which keep it
+    ///     legible) but always remains present.
+    ///
+    /// `reduce_motion` is the per-user a11y reduce-motion preference (the Q32
+    /// contract); `system_reduce_motion` is the OS/Cosmic system preference.
+    /// Both narrow motion; neither is allowed to widen it.
+    #[must_use]
+    pub fn apply_role(
+        self,
+        m: crate::motion::Motion,
+        role: MotionRole,
+        reduce_motion: bool,
+        system_reduce_motion: bool,
+    ) -> crate::motion::Motion {
+        use crate::motion::{Easing, Motion};
+        // The decorative gate only ever drops *decorative* motion — an essential
+        // state cue passes straight through to the kill-switch / reduce-motion
+        // resolution below.
+        if role.is_decorative() && !self.decorative_enabled(system_reduce_motion) {
+            return Motion {
+                duration: std::time::Duration::ZERO,
+                easing: Easing::Linear,
+                looping: false,
+            };
+        }
+        // A system reduce-motion request also caps essential motion to the Q32
+        // ≤80 ms crossfade (matching the per-user reduce-motion contract) so the
+        // cue stays but never *moves* the surface.
+        self.apply(m, reduce_motion || system_reduce_motion)
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -106,6 +208,30 @@ fn default_motion_enabled() -> bool {
 #[cfg(feature = "serde")]
 fn default_motion_scale() -> f32 {
     1.0
+}
+
+#[cfg(feature = "serde")]
+fn default_motion_decorative() -> bool {
+    true
+}
+
+/// MOTION-A11Y-2 — the read-only system reduce-motion hint (the OS/Cosmic
+/// preference).
+///
+/// Cosmic exposes no such toggle today (GUI-9), so the platform layer surfaces
+/// whatever the host desktop reports — GNOME's `gtk-enable-animations`, the
+/// freedesktop `prefers-reduced-motion` portal — by setting
+/// `MDE_SYSTEM_REDUCE_MOTION` (`1`/`true`/`yes`, case-insensitive) before startup.
+/// `mde-theme` stays pure (no gsettings/portal dependency), reading only the env
+/// hook. This is advisory: it can *trim* decorative motion (see
+/// [`MotionPrefs::apply_role`]) but never overrides the authoritative local
+/// config. Defaults `false` (the system asks for nothing).
+#[must_use]
+pub fn system_reduce_motion() -> bool {
+    std::env::var("MDE_SYSTEM_REDUCE_MOTION").is_ok_and(|v| {
+        let v = v.trim().to_ascii_lowercase();
+        v == "1" || v == "true" || v == "yes"
+    })
 }
 
 impl Preferences {
@@ -146,6 +272,11 @@ impl Preferences {
                     prefs.motion.speed_scale = f;
                 }
             }
+        }
+        // MOTION-A11Y-2 — env override for the decorative comfort toggle
+        // (CI / headless / a quick "just give me the static end-state" knob).
+        if std::env::var_os("MDE_MOTION_DECORATIVE").map_or(false, |v| v == "0") {
+            prefs.motion.decorative = false;
         }
         prefs
     }
@@ -271,6 +402,129 @@ mod tests {
         let m = MotionPrefs::default();
         assert!(m.enabled);
         assert!((m.speed_scale - 1.0).abs() < f32::EPSILON);
+        // MOTION-A11Y-2 — decorative polish is on by default (full motion).
+        assert!(m.decorative);
+    }
+
+    // ── MOTION-A11Y-2 — decorative-off + system reduce-motion ───────────────
+
+    #[test]
+    fn decorative_off_drops_lifts_and_shimmer_keeps_state_cues() {
+        // Acceptance: decorative-off removes lifts/shimmer (the ornamental
+        // presets) but keeps loading/progress/state cues (the essential ones).
+        use crate::motion::Motion;
+        let prefs = MotionPrefs {
+            decorative: false,
+            ..MotionPrefs::default()
+        };
+        // A decorative animation (hover lift / shimmer / panel slide) collapses
+        // to a zero-duration terminal frame — no motion at all.
+        let lift = prefs.apply_role(Motion::hover(), MotionRole::Decorative, false, false);
+        assert_eq!(
+            lift.duration,
+            std::time::Duration::ZERO,
+            "decorative lift is dropped"
+        );
+        assert!(!lift.looping);
+        // An essential loading/progress cue is KEPT — it still animates (only the
+        // master kill-switch / reduce-motion can trim it, neither set here). The
+        // duration round-trips through `apply`'s f32 speed-scale, so compare with
+        // tolerance like `motion_prefs_apply_scales_duration`.
+        let loading = prefs.apply_role(Motion::loading(), MotionRole::Essential, false, false);
+        assert!(
+            (loading.duration.as_secs_f32() - Motion::loading().duration.as_secs_f32()).abs()
+                < 1e-4,
+            "essential loading cue survives decorative-off (got {:?})",
+            loading.duration
+        );
+        assert!(loading.looping, "the loading activity loop is preserved");
+    }
+
+    #[test]
+    fn decorative_on_keeps_decorative_motion() {
+        // The default (decorative on) leaves a decorative animation animating.
+        use crate::motion::Motion;
+        let prefs = MotionPrefs::default();
+        let lift = prefs.apply_role(Motion::hover(), MotionRole::Decorative, false, false);
+        assert_eq!(lift.duration, Motion::hover().duration);
+    }
+
+    #[test]
+    fn system_reduce_motion_trims_decorative_but_local_config_stays_authoritative() {
+        // Acceptance: respect the system reduce-motion preference, but local
+        // config stays authoritative (GUI-9). The system hint can only *trim*
+        // decorative motion; it never re-enables what the user turned off, and it
+        // does not rewrite the persisted field.
+        // decorative = true locally.
+        let on = MotionPrefs::default();
+        // System asks for reduced motion ⇒ effective decorative is off…
+        assert!(!on.decorative_enabled(true), "system hint trims decorative");
+        // …but the persisted local field is untouched (still true).
+        assert!(on.decorative, "system hint never rewrites local config");
+        // …and the system asking for FULL motion can't re-enable a locally-off
+        // decorative preference — local config wins.
+        let off = MotionPrefs {
+            decorative: false,
+            ..MotionPrefs::default()
+        };
+        assert!(
+            !off.decorative_enabled(false),
+            "local decorative=false wins over a permissive system pref"
+        );
+    }
+
+    #[test]
+    fn system_reduce_motion_caps_essential_motion_but_keeps_it() {
+        // The system reduce-motion hint caps an essential cue to the Q32 ≤80 ms
+        // crossfade (no surface movement) — but the cue is still present.
+        use crate::motion::Motion;
+        let prefs = MotionPrefs::default();
+        let loading = prefs.apply_role(Motion::loading(), MotionRole::Essential, false, true);
+        assert_eq!(loading.duration, std::time::Duration::from_millis(80));
+        assert!(!loading.looping, "looping is dropped under reduce-motion");
+        // …and the decorative version is dropped entirely under the same hint.
+        let lift = prefs.apply_role(Motion::hover(), MotionRole::Decorative, false, true);
+        assert_eq!(lift.duration, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn motion_prefs_round_trips_decorative_through_toml() {
+        // The decorative toggle persists + reloads.
+        let prefs = MotionPrefs {
+            decorative: false,
+            ..MotionPrefs::default()
+        };
+        let wrapped = Preferences {
+            motion: prefs,
+            ..Preferences::default()
+        };
+        let s = wrapped.to_toml_string().unwrap();
+        let parsed: Preferences = toml::from_str(&s).unwrap();
+        assert!(!parsed.motion.decorative);
+        // An older config with no `decorative` key defaults to on.
+        let legacy = "[motion]\nenabled = true\nspeed_scale = 1.0\n";
+        let p: Preferences = toml::from_str(legacy).unwrap();
+        assert!(
+            p.motion.decorative,
+            "a config predating the toggle defaults to full polish"
+        );
+    }
+
+    #[test]
+    fn system_reduce_motion_reads_the_env_hook() {
+        // The platform layer surfaces the OS/Cosmic preference via the env hook;
+        // mde-theme stays pure (no gsettings/portal dep) and only reads it.
+        std::env::set_var("MDE_SYSTEM_REDUCE_MOTION", "1");
+        assert!(
+            system_reduce_motion(),
+            "env=1 ⇒ system asks for reduced motion"
+        );
+        std::env::set_var("MDE_SYSTEM_REDUCE_MOTION", "TRUE");
+        assert!(system_reduce_motion(), "case-insensitive true");
+        std::env::set_var("MDE_SYSTEM_REDUCE_MOTION", "0");
+        assert!(!system_reduce_motion(), "env=0 ⇒ no system request");
+        std::env::remove_var("MDE_SYSTEM_REDUCE_MOTION");
+        assert!(!system_reduce_motion(), "unset ⇒ default false");
     }
 
     #[test]
@@ -279,6 +533,7 @@ mod tests {
         let off = MotionPrefs {
             enabled: false,
             speed_scale: 1.0,
+            ..MotionPrefs::default()
         };
         let r = off.apply(crate::motion::Motion::loading(), false);
         assert_eq!(r.duration, std::time::Duration::ZERO);
@@ -292,12 +547,14 @@ mod tests {
         let fast = MotionPrefs {
             enabled: true,
             speed_scale: 2.0,
+            ..MotionPrefs::default()
         }
         .apply(crate::motion::Motion::panel_mount(), false);
         assert!((fast.duration.as_secs_f32() - base / 2.0).abs() < 1e-4);
         let slow = MotionPrefs {
             enabled: true,
             speed_scale: 0.5,
+            ..MotionPrefs::default()
         }
         .apply(crate::motion::Motion::panel_mount(), false);
         assert!((slow.duration.as_secs_f32() - base * 2.0).abs() < 1e-4);
@@ -309,6 +566,7 @@ mod tests {
         let r = MotionPrefs {
             enabled: true,
             speed_scale: 2.0,
+            ..MotionPrefs::default()
         }
         .apply(crate::motion::Motion::loading(), true);
         assert_eq!(r.duration, std::time::Duration::from_millis(80));

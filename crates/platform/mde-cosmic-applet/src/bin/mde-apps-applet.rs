@@ -2776,6 +2776,7 @@ mod motion_tests {
         let off = mde_theme::prefs::MotionPrefs {
             enabled: false,
             speed_scale: 1.0,
+            ..mde_theme::prefs::MotionPrefs::default()
         };
         assert_eq!(
             off.apply(Motion::panel_mount(), false).duration,
