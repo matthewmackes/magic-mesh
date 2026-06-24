@@ -10,15 +10,29 @@
 //! Per §6 this is **glue, not reimplementation**: `std::process` shells out to
 //! the host's own `xe`/`ssh`. Everything mechanically checkable — the `xe` argv
 //! construction and the output parsing — is a pure function and unit-tested here;
-//! the side-effecting [`Runner`] is the thin shell around it. A native rustls
+//! the side-effecting [`XeSsh`] is the thin shell around it. A native rustls
 //! XAPI backend can later implement [`Hypervisor`] behind the same trait.
+//!
+//! ## XCP-7 — the dom0 credential never reaches `ps`
+//!
+//! When a dom0 isn't reachable by the mesh SSH key (a freshly enrolled host, or
+//! one whose XAPI/root login is password-only), mackesd authenticates with a
+//! per-host secret sourced from the mesh secret store ([`HostTarget::Ssh::password`]).
+//! That password is fed to `sshpass` on its **stdin** (its no-flag mode) — never
+//! an argv token (`sshpass -p`), never a temp file. So the credential is absent
+//! from the process listing and leaves nothing on disk (the XCP-7 acceptance).
+//! [`full_command`] stays pure: it only consults whether a password is present
+//! (to emit the `sshpass` wrapper), never the secret itself, which the runner
+//! writes to the child's stdin at spawn time.
 
 use std::process::Command;
 
 use thiserror::Error;
 
 /// Where (and how) to run `xe`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is hand-rolled below (not derived) to redact the XCP-7 password.
+#[derive(Clone, PartialEq, Eq)]
 pub enum HostTarget {
     /// mackesd runs on the dom0 itself — run `xe` locally (no SSH). The
     /// Half-B compute-provider case: the hypervisor *is* the node.
@@ -31,17 +45,73 @@ pub enum HostTarget {
         user: String,
         /// Path to the SSH identity (the mesh key); `None` uses the agent/default.
         identity: Option<String>,
+        /// XCP-7 dom0 credential (the XAPI/root password) when key auth isn't
+        /// available, sourced from the mesh secret store. `None` ⇒ key-only auth.
+        /// NEVER placed in argv — fed to `sshpass` on its stdin by the runner so
+        /// it can't appear in `ps`. `Debug` is hand-rolled to redact it.
+        password: Option<String>,
     },
 }
 
+// Hand-rolled so a `{:?}` of a target (e.g. in a `tracing` line or a panic
+// message) can NEVER leak the dom0 password — it renders as `***` (XCP-7: the
+// credential must not appear in logs).
+impl std::fmt::Debug for HostTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local => f.write_str("Local"),
+            Self::Ssh {
+                host,
+                user,
+                identity,
+                password,
+            } => f
+                .debug_struct("Ssh")
+                .field("host", host)
+                .field("user", user)
+                .field("identity", identity)
+                .field("password", &password.as_ref().map(|_| "***"))
+                .finish(),
+        }
+    }
+}
+
 impl HostTarget {
-    /// A remote SSH target with the conventional `root` dom0 login.
+    /// A remote SSH target with the conventional `root` dom0 login, key auth only.
     #[must_use]
     pub fn ssh_root(host: impl Into<String>, identity: Option<String>) -> Self {
         Self::Ssh {
             host: host.into(),
             user: "root".to_string(),
             identity,
+            password: None,
+        }
+    }
+
+    /// As [`HostTarget::ssh_root`] but also carries the XCP-7 dom0 password
+    /// (from the mesh secret store) for hosts that aren't reachable by key.
+    /// `password` is `None` ⇒ key-only (identical to [`HostTarget::ssh_root`]).
+    #[must_use]
+    pub fn ssh_root_with_password(
+        host: impl Into<String>,
+        identity: Option<String>,
+        password: Option<String>,
+    ) -> Self {
+        Self::Ssh {
+            host: host.into(),
+            user: "root".to_string(),
+            identity,
+            password,
+        }
+    }
+
+    /// The dom0 password for this target, if any (used by the runner to feed the
+    /// `sshpass` pipe). `None` for `Local` and for key-only SSH targets.
+    #[must_use]
+    pub fn password(&self) -> Option<&str> {
+        match self {
+            Self::Local => None,
+            Self::Ssh { password, .. } => password.as_deref(),
         }
     }
 }
@@ -311,6 +381,12 @@ pub fn argv_sr_list() -> Vec<String> {
 
 /// Build the full executable + argv for a target: `xe <args…>` locally, or
 /// `ssh [-i id] -o BatchMode=yes user@host xe <args…>` remotely. Pure + tested.
+///
+/// XCP-7: when the SSH target carries a password, the command is wrapped in
+/// `sshpass ssh …` so the runner can feed the credential on the child's **stdin**
+/// (`sshpass`'s no-flag mode) — the password is NEVER an argv element here (so it
+/// can't surface in `ps`) and never touches disk. `BatchMode=yes` is also dropped
+/// in that case, since it would refuse the password prompt `sshpass` answers.
 #[must_use]
 pub fn full_command(target: &HostTarget, xe_args: &[String]) -> (String, Vec<String>) {
     match target {
@@ -319,20 +395,37 @@ pub fn full_command(target: &HostTarget, xe_args: &[String]) -> (String, Vec<Str
             host,
             user,
             identity,
+            password,
         } => {
-            let mut argv = Vec::new();
+            let has_password = password.is_some();
+            // The `ssh …` argv (shared whether or not it's wrapped by sshpass).
+            let mut ssh_argv = Vec::new();
             if let Some(id) = identity {
-                argv.push("-i".to_string());
-                argv.push(id.clone());
+                ssh_argv.push("-i".to_string());
+                ssh_argv.push(id.clone());
             }
-            argv.push("-o".to_string());
-            argv.push("BatchMode=yes".to_string());
-            argv.push("-o".to_string());
-            argv.push("StrictHostKeyChecking=accept-new".to_string());
-            argv.push(format!("{user}@{host}"));
-            argv.push("xe".to_string());
-            argv.extend(xe_args.iter().cloned());
-            ("ssh".to_string(), argv)
+            // BatchMode refuses interactive auth; only set it for key-only auth.
+            // With a password we let sshpass answer the prompt.
+            if !has_password {
+                ssh_argv.push("-o".to_string());
+                ssh_argv.push("BatchMode=yes".to_string());
+            }
+            ssh_argv.push("-o".to_string());
+            ssh_argv.push("StrictHostKeyChecking=accept-new".to_string());
+            ssh_argv.push(format!("{user}@{host}"));
+            ssh_argv.push("xe".to_string());
+            ssh_argv.extend(xe_args.iter().cloned());
+
+            if has_password {
+                // `sshpass ssh …` — `sshpass` with no -p/-f/-d/-e reads the
+                // password from its OWN stdin, NOT from argv (the whole point of
+                // XCP-7). The runner writes the secret to the child's stdin.
+                let mut argv = vec!["ssh".to_string()];
+                argv.extend(ssh_argv);
+                ("sshpass".to_string(), argv)
+            } else {
+                ("ssh".to_string(), ssh_argv)
+            }
         }
     }
 }
@@ -509,13 +602,19 @@ impl XeSsh {
 
     /// Run an `xe` sub-command, returning trimmed stdout. The single I/O choke
     /// point; everything above it is pure.
+    ///
+    /// XCP-7: a password-bearing target is run via `sshpass ssh …` with the
+    /// credential fed on the child's stdin (never argv / disk) — see [`run_sshpass`].
     fn run(&self, xe_args: &[String]) -> Result<String, XcpError> {
         let (exe, argv) = full_command(&self.target, xe_args);
         let cmd_name = xe_args.first().cloned().unwrap_or_default();
-        let out = Command::new(&exe)
-            .args(&argv)
-            .output()
-            .map_err(|e| XcpError::Spawn(exe.clone(), e))?;
+        let out = match self.target.password() {
+            Some(pw) => run_sshpass(&exe, &argv, pw)?,
+            None => Command::new(&exe)
+                .args(&argv)
+                .output()
+                .map_err(|e| XcpError::Spawn(exe.clone(), e))?,
+        };
         if !out.status.success() {
             return Err(XcpError::Xe {
                 cmd: cmd_name,
@@ -525,6 +624,45 @@ impl XeSsh {
         }
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
+}
+
+/// Spawn `sshpass ssh …`, feeding `password` on the child's **stdin** —
+/// `sshpass`'s no-flag mode reads the password there. This is the XCP-7 no-leak
+/// path: the password is absent from argv (so not in `ps`), never written to
+/// disk, and never logged. `sshpass` consumes only the first line of stdin and
+/// hands the rest (none, here) to `ssh`; the `xe` command rides in the ssh argv,
+/// so ssh needs no stdin of its own.
+fn run_sshpass(
+    exe: &str,
+    argv: &[String],
+    password: &str,
+) -> Result<std::process::Output, XcpError> {
+    use std::io::Write as _;
+
+    let mut child = Command::new(exe)
+        .args(argv)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| XcpError::Spawn(exe.to_string(), e))?;
+    // Write the password + newline to sshpass's stdin, then close it so sshpass
+    // stops reading and proceeds. A broken pipe (sshpass already exited, e.g.
+    // missing binary races) is tolerated — the exit status is the source of truth.
+    {
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| XcpError::Parse("sshpass stdin unavailable".to_string()))?;
+        let mut stdin = stdin;
+        let _ = stdin
+            .write_all(password.as_bytes())
+            .and_then(|()| stdin.write_all(b"\n"));
+        // `stdin` drops here, closing the pipe.
+    }
+    child
+        .wait_with_output()
+        .map_err(|e| XcpError::Spawn("sshpass wait".to_string(), e))
 }
 
 impl Hypervisor for XeSsh {
@@ -612,6 +750,71 @@ mod tests {
         // No identity → no -i.
         let (_, argv2) = full_command(&HostTarget::ssh_root("h", None), &argv_start("u1"));
         assert!(!argv2.contains(&"-i".to_string()));
+    }
+
+    #[test]
+    fn full_command_with_password_wraps_sshpass_and_never_leaks_the_secret() {
+        // XCP-7: a password-bearing target is run as `sshpass ssh …`; the password
+        // is fed on stdin by the runner, so it must NOT appear anywhere in argv.
+        let secret = "s3cr3t-dom0-pw";
+        let t = HostTarget::ssh_root_with_password(
+            "10.0.0.4",
+            Some("/k/id".into()),
+            Some(secret.to_string()),
+        );
+        let (exe, argv) = full_command(&t, &argv_start("u1"));
+        assert_eq!(exe, "sshpass");
+        // The wrapper invokes ssh, with no -p/-f/-d/-e flag (stdin mode).
+        assert_eq!(argv[0], "ssh");
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a == "-p" || a == "-f" || a == "-e" || a.starts_with("-d")),
+            "sshpass must read the password from stdin, not a flag: {argv:?}"
+        );
+        // THE acceptance assertion: the secret is in NO argv token.
+        assert!(
+            !argv.iter().any(|a| a.contains(secret)),
+            "the dom0 password must never appear in argv (ps): {argv:?}"
+        );
+        // BatchMode is dropped (it would refuse the password prompt) but the host
+        // + xe command still ride through.
+        assert!(!argv.iter().any(|a| a == "BatchMode=yes"));
+        assert!(argv.contains(&"root@10.0.0.4".to_string()));
+        let xe_pos = argv.iter().position(|a| a == "xe").unwrap();
+        assert_eq!(
+            &argv[xe_pos + 1..],
+            &["vm-start".to_string(), "uuid=u1".to_string()]
+        );
+        // A None password is the key-only path (plain ssh, BatchMode on).
+        let (exe2, argv2) = full_command(
+            &HostTarget::ssh_root_with_password("h", None, None),
+            &argv_start("u1"),
+        );
+        assert_eq!(exe2, "ssh");
+        assert!(argv2.contains(&"BatchMode=yes".to_string()));
+    }
+
+    #[test]
+    fn debug_redacts_the_dom0_password() {
+        // XCP-7: a {:?} of the target (a tracing line / panic) must not leak the
+        // credential — it renders as ***.
+        let t = HostTarget::ssh_root_with_password(
+            "10.0.0.4",
+            None,
+            Some("super-secret-pw".to_string()),
+        );
+        let dbg = format!("{t:?}");
+        assert!(
+            !dbg.contains("super-secret-pw"),
+            "password leaked into Debug: {dbg}"
+        );
+        assert!(dbg.contains("***"));
+        // The accessor exposes it for the runner, but the type never prints it.
+        assert_eq!(t.password(), Some("super-secret-pw"));
+        // A key-only target has no password.
+        assert_eq!(HostTarget::ssh_root("h", None).password(), None);
+        assert_eq!(HostTarget::Local.password(), None);
     }
 
     #[test]

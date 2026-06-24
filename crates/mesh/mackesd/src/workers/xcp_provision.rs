@@ -49,6 +49,8 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 
+use crate::ipc::secret_store::{self, SecretStore};
+
 use super::{ShutdownToken, Worker};
 
 /// Bus topic this worker drains for spawn requests (the A4 surface).
@@ -78,6 +80,13 @@ pub const START_TOPIC: &str = "action/provision/start";
 /// capacity that feeds the spawn target picker (XCP-4). Read-only; the reply
 /// lands on `reply/<request-ulid>`.
 pub const HOSTS_TOPIC: &str = "action/provision/hosts";
+
+/// XCP-7 — bus action topic the Provisioning panel fires to **set/rotate** a
+/// dom0's XAPI/root credential. The body is a [`SetCredsRequest`]; the daemon
+/// age-encrypts it into the mesh secret store under `xcp/<host>`. The reply lands
+/// on `reply/<request-ulid>`. Leader-managed: any authorized node can drive it
+/// and every enrolled node then reads the same replicated secret.
+pub const SET_CREDS_TOPIC: &str = "action/provision/set-creds";
 
 /// The golden template every spawn clones (design A2).
 pub const GOLDEN_TEMPLATE: &str = "MDE-VM-golden";
@@ -297,6 +306,59 @@ pub fn build_error_reply(message: &str) -> String {
         .unwrap_or_else(|_| r#"{"error":"encode failed"}"#.into())
 }
 
+// ───────────────────────── XCP-7 set/rotate dom0 credential ─────────────────────────
+
+/// A [`SET_CREDS_TOPIC`] request — store/rotate the `password` for dom0 `host`'s
+/// XAPI/root login in the mesh secret store under `xcp/<host>`.
+///
+/// `password` is the secret; it is age-encrypted at rest and NEVER logged or put
+/// in `ps`. The request body is the only place it appears in transit (the bus is
+/// the local replicated store, not a process argv).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct SetCredsRequest {
+    /// dom0 address the credential authenticates (must be allow-listed).
+    pub host: String,
+    /// The XAPI/root password to seal into the store.
+    pub password: String,
+}
+
+// Hand-rolled Debug so a `{:?}` of the request can't leak the password into a log
+// line (XCP-7: the credential must never be logged).
+impl std::fmt::Debug for SetCredsRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetCredsRequest")
+            .field("host", &self.host)
+            .field("password", &"***")
+            .finish()
+    }
+}
+
+/// Parse a set-creds request body.
+///
+/// # Errors
+/// Malformed JSON, an empty `host` (nothing to key on), or an empty `password`
+/// (we don't store a blank credential — that would mask the honest "no credential
+/// stored" state).
+pub fn parse_set_creds_request(body: &str) -> Result<SetCredsRequest, String> {
+    let req: SetCredsRequest =
+        serde_json::from_str(body).map_err(|e| format!("malformed set-creds request: {e}"))?;
+    if req.host.trim().is_empty() {
+        return Err("set-creds request: host is empty".to_string());
+    }
+    if req.password.is_empty() {
+        return Err("set-creds request: password is empty".to_string());
+    }
+    Ok(req)
+}
+
+/// Build a `{"stored":<host>}` reply for a completed credential write (the host,
+/// never the secret).
+#[must_use]
+pub fn build_set_creds_reply_ok(host: &str) -> String {
+    serde_json::to_string(&serde_json::json!({ "stored": host }))
+        .unwrap_or_else(|_| r#"{"error":"set-creds encode failed"}"#.into())
+}
+
 /// Resolve the uuid of the VM named `name` from a roster (the destroy path:
 /// `destroy` takes a uuid, but the operator names a VM).
 ///
@@ -488,10 +550,83 @@ fn spawn_over_ssh(req: &SpawnRequest) -> Result<String, String> {
     )
 }
 
-/// The xe-over-SSH target reaching a single dom0 with the mesh key (the same
-/// target [`spawn_over_ssh`] builds — the destroy/list/hosts handlers reuse it).
+/// The xe-over-SSH target reaching a single dom0 (the same target
+/// [`spawn_over_ssh`] builds — the destroy/list/hosts handlers reuse it).
+///
+/// XCP-7: when a per-host XAPI/root credential is stored in the mesh secret store
+/// under `xcp/<dom0>`, it is attached to the target so the runner authenticates
+/// over `sshpass` (password on stdin, never argv) for hosts the mesh key can't
+/// reach. When no credential is stored, the target is key-only — identical to the
+/// prior behaviour, so key-reachable dom0s are unaffected.
+///
+/// Resolves the secret store fresh — for the single-host spawn/destroy/start
+/// paths. Loops over many dom0s (`list_all_vms`, `probe_all_hosts`) should
+/// instead resolve the store ONCE and call [`hv_target_with_store`] per dom0, so
+/// the per-dom0 work is one credential read, not a fresh store resolution each.
 fn hv_target_for(dom0: &str) -> HostTarget {
-    HostTarget::ssh_root(dom0.to_string(), Some(dom0_ssh_key()))
+    hv_target_with_store(dom0, &dom0_secret_store())
+}
+
+/// As [`hv_target_for`] but with a caller-resolved `store`, so a loop over dom0s
+/// resolves the store once and pays only one credential read per host.
+fn hv_target_with_store(dom0: &str, store: &SecretStore) -> HostTarget {
+    HostTarget::ssh_root_with_password(
+        dom0.to_string(),
+        Some(dom0_ssh_key()),
+        read_dom0_password(store, dom0),
+    )
+}
+
+/// The mesh secret store for dom0 credentials, anchored on
+/// [`secret_store::repo_root`] (so the replicated `age`+etcd store is found under
+/// the deployed repo, not the systemd cwd `/`) with the local-AEAD fallback rooted
+/// under the workgroup volume.
+fn dom0_secret_store() -> SecretStore {
+    SecretStore::resolve(&secret_store::repo_root(), &crate::default_qnm_shared_root())
+}
+
+/// Store-injected core of [`dom0_password`] — read `xcp/<dom0>` from `store`,
+/// degrading a fault to `None` (key-only auth) after logging the error (never the
+/// secret). Split out so the honest absent / present paths are testable with an
+/// injected `LocalAead` store, no env juggling.
+fn read_dom0_password(store: &SecretStore, dom0: &str) -> Option<String> {
+    let name = secret_store::xcp_creds_ref(dom0);
+    match store.get(&name) {
+        Ok(Some(pw)) => Some(pw),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(dom0 = %dom0, error = %e, "xcp_provision: dom0 credential read failed; using key-only auth");
+            None
+        }
+    }
+}
+
+/// XCP-7 — seal `password` into the mesh secret store under `xcp/<host>` (set or
+/// rotate the dom0 credential). The host must be allow-listed (`MCNF_XEN_DOM0S`),
+/// the same guard the spawn/list/destroy verbs apply, so a node can't be made to
+/// store a credential for an arbitrary host. Returns the host on success.
+///
+/// # Errors
+/// Host not allow-listed, or a secret-store write failure (surfaced honestly —
+/// the panel shows the failure rather than claiming the credential was stored).
+/// The error string never carries the password.
+fn store_dom0_credential(req: &SetCredsRequest) -> Result<String, String> {
+    store_dom0_credential_in(&dom0_secret_store(), req, &allowed_dom0s())
+}
+
+/// Store-injected core of [`store_dom0_credential`] — allow-list-guard `host`,
+/// then seal `password` into `store` under `xcp/<host>`. Split out so the
+/// round-trip + the allow-list rejection are testable with an injected store and
+/// an explicit allow-list, no env juggling.
+fn store_dom0_credential_in(
+    store: &SecretStore,
+    req: &SetCredsRequest,
+    allowed: &[String],
+) -> Result<String, String> {
+    let host = resolve_dom0(Some(req.host.trim()), allowed)?;
+    let name = secret_store::xcp_creds_ref(&host);
+    store.put(&name, &req.password)?;
+    Ok(host)
 }
 
 /// Enumerate every configured dom0's VMs (each tagged with its host) for a
@@ -499,8 +634,11 @@ fn hv_target_for(dom0: &str) -> HostTarget {
 /// shows the VMs on the hosts that answered) rather than failing the whole list.
 fn list_all_vms() -> Vec<ListedVm> {
     let mut out = Vec::new();
+    // Resolve the secret store once for the whole sweep (one credential read per
+    // dom0, not a fresh store resolution each — XCP-7 efficiency).
+    let store = dom0_secret_store();
     for dom0 in allowed_dom0s() {
-        let hv = XeSsh::new(hv_target_for(&dom0));
+        let hv = XeSsh::new(hv_target_with_store(&dom0, &store));
         match hv.list() {
             Ok(vms) => out.extend(vms.into_iter().map(|v| ListedVm {
                 uuid: v.uuid,
@@ -519,10 +657,12 @@ fn list_all_vms() -> Vec<ListedVm> {
 /// Probe every configured dom0's capacity for a [`HOSTS_TOPIC`] reply, recording
 /// an error row for any host that didn't answer (so the panel can grey it out).
 fn probe_all_hosts() -> Vec<HostRow> {
+    // One store resolution for the whole probe sweep (XCP-7 efficiency).
+    let store = dom0_secret_store();
     allowed_dom0s()
         .into_iter()
         .map(|dom0| {
-            let hv = XeSsh::new(hv_target_for(&dom0));
+            let hv = XeSsh::new(hv_target_with_store(&dom0, &store));
             match hv.host_capacity() {
                 Ok(cap) => HostRow::ok(&dom0, &cap),
                 Err(e) => HostRow::failed(&dom0, &e.to_string()),
@@ -654,6 +794,22 @@ fn handle_start_blocking(bus_root: &Path, req_ulid: &str, body: &str) {
     write_reply(bus_root, req_ulid, &reply);
 }
 
+/// Handle one [`SET_CREDS_TOPIC`] request on a blocking thread + write the reply.
+///
+/// XCP-7: parses the (password-bearing) body, age-encrypts the credential into the
+/// mesh secret store under `xcp/<host>`, and replies with the host on success.
+/// The password is never logged: only the host + any error string reach `tracing`.
+fn handle_set_creds_blocking(bus_root: &Path, req_ulid: &str, body: &str) {
+    let reply = match parse_set_creds_request(body).and_then(|req| store_dom0_credential(&req)) {
+        Ok(host) => build_set_creds_reply_ok(&host),
+        Err(e) => {
+            tracing::warn!(req = req_ulid, error = %e, "xcp_provision: set-creds failed");
+            build_error_reply(&e)
+        }
+    };
+    write_reply(bus_root, req_ulid, &reply);
+}
+
 /// Cursors for the XCP-4 responder topics, advanced per drained request so each
 /// request is handled exactly once across ticks. Seeded at each topic's tail on
 /// worker start ([`ResponderCursors::seed_at_tail`]) so a restart does NOT
@@ -665,6 +821,7 @@ struct ResponderCursors {
     destroy: Option<String>,
     start: Option<String>,
     hosts: Option<String>,
+    set_creds: Option<String>,
 }
 
 impl ResponderCursors {
@@ -680,6 +837,7 @@ impl ResponderCursors {
             destroy: tail(DESTROY_TOPIC),
             start: tail(START_TOPIC),
             hosts: tail(HOSTS_TOPIC),
+            set_creds: tail(SET_CREDS_TOPIC),
         }
     }
 }
@@ -711,6 +869,17 @@ async fn drain_responders(bus_root: &Path, cursors: &mut ResponderCursors) {
         run_blocking(
             move || handle_destroy_blocking(&bus_root, &req.ulid, &req.body),
             "destroy",
+        )
+        .await;
+    }
+    // XCP-7: the set/rotate-credential verb. Mutating (writes the secret store),
+    // so its cursor is seeded at the tail like start/destroy — no replay of an
+    // old credential write on a worker restart.
+    for req in read_new_requests(bus_root, SET_CREDS_TOPIC, &mut cursors.set_creds) {
+        let bus_root = bus_root.to_path_buf();
+        run_blocking(
+            move || handle_set_creds_blocking(&bus_root, &req.ulid, &req.body),
+            "set-creds",
         )
         .await;
     }
@@ -1022,6 +1191,8 @@ mod tests {
         assert_eq!(DESTROY_TOPIC, "action/provision/destroy");
         assert_eq!(START_TOPIC, "action/provision/start");
         assert_eq!(HOSTS_TOPIC, "action/provision/hosts");
+        // XCP-7 set/rotate-credential verb.
+        assert_eq!(SET_CREDS_TOPIC, "action/provision/set-creds");
     }
 
     // ── XCP-4 list/destroy/hosts codecs ──
@@ -1123,5 +1294,103 @@ mod tests {
         ];
         assert_eq!(resolve_uuid_by_name(&vms, "MDE-VM-db").unwrap(), "u-2");
         assert!(resolve_uuid_by_name(&vms, "MDE-VM-ghost").is_err());
+    }
+
+    // ── XCP-7 dom0 credential: codec + store round-trip ──
+
+    /// A `LocalAead` secret store over a tempdir with a real-ish age identity —
+    /// the same shape the secret_store tests drive (the bytes key the AEAD).
+    fn local_store() -> (tempfile::TempDir, SecretStore) {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("mcnf-age-key");
+        std::fs::write(
+            &key_path,
+            "AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQSXKLP0E\n",
+        )
+        .unwrap();
+        let store = SecretStore::LocalAead {
+            dir: tmp.path().join("secrets"),
+            key_path,
+        };
+        (tmp, store)
+    }
+
+    #[test]
+    fn parse_set_creds_happy_and_rejects_blank_fields() {
+        let req =
+            parse_set_creds_request(r#"{"host":"172.20.0.4","password":"pw"}"#).expect("parse");
+        assert_eq!(req.host, "172.20.0.4");
+        assert_eq!(req.password, "pw");
+        // A blank host (nothing to key on) or a blank password (would mask the
+        // honest "no credential stored" state) is rejected.
+        assert!(parse_set_creds_request(r#"{"host":"  ","password":"pw"}"#).is_err());
+        assert!(parse_set_creds_request(r#"{"host":"h","password":""}"#).is_err());
+        assert!(parse_set_creds_request("not json").is_err());
+    }
+
+    #[test]
+    fn set_creds_request_debug_redacts_the_password() {
+        // XCP-7: the request must not leak the password into a log/panic line.
+        let req = SetCredsRequest {
+            host: "172.20.0.4".into(),
+            password: "top-secret-pw".into(),
+        };
+        let dbg = format!("{req:?}");
+        assert!(
+            !dbg.contains("top-secret-pw"),
+            "password leaked into Debug: {dbg}"
+        );
+        assert!(dbg.contains("***"));
+        assert!(dbg.contains("172.20.0.4"));
+    }
+
+    #[test]
+    fn set_creds_reply_ok_carries_host_not_secret() {
+        let v: serde_json::Value =
+            serde_json::from_str(&build_set_creds_reply_ok("172.20.0.4")).unwrap();
+        assert_eq!(v["stored"], "172.20.0.4");
+        assert!(!v.as_object().unwrap().contains_key("error"));
+        // The success reply never carries a password field.
+        assert!(!v.as_object().unwrap().contains_key("password"));
+    }
+
+    #[test]
+    fn dom0_credential_round_trips_and_absent_is_honest() {
+        // XCP-7 acceptance: store a dom0 credential, then any authorized node
+        // reads it back; an unstored host is the honest "no credential" (None).
+        let (_t, store) = local_store();
+        let allowed = vec!["172.20.0.4".to_string(), "172.20.0.5".to_string()];
+        // Absent before set → key-only auth path.
+        assert_eq!(read_dom0_password(&store, "172.20.0.4"), None);
+        // The leader stores it…
+        let req = SetCredsRequest {
+            host: "172.20.0.4".into(),
+            password: "dom0-pw-xyz".into(),
+        };
+        let host = store_dom0_credential_in(&store, &req, &allowed).expect("stored");
+        assert_eq!(host, "172.20.0.4");
+        // …and it reads back decrypted, byte-for-byte (any enrolled node).
+        assert_eq!(
+            read_dom0_password(&store, "172.20.0.4").as_deref(),
+            Some("dom0-pw-xyz")
+        );
+        // A different, un-credentialed allow-listed host stays honestly absent.
+        assert_eq!(read_dom0_password(&store, "172.20.0.5"), None);
+    }
+
+    #[test]
+    fn set_creds_rejects_a_host_not_in_the_allow_list() {
+        // The same allow-list guard the spawn/destroy verbs apply: a node can't
+        // be made to store a credential for an arbitrary host.
+        let (_t, store) = local_store();
+        let allowed = vec!["172.20.0.4".to_string()];
+        let req = SetCredsRequest {
+            host: "9.9.9.9".into(),
+            password: "pw".into(),
+        };
+        let err = store_dom0_credential_in(&store, &req, &allowed).expect_err("rejected");
+        assert!(err.contains("allow-list"), "{err}");
+        // Nothing was written for the rejected host.
+        assert_eq!(read_dom0_password(&store, "9.9.9.9"), None);
     }
 }
