@@ -3,7 +3,7 @@
 
 use crate::cosmic_compat::{ButtonSty, ContainerSty, TextSty};
 use cosmic::iced::widget::{
-    button, column, container, row, scrollable, text, text_input, tooltip, Space,
+    button, column, container, mouse_area, row, scrollable, text, text_input, tooltip, Space,
 };
 use cosmic::iced::{Background, Border, Color, Length, Padding};
 use cosmic::{Element, Theme};
@@ -15,6 +15,8 @@ use crate::density::FileListMetrics;
 use crate::grid;
 use crate::icons;
 use crate::model::{fmt_count, FileRow, Layout, Peer, PeerStatus, SelfNode, Tab, View};
+use crate::panels::ContextMenuItem;
+use crate::properties::FileProperties;
 use crate::search;
 use crate::selection::Selection;
 use crate::theme as t;
@@ -1283,6 +1285,9 @@ pub fn local_browser<'a>(
     metrics: FileListMetrics,
     selection: &'a Selection,
     motion: RowMotionCtx<'a>,
+    // CTXMENU — `Some((original_name, edited_text))` for the row currently
+    // being inline-renamed; that row renders a text field instead of its label.
+    rename: Option<(&'a str, &'a str)>,
 ) -> Element<'a, Message> {
     let up = button(icon(icons::ARROW_LEFT, 16.0, t::FG))
         .on_press(Message::LocalUp)
@@ -1306,6 +1311,22 @@ pub fn local_browser<'a>(
         );
     } else {
         for (i, f) in files.iter().enumerate() {
+            // CTXMENU — the row under inline rename swaps its content for a text
+            // field (Enter commits via `on_submit`; Escape cancels via the key
+            // subscription's `EscapeDismiss`); all other rows render normally.
+            if let Some((orig, edited)) = rename {
+                if orig == f.name {
+                    list = list.push(
+                        text_input("Name", edited)
+                            .on_input(Message::RenameBufferChanged)
+                            .on_submit(Message::RenameCommit)
+                            .padding(Padding::from([6.0, 8.0]))
+                            .size(13)
+                            .width(Length::Fill),
+                    );
+                    continue;
+                }
+            }
             let sel = selection.is_selected(&f.name);
             let foc = selection.is_focused(&f.name);
             let rm = motion.for_row(&f.name, i, sel);
@@ -1317,12 +1338,21 @@ pub fn local_browser<'a>(
                 Layout::List => list_row(f.clone(), true, sel, foc, metrics, rm),
                 Layout::Grid => file_row(f.clone(), true, sel, foc, rm),
             };
+            let activatable = button(row_el)
+                .padding(0)
+                .width(Length::Fill)
+                .sty(|_, _| ghost_button_style())
+                .on_press(Message::LocalActivate(f.name.clone()));
+            // CTXMENU — secondary (right) press opens the context menu over this
+            // row. The vendored iced `mouse_area` exposes `on_right_press`; the
+            // menu itself renders as a centered overlay (iced has no native
+            // cursor-anchored popup — the mde-music idiom).
             list = list.push(
-                button(row_el)
-                    .padding(0)
-                    .width(Length::Fill)
-                    .sty(|_, _| ghost_button_style())
-                    .on_press(Message::LocalActivate(f.name.clone())),
+                mouse_area(activatable).on_right_press(Message::OpenContextMenu(
+                    f.name.clone(),
+                    0.0,
+                    0.0,
+                )),
             );
         }
     }
@@ -1869,6 +1899,253 @@ pub fn resolve_conflict_dialog<'a>(original: &'a str, sibling: &'a str) -> Eleme
     cosmic::iced::widget::Stack::with_children(vec![
         dismiss_backdrop.into(),
         centered_dialog.into(),
+    ])
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
+
+// ── CTXMENU: right-click context menu + Send-To picker + Properties ─────────
+
+/// CTXMENU — a full-screen click-to-dismiss scrim. Shared by every modal
+/// overlay below so they all dim + dismiss identically (mirrors the
+/// resolve-dialog scrim).
+fn modal_scrim(dismiss: Message) -> Element<'static, Message> {
+    button(Space::new().width(Length::Fill).height(Length::Fill))
+        .padding(0)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .sty(|_, _| button::Style {
+            snap: false,
+            background: Some(Background::Color(Color {
+                a: 0.45,
+                ..t::PF_SCRIM_BLACK
+            })),
+            text_color: Color::TRANSPARENT,
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 0.0.into(),
+            },
+            ..button::Style::default()
+        })
+        .on_press(dismiss)
+        .into()
+}
+
+/// CTXMENU — one Carbon menu/list row: a full-width ghost button that tints on
+/// hover, with the label in `colr` (red for the destructive `Delete`). Takes an
+/// owned label so both `'static` action items and runtime peer names share it.
+fn menu_row(
+    label: impl Into<String>,
+    msg: Message,
+    destructive: bool,
+) -> Element<'static, Message> {
+    let fg = if destructive { t::PF_DANGER } else { t::FG };
+    button(text(label.into()).size(13).colr(fg))
+        .padding(Padding::from([8.0, 14.0]))
+        .width(Length::Fill)
+        .sty(move |_, status| {
+            let bg = match status {
+                button::Status::Hovered | button::Status::Pressed => Color {
+                    a: 0.08,
+                    ..Color::WHITE
+                },
+                _ => Color::TRANSPARENT,
+            };
+            button::Style {
+                snap: false,
+                background: Some(Background::Color(bg)),
+                text_color: fg,
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 0.0.into(),
+                },
+                ..button::Style::default()
+            }
+        })
+        .on_press(msg)
+        .into()
+}
+
+/// CTXMENU — the right-click context menu: the canonical action list over a
+/// full-screen dismiss backdrop. Wired to a real side-effect per item (Open /
+/// Copy-path / Send-to / Rename / Delete / Properties). iced has no native
+/// cursor-anchored popup, so the menu centers (the mde-music idiom).
+pub fn context_menu_sheet(row_name: &str) -> Element<'static, Message> {
+    let mut col = column![
+        text(row_name.to_string()).size(12).colr(t::FG_DIM),
+        Space::new().height(Length::Fixed(4.0)),
+    ]
+    .spacing(0)
+    .padding(Padding::from([8.0, 0.0]))
+    .width(Length::Fixed(220.0));
+    for item in &[
+        ContextMenuItem::Open,
+        ContextMenuItem::CopyPath,
+        ContextMenuItem::SendTo,
+        ContextMenuItem::Rename,
+        ContextMenuItem::Delete,
+        ContextMenuItem::Properties,
+    ] {
+        col = col.push(menu_row(
+            item.label(),
+            Message::ContextMenuItemClicked(*item),
+            item.is_destructive(),
+        ));
+    }
+
+    let card = container(col).sty(|_| container::Style {
+        snap: false,
+        background: Some(Background::Color(t::PF_BG_200)),
+        border: Border {
+            color: t::DIVIDER,
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        ..container::Style::default()
+    });
+    let centered = container(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(cosmic::iced::alignment::Horizontal::Center)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+
+    cosmic::iced::widget::Stack::with_children(vec![
+        modal_scrim(Message::CloseContextMenu),
+        centered.into(),
+    ])
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
+
+/// CTXMENU — the "Send to…" peer picker: lists the reachable peers (online /
+/// idle / self) as rows; choosing one dispatches a real Send-To of the
+/// buffered source file. An empty roster shows an honest message.
+pub fn send_to_picker_sheet<'a>(source: &str, peers: &'a [Peer]) -> Element<'a, Message> {
+    let file_name = std::path::Path::new(source)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| source.to_string());
+    let mut col = column![
+        text("Send to peer").size(14).colr(t::FG),
+        text(format!("File: {file_name}")).size(11).colr(t::FG_DIM),
+        Space::new().height(Length::Fixed(10.0)),
+    ]
+    .spacing(2)
+    .padding(Padding::from([16.0, 18.0]))
+    .width(Length::Fixed(320.0));
+
+    let reachable: Vec<&Peer> = peers.iter().filter(|p| p.status.is_reachable()).collect();
+    if reachable.is_empty() {
+        col = col.push(
+            text("No reachable peers on the mesh.")
+                .size(12)
+                .colr(t::FG_FAINT),
+        );
+    } else {
+        for p in reachable {
+            let id = p.id.clone();
+            col = col.push(menu_row(
+                p.label.clone(),
+                Message::SendToPickerPeer(id),
+                false,
+            ));
+        }
+    }
+    col = col.push(Space::new().height(Length::Fixed(10.0)));
+    col = col.push(menu_row("Cancel", Message::DismissSendToPicker, false));
+
+    let card = container(col).sty(|_| container::Style {
+        snap: false,
+        background: Some(Background::Color(t::PF_BG_200)),
+        border: Border {
+            color: t::DIVIDER,
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        ..container::Style::default()
+    });
+    let centered = container(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(cosmic::iced::alignment::Horizontal::Center)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+
+    cosmic::iced::widget::Stack::with_children(vec![
+        modal_scrim(Message::DismissSendToPicker),
+        centered.into(),
+    ])
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
+
+/// CTXMENU — the Properties dialog: a Carbon card listing the file's stat-ed
+/// metadata (name / kind / size / permissions / owner / modified), dismissible.
+pub fn properties_dialog(props: &FileProperties) -> Element<'static, Message> {
+    let name = props
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| props.path.display().to_string());
+    let kv = |k: &str, v: String| -> Element<'static, Message> {
+        row![
+            container(text(k.to_string()).size(11).colr(t::FG_DIM)).width(Length::Fixed(96.0)),
+            text(v).size(11).colr(t::FG),
+        ]
+        .spacing(8)
+        .into()
+    };
+    let mut col = column![
+        text(name).size(14).colr(t::FG),
+        text(props.path.display().to_string())
+            .size(10)
+            .colr(t::FG_FAINT),
+        Space::new().height(Length::Fixed(12.0)),
+        kv("Kind", props.kind.label().to_string()),
+        kv(
+            "Size",
+            format!("{} ({} bytes)", props.human_size(), props.size_bytes)
+        ),
+        kv(
+            "Permissions",
+            format!("{} ({})", props.permission_string(), props.mode_octal())
+        ),
+        kv("Links", props.links.to_string()),
+        kv("Owner", format!("{}:{}", props.uid, props.gid)),
+        kv("Modified", props.modified_local()),
+    ]
+    .spacing(4)
+    .padding(Padding::from([20.0, 24.0]))
+    .width(Length::Fixed(380.0));
+    if let Some(tgt) = &props.symlink_target {
+        col = col.push(kv("Links to", tgt.display().to_string()));
+    }
+    col = col.push(Space::new().height(Length::Fixed(16.0)));
+    col = col.push(menu_row("Close", Message::DismissProperties, false));
+
+    let card = container(col).sty(|_| container::Style {
+        snap: false,
+        background: Some(Background::Color(t::PF_BG_200)),
+        border: Border {
+            color: t::DIVIDER,
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        ..container::Style::default()
+    });
+    let centered = container(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(cosmic::iced::alignment::Horizontal::Center)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+
+    cosmic::iced::widget::Stack::with_children(vec![
+        modal_scrim(Message::DismissProperties),
+        centered.into(),
     ])
     .width(Length::Fill)
     .height(Length::Fill)
