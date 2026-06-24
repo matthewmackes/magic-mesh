@@ -27,7 +27,7 @@ const TRACE_TIMEOUT: Duration = Duration::from_secs(2);
 use cosmic::iced::{Background, Border, Color, Length, Padding};
 use cosmic::{Element, Theme};
 use mackes_mesh_types::route_trace::{
-    ControlPoint, Direction, Layer, NodeKind, PathEdge, PathGraph, Verdict,
+    ControlPoint, Direction, Layer, NodeKind, PathEdge, PathGraph, PathNode, Transport, Verdict,
 };
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
 
@@ -97,6 +97,10 @@ pub struct TraceState {
     pub busy: bool,
     /// The most recent trace result: the rendered `PathGraph`, or an error.
     pub result: Option<Result<PathGraph, String>>,
+    /// ROUTE-TRACE-5 — the edge id (`<from>-><to>`) of the hop whose drill-down
+    /// detail panel is open, if any. Set by clicking a control-hop row; cleared
+    /// when a fresh trace lands (a new graph invalidates the old selection).
+    pub selected_hop: Option<String>,
 }
 
 impl TraceState {
@@ -169,6 +173,9 @@ pub enum Message {
     /// ROUTE-TRACE-4 — an `action/route/trace` reply landed (the `PathGraph` or
     /// an error message).
     TraceLoaded(Result<PathGraph, String>),
+    /// ROUTE-TRACE-5 — a hop/segment was clicked: open (or, if already open,
+    /// close) its drill-down detail panel. The payload is the edge id.
+    SelectTraceHop(String),
 }
 
 impl RoutingPanel {
@@ -278,6 +285,19 @@ impl RoutingPanel {
             Message::TraceLoaded(result) => {
                 self.trace.busy = false;
                 self.trace.result = Some(result);
+                // A new graph invalidates any open hop drill-down — the old edge
+                // id may not exist in the fresh path.
+                self.trace.selected_hop = None;
+                Task::none()
+            }
+            Message::SelectTraceHop(edge_id) => {
+                // Toggle: clicking the already-open hop closes its detail panel.
+                self.trace.selected_hop =
+                    if self.trace.selected_hop.as_deref() == Some(edge_id.as_str()) {
+                        None
+                    } else {
+                        Some(edge_id)
+                    };
                 Task::none()
             }
         }
@@ -683,11 +703,20 @@ fn trace_graph<'a>(state: &TraceState, palette: Palette) -> Element<'a, crate::M
             let verdict = path_verdict_line(graph, palette);
             let mut body = column![verdict, container(canvas).width(Length::Fill)].spacing(8);
             // ROUTE-TRACE-5 — the per-hop control list under the canvas: one row
-            // per edge that crosses a firewall/control point, each with a
-            // tone-tinted verdict badge + the cited rule. The canvas shows *where*
-            // the path stops; this list says *why*, citing each control's rule.
-            if let Some(controls) = control_hops_list(graph, palette) {
+            // per edge that crosses a firewall/control point, each a CLICKABLE
+            // button with a tone-tinted verdict badge + the cited rule. The canvas
+            // shows *where* the path stops; this list says *why*, citing each
+            // control's rule. Selecting a hop opens its drill-down detail panel.
+            if let Some(controls) = control_hops_list(graph, state.selected_hop.as_deref(), palette)
+            {
                 body = body.push(controls);
+            }
+            // ROUTE-TRACE-5 — the drill-down detail panel for the selected hop:
+            // endpoints + transport + RTT/loss + the full firewall rule chain +
+            // verdict + the DNS name resolved at that hop — all five connectivity
+            // concepts in one place.
+            if let Some(detail) = hop_detail_panel(graph, state.selected_hop.as_deref(), palette) {
+                body = body.push(detail);
             }
             card(body, palette)
         }
@@ -750,16 +779,15 @@ fn path_verdict_line<'a>(graph: &PathGraph, palette: Palette) -> Element<'a, cra
 /// reads like the graph (hostnames/service names) rather than the internal wire
 /// ids. Falls back to the raw edge id if the edge isn't found.
 fn blocked_edge_label(graph: &PathGraph, edge_id: &str) -> String {
-    let label_of = |id: &str| -> String {
-        graph
-            .nodes
-            .iter()
-            .find(|n| n.id == id)
-            .map_or_else(|| id.to_string(), |n| n.label.clone())
-    };
     graph.edges.iter().find(|e| e.id() == edge_id).map_or_else(
         || edge_id.to_string(),
-        |e| format!("{} → {}", label_of(&e.from), label_of(&e.to)),
+        |e| {
+            format!(
+                "{} → {}",
+                node_label(graph, &e.from),
+                node_label(graph, &e.to)
+            )
+        },
     )
 }
 
@@ -803,31 +831,40 @@ fn firewall_badge<'a>(control: &ControlPoint, palette: Palette) -> Element<'a, c
     )
 }
 
-/// ROUTE-TRACE-5 — one control-point hop row: the tone-tinted [`firewall_badge`],
-/// the human `<from> → <to>` segment, and a small drill-down detail line under it
-/// citing the control (`firewall` name) and its `rule`. The blocking hop (the one
-/// `blocked_at` points at) is marked so the operator can read the per-hop list as
-/// the canvas's explanation. The detail line is the per-hop drill-down — the wire
-/// firewall id + the exact cited rule, the "why" behind the badge.
+/// ROUTE-TRACE-5 — resolve a node id to its human label (hostname / service name
+/// / "Internet"), falling back to the raw id when the node isn't in the graph.
+fn node_label(graph: &PathGraph, id: &str) -> String {
+    graph
+        .nodes
+        .iter()
+        .find(|n| n.id == id)
+        .map_or_else(|| id.to_string(), |n| n.label.clone())
+}
+
+/// ROUTE-TRACE-5 — one control-point hop row, rendered as a CLICKABLE button so
+/// the operator can drill into it: the tone-tinted [`firewall_badge`], the human
+/// `<from> → <to>` segment, and a small detail line under it citing the control
+/// (`firewall` name) and its `rule`. The blocking hop (the one `blocked_at`
+/// points at) is marked so the per-hop list reads as the canvas's explanation;
+/// `selected` tints the row's surface so the open drill-down is obvious. Pressing
+/// it fires [`Message::SelectTraceHop`] which toggles the detail panel below.
 fn control_hop_row<'a>(
     graph: &PathGraph,
     edge: &PathEdge,
+    selected: bool,
     palette: Palette,
 ) -> Option<Element<'a, crate::Message>> {
     let control = edge.control.as_ref()?;
-    let label_of = |id: &str| -> String {
-        graph
-            .nodes
-            .iter()
-            .find(|n| n.id == id)
-            .map_or_else(|| id.to_string(), |n| n.label.clone())
-    };
     let badge = firewall_badge(control, palette);
     let is_blocking = graph.blocked_at.as_deref() == Some(edge.id().as_str());
 
-    let segment = text(format!("{} → {}", label_of(&edge.from), label_of(&edge.to)))
-        .size(12)
-        .colr(palette.text.into_cosmic_color());
+    let segment = text(format!(
+        "{} → {}",
+        node_label(graph, &edge.from),
+        node_label(graph, &edge.to)
+    ))
+    .size(12)
+    .colr(palette.text.into_cosmic_color());
 
     let mut head = row![badge, segment]
         .spacing(8)
@@ -843,28 +880,66 @@ fn control_hop_row<'a>(
         );
     }
 
-    // The per-hop drill-down: the control's name + the exact cited rule — the
-    // detail behind the badge ("firewalld:public · default deny (no matching rule)").
-    let detail = text(format!("{} · {}", control.firewall, control.rule))
+    // The per-hop summary: the control's name + the exact cited rule — the detail
+    // behind the badge ("firewalld:public · default deny (no matching rule)").
+    // The full drill-down (endpoints/transport/RTT/DNS) is the detail panel below.
+    let summary = text(format!("{} · {}", control.firewall, control.rule))
         .size(10)
         .colr(palette.text_muted.into_cosmic_color());
 
-    Some(card(column![head, detail].spacing(4), palette))
+    let inner = column![head, summary].spacing(4);
+    // A selected (or hovered) row reads on the Carbon hover tint; an unselected,
+    // unhovered one is transparent so the list reads plain until clicked. Both
+    // sourced from `mde-theme` tokens — no raw hex (§4).
+    let tint = palette.hover_tint().into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
+    let text_color = palette.text.into_cosmic_color();
+    let btn = button(inner)
+        .padding(Padding::from([8u16, 12u16]))
+        .width(Length::Fill)
+        .on_press(crate::Message::Routing(Message::SelectTraceHop(edge.id())))
+        .sty(move |_theme, status| {
+            // Hover lifts onto the tint even for an unselected row so the row
+            // reads as clickable; the selected row already sits on it.
+            let hovered = matches!(status, cosmic::iced::widget::button::Status::Hovered);
+            let bg = if selected || hovered {
+                tint
+            } else {
+                Color::TRANSPARENT
+            };
+            button::Style {
+                snap: false,
+                background: Some(Background::Color(bg)),
+                text_color,
+                border: Border {
+                    color: border,
+                    width: 1.0,
+                    radius: 5.0.into(),
+                },
+                ..button::Style::default()
+            }
+        });
+    Some(btn.into())
 }
 
 /// ROUTE-TRACE-5 — the per-hop control list: one [`control_hop_row`] for each
 /// edge that crosses a control point (a [`ControlPoint`]), in source→dest order,
-/// under a small heading. Returns `None` when the path crosses no control points
-/// (a plain egress with no modeled firewall) — the canvas alone suffices then, so
-/// no empty list chrome is rendered.
+/// under a small heading. `selected` is the edge id whose row is highlighted (the
+/// open drill-down). Returns `None` when the path crosses no control points (a
+/// plain egress with no modeled firewall) — the canvas alone suffices then, so no
+/// empty list chrome is rendered.
 fn control_hops_list<'a>(
     graph: &PathGraph,
+    selected: Option<&str>,
     palette: Palette,
 ) -> Option<Element<'a, crate::Message>> {
     let hop_rows: Vec<Element<'a, crate::Message>> = graph
         .edges
         .iter()
-        .filter_map(|edge| control_hop_row(graph, edge, palette))
+        .filter_map(|edge| {
+            let is_sel = selected == Some(edge.id().as_str());
+            control_hop_row(graph, edge, is_sel, palette)
+        })
         .collect();
     if hop_rows.is_empty() {
         return None;
@@ -873,10 +948,204 @@ fn control_hops_list<'a>(
     for r in hop_rows {
         rows = rows.push(r);
     }
-    let heading = text("Control points")
+    let heading = text("Control points — click a hop for detail")
         .size(11)
         .colr(palette.text_muted.into_cosmic_color());
     Some(column![heading, rows].spacing(6).into())
+}
+
+// ---- ROUTE-TRACE-5: selectable hop drill-down detail panel ----------------
+
+/// ROUTE-TRACE-5 — the human label for an edge's [`Transport`] (how the segment
+/// is carried: direct/relay overlay, VPN tunnel, public, loopback).
+#[must_use]
+fn transport_label(transport: Transport) -> &'static str {
+    match transport {
+        Transport::DirectOverlay => "direct overlay (Nebula, hole-punched)",
+        Transport::RelayOverlay => "relayed overlay (via a lighthouse)",
+        Transport::VpnTunnel => "VPN tunnel",
+        Transport::Public => "public internet",
+        Transport::Loopback => "on-host loopback",
+    }
+}
+
+/// ROUTE-TRACE-5 — the human label for a node's [`NodeKind`] (the five-concept
+/// taxonomy: hosting & VMs, mesh peers, the gateway/exit, ingress, services).
+#[must_use]
+fn node_kind_label(kind: NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Host => "host",
+        NodeKind::Vm => "VM",
+        NodeKind::Container => "container",
+        NodeKind::OverlayPeer => "overlay peer",
+        NodeKind::Gateway => "VPN gateway",
+        NodeKind::VpnExit => "VPN exit",
+        NodeKind::Ingress => "ingress",
+        NodeKind::Internet => "internet",
+        NodeKind::Service => "service",
+    }
+}
+
+/// ROUTE-TRACE-5 — the RTT/loss line for a measured segment, or an honest
+/// "not measured" when the segment was modeled-only (degrade-to-modeled — never
+/// fabricate a latency). Pure so the formatting is unit-testable.
+#[must_use]
+fn rtt_loss_line(edge: &PathEdge) -> String {
+    match (edge.rtt_ms, edge.loss) {
+        (Some(rtt), Some(loss)) => format!("{rtt:.1} ms · {:.0}% loss", loss * 100.0),
+        (Some(rtt), None) => format!("{rtt:.1} ms"),
+        (None, Some(loss)) => format!("{:.0}% loss", loss * 100.0),
+        (None, None) => "not measured (modeled hop)".to_string(),
+    }
+}
+
+/// ROUTE-TRACE-5 — find the selected edge by its `<from>-><to>` id.
+fn find_edge<'a>(graph: &'a PathGraph, edge_id: &str) -> Option<&'a PathEdge> {
+    graph.edges.iter().find(|e| e.id() == edge_id)
+}
+
+/// ROUTE-TRACE-5 — a labelled key/value detail line (muted key, default-text
+/// value). The atom every endpoint/segment row in the drill-down is built from.
+fn detail_row<'a>(key: &str, value: String, palette: Palette) -> Element<'a, crate::Message> {
+    row![
+        text(format!("{key}:"))
+            .size(11)
+            .colr(palette.text_muted.into_cosmic_color())
+            .width(Length::Fixed(96.0)),
+        text(value).size(11).colr(palette.text.into_cosmic_color()),
+    ]
+    .spacing(8)
+    .align_y(cosmic::iced::alignment::Vertical::Top)
+    .into()
+}
+
+/// ROUTE-TRACE-5 — the endpoint detail block for one node: its kind, every known
+/// address (LAN / overlay / public), the DNS name resolved at that hop (Dynamic
+/// DNS), and the hosting node (Hosting & VMs). Only the addresses that exist are
+/// shown — no "unknown" placeholders for a node that simply has no overlay IP.
+fn endpoint_detail<'a>(
+    title: &str,
+    node: &PathNode,
+    palette: Palette,
+) -> Element<'a, crate::Message> {
+    let mut col = column![text(format!("{title} — {}", node.label))
+        .size(12)
+        .colr(palette.text.into_cosmic_color())]
+    .spacing(3);
+    col = col.push(detail_row(
+        "kind",
+        node_kind_label(node.kind).to_string(),
+        palette,
+    ));
+    if let Some(ip) = &node.node_ip {
+        col = col.push(detail_row("host IP", ip.clone(), palette));
+    }
+    if let Some(ip) = &node.overlay_ip {
+        col = col.push(detail_row("overlay IP", ip.clone(), palette));
+    }
+    if let Some(ip) = &node.public_ip {
+        col = col.push(detail_row("public IP", ip.clone(), palette));
+    }
+    if let Some(dns) = &node.dns_name {
+        // Dynamic DNS — the published name resolved at this hop.
+        col = col.push(detail_row("DNS name", dns.clone(), palette));
+    }
+    if let Some(host) = &node.hosting_node {
+        col = col.push(detail_row("hosted on", host.clone(), palette));
+    }
+    col.into()
+}
+
+/// ROUTE-TRACE-5 — the per-hop drill-down detail panel for the selected segment.
+///
+/// Surfaces all five connectivity concepts for the one clicked hop: its two
+/// endpoints with every known address + the Dynamic-DNS name + the hosting node
+/// (Hosting & VMs + Mesh), the transport + layer (Mesh/VPN/Public), the measured
+/// RTT/loss, and the firewall control verdict + the exact cited rule (Firewalls &
+/// Control) — flagged when it is the first blocking point. Returns `None` when no
+/// hop is selected or the selection no longer resolves (a stale id after a fresh
+/// trace). Carbon tokens only (§4).
+fn hop_detail_panel<'a>(
+    graph: &PathGraph,
+    selected: Option<&str>,
+    palette: Palette,
+) -> Option<Element<'a, crate::Message>> {
+    let edge_id = selected?;
+    let edge = find_edge(graph, edge_id)?;
+    let from = graph.nodes.iter().find(|n| n.id == edge.from);
+    let to = graph.nodes.iter().find(|n| n.id == edge.to);
+
+    let heading = text(format!(
+        "Hop detail — {} → {}",
+        node_label(graph, &edge.from),
+        node_label(graph, &edge.to)
+    ))
+    .size(13)
+    .colr(palette.text.into_cosmic_color());
+
+    let mut body = column![heading].spacing(8);
+
+    // Endpoints (Hosting & VMs + Mesh).
+    if let Some(n) = from {
+        body = body.push(endpoint_detail("From", n, palette));
+    }
+    if let Some(n) = to {
+        body = body.push(endpoint_detail("To", n, palette));
+    }
+
+    // The segment itself (Mesh / VPN egress-ingress / Public).
+    let mut segment = column![text("Segment")
+        .size(12)
+        .colr(palette.text.into_cosmic_color())]
+    .spacing(3);
+    segment = segment.push(detail_row(
+        "transport",
+        transport_label(edge.transport).to_string(),
+        palette,
+    ));
+    segment = segment.push(detail_row(
+        "layer",
+        layer_label(edge.layer).to_string(),
+        palette,
+    ));
+    segment = segment.push(detail_row("rtt/loss", rtt_loss_line(edge), palette));
+    body = body.push(segment);
+
+    // Firewalls & Control — the verdict badge + the full cited rule chain, with
+    // the first-block flag when this is where the path stops.
+    let mut control_block = column![text("Firewall / control")
+        .size(12)
+        .colr(palette.text.into_cosmic_color())]
+    .spacing(3);
+    if let Some(control) = &edge.control {
+        let is_blocking = graph.blocked_at.as_deref() == Some(edge.id().as_str());
+        let badge_row = row![
+            firewall_badge(control, palette),
+            text(control.firewall.clone())
+                .size(11)
+                .colr(palette.text.into_cosmic_color()),
+        ]
+        .spacing(8)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+        control_block = control_block.push(badge_row);
+        control_block = control_block.push(detail_row("rule", control.rule.clone(), palette));
+        if is_blocking {
+            control_block = control_block.push(
+                text("This is the first point that blocks the path.")
+                    .size(11)
+                    .colr(palette.danger.into_cosmic_color()),
+            );
+        }
+    } else {
+        control_block = control_block.push(
+            text("No control point on this segment (open path).")
+                .size(11)
+                .colr(palette.text_muted.into_cosmic_color()),
+        );
+    }
+    body = body.push(control_block);
+
+    Some(card(body, palette))
 }
 
 /// ROUTE-TRACE-4 — the topology-graph canvas program. Lays the path out as a
@@ -1492,16 +1761,17 @@ mod tests {
         // At least one edge carries a control point ⇒ the list is rendered.
         assert!(blocked.edges.iter().any(|e| e.control.is_some()));
         assert!(
-            control_hops_list(&blocked, palette).is_some(),
+            control_hops_list(&blocked, None, palette).is_some(),
             "a constrained path renders the control list"
         );
-        // The blocking edge resolves to a renderable row.
+        // The blocking edge resolves to a renderable row (selected + unselected).
         let blocking = blocked
             .edges
             .iter()
             .find(|e| e.is_blocked())
             .expect("mesh-only blocks at the boundary");
-        assert!(control_hop_row(&blocked, blocking, palette).is_some());
+        assert!(control_hop_row(&blocked, blocking, false, palette).is_some());
+        assert!(control_hop_row(&blocked, blocking, true, palette).is_some());
         let _ = firewall_badge(blocking.control.as_ref().unwrap(), palette);
 
         // A plain egress with no modeled firewall crosses no control points ⇒ the
@@ -1510,9 +1780,137 @@ mod tests {
         let open = mackes_mesh_types::route_trace::assemble_egress("eagle", None, "1.1.1.1");
         assert!(open.edges.iter().all(|e| e.control.is_none()));
         assert!(
-            control_hops_list(&open, palette).is_none(),
+            control_hops_list(&open, None, palette).is_none(),
             "an unconstrained path renders no control list"
         );
-        assert!(control_hop_row(&open, &open.edges[0], palette).is_none());
+        assert!(control_hop_row(&open, &open.edges[0], false, palette).is_none());
+    }
+
+    // --- ROUTE-TRACE-5: selectable hop drill-down detail panel ------------------
+
+    #[test]
+    fn transport_layer_kind_labels_are_distinct_and_human() {
+        // Each enum variant maps to a distinct, non-empty human string (no two
+        // transports/layers/kinds collapse to the same label).
+        let transports = [
+            Transport::DirectOverlay,
+            Transport::RelayOverlay,
+            Transport::VpnTunnel,
+            Transport::Public,
+            Transport::Loopback,
+        ];
+        let t_labels: Vec<&str> = transports.iter().map(|t| transport_label(*t)).collect();
+        assert!(t_labels.iter().all(|s| !s.is_empty()));
+        for i in 0..t_labels.len() {
+            for j in (i + 1)..t_labels.len() {
+                assert_ne!(t_labels[i], t_labels[j], "transport labels collide");
+            }
+        }
+        // A relay vs direct overlay read differently (the operator can tell a
+        // hole-punched hop from a lighthouse-relayed one).
+        assert_ne!(
+            transport_label(Transport::DirectOverlay),
+            transport_label(Transport::RelayOverlay)
+        );
+
+        // The pre-existing ROUTE-TRACE-4 layer_label (reused by the detail panel).
+        assert_eq!(layer_label(Layer::Mesh), "mesh");
+        assert_eq!(layer_label(Layer::Vpn), "vpn");
+        assert_ne!(layer_label(Layer::Host), layer_label(Layer::Public));
+
+        assert_eq!(node_kind_label(NodeKind::Vm), "VM");
+        assert_eq!(node_kind_label(NodeKind::Service), "service");
+        assert_ne!(
+            node_kind_label(NodeKind::Gateway),
+            node_kind_label(NodeKind::VpnExit)
+        );
+    }
+
+    #[test]
+    fn rtt_loss_line_reports_measured_and_is_honest_when_modeled() {
+        let mut e = PathEdge {
+            from: "a".into(),
+            to: "b".into(),
+            ..Default::default()
+        };
+        // Both measured.
+        e.rtt_ms = Some(12.34);
+        e.loss = Some(0.05);
+        let s = rtt_loss_line(&e);
+        assert!(s.contains("12.3 ms"), "{s}");
+        assert!(s.contains("5% loss"), "{s}");
+        // RTT only.
+        e.loss = None;
+        assert_eq!(rtt_loss_line(&e), "12.3 ms");
+        // Neither — never fabricate a latency; say so plainly.
+        e.rtt_ms = None;
+        assert_eq!(rtt_loss_line(&e), "not measured (modeled hop)");
+    }
+
+    #[test]
+    fn hop_detail_panel_opens_for_a_selected_edge_and_handles_a_stale_id() {
+        // A real blocked ingress graph: selecting the blocking edge renders the
+        // detail panel; no selection or a stale id renders nothing.
+        let palette = mde_theme::Palette::gray_90();
+        let g = mackes_mesh_types::route_trace::assemble_ingress(
+            &mackes_mesh_types::exposure::ExposurePolicy {
+                id: "grafana".into(),
+                source: mackes_mesh_types::exposure::ServiceSource {
+                    node: "eagle".into(),
+                    port: 3000,
+                    proto: "tcp".into(),
+                    ..Default::default()
+                },
+                tier: mackes_mesh_types::exposure::Tier::MeshOnly,
+                ..Default::default()
+            },
+            Some("10.42.0.2"),
+            None,
+        );
+        // No selection ⇒ no panel.
+        assert!(hop_detail_panel(&g, None, palette).is_none());
+        // A stale/unknown edge id ⇒ no panel (a fresh trace dropped the old id).
+        assert!(hop_detail_panel(&g, Some("ghost->void"), palette).is_none());
+        // The first edge's id resolves ⇒ a panel renders, and find_edge agrees.
+        let id = g.edges[0].id();
+        assert!(find_edge(&g, &id).is_some());
+        assert!(
+            hop_detail_panel(&g, Some(&id), palette).is_some(),
+            "a selected real edge opens its detail panel"
+        );
+        // The blocking edge (the one blocked_at cites) also opens cleanly.
+        let blocking = g
+            .blocked_at
+            .clone()
+            .expect("mesh-only blocks at the boundary");
+        assert!(hop_detail_panel(&g, Some(&blocking), palette).is_some());
+    }
+
+    #[test]
+    fn select_trace_hop_toggles_and_a_fresh_trace_clears_the_selection() {
+        // The update reducer: selecting a hop opens it, re-selecting the same hop
+        // closes it, selecting a different hop switches, and a fresh TraceLoaded
+        // clears the open drill-down (a new graph invalidates the old edge id).
+        let mut panel = RoutingPanel::new();
+        assert_eq!(panel.trace.selected_hop, None);
+
+        let _ = panel.update(Message::SelectTraceHop("a->b".into()));
+        assert_eq!(panel.trace.selected_hop.as_deref(), Some("a->b"));
+
+        // Re-select the same hop ⇒ closes.
+        let _ = panel.update(Message::SelectTraceHop("a->b".into()));
+        assert_eq!(panel.trace.selected_hop, None);
+
+        // Switch to a different hop.
+        let _ = panel.update(Message::SelectTraceHop("b->c".into()));
+        assert_eq!(panel.trace.selected_hop.as_deref(), Some("b->c"));
+
+        // A fresh trace result clears the selection.
+        let g = mackes_mesh_types::route_trace::assemble_egress("eagle", None, "1.1.1.1");
+        let _ = panel.update(Message::TraceLoaded(Ok(g)));
+        assert_eq!(
+            panel.trace.selected_hop, None,
+            "a new graph invalidates the open hop"
+        );
     }
 }
