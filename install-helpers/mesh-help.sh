@@ -31,10 +31,10 @@ printf '%s│%s  %s⬢  M A G I C   M E S H  —  cheat sheet%s       %s│%s\n'
 printf '%s└──────────────────────────────────────────────┘%s\n' "$BLUE" "$RST"
 
 header "Enrollment & join"
-cmd "network-enroll found <name>"     "found a new mesh (this node = first lighthouse)"
-cmd "network-enroll join <addr>"      "join an existing mesh via a lighthouse"
+cmd "mackesd found <name>"            "found a new mesh (this node = first lighthouse)"
+cmd "mackesd add-peer --role <role>"  "mint a single-use v3 join token (on a lighthouse)"
+cmd "mackesd join <token>"            "join an existing mesh with an add-peer token"
 cmd "mde-enroll"                       "interactive enroll/join TUI"
-cmd "mackesd enroll-token"             "mint a single-use join token (on a lighthouse)"
 cmd "mackesd leave"                    "voluntarily exit the mesh"
 
 header "Status & health"
