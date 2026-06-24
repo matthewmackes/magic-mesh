@@ -242,15 +242,40 @@ pub fn skeleton_rows<'a>(rows: usize, phase: f32, reduce_motion: bool) -> Elemen
 /// pass-through for the common `Loaded` path.
 #[must_use]
 pub fn dim<'a>(body: Element<'a, Message>, content_alpha: f32) -> Element<'a, Message> {
-    if content_alpha >= 1.0 {
+    // Carbon Gray-80 content surface (`t::PF_BG_300`, the pane background) — a
+    // token, not a raw colour (§4). Fill-width: dims a flex-sized content pane.
+    scrim_over(body, content_alpha, t::PF_BG_300, Length::Fill)
+}
+
+/// MOTION-TRANS-2 — like [`dim`], but for a **fixed-width** surface (the side
+/// rail): the dim scrim is constrained to `width` so the stack keeps the rail's
+/// own width instead of expanding to fill its slot. Used to crossfade the
+/// sidebar in on a collapse/expand without disturbing the row layout. Full-alpha
+/// (`>= 1.0`) is the zero-cost settled pass-through.
+#[must_use]
+pub fn dim_fixed<'a>(body: Element<'a, Message>, alpha: f32, width: f32) -> Element<'a, Message> {
+    // Carbon Gray-90 side-rail surface (`t::WINDOW_SIDE`) so the rail fades toward
+    // its own page colour, never a hole; width-pinned so it keeps the rail width.
+    scrim_over(body, alpha, t::WINDOW_SIDE, Length::Fixed(width))
+}
+
+/// BEAUT-FILES / MOTION-TRANS-2 — the shared fake-opacity primitive: stack a
+/// `surface`-coloured scrim over `body` at `1 - alpha`, so the content fades
+/// toward its page colour (the iced fork has no opacity widget). `stack_w` pins
+/// the resulting stack's width (Fill for a flex pane, Fixed for the side rail).
+/// Full-alpha (`>= 1.0`) skips the scrim entirely — a zero-cost pass-through.
+fn scrim_over<'a>(
+    body: Element<'a, Message>,
+    alpha: f32,
+    surface: Color,
+    stack_w: Length,
+) -> Element<'a, Message> {
+    if alpha >= 1.0 {
         return body;
     }
-    let scrim_alpha = (1.0 - content_alpha).clamp(0.0, 1.0);
-    // Carbon Gray-80 content surface (`t::PF_BG_300`, the pane background) at the
-    // complementary alpha — a token, not a raw colour (§4).
     let scrim_color = Color {
-        a: scrim_alpha,
-        ..t::PF_BG_300
+        a: (1.0 - alpha).clamp(0.0, 1.0),
+        ..surface
     };
     let scrim = container(Space::new().width(Length::Fill).height(Length::Fill))
         .width(Length::Fill)
@@ -261,7 +286,8 @@ pub fn dim<'a>(body: Element<'a, Message>, content_alpha: f32) -> Element<'a, Me
             ..container::Style::default()
         });
     cosmic::iced::widget::Stack::with_children(vec![body, scrim.into()])
-        .width(Length::Fill)
+        .width(stack_w)
+        .height(Length::Fill)
         .into()
 }
 

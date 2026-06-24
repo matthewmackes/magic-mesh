@@ -151,6 +151,10 @@ pub const WIN_W: f32 = 1480.0;
 pub const WIN_H: f32 = 940.0;
 pub const TITLEBAR_H: f32 = 32.0;
 pub const SIDEBAR_W: f32 = 248.0;
+/// AFM-2 — width of the collapsed sidebar rail (the slim icon-only column that
+/// keeps just the panel-toggle / back / refresh). MOTION-TRANS-2 pins the
+/// crossfade scrim to this width when collapsed.
+pub const SIDEBAR_RAIL_W: f32 = 44.0;
 pub const SIDE_ROW_PAD_Y: f32 = 5.0;
 pub const SIDE_ROW_PAD_X: f32 = 14.0;
 pub const SIDE_ROW_GAP: f32 = 10.0;

@@ -161,7 +161,7 @@ pub fn sidebar<'a>(
             .align_x(cosmic::iced::alignment::Horizontal::Center),
         )
         .padding(Padding::new(6.0))
-        .width(Length::Fixed(44.0))
+        .width(Length::Fixed(t::SIDEBAR_RAIL_W))
         .height(Length::Fill)
         .sty(|_| container::Style {
             snap: false,
