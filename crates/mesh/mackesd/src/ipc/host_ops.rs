@@ -61,7 +61,7 @@ impl HostOpsService {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 10] = [
+pub const ACTION_VERBS: [&str; 11] = [
     "host-power",
     // DATACENTER-10 — the Hosts tab's impact preview + pool read.
     "host-impact",
@@ -75,6 +75,8 @@ pub const ACTION_VERBS: [&str; 10] = [
     // DATACENTER-13 — the Network tab's L2 read + VLAN create.
     "host-net",
     "host-vlan-create",
+    // DATACENTER-14 — the Gateway tab's EdgeOS DHCP read (reservations + leases).
+    "gateway-dhcp",
 ];
 
 /// Responder poll interval.
@@ -497,6 +499,141 @@ fn gateway_status(req_body: Option<&str>) -> Result<(u32, String, String), Strin
     let uptime_line = lines.next().unwrap_or("");
     let model_line = lines.next().unwrap_or("");
     Ok(parse_gateway_status(leases_line, uptime_line, model_line))
+}
+
+/// DATACENTER-14 (Gateway tab) — one tofu-managed DHCP static reservation on the
+/// EdgeRouter (a `managed_reservations` output entry, `name => {mac, ip}`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct GatewayReservation {
+    /// The reservation's name (the EdgeOS static-mapping name).
+    pub name: String,
+    /// The reserved MAC.
+    pub mac: String,
+    /// The reserved IPv4.
+    pub ip: String,
+}
+
+/// DATACENTER-14 (Gateway tab) — one live DHCP lease on the EdgeRouter (a
+/// `dhcp_leases` output entry, decoded from `ip => "mac|expiry|hostname"`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct GatewayLease {
+    /// The leased IPv4.
+    pub ip: String,
+    /// The lessee's MAC.
+    pub mac: String,
+    /// The lease expiry (the EdgeOS-formatted timestamp string).
+    pub expiry: String,
+    /// The client hostname (may be empty when the client sent none).
+    pub hostname: String,
+}
+
+/// Parse the `managed_reservations` tofu-output value (a JSON object
+/// `name => {mac, ip}`) into a name-sorted reservation list. PURE.
+///
+/// `out` is the `.value` of the `tofu output -json` block for
+/// `managed_reservations`. A missing/non-object value yields an empty list (the
+/// workspace simply has no reservations, not an error).
+#[must_use]
+pub fn parse_reservations(out: &serde_json::Value) -> Vec<GatewayReservation> {
+    let Some(map) = out.as_object() else {
+        return Vec::new();
+    };
+    let mut rows: Vec<GatewayReservation> = map
+        .iter()
+        .map(|(name, v)| GatewayReservation {
+            name: name.clone(),
+            mac: v
+                .get("mac")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            ip: v
+                .get("ip")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+/// Parse the `dhcp_leases` tofu-output value (a JSON object `ip =>
+/// "mac|expiry|hostname"`) into an IP-sorted lease list. PURE.
+///
+/// `out` is the `.value` of the `tofu output -json` block for `dhcp_leases`. Each
+/// value is the pipe-joined `mac|expiry|hostname` the poll script emits; a value
+/// with fewer fields fills the rest blank. A missing/non-object value yields an
+/// empty list.
+#[must_use]
+pub fn parse_leases(out: &serde_json::Value) -> Vec<GatewayLease> {
+    let Some(map) = out.as_object() else {
+        return Vec::new();
+    };
+    let mut rows: Vec<GatewayLease> = map
+        .iter()
+        .map(|(ip, v)| {
+            let raw = v.as_str().unwrap_or("");
+            let mut parts = raw.splitn(3, '|');
+            GatewayLease {
+                ip: ip.clone(),
+                mac: parts.next().unwrap_or("").trim().to_string(),
+                expiry: parts.next().unwrap_or("").trim().to_string(),
+                hostname: parts.next().unwrap_or("").trim().to_string(),
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.ip.cmp(&b.ip));
+    rows
+}
+
+/// DATACENTER-14 (Gateway tab) — read the EdgeOS DHCP state from the `edgeos` tofu
+/// workspace outputs: the tofu-managed static reservations + the live DHCP leases.
+///
+/// Runs `tofu output -json` in `infra/tofu/edgeos` (read-only — the live-lease
+/// poll is an external-data read, and `managed_reservations` echoes the desired
+/// state), parses the `managed_reservations` + `dhcp_leases` outputs, and returns
+/// the two structured lists. Reservation CHANGES never go through this read — they
+/// go through the tofu-gated `tofu-plan`/`tofu-apply` on the `edgeos` workspace.
+///
+/// # Errors
+/// Returns `Err` on a spawn failure, a non-zero `tofu output` exit (e.g. no
+/// state yet), or unparseable JSON.
+fn gateway_dhcp(
+    workgroup_root: &std::path::Path,
+) -> Result<(Vec<GatewayReservation>, Vec<GatewayLease>), String> {
+    let repo = workgroup_root.display();
+    // `repo` is process-owned and the dir is a fixed literal, so this is not an
+    // injection surface. `tofu output -json` is read-only.
+    let script = format!("cd {repo}/infra/tofu/edgeos && tofu output -json 2>&1");
+    let o = std::process::Command::new("bash")
+        .args(["-lc", &script])
+        .output()
+        .map_err(|e| format!("gateway-dhcp exec failed: {e}"))?;
+    if !o.status.success() {
+        let mut out = String::from_utf8_lossy(&o.stdout).into_owned();
+        out.push_str(&String::from_utf8_lossy(&o.stderr));
+        let msg = out.trim();
+        return Err(if msg.is_empty() {
+            "gateway-dhcp: tofu output failed".into()
+        } else {
+            msg.to_string()
+        });
+    }
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&o.stdout))
+        .map_err(|e| format!("gateway-dhcp: bad tofu output json: {e}"))?;
+    // `tofu output -json` shape: { "<name>": { "value": <v>, "type": .. }, .. }.
+    let reservations = parse_reservations(
+        v.get("managed_reservations")
+            .and_then(|o| o.get("value"))
+            .unwrap_or(&serde_json::Value::Null),
+    );
+    let leases = parse_leases(
+        v.get("dhcp_leases")
+            .and_then(|o| o.get("value"))
+            .unwrap_or(&serde_json::Value::Null),
+    );
+    Ok((reservations, leases))
 }
 
 /// Run the DATACENTER-23 disaster-recovery backup (confirm-gated): shells out to
@@ -1069,6 +1206,21 @@ pub fn build_reply(svc: &HostOpsService, verb: &str, req_body: Option<&str>) -> 
                 Err(m) => err(m),
             };
         }
+        // DATACENTER-14 — the Gateway tab's EdgeOS DHCP read: the tofu-managed
+        // static reservations + the live DHCP leases, read from the edgeos tofu
+        // workspace outputs (read-only; reservation CHANGES go through the
+        // tofu-gated apply, never a blind apply from the GUI).
+        "gateway-dhcp" => {
+            return match gateway_dhcp(&svc.workgroup_root) {
+                Ok((reservations, leases)) => json!({
+                    "ok": true,
+                    "reservations": reservations,
+                    "leases": leases,
+                })
+                .to_string(),
+                Err(m) => err(m),
+            };
+        }
         // DATACENTER-13 — the Network tab's L2 read + VLAN create (factored out so
         // `build_reply` stays a thin dispatcher; the two verbs reply-shape together).
         "host-net" | "host-vlan-create" => return net_build_reply(verb, req_body),
@@ -1432,6 +1584,67 @@ mod tests {
         let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
         let r = build_reply(&s, "gateway-status", None);
         assert!(r.contains("missing request body"), "{r}");
+    }
+
+    // ── DATACENTER-14 — Gateway tab (EdgeOS DHCP) ────────────────────────────
+
+    #[test]
+    fn gateway_dhcp_verb_is_served() {
+        assert!(ACTION_VERBS.contains(&"gateway-dhcp"));
+        assert_eq!(action_topic("gateway-dhcp"), "action/dc/gateway-dhcp");
+    }
+
+    #[test]
+    fn parse_reservations_sorts_by_name() {
+        let v = json!({
+            "rocky9-kvm1": { "mac": "00:23:24:c2:0f:1c", "ip": "172.20.145.193" },
+            "mcnf-a":      { "mac": "f2:f2:0b:c5:dc:00", "ip": "172.20.121.10" },
+        });
+        let rows = parse_reservations(&v);
+        assert_eq!(rows.len(), 2);
+        // Name-sorted: mcnf-a before rocky9-kvm1.
+        assert_eq!(rows[0].name, "mcnf-a");
+        assert_eq!(rows[0].mac, "f2:f2:0b:c5:dc:00");
+        assert_eq!(rows[0].ip, "172.20.121.10");
+        assert_eq!(rows[1].name, "rocky9-kvm1");
+    }
+
+    #[test]
+    fn parse_reservations_empty_or_non_object() {
+        assert!(parse_reservations(&serde_json::Value::Null).is_empty());
+        assert!(parse_reservations(&json!([])).is_empty());
+        assert!(parse_reservations(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn parse_leases_decodes_pipe_fields_and_sorts_by_ip() {
+        let v = json!({
+            "172.20.145.33": "2c:54:91:0d:fc:30|2026/06/25 10:00:00|xbox",
+            "172.20.121.10": "f2:f2:0b:c5:dc:00|2026/06/25 09:00:00|mcnf-a",
+        });
+        let rows = parse_leases(&v);
+        assert_eq!(rows.len(), 2);
+        // IP-sorted (string sort): .121.10 before .145.33.
+        assert_eq!(rows[0].ip, "172.20.121.10");
+        assert_eq!(rows[0].mac, "f2:f2:0b:c5:dc:00");
+        assert_eq!(rows[0].expiry, "2026/06/25 09:00:00");
+        assert_eq!(rows[0].hostname, "mcnf-a");
+        assert_eq!(rows[1].ip, "172.20.145.33");
+        assert_eq!(rows[1].hostname, "xbox");
+    }
+
+    #[test]
+    fn parse_leases_tolerates_missing_fields() {
+        // A lease value with no hostname (or no expiry) fills the rest blank.
+        let v = json!({ "10.0.0.5": "aa:bb:cc:dd:ee:ff|2026/01/01 00:00:00" });
+        let rows = parse_leases(&v);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].mac, "aa:bb:cc:dd:ee:ff");
+        assert_eq!(rows[0].expiry, "2026/01/01 00:00:00");
+        assert_eq!(rows[0].hostname, "");
+        // Empty / non-object → empty.
+        assert!(parse_leases(&serde_json::Value::Null).is_empty());
+        assert!(parse_leases(&json!("nope")).is_empty());
     }
 
     #[test]

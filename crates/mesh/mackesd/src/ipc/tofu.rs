@@ -63,15 +63,17 @@ pub fn action_topic(verb: &str) -> String {
 
 /// Resolve a request `workspace` to its relative tofu dir. PURE.
 ///
-/// Allow-lists `ws` ∈ {`xen-xapi`, `zone1-do`} → `infra/tofu/<ws>`. Any other
-/// value (including anything with path separators / traversal / injection
-/// characters) is rejected, so the caller can never escape the tofu tree.
+/// Allow-lists `ws` ∈ {`xen-xapi`, `zone1-do`, `edgeos`} → `infra/tofu/<ws>`.
+/// Any other value (including anything with path separators / traversal /
+/// injection characters) is rejected, so the caller can never escape the tofu
+/// tree. `edgeos` (DATACENTER-14) is the EdgeRouter DHCP-as-code workspace the
+/// Gateway tab plans/applies reservation changes through.
 ///
 /// # Errors
 /// Returns `Err` for any `ws` not in the allow-list.
 pub fn tofu_workspace_dir(ws: &str) -> Result<String, String> {
     match ws {
-        "xen-xapi" | "zone1-do" => Ok(format!("infra/tofu/{ws}")),
+        "xen-xapi" | "zone1-do" | "edgeos" => Ok(format!("infra/tofu/{ws}")),
         other => Err(format!("unknown tofu workspace: {other}")),
     }
 }
@@ -414,6 +416,8 @@ mod tests {
             tofu_workspace_dir("zone1-do").unwrap(),
             "infra/tofu/zone1-do"
         );
+        // DATACENTER-14 — the EdgeOS DHCP workspace the Gateway tab manages.
+        assert_eq!(tofu_workspace_dir("edgeos").unwrap(), "infra/tofu/edgeos");
     }
 
     #[test]
