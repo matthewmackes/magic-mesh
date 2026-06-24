@@ -13,6 +13,7 @@
 //! load + projection here are pure and unit-tested.
 
 use std::collections::{BTreeSet, VecDeque};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use cosmic::iced::widget::{column, container, mouse_area, row, scrollable, text, text_input};
@@ -21,6 +22,7 @@ use cosmic::Element;
 use mde_theme::animation::{lerp_f32, slide_in, Animator};
 use mde_theme::motion::Motion;
 use mde_theme::{spacing, Palette};
+use serde::{Deserialize, Serialize};
 
 use crate::controls::{variant_button, ButtonVariant};
 // Brings the `.colr(..)` text extension + `Rgba::into_cosmic_color()` into scope
@@ -939,6 +941,20 @@ pub struct DatacenterPanel {
     /// buffer so a long-running session keeps only the recent trend, not unbounded
     /// growth.
     pub history: VecDeque<HistorySample>,
+    /// DATACENTER-8 (saved views) — the operator's named saved views (each a view
+    /// mode, zone tab, and search needle), hydrated from the local config file by
+    /// the first panel-open `load()`. The header renders a restore chip per view;
+    /// saving the current view persists the file.
+    pub saved_views: SavedViews,
+    /// DATACENTER-8 (saved views) — the in-progress name in the "Save view as…"
+    /// box. Cleared once a view is saved. Pure UI state.
+    pub save_view_name: String,
+    /// DATACENTER-8 (saved views) — whether [`Self::saved_views`] has been
+    /// hydrated from disk yet. The first panel-open's `load()` reads the file
+    /// off-thread (keeping `Default`/init pure + non-blocking, matching the
+    /// panel's lazy-load convention); subsequent reloads are ignored so a Bus
+    /// refresh never clobbers in-memory saved-view edits.
+    pub views_loaded: bool,
 }
 
 /// Top-level view selector for the datacenter panel.
@@ -955,6 +971,184 @@ pub enum ViewMode {
     /// The structured infrastructure map: resources grouped by their owning
     /// host/zone, with collapsible host group headers (DATACENTER-13).
     Topology,
+}
+
+impl ViewMode {
+    /// A stable lowercase slug for persistence — the on-disk saved-view record
+    /// names the view mode by this string (NOT the `Debug` name, so a future
+    /// rename of the variant can't silently invalidate a saved file). Pure.
+    #[must_use]
+    pub fn slug(self) -> &'static str {
+        match self {
+            ViewMode::Overview => "overview",
+            ViewMode::Zone => "resources",
+            ViewMode::Tofu => "tofu",
+            ViewMode::Audit => "audit",
+            ViewMode::Topology => "topology",
+        }
+    }
+
+    /// The inverse of [`ViewMode::slug`] — recover a view mode from a persisted
+    /// slug. An unrecognized slug (a file from a newer build, or corruption)
+    /// falls back to `Overview`, the safe default landing view, rather than
+    /// dropping the saved view. Pure.
+    #[must_use]
+    pub fn from_slug(slug: &str) -> ViewMode {
+        match slug {
+            "resources" => ViewMode::Zone,
+            "tofu" => ViewMode::Tofu,
+            "audit" => ViewMode::Audit,
+            "topology" => ViewMode::Topology,
+            // "overview" and anything unknown.
+            _ => ViewMode::Overview,
+        }
+    }
+}
+
+/// DATACENTER-8 (saved views) — the largest number of saved views kept. A view is
+/// a tiny record (a name + three short strings), so the cap is generous; it only
+/// bounds an accidental unbounded-growth footgun and keeps the restore bar from
+/// overflowing the header. The oldest (front) entry is evicted when a new save
+/// would exceed it.
+pub const SAVED_VIEW_CAP: usize = 12;
+
+/// DATACENTER-8 (saved views) — one named, restorable snapshot of the panel's
+/// view selectors: the top-level [`ViewMode`], the active zone tab, and the global
+/// search needle. Saving the current view captures these three; applying a saved
+/// view restores them. This is purely the operator's local UI state (which slice
+/// of the datacenter they like to land on) — it carries no infra coupling and no
+/// Bus data, so it persists in the local config dir, not on the mesh.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedView {
+    /// The operator-given name shown on the restore chip (e.g. "Prod VMs").
+    pub name: String,
+    /// The view mode this snapshot lands on, by [`ViewMode::slug`].
+    pub view_mode: String,
+    /// The zone tab this snapshot selects ("prod" | "dev").
+    pub zone_tab: String,
+    /// The global search needle this snapshot restores (may be empty).
+    pub filter: String,
+}
+
+impl SavedView {
+    /// The [`ViewMode`] this saved view lands on, decoded from its slug.
+    #[must_use]
+    pub fn mode(&self) -> ViewMode {
+        ViewMode::from_slug(&self.view_mode)
+    }
+}
+
+/// DATACENTER-8 (saved views) — the operator's collection of named saved views,
+/// in save order. Pure value type: add/remove/find are total functions with no
+/// I/O (persistence lives in [`load_saved_views`]/[`save_saved_views`]), so the
+/// whole thing is unit-testable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedViews {
+    pub views: Vec<SavedView>,
+}
+
+impl SavedViews {
+    /// Upsert a saved view by name (case-insensitive): a save under an existing
+    /// name overwrites it in place (so re-saving "Prod VMs" updates rather than
+    /// duplicates); a new name appends. Appending past [`SAVED_VIEW_CAP`] evicts
+    /// the oldest. A blank/whitespace name is rejected (returns `false`,
+    /// unchanged) so the restore bar never grows an unnamed chip. Pure.
+    pub fn upsert(&mut self, view: SavedView) -> bool {
+        let name = view.name.trim();
+        if name.is_empty() {
+            return false;
+        }
+        if let Some(existing) = self
+            .views
+            .iter_mut()
+            .find(|v| v.name.eq_ignore_ascii_case(name))
+        {
+            *existing = view;
+        } else {
+            self.views.push(view);
+            while self.views.len() > SAVED_VIEW_CAP {
+                self.views.remove(0);
+            }
+        }
+        true
+    }
+
+    /// Remove the saved view with this name (case-insensitive). Returns whether a
+    /// view was removed. Pure.
+    pub fn remove(&mut self, name: &str) -> bool {
+        let before = self.views.len();
+        self.views.retain(|v| !v.name.eq_ignore_ascii_case(name));
+        self.views.len() != before
+    }
+
+    /// Find a saved view by name (case-insensitive). Pure.
+    #[must_use]
+    pub fn find(&self, name: &str) -> Option<&SavedView> {
+        self.views
+            .iter()
+            .find(|v| v.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Whether there are no saved views (drives the restore bar's empty hint).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.views.is_empty()
+    }
+}
+
+/// DATACENTER-8 (saved views) — the local config-file path the saved views
+/// persist to, mirroring the workbench's established `$XDG_CONFIG_HOME/mde/…`
+/// convention (the same root `panels/mesh_bus.rs` uses for its bus-hooks file).
+/// `None` only when neither `XDG_CONFIG_HOME` nor `HOME` is set (a degenerate
+/// headless env), in which case saved views are session-only.
+#[must_use]
+pub fn saved_views_path() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .map(|d| d.join("mde").join("datacenter-views.json"))
+}
+
+/// DATACENTER-8 (saved views) — read the persisted saved views from the local
+/// config file. The file is tiny (a handful of short records).
+///
+/// The two "no data" cases yield an empty collection, NOT an error — a first run
+/// (no file yet) and an unparseable/corrupt body both legitimately mean "no saved
+/// views". But a genuine read failure on an *existing* file (a permission error,
+/// a transient I/O fault) returns `Err`: the caller must NOT treat that as "empty"
+/// and then overwrite the still-on-disk file on the next save, which would lose
+/// the operator's views (the code-review data-loss path). The caller keeps its
+/// current (unloaded) collection and surfaces the error instead.
+pub fn load_saved_views() -> Result<SavedViews, String> {
+    let Some(path) = saved_views_path() else {
+        // No config dir at all (HOME unset) — there can be no file, so "empty".
+        return Ok(SavedViews::default());
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            // An empty or unparseable body is "no saved views", not an error —
+            // a corrupt file shouldn't block the panel or wedge a save.
+            Ok(serde_json::from_str(&text).unwrap_or_default())
+        }
+        // A missing file is the normal first-run case → empty.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SavedViews::default()),
+        // A real read error on an existing file → surface it; do NOT silently
+        // empty (which a later save would overwrite as data loss).
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// DATACENTER-8 (saved views) — persist the saved views to the local config file,
+/// creating the `mde/` config dir if needed. Best-effort: returns the error text
+/// on failure so the caller can surface it in the panel status line, but a failed
+/// write never loses the in-memory collection (the next save retries).
+pub fn save_saved_views(views: &SavedViews) -> Result<(), String> {
+    let path = saved_views_path().ok_or_else(|| "no config dir (HOME unset)".to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(views).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json.as_bytes()).map_err(|e| e.to_string())
 }
 
 impl Default for DatacenterPanel {
@@ -988,6 +1182,12 @@ impl Default for DatacenterPanel {
             hover_since: Instant::now(),
             motion_ticking: false,
             history: VecDeque::new(),
+            // DATACENTER-8 — saved views hydrate lazily off-thread on the first
+            // panel-open `load()` (see `Message::SavedViewsLoaded`), keeping the
+            // constructor pure + non-blocking like the rest of the panel.
+            saved_views: SavedViews::default(),
+            save_view_name: String::new(),
+            views_loaded: false,
         }
     }
 }
@@ -1130,6 +1330,26 @@ pub enum Message {
     /// while a reveal or the selection accent is in flight, then stops (no idle
     /// wakeups). Pure: re-renders + advances/garbage-collects the tweens.
     MotionTick,
+    /// DATACENTER-8 (saved views) — the "Save view as…" name box changed. Pure
+    /// state; fires no I/O.
+    SaveViewNameChanged(String),
+    /// DATACENTER-8 (saved views) — the "Save" button was clicked: capture the
+    /// current view mode + zone tab + search needle under the box's name, persist
+    /// the collection, and clear the box. A blank name is a no-op.
+    SaveCurrentView,
+    /// DATACENTER-8 (saved views) — a saved-view restore chip was clicked: apply
+    /// that view's mode + zone tab + filter. Payload is the view's name. Pure
+    /// state restore; fires no RPC (it re-points the existing Bus reads).
+    ApplyView(String),
+    /// DATACENTER-8 (saved views) — a saved view's delete affordance was clicked:
+    /// remove it and persist. Payload is the view's name.
+    DeleteView(String),
+    /// DATACENTER-8 (saved views) — the off-thread saved-views file read finished
+    /// (fired once by the first panel-open `load()`). `Ok` carries the loaded
+    /// collection; `Err` carries a real read error (an existing file that couldn't
+    /// be read), which is surfaced rather than silently emptied — so a later save
+    /// can't overwrite a still-on-disk file. Only the FIRST load is applied.
+    SavedViewsLoaded(Result<SavedViews, String>),
 }
 
 impl DatacenterPanel {
@@ -1157,10 +1377,19 @@ impl DatacenterPanel {
 
     /// Read the `event/dc/*` topics off the Bus + project them into rows.
     pub fn load() -> Task<crate::Message> {
-        Task::perform(
+        // The Bus `event/dc/*` read, plus a one-shot saved-views file read — both
+        // off the GUI thread (the panel's lazy-load convention; `Default`/init
+        // stays pure). The saved-views handler ignores all but the first load, so
+        // batching it on every panel-open is harmless.
+        let bus = Task::perform(
             async move { Message::Loaded(read_dc_events()) },
             crate::Message::Datacenter,
-        )
+        );
+        let views = Task::perform(
+            async move { Message::SavedViewsLoaded(load_saved_views()) },
+            crate::Message::Datacenter,
+        );
+        Task::batch([bus, views])
     }
 
     pub fn update(&mut self, message: Message) -> Task<crate::Message> {
@@ -1507,6 +1736,64 @@ impl DatacenterPanel {
                 Task::none()
             }
             Message::MotionTick => self.tick_motion(),
+            Message::SaveViewNameChanged(name) => {
+                self.save_view_name = name;
+                Task::none()
+            }
+            Message::SaveCurrentView => {
+                let view = SavedView {
+                    name: self.save_view_name.trim().to_string(),
+                    view_mode: self.view_mode.slug().to_string(),
+                    zone_tab: self.zone_tab.clone(),
+                    filter: self.filter.clone(),
+                };
+                if self.saved_views.upsert(view) {
+                    self.save_view_name.clear();
+                    self.persist_saved_views();
+                }
+                Task::none()
+            }
+            Message::ApplyView(name) => {
+                if let Some(v) = self.saved_views.find(&name) {
+                    self.view_mode = v.mode();
+                    self.zone_tab = v.zone_tab.clone();
+                    self.filter = v.filter.clone();
+                    // A restored Topology view needs its group headers seeded, the
+                    // same as a direct ViewMode switch into Topology.
+                    if self.view_mode == ViewMode::Topology {
+                        self.ensure_topology_seeded();
+                    }
+                }
+                Task::none()
+            }
+            Message::DeleteView(name) => {
+                if self.saved_views.remove(&name) {
+                    self.persist_saved_views();
+                }
+                Task::none()
+            }
+            Message::SavedViewsLoaded(result) => {
+                // Apply only the FIRST load: once the operator has the panel open,
+                // a Bus refresh (which re-batches this read) must not clobber any
+                // in-memory saved-view edits they've made since.
+                if self.views_loaded {
+                    return Task::none();
+                }
+                match result {
+                    Ok(views) => {
+                        self.saved_views = views;
+                        self.views_loaded = true;
+                    }
+                    // A real read error on an existing file: keep the (empty)
+                    // in-memory set but do NOT mark loaded, so a later save can't
+                    // overwrite the still-on-disk file as a side effect — and a
+                    // subsequent panel-open retries the read.
+                    Err(e) => {
+                        self.status = format!("Couldn't read saved views: {e}");
+                    }
+                }
+                Task::none()
+            }
         }
     }
 
@@ -1601,6 +1888,106 @@ impl DatacenterPanel {
         self.topology_seeded = true;
     }
 
+    /// DATACENTER-8 (saved views) — persist the current saved-views collection to
+    /// disk, surfacing a write failure in the status line (the in-memory edit is
+    /// kept; the next save retries). Refuses to write when the views were never
+    /// successfully loaded (`!views_loaded`) — that state means a real read error
+    /// on an existing file, so writing the (empty / partial) in-memory set would
+    /// overwrite the still-on-disk views as data loss (the code-review path).
+    fn persist_saved_views(&mut self) {
+        if !self.views_loaded {
+            self.status =
+                "Saved view kept in this session — the saved-views file couldn't be read, \
+                 so it wasn't written (to avoid overwriting it)."
+                    .into();
+            return;
+        }
+        if let Err(e) = save_saved_views(&self.saved_views) {
+            self.status = format!("Saved view kept, but couldn't write the file: {e}");
+        }
+    }
+
+    /// DATACENTER-8 (saved views) — the "Saved views" bar: a "Save view as…" name
+    /// box + a Save button, then one restore chip per saved view (click to apply)
+    /// each paired with a "✕" delete affordance. Renders entirely through the
+    /// shared Carbon controls (`variant_button` / `text_input`) so it matches the
+    /// rest of the panel (§4). When there are no saved views the chip row shows a
+    /// muted hint instead.
+    fn saved_views_bar(&self, palette: Palette) -> Element<'_, crate::Message> {
+        // Name box + Save. Save is enabled only when the box has a non-blank name
+        // (a blank save is a no-op anyway, but disabling it reads honestly).
+        let name_box = text_input("Save view as…", &self.save_view_name)
+            .on_input(|v| crate::Message::Datacenter(Message::SaveViewNameChanged(v)))
+            .on_submit(crate::Message::Datacenter(Message::SaveCurrentView))
+            .width(Length::FillPortion(2));
+        let save_enabled = !self.save_view_name.trim().is_empty();
+        let save_btn = variant_button(
+            "Save".to_string(),
+            ButtonVariant::Secondary,
+            save_enabled.then_some(crate::Message::Datacenter(Message::SaveCurrentView)),
+            palette,
+        );
+
+        let mut bar = row![
+            text("Saved views").colr(palette.text_muted.into_cosmic_color()),
+            name_box,
+            save_btn,
+        ]
+        .spacing(f32::from(spacing::BASE[2]))
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+
+        if self.saved_views.is_empty() {
+            bar = bar.push(
+                text("— none yet")
+                    .colr(palette.text_muted.into_cosmic_color())
+                    .size(f32::from(spacing::BASE[4])),
+            );
+        } else {
+            for v in &self.saved_views.views {
+                // The restore chip: clicking it applies the saved view. The
+                // currently-applied view (same mode + zone + filter) reads as
+                // Primary so the operator sees which one is active.
+                let is_active = self.view_mode == v.mode()
+                    && self.zone_tab == v.zone_tab
+                    && self.filter == v.filter;
+                let variant = if is_active {
+                    ButtonVariant::Primary
+                } else {
+                    ButtonVariant::Secondary
+                };
+                let apply = variant_button(
+                    v.name.clone(),
+                    variant,
+                    Some(crate::Message::Datacenter(Message::ApplyView(
+                        v.name.clone(),
+                    ))),
+                    palette,
+                );
+                // A small Ghost "✕" to delete the saved view.
+                let del = variant_button(
+                    "✕".to_string(),
+                    ButtonVariant::Ghost,
+                    Some(crate::Message::Datacenter(Message::DeleteView(
+                        v.name.clone(),
+                    ))),
+                    palette,
+                );
+                bar = bar.push(
+                    row![apply, del]
+                        .spacing(f32::from(spacing::BASE[1]))
+                        .align_y(cosmic::iced::alignment::Vertical::Center),
+                );
+            }
+        }
+
+        scrollable(bar)
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new(),
+            ))
+            .width(Length::Fill)
+            .into()
+    }
+
     pub fn view(&self) -> Element<'_, crate::Message> {
         let palette = crate::live_theme::palette();
         if let Some(err) = &self.load_error {
@@ -1674,6 +2061,12 @@ impl DatacenterPanel {
         .spacing(f32::from(spacing::BASE[2]))
         .align_y(cosmic::iced::alignment::Vertical::Center);
         col = col.push(search);
+
+        // DATACENTER-8 (saved views) — a bar to name + save the current view
+        // (mode + zone tab + search needle) and restore/delete saved ones. Sits
+        // under the search box so the operator saves exactly what they've filtered
+        // down to. Carbon tokens only (§4).
+        col = col.push(self.saved_views_bar(palette));
 
         match self.view_mode {
             ViewMode::Overview => {
@@ -3268,6 +3661,266 @@ fn vm_delete(uuid: &str, dom0: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // DATACENTER-8 (saved views) ----------------------------------------------
+
+    // The saved-views tests that touch the config FILE (and the panel ctor,
+    // which loads it) mutate the process-wide `XDG_CONFIG_HOME`. Serialize them
+    // behind one lock so they don't observe each other's env/file writes — the
+    // same idiom `dbus.rs`'s focus tests use for a process-wide slot.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Point `XDG_CONFIG_HOME` at a fresh tempdir for the test's duration so
+    /// `load_saved_views`/`save_saved_views` (and `DatacenterPanel::new`) read +
+    /// write an isolated file, never the operator's. The returned `TempDir` keeps
+    /// the dir alive until the test ends; the prior env value is restored.
+    struct IsolatedConfig {
+        _tmp: tempfile::TempDir,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl IsolatedConfig {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let prev = std::env::var_os("XDG_CONFIG_HOME");
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+            Self { _tmp: tmp, prev }
+        }
+    }
+    impl Drop for IsolatedConfig {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn view_mode_slug_round_trips_every_variant() {
+        for mode in [
+            ViewMode::Overview,
+            ViewMode::Zone,
+            ViewMode::Tofu,
+            ViewMode::Audit,
+            ViewMode::Topology,
+        ] {
+            assert_eq!(
+                ViewMode::from_slug(mode.slug()),
+                mode,
+                "{mode:?} must round-trip through its slug"
+            );
+        }
+        // An unknown / future slug falls back to Overview, not a panic or a drop.
+        assert_eq!(ViewMode::from_slug("nonsense"), ViewMode::Overview);
+        assert_eq!(ViewMode::from_slug(""), ViewMode::Overview);
+    }
+
+    fn a_view(name: &str) -> SavedView {
+        SavedView {
+            name: name.to_string(),
+            view_mode: ViewMode::Zone.slug().to_string(),
+            zone_tab: "prod".to_string(),
+            filter: "web".to_string(),
+        }
+    }
+
+    #[test]
+    fn upsert_appends_then_overwrites_by_name_case_insensitively() {
+        let mut s = SavedViews::default();
+        assert!(s.upsert(a_view("Prod VMs")));
+        assert!(s.upsert(a_view("Dev Hosts")));
+        assert_eq!(s.views.len(), 2);
+        // Re-saving the same name (different case) overwrites in place — no dup.
+        let mut updated = a_view("PROD VMS");
+        updated.filter = "db".to_string();
+        assert!(s.upsert(updated));
+        assert_eq!(s.views.len(), 2, "same-name save must not duplicate");
+        assert_eq!(s.find("prod vms").unwrap().filter, "db");
+    }
+
+    #[test]
+    fn upsert_rejects_a_blank_name() {
+        let mut s = SavedViews::default();
+        assert!(!s.upsert(a_view("   ")));
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn upsert_caps_the_collection_evicting_the_oldest() {
+        let mut s = SavedViews::default();
+        for i in 0..(SAVED_VIEW_CAP + 3) {
+            assert!(s.upsert(a_view(&format!("view-{i}"))));
+        }
+        assert_eq!(s.views.len(), SAVED_VIEW_CAP);
+        // The three oldest were evicted; the newest survives.
+        assert!(s.find("view-0").is_none());
+        assert!(s.find("view-2").is_none());
+        assert!(s.find(&format!("view-{}", SAVED_VIEW_CAP + 2)).is_some());
+    }
+
+    #[test]
+    fn remove_drops_a_view_by_name() {
+        let mut s = SavedViews::default();
+        s.upsert(a_view("Keep"));
+        s.upsert(a_view("Drop"));
+        assert!(s.remove("DROP"));
+        assert!(!s.remove("missing"));
+        assert!(s.find("Drop").is_none());
+        assert!(s.find("Keep").is_some());
+    }
+
+    #[test]
+    fn saved_view_mode_decodes_its_slug() {
+        let v = SavedView {
+            name: "x".into(),
+            view_mode: "topology".into(),
+            zone_tab: "dev".into(),
+            filter: String::new(),
+        };
+        assert_eq!(v.mode(), ViewMode::Topology);
+    }
+
+    #[test]
+    fn saved_views_serde_round_trips() {
+        let mut s = SavedViews::default();
+        s.upsert(a_view("Prod VMs"));
+        s.upsert(SavedView {
+            name: "Dev Topology".into(),
+            view_mode: ViewMode::Topology.slug().into(),
+            zone_tab: "dev".into(),
+            filter: String::new(),
+        });
+        let json = serde_json::to_string(&s).unwrap();
+        let back: SavedViews = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn load_saved_views_treats_a_missing_or_corrupt_file_as_empty() {
+        let _guard = lock_env();
+        let _cfg = IsolatedConfig::new();
+        // No file yet (NotFound) → Ok(empty), never an error.
+        assert_eq!(load_saved_views(), Ok(SavedViews::default()));
+        // A corrupt (non-JSON) body → Ok(empty) too: "no saved views", not an
+        // error that would block the panel.
+        let path = saved_views_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not json{").unwrap();
+        assert_eq!(load_saved_views(), Ok(SavedViews::default()));
+    }
+
+    #[test]
+    fn save_then_load_round_trips_through_the_config_file() {
+        let _guard = lock_env();
+        // Isolate the config dir to a tempdir so the round-trip touches a real
+        // file without clobbering the operator's.
+        let _cfg = IsolatedConfig::new();
+
+        let mut s = SavedViews::default();
+        s.upsert(a_view("Prod VMs"));
+        save_saved_views(&s).expect("write saved views");
+        // The file lands at <cfg>/mde/datacenter-views.json — round-trips back.
+        assert!(saved_views_path().unwrap().exists());
+        let loaded = load_saved_views().expect("read back");
+        assert_eq!(loaded, s);
+    }
+
+    #[test]
+    fn save_current_view_message_captures_the_active_view() {
+        let _guard = lock_env();
+        // Isolated empty config so `new()` starts with no saved views and the
+        // save writes to the tempdir, not the operator's file.
+        let _cfg = IsolatedConfig::new();
+        let mut p = DatacenterPanel::new();
+        // The constructor is now pure (no disk read); the first load hydrates the
+        // (empty, isolated) file + marks the panel loaded so saves persist.
+        assert!(p.saved_views.is_empty(), "constructor starts empty");
+        let _ = p.update(Message::SavedViewsLoaded(load_saved_views()));
+        assert!(p.views_loaded, "first load marks the panel hydrated");
+        // Start from a known view state.
+        let _ = p.update(Message::ViewMode(ViewMode::Zone));
+        let _ = p.update(Message::ZoneTab("dev".to_string()));
+        let _ = p.update(Message::FilterChanged("builder".to_string()));
+        let _ = p.update(Message::SaveViewNameChanged("My Builders".to_string()));
+        let _ = p.update(Message::SaveCurrentView);
+        assert_eq!(p.saved_views.views.len(), 1);
+        let v = p.saved_views.find("My Builders").expect("view saved");
+        assert_eq!(v.view_mode, ViewMode::Zone.slug());
+        assert_eq!(v.zone_tab, "dev");
+        assert_eq!(v.filter, "builder");
+        // The name box is cleared after a successful save.
+        assert!(p.save_view_name.is_empty());
+        // The save persisted to disk: a fresh load sees the same view.
+        let reloaded = load_saved_views().expect("read back");
+        assert!(reloaded.find("My Builders").is_some());
+    }
+
+    #[test]
+    fn a_real_read_error_blocks_persistence_so_no_overwrite() {
+        // The code-review data-loss path: when the saved-views file exists but
+        // couldn't be read (a real error, surfaced as `!views_loaded`), a save
+        // must NOT write — overwriting the on-disk file would lose the operator's
+        // views. Here `views_loaded` stays false (no successful load), so
+        // `persist_saved_views` refuses and only the status line changes.
+        let _guard = lock_env();
+        let _cfg = IsolatedConfig::new();
+        // Pre-seed an on-disk file with two views that a save must not clobber.
+        let mut on_disk = SavedViews::default();
+        on_disk.upsert(a_view("Keep A"));
+        on_disk.upsert(a_view("Keep B"));
+        save_saved_views(&on_disk).unwrap();
+
+        let mut p = DatacenterPanel::new();
+        // Simulate the load failing (the Err arm) — views_loaded stays false.
+        let _ = p.update(Message::SavedViewsLoaded(Err("permission denied".into())));
+        assert!(
+            !p.views_loaded,
+            "a failed load leaves the panel un-hydrated"
+        );
+        // Now a save attempt must not write.
+        let _ = p.update(Message::SaveViewNameChanged("New One".to_string()));
+        let _ = p.update(Message::SaveCurrentView);
+        // The on-disk file is untouched — both originals survive.
+        let still = load_saved_views().expect("read back");
+        assert!(still.find("Keep A").is_some());
+        assert!(still.find("Keep B").is_some());
+        assert!(
+            still.find("New One").is_none(),
+            "the un-hydrated save did not write"
+        );
+    }
+
+    #[test]
+    fn apply_view_message_restores_mode_zone_and_filter() {
+        let mut p = DatacenterPanel::new();
+        p.saved_views.upsert(SavedView {
+            name: "Dev Topology".into(),
+            view_mode: ViewMode::Topology.slug().into(),
+            zone_tab: "dev".into(),
+            filter: "xen".into(),
+        });
+        // Move away from that view, then restore it.
+        let _ = p.update(Message::ViewMode(ViewMode::Overview));
+        let _ = p.update(Message::ZoneTab("prod".to_string()));
+        let _ = p.update(Message::FilterChanged(String::new()));
+        let _ = p.update(Message::ApplyView("Dev Topology".to_string()));
+        assert_eq!(p.view_mode, ViewMode::Topology);
+        assert_eq!(p.zone_tab, "dev");
+        assert_eq!(p.filter, "xen");
+    }
+
+    #[test]
+    fn save_view_name_changed_updates_the_box() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::SaveViewNameChanged("Prod".to_string()));
+        assert_eq!(p.save_view_name, "Prod");
+    }
 
     #[test]
     fn parse_dc_event_reads_a_droplet() {
