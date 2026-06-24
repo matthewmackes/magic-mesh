@@ -137,7 +137,13 @@ fa_posint() {
     * )             echo "$1" ;;
   esac
 }
-BUILD_MEM_GIB="$(fa_posint "${FA_BUILD_MEM_GIB:-4}" 4)"
+# Elastic VM RAM. RAISED 4→12 GiB at the 2026-06-24 full-elastic cutover: the
+# always-on baselines (which held the dom0 RAM, forcing the conservative 4 GiB burst)
+# are decommissioned, so the dom0s now have 18-27 GiB free. A 4 GiB VM OOMs heavy
+# crate builds (mackesd/mde-workbench — seen live: load 27 / 0 free RAM); 12 GiB fits
+# every dom0 (HOME tightest at ~18 GiB free) and carries 2 concurrent builds. The old
+# 4 GiB was correct only while the baselines coexisted. Override: FA_BUILD_MEM_GIB.
+BUILD_MEM_GIB="$(fa_posint "${FA_BUILD_MEM_GIB:-12}" 12)"
 BUILD_VCPUS="$(fa_posint "${FA_BUILD_VCPUS:-4}" 4)"
 # Export as TF_VARs so plan (autoscaler child) and apply (here) agree on the size.
 export TF_VAR_build_memory_gib="$BUILD_MEM_GIB"
@@ -447,8 +453,8 @@ if [ "${1:-}" = "--self-test" ]; then
   # SC2016: the single-quotes are DELIBERATE — the ${VAR:-default} must expand inside
   # the `env -u`-cleared CHILD shell (with the var unset), not in this parent shell.
   # shellcheck disable=SC2016
-  check "default elastic mem fit-to-headroom" \
-    "$(env -u FA_BUILD_MEM_GIB bash -c 'echo "${FA_BUILD_MEM_GIB:-4}"')" 4
+  check "default elastic mem (full-elastic, post-cutover)" \
+    "$(env -u FA_BUILD_MEM_GIB bash -c 'echo "${FA_BUILD_MEM_GIB:-12}"')" 12
   # shellcheck disable=SC2016
   check "default elastic vcpus fit-to-headroom" \
     "$(env -u FA_BUILD_VCPUS bash -c 'echo "${FA_BUILD_VCPUS:-4}"')" 4
