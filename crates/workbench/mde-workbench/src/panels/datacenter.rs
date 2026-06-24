@@ -532,6 +532,26 @@ pub fn parse_job_event(body: &str) -> Option<JobRow> {
 /// Maximum number of recent Tofu runs the Overview shows.
 const RECENT_TOFU_CAP: usize = 8;
 
+/// The OpenTofu workspaces the Tofu tab manages, prod-first. `xen-xapi` is the
+/// dev/farm Xen plane; `zone1-do` is the **prod** DigitalOcean plane gated by the
+/// prod-arm master switch.
+pub const TOFU_WORKSPACES: [&str; 2] = ["xen-xapi", "zone1-do"];
+
+/// The PROD OpenTofu workspace — a mutating op (apply/destroy) here is refused
+/// unless the prod-arm master switch is armed (DATACENTER-15). The DO zone is the
+/// only live-fleet (prod) plane; the Xen plane is dev/farm.
+pub const PROD_TOFU_WS: &str = "zone1-do";
+
+/// Whether a mutating Tofu op on `ws` is allowed to fire given the prod-arm
+/// switch. PURE + fails closed: a PROD-workspace op requires `armed == true`;
+/// any non-prod workspace is always allowed (its own typed-confirm still gates
+/// it). Mirrors the FA_APPLY operator gate — a prod apply never fires from the
+/// GUI on a typed-confirm alone.
+#[must_use]
+pub fn prod_arm_allows(ws: &str, armed: bool) -> bool {
+    ws != PROD_TOFU_WS || armed
+}
+
 /// Filter a set of job rows to the **Tofu** runs (action contains "tofu" —
 /// tofu-plan / tofu-apply / tofu-destroy / tofu-state), newest-first (descending
 /// `ulid`, which is time-ordered), capped at [`RECENT_TOFU_CAP`]. Pure + testable.
@@ -993,6 +1013,17 @@ pub struct DatacenterPanel {
     /// confirm button fires the `action/dc/tofu-apply` RPC. Cleared once the
     /// apply is fired or cancelled.
     pub tofu_confirm: Option<String>,
+    /// When `Some(workspace)`, a Tofu **destroy** is awaiting typed confirmation —
+    /// the workspace's row renders a "Type DESTROY to confirm" prompt and only the
+    /// confirm button fires the destructive `action/dc/tofu-destroy` RPC. Cleared
+    /// once the destroy is fired or cancelled. Mirrors [`Self::tofu_confirm`].
+    pub tofu_destroy_confirm: Option<String>,
+    /// The **prod-arm master switch** (DATACENTER-15). Mirrors the FA_APPLY
+    /// operator gate: a mutating Tofu op (apply/destroy) on the PROD workspace
+    /// ([`PROD_TOFU_WS`]) is refused unless this is armed — so a prod apply can
+    /// never fire from the GUI on a typed-confirm alone. Non-prod workspaces are
+    /// unaffected; defaults disarmed (fails closed). Toggled by `TofuProdArm`.
+    pub tofu_prod_armed: bool,
     /// Which `Topology`-view group headers are currently expanded — a set of host
     /// `id`s (the synthetic Prod/Gateway group uses the empty-string key). A host
     /// header is rendered expanded (children shown) iff its id is present; the
@@ -1675,6 +1706,8 @@ impl Default for DatacenterPanel {
             tofu_state_resources: Vec::new(),
             tofu_state_drift: false,
             tofu_state_ws: String::new(),
+            tofu_destroy_confirm: None,
+            tofu_prod_armed: false,
             confirm_delete: None,
             audit: Vec::new(),
             promote: Vec::new(),
@@ -1799,6 +1832,25 @@ pub enum Message {
     /// The `action/dc/tofu-apply` RPC came back — `Ok` carries the apply summary,
     /// `Err` the error text. Routes here as a panel-scoped message.
     TofuApplyDone(Result<String, String>),
+    /// A Tofu "Destroy" button was clicked. The payload is the workspace name.
+    /// This only *arms* the typed-confirm (`tofu_destroy_confirm = Some(ws)`); no
+    /// RPC fires until the inline "Type DESTROY to confirm" button is pressed.
+    TofuDestroyClicked(String),
+    /// The inline confirm for a Tofu destroy was pressed — only this fires the
+    /// destructive `action/dc/tofu-destroy` RPC (with `"confirm":true`). Payload
+    /// is the workspace name.
+    TofuDestroy(String),
+    /// The pending Tofu-destroy confirmation was dismissed (the "Cancel" button) —
+    /// clears `tofu_destroy_confirm` without firing any RPC.
+    TofuDestroyCancelled,
+    /// The `action/dc/tofu-destroy` RPC came back — `Ok` carries the destroy
+    /// summary, `Err` the error text. Routes here as a panel-scoped message.
+    TofuDestroyDone(Result<String, String>),
+    /// The **prod-arm master switch** was toggled. The payload is the new armed
+    /// state. While disarmed, an apply/destroy on the PROD workspace
+    /// ([`PROD_TOFU_WS`]) is refused (mirrors the FA_APPLY operator gate); arming
+    /// is a deliberate, separate action from the per-op typed-confirm.
+    TofuProdArm(bool),
     /// A VM "Clone" button was clicked. `uuid` is the VM id (`DcRow::id`);
     /// `dom0` is the owning dom0 IP (`DcRow::host`). Fires the
     /// `action/dc/vm-clone` RPC.
@@ -2193,8 +2245,11 @@ impl DatacenterPanel {
                 // A fresh projection may not include the row pending a delete —
                 // drop the stale confirm prompt rather than leave it dangling.
                 self.confirm_delete = None;
-                // Likewise drop a stale tofu-apply confirm on a refresh.
+                // Likewise drop a stale tofu-apply / tofu-destroy confirm on a
+                // refresh. The prod-arm master switch is a deliberate operator
+                // setting (not row-derived), so it survives the refresh.
                 self.tofu_confirm = None;
+                self.tofu_destroy_confirm = None;
                 // DATACENTER-11 — a refresh can change which VMs exist, so drop any
                 // pending per-VM prompt + the bulk selection / progress rather than
                 // act on a stale set. The create-wizard form is the operator's draft
@@ -2335,6 +2390,15 @@ impl DatacenterPanel {
                 Task::none()
             }
             Message::TofuApply(ws) => {
+                // The prod-arm master switch is the FA_APPLY-style operator gate:
+                // a PROD apply never fires from the GUI on the typed-confirm alone.
+                // Fails closed — clear the confirm so the operator must re-arm and
+                // re-confirm.
+                if !prod_arm_allows(&ws, self.tofu_prod_armed) {
+                    self.tofu_confirm = None;
+                    self.status = format!("Arm PROD before applying {ws}.");
+                    return Task::none();
+                }
                 self.tofu_confirm = None;
                 self.status = format!("Applying {ws}…");
                 self.tofu_output = format!("Applying {ws}…");
@@ -2364,6 +2428,61 @@ impl DatacenterPanel {
             Message::TofuApplyDone(Err(e)) => {
                 self.status = e.clone();
                 self.tofu_output = e;
+                Task::none()
+            }
+            Message::TofuDestroyClicked(ws) => {
+                // First click only arms the typed-confirm — no RPC fires until the
+                // operator confirms. Mirrors `TofuApplyClicked`.
+                self.tofu_destroy_confirm = Some(ws);
+                self.status = "Type DESTROY to confirm below.".into();
+                Task::none()
+            }
+            Message::TofuDestroy(ws) => {
+                // The same prod-arm operator gate as apply: a PROD destroy never
+                // fires from the GUI on the typed-confirm alone. Fails closed.
+                if !prod_arm_allows(&ws, self.tofu_prod_armed) {
+                    self.tofu_destroy_confirm = None;
+                    self.status = format!("Arm PROD before destroying {ws}.");
+                    return Task::none();
+                }
+                self.tofu_destroy_confirm = None;
+                self.status = format!("Destroying {ws}…");
+                self.tofu_output = format!("Destroying {ws}…");
+                Task::perform(
+                    async move {
+                        // Same shape as `tofu_apply`: the Bus RPC borrows a
+                        // non-Send Persist across its internal await, so run the
+                        // whole round trip on a blocking thread with a local
+                        // runtime.
+                        tokio::task::spawn_blocking(move || tofu_destroy(&ws))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("tofu task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::TofuDestroyDone(result)),
+                )
+            }
+            Message::TofuDestroyCancelled => {
+                self.tofu_destroy_confirm = None;
+                self.status.clear();
+                Task::none()
+            }
+            Message::TofuDestroyDone(Ok(s)) => {
+                self.status = "Destroy complete".into();
+                self.tofu_output = s;
+                Task::none()
+            }
+            Message::TofuDestroyDone(Err(e)) => {
+                self.status = e.clone();
+                self.tofu_output = e;
+                Task::none()
+            }
+            Message::TofuProdArm(armed) => {
+                self.tofu_prod_armed = armed;
+                self.status = if armed {
+                    "PROD armed — apply/destroy on the DO zone is now allowed.".into()
+                } else {
+                    "PROD disarmed.".into()
+                };
                 Task::none()
             }
             Message::CloneClicked { uuid, dom0 } => {
@@ -3431,6 +3550,54 @@ impl DatacenterPanel {
     /// over-threshold SRs + an editable warning threshold (percent). The live
     /// `storage_threshold_pct` drives the per-SR alert badges; this lets the
     /// operator tune the line. Carbon tokens only (§4).
+    /// DATACENTER-15 (Tofu tab) — the **prod-arm master switch** bar. Mirrors the
+    /// FA_APPLY operator gate: while disarmed (the default), a mutating Tofu op on
+    /// the PROD workspace ([`PROD_TOFU_WS`]) can never fire from the GUI — its
+    /// Apply/Destroy buttons are disabled. Arming is a deliberate, separate action
+    /// from the per-op typed-confirm. Colors from mde-theme tokens (danger = armed/
+    /// live, success = safe-disarmed) — never raw hex.
+    fn tofu_prod_arm_bar(&self, palette: Palette) -> Element<'_, crate::Message> {
+        let (status_text, status_color) = if self.tofu_prod_armed {
+            (
+                format!("PROD ARMED — apply/destroy on {PROD_TOFU_WS} is LIVE"),
+                palette.danger,
+            )
+        } else {
+            (
+                format!("PROD disarmed — {PROD_TOFU_WS} apply/destroy is blocked"),
+                palette.success,
+            )
+        };
+        // Toggle button flips the arm state; its label names the action it takes.
+        let toggle = variant_button(
+            if self.tofu_prod_armed {
+                "Disarm PROD".to_string()
+            } else {
+                "Arm PROD".to_string()
+            },
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::TofuProdArm(
+                !self.tofu_prod_armed,
+            ))),
+            palette,
+        );
+        let line = row![
+            text("Prod-arm master switch")
+                .colr(palette.text_muted.into_cosmic_color())
+                .width(Length::FillPortion(1)),
+            text(status_text)
+                .colr(status_color.into_cosmic_color())
+                .width(Length::FillPortion(2)),
+            toggle,
+        ]
+        .spacing(f32::from(spacing::BASE[2]))
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+        container(line)
+            .padding(f32::from(spacing::BASE[3]))
+            .width(Length::Fill)
+            .into()
+    }
+
     fn storage_threshold_bar(
         &self,
         palette: Palette,
@@ -4994,9 +5161,23 @@ impl DatacenterPanel {
                 }
             }
             ViewMode::Tofu => {
-                // A Plan + Apply control pair per workspace. Apply arms a typed
-                // confirm before firing the destructive `action/dc/tofu-apply`.
-                for ws in ["xen-xapi", "zone1-do"] {
+                // The prod-arm master switch (FA_APPLY-style operator gate): a
+                // mutating op on the PROD workspace is refused unless this is armed
+                // — surfaced first so its state is unmissable. Color from mde-theme
+                // tokens (danger = armed/live, success = safe-disarmed).
+                col = col.push(self.tofu_prod_arm_bar(palette));
+
+                // A Plan + State + Apply + Destroy control set per workspace. Apply
+                // and Destroy each arm a typed confirm before firing the
+                // destructive `action/dc/tofu-{apply,destroy}` RPC; for the PROD
+                // workspace the prod-arm switch gates the fire on top of that.
+                for ws in TOFU_WORKSPACES {
+                    let is_prod = ws == PROD_TOFU_WS;
+                    let label = if is_prod {
+                        format!("{ws}  (PROD)")
+                    } else {
+                        ws.to_string()
+                    };
                     let plan_btn = variant_button(
                         format!("Plan {ws}"),
                         ButtonVariant::Secondary,
@@ -5014,22 +5195,32 @@ impl DatacenterPanel {
                         palette,
                     );
                     let mut ws_row = row![
-                        text(ws.to_string()).width(Length::FillPortion(2)),
+                        text(label).width(Length::FillPortion(2)),
                         plan_btn,
                         state_btn
                     ]
                     .spacing(f32::from(spacing::BASE[2]));
+                    // The Apply control — whether it's allowed to fire (prod-arm)
+                    // is enforced in the update handler; the button itself is only
+                    // disabled (no message) when prod is disarmed, so the gate is
+                    // visible, not silent.
+                    let mutating_blocked = is_prod && !self.tofu_prod_armed;
                     if self.tofu_confirm.as_deref() == Some(ws) {
                         // Armed: surface the typed-confirm — only the confirm
                         // button carries the destructive `TofuApply` message.
+                        let confirm_msg = if mutating_blocked {
+                            None
+                        } else {
+                            Some(crate::Message::Datacenter(Message::TofuApply(
+                                ws.to_string(),
+                            )))
+                        };
                         ws_row = ws_row
                             .push(text("Type APPLY to confirm"))
                             .push(variant_button(
                                 "APPLY".to_string(),
                                 ButtonVariant::Primary,
-                                Some(crate::Message::Datacenter(Message::TofuApply(
-                                    ws.to_string(),
-                                ))),
+                                confirm_msg,
                                 palette,
                             ))
                             .push(variant_button(
@@ -5040,16 +5231,67 @@ impl DatacenterPanel {
                             ));
                     } else {
                         // Unarmed: the first click only arms the confirm (no RPC).
+                        // Disabled when prod is disarmed so the gate is obvious.
+                        let apply_msg = if mutating_blocked {
+                            None
+                        } else {
+                            Some(crate::Message::Datacenter(Message::TofuApplyClicked(
+                                ws.to_string(),
+                            )))
+                        };
                         ws_row = ws_row.push(variant_button(
                             format!("Apply {ws}"),
                             ButtonVariant::Primary,
-                            Some(crate::Message::Datacenter(Message::TofuApplyClicked(
+                            apply_msg,
+                            palette,
+                        ));
+                    }
+                    // The Destroy control — same typed-confirm + prod-arm shape as
+                    // Apply, on its own row so the destructive action is distinct.
+                    let mut destroy_row = row![text("").width(Length::FillPortion(2))]
+                        .spacing(f32::from(spacing::BASE[2]));
+                    if self.tofu_destroy_confirm.as_deref() == Some(ws) {
+                        let confirm_msg = if mutating_blocked {
+                            None
+                        } else {
+                            Some(crate::Message::Datacenter(Message::TofuDestroy(
                                 ws.to_string(),
-                            ))),
+                            )))
+                        };
+                        destroy_row = destroy_row
+                            .push(
+                                text("Type DESTROY to confirm")
+                                    .colr(palette.danger.into_cosmic_color()),
+                            )
+                            .push(variant_button(
+                                "DESTROY".to_string(),
+                                ButtonVariant::Primary,
+                                confirm_msg,
+                                palette,
+                            ))
+                            .push(variant_button(
+                                "Cancel".to_string(),
+                                ButtonVariant::Secondary,
+                                Some(crate::Message::Datacenter(Message::TofuDestroyCancelled)),
+                                palette,
+                            ));
+                    } else {
+                        let destroy_msg = if mutating_blocked {
+                            None
+                        } else {
+                            Some(crate::Message::Datacenter(Message::TofuDestroyClicked(
+                                ws.to_string(),
+                            )))
+                        };
+                        destroy_row = destroy_row.push(variant_button(
+                            format!("Destroy {ws}"),
+                            ButtonVariant::Secondary,
+                            destroy_msg,
                             palette,
                         ));
                     }
                     col = col.push(ws_row);
+                    col = col.push(destroy_row);
                 }
                 if self.tofu_output.is_empty() {
                     col = col.push(text(
@@ -5094,6 +5336,14 @@ impl DatacenterPanel {
                             );
                         }
                     }
+                }
+                // The persisted run-log (DATACENTER-15 acceptance): the Tofu runs
+                // off the durable `event/dc/job/*` Bus lane — plan/apply/destroy/
+                // state newest-first with a status chip. Persisted by the leader-
+                // gated `dc_jobs` worker, so a reload still shows past runs.
+                col = col.push(text("Tofu run-log").size(f32::from(spacing::BASE[5])));
+                for el in recent_tofu_runs_view(&self.jobs, palette) {
+                    col = col.push(el);
                 }
             }
             ViewMode::Audit => {
@@ -6417,6 +6667,48 @@ fn tofu_apply(workspace: &str) -> Result<String, String> {
         return Ok(summary.to_string());
     }
     Err(format!("unexpected tofu-apply reply: {raw}"))
+}
+
+/// Fire the destructive `action/dc/tofu-destroy` Bus RPC (blocking — runs on a
+/// `spawn_blocking` thread) and translate the reply into the destroy output. Only
+/// reached after the typed confirm (and, for prod, the prod-arm gate), so it
+/// always sends `"confirm":true`. Mirrors `tofu_apply` exactly: a Persist +
+/// `mde_bus::rpc::request` round trip wrapped in a local tokio runtime because
+/// `request` borrows a non-`Send` `Persist` across its internal await. The reply
+/// body is `{"ok":true,"summary":".."}` (→ the summary) or `{"error":".."}` (→ the
+/// error text).
+fn tofu_destroy(workspace: &str) -> Result<String, String> {
+    let Some(dir) = mde_bus::default_data_dir() else {
+        return Err("no Bus data dir".to_string());
+    };
+    let body = serde_json::json!({ "workspace": workspace, "confirm": true }).to_string();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    let reply = rt.block_on(async {
+        let persist = mde_bus::persist::Persist::open(dir).map_err(|e| e.to_string())?;
+        mde_bus::rpc::request(
+            &persist,
+            "action/dc/tofu-destroy",
+            mde_bus::hooks::config::Priority::Default,
+            Some("tofu-destroy"),
+            Some(&body),
+            Duration::from_secs(600),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+    let raw = reply.body.unwrap_or_default();
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("bad tofu-destroy reply: {e}"))?;
+    if let Some(err) = v.get("error").and_then(serde_json::Value::as_str) {
+        return Err(err.to_string());
+    }
+    if let Some(summary) = v.get("summary").and_then(serde_json::Value::as_str) {
+        return Ok(summary.to_string());
+    }
+    Err(format!("unexpected tofu-destroy reply: {raw}"))
 }
 
 /// Fire the `action/dc/dr-backup` Bus RPC (blocking — runs on a `spawn_blocking`
@@ -8107,6 +8399,133 @@ mod tests {
         let _ = p.update(Message::TofuApplyDone(Err("apply failed".to_string())));
         assert_eq!(p.tofu_output, "apply failed");
         assert_eq!(p.status, "apply failed");
+    }
+
+    #[test]
+    fn prod_arm_allows_gates_only_prod() {
+        // Non-prod workspace is always allowed (its own confirm still gates it).
+        assert!(prod_arm_allows("xen-xapi", false));
+        assert!(prod_arm_allows("xen-xapi", true));
+        // The PROD workspace requires the arm; fails closed when disarmed.
+        assert!(!prod_arm_allows(PROD_TOFU_WS, false));
+        assert!(prod_arm_allows(PROD_TOFU_WS, true));
+        // Sanity: the prod ws constant is the DO zone.
+        assert_eq!(PROD_TOFU_WS, "zone1-do");
+    }
+
+    #[test]
+    fn prod_apply_refuses_until_armed() {
+        let mut p = DatacenterPanel::new();
+        assert!(!p.tofu_prod_armed);
+        // Arm the typed-confirm on the PROD workspace, then confirm — with the
+        // prod-arm switch DISARMED the RPC must NOT fire; the confirm is cleared
+        // and the status nudges the operator to arm first.
+        let _ = p.update(Message::TofuApplyClicked(PROD_TOFU_WS.to_string()));
+        assert_eq!(p.tofu_confirm.as_deref(), Some(PROD_TOFU_WS));
+        let _ = p.update(Message::TofuApply(PROD_TOFU_WS.to_string()));
+        assert!(p.tofu_confirm.is_none());
+        assert_eq!(
+            p.status,
+            format!("Arm PROD before applying {PROD_TOFU_WS}.")
+        );
+        // The output is untouched — no "Applying…" because nothing fired.
+        assert!(p.tofu_output.is_empty());
+        // Arm, re-confirm → now it proceeds to the in-flight state.
+        let _ = p.update(Message::TofuProdArm(true));
+        assert!(p.tofu_prod_armed);
+        let _ = p.update(Message::TofuApplyClicked(PROD_TOFU_WS.to_string()));
+        let _ = p.update(Message::TofuApply(PROD_TOFU_WS.to_string()));
+        assert_eq!(p.status, format!("Applying {PROD_TOFU_WS}…"));
+        assert_eq!(p.tofu_output, format!("Applying {PROD_TOFU_WS}…"));
+    }
+
+    #[test]
+    fn nonprod_apply_fires_without_the_prod_arm() {
+        let mut p = DatacenterPanel::new();
+        // The dev/farm Xen plane is not prod-gated — a typed-confirm is enough.
+        assert!(!p.tofu_prod_armed);
+        let _ = p.update(Message::TofuApplyClicked("xen-xapi".to_string()));
+        let _ = p.update(Message::TofuApply("xen-xapi".to_string()));
+        assert_eq!(p.status, "Applying xen-xapi…");
+        assert_eq!(p.tofu_output, "Applying xen-xapi…");
+    }
+
+    #[test]
+    fn tofu_destroy_requires_typed_confirm_before_firing() {
+        let mut p = DatacenterPanel::new();
+        // First click only arms the typed-confirm — it must NOT fire the RPC.
+        let _ = p.update(Message::TofuDestroyClicked("xen-xapi".to_string()));
+        assert_eq!(p.tofu_destroy_confirm.as_deref(), Some("xen-xapi"));
+        assert_eq!(p.status, "Type DESTROY to confirm below.");
+        // Only the explicit confirm clears the pending state + moves the status
+        // to the in-flight "Destroying…" (the RPC then fires).
+        let _ = p.update(Message::TofuDestroy("xen-xapi".to_string()));
+        assert!(p.tofu_destroy_confirm.is_none());
+        assert_eq!(p.status, "Destroying xen-xapi…");
+        assert_eq!(p.tofu_output, "Destroying xen-xapi…");
+    }
+
+    #[test]
+    fn prod_destroy_refuses_until_armed() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::TofuDestroyClicked(PROD_TOFU_WS.to_string()));
+        assert_eq!(p.tofu_destroy_confirm.as_deref(), Some(PROD_TOFU_WS));
+        // Disarmed → confirm is cleared and the destroy never fires.
+        let _ = p.update(Message::TofuDestroy(PROD_TOFU_WS.to_string()));
+        assert!(p.tofu_destroy_confirm.is_none());
+        assert_eq!(
+            p.status,
+            format!("Arm PROD before destroying {PROD_TOFU_WS}.")
+        );
+        assert!(p.tofu_output.is_empty());
+    }
+
+    #[test]
+    fn tofu_destroy_cancel_clears_the_pending_confirm() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::TofuDestroyClicked("zone1-do".to_string()));
+        assert_eq!(p.tofu_destroy_confirm.as_deref(), Some("zone1-do"));
+        let _ = p.update(Message::TofuDestroyCancelled);
+        assert!(p.tofu_destroy_confirm.is_none());
+        assert!(p.status.is_empty());
+    }
+
+    #[test]
+    fn tofu_destroy_done_writes_output() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::TofuDestroyDone(Ok(
+            "Destroy complete! 2 destroyed.".to_string(),
+        )));
+        assert_eq!(p.tofu_output, "Destroy complete! 2 destroyed.");
+        assert_eq!(p.status, "Destroy complete");
+        let _ = p.update(Message::TofuDestroyDone(Err("destroy failed".to_string())));
+        assert_eq!(p.tofu_output, "destroy failed");
+        assert_eq!(p.status, "destroy failed");
+    }
+
+    #[test]
+    fn prod_arm_toggle_flips_state_and_status() {
+        let mut p = DatacenterPanel::new();
+        assert!(!p.tofu_prod_armed);
+        let _ = p.update(Message::TofuProdArm(true));
+        assert!(p.tofu_prod_armed);
+        assert!(p.status.contains("PROD armed"));
+        let _ = p.update(Message::TofuProdArm(false));
+        assert!(!p.tofu_prod_armed);
+        assert_eq!(p.status, "PROD disarmed.");
+    }
+
+    #[test]
+    fn tofu_view_renders_with_destroy_and_arm_controls() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::ViewMode(ViewMode::Tofu));
+        // Render the bare tab (arm bar + per-ws control rows + run-log empty).
+        let _ = p.view();
+        // Arm prod + arm both confirms to exercise every render branch.
+        let _ = p.update(Message::TofuProdArm(true));
+        let _ = p.update(Message::TofuApplyClicked(PROD_TOFU_WS.to_string()));
+        let _ = p.update(Message::TofuDestroyClicked("xen-xapi".to_string()));
+        let _ = p.view();
     }
 
     #[test]
