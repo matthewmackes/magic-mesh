@@ -36,7 +36,7 @@ use cosmic::Element;
 
 use mde_music::album::{self, AlbumView};
 use mde_music::color;
-use mde_music::density::ListMetrics;
+use mde_music::density::{GridMetrics, ListMetrics};
 use mde_music::hub::HubCard;
 use mde_music::library::{self, LibraryItem};
 use mde_music::motion;
@@ -1942,12 +1942,14 @@ impl State {
     /// offset `offset_y`, bounded so a large library can't fan out hundreds of
     /// fetches (each of which re-renders the whole grid → the UI lock). Skips
     /// already-cached + already-requested ids; marks the rest requested. The
-    /// row pitch (168) + column count mirror the grid in [`Self::library_view`].
+    /// row pitch + column count are the single-sourced Carbon grid metrics
+    /// (MUSIC-RFX-10) shared with the grid in [`Self::library_view`].
     fn art_window_task(&mut self, offset_y: f32) -> Task<Message> {
-        const ROW_PITCH: f32 = 168.0; // 160px card + 8px spacing
         const WINDOW_ROWS: usize = 14; // ~2 screenfuls + buffer
-        let cols = ((self.grid_width + 8.0) / ROW_PITCH).floor().max(1.0) as usize;
-        let start_row = ((offset_y / ROW_PITCH).floor() as usize).saturating_sub(2);
+        let gm = GridMetrics::carbon_dense();
+        let row_pitch = gm.row_pitch();
+        let cols = gm.columns_for_width(self.grid_width);
+        let start_row = ((offset_y / row_pitch).floor() as usize).saturating_sub(2);
         let start = start_row.saturating_mul(cols);
         let end = (start + WINDOW_ROWS * cols).min(self.items.len());
         if start >= end {
@@ -2326,9 +2328,12 @@ impl State {
                 ]
                 .spacing(8);
                 let mut col = column![title_row].spacing(10);
+                // MUSIC-RFX-10 — single-sourced Carbon card-grid metrics (card
+                // width / art tile / gutter / row pitch all from mde-theme tokens).
+                let gm = GridMetrics::carbon_dense();
                 // AIR-11.c — width-adaptive column count (shared by the skeleton +
                 // the real grid so the loading placeholder matches the layout).
-                let cols = ((self.grid_width + 8.0) / 168.0).floor().max(1.0) as usize;
+                let cols = gm.columns_for_width(self.grid_width);
                 if self.loading {
                     // MUSIC-RESPONSIVE-6 / BEAUT-MUSIC — breathing Carbon skeleton
                     // tiles (matching the card geometry) instead of a blank
@@ -2382,9 +2387,9 @@ impl State {
                     // build every card per frame. Skipped for the Playlists page
                     // (variable-height cards + inline forms) and small grids (where
                     // full render is cheaper than the windowing bookkeeping). Same
-                    // ROW_PITCH/window as `art_window_task`, and the live scroll
+                    // row pitch / window as `art_window_task`, and the live scroll
                     // offset comes from `grid_scroll` (kept current by GridScrolled).
-                    const ROW_PITCH: f32 = 168.0;
+                    let row_pitch = gm.row_pitch();
                     const WINDOW_ROWS: usize = 14;
                     let total_rows = items.len().div_ceil(cols);
                     let virtualize = !matches!(route, Route::Category(HubCard::Playlists))
@@ -2395,7 +2400,7 @@ impl State {
                         .copied()
                         .unwrap_or(0.0);
                     let start_row = if virtualize {
-                        ((offset_y / ROW_PITCH).floor() as usize).saturating_sub(2)
+                        ((offset_y / row_pitch).floor() as usize).saturating_sub(2)
                     } else {
                         0
                     };
@@ -2404,39 +2409,40 @@ impl State {
                     } else {
                         total_rows
                     };
-                    let mut grid = column![].spacing(8);
+                    let mut grid = column![].spacing(gm.gap);
                     if virtualize && start_row > 0 {
                         grid = grid
-                            .push(Space::new().height(Length::Fixed(start_row as f32 * ROW_PITCH)));
+                            .push(Space::new().height(Length::Fixed(start_row as f32 * row_pitch)));
                     }
                     for (row_idx, chunk) in items.chunks(cols).enumerate() {
                         if virtualize && (row_idx < start_row || row_idx >= end_row) {
                             continue;
                         }
-                        let mut r = row![].spacing(8);
+                        let mut r = row![].spacing(gm.gap);
                         for item in chunk {
                             // MUSIC-ALBUMS-3 — Carbon album card: square art tile
                             // (raised fill + ♪ placeholder until art loads) over
                             // a 2-line title.
                             let cpal = mde_theme::Palette::dark();
-                            let art_inner: Element<'_, Message> = if let Some(handle) =
-                                self.art_cache.get(&item.id)
-                            {
-                                image(handle.clone())
-                                    .width(Length::Fill)
-                                    .height(Length::Fixed(150.0))
+                            let art_inner: Element<'_, Message> =
+                                if let Some(handle) = self.art_cache.get(&item.id) {
+                                    image(handle.clone())
+                                        .width(Length::Fill)
+                                        .height(Length::Fixed(gm.art_height))
+                                        .into()
+                                } else {
+                                    container(
+                                        text("\u{266A}")
+                                            .size(gm.placeholder_glyph)
+                                            .colr(carbon(cpal.text_muted, 1.0)),
+                                    )
+                                    .center_x(Length::Fill)
+                                    .center_y(Length::Fixed(gm.art_height))
                                     .into()
-                            } else {
-                                container(
-                                    text("\u{266A}").size(30).colr(carbon(cpal.text_muted, 1.0)),
-                                )
-                                .center_x(Length::Fill)
-                                .center_y(Length::Fixed(150.0))
-                                .into()
-                            };
+                                };
                             let art = container(art_inner)
                                 .width(Length::Fill)
-                                .height(Length::Fixed(150.0))
+                                .height(Length::Fixed(gm.art_height))
                                 .style({
                                     let bg = carbon(cpal.raised, 1.0);
                                     move |_| cosmic::iced::widget::container::Style {
@@ -2447,13 +2453,13 @@ impl State {
                             let card_content: Element<'_, Message> = column![
                                 art,
                                 text(item.label.clone())
-                                    .size(13)
+                                    .size(gm.title)
                                     .colr(carbon(cpal.text, 1.0)),
                             ]
-                            .spacing(8)
+                            .spacing(gm.gap)
                             .into();
                             let mut btn = button(card_content)
-                                .width(Length::Fixed(160.0))
+                                .width(Length::Fixed(gm.card_width))
                                 .padding(0)
                                 .sty({
                                     // MUSIC-ALBUMS-7 — card hover outline reads
@@ -2550,7 +2556,7 @@ impl State {
                                 r = r.push(
                                     column![btn, controls]
                                         .spacing(4)
-                                        .width(Length::Fixed(160.0)),
+                                        .width(Length::Fixed(gm.card_width)),
                                 );
                             } else {
                                 r = r.push(btn);
@@ -2561,7 +2567,7 @@ impl State {
                     if virtualize && end_row < total_rows {
                         grid = grid.push(
                             Space::new()
-                                .height(Length::Fixed((total_rows - end_row) as f32 * ROW_PITCH)),
+                                .height(Length::Fixed((total_rows - end_row) as f32 * row_pitch)),
                         );
                     }
                     // MUSIC-RFX-6 — the Playlists page gets a "new playlist" form.
@@ -3608,19 +3614,23 @@ fn skeleton_grid(cols: usize, alpha: f32) -> Element<'static, Message> {
             })
             .into()
     };
+    // MUSIC-RFX-10 — the skeleton tile mirrors the real card geometry from the
+    // single-sourced Carbon grid metrics (art tile + gutter + card width), so the
+    // loading placeholder lines up pixel-for-pixel with the cards it precedes.
+    let gm = GridMetrics::carbon_dense();
     let tile = move || -> Element<'static, Message> {
         column![
-            block(Length::Fill, 150.0),
+            block(Length::Fill, gm.art_height),
             block(Length::Fixed(110.0), 12.0),
         ]
-        .spacing(8)
-        .width(Length::Fixed(160.0))
+        .spacing(gm.gap)
+        .width(Length::Fixed(gm.card_width))
         .into()
     };
     // Two rows of placeholders — enough to fill the typical viewport.
-    let mut grid = column![].spacing(8);
+    let mut grid = column![].spacing(gm.gap);
     for _ in 0..2 {
-        let mut r = row![].spacing(8);
+        let mut r = row![].spacing(gm.gap);
         for _ in 0..cols {
             r = r.push(tile());
         }
