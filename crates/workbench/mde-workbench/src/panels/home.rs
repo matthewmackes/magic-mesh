@@ -50,6 +50,7 @@ use cosmic::Theme;
 use mde_theme::feedback::{ControlFeedback, FeedbackParams};
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
 
+use crate::components::connect_progress::{self, ConnectProgress};
 use crate::cosmic_compat::prelude::*;
 
 use crate::model::Group;
@@ -581,6 +582,19 @@ pub enum Message {
     /// BOOT-STATUS-6 — the restart finished; carries the result line.
     RemediationDone(String),
     DbusEvent(DbusEvent),
+    /// MESH-CONNECT-DIALOG-1 — a capability row's "Configure" was clicked:
+    /// open the progress modal and re-probe that capability's real status.
+    ConfigureClicked(CapabilityId),
+    /// MESH-CONNECT-DIALOG-1 — the configure re-probe landed; resolves the
+    /// modal to its terminal success / failure.
+    ConnectProbed {
+        id: CapabilityId,
+        outcome: ProbeOutcome,
+    },
+    /// MESH-CONNECT-DIALOG-1 — re-run the probe from the modal's failure state.
+    ConnectRetry,
+    /// MESH-CONNECT-DIALOG-1 — close the connect modal (Dismiss / backdrop).
+    ConnectDismiss,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -588,6 +602,13 @@ pub struct HomePanel {
     pub snapshot: HomeSnapshot,
     /// BOOT-STATUS-6 — the last inline-remediation result line (empty = none).
     pub remediation: String,
+    /// MESH-CONNECT-DIALOG-1 — the connect/configure progress modal opened
+    /// by a capability row's "Configure" button: pending (re-probing the
+    /// capability's real status) → success / failure.
+    pub connect: ConnectProgress,
+    /// The capability the open modal is probing — drives Retry + the jump
+    /// offered on success.
+    pub connect_target: Option<CapabilityId>,
 }
 
 impl HomePanel {
@@ -596,6 +617,8 @@ impl HomePanel {
         Self {
             snapshot: HomeSnapshot::load_sync(),
             remediation: String::new(),
+            connect: ConnectProgress::Closed,
+            connect_target: None,
         }
     }
 
@@ -674,7 +697,63 @@ impl HomePanel {
                     mackesd_reachable: ok,
                 })
             }),
+            // MESH-CONNECT-DIALOG-1 — Configure opens the modal and re-probes
+            // the capability's REAL status (the same probe the row's pill uses),
+            // so the operator gets live progress + a terminal outcome instead of
+            // a silent panel jump.
+            Message::ConfigureClicked(id) => self.probe_capability(id),
+            // Retry re-runs the same probe for the modal's remembered target.
+            Message::ConnectRetry => match self.connect_target {
+                Some(id) => self.probe_capability(id),
+                None => Task::none(),
+            },
+            Message::ConnectDismiss => {
+                self.connect = ConnectProgress::Closed;
+                self.connect_target = None;
+                Task::none()
+            }
+            // The re-probe landed — resolve the modal from the capability's real
+            // status. Active = connected (success); SetupNeeded/Failed/Unknown =
+            // a real, operator-readable reason (failure → Retry/Dismiss).
+            Message::ConnectProbed { id, outcome } => {
+                if self.connect_target == Some(id) {
+                    self.connect = match &outcome.status {
+                        CapabilityStatus::Active => self.connect.success(
+                            outcome
+                                .sub_status
+                                .clone()
+                                .unwrap_or_else(|| "Connected and active.".into()),
+                        ),
+                        CapabilityStatus::SetupNeeded => {
+                            self.connect
+                                .failure(outcome.sub_status.clone().unwrap_or_else(|| {
+                                    "Not connected yet — set this capability up.".into()
+                                }))
+                        }
+                        CapabilityStatus::Failed { detail } => self.connect.failure(detail.clone()),
+                        CapabilityStatus::Unknown => self
+                            .connect
+                            .failure("Status unavailable — the control plane did not answer."),
+                    };
+                }
+                Task::none()
+            }
         }
+    }
+
+    /// MESH-CONNECT-DIALOG-1 — open the connect/configure modal for `id` and
+    /// fire that capability's real status probe. Shared by the row's Configure
+    /// button and the modal's Retry. The probe result resolves the modal via
+    /// [`Message::ConnectProbed`].
+    fn probe_capability(&mut self, id: CapabilityId) -> Task<crate::Message> {
+        self.connect = ConnectProgress::pending(
+            format!("Configure {}", capability_label(id)),
+            format!("Checking {} status…", capability_label(id)),
+        );
+        self.connect_target = Some(id);
+        Task::perform(probe_capability_status(id), move |outcome| {
+            crate::Message::Home(Message::ConnectProbed { id, outcome })
+        })
     }
 
     /// Render the Overview.
@@ -967,10 +1046,34 @@ impl HomePanel {
         ]
         .spacing(2);
 
-        container(scrollable(body).width(Length::Fill))
-            .padding(Padding::from([24u16, 32u16]))
-            .width(Length::Fill)
-            .into()
+        let panel: Element<'_, crate::Message, Theme> =
+            container(scrollable(body).width(Length::Fill))
+                .padding(Padding::from([24u16, 32u16]))
+                .width(Length::Fill)
+                .into();
+
+        // MESH-CONNECT-DIALOG-1 — stack the connect/configure progress modal
+        // over the Overview when a capability's Configure is open. The modal's
+        // primary "Open settings ▸" action deep-links to that capability's panel
+        // so confirming status (or finding it needs setup) doesn't dead-end —
+        // the operator can still jump to where they configure it.
+        let primary = self
+            .connect_target
+            .and_then(capability_jump)
+            .map(|(group, panel)| {
+                (
+                    "Open settings  ▸",
+                    crate::Message::SelectPanel { group, panel },
+                )
+            });
+        connect_progress::overlay_with_action(
+            &self.connect,
+            panel,
+            palette,
+            crate::Message::Home(Message::ConnectRetry),
+            crate::Message::Home(Message::ConnectDismiss),
+            primary,
+        )
     }
 }
 
@@ -1080,6 +1183,69 @@ pub async fn load_capabilities() -> (Vec<CapabilityRow>, bool) {
         build_notifications_row(&notifications),
     ];
     (rows, mackesd_ok)
+}
+
+/// MESH-CONNECT-DIALOG-1 — the human label for a capability, reused in the
+/// connect modal's title + "checking …" line. Mirrors the row builders'
+/// `name` so the modal and the row agree.
+#[must_use]
+pub fn capability_label(id: CapabilityId) -> &'static str {
+    match id {
+        CapabilityId::Mesh => "Mesh Network",
+        CapabilityId::Peers => "Peer Reachability",
+        CapabilityId::Files => "File Sharing",
+        CapabilityId::Ssh => "SSH Across Mesh",
+        CapabilityId::Rdp => "Remote Desktop (RDP)",
+        CapabilityId::Vnc => "Remote Desktop (VNC)",
+        CapabilityId::Services => "Media & App Discovery",
+        CapabilityId::Phone => "Mesh peer (phone)",
+        CapabilityId::Voice => "Voice & Video",
+        CapabilityId::Fleet => "Fleet Configuration",
+        CapabilityId::Notifications => "Desktop Notifications",
+    }
+}
+
+/// MESH-CONNECT-DIALOG-1 — the in-Workbench panel a capability's Configure
+/// deep-links to (the `(Group, panel-slug)` the row builders carry). `None`
+/// for a capability with no in-Workbench panel (e.g. Voice, which launches a
+/// standalone app). Drives the connect modal's "Open settings ▸" primary
+/// action so confirming status doesn't dead-end the operator.
+#[must_use]
+pub fn capability_jump(id: CapabilityId) -> Option<(Group, &'static str)> {
+    match id {
+        CapabilityId::Mesh => Some((Group::Mesh, "mesh_control")),
+        CapabilityId::Peers => Some((Group::Mesh, "peers")),
+        CapabilityId::Files => Some((Group::Mesh, "mesh_storage")),
+        CapabilityId::Ssh | CapabilityId::Rdp | CapabilityId::Vnc => {
+            Some((Group::ThisNode, "remote_desktop"))
+        }
+        CapabilityId::Services => Some((Group::ThisNode, "mesh_services")),
+        CapabilityId::Phone => Some((Group::Mesh, "connect")),
+        // Voice has no in-Workbench panel (standalone mde-voice-config app).
+        CapabilityId::Voice => None,
+        CapabilityId::Fleet => Some((Group::Fleet, "playbooks")),
+        CapabilityId::Notifications => Some((Group::System, "notifications")),
+    }
+}
+
+/// MESH-CONNECT-DIALOG-1 — re-run the SINGLE real status probe behind a
+/// capability's pill (the same probes [`load_capabilities`] fans out), so the
+/// connect modal reflects that capability's true state. Dispatches by id to the
+/// existing per-capability probe — no fake/demo progress.
+pub async fn probe_capability_status(id: CapabilityId) -> ProbeOutcome {
+    match id {
+        CapabilityId::Mesh => probe_nebula().await,
+        CapabilityId::Peers => probe_peers().await,
+        CapabilityId::Files => probe_files().await,
+        CapabilityId::Ssh => probe_systemd_unit("sshd.service").await,
+        CapabilityId::Rdp => probe_systemd_unit("xrdp.service").await,
+        CapabilityId::Vnc => probe_vnc().await,
+        CapabilityId::Services => probe_mesh_services().await,
+        CapabilityId::Phone => probe_phone().await,
+        CapabilityId::Voice => probe_voice().await,
+        CapabilityId::Fleet => probe_fleet_revision().await,
+        CapabilityId::Notifications => probe_notifications().await,
+    }
 }
 
 /// Re-fire only the probes affected by a given D-Bus event,
@@ -2064,11 +2230,15 @@ fn jump_button<'a>(
         )
     };
 
-    if let Some((group, panel)) = row_data.jump {
+    if row_data.jump.is_some() {
+        // MESH-CONNECT-DIALOG-1 — Configure opens the progress modal that
+        // re-probes this capability's real status (no silent jump); the modal's
+        // own actions take it from there.
+        let id = row_data.id;
         button(text("Configure  ▸").size(13))
             .padding(Padding::from([6u16, 14u16]))
             .sty(style)
-            .on_press(crate::Message::SelectPanel { group, panel })
+            .on_press(crate::Message::Home(Message::ConfigureClicked(id)))
             .into()
     } else if let Some(bin) = row_data.launch {
         button(text("Set up  ▸").size(13))
@@ -3063,5 +3233,36 @@ mod tests {
         // Unknown kind + malformed JSON yield None (ignored).
         assert!(nebula_event_from_body(r#"{"kind":"who-knows"}"#).is_none());
         assert!(nebula_event_from_body("not json").is_none());
+    }
+
+    #[test]
+    fn capability_jump_matches_the_row_builders() {
+        // MESH-CONNECT-DIALOG-1 — the connect modal's "Open settings ▸" target
+        // (`capability_jump`) MUST agree with each row's own Configure deep-link
+        // (`CapabilityRow::jump`), or the modal would send the operator to a
+        // different panel than the row's button. Lock them together so a future
+        // row-target edit that forgets `capability_jump` fails here.
+        for row in build_all_rows_with_unknown_status() {
+            assert_eq!(
+                capability_jump(row.id),
+                row.jump,
+                "capability_jump({:?}) drifted from the row builder's jump target",
+                row.id
+            );
+        }
+    }
+
+    #[test]
+    fn capability_label_matches_the_row_builders() {
+        // The modal title reuses `capability_label`; keep it equal to the row's
+        // own `name` so the dialog and the row agree on what's being configured.
+        for row in build_all_rows_with_unknown_status() {
+            assert_eq!(
+                capability_label(row.id),
+                row.name,
+                "label drift for {:?}",
+                row.id
+            );
+        }
     }
 }

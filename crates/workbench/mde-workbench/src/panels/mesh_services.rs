@@ -24,6 +24,7 @@ use cosmic::iced::{Background, Border, Color, Length, Padding, Task};
 use cosmic::{Element, Theme};
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
 
+use crate::components::connect_progress::{self, ConnectProgress};
 use crate::cosmic_compat::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +93,14 @@ pub struct MeshServicesPanel {
     pub busy: bool,
     pub last_run_at: Option<SystemTime>,
     pub last_op: String,
+    /// MESH-CONNECT-DIALOG-1 — the connect/start progress modal: pending
+    /// (the unit is starting/joining) → success / failure (the real
+    /// post-op `systemctl` state). Carries the unit being acted on so
+    /// Retry re-runs the same start.
+    pub connect: ConnectProgress,
+    /// The `(name, scope)` of the unit the open modal is starting — drives
+    /// the modal's Retry.
+    pub connect_target: Option<(String, UnitScope)>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +124,17 @@ pub enum Message {
         op: String,
         success: bool,
     },
+    /// MESH-CONNECT-DIALOG-1 — the post-start re-probe landed: the unit's
+    /// real `ActiveState` after a connect/start, so the modal can show the
+    /// terminal outcome (running = success, anything else = failure).
+    ConnectProbed {
+        name: String,
+        active_state: String,
+    },
+    /// MESH-CONNECT-DIALOG-1 — re-run the start from the modal's failure state.
+    ConnectRetry,
+    /// MESH-CONNECT-DIALOG-1 — close the connect modal (Dismiss / backdrop).
+    ConnectDismiss,
 }
 
 impl MeshServicesPanel {
@@ -141,18 +161,41 @@ impl MeshServicesPanel {
                 self.busy = true;
                 Self::load()
             }
-            Message::StartClicked { name, scope } => {
-                self.busy = true;
-                self.last_op = format!("starting {name}");
-                Task::perform(
-                    async move {
-                        let ok = run_pkexec_systemctl(&scope, "start", &name).await;
-                        (name, "start".to_string(), ok)
-                    },
-                    |(name, op, success)| {
-                        crate::Message::MeshServices(Message::OpFinished { name, op, success })
-                    },
-                )
+            Message::StartClicked { name, scope } => self.start_unit(name, scope),
+            // MESH-CONNECT-DIALOG-1 — Retry re-runs the start for the unit the
+            // open modal remembers (no-op if the modal has no target).
+            Message::ConnectRetry => match self.connect_target.clone() {
+                Some((name, scope)) => self.start_unit(name, scope),
+                None => Task::none(),
+            },
+            Message::ConnectDismiss => {
+                self.connect = ConnectProgress::Closed;
+                self.connect_target = None;
+                Task::none()
+            }
+            // MESH-CONNECT-DIALOG-1 — the post-start re-probe landed; resolve
+            // the modal from the unit's real state (active = success). Guard on
+            // the live target + pending: a late probe (it's delayed ~750ms) must
+            // NOT resurrect a dismissed modal or clobber one already re-opened
+            // for a different unit.
+            Message::ConnectProbed { name, active_state } => {
+                let is_current = self.connect.is_pending()
+                    && self
+                        .connect_target
+                        .as_ref()
+                        .is_some_and(|(t, _)| *t == name);
+                if is_current {
+                    let running = active_state == "active";
+                    self.connect = if running {
+                        self.connect
+                            .success(format!("{name} is running and connected to the mesh."))
+                    } else {
+                        self.connect.failure(format!(
+                            "{name} did not come up (state: {active_state}). See the journal below."
+                        ))
+                    };
+                }
+                Task::none()
             }
             Message::StopClicked { name, scope } => {
                 self.busy = true;
@@ -187,9 +230,65 @@ impl MeshServicesPanel {
                     format!("{op} {name}: FAILED — see journalctl")
                 };
                 self.busy = false;
-                Self::load()
+                // MESH-CONNECT-DIALOG-1 — a connect/start with the modal open
+                // doesn't trust the pkexec exit alone (a unit can exit 0 then
+                // fail its ExecStart): re-probe the unit's real state to set the
+                // terminal outcome, alongside the panel reload. Stop/Restart (no
+                // modal) just reload.
+                let is_connect_start = op == "start"
+                    && self.connect.is_pending()
+                    && self
+                        .connect_target
+                        .as_ref()
+                        .is_some_and(|(t, _)| *t == name);
+                if is_connect_start {
+                    let scope = self
+                        .connect_target
+                        .as_ref()
+                        .map_or(UnitScope::System, |(_, s)| *s);
+                    Task::batch(vec![
+                        Self::load(),
+                        Task::perform(
+                            async move {
+                                let active_state = probe_active_state(&name, scope).await;
+                                (name, active_state)
+                            },
+                            move |(name, active_state)| {
+                                crate::Message::MeshServices(Message::ConnectProbed {
+                                    name,
+                                    active_state,
+                                })
+                            },
+                        ),
+                    ])
+                } else {
+                    Self::load()
+                }
             }
         }
+    }
+
+    /// MESH-CONNECT-DIALOG-1 — start `name` and open the connect/start
+    /// progress modal. Shared by the row's Start button and the modal's
+    /// Retry. The post-start re-probe ([`Message::ConnectProbed`]) sets the
+    /// terminal outcome from the unit's real `ActiveState`.
+    fn start_unit(&mut self, name: String, scope: UnitScope) -> Task<crate::Message> {
+        self.busy = true;
+        self.last_op = format!("starting {name}");
+        self.connect = ConnectProgress::pending(
+            format!("Connect {name}"),
+            format!("Starting {name} and joining the mesh fabric…"),
+        );
+        self.connect_target = Some((name.clone(), scope));
+        Task::perform(
+            async move {
+                let ok = run_pkexec_systemctl(&scope, "start", &name).await;
+                (name, "start".to_string(), ok)
+            },
+            |(name, op, success)| {
+                crate::Message::MeshServices(Message::OpFinished { name, op, success })
+            },
+        )
     }
 
     pub fn view(&self) -> Element<'_, crate::Message> {
@@ -312,7 +411,7 @@ impl MeshServicesPanel {
             }
         }
 
-        container(
+        let body: Element<'_, crate::Message> = container(
             column![
                 header,
                 Space::new().height(Length::Fixed(20.0)),
@@ -323,7 +422,17 @@ impl MeshServicesPanel {
         .padding(Padding::from([24u16, 32u16]))
         .width(Length::Fill)
         .height(Length::Fill)
-        .into()
+        .into();
+
+        // MESH-CONNECT-DIALOG-1 — stack the connect/start progress modal over
+        // the panel body while a Start is in flight or showing its outcome.
+        connect_progress::overlay(
+            &self.connect,
+            body,
+            palette,
+            crate::Message::MeshServices(Message::ConnectRetry),
+            crate::Message::MeshServices(Message::ConnectDismiss),
+        )
     }
 }
 
@@ -593,6 +702,20 @@ fn probe_unit(name: &str, scope: UnitScope, description: &str) -> UnitStatus {
     }
 }
 
+/// MESH-CONNECT-DIALOG-1 — re-probe `name`'s real `ActiveState` after a
+/// short settle delay, off the iced executor. A freshly-started unit
+/// often reports `activating` for a beat before it reaches `active`, so
+/// give it a moment before reading the terminal state the connect modal
+/// renders. `systemctl_show_property` is a sync `std::process::Command`,
+/// so it rides `spawn_blocking`.
+async fn probe_active_state(name: &str, scope: UnitScope) -> String {
+    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    let name = name.to_string();
+    tokio::task::spawn_blocking(move || systemctl_show_property(&name, scope, "ActiveState"))
+        .await
+        .unwrap_or_else(|_| "not-found".to_string())
+}
+
 /// SUBAUDIT-D1 — is the covert :443 relay listener bound locally? A quick
 /// loopback TCP connect (200 ms) — `true` confirms the relay tunnel is up.
 fn tcp_probe_443() -> bool {
@@ -738,5 +861,82 @@ mod tests {
     fn fmt_age_thresholds() {
         let now = SystemTime::now();
         assert_eq!(fmt_age(now), "0 s");
+    }
+
+    // MESH-CONNECT-DIALOG-1 — the connect/start progress modal.
+
+    #[test]
+    fn start_unit_opens_the_pending_modal_with_a_target() {
+        let mut p = MeshServicesPanel::new();
+        let _ = p.start_unit("nebula".into(), UnitScope::System);
+        assert!(
+            p.connect.is_pending(),
+            "Start opens the modal in its pending state"
+        );
+        assert_eq!(
+            p.connect_target,
+            Some(("nebula".to_string(), UnitScope::System))
+        );
+    }
+
+    #[test]
+    fn connect_probed_resolves_the_matching_pending_modal() {
+        let mut p = MeshServicesPanel::new();
+        let _ = p.start_unit("nebula".into(), UnitScope::System);
+        let _ = p.update(Message::ConnectProbed {
+            name: "nebula".into(),
+            active_state: "active".into(),
+        });
+        assert!(matches!(p.connect, ConnectProgress::Success { .. }));
+    }
+
+    #[test]
+    fn connect_probed_failure_for_a_non_active_state() {
+        let mut p = MeshServicesPanel::new();
+        let _ = p.start_unit("nebula".into(), UnitScope::System);
+        let _ = p.update(Message::ConnectProbed {
+            name: "nebula".into(),
+            active_state: "failed".into(),
+        });
+        assert!(matches!(p.connect, ConnectProgress::Failure { .. }));
+    }
+
+    #[test]
+    fn stale_connect_probed_does_not_resurrect_a_dismissed_modal() {
+        let mut p = MeshServicesPanel::new();
+        let _ = p.start_unit("nebula".into(), UnitScope::System);
+        let _ = p.update(Message::ConnectDismiss); // close while the probe is delayed
+                                                   // The delayed post-start probe lands — it must NOT reopen the modal.
+        let _ = p.update(Message::ConnectProbed {
+            name: "nebula".into(),
+            active_state: "active".into(),
+        });
+        assert!(
+            !p.connect.is_open(),
+            "a stale probe must not resurrect a dismissed modal"
+        );
+        assert!(p.connect_target.is_none());
+    }
+
+    #[test]
+    fn stale_connect_probed_for_a_different_unit_is_ignored() {
+        let mut p = MeshServicesPanel::new();
+        let _ = p.start_unit("nebula".into(), UnitScope::System);
+        // A probe for a DIFFERENT unit (an earlier start's late probe) must not
+        // clobber the modal that's now pending for nebula.
+        let _ = p.update(Message::ConnectProbed {
+            name: "mackesd".into(),
+            active_state: "active".into(),
+        });
+        assert!(p.connect.is_pending(), "the nebula modal stays pending");
+    }
+
+    #[test]
+    fn dismiss_closes_the_modal_and_clears_the_target() {
+        let mut p = MeshServicesPanel::new();
+        let _ = p.start_unit("nebula".into(), UnitScope::System);
+        let _ = p.update(Message::ConnectDismiss);
+        assert!(!p.connect.is_open());
+        assert!(p.connect_target.is_none());
     }
 }

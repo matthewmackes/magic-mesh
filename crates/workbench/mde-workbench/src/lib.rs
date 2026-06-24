@@ -13,6 +13,9 @@
 
 pub mod app;
 pub mod backend;
+/// MESH-CONNECT-DIALOG-1 — shared, panel-agnostic UI components
+/// (e.g. the connect/configure progress modal).
+pub mod components;
 pub mod controls;
 pub mod cosmic_compat;
 pub mod dbus;
