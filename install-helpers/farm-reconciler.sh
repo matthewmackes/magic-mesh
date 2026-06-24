@@ -1,0 +1,690 @@
+#!/usr/bin/env bash
+# farm-reconciler.sh — FARM-AUTO reconciler loop (FARM-AUTOSCALE design L2).
+#
+# The no-AI, timer-drivable reconcile that ties the FA components into the live
+# build lifecycle. One tick = one reconcile:
+#
+#   1. QUEUE SOURCE (no AI): determine the live per-dom0 build demand by reusing
+#      what already exists — the worklist's active @farm:{…} jobs (parsed by
+#      automation/lib/farm-jobs.sh) PLUS the LIVE in-flight builds on each build VM
+#      (a running cargo/rustc/cc1plus — a true "a job is on this dom0 right now"
+#      signal, so a busy dom0 is never scaled to zero out from under its build).
+#      Each worklist job's command is classified BIG (whole-workspace / release /
+#      rpm) or SMALL (per-crate / agent pod) by the SAME heuristic xcp-build.sh
+#      uses (infer_shape, FA-6) — sourced, never re-implemented; each live build is
+#      counted as one in-flight SMALL on its dom0. The counts are bucketed per dom0
+#      into the "big:small[:pods]" the autoscaler expects (BIG → BigBoy; SMALL →
+#      spread across the small-capable dom0s).
+#   2. DECIDE: call install-helpers/farm-autoscale.sh with those counts to compute
+#      + commit the per-dom0 shapes (FA-4 hysteresis/drain + FA-5 pod budget). The
+#      autoscaler writes the tofu vars and runs `tofu plan` — it NEVER applies.
+#   3. APPLY — GATED (L2, design-locked "operator/reconciler-gated"). Default is
+#      PLAN-ONLY (never applies). Apply runs ONLY when FA_APPLY=1 AND the tofu
+#      state is sane AND XO is reachable. When applying: `tofu apply` the committed
+#      shapes (clone from MDE-VM-golden, scale-to-zero idle), and between jobs
+#      farm-vm-snapshot.sh snapshot-reverts each VM to its clean baseline (L3).
+#   4. DEGRADE GRACEFULLY (REQUIRED — the CURRENT live state): XO is presently
+#      UNREACHABLE (ws://172.20.145.192:8080 connection-refused) and tofu has no
+#      state. The reconciler DETECTS XO-unreachable / no-state, keeps the last-good
+#      topology, logs loudly, and NEVER strands a running build or crashes — a
+#      plan/apply failure DEGRADES the tick, it does not abort the loop.
+#   5. OBSERVE (FA-7 tie-in): every tick logs its decision + reason + apply-gate
+#      status. Modes for the timer/operator below.
+#
+# Modes:
+#   farm-reconciler.sh --once               one reconcile (the systemd-timer entry)
+#   farm-reconciler.sh --once --dry-run      one reconcile, decide-only (no commit,
+#                                            no apply — succeeds even with XO down)
+#   farm-reconciler.sh --status              current topology + queue + gate state
+#   farm-reconciler.sh --self-test           pure-function assertions (no farm I/O)
+#
+# Apply prerequisites (ALL required before a real apply happens — honest defaults):
+#   - FA_APPLY=1            opt in to apply (default OFF → plan-only, safe)
+#   - XO reachable          the XO websocket host:port accepts a TCP connect
+#   - tofu state present     `tofu state list` succeeds with ≥0 resources (sane)
+#   - golden template set    var.golden_template_name is NON-EMPTY (default
+#                            MDE-VM-golden) — i.e. apply WOULD create VMs at all (an
+#                            operator blanks it for a connect-only plan). NB: this
+#                            gate checks CONFIG, not template existence — that the
+#                            template actually exists on XCP-2 is enforced by `tofu
+#                            apply` itself failing loudly (the reconciler degrades).
+# Until ALL hold, the reconciler stays PLAN-ONLY and says so on every tick. There
+# is NO fake apply and NO pretend-provisioned VM — the live apply is OFF by default.
+#
+# Env: MCNF_REPO (default <repo>), MCNF_TOFU_DIR (default <repo>/infra/tofu),
+#      MCNF_TOFU (default `tofu`), MCNF_WORKLIST (default <repo>/docs/WORKLIST.md),
+#      MCNF_XO_URL (default ws://172.20.145.192:8080 — XO reachability probe),
+#      MCNF_BUILD_USER (default mm), MCNF_FARM_KEY (default ~/.ssh/mackes_mesh_ed25519),
+#      FA_APPLY (default 0 — the apply gate), FA_NOW (epoch; injectable for tests),
+#      FA_PROBE_TIMEOUT (default 4s — XO TCP probe timeout),
+#      FA_NO_SLOTS (set to skip the per-VM in-flight-slot probe — offline/tests).
+#      Autoscaler tunables (FA_MAX_SMALL/FA_DWELL_SECS/FA_POD_BUDGET) pass through.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="${MCNF_REPO:-$(cd "$HERE/.." && pwd)}"
+TOFU_DIR="${MCNF_TOFU_DIR:-$REPO_ROOT/infra/tofu}"
+TOFU="${MCNF_TOFU:-tofu}"
+WORKLIST="${MCNF_WORKLIST:-$REPO_ROOT/docs/WORKLIST.md}"
+AUTOSCALE="$HERE/farm-autoscale.sh"
+SNAPSHOT="$HERE/farm-vm-snapshot.sh"
+XCP_BUILD="$HERE/xcp-build.sh"
+FARM_JOBS="$REPO_ROOT/automation/lib/farm-jobs.sh"
+XO_URL="${MCNF_XO_URL:-ws://172.20.145.192:8080}"
+BUILD_USER="${MCNF_BUILD_USER:-mm}"
+KEY="${MCNF_FARM_KEY:-$HOME/.ssh/mackes_mesh_ed25519}"
+PROBE_TIMEOUT="${FA_PROBE_TIMEOUT:-4}"
+APPLY="${FA_APPLY:-0}"
+
+# Stable dom0 print/iterate order (matches the design doc + farm-autoscale.sh).
+ORDER=("xen-bigboy" "xen-home-services" "kvm-xcp1")
+# dom0 → the build-VM IPs to probe for in-flight work (best-effort, degrades).
+# Per dom0 we probe BOTH:
+#   - the elastic lane the autoscaler provisions (ip_base + the +10 small steps,
+#     cold facts from infra/tofu/main.tf local.dom0 — a 4-wide small pool),
+#   - AND the legacy fixed build VM (xcp-build.sh's DEFAULT_BUILD_HOST .52 on
+#     BigBoy, .50/.51 historically), so the probe sees real builds in the CURRENT
+#     live state too (XO down → nothing elastic provisioned → jobs route to .52).
+# Unreachable IPs cost ~one probe-timeout each and contribute 0. Kept here as a
+# small explicit list rather than re-deriving the +10 scheme so the probe stays a
+# few cheap TCP checks; xcp-build.sh::topology_from_tfvars owns the authoritative
+# IP math for ROUTING (this is only a liveness probe, so a superset is safe).
+declare -A DOM0_IPS=(
+  ["xen-bigboy"]="172.20.0.130 172.20.0.140 172.20.0.150 172.20.0.160 172.20.0.52"
+  ["xen-home-services"]="172.20.0.50 172.20.0.60 172.20.0.70 172.20.0.80"
+  ["kvm-xcp1"]="172.20.0.90 172.20.0.100 172.20.0.110 172.20.0.120 172.20.0.51"
+)
+# dom0 → its hypervisor (dom0) host, for the inter-job snapshot-revert (the dom0
+# runs `xe`). Cold facts from install-helpers/farm.sh's fleet + main.tf pool names.
+declare -A DOM0_HOST=(
+  ["xen-bigboy"]="172.20.145.165"
+  ["xen-home-services"]="172.20.0.9"
+  ["kvm-xcp1"]="172.20.145.193"
+)
+# dom0 → the VM name-labels per shape (cold facts from infra/tofu/main.tf
+# local.dom0: big_name / small_name; the nth small is "<small_name>-<n>" for n≥1).
+declare -A DOM0_BIG_NAME=(
+  ["xen-bigboy"]="mcnf-build-big-52"
+  ["xen-home-services"]="mcnf-build-big-50"
+  ["kvm-xcp1"]="mcnf-build-big-51"
+)
+declare -A DOM0_SMALL_NAME=(
+  ["xen-bigboy"]="mcnf-build-52"
+  ["xen-home-services"]="mcnf-build-50"
+  ["kvm-xcp1"]="mcnf-build-51"
+)
+# dom0 → the autoscaler flag that carries its queue spec.
+declare -A DOM0_FLAG=(
+  ["xen-bigboy"]="--bigboy"
+  ["xen-home-services"]="--home"
+  ["kvm-xcp1"]="--xcp1"
+)
+
+usage() { sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# =============================================================================
+# PURE helpers — no I/O, no globals; exercised by --self-test.
+# =============================================================================
+
+# classify_command <cargo-command-string> — BIG | SMALL for a single @farm job's
+# command. Defers to xcp-build.sh's infer_shape (FA-6) when sourceable so the rule
+# can NEVER drift from the router; the small inline fallback mirrors it 1:1 for the
+# self-test / when xcp-build.sh is absent. The command is the text inside @farm:{…}
+# (e.g. "cargo build --workspace --release" or "cargo build -p mde-bus"). Echoes
+# "big" or "small".
+classify_command() {
+  local cmd="$1"
+  # Drop a leading "cargo" so infer_shape sees the subcommand+args it expects.
+  local args="${cmd#cargo }"
+  if declare -f infer_shape >/dev/null 2>&1; then
+    # infer_shape reads MCNF_BUILD_SHAPE; unset it so the COMMAND drives the shape
+    # (a stray env from the caller must not pin every job's class). $args is split
+    # ON PURPOSE — infer_shape wants the cargo args as separate positionals.
+    # shellcheck disable=SC2086
+    ( unset MCNF_BUILD_SHAPE; infer_shape $args )
+    return
+  fi
+  # Fallback (xcp-build.sh not sourced): the same rule, inline.
+  local a=" $args " ws=0 rel=0 hp=0 isb=0 isr=0
+  case "$a" in *" --workspace "*) ws=1 ;; esac
+  case "$a" in *" --release "*) rel=1 ;; esac
+  case "$a" in *" -p "*) hp=1 ;; esac
+  case "$a" in *" build "*) isb=1 ;; esac
+  case "$a" in *" rpm "* | *" generate-rpm "*) isr=1 ;; esac
+  if [ "$isr" -eq 1 ]; then echo big
+  elif [ "$hp" -eq 1 ]; then echo small
+  elif [ "$isb" -eq 1 ] && { [ "$ws" -eq 1 ] || [ "$rel" -eq 1 ]; }; then echo big
+  else echo small; fi
+}
+
+# bucket_demand <big-total> <small-total> <pod-total> — PURE: turn the WHOLE-FLEET
+# big/small/pod job totals into the per-dom0 "big:small:pods" specs the autoscaler
+# takes, on stdout as three lines IN ORDER (xen-bigboy, xen-home-services, kvm-xcp1).
+# Placement rule (mirrors xcp-build.sh routing + design L1/L4):
+#   - BIG jobs want a whole host → ALL counted on xen-bigboy (the only true big iron;
+#     a big VM on home/xcp1 is only 3 vCPU). The autoscaler then runs BigBoy `big`.
+#   - SMALL jobs + pods spread across the small-capable dom0s. We split smalls
+#     round-robin-ish across home + xcp1 (BigBoy carries the bigs); pods follow the
+#     smalls so a pod-heavy queue biases the dom0s toward small×N (FA-5).
+#   - If there ARE bigs, BigBoy is claimed by big (L4 mutual exclusion) and its
+#     smalls fold onto home/xcp1; with no bigs, BigBoy can also take smalls.
+# Deterministic in its 3 args, so the self-test can assert exact specs.
+bucket_demand() {
+  local big="$1" small="$2" pods="$3"
+  local bb_big=0 bb_small=0 hm_small=0 x1_small=0
+  local bb_pods=0 hm_pods=0 x1_pods=0
+  # BIG → BigBoy (whole host). A nonzero big count claims BigBoy's big shape.
+  bb_big="$big"
+  # SMALL pool dom0s: home + xcp1 always; BigBoy too ONLY when no bigs claim it.
+  local -a pool=("xen-home-services" "kvm-xcp1")
+  [ "$big" -eq 0 ] && pool=("xen-bigboy" "xen-home-services" "kvm-xcp1")
+  local n="${#pool[@]}" i=0 dk
+  # Spread smalls + pods round-robin across the pool (deterministic order).
+  local s=0 p=0
+  while [ "$s" -lt "$small" ] || [ "$p" -lt "$pods" ]; do
+    dk="${pool[$(( i % n ))]}"
+    if [ "$s" -lt "$small" ]; then
+      case "$dk" in
+        xen-bigboy) bb_small=$(( bb_small + 1 )) ;;
+        xen-home-services) hm_small=$(( hm_small + 1 )) ;;
+        kvm-xcp1) x1_small=$(( x1_small + 1 )) ;;
+      esac
+      s=$(( s + 1 ))
+    fi
+    if [ "$p" -lt "$pods" ]; then
+      case "$dk" in
+        xen-bigboy) bb_pods=$(( bb_pods + 1 )) ;;
+        xen-home-services) hm_pods=$(( hm_pods + 1 )) ;;
+        kvm-xcp1) x1_pods=$(( x1_pods + 1 )) ;;
+      esac
+      p=$(( p + 1 ))
+    fi
+    i=$(( i + 1 ))
+  done
+  printf '%s:%s:%s\n' "$bb_big" "$bb_small" "$bb_pods"
+  printf '%s:%s:%s\n' "0" "$hm_small" "$hm_pods"
+  printf '%s:%s:%s\n' "0" "$x1_small" "$x1_pods"
+}
+
+# apply_gate <fa_apply> <xo_reachable> <state_sane> <golden_set> — PURE: the apply
+# decision (L2). Echoes "apply" iff ALL four hold, else "plan-only:<reason>" naming
+# the FIRST failing prerequisite (so the tick logs exactly why it stayed plan-only).
+# Each input is "1"/"0". Default-safe: any 0 → plan-only.
+apply_gate() {
+  local fa="$1" xo="$2" state="$3" golden="$4"
+  if [ "$fa" != "1" ];     then echo "plan-only:FA_APPLY!=1 (apply opt-in off)"; return; fi
+  if [ "$xo" != "1" ];     then echo "plan-only:XO-unreachable"; return; fi
+  if [ "$state" != "1" ];  then echo "plan-only:tofu-state-unsafe"; return; fi
+  if [ "$golden" != "1" ]; then echo "plan-only:no-golden-template"; return; fi
+  echo "apply"
+}
+
+# host_port_from_xo_url <ws://host:port[/...]> — PURE: extract "host port" for the
+# TCP reachability probe. ws://172.20.145.192:8080 → "172.20.145.192 8080".
+# Handles a bracketed IPv6 literal (ws://[::1]:8080 → "::1 8080") so an IPv6 XO
+# isn't pinned plan-only by a misparse. Defaults the port to 80 (ws) if absent.
+host_port_from_xo_url() {
+  local u="$1" rest host port
+  rest="${u#*://}"          # strip scheme
+  rest="${rest%%/*}"        # drop any /path
+  case "$rest" in
+    \[*\]*)                 # [ipv6] or [ipv6]:port
+      host="${rest#\[}"; host="${host%%\]*}"
+      port="${rest#*\]}"    # ":port" or ""
+      port="${port#:}"
+      [ -n "$port" ] || port=80
+      ;;
+    *)
+      host="${rest%%:*}"
+      if [ "$rest" = "$host" ]; then port=80; else port="${rest##*:}"; fi
+      ;;
+  esac
+  printf '%s %s\n' "$host" "$port"
+}
+
+# =============================================================================
+# --self-test — pure-function assertions (no farm I/O). Run first, exits.
+# =============================================================================
+if [ "${1:-}" = "--self-test" ]; then
+  fails=0
+  check() { # check <label> <got> <want>
+    if [ "$2" = "$3" ]; then echo "  ok: $1"
+    else echo "  FAIL: $1 — got '$2' want '$3'" >&2; fails=$((fails + 1)); fi
+  }
+  echo "farm-reconciler --self-test:"
+
+  # --- classify_command (the @farm-job shape rule; mirrors infer_shape FA-6) ---
+  check "workspace build → big"   "$(classify_command 'cargo build --workspace --release')" big
+  check "release build → big"     "$(classify_command 'cargo build --release')" big
+  check "rpm cut → big"           "$(classify_command 'cargo generate-rpm -p crates/mesh/mackesd')" big
+  check "per-crate build → small" "$(classify_command 'cargo build -p mde-bus')" small
+  check "per-crate test → small"  "$(classify_command 'cargo test -p mde-theme')" small
+  check "workspace test → small"  "$(classify_command 'cargo test --workspace')" small
+  check "per-crate +release small" "$(classify_command 'cargo build -p mackesd --release')" small
+
+  # --- bucket_demand (whole-fleet totals → per-dom0 specs) ---
+  # One big job → BigBoy big, nothing else.
+  check "1 big → bigboy big" "$(bucket_demand 1 0 0 | tr '\n' '|')" "1:0:0|0:0:0|0:0:0|"
+  # Two smalls, no bigs → BigBoy + home take one each (round-robin from the 3-pool).
+  check "2 small no-big spread" "$(bucket_demand 0 2 0 | tr '\n' '|')" "0:1:0|0:1:0|0:0:0|"
+  # Bigs present → BigBoy claimed by big; smalls fold onto home+xcp1 only (L4).
+  check "big preempts: smalls to home+xcp1" "$(bucket_demand 1 2 0 | tr '\n' '|')" "1:0:0|0:1:0|0:1:0|"
+  # Pods follow the smalls; a pod-heavy queue lands pods on the small pool (FA-5).
+  check "pods spread to small pool" "$(bucket_demand 0 0 3 | tr '\n' '|')" "0:0:1|0:0:1|0:0:1|"
+  # Idle fleet → every dom0 off (0:0:0).
+  check "idle → all off" "$(bucket_demand 0 0 0 | tr '\n' '|')" "0:0:0|0:0:0|0:0:0|"
+
+  # --- apply_gate (L2: all four prereqs must hold) ---
+  check "gate: all ok → apply"        "$(apply_gate 1 1 1 1)" apply
+  check "gate: FA_APPLY off"          "$(apply_gate 0 1 1 1)" "plan-only:FA_APPLY!=1 (apply opt-in off)"
+  check "gate: XO down (current live)" "$(apply_gate 1 0 1 1)" "plan-only:XO-unreachable"
+  check "gate: no state"              "$(apply_gate 1 1 0 1)" "plan-only:tofu-state-unsafe"
+  check "gate: no golden"             "$(apply_gate 1 1 1 0)" "plan-only:no-golden-template"
+  # The CURRENT live state (XO down, no state) is plan-only even if opted in.
+  check "gate: live state → plan-only" "$(apply_gate 1 0 0 1)" "plan-only:XO-unreachable"
+
+  # --- host_port_from_xo_url ---
+  check "xo url host:port"      "$(host_port_from_xo_url 'ws://172.20.145.192:8080')" "172.20.145.192 8080"
+  check "xo url with path"      "$(host_port_from_xo_url 'ws://10.0.0.1:8080/api')" "10.0.0.1 8080"
+  check "xo url no port → 80"   "$(host_port_from_xo_url 'ws://10.0.0.1')" "10.0.0.1 80"
+  check "xo url ipv6 host:port" "$(host_port_from_xo_url 'ws://[::1]:8080')" "::1 8080"
+  check "xo url ipv6 no port"   "$(host_port_from_xo_url 'ws://[fe80::1]')" "fe80::1 80"
+
+  if [ "$fails" -eq 0 ]; then
+    echo "farm-reconciler: self-test passed"; exit 0
+  fi
+  echo "farm-reconciler: SELF-TEST FAILED ($fails)" >&2; exit 1
+fi
+
+# =============================================================================
+# Arg parse (modes). Default with no args = --status (read-only, safe).
+# =============================================================================
+MODE="status"
+DRY_RUN=0
+while [ $# -gt 0 ]; do case "$1" in
+  --once)    MODE="once"; shift;;
+  --status)  MODE="status"; shift;;
+  --dry-run) DRY_RUN=1; shift;;
+  -h | --help | help) usage; exit 0;;
+  *) echo "farm-reconciler: unknown arg: $1" >&2; usage; exit 2;;
+esac; done
+
+# All diagnostics go to STDERR (visible in the systemd-timer journal). STDOUT is
+# reserved for DATA the helpers capture via `< <(…)` (the per-dom0 specs from
+# collect_demand) — a diagnostic on stdout would be slurped in as a fake spec.
+log()  { echo "==> farm-reconciler: $*" >&2; }
+warn() { echo "==> farm-reconciler: $*" >&2; }
+die()  { warn "$*"; exit 2; }
+
+NOW="${FA_NOW:-$(date +%s)}"
+SSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=8)
+
+# Reuse xcp-build.sh's canonical helpers (infer_shape FA-6, dom0_shape) by eval'ing
+# JUST their definitions here, instead of re-implementing them (no drift). We can't
+# plain-`source` xcp-build.sh — its top-level dispatch `case` ends in `*) … exit 1`,
+# which a source would propagate into us. So extract each function's text and eval.
+#
+# source_fn_from <file> <fnname> — define <fnname> in THIS shell from its definition
+# in <file>. Captures from `^<fnname>() {` to the matching `^}` at COLUMN 0 (these
+# helpers are flat — no column-0 `}` inside the body — so the first col-0 `}` is the
+# function's own close). Returns nonzero (caller warns + uses the inline fallback) if
+# the file is unreadable or the function isn't found, so a refactor that renames the
+# upstream function degrades loudly to the mirror rather than silently misbehaving.
+source_fn_from() {
+  local file="$1" fn="$2" body
+  [ -r "$file" ] || return 1
+  body="$(awk -v fn="$fn" '
+    $0 ~ "^" fn "\\(\\) \\{" { f=1 }
+    f { print }
+    f && /^\}/ { exit }
+  ' "$file")"
+  # Must have captured a complete block: starts with the def and ends with a col-0 }.
+  case "$body" in
+    "$fn"'() {'*) ;; *) return 1 ;;
+  esac
+  printf '%s\n' "$body" | grep -qE '^\}$' || return 1
+  eval "$body"
+}
+source_fn_from "$XCP_BUILD" infer_shape || warn "could not reuse infer_shape from $XCP_BUILD — using the inline mirror"
+# dom0_shape lets the reset step read the committed per-dom0 shape from the tfvars;
+# if it can't be sourced the reset step degrades to a no-op (logged), never crashes.
+source_fn_from "$XCP_BUILD" dom0_shape || warn "could not reuse dom0_shape from $XCP_BUILD — inter-job reset will be skipped"
+
+# --- XO reachability probe (graceful-degrade signal #1) -----------------------
+# A pure TCP connect to the XO websocket host:port. The CURRENT live state is
+# connection-refused (XO down) → returns 1, and the reconciler degrades. Never
+# blocks the loop: bounded by FA_PROBE_TIMEOUT.
+xo_reachable() {
+  local hp host port
+  hp="$(host_port_from_xo_url "$XO_URL")"
+  host="${hp%% *}"; port="${hp##* }"
+  timeout "$PROBE_TIMEOUT" bash -c "cat </dev/null >/dev/tcp/$host/$port" 2>/dev/null
+}
+
+# --- tofu state sanity (graceful-degrade signal #2) ---------------------------
+# State is "sane" iff tofu is installed, the dir initialised, and `tofu state list`
+# succeeds (an empty list is fine — it means zero managed resources, not a fault;
+# a missing/locked/corrupt backend FAILS the command → unsafe → plan-only). The
+# CURRENT live state has NO tofu state → unsafe → plan-only. Best-effort + bounded.
+tofu_state_sane() {
+  command -v "$TOFU" >/dev/null 2>&1 || return 1
+  [ -d "$TOFU_DIR" ] || return 1
+  ( cd "$TOFU_DIR" && timeout 30 "$TOFU" state list >/dev/null 2>&1 )
+}
+
+# --- golden-template gate -----------------------------------------------------
+# HONEST SCOPE: this checks the CONFIG — is var.golden_template_name non-empty, so
+# the build-VM resources are NOT inert (count 0)? It does NOT, and cannot from the
+# control host alone, prove the template was actually built on XCP-2. That deeper
+# truth is enforced where it MUST be: `tofu apply` clones the template by name and
+# FAILS LOUDLY if it doesn't exist on the pool — and the reconciler degrades on an
+# apply failure (keeps last-good, never strands a build). So this gate's job is
+# only "would apply create VMs at all" (an operator blanks the name for a
+# connect-only plan → off); template existence is the apply's own gate.
+#
+# Effective value = env/tfvars override if present, else the variables.tf default.
+# An override can ADD or BLANK it; we honour both so a deliberate "" → off.
+golden_template_set() {
+  local val
+  # 1) explicit env (TF_VAR_golden_template_name) wins.
+  if [ -n "${TF_VAR_golden_template_name+x}" ]; then
+    val="${TF_VAR_golden_template_name}"
+  # 2) an *.auto.tfvars override (operator-set), if any carries the key. The grep
+  #    GATES this branch (key present), so a blank override (`= ""`) → val="" → off,
+  #    while a key-absent tfvars falls through to the default.
+  elif grep -qhE 'golden_template_name' "$TOFU_DIR"/*.auto.tfvars 2>/dev/null; then
+    val="$(grep -hoE 'golden_template_name[[:space:]]*=[[:space:]]*"[^"]*"' \
+        "$TOFU_DIR"/*.auto.tfvars 2>/dev/null | sed -E 's/.*"([^"]*)".*/\1/' | tail -1)"
+  else
+    # 3) the variables.tf default (the conservative floor for a clean checkout).
+    # Scope sed to the `variable "golden_template_name" { … }` block so we read ITS
+    # default, not some other variable's.
+    val="$(sed -nE '/variable "golden_template_name"/,/^}/{ s/.*default[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p }' \
+            "$TOFU_DIR/variables.tf" 2>/dev/null | tail -1)"
+  fi
+  [ -n "$val" ]
+}
+
+# eval_gate — run the three apply prerequisites' probes once and set the globals
+# GATE_XO / GATE_STATE / GATE_GOLDEN (each 0/1) + GATE (the apply_gate verdict).
+# Each probe is bounded + never throws (a failure is the safe 0 = plan-only). Used
+# by both --status (report) and --once (decide), so the probe logic lives in ONE
+# place and the two paths can't disagree.
+GATE_XO=0; GATE_STATE=0; GATE_GOLDEN=0; GATE=""
+eval_gate() {
+  GATE_XO=0; GATE_STATE=0; GATE_GOLDEN=0
+  if xo_reachable;        then GATE_XO=1;     fi
+  if tofu_state_sane;     then GATE_STATE=1;  fi
+  if golden_template_set; then GATE_GOLDEN=1; fi
+  GATE="$(apply_gate "$APPLY" "$GATE_XO" "$GATE_STATE" "$GATE_GOLDEN")"
+}
+
+# =============================================================================
+# QUEUE SOURCE — live per-dom0 demand, no AI.
+# =============================================================================
+# Two signals, summed:
+#   (a) worklist @farm:{…} ACTIVE jobs (farm-jobs.sh active) — each command
+#       classified BIG/SMALL by classify_command (infer_shape, FA-6).
+#   (b) in-flight build SLOTS on each build VM (~/magic-mesh-* dirs) — a live
+#       proxy for jobs ALREADY running (so we don't scale a dom0 to zero out from
+#       under a build). Best-effort over SSH; an unreachable VM contributes 0 (it
+#       can't be hosting a slot if it's unreachable) and NEVER fails the tick.
+# We emit whole-fleet totals (big, small, pods) then bucket_demand them per dom0.
+
+# collect_worklist_demand — echo "big small pods" whole-fleet totals from the
+# worklist's active @farm jobs. Pods: an @farm command that is NOT a cargo build/
+# test (e.g. an agent-pod spawn) counts as a pod; here every @farm job is a cargo
+# build/test, so pods stay 0 from this signal (slots may add pods later). Degrades
+# to 0/0/0 if the worklist or farm-jobs.sh is missing.
+collect_worklist_demand() {
+  local big=0 small=0 pods=0
+  if [ -x "$FARM_JOBS" ] && [ -f "$WORKLIST" ]; then
+    # farm-jobs.sh emits "<jobid>\t<status>\t<task>\t<command>"; we only need the
+    # command to classify the job's shape — the rest is discarded with `_`.
+    local _jid _status _task cmd shape
+    while IFS=$'\t' read -r _jid _status _task cmd; do
+      [ -n "$cmd" ] || continue
+      shape="$(classify_command "$cmd")"
+      case "$shape" in
+        big)   big=$(( big + 1 )) ;;
+        small) small=$(( small + 1 )) ;;
+      esac
+    done < <(MCNF_WORKLIST="$WORKLIST" "$FARM_JOBS" active 2>/dev/null || true)
+  else
+    warn "no farm-jobs.sh / worklist — worklist demand = 0 (slots may still drive)"
+  fi
+  printf '%s %s %s\n' "$big" "$small" "$pods"
+}
+
+# collect_slot_demand — echo "big small pods" from the LIVE in-flight builds on the
+# build VMs. We count RUNNING build processes (cargo/rustc/cc1plus/cc1), NOT the
+# ~/magic-mesh-* slot DIRS: those dirs persist forever (xcp-build.sh keeps target/
+# on the VM permanently and never removes a slot), so a finished job's dir would
+# inflate demand for good. A running compiler is a TRUE in-flight signal — it tells
+# us a job is on this dom0 RIGHT NOW so the autoscaler must not scale it to zero out
+# from under the build. Each VM with a live build counts as 1 in-flight SMALL job on
+# its dom0 (a build VM runs one logical job; the per-VM POD/parallelism is the
+# autoscaler's small_count concern, not a demand multiplier here).
+#   - Probe every IP in the dom0's lane + its legacy fixed host (DOM0_IPS) so we see
+#     builds in the elastic AND the degraded/fallback (.52) state.
+#   - Best-effort: an unreachable IP costs ~one probe-timeout and contributes 0.
+#   - FA_NO_SLOTS skips the probe entirely (offline / --self-test / CI).
+collect_slot_demand() {
+  local big=0 small=0 pods=0
+  if [ -n "${FA_NO_SLOTS:-}" ]; then printf '0 0 0\n'; return; fi
+  local dk ip busy
+  for dk in "${ORDER[@]}"; do
+    for ip in ${DOM0_IPS[$dk]}; do
+      # TCP-probe first (bounded) so a down VM costs ~probe-timeout, not the ssh wait.
+      timeout "$PROBE_TIMEOUT" bash -c "cat </dev/null >/dev/tcp/$ip/22" 2>/dev/null || continue
+      # Is a build compiler running? pgrep exits 0 (match) / 1 (no match) / 2 (err).
+      # We only care MATCH vs not — a running cargo/rustc/cc1plus = one live build.
+      # $(id -u) is intentionally single-quoted: it must expand on the REMOTE VM
+      # (the mm user's uid there), not on the control host.
+      # shellcheck disable=SC2016
+      if "${SSH[@]}" -n "$BUILD_USER@$ip" \
+            'pgrep -x -u "$(id -u)" cargo >/dev/null 2>&1 || pgrep -x rustc >/dev/null 2>&1 || pgrep -x cc1plus >/dev/null 2>&1' \
+            >/dev/null 2>&1; then
+        busy=1
+      else
+        busy=0
+      fi
+      [ "$busy" -eq 1 ] && small=$(( small + 1 ))
+    done
+  done
+  printf '%s %s %s\n' "$big" "$small" "$pods"
+}
+
+# collect_demand — sum the worklist + slot signals into the per-dom0 specs, echoed
+# as three lines (xen-bigboy, home, xcp1) of "big:small:pods" IN ORDER. Also stashes
+# the whole-fleet totals into the FLEET_* globals for the status/log line.
+FLEET_BIG=0; FLEET_SMALL=0; FLEET_PODS=0
+collect_demand() {
+  local wl sl wb ws wp sb ss sp
+  wl="$(collect_worklist_demand)"; read -r wb ws wp <<<"$wl"
+  sl="$(collect_slot_demand)";     read -r sb ss sp <<<"$sl"
+  FLEET_BIG=$(( wb + sb )); FLEET_SMALL=$(( ws + ss )); FLEET_PODS=$(( wp + sp ))
+  log "queue: worklist(big=$wb small=$ws pods=$wp) + slots(big=$sb small=$ss pods=$sp)" \
+      "→ fleet(big=$FLEET_BIG small=$FLEET_SMALL pods=$FLEET_PODS)"
+  bucket_demand "$FLEET_BIG" "$FLEET_SMALL" "$FLEET_PODS"
+}
+
+# =============================================================================
+# --status — read-only: current committed topology + the live queue it WOULD act
+# on + the apply-gate state. Mutates NOTHING (defers to farm-autoscale --topology,
+# which is itself read-only). Safe to run anytime / from a panel.
+# =============================================================================
+if [ "$MODE" = "status" ]; then
+  log "FARM-AUTO reconciler status @ $(date -u -d "@$NOW" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  # Gate state (each prereq + the resulting decision).
+  eval_gate
+  log "apply-gate: FA_APPLY=$APPLY xo_reachable=$GATE_XO state_sane=$GATE_STATE golden_set=$GATE_GOLDEN → ${GATE%%:*}"
+  case "$GATE" in plan-only:*) log "  plan-only reason: ${GATE#plan-only:}";; esac
+
+  # Live queue → per-dom0 specs (best-effort; degrades to 0s if signals are down).
+  declare -a SPECS=()
+  while IFS= read -r line; do [ -n "$line" ] && SPECS+=("$line"); done < <(collect_demand)
+
+  # Show the autoscaler's committed topology + what THIS queue would decide next.
+  if [ -x "$AUTOSCALE" ]; then
+    args=(); i=0
+    for dk in "${ORDER[@]}"; do args+=("${DOM0_FLAG[$dk]}" "${SPECS[$i]:-0:0:0}"); i=$(( i + 1 )); done
+    log "current topology (committed) + drift preview for the live queue:"
+    FA_NOW="$NOW" "$AUTOSCALE" "${args[@]}" --topology || warn "autoscale --topology failed (degraded)"
+  else
+    warn "autoscaler not found at $AUTOSCALE — cannot show topology"
+  fi
+  exit 0
+fi
+
+# =============================================================================
+# --once — one reconcile tick.
+# =============================================================================
+[ "$MODE" = "once" ] || die "internal: unexpected mode '$MODE'"
+[ -x "$AUTOSCALE" ] || die "autoscaler not found/executable: $AUTOSCALE"
+
+STAMP="$(date -u -d "@$NOW" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+log "tick $STAMP (dry-run=$DRY_RUN, FA_APPLY=$APPLY)"
+
+# --- 1) QUEUE SOURCE ----------------------------------------------------------
+declare -a SPECS=()
+while IFS= read -r line; do [ -n "$line" ] && SPECS+=("$line"); done < <(collect_demand)
+
+# --- 2) DECIDE (+ optionally commit) via farm-autoscale.sh --------------------
+# Build the per-dom0 flag args once; reuse for the decide call.
+AS_ARGS=(); i=0
+for dk in "${ORDER[@]}"; do AS_ARGS+=("${DOM0_FLAG[$dk]}" "${SPECS[$i]:-0:0:0}"); i=$(( i + 1 )); done
+
+# Evaluate the apply gate UP FRONT (so a dry-run reports it without committing, and
+# the commit path knows whether to attempt apply). XO + state probes are bounded
+# and never throw — a probe failure is just a 0 (→ plan-only), the safe direction.
+eval_gate
+log "apply-gate: FA_APPLY=$APPLY xo_reachable=$GATE_XO state_sane=$GATE_STATE golden_set=$GATE_GOLDEN → ${GATE%%:*}"
+case "$GATE" in plan-only:*)
+  warn "APPLY GATED — plan-only this tick (reason: ${GATE#plan-only:}). Last-good topology kept; no VM touched."
+;; esac
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  # Decide-only: farm-autoscale --dry-run mutates nothing (no tfvars, no state, no
+  # tofu). This path MUST succeed even with XO down — it proves graceful degrade.
+  log "--dry-run: decide-only (autoscaler --dry-run; no commit, no apply, no tofu contact)"
+  FA_NOW="$NOW" "$AUTOSCALE" "${AS_ARGS[@]}" --dry-run || warn "autoscale --dry-run reported nonzero (degraded; loop continues)"
+  log "--dry-run tick complete — nothing mutated."
+  exit 0
+fi
+
+# COMMIT the decision: farm-autoscale writes the tfvars + state + runs `tofu plan`.
+# The plan reads live XO; with XO DOWN it fails LOUDLY but the tfvars/state are
+# already written (last-good advances locally) — so a plan failure DEGRADES the
+# tick, it does NOT crash the loop. We capture the rc and carry on.
+log "decide+commit: farm-autoscale.sh (writes tofu vars + state, runs tofu plan)"
+AS_RC=0
+FA_NOW="$NOW" "$AUTOSCALE" "${AS_ARGS[@]}" || AS_RC=$?
+if [ "$AS_RC" -ne 0 ]; then
+  warn "autoscaler returned rc=$AS_RC (likely XO-unreachable tofu plan) — DEGRADED."
+  warn "  tofu vars/state are committed locally; last-good topology kept; loop NOT aborted."
+fi
+
+# --- 3) APPLY — GATED --------------------------------------------------------
+if [ "$GATE" != "apply" ]; then
+  log "apply skipped (${GATE}). Reconcile tick done (plan-only)."
+  exit 0
+fi
+
+# Re-confirm the gate right before mutating (defence in depth — XO could have
+# dropped between the probe and here; never apply against a stale green probe).
+if ! xo_reachable; then
+  warn "XO went unreachable since the gate check — ABORTING apply (degrade, keep last-good)."
+  exit 0
+fi
+if ! tofu_state_sane; then
+  warn "tofu state no longer sane — ABORTING apply (degrade, keep last-good)."
+  exit 0
+fi
+
+TFVARS="$TOFU_DIR/farm-autoscale.auto.tfvars"
+[ -f "$TFVARS" ] || { warn "no $TFVARS to apply (autoscaler did not commit) — skip apply."; exit 0; }
+
+log "APPLY ENABLED — tofu apply the committed shapes ($TFVARS)"
+# -input=false: an unattended tick must never block on a prompt. -auto-approve is
+# intentional ONLY behind the full gate (FA_APPLY + XO + state + golden). A failed
+# apply degrades — log loudly, keep the loop alive, do NOT strand a running build.
+APPLY_RC=0
+( cd "$TOFU_DIR" && "$TOFU" apply -input=false -auto-approve -var-file="$(basename "$TFVARS")" ) || APPLY_RC=$?
+if [ "$APPLY_RC" -ne 0 ]; then
+  warn "tofu apply rc=$APPLY_RC — DEGRADED. Last-good topology kept; running builds NOT stranded."
+  exit 0
+fi
+log "tofu apply OK — farm converged to the committed shapes."
+
+# --- 4) inter-job snapshot-revert (L3) ---------------------------------------
+# Between jobs, revert each freshly-converged build VM to its clean post-toolchain
+# baseline (FA-2 / farm-vm-snapshot.sh reset) so job N+1 doesn't inherit job N's
+# workspace/sccache state. We reset ONLY the VMs the autoscaler decided to KEEP this
+# tick — read from the committed shape vars (dom0_shape, reused from xcp-build.sh) —
+# and skip any VM that is currently BUSY (a live build process), so a mid-flight job
+# is never reverted out from under itself. Each reset is per-VM isolated + best
+# effort: a missing snapshot / unreachable dom0 is warned and skipped, never failing
+# the tick (the apply already converged; reset is the inter-job optimisation).
+reset_running_vms() {
+  [ -x "$SNAPSHOT" ] || { warn "farm-vm-snapshot.sh not found at $SNAPSHOT — skipping inter-job reset"; return 0; }
+  declare -f dom0_shape >/dev/null 2>&1 || { warn "dom0_shape unavailable — skipping inter-job reset"; return 0; }
+  local tfvars_text="" dk shape n i name host
+  [ -f "$TFVARS" ] && tfvars_text="$(cat "$TFVARS")"
+  for dk in "${ORDER[@]}"; do
+    shape="$(dom0_shape "$tfvars_text" "$dk")"
+    host="${DOM0_HOST[$dk]}"
+    case "$shape" in
+      big)
+        reset_one_vm "${DOM0_BIG_NAME[$dk]}" "$host" "${DOM0_IPS[$dk]%% *}"
+        ;;
+      small)
+        # small_count for this dom0 (default 1 if absent) → small-0..small-(n-1).
+        n="$(printf '%s\n' "$tfvars_text" | sed -nE "/\"$dk\"[[:space:]]*=[[:space:]]*[0-9]/{s/.*\"$dk\"[[:space:]]*=[[:space:]]*([0-9]+).*/\\1/p;q}")"
+        [ -n "$n" ] || n=1
+        # The dom0's elastic lane IPs in small-index order (ip_base, +10, +20, +30);
+        # the trailing legacy host (.52/.51) is NOT a small index, so read only the
+        # first MAX_SMALL_INDEX lane tokens by position. Clamp n to that lane width so
+        # a stale/hand-edited tfvars with small_count > 4 can't index past the elastic
+        # IPs into the legacy host (the live autoscaler caps at 4, but be defensive).
+        local -a lane; read -ra lane <<<"${DOM0_IPS[$dk]}"
+        local max_small_idx=4
+        [ "$n" -gt "$max_small_idx" ] && { warn "small_count=$n on $dk exceeds the $max_small_idx-wide lane — clamping reset to $max_small_idx"; n="$max_small_idx"; }
+        i=0
+        while [ "$i" -lt "$n" ]; do
+          if [ "$i" -eq 0 ]; then name="${DOM0_SMALL_NAME[$dk]}"; else name="${DOM0_SMALL_NAME[$dk]}-$i"; fi
+          reset_one_vm "$name" "$host" "${lane[$i]:-}"
+          i=$(( i + 1 ))
+        done
+        ;;
+      off) : ;; # nothing running on this dom0 — nothing to reset
+    esac
+  done
+}
+
+# reset_one_vm <vm-name> <dom0-host> <vm-ip-or-empty> — reset ONE VM to its clean
+# snapshot, UNLESS it's mid-build (a live compiler on <vm-ip>, when known). Best
+# effort: any failure is warned and swallowed (never aborts the tick).
+reset_one_vm() {
+  local name="$1" host="$2" ip="$3"
+  if [ -n "$ip" ]; then
+    if timeout "$PROBE_TIMEOUT" bash -c "cat </dev/null >/dev/tcp/$ip/22" 2>/dev/null \
+       && "${SSH[@]}" -n "$BUILD_USER@$ip" \
+            'pgrep -x cargo >/dev/null 2>&1 || pgrep -x rustc >/dev/null 2>&1 || pgrep -x cc1plus >/dev/null 2>&1' \
+            >/dev/null 2>&1; then
+      log "  skip reset of $name — a build is in flight (won't revert under a live job)"
+      return 0
+    fi
+  fi
+  log "  reset $name → clean baseline (dom0 $host)"
+  if ! MCNF_XCP_HOST="$host" MCNF_FARM_KEY="$KEY" "$SNAPSHOT" reset "$name" --xcp-host "$host" >/dev/null 2>&1; then
+    warn "  reset of $name failed/absent (no clean snapshot? mid-provision?) — skipped, tick continues"
+  fi
+}
+
+log "inter-job snapshot-revert of the converged build VMs to their clean baseline (L3)"
+reset_running_vms
+
+log "reconcile tick complete (applied)."
+exit 0
