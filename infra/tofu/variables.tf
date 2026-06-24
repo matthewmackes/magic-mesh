@@ -16,8 +16,12 @@ variable "golden_template_name" {
     (UEFI) by install-helpers/setup-xcp-golden-template.sh. Set to "" to make the
     build-VM resources inert (count 0) — useful for a connectivity-only plan.
   EOT
+  # MDE-VM-golden-tc is the toolchained bake (rustc/cargo/generate-rpm/mold
+  # pre-installed in /home/mm/.cargo) so an elastic clone is build-ready at
+  # first boot with no ~15-min toolchain step — what makes scale-from-zero
+  # practical. Plain MDE-VM-golden (no toolchain) is the fallback.
   type        = string
-  default     = "MDE-VM-golden"
+  default     = "MDE-VM-golden-tc"
 }
 
 # --- FARM-AUTOSCALE shape model (docs/design/farm-autoscale.md, FA-1) ---
