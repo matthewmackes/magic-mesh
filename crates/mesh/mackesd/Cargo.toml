@@ -394,6 +394,10 @@ assets = [
     # shared-state volume over the overlay, boot-durable. Run per-node with
     # --master/--chunkserver/--client (see the script header).
     { source = "install-helpers/setup-qnm-shared.sh",    dest = "/usr/libexec/mackesd/setup-qnm-shared",        mode = "755" },
+    # BOOT-XPA8-4 — the robust QNM-Shared mount loop, shipped so qnm-shared.service
+    # just calls it (the loop logic updates with every RPM upgrade instead of
+    # being baked inline in the unit or sed-patched in post_install).
+    { source = "install-helpers/qnm-mount.sh",           dest = "/usr/libexec/mackesd/qnm-mount",               mode = "755" },
     # SUBSTRATE-1 (SUBSTRATE-V2) — the etcd coordination cluster: overlay-bound
     # leader/directory/health. Run per-node with --init/--join/--client-only.
     # The unit only starts where setup-etcd.sh wrote /etc/etcd/etcd.env (members).
@@ -544,6 +548,28 @@ if [ -f /etc/systemd/system/qnm-shared.service ]; then
   # BOOT-XPA8-2 — back off the mount-retry so a disconnected node doesn't spin
   # the loop every 5s (it can never mount off-mesh; mackesd self-heals it).
   sed -i 's/^RestartSec=5$/RestartSec=30/' /etc/systemd/system/qnm-shared.service || :
+  # BOOT-XPA8-4 — migrate the inline mount loop onto the shipped script. Older
+  # nodes have the loop baked into the unit's ExecStart= heredoc, so a loop fix
+  # never reached them without a setup-qnm-shared re-run or an even-more-fragile
+  # multi-line sed of the unit body. Drop in a clean [Service] override that
+  # resets ExecStart/ExecStop and points them at /usr/libexec/mackesd/qnm-mount
+  # (which the RPM just (re)installed) — idiomatic, no sed of the generated body,
+  # and every future loop fix lands by replacing the shipped script alone. The
+  # script reads QNM_PATH/MASTER_IP from the env (the new unit sets them) or
+  # falls back to /etc/mackesd-qnm-master + /mnt/mesh-storage, so a legacy node
+  # with no Environment= still resolves the same master it always mounted.
+  if [ -x /usr/libexec/mackesd/qnm-mount ]; then
+    install -d -m 0755 /etc/systemd/system/qnm-shared.service.d
+    cat > /etc/systemd/system/qnm-shared.service.d/10-xpa8-4-shipped-loop.conf <<'DROPIN'
+[Service]
+# BOOT-XPA8-4: reset the (possibly inline) ExecStart/ExecStop and call the
+# shipped mount loop, so the logic updates with every RPM upgrade.
+ExecStart=
+ExecStart=/usr/libexec/mackesd/qnm-mount mount
+ExecStop=
+ExecStop=/usr/libexec/mackesd/qnm-mount unmount
+DROPIN
+  fi
 fi
 if [ -f /etc/systemd/system/mackesd.service.d/20-qnm.conf ]; then
   sed -i '/^After=qnm-shared.service/d' /etc/systemd/system/mackesd.service.d/20-qnm.conf || :
@@ -732,6 +758,8 @@ assets = [
     { source = "install-helpers/mesh-alert.sh",          dest = "/usr/libexec/mackesd/mesh-alert",              mode = "755" },
     # ONBOARD-6 / SUBSTRATE — the QNM-Shared + etcd + Syncthing substrate.
     { source = "install-helpers/setup-qnm-shared.sh",    dest = "/usr/libexec/mackesd/setup-qnm-shared",        mode = "755" },
+    # BOOT-XPA8-4 — the shipped QNM-Shared mount loop (see the full-variant note).
+    { source = "install-helpers/qnm-mount.sh",           dest = "/usr/libexec/mackesd/qnm-mount",               mode = "755" },
     { source = "install-helpers/setup-etcd.sh",          dest = "/usr/libexec/mackesd/setup-etcd",              mode = "755" },
     { source = "packaging/systemd/etcd.service",         dest = "/etc/systemd/system/etcd.service",             mode = "644" },
     { source = "install-helpers/setup-syncthing.sh",     dest = "/usr/libexec/mackesd/setup-syncthing",         mode = "755" },
