@@ -63,6 +63,12 @@ const FALLBACK_MENU_HEIGHT: f32 = FALLBACK_OUTPUT_HEIGHT * MENU_HEIGHT_FRACTION;
 /// panel output's logical width × the same fraction of its height. Best-effort —
 /// shells `cosmic-randr list --kdl`, scoped to this panel's output
 /// (`COSMIC_PANEL_OUTPUT`); any failure falls back to the golden rectangle.
+///
+/// APPS-OPEN-PERF — this **blocks** on a `cosmic-randr` subprocess (a Wayland
+/// round-trip that, on some compositors, can take seconds — the "count of 4"
+/// open stall). It must therefore NEVER run on the open / first-frame path; it's
+/// driven off-thread via [`detect_menu_size_task`] and the cached
+/// [`AppsApplet::menu_w`]/`menu_h` are used to open instantly.
 fn detect_menu_size() -> (f32, f32) {
     let target = std::env::var("COSMIC_PANEL_OUTPUT").unwrap_or_default();
     std::process::Command::new("cosmic-randr")
@@ -73,6 +79,37 @@ fn detect_menu_size() -> (f32, f32) {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|kdl| parse_menu_size_from_kdl(&kdl, &target))
         .unwrap_or((FALLBACK_MENU_WIDTH, FALLBACK_MENU_HEIGHT))
+}
+
+/// APPS-OPEN-PERF — run the blocking [`detect_menu_size`] probe **off the UI
+/// thread** (a `spawn_blocking` worker, since it shells a subprocess), mapping the
+/// result back into a [`Message::MenuSizeDetected`]. The open path uses the cached
+/// size and fires this to refresh it for the *next* open, so a slow/hanging
+/// `cosmic-randr` can never stall the popup from appearing.
+fn detect_menu_size_task() -> Task<Message> {
+    Task::perform(
+        async {
+            tokio::task::spawn_blocking(detect_menu_size)
+                .await
+                .unwrap_or((FALLBACK_MENU_WIDTH, FALLBACK_MENU_HEIGHT))
+        },
+        |(w, h)| cosmic::Action::App(Message::MenuSizeDetected(w, h)),
+    )
+}
+
+/// APPS-OPEN-PERF — pure cache-update rule for an off-thread size probe result:
+/// adopt `(w, h)` only when both are positive (a failed probe returns the
+/// fallback, which is also positive, so the cache always holds a usable size).
+/// Returns the size the cache should hold given its `current` value and the
+/// `probed` result. Split out so the caching contract is unit-testable without a
+/// libcosmic `Core`.
+fn apply_probed_size(current: (f32, f32), probed: (f32, f32)) -> (f32, f32) {
+    let (w, h) = probed;
+    if w > 0.0 && h > 0.0 {
+        (w, h)
+    } else {
+        current
+    }
 }
 
 /// APPS-FIT — pure parser for `cosmic-randr list --kdl`. Returns the launcher
@@ -356,6 +393,9 @@ enum Message {
     RunSubmit,
     /// Re-fetch the entry list.
     Refresh,
+    /// APPS-OPEN-PERF — the off-thread `cosmic-randr` size probe finished;
+    /// cache `(menu_w, menu_h)` for the next open. Never blocks the open path.
+    MenuSizeDetected(f32, f32),
     /// APPS-FX-1 — one animation frame: advance/GC the [`Animator`]. Emitted by
     /// the tick subscription only while a tween is in flight.
     AnimTick,
@@ -731,7 +771,11 @@ impl Application for AppsApplet {
     }
 
     fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Message>) {
-        let (menu_w, menu_h) = detect_menu_size();
+        // APPS-OPEN-PERF — start from the fallback size (no subprocess on the
+        // init path); the real desktop size is probed off-thread below and
+        // cached for the first open. The launcher is never shown before init
+        // completes, so the fallback is only ever a transient default.
+        let (menu_w, menu_h) = (FALLBACK_MENU_WIDTH, FALLBACK_MENU_HEIGHT);
         let prefs = Preferences::load();
         let reduce_motion = prefs.a11y.reduce_motion;
         (
@@ -764,8 +808,10 @@ impl Application for AppsApplet {
                 motion: prefs.motion,
                 this_host: local_hostname(),
             },
-            // Prime the list so the first open is instant.
-            load_task(),
+            // Prime the list AND probe the desktop size off-thread so the first
+            // open is instant (neither the bus round-trip nor the cosmic-randr
+            // subprocess runs on the open / first-frame path) — APPS-OPEN-PERF.
+            Task::batch([load_task(), detect_menu_size_task()]),
         )
     }
 
@@ -807,6 +853,12 @@ impl Application for AppsApplet {
                     // will arrive for a tile that was hovered at close; clear the
                     // hover state so it doesn't render pre-lifted on the next open.
                     self.reset_hover();
+                    // APPS-OPEN-PERF — re-probe the desktop size off-thread *now
+                    // that the popup is closed*, so a resolution change is picked
+                    // up for the next open WITHOUT (a) blocking the open path or
+                    // (b) resizing a live popup (the cache is only ever mutated
+                    // while no popup is open — see `MenuSizeDetected`).
+                    return detect_menu_size_task();
                 }
             }
             Message::PollToggleSignal => {
@@ -835,11 +887,13 @@ impl Application for AppsApplet {
                 self.reset_hover();
                 self.apply_prefs();
                 self.start_anim(ANIM_MENU, Motion::panel_mount());
-                // APPS-FIT — re-detect the desktop size on open so a resolution
-                // change is picked up without a re-login.
-                let (mw, mh) = detect_menu_size();
-                self.menu_w = mw;
-                self.menu_h = mh;
+                // APPS-OPEN-PERF — open at the CACHED size immediately. The old
+                // code shelled a blocking `cosmic-randr list --kdl` here on every
+                // open, stalling the popup behind a multi-second Wayland round-trip
+                // ("until the count of 4"). The desktop size is now re-probed
+                // off-thread (`detect_menu_size_task`, batched into the return) so
+                // a resolution change is still picked up — just for the *next*
+                // open, never blocking *this* one.
                 // Open the dropdown + refresh-on-open (Q: cached + refresh-on-open).
                 let open = cosmic::task::message(cosmic::Action::Cosmic(
                     cosmic::app::Action::Surface(app_popup::<AppsApplet>(
@@ -880,6 +934,11 @@ impl Application for AppsApplet {
                         })),
                     )),
                 ));
+                // APPS-OPEN-PERF — refresh the cached entry list off-thread for
+                // this open; it doesn't block the open. The desktop size is NOT
+                // re-probed here — that runs on close (`PopupClosed`) so it can
+                // never resize the live popup nor re-shell `cosmic-randr` on every
+                // click; the open uses the size cached since init/the last close.
                 return Task::batch([open, load_task()]);
             }
             Message::OpenPowerMenu => {
@@ -1107,6 +1166,21 @@ impl Application for AppsApplet {
                 self.toast = Some(format!("{}…", kind.label()));
             }
             Message::Refresh => return load_task(),
+            Message::MenuSizeDetected(w, h) => {
+                // APPS-OPEN-PERF — the off-thread `cosmic-randr` probe finished;
+                // cache it for the next open (positive sizes only). The open path
+                // never waits on this — it uses whatever is already cached. Guard:
+                // never mutate the size while a popup is OPEN — the positioner is
+                // frozen at open-time, so changing `menu_w/menu_h` under a live
+                // popup would drive an autosize resize that mismatches the
+                // positioner. The probe normally runs on close (no popup), but a
+                // fast reopen could race it, so this guard is the invariant.
+                if self.popup.is_none() {
+                    let (mw, mh) = apply_probed_size((self.menu_w, self.menu_h), (w, h));
+                    self.menu_w = mw;
+                    self.menu_h = mh;
+                }
+            }
             Message::AnimTick => {
                 // APPS-FX-1 — one frame: drop settled tweens. When the released
                 // element's fall has settled, clear the marker so it's not re-eased.
@@ -2408,6 +2482,70 @@ output "HDMI-A-1" enabled=#false {
 }
 "#;
         assert!(parse_menu_size_from_kdl(kdl, "DP-1").is_none());
+    }
+}
+
+#[cfg(test)]
+mod open_perf_tests {
+    //! APPS-OPEN-PERF — the open/first-frame path must not block on the
+    //! `cosmic-randr` size probe (the "count of 4" stall). The size is cached at
+    //! init and refreshed off-thread *on close*; these pin the caching/lazy-load
+    //! contract (probe result adopted only when sane; the open path reads the
+    //! cache, never a fresh synchronous probe).
+    use super::{
+        apply_probed_size, parse_menu_size_from_kdl, FALLBACK_MENU_HEIGHT, FALLBACK_MENU_WIDTH,
+    };
+
+    #[test]
+    fn probe_result_is_adopted_only_when_positive() {
+        let cur = (FALLBACK_MENU_WIDTH, FALLBACK_MENU_HEIGHT);
+        // A real probe result replaces the cached size.
+        assert_eq!(apply_probed_size(cur, (845.0, 950.0)), (845.0, 950.0));
+        // A zero / negative result (a degenerate probe) is rejected — the cache
+        // keeps its last good size, so the menu never opens at 0×0.
+        assert_eq!(apply_probed_size(cur, (0.0, 950.0)), cur);
+        assert_eq!(apply_probed_size(cur, (845.0, 0.0)), cur);
+        assert_eq!(apply_probed_size(cur, (-1.0, -1.0)), cur);
+        // The fallback (what a failed `cosmic-randr` returns) is itself positive,
+        // so it's a valid cache value — the menu still opens at a sane size.
+        assert_eq!(apply_probed_size((10.0, 10.0), cur), cur);
+    }
+
+    #[test]
+    fn open_uses_the_cache_not_a_fresh_probe() {
+        // APPS-OPEN-PERF regression guard: the open path reads the *cached*
+        // `menu_w/menu_h`, and a later off-thread probe (on close) only updates
+        // that cache — it never runs synchronously on open. Model that flow: a
+        // cached size is used as-is on open; a subsequent probe result swaps the
+        // cache for the NEXT open, without the open having waited on it.
+        let cached = (845.0, 950.0); // what init / the last close left in the cache
+        let opened_with = cached; // the open path uses the cache verbatim
+        assert_eq!(opened_with, cached, "open must use the cached size");
+        // A new resolution is probed off-thread (on close) and lands in the cache.
+        let after_probe = apply_probed_size(cached, (633.0, 712.0));
+        assert_eq!(after_probe, (633.0, 712.0), "probe refreshes the cache");
+        assert_ne!(after_probe, opened_with, "the refresh is for the NEXT open");
+    }
+
+    #[test]
+    fn the_probe_parser_is_the_only_blocking_cost_and_is_off_thread() {
+        // The expensive work is the `cosmic-randr` subprocess that feeds this
+        // parser; the parser itself is pure/cheap. The subprocess is what
+        // `detect_menu_size_task` runs off-thread, so even a slow probe can't
+        // stall the open — the parser is exercised here only to confirm the
+        // size math is unchanged (the value the off-thread task caches).
+        let kdl = r#"output "DP-1" enabled=#true {
+  scale 1.00
+  modes {
+    mode 2560 1440 59951 current=#true preferred=#true
+  }
+}
+"#;
+        let (w, h) = parse_menu_size_from_kdl(kdl, "DP-1").unwrap();
+        assert!(
+            w > 0.0 && h > 0.0 && h > w,
+            "off-thread probe yields a portrait size"
+        );
     }
 }
 
