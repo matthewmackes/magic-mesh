@@ -81,6 +81,29 @@ pub const DEFAULT_BUS_ROOT: &str = "~/.local/share/mde/bus";
 /// re-audited (the cycle guard in [`Persist::write`]).
 pub const AUDIT_TOPIC_PREFIX: &str = "audit/";
 
+/// BUS-AUDIT-FLOOD — whether a published topic warrants a metadata audit
+/// record (§8: "security events are hash-chain audited"). Audit records are
+/// EXEMPT from retention, so auditing must be reserved for control-plane
+/// **mutations + events** — never the high-frequency observational classes:
+/// `audit/*` (recursion guard), `state/*` status broadcasts, `reply/*`
+/// responses, and read-only query verbs (`get-*`, `list-*`, `peer-states`,
+/// `*-stats`, `mesh/directory`). Without this, a 2s music `get-state` poll
+/// grew `audit/<peer>` to 122k records / 479M on a 3.9G tmpfs `/run` (Eagle,
+/// 2026-06-24). Every mutation (play/enroll/revoke/provision/config/role/…)
+/// still audits — only reads/observations are skipped.
+#[must_use]
+pub fn is_auditable(topic: &str) -> bool {
+    !topic.starts_with(AUDIT_TOPIC_PREFIX)
+        && !topic.starts_with("state/")
+        && !topic.starts_with("reply/")
+        && !topic.contains("/get-")
+        && !topic.contains("/list-")
+        && !topic.ends_with("/list")
+        && !topic.contains("peer-states")
+        && !topic.ends_with("-stats")
+        && topic != "action/mesh/directory"
+}
+
 /// BUS-2.7 — a single notification action button: a `label` the
 /// notification surface renders, and a `url` (typically `mde://…`)
 /// dispatched via `mde-open` when the operator clicks it.
@@ -441,15 +464,23 @@ impl Persist {
         relax_db(&self.bus_root); // SETUP-fix: the INSERT (re)created sqlite -wal/-shm
 
         // BUS-7.1 + EPIC-BUS-EXT-AUDIT-BUS (Q28) — emit a metadata-only
-        // audit record to the `audit/<peer>` Bus topic (uniform
-        // substrate + trivial cross-peer visibility, replacing the old
-        // per-day JSONL). **Cycle guard:** audit records are NOT
-        // themselves audited — without this, the recursive write below
-        // would loop forever. Best-effort: a failed audit emit logs +
-        // carries on (the original message is already durably stored;
-        // the gap is recoverable from the SQLite index later) and never
-        // fails the caller's write.
-        if !topic.starts_with(AUDIT_TOPIC_PREFIX) {
+        // audit record to the `audit/<peer>` Bus topic. **Cycle guard:**
+        // audit records are NOT themselves audited. Best-effort: a failed
+        // audit emit logs + carries on (the original message is already
+        // durably stored) and never fails the caller's write.
+        //
+        // BUS-AUDIT-FLOOD fix (live on Eagle, 2026-06-24): audit only
+        // control-plane MUTATIONS + events (§8 — "security events are
+        // hash-chain audited"). Observational `state/*` broadcasts, read-only
+        // query verbs (`get-*`/`list-*`/`peer-states`/`*-stats`/`mesh/directory`)
+        // and their `reply/*` carry NO security value — and the `audit/<peer>`
+        // topic is EXEMPT from retention (see retention.rs), so auditing a
+        // chatty poller (music `get-state` @2s + the notify-center) grew it
+        // unbounded to 122k records / 479M on the 3.9G tmpfs `/run`, tripping
+        // the bus-full alert. Skipping the read/observational classes keeps the
+        // audit to real security/control events while every mutation is still
+        // recorded.
+        if is_auditable(topic) {
             let pid = publisher_id();
             let entry = crate::audit::AuditEntry {
                 publisher: pid.clone(),
@@ -1172,6 +1203,44 @@ mod tests {
         // ULIDs are monotonically increasing within a process.
         for w in rows.windows(2) {
             assert!(w[0].ulid < w[1].ulid, "ULID order broke: {w:?}");
+        }
+    }
+
+    #[test]
+    fn is_auditable_skips_observational_reads_but_keeps_mutations() {
+        // The flood classes observed live on Eagle (2026-06-24) must NOT audit:
+        for noisy in [
+            "audit/UNIT-EAGLE",       // recursion guard
+            "state/voice/status",     // observational broadcast
+            "state/boot-readiness",
+            "reply/abc",              // query response
+            "action/music/get-state", // the dominant poller (~36% of the flood)
+            "action/music/list-starred",
+            "action/music/list-frequent",
+            "action/music/peer-states",
+            "action/music/library-stats",
+            "action/clipboard/list",
+            "action/mesh/directory",
+        ] {
+            assert!(
+                !super::is_auditable(noisy),
+                "{noisy} must NOT be audited (read/observational)"
+            );
+        }
+        // Control-plane mutations + events MUST still be audited (§8):
+        for sec in [
+            "action/enroll/accept",
+            "action/ca/revoke",
+            "action/provision/spawn",
+            "action/music/play",
+            "action/role/pin",
+            "event/security/alert",
+            "action/connect/expose",
+        ] {
+            assert!(
+                super::is_auditable(sec),
+                "{sec} must still be audited (mutation/event)"
+            );
         }
     }
 }
