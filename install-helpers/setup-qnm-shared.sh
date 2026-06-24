@@ -167,16 +167,24 @@ if [ "$DO_CLIENT" = 1 ]; then
     log "enabled user_allow_other in /etc/fuse.conf"
   fi
   # A oneshot mount unit ordered after nebula; mackesd is made to wait on it so
-  # it never reads a not-yet-mounted QNM-Shared. ExecStartPre waits for the
-  # overlay master to answer so a boot race can't fail the mount.
+  # it never reads a not-yet-mounted QNM-Shared.
+  #
+  # BOOT-XPA8-4 — the robust mount loop lives in the SHIPPED libexec script
+  # /usr/libexec/mackesd/qnm-mount (install-helpers/qnm-mount.sh), NOT inline in
+  # this heredoc. The unit just calls it. WHY: inline, every loop fix (BOOT-REC-2
+  # retry, LH-JOIN-QNM-1 wedge-proofing, BOOT-XPA8-3 race-fix) only reached an
+  # existing node via a setup-qnm-shared re-run or a fragile in-place sed of the
+  # unit; shipped, the logic updates with every RPM upgrade and ExecStart is a
+  # stable one-liner that never needs sed-patching. Config is passed via
+  # Environment= (path + master ip) so the script needs no per-node baked args.
   cat > /etc/systemd/system/qnm-shared.service <<EOF
 [Unit]
 Description=Mount the QNM-Shared LizardFS volume over the overlay
 After=nebula.service network-online.target
 Wants=nebula.service
 # XPA-8 (2026-06-17): do NOT order before mackesd. This unit RETRIES the mount
-# for up to ~2 min and Restart=on-failure loops it; a hard `Before=mackesd`
-# (and the matching `After=qnm-shared` drop-in) made mackesd's start job QUEUE
+# for up to ~2 min and Restart=on-failure loops it; a hard \`Before=mackesd\`
+# (and the matching \`After=qnm-shared\` drop-in) made mackesd's start job QUEUE
 # behind it and, on a node where the mount can't yet succeed (e.g. fuse-libs
 # missing — XPA-9), mackesd NEVER started (silent "inactive", no journal).
 # mackesd self-heals the mount via meshfs_worker + BOOT-REC, so it must start
@@ -188,23 +196,14 @@ StartLimitIntervalSec=0
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# BOOT-REC-2: a cold boot brings nebula + the LizardFS master up AFTER this unit
-# is first scheduled, so RETRY the actual mount until it succeeds (the master
-# becomes reachable a few seconds into boot). A portable POSIX loop — no bashism
-# (/dev/tcp is unavailable under /bin/sh=dash, which made the old probe spin the
-# full timeout and block mackesd). Bounded ~2 min; on a genuinely-down master it
-# exits non-zero → Restart + the mesh-health watchdog keep retrying.
-# LH-JOIN-QNM-1 (2026-06-20): wedge-proof. Every check that touches the mount is
-# timeout-guarded so a half-formed/stale FUSE mount in uninterruptible D-state
-# (mfsmount daemon gone, kernel entry lingering) can NEVER hang the loop; the
-# recovery uses lazy fusermount-uz + umount-l so it actually detaches a wedged
-# mount (plain -u cannot). A fresh remote lighthouse join hit exactly this
-# (mackesd, started Wants-only per XPA-8, writes stray into the unmounted path,
-# mfsmount over non-empty half-succeeds-then-dies, wedge that survives reboot).
-# NOTE: no backticks in these heredoc comments — this is an unquoted heredoc, so
-# a backticked command would be run at write-time (it broke the first attempt).
-ExecStart=/bin/sh -c 'i=0; while [ \$i -lt 15 ]; do timeout 6 mountpoint -q $QNM_PATH && exit 0; fusermount -uz $QNM_PATH 2>/dev/null; umount -l $QNM_PATH 2>/dev/null; pkill -f "mfsmount $QNM_PATH" 2>/dev/null; sleep 1; if [ -n "\$(timeout 6 ls -A $QNM_PATH 2>/dev/null)" ]; then d=/var/lib/mde/qnm-stray-\$(date +%s 2>/dev/null || echo bk); mkdir -p \$d; mv $QNM_PATH/* $QNM_PATH/.[!.]* \$d/ 2>/dev/null; fi; mfsmount $QNM_PATH -H $MASTER_IP -o allow_other,nonempty 2>/dev/null; sleep 3; timeout 6 mountpoint -q $QNM_PATH && exit 0; i=\$((i+1)); sleep 2; done; exit 1'
-ExecStop=/bin/sh -c 'fusermount -uz $QNM_PATH 2>/dev/null; umount -l $QNM_PATH 2>/dev/null; true'
+# BOOT-XPA8-4: the boot-race-proof retry loop (BOOT-REC-2) + the wedge-proofing
+# (LH-JOIN-QNM-1) + the race-fix (BOOT-XPA8-3) all live in the shipped script.
+# Pass this node's mount point + overlay master via the environment so the
+# script stays generic and the same shipped logic serves every node.
+Environment=QNM_PATH=$QNM_PATH
+Environment=MASTER_IP=$MASTER_IP
+ExecStart=/usr/libexec/mackesd/qnm-mount mount
+ExecStop=/usr/libexec/mackesd/qnm-mount unmount
 # LH-JOIN-QNM-1: bound the start job ABOVE the loop's worst case. WITHOUT this,
 # systemd's default 90s TimeoutStartSec fired mid-loop and SIGKILLed the mount
 # script ("fatal signal delivered to the control process"), leaving a wedged
