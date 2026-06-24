@@ -62,6 +62,26 @@ pub fn creds_ref_for(ifname: &str) -> String {
     format!("vpn/{ifname}")
 }
 
+/// XCP-7 — derive the secret-store key for a dom0's XAPI/root credential from
+/// its host address. The `xcp/` prefix namespaces these alongside the `vpn/`
+/// tunnel creds (the design's `<QNM-Shared>/secrets/xcp/<host>.age` intent), so
+/// any authorized node resolves `xcp/<host>` → reads the ciphertext → decrypts
+/// the dom0 password. Pure + stable: this string IS the on-disk / etcd key, so a
+/// change orphans every stored credential.
+///
+/// `host` is sanitized to the address charset (alnum, `.`, `-`, `:`) so a stray
+/// separator can't widen the key namespace; the `vpn/` half quotes defensively
+/// for the same reason ([`shell_quote`]).
+#[must_use]
+pub fn xcp_creds_ref(host: &str) -> String {
+    let safe: String = host
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '_'))
+        .collect();
+    format!("xcp/{safe}")
+}
+
 /// A keyed, encrypted, distribution-capable secret store. Both backends do real
 /// encryption; the choice is driven by what the node can reach (see
 /// [`SecretStore::resolve`]).
@@ -372,6 +392,51 @@ mod tests {
     #[test]
     fn creds_ref_namespaces_under_vpn() {
         assert_eq!(creds_ref_for("mvpn-mullvad1"), "vpn/mvpn-mullvad1");
+    }
+
+    #[test]
+    fn xcp_creds_ref_namespaces_under_xcp_and_sanitizes() {
+        // The dom0 address keys the credential under xcp/<host>.
+        assert_eq!(xcp_creds_ref("172.20.0.4"), "xcp/172.20.0.4");
+        // A hostname / overlay address with a port is preserved.
+        assert_eq!(xcp_creds_ref("dom0.lab.local:22"), "xcp/dom0.lab.local:22");
+        // Whitespace is trimmed and stray separators that could widen the key
+        // namespace (a `/`, a space) are dropped.
+        assert_eq!(xcp_creds_ref("  10.0.0.5 "), "xcp/10.0.0.5");
+        assert_eq!(xcp_creds_ref("a/b c"), "xcp/abc");
+    }
+
+    #[test]
+    fn xcp_credential_round_trips_through_the_store() {
+        // XCP-7: a dom0 XAPI/root password stored under xcp/<host> reads back
+        // decrypted, byte-for-byte, and is honestly absent before it's stored.
+        let (_t, store) = local_store();
+        let name = xcp_creds_ref("172.20.0.4");
+        assert_eq!(store.get(&name).unwrap(), None, "absent before set");
+        let password = "dom0-XAPI-r00t-pw!";
+        store.put(&name, password).unwrap();
+        assert_eq!(store.get(&name).unwrap().as_deref(), Some(password));
+        // A different dom0's slot is independent + still honestly absent.
+        assert_eq!(store.get(&xcp_creds_ref("172.20.0.5")).unwrap(), None);
+    }
+
+    #[test]
+    fn xcp_credential_ciphertext_on_disk_is_not_plaintext() {
+        // The dom0 password never appears in the at-rest ciphertext file.
+        let (_t, store) = local_store();
+        let name = xcp_creds_ref("172.20.0.9");
+        let password = "PLAINTEXT-SHOULD-NOT-LEAK";
+        store.put(&name, password).unwrap();
+        let SecretStore::LocalAead { dir, .. } = &store else {
+            unreachable!()
+        };
+        let raw = std::fs::read(local_secret_path(dir, &name)).unwrap();
+        assert!(
+            !raw.windows(password.len())
+                .any(|w| w == password.as_bytes()),
+            "dom0 password leaked into the at-rest secret file"
+        );
+        assert_eq!(&raw[..4], crate::ca::backup::BUNDLE_MAGIC);
     }
 
     #[test]

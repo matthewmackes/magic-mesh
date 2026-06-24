@@ -19,11 +19,12 @@
 
 use std::time::Duration;
 
-use cosmic::iced::widget::{column, pick_list, row, scrollable, text, Space};
-use cosmic::iced::{Length, Task};
+use cosmic::iced::widget::{column, pick_list, row, scrollable, text, text_input, Space};
+use cosmic::iced::{Length, Padding, Task};
 use cosmic::Element;
 use mde_theme::{EmptyState, Icon};
 
+use crate::components::connect_progress::{self, ConnectProgress};
 use crate::controls::{styled_text_input, variant_button, ButtonVariant};
 // `.colr()` (TextSty) + `.into_cosmic_color()` (IntoIcedColor) extension traits —
 // the same Carbon-token color path the sibling panels thread through.
@@ -48,6 +49,10 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 /// polls for the guest IP (up to its own 90 s window). Cover the full flow.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Set/rotate-credential budget — an age-encrypt + a store write (etcd or local
+/// AEAD). A few seconds is ample; give the same headroom as a destroy.
+const SET_CREDS_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Action topic the `list` probe queries.
 const LIST_TOPIC: &str = "action/provision/list";
 /// Action topic the `hosts` probe queries.
@@ -58,6 +63,8 @@ const DESTROY_TOPIC: &str = "action/provision/destroy";
 const START_TOPIC: &str = "action/provision/start";
 /// Action topic a spawn fires.
 const SPAWN_TOPIC: &str = "action/provision/spawn";
+/// XCP-7 — action topic the set/rotate-credential button fires.
+const SET_CREDS_TOPIC: &str = "action/provision/set-creds";
 /// Reply-topic prefix the spawn responder acks on (suffix = the request ULID we
 /// mint and put in the body, so we know where to await).
 const SPAWN_ACK_PREFIX: &str = "action/provision/spawn-ack/";
@@ -128,6 +135,15 @@ pub struct ProvisioningPanel {
     /// Set when the LOAD itself failed (vs a legitimately empty roster) — the
     /// view then renders the error state, never the misleading empty state.
     pub load_error: Option<String>,
+    /// XCP-7 — set/rotate-credential form: the dom0 the credential is for; `None`
+    /// ⇒ default to the first reachable host (mirrors `spawn_host`).
+    pub cred_host: Option<String>,
+    /// XCP-7 — the password typed into the credential form (masked input). Held
+    /// only until the Set button fires it to the daemon, then cleared.
+    pub cred_password: String,
+    /// XCP-7 — the set/rotate-credential progress modal (pending → success /
+    /// failure), reusing the shared `connect_progress` chrome.
+    pub cred_modal: ConnectProgress,
 }
 
 #[derive(Debug, Clone)]
@@ -137,9 +153,25 @@ pub enum Message {
     SpawnNameChanged(String),
     SpawnHostSelected(String),
     SpawnClicked,
-    DestroyClicked { name: String, host: String },
-    StartClicked { name: String, host: String },
+    DestroyClicked {
+        name: String,
+        host: String,
+    },
+    StartClicked {
+        name: String,
+        host: String,
+    },
     OperationFinished(Result<String, String>),
+    // XCP-7 — set/rotate a dom0's XAPI/root credential.
+    CredHostSelected(String),
+    CredPasswordChanged(String),
+    SetCredsClicked,
+    /// The store write finished — `Ok(host)` / `Err(message)`, resolving the modal.
+    CredFinished(Result<String, String>),
+    /// Dismiss the credential modal (Dismiss button / backdrop click).
+    CredDismiss,
+    /// Retry the credential write from the modal's Failure state.
+    CredRetry,
 }
 
 impl ProvisioningPanel {
@@ -180,6 +212,17 @@ impl ProvisioningPanel {
                         .iter()
                         .find(|h| h.reachable())
                         .map(|h| h.host.clone());
+                }
+                // XCP-7: same defaulting for the credential-form host picker. A
+                // credential can target ANY allow-listed host (even one whose
+                // capacity probe failed — that's often exactly why it needs a
+                // password), so the pick is validated against the full roster.
+                let cred_valid = self
+                    .cred_host
+                    .as_deref()
+                    .is_some_and(|h| self.hosts.iter().any(|host| host.host == h));
+                if !cred_valid {
+                    self.cred_host = self.hosts.first().map(|h| h.host.clone());
                 }
                 if self.status.is_empty() {
                     self.status = format!(
@@ -273,7 +316,75 @@ impl ProvisioningPanel {
                 // Reload the rosters to reflect the new state.
                 Self::load()
             }
+            Message::CredHostSelected(h) => {
+                self.cred_host = Some(h);
+                Task::none()
+            }
+            Message::CredPasswordChanged(v) => {
+                self.cred_password = v;
+                Task::none()
+            }
+            Message::SetCredsClicked => self.fire_set_creds(),
+            Message::CredRetry => self.fire_set_creds(),
+            Message::CredFinished(result) => {
+                // Ignore a late result for a modal the operator already dismissed
+                // (Dismiss → Closed before the in-flight store write landed) — a
+                // resolved-then-closed modal must not pop back open titleless.
+                if !self.cred_modal.is_pending() {
+                    return Task::none();
+                }
+                self.cred_modal = match result {
+                    Ok(host) => {
+                        // Stored — clear the password now (and only now), so a
+                        // failure path keeps it for an in-place Retry.
+                        self.cred_password.clear();
+                        self.cred_modal
+                            .success(format!("Credential stored for {host}."))
+                    }
+                    Err(e) => self.cred_modal.failure(e),
+                };
+                Task::none()
+            }
+            Message::CredDismiss => {
+                self.cred_modal = ConnectProgress::Closed;
+                // Drop the password on dismiss too — the operator walked away, so
+                // the GUI keeps no copy of an un-stored credential.
+                self.cred_password.clear();
+                Task::none()
+            }
         }
+    }
+
+    /// XCP-7 — fire `action/provision/set-creds` for the chosen dom0 with the
+    /// typed password, opening the progress modal. Shared by the Set button and
+    /// the modal's Retry. The password is CLONED into the blocking task (not
+    /// taken), so the field survives a failure for an in-place Retry; it is
+    /// cleared only once the store write succeeds ([`Message::CredFinished`]) or
+    /// the modal is dismissed, so the GUI never retains a stored/abandoned secret.
+    fn fire_set_creds(&mut self) -> Task<crate::Message> {
+        let Some(host) = self.cred_host.clone() else {
+            self.cred_modal = ConnectProgress::pending("Set dom0 credential", "")
+                .failure("Pick a dom0 host first.");
+            return Task::none();
+        };
+        if self.cred_password.is_empty() {
+            self.cred_modal = ConnectProgress::pending("Set dom0 credential", "")
+                .failure("Enter the dom0 password first.");
+            return Task::none();
+        }
+        let password = self.cred_password.clone();
+        self.cred_modal = ConnectProgress::pending(
+            "Set dom0 credential",
+            format!("Encrypting + storing the credential for {host}…"),
+        );
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || set_dom0_creds(&host, &password))
+                    .await
+                    .unwrap_or_else(|_| Err("set-creds task panicked".into()))
+            },
+            |res| crate::Message::Provisioning(Message::CredFinished(res)),
+        )
     }
 
     pub fn view(&self) -> Element<'_, crate::Message> {
@@ -291,6 +402,13 @@ impl ProvisioningPanel {
         }
 
         let spawn_form = section_block("Spawn an MDE-VM", self.spawn_form(), palette, density);
+        // XCP-7 — the set/rotate dom0-credential form.
+        let cred_form = section_block(
+            "dom0 credential (XAPI / root)",
+            self.cred_form(),
+            palette,
+            density,
+        );
 
         let roster: Element<'_, crate::Message> = if self.vms.is_empty() {
             let state = EmptyState::with_cta(
@@ -323,11 +441,25 @@ impl ProvisioningPanel {
         .spacing(12)
         .align_y(cosmic::iced::alignment::Vertical::Center);
 
-        let body = column![header, spawn_form, roster, text(&self.status).size(13),]
-            .spacing(16)
-            .width(Length::Fill);
+        let body = column![
+            header,
+            spawn_form,
+            cred_form,
+            roster,
+            text(&self.status).size(13),
+        ]
+        .spacing(16)
+        .width(Length::Fill);
 
-        panel_container(body.into(), density)
+        // XCP-7 — stack the set/rotate-credential progress modal over the panel
+        // body while a store write is in flight or showing its outcome.
+        connect_progress::overlay(
+            &self.cred_modal,
+            panel_container(body.into(), density),
+            palette,
+            crate::Message::Provisioning(Message::CredRetry),
+            crate::Message::Provisioning(Message::CredDismiss),
+        )
     }
 
     /// The name input + host picker + Spawn button.
@@ -371,6 +503,60 @@ impl ProvisioningPanel {
         );
 
         row![name_input, host_picker, spawn_btn,]
+            .spacing(12)
+            .align_y(cosmic::iced::alignment::Vertical::Center)
+            .into()
+    }
+
+    /// XCP-7 — the host picker + masked password input + Set button to store /
+    /// rotate a dom0's XAPI/root credential into the mesh secret store. The
+    /// credential is needed for hosts the mesh key can't reach (a freshly
+    /// enrolled dom0); once stored, any authorized node drives that host without
+    /// the password ever touching a process listing.
+    fn cred_form(&self) -> Element<'_, crate::Message> {
+        let palette = crate::live_theme::palette();
+
+        // A credential can target ANY allow-listed dom0 (even one whose capacity
+        // probe failed — that's often why it needs a password), so the picker
+        // offers the full roster, not just the reachable subset.
+        let host_choices: Vec<String> = self.hosts.iter().map(|h| h.host.clone()).collect();
+
+        let host_picker: Element<'_, crate::Message> = if host_choices.is_empty() {
+            text("no dom0 configured (set MCNF_XEN_DOM0S)")
+                .size(13)
+                .colr(palette.text_muted.into_cosmic_color())
+                .into()
+        } else {
+            pick_list(host_choices, self.cred_host.clone(), |v| {
+                crate::Message::Provisioning(Message::CredHostSelected(v))
+            })
+            .into()
+        };
+
+        // Masked password input (mirrors the SIP-gateway secret field). The value
+        // lives in panel state only until Set fires it, then it is cleared.
+        let password_input = text_input("dom0 password", &self.cred_password)
+            .secure(true)
+            .on_input(|v| crate::Message::Provisioning(Message::CredPasswordChanged(v)))
+            .padding(Padding {
+                top: 0.0,
+                right: 10.0,
+                bottom: 0.0,
+                left: 10.0,
+            })
+            .size(13);
+
+        let can_set = !self.cred_password.is_empty()
+            && self.cred_host.is_some()
+            && !self.cred_modal.is_pending();
+        let set_btn = variant_button(
+            "Set / rotate",
+            ButtonVariant::Secondary,
+            can_set.then_some(crate::Message::Provisioning(Message::SetCredsClicked)),
+            palette,
+        );
+
+        row![host_picker, password_input, set_btn,]
             .spacing(12)
             .align_y(cosmic::iced::alignment::Vertical::Center)
             .into()
@@ -503,6 +689,30 @@ fn named_vm_action(
         return Err(format!("{done} failed: {e}"));
     }
     Ok(format!("{} {name}.", capitalize(done)))
+}
+
+/// XCP-7 — fire `action/provision/set-creds` to seal `password` for dom0 `host`
+/// into the mesh secret store. Blocking (the Bus client builds its own runtime) —
+/// call from `spawn_blocking`. Returns the host on success.
+///
+/// The password rides only in the request body (the bus is the local replicated
+/// store, not a process argv); on success the reply carries the host, never the
+/// secret, so nothing here logs or echoes the credential.
+fn set_dom0_creds(host: &str, password: &str) -> Result<String, String> {
+    let body = serde_json::json!({ "host": host, "password": password });
+    let reply = crate::dbus::action_request_with_body(
+        SET_CREDS_TOPIC,
+        Some(&body.to_string()),
+        SET_CREDS_TIMEOUT,
+    )
+    .ok_or("mackesd not reachable over the Bus (set-creds)")?;
+    if let Some(e) = reply_error(&reply) {
+        return Err(format!("set-creds failed: {e}"));
+    }
+    // The reply only echoes the host we already sent (the daemon stores no new
+    // info we need back), so — like the destroy/start verbs (`named_vm_action`) —
+    // we return the requested host without re-parsing the success payload.
+    Ok(host.to_string())
 }
 
 /// Fire `action/provision/destroy` for `name` on `host`.
@@ -765,5 +975,129 @@ mod tests {
         let id = mint_request_id();
         assert!(!id.is_empty());
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ── XCP-7 set/rotate dom0 credential ──
+
+    #[test]
+    fn loaded_defaults_cred_host_to_first_host_even_if_unreachable() {
+        let mut p = ProvisioningPanel::new();
+        let _ = p.update(Message::Loaded(Ok(Loaded {
+            vms: vec![],
+            hosts: vec![HostCard {
+                host: "172.20.0.4".into(),
+                // An UNREACHABLE host is still a valid credential target — that's
+                // typically exactly why it needs a password set.
+                error: Some("unreachable".into()),
+                ..HostCard::default()
+            }],
+        })));
+        assert_eq!(p.cred_host.as_deref(), Some("172.20.0.4"));
+    }
+
+    #[test]
+    fn set_creds_without_password_opens_modal_failure_no_fire() {
+        let mut p = ProvisioningPanel::new();
+        p.cred_host = Some("172.20.0.4".into());
+        // No password typed → an immediate, honest modal failure (no bus fire).
+        let _ = p.update(Message::SetCredsClicked);
+        assert!(matches!(p.cred_modal, ConnectProgress::Failure { .. }));
+    }
+
+    #[test]
+    fn set_creds_without_host_opens_modal_failure() {
+        let mut p = ProvisioningPanel::new();
+        p.cred_host = None;
+        p.cred_password = "pw".into();
+        let _ = p.update(Message::SetCredsClicked);
+        assert!(matches!(p.cred_modal, ConnectProgress::Failure { .. }));
+    }
+
+    #[test]
+    fn set_creds_keeps_password_on_fire_for_retry_clears_on_success() {
+        // With a host + password the modal goes Pending; the password is RETAINED
+        // (cloned, not taken) so a Failure → Retry can re-fire it in place.
+        let mut p = ProvisioningPanel::new();
+        p.cred_host = Some("172.20.0.4".into());
+        p.cred_password = "dom0-secret".into();
+        let _ = p.update(Message::SetCredsClicked);
+        assert!(p.cred_modal.is_pending(), "modal should be pending");
+        assert_eq!(
+            p.cred_password, "dom0-secret",
+            "the password must survive the fire so Retry works"
+        );
+        // A success clears the field (the daemon now holds the sealed copy).
+        let _ = p.update(Message::CredFinished(Ok("172.20.0.4".into())));
+        assert!(matches!(p.cred_modal, ConnectProgress::Success { .. }));
+        assert!(
+            p.cred_password.is_empty(),
+            "the password is cleared once it's been stored"
+        );
+    }
+
+    #[test]
+    fn cred_retry_after_failure_re_fires_the_still_present_password() {
+        // The failure path keeps the password so Retry works in place (the modal
+        // is back to Pending after Retry, NOT a 'enter the password first' bounce).
+        let mut p = ProvisioningPanel::new();
+        p.cred_host = Some("172.20.0.4".into());
+        p.cred_password = "dom0-secret".into();
+        let _ = p.update(Message::SetCredsClicked);
+        let _ = p.update(Message::CredFinished(Err(
+            "set-creds failed: etcd down".into()
+        )));
+        assert!(matches!(p.cred_modal, ConnectProgress::Failure { .. }));
+        assert_eq!(p.cred_password, "dom0-secret", "password kept for retry");
+        // Retry re-fires (modal back to Pending), not a validation bounce.
+        let _ = p.update(Message::CredRetry);
+        assert!(p.cred_modal.is_pending(), "retry should re-fire, not bounce");
+    }
+
+    #[test]
+    fn cred_finished_for_a_dismissed_modal_is_ignored() {
+        // A late result for a modal the operator already dismissed must NOT pop a
+        // (titleless) dialog back open.
+        let mut p = ProvisioningPanel::new();
+        p.cred_modal = ConnectProgress::Closed;
+        let _ = p.update(Message::CredFinished(Ok("172.20.0.4".into())));
+        assert!(!p.cred_modal.is_open(), "a closed modal stays closed");
+        let _ = p.update(Message::CredFinished(Err("etcd down".into())));
+        assert!(!p.cred_modal.is_open());
+    }
+
+    #[test]
+    fn cred_finished_resolves_the_modal_success_and_failure() {
+        let mut p = ProvisioningPanel::new();
+        p.cred_modal = ConnectProgress::pending("Set dom0 credential", "Storing…");
+        let _ = p.update(Message::CredFinished(Ok("172.20.0.4".into())));
+        match &p.cred_modal {
+            ConnectProgress::Success { message, .. } => {
+                assert!(message.contains("172.20.0.4"));
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+        // A failure resolves to the Failure state surfacing the error.
+        p.cred_modal = ConnectProgress::pending("Set dom0 credential", "Storing…");
+        let _ = p.update(Message::CredFinished(Err(
+            "set-creds failed: etcd down".into()
+        )));
+        match &p.cred_modal {
+            ConnectProgress::Failure { error, .. } => assert!(error.contains("etcd down")),
+            other => panic!("expected Failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cred_dismiss_closes_the_modal_and_drops_the_password() {
+        let mut p = ProvisioningPanel::new();
+        p.cred_password = "unsaved-secret".into();
+        p.cred_modal =
+            ConnectProgress::pending("Set dom0 credential", "Storing…").failure("etcd down");
+        let _ = p.update(Message::CredDismiss);
+        assert!(!p.cred_modal.is_open());
+        assert!(
+            p.cred_password.is_empty(),
+            "dismiss drops the un-stored credential"
+        );
     }
 }
