@@ -724,7 +724,10 @@ fn apply_transport(
                 return json!({ "ok": false, "error": "no Airsonic server configured" })
                     .to_string();
             };
-            // Gapless album: hand the engine current..end in one list.
+            // Gapless album: hand the engine current..end in one list. The
+            // base cursor lets the AIR-2.c auto-advance driver map the audible
+            // track back to the right queue index as playback crosses gapless
+            // boundaries.
             let upcoming: Vec<(String, SourceCodec)> = queue
                 .songs
                 .iter()
@@ -734,7 +737,7 @@ fn apply_transport(
             if upcoming.is_empty() {
                 return json!({ "ok": false, "error": "queue is empty" }).to_string();
             }
-            engine.play(upcoming);
+            engine.play_from(upcoming, queue.current);
             let song = queue.current().unwrap_or("");
             write_playback_state(true, song, 0);
             json!({ "ok": true, "playing": true, "song_id": song }).to_string()
@@ -822,6 +825,48 @@ pub fn poll_transport(
                 Some(&reply),
             );
         }
+    }
+}
+
+/// AIR-2.c — the queue index of the currently-audible track.
+///
+/// The play-start base cursor plus how many gapless track boundaries the engine
+/// has crossed, clamped into the queue. A pure function so the boundary math is
+/// unit-tested.
+#[must_use]
+pub fn audible_cursor(play_base: usize, track_index: usize, queue_len: usize) -> usize {
+    if queue_len == 0 {
+        return 0;
+    }
+    play_base.saturating_add(track_index).min(queue_len - 1)
+}
+
+/// AIR-2.c — the queue-driver. As gapless album playback crosses each track
+/// boundary the engine's audible-track index advances, but the persisted queue
+/// cursor (the now-playing `song_id` the GUI + the AIR-8 heartbeat report) was
+/// pinned to the track that was current when Play was pressed. This runs every
+/// serve sweep: when the engine is active and the audible track has moved past
+/// the persisted cursor, it advances + persists the cursor so the now-playing
+/// surface tracks the song you actually hear. No-op when idle or unchanged.
+fn advance_queue_cursor(engine: Option<&Engine>, queue_path: &Path) {
+    let Some(engine) = engine else { return };
+    if !engine.is_active() {
+        return;
+    }
+    let mut queue = queue::read_from(queue_path);
+    let want = audible_cursor(
+        engine.play_base(),
+        engine.current_track_index(),
+        queue.songs.len(),
+    );
+    // Forward-only: the engine plays its list strictly front-to-back, so the
+    // driver only ever pushes the cursor FORWARD. This bounds the blast radius of
+    // any base/queue skew (a mid-play queue edit, or a caller that mis-set the
+    // play base) — it can lag the audible track by a sweep but never yanks the
+    // now-playing cursor backward to an earlier song than the user already heard.
+    if want > queue.current && want < queue.songs.len() {
+        queue.current = want;
+        let _ = queue::write_to(queue_path, &queue);
     }
 }
 
@@ -969,6 +1014,10 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
         // of browse latency. (The Airsonic client also has connect/total
         // timeouts now so browse itself can't hang forever.)
         poll_once(&persist, queue_path, &mut cursors);
+        // AIR-2.c — advance the persisted queue cursor to the audible track as
+        // gapless playback crosses boundaries, BEFORE poll_transport so a
+        // get-state in this same sweep reports the song you actually hear.
+        advance_queue_cursor(engine.as_ref(), queue_path);
         // MUSIC-RESPONSIVE-10 — refresh the shared client once per sweep (cheap;
         // rebuilds only on a creds change) and hand it to both network pollers.
         let client = refresh_airsonic_client(&mut airsonic);
@@ -1144,6 +1193,24 @@ mod tests {
         assert_eq!(song_id_from(r#""s2""#).as_deref(), Some("s2"));
         assert_eq!(song_id_from("s3").as_deref(), Some("s3"));
         assert_eq!(song_id_from("  "), None);
+    }
+
+    #[test]
+    fn audible_cursor_advances_per_gapless_boundary() {
+        // AIR-2.c — Play started at queue index 2 (`play_base`), engine track 0.
+        // Queue has 5 songs. The audible queue index = base + engine track index.
+        assert_eq!(audible_cursor(2, 0, 5), 2); // still on the track Play began on
+        assert_eq!(audible_cursor(2, 1, 5), 3); // crossed one boundary
+        assert_eq!(audible_cursor(2, 2, 5), 4); // last song
+                                                // Never runs off the end of the queue (clamped to len-1).
+        assert_eq!(audible_cursor(2, 5, 5), 4);
+        assert_eq!(audible_cursor(0, 99, 3), 2);
+        // Play from the very start.
+        assert_eq!(audible_cursor(0, 0, 3), 0);
+        assert_eq!(audible_cursor(0, 1, 3), 1);
+        // Empty queue → 0, no panic.
+        assert_eq!(audible_cursor(0, 0, 0), 0);
+        assert_eq!(audible_cursor(3, 2, 0), 0);
     }
 
     #[test]

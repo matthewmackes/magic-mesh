@@ -22,11 +22,14 @@
 //!
 //! `Shuffle` + `LoopStatus` persist to a small sidecar and are honored on
 //! the explicit `Next`/`Previous`/`Play` paths. Auto-advance *at a track's
-//! natural end* (which is what would make repeat fire on its own) is the
-//! AIR-2.c queue-driver's job and is not yet built for **any** mode — the
-//! daemon has no track-end callback today; that is a pre-existing gap, not
-//! one this surface introduces. `CanSeek` is reported `false` because the
-//! AIR-5 engine has no seek yet (the AIR-15 scrub bar adds it).
+//! natural end* is now the AIR-2.c queue-driver's job (the engine plays an
+//! album gaplessly as one list; the serve loop maps the audible track back to
+//! the queue cursor and advances it at each boundary — see
+//! [`advance_queue_cursor`](crate::bus_responder)), so this surface's `Metadata`
+//! + `Position` track the song you actually hear without any MPRIS-side
+//! callback. `CanSeek` is reported `false` here even though the AIR-5 engine
+//! gained seek (MUSIC-RFX-2) — wiring MPRIS `Seek`/`SetPosition` to it is a
+//! small follow-on (the GUI scrub bar already drives `action/music/seek`).
 
 // MPRIS plumbing trips a few pedantic/nursery lints that are noise here:
 // the f32↔f64 volume + u64→i64 position conversions are intentional and
@@ -211,6 +214,19 @@ fn shuffle_slice(s: &mut [String]) {
         let j = (r % (i as u64 + 1)) as usize;
         s.swap(i, j);
     }
+}
+
+/// AIR-2.c — splice `tail` (the exact order the engine will play) into `songs`
+/// starting at `base`, replacing everything from `base` on. This keeps the
+/// persisted queue order identical to the engine's playback order so the serve
+/// loop's auto-advance driver can map the audible engine-track index back to the
+/// queue cursor by arithmetic (`play_base + index`). A pure function for tests.
+#[must_use]
+fn rebuild_queue_tail(songs: &[String], base: usize, tail: &[String]) -> Vec<String> {
+    let base = base.min(songs.len());
+    let mut out: Vec<String> = songs[..base].to_vec();
+    out.extend(tail.iter().cloned());
+    out
 }
 
 /// A random index in `0..n` that is **not** `exclude` (when `n > 1`).
@@ -408,14 +424,24 @@ impl Player {
     /// client or on an empty queue.
     async fn start_play(&self) {
         let Some(client) = self.client() else { return };
-        let q = queue::read_from(&self.queue_path);
+        let mut q = queue::read_from(&self.queue_path);
         let Some(current) = q.current().map(ToString::to_string) else {
             return;
         };
         let mode = read_mode(&self.data_dir);
-        let mut tail: Vec<String> = q.songs.iter().skip(q.current).cloned().collect();
+        let base = q.current.min(q.songs.len().saturating_sub(1));
+        let mut tail: Vec<String> = q.songs.iter().skip(base).cloned().collect();
         if mode.shuffle && tail.len() > 2 {
             shuffle_slice(&mut tail[1..]);
+            // AIR-2.c — the engine plays the tail in THIS order, and the serve
+            // loop's auto-advance driver maps the audible engine-track index back
+            // to the queue cursor by arithmetic (`play_base + index`). That only
+            // holds when the queue order matches the engine's, so persist the
+            // shuffled order back into the queue tail (current stays first) before
+            // playing — otherwise the cursor would advance through the un-shuffled
+            // queue while shuffled audio plays.
+            q.songs = rebuild_queue_tail(&q.songs, base, &tail);
+            let _ = queue::write_to(&self.queue_path, &q);
         }
         let tracks: Vec<(String, SourceCodec)> = tail
             .iter()
@@ -424,7 +450,10 @@ impl Player {
         if tracks.is_empty() {
             return;
         }
-        self.engine.play(tracks);
+        // AIR-2.c — engine-track 0 is the queue's current song, so hand the
+        // driver that base (the Bus Play arm does the same); `play()` would set
+        // base 0 and snap the now-playing cursor back to the top of the queue.
+        self.engine.play_from(tracks, base);
         self.resolve_now(&client, &current).await;
         self.write_state(true, &current, 0);
     }
@@ -869,5 +898,31 @@ mod tests {
         // Degenerate sizes.
         assert_eq!(random_other_index(1, 0), 0);
         assert_eq!(random_other_index(0, 0), 0);
+    }
+
+    #[test]
+    fn rebuild_queue_tail_keeps_head_and_splices_play_order() {
+        // AIR-2.c — the persisted queue must match the order the engine plays so
+        // the auto-advance driver's `play_base + index` mapping stays valid.
+        let songs: Vec<String> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        // Play from index 2; the engine got the (shuffled) tail [c, e, d].
+        let tail: Vec<String> = ["c", "e", "d"].iter().map(|s| (*s).to_string()).collect();
+        let rebuilt = rebuild_queue_tail(&songs, 2, &tail);
+        assert_eq!(rebuilt, vec!["a", "b", "c", "e", "d"]);
+        // The spliced tail (from `base`) is byte-for-byte the engine's play order.
+        assert_eq!(&rebuilt[2..], tail.as_slice());
+        // base 0 replaces the whole queue with the tail.
+        assert_eq!(rebuild_queue_tail(&songs, 0, &tail), tail);
+        // A base past the end is clamped → just appends the tail.
+        assert_eq!(
+            rebuild_queue_tail(&songs, 99, &tail),
+            ["a", "b", "c", "d", "e", "c", "e", "d"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>()
+        );
     }
 }
