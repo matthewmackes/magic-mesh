@@ -5,7 +5,8 @@
 //!
 //! This crate is the in-process library used by the `mde-bus` binary,
 //! by the `mackesd::workers::bus_supervisor` subprocess supervisor,
-//! and (eventually) by `crates/mde-clipd/`. It exposes:
+//! and by the `mackesd::workers::clipboard_sync` capturer (which
+//! publishes every clip on the bus). It exposes:
 //!
 //! * [`topic`] — slash-hierarchy topic names + MQTT-wildcard matcher
 //!   (BUS-1.5).

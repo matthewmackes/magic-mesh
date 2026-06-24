@@ -454,9 +454,6 @@ pub mod xcp_host;
 // the IP over the mackes-xcp Hypervisor layer (the runtime caller of
 // set_identity_seed, so a provisioned VM actually gets its identity seed).
 pub mod xcp_provision;
-// BUS-5.1 — clipboard daemon supervisor. Spawns one `mde-clipd` process
-// per Wayland session; idles when $WAYLAND_DISPLAY is unset.
-pub mod clipd_supervisor;
 // CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
 // (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every
 // text clip on the bus + appends to ONE mesh-global `clipboard/history.json`
@@ -478,7 +475,7 @@ pub trait Worker: Send + 'static {
     /// Short, stable identifier used in logs + `mackesd healthz`
     /// output. Should be `kebab-case` and match the matching
     /// `crates/mackesd/src/workers/<name>.rs` module name (e.g.
-    /// `clipd_supervisor`, `mdns`, `notifications-server`).
+    /// `clipboard_sync`, `mdns`, `notifications-server`).
     fn name(&self) -> &'static str;
 
     /// Body of the worker. Runs on the tokio runtime until
@@ -542,7 +539,7 @@ pub enum RestartPolicy {
     /// one-shot timer workers like `app_sync`.
     Never,
     /// Restart only if the worker returned `Err`. Right for
-    /// long-running watchers (`clipd_supervisor`, `mdns`, etc.).
+    /// long-running watchers (`clipboard_sync`, `mdns`, etc.).
     OnFailure,
     /// Restart on any return (Ok or Err). Right for "should never
     /// exit" workers like `notifications_server`.

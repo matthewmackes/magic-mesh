@@ -7661,23 +7661,16 @@ fn run_serve(
         ));
         worker_names.lock().expect("worker_names mutex").push("bus_supervisor".into());
 
-        // BUS-5.1 — clipboard daemon. Spawns one `mde-clipd` process per
-        // Wayland session. Idles gracefully when $WAYLAND_DISPLAY is unset
-        // (e.g., early in the boot sequence or on a headless peer).
-        if mackesd_core::worker_role::runs("clipd_supervisor", role_rank) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::clipd_supervisor::ClipdSupervisor::new(),
-                RestartPolicy::Always,
-            ));
-            worker_names.lock().expect("worker_names mutex").push("clipd_supervisor".into());
-        }
-
         // CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
         // (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every
         // text clip on the bus + appends to the mesh-global `clipboard/history.json`
-        // (last 50 unpinned + unlimited pinned). Idles gracefully without a display
-        // (the worker self-gates on $WAYLAND_DISPLAY), so it's cheap on a headless
-        // peer. Workstation-tier alongside clipd_supervisor.
+        // (last 50 unpinned + unlimited pinned). As the root system daemon it has
+        // no inherited $WAYLAND_DISPLAY, so it DISCOVERS the active seat0 graphical
+        // session (CLIP-SYNC-2) and spawns the capture as that user; a genuinely
+        // headless peer (Lighthouse/Server) finds no session and idles quietly, so
+        // it's cheap there. (This replaces the never-built `mde-clipd` daemon +
+        // `clipd_supervisor`: that binary never existed in the workspace; this
+        // worker is the sole, real clipboard capturer.)
         if mackesd_core::worker_role::runs("clipboard_sync", role_rank) {
             sup.spawn(Spawn::new(
                 mackesd_core::workers::clipboard_sync::build(workgroup_root.clone()),

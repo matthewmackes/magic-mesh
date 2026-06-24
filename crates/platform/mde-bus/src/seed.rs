@@ -102,7 +102,7 @@ const CURATED: &[CuratedTopic] = &[
     },
     CuratedTopic {
         name_template: "clipboard/sync",
-        description: "Global clipboard payloads from mde-clipd (BUS-5).",
+        description: "Global clipboard payloads from the clipboard_sync worker + KDC phone clip bridge (BUS-5).",
         priority_default: Priority::Min,
         retention_s: None,
     },
