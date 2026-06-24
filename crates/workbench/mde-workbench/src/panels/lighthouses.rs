@@ -83,9 +83,22 @@ impl LighthousesPanel {
     }
 
     pub fn load() -> Task<crate::Message> {
-        Task::perform(async { load_cards() }, |cards| {
-            crate::Message::Lighthouses(Message::Loaded(cards))
-        })
+        // `load_cards` is blocking — it routes through `crate::dbus::action_request`
+        // (via `mesh_directory::fetch_peers_and_leader`), which builds its OWN
+        // current-thread tokio runtime and `block_on`s it. The iced
+        // `cosmic::executor::Default` is a multi-thread `tokio::runtime::Runtime`, so a
+        // bare `Task::perform(async { load_cards() })` runs `block_on` ON a tokio worker
+        // and panics ("Cannot start a runtime from within a runtime"), dropping the task
+        // so `Loaded` never lands and the tab stays empty. `spawn_blocking` moves it onto
+        // the blocking pool (no nested runtime), matching the other directory-RPC panels.
+        Task::perform(
+            async {
+                tokio::task::spawn_blocking(load_cards)
+                    .await
+                    .unwrap_or_default()
+            },
+            |cards| crate::Message::Lighthouses(Message::Loaded(cards)),
+        )
     }
 
     /// Set the deep-link focus target (the Hub footer passed `lighthouses:<host>`).
