@@ -457,12 +457,8 @@ fn unit_row<'a>(u: &'a UnitStatus, palette: Palette) -> Element<'a, crate::Messa
             .padding(Padding::from([8u16, 12u16]))
             .sty(move |_| container::Style {
                 snap: false,
-                background: Some(Background::Color(Color {
-                    r: 0.06,
-                    g: 0.06,
-                    b: 0.07,
-                    a: 1.0,
-                })),
+                // Recessed journal inset: the darkest surface token (Carbon Gray 100).
+                background: Some(Background::Color(palette.background.into_cosmic_color())),
                 border: Border {
                     color: palette.border.into_cosmic_color(),
                     width: 1.0,
@@ -497,14 +493,9 @@ fn action_btn_style(
 ) -> impl Fn(&Theme, cosmic::iced::widget::button::Status) -> cosmic::iced::widget::button::Style {
     let accent = palette.accent.into_cosmic_color();
     let border = palette.border.into_cosmic_color();
+    let hover_bg = palette.overlay.into_cosmic_color();
     move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
         let (bg, text_color) = if ghost {
-            let hover_bg = Color {
-                r: 0.20,
-                g: 0.20,
-                b: 0.22,
-                a: 1.0,
-            };
             match status {
                 cosmic::iced::widget::button::Status::Hovered => {
                     (hover_bg, palette.text.into_cosmic_color())

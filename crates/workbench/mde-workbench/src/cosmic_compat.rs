@@ -252,11 +252,10 @@ pub fn object_card<'a, Message: 'a>(
             background: Some(Background::Color(final_bg)),
             border,
             shadow: IcedShadow {
+                // Pure-black scrim token; the elevation alpha is the dynamic part.
                 color: Color {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
                     a: shadow_alpha,
+                    ..mde_theme::carbon::BLACK.into_cosmic_color()
                 },
                 offset: cosmic::iced::Vector::new(0.0, shadow_offset),
                 blur_radius: shadow_blur,

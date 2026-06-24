@@ -711,6 +711,8 @@ impl MeshFederationPanel {
         let accent = palette.accent.into_cosmic_color();
         let text_color = palette.text.into_cosmic_color();
         let text_muted = palette.text_muted.into_cosmic_color();
+        let danger = palette.danger.into_cosmic_color();
+        let danger_fill = Color { a: 0.12, ..danger };
         let r = f32::from(radii.sm);
 
         let heading = text("Mint a passcode for sharing")
@@ -788,28 +790,13 @@ impl MeshFederationPanel {
                     "Revoke"
                 })
                 .size(TypeRole::Body.size_in(sizes))
-                .colr(Color {
-                    r: 0.9,
-                    g: 0.2,
-                    b: 0.2,
-                    a: 1.0,
-                }),
+                .colr(danger),
             )
             .padding([6u16, 14u16])
             .sty(move |_t, _s: ButtonStatus| button::Style {
                 snap: false,
-                background: Some(Background::Color(Color {
-                    r: 0.8,
-                    g: 0.1,
-                    b: 0.1,
-                    a: 0.12,
-                })),
-                text_color: Color {
-                    r: 0.9,
-                    g: 0.2,
-                    b: 0.2,
-                    a: 1.0,
-                },
+                background: Some(Background::Color(danger_fill)),
+                text_color: danger,
                 border: Border {
                     color: Color::TRANSPARENT,
                     width: 0.0,
@@ -828,12 +815,7 @@ impl MeshFederationPanel {
             items.push(
                 text(format!("Error: {e}"))
                     .size(TypeRole::Caption.size_in(sizes))
-                    .colr(Color {
-                        r: 0.9,
-                        g: 0.2,
-                        b: 0.2,
-                        a: 1.0,
-                    })
+                    .colr(danger)
                     .into(),
             );
         }
@@ -850,6 +832,7 @@ impl MeshFederationPanel {
         let accent = palette.accent.into_cosmic_color();
         let text_color = palette.text.into_cosmic_color();
         let text_muted = palette.text_muted.into_cosmic_color();
+        let danger = palette.danger.into_cosmic_color();
         let r = f32::from(radii.sm);
 
         let heading = text("Accept passcode from peer mesh")
@@ -936,12 +919,7 @@ impl MeshFederationPanel {
             items.push(
                 text(format!("Error: {e}"))
                     .size(TypeRole::Caption.size_in(sizes))
-                    .colr(Color {
-                        r: 0.9,
-                        g: 0.2,
-                        b: 0.2,
-                        a: 1.0,
-                    })
+                    .colr(danger)
                     .into(),
             );
         }
@@ -959,6 +937,8 @@ impl MeshFederationPanel {
         let text_color = palette.text.into_cosmic_color();
         let text_muted = palette.text_muted.into_cosmic_color();
         let raised = palette.raised.into_cosmic_color();
+        let danger = palette.danger.into_cosmic_color();
+        let danger_fill = Color { a: 0.12, ..danger };
         let r = f32::from(radii.sm);
 
         if self.grant.peer_mesh_id.is_none() {
@@ -1008,28 +988,13 @@ impl MeshFederationPanel {
                     let rm_btn: Element<'_, crate::Message> = button(
                         text("Remove")
                             .size(TypeRole::Caption.size_in(sizes))
-                            .colr(Color {
-                                r: 0.9,
-                                g: 0.2,
-                                b: 0.2,
-                                a: 1.0,
-                            }),
+                            .colr(danger),
                     )
                     .padding([2u16, 8u16])
                     .sty(move |_t, _s: ButtonStatus| button::Style {
                         snap: false,
-                        background: Some(Background::Color(Color {
-                            r: 0.8,
-                            g: 0.1,
-                            b: 0.1,
-                            a: 0.12,
-                        })),
-                        text_color: Color {
-                            r: 0.9,
-                            g: 0.2,
-                            b: 0.2,
-                            a: 1.0,
-                        },
+                        background: Some(Background::Color(danger_fill)),
+                        text_color: danger,
                         border: Border {
                             color: Color::TRANSPARENT,
                             width: 0.0,
@@ -1125,28 +1090,13 @@ impl MeshFederationPanel {
                     let rm_btn: Element<'_, crate::Message> = button(
                         text("Remove")
                             .size(TypeRole::Caption.size_in(sizes))
-                            .colr(Color {
-                                r: 0.9,
-                                g: 0.2,
-                                b: 0.2,
-                                a: 1.0,
-                            }),
+                            .colr(danger),
                     )
                     .padding([2u16, 8u16])
                     .sty(move |_t, _s: ButtonStatus| button::Style {
                         snap: false,
-                        background: Some(Background::Color(Color {
-                            r: 0.8,
-                            g: 0.1,
-                            b: 0.1,
-                            a: 0.12,
-                        })),
-                        text_color: Color {
-                            r: 0.9,
-                            g: 0.2,
-                            b: 0.2,
-                            a: 1.0,
-                        },
+                        background: Some(Background::Color(danger_fill)),
+                        text_color: danger,
                         border: Border {
                             color: Color::TRANSPARENT,
                             width: 0.0,
@@ -1267,12 +1217,7 @@ impl MeshFederationPanel {
             col = col.push(Space::new().height(12)).push(
                 text(format!("Error: {e}"))
                     .size(TypeRole::Caption.size_in(sizes))
-                    .colr(Color {
-                        r: 0.9,
-                        g: 0.2,
-                        b: 0.2,
-                        a: 1.0,
-                    }),
+                    .colr(danger),
             );
         }
 
@@ -1308,6 +1253,8 @@ impl MeshFederationPanel {
         let text_muted = palette.text_muted.into_cosmic_color();
         let raised = palette.raised.into_cosmic_color();
         let accent = palette.accent.into_cosmic_color();
+        let danger = palette.danger.into_cosmic_color();
+        let danger_fill = Color { a: 0.12, ..danger };
         let r = f32::from(radii.sm);
 
         let mut items: Vec<Element<'_, crate::Message>> = Vec::new();
@@ -1339,28 +1286,13 @@ impl MeshFederationPanel {
             let revoke_btn: Element<'_, crate::Message> = button(
                 text(if is_revoking { "Revoking…" } else { "Revoke" })
                     .size(TypeRole::Caption.size_in(sizes))
-                    .colr(Color {
-                        r: 0.9,
-                        g: 0.2,
-                        b: 0.2,
-                        a: 1.0,
-                    }),
+                    .colr(danger),
             )
             .padding([4u16, 10u16])
             .sty(move |_t, _s: ButtonStatus| button::Style {
                 snap: false,
-                background: Some(Background::Color(Color {
-                    r: 0.8,
-                    g: 0.1,
-                    b: 0.1,
-                    a: 0.12,
-                })),
-                text_color: Color {
-                    r: 0.9,
-                    g: 0.2,
-                    b: 0.2,
-                    a: 1.0,
-                },
+                background: Some(Background::Color(danger_fill)),
+                text_color: danger,
                 border: Border {
                     color: Color::TRANSPARENT,
                     width: 0.0,
@@ -1466,12 +1398,7 @@ impl MeshFederationPanel {
             items.push(
                 text(format!("Error: {e}"))
                     .size(TypeRole::Caption.size_in(sizes))
-                    .colr(Color {
-                        r: 0.9,
-                        g: 0.2,
-                        b: 0.2,
-                        a: 1.0,
-                    })
+                    .colr(danger)
                     .into(),
             );
         }

@@ -183,12 +183,7 @@ impl NetworkHostsPanel {
         let body: Element<'_, crate::Message> = if let Some(ref e) = self.error {
             text(format!("Error: {e}"))
                 .size(TypeRole::Body.size_in(sizes))
-                .colr(Color {
-                    r: 1.0,
-                    g: 0.35,
-                    b: 0.35,
-                    a: 1.0,
-                })
+                .colr(palette.danger.into_cosmic_color())
                 .into()
         } else if self.inventory.hosts.is_empty() && self.last_run_at.is_some() {
             text("No hosts in the inventory yet — the probe worker populates it on its scan cadence.")
@@ -225,18 +220,8 @@ impl NetworkHostsPanel {
 /// an explicit trusted/untrusted verdict gets green/red.
 fn trust_color(trust: &str, palette: Palette) -> Color {
     match trust.to_ascii_lowercase().as_str() {
-        "trusted" | "mesh" | "enrolled" => Color {
-            r: 0.4,
-            g: 0.82,
-            b: 0.45,
-            a: 1.0,
-        },
-        "untrusted" | "blocked" | "denied" => Color {
-            r: 1.0,
-            g: 0.35,
-            b: 0.35,
-            a: 1.0,
-        },
+        "trusted" | "mesh" | "enrolled" => palette.success.into_cosmic_color(),
+        "untrusted" | "blocked" | "denied" => palette.danger.into_cosmic_color(),
         _ => palette.text_muted.into_cosmic_color(),
     }
 }

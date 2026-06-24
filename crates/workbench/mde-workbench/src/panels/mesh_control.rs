@@ -237,14 +237,10 @@ impl MeshControlPanel {
         let ghost_btn_style = {
             let border = palette.border.into_cosmic_color();
             let text_main = palette.text.into_cosmic_color();
+            let hover = palette.overlay.into_cosmic_color();
             move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
                 let bg = match status {
-                    cosmic::iced::widget::button::Status::Hovered => Color {
-                        r: 0.20,
-                        g: 0.20,
-                        b: 0.22,
-                        a: 1.0,
-                    },
+                    cosmic::iced::widget::button::Status::Hovered => hover,
                     _ => Color::TRANSPARENT,
                 };
                 cosmic::iced::widget::button::Style {
@@ -454,12 +450,8 @@ fn healthz_card_view<'a>(
 
     let bg = palette.raised.into_cosmic_color();
     let border = palette.border.into_cosmic_color();
-    let raw_box_bg = Color {
-        r: 0.06,
-        g: 0.06,
-        b: 0.07,
-        a: 1.0,
-    };
+    // Recessed raw-output inset: the darkest surface token (Carbon Gray 100).
+    let raw_box_bg = palette.background.into_cosmic_color();
     container(
         column![
             header,
@@ -499,12 +491,8 @@ fn healthz_card_view<'a>(
 }
 
 fn kv_pill<'a>(key: &'a str, value: String, palette: Palette) -> Element<'a, crate::Message> {
-    let bg = Color {
-        r: 0.10,
-        g: 0.10,
-        b: 0.12,
-        a: 1.0,
-    };
+    // Recessed pill chip: the darkest surface token (Carbon Gray 100).
+    let bg = palette.background.into_cosmic_color();
     container(
         row![
             text(key)
