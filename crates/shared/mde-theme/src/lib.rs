@@ -100,7 +100,7 @@ pub use icons::{
 pub use load_state::{LoadState, StateTone};
 pub use motion::{Easing, Motion, PANEL_MOUNT_TRANSLATE_Y_PX, PULSE_MAX_SCALE};
 pub use palette::Palette;
-pub use prefs::Preferences;
+pub use prefs::{system_reduce_motion, MotionPrefs, MotionRole, Preferences};
 pub use radii::Radii;
 pub use shadows::Shadow;
 pub use skeleton::{SkeletonBlock, SkeletonShimmer, TEXT_LINE_HEIGHT_PX};
