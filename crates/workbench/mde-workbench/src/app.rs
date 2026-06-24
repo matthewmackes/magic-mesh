@@ -37,12 +37,13 @@ use crate::panels::{
     mirrors as mirrors_panel, music as music_panel, network_hosts as network_hosts_panel,
     node_roles as node_roles_panel, notifications as notifications_panel, peers as peers_panel,
     playbooks as playbooks_panel, policy as policy_panel, profiles as profiles_panel,
-    registration as registration_panel, remote_desktop as remote_desktop_panel,
-    repair as repair_panel, resources as resources_panel, routing as routing_panel,
-    run_history as run_history_panel, service_publishing as service_publishing_panel,
-    sip_gateway as sip_gateway_panel, snapshots as snapshots_panel,
-    sync_status as sync_status_panel, system_update as system_update_panel, tags as tags_panel,
-    vpn as vpn_panel, wallpaper as wallpaper_panel, wifi as wifi_panel,
+    provisioning as provisioning_panel, registration as registration_panel,
+    remote_desktop as remote_desktop_panel, repair as repair_panel, resources as resources_panel,
+    routing as routing_panel, run_history as run_history_panel,
+    service_publishing as service_publishing_panel, sip_gateway as sip_gateway_panel,
+    snapshots as snapshots_panel, sync_status as sync_status_panel,
+    system_update as system_update_panel, tags as tags_panel, vpn as vpn_panel,
+    wallpaper as wallpaper_panel, wifi as wifi_panel,
 };
 use crate::patternfly::{breadcrumb, page_subtitle, page_title};
 use crate::sidebar::SidebarState;
@@ -169,6 +170,8 @@ pub enum Message {
     Resources(resources_panel::Message),
     /// E6.10 — Compute group instance-list sub-message.
     Compute(compute_panel::Message),
+    /// XCP-4 — Provisioning (VM Spawner) panel sub-message.
+    Provisioning(provisioning_panel::Message),
     /// CB-1.7 partial — Maintain system-update panel sub-message.
     SystemUpdate(system_update_panel::Message),
     /// CB-1.7 partial — Maintain repair panel sub-message.
@@ -323,6 +326,7 @@ pub struct App {
     logs: logs_panel::LogsPanel,
     resources: resources_panel::ResourcesPanel,
     compute: compute_panel::ComputePanel,
+    provisioning: provisioning_panel::ProvisioningPanel,
     system_update: system_update_panel::SystemUpdatePanel,
     repair: repair_panel::RepairPanel,
     health_check: health_check_panel::HealthCheckPanel,
@@ -435,6 +439,7 @@ impl App {
             logs: logs_panel::LogsPanel::new(),
             resources: resources_panel::ResourcesPanel::new(),
             compute: compute_panel::ComputePanel::new(),
+            provisioning: provisioning_panel::ProvisioningPanel::new(),
             system_update: system_update_panel::SystemUpdatePanel::new(),
             repair: repair_panel::RepairPanel::new(),
             health_check: health_check_panel::HealthCheckPanel::new(),
@@ -867,6 +872,7 @@ impl App {
             Message::Logs(msg) => self.logs.update(msg),
             Message::Resources(msg) => self.resources.update(msg),
             Message::Compute(msg) => self.compute.update(msg),
+            Message::Provisioning(msg) => self.provisioning.update(msg),
             Message::SystemUpdate(msg) => self.system_update.update(msg),
             Message::Repair(msg) => self.repair.update(msg),
             Message::HealthCheck(msg) => self.health_check.update(msg),
@@ -1007,6 +1013,9 @@ impl App {
             // VMs/pods + folds the fleet QNM inventory on nav (was the one
             // panel missing here, so it sat at "Loading instances…" forever).
             "instances" => compute_panel::ComputePanel::load(),
+            // XCP-4 — the VM Spawner queries the xcp_provision worker for the
+            // VM + dom0-host rosters on nav so the panel lands populated.
+            "provisioning" => provisioning_panel::ProvisioningPanel::load(),
             "audit" => audit_panel::AuditPanel::load(),
             "mesh_logs" => mesh_logs_panel::MeshLogsPanel::load(),
             "fleet_logs" => fleet_logs_panel::FleetLogsPanel::load(),
@@ -1518,6 +1527,11 @@ impl App {
             View::Panel {
                 panel: "instances", ..
             } => self.compute.view(),
+            // XCP-4 — the VM Spawner / Provisioning plane (A-plane MDE-VMs).
+            View::Panel {
+                panel: "provisioning",
+                ..
+            } => self.provisioning.view(),
             // WB-OVERVIEW-2 — the "Home" panel renders the real Overview
             // dashboard (same as the group root), not the "isn't ready yet"
             // stub it fell through to before.

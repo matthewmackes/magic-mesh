@@ -99,6 +99,50 @@ pub fn action_request_with_body(
     })
 }
 
+/// Publish a request to `topic` and block for a reply on an
+/// EXPLICIT `reply_topic` (not the generic `reply/<request-ulid>`
+/// RPC lane). The provisioning spawn responder acks on its own
+/// `action/provision/spawn-ack/<request-ulid>` topic keyed by a
+/// caller-supplied `request_ulid` in the body — so the caller
+/// already knows where the reply will land and passes it here.
+///
+/// Same current-thread-runtime contract as [`action_request`]:
+/// `Persist`/rusqlite isn't `Send`, so MUST be called OUTSIDE an
+/// async runtime; iced callers wrap it in
+/// `tokio::task::spawn_blocking`. Returns the reply body, or `None`
+/// on no Bus / persist error / timeout (no reply on `reply_topic`).
+#[must_use]
+pub fn action_request_reply_on(
+    topic: &str,
+    body: Option<&str>,
+    reply_topic: &str,
+    timeout: Duration,
+) -> Option<String> {
+    let bus_dir = mde_bus::client_data_dir()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    rt.block_on(async {
+        let persist = Persist::open(bus_dir).ok()?;
+        mde_bus::rpc::publish_request(&persist, topic, Priority::Default, None, body).ok()?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            // The ack topic carries exactly one reply for this request, so read
+            // the whole (single-message) topic each poll — no cursor to track.
+            if let Ok(msgs) = persist.list_since(reply_topic, None) {
+                if let Some(msg) = msgs.into_iter().next_back() {
+                    return msg.body;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(mde_bus::rpc::INTERACTIVE_POLL_INTERVAL).await;
+        }
+    })
+}
+
 /// Fire-and-forget Bus publish: enqueue one request to `topic` with
 /// `body` and return WITHOUT awaiting a reply. For best-effort
 /// propagation pushes — e.g. `RemoteBackend`'s settings write-through
@@ -115,6 +159,19 @@ pub fn action_publish(topic: &str, body: &str) -> bool {
         return false;
     };
     mde_bus::rpc::publish_request(&persist, topic, Priority::Default, None, Some(body)).is_ok()
+}
+
+/// Pull a `{"error":…}` message out of a mackesd reply envelope, if present.
+/// The shared decoder for the `action/*` reply convention every responder
+/// uses (`{"error":<message>}` on failure) — panels call this on a reply body
+/// to distinguish a worker-reported failure from a success payload. `None`
+/// when the body isn't an object with a string `error` field.
+#[must_use]
+pub fn reply_error(raw: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    v.get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 /// Normalise a focus-request body into the slug to submit. Trims

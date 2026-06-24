@@ -266,6 +266,8 @@ pub fn nav_model() -> Vec<NavEntry> {
                 Panel::new("mirrors", "Mirrors"),
                 // Compute folded into Provisioning.
                 Panel::new("instances", "Instances"),
+                // XCP-4 — the VM Spawner (A-plane MDE-VMs over XCP-ng dom0s).
+                Panel::new("provisioning", "VM Spawner"),
                 // FARM-AUTO-5 — build-farm activity (jobs queued/passed/failed).
                 Panel::new("build-farm", "Build Farm"),
                 // DATACENTER-8 — datacenter plane (DO/Xen resources via event/dc/*).
