@@ -26,10 +26,13 @@ const MAX_POLLS: u8 = 12;
 const TRACE_TIMEOUT: Duration = Duration::from_secs(2);
 use cosmic::iced::{Background, Border, Color, Length, Padding};
 use cosmic::{Element, Theme};
-use mackes_mesh_types::route_trace::{Direction, Layer, NodeKind, PathGraph, Verdict};
+use mackes_mesh_types::route_trace::{
+    ControlPoint, Direction, Layer, NodeKind, PathEdge, PathGraph, Verdict,
+};
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
 
 use crate::cosmic_compat::prelude::*;
+use crate::panel_chrome::BadgeSeverity;
 
 /// One directed `from → to` edge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -678,10 +681,15 @@ fn trace_graph<'a>(state: &TraceState, palette: Palette) -> Element<'a, crate::M
             let canvas: Element<'_, crate::Message> =
                 cosmic::iced::widget::themer(None, canvas_stock).into();
             let verdict = path_verdict_line(graph, palette);
-            card(
-                column![verdict, container(canvas).width(Length::Fill)].spacing(8),
-                palette,
-            )
+            let mut body = column![verdict, container(canvas).width(Length::Fill)].spacing(8);
+            // ROUTE-TRACE-5 — the per-hop control list under the canvas: one row
+            // per edge that crosses a firewall/control point, each with a
+            // tone-tinted verdict badge + the cited rule. The canvas shows *where*
+            // the path stops; this list says *why*, citing each control's rule.
+            if let Some(controls) = control_hops_list(graph, palette) {
+                body = body.push(controls);
+            }
+            card(body, palette)
         }
         Some(Err(e)) => card(
             text(format!("Trace failed — {e}"))
@@ -753,6 +761,122 @@ fn blocked_edge_label(graph: &PathGraph, edge_id: &str) -> String {
         || edge_id.to_string(),
         |e| format!("{} → {}", label_of(&e.from), label_of(&e.to)),
     )
+}
+
+// ---- ROUTE-TRACE-5: per-hop control-point list ----------------------------
+
+/// ROUTE-TRACE-5 — the shared severity tone a control-point [`Verdict`] reads
+/// as, on the Carbon support ramp (no raw hex — §4): Allow is success (the
+/// segment is permitted), Block is danger (the path stops here), Indeterminate
+/// is warning (the rule set couldn't be resolved — never guessed). This is the
+/// 1:1 verdict→[`BadgeSeverity`] mapping the firewall badge tints from; pure +
+/// unit-tested so the color derivation is verifiable without rendering.
+#[must_use]
+fn verdict_severity(verdict: Verdict) -> BadgeSeverity {
+    match verdict {
+        Verdict::Allow => BadgeSeverity::Success,
+        Verdict::Block => BadgeSeverity::Danger,
+        Verdict::Indeterminate => BadgeSeverity::Warning,
+    }
+}
+
+/// ROUTE-TRACE-5 — the short, uppercase label a [`Verdict`] shows on its badge.
+#[must_use]
+fn verdict_label(verdict: Verdict) -> &'static str {
+    match verdict {
+        Verdict::Allow => "ALLOW",
+        Verdict::Block => "BLOCK",
+        Verdict::Indeterminate => "INDET",
+    }
+}
+
+/// ROUTE-TRACE-5 — a tone-tinted firewall badge for a control point, so
+/// Allow/Block/Indeterminate read as a glanceable green/red/amber chip. Reuses
+/// the shared [`panel_chrome::status_badge`] (the same severity-tinted pill every
+/// other panel uses) tinted from `control.verdict` via [`verdict_severity`] — one
+/// badge chrome, sourced from Carbon tokens, no raw hex.
+fn firewall_badge<'a>(control: &ControlPoint, palette: Palette) -> Element<'a, crate::Message> {
+    crate::panel_chrome::status_badge(
+        verdict_label(control.verdict),
+        verdict_severity(control.verdict),
+        palette,
+    )
+}
+
+/// ROUTE-TRACE-5 — one control-point hop row: the tone-tinted [`firewall_badge`],
+/// the human `<from> → <to>` segment, and a small drill-down detail line under it
+/// citing the control (`firewall` name) and its `rule`. The blocking hop (the one
+/// `blocked_at` points at) is marked so the operator can read the per-hop list as
+/// the canvas's explanation. The detail line is the per-hop drill-down — the wire
+/// firewall id + the exact cited rule, the "why" behind the badge.
+fn control_hop_row<'a>(
+    graph: &PathGraph,
+    edge: &PathEdge,
+    palette: Palette,
+) -> Option<Element<'a, crate::Message>> {
+    let control = edge.control.as_ref()?;
+    let label_of = |id: &str| -> String {
+        graph
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .map_or_else(|| id.to_string(), |n| n.label.clone())
+    };
+    let badge = firewall_badge(control, palette);
+    let is_blocking = graph.blocked_at.as_deref() == Some(edge.id().as_str());
+
+    let segment = text(format!("{} → {}", label_of(&edge.from), label_of(&edge.to)))
+        .size(12)
+        .colr(palette.text.into_cosmic_color());
+
+    let mut head = row![badge, segment]
+        .spacing(8)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+    if is_blocking {
+        // The first denying point — flag it so this row reads as the canvas's
+        // BLOCKED highlight in list form.
+        head = head.push(Space::new().width(Length::Fill));
+        head = head.push(
+            text("first block")
+                .size(10)
+                .colr(palette.danger.into_cosmic_color()),
+        );
+    }
+
+    // The per-hop drill-down: the control's name + the exact cited rule — the
+    // detail behind the badge ("firewalld:public · default deny (no matching rule)").
+    let detail = text(format!("{} · {}", control.firewall, control.rule))
+        .size(10)
+        .colr(palette.text_muted.into_cosmic_color());
+
+    Some(card(column![head, detail].spacing(4), palette))
+}
+
+/// ROUTE-TRACE-5 — the per-hop control list: one [`control_hop_row`] for each
+/// edge that crosses a control point (a [`ControlPoint`]), in source→dest order,
+/// under a small heading. Returns `None` when the path crosses no control points
+/// (a plain egress with no modeled firewall) — the canvas alone suffices then, so
+/// no empty list chrome is rendered.
+fn control_hops_list<'a>(
+    graph: &PathGraph,
+    palette: Palette,
+) -> Option<Element<'a, crate::Message>> {
+    let hop_rows: Vec<Element<'a, crate::Message>> = graph
+        .edges
+        .iter()
+        .filter_map(|edge| control_hop_row(graph, edge, palette))
+        .collect();
+    if hop_rows.is_empty() {
+        return None;
+    }
+    let mut rows = column![].spacing(6);
+    for r in hop_rows {
+        rows = rows.push(r);
+    }
+    let heading = text("Control points")
+        .size(11)
+        .colr(palette.text_muted.into_cosmic_color());
+    Some(column![heading, rows].spacing(6).into())
 }
 
 /// ROUTE-TRACE-4 — the topology-graph canvas program. Lays the path out as a
@@ -1294,5 +1418,101 @@ mod tests {
             parse_trace_reply(r#"{"ok":true}"#).is_err(),
             "missing graph"
         );
+    }
+
+    // --- ROUTE-TRACE-5: per-hop control-point list -----------------------------
+
+    #[test]
+    fn verdict_severity_maps_each_verdict_to_its_carbon_support_tone() {
+        // The badge's tone derives from control.verdict via the shared
+        // BadgeSeverity ramp — Allow=Success(green), Block=Danger(red),
+        // Indeterminate=Warning(amber) — which status_badge tints from Carbon
+        // tokens (never a raw hex). Pinning the derivation here makes the §4 tone
+        // mapping verifiable without rendering.
+        let cp = |verdict: Verdict| ControlPoint {
+            firewall: "firewalld:public".into(),
+            verdict,
+            rule: "x".into(),
+        };
+        assert_eq!(
+            verdict_severity(cp(Verdict::Allow).verdict),
+            BadgeSeverity::Success,
+            "Allow reads success (permitted)"
+        );
+        assert_eq!(
+            verdict_severity(cp(Verdict::Block).verdict),
+            BadgeSeverity::Danger,
+            "Block reads danger (path stops here)"
+        );
+        assert_eq!(
+            verdict_severity(cp(Verdict::Indeterminate).verdict),
+            BadgeSeverity::Warning,
+            "Indeterminate reads warning (unresolved, not guessed)"
+        );
+        // The three tones are distinct — a glanceable green/red/amber chip.
+        assert_ne!(
+            verdict_severity(Verdict::Allow),
+            verdict_severity(Verdict::Block)
+        );
+        assert_ne!(
+            verdict_severity(Verdict::Block),
+            verdict_severity(Verdict::Indeterminate)
+        );
+    }
+
+    #[test]
+    fn verdict_label_is_a_short_uppercase_chip() {
+        assert_eq!(verdict_label(Verdict::Allow), "ALLOW");
+        assert_eq!(verdict_label(Verdict::Block), "BLOCK");
+        assert_eq!(verdict_label(Verdict::Indeterminate), "INDET");
+    }
+
+    #[test]
+    fn control_hops_list_renders_a_row_per_control_and_none_when_unconstrained() {
+        // An ingress trace to a mesh-only service crosses the public boundary
+        // control point (a Block), so the list renders at least one hop row and
+        // the helpers don't panic for a real assembled graph. The blocking edge is
+        // the one `blocked_at` cites.
+        let palette = mde_theme::Palette::gray_90();
+        let blocked = mackes_mesh_types::route_trace::assemble_ingress(
+            &mackes_mesh_types::exposure::ExposurePolicy {
+                id: "grafana".into(),
+                source: mackes_mesh_types::exposure::ServiceSource {
+                    node: "eagle".into(),
+                    port: 3000,
+                    proto: "tcp".into(),
+                    ..Default::default()
+                },
+                tier: mackes_mesh_types::exposure::Tier::MeshOnly,
+                ..Default::default()
+            },
+            Some("10.42.0.2"),
+            None,
+        );
+        // At least one edge carries a control point ⇒ the list is rendered.
+        assert!(blocked.edges.iter().any(|e| e.control.is_some()));
+        assert!(
+            control_hops_list(&blocked, palette).is_some(),
+            "a constrained path renders the control list"
+        );
+        // The blocking edge resolves to a renderable row.
+        let blocking = blocked
+            .edges
+            .iter()
+            .find(|e| e.is_blocked())
+            .expect("mesh-only blocks at the boundary");
+        assert!(control_hop_row(&blocked, blocking, palette).is_some());
+        let _ = firewall_badge(blocking.control.as_ref().unwrap(), palette);
+
+        // A plain egress with no modeled firewall crosses no control points ⇒ the
+        // list collapses to None (no empty chrome), and a no-control edge yields no
+        // row.
+        let open = mackes_mesh_types::route_trace::assemble_egress("eagle", None, "1.1.1.1");
+        assert!(open.edges.iter().all(|e| e.control.is_none()));
+        assert!(
+            control_hops_list(&open, palette).is_none(),
+            "an unconstrained path renders no control list"
+        );
+        assert!(control_hop_row(&open, &open.edges[0], palette).is_none());
     }
 }
