@@ -1044,6 +1044,10 @@ pub fn peer_folder<'a>(
             Layout::Grid => column![],
         };
         for (i, f) in filtered_rows.iter().enumerate() {
+            // MOTION-TRANS-3 — splice a removed-at-this-slot row collapsing away.
+            for leaving in motion.collapse_at(i, true, metrics) {
+                list = list.push(leaving);
+            }
             let sel = selection.is_selected(&f.name);
             let foc = selection.is_focused(&f.name);
             let rm = motion.for_row(&f.name, i, sel);
@@ -1052,6 +1056,10 @@ pub fn peer_folder<'a>(
                 Layout::Grid => file_row(f.clone(), true, sel, foc, rm),
             };
             list = list.push(row_el);
+        }
+        // MOTION-TRANS-3 — rows removed at/after the tail collapse at the end.
+        for leaving in motion.collapse_tail(filtered_rows.len(), true, metrics) {
+            list = list.push(leaving);
         }
         crate::loading::dim(list.into(), motion.content_alpha())
     };
@@ -1109,6 +1117,11 @@ fn file_listing(
         Layout::Grid => column![].spacing(8),
     };
     for (i, f) in rows.iter().enumerate() {
+        // MOTION-TRANS-3 — splice in any row that was removed at this slot,
+        // collapsing away so the table closes its gap smoothly (no scroll jump).
+        for leaving in motion.collapse_at(i, show_src, metrics) {
+            list = list.push(leaving);
+        }
         let sel = selection.is_selected(&f.name);
         let foc = selection.is_focused(&f.name);
         let rm = motion.for_row(&f.name, i, sel);
@@ -1117,6 +1130,10 @@ fn file_listing(
             Layout::Grid => file_row(f.clone(), show_src, sel, foc, rm),
         };
         list = list.push(el);
+    }
+    // MOTION-TRANS-3 — rows removed from at/after the new tail collapse at the end.
+    for leaving in motion.collapse_tail(rows.len(), show_src, metrics) {
+        list = list.push(leaving);
     }
     // BEAUT-FILES — stale-while-refreshing: dim the kept-on-screen rows during a
     // background refresh (full opacity otherwise — a zero-cost pass-through).
