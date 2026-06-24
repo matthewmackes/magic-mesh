@@ -933,28 +933,57 @@ provision_one_vm() {
 # inter-job optimisation, and provision_build_ready already created the baseline).
 reset_running_vms() {
   [ -x "$SNAPSHOT" ] || { warn "farm-vm-snapshot.sh not found at $SNAPSHOT — skipping inter-job reset"; return 0; }
+  # Busy-state across ticks: a VM is reverted to its clean baseline ONLY after a build
+  # finishes (seen busy a prior tick, idle now) — never on every tick — so an idle
+  # clean VM is never needlessly reverted+rebooted (the churn that left them Halted).
+  # for_each_kept_vm calls the cb in-shell (no subshell), so these globals carry across.
+  FARM_BUSY_STATE="${MCNF_FARM_BUSY_STATE:-/var/lib/mcnf-farm/farm-busy-state}"
+  mkdir -p "$(dirname "$FARM_BUSY_STATE")" 2>/dev/null || true
+  PREV_BUSY="$(cat "$FARM_BUSY_STATE" 2>/dev/null || true)"
+  THIS_BUSY=""
   for_each_kept_vm reset_one_vm || warn "could not enumerate kept VMs — inter-job reset skipped this tick"
+  printf '%s' "$THIS_BUSY" > "$FARM_BUSY_STATE" 2>/dev/null \
+    || warn "could not persist farm busy-state to $FARM_BUSY_STATE"
 }
 
-# reset_one_vm <vm-name> <dom0-host> <vm-ip-or-empty> — reset ONE VM to its clean
-# snapshot, UNLESS it's mid-build (a live compiler on <vm-ip>, when known). Best
-# effort: any failure is warned and swallowed (never aborts the tick).
+# reset_one_vm <vm-name> <dom0-host> <vm-ip-or-empty> — keep ONE kept build VM
+# build-ready, correctly (uses PREV_BUSY/THIS_BUSY globals from reset_running_vms):
+#   - building (live cargo/rustc/cc1plus) → leave it; record busy (reset next tick).
+#   - idle, busy LAST tick (job finished) → snapshot-revert to clean baseline + restart.
+#   - idle + clean (not busy last tick)   → leave running; NO needless revert (no churn).
+#   - Halted/unreachable + clean          → start it (a disk-revert leaves a VM Halted;
+#                                           a kept VM must end up running — the bug fix).
+# Best effort: every step's failure is warned + swallowed, never aborts the tick.
 # SC2317: a for_each_kept_vm callback (invoked via "$cb") — indirect call site.
 # shellcheck disable=SC2317
 reset_one_vm() {
-  local name="$1" host="$2" ip="$3"
-  if [ -n "$ip" ]; then
-    if timeout "$PROBE_TIMEOUT" bash -c "cat </dev/null >/dev/tcp/$ip/22" 2>/dev/null \
-       && "${SSH[@]}" -n "$BUILD_USER@$ip" \
-            'pgrep -x cargo >/dev/null 2>&1 || pgrep -x rustc >/dev/null 2>&1 || pgrep -x cc1plus >/dev/null 2>&1' \
-            >/dev/null 2>&1; then
-      log "  skip reset of $name — a build is in flight (won't revert under a live job)"
-      return 0
-    fi
+  local name="$1" host="$2" ip="$3" reachable=0 busy=0
+  if [ -n "$ip" ] && timeout "$PROBE_TIMEOUT" bash -c "cat </dev/null >/dev/tcp/$ip/22" 2>/dev/null; then
+    reachable=1
+    "${SSH[@]}" -n "$BUILD_USER@$ip" \
+      'pgrep -x cargo >/dev/null 2>&1 || pgrep -x rustc >/dev/null 2>&1 || pgrep -x cc1plus >/dev/null 2>&1' \
+      >/dev/null 2>&1 && busy=1
   fi
-  log "  reset $name → clean baseline (dom0 $host)"
-  if ! MCNF_XCP_HOST="$host" MCNF_FARM_KEY="$KEY" "$SNAPSHOT" reset "$name" --xcp-host "$host" >/dev/null 2>&1; then
-    warn "  reset of $name failed/absent (no clean snapshot? mid-provision?) — skipped, tick continues"
+  if [ "$reachable" = 1 ] && [ "$busy" = 1 ]; then
+    log "  $name is building — leave it (reset after the job completes)"
+    THIS_BUSY="${THIS_BUSY}${name}"$'\n'
+    return 0
+  fi
+  # Idle now. Revert to clean ONLY if a build just finished (it was busy last tick).
+  if [ -n "$PREV_BUSY" ] && grep -qxF "$name" <<<"$PREV_BUSY"; then
+    log "  reset $name → clean baseline + restart (job finished; dom0 $host)"
+    if ! MCNF_XCP_HOST="$host" MCNF_FARM_KEY="$KEY" "$SNAPSHOT" reset "$name" --xcp-host "$host" >/dev/null 2>&1; then
+      warn "  reset of $name failed/absent (no clean snapshot? mid-provision?) — skipped, tick continues"
+    fi
+    return 0
+  fi
+  # Idle + clean. Leave a reachable VM running untouched; bring up a Halted/booting one
+  # so every kept VM is build-ready (this un-sticks VMs the old revert left powered off).
+  if [ "$reachable" != 1 ]; then
+    log "  ensure $name running — kept VM unreachable on :22 (Halted/booting); dom0 $host"
+    if ! MCNF_XCP_HOST="$host" MCNF_FARM_KEY="$KEY" "$SNAPSHOT" start "$name" --xcp-host "$host" >/dev/null 2>&1; then
+      warn "  start of $name failed — skipped, tick continues"
+    fi
   fi
 }
 

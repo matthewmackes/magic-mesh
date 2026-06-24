@@ -35,7 +35,7 @@ usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; }
 
 ACTION=""; VM=""
 while [ $# -gt 0 ]; do case "$1" in
-  snapshot | reset | has-clean) ACTION="$1"; shift;;
+  snapshot | reset | has-clean | start) ACTION="$1"; shift;;
   --xcp-host) XCP_HOST="$2"; shift 2;;
   --xcp-user) XCP_USER="$2"; shift 2;;
   --key) KEY="$2"; shift 2;;
@@ -46,7 +46,7 @@ while [ $# -gt 0 ]; do case "$1" in
     shift;;
 esac; done
 
-[ -n "$ACTION" ] || { echo "farm-vm-snapshot: need a verb (snapshot|reset|has-clean)" >&2; usage; exit 2; }
+[ -n "$ACTION" ] || { echo "farm-vm-snapshot: need a verb (snapshot|reset|has-clean|start)" >&2; usage; exit 2; }
 [ -n "$VM" ]     || { echo "farm-vm-snapshot: need a <vm-name-or-uuid>" >&2; usage; exit 2; }
 [ -n "$XCP_HOST" ] || { echo "farm-vm-snapshot: no dom0 — pass --xcp-host or set MCNF_XCP_HOST" >&2; exit 2; }
 [ -s "$KEY" ]      || { echo "farm-vm-snapshot: farm key not found: $KEY" >&2; exit 2; }
@@ -145,11 +145,28 @@ case "$ACTION" in
     LATEST="$(clean_snapshots "$VM_UUID" | head -1)"
     [ -n "$LATEST" ] || { warn "no '$SNAP_NAME' snapshot on '$VM' — run 'snapshot' first"; exit 1; }
     log "reverting to latest '$SNAP_NAME' snapshot $LATEST"
-    # snapshot-revert restores the VM's disks + memory to the snapshot; it leaves
-    # the VM in the snapshot's power state. Idempotent: re-reverting to the same
-    # clean point is a no-op state-wise.
+    # The baseline is a DISK-ONLY snapshot (vm-snapshot above, not a memory checkpoint),
+    # so snapshot-revert returns the disks to the clean baseline but leaves the VM
+    # HALTED. Boot it back so 'reset' yields a VM that is clean AND running
+    # (build-ready) — a kept build VM left powered off is the bug this fixes.
     xe snapshot-revert snapshot-uuid="$LATEST"
-    log "reverted — '$VM' is back to the clean baseline"
+    if xe vm-start uuid="$VM_UUID" >/dev/null 2>&1; then
+      log "reverted + started — '$VM' is clean and running"
+    else
+      log "reverted — '$VM' clean (was already running, or vm-start declined)"
+    fi
+    ;;
+  start)
+    # Ensure the VM is running. Clean-baseline VMs are Halted after a disk-only
+    # snapshot-revert; the reconciler calls this to bring a kept VM back up
+    # build-ready WITHOUT reverting it (it is already clean). Idempotent.
+    if [ "$(xe vm-list uuid="$VM_UUID" params=power-state --minimal 2>/dev/null)" = "running" ]; then
+      log "'$VM' already running — nothing to do"
+    elif xe vm-start uuid="$VM_UUID" >/dev/null 2>&1; then
+      log "'$VM' started"
+    else
+      warn "vm-start of '$VM' failed"
+    fi
     ;;
   has-clean)
     # Quiet build-ready probe: exit 0 iff a `clean` snapshot exists (reuses the same
