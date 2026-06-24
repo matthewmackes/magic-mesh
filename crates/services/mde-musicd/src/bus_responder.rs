@@ -290,6 +290,60 @@ fn str_array(v: &serde_json::Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// MUSIC-RESPONSIVE-4 — the LOCAL (per-node), always-readable cover-art cache
+/// dir: `<music-cache>/artwork/`. Distinct from the communal LizardFS mesh
+/// artwork dir (`crate::cache::artwork_dir`), which can be down — this one lives
+/// under the daemon's own `$HOME/.local/share` so the path returned to the GUI is
+/// always openable on the node that served the RPC.
+#[must_use]
+fn local_artwork_dir() -> PathBuf {
+    crate::cache::cache_dir().join("artwork")
+}
+
+/// MUSIC-RESPONSIVE-4 — write `bytes` to the local cover-art cache and return the
+/// absolute file path (creating the dir + writing via a temp-then-rename so a
+/// concurrent reader never sees a half-written image). The id is sanitized to a
+/// single safe filename via [`crate::cache::artwork_filename`] (Subsonic ids are
+/// never trusted as paths). `None` on any IO failure (no dir, read-only, race).
+#[must_use]
+fn materialize_local_artwork(cover_id: &str, bytes: &[u8]) -> Option<PathBuf> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let dir = local_artwork_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let name = crate::cache::artwork_filename(cover_id);
+    let path = dir.join(&name);
+    // Already present + non-empty (a prior pull) → reuse it, no rewrite.
+    if std::fs::metadata(&path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
+    {
+        return Some(path);
+    }
+    let tmp = dir.join(format!(".{name}.tmp"));
+    std::fs::write(&tmp, bytes).ok()?;
+    std::fs::rename(&tmp, &path).ok()?;
+    Some(path)
+}
+
+/// MUSIC-RESPONSIVE-4 — build the `get-cover-art` reply that carries a file PATH
+/// instead of base64 bytes. Materializes `bytes` into the local cache and returns
+/// `{ "path": "<abs>", "bytes": <n> }`. On a materialize failure (e.g. a
+/// read-only cache) it falls back to the legacy base64 `{ "art": … }` shape so
+/// art never silently disappears — but the steady-state reply is a short path, so
+/// the Bus spool no longer grows with cover bytes. Infallible — a materialize
+/// failure degrades to the legacy base64 shape rather than erroring.
+#[must_use]
+fn cover_art_path_reply(cover_id: &str, bytes: &[u8]) -> serde_json::Value {
+    if let Some(path) = materialize_local_artwork(cover_id, bytes) {
+        json!({ "path": path.to_string_lossy(), "bytes": bytes.len() })
+    } else {
+        use base64::Engine;
+        json!({ "art": base64::engine::general_purpose::STANDARD.encode(bytes) })
+    }
+}
+
 /// Parse a queue index from a request body: `{"index":N}` or a bare number.
 fn index_from(body: &str) -> Option<usize> {
     let v: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
@@ -373,24 +427,33 @@ fn dispatch_browse(
                     .map_err(|e| e.to_string())
             }
             "get-cover-art" => {
-                use base64::Engine;
                 let id = song_id_from(body).unwrap_or_default();
-                // MUSIC-ART-SYNC — serve from the communal mesh cache first (art
-                // pulled by any node, reused mesh-wide + offline); on a miss,
-                // fetch from Airsonic and write it through for every other node.
+                // MUSIC-RESPONSIVE-4 — serve cover art by file PATH, not
+                // base64-over-bus. The base64 blob used to ride the reply onto
+                // `reply/<ulid>` in the Bus persistence store, so every cover the
+                // GUI grid requested grew the spool (the EFF-47 ephemeral reaper
+                // only bounded it after the fact). Now the daemon materializes the
+                // image into a LOCAL, always-readable cache file (NOT the LizardFS
+                // mesh mount — that addresses the deferral's "regress when the
+                // mount is down" concern) and returns just its path; the GUI opens
+                // the file directly. The reply now carries a short path string, so
+                // the Bus spool no longer grows with art bytes.
+                //
+                // MUSIC-ART-SYNC still applies: a communal mesh-cache hit (art any
+                // node already pulled) is reused without an Airsonic round-trip,
+                // and a fresh Airsonic pull is written THROUGH to the mesh cache
+                // for every other node. Either way the bytes are also mirrored to
+                // the local cache so the returned path is valid on this node even
+                // when the mesh mount is unreachable.
                 if let Some(bytes) = crate::cache::read_shared_artwork(&id) {
-                    Ok(json!({
-                        "art": base64::engine::general_purpose::STANDARD.encode(&bytes)
-                    }))
+                    Ok(cover_art_path_reply(&id, &bytes))
                 } else {
                     client
                         .get_cover_art_bytes(&id)
                         .await
                         .map(|bytes| {
                             crate::cache::write_shared_artwork(&id, &bytes);
-                            json!({
-                                "art": base64::engine::general_purpose::STANDARD.encode(&bytes)
-                            })
+                            cover_art_path_reply(&id, &bytes)
                         })
                         .map_err(|e| e.to_string())
                 }
@@ -1146,6 +1209,40 @@ mod tests {
         // {"id":...} used to reach getSong as the literal id → HTTP 400).
         assert_eq!(song_id_from(r#"{"foo":"bar"}"#), None);
         assert_eq!(song_id_from(""), None);
+    }
+
+    #[test]
+    fn cover_art_reply_carries_a_path_not_base64_bytes() {
+        // MUSIC-RESPONSIVE-4 — the get-cover-art reply must carry a file PATH, not
+        // the base64 image blob, so the Bus spool stops growing with art bytes.
+        // Point the LOCAL artwork cache at a tempdir (it keys off $HOME via
+        // crate::cache::cache_dir()). One test owns $HOME so there's no parallel race.
+        let home = tempfile::tempdir().expect("tmp home");
+        std::env::set_var("HOME", home.path());
+
+        let bytes = b"\xff\xd8\xff\xe0JFIF-cover-bytes".to_vec();
+        let reply = cover_art_path_reply("al-42", &bytes);
+        // Path, not bytes: the reply has a `path` and NO base64 `art` field.
+        let path = reply
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .expect("path field");
+        assert!(reply.get("art").is_none(), "must not carry base64 art");
+        assert_eq!(
+            reply.get("bytes").and_then(serde_json::Value::as_u64),
+            Some(bytes.len() as u64)
+        );
+        // The path is a real, always-readable local file holding exactly the bytes.
+        let on_disk = std::fs::read(path).expect("materialized art file");
+        assert_eq!(on_disk, bytes);
+        // The path string itself is tiny vs the would-be base64 payload — that's
+        // the whole point: the Bus reply no longer grows with the image.
+        assert!(path.len() < 256, "path reply stays small");
+        // A second call for the same id reuses the file (no rewrite, same path).
+        let again = cover_art_path_reply("al-42", &bytes);
+        assert_eq!(again.get("path"), reply.get("path"));
+
+        std::env::remove_var("HOME");
     }
 
     #[test]
