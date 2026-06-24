@@ -12,9 +12,12 @@
 //!
 //! MUSIC-DOCK-1..5 — the player is a **layer-shell bottom dock**, not a normal
 //! window: the shell is now a `cosmic::iced::daemon` (the `mde-notify-center` /
-//! `mde-mesh-wallpaper` pattern) that maps an Overlay layer surface anchored
-//! bottom+left+right, full height, with `OnDemand` keyboard and **no exclusive
-//! zone** (DOCK-5 — it overlays the desktop, never reserving space). The dock
+//! `mde-mesh-wallpaper` pattern) that maps a full-height Overlay layer surface
+//! anchored on all four edges (top+bottom+left+right, the wallpaper pattern —
+//! MUSIC-DOCK-NORENDER: anchoring only three edges leaves the vertical axis
+//! unspanned, so the compositor maps it at zero height and nothing renders),
+//! with `OnDemand` keyboard and **no exclusive zone** (DOCK-5 — it overlays the
+//! desktop, never reserving space). The dock
 //! slides up from the bottom edge on map (DOCK-2, `set_margin`-driven, honoring
 //! reduce-motion), and "closing" slides it back down to a small always-mapped
 //! bottom-center handle (DOCK-3) — the process never exits on close. The
@@ -55,15 +58,16 @@ type Task<M> = cosmic::iced::Task<M>;
 
 /// MUSIC-DOCK-2 — the bottom-dock slide-up: a Carbon `panel_mount` entrance
 /// (`moderate-02`, 240 ms ease-out), single-sourced from `mde-theme` motion
-/// tokens. The dock starts pushed [`DOCK_SLIDE_PX`] below the bottom edge (a
-/// negative bottom margin) and rises to rest; under reduce-motion the tween
-/// collapses to the ≤80 ms cap and the dock effectively maps in place.
+/// tokens. The dock's content starts pushed [`DOCK_SLIDE_PX`] down (a positive
+/// top margin on the four-edge-anchored surface) and rises to rest; under
+/// reduce-motion the tween collapses to the ≤80 ms cap and the dock effectively
+/// maps in place.
 const DOCK_SLIDE: mde_theme::motion::Motion = mde_theme::motion::Motion::panel_mount();
 /// MUSIC-DOCK-2 — the slide-up travel distance (px): a fixed reveal offset, NOT
-/// the dock's full height. A bottom-anchored full-height surface is translated by
-/// a negative bottom margin; a modest fixed travel reads as a rise from the edge
-/// (translating a full-height surface by its whole height would just fling it
-/// entirely off-screen). Carbon's expansion tier (`moderate-02` reveals ~48px).
+/// the dock's full height. The full-height (four-edge-anchored) surface's top
+/// margin is tweened from this offset to 0, so the content rises into place; a
+/// modest fixed travel reads as a rise (tweening by the whole height would just
+/// fling it off-screen). Carbon's expansion tier (`moderate-02` reveals ~48px).
 const DOCK_SLIDE_PX: f32 = 48.0;
 /// MUSIC-DOCK-2 — the per-frame cadence for the slide tween (~60 fps). Armed
 /// only while the slide is in flight (MOTION-PERF-1 — zero idle wakeups).
@@ -1123,10 +1127,19 @@ impl State {
                 let map = self.show_dock();
                 Task::batch([map, load_home_tasks()])
             }
-            // MUSIC-DOCK-2 — drive the slide tween. While in flight, raise the
-            // dock's bottom margin from -DOCK_SLIDE_PX toward 0 (at rest) along
-            // the eased curve; when complete, clear the tween (the tick
-            // subscription then disarms — no idle wakeups).
+            // MUSIC-DOCK-2 — drive the slide tween. While in flight, shrink the
+            // dock's TOP margin from +DOCK_SLIDE_PX toward 0 (at rest) along the
+            // eased curve; when complete, clear the tween (the tick subscription
+            // then disarms — no idle wakeups).
+            //
+            // MUSIC-DOCK-NORENDER — the surface is now anchored on all four edges
+            // (full height), so a margin offsets only ITS OWN edge: a positive
+            // top margin pushes the whole dock's top edge DOWN by that many px
+            // (the content, which lays out top-down, starts lower and rises into
+            // place). A negative *bottom* margin — what this used to drive — would
+            // only extend the bottom edge below the screen while the top (and all
+            // the visible content) stayed pinned, so it produced no visible rise.
+            // The reveal therefore animates the top margin instead.
             Message::SlideTick => {
                 let Some((tween, _)) = self.slide else {
                     return Task::none();
@@ -1138,8 +1151,8 @@ impl State {
                 let now = std::time::Instant::now();
                 let t = mde_theme::animation::ease(tween.progress(now), DOCK_SLIDE.easing);
                 // SlideUp(distance): translate_y = (1 - t) * distance, i.e. the
-                // dock starts DOCK_SLIDE_PX below the bottom edge and rises to 0
-                // (single-sourced slide math from mde-theme's Transition).
+                // dock starts DOCK_SLIDE_PX down (top margin = +offset) and rises
+                // to 0 (single-sourced slide math from mde-theme's Transition).
                 let offset = mde_theme::animation::Transition::SlideUp(DOCK_SLIDE_PX)
                     .params(t)
                     .translate_y;
@@ -1147,7 +1160,7 @@ impl State {
                     self.slide = None;
                     set_margin(id, 0, 0, 0, 0)
                 } else {
-                    set_margin(id, 0, 0, -(offset.round() as i32), 0)
+                    set_margin(id, offset.round() as i32, 0, 0, 0)
                 }
             }
             // MUSIC-DOCK-3 — "close" slides the dock down to the handle. Destroy
@@ -1897,13 +1910,13 @@ impl State {
         }
     }
 
-    /// MUSIC-DOCK-1/2/5 — map the dock as a full-height bottom Overlay surface
-    /// (anchored bottom+left+right) and start the slide-up. **No exclusive zone**
-    /// (DOCK-5 — it overlays the desktop and never reserves space / reshapes
-    /// other windows). `OnDemand` keyboard so its buttons + search field take
-    /// focus on click; no titlebar (a layer surface has none). The surface is
-    /// created already pushed below the bottom edge (the negative bottom margin)
-    /// so the first slide tick reveals it.
+    /// MUSIC-DOCK-1/2/5 — map the dock as a full-height Overlay surface anchored
+    /// on all four edges (top+bottom+left+right) and start the slide-up. **No
+    /// exclusive zone** (DOCK-5 — it overlays the desktop and never reserves space
+    /// / reshapes other windows). `OnDemand` keyboard so its buttons + search
+    /// field take focus on click; no titlebar (a layer surface has none). The
+    /// surface is created with its content pushed down (a positive top margin) so
+    /// the first slide tick reveals it rising into place.
     fn show_dock(&mut self) -> Task<Message> {
         // Already open → nothing to map (idempotent: a stray RestoreDock while
         // open shouldn't stack a second surface).
@@ -1917,31 +1930,47 @@ impl State {
         let tween =
             mde_theme::animation::Tween::resolved(now, DOCK_SLIDE.duration, self.reduce_motion);
         self.slide = Some((tween, now));
-        // Start DOCK_SLIDE_PX below the edge so the entrance reads (under
-        // reduce-motion the tween is ~instant, so it snaps to 0 on the first
-        // tick — the dock effectively maps in place, honoring reduce-motion).
-        let start_bottom = -(DOCK_SLIDE_PX.round() as i32);
+        // MUSIC-DOCK-NORENDER — start the dock's top edge DOCK_SLIDE_PX down (a
+        // positive top margin) so the entrance rises into place on the slide
+        // ticks (under reduce-motion the tween is ~instant, so it snaps to 0 on
+        // the first tick — the dock effectively maps in place). On a four-edge-
+        // anchored surface a margin offsets only its own edge, so the top margin
+        // is what shifts the visible content; see `Message::SlideTick`.
+        let start_top = DOCK_SLIDE_PX.round() as i32;
         get_layer_surface(SctkLayerSurfaceSettings {
             id,
             namespace: "mde-music".to_string(),
-            // Full-height bottom dock: anchor all but the top is what reserves a
-            // panel; anchoring bottom+left+right + no fixed height fills the
-            // output vertically (the wallpaper anchors all four for full-screen;
-            // the dock leaves the height free so the compositor sizes it to the
-            // output, while the slide margin animates it up from the bottom).
-            anchor: Anchor::BOTTOM.union(Anchor::LEFT).union(Anchor::RIGHT),
-            // No fixed size → fill the anchored axes.
-            size: Some((None, None)),
+            // MUSIC-DOCK-NORENDER (2026-06-24) — full-height dock: anchor ALL FOUR
+            // edges (top+bottom+left+right), exactly like `mde-mesh-wallpaper`.
+            // A layer surface only gets a non-zero extent on an axis when BOTH of
+            // that axis's edges are anchored *or* a fixed size is given for it; a
+            // surface anchored only bottom+left+right with `size: (None, None)`
+            // has its vertical axis unspanned and unsized, so the compositor maps
+            // it at ZERO height — the dock came up invisible (opening "Music"
+            // rendered nothing). Anchoring top+bottom spans the vertical axis so
+            // the compositor sizes it to the output; the DOCK-2 slide-up still
+            // works, now by animating the TOP margin (on a four-edge-anchored
+            // surface a margin offsets only its own edge, so the top margin is
+            // what shifts the visible content down/up — see `Message::SlideTick`).
+            anchor: Anchor::TOP
+                .union(Anchor::BOTTOM)
+                .union(Anchor::LEFT)
+                .union(Anchor::RIGHT),
+            // All four edges anchored → the compositor fills both axes; no fixed
+            // size needed (mirrors the wallpaper's `size: None`).
+            size: None,
             // MUSIC-DOCK-5 — overlay only; reserve NO space (0 = don't push other
             // surfaces). Distinct from the notify-center, which DOES reserve.
+            // Anchoring all four edges does NOT reserve space — only a non-zero
+            // (or -1) exclusive_zone does — so the dock still just overlays.
             exclusive_zone: 0,
             layer: Layer::Overlay,
             // Interactive: buttons + the search field need clicks/focus.
             keyboard_interactivity: KeyboardInteractivity::OnDemand,
             margin: cosmic::iced::platform_specific::runtime::wayland::layer_surface::IcedMargin {
-                top: 0,
+                top: start_top,
                 right: 0,
-                bottom: start_bottom,
+                bottom: 0,
                 left: 0,
             },
             ..Default::default()
