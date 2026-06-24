@@ -1524,7 +1524,7 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
 - [>] **MOTION-A11Y-1: wire reduce-motion through every consumer (P0).** **As** a user, **I want** reduce-motion honored everywhere, **so that** the shell is accessible. **Acceptance:** with `MDE_REDUCE_MOTION=1` no surface moves (crossfade/instant only) and every loading/refresh state still reads via text/icon. *(deps: Epics 1,2)*
   - *Plumbing + env override landed (2026-06-21):* `live_theme::reduce_motion()` now honors `MDE_REDUCE_MOTION=1/true/yes` (case-insensitive) on top of the persisted a11y pref — the acceptance's env knob. The reduce-motion contract routes through `Motion::resolved`/`Tween::resolved` + this flag; current consumers (skeleton/NET-2, NET-1 indicator) read it. Test: `reduce_motion_honors_the_env_override`. **STILL `[>]`:** "every consumer ⇒ no surface moves" completes as the animated consumers land (most gated on the iced-0.14 opacity/transform widget, UX-PRE).
 - [✓] **MOTION-A11Y-2: disable non-essential motion + respect system prefs (P2).** **As** a user, **I want** to drop decorative motion but keep state cues, **so that** I tune comfort. **Acceptance:** decorative-off removes lifts/shimmer but keeps loading/progress/state cues; local config stays authoritative (Cosmic exposes none — GUI-9). *(deps: A11Y-1)*
-- [>] **MOTION-A11Y-3: no flashing / bounded pulse + keyboard/SR semantics (P1).** **As** a user, **I want** no flashing + intact a11y semantics during motion, **so that** it's safe. **Acceptance:** no animation exceeds the flash threshold (≤3 Hz); keyboard focus + accesskit tree unchanged during motion. *(deps: A11Y-1)*
+- [✓] **MOTION-A11Y-3: no flashing / bounded pulse + keyboard/SR semantics (P1).** **As** a user, **I want** no flashing + intact a11y semantics during motion, **so that** it's safe. **Acceptance:** no animation exceeds the flash threshold (≤3 Hz); keyboard focus + accesskit tree unchanged during motion. *(deps: A11Y-1)*
 **Epic 8 — Consistency Audit & Refactor**
 - [✓] **MOTION-AUDIT-1: inventory static/no-feedback components (P1).** **As** the project, **I want** a gap list of components lacking standard feedback, **so that** coverage is complete. **Acceptance:** a checklist of gaps, each lifted to a MOTION-FEEDBACK/TRANS task. *(deps: Epics 3,5)*
 - [ ] **MOTION-AUDIT-2: replace duplicate/one-off animation logic with shared primitives (P1).** **As** the project, **I want** all motion routed through MOTION-INFRA, **so that** there are no isolated one-screen effects. **Acceptance:** a lint finds no bespoke animation tick/literal outside the shared module. *(deps: Epic 2)*
@@ -1832,7 +1832,7 @@ the plane and it **survives killing the current zone leader**.
 - [✓] **DATACENTER-12: Storage tab (SR/VDI/create + scheduled snapshots + image library).**
   **Acceptance**:
     - [ ] SRs + VDIs (attach/detach/create); scheduled snapshots w/ retention + backup target; ISO + template library (absorbs `images`); SR capacity threshold alerts → Bus/Hub
-- [>] **DATACENTER-13: Network tab (L2 + overlay + topology + unified IP/DNS).**
+- [✓] **DATACENTER-13: Network tab (L2 + overlay + topology + unified IP/DNS).**
   **Acceptance**:
     - [ ] networks/PIFs/VLANs/NIC mgmt/create; overlay peer/route management; an interactive topology map (hosts↔networks↔VMs↔gateway); a unified IP/DNS view correlating UniFi leases ↔ DO DNS ↔ overlay IPs
 - [>] **DATACENTER-14: Gateway tab (UniFi full control).**
