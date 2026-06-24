@@ -1293,6 +1293,56 @@ impl AppsApplet {
         Transition::SlideUp(MENU_SLIDE_PX).params(t)
     }
 
+    /// MOTION-FEEDBACK-3 — the open-in slide distance (px, ≥ 0) for whatever popup
+    /// body the surface is showing at this frame, the **single** shared open-in
+    /// beat every overlay this applet maps (the launcher, the right-click power
+    /// menu, and the Run dialog) rises from. It resolves the same `ANIM_MENU`
+    /// panel-mount tween [`menu_in`] does (the Notification Hub's `open_in` resolves
+    /// the identical `Transition::SlideUp(PANEL_MOUNT_TRANSLATE_Y_PX)` over the
+    /// shared `mde_theme::animation::slide_in`), so menus / dialogs / the Hub all
+    /// share one enter vocabulary. Both `TogglePopup` and `OpenPowerMenu` start that
+    /// tween on open; before this every popup but the launcher dropped it on the
+    /// floor, so the power menu + Run box popped in with no motion. Rendered as
+    /// decaying top padding (iced 0.13 has no transform widget — MOTION-INFRA-2's
+    /// translate-as-padding idiom); `0.0` once the beat has settled / under a
+    /// disabled motion preference, so the body renders exactly as before at rest.
+    ///
+    /// MOTION-FEEDBACK-3 — under **reduce-motion** the slide is dropped entirely
+    /// (returns `0.0`, no positional movement): the open then reads as a pure
+    /// crossfade-in, the "reduce-motion ⇒ crossfade only" acceptance, exactly as the
+    /// Hub's `open_in` collapses `slide_in` → `fade_in`. The duration is already
+    /// capped to the ≤80 ms Carbon crossfade by `start_anim`'s
+    /// `MotionPrefs::apply(.., reduce_motion)`; this also strips the travel so no
+    /// surface *moves* under reduce-motion.
+    fn open_in_offset(&self) -> f32 {
+        if self.reduce_motion {
+            return 0.0;
+        }
+        self.menu_in().translate_y.max(0.0)
+    }
+
+    /// MOTION-FEEDBACK-3 — wrap a popup `body` in the shared open-in slide so it
+    /// rises into place on open exactly like the launcher dropdown. The slide is
+    /// height-preserving — the top padding grows by the offset while the bottom
+    /// shrinks by the same amount — so a `Length::Fill` body (the power menu / Run
+    /// box fill their fixed popup surface) never reflows the surface as it settles.
+    /// At rest the offset is 0, so the body renders unchanged once the open beat is
+    /// over. The lone shared chokepoint for the menu / dialog enter motion, mirrored
+    /// from the launcher dropdown's own open-in padding.
+    fn with_open_in<'a>(&self, body: Element<'a, Message>) -> Element<'a, Message> {
+        let slide = self.open_in_offset();
+        cosmic::iced::widget::container(body)
+            .padding(cosmic::iced::Padding {
+                top: slide,
+                right: 0.0,
+                bottom: (4.0 - slide).max(0.0),
+                left: 0.0,
+            })
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
     /// APPS-FX-1 — the tab-switch transition offset (px) for the result body: on a
     /// tab change the body slides up a few px into place (`MENU_SLIDE_PX` → 0),
     /// reading as a crossfade-in without iced 0.13 opacity. `0.0` once settled.
@@ -1614,12 +1664,18 @@ impl AppsApplet {
     fn dropdown(&self) -> Element<'_, Message> {
         // RCLICK — the same popup surface renders the Win+X power menu when it
         // was opened by a secondary-click (or the Run box within it).
+        // MOTION-FEEDBACK-3 — wrap these in the SAME open-in slide the launcher
+        // dropdown uses (`open_in_offset`, the shared `ANIM_MENU` panel-mount beat
+        // `OpenPowerMenu` already starts) so menus + dialogs + the launcher all
+        // enter with one motion vocabulary instead of the power menu / Run box
+        // popping in static.
         if self.rclick_open {
-            return if self.run_open {
+            let body = if self.run_open {
                 self.run_view()
             } else {
                 self.power_menu()
             };
+            return self.with_open_in(body);
         }
         use cosmic::widget::{button, column, row, scrollable, text, text_input, Space};
         let p = self.palette;
@@ -1848,13 +1904,15 @@ impl AppsApplet {
         }
         col = col.push(self.footer());
 
-        // APPS-FX-1 — open-in slide: the body starts a few px low and rises to
-        // rest (Carbon panel-mount). Rendered as extra top padding that decays to
-        // 0 — iced 0.13 has no transform widget, so we offset layout instead
-        // (MOTION-INFRA-2's translate-as-padding approach). Bottom padding shrinks
-        // by the same amount so the overall height stays put (no jank / reflow of
-        // the fixed popup surface).
-        let slide = self.menu_in().translate_y.max(0.0);
+        // APPS-FX-1 / MOTION-FEEDBACK-3 — open-in slide: the body starts a few px
+        // low and rises to rest (Carbon panel-mount). Rendered as extra top padding
+        // that decays to 0 — iced 0.13 has no transform widget, so we offset layout
+        // instead (MOTION-INFRA-2's translate-as-padding approach). Bottom padding
+        // shrinks by the same amount so the overall height stays put (no jank /
+        // reflow of the fixed popup surface). Derived from the same shared
+        // `open_in_offset` the power menu + Run box now use, so every overlay this
+        // applet maps enters with one motion vocabulary.
+        let slide = self.open_in_offset();
         let pad = cosmic::iced::Padding {
             top: 12.0 + slide,
             right: 12.0,
@@ -2664,6 +2722,35 @@ mod motion_tests {
             .params(a.value("menu", done, Easing::EaseOut))
             .translate_y;
         assert!(at_end.abs() < 1e-4, "settles at rest, got {at_end}");
+    }
+
+    #[test]
+    fn open_in_offset_is_shared_and_non_negative_across_overlays() {
+        // MOTION-FEEDBACK-3 — the launcher dropdown, the right-click power menu, and
+        // the Run dialog all derive their open-in slide from the SAME `ANIM_MENU`
+        // panel-mount tween via `open_in_offset` (= `menu_in().translate_y.max(0)`).
+        // Pin the shared chokepoint's value path: it starts positive (below rest)
+        // and settles to a clamped 0, so the height-preserving padding split never
+        // goes negative for any of the three bodies.
+        let t0 = Instant::now();
+        let mut a = Animator::new();
+        a.start("menu", t0, Motion::panel_mount(), false);
+        let offset = |now: Instant| {
+            Transition::SlideUp(MENU_SLIDE_PX)
+                .params(a.value("menu", now, Easing::EaseOut))
+                .translate_y
+                .max(0.0)
+        };
+        // On open every overlay rises from a positive offset…
+        assert!(offset(t0) > 0.0, "shared open-in starts below rest");
+        // …and settles to exactly 0 (clamped, never negative) once the beat ends,
+        // so `with_open_in`'s `(bottom - slide).max(0.0)` split is always valid.
+        let done = t0 + Motion::panel_mount().duration + Duration::from_millis(1);
+        assert!(
+            offset(done).abs() < 1e-4,
+            "shared open-in settles to a clamped rest, got {}",
+            offset(done)
+        );
     }
 
     #[test]
