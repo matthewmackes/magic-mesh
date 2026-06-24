@@ -98,8 +98,8 @@ pub fn variant_button<'a, Message: Clone + 'a>(
         // accessor loads the prefs file; reading it for every button every
         // frame would be a per-render disk-I/O storm. At most one button is
         // hovered per frame, matching the established once-per-view cost.
-        let reduce_motion = matches!(status, ButtonStatus::Hovered)
-            && crate::live_theme::reduce_motion();
+        let reduce_motion =
+            matches!(status, ButtonStatus::Hovered) && crate::live_theme::reduce_motion();
         variant_button_style(variant, accent, palette, reduce_motion, status)
     };
 
@@ -650,7 +650,11 @@ mod tests {
 
     // MOTION-FEEDBACK-1 — status→style mapping for the shared variant_button.
 
-    fn style_for(variant: ButtonVariant, reduce_motion: bool, status: ButtonStatus) -> button::Style {
+    fn style_for(
+        variant: ButtonVariant,
+        reduce_motion: bool,
+        status: ButtonStatus,
+    ) -> button::Style {
         let palette = crate::live_theme::palette();
         let accent = palette.accent.into_cosmic_color();
         variant_button_style(variant, accent, palette, reduce_motion, status)
@@ -675,7 +679,10 @@ mod tests {
             "hover must change the background (accent tint)"
         );
         // Movement: a raised lift shadow at the Carbon hover-shadow strength.
-        assert!(active.shadow.offset.y.abs() < f32::EPSILON, "resting button has no lift");
+        assert!(
+            active.shadow.offset.y.abs() < f32::EPSILON,
+            "resting button has no lift"
+        );
         assert!(
             (hovered.shadow.offset.y - CARD_SHADOW_HOVER_OFFSET_Y).abs() < f32::EPSILON,
             "hover lift uses the Carbon hover-shadow offset"
@@ -691,7 +698,11 @@ mod tests {
         // The hover feedback must not touch the structural chrome: border width
         // is unchanged from the resting (Active) border, and the helper never
         // sets a height/padding (those live on the widget, not the style).
-        for variant in [ButtonVariant::Primary, ButtonVariant::Secondary, ButtonVariant::Ghost] {
+        for variant in [
+            ButtonVariant::Primary,
+            ButtonVariant::Secondary,
+            ButtonVariant::Ghost,
+        ] {
             let active = style_for(variant, false, ButtonStatus::Active);
             let hovered = style_for(variant, false, ButtonStatus::Hovered);
             assert!(
@@ -733,7 +744,10 @@ mod tests {
             p.r <= h.r && p.g <= h.g && p.b <= h.b && (p.r < h.r || p.g < h.g || p.b < h.b),
             "press darkens the background relative to hover"
         );
-        assert!(pressed.shadow.offset.y.abs() < f32::EPSILON, "no lift on press");
+        assert!(
+            pressed.shadow.offset.y.abs() < f32::EPSILON,
+            "no lift on press"
+        );
     }
 
     #[test]
@@ -760,7 +774,10 @@ mod tests {
         for variant in [ButtonVariant::Secondary, ButtonVariant::Ghost] {
             let active = style_for(variant, false, ButtonStatus::Active);
             let hovered = style_for(variant, false, ButtonStatus::Hovered);
-            assert!(bg_color(&active).a < f32::EPSILON, "{variant:?} rests transparent");
+            assert!(
+                bg_color(&active).a < f32::EPSILON,
+                "{variant:?} rests transparent"
+            );
             assert!(
                 bg_color(&hovered).a > f32::EPSILON,
                 "{variant:?} gains a visible hover wash"
