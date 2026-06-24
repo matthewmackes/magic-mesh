@@ -19,6 +19,23 @@
 //! DATACENTER-4 XAPI-over-overlay, DATACENTER-3 mesh secrets) without touching the
 //! brain or the Bus contract.
 //!
+//! DATACENTER-5 (this increment): **per-zone leaders** + a **storage/net/gateway
+//! rollup**. The single shared `.mackesd-leader.lock` is split into one lock *per
+//! zone* ([`Zone::lock_name`]) so each substrate is led independently:
+//! * the **DO / global** zone can be led by *any* eligible node (it reaches DO over
+//!   the public internet);
+//! * the **Xen** + **gateway** zones are **on-LAN-gated** — only a node that holds a
+//!   `172.20.x` lab-LAN address ([`node_on_lan`]) may take their leadership, because
+//!   only an on-LAN node can `xe`/`ssh` the dom0s and the router. An off-LAN node
+//!   simply never contends for those locks, so leadership lands where the reach is.
+//!
+//! Killing a zone leader still re-elects within the 60 s lease window
+//! ([`crate::leader`]) — now independently per zone. On top of the per-resource
+//! events the leader also publishes one **rollup** per zone
+//! (`event/dc/rollup/<zone>`): a deduped storage/net/gateway/compute summary
+//! ([`zone_rollups`]) so the cross-zone capacity headline is first-class mesh state,
+//! not only a panel-local reduction.
+//!
 //! DATACENTER-4 (done): the Xen source now routes its `xe`-over-SSH per node —
 //! [`resolve_xe_route`] picks **Direct** when this node is on the `172.20.0.0/16`
 //! lab LAN (or no relay is set) and **ProxyJump** through an on-LAN relay peer
@@ -113,7 +130,30 @@ impl DatacenterOrchestrator {
     /// Reconcile against the full current resource set. Emits an event for each
     /// resource whose signature is new or changed, plus a `gone` event for each
     /// previously-seen resource no longer present. Advances internal state.
+    ///
+    /// Full-scope: every previously-seen resource is a gone candidate. The worker
+    /// uses [`Self::reconcile_scoped`] so it only gone's resources in the zones it
+    /// currently leads.
     pub fn reconcile(&mut self, current: &[DcResource]) -> Vec<DcEvent> {
+        self.reconcile_scoped(current, None)
+    }
+
+    /// DATACENTER-5 — reconcile, scoping gone-detection to `active_zones`.
+    ///
+    /// New/changed emission is unconditional (we only ever gather the zones we
+    /// lead). The gone sweep is the subtle part under per-zone leadership: when this
+    /// node *loses* a zone's leadership, that zone's resources vanish from `current`
+    /// — but they're still alive (the new zone leader publishes them now), so we must
+    /// NOT emit a flood of false `gone` events for them. `active_zones = Some(set)`
+    /// restricts gone-detection (and the forget) to resources whose stored `zone`
+    /// matches the set; a resource in an un-led zone is left frozen in `published`
+    /// (no re-emit, no gone), exactly mirroring the old whole-worker lost-leadership
+    /// freeze. `None` ⇒ every zone active (the plain [`Self::reconcile`] contract).
+    pub fn reconcile_scoped(
+        &mut self,
+        current: &[DcResource],
+        active_zones: Option<&BTreeSet<String>>,
+    ) -> Vec<DcEvent> {
         let mut events = Vec::new();
         let mut seen: BTreeSet<String> = BTreeSet::new();
         for r in current {
@@ -133,12 +173,17 @@ impl DatacenterOrchestrator {
                 });
             }
         }
-        // Anything previously published but now absent → a `gone` event, then drop.
+        // Anything previously published, absent now, AND in an active (led) zone →
+        // a real `gone` event, then drop. Resources in un-led zones are left
+        // untouched (frozen) so losing a zone's leadership doesn't false-gone it.
         let absent: Vec<String> = self
             .published
-            .keys()
-            .filter(|k| !seen.contains(*k))
-            .cloned()
+            .iter()
+            .filter(|(k, (_, _, sig))| {
+                !seen.contains(*k)
+                    && active_zones.is_none_or(|zs| zs.contains(&signature_zone(sig)))
+            })
+            .map(|(k, _)| k.clone())
             .collect();
         for k in absent {
             if let Some((kind, id, _)) = self.published.remove(&k) {
@@ -151,6 +196,203 @@ impl DatacenterOrchestrator {
         }
         events
     }
+}
+
+// ---- per-zone leadership ------------------------------------------------------
+//
+// DATACENTER-5: each substrate is led independently. The DO/global zone reaches
+// DigitalOcean over the public internet, so ANY eligible node can lead it. The Xen
+// + gateway zones live on the `172.20.x` lab LAN, so only an ON-LAN node can reach
+// them — and so only an on-LAN node should ever take their leadership. Splitting the
+// one shared lock into a lock-per-zone is what makes "kill the leader → a survivor
+// re-assumes" hold *per zone*: a roaming laptop that was the DO leader dropping off
+// doesn't strand the Xen zone (a different on-LAN node already leads it), and vice
+// versa.
+
+/// One datacenter zone the orchestrator leads + samples independently. The variant
+/// set is closed: the substrate is DO (production), Xen (dev hosts/VMs/SR/net), and
+/// the on-prem UniFi gateway.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Zone {
+    /// DigitalOcean / production — reachable over the public internet from anywhere.
+    Do,
+    /// The on-prem Xen (XCP-ng) dev substrate — dom0s on the lab LAN.
+    Xen,
+    /// The on-prem UniFi gateway (the lab router) — also on the lab LAN.
+    Gateway,
+}
+
+impl Zone {
+    /// Every zone, in sample order (DO first — it's the always-available one).
+    pub const ALL: [Self; 3] = [Self::Do, Self::Xen, Self::Gateway];
+
+    /// Stable token used in the per-zone leader lock filename + logs.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Do => "do",
+            Self::Xen => "xen",
+            Self::Gateway => "gateway",
+        }
+    }
+
+    /// The `zone` field a resource from this zone carries in its signature — the
+    /// label the panel groups on and the brain's gone-scope matches against. DO ⇒
+    /// `prod`; Xen + gateway are both the on-prem `dev` substrate. (Two distinct
+    /// leader *locks* can share one resource-zone label — the gateway rides the
+    /// dev zone's rollup.)
+    #[must_use]
+    pub const fn resource_zone(self) -> &'static str {
+        match self {
+            Self::Do => "prod",
+            Self::Xen | Self::Gateway => "dev",
+        }
+    }
+
+    /// The per-zone leader-lock filename under the workgroup root. A distinct lock
+    /// per zone means each zone elects its own leader (60 s lease, [`crate::leader`])
+    /// without contending with the others.
+    #[must_use]
+    pub fn lock_name(self) -> String {
+        format!(".mackesd-dc-{}-leader.lock", self.token())
+    }
+
+    /// Is a node eligible to lead this zone given its on-LAN status? The DO zone is
+    /// reachable from anywhere (always eligible); the Xen + gateway zones require an
+    /// on-LAN node (only it can reach the dom0s / router), so an off-LAN node never
+    /// contends for them. PURE — decidable from data, unit-tested without I/O.
+    #[must_use]
+    pub const fn eligible(self, on_lan: bool) -> bool {
+        match self {
+            Self::Do => true,
+            Self::Xen | Self::Gateway => on_lan,
+        }
+    }
+}
+
+// ---- DATACENTER-5: the storage/net/gateway (+ compute) rollup -----------------
+//
+// Mirrors `fleet_rollup`'s shape: a pure reduction over the gathered resources into
+// one compact per-zone summary the panel's Overview can read straight off the Bus
+// (`event/dc/rollup/<zone>`) instead of re-deriving it from every row. The headline
+// numbers are storage (SR count + summed bytes), network count, gateway up/leases,
+// and the compute footprint (hosts/VMs/droplets) — exactly the rollup the
+// Datacenter plane wants.
+
+/// One zone's storage/net/gateway/compute rollup, summed from that zone's resources.
+/// Pure data; serialized into the `event/dc/rollup/<zone>` signature.
+#[derive(Clone, PartialEq, Eq, Debug, Default, serde::Serialize)]
+pub struct ZoneRollup {
+    /// Zone token (`prod` for DO, `dev` for Xen — the same `zone` field the
+    /// per-resource signatures carry, so the panel groups them consistently).
+    pub zone: String,
+    /// Hosts (dom0s) in the zone.
+    pub hosts: usize,
+    /// VMs in the zone.
+    pub vms: usize,
+    /// Droplets in the zone.
+    pub droplets: usize,
+    /// Storage repositories (SRs) in the zone.
+    pub srs: usize,
+    /// Summed SR physical size (bytes) across the zone's storage.
+    pub storage_total_bytes: u64,
+    /// Summed SR physical utilisation (bytes) across the zone's storage.
+    pub storage_used_bytes: u64,
+    /// Networks (bridges) in the zone.
+    pub nets: usize,
+    /// Whether the zone's gateway reported up (only the gateway zone has one).
+    pub gateway_up: bool,
+    /// Active DHCP leases reported by the gateway (0 when there's no gateway).
+    pub gateway_leases: u64,
+}
+
+/// The `zone` field carried in a resource's signature JSON (`"prod"` / `"dev"`),
+/// or `""` when it has none. Pure; reads the already-built signature so the rollup
+/// (and the brain's gone-scope) reuse exactly the zone the per-resource events
+/// publish.
+fn signature_zone(sig: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(sig)
+        .ok()
+        .and_then(|v| {
+            v.get("zone")
+                .and_then(|z| z.as_str())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_default()
+}
+
+/// Read a numeric field out of a resource signature, tolerating both a JSON number
+/// and a JSON string (the `xe` helpers emit byte sizes as strings). `0` when absent
+/// or unparseable. Pure.
+fn sig_u64(sig: &serde_json::Value, field: &str) -> u64 {
+    match sig.get(field) {
+        Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0),
+        Some(serde_json::Value::String(s)) => s.trim().parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Reduce a full resource set into one [`ZoneRollup`] per non-empty zone, as
+/// `rollup`-kind [`DcResource`]s (id = the zone token) so they flow through the same
+/// dedup brain + Bus contract as every other event. PURE — fed the gathered
+/// resources, no I/O, fully unit-tested. A zone with no resources produces no
+/// rollup (so we never publish an all-zero `prod`/`dev` card before the first
+/// sample lands).
+#[must_use]
+pub fn zone_rollups(resources: &[DcResource]) -> Vec<DcResource> {
+    let mut by_zone: BTreeMap<String, ZoneRollup> = BTreeMap::new();
+    for r in resources {
+        // The rollup is itself a resource kind — never roll the rollups up.
+        if r.kind == "rollup" {
+            continue;
+        }
+        let zone = signature_zone(&r.signature);
+        if zone.is_empty() {
+            continue;
+        }
+        let entry = by_zone.entry(zone.clone()).or_default();
+        entry.zone = zone;
+        let sig: serde_json::Value =
+            serde_json::from_str(&r.signature).unwrap_or(serde_json::Value::Null);
+        match r.kind.as_str() {
+            "host" => entry.hosts += 1,
+            "vm" => entry.vms += 1,
+            "droplet" => entry.droplets += 1,
+            "sr" => {
+                entry.srs += 1;
+                entry.storage_total_bytes += sig_u64(&sig, "size");
+                entry.storage_used_bytes += sig_u64(&sig, "used");
+            }
+            "net" => entry.nets += 1,
+            "gateway" => {
+                entry.gateway_up = sig.get("status").and_then(|s| s.as_str()) == Some("up");
+                entry.gateway_leases += sig_u64(&sig, "leases");
+            }
+            _ => {}
+        }
+    }
+    by_zone
+        .into_values()
+        .map(|roll| {
+            let id = roll.zone.clone();
+            let signature = serde_json::json!({
+                "kind": "rollup",
+                "id": id,
+                "zone": roll.zone,
+                "hosts": roll.hosts,
+                "vms": roll.vms,
+                "droplets": roll.droplets,
+                "srs": roll.srs,
+                "storage_total_bytes": roll.storage_total_bytes,
+                "storage_used_bytes": roll.storage_used_bytes,
+                "nets": roll.nets,
+                "gateway_up": roll.gateway_up,
+                "gateway_leases": roll.gateway_leases,
+            })
+            .to_string();
+            DcResource::new("rollup", id, signature)
+        })
+        .collect()
 }
 
 // ---- thin I/O: sample the substrate, emit via the Bus ----
@@ -779,13 +1021,17 @@ fn publish(ev: &DcEvent) {
     crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
 }
 
-/// The supervised worker. Leader-gated (only the elected node samples + publishes,
-/// so a multi-node mesh doesn't multi-publish) and best-effort.
+/// The supervised worker. **Per-zone leader-gated** (DATACENTER-5): each zone is
+/// led independently — the DO/global zone by any eligible node, the Xen + gateway
+/// zones by an on-LAN node — so a multi-node mesh publishes each change once and
+/// killing one zone's leader re-elects only that zone. Best-effort throughout.
 pub struct DatacenterOrchestratorWorker {
     core: DatacenterOrchestrator,
     tick_interval: Duration,
     node_id: String,
-    leader_lock: PathBuf,
+    /// The workgroup root — the per-zone leader locks live directly under it
+    /// ([`Zone::lock_name`]), the same dir the shared `.mackesd-leader.lock` did.
+    workgroup_root: PathBuf,
 }
 
 impl DatacenterOrchestratorWorker {
@@ -794,28 +1040,59 @@ impl DatacenterOrchestratorWorker {
         Self {
             core: DatacenterOrchestrator::new(),
             tick_interval: DEFAULT_TICK_INTERVAL,
-            leader_lock: workgroup_root.join(".mackesd-leader.lock"),
+            workgroup_root,
             node_id,
         }
     }
 
-    /// Only the directory leader orchestrates (no-fixed-center: any eligible node
-    /// can be it, the elected one publishes). Reuses the shared leader lock.
-    fn is_leader(&self) -> bool {
+    /// Does this node lead `zone`? It must be **eligible** for the zone (DO: always;
+    /// Xen/gateway: on-LAN only — `on_lan` is resolved once per tick) AND win that
+    /// zone's own lease. Splitting the lock per zone is what lets leadership land
+    /// where the reach is + re-elect per zone on a leader's death.
+    fn leads_zone(&self, zone: Zone, on_lan: bool) -> bool {
+        if !zone.eligible(on_lan) {
+            return false;
+        }
+        let lock = self.workgroup_root.join(zone.lock_name());
         matches!(
-            crate::leader::try_acquire(&self.leader_lock, &self.node_id),
+            crate::leader::try_acquire(&lock, &self.node_id),
             Ok(crate::leader::AcquireResult::Acquired)
         )
     }
 
     fn tick_once(&mut self) {
-        if !self.is_leader() {
+        // Resolve on-LAN status once per tick — it gates Xen/gateway eligibility
+        // and the Xen source's own route selection reads it again internally.
+        let on_lan = node_on_lan();
+        // Gather only the zones this node leads. An off-LAN node leads neither Xen
+        // nor gateway (it can't reach them), so it never even attempts those
+        // sources. `active` collects the resource-zone label of each led zone so the
+        // brain's gone-sweep is scoped to them (losing a zone must not false-gone it).
+        let mut current = Vec::new();
+        let mut active: BTreeSet<String> = BTreeSet::new();
+        for zone in Zone::ALL {
+            if !self.leads_zone(zone, on_lan) {
+                continue;
+            }
+            active.insert(zone.resource_zone().to_string());
+            current.extend(match zone {
+                Zone::Do => gather_do(),
+                Zone::Xen => gather_xen(),
+                Zone::Gateway => gather_gateway(),
+            });
+        }
+        // Lead nothing this tick (off-LAN with no DO lease, or simply a follower) ⇒
+        // don't reconcile at all, so the brain stays frozen and emits no spurious
+        // gone — the same freeze the single-lock design had on losing leadership.
+        if active.is_empty() {
             return;
         }
-        let mut current = gather_do();
-        current.extend(gather_xen());
-        current.extend(gather_gateway());
-        for ev in self.core.reconcile(&current) {
+        // DATACENTER-5: the storage/net/gateway (+ compute) rollup — one `rollup`
+        // resource per led zone, summed from the gathered set, flowing through the
+        // same dedup brain so it only re-publishes when a zone's headline changes.
+        let rollups = zone_rollups(&current);
+        current.extend(rollups);
+        for ev in self.core.reconcile_scoped(&current, Some(&active)) {
             publish(&ev);
         }
     }
@@ -1102,5 +1379,205 @@ mod tests {
         assert!(local_ipv4s_from_ip_json("not json").is_empty());
         assert!(local_ipv4s_from_ip_json("{}").is_empty());
         assert!(local_ipv4s_from_ip_json("[]").is_empty());
+    }
+
+    // ---- DATACENTER-5: per-zone leadership -------------------------------------
+
+    #[test]
+    fn zone_lock_names_are_distinct_per_zone() {
+        // Each zone gets its own lock file ⇒ each elects independently. None of
+        // them collide with each other or with the legacy shared lock.
+        let names: Vec<String> = Zone::ALL.iter().map(|z| z.lock_name()).collect();
+        assert_eq!(
+            names,
+            vec![
+                ".mackesd-dc-do-leader.lock",
+                ".mackesd-dc-xen-leader.lock",
+                ".mackesd-dc-gateway-leader.lock",
+            ]
+        );
+        // Distinct from one another.
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "no two zones share a lock");
+        // And distinct from the old shared lock (so a split deploy can't clash).
+        assert!(!names.iter().any(|n| n == ".mackesd-leader.lock"));
+    }
+
+    #[test]
+    fn zone_eligibility_gates_xen_and_gateway_to_on_lan() {
+        // DO is reachable from anywhere ⇒ eligible regardless of on-LAN status.
+        assert!(Zone::Do.eligible(true));
+        assert!(Zone::Do.eligible(false));
+        // Xen + gateway are on the lab LAN ⇒ an off-LAN node is NOT eligible (it
+        // can't reach the dom0s / router, so it must never take their leadership).
+        assert!(Zone::Xen.eligible(true));
+        assert!(!Zone::Xen.eligible(false));
+        assert!(Zone::Gateway.eligible(true));
+        assert!(!Zone::Gateway.eligible(false));
+    }
+
+    #[test]
+    fn zone_tokens_are_stable() {
+        assert_eq!(Zone::Do.token(), "do");
+        assert_eq!(Zone::Xen.token(), "xen");
+        assert_eq!(Zone::Gateway.token(), "gateway");
+    }
+
+    // ---- DATACENTER-5: the storage/net/gateway rollup --------------------------
+
+    fn dev_host(id: &str) -> DcResource {
+        let sig = serde_json::json!({"kind":"host","id":id,"zone":"dev"}).to_string();
+        DcResource::new("host", id, sig)
+    }
+    fn dev_sr(id: &str, size: u64, used: u64) -> DcResource {
+        // The xe helper emits byte sizes as STRINGS — the rollup must parse them.
+        let sig = serde_json::json!({
+            "kind":"sr","id":id,"zone":"dev","size":size.to_string(),"used":used.to_string()
+        })
+        .to_string();
+        DcResource::new("sr", id, sig)
+    }
+    fn dev_net(id: &str) -> DcResource {
+        let sig = serde_json::json!({"kind":"net","id":id,"zone":"dev"}).to_string();
+        DcResource::new("net", id, sig)
+    }
+    fn prod_droplet(id: &str) -> DcResource {
+        let sig = serde_json::json!({"kind":"droplet","id":id,"zone":"prod"}).to_string();
+        DcResource::new("droplet", id, sig)
+    }
+    fn dev_gateway(id: &str, up: bool, leases: u64) -> DcResource {
+        let sig = serde_json::json!({
+            "kind":"gateway","id":id,"zone":"dev","status": if up {"up"} else {"down"},"leases":leases
+        })
+        .to_string();
+        DcResource::new("gateway", id, sig)
+    }
+
+    #[test]
+    fn zone_rollups_summarise_storage_net_gateway_per_zone() {
+        let resources = vec![
+            dev_host("d1"),
+            dev_sr("s1", 200, 50),
+            dev_sr("s2", 100, 25),
+            dev_net("n1"),
+            dev_net("n2"),
+            dev_gateway("g1", true, 7),
+            prod_droplet("100"),
+            prod_droplet("101"),
+        ];
+        let rollups = zone_rollups(&resources);
+        // One rollup per non-empty zone, keyed by zone token; BTreeMap order ⇒
+        // dev before prod.
+        assert_eq!(rollups.len(), 2);
+        assert_eq!(rollups[0].kind, "rollup");
+        assert_eq!(rollups[0].id, "dev");
+        assert_eq!(rollups[1].id, "prod");
+
+        let dev: serde_json::Value = serde_json::from_str(&rollups[0].signature).unwrap();
+        assert_eq!(dev["zone"], "dev");
+        assert_eq!(dev["hosts"], 1);
+        assert_eq!(dev["srs"], 2);
+        // Byte sizes summed across both SRs (parsed from their string fields).
+        assert_eq!(dev["storage_total_bytes"], 300);
+        assert_eq!(dev["storage_used_bytes"], 75);
+        assert_eq!(dev["nets"], 2);
+        assert_eq!(dev["gateway_up"], true);
+        assert_eq!(dev["gateway_leases"], 7);
+
+        let prod: serde_json::Value = serde_json::from_str(&rollups[1].signature).unwrap();
+        assert_eq!(prod["zone"], "prod");
+        assert_eq!(prod["droplets"], 2);
+        assert_eq!(prod["srs"], 0);
+        assert_eq!(prod["gateway_up"], false);
+    }
+
+    #[test]
+    fn zone_rollups_skips_zoneless_and_rollup_resources() {
+        // A resource with no `zone` field contributes to no rollup, and an existing
+        // `rollup` resource is never re-rolled (so a re-tick is idempotent).
+        let zoneless = DcResource::new("route", "x", r#"{"kind":"route","id":"x"}"#);
+        let prior_rollup = DcResource::new(
+            "rollup",
+            "dev",
+            r#"{"kind":"rollup","id":"dev","zone":"dev"}"#,
+        );
+        let resources = vec![zoneless, prior_rollup, dev_host("d1")];
+        let rollups = zone_rollups(&resources);
+        assert_eq!(
+            rollups.len(),
+            1,
+            "only the dev zone (from the host) rolls up"
+        );
+        assert_eq!(rollups[0].id, "dev");
+        let dev: serde_json::Value = serde_json::from_str(&rollups[0].signature).unwrap();
+        assert_eq!(dev["hosts"], 1);
+    }
+
+    #[test]
+    fn zone_rollups_empty_for_no_resources() {
+        // No resources ⇒ no rollup card (don't publish an all-zero prod/dev before
+        // the first real sample lands).
+        assert!(zone_rollups(&[]).is_empty());
+    }
+
+    #[test]
+    fn zone_rollup_event_topic_is_event_dc_rollup_zone() {
+        // The rollup flows through the brain → a `event/dc/rollup/<zone>` topic.
+        let mut o = DatacenterOrchestrator::new();
+        let rollups = zone_rollups(&[dev_host("d1")]);
+        let events = o.reconcile(&rollups);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].topic(), "event/dc/rollup/dev");
+    }
+
+    #[test]
+    fn losing_a_zones_leadership_does_not_false_gone_its_resources() {
+        // The crux of per-zone leadership: this node leads BOTH zones, publishes a
+        // prod droplet + a dev host, then loses the dev (Xen) zone. The next tick
+        // only gathers prod — but dev's host must NOT be gone'd (the new Xen leader
+        // is publishing it now). Scoping the gone-sweep to the led zones is what
+        // makes "kill the leader → a survivor re-assumes" clean per zone.
+        let mut o = DatacenterOrchestrator::new();
+        let both = vec![prod_droplet("100"), dev_host("d1")];
+        let active_both: BTreeSet<String> = ["prod".into(), "dev".into()].into_iter().collect();
+        let e = o.reconcile_scoped(&both, Some(&active_both));
+        assert_eq!(e.len(), 2, "both resources first-seen → 2 events");
+
+        // Now we lead ONLY prod. dev's host is absent from `current` but dev is not
+        // in the active set ⇒ no gone for it.
+        let active_prod: BTreeSet<String> = ["prod".into()].into_iter().collect();
+        let e = o.reconcile_scoped(&[prod_droplet("100")], Some(&active_prod));
+        assert!(
+            e.is_empty(),
+            "prod unchanged + dev frozen (not led) ⇒ no events, got {e:?}"
+        );
+
+        // A genuinely-removed prod resource (a led zone) still gone's normally.
+        let e = o.reconcile_scoped(&[], Some(&active_prod));
+        assert_eq!(e.len(), 1);
+        assert!(e[0].signature.is_empty(), "prod droplet really gone");
+        assert_eq!(e[0].topic(), "event/dc/droplet/100");
+    }
+
+    #[test]
+    fn full_scope_reconcile_still_gones_everything_absent() {
+        // The plain `reconcile` (active_zones = None) keeps the original contract:
+        // every previously-seen resource absent now is gone'd.
+        let mut o = DatacenterOrchestrator::new();
+        o.reconcile(&[prod_droplet("100"), dev_host("d1")]);
+        let e = o.reconcile(&[]);
+        assert_eq!(e.len(), 2, "both gone under full-scope");
+        assert!(e.iter().all(|ev| ev.signature.is_empty()));
+    }
+
+    #[test]
+    fn zone_resource_zone_maps_do_to_prod_and_lan_to_dev() {
+        // The rollup label + the gone-scope key. Two distinct locks (xen, gateway)
+        // share the on-prem `dev` resource-zone.
+        assert_eq!(Zone::Do.resource_zone(), "prod");
+        assert_eq!(Zone::Xen.resource_zone(), "dev");
+        assert_eq!(Zone::Gateway.resource_zone(), "dev");
     }
 }
