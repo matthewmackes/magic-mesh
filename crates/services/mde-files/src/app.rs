@@ -382,6 +382,31 @@ pub struct MdeFiles {
     /// drives the skeleton-first paint (new listing, no prior content) and the
     /// stale-while-refreshing dim + crossfade (refresh over existing content).
     pub listing_load: crate::loading::ListingLoad,
+    /// MOTION-TRANS-3 — rows that were on screen in the prior render of THIS
+    /// listing but are gone after an in-place refresh (a delete / move / remote
+    /// drop). Each is kept here, with the visible index it last held + when its
+    /// removal was observed, just long enough to collapse away (height + fade →
+    /// 0) so the table closes the gap smoothly instead of jumping. Drained by
+    /// [`crate::widgets::RowMotionCtx::for_removed_row`] returning `None` once the
+    /// collapse elapses (GC'd in `AnimTick`); empty at rest.
+    pub removed_rows: Vec<RemovedRow>,
+    /// MOTION-TRANS-3 — the rows the active listing showed at the previous
+    /// refresh (full data, in display order), used to diff removals on the next
+    /// in-place refresh and to render the departed row's real shape collapsing.
+    prev_listing_rows: Vec<crate::model::FileRow>,
+}
+
+/// MOTION-TRANS-3 — one row collapsing out of the listing: the full row data (so
+/// it renders as the same row shrinking, not a blank bar), the visible index it
+/// last occupied, and when its removal was observed (the collapse origin).
+#[derive(Debug, Clone)]
+pub struct RemovedRow {
+    /// The departed row's data — rendered collapsing at its old slot.
+    pub row: crate::model::FileRow,
+    /// The visible index it held before removal (where the collapse renders).
+    pub index: usize,
+    /// When the removal was observed — the collapse tween origin.
+    pub at: std::time::Instant,
 }
 
 /// v2.0.0 Phase 5.1 — pane currently receiving keyboard input.
@@ -465,6 +490,8 @@ impl Default for MdeFiles {
             reveal_origin: None,
             listing_sig: String::new(),
             listing_load: crate::loading::ListingLoad::default(),
+            removed_rows: Vec::new(),
+            prev_listing_rows: Vec::new(),
         }
     }
 }
@@ -1097,6 +1124,11 @@ impl MdeFiles {
                 {
                     self.reveal_origin = None;
                 }
+                // MOTION-TRANS-3 — drop any removed-row whose collapse has fully
+                // elapsed, so a settled listing keeps no leaving rows around (no
+                // per-row work, no reflow).
+                let collapse_win = Self::collapse_window();
+                self.removed_rows.retain(|r| now < r.at + collapse_win);
                 // BEAUT-FILES — advance the load state to Loaded once its window
                 // elapses so the skeleton/crossfade stops and the tick can idle.
                 self.listing_load.settle(now);
@@ -1279,6 +1311,58 @@ impl MdeFiles {
                 .refresh_in_place(now, self.active_listing_len() > 0);
         }
         self.listing_load.settle(now);
+        // MOTION-TRANS-3 — diff the active listing against the prior render to
+        // drive the remove transition. A signature change is a navigation (the
+        // whole staggered reveal handles it) — reset the diff baseline and drop
+        // any pending collapses. An in-place refresh of the SAME listing collapses
+        // the rows that vanished (delete / move / remote drop) so the table closes
+        // their gap smoothly instead of jumping.
+        let rows = self.active_listing_rows();
+        if sig_changed {
+            self.removed_rows.clear();
+        } else {
+            self.diff_removed_rows(&rows, now);
+        }
+        self.prev_listing_rows = rows;
+    }
+
+    /// MOTION-TRANS-3 — the row data of whichever file listing the active view
+    /// renders, in display order (empty for non-listing views). The diff baseline
+    /// + the collapse-on-remove queue read this.
+    fn active_listing_rows(&self) -> Vec<crate::model::FileRow> {
+        match &self.view {
+            View::Peer(_) | View::MeshHomeChild(_) => self.peer_files.clone(),
+            View::Inbox => self.snapshot.inbox.clone(),
+            View::Outbox => self.snapshot.outbox.clone(),
+            View::Downloads => self.snapshot.downloads.clone(),
+            View::Local => self.local_files.clone(),
+            View::CloudDevices => self.cloud_files.clone(),
+            View::MeshOverview | View::MeshHome | View::MeshUndelete | View::Network => Vec::new(),
+        }
+    }
+
+    /// MOTION-TRANS-3 — queue any row that was on screen in the prior render of
+    /// this same listing but is gone now, so it collapses away at its old slot.
+    /// Skipped entirely under reduce-motion (rows just disappear — the a11y
+    /// contract; nothing is queued so there is no collapse animation). Each queued
+    /// row remembers the index it last held so the collapse renders in place; the
+    /// queue is GC'd by the view + `AnimTick` once each collapse elapses.
+    fn diff_removed_rows(&mut self, new_rows: &[crate::model::FileRow], now: std::time::Instant) {
+        if self.reduce_motion() {
+            self.removed_rows.clear();
+            return;
+        }
+        for (old_index, row) in self.prev_listing_rows.iter().enumerate() {
+            let still_present = new_rows.iter().any(|r| r.name == row.name);
+            let already_collapsing = self.removed_rows.iter().any(|r| r.row.name == row.name);
+            if !still_present && !already_collapsing {
+                self.removed_rows.push(RemovedRow {
+                    row: row.clone(),
+                    index: old_index,
+                    at: now,
+                });
+            }
+        }
     }
 
     /// BEAUT-FILES — the row count of whichever file listing the active view
@@ -1325,6 +1409,14 @@ impl MdeFiles {
         use mde_theme::motion::list;
         let max_delay = (list::STAGGER_CAP as u64 - 1) * u64::from(list::STAGGER_STEP_MS);
         std::time::Duration::from_millis(max_delay + u64::from(list::STAGGER_REVEAL_MS))
+    }
+
+    /// MOTION-TRANS-3 — the longest a removed-row collapse runs before it is
+    /// dropped from `removed_rows`. Matches the Carbon `dialog_mount` (crossfade)
+    /// duration that [`crate::widgets::RowMotionCtx::for_removed_row`] eases the
+    /// collapse over, so the GC fires exactly when the row has finished leaving.
+    fn collapse_window() -> std::time::Duration {
+        mde_theme::motion::Motion::dialog_mount().duration
     }
 
     /// MOTION-FEEDBACK — start (or restart) the hover tween under `key` from now,
@@ -1419,6 +1511,9 @@ impl MdeFiles {
             // crossfade is in flight, so the placeholder breathes + fresh content
             // fades in; goes idle the instant it settles (MOTION-PERF-1).
             || self.listing_load.is_animating(now)
+            // MOTION-TRANS-3 — keep ticking while any removed row is collapsing
+            // away, so the gap closes smoothly; idles the instant the queue drains.
+            || !self.removed_rows.is_empty()
     }
 
     /// MOTION-FEEDBACK — build the read-only [`RowMotionCtx`] the file views pass
@@ -1432,6 +1527,7 @@ impl MdeFiles {
             now: std::time::Instant::now(),
             reduce_motion: self.reduce_motion(),
             load: self.listing_load,
+            removed: &self.removed_rows,
         }
     }
 

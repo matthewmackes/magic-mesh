@@ -536,7 +536,7 @@ pub fn row_hover_key(name: &str) -> String {
 /// [`RowMotionCtx::for_row`]. All fields collapse to "rest" under reduce-motion
 /// (no movement; the state change is instant — the selection accent is still
 /// shown, just not animated).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RowMotion {
     /// Hover-lift offset (px, ≤ 0 = up); 0 at rest.
     pub lift_px: f32,
@@ -545,6 +545,26 @@ pub struct RowMotion {
     pub accent_t: f32,
     /// Staggered-reveal slide offset (px, ≥ 0 = starts below, settles to 0).
     pub reveal_y: f32,
+    /// MOTION-TRANS-3 — presence factor `0.0..=1.0` for the insert/remove
+    /// transition: `1.0` = fully present (a normal/inserted row that has settled),
+    /// easing toward `0.0` as a *removed* row collapses away (its height + opacity
+    /// shrink to nothing). A present row sits at `1.0`; only a row leaving the
+    /// listing dips below it. Drives [`RowMotion::collapse_height_factor`] +
+    /// [`RowMotion::collapse_alpha`].
+    pub presence_t: f32,
+}
+
+impl Default for RowMotion {
+    fn default() -> Self {
+        // A row at rest is fully present (`presence_t == 1.0`) — collapse only
+        // applies to a row that is actively being removed.
+        Self {
+            lift_px: 0.0,
+            accent_t: 0.0,
+            reveal_y: 0.0,
+            presence_t: 1.0,
+        }
+    }
 }
 
 impl RowMotion {
@@ -565,6 +585,33 @@ impl RowMotion {
         let offset = self.lift_px + self.reveal_y;
         let top = (ROW_HOVER_RISE_PX + offset).clamp(0.0, RESERVE);
         (top, RESERVE - top)
+    }
+
+    /// MOTION-TRANS-3 — the height multiplier `0.0..=1.0` for a row mid-collapse:
+    /// `1.0` while present, shrinking to `0.0` as a removed row eases out, so the
+    /// row's reserved vertical space closes smoothly and the rows below slide up
+    /// to fill the gap instead of the whole table jumping. A present row
+    /// (`presence_t == 1.0`) returns `1.0` — a no-op the renderer can skip. Pure;
+    /// the renderer multiplies the row height by this.
+    #[must_use]
+    pub fn collapse_height_factor(self) -> f32 {
+        self.presence_t.clamp(0.0, 1.0)
+    }
+
+    /// MOTION-TRANS-3 — the opacity `0.0..=1.0` a collapsing row renders at,
+    /// derived from the shared [`mde_theme::animation::Transition::FadeOut`] so a
+    /// removed row fades as it shrinks (the iced-0.13-fork reads this as a
+    /// color-alpha multiplier — no opacity widget needed). A fully-present row
+    /// returns `1.0`. The fade runs slightly ahead of the height collapse (the
+    /// `FadeOut` is keyed on `1 - presence_t`) so the row reads as *leaving*
+    /// before its space fully closes.
+    #[must_use]
+    pub fn collapse_alpha(self) -> f32 {
+        use mde_theme::animation::Transition;
+        // `presence_t` 1→0 as the row leaves; FadeOut wants progress 0→1.
+        Transition::FadeOut
+            .params(1.0 - self.presence_t.clamp(0.0, 1.0))
+            .alpha
     }
 
     #[must_use]
@@ -611,6 +658,11 @@ pub struct RowMotionCtx<'a> {
     /// the skeleton-first paint + the stale-while-refreshing dim/crossfade the
     /// file views apply around their row list.
     pub load: crate::loading::ListingLoad,
+    /// MOTION-TRANS-3 — rows removed from this listing since the prior render,
+    /// each collapsing away at the index it last held. Borrowed read-only; the
+    /// view splices them back in via [`RowMotionCtx::collapse_at`] so the table
+    /// closes their gap smoothly instead of jumping. Empty at rest.
+    pub removed: &'a [crate::app::RemovedRow],
 }
 
 impl RowMotionCtx<'_> {
@@ -666,11 +718,13 @@ impl RowMotionCtx<'_> {
         };
 
         if self.reduce_motion {
-            // No movement at all — instant state change (a11y contract).
+            // No movement at all — instant state change (a11y contract). A present
+            // row is fully present (presence_t == 1.0 via Default).
             return RowMotion {
                 lift_px: 0.0,
                 accent_t,
                 reveal_y: 0.0,
+                ..RowMotion::default()
             };
         }
 
@@ -716,7 +770,94 @@ impl RowMotionCtx<'_> {
             lift_px,
             accent_t,
             reveal_y,
+            // A present row is fully present; only `for_removed_row` dips below 1.0.
+            ..RowMotion::default()
         }
+    }
+
+    /// MOTION-TRANS-3 — resolve the collapse [`RowMotion`] for a row that has been
+    /// *removed* from the listing since the prior render. `collapse_origin` is when
+    /// the removal was observed; the row's `presence_t` eases `1.0 → 0.0` over the
+    /// shared exit window so its height + opacity shrink to nothing (the renderer
+    /// closes the gap, so the rows below slide up to fill it instead of the table
+    /// jumping). Under reduce-motion the row is removed instantly (`presence_t == 0`
+    /// at once — no movement, the a11y contract). Returns `None` once the collapse
+    /// has fully elapsed, so a settled listing keeps no leaving rows around (no
+    /// per-row work, no neighbour reflow) — the caller drops the row entirely.
+    #[must_use]
+    pub fn for_removed_row(self, collapse_origin: std::time::Instant) -> Option<RowMotion> {
+        use mde_theme::animation::{ease, Tween};
+        use mde_theme::motion::{Easing, Motion};
+
+        if self.reduce_motion {
+            // No collapse animation — the row is simply gone (instant removal).
+            return None;
+        }
+
+        // The exit shares the Carbon `dialog_mount` *crossfade* family duration
+        // (the same preset the panel/drawer exits use) resolved against
+        // reduce-motion, so removal feels consistent with every other leave.
+        let dur = Motion::dialog_mount().resolved(self.reduce_motion).duration;
+        let tw = Tween::starting_at(collapse_origin, dur);
+        if tw.is_complete(self.now) {
+            // Fully collapsed — the row no longer occupies any space; drop it.
+            return None;
+        }
+        // `t` 0→1 as the collapse progresses; presence is its inverse (1→0). The
+        // collapse is a direct time-based tween from `collapse_origin` (tracked in
+        // the app's `removed_rows` queue) — a leaving row is no longer in the live
+        // list the hover/accent tweens key off, so it needs no animator key.
+        let t = ease(tw.progress(self.now), Easing::EaseOut);
+        Some(RowMotion {
+            presence_t: 1.0 - t,
+            ..RowMotion::default()
+        })
+    }
+
+    /// MOTION-TRANS-3 — render every removed row that last occupied visible index
+    /// `slot`, each collapsing away in place. The view splices these into its row
+    /// column at `slot` so a deleted/moved row closes its gap smoothly (the rows
+    /// below slide up) rather than the table jumping.
+    /// `show_src`/`m` mirror what the live rows render with so the leaving row
+    /// matches the listing rhythm. Yields nothing for rows whose collapse has
+    /// elapsed or under reduce-motion (the row is simply gone). Pure read-only.
+    #[must_use]
+    pub fn collapse_at(
+        &self,
+        slot: usize,
+        show_src: bool,
+        m: crate::density::FileListMetrics,
+    ) -> Vec<Element<'static, Message>> {
+        self.removed
+            .iter()
+            .filter(|r| r.index == slot)
+            .filter_map(|r| {
+                let motion = self.for_removed_row(r.at)?;
+                Some(collapsing_row(r.row.clone(), show_src, m, motion))
+            })
+            .collect()
+    }
+
+    /// MOTION-TRANS-3 — render every removed row whose old visible index is at or
+    /// beyond `len` (the new listing's row count), collapsing away at the tail.
+    /// Catches rows that were removed from the END of the listing (their old slot
+    /// no longer has a live row to splice before). Same contract as
+    /// [`RowMotionCtx::collapse_at`].
+    #[must_use]
+    pub fn collapse_tail(
+        &self,
+        len: usize,
+        show_src: bool,
+        m: crate::density::FileListMetrics,
+    ) -> Vec<Element<'static, Message>> {
+        self.removed
+            .iter()
+            .filter(|r| r.index >= len)
+            .filter_map(|r| {
+                let motion = self.for_removed_row(r.at)?;
+                Some(collapsing_row(r.row.clone(), show_src, m, motion))
+            })
+            .collect()
     }
 }
 
@@ -855,18 +996,35 @@ pub fn file_row(
     // MOTION-FEEDBACK — hover-lift + staggered reveal as compensating padding
     // (no neighbour reflow), wrapped in a `mouse_area` so enter/exit drive the
     // hover tween. The selection accent rides the card's `CardState` tint above.
-    with_row_motion(body, &name, motion)
+    // MOTION-TRANS-3 — the grid tile's collapse footprint is the small object
+    // card's height (icon row + title/subtitle); a stable estimate is fine since
+    // the collapse only scales it toward 0.
+    with_row_motion(body, &name, motion, GRID_TILE_COLLAPSE_PX)
 }
 
-/// MOTION-FEEDBACK — wrap a row/tile body with its [`RowMotion`]: render the
-/// hover-lift + reveal-slide as compensating top/bottom padding so the grid
-/// never reflows, and attach the `mouse_area` enter/exit that arm the hover
-/// tween. At rest (no offset) this is a no-op padding of zero. Shared by both
-/// the grid tile ([`file_row`]) and the list row ([`list_row`]).
+/// MOTION-TRANS-3 — the height (px) a grid tile collapses from when removed. The
+/// small object card is a leading icon beside a 2-line title/subtitle on ~8px
+/// vertical padding; this matches that footprint closely enough to close the gap
+/// smoothly (the collapse only scales it toward 0).
+const GRID_TILE_COLLAPSE_PX: f32 = 56.0;
+
+/// MOTION-FEEDBACK / MOTION-TRANS-3 — wrap a row/tile body with its [`RowMotion`]:
+/// render the hover-lift + reveal-slide as compensating top/bottom padding so the
+/// grid never reflows, and attach the `mouse_area` enter/exit that arm the hover
+/// tween. At rest (no offset) this is a no-op padding of zero. Shared by both the
+/// grid tile ([`file_row`]) and the list row ([`list_row`]).
+///
+/// MOTION-TRANS-3 — when the row is mid-**collapse** (`presence_t < 1.0`, a row
+/// removed since the prior render), the wrapper instead shrinks the row's height
+/// by [`RowMotion::collapse_height_factor`] and fades it via
+/// [`RowMotion::collapse_alpha`], so a removed row closes its gap smoothly and the
+/// rows below slide up to fill it — the table never jumps. A fully-present row
+/// (`presence_t == 1.0`, the common path) skips the collapse entirely.
 fn with_row_motion(
     body: Element<'static, Message>,
     name: &str,
     motion: RowMotion,
+    full_height: f32,
 ) -> Element<'static, Message> {
     use cosmic::iced::widget::mouse_area;
     let (top, bottom) = motion.vertical_padding();
@@ -876,11 +1034,54 @@ fn with_row_motion(
         bottom,
         left: 0.0,
     });
+    // MOTION-TRANS-3 — a row leaving the listing collapses height-stably: its
+    // reserved height is scaled toward 0 (closing the gap) while it fades out.
+    // Clip so the still-full-height body inside doesn't spill past the shrinking
+    // window. Present rows (`collapse_height_factor() == 1.0`) take the cheap
+    // identity path with no extra wrappers.
+    let factor = motion.collapse_height_factor();
     let key = row_hover_key(name);
+    if factor < 1.0 {
+        // Reserve the full row span (body + the compensating padding) so the
+        // collapse closes ALL of the row's vertical footprint, not just the body.
+        let reserved = full_height + ROW_HOVER_RISE_PX + ROW_REVEAL_SLIDE_PX;
+        let h = (reserved * factor).max(0.0);
+        let collapsing = container(padded)
+            .height(Length::Fixed(h))
+            .clip(true)
+            .sty(move |_| container::Style {
+                snap: false,
+                ..container::Style::default()
+            });
+        // No hover handlers on a leaving row — it is on its way out.
+        return collapsing.into();
+    }
     mouse_area(padded)
         .on_enter(Message::RowHoverEnter(key.clone()))
         .on_exit(Message::RowHoverExit(key))
         .into()
+}
+
+/// MOTION-TRANS-3 — render a file row that has been **removed** from the listing
+/// since the prior render, collapsing it away. The row keeps its real
+/// [`list_row`] / [`file_row`] body (so it reads as the same row shrinking, not a
+/// blank bar) wrapped in the collapse-aware [`with_row_motion`]: its height eases
+/// to 0 and it fades out, so the rows below slide up to fill the gap with no
+/// scroll jump. The caller resolves `motion` via
+/// [`RowMotionCtx::for_removed_row`] (which yields `None`, ⇒ drop the row, once
+/// the collapse has fully elapsed or under reduce-motion). `m` carries the
+/// density-resolved metrics so the leaving row matches the live row rhythm.
+pub fn collapsing_row(
+    row_data: FileRow,
+    show_src: bool,
+    m: FileListMetrics,
+    motion: RowMotion,
+) -> Element<'static, Message> {
+    // A leaving row is never selected/focused — it is on its way out. `list_row`
+    // routes through the collapse-aware `with_row_motion` (height → 0); fade the
+    // whole row by `collapse_alpha` so it dims as it shrinks.
+    let body = list_row(row_data, show_src, false, false, m, motion);
+    crate::loading::dim(body, motion.collapse_alpha())
 }
 
 /// File-list head row (caps, dim). DENSITY-SYMMETRY — every metric (column
@@ -1094,7 +1295,7 @@ pub fn list_row(
         }
         col.into()
     };
-    with_row_motion(body, &name, motion)
+    with_row_motion(body, &name, motion, m.row_h)
 }
 
 // ─── Transfer-log row (`.fm-tx`) ───────────────────────────────────────────
@@ -1373,6 +1574,7 @@ mod motion_tests {
             now,
             reduce_motion,
             load: crate::loading::ListingLoad::default(),
+            removed: &[],
         }
     }
 
@@ -1387,6 +1589,7 @@ mod motion_tests {
                     lift_px: lift,
                     accent_t: 0.0,
                     reveal_y: reveal,
+                    ..RowMotion::default()
                 };
                 let (top, bottom) = m.vertical_padding();
                 assert!(top >= 0.0 && bottom >= 0.0, "padding never negative");
@@ -1543,5 +1746,98 @@ mod motion_tests {
         // collide (different keys) so one never disturbs the other.
         assert_ne!(row_hover_key("a"), accent_key("a"));
         assert!(row_hover_key("a").starts_with(HOVER_KEY_PREFIX));
+    }
+
+    // ── MOTION-TRANS-3 — list insert/remove + table-refresh transitions ──────
+
+    #[test]
+    fn present_row_is_fully_present_and_collapse_is_a_noop() {
+        // A normal (present) row sits at presence_t == 1.0 — full height, full
+        // opacity — so the collapse path is a cheap identity for every live row.
+        let rm = RowMotion::default();
+        assert_eq!(rm.presence_t, 1.0, "default row is fully present");
+        assert_eq!(rm.collapse_height_factor(), 1.0, "no height shrink");
+        assert_eq!(rm.collapse_alpha(), 1.0, "no fade");
+        // for_row never dips a present row below full presence.
+        let anim = Animator::new();
+        let now = Instant::now();
+        let c = ctx(&anim, None, None, None, now, false);
+        assert_eq!(c.for_row("live.txt", 0, false).presence_t, 1.0);
+    }
+
+    #[test]
+    fn removed_row_collapses_height_and_fades_then_drops() {
+        // A removed row eases presence 1→0 over the collapse window: height factor
+        // + alpha both shrink monotonically, and once the window elapses
+        // for_removed_row yields None (the caller drops the row entirely).
+        let anim = Animator::new();
+        let origin = Instant::now();
+        let dur = Motion::dialog_mount().duration;
+
+        // At the start: nearly fully present (height ~1, alpha ~1).
+        let c0 = ctx(&anim, None, None, None, origin, false);
+        let m0 = c0
+            .for_removed_row(origin)
+            .expect("collapse in flight at start");
+        assert!(m0.collapse_height_factor() > 0.9, "starts near full height");
+
+        // Midway: strictly between — shrinking + fading.
+        let mid = origin + dur / 2;
+        let cmid = ctx(&anim, None, None, None, mid, false);
+        let mmid = cmid
+            .for_removed_row(origin)
+            .expect("collapse in flight mid");
+        let hmid = mmid.collapse_height_factor();
+        let amid = mmid.collapse_alpha();
+        assert!(
+            hmid > 0.0 && hmid < m0.collapse_height_factor(),
+            "height shrinks"
+        );
+        assert!((0.0..1.0).contains(&amid), "row is fading, got {amid}");
+
+        // After the window: gone — None, so the row is dropped (no leftover).
+        let done = origin + dur + Duration::from_millis(5);
+        let cdone = ctx(&anim, None, None, None, done, false);
+        assert!(
+            cdone.for_removed_row(origin).is_none(),
+            "collapse settled ⇒ row dropped"
+        );
+    }
+
+    #[test]
+    fn reduce_motion_removes_rows_instantly_with_no_collapse() {
+        // a11y: under reduce-motion a removed row simply disappears — no collapse
+        // animation is produced (for_removed_row is None at once).
+        let anim = Animator::new();
+        let now = Instant::now();
+        let c = ctx(&anim, None, None, None, now, true);
+        assert!(
+            c.for_removed_row(now).is_none(),
+            "reduce-motion ⇒ instant removal, no collapse"
+        );
+    }
+
+    #[test]
+    fn collapse_alpha_runs_from_opaque_to_transparent() {
+        // The fade-out maps presence 1→0 onto alpha 1→0 (FadeOut primitive).
+        let opaque = RowMotion {
+            presence_t: 1.0,
+            ..RowMotion::default()
+        };
+        assert!((opaque.collapse_alpha() - 1.0).abs() < 1e-6);
+        let gone = RowMotion {
+            presence_t: 0.0,
+            ..RowMotion::default()
+        };
+        assert!(
+            gone.collapse_alpha().abs() < 1e-6,
+            "fully collapsed ⇒ transparent"
+        );
+        let half = RowMotion {
+            presence_t: 0.5,
+            ..RowMotion::default()
+        };
+        let a = half.collapse_alpha();
+        assert!(a > 0.0 && a < 1.0, "mid-collapse partly faded, got {a}");
     }
 }
