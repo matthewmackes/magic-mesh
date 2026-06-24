@@ -98,7 +98,10 @@ pub use icons::{
     MATERIAL_LINE_WEIGHT_PX,
 };
 pub use load_state::{LoadState, StateTone};
-pub use motion::{Easing, Motion, PANEL_MOUNT_TRANSLATE_Y_PX, PULSE_MAX_SCALE};
+pub use motion::{
+    Easing, Motion, FLASH_SAFE_MAX_HZ, FLASH_SAFE_MIN_PERIOD_MS, PANEL_MOUNT_TRANSLATE_Y_PX,
+    PULSE_MAX_SCALE,
+};
 pub use palette::Palette;
 pub use prefs::{system_reduce_motion, MotionPrefs, MotionRole, Preferences};
 pub use radii::Radii;

@@ -257,6 +257,26 @@ impl ControlFeedback {
             offset: FOCUS_RING_OFFSET_PX,
         }
     }
+
+    /// MOTION-A11Y-3 — the **accessibility focus state** to expose to the
+    /// accesskit / screen-reader tree (accesskit `Focused`), decoupled from the
+    /// focus-ring *animation*.
+    ///
+    /// The focus ring grows in over [`Motion::focus`] (see [`Self::focus_ring`]),
+    /// so its `alpha`/`width` rise from 0 while the tween runs. The
+    /// **semantics**, however, must not animate: a keyboard-focused control is
+    /// focused for the a11y tree the *instant* focus arrives and for the whole
+    /// time it holds focus — never "becoming focused" as the visual ring fills,
+    /// and never flickering between focused/unfocused as motion plays. This
+    /// returns that stable boolean (`== self` focus state, independent of `now`
+    /// and of `reduce_motion`), so a consumer wiring up the accesskit node sets
+    /// `Focused` from here, not from whether the ring has finished drawing. The
+    /// acceptance: keyboard focus + the accesskit tree are unchanged *during*
+    /// motion.
+    #[must_use]
+    pub const fn a11y_focused(self) -> bool {
+        self.focused
+    }
 }
 
 impl Default for ControlFeedback {
@@ -353,14 +373,20 @@ mod tests {
         for ms in [0, 35, 70, 110, 240] {
             let t = now + Duration::from_millis(ms);
             let g = fb.params(t, true);
-            assert_eq!(g.translate_y, 0.0, "no hover-lift under reduce-motion @{ms}ms");
+            assert_eq!(
+                g.translate_y, 0.0,
+                "no hover-lift under reduce-motion @{ms}ms"
+            );
             assert_eq!(g.scale, 1.0, "no press-depress under reduce-motion @{ms}ms");
             assert!(g.is_at_rest());
         }
         // The focus-ring STATE is kept — the ring is present immediately at full
         // width/opacity (it just doesn't animate in).
         let ring = fb.focus_ring(now, true);
-        assert!(ring.is_visible(), "focus ring state kept under reduce-motion");
+        assert!(
+            ring.is_visible(),
+            "focus ring state kept under reduce-motion"
+        );
         assert!((ring.width - FOCUS_RING_WIDTH_PX).abs() < 1e-6);
         assert!((ring.alpha - 1.0).abs() < 1e-6);
     }
@@ -398,6 +424,37 @@ mod tests {
             "ring ends at full width"
         );
         assert!((end.offset - FOCUS_RING_OFFSET_PX).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a11y_focus_is_stable_across_the_whole_focus_ring_animation() {
+        // MOTION-A11Y-3 acceptance: keyboard focus + the accesskit tree are
+        // unchanged *during* motion. The focus ring grows in over Motion::focus(),
+        // so its alpha/width animate from 0 → full — but the a11y-tree focus
+        // boolean must be `true` for the entire focused window, never flickering
+        // with the visual tween and never lagging until the ring finishes drawing.
+        let now = Instant::now();
+        let dur = Motion::focus().duration; // 110 ms
+        let fb = ControlFeedback::new().focused(true, now);
+        // The ring is mid-animation early on (not yet fully drawn)...
+        let early = fb.focus_ring(now + dur / 4, false);
+        assert!(early.width < FOCUS_RING_WIDTH_PX, "ring still growing in");
+        // ...yet the a11y focus state is already (and stays) true across every
+        // frame of the grow-in and after it settles.
+        for ms in [0, 27, 55, 110, 500] {
+            let t = now + Duration::from_millis(ms);
+            assert!(
+                fb.a11y_focused(),
+                "accesskit Focused must hold for the whole focused window @{ms}ms",
+            );
+            // Reduce-motion must not change the SR semantics either.
+            let _ = fb.focus_ring(t, true);
+            assert!(fb.a11y_focused(), "a11y focus is reduce-motion-independent");
+        }
+        // Losing focus flips the a11y state exactly once, to false — not gated on
+        // any leave animation.
+        let unfocused = ControlFeedback::new().focused(false, now);
+        assert!(!unfocused.a11y_focused());
     }
 
     #[test]
