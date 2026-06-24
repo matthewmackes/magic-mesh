@@ -1435,8 +1435,15 @@ impl DatacenterPanel {
                 self.begin_reveal()
             }
             Message::Loaded(Err(e)) => {
+                // Graceful-degrade: a failed Bus read marks the plane stale but
+                // does NOT discard `self.rows` / audit / health — the last-known
+                // snapshot stays rendered under a stale badge (see `view`), and
+                // the Retry button re-fires `load()`. Clearing `status` drops any
+                // lingering "Refreshing…" so the banner is the single source of
+                // truth for the failure.
                 self.load_error = Some(e);
                 self.busy = false;
+                self.status.clear();
                 Task::none()
             }
             Message::RefreshClicked => {
@@ -1990,10 +1997,31 @@ impl DatacenterPanel {
 
     pub fn view(&self) -> Element<'_, crate::Message> {
         let palette = crate::live_theme::palette();
+        // Graceful-degrade (DATACENTER-8 acceptance: "unreachable → last-known +
+        // stale badge + retry"). A failed Bus read keeps the last-known rows in
+        // `self.rows` rather than discarding them; we only fall back to a bare
+        // error screen when there's nothing last-known to show. Otherwise the
+        // view renders as normal with a `stale_banner` pinned at the top.
         if let Some(err) = &self.load_error {
-            return container(text(format!("Couldn't read datacenter state: {err}")))
+            if self.rows.is_empty() {
+                return container(
+                    column![
+                        text("Couldn't read datacenter state.")
+                            .colr(palette.danger.into_cosmic_color())
+                            .size(f32::from(spacing::BASE[6])),
+                        text(err.clone()).colr(palette.text_muted.into_cosmic_color()),
+                        variant_button(
+                            "Retry".to_string(),
+                            ButtonVariant::Primary,
+                            Some(crate::Message::Datacenter(Message::RefreshClicked)),
+                            palette,
+                        ),
+                    ]
+                    .spacing(f32::from(spacing::BASE[2])),
+                )
                 .padding(f32::from(spacing::BASE[5]))
                 .into();
+            }
         }
 
         let prod = self.rows.iter().filter(|r| r.zone == "prod").count();
@@ -2046,6 +2074,13 @@ impl DatacenterPanel {
 
         if !self.status.is_empty() {
             col = col.push(text(self.status.clone()));
+        }
+
+        // Graceful-degrade banner: when a Bus read failed but we still have
+        // last-known rows, pin a stale badge + Retry over the (stale) data rather
+        // than blanking the plane. Color from mde-theme tokens only (§4).
+        if let Some(err) = &self.load_error {
+            col = col.push(stale_banner(err, palette));
         }
 
         // Global search — a free-text needle matched case-insensitively against
@@ -2427,6 +2462,36 @@ impl DatacenterPanel {
 
         scrollable(col).into()
     }
+}
+
+/// DATACENTER-8 — the graceful-degrade banner shown when a Bus read failed but
+/// the panel still holds a last-known snapshot. Renders a `STALE` badge (danger
+/// token), the failure detail (muted token), and a Retry button that re-fires the
+/// `load()` path. Colors come from the live `mde-theme` palette only (§4 — no raw
+/// hex). Pure construction; the staleness decision lives in `view`.
+fn stale_banner<'a>(err: &str, palette: Palette) -> Element<'a, crate::Message> {
+    let badge = container(
+        text("STALE")
+            .colr(palette.danger.into_cosmic_color())
+            .size(f32::from(spacing::BASE[4])),
+    )
+    .padding(f32::from(spacing::BASE[1]));
+    let detail = text(format!("Showing last-known state — Bus read failed: {err}"))
+        .colr(palette.text_muted.into_cosmic_color());
+    let retry = variant_button(
+        "Retry".to_string(),
+        ButtonVariant::Primary,
+        Some(crate::Message::Datacenter(Message::RefreshClicked)),
+        palette,
+    );
+    container(
+        row![badge, detail, retry]
+            .spacing(f32::from(spacing::BASE[2]))
+            .align_y(cosmic::iced::alignment::Vertical::Center),
+    )
+    .padding(f32::from(spacing::BASE[2]))
+    .width(Length::Fill)
+    .into()
 }
 
 /// The number of resource cards per row in the [`card_grid`]. A fixed column
@@ -4109,6 +4174,51 @@ mod tests {
         let _ = p.view(); // dev tab — exercises the VM power+snapshot row + net bridge readout
         let _ = p.update(Message::ViewMode(ViewMode::Tofu));
         let _ = p.view(); // Tofu view — exercises the Plan buttons
+    }
+
+    #[test]
+    fn load_error_keeps_last_known_rows_and_clears_status() {
+        // DATACENTER-8 graceful-degrade: a failed Bus read after a good one must
+        // mark the plane stale WITHOUT discarding the last-known snapshot, so the
+        // operator keeps seeing data (under a stale badge) rather than a blank.
+        let mut p = DatacenterPanel::new();
+        let rows = project_rows(&[(
+            "event/dc/droplet/2".into(),
+            r#"{"kind":"droplet","id":"2","name":"lighthouse-01","status":"active","zone":"prod"}"#
+                .into(),
+        )]);
+        let _ = p.update(Message::Loaded(Ok(DcLoad {
+            rows,
+            ..Default::default()
+        })));
+        assert_eq!(p.rows.len(), 1);
+        assert!(p.load_error.is_none());
+        // A subsequent failed read marks stale but keeps the last-known row.
+        let _ = p.update(Message::Loaded(Err("bus unreachable".to_string())));
+        assert_eq!(
+            p.rows.len(),
+            1,
+            "last-known rows must survive a failed read (graceful-degrade)"
+        );
+        assert_eq!(p.load_error.as_deref(), Some("bus unreachable"));
+        assert!(!p.busy);
+        assert!(
+            p.status.is_empty(),
+            "stale banner is the single failure cue"
+        );
+        // The view renders the stale banner over the kept rows without panicking.
+        let _ = p.view();
+    }
+
+    #[test]
+    fn load_error_with_no_rows_renders_bare_error_with_retry() {
+        // With nothing last-known, the plane falls back to a bare error screen
+        // (which carries a Retry) rather than an empty stale banner.
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::Loaded(Err("bus unreachable".to_string())));
+        assert!(p.rows.is_empty());
+        assert_eq!(p.load_error.as_deref(), Some("bus unreachable"));
+        let _ = p.view(); // exercises the no-last-known error/Retry path
     }
 
     #[test]
