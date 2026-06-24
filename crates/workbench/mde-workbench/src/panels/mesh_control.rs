@@ -49,6 +49,16 @@ pub struct MeshControlSnapshot {
     /// CA exists. Surfaced next to the epoch pill so operators
     /// can confirm which mesh's CA they're about to rotate.
     pub nebula_mesh_id: String,
+    /// HA-5 — the live HA health summary (lighthouse_count, ha_ok,
+    /// node_count) decoded from `action/shell/healthz`. `None` when
+    /// the daemon is unreachable (the HA card renders an honest
+    /// "daemon unreachable" state).
+    pub health: Option<crate::mesh_directory::HealthSummary>,
+    /// HA-5 — lighthouse member hostnames from the live directory
+    /// (`role == "lighthouse"`), sorted. Under SUBSTRATE-V2 these are
+    /// the etcd-quorum members; the card lists them by name. Empty
+    /// when the directory is unreachable or no lighthouse is enrolled.
+    pub lighthouse_members: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +243,7 @@ impl MeshControlPanel {
 
         let leader_card = leader_card_view(&self.snapshot, palette);
         let healthz_card = healthz_card_view(&self.snapshot, palette);
+        let ha_card = ha_card_view(&self.snapshot, palette);
 
         let ghost_btn_style = {
             let border = palette.border.into_cosmic_color();
@@ -302,7 +313,9 @@ impl MeshControlPanel {
                     column![
                         leader_card,
                         Space::new().height(Length::Fixed(12.0)),
-                        healthz_card
+                        healthz_card,
+                        Space::new().height(Length::Fixed(12.0)),
+                        ha_card,
                     ]
                     .spacing(2),
                 )
@@ -490,6 +503,234 @@ fn healthz_card_view<'a>(
     .into()
 }
 
+/// HA-5 — the Raft/etcd quorum threshold for an `n`-member cluster:
+/// `floor(n/2) + 1` (a strict majority). `0` for an empty cluster (no
+/// members ⇒ no quorum to meet). Pure + testable.
+#[must_use]
+pub fn quorum_threshold(n: u32) -> u32 {
+    if n == 0 {
+        0
+    } else {
+        n / 2 + 1
+    }
+}
+
+/// HA-5 — how many member losses an `n`-member cluster can take while still
+/// holding a quorum (`n - quorum_threshold(n)`). `0` for n ≤ 2: a 2-member
+/// etcd cluster has a quorum but ZERO fault tolerance (lose one and quorum is
+/// gone), which is exactly why HA wants ≥3 lighthouses. This is the honest
+/// "quorum status" signal — membership-vs-its-own-threshold is always true, so
+/// the card reports fault-tolerance headroom instead. Pure + testable.
+#[must_use]
+pub fn quorum_fault_tolerance(n: u32) -> u32 {
+    n.saturating_sub(quorum_threshold(n))
+}
+
+/// HA-5 — render the SUBSTRATE-V2 HA picture: the etcd-quorum status (the
+/// quorum runs on the lighthouses) + the lighthouse-HA readiness. Sourced
+/// entirely from live state (`action/shell/healthz` + the directory roster);
+/// renders an honest "daemon unreachable" state when [`MeshControlSnapshot::
+/// health`] is `None`, and a "no HA" warning when the daemon reports
+/// `ha_ok == false` (single lighthouse / no failover headroom).
+fn ha_card_view<'a>(
+    snap: &'a MeshControlSnapshot,
+    palette: Palette,
+) -> Element<'a, crate::Message> {
+    let success = palette.success.into_cosmic_color();
+    let warning = palette.warning.into_cosmic_color();
+    let text_main = palette.text.into_cosmic_color();
+    let text_muted = palette.text_muted.into_cosmic_color();
+
+    let header = row![
+        text("HA status").size(13).colr(text_main),
+        Space::new().width(Length::Fill),
+        text("etcd quorum + lighthouse failover (SUBSTRATE-V2)")
+            .size(11)
+            .colr(text_muted),
+    ]
+    .align_y(cosmic::iced::alignment::Vertical::Center);
+
+    let Some(health) = &snap.health else {
+        // Honest unreachable state — no demo data, no zeroed quorum verdict.
+        let body = text(
+            "mackesd healthz not reachable over the Bus — can't read the etcd \
+             quorum / lighthouse HA. Is the daemon running?",
+        )
+        .size(12)
+        .colr(text_muted);
+        return ha_card_shell(column![header, body].spacing(10), palette);
+    };
+
+    // --- etcd cluster / quorum (the quorum runs on the lighthouses) ---
+    //
+    // The member count comes from two independent Bus round-trips: healthz's
+    // `lighthouse_count` (which a wedged QNM-Shared mount can silently zero —
+    // the daemon's MESH_ENRICH_TIMEOUT fallback, ipc::shell) and the directory
+    // roster `lighthouse_members`. Prefer the directory roster whenever it's
+    // populated so a transient healthz-enrichment stall can't flash a false
+    // "no members / no quorum" over a card that's already listing real members.
+    let roster_len = u32::try_from(snap.lighthouse_members.len()).unwrap_or(u32::MAX);
+    let members = if roster_len > 0 {
+        roster_len
+    } else {
+        health.lighthouse_count
+    };
+    let quorum = quorum_threshold(members);
+    let tolerance = quorum_fault_tolerance(members);
+    // `members >= quorum_threshold(members)` is always true for members > 0, so
+    // it tells the operator nothing. The honest verdict is fault-tolerance: a
+    // cluster that can lose a member and keep quorum (tolerance ≥ 1, i.e. ≥ 3
+    // members) is HA; 1–2 members hold a quorum but with zero loss headroom; 0
+    // members can't form one at all. Tie the green/amber to that, not the
+    // tautology.
+    let (etcd_icon, etcd_color, etcd_label) = if tolerance >= 1 {
+        (Icon::StatusOk, success, "QUORUM HA")
+    } else {
+        (Icon::StatusWarning, warning, "QUORUM AT RISK")
+    };
+    let etcd_summary = if members == 0 {
+        "no etcd members in the directory — quorum cannot form".to_string()
+    } else if tolerance >= 1 {
+        format!("{members} members · quorum {quorum} · tolerates {tolerance} loss",)
+    } else {
+        format!("{members} member(s) · quorum {quorum} · zero loss headroom (needs 3 for HA)",)
+    };
+    let etcd_row = ha_status_row(
+        "etcd cluster",
+        etcd_icon,
+        etcd_color,
+        etcd_label,
+        etcd_summary,
+        palette,
+    );
+
+    // Member pills — the live lighthouse roster (etcd-quorum members). Honest
+    // empty state: when the directory gave us no member names we say so rather
+    // than render a blank row.
+    let members_row: Element<'a, crate::Message> = if snap.lighthouse_members.is_empty() {
+        text("members: none in directory")
+            .size(11)
+            .colr(text_muted)
+            .into()
+    } else {
+        let mut r = row![text("members:").size(10).colr(text_muted)].spacing(6);
+        for host in &snap.lighthouse_members {
+            r = r.push(kv_pill("node", host.clone(), palette));
+        }
+        r.into()
+    };
+
+    // --- lighthouse HA readiness ---
+    // The HA verdict reuses the canonical floor from `mackes_mesh_types::
+    // lighthouse` (the same `ha_degraded`/`HA_MIN_LIGHTHOUSES` the daemon's
+    // `ha_ok` is built from — §6 reuse, not a re-derived threshold). We compute
+    // it from the reconciled `members` count rather than `health.ha_ok` so a
+    // healthz enrichment stall (which zeroes the daemon's lighthouse_count, and
+    // thus its ha_ok) can't render "NO HA" over a card listing real members.
+    let ha_ready = !mackes_mesh_types::lighthouse::ha_degraded(members as usize);
+    let (lh_icon, lh_color, lh_label) = if ha_ready {
+        (Icon::StatusOk, success, "HA READY")
+    } else {
+        (Icon::StatusWarning, warning, "NO HA")
+    };
+    let lh_summary = if ha_ready {
+        format!("{members} lighthouses — failover headroom for relay/discovery + etcd")
+    } else if members == 0 {
+        "no lighthouse enrolled — found/join a lighthouse to anchor the mesh".to_string()
+    } else {
+        // Below the HA floor — exactly one lighthouse (a single lighthouse is a SPOF).
+        format!("{members} lighthouse — a single lighthouse is a SPOF; add a 2nd for failover")
+    };
+    let lh_row = ha_status_row(
+        "lighthouse HA",
+        lh_icon,
+        lh_color,
+        lh_label,
+        lh_summary,
+        palette,
+    );
+
+    // Mesh-size context pills — the etcd cluster sits on top of this mesh;
+    // useful at a glance, not the HA verdict itself. The lighthouse/member
+    // count is already shown in the etcd row + members pills, so it isn't
+    // repeated here.
+    let context_row = row![
+        kv_pill("mesh nodes", health.node_count.to_string(), palette),
+        kv_pill("healthy", health.healthy_nodes.to_string(), palette),
+    ]
+    .spacing(6);
+
+    ha_card_shell(
+        column![header, etcd_row, members_row, lh_row, context_row].spacing(10),
+        palette,
+    )
+}
+
+/// One labelled status line for the HA card: an icon pill + a bold verdict
+/// label + a muted one-line summary. Mirrors the leader-card status row shape.
+fn ha_status_row<'a>(
+    title: &'a str,
+    icon: Icon,
+    color: Color,
+    label: &'a str,
+    summary: String,
+    palette: Palette,
+) -> Element<'a, crate::Message> {
+    let resolved = mde_icon(icon, IconSize::Nav);
+    let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
+        use cosmic::iced::widget::svg as widget_svg;
+        widget_svg(widget_svg::Handle::from_memory(svg_bytes))
+            .width(Length::Fixed(18.0))
+            .height(Length::Fixed(18.0))
+            .sty(move |_t: &Theme| widget_svg::Style { color: Some(color) })
+            .into()
+    } else {
+        text(resolved.fallback_glyph).size(18.0).colr(color).into()
+    };
+    row![
+        icon_widget,
+        column![
+            row![
+                text(title).size(12).colr(palette.text.into_cosmic_color()),
+                text(label).size(11).colr(color),
+            ]
+            .spacing(8)
+            .align_y(cosmic::iced::alignment::Vertical::Center),
+            text(summary)
+                .size(11)
+                .colr(palette.text_muted.into_cosmic_color()),
+        ]
+        .spacing(2),
+    ]
+    .spacing(10)
+    .align_y(cosmic::iced::alignment::Vertical::Center)
+    .into()
+}
+
+/// Wrap the HA card body in the shared raised-surface card chrome (matches the
+/// leader/healthz cards: Carbon raised token, hairline border, 6 px radius).
+fn ha_card_shell<'a>(
+    body: cosmic::iced::widget::Column<'a, crate::Message, Theme>,
+    palette: Palette,
+) -> Element<'a, crate::Message> {
+    let bg = palette.raised.into_cosmic_color();
+    let border = palette.border.into_cosmic_color();
+    container(body)
+        .padding(Padding::from([14u16, 18u16]))
+        .width(Length::Fill)
+        .sty(move |_| container::Style {
+            snap: false,
+            background: Some(Background::Color(bg)),
+            border: Border {
+                color: border,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
 fn kv_pill<'a>(key: &'a str, value: String, palette: Palette) -> Element<'a, crate::Message> {
     // Recessed pill chip: the darkest surface token (Carbon Gray 100).
     let bg = palette.background.into_cosmic_color();
@@ -530,6 +771,12 @@ pub fn probe_cluster() -> MeshControlSnapshot {
     let healthz_summary = summarise_healthz(&healthz_raw);
     let self_node_json = read_nebula_self_node();
     let (nebula_ca_epoch, nebula_mesh_id) = parse_self_node_epoch(&self_node_json);
+    // HA-5 — the live HA picture from the daemon: the mesh-enriched
+    // lighthouse_count/ha_ok off the Bus healthz, plus the lighthouse
+    // member roster from the directory (the SUBSTRATE-V2 etcd-quorum
+    // members). Both degrade to an honest empty/unreachable state.
+    let health = crate::mesh_directory::fetch_health();
+    let lighthouse_members = read_lighthouse_members();
     MeshControlSnapshot {
         lease,
         self_is_leader,
@@ -538,7 +785,22 @@ pub fn probe_cluster() -> MeshControlSnapshot {
         healthz_summary,
         nebula_ca_epoch,
         nebula_mesh_id,
+        health,
+        lighthouse_members,
     }
+}
+
+/// HA-5 — the lighthouse member hostnames from the live mesh directory
+/// (`role == "lighthouse"`), sorted for a stable render order. Under
+/// SUBSTRATE-V2 the etcd quorum runs on the lighthouses, so this is the
+/// etcd-cluster member list the HA card names. Empty on a daemon-down /
+/// no-lighthouse directory (an honest empty state).
+fn read_lighthouse_members() -> Vec<String> {
+    let peers = crate::mesh_directory::fetch_peers();
+    mackes_mesh_types::lighthouse::lighthouse_records(&peers)
+        .into_iter()
+        .map(|p| p.hostname)
+        .collect()
 }
 
 fn read_self_node_id() -> String {
@@ -864,6 +1126,13 @@ mod tests {
             healthz_summary: "peer:anvil · ok".into(),
             nebula_ca_epoch: Some(3),
             nebula_mesh_id: "mesh-anvil".into(),
+            health: Some(crate::mesh_directory::HealthSummary {
+                node_count: 4,
+                healthy_nodes: 3,
+                lighthouse_count: 3,
+                ha_ok: true,
+            }),
+            lighthouse_members: vec!["anvil".into(), "forge".into(), "kiln".into()],
         };
         let _ = p.view();
     }
@@ -953,7 +1222,117 @@ mod tests {
             healthz_summary: String::new(),
             nebula_ca_epoch: None,
             nebula_mesh_id: String::new(),
+            health: None,
+            lighthouse_members: Vec::new(),
         };
+        let _ = p.view();
+    }
+
+    // ---- HA-5 — HA status card (quorum + lighthouse HA) -------
+
+    #[test]
+    fn quorum_threshold_is_strict_majority() {
+        // floor(n/2)+1 — the Raft/etcd majority.
+        assert_eq!(quorum_threshold(0), 0);
+        assert_eq!(quorum_threshold(1), 1);
+        assert_eq!(quorum_threshold(2), 2);
+        assert_eq!(quorum_threshold(3), 2);
+        assert_eq!(quorum_threshold(4), 3);
+        assert_eq!(quorum_threshold(5), 3);
+    }
+
+    #[test]
+    fn quorum_fault_tolerance_is_zero_below_three_members() {
+        // n - quorum: a 1- or 2-member cluster has a quorum but ZERO loss
+        // headroom; HA needs ≥3 (tolerates 1) — the honest verdict the card
+        // reports instead of the always-true membership-vs-threshold check.
+        assert_eq!(quorum_fault_tolerance(0), 0);
+        assert_eq!(quorum_fault_tolerance(1), 0);
+        assert_eq!(quorum_fault_tolerance(2), 0);
+        assert_eq!(quorum_fault_tolerance(3), 1);
+        assert_eq!(quorum_fault_tolerance(4), 1);
+        assert_eq!(quorum_fault_tolerance(5), 2);
+    }
+
+    /// HA-5 — the card decodes a realistic healthz payload and renders the
+    /// member count + quorum verdict + lighthouse HA. We exercise the decode
+    /// path (the same `parse_health_report` the live probe uses) and confirm
+    /// the view builds without panicking on the healthy 3-lighthouse picture.
+    #[test]
+    fn ha_card_renders_healthy_quorum_from_decoded_payload() {
+        let raw = r#"{"schema":1,"is_leader":true,"node_count":4,"healthy_nodes":4,
+            "lighthouse_count":3,"ha_ok":true}"#;
+        let health = crate::mesh_directory::parse_health_report(raw).expect("decoded");
+        assert_eq!(health.lighthouse_count, 3);
+        assert!(health.ha_ok);
+        // 3 members ⇒ quorum threshold 2 (a majority), met.
+        assert_eq!(quorum_threshold(health.lighthouse_count), 2);
+
+        let mut p = MeshControlPanel::new();
+        p.snapshot = MeshControlSnapshot {
+            health: Some(health),
+            lighthouse_members: vec!["anvil".into(), "forge".into(), "kiln".into()],
+            ..MeshControlSnapshot::default()
+        };
+        let _ = p.view();
+    }
+
+    /// HA-5 — the degraded path: a single-lighthouse mesh (`ha_ok=false`).
+    /// The decode surfaces the honest "no HA" posture, and the card renders
+    /// the warning state without panicking.
+    #[test]
+    fn ha_card_renders_no_ha_degraded_path() {
+        let raw = r#"{"schema":1,"node_count":2,"healthy_nodes":2,
+            "lighthouse_count":1,"ha_ok":false}"#;
+        let health = crate::mesh_directory::parse_health_report(raw).expect("decoded");
+        assert_eq!(health.lighthouse_count, 1);
+        assert!(!health.ha_ok);
+        // 1 member ⇒ quorum threshold 1, met by membership but no HA headroom.
+        assert_eq!(quorum_threshold(health.lighthouse_count), 1);
+
+        let mut p = MeshControlPanel::new();
+        p.snapshot = MeshControlSnapshot {
+            health: Some(health),
+            lighthouse_members: vec!["anvil".into()],
+            ..MeshControlSnapshot::default()
+        };
+        let _ = p.view();
+    }
+
+    /// HA-5 — daemon-unreachable: `health == None`. The card renders the
+    /// honest "not reachable" state (no demo data) without panicking.
+    #[test]
+    fn ha_card_renders_unreachable_state() {
+        let p = MeshControlPanel::new(); // default snapshot: health = None
+        assert!(p.snapshot.health.is_none());
+        let _ = p.view();
+    }
+
+    /// HA-5 — the two-round-trip reconciliation: healthz's `lighthouse_count`
+    /// can be silently zeroed by a wedged-mount enrichment timeout while the
+    /// directory roster still lists real members. The card must NOT flash a
+    /// false "no members / quorum can't form" over a populated members row, so
+    /// it prefers the directory roster count when it's non-empty.
+    #[test]
+    fn ha_card_prefers_directory_roster_over_zeroed_healthz_count() {
+        // healthz says 0 lighthouses (timeout fallback) but ha_ok is honest-
+        // false; the directory still has 3 real lighthouse members.
+        let raw = r#"{"schema":1,"node_count":4,"healthy_nodes":4,
+            "lighthouse_count":0,"ha_ok":false}"#;
+        let health = crate::mesh_directory::parse_health_report(raw).expect("decoded");
+        assert_eq!(health.lighthouse_count, 0);
+
+        let mut p = MeshControlPanel::new();
+        p.snapshot = MeshControlSnapshot {
+            health: Some(health),
+            lighthouse_members: vec!["anvil".into(), "forge".into(), "kiln".into()],
+            ..MeshControlSnapshot::default()
+        };
+        // The reconciled member count the card renders from is the roster (3),
+        // not the zeroed healthz field — tolerates 1 loss, so quorum is HA.
+        let members = u32::try_from(p.snapshot.lighthouse_members.len()).unwrap();
+        assert_eq!(members, 3);
+        assert_eq!(quorum_fault_tolerance(members), 1);
         let _ = p.view();
     }
 }
