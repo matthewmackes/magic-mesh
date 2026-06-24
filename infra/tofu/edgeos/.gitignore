@@ -1,0 +1,7 @@
+# Local tofu state holds live lease data (MACs/hostnames) + the null_resource
+# id — never commit it; the device config itself is the durable record.
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+tfplan
+crash.log
