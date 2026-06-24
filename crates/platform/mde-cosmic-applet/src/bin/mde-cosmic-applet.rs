@@ -20,6 +20,7 @@ use cosmic::iced::window::Id;
 use cosmic::iced::{time, Subscription};
 use cosmic::{Application, Element};
 
+use mde_cosmic_applet::{lighthouse_health_from_snapshot, LighthouseHealth, LIGHTHOUSE_FOCUS_SLUG};
 use mde_notify::{severity_token, AlertTail, Severity};
 use mde_theme::{Palette, Rgba};
 
@@ -37,6 +38,11 @@ struct Applet {
     /// NEB-CRYPTO-LABEL — the live Nebula overlay cipher strength shown beside
     /// the bell (`None` = overlay down → no label).
     cipher: Option<String>,
+    /// LIGHTHOUSE-7 — worst-of lighthouse health for the panel indicator
+    /// (`None` = the snapshot names no lighthouses → no dot).
+    lighthouse: LighthouseHealth,
+    /// `(healthy, total)` lighthouse counts behind the indicator's tooltip.
+    lighthouse_counts: (usize, usize),
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +51,9 @@ enum Message {
     Tick,
     /// Click — toggle the Action Center open/closed + clear the indicator.
     Toggle,
+    /// LIGHTHOUSE-7 — click the lighthouse dot → open the Workbench Lighthouses
+    /// tab.
+    OpenLighthouses,
 }
 
 /// Drain fresh alerts off the bus; return the most-severe new alert's severity
@@ -89,6 +98,32 @@ fn toggle_center() {
     }
 }
 
+/// LIGHTHOUSE-7 — the worst-of lighthouse health + `(healthy,total)` counts off
+/// the world-readable mesh-status snapshot. Mirrors the NEB-CRYPTO-LABEL source
+/// (the applet runs as the user + can't read the root-only peer directory), so
+/// the snapshot the root timer writes is the read path. Pure parsing lives in
+/// the lib (`lighthouse_health_from_snapshot`); this is the file read.
+fn lighthouse_health() -> (LighthouseHealth, (usize, usize)) {
+    match std::fs::read_to_string("/run/mde/mesh-status.json") {
+        Ok(body) => {
+            let (h, healthy, total) = lighthouse_health_from_snapshot(&body);
+            (h, (healthy, total))
+        }
+        // No snapshot yet → hide the indicator (honest empty state).
+        Err(_) => (LighthouseHealth::None, (0, 0)),
+    }
+}
+
+/// LIGHTHOUSE-7 — open the Workbench Lighthouses tab. Spawns detached via
+/// `setsid --fork` (same reap-safe pattern as the Action Center toggle); the
+/// Workbench is single-instance + carries a Bus focus-responder, so this raises
+/// a running window onto the tab (LIGHTHOUSE-4) or starts one focused there.
+fn open_lighthouses() {
+    let _ = std::process::Command::new("setsid")
+        .args(["--fork", "mde-workbench", "--focus", LIGHTHOUSE_FOCUS_SLUG])
+        .status();
+}
+
 /// Convert an `mde-theme` Carbon `Rgba` token into an iced color. Single
 /// converter shared by the bell glyph + the cipher label (§4 — colors come
 /// from the palette tokens, never raw literals here).
@@ -109,6 +144,20 @@ fn bell_color(severity: Option<Severity>) -> cosmic::iced::Color {
         // GLYPH-FIX — idle bell in primary text (Carbon Gray-10 ≈ white on the
         // dark panel), not muted gray, so it reads clearly (operator request).
         None => p.text,
+    };
+    to_color(rgba)
+}
+
+/// LIGHTHOUSE-7 — resolve a lighthouse-health Carbon token name to its color.
+/// The lib names the token (`beacon_healthy` green / `danger` red — the
+/// dedicated lighthouse-beacon hues); the shell maps it through the dark
+/// palette, like `Pip::token` → color elsewhere (§4 — no raw literals).
+fn lighthouse_color(token: &str) -> cosmic::iced::Color {
+    let p = Palette::dark();
+    let rgba = match token {
+        "danger" => p.danger,
+        // "beacon_healthy" (and any future addition) reads the beacon-healthy hue.
+        _ => p.beacon_healthy,
     };
     to_color(rgba)
 }
@@ -197,12 +246,15 @@ impl Application for Applet {
     }
 
     fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Message>) {
+        let (lighthouse, lighthouse_counts) = lighthouse_health();
         (
             Applet {
                 core,
                 tail: AlertTail::default(),
                 severity: None,
                 cipher: nebula_cipher(),
+                lighthouse,
+                lighthouse_counts,
             },
             // Prime immediately so the bell reflects existing alerts at launch.
             Task::done(cosmic::Action::App(Message::Tick)),
@@ -220,12 +272,18 @@ impl Application for Applet {
                 self.severity = merge_severity(self.severity, fresh);
                 // Refresh the overlay cipher label (cheap file + pgrep read).
                 self.cipher = nebula_cipher();
+                // LIGHTHOUSE-7 — refresh the worst-of lighthouse indicator off
+                // the snapshot (a cheap world-readable file read).
+                let (lh, counts) = lighthouse_health();
+                self.lighthouse = lh;
+                self.lighthouse_counts = counts;
             }
             Message::Toggle => {
                 toggle_center();
                 // Opening (or closing) the center marks the current alerts seen.
                 self.severity = None;
             }
+            Message::OpenLighthouses => open_lighthouses(),
         }
         Task::none()
     }
@@ -258,13 +316,44 @@ impl Application for Applet {
         let btn = cosmic::widget::button::custom(content)
             .on_press(Message::Toggle)
             .class(cosmic::theme::Button::AppletIcon);
-        Element::from(self.core.applet.applet_tooltip::<Message>(
+        let bell = Element::from(self.core.applet.applet_tooltip::<Message>(
             btn,
             "Notifications — click to open the Action Center".to_string(),
             false,
             |_| Message::Toggle,
             None,
-        ))
+        ));
+
+        // LIGHTHOUSE-7 — the worst-of lighthouse-health indicator: a single dot
+        // (Carbon beacon-healthy green / danger red), worst-of across every
+        // lighthouse, hidden when the snapshot names none. Its OWN button (a
+        // separate press from the bell's Action-Center toggle) deep-links into
+        // the Workbench Lighthouses tab. Sits left of the Activity bell.
+        let mut row_children: Vec<Element<'_, Message>> = Vec::new();
+        if let (Some(token), (healthy, total)) = (self.lighthouse.token(), self.lighthouse_counts) {
+            let dot = cosmic::widget::text("\u{25CF}")
+                .size(12)
+                .class(cosmic::theme::Text::Color(lighthouse_color(token)));
+            let lh_btn = cosmic::widget::button::custom(dot)
+                .on_press(Message::OpenLighthouses)
+                .class(cosmic::theme::Button::AppletIcon);
+            let tip = self
+                .lighthouse
+                .tooltip(healthy, total)
+                .unwrap_or_else(|| "Lighthouses".to_string());
+            row_children.push(Element::from(self.core.applet.applet_tooltip::<Message>(
+                lh_btn,
+                tip,
+                false,
+                |_| Message::OpenLighthouses,
+                None,
+            )));
+        }
+        row_children.push(bell);
+        cosmic::widget::row(row_children)
+            .spacing(4)
+            .align_y(cosmic::iced::Alignment::Center)
+            .into()
     }
 
     fn view_window(&self, _id: Id) -> Element<'_, Message> {
