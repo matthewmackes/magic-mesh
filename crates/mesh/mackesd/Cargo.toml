@@ -328,8 +328,9 @@ name = "magic-mesh"
 # PKG — payload codec. The monolithic RPM bundles every workspace binary
 # (~186 MiB raw); default zstd lands ~103 MiB, over GitHub's 100 MiB file limit
 # for the gh-pages dnf channel. xz packs the same payload under 100 MiB so the
-# RPM can be hosted on GitHub. (A -server subpackage that drops the GUIs — XPA-6 —
-# is the durable fix; this is the size lever until then.)
+# RPM can be hosted on GitHub. (The `magic-mesh-server` variant below — XPA-6 —
+# drops the GUI bins entirely for headless roles; this xz lever keeps the full
+# desktop RPM under the limit.)
 payload_compress = "xz"
 # EFF-40 — the NEVRA release field: bump THIS (not the workspace
 # version) for asset-only/packaging-only changes so `dnf upgrade`
@@ -678,4 +679,146 @@ rsync = "*"
 # (the E8-era RPM; see config/daemon.rs's template note). Obsolete it so
 # a box carrying the old package upgrades cleanly into `magic-mesh`.
 [package.metadata.generate-rpm.obsoletes]
+mde-core = "*"
+
+# XPA-6 — the full package and the GUI-less `magic-mesh-server` subpackage own
+# the same /usr/bin/mackesd + units, so they must not co-install. dnf treats
+# Conflicts symmetrically; declaring it on the full side too makes `dnf swap`
+# between roles explicit. (Harmless when the subpackage isn't present.)
+[package.metadata.generate-rpm.conflicts]
+magic-mesh-server = "*"
+
+# XPA-6 — the GUI-less `magic-mesh-server` subpackage (a cargo-generate-rpm
+# *variant*). Built with `cargo generate-rpm -p crates/mesh/mackesd --variant
+# server`; build-rpm-fedora43.sh's `--server` mode compiles ONLY the daemon +
+# mesh-substrate crates (mackesd/magic-fleet/mde-enroll/mde-bus — none of which
+# pull libcosmic/iced), so a headless build neither gates on the ~100 MB
+# libcosmic GUI compile nor ships the workbench/files/music/voice-hud/applet
+# binaries a Server never runs. cargo-generate-rpm overrides each base
+# generate-rpm key with the variant's value (and `auto_req` regenerates the ELF
+# `Requires` from the listed assets only, so the GUI's gtk3/libcosmic ELF deps
+# drop out automatically). The variant `assets` array REPLACES the base list —
+# it carries the daemon bins + every systemd unit / install-helper / substrate
+# script / doc the headless roles need, minus the desktop GUI surface
+# (app/applet binaries, *.desktop launchers + autostart, the hicolor icon set,
+# and the Carbon wallpaper/cosmic-layout/brand imagery).
+[package.metadata.generate-rpm.variants.server]
+name = "magic-mesh-server"
+summary = "MCNF (headless Server) — the mesh daemon, Nebula overlay + LizardFS substrate, no desktop GUIs"
+# A node carries EITHER the full magic-mesh OR magic-mesh-server, never both:
+# they install the same /usr/bin/mackesd + units, so let dnf refuse co-install
+# and let `dnf swap` move between roles. The full package likewise conflicts
+# with this one (declared base-side would force every full install to know
+# about the subpackage; the variant carries both directions of the pair).
+conflicts = { magic-mesh = "*" }
+# The headless asset set: daemon/CLI bins + the full systemd/substrate/shell/
+# doc payload, MINUS the GUI app+applet binaries, their .desktop launchers and
+# autostart entries, the hicolor icon tree, and the desktop brand imagery.
+assets = [
+    { source = "target/release/mackesd",            dest = "/usr/bin/mackesd",            mode = "755" },
+    { source = "target/release/meshctl",            dest = "/usr/bin/meshctl",            mode = "755" },
+    { source = "target/release/magic-fleet",        dest = "/usr/bin/magic-fleet",        mode = "755" },
+    # ONBOARD-5 — the Magic enrollment TUI (headless over SSH).
+    { source = "target/release/mde-enroll",         dest = "/usr/bin/mde-enroll",         mode = "755" },
+    { source = "target/release/magic-setup",        dest = "/usr/bin/magic-setup",        mode = "755" },
+    { source = "target/release/mde-bus",            dest = "/usr/bin/mde-bus",            mode = "755" },
+    # PKG-3 — the self-gating daemon unit + the health/alert watchdog.
+    { source = "packaging/systemd/mackesd.service",   dest = "/usr/lib/systemd/system/mackesd.service",   mode = "644" },
+    { source = "packaging/systemd/mesh-health.service",  dest = "/usr/lib/systemd/system/mesh-health.service",  mode = "644" },
+    { source = "packaging/systemd/mesh-health.timer",    dest = "/usr/lib/systemd/system/mesh-health.timer",    mode = "644" },
+    { source = "packaging/systemd/mesh-alert@.service",  dest = "/usr/lib/systemd/system/mesh-alert@.service",  mode = "644" },
+    { source = "packaging/systemd/nebula.service.d/10-mesh-recovery.conf", dest = "/usr/lib/systemd/system/nebula.service.d/10-mesh-recovery.conf", mode = "644" },
+    { source = "install-helpers/mesh-health-check.sh",   dest = "/usr/libexec/mackesd/mesh-health-check",       mode = "755" },
+    { source = "install-helpers/mesh-alert.sh",          dest = "/usr/libexec/mackesd/mesh-alert",              mode = "755" },
+    # ONBOARD-6 / SUBSTRATE — the QNM-Shared + etcd + Syncthing substrate.
+    { source = "install-helpers/setup-qnm-shared.sh",    dest = "/usr/libexec/mackesd/setup-qnm-shared",        mode = "755" },
+    { source = "install-helpers/setup-etcd.sh",          dest = "/usr/libexec/mackesd/setup-etcd",              mode = "755" },
+    { source = "packaging/systemd/etcd.service",         dest = "/etc/systemd/system/etcd.service",             mode = "644" },
+    { source = "install-helpers/setup-syncthing.sh",     dest = "/usr/libexec/mackesd/setup-syncthing",         mode = "755" },
+    { source = "install-helpers/syncthing-reconcile.sh", dest = "/usr/libexec/mackesd/syncthing-reconcile",     mode = "755" },
+    { source = "packaging/systemd/syncthing.service",    dest = "/etc/systemd/system/syncthing.service",        mode = "644" },
+    { source = "install-helpers/setup-caddy.sh",         dest = "/usr/libexec/mackesd/setup-caddy",             mode = "755" },
+    { source = "install-helpers/cutover-substrate-v2.sh", dest = "/usr/libexec/mackesd/cutover-substrate-v2",    mode = "755" },
+    { source = "install-helpers/verify-boot-recovery.sh", dest = "/usr/libexec/mackesd/verify-boot-recovery",   mode = "755" },
+    # SETUP-fix — the shared bus spool (tmpfiles + environment.d).
+    { source = "packaging/tmpfiles/magic-mesh.conf",     dest = "/usr/lib/tmpfiles.d/magic-mesh.conf",          mode = "644" },
+    { source = "packaging/environment.d/90-mde-bus.conf", dest = "/usr/lib/environment.d/90-mde-bus.conf",       mode = "644" },
+    { source = "packaging/environment.d/90-mde-workgroup.conf", dest = "/usr/lib/environment.d/90-mde-workgroup.conf", mode = "644" },
+    # EFF-43 / VV-1 — the voice-stack units (disabled; server-side render via
+    # `mackesd voice render-config`).
+    { source = "packaging/systemd/kamailio-mde.service",  dest = "/usr/lib/systemd/system/kamailio-mde.service",  mode = "644" },
+    { source = "packaging/systemd/rtpengine-mde.service", dest = "/usr/lib/systemd/system/rtpengine-mde.service", mode = "644" },
+    # DISCLAIMER + license + notices.
+    { source = "DISCLAIMER.md",                    dest = "/usr/share/magic-mesh/DISCLAIMER.md", mode = "644" },
+    { source = "LICENSE",                          dest = "/usr/share/licenses/magic-mesh-server/LICENSE", mode = "644" },
+    { source = "NOTICE",                           dest = "/usr/share/licenses/magic-mesh-server/NOTICE",  mode = "644" },
+    # EFF-17 — the dnf upgrade channel + signing key.
+    { source = "packaging/repo/magic-mesh.repo",         dest = "/etc/yum.repos.d/magic-mesh.repo",          mode = "644" },
+    { source = "packaging/repo/RPM-GPG-KEY-magic-mesh",  dest = "/etc/pki/rpm-gpg/RPM-GPG-KEY-magic-mesh",   mode = "644" },
+    { source = "SUPPORT.md",                       dest = "/usr/share/magic-mesh/SUPPORT.md", mode = "644" },
+    { source = "ADMIN.md",                         dest = "/usr/share/magic-mesh/ADMIN.md", mode = "644" },
+    { source = "docs/help/*.md",                   dest = "/usr/share/mde/help/", mode = "644" },
+    # SETUP-7 — the hybrid-Ansible convergence role.
+    { source = "ansible/ansible.cfg",              dest = "/usr/share/mackes/ansible/ansible.cfg",      mode = "644" },
+    { source = "ansible/roles/mackes/**/*",        dest = "/usr/share/mackes/ansible/roles/mackes/",    mode = "644" },
+    # MESHSHELL — the mesh-status snapshot + Carbon prompt/greeting/help (all roles).
+    { source = "install-helpers/mesh-status-snapshot.sh", dest = "/usr/libexec/mackesd/mesh-status-snapshot", mode = "755" },
+    { source = "packaging/systemd/mesh-status.service", dest = "/usr/lib/systemd/system/mesh-status.service", mode = "644" },
+    { source = "packaging/systemd/mesh-status.timer",   dest = "/usr/lib/systemd/system/mesh-status.timer",   mode = "644" },
+    { source = "install-helpers/mesh-prompt-nodes.sh", dest = "/usr/libexec/mackesd/mesh-prompt-nodes", mode = "755" },
+    { source = "packaging/starship/starship.toml",     dest = "/etc/starship.toml",                       mode = "644" },
+    { source = "packaging/profile.d/zz-mde-starship.sh", dest = "/etc/profile.d/zz-mde-starship.sh",      mode = "644" },
+    { source = "install-helpers/mesh-install-starship.sh", dest = "/usr/libexec/mackesd/mesh-install-starship", mode = "755" },
+    { source = "packaging/systemd/mesh-shell-setup.service", dest = "/usr/lib/systemd/system/mesh-shell-setup.service", mode = "644" },
+    { source = "install-helpers/mesh-welcome.py",       dest = "/usr/libexec/mackesd/mesh-welcome",        mode = "755" },
+    { source = "packaging/profile.d/zz-mde-welcome.sh", dest = "/etc/profile.d/zz-mde-welcome.sh",         mode = "644" },
+    { source = "install-helpers/mesh-help.sh",          dest = "/usr/bin/mesh-help",                       mode = "755" },
+    # SETUP-6 — the first-run console wizard (TUI, headless-friendly).
+    { source = "packaging/systemd/magic-setup.service", dest = "/usr/lib/systemd/system/magic-setup.service", mode = "644" },
+    { source = "packaging/profile.d/zz-mde-setup-motd.sh", dest = "/etc/profile.d/zz-mde-setup-motd.sh",   mode = "644" },
+    # BUS / NETDATA — the cross-node ntfy broker + the netdata metrics agent.
+    { source = "data/ntfy/server.yml.tmpl",             dest = "/usr/share/mde/ntfy/server.yml.tmpl",      mode = "644" },
+    { source = "install-helpers/mesh-install-ntfy.sh",  dest = "/usr/libexec/mackesd/mesh-install-ntfy",   mode = "755" },
+    { source = "packaging/systemd/mesh-broker-setup.service", dest = "/usr/lib/systemd/system/mesh-broker-setup.service", mode = "644" },
+    { source = "install-helpers/mesh-install-netdata.sh", dest = "/usr/libexec/mackesd/mesh-install-netdata", mode = "755" },
+    { source = "packaging/systemd/mesh-netdata-setup.service", dest = "/usr/lib/systemd/system/mesh-netdata-setup.service", mode = "644" },
+    # BIRTHRIGHT — the bundled air-gapped first-boot blobs (ntfy + starship) +
+    # the fc43 LizardFS RPM family (the §1 shared-state substrate).
+    { source = "vendor/birthright/ntfy_2.24.0_linux_amd64.tar.gz", dest = "/usr/share/magic-mesh/vendor/ntfy_2.24.0_linux_amd64.tar.gz", mode = "644" },
+    { source = "vendor/birthright/starship-x86_64-unknown-linux-musl.tar.gz", dest = "/usr/share/magic-mesh/vendor/starship-x86_64-unknown-linux-musl.tar.gz", mode = "644" },
+    { source = "install-helpers/mesh-install-lizardfs.sh", dest = "/usr/libexec/mackesd/mesh-install-lizardfs", mode = "755" },
+    { source = "vendor/birthright/lizardfs/*.rpm", dest = "/usr/share/magic-mesh/vendor/lizardfs/", mode = "644" },
+    # SELINUX-1 — the local SELinux policy modules + installer.
+    { source = "install-helpers/selinux/*.cil", dest = "/usr/share/magic-mesh/selinux/", mode = "644" },
+    { source = "install-helpers/setup-selinux-policy.sh", dest = "/usr/libexec/mackesd/setup-selinux-policy", mode = "755" },
+]
+
+# XPA-6 — the headless variant's hard runtime deps: the same mesh substrate the
+# base RPM Requires (nebula overlay, the FUSE2 stack the bundled fc43 lizardfs
+# mfsmount needs, nmap for the host probe, alsa-lib for the audio-linked bins),
+# but WITHOUT the desktop-only btop/mc (RCLICK power-menu launchers — a headless
+# Server has no right-click menu).
+[package.metadata.generate-rpm.variants.server.requires]
+nebula = "*"
+nmap = "*"
+alsa-lib = "*"
+fuse-libs = "*"
+fuse = "*"
+
+# XPA-6 — the headless variant's weak deps: the Server-tier shell-outs only.
+# Dropped vs the base: the desktop-only cosmic-disks, the voice binaries
+# (kamailio/rtpengine stay operator-enabled and aren't on a default Server), and
+# the libvirt GUI stack stays since a Server hosts compute.
+[package.metadata.generate-rpm.variants.server.recommends]
+ansible-core = "*"
+libvirt-daemon-driver-qemu = "*"
+libvirt-daemon-config-network = "*"
+openssh-clients = "*"
+NetworkManager = "*"
+firewalld = "*"
+podman = "*"
+rsync = "*"
+
+# XPA-6 — upgrade/obsolete continuity for the headless variant (matches the base).
+[package.metadata.generate-rpm.variants.server.obsoletes]
 mde-core = "*"

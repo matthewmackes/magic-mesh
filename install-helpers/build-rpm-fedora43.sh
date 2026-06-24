@@ -13,8 +13,32 @@
 # release, and runs cargo-generate-rpm. Reuses the host's ~/.cargo crate caches.
 # Output: target-f43/generate-rpm/magic-mesh-*.x86_64.rpm (host-owned, rootless).
 #
-# Usage: install-helpers/build-rpm-fedora43.sh [fedora_version]   # default 43
+# XPA-6 — the GUI-less headless package. With `--server` this builds ONLY the
+# daemon + mesh-substrate crates (mackesd/magic-fleet/mde-enroll/mde-bus — none
+# pull libcosmic/iced), so a headless build skips the ~100 MB workbench/files/
+# music/voice-hud/applet GUI compile entirely, then rolls the `server` variant
+# (`cargo generate-rpm --variant server`) → a small `magic-mesh-server-*.rpm`
+# with no GUI bins and no gtk3/libcosmic ELF Requires. The default (no flag)
+# still builds the full workspace + the monolithic `magic-mesh` RPM unchanged.
+#
+# Usage: install-helpers/build-rpm-fedora43.sh [--server] [fedora_version]
+#        install-helpers/build-rpm-fedora43.sh            # full GUI RPM, F43
+#        install-helpers/build-rpm-fedora43.sh --server   # headless RPM, F43
 set -euo pipefail
+
+# XPA-6 — parse the optional --server flag (position-independent) so the
+# remaining positional arg stays the Fedora version (back-compat with the
+# original `[fedora_version]` calling convention).
+MODE="full"
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    --server) MODE="server" ;;
+    --full)   MODE="full" ;;
+    *)        ARGS+=("$a") ;;
+  esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
 
 FEDORA="${1:-43}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -64,33 +88,57 @@ echo "[f43] toolchain: $(rustc --version)"
 echo "[f43] installing cargo-generate-rpm"
 cargo install cargo-generate-rpm --locked >/tmp/cgr.log 2>&1 || { tail -20 /tmp/cgr.log; exit 1; }
 
-echo "[f43] building workspace (release) — this is the long part"
 export CARGO_TARGET_DIR=/src/target-f43
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
-cargo build --workspace --release --locked
-
-echo "[f43] generating RPM"
-cargo generate-rpm -p crates/mesh/mackesd
+# XPA-6 — MODE (full|server) is passed in via `podman run -e MODE=…`.
+if [ "${MODE:-full}" = "server" ]; then
+  echo "[f43] building HEADLESS crates only (release) — no libcosmic GUIs"
+  # Just the daemon + mesh-substrate crates. mde-enroll yields BOTH the
+  # mde-enroll + magic-setup bins; mde-bus is the shared-bus daemon. None pull
+  # libcosmic/iced, so the long GUI compile is skipped entirely.
+  cargo build --release --locked \
+      -p mackesd -p magic-fleet -p mde-enroll -p mde-bus
+  echo "[f43] generating headless RPM (--variant server)"
+  cargo generate-rpm -p crates/mesh/mackesd --variant server
+else
+  echo "[f43] building workspace (release) — this is the long part"
+  cargo build --workspace --release --locked
+  echo "[f43] generating RPM"
+  cargo generate-rpm -p crates/mesh/mackesd
+fi
 
 echo "[f43] DONE — artifact:"
 ls -la /src/target-f43/generate-rpm/*.rpm
 '
 
-echo "==> building in $IMAGE (workspace release + RPM; reuses ~/.cargo caches)"
+echo "==> building in $IMAGE (mode=$MODE; release + RPM; reuses ~/.cargo caches)"
 # --security-opt label=disable: skip SELinux confinement for this trusted
 # local build so the container can read the bind-mounted repo + crate caches
 # without relabeling the host trees.
+# XPA-6 — MODE selects full (GUI) vs server (headless) inside the container.
 podman run --rm \
     --security-opt label=disable \
+    -e "MODE=$MODE" \
     -v "$REPO:/src" \
     -v "$HOME/.cargo/registry:/root/.cargo/registry" \
     -v "$HOME/.cargo/git:/root/.cargo/git" \
     -w /src \
     "$IMAGE" bash -c "$IN_CONTAINER"
 
-RPM="$(ls -1 "$REPO"/target-f43/generate-rpm/*.rpm 2>/dev/null | head -1 || true)"
-[ -n "$RPM" ] || { echo "!! no RPM produced" >&2; exit 1; }
+# XPA-6 — pick the artifact for THIS mode. `magic-mesh-server-*` sorts after
+# `magic-mesh-*`, and a stale full RPM can sit beside it, so glob on the exact
+# name prefix instead of taking the first *.rpm.
+if [ "$MODE" = "server" ]; then
+  GLOB="$REPO/target-f43/generate-rpm/magic-mesh-server-*.rpm"
+else
+  # The full package: magic-mesh-<ver>… but NOT magic-mesh-server-…
+  GLOB="$REPO/target-f43/generate-rpm/magic-mesh-[0-9]*.rpm"
+fi
+# shellcheck disable=SC2086,SC2012  # $GLOB MUST stay unquoted to expand the
+# wildcard; the existing artifact-pick uses the same `ls` glob idiom.
+RPM="$(ls -1t $GLOB 2>/dev/null | head -1 || true)"
+[ -n "$RPM" ] || { echo "!! no RPM produced (mode=$MODE)" >&2; exit 1; }
 echo
-echo "✅ Fedora $FEDORA RPM: $RPM"
+echo "✅ Fedora $FEDORA RPM (mode=$MODE): $RPM"
 echo "   install on F$FEDORA:  sudo dnf install $RPM"
 echo "   or via Option A:      do-lighthouse-up.sh <mesh> --rpm-url <served-url-of-this-rpm>"
