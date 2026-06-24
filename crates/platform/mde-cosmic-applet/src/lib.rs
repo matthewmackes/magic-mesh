@@ -335,9 +335,32 @@ pub fn workload_argv(source: &str, name: &str, action: WorkloadAction) -> Option
     }
 }
 
+/// Relevance score for a launcher search match (lower = better): `0` exact,
+/// `1` name-prefix, `2` word-prefix (a word in the name starts with the query).
+/// Returns `None` for a mid-word substring — so "files" matches "Files" but NOT
+/// "Color Profiles" (the Start-Menu search bug fixed 2026-06-24: a bare
+/// `contains` surfaced "Pro**files**" and buried the real Files app).
+#[must_use]
+fn name_match_score(name_lc: &str, q: &str) -> Option<u32> {
+    if name_lc == q {
+        return Some(0);
+    }
+    if name_lc.starts_with(q) {
+        return Some(1);
+    }
+    if name_lc
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| w.starts_with(q))
+    {
+        return Some(2);
+    }
+    None
+}
+
 /// Filter entries for the dropdown: a non-empty `query` searches across ALL tabs
-/// (Q2 fuzzy-ish — case-insensitive substring on the name); an empty query shows
-/// the active `tab` (Favorites = ids in `favorites`, else by kind). Sorted by name.
+/// by **relevance** (exact > name-prefix > word-prefix; mid-word substrings are
+/// NOT matches), ranked best-first then alphabetically. An empty query shows the
+/// active `tab` (Favorites = ids in `favorites`, else by kind), sorted by name.
 #[must_use]
 pub fn filter_entries<'a>(
     entries: &'a [Entry],
@@ -346,16 +369,22 @@ pub fn filter_entries<'a>(
     favorites: &std::collections::HashSet<String>,
 ) -> Vec<&'a Entry> {
     let q = query.trim().to_lowercase();
+    if !q.is_empty() {
+        let mut scored: Vec<(u32, &Entry)> = entries
+            .iter()
+            .filter_map(|e| name_match_score(&e.name.to_lowercase(), &q).map(|s| (s, e)))
+            .collect();
+        scored.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()))
+        });
+        return scored.into_iter().map(|(_, e)| e).collect();
+    }
     let mut out: Vec<&Entry> = entries
         .iter()
-        .filter(|e| {
-            if !q.is_empty() {
-                return e.name.to_lowercase().contains(&q);
-            }
-            match tab.kind() {
-                Some(k) => e.kind == k,
-                None => favorites.contains(&e.id), // Favorites tab
-            }
+        .filter(|e| match tab.kind() {
+            Some(k) => e.kind == k,
+            None => favorites.contains(&e.id), // Favorites tab
         })
         .collect();
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -716,6 +745,23 @@ mod tests {
         let s = filter_entries(&entries, LauncherTab::Apps, "jelly", &none);
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].name, "Jellyfin");
+    }
+
+    #[test]
+    fn search_surfaces_real_match_not_midword_substring() {
+        // Start-Menu bug (2026-06-24): "files" surfaced "Color Profiles"
+        // (Pro-FILES) and buried the real Files app. Word-boundary relevance.
+        let reply = r#"{"ok":true,"entries":[
+            {"id":"cp","name":"Color Profiles","kind":"app","source":"xdg","exec":"x"},
+            {"id":"files","name":"Files","kind":"app","source":"xdg","exec":"mde-files"}
+        ]}"#;
+        let entries = parse_entries(reply);
+        let none = std::collections::HashSet::new();
+        let r: Vec<&str> = filter_entries(&entries, LauncherTab::Apps, "files", &none)
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(r, ["Files"], "files -> Files only; Color Profiles must not match");
     }
 
     #[test]
