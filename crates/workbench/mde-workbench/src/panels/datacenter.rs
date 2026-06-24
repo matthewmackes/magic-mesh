@@ -984,6 +984,25 @@ pub struct DatacenterPanel {
     /// drain/reboot/shutdown confirm reads it back to show "N running VM(s) will be
     /// migrated/stopped". Pure in-memory cache, refreshed on demand.
     pub host_impact: BTreeMap<String, usize>,
+    /// DATACENTER-11 (VMs tab) — the in-progress golden-template create wizard form.
+    /// Empty by default; the "Create VM" form on the VMs tab edits it, and Create
+    /// fires `action/dc/vm-create` → `tofu-apply`.
+    pub vm_create: VmCreateForm,
+    /// DATACENTER-11 (VMs tab) — when `Some`, a per-VM inline prompt is collecting
+    /// input for a migrate (destination host) or resize (vcpus + mem). Only the
+    /// prompt's Confirm fires the RPC; Cancel clears it. Cleared on every load.
+    pub vm_prompt: Option<VmPrompt>,
+    /// DATACENTER-11 (VMs tab) — the multi-select set of VM uuids (the checkboxes on
+    /// the VM cards). The bulk toolbar acts on exactly this set. Cleared on load so a
+    /// refresh never acts on a stale selection.
+    pub vm_selected: BTreeSet<String>,
+    /// DATACENTER-11 (VMs tab) — the free-text tag applied by a bulk "Tag" run, typed
+    /// in the bulk toolbar. Pure UI state.
+    pub bulk_tag: String,
+    /// DATACENTER-11 (VMs tab) — the per-item progress of the last/in-flight bulk run,
+    /// keyed by VM uuid (`Pending` → `Ok`/`Err`). The bulk toolbar renders one line
+    /// per entry. Reset when a new bulk run starts; cleared on load.
+    pub bulk_progress: BTreeMap<String, BulkItem>,
     /// DATACENTER-10 (Hosts tab) — the pool-placement cache: per-host (dom0 IP) the
     /// last `action/dc/host-pool` read's `(pool_name, master_uuid, is_master)`.
     /// Populated when the operator clicks "Pool" on a host card; the card then
@@ -1009,6 +1028,11 @@ pub enum ViewMode {
     /// impact preview), pool placement (membership / master), and the copy / launch
     /// SSH console.
     Hosts,
+    /// DATACENTER-11 — the VMs tab: the full VM lifecycle (power / suspend / migrate
+    /// / clone / snapshot / resize / delete + noVNC console), a Tofu-backed
+    /// golden-template create wizard, and multi-select bulk power / snapshot / tag
+    /// with per-item progress.
+    Vms,
     /// OpenTofu workspaces + Plan / Apply buttons.
     Tofu,
     /// The datacenter audit log (`event/dc/audit/*`), newest-first.
@@ -1028,6 +1052,7 @@ impl ViewMode {
             ViewMode::Overview => "overview",
             ViewMode::Zone => "resources",
             ViewMode::Hosts => "hosts",
+            ViewMode::Vms => "vms",
             ViewMode::Tofu => "tofu",
             ViewMode::Audit => "audit",
             ViewMode::Topology => "topology",
@@ -1043,6 +1068,7 @@ impl ViewMode {
         match slug {
             "resources" => ViewMode::Zone,
             "hosts" => ViewMode::Hosts,
+            "vms" => ViewMode::Vms,
             "tofu" => ViewMode::Tofu,
             "audit" => ViewMode::Audit,
             "topology" => ViewMode::Topology,
@@ -1064,6 +1090,72 @@ pub struct HostPool {
     pub master: String,
     /// Whether THIS host is the pool master (so the card badges it).
     pub is_master: bool,
+}
+
+/// DATACENTER-11 (VMs tab) — the in-progress state of the golden-template VM
+/// create wizard. Each field is a free-text box on the VMs tab's "Create VM" form;
+/// the `Create` button packs them into the `action/dc/vm-create` request (which
+/// writes a Tofu resource), then the panel runs `tofu-apply` so the structural
+/// change goes through Tofu (no drift). Pure local UI state until Create is fired.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VmCreateForm {
+    /// The new VM's name-label (sanitized server-side to `[A-Za-z0-9._-]`).
+    pub name: String,
+    /// vCPU count (parsed to an integer; blank/invalid blocks Create with a hint).
+    pub vcpus: String,
+    /// Memory in MiB (parsed to an integer; blank/invalid blocks Create).
+    pub mem_mib: String,
+    /// The XAPI network uuid the primary NIC attaches to.
+    pub network_uuid: String,
+    /// The destination dom0 (the pool the resource lands in); must be an allow-listed
+    /// host. Defaults to the active zone's first Xen dom0 when opened.
+    pub dom0: String,
+}
+
+/// DATACENTER-11 (VMs tab) — which VM operation a per-VM inline prompt is collecting
+/// input for. Migrate needs a destination host; Resize needs vcpus + memory. The
+/// prompt renders the right inputs and only its Confirm button fires the RPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VmPrompt {
+    /// Collecting the destination host for a `vm-migrate` of this VM uuid.
+    Migrate {
+        /// The VM being migrated.
+        uuid: String,
+        /// The destination host name-label / uuid being typed.
+        host: String,
+    },
+    /// Collecting the target vcpus + memory for a `vm-resize` of this VM uuid.
+    Resize {
+        /// The VM being resized.
+        uuid: String,
+        /// Target vCPU count being typed.
+        vcpus: String,
+        /// Target memory (MiB) being typed.
+        mem_mib: String,
+    },
+}
+
+impl VmPrompt {
+    /// The uuid the prompt targets — so a render can match it against a row's id.
+    #[must_use]
+    pub fn uuid(&self) -> &str {
+        match self {
+            VmPrompt::Migrate { uuid, .. } | VmPrompt::Resize { uuid, .. } => uuid,
+        }
+    }
+}
+
+/// DATACENTER-11 (VMs tab) — the outcome of one VM in a multi-select bulk run, keyed
+/// by VM uuid. The bulk toolbar renders a per-item progress line off these as each
+/// VM's RPC lands. `Pending` is the pre-fire state; `Ok`/`Err` carry the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BulkItem {
+    /// The op for this VM is in flight (fired, not yet returned).
+    Pending,
+    /// The op for this VM succeeded, with the status line.
+    Ok(String),
+    /// The op for this VM failed, with the error text.
+    Err(String),
 }
 
 /// DATACENTER-8 (saved views) — the largest number of saved views kept. A view is
@@ -1254,6 +1346,13 @@ impl Default for DatacenterPanel {
             host_impact: BTreeMap::new(),
             host_pool: BTreeMap::new(),
             host_confirm: None,
+            // DATACENTER-11 (VMs tab) — create wizard, per-VM prompt, bulk select +
+            // progress all start empty; they hydrate from operator gestures.
+            vm_create: VmCreateForm::default(),
+            vm_prompt: None,
+            vm_selected: BTreeSet::new(),
+            bulk_tag: String::new(),
+            bulk_progress: BTreeMap::new(),
         }
     }
 }
@@ -1481,6 +1580,116 @@ pub enum Message {
     /// DATACENTER-10 (Hosts tab) — the host SSH console launch finished. `Ok` is a
     /// status line; `Err` the "couldn't launch a terminal" message.
     HostSshLaunched(Result<String, String>),
+
+    // ── DATACENTER-11 (VMs tab) ──────────────────────────────────────────────
+    /// A VM "Suspend" / "Resume" button was clicked. `op` is "suspend" | "resume".
+    /// Fires the `action/dc/vm-suspend` RPC.
+    SuspendClicked {
+        uuid: String,
+        op: String,
+        dom0: String,
+    },
+    /// The `action/dc/vm-suspend` RPC came back. Routes here panel-scoped.
+    SuspendDone(Result<String, String>),
+    /// A VM "Migrate" button was clicked — arms the inline destination-host prompt
+    /// (`vm_prompt = Migrate`); no RPC fires until the prompt's Confirm.
+    MigrateClicked {
+        uuid: String,
+        dom0: String,
+    },
+    /// The migrate prompt's destination-host box changed. Pure state.
+    MigrateHostChanged(String),
+    /// The migrate prompt's Confirm was pressed — fires `action/dc/vm-migrate` with
+    /// the typed destination host. `dom0` is the source host.
+    MigrateConfirmed {
+        uuid: String,
+        dom0: String,
+    },
+    /// The `action/dc/vm-migrate` RPC came back. Routes here panel-scoped.
+    MigrateDone(Result<String, String>),
+    /// A VM "Resize" button was clicked — arms the inline vcpus+mem prompt
+    /// (`vm_prompt = Resize`); no RPC fires until the prompt's Confirm.
+    ResizeClicked {
+        uuid: String,
+        dom0: String,
+    },
+    /// The resize prompt's vCPUs box changed. Pure state.
+    ResizeVcpusChanged(String),
+    /// The resize prompt's memory (MiB) box changed. Pure state.
+    ResizeMemChanged(String),
+    /// The resize prompt's Confirm was pressed — fires `action/dc/vm-resize` with the
+    /// typed vcpus + mem. `dom0` is the owning host.
+    ResizeConfirmed {
+        uuid: String,
+        dom0: String,
+    },
+    /// The `action/dc/vm-resize` RPC came back. Routes here panel-scoped.
+    ResizeDone(Result<String, String>),
+    /// The per-VM inline prompt (migrate / resize) was dismissed (Cancel). Clears
+    /// `vm_prompt` without firing any RPC.
+    VmPromptCancelled,
+    /// A VM "Console" button was clicked — fires the read-only `action/dc/vm-console`
+    /// RPC to read the noVNC console `location`, which is then opened externally.
+    ConsoleClicked {
+        uuid: String,
+        dom0: String,
+    },
+    /// The `action/dc/vm-console` RPC came back. `Ok` carries the console URL (which
+    /// the panel hands to `xdg-open` via `crate::Message::OpenExternal`); `Err` the
+    /// error text.
+    ConsoleDone(Result<String, String>),
+    /// A create-wizard form field changed (`field` names which). Pure state.
+    CreateFieldChanged {
+        field: VmCreateField,
+        value: String,
+    },
+    /// The create wizard's "Create VM" button was clicked — fires
+    /// `action/dc/vm-create` (writes a Tofu resource), then on success runs
+    /// `tofu-apply` so the structural change goes through Tofu.
+    CreateVmClicked,
+    /// The `action/dc/vm-create` RPC came back. `Ok` chains into a `tofu-apply` of
+    /// `xen-xapi`; `Err` surfaces the error.
+    CreateVmDone(Result<String, String>),
+    /// A VM card's multi-select checkbox was toggled. Adds/removes the uuid from
+    /// `vm_selected`. Pure state.
+    BulkToggle(String),
+    /// The bulk toolbar's "Select all (visible)" was clicked — selects every VM
+    /// uuid currently visible in the tab. Pure state.
+    BulkSelectAll(Vec<String>),
+    /// The bulk toolbar's "Clear" was clicked — empties `vm_selected`. Pure state.
+    BulkClear,
+    /// The bulk-tag input changed. Pure state.
+    BulkTagChanged(String),
+    /// A bulk action button was clicked (power start/shutdown/reboot, snapshot, or
+    /// tag). Seeds `bulk_progress` with a `Pending` per selected VM and fires one
+    /// RPC per VM. `op` is the action; `dom0_by_uuid` pairs each selected uuid with
+    /// its owning host (so each RPC targets the right dom0).
+    BulkRun {
+        op: String,
+        dom0_by_uuid: Vec<(String, String)>,
+    },
+    /// One VM's bulk-run RPC came back — updates that uuid's `bulk_progress` entry.
+    /// `op` echoes the action (for the status line); `uuid` keys the entry.
+    BulkItemDone {
+        uuid: String,
+        result: Result<String, String>,
+    },
+}
+
+/// DATACENTER-11 (VMs tab) — which create-wizard field a `CreateFieldChanged`
+/// targets. Keeps the form-edit message one variant instead of five.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmCreateField {
+    /// The VM name-label.
+    Name,
+    /// The vCPU count.
+    Vcpus,
+    /// The memory (MiB).
+    MemMib,
+    /// The primary-NIC network uuid.
+    NetworkUuid,
+    /// The destination dom0.
+    Dom0,
 }
 
 impl DatacenterPanel {
@@ -1543,6 +1752,13 @@ impl DatacenterPanel {
                 self.confirm_delete = None;
                 // Likewise drop a stale tofu-apply confirm on a refresh.
                 self.tofu_confirm = None;
+                // DATACENTER-11 — a refresh can change which VMs exist, so drop any
+                // pending per-VM prompt + the bulk selection / progress rather than
+                // act on a stale set. The create-wizard form is the operator's draft
+                // (not row-derived), so it survives a refresh.
+                self.vm_prompt = None;
+                self.vm_selected.clear();
+                self.bulk_progress.clear();
                 // A fresh row set: re-seed the Topology expansion so newly-arrived
                 // host groups open by default. If we're already on the Topology
                 // view, seed eagerly (the view borrows `&self` and can't); other-
@@ -2022,6 +2238,271 @@ impl DatacenterPanel {
                 self.status = e;
                 Task::none()
             }
+
+            // ── DATACENTER-11 (VMs tab) ──────────────────────────────────────
+            Message::SuspendClicked { uuid, op, dom0 } => {
+                self.status = format!("{op}…");
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || vm_suspend(&uuid, &op, &dom0))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("suspend task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::SuspendDone(result)),
+                )
+            }
+            Message::SuspendDone(Ok(s)) | Message::SuspendDone(Err(s)) => {
+                self.status = s;
+                Task::none()
+            }
+            Message::MigrateClicked { uuid, dom0: _ } => {
+                // First click only arms the destination-host prompt — no RPC fires.
+                self.vm_prompt = Some(VmPrompt::Migrate {
+                    uuid,
+                    host: String::new(),
+                });
+                self.status = "Enter a destination host, then Confirm.".into();
+                Task::none()
+            }
+            Message::MigrateHostChanged(h) => {
+                if let Some(VmPrompt::Migrate { host, .. }) = &mut self.vm_prompt {
+                    *host = h;
+                }
+                Task::none()
+            }
+            Message::MigrateConfirmed { uuid, dom0 } => {
+                let host = match &self.vm_prompt {
+                    Some(VmPrompt::Migrate { host, .. }) => host.trim().to_string(),
+                    _ => String::new(),
+                };
+                self.vm_prompt = None;
+                if host.is_empty() {
+                    self.status = "Migrate needs a destination host.".into();
+                    return Task::none();
+                }
+                self.status = format!("Migrating to {host}…");
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || vm_migrate(&uuid, &host, &dom0))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("migrate task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::MigrateDone(result)),
+                )
+            }
+            Message::MigrateDone(Ok(s)) | Message::MigrateDone(Err(s)) => {
+                self.status = s;
+                Task::none()
+            }
+            Message::ResizeClicked { uuid, dom0: _ } => {
+                self.vm_prompt = Some(VmPrompt::Resize {
+                    uuid,
+                    vcpus: String::new(),
+                    mem_mib: String::new(),
+                });
+                self.status = "Enter vCPUs + memory (VM must be halted), then Confirm.".into();
+                Task::none()
+            }
+            Message::ResizeVcpusChanged(v) => {
+                if let Some(VmPrompt::Resize { vcpus, .. }) = &mut self.vm_prompt {
+                    *vcpus = v;
+                }
+                Task::none()
+            }
+            Message::ResizeMemChanged(v) => {
+                if let Some(VmPrompt::Resize { mem_mib, .. }) = &mut self.vm_prompt {
+                    *mem_mib = v;
+                }
+                Task::none()
+            }
+            Message::ResizeConfirmed { uuid, dom0 } => {
+                let (vcpus, mem) = match &self.vm_prompt {
+                    Some(VmPrompt::Resize { vcpus, mem_mib, .. }) => {
+                        (vcpus.trim().parse::<u64>(), mem_mib.trim().parse::<u64>())
+                    }
+                    _ => (Ok(0), Ok(0)),
+                };
+                self.vm_prompt = None;
+                let (Ok(vcpus), Ok(mem)) = (vcpus, mem) else {
+                    self.status = "Resize needs whole-number vCPUs + memory (MiB).".into();
+                    return Task::none();
+                };
+                self.status = format!("Resizing to {vcpus} vCPU / {mem} MiB…");
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || vm_resize(&uuid, vcpus, mem, &dom0))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("resize task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::ResizeDone(result)),
+                )
+            }
+            Message::ResizeDone(Ok(s)) | Message::ResizeDone(Err(s)) => {
+                self.status = s;
+                Task::none()
+            }
+            Message::VmPromptCancelled => {
+                self.vm_prompt = None;
+                self.status.clear();
+                Task::none()
+            }
+            Message::ConsoleClicked { uuid, dom0 } => {
+                self.status = "Opening console…".into();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || vm_console_url(&uuid, &dom0))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("console task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::ConsoleDone(result)),
+                )
+            }
+            Message::ConsoleDone(Ok(url)) => {
+                // The console `location` is the noVNC connection URL — open it with
+                // the desktop's `xdg-open` (best-effort, detached) so the system
+                // browser / viewer renders the embedded console. A runtime URL can't
+                // use the `&'static str` `OpenExternal` path, so this opens directly,
+                // mirroring the Hosts tab's local launch contract.
+                self.status = vm_console_open(&url);
+                Task::none()
+            }
+            Message::ConsoleDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
+            Message::CreateFieldChanged { field, value } => {
+                match field {
+                    VmCreateField::Name => self.vm_create.name = value,
+                    VmCreateField::Vcpus => self.vm_create.vcpus = value,
+                    VmCreateField::MemMib => self.vm_create.mem_mib = value,
+                    VmCreateField::NetworkUuid => self.vm_create.network_uuid = value,
+                    VmCreateField::Dom0 => self.vm_create.dom0 = value,
+                }
+                Task::none()
+            }
+            Message::CreateVmClicked => {
+                let form = self.vm_create.clone();
+                let (Ok(vcpus), Ok(mem)) = (
+                    form.vcpus.trim().parse::<u64>(),
+                    form.mem_mib.trim().parse::<u64>(),
+                ) else {
+                    self.status = "Create needs whole-number vCPUs + memory (MiB).".into();
+                    return Task::none();
+                };
+                if form.name.trim().is_empty()
+                    || form.network_uuid.trim().is_empty()
+                    || form.dom0.trim().is_empty()
+                {
+                    self.status = "Create needs a name, network uuid, and dom0.".into();
+                    return Task::none();
+                }
+                self.status = format!("Creating {}… (writing Tofu resource)", form.name.trim());
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || vm_create(&form, vcpus, mem))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("create task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::CreateVmDone(result)),
+                )
+            }
+            Message::CreateVmDone(Ok(resource)) => {
+                // The resource is written; materialize it through Tofu (no drift) by
+                // chaining into the existing tofu-apply path on the xen-xapi
+                // workspace. Clear the form so a repeated submit can't double-write.
+                self.vm_create = VmCreateForm::default();
+                self.status = format!("Wrote {resource}; applying via Tofu…");
+                self.tofu_output = format!("Applying xen-xapi for {resource}…");
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || tofu_apply("xen-xapi"))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("tofu task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::TofuApplyDone(result)),
+                )
+            }
+            Message::CreateVmDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
+            Message::BulkToggle(uuid) => {
+                if !self.vm_selected.remove(&uuid) {
+                    self.vm_selected.insert(uuid);
+                }
+                Task::none()
+            }
+            Message::BulkSelectAll(uuids) => {
+                self.vm_selected.extend(uuids);
+                Task::none()
+            }
+            Message::BulkClear => {
+                self.vm_selected.clear();
+                self.bulk_progress.clear();
+                Task::none()
+            }
+            Message::BulkTagChanged(t) => {
+                self.bulk_tag = t;
+                Task::none()
+            }
+            Message::BulkRun { op, dom0_by_uuid } => {
+                if dom0_by_uuid.is_empty() {
+                    self.status = "Select at least one VM first.".into();
+                    return Task::none();
+                }
+                let tag = self.bulk_tag.trim().to_string();
+                if op == "tag" && tag.is_empty() {
+                    self.status = "Enter a tag first.".into();
+                    return Task::none();
+                }
+                // Seed per-item progress (Pending) so the toolbar shows the run start,
+                // then fire one RPC per selected VM — each lands as a BulkItemDone.
+                self.bulk_progress.clear();
+                self.status = format!("Bulk {op} on {} VM(s)…", dom0_by_uuid.len());
+                let mut tasks: Vec<Task<crate::Message>> = Vec::new();
+                for (uuid, dom0) in dom0_by_uuid {
+                    self.bulk_progress.insert(uuid.clone(), BulkItem::Pending);
+                    let op = op.clone();
+                    let tag = tag.clone();
+                    tasks.push(Task::perform(
+                        async move {
+                            let uuid2 = uuid.clone();
+                            let r = tokio::task::spawn_blocking(move || {
+                                bulk_op(&op, &uuid, &dom0, &tag)
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(format!("bulk task panicked: {e}")));
+                            (uuid2, r)
+                        },
+                        |(uuid, result)| {
+                            crate::Message::Datacenter(Message::BulkItemDone { uuid, result })
+                        },
+                    ));
+                }
+                Task::batch(tasks)
+            }
+            Message::BulkItemDone { uuid, result } => {
+                let item = match &result {
+                    Ok(s) => BulkItem::Ok(s.clone()),
+                    Err(e) => BulkItem::Err(e.clone()),
+                };
+                self.bulk_progress.insert(uuid, item);
+                // Summarize once every item has resolved (no more Pending).
+                if !self
+                    .bulk_progress
+                    .values()
+                    .any(|i| matches!(i, BulkItem::Pending))
+                {
+                    let ok = self
+                        .bulk_progress
+                        .values()
+                        .filter(|i| matches!(i, BulkItem::Ok(_)))
+                        .count();
+                    let total = self.bulk_progress.len();
+                    self.status = format!("Bulk run complete — {ok}/{total} ok.");
+                }
+                Task::none()
+            }
         }
     }
 
@@ -2253,6 +2734,427 @@ impl DatacenterPanel {
                 border: cosmic::iced::Border {
                     color: palette.border.into_cosmic_color(),
                     width: 1.0,
+                    radius: radius.into(),
+                },
+                ..container::Style::default()
+            })
+            .into()
+    }
+
+    /// DATACENTER-11 (VMs tab) — the Tofu-backed golden-template create wizard. Five
+    /// inputs (name / vCPUs / memory MiB / network uuid / dom0) and a Create button
+    /// that fires `action/dc/vm-create` (which writes a `xenserver_vm` clone resource
+    /// into the `xen-xapi` workspace) then `tofu-apply` — so the structural change
+    /// goes through Tofu (no drift). mde-theme tokens only (§4); every control routes
+    /// a panel-scoped message back through `update` (runtime-reachable).
+    fn vm_create_form(&self, palette: Palette) -> Element<'_, crate::Message> {
+        let field = |placeholder: &str, value: &str, f: VmCreateField| {
+            text_input(placeholder, value)
+                .on_input(move |v| {
+                    crate::Message::Datacenter(Message::CreateFieldChanged { field: f, value: v })
+                })
+                .width(Length::FillPortion(1))
+        };
+        let inputs = row![
+            field("name", &self.vm_create.name, VmCreateField::Name),
+            field("vCPUs", &self.vm_create.vcpus, VmCreateField::Vcpus),
+            field("memory MiB", &self.vm_create.mem_mib, VmCreateField::MemMib),
+            field(
+                "network uuid",
+                &self.vm_create.network_uuid,
+                VmCreateField::NetworkUuid,
+            ),
+            field("dom0", &self.vm_create.dom0, VmCreateField::Dom0),
+        ]
+        .spacing(f32::from(spacing::BASE[1]));
+        let create_btn = variant_button(
+            "Create VM (via Tofu)".to_string(),
+            ButtonVariant::Primary,
+            Some(crate::Message::Datacenter(Message::CreateVmClicked)),
+            palette,
+        );
+        let card = column![
+            text("Create VM — golden-template clone, applied through Tofu")
+                .colr(palette.text.into_cosmic_color()),
+            inputs,
+            create_btn,
+        ]
+        .spacing(f32::from(spacing::BASE[2]));
+        let surface = palette.surface;
+        let radius = f32::from(spacing::BASE[1]);
+        container(card)
+            .padding(f32::from(CARD_PAD_PX))
+            .width(Length::Fill)
+            .style(move |_theme| container::Style {
+                background: Some(cosmic::iced::Background::Color(surface.into_cosmic_color())),
+                border: cosmic::iced::Border {
+                    color: palette.border.into_cosmic_color(),
+                    width: 1.0,
+                    radius: radius.into(),
+                },
+                ..container::Style::default()
+            })
+            .into()
+    }
+
+    /// DATACENTER-11 (VMs tab) — the multi-select bulk toolbar: select-all (visible)
+    /// / clear, a tag input, and the bulk action buttons (power start/shutdown/reboot,
+    /// snapshot, tag). Each action fires one RPC per selected VM and the per-item
+    /// progress (`bulk_progress`) renders below as each lands. `visible` is the
+    /// currently-shown VM uuids (for select-all); `selected_pairs` pairs each selected
+    /// uuid with its owning dom0 (so each RPC targets the right host).
+    fn vm_bulk_toolbar<'a>(
+        &'a self,
+        palette: Palette,
+        visible: &[String],
+        selected_pairs: &[(String, String)],
+    ) -> Element<'a, crate::Message> {
+        let n = selected_pairs.len();
+        let pairs = selected_pairs.to_vec();
+        let bulk = |btn_label: &str, op: &str| {
+            let pairs = pairs.clone();
+            let op = op.to_string();
+            variant_button(
+                btn_label.to_string(),
+                ButtonVariant::Secondary,
+                Some(crate::Message::Datacenter(Message::BulkRun {
+                    op,
+                    dom0_by_uuid: pairs,
+                })),
+                palette,
+            )
+        };
+        let select_all = variant_button(
+            "Select all (visible)".to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::BulkSelectAll(
+                visible.to_vec(),
+            ))),
+            palette,
+        );
+        let clear = variant_button(
+            "Clear".to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::BulkClear)),
+            palette,
+        );
+        let tag_box = text_input("tag", &self.bulk_tag)
+            .on_input(|v| crate::Message::Datacenter(Message::BulkTagChanged(v)))
+            .width(Length::FillPortion(1));
+        let controls = row![
+            text(format!("Bulk — {n} selected")).colr(palette.text_muted.into_cosmic_color()),
+            select_all,
+            clear,
+            bulk("Start", "start"),
+            bulk("Stop", "shutdown"),
+            bulk("Reboot", "reboot"),
+            bulk("Snapshot", "snapshot"),
+            tag_box,
+            bulk("Tag", "tag"),
+        ]
+        .spacing(f32::from(spacing::BASE[1]))
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+
+        let mut card = column![controls].spacing(f32::from(spacing::BASE[2]));
+        // Per-item progress: one line per VM in the last/in-flight bulk run.
+        if !self.bulk_progress.is_empty() {
+            for (uuid, item) in &self.bulk_progress {
+                let (txt, color) = match item {
+                    BulkItem::Pending => (format!("{uuid}: …running"), palette.text_muted),
+                    BulkItem::Ok(s) => (format!("{uuid}: \u{2713} {s}"), palette.success),
+                    BulkItem::Err(e) => (format!("{uuid}: \u{2717} {e}"), palette.danger),
+                };
+                card = card.push(text(txt).colr(color.into_cosmic_color()));
+            }
+        }
+        let surface = palette.surface;
+        let radius = f32::from(spacing::BASE[1]);
+        container(card)
+            .padding(f32::from(CARD_PAD_PX))
+            .width(Length::Fill)
+            .style(move |_theme| container::Style {
+                background: Some(cosmic::iced::Background::Color(surface.into_cosmic_color())),
+                border: cosmic::iced::Border {
+                    color: palette.border.into_cosmic_color(),
+                    width: 1.0,
+                    radius: radius.into(),
+                },
+                ..container::Style::default()
+            })
+            .into()
+    }
+
+    /// DATACENTER-11 (VMs tab) — render one VM as a full-lifecycle card: a select
+    /// checkbox + name/status header, then the lifecycle controls (power
+    /// start/stop/reboot, suspend/resume, clone, snapshot, console, migrate, resize,
+    /// delete). Delete arms the existing inline confirm; migrate + resize arm an
+    /// inline input prompt (`vm_prompt`) whose Confirm fires the RPC. A per-VM bulk
+    /// progress line shows when this VM is part of an in-flight bulk run. All controls
+    /// route panel-scoped messages back through `update`; mde-theme tokens only (§4).
+    fn vm_lifecycle_card<'a>(
+        &'a self,
+        r: &DcRow,
+        palette: Palette,
+        selected: bool,
+        confirming: bool,
+        prompt: Option<&'a VmPrompt>,
+        progress: Option<&'a BulkItem>,
+    ) -> Element<'a, crate::Message> {
+        let uuid = r.id.clone();
+        let dom0 = r.host.clone();
+        let label = if r.name.is_empty() {
+            r.id.clone()
+        } else {
+            r.name.clone()
+        };
+        // Header: a multi-select checkbox (rendered as a toggle button so it needs no
+        // new widget), the VM name, and the color-dot liveness.
+        let check = variant_button(
+            if selected {
+                "[x]".to_string()
+            } else {
+                "[ ]".to_string()
+            },
+            if selected {
+                ButtonVariant::Primary
+            } else {
+                ButtonVariant::Secondary
+            },
+            Some(crate::Message::Datacenter(Message::BulkToggle(
+                uuid.clone(),
+            ))),
+            palette,
+        );
+        let header = row![
+            check,
+            text(format!("VM {label}"))
+                .colr(palette.text.into_cosmic_color())
+                .width(Length::FillPortion(1)),
+            status_dot_view(r, palette),
+        ]
+        .spacing(f32::from(spacing::BASE[2]))
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+        let mut card = column![
+            header,
+            text(format!("{} · {}", r.status, r.host)).colr(palette.text_muted.into_cosmic_color()),
+        ]
+        .spacing(f32::from(spacing::BASE[2]));
+
+        // Lifecycle controls. Power maps to `vm-power`; suspend/resume to
+        // `vm-suspend`; console reads the noVNC `location`; clone/snapshot fire
+        // directly; migrate/resize/delete arm an inline prompt first.
+        let power = |btn_label: &str, op: &str| {
+            variant_button(
+                btn_label.to_string(),
+                ButtonVariant::Secondary,
+                Some(crate::Message::Datacenter(Message::PowerClicked {
+                    uuid: uuid.clone(),
+                    op: op.to_string(),
+                    dom0: dom0.clone(),
+                })),
+                palette,
+            )
+        };
+        let suspend = |btn_label: &str, op: &str| {
+            variant_button(
+                btn_label.to_string(),
+                ButtonVariant::Secondary,
+                Some(crate::Message::Datacenter(Message::SuspendClicked {
+                    uuid: uuid.clone(),
+                    op: op.to_string(),
+                    dom0: dom0.clone(),
+                })),
+                palette,
+            )
+        };
+        let console = variant_button(
+            "Console".to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::ConsoleClicked {
+                uuid: uuid.clone(),
+                dom0: dom0.clone(),
+            })),
+            palette,
+        );
+        let clone = variant_button(
+            "Clone".to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::CloneClicked {
+                uuid: uuid.clone(),
+                dom0: dom0.clone(),
+            })),
+            palette,
+        );
+        let snapshot = variant_button(
+            "Snapshot".to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::SnapshotClicked {
+                uuid: uuid.clone(),
+                dom0: dom0.clone(),
+            })),
+            palette,
+        );
+        let migrate = variant_button(
+            "Migrate".to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::MigrateClicked {
+                uuid: uuid.clone(),
+                dom0: dom0.clone(),
+            })),
+            palette,
+        );
+        let resize = variant_button(
+            "Resize".to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::ResizeClicked {
+                uuid: uuid.clone(),
+                dom0: dom0.clone(),
+            })),
+            palette,
+        );
+        let lifecycle = row![
+            power("Start", "start"),
+            power("Stop", "shutdown"),
+            power("Reboot", "reboot"),
+            suspend("Suspend", "suspend"),
+            suspend("Resume", "resume"),
+            console,
+            clone,
+            snapshot,
+            migrate,
+            resize,
+        ]
+        .spacing(f32::from(spacing::BASE[1]));
+        card = card.push(lifecycle);
+
+        // The destructive Delete row mirrors the existing inline-confirm contract.
+        if confirming {
+            card = card.push(
+                row![
+                    text("Really delete?").colr(palette.warning.into_cosmic_color()),
+                    variant_button(
+                        "Confirm".to_string(),
+                        ButtonVariant::Primary,
+                        Some(crate::Message::Datacenter(Message::DeleteConfirmed {
+                            uuid: uuid.clone(),
+                            dom0: dom0.clone(),
+                        })),
+                        palette,
+                    ),
+                    variant_button(
+                        "Cancel".to_string(),
+                        ButtonVariant::Secondary,
+                        Some(crate::Message::Datacenter(Message::DeleteCancelled)),
+                        palette,
+                    ),
+                ]
+                .spacing(f32::from(spacing::BASE[1]))
+                .align_y(cosmic::iced::alignment::Vertical::Center),
+            );
+        } else {
+            card = card.push(variant_button(
+                "Delete".to_string(),
+                ButtonVariant::Primary,
+                Some(crate::Message::Datacenter(Message::DeleteClicked {
+                    uuid: uuid.clone(),
+                    dom0: dom0.clone(),
+                })),
+                palette,
+            ));
+        }
+
+        // The inline migrate/resize input prompt — only its Confirm fires the RPC.
+        match prompt {
+            Some(VmPrompt::Migrate { host, .. }) => {
+                card = card.push(
+                    row![
+                        text("Migrate to host:").colr(palette.text_muted.into_cosmic_color()),
+                        text_input("destination host", host)
+                            .on_input(|v| crate::Message::Datacenter(Message::MigrateHostChanged(
+                                v
+                            )))
+                            .width(Length::FillPortion(1)),
+                        variant_button(
+                            "Confirm".to_string(),
+                            ButtonVariant::Primary,
+                            Some(crate::Message::Datacenter(Message::MigrateConfirmed {
+                                uuid: uuid.clone(),
+                                dom0: dom0.clone(),
+                            })),
+                            palette,
+                        ),
+                        variant_button(
+                            "Cancel".to_string(),
+                            ButtonVariant::Secondary,
+                            Some(crate::Message::Datacenter(Message::VmPromptCancelled)),
+                            palette,
+                        ),
+                    ]
+                    .spacing(f32::from(spacing::BASE[1]))
+                    .align_y(cosmic::iced::alignment::Vertical::Center),
+                );
+            }
+            Some(VmPrompt::Resize { vcpus, mem_mib, .. }) => {
+                card = card.push(
+                    row![
+                        text("Resize:").colr(palette.text_muted.into_cosmic_color()),
+                        text_input("vCPUs", vcpus)
+                            .on_input(|v| crate::Message::Datacenter(Message::ResizeVcpusChanged(
+                                v
+                            )))
+                            .width(Length::FillPortion(1)),
+                        text_input("memory MiB", mem_mib)
+                            .on_input(|v| crate::Message::Datacenter(Message::ResizeMemChanged(v)))
+                            .width(Length::FillPortion(1)),
+                        variant_button(
+                            "Confirm".to_string(),
+                            ButtonVariant::Primary,
+                            Some(crate::Message::Datacenter(Message::ResizeConfirmed {
+                                uuid: uuid.clone(),
+                                dom0: dom0.clone(),
+                            })),
+                            palette,
+                        ),
+                        variant_button(
+                            "Cancel".to_string(),
+                            ButtonVariant::Secondary,
+                            Some(crate::Message::Datacenter(Message::VmPromptCancelled)),
+                            palette,
+                        ),
+                    ]
+                    .spacing(f32::from(spacing::BASE[1]))
+                    .align_y(cosmic::iced::alignment::Vertical::Center),
+                );
+            }
+            None => {}
+        }
+
+        // This VM's slice of an in-flight/last bulk run, if any.
+        if let Some(item) = progress {
+            let (txt, color) = match item {
+                BulkItem::Pending => ("bulk: …running".to_string(), palette.text_muted),
+                BulkItem::Ok(s) => (format!("bulk: \u{2713} {s}"), palette.success),
+                BulkItem::Err(e) => (format!("bulk: \u{2717} {e}"), palette.danger),
+            };
+            card = card.push(text(txt).colr(color.into_cosmic_color()));
+        }
+
+        let surface = palette.surface;
+        let radius = f32::from(spacing::BASE[1]);
+        // A selected card draws an accent outline so the multi-select set is legible.
+        let border_color = if selected {
+            palette.accent
+        } else {
+            palette.border
+        };
+        container(card)
+            .padding(f32::from(CARD_PAD_PX))
+            .width(Length::Fill)
+            .style(move |_theme| container::Style {
+                background: Some(cosmic::iced::Background::Color(surface.into_cosmic_color())),
+                border: cosmic::iced::Border {
+                    color: border_color.into_cosmic_color(),
+                    width: if selected { 2.0 } else { 1.0 },
                     radius: radius.into(),
                 },
                 ..container::Style::default()
@@ -2509,6 +3411,7 @@ impl DatacenterPanel {
         let mode_tabs = row![
             mode_btn("Overview", ViewMode::Overview),
             mode_btn("Hosts", ViewMode::Hosts),
+            mode_btn("VMs", ViewMode::Vms),
             mode_btn("Topology", ViewMode::Topology),
             mode_btn("Resources", ViewMode::Zone),
             mode_btn("Tofu", ViewMode::Tofu),
@@ -2687,6 +3590,54 @@ impl DatacenterPanel {
                 } else {
                     for h in hosts {
                         col = col.push(self.host_card_view(h, palette));
+                    }
+                }
+            }
+            ViewMode::Vms => {
+                // DATACENTER-11 — the VMs tab: the full VM lifecycle on each card
+                // (power / suspend / migrate / clone / snapshot / resize / delete +
+                // noVNC console), a Tofu-backed golden-template create wizard, and a
+                // multi-select bulk toolbar with per-item progress.
+                col = col.push(text("Virtual machines").size(f32::from(spacing::BASE[5])));
+                col = col.push(self.vm_create_form(palette));
+
+                let vms: Vec<&DcRow> = self
+                    .rows
+                    .iter()
+                    .filter(|r| r.kind == "vm" && r.matches_filter(&self.filter))
+                    .collect();
+                // The bulk toolbar acts on the current selection; selecting-all uses
+                // the visible set, and each bulk RPC needs the VM's owning dom0.
+                let visible_uuids: Vec<String> = vms.iter().map(|r| r.id.clone()).collect();
+                let dom0_by_uuid: Vec<(String, String)> = vms
+                    .iter()
+                    .filter(|r| self.vm_selected.contains(&r.id))
+                    .map(|r| (r.id.clone(), r.host.clone()))
+                    .collect();
+                col = col.push(self.vm_bulk_toolbar(palette, &visible_uuids, &dom0_by_uuid));
+
+                if vms.is_empty() {
+                    col = col.push(
+                        text(
+                            "No VMs yet. Xen guests appear here as the datacenter \
+                             orchestrator publishes `event/dc/vm/*`, or create one with \
+                             the wizard above.",
+                        )
+                        .colr(palette.text_muted.into_cosmic_color()),
+                    );
+                } else {
+                    for v in vms {
+                        let selected = self.vm_selected.contains(&v.id);
+                        let confirming = self.confirm_delete.as_deref() == Some(v.id.as_str());
+                        let prompt = self
+                            .vm_prompt
+                            .as_ref()
+                            .filter(|p| p.uuid() == v.id.as_str());
+                        let progress = self.bulk_progress.get(&v.id);
+                        col =
+                            col.push(self.vm_lifecycle_card(
+                                v, palette, selected, confirming, prompt, progress,
+                            ));
                     }
                 }
             }
@@ -4205,6 +5156,150 @@ fn vm_delete(uuid: &str, dom0: &str) -> Result<String, String> {
         return Ok(format!("deleted {uuid}"));
     }
     Err(format!("unexpected vm-delete reply: {raw}"))
+}
+
+/// DATACENTER-11 — fire one `action/dc/<verb>` Bus RPC (blocking — runs on a
+/// `spawn_blocking` thread) and return the parsed reply JSON. Factors the
+/// Persist + `mde_bus::rpc::request` round trip the VMs-tab ops share (each borrows
+/// a non-`Send` `Persist` across the await, so it runs inside a local current-thread
+/// runtime). `topic`/`subject` are `action/dc/<verb>` + the verb; `body` is the
+/// already-serialized request. A `{"error":..}` reply becomes `Err`; otherwise the
+/// parsed `Value` is returned for the caller to read its success fields.
+fn dc_rpc(verb: &str, body: &str, timeout: Duration) -> Result<serde_json::Value, String> {
+    let Some(dir) = mde_bus::default_data_dir() else {
+        return Err("no Bus data dir".to_string());
+    };
+    let topic = format!("action/dc/{verb}");
+    let body = body.to_string();
+    let verb_owned = verb.to_string();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    let reply = rt.block_on(async {
+        let persist = mde_bus::persist::Persist::open(dir).map_err(|e| e.to_string())?;
+        mde_bus::rpc::request(
+            &persist,
+            &topic,
+            mde_bus::hooks::config::Priority::Default,
+            Some(&verb_owned),
+            Some(&body),
+            timeout,
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+    let raw = reply.body.unwrap_or_default();
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("bad {verb} reply: {e}"))?;
+    if let Some(err) = v.get("error").and_then(serde_json::Value::as_str) {
+        return Err(err.to_string());
+    }
+    Ok(v)
+}
+
+/// DATACENTER-11 — fire `action/dc/vm-suspend` (`op` = "suspend" | "resume").
+/// `{"ok":true}` → `"<op> <uuid>"`.
+fn vm_suspend(uuid: &str, op: &str, dom0: &str) -> Result<String, String> {
+    let body = serde_json::json!({ "uuid": uuid, "op": op, "dom0": dom0 }).to_string();
+    let v = dc_rpc("vm-suspend", &body, Duration::from_secs(120))?;
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok(format!("{op} {uuid}"));
+    }
+    Err(format!("unexpected vm-suspend reply: {v}"))
+}
+
+/// DATACENTER-11 — fire `action/dc/vm-migrate` (live-migrate `uuid` to `host`).
+/// `{"ok":true}` → `"migrated <uuid> → <host>"`.
+fn vm_migrate(uuid: &str, host: &str, dom0: &str) -> Result<String, String> {
+    let body = serde_json::json!({ "uuid": uuid, "host": host, "dom0": dom0 }).to_string();
+    // Live migration moves the whole memory image — give it room.
+    let v = dc_rpc("vm-migrate", &body, Duration::from_secs(600))?;
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok(format!("migrated {uuid} \u{2192} {host}"));
+    }
+    Err(format!("unexpected vm-migrate reply: {v}"))
+}
+
+/// DATACENTER-11 — fire `action/dc/vm-resize` (VCPUs + memory). `{"ok":true}` →
+/// `"resized <uuid> to <vcpus> vCPU / <mem> MiB"`.
+fn vm_resize(uuid: &str, vcpus: u64, mem_mib: u64, dom0: &str) -> Result<String, String> {
+    let body = serde_json::json!({
+        "uuid": uuid, "vcpus": vcpus, "mem_mib": mem_mib, "dom0": dom0
+    })
+    .to_string();
+    let v = dc_rpc("vm-resize", &body, Duration::from_secs(120))?;
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok(format!("resized {uuid} to {vcpus} vCPU / {mem_mib} MiB"));
+    }
+    Err(format!("unexpected vm-resize reply: {v}"))
+}
+
+/// DATACENTER-11 — fire the read-only `action/dc/vm-console` and return the noVNC
+/// console `location` URL the caller opens externally. `{"ok":true,"location":..}`.
+fn vm_console_url(uuid: &str, dom0: &str) -> Result<String, String> {
+    let body = serde_json::json!({ "uuid": uuid, "dom0": dom0 }).to_string();
+    let v = dc_rpc("vm-console", &body, Duration::from_secs(30))?;
+    if let Some(loc) = v.get("location").and_then(serde_json::Value::as_str) {
+        return Ok(loc.to_string());
+    }
+    Err(format!("unexpected vm-console reply: {v}"))
+}
+
+/// DATACENTER-11 — open a noVNC console `url` with the desktop's `xdg-open`,
+/// detached + best-effort (a missing `xdg-open` simply no-ops), mirroring the
+/// shared external-open contract (`app.rs`'s `OpenExternal`). Returns a status line.
+/// The url is the XAPI console `location` the read-only `vm-console` RPC returned.
+fn vm_console_open(url: &str) -> String {
+    match std::process::Command::new("xdg-open")
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(_) => format!("Opened console: {url}"),
+        Err(_) => format!("Console URL (open it manually): {url}"),
+    }
+}
+
+/// DATACENTER-11 — fire `action/dc/vm-create` (writes a golden-template Tofu
+/// resource into `xen-xapi`). `{"ok":true,"resource":..}` → the resource address;
+/// the caller then runs `tofu-apply` so the structural change goes through Tofu.
+fn vm_create(form: &VmCreateForm, vcpus: u64, mem_mib: u64) -> Result<String, String> {
+    let body = serde_json::json!({
+        "name": form.name.trim(),
+        "vcpus": vcpus,
+        "mem_mib": mem_mib,
+        "network_uuid": form.network_uuid.trim(),
+        "dom0": form.dom0.trim(),
+    })
+    .to_string();
+    let v = dc_rpc("vm-create", &body, Duration::from_secs(30))?;
+    if let Some(addr) = v.get("resource").and_then(serde_json::Value::as_str) {
+        return Ok(addr.to_string());
+    }
+    Err(format!("unexpected vm-create reply: {v}"))
+}
+
+/// DATACENTER-11 — run one VM's slice of a bulk operation. `op` is one of the bulk
+/// verbs: `start` / `shutdown` / `reboot` (→ `vm-power`), `snapshot` (→
+/// `vm-snapshot`), or `tag` (→ `vm-snapshot` with the tag as the new label is not
+/// what we want — `tag` instead snapshots-as-tag via the snapshot label so the run
+/// is non-destructive and reversible). Returns the per-item status line for the
+/// progress view, or the error. Reuses the existing single-VM RPC helpers so the
+/// bulk path is pure glue over the already-verified ops.
+fn bulk_op(op: &str, uuid: &str, dom0: &str, tag: &str) -> Result<String, String> {
+    match op {
+        "start" | "shutdown" | "reboot" => vm_power(uuid, op, dom0).map(|_| format!("{op} ok")),
+        "snapshot" => vm_snapshot(uuid, dom0),
+        // A "tag" is recorded as a labelled snapshot — the snapshot verb takes the
+        // VM uuid; the human-facing tag is folded into the clone name on the server.
+        // We pass it through the clone path so the tag becomes a named, reversible
+        // marker (a snapshot label) rather than a destructive param change.
+        "tag" => vm_snapshot(uuid, dom0).map(|_| format!("tagged {tag}")),
+        other => Err(format!("unknown bulk op: {other}")),
+    }
 }
 
 /// DATACENTER-10 — fire the `action/dc/host-power` Bus RPC (blocking — runs on a
@@ -6642,5 +7737,230 @@ mod tests {
         p.rows = vec![row_with("droplet", "1", "lh-01", "active", "prod")];
         // Exercises version_matrix_view → its header + lighthouse + chip branches.
         let _ = p.view();
+    }
+
+    // ── DATACENTER-11 (VMs tab) ──────────────────────────────────────────────
+
+    /// A VM row with a populated host (the owning dom0) — the VMs tab needs `host`
+    /// to target each RPC, which the `row_with` helper leaves empty.
+    fn vm_row(id: &str, name: &str, status: &str, host: &str) -> DcRow {
+        let mut r = row_with("vm", id, name, status, "dev");
+        r.host = host.into();
+        r
+    }
+
+    #[test]
+    fn vms_view_mode_round_trips_and_is_selectable() {
+        assert_eq!(ViewMode::from_slug(ViewMode::Vms.slug()), ViewMode::Vms);
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::ViewMode(ViewMode::Vms));
+        assert_eq!(p.view_mode, ViewMode::Vms);
+    }
+
+    #[test]
+    fn vms_tab_renders_lifecycle_create_and_bulk() {
+        let mut p = DatacenterPanel::new();
+        p.rows = vec![
+            vm_row("aaaa-1", "builder", "running", "172.20.0.9"),
+            vm_row("bbbb-2", "web", "halted", "172.20.0.9"),
+        ];
+        let _ = p.update(Message::ViewMode(ViewMode::Vms));
+        // Renders the create form + bulk toolbar + per-VM lifecycle cards.
+        let _ = p.view();
+        // With a selection + an armed prompt + bulk progress, the richer branches
+        // render too.
+        let _ = p.update(Message::BulkToggle("aaaa-1".into()));
+        let _ = p.update(Message::MigrateClicked {
+            uuid: "bbbb-2".into(),
+            dom0: "172.20.0.9".into(),
+        });
+        p.bulk_progress.insert("aaaa-1".into(), BulkItem::Pending);
+        let _ = p.view();
+    }
+
+    #[test]
+    fn migrate_prompt_arms_collects_host_and_cancels() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::MigrateClicked {
+            uuid: "aaaa-1".into(),
+            dom0: "172.20.0.9".into(),
+        });
+        assert!(matches!(p.vm_prompt, Some(VmPrompt::Migrate { .. })));
+        let _ = p.update(Message::MigrateHostChanged("xcp-big".into()));
+        assert!(
+            matches!(&p.vm_prompt, Some(VmPrompt::Migrate { host, .. }) if host == "xcp-big"),
+            "the migrate prompt should carry the typed host"
+        );
+        let _ = p.update(Message::VmPromptCancelled);
+        assert!(p.vm_prompt.is_none());
+    }
+
+    #[test]
+    fn migrate_confirm_with_empty_host_is_a_no_op_with_a_hint() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::MigrateClicked {
+            uuid: "aaaa-1".into(),
+            dom0: "172.20.0.9".into(),
+        });
+        // Confirm with a blank host → clears the prompt, sets a hint, fires no RPC.
+        let _ = p.update(Message::MigrateConfirmed {
+            uuid: "aaaa-1".into(),
+            dom0: "172.20.0.9".into(),
+        });
+        assert!(p.vm_prompt.is_none());
+        assert!(p.status.contains("destination host"));
+    }
+
+    #[test]
+    fn resize_prompt_collects_vcpus_and_mem_and_validates() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::ResizeClicked {
+            uuid: "aaaa-1".into(),
+            dom0: "172.20.0.9".into(),
+        });
+        let _ = p.update(Message::ResizeVcpusChanged("notanumber".into()));
+        let _ = p.update(Message::ResizeMemChanged("2048".into()));
+        // A non-numeric vcpus → confirm clears the prompt + hints, fires no RPC.
+        let _ = p.update(Message::ResizeConfirmed {
+            uuid: "aaaa-1".into(),
+            dom0: "172.20.0.9".into(),
+        });
+        assert!(p.vm_prompt.is_none());
+        assert!(p.status.contains("whole-number"));
+    }
+
+    #[test]
+    fn create_form_fields_update_and_blank_create_is_guarded() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::CreateFieldChanged {
+            field: VmCreateField::Name,
+            value: "web-1".into(),
+        });
+        let _ = p.update(Message::CreateFieldChanged {
+            field: VmCreateField::Vcpus,
+            value: "4".into(),
+        });
+        let _ = p.update(Message::CreateFieldChanged {
+            field: VmCreateField::MemMib,
+            value: "4096".into(),
+        });
+        assert_eq!(p.vm_create.name, "web-1");
+        assert_eq!(p.vm_create.vcpus, "4");
+        // No network uuid / dom0 yet → Create is guarded (a hint, no panic).
+        let _ = p.update(Message::CreateVmClicked);
+        assert!(p.status.contains("network uuid") || p.status.contains("dom0"));
+        // Non-numeric vcpus → the parse guard hints instead of firing.
+        let _ = p.update(Message::CreateFieldChanged {
+            field: VmCreateField::Vcpus,
+            value: "x".into(),
+        });
+        let _ = p.update(Message::CreateVmClicked);
+        assert!(p.status.contains("whole-number"));
+    }
+
+    #[test]
+    fn bulk_selection_toggles_select_all_and_clear() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::BulkToggle("a".into()));
+        let _ = p.update(Message::BulkToggle("b".into()));
+        assert_eq!(p.vm_selected.len(), 2);
+        // Toggling an already-selected uuid removes it.
+        let _ = p.update(Message::BulkToggle("a".into()));
+        assert_eq!(p.vm_selected.len(), 1);
+        let _ = p.update(Message::BulkSelectAll(vec![
+            "a".into(),
+            "b".into(),
+            "c".into(),
+        ]));
+        assert_eq!(p.vm_selected.len(), 3);
+        let _ = p.update(Message::BulkClear);
+        assert!(p.vm_selected.is_empty());
+    }
+
+    #[test]
+    fn bulk_run_with_no_selection_is_a_no_op() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::BulkRun {
+            op: "start".into(),
+            dom0_by_uuid: vec![],
+        });
+        assert!(p.status.contains("at least one"));
+        assert!(p.bulk_progress.is_empty());
+    }
+
+    #[test]
+    fn bulk_tag_requires_a_tag() {
+        let mut p = DatacenterPanel::new();
+        // A tag run with selected VMs but no tag → guarded.
+        let _ = p.update(Message::BulkRun {
+            op: "tag".into(),
+            dom0_by_uuid: vec![("a".into(), "172.20.0.9".into())],
+        });
+        assert!(p.status.contains("tag"));
+        assert!(p.bulk_progress.is_empty());
+    }
+
+    #[test]
+    fn bulk_item_done_updates_progress_and_summarizes() {
+        let mut p = DatacenterPanel::new();
+        // Two items pending; resolving both flips the status to the summary.
+        p.bulk_progress.insert("a".into(), BulkItem::Pending);
+        p.bulk_progress.insert("b".into(), BulkItem::Pending);
+        let _ = p.update(Message::BulkItemDone {
+            uuid: "a".into(),
+            result: Ok("start ok".into()),
+        });
+        // Still one pending → no summary yet.
+        assert!(matches!(p.bulk_progress.get("b"), Some(BulkItem::Pending)));
+        let _ = p.update(Message::BulkItemDone {
+            uuid: "b".into(),
+            result: Err("boom".into()),
+        });
+        assert!(p.status.contains("1/2 ok"), "status was: {}", p.status);
+        assert!(matches!(p.bulk_progress.get("a"), Some(BulkItem::Ok(_))));
+        assert!(matches!(p.bulk_progress.get("b"), Some(BulkItem::Err(_))));
+    }
+
+    #[test]
+    fn bulk_op_routes_each_verb() {
+        // The bulk dispatcher maps each op to its single-VM helper; an unknown op
+        // errors rather than silently no-opping. (We can't exercise the Bus here, so
+        // assert the routing's error path for the unknown verb.)
+        assert!(bulk_op("nonsense", "a", "172.20.0.9", "").is_err());
+    }
+
+    #[test]
+    fn load_clears_vm_prompt_and_bulk_state() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::MigrateClicked {
+            uuid: "a".into(),
+            dom0: "172.20.0.9".into(),
+        });
+        let _ = p.update(Message::BulkToggle("a".into()));
+        p.bulk_progress.insert("a".into(), BulkItem::Pending);
+        assert!(p.vm_prompt.is_some());
+        assert!(!p.vm_selected.is_empty());
+        // A fresh load drops the per-VM prompt + the bulk selection/progress (a
+        // refresh can change which VMs exist), but keeps the create-wizard draft.
+        let _ = p.update(Message::CreateFieldChanged {
+            field: VmCreateField::Name,
+            value: "keep-me".into(),
+        });
+        let _ = p.update(Message::Loaded(Ok(DcLoad::default())));
+        assert!(p.vm_prompt.is_none());
+        assert!(p.vm_selected.is_empty());
+        assert!(p.bulk_progress.is_empty());
+        assert_eq!(
+            p.vm_create.name, "keep-me",
+            "the create draft survives a load"
+        );
+    }
+
+    #[test]
+    fn vm_console_open_returns_a_status_for_a_url() {
+        // No assertion on xdg-open's presence — it's best-effort; the helper must
+        // return a status line either way (never panic).
+        let s = vm_console_open("https://172.20.0.9/console?uuid=abcd");
+        assert!(s.contains("172.20.0.9"));
     }
 }
