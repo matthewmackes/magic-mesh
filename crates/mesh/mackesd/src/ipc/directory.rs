@@ -78,6 +78,13 @@ pub fn revision_currency(head: Option<u64>, acked: Option<u64>) -> &'static str 
 /// `headless`) read from the replicated tag manifest; empty when the
 /// peer has none. The Peers Front Door renders them as chips and folds
 /// them into the filter.
+///
+/// `lighthouse_ips` is the canonical mesh-wide lighthouse overlay-IP set
+/// (the replicated Nebula bundle's `static_host_map` roster — the SAME
+/// fact `nebula_supervisor` uses: "a node is a lighthouse iff its overlay
+/// IP is in the bundle's lighthouse set"). It's the role source of last
+/// resort, consulted when none of the per-peer signals carry a role — see
+/// the role-precedence note below.
 #[must_use]
 pub fn directory_row(
     rec: &PeerRecord,
@@ -85,8 +92,16 @@ pub fn directory_row(
     head: Option<u64>,
     acked: Option<u64>,
     tags: &[String],
+    lighthouse_ips: &[String],
     now_ms: u64,
 ) -> serde_json::Value {
+    // The effective overlay IP this row reports (the peer's own record wins,
+    // then the signer roster mirror) — also what we match against the
+    // canonical lighthouse roster below.
+    let overlay_ip = rec
+        .overlay_ip
+        .clone()
+        .or_else(|| overlay.map(|(ip, _)| ip.clone()));
     json!({
         "hostname": rec.hostname,
         "presence": presence_tier(now_ms, rec.last_seen_ms),
@@ -99,23 +114,32 @@ pub fn directory_row(
         // roster mirror (only populated on the signer). This is what lets
         // a peer's Mesh DNS / Service Publishing / Routing panels resolve
         // overlay addresses instead of showing empty.
-        "overlay_ip": rec
-            .overlay_ip
-            .clone()
-            .or_else(|| overlay.map(|(ip, _)| ip.clone())),
+        "overlay_ip": overlay_ip,
         // Role precedence: the signer's roster mirror (authoritative, but
         // only populated on the signer) → the peer's OWN replicated
         // `rec.role` (self-declared, available mesh-wide under SUBSTRATE-V2)
-        // → capability-tag derivation → "peer". Trusting `rec.role` is what
-        // fixes HA-4: without it every peer collapsed to "peer", so
-        // `mesh_health_counts` saw 0 lighthouses and `ha_ok` never flipped
-        // even with ≥2 live lighthouses in the directory (found live on a
-        // 2-lighthouse mesh, 2026-06-23).
+        // → capability-tag derivation → the canonical lighthouse roster
+        // (the replicated bundle's overlay-IP set) → "peer".
+        //
+        // Trusting `rec.role` fixed HA-4: without it every peer collapsed
+        // to "peer". But `rec.role` is itself empty on the pre-role peer
+        // writers still live on the fleet (found on Eagle 11.0.5: the
+        // directory carried role="-" for both lighthouses while `healthz`
+        // counted 2), so the row must ALSO fall back to the canonical
+        // lighthouse roster — a node whose overlay IP is in the replicated
+        // bundle's `static_host_map` set IS a lighthouse, mesh-wide,
+        // regardless of what its own record happens to declare. This is the
+        // SAME detection `mesh_health_counts` feeds `lighthouse_count`, so
+        // `action/mesh/directory` and `healthz` can no longer diverge.
         "role": overlay
             .map(|(_, role)| role.clone())
             .or_else(|| rec.role.clone().filter(|r| !r.trim().is_empty()))
             .unwrap_or_else(|| {
-                if tags.iter().any(|t| t.eq_ignore_ascii_case("lighthouse")) {
+                if tags.iter().any(|t| t.eq_ignore_ascii_case("lighthouse"))
+                    || overlay_ip
+                        .as_deref()
+                        .is_some_and(|ip| lighthouse_ips.iter().any(|lh| lh == ip))
+                {
                     "lighthouse".to_string()
                 } else {
                     "peer".to_string()
@@ -169,6 +193,55 @@ impl DirectoryService {
                 .collect(),
             Err(_) => HashMap::new(),
         }
+    }
+
+    /// The canonical mesh-wide lighthouse overlay-IP set — the Nebula bundle's
+    /// `static_host_map` roster, the SAME fact `nebula_supervisor` keys a node's
+    /// lighthouse role off ("a node is a lighthouse iff its overlay IP is in the
+    /// bundle's lighthouse set"). The bundle is replicated per-peer under
+    /// `<root>/<node_id>/mackesd/nebula-bundle.json`.
+    ///
+    /// We UNION every readable bundle's lighthouse IPs rather than trusting any
+    /// single one: the per-peer bundles are NOT all written with the full roster.
+    /// The `/enroll` listener writes the complete redundant set (LIGHTHOUSE-10),
+    /// but the auto-signer (`nebula_csr_watcher`) and `mesh_init` write a
+    /// single-self entry — so reading one arbitrary bundle (whichever `read_dir`
+    /// happened to surface first) would intermittently under-count and re-open the
+    /// very HA-4 divergence this fixes. The union is order-independent (sorted +
+    /// deduped), so every node computes the same set from the same replicated
+    /// state. Empty when no bundle is reachable (the join degrades to the per-peer
+    /// role signals, never errors) — the pre-bundle / unjoined state, where
+    /// there's no lighthouse to surface anyway.
+    ///
+    /// This is what lets `directory_row` resolve `role=lighthouse` mesh-wide even
+    /// when a peer's own `rec.role` is empty (the pre-role writers still live on
+    /// the fleet), keeping `action/mesh/directory` and the `healthz`
+    /// `lighthouse_count` (both built off `directory_row`) from diverging.
+    #[must_use]
+    pub fn lighthouse_overlay_ips(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&self.workgroup_root) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            // Per-peer dirs hold the replicated bundle at
+            // `<node_id>/mackesd/nebula-bundle.json`. Union them all — a skinny
+            // (self-only) bundle must not shadow a peer's full roster.
+            let bundle_path = entry
+                .path()
+                .join("mackesd")
+                .join(crate::ca::bundle::BUNDLE_FILENAME);
+            if let Ok(bundle) = crate::ca::bundle::read_bundle(&bundle_path) {
+                for lh in &bundle.lighthouses {
+                    if !lh.overlay_ip.is_empty() {
+                        out.push(lh.overlay_ip.clone());
+                    }
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// ONBOARD-6 (OB6-FIX-4) — `(node_count, healthy, degraded, unreachable,
@@ -238,6 +311,10 @@ impl DirectoryService {
             })
         };
         let roster = self.roster_index();
+        // SUBSTRATE-8 / HA-4 — the canonical mesh-wide lighthouse roster
+        // (bundle `static_host_map` overlay IPs), the role source of last
+        // resort `directory_row` consults when no per-peer signal carries one.
+        let lighthouse_ips = self.lighthouse_overlay_ips();
         let rev_dir = store::revisions_dir(&self.workgroup_root);
         let head = store::elect_head(&rev_dir).map(|r| r.version);
         // Latest applied ack per peer across all revisions.
@@ -268,6 +345,7 @@ impl DirectoryService {
                     head,
                     acked.get(&rec.hostname).copied(),
                     &tags,
+                    &lighthouse_ips,
                     now_ms,
                 )
             })
@@ -708,6 +786,135 @@ mod tests {
         assert!(
             !mackes_mesh_types::lighthouse::ha_degraded(lighthouses as usize),
             "2 lighthouses meet the HA floor → not degraded"
+        );
+    }
+
+    #[test]
+    fn directory_row_resolves_lighthouse_from_the_canonical_roster_when_rec_role_empty() {
+        // Regression (found live on Eagle 11.0.5): the directory carried role
+        // "-" (empty `rec.role`) for both online lighthouses — they were written
+        // by a pre-role peer writer — while `healthz` reported lighthouse_count:2.
+        // `action/mesh/directory` (the Workbench Lighthouses panel's source) and
+        // the healthz path BOTH build off `directory_row`, so the row must fall
+        // back to the canonical mesh-wide lighthouse detection: a node whose
+        // overlay IP is in the replicated Nebula bundle's `static_host_map`
+        // roster IS a lighthouse, regardless of what its own record declares.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let pdir = mackes_mesh_types::peers::peers_dir(root);
+        std::fs::create_dir_all(&pdir).unwrap();
+        let now = now_ms();
+
+        // Two lighthouses with EMPTY rec.role (the live-Eagle shape) + a plain
+        // peer that is NOT in the lighthouse roster.
+        let lhs = [("lh-1", "10.42.0.1"), ("lh-2", "10.42.0.3")];
+        for (h, ip) in lhs {
+            write_peer_record(
+                &pdir,
+                &PeerRecord {
+                    hostname: h.into(),
+                    mde_version: Some("11.0.5".into()),
+                    last_seen_ms: now,
+                    health: "healthy".into(),
+                    descriptors: None,
+                    overlay_ip: Some(ip.into()),
+                    role: None, // pre-role writer — the bug condition
+                    external_addr: None,
+                },
+            )
+            .unwrap();
+        }
+        write_peer_record(
+            &pdir,
+            &PeerRecord {
+                hostname: "unit-eagle".into(),
+                mde_version: Some("11.0.5".into()),
+                last_seen_ms: now,
+                health: "healthy".into(),
+                descriptors: None,
+                overlay_ip: Some("10.42.0.2".into()), // not in the LH roster
+                role: None,
+                external_addr: None,
+            },
+        )
+        .unwrap();
+
+        // Seed TWO replicated bundles, exactly the divergent shapes that land on
+        // a real mesh: a "skinny" self-only bundle (what the auto-signer /
+        // mesh_init write — a single self entry) AND a full-roster bundle (what
+        // the /enroll listener writes, LIGHTHOUSE-10). `lighthouse_overlay_ips`
+        // must UNION them — a skinny bundle surfacing first under `read_dir` must
+        // not shadow the full roster, or the second lighthouse (10.42.0.3) goes
+        // missing and HA-4 under-counts again.
+        let mk =
+            |mesh_overlay: &str, lhs: Vec<(&str, &str, &str)>| crate::ca::bundle::NebulaBundle {
+                mesh_id: "eagle".into(),
+                epoch: 1,
+                ca_cert_pem: "-----BEGIN NEBULA CA-----\n-----END NEBULA CA-----\n".into(),
+                peer_cert_pem: "-----BEGIN NEBULA CERT-----\n-----END NEBULA CERT-----\n".into(),
+                peer_key_pem: "-----BEGIN NEBULA KEY-----\n-----END NEBULA KEY-----\n".into(),
+                overlay_ip: mesh_overlay.into(),
+                mesh_cidr: "10.42.0.0/16".into(),
+                lighthouses: lhs
+                    .into_iter()
+                    .map(|(node_id, ip, ext)| crate::ca::bundle::LighthouseEntry {
+                        node_id: node_id.into(),
+                        overlay_ip: ip.into(),
+                        external_addr: ext.into(),
+                    })
+                    .collect(),
+                created_at: 1,
+            };
+        // Skinny: only lh-1 (the signer's hardcoded conventional first host).
+        crate::ca::bundle::write_bundle(
+            &crate::ca::bundle::bundle_path(root, "peer:unit-eagle"),
+            &mk(
+                "10.42.0.2",
+                vec![("peer:lh-1", "10.42.0.1", "203.0.113.1:4242")],
+            ),
+        )
+        .unwrap();
+        // Full roster: both lighthouses.
+        crate::ca::bundle::write_bundle(
+            &crate::ca::bundle::bundle_path(root, "peer:lh-2"),
+            &mk(
+                "10.42.0.3",
+                vec![
+                    ("peer:lh-1", "10.42.0.1", "203.0.113.1:4242"),
+                    ("peer:lh-2", "10.42.0.3", "203.0.113.3:4242"),
+                ],
+            ),
+        )
+        .unwrap();
+
+        let svc = DirectoryService::new(root, None); // non-signer: no roster DB
+
+        // The union must carry BOTH lighthouse IPs regardless of read order.
+        let ips = svc.lighthouse_overlay_ips();
+        assert!(
+            ips.contains(&"10.42.0.1".to_string()) && ips.contains(&"10.42.0.3".to_string()),
+            "union of skinny + full bundles must carry both lighthouses, got {ips:?}"
+        );
+        let dir = svc.build_directory(now);
+        let role_of = |host: &str| -> String {
+            dir["peers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["hostname"] == host)
+                .map(|p| p["role"].as_str().unwrap_or("").to_string())
+                .unwrap_or_default()
+        };
+        assert_eq!(role_of("lh-1"), "lighthouse", "roster IP ⇒ lighthouse");
+        assert_eq!(role_of("lh-2"), "lighthouse", "roster IP ⇒ lighthouse");
+        assert_eq!(role_of("unit-eagle"), "peer", "non-roster IP stays a peer");
+
+        // The directory the panel reads and the healthz counter now AGREE: both
+        // are built off `directory_row`, so the canonical roster resolves both.
+        let (_t, _h, _d, _u, _l, lighthouses) = svc.mesh_health_counts("unit-eagle", now);
+        assert_eq!(
+            lighthouses, 2,
+            "directory + healthz lighthouse_count cannot diverge"
         );
     }
 
