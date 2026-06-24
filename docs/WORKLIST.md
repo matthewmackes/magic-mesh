@@ -888,8 +888,18 @@ Prompted by the QNM master SPOF outage. Master `45.55.33.179` (10.42.0.1) + shad
 > stand up a 2nd lighthouse → 3rd etcd member → real quorum (quorum 2-of-3, tolerates
 > 1 failure). Live state 2026-06-23: 1 lighthouse `167.71.247.150` (10.42.0.1) + Eagle
 > = 2-member etcd (no fault-tolerance); substrate healthy (syncthing.service active,
-> etcd endpoint healthy). 2nd-lighthouse deploy staged, **pending operator go-ahead**
-> (new DO droplet = cost + live infra).
+> etcd endpoint healthy). **DEPLOYED LIVE 2026-06-24 (operator-authorized):** 2nd
+> lighthouse `mcnf-lh2` 68.183.55.253 (overlay 10.42.0.3) joined as role=lighthouse;
+> **etcd grown to a healthy 3-member quorum** (lh1 10.42.0.1 + Eagle 10.42.0.2 + lh2
+> 10.42.0.3, all endpoints healthy → tolerates 1 failure); Syncthing active on lh2;
+> public addr published. **HA infrastructure ACHIEVED.** Live-verify caught a real
+> bug: `ha_ok` stayed false / `lighthouse_count=0` because `directory_row` never
+> propagated `rec.role` (every peer collapsed to "peer") — **fixed + merged (#26,
+> 10ee9ab)** with a 2-lighthouse regression test. **Remaining (operational):** the
+> running lighthouses still run the buggy published 11.0.2, so the live `ha_ok` flips
+> true only after a mackesd redeploy of the fix to lh1/lh2/Eagle (next release roll or
+> a targeted push). Also: `setup-etcd` double-lists the anchor in the endpoints file
+> (harmless, etcd dedups) — minor fix pending.
 - [✓] **HA-6: lighthouse `/tmp` tmpfs shrunk to 128M (2026-06-17).** Both 947 MB lighthouses: `tmp.mount` drop-in `Options=…size=128M` + live remount → /tmp 474M→128M, freed ~350 MB so a heavy transient can't OOM mfsmaster. Master verified UP through the remount. *(persistent via the drop-in.)* Original:
   **Acceptance:** both 947 MB lighthouses have `/tmp` sized to ~128 MB (persistent via fstab/tmpfiles), freeing ~350 MB usable RAM so a heavy transient can't OOM the master; verified `df -h /tmp` + survives reboot.
 - [✓] **HA-1: shadow-master substrate — LIVE on 159.65.183.51 (2026-06-17).** `setup-qnm-shared --shadow` added (PERSONALITY=shadow + MASTER_HOST + metalogger). Deployed to 159: lizardfs-master active in shadow personality, **synced at metadata version 5191872** ('all needed changelogs applied successfully'), streaming live from the master; keeps its chunkserver (Q8); master stayed UP (load 0.53). The QNM-Shared master is no longer a hard SPOF. *(metalogger package absent on F44 → cold-backup half deferred; the live shadow is the warm standby. Failover is manual until HA-3's auto-promote worker lands.)* Original:
