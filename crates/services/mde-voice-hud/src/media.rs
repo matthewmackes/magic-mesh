@@ -23,6 +23,75 @@ use crate::sip::RemoteMedia;
 const SAMPLE_RATE: u32 = 8000;
 const FRAME_SAMPLES: usize = 160;
 
+// ── RFC 4733 telephone-event (out-of-band DTMF) ──────────────────────────────
+
+/// How many 20 ms packets one DTMF tone spans (~180 ms). Each repeats the same
+/// event with a growing duration; the last three carry the end-of-event bit so a
+/// lost final packet still terminates the tone (RFC 4733 §2.5.1.4).
+const DTMF_PACKETS: u32 = 9;
+
+/// Map a dialer character to its RFC 4733 telephone-event code (0-9 → 0-9,
+/// `*` → 10, `#` → 11, A-D → 12-15). Returns `None` for anything that is not a
+/// DTMF-representable key, so a stray char never produces a malformed event.
+#[must_use]
+pub const fn dtmf_event_code(c: char) -> Option<u8> {
+    match c {
+        '0'..='9' => Some(c as u8 - b'0'),
+        '*' => Some(10),
+        '#' => Some(11),
+        'A' | 'a' => Some(12),
+        'B' | 'b' => Some(13),
+        'C' | 'c' => Some(14),
+        'D' | 'd' => Some(15),
+        _ => None,
+    }
+}
+
+/// The event-specific fields of one RFC 4733 telephone-event packet — the parts
+/// that change packet-to-packet within a single DTMF tone (the RTP framing
+/// fields are passed separately to [`build_dtmf_packet`]).
+#[derive(Debug, Clone, Copy)]
+pub struct DtmfEvent {
+    /// The telephone-event code (see [`dtmf_event_code`]).
+    pub event: u8,
+    /// The end-of-event bit: set on the trailing packets so the tone terminates
+    /// even if the final packet is lost (RFC 4733 §2.5.1.4).
+    pub end: bool,
+    /// Cumulative tone duration in timestamp units (grows each packet).
+    pub duration: u16,
+    /// The RTP marker bit: set only on the first packet of a new event.
+    pub marker: bool,
+}
+
+/// Build one RFC 4733 telephone-event RTP packet from the RTP framing fields
+/// (`payload_type`/`seq`/`timestamp`/`ssrc`) and the per-packet [`DtmfEvent`].
+///
+/// The 4-byte event payload is `[event, E<<7 | volume, duration_be_hi,
+/// duration_be_lo]`. The same `timestamp` (the event's start) is reused for
+/// every packet of one tone, while `ev.duration` grows each packet.
+#[must_use]
+pub fn build_dtmf_packet(
+    payload_type: u8,
+    seq: u16,
+    timestamp: u32,
+    ssrc: u32,
+    ev: DtmfEvent,
+) -> Vec<u8> {
+    let mut p = Vec::with_capacity(16);
+    p.push(0x80); // V=2, P=0, X=0, CC=0
+    let m_bit = if ev.marker { 0x80 } else { 0x00 };
+    p.push(m_bit | (payload_type & 0x7F));
+    p.extend_from_slice(&seq.to_be_bytes());
+    p.extend_from_slice(&timestamp.to_be_bytes());
+    p.extend_from_slice(&ssrc.to_be_bytes());
+    // Telephone-event payload (RFC 4733 §2.3): event, E|R|volume, duration.
+    p.push(ev.event);
+    let volume: u8 = 10; // -10 dBm0, a conventional DTMF level.
+    p.push(if ev.end { 0x80 } else { 0x00 } | (volume & 0x3F));
+    p.extend_from_slice(&ev.duration.to_be_bytes());
+    p
+}
+
 // ── G.711 µ-law (PCMU, payload type 0) ──────────────────────────────────────
 
 const ULAW_BIAS: i32 = 0x84;
@@ -184,6 +253,11 @@ pub struct MediaSession {
     /// receive path keeps playing their audio. Shared with the audio thread so
     /// a toggle takes effect on the next frame without restarting the session.
     muted: Arc<AtomicBool>,
+    /// Pending DTMF event codes (RFC 4733) queued by [`Self::send_dtmf`] and
+    /// drained by the send loop, which transmits each as a telephone-event tone.
+    /// `None` when the peer did not negotiate `telephone-event` — `send_dtmf`
+    /// then no-ops rather than queue a tone that can never be sent.
+    dtmf_queue: Option<Arc<Mutex<VecDeque<u8>>>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -207,6 +281,33 @@ impl MediaSession {
     #[must_use]
     pub fn is_muted(&self) -> bool {
         self.muted.load(Ordering::Relaxed)
+    }
+
+    /// `true` when the peer negotiated out-of-band DTMF (a `telephone-event`
+    /// payload type), so [`Self::send_dtmf`] will actually transmit.
+    #[must_use]
+    pub const fn dtmf_supported(&self) -> bool {
+        self.dtmf_queue.is_some()
+    }
+
+    /// Queue a DTMF keypress for transmission as an RFC 4733 telephone-event
+    /// tone. `true` if the key maps to a DTMF event AND the peer negotiated
+    /// out-of-band DTMF (so the tone will be sent); `false` otherwise (the call
+    /// continues normally — a non-DTMF key or a peer with no telephone-event is
+    /// simply ignored). The send loop transmits the tone on the next frames.
+    pub fn send_dtmf(&self, key: char) -> bool {
+        let Some(code) = dtmf_event_code(key) else {
+            return false;
+        };
+        let Some(queue) = &self.dtmf_queue else {
+            return false;
+        };
+        if let Ok(mut q) = queue.lock() {
+            q.push_back(code);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -241,23 +342,64 @@ pub fn start_media(local_rtp_port: u16, remote: &RemoteMedia) -> Result<MediaSes
     let muted_thread = muted.clone();
     let payload_type = remote.payload_type;
 
+    // DTMF queue is only wired when the peer negotiated telephone-event — a
+    // `None` here means `send_dtmf` no-ops (the peer can't decode it anyway).
+    let dtmf_queue: Option<Arc<Mutex<VecDeque<u8>>>> = remote
+        .telephone_event_pt
+        .map(|_| Arc::new(Mutex::new(VecDeque::new())));
+    let dtmf_thread = dtmf_queue.clone();
+    let telephone_event_pt = remote.telephone_event_pt;
+
     let thread = std::thread::Builder::new()
         .name("mwv-rtp-media".into())
-        .spawn(move || run_audio(&sock, payload_type, &stop_thread, &muted_thread))
+        .spawn(move || {
+            let codec = CodecConfig {
+                payload_type,
+                telephone_event_pt,
+            };
+            run_audio(
+                &sock,
+                codec,
+                &stop_thread,
+                &muted_thread,
+                dtmf_thread.as_deref(),
+            );
+        })
         .map_err(|e| format!("media thread spawn failed ({e})"))?;
 
     Ok(MediaSession {
         stop,
         muted,
+        dtmf_queue,
         thread: Some(thread),
     })
 }
 
+/// The negotiated RTP payload types for a session: the G.711 audio codec and the
+/// dynamic `telephone-event` type for out-of-band DTMF (`None` if the peer did
+/// not offer it). Carried as one value so the audio thread takes fewer params.
+#[derive(Debug, Clone, Copy)]
+struct CodecConfig {
+    /// Audio payload type: 0 = PCMU (µ-law), 8 = PCMA (A-law).
+    payload_type: u8,
+    /// The peer's `telephone-event` payload type for DTMF, or `None`.
+    telephone_event_pt: Option<u8>,
+}
+
 /// The audio thread: owns the cpal streams (`Stream` is `!Send`) and drives the
 /// RTP send/recv loops. Shared `VecDeque`s bridge the cpal callbacks and the
-/// network I/O.
-fn run_audio(sock: &UdpSocket, payload_type: u8, stop: &AtomicBool, muted: &AtomicBool) {
+/// network I/O. `dtmf_queue` (when the peer negotiated `telephone-event`) feeds
+/// RFC 4733 DTMF tones the send loop interleaves between audio frames.
+fn run_audio(
+    sock: &UdpSocket,
+    codec: CodecConfig,
+    stop: &AtomicBool,
+    muted: &AtomicBool,
+    dtmf_queue: Option<&Mutex<VecDeque<u8>>>,
+) {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    let payload_type = codec.payload_type;
+    let telephone_event_pt = codec.telephone_event_pt;
 
     // mic samples captured by the input callback, drained by the send loop.
     let capture: Arc<Mutex<VecDeque<i16>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -338,6 +480,16 @@ fn run_audio(sock: &UdpSocket, payload_type: u8, stop: &AtomicBool, muted: &Atom
             seq = seq.wrapping_add(1);
             timestamp = timestamp.wrapping_add(FRAME_SAMPLES as u32);
         }
+        // DTMF: if a keypress is queued and the peer negotiated telephone-event,
+        // transmit it as an RFC 4733 tone interleaved into the audio RTP stream
+        // (same SSRC, shared seq, the event's start timestamp). Pop one digit per
+        // outer tick so a fast sequence keeps an inter-digit gap.
+        if let (Some(te_pt), Some(queue)) = (telephone_event_pt, dtmf_queue) {
+            let code = queue.lock().ok().and_then(|mut q| q.pop_front());
+            if let Some(event) = code {
+                send_dtmf_tone(sock, te_pt, &mut seq, &mut timestamp, ssrc, event);
+            }
+        }
         // Receive: decode any waiting RTP into the playback queue.
         match sock.recv(&mut recv_buf) {
             Ok(n) => {
@@ -359,6 +511,55 @@ fn run_audio(sock: &UdpSocket, payload_type: u8, stop: &AtomicBool, muted: &Atom
         }
     }
     // Streams stop on drop here.
+}
+
+/// One DTMF packetization interval (20 ms), matching the audio frame cadence.
+const DTMF_PACKET_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Transmit one DTMF digit as an RFC 4733 telephone-event tone on the live
+/// stream. Sends `DTMF_PACKETS` "active" packets, one per 20 ms, the duration
+/// growing each packet, then three end-of-event packets that ALL carry the full
+/// final duration (RFC 4733 §2.5.1.4 — the retransmissions repeat the terminator
+/// so a single lost final packet still ends the tone). `seq`/`timestamp` are the
+/// shared audio counters: seq advances per packet, and the timestamp jumps past
+/// the whole event afterward so audio resumes on the correct RTP timeline.
+fn send_dtmf_tone(
+    sock: &UdpSocket,
+    te_pt: u8,
+    seq: &mut u16,
+    timestamp: &mut u32,
+    ssrc: u32,
+    event: u8,
+) {
+    let start_ts = *timestamp;
+    #[allow(clippy::cast_possible_truncation)]
+    let final_duration = (DTMF_PACKETS * FRAME_SAMPLES as u32) as u16;
+    // Active packets: duration grows each interval; M-bit only on the first.
+    for i in 0..DTMF_PACKETS {
+        #[allow(clippy::cast_possible_truncation)]
+        let ev = DtmfEvent {
+            event,
+            end: false,
+            duration: ((i + 1) * FRAME_SAMPLES as u32) as u16,
+            marker: i == 0,
+        };
+        let _ = sock.send(&build_dtmf_packet(te_pt, *seq, start_ts, ssrc, ev));
+        *seq = seq.wrapping_add(1);
+        std::thread::sleep(DTMF_PACKET_INTERVAL);
+    }
+    // End-of-event: three retransmissions, all carrying the full duration.
+    for _ in 0..3 {
+        let ev = DtmfEvent {
+            event,
+            end: true,
+            duration: final_duration,
+            marker: false,
+        };
+        let _ = sock.send(&build_dtmf_packet(te_pt, *seq, start_ts, ssrc, ev));
+        *seq = seq.wrapping_add(1);
+    }
+    // Audio resumes after the event's RTP duration.
+    *timestamp = timestamp.wrapping_add(u32::from(final_duration));
 }
 
 #[cfg(test)]
@@ -444,6 +645,7 @@ mod tests {
             addr: peer_addr.ip().to_string(),
             port: peer_addr.port(),
             payload_type: 0,
+            telephone_event_pt: Some(101),
         };
         // Local RTP port 0 → the OS picks a free one.
         let session = start_media(0, &remote).expect("media session starts");
@@ -452,6 +654,172 @@ mod tests {
         assert!(session.is_muted(), "set_muted(true) takes effect");
         session.set_muted(false);
         assert!(!session.is_muted(), "set_muted(false) clears it");
+        session.stop();
+    }
+
+    #[test]
+    fn dtmf_event_code_maps_every_keypad_key() {
+        for (c, code) in [
+            ('0', 0u8),
+            ('5', 5),
+            ('9', 9),
+            ('*', 10),
+            ('#', 11),
+            ('A', 12),
+            ('D', 15),
+        ] {
+            assert_eq!(dtmf_event_code(c), Some(code), "key {c}");
+        }
+        // Non-DTMF keys map to nothing (no malformed event ever queued).
+        assert_eq!(dtmf_event_code('x'), None);
+        assert_eq!(dtmf_event_code('+'), None);
+    }
+
+    #[test]
+    fn dtmf_packet_has_rfc4733_shape() {
+        // Mid-tone packet: M-bit clear, end clear, the 4-byte event payload.
+        let p = build_dtmf_packet(
+            101,
+            42,
+            1600,
+            0xDEAD_BEEF,
+            DtmfEvent {
+                event: 7,
+                end: false,
+                duration: 320,
+                marker: false,
+            },
+        );
+        assert_eq!(p.len(), 16); // 12-byte RTP header + 4-byte event
+        assert_eq!(p[0], 0x80); // V=2
+        assert_eq!(p[1], 101); // M=0 | PT=101
+        assert_eq!(u16::from_be_bytes([p[2], p[3]]), 42); // seq
+        assert_eq!(p[12], 7); // event code
+        assert_eq!(p[13] & 0x80, 0); // E bit clear
+        assert_eq!(u16::from_be_bytes([p[14], p[15]]), 320); // duration
+
+        // First packet of the tone: M-bit set. End packet: E bit set.
+        let first = build_dtmf_packet(
+            101,
+            1,
+            0,
+            0,
+            DtmfEvent {
+                event: 3,
+                end: false,
+                duration: 160,
+                marker: true,
+            },
+        );
+        assert_eq!(first[1] & 0x80, 0x80, "first packet carries the RTP marker");
+        let last = build_dtmf_packet(
+            101,
+            9,
+            0,
+            0,
+            DtmfEvent {
+                event: 3,
+                end: true,
+                duration: 1440,
+                marker: false,
+            },
+        );
+        assert_eq!(last[13] & 0x80, 0x80, "end packet carries the E bit");
+    }
+
+    #[test]
+    fn send_dtmf_transmits_a_tone_when_negotiated() {
+        // A loopback "peer" receives whatever the session transmits. With
+        // telephone-event negotiated, a queued '5' must arrive as a burst of
+        // RFC 4733 packets on PT 101 carrying event code 5.
+        let peer = UdpSocket::bind(("127.0.0.1", 0)).expect("bind loopback peer");
+        peer.set_read_timeout(Some(Duration::from_secs(2))).ok();
+        let peer_addr = peer.local_addr().expect("peer addr");
+        let remote = RemoteMedia {
+            addr: peer_addr.ip().to_string(),
+            port: peer_addr.port(),
+            payload_type: 0,
+            telephone_event_pt: Some(101),
+        };
+        let session = start_media(0, &remote).expect("media session starts");
+        assert!(session.dtmf_supported(), "peer offered telephone-event");
+        assert!(session.send_dtmf('5'), "a DTMF key queues a tone");
+        assert!(!session.send_dtmf('x'), "a non-DTMF key is rejected");
+
+        // Drain the burst; collect PT-101 events for code 5. Every end-of-event
+        // (E-bit) packet must carry the SAME full duration (RFC 4733 §2.5.1.4).
+        let mut buf = [0u8; 64];
+        let mut saw_event = false;
+        let mut end_durations = Vec::new();
+        #[allow(clippy::cast_possible_truncation)]
+        let full_duration = (DTMF_PACKETS * FRAME_SAMPLES as u32) as u16;
+        for _ in 0..(DTMF_PACKETS + 6) {
+            match peer.recv(&mut buf) {
+                Ok(n) if n >= 16 && (buf[1] & 0x7F) == 101 => {
+                    assert_eq!(buf[12], 5, "DTMF event code is 5");
+                    saw_event = true;
+                    if buf[13] & 0x80 != 0 {
+                        end_durations.push(u16::from_be_bytes([buf[14], buf[15]]));
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(saw_event, "received an RFC 4733 telephone-event for '5'");
+        assert!(
+            !end_durations.is_empty(),
+            "saw at least one end-of-event packet"
+        );
+        assert!(
+            end_durations.iter().all(|&d| d == full_duration),
+            "every end packet carries the full duration {full_duration}, got {end_durations:?}"
+        );
+        session.stop();
+    }
+
+    #[test]
+    fn send_dtmf_tone_keeps_audio_timestamp_continuous() {
+        // The tone consumes exactly its RTP duration of timeline: after the tone
+        // the audio timestamp must have advanced by DTMF_PACKETS*FRAME_SAMPLES so
+        // audio resumes on the correct RTP clock (no double-count, no gap).
+        let peer = UdpSocket::bind(("127.0.0.1", 0)).expect("bind loopback peer");
+        let sock = UdpSocket::bind(("127.0.0.1", 0)).expect("bind sender");
+        sock.connect(peer.local_addr().unwrap()).expect("connect");
+        let mut seq: u16 = 100;
+        let mut ts: u32 = 1600;
+        let start = ts;
+        send_dtmf_tone(&sock, 101, &mut seq, &mut ts, 0xABCD, 5);
+        #[allow(clippy::cast_possible_truncation)]
+        let expected = (DTMF_PACKETS * FRAME_SAMPLES as u32) as u32;
+        assert_eq!(
+            ts - start,
+            expected,
+            "timestamp advances by one event period"
+        );
+        // 9 active + 3 end = 12 packets, each consumed one seq.
+        assert_eq!(
+            seq,
+            100 + (DTMF_PACKETS as u16) + 3,
+            "seq advanced per packet"
+        );
+    }
+
+    #[test]
+    fn send_dtmf_no_ops_without_telephone_event() {
+        // A peer that did NOT offer telephone-event → send_dtmf is a no-op
+        // (returns false), never queueing a tone the peer can't decode.
+        let peer = UdpSocket::bind(("127.0.0.1", 0)).expect("bind loopback peer");
+        let peer_addr = peer.local_addr().expect("peer addr");
+        let remote = RemoteMedia {
+            addr: peer_addr.ip().to_string(),
+            port: peer_addr.port(),
+            payload_type: 0,
+            telephone_event_pt: None,
+        };
+        let session = start_media(0, &remote).expect("media session starts");
+        assert!(!session.dtmf_supported(), "no telephone-event negotiated");
+        assert!(!session.send_dtmf('5'), "no DTMF without telephone-event");
         session.stop();
     }
 }

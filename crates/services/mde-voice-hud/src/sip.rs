@@ -594,6 +594,12 @@ pub struct RemoteMedia {
     pub port: u16,
     /// RTP payload type: 0 = PCMU (G.711 µ-law), 8 = PCMA (G.711 A-law).
     pub payload_type: u8,
+    /// The dynamic payload type the peer negotiated for `telephone-event`
+    /// (RFC 4733 DTMF), parsed from the SDP `a=rtpmap:<pt> telephone-event/8000`
+    /// line. `None` when the peer did not offer out-of-band DTMF — in-call
+    /// keypad presses then fall back to nothing rather than sending malformed
+    /// events to a payload type the peer never agreed to.
+    pub telephone_event_pt: Option<u8>,
 }
 
 /// An established dialog — enough to hang up (BYE) and (slice 3) attach media.
@@ -637,7 +643,12 @@ fn target_uri(account: &SipAccount, dialed: &str) -> String {
     }
 }
 
-/// Minimal audio SDP offer — PCMU(0) + PCMA(8) at 8 kHz on `rtp_port`.
+/// The dynamic RTP payload type we advertise for RFC 4733 `telephone-event`
+/// (DTMF). 101 is the de-facto convention (Asterisk/most softphones).
+const TELEPHONE_EVENT_PT: u8 = 101;
+
+/// Minimal audio SDP offer — PCMU(0) + PCMA(8) + `telephone-event`(101, RFC
+/// 4733 out-of-band DTMF, events 0-15) at 8 kHz on `rtp_port`.
 fn build_sdp_offer(local_host: &str, rtp_port: u16) -> String {
     format!(
         "v=0\r\n\
@@ -645,18 +656,22 @@ fn build_sdp_offer(local_host: &str, rtp_port: u16) -> String {
          s=MCNF Voice\r\n\
          c=IN IP4 {local_host}\r\n\
          t=0 0\r\n\
-         m=audio {rtp_port} RTP/AVP 0 8\r\n\
+         m=audio {rtp_port} RTP/AVP 0 8 {TELEPHONE_EVENT_PT}\r\n\
          a=rtpmap:0 PCMU/8000\r\n\
          a=rtpmap:8 PCMA/8000\r\n\
+         a=rtpmap:{TELEPHONE_EVENT_PT} telephone-event/8000\r\n\
+         a=fmtp:{TELEPHONE_EVENT_PT} 0-15\r\n\
          a=sendrecv\r\n"
     )
 }
 
-/// Parse the connection address + first audio media line from an SDP body.
+/// Parse the connection address + first audio media line from an SDP body,
+/// plus the dynamic payload type the peer chose for `telephone-event` (DTMF).
 fn parse_sdp(body: &str) -> Option<RemoteMedia> {
     let mut addr: Option<String> = None;
     let mut port: Option<u16> = None;
     let mut pt: Option<u8> = None;
+    let mut tel_pt: Option<u8> = None;
     for line in body.lines() {
         if let Some(rest) = line.strip_prefix("c=IN IP4 ") {
             addr = Some(rest.trim().to_string());
@@ -665,12 +680,24 @@ fn parse_sdp(body: &str) -> Option<RemoteMedia> {
             port = it.next().and_then(|p| p.parse::<u16>().ok());
             let _proto = it.next(); // RTP/AVP
             pt = it.next().and_then(|p| p.parse::<u8>().ok());
+        } else if let Some(rest) = line.strip_prefix("a=rtpmap:") {
+            // `a=rtpmap:<pt> <encoding>/<clock>[/<channels>]` — match the peer's
+            // chosen telephone-event payload type (it need not be our 101). Match
+            // on the encoding NAME, tolerating any clock rate / channel suffix
+            // (e.g. `telephone-event/8000` or `telephone-event/8000/1`).
+            if let Some((pt_str, enc)) = rest.split_once(char::is_whitespace) {
+                let name = enc.trim().split('/').next().unwrap_or("");
+                if name.eq_ignore_ascii_case("telephone-event") {
+                    tel_pt = pt_str.trim().parse::<u8>().ok();
+                }
+            }
         }
     }
     Some(RemoteMedia {
         addr: addr?,
         port: port?,
         payload_type: pt.unwrap_or(0),
+        telephone_event_pt: tel_pt,
     })
 }
 
@@ -1139,6 +1166,11 @@ pub enum AgentCommand {
     Decline,
     /// Hang up the active inbound call.
     HangUp,
+    /// Send a DTMF keypress (RFC 4733 telephone-event) on the active inbound
+    /// call — the answered call's media session lives in the agent thread, so
+    /// in-call keypad digits route here. A no-op if no call/media is up or the
+    /// key is not a DTMF digit.
+    Dtmf(char),
 }
 
 /// Discover the local IP that routes to `peer` (the overlay IP for a mesh
@@ -1319,6 +1351,14 @@ pub fn run_agent(
                         None,
                     );
                     let _ = sock.send_to(busy.as_bytes(), inv.source);
+                }
+            }
+            Ok(AgentCommand::Dtmf(key)) => {
+                // In-call keypad digit on an answered (agent-owned) call → send
+                // it as an RFC 4733 tone on the live media session. No-op if no
+                // media is up or the peer never negotiated telephone-event.
+                if let Some(m) = &media {
+                    let _ = m.send_dtmf(key);
                 }
             }
             Ok(AgentCommand::HangUp) => {
@@ -1647,11 +1687,14 @@ mod tests {
     }
 
     #[test]
-    fn sdp_offer_advertises_g711_audio() {
+    fn sdp_offer_advertises_g711_audio_and_dtmf() {
         let sdp = build_sdp_offer("10.0.0.5", 40002);
-        assert!(sdp.contains("m=audio 40002 RTP/AVP 0 8\r\n"));
+        assert!(sdp.contains("m=audio 40002 RTP/AVP 0 8 101\r\n"));
         assert!(sdp.contains("a=rtpmap:0 PCMU/8000\r\n"));
         assert!(sdp.contains("a=rtpmap:8 PCMA/8000\r\n"));
+        // RFC 4733 out-of-band DTMF on the dynamic PT, events 0-15.
+        assert!(sdp.contains("a=rtpmap:101 telephone-event/8000\r\n"));
+        assert!(sdp.contains("a=fmtp:101 0-15\r\n"));
         assert!(sdp.contains("c=IN IP4 10.0.0.5\r\n"));
     }
 
@@ -1663,6 +1706,21 @@ mod tests {
         assert_eq!(r.addr, "1.2.3.4");
         assert_eq!(r.port, 5004);
         assert_eq!(r.payload_type, 8);
+        // No telephone-event line → no out-of-band DTMF agreed.
+        assert_eq!(r.telephone_event_pt, None);
+    }
+
+    #[test]
+    fn parse_sdp_picks_up_the_peers_telephone_event_pt() {
+        // The peer can pick its OWN dynamic PT for telephone-event (here 96, not
+        // our 101). We must DTMF to the PT the peer agreed to, not assume 101.
+        let body = "v=0\r\no=x 0 0 IN IP4 1.2.3.4\r\nc=IN IP4 1.2.3.4\r\n\
+                    t=0 0\r\nm=audio 5004 RTP/AVP 0 96\r\n\
+                    a=rtpmap:0 PCMU/8000\r\na=rtpmap:96 telephone-event/8000\r\n\
+                    a=fmtp:96 0-15\r\n";
+        let r = parse_sdp(body).expect("sdp");
+        assert_eq!(r.payload_type, 0);
+        assert_eq!(r.telephone_event_pt, Some(96));
     }
 
     #[test]
@@ -1706,6 +1764,7 @@ mod tests {
                 addr: "1.2.3.4".into(),
                 port: 5004,
                 payload_type: 0,
+                telephone_event_pt: Some(TELEPHONE_EVENT_PT),
             },
             cseq: 1,
         }
