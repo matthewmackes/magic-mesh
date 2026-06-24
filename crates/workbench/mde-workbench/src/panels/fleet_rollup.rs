@@ -407,6 +407,10 @@ impl FleetRollupPanel {
                 .height(Length::Fixed(0.0))
                 .into()
         } else {
+            // LIGHTHOUSE-7/9 — flag anchors by the same authoritative overlay-IP
+            // signal the wallpaper + Peers Map use (role under-reports anchors on
+            // Server tier) so the rollup map agrees. One snapshot read per build.
+            let lh_ips = super::peers_map::lighthouse_overlay_ips();
             let nodes: Vec<MapNode> = self
                 .rows
                 .iter()
@@ -415,6 +419,7 @@ impl FleetRollupPanel {
                     presence: r.presence.clone(),
                     rtt_ms: self.rtt.get(&r.hostname).copied().flatten(),
                     is_self: r.hostname == self.self_hostname,
+                    lighthouse: super::peers_map::is_lighthouse(&r.role, &r.overlay_ip, &lh_ips),
                     // PD-7/L18 — the rollup map is a static overview; no live
                     // flow particles here (the Peers Map drives those).
                     flow: 0.0,

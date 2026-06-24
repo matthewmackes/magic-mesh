@@ -2121,6 +2121,11 @@ impl PeersPanel {
             palette,
         );
         if self.map_view {
+            // LIGHTHOUSE-7/9 — flag anchors by the same authoritative
+            // overlay-IP-membership signal the wallpaper uses (role under-reports
+            // anchors that run Server tier), so the Map view gives them the same
+            // beacon-hero treatment. One snapshot read per map build.
+            let lh_ips = super::peers_map::lighthouse_overlay_ips();
             let nodes: Vec<super::peers_map::MapNode> = self
                 .rows
                 .iter()
@@ -2129,6 +2134,7 @@ impl PeersPanel {
                     presence: r.presence.clone(),
                     rtt_ms: self.rtt.get(&r.hostname).copied().flatten(),
                     is_self: r.hostname == self.self_hostname,
+                    lighthouse: super::peers_map::is_lighthouse(&r.role, &r.overlay_ip, &lh_ips),
                     flow: self.flows.get(&r.hostname).copied().unwrap_or(0.0),
                 })
                 .collect();
