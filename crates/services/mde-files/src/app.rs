@@ -189,6 +189,11 @@ pub enum Message {
     AnimTick,
 }
 
+/// MOTION-TRANS-2 — the [`mde_theme::animation::Animator`] tween id for the
+/// sidebar-rail collapse/expand crossfade. A stable, view-unique key so it never
+/// collides with the per-row hover/accent keys (`fm-accent:` / row-hover).
+const SIDEBAR_FADE_KEY: &str = "fm-sidebar";
+
 /// MESHFS-8.1 — one recoverable file from the LizardFS `.trash` directory.
 #[derive(Debug, Clone)]
 pub struct TrashItem {
@@ -658,7 +663,16 @@ impl MdeFiles {
                     self.selection.clear();
                 }
             }
-            Message::ToggleSidebar => self.sidebar_collapsed = !self.sidebar_collapsed,
+            Message::ToggleSidebar => {
+                self.sidebar_collapsed = !self.sidebar_collapsed;
+                // MOTION-TRANS-2 — the rail collapse/expand is a panel
+                // expand/collapse: rather than thrash the layout by animating its
+                // width per-frame (MOTION-PERF-2 forbids per-frame relayout), the
+                // new rail form crossfades in from the Carbon page colour. The
+                // width still snaps (one reflow), the *content* eases — the
+                // design's size-can't-animate-cleanly ⇒ crossfade fallback.
+                self.start_sidebar_fade();
+            }
             Message::OpenRegistration => {
                 // AFM-2 — peer enrollment/registration lives in the workbench;
                 // launch it detached. Best-effort: a missing binary is a no-op.
@@ -1166,6 +1180,38 @@ impl MdeFiles {
         );
     }
 
+    /// MOTION-TRANS-2 — arm the sidebar-rail crossfade. On a collapse/expand the
+    /// new rail form fades 0→1 in from the Carbon page colour over the
+    /// `dialog_mount` (crossfade) preset, resolved against reduce-motion. Under
+    /// reduce-motion no tween is started, so [`Self::sidebar_fade`] reads the
+    /// final frame (1.0) immediately — an instant swap with no movement (the a11y
+    /// contract). Mirrors [`Self::start_row_anim`] so all motion shares one
+    /// animator + one tick + the single reduce-motion gate.
+    fn start_sidebar_fade(&mut self) {
+        if self.reduce_motion() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.anim.gc(now);
+        self.anim.start(
+            SIDEBAR_FADE_KEY,
+            now,
+            mde_theme::motion::Motion::dialog_mount(),
+            false,
+        );
+    }
+
+    /// MOTION-TRANS-2 — the rail-crossfade alpha `0.0..=1.0` for this frame. `1.0`
+    /// (fully shown) whenever no fade is in flight — the common settled path and
+    /// the reduce-motion instant case both fall through to it.
+    fn sidebar_fade(&self) -> f32 {
+        self.anim.value(
+            SIDEBAR_FADE_KEY,
+            std::time::Instant::now(),
+            mde_theme::motion::Easing::EaseOut,
+        )
+    }
+
     /// MOTION-FEEDBACK — true when reduce-motion is active (instant state changes,
     /// no movement). Reads the loaded accessibility prefs.
     fn reduce_motion(&self) -> bool {
@@ -1321,8 +1367,23 @@ impl MdeFiles {
         ]
         .spacing(0);
 
-        let body = row![
+        // MOTION-TRANS-2 — crossfade the rail on collapse/expand: the new form
+        // fades in from the rail page colour (`loading::dim_fixed` at `1 - fade`,
+        // the opacity-less fork's scrim trick, width-pinned so it keeps the rail's
+        // fixed width), settling to a zero-cost pass-through at full alpha.
+        // Reduce-motion ⇒ `sidebar_fade()` is 1.0 ⇒ instant.
+        let rail_w = if self.sidebar_collapsed {
+            t::SIDEBAR_RAIL_W
+        } else {
+            t::SIDEBAR_W
+        };
+        let rail = crate::loading::dim_fixed(
             views::sidebar(&self.view, self.local_open, self.sidebar_collapsed, snap),
+            self.sidebar_fade(),
+            rail_w,
+        );
+        let body = row![
+            rail,
             container(main).width(Length::Fill).height(Length::Fill),
         ]
         .height(Length::Fill);
@@ -1987,6 +2048,67 @@ mod tests {
         assert!(s.op_drawer.is_open());
         let _ = s.update(Message::ToggleOperationDrawer);
         assert!(!s.op_drawer.is_open());
+    }
+
+    #[test]
+    fn toggle_sidebar_flips_the_collapse_state() {
+        // MOTION-TRANS-2 — the message toggles the rail collapse/expand state.
+        let mut s = MdeFiles::default();
+        assert!(!s.sidebar_collapsed);
+        let _ = s.update(Message::ToggleSidebar);
+        assert!(s.sidebar_collapsed, "rail collapsed");
+        let _ = s.update(Message::ToggleSidebar);
+        assert!(!s.sidebar_collapsed, "rail expanded again");
+    }
+
+    #[test]
+    fn toggle_sidebar_arms_the_rail_crossfade() {
+        // MOTION-TRANS-2 — arming the crossfade adds the rail tween to the shared
+        // animator, so the new rail form eases in (not an instant cut). Driven
+        // through `start_sidebar_fade` directly so the assertion isn't racing the
+        // 240 ms tween against the reducer's end-of-update snapshot refresh.
+        let mut s = MdeFiles::default();
+        // No fade in flight at rest.
+        assert!(!s.anim.is_animating(SIDEBAR_FADE_KEY, std::time::Instant::now()));
+
+        s.start_sidebar_fade();
+        let now = std::time::Instant::now();
+        assert!(
+            s.anim.is_animating(SIDEBAR_FADE_KEY, now),
+            "the rail crossfade is in flight right after arming"
+        );
+        // Evaluated at the tween's own start it reads ~0 (fully faded out) and
+        // ramps to 1.0 by the end of the 240 ms window.
+        let dur = mde_theme::motion::Motion::dialog_mount().duration;
+        assert!(s.anim.value(SIDEBAR_FADE_KEY, now, mde_theme::motion::Easing::EaseOut) < 0.25);
+        assert!(
+            (s.anim
+                .value(SIDEBAR_FADE_KEY, now + dur, mde_theme::motion::Easing::EaseOut)
+                - 1.0)
+                .abs()
+                < f32::EPSILON,
+            "the rail is fully shown by the end of the window"
+        );
+        assert!(s.animating(), "the subscription ticks while the rail eases in");
+    }
+
+    #[test]
+    fn reduce_motion_makes_the_sidebar_swap_instant() {
+        // MOTION-A11Y — under reduce-motion the rail swap arms no tween, so the
+        // fade reads its final frame (1.0 — fully shown) immediately: an instant
+        // state change with no movement.
+        let mut s = MdeFiles::default();
+        s.a11y.motion = crate::prefs::Motion::Reduced;
+        s.start_sidebar_fade();
+        assert!(
+            !s.anim.is_animating(SIDEBAR_FADE_KEY, std::time::Instant::now()),
+            "no crossfade tween is armed under reduce-motion"
+        );
+        assert_eq!(
+            s.sidebar_fade(),
+            1.0,
+            "the rail is shown at full alpha (instant)"
+        );
     }
 
     #[test]
