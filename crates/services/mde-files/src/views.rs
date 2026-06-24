@@ -11,6 +11,7 @@ use cosmic::{Element, Theme};
 use crate::a11y_labels::{self, A11yAction};
 use crate::app::{Crumb, Message, TrashItem};
 use crate::backend::BackendSnapshot;
+use crate::density::FileListMetrics;
 use crate::grid;
 use crate::icons;
 use crate::model::{fmt_count, FileRow, Layout, Peer, PeerStatus, SelfNode, Tab, View};
@@ -583,6 +584,7 @@ pub fn tab_strip(tabs: &[Tab], active: usize) -> Element<'static, Message> {
 pub fn toolbar<'a>(
     view: &'a View,
     layout: Layout,
+    density: mde_theme::Density,
     search: &'a str,
     crumbs: Vec<Crumb>,
 ) -> Element<'a, Message> {
@@ -704,6 +706,11 @@ pub fn toolbar<'a>(
         ..container::Style::default()
     });
 
+    // DENSITY-SYMMETRY — the density cycle control. Clicking advances Compact →
+    // Comfortable → Spacious → Compact, which dispatches `SetDensity` and
+    // re-rhythms every file listing this frame via `FileListMetrics`.
+    let density_ctl = density_cycle(density);
+
     let primary = primary_action(view);
 
     container(
@@ -711,6 +718,7 @@ pub fn toolbar<'a>(
             crumb_row,
             Space::new().width(Length::Fill),
             search_widget,
+            density_ctl,
             view_toggle,
             primary,
         ]
@@ -766,6 +774,66 @@ fn view_toggle_btn(
         ..button::Style::default()
     })
     .on_press(msg)
+    .into()
+}
+
+/// DENSITY-SYMMETRY — the next density in the Compact → Comfortable → Spacious
+/// → Compact cycle. The single source of the cycle order, shared by the toolbar
+/// control's `on_press` and its hover tooltip.
+#[must_use]
+pub fn next_density(d: mde_theme::Density) -> mde_theme::Density {
+    use mde_theme::Density;
+    match d {
+        Density::Compact => Density::Comfortable,
+        Density::Comfortable => Density::Spacious,
+        Density::Spacious => Density::Compact,
+    }
+}
+
+/// Human label for a density mode — the toolbar control's caption.
+#[must_use]
+pub fn density_label(d: mde_theme::Density) -> &'static str {
+    use mde_theme::Density;
+    match d {
+        Density::Compact => "Compact",
+        Density::Comfortable => "Comfortable",
+        Density::Spacious => "Spacious",
+    }
+}
+
+/// DENSITY-SYMMETRY — the toolbar's density cycle control: a labelled button
+/// showing the current density that advances to the next on press (dispatching
+/// `SetDensity`), with a tooltip + a11y label so it announces itself to AT.
+fn density_cycle(density: mde_theme::Density) -> Element<'static, Message> {
+    let btn = button(
+        row![
+            icon(icons::LIST_VIEW, 13.0, t::FG_DIM),
+            text(density_label(density).to_string())
+                .size(11)
+                .colr(t::FG_DIM),
+        ]
+        .spacing(6)
+        .align_y(cosmic::iced::alignment::Vertical::Center),
+    )
+    .padding(Padding::from([5.0, 10.0]))
+    .on_press(Message::SetDensity(next_density(density)))
+    .sty(|_t: &Theme, status: button::Status| button::Style {
+        snap: false,
+        background: matches!(status, button::Status::Hovered)
+            .then_some(Background::Color(t::ROW_HOVER)),
+        text_color: t::FG,
+        border: Border {
+            color: t::DIVIDER,
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        ..button::Style::default()
+    });
+    tooltip(
+        btn,
+        text(a11y_labels::label_for(A11yAction::ToolbarCycleDensity)).size(11),
+        tooltip::Position::Bottom,
+    )
     .into()
 }
 
@@ -900,12 +968,18 @@ pub fn mesh_overview<'a>(snap: &'a BackendSnapshot) -> Element<'a, Message> {
 
 // ─── Peer folder ───────────────────────────────────────────────────────────
 
+// DENSITY-SYMMETRY — the density `metrics` join the existing list-render args
+// (layout / selection / motion); every one is genuinely-distinct data the view
+// needs, so the 8th arg is justified rather than bundled into a parameter
+// object that would only obscure the call site.
+#[allow(clippy::too_many_arguments)]
 pub fn peer_folder<'a>(
     peer: &'a Peer,
     self_node: &'a SelfNode,
     files: Vec<FileRow>,
     search_query: &'a str,
     layout: Layout,
+    metrics: FileListMetrics,
     selection: &'a Selection,
     motion: RowMotionCtx<'a>,
 ) -> Element<'a, Message> {
@@ -958,13 +1032,13 @@ pub fn peer_folder<'a>(
     // keep; stale-dim the kept rows on a refresh.
     let list: Element<'_, Message> = if motion.show_skeleton() {
         let head: Element<'_, Message> = match layout {
-            Layout::List => file_row_head("Origin"),
+            Layout::List => file_row_head("Origin", metrics),
             Layout::Grid => Space::new().height(Length::Fixed(0.0)).into(),
         };
         column![head, motion.skeleton()].spacing(0).into()
     } else {
         let mut list = match layout {
-            Layout::List => column![file_row_head("Origin")],
+            Layout::List => column![file_row_head("Origin", metrics)],
             Layout::Grid => column![],
         };
         for (i, f) in filtered_rows.iter().enumerate() {
@@ -972,7 +1046,7 @@ pub fn peer_folder<'a>(
             let foc = selection.is_focused(&f.name);
             let rm = motion.for_row(&f.name, i, sel);
             let row_el = match layout {
-                Layout::List => list_row(f.clone(), true, sel, foc, rm),
+                Layout::List => list_row(f.clone(), true, sel, foc, metrics, rm),
                 Layout::Grid => file_row(f.clone(), true, sel, foc, rm),
             };
             list = list.push(row_el);
@@ -1013,6 +1087,7 @@ fn file_listing(
     show_src: bool,
     head_label: &str,
     layout: Layout,
+    metrics: FileListMetrics,
     selection: &Selection,
     motion: RowMotionCtx<'_>,
 ) -> Element<'static, Message> {
@@ -1021,14 +1096,14 @@ fn file_listing(
     // column header so the listing's chrome lands instantly too.
     if motion.show_skeleton() {
         let head: Element<'static, Message> = match layout {
-            Layout::List => file_row_head(head_label),
+            Layout::List => file_row_head(head_label, metrics),
             Layout::Grid => Space::new().height(Length::Fixed(0.0)).into(),
         };
         return column![head, motion.skeleton()].spacing(0).into();
     }
 
     let mut list = match layout {
-        Layout::List => column![file_row_head(head_label)],
+        Layout::List => column![file_row_head(head_label, metrics)],
         Layout::Grid => column![].spacing(8),
     };
     for (i, f) in rows.iter().enumerate() {
@@ -1036,7 +1111,7 @@ fn file_listing(
         let foc = selection.is_focused(&f.name);
         let rm = motion.for_row(&f.name, i, sel);
         let el = match layout {
-            Layout::List => list_row(f.clone(), show_src, sel, foc, rm),
+            Layout::List => list_row(f.clone(), show_src, sel, foc, metrics, rm),
             Layout::Grid => file_row(f.clone(), show_src, sel, foc, rm),
         };
         list = list.push(el);
@@ -1051,6 +1126,7 @@ fn file_listing(
 pub fn inbox<'a>(
     snap: &'a BackendSnapshot,
     layout: Layout,
+    metrics: FileListMetrics,
     selection: &'a Selection,
     motion: RowMotionCtx<'a>,
 ) -> Element<'a, Message> {
@@ -1079,7 +1155,15 @@ pub fn inbox<'a>(
         ],
     );
 
-    let list = file_listing(&snap.inbox, true, "From", layout, selection, motion);
+    let list = file_listing(
+        &snap.inbox,
+        true,
+        "From",
+        layout,
+        metrics,
+        selection,
+        motion,
+    );
 
     column![
         banner_widget,
@@ -1097,6 +1181,7 @@ pub fn inbox<'a>(
 pub fn outbox<'a>(
     snap: &'a BackendSnapshot,
     layout: Layout,
+    metrics: FileListMetrics,
     selection: &'a Selection,
     motion: RowMotionCtx<'a>,
 ) -> Element<'a, Message> {
@@ -1131,7 +1216,7 @@ pub fn outbox<'a>(
         .padding(Padding::from([8.0, 4.0]))
         .into()
     } else {
-        file_listing(&snap.outbox, true, "To", layout, selection, motion)
+        file_listing(&snap.outbox, true, "To", layout, metrics, selection, motion)
     };
 
     column![
@@ -1148,6 +1233,7 @@ pub fn outbox<'a>(
 pub fn downloads<'a>(
     snap: &'a BackendSnapshot,
     layout: Layout,
+    metrics: FileListMetrics,
     selection: &'a Selection,
     motion: RowMotionCtx<'a>,
 ) -> Element<'a, Message> {
@@ -1166,7 +1252,15 @@ pub fn downloads<'a>(
         ],
     );
 
-    let list = file_listing(&snap.downloads, true, "Origin", layout, selection, motion);
+    let list = file_listing(
+        &snap.downloads,
+        true,
+        "Origin",
+        layout,
+        metrics,
+        selection,
+        motion,
+    );
 
     column![
         banner_widget,
@@ -1186,6 +1280,7 @@ pub fn local_browser<'a>(
     files: &'a [crate::model::FileRow],
     path: &'a str,
     layout: Layout,
+    metrics: FileListMetrics,
     selection: &'a Selection,
     motion: RowMotionCtx<'a>,
 ) -> Element<'a, Message> {
@@ -1201,7 +1296,7 @@ pub fn local_browser<'a>(
     .align_y(cosmic::iced::alignment::Vertical::Center);
 
     let mut list = match layout {
-        Layout::List => column![file_row_head("Name")],
+        Layout::List => column![file_row_head("Name", metrics)],
         Layout::Grid => column![].spacing(8),
     };
     if files.is_empty() {
@@ -1219,7 +1314,7 @@ pub fn local_browser<'a>(
             // reducer). Was an inert card that no click reached. AFM-7 — the
             // row shape honors the toolbar list/grid toggle.
             let row_el = match layout {
-                Layout::List => list_row(f.clone(), true, sel, foc, rm),
+                Layout::List => list_row(f.clone(), true, sel, foc, metrics, rm),
                 Layout::Grid => file_row(f.clone(), true, sel, foc, rm),
             };
             list = list.push(
@@ -1242,6 +1337,7 @@ pub fn local_browser<'a>(
 /// device rows. Honest empty state when nothing is paired / mackesd is down.
 pub fn cloud_devices<'a>(
     files: &'a [crate::model::FileRow],
+    metrics: FileListMetrics,
     selection: &'a Selection,
     motion: RowMotionCtx<'a>,
 ) -> Element<'a, Message> {
@@ -1252,7 +1348,7 @@ pub fn cloud_devices<'a>(
     .spacing(8)
     .align_y(cosmic::iced::alignment::Vertical::Center);
 
-    let mut list = column![file_row_head("Device")];
+    let mut list = column![file_row_head("Device", metrics)];
     if files.is_empty() {
         list = list.push(
             container(
@@ -1283,6 +1379,7 @@ pub fn network<'a>(
     host: &'a str,
     shares: &'a [String],
     status: Option<&'a str>,
+    metrics: FileListMetrics,
 ) -> Element<'a, Message> {
     let header = row![
         icon(icons::MESH_HUB, 18.0, t::FG),
@@ -1309,7 +1406,7 @@ pub fn network<'a>(
         list = list.push(text(s.to_string()).size(12).colr(t::FG_DIM));
     }
     if !shares.is_empty() {
-        list = list.push(file_row_head("Share"));
+        list = list.push(file_row_head("Share", metrics));
         for sh in shares {
             let r = button(
                 row![
@@ -1399,11 +1496,16 @@ pub fn mesh_home<'a>(snap: &'a BackendSnapshot) -> Element<'a, Message> {
 /// and folder rows render as clickable buttons that dispatch
 /// `Message::MeshFolderEnter`. File rows stay non-clickable;
 /// future commits add per-file actions.
+// DENSITY-SYMMETRY — the density `metrics` join the existing list-render args
+// (layout / path / selection / motion); each is genuinely-distinct data the
+// view consumes, so the 8th arg is justified rather than bundled.
+#[allow(clippy::too_many_arguments)]
 pub fn mesh_home_child<'a>(
     slug: &'a str,
     files: Vec<FileRow>,
     search: &'a str,
     layout: Layout,
+    metrics: FileListMetrics,
     path: &'a [String],
     selection: &'a Selection,
     motion: RowMotionCtx<'a>,
@@ -1445,13 +1547,13 @@ pub fn mesh_home_child<'a>(
     // keep (the column header lands instantly underneath the placeholders).
     let list_el: Element<'_, Message> = if motion.show_skeleton() {
         let head: Element<'_, Message> = match layout {
-            Layout::List => file_row_head("Modified"),
+            Layout::List => file_row_head("Modified", metrics),
             Layout::Grid => Space::new().height(Length::Fixed(0.0)).into(),
         };
         column![head, motion.skeleton()].spacing(0).into()
     } else {
         let mut list = match layout {
-            Layout::List => column![file_row_head("Modified")],
+            Layout::List => column![file_row_head("Modified", metrics)],
             Layout::Grid => column![].spacing(8),
         };
         // Parent-link row when descended at least one level.
@@ -1476,7 +1578,7 @@ pub fn mesh_home_child<'a>(
                 row_idx += 1;
                 // AFM-7 — honor the list/grid toggle for file rows.
                 let row_el = match layout {
-                    Layout::List => list_row(f, false, sel, foc, rm),
+                    Layout::List => list_row(f, false, sel, foc, metrics, rm),
                     Layout::Grid => file_row(f, false, sel, foc, rm),
                 };
                 list = list.push(row_el);
