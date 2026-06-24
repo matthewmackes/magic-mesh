@@ -6,9 +6,12 @@
 # autoscaler does a fast `xe snapshot-revert` to that snapshot instead of a full
 # re-clone (clean state without the clone/boot cost). This script is the two verbs:
 #
-#   snapshot <vm>   create/REFRESH the VM's `clean` snapshot (replaces any prior
+#   snapshot  <vm>  create/REFRESH the VM's `clean` snapshot (replaces any prior
 #                   one, so re-toolchaining re-bases the baseline). Idempotent.
-#   reset    <vm>   revert the VM to its LATEST `clean` snapshot (inter-job reset).
+#   reset     <vm>  revert the VM to its LATEST `clean` snapshot (inter-job reset).
+#   has-clean <vm>  exit 0 iff the VM HAS a `clean` snapshot (the build-ready probe
+#                   the reconciler gates toolchain-on-first-provision on); quiet —
+#                   the EXIT CODE is the answer. Absent VM / no snapshot → nonzero.
 #
 # <vm> is a name-label OR a uuid. The dom0 hosting it is reached over SSH with the
 # farm key (passwordless `xe`, matching farm.sh); pass --xcp-host or let it default
@@ -32,7 +35,7 @@ usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; }
 
 ACTION=""; VM=""
 while [ $# -gt 0 ]; do case "$1" in
-  snapshot | reset) ACTION="$1"; shift;;
+  snapshot | reset | has-clean) ACTION="$1"; shift;;
   --xcp-host) XCP_HOST="$2"; shift 2;;
   --xcp-user) XCP_USER="$2"; shift 2;;
   --key) KEY="$2"; shift 2;;
@@ -43,7 +46,7 @@ while [ $# -gt 0 ]; do case "$1" in
     shift;;
 esac; done
 
-[ -n "$ACTION" ] || { echo "farm-vm-snapshot: need a verb (snapshot|reset)" >&2; usage; exit 2; }
+[ -n "$ACTION" ] || { echo "farm-vm-snapshot: need a verb (snapshot|reset|has-clean)" >&2; usage; exit 2; }
 [ -n "$VM" ]     || { echo "farm-vm-snapshot: need a <vm-name-or-uuid>" >&2; usage; exit 2; }
 [ -n "$XCP_HOST" ] || { echo "farm-vm-snapshot: no dom0 — pass --xcp-host or set MCNF_XCP_HOST" >&2; exit 2; }
 [ -s "$KEY" ]      || { echo "farm-vm-snapshot: farm key not found: $KEY" >&2; exit 2; }
@@ -109,8 +112,13 @@ clean_snapshots() {
 }
 
 VM_UUID="$(resolve_vm "$VM")"
-[ -n "$VM_UUID" ] || { warn "no VM named/uuid '$VM' on $XCP_HOST — nothing to do"; exit 1; }
-log "VM '$VM' → $VM_UUID on $XCP_HOST"
+if [ -z "$VM_UUID" ]; then
+  # has-clean is a QUIET probe (exit code is the answer): an absent VM is simply
+  # "not build-ready" → nonzero, no warn. The mutating verbs report loudly.
+  [ "$ACTION" = "has-clean" ] && exit 1
+  warn "no VM named/uuid '$VM' on $XCP_HOST — nothing to do"; exit 1
+fi
+[ "$ACTION" = "has-clean" ] || log "VM '$VM' → $VM_UUID on $XCP_HOST"
 
 case "$ACTION" in
   snapshot)
@@ -142,5 +150,11 @@ case "$ACTION" in
     # clean point is a no-op state-wise.
     xe snapshot-revert snapshot-uuid="$LATEST"
     log "reverted — '$VM' is back to the clean baseline"
+    ;;
+  has-clean)
+    # Quiet build-ready probe: exit 0 iff a `clean` snapshot exists (reuses the same
+    # resolve_vm + clean_snapshots the reset path trusts, so the reconciler's
+    # readiness check can NEVER drift from what reset actually reverts to).
+    [ -n "$(clean_snapshots "$VM_UUID" | head -1)" ] || exit 1
     ;;
 esac
