@@ -9,6 +9,13 @@
 //!     - `min`     — 24 hours
 //!   Operators can override per-topic via `policy.yaml` (deferred
 //!   to BUS-7.3 — the default policy ships hardcoded here).
+//! - **`audit/*` is BOUNDED, not exempt** (AUDIT-RUN-CAP-1): the audit
+//!   trail rides the bus on the `/run` tmpfs, so each pass prunes the
+//!   oldest audit records once the lane exceeds [`AUDIT_RUN_CAP_BYTES`],
+//!   keeping only the most-recent window resident. The old
+//!   retention=forever exemption let audit fill a small `/run` to 100%
+//!   and wedge the node (lh1, 2026-06-24). The §8 long-term hash-chain
+//!   audit is a durable-disk concern (not yet persisted there).
 //! - **GFS quota** — soft 500 MB, hard 2 GB. Soft breach
 //!   publishes a `bus/sys/quota` warning at `default` priority;
 //!   hard breach AFAICT halts new publishes (BUS-1.4 write path
@@ -58,6 +65,49 @@ pub const DEFAULT_TTL_EPHEMERAL_SECS: u64 = 60 * 60;
 pub const DEFAULT_QUOTA_SOFT_BYTES: u64 = 96 * 1024 * 1024;
 pub const DEFAULT_QUOTA_HARD_BYTES: u64 = 144 * 1024 * 1024;
 
+/// AUDIT-RUN-CAP-1 — per-topic byte cap for the `audit/*` lane on `/run`.
+///
+/// The audit trail rides the bus on the `/run` tmpfs (see [`crate::audit`]).
+/// It was previously **retention=forever / exempt** — neither the per-priority
+/// TTL reap nor the hard-cap evictor would shed it until every non-audit byte
+/// was already gone. On a small lighthouse `/run` (~190 MB) that exemption was
+/// the wedge: a `get-state` poll grew `audit/<peer>` to 79 MB and filled `/run`
+/// to 100% before the df-pressure evictor could ever reach the audit lane
+/// (lh1, 2026-06-24; Eagle, same week, hit 479 MB / 122k records). So the
+/// `/run` copy of the audit trail is now **bounded**, not exempt: each pass
+/// prunes the OLDEST `audit/*` records once the lane exceeds this cap, and the
+/// hard-cap / df-pressure evictor can shed audit too (it is no longer skipped).
+///
+/// 8 MiB keeps a generous most-recent audit window resident on `/run` — the
+/// only window an operator needs live for incident triage — while staying a
+/// small fraction of even the smallest tmpfs, so audit alone can never fill it.
+///
+/// SECURITY NOTE (§8): this bounds ONLY the volatile `/run` copy. The §8
+/// long-term hash-chain audit is a DURABLE-DISK concern and is NOT yet
+/// persisted there — the trail today lives solely on this tmpfs and does not
+/// survive reboot (see [`crate::audit`]). Bounding the `/run` copy does not
+/// regress that, because the long-term store was never the tmpfs copy; when the
+/// durable §8 store lands, the most-recent window kept here is the live tail of
+/// it, not the system of record. Until then, an operator who needs history
+/// beyond this window must read it before it rotates off `/run`.
+pub const AUDIT_RUN_CAP_BYTES: u64 = 8 * 1024 * 1024;
+
+/// AUDIT-RUN-CAP-1 — entry-count backstop for the `audit/*` lane, paired with
+/// [`AUDIT_RUN_CAP_BYTES`]. The byte cap measures spool *file* bytes, but the
+/// SQLite index ALSO duplicates each record (BUS-RETENTION-1) and is itself a
+/// real tmpfs consumer, and a record whose spool file is missing/0-length (a
+/// partial write, or a tmpfs that lost spool files but kept the index)
+/// contributes 0 to the byte sum. Without a second bound, such records would
+/// accumulate index rows without ever tripping the byte cap — re-opening the
+/// unbounded-index wedge that filled a 391 MB `/run` (v10.0.18). So the prune
+/// ALSO keeps at most this many of the most-recent records REGARDLESS of their
+/// on-disk size: every record costs exactly one toward this budget, so the lane
+/// can never stall on a 0-byte read. At the ~200 B audit metadata-record size,
+/// 20k records is well under the 8 MiB byte cap, so bytes are the binding limit
+/// when files are present and this count is the floor that holds when they are
+/// not. Whichever bound is hit first wins (the prune keeps the SMALLER window).
+pub const AUDIT_RUN_CAP_ENTRIES: usize = 20_000;
+
 /// BUS-RUN-FULL-1-dfguard — filesystem-pressure trip point. The bus's own
 /// quota (`quota_hard_bytes`) only bounds the bus's *own* footprint; it says
 /// nothing about the rest of the `/run` tmpfs the bus shares with dnf locks, the
@@ -100,6 +150,16 @@ pub struct RetentionPolicy {
     /// Hard quota — surfaced in [`QuotaReport::hard_exceeded`]
     /// so the operator + downstream alerting can react.
     pub quota_hard_bytes: u64,
+    /// AUDIT-RUN-CAP-1 — per-topic byte cap for the `audit/*` lane on `/run`.
+    /// Audit is BOUNDED, not exempt: each pass prunes the oldest audit records
+    /// once the lane exceeds this, keeping the most-recent window resident on
+    /// the tmpfs without letting audit grow unbounded and wedge the node.
+    pub audit_cap_bytes: u64,
+    /// AUDIT-RUN-CAP-1 — entry-count backstop for the `audit/*` lane. The prune
+    /// keeps at most this many of the most-recent audit records regardless of
+    /// their on-disk size, so a 0-byte/missing-file read can never stall the
+    /// byte cap and let index rows grow unbounded. See [`AUDIT_RUN_CAP_ENTRIES`].
+    pub audit_cap_entries: usize,
 }
 
 impl Default for RetentionPolicy {
@@ -111,6 +171,8 @@ impl Default for RetentionPolicy {
             ttl_ephemeral_secs: DEFAULT_TTL_EPHEMERAL_SECS,
             quota_soft_bytes: DEFAULT_QUOTA_SOFT_BYTES,
             quota_hard_bytes: DEFAULT_QUOTA_HARD_BYTES,
+            audit_cap_bytes: AUDIT_RUN_CAP_BYTES,
+            audit_cap_entries: AUDIT_RUN_CAP_ENTRIES,
         }
     }
 }
@@ -135,6 +197,12 @@ impl RetentionPolicy {
 pub struct PassReport {
     /// Files (and matching index rows) removed by TTL expiry this pass.
     pub removed: usize,
+    /// AUDIT-RUN-CAP-1 — oldest `audit/*` records pruned this pass because the
+    /// audit lane exceeded its per-topic `/run` cap ([`AUDIT_RUN_CAP_BYTES`]).
+    /// The audit trail is BOUNDED on the tmpfs, not exempt: the most-recent
+    /// window stays resident, everything older rotates off. Distinct from
+    /// `removed` (TTL expiry) and `evicted` (hard-cap / fs-pressure).
+    pub audit_pruned: usize,
     /// BULLETPROOF-1 — messages evicted by the hard-cap safety valve
     /// (oldest-first, regardless of TTL) because the spool exceeded the
     /// hard quota. Distinct from `removed` so the log shows when the bus
@@ -474,19 +542,39 @@ fn run_pass_at_inner(
         removed += 1;
     }
 
+    // AUDIT-RUN-CAP-1 — bound the `audit/*` lane on `/run`. The TTL reap above
+    // deliberately skips `audit/*` (so the audit window isn't governed by the
+    // `min` 24 h class), but audit is no longer EXEMPT: prune the oldest audit
+    // records whenever the lane exceeds its per-topic cap, keeping the
+    // most-recent window resident on the tmpfs. This runs every pass — it is the
+    // primary bound on audit growth, so the lane can never fill a small `/run`
+    // before the hard-cap / fs-pressure evictor would even look at it (the lh1 +
+    // Eagle 2026-06-24 wedge). The §8 long-term hash-chain audit belongs on
+    // durable disk (not yet persisted there — see [`AUDIT_RUN_CAP_BYTES`]).
+    let audit_pruned = prune_audit_over_cap(
+        &conn,
+        bus_root,
+        policy.audit_cap_bytes,
+        policy.audit_cap_entries,
+    )?;
+
     // BUS-RETENTION-1 — reclaim the DB pages the deletes above freed BEFORE we
     // measure/evict, so the footprint reflects a compacted index (not its stale
     // high-water mark) and we don't over-evict spool to compensate for a bloated
     // DB that's about to shrink.
     compact_index(&conn);
 
-    // BULLETPROOF-1 — hard-cap safety valve. The TTL reap above leaves
-    // `audit/*` untouched (Q28: the audit trail is retention=forever). On the
-    // tmpfs that backs the bus that is unbounded growth → a full `/run` that
-    // downs the whole node. So if we're still over the HARD cap after the TTL
-    // reap, evict oldest-first until back under the SOFT cap. Non-audit goes
-    // first; `audit/*` is shed only as a last resort (a full `/run` is strictly
-    // worse than losing ephemeral tmpfs audit that does not survive reboot).
+    // BULLETPROOF-1 — hard-cap safety valve. The TTL reap skips `audit/*` and
+    // the per-topic audit cap above already bounds the audit lane to its
+    // most-recent `/run` window — so audit is no longer the unbounded-growth
+    // wedge it once was. But the evictor must STILL be able to shed audit under
+    // df-pressure: a co-tenant can fill a small `/run` even with audit already
+    // capped, and on a 190 MB tmpfs that is the difference between a prune and a
+    // node wedge. So if we're still over the HARD cap after the reap + audit
+    // prune, evict oldest-first until back under the SOFT cap. Non-audit goes
+    // first; `audit/*` is shed after it (it is bounded, but NOT skipped — a full
+    // `/run` is strictly worse than losing more of the volatile tmpfs audit tail
+    // that does not survive reboot and is not the §8 durable system of record).
     //
     // BUS-RETENTION-1 — the footprint counts the spool files AND the index DB
     // itself (`index_db_bytes`): the DB is a real tmpfs consumer (it duplicates
@@ -544,6 +632,7 @@ fn run_pass_at_inner(
     };
     Ok(PassReport {
         removed,
+        audit_pruned,
         evicted,
         bytes_after,
         fs_pressure,
@@ -602,6 +691,111 @@ fn evict_oldest_to_cap(
     Ok(evicted)
 }
 
+/// Delete one message's spool file (if present) then its index row. File first
+/// so an index-only orphan is the worst-case failure mode (a row pointing at a
+/// deleted file is what the divergence detector then has to clean up). Shared by
+/// the audit-cap prune; the TTL reap + hard-cap evict loops keep their own
+/// inline copies (they track a running byte total as they go).
+fn delete_message_file_and_row(
+    conn: &rusqlite::Connection,
+    abs: &Path,
+    ulid: &str,
+) -> Result<(), RetentionError> {
+    if abs.exists() {
+        std::fs::remove_file(abs)
+            .map_err(|e| RetentionError::Io(format!("rm {}: {e}", abs.display())))?;
+    }
+    conn.execute("DELETE FROM messages WHERE ulid = ?1", params![ulid])
+        .map_err(|e| RetentionError::Sql(format!("delete row {ulid}: {e}")))?;
+    Ok(())
+}
+
+/// AUDIT-RUN-CAP-1 — prune the OLDEST `audit/*` records until the audit lane is
+/// bounded to its most-recent window: at most `cap_bytes` of on-disk spool AND
+/// at most `cap_entries` records (whichever is the smaller window wins). The
+/// most-recent records stay resident on `/run`; everything older rotates off.
+/// Returns the number of audit records pruned.
+///
+/// This is what makes `audit/*` BOUNDED rather than exempt: unlike the TTL reap
+/// (which still skips `audit/*` so the audit window isn't governed by the `min`
+/// 24 h class) and unlike the hard-cap evictor (which only fires under quota /
+/// fs pressure), this runs every pass and keeps the audit lane itself from ever
+/// growing unbounded on the tmpfs.
+///
+/// Two bounds, because the byte cap alone is not robust:
+/// - **`cap_bytes`** sums each record's spool *file* size (the index has no size
+///   column), mirroring [`disk_usage_bytes`]. This is the binding limit in the
+///   normal case where files are present.
+/// - **`cap_entries`** is the backstop: a record whose file is missing/0-length
+///   contributes 0 to the byte sum, so a byte-only cap could never trip while
+///   index rows (which duplicate each body — BUS-RETENTION-1) grow unbounded.
+///   Counting one-per-record can never stall on a 0-byte read.
+///
+/// Ordering is `ts_unix_ms DESC, ulid DESC`: ULIDs are monotonic +
+/// lexicographically time-ordered, so the secondary key makes the kept window
+/// fully deterministic even when a burst of audit records shares the same
+/// millisecond (the lh1 `get-state`-poll pattern) — without it, *which* of the
+/// equal-timestamp records survived at the boundary was unspecified by SQLite.
+///
+/// Always keeps at least the single most-recent record (the first row is kept
+/// before either bound is consulted), so a degenerate `cap_bytes == 0` /
+/// `cap_entries == 0` config bounds the lane to one record rather than wiping
+/// the audit trail entirely.
+fn prune_audit_over_cap(
+    conn: &rusqlite::Connection,
+    bus_root: &Path,
+    cap_bytes: u64,
+    cap_entries: usize,
+) -> Result<usize, RetentionError> {
+    let audit_like = format!("{}%", crate::persist::AUDIT_TOPIC_PREFIX);
+    // Newest-first (deterministic tiebreak on the unique ulid) so we keep the
+    // most-recent window and prune from the tail.
+    let mut stmt = conn
+        .prepare(
+            "SELECT ulid, file_path FROM messages \
+             WHERE topic LIKE ?1 ORDER BY ts_unix_ms DESC, ulid DESC",
+        )
+        .map_err(|e| RetentionError::Sql(format!("audit-cap prepare: {e}")))?;
+    let rows = stmt
+        .query_map(params![audit_like], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(|e| RetentionError::Sql(format!("audit-cap query: {e}")))?;
+
+    let mut kept_bytes: u64 = 0;
+    let mut kept_count: usize = 0;
+    let mut victims: Vec<(String, PathBuf)> = Vec::new();
+    for r in rows {
+        let (ulid, rel_path) =
+            r.map_err(|e| RetentionError::Sql(format!("audit-cap decode: {e}")))?;
+        let abs = bus_root.join(&rel_path);
+        let sz = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
+        // Keep this record if it is the first (always retain the newest) OR it
+        // still fits BOTH bounds. Either bound being reached starts the prune of
+        // this and every older record. `kept_count == 0` guarantees forward
+        // progress even when both caps are 0 — the lane floors at one record,
+        // never zero.
+        let within_bounds = kept_count == 0
+            || (kept_bytes.saturating_add(sz) <= cap_bytes && kept_count < cap_entries);
+        if within_bounds {
+            kept_bytes = kept_bytes.saturating_add(sz);
+            kept_count += 1;
+        } else {
+            // Past a cap: this record (and everything older) is pruned.
+            victims.push((ulid, abs));
+        }
+    }
+    // Release the statement's borrow before the delete loop reuses `conn`.
+    drop(stmt);
+
+    let mut pruned = 0_usize;
+    for (ulid, abs) in &victims {
+        delete_message_file_and_row(conn, abs, ulid)?;
+        pruned += 1;
+    }
+    Ok(pruned)
+}
+
 /// Convenience: today's clock as unix-ms.
 pub fn current_unix_ms() -> i64 {
     SystemTime::now()
@@ -638,6 +832,7 @@ pub async fn run_loop(
                         tracing::info!(
                             target: "mde_bus::retention",
                             removed = report.removed,
+                            audit_pruned = report.audit_pruned,
                             evicted = report.evicted,
                             bytes_after = report.bytes_after,
                             fs_pressure = report.fs_pressure,
@@ -645,6 +840,13 @@ pub async fn run_loop(
                             hard_exceeded = report.quota.hard_exceeded,
                             "retention pass complete"
                         );
+                        if report.audit_pruned > 0 {
+                            tracing::info!(
+                                target: "mde_bus::retention",
+                                audit_pruned = report.audit_pruned,
+                                "AUDIT-RUN-CAP-1: audit lane over its /run cap — pruned oldest audit records, kept the most-recent window"
+                            );
+                        }
                         if report.evicted > 0 {
                             tracing::warn!(
                                 target: "mde_bus::retention",
@@ -857,9 +1059,14 @@ mod tests {
     }
 
     #[test]
-    fn audit_topics_exempt_from_retention() {
-        // EPIC-BUS-EXT-AUDIT-BUS (Q28) — audit/* is retention=forever
-        // even though audit records are `min` priority.
+    fn audit_topics_not_ttl_reaped_but_bounded_by_cap() {
+        // AUDIT-RUN-CAP-1 — audit/* is NOT governed by the per-priority TTL
+        // (so an old-but-within-cap audit window survives a reap), but it is no
+        // longer retention=forever/exempt: it is BOUNDED by the per-topic cap
+        // (asserted in `audit_lane_pruned_to_cap_keeps_most_recent` below). Here
+        // we prove the TTL reap alone still leaves a small audit window intact
+        // while reaping the same-age non-audit message — with a cap far above
+        // the tiny audit footprint so the cap doesn't fire.
         let now = 1_000_000_000_000_i64;
         let ten_days = now - (10 * 24 * 60 * 60 * 1000);
         let tmp = tempfile::tempdir().unwrap();
@@ -877,13 +1084,201 @@ mod tests {
             .unwrap();
         drop(conn);
         let report = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
-        // Only the non-audit message is reaped; both audit/* records
-        // survive despite being 10 days old + min priority.
+        // Only the non-audit message is TTL-reaped; the tiny audit window is
+        // under the 8 MiB cap so the audit prune doesn't fire either.
         assert_eq!(report.removed, 1, "only the non-audit message reaped");
+        assert_eq!(report.audit_pruned, 0, "tiny audit window is under the cap");
         let p = Persist::open(root.clone()).unwrap();
         assert!(
             !p.list_since("audit/peerx", None).unwrap().is_empty(),
-            "audit/peerx survived the reap"
+            "audit/peerx within the cap survives the TTL reap"
+        );
+    }
+
+    #[test]
+    fn audit_lane_pruned_to_cap_keeps_most_recent() {
+        // AUDIT-RUN-CAP-1 — the decisive regression for the lh1/Eagle 2026-06-24
+        // wedge: an over-cap audit lane MUST be pruned (it is bounded, NOT
+        // exempt), and the MOST-RECENT window must be what survives.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let now = 1_000_000_000_000_i64;
+        // 8 audit records, 256 KB each = 2 MB of audit, ascending ts so the
+        // first is the oldest. Cap at 1 MB → only the newest ~4 survive.
+        let kb = 1024;
+        let mut ulids = Vec::new();
+        for i in 0..8 {
+            ulids.push(write_sized(
+                &root,
+                "audit/peerx",
+                Priority::Min,
+                now - (8 - i) * 1000,
+                256 * kb,
+            ));
+        }
+        let policy = RetentionPolicy {
+            audit_cap_bytes: 1024 * 1024, // 1 MB cap over a ~2 MB audit lane
+            ..RetentionPolicy::default()
+        };
+        let report = run_pass_at(&policy, &root, now).unwrap();
+        assert!(
+            report.audit_pruned >= 1,
+            "over-cap audit lane must be pruned, not exempt"
+        );
+        let p = Persist::open(root.clone()).unwrap();
+        let remaining: Vec<String> = p
+            .list_since("audit/peerx", None)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.ulid)
+            .collect();
+        // Oldest pruned, newest kept (most-recent window stays on /run).
+        assert!(
+            !remaining.contains(&ulids[0]),
+            "oldest audit record pruned over the cap"
+        );
+        assert!(
+            remaining.contains(ulids.last().unwrap()),
+            "most-recent audit record survives"
+        );
+        // The kept audit lane is at/under the cap (within one record's slack).
+        let p = Persist::open(root.clone()).unwrap();
+        let audit_bytes: u64 = p
+            .list_since("audit/peerx", None)
+            .unwrap()
+            .iter()
+            .map(|m| std::fs::metadata(root.join(&m.file_path)).map(|x| x.len()).unwrap_or(0))
+            .sum();
+        assert!(
+            audit_bytes <= policy.audit_cap_bytes + 256 * kb as u64,
+            "audit lane bounded to ~cap, was {audit_bytes}"
+        );
+    }
+
+    #[test]
+    fn audit_lane_under_cap_is_untouched() {
+        // A small audit lane (well under the cap) is never pruned — the
+        // most-recent window stays fully resident.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let now = 1_000_000_000_000_i64;
+        for i in 0..3 {
+            write_sized(&root, "audit/peerx", Priority::Min, now - i * 1000, 4 * 1024);
+        }
+        let report = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
+        assert_eq!(report.audit_pruned, 0, "under-cap audit lane untouched");
+        let p = Persist::open(root.clone()).unwrap();
+        assert_eq!(
+            p.list_since("audit/peerx", None).unwrap().len(),
+            3,
+            "all three audit records survive under the cap"
+        );
+    }
+
+    #[test]
+    fn audit_entry_count_backstop_bounds_a_zero_byte_lane() {
+        // AUDIT-RUN-CAP-1 — the entry-count backstop. If the byte cap is huge
+        // (or the spool files read as 0 bytes), the lane must STILL be bounded by
+        // record count so index rows can't grow unbounded — the metadata-zero
+        // stall that would re-open the v10.0.18 unbounded-index wedge. Here the
+        // byte cap is effectively infinite, so ONLY the entry cap can fire.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let now = 1_000_000_000_000_i64;
+        for i in 0..10 {
+            write_sized(&root, "audit/peerx", Priority::Min, now - (10 - i) * 1000, 64);
+        }
+        let policy = RetentionPolicy {
+            audit_cap_bytes: u64::MAX, // byte cap can never bind
+            audit_cap_entries: 4,      // keep only the 4 most-recent records
+            ..RetentionPolicy::default()
+        };
+        let report = run_pass_at(&policy, &root, now).unwrap();
+        assert_eq!(report.audit_pruned, 6, "entry cap sheds the 6 oldest");
+        let p = Persist::open(root.clone()).unwrap();
+        assert_eq!(
+            p.list_since("audit/peerx", None).unwrap().len(),
+            4,
+            "entry-count backstop bounds the lane regardless of bytes"
+        );
+    }
+
+    #[test]
+    fn audit_zero_cap_floors_at_one_record_not_zero() {
+        // AUDIT-RUN-CAP-1 — a degenerate cap (0 bytes / 0 entries) must NOT wipe
+        // the audit trail; the lane floors at the single most-recent record so
+        // the newest audit event is always retained.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let now = 1_000_000_000_000_i64;
+        let mut ulids = Vec::new();
+        for i in 0..5 {
+            ulids.push(write_sized(
+                &root,
+                "audit/peerx",
+                Priority::Min,
+                now - (5 - i) * 1000,
+                128,
+            ));
+        }
+        let policy = RetentionPolicy {
+            audit_cap_bytes: 0,
+            audit_cap_entries: 0,
+            ..RetentionPolicy::default()
+        };
+        let report = run_pass_at(&policy, &root, now).unwrap();
+        assert_eq!(report.audit_pruned, 4, "all but the newest pruned");
+        let p = Persist::open(root.clone()).unwrap();
+        let remaining: Vec<String> = p
+            .list_since("audit/peerx", None)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.ulid)
+            .collect();
+        assert_eq!(remaining.len(), 1, "exactly the newest record survives a 0 cap");
+        assert!(
+            remaining.contains(ulids.last().unwrap()),
+            "the surviving record is the most-recent one"
+        );
+    }
+
+    #[test]
+    fn audit_prune_is_deterministic_under_same_ms_burst() {
+        // AUDIT-RUN-CAP-1 — the lh1 pattern: a burst of audit records sharing the
+        // SAME ts_unix_ms. The `ulid DESC` secondary sort must make the kept
+        // window deterministic — the lexicographically-greatest (newest) ULIDs
+        // survive — not whatever order SQLite happens to return for the tie.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let now = 1_000_000_000_000_i64;
+        // All 8 share the SAME timestamp; ULIDs are monotonic so write order ==
+        // ulid order. 256 KB each → ~2 MB; cap 1 MB keeps the newest few.
+        let mut ulids = Vec::new();
+        for _ in 0..8 {
+            ulids.push(write_sized(&root, "audit/peerx", Priority::Min, now, 256 * 1024));
+        }
+        let policy = RetentionPolicy {
+            audit_cap_bytes: 1024 * 1024,
+            ..RetentionPolicy::default()
+        };
+        let report = run_pass_at(&policy, &root, now).unwrap();
+        assert!(report.audit_pruned >= 1, "over-cap lane pruned even under a ts tie");
+        let p = Persist::open(root.clone()).unwrap();
+        let remaining: std::collections::HashSet<String> = p
+            .list_since("audit/peerx", None)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.ulid)
+            .collect();
+        // The newest (greatest ULID) is kept; the oldest (least ULID) is pruned —
+        // deterministically, despite every record sharing ts_unix_ms.
+        assert!(
+            remaining.contains(ulids.last().unwrap()),
+            "newest ULID survives the tie"
+        );
+        assert!(
+            !remaining.contains(&ulids[0]),
+            "oldest ULID pruned under the tie"
         );
     }
 
