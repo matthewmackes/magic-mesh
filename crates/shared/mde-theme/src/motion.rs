@@ -235,7 +235,79 @@ impl Motion {
             self
         }
     }
+
+    /// MOTION-A11Y-3 — this motion's visible flash rate (Hz) **if it loops**, or
+    /// `0.0` for a single-shot. A looping motion shows one bright→dim cycle per
+    /// [`Self::duration`], so the flash rate is `1 / duration_secs`. A single-shot
+    /// (`looping == false`) never repeats, so it can never flash — it returns
+    /// `0.0`. Pair with [`Self::is_flash_safe`] to assert the WCAG 2.3.1 bound.
+    #[must_use]
+    pub fn loop_frequency_hz(self) -> f32 {
+        if !self.looping {
+            return 0.0;
+        }
+        let secs = self.duration.as_secs_f32();
+        if secs <= f32::EPSILON {
+            // A degenerate zero-period loop would flash infinitely fast; report
+            // an over-threshold rate so `is_flash_safe` rejects it rather than
+            // dividing by zero.
+            return f32::INFINITY;
+        }
+        1.0 / secs
+    }
+
+    /// MOTION-A11Y-3 — does this motion stay at or below the photosensitive flash
+    /// ceiling ([`FLASH_SAFE_MAX_HZ`], 3 Hz per WCAG 2.3.1)? Single-shots are
+    /// always safe (they never repeat); a loop is safe only when its period is
+    /// long enough that it cycles ≤ 3 times/second. This is the frequency
+    /// assertion every looping preset/consumer can gate on.
+    #[must_use]
+    pub fn is_flash_safe(self) -> bool {
+        self.loop_frequency_hz() <= FLASH_SAFE_MAX_HZ
+    }
+
+    /// MOTION-A11Y-3 — return a flash-safe copy: if this motion loops faster than
+    /// [`FLASH_SAFE_MAX_HZ`], lengthen its period up to
+    /// [`FLASH_SAFE_MIN_PERIOD_MS`] so the realized rate sits at or under the WCAG
+    /// 2.3.1 ceiling; otherwise it is returned unchanged. A single-shot is never
+    /// altered. Route any caller-supplied looping period through this so a bespoke
+    /// pulse can never be configured into the seizure-risk band — the bound is
+    /// enforced, not merely documented.
+    #[must_use]
+    pub fn flash_safe(self) -> Self {
+        if self.looping && self.duration < Duration::from_millis(FLASH_SAFE_MIN_PERIOD_MS) {
+            Self {
+                duration: Duration::from_millis(FLASH_SAFE_MIN_PERIOD_MS),
+                ..self
+            }
+        } else {
+            self
+        }
+    }
 }
+
+/// MOTION-A11Y-3 — the flash-safety ceiling (Hz).
+///
+/// No looping/pulsing animation may complete more than this many visible state
+/// cycles per second, so motion can never reach the photosensitive-seizure flash
+/// threshold. WCAG 2.3.1
+/// ("Three Flashes or Below Threshold", success criterion level A) caps a
+/// general flash at **three per second**; we adopt that 3 Hz bound as the hard
+/// ceiling. A looping motion's flash rate is `1 / period_secs` (one bright→dim
+/// cycle per period; see [`Motion::loop_frequency_hz`]), so a safe loop has a
+/// period of at least `1 / FLASH_SAFE_MAX_HZ` ≈ 333 ms. Every looping preset in
+/// this module is well under the ceiling (the fastest, [`Motion::refresh`], is
+/// 400 ms ⇒ 2.5 Hz); [`Motion::flash_safe`] clamps any caller-supplied loop up
+/// to it.
+pub const FLASH_SAFE_MAX_HZ: f32 = 3.0;
+
+/// MOTION-A11Y-3 — the minimum flash-safe loop period (ms): `1 / FLASH_SAFE_MAX_HZ`
+/// rounded up.
+///
+/// A looping motion shorter than this would flash above the WCAG 2.3.1 threshold,
+/// so [`Motion::flash_safe`] never returns a period below it. 334 ms (⌈1000 / 3⌉)
+/// keeps the realized rate at or under [`FLASH_SAFE_MAX_HZ`].
+pub const FLASH_SAFE_MIN_PERIOD_MS: u64 = 334;
 
 /// UX-9 (b) — notification bell pulse maximum scale factor.
 /// Component dimension, not density-scaled.
@@ -420,6 +492,100 @@ mod tests {
         assert!(!reduced.looping, "loops are dropped under reduce-motion");
         // A short single-shot is also capped (never exceeds 80 ms).
         assert!(Motion::panel_mount().resolved(true).duration <= Duration::from_millis(80));
+    }
+
+    #[test]
+    fn every_looping_preset_is_under_the_flash_threshold() {
+        // MOTION-A11Y-3 acceptance: no animation exceeds the flash threshold
+        // (≤3 Hz). Every *looping* preset (the only ones that can flash
+        // repeatedly) must cycle at or below FLASH_SAFE_MAX_HZ. Single-shots
+        // never repeat, so they report 0 Hz and are trivially safe.
+        assert!((FLASH_SAFE_MAX_HZ - 3.0).abs() < f32::EPSILON);
+        for m in [
+            Motion::notification_pulse(), // 2000 ms ⇒ 0.5 Hz
+            Motion::loading(),            // 700 ms ⇒ ~1.43 Hz
+            Motion::refresh(),            // 400 ms ⇒ 2.5 Hz (the fastest loop)
+        ] {
+            assert!(m.looping, "guarding the looping presets");
+            assert!(
+                m.is_flash_safe(),
+                "looping preset {:?} flashes at {} Hz, over the {} Hz ceiling",
+                m,
+                m.loop_frequency_hz(),
+                FLASH_SAFE_MAX_HZ
+            );
+            assert!(m.loop_frequency_hz() <= FLASH_SAFE_MAX_HZ);
+        }
+        // The fastest loop (refresh, 400 ms) is exactly 2.5 Hz — under 3 Hz.
+        assert!((Motion::refresh().loop_frequency_hz() - 2.5).abs() < 1e-3);
+        // Single-shots never flash: 0 Hz, always safe.
+        for m in [Motion::panel_mount(), Motion::hover(), Motion::success()] {
+            assert!(!m.looping);
+            assert!(m.loop_frequency_hz().abs() < f32::EPSILON);
+            assert!(m.is_flash_safe());
+        }
+    }
+
+    #[test]
+    fn flash_safe_clamps_an_over_threshold_loop_up_to_the_safe_floor() {
+        // MOTION-A11Y-3: a bespoke pulse cannot be configured into the
+        // seizure-risk band — flash_safe lengthens any too-fast loop up to the
+        // safe minimum period, and is_flash_safe then holds.
+        let unsafe_blink = Motion {
+            duration: Duration::from_millis(100), // 10 Hz — well over the ceiling
+            easing: Easing::EaseInOut,
+            looping: true,
+        };
+        assert!(!unsafe_blink.is_flash_safe(), "10 Hz must be rejected");
+        let clamped = unsafe_blink.flash_safe();
+        assert_eq!(
+            clamped.duration,
+            Duration::from_millis(FLASH_SAFE_MIN_PERIOD_MS)
+        );
+        assert!(
+            clamped.is_flash_safe(),
+            "clamped loop is at or under {} Hz (got {} Hz)",
+            FLASH_SAFE_MAX_HZ,
+            clamped.loop_frequency_hz()
+        );
+        assert!(clamped.loop_frequency_hz() <= FLASH_SAFE_MAX_HZ);
+        // A degenerate zero-period loop is treated as over-threshold (no div-by-0)
+        // and is clamped to the safe floor.
+        let degenerate = Motion {
+            duration: Duration::ZERO,
+            easing: Easing::Linear,
+            looping: true,
+        };
+        assert!(degenerate.loop_frequency_hz().is_infinite());
+        assert!(!degenerate.is_flash_safe());
+        assert!(degenerate.flash_safe().is_flash_safe());
+    }
+
+    #[test]
+    fn flash_safe_leaves_already_safe_and_single_shot_motion_untouched() {
+        // An already-safe loop and any single-shot pass through flash_safe
+        // unchanged — the clamp only ever lengthens a too-fast loop.
+        let safe_loop = Motion::refresh(); // 2.5 Hz, already safe
+        assert_eq!(safe_loop.flash_safe(), safe_loop);
+        let single = Motion::panel_mount(); // single-shot, 240 ms
+        assert_eq!(
+            single.flash_safe(),
+            single,
+            "a single-shot is never lengthened even though 240 ms < the loop floor"
+        );
+    }
+
+    #[test]
+    fn flash_safe_min_period_realizes_at_or_under_the_ceiling() {
+        // The minimum safe period must actually yield ≤ FLASH_SAFE_MAX_HZ — guards
+        // against an off-by-one that would leave the floor a hair over 3 Hz.
+        let at_floor = Motion {
+            duration: Duration::from_millis(FLASH_SAFE_MIN_PERIOD_MS),
+            easing: Easing::EaseInOut,
+            looping: true,
+        };
+        assert!(at_floor.loop_frequency_hz() <= FLASH_SAFE_MAX_HZ);
+        assert!(at_floor.is_flash_safe());
     }
 
     #[test]
