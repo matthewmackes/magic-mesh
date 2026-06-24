@@ -27,6 +27,12 @@ path = "src/bin/mde-apps-applet.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 mde-bus = { path = "../mde-bus" }
+# LIGHTHOUSE-7 — the canonical lighthouse `role` string (LIGHTHOUSE_ROLE) so the
+# applet's snapshot-based lighthouse-health indicator can't silently diverge from
+# the Workbench tab / mackesd. mackes-mesh-types is a shell-free mesh-side leaf
+# crate (the §6 boundary lint only forbids deps into crates/shell/*), already a
+# dep of the sibling mde-workbench.
+mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
 # NOTIFY-7 / AC — the bell tints by the highest-severity unread alert tailed off
 # the bus, and shares the severity→Carbon-token map with the Action Center.
 mde-notify = { path = "../../services/mde-notify" }
