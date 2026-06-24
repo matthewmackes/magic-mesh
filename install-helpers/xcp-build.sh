@@ -54,7 +54,12 @@ KEY="${MCNF_BUILD_KEY:-$HOME/.ssh/mackes_mesh_ed25519}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 TOFU_DIR="${MCNF_TOFU_DIR:-$REPO/infra/tofu}"
 # Per-slot remote dir lets concurrent agents share one VM (each its own target/).
-REMOTE_DIR="magic-mesh${MCNF_BUILD_SLOT:+-$MCNF_BUILD_SLOT}"
+# Base is `magic-mesh-farm` (NOT the bare `magic-mesh`): the build VMs carry a
+# stale Forgejo-mirror clone at ~/magic-mesh whose origin/master sits at an old
+# commit, and a CI git-reset there reverts the working tree mid-build (it broke
+# the 11.0.6 + 11.0.8 generate-rpm step — Cargo.toml snapped back to 11.0.1). A
+# dedicated, git-free build dir is immune. Override with MCNF_BUILD_DIR.
+REMOTE_DIR="${MCNF_BUILD_DIR:-magic-mesh-farm}${MCNF_BUILD_SLOT:+-$MCNF_BUILD_SLOT}"
 ARTIFACTS="${MCNF_BUILD_ARTIFACTS:-$HOME/mcnf-release-artifacts}"
 SSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o BatchMode=yes)
 
@@ -63,9 +68,13 @@ warn() { echo "==> xcp-build: $*" >&2; }
 
 do_sync() {
   log "rsync working tree → $DEST:$REMOTE_DIR (excluding target*/)"
+  # Exclude /.git entirely: farm builds need source files, not git history, and
+  # syncing a worktree's .git-file (a broken gitdir pointer) or colliding with a
+  # stale clone is how the working tree got reverted mid-build. A git-free build
+  # dir cannot be `git reset` out from under a build.
   rsync -az --delete -e "${SSH[*]}" \
     --exclude '/target' --exclude '/target-f43' --exclude '/target-f44' \
-    --exclude '/.git/objects/pack/tmp_*' \
+    --exclude '/.git' \
     "$REPO/" "$DEST:$REMOTE_DIR/"
 }
 
