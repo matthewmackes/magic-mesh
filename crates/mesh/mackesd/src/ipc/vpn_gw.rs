@@ -90,7 +90,7 @@ impl VpnService {
 }
 
 /// Action verbs served on `action/vpn/<verb>`.
-pub const ACTION_VERBS: [&str; 12] = [
+pub const ACTION_VERBS: [&str; 14] = [
     "list-tunnels",
     "add-tunnel",
     "remove-tunnel",
@@ -105,6 +105,9 @@ pub const ACTION_VERBS: [&str; 12] = [
     "clear-route",
     "list-routes",
     "route-status",
+    // VPN-GW-6 — health + exit-IP/leak verification + auto-failover + alerts.
+    "verify-egress",
+    "egress-health",
 ];
 
 /// Where a tunnel's DECRYPTED config lands on the node just before bring-up, for
@@ -178,6 +181,14 @@ fn iface_up(spawn: bool, ifname: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Liveness check shared with the VPN-GW-6 health module so the "is the tunnel's
+/// interface present" rule lives in exactly one place (the `mvpn-<id>` ifname
+/// derivation already does). Re-exports the private [`iface_up`].
+#[must_use]
+pub fn iface_up_public(spawn: bool, ifname: &str) -> bool {
+    iface_up(spawn, ifname)
 }
 
 /// Build the reply for one `action/vpn/<verb>` request.
@@ -260,6 +271,10 @@ pub fn build_reply(svc: &VpnService, verb: &str, req_body: Option<&str>) -> Stri
         "clear-route" => clear_route(svc, req_body),
         "list-routes" => list_routes(svc),
         "route-status" => route_status(svc, req_body),
+        // VPN-GW-6 — verify one tunnel's exit IP / leak state on demand, or read
+        // the full per-tunnel egress-health (with the verified exit IPs).
+        "verify-egress" => verify_egress(svc, req_body),
+        "egress-health" => egress_health(svc),
         other => err(format!("unknown vpn verb: {other}")),
     }
 }
@@ -667,6 +682,66 @@ fn route_status(svc: &VpnService, req_body: Option<&str>) -> String {
     .to_string()
 }
 
+// ── VPN-GW-6 — health + exit-IP/leak verification (operator-facing reads) ──
+
+/// `verify-egress` — verify ONE tunnel's egress on demand: liveness, the real
+/// exit IP fetched through the tunnel, the WAN-leak comparison, and a DNS-leak
+/// probe. The body is the tunnel id. Returns the [`vpn_health::TunnelReport`]
+/// (health verdict + the verified exit IP + the leak reason). This is the live
+/// verification the UI's "verify now" button calls; the periodic sweep
+/// ([`serve_bus`]) runs the same check + raises the alert.
+fn verify_egress(svc: &VpnService, req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(id) = req_body.map(str::trim).filter(|s| !s.is_empty()) else {
+        return err("verify-egress: missing tunnel id".into());
+    };
+    let root = svc.workgroup_root.as_path();
+    let cfg = vpn::load(root);
+    let Some(t) = cfg.get(id) else {
+        return err(format!("verify-egress: no such tunnel '{id}'"));
+    };
+    // The raw-WAN IP (default route, not the tunnel) the exit is compared
+    // against — only fetched when the tools can spawn.
+    let wan = if svc.spawn {
+        crate::ipc::vpn_health::wan_ip()
+    } else {
+        None
+    };
+    let report = crate::ipc::vpn_health::verify_tunnel(svc.spawn, t, wan.as_deref());
+    json!({ "ok": true, "report": report.to_json() }).to_string()
+}
+
+/// `egress-health` — verify EVERY tunnel on every route's chain right now and
+/// report the per-tunnel health (incl. the verified exit IP). The same sweep the
+/// responder runs on its interval, exposed as a read so the UI can show the live
+/// egress-health table (and DDNS-EGRESS-1 can read the verified exit IP). Does
+/// NOT raise alerts — that's the periodic sweep's job; this is a pure read.
+fn egress_health(svc: &VpnService) -> String {
+    let root = svc.workgroup_root.as_path();
+    let cfg = vpn::load(root);
+    let routing = vpn_egress::load_routing(root);
+    let wan = if svc.spawn {
+        crate::ipc::vpn_health::wan_ip()
+    } else {
+        None
+    };
+    // Verify each tunnel that appears on some chain exactly once (reusing the
+    // shared chain-tunnel verifier so the missing-tunnel rule lives in one place).
+    let mut seen = std::collections::HashSet::new();
+    let mut reports = Vec::new();
+    for route in &routing.route {
+        for id in route.chain() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let report =
+                crate::ipc::vpn_health::verify_chain_tunnel(svc.spawn, &id, &cfg, wan.as_deref());
+            reports.push(report.to_json());
+        }
+    }
+    json!({ "ok": true, "tunnels": reports }).to_string()
+}
+
 /// Write the produced secret material with owner-only perms (it carries the
 /// private key). Creates the parent dir. Best-effort 0600.
 fn write_secret(path: &std::path::Path, body: &str) -> std::io::Result<()> {
@@ -682,11 +757,31 @@ fn write_secret(path: &std::path::Path, body: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Run the VPN Bus responder loop until `should_stop`.
+/// VPN-GW-6 — how often the responder runs the egress-health sweep (verify each
+/// routed tunnel's exit IP / leak state, fail over the chain, raise
+/// `vpn/tunnel-down`). Slower than the action-poll interval: the sweep shells out
+/// to `curl` per tunnel, so a tight loop would hammer the reflectors. 30 s
+/// catches a silent leak well within an operator's reaction window.
+pub const HEALTH_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run the VPN Bus responder loop until `should_stop`. Each iteration serves the
+/// `action/vpn/*` verbs (fast poll) and, on the [`HEALTH_SWEEP_INTERVAL`] cadence,
+/// runs the VPN-GW-6 egress-health sweep over the durable routes — verifying each
+/// tunnel's real exit IP, failing the chain over off a leaking/down tunnel, and
+/// raising the `vpn/tunnel-down` alert on `event/vpn/signals`.
 pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &VpnService, should_stop: F) {
     let mut cursors: HashMap<String, String> = HashMap::new();
+    let mut last_sweep = std::time::Instant::now()
+        .checked_sub(HEALTH_SWEEP_INTERVAL)
+        .unwrap_or_else(std::time::Instant::now);
     while !should_stop() {
         poll_once(persist, svc, &mut cursors);
+        if last_sweep.elapsed() >= HEALTH_SWEEP_INTERVAL {
+            // The sweep is best-effort: it spawns its own probes and only writes
+            // alert events, never blocks the action responder for long.
+            let _ = crate::ipc::vpn_health::sweep(persist, svc.workgroup_root.as_path(), svc.spawn);
+            last_sweep = std::time::Instant::now();
+        }
         std::thread::sleep(POLL_INTERVAL);
     }
 }
@@ -743,13 +838,67 @@ mod tests {
     #[test]
     fn topic_and_verbs_lock() {
         assert_eq!(action_topic("tunnel-up"), "action/vpn/tunnel-up");
-        assert_eq!(ACTION_VERBS.len(), 12);
+        assert_eq!(ACTION_VERBS.len(), 14);
         assert!(ACTION_VERBS.contains(&"list-providers"));
         assert!(ACTION_VERBS.contains(&"setup-provider"));
         // VPN-GW-4 routing verbs.
         for v in ["set-route", "clear-route", "list-routes", "route-status"] {
             assert!(ACTION_VERBS.contains(&v), "missing {v}");
         }
+        // VPN-GW-6 health verbs.
+        for v in ["verify-egress", "egress-health"] {
+            assert!(ACTION_VERBS.contains(&v), "missing {v}");
+        }
+    }
+
+    // ── VPN-GW-6: health + exit-IP/leak verification reachable as verbs ──
+
+    #[test]
+    fn verify_egress_reports_down_without_iface() {
+        // spawn disabled → the tunnel's interface reads absent → Down, with the
+        // verified exit IP null. The verb is reachable + honest, no host I/O.
+        let (_t, s) = svc();
+        let _ = add(&s, "mullvad1", "wg");
+        let r = build_reply(&s, "verify-egress", Some("mullvad1"));
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{r}");
+        assert_eq!(v["report"]["ifname"], "mvpn-mullvad1");
+        assert_eq!(v["report"]["health"], "down");
+        assert_eq!(v["report"]["verified_exit_ip"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn verify_egress_errors_on_missing_or_unknown() {
+        let (_t, s) = svc();
+        assert!(build_reply(&s, "verify-egress", None).contains("missing tunnel id"));
+        assert!(build_reply(&s, "verify-egress", Some("ghost")).contains("no such tunnel"));
+    }
+
+    #[test]
+    fn egress_health_verifies_every_chain_tunnel_once() {
+        // Two routes sharing a failover tunnel: egress-health reports each
+        // distinct chain tunnel exactly once (deduped), all Down with spawn off.
+        let (_t, s) = svc();
+        let body = set_route_body("any", None, "gw1", "mullvad1", &["proton1"]);
+        assert!(build_reply(&s, "set-route", Some(&body)).contains("\"ok\":true"));
+        let body = set_route_body("node", Some("anvil"), "gw1", "ivpn1", &["proton1"]);
+        assert!(build_reply(&s, "set-route", Some(&body)).contains("\"ok\":true"));
+
+        let r = build_reply(&s, "egress-health", None);
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{r}");
+        let tunnels = v["tunnels"].as_array().unwrap();
+        let ids: Vec<&str> = tunnels.iter().filter_map(|t| t["id"].as_str()).collect();
+        // proton1 appears in both chains but is verified once.
+        assert_eq!(
+            ids.iter().filter(|i| **i == "proton1").count(),
+            1,
+            "{ids:?}"
+        );
+        for want in ["mullvad1", "proton1", "ivpn1"] {
+            assert!(ids.contains(&want), "missing {want} in {ids:?}");
+        }
+        assert!(tunnels.iter().all(|t| t["health"] == "down"));
     }
 
     #[test]
