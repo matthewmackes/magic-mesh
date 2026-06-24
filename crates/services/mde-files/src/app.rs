@@ -104,6 +104,24 @@ pub enum Message {
     /// dialog, clipboard, etc.); the reducer just closes the
     /// menu so the floating widget disappears.
     ContextMenuItemClicked(ContextMenuItem),
+    /// CTXMENU — the inline-rename text field changed.
+    RenameBufferChanged(String),
+    /// CTXMENU — commit the inline rename (filesystem `rename`, then
+    /// the end-of-update refresh re-lists).
+    RenameCommit,
+    /// CTXMENU — abandon the inline rename without renaming.
+    RenameCancel,
+    /// CTXMENU — the "Send to…" peer-picker chose a peer (by id) for
+    /// the buffered source path; dispatches a real Send-To.
+    SendToPickerPeer(String),
+    /// CTXMENU — dismiss the "Send to…" peer-picker sheet.
+    DismissSendToPicker,
+    /// CTXMENU — dismiss the Properties dialog.
+    DismissProperties,
+    /// CTXMENU — the Escape key: close the topmost transient surface (context
+    /// menu / Send-To picker / Properties dialog / inline rename). No-op when
+    /// none is open.
+    EscapeDismiss,
     /// v2.0.0 Phase 1.7 — show / hide the operation drawer.
     ToggleOperationDrawer,
     /// v2.0.0 Phase 1.7 — backend pushed a fresh op row (new or
@@ -301,6 +319,15 @@ pub struct MdeFiles {
     pub details: DetailsPanel,
     /// v2.0.0 Phase 1.5 — right-click context-menu state.
     pub context_menu: ContextMenu,
+    /// CTXMENU — inline-rename state: `Some((original_name, edited_text))`
+    /// while a local row is being renamed, `None` otherwise.
+    pub rename_buffer: Option<(String, String)>,
+    /// CTXMENU — the "Send to…" peer-picker: `Some(source_path)` while the
+    /// picker sheet is open over a local file, `None` otherwise.
+    pub send_to_picker: Option<String>,
+    /// CTXMENU — the Properties dialog: `Some(props)` while open, `None`
+    /// otherwise. Captured synchronously via `FileProperties::of`.
+    pub properties_dialog: Option<crate::properties::FileProperties>,
     /// v2.0.0 Phase 1.7 — slide-up operation drawer state.
     pub op_drawer: OperationDrawer,
     /// v2.0.0 Phase 1.6 — drag-and-drop session state.
@@ -418,6 +445,9 @@ impl Default for MdeFiles {
             selection: Selection::default(),
             details: DetailsPanel::default(),
             context_menu: ContextMenu::default(),
+            rename_buffer: None,
+            send_to_picker: None,
+            properties_dialog: None,
             op_drawer: OperationDrawer::default(),
             drag: DragSession::default(),
             a11y: Accessibility::default(),
@@ -484,6 +514,12 @@ impl MdeFiles {
             else {
                 return None;
             };
+            // CTXMENU — unmodified Escape dismisses any open transient surface
+            // (context menu / Send-To picker / Properties / inline rename). The
+            // reducer no-ops when nothing is open, so this is safe to always emit.
+            if matches!(key.as_ref(), Key::Named(Named::Escape)) && modifiers.is_empty() {
+                return Some(Message::EscapeDismiss);
+            }
             if !modifiers.command() {
                 return None;
             }
@@ -728,9 +764,12 @@ impl MdeFiles {
             }
             Message::CloseContextMenu => self.context_menu.close(),
             Message::ContextMenuItemClicked(item) => {
-                // E10 — resolve the row the menu was opened over (local listing)
-                // and route the path-based actions. Send-To / Rename / Delete /
-                // Properties route elsewhere / are future.
+                // CTXMENU — resolve the row the menu was opened over (local
+                // listing) and run the chosen action. Every item is wired: Open
+                // launches/descends, Copy-path → clipboard, Send-to opens a peer
+                // picker, Rename starts inline edit, Delete trashes, Properties
+                // opens the details dialog. No-op only for a virtual row with no
+                // filesystem path (mesh/peer rows can't be renamed/trashed here).
                 let row = self.context_menu.row().and_then(|key| {
                     self.local_files
                         .iter()
@@ -738,6 +777,7 @@ impl MdeFiles {
                         .find(|r| r.name == key)
                         .cloned()
                 });
+                let name = self.context_menu.row().map(str::to_owned);
                 match item {
                     ContextMenuItem::Open => {
                         if let Some(r) = &row {
@@ -757,9 +797,121 @@ impl MdeFiles {
                             let _ = std::process::Command::new("wl-copy").arg(p).spawn();
                         }
                     }
-                    _ => {}
+                    ContextMenuItem::SendTo => {
+                        // Open the peer-picker sheet over this file; the chosen
+                        // peer drives a real Send-To through the wired backend.
+                        // Clear the sibling transient surfaces so exactly one
+                        // overlay is ever live (the `view()` precedence then has
+                        // no stale state to re-surface behind it).
+                        if let Some(p) = row.and_then(|r| r.path) {
+                            self.properties_dialog = None;
+                            self.rename_buffer = None;
+                            self.send_to_picker = Some(p);
+                        }
+                    }
+                    ContextMenuItem::Rename => {
+                        // Enter inline-edit: seed the buffer with the current
+                        // name. The view renders a text field over the row.
+                        // Gated like the other actions on a resolved local row
+                        // with a real path (virtual mesh/peer rows aren't
+                        // renamable here), so the name always matches a live file.
+                        if let (Some(n), Some(r)) = (name, &row) {
+                            if r.path.is_some() {
+                                self.send_to_picker = None;
+                                self.properties_dialog = None;
+                                self.rename_buffer = Some((n.clone(), n));
+                            }
+                        }
+                    }
+                    ContextMenuItem::Delete => {
+                        // Move to the freedesktop trash (recoverable — no destroy).
+                        // The trash op is synchronous + bounded; the end-of-update
+                        // refresh re-lists without the trashed row.
+                        if let Some(p) = row.and_then(|r| r.path) {
+                            self.trash_local_path(&p);
+                        }
+                    }
+                    ContextMenuItem::Properties => {
+                        // Capture the file's properties synchronously and open the
+                        // dialog. A read error leaves the dialog closed (honest).
+                        // Clear the sibling transient surfaces (single-overlay
+                        // invariant — see SendTo).
+                        if let Some(p) = row.and_then(|r| r.path) {
+                            if let Ok(props) =
+                                crate::properties::FileProperties::of(std::path::Path::new(&p))
+                            {
+                                self.send_to_picker = None;
+                                self.rename_buffer = None;
+                                self.properties_dialog = Some(props);
+                            }
+                        }
+                    }
                 }
                 self.context_menu.close();
+            }
+            Message::RenameBufferChanged(text) => {
+                if let Some((_, edit)) = self.rename_buffer.as_mut() {
+                    *edit = text;
+                }
+            }
+            Message::RenameCommit => {
+                // CTXMENU — rename the file in place (same directory). Inline
+                // rename only exists in the Local browser, so commit is gated on
+                // `View::Local` (its `local_path` is the row's directory). Empty /
+                // unchanged / path-bearing names are rejected; the end-of-update
+                // refresh re-lists under the new name.
+                if let Some((orig, edited)) = self.rename_buffer.take() {
+                    let new_name = edited.trim();
+                    if matches!(self.view, View::Local)
+                        && !new_name.is_empty()
+                        && new_name != orig
+                        && !new_name.contains('/')
+                        && new_name != "."
+                        && new_name != ".."
+                    {
+                        let dir = std::path::Path::new(&self.local_path);
+                        let from = dir.join(&orig);
+                        let to = dir.join(new_name);
+                        if from.exists() && !to.exists() {
+                            let _ = crate::fileops::move_path(&from, &to);
+                        }
+                    }
+                }
+            }
+            Message::RenameCancel => {
+                self.rename_buffer = None;
+            }
+            Message::SendToPickerPeer(id) => {
+                // CTXMENU — the picker chose a peer for the buffered source file.
+                if let Some(path) = self.send_to_picker.take() {
+                    if let Some(dest) = self.peer_destination(&id) {
+                        self.dispatch_send(
+                            vec![std::path::PathBuf::from(path)],
+                            dest,
+                            SendMode::Copy,
+                            ConflictPolicy::Rename,
+                        );
+                    }
+                }
+            }
+            Message::DismissSendToPicker => {
+                self.send_to_picker = None;
+            }
+            Message::DismissProperties => {
+                self.properties_dialog = None;
+            }
+            Message::EscapeDismiss => {
+                // CTXMENU — close the topmost open transient surface, mirroring
+                // the overlay precedence in `view()`. One press peels one layer.
+                if self.properties_dialog.is_some() {
+                    self.properties_dialog = None;
+                } else if self.send_to_picker.is_some() {
+                    self.send_to_picker = None;
+                } else if self.context_menu.is_open() {
+                    self.context_menu.close();
+                } else {
+                    self.rename_buffer = None;
+                }
             }
             Message::ToggleOperationDrawer => {
                 let open = !self.op_drawer.is_open();
@@ -1022,6 +1174,16 @@ impl MdeFiles {
             None
         } else {
             Some(Destination::Peer(name))
+        }
+    }
+
+    /// CTXMENU — move a local file/dir to the freedesktop trash (recoverable;
+    /// the same `~/.local/share/Trash` spool the `--trash` CLI uses). Best-effort:
+    /// a failure (no trash dir / cross-device) leaves the file in place and the
+    /// end-of-update refresh simply re-shows it — honest, never a silent destroy.
+    fn trash_local_path(&self, path: &str) {
+        if let Ok(trash) = crate::trash::TrashDir::home() {
+            let _ = trash.trash(std::path::Path::new(path));
         }
     }
 
@@ -1313,6 +1475,9 @@ impl MdeFiles {
                 metrics,
                 &self.selection,
                 rm,
+                self.rename_buffer
+                    .as_ref()
+                    .map(|(o, e)| (o.as_str(), e.as_str())),
             ),
             View::MeshHome => views::mesh_home(snap),
             View::MeshHomeChild(slug) => views::mesh_home_child(
@@ -1414,15 +1579,29 @@ impl MdeFiles {
                 })
                 .into();
 
-        // MESHFS-11.1 — overlay the resolve dialog when active.
-        if let Some((orig, sib)) = &self.resolve_dialog {
-            cosmic::iced::widget::Stack::with_children(vec![
-                root,
-                views::resolve_conflict_dialog(orig, sib),
-            ])
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+        // Overlay the topmost active modal. At most one of these is open at a
+        // time (each item-click closes the menu before opening the next sheet),
+        // so a single-layer overlay is correct and keeps the Stack shallow.
+        // MESHFS-11.1 — the resolve dialog; CTXMENU — the context menu, the
+        // Send-To peer picker, and the Properties dialog.
+        let overlay: Option<Element<'_, Message>> = if let Some((orig, sib)) = &self.resolve_dialog
+        {
+            Some(views::resolve_conflict_dialog(orig, sib))
+        } else if let Some(props) = &self.properties_dialog {
+            Some(views::properties_dialog(props))
+        } else if let Some(src) = &self.send_to_picker {
+            Some(views::send_to_picker_sheet(src, &self.snapshot.peers))
+        } else if self.context_menu.is_open() {
+            self.context_menu.row().map(views::context_menu_sheet)
+        } else {
+            None
+        };
+
+        if let Some(top) = overlay {
+            cosmic::iced::widget::Stack::with_children(vec![root, top])
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
         } else {
             root
         }
@@ -2041,6 +2220,183 @@ mod tests {
     }
 
     #[test]
+    fn context_rename_renames_the_file_on_disk() {
+        // CTXMENU — Rename enters inline-edit; committing a new name moves the
+        // file in place and the end-of-update refresh re-lists under the new name.
+        let tmp = std::env::temp_dir().join(format!("mdefiles-rename-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("old.txt"), b"x").unwrap();
+        let mut s = MdeFiles::default();
+        s.view = View::Local;
+        s.local_path = tmp.to_string_lossy().into_owned();
+        let _ = s.update(Message::OpenContextMenu("old.txt".into(), 0.0, 0.0));
+        let _ = s.update(Message::ContextMenuItemClicked(ContextMenuItem::Rename));
+        assert_eq!(
+            s.rename_buffer,
+            Some(("old.txt".to_string(), "old.txt".to_string())),
+            "Rename seeds the buffer with the current name"
+        );
+        let _ = s.update(Message::RenameBufferChanged("new.txt".into()));
+        let _ = s.update(Message::RenameCommit);
+        assert!(s.rename_buffer.is_none(), "commit clears the buffer");
+        assert!(!tmp.join("old.txt").exists(), "old name gone");
+        assert!(tmp.join("new.txt").exists(), "new name present");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn context_rename_cancel_leaves_the_file_untouched() {
+        let tmp = std::env::temp_dir().join(format!("mdefiles-rcancel-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("keep.txt"), b"x").unwrap();
+        let mut s = MdeFiles::default();
+        s.view = View::Local;
+        s.local_path = tmp.to_string_lossy().into_owned();
+        let _ = s.update(Message::OpenContextMenu("keep.txt".into(), 0.0, 0.0));
+        let _ = s.update(Message::ContextMenuItemClicked(ContextMenuItem::Rename));
+        let _ = s.update(Message::RenameBufferChanged("other.txt".into()));
+        let _ = s.update(Message::RenameCancel);
+        assert!(s.rename_buffer.is_none());
+        assert!(tmp.join("keep.txt").exists(), "cancel renames nothing");
+        assert!(!tmp.join("other.txt").exists());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn context_rename_rejects_a_path_bearing_name() {
+        // A name with a path separator must not escape the directory.
+        let tmp = std::env::temp_dir().join(format!("mdefiles-rpath-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("a.txt"), b"x").unwrap();
+        let mut s = MdeFiles::default();
+        s.view = View::Local;
+        s.local_path = tmp.to_string_lossy().into_owned();
+        let _ = s.update(Message::OpenContextMenu("a.txt".into(), 0.0, 0.0));
+        let _ = s.update(Message::ContextMenuItemClicked(ContextMenuItem::Rename));
+        let _ = s.update(Message::RenameBufferChanged("../escape.txt".into()));
+        let _ = s.update(Message::RenameCommit);
+        assert!(tmp.join("a.txt").exists(), "the original is left in place");
+        assert!(!tmp.parent().unwrap().join("escape.txt").exists());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn context_delete_moves_the_file_to_trash() {
+        // CTXMENU — Delete trashes the file (recoverable). Use an isolated
+        // XDG_DATA_HOME so the test's trash spool is its own temp tree.
+        let tmp = std::env::temp_dir().join(format!("mdefiles-del-{}", std::process::id()));
+        let data = tmp.join("xdg-data");
+        std::fs::create_dir_all(&data).unwrap();
+        let target = tmp.join("doomed.txt");
+        std::fs::write(&target, b"bye").unwrap();
+        std::env::set_var("XDG_DATA_HOME", &data);
+        let mut s = MdeFiles::default();
+        s.view = View::Local;
+        s.local_path = tmp.to_string_lossy().into_owned();
+        let _ = s.update(Message::OpenContextMenu("doomed.txt".into(), 0.0, 0.0));
+        let _ = s.update(Message::ContextMenuItemClicked(ContextMenuItem::Delete));
+        assert!(!target.exists(), "the file left its original location");
+        let trashed = data.join("Trash/files/doomed.txt");
+        assert!(trashed.exists(), "the file landed in the trash spool");
+        std::env::remove_var("XDG_DATA_HOME");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn context_properties_opens_the_dialog() {
+        let tmp = std::env::temp_dir().join(format!("mdefiles-props-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("info.txt"), b"hello").unwrap();
+        let mut s = MdeFiles::default();
+        s.view = View::Local;
+        s.local_path = tmp.to_string_lossy().into_owned();
+        let _ = s.update(Message::OpenContextMenu("info.txt".into(), 0.0, 0.0));
+        let _ = s.update(Message::ContextMenuItemClicked(ContextMenuItem::Properties));
+        let props = s.properties_dialog.as_ref().expect("dialog open");
+        assert_eq!(props.size_bytes, 5);
+        assert!(!s.context_menu.is_open(), "menu closed behind the dialog");
+        let _ = s.update(Message::DismissProperties);
+        assert!(s.properties_dialog.is_none(), "dismiss closes the dialog");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn context_send_to_opens_the_peer_picker() {
+        let tmp = std::env::temp_dir().join(format!("mdefiles-send-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("share.txt"), b"x").unwrap();
+        let mut s = MdeFiles::default();
+        s.view = View::Local;
+        s.local_path = tmp.to_string_lossy().into_owned();
+        let _ = s.update(Message::OpenContextMenu("share.txt".into(), 0.0, 0.0));
+        let _ = s.update(Message::ContextMenuItemClicked(ContextMenuItem::SendTo));
+        assert_eq!(
+            s.send_to_picker.as_deref(),
+            Some(tmp.join("share.txt").to_string_lossy().as_ref()),
+            "the picker buffers the file's absolute path"
+        );
+        let _ = s.update(Message::DismissSendToPicker);
+        assert!(s.send_to_picker.is_none(), "dismiss closes the picker");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn opening_one_overlay_clears_the_siblings() {
+        // CTXMENU single-overlay invariant: opening Properties closes an already
+        // open Send-To picker (and vice-versa), so the view() precedence chain
+        // never hides a stale modal that re-surfaces on dismiss.
+        let tmp = std::env::temp_dir().join(format!("mdefiles-1overlay-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("a.txt"), b"x").unwrap();
+        let mut s = MdeFiles::default();
+        s.view = View::Local;
+        s.local_path = tmp.to_string_lossy().into_owned();
+        let _ = s.update(Message::OpenContextMenu("a.txt".into(), 0.0, 0.0));
+        let _ = s.update(Message::ContextMenuItemClicked(ContextMenuItem::SendTo));
+        assert!(s.send_to_picker.is_some());
+        let _ = s.update(Message::OpenContextMenu("a.txt".into(), 0.0, 0.0));
+        let _ = s.update(Message::ContextMenuItemClicked(ContextMenuItem::Properties));
+        assert!(s.properties_dialog.is_some(), "Properties opened");
+        assert!(
+            s.send_to_picker.is_none(),
+            "the stale Send-To picker was cleared"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn escape_peels_one_overlay_layer_at_a_time() {
+        // CTXMENU — Escape closes the topmost surface (Properties), leaving
+        // lower state for the next press; a final Escape clears the rename buffer.
+        let mut s = MdeFiles::default();
+        s.properties_dialog = crate::properties::FileProperties::of(std::path::Path::new("/")).ok();
+        assert!(s.properties_dialog.is_some());
+        let _ = s.update(Message::EscapeDismiss);
+        assert!(s.properties_dialog.is_none(), "Escape closed Properties");
+        // With nothing else open, an Escape over an active rename clears it.
+        s.rename_buffer = Some(("a".into(), "b".into()));
+        let _ = s.update(Message::EscapeDismiss);
+        assert!(s.rename_buffer.is_none(), "Escape cancelled the rename");
+    }
+
+    #[test]
+    fn rename_commit_outside_local_view_is_rejected() {
+        // The inline rename only exists in View::Local; a commit that lands while
+        // the view changed must not touch the filesystem.
+        let tmp = std::env::temp_dir().join(format!("mdefiles-rview-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("a.txt"), b"x").unwrap();
+        let mut s = MdeFiles::default();
+        s.local_path = tmp.to_string_lossy().into_owned();
+        s.view = View::Inbox; // not Local
+        s.rename_buffer = Some(("a.txt".into(), "b.txt".into()));
+        let _ = s.update(Message::RenameCommit);
+        assert!(tmp.join("a.txt").exists(), "no rename outside View::Local");
+        assert!(!tmp.join("b.txt").exists());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
     fn toggle_operation_drawer_message() {
         let mut s = MdeFiles::default();
         assert!(!s.op_drawer.is_open());
@@ -2069,7 +2425,9 @@ mod tests {
         // 240 ms tween against the reducer's end-of-update snapshot refresh.
         let mut s = MdeFiles::default();
         // No fade in flight at rest.
-        assert!(!s.anim.is_animating(SIDEBAR_FADE_KEY, std::time::Instant::now()));
+        assert!(!s
+            .anim
+            .is_animating(SIDEBAR_FADE_KEY, std::time::Instant::now()));
 
         s.start_sidebar_fade();
         let now = std::time::Instant::now();
@@ -2080,16 +2438,25 @@ mod tests {
         // Evaluated at the tween's own start it reads ~0 (fully faded out) and
         // ramps to 1.0 by the end of the 240 ms window.
         let dur = mde_theme::motion::Motion::dialog_mount().duration;
-        assert!(s.anim.value(SIDEBAR_FADE_KEY, now, mde_theme::motion::Easing::EaseOut) < 0.25);
         assert!(
-            (s.anim
-                .value(SIDEBAR_FADE_KEY, now + dur, mde_theme::motion::Easing::EaseOut)
-                - 1.0)
+            s.anim
+                .value(SIDEBAR_FADE_KEY, now, mde_theme::motion::Easing::EaseOut)
+                < 0.25
+        );
+        assert!(
+            (s.anim.value(
+                SIDEBAR_FADE_KEY,
+                now + dur,
+                mde_theme::motion::Easing::EaseOut
+            ) - 1.0)
                 .abs()
                 < f32::EPSILON,
             "the rail is fully shown by the end of the window"
         );
-        assert!(s.animating(), "the subscription ticks while the rail eases in");
+        assert!(
+            s.animating(),
+            "the subscription ticks while the rail eases in"
+        );
     }
 
     #[test]
@@ -2101,7 +2468,8 @@ mod tests {
         s.a11y.motion = crate::prefs::Motion::Reduced;
         s.start_sidebar_fade();
         assert!(
-            !s.anim.is_animating(SIDEBAR_FADE_KEY, std::time::Instant::now()),
+            !s.anim
+                .is_animating(SIDEBAR_FADE_KEY, std::time::Instant::now()),
             "no crossfade tween is armed under reduce-motion"
         );
         assert_eq!(
