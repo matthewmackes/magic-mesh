@@ -14,7 +14,7 @@ use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use serde_json::json;
 
-use mackes_mesh_types::ddns::{self, DdnsConfig, RecordDef};
+use mackes_mesh_types::ddns::{self, DdnsConfig, RecordDef, SourceState};
 
 /// The DDNS responder — rooted at the shared workgroup root (the config home).
 #[derive(Debug, Clone)]
@@ -31,7 +31,17 @@ impl DdnsService {
 }
 
 /// Action verbs served on `action/ddns/<verb>`.
-pub const ACTION_VERBS: [&str; 4] = ["get-config", "set-config", "add-record", "remove-record"];
+///
+/// `record-status` (DDNS-EGRESS-4) is the reconcile-decision query: given a
+/// record name + the live source state, it returns the planned [`ddns::DdnsAction`]
+/// (reconnect rewrite / on-down policy) + the [`ddns::Reachability`] flag.
+pub const ACTION_VERBS: [&str; 5] = [
+    "get-config",
+    "set-config",
+    "add-record",
+    "remove-record",
+    "record-status",
+];
 
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -103,8 +113,44 @@ pub fn build_reply(svc: &DdnsService, verb: &str, req_body: Option<&str>) -> Str
                 Err(e) => err(format!("remove-record: save: {e}")),
             }
         }
+        "record-status" => {
+            let Some(body) = req_body else {
+                return err("record-status: missing {name,state[,last]} body".into());
+            };
+            let q: StatusQuery = match serde_json::from_str(body) {
+                Ok(q) => q,
+                Err(e) => return err(format!("record-status: bad json: {e}")),
+            };
+            let cfg = ddns::load(root);
+            let Some(record) = cfg.record.iter().find(|r| r.name == q.name) else {
+                return err(format!("record-status: no record named '{}'", q.name));
+            };
+            let action = ddns::plan_action(record, q.last.as_deref(), &q.state);
+            let reach = ddns::reachability(&q.state);
+            json!({
+                "ok": true,
+                "name": q.name,
+                "on_down": record.on_down,
+                "action": action,
+                "reachability": reach,
+                "reachability_label": reach.label(),
+            })
+            .to_string()
+        }
         other => err(format!("unknown ddns verb: {other}")),
     }
+}
+
+/// DDNS-EGRESS-4 — the `record-status` request body: a managed record's `name`,
+/// the live source `state` (from the VPN-GW exit-IP verifier / WAN check), and
+/// the `last`-published value (omit = never published). The reply carries the
+/// planned [`ddns::DdnsAction`] + the [`ddns::Reachability`] flag.
+#[derive(serde::Deserialize)]
+struct StatusQuery {
+    name: String,
+    state: SourceState,
+    #[serde(default)]
+    last: Option<String>,
 }
 
 /// Run the DDNS Bus responder loop until `should_stop`.
@@ -199,5 +245,66 @@ mod tests {
         let (_t, s) = service();
         assert!(build_reply(&s, "bogus", None).contains("unknown ddns verb"));
         assert!(build_reply(&s, "add-record", None).contains("missing RecordDef"));
+    }
+
+    // ── DDNS-EGRESS-4: record-status reconcile-decision query ──────────────
+
+    fn add_keep_record(s: &DdnsService) {
+        let add = build_reply(
+            s,
+            "add-record",
+            Some(
+                &json!({"name":"eagle-mullvad","source":"tunnel:mullvad-1","on_down":"keep"})
+                    .to_string(),
+            ),
+        );
+        assert!(add.contains("\"ok\":true"), "{add}");
+    }
+
+    #[test]
+    fn record_status_reconnect_rewrite_and_reachability() {
+        let (_t, s) = service();
+        add_keep_record(&s);
+        // Up with a NEW ip vs last → upsert (the reconnect rewrite); no port
+        // forward → identity-only ("port-forward only").
+        let body = json!({
+            "name": "eagle-mullvad",
+            "last": "1.2.3.4",
+            "state": {"state":"up","ip":"5.6.7.8","port_forward":false}
+        })
+        .to_string();
+        let r = build_reply(&s, "record-status", Some(&body));
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true));
+        assert_eq!(v["action"]["action"], "upsert");
+        assert_eq!(v["action"]["ip"], "5.6.7.8");
+        assert_eq!(v["reachability"], "identity-only");
+        assert_eq!(v["reachability_label"], "port-forward only");
+    }
+
+    #[test]
+    fn record_status_down_keep_with_kill_switch_parks_sentinel() {
+        let (_t, s) = service();
+        add_keep_record(&s);
+        // Down + kill-switch engaged → leak-coupling parks at the sentinel.
+        let body = json!({
+            "name": "eagle-mullvad",
+            "last": "1.2.3.4",
+            "state": {"state":"down","kill_switch":true}
+        })
+        .to_string();
+        let r = build_reply(&s, "record-status", Some(&body));
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["action"]["action"], "upsert");
+        assert_eq!(v["action"]["ip"], mackes_mesh_types::ddns::SENTINEL_ADDR);
+        assert_eq!(v["reachability"], "down");
+    }
+
+    #[test]
+    fn record_status_unknown_record_and_bad_body_error() {
+        let (_t, s) = service();
+        assert!(build_reply(&s, "record-status", None).contains("missing"));
+        let body = json!({"name":"ghost","state":{"state":"down"}}).to_string();
+        assert!(build_reply(&s, "record-status", Some(&body)).contains("no record named 'ghost'"));
     }
 }

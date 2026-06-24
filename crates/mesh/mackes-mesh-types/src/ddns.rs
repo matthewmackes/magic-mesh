@@ -183,6 +183,183 @@ pub fn do_delete_request(domain: &str, id: &str) -> (&'static str, String) {
     ("DELETE", format!("/v2/domains/{domain}/records/{id}"))
 }
 
+/// DDNS-EGRESS-4 — the **sentinel address** an `on_down = sentinel` record is
+/// parked at when its tunnel drops: RFC 5737 TEST-NET-1 (`192.0.2.1`), an address
+/// guaranteed never to be globally routed. Pointing a name here on a down tunnel
+/// keeps the record resolvable (so clients get a definite *unreachable* answer
+/// instead of NXDOMAIN) without ever leaking to a live/leaking exit.
+pub const SENTINEL_ADDR: &str = "192.0.2.1";
+
+/// DDNS-EGRESS-4 — the live state of a record's IP source, fed from the VPN-GW
+/// exit-IP verifier (VPN-GW-6) for a `tunnel:<id>` source or the WAN check for a
+/// `wan` source. This is what the reconcile decision ([`plan_action`]) consumes;
+/// the worker resolves it each tick and the responder accepts it as a status
+/// query input.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum SourceState {
+    /// The source is **up** with a verified address — publish/rewrite to it.
+    Up {
+        /// The verified current exit/WAN IP (A or AAAA literal).
+        ip: String,
+        /// Whether the tunnel can accept **inbound** connections at this IP —
+        /// `true` only when the provider exposes a forwarded port / dedicated IP.
+        /// A shared exit with no port-forward is identity-only (see
+        /// [`reachability`]).
+        ///
+        /// [`reachability`]: Self::reachability
+        #[serde(default)]
+        port_forward: bool,
+    },
+    /// The source is **down** (tunnel flapped / WAN check failed). The reconcile
+    /// decision then follows the record's [`OnDown`] policy, tied to whether the
+    /// VPN-GW kill-switch is actively blocking this tunnel's egress.
+    Down {
+        /// `true` when the VPN-GW kill-switch is blocking this source's egress —
+        /// the leak-proof state. With the kill-switch engaged, an
+        /// `on_down = keep` record is downgraded to a sentinel park so the name
+        /// never points at an IP that is (or could resume) leaking (the
+        /// leak-coupling rule, design Risks).
+        #[serde(default)]
+        kill_switch: bool,
+    },
+}
+
+/// DDNS-EGRESS-4 — how reachable a published name is, for the UI flag the
+/// acceptance calls out: a name whose tunnel can't accept inbound is **identity
+/// only** ("port-forward only") while still publishing its A record; a tunnel
+/// with a forwarded port / dedicated IP is fully `Inbound`-reachable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Reachability {
+    /// The exit accepts inbound — the reachability use works (port-forward / a
+    /// dedicated IP).
+    Inbound,
+    /// A shared exit with no port-forward — the record is an **identity** record
+    /// only; reachability is "port-forward only" / not inbound-reachable.
+    IdentityOnly,
+    /// The source is down — nothing is reachable right now.
+    Down,
+}
+
+impl Reachability {
+    /// The operator-facing label the UI shows for this reachability.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Inbound => "inbound",
+            Self::IdentityOnly => "port-forward only",
+            Self::Down => "down",
+        }
+    }
+}
+
+/// DDNS-EGRESS-4 — the reachability of a record given its source state: an up
+/// source with a forwarded port is [`Reachability::Inbound`], an up source
+/// without one is [`Reachability::IdentityOnly`] (still published, flagged
+/// "port-forward only"), and a down source is [`Reachability::Down`].
+#[must_use]
+pub const fn reachability(state: &SourceState) -> Reachability {
+    match state {
+        SourceState::Up {
+            port_forward: true, ..
+        } => Reachability::Inbound,
+        SourceState::Up {
+            port_forward: false,
+            ..
+        } => Reachability::IdentityOnly,
+        SourceState::Down { .. } => Reachability::Down,
+    }
+}
+
+/// DDNS-EGRESS-4 — the reconcile **decision** for one record: what the DNS writer
+/// should do given the record's last-published value and the live source state.
+/// Pure value the [`plan_action`] predicate yields; the daemon adapter turns it
+/// into the DO API call ([`do_upsert_request`] / [`do_delete_request`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "kebab-case")]
+pub enum DdnsAction {
+    /// Write (create-or-update) the A/AAAA record to `ip`. Emitted on
+    /// first-publish and on a **reconnect-with-new-IP** (the rewrite the
+    /// acceptance requires) — only when the value actually changed (no churn).
+    Upsert {
+        /// The address to publish.
+        ip: String,
+    },
+    /// Delete the record (`on_down = remove`, or a kill-switched `keep`/`remove`)
+    /// so no stale name points at a dead exit.
+    Remove,
+    /// Leave the record exactly as published — no DNS call. Either nothing
+    /// changed (the no-churn case) or `on_down = keep` on a clean (non-kill-
+    /// switched) down where the operator chose to retain the last value.
+    Noop,
+}
+
+/// DDNS-EGRESS-4 — the pure reconcile decision tying together **reconnect
+/// rewrite** and the **on-down policy**. Given a record, its `last`-published
+/// value (`None` = never published), and the live [`SourceState`], decide the
+/// [`DdnsAction`]:
+///
+/// - **Source up** → publish/rewrite to the verified IP, but only if it differs
+///   from `last` ([`needs_update`] — no churn). An already-correct record is a
+///   [`DdnsAction::Noop`]. This is the reconnect-with-new-IP rewrite: a new exit
+///   IP differs from `last`, so it is rewritten (within ~TTL).
+/// - **Source down** → follow [`OnDown`], **tied to the kill-switch**:
+///     - `remove` → [`DdnsAction::Remove`] (never leave a dead/leaking record).
+///     - `sentinel` → rewrite to [`SENTINEL_ADDR`] (a parked, unroutable address)
+///       — resolvable but definitively unreachable, never the dead exit.
+///     - `keep` → keep the last value **unless the kill-switch is engaged**, in
+///       which case it is downgraded to a sentinel park (the leak-coupling rule:
+///       a kill-switched tunnel must not keep a name pointed at an IP that is or
+///       could resume leaking). A never-published `keep`/`sentinel` on a down
+///       source has nothing to keep ⇒ [`DdnsAction::Noop`] / sentinel publish.
+#[must_use]
+pub fn plan_action(record: &RecordDef, last: Option<&str>, state: &SourceState) -> DdnsAction {
+    match state {
+        SourceState::Up { ip, .. } => {
+            if needs_update(last, ip) {
+                DdnsAction::Upsert { ip: ip.clone() }
+            } else {
+                DdnsAction::Noop
+            }
+        }
+        SourceState::Down { kill_switch } => match record.on_down {
+            OnDown::Remove => {
+                // Already absent ⇒ nothing to do; else delete it.
+                if last.is_none() {
+                    DdnsAction::Noop
+                } else {
+                    DdnsAction::Remove
+                }
+            }
+            OnDown::Sentinel => park_sentinel(last),
+            OnDown::Keep => {
+                if *kill_switch {
+                    // Leak-coupling: a kill-switched keep is downgraded to a park
+                    // so the name never resolves to the (blocked/leaking) exit.
+                    park_sentinel(last)
+                } else {
+                    // Retain the last value as-is (identity record) — no call.
+                    DdnsAction::Noop
+                }
+            }
+        },
+    }
+}
+
+/// Park a record at the [`SENTINEL_ADDR`] — an upsert only when it is not already
+/// there (no churn); a never-published record has nothing to point and stays a
+/// [`DdnsAction::Noop`] (don't create a record just to park it).
+fn park_sentinel(last: Option<&str>) -> DdnsAction {
+    match last {
+        None => DdnsAction::Noop,
+        Some(SENTINEL_ADDR) => DdnsAction::Noop,
+        Some(_) => DdnsAction::Upsert {
+            ip: SENTINEL_ADDR.to_string(),
+        },
+    }
+}
+
 /// Durable path for the DDNS config: `<workgroup_root>/ddns/config.toml`.
 #[must_use]
 pub fn config_path(workgroup_root: &std::path::Path) -> std::path::PathBuf {
@@ -311,5 +488,178 @@ mod tests {
     fn load_missing_is_default() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(load(tmp.path()), DdnsConfig::default());
+    }
+
+    // ── DDNS-EGRESS-4: reconnect rewrite + on-down policy ──────────────────
+
+    fn rec(on_down: OnDown) -> RecordDef {
+        RecordDef {
+            name: "{node}-{provider}".into(),
+            source: "tunnel:mullvad-1".into(),
+            on_down,
+        }
+    }
+
+    #[test]
+    fn up_publishes_first_then_rewrites_on_new_ip_no_churn() {
+        let r = rec(OnDown::Remove);
+        let up = |ip: &str| SourceState::Up {
+            ip: ip.into(),
+            port_forward: false,
+        };
+        // Never published → first publish.
+        assert_eq!(
+            plan_action(&r, None, &up("1.2.3.4")),
+            DdnsAction::Upsert {
+                ip: "1.2.3.4".into()
+            }
+        );
+        // Reconnect with a NEW IP → rewrite (within ~TTL).
+        assert_eq!(
+            plan_action(&r, Some("1.2.3.4"), &up("5.6.7.8")),
+            DdnsAction::Upsert {
+                ip: "5.6.7.8".into()
+            }
+        );
+        // Same IP already published → no churn.
+        assert_eq!(
+            plan_action(&r, Some("5.6.7.8"), &up("5.6.7.8")),
+            DdnsAction::Noop
+        );
+    }
+
+    #[test]
+    fn down_remove_deletes_a_published_record_but_noops_when_absent() {
+        let r = rec(OnDown::Remove);
+        let down = SourceState::Down { kill_switch: false };
+        // A live record on a down tunnel → delete it (no stale/leaking record).
+        assert_eq!(plan_action(&r, Some("1.2.3.4"), &down), DdnsAction::Remove);
+        // Nothing was ever published → nothing to remove.
+        assert_eq!(plan_action(&r, None, &down), DdnsAction::Noop);
+    }
+
+    #[test]
+    fn down_sentinel_parks_at_test_net_and_does_not_re_churn() {
+        let r = rec(OnDown::Sentinel);
+        let down = SourceState::Down { kill_switch: false };
+        // Park a live record at the sentinel (resolvable but unreachable).
+        assert_eq!(
+            plan_action(&r, Some("1.2.3.4"), &down),
+            DdnsAction::Upsert {
+                ip: SENTINEL_ADDR.into()
+            }
+        );
+        // Already parked → no churn.
+        assert_eq!(
+            plan_action(&r, Some(SENTINEL_ADDR), &down),
+            DdnsAction::Noop
+        );
+        // Never published → don't create a record just to park it.
+        assert_eq!(plan_action(&r, None, &down), DdnsAction::Noop);
+        // The sentinel is the RFC 5737 TEST-NET-1 address.
+        assert_eq!(SENTINEL_ADDR, "192.0.2.1");
+    }
+
+    #[test]
+    fn down_keep_retains_unless_kill_switch_engaged() {
+        let r = rec(OnDown::Keep);
+        // Clean down (kill-switch not engaged) → keep the last value (identity).
+        assert_eq!(
+            plan_action(
+                &r,
+                Some("1.2.3.4"),
+                &SourceState::Down { kill_switch: false }
+            ),
+            DdnsAction::Noop
+        );
+        // Kill-switch engaged → leak-coupling downgrades keep to a sentinel park,
+        // so the name never resolves to the blocked/leaking exit.
+        assert_eq!(
+            plan_action(
+                &r,
+                Some("1.2.3.4"),
+                &SourceState::Down { kill_switch: true }
+            ),
+            DdnsAction::Upsert {
+                ip: SENTINEL_ADDR.into()
+            }
+        );
+        // Kill-switched but already parked → no churn.
+        assert_eq!(
+            plan_action(
+                &r,
+                Some(SENTINEL_ADDR),
+                &SourceState::Down { kill_switch: true }
+            ),
+            DdnsAction::Noop
+        );
+    }
+
+    #[test]
+    fn reachability_flags_port_forward_only() {
+        // Up with a forwarded port → fully inbound-reachable.
+        assert_eq!(
+            reachability(&SourceState::Up {
+                ip: "1.2.3.4".into(),
+                port_forward: true,
+            }),
+            Reachability::Inbound
+        );
+        // Up without one → identity only ("port-forward only").
+        let id = reachability(&SourceState::Up {
+            ip: "1.2.3.4".into(),
+            port_forward: false,
+        });
+        assert_eq!(id, Reachability::IdentityOnly);
+        assert_eq!(id.label(), "port-forward only");
+        // Down → nothing reachable.
+        assert_eq!(
+            reachability(&SourceState::Down { kill_switch: false }),
+            Reachability::Down
+        );
+    }
+
+    #[test]
+    fn identity_only_source_still_publishes_the_record() {
+        // A shared exit with no port-forward is identity-only, but the A record
+        // is still published (the acceptance: publish the identity record
+        // regardless, flag reachability "port-forward only").
+        let r = rec(OnDown::Keep);
+        let state = SourceState::Up {
+            ip: "9.9.9.9".into(),
+            port_forward: false,
+        };
+        assert_eq!(reachability(&state), Reachability::IdentityOnly);
+        assert_eq!(
+            plan_action(&r, None, &state),
+            DdnsAction::Upsert {
+                ip: "9.9.9.9".into()
+            }
+        );
+    }
+
+    #[test]
+    fn source_state_round_trips_through_json() {
+        for state in [
+            SourceState::Up {
+                ip: "1.2.3.4".into(),
+                port_forward: true,
+            },
+            SourceState::Down { kill_switch: true },
+        ] {
+            let s = serde_json::to_string(&state).unwrap();
+            assert_eq!(serde_json::from_str::<SourceState>(&s).unwrap(), state);
+        }
+        // port_forward / kill_switch default to false when omitted.
+        let up: SourceState = serde_json::from_str(r#"{"state":"up","ip":"1.2.3.4"}"#).unwrap();
+        assert_eq!(
+            up,
+            SourceState::Up {
+                ip: "1.2.3.4".into(),
+                port_forward: false
+            }
+        );
+        let down: SourceState = serde_json::from_str(r#"{"state":"down"}"#).unwrap();
+        assert_eq!(down, SourceState::Down { kill_switch: false });
     }
 }
