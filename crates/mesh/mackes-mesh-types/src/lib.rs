@@ -43,6 +43,11 @@ pub mod route_trace;
 pub mod tags;
 /// VPN-GW-1 — the VPN tunnel definition model + pure wg-quick/openvpn helpers.
 pub mod vpn;
+/// VPN-GW-3 — selective egress: fwmark/ip-rule policy routing + nftables
+/// masquerade + a leak-proof kill-switch, with the Nebula overlay carved out so
+/// mesh traffic never tunnels. Pure argv builders applied by the `vpn_gw`
+/// responder on tunnel up/down.
+pub mod vpn_egress;
 /// VPN-GW-5 — first-class provider adapters (Mullvad/Proton/IVPN/Nord/Surfshark)
 /// + the generic "paste WG config" / "import .ovpn" config-generation paths.
 pub mod vpn_providers;
