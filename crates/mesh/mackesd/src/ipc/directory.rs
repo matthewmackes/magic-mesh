@@ -103,18 +103,24 @@ pub fn directory_row(
             .overlay_ip
             .clone()
             .or_else(|| overlay.map(|(ip, _)| ip.clone())),
-        // Role: the roster mirror when present (only on the signer),
-        // else derived from the capability tags so every peer shows a
-        // real role mesh-wide ("lighthouse" if tagged, else "peer") —
-        // was null on a peer, rendering "role: -" and breaking role
-        // filters/rollups.
-        "role": overlay.map(|(_, role)| role.clone()).unwrap_or_else(|| {
-            if tags.iter().any(|t| t.eq_ignore_ascii_case("lighthouse")) {
-                "lighthouse".to_string()
-            } else {
-                "peer".to_string()
-            }
-        }),
+        // Role precedence: the signer's roster mirror (authoritative, but
+        // only populated on the signer) → the peer's OWN replicated
+        // `rec.role` (self-declared, available mesh-wide under SUBSTRATE-V2)
+        // → capability-tag derivation → "peer". Trusting `rec.role` is what
+        // fixes HA-4: without it every peer collapsed to "peer", so
+        // `mesh_health_counts` saw 0 lighthouses and `ha_ok` never flipped
+        // even with ≥2 live lighthouses in the directory (found live on a
+        // 2-lighthouse mesh, 2026-06-23).
+        "role": overlay
+            .map(|(_, role)| role.clone())
+            .or_else(|| rec.role.clone().filter(|r| !r.trim().is_empty()))
+            .unwrap_or_else(|| {
+                if tags.iter().any(|t| t.eq_ignore_ascii_case("lighthouse")) {
+                    "lighthouse".to_string()
+                } else {
+                    "peer".to_string()
+                }
+            }),
         "tags": tags,
         "revision": {
             "head": head,
@@ -659,6 +665,50 @@ mod tests {
         assert_eq!(p["mde_version"], "4.2.1");
         // No roster DB → overlay/role are honest nulls.
         assert!(p["overlay_ip"].is_null());
+    }
+
+    #[test]
+    fn directory_row_propagates_the_peers_own_role_so_ha_counts_lighthouses() {
+        // Regression (found live 2026-06-23 on a 2-lighthouse mesh): a peer's
+        // replicated record carries role="lighthouse", but the directory row
+        // collapsed every peer to "peer" — it consulted only the signer-only
+        // roster mirror + capability tags, never `rec.role` — so
+        // `mesh_health_counts` reported 0 lighthouses and `ha_ok` never flipped.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let pdir = mackes_mesh_types::peers::peers_dir(root);
+        std::fs::create_dir_all(&pdir).unwrap();
+        let now = now_ms();
+        for h in ["lh-a", "lh-b"] {
+            write_peer_record(
+                &pdir,
+                &PeerRecord {
+                    hostname: h.into(),
+                    mde_version: Some("11.0.2".into()),
+                    last_seen_ms: now,
+                    health: "healthy".into(),
+                    descriptors: None,
+                    overlay_ip: Some("10.42.0.9".into()),
+                    role: Some("lighthouse".into()),
+                    external_addr: None,
+                },
+            )
+            .unwrap();
+        }
+        let svc = DirectoryService::new(root, None); // no roster DB (non-signer)
+        let dir = svc.build_directory(now);
+        // Each row reflects the peer's OWN declared role, not a flat "peer".
+        for p in dir["peers"].as_array().unwrap() {
+            assert_eq!(p["role"], "lighthouse", "rec.role must propagate mesh-wide");
+        }
+        // …and the HA counter sees both, so ha_ok flips at the 2-LH floor.
+        let (_total, _healthy, _deg, _unreach, _leader, lighthouses) =
+            svc.mesh_health_counts("lh-a", now);
+        assert_eq!(lighthouses, 2, "both live lighthouses are counted");
+        assert!(
+            !mackes_mesh_types::lighthouse::ha_degraded(lighthouses as usize),
+            "2 lighthouses meet the HA floor → not degraded"
+        );
     }
 
     #[test]
