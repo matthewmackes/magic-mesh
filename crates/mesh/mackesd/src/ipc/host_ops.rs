@@ -61,7 +61,7 @@ impl HostOpsService {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 8] = [
+pub const ACTION_VERBS: [&str; 10] = [
     "host-power",
     // DATACENTER-10 — the Hosts tab's impact preview + pool read.
     "host-impact",
@@ -72,6 +72,9 @@ pub const ACTION_VERBS: [&str; 8] = [
     // LIGHTHOUSE-6 — the Workbench Lighthouses tab's full-ops actions.
     "lighthouse-restart",
     "lighthouse-promote",
+    // DATACENTER-13 — the Network tab's L2 read + VLAN create.
+    "host-net",
+    "host-vlan-create",
 ];
 
 /// Responder poll interval.
@@ -146,6 +149,160 @@ pub fn parse_pool(pool_line: &str, master_line: &str, this_uuid: &str) -> (Strin
     let master = master_line.trim().to_string();
     let is_master = !master.is_empty() && master == this_uuid.trim();
     (pool, master, is_master)
+}
+
+/// DATACENTER-13 (Network tab) — one physical interface (PIF) on a dom0.
+///
+/// Decoded from the `host-net` read's `pif` block. The Network tab's L2 view
+/// renders these as the NIC inventory (device, MAC, the network it backs,
+/// carrier/management flags, and the VLAN tag when this PIF is a VLAN
+/// sub-interface).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PifInfo {
+    /// The PIF uuid.
+    pub uuid: String,
+    /// The NIC device name (e.g. `eth0`, or `eth0.100` for a VLAN PIF).
+    pub device: String,
+    /// The hardware MAC address.
+    pub mac: String,
+    /// The VLAN tag (`-1` = not a VLAN / untagged trunk).
+    pub vlan: i64,
+    /// Whether the link is up (`carrier`).
+    pub carrier: bool,
+    /// Whether this PIF carries the host's management interface.
+    pub management: bool,
+    /// The uuid of the XAPI network this PIF attaches to.
+    pub network: String,
+}
+
+/// DATACENTER-13 (Network tab) — one L2 network (bridge) on a dom0.
+///
+/// Decoded from the `host-net` read's `net` block. Mirrors the orchestrator's
+/// `event/dc/net/*` shape but carries the extra L2 detail (bridge + MTU + VLAN
+/// association) the Network tab's create/inspect flows need that the lightweight
+/// event omits.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct NetInfo {
+    /// The network uuid.
+    pub uuid: String,
+    /// The network's name-label.
+    pub name: String,
+    /// The Linux bridge (e.g. `xenbr0`).
+    pub bridge: String,
+    /// The MTU (bytes); `0` when the read returned none.
+    pub mtu: u32,
+}
+
+/// DATACENTER-13 — parse the `host-net` PIF block into [`PifInfo`]s.
+///
+/// Fed the pipe-delimited `uuid|device|mac|VLAN|carrier|management|network` lines.
+/// PURE. Skips blank/short lines; the booleans accept the XAPI `true`/`false`
+/// spelling (anything else is `false`); the VLAN parses as a signed integer (XAPI
+/// uses `-1` for a non-VLAN PIF), defaulting to `-1`.
+#[must_use]
+pub fn parse_pifs(output: &str) -> Vec<PifInfo> {
+    output
+        .lines()
+        .filter_map(|l| {
+            let mut p = l.splitn(7, '|');
+            let uuid = p.next()?.trim();
+            if uuid.is_empty() {
+                return None;
+            }
+            let device = p.next().unwrap_or("").trim();
+            let mac = p.next().unwrap_or("").trim();
+            let vlan = p.next().unwrap_or("").trim().parse::<i64>().unwrap_or(-1);
+            let carrier = p.next().unwrap_or("").trim() == "true";
+            let management = p.next().unwrap_or("").trim() == "true";
+            let network = p.next().unwrap_or("").trim();
+            Some(PifInfo {
+                uuid: uuid.to_string(),
+                device: device.to_string(),
+                mac: mac.to_string(),
+                vlan,
+                carrier,
+                management,
+                network: network.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// DATACENTER-13 — parse the `host-net` network block into [`NetInfo`]s.
+///
+/// Fed the pipe-delimited `uuid|name|bridge|MTU` lines. PURE. Skips blank/short
+/// lines; the MTU parses as a `u32`, defaulting to `0` when empty/unparseable.
+#[must_use]
+pub fn parse_nets(output: &str) -> Vec<NetInfo> {
+    output
+        .lines()
+        .filter_map(|l| {
+            let mut p = l.splitn(4, '|');
+            let uuid = p.next()?.trim();
+            if uuid.is_empty() {
+                return None;
+            }
+            let name = p.next().unwrap_or("").trim();
+            let bridge = p.next().unwrap_or("").trim();
+            let mtu = p.next().unwrap_or("").trim().parse::<u32>().unwrap_or(0);
+            Some(NetInfo {
+                uuid: uuid.to_string(),
+                name: name.to_string(),
+                bridge: bridge.to_string(),
+                mtu,
+            })
+        })
+        .collect()
+}
+
+/// DATACENTER-13 — validate a VLAN-create request and build its `xe` command pair.
+///
+/// Given the request fields `pif` / `vlan` / `network_name`, validates each and (on
+/// success) returns the ordered, fully-escaped two-step `xe` recipe. PURE so the
+/// validation + command shape are unit-testable without touching the network.
+///
+/// * `pif` — the trunk PIF uuid the VLAN rides on; XAPI-uuid-shaped
+///   (`[0-9a-f-]`), so it can never carry shell metacharacters;
+/// * `vlan` — the 802.1Q tag, `1..=4094`;
+/// * `network_name` — the new bridge network's name-label, `[A-Za-z0-9._-]` only.
+///
+/// The command is `pool-vlan-create`, the XAPI primitive that both makes the VLAN
+/// sub-interface and binds it to a fresh network across the pool. The new network
+/// is created first (`network-create`) and its uuid is substituted by the caller,
+/// so this returns the two-step recipe markers, not a single literal.
+///
+/// # Errors
+/// Returns `Err(<message>)` for an empty/metachar-bearing `pif`, a `vlan` outside
+/// `1..=4094`, or an empty/metachar-bearing `network_name`.
+pub fn vlan_create_commands(
+    pif: &str,
+    vlan: i64,
+    network_name: &str,
+) -> Result<(String, String), String> {
+    if pif.is_empty() {
+        return Err("empty pif".into());
+    }
+    if !pif.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err("pif contains invalid characters".into());
+    }
+    if !(1..=4094).contains(&vlan) {
+        return Err("vlan tag out of range (1..=4094)".into());
+    }
+    if network_name.is_empty() {
+        return Err("empty network_name".into());
+    }
+    if !network_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err("network_name contains invalid characters".into());
+    }
+    // Step 1: create the backing network (returns its uuid on stdout).
+    let create_net = format!("xe network-create name-label={network_name}");
+    // Step 2: bind the VLAN — `@NET@` is substituted with step-1's uuid by the
+    // handler once it has been created + uuid-validated.
+    let create_vlan = format!("xe pool-vlan-create pif-uuid={pif} vlan={vlan} network-uuid=@NET@");
+    Ok((create_net, create_vlan))
 }
 
 /// Run a remote `xe` command on a dom0 over SSH, returning the process result.
@@ -697,6 +854,156 @@ fn host_pool(req_body: Option<&str>) -> Result<(String, String, bool), String> {
     }
 }
 
+/// DATACENTER-13 (Network tab) — read a dom0's L2 inventory (networks, PIFs/NICs,
+/// and the VLAN tags) over ONE SSH round-trip, the data the Network tab's L2 view
+/// renders. Read-only: validates the dom0 against the allow-list FIRST (via
+/// [`resolve_dom0_uuid`]), then runs two minimal `xe` reads separated by a literal
+/// `@@` marker so the parse stays positional. Body `{ "dom0" }`. Returns
+/// `(nets, pifs)` or `Err(<message>)`.
+fn host_net(req_body: Option<&str>) -> Result<(Vec<NetInfo>, Vec<PifInfo>), String> {
+    let Some(body) = req_body else {
+        return Err("host-net: missing request body".into());
+    };
+    let req: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("host-net: bad json: {e}"))?;
+    let dom0 = req
+        .get("dom0")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let (key, _uuid) = resolve_dom0_uuid(dom0)?;
+    // Two pipe-delimited reads over one ssh session. The `xe` verbs + param names
+    // are all literal — no operator input reaches the remote shell here, so there
+    // is nothing to escape. `@@` separates the two blocks for positional parsing.
+    let remote = "for u in $(xe network-list params=uuid --minimal | tr , ' '); do \
+         echo \"$u|$(xe network-param-get uuid=$u param-name=name-label)|\
+$(xe network-param-get uuid=$u param-name=bridge)|\
+$(xe network-param-get uuid=$u param-name=MTU)\"; done; \
+         echo '@@'; \
+         for p in $(xe pif-list params=uuid --minimal | tr , ' '); do \
+         echo \"$p|$(xe pif-param-get uuid=$p param-name=device)|\
+$(xe pif-param-get uuid=$p param-name=MAC)|\
+$(xe pif-param-get uuid=$p param-name=VLAN)|\
+$(xe pif-param-get uuid=$p param-name=carrier)|\
+$(xe pif-param-get uuid=$p param-name=management)|\
+$(xe pif-param-get uuid=$p param-name=network-uuid)\"; done";
+    match ssh_xe_status(&key, dom0, remote) {
+        Ok(o) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let mut parts = stdout.split("@@");
+            let net_block = parts.next().unwrap_or("");
+            let pif_block = parts.next().unwrap_or("");
+            Ok((parse_nets(net_block), parse_pifs(pif_block)))
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let msg = stderr.trim();
+            Err(if msg.is_empty() {
+                "network read failed".into()
+            } else {
+                msg.to_string()
+            })
+        }
+        Err(e) => Err(format!("ssh failed: {e}")),
+    }
+}
+
+/// DATACENTER-13 (Network tab) — create a VLAN sub-interface on a dom0's trunk
+/// PIF, bound to a fresh pool-wide network. Confirm-gated + dom0-allow-listed.
+/// Body `{ "dom0", "pif", "vlan", "network_name", "confirm": true }`. Two `xe`
+/// steps over the mesh key: `network-create` (yields the new network uuid), then
+/// `pool-vlan-create` with that uuid substituted (and re-validated as XAPI-shaped
+/// before interpolation). Returns the new network uuid or `Err(<message>)`.
+fn host_vlan_create(req_body: Option<&str>) -> Result<String, String> {
+    let Some(body) = req_body else {
+        return Err("host-vlan-create: missing request body".into());
+    };
+    let req: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("host-vlan-create: bad json: {e}"))?;
+    let confirm = req
+        .get("confirm")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !confirm {
+        return Err("vlan-create requires confirm:true".into());
+    }
+    let dom0 = req
+        .get("dom0")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let pif = req
+        .get("pif")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let vlan = req
+        .get("vlan")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(-1);
+    let network_name = req
+        .get("network_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    // Validate every operator-supplied field + build the command recipe BEFORE any
+    // SSH — an invalid pif/vlan/name never reaches the network.
+    let (create_net, create_vlan) = vlan_create_commands(pif, vlan, network_name)?;
+    // Allow-list check + key (the uuid return is unused: we act on the PIF, not the
+    // host uuid, but resolving still proves the dom0 is reachable + allow-listed).
+    let (key, _uuid) = resolve_dom0_uuid(dom0)?;
+    // Step 1 — create the backing network; capture its uuid.
+    let net_uuid = match ssh_xe_status(&key, dom0, &create_net) {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let msg = stderr.trim();
+            return Err(if msg.is_empty() {
+                "network-create failed".into()
+            } else {
+                msg.to_string()
+            });
+        }
+        Err(e) => return Err(format!("ssh failed: {e}")),
+    };
+    if net_uuid.is_empty() {
+        return Err("network-create returned no uuid".into());
+    }
+    // The uuid is XAPI-generated; guard anyway before interpolation into step 2.
+    if !net_uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err("new network uuid contains invalid characters".into());
+    }
+    // Step 2 — bind the VLAN to that network.
+    let vlan_cmd = create_vlan.replace("@NET@", &net_uuid);
+    match ssh_xe_status(&key, dom0, &vlan_cmd) {
+        Ok(o) if o.status.success() => Ok(net_uuid),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let msg = stderr.trim();
+            Err(if msg.is_empty() {
+                "pool-vlan-create failed".into()
+            } else {
+                msg.to_string()
+            })
+        }
+        Err(e) => Err(format!("ssh failed: {e}")),
+    }
+}
+
+/// DATACENTER-13 (Network tab) — build the reply for the two network verbs
+/// (`host-net` read + `host-vlan-create`), factored out of [`build_reply`] so the
+/// top-level dispatcher stays a thin match. Returns the JSON reply string.
+fn net_build_reply(verb: &str, req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    match verb {
+        "host-net" => match host_net(req_body) {
+            Ok((nets, pifs)) => json!({ "ok": true, "nets": nets, "pifs": pifs }).to_string(),
+            Err(m) => err(m),
+        },
+        "host-vlan-create" => match host_vlan_create(req_body) {
+            Ok(network) => json!({ "ok": true, "network": network }).to_string(),
+            Err(m) => err(m),
+        },
+        other => err(format!("net_build_reply: unknown verb {other}")),
+    }
+}
+
 /// Build the reply for one `action/dc/<verb>` request.
 #[must_use]
 pub fn build_reply(svc: &HostOpsService, verb: &str, req_body: Option<&str>) -> String {
@@ -762,6 +1069,9 @@ pub fn build_reply(svc: &HostOpsService, verb: &str, req_body: Option<&str>) -> 
                 Err(m) => err(m),
             };
         }
+        // DATACENTER-13 — the Network tab's L2 read + VLAN create (factored out so
+        // `build_reply` stays a thin dispatcher; the two verbs reply-shape together).
+        "host-net" | "host-vlan-create" => return net_build_reply(verb, req_body),
         _ => return err("unknown dc verb".into()),
     }
     let Some(body) = req_body else {
@@ -875,6 +1185,11 @@ mod tests {
             action_topic("lighthouse-promote"),
             "action/dc/lighthouse-promote"
         );
+        assert_eq!(action_topic("host-net"), "action/dc/host-net");
+        assert_eq!(
+            action_topic("host-vlan-create"),
+            "action/dc/host-vlan-create"
+        );
         assert!(ACTION_VERBS.contains(&"host-power"));
         assert!(ACTION_VERBS.contains(&"host-impact"));
         assert!(ACTION_VERBS.contains(&"host-pool"));
@@ -883,6 +1198,84 @@ mod tests {
         assert!(ACTION_VERBS.contains(&"gateway-status"));
         assert!(ACTION_VERBS.contains(&"lighthouse-restart"));
         assert!(ACTION_VERBS.contains(&"lighthouse-promote"));
+        assert!(ACTION_VERBS.contains(&"host-net"));
+        assert!(ACTION_VERBS.contains(&"host-vlan-create"));
+    }
+
+    #[test]
+    fn parse_pifs_decodes_devices_vlans_and_flags() {
+        let raw = "uuid-0|eth0|aa:bb:cc:dd:ee:ff|-1|true|true|net-0\n\
+                   uuid-1|eth0.100|aa:bb:cc:dd:ee:ff|100|true|false|net-1\n\
+                   |skip-empty-uuid|x|0|false|false|x";
+        let pifs = parse_pifs(raw);
+        assert_eq!(pifs.len(), 2);
+        assert_eq!(pifs[0].device, "eth0");
+        assert_eq!(pifs[0].vlan, -1);
+        assert!(pifs[0].carrier && pifs[0].management);
+        assert_eq!(pifs[0].network, "net-0");
+        assert_eq!(pifs[1].device, "eth0.100");
+        assert_eq!(pifs[1].vlan, 100);
+        assert!(!pifs[1].management);
+    }
+
+    #[test]
+    fn parse_nets_decodes_bridge_and_mtu() {
+        let raw = "net-0|Pool-wide network|xenbr0|1500\n\
+                   net-1|Internal|xenbr1|\n\
+                   |skip||";
+        let nets = parse_nets(raw);
+        assert_eq!(nets.len(), 2);
+        assert_eq!(nets[0].bridge, "xenbr0");
+        assert_eq!(nets[0].mtu, 1500);
+        // Unparseable MTU defaults to 0, not an error.
+        assert_eq!(nets[1].mtu, 0);
+    }
+
+    #[test]
+    fn vlan_create_commands_validates_and_builds() {
+        // Happy path: a XAPI-shaped PIF uuid + a valid tag + a clean name.
+        let (net, vlan) =
+            vlan_create_commands("0a1b-2c3d", 100, "vlan100").expect("valid vlan-create");
+        assert!(net.contains("network-create name-label=vlan100"), "{net}");
+        assert!(
+            vlan.contains("pool-vlan-create pif-uuid=0a1b-2c3d vlan=100 network-uuid=@NET@"),
+            "{vlan}"
+        );
+        // A metachar-bearing PIF never builds a command.
+        assert!(vlan_create_commands("0a1b; reboot", 100, "vlan100").is_err());
+        // Out-of-range tags are rejected.
+        assert!(vlan_create_commands("0a1b", 0, "v").is_err());
+        assert!(vlan_create_commands("0a1b", 4095, "v").is_err());
+        // A metachar-bearing network name never builds a command.
+        assert!(vlan_create_commands("0a1b", 100, "v;rm -rf /").is_err());
+    }
+
+    #[test]
+    fn host_vlan_create_requires_confirm_true() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        let body = json!({ "dom0": "172.20.0.9", "pif": "0a1b", "vlan": 100,
+                           "network_name": "vlan100" })
+        .to_string();
+        let r = build_reply(&s, "host-vlan-create", Some(&body));
+        assert!(r.contains("vlan-create requires confirm:true"), "{r}");
+    }
+
+    #[test]
+    fn host_vlan_create_rejects_bad_fields_before_ssh() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        // A metachar-bearing pif is rejected before any allow-list/SSH step.
+        let body = json!({ "dom0": "172.20.0.9", "pif": "0a1b; reboot", "vlan": 100,
+                           "network_name": "vlan100", "confirm": true })
+        .to_string();
+        let r = build_reply(&s, "host-vlan-create", Some(&body));
+        assert!(r.contains("pif contains invalid characters"), "{r}");
+    }
+
+    #[test]
+    fn host_net_missing_body_errors() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        let r = build_reply(&s, "host-net", None);
+        assert!(r.contains("missing request body"), "{r}");
     }
 
     #[test]

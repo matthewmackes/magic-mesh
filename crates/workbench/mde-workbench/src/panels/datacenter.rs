@@ -30,7 +30,7 @@ use crate::controls::{variant_button, ButtonVariant};
 use crate::cosmic_compat::prelude::*;
 
 /// One datacenter resource as last seen on the Bus.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DcRow {
     /// "droplet" | "host" | "vm" | …
     pub kind: String,
@@ -65,6 +65,14 @@ pub struct DcRow {
     /// 1-minute load average on a host (`host` events carry `load`). Empty for
     /// non-host resources or when the metric was missing.
     pub load: String,
+    /// DATACENTER-13 (Network tab) — the resource's primary IPv4. Droplet events
+    /// carry `ip` (the public v4); host/VM events may carry an overlay/management
+    /// IP. Empty when the event didn't name one. Feeds the unified IP/DNS view.
+    pub ip: String,
+    /// DATACENTER-13 (Network tab) — the DigitalOcean region slug (`droplet`
+    /// events carry `region`, e.g. `nyc3`). Empty for non-droplet resources. Shown
+    /// in the unified IP/DNS view to correlate a public IP with its DO region.
+    pub region: String,
 }
 
 impl DcRow {
@@ -252,6 +260,16 @@ pub fn parse_dc_event(body: &str) -> Option<DcRow> {
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
+    let ip = v
+        .get("ip")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let region = v
+        .get("region")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     Some(DcRow {
         kind,
         id,
@@ -266,6 +284,8 @@ pub fn parse_dc_event(body: &str) -> Option<DcRow> {
         mem_total_mb,
         mem_free_mb,
         load,
+        ip,
+        region,
     })
 }
 
@@ -541,13 +561,70 @@ pub fn project_jobs(events: &[(String, String)]) -> Vec<JobRow> {
         .collect()
 }
 
+/// DATACENTER-13 (Network tab) — one overlay route as last seen on the Bus
+/// (`event/dc/route/xen/<dom0>`, published by the orchestrator's `publish_route`).
+/// The Network tab's overlay peer/route table renders these so the path the mesh
+/// takes to each dom0's XAPI (direct vs a relay hop, and any relay-down fallback)
+/// is visible operator state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouteRow {
+    /// The route target id — the dom0 IP this route reaches.
+    pub id: String,
+    /// The XAPI target label (`"xen"`).
+    pub target: String,
+    /// The chosen path: `"direct"` (on-LAN) or `"relay"` (a proxy-jump hop).
+    pub path: String,
+    /// The relay host when `path == "relay"`, else empty.
+    pub relay: String,
+    /// A human note on why this path was chosen / any relay-down fallback.
+    pub note: String,
+}
+
+/// Parse one `event/dc/route/xen/<dom0>` message body into a [`RouteRow`]. Returns
+/// `None` for unparseable JSON, a non-`route` kind, or a body missing `id`. Pure +
+/// testable. Mirrors [`parse_dc_event`]'s tolerant string extraction.
+#[must_use]
+pub fn parse_route_event(body: &str) -> Option<RouteRow> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if v.get("kind").and_then(|k| k.as_str()) != Some("route") {
+        return None;
+    }
+    let id = v.get("id")?.as_str()?.to_string();
+    let getter = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    Some(RouteRow {
+        id,
+        target: getter("target"),
+        path: getter("path"),
+        relay: getter("relay"),
+        note: getter("note"),
+    })
+}
+
+/// Project a set of `(topic, latest-body)` Bus reads into overlay route rows —
+/// `event/dc/route/*` topics only, sorted by target id for a stable table. Pure +
+/// testable.
+#[must_use]
+pub fn project_routes(events: &[(String, String)]) -> Vec<RouteRow> {
+    let mut routes: Vec<RouteRow> = events
+        .iter()
+        .filter(|(topic, _)| topic.starts_with("event/dc/route/"))
+        .filter_map(|(_, body)| parse_route_event(body))
+        .collect();
+    routes.sort_by(|a, b| a.id.cmp(&b.id));
+    routes
+}
+
 /// Project a set of `(topic, latest-body)` Bus reads into sorted rows — datacenter
 /// resources (`event/dc/*`), grouped by zone (prod first) then kind then name.
+/// Route events (`event/dc/route/*`) are excluded — they project to [`RouteRow`]s
+/// via [`project_routes`], not resource cards.
 #[must_use]
 pub fn project_rows(events: &[(String, String)]) -> Vec<DcRow> {
     let mut rows: Vec<DcRow> = events
         .iter()
-        .filter(|(topic, _)| topic.starts_with("event/dc/"))
+        .filter(|(topic, _)| {
+            topic.starts_with("event/dc/") && !topic.starts_with("event/dc/route/")
+        })
         .filter_map(|(_, body)| parse_dc_event(body))
         .collect();
     rows.sort_by(|a, b| {
@@ -597,19 +674,8 @@ pub fn group_by_host(rows: &[DcRow]) -> Vec<(DcRow, Vec<DcRow>)> {
         // Synthetic header — the empty `kind`/`id` is the sentinel the view keys
         // on to render the "Prod · DO / Gateway / unattached" label.
         let synthetic = DcRow {
-            kind: String::new(),
-            id: String::new(),
             name: "Prod · DO / Gateway".to_string(),
-            status: String::new(),
-            zone: String::new(),
-            host: String::new(),
-            size: String::new(),
-            used: String::new(),
-            bridge: String::new(),
-            cpu: String::new(),
-            mem_total_mb: String::new(),
-            mem_free_mb: String::new(),
-            load: String::new(),
+            ..DcRow::default()
         };
         groups.push((synthetic, orphans));
     }
@@ -1051,6 +1117,19 @@ pub struct DatacenterPanel {
     /// value (parsed into `storage_threshold_pct` on change; kept as text so an
     /// in-progress empty box doesn't snap to 0). Pure UI state.
     pub storage_threshold_input: String,
+    /// DATACENTER-13 (Network tab) — the overlay routes read off `event/dc/route/*`.
+    /// Rendered as the overlay peer/route table. Refreshed alongside `rows`.
+    pub routes: Vec<RouteRow>,
+    /// DATACENTER-13 (Network tab) — the decoded `host-net` L2 read for the active
+    /// dom0 (its networks + PIFs/NICs). `None` until "Read L2" returns. Populated by
+    /// the `action/dc/host-net` RPC; the L2 inventory renders off it.
+    pub net_read: Option<NetRead>,
+    /// DATACENTER-13 (Network tab) — the in-progress VLAN-create form. Fires
+    /// `action/dc/host-vlan-create`. A PIF card's "VLAN here" seeds `pif`+`dom0`.
+    pub vlan_create: VlanCreateForm,
+    /// DATACENTER-13 (Network tab) — the in-progress "Read L2" target dom0 box. The
+    /// "Read L2" button fires `action/dc/host-net` against it. Pure UI state.
+    pub net_read_dom0: String,
 }
 
 /// Top-level view selector for the datacenter panel.
@@ -1082,6 +1161,11 @@ pub enum ViewMode {
     /// The structured infrastructure map: resources grouped by their owning
     /// host/zone, with collapsible host group headers (DATACENTER-13).
     Topology,
+    /// DATACENTER-13 — the Network tab: the L2 inventory (networks / PIFs / VLANs
+    /// with a VLAN-create form), the overlay peer/route table (`event/dc/route/*`),
+    /// the interactive hosts↔networks↔VMs↔gateway topology map, and the unified
+    /// IP/DNS view correlating droplet public IPs ↔ DO regions ↔ overlay IPs.
+    Network,
 }
 
 impl ViewMode {
@@ -1099,6 +1183,7 @@ impl ViewMode {
             ViewMode::Tofu => "tofu",
             ViewMode::Audit => "audit",
             ViewMode::Topology => "topology",
+            ViewMode::Network => "network",
         }
     }
 
@@ -1116,6 +1201,7 @@ impl ViewMode {
             "tofu" => ViewMode::Tofu,
             "audit" => ViewMode::Audit,
             "topology" => ViewMode::Topology,
+            "network" => ViewMode::Network,
             // "overview" and anything unknown.
             _ => ViewMode::Overview,
         }
@@ -1200,6 +1286,101 @@ pub struct SnapScheduleForm {
     pub backup_target: String,
     /// The destination dom0 (must be allow-listed).
     pub dom0: String,
+}
+
+/// DATACENTER-13 (Network tab) — the in-progress VLAN-create form. The "Create
+/// VLAN" button packs it into the `action/dc/host-vlan-create` request (which runs
+/// `network-create` + `pool-vlan-create` on the dom0). Pure local UI state. A PIF
+/// card's "VLAN here" seeds `pif` + `dom0`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VlanCreateForm {
+    /// The trunk PIF uuid the VLAN rides on.
+    pub pif: String,
+    /// The 802.1Q VLAN tag (parsed to 1..=4094; blank/invalid blocks Create).
+    pub vlan: String,
+    /// The new bridge network's name-label (`[A-Za-z0-9._-]`).
+    pub network_name: String,
+    /// The destination dom0 (must be allow-listed).
+    pub dom0: String,
+}
+
+/// DATACENTER-13 (Network tab) — one L2 network decoded from a `host-net` reply's
+/// `nets` array (mirrors the daemon's `NetInfo`). Rendered in the L2 inventory.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct NetInfoRow {
+    /// The network uuid.
+    #[serde(default)]
+    pub uuid: String,
+    /// The name-label.
+    #[serde(default)]
+    pub name: String,
+    /// The Linux bridge.
+    #[serde(default)]
+    pub bridge: String,
+    /// The MTU (bytes); 0 when unknown.
+    #[serde(default)]
+    pub mtu: u32,
+}
+
+/// DATACENTER-13 (Network tab) — one PIF/NIC decoded from a `host-net` reply's
+/// `pifs` array (mirrors the daemon's `PifInfo`). Rendered as the NIC inventory.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct PifInfoRow {
+    /// The PIF uuid.
+    #[serde(default)]
+    pub uuid: String,
+    /// The NIC device name (e.g. `eth0`, `eth0.100`).
+    #[serde(default)]
+    pub device: String,
+    /// The hardware MAC.
+    #[serde(default)]
+    pub mac: String,
+    /// The VLAN tag (`-1` = untagged trunk / not a VLAN).
+    #[serde(default = "minus_one")]
+    pub vlan: i64,
+    /// Whether the link is up.
+    #[serde(default)]
+    pub carrier: bool,
+    /// Whether this PIF carries the management interface.
+    #[serde(default)]
+    pub management: bool,
+    /// The uuid of the XAPI network this PIF attaches to.
+    #[serde(default)]
+    pub network: String,
+}
+
+/// `serde` default for [`PifInfoRow::vlan`] — XAPI's "not a VLAN" sentinel.
+fn minus_one() -> i64 {
+    -1
+}
+
+/// DATACENTER-13 (Network tab) — the decoded `host-net` L2 read for the active
+/// dom0: its networks + PIFs/NICs. Populated when the operator clicks "Read L2" on
+/// the Network tab; the L2 inventory renders off it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct NetRead {
+    /// The L2 networks (bridges) on the dom0.
+    #[serde(default)]
+    pub nets: Vec<NetInfoRow>,
+    /// The physical interfaces (NICs) on the dom0, incl. VLAN sub-interfaces.
+    #[serde(default)]
+    pub pifs: Vec<PifInfoRow>,
+}
+
+/// DATACENTER-13 (Network tab) — which network-form field a `NetFieldChanged`
+/// targets. Keeps every network form-edit a single message variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetField {
+    /// The L2-read target dom0 (the "Read L2" box).
+    ReadDom0,
+    /// VLAN-create: trunk PIF uuid.
+    VlanPif,
+    /// VLAN-create: 802.1Q tag.
+    VlanTag,
+    /// VLAN-create: new network name-label.
+    VlanName,
+    /// VLAN-create: destination dom0.
+    VlanDom0,
 }
 
 /// DATACENTER-12 (Storage tab) — which storage form field a `StorageFieldChanged`
@@ -1537,6 +1718,12 @@ impl Default for DatacenterPanel {
             snap_schedule: SnapScheduleForm::default(),
             storage_threshold_pct: 85,
             storage_threshold_input: "85".to_string(),
+            // DATACENTER-13 (Network tab) — routes hydrate from the Bus on load; the
+            // L2 read + VLAN-create form hydrate from operator gestures.
+            routes: Vec::new(),
+            net_read: None,
+            vlan_create: VlanCreateForm::default(),
+            net_read_dom0: String::new(),
         }
     }
 }
@@ -1559,6 +1746,9 @@ pub struct DcLoad {
     /// verbs for the "Recent Tofu runs" run-log on the Overview view. Refreshed
     /// alongside `rows` on every load.
     pub jobs: Vec<JobRow>,
+    /// DATACENTER-13 — the overlay routes read off `event/dc/route/*`. Rendered as
+    /// the Network tab's overlay peer/route table. Refreshed alongside `rows`.
+    pub routes: Vec<RouteRow>,
 }
 
 #[derive(Debug, Clone)]
@@ -1901,6 +2091,31 @@ pub enum Message {
     SnapScheduleClicked,
     /// The `action/dc/snap-schedule` RPC came back. `Ok` carries a status line.
     SnapScheduleDone(Result<String, String>),
+    /// DATACENTER-13 (Network tab) — a network-form field changed (the "Read L2"
+    /// dom0 box or a VLAN-create field). Keeps every net form-edit one variant.
+    NetFieldChanged {
+        field: NetField,
+        value: String,
+    },
+    /// DATACENTER-13 — the "Read L2" button was clicked. Fires `action/dc/host-net`
+    /// against the target dom0 to read its networks + PIFs/VLANs.
+    NetReadClicked,
+    /// DATACENTER-13 — the `action/dc/host-net` RPC came back. `Ok` carries the
+    /// decoded L2 read (nets + pifs); `Err` the error text.
+    NetReadDone(Result<NetRead, String>),
+    /// DATACENTER-13 — a PIF card's "VLAN here" was clicked: seed the VLAN-create
+    /// form's `pif` + `dom0` so the operator only types the tag + name.
+    VlanTargetPif {
+        pif: String,
+        dom0: String,
+    },
+    /// DATACENTER-13 — the "Create VLAN" button was clicked. Fires
+    /// `action/dc/host-vlan-create` (network-create + pool-vlan-create) with
+    /// `confirm:true` after the form's tag is parsed/validated.
+    VlanCreateClicked,
+    /// DATACENTER-13 — the `action/dc/host-vlan-create` RPC came back. `Ok` carries
+    /// the new network uuid; `Err` the error text.
+    VlanCreateDone(Result<String, String>),
 }
 
 /// DATACENTER-11 (VMs tab) — which create-wizard field a `CreateFieldChanged`
@@ -1967,6 +2182,7 @@ impl DatacenterPanel {
                 self.promote = load.promote;
                 self.health = load.health;
                 self.jobs = load.jobs;
+                self.routes = load.routes;
                 self.busy = false;
                 self.load_error = None;
                 self.status.clear();
@@ -2849,6 +3065,74 @@ impl DatacenterPanel {
                 self.status = e;
                 Task::none()
             }
+            Message::NetFieldChanged { field, value } => {
+                match field {
+                    NetField::ReadDom0 => self.net_read_dom0 = value,
+                    NetField::VlanPif => self.vlan_create.pif = value,
+                    NetField::VlanTag => self.vlan_create.vlan = value,
+                    NetField::VlanName => self.vlan_create.network_name = value,
+                    NetField::VlanDom0 => self.vlan_create.dom0 = value,
+                }
+                Task::none()
+            }
+            Message::NetReadClicked => {
+                let dom0 = self.net_read_dom0.trim().to_string();
+                if dom0.is_empty() {
+                    self.status = "Read L2 needs a dom0 (an allow-listed Xen host).".into();
+                    return Task::none();
+                }
+                self.status = format!("Reading L2 inventory on {dom0}…");
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || host_net(&dom0))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("host-net task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::NetReadDone(result)),
+                )
+            }
+            Message::NetReadDone(Ok(read)) => {
+                self.status = format!(
+                    "L2 inventory: {} network(s), {} NIC(s).",
+                    read.nets.len(),
+                    read.pifs.len()
+                );
+                self.net_read = Some(read);
+                Task::none()
+            }
+            Message::NetReadDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
+            Message::VlanTargetPif { pif, dom0 } => {
+                // Seed the VLAN-create form from the clicked PIF card so the operator
+                // only types the tag + name.
+                self.vlan_create.pif = pif;
+                self.vlan_create.dom0 = dom0;
+                self.status = "VLAN target set — tag + name, then Create VLAN.".into();
+                Task::none()
+            }
+            Message::VlanCreateClicked => {
+                let form = self.vlan_create.clone();
+                self.status = "Creating VLAN…".into();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || vlan_create(&form))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("vlan-create task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::VlanCreateDone(result)),
+                )
+            }
+            Message::VlanCreateDone(Ok(net)) => {
+                self.status = format!("VLAN network created: {net}");
+                self.vlan_create = VlanCreateForm::default();
+                Task::none()
+            }
+            Message::VlanCreateDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
         }
     }
 
@@ -3378,6 +3662,404 @@ impl DatacenterPanel {
                 ..container::Style::default()
             })
             .into()
+    }
+
+    /// DATACENTER-13 (Network tab) — the whole Network tab: the L2 inventory
+    /// (networks / PIFs / VLANs + a VLAN-create form), the overlay peer/route table
+    /// (`event/dc/route/*`), the interactive hosts↔networks↔VMs↔gateway topology
+    /// map, and the unified IP/DNS view. Returns one column the view dispatch
+    /// pushes. mde-theme tokens only (§4).
+    fn network_tab_view(&self, palette: Palette) -> Element<'_, crate::Message> {
+        let mut col = column![text("Network").size(f32::from(spacing::BASE[5]))]
+            .spacing(f32::from(spacing::BASE[2]));
+
+        // ── Section 1: L2 — networks / PIFs / VLANs / NIC mgmt + create ──────────
+        col = col.push(text("L2 — networks · NICs · VLANs").size(f32::from(spacing::BASE[5])));
+        // Read L2 box + button (fires `action/dc/host-net` against a dom0).
+        let read_row = row![
+            text("Read L2 on dom0").colr(palette.text_muted.into_cosmic_color()),
+            text_input("dom0 IP (allow-listed Xen host)", &self.net_read_dom0)
+                .on_input(|v| crate::Message::Datacenter(Message::NetFieldChanged {
+                    field: NetField::ReadDom0,
+                    value: v,
+                }))
+                .width(Length::FillPortion(2)),
+            variant_button(
+                "Read L2".to_string(),
+                ButtonVariant::Secondary,
+                Some(crate::Message::Datacenter(Message::NetReadClicked)),
+                palette,
+            ),
+        ]
+        .spacing(f32::from(spacing::BASE[2]))
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+        col = col.push(self.storage_card(read_row.into(), palette));
+
+        // The networks/PIFs cards: prefer the live `host-net` read; otherwise fall
+        // back to the bridge rows already on the Bus (`kind == "net"`), so the tab
+        // is useful even before a Read L2.
+        if let Some(read) = &self.net_read {
+            col = col.push(text("Networks (live)").colr(palette.text_muted.into_cosmic_color()));
+            if read.nets.is_empty() {
+                col = col.push(
+                    text("No networks on this dom0.").colr(palette.text_muted.into_cosmic_color()),
+                );
+            } else {
+                for n in &read.nets {
+                    let mtu = if n.mtu == 0 {
+                        String::new()
+                    } else {
+                        format!(" · MTU {}", n.mtu)
+                    };
+                    col = col.push(
+                        self.storage_card(
+                            text(format!(
+                                "{} — bridge {}{}  ({})",
+                                if n.name.is_empty() { &n.uuid } else { &n.name },
+                                n.bridge,
+                                mtu,
+                                n.uuid
+                            ))
+                            .colr(palette.text.into_cosmic_color())
+                            .into(),
+                            palette,
+                        ),
+                    );
+                }
+            }
+            col = col.push(text("NICs (PIFs)").colr(palette.text_muted.into_cosmic_color()));
+            if read.pifs.is_empty() {
+                col = col.push(
+                    text("No PIFs on this dom0.").colr(palette.text_muted.into_cosmic_color()),
+                );
+            } else {
+                let dom0 = self.net_read_dom0.trim().to_string();
+                for p in &read.pifs {
+                    col = col.push(self.pif_card_view(p, &dom0, palette));
+                }
+            }
+        } else {
+            // Bus-fallback: the lightweight `kind == "net"` rows.
+            let nets: Vec<&DcRow> = self
+                .rows
+                .iter()
+                .filter(|r| r.kind == "net" && r.matches_filter(&self.filter))
+                .collect();
+            if nets.is_empty() {
+                col = col.push(
+                    text(
+                        "No networks on the Bus yet. Set `MCNF_XEN_DOM0S` on the host \
+                         source, or click Read L2 for the full PIF/VLAN inventory.",
+                    )
+                    .colr(palette.text_muted.into_cosmic_color()),
+                );
+            } else {
+                for n in nets {
+                    let bridge = if n.bridge.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · bridge {}", n.bridge)
+                    };
+                    col = col.push(
+                        self.storage_card(
+                            text(format!(
+                                "{} — {}{} ({})",
+                                if n.name.is_empty() { &n.id } else { &n.name },
+                                n.status,
+                                bridge,
+                                n.id
+                            ))
+                            .colr(palette.text.into_cosmic_color())
+                            .into(),
+                            palette,
+                        ),
+                    );
+                }
+            }
+        }
+        // VLAN-create form.
+        col = col.push(self.vlan_create_form(palette));
+
+        // ── Section 2: overlay peer / route management ───────────────────────────
+        col = col.push(self.overlay_routes_view(palette));
+
+        // ── Section 3: interactive topology map (hosts↔networks↔VMs↔gateway) ─────
+        col = col.push(self.network_topology_view(palette));
+
+        // ── Section 4: unified IP / DNS view ─────────────────────────────────────
+        col = col.push(self.ip_dns_view(palette));
+
+        col.into()
+    }
+
+    /// DATACENTER-13 (Network tab) — one PIF rendered as a NIC card: device, MAC,
+    /// VLAN tag, carrier/management flags, its network, plus a "VLAN here" action
+    /// that seeds the VLAN-create form from this PIF. mde-theme tokens only (§4).
+    fn pif_card_view(
+        &self,
+        p: &PifInfoRow,
+        dom0: &str,
+        palette: Palette,
+    ) -> Element<'_, crate::Message> {
+        // The carrier dot reads liveness at a glance: success up, danger down.
+        let dot_token = if p.carrier {
+            palette.success
+        } else {
+            palette.danger
+        };
+        let vlan = if p.vlan < 0 {
+            "trunk".to_string()
+        } else {
+            format!("VLAN {}", p.vlan)
+        };
+        let mgmt = if p.management { " · mgmt" } else { "" };
+        let header = row![
+            text("\u{25cf}").colr(dot_token.into_cosmic_color()),
+            text(format!("{} — {} · {}{}", p.device, p.mac, vlan, mgmt))
+                .colr(palette.text.into_cosmic_color())
+                .width(Length::FillPortion(4)),
+            variant_button(
+                "VLAN here".to_string(),
+                ButtonVariant::Secondary,
+                Some(crate::Message::Datacenter(Message::VlanTargetPif {
+                    pif: p.uuid.clone(),
+                    dom0: dom0.to_string(),
+                })),
+                palette,
+            ),
+        ]
+        .spacing(f32::from(spacing::BASE[2]))
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+        let meta = text(format!("net {} · pif {}", p.network, p.uuid))
+            .colr(palette.text_muted.into_cosmic_color());
+        self.storage_card(
+            column![header, meta]
+                .spacing(f32::from(spacing::BASE[1]))
+                .into(),
+            palette,
+        )
+    }
+
+    /// DATACENTER-13 (Network tab) — the VLAN-create form: trunk PIF + tag + new
+    /// network name + dom0, packed into `action/dc/host-vlan-create`. A PIF card's
+    /// "VLAN here" seeds pif+dom0. mde-theme tokens only (§4).
+    fn vlan_create_form(&self, palette: Palette) -> Element<'_, crate::Message> {
+        let field = |placeholder: &str, value: &str, f: NetField| {
+            text_input(placeholder, value)
+                .on_input(move |v| {
+                    crate::Message::Datacenter(Message::NetFieldChanged { field: f, value: v })
+                })
+                .width(Length::FillPortion(1))
+        };
+        let inputs = row![
+            field("trunk PIF uuid", &self.vlan_create.pif, NetField::VlanPif),
+            field(
+                "VLAN tag (1..4094)",
+                &self.vlan_create.vlan,
+                NetField::VlanTag
+            ),
+            field(
+                "new network name",
+                &self.vlan_create.network_name,
+                NetField::VlanName,
+            ),
+            field("dom0", &self.vlan_create.dom0, NetField::VlanDom0),
+        ]
+        .spacing(f32::from(spacing::BASE[1]));
+        let create_btn = variant_button(
+            "Create VLAN".to_string(),
+            ButtonVariant::Primary,
+            Some(crate::Message::Datacenter(Message::VlanCreateClicked)),
+            palette,
+        );
+        let card = column![
+            text("Create VLAN — network-create + pool-vlan-create")
+                .colr(palette.text.into_cosmic_color()),
+            inputs,
+            create_btn,
+        ]
+        .spacing(f32::from(spacing::BASE[2]));
+        self.storage_card(card.into(), palette)
+    }
+
+    /// DATACENTER-13 (Network tab) — the overlay peer/route table: one row per
+    /// `event/dc/route/*` route, showing the dom0 it reaches, the path (direct vs a
+    /// relay hop), the relay, and the note. The path glyph + token signal direct
+    /// (success) vs relay (warning) at a glance. mde-theme tokens only (§4).
+    fn overlay_routes_view(&self, palette: Palette) -> Element<'_, crate::Message> {
+        let mut col = column![text("Overlay — peers & routes").size(f32::from(spacing::BASE[5]))]
+            .spacing(f32::from(spacing::BASE[1]));
+        if self.routes.is_empty() {
+            col = col.push(
+                text(
+                    "No overlay routes yet. The orchestrator publishes \
+                     `event/dc/route/xen/*` as it chooses each dom0's XAPI path \
+                     (direct on-LAN vs a relay hop).",
+                )
+                .colr(palette.text_muted.into_cosmic_color()),
+            );
+            return self.storage_card(col.into(), palette);
+        }
+        for r in &self.routes {
+            let (glyph, token) = if r.path == "relay" {
+                ("\u{2192}\u{2192}", palette.warning)
+            } else {
+                ("\u{2192}", palette.success)
+            };
+            let relay = if r.relay.is_empty() {
+                String::new()
+            } else {
+                format!(" via {}", r.relay)
+            };
+            let note = if r.note.is_empty() {
+                String::new()
+            } else {
+                format!("  — {}", r.note)
+            };
+            let line = row![
+                text(glyph.to_string())
+                    .colr(token.into_cosmic_color())
+                    .width(Length::FillPortion(1)),
+                text(format!("{} ({})", r.id, r.target))
+                    .colr(palette.text.into_cosmic_color())
+                    .width(Length::FillPortion(3)),
+                text(format!("{}{}{}", r.path, relay, note))
+                    .colr(palette.text_muted.into_cosmic_color())
+                    .width(Length::FillPortion(4)),
+            ]
+            .spacing(f32::from(spacing::BASE[2]));
+            col = col.push(line);
+        }
+        self.storage_card(col.into(), palette)
+    }
+
+    /// DATACENTER-13 (Network tab) — the interactive hosts↔networks↔VMs↔gateway
+    /// topology map. Reuses the collapsible host-group tree (the same
+    /// expand/collapse `HeaderClicked` interaction as the Topology tab) but lenses
+    /// each host group down to its NETWORK fabric: the host's nets/bridges, the VMs
+    /// attached to it, and the synthetic Prod/Gateway group. mde-theme tokens (§4).
+    fn network_topology_view(&self, palette: Palette) -> Element<'_, crate::Message> {
+        let mut col =
+            column![
+                text("Topology — hosts \u{2194} networks \u{2194} VMs \u{2194} gateway")
+                    .size(f32::from(spacing::BASE[5]))
+            ]
+            .spacing(f32::from(spacing::BASE[1]));
+        // Keep only network-relevant rows in each host group: nets, VMs, gateway,
+        // droplets (their public IPs), plus the host headers themselves.
+        let filtered: Vec<DcRow> = self
+            .rows
+            .iter()
+            .filter(|r| {
+                r.matches_filter(&self.filter)
+                    && matches!(
+                        r.kind.as_str(),
+                        "host" | "net" | "vm" | "gateway" | "droplet"
+                    )
+            })
+            .cloned()
+            .collect();
+        let groups = group_by_host(&filtered);
+        if groups.is_empty() {
+            col = col.push(
+                text(
+                    "No network topology yet. Hosts, their networks/bridges, the VMs \
+                     attached, and the gateway appear here as the orchestrator \
+                     publishes them.",
+                )
+                .colr(palette.text_muted.into_cosmic_color()),
+            );
+            return self.storage_card(col.into(), palette);
+        }
+        for (header, children) in &groups {
+            let key = header.id.clone();
+            let is_open = self.expanded.contains(&key);
+            col = col.push(topology_header_view(
+                header,
+                children.len(),
+                is_open,
+                palette,
+            ));
+            if is_open {
+                let n = children.len();
+                for (i, child) in children.iter().enumerate() {
+                    let last = i + 1 == n;
+                    col = col.push(topology_child_view(child, last, palette));
+                }
+            }
+        }
+        self.storage_card(col.into(), palette)
+    }
+
+    /// DATACENTER-13 (Network tab) — the unified IP / DNS view. Correlates the
+    /// public/overlay IPs the Bus carries (droplet `ip` + DO `region`, and any
+    /// host/VM `ip`) into one table so an operator sees the fleet's addressing in
+    /// one place: UniFi-lease ↔ DO-DNS ↔ overlay correlation. Rows with no IP are
+    /// omitted. mde-theme tokens only (§4).
+    fn ip_dns_view(&self, palette: Palette) -> Element<'_, crate::Message> {
+        let mut col = column![text("Unified IP / DNS").size(f32::from(spacing::BASE[5]))]
+            .spacing(f32::from(spacing::BASE[1]));
+        // Header row.
+        col = col.push(
+            row![
+                text("resource")
+                    .colr(palette.text_muted.into_cosmic_color())
+                    .width(Length::FillPortion(3)),
+                text("IPv4")
+                    .colr(palette.text_muted.into_cosmic_color())
+                    .width(Length::FillPortion(2)),
+                text("region / zone")
+                    .colr(palette.text_muted.into_cosmic_color())
+                    .width(Length::FillPortion(2)),
+                text("kind")
+                    .colr(palette.text_muted.into_cosmic_color())
+                    .width(Length::FillPortion(1)),
+            ]
+            .spacing(f32::from(spacing::BASE[2])),
+        );
+        let addressed: Vec<&DcRow> = self
+            .rows
+            .iter()
+            .filter(|r| !r.ip.is_empty() && r.matches_filter(&self.filter))
+            .collect();
+        if addressed.is_empty() {
+            col = col.push(
+                text(
+                    "No addressed resources yet. Droplet public IPs (+ DO region), \
+                     and host/VM overlay IPs appear here as the orchestrator \
+                     publishes them.",
+                )
+                .colr(palette.text_muted.into_cosmic_color()),
+            );
+            return self.storage_card(col.into(), palette);
+        }
+        for r in addressed {
+            let label = if r.name.is_empty() { &r.id } else { &r.name };
+            // Region (droplets) falls back to the zone label for non-DO rows.
+            let locus = if r.region.is_empty() {
+                r.zone_label().to_string()
+            } else {
+                r.region.clone()
+            };
+            col = col.push(
+                row![
+                    text(label.clone())
+                        .colr(palette.text.into_cosmic_color())
+                        .width(Length::FillPortion(3)),
+                    text(r.ip.clone())
+                        .colr(palette.text.into_cosmic_color())
+                        .width(Length::FillPortion(2)),
+                    text(locus)
+                        .colr(palette.text_muted.into_cosmic_color())
+                        .width(Length::FillPortion(2)),
+                    text(r.kind.clone())
+                        .colr(palette.text_muted.into_cosmic_color())
+                        .width(Length::FillPortion(1)),
+                ]
+                .spacing(f32::from(spacing::BASE[2])),
+            );
+        }
+        self.storage_card(col.into(), palette)
     }
 
     /// DATACENTER-11 (VMs tab) — the multi-select bulk toolbar: select-all (visible)
@@ -3996,6 +4678,7 @@ impl DatacenterPanel {
             mode_btn("Hosts", ViewMode::Hosts),
             mode_btn("VMs", ViewMode::Vms),
             mode_btn("Storage", ViewMode::Storage),
+            mode_btn("Network", ViewMode::Network),
             mode_btn("Topology", ViewMode::Topology),
             mode_btn("Resources", ViewMode::Zone),
             mode_btn("Tofu", ViewMode::Tofu),
@@ -4469,6 +5152,9 @@ impl DatacenterPanel {
                         }
                     }
                 }
+            }
+            ViewMode::Network => {
+                col = col.push(self.network_tab_view(palette));
             }
             ViewMode::Zone => {
                 if self.rows.is_empty() {
@@ -5512,6 +6198,7 @@ fn read_dc_events() -> Result<DcLoad, String> {
         promote: project_promote(&events),
         health: project_health(&events),
         jobs: project_jobs(&events),
+        routes: project_routes(&events),
     })
 }
 
@@ -6270,6 +6957,61 @@ fn host_pool_rpc(dom0: &str) -> Result<(String, HostPool), String> {
     Err(format!("unexpected host-pool reply: {raw}"))
 }
 
+/// DATACENTER-13 (Network tab) — fire the read-only `action/dc/host-net` RPC for a
+/// dom0's L2 inventory (networks + PIFs/NICs + VLAN tags) and decode the reply into
+/// a [`NetRead`]. The reply is `{"ok":true,"nets":[..],"pifs":[..]}` (→ the decoded
+/// read) or `{"error":".."}` (→ the error text). Uses the shared [`dc_rpc`] round
+/// trip; a read of the whole NIC/network table over SSH may be slow, so the timeout
+/// is generous.
+fn host_net(dom0: &str) -> Result<NetRead, String> {
+    if dom0.trim().is_empty() {
+        return Err("dom0 is required".into());
+    }
+    let body = serde_json::json!({ "dom0": dom0.trim() }).to_string();
+    let v = dc_rpc("host-net", &body, Duration::from_secs(60))?;
+    // The reply carries `nets` + `pifs` arrays; decode them into the panel rows.
+    serde_json::from_value::<NetRead>(v.clone())
+        .map_err(|e| format!("bad host-net reply: {e} ({v})"))
+}
+
+/// DATACENTER-13 (Network tab) — fire `action/dc/host-vlan-create` (which runs
+/// `network-create` then `pool-vlan-create`) with `confirm:true`. The tag box is
+/// parsed to an integer in `1..=4094` before the RPC; the daemon re-validates every
+/// field server-side before any SSH. The reply is `{"ok":true,"network":".."}`
+/// (the new network uuid) or `{"error":".."}` (the error text).
+fn vlan_create(form: &VlanCreateForm) -> Result<String, String> {
+    if form.pif.trim().is_empty() {
+        return Err("trunk PIF uuid is required".into());
+    }
+    if form.network_name.trim().is_empty() {
+        return Err("network name is required".into());
+    }
+    if form.dom0.trim().is_empty() {
+        return Err("dom0 is required".into());
+    }
+    let vlan: i64 = form
+        .vlan
+        .trim()
+        .parse()
+        .map_err(|_| "VLAN tag must be an integer (1..=4094)".to_string())?;
+    if !(1..=4094).contains(&vlan) {
+        return Err("VLAN tag out of range (1..=4094)".into());
+    }
+    let body = serde_json::json!({
+        "dom0": form.dom0.trim(),
+        "pif": form.pif.trim(),
+        "vlan": vlan,
+        "network_name": form.network_name.trim(),
+        "confirm": true,
+    })
+    .to_string();
+    let v = dc_rpc("host-vlan-create", &body, Duration::from_secs(120))?;
+    if let Some(net) = v.get("network").and_then(serde_json::Value::as_str) {
+        return Ok(net.to_string());
+    }
+    Err(format!("unexpected host-vlan-create reply: {v}"))
+}
+
 /// DATACENTER-10 — launch a local `cosmic-term ssh root@<dom0>` console to a host.
 /// A pure local terminal launch (never touches the daemon), mirroring the shared
 /// [`crate::launcher`]'s detach contract: the spawn succeeding IS the success
@@ -6345,6 +7087,7 @@ mod tests {
             ViewMode::Tofu,
             ViewMode::Audit,
             ViewMode::Topology,
+            ViewMode::Network,
         ] {
             assert_eq!(
                 ViewMode::from_slug(mode.slug()),
@@ -6617,17 +7360,10 @@ mod tests {
         let zero = DcRow {
             kind: "sr".into(),
             id: "x".into(),
-            name: String::new(),
-            status: String::new(),
             zone: "dev".into(),
-            host: String::new(),
             size: "0".into(),
             used: "0".into(),
-            bridge: String::new(),
-            cpu: String::new(),
-            mem_total_mb: String::new(),
-            mem_free_mb: String::new(),
-            load: String::new(),
+            ..DcRow::default()
         };
         assert_eq!(zero.capacity_readout(), None);
         let garbage = DcRow {
@@ -6642,17 +7378,11 @@ mod tests {
         DcRow {
             kind: "sr".into(),
             id: id.into(),
-            name: String::new(),
-            status: String::new(),
             zone: "dev".into(),
             host: "172.20.0.9".into(),
             size: size.into(),
             used: used.into(),
-            bridge: String::new(),
-            cpu: String::new(),
-            mem_total_mb: String::new(),
-            mem_free_mb: String::new(),
-            load: String::new(),
+            ..DcRow::default()
         }
     }
 
@@ -7428,6 +8158,7 @@ mod tests {
             promote: Vec::new(),
             health: Vec::new(),
             jobs: Vec::new(),
+            routes: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert_eq!(p.audit.len(), 1);
@@ -7616,6 +8347,7 @@ mod tests {
             promote: Vec::new(),
             health: Vec::new(),
             jobs: Vec::new(),
+            routes: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert!(p.expanded.contains("172.20.0.9"));
@@ -7822,6 +8554,7 @@ mod tests {
             }],
             health: Vec::new(),
             jobs: Vec::new(),
+            routes: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert_eq!(p.promote.len(), 1);
@@ -7957,6 +8690,7 @@ mod tests {
                 detail: String::new(),
             }],
             jobs: Vec::new(),
+            routes: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert_eq!(p.health.len(), 1);
@@ -8147,6 +8881,7 @@ mod tests {
                 ulid: "01J0001".into(),
                 status: "ok".into(),
             }],
+            routes: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert_eq!(p.jobs.len(), 1);
@@ -8200,14 +8935,7 @@ mod tests {
             name: name.into(),
             status: status.into(),
             zone: zone.into(),
-            host: String::new(),
-            size: String::new(),
-            used: String::new(),
-            bridge: String::new(),
-            cpu: String::new(),
-            mem_total_mb: String::new(),
-            mem_free_mb: String::new(),
-            load: String::new(),
+            ..DcRow::default()
         }
     }
 
@@ -8899,5 +9627,167 @@ mod tests {
         // return a status line either way (never panic).
         let s = vm_console_open("https://172.20.0.9/console?uuid=abcd");
         assert!(s.contains("172.20.0.9"));
+    }
+
+    // ── DATACENTER-13 (Network tab) ──────────────────────────────────────────────
+
+    #[test]
+    fn network_view_mode_round_trips_and_is_selectable() {
+        assert_eq!(
+            ViewMode::from_slug(ViewMode::Network.slug()),
+            ViewMode::Network
+        );
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::ViewMode(ViewMode::Network));
+        assert_eq!(p.view_mode, ViewMode::Network);
+    }
+
+    #[test]
+    fn route_events_project_and_are_excluded_from_rows() {
+        let events = vec![
+            (
+                "event/dc/route/xen/172.20.0.9".to_string(),
+                r#"{"kind":"route","id":"172.20.0.9","target":"xen","path":"relay","relay":"10.0.0.2","note":"off-LAN"}"#.to_string(),
+            ),
+            (
+                "event/dc/route/xen/172.20.0.10".to_string(),
+                r#"{"kind":"route","id":"172.20.0.10","target":"xen","path":"direct","relay":"","note":""}"#.to_string(),
+            ),
+            (
+                "event/dc/droplet/1".to_string(),
+                r#"{"kind":"droplet","id":"1","name":"lh","status":"active","zone":"prod","ip":"203.0.113.5","region":"nyc3"}"#.to_string(),
+            ),
+        ];
+        let routes = project_routes(&events);
+        assert_eq!(routes.len(), 2);
+        // Sorted by id lexicographically: "172.20.0.10" < "172.20.0.9" ('1' < '9').
+        assert_eq!(routes[0].id, "172.20.0.10");
+        assert_eq!(routes[0].path, "direct");
+        // The relay route (`.9`) carries its relay + note.
+        let relay = routes
+            .iter()
+            .find(|r| r.id == "172.20.0.9")
+            .expect("relay route present");
+        assert_eq!(relay.path, "relay");
+        assert_eq!(relay.relay, "10.0.0.2");
+        // Route events never leak into the resource card rows.
+        let rows = project_rows(&events);
+        assert!(rows.iter().all(|r| r.kind != "route"));
+        // …but the droplet (with its ip + region) still projects.
+        let d = rows.iter().find(|r| r.kind == "droplet").expect("droplet");
+        assert_eq!(d.ip, "203.0.113.5");
+        assert_eq!(d.region, "nyc3");
+    }
+
+    #[test]
+    fn parse_route_event_rejects_non_route_kinds() {
+        // A droplet body is not a route — `parse_route_event` returns None.
+        assert!(parse_route_event(r#"{"kind":"droplet","id":"1","name":"x"}"#).is_none());
+        // Garbage / missing id → None, never a panic.
+        assert!(parse_route_event("not json").is_none());
+        assert!(parse_route_event(r#"{"kind":"route"}"#).is_none());
+    }
+
+    #[test]
+    fn network_tab_renders_all_four_sections_without_panicking() {
+        let mut p = DatacenterPanel::new();
+        // L2 (a net row), a VM + host for the topology lens, and an addressed
+        // droplet for the IP/DNS view + a route for the overlay table.
+        let _ = p.update(Message::Loaded(Ok(DcLoad {
+            rows: project_rows(&[
+                (
+                    "event/dc/host/172.20.0.9".into(),
+                    r#"{"kind":"host","id":"172.20.0.9","name":"dom0","status":"up","zone":"dev"}"#.into(),
+                ),
+                (
+                    "event/dc/net/0".into(),
+                    r#"{"kind":"net","id":"net-0","name":"Pool-wide","status":"up","zone":"dev","bridge":"xenbr0","host":"172.20.0.9"}"#.into(),
+                ),
+                (
+                    "event/dc/vm/aaaa".into(),
+                    r#"{"kind":"vm","id":"aaaa","name":"web","status":"running","zone":"dev","host":"172.20.0.9"}"#.into(),
+                ),
+                (
+                    "event/dc/droplet/1".into(),
+                    r#"{"kind":"droplet","id":"1","name":"lh","status":"active","zone":"prod","ip":"203.0.113.5","region":"nyc3"}"#.into(),
+                ),
+            ]),
+            routes: project_routes(&[(
+                "event/dc/route/xen/172.20.0.9".into(),
+                r#"{"kind":"route","id":"172.20.0.9","target":"xen","path":"direct","relay":"","note":""}"#.into(),
+            )]),
+            ..DcLoad::default()
+        })));
+        let _ = p.update(Message::ViewMode(ViewMode::Network));
+        // Renders the whole tab (L2 + overlay + topology + IP/DNS) off the Bus
+        // fallback (no live host-net read yet).
+        let _ = p.view();
+        // Seed a live host-net read so the PIF cards + live-net branch render too.
+        let _ = p.update(Message::NetFieldChanged {
+            field: NetField::ReadDom0,
+            value: "172.20.0.9".into(),
+        });
+        let _ = p.update(Message::NetReadDone(Ok(NetRead {
+            nets: vec![NetInfoRow {
+                uuid: "net-0".into(),
+                name: "Pool-wide".into(),
+                bridge: "xenbr0".into(),
+                mtu: 1500,
+            }],
+            pifs: vec![PifInfoRow {
+                uuid: "pif-0".into(),
+                device: "eth0".into(),
+                mac: "aa:bb:cc:dd:ee:ff".into(),
+                vlan: -1,
+                carrier: true,
+                management: true,
+                network: "net-0".into(),
+            }],
+        })));
+        assert!(p.net_read.is_some());
+        let _ = p.view();
+    }
+
+    #[test]
+    fn vlan_target_pif_seeds_the_create_form() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::VlanTargetPif {
+            pif: "pif-0".into(),
+            dom0: "172.20.0.9".into(),
+        });
+        assert_eq!(p.vlan_create.pif, "pif-0");
+        assert_eq!(p.vlan_create.dom0, "172.20.0.9");
+    }
+
+    #[test]
+    fn vlan_create_validates_tag_locally_before_rpc() {
+        // A non-integer / out-of-range tag is rejected client-side (no Bus round
+        // trip), with a clear hint and no panic.
+        let bad = VlanCreateForm {
+            pif: "pif-0".into(),
+            vlan: "not-a-number".into(),
+            network_name: "vlan100".into(),
+            dom0: "172.20.0.9".into(),
+        };
+        assert!(vlan_create(&bad).is_err());
+        let oor = VlanCreateForm {
+            vlan: "4095".into(),
+            ..bad.clone()
+        };
+        assert!(vlan_create(&oor).is_err());
+        // Missing fields are caught before parsing the tag.
+        let no_pif = VlanCreateForm {
+            pif: String::new(),
+            ..bad
+        };
+        assert!(vlan_create(&no_pif).is_err());
+    }
+
+    #[test]
+    fn read_l2_needs_a_dom0() {
+        let mut p = DatacenterPanel::new();
+        // An empty dom0 box → a hint, no RPC fired.
+        let _ = p.update(Message::NetReadClicked);
+        assert!(p.status.contains("dom0"), "{}", p.status);
     }
 }
