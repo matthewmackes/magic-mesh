@@ -17,7 +17,7 @@
 //! Services snap-in — service name + status pill + per-row
 //! action buttons.
 
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
 use cosmic::iced::{Background, Border, Color, Length, Padding, Task};
@@ -101,6 +101,12 @@ pub struct MeshServicesPanel {
     /// The `(name, scope)` of the unit the open modal is starting — drives
     /// the modal's Retry.
     pub connect_target: Option<(String, UnitScope)>,
+    /// MOTION-NET-3 — the monotonic instant fresh data last replaced the
+    /// stale-while-refreshing view. Drives [`mde_theme::settle_alpha`] so the new
+    /// units **crossfade up** from the dimmed stale render to full opacity instead
+    /// of snapping — the "smooth data replacement" half. `None` until the first
+    /// load lands (and after the fade settles it just yields full opacity).
+    pub data_replaced_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +158,14 @@ impl MeshServicesPanel {
     pub fn update(&mut self, msg: Message) -> Task<crate::Message> {
         match msg {
             Message::Loaded(units) => {
+                // MOTION-NET-3 — if a refresh just replaced already-shown units
+                // (the stale-while-refreshing case), arm the settle clock so the
+                // fresh data crossfades up from the dimmed stale render instead of
+                // snapping. A first load over an empty panel has nothing to fade
+                // from (the panel-mount transition owns that), so leave it `None`.
+                if !self.units.is_empty() {
+                    self.data_replaced_at = Some(Instant::now());
+                }
                 self.units = units;
                 self.busy = false;
                 self.last_run_at = Some(SystemTime::now());
@@ -368,12 +382,28 @@ impl MeshServicesPanel {
         .spacing(8)
         .align_y(cosmic::iced::alignment::Vertical::Center);
 
-        // MOTION-NET-3 — during a refresh the previous units stay on screen
-        // (never blank) but render DIMMED via the load state's content alpha, with
-        // the header's "Refreshing" indicator (MOTION-NET-1) showing it's live;
-        // they snap back to full opacity when fresh data lands.
-        let unit_palette = if load.is_busy() && !self.units.is_empty() {
-            palette.dimmed(load.content_alpha())
+        // MOTION-NET-3 — stale-while-refreshing + smooth data replacement.
+        //   * In flight: the previous units stay on screen (never blank) rendered
+        //     DIMMED via the load state's content alpha, with the header's
+        //     "Refreshing" indicator (MOTION-NET-1) showing it's live.
+        //   * When fresh data lands: instead of snapping dim→full, the content
+        //     CROSSFADES up over the dialog-mount duration (`settle_alpha`, a
+        //     color-alpha interpolation — no transform widget needed), so the swap
+        //     reads as one motion and never flashes. Past the settle (and at rest)
+        //     `settle_alpha` returns 1.0, so the panel does zero per-frame work.
+        let content_alpha = if load.is_busy() && !self.units.is_empty() {
+            load.content_alpha()
+        } else if let Some(replaced_at) = self.data_replaced_at {
+            mde_theme::settle_alpha(
+                replaced_at,
+                Instant::now(),
+                crate::live_theme::reduce_motion(),
+            )
+        } else {
+            1.0
+        };
+        let unit_palette = if content_alpha < 1.0 && !self.units.is_empty() {
+            palette.dimmed(content_alpha)
         } else {
             palette
         };

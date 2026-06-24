@@ -97,7 +97,7 @@ pub use icons::{
     icon_for_device_type, mde_icon, FillMode, Icon, IconSize, IconState, ResolvedIcon,
     MATERIAL_LINE_WEIGHT_PX,
 };
-pub use load_state::{LoadState, StateTone};
+pub use load_state::{settle_alpha, LoadState, StateTone, STALE_CONTENT_ALPHA};
 pub use motion::{
     Easing, Motion, FLASH_SAFE_MAX_HZ, FLASH_SAFE_MIN_PERIOD_MS, PANEL_MOUNT_TRANSLATE_Y_PX,
     PULSE_MAX_SCALE,

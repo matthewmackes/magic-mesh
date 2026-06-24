@@ -14,7 +14,16 @@
 //! ([`tone`](LoadState::tone)) is a secondary cue layered on top, never the only
 //! differentiator.
 
-use crate::motion::Motion;
+use crate::animation::{ease, Tween};
+use crate::motion::{Easing, Motion};
+use std::time::Instant;
+
+/// MOTION-NET-3 — the dimmed alpha kept-on-screen stale content renders at.
+///
+/// While a background refresh is in flight (stale-while-revalidate) the prior
+/// data stays visible at this alpha; foreground content is dimmed to it while
+/// surfaces stay opaque (see [`crate::Palette::dimmed`]).
+pub const STALE_CONTENT_ALPHA: f32 = 0.55;
 
 /// The seven canonical async states a surface can be in.
 ///
@@ -159,10 +168,49 @@ impl LoadState {
     #[must_use]
     pub const fn content_alpha(self) -> f32 {
         match self {
-            Self::Refreshing { stale: true } => 0.55,
+            Self::Refreshing { stale: true } => STALE_CONTENT_ALPHA,
             _ => 1.0,
         }
     }
+}
+
+/// MOTION-NET-3 — the eased content alpha for the **smooth data replacement** at
+/// the end of a stale-while-refreshing cycle.
+///
+/// The "refresh never blanks the view" half is handled by
+/// [`LoadState::content_alpha`] together with [`crate::Palette::dimmed`]: the
+/// prior data stays on screen at [`STALE_CONTENT_ALPHA`] while the refresh is in
+/// flight. This is the *other* half — when fresh data lands, the new content must
+/// **crossfade in** rather than snap from dimmed to full, so the swap reads as one
+/// motion and never flashes.
+///
+/// The iced-0.13 fork has no opacity/transform widget, but a crossfade does not
+/// need one: it is an interpolated **color-alpha**, the exact technique the dimmed
+/// stale render already uses (it just holds a *constant* dimmed alpha). This eases
+/// that alpha [`STALE_CONTENT_ALPHA`] → `1.0` over the [`Motion::dialog_mount`]
+/// crossfade duration (the same preset [`crate::animation::crossfade`] uses, so a
+/// data swap reads as one vocabulary with every other surface transition), keyed
+/// off `replaced_at` — the [`Instant`] the fresh data landed. Pure; the consumer
+/// passes `now` from its render and applies the result through
+/// [`crate::Palette::dimmed`].
+///
+/// Returns `1.0` once the settle completes, so a panel at rest renders content at
+/// full opacity with zero per-frame work. **Under reduce-motion** the duration is
+/// capped to the Q32 ≤80 ms crossfade ([`Tween::resolved`]) — a quick fade, never
+/// a snap-to-blank and never a long distracting motion (the a11y contract: the
+/// data is always legible, motion is only the polish on top).
+#[must_use]
+pub fn settle_alpha(replaced_at: Instant, now: Instant, reduce_motion: bool) -> f32 {
+    let motion = Motion::dialog_mount();
+    let tw = Tween::resolved(replaced_at, motion.duration, reduce_motion);
+    let easing = if reduce_motion {
+        Easing::Linear
+    } else {
+        motion.easing
+    };
+    let t = ease(tw.progress(now), easing);
+    // Fade the dimmed stale alpha up to full as the swap settles.
+    (1.0 - STALE_CONTENT_ALPHA).mul_add(t, STALE_CONTENT_ALPHA)
 }
 
 #[cfg(test)]
@@ -286,5 +334,82 @@ mod tests {
         assert_eq!(LoadState::Loaded.content_alpha(), 1.0);
         assert_eq!(LoadState::Idle.content_alpha(), 1.0);
         assert_eq!(LoadState::Failed.content_alpha(), 1.0);
+    }
+
+    #[test]
+    fn stale_content_alpha_matches_the_dimmed_refresh_value() {
+        // The eased settle starts at the same dim the in-flight refresh holds, so
+        // the data swap is one continuous fade — no jump at the hand-off.
+        assert_eq!(
+            LoadState::Refreshing { stale: true }.content_alpha(),
+            STALE_CONTENT_ALPHA
+        );
+    }
+
+    #[test]
+    fn settle_alpha_crossfades_from_dim_up_to_full_never_blanks() {
+        // MOTION-NET-3: when fresh data lands the content fades dim→full rather
+        // than snapping. At the swap it starts at the stale dim (so there is no
+        // jump from the in-flight refresh, and crucially it is NEVER 0 — the
+        // panel never blanks), and it reaches full opacity once the settle ends.
+        let now = Instant::now();
+        let motion = Motion::dialog_mount();
+
+        let at_swap = settle_alpha(now, now, false);
+        assert!(
+            (at_swap - STALE_CONTENT_ALPHA).abs() < 1e-6,
+            "the swap begins at the stale dim, continuous with the refresh"
+        );
+        assert!(
+            at_swap > 0.0,
+            "stale content is always visible — never blanked"
+        );
+
+        let mid = settle_alpha(now, now + motion.duration / 2, false);
+        assert!(
+            mid > STALE_CONTENT_ALPHA && mid < 1.0,
+            "mid-settle the content is fading up, not at either endpoint: {mid}"
+        );
+
+        let done = settle_alpha(now, now + motion.duration, false);
+        assert!(
+            (done - 1.0).abs() < 1e-6,
+            "the settle ends at full opacity (rest)"
+        );
+        // Past the end stays clamped at full — a panel at rest does zero work.
+        let after = settle_alpha(now, now + motion.duration * 4, false);
+        assert!((after - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn settle_alpha_is_monotonic_non_decreasing() {
+        // A fade-up never reverses — the content only ever gets brighter as the
+        // swap settles (no flicker, no dip back toward blank).
+        let now = Instant::now();
+        let motion = Motion::dialog_mount();
+        let mut prev = 0.0;
+        for step in 0..=20 {
+            let a = settle_alpha(now, now + motion.duration * step / 20, false);
+            assert!(a >= prev - 1e-6, "alpha must not decrease: {a} < {prev}");
+            assert!(a >= STALE_CONTENT_ALPHA - 1e-6, "never below the stale dim");
+            assert!(a <= 1.0 + 1e-6, "never above full");
+            prev = a;
+        }
+    }
+
+    #[test]
+    fn settle_alpha_reduce_motion_settles_within_the_q32_crossfade_cap() {
+        // Reduce-motion caps the fade to the ≤80 ms crossfade — quick, but still a
+        // fade (legible, never a hard blank): full opacity is reached by the cap.
+        use crate::motion::REDUCE_MOTION_CAP_MS;
+        use std::time::Duration;
+        let now = Instant::now();
+        let capped = settle_alpha(now, now + Duration::from_millis(REDUCE_MOTION_CAP_MS), true);
+        assert!(
+            (capped - 1.0).abs() < 1e-6,
+            "reduce-motion settles by the ≤80 ms cap"
+        );
+        // It still starts dimmed (legible content kept), not blank.
+        assert!(settle_alpha(now, now, true) >= STALE_CONTENT_ALPHA - 1e-6);
     }
 }
