@@ -370,6 +370,11 @@ struct State {
     /// MUSIC-RFX-5 — the multi-selected queue row indices (for "remove selected").
     /// Cleared on any structural mutation since indices shift after a reorder/remove.
     queue_selected: std::collections::HashSet<usize>,
+    /// MUSIC-RFX-9 — the maxi Queue list's live scroll offset (y), kept current by
+    /// [`Message::QueueScrolled`]. Drives the row-window virtualization in
+    /// [`Self::maxi_view`] so a multi-thousand-track queue renders only the visible
+    /// rows (the same spacer-windowing pattern the library grid uses, RESPONSIVE-9).
+    queue_scroll: f32,
     /// MUSIC-RFX-7 — the "add to playlist" picker: the song id pending add
     /// (`Some` = the picker sheet is open) + the playlist choices loaded for it.
     add_to_playlist_song: Option<String>,
@@ -470,6 +475,9 @@ enum Message {
     WindowResized(f32),
     /// AIR-11.c.2 — the library grid scrolled; record the offset per route.
     GridScrolled(f32),
+    /// MUSIC-RFX-9 — the maxi Queue list scrolled; record the offset so the row
+    /// window (virtualization) follows the viewport.
+    QueueScrolled(f32),
     /// AIR-11.c.3 — a grid card's cover art fetched (id, decoded handle or None).
     ArtLoaded(String, Option<image::Handle>),
     /// AIR-15.b — toggle the maxi-player full-window surface.
@@ -662,6 +670,7 @@ impl State {
             queue_current: 0,
             queue_titles: std::collections::HashMap::new(),
             queue_selected: std::collections::HashSet::new(),
+            queue_scroll: 0.0,
             add_to_playlist_song: None,
             add_to_playlist_choices: Vec::new(),
             new_playlist_name: String::new(),
@@ -680,6 +689,23 @@ impl State {
             mount: Some(motion::MountReveal::starting_at(now, reduce_motion)),
             shimmer: motion::Shimmer::starting_at(now, reduce_motion),
         }
+    }
+
+    /// MUSIC-RFX-9 — snap the (re)mounted maxi Queue scrollable to the saved
+    /// `queue_scroll` offset, so the virtualization window lines up with the
+    /// viewport. The Queue scrollable only exists in the widget tree while the
+    /// Queue tab is showing, so every path that (re)mounts it — reopening the maxi,
+    /// reloading after a reorder/remove (`QueueLoaded`), switching back from the
+    /// Lyrics/Peers tab — must restore the offset, mirroring how `apply_items`
+    /// restores the grid's per-route scroll.
+    fn restore_queue_scroll(&self) -> Task<Message> {
+        cosmic::iced::widget::scrollable::scroll_to(
+            queue_scroll_id(),
+            cosmic::iced::widget::scrollable::AbsoluteOffset {
+                x: None,
+                y: Some(self.queue_scroll),
+            },
+        )
     }
 
     /// MUSIC-RESPONSIVE-1 — re-issue the grid fetch for the current route (used
@@ -840,7 +866,7 @@ impl State {
                     motion::Reveal::starting_at(std::time::Instant::now(), self.reduce_motion)
                 });
                 self.queue_songs = songs;
-                let tasks: Vec<Task<Message>> = self
+                let mut tasks: Vec<Task<Message>> = self
                     .queue_songs
                     .iter()
                     .filter(|id| !self.queue_titles.contains_key(*id))
@@ -851,6 +877,14 @@ impl State {
                         })
                     })
                     .collect();
+                // MUSIC-RFX-9 — keep the (re)mounted Queue scrollable's real offset
+                // in sync with `queue_scroll`, the same way the grid restores its
+                // saved offset in `apply_items`. Without this, reopening the maxi (or
+                // any reload after a reorder/remove) mounts the scrollable at the top
+                // while `queue_scroll` still holds a deep offset → the virtualization
+                // window would mount off-screen and the user would see only the
+                // leading spacer (a blank Queue) until the next scroll re-synced it.
+                tasks.push(self.restore_queue_scroll());
                 Task::batch(tasks)
             }
             Message::QueueTitle(id, title) => {
@@ -908,7 +942,11 @@ impl State {
                     MaxiTab::Peers => Task::perform(nowplaying::fetch_peer_states(), |r| {
                         Message::PeersLoaded(r.unwrap_or_default())
                     }),
-                    _ => Task::none(),
+                    // MUSIC-RFX-9 — the Queue scrollable is remounted (it only
+                    // exists while its tab is active), so restore its offset or the
+                    // virtualization window would mount off-screen (blank Queue).
+                    MaxiTab::Queue => self.restore_queue_scroll(),
+                    MaxiTab::Lyrics => Task::none(),
                 }
             }
             Message::LyricsLoaded(lines) => {
@@ -1316,6 +1354,14 @@ impl State {
                 });
                 // MUSIC-LOCK-FIX — load cover art for the newly-visible window.
                 self.art_window_task(y)
+            }
+            Message::QueueScrolled(y) => {
+                // MUSIC-RFX-9 — track the maxi Queue scroll so the row window
+                // (virtualization) re-centers on the viewport. No I/O — the queue
+                // titles are already resolved on load (QueueLoaded), so this only
+                // advances which rows the next frame builds.
+                self.queue_scroll = y;
+                Task::none()
             }
             Message::EnqueueSong(id) => Task::perform(search::enqueue(id), Message::SearchEnqueued),
             Message::SearchEnqueued(result) => {
@@ -3172,11 +3218,26 @@ impl State {
         ]
         .align_y(cosmic::iced::Alignment::Center);
         let mut queue = column![header_row].spacing(4);
+        // MUSIC-RFX-9 — virtualize the queue: render only the visible row window
+        // (+overscan) and reserve the off-window height with spacers, so a queue of
+        // thousands of tracks doesn't build every row per frame. Same spacer pattern
+        // as the library grid (RESPONSIVE-9); `queue_scroll` is kept live by
+        // `QueueScrolled`. A short queue renders in full (`virtualize=false`).
+        let win = QueueWindow::resolve(self.queue_songs.len(), self.queue_scroll);
+        if win.virtualize && win.start > 0 {
+            queue =
+                queue.push(Space::new().height(Length::Fixed(win.start as f32 * QUEUE_ROW_PITCH)));
+        }
         // MOTION-FEEDBACK — a (re)loaded queue reveals its rows top-down: each
         // row's staggered slide-in (queue_reveal) gives a leading-padding rise +
         // a label fade. Settled (or absent) reveals read at rest.
         let reveal_now = std::time::Instant::now();
         for (i, sid) in self.queue_songs.iter().enumerate() {
+            // Skip rows outside the mounted window; their height is held by the
+            // leading/trailing spacers so the scrollbar geometry is unchanged.
+            if win.virtualize && (i < win.start || i >= win.end) {
+                continue;
+            }
             let label = self
                 .queue_titles
                 .get(sid)
@@ -3230,6 +3291,13 @@ impl State {
                 left: rv.translate_y.max(0.0),
             }));
         }
+        // MUSIC-RFX-9 — reserve the height of the rows below the window so the
+        // scrollbar reflects the full queue length (the user can scroll all the way
+        // down even though only the windowed rows are mounted).
+        if win.virtualize && win.end < self.queue_songs.len() {
+            let below = (self.queue_songs.len() - win.end) as f32 * QUEUE_ROW_PITCH;
+            queue = queue.push(Space::new().height(Length::Fixed(below)));
+        }
 
         let lyrics: Element<'_, Message> = if self.maxi_lyrics.is_empty() {
             text("No lyrics for this track").size(13).colr(muted).into()
@@ -3269,7 +3337,11 @@ impl State {
         ]
         .spacing(8);
         let body: Element<'_, Message> = match self.maxi_tab {
-            MaxiTab::Queue => scrollable(queue).into(),
+            // MUSIC-RFX-9 — id + on_scroll feed the row-window virtualization above.
+            MaxiTab::Queue => scrollable(queue)
+                .id(queue_scroll_id())
+                .on_scroll(|vp| Message::QueueScrolled(vp.absolute_offset().y))
+                .into(),
             MaxiTab::Lyrics => scrollable(lyrics).into(),
             MaxiTab::Peers => scrollable(peers).into(),
         };
@@ -3445,6 +3517,72 @@ fn grid_scroll_id() -> cosmic::iced::widget::Id {
     cosmic::iced::widget::Id::new("mde-music-grid")
 }
 
+/// MUSIC-RFX-9 — stable id for the maxi Queue list's scrollable, so its scroll
+/// offset feeds the row-window virtualization (`on_scroll` → `QueueScrolled`).
+fn queue_scroll_id() -> cosmic::iced::widget::Id {
+    cosmic::iced::widget::Id::new("mde-music-queue")
+}
+
+/// MUSIC-RFX-9 — the fixed per-row height of a maxi Queue row (px). A row's
+/// tallest child is a `button(text(...).size(13))`: in the vendored libcosmic iced
+/// that's `1.4 * 13` (default `LineHeight::Relative(1.4)`) `+ 5 + 5` (button
+/// `DEFAULT_PADDING` top/bottom) = 28.2 px, and the enclosing `column!().spacing(4)`
+/// adds a 4 px inter-row gap → a 32.2 px pitch. It must match the rendered height
+/// so the off-window spacers reserve exactly what the mounted rows would occupy
+/// (a too-small pitch would drift the window off the viewport over a long queue).
+const QUEUE_ROW_PITCH: f32 = 32.2;
+
+/// MUSIC-RFX-9 — how many rows to keep mounted around the viewport. ~24 rows
+/// covers a tall maxi window plus overscan above/below so a fast scroll never
+/// reveals an un-built gap before the next `QueueScrolled` frame.
+const QUEUE_WINDOW_ROWS: usize = 24;
+
+/// MUSIC-RFX-9 — only virtualize once the queue is taller than the window (below
+/// that a full render is cheaper than the spacer bookkeeping), mirroring the
+/// library grid's `total_rows > WINDOW_ROWS` gate (RESPONSIVE-9).
+const QUEUE_VIRTUALIZE_THRESHOLD: usize = QUEUE_WINDOW_ROWS;
+
+/// MUSIC-RFX-9 — the half-open `[start, end)` row range the maxi Queue should
+/// mount for a given total row count + scroll offset, plus whether to virtualize.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QueueWindow {
+    /// First row index to mount (0 when not virtualizing).
+    start: usize,
+    /// One past the last row to mount (`total` when not virtualizing).
+    end: usize,
+    /// `false` for a short queue rendered in full (no spacers).
+    virtualize: bool,
+}
+
+impl QueueWindow {
+    /// Resolve which queue rows to mount. Below the threshold the whole queue
+    /// renders (`virtualize=false`, `[0, total)`). Above it, a `QUEUE_WINDOW_ROWS`
+    /// band centred on the scroll offset is mounted, started two rows early as
+    /// overscan and clamped to the queue so a stale (too-large) offset never
+    /// leaves a blank window. Pure (no widgets) so it's unit-tested.
+    fn resolve(total: usize, offset_y: f32) -> Self {
+        if total <= QUEUE_VIRTUALIZE_THRESHOLD {
+            return Self {
+                start: 0,
+                end: total,
+                virtualize: false,
+            };
+        }
+        // The first fully-scrolled-past row, minus a two-row overscan lead.
+        let lead = ((offset_y.max(0.0) / QUEUE_ROW_PITCH).floor() as usize).saturating_sub(2);
+        // Clamp the window so it always shows a full band even when the offset is
+        // stale past the (now shorter) end of the queue.
+        let max_start = total.saturating_sub(QUEUE_WINDOW_ROWS);
+        let start = lead.min(max_start);
+        let end = (start + QUEUE_WINDOW_ROWS).min(total);
+        Self {
+            start,
+            end,
+            virtualize: true,
+        }
+    }
+}
+
 /// MUSIC-RESPONSIVE-6 / BEAUT-MUSIC — a grid of greyed Carbon skeleton tiles
 /// shown while a category loads, matching the real card geometry (160px col,
 /// 150px art tile + a short label bar) so navigation paints structure within one
@@ -3577,5 +3715,73 @@ mod theme_tests {
         assert!((bg.r - f32::from(p.background.r) / 255.0).abs() < 0.01);
         assert!((bg.g - f32::from(p.background.g) / 255.0).abs() < 0.01);
         assert!((bg.b - f32::from(p.background.b) / 255.0).abs() < 0.01);
+    }
+}
+
+#[cfg(test)]
+mod queue_window_tests {
+    use super::{QueueWindow, QUEUE_ROW_PITCH, QUEUE_VIRTUALIZE_THRESHOLD, QUEUE_WINDOW_ROWS};
+
+    #[test]
+    fn short_queue_renders_in_full() {
+        // MUSIC-RFX-9 — at/below the threshold the whole queue mounts (no spacers,
+        // no virtualization), regardless of the scroll offset.
+        for total in [0_usize, 1, QUEUE_VIRTUALIZE_THRESHOLD] {
+            let w = QueueWindow::resolve(total, 0.0);
+            assert!(!w.virtualize, "total={total} should render full");
+            assert_eq!(w.start, 0);
+            assert_eq!(w.end, total);
+        }
+    }
+
+    #[test]
+    fn long_queue_windows_around_the_top_when_unscrolled() {
+        // A large queue at offset 0 mounts exactly the first WINDOW_ROWS band.
+        let total = 5000;
+        let w = QueueWindow::resolve(total, 0.0);
+        assert!(w.virtualize);
+        assert_eq!(w.start, 0);
+        assert_eq!(w.end, QUEUE_WINDOW_ROWS);
+        // The window is strictly smaller than the queue — the win for big queues.
+        assert!(w.end - w.start < total);
+    }
+
+    #[test]
+    fn window_follows_the_scroll_offset_with_overscan() {
+        // Scrolled 100 rows down, the window leads two rows early (overscan) and
+        // spans WINDOW_ROWS, so the on-screen rows are always built ahead of the
+        // viewport.
+        let total = 5000;
+        let offset = 100.0 * QUEUE_ROW_PITCH;
+        let w = QueueWindow::resolve(total, offset);
+        assert!(w.virtualize);
+        assert_eq!(w.start, 98, "two-row overscan lead");
+        assert_eq!(w.end, 98 + QUEUE_WINDOW_ROWS);
+    }
+
+    #[test]
+    fn stale_offset_past_the_end_still_shows_a_full_band() {
+        // After a remove shrinks the queue, a now-too-large offset must not leave a
+        // blank window: the start clamps so a full WINDOW_ROWS band still mounts at
+        // the tail (the regression a naive floor() would cause — start past total).
+        let total = 30;
+        let offset = 10_000.0 * QUEUE_ROW_PITCH; // far past the (now short) queue
+        let w = QueueWindow::resolve(total, offset);
+        assert!(w.virtualize);
+        assert_eq!(w.end, total, "window ends at the real tail");
+        assert_eq!(
+            w.end - w.start,
+            QUEUE_WINDOW_ROWS,
+            "a full band is still shown, not a blank window"
+        );
+    }
+
+    #[test]
+    fn negative_offset_clamps_to_the_top() {
+        // A bounce/overscroll can momentarily report a negative offset; it must
+        // resolve to the top window, never an underflowed start.
+        let w = QueueWindow::resolve(5000, -500.0);
+        assert_eq!(w.start, 0);
+        assert_eq!(w.end, QUEUE_WINDOW_ROWS);
     }
 }
