@@ -48,12 +48,17 @@ pub enum Hero {
     Rustls,
     /// Generic VPN indicator — shown when no more-specific overlay hero applies.
     Vpn,
+    /// Syncthing full-mesh file sync (SUBSTRATE-V2) — the mesh **file plane**.
+    /// Every node syncs the `/mnt/mesh-storage` folder peer-to-peer over the
+    /// Nebula overlay (a plain directory, no FUSE); it replaced `LizardFS` as
+    /// the mesh storage substrate. Coordination lives in etcd, not here.
+    Syncthing,
 }
 
 impl Hero {
     /// Every hero, in stable order.
     #[must_use]
-    pub const fn all() -> [Self; 13] {
+    pub const fn all() -> [Self; 14] {
         [
             Self::Ansible,
             Self::LizardFs,
@@ -68,6 +73,7 @@ impl Hero {
             Self::PipeWire,
             Self::Rustls,
             Self::Vpn,
+            Self::Syncthing,
         ]
     }
 
@@ -88,6 +94,7 @@ impl Hero {
             Self::PipeWire => "PipeWire",
             Self::Rustls => "rustls",
             Self::Vpn => "VPN",
+            Self::Syncthing => "Syncthing",
         }
     }
 
@@ -108,6 +115,7 @@ impl Hero {
             Self::PipeWire => include_bytes!("../../../../assets/heroes/pipewire.svg"),
             Self::Rustls => include_bytes!("../../../../assets/heroes/rustls.svg"),
             Self::Vpn => include_bytes!("../../../../assets/heroes/vpn.svg"),
+            Self::Syncthing => include_bytes!("../../../../assets/heroes/syncthing.svg"),
         }
     }
 }
@@ -143,16 +151,44 @@ mod tests {
     }
 
     #[test]
-    fn all_thirteen_services_present_with_names() {
+    fn all_fourteen_services_present_with_names() {
         let names: Vec<&str> = Hero::all().iter().map(|h| h.name()).collect();
-        assert_eq!(names.len(), 13);
+        assert_eq!(names.len(), 14);
         for expected in [
-            "Ansible", "LizardFS", "Nebula", "Fedora", "COSMIC", "rustls", "VPN",
+            "Ansible",
+            "LizardFS",
+            "Nebula",
+            "Fedora",
+            "COSMIC",
+            "rustls",
+            "VPN",
+            "Syncthing",
         ] {
             assert!(names.contains(&expected), "missing hero name {expected}");
         }
         // names are distinct.
         let uniq: std::collections::BTreeSet<&str> = names.iter().copied().collect();
         assert_eq!(uniq.len(), names.len(), "duplicate hero name");
+    }
+
+    #[test]
+    fn syncthing_is_the_mesh_file_plane_hero() {
+        // SUBSTRATE-V2 — the Syncthing hero is the mesh **file plane**; it
+        // replaced the LizardFS hero on the Mesh Storage panel. Pin its name +
+        // that its art is a non-empty currentColor line-art glyph (the generic
+        // sweep already covers `all()`, but Syncthing is load-bearing for the
+        // Mesh Storage surface, so guard it explicitly).
+        assert_eq!(Hero::Syncthing.name(), "Syncthing");
+        let svg = std::str::from_utf8(Hero::Syncthing.svg_bytes()).expect("utf-8 svg");
+        assert!(svg.starts_with("<svg"), "syncthing hero not an svg");
+        assert!(svg.contains("</svg>"), "syncthing hero svg truncated");
+        assert!(
+            svg.contains("currentColor"),
+            "syncthing hero must stroke currentColor"
+        );
+        assert!(
+            svg.contains("fill=\"none\""),
+            "syncthing hero must be line-art"
+        );
     }
 }

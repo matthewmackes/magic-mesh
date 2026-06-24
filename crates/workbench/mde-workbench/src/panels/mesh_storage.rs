@@ -1,8 +1,17 @@
 //! MESHFS-13.1 (v5.0.0) — Workbench "Mesh Storage" panel.
 //!
-//! Shows per-peer chunkserver status (address, used/available bytes),
-//! the current replication goal, the effective quota cap, and which
-//! peer is the bottleneck. Data comes from `mackesd mesh-fs-status --json`.
+//! SUBSTRATE-V2: the mesh **file plane** is **Syncthing**, not LizardFS. Every
+//! node full-mesh-syncs the **Mesh Sync** share at `/mnt/mesh-storage` — a plain
+//! local directory (NO FUSE mount) over the Nebula overlay, with trash-can
+//! versioning (`.stversions`). Coordination (leader/peer-directory/health) lives
+//! in **etcd**, off the filesystem, so a slow or stopped Syncthing degrades file
+//! access only and never takes the mesh down (the failure class the old single
+//! LizardFS mount caused). See `docs/design/substrate-v2.md`.
+//!
+//! The panel renders the real substrate status — the local `syncthing` service +
+//! version and the `/mnt/mesh-storage` share — plus per-peer share usage
+//! (address, used/available bytes), the replication goal, the effective quota
+//! cap, and the limiting peer. Peer data comes from `mackesd mesh-fs-status`.
 
 use std::time::SystemTime;
 
@@ -15,9 +24,15 @@ use mde_theme::{FontSize, Palette, TypeRole};
 use crate::cosmic_compat::prelude::*;
 use crate::panel_chrome::{hero_band, pkg_version_cached};
 
+/// The Syncthing package whose version captions the Mesh Storage hero (H8).
+const SYNCTHING_PKG: &str = "syncthing";
+
+/// The local `syncthing` system unit backing the Mesh Sync file plane.
+const SYNCTHING_UNIT: &str = "syncthing.service";
+
 /// NOTIFY-UI-3 / ICON-MESH — the `folder-remote` network glyph for the
-/// mesh-storage surface. Mesh Storage is the LizardFS / QNM-Shared mesh file
-/// service, *not* a local mounted volume, so its title takes the network folder
+/// mesh-storage surface. Mesh Storage is the Syncthing / Mesh Sync mesh file
+/// share, *not* a local mounted volume, so its title takes the network folder
 /// icon (the freedesktop `folder-remote` equivalent) the same as the mde-files
 /// mesh-storage representation. Same lucide path as `mde_files::icons::FOLDER_REMOTE`.
 const FOLDER_REMOTE_NAME: &str = "folder-remote";
@@ -53,6 +68,91 @@ fn human_bytes(b: u64) -> String {
         unit += 1;
     }
     format!("{val:.1} {}", UNITS[unit])
+}
+
+/// True only when `systemctl is-active` reported the unit as `active` — the whole
+/// word, not the `activating` / `active (auto-restart)` prefixes a starting or
+/// flapping unit prints (so those are correctly treated as not-up).
+fn is_active_output(stdout: &[u8]) -> bool {
+    String::from_utf8_lossy(stdout).trim() == "active"
+}
+
+/// SUBSTRATE-V2 — the live state of the local Syncthing file plane: whether the
+/// `syncthing` unit is active and whether the `/mnt/mesh-storage` Mesh Sync share
+/// is present on disk. The panel reflects the real substrate rather than a
+/// placeholder (§7); [`SubstrateStatus::cached`] keeps the `view()` repaint cheap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SubstrateStatus {
+    /// The `syncthing.service` unit is `active` per `systemctl is-active`.
+    service_active: bool,
+    /// `/mnt/mesh-storage` (the Mesh Sync share root) exists as a directory.
+    share_present: bool,
+}
+
+/// How long a [`SubstrateStatus::cached`] probe is reused before re-shelling
+/// `systemctl`. Long enough that a repaint storm (input events, a 60 Hz
+/// transition tick) never spawns a subprocess per frame, short enough that the
+/// status line tracks the service within a couple of seconds.
+const SUBSTRATE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl SubstrateStatus {
+    /// The live substrate state, memoized for [`SUBSTRATE_TTL`]. `view()` runs on
+    /// every repaint (a 60 Hz transition tick, every input event), so an
+    /// un-memoized probe would `fork`/`exec` `systemctl` dozens of times a second
+    /// and stutter the UI — the same reason [`pkg_version_cached`] memoizes its
+    /// `rpm -q`. Returns the cached value when fresh, else re-reads.
+    fn cached() -> Self {
+        use std::sync::{Mutex, OnceLock};
+        use std::time::Instant;
+        static CACHE: OnceLock<Mutex<Option<(Instant, SubstrateStatus)>>> = OnceLock::new();
+        let cell = CACHE.get_or_init(|| Mutex::new(None));
+        if let Ok(guard) = cell.lock() {
+            if let Some((at, st)) = *guard {
+                if at.elapsed() < SUBSTRATE_TTL {
+                    return st;
+                }
+            }
+        }
+        let fresh = Self::read();
+        if let Ok(mut guard) = cell.lock() {
+            *guard = Some((Instant::now(), fresh));
+        }
+        fresh
+    }
+
+    /// Read the live Syncthing substrate state. `systemctl is-active` prints
+    /// exactly `active` (with a trailing newline) only when the unit is up, and
+    /// `inactive`/`failed`/`activating`/… otherwise; an absent `systemctl`
+    /// (CI/headless) degrades to "not active" rather than a panic, matching the
+    /// rest of the panel's honest-when-offline contract.
+    fn read() -> Self {
+        let service_active = std::process::Command::new("systemctl")
+            .args(["is-active", SYNCTHING_UNIT])
+            .output()
+            .map(|o| is_active_output(&o.stdout))
+            .unwrap_or(false);
+        let share_present = mackes_mesh_types::peers::default_workgroup_root().is_dir();
+        Self {
+            service_active,
+            share_present,
+        }
+    }
+
+    /// A one-line operator summary of the file plane, e.g.
+    /// `"Mesh Sync · syncthing active · /mnt/mesh-storage present"`.
+    fn summary_line(self) -> String {
+        let svc = if self.service_active {
+            "syncthing active"
+        } else {
+            "syncthing not active"
+        };
+        let share = if self.share_present {
+            "/mnt/mesh-storage present"
+        } else {
+            "/mnt/mesh-storage missing"
+        };
+        format!("Mesh Sync · {svc} · {share}")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -123,8 +223,8 @@ impl MeshStoragePanel {
         let palette = crate::live_theme::palette();
         let sizes = FontSize::defaults();
 
-        // NOTIFY-UI-3 / ICON-MESH — Mesh Storage is the mesh file-service
-        // (LizardFS / QNM-Shared) surface, so its title leads with the
+        // NOTIFY-UI-3 / ICON-MESH — Mesh Storage is the mesh file plane (the
+        // Syncthing / Mesh Sync share), so its title leads with the
         // `folder-remote` network icon rather than a local-volume glyph.
         let title_icon = mesh_storage_icon(palette.text.into_cosmic_color());
         let title = text("Mesh Storage")
@@ -145,7 +245,7 @@ impl MeshStoragePanel {
                 age_s,
             )
         } else {
-            "click Refresh to query the master".into()
+            "click Refresh to query Mesh Sync share usage".into()
         };
         let subtitle = text(subtitle_str)
             .size(TypeRole::Body.size_in(sizes))
@@ -185,10 +285,11 @@ impl MeshStoragePanel {
         )
         .on_press(crate::Message::MeshStorage(Message::RefreshClicked));
 
-        // PLANES-2 — Mesh Storage is the LizardFS surface; carry its hero.
-        let lizardfs = hero_band(
-            Hero::LizardFs,
-            pkg_version_cached("lizardfs-client").as_deref(),
+        // PLANES-2 / SUBSTRATE-V2 — Mesh Storage is the Syncthing file plane;
+        // carry the Syncthing hero captioned with the live `syncthing` version.
+        let syncthing = hero_band(
+            Hero::Syncthing,
+            pkg_version_cached(SYNCTHING_PKG).as_deref(),
             palette,
         );
         let header = row![
@@ -196,10 +297,24 @@ impl MeshStoragePanel {
             title,
             Space::new().width(Length::Fill),
             refresh_btn,
-            lizardfs
+            syncthing
         ]
         .spacing(12)
         .align_y(cosmic::iced::Alignment::Center);
+
+        // SUBSTRATE-V2 — real file-plane status (service active + share present).
+        // This is the substrate the panel describes, so it renders even before /
+        // independent of the per-peer `mackesd` query. Memoized (`cached`) so a
+        // repaint storm doesn't spawn `systemctl` per frame.
+        let substrate = SubstrateStatus::cached();
+        let substrate_color = if substrate.service_active && substrate.share_present {
+            palette.success
+        } else {
+            palette.warning
+        };
+        let substrate_row = row![text(substrate.summary_line())
+            .size(TypeRole::Body.size_in(sizes))
+            .colr(substrate_color.into_cosmic_color())];
         let sub_row = row![subtitle];
 
         let body: Element<'_, crate::Message> = if let Some(ref e) = self.error {
@@ -208,7 +323,7 @@ impl MeshStoragePanel {
                 .colr(palette.danger.into_cosmic_color())
                 .into()
         } else if self.status.peers.is_empty() && self.last_run_at.is_some() {
-            text("Master unreachable — mesh-storage not yet active.")
+            text("No peer share usage reported yet — Mesh Sync may still be settling.")
                 .size(TypeRole::Body.size_in(sizes))
                 .colr(palette.text_muted.into_cosmic_color())
                 .into()
@@ -254,7 +369,14 @@ impl MeshStoragePanel {
             scrollable(content_col).into()
         };
 
-        let page = column![header, sub_row, Space::new().height(12), body].spacing(4);
+        let page = column![
+            header,
+            sub_row,
+            substrate_row,
+            Space::new().height(12),
+            body
+        ]
+        .spacing(4);
 
         let surface_color = palette.surface.into_cosmic_color();
         container(page)
@@ -319,7 +441,8 @@ pub fn fetch_status() -> Result<StorageStatus, String> {
         .args(["mesh-fs-status"])
         .output()
         .map_err(|e| format!("mackesd mesh-fs-status failed to spawn: {e}"))?;
-    // Exit 1 means master unreachable — still parse the JSON.
+    // `mackesd` may exit non-zero when the share usage is unavailable but still
+    // emits a (possibly empty) JSON body — parse stdout regardless of exit code.
     let stdout = String::from_utf8_lossy(&out.stdout);
     if stdout.trim().is_empty() {
         return Err("mackesd mesh-fs-status returned no output".to_string());
@@ -372,9 +495,9 @@ mod tests {
 
     #[test]
     fn mesh_storage_surface_uses_the_network_folder_icon() {
-        // NOTIFY-UI-3 / ICON-MESH: Mesh Storage is a mesh file service
-        // (LizardFS / QNM-Shared), not a local volume, so its surface renders
-        // the `folder-remote` network icon — matching the mde-files
+        // NOTIFY-UI-3 / ICON-MESH: Mesh Storage is a mesh file share (the
+        // Syncthing / Mesh Sync plane), not a local volume, so its surface
+        // renders the `folder-remote` network icon — matching the mde-files
         // mesh-storage representation. Guard the SVG envelope too so the glyph
         // can't silently rot into something un-renderable.
         assert_eq!(mesh_storage_icon_name(), "folder-remote");
@@ -382,6 +505,73 @@ mod tests {
         let s = std::str::from_utf8(FOLDER_REMOTE_SVG).expect("icon bytes utf8");
         assert!(s.starts_with("<svg "), "mesh-storage icon must be an <svg>");
         assert!(s.ends_with("</svg>"), "mesh-storage icon must close </svg>");
+    }
+
+    #[test]
+    fn mesh_storage_carries_the_syncthing_hero_not_lizardfs() {
+        // SUBSTRATE-V2 — the file plane is Syncthing; the panel's hero must be
+        // the Syncthing hero captioned with the `syncthing` package (NOT the
+        // retired LizardFS / `lizardfs-client` pairing). Pin the constants the
+        // header uses so a regression back to LizardFS is a test failure.
+        assert_eq!(SYNCTHING_PKG, "syncthing");
+        assert_eq!(SYNCTHING_UNIT, "syncthing.service");
+        assert_eq!(Hero::Syncthing.name(), "Syncthing");
+    }
+
+    #[test]
+    fn substrate_status_summary_reflects_service_and_share() {
+        // §7 — the file-plane status line is real, not a placeholder: it names
+        // the service liveness and the /mnt/mesh-storage share presence, and
+        // brands the share "Mesh Sync" (SUBSTRATE-V2 lock #12), never "LizardFS".
+        let up = SubstrateStatus {
+            service_active: true,
+            share_present: true,
+        };
+        let s = up.summary_line();
+        assert!(
+            s.starts_with("Mesh Sync"),
+            "must brand the share Mesh Sync: {s}"
+        );
+        assert!(s.contains("syncthing active"), "{s}");
+        assert!(s.contains("/mnt/mesh-storage present"), "{s}");
+        assert!(!s.contains("LizardFS"), "must not mention LizardFS: {s}");
+
+        let down = SubstrateStatus {
+            service_active: false,
+            share_present: false,
+        };
+        let s = down.summary_line();
+        assert!(s.contains("syncthing not active"), "{s}");
+        assert!(s.contains("/mnt/mesh-storage missing"), "{s}");
+    }
+
+    #[test]
+    fn is_active_output_matches_active_only_not_activating() {
+        // `systemctl is-active` prints the unit's state word; only `active`
+        // (whole word, trailing newline) means up. A starting or auto-restart-
+        // flapping unit prints `activating` / `active (auto-restart)` and MUST
+        // NOT read as up (else the status line goes green while the file plane
+        // is not serving).
+        assert!(is_active_output(b"active\n"));
+        assert!(is_active_output(b"active"));
+        assert!(!is_active_output(b"activating\n"));
+        assert!(!is_active_output(b"active (auto-restart)\n"));
+        assert!(!is_active_output(b"inactive\n"));
+        assert!(!is_active_output(b"failed\n"));
+        assert!(!is_active_output(b""));
+    }
+
+    #[test]
+    fn substrate_status_read_does_not_panic_headless() {
+        // In CI / headless environments `systemctl` may be absent and the share
+        // unmounted — read()/cached() must degrade to a value, never panic.
+        let st = SubstrateStatus::read();
+        // Both fields are valid in either state; just assert the read completes
+        // and the summary renders.
+        let _ = st.summary_line();
+        // The memoized path returns the same shape and must not panic either.
+        let cached = SubstrateStatus::cached();
+        let _ = cached.summary_line();
     }
 
     #[test]
