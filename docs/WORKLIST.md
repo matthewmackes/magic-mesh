@@ -1851,7 +1851,7 @@ the plane and it **survives killing the current zone leader**.
     - [>] per-zone workspace cards; streamed plan/apply/destroy; state browser + drift vs live; **plan→review-diff→explicit Apply** (typed confirm for prod); persisted run-log on `event/dc/tofu/*` — *plan/apply/destroy + typed-confirm Apply + state-browser + drift badge done; run-log + prod-arm pending*
 
 ### Phase 3 — Power orchestration
-- [ ] **DATACENTER-16: energy-aware host power (WOL/IPMI + idle-shutdown + learned ETAs).**
+- [>] **DATACENTER-16: energy-aware host power (WOL/IPMI + idle-shutdown + learned ETAs).**
   **As** an operator, **I want** hosts powered by demand with honest progress, **so that** the fleet saves energy
   and I can see wakes happening.
   **Acceptance**:
