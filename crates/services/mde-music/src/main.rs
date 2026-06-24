@@ -323,6 +323,15 @@ struct State {
     now_state: NowState,
     now_title: String,
     now_artist: String,
+    /// MOTION-NET-4 — the in-flight optimistic transport action + the `now_state`
+    /// captured BEFORE it was applied. `Some` while a transport RPC is pending; on
+    /// failure the snapshot reverts the optimistic flip so the footer keeps its
+    /// prior context instead of blanking. Cleared on success/failure resolution.
+    pending_transport: Option<(TransportAction, NowState)>,
+    /// MOTION-NET-4 — the last transport action that failed, surfaced as a
+    /// non-blocking "… — Retry" banner in the footer. `None` when the last action
+    /// succeeded (or none has run). Retrying re-issues exactly this action.
+    failed_transport: Option<TransportAction>,
     /// AIR-15.b.2 — the current track's decoded cover art (maxi header).
     now_art: Option<image::Handle>,
     /// AIR-15.b.2 — current track duration (ms) for the maxi scrub bar.
@@ -433,6 +442,103 @@ enum MaxiTab {
     Queue,
     Lyrics,
     Peers,
+}
+
+/// MOTION-NET-4 — a transport command the GUI applied optimistically (the play
+/// icon flipped / playhead jumped before the daemon confirmed). The variant
+/// carries everything needed to **re-issue** it on a retry; the pre-action
+/// `NowState` snapshot for the **revert** is held separately in
+/// [`State::pending_transport`] so a failed action restores the exact prior view
+/// instead of blanking the footer. Cheap to clone (POD), so it rides the in-flight
+/// task and the retry message.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TransportAction {
+    /// Toggle play/pause; `was_playing` is the PRE-flip state `play_pause` reads
+    /// to pick pause-vs-resume (so a retry issues the same verb).
+    PlayPause { was_playing: bool },
+    /// Skip to the next queued track.
+    SkipNext,
+    /// Skip to the previous queued track.
+    SkipPrev,
+    /// Set the volume to `level` (0.0..=1.0).
+    SetVolume { level: f32 },
+    /// Seek the current track to `position_ms`.
+    Seek { position_ms: u64 },
+}
+
+/// MOTION-NET-4 — what the update loop should do when a transport RPC resolves,
+/// computed purely so the reconcile-vs-revert decision is unit-testable apart from
+/// the cosmic runtime. The handler applies the resulting [`State`] mutations + the
+/// follow-up task.
+#[derive(Debug, Clone, PartialEq)]
+enum TransportOutcome {
+    /// The action succeeded: clear the pending/failed state and reconcile from a
+    /// fresh `get-state` fetch (the daemon is the truth).
+    Reconcile,
+    /// The action failed: revert `now_state` to this pre-action snapshot and arm
+    /// the retry banner for `action`.
+    Revert {
+        snapshot: NowState,
+        action: TransportAction,
+    },
+    /// A stale completion for an action that's no longer the pending one (a newer
+    /// action superseded it). Ignore it: the newer action owns the optimistic
+    /// state + the pending slot, so neither revert nor disturb the pending slot.
+    /// (A stale success doesn't need a reconcile either — the newer action's own
+    /// completion will reconcile.)
+    Ignore,
+}
+
+/// MOTION-NET-4 — pure decision for a resolved transport RPC. `pending` is the
+/// in-flight `(action, pre-action snapshot)`; `result` is the RPC outcome. A
+/// completion whose action no longer matches the pending slot is stale (a newer
+/// action raced ahead) and is ignored — the newer action owns the state, so we
+/// never revert to an outdated snapshot or blank the footer.
+fn resolve_transport_outcome(
+    pending: Option<(TransportAction, NowState)>,
+    action: TransportAction,
+    result: Result<(), ()>,
+) -> TransportOutcome {
+    let snapshot = match pending {
+        Some((a, snap)) if a == action => snap,
+        // Not the current pending action → stale completion, ignore.
+        _ => return TransportOutcome::Ignore,
+    };
+    match result {
+        Ok(()) => TransportOutcome::Reconcile,
+        Err(()) => TransportOutcome::Revert { snapshot, action },
+    }
+}
+
+impl TransportAction {
+    /// The async Bus call that performs this action, as a [`Task`] resolving to
+    /// a [`Message::TransportDone`] carrying the action + its outcome (so the
+    /// update loop can reconcile on success or revert + offer a retry on failure).
+    fn perform(self) -> Task<Message> {
+        let fut = async move {
+            match self {
+                Self::PlayPause { was_playing } => nowplaying::play_pause(was_playing).await,
+                Self::SkipNext => nowplaying::skip_next().await,
+                Self::SkipPrev => nowplaying::skip_prev().await,
+                Self::SetVolume { level } => nowplaying::set_volume(level).await,
+                Self::Seek { position_ms } => nowplaying::seek(position_ms).await,
+            }
+        };
+        Task::perform(fut, move |r| {
+            Message::TransportDone(self, r.map_err(|_| ()))
+        })
+    }
+
+    /// A short, user-facing description of what failed, for the retry banner.
+    fn failed_label(self) -> &'static str {
+        match self {
+            Self::PlayPause { .. } => "Couldn't change playback",
+            Self::SkipNext => "Couldn't skip to the next track",
+            Self::SkipPrev => "Couldn't skip to the previous track",
+            Self::SetVolume { .. } => "Couldn't set the volume",
+            Self::Seek { .. } => "Couldn't seek",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -593,10 +699,14 @@ enum Message {
     PlayPause,
     SkipNext,
     SkipPrev,
-    /// A transport command (volume/play/skip) finished — outcome is
-    /// irrelevant; the follow-up state fetch is the truth (sweep-3 I8
-    /// dropped the never-read `Result` payload).
-    TransportDone,
+    /// A transport command (volume/play/skip/seek) finished. MOTION-NET-4 — the
+    /// outcome now drives reconcile-vs-revert: `Ok` reconciles from a fresh state
+    /// fetch (the truth); `Err` reverts the optimistic flip to the pre-action
+    /// snapshot and surfaces a retry banner, never losing context.
+    TransportDone(TransportAction, Result<(), ()>),
+    /// MOTION-NET-4 — re-issue the last failed transport action (the retry banner
+    /// button), re-applying it optimistically against the current state.
+    RetryTransport,
     /// MOTION-FEEDBACK — advance the in-flight now-playing / queue reveal one
     /// frame. Armed only while a reveal is animating (MOTION-PERF-1).
     RevealTick,
@@ -652,6 +762,8 @@ impl State {
             now_state: NowState::default(),
             now_title: String::new(),
             now_artist: String::new(),
+            pending_transport: None,
+            failed_transport: None,
             now_art: None,
             now_duration_ms: 0,
             album_color: color::accent_rgb(),
@@ -1449,6 +1561,21 @@ impl State {
                 Message::StateLoaded(r.unwrap_or_default())
             }),
             Message::StateLoaded(s) => {
+                // MOTION-NET-4 — a transport RPC is in flight: its optimistic state
+                // is authoritative until it resolves (Reconcile re-fetches, or Revert
+                // restores the snapshot). Don't let a racing 2s background poll clobber
+                // the optimistic flip — that would un-flip the play icon for a frame, or
+                // (on a transient fetch error → NowState::default()) blank the footer
+                // mid-action. The in-flight action's own completion reconciles.
+                if self.pending_transport.is_some() {
+                    return Task::none();
+                }
+                // A fresh authoritative state with no action pending: any standing
+                // retry banner is now moot (the daemon answered + this is the truth),
+                // so dismiss it — otherwise a transport that actually applied
+                // server-side after a client-side timeout would leave the banner
+                // stuck, contradicting the visible state.
+                self.failed_transport = None;
                 let changed = s.song_id != self.now_state.song_id;
                 self.now_state = s;
                 if changed {
@@ -1512,36 +1639,97 @@ impl State {
                 Task::none()
             }
             Message::SetVolume(v) => {
+                // MOTION-NET-4 — apply optimistically, then issue with revert/retry.
+                // `begin_transport` snapshots the PRE-action state (for the revert)
+                // before this flip is applied, so capture `prior` first.
+                let prior = self.now_state.clone();
                 self.now_state.volume = v;
-                Task::perform(nowplaying::set_volume(v), |_| Message::TransportDone)
+                self.begin_transport(TransportAction::SetVolume { level: v }, prior)
             }
             // MUSIC-RFX-4 — scrub: jump the playhead optimistically so the slider
             // tracks the drag, then tell the daemon to seek (RFX-2).
             Message::Seek(ms) => {
+                let prior = self.now_state.clone();
                 self.now_state.position_ms = ms;
-                Task::perform(nowplaying::seek(ms), |_| Message::TransportDone)
+                self.begin_transport(TransportAction::Seek { position_ms: ms }, prior)
             }
             Message::PlayPause => {
                 // MUSIC-RESPONSIVE-8 — optimistic: flip the play icon immediately,
                 // then reconcile from the real state on TransportDone. `play_pause`
                 // takes the PRE-flip state to decide the action.
+                let prior = self.now_state.clone();
                 let was = self.now_state.playing;
                 self.now_state.playing = !was;
-                Task::perform(nowplaying::play_pause(was), |_| Message::TransportDone)
+                self.begin_transport(TransportAction::PlayPause { was_playing: was }, prior)
             }
             Message::SkipNext => {
                 // MUSIC-RESPONSIVE-8 — a skip keeps playing; show that immediately,
                 // the new track title reconciles on TransportDone.
+                let prior = self.now_state.clone();
                 self.now_state.playing = true;
-                Task::perform(nowplaying::skip_next(), |_| Message::TransportDone)
+                self.begin_transport(TransportAction::SkipNext, prior)
             }
             Message::SkipPrev => {
+                let prior = self.now_state.clone();
                 self.now_state.playing = true;
-                Task::perform(nowplaying::skip_prev(), |_| Message::TransportDone)
+                self.begin_transport(TransportAction::SkipPrev, prior)
             }
-            Message::TransportDone => Task::perform(nowplaying::fetch_state(), |r| {
-                Message::StateLoaded(r.unwrap_or_default())
-            }),
+            // MOTION-NET-4 — the transport RPC resolved. The pure
+            // `resolve_transport_outcome` decides: reconcile from the real daemon
+            // state on success (clearing the pending/failed slots), revert the
+            // optimistic flip to the pre-action snapshot + arm the retry banner on
+            // failure (the footer keeps its context, never blanks), or ignore a
+            // stale completion that a newer action already superseded.
+            Message::TransportDone(action, result) => {
+                match resolve_transport_outcome(self.pending_transport.clone(), action, result) {
+                    TransportOutcome::Reconcile => {
+                        self.pending_transport = None;
+                        self.failed_transport = None;
+                        Task::perform(nowplaying::fetch_state(), |r| {
+                            Message::StateLoaded(r.unwrap_or_default())
+                        })
+                    }
+                    TransportOutcome::Revert { snapshot, action } => {
+                        self.pending_transport = None;
+                        self.now_state = snapshot;
+                        self.failed_transport = Some(action);
+                        Task::none()
+                    }
+                    // Stale: a newer action owns the state + pending slot — leave
+                    // `pending_transport` intact so the newer action's own
+                    // completion still finds its pending entry.
+                    TransportOutcome::Ignore => Task::none(),
+                }
+            }
+            // MOTION-NET-4 — the retry banner button: re-apply + re-issue the last
+            // failed action against the current state (so the optimistic flip + the
+            // revert/retry loop hold across repeated failures).
+            Message::RetryTransport => {
+                let Some(action) = self.failed_transport.take() else {
+                    return Task::none();
+                };
+                let prior = self.now_state.clone();
+                // Re-issue the EXACT failed action (same verb/target), re-applying
+                // its optimistic effect. We reuse the stored action verbatim — e.g.
+                // PlayPause carries the original `was_playing`, so a background poll
+                // that flipped `now_state` between the revert and this click can't
+                // make the retry send the opposite verb (the documented contract).
+                match action {
+                    TransportAction::PlayPause { was_playing } => {
+                        // The optimistic icon should reflect the action's intent:
+                        // resume (`was_playing=false`) ⇒ show playing, and vice versa.
+                        self.now_state.playing = !was_playing;
+                    }
+                    TransportAction::SkipNext | TransportAction::SkipPrev => {
+                        self.now_state.playing = true;
+                    }
+                    TransportAction::SetVolume { level } => self.now_state.volume = level,
+                    TransportAction::Seek { position_ms } => {
+                        self.now_state.position_ms = position_ms
+                    }
+                }
+                self.begin_transport(action, prior)
+            }
             // MOTION-FEEDBACK — clear any reveal that has finished so the tick
             // subscription disarms (zero idle wakeups). The repaint this tick
             // triggers re-reads the live `slide_in` params for in-flight reveals.
@@ -1593,6 +1781,17 @@ impl State {
             // A category grid shows the skeleton tiles while fetching.
             _ => self.loading,
         }
+    }
+
+    /// MOTION-NET-4 — record `action` as the in-flight optimistic transport
+    /// (with `prior` = the `now_state` captured BEFORE the optimistic flip, for a
+    /// revert) and issue its Bus call. Any standing retry banner is cleared — a
+    /// fresh attempt is now in flight; it re-arms only if THIS attempt also fails.
+    /// The caller has already applied the optimistic state change.
+    fn begin_transport(&mut self, action: TransportAction, prior: NowState) -> Task<Message> {
+        self.pending_transport = Some((action, prior));
+        self.failed_transport = None;
+        action.perform()
     }
 
     /// Close the search sheet + clear its state (shared by Esc, navigating
@@ -3077,7 +3276,46 @@ impl State {
                 bottom: 0.0,
                 left: 0.0,
             });
-        Some(bar.into())
+        // MOTION-NET-4 — a failed transport action surfaces a non-blocking retry
+        // banner pinned above the controls (the optimistic flip has already been
+        // reverted, so the bar below still shows the real prior track + state).
+        let stacked: Element<'_, Message> = match self.retry_banner() {
+            Some(banner) => column![banner, bar].into(),
+            None => bar.into(),
+        };
+        Some(stacked)
+    }
+
+    /// MOTION-NET-4 — the non-blocking retry banner: shown when the last transport
+    /// action failed (the optimistic flip was already reverted to its pre-action
+    /// snapshot). It names what failed (amber warning token) and offers a Retry
+    /// that re-issues the exact action. `None` when the last action succeeded.
+    fn retry_banner(&self) -> Option<Element<'_, Message>> {
+        let action = self.failed_transport?;
+        let p = mde_theme::Palette::dark();
+        let warning = carbon(p.warning, 1.0);
+        let label = text(action.failed_label())
+            .size(12)
+            .colr(warning)
+            .width(Length::Fill);
+        let retry = button(text("Retry").size(12).colr(carbon(p.text, 1.0)))
+            .on_press(Message::RetryTransport)
+            .padding([4, 12]);
+        let row = row![label, retry]
+            .spacing(10)
+            .align_y(cosmic::iced::Alignment::Center);
+        // A subtle raised band so the banner reads as a transient status strip,
+        // not part of the controls (tokens only — §4).
+        Some(
+            container(row)
+                .width(Length::Fill)
+                .padding([6, 12])
+                .style(move |_| cosmic::iced::widget::container::Style {
+                    background: Some(carbon(p.raised, 1.0).into()),
+                    ..Default::default()
+                })
+                .into(),
+        )
     }
 
     /// AIR-15.b — the maxi-player full-window surface: now-playing header
@@ -3208,7 +3446,12 @@ impl State {
         )
         .width(Length::Fill)
         .center_x(Length::Fill);
-        let header = column![top_bar, hero].spacing(12);
+        // MOTION-NET-4 — surface the same retry banner in the maxi view, so a
+        // failed transport from the full surface is recoverable in place too.
+        let header = match self.retry_banner() {
+            Some(banner) => column![top_bar, banner, hero].spacing(12),
+            None => column![top_bar, hero].spacing(12),
+        };
 
         // MUSIC-RFX-5 — the queue tab is now editable: per-row select / move /
         // play-next / remove, plus a "Remove selected" action. iced has no
@@ -3793,5 +4036,121 @@ mod queue_window_tests {
         let w = QueueWindow::resolve(5000, -500.0);
         assert_eq!(w.start, 0);
         assert_eq!(w.end, QUEUE_WINDOW_ROWS);
+    }
+}
+
+#[cfg(test)]
+mod transport_outcome_tests {
+    use super::{resolve_transport_outcome, NowState, TransportAction, TransportOutcome};
+
+    fn paused_state() -> NowState {
+        NowState {
+            playing: false,
+            active: true,
+            song_id: "s7".to_string(),
+            position_ms: 12_000,
+            volume: 0.5,
+            ..NowState::default()
+        }
+    }
+
+    #[test]
+    fn success_reconciles_when_action_is_current() {
+        // MOTION-NET-4 — a successful transport whose action is the pending one
+        // reconciles from a fresh fetch (clearing pending/failed).
+        let action = TransportAction::PlayPause { was_playing: false };
+        let pending = Some((action, paused_state()));
+        assert_eq!(
+            resolve_transport_outcome(pending, action, Ok(())),
+            TransportOutcome::Reconcile
+        );
+    }
+
+    #[test]
+    fn failure_reverts_to_the_pre_action_snapshot() {
+        // A failed action reverts to the EXACT pre-action state (no blank footer)
+        // and arms a retry for the same action.
+        let action = TransportAction::SkipNext;
+        let snap = paused_state();
+        let pending = Some((action, snap.clone()));
+        match resolve_transport_outcome(pending, action, Err(())) {
+            TransportOutcome::Revert {
+                snapshot,
+                action: reverted,
+            } => {
+                assert_eq!(snapshot, snap, "revert restores the pre-action view");
+                assert_eq!(reverted, action, "the retry re-issues the same action");
+            }
+            other => panic!("expected Revert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seek_revert_restores_the_prior_position() {
+        // A failed seek must put the playhead back where it was, not at the
+        // dragged-to position (the optimistic jump is undone).
+        let action = TransportAction::Seek {
+            position_ms: 90_000,
+        };
+        let snap = paused_state(); // position_ms == 12_000
+        let pending = Some((action, snap.clone()));
+        match resolve_transport_outcome(pending, action, Err(())) {
+            TransportOutcome::Revert { snapshot, .. } => {
+                assert_eq!(snapshot.position_ms, 12_000);
+            }
+            other => panic!("expected Revert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stale_completion_is_ignored() {
+        // A completion whose action no longer matches the pending slot (a newer
+        // action raced ahead) is ignored — never reverting to an outdated snapshot
+        // or blanking the footer the newer action now owns.
+        let stale = TransportAction::PlayPause { was_playing: true };
+        let current = TransportAction::SkipNext;
+        let pending = Some((current, paused_state()));
+        // Both a stale success and a stale failure are ignored.
+        assert_eq!(
+            resolve_transport_outcome(pending.clone(), stale, Ok(())),
+            TransportOutcome::Ignore
+        );
+        assert_eq!(
+            resolve_transport_outcome(pending, stale, Err(())),
+            TransportOutcome::Ignore
+        );
+    }
+
+    #[test]
+    fn completion_with_no_pending_is_ignored() {
+        // A completion arriving when nothing is pending (e.g. after a reconcile
+        // already cleared it) is a no-op.
+        let action = TransportAction::SkipPrev;
+        assert_eq!(
+            resolve_transport_outcome(None, action, Ok(())),
+            TransportOutcome::Ignore
+        );
+        assert_eq!(
+            resolve_transport_outcome(None, action, Err(())),
+            TransportOutcome::Ignore
+        );
+    }
+
+    #[test]
+    fn failed_label_is_action_specific() {
+        // Each action surfaces its own retry-banner copy.
+        assert!(TransportAction::SkipNext.failed_label().contains("next"));
+        assert!(TransportAction::SkipPrev
+            .failed_label()
+            .contains("previous"));
+        assert!(TransportAction::SetVolume { level: 0.5 }
+            .failed_label()
+            .contains("volume"));
+        assert!(TransportAction::Seek { position_ms: 0 }
+            .failed_label()
+            .contains("seek"));
+        assert!(TransportAction::PlayPause { was_playing: true }
+            .failed_label()
+            .contains("playback"));
     }
 }
