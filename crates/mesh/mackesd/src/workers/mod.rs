@@ -465,6 +465,12 @@ pub mod clipboard_sync;
 // ~/.cache/mde/peer-cap.json every 30 s; publishes to
 // mesh/peer-cap/updated Bus topic for real-time UI consumers.
 pub mod peer_cap;
+// LIGHTHOUSE-8 (2026-06-24) — per-lighthouse deep-probe lane. Every ~15 s probes
+// each lighthouse for Nebula handshake / public IP / overlay peer count / uptime
+// / CA cert-expiry (GLUE over nebula_admin + transport_probe + ca::expiry + the
+// replicated directory) and publishes a `LighthouseProbe` to
+// `compute/lighthouse-probe/<name>`. The Workbench Lighthouses tab renders it.
+pub mod lighthouse_probe;
 
 /// Every worker registered with the supervisor implements this
 /// trait. The trait is `async_trait` because the supervisor stores
@@ -603,6 +609,32 @@ impl Supervisor {
     /// before the first `spawn` so every worker is tracked.
     pub fn set_status_map(&mut self, map: WorkerStatusMap) {
         self.status = Some(map);
+    }
+
+    /// LIGHTHOUSE-8 — register the per-lighthouse deep-probe worker following the
+    /// sibling spawn pattern (`Spawn::new(worker, policy)` + the role gate the
+    /// inline spawns use). `RestartPolicy::OnFailure` mirrors the other
+    /// long-running tick workers (`mesh_latency`, `peer_cap`).
+    ///
+    /// This is the module-owned registration the worker pool calls so the probe
+    /// joins the supervisor without `bin/mackesd.rs`'s inline spawn list being
+    /// edited. The probe is a rank-0 relay control-plane concern — every node
+    /// probes the lighthouse set — so it is gated by the same
+    /// [`crate::worker_role`] resolver as its siblings (unknown workers default
+    /// to rank 0 ⇒ runs everywhere), and its workgroup root self-resolves from
+    /// the daemon's `MDE_WORKGROUP_ROOT` env (set by the systemd unit). Returns
+    /// the spawned worker's name for the caller's `worker_names` roster, or
+    /// `None` when the role gate skips it.
+    pub fn spawn_lighthouse_probe(&mut self) -> Option<&'static str> {
+        let rank = crate::worker_role::resolve_rank();
+        if !crate::worker_role::runs("lighthouse_probe", rank) {
+            return None;
+        }
+        let root = mackes_mesh_types::peers::default_workgroup_root();
+        let worker = lighthouse_probe::LighthouseProbeWorker::new(root);
+        let name = worker.name();
+        self.spawn(Spawn::new(worker, RestartPolicy::OnFailure));
+        Some(name)
     }
 
     /// Issue every spawned worker a fresh shutdown token cloned from

@@ -6649,6 +6649,21 @@ fn run_serve(
             }
         }
 
+        // LIGHTHOUSE-8 — per-lighthouse deep-probe lane. Every ~15 s probes each
+        // lighthouse for Nebula handshake / public IP / overlay peer count /
+        // uptime / CA cert-expiry and publishes a LighthouseProbe to
+        // `compute/lighthouse-probe/<name>`; the Workbench Lighthouses tab
+        // renders it. The spawn is owned by the worker module
+        // (`Supervisor::spawn_lighthouse_probe`, sibling `Spawn::new` pattern +
+        // the rank-0 role gate); it self-resolves its workgroup root from
+        // `MDE_WORKGROUP_ROOT`, so no DB/handle plumbing is needed here.
+        if let Some(name) = sup.spawn_lighthouse_probe() {
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push(name.into());
+        }
+
         // v4.0.1 AF-* (2026-05-23) — register the
         // dev.mackes.MDE.Fleet.Files surface on the session bus
         // so mde-files's DBusBackend can read the live mesh
