@@ -58,6 +58,20 @@ pub const DEFAULT_TTL_EPHEMERAL_SECS: u64 = 60 * 60;
 pub const DEFAULT_QUOTA_SOFT_BYTES: u64 = 96 * 1024 * 1024;
 pub const DEFAULT_QUOTA_HARD_BYTES: u64 = 144 * 1024 * 1024;
 
+/// BUS-RUN-FULL-1-dfguard — filesystem-pressure trip point. The bus's own
+/// quota (`quota_hard_bytes`) only bounds the bus's *own* footprint; it says
+/// nothing about the rest of the `/run` tmpfs the bus shares with dnf locks, the
+/// journal, systemd runtime state, etc. On a small lighthouse `/run` (~190 MB) a
+/// co-tenant writer can push the *filesystem* to 90%+ while the bus is still
+/// comfortably under its own hard cap — and a full `/run` breaks runtime locks
+/// (dnf, the bus's own WAL) and wedges the node (the v10.0.18 roll failure
+/// class). So when the actual filesystem holding `bus_root` crosses this fill
+/// ratio, `run_pass_at` lowers the *effective* hard cap below the bus's current
+/// footprint and lets the existing oldest-first evictor emergency-prune the
+/// spool, handing headroom back to the OS rather than wedging on a small `/run`.
+/// 85% leaves enough slack that the prune lands before ENOSPC.
+pub const FS_PRESSURE_FILL_PCT: u64 = 85;
+
 /// Default GC pass cadence. BUS-RUN-FULL-1 (2026-06-18): the old hourly pass let
 /// high-ingest nodes refill `/run` (tmpfs) from the quota cap to 100% between
 /// passes — a live .13 spool reached 389 MB (double the ~195 MB cap) and blocked
@@ -130,6 +144,13 @@ pub struct PassReport {
     /// `*.json` files PLUS the index DB itself (`index.sqlite{,-wal,-shm}`,
     /// BUS-RETENTION-1). This is the true `/run` footprint the quota guards.
     pub bytes_after: u64,
+    /// BUS-RUN-FULL-1-dfguard — true when the filesystem holding `bus_root` was
+    /// at/over [`FS_PRESSURE_FILL_PCT`] this pass, so the effective hard cap was
+    /// lowered below the bus's own footprint to emergency-prune the spool (the
+    /// bus shedding its own data to keep a near-full `/run` off ENOSPC, even
+    /// though the bus's bytes alone were under the configured hard cap). Distinct
+    /// from `evicted > 0`, which also fires on a plain bus-only hard-cap breach.
+    pub fs_pressure: bool,
     /// Quota state post-pass.
     pub quota: QuotaReport,
 }
@@ -219,6 +240,86 @@ pub fn index_db_bytes(root: &Path) -> u64 {
         .sum()
 }
 
+/// BUS-RUN-FULL-1-dfguard — the actual fill state of the filesystem hosting
+/// `bus_root`, as `(total_bytes, avail_bytes)`. Unlike [`disk_usage_bytes`] +
+/// [`index_db_bytes`] (which measure only the *bus's own* footprint), this is the
+/// whole shared `/run` tmpfs including every co-tenant writer (dnf locks, the
+/// journal, systemd runtime state). `df -B1 --output=size,avail` mirrors the
+/// existing mackesd probes; the workspace forbids `unsafe_code`, so a direct
+/// `statvfs(2)` via libc is off the table and the coreutils `df` (on every Fedora
+/// install) is the no-unsafe read. Returns `None` if `df` is missing or its
+/// output is unparseable — the caller then degrades to the plain bus-only cap.
+#[must_use]
+pub fn filesystem_total_avail_bytes(path: &Path) -> Option<(u64, u64)> {
+    let out = std::process::Command::new("df")
+        .arg("-B1")
+        .arg("--output=size,avail")
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // Line 1 is the header ("1B-blocks  Avail"); line 2 is "<size> <avail>".
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut cols = text.lines().nth(1)?.split_whitespace();
+    let total = cols.next()?.parse::<u64>().ok()?;
+    let avail = cols.next()?.parse::<u64>().ok()?;
+    Some((total, avail))
+}
+
+/// BUS-RUN-FULL-1-dfguard — pure threshold helper. Given the configured bus hard
+/// cap, the bus's current footprint, and the *whole filesystem's* `(total,
+/// avail)`, decide the **effective** hard cap to feed the oldest-first evictor and
+/// whether the filesystem is under pressure.
+///
+/// When the filesystem fill ratio `(total - avail) / total` is at/over
+/// [`FS_PRESSURE_FILL_PCT`], the bus must shed regardless of its own cap: we
+/// compute how many bytes must be freed to bring the filesystem back to the
+/// trip point (`reclaim`) and lower the effective hard cap to
+/// `footprint - reclaim` (never below 0, never above the configured cap). The
+/// existing evictor, which already drives the footprint down toward the soft cap
+/// when it exceeds the hard cap, then emergency-prunes the spool. Only the bus's
+/// own bytes can be reclaimed, so the achievable floor is naturally bounded — but
+/// every byte the bus gives back is headroom the OS regains.
+///
+/// With no pressure (or `total == 0`, an unreadable probe) the effective cap is
+/// just the configured hard cap and `pressure` is false — identical to the
+/// pre-dfguard behavior.
+#[must_use]
+pub fn fs_pressure_hard_cap(
+    configured_hard_bytes: u64,
+    footprint_bytes: u64,
+    fs_total_bytes: u64,
+    fs_avail_bytes: u64,
+) -> (u64, bool) {
+    if fs_total_bytes == 0 {
+        return (configured_hard_bytes, false);
+    }
+    let used = fs_total_bytes.saturating_sub(fs_avail_bytes);
+    // Integer-only fill check: used/total >= PCT/100  ⇔  used*100 >= total*PCT.
+    // u128 so a multi-GB workstation tmpfs can't overflow the multiply.
+    let over = u128::from(used) * 100
+        >= u128::from(fs_total_bytes) * u128::from(FS_PRESSURE_FILL_PCT);
+    if !over {
+        return (configured_hard_bytes, false);
+    }
+    // Bytes that must leave the filesystem to drop back to exactly the trip
+    // point: used - total*PCT/100.
+    let target_used =
+        u64::try_from(u128::from(fs_total_bytes) * u128::from(FS_PRESSURE_FILL_PCT) / 100)
+            .unwrap_or(fs_total_bytes);
+    let reclaim = used.saturating_sub(target_used);
+    // Lower the cap below the current footprint by `reclaim` so the evictor sheds
+    // at least that much — clamped to [0, configured] so pressure never *raises*
+    // the cap and an over-large reclaim just drives the cap to 0 (shed all
+    // sheddable spool).
+    let effective = footprint_bytes
+        .saturating_sub(reclaim)
+        .min(configured_hard_bytes);
+    (effective, true)
+}
+
 /// BUS-RETENTION-1 — return disk that the index DB freed (by the row deletes in
 /// a pass) to the OS. SQLite frees pages internally on `DELETE` but never shrinks
 /// the file on its own, so without this the index only ever grows — a live
@@ -265,6 +366,13 @@ fn open_index(bus_root: &Path) -> Result<Connection, RetentionError> {
 /// `now_unix_ms` is injected for testability — production
 /// callers pass `current_unix_ms()`.
 ///
+/// BUS-RUN-FULL-1-dfguard — also reads the *actual* fill of the filesystem
+/// holding `bus_root` ([`filesystem_total_avail_bytes`]); when `/run` is over
+/// [`FS_PRESSURE_FILL_PCT`] the effective hard cap is lowered below the bus's own
+/// footprint so the existing oldest-first evictor emergency-prunes the spool
+/// (handing headroom back to the OS) instead of wedging the node on a small,
+/// co-tenant-filled `/run`. See [`fs_pressure_hard_cap`].
+///
 /// # Errors
 /// [`RetentionError::Sql`] or [`RetentionError::Io`] depending
 /// on which layer fails.
@@ -272,6 +380,22 @@ pub fn run_pass_at(
     policy: &RetentionPolicy,
     bus_root: &Path,
     now_unix_ms: i64,
+) -> Result<PassReport, RetentionError> {
+    // Probe the real filesystem fill once; `None` (df missing/unparseable)
+    // degrades to the plain bus-only cap.
+    let fs = filesystem_total_avail_bytes(bus_root);
+    run_pass_at_inner(policy, bus_root, now_unix_ms, fs)
+}
+
+/// BUS-RUN-FULL-1-dfguard — the body of [`run_pass_at`] with the filesystem
+/// `(total, avail)` reading injected, so the dfguard path is unit-testable
+/// without a controllable real `/run`. `fs == None` means "probe unavailable" and
+/// reproduces the pre-dfguard behavior exactly.
+fn run_pass_at_inner(
+    policy: &RetentionPolicy,
+    bus_root: &Path,
+    now_unix_ms: i64,
+    fs: Option<(u64, u64)>,
 ) -> Result<PassReport, RetentionError> {
     let conn = open_index(bus_root)?;
 
@@ -370,8 +494,31 @@ pub fn run_pass_at(
     // the cap reported "under budget". Eviction can only shed spool files, so it
     // targets `soft - db` to bring spool + (compacted) DB back under the soft cap.
     let mut bytes_after = disk_usage_bytes(bus_root)? + index_db_bytes(bus_root);
+
+    // BUS-RUN-FULL-1-dfguard — fold the *whole filesystem's* fill into the cap.
+    // When `/run` is over FS_PRESSURE_FILL_PCT the effective hard cap drops below
+    // the bus's current footprint (so eviction fires even if the bus alone is
+    // under its configured cap), and the soft target — the level eviction sheds
+    // down to — drops by the same relief so the spool actually gives the OS that
+    // headroom back. With no pressure both equal the configured caps and the
+    // behavior is identical to before.
+    let (effective_hard, fs_pressure) = match fs {
+        Some((total, avail)) => {
+            fs_pressure_hard_cap(policy.quota_hard_bytes, bytes_after, total, avail)
+        }
+        None => (policy.quota_hard_bytes, false),
+    };
+    // The eviction landing zone (target total footprint) is the configured soft
+    // cap, but never ABOVE the effective hard cap: under fs pressure the effective
+    // hard cap sits just below the current footprint (footprint - reclaim), so the
+    // evictor sheds exactly the filesystem overshoot — not the whole spool. When
+    // the bus is ALSO over its own soft cap, the configured soft cap is the lower
+    // (more aggressive) target and wins. With no pressure this is just the
+    // configured soft cap, identical to the pre-dfguard behavior.
+    let effective_soft = policy.quota_soft_bytes.min(effective_hard);
+
     let mut evicted = 0_usize;
-    if bytes_after > policy.quota_hard_bytes {
+    if bytes_after > effective_hard {
         let spool = disk_usage_bytes(bus_root)?;
         // The index duplicates each message's title+body, so evicting a message
         // frees its spool file AND (after compaction) its DB rows — roughly
@@ -380,10 +527,8 @@ pub fn run_pass_at(
         // soft cap: spool_target = spool * soft / total. (u128 to avoid overflow
         // at multi-GB workstation tmpfs sizes.)
         let spool_target = if bytes_after > 0 {
-            u64::try_from(
-                u128::from(spool) * u128::from(policy.quota_soft_bytes) / u128::from(bytes_after),
-            )
-            .unwrap_or(policy.quota_soft_bytes)
+            u64::try_from(u128::from(spool) * u128::from(effective_soft) / u128::from(bytes_after))
+                .unwrap_or(effective_soft)
         } else {
             0
         };
@@ -401,6 +546,7 @@ pub fn run_pass_at(
         removed,
         evicted,
         bytes_after,
+        fs_pressure,
         quota,
     })
 }
@@ -494,6 +640,7 @@ pub async fn run_loop(
                             removed = report.removed,
                             evicted = report.evicted,
                             bytes_after = report.bytes_after,
+                            fs_pressure = report.fs_pressure,
                             soft_exceeded = report.quota.soft_exceeded,
                             hard_exceeded = report.quota.hard_exceeded,
                             "retention pass complete"
@@ -503,7 +650,15 @@ pub async fn run_loop(
                                 target: "mde_bus::retention",
                                 evicted = report.evicted,
                                 bytes_after = report.bytes_after,
+                                fs_pressure = report.fs_pressure,
                                 "BULLETPROOF-1: hard-cap reached — evicted oldest messages to keep the bus tmpfs off ENOSPC"
+                            );
+                        }
+                        if report.fs_pressure {
+                            tracing::warn!(
+                                target: "mde_bus::retention",
+                                bytes_after = report.bytes_after,
+                                "BUS-RUN-FULL-1-dfguard: filesystem over the fill threshold — lowered the effective hard cap to emergency-prune the spool and hand /run headroom back to the OS"
                             );
                         }
                         if report.quota.soft_exceeded && !last_soft_warn {
@@ -1154,5 +1309,162 @@ mod tests {
             "plateau {last} is far above the cap {} — eviction did not bound the bus",
             policy.quota_hard_bytes,
         );
+    }
+
+    // BUS-RUN-FULL-1-dfguard — filesystem-pressure guard.
+
+    #[test]
+    fn fs_pressure_below_threshold_keeps_configured_cap() {
+        // 80% full (< 85% trip) → effective cap == configured, no pressure.
+        let total = 100;
+        let avail = 20; // used = 80 → 80%
+        let (cap, pressure) = fs_pressure_hard_cap(1000, 500, total, avail);
+        assert_eq!(cap, 1000, "below threshold: cap unchanged");
+        assert!(!pressure, "below threshold: no pressure");
+    }
+
+    #[test]
+    fn fs_pressure_at_threshold_lowers_cap_below_footprint() {
+        // Exactly 85% full → pressure trips. With used == target (85%) the
+        // reclaim is 0, so the cap equals the footprint (clamped to configured):
+        // any growth from here evicts.
+        let total = 100;
+        let avail = 15; // used = 85 → exactly 85%
+        let footprint = 40;
+        let (cap, pressure) = fs_pressure_hard_cap(1000, footprint, total, avail);
+        assert!(pressure, "at threshold: pressure trips");
+        assert_eq!(cap, footprint, "reclaim 0 at the trip point → cap == footprint");
+    }
+
+    #[test]
+    fn fs_pressure_over_threshold_reclaims_the_overshoot() {
+        // 95% full on a 100-byte fs, 15% over the 85% trip → reclaim = 95 - 85 =
+        // 10 bytes. A 50-byte footprint must be capped at 50 - 10 = 40 so the
+        // evictor sheds ~10 bytes of spool back to the OS.
+        let total = 100;
+        let avail = 5; // used = 95
+        let (cap, pressure) = fs_pressure_hard_cap(1000, 50, total, avail);
+        assert!(pressure);
+        assert_eq!(cap, 40, "cap = footprint - (used - 85% target)");
+    }
+
+    #[test]
+    fn fs_pressure_clamps_cap_to_configured_and_zero() {
+        // Reclaim larger than the footprint drives the cap to 0 (shed all
+        // sheddable spool), never negative.
+        let total = 100;
+        let avail = 0; // 100% full → reclaim = 15
+        let (cap, pressure) = fs_pressure_hard_cap(1000, 5, total, avail);
+        assert!(pressure);
+        assert_eq!(cap, 0, "reclaim > footprint → cap floors at 0");
+
+        // Pressure never RAISES the cap above the configured hard cap: a tiny
+        // reclaim on a footprint far above the configured cap still clamps down.
+        let (cap2, pressure2) = fs_pressure_hard_cap(30, 1000, 100, 10); // 90% full
+        assert!(pressure2);
+        assert!(cap2 <= 30, "effective cap never exceeds configured, got {cap2}");
+    }
+
+    #[test]
+    fn fs_pressure_unreadable_probe_is_noop() {
+        // total == 0 models an unreadable/missing `df` → degrade to the plain cap.
+        let (cap, pressure) = fs_pressure_hard_cap(1000, 999, 0, 0);
+        assert_eq!(cap, 1000);
+        assert!(!pressure);
+    }
+
+    #[test]
+    fn dfguard_emergency_prunes_when_fs_full_though_bus_under_cap() {
+        // The decisive end-to-end case: the bus's OWN footprint is comfortably
+        // under its configured hard cap, but the shared filesystem is 95% full
+        // (a co-tenant filled /run). The dfguard must still evict oldest-first to
+        // hand the OS headroom back, rather than leaving the node to wedge.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let mb = 1024 * 1024;
+        let now = 1_000_000_000_000_i64;
+        let mut ulids = Vec::new();
+        for i in 0..6 {
+            // Recent High messages → no TTL reap; only the dfguard can shed them.
+            ulids.push(write_sized(&root, "t/bulk", Priority::High, now - (6 - i) * 1000, mb));
+        }
+        purge_audit(&root);
+        // Caps far above the ~6 MB spool+DB footprint, so the bus-only hard-cap
+        // valve would NEVER fire on its own.
+        let policy = RetentionPolicy {
+            quota_soft_bytes: 500 * mb as u64,
+            quota_hard_bytes: 600 * mb as u64,
+            ..RetentionPolicy::default()
+        };
+        // Inject a 95%-full filesystem (10 MB total, 0.5 MB avail). 95% - 85% =
+        // 10% of 10 MB = 1 MB to reclaim → at least one 1 MB message is shed.
+        let fs = Some((10 * mb as u64, mb as u64 / 2));
+        let report = run_pass_at_inner(&policy, &root, now, fs).unwrap();
+        assert!(report.fs_pressure, "fs pressure must be flagged");
+        assert!(
+            report.evicted >= 1,
+            "dfguard must shed despite the bus being under its own cap"
+        );
+        // Oldest-first: the very first message is gone; the newest survives.
+        let p = Persist::open(root.clone()).unwrap();
+        let remaining: Vec<String> = p
+            .list_since("t/bulk", None)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.ulid)
+            .collect();
+        assert!(!remaining.contains(&ulids[0]), "oldest evicted under fs pressure");
+        assert!(remaining.contains(ulids.last().unwrap()), "newest survives");
+    }
+
+    #[test]
+    fn dfguard_no_pressure_leaves_bus_only_behavior_unchanged() {
+        // With the filesystem at 50% full, the dfguard is inert: a bus under its
+        // own hard cap evicts nothing and `fs_pressure` is false — byte-for-byte
+        // the pre-dfguard path.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_sized(&root, "t/small", Priority::High, 1, 1024);
+        purge_audit(&root);
+        let mb = 1024 * 1024;
+        let fs = Some((100 * mb as u64, 50 * mb as u64)); // 50% full
+        let report =
+            run_pass_at_inner(&RetentionPolicy::default(), &root, 1_000_000_000_000, fs).unwrap();
+        assert!(!report.fs_pressure);
+        assert_eq!(report.evicted, 0);
+    }
+
+    #[test]
+    fn run_pass_at_reaches_the_real_df_probe_without_panicking() {
+        // The wired entrypoint `run_pass_at` (called from mackesd's GC thread)
+        // must actually probe the real filesystem via `df`. This proves that read
+        // is reachable and its output parses without panicking — and that a tiny
+        // spool under the default tmpfs-safe caps does not evict. We deliberately
+        // do NOT assert on `fs_pressure`: a build host's tmp could legitimately be
+        // over the fill threshold, so that bit is exercised deterministically by
+        // the injected-fs tests above; here we only require the probe path runs.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_sized(&root, "t/x", Priority::High, 1, 1024);
+        purge_audit(&root);
+        let report = run_pass_at(&RetentionPolicy::default(), &root, 1_000_000_000_000).unwrap();
+        // A 1 KB spool is far under the 144 MB default hard cap; only a genuinely
+        // full filesystem could force eviction, which a tempdir-on-a-real-disk is
+        // not, so nothing should be shed.
+        assert_eq!(report.evicted, 0, "tiny spool under default caps evicts nothing");
+    }
+
+    #[test]
+    fn filesystem_probe_parses_a_real_path() {
+        // The `df` reader returns a sane (total, avail) for the temp dir's real
+        // filesystem: total > 0 and avail <= total. Guards against a column-order
+        // or parse regression in the `--output=size,avail` read.
+        let tmp = tempfile::tempdir().unwrap();
+        if let Some((total, avail)) = filesystem_total_avail_bytes(tmp.path()) {
+            assert!(total > 0, "real filesystem reports a non-zero size");
+            assert!(avail <= total, "avail ({avail}) must not exceed total ({total})");
+        }
+        // `None` (no `df`) is an acceptable degraded outcome — the guard then
+        // falls back to the bus-only cap — so we don't fail the test on it.
     }
 }
