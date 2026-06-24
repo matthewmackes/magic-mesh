@@ -237,6 +237,14 @@ struct Center {
     /// when the daemon is down. Each row renders as text + source-node + age, is
     /// click-to-copy onto THIS node, and carries per-entry pin + delete.
     clips: Vec<ClipRow>,
+    /// NOTIFY-FX-1 — the instant the Hub surface opened, so its open-in animation
+    /// (the launcher's `panel_mount` slide-up, folded in here for one shared
+    /// effects vocabulary) eases from this start. Set in [`Center::new`].
+    opened_at: std::time::Instant,
+    /// NOTIFY-FX-1 — `a11y.reduce_motion` resolved from the user's preferences, so
+    /// the shared open-in helper collapses the slide to a pure crossfade (the same
+    /// reduce-motion contract `HubAnim` already honors for the per-item motion).
+    reduce_motion: bool,
 }
 
 impl Center {
@@ -258,7 +266,40 @@ impl Center {
             seen_ids: HashSet::new(),
             expanded_stacks: HashSet::new(),
             clips: Vec::new(),
+            // NOTIFY-FX-1 — the open-in clock starts the moment the Center is
+            // constructed (the layer surface is mapped right after), so the Hub
+            // slides up on open exactly like the launcher dropdown.
+            opened_at: std::time::Instant::now(),
+            reduce_motion,
         }
+    }
+
+    /// NOTIFY-FX-1 — the Hub-open transition at `now`, reusing the **same** shared
+    /// vocabulary the launcher's open-in uses (`mde_theme::animation::slide_in` =
+    /// `Motion::panel_mount` slide-up, reduce-motion ⇒ crossfade). This is GLUE
+    /// over the shared helper — the launcher's `menu_in()` resolves the identical
+    /// `Transition::SlideUp(PANEL_MOUNT_TRANSLATE_Y_PX)`, so Hub + Application Menu
+    /// open with one motion idiom (NOTIFY-FX-1 acceptance). A settled/disabled
+    /// motion returns rest (no offset), so once the open beat is over the Hub
+    /// renders exactly as before.
+    fn open_in(&self, now: std::time::Instant) -> mde_theme::animation::RenderParams {
+        mde_theme::animation::slide_in(
+            self.opened_at,
+            now,
+            mde_theme::PANEL_MOUNT_TRANSLATE_Y_PX,
+            self.reduce_motion,
+        )
+    }
+
+    /// NOTIFY-FX-1 — is the open-in slide still in flight at `now`? Gates the
+    /// animation tick so the Hub keeps ticking through the open beat (then stops),
+    /// same as it does for an in-flight per-item entrance (MOTION-PERF-1: no idle
+    /// wakeups once both are settled).
+    fn open_in_flight(&self, now: std::time::Instant) -> bool {
+        // `panel_mount` is the longest beat in play; once it's elapsed the slide
+        // has settled. Under reduce-motion the helper caps the duration, but the
+        // ≤80 ms window is still bounded by the full beat, so this gate is safe.
+        now.duration_since(self.opened_at) < mde_theme::Motion::panel_mount().duration
     }
 
     /// NOTIFY-HUB-2 — register any rows that are new since the last frame so they
@@ -652,9 +693,12 @@ fn subscription(s: &Center) -> Subscription<Message> {
                 .map(|_| Message::BeamTick),
         );
     }
-    // NOTIFY-HUB-2 — only tick the new-item slide/blink while an entrance is
-    // actually in flight (MOTION-PERF-1: an idle Hub does no animation work).
-    if !s.anim.is_idle(std::time::Instant::now()) {
+    // NOTIFY-HUB-2 / NOTIFY-FX-1 — tick the per-item slide/blink while an entrance
+    // is in flight, AND tick through the Hub-open slide-up beat so the launcher's
+    // folded-in open-in animates to rest. One shared `AnimTick` drives both; at
+    // rest neither is armed (MOTION-PERF-1: an idle Hub does no animation work).
+    let now = std::time::Instant::now();
+    if !s.anim.is_idle(now) || s.open_in_flight(now) {
         subs.push(
             cosmic::iced::time::every(std::time::Duration::from_millis(ANIM_TICK_MS))
                 .map(|_| Message::AnimTick),
@@ -1150,8 +1194,24 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
     sections.push(quick_actions.into());
     sections.push(launch_bar.into());
 
+    // NOTIFY-FX-1 — fold the launcher's "menu effects" open-in into the Hub: the
+    // whole content body starts a few px low and rises to rest on open (the shared
+    // `panel_mount` slide-up `open_in` resolves — the identical vocabulary the
+    // Application Menu's `menu_in()` uses). Rendered as decaying top padding (iced
+    // 0.13 has no transform widget — MOTION-INFRA-2's translate-as-padding idiom,
+    // exactly as the launcher applies it). The surface is full-height
+    // (`Length::Fill`), so nudging the content down within it never reflows the
+    // layer surface; at rest / under a disabled motion preference the offset is 0,
+    // so the Hub renders unchanged once the open beat has elapsed.
+    let slide = state.open_in(anim_now).translate_y.max(0.0);
     let content: Element<'_, Message> =
         container(cosmic::iced::widget::column(sections).spacing(0))
+            .padding(Padding {
+                top: slide,
+                right: 0.0,
+                bottom: 0.0,
+                left: 0.0,
+            })
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
@@ -2016,6 +2076,63 @@ mod tests {
         // Building the view must succeed (chrome + skeleton sections) — this is
         // what the operator sees on the first frame, before any Loaded lands.
         let _element = view(&state, window::Id::unique());
+    }
+
+    /// NOTIFY-FX-1 — the Hub-open animation folds in the launcher's idiom: on open
+    /// the content body is offset down by the shared `panel_mount` slide distance
+    /// and eases up to rest, and the tick subscription stays armed only while that
+    /// open beat is in flight (MOTION-PERF-1). We assert against the SAME shared
+    /// helper the launcher's `menu_in()` resolves, so the two open with one
+    /// vocabulary (not a Hub-local reimplementation).
+    #[test]
+    fn hub_open_in_matches_the_launcher_slide_idiom() {
+        use std::time::Duration;
+        let mut state = Center::new();
+        // Pin the open clock so the assertions are deterministic.
+        let t0 = std::time::Instant::now();
+        state.opened_at = t0;
+        state.reduce_motion = false;
+
+        // At the open instant the body starts offset down by the shared
+        // panel-mount slide distance — the exact launcher vocabulary.
+        let at_open = state.open_in(t0);
+        assert!(
+            (at_open.translate_y - mde_theme::PANEL_MOUNT_TRANSLATE_Y_PX).abs() < 1e-3,
+            "Hub opens offset by the shared panel-mount slide, got {}",
+            at_open.translate_y
+        );
+        assert!(state.open_in_flight(t0), "the open beat is in flight at t0");
+
+        // Past the panel-mount beat it has settled to rest (no offset) and the
+        // open-in tick stops (so an open Hub at rest does no animation work).
+        let beat = mde_theme::Motion::panel_mount().duration;
+        let after = t0 + beat + Duration::from_millis(1);
+        assert!(
+            state.open_in(after).translate_y.abs() < 1e-3,
+            "the open-in slide settles to rest after one panel-mount beat"
+        );
+        assert!(
+            !state.open_in_flight(after),
+            "the open beat is over, so the tick gate releases"
+        );
+    }
+
+    /// NOTIFY-FX-1 — under reduce-motion the open-in collapses to a pure crossfade
+    /// (no positional slide), honoring the same a11y contract the per-item motion
+    /// already does — and the shared helper, not a Hub-local branch, enforces it.
+    #[test]
+    fn hub_open_in_has_no_slide_under_reduce_motion() {
+        let mut state = Center::new();
+        state.opened_at = std::time::Instant::now();
+        state.reduce_motion = true;
+        // Sampled anywhere in the window, the reduce-motion open-in never moves the
+        // surface — translate_y is always 0 (opacity-only crossfade).
+        let p = state.open_in(state.opened_at);
+        assert!(
+            p.translate_y.abs() < 1e-6,
+            "reduce-motion open-in must not slide, got {}",
+            p.translate_y
+        );
     }
 
     #[test]
