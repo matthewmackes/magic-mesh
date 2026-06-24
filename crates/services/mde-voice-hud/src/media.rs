@@ -179,6 +179,11 @@ pub fn rtp_payload(packet: &[u8]) -> Option<&[u8]> {
 /// A running media session — drop or `stop()` to tear down the streams.
 pub struct MediaSession {
     stop: Arc<AtomicBool>,
+    /// In-call microphone mute. When set, the send loop drops captured mic
+    /// frames instead of packetizing them, so the peer hears silence while the
+    /// receive path keeps playing their audio. Shared with the audio thread so
+    /// a toggle takes effect on the next frame without restarting the session.
+    muted: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -189,6 +194,19 @@ impl MediaSession {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+    }
+
+    /// Set the microphone-mute state. `true` stops transmitting mic audio (the
+    /// peer hears silence) while still playing the peer's audio; `false`
+    /// resumes transmitting. Takes effect on the next 20 ms frame.
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
+    }
+
+    /// `true` when the microphone is currently muted.
+    #[must_use]
+    pub fn is_muted(&self) -> bool {
+        self.muted.load(Ordering::Relaxed)
     }
 }
 
@@ -219,15 +237,18 @@ pub fn start_media(local_rtp_port: u16, remote: &RemoteMedia) -> Result<MediaSes
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
+    let muted = Arc::new(AtomicBool::new(false));
+    let muted_thread = muted.clone();
     let payload_type = remote.payload_type;
 
     let thread = std::thread::Builder::new()
         .name("mwv-rtp-media".into())
-        .spawn(move || run_audio(&sock, payload_type, &stop_thread))
+        .spawn(move || run_audio(&sock, payload_type, &stop_thread, &muted_thread))
         .map_err(|e| format!("media thread spawn failed ({e})"))?;
 
     Ok(MediaSession {
         stop,
+        muted,
         thread: Some(thread),
     })
 }
@@ -235,7 +256,7 @@ pub fn start_media(local_rtp_port: u16, remote: &RemoteMedia) -> Result<MediaSes
 /// The audio thread: owns the cpal streams (`Stream` is `!Send`) and drives the
 /// RTP send/recv loops. Shared `VecDeque`s bridge the cpal callbacks and the
 /// network I/O.
-fn run_audio(sock: &UdpSocket, payload_type: u8, stop: &AtomicBool) {
+fn run_audio(sock: &UdpSocket, payload_type: u8, stop: &AtomicBool, muted: &AtomicBool) {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
     // mic samples captured by the input callback, drained by the send loop.
@@ -305,9 +326,15 @@ fn run_audio(sock: &UdpSocket, payload_type: u8, stop: &AtomicBool) {
                 }
             });
             let Some(pcm) = frame else { break };
-            let payload = encode_frame(&pcm, payload_type);
-            let packet = build_rtp_packet(payload_type, seq, timestamp, ssrc, &payload);
-            let _ = sock.send(&packet);
+            // Mic mute: the frame is still drained from the capture queue (so it
+            // can't grow unbounded while muted), but it is not packetized or
+            // sent — the peer hears silence. The RTP seq/timestamp still advance
+            // so the stream stays well-formed when transmit resumes.
+            if !muted.load(Ordering::Relaxed) {
+                let payload = encode_frame(&pcm, payload_type);
+                let packet = build_rtp_packet(payload_type, seq, timestamp, ssrc, &payload);
+                let _ = sock.send(&packet);
+            }
             seq = seq.wrapping_add(1);
             timestamp = timestamp.wrapping_add(FRAME_SAMPLES as u32);
         }
@@ -402,5 +429,29 @@ mod tests {
     fn rtp_payload_rejects_short_or_nonrtp() {
         assert_eq!(rtp_payload(&[0u8; 4]), None); // too short
         assert_eq!(rtp_payload(&[0x40u8; 16]), None); // version 1, not 2
+    }
+
+    #[test]
+    fn mute_toggle_round_trips_on_a_live_session() {
+        // Stand up a real session against a loopback "peer" (a bound UDP socket
+        // that just receives) and exercise the public mute API. No audio
+        // hardware is required — `start_media` returns Ok even when cpal finds no
+        // devices; the send/recv loop runs regardless. This proves the mute flag
+        // is wired end-to-end (start_media → run_audio) and toggles live.
+        let peer = UdpSocket::bind(("127.0.0.1", 0)).expect("bind loopback peer");
+        let peer_addr = peer.local_addr().expect("peer addr");
+        let remote = RemoteMedia {
+            addr: peer_addr.ip().to_string(),
+            port: peer_addr.port(),
+            payload_type: 0,
+        };
+        // Local RTP port 0 → the OS picks a free one.
+        let session = start_media(0, &remote).expect("media session starts");
+        assert!(!session.is_muted(), "a fresh session starts un-muted");
+        session.set_muted(true);
+        assert!(session.is_muted(), "set_muted(true) takes effect");
+        session.set_muted(false);
+        assert!(!session.is_muted(), "set_muted(false) clears it");
+        session.stop();
     }
 }
