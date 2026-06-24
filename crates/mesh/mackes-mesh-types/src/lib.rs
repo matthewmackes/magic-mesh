@@ -52,7 +52,9 @@ pub mod vpn;
 /// VPN-GW-3 — selective egress: fwmark/ip-rule policy routing + nftables
 /// masquerade + a leak-proof kill-switch, with the Nebula overlay carved out so
 /// mesh traffic never tunnels. Pure argv builders applied by the `vpn_gw`
-/// responder on tunnel up/down.
+/// responder on tunnel up/down. Also holds VPN-GW-4 — the mesh egress *routing*
+/// table (per-node / group / ANY) + the ordered failover chain the `vpn_gw`
+/// responder serves over `action/vpn/{set,clear,list,…}-route`.
 pub mod vpn_egress;
 /// VPN-GW-5 — first-class provider adapters (Mullvad/Proton/IVPN/Nord/Surfshark)
 /// + the generic "paste WG config" / "import .ovpn" config-generation paths.
