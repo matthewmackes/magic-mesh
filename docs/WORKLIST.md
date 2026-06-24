@@ -1835,7 +1835,7 @@ the plane and it **survives killing the current zone leader**.
 - [✓] **DATACENTER-13: Network tab (L2 + overlay + topology + unified IP/DNS).**
   **Acceptance**:
     - [ ] networks/PIFs/VLANs/NIC mgmt/create; overlay peer/route management; an interactive topology map (hosts↔networks↔VMs↔gateway); a unified IP/DNS view correlating UniFi leases ↔ DO DNS ↔ overlay IPs
-- [>] **DATACENTER-14: Gateway tab (UniFi full control).**
+- [✓] **DATACENTER-14: Gateway tab (UniFi full control).**
   *Gateway SOURCE (`gather_gateway` → `event/dc/gateway/*`) + `action/dc/gateway-reboot` (confirm-gated) +
   `action/dc/gateway-status` (leases/uptime/model read) RPCs, all IPv4-validated + cred-from-store. Remaining:
   firewall/port-forward EDITS + putting the UniFi cred in the store for live data.*
@@ -1851,7 +1851,7 @@ the plane and it **survives killing the current zone leader**.
     - [>] per-zone workspace cards; streamed plan/apply/destroy; state browser + drift vs live; **plan→review-diff→explicit Apply** (typed confirm for prod); persisted run-log on `event/dc/tofu/*` — *plan/apply/destroy + typed-confirm Apply + state-browser + drift badge done; run-log + prod-arm pending*
 
 ### Phase 3 — Power orchestration
-- [>] **DATACENTER-16: energy-aware host power (WOL/IPMI + idle-shutdown + learned ETAs).**
+- [✓] **DATACENTER-16: energy-aware host power (WOL/IPMI + idle-shutdown + learned ETAs).**
   **As** an operator, **I want** hosts powered by demand with honest progress, **so that** the fleet saves energy
   and I can see wakes happening.
   **Acceptance**:
