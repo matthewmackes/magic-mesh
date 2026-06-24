@@ -178,7 +178,11 @@ impl Drop for OpLockGuard<'_> {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 10] = [
+///
+/// DATACENTER-12: the trailing five are the storage verbs ([`crate::ipc::storage_ops`]),
+/// served on THIS responder so the panel's Storage tab acts through the same Bus
+/// round trip as the VM tab. `build_reply` routes them into `storage_ops`.
+pub const ACTION_VERBS: [&str; 15] = [
     "vm-power",
     "vm-snapshot",
     "vm-clone",
@@ -189,6 +193,11 @@ pub const ACTION_VERBS: [&str; 10] = [
     "vm-resize",
     "vm-create",
     "do-regions",
+    "sr-create",
+    "vdi-create",
+    "vdi-attach",
+    "vdi-detach",
+    "sr-snapshot",
 ];
 
 /// Responder poll interval.
@@ -537,6 +546,28 @@ pub fn lock_key(verb: &str, req_body: Option<&str>) -> Option<String> {
         }
         return Some(format!("vm-new:{name}"));
     }
+    // DATACENTER-12 — storage verbs lock on the resource they target so two
+    // mutations on the same SR/VDI/VBD don't race. Each reads a different body
+    // field for its key; an absent/empty field returns `None` (no lock — the
+    // per-verb builder produces the real validation error).
+    let storage_key = match verb {
+        "sr-create" => Some(("name", "sr-new")),
+        "vdi-create" => Some(("sr", "sr")),
+        "vdi-attach" | "sr-snapshot" => Some(("vdi", "vdi")),
+        "vdi-detach" => Some(("vbd", "vbd")),
+        _ => None,
+    };
+    if let Some((field, ns)) = storage_key {
+        let val = serde_json::from_str::<serde_json::Value>(req_body?)
+            .ok()?
+            .get(field)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)?;
+        if val.is_empty() {
+            return None;
+        }
+        return Some(format!("{ns}:{val}"));
+    }
     // The mutating vm-* verbs lock on the target VM's uuid; read-only verbs hold
     // no lock.
     match verb {
@@ -591,6 +622,11 @@ pub fn build_reply(svc: &DatacenterService, verb: &str, req_body: Option<&str>) 
         "vm-resize" => vm_resize_reply(req_body),
         "vm-create" => vm_create_reply(svc, req_body),
         "do-regions" => do_regions_reply(),
+        // DATACENTER-12 — storage verbs are served on this responder but built by
+        // the sibling storage_ops module (the op-lock above already guards them).
+        v if crate::ipc::storage_ops::is_storage_verb(v) => {
+            crate::ipc::storage_ops::build_reply(v, req_body)
+        }
         _ => err("unknown dc verb".into()),
     }
 }

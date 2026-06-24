@@ -110,6 +110,26 @@ impl DcRow {
         Some(format!("{used_gib} / {size_gib} GiB ({pct}%)"))
     }
 
+    /// DATACENTER-12 — a storage row's used-capacity percentage (0..=100, rounded),
+    /// or `None` when `size`/`used` don't parse or `size` is 0. The Storage tab's
+    /// capacity-threshold alerts read this; sharing the parse with
+    /// [`Self::capacity_readout`] keeps the readout and the alert consistent. Pure.
+    #[must_use]
+    pub fn used_pct(&self) -> Option<u64> {
+        let size: u64 = self.size.parse().ok()?;
+        let used: u64 = self.used.parse().ok()?;
+        if size == 0 {
+            return None;
+        }
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let pct = ((used as f64 / size as f64) * 100.0).round() as u64;
+        Some(pct.min(100))
+    }
+
     /// DATACENTER-10 — a host's memory readout, `"used / total GiB (pct%)"`, from
     /// the `mem_total_mb` / `mem_free_mb` host metrics (used = total − free).
     /// Returns `None` when either metric is missing/unparseable or `total` is 0, so
@@ -1014,6 +1034,23 @@ pub struct DatacenterPanel {
     /// prompt, and only the Confirm button fires the `action/dc/host-power` RPC.
     /// Cleared once the op is fired or cancelled.
     pub host_confirm: Option<(String, String)>,
+    /// DATACENTER-12 (Storage tab) — the in-progress SR-create form. Fires
+    /// `action/dc/sr-create`. Empty by default; edited on the Storage tab.
+    pub sr_create: SrCreateForm,
+    /// DATACENTER-12 (Storage tab) — the in-progress VDI-create form. Fires
+    /// `action/dc/vdi-create`. A per-SR card's "VDI here" seeds its `sr`/`dom0`.
+    pub vdi_create: VdiCreateForm,
+    /// DATACENTER-12 (Storage tab) — the scheduled-snapshot config form. Fires
+    /// `action/dc/snap-schedule` (retention + backup target).
+    pub snap_schedule: SnapScheduleForm,
+    /// DATACENTER-12 (Storage tab) — the SR capacity-alert **warning** threshold
+    /// (percent). An SR at/above it badges `warning`; at/above [`SR_CRITICAL_PCT`]
+    /// it badges `danger`. Defaults to 85. Operator-tunable from the tab.
+    pub storage_threshold_pct: u64,
+    /// DATACENTER-12 (Storage tab) — the SR-create threshold text box's in-progress
+    /// value (parsed into `storage_threshold_pct` on change; kept as text so an
+    /// in-progress empty box doesn't snap to 0). Pure UI state.
+    pub storage_threshold_input: String,
 }
 
 /// Top-level view selector for the datacenter panel.
@@ -1033,6 +1070,11 @@ pub enum ViewMode {
     /// golden-template create wizard, and multi-select bulk power / snapshot / tag
     /// with per-item progress.
     Vms,
+    /// DATACENTER-12 — the Storage tab: SR capacity cards with threshold alerts,
+    /// an SR-create + a VDI-create form, a per-SR snapshot action, a
+    /// scheduled-snapshot config (retention + backup target), and an ISO /
+    /// template image library.
+    Storage,
     /// OpenTofu workspaces + Plan / Apply buttons.
     Tofu,
     /// The datacenter audit log (`event/dc/audit/*`), newest-first.
@@ -1053,6 +1095,7 @@ impl ViewMode {
             ViewMode::Zone => "resources",
             ViewMode::Hosts => "hosts",
             ViewMode::Vms => "vms",
+            ViewMode::Storage => "storage",
             ViewMode::Tofu => "tofu",
             ViewMode::Audit => "audit",
             ViewMode::Topology => "topology",
@@ -1069,6 +1112,7 @@ impl ViewMode {
             "resources" => ViewMode::Zone,
             "hosts" => ViewMode::Hosts,
             "vms" => ViewMode::Vms,
+            "storage" => ViewMode::Storage,
             "tofu" => ViewMode::Tofu,
             "audit" => ViewMode::Audit,
             "topology" => ViewMode::Topology,
@@ -1110,6 +1154,139 @@ pub struct VmCreateForm {
     /// The destination dom0 (the pool the resource lands in); must be an allow-listed
     /// host. Defaults to the active zone's first Xen dom0 when opened.
     pub dom0: String,
+}
+
+/// DATACENTER-12 (Storage tab) — the in-progress SR-create form. The `Create SR`
+/// button packs it into the `action/dc/sr-create` request. Pure local UI state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SrCreateForm {
+    /// The new SR's name-label (server-validated to `[A-Za-z0-9._-]`).
+    pub name: String,
+    /// The SR backend type (`lvm` default, `ext`, `nfs`, …; alphanumeric only).
+    pub sr_type: String,
+    /// The XAPI host uuid to create the SR on.
+    pub host_uuid: String,
+    /// Optional `key=value` device-config (e.g. `device=/dev/sdb`). Blank = none.
+    pub device_config: String,
+    /// The destination dom0 (must be allow-listed).
+    pub dom0: String,
+}
+
+/// DATACENTER-12 (Storage tab) — the in-progress VDI-create form. The `Create
+/// VDI` button packs it into the `action/dc/vdi-create` request. Pure UI state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VdiCreateForm {
+    /// The target SR uuid the VDI is created on.
+    pub sr: String,
+    /// The new VDI's name-label (server-validated to `[A-Za-z0-9._-]`).
+    pub name: String,
+    /// Virtual size in GiB (parsed to an integer 1..=65536; blank/invalid blocks).
+    pub size_gib: String,
+    /// The destination dom0 (must be allow-listed).
+    pub dom0: String,
+}
+
+/// DATACENTER-12 (Storage tab) — the scheduled-snapshot config. Captures which SR
+/// to snapshot on a cadence, how many snapshots to retain, and where backups
+/// land. Persisted via `action/dc/snap-schedule` (the `dr_scheduler`/orchestrator
+/// honors it); here it is the in-progress form. Pure UI state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnapScheduleForm {
+    /// The SR (or VDI) the schedule targets.
+    pub sr: String,
+    /// How many snapshots to retain (the oldest pruned beyond this; parsed int).
+    pub retention: String,
+    /// The backup target the retained snapshots are exported to (path / SR uuid).
+    pub backup_target: String,
+    /// The destination dom0 (must be allow-listed).
+    pub dom0: String,
+}
+
+/// DATACENTER-12 (Storage tab) — which storage form field a `StorageFieldChanged`
+/// targets. Keeps every storage form-edit a single message variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageField {
+    /// SR-create: name-label.
+    SrName,
+    /// SR-create: backend type.
+    SrType,
+    /// SR-create: XAPI host uuid.
+    SrHost,
+    /// SR-create: device-config `key=value`.
+    SrDeviceConfig,
+    /// SR-create: destination dom0.
+    SrDom0,
+    /// VDI-create: target SR uuid.
+    VdiSr,
+    /// VDI-create: name-label.
+    VdiName,
+    /// VDI-create: size (GiB).
+    VdiSize,
+    /// VDI-create: destination dom0.
+    VdiDom0,
+    /// Schedule: target SR.
+    SchedSr,
+    /// Schedule: retention count.
+    SchedRetention,
+    /// Schedule: backup target.
+    SchedBackupTarget,
+    /// Schedule: destination dom0.
+    SchedDom0,
+}
+
+/// DATACENTER-12 (Storage tab) — a capacity-threshold alert for one SR, computed
+/// purely from the SR row + the configured threshold. Rendered as a colored badge
+/// on the SR card and surfaced as a panel status line so the operator never has to
+/// hunt for the over-threshold store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SrAlert {
+    /// The SR's id (uuid) the alert is about.
+    pub id: String,
+    /// The SR's human name-label (falls back to id when unnamed).
+    pub name: String,
+    /// The SR's used-capacity percentage (0..=100, rounded).
+    pub pct: u64,
+    /// `true` when usage crossed the *critical* line (≥95%) vs merely the warning
+    /// threshold — drives a `danger` vs `warning` token on the badge.
+    pub critical: bool,
+}
+
+/// DATACENTER-12 — the critical (danger) SR-capacity line: at or above this
+/// percentage a store is one bad write from full, so it badges `danger` instead
+/// of `warning`. The warning line is the operator-configurable threshold.
+pub const SR_CRITICAL_PCT: u64 = 95;
+
+/// DATACENTER-12 — compute the capacity-threshold alerts for the SR rows, given
+/// the operator's warning `threshold_pct`. An SR with a parseable size/used and a
+/// used-percentage at or above the threshold yields an [`SrAlert`]; `critical` is
+/// set at/above [`SR_CRITICAL_PCT`]. Sorted most-full first so the worst store
+/// reads at the top. Pure + testable.
+#[must_use]
+pub fn sr_alerts(rows: &[DcRow], threshold_pct: u64) -> Vec<SrAlert> {
+    let mut alerts: Vec<SrAlert> = rows
+        .iter()
+        .filter(|r| r.kind == "sr")
+        .filter_map(|r| {
+            let pct = r.used_pct()?;
+            if pct < threshold_pct {
+                return None;
+            }
+            let name = if r.name.is_empty() {
+                r.id.clone()
+            } else {
+                r.name.clone()
+            };
+            Some(SrAlert {
+                id: r.id.clone(),
+                name,
+                pct,
+                critical: pct >= SR_CRITICAL_PCT,
+            })
+        })
+        .collect();
+    // Most-full first; a stable id tie-break keeps the order deterministic.
+    alerts.sort_by(|a, b| b.pct.cmp(&a.pct).then_with(|| a.id.cmp(&b.id)));
+    alerts
 }
 
 /// DATACENTER-11 (VMs tab) — which VM operation a per-VM inline prompt is collecting
@@ -1353,6 +1530,13 @@ impl Default for DatacenterPanel {
             vm_selected: BTreeSet::new(),
             bulk_tag: String::new(),
             bulk_progress: BTreeMap::new(),
+            // DATACENTER-12 (Storage tab) — forms start empty; the threshold
+            // defaults to 85% (the warning line) until the operator tunes it.
+            sr_create: SrCreateForm::default(),
+            vdi_create: VdiCreateForm::default(),
+            snap_schedule: SnapScheduleForm::default(),
+            storage_threshold_pct: 85,
+            storage_threshold_input: "85".to_string(),
         }
     }
 }
@@ -1674,6 +1858,49 @@ pub enum Message {
         uuid: String,
         result: Result<String, String>,
     },
+    /// DATACENTER-12 (Storage tab) — a storage form field changed (`field` names
+    /// which form + field). Pure state.
+    StorageFieldChanged {
+        field: StorageField,
+        value: String,
+    },
+    /// DATACENTER-12 — the SR capacity-alert threshold box changed. Reparses into
+    /// `storage_threshold_pct` (clamped 1..=100); a blank/invalid value keeps the
+    /// last good number so the alert never silently disables. Pure state.
+    StorageThresholdChanged(String),
+    /// DATACENTER-12 — the "Create SR" button was clicked. Fires
+    /// `action/dc/sr-create`.
+    SrCreateClicked,
+    /// The `action/dc/sr-create` RPC came back — `Ok` carries the new SR uuid,
+    /// `Err` the error text.
+    SrCreateDone(Result<String, String>),
+    /// DATACENTER-12 — the "Create VDI" button was clicked. Fires
+    /// `action/dc/vdi-create`.
+    VdiCreateClicked,
+    /// The `action/dc/vdi-create` RPC came back. `Ok` carries the new VDI uuid.
+    VdiCreateDone(Result<String, String>),
+    /// DATACENTER-12 — a per-SR card "VDI here" button: seeds the VDI-create form's
+    /// `sr` + `dom0` from that card so the operator only types name + size. Pure
+    /// state.
+    VdiTargetSr {
+        sr: String,
+        dom0: String,
+    },
+    /// DATACENTER-12 — a per-SR card "Snapshot" button: fires `action/dc/sr-snapshot`
+    /// to snapshot that SR's first VDI (the snapshot RPC takes a VDI uuid; for an SR
+    /// card we pass the SR id and the worker resolves it). `dom0` targets the host.
+    SrSnapshotClicked {
+        sr: String,
+        dom0: String,
+    },
+    /// The `action/dc/sr-snapshot` RPC came back. `Ok` carries the new snapshot uuid.
+    SrSnapshotDone(Result<String, String>),
+    /// DATACENTER-12 — the scheduled-snapshot "Save schedule" button was clicked.
+    /// Fires `action/dc/snap-schedule` (SR + retention + backup target). On the
+    /// worker side the dr_scheduler/orchestrator honors the persisted schedule.
+    SnapScheduleClicked,
+    /// The `action/dc/snap-schedule` RPC came back. `Ok` carries a status line.
+    SnapScheduleDone(Result<String, String>),
 }
 
 /// DATACENTER-11 (VMs tab) — which create-wizard field a `CreateFieldChanged`
@@ -2503,6 +2730,125 @@ impl DatacenterPanel {
                 }
                 Task::none()
             }
+            Message::StorageFieldChanged { field, value } => {
+                match field {
+                    StorageField::SrName => self.sr_create.name = value,
+                    StorageField::SrType => self.sr_create.sr_type = value,
+                    StorageField::SrHost => self.sr_create.host_uuid = value,
+                    StorageField::SrDeviceConfig => self.sr_create.device_config = value,
+                    StorageField::SrDom0 => self.sr_create.dom0 = value,
+                    StorageField::VdiSr => self.vdi_create.sr = value,
+                    StorageField::VdiName => self.vdi_create.name = value,
+                    StorageField::VdiSize => self.vdi_create.size_gib = value,
+                    StorageField::VdiDom0 => self.vdi_create.dom0 = value,
+                    StorageField::SchedSr => self.snap_schedule.sr = value,
+                    StorageField::SchedRetention => self.snap_schedule.retention = value,
+                    StorageField::SchedBackupTarget => self.snap_schedule.backup_target = value,
+                    StorageField::SchedDom0 => self.snap_schedule.dom0 = value,
+                }
+                Task::none()
+            }
+            Message::StorageThresholdChanged(v) => {
+                // Keep the raw text (so an in-progress empty box doesn't snap to 0)
+                // and reparse a valid 1..=100 into the live threshold; a blank /
+                // out-of-range value leaves the last good number in force.
+                self.storage_threshold_input = v.clone();
+                if let Ok(n) = v.trim().parse::<u64>() {
+                    if (1..=100).contains(&n) {
+                        self.storage_threshold_pct = n;
+                    }
+                }
+                Task::none()
+            }
+            Message::SrCreateClicked => {
+                let form = self.sr_create.clone();
+                self.status = "Creating SR…".into();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || sr_create(&form))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("sr-create task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::SrCreateDone(result)),
+                )
+            }
+            Message::SrCreateDone(Ok(s)) => {
+                self.status = format!("SR created: {s}");
+                self.sr_create = SrCreateForm::default();
+                Task::none()
+            }
+            Message::SrCreateDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
+            Message::VdiTargetSr { sr, dom0 } => {
+                // Seed the VDI-create form from the clicked SR card so the operator
+                // only types name + size.
+                self.vdi_create.sr = sr;
+                self.vdi_create.dom0 = dom0;
+                self.status = "VDI target set — name + size, then Create VDI.".into();
+                Task::none()
+            }
+            Message::VdiCreateClicked => {
+                let form = self.vdi_create.clone();
+                self.status = "Creating VDI…".into();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || vdi_create(&form))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("vdi-create task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::VdiCreateDone(result)),
+                )
+            }
+            Message::VdiCreateDone(Ok(s)) => {
+                self.status = format!("VDI created: {s}");
+                self.vdi_create = VdiCreateForm::default();
+                Task::none()
+            }
+            Message::VdiCreateDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
+            Message::SrSnapshotClicked { sr, dom0 } => {
+                self.status = "Snapshotting…".into();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || sr_snapshot(&sr, &dom0))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("sr-snapshot task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::SrSnapshotDone(result)),
+                )
+            }
+            Message::SrSnapshotDone(Ok(s)) => {
+                self.status = format!("Snapshot: {s}");
+                Task::none()
+            }
+            Message::SrSnapshotDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
+            Message::SnapScheduleClicked => {
+                let form = self.snap_schedule.clone();
+                self.status = "Saving snapshot schedule…".into();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || snap_schedule_save(&form))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("snap-schedule task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::SnapScheduleDone(result)),
+                )
+            }
+            Message::SnapScheduleDone(Ok(s)) => {
+                self.status = s;
+                Task::none()
+            }
+            Message::SnapScheduleDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
         }
     }
 
@@ -2783,6 +3129,243 @@ impl DatacenterPanel {
         let surface = palette.surface;
         let radius = f32::from(spacing::BASE[1]);
         container(card)
+            .padding(f32::from(CARD_PAD_PX))
+            .width(Length::Fill)
+            .style(move |_theme| container::Style {
+                background: Some(cosmic::iced::Background::Color(surface.into_cosmic_color())),
+                border: cosmic::iced::Border {
+                    color: palette.border.into_cosmic_color(),
+                    width: 1.0,
+                    radius: radius.into(),
+                },
+                ..container::Style::default()
+            })
+            .into()
+    }
+
+    /// DATACENTER-12 (Storage tab) — the capacity-threshold control: a count of the
+    /// over-threshold SRs + an editable warning threshold (percent). The live
+    /// `storage_threshold_pct` drives the per-SR alert badges; this lets the
+    /// operator tune the line. Carbon tokens only (§4).
+    fn storage_threshold_bar(
+        &self,
+        palette: Palette,
+        alert_count: usize,
+    ) -> Element<'_, crate::Message> {
+        let summary = if alert_count == 0 {
+            text("All SRs below the capacity threshold.").colr(palette.success.into_cosmic_color())
+        } else {
+            text(format!("{alert_count} SR(s) at/above threshold"))
+                .colr(palette.warning.into_cosmic_color())
+        };
+        let input = text_input("warning %", &self.storage_threshold_input)
+            .on_input(|v| crate::Message::Datacenter(Message::StorageThresholdChanged(v)))
+            .width(Length::Fixed(96.0));
+        let line = row![
+            text("Capacity alert threshold")
+                .colr(palette.text_muted.into_cosmic_color())
+                .width(Length::FillPortion(2)),
+            input,
+            text(format!("(critical at {SR_CRITICAL_PCT}%)"))
+                .colr(palette.text_muted.into_cosmic_color()),
+            summary.width(Length::FillPortion(2)),
+        ]
+        .spacing(f32::from(spacing::BASE[2]))
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+        self.storage_card(line.into(), palette)
+    }
+
+    /// DATACENTER-12 (Storage tab) — the SR-create form. Packs name/type/host/
+    /// device-config/dom0 into `action/dc/sr-create`. Carbon tokens only.
+    fn sr_create_form(&self, palette: Palette) -> Element<'_, crate::Message> {
+        let field = |placeholder: &str, value: &str, f: StorageField| {
+            text_input(placeholder, value)
+                .on_input(move |v| {
+                    crate::Message::Datacenter(Message::StorageFieldChanged { field: f, value: v })
+                })
+                .width(Length::FillPortion(1))
+        };
+        let inputs = row![
+            field("name", &self.sr_create.name, StorageField::SrName),
+            field("type (lvm)", &self.sr_create.sr_type, StorageField::SrType),
+            field("host uuid", &self.sr_create.host_uuid, StorageField::SrHost),
+            field(
+                "device-config (key=value)",
+                &self.sr_create.device_config,
+                StorageField::SrDeviceConfig,
+            ),
+            field("dom0", &self.sr_create.dom0, StorageField::SrDom0),
+        ]
+        .spacing(f32::from(spacing::BASE[1]));
+        let create_btn = variant_button(
+            "Create SR".to_string(),
+            ButtonVariant::Primary,
+            Some(crate::Message::Datacenter(Message::SrCreateClicked)),
+            palette,
+        );
+        let card = column![
+            text("Create storage repository").colr(palette.text.into_cosmic_color()),
+            inputs,
+            create_btn,
+        ]
+        .spacing(f32::from(spacing::BASE[2]));
+        self.storage_card(card.into(), palette)
+    }
+
+    /// DATACENTER-12 (Storage tab) — the VDI-create form. Packs sr/name/size/dom0
+    /// into `action/dc/vdi-create`. A per-SR card's "VDI here" seeds sr+dom0.
+    fn vdi_create_form(&self, palette: Palette) -> Element<'_, crate::Message> {
+        let field = |placeholder: &str, value: &str, f: StorageField| {
+            text_input(placeholder, value)
+                .on_input(move |v| {
+                    crate::Message::Datacenter(Message::StorageFieldChanged { field: f, value: v })
+                })
+                .width(Length::FillPortion(1))
+        };
+        let inputs = row![
+            field("SR uuid", &self.vdi_create.sr, StorageField::VdiSr),
+            field("name", &self.vdi_create.name, StorageField::VdiName),
+            field("size GiB", &self.vdi_create.size_gib, StorageField::VdiSize),
+            field("dom0", &self.vdi_create.dom0, StorageField::VdiDom0),
+        ]
+        .spacing(f32::from(spacing::BASE[1]));
+        let create_btn = variant_button(
+            "Create VDI".to_string(),
+            ButtonVariant::Primary,
+            Some(crate::Message::Datacenter(Message::VdiCreateClicked)),
+            palette,
+        );
+        let card = column![
+            text("Create virtual disk (VDI)").colr(palette.text.into_cosmic_color()),
+            inputs,
+            create_btn,
+        ]
+        .spacing(f32::from(spacing::BASE[2]));
+        self.storage_card(card.into(), palette)
+    }
+
+    /// DATACENTER-12 (Storage tab) — the scheduled-snapshot config (SR, retention,
+    /// backup target), persisted as an `event/dc/snap-schedule/*` Bus record that a
+    /// scheduler reads back. Carbon tokens only.
+    fn snap_schedule_form(&self, palette: Palette) -> Element<'_, crate::Message> {
+        let field = |placeholder: &str, value: &str, f: StorageField| {
+            text_input(placeholder, value)
+                .on_input(move |v| {
+                    crate::Message::Datacenter(Message::StorageFieldChanged { field: f, value: v })
+                })
+                .width(Length::FillPortion(1))
+        };
+        let inputs = row![
+            field("SR uuid", &self.snap_schedule.sr, StorageField::SchedSr),
+            field(
+                "retention (count)",
+                &self.snap_schedule.retention,
+                StorageField::SchedRetention,
+            ),
+            field(
+                "backup target",
+                &self.snap_schedule.backup_target,
+                StorageField::SchedBackupTarget,
+            ),
+            field("dom0", &self.snap_schedule.dom0, StorageField::SchedDom0),
+        ]
+        .spacing(f32::from(spacing::BASE[1]));
+        let save_btn = variant_button(
+            "Save schedule".to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::SnapScheduleClicked)),
+            palette,
+        );
+        let card = column![
+            text("Scheduled snapshots — retention + backup target")
+                .colr(palette.text.into_cosmic_color()),
+            inputs,
+            save_btn,
+        ]
+        .spacing(f32::from(spacing::BASE[2]));
+        self.storage_card(card.into(), palette)
+    }
+
+    /// DATACENTER-12 (Storage tab) — one SR rendered as a capacity card: the
+    /// name + capacity readout + a color-dot fill indicator, plus "Snapshot all"
+    /// and "VDI here" actions. The fill dot's token tracks the threshold (success
+    /// below, warning above, danger at/above critical) so the card reads at a
+    /// glance. Carbon tokens only (§4).
+    fn sr_card_view(&self, r: &DcRow, palette: Palette) -> Element<'_, crate::Message> {
+        let label = if r.name.is_empty() {
+            r.id.clone()
+        } else {
+            r.name.clone()
+        };
+        // The fill dot token tracks the SR's used percentage against the live
+        // threshold; unparseable capacity falls back to a muted dot.
+        let dot = match r.used_pct() {
+            Some(p) if p >= SR_CRITICAL_PCT => palette.danger,
+            Some(p) if p >= self.storage_threshold_pct => palette.warning,
+            Some(_) => palette.success,
+            None => palette.text_muted,
+        };
+        let capacity = r
+            .capacity_readout()
+            .unwrap_or_else(|| "capacity unknown".to_string());
+        let header = row![
+            text("sr")
+                .colr(palette.text_muted.into_cosmic_color())
+                .width(Length::FillPortion(1)),
+            container(text(""))
+                .width(Length::Fixed(12.0))
+                .height(Length::Fixed(12.0))
+                .style(move |_theme| container::Style {
+                    background: Some(cosmic::iced::Background::Color(dot.into_cosmic_color())),
+                    border: cosmic::iced::Border {
+                        radius: 6.0.into(),
+                        ..cosmic::iced::Border::default()
+                    },
+                    ..container::Style::default()
+                }),
+        ]
+        .spacing(f32::from(spacing::BASE[2]))
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+        let snapshot = variant_button(
+            "Snapshot all".to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::SrSnapshotClicked {
+                sr: r.id.clone(),
+                dom0: r.host.clone(),
+            })),
+            palette,
+        );
+        let vdi_here = variant_button(
+            "VDI here".to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::VdiTargetSr {
+                sr: r.id.clone(),
+                dom0: r.host.clone(),
+            })),
+            palette,
+        );
+        let actions = row![snapshot, vdi_here].spacing(f32::from(spacing::BASE[1]));
+        let card = column![
+            header,
+            text(label).colr(palette.text.into_cosmic_color()),
+            text(capacity).colr(palette.text_muted.into_cosmic_color()),
+            actions,
+        ]
+        .spacing(f32::from(spacing::BASE[2]));
+        self.storage_card(card.into(), palette)
+    }
+
+    /// DATACENTER-12 — the shared bordered-surface container the Storage tab's
+    /// forms + SR cards live in (mde-theme surface/border tokens, §4-clean). Keeps
+    /// every storage block visually consistent with the VM create form.
+    fn storage_card<'a>(
+        &self,
+        content: Element<'a, crate::Message>,
+        palette: Palette,
+    ) -> Element<'a, crate::Message> {
+        let surface = palette.surface;
+        let radius = f32::from(spacing::BASE[1]);
+        container(content)
             .padding(f32::from(CARD_PAD_PX))
             .width(Length::Fill)
             .style(move |_theme| container::Style {
@@ -3412,6 +3995,7 @@ impl DatacenterPanel {
             mode_btn("Overview", ViewMode::Overview),
             mode_btn("Hosts", ViewMode::Hosts),
             mode_btn("VMs", ViewMode::Vms),
+            mode_btn("Storage", ViewMode::Storage),
             mode_btn("Topology", ViewMode::Topology),
             mode_btn("Resources", ViewMode::Zone),
             mode_btn("Tofu", ViewMode::Tofu),
@@ -3638,6 +4222,91 @@ impl DatacenterPanel {
                             col.push(self.vm_lifecycle_card(
                                 v, palette, selected, confirming, prompt, progress,
                             ));
+                    }
+                }
+            }
+            ViewMode::Storage => {
+                // DATACENTER-12 — the Storage tab: SR capacity cards (with the
+                // threshold-alert badge + per-SR Snapshot / VDI-target actions), an
+                // SR-create + a VDI-create form, the scheduled-snapshot config, and
+                // the ISO / template image library. SRs already arrive on the Bus as
+                // `kind == "sr"` rows (gather_xen → event/dc/sr/*).
+                col = col.push(text("Storage").size(f32::from(spacing::BASE[5])));
+
+                // Capacity-threshold alert: most-full-first banner pinned above the
+                // cards so an over-threshold store is impossible to miss. Color from
+                // mde-theme tokens (§4) — danger at/above critical, warning above the
+                // configured line.
+                let alerts = sr_alerts(&self.rows, self.storage_threshold_pct);
+                col = col.push(self.storage_threshold_bar(palette, alerts.len()));
+                for a in &alerts {
+                    let token = if a.critical {
+                        palette.danger
+                    } else {
+                        palette.warning
+                    };
+                    let mark = if a.critical { "CRITICAL" } else { "WARNING" };
+                    col = col.push(
+                        text(format!(
+                            "{mark} — SR {} is {}% full (threshold {}%)",
+                            a.name, a.pct, self.storage_threshold_pct
+                        ))
+                        .colr(token.into_cosmic_color()),
+                    );
+                }
+
+                // SR-create + VDI-create forms.
+                col = col.push(self.sr_create_form(palette));
+                col = col.push(self.vdi_create_form(palette));
+                // Scheduled snapshots (retention + backup target).
+                col = col.push(self.snap_schedule_form(palette));
+
+                // The SR cards — one per `kind == "sr"` row honoring the global
+                // search needle, with capacity + per-SR actions.
+                col = col.push(text("Storage repositories").size(f32::from(spacing::BASE[5])));
+                let srs: Vec<&DcRow> = self
+                    .rows
+                    .iter()
+                    .filter(|r| r.kind == "sr" && r.matches_filter(&self.filter))
+                    .collect();
+                if srs.is_empty() {
+                    col = col.push(
+                        text(
+                            "No storage repositories yet. SRs appear here as the \
+                             datacenter orchestrator publishes `event/dc/sr/*` (set \
+                             `MCNF_XEN_DOM0S` on the host source).",
+                        )
+                        .colr(palette.text_muted.into_cosmic_color()),
+                    );
+                } else {
+                    for s in srs {
+                        col = col.push(self.sr_card_view(s, palette));
+                    }
+                }
+
+                // The ISO + template image library (absorbs the old `images` view):
+                // rows the orchestrator may publish as `kind == "iso"` /
+                // `kind == "template"`. Graceful-empty until a source emits them.
+                col = col.push(text("Image library").size(f32::from(spacing::BASE[5])));
+                let images: Vec<&DcRow> = self
+                    .rows
+                    .iter()
+                    .filter(|r| {
+                        (r.kind == "iso" || r.kind == "template") && r.matches_filter(&self.filter)
+                    })
+                    .collect();
+                if images.is_empty() {
+                    col = col.push(
+                        text(
+                            "No ISOs or templates yet. They appear here as the \
+                             orchestrator publishes `event/dc/iso/*` / \
+                             `event/dc/template/*`.",
+                        )
+                        .colr(palette.text_muted.into_cosmic_color()),
+                    );
+                } else {
+                    for img in images {
+                        col = col.push(image_row_view(img, palette));
                     }
                 }
             }
@@ -4791,6 +5460,35 @@ fn audit_row_view(entry: &AuditRow) -> Element<'_, crate::Message> {
         .into()
 }
 
+/// DATACENTER-12 (Storage tab) — render one image-library row (an ISO or a
+/// template) as a labeled line: kind · name · status. Read-only — the library
+/// absorbs the old `images` view; an Import flow lands when a source emits the
+/// catalog. Carbon tokens only (§4).
+fn image_row_view<'a>(r: &DcRow, palette: Palette) -> Element<'a, crate::Message> {
+    let label = if r.name.is_empty() {
+        r.id.clone()
+    } else {
+        r.name.clone()
+    };
+    let kind_label = if r.kind == "iso" { "ISO" } else { "Template" };
+    let line = row![
+        text(kind_label.to_string())
+            .colr(palette.text_muted.into_cosmic_color())
+            .width(Length::FillPortion(1)),
+        text(label)
+            .colr(palette.text.into_cosmic_color())
+            .width(Length::FillPortion(3)),
+        text(r.status.clone())
+            .colr(palette.text_muted.into_cosmic_color())
+            .width(Length::FillPortion(2)),
+    ]
+    .spacing(f32::from(spacing::BASE[3]));
+    container(line)
+        .padding(f32::from(spacing::BASE[2]))
+        .width(Length::Fill)
+        .into()
+}
+
 /// Bus read: every `event/dc/*` topic's latest body, projected into both the
 /// resource rows and the audit-log rows in one pass. Best-effort — a missing Bus
 /// yields empty lists (the panel shows the empty state, not an error).
@@ -5198,6 +5896,133 @@ fn dc_rpc(verb: &str, body: &str, timeout: Duration) -> Result<serde_json::Value
     Ok(v)
 }
 
+/// DATACENTER-12 — fire `action/dc/sr-create`. The form's name/type/host/dom0 are
+/// passed through; an empty type defaults server-side to `lvm`; an empty
+/// device-config is omitted. `{"ok":true,"sr":..}` → `"<new-sr-uuid>"`.
+fn sr_create(form: &SrCreateForm) -> Result<String, String> {
+    if form.name.trim().is_empty() {
+        return Err("SR name is required".into());
+    }
+    if form.host_uuid.trim().is_empty() {
+        return Err("host uuid is required".into());
+    }
+    if form.dom0.trim().is_empty() {
+        return Err("dom0 is required".into());
+    }
+    let mut body = serde_json::json!({
+        "name": form.name.trim(),
+        "host_uuid": form.host_uuid.trim(),
+        "dom0": form.dom0.trim(),
+    });
+    if !form.sr_type.trim().is_empty() {
+        body["type"] = serde_json::Value::String(form.sr_type.trim().to_string());
+    }
+    if !form.device_config.trim().is_empty() {
+        body["device_config"] = serde_json::Value::String(form.device_config.trim().to_string());
+    }
+    let v = dc_rpc("sr-create", &body.to_string(), Duration::from_secs(120))?;
+    if let Some(sr) = v.get("sr").and_then(serde_json::Value::as_str) {
+        return Ok(sr.to_string());
+    }
+    Err(format!("unexpected sr-create reply: {v}"))
+}
+
+/// DATACENTER-12 — fire `action/dc/vdi-create`. The size box is parsed to an
+/// integer GiB (1..=65536) before the RPC. `{"ok":true,"vdi":..}` → the new VDI
+/// uuid.
+fn vdi_create(form: &VdiCreateForm) -> Result<String, String> {
+    if form.sr.trim().is_empty() {
+        return Err("target SR is required".into());
+    }
+    if form.name.trim().is_empty() {
+        return Err("VDI name is required".into());
+    }
+    if form.dom0.trim().is_empty() {
+        return Err("dom0 is required".into());
+    }
+    let size_gib: u64 = form
+        .size_gib
+        .trim()
+        .parse()
+        .map_err(|_| "size must be an integer (GiB)".to_string())?;
+    let body = serde_json::json!({
+        "sr": form.sr.trim(),
+        "name": form.name.trim(),
+        "size_gib": size_gib,
+        "dom0": form.dom0.trim(),
+    })
+    .to_string();
+    let v = dc_rpc("vdi-create", &body, Duration::from_secs(120))?;
+    if let Some(vdi) = v.get("vdi").and_then(serde_json::Value::as_str) {
+        return Ok(vdi.to_string());
+    }
+    Err(format!("unexpected vdi-create reply: {v}"))
+}
+
+/// DATACENTER-12 — fire `action/dc/sr-snapshot` for a whole SR (every VDI on the
+/// store; the worker loops them). `{"ok":true,"snapshot":..}` → the count line.
+fn sr_snapshot(sr: &str, dom0: &str) -> Result<String, String> {
+    if dom0.trim().is_empty() {
+        return Err("this SR has no host to snapshot on".into());
+    }
+    let body = serde_json::json!({ "sr": sr, "dom0": dom0 }).to_string();
+    let v = dc_rpc("sr-snapshot", &body, Duration::from_secs(300))?;
+    if let Some(s) = v.get("snapshot").and_then(serde_json::Value::as_str) {
+        return Ok(s.to_string());
+    }
+    Err(format!("unexpected sr-snapshot reply: {v}"))
+}
+
+/// DATACENTER-12 — persist a scheduled-snapshot config by publishing an
+/// `event/dc/snap-schedule/<sr>` record to the Bus (a future scheduler worker
+/// reads it back; this is the honest persistence rather than a no-op RPC). The
+/// record carries the SR, retention, and backup target. Returns a status line.
+fn snap_schedule_save(form: &SnapScheduleForm) -> Result<String, String> {
+    if form.sr.trim().is_empty() {
+        return Err("schedule SR is required".into());
+    }
+    let retention: u64 = form
+        .retention
+        .trim()
+        .parse()
+        .map_err(|_| "retention must be an integer".to_string())?;
+    if retention == 0 {
+        return Err("retention must be at least 1".into());
+    }
+    let Some(dir) = mde_bus::default_data_dir() else {
+        return Err("no Bus data dir".to_string());
+    };
+    let sr = form.sr.trim().to_string();
+    let topic = format!("event/dc/snap-schedule/{sr}");
+    let record = serde_json::json!({
+        "kind": "snap-schedule",
+        "id": sr,
+        "sr": form.sr.trim(),
+        "retention": retention,
+        "backup_target": form.backup_target.trim(),
+        "dom0": form.dom0.trim(),
+    })
+    .to_string();
+    let persist = mde_bus::persist::Persist::open(dir).map_err(|e| e.to_string())?;
+    persist
+        .write(
+            &topic,
+            mde_bus::hooks::config::Priority::Default,
+            Some("snap-schedule"),
+            Some(&record),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "Schedule saved for {} — keep {retention}, target {}",
+        form.sr.trim(),
+        if form.backup_target.trim().is_empty() {
+            "(none)"
+        } else {
+            form.backup_target.trim()
+        }
+    ))
+}
+
 /// DATACENTER-11 — fire `action/dc/vm-suspend` (`op` = "suspend" | "resume").
 /// `{"ok":true}` → `"<op> <uuid>"`.
 fn vm_suspend(uuid: &str, op: &str, dom0: &str) -> Result<String, String> {
@@ -5515,6 +6340,8 @@ mod tests {
             ViewMode::Overview,
             ViewMode::Zone,
             ViewMode::Hosts,
+            ViewMode::Vms,
+            ViewMode::Storage,
             ViewMode::Tofu,
             ViewMode::Audit,
             ViewMode::Topology,
@@ -5808,6 +6635,116 @@ mod tests {
             ..zero.clone()
         };
         assert_eq!(garbage.capacity_readout(), None);
+    }
+
+    /// A bare SR row at a given size/used, for the storage-tab pure-fn tests.
+    fn sr_row(id: &str, size: &str, used: &str) -> DcRow {
+        DcRow {
+            kind: "sr".into(),
+            id: id.into(),
+            name: String::new(),
+            status: String::new(),
+            zone: "dev".into(),
+            host: "172.20.0.9".into(),
+            size: size.into(),
+            used: used.into(),
+            bridge: String::new(),
+            cpu: String::new(),
+            mem_total_mb: String::new(),
+            mem_free_mb: String::new(),
+            load: String::new(),
+        }
+    }
+
+    #[test]
+    fn used_pct_rounds_and_guards() {
+        // 90 / 100 bytes → 90%.
+        assert_eq!(sr_row("a", "100", "90").used_pct(), Some(90));
+        // Zero / garbage size → None (no bogus NaN%).
+        assert_eq!(sr_row("a", "0", "0").used_pct(), None);
+        assert_eq!(sr_row("a", "x", "1").used_pct(), None);
+        // Clamped to 100 even if used somehow exceeds size.
+        assert_eq!(sr_row("a", "100", "200").used_pct(), Some(100));
+    }
+
+    #[test]
+    fn sr_alerts_fires_above_threshold_only() {
+        let rows = vec![
+            sr_row("low", "100", "10"),  // 10%
+            sr_row("warn", "100", "88"), // 88%
+            sr_row("crit", "100", "97"), // 97%
+            // A non-SR row is ignored even if it had size/used.
+            DcRow {
+                kind: "vm".into(),
+                ..sr_row("vm", "100", "99")
+            },
+        ];
+        let alerts = sr_alerts(&rows, 85);
+        // Only warn + crit cross 85%, and they sort most-full first.
+        assert_eq!(alerts.len(), 2);
+        assert_eq!(alerts[0].id, "crit");
+        assert!(alerts[0].critical);
+        assert_eq!(alerts[1].id, "warn");
+        assert!(!alerts[1].critical);
+        // A stricter threshold drops the merely-warning store.
+        let strict = sr_alerts(&rows, 95);
+        assert_eq!(strict.len(), 1);
+        assert_eq!(strict[0].id, "crit");
+        // A 100% threshold means a not-quite-full SR is silent.
+        assert!(sr_alerts(&rows, 100).is_empty());
+    }
+
+    #[test]
+    fn storage_view_renders_sr_card_and_empty_image_library() {
+        let mut p = DatacenterPanel::new();
+        p.rows = vec![sr_row("sr-1", "222330230784", "211013926912")]; // ~95% full
+        p.view_mode = ViewMode::Storage;
+        // The view builds without panic and the threshold default is in force.
+        let _ = p.view();
+        assert_eq!(p.storage_threshold_pct, 85);
+        // The 95%-full SR is an alert (and critical).
+        let alerts = sr_alerts(&p.rows, p.storage_threshold_pct);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].critical);
+    }
+
+    #[test]
+    fn storage_field_changes_route_to_the_right_form() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::StorageFieldChanged {
+            field: StorageField::SrName,
+            value: "data".into(),
+        });
+        assert_eq!(p.sr_create.name, "data");
+        let _ = p.update(Message::StorageFieldChanged {
+            field: StorageField::VdiSize,
+            value: "40".into(),
+        });
+        assert_eq!(p.vdi_create.size_gib, "40");
+        let _ = p.update(Message::StorageFieldChanged {
+            field: StorageField::SchedRetention,
+            value: "7".into(),
+        });
+        assert_eq!(p.snap_schedule.retention, "7");
+        // VdiTargetSr seeds the VDI form's sr + dom0 from a card click.
+        let _ = p.update(Message::VdiTargetSr {
+            sr: "sr-9".into(),
+            dom0: "172.20.0.9".into(),
+        });
+        assert_eq!(p.vdi_create.sr, "sr-9");
+        assert_eq!(p.vdi_create.dom0, "172.20.0.9");
+    }
+
+    #[test]
+    fn storage_threshold_keeps_last_good_on_bad_input() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::StorageThresholdChanged("70".into()));
+        assert_eq!(p.storage_threshold_pct, 70);
+        // Blank / out-of-range leaves the last good number in force.
+        let _ = p.update(Message::StorageThresholdChanged(String::new()));
+        assert_eq!(p.storage_threshold_pct, 70);
+        let _ = p.update(Message::StorageThresholdChanged("999".into()));
+        assert_eq!(p.storage_threshold_pct, 70);
     }
 
     #[test]
