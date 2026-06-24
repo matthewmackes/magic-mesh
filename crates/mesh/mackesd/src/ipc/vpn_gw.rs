@@ -29,7 +29,7 @@ use mde_bus::rpc::reply_topic;
 use serde_json::json;
 
 use mackes_mesh_types::vpn::{self, Method, TunnelDef};
-use mackes_mesh_types::vpn_egress::EgressPlan;
+use mackes_mesh_types::vpn_egress::{self, EgressPlan, EgressRoute};
 use mackes_mesh_types::vpn_providers::{
     self, AdapterError, ProducedTunnel, Provider, SecretKind, WgSetup,
 };
@@ -90,7 +90,7 @@ impl VpnService {
 }
 
 /// Action verbs served on `action/vpn/<verb>`.
-pub const ACTION_VERBS: [&str; 8] = [
+pub const ACTION_VERBS: [&str; 12] = [
     "list-tunnels",
     "add-tunnel",
     "remove-tunnel",
@@ -100,6 +100,11 @@ pub const ACTION_VERBS: [&str; 8] = [
     // VPN-GW-5 — provider adapters (5 named + generic WG paste / .ovpn import).
     "list-providers",
     "setup-provider",
+    // VPN-GW-4 — mesh egress routing (per-node / group / ANY) + failover chain.
+    "set-route",
+    "clear-route",
+    "list-routes",
+    "route-status",
 ];
 
 /// Where a tunnel's DECRYPTED config lands on the node just before bring-up, for
@@ -250,6 +255,11 @@ pub fn build_reply(svc: &VpnService, verb: &str, req_body: Option<&str>) -> Stri
         }
         "list-providers" => list_providers_reply(),
         "setup-provider" => setup_provider(svc, req_body),
+        // VPN-GW-4 — mesh egress routing + failover chain.
+        "set-route" => set_route(svc, req_body),
+        "clear-route" => clear_route(svc, req_body),
+        "list-routes" => list_routes(svc),
+        "route-status" => route_status(svc, req_body),
         other => err(format!("unknown vpn verb: {other}")),
     }
 }
@@ -558,6 +568,105 @@ fn str_field(v: &serde_json::Value, key: &str) -> String {
         .to_string()
 }
 
+// ── VPN-GW-4 — mesh egress routing (per-node / group / ANY) + failover chain ──
+
+/// `set-route` — assign egress for a node / node-group / ANth (all-mesh) target
+/// to a gateway with a primary tunnel + an ordered failover chain (+ a per-route
+/// kill-switch). The body is an [`EgressRoute`] JSON
+/// (`{target:{scope,name?}, gateway, primary, failover?, kill_switch?}`). The
+/// assignment is validated + persisted to the durable routing table on the
+/// shared substrate (one route per target, set replaces in place); every node
+/// then resolves its own effective route from the same table.
+fn set_route(svc: &VpnService, req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("set-route: missing EgressRoute body".into());
+    };
+    let r: EgressRoute = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => return err(format!("set-route: bad json: {e}")),
+    };
+    if let Err(e) = r.validate() {
+        return err(format!("set-route: {e}"));
+    }
+    let root = svc.workgroup_root.as_path();
+    let mut routing = vpn_egress::load_routing(root);
+    let key = r.target.key();
+    routing.set(r);
+    match vpn_egress::save_routing(root, &routing) {
+        Ok(_) => json!({ "ok": true, "target": key }).to_string(),
+        Err(e) => err(format!("set-route: save: {e}")),
+    }
+}
+
+/// `clear-route` — remove the egress assignment for a target key
+/// (`node:<name>` / `group:<name>` / `any`); the target then falls back to a
+/// less-specific route (a node to its group's, a group to ANY) or to direct WAN
+/// if none remains.
+fn clear_route(svc: &VpnService, req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(key) = req_body.map(str::trim).filter(|s| !s.is_empty()) else {
+        return err("clear-route: missing target key (node:<n> / group:<n> / any)".into());
+    };
+    let root = svc.workgroup_root.as_path();
+    let mut routing = vpn_egress::load_routing(root);
+    if !routing.clear(key) {
+        return err(format!("clear-route: no route for target '{key}'"));
+    }
+    match vpn_egress::save_routing(root, &routing) {
+        Ok(_) => json!({ "ok": true, "target": key }).to_string(),
+        Err(e) => err(format!("clear-route: save: {e}")),
+    }
+}
+
+/// `list-routes` — the durable egress-routing table (every assignment).
+fn list_routes(svc: &VpnService) -> String {
+    let routing = vpn_egress::load_routing(svc.workgroup_root.as_path());
+    json!({ "ok": true, "routes": routing.route }).to_string()
+}
+
+/// `route-status` — for a target key, report the route's gateway + ordered chain
+/// and which tunnel is **currently active** (the first chain tunnel whose
+/// interface is up on this node), so the operator sees the live failover state.
+/// `active` is `null` when the whole chain is down — the kill-switch (if set)
+/// then blocks egress (no WAN leak) instead of failing over.
+fn route_status(svc: &VpnService, req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(key) = req_body.map(str::trim).filter(|s| !s.is_empty()) else {
+        return err("route-status: missing target key (node:<n> / group:<n> / any)".into());
+    };
+    let root = svc.workgroup_root.as_path();
+    let routing = vpn_egress::load_routing(root);
+    let Some(route) = routing.get(key) else {
+        return err(format!("route-status: no route for target '{key}'"));
+    };
+    // The live down-set for the chain on THIS node (the gateway): a tunnel is
+    // down when its `mvpn-<id>` interface isn't present. Resolving the id → its
+    // ifname through the durable tunnel config keeps the sanitize/bound rule in
+    // one place.
+    let cfg = vpn::load(root);
+    let down: Vec<String> = route
+        .chain()
+        .into_iter()
+        .filter(|id| {
+            let ifname = cfg
+                .get(id)
+                .map_or_else(|| format!("mvpn-{id}"), TunnelDef::ifname);
+            !iface_up(svc.spawn, &ifname)
+        })
+        .collect();
+    let active = route.active_tunnel(&down);
+    json!({
+        "ok": true,
+        "target": key,
+        "gateway": route.gateway,
+        "chain": route.chain(),
+        "active": active,
+        "kill_switch": route.kill_switch,
+    })
+    .to_string()
+}
+
 /// Write the produced secret material with owner-only perms (it carries the
 /// private key). Creates the parent dir. Best-effort 0600.
 fn write_secret(path: &std::path::Path, body: &str) -> std::io::Result<()> {
@@ -634,9 +743,13 @@ mod tests {
     #[test]
     fn topic_and_verbs_lock() {
         assert_eq!(action_topic("tunnel-up"), "action/vpn/tunnel-up");
-        assert_eq!(ACTION_VERBS.len(), 8);
+        assert_eq!(ACTION_VERBS.len(), 12);
         assert!(ACTION_VERBS.contains(&"list-providers"));
         assert!(ACTION_VERBS.contains(&"setup-provider"));
+        // VPN-GW-4 routing verbs.
+        for v in ["set-route", "clear-route", "list-routes", "route-status"] {
+            assert!(ACTION_VERBS.contains(&v), "missing {v}");
+        }
     }
 
     #[test]
@@ -1081,5 +1194,110 @@ mod tests {
             Some(&json!({"provider":"generic-ovpn","id":"o"}).to_string()),
         );
         assert!(r.contains("needs an 'ovpn' body"), "{r}");
+    }
+
+    // ── VPN-GW-4: mesh egress routing (per-node / group / ANY) + failover ──
+
+    fn set_route_body(
+        scope: &str,
+        name: Option<&str>,
+        gw: &str,
+        primary: &str,
+        chain: &[&str],
+    ) -> String {
+        let mut target = json!({ "scope": scope });
+        if let Some(n) = name {
+            target["name"] = json!(n);
+        }
+        json!({
+            "target": target,
+            "gateway": gw,
+            "primary": primary,
+            "failover": chain,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn set_list_clear_route_round_trip() {
+        let (_t, s) = svc();
+        // Set an ANY/all-mesh route through a gateway with a failover chain.
+        let body = set_route_body("any", None, "gw1", "mullvad1", &["proton1"]);
+        let r = build_reply(&s, "set-route", Some(&body));
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{r}");
+        assert_eq!(v["target"], "any");
+
+        // And a per-node override.
+        let body = set_route_body("node", Some("anvil"), "gw2", "ivpn1", &[]);
+        assert!(build_reply(&s, "set-route", Some(&body)).contains("\"ok\":true"));
+
+        // list-routes carries both, with the chain + kill-switch default.
+        let list = build_reply(&s, "list-routes", None);
+        let lv: serde_json::Value = serde_json::from_str(&list).unwrap();
+        let routes = lv["routes"].as_array().unwrap();
+        assert_eq!(routes.len(), 2, "{list}");
+        let any = routes
+            .iter()
+            .find(|r| r["target"]["scope"] == "any")
+            .unwrap();
+        assert_eq!(any["gateway"], "gw1");
+        assert_eq!(any["primary"], "mullvad1");
+        assert_eq!(any["failover"][0], "proton1");
+        // Kill-switch defaulted on (Q8).
+        assert_eq!(any["kill_switch"], serde_json::Value::Bool(true));
+
+        // Re-setting ANY replaces in place (still 2 routes total).
+        let body = set_route_body("any", None, "gwX", "nord1", &[]);
+        assert!(build_reply(&s, "set-route", Some(&body)).contains("\"ok\":true"));
+        let list = build_reply(&s, "list-routes", None);
+        let lv: serde_json::Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(lv["routes"].as_array().unwrap().len(), 2);
+
+        // Clear the node route by its key.
+        let r = build_reply(&s, "clear-route", Some("node:anvil"));
+        assert!(r.contains("\"ok\":true"), "{r}");
+        let list = build_reply(&s, "list-routes", None);
+        let lv: serde_json::Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(lv["routes"].as_array().unwrap().len(), 1);
+        // Clearing a ghost errors.
+        assert!(build_reply(&s, "clear-route", Some("node:ghost")).contains("no route"));
+    }
+
+    #[test]
+    fn set_route_rejects_bad_input() {
+        let (_t, s) = svc();
+        // Missing body.
+        assert!(build_reply(&s, "set-route", None).contains("missing EgressRoute body"));
+        // Empty primary → validation error.
+        let body = set_route_body("any", None, "gw1", "", &[]);
+        assert!(build_reply(&s, "set-route", Some(&body)).contains("primary tunnel is empty"));
+        // A tunnel can't fail over to itself.
+        let body = set_route_body("any", None, "gw1", "m1", &["m1"]);
+        assert!(build_reply(&s, "set-route", Some(&body)).contains("duplicate tunnel"));
+        // clear-route with no key.
+        assert!(build_reply(&s, "clear-route", None).contains("missing target key"));
+    }
+
+    #[test]
+    fn route_status_reports_chain_and_active_tunnel() {
+        // With spawn disabled, every tunnel interface reads down, so the whole
+        // chain is down and `active` is null — exactly the kill-switch-floor
+        // state. The chain + gateway + kill-switch flag still report.
+        let (_t, s) = svc();
+        let body = set_route_body("any", None, "gw1", "mullvad1", &["proton1"]);
+        assert!(build_reply(&s, "set-route", Some(&body)).contains("\"ok\":true"));
+        let r = build_reply(&s, "route-status", Some("any"));
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{r}");
+        assert_eq!(v["gateway"], "gw1");
+        assert_eq!(v["chain"][0], "mullvad1");
+        assert_eq!(v["chain"][1], "proton1");
+        // No interface is up (spawn disabled) → whole chain down → active null.
+        assert_eq!(v["active"], serde_json::Value::Null);
+        assert_eq!(v["kill_switch"], serde_json::Value::Bool(true));
+        // Status for an unknown target errors.
+        assert!(build_reply(&s, "route-status", Some("node:nope")).contains("no route"));
+        assert!(build_reply(&s, "route-status", None).contains("missing target key"));
     }
 }

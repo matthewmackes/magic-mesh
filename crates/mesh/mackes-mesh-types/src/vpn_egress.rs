@@ -359,6 +359,285 @@ impl EgressPlan {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// VPN-GW-4 — mesh egress *routing* (per-node / group / ANY) + failover chain.
+//
+// Where the rest of this module is the per-tunnel *mechanism* (an `EgressPlan`'s
+// fwmark/ip-rule/NAT/kill-switch argv), this is the *policy*: which node — or
+// node-group, or the whole mesh (ANY/all-mesh) — exits through which gateway +
+// primary tunnel, with an ordered **failover chain** so a tunnel drop walks down
+// to the next tunnel instead of dropping egress (the kill-switch is the floor).
+//
+// The model is pure + durable (TOML on the shared substrate, the same shape as
+// `vpn::VpnConfig`). The `vpn_gw` responder serves `action/vpn/{set-route,
+// clear-route, list-routes, route-status}` over it; the assigned node sends its
+// selected egress over the Nebula overlay to the gateway's overlay IP, where the
+// gateway marks + NATs it out the chain's currently-active tunnel.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Who a route assigns egress for — the three scopes the survey locked (Q6):
+/// a single node, a named node-group, or ANY/all-mesh (the default route every
+/// node falls back to when no more-specific route matches it).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "kebab-case")]
+pub enum RouteTarget {
+    /// One specific node, keyed by its mesh identity (hostname / overlay name).
+    Node {
+        /// The node's mesh node-name (matches the peer directory's `name`).
+        name: String,
+    },
+    /// A named node-group — several nodes routed to one gateway together. The
+    /// group's membership is resolved by the caller (a tag/peer-group name); the
+    /// route only carries the group's name so it follows membership changes.
+    Group {
+        /// The group's name (a tag / peer-group identifier).
+        name: String,
+    },
+    /// ANY / all-mesh — the default egress every node uses unless a Node/Group
+    /// route is more specific for it. Exactly one ANY route may exist.
+    Any,
+}
+
+impl RouteTarget {
+    /// The stable key a route is stored under — `node:<name>` / `group:<name>` /
+    /// `any`. Two routes with the same key are the same assignment (set replaces,
+    /// clear removes), so there is one route per node, one per group, one ANY.
+    #[must_use]
+    pub fn key(&self) -> String {
+        match self {
+            Self::Node { name } => format!("node:{name}"),
+            Self::Group { name } => format!("group:{name}"),
+            Self::Any => "any".to_string(),
+        }
+    }
+
+    /// Routing specificity — a higher number wins when several routes could apply
+    /// to one node. Node (2) beats Group (1) beats ANY (0), so a per-node
+    /// override always takes precedence over its group's route or the mesh
+    /// default. Used by [`EgressRouting::route_for`].
+    #[must_use]
+    pub const fn specificity(&self) -> u8 {
+        match self {
+            Self::Node { .. } => 2,
+            Self::Group { .. } => 1,
+            Self::Any => 0,
+        }
+    }
+}
+
+/// One egress-routing assignment: a [`RouteTarget`] exits through `gateway`'s
+/// tunnel chain. The chain is `[primary, …failover]` — the gateway NATs the
+/// assigned traffic out the first tunnel that is up; on a drop it walks down the
+/// chain, and only when the whole chain is down does the kill-switch (if set)
+/// block egress so there is no WAN leak.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressRoute {
+    /// Who this route assigns egress for.
+    pub target: RouteTarget,
+    /// The gateway node (mesh node-name) that runs the tunnels + does the NAT.
+    pub gateway: String,
+    /// The primary tunnel id on the gateway (a `vpn::TunnelDef::id`).
+    pub primary: String,
+    /// The ordered failover tunnel ids (tried in order after `primary`).
+    #[serde(default)]
+    pub failover: Vec<String>,
+    /// Block egress (kill-switch) when the whole chain is down, so a total
+    /// outage never leaks to the raw WAN. Per-route, defaulting on (Q8).
+    #[serde(default = "default_kill_switch")]
+    pub kill_switch: bool,
+}
+
+/// Kill-switch defaults **on** per the survey (Q8) — a route blocks rather than
+/// leaks when its whole chain is down unless the operator opts out.
+const fn default_kill_switch() -> bool {
+    true
+}
+
+impl EgressRoute {
+    /// The full ordered tunnel chain `[primary, …failover]` — the order the
+    /// gateway tries tunnels in. Always non-empty (the primary leads).
+    #[must_use]
+    pub fn chain(&self) -> Vec<String> {
+        let mut chain = Vec::with_capacity(1 + self.failover.len());
+        chain.push(self.primary.clone());
+        chain.extend(self.failover.iter().cloned());
+        chain
+    }
+
+    /// The tunnel that is **currently active** for this route given the set of
+    /// tunnel ids that are *down*: the first tunnel in `[primary, …failover]`
+    /// that is not down. `None` means the whole chain is down — the caller then
+    /// engages the kill-switch (if [`kill_switch`]) so egress is blocked, not
+    /// leaked.
+    ///
+    /// This is the pure failover decision: feeding it the live down-set (from the
+    /// health checker, VPN-GW-6) yields exactly which tunnel the gateway should
+    /// be NATing out of right now, and a single drop walks it to the next.
+    ///
+    /// [`kill_switch`]: Self::kill_switch
+    #[must_use]
+    pub fn active_tunnel(&self, down: &[String]) -> Option<String> {
+        self.chain().into_iter().find(|t| !down.contains(t))
+    }
+
+    /// Validate the route is usable: a non-empty gateway + primary, a chain with
+    /// no duplicate tunnel ids (a repeated id can never fail over to itself), and
+    /// a non-empty target name for Node/Group scopes.
+    ///
+    /// # Errors
+    /// A human-readable reason.
+    pub fn validate(&self) -> Result<(), String> {
+        match &self.target {
+            RouteTarget::Node { name } | RouteTarget::Group { name } if name.trim().is_empty() => {
+                return Err("route target name is empty".into());
+            }
+            _ => {}
+        }
+        if self.gateway.trim().is_empty() {
+            return Err("route gateway is empty".into());
+        }
+        if self.primary.trim().is_empty() {
+            return Err("route primary tunnel is empty".into());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for t in self.chain() {
+            if !seen.insert(t.clone()) {
+                return Err(format!("duplicate tunnel '{t}' in the failover chain"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The node's durable egress-routing table — the set of [`EgressRoute`]s, keyed
+/// by their target. The same TOML-on-the-substrate shape as [`vpn::VpnConfig`]
+/// so it loads/saves alongside the tunnel config.
+///
+/// [`vpn::VpnConfig`]: crate::vpn::VpnConfig
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressRouting {
+    /// The egress-routing assignments (one per target key).
+    #[serde(default)]
+    pub route: Vec<EgressRoute>,
+}
+
+impl EgressRouting {
+    /// Parse from TOML (missing sections → empty).
+    ///
+    /// # Errors
+    /// A TOML parse error.
+    pub fn from_toml_str(s: &str) -> Result<Self, toml::de::Error> {
+        toml::from_str(s)
+    }
+
+    /// Serialize to TOML.
+    ///
+    /// # Errors
+    /// A TOML serialize error.
+    pub fn to_toml_string(&self) -> Result<String, toml::ser::Error> {
+        toml::to_string_pretty(self)
+    }
+
+    /// The route for a given target key (`node:<n>` / `group:<n>` / `any`).
+    #[must_use]
+    pub fn get(&self, target_key: &str) -> Option<&EgressRoute> {
+        self.route.iter().find(|r| r.target.key() == target_key)
+    }
+
+    /// Set (insert or replace) a route, keyed by its target — so a node/group/ANY
+    /// has exactly one assignment and re-assigning it replaces in place.
+    pub fn set(&mut self, r: EgressRoute) {
+        let key = r.target.key();
+        if let Some(e) = self.route.iter_mut().find(|x| x.target.key() == key) {
+            *e = r;
+        } else {
+            self.route.push(r);
+        }
+    }
+
+    /// Remove the route for `target_key`; `true` if one was removed.
+    pub fn clear(&mut self, target_key: &str) -> bool {
+        let before = self.route.len();
+        self.route.retain(|r| r.target.key() != target_key);
+        self.route.len() != before
+    }
+
+    /// The route that governs `node`'s egress given the groups it belongs to:
+    /// the most *specific* matching route — a per-node route beats any of the
+    /// node's group routes, which beat the ANY/all-mesh default. `None` only when
+    /// there is no Node route, no matching Group route, and no ANY route.
+    ///
+    /// This is the resolution the gateway/each node runs to decide where its
+    /// traffic exits: exactly one effective route per node, with the per-node
+    /// override winning, so "route ANY through G but pin node X to gateway H"
+    /// resolves correctly.
+    #[must_use]
+    pub fn route_for(&self, node: &str, groups: &[String]) -> Option<&EgressRoute> {
+        self.route
+            .iter()
+            .filter(|r| match &r.target {
+                RouteTarget::Node { name } => name == node,
+                RouteTarget::Group { name } => groups.iter().any(|g| g == name),
+                RouteTarget::Any => true,
+            })
+            .max_by_key(|r| r.target.specificity())
+    }
+
+    /// Validate every route + that target keys don't collide (two routes for the
+    /// same node/group/ANY can't coexist).
+    ///
+    /// # Errors
+    /// The first inconsistency's reason.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for r in &self.route {
+            r.validate()?;
+            let key = r.target.key();
+            if !seen.insert(key.clone()) {
+                return Err(format!("duplicate route target: {key}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Durable path for the egress-routing table:
+/// `<workgroup_root>/vpn/egress-routes.toml` (alongside `vpn/tunnels.toml`).
+#[must_use]
+pub fn routing_path(workgroup_root: &std::path::Path) -> std::path::PathBuf {
+    workgroup_root.join("vpn").join("egress-routes.toml")
+}
+
+/// Load the egress-routing table (missing/malformed → default empty).
+#[must_use]
+pub fn load_routing(workgroup_root: &std::path::Path) -> EgressRouting {
+    std::fs::read_to_string(routing_path(workgroup_root))
+        .ok()
+        .and_then(|raw| EgressRouting::from_toml_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the egress-routing table (validate → atomic temp+rename), the same
+/// durability contract as [`crate::vpn::save`].
+///
+/// # Errors
+/// Validation failure, or an I/O / serialize error.
+pub fn save_routing(
+    workgroup_root: &std::path::Path,
+    routing: &EgressRouting,
+) -> Result<std::path::PathBuf, String> {
+    routing.validate()?;
+    let path = routing_path(workgroup_root);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    let toml = routing.to_toml_string().map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename {}: {e}", path.display()))?;
+    Ok(path)
+}
+
 /// A stable slot in `0..SLOT_SPACE` derived from `s` via FNV-1a — deterministic
 /// and dependency-free (not `DefaultHasher`, whose output is unspecified across
 /// toolchains) so a node's fwmark for a given interface is reproducible.
@@ -600,7 +879,10 @@ mod tests {
     fn custom_overlay_cidr_is_carved_out_not_the_default() {
         let p = EgressPlan::new("mvpn-x", 3, "10.99.0.0/16");
         assert_eq!(p.overlay_cidr, "10.99.0.0/16");
-        assert!(p.up_argv().iter().any(|c| c.contains(&"10.99.0.0/16".to_string())));
+        assert!(p
+            .up_argv()
+            .iter()
+            .any(|c| c.contains(&"10.99.0.0/16".to_string())));
         assert!(p
             .kill_switch_argv()
             .iter()
@@ -610,5 +892,213 @@ mod tests {
             .up_argv()
             .iter()
             .any(|c| c.contains(&DEFAULT_OVERLAY_CIDR.to_string())));
+    }
+
+    // ── VPN-GW-4: mesh egress routing (per-node / group / ANY) + failover ──
+
+    fn route(target: RouteTarget, gw: &str, primary: &str, failover: &[&str]) -> EgressRoute {
+        EgressRoute {
+            target,
+            gateway: gw.into(),
+            primary: primary.into(),
+            failover: failover.iter().map(|s| (*s).to_string()).collect(),
+            kill_switch: true,
+        }
+    }
+
+    #[test]
+    fn target_keys_are_distinct_per_scope() {
+        assert_eq!(RouteTarget::Node { name: "a".into() }.key(), "node:a");
+        assert_eq!(RouteTarget::Group { name: "g".into() }.key(), "group:g");
+        assert_eq!(RouteTarget::Any.key(), "any");
+        // Node beats group beats ANY in specificity (per-node override wins).
+        assert!(
+            RouteTarget::Node { name: "a".into() }.specificity()
+                > RouteTarget::Group { name: "g".into() }.specificity()
+        );
+        assert!(
+            RouteTarget::Group { name: "g".into() }.specificity() > RouteTarget::Any.specificity()
+        );
+    }
+
+    #[test]
+    fn chain_is_primary_then_failover_in_order() {
+        let r = route(RouteTarget::Any, "gw1", "mullvad1", &["proton1", "ivpn1"]);
+        assert_eq!(r.chain(), vec!["mullvad1", "proton1", "ivpn1"]);
+        // Always non-empty even with no failover.
+        let bare = route(RouteTarget::Any, "gw1", "only", &[]);
+        assert_eq!(bare.chain(), vec!["only"]);
+    }
+
+    #[test]
+    fn active_tunnel_walks_down_the_chain_on_drops() {
+        let r = route(RouteTarget::Any, "gw1", "mullvad1", &["proton1", "ivpn1"]);
+        // Nothing down → the primary is active.
+        assert_eq!(r.active_tunnel(&[]).as_deref(), Some("mullvad1"));
+        // Primary drops → fail over to the next in the chain.
+        assert_eq!(
+            r.active_tunnel(&["mullvad1".into()]).as_deref(),
+            Some("proton1")
+        );
+        // Primary + first failover down → second failover.
+        assert_eq!(
+            r.active_tunnel(&["mullvad1".into(), "proton1".into()])
+                .as_deref(),
+            Some("ivpn1")
+        );
+        // The WHOLE chain down → None (the caller engages the kill-switch).
+        assert_eq!(
+            r.active_tunnel(&["mullvad1".into(), "proton1".into(), "ivpn1".into()]),
+            None
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_fields_and_duplicate_chain_entries() {
+        // Empty gateway.
+        assert!(route(RouteTarget::Any, "", "p", &[]).validate().is_err());
+        // Empty primary.
+        assert!(route(RouteTarget::Any, "gw", "", &[]).validate().is_err());
+        // Empty node-target name.
+        assert!(
+            route(RouteTarget::Node { name: "  ".into() }, "gw", "p", &[])
+                .validate()
+                .is_err()
+        );
+        // A tunnel can't fail over to itself.
+        let dup = route(RouteTarget::Any, "gw", "p", &["p"]);
+        assert!(dup.validate().unwrap_err().contains("duplicate tunnel"));
+        // A clean route validates.
+        assert!(route(RouteTarget::Any, "gw", "p", &["q"])
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn routing_set_replaces_by_target_and_clear_removes() {
+        let mut routing = EgressRouting::default();
+        routing.set(route(
+            RouteTarget::Node {
+                name: "anvil".into(),
+            },
+            "gw1",
+            "m1",
+            &[],
+        ));
+        routing.set(route(RouteTarget::Any, "gw2", "p1", &[]));
+        assert_eq!(routing.route.len(), 2);
+        // Re-set the SAME target → replace in place (not a second entry).
+        routing.set(route(
+            RouteTarget::Node {
+                name: "anvil".into(),
+            },
+            "gwX",
+            "m9",
+            &[],
+        ));
+        assert_eq!(routing.route.len(), 2);
+        assert_eq!(routing.get("node:anvil").unwrap().gateway, "gwX");
+        // Clear by key.
+        assert!(routing.clear("node:anvil"));
+        assert!(!routing.clear("node:anvil"));
+        assert_eq!(routing.route.len(), 1);
+        assert!(routing.get("any").is_some());
+    }
+
+    #[test]
+    fn route_for_picks_the_most_specific_match() {
+        let mut routing = EgressRouting::default();
+        routing.set(route(RouteTarget::Any, "gw-any", "a1", &[]));
+        routing.set(route(
+            RouteTarget::Group { name: "lab".into() },
+            "gw-grp",
+            "g1",
+            &[],
+        ));
+        routing.set(route(
+            RouteTarget::Node {
+                name: "anvil".into(),
+            },
+            "gw-node",
+            "n1",
+            &[],
+        ));
+        // A node with its own route → the per-node route wins over its group/ANY.
+        let r = routing.route_for("anvil", &["lab".into()]).unwrap();
+        assert_eq!(r.gateway, "gw-node");
+        // A node only in the group → the group route beats ANY.
+        let r = routing.route_for("forge", &["lab".into()]).unwrap();
+        assert_eq!(r.gateway, "gw-grp");
+        // A node in no matching group → the ANY/all-mesh default.
+        let r = routing.route_for("loner", &[]).unwrap();
+        assert_eq!(r.gateway, "gw-any");
+        // No ANY route + no match → None.
+        let mut sparse = EgressRouting::default();
+        sparse.set(route(
+            RouteTarget::Node {
+                name: "anvil".into(),
+            },
+            "gw",
+            "n1",
+            &[],
+        ));
+        assert!(sparse.route_for("other", &[]).is_none());
+    }
+
+    #[test]
+    fn routing_round_trips_through_toml_and_disk() {
+        let mut routing = EgressRouting::default();
+        routing.set(route(
+            RouteTarget::Group { name: "lab".into() },
+            "gw1",
+            "mullvad1",
+            &["proton1"],
+        ));
+        routing.set(route(RouteTarget::Any, "gw2", "ivpn1", &[]));
+        let s = routing.to_toml_string().unwrap();
+        assert_eq!(EgressRouting::from_toml_str(&s).unwrap(), routing);
+        assert!(routing.validate().is_ok());
+
+        let tmp = tempfile::tempdir().unwrap();
+        save_routing(tmp.path(), &routing).unwrap();
+        assert_eq!(load_routing(tmp.path()), routing);
+        // Missing file → default empty.
+        assert_eq!(
+            load_routing(tmp.path().join("nope").as_path()),
+            EgressRouting::default()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_target_keys() {
+        // Two routes with the same target key can't coexist (set dedupes, but a
+        // hand-built / deserialized table must still be rejected).
+        let routing = EgressRouting {
+            route: vec![
+                route(RouteTarget::Any, "gw1", "a", &[]),
+                route(RouteTarget::Any, "gw2", "b", &[]),
+            ],
+        };
+        assert!(routing
+            .validate()
+            .unwrap_err()
+            .contains("duplicate route target"));
+    }
+
+    #[test]
+    fn kill_switch_defaults_on_when_omitted_in_toml() {
+        // A route TOML that omits `kill_switch` defaults it ON (Q8 — block, don't
+        // leak, unless the operator opts out).
+        let toml = r#"
+            [[route]]
+            gateway = "gw1"
+            primary = "mullvad1"
+            [route.target]
+            scope = "any"
+        "#;
+        let routing = EgressRouting::from_toml_str(toml).unwrap();
+        assert_eq!(routing.route.len(), 1);
+        assert!(routing.route[0].kill_switch, "kill-switch defaults on");
+        assert!(routing.route[0].failover.is_empty());
     }
 }
