@@ -21,8 +21,29 @@
 #   3. APPLY — GATED (L2, design-locked "operator/reconciler-gated"). Default is
 #      PLAN-ONLY (never applies). Apply runs ONLY when FA_APPLY=1 AND the tofu
 #      state is sane AND XO is reachable. When applying: `tofu apply` the committed
-#      shapes (clone from MDE-VM-golden, scale-to-zero idle), and between jobs
+#      shapes (clone from MDE-VM-golden, scale-to-zero idle), then make each KEPT
+#      build VM BUILD-READY (toolchain-on-first-provision, below), and between jobs
 #      farm-vm-snapshot.sh snapshot-reverts each VM to its clean baseline (L3).
+#
+#      BUILD-READINESS — toolchain-on-first-provision + snapshot baseline:
+#      MDE-VM-golden is a BASE template with NO Rust toolchain — a fresh clone has
+#      cargo/rustc MISSING and CANNOT build. So after a successful apply, for each
+#      build VM the autoscaler KEPT this tick, provision_build_ready (gated behind
+#      the SAME apply gate) checks whether the VM already carries a `clean` baseline
+#      snapshot (the one the inter-job reset reverts to). If it does, the VM is
+#      build-ready and we SKIP — the toolchain cost is paid ONCE per VM, not per
+#      tick, and the existing inter-job revert keeps it clean. If NOT (freshly
+#      provisioned, no clean snapshot), we run infra/ansible/build-vm-toolchain.yml
+#      against that VM's IP to install rust 1.94 + dev libs + mold, THEN take the
+#      `clean` baseline snapshot so every future tick reverts to a TOOLCHAINED
+#      baseline. Any failure (ansible missing / VM unreachable / playbook or
+#      snapshot failure) WARNs loudly + skips that VM for the next tick to retry —
+#      it NEVER crashes the tick or strands a running build. Plan-only / FA_APPLY=0
+#      / --dry-run installs NOTHING (no ansible, no snapshot) — only the gated apply
+#      path provisions.
+#        FOLLOW-UP (faster): bake the toolchain INTO MDE-VM-golden so every clone is
+#        instantly build-ready (zero per-VM toolchain cost on first provision). Then
+#        provision_build_ready collapses to just taking the baseline snapshot.
 #   4. DEGRADE GRACEFULLY (REQUIRED — the CURRENT live state): XO is presently
 #      UNREACHABLE (ws://172.20.145.192:8080 connection-refused) and tofu has no
 #      state. The reconciler DETECTS XO-unreachable / no-state, keeps the last-good
@@ -57,7 +78,9 @@
 #      MCNF_BUILD_USER (default mm), MCNF_FARM_KEY (default ~/.ssh/mackes_mesh_ed25519),
 #      FA_APPLY (default 0 — the apply gate), FA_NOW (epoch; injectable for tests),
 #      FA_PROBE_TIMEOUT (default 4s — XO TCP probe timeout),
-#      FA_NO_SLOTS (set to skip the per-VM in-flight-slot probe — offline/tests).
+#      FA_NO_SLOTS (set to skip the per-VM in-flight-slot probe — offline/tests),
+#      MCNF_TOOLCHAIN_PLAYBOOK (default <repo>/infra/ansible/build-vm-toolchain.yml —
+#        the build-ready provisioning playbook; overridable for tests).
 #      Autoscaler tunables (FA_MAX_SMALL/FA_DWELL_SECS/FA_POD_BUDGET) pass through.
 set -euo pipefail
 
@@ -69,6 +92,7 @@ WORKLIST="${MCNF_WORKLIST:-$REPO_ROOT/docs/WORKLIST.md}"
 AUTOSCALE="$HERE/farm-autoscale.sh"
 SNAPSHOT="$HERE/farm-vm-snapshot.sh"
 XCP_BUILD="$HERE/xcp-build.sh"
+TOOLCHAIN_PLAYBOOK="${MCNF_TOOLCHAIN_PLAYBOOK:-$REPO_ROOT/infra/ansible/build-vm-toolchain.yml}"
 FARM_JOBS="$REPO_ROOT/automation/lib/farm-jobs.sh"
 XO_URL="${MCNF_XO_URL:-ws://172.20.145.192:8080}"
 BUILD_USER="${MCNF_BUILD_USER:-mm}"
@@ -242,6 +266,40 @@ host_port_from_xo_url() {
   printf '%s %s\n' "$host" "$port"
 }
 
+# vm_is_build_ready <has-clean-probe-rc> — PURE: decide build-readiness from the EXIT
+# CODE of the `farm-vm-snapshot.sh has-clean` probe for one VM. A build VM is BUILD-
+# READY iff it already carries a `clean` baseline snapshot (the one reset_running_vms
+# reverts to — taken only AFTER the toolchain is installed, so its presence means the
+# toolchain is baked in). rc 0 = has a clean snapshot → "ready"; ANY nonzero (no
+# snapshot / absent VM / dom0-unreachable) → "not-ready", which re-provisions — the
+# SAFE direction, since the toolchain playbook is idempotent. Pure in its one arg so
+# the self-test can assert both branches without touching a dom0.
+vm_is_build_ready() {
+  if [ "$1" = "0" ]; then echo ready; else echo not-ready; fi
+}
+
+# provision_enabled <gate-verdict> — PURE: may provision_build_ready install the
+# toolchain this tick? ONLY when the apply gate verdict is exactly "apply" (the same
+# verdict that authorised the tofu apply). Any plan-only:* verdict — FA_APPLY=0,
+# XO-unreachable, dry-run, etc. — returns nonzero so the step is a hard no-op: NO
+# ansible, NO snapshot. This is the structural guarantee that plan-only/--dry-run
+# never provisions. Echoes nothing; the rc IS the answer (0 = provision).
+provision_enabled() { [ "$1" = "apply" ]; }
+
+# toolchain_inventory_line <ip> <user> <key> — PURE: build the single host line for a
+# one-host inventory FILE, pinning the VM's IP + ssh user + key so the run is self-
+# contained (no dependence on infra/ansible/inventory.ini, which only lists the 3
+# FIXED build VMs — an elastically-cloned VM's IP wouldn't be in it). The caller
+# writes it under a `[build_vms]` header (the group build-vm-toolchain.yml targets);
+# an inline `-i host,` would put the host in `ungrouped` and the play would match
+# nothing. Matches the inventory.ini schema (ansible_host/ansible_user/
+# ansible_ssh_private_key_file). Pure string-builder so the self-test asserts it.
+toolchain_inventory_line() {
+  local ip="$1" user="$2" key="$3"
+  printf '%s ansible_host=%s ansible_user=%s ansible_ssh_private_key_file=%s\n' \
+    "$ip" "$ip" "$user" "$key"
+}
+
 # =============================================================================
 # --self-test — pure-function assertions (no farm I/O). Run first, exits.
 # =============================================================================
@@ -289,6 +347,25 @@ if [ "${1:-}" = "--self-test" ]; then
   check "xo url no port → 80"   "$(host_port_from_xo_url 'ws://10.0.0.1')" "10.0.0.1 80"
   check "xo url ipv6 host:port" "$(host_port_from_xo_url 'ws://[::1]:8080')" "::1 8080"
   check "xo url ipv6 no port"   "$(host_port_from_xo_url 'ws://[fe80::1]')" "fe80::1 80"
+
+  # --- vm_is_build_ready (toolchain-on-first-provision readiness from the probe rc) ---
+  # has-clean rc 0 = a clean snapshot exists → already toolchained → ready → SKIP.
+  check "probe rc 0 → ready"            "$(vm_is_build_ready 0)" ready
+  # ANY nonzero (no snapshot / absent VM / dom0 down) → not-ready → provision RUNS.
+  check "probe rc 1 → run"              "$(vm_is_build_ready 1)" not-ready
+  check "probe rc 255 (ssh fail) → run" "$(vm_is_build_ready 255)" not-ready
+
+  # --- toolchain_inventory_line (one [build_vms]-group host line for the clone) ---
+  check "inventory line for a clone" \
+    "$(toolchain_inventory_line 172.20.0.130 mm /root/.ssh/mackes_mesh_ed25519)" \
+    "172.20.0.130 ansible_host=172.20.0.130 ansible_user=mm ansible_ssh_private_key_file=/root/.ssh/mackes_mesh_ed25519"
+
+  # --- provision_enabled: the structural "dry-run/plan-only NEVER provisions" guard.
+  # Only the exact "apply" verdict authorises installing the toolchain; every
+  # plan-only:* verdict (FA_APPLY=0, XO-down, dry-run) is a hard no-op.
+  check "gate apply → provision"        "$(provision_enabled apply && echo yes || echo no)" yes
+  check "FA_APPLY=0 → no provision"     "$(provision_enabled 'plan-only:FA_APPLY!=1 (apply opt-in off)' && echo yes || echo no)" no
+  check "XO-down → no provision"        "$(provision_enabled 'plan-only:XO-unreachable' && echo yes || echo no)" no
 
   if [ "$fails" -eq 0 ]; then
     echo "farm-reconciler: self-test passed"; exit 0
@@ -618,18 +695,17 @@ if [ "$APPLY_RC" -ne 0 ]; then
 fi
 log "tofu apply OK — farm converged to the committed shapes."
 
-# --- 4) inter-job snapshot-revert (L3) ---------------------------------------
-# Between jobs, revert each freshly-converged build VM to its clean post-toolchain
-# baseline (FA-2 / farm-vm-snapshot.sh reset) so job N+1 doesn't inherit job N's
-# workspace/sccache state. We reset ONLY the VMs the autoscaler decided to KEEP this
-# tick — read from the committed shape vars (dom0_shape, reused from xcp-build.sh) —
-# and skip any VM that is currently BUSY (a live build process), so a mid-flight job
-# is never reverted out from under itself. Each reset is per-VM isolated + best
-# effort: a missing snapshot / unreachable dom0 is warned and skipped, never failing
-# the tick (the apply already converged; reset is the inter-job optimisation).
-reset_running_vms() {
-  [ -x "$SNAPSHOT" ] || { warn "farm-vm-snapshot.sh not found at $SNAPSHOT — skipping inter-job reset"; return 0; }
-  declare -f dom0_shape >/dev/null 2>&1 || { warn "dom0_shape unavailable — skipping inter-job reset"; return 0; }
+# for_each_kept_vm <callback> — iterate the build VMs the autoscaler KEPT this tick
+# (from the committed shape vars), calling `<callback> <vm-name> <dom0-host> <vm-ip>`
+# for each, IN ORDER. This is the SINGLE source of the dom0/shape + elastic-lane IP
+# math: both the build-ready provision step (provision_build_ready) and the inter-job
+# reset (reset_running_vms) drive off it, so they can NEVER disagree about which VMs
+# exist or what their IPs are. Returns nonzero (caller skips its step) only if the
+# shape vars can't be read (dom0_shape unavailable) — a per-VM problem is the
+# callback's own concern (degrade per VM, never abort the iteration).
+for_each_kept_vm() {
+  local cb="$1"
+  declare -f dom0_shape >/dev/null 2>&1 || { warn "dom0_shape unavailable — cannot enumerate kept VMs"; return 1; }
   local tfvars_text="" dk shape n i name host
   [ -f "$TFVARS" ] && tfvars_text="$(cat "$TFVARS")"
   for dk in "${ORDER[@]}"; do
@@ -637,7 +713,7 @@ reset_running_vms() {
     host="${DOM0_HOST[$dk]}"
     case "$shape" in
       big)
-        reset_one_vm "${DOM0_BIG_NAME[$dk]}" "$host" "${DOM0_IPS[$dk]%% *}"
+        "$cb" "${DOM0_BIG_NAME[$dk]}" "$host" "${DOM0_IPS[$dk]%% *}"
         ;;
       small)
         # small_count for this dom0 (default 1 if absent) → small-0..small-(n-1).
@@ -650,22 +726,114 @@ reset_running_vms() {
         # IPs into the legacy host (the live autoscaler caps at 4, but be defensive).
         local -a lane; read -ra lane <<<"${DOM0_IPS[$dk]}"
         local max_small_idx=4
-        [ "$n" -gt "$max_small_idx" ] && { warn "small_count=$n on $dk exceeds the $max_small_idx-wide lane — clamping reset to $max_small_idx"; n="$max_small_idx"; }
+        [ "$n" -gt "$max_small_idx" ] && { warn "small_count=$n on $dk exceeds the $max_small_idx-wide lane — clamping to $max_small_idx"; n="$max_small_idx"; }
         i=0
         while [ "$i" -lt "$n" ]; do
           if [ "$i" -eq 0 ]; then name="${DOM0_SMALL_NAME[$dk]}"; else name="${DOM0_SMALL_NAME[$dk]}-$i"; fi
-          reset_one_vm "$name" "$host" "${lane[$i]:-}"
+          "$cb" "$name" "$host" "${lane[$i]:-}"
           i=$(( i + 1 ))
         done
         ;;
-      off) : ;; # nothing running on this dom0 — nothing to reset
+      off) : ;; # nothing running on this dom0 — nothing to enumerate
     esac
   done
+}
+
+# --- 4) BUILD-READINESS: toolchain-on-first-provision + snapshot baseline ------
+# MDE-VM-golden is a BASE template (no Rust toolchain) — a fresh clone CANNOT build.
+# For each VM the autoscaler KEPT this tick, make it build-ready ONCE: if it already
+# carries a `clean` baseline snapshot (taken only post-toolchain) it's ready → SKIP;
+# else install the toolchain (infra/ansible/build-vm-toolchain.yml) and take the
+# `clean` snapshot so every future tick's inter-job reset reverts to a TOOLCHAINED
+# baseline. Per-VM isolated + degrade-don't-crash: ansible missing / unreachable VM
+# / playbook or snapshot failure → WARN + skip that VM (next tick retries), NEVER
+# abort the tick or strand a build. Runs ONLY on the gated apply path — provision_
+# enabled "$GATE" makes plan-only/--dry-run a hard no-op (no ansible, no snapshot).
+provision_build_ready() {
+  local gate="$1"
+  provision_enabled "$gate" || { log "provision_build_ready: skipped (${gate}) — no toolchain/snapshot on a non-apply tick"; return 0; }
+  if ! command -v ansible-playbook >/dev/null 2>&1; then
+    warn "ansible-playbook not found — cannot toolchain fresh build VMs this tick (they'll lack cargo/rustc); next tick retries"
+    return 0
+  fi
+  [ -r "$TOOLCHAIN_PLAYBOOK" ] || { warn "toolchain playbook missing/unreadable ($TOOLCHAIN_PLAYBOOK) — skipping build-ready provision"; return 0; }
+  [ -x "$SNAPSHOT" ] || { warn "farm-vm-snapshot.sh not found at $SNAPSHOT — cannot baseline a toolchained VM; skipping build-ready provision"; return 0; }
+  for_each_kept_vm provision_one_vm || warn "could not enumerate kept VMs — build-ready provision skipped this tick"
+}
+
+# provision_one_vm <vm-name> <dom0-host> <vm-ip-or-empty> — make ONE kept VM build-
+# ready. SKIP if it already has a `clean` snapshot (toolchain already baked, paid
+# once). Else: toolchain via ansible (a temp inventory pinned to this VM's IP under
+# the build_vms group the playbook targets), then take the `clean` baseline. Every
+# failure WARNs + returns 0 — the next tick retries.
+# SC2317: a for_each_kept_vm callback (invoked via "$cb") — indirect, so shellcheck
+# can't see the call site.
+# shellcheck disable=SC2317
+provision_one_vm() {
+  local name="$1" host="$2" ip="$3" probe_rc ready
+  # READINESS — reuse farm-vm-snapshot.sh's `has-clean` (its resolve_vm + clean_snapshots,
+  # which OWN the `clean` name-label) so this check can NEVER drift from what the
+  # inter-job reset actually reverts to. Exit 0 = has a clean snapshot. Any dom0/ssh
+  # failure → nonzero → treated as not-ready (the SAFE direction: re-toolchain, which
+  # is idempotent, rather than skip a possibly-untoolchained VM). `|| probe_rc=$?`
+  # keeps the nonzero out of `set -e`.
+  probe_rc=0
+  MCNF_XCP_HOST="$host" MCNF_FARM_KEY="$KEY" "$SNAPSHOT" has-clean "$name" --xcp-host "$host" >/dev/null 2>&1 || probe_rc=$?
+  ready="$(vm_is_build_ready "$probe_rc")"
+  if [ "$ready" = "ready" ]; then
+    log "  $name already build-ready (has a clean snapshot) — skip toolchain (paid once)"
+    return 0
+  fi
+  if [ -z "$ip" ]; then
+    warn "  $name has no clean snapshot but no known IP — cannot toolchain; skipped (next tick retries)"
+    return 0
+  fi
+  if ! timeout "$PROBE_TIMEOUT" bash -c "cat </dev/null >/dev/tcp/$ip/22" 2>/dev/null; then
+    warn "  $name ($ip) unreachable on :22 — cannot toolchain; skipped (next tick retries)"
+    return 0
+  fi
+  log "  $name ($ip) not build-ready → installing toolchain (ansible build-vm-toolchain.yml)"
+  # The playbook is `hosts: build_vms`, so the target MUST be in that group — an
+  # inline `-i host,` puts it in `ungrouped` (play matches nothing, exits 0, and we'd
+  # snapshot an UN-toolchained VM). Write a one-host inventory FILE under [build_vms]
+  # with the connection vars (inventory.ini doesn't list elastically-cloned IPs).
+  local inv_file; inv_file="$(mktemp "${TMPDIR:-/tmp}/mcnf-fa-inv.XXXXXX")" || {
+    warn "  could not create a temp inventory for $name — skipped (next tick retries)"; return 0; }
+  { printf '[build_vms]\n'; toolchain_inventory_line "$ip" "$BUILD_USER" "$KEY"; } >"$inv_file"
+  local pb_rc=0
+  ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i "$inv_file" "$TOOLCHAIN_PLAYBOOK" >/dev/null 2>&1 || pb_rc=$?
+  rm -f "$inv_file"
+  if [ "$pb_rc" -ne 0 ]; then
+    warn "  toolchain playbook FAILED on $name ($ip) — skipped, NOT snapshotting a half-provisioned VM; next tick retries"
+    return 0
+  fi
+  log "  toolchain installed on $name → taking the clean baseline snapshot"
+  if ! MCNF_XCP_HOST="$host" MCNF_FARM_KEY="$KEY" "$SNAPSHOT" snapshot "$name" --xcp-host "$host" >/dev/null 2>&1; then
+    warn "  baseline snapshot of $name FAILED — toolchain is installed but no clean point yet; next tick re-checks"
+    return 0
+  fi
+  log "  $name is now build-ready (toolchained + clean baseline snapshot taken)"
+}
+
+# --- 5) inter-job snapshot-revert (L3) ---------------------------------------
+# Between jobs, revert each freshly-converged build VM to its clean post-toolchain
+# baseline (FA-2 / farm-vm-snapshot.sh reset) so job N+1 doesn't inherit job N's
+# workspace/sccache state. We reset ONLY the VMs the autoscaler decided to KEEP this
+# tick (for_each_kept_vm) — and skip any VM that is currently BUSY (a live build
+# process), so a mid-flight job is never reverted out from under itself. Each reset
+# is per-VM isolated + best effort: a missing snapshot / unreachable dom0 is warned
+# and skipped, never failing the tick (the apply already converged; reset is the
+# inter-job optimisation, and provision_build_ready already created the baseline).
+reset_running_vms() {
+  [ -x "$SNAPSHOT" ] || { warn "farm-vm-snapshot.sh not found at $SNAPSHOT — skipping inter-job reset"; return 0; }
+  for_each_kept_vm reset_one_vm || warn "could not enumerate kept VMs — inter-job reset skipped this tick"
 }
 
 # reset_one_vm <vm-name> <dom0-host> <vm-ip-or-empty> — reset ONE VM to its clean
 # snapshot, UNLESS it's mid-build (a live compiler on <vm-ip>, when known). Best
 # effort: any failure is warned and swallowed (never aborts the tick).
+# SC2317: a for_each_kept_vm callback (invoked via "$cb") — indirect call site.
+# shellcheck disable=SC2317
 reset_one_vm() {
   local name="$1" host="$2" ip="$3"
   if [ -n "$ip" ]; then
@@ -682,6 +850,12 @@ reset_one_vm() {
     warn "  reset of $name failed/absent (no clean snapshot? mid-provision?) — skipped, tick continues"
   fi
 }
+
+log "build-readiness: toolchain-on-first-provision + clean-baseline snapshot for kept VMs"
+# `|| warn` is belt-and-suspenders: provision_build_ready already returns 0 on every
+# path, but the guard guarantees a future edit can't let a stray nonzero crash the
+# tick out from under a running build (the apply already converged).
+provision_build_ready "$GATE" || warn "build-ready provision step degraded (rc=$?) — tick continues; next tick retries"
 
 log "inter-job snapshot-revert of the converged build VMs to their clean baseline (L3)"
 reset_running_vms
