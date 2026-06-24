@@ -42,9 +42,12 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use mackes_xcp::{build_identity_seed, mde_vm_hostname, HostTarget, Hypervisor, XeSsh};
+use mackes_xcp::{
+    build_identity_seed, mde_vm_hostname, HostCapacity, HostTarget, Hypervisor, VmInfo, XeSsh,
+};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
+use mde_bus::rpc::reply_topic;
 
 use super::{ShutdownToken, Worker};
 
@@ -53,6 +56,28 @@ pub const SPAWN_TOPIC: &str = "action/provision/spawn";
 
 /// Reply-topic prefix for spawn acks (suffix = request ULID).
 pub const SPAWN_ACK_PREFIX: &str = "action/provision/spawn-ack/";
+
+/// Enumerate the VMs (with power-state) across every configured dom0 (XCP-4).
+///
+/// The Workbench Provisioning panel queries this. Read-only; the reply lands on
+/// the generic `reply/<request-ulid>` RPC lane.
+pub const LIST_TOPIC: &str = "action/provision/list";
+
+/// Bus action topic the panel uses to destroy a named VM (XCP-4). The request
+/// body is a [`DestroyRequest`]; the reply lands on `reply/<request-ulid>`.
+pub const DESTROY_TOPIC: &str = "action/provision/destroy";
+
+/// (Re)start an already-cloned, halted VM by name (XCP-4).
+///
+/// Distinct from `spawn`, which clones a *new* VM from the golden; `start`
+/// issues `xe vm-start` on the existing VM the request names. The body is a
+/// [`StartRequest`]; the reply lands on `reply/<request-ulid>`.
+pub const START_TOPIC: &str = "action/provision/start";
+
+/// Bus action topic the panel queries for the dom0 host roster + per-host
+/// capacity that feeds the spawn target picker (XCP-4). Read-only; the reply
+/// lands on `reply/<request-ulid>`.
+pub const HOSTS_TOPIC: &str = "action/provision/hosts";
 
 /// The golden template every spawn clones (design A2).
 pub const GOLDEN_TEMPLATE: &str = "MDE-VM-golden";
@@ -126,6 +151,162 @@ pub fn build_spawn_ack_error(message: &str) -> String {
         error: Some(message.to_string()),
     };
     serde_json::to_string(&ack).unwrap_or_else(|_| r#"{"error":"ack encode failed"}"#.into())
+}
+
+// ───────────────────────── XCP-4 list/destroy/hosts ─────────────────────────
+// The Workbench Provisioning panel's three read/destroy verbs. Unlike the spawn
+// flow (which acks on its own `action/provision/spawn-ack/<ulid>` topic keyed by
+// a body `request_ulid`), these reply on the generic `reply/<request-ulid>` RPC
+// lane so the panel's `mde_bus::rpc::request` round-trip (via
+// `crate::dbus::action_request*`) resolves them with no extra correlation.
+
+/// One VM in a [`LIST_TOPIC`] reply — a [`VmInfo`] tagged with the dom0 it lives
+/// on (the panel needs the host to target a destroy at the right dom0).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ListedVm {
+    /// XAPI VM uuid.
+    pub uuid: String,
+    /// `name-label`.
+    pub name: String,
+    /// `power-state` (`running` / `halted` / …).
+    pub power_state: String,
+    /// dom0 this VM is hosted on (one of the `MCNF_XEN_DOM0S`).
+    pub host: String,
+}
+
+/// One dom0's capacity row in a [`HOSTS_TOPIC`] reply.
+///
+/// Carries the host address plus either its [`HostCapacity`] or the probe error
+/// that host returned. The panel renders reachable hosts as pickable spawn
+/// targets and surfaces the error for any that failed to probe.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HostRow {
+    /// dom0 address (one of the `MCNF_XEN_DOM0S`).
+    pub host: String,
+    /// Physical CPU count.
+    #[serde(default)]
+    pub cpu_count: u32,
+    /// Total host memory (KiB).
+    #[serde(default)]
+    pub mem_total_kib: u64,
+    /// Free host memory (KiB).
+    #[serde(default)]
+    pub mem_free_kib: u64,
+    /// Largest free SR space (bytes) — the spawn ceiling.
+    #[serde(default)]
+    pub sr_free_bytes: u64,
+    /// Running VMs on the host.
+    #[serde(default)]
+    pub running_vms: u32,
+    /// Probe error for this host, if it was unreachable / `xe` failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl HostRow {
+    /// A reachable host row built from a successful capacity probe.
+    #[must_use]
+    pub fn ok(host: &str, cap: &HostCapacity) -> Self {
+        Self {
+            host: host.to_string(),
+            cpu_count: cap.cpu_count,
+            mem_total_kib: cap.mem_total_kib,
+            mem_free_kib: cap.mem_free_kib,
+            sr_free_bytes: cap.sr_free_bytes,
+            running_vms: cap.running_vms,
+            error: None,
+        }
+    }
+
+    /// An error row for a host whose capacity probe failed.
+    #[must_use]
+    pub fn failed(host: &str, message: &str) -> Self {
+        Self {
+            host: host.to_string(),
+            error: Some(message.to_string()),
+            ..Self::ok(host, &HostCapacity::default())
+        }
+    }
+}
+
+/// A [`DESTROY_TOPIC`] request — destroy the VM named `name` (the operator picks
+/// it from the list). `host` pins the dom0 (the list reply carries it); `None`
+/// falls back to the first configured dom0.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NamedVmRequest {
+    /// `name-label` of the target VM.
+    pub name: String,
+    /// dom0 the VM lives on; `None` ⇒ the first configured `MCNF_XEN_DOM0S`.
+    #[serde(default)]
+    pub host: Option<String>,
+}
+
+/// A [`DESTROY_TOPIC`] / [`START_TOPIC`] request — both name a VM on a dom0.
+pub type DestroyRequest = NamedVmRequest;
+/// A [`START_TOPIC`] request (alias of [`NamedVmRequest`]).
+pub type StartRequest = NamedVmRequest;
+
+/// Parse a name-on-a-dom0 request body (the `destroy` / `start` verbs share the
+/// shape). `verb` names the request in the error message.
+///
+/// # Errors
+/// A human-readable string on malformed JSON / an empty `name` (we'd have no VM
+/// to act on).
+pub fn parse_named_vm_request(body: &str, verb: &str) -> Result<NamedVmRequest, String> {
+    let req: NamedVmRequest =
+        serde_json::from_str(body).map_err(|e| format!("malformed {verb} request: {e}"))?;
+    if req.name.trim().is_empty() {
+        return Err(format!("{verb} request: name is empty"));
+    }
+    Ok(req)
+}
+
+/// Build a `{"vms":[…]}` list-reply body (or `{"error":…}` on encode failure).
+#[must_use]
+pub fn build_list_reply(vms: &[ListedVm]) -> String {
+    serde_json::to_string(&serde_json::json!({ "vms": vms }))
+        .unwrap_or_else(|_| r#"{"error":"list encode failed"}"#.into())
+}
+
+/// Build a `{"hosts":[…]}` hosts-reply body (or `{"error":…}` on encode failure).
+#[must_use]
+pub fn build_hosts_reply(hosts: &[HostRow]) -> String {
+    serde_json::to_string(&serde_json::json!({ "hosts": hosts }))
+        .unwrap_or_else(|_| r#"{"error":"hosts encode failed"}"#.into())
+}
+
+/// Build a `{"destroyed":<name>}` reply for a completed destroy.
+#[must_use]
+pub fn build_destroy_reply_ok(name: &str) -> String {
+    serde_json::to_string(&serde_json::json!({ "destroyed": name }))
+        .unwrap_or_else(|_| r#"{"error":"destroy encode failed"}"#.into())
+}
+
+/// Build a `{"started":<name>}` reply for a completed start.
+#[must_use]
+pub fn build_start_reply_ok(name: &str) -> String {
+    serde_json::to_string(&serde_json::json!({ "started": name }))
+        .unwrap_or_else(|_| r#"{"error":"start encode failed"}"#.into())
+}
+
+/// Build a `{"error":<message>}` reply body — the shape the panel's
+/// `reply_error` decoder looks for across all three verbs.
+#[must_use]
+pub fn build_error_reply(message: &str) -> String {
+    serde_json::to_string(&serde_json::json!({ "error": message }))
+        .unwrap_or_else(|_| r#"{"error":"encode failed"}"#.into())
+}
+
+/// Resolve the uuid of the VM named `name` from a roster (the destroy path:
+/// `destroy` takes a uuid, but the operator names a VM).
+///
+/// # Errors
+/// `Err` when no VM in `vms` carries that `name-label`.
+pub fn resolve_uuid_by_name(vms: &[VmInfo], name: &str) -> Result<String, String> {
+    vms.iter()
+        .find(|v| v.name == name)
+        .map(|v| v.uuid.clone())
+        .ok_or_else(|| format!("no VM named {name:?} on the target dom0"))
 }
 
 /// Resolve the dom0 the request targets.
@@ -294,9 +475,10 @@ fn run_spawn_blocking(bus_root: PathBuf, req: &SpawnRequest) {
 /// Build the live [`XeSsh`] target for the request + run the spawn. Split from
 /// [`run_spawn`] so the latter stays host-free + unit-testable.
 fn spawn_over_ssh(req: &SpawnRequest) -> Result<String, String> {
-    let dom0 = resolve_dom0(req.host.as_deref(), &allowed_dom0s())?;
-    let target = HostTarget::ssh_root(dom0, Some(dom0_ssh_key()));
-    let hv = XeSsh::new(target);
+    let hv = XeSsh::new(hv_target_for(&resolve_dom0(
+        req.host.as_deref(),
+        &allowed_dom0s(),
+    )?));
     run_spawn(
         &hv,
         &req.name,
@@ -304,6 +486,242 @@ fn spawn_over_ssh(req: &SpawnRequest) -> Result<String, String> {
         IP_WAIT_TIMEOUT,
         IP_WAIT_POLL,
     )
+}
+
+/// The xe-over-SSH target reaching a single dom0 with the mesh key (the same
+/// target [`spawn_over_ssh`] builds — the destroy/list/hosts handlers reuse it).
+fn hv_target_for(dom0: &str) -> HostTarget {
+    HostTarget::ssh_root(dom0.to_string(), Some(dom0_ssh_key()))
+}
+
+/// Enumerate every configured dom0's VMs (each tagged with its host) for a
+/// [`LIST_TOPIC`] reply. A per-host probe failure is skipped (the panel still
+/// shows the VMs on the hosts that answered) rather than failing the whole list.
+fn list_all_vms() -> Vec<ListedVm> {
+    let mut out = Vec::new();
+    for dom0 in allowed_dom0s() {
+        let hv = XeSsh::new(hv_target_for(&dom0));
+        match hv.list() {
+            Ok(vms) => out.extend(vms.into_iter().map(|v| ListedVm {
+                uuid: v.uuid,
+                name: v.name,
+                power_state: v.power_state,
+                host: dom0.clone(),
+            })),
+            Err(e) => {
+                tracing::warn!(dom0 = %dom0, error = %e, "xcp_provision: list over dom0 failed");
+            }
+        }
+    }
+    out
+}
+
+/// Probe every configured dom0's capacity for a [`HOSTS_TOPIC`] reply, recording
+/// an error row for any host that didn't answer (so the panel can grey it out).
+fn probe_all_hosts() -> Vec<HostRow> {
+    allowed_dom0s()
+        .into_iter()
+        .map(|dom0| {
+            let hv = XeSsh::new(hv_target_for(&dom0));
+            match hv.host_capacity() {
+                Ok(cap) => HostRow::ok(&dom0, &cap),
+                Err(e) => HostRow::failed(&dom0, &e.to_string()),
+            }
+        })
+        .collect()
+}
+
+/// Resolve a name-on-a-dom0 request to its live `(XeSsh, uuid)`: resolve the
+/// dom0 (allow-list guard), list its VMs, map `name` → uuid. Shared preamble for
+/// the `destroy` + `start` handlers (both act on an existing named VM).
+///
+/// # Errors
+/// Dom0 not allow-listed / `xe list` failed / no VM by that name.
+fn resolve_named_vm(req: &NamedVmRequest) -> Result<(XeSsh, String), String> {
+    let dom0 = resolve_dom0(req.host.as_deref(), &allowed_dom0s())?;
+    let hv = XeSsh::new(hv_target_for(&dom0));
+    let vms = hv.list().map_err(|e| format!("list {dom0}: {e}"))?;
+    let uuid = resolve_uuid_by_name(&vms, req.name.trim())?;
+    Ok((hv, uuid))
+}
+
+/// Destroy the named VM on the resolved dom0 (force-shutdown + uninstall).
+/// Returns the destroyed name on success.
+///
+/// # Errors
+/// Per [`resolve_named_vm`], plus an `xe` uninstall failure.
+fn destroy_named_vm(req: &DestroyRequest) -> Result<String, String> {
+    let (hv, uuid) = resolve_named_vm(req)?;
+    hv.destroy(&uuid)
+        .map_err(|e| format!("destroy {} ({uuid}): {e}", req.name))?;
+    Ok(req.name.clone())
+}
+
+/// Start the named (already-cloned, halted) VM on the resolved dom0 via
+/// `xe vm-start` — the real "restart an existing VM" path, distinct from `spawn`
+/// (which clones a *new* VM from the golden). Returns the started name.
+///
+/// # Errors
+/// Per [`resolve_named_vm`], plus an `xe vm-start` failure.
+fn start_named_vm(req: &StartRequest) -> Result<String, String> {
+    let (hv, uuid) = resolve_named_vm(req)?;
+    hv.start(&uuid)
+        .map_err(|e| format!("start {} ({uuid}): {e}", req.name))?;
+    Ok(req.name.clone())
+}
+
+/// One request on a responder topic — the request ULID (for the
+/// `reply/<ulid>` lane) plus its body. Opens + drops a `Persist` synchronously
+/// so it never crosses an `.await` (the file's `!Sync` invariant).
+struct PendingRequest {
+    ulid: String,
+    body: String,
+}
+
+/// Read new messages on `topic` since `cursor`, advancing the cursor. Mirrors
+/// [`read_new_spawns`] but generic over the topic (the three XCP-4 responders
+/// share it) and keeps the raw body so each handler parses its own request.
+fn read_new_requests(
+    bus_root: &Path,
+    topic: &str,
+    cursor: &mut Option<String>,
+) -> Vec<PendingRequest> {
+    let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
+        return vec![];
+    };
+    let Ok(msgs) = persist.list_since(topic, cursor.as_deref()) else {
+        return vec![];
+    };
+    msgs.into_iter()
+        .map(|msg| {
+            *cursor = Some(msg.ulid.clone());
+            PendingRequest {
+                body: msg.body.unwrap_or_default(),
+                ulid: msg.ulid,
+            }
+        })
+        .collect()
+}
+
+/// Write `body` to the generic `reply/<ulid>` RPC lane the panel waits on.
+/// Never panics; a persist failure is logged and dropped (the caller times out).
+fn write_reply(bus_root: &Path, req_ulid: &str, body: &str) {
+    let topic = reply_topic(req_ulid);
+    let persist = match Persist::open(bus_root.to_path_buf()) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "xcp_provision: persist open failed; cannot reply");
+            return;
+        }
+    };
+    if let Err(e) = persist.write(&topic, Priority::Default, None, Some(body)) {
+        tracing::warn!(error = %e, topic = topic, "xcp_provision: reply write failed");
+    }
+}
+
+/// Handle one [`LIST_TOPIC`] request on a blocking thread + write the reply.
+fn handle_list_blocking(bus_root: &Path, req_ulid: &str) {
+    write_reply(bus_root, req_ulid, &build_list_reply(&list_all_vms()));
+}
+
+/// Handle one [`HOSTS_TOPIC`] request on a blocking thread + write the reply.
+fn handle_hosts_blocking(bus_root: &Path, req_ulid: &str) {
+    write_reply(bus_root, req_ulid, &build_hosts_reply(&probe_all_hosts()));
+}
+
+/// Handle one [`DESTROY_TOPIC`] request on a blocking thread + write the reply.
+fn handle_destroy_blocking(bus_root: &Path, req_ulid: &str, body: &str) {
+    let reply = match parse_named_vm_request(body, "destroy").and_then(|req| destroy_named_vm(&req))
+    {
+        Ok(name) => build_destroy_reply_ok(&name),
+        Err(e) => {
+            tracing::warn!(req = req_ulid, error = %e, "xcp_provision: destroy failed");
+            build_error_reply(&e)
+        }
+    };
+    write_reply(bus_root, req_ulid, &reply);
+}
+
+/// Handle one [`START_TOPIC`] request on a blocking thread + write the reply.
+fn handle_start_blocking(bus_root: &Path, req_ulid: &str, body: &str) {
+    let reply = match parse_named_vm_request(body, "start").and_then(|req| start_named_vm(&req)) {
+        Ok(name) => build_start_reply_ok(&name),
+        Err(e) => {
+            tracing::warn!(req = req_ulid, error = %e, "xcp_provision: start failed");
+            build_error_reply(&e)
+        }
+    };
+    write_reply(bus_root, req_ulid, &reply);
+}
+
+/// Cursors for the XCP-4 responder topics, advanced per drained request so each
+/// request is handled exactly once across ticks. Seeded at each topic's tail on
+/// worker start ([`ResponderCursors::seed_at_tail`]) so a restart does NOT
+/// replay still-retained requests — load-bearing for the mutating `destroy` /
+/// `start` verbs, which must not re-fire an old teardown / boot.
+#[derive(Default)]
+struct ResponderCursors {
+    list: Option<String>,
+    destroy: Option<String>,
+    start: Option<String>,
+    hosts: Option<String>,
+}
+
+impl ResponderCursors {
+    /// Seed every cursor past the current tail of its topic so only requests
+    /// that arrive *after* the worker starts are handled (no backlog replay).
+    fn seed_at_tail(bus_root: &Path) -> Self {
+        let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
+            return Self::default();
+        };
+        let tail = |topic: &str| persist.latest_ulid(topic).ok().flatten();
+        Self {
+            list: tail(LIST_TOPIC),
+            destroy: tail(DESTROY_TOPIC),
+            start: tail(START_TOPIC),
+            hosts: tail(HOSTS_TOPIC),
+        }
+    }
+}
+
+/// Drain one tick of the XCP-4 responder topics, replying on each request's
+/// `reply/<ulid>` lane. Each request's `xe`/`ssh` work runs on a blocking thread
+/// (keeping the async loop responsive + `Persist` off the `.await`), exactly
+/// like the spawn drain. Separate cursors mean these never interfere with the
+/// spawn flow.
+async fn drain_responders(bus_root: &Path, cursors: &mut ResponderCursors) {
+    for req in read_new_requests(bus_root, LIST_TOPIC, &mut cursors.list) {
+        let bus_root = bus_root.to_path_buf();
+        run_blocking(move || handle_list_blocking(&bus_root, &req.ulid), "list").await;
+    }
+    for req in read_new_requests(bus_root, HOSTS_TOPIC, &mut cursors.hosts) {
+        let bus_root = bus_root.to_path_buf();
+        run_blocking(move || handle_hosts_blocking(&bus_root, &req.ulid), "hosts").await;
+    }
+    for req in read_new_requests(bus_root, START_TOPIC, &mut cursors.start) {
+        let bus_root = bus_root.to_path_buf();
+        run_blocking(
+            move || handle_start_blocking(&bus_root, &req.ulid, &req.body),
+            "start",
+        )
+        .await;
+    }
+    for req in read_new_requests(bus_root, DESTROY_TOPIC, &mut cursors.destroy) {
+        let bus_root = bus_root.to_path_buf();
+        run_blocking(
+            move || handle_destroy_blocking(&bus_root, &req.ulid, &req.body),
+            "destroy",
+        )
+        .await;
+    }
+}
+
+/// Run a responder handler on `spawn_blocking`, logging a join failure under the
+/// responder's `verb` label. Shared by the three responder drains.
+async fn run_blocking<F: FnOnce() + Send + 'static>(f: F, verb: &str) {
+    if let Err(e) = tokio::task::spawn_blocking(f).await {
+        tracing::warn!(error = %e, verb, "xcp_provision: responder task join failed");
+    }
 }
 
 /// Worker handle.
@@ -348,6 +766,11 @@ impl Worker for XcpProvisionWorker {
             return Ok(());
         };
         let mut cursor: Option<String> = None;
+        // Seed the responder cursors at each topic's tail so a worker restart
+        // doesn't replay still-retained requests (critical for the mutating
+        // start/destroy verbs). The spawn cursor stays at None to match the
+        // existing spawn flow's behavior.
+        let mut responder_cursors = ResponderCursors::seed_at_tail(&bus_root);
         let mut tick = tokio::time::interval(self.poll_interval);
         tick.tick().await;
         loop {
@@ -365,6 +788,10 @@ impl Worker for XcpProvisionWorker {
                             tracing::warn!(error = %e, "xcp_provision: spawn task join failed");
                         }
                     }
+                    // XCP-4: drain the list/destroy/hosts responder topics the
+                    // Workbench Provisioning panel queries — separate cursors,
+                    // so they never disturb the spawn flow above.
+                    drain_responders(&bus_root, &mut responder_cursors).await;
                 }
                 () = shutdown.wait() => break,
             }
@@ -589,5 +1016,112 @@ mod tests {
         assert_eq!(SPAWN_TOPIC, "action/provision/spawn");
         assert!(SPAWN_ACK_PREFIX.starts_with("action/provision/"));
         assert_eq!(GOLDEN_TEMPLATE, "MDE-VM-golden");
+        // XCP-4 responder topics live under the same action namespace so the
+        // panel's `mde_bus::rpc::request` accepts them.
+        assert_eq!(LIST_TOPIC, "action/provision/list");
+        assert_eq!(DESTROY_TOPIC, "action/provision/destroy");
+        assert_eq!(START_TOPIC, "action/provision/start");
+        assert_eq!(HOSTS_TOPIC, "action/provision/hosts");
+    }
+
+    // ── XCP-4 list/destroy/hosts codecs ──
+
+    #[test]
+    fn list_reply_carries_each_vm_with_its_host() {
+        let vms = vec![
+            ListedVm {
+                uuid: "u-1".into(),
+                name: "MDE-VM-web1".into(),
+                power_state: "running".into(),
+                host: "172.20.0.4".into(),
+            },
+            ListedVm {
+                uuid: "u-2".into(),
+                name: "MDE-VM-db".into(),
+                power_state: "halted".into(),
+                host: "172.20.0.5".into(),
+            },
+        ];
+        let v: serde_json::Value = serde_json::from_str(&build_list_reply(&vms)).unwrap();
+        let arr = v["vms"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["uuid"], "u-1");
+        assert_eq!(arr[0]["name"], "MDE-VM-web1");
+        assert_eq!(arr[0]["power_state"], "running");
+        assert_eq!(arr[0]["host"], "172.20.0.4");
+        assert_eq!(arr[1]["host"], "172.20.0.5");
+    }
+
+    #[test]
+    fn hosts_reply_distinguishes_ok_and_failed_rows() {
+        let cap = HostCapacity {
+            cpu_count: 8,
+            mem_total_kib: 1024,
+            mem_free_kib: 512,
+            sr_free_bytes: 9000,
+            running_vms: 3,
+        };
+        let rows = vec![
+            HostRow::ok("172.20.0.4", &cap),
+            HostRow::failed("172.20.0.5", "unreachable"),
+        ];
+        let v: serde_json::Value = serde_json::from_str(&build_hosts_reply(&rows)).unwrap();
+        let arr = v["hosts"].as_array().unwrap();
+        assert_eq!(arr[0]["host"], "172.20.0.4");
+        assert_eq!(arr[0]["cpu_count"], 8);
+        assert_eq!(arr[0]["running_vms"], 3);
+        // An OK row carries no error key (skip_serializing_if).
+        assert!(!arr[0].as_object().unwrap().contains_key("error"));
+        // A failed row surfaces the probe error.
+        assert_eq!(arr[1]["host"], "172.20.0.5");
+        assert_eq!(arr[1]["error"], "unreachable");
+    }
+
+    #[test]
+    fn parse_named_vm_request_happy_and_rejects_empty_name() {
+        let req =
+            parse_named_vm_request(r#"{"name":"MDE-VM-web1","host":"172.20.0.4"}"#, "destroy")
+                .expect("parse");
+        assert_eq!(req.name, "MDE-VM-web1");
+        assert_eq!(req.host.as_deref(), Some("172.20.0.4"));
+        // host defaults to None.
+        let req = parse_named_vm_request(r#"{"name":"db"}"#, "start").expect("parse");
+        assert!(req.host.is_none());
+        // Empty / missing name is rejected (we'd have no VM to act on); the verb
+        // is named in the error.
+        let err = parse_named_vm_request(r#"{"name":"  "}"#, "start").expect_err("empty");
+        assert!(err.contains("start"), "{err}");
+        assert!(parse_named_vm_request("nope", "destroy").is_err());
+    }
+
+    #[test]
+    fn destroy_and_start_reply_ok_and_error_shapes() {
+        let ok: serde_json::Value =
+            serde_json::from_str(&build_destroy_reply_ok("MDE-VM-web1")).unwrap();
+        assert_eq!(ok["destroyed"], "MDE-VM-web1");
+        assert!(!ok.as_object().unwrap().contains_key("error"));
+        let started: serde_json::Value =
+            serde_json::from_str(&build_start_reply_ok("MDE-VM-web1")).unwrap();
+        assert_eq!(started["started"], "MDE-VM-web1");
+        let err: serde_json::Value = serde_json::from_str(&build_error_reply("boom")).unwrap();
+        assert_eq!(err["error"], "boom");
+    }
+
+    #[test]
+    fn resolve_uuid_by_name_maps_or_errors() {
+        let vms = vec![
+            VmInfo {
+                uuid: "u-1".into(),
+                name: "MDE-VM-web1".into(),
+                power_state: "running".into(),
+            },
+            VmInfo {
+                uuid: "u-2".into(),
+                name: "MDE-VM-db".into(),
+                power_state: "halted".into(),
+            },
+        ];
+        assert_eq!(resolve_uuid_by_name(&vms, "MDE-VM-db").unwrap(), "u-2");
+        assert!(resolve_uuid_by_name(&vms, "MDE-VM-ghost").is_err());
     }
 }

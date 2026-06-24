@@ -54,6 +54,8 @@ pub mod peers_map;
 pub mod playbooks;
 pub mod policy;
 pub mod profiles;
+/// XCP-4 — the VM Spawner / Provisioning panel (A-plane MDE-VMs).
+pub mod provisioning;
 pub mod registration;
 pub mod remote_desktop;
 pub mod repair;
