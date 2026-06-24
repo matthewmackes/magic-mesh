@@ -1185,6 +1185,10 @@ pub struct DatacenterPanel {
     /// a graceful shutdown. Drives the "Shut down (graceful)" button's enablement
     /// so the operator only acts on a recommendation.
     pub idle_shutdown_ok: bool,
+    /// DATACENTER-14 (Gateway tab) — the decoded `gateway-dhcp` read (tofu-managed
+    /// reservations + live leases) for the EdgeOS gateway, or `None` until the
+    /// operator clicks "Read DHCP". The reservation + lease tables render off it.
+    pub gateway_dhcp: Option<GatewayDhcp>,
 }
 
 /// Top-level view selector for the datacenter panel.
@@ -1226,6 +1230,11 @@ pub enum ViewMode {
     /// bar driven by a learned per-host ETA, plus an idle-shutdown policy that
     /// recommends powering down a host carrying zero running guests.
     Power,
+    /// DATACENTER-14 — the Gateway tab: the EdgeOS EdgeRouter (172.20.0.1) DHCP
+    /// surface. The tofu-managed static reservations + the live DHCP leases
+    /// (read-mostly), with a tofu-gated Plan / typed-confirm Apply for reservation
+    /// changes (the `edgeos` workspace — never a blind apply from the GUI).
+    Gateway,
 }
 
 impl ViewMode {
@@ -1245,6 +1254,7 @@ impl ViewMode {
             ViewMode::Topology => "topology",
             ViewMode::Network => "network",
             ViewMode::Power => "power",
+            ViewMode::Gateway => "gateway",
         }
     }
 
@@ -1264,6 +1274,7 @@ impl ViewMode {
             "topology" => ViewMode::Topology,
             "network" => ViewMode::Network,
             "power" => ViewMode::Power,
+            "gateway" => ViewMode::Gateway,
             // "overview" and anything unknown.
             _ => ViewMode::Overview,
         }
@@ -1443,6 +1454,55 @@ pub enum NetField {
     VlanName,
     /// VLAN-create: destination dom0.
     VlanDom0,
+}
+
+/// DATACENTER-14 (Gateway tab) — one tofu-managed EdgeOS DHCP static reservation,
+/// decoded from a `gateway-dhcp` reply's `reservations` array (mirrors the
+/// daemon's `GatewayReservation`). Rendered in the Gateway tab's reservation
+/// table.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct GatewayReservationRow {
+    /// The reservation's name (the EdgeOS static-mapping name).
+    #[serde(default)]
+    pub name: String,
+    /// The reserved MAC.
+    #[serde(default)]
+    pub mac: String,
+    /// The reserved IPv4.
+    #[serde(default)]
+    pub ip: String,
+}
+
+/// DATACENTER-14 (Gateway tab) — one live EdgeOS DHCP lease, decoded from a
+/// `gateway-dhcp` reply's `leases` array (mirrors the daemon's `GatewayLease`).
+/// Rendered in the Gateway tab's live-lease table.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct GatewayLeaseRow {
+    /// The leased IPv4.
+    #[serde(default)]
+    pub ip: String,
+    /// The lessee's MAC.
+    #[serde(default)]
+    pub mac: String,
+    /// The lease expiry (EdgeOS-formatted timestamp).
+    #[serde(default)]
+    pub expiry: String,
+    /// The client hostname (may be empty).
+    #[serde(default)]
+    pub hostname: String,
+}
+
+/// DATACENTER-14 (Gateway tab) — the decoded `gateway-dhcp` read: the tofu-managed
+/// reservations + the live DHCP leases. Populated when the operator clicks
+/// "Read DHCP" on the Gateway tab; the reservation + lease tables render off it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct GatewayDhcp {
+    /// The tofu-managed static reservations (`managed_reservations`).
+    #[serde(default)]
+    pub reservations: Vec<GatewayReservationRow>,
+    /// The live DHCP leases polled from the router (`dhcp_leases`).
+    #[serde(default)]
+    pub leases: Vec<GatewayLeaseRow>,
 }
 
 /// DATACENTER-16 (Power tab) — the in-progress host-wake form. The "Wake" button
@@ -1847,6 +1907,9 @@ impl Default for DatacenterPanel {
             wake_samples: BTreeMap::new(),
             idle_reason: String::new(),
             idle_shutdown_ok: false,
+            // DATACENTER-14 (Gateway tab) — the DHCP read hydrates on demand
+            // ("Read DHCP"); the constructor stays pure.
+            gateway_dhcp: None,
         }
     }
 }
@@ -2294,6 +2357,15 @@ pub enum Message {
     /// idle policy recommends it): fires the existing confirm-gated
     /// `action/dc/host-power` `shutdown` op against the form's dom0.
     IdleShutdownClicked,
+
+    // ── DATACENTER-14 (Gateway tab) ──────────────────────────────────────────
+    /// DATACENTER-14 — the "Read DHCP" button: fire the read-only
+    /// `action/dc/gateway-dhcp` RPC to read the EdgeOS gateway's tofu-managed
+    /// reservations + live DHCP leases.
+    GatewayDhcpClicked,
+    /// DATACENTER-14 — the `action/dc/gateway-dhcp` RPC came back. `Ok` carries the
+    /// decoded reservations + leases; `Err` the error text.
+    GatewayDhcpDone(Result<GatewayDhcp, String>),
 }
 
 /// DATACENTER-11 (VMs tab) — which create-wizard field a `CreateFieldChanged`
@@ -3534,6 +3606,32 @@ impl DatacenterPanel {
                 self.status = format!("Shutting down idle host {dom0} (graceful)…");
                 Self::host_power_task(dom0, "shutdown".to_string())
             }
+
+            // ── DATACENTER-14 (Gateway tab) ──────────────────────────────────
+            Message::GatewayDhcpClicked => {
+                self.status = "Reading EdgeOS DHCP (reservations + leases)…".into();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(gateway_dhcp_rpc)
+                            .await
+                            .unwrap_or_else(|e| Err(format!("gateway-dhcp task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::GatewayDhcpDone(result)),
+                )
+            }
+            Message::GatewayDhcpDone(Ok(dhcp)) => {
+                self.status = format!(
+                    "EdgeOS DHCP: {} reservation(s) · {} live lease(s)",
+                    dhcp.reservations.len(),
+                    dhcp.leases.len()
+                );
+                self.gateway_dhcp = Some(dhcp);
+                Task::none()
+            }
+            Message::GatewayDhcpDone(Err(e)) => {
+                self.status = format!("gateway-dhcp: {e}");
+                Task::none()
+            }
         }
     }
 
@@ -4360,6 +4458,176 @@ impl DatacenterPanel {
                 .into(),
             palette,
         )
+    }
+
+    /// DATACENTER-14 (Gateway tab) — the whole Gateway tab against the DEPLOYED
+    /// EdgeOS EdgeRouter (172.20.0.1): the tofu-managed DHCP static reservations +
+    /// the live DHCP leases (read-mostly, off `action/dc/gateway-dhcp`), and a
+    /// tofu-gated Plan / typed-confirm Apply for reservation changes (the `edgeos`
+    /// workspace — never a blind apply from the GUI; the typed-confirm mirrors the
+    /// FA_APPLY operator gate). Returns one column the view dispatch pushes;
+    /// mde-theme tokens only (§4) — every control routes a panel-scoped message.
+    ///
+    /// (The worklist named "UniFi", but UniFi is NOT deployed; the live gateway is
+    /// the tofu-managed EdgeRouter at `infra/tofu/edgeos/` — see EDGEOS-DHCP-1.)
+    fn gateway_tab_view(&self, palette: Palette) -> Element<'_, crate::Message> {
+        const EDGEOS_WS: &str = "edgeos";
+        let mut col = column![text("Gateway").size(f32::from(spacing::BASE[5]))]
+            .spacing(f32::from(spacing::BASE[2]));
+        col = col.push(
+            text(
+                "EdgeOS EdgeRouter @ 172.20.0.1 — DHCP-as-code. Reservations are \
+                 tofu-managed; changes go through the gated Plan → Apply below, \
+                 never a blind apply.",
+            )
+            .colr(palette.text_muted.into_cosmic_color()),
+        );
+
+        // ── Section 1: read the live DHCP state ──────────────────────────────
+        let read_row = row![
+            text("EdgeOS DHCP").colr(palette.text_muted.into_cosmic_color()),
+            variant_button(
+                "Read DHCP".to_string(),
+                ButtonVariant::Secondary,
+                Some(crate::Message::Datacenter(Message::GatewayDhcpClicked)),
+                palette,
+            ),
+        ]
+        .spacing(f32::from(spacing::BASE[2]))
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+        col = col.push(self.storage_card(read_row.into(), palette));
+
+        if let Some(dhcp) = &self.gateway_dhcp {
+            // Reservations (tofu-managed, the desired state).
+            col = col.push(
+                text(format!(
+                    "Static reservations (tofu-managed) — {}",
+                    dhcp.reservations.len()
+                ))
+                .size(f32::from(spacing::BASE[5])),
+            );
+            if dhcp.reservations.is_empty() {
+                col = col.push(
+                    text("No reservations in the edgeos workspace.")
+                        .colr(palette.text_muted.into_cosmic_color()),
+                );
+            } else {
+                for r in &dhcp.reservations {
+                    col = col.push(
+                        self.storage_card(
+                            text(format!("{} — {} → {}", r.name, r.mac, r.ip))
+                                .colr(palette.text.into_cosmic_color())
+                                .into(),
+                            palette,
+                        ),
+                    );
+                }
+            }
+
+            // Live leases (read off the router right now).
+            col = col.push(
+                text(format!("Live DHCP leases — {}", dhcp.leases.len()))
+                    .size(f32::from(spacing::BASE[5])),
+            );
+            if dhcp.leases.is_empty() {
+                col = col.push(
+                    text("No active leases reported.").colr(palette.text_muted.into_cosmic_color()),
+                );
+            } else {
+                for l in &dhcp.leases {
+                    let name = if l.hostname.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  ({})", l.hostname)
+                    };
+                    let expiry = if l.expiry.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  · expires {}", l.expiry)
+                    };
+                    col = col.push(
+                        self.storage_card(
+                            text(format!("{} — {}{}{}", l.ip, l.mac, name, expiry))
+                                .colr(palette.text.into_cosmic_color())
+                                .into(),
+                            palette,
+                        ),
+                    );
+                }
+            }
+        } else {
+            col = col.push(
+                text("Click Read DHCP to load the EdgeOS reservations + live leases.")
+                    .colr(palette.text_muted.into_cosmic_color()),
+            );
+        }
+
+        // ── Section 2: tofu-gated reservation changes (Plan → typed Apply) ───
+        col = col.push(
+            text("Reservation changes — gated Plan → Apply").size(f32::from(spacing::BASE[5])),
+        );
+        col = col.push(
+            text(
+                "Edit infra/tofu/edgeos/terraform.tfvars (the source of truth), then \
+                 Plan to review the diff and Apply (typed confirm) to converge the \
+                 router. The apply is operator-gated — it never fires on one click.",
+            )
+            .colr(palette.text_muted.into_cosmic_color()),
+        );
+        let plan_btn = variant_button(
+            "Plan edgeos".to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::TofuPlan(
+                EDGEOS_WS.to_string(),
+            ))),
+            palette,
+        );
+        let mut ws_row = row![text("edgeos").width(Length::FillPortion(2)), plan_btn]
+            .spacing(f32::from(spacing::BASE[2]));
+        if self.tofu_confirm.as_deref() == Some(EDGEOS_WS) {
+            // Armed: the typed-confirm — only the confirm button carries Apply.
+            ws_row = ws_row
+                .push(text("Type APPLY to confirm"))
+                .push(variant_button(
+                    "APPLY".to_string(),
+                    ButtonVariant::Primary,
+                    Some(crate::Message::Datacenter(Message::TofuApply(
+                        EDGEOS_WS.to_string(),
+                    ))),
+                    palette,
+                ))
+                .push(variant_button(
+                    "Cancel".to_string(),
+                    ButtonVariant::Secondary,
+                    Some(crate::Message::Datacenter(Message::TofuApplyCancelled)),
+                    palette,
+                ));
+        } else {
+            // Unarmed: the first click only arms the confirm (no RPC fires).
+            ws_row = ws_row.push(variant_button(
+                "Apply edgeos".to_string(),
+                ButtonVariant::Primary,
+                Some(crate::Message::Datacenter(Message::TofuApplyClicked(
+                    EDGEOS_WS.to_string(),
+                ))),
+                palette,
+            ));
+        }
+        col = col.push(ws_row);
+        if self.tofu_output.is_empty() {
+            col = col.push(
+                text("Run Plan to see the edgeos OpenTofu diff here.")
+                    .colr(palette.text_muted.into_cosmic_color()),
+            );
+        } else {
+            col = col.push(
+                container(text(self.tofu_output.clone()))
+                    .padding(f32::from(spacing::BASE[3]))
+                    .width(Length::Fill),
+            );
+        }
+
+        col.into()
     }
 
     /// DATACENTER-13 (Network tab) — the whole Network tab: the L2 inventory
@@ -5378,6 +5646,7 @@ impl DatacenterPanel {
             mode_btn("Storage", ViewMode::Storage),
             mode_btn("Network", ViewMode::Network),
             mode_btn("Power", ViewMode::Power),
+            mode_btn("Gateway", ViewMode::Gateway),
             mode_btn("Topology", ViewMode::Topology),
             mode_btn("Resources", ViewMode::Zone),
             mode_btn("Tofu", ViewMode::Tofu),
@@ -5940,6 +6209,9 @@ impl DatacenterPanel {
             }
             ViewMode::Power => {
                 col = col.push(self.power_tab_view(palette));
+            }
+            ViewMode::Gateway => {
+                col = col.push(self.gateway_tab_view(palette));
             }
             ViewMode::Zone => {
                 if self.rows.is_empty() {
@@ -7904,6 +8176,18 @@ fn idle_policy_rpc(dom0: &str) -> Result<(usize, bool, String), String> {
     Ok((running, shutdown, reason))
 }
 
+/// DATACENTER-14 (Gateway tab) — fire the read-only `action/dc/gateway-dhcp` RPC
+/// and decode the EdgeOS gateway's tofu-managed reservations + live DHCP leases
+/// into a [`GatewayDhcp`]. The reply is
+/// `{"ok":true,"reservations":[..],"leases":[..]}` (→ the decoded read) or
+/// `{"error":".."}` (→ the error text). Uses the shared [`dc_rpc`] round trip; the
+/// daemon runs `tofu output -json` + an SSH lease poll, so the timeout is generous.
+fn gateway_dhcp_rpc() -> Result<GatewayDhcp, String> {
+    let v = dc_rpc("gateway-dhcp", "{}", Duration::from_secs(45))?;
+    serde_json::from_value::<GatewayDhcp>(v.clone())
+        .map_err(|e| format!("bad gateway-dhcp reply: {e} ({v})"))
+}
+
 /// DATACENTER-13 (Network tab) — fire the read-only `action/dc/host-net` RPC for a
 /// dom0's L2 inventory (networks + PIFs/NICs + VLAN tags) and decode the reply into
 /// a [`NetRead`]. The reply is `{"ok":true,"nets":[..],"pifs":[..]}` (→ the decoded
@@ -8036,6 +8320,7 @@ mod tests {
             ViewMode::Topology,
             ViewMode::Network,
             ViewMode::Power,
+            ViewMode::Gateway,
         ] {
             assert_eq!(
                 ViewMode::from_slug(mode.slug()),
@@ -8784,6 +9069,80 @@ mod tests {
         let mut s = vec![1000, 1000];
         s.extend(std::iter::repeat_n(100u64, WAKE_SAMPLE_WINDOW_LOCAL));
         assert_eq!(rolling_avg_local(Some(&s)), 100);
+    }
+
+    // ── DATACENTER-14 (Gateway tab) ──────────────────────────────────────────
+
+    #[test]
+    fn gateway_dhcp_clicked_sets_in_flight_status() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::GatewayDhcpClicked);
+        assert!(p.status.contains("Reading EdgeOS DHCP"), "{}", p.status);
+    }
+
+    #[test]
+    fn gateway_dhcp_done_stores_rows_and_counts() {
+        let mut p = DatacenterPanel::new();
+        let dhcp = GatewayDhcp {
+            reservations: vec![GatewayReservationRow {
+                name: "mcnf-a".into(),
+                mac: "f2:f2:0b:c5:dc:00".into(),
+                ip: "172.20.121.10".into(),
+            }],
+            leases: vec![
+                GatewayLeaseRow {
+                    ip: "172.20.145.33".into(),
+                    mac: "2c:54:91:0d:fc:30".into(),
+                    expiry: "2026/06/25 10:00:00".into(),
+                    hostname: "xbox".into(),
+                },
+                GatewayLeaseRow {
+                    ip: "172.20.121.10".into(),
+                    mac: "f2:f2:0b:c5:dc:00".into(),
+                    expiry: String::new(),
+                    hostname: String::new(),
+                },
+            ],
+        };
+        let _ = p.update(Message::GatewayDhcpDone(Ok(dhcp.clone())));
+        assert_eq!(p.gateway_dhcp.as_ref().unwrap().reservations.len(), 1);
+        assert_eq!(p.gateway_dhcp.as_ref().unwrap().leases.len(), 2);
+        assert!(p.status.contains("1 reservation(s)"), "{}", p.status);
+        assert!(p.status.contains("2 live lease(s)"), "{}", p.status);
+    }
+
+    #[test]
+    fn gateway_dhcp_done_err_writes_status_and_keeps_none() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::GatewayDhcpDone(Err("no tofu state".into())));
+        assert!(p.gateway_dhcp.is_none());
+        assert!(p.status.contains("gateway-dhcp"), "{}", p.status);
+    }
+
+    #[test]
+    fn gateway_reply_decodes_into_rows() {
+        // The on-wire `gateway-dhcp` reply shape decodes into GatewayDhcp.
+        let v = serde_json::json!({
+            "ok": true,
+            "reservations": [{ "name": "kvm1", "mac": "00:23:24:c2:0f:1c", "ip": "172.20.145.193" }],
+            "leases": [{ "ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:ff", "expiry": "x", "hostname": "h" }],
+        });
+        let dhcp: GatewayDhcp = serde_json::from_value(v).unwrap();
+        assert_eq!(dhcp.reservations[0].name, "kvm1");
+        assert_eq!(dhcp.reservations[0].ip, "172.20.145.193");
+        assert_eq!(dhcp.leases[0].hostname, "h");
+    }
+
+    #[test]
+    fn gateway_apply_is_typed_confirm_gated() {
+        // The edgeos apply mirrors the Tofu typed-confirm gate: the first click
+        // only arms the confirm (TofuApplyClicked), no RPC fires.
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::TofuApplyClicked("edgeos".into()));
+        assert_eq!(p.tofu_confirm.as_deref(), Some("edgeos"));
+        // Cancel clears it without firing.
+        let _ = p.update(Message::TofuApplyCancelled);
+        assert!(p.tofu_confirm.is_none());
     }
 
     #[test]
