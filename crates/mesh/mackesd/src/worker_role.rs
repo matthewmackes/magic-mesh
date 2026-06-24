@@ -51,7 +51,6 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     ("job_exec", 1),
     // ── Workstation (rank 2) — adds voice + media + kdc + remmina.
     ("voice_config", 2),
-    ("clipd_supervisor", 2),
     ("clipboard_sync", 2),
     ("kdc_host", 2),
     ("remmina-sync", 2),
@@ -132,7 +131,7 @@ mod tests {
     fn the_table_is_the_full_17_worker_census() {
         // Guards against a worker added to run_serve without a deliberate tier
         // (it would silently default to Lighthouse). 31 originally; -1 redundant
-        // python `clipboard` (RETIRE-PY.3, mde-clipd is sole), -1 broken python
+        // python `clipboard` (RETIRE-PY.3), -1 broken python
         // `mdns` relay (RETIRE-PY.1), +1 native `mdns_relay` (MESH-MDNS-RELAY,
         // the real Rust cross-segment relay), -1 dead python `fs_sync` GVFS
         // worker (RETIRE-PY.4, mesh storage is LizardFS/E3).
@@ -143,8 +142,11 @@ mod tests {
         // +1 mesh_dns (PLANES-18), +1 netstate_apply (PLANES-15),
         // +1 validation_suite (PLANES-19), +1 metrics_exporter (EFF-9),
         // +1 hardware_probe (SUBAUDIT-D2 — the PeerProbe producer).
-        // +1 clipboard_sync (CLIP-SYNC-1 — the mesh clipboard watcher).
-        assert_eq!(WORKER_TIERS.len(), 28);
+        // +1 clipboard_sync (CLIP-SYNC-1 — the mesh clipboard watcher; it is the
+        // SOLE clipboard capturer, spawning `wl-paste --watch` directly. The
+        // never-built `mde-clipd` daemon + its `clipd_supervisor` worker were
+        // removed in CLIP-SYNC-2: that binary never existed in the workspace).
+        assert_eq!(WORKER_TIERS.len(), 27);
     }
 
     #[test]
@@ -178,8 +180,8 @@ mod tests {
         );
         assert_eq!(
             count(2),
-            5,
-            "Workstation adds voice/clipd/clipboard_sync/kdc/remmina"
+            4,
+            "Workstation adds voice/clipboard_sync/kdc/remmina"
         );
     }
 
@@ -206,7 +208,7 @@ mod tests {
         for w in ["ansible-pull", "app-sync", "nebula_supervisor", "heartbeat"] {
             assert!(runs(w, r), "Server must run {w}");
         }
-        for w in ["voice_config", "clipd_supervisor", "kdc_host"] {
+        for w in ["voice_config", "clipboard_sync", "kdc_host"] {
             assert!(!runs(w, r), "Server must NOT run {w}");
         }
     }
@@ -233,7 +235,8 @@ mod tests {
         // +1 each (hardware_probe, rank 0 → present in every tier).
         assert_eq!(lh.len(), 20);
         assert_eq!(srv.len(), 23);
-        assert_eq!(ws.len(), 28); // +clipboard_sync (CLIP-SYNC-1)
+        // 27: +clipboard_sync (CLIP-SYNC-1), -clipd_supervisor (removed, CLIP-SYNC-2).
+        assert_eq!(ws.len(), 27);
         // Strict superset: every lower-tier worker is in the higher tier.
         assert!(lh.iter().all(|w| srv.contains(w)));
         assert!(srv.iter().all(|w| ws.contains(w)));

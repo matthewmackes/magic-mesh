@@ -13,6 +13,17 @@
 //!     data-control protocol, so `wl-paste --watch` IS the integration
 //!     hook on Cosmic; it is also the explicit fallback elsewhere. One
 //!     subprocess streams a fresh copy of the selection on every change.
+//!
+//! **System-daemon session attach (CLIP-SYNC-2).** `mackesd` runs as a root
+//! system service with **no `$WAYLAND_DISPLAY`** — it is not in any user's
+//! graphical session. The capture (`wl-paste --watch`) needs one, so when the
+//! worker has no inherited display it discovers the active seat0 graphical
+//! session via logind (`workers::clipboard_sync::session`) and spawns the
+//! capture as that user with its `XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY`. Without
+//! this the worker idled forever and the Notification-Center Clipboard Viewer
+//! showed "Clipboard history is empty." on every Workstation (found live on
+//! Eagle, 2026-06-24). A genuinely headless node has no graphical session, so
+//! discovery returns `None` and the worker idles quietly (no error spam).
 //!   * O2 echo-loop — **debounce identical content**: a copy whose text
 //!     equals the most-recent applied clip is dropped. This is what kills
 //!     the click-to-load echo (the viewer `wl-copy`s an entry back onto
@@ -54,6 +65,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
+pub mod session;
+
 /// The capture command: `wl-paste --watch` runs the given command on every
 /// selection change. We frame each selection with a trailing NUL
 /// (`cat; printf '\0'`) so a clip containing embedded newlines is read back
@@ -83,6 +96,12 @@ pub const CLIP_TOPIC: &str = "event/clipboard/clip";
 /// (compositor restart, display coming up late). Paced so a missing
 /// display doesn't busy-loop.
 const RESPAWN_COOLDOWN: Duration = Duration::from_secs(3);
+
+/// CLIP-SYNC-2 — how long the system daemon waits before re-probing for an
+/// active graphical session when none is found yet (headless node, or the
+/// desktop still coming up). Slower than [`RESPAWN_COOLDOWN`] so a genuinely
+/// headless Lighthouse/Server doesn't shell `loginctl` every few seconds.
+const NO_SESSION_POLL: Duration = Duration::from_secs(20);
 
 /// One clipboard entry in the mesh-global history. `id` is a stable
 /// content fingerprint so the viewer/IPC can address an entry (pin/delete)
@@ -325,6 +344,11 @@ fn publish_clip(entry: &ClipEntry) {
 pub struct ClipboardSyncWorker {
     workgroup_root: PathBuf,
     source: String,
+    /// CLIP-SYNC-2 — the discovered graphical session, cached across respawns.
+    /// `loginctl` discovery is only re-run when this is `None` or its socket
+    /// has vanished, so a flapping `wl-paste` doesn't fork `loginctl` on every
+    /// 3 s respawn tick. `None` on the dev-box path (inherited `$WAYLAND_DISPLAY`).
+    session: Option<session::GraphicalSession>,
 }
 
 impl ClipboardSyncWorker {
@@ -335,6 +359,7 @@ impl ClipboardSyncWorker {
         Self {
             workgroup_root,
             source: local_hostname(),
+            session: None,
         }
     }
 
@@ -343,6 +368,30 @@ impl ClipboardSyncWorker {
     pub fn with_source(mut self, source: String) -> Self {
         self.source = source;
         self
+    }
+
+    /// CLIP-SYNC-2 — resolve the graphical session to spawn the capture into,
+    /// reusing the cached one when its Wayland socket still exists and only
+    /// re-running the (blocking) `loginctl` discovery when there is no live
+    /// cached session. This keeps a flapping `wl-paste` from forking `loginctl`
+    /// on every respawn tick. The blocking discovery runs on a `spawn_blocking`
+    /// thread so it never parks a tokio worker.
+    ///
+    /// Returns a reference to the live session, or `None` when none is available
+    /// (headless node / desktop not up yet).
+    async fn resolve_session(&mut self) -> Option<&session::GraphicalSession> {
+        let cached_live = self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.runtime_dir.join(&s.wayland_display).exists());
+        if !cached_live {
+            // Cache empty or its socket vanished (compositor restart / logout) —
+            // re-discover off the tokio worker threads.
+            self.session = tokio::task::spawn_blocking(session::discover)
+                .await
+                .unwrap_or(None);
+        }
+        self.session.as_ref()
     }
 
     /// Whether it is safe to write `clipboard/history.json` under the shared
@@ -412,21 +461,56 @@ impl Worker for ClipboardSyncWorker {
         // record rather than being split per line (the fidelity bug a naive
         // `--watch cat` + line reader would have).
         loop {
-            // A Wayland display is required for any clipboard to exist.
-            if std::env::var("WAYLAND_DISPLAY").is_err() {
-                debug!(target: "clipboard_sync", "$WAYLAND_DISPLAY unset; idling");
-                tokio::select! {
-                    () = tokio::time::sleep(RESPAWN_COOLDOWN) => continue,
-                    () = shutdown.wait() => return Ok(()),
-                }
-            }
-            let mut child = match Command::new(WL_PASTE)
-                .args(WATCH_ARGS)
+            // CLIP-SYNC-2 — resolve the Wayland session to attach to. When the
+            // worker already has a `$WAYLAND_DISPLAY` (a dev box / a per-session
+            // launch) we spawn against the inherited env. As the system daemon
+            // (`mackesd.service`, root, no graphical session) `$WAYLAND_DISPLAY`
+            // is unset, so we DISCOVER the active seat0 graphical session via
+            // logind and spawn the capture as that user with its env — otherwise
+            // the worker idled forever and the Hub's clipboard stayed empty
+            // (found live on Eagle 2026-06-24).
+            // Resolve where to attach. With an inherited `$WAYLAND_DISPLAY`
+            // (dev box / per-session launch) we spawn against the inherited env
+            // and skip session discovery entirely. Otherwise (the system daemon)
+            // we discover the active graphical session — cloned out so the `&mut
+            // self` discovery borrow is released before we read `self.source`.
+            let attach: Option<session::GraphicalSession> =
+                if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                    None
+                } else {
+                    let Some(s) = self.resolve_session().await.cloned() else {
+                        // Genuinely headless (Lighthouse/Server, or a Workstation
+                        // before the desktop is up) — idle quietly, no error spam.
+                        debug!(target: "clipboard_sync", "no active graphical session; idling");
+                        tokio::select! {
+                            () = tokio::time::sleep(NO_SESSION_POLL) => continue,
+                            () = shutdown.wait() => return Ok(()),
+                        }
+                    };
+                    Some(s)
+                };
+
+            let mut cmd = Command::new(WL_PASTE);
+            cmd.args(WATCH_ARGS)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .spawn()
-            {
+                .kill_on_drop(true);
+            if let Some(s) = &attach {
+                // Spawn as the desktop user with a COMPLETE credential drop +
+                // its session env. `uid`/`gid` (tokio's `Command` exposes both
+                // inherently) drop from root to the operator — uid alone would
+                // leave the child in root's group, so we set the gid too. HOME +
+                // XDG_RUNTIME_DIR + WAYLAND_DISPLAY point `wl-paste`'s socket and
+                // config lookups at the operator's session, not root's `/root`
+                // (XDG_CONFIG_HOME is cleared so it derives from the new HOME).
+                cmd.uid(s.uid)
+                    .gid(s.gid)
+                    .env("HOME", &s.home)
+                    .env("XDG_RUNTIME_DIR", &s.runtime_dir)
+                    .env("WAYLAND_DISPLAY", &s.wayland_display)
+                    .env_remove("XDG_CONFIG_HOME");
+            }
+            let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => {
                     debug!(target: "clipboard_sync", "{WL_PASTE} unavailable: {e}; retrying");
@@ -436,7 +520,18 @@ impl Worker for ClipboardSyncWorker {
                     }
                 }
             };
-            info!(target: "clipboard_sync", source = %self.source, "watching clipboard via {WL_PASTE} --watch");
+            if let Some(s) = &attach {
+                info!(
+                    target: "clipboard_sync", source = %self.source, uid = s.uid,
+                    display = %s.wayland_display,
+                    "watching clipboard via {WL_PASTE} --watch (discovered graphical session)"
+                );
+            } else {
+                info!(
+                    target: "clipboard_sync", source = %self.source,
+                    "watching clipboard via {WL_PASTE} --watch"
+                );
+            }
             // stdout is configured `Stdio::piped()` above, so `take()` is
             // Some on the first read; tolerate None defensively (respawn)
             // rather than panic the worker.
