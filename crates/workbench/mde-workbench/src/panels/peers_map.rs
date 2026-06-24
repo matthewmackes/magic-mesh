@@ -22,6 +22,48 @@ use mde_theme::Palette;
 
 use crate::cosmic_compat::prelude::*;
 
+/// LIGHTHOUSE-7/9 — the overlay IPs of the mesh's lighthouses, read from the
+/// world-readable mesh-status snapshot (`/run/mde/mesh-status.json`,
+/// `network.lighthouse_ips`). This is the LIGHTHOUSE-9 **authoritative**
+/// "is a lighthouse" signal (Nebula `static_host_map` membership) — anchors run
+/// Server tier for storage, so the directory `role` field under-reports them.
+/// Every map surface (wallpaper, Peers Map, Fleet rollup) keys lighthouse status
+/// on this same set so they all agree on which node is an anchor. Missing/old
+/// snapshot = empty (callers then fall back to the `role` field). Pure read.
+#[must_use]
+pub fn lighthouse_overlay_ips() -> Vec<String> {
+    parse_lighthouse_ips(&std::fs::read_to_string("/run/mde/mesh-status.json").unwrap_or_default())
+}
+
+/// Parse `network.lighthouse_ips` out of a mesh-status snapshot body (pure).
+#[must_use]
+pub fn parse_lighthouse_ips(raw: &str) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(raw.trim())
+        .ok()
+        .and_then(|v| {
+            v.get("network")?
+                .get("lighthouse_ips")?
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a directory record is a lighthouse anchor (LIGHTHOUSE-7/9). A node is
+/// an anchor when its overlay IP is in the snapshot's `lighthouse_ips` set (the
+/// authoritative Nebula-membership signal) OR its directory `role` is
+/// `lighthouse` (the back-fill for records that predate IP-membership stamping).
+/// An empty `overlay_ip` never matches (a blank IP can't be a lighthouse).
+#[must_use]
+pub fn is_lighthouse(role: &str, overlay_ip: &str, lh_ips: &[String]) -> bool {
+    role.eq_ignore_ascii_case("lighthouse")
+        || (!overlay_ip.is_empty() && lh_ips.iter().any(|l| l == overlay_ip))
+}
+
 /// One node's map datum.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MapNode {
@@ -33,6 +75,12 @@ pub struct MapNode {
     pub rtt_ms: Option<f64>,
     /// `true` for this machine (the map's anchor).
     pub is_self: bool,
+    /// LIGHTHOUSE-7 (wallpaper hero motif) — `true` when this node is an
+    /// overlay anchor (a lighthouse). A lighthouse node gets the beacon hero
+    /// treatment in the draw pass (a Carbon Green-50 beacon halo when online,
+    /// danger otherwise) so the relay/anchor nodes read as the hero of the
+    /// mesh map — both on the live desktop wallpaper and the Peers Map view.
+    pub lighthouse: bool,
     /// PD-7/L18 — this peer's recent overlay throughput, normalized to
     /// 0.0..=1.0 (from its Netdata `system.net`). Drives the flow-particle
     /// density + speed on its self→peer edge; 0.0 = idle (no particles, so
@@ -325,6 +373,33 @@ impl canvas::Program<crate::Message> for MapProgram {
                 _ => (p.text_muted, p.danger),
             };
             let r = if n.is_self { 14.0 } else { 10.0 };
+            // LIGHTHOUSE-7 — the beacon hero motif. An anchor node renders a
+            // concentric beacon halo behind its presence dot: Carbon Green-50
+            // (`beacon_healthy`) when the lighthouse is online, danger otherwise
+            // — the same green/red split the Hub footer + Lighthouses tab beacons
+            // use, so every lighthouse surface agrees. The halo + ring lift the
+            // relay/anchor nodes out of the peer field as the map's hero, ambient
+            // on the desktop (no animation loop — L22).
+            if n.lighthouse {
+                // Green strictly when the anchor is online (matching its green
+                // presence dot); idle / offline / unknown all read danger, so the
+                // beacon never shows healthy-green over a down or degraded
+                // anchor (the dot uses `online` for green too).
+                let beacon = if n.presence == "online" {
+                    p.beacon_healthy
+                } else {
+                    p.danger
+                };
+                // Outer faint halo, then a bright beacon ring hugging the node.
+                for (rr, w) in [(r + 9.0, 1.0_f32), (r + 5.0, 1.5)] {
+                    frame.stroke(
+                        &Path::circle(at, rr),
+                        Stroke::default()
+                            .with_color(beacon.into_cosmic_color())
+                            .with_width(w),
+                    );
+                }
+            }
             frame.fill(&Path::circle(at, r), fill.into_cosmic_color());
             frame.stroke(
                 &Path::circle(at, r + 2.0),
@@ -332,13 +407,19 @@ impl canvas::Program<crate::Message> for MapProgram {
                     .with_color(ring.into_cosmic_color())
                     .with_width(1.0),
             );
+            // The label; a lighthouse carries the ◉ beacon marker (matching the
+            // shell's mesh-welcome lighthouse glyph) so it's nameable as an
+            // anchor at a glance, and sits below the wider beacon halo.
+            let label = match (n.is_self, n.lighthouse) {
+                (true, true) => format!("◉ {} (this machine)", n.hostname),
+                (true, false) => format!("{} (this machine)", n.hostname),
+                (false, true) => format!("◉ {}", n.hostname),
+                (false, false) => n.hostname.clone(),
+            };
+            let label_y = if n.lighthouse { r + 11.0 } else { r + 6.0 };
             frame.fill_text(Text {
-                content: if n.is_self {
-                    format!("{} (this machine)", n.hostname)
-                } else {
-                    n.hostname.clone()
-                },
-                position: Point::new(at.x, at.y + r + 6.0),
+                content: label,
+                position: Point::new(at.x, at.y + label_y),
                 color: p.text.into_cosmic_color(),
                 size: Pixels(12.0),
                 ..Text::default()
@@ -472,8 +553,39 @@ mod tests {
             presence: presence.into(),
             rtt_ms: rtt,
             is_self,
+            lighthouse: false,
             flow: 0.0,
         }
+    }
+
+    #[test]
+    fn is_lighthouse_keys_on_overlay_ip_or_role() {
+        let lh_ips = vec!["10.42.0.1".to_string(), "10.42.0.2".to_string()];
+        // Authoritative overlay-IP membership flags an anchor even when the
+        // directory role under-reports it (Server tier — the LIGHTHOUSE-9 case).
+        assert!(is_lighthouse("server", "10.42.0.1", &lh_ips));
+        // The role back-fill still flags pre-IP-stamping records (case-insensitive).
+        assert!(is_lighthouse("Lighthouse", "10.42.0.9", &[]));
+        // A plain peer with neither signal is not an anchor.
+        assert!(!is_lighthouse("server", "10.42.0.9", &lh_ips));
+        // An empty overlay IP never matches, even against a populated set.
+        assert!(!is_lighthouse("server", "", &lh_ips));
+        assert!(parse_lighthouse_ips("junk").is_empty());
+    }
+
+    #[test]
+    fn lighthouse_node_is_distinguished_from_a_plain_peer() {
+        // A lighthouse node carries the hero flag; a plain peer does not.
+        // The flag is what the draw pass keys the beacon halo + ◉ label on, so
+        // the map can tell an anchor apart from a worker — the LIGHTHOUSE-7
+        // wallpaper-hero contract. (The draw itself is exercised live; the data
+        // distinction is the unit-testable contract.)
+        let mut lh = node("lh-01", "online", Some(8.0), false);
+        lh.lighthouse = true;
+        let peer = node("worker", "online", Some(8.0), false);
+        assert!(lh.lighthouse, "the anchor is flagged a lighthouse");
+        assert!(!peer.lighthouse, "a plain peer is not");
+        assert_ne!(lh, peer, "the hero flag makes the nodes distinct");
     }
 
     #[test]

@@ -133,7 +133,8 @@ fn refresh_task() -> Task<Message> {
                     .and_then(|o| String::from_utf8(o.stdout).ok())
                     .map(|s| s.trim().to_string())
                     .unwrap_or_default();
-                parse_nodes(&raw, &rtt, &hostname)
+                let lh_ips = mde_workbench::panels::peers_map::lighthouse_overlay_ips();
+                parse_nodes(&raw, &rtt, &hostname, &lh_ips)
             })
             .await
             .unwrap_or_default()
@@ -142,11 +143,16 @@ fn refresh_task() -> Task<Message> {
     )
 }
 
-/// Build MapNodes from the `mackesd peers --json` reply (pure).
+/// Build MapNodes from the `mackesd peers --json` reply (pure). `lh_ips` is the
+/// lighthouse overlay-IP set (LIGHTHOUSE-9, via `peers_map::lighthouse_overlay_ips`);
+/// a node is flagged a lighthouse via the shared `peers_map::is_lighthouse`
+/// predicate (overlay-IP membership OR `role == lighthouse`) so the wallpaper
+/// hero agrees with the in-app Peers Map + Fleet rollup.
 fn parse_nodes(
     raw: &str,
     rtt: &std::collections::HashMap<String, Option<f64>>,
     self_hostname: &str,
+    lh_ips: &[String],
 ) -> Vec<MapNode> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
         return Vec::new();
@@ -164,11 +170,16 @@ fn parse_nodes(
                         .to_string();
                     let is_self = hostname == self_hostname;
                     let rtt_ms = rtt.get(&hostname).copied().flatten();
+                    let overlay_ip = p.get("overlay_ip").and_then(|x| x.as_str()).unwrap_or("");
+                    let role = p.get("role").and_then(|x| x.as_str()).unwrap_or("");
+                    let lighthouse =
+                        mde_workbench::panels::peers_map::is_lighthouse(role, overlay_ip, lh_ips);
                     Some(MapNode {
                         hostname,
                         presence,
                         rtt_ms,
                         is_self,
+                        lighthouse,
                         // The wallpaper is a pure ambient render (no Netdata
                         // sampling loop); flow particles stay off here.
                         flow: 0.0,
@@ -221,10 +232,49 @@ mod tests {
             {"hostname":"oak","presence":"offline"}]}"#;
         let mut rtt = std::collections::HashMap::new();
         rtt.insert("oak".to_string(), Some(20.0));
-        let nodes = parse_nodes(raw, &rtt, "pine");
+        let nodes = parse_nodes(raw, &rtt, "pine", &[]);
         assert_eq!(nodes.len(), 2);
         assert!(nodes[0].is_self);
         assert_eq!(nodes[1].rtt_ms, Some(20.0));
-        assert!(parse_nodes("junk", &rtt, "x").is_empty());
+        assert!(!nodes[0].lighthouse, "no lighthouse signal → plain peer");
+        assert!(parse_nodes("junk", &rtt, "x", &[]).is_empty());
+    }
+
+    #[test]
+    fn lighthouse_flagged_by_role_or_overlay_ip() {
+        // Two anchor signals, one per peer: `lh-role` carries the directory
+        // role; `lh-ip` is identified only by its overlay IP being in the
+        // snapshot's lighthouse set (the LIGHTHOUSE-9 authoritative source).
+        let raw = r#"{"peers":[
+            {"hostname":"lh-role","presence":"online","role":"lighthouse","overlay_ip":"10.42.0.9"},
+            {"hostname":"lh-ip","presence":"online","role":"server","overlay_ip":"10.42.0.1"},
+            {"hostname":"worker","presence":"online","role":"server","overlay_ip":"10.42.0.5"}]}"#;
+        let rtt = std::collections::HashMap::new();
+        let lh_ips = vec!["10.42.0.1".to_string()];
+        let nodes = parse_nodes(raw, &rtt, "self", &lh_ips);
+        let by = |h: &str| nodes.iter().find(|n| n.hostname == h).unwrap().lighthouse;
+        assert!(by("lh-role"), "role==lighthouse flags the anchor");
+        assert!(
+            by("lh-ip"),
+            "overlay IP in the snapshot set flags the anchor"
+        );
+        assert!(!by("worker"), "a plain server is not a lighthouse");
+    }
+
+    #[test]
+    fn lighthouse_ips_parse_from_the_snapshot() {
+        // The snapshot parse + lighthouse predicate are the shared
+        // `peers_map` helpers; assert the wallpaper relies on them correctly.
+        use mde_workbench::panels::peers_map::{is_lighthouse, parse_lighthouse_ips};
+        let raw =
+            r#"{"network":{"lighthouse_ips":["10.42.0.1","10.42.0.2"],"cipher":"AES-256-GCM"}}"#;
+        let ips = parse_lighthouse_ips(raw);
+        assert_eq!(ips, vec!["10.42.0.1", "10.42.0.2"]);
+        // Missing / malformed snapshot → empty (falls back to the role field).
+        assert!(parse_lighthouse_ips("{}").is_empty());
+        assert!(parse_lighthouse_ips("junk").is_empty());
+        // An empty overlay_ip never matches even if the set has entries.
+        assert!(is_lighthouse("server", "10.42.0.1", &ips));
+        assert!(!is_lighthouse("server", "", &ips));
     }
 }
