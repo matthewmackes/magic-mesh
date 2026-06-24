@@ -728,6 +728,158 @@ fn ssh_unifi(pw: &str, user: &str, host: &str, remote: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
+// ---- DATACENTER-5: storage / net / gateway rollup -----------------------------
+//
+// The per-resource `event/dc/{sr,net,gateway}/*` deltas above are the truth, but
+// the Datacenter **Overview** tab (DC-9) and the Storage/Network sub-tab headers
+// want a single per-zone *rollup* — "how much storage total, how full, how many
+// networks, is the gateway up" — without re-deriving it from N card events on the
+// panel side. [`rollup_zone`] folds a zone's gathered resources into one
+// `event/dc/rollup/<zone>` signature; it is PURE (fed the already-gathered
+// `DcResource`s), so it's unit-tested exactly like the `parse_*` helpers and adds
+// no extra I/O — it reuses the same sample the resource events came from.
+
+/// The folded storage/net/gateway summary for one zone.
+///
+/// Published as the body of `event/dc/rollup/<zone>` so the panel reads one row per
+/// zone instead of summing cards. Counts/bytes are `0` when a zone has no resources
+/// of that kind (a clean, always-present rollup rather than a missing field).
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct ZoneRollup {
+    /// Number of storage repositories (`kind="sr"`) seen in the zone.
+    pub sr_count: u64,
+    /// Summed physical capacity across the zone's SRs, in bytes.
+    pub storage_total_bytes: u128,
+    /// Summed physical utilisation across the zone's SRs, in bytes.
+    pub storage_used_bytes: u128,
+    /// Number of networks/bridges (`kind="net"`) seen in the zone.
+    pub net_count: u64,
+    /// Whether a gateway (`kind="gateway"`) was sampled up in the zone.
+    pub gateway_up: bool,
+    /// Active DHCP lease count from the gateway (`0` when absent).
+    pub gateway_leases: u64,
+}
+
+impl ZoneRollup {
+    /// Utilisation percent (0–100, integer) of the zone's summed storage, or `0`
+    /// when the zone reports no capacity. Saturating + checked so a zero total can
+    /// never divide-by-zero and an over-100 reading (mid-sample race) is clamped.
+    #[must_use]
+    pub fn storage_pct(&self) -> u64 {
+        if self.storage_total_bytes == 0 {
+            return 0;
+        }
+        let pct = self.storage_used_bytes.saturating_mul(100) / self.storage_total_bytes;
+        u64::try_from(pct).unwrap_or(100).min(100)
+    }
+
+    /// The rollup body for the Bus — a stable JSON object keyed for the panel. The
+    /// `zone` is carried so a single `event/dc/rollup/*` subscription self-labels.
+    #[must_use]
+    pub fn signature(&self, zone: &str) -> String {
+        serde_json::json!({
+            "kind": "rollup",
+            "id": zone,
+            "zone": zone,
+            "sr_count": self.sr_count,
+            "storage_total_bytes": self.storage_total_bytes.to_string(),
+            "storage_used_bytes": self.storage_used_bytes.to_string(),
+            "storage_pct": self.storage_pct(),
+            "net_count": self.net_count,
+            "gateway_up": self.gateway_up,
+            "gateway_leases": self.gateway_leases,
+        })
+        .to_string()
+    }
+}
+
+/// Fold a zone's gathered resources into its storage/net/gateway [`ZoneRollup`].
+/// PURE — fed the same `DcResource`s the per-resource events came from, filtered to
+/// `zone`, so the rollup is always consistent with the cards. Unknown/garbage
+/// numeric fields contribute 0 (best-effort, never an error), and only `sr`/`net`/
+/// `gateway` kinds participate (hosts/vms/droplets/power are summarised elsewhere).
+#[must_use]
+pub fn rollup_zone(zone: &str, resources: &[DcResource]) -> ZoneRollup {
+    let mut roll = ZoneRollup::default();
+    for r in resources {
+        // Only this zone's resources contribute.
+        let v: serde_json::Value = match serde_json::from_str(&r.signature) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v.get("zone").and_then(|z| z.as_str()) != Some(zone) {
+            continue;
+        }
+        match r.kind.as_str() {
+            "sr" => {
+                roll.sr_count += 1;
+                roll.storage_total_bytes += field_bytes(&v, "size")
+                    .or_else(|| str_u128(&v, "size"))
+                    .unwrap_or(0);
+                roll.storage_used_bytes += field_bytes(&v, "used")
+                    .or_else(|| str_u128(&v, "used"))
+                    .unwrap_or(0);
+            }
+            "net" => roll.net_count += 1,
+            "gateway" => {
+                roll.gateway_up =
+                    roll.gateway_up || v.get("status").and_then(|s| s.as_str()) == Some("up");
+                roll.gateway_leases += v
+                    .get("leases")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+            }
+            _ => {}
+        }
+    }
+    roll
+}
+
+/// Read a numeric JSON field as `u128` (the SR sizes arrive as JSON numbers when
+/// they fit; large byte counts may overflow `u64` JSON and arrive as strings —
+/// handled by [`str_u128`]). `None` when absent or non-numeric.
+fn field_bytes(v: &serde_json::Value, key: &str) -> Option<u128> {
+    v.get(key)
+        .and_then(serde_json::Value::as_u64)
+        .map(u128::from)
+}
+
+/// Read a numeric JSON field that arrived as a string (the `xe` sizes are emitted
+/// as quoted strings in the SR signature) into `u128`. `None` when absent/unparsable.
+fn str_u128(v: &serde_json::Value, key: &str) -> Option<u128> {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .and_then(|s| s.trim().parse::<u128>().ok())
+}
+
+/// Build the rollup `DcResource`s for every zone present in `resources`.
+///
+/// A zone with no sampled resources publishes nothing, and a vanished zone's rollup
+/// goes `gone` through the normal reconcile path. One `kind="rollup"` resource per
+/// zone.
+#[must_use]
+pub fn rollup_resources(resources: &[DcResource]) -> Vec<DcResource> {
+    // Distinct zones present, in stable order.
+    let mut zones: Vec<String> = resources
+        .iter()
+        .filter_map(|r| serde_json::from_str::<serde_json::Value>(&r.signature).ok())
+        .filter_map(|v| {
+            v.get("zone")
+                .and_then(|z| z.as_str())
+                .map(std::string::ToString::to_string)
+        })
+        .collect();
+    zones.sort();
+    zones.dedup();
+    zones
+        .into_iter()
+        .map(|zone| {
+            let roll = rollup_zone(&zone, resources);
+            DcResource::new("rollup", zone.clone(), roll.signature(&zone))
+        })
+        .collect()
+}
+
 /// Sample the on-prem UniFi gateway (the dev-zone router): one `gateway` resource
 /// carrying its live status and active DHCP lease count. Reads over `sshpass` SSH
 /// using the cred from the mesh secret store (DATACENTER-3) — best-effort, so a
@@ -779,46 +931,114 @@ fn publish(ev: &DcEvent) {
     crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
 }
 
-/// The supervised worker. Leader-gated (only the elected node samples + publishes,
-/// so a multi-node mesh doesn't multi-publish) and best-effort.
+/// A datacenter control zone, each with its OWN leader election (the design's
+/// "one [worker] per zone" — §3 of `datacenter-control.md`). The two zones elect
+/// **independently** off separate lock files so the node that leads Xen need not be
+/// the node that leads DO, and losing one zone's leader never disturbs the other.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Zone {
+    /// The on-prem Xen (dev) zone **plus the UniFi gateway**: its dom0s + router sit
+    /// on the `172.20.0.0/16` lab LAN, so only an **on-LAN** node is leader-eligible
+    /// (an off-LAN node can read XAPI over a relay but can't be the always-on Xen
+    /// control point). Carries hosts/vms/srs/nets/gateway/power.
+    Xen,
+    /// The DigitalOcean (prod) zone: the DO API is internet-reachable, so **any**
+    /// eligible node can be its leader. Carries droplets.
+    Do,
+}
+
+impl Zone {
+    /// The lock-file basename for this zone's independent leader election (under
+    /// the workgroup root, beside the shared `.mackesd-leader.lock`).
+    const fn lock_name(self) -> &'static str {
+        match self {
+            Self::Xen => ".mackesd-dc-xen-leader.lock",
+            Self::Do => ".mackesd-dc-do-leader.lock",
+        }
+    }
+
+    /// Is this node ELIGIBLE to lead this zone at all? The Xen/gateway zone is
+    /// restricted to on-LAN nodes (the substrate is LAN-only); the DO zone is open
+    /// to any node. Ineligible nodes never contend, so they don't churn the lock.
+    fn eligible(self, on_lan: bool) -> bool {
+        match self {
+            Self::Xen => on_lan,
+            Self::Do => true,
+        }
+    }
+}
+
+/// The supervised worker. **Per-zone leader-gated**: it runs an independent leader
+/// election for each [`Zone`] (Xen+gateway / DO) so a multi-node mesh publishes each
+/// zone's deltas from exactly one node, the right-placed one (Xen from an on-LAN
+/// node, DO from anywhere) — and killing one zone's leader leaves the other zone
+/// publishing uninterrupted. Best-effort throughout.
 pub struct DatacenterOrchestratorWorker {
-    core: DatacenterOrchestrator,
+    /// Independent dedup core per zone — a zone we don't lead is left untouched, so
+    /// we never emit a spurious `gone` for resources another node owns.
+    xen_core: DatacenterOrchestrator,
+    do_core: DatacenterOrchestrator,
     tick_interval: Duration,
     node_id: String,
-    leader_lock: PathBuf,
+    workgroup_root: PathBuf,
 }
 
 impl DatacenterOrchestratorWorker {
     #[must_use]
     pub fn new(workgroup_root: PathBuf, node_id: String) -> Self {
         Self {
-            core: DatacenterOrchestrator::new(),
+            xen_core: DatacenterOrchestrator::new(),
+            do_core: DatacenterOrchestrator::new(),
             tick_interval: DEFAULT_TICK_INTERVAL,
-            leader_lock: workgroup_root.join(".mackesd-leader.lock"),
+            workgroup_root,
             node_id,
         }
     }
 
-    /// Only the directory leader orchestrates (no-fixed-center: any eligible node
-    /// can be it, the elected one publishes). Reuses the shared leader lock.
-    fn is_leader(&self) -> bool {
+    /// Does this node currently hold `zone`'s leader lease? Each zone has its own
+    /// lock file, so the two elections are fully independent (no-fixed-center: any
+    /// eligible node can be it, the elected one publishes).
+    fn leads(&self, zone: Zone) -> bool {
+        let lock = self.workgroup_root.join(zone.lock_name());
         matches!(
-            crate::leader::try_acquire(&self.leader_lock, &self.node_id),
+            crate::leader::try_acquire(&lock, &self.node_id),
             Ok(crate::leader::AcquireResult::Acquired)
         )
     }
 
     fn tick_once(&mut self) {
-        if !self.is_leader() {
-            return;
+        // Eligibility is decided once per tick (a single `ip -j addr` probe) and
+        // gates which zones this node may even contend for.
+        let on_lan = node_on_lan();
+
+        // DO (prod) zone — any eligible node may lead it.
+        if Zone::Do.eligible(on_lan) && self.leads(Zone::Do) {
+            let current = gather_do();
+            let mut events = self.do_core.reconcile(&with_rollup(current));
+            for ev in events.drain(..) {
+                publish(&ev);
+            }
         }
-        let mut current = gather_do();
-        current.extend(gather_xen());
-        current.extend(gather_gateway());
-        for ev in self.core.reconcile(&current) {
-            publish(&ev);
+
+        // Xen (dev) zone + the on-LAN gateway — only an on-LAN node may lead it.
+        if Zone::Xen.eligible(on_lan) && self.leads(Zone::Xen) {
+            let mut current = gather_xen();
+            current.extend(gather_gateway());
+            let mut events = self.xen_core.reconcile(&with_rollup(current));
+            for ev in events.drain(..) {
+                publish(&ev);
+            }
         }
     }
+}
+
+/// Append the per-zone storage/net/gateway rollup resources to a freshly-gathered
+/// set, so the rollup flows through the SAME dedup/`gone` reconcile as the cards it
+/// summarises (one `event/dc/rollup/<zone>` per zone present).
+fn with_rollup(mut resources: Vec<DcResource>) -> Vec<DcResource> {
+    let rollups = rollup_resources(&resources);
+    resources.extend(rollups);
+    resources
 }
 
 #[async_trait::async_trait]
@@ -1102,5 +1322,143 @@ mod tests {
         assert!(local_ipv4s_from_ip_json("not json").is_empty());
         assert!(local_ipv4s_from_ip_json("{}").is_empty());
         assert!(local_ipv4s_from_ip_json("[]").is_empty());
+    }
+
+    // ---- DATACENTER-5: per-zone leaders -----------------------------------------
+
+    #[test]
+    fn zone_eligibility_gates_xen_to_on_lan_only() {
+        // The Xen/gateway zone is LAN-only; the DO zone is open to any node.
+        assert!(Zone::Xen.eligible(true));
+        assert!(!Zone::Xen.eligible(false));
+        assert!(Zone::Do.eligible(true));
+        assert!(Zone::Do.eligible(false));
+    }
+
+    #[test]
+    fn zone_lock_names_are_distinct_so_elections_are_independent() {
+        // Two different lock files ⇒ the Xen leader and the DO leader can be
+        // different nodes, and one zone's leader loss never touches the other.
+        assert_ne!(Zone::Xen.lock_name(), Zone::Do.lock_name());
+        assert!(Zone::Xen.lock_name().contains("xen"));
+        assert!(Zone::Do.lock_name().contains("do"));
+    }
+
+    // ---- DATACENTER-5: storage / net / gateway rollup ---------------------------
+
+    fn sr(id: &str, zone: &str, size: &str, used: &str) -> DcResource {
+        let sig = serde_json::json!({
+            "kind":"sr","id":id,"name":id,"size":size,"used":used,"zone":zone
+        })
+        .to_string();
+        DcResource::new("sr", id, sig)
+    }
+    fn net(id: &str, zone: &str) -> DcResource {
+        let sig = serde_json::json!({"kind":"net","id":id,"name":id,"zone":zone}).to_string();
+        DcResource::new("net", id, sig)
+    }
+    fn gateway(id: &str, zone: &str, up: bool, leases: u64) -> DcResource {
+        let sig = serde_json::json!({
+            "kind":"gateway","id":id,"status": if up {"up"} else {"down"},"leases":leases,"zone":zone
+        })
+        .to_string();
+        DcResource::new("gateway", id, sig)
+    }
+
+    #[test]
+    fn rollup_zone_sums_storage_counts_nets_and_reads_gateway() {
+        let res = vec![
+            sr("s1", "dev", "200", "50"),
+            sr("s2", "dev", "100", "50"),
+            net("n1", "dev"),
+            net("n2", "dev"),
+            net("n3", "dev"),
+            gateway("g1", "dev", true, 42),
+            // a prod resource must NOT contribute to the dev rollup
+            sr("s9", "prod", "999", "999"),
+        ];
+        let roll = rollup_zone("dev", &res);
+        assert_eq!(roll.sr_count, 2);
+        assert_eq!(roll.storage_total_bytes, 300);
+        assert_eq!(roll.storage_used_bytes, 100);
+        assert_eq!(roll.storage_pct(), 33); // 100/300
+        assert_eq!(roll.net_count, 3);
+        assert!(roll.gateway_up);
+        assert_eq!(roll.gateway_leases, 42);
+    }
+
+    #[test]
+    fn rollup_zone_storage_pct_is_zero_when_no_capacity() {
+        let roll = rollup_zone("dev", &[net("n1", "dev")]);
+        assert_eq!(roll.storage_total_bytes, 0);
+        assert_eq!(roll.storage_pct(), 0); // no divide-by-zero
+        assert_eq!(roll.net_count, 1);
+        assert!(!roll.gateway_up);
+    }
+
+    #[test]
+    fn rollup_zone_clamps_over_full_storage_to_100() {
+        // A mid-sample read where used > total must clamp, never exceed 100.
+        let roll = rollup_zone("dev", &[sr("s1", "dev", "100", "150")]);
+        assert_eq!(roll.storage_pct(), 100);
+    }
+
+    #[test]
+    fn rollup_resources_emits_one_rollup_per_zone() {
+        let res = vec![
+            sr("s1", "dev", "100", "10"),
+            net("n1", "prod"),
+            gateway("g1", "dev", true, 5),
+        ];
+        let rolls = rollup_resources(&res);
+        // One rollup per distinct zone (dev, prod).
+        assert_eq!(rolls.len(), 2);
+        assert!(rolls.iter().all(|r| r.kind == "rollup"));
+        let dev = rolls.iter().find(|r| r.id == "dev").expect("dev rollup");
+        let v: serde_json::Value = serde_json::from_str(&dev.signature).unwrap();
+        assert_eq!(v["zone"], "dev");
+        assert_eq!(v["sr_count"], 1);
+        assert_eq!(v["gateway_up"], true);
+        assert_eq!(v["storage_total_bytes"], "100");
+        assert_eq!(v["storage_pct"], 10);
+        // Topic is the panel-facing `event/dc/rollup/<zone>`.
+        let ev = DcEvent {
+            kind: dev.kind.clone(),
+            id: dev.id.clone(),
+            signature: dev.signature.clone(),
+        };
+        assert_eq!(ev.topic(), "event/dc/rollup/dev");
+    }
+
+    #[test]
+    fn rollup_handles_string_byte_sizes_from_xe() {
+        // The `xe` SR sizes arrive as quoted-string bytes (can exceed u64-as-JSON).
+        let res = vec![sr("s1", "dev", "207296921600", "42949672960")];
+        let roll = rollup_zone("dev", &res);
+        assert_eq!(roll.storage_total_bytes, 207_296_921_600);
+        assert_eq!(roll.storage_used_bytes, 42_949_672_960);
+        assert_eq!(roll.storage_pct(), 20); // ~20.7%
+    }
+
+    #[test]
+    fn rollup_flows_through_reconcile_dedup_and_gone() {
+        // A rollup resource is just another DcResource: new→event, unchanged→silent,
+        // absent→gone. Proves the rollup rides the same Bus contract as the cards.
+        let mut core = DatacenterOrchestrator::new();
+        let with = with_rollup(vec![sr("s1", "dev", "100", "10")]);
+        let ev = core.reconcile(&with);
+        assert!(ev.iter().any(|e| e.topic() == "event/dc/rollup/dev"));
+        // Same sample again → no rollup event (deduped).
+        assert!(core
+            .reconcile(&with_rollup(vec![sr("s1", "dev", "100", "10")]))
+            .iter()
+            .all(|e| e.topic() != "event/dc/rollup/dev"));
+        // Zone empties → the rollup goes `gone`.
+        let gone = core.reconcile(&[]);
+        let roll_gone = gone
+            .iter()
+            .find(|e| e.topic() == "event/dc/rollup/dev")
+            .expect("rollup gone");
+        assert!(roll_gone.body().contains(r#""gone":true"#));
     }
 }
