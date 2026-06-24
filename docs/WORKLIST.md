@@ -1832,7 +1832,7 @@ the plane and it **survives killing the current zone leader**.
 - [✓] **DATACENTER-12: Storage tab (SR/VDI/create + scheduled snapshots + image library).**
   **Acceptance**:
     - [ ] SRs + VDIs (attach/detach/create); scheduled snapshots w/ retention + backup target; ISO + template library (absorbs `images`); SR capacity threshold alerts → Bus/Hub
-- [ ] **DATACENTER-13: Network tab (L2 + overlay + topology + unified IP/DNS).**
+- [>] **DATACENTER-13: Network tab (L2 + overlay + topology + unified IP/DNS).**
   **Acceptance**:
     - [ ] networks/PIFs/VLANs/NIC mgmt/create; overlay peer/route management; an interactive topology map (hosts↔networks↔VMs↔gateway); a unified IP/DNS view correlating UniFi leases ↔ DO DNS ↔ overlay IPs
 - [>] **DATACENTER-14: Gateway tab (UniFi full control).**
