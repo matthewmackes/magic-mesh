@@ -349,6 +349,11 @@ pub struct ClipboardSyncWorker {
     /// has vanished, so a flapping `wl-paste` doesn't fork `loginctl` on every
     /// 3 s respawn tick. `None` on the dev-box path (inherited `$WAYLAND_DISPLAY`).
     session: Option<session::GraphicalSession>,
+    /// CLIP-SYNC-2 — was discovery in a steady "headless / no desktop" miss on
+    /// the previous probe? Used to log that verdict only on the EDGE into it,
+    /// so a genuinely headless node (which re-probes every 20 s forever) logs it
+    /// once rather than every poll. `false` after a successful discovery.
+    headless_logged: bool,
 }
 
 impl ClipboardSyncWorker {
@@ -360,6 +365,7 @@ impl ClipboardSyncWorker {
             workgroup_root,
             source: local_hostname(),
             session: None,
+            headless_logged: false,
         }
     }
 
@@ -377,6 +383,12 @@ impl ClipboardSyncWorker {
     /// on every respawn tick. The blocking discovery runs on a `spawn_blocking`
     /// thread so it never parks a tokio worker.
     ///
+    /// Logs the discovery outcome so the worker is never silent about why it
+    /// isn't capturing (the CLIP bug): a successful pick at INFO (uid + display);
+    /// a steady headless miss ONCE on the edge into it (a headless node re-probes
+    /// every 20 s — we don't re-log each poll); an anomalous miss (socket not up
+    /// / uid absent) at WARN every recurrence.
+    ///
     /// Returns a reference to the live session, or `None` when none is available
     /// (headless node / desktop not up yet).
     async fn resolve_session(&mut self) -> Option<&session::GraphicalSession> {
@@ -387,9 +399,41 @@ impl ClipboardSyncWorker {
         if !cached_live {
             // Cache empty or its socket vanished (compositor restart / logout) —
             // re-discover off the tokio worker threads.
-            self.session = tokio::task::spawn_blocking(session::discover)
-                .await
-                .unwrap_or(None);
+            match tokio::task::spawn_blocking(session::discover).await {
+                Ok(Ok(found)) => {
+                    info!(
+                        target: "clipboard_sync", source = %self.source,
+                        uid = found.uid, display = %found.wayland_display,
+                        runtime_dir = %found.runtime_dir.display(),
+                        "discovered active graphical session to drive wl-paste into"
+                    );
+                    self.headless_logged = false;
+                    self.session = Some(found);
+                }
+                Ok(Err(miss)) => {
+                    self.session = None;
+                    match miss.kind {
+                        // Steady headless/pre-desktop state — log once on the
+                        // edge in, then stay quiet across the 20 s re-probes.
+                        session::MissKind::Steady => {
+                            if !self.headless_logged {
+                                info!(target: "clipboard_sync", "{}", miss.reason);
+                                self.headless_logged = true;
+                            }
+                        }
+                        // A session resolved but isn't drivable yet — unexpected,
+                        // so surface it every recurrence (and re-arm the steady
+                        // edge so a later drop back to headless re-logs).
+                        session::MissKind::Anomalous => {
+                            warn!(target: "clipboard_sync", "{}", miss.reason);
+                            self.headless_logged = false;
+                        }
+                    }
+                }
+                // spawn_blocking itself failed (panic/cancel) — keep the prior
+                // cache decision; surface it so it isn't silent.
+                Err(e) => warn!(target: "clipboard_sync", "session discovery task failed: {e}"),
+            }
         }
         self.session.as_ref()
     }
@@ -461,27 +505,25 @@ impl Worker for ClipboardSyncWorker {
         // record rather than being split per line (the fidelity bug a naive
         // `--watch cat` + line reader would have).
         loop {
-            // CLIP-SYNC-2 — resolve the Wayland session to attach to. When the
-            // worker already has a `$WAYLAND_DISPLAY` (a dev box / a per-session
-            // launch) we spawn against the inherited env. As the system daemon
-            // (`mackesd.service`, root, no graphical session) `$WAYLAND_DISPLAY`
-            // is unset, so we DISCOVER the active seat0 graphical session via
-            // logind and spawn the capture as that user with its env — otherwise
-            // the worker idled forever and the Hub's clipboard stayed empty
-            // (found live on Eagle 2026-06-24).
-            // Resolve where to attach. With an inherited `$WAYLAND_DISPLAY`
-            // (dev box / per-session launch) we spawn against the inherited env
-            // and skip session discovery entirely. Otherwise (the system daemon)
-            // we discover the active graphical session — cloned out so the `&mut
-            // self` discovery borrow is released before we read `self.source`.
+            // CLIP-SYNC-2 — resolve the Wayland session to attach to. With an
+            // inherited `$WAYLAND_DISPLAY` (a dev box / a per-session launch) we
+            // spawn against the inherited env and skip discovery. As the system
+            // daemon (`mackesd.service`, root, no graphical session)
+            // `$WAYLAND_DISPLAY` is unset, so we DISCOVER the active seat0
+            // graphical session via logind and spawn the capture as that user
+            // with its env — otherwise the worker idled forever and the Hub's
+            // clipboard stayed empty (found live on Eagle 2026-06-24). The
+            // session is cloned out so the `&mut self` discovery borrow is
+            // released before we read `self.source`; `resolve_session` already
+            // logged the outcome (success / headless / anomalous).
             let attach: Option<session::GraphicalSession> =
                 if std::env::var_os("WAYLAND_DISPLAY").is_some() {
                     None
                 } else {
                     let Some(s) = self.resolve_session().await.cloned() else {
                         // Genuinely headless (Lighthouse/Server, or a Workstation
-                        // before the desktop is up) — idle quietly, no error spam.
-                        debug!(target: "clipboard_sync", "no active graphical session; idling");
+                        // before the desktop is up) — idle. `resolve_session`
+                        // logged the reason (edge-triggered, no per-poll spam).
                         tokio::select! {
                             () = tokio::time::sleep(NO_SESSION_POLL) => continue,
                             () = shutdown.wait() => return Ok(()),
@@ -572,8 +614,20 @@ impl Worker for ClipboardSyncWorker {
                     }
                 }
             }
-            // Child exited / stdout closed — reap + pace the respawn.
-            let _ = child.wait().await;
+            // Child exited / stdout closed — reap, log the exit (so a flapping
+            // capture is never silent — the CLIP bug was a worker that captured
+            // nothing without a trace), + pace the respawn.
+            match child.wait().await {
+                Ok(status) => info!(
+                    target: "clipboard_sync",
+                    source = %self.source,
+                    "{WL_PASTE} --watch exited ({status}); respawning after cooldown"
+                ),
+                Err(e) => warn!(
+                    target: "clipboard_sync",
+                    "reaping {WL_PASTE} --watch failed: {e}; respawning after cooldown"
+                ),
+            }
             tokio::select! {
                 () = tokio::time::sleep(RESPAWN_COOLDOWN) => {}
                 () = shutdown.wait() => return Ok(()),
