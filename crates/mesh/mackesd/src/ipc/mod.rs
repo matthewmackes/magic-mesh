@@ -53,6 +53,8 @@ pub mod route;
 pub mod secret_store;
 // VPN-GW-1 — action/vpn/* tunnel CRUD + wg-quick/openvpn bring-up responder.
 pub mod vpn_gw;
+// VPN-GW-6 — tunnel health + exit-IP/leak verification + auto-failover + alerts.
+pub mod vpn_health;
 // NF-Bundle-0 (v2.5) — dev.mackes.MDE.Nebula.Status surface.
 // Foundation that NF-10..NF-18 desktop consumers chain on.
 // Reachable from run_serve at boot.
