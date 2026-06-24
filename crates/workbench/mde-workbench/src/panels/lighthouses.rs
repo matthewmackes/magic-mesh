@@ -15,15 +15,21 @@
 //! lighthouse first. The beam + a periodic refresh run only while this tab is
 //! active (wired in `app::subscription`).
 //!
-//! Full-ops actions (confirmed restart / SSH / promote-shadow) are LIGHTHOUSE-6;
-//! handshake/cert-expiry/uptime need a per-lighthouse probe lane that the
-//! replicated directory does not carry today (tracked as a LIGHTHOUSE follow-on)
-//! and are deliberately omitted rather than stubbed (§7).
+//! Full-ops actions (confirmed restart / SSH / promote-shadow) are LIGHTHOUSE-6.
+//!
+//! LIGHTHOUSE-8 — handshake / public IP / overlay peer count / uptime / CA
+//! cert-expiry now come from the per-lighthouse deep-probe lane: the `mackesd`
+//! `lighthouse_probe` worker publishes a [`LighthouseProbe`] to
+//! `compute/lighthouse-probe/<name>` every ~15 s, and each card reads the newest
+//! probe off the mesh-bus spool on the same 5 s refresh tick that loads the
+//! directory rows. Fields the probe could not measure render `—` (never stubbed,
+//! §7).
 
 use cosmic::iced::widget::{column, container, row, scrollable, text, Space};
 use cosmic::iced::{Length, Padding, Task};
 use cosmic::Element;
 use mackes_mesh_types::lighthouse::{self, Beacon};
+use mackes_mesh_types::lighthouse_probe::LighthouseProbe;
 use mde_theme::{FontSize, Palette, TypeRole};
 
 use crate::cosmic_compat::prelude::*;
@@ -42,6 +48,11 @@ pub struct LighthouseCard {
     pub services: String,
     /// Installed `magic-mesh` version, if recorded.
     pub mde_version: Option<String>,
+    /// LIGHTHOUSE-8 — the newest deep-probe for this lighthouse off the mesh-bus
+    /// (`compute/lighthouse-probe/<name>`): handshake / public IP / overlay peer
+    /// count / uptime / CA cert-expiry. `None` until the first probe lands (or
+    /// when the bus is unreachable) — the card renders `—` for each field.
+    pub probe: Option<LighthouseProbe>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -307,7 +318,12 @@ fn lighthouse_card<'a>(
         .size(12)
         .colr(p.text_muted.into_cosmic_color()),
     ]
-    .spacing(3);
+    .spacing(3)
+    // LIGHTHOUSE-8 — the deep-probe lines (handshake / public IP / peers /
+    // uptime, then a colored CA cert-expiry line). Each field is `—` until the
+    // probe lands (graceful degradation, §7).
+    .push(probe_line(c.probe.as_ref(), p))
+    .push(cert_expiry_line(c.probe.as_ref(), p));
 
     let inner = row![
         square,
@@ -334,6 +350,51 @@ fn lighthouse_card<'a>(
                 ..Default::default()
             },
         )
+        .into()
+}
+
+/// CA cert-expiry days at/below which the card warns (matches the daemon's
+/// `ca::expiry::CERT_EXPIRY_WARN_DAYS` — a full ops cycle of lead time). Kept as
+/// a local UI threshold so the panel doesn't take a daemon-crate dependency.
+const CERT_EXPIRY_WARN_DAYS: i64 = 30;
+
+/// LIGHTHOUSE-8 — the handshake / public-IP / overlay-peers / uptime line. Every
+/// field degrades to `—` when the probe hasn't measured it (or hasn't landed).
+fn probe_line<'a>(probe: Option<&LighthouseProbe>, p: Palette) -> Element<'a, crate::Message> {
+    let dash = "—".to_string();
+    let handshake = probe.map_or("—", LighthouseProbe::handshake_word);
+    let public_ip = probe
+        .and_then(|pr| pr.public_ip.clone())
+        .unwrap_or_else(|| dash.clone());
+    let peers = probe
+        .and_then(|pr| pr.peer_count)
+        .map_or(dash.clone(), |n| n.to_string());
+    let uptime = probe.map_or(dash, LighthouseProbe::uptime_human);
+    text(format!(
+        "handshake: {handshake}  ·  public: {public_ip}  ·  peers: {peers}  ·  up {uptime}",
+    ))
+    .size(12)
+    .colr(p.text_muted.into_cosmic_color())
+    .into()
+}
+
+/// LIGHTHOUSE-8 — the CA cert-expiry line, colored by urgency through the
+/// mde-theme Carbon tokens: `danger` once expired or inside the warn window,
+/// `warning` while approaching it, else `text_muted`. `—` until the probe lands.
+fn cert_expiry_line<'a>(
+    probe: Option<&LighthouseProbe>,
+    p: Palette,
+) -> Element<'a, crate::Message> {
+    let days = probe.and_then(|pr| pr.cert_expiry_days);
+    let color = match days {
+        Some(d) if d <= CERT_EXPIRY_WARN_DAYS => p.danger,
+        Some(d) if d <= CERT_EXPIRY_WARN_DAYS * 2 => p.warning,
+        _ => p.text_muted,
+    };
+    let detail = probe.map_or_else(|| "—".to_string(), LighthouseProbe::cert_expiry_human);
+    text(format!("mesh CA cert: {detail}"))
+        .size(12)
+        .colr(color.into_cosmic_color())
         .into()
 }
 
@@ -415,14 +476,58 @@ fn load_cards() -> Vec<LighthouseCard> {
             let is_master = master.as_deref() == Some(p.hostname.as_str());
             let beacon = lighthouse::beacon_for(p, is_master, now_ms, lighthouse::DEFAULT_STALE_MS);
             LighthouseCard {
-                beacon,
                 health: p.health.clone(),
                 last_seen_age_s: now_ms.saturating_sub(p.last_seen_ms) / 1000,
                 services: summarize_services(p),
                 mde_version: p.mde_version.clone(),
+                // LIGHTHOUSE-8 — newest deep-probe off the bus for this name.
+                probe: read_latest_probe(&p.hostname),
+                beacon,
             }
         })
         .collect()
+}
+
+/// LIGHTHOUSE-8 — read the newest [`LighthouseProbe`] for `name` off the
+/// mde-bus spool topic `compute/lighthouse-probe/<name>`. The probe worker
+/// publishes one document per lighthouse each tick; the bus stores each as a
+/// `{ … , "body": "<json>" }` envelope under `<bus-root>/compute/lighthouse-
+/// probe/<name>/<ulid>.json` (the same on-disk shape the Mesh ▸ Bus panel
+/// reads). Returns the freshest by **ULID filename** — ULIDs are monotonic +
+/// lexically time-sortable, so the lexicographically-greatest `.json` name is
+/// the newest message, a deterministic order (unlike filesystem mtime, which
+/// ties at coarse granularity) that also needs no per-file `stat`. Best-effort:
+/// a missing/unreadable bus yields `None`, and the card renders `—`.
+fn read_latest_probe(name: &str) -> Option<LighthouseProbe> {
+    let root = mde_bus::client_data_dir()?;
+    let topic_dir = root.join("compute").join("lighthouse-probe").join(name);
+    let entries = std::fs::read_dir(&topic_dir).ok()?;
+    let mut newest: Option<std::ffi::OsString> = None;
+    for ent in entries.flatten() {
+        let fname = ent.file_name();
+        if std::path::Path::new(&fname)
+            .extension()
+            .is_none_or(|e| e != "json")
+        {
+            continue;
+        }
+        if newest.as_ref().is_none_or(|cur| fname > *cur) {
+            newest = Some(fname);
+        }
+    }
+    let raw = std::fs::read_to_string(topic_dir.join(newest?)).ok()?;
+    parse_probe_envelope(&raw)
+}
+
+/// Parse a [`LighthouseProbe`] out of one mde-bus envelope file's text: the
+/// publisher wrote our JSON payload into the envelope's `body` string field
+/// (`mde-bus publish … --body-flag <json>`). Pure (no I/O) so the decode path is
+/// unit-tested. `None` on a malformed envelope or an unparseable body.
+#[must_use]
+fn parse_probe_envelope(raw: &str) -> Option<LighthouseProbe> {
+    let envelope: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let body = envelope.get("body")?.as_str()?;
+    serde_json::from_str::<LighthouseProbe>(body).ok()
 }
 
 /// A one-line service summary from a peer's published descriptors.
@@ -454,4 +559,92 @@ fn now_ms() -> u64 {
             .unwrap_or(0),
     )
     .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a bus-envelope JSON string the way `mde-bus publish --body-flag`
+    /// stores it: our [`LighthouseProbe`] JSON lives in the `body` string field.
+    fn envelope_for(probe: &LighthouseProbe) -> String {
+        let body = serde_json::to_string(probe).expect("serialize probe");
+        let env = serde_json::json!({
+            "ulid": "01TESTULID0000000000000000",
+            "topic": LighthouseProbe::topic(&probe.name),
+            "priority": "default",
+            "title": null,
+            "body": body,
+            "ts_unix_ms": probe.probed_at_ms,
+            "file_path": "compute/lighthouse-probe/anvil/01TESTULID0000000000000000.json",
+        });
+        serde_json::to_string(&env).expect("serialize envelope")
+    }
+
+    #[test]
+    fn parse_probe_envelope_decodes_the_body_payload() {
+        let probe = LighthouseProbe {
+            name: "anvil".into(),
+            overlay_ip: Some("10.42.0.5".into()),
+            handshake: Some(true),
+            public_ip: Some("203.0.113.5:4242".into()),
+            peer_count: Some(4),
+            uptime_s: Some(7_200),
+            cert_expiry_days: Some(180),
+            probed_at_ms: 1_700_000_000_000,
+        };
+        let raw = envelope_for(&probe);
+        let back = parse_probe_envelope(&raw).expect("decode");
+        assert_eq!(back, probe);
+    }
+
+    #[test]
+    fn parse_probe_envelope_rejects_garbage_and_missing_body() {
+        assert!(parse_probe_envelope("not json").is_none());
+        assert!(parse_probe_envelope(r#"{"topic":"t"}"#).is_none());
+        // A body that isn't a LighthouseProbe document.
+        assert!(parse_probe_envelope(r#"{"body":"{\"foo\":1}"}"#).is_none());
+    }
+
+    #[test]
+    fn read_latest_probe_picks_the_newest_envelope() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let topic_dir = tmp
+            .path()
+            .join("compute")
+            .join("lighthouse-probe")
+            .join("anvil");
+        std::fs::create_dir_all(&topic_dir).expect("mkdir topic");
+
+        // An older probe (peers=2) and a newer probe (peers=9). The reader picks
+        // by ULID filename: ULIDs are monotonic + lexically time-sortable, so the
+        // newer message has the lexicographically-greater name. Write in reverse
+        // (newer file first) to prove the order is by NAME, not write/mtime order.
+        let mut old = LighthouseProbe::unmeasured("anvil", 1_000);
+        old.peer_count = Some(2);
+        let mut new = LighthouseProbe::unmeasured("anvil", 2_000);
+        new.peer_count = Some(9);
+
+        // Representative monotonic ULIDs (the newer one sorts lexically last).
+        let old_path = topic_dir.join("01J000000000000000000OLDER.json");
+        let new_path = topic_dir.join("01J000000000000000000ZNEWR.json");
+        std::fs::write(&new_path, envelope_for(&new)).expect("write new");
+        std::fs::write(&old_path, envelope_for(&old)).expect("write old");
+
+        std::env::set_var("MDE_BUS_ROOT", tmp.path());
+        let got = read_latest_probe("anvil");
+        std::env::remove_var("MDE_BUS_ROOT");
+
+        let got = got.expect("a probe should be read");
+        assert_eq!(got.peer_count, Some(9), "newest ULID wins");
+    }
+
+    #[test]
+    fn read_latest_probe_is_none_when_topic_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("MDE_BUS_ROOT", tmp.path());
+        let got = read_latest_probe("ghost-lighthouse");
+        std::env::remove_var("MDE_BUS_ROOT");
+        assert!(got.is_none());
+    }
 }
