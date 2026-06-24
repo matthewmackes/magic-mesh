@@ -121,6 +121,14 @@ pub struct FleetRollupPanel {
     /// fresh instant but does NOT spawn a second loop, so rapid refreshes never
     /// multiply the timer wakeups.
     crossfade_ticking: bool,
+    /// MOTION-NET-5 — back-to-back failed `fleet-status` polls (bus/mesh
+    /// unreachable). Bumped on each [`Message::LoadError`], reset to 0 on any
+    /// successful [`Message::Loaded`]. Once it reaches
+    /// [`crate::panel_chrome::CONNECTION_DEGRADED_AFTER`] the panel declares the
+    /// connection degraded (cached groups kept) / offline (nothing cached) instead
+    /// of a hard terminal failure — and **auto-recovers** the instant a poll
+    /// succeeds, because the success path clears this counter.
+    consecutive_failures: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +222,10 @@ impl FleetRollupPanel {
                 self.self_hostname = self_hostname;
                 self.loaded = true;
                 self.load_error = None;
+                // MOTION-NET-5 — a successful poll auto-recovers a degraded/offline
+                // connection: clear the failure counter so the next `load_state`
+                // drops straight back to Loaded.
+                self.consecutive_failures = 0;
                 self.busy = false;
                 self.status.clear();
                 if had_prior && !reduce_motion {
@@ -228,6 +240,10 @@ impl FleetRollupPanel {
             Message::LoadError(e) => {
                 // EFF-45 — fleet-status failure is an error, not an empty
                 // fleet.
+                // MOTION-NET-5 — count the failure so a repeated bus/mesh outage
+                // reads as a *degraded/offline connection* (kept on screen, with a
+                // reconnect affordance) rather than only a one-shot terminal error.
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
                 self.load_error = Some(e);
                 self.busy = false;
                 self.crossfade_start = None;
@@ -289,25 +305,45 @@ impl FleetRollupPanel {
         )
     }
 
-    /// MOTION-NET-3 — the canonical async state this panel is in, derived from
-    /// its existing data/refresh flags. A refresh that still has prior groups to
-    /// show is `Refreshing { stale: true }` (keep them dimmed, never blank); a
-    /// first load with nothing yet is `Loading`.
+    /// MOTION-NET-3 / MOTION-NET-5 — the canonical async state this panel is in,
+    /// derived from its existing data/refresh/error flags.
+    ///
+    /// * **Background poll vs first load** (MOTION-NET-3): a refresh that still has
+    ///   prior groups is `Refreshing { stale: true }` (keep them dimmed, never
+    ///   blank); a first load with nothing yet is `Loading`.
+    /// * **Degraded connection vs one-shot failure** (MOTION-NET-5): a *single*
+    ///   failed poll is a terminal `Failed` (retry the action) — but once polls fail
+    ///   back-to-back past
+    ///   [`CONNECTION_DEGRADED_AFTER`](crate::panel_chrome::CONNECTION_DEGRADED_AFTER)
+    ///   the bus/mesh is treated as *degraded* (cached groups stay on screen,
+    ///   usable-but-flagged) or *offline* (nothing cached) via
+    ///   [`connection_state`](crate::panel_chrome::connection_state). Either clears
+    ///   itself the moment a poll succeeds (the success path zeroes the counter).
     #[must_use]
     fn load_state(&self) -> LoadState {
-        if self.load_error.is_some() {
-            LoadState::Failed
-        } else if self.busy {
-            if self.rollup.groups.is_empty() {
-                LoadState::Loading
-            } else {
-                LoadState::Refreshing { stale: true }
-            }
-        } else if self.loaded {
-            LoadState::Loaded
-        } else {
-            LoadState::Idle
+        // A sustained outage is a degraded/offline *connection*, not a one-off
+        // error — surface that (and let it auto-recover) before the terminal Failed.
+        if self.load_error.is_some()
+            && self.consecutive_failures >= crate::panel_chrome::CONNECTION_DEGRADED_AFTER
+        {
+            return crate::panel_chrome::connection_state(
+                false,
+                !self.rollup.groups.is_empty(),
+                self.consecutive_failures,
+            );
         }
+        if self.load_error.is_some() {
+            return LoadState::Failed;
+        }
+        // `has_content` for the live state: real groups while polling (so a refresh
+        // keeps them), and the `loaded` flag at rest (a successfully-loaded but
+        // empty fleet still reads `Loaded`, not `Idle`).
+        let has_content = if self.busy {
+            !self.rollup.groups.is_empty()
+        } else {
+            self.loaded
+        };
+        crate::panel_chrome::connection_state(self.busy, has_content, 0)
     }
 
     pub fn view(&self) -> Element<'_, crate::Message> {
@@ -321,11 +357,18 @@ impl FleetRollupPanel {
             palette,
         );
 
-        // EFF-45 — a failed fleet-status run renders as failure, never as the
-        // "No enrolled nodes yet" empty state.
-        if let Some(err) = &self.load_error {
+        // EFF-45 / MOTION-NET-5 — a failed fleet-status run renders as failure,
+        // never as the "No enrolled nodes yet" empty state. BUT once the load state
+        // has crossed into `Degraded` (a sustained outage with prior groups still
+        // cached), we DON'T blank to the full-page error: we keep those groups on
+        // screen (dimmed, with the degraded indicator in the header) so the panel
+        // stays usable and auto-recovers in place. The blocking error_state is
+        // reserved for a hard `Failed`/`Offline` with nothing cached to keep.
+        let degraded_with_cache = load == LoadState::Degraded && !self.rollup.groups.is_empty();
+        if self.load_error.is_some() && !degraded_with_cache {
+            let err = self.load_error.clone().unwrap_or_default();
             return panel_container(
-                crate::panel_chrome::error_state(err.clone(), palette, || {
+                crate::panel_chrome::error_state(err, palette, || {
                     crate::Message::FleetRollup(Message::RefreshClicked)
                 }),
                 density,
@@ -448,9 +491,15 @@ impl FleetRollupPanel {
         // (icon + "Refreshing…", a non-motion cue) so a background refresh is
         // legible even under reduce-motion. The header itself never dims — only
         // the data below it does.
+        // MOTION-NET-5 — the dedicated NON-BLOCKING background-poll indicator: an
+        // "Updating…" pill that surfaces *only* while a background refresh runs over
+        // content that's still on screen, distinct from the full async-state badge
+        // (which also covers the blocking states). It's an inert empty element in
+        // every other state, so it costs nothing when the panel isn't polling.
         let header = row![
             text(format!("Fleet — {} node(s)", self.rollup.total)).size(20),
             cosmic::iced::widget::Space::new().width(Length::Fill),
+            crate::panel_chrome::background_activity_indicator(load, palette),
             load_state_indicator(load, palette),
             refresh,
         ]
@@ -459,13 +508,11 @@ impl FleetRollupPanel {
 
         // The live data section (centerpiece + role cards) — the part that dims
         // while refreshing and crossfades on swap.
-        let content: Element<'_, crate::Message> = column![
-            centerpiece,
-            scrollable(cards).height(Length::Fill),
-        ]
-        .spacing(16)
-        .width(Length::Fill)
-        .into();
+        let content: Element<'_, crate::Message> =
+            column![centerpiece, scrollable(cards).height(Length::Fill),]
+                .spacing(16)
+                .width(Length::Fill)
+                .into();
 
         panel_container(
             column![header, self.crossfaded(content, palette)]
@@ -689,12 +736,84 @@ mod tests {
         // (no idle wakeups): once `crossfade_start` is in the past beyond the
         // dialog_mount duration, a tick clears it.
         let mut p = loaded_panel();
-        p.crossfade_start =
-            Some(Instant::now() - Motion::dialog_mount().duration - std::time::Duration::from_secs(1));
+        p.crossfade_start = Some(
+            Instant::now() - Motion::dialog_mount().duration - std::time::Duration::from_secs(1),
+        );
         let _ = p.update(Message::CrossfadeTick);
         assert!(
             p.crossfade_start.is_none(),
             "a settled crossfade is dropped, stopping the tick loop"
         );
+    }
+
+    /// Drive `n` back-to-back failed `fleet-status` polls into `p`.
+    fn fail_polls(p: &mut FleetRollupPanel, n: u32) {
+        for _ in 0..n {
+            let _ = p.update(Message::LoadError("mackesd fleet-status: bus down".into()));
+        }
+    }
+
+    #[test]
+    fn one_failure_is_terminal_but_sustained_outage_is_degraded() {
+        // MOTION-NET-5 — a single failed poll over cached groups is a terminal
+        // Failed (the user retries the action); a *sustained* outage (≥ the
+        // threshold) re-reads as a Degraded connection that keeps the cached groups
+        // on screen instead of a hard error.
+        let mut p = loaded_panel();
+        fail_polls(&mut p, 1);
+        assert_eq!(p.consecutive_failures, 1);
+        assert_eq!(
+            p.load_state(),
+            LoadState::Failed,
+            "one blip is a terminal failure, not yet a degraded connection"
+        );
+        fail_polls(&mut p, crate::panel_chrome::CONNECTION_DEGRADED_AFTER - 1);
+        assert!(p.consecutive_failures >= crate::panel_chrome::CONNECTION_DEGRADED_AFTER);
+        assert_eq!(
+            p.load_state(),
+            LoadState::Degraded,
+            "a sustained outage with cached groups ⇒ Degraded (kept on screen)"
+        );
+        // Degraded offers a reconnect affordance and is rendered (not panicking),
+        // keeping the cached groups rather than blanking to the error state.
+        assert!(p.load_state().can_retry());
+        let _ = p.view();
+    }
+
+    #[test]
+    fn sustained_outage_with_no_cache_is_offline() {
+        // MOTION-NET-5 — repeated failures with nothing cached to show ⇒ Offline
+        // (no data, waiting to reconnect), distinct from Degraded.
+        let mut p = FleetRollupPanel::new();
+        fail_polls(&mut p, crate::panel_chrome::CONNECTION_DEGRADED_AFTER);
+        assert!(p.rollup.groups.is_empty(), "no cached groups");
+        assert_eq!(p.load_state(), LoadState::Offline);
+        assert!(p.load_state().can_retry());
+        let _ = p.view();
+    }
+
+    #[test]
+    fn a_successful_poll_auto_recovers_from_degraded() {
+        // MOTION-NET-5 — the degraded/offline connection clears itself the instant
+        // a poll succeeds: the success path zeroes the failure counter, so the next
+        // load_state drops straight back to Loaded with no separate recover step.
+        let mut p = loaded_panel();
+        fail_polls(&mut p, crate::panel_chrome::CONNECTION_DEGRADED_AFTER);
+        assert_eq!(p.load_state(), LoadState::Degraded);
+        // A poll succeeds → auto-recovered.
+        let _ = p.update(Message::Loaded {
+            rollup: parse_rollup(
+                r#"{"total":1,"groups":[{"role":"host","total":1,"worst_health":"healthy"}]}"#,
+            ),
+            rows: Vec::new(),
+            rtt: HashMap::new(),
+            self_hostname: "pine".into(),
+        });
+        assert_eq!(
+            p.consecutive_failures, 0,
+            "success clears the failure counter"
+        );
+        assert_eq!(p.load_state(), LoadState::Loaded, "auto-recovered in place");
+        assert!(p.load_error.is_none());
     }
 }

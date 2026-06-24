@@ -251,6 +251,92 @@ pub fn load_state_indicator<'a, Message: 'a>(
     )
 }
 
+/// MOTION-NET-5 — how many back-to-back failed polls a panel tolerates before it
+/// declares the connection **degraded**. Below this a single hiccup is absorbed
+/// silently (the next poll usually succeeds); at/above it the surface admits the
+/// connection is unhealthy. One short blip shouldn't flap the indicator.
+pub const CONNECTION_DEGRADED_AFTER: u32 = 2;
+
+/// MOTION-NET-5 — derive the canonical [`LoadState`] for a panel from its raw
+/// connectivity inputs, so every panel reads *background-poll* and
+/// *connection-degraded* the same way instead of hand-rolling the busy→state
+/// mapping (`mesh_services` grew its own three-arm version).
+///
+/// The mapping, in precedence order:
+///
+/// * **Background poll** (`polling == true`):
+///   * with content already on screen ⇒ [`LoadState::Refreshing { stale: true }`]
+///     — a *non-blocking* refresh (keep the old data, dim it, show the indicator),
+///     never a blank panel;
+///   * with nothing yet ⇒ [`LoadState::Loading`] — the blocking first load.
+/// * **Connection degraded** (`consecutive_failures >= CONNECTION_DEGRADED_AFTER`,
+///   not currently polling): the bus/mesh is unreachable —
+///   * with cached content still on screen ⇒ [`LoadState::Degraded`] (usable, but
+///     stale — flagged);
+///   * with nothing cached ⇒ [`LoadState::Offline`] (no data, waiting to reconnect).
+/// * **Settled**: `has_content` ⇒ [`LoadState::Loaded`]; otherwise
+///   [`LoadState::Idle`].
+///
+/// **Auto-recovery** falls out for free: a panel resets `consecutive_failures` to
+/// `0` on any successful poll, so the very next derivation drops straight back to
+/// `Loaded`/`Idle` — the degraded/offline state clears itself the instant the mesh
+/// answers again, with no separate "recover" path to forget to call. Pure; the
+/// caller owns the counter (bump on a failed poll, clear on success).
+#[must_use]
+pub fn connection_state(polling: bool, has_content: bool, consecutive_failures: u32) -> LoadState {
+    if polling {
+        return if has_content {
+            LoadState::Refreshing { stale: true }
+        } else {
+            LoadState::Loading
+        };
+    }
+    if consecutive_failures >= CONNECTION_DEGRADED_AFTER {
+        return if has_content {
+            LoadState::Degraded
+        } else {
+            LoadState::Offline
+        };
+    }
+    if has_content {
+        LoadState::Loaded
+    } else {
+        LoadState::Idle
+    }
+}
+
+/// MOTION-NET-5 — the **non-blocking** background-activity indicator: a small,
+/// unobtrusive "Updating…" pill shown ONLY while a panel is polling in the
+/// background over content that's already on screen
+/// (`state == Refreshing { stale: true }`). Unlike [`load_state_indicator`] — which
+/// renders the full async-state badge for any state, including the blocking
+/// `Loading` — this surfaces *only* the case the operator must see without being
+/// interrupted: "work is happening, your data is still good". For every other
+/// state it renders an empty zero-size element, so dropping it into a header costs
+/// nothing when the panel isn't doing background work.
+///
+/// The glyph (`↻`) + "Updating…" text carry the meaning without motion or colour
+/// (the a11y contract); the `Info` tint is the secondary cue. The indicator never
+/// blocks: it sits beside the content, which stays visible (dimmed via
+/// [`LoadState::content_alpha`]), rather than replacing it with a spinner.
+pub fn background_activity_indicator<'a, Message: 'a>(
+    state: LoadState,
+    palette: Palette,
+) -> Element<'a, Message> {
+    if state == (LoadState::Refreshing { stale: true }) {
+        status_badge(
+            format!("{} Updating…", LoadState::Refreshing { stale: true }.icon()),
+            badge_severity_for(StateTone::Info),
+            palette,
+        )
+    } else {
+        Space::new()
+            .width(Length::Shrink)
+            .height(Length::Shrink)
+            .into()
+    }
+}
+
 /// MOTION-NET-2 — a layout-matching skeleton placeholder: `rows` greyed Carbon
 /// bars (≈ a data row tall) shown while a panel is `LoadState::Loading`, so a
 /// slow first load never shows a blank area or a bare "Loading…" string. The
@@ -839,6 +925,100 @@ mod tests {
             StateTone::Success,
         ] {
             let _ = badge_severity_for(t);
+        }
+    }
+
+    #[test]
+    fn connection_state_distinguishes_background_poll_from_blocking_first_load() {
+        // MOTION-NET-5 — a poll *with* content on screen is a non-blocking
+        // background refresh (keep the stale data); a poll with nothing yet is the
+        // blocking first load.
+        assert_eq!(
+            connection_state(true, true, 0),
+            LoadState::Refreshing { stale: true },
+            "polling over content ⇒ non-blocking background refresh"
+        );
+        assert_eq!(
+            connection_state(true, false, 0),
+            LoadState::Loading,
+            "polling with no content yet ⇒ blocking first load"
+        );
+        // A poll-in-progress takes precedence over the failure count: while we are
+        // actively retrying, show "refreshing", not "degraded".
+        assert_eq!(
+            connection_state(true, true, 9),
+            LoadState::Refreshing { stale: true },
+            "an in-flight poll outranks a stale failure count"
+        );
+    }
+
+    #[test]
+    fn connection_state_flags_degraded_then_offline_when_the_mesh_is_unreachable() {
+        // MOTION-NET-5 — below the threshold a single blip is absorbed (still
+        // Loaded); at/above it the connection is declared degraded (cached content
+        // kept) or offline (nothing cached to show).
+        assert_eq!(
+            connection_state(false, true, CONNECTION_DEGRADED_AFTER - 1),
+            LoadState::Loaded,
+            "one blip below the threshold doesn't flap to degraded"
+        );
+        assert_eq!(
+            connection_state(false, true, CONNECTION_DEGRADED_AFTER),
+            LoadState::Degraded,
+            "repeated failures with cached content ⇒ degraded (usable, flagged)"
+        );
+        assert_eq!(
+            connection_state(false, false, CONNECTION_DEGRADED_AFTER),
+            LoadState::Offline,
+            "repeated failures with nothing cached ⇒ offline"
+        );
+        // The degraded/offline states both offer a reconnect affordance.
+        assert!(connection_state(false, true, CONNECTION_DEGRADED_AFTER).can_retry());
+        assert!(connection_state(false, false, CONNECTION_DEGRADED_AFTER).can_retry());
+    }
+
+    #[test]
+    fn connection_state_auto_recovers_when_a_poll_succeeds() {
+        // MOTION-NET-5 — the degraded/offline state clears itself the instant the
+        // mesh answers again: a successful poll resets the failure counter to 0, so
+        // the next derivation drops straight back to Loaded/Idle with no separate
+        // "recover" call.
+        let degraded = connection_state(false, true, CONNECTION_DEGRADED_AFTER);
+        assert_eq!(degraded, LoadState::Degraded);
+        // Caller clears the counter on success → auto-recovered.
+        assert_eq!(
+            connection_state(false, true, 0),
+            LoadState::Loaded,
+            "failures reset ⇒ back to Loaded"
+        );
+        assert_eq!(
+            connection_state(false, false, 0),
+            LoadState::Idle,
+            "failures reset, nothing loaded ⇒ Idle"
+        );
+    }
+
+    #[test]
+    fn background_activity_indicator_shows_only_for_a_non_blocking_refresh() {
+        // MOTION-NET-5 — the non-blocking indicator renders for exactly the
+        // background-poll-over-content case and is an empty no-op element for every
+        // other state (so it never blocks or interrupts).
+        let palette = crate::live_theme::palette();
+        // Constructs (and is a real badge) for the one surfaced state…
+        let _: Element<'_, ()> =
+            background_activity_indicator(LoadState::Refreshing { stale: true }, palette);
+        // …and is a harmless empty element for everything else (blocking Loading
+        // included — that's the skeleton/load_state_indicator's job, not this one).
+        for s in [
+            LoadState::Idle,
+            LoadState::Loading,
+            LoadState::Refreshing { stale: false },
+            LoadState::Degraded,
+            LoadState::Offline,
+            LoadState::Failed,
+            LoadState::Loaded,
+        ] {
+            let _: Element<'_, ()> = background_activity_indicator(s, palette);
         }
     }
 
