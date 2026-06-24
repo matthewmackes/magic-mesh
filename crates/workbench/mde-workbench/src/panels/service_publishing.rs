@@ -80,9 +80,23 @@ impl ServicePublishingPanel {
     }
 
     pub fn load() -> Task<crate::Message> {
-        Task::perform(async { fetch_summary() }, |(rows, error)| {
-            crate::Message::ServicePublishing(Message::Loaded { rows, error })
-        })
+        // `fetch_summary` is blocking — it routes through `crate::dbus::action_request`,
+        // which builds its OWN current-thread tokio runtime and `block_on`s it. The iced
+        // `cosmic::executor::Default` is a multi-thread `tokio::runtime::Runtime`, so a
+        // `Task::perform` future runs ON a tokio worker; calling `block_on` there panics
+        // ("Cannot start a runtime from within a runtime"). The panicking task is dropped
+        // by iced and `Loaded` never arrives, so the panel sat permanently empty — no
+        // services, no error (the live-fleet symptom). `spawn_blocking` moves the blocking
+        // work onto the blocking pool (no nested runtime), matching every other panel that
+        // calls these helpers (connectivity / vpn / peers / home).
+        Task::perform(
+            async {
+                tokio::task::spawn_blocking(fetch_summary)
+                    .await
+                    .unwrap_or_else(|_| (Vec::new(), Some("service summary task panicked".into())))
+            },
+            |(rows, error)| crate::Message::ServicePublishing(Message::Loaded { rows, error }),
+        )
     }
 
     pub fn update(&mut self, msg: Message) -> Task<crate::Message> {
@@ -468,6 +482,121 @@ mod tests {
     fn fleet_rows_empty_when_no_peer_has_overlay_ip() {
         let peers = vec![PeerRecord::now("node-c", None, "healthy")];
         assert!(fleet_rows_from_peers(&peers).is_empty());
+    }
+
+    #[test]
+    fn fleet_rows_from_a_real_directory_rpc_reply() {
+        // End-to-end over the REAL wire shape `action/mesh/directory` emits
+        // (the same reply `mackesd peers` builds): parse it with the panel's
+        // directory decoder, then aggregate. A healthy 3-node mesh with overlay
+        // IPs must yield 7 services × 2 enrolled peers (the third has no overlay
+        // IP — not yet enrolled — and is correctly excluded). This is the data the
+        // panel was meant to show but rendered empty in the field, because the
+        // blocking fetch panicked on the iced executor (see the spawn_blocking
+        // contract tests below).
+        let reply = r#"{"ok":true,"head":4,"leader":"eagle-lh-01","peers":[
+            {"hostname":"eagle-lh-01","presence":"online","last_seen_ms":1750000000000,
+             "health":"healthy","mde_version":"11.0.5","overlay_ip":"10.42.0.1",
+             "role":"lighthouse","tags":[],"revision":{"currency":"synced"}},
+            {"hostname":"eagle-node-a","presence":"online","last_seen_ms":1750000000000,
+             "health":"degraded","mde_version":"11.0.5","overlay_ip":"10.42.0.7",
+             "role":"workstation","tags":[],"revision":{"currency":"synced"}},
+            {"hostname":"eagle-joining","presence":"idle","last_seen_ms":1750000000000,
+             "health":"healthy","mde_version":"11.0.5","overlay_ip":"",
+             "role":null,"tags":[],"revision":{"currency":"behind"}}
+        ]}"#;
+        let peers = crate::mesh_directory::parse_directory_peers(reply);
+        assert_eq!(peers.len(), 3, "all 3 directory rows decode");
+        let rows = fleet_rows_from_peers(&peers);
+        // 2 enrolled (have overlay IPs) × 7 canonical services; the un-enrolled
+        // node contributes nothing.
+        assert_eq!(rows.len(), 14);
+        assert!(rows.iter().all(|r| r.node != "eagle-joining"));
+        // The lighthouse + the degraded node both publish (healthy|degraded are
+        // reachable); each carries its own overlay IP.
+        assert!(rows
+            .iter()
+            .filter(|r| r.node == "eagle-lh-01")
+            .all(|r| r.is_publishable && r.overlay_ip.as_deref() == Some("10.42.0.1")));
+        assert!(rows
+            .iter()
+            .filter(|r| r.node == "eagle-node-a")
+            .all(|r| r.is_publishable && r.overlay_ip.as_deref() == Some("10.42.0.7")));
+        // Sorted by node, canonical service order within each.
+        assert_eq!(rows[0].node, "eagle-lh-01");
+        assert_eq!(rows[0].id, "ssh");
+    }
+
+    #[test]
+    fn load_returns_a_task_without_constructing_eagerly() {
+        // `load()` must only BUILD a Task — the blocking `fetch_summary` work runs
+        // later on the blocking pool, never inline here.
+        let _task = ServicePublishingPanel::load();
+    }
+
+    // The field bug: `load()` did `Task::perform(async { fetch_summary() })`. The
+    // iced `cosmic::executor::Default` is a multi-thread `tokio::runtime::Runtime`,
+    // so that future runs ON a runtime worker — and `fetch_summary` builds a private
+    // current-thread runtime + `block_on`s it (via `crate::dbus::action_request`),
+    // which PANICS ("Cannot start a runtime from within a runtime") on a worker
+    // thread. The panicking task is dropped, `Loaded` never arrives, and the panel
+    // sat permanently empty. The tests below pin the contract: the blocking
+    // aggregation MUST ride `spawn_blocking`, which is panic-free on a worker.
+
+    /// Serialize the `MDE_BUS_ROOT` env override below — `set_var` is
+    /// process-global and `cargo test` runs the suite multi-threaded, so without
+    /// this another test reading `client_data_dir()` could observe the override.
+    static BUS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nested_current_thread_block_on_panics_on_a_runtime_worker() {
+        // The OLD bug shape, distilled: building a current-thread runtime and
+        // `block_on`-ing it inside a future SPAWNED on the multi-thread runtime
+        // panics — exactly what `fetch_summary`'s `crate::dbus::action_request`
+        // does, and what `Task::perform(async { fetch_summary() })` triggered. This
+        // is reliable regardless of env because it builds the runtime
+        // unconditionally (it doesn't depend on a bus spool being present).
+        let joined = tokio::spawn(async {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async { 1 })
+        })
+        .await;
+        assert!(
+            joined.is_err() && joined.unwrap_err().is_panic(),
+            "the old bare-Task::perform shape panics on a runtime worker"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_fetch_summary_via_spawn_blocking_is_panic_free_on_a_worker() {
+        // Drives the REAL `load()` path on a multi-thread runtime (the iced
+        // executor's shape): `spawn_blocking(fetch_summary)` →
+        // `mesh_directory::fetch_peers` → `dbus::action_request`, which builds a
+        // current-thread runtime + `block_on`. On a bare worker that nested runtime
+        // panics; `spawn_blocking` moves it to the blocking pool, where it's legal.
+        // If a future edit drops the `spawn_blocking` wrapper, this test panics.
+        //
+        // Point the bus at an empty temp spool so there's no responder: the request
+        // times out → None → `fetch_summary` returns (empty rows, an honest error),
+        // deterministically and without touching the ambient /run/mde-bus spool.
+        let _guard = BUS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("MDE_BUS_ROOT", tmp.path());
+
+        let joined = tokio::task::spawn_blocking(fetch_summary).await;
+
+        std::env::remove_var("MDE_BUS_ROOT");
+        drop(_guard);
+
+        let (rows, error) =
+            joined.expect("spawn_blocking(fetch_summary) must not panic on a worker");
+        // No responder on the temp spool → an honest empty-with-error, never a
+        // crash. Asserting the shape (not the exact text) keeps the contract.
+        assert!(rows.is_empty(), "no responder → no service rows");
+        assert!(error.is_some(), "no responder → an honest error message");
     }
 
     #[test]
