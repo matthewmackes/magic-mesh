@@ -48,6 +48,9 @@ pub mod files;
 pub mod fleet;
 pub mod jobs;
 pub mod route;
+// VPN-GW-2 — leader-managed, age-encrypted tunnel-secret distribution over the
+// mesh secret store; consumed by vpn_gw on add-tunnel (put) + tunnel-up (get).
+pub mod secret_store;
 // VPN-GW-1 — action/vpn/* tunnel CRUD + wg-quick/openvpn bring-up responder.
 pub mod vpn_gw;
 // NF-Bundle-0 (v2.5) — dev.mackes.MDE.Nebula.Status surface.

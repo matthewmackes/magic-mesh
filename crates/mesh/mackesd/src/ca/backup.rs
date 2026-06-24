@@ -170,6 +170,21 @@ impl From<BackupError> for CaError {
 ///
 /// Per [`BackupError`].
 pub fn seal(passphrase: &str, plaintext: &BundlePlaintext) -> Result<Vec<u8>, BackupError> {
+    let json = serde_json::to_vec(plaintext).map_err(|e| BackupError::Json(e.to_string()))?;
+    seal_bytes(passphrase, &json)
+}
+
+/// Encrypt an arbitrary byte payload under the same versioned envelope [`seal`]
+/// uses (magic + version + salt + nonce + ciphertext).
+///
+/// Exposed so other passphrase-sealed-blob callers (e.g. the VPN secret store's
+/// local-AEAD fallback) reuse the one audited Argon2id + XChaCha20-Poly1305 path
+/// rather than re-rolling AEAD. [`seal`] is this over the bundle JSON.
+///
+/// # Errors
+///
+/// Per [`BackupError`] (empty passphrase, KDF, or AEAD failure).
+pub fn seal_bytes(passphrase: &str, plaintext: &[u8]) -> Result<Vec<u8>, BackupError> {
     if passphrase.is_empty() {
         return Err(BackupError::EmptyPassphrase);
     }
@@ -179,8 +194,7 @@ pub fn seal(passphrase: &str, plaintext: &BundlePlaintext) -> Result<Vec<u8>, Ba
     rand::thread_rng().fill_bytes(&mut nonce);
 
     let key = derive_key(passphrase.as_bytes(), &salt)?;
-    let json = serde_json::to_vec(plaintext).map_err(|e| BackupError::Json(e.to_string()))?;
-    let ciphertext = aead_seal(&key, &nonce, &json)?;
+    let ciphertext = aead_seal(&key, &nonce, plaintext)?;
 
     let mut out = Vec::with_capacity(HEADER_LEN + ciphertext.len());
     out.extend_from_slice(BUNDLE_MAGIC);
@@ -202,6 +216,25 @@ pub fn seal(passphrase: &str, plaintext: &BundlePlaintext) -> Result<Vec<u8>, Ba
 /// error is indistinguishable, and exposing the distinction
 /// would help an attacker confirm a tamper attempt).
 pub fn unseal(passphrase: &str, sealed: &[u8]) -> Result<BundlePlaintext, BackupError> {
+    let plain_bytes = unseal_bytes(passphrase, sealed)?;
+    serde_json::from_slice(&plain_bytes).map_err(|e| BackupError::Json(e.to_string()))
+}
+
+/// Decrypt a payload sealed by [`seal_bytes`], returning the raw
+/// plaintext bytes. Inverse of [`seal_bytes`]; [`unseal`] is this
+/// plus a bundle-JSON deserialize.
+///
+/// # Errors
+///
+/// Per [`BackupError`]. Wrong passphrase + tampered ciphertext
+/// both surface as `Aead` (intentional — see [`unseal`]).
+///
+/// # Panics
+///
+/// Never in practice: the salt/nonce fixed-slice conversions are
+/// guarded by the `sealed.len() >= HEADER_LEN` check above, so the
+/// `try_into` always has exactly the bytes it needs.
+pub fn unseal_bytes(passphrase: &str, sealed: &[u8]) -> Result<Vec<u8>, BackupError> {
     if passphrase.is_empty() {
         return Err(BackupError::EmptyPassphrase);
     }
@@ -228,8 +261,7 @@ pub fn unseal(passphrase: &str, sealed: &[u8]) -> Result<BundlePlaintext, Backup
     let ciphertext = &sealed[HEADER_LEN..];
 
     let key = derive_key(passphrase.as_bytes(), &salt)?;
-    let plain_bytes = aead_unseal(&key, &nonce, ciphertext)?;
-    serde_json::from_slice(&plain_bytes).map_err(|e| BackupError::Json(e.to_string()))
+    aead_unseal(&key, &nonce, ciphertext)
 }
 
 /// ASCII-armor a binary bundle for sneakernet-friendly transport

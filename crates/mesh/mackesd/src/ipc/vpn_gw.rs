@@ -2,10 +2,15 @@
 //! `openvpn` (design: `docs/design/vpn-gateway.md`).
 //!
 //! CRUD on the per-node [`mackes_mesh_types::vpn::VpnConfig`] (TOML on the shared
-//! substrate) + best-effort bring-up/down via the pure argv builders. The
-//! secret-material distribution (age creds → `/etc/wireguard/<ifname>.conf`) is
-//! VPN-GW-3; here `tunnel-up` spawns `wg-quick`/`openvpn` and reports the result,
-//! so it works once the config is present + is honest ("config missing") when not.
+//! substrate) + best-effort bring-up/down via the pure argv builders.
+//!
+//! VPN-GW-2 — secret distribution: on `setup-provider` a tunnel's secret material
+//! (the rendered `.conf`/`.ovpn`, which carries the private key) is age-encrypted
+//! into the replicated secret store (`crate::ipc::secret_store`) keyed by
+//! `creds_ref`; on `tunnel-up` every enrolled node resolves `creds_ref`, reads +
+//! decrypts the secret, and materializes `/etc/wireguard/<ifname>.conf` (or the
+//! `.ovpn`) where `wg-quick`/`openvpn` reads it — then spawns. Honest until the
+//! secret is distributed ("secret distribution pending"), never a fake success.
 //!
 //! VPN-GW-3 — selective egress: after a successful tunnel-up [`bring`] applies
 //! the [`EgressPlan`] (fwmark/ip-rule policy routing + an nftables masquerade,
@@ -29,6 +34,8 @@ use mackes_mesh_types::vpn_providers::{
     self, AdapterError, ProducedTunnel, Provider, SecretKind, WgSetup,
 };
 
+use crate::ipc::secret_store::{self, SecretStore};
+
 /// The VPN responder — rooted at the shared workgroup root (the config home).
 #[derive(Debug, Clone)]
 pub struct VpnService {
@@ -36,15 +43,21 @@ pub struct VpnService {
     /// `wg-quick`/`openvpn`/`ip` binaries are spawned by default; tests set the
     /// flag false to exercise the pure CRUD without the system tools.
     spawn: bool,
+    /// VPN-GW-2 — the secret store used to distribute/resolve tunnel secrets.
+    /// `None` selects the runtime default ([`SecretStore::resolve`]) lazily; a
+    /// test injects a `LocalAead` store over a tempdir so the secret-distribution
+    /// path runs with real crypto and no etcd/age CLI.
+    store: Option<SecretStore>,
 }
 
 impl VpnService {
     /// Build the service rooted at the shared workgroup root.
     #[must_use]
-    pub fn new(workgroup_root: PathBuf) -> Self {
+    pub const fn new(workgroup_root: PathBuf) -> Self {
         Self {
             workgroup_root,
             spawn: true,
+            store: None,
         }
     }
 
@@ -53,6 +66,26 @@ impl VpnService {
     pub fn without_spawn(mut self) -> Self {
         self.spawn = false;
         self
+    }
+
+    /// Inject the secret store (tests). Production resolves it lazily from the
+    /// deployed repo root + workgroup root via [`VpnService::secret_store`].
+    #[must_use]
+    pub fn with_store(mut self, store: SecretStore) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// The secret store for this node: the injected one, else the runtime
+    /// default (the mesh `age`+etcd store when its helper is found under the
+    /// deployed repo root, else the local-AEAD fallback under the workgroup
+    /// root). Anchored on [`secret_store::repo_root`] (`MCNF_REPO`), NOT the
+    /// process cwd — the daemon's systemd unit runs with cwd `/`.
+    fn secret_store(&self) -> SecretStore {
+        if let Some(s) = &self.store {
+            return s.clone();
+        }
+        SecretStore::resolve(&secret_store::repo_root(), &self.workgroup_root)
     }
 }
 
@@ -69,16 +102,56 @@ pub const ACTION_VERBS: [&str; 8] = [
     "setup-provider",
 ];
 
-/// Where a produced tunnel's secret material lands on the node before bring-up.
-/// VPN-GW-2/3 will age-encrypt + leader-distribute this; until then it's written
-/// locally so a single-node setup works end-to-end. WireGuard configs go to the
-/// `wg-quick` config dir; `.ovpn` to the openvpn client dir.
+/// Where a tunnel's DECRYPTED config lands on the node just before bring-up, for
+/// the bring-up tool to read. Materialized by [`materialize_secret`] from the
+/// age-encrypted secret store (VPN-GW-2). `WireGuard` configs go to the `wg-quick`
+/// config dir; `.ovpn` to the `openvpn` client dir.
 #[must_use]
 fn secret_path(kind: SecretKind, ifname: &str) -> PathBuf {
     match kind {
         SecretKind::WgQuick => PathBuf::from(format!("/etc/wireguard/{ifname}.conf")),
         SecretKind::Ovpn => PathBuf::from(format!("/etc/openvpn/client/{ifname}.ovpn")),
     }
+}
+
+/// VPN-GW-2 — materialize a tunnel's decrypted config where the bring-up tool
+/// reads it (`/etc/wireguard/<ifname>.conf` or `/etc/openvpn/client/<ifname>.ovpn`),
+/// by resolving its secret from the age-encrypted store and writing it 0600.
+///
+/// Resolution order for the store key:
+///   1. `t.creds_ref` if the durable def carries one (set when the tunnel was set
+///      up), else
+///   2. the derived `vpn/<ifname>` key (a tunnel added before distribution, or
+///      one whose def predates `creds_ref` being populated).
+///
+/// Returns `Ok(())` once the config is on disk; an `Err(detail)` carrying an
+/// HONEST reason otherwise:
+///   * "secret distribution pending" when the secret simply isn't in the store
+///     yet (it wasn't distributed / this node hasn't synced it),
+///   * a store / decrypt / write error string for a real fault.
+fn materialize_secret(svc: &VpnService, t: &TunnelDef, kind: SecretKind) -> Result<(), String> {
+    let ifname = t.ifname();
+    let store = svc.secret_store();
+    let key = if t.creds_ref.trim().is_empty() {
+        secret_store::creds_ref_for(&ifname)
+    } else {
+        t.creds_ref.trim().to_string()
+    };
+    let body = match store.get(&key) {
+        Ok(Some(body)) => body,
+        Ok(None) => {
+            return Err(format!(
+                "{} config missing: secret '{key}' not in store (secret distribution pending)",
+                match kind {
+                    SecretKind::WgQuick => "wireguard",
+                    SecretKind::Ovpn => "openvpn",
+                }
+            ));
+        }
+        Err(e) => return Err(format!("secret store read '{key}': {e}")),
+    };
+    let path = secret_path(kind, &ifname);
+    write_secret(&path, &body).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// Responder poll interval.
@@ -188,23 +261,31 @@ fn bring(svc: &VpnService, t: &TunnelDef, up: bool) -> (bool, String) {
     if !svc.spawn {
         return (false, "spawn disabled".into());
     }
+    let ifname = t.ifname();
     let argv = match t.method {
-        Method::Wg => vpn::wg_quick_argv(t, up),
+        Method::Wg => {
+            if up {
+                // VPN-GW-2 — materialize `/etc/wireguard/<ifname>.conf` from the
+                // age-encrypted secret store before `wg-quick up` reads it.
+                // Honest "secret distribution pending" when it isn't distributed.
+                if let Err(detail) = materialize_secret(svc, t, SecretKind::WgQuick) {
+                    return (false, detail);
+                }
+            }
+            vpn::wg_quick_argv(t, up)
+        }
         Method::Ovpn => {
             if !up {
                 // OpenVPN down = kill the daemon for this dev (best-effort).
-                vec!["pkill".into(), "-f".into(), format!("--dev {}", t.ifname())]
+                vec!["pkill".into(), "-f".into(), format!("--dev {ifname}")]
             } else {
-                // The decrypted .ovpn lands here once the secret store (VPN-GW-3)
-                // distributes it; honest until then.
-                let cfg = format!("/etc/openvpn/client/{}.ovpn", t.ifname());
-                if !std::path::Path::new(&cfg).exists() {
-                    return (
-                        false,
-                        format!("openvpn config missing: {cfg} (secret distribution pending)"),
-                    );
+                // VPN-GW-2 — materialize the decrypted `.ovpn` from the secret
+                // store, then hand it to `openvpn`. Honest until distributed.
+                let cfg = secret_path(SecretKind::Ovpn, &ifname);
+                if let Err(detail) = materialize_secret(svc, t, SecretKind::Ovpn) {
+                    return (false, detail);
                 }
-                vpn::openvpn_argv(t, &cfg)
+                vpn::openvpn_argv(t, &cfg.to_string_lossy())
             }
         }
         Method::Cli | Method::Api => {
@@ -405,28 +486,39 @@ fn setup_provider(svc: &VpnService, req_body: Option<&str>) -> String {
         vpn_providers::build_wg(provider, &setup)
     };
 
-    let produced = match produced {
+    let mut produced = match produced {
         Ok(p) => p,
         Err(e) => return err(format!("setup-provider: {e}")),
     };
 
     let ifname = produced.def.ifname();
-    // Write the secret material where bring-up reads it (single-node path; the
-    // leader-managed age distribution is VPN-GW-2/3). Best-effort — honest on a
-    // write failure rather than silently claiming success.
-    let mut wrote_secret = false;
+
+    // VPN-GW-2 — age-encrypted secret distribution. The secret material (the
+    // rendered `.conf`/`.ovpn`, which carries the private key) is age-encrypted
+    // into the secret store keyed by `creds_ref`, so every enrolled node resolves
+    // it at bring-up — never inlined into the durable def. The `creds_ref` (a
+    // deterministic `vpn/<ifname>` key) is set on the def so it round-trips in
+    // config regardless of which node holds the plaintext.
+    //
+    // The node handling this request is the ONLY one with the secret plaintext,
+    // so it MUST write the store — gating the write on leadership would simply
+    // lose the secret on a non-leader / single-node box (nothing else can ever
+    // re-derive it). With the replicated mesh store a redundant write is
+    // idempotent, so every enrolled node reads the same `creds_ref`.
+    let creds_ref = secret_store::creds_ref_for(&ifname);
+    produced.def.creds_ref.clone_from(&creds_ref);
+
+    let mut distributed = false;
     let mut secret_note = String::new();
-    if svc.spawn {
-        let path = secret_path(produced.secret_kind, &ifname);
-        match write_secret(&path, &produced.secret) {
-            Ok(()) => wrote_secret = true,
-            Err(e) => secret_note = format!("secret not written ({}): {e}", path.display()),
-        }
-    } else {
-        secret_note = "spawn disabled — secret not written".into();
+    match svc.secret_store().put(&creds_ref, &produced.secret) {
+        Ok(()) => distributed = true,
+        // Honest: the store was unreachable. The def still persists (with its
+        // creds_ref); bring-up will report "distribution pending".
+        Err(e) => secret_note = format!("secret not distributed: {e}"),
     }
 
-    // Persist the durable def (no secret material) into the node's VPN config.
+    // Persist the durable def (no secret material, only `creds_ref`) into the
+    // node's VPN config.
     let root = svc.workgroup_root.as_path();
     let mut cfg = vpn::load(root);
     cfg.upsert(produced.def.clone());
@@ -445,7 +537,11 @@ fn setup_provider(svc: &VpnService, req_body: Option<&str>) -> String {
             Method::Cli => "cli",
             Method::Api => "api",
         },
-        "secret_written": wrote_secret,
+        // VPN-GW-2: the durable creds reference + whether the secret was
+        // age-encrypted into the store on this request (so enrolled nodes can
+        // read it at bring-up).
+        "creds_ref": creds_ref,
+        "secret_distributed": distributed,
         "secret_note": secret_note,
         // The daemon-side verifier curls this THROUGH the tunnel to confirm the
         // exit IP is the provider's (live verification needs a real account).
@@ -604,8 +700,14 @@ mod tests {
         // Each tunnel gets its own interface, fwmark, and routing table.
         assert_eq!(p_first.ifname, "mvpn-first");
         assert_eq!(p_second.ifname, "mvpn-second");
-        assert_ne!(p_first.fwmark, p_second.fwmark, "tunnels must not share a mark");
-        assert_ne!(p_first.table, p_second.table, "tunnels must not share a table");
+        assert_ne!(
+            p_first.fwmark, p_second.fwmark,
+            "tunnels must not share a mark"
+        );
+        assert_ne!(
+            p_first.table, p_second.table,
+            "tunnels must not share a table"
+        );
 
         // The mark is a function of the interface, NOT the config position:
         // remove the FIRST tunnel (so "second" shifts from index 1 → 0) and
@@ -653,7 +755,9 @@ mod tests {
         let cfg = vpn::load(s.workgroup_root.as_path());
         let p = egress_plan(&s, cfg.get("k").unwrap());
         let up = p.up_argv();
-        assert!(up.iter().any(|c| c[0] == "ip" && c.contains(&"rule".to_string())));
+        assert!(up
+            .iter()
+            .any(|c| c[0] == "ip" && c.contains(&"rule".to_string())));
         assert!(up
             .iter()
             .any(|c| c[0] == "ip" && c.contains(&"route".to_string())));
@@ -667,11 +771,12 @@ mod tests {
         assert!(down
             .iter()
             .any(|c| c[0] == "nft" && c.contains(&"delete".to_string())));
-        assert!(down
-            .iter()
-            .filter(|c| c[0] == "ip" && c.contains(&"del".to_string()))
-            .count()
-            >= 2);
+        assert!(
+            down.iter()
+                .filter(|c| c[0] == "ip" && c.contains(&"del".to_string()))
+                .count()
+                >= 2
+        );
     }
 
     // ── VPN-GW-5: provider adapters reachable from the vpn responder ──
@@ -708,7 +813,17 @@ mod tests {
 
     #[test]
     fn setup_provider_wg_persists_tunnel_and_reports_exit_check() {
-        let (_t, s) = svc(); // spawn disabled → no secret write attempted
+        // Inject a real-AEAD store over a tempdir so the distribution `put` is
+        // deterministic (independent of the host's MCNF_REPO / age key).
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("mcnf-age-key");
+        std::fs::write(&key_path, "AGE-SECRET-KEY-1PERSISTSTESTZZZ\n").unwrap();
+        let s = VpnService::new(tmp.path().to_path_buf())
+            .without_spawn()
+            .with_store(SecretStore::LocalAead {
+                dir: tmp.path().join("secrets"),
+                key_path,
+            });
         let body = json!({
             "provider": "mullvad",
             "id": "mullvad1",
@@ -727,15 +842,135 @@ mod tests {
         assert_eq!(v["ifname"], "mvpn-mullvad1");
         assert_eq!(v["method"], "wg");
         assert_eq!(v["exit_check"], "https://am.i.mullvad.net/json");
-        // spawn disabled → secret intentionally not written, reported honestly.
-        assert_eq!(v["secret_written"], serde_json::Value::Bool(false));
-        // The durable def landed in the config (and carries NO secret).
+        // The handling node (it holds the plaintext) writes the secret to its
+        // store regardless of leadership — so distribution succeeds here.
+        assert_eq!(
+            v["secret_distributed"],
+            serde_json::Value::Bool(true),
+            "{r}"
+        );
+        // The durable def carries the deterministic creds_ref (not the secret).
+        assert_eq!(v["creds_ref"], "vpn/mvpn-mullvad1");
+        // The durable def landed in the config (and carries NO secret material).
         let list = build_reply(&s, "list-tunnels", None);
         assert!(list.contains("mullvad1"), "{list}");
         assert!(
             !list.contains(PK),
             "private key must not be in the durable config: {list}"
         );
+        // The creds_ref IS in the durable config (so bring-up can resolve it).
+        assert!(list.contains("vpn/mvpn-mullvad1"), "{list}");
+        // The secret round-trips out of the store decrypted (real distribution).
+        let got = s.secret_store().get("vpn/mvpn-mullvad1").unwrap().unwrap();
+        assert!(got.contains(&format!("PrivateKey = {PK}")), "{got}");
+    }
+
+    // ── VPN-GW-2: secret distribution + materialized bring-up ──
+
+    /// A service whose secret store is a real-AEAD local store over a tempdir, so
+    /// the distribution `put` + the bring-up `get` exercise real crypto with no
+    /// etcd/age CLI. The returned dir keeps the workgroup root + store alive.
+    fn svc_with_store() -> (tempfile::TempDir, VpnService) {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("mcnf-age-key");
+        std::fs::write(
+            &key_path,
+            "AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQSXKLP0E\n",
+        )
+        .unwrap();
+        let store = SecretStore::LocalAead {
+            dir: tmp.path().join("secrets"),
+            key_path,
+        };
+        let s = VpnService::new(tmp.path().to_path_buf()).with_store(store);
+        (tmp, s)
+    }
+
+    #[test]
+    fn secret_round_trip_distribute_then_materialize_on_up() {
+        let (_t, s) = svc_with_store();
+        // setup-provider age-encrypts the secret into the store.
+        let body = json!({
+            "provider": "mullvad",
+            "id": "mullvad1",
+            "server": "us-nyc",
+            "private_key": PK,
+            "peer_public_key": PUB,
+            "address": "10.64.0.2/32",
+            "endpoint": "us-nyc-wg-301.relays.example",
+            "dns": "10.64.0.1",
+        })
+        .to_string();
+        let r = build_reply(&s, "setup-provider", Some(&body));
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{r}");
+        // The secret really was age-encrypted + distributed.
+        assert_eq!(
+            v["secret_distributed"],
+            serde_json::Value::Bool(true),
+            "{r}"
+        );
+        assert_eq!(v["creds_ref"], "vpn/mvpn-mullvad1");
+
+        // The store now holds the ENCRYPTED secret (not plaintext) and decrypts
+        // back to the rendered wg-quick config.
+        let got = s
+            .secret_store()
+            .get("vpn/mvpn-mullvad1")
+            .unwrap()
+            .expect("secret distributed");
+        assert!(got.contains("[Interface]"));
+        assert!(got.contains(&format!("PrivateKey = {PK}")));
+
+        // tunnel-up resolves the SAME distributed body via the def's creds_ref,
+        // which materialize_secret then writes where wg-quick reads it. (We read
+        // the store body directly rather than spawn the real `wg-quick`, which
+        // would mutate the host; the path-write is covered by write_secret.)
+        let t = vpn::load(s.workgroup_root.as_path())
+            .get("mullvad1")
+            .cloned()
+            .unwrap();
+        let resolved = s
+            .secret_store()
+            .get(&t.creds_ref)
+            .unwrap()
+            .expect("creds_ref resolves");
+        assert_eq!(
+            resolved, got,
+            "tunnel-up resolves the same distributed body"
+        );
+        assert!(resolved.contains("AllowedIPs = 0.0.0.0/0, ::/0"));
+    }
+
+    #[test]
+    fn tunnel_up_honest_pending_when_secret_not_distributed() {
+        // A follower-shaped service (bare svc, no leader lease) that set up a
+        // tunnel: creds_ref is set but no node distributed the secret. With a
+        // spawn-enabled service whose store has no entry, materialize must
+        // report the honest "distribution pending", NOT spawn / fake-succeed.
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("mcnf-age-key");
+        std::fs::write(&key_path, "AGE-SECRET-KEY-1EMPTYSTOREZZZ\n").unwrap();
+        let store = SecretStore::LocalAead {
+            dir: tmp.path().join("secrets"),
+            key_path,
+        };
+        let s = VpnService::new(tmp.path().to_path_buf()).with_store(store);
+        // A tunnel with a creds_ref but nothing in the store.
+        let t = TunnelDef {
+            id: "mullvad1".into(),
+            provider: "mullvad".into(),
+            method: Method::Wg,
+            server: "us-nyc".into(),
+            protocol: "udp".into(),
+            creds_ref: "vpn/mvpn-mullvad1".into(),
+        };
+        let detail = materialize_secret(&s, &t, SecretKind::WgQuick).unwrap_err();
+        assert!(
+            detail.contains("secret distribution pending"),
+            "expected honest pending, got: {detail}"
+        );
+        assert!(detail.contains("vpn/mvpn-mullvad1"), "{detail}");
     }
 
     #[test]
