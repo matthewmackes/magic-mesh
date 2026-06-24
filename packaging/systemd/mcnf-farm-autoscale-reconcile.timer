@@ -1,0 +1,15 @@
+# Drives mcnf-farm-autoscale-reconcile.service — reconcile the elastic farm's
+# per-dom0 VM shapes to live build demand every 5 min (and shortly after boot).
+# Idempotent + hysteresis-debounced (FA-4), so it's quiet/cheap when demand is
+# steady. Faster than the @farm build reconciler's 15 min because shape decisions
+# (and the gated apply) want to track demand more tightly than build dispatch.
+[Unit]
+Description=MCNF FARM-AUTOSCALE reconciler timer
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
