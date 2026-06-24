@@ -10,6 +10,15 @@
 #     [ ] open · [>] in-progress · [✓] done · [!] blocked
 # Only OPEN + IN-PROGRESS tasks yield ACTIVE jobs (done/blocked are skipped).
 #
+# A @farm:{…} payload counts as a REAL build job ONLY when its command is an actual
+# build command — i.e. it begins with `cargo ` (cargo build/test/clippy/generate-rpm
+# …). Documentation-only payloads that happen to use the @farm:{…} syntax are NOT
+# commands and contribute ZERO demand:
+#     @farm:{crate,verify}  — a TEMPLATE describing the tag format (not a command)
+#     @farm:{…}             — a literal ellipsis placeholder
+# is_build_command() (below) is the single gate; the parser drops anything it rejects
+# so the demand count reflects only genuine `cargo …` work.
+#
 # Output (one job per line, tab-separated, stable job id = sha1 of status-blind
 # key so a re-run of the same task+command is the same job):
 #     <jobid>\t<status>\t<task_id>\t<command>
@@ -23,6 +32,21 @@ set -uo pipefail
 WORKLIST="${MCNF_WORKLIST:-$(cd "$(dirname "$0")/../.." && pwd)/docs/WORKLIST.md}"
 
 jobid() { printf '%s\037%s' "$1" "$2" | sha1sum | cut -c1-12; }
+
+# is_build_command <payload> — PURE: true iff the @farm:{…} payload is a real build
+# command (begins with `cargo ` after trimming leading whitespace). Rejects template/
+# placeholder payloads like `crate,verify`, `…`, `...`, or anything not starting with
+# the `cargo` build verb, so documentation that reuses the @farm:{…} syntax never
+# inflates the queue. Tab/space leading whitespace is trimmed before the check.
+is_build_command() {
+  local c="$1"
+  # Trim leading whitespace (spaces/tabs) so `@farm:{ cargo … }` still counts.
+  c="${c#"${c%%[![:space:]]*}"}"
+  case "$c" in
+    cargo' '*) return 0 ;;   # `cargo build/test/clippy/generate-rpm …` — a real job
+    *)         return 1 ;;   # template / placeholder / non-build payload — 0 demand
+  esac
+}
 
 # Parse: emit "<jobid>\t<status>\t<task_id>\t<command>" for every @farm:{…}.
 parse() {
@@ -47,15 +71,45 @@ parse() {
       rest="${rest#*@farm:\{}"
       local cmd="${rest%%\}*}"
       rest="${rest#*\}}"
-      [ -n "$cmd" ] && printf '%s\t%s\t%s\t%s\n' "$(jobid "$task_id" "$cmd")" "$status" "$task_id" "$cmd"
+      # Count ONLY real build commands (cargo …); drop template/placeholder payloads
+      # (crate,verify / … ) so documentation never inflates demand.
+      is_build_command "$cmd" || continue
+      printf '%s\t%s\t%s\t%s\n' "$(jobid "$task_id" "$cmd")" "$status" "$task_id" "$cmd"
     done
   done < "$WORKLIST"
+}
+
+# --self-test — pure-function assertions for the build-command gate (no worklist I/O).
+self_test() {
+  local fails=0
+  check() { # check <label> <got> <want>
+    if [ "$2" = "$3" ]; then echo "  ok: $1"
+    else echo "  FAIL: $1 — got '$2' want '$3'" >&2; fails=$((fails + 1)); fi
+  }
+  bc() { is_build_command "$1" && echo yes || echo no; }   # build-command? yes/no
+  echo "farm-jobs --self-test:"
+  # Real build commands → counted.
+  check "cargo build -p → yes"     "$(bc 'cargo build -p mde-bus')" yes
+  check "cargo test -p → yes"      "$(bc 'cargo test -p mde-theme')" yes
+  check "cargo clippy → yes"       "$(bc 'cargo clippy --workspace')" yes
+  check "cargo generate-rpm → yes" "$(bc 'cargo generate-rpm -p crates/mesh/mackesd')" yes
+  check "leading space + cargo → yes" "$(bc '  cargo build -p x')" yes
+  # Template / placeholder / non-build payloads → NOT counted.
+  check "crate,verify template → no" "$(bc 'crate,verify')" no
+  check "ellipsis … placeholder → no" "$(bc '…')" no
+  check "ascii ... placeholder → no"  "$(bc '...')" no
+  check "empty payload → no"          "$(bc '')" no
+  check "non-cargo verb → no"         "$(bc 'make all')" no
+  check "cargo-prefixed non-word → no" "$(bc 'cargofoo build')" no
+  if [ "$fails" -eq 0 ]; then echo "farm-jobs: self-test passed"; return 0; fi
+  echo "farm-jobs: SELF-TEST FAILED ($fails)" >&2; return 1
 }
 
 case "${1:-active}" in
   list)   parse ;;
   active) parse | awk -F'\t' '$2=="open"||$2=="prog"' ;;
   jobid)  jobid "${2:?task}" "${3:?cmd}" ;;
+  --self-test) self_test ;;
   -h|--help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//' ;;
-  *) echo "usage: farm-jobs.sh list|active|jobid <task> <cmd>" >&2; exit 1 ;;
+  *) echo "usage: farm-jobs.sh list|active|jobid <task> <cmd>|--self-test" >&2; exit 1 ;;
 esac

@@ -81,6 +81,11 @@
 #      FA_NO_SLOTS (set to skip the per-VM in-flight-slot probe — offline/tests),
 #      MCNF_TOOLCHAIN_PLAYBOOK (default <repo>/infra/ansible/build-vm-toolchain.yml —
 #        the build-ready provisioning playbook; overridable for tests).
+#      OVERCOMMIT GUARD (safe hybrid mode): FA_BUILD_MEM_GIB (default 4) +
+#        FA_BUILD_VCPUS (default 4) size the elastic burst VMs FIT-TO-HEADROOM so they
+#        coexist with each dom0's always-on baseline VM rather than overcommitting it;
+#        FA_MAX_SMALL defaults to 1 HERE (one elastic VM per dom0). Full-elastic (big
+#        shapes) is the operator-driven alternative AFTER decommissioning the baselines.
 #      Autoscaler tunables (FA_MAX_SMALL/FA_DWELL_SECS/FA_POD_BUDGET) pass through.
 set -euo pipefail
 
@@ -99,6 +104,48 @@ BUILD_USER="${MCNF_BUILD_USER:-mm}"
 KEY="${MCNF_FARM_KEY:-$HOME/.ssh/mackes_mesh_ed25519}"
 PROBE_TIMEOUT="${FA_PROBE_TIMEOUT:-4}"
 APPLY="${FA_APPLY:-0}"
+
+# --- OVERCOMMIT GUARD (safe hybrid mode) -------------------------------------
+# The three dom0s each already run an ALWAYS-ON baseline build VM (16-24 GiB) with
+# only a few GiB of headroom. tofu's default elastic VM is build_memory_gib=16 — so
+# provisioning an elastic burst VM at 16 GiB (let alone several per dom0) would
+# OVERCOMMIT the dom0 and the new VM would fail to boot. To make FA_APPLY=1 safe we
+# bound the burst to FIT the headroom:
+#   - fit-to-headroom SIZE: TF_VAR_build_memory_gib / TF_VAR_build_vcpus are EXPORTED
+#     so EVERY tofu invocation this tick — the autoscaler's `tofu plan` AND the
+#     reconciler's `tofu apply` — sizes elastic VMs the same, small enough to coexist
+#     with the always-on baseline (defaults 4 GiB / 4 vCPU; override via
+#     FA_BUILD_MEM_GIB / FA_BUILD_VCPUS). Exporting (vs a one-shot `-var` on apply
+#     only) keeps PLAN and APPLY in agreement so the preview an operator gates on
+#     matches what apply lands.
+#   - bounded COUNT: FA_MAX_SMALL defaults to 1 HERE (the reconciler caps the
+#     autoscaler at one small VM per dom0), so a burst is exactly one fit-sized
+#     elastic VM per dom0 ALONGSIDE the always-on baseline — never multiple.
+# This is the SAFE HYBRID MODE: always-on baseline + bounded elastic burst. The
+# full-elastic migration (decommission the always-on VMs, then run big shapes) is
+# the operator-driven alternative — see the apply step's note. Operators raise these
+# only after confirming real dom0 headroom.
+#
+# fa_posint <value> <default> — echo <value> if it is a positive integer, else WARN
+# and fall back to <default>. Guards an operator override (FA_BUILD_MEM_GIB=64, a
+# typo, or "") from passing a bad/unsafe size straight into tofu — a non-integer
+# would fail the apply, and a silently-huge value would defeat the guard's purpose.
+fa_posint() {
+  case "$1" in
+    '' | *[!0-9]* ) echo "==> farm-reconciler: ignoring non-positive-integer override '$1' — using default $2" >&2; echo "$2" ;;
+    0 )             echo "==> farm-reconciler: ignoring zero override — using default $2" >&2; echo "$2" ;;
+    * )             echo "$1" ;;
+  esac
+}
+BUILD_MEM_GIB="$(fa_posint "${FA_BUILD_MEM_GIB:-4}" 4)"
+BUILD_VCPUS="$(fa_posint "${FA_BUILD_VCPUS:-4}" 4)"
+# Export as TF_VARs so plan (autoscaler child) and apply (here) agree on the size.
+export TF_VAR_build_memory_gib="$BUILD_MEM_GIB"
+export TF_VAR_build_vcpus="$BUILD_VCPUS"
+# Cap the autoscaler at one small VM per dom0 by default (overridable via FA_MAX_SMALL
+# in the environment) so the elastic burst can never overcommit a dom0. Exported so
+# the autoscaler child process honours it without threading a flag through every call.
+export FA_MAX_SMALL="${FA_MAX_SMALL:-1}"
 
 # Stable dom0 print/iterate order (matches the design doc + farm-autoscale.sh).
 ORDER=("xen-bigboy" "xen-home-services" "kvm-xcp1")
@@ -366,6 +413,53 @@ if [ "${1:-}" = "--self-test" ]; then
   check "gate apply → provision"        "$(provision_enabled apply && echo yes || echo no)" yes
   check "FA_APPLY=0 → no provision"     "$(provision_enabled 'plan-only:FA_APPLY!=1 (apply opt-in off)' && echo yes || echo no)" no
   check "XO-down → no provision"        "$(provision_enabled 'plan-only:XO-unreachable' && echo yes || echo no)" no
+
+  # --- demand contribution (queue-accuracy bug A): a @farm:{…} payload contributes
+  # to demand ONLY when it is a real `cargo …` build command. Templates/placeholders
+  # (crate,verify / …) contribute 0. We assert this end-to-end through the REAL
+  # farm-jobs.sh active path (the same path collect_worklist_demand uses), counting
+  # the active jobs for a synthetic worklist. Skipped (not failed) if farm-jobs.sh
+  # is absent, so the pure self-test stays runnable anywhere.
+  if [ -x "$FARM_JOBS" ]; then
+    demand_for() { # demand_for <worklist-body> → number of active @farm jobs
+      local wl; wl="$(mktemp "${TMPDIR:-/tmp}/mcnf-fa-st.XXXXXX")" || { echo 0; return; }
+      printf '%s\n' "$1" >"$wl"
+      MCNF_WORKLIST="$wl" "$FARM_JOBS" active 2>/dev/null | grep -c . || true
+      rm -f "$wl"
+    }
+    check "template payload → 0 demand" \
+      "$(demand_for '- [ ] **DRAIN-4: x** @farm:{crate,verify}')" 0
+    check "ellipsis placeholder → 0 demand" \
+      "$(demand_for '- [>] **FOO-1: x** @farm:{…}')" 0
+    check "real cargo job → 1 demand" \
+      "$(demand_for '- [>] **FOO-2: x** @farm:{cargo build -p mde-bus}')" 1
+    check "mixed: template + 2 real → 2 demand" \
+      "$(demand_for '- [>] **FOO-3: x** @farm:{crate,verify} @farm:{cargo build -p a} @farm:{cargo test -p b}')" 2
+  else
+    echo "  skip: demand-contribution (no farm-jobs.sh at $FARM_JOBS)"
+  fi
+
+  # --- overcommit guard (bug B): the apply path is bounded by default — a
+  # fit-to-headroom size + one small VM per dom0, so a burst can't overcommit a dom0.
+  # Assert the DEFAULT-DERIVATION logic in a controlled (unset) sub-env, NOT the live
+  # globals — so an operator who legitimately overrode FA_MAX_SMALL/FA_BUILD_* in their
+  # shell still sees a green self-test (the script is correct; only the defaults differ).
+  # SC2016: the single-quotes are DELIBERATE — the ${VAR:-default} must expand inside
+  # the `env -u`-cleared CHILD shell (with the var unset), not in this parent shell.
+  # shellcheck disable=SC2016
+  check "default elastic mem fit-to-headroom" \
+    "$(env -u FA_BUILD_MEM_GIB bash -c 'echo "${FA_BUILD_MEM_GIB:-4}"')" 4
+  # shellcheck disable=SC2016
+  check "default elastic vcpus fit-to-headroom" \
+    "$(env -u FA_BUILD_VCPUS bash -c 'echo "${FA_BUILD_VCPUS:-4}"')" 4
+  # shellcheck disable=SC2016
+  check "max_small capped to 1/dom0 by default" \
+    "$(env -u FA_MAX_SMALL bash -c 'echo "${FA_MAX_SMALL:-1}"')" 1
+  # And the override-validation guard: a bad override falls back to the default + warns.
+  check "non-int mem override → default" "$(fa_posint abc 4 2>/dev/null)" 4
+  check "zero mem override → default"    "$(fa_posint 0 4 2>/dev/null)" 4
+  check "empty mem override → default"   "$(fa_posint '' 4 2>/dev/null)" 4
+  check "valid mem override kept"        "$(fa_posint 8 4 2>/dev/null)" 8
 
   if [ "$fails" -eq 0 ]; then
     echo "farm-reconciler: self-test passed"; exit 0
@@ -683,12 +777,25 @@ fi
 TFVARS="$TOFU_DIR/farm-autoscale.auto.tfvars"
 [ -f "$TFVARS" ] || { warn "no $TFVARS to apply (autoscaler did not commit) — skip apply."; exit 0; }
 
-log "APPLY ENABLED — tofu apply the committed shapes ($TFVARS)"
+log "APPLY ENABLED — tofu apply the committed shapes ($TFVARS) at the fit-to-headroom burst size (build_memory_gib=$BUILD_MEM_GIB build_vcpus=$BUILD_VCPUS, max_small=$FA_MAX_SMALL/dom0)"
+# OVERCOMMIT GUARD (safe hybrid mode): override tofu's default elastic VM size
+# (build_memory_gib=16) with a fit-to-headroom size so an elastic burst VM coexists
+# with the always-on baseline VM on the same dom0 instead of failing to boot. Paired
+# with FA_MAX_SMALL=1 (capped above), a burst is one small fit-sized VM per dom0. The
+# same size is already in effect for the autoscaler's `tofu plan` this tick (exported
+# TF_VAR_build_memory_gib / TF_VAR_build_vcpus, above) so plan and apply agree; the
+# explicit -var here is belt-and-suspenders at the mutation site.
+# To go FULL-ELASTIC instead (operator-driven): decommission the always-on baseline
+# VMs, then raise FA_BUILD_MEM_GIB/FA_BUILD_VCPUS/FA_MAX_SMALL back to big shapes —
+# the always-on + bounded-burst hybrid is the default precisely because it can't
+# overcommit a dom0 that still carries its baseline VM.
 # -input=false: an unattended tick must never block on a prompt. -auto-approve is
 # intentional ONLY behind the full gate (FA_APPLY + XO + state + golden). A failed
 # apply degrades — log loudly, keep the loop alive, do NOT strand a running build.
 APPLY_RC=0
-( cd "$TOFU_DIR" && "$TOFU" apply -input=false -auto-approve -var-file="$(basename "$TFVARS")" ) || APPLY_RC=$?
+( cd "$TOFU_DIR" && "$TOFU" apply -input=false -auto-approve \
+    -var "build_memory_gib=$BUILD_MEM_GIB" -var "build_vcpus=$BUILD_VCPUS" \
+    -var-file="$(basename "$TFVARS")" ) || APPLY_RC=$?
 if [ "$APPLY_RC" -ne 0 ]; then
   warn "tofu apply rc=$APPLY_RC — DEGRADED. Last-good topology kept; running builds NOT stranded."
   exit 0
