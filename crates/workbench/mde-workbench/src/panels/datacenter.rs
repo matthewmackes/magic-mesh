@@ -12,7 +12,7 @@
 //! VMs/Storage/Network/Tofu/Gateway) layer on top in later DATACENTER tasks; the
 //! load + projection here are pure and unit-tested.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -110,6 +110,28 @@ impl DcRow {
         Some(format!("{used_gib} / {size_gib} GiB ({pct}%)"))
     }
 
+    /// DATACENTER-10 — a host's memory readout, `"used / total GiB (pct%)"`, from
+    /// the `mem_total_mb` / `mem_free_mb` host metrics (used = total − free).
+    /// Returns `None` when either metric is missing/unparseable or `total` is 0, so
+    /// the Hosts card renders nothing rather than a bogus "0 / 0 GiB". Pure +
+    /// testable.
+    #[must_use]
+    pub fn host_memory_readout(&self) -> Option<String> {
+        let total_mb: u64 = self.mem_total_mb.parse().ok()?;
+        let free_mb: u64 = self.mem_free_mb.parse().ok()?;
+        if total_mb == 0 {
+            return None;
+        }
+        let used_mb = total_mb.saturating_sub(free_mb);
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        let pct = ((used_mb as f64 / total_mb as f64) * 100.0).round() as u64;
+        // MB → GiB (1 GiB = 1024 MiB; the source reports MiB-ish MB, close enough
+        // for a capacity readout).
+        let used_gib = (used_mb + 512) / 1024;
+        let total_gib = (total_mb + 512) / 1024;
+        Some(format!("{used_gib} / {total_gib} GiB ({pct}%)"))
+    }
+
     /// The mde-theme palette token for this row's status dot. Maps the raw status
     /// string (across DO droplets and Xen VMs/hosts) onto one of the three
     /// semantic color roles — `success` (up/running), `danger` (off/halted), or
@@ -122,8 +144,9 @@ impl DcRow {
         match self.status.to_ascii_lowercase().as_str() {
             "running" | "active" | "up" | "online" | "ready" => palette.success,
             "halted" | "off" | "stopped" | "shutoff" | "down" | "error" => palette.danger,
-            "paused" | "suspended" | "rebooting" | "starting" | "pending"
-            | "provisioning" => palette.warning,
+            "paused" | "suspended" | "rebooting" | "starting" | "pending" | "provisioning" => {
+                palette.warning
+            }
             // Unknown / empty — a muted dot rather than a misleading green/red.
             _ => palette.text_muted,
         }
@@ -955,6 +978,23 @@ pub struct DatacenterPanel {
     /// panel's lazy-load convention); subsequent reloads are ignored so a Bus
     /// refresh never clobbers in-memory saved-view edits.
     pub views_loaded: bool,
+    /// DATACENTER-10 (Hosts tab) — the impact-preview cache: per-host (dom0 IP) the
+    /// count of running guests the last `action/dc/host-impact` read reported.
+    /// Populated when the operator clicks "Impact" on a host card; the destructive
+    /// drain/reboot/shutdown confirm reads it back to show "N running VM(s) will be
+    /// migrated/stopped". Pure in-memory cache, refreshed on demand.
+    pub host_impact: BTreeMap<String, usize>,
+    /// DATACENTER-10 (Hosts tab) — the pool-placement cache: per-host (dom0 IP) the
+    /// last `action/dc/host-pool` read's `(pool_name, master_uuid, is_master)`.
+    /// Populated when the operator clicks "Pool" on a host card; the card then
+    /// renders the host's pool membership + a master badge.
+    pub host_pool: BTreeMap<String, HostPool>,
+    /// DATACENTER-10 (Hosts tab) — when `Some((dom0, op))`, a destructive host op
+    /// (`reboot` | `shutdown` | `evacuate`) is awaiting explicit confirmation on
+    /// that host's card: the card renders the impact preview + a Confirm/Cancel
+    /// prompt, and only the Confirm button fires the `action/dc/host-power` RPC.
+    /// Cleared once the op is fired or cancelled.
+    pub host_confirm: Option<(String, String)>,
 }
 
 /// Top-level view selector for the datacenter panel.
@@ -964,6 +1004,11 @@ pub enum ViewMode {
     Overview,
     /// Per-zone resource tabs (Prod / Dev).
     Zone,
+    /// DATACENTER-10 — the Hosts tab: per-host capacity/health cards with the full
+    /// host lifecycle (maintenance / reboot / shutdown / evacuate, each with an
+    /// impact preview), pool placement (membership / master), and the copy / launch
+    /// SSH console.
+    Hosts,
     /// OpenTofu workspaces + Plan / Apply buttons.
     Tofu,
     /// The datacenter audit log (`event/dc/audit/*`), newest-first.
@@ -982,6 +1027,7 @@ impl ViewMode {
         match self {
             ViewMode::Overview => "overview",
             ViewMode::Zone => "resources",
+            ViewMode::Hosts => "hosts",
             ViewMode::Tofu => "tofu",
             ViewMode::Audit => "audit",
             ViewMode::Topology => "topology",
@@ -996,6 +1042,7 @@ impl ViewMode {
     pub fn from_slug(slug: &str) -> ViewMode {
         match slug {
             "resources" => ViewMode::Zone,
+            "hosts" => ViewMode::Hosts,
             "tofu" => ViewMode::Tofu,
             "audit" => ViewMode::Audit,
             "topology" => ViewMode::Topology,
@@ -1003,6 +1050,20 @@ impl ViewMode {
             _ => ViewMode::Overview,
         }
     }
+}
+
+/// DATACENTER-10 (Hosts tab) — one host's pool placement, decoded from an
+/// `action/dc/host-pool` reply (`{pool, master, is_master}`). The Hosts card
+/// renders the pool name + a master badge off this; an empty `pool` means the host
+/// is a pool-of-one (or hasn't reported a label).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostPool {
+    /// The pool's name-label (empty = unlabeled / pool-of-one).
+    pub pool: String,
+    /// The pool master host's uuid (empty when the read returned none).
+    pub master: String,
+    /// Whether THIS host is the pool master (so the card badges it).
+    pub is_master: bool,
 }
 
 /// DATACENTER-8 (saved views) — the largest number of saved views kept. A view is
@@ -1188,6 +1249,11 @@ impl Default for DatacenterPanel {
             saved_views: SavedViews::default(),
             save_view_name: String::new(),
             views_loaded: false,
+            // DATACENTER-10 — the Hosts tab caches hydrate on demand (Impact / Pool
+            // clicks); the constructor stays pure.
+            host_impact: BTreeMap::new(),
+            host_pool: BTreeMap::new(),
+            host_confirm: None,
         }
     }
 }
@@ -1350,6 +1416,71 @@ pub enum Message {
     /// be read), which is surfaced rather than silently emptied — so a later save
     /// can't overwrite a still-on-disk file. Only the FIRST load is applied.
     SavedViewsLoaded(Result<SavedViews, String>),
+    /// DATACENTER-10 (Hosts tab) — a NON-destructive host op button was clicked
+    /// (`maintenance-on` | `maintenance-off`). `dom0` is the host IP. Fires the
+    /// `action/dc/host-power` RPC immediately (these are reversible, so no confirm).
+    HostPowerClicked {
+        dom0: String,
+        op: String,
+    },
+    /// DATACENTER-10 (Hosts tab) — a DESTRUCTIVE host op button was clicked
+    /// (`reboot` | `shutdown` | `evacuate`). This only *arms* the confirm
+    /// (`host_confirm = Some((dom0, op))`) AND fires a fresh impact read so the
+    /// confirm prompt shows how many guests are affected — no host-power RPC fires
+    /// until the inline Confirm button.
+    HostOpArmed {
+        dom0: String,
+        op: String,
+    },
+    /// DATACENTER-10 (Hosts tab) — the inline Confirm for an armed destructive host
+    /// op was pressed. Only this fires the `action/dc/host-power` RPC. `dom0`/`op`
+    /// echo the armed pair.
+    HostOpConfirmed {
+        dom0: String,
+        op: String,
+    },
+    /// DATACENTER-10 (Hosts tab) — the armed destructive op was dismissed (Cancel):
+    /// clears `host_confirm` without firing any RPC.
+    HostOpCancelled,
+    /// DATACENTER-10 (Hosts tab) — the `action/dc/host-power` RPC came back. `Ok`
+    /// carries a status line, `Err` the error text. Routes here as a panel-scoped
+    /// message.
+    HostPowerDone(Result<String, String>),
+    /// DATACENTER-10 (Hosts tab) — the "Impact" button was clicked: fire the
+    /// read-only `action/dc/host-impact` RPC to count running guests on `dom0` for
+    /// the impact preview.
+    HostImpactClicked {
+        dom0: String,
+    },
+    /// DATACENTER-10 (Hosts tab) — the `action/dc/host-impact` RPC came back. `Ok`
+    /// carries `(dom0, running_count)` (the dom0 is echoed so the reply keys the
+    /// per-host cache); `Err` the error text.
+    HostImpactDone(Result<(String, usize), String>),
+    /// DATACENTER-10 (Hosts tab) — the "Pool" button was clicked: fire the
+    /// read-only `action/dc/host-pool` RPC to read `dom0`'s pool placement.
+    HostPoolClicked {
+        dom0: String,
+    },
+    /// DATACENTER-10 (Hosts tab) — the `action/dc/host-pool` RPC came back. `Ok`
+    /// carries `(dom0, HostPool)` (the dom0 is echoed to key the cache); `Err` the
+    /// error text.
+    HostPoolDone(Result<(String, HostPool), String>),
+    /// DATACENTER-10 (Hosts tab) — "Copy SSH": copy the `ssh root@<dom0>` command
+    /// for this host onto the local clipboard (a pure local gesture — no Bus / no
+    /// daemon round-trip). `dom0` is the host IP.
+    HostSshCopy {
+        dom0: String,
+    },
+    /// DATACENTER-10 (Hosts tab) — "Console": launch a local `cosmic-term ssh
+    /// root@<dom0>` to the host via the shared [`crate::launcher`] (a pure local
+    /// terminal launch, like the Lighthouses tab's SSH action — never touches the
+    /// daemon). `dom0` is the host IP.
+    HostSshLaunch {
+        dom0: String,
+    },
+    /// DATACENTER-10 (Hosts tab) — the host SSH console launch finished. `Ok` is a
+    /// status line; `Err` the "couldn't launch a terminal" message.
+    HostSshLaunched(Result<String, String>),
 }
 
 impl DatacenterPanel {
@@ -1801,7 +1932,332 @@ impl DatacenterPanel {
                 }
                 Task::none()
             }
+            // ── DATACENTER-10 (Hosts tab) — host lifecycle + pools ──────────────
+            Message::HostPowerClicked { dom0, op } => {
+                // Reversible ops (maintenance on/off) fire immediately — no confirm.
+                self.status = format!("Host {op} on {dom0}…");
+                Self::host_power_task(dom0, op)
+            }
+            Message::HostOpArmed { dom0, op } => {
+                // Arm the destructive confirm AND refresh the impact preview so the
+                // prompt shows how many guests are affected before the operator
+                // commits. The impact read is best-effort (its own message updates
+                // the cache); the confirm renders the cached number if/when it lands.
+                self.host_confirm = Some((dom0.clone(), op));
+                Self::host_impact_task(dom0)
+            }
+            Message::HostOpConfirmed { dom0, op } => {
+                self.host_confirm = None;
+                self.status = format!("Host {op} on {dom0}…");
+                Self::host_power_task(dom0, op)
+            }
+            Message::HostOpCancelled => {
+                self.host_confirm = None;
+                Task::none()
+            }
+            Message::HostPowerDone(Ok(s)) => {
+                self.status = s;
+                Task::none()
+            }
+            Message::HostPowerDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
+            Message::HostImpactClicked { dom0 } => {
+                self.status = format!("Reading impact for {dom0}…");
+                Self::host_impact_task(dom0)
+            }
+            Message::HostImpactDone(Ok((dom0, running))) => {
+                self.host_impact.insert(dom0.clone(), running);
+                self.status = format!("{dom0}: {running} running VM(s) resident");
+                Task::none()
+            }
+            Message::HostImpactDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
+            Message::HostPoolClicked { dom0 } => {
+                self.status = format!("Reading pool for {dom0}…");
+                Self::host_pool_task(dom0)
+            }
+            Message::HostPoolDone(Ok((dom0, pool))) => {
+                let line = if pool.pool.is_empty() {
+                    format!("{dom0}: standalone (no pool)")
+                } else if pool.is_master {
+                    format!("{dom0}: pool '{}' (this host is master)", pool.pool)
+                } else {
+                    format!("{dom0}: pool '{}' (member)", pool.pool)
+                };
+                self.host_pool.insert(dom0, pool);
+                self.status = line;
+                Task::none()
+            }
+            Message::HostPoolDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
+            Message::HostSshCopy { dom0 } => {
+                // Pure local gesture: drop the ssh command onto the clipboard so the
+                // operator can paste it into any terminal. No Bus / daemon.
+                let cmd = format!("ssh root@{dom0}");
+                self.status = format!("Copied: {cmd}");
+                cosmic::iced::clipboard::write::<crate::Message>(cmd)
+            }
+            Message::HostSshLaunch { dom0 } => {
+                // Pure local launch — a `cosmic-term ssh root@<dom0>`, mirroring the
+                // Lighthouses tab's SSH action (never touches the daemon). dom0 reach
+                // is root-only (the mesh key authorizes root), so this targets root
+                // explicitly rather than `$USER` — spawned the same way the shared
+                // launcher detaches a terminal (spawn IS the success signal).
+                self.status = format!("Opening an SSH terminal to {dom0}…");
+                Task::perform(async move { host_ssh_console(&dom0) }, |result| {
+                    crate::Message::Datacenter(Message::HostSshLaunched(result))
+                })
+            }
+            Message::HostSshLaunched(Ok(s)) => {
+                self.status = s;
+                Task::none()
+            }
+            Message::HostSshLaunched(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
         }
+    }
+
+    /// DATACENTER-10 — fire the `action/dc/host-power` RPC on a blocking thread
+    /// (the Bus RPC borrows a non-Send `Persist` across its await, same shape as
+    /// `PowerClicked`'s `vm_power`), routing the reply back as `HostPowerDone`.
+    fn host_power_task(dom0: String, op: String) -> Task<crate::Message> {
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || host_power(&dom0, &op))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("host-power task panicked: {e}")))
+            },
+            |result| crate::Message::Datacenter(Message::HostPowerDone(result)),
+        )
+    }
+
+    /// DATACENTER-10 — fire the read-only `action/dc/host-impact` RPC on a blocking
+    /// thread, routing the reply back as `HostImpactDone`.
+    fn host_impact_task(dom0: String) -> Task<crate::Message> {
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || host_impact_rpc(&dom0))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("host-impact task panicked: {e}")))
+            },
+            |result| crate::Message::Datacenter(Message::HostImpactDone(result)),
+        )
+    }
+
+    /// DATACENTER-10 — fire the read-only `action/dc/host-pool` RPC on a blocking
+    /// thread, routing the reply back as `HostPoolDone`.
+    fn host_pool_task(dom0: String) -> Task<crate::Message> {
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || host_pool_rpc(&dom0))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("host-pool task panicked: {e}")))
+            },
+            |result| crate::Message::Datacenter(Message::HostPoolDone(result)),
+        )
+    }
+
+    /// DATACENTER-10 — render one Xen dom0 host as a Hosts-tab card: capacity +
+    /// health header, the full host lifecycle controls (maintenance on/off / reboot
+    /// / shutdown / evacuate — the destructive three arming an impact-preview
+    /// confirm), pool placement (membership / master, read on demand), and the
+    /// copy / launch SSH console. All controls route panel-scoped messages back
+    /// through `update` (runtime-reachable); mde-theme tokens only (§4).
+    fn host_card_view<'a>(&self, h: &DcRow, palette: Palette) -> Element<'a, crate::Message> {
+        let dom0 = h.id.clone();
+        let label = if h.name.is_empty() {
+            h.id.clone()
+        } else {
+            h.name.clone()
+        };
+
+        // Header: the host name + the color-dot liveness.
+        let header = row![
+            text(format!("Host {label}"))
+                .colr(palette.text.into_cosmic_color())
+                .width(Length::FillPortion(1)),
+            status_dot_view(h, palette),
+        ]
+        .spacing(f32::from(spacing::BASE[2]))
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+
+        let mut card = column![header].spacing(f32::from(spacing::BASE[2]));
+
+        // Capacity + health line: dom0 IP, vCPU, memory, load — whatever the host
+        // reported. Built off the host metrics already projected from the Bus.
+        let mut capacity = h.id.clone();
+        if !h.cpu.is_empty() {
+            capacity.push_str(&format!(" · {} vCPU", h.cpu));
+        }
+        if let Some(mem) = h.host_memory_readout() {
+            capacity.push_str(&format!(" · mem {mem}"));
+        }
+        if !h.load.is_empty() {
+            capacity.push_str(&format!(" · load {}", h.load));
+        }
+        card = card.push(text(capacity).colr(palette.text_muted.into_cosmic_color()));
+
+        // Pool placement, when read. Renders the cached `action/dc/host-pool`
+        // result; the "Pool" button (below) refreshes it.
+        if let Some(p) = self.host_pool.get(&dom0) {
+            let pool_line = if p.pool.is_empty() {
+                "Pool: standalone (no pool)".to_string()
+            } else if p.is_master {
+                format!("Pool: {} — this host is MASTER", p.pool)
+            } else {
+                format!("Pool: {} — member", p.pool)
+            };
+            let color = if p.is_master {
+                palette.accent
+            } else {
+                palette.text_muted
+            };
+            card = card.push(text(pool_line).colr(color.into_cosmic_color()));
+        }
+
+        // Reversible lifecycle ops fire immediately (no confirm).
+        let maint = |btn_label: &str, op: &str| {
+            variant_button(
+                btn_label.to_string(),
+                ButtonVariant::Secondary,
+                Some(crate::Message::Datacenter(Message::HostPowerClicked {
+                    dom0: dom0.clone(),
+                    op: op.to_string(),
+                })),
+                palette,
+            )
+        };
+        let pool_btn = variant_button(
+            "Pool".to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::HostPoolClicked {
+                dom0: dom0.clone(),
+            })),
+            palette,
+        );
+        let impact_btn = variant_button(
+            "Impact".to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::HostImpactClicked {
+                dom0: dom0.clone(),
+            })),
+            palette,
+        );
+        let copy_btn = variant_button(
+            "Copy SSH".to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::HostSshCopy {
+                dom0: dom0.clone(),
+            })),
+            palette,
+        );
+        let console_btn = variant_button(
+            "Console".to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::HostSshLaunch {
+                dom0: dom0.clone(),
+            })),
+            palette,
+        );
+
+        let reversible = row![
+            maint("Maintenance on", "maintenance-on"),
+            maint("Maintenance off", "maintenance-off"),
+            impact_btn,
+            pool_btn,
+            copy_btn,
+            console_btn,
+        ]
+        .spacing(f32::from(spacing::BASE[1]));
+        card = card.push(reversible);
+
+        // Destructive lifecycle ops (reboot / shutdown / evacuate): the first click
+        // ARMS a confirm + refreshes the impact preview; only the inline Confirm
+        // fires the `action/dc/host-power` RPC.
+        let armed = self
+            .host_confirm
+            .as_ref()
+            .filter(|(d, _)| *d == dom0)
+            .map(|(_, op)| op.clone());
+        if let Some(op) = armed {
+            // Show the impact preview, if cached, then the explicit confirm.
+            let impact = self.host_impact.get(&dom0).copied();
+            let preview = match impact {
+                Some(n) => format!(
+                    "Confirm {op} on {dom0}? {n} running VM(s) will be {}.",
+                    if op == "evacuate" {
+                        "migrated off"
+                    } else {
+                        "stopped"
+                    }
+                ),
+                None => format!("Confirm {op} on {dom0}? (reading impact…)"),
+            };
+            let confirm_row = row![
+                text(preview).colr(palette.warning.into_cosmic_color()),
+                variant_button(
+                    "Confirm".to_string(),
+                    ButtonVariant::Primary,
+                    Some(crate::Message::Datacenter(Message::HostOpConfirmed {
+                        dom0: dom0.clone(),
+                        op: op.clone(),
+                    })),
+                    palette,
+                ),
+                variant_button(
+                    "Cancel".to_string(),
+                    ButtonVariant::Secondary,
+                    Some(crate::Message::Datacenter(Message::HostOpCancelled)),
+                    palette,
+                ),
+            ]
+            .spacing(f32::from(spacing::BASE[1]))
+            .align_y(cosmic::iced::alignment::Vertical::Center);
+            card = card.push(confirm_row);
+        } else {
+            let destructive = |btn_label: &str, op: &str| {
+                variant_button(
+                    btn_label.to_string(),
+                    ButtonVariant::Primary,
+                    Some(crate::Message::Datacenter(Message::HostOpArmed {
+                        dom0: dom0.clone(),
+                        op: op.to_string(),
+                    })),
+                    palette,
+                )
+            };
+            let destructive_row = row![
+                destructive("Reboot", "reboot"),
+                destructive("Shut down", "shutdown"),
+                destructive("Evacuate", "evacuate"),
+            ]
+            .spacing(f32::from(spacing::BASE[1]));
+            card = card.push(destructive_row);
+        }
+
+        let surface = palette.surface;
+        let radius = f32::from(spacing::BASE[1]);
+        container(card)
+            .padding(f32::from(CARD_PAD_PX))
+            .width(Length::Fill)
+            .style(move |_theme| container::Style {
+                background: Some(cosmic::iced::Background::Color(surface.into_cosmic_color())),
+                border: cosmic::iced::Border {
+                    color: palette.border.into_cosmic_color(),
+                    width: 1.0,
+                    radius: radius.into(),
+                },
+                ..container::Style::default()
+            })
+            .into()
     }
 
     /// MOTION-FEEDBACK-2 — stamp the card-grid reveal origin and arm the motion
@@ -1835,10 +2291,9 @@ impl DatacenterPanel {
         // duration is reduce-motion-aware, matching `slide_in`), so a settled grid
         // renders statically with no per-frame easing — and a small grid doesn't
         // keep ticking for the absent cap slots.
-        if self
-            .reveal_start
-            .is_some_and(|start| reveal_is_complete(start, now, self.visible_card_count(), reduce_motion))
-        {
+        if self.reveal_start.is_some_and(|start| {
+            reveal_is_complete(start, now, self.visible_card_count(), reduce_motion)
+        }) {
             self.reveal_start = None;
         }
         if self.motion_in_flight(now, reduce_motion) {
@@ -2053,6 +2508,7 @@ impl DatacenterPanel {
         );
         let mode_tabs = row![
             mode_btn("Overview", ViewMode::Overview),
+            mode_btn("Hosts", ViewMode::Hosts),
             mode_btn("Topology", ViewMode::Topology),
             mode_btn("Resources", ViewMode::Zone),
             mode_btn("Tofu", ViewMode::Tofu),
@@ -2205,6 +2661,33 @@ impl DatacenterPanel {
                     col = col.push(
                         text(self.dr_status.clone()).colr(palette.text_muted.into_cosmic_color()),
                     );
+                }
+            }
+            ViewMode::Hosts => {
+                // DATACENTER-10 — the Hosts tab: one card per `kind == "host"` row
+                // (the Xen dom0s the orchestrator publishes), honoring the global
+                // search needle. Each card shows the host's capacity + health and
+                // the full lifecycle controls (maintenance / reboot / shutdown /
+                // evacuate with impact preview), pool placement, and the SSH console.
+                col = col.push(text("Hosts").size(f32::from(spacing::BASE[5])));
+                let hosts: Vec<&DcRow> = self
+                    .rows
+                    .iter()
+                    .filter(|r| r.kind == "host" && r.matches_filter(&self.filter))
+                    .collect();
+                if hosts.is_empty() {
+                    col = col.push(
+                        text(
+                            "No hosts yet. Xen dom0s appear here as the datacenter \
+                             orchestrator publishes `event/dc/host/*` (set `MCNF_XEN_DOM0S` \
+                             on the host source).",
+                        )
+                        .colr(palette.text_muted.into_cosmic_color()),
+                    );
+                } else {
+                    for h in hosts {
+                        col = col.push(self.host_card_view(h, palette));
+                    }
                 }
             }
             ViewMode::Tofu => {
@@ -2443,8 +2926,7 @@ impl DatacenterPanel {
                                 let motion = CardMotion {
                                     index: i,
                                     reveal_start: self.reveal_start,
-                                    selected: self.selected_card.as_deref()
-                                        == Some(r.id.as_str()),
+                                    selected: self.selected_card.as_deref() == Some(r.id.as_str()),
                                     selection: &self.selection,
                                     hovered: self.hovered_card.as_deref() == Some(r.id.as_str()),
                                     hover_since: self.hover_since,
@@ -2575,7 +3057,9 @@ fn reveal_is_complete(
     let last_start = reveal_card_start(reveal_start, last_index);
     let mount = Motion::panel_mount().duration;
     let dur = if reduce_motion {
-        mount.min(Duration::from_millis(mde_theme::motion::REDUCE_MOTION_CAP_MS))
+        mount.min(Duration::from_millis(
+            mde_theme::motion::REDUCE_MOTION_CAP_MS,
+        ))
     } else {
         mount
     };
@@ -3723,6 +4207,170 @@ fn vm_delete(uuid: &str, dom0: &str) -> Result<String, String> {
     Err(format!("unexpected vm-delete reply: {raw}"))
 }
 
+/// DATACENTER-10 — fire the `action/dc/host-power` Bus RPC (blocking — runs on a
+/// `spawn_blocking` thread) for a host lifecycle op and translate the reply into a
+/// status line. `op` is one of `maintenance-on` / `maintenance-off` / `reboot` /
+/// `shutdown` / `evacuate` (validated server-side); `dom0` is the host IP.
+/// Mirrors `vm_power` exactly — a Persist + `mde_bus::rpc::request` round trip
+/// wrapped in a local tokio runtime because `request` borrows a non-`Send`
+/// `Persist` across its internal await. The reply is `{"ok":true}` (→ "host <op>
+/// ok") or `{"error":".."}` (→ the error text). Evacuate live-migrates every guest
+/// off, so its timeout is generous.
+fn host_power(dom0: &str, op: &str) -> Result<String, String> {
+    let Some(dir) = mde_bus::default_data_dir() else {
+        return Err("no Bus data dir".to_string());
+    };
+    let body = serde_json::json!({ "dom0": dom0, "op": op }).to_string();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    let reply = rt.block_on(async {
+        let persist = mde_bus::persist::Persist::open(dir).map_err(|e| e.to_string())?;
+        mde_bus::rpc::request(
+            &persist,
+            "action/dc/host-power",
+            mde_bus::hooks::config::Priority::Default,
+            Some("host-power"),
+            Some(&body),
+            // Evacuate live-migrates every resident guest off the host, which can
+            // take minutes on a busy host — give it room.
+            Duration::from_secs(600),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+    let raw = reply.body.unwrap_or_default();
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("bad host-power reply: {e}"))?;
+    if let Some(err) = v.get("error").and_then(serde_json::Value::as_str) {
+        return Err(err.to_string());
+    }
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok(format!("host {op} ok"));
+    }
+    Err(format!("unexpected host-power reply: {raw}"))
+}
+
+/// DATACENTER-10 — fire the read-only `action/dc/host-impact` Bus RPC and return
+/// `(dom0, running_count)` — the number of running guests resident on `dom0` (the
+/// impact preview shown before a drain / reboot / shutdown). The dom0 is echoed
+/// back so the panel keys its per-host cache off the reply. Mirrors `host_power`'s
+/// transport; the reply is `{"ok":true,"running":N}` or `{"error":".."}`.
+fn host_impact_rpc(dom0: &str) -> Result<(String, usize), String> {
+    let Some(dir) = mde_bus::default_data_dir() else {
+        return Err("no Bus data dir".to_string());
+    };
+    let body = serde_json::json!({ "dom0": dom0 }).to_string();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    let reply = rt.block_on(async {
+        let persist = mde_bus::persist::Persist::open(dir).map_err(|e| e.to_string())?;
+        mde_bus::rpc::request(
+            &persist,
+            "action/dc/host-impact",
+            mde_bus::hooks::config::Priority::Default,
+            Some("host-impact"),
+            Some(&body),
+            Duration::from_secs(30),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+    let raw = reply.body.unwrap_or_default();
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("bad host-impact reply: {e}"))?;
+    if let Some(err) = v.get("error").and_then(serde_json::Value::as_str) {
+        return Err(err.to_string());
+    }
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        let running = v
+            .get("running")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
+        return Ok((dom0.to_string(), running));
+    }
+    Err(format!("unexpected host-impact reply: {raw}"))
+}
+
+/// DATACENTER-10 — fire the read-only `action/dc/host-pool` Bus RPC and return
+/// `(dom0, HostPool)` — `dom0`'s pool placement (name / master / is-master). The
+/// dom0 is echoed back so the panel keys its per-host cache off the reply. Mirrors
+/// `host_impact_rpc`'s transport; the reply is
+/// `{"ok":true,"pool":"..","master":"..","is_master":bool}` or `{"error":".."}`.
+fn host_pool_rpc(dom0: &str) -> Result<(String, HostPool), String> {
+    let Some(dir) = mde_bus::default_data_dir() else {
+        return Err("no Bus data dir".to_string());
+    };
+    let body = serde_json::json!({ "dom0": dom0 }).to_string();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    let reply = rt.block_on(async {
+        let persist = mde_bus::persist::Persist::open(dir).map_err(|e| e.to_string())?;
+        mde_bus::rpc::request(
+            &persist,
+            "action/dc/host-pool",
+            mde_bus::hooks::config::Priority::Default,
+            Some("host-pool"),
+            Some(&body),
+            Duration::from_secs(30),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+    let raw = reply.body.unwrap_or_default();
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("bad host-pool reply: {e}"))?;
+    if let Some(err) = v.get("error").and_then(serde_json::Value::as_str) {
+        return Err(err.to_string());
+    }
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        let pool = HostPool {
+            pool: v
+                .get("pool")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            master: v
+                .get("master")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            is_master: v
+                .get("is_master")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        };
+        return Ok((dom0.to_string(), pool));
+    }
+    Err(format!("unexpected host-pool reply: {raw}"))
+}
+
+/// DATACENTER-10 — launch a local `cosmic-term ssh root@<dom0>` console to a host.
+/// A pure local terminal launch (never touches the daemon), mirroring the shared
+/// [`crate::launcher`]'s detach contract: the spawn succeeding IS the success
+/// signal (the window detaches). dom0 reach is root-only via the mesh key, so this
+/// targets `root@` explicitly rather than `$USER`. `Ok` on a successful spawn.
+fn host_ssh_console(dom0: &str) -> Result<String, String> {
+    let target = format!("root@{dom0}");
+    match std::process::Command::new("cosmic-term")
+        .args(["--", "ssh", &target])
+        .spawn()
+    {
+        Ok(mut child) => {
+            let _ = child.try_wait();
+            Ok(format!("Opened a terminal to {dom0}."))
+        }
+        Err(_) => Err(format!(
+            "Could not launch a terminal for {dom0} (is cosmic-term installed?)."
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3771,6 +4419,7 @@ mod tests {
         for mode in [
             ViewMode::Overview,
             ViewMode::Zone,
+            ViewMode::Hosts,
             ViewMode::Tofu,
             ViewMode::Audit,
             ViewMode::Topology,
@@ -4174,6 +4823,122 @@ mod tests {
         let _ = p.view(); // dev tab — exercises the VM power+snapshot row + net bridge readout
         let _ = p.update(Message::ViewMode(ViewMode::Tofu));
         let _ = p.view(); // Tofu view — exercises the Plan buttons
+    }
+
+    // ---- DATACENTER-10: Hosts tab (lifecycle + pools + console) -----------------
+
+    #[test]
+    fn host_memory_readout_uses_total_minus_free() {
+        // 16000 MB total, 9000 free → 7000 used ≈ 7/16 GiB, 44%.
+        let r = parse_dc_event(
+            r#"{"kind":"host","id":"172.20.0.9","name":"dom0-a","status":"up","zone":"dev","cpu":"8","mem_total_mb":"16000","mem_free_mb":"9000","load":"0.4"}"#,
+        )
+        .expect("host row");
+        let mem = r.host_memory_readout().expect("memory readout");
+        assert!(mem.contains("GiB"), "{mem}");
+        assert!(mem.contains("44%"), "{mem}");
+        // A non-host (droplet) row has no metrics → None, not a bogus 0/0.
+        let d = parse_dc_event(
+            r#"{"kind":"droplet","id":"2","name":"lh","status":"active","zone":"prod"}"#,
+        )
+        .expect("droplet row");
+        assert!(d.host_memory_readout().is_none());
+    }
+
+    #[test]
+    fn hosts_view_renders_host_cards_without_panicking() {
+        let mut p = DatacenterPanel::new();
+        p.rows = project_rows(&[
+            (
+                "event/dc/host/a".into(),
+                r#"{"kind":"host","id":"172.20.0.9","name":"dom0-a","status":"up","zone":"dev","cpu":"8","mem_total_mb":"16000","mem_free_mb":"9000","load":"0.4"}"#.into(),
+            ),
+            (
+                "event/dc/vm/9".into(),
+                r#"{"kind":"vm","id":"9","name":"builder","status":"running","zone":"dev","host":"172.20.0.9"}"#.into(),
+            ),
+        ]);
+        let _ = p.update(Message::ViewMode(ViewMode::Hosts));
+        let _ = p.view(); // host card with capacity + lifecycle controls
+                          // Arm a destructive op + seed an impact preview, then re-render the confirm.
+        p.host_impact.insert("172.20.0.9".into(), 3);
+        let _ = p.update(Message::HostOpArmed {
+            dom0: "172.20.0.9".to_string(),
+            op: "evacuate".to_string(),
+        });
+        assert_eq!(
+            p.host_confirm,
+            Some(("172.20.0.9".to_string(), "evacuate".to_string()))
+        );
+        let _ = p.view(); // exercises the impact-preview confirm row
+    }
+
+    #[test]
+    fn host_op_arm_confirm_and_cancel_gate_the_destructive_rpc() {
+        let mut p = DatacenterPanel::new();
+        // Arm reboot — no RPC yet, just the pending confirm + an impact refresh.
+        let _ = p.update(Message::HostOpArmed {
+            dom0: "172.20.0.9".to_string(),
+            op: "reboot".to_string(),
+        });
+        assert_eq!(
+            p.host_confirm,
+            Some(("172.20.0.9".to_string(), "reboot".to_string()))
+        );
+        // Cancel clears it without firing.
+        let _ = p.update(Message::HostOpCancelled);
+        assert!(p.host_confirm.is_none());
+        // Re-arm then confirm: the confirm clears the pending state + sets the
+        // in-flight status (the RPC task itself can't be driven hermetically).
+        let _ = p.update(Message::HostOpArmed {
+            dom0: "172.20.0.9".to_string(),
+            op: "shutdown".to_string(),
+        });
+        let _ = p.update(Message::HostOpConfirmed {
+            dom0: "172.20.0.9".to_string(),
+            op: "shutdown".to_string(),
+        });
+        assert!(p.host_confirm.is_none());
+        assert_eq!(p.status, "Host shutdown on 172.20.0.9…");
+    }
+
+    #[test]
+    fn host_impact_and_pool_done_cache_per_host() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::HostImpactDone(Ok(("172.20.0.9".to_string(), 5))));
+        assert_eq!(p.host_impact.get("172.20.0.9").copied(), Some(5));
+        assert!(p.status.contains("5 running VM(s)"));
+        let pool = HostPool {
+            pool: "lab-pool".to_string(),
+            master: "m-uuid".to_string(),
+            is_master: true,
+        };
+        let _ = p.update(Message::HostPoolDone(Ok(("172.20.0.9".to_string(), pool))));
+        assert!(p.host_pool.get("172.20.0.9").is_some_and(|p| p.is_master));
+        assert!(p.status.contains("master"));
+    }
+
+    #[test]
+    fn host_power_clicked_sets_in_flight_status() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::HostPowerClicked {
+            dom0: "172.20.0.9".to_string(),
+            op: "maintenance-on".to_string(),
+        });
+        assert_eq!(p.status, "Host maintenance-on on 172.20.0.9…");
+        let _ = p.update(Message::HostPowerDone(Ok(
+            "host maintenance-on ok".to_string()
+        )));
+        assert_eq!(p.status, "host maintenance-on ok");
+    }
+
+    #[test]
+    fn host_ssh_copy_sets_a_copied_status() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::HostSshCopy {
+            dom0: "172.20.0.9".to_string(),
+        });
+        assert_eq!(p.status, "Copied: ssh root@172.20.0.9");
     }
 
     #[test]
@@ -5418,23 +6183,38 @@ mod tests {
     fn status_dot_maps_liveness_onto_semantic_tokens() {
         let p = Palette::dark();
         // Up vocabularies (DO "active" / Xen "running" / "up") → success.
-        assert_eq!(row_with("vm", "1", "a", "running", "dev").status_dot(p), p.success);
+        assert_eq!(
+            row_with("vm", "1", "a", "running", "dev").status_dot(p),
+            p.success
+        );
         assert_eq!(
             row_with("droplet", "2", "b", "active", "prod").status_dot(p),
             p.success
         );
         // Off vocabularies → danger.
-        assert_eq!(row_with("vm", "3", "c", "halted", "dev").status_dot(p), p.danger);
-        assert_eq!(row_with("droplet", "4", "d", "off", "prod").status_dot(p), p.danger);
+        assert_eq!(
+            row_with("vm", "3", "c", "halted", "dev").status_dot(p),
+            p.danger
+        );
+        assert_eq!(
+            row_with("droplet", "4", "d", "off", "prod").status_dot(p),
+            p.danger
+        );
         // Transitional → warning.
         assert_eq!(
             row_with("vm", "5", "e", "rebooting", "dev").status_dot(p),
             p.warning
         );
         // Case-insensitive.
-        assert_eq!(row_with("vm", "6", "f", "RUNNING", "dev").status_dot(p), p.success);
+        assert_eq!(
+            row_with("vm", "6", "f", "RUNNING", "dev").status_dot(p),
+            p.success
+        );
         // Unknown / empty → muted (never a misleading green/red).
-        assert_eq!(row_with("vm", "7", "g", "", "dev").status_dot(p), p.text_muted);
+        assert_eq!(
+            row_with("vm", "7", "g", "", "dev").status_dot(p),
+            p.text_muted
+        );
         assert_eq!(
             row_with("vm", "8", "h", "weird", "dev").status_dot(p),
             p.text_muted

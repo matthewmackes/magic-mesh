@@ -61,8 +61,11 @@ impl HostOpsService {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 6] = [
+pub const ACTION_VERBS: [&str; 8] = [
     "host-power",
+    // DATACENTER-10 — the Hosts tab's impact preview + pool read.
+    "host-impact",
+    "host-pool",
     "gateway-reboot",
     "dr-backup",
     "gateway-status",
@@ -85,19 +88,64 @@ pub fn action_topic(verb: &str) -> String {
 /// * `maintenance-on`  → `["host-disable"]` (enters maintenance mode);
 /// * `maintenance-off` → `["host-enable"]` (leaves maintenance mode);
 /// * `reboot`          → `["host-disable", "host-reboot"]` — XAPI refuses to
-///   reboot an enabled host, so it must be disabled first.
+///   reboot an enabled host, so it must be disabled first;
+/// * `shutdown`        → `["host-disable", "host-shutdown"]` — same gate: XAPI
+///   refuses to shut down an enabled host, so disable it first;
+/// * `evacuate`        → `["host-disable", "host-evacuate"]` — disable so no new
+///   VMs land, then live-migrate every resident guest off onto other pool
+///   members (the day-2 "drain before patch/reboot" primitive).
 ///
 /// Each returned verb is later run as `xe <verb> host=<uuid>`.
 ///
 /// # Errors
-/// Returns `Err` for any `op` outside the three above.
+/// Returns `Err` for any `op` outside the five above.
 pub fn host_power_commands(op: &str) -> Result<Vec<String>, String> {
     match op {
         "maintenance-on" => Ok(vec!["host-disable".to_string()]),
         "maintenance-off" => Ok(vec!["host-enable".to_string()]),
         "reboot" => Ok(vec!["host-disable".to_string(), "host-reboot".to_string()]),
+        "shutdown" => Ok(vec![
+            "host-disable".to_string(),
+            "host-shutdown".to_string(),
+        ]),
+        "evacuate" => Ok(vec![
+            "host-disable".to_string(),
+            "host-evacuate".to_string(),
+        ]),
         other => Err(format!("unknown op: {other}")),
     }
+}
+
+/// Parse the `xe vm-list resident-on=<uuid> power-state=running --minimal` reply
+/// (a comma-separated list of running-guest uuids, possibly empty) into the count
+/// of guests that would be affected by draining/rebooting/shutting down the host.
+/// PURE — the impact-preview number the panel renders before a destructive op.
+#[must_use]
+pub fn parse_running_count(minimal: &str) -> usize {
+    minimal
+        .trim()
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .count()
+}
+
+/// Parse the two `xe`-minimal lines that read a host's pool placement into the
+/// `(pool_name, master_uuid, is_master)` triple the panel renders. PURE.
+///
+/// * `pool_line`  — `xe pool-list params=name-label --minimal` (the single pool's
+///   name; empty on a pool-of-one with no label);
+/// * `master_line`— `xe pool-list params=master --minimal` (the master host's
+///   uuid);
+/// * `this_uuid`  — this host's own uuid, already resolved by the caller.
+///
+/// `is_master` is `true` iff this host's uuid equals the pool master's — so the
+/// panel can badge the master and gate join/leave accordingly.
+#[must_use]
+pub fn parse_pool(pool_line: &str, master_line: &str, this_uuid: &str) -> (String, String, bool) {
+    let pool = pool_line.trim().to_string();
+    let master = master_line.trim().to_string();
+    let is_master = !master.is_empty() && master == this_uuid.trim();
+    (pool, master, is_master)
 }
 
 /// Run a remote `xe` command on a dom0 over SSH, returning the process result.
@@ -531,12 +579,151 @@ fn promote_with_endpoints(
         .to_string())
 }
 
+/// Resolve `dom0`'s own host uuid over SSH (`xe host-list params=uuid
+/// --minimal`, first value), validating the dom0 against the allow-list FIRST so
+/// an attacker-supplied host never reaches SSH. Shared by host-power (the
+/// destructive path) and the host-impact / host-pool reads so all three resolve
+/// the uuid identically. Returns `Ok((key, uuid))` (the ssh key is returned so
+/// the caller's follow-up `xe` calls reuse it) or `Err(<message>)`.
+fn resolve_dom0_uuid(dom0: &str) -> Result<(String, String), String> {
+    if !crate::workers::datacenter_orchestrator::xen_dom0s()
+        .iter()
+        .any(|d| d == dom0)
+    {
+        return Err("dom0 not in allowed set".into());
+    }
+    let key = crate::workers::datacenter_orchestrator::xen_ssh_key();
+    let uuid = match ssh_xe_status(&key, dom0, "xe host-list params=uuid --minimal") {
+        Ok(o) if o.status.success() => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            out.trim()
+                .split(',')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let msg = stderr.trim();
+            return Err(if msg.is_empty() {
+                "host-list failed".into()
+            } else {
+                msg.to_string()
+            });
+        }
+        Err(e) => return Err(format!("ssh failed: {e}")),
+    };
+    if uuid.is_empty() {
+        return Err("host uuid not found".into());
+    }
+    // The remote uuid is XAPI-generated; guard anyway before interpolation.
+    if !uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err("host uuid contains invalid characters".into());
+    }
+    Ok((key, uuid))
+}
+
+/// DATACENTER-10 — count the running guests resident on `dom0`, the impact-preview
+/// number the panel shows before a drain / reboot / shutdown ("N running VM(s)
+/// will be migrated/stopped"). Read-only: resolves the host uuid then runs
+/// `xe vm-list resident-on=<uuid> power-state=running --minimal`. Body
+/// `{ "dom0" }`. Returns the count or `Err(<message>)`.
+fn host_impact(req_body: Option<&str>) -> Result<usize, String> {
+    let Some(body) = req_body else {
+        return Err("host-impact: missing request body".into());
+    };
+    let req: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("host-impact: bad json: {e}"))?;
+    let dom0 = req
+        .get("dom0")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let (key, uuid) = resolve_dom0_uuid(dom0)?;
+    let remote = format!("xe vm-list resident-on={uuid} power-state=running --minimal");
+    match ssh_xe_status(&key, dom0, &remote) {
+        Ok(o) if o.status.success() => Ok(parse_running_count(&String::from_utf8_lossy(&o.stdout))),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let msg = stderr.trim();
+            Err(if msg.is_empty() {
+                "vm-list failed".into()
+            } else {
+                msg.to_string()
+            })
+        }
+        Err(e) => Err(format!("ssh failed: {e}")),
+    }
+}
+
+/// DATACENTER-10 — read `dom0`'s pool placement (membership / master), the data
+/// the Hosts tab's pool panel renders. Read-only: resolves the host uuid, then
+/// reads the pool's name + master uuid over one SSH session, and folds them with
+/// [`parse_pool`] into `(pool_name, master_uuid, is_master)`. Body `{ "dom0" }`.
+fn host_pool(req_body: Option<&str>) -> Result<(String, String, bool), String> {
+    let Some(body) = req_body else {
+        return Err("host-pool: missing request body".into());
+    };
+    let req: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("host-pool: bad json: {e}"))?;
+    let dom0 = req
+        .get("dom0")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let (key, uuid) = resolve_dom0_uuid(dom0)?;
+    // Two positional minimal reads over ONE ssh round-trip (literal markers so the
+    // parse stays positional even when a field is empty). The literal verbs carry
+    // no operator input, so there's nothing to escape.
+    let remote = "xe pool-list params=name-label --minimal; echo '@@'; \
+         xe pool-list params=master --minimal";
+    match ssh_xe_status(&key, dom0, remote) {
+        Ok(o) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let mut parts = stdout.split("@@");
+            let pool_line = parts.next().unwrap_or("");
+            let master_line = parts.next().unwrap_or("");
+            Ok(parse_pool(pool_line, master_line, &uuid))
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let msg = stderr.trim();
+            Err(if msg.is_empty() {
+                "pool-list failed".into()
+            } else {
+                msg.to_string()
+            })
+        }
+        Err(e) => Err(format!("ssh failed: {e}")),
+    }
+}
+
 /// Build the reply for one `action/dc/<verb>` request.
 #[must_use]
 pub fn build_reply(svc: &HostOpsService, verb: &str, req_body: Option<&str>) -> String {
     let err = |m: String| json!({ "error": m }).to_string();
     match verb {
         "host-power" => {}
+        // DATACENTER-10 — impact preview: how many running guests a drain/reboot/
+        // shutdown of this host would move/stop.
+        "host-impact" => {
+            return match host_impact(req_body) {
+                Ok(running) => json!({ "ok": true, "running": running }).to_string(),
+                Err(m) => err(m),
+            };
+        }
+        // DATACENTER-10 — pool placement read (membership / master).
+        "host-pool" => {
+            return match host_pool(req_body) {
+                Ok((pool, master, is_master)) => json!({
+                    "ok": true,
+                    "pool": pool,
+                    "master": master,
+                    "is_master": is_master,
+                })
+                .to_string(),
+                Err(m) => err(m),
+            };
+        }
         "gateway-reboot" => {
             return match gateway_reboot(req_body) {
                 Ok(()) => json!({ "ok": true }).to_string(),
@@ -593,53 +780,20 @@ pub fn build_reply(svc: &HostOpsService, verb: &str, req_body: Option<&str>) -> 
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
 
-    // SECURITY: only act on a dom0 in the configured allowed set — never SSH an
-    // attacker-supplied host. Checked BEFORE building/running anything.
-    if !crate::workers::datacenter_orchestrator::xen_dom0s()
-        .iter()
-        .any(|d| d == dom0)
-    {
-        return err("dom0 not in allowed set".into());
-    }
-
+    // Map the op to its `xe` verb sequence BEFORE any SSH — an unknown op never
+    // reaches the network.
     let verbs = match host_power_commands(op) {
         Ok(v) => v,
         Err(e) => return err(e),
     };
 
-    let key = crate::workers::datacenter_orchestrator::xen_ssh_key();
-
-    // Resolve the host's UUID remotely. `--minimal` prints just the value.
-    let uuid = match ssh_xe_status(&key, dom0, "xe host-list params=uuid --minimal") {
-        Ok(o) if o.status.success() => {
-            let out = String::from_utf8_lossy(&o.stdout);
-            // `--minimal` yields a comma-separated list for multiple hosts; on a
-            // single-host pool member it's one uuid. Take the first.
-            out.trim()
-                .split(',')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string()
-        }
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            let msg = stderr.trim();
-            return if msg.is_empty() {
-                err("host-list failed".into())
-            } else {
-                err(msg.to_string())
-            };
-        }
-        Err(e) => return err(format!("ssh failed: {e}")),
+    // SECURITY + resolution in one place (shared with the host-impact / host-pool
+    // reads): allow-list check FIRST, then resolve+validate the host uuid. Never
+    // SSHes an attacker-supplied host.
+    let (key, uuid) = match resolve_dom0_uuid(dom0) {
+        Ok(pair) => pair,
+        Err(m) => return err(m),
     };
-    if uuid.is_empty() {
-        return err("host uuid not found".into());
-    }
-    // The remote uuid is XAPI-generated; guard anyway before interpolation.
-    if !uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
-        return err("host uuid contains invalid characters".into());
-    }
 
     // Run each verb in sequence; stop at the first failure.
     for v in &verbs {
@@ -708,6 +862,8 @@ mod tests {
     #[test]
     fn topic_and_verbs_lock() {
         assert_eq!(action_topic("host-power"), "action/dc/host-power");
+        assert_eq!(action_topic("host-impact"), "action/dc/host-impact");
+        assert_eq!(action_topic("host-pool"), "action/dc/host-pool");
         assert_eq!(action_topic("gateway-reboot"), "action/dc/gateway-reboot");
         assert_eq!(action_topic("dr-backup"), "action/dc/dr-backup");
         assert_eq!(action_topic("gateway-status"), "action/dc/gateway-status");
@@ -720,6 +876,8 @@ mod tests {
             "action/dc/lighthouse-promote"
         );
         assert!(ACTION_VERBS.contains(&"host-power"));
+        assert!(ACTION_VERBS.contains(&"host-impact"));
+        assert!(ACTION_VERBS.contains(&"host-pool"));
         assert!(ACTION_VERBS.contains(&"gateway-reboot"));
         assert!(ACTION_VERBS.contains(&"dr-backup"));
         assert!(ACTION_VERBS.contains(&"gateway-status"));
@@ -964,13 +1122,71 @@ mod tests {
             host_power_commands("reboot").unwrap(),
             vec!["host-disable".to_string(), "host-reboot".to_string()]
         );
+        // DATACENTER-10 — shutdown + evacuate both disable first (XAPI gate), then
+        // their terminal verb.
+        assert_eq!(
+            host_power_commands("shutdown").unwrap(),
+            vec!["host-disable".to_string(), "host-shutdown".to_string()]
+        );
+        assert_eq!(
+            host_power_commands("evacuate").unwrap(),
+            vec!["host-disable".to_string(), "host-evacuate".to_string()]
+        );
     }
 
     #[test]
     fn host_power_commands_unknown_op_errors() {
         assert!(host_power_commands("destroy").is_err());
         assert!(host_power_commands("").is_err());
-        assert!(host_power_commands("shutdown").is_err());
+        // A bogus op is rejected; the five mapped ops above are not.
+        assert!(host_power_commands("poweroff").is_err());
+    }
+
+    #[test]
+    fn parse_running_count_counts_nonblank_uuids() {
+        // Empty reply → zero affected guests.
+        assert_eq!(parse_running_count(""), 0);
+        assert_eq!(parse_running_count("  \n"), 0);
+        // One uuid.
+        assert_eq!(parse_running_count("uuid-a\n"), 1);
+        // A comma-separated minimal list, with a trailing blank.
+        assert_eq!(parse_running_count("a,b,c"), 3);
+        assert_eq!(parse_running_count("a, b ,c,"), 3);
+    }
+
+    #[test]
+    fn parse_pool_flags_the_master() {
+        // This host IS the master.
+        let (pool, master, is_master) = parse_pool(" lab-pool \n", " m-uuid \n", "m-uuid");
+        assert_eq!(pool, "lab-pool");
+        assert_eq!(master, "m-uuid");
+        assert!(is_master);
+        // A pool member that is NOT the master.
+        let (_, _, is_master) = parse_pool("lab-pool", "m-uuid", "other-uuid");
+        assert!(!is_master);
+        // An empty master line never falsely flags a host as master.
+        let (_, master, is_master) = parse_pool("lab-pool", "", "");
+        assert_eq!(master, "");
+        assert!(!is_master);
+    }
+
+    #[test]
+    fn host_impact_and_pool_reject_dom0_not_in_allowed_set() {
+        // With MCNF_XEN_DOM0S unset the allowed set is empty, so both reads bail
+        // out BEFORE any SSH (the shared `resolve_dom0_uuid` allow-list guard).
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        let body = json!({ "dom0": "10.0.0.1" }).to_string();
+        let r = build_reply(&s, "host-impact", Some(&body));
+        assert!(r.contains("dom0 not in allowed set"), "{r}");
+        let r = build_reply(&s, "host-pool", Some(&body));
+        assert!(r.contains("dom0 not in allowed set"), "{r}");
+    }
+
+    #[test]
+    fn host_impact_and_pool_missing_body_error() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        assert!(build_reply(&s, "host-impact", None).contains("missing request body"));
+        assert!(build_reply(&s, "host-pool", None).contains("missing request body"));
     }
 
     #[test]
