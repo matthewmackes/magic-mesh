@@ -32,6 +32,8 @@ use cosmic::iced::{Background, Border, Length, Padding, Task};
 use cosmic::{Element, Theme};
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, Rgba, TypeRole};
 
+use mackes_mesh_types::ddns::{DdnsConfig, RecordDef};
+
 use crate::controls::{variant_button, ButtonVariant};
 use crate::cosmic_compat::prelude::*;
 
@@ -97,6 +99,24 @@ pub struct VpnPanel {
     pub busy: bool,
     /// The add/edit-tunnel wizard, present while the operator is running it.
     pub wizard: Option<Wizard>,
+    /// DDNS-EGRESS-5 — the published-hostname context: the loaded `[ddns]` config
+    /// (its record definitions) + the local node short name, so each tunnel card
+    /// can show the DDNS name it publishes under and whether it's in sync. Loaded
+    /// best-effort alongside the tunnels (DDNS off ⇒ no published line, never an
+    /// error). All real over `action/ddns/get-config` + `action/nebula/self-node`.
+    pub ddns: DdnsContext,
+}
+
+/// DDNS-EGRESS-5 — the DDNS context a tunnel card reads to render its "published
+/// as <hostname>" line: the loaded record definitions + the local node short name
+/// (for `{node}` templating). Empty when DDNS is unreadable/disabled — the line is
+/// simply omitted rather than shown as an error.
+#[derive(Debug, Clone, Default)]
+pub struct DdnsContext {
+    /// The loaded `[ddns]` config (zone + record definitions).
+    pub config: DdnsConfig,
+    /// The local node short name (`self-node` host), the `{node}` substitution.
+    pub node: String,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +155,9 @@ pub enum Message {
     ProvidersLoaded(Result<Vec<ProviderInfo>, String>),
     /// A `setup-provider` (save) reply landed.
     SetupFinished(Result<String, String>),
+    /// DDNS-EGRESS-5 — the published-hostname context (`action/ddns/get-config` +
+    /// `action/nebula/self-node`) landed, for the per-card "published as" line.
+    DdnsContextLoaded(DdnsContext),
 }
 
 /// The live exit-IP / health verdict for one tunnel, decoded from a
@@ -156,11 +179,29 @@ impl VpnPanel {
     /// its own current-thread runtime, so the blocking fetch rides
     /// `spawn_blocking`, never the iced executor.
     pub fn load() -> Task<crate::Message> {
+        Task::batch([
+            Task::perform(
+                async move {
+                    let joined = tokio::task::spawn_blocking(fetch_tunnels).await;
+                    let result = joined.unwrap_or_else(|e| Err(format!("vpn fetch task: {e}")));
+                    crate::Message::Vpn(Message::Loaded(result))
+                },
+                |m| m,
+            ),
+            Self::load_ddns_context(),
+        ])
+    }
+
+    /// DDNS-EGRESS-5 — fetch the DDNS record context (config + node short name) for
+    /// the per-card "published as" line. Best-effort: an unreadable/disabled DDNS
+    /// yields an empty context (the line is omitted), never a panel error. Blocking
+    /// → `spawn_blocking`.
+    fn load_ddns_context() -> Task<crate::Message> {
         Task::perform(
             async move {
-                let joined = tokio::task::spawn_blocking(fetch_tunnels).await;
-                let result = joined.unwrap_or_else(|e| Err(format!("vpn fetch task: {e}")));
-                crate::Message::Vpn(Message::Loaded(result))
+                let joined = tokio::task::spawn_blocking(fetch_ddns_context).await;
+                let ctx = joined.unwrap_or_default();
+                crate::Message::Vpn(Message::DdnsContextLoaded(ctx))
             },
             |m| m,
         )
@@ -307,6 +348,10 @@ impl VpnPanel {
                     }
                 }
             }
+            Message::DdnsContextLoaded(ctx) => {
+                self.ddns = ctx;
+                Task::none()
+            }
         }
     }
 
@@ -384,7 +429,7 @@ impl VpnPanel {
             ));
         } else {
             for t in &self.tunnels {
-                body_col = body_col.push(tunnel_card(t, self.busy, palette));
+                body_col = body_col.push(tunnel_card(t, &self.ddns, self.busy, palette));
             }
             body_col = body_col.push(
                 text(format!(
@@ -415,7 +460,12 @@ impl VpnPanel {
 /// One tunnel's card: a provider · liveness header, the detail + interface
 /// lines, the live verified exit IP + health verdict + kill-switch posture, and
 /// the Verify / Up·Down / Edit / Remove actions.
-fn tunnel_card<'a>(t: &VpnRow, busy: bool, palette: Palette) -> Element<'a, crate::Message> {
+fn tunnel_card<'a>(
+    t: &VpnRow,
+    ddns: &DdnsContext,
+    busy: bool,
+    palette: Palette,
+) -> Element<'a, crate::Message> {
     let sizes = FontSize::defaults();
     let (badge_icon, badge_color, badge_label) = if t.up {
         (Icon::StatusOk, palette.success, "up")
@@ -454,6 +504,14 @@ fn tunnel_card<'a>(t: &VpnRow, busy: bool, palette: Palette) -> Element<'a, crat
     // Kill-switch posture (VPN-GW-3): engaged ⇒ egress blocked (leak-proof) when
     // the tunnel is down; cleared ⇒ egress flows when up.
     inner = inner.push(kill_switch_line(t, palette));
+
+    // DDNS-EGRESS-5 — "published as <hostname>": when a DDNS record names this
+    // tunnel as its source, show the FQDN it publishes under + whether the live
+    // exit IP currently backs it. Omitted entirely when no record targets this
+    // tunnel (DDNS off / a different source).
+    if let Some(line) = published_as(t, ddns) {
+        inner = inner.push(line);
+    }
 
     // Up XOR Down (the relevant transition), Verify, Edit, Remove.
     let toggle_label = if t.up { "Down" } else { "Up" };
@@ -549,6 +607,99 @@ fn kill_switch_line<'a>(t: &VpnRow, palette: Palette) -> Element<'a, crate::Mess
     ]
     .spacing(8)
     .into()
+}
+
+/// DDNS-EGRESS-5 — the published-DNS verdict for one tunnel, paired with its
+/// status colour: where the tunnel publishes (the DDNS FQDN) and whether the live
+/// exit IP currently backs it. Pure value the card renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedAs {
+    /// The FQDN(s) this tunnel is published under (one per matching record).
+    pub fqdns: Vec<String>,
+    /// Whether the name currently resolves to the live exit IP: synced (up +
+    /// verified exit IP), pending (up but exit not yet verified — run Verify),
+    /// or down (the tunnel is down, so the published name is stale/parked).
+    pub state: PublishState,
+}
+
+/// DDNS-EGRESS-5 — whether a tunnel's published DNS name currently resolves to its
+/// live exit IP. Derived purely from the tunnel's liveness + verified exit IP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishState {
+    /// Up + a verified exit IP — the name resolves to the live exit.
+    Synced,
+    /// Up but the exit IP hasn't been verified yet (no Verify run) — unknown.
+    Pending,
+    /// The tunnel is down — the published name is stale (or parked by the
+    /// on-down policy); it does not resolve to a live exit.
+    Down,
+}
+
+/// DDNS-EGRESS-5 — derive the published-DNS verdict for a tunnel from the loaded
+/// DDNS records + the tunnel's live row. Pure (no I/O) — finds every record whose
+/// source is `tunnel:<t.id>`, templates each FQDN the same way the worker does
+/// (`{node}`/`{provider}` → the node short name / the tunnel id), and folds the
+/// tunnel's liveness/verified-exit-IP into the resolve state. Returns `None` when
+/// no record targets this tunnel (the line is then omitted). Unit-tested.
+#[must_use]
+pub fn published_for(t: &VpnRow, ddns: &DdnsContext) -> Option<PublishedAs> {
+    let want = format!("tunnel:{}", t.id);
+    let fqdns: Vec<String> = ddns
+        .config
+        .record
+        .iter()
+        .filter(|r| r.source.trim() == want)
+        .map(|r| record_fqdn(r, &ddns.node, &t.id, &ddns.config.zone))
+        .collect();
+    if fqdns.is_empty() {
+        return None;
+    }
+    let state = if !t.up {
+        PublishState::Down
+    } else if t.exit_ip.is_some() {
+        PublishState::Synced
+    } else {
+        PublishState::Pending
+    };
+    Some(PublishedAs { fqdns, state })
+}
+
+/// DDNS-EGRESS-5 — template a record's FQDN for a tunnel source, mirroring the
+/// worker: `{provider}` is the tunnel id (the operator names the tunnel after the
+/// provider). Pure.
+#[must_use]
+fn record_fqdn(rec: &RecordDef, node: &str, tunnel_id: &str, zone: &str) -> String {
+    rec.fqdn(node, tunnel_id.trim(), 1, zone)
+}
+
+/// DDNS-EGRESS-5 — the "published as <hostname>" card line, or `None` when no DDNS
+/// record targets this tunnel. The hostname(s) + an in-sync indicator coloured by
+/// the resolve state (synced/pending/down). All from the loaded DDNS context — no
+/// extra network (it reuses the tunnel's already-fetched liveness + exit IP).
+fn published_as<'a>(t: &VpnRow, ddns: &DdnsContext) -> Option<Element<'a, crate::Message>> {
+    let p = published_for(t, ddns)?;
+    let sizes = FontSize::defaults();
+    let palette = crate::live_theme::palette();
+    let (color, note) = match p.state {
+        PublishState::Synced => (palette.success, "resolves to the live exit IP"),
+        PublishState::Pending => (palette.warning, "exit not yet verified — run Verify"),
+        PublishState::Down => (palette.text_muted, "down — name is stale/parked"),
+    };
+    let names = p.fqdns.join(", ");
+    let body = format!("{names} · {note}");
+    Some(
+        row![
+            text("Published")
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(palette.text_muted.into_cosmic_color())
+                .width(Length::Fixed(72.0)),
+            text(body)
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(color.into_cosmic_color()),
+        ]
+        .spacing(8)
+        .into(),
+    )
 }
 
 /// Map a `verify-egress` health tag → (colour, short label). Pure — unit-tested.
@@ -1331,6 +1482,43 @@ fn fetch_tunnels() -> Result<Vec<VpnRow>, String> {
     Ok(rows)
 }
 
+/// DDNS-EGRESS-5 — fetch the DDNS record context (the `[ddns]` config +
+/// the local node short name) for the per-card "published as" line. Best-effort:
+/// an unreadable/disabled DDNS or self-node yields an empty context (the line is
+/// then omitted), never an error — the VPN panel must render with or without DDNS.
+/// Blocking (the Bus client owns a current-thread runtime).
+fn fetch_ddns_context() -> DdnsContext {
+    let config = crate::dbus::action_request("action/ddns/get-config", VPN_TIMEOUT)
+        .and_then(|raw| parse_ddns_config(&raw))
+        .unwrap_or_default();
+    let node = crate::dbus::nebula_request("self-node")
+        .and_then(|raw| {
+            serde_json::from_str::<serde_json::Value>(raw.trim())
+                .ok()
+                .and_then(|v| {
+                    v.get("host")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                })
+        })
+        .unwrap_or_default();
+    DdnsContext { config, node }
+}
+
+/// DDNS-EGRESS-5 — pure decoder for the `action/ddns/get-config` reply
+/// `{"ok":true,"config":<DdnsConfig>}` → the [`DdnsConfig`]; any error/missing
+/// field → `None` (best-effort context, never a hard failure).
+#[must_use]
+fn parse_ddns_config(raw: &str) -> Option<DdnsConfig> {
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    if v.get("error").is_some() {
+        return None;
+    }
+    serde_json::from_value(v.get("config")?.clone()).ok()
+}
+
 /// Fetch the provider catalog over the Bus (`list-providers`). Blocking.
 fn fetch_providers() -> Result<Vec<ProviderInfo>, String> {
     let raw = crate::dbus::action_request("action/vpn/list-providers", VPN_TIMEOUT)
@@ -1822,6 +2010,129 @@ mod tests {
         );
     }
 
+    // ── DDNS-EGRESS-5: the per-card "published as" line ──
+
+    fn ddns_ctx(records: Vec<(&str, &str)>) -> DdnsContext {
+        DdnsContext {
+            config: DdnsConfig {
+                zone: "services.matthewmackes.com".into(),
+                record: records
+                    .into_iter()
+                    .map(|(name, source)| RecordDef {
+                        name: name.into(),
+                        source: source.into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            node: "eagle".into(),
+        }
+    }
+
+    #[test]
+    fn published_for_templates_the_fqdn_and_tracks_sync_state() {
+        let ctx = ddns_ctx(vec![("{node}-{provider}", "tunnel:mullvad1")]);
+        // Up + a verified exit IP → synced, FQDN templated with node + tunnel id.
+        let up = VpnRow {
+            id: "mullvad1".into(),
+            up: true,
+            exit_ip: Some("203.0.113.7".into()),
+            ..Default::default()
+        };
+        let p = published_for(&up, &ctx).expect("a record targets this tunnel");
+        assert_eq!(p.fqdns, vec!["eagle-mullvad1.services.matthewmackes.com"]);
+        assert_eq!(p.state, PublishState::Synced);
+
+        // Up but no verified exit IP yet → pending (run Verify).
+        let pending = VpnRow {
+            id: "mullvad1".into(),
+            up: true,
+            exit_ip: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            published_for(&pending, &ctx).unwrap().state,
+            PublishState::Pending
+        );
+
+        // Down → the published name is stale/parked.
+        let down = VpnRow {
+            id: "mullvad1".into(),
+            up: false,
+            exit_ip: Some("203.0.113.7".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            published_for(&down, &ctx).unwrap().state,
+            PublishState::Down
+        );
+    }
+
+    #[test]
+    fn published_for_is_none_when_no_record_targets_the_tunnel() {
+        // A record for a DIFFERENT tunnel, plus a WAN record — neither names this
+        // tunnel, so the line is omitted.
+        let ctx = ddns_ctx(vec![("a", "tunnel:other"), ("b", "wan")]);
+        let t = VpnRow {
+            id: "mullvad1".into(),
+            up: true,
+            exit_ip: Some("1.2.3.4".into()),
+            ..Default::default()
+        };
+        assert!(published_for(&t, &ctx).is_none());
+        // No DDNS config at all → no line.
+        assert!(published_for(&t, &DdnsContext::default()).is_none());
+    }
+
+    #[test]
+    fn published_for_lists_every_matching_record() {
+        // Two records can name the same tunnel (e.g. an identity + a service name).
+        let ctx = ddns_ctx(vec![
+            ("{node}-{provider}", "tunnel:m1"),
+            ("vpn-{node}", "tunnel:m1"),
+        ]);
+        let t = VpnRow {
+            id: "m1".into(),
+            up: true,
+            exit_ip: Some("1.2.3.4".into()),
+            ..Default::default()
+        };
+        let p = published_for(&t, &ctx).unwrap();
+        assert_eq!(p.fqdns.len(), 2);
+        assert!(p
+            .fqdns
+            .contains(&"eagle-m1.services.matthewmackes.com".to_string()));
+        assert!(p
+            .fqdns
+            .contains(&"vpn-eagle.services.matthewmackes.com".to_string()));
+    }
+
+    #[test]
+    fn parse_ddns_config_decodes_and_degrades() {
+        let cfg = parse_ddns_config(
+            r#"{"ok":true,"config":{"enabled":true,"zone":"z.example","ttl":30,
+               "record":[{"name":"{node}-{provider}","source":"tunnel:m1","on_down":"keep"}]}}"#,
+        )
+        .expect("ok envelope decodes");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.zone, "z.example");
+        assert_eq!(cfg.record.len(), 1);
+        // Error / missing-config / garbage all degrade to None (best-effort).
+        assert!(parse_ddns_config(r#"{"error":"x"}"#).is_none());
+        assert!(parse_ddns_config(r#"{"ok":true}"#).is_none());
+        assert!(parse_ddns_config("garbage").is_none());
+    }
+
+    #[test]
+    fn ddns_context_loaded_stores_the_context() {
+        let mut panel = VpnPanel::new();
+        let ctx = ddns_ctx(vec![("{node}-{provider}", "tunnel:m1")]);
+        let _ = panel.update(Message::DdnsContextLoaded(ctx));
+        assert_eq!(panel.ddns.node, "eagle");
+        assert_eq!(panel.ddns.config.record.len(), 1);
+    }
+
     #[test]
     fn health_badge_maps_every_verdict_tag() {
         let p = Palette::dark();
@@ -2227,7 +2538,23 @@ mod tests {
         panel.tunnels[0].exit_ip = Some("203.0.113.7".into());
         panel.tunnels[0].health = "ok".into();
         panel.status = "m1 up — wg-quick up".into();
-        let _ = panel.view(); // a live tunnel card + exit line + status strip
+        // DDNS-EGRESS-5 — a record publishing this tunnel, so the card shows the
+        // "published as <hostname>" line.
+        panel.ddns = DdnsContext {
+            config: DdnsConfig {
+                zone: "services.matthewmackes.com".into(),
+                record: vec![RecordDef {
+                    name: "{node}-{provider}".into(),
+                    source: "tunnel:m1".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            node: "eagle".into(),
+        };
+        let _ = panel.view(); // a live tunnel card + exit line + published line + status strip
+        panel.tunnels[0].up = false;
+        let _ = panel.view(); // down → published line shows stale/parked
 
         // The wizard surface renders every step without panic.
         let _ = panel.update(Message::OpenWizard { edit_id: None });
