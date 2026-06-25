@@ -56,7 +56,8 @@ use cosmic::iced::widget::canvas::{self, Frame, Path, Text};
 use cosmic::iced::widget::text::Alignment;
 use cosmic::iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
 use cosmic::iced::{
-    Background, Border, Element, Length, Padding, Pixels, Point, Size, Subscription, Task,
+    mouse, Background, Border, Element, Length, Padding, Pixels, Point, Rectangle, Size,
+    Subscription, Task,
 };
 use cosmic::Theme;
 use mde_theme::{FontSize, Palette, TypeRole};
@@ -88,6 +89,13 @@ pub enum Message {
     /// the [`FrontDoor::loading`] skeleton on the first arrival. Boxed so the
     /// enum stays small (clippy `large_enum_variant`).
     Loaded(Box<FrontDoorData>),
+    /// FRONTDOOR-5 — a tile was left-clicked on the canvas (Q45). Carries the
+    /// clicked tile's index into [`FrontDoor::tiles`]; the handler opens that
+    /// tile's detail **actions menu** (Q49) over the grid.
+    TileActivated(usize),
+    /// FRONTDOOR-5 — the detail actions-menu's back/close control was pressed;
+    /// return to the tile grid.
+    CloseDetail,
 }
 
 /// FRONTDOOR-3 — which of the two locked render modes the Front Door is in
@@ -201,6 +209,100 @@ impl Tile {
             tone,
             key: Some(key),
             value: None,
+        }
+    }
+
+    /// FRONTDOOR-5 — the **real** actions for this tile's detail menu (Q49), in
+    /// menu order. Every entry navigates to an EXISTING panel via the app router
+    /// ([`crate::Message::SelectPanel`]) or launches a real installed app
+    /// ([`crate::Message::LaunchApp`]) — no stubs, no `todo!` (§7). The rich
+    /// 1-click DevOps / Data-Center action *sets* are FRONTDOOR-7/8; here the
+    /// detail simply routes to the surface that already owns those actions.
+    ///
+    /// A tile with no workbench-readable destination yet (Copilot — backend only,
+    /// no route/app the workbench can open) returns an empty list: the detail
+    /// still renders its live data + the always-real Back control, rather than a
+    /// dead button.
+    fn actions(&self) -> Vec<TileAction> {
+        // Widget tiles route by their key; launchers route by their label.
+        match self.key {
+            Some(TileKey::MeshMap) => vec![
+                TileAction::nav("Open Peers map", Group::Mesh, "peers"),
+                TileAction::nav("Open Routing", Group::Mesh, "routing"),
+            ],
+            Some(TileKey::NodeHealth) => vec![
+                TileAction::nav("Open Peers", Group::Mesh, "peers"),
+                TileAction::nav("Open Fleet Roster", Group::Fleet, "inventory"),
+            ],
+            Some(TileKey::DataCenter) => vec![
+                TileAction::nav("Open Datacenter", Group::Provisioning, "datacenter"),
+                TileAction::nav("Open Peers", Group::Mesh, "peers"),
+            ],
+            Some(TileKey::BuildFarm) => vec![
+                TileAction::nav("Open Build Farm", Group::Provisioning, "build-farm"),
+                TileAction::nav("Open Jobs", Group::Fleet, "jobs"),
+            ],
+            Some(TileKey::DevOps) => vec![
+                TileAction::nav("Open Build Farm", Group::Provisioning, "build-farm"),
+                TileAction::nav("Open Jobs", Group::Fleet, "jobs"),
+            ],
+            Some(TileKey::Alerts) => vec![
+                TileAction::nav("Open Datacenter", Group::Provisioning, "datacenter"),
+                TileAction::nav("Open Health", Group::Monitoring, "health_check"),
+            ],
+            Some(TileKey::System) => vec![
+                TileAction::nav("Open Health", Group::Monitoring, "health_check"),
+                TileAction::launch("Open Settings", "cosmic-settings"),
+            ],
+            // Copilot is seeded as a launcher (no key) — backend only
+            // (FRONTDOOR-12), no route/app the workbench can open yet — so it
+            // falls into the launcher arm below and yields an empty action list.
+            Some(TileKey::Copilot) => Vec::new(),
+            // Plain app launchers route to their real installed app / in-app
+            // surface. Each binary/route is one the workbench already opens
+            // elsewhere (notify-center / launcher / the Music panel). Copilot
+            // has no openable surface yet → honest empty list (§7 — needs a
+            // publisher), still rendering its data + the Back control.
+            None => match self.label.as_str() {
+                "Files" => vec![TileAction::launch("Open Files", "mde-files")],
+                "Terminal" => vec![TileAction::launch("Open Terminal", "cosmic-term")],
+                "Settings" => vec![TileAction::launch("Open Settings", "cosmic-settings")],
+                "Music" => vec![TileAction::nav("Open Music", Group::Mesh, "music")],
+                // Copilot + any unrecognized launcher carry no faked action (§7).
+                _ => Vec::new(),
+            },
+        }
+    }
+}
+
+/// FRONTDOOR-5 — one entry in a tile's detail **actions menu** (Q49). Each is a
+/// real, reachable action (§7): it carries the [`crate::Message`] the app already
+/// handles — a router navigation ([`TileAction::nav`]) to an existing panel, or a
+/// detached app launch ([`TileAction::launch`]). There is no inert variant.
+#[derive(Debug, Clone)]
+pub struct TileAction {
+    /// The menu row's label.
+    pub label: String,
+    /// The app message this action fires — always one `App::update` handles.
+    pub message: crate::Message,
+}
+
+impl TileAction {
+    /// A navigation to an EXISTING panel route, via the app router
+    /// ([`crate::Message::SelectPanel`]). `panel` must be a live panel slug.
+    fn nav(label: &str, group: Group, panel: &'static str) -> Self {
+        Self {
+            label: label.to_string(),
+            message: crate::Message::SelectPanel { group, panel },
+        }
+    }
+
+    /// A detached launch of a real installed app ([`crate::Message::LaunchApp`]),
+    /// the same spawn path the rail / notify-center launchers use.
+    fn launch(label: &str, bin: &'static str) -> Self {
+        Self {
+            label: label.to_string(),
+            message: crate::Message::LaunchApp(bin),
         }
     }
 }
@@ -416,6 +518,11 @@ pub struct FrontDoor {
     /// FRONTDOOR-3 — which render mode the Front Door is in (panel default,
     /// flipped by the top-bar toggle). Default [`Mode::Panel`] (Q29).
     pub mode: Mode,
+    /// FRONTDOOR-5 — the index of the tile whose detail **actions menu** is open
+    /// (Q45/Q49), or `None` when the grid is showing. Set by a canvas tile click
+    /// ([`Message::TileActivated`]); cleared by the menu's back control
+    /// ([`Message::CloseDetail`]) or by leaving / reloading the view.
+    pub detail: Option<usize>,
 }
 
 impl Default for FrontDoor {
@@ -458,6 +565,8 @@ impl FrontDoor {
             loading: true,
             query: String::new(),
             mode: Mode::Panel,
+            // FRONTDOOR-5 — start on the grid; a tile click opens a detail menu.
+            detail: None,
         }
     }
 
@@ -508,10 +617,26 @@ impl FrontDoor {
             // The slow-poll / reconnect tick: fire a fresh off-thread Bus read.
             Message::Reload => Self::load(),
             // A fresh snapshot landed — fold it into the widget tiles and lift
-            // the skeleton (Q92 — the first real data clears `loading`).
+            // the skeleton (Q92 — the first real data clears `loading`). The
+            // detail menu (if open) re-reads its tile by index, so a reload that
+            // refreshes the live `value` line shows through without re-opening.
             Message::Loaded(data) => {
                 self.apply(&data);
                 self.loading = false;
+                Task::none()
+            }
+            // FRONTDOOR-5 — a tile was clicked (Q45): open its detail actions
+            // menu (Q49). Guard the index against a stale click landing after the
+            // tile set changed, so a bad index never opens an empty menu.
+            Message::TileActivated(i) => {
+                if i < self.tiles.len() {
+                    self.detail = Some(i);
+                }
+                Task::none()
+            }
+            // FRONTDOOR-5 — back out of the detail menu to the grid.
+            Message::CloseDetail => {
+                self.detail = None;
                 Task::none()
             }
         }
@@ -542,10 +667,120 @@ impl FrontDoor {
     #[must_use]
     pub fn view(&self) -> Element<'_, crate::Message, Theme> {
         let palette = crate::live_theme::palette();
+        // FRONTDOOR-5 — an open tile detail takes over the pane (Q45/Q49): the
+        // actions menu for the clicked tile, with a Back control to the grid.
+        // Validate the index against the live tile set so a stale index can never
+        // panic the view.
+        if let Some(tile) = self.detail.and_then(|i| self.tiles.get(i)) {
+            return self.detail_view(tile, palette);
+        }
         match self.mode {
             Mode::Panel => self.panel_view(palette),
             Mode::FullScreen => self.fullscreen_view(palette),
         }
+    }
+
+    /// FRONTDOOR-5 — the **detail actions menu** for one tile (Q45 click→detail,
+    /// Q49 detail = actions menu): the tile's label + its live data line, then a
+    /// list of REAL actions (each navigates to an existing panel or launches a
+    /// real app — §7, no stubs), under a Back control that returns to the grid.
+    /// A tile with no openable surface yet (Copilot) shows its data + Back only —
+    /// an honest empty menu rather than a dead button. Carbon chrome via tokens
+    /// only (§4). Rendered for both modes (the grid mode is restored on Back).
+    fn detail_view(&self, tile: &Tile, palette: Palette) -> Element<'_, crate::Message, Theme> {
+        let sizes = FontSize::defaults();
+
+        // Back control — always real (clears the detail), mirrors the mode toggle.
+        let back = {
+            let accent = palette.accent.into_cosmic_color();
+            let raised = palette.raised.into_cosmic_color();
+            let idle_bg = palette.hover_tint().into_cosmic_color();
+            button(
+                text("← Back")
+                    .size(TypeRole::Body.size_in(sizes))
+                    .colr(accent),
+            )
+            .padding(Padding::from([8u16, 14u16]))
+            .sty(
+                move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+                    use cosmic::iced::widget::button::Status;
+                    let bg = match status {
+                        Status::Hovered | Status::Pressed => raised,
+                        _ => idle_bg,
+                    };
+                    cosmic::iced::widget::button::Style {
+                        snap: false,
+                        background: Some(Background::Color(bg)),
+                        text_color: accent,
+                        border: Border {
+                            color: cosmic::iced::Color::TRANSPARENT,
+                            width: 0.0,
+                            radius: 6.0.into(),
+                        },
+                        shadow: cosmic::iced::Shadow::default(),
+                        ..cosmic::iced::widget::button::Style::default()
+                    }
+                },
+            )
+            .on_press(crate::Message::FrontDoor(Message::CloseDetail))
+        };
+
+        // Header: the tile label + its live data line (or a resting note when the
+        // source had nothing this round — never a faked metric, §7).
+        let value_line = match &tile.value {
+            Some(v) => text(v.clone())
+                .size(TypeRole::Body.size_in(sizes))
+                .colr(tile.tone.color(&palette)),
+            None => text("No live data")
+                .size(TypeRole::Body.size_in(sizes))
+                .colr(palette.text_muted.into_cosmic_color()),
+        };
+        let header = column![
+            text(tile.label.clone())
+                .size(TypeRole::Heading.size_in(sizes))
+                .colr(palette.text.into_cosmic_color()),
+            value_line,
+        ]
+        .spacing(4);
+
+        // The actions list — every row is a REAL navigation / launch (§7). An
+        // empty list (Copilot) renders an honest note instead of a dead row.
+        let actions = tile.actions();
+        let mut menu = column![rail_section_label("Actions", palette)].spacing(6);
+        if actions.is_empty() {
+            menu = menu.push(
+                text("No actions available yet for this tile.")
+                    .size(TypeRole::Caption.size_in(sizes))
+                    .colr(palette.text_muted.into_cosmic_color()),
+            );
+        } else {
+            for action in actions {
+                menu = menu.push(detail_action_row(action, palette));
+            }
+        }
+
+        let body = column![
+            back,
+            Space::new().height(Length::Fixed(16.0)),
+            header,
+            Space::new().height(Length::Fixed(20.0)),
+            menu,
+        ]
+        .spacing(8)
+        .width(Length::Fill);
+
+        let scroller = scrollable(container(body).padding(Padding::from([24u16, 24u16])))
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+        container(scroller)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(palette.background.into_cosmic_color())),
+                ..container::Style::default()
+            })
+            .into()
     }
 
     /// FRONTDOOR-2 — the Win10-Start two-pane view: a fixed left **rail** beside a
@@ -908,6 +1143,49 @@ fn accent_tint(accent: cosmic::iced::Color) -> cosmic::iced::Color {
     cosmic::iced::Color { a: 0.28, ..accent }
 }
 
+/// FRONTDOOR-5 — one full-width row in a tile's detail actions menu. Carries the
+/// action's REAL `on_press` message (a panel navigation or app launch — §7, never
+/// a stub). Styled like an emphasized rail link (accent text + a quiet idle wash
+/// that lifts on hover), so the menu reads as a list of live, clickable actions.
+fn detail_action_row<'a>(
+    action: TileAction,
+    palette: Palette,
+) -> Element<'a, crate::Message, Theme> {
+    let accent = palette.accent.into_cosmic_color();
+    let idle_bg = palette.hover_tint().into_cosmic_color();
+
+    button(
+        text(action.label)
+            .size(TypeRole::Body.size_in(FontSize::defaults()))
+            .colr(accent),
+    )
+    .width(Length::Fill)
+    .padding(Padding::from([10u16, 14u16]))
+    .sty(
+        move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+            use cosmic::iced::widget::button::Status;
+            let bg = match status {
+                Status::Hovered | Status::Pressed => accent_tint(accent),
+                _ => idle_bg,
+            };
+            cosmic::iced::widget::button::Style {
+                snap: false,
+                background: Some(Background::Color(bg)),
+                text_color: accent,
+                border: Border {
+                    color: cosmic::iced::Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 6.0.into(),
+                },
+                shadow: cosmic::iced::Shadow::default(),
+                ..cosmic::iced::widget::button::Style::default()
+            }
+        },
+    )
+    .on_press(action.message)
+    .into()
+}
+
 /// The accent strip down the left edge of a card. Mode-independent (it's a hair
 /// of color, not a sized element).
 const STRIP_W: f32 = 5.0;
@@ -1023,10 +1301,77 @@ impl TileGrid {
             pad + row as f32 * (tile_h + gap),
         )
     }
+
+    /// FRONTDOOR-5 — hit-test a canvas-local point against the tile rects, using
+    /// the **same** column/origin/size math `draw` lays out with (so a click
+    /// lands on exactly the card the operator sees). `width` is the canvas's real
+    /// `bounds.width`, which drives the column count. Returns the index of the
+    /// tile under `pos`, or `None` for a click in the gutter / padding / past the
+    /// last tile. Pure + `width`-parameterized so it's unit-tested without a live
+    /// canvas.
+    fn tile_at(&self, pos: Point, width: f32) -> Option<usize> {
+        let layout = self.layout;
+        let (tile_w, tile_h) = (layout.tile_w(), layout.tile_h());
+        let cols = Self::columns(width, layout);
+        for i in 0..self.tiles.len() {
+            let o = Self::tile_origin(i, cols, layout);
+            if pos.x >= o.x && pos.x <= o.x + tile_w && pos.y >= o.y && pos.y <= o.y + tile_h {
+                return Some(i);
+            }
+        }
+        None
+    }
 }
 
 impl canvas::Program<crate::Message> for TileGrid {
     type State = ();
+
+    /// FRONTDOOR-5 — a left-click on a tile opens that tile's detail actions
+    /// menu (Q45). Hit-tests the cursor against the same tile rects `draw` paints
+    /// (via [`TileGrid::tile_at`], driven by the canvas's real `bounds.width`) and
+    /// publishes [`Message::TileActivated`] with the clicked index. A miss (a
+    /// click in the gutter or while the grid is a skeleton) is ignored. Mirrors
+    /// the Peers-map canvas click handler's shape (same `position_in` + publish).
+    fn update(
+        &self,
+        _state: &mut Self::State,
+        event: &cosmic::iced::Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Option<canvas::Action<crate::Message>> {
+        // Skeleton cards aren't interactive (no real tile to detail yet).
+        if self.loading {
+            return None;
+        }
+        if let cosmic::iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event
+        {
+            let pos = cursor.position_in(bounds)?;
+            let i = self.tile_at(pos, bounds.width)?;
+            return Some(canvas::Action::publish(crate::Message::FrontDoor(
+                Message::TileActivated(i),
+            )));
+        }
+        None
+    }
+
+    /// FRONTDOOR-5 — show the pointer cursor while hovering a tile, so the grid
+    /// reads as clickable (the affordance for the Q45 click→detail). A skeleton
+    /// grid or a cursor in the gutter keeps the default arrow.
+    fn mouse_interaction(
+        &self,
+        _state: &Self::State,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> mouse::Interaction {
+        if !self.loading {
+            if let Some(pos) = cursor.position_in(bounds) {
+                if self.tile_at(pos, bounds.width).is_some() {
+                    return mouse::Interaction::Pointer;
+                }
+            }
+        }
+        mouse::Interaction::default()
+    }
 
     fn draw(
         &self,
@@ -1505,5 +1850,135 @@ mod tests {
             ..FrontDoorData::default()
         };
         assert!(data.for_key(TileKey::Copilot).is_none());
+    }
+
+    // ── FRONTDOOR-5: tile click → detail actions menu ──
+
+    /// A `TileGrid` over the seeded tiles at the given layout, in the loaded
+    /// (interactive) state — the shape the canvas sees once data has landed.
+    fn grid(layout: Layout) -> TileGrid {
+        TileGrid {
+            tiles: FrontDoor::new().tiles,
+            loading: false,
+            palette: Palette::dark(),
+            layout,
+        }
+    }
+
+    #[test]
+    fn tile_at_hits_the_card_under_the_cursor_and_misses_the_gutter() {
+        // FRONTDOOR-5 — the hit-test reuses the SAME origin/size/column math
+        // `draw` lays out with, so a point inside a card's rect resolves to that
+        // card's index and a point in the inter-tile gutter resolves to nothing.
+        let g = grid(Layout::Panel);
+        let l = Layout::Panel;
+        let width = 1200.0;
+        let cols = TileGrid::columns(width, l);
+
+        // The center of tile 0 hits tile 0.
+        let o0 = TileGrid::tile_origin(0, cols, l);
+        let c0 = Point::new(o0.x + l.tile_w() / 2.0, o0.y + l.tile_h() / 2.0);
+        assert_eq!(g.tile_at(c0, width), Some(0));
+
+        // The center of tile 1 (next column over) hits tile 1.
+        let o1 = TileGrid::tile_origin(1, cols, l);
+        let c1 = Point::new(o1.x + l.tile_w() / 2.0, o1.y + l.tile_h() / 2.0);
+        assert_eq!(g.tile_at(c1, width), Some(1));
+
+        // The gap between tile 0 and tile 1 is gutter → no hit.
+        let gutter = Point::new(o0.x + l.tile_w() + l.gap() / 2.0, c0.y);
+        assert_eq!(g.tile_at(gutter, width), None);
+
+        // The outer padding (above the first row) is no hit.
+        assert_eq!(g.tile_at(Point::new(c0.x, l.pad() / 2.0), width), None);
+
+        // A point past the last tile is no hit.
+        let last = g.tiles.len() - 1;
+        let ol = TileGrid::tile_origin(last, cols, l);
+        let beyond = Point::new(ol.x + l.tile_w() / 2.0, ol.y + l.tile_h() + l.gap() + 5.0);
+        assert_eq!(g.tile_at(beyond, width), None);
+    }
+
+    #[test]
+    fn tile_activated_opens_the_detail_and_close_returns_to_grid() {
+        // FRONTDOOR-5 — a tile click (Q45) opens that tile's detail; the menu's
+        // Back control (Q49) returns to the grid. Out-of-range indices are
+        // ignored so a stale click never opens an empty menu.
+        let mut fd = FrontDoor::new();
+        assert!(fd.detail.is_none());
+
+        let _ = fd.update(Message::TileActivated(2));
+        assert_eq!(fd.detail, Some(2));
+
+        // Re-activating swaps the open tile.
+        let _ = fd.update(Message::TileActivated(0));
+        assert_eq!(fd.detail, Some(0));
+
+        // Back closes the detail.
+        let _ = fd.update(Message::CloseDetail);
+        assert!(fd.detail.is_none());
+
+        // An out-of-range index is rejected (no panic, stays closed).
+        let _ = fd.update(Message::TileActivated(9_999));
+        assert!(fd.detail.is_none());
+    }
+
+    #[test]
+    fn every_tile_action_is_a_real_navigation_or_launch() {
+        // §7 — every detail action must be a REAL app message (a panel route or
+        // an app launch), never an inert/no-op. Walk every seeded tile's menu and
+        // assert each carries one of the two real message shapes.
+        let fd = FrontDoor::new();
+        for tile in &fd.tiles {
+            for action in tile.actions() {
+                match action.message {
+                    crate::Message::SelectPanel { .. } | crate::Message::LaunchApp(_) => {}
+                    other => panic!("tile {:?} has a non-real action: {other:?}", tile.label),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keyed_widget_tiles_have_real_actions_and_copilot_is_honestly_empty() {
+        // The keyed widgets all route somewhere real (no empty menus); Copilot
+        // (no workbench-readable surface yet) has an honest empty action list
+        // rather than a dead button (§7).
+        let fd = FrontDoor::new();
+        let tile = |label: &str| fd.tiles.iter().find(|t| t.label == label).unwrap();
+
+        for label in [
+            "Mesh Map",
+            "Build / Farm",
+            "Alerts",
+            "Node Health",
+            "System",
+            "Data Center",
+            "DevOps",
+        ] {
+            assert!(
+                !tile(label).actions().is_empty(),
+                "widget tile {label} should expose at least one real action"
+            );
+        }
+        // Copilot — empty, but never faked.
+        assert!(tile("Copilot").actions().is_empty());
+    }
+
+    #[test]
+    fn detail_view_builds_for_a_keyed_tile_and_for_copilot() {
+        // The detail actions-menu view constructs for a tile with actions + live
+        // data, and for the action-less Copilot (data + Back only) — neither
+        // panics.
+        let mut fd = FrontDoor::new();
+        fd.loading = false;
+
+        let mesh_idx = fd.tiles.iter().position(|t| t.label == "Mesh Map").unwrap();
+        let _ = fd.update(Message::TileActivated(mesh_idx));
+        let _: Element<'_, crate::Message, Theme> = fd.view();
+
+        let copilot_idx = fd.tiles.iter().position(|t| t.label == "Copilot").unwrap();
+        let _ = fd.update(Message::TileActivated(copilot_idx));
+        let _: Element<'_, crate::Message, Theme> = fd.view();
     }
 }

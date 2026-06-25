@@ -1953,12 +1953,12 @@ clean+reachable smoke); visual gate lifted.
     - [ ] 4 resizable tile sizes on a snap-grid, auto-grouped by category, plus app-launch tiles
     - [ ] each widget updates live from a real bus topic (no `demo_data`/placeholder, §7)
 
-- [ ] **FRONTDOOR-5: tile detail actions-menu + tile management.**
+- [✓] **FRONTDOOR-5: tile detail actions-menu + tile management.**
   **As** an operator, **I want** clicking a tile to show what I can do with it,
   **so that** every resource's actions are one click deep.
   **Acceptance**:
-    - [ ] tile click opens a detail view = an actions menu for that resource (live data + actions)
-    - [ ] tiles arranged via the settings panel; Copilot can author a custom tile from any data/command
+    - [✓] tile click opens a detail view = an actions menu for that resource (live data + actions) — `TileGrid::update` hit-tests the canvas left-click (reusing the draw layout math) → `TileActivated`; the detail menu shows the tile's live data + REAL actions that navigate to the owning panel (Mesh→peers/routing, Provisioning→build-farm/datacenter, Fleet→inventory/jobs, Monitoring→health) or launch a real app (settings/files/terminal/music), with Back to the grid (§7 — no stubs; Copilot is an honest empty menu pending a publisher). Pointer cursor on hover via `mouse_interaction`.
+    - [ ] tiles arranged via the settings panel; Copilot can author a custom tile from any data/command — DEFERRED to FRONTDOOR-14 (arrangement/settings) + FRONTDOOR-10 (Copilot authoring); FD-7/8 own the rich 1-click action sets the detail menu currently just routes to.
 
 - [ ] **FRONTDOOR-6: unified omnibox search.**
   **As** an operator, **I want** one box that finds apps, files, mesh, and asks the AI,

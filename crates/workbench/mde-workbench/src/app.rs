@@ -785,6 +785,10 @@ impl App {
             Message::SelectGroup(group) => {
                 self.view = View::Group(group);
                 self.focused_pane = Pane::Main;
+                // FRONTDOOR-5 — leaving (or re-entering) the Front Door drops any
+                // open tile detail, so it always lands on the grid, not a stale
+                // actions menu from a prior visit.
+                self.front_door.detail = None;
                 self.on_group_navigated(group)
             }
             // PLANES-20 / W87 — open the Peers Front Door filtered to the
@@ -803,6 +807,9 @@ impl App {
             Message::SelectPanel { group, panel } => {
                 self.view = View::Panel { group, panel };
                 self.focused_pane = Pane::Main;
+                // FRONTDOOR-5 — see SelectGroup: any navigation resets the Front
+                // Door to its grid (no stale tile detail on return).
+                self.front_door.detail = None;
                 self.on_panel_navigated(group, panel)
             }
             Message::ToggleGroupExpansion(group) => {
