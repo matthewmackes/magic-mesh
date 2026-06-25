@@ -1913,3 +1913,128 @@ the plane and it **survives killing the current zone leader**.
   dead nav (§7 reachability).
   **Acceptance**:
     - [ ] `compute`, `vm_wizard`, `snapshots`, `images`, `lighthouses`, `build_farm` logic reused as Datacenter tabs; the now-duplicate nav entries removed; no unreachable `pub mod` left behind
+
+## FRONTDOOR — the Magic Mesh Front Door / App Menu redesign (operator 2026-06-25; design: docs/design/front-door.md)
+
+100-question survey locked 2026-06-25. Refactors `mde-workbench` in place into the
+primary mesh+OS interface: Win10-Start panel / iPadOS full-screen, custom wgpu render
+(kills the 4s), Carbon look, and a proactive **Copilot** (codex on the leader) living
+in the tiles. Ships as one release across parallel tracks. DoD §7 (build+test+token-
+clean+reachable smoke); visual gate lifted.
+
+- [ ] **FRONTDOOR-1: shell + perf — the custom wgpu grid renderer.**
+  **As** an operator, **I want** the menu to open in under a second,
+  **so that** the 4-second render is gone and it feels instant.
+  **Acceptance**:
+    - [ ] a custom wgpu renderer draws the tile/icon grid inside the iced `mde-workbench` shell
+    - [ ] cold open <1s, skeleton placeholders while data streams, no layout shift on fill
+    - [ ] the old slow launcher render path is removed (no dead code left behind, §7)
+
+- [ ] **FRONTDOOR-2: the Win10-Start panel + left rail.**
+  **As** an operator, **I want** a two-pane Start panel summoned by the Super key,
+  **so that** identity, power, pinned apps, and DevOps/Data Center are one keystroke away.
+  **Acceptance**:
+    - [ ] Super/Win summons a Carbon panel: left rail (identity · power+mesh-power tile · pinned · DevOps · Data Center) + right live-tile grid
+    - [ ] top full-width omnibox; follow-OS theme, Carbon Blue 60, expressive motion, blurred mesh-wallpaper backdrop
+    - [ ] Esc dismisses; renders through `mde-theme` tokens (no raw hex/metrics, §4)
+
+- [ ] **FRONTDOOR-3: the iPadOS full-screen mode.**
+  **As** an operator, **I want** a full-screen toggle that feels like the iPadOS home,
+  **so that** I get an immersive paged grid for browsing apps + widgets.
+  **Acceptance**:
+    - [ ] a toggle switches the panel to full-screen: paged rounded-icon grid + widgets, no dock
+    - [ ] paging works (swipe/click); same tile model as the panel; reuses the wgpu renderer
+
+- [ ] **FRONTDOOR-4: live tiles + widgets over mde-bus.**
+  **As** an operator, **I want** tiles that show live mesh/DevOps data,
+  **so that** the menu is a dashboard, not just launchers.
+  **Acceptance**:
+    - [ ] default widgets: mesh map, build/farm, alerts, node health, Copilot, system — fed by mackesd workers over mde-bus topics (event-driven + slow-poll fallback)
+    - [ ] 4 resizable tile sizes on a snap-grid, auto-grouped by category, plus app-launch tiles
+    - [ ] each widget updates live from a real bus topic (no `demo_data`/placeholder, §7)
+
+- [ ] **FRONTDOOR-5: tile detail actions-menu + tile management.**
+  **As** an operator, **I want** clicking a tile to show what I can do with it,
+  **so that** every resource's actions are one click deep.
+  **Acceptance**:
+    - [ ] tile click opens a detail view = an actions menu for that resource (live data + actions)
+    - [ ] tiles arranged via the settings panel; Copilot can author a custom tile from any data/command
+
+- [ ] **FRONTDOOR-6: unified omnibox search.**
+  **As** an operator, **I want** one box that finds apps, files, mesh, and asks the AI,
+  **so that** typing anything gets me there.
+  **Acceptance**:
+    - [ ] unified scope (apps + files + mesh nodes/services + AI), instant local results first
+    - [ ] the AI answer streams in below as a distinct card; AI ranks the merged result list; no special syntax
+
+- [ ] **FRONTDOOR-7: DevOps surface — one-click pipeline.**
+  **As** an operator, **I want** build/CI + the farm at a glance with one-click actions,
+  **so that** the everyday DevOps loop is immediate.
+  **Acceptance**:
+    - [ ] DevOps tiles show build/CI status + live farm utilization (the FARM-AUTOSCALE autoscaler)
+    - [ ] one-click build, deploy, rollback, logs, rerun-failed — each executes through the action worker
+
+- [ ] **FRONTDOOR-8: Data Center surface — node lifecycle.**
+  **As** an operator, **I want** the live mesh and one-click node actions,
+  **so that** I run the fleet from the menu.
+  **Acceptance**:
+    - [ ] live topology + per-node health; one-click join/drain/restart/cutover-helpers
+    - [ ] provision/destroy nodes drives the tofu/autoscaler with the operator-gated apply
+
+- [ ] **FRONTDOOR-9: the mackesd `copilot` worker (codex backend).**
+  **As** an operator, **I want** an AI service in the mesh,
+  **so that** Copilot can see and act on the whole system.
+  **Acceptance**:
+    - [ ] a new mackesd `copilot` worker on the leader (state in etcd, follows leadership), bus ask/act topic
+    - [ ] wraps openai/codex in sandboxed `exec` per request (external, pulled at runtime); key = sealed leader-managed mesh secret; tiered model; full-mesh-state context
+    - [ ] degrades gracefully when codex/network is down (the rest of the Front Door keeps working)
+
+- [ ] **FRONTDOOR-10: proactive inline suggestions.**
+  **As** an operator, **I want** Copilot to surface high-impact ops fixes unprompted,
+  **so that** problems come to me already triaged.
+  **Acceptance**:
+    - [ ] context feed → codex → ranked suggestion cards rendered inline on the relevant tile (moderate cadence, high-confidence only)
+    - [ ] clicking a suggestion opens a task-scoped mini-conversation (durable transcript); thumbs up/down feeds ranking
+
+- [ ] **FRONTDOOR-11: the action worker + confirm gate + audit.**
+  **As** an operator, **I want** AI/one-click actions to run safely and be logged,
+  **so that** power doesn't mean risk.
+  **Acceptance**:
+    - [ ] approved actions run via a typed mackesd action worker; default reach = whole-mesh broadcast with blast-radius shown
+    - [ ] destructive ops show a preview/diff (commands + targets + effect + dry-run) and require a typed-confirm; non-destructive are low-friction
+    - [ ] every suggestion + action + confirm logs to the mesh audit plane; role-gated (Lighthouse read-only)
+
+- [ ] **FRONTDOOR-12: Copilot capabilities incl. code edits.**
+  **As** an operator, **I want** Copilot to actually operate the box,
+  **so that** it aids at all levels of operation.
+  **Acceptance**:
+    - [ ] tools: read state, run gated ops, author/run scripts, query logs, edit configs/code
+    - [ ] code/config edits land as a reviewable diff → apply → git commit (with attribution)
+    - [ ] a failed action gets an inline Copilot diagnosis + fix/retry; long ops show a progress tile with cancel + completion notify
+
+- [ ] **FRONTDOOR-13: alerts tile + AI triage.**
+  **As** an operator, **I want** alerts clustered and explained with a fix,
+  **so that** I act, not dig.
+  **Acceptance**:
+    - [ ] an Alerts tile; Copilot groups + explains alerts and proposes a one-click fix each (notifyd stays separate)
+
+- [ ] **FRONTDOOR-14: platform — settings, prefs, look, lock.**
+  **As** an operator, **I want** my Front Door configured and consistent,
+  **so that** it's mine across the mesh.
+  **Acceptance**:
+    - [ ] in-menu settings panel (theme, tiles, AI policy, hotkeys); prefs/layout sync over etcd (single shared layout per node)
+    - [ ] rich-but-tasteful polish: expressive motion, subtle mutable sound cues, haptics; locks with the session (actions need unlock)
+
+- [ ] **FRONTDOOR-15: voice + cross-node launch.**
+  **As** an operator, **I want** to ask out loud and act on any node,
+  **so that** the whole mesh is reachable from one surface.
+  **Acceptance**:
+    - [ ] optional push-to-talk + spoken summaries via mde-voice-hud (off by default)
+    - [ ] a tile can target any node (ops headless on the node; GUI apps open locally on remote data) and the result returns
+
+- [ ] **FRONTDOOR-16: rollout — replace the old launcher.**
+  **As** the project, **I want** one coherent surface,
+  **so that** there's no long-lived fork.
+  **Acceptance**:
+    - [ ] the new Front Door reaches parity with + replaces the old `mde-workbench` launcher; old launcher code removed; guided first-run auto-builds tiles from the mesh
+    - [ ] DoD: builds + `cargo test` + clippy green, `mde-theme` tokens only (§4), `lint-mesh-boundary.sh` clean (§6); both modes launch and a DevOps + a Data Center action execute end-to-end (reachable smoke, §7)
