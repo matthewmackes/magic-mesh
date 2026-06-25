@@ -1938,7 +1938,7 @@ clean+reachable smoke); visual gate lifted.
     - [ ] top full-width omnibox; follow-OS theme, Carbon Blue 60, expressive motion, blurred mesh-wallpaper backdrop
     - [ ] Esc dismisses; renders through `mde-theme` tokens (no raw hex/metrics, §4)
 
-- [ ] **FRONTDOOR-3: the iPadOS full-screen mode.**
+- [✓] **FRONTDOOR-3: the iPadOS full-screen mode.**
   **As** an operator, **I want** a full-screen toggle that feels like the iPadOS home,
   **so that** I get an immersive paged grid for browsing apps + widgets.
   **Acceptance**:
