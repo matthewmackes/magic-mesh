@@ -11,7 +11,13 @@ use crate::theme::Theme;
 /// Aggregated user preferences resolved at startup. Default
 /// values track the lock survey: `Theme::Dark`, `Density::Comfortable`,
 /// no accessibility variants on.
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// FRONTDOOR-14 — no longer `Copy`: the embedded [`FrontDoorPrefs`] carries a
+/// `Vec` (the tile arrangement), so the bundle is `Clone` instead. Every consumer
+/// loads a fresh `Preferences` and reads its (still-`Copy`) scalar fields, so
+/// dropping `Copy` here is invisible to them — no call site copied the whole
+/// bundle by value.
+#[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Preferences {
     /// Theme — defaults to Dark per Q6 (wizard asks first-launch).
@@ -26,6 +32,12 @@ pub struct Preferences {
     /// MOTION-CORE-3 — global motion controls (kill switch + speed scale).
     #[cfg_attr(feature = "serde", serde(default))]
     pub motion: MotionPrefs,
+    /// FRONTDOOR-14 — the Front Door's own persisted prefs (the in-menu settings
+    /// panel writes here): the Copilot proactivity policy + the tile arrangement
+    /// (order / pin / hide). Defaults to a quiet, untouched arrangement so a fresh
+    /// install reads exactly as before the settings panel existed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub front_door: FrontDoorPrefs,
 }
 
 impl Default for Preferences {
@@ -35,8 +47,84 @@ impl Default for Preferences {
             density: Density::Comfortable,
             a11y: A11y::default(),
             motion: MotionPrefs::default(),
+            front_door: FrontDoorPrefs::default(),
         }
     }
+}
+
+/// FRONTDOOR-14 — the Front Door's persisted preferences (`preferences.toml
+/// [front_door]`), the in-menu settings panel's store (design Q48 in-menu
+/// settings + Q79 settings-managed tile arrangement). Theme + density already
+/// live on [`Preferences`] (the settings panel writes those too); this carries
+/// the Front-Door-specific knobs that have no home elsewhere:
+///
+///   * `ai_proactive` — the Copilot **proactivity** policy (Q61 — moderate
+///     proactivity is the design default; the operator can turn the proactive
+///     suggestion cards off entirely). The Front Door reads this to gate whether
+///     it surfaces the inline suggestion cards + on-tile badges.
+///   * `tiles` — the per-tile **arrangement** (Q79): the operator's order, plus
+///     which tiles are pinned (sorted first) or hidden (dropped from the grid).
+///     Stored as a list of stable tile-id rules so a tile the operator never
+///     touched keeps its seed position, and an arrangement made before a tile
+///     existed still applies to the tiles it names.
+///
+/// `serde(default)` on every field means an older config (one predating the
+/// settings panel) loads with the design defaults — proactivity on, no
+/// arrangement overrides — exactly as the Front Door behaved before FD-14.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FrontDoorPrefs {
+    /// Q61 — surface Copilot's proactive suggestion cards + on-tile badges? `true`
+    /// (the design's moderate proactivity) by default; `false` silences them
+    /// entirely (the operator opted out in Settings). Gates the GUI's rendering of
+    /// the suggestion set — it never changes what the backend publishes.
+    #[cfg_attr(feature = "serde", serde(default = "default_ai_proactive"))]
+    pub ai_proactive: bool,
+    /// Q79 — the operator's tile arrangement rules, in the order they should be
+    /// laid out. Each entry names a tile by its stable id and carries its pin /
+    /// hide flags. A tile not named here keeps its seed order after the named
+    /// ones; a named-but-now-absent tile is simply ignored (the Front Door maps
+    /// ids to live tiles). Empty = the untouched seed arrangement.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub tiles: Vec<TileArrangement>,
+}
+
+impl Default for FrontDoorPrefs {
+    fn default() -> Self {
+        // The design defaults: moderate proactivity ON (Q61), no arrangement
+        // overrides (the untouched seed grid) — exactly the pre-FD-14 behavior.
+        Self {
+            ai_proactive: true,
+            tiles: Vec::new(),
+        }
+    }
+}
+
+/// FRONTDOOR-14 — one tile's arrangement rule (Q79): its stable id plus whether
+/// the operator pinned it (sorted to the front) or hid it (dropped from the
+/// grid). The order of these entries in [`FrontDoorPrefs::tiles`] is the
+/// operator's chosen tile order; the flags layer pin/hide over that order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TileArrangement {
+    /// The stable tile id this rule addresses — a widget tile's [`crate::Theme`]-
+    /// independent key id (e.g. `"mesh_map"`) or a launcher's lowercased label
+    /// (e.g. `"files"`). The Front Door owns the id ↔ tile mapping; this crate
+    /// only stores + round-trips the string.
+    pub id: String,
+    /// Pinned tiles sort to the front of the grid (before un-pinned ones), in
+    /// arrangement order. Defaults `false`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub pinned: bool,
+    /// Hidden tiles are dropped from the grid entirely (still listed in Settings
+    /// so the operator can un-hide them). Defaults `false`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub hidden: bool,
+}
+
+#[cfg(feature = "serde")]
+fn default_ai_proactive() -> bool {
+    true
 }
 
 /// MOTION-A11Y-2 — whether a given animation is *decorative* or *essential*.
@@ -592,6 +680,7 @@ mod tests {
                 reduce_motion: true,
             },
             motion: MotionPrefs::default(),
+            front_door: FrontDoorPrefs::default(),
         };
         let s = prefs.to_toml_string().unwrap();
         let parsed: Preferences = toml::from_str(&s).unwrap();
@@ -612,6 +701,69 @@ mod tests {
         let s = "theme = \"sepia\"\n";
         let err = toml::from_str::<Preferences>(s);
         assert!(err.is_err());
+    }
+
+    // ── FRONTDOOR-14 — the Front Door prefs (AI policy + tile arrangement) ──────
+
+    #[test]
+    fn front_door_prefs_default_proactivity_on_no_arrangement() {
+        // The design default (Q61 moderate proactivity) is ON; a fresh install has
+        // no arrangement overrides (the untouched seed grid).
+        let fd = FrontDoorPrefs::default();
+        assert!(fd.ai_proactive, "proactivity defaults on (Q61)");
+        assert!(fd.tiles.is_empty(), "no arrangement overrides by default");
+    }
+
+    #[test]
+    fn front_door_prefs_round_trip_through_toml() {
+        // The AI policy + a pin/hide/reorder arrangement persists and reloads.
+        let prefs = Preferences {
+            front_door: FrontDoorPrefs {
+                ai_proactive: false,
+                tiles: vec![
+                    TileArrangement {
+                        id: "alerts".to_string(),
+                        pinned: true,
+                        hidden: false,
+                    },
+                    TileArrangement {
+                        id: "music".to_string(),
+                        pinned: false,
+                        hidden: true,
+                    },
+                ],
+            },
+            ..Preferences::default()
+        };
+        let s = prefs.to_toml_string().unwrap();
+        let parsed: Preferences = toml::from_str(&s).unwrap();
+        assert_eq!(prefs.front_door, parsed.front_door);
+        assert!(!parsed.front_door.ai_proactive);
+        assert_eq!(parsed.front_door.tiles.len(), 2);
+        assert!(parsed.front_door.tiles[0].pinned);
+        assert!(parsed.front_door.tiles[1].hidden);
+    }
+
+    #[test]
+    fn front_door_prefs_legacy_config_defaults_to_pre_fd14_behavior() {
+        // A config predating the settings panel (no [front_door] table) loads with
+        // proactivity ON and no arrangement — exactly how the Front Door behaved
+        // before FD-14.
+        let legacy = "theme = \"dark\"\ndensity = \"comfortable\"\n";
+        let p: Preferences = toml::from_str(legacy).unwrap();
+        assert!(p.front_door.ai_proactive);
+        assert!(p.front_door.tiles.is_empty());
+    }
+
+    #[test]
+    fn front_door_tile_arrangement_flags_default_off() {
+        // A `[[front_door.tiles]]` entry naming only an id defaults both flags off.
+        let s = "[[front_door.tiles]]\nid = \"system\"\n";
+        let p: Preferences = toml::from_str(s).unwrap();
+        assert_eq!(p.front_door.tiles.len(), 1);
+        assert_eq!(p.front_door.tiles[0].id, "system");
+        assert!(!p.front_door.tiles[0].pinned);
+        assert!(!p.front_door.tiles[0].hidden);
     }
 }
 

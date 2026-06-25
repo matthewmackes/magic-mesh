@@ -103,7 +103,9 @@ pub use motion::{
     PULSE_MAX_SCALE,
 };
 pub use palette::Palette;
-pub use prefs::{system_reduce_motion, MotionPrefs, MotionRole, Preferences};
+pub use prefs::{
+    system_reduce_motion, FrontDoorPrefs, MotionPrefs, MotionRole, Preferences, TileArrangement,
+};
 pub use radii::Radii;
 pub use shadows::Shadow;
 pub use skeleton::{SkeletonBlock, SkeletonShimmer, TEXT_LINE_HEIGHT_PX};

@@ -2018,7 +2018,7 @@ clean+reachable smoke); visual gate lifted.
   **Acceptance**:
     - [✓] an Alerts tile; Copilot groups + explains alerts and proposes a one-click fix each (notifyd stays separate)
 
-- [ ] **FRONTDOOR-14: platform — settings, prefs, look, lock.**
+- [>] **FRONTDOOR-14: platform — settings, prefs, look, lock.** (the in-menu **Settings** panel landed (Q48), reachable from the rail + top bar in BOTH modes: theme (Q23 follow-OS/Gray-90/Gray-10) + density (Q80 comfortable/compact) apply LIVE via `live_theme::set` and persist; an AI/Copilot **proactivity** toggle (Q61) gates the inline suggestion cards + on-tile badges; **tile arrangement** (Q79, closing FD-5's deferred bit) reorders/pins/hides tiles and the grid honors it — all persisted through the existing `mde_theme::Preferences` store (new `[front_door]` section: `ai_proactive` + a `tiles` arrangement list). The session **lock** (Q91) gates every action affordance — the detail menu's pipeline actions, the suggestion "Act" / triage "Apply fix", and the confirm-gate Approve/Execute go inert until unlock, with a defence-in-depth guard in the update handlers so a locked session never reaches the exec topic — while navigation/viewing stays open. §4 tokens, both modes, tests + farm build/clippy/test GREEN. DEFERRED tail: the **etcd mesh-sync** of prefs/layout (Q56 — local persistence only today) and the **OS-session lock hook** (the lock is a local toggle); the design's sound/haptics polish is also still open.)
   **As** an operator, **I want** my Front Door configured and consistent,
   **so that** it's mine across the mesh.
   **Acceptance**:
