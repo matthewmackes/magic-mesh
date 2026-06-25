@@ -13,9 +13,11 @@ The DO Spaces bucket + sealed S3 keys are now **RESOLVED** (MEDIA-2, 2026-06-25)
 - **MEDIA-9** — no upload path or rescan trigger is wired, and every acceptance (upload, rescan refresh, tracks appear in mde-music) needs the live MEDIA-2 bucket + running Lighthouse_Media instances.
 - **MEDIA-10** — pure live verification (>=2 Lighthouse_Media nodes serving the same bucket, kill-one resilience, fresh-node auto-config) requiring real DO infrastructure + the MEDIA-2 bucket/keys.
 
-## SUBSTRATE-V2 cutover (etcd + Syncthing, operator-gated big-bang)
+## SUBSTRATE-V2 cutover (etcd + Syncthing) — ✅ PRE-APPROVED 2026-06-25 (execute at the next /release cut)
 
-- **OPROG-2** — KEYSTONE: code-complete + dormant; the acceptance is the operator-gated, rehearsed big-bang cutover on the live fleet (gated by writing `/etc/mackesd/etcd-endpoints`), an operator go-ahead — not a build-verifiable change.
+> The operator **formally approved the SUBSTRATE-V2 cutover "when required for cut"** (2026-06-25). The go-ahead is no longer pending — the trigger is now the next release cut. When `/release` cuts the fleet: rehearse `cutover-substrate-v2.sh` on the VM bed → produce the rollback RPM → cut. This unblocks OPROG-2/OPROG-1/OPROG-4/INCIDENT-WEDGE-2/BIRTHRIGHT-1. Do NOT run it speculatively (it's a big-bang live-infra op that belongs at the cut moment).
+
+- **OPROG-2** — KEYSTONE: code-complete + dormant. Approval GRANTED (above); remaining action = execute the rehearsed big-bang cutover (writes `/etc/mackesd/etcd-endpoints`) as part of the next cut.
 - **INCIDENT-WEDGE-2** — cutover tooling exists, but the acceptance requires running the operator-gated SUBSTRATE-V2 cutover on the live founding lighthouse so it coordinates via etcd and new joins use Syncthing (no FUSE).
 - **OPROG-4** — supporting code exists, but the deliverable is live provisioning of 3 lighthouse nodes (2 Lighthouse_Media), gated on the OPROG-2 cutover.
 
