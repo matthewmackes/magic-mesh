@@ -51,4 +51,4 @@ These all share one blocker: the DigitalOcean Spaces bucket + S3 access keys are
 - **BOOT-REC-4** ([!]) — live reboot/power-cycle auto-recovery drill of every role before /release; mount half superseded by the LizardFS→Syncthing cutover.
 - **FARM-AUTO-PROD** ([!]) — all farm automation built; only the standing build-job tags executing on the live farm VMs remain (operator-gated live exec).
 - **MUSIC-BROWSE/ART** ([!]) — full art chain wired daemon→GUI; only a live re-verify on a Workstation with mde-musicd running remains.
-- **DRAIN-5** (stays [ ]) — cited spec §C.4 is absent + the unit count (21 vs 25) is stale; needs operator spec reconciliation + the /ship-skill encoding (skill self-edit is permission-gated).
+- ~~**DRAIN-5**~~ — RESOLVED 2026-06-25: the cited blocker was itself stale (design §C.4 "Park, don't stall" is present, and the /ship skill is a tracked repo file, not a permission-gated global edit). Implemented as `install-helpers/park-blocker.sh` + the ship-skill coordinator section. No operator action needed.

@@ -64,6 +64,18 @@ Every drain tick, in order:
 5. **No-flinch:** GUI/infra/gated units are picked on the same footing as backend; the
    measure is finished epics, not clean success signals.
 
+### D. Coordinator + park + worktree tools (DRAIN-5/6/7) — *implemented 2026-06-25*
+- **`install-helpers/drain-coordinator.sh`** (DRAIN-6) — `plan`/`slots`/`next`/`preflight`:
+  the per-tick mechanics as one runnable tool over the REAL farm topology
+  (`.50`/`.90`/`.130`, caps 2/2/3 — not the stale `.50/.51/.52`). The ship skill's
+  "coordinator loop (DRAIN-5/6/7)" section drives it.
+- **`install-helpers/park-blocker.sh <ID> "<reason>"`** (DRAIN-5) — flips a blocked unit
+  to `[!]`, annotates its worklist line, surfaces it under "Parked by the drain loop" in
+  `docs/NEEDS-OPERATOR.md`, and exits 0 so the loop continues. Park, never stall.
+- **`install-helpers/assert-own-worktree.sh`** (DRAIN-7) — an isolated agent's STEP-0
+  guard; REFUSES the shared/primary checkout so an agent can never edit/reset the
+  coordinator's tree (it wiped an agent's work once, 2026-06-24).
+
 ## Acceptance (each runtime-observable)
 - A local `cargo build` on the dev host exits non-zero with the farm redirect (guard live).
 - Free disk on `/` never drops below the watchdog threshold for more than one tick.

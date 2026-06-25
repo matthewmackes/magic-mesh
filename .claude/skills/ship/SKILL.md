@@ -52,9 +52,14 @@ older-glibc forward-compat), user `mm`, key `/root/.ssh/mackes_mesh_ed25519`,
 
 | Host | VM | IP | vCPU / RAM | SAFE heavy slots |
 |---|---|---|---|---|
-| **XEN-BIGBOY** | `mcnf-build-52` | `172.20.0.52` | 8 / 24 GB | **3** |
-| KVM-XCP1 | `mcnf-build-51` | `172.20.0.51` | 4 / 16 GB | **2** |
+| **XEN-BIGBOY** | `mcnf-build-52` | `172.20.0.130` | 8 / 24 GB | **3** |
+| KVM-XCP1 | `mcnf-build-51` | `172.20.0.90` | 4 / 16 GB | **2** |
 | XEN-HOME-SERVICES | `mcnf-build-50` | `172.20.0.50` | 4 / 16 GB | **2** |
+
+> ⚠️ **VM names are legacy and do NOT equal the IP octet** (`docs/BUILD-ENVIRONMENT.md §3`):
+> `mcnf-build-51`=**.90**, `mcnf-build-52`=**.130**. The real farm is **.50 / .90 / .130** —
+> probing `.51`/`.52` gives "No route to host" (don't be fooled into a false "node down"
+> alarm). `install-helpers/drain-coordinator.sh slots` reads the real topology for you.
 
 **Total = 7 concurrent heavy (cosmic/iced/mackesd-release) build slots.** Full
 utilization = all 7 busy, spread **3 + 2 + 2**.
@@ -63,8 +68,8 @@ utilization = all 7 busy, spread **3 + 2 + 2**.
 **≤3 heavy builds per node. NEVER more.** Proven live: 6 concurrent heavy builds on
 BIGBOY → load average **44**, disk full, stuck/dud agents whose code had to be
 salvaged on the small nodes (`AI_GOVERNANCE.md §10`). "Full utilization" means
-filling **to** the cap, *spread*, NOT piling onto BIGBOY. A 4-vCPU node (.50/.51)
-caps at **2**; the 8-vCPU BIGBOY at **3**. Exceeding the cap is the *opposite* of
+filling **to** the cap, *spread*, NOT piling onto BIGBOY. A 4-vCPU node (.50/.90)
+caps at **2**; the 8-vCPU BIGBOY (.130) at **3**. Exceeding the cap is the *opposite* of
 utilization — it deadlocks the node and you lose the work.
 
 ### Slot mechanics (so concurrent builds don't clobber each other)
@@ -75,7 +80,7 @@ utilization — it deadlocks the node and you lose the work.
 clobber** (rsync `--delete`). Therefore:
 - Every concurrent build gets a **unique slot name on its host**.
 - A slot-assigning **workflow** uses numeric slots `1/2/3` by index over
-  `[.52/1, .52/2, .52/3, .50/1, .50/2, .51/1, .51/2]`.
+  `[.130/1, .130/2, .130/3, .50/1, .50/2, .90/1, .90/2]`.
 - Ad-hoc / second-campaign builds use **named** slots (`fixclip`, `eagledeploy`,
   `fillA`) so they never collide with a workflow's numeric dirs — but you MUST still
   count them against that node's ≤3 cap.
@@ -94,7 +99,7 @@ that idles every fast slot for the duration of the slowest build. Use `pipeline(
 ### The procedure (reach + HOLD full utilization)
 1. **Inventory all three nodes** (read-only):
    ```
-   for n in 50 51 52; do ssh -i /root/.ssh/mackes_mesh_ed25519 -o BatchMode=yes mm@172.20.0.$n \
+   for n in 50 90 130; do ssh -i /root/.ssh/mackes_mesh_ed25519 -o BatchMode=yes mm@172.20.0.$n \
      'echo ".'$n' load=$(cut -d" " -f1 /proc/loadavg) rustc=$(pgrep -c rustc) cargo=$(pgrep -c cargo) free=$(df -h --output=avail /home|tail -1|tr -d " ") dirs=$(ls -d ~/magic-mesh-* 2>/dev/null|wc -l)"'; done
    ```
 2. **Compute free slots/node** = cap (3/2/2) − active heavy builds (a single
@@ -107,6 +112,29 @@ that idles every fast slot for the duration of the slowest build. Use `pipeline(
    slot dirs** (`rm -rf ~/magic-mesh-<stale>` for finished agents). Leftover per-agent
    dirs accumulate and fill the disk — the farm hit **96% → 31%** only after
    reclaiming ~72 GB of stale `magic-mesh-1..6`/`-fn5`/`-x`/`-y`.
+
+### The coordinator loop (DRAIN-5/6/7) — concrete tools
+The mechanics above are encoded as runnable helpers so a tick never depends on
+re-deriving them by hand:
+- **`install-helpers/drain-coordinator.sh plan [N]`** — one tick end-to-end:
+  pre-flight `disk-watchdog.sh` → free-slot compute over the REAL topology
+  (`.50/.90/.130`, caps 2/2/3) → the next N open, unblocked unit ids. `… slots` /
+  `… next N` / `… preflight` run the pieces alone.
+- **`install-helpers/park-blocker.sh <ID> "<reason>"`** (DRAIN-5) — when a unit hits a
+  live-infra/artifact/gate blocker you can't clear from a build, PARK it: flips the unit
+  to `[!]`, surfaces it in `docs/NEEDS-OPERATOR.md`, exits 0 so the loop CONTINUES.
+  Never stall a whole tick on one item.
+- **`install-helpers/assert-own-worktree.sh`** (DRAIN-7) — every isolated subagent runs
+  this as STEP-0; it REFUSES the shared `calm-ray-dcr8`/primary checkout so an agent can't
+  edit/reset the coordinator's tree (it wiped an agent's work once, 2026-06-24). Each
+  agent prompt MUST open with: *"STEP-0: run `./install-helpers/assert-own-worktree.sh`;
+  abort if it exits non-zero."*
+
+**Per tick:** `drain-coordinator.sh plan` → dispatch one disjoint unit per free slot,
+each farm-only, each STEP-0'ing the worktree guard → on each completion
+merge/cherry-pick + reclaim the worktree + relaunch (rearm, never batch-wait) →
+`park-blocker.sh` anything blocked and move on → no-flinch (GUI/infra/gated picked on
+the same footing as backend).
 
 ### What counts as "productive fill" when the disjoint-unit supply runs thin
 The file-disjoint worklist-unit supply depletes wave by wave. When it is thin, KEEP
