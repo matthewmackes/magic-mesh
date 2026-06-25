@@ -88,7 +88,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// FPG-8: elect the head of the LizardFS revision log, converge to
+    /// FPG-8: elect the head of the Syncthing-replicated revision log, converge to
     /// it host-local, write the apply-ack.
     Reconcile {
         /// Replicated workgroup root (defaults to $MDE_WORKGROUP_ROOT

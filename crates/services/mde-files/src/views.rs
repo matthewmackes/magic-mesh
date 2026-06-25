@@ -222,7 +222,7 @@ pub fn sidebar<'a>(
 
     // AF-mesh.2 — Mesh Home entry. Routes to the XDG-dir card
     // grid; the shared XDG dirs are first-class mesh resources
-    // on the LizardFS mesh store, not local. ICON-MESH — it's a
+    // on the Syncthing mesh store, not local. ICON-MESH — it's a
     // network file service, so it takes the `folder-remote`-style
     // network icon, not the plain local-folder one.
     mesh_col = mesh_col.push(side_row(
@@ -238,7 +238,7 @@ pub fn sidebar<'a>(
         Message::SelectView(View::MeshHome),
     ));
 
-    // MESHFS-8.1 — Recycle Bin entry (LizardFS `.trash` virtual directory).
+    // MESHFS-8.1 — Recycle Bin entry (the mesh-storage trash directory).
     mesh_col = mesh_col.push(side_row(
         icons::TRASH2,
         "Recycle Bin",
@@ -1486,7 +1486,7 @@ pub fn network<'a>(
 // ─── Mesh Home (AF-mesh.2) ────────────────────────────────────────────────
 
 /// Landing card grid for the five shared XDG dirs. These dirs
-/// live on the LizardFS mesh store, replicated across the fleet
+/// live on the Syncthing mesh store, replicated across the fleet
 /// over Nebula, so they're first-class mesh resources — not
 /// local files. The page is the operator's primary entry into
 /// the shared file plane.
@@ -1534,7 +1534,7 @@ pub fn mesh_home<'a>(snap: &'a BackendSnapshot) -> Element<'a, Message> {
 
 /// File listing inside one of the shared XDG dirs. Reads
 /// from `local:<slug>` via the backend (which today is the
-/// `LocalFsBackend` path) — once the LizardFS mount backs the
+/// `LocalFsBackend` path) — once the Syncthing-replicated share backs the
 /// XDG dirs the listing is the same disk read but the content
 /// reflects mesh-replicated state.
 ///
@@ -2171,7 +2171,7 @@ pub fn properties_dialog(props: &FileProperties) -> Element<'static, Message> {
 
 // ── MESHFS-8.1: Recycle Bin view ────────────────────────────────────────────
 
-/// Render the LizardFS trash listing. Shows items recoverable within the
+/// Render the mesh-storage trash listing. Shows items recoverable within the
 /// configured retention window (default 48 h) with a "Restore" button per
 /// row. Displays a loading/error state when busy or on error.
 pub fn mesh_undelete<'a>(

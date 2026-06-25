@@ -791,7 +791,7 @@ impl Backend for RealBackend {
                 .unwrap_or_default();
         }
         // AFM-5 — the empty path is the mesh Inbox ONLY: received files from the
-        // LizardFS-replicated inbox over the Bus. When mackesd/Bus is
+        // Syncthing-replicated inbox over the Bus. When mackesd/Bus is
         // unavailable the inbox is empty — return an honest empty list, never
         // the local home directory. (The old fallback to `local.list("")`
         // resolved to `$HOME`, so an offline Bus made the Inbox view show the
@@ -825,7 +825,7 @@ impl Backend for RealBackend {
         conflict: ConflictPolicy,
     ) -> Result<OpId, BackendError> {
         // AUD-1 — route the send through mackesd's file-ops surface, which
-        // copies the sources into the target peer's LizardFS-replicated
+        // copies the sources into the target peer's Syncthing-replicated
         // inbox (the real cross-mesh transport). With no mackesd, fall back
         // to the local-FS backend (records an audit row, rejects mesh dests).
         #[cfg(feature = "dbus")]

@@ -52,7 +52,6 @@ use mde_bus::persist::Persist;
 
 use crate::ca::bundle::{bundle_path, read_bundle, LighthouseEntry};
 use crate::nebula_roster::{export_roster, RosterRow};
-use crate::workers::meshfs_worker::DEFAULT_VIP;
 
 use super::{ShutdownToken, Worker};
 
@@ -185,10 +184,9 @@ pub struct TraceHop {
 pub struct RouteTrace {
     /// Target IP/host traced.
     pub target: String,
-    /// Target class: `gateway`, `public-dns`, `lighthouse`, `peer`,
-    /// `mesh-storage-leader`. (MESH-A-2.a ships `gateway` +
-    /// `public-dns`; `lighthouse`/`peer`/`mesh-storage-leader` land
-    /// with MESH-A-2.b.)
+    /// Target class: `gateway`, `public-dns`, `lighthouse`, `peer`.
+    /// (MESH-A-2.a ships `gateway` + `public-dns`; `lighthouse`/`peer`
+    /// land with MESH-A-2.b.)
     pub kind: String,
     /// Hops in TTL order.
     pub hops: Vec<TraceHop>,
@@ -227,8 +225,7 @@ pub struct AssessmentSnapshot {
     /// Item 9.
     pub subnet: SubnetDiscovery,
     /// MESH-A-2 route traces (R7-Q7). A-2.a traces gateway + the two
-    /// public DNS anchors; lighthouse/peer/mesh-storage-leader
-    /// targets land with A-2.b.
+    /// public DNS anchors; lighthouse/peer targets land with A-2.b.
     #[serde(default)]
     pub route_traces: Vec<RouteTrace>,
 }
@@ -440,8 +437,8 @@ pub fn parse_traceroute(stdout: &str) -> Vec<TraceHop> {
 
 /// Build the MESH-A-2.a route-trace target list: the default
 /// gateway (skipped when unknown) + the two public DNS anchors.
-/// Lighthouse / peer / mesh-storage-leader targets land with
-/// MESH-A-2.b (they need the bundle / roster DB / meshfs status).
+/// Lighthouse / peer targets land with MESH-A-2.b (they need the
+/// bundle / roster DB).
 #[must_use]
 pub fn build_route_targets(gateway: &str) -> Vec<(String, String)> {
     let mut targets = Vec::new();
@@ -599,13 +596,6 @@ fn peer_trace_targets(roster: &[RosterRow], self_node_id: &str) -> Vec<(String, 
         .collect()
 }
 
-/// MESH-A-2.b mesh-storage leader trace target — the LizardFS floating
-/// VIP, which the active master always owns
-/// ([`DEFAULT_VIP`](crate::workers::meshfs_worker::DEFAULT_VIP)).
-fn leader_trace_target(vip: &str) -> (String, String) {
-    (vip.to_string(), "mesh-storage-leader".to_string())
-}
-
 fn now_epoch_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -759,9 +749,9 @@ impl NetAssessWorker {
 
     /// Gather the MESH-A-2.b mesh-derived trace targets from the
     /// worker's optional mesh context: the lighthouses in this peer's
-    /// Nebula bundle, every other roster peer, and the mesh-storage
-    /// leader VIP. Returns empty on a pre-enrollment / store-less host
-    /// so A-2.a's locally-resolvable targets still trace.
+    /// Nebula bundle and every other roster peer. Returns empty on a
+    /// pre-enrollment / store-less host so A-2.a's locally-resolvable
+    /// targets still trace.
     fn mesh_route_targets(&self) -> Vec<(String, String)> {
         let mut targets = Vec::new();
 
@@ -786,12 +776,6 @@ impl NetAssessWorker {
                 },
                 Err(e) => tracing::debug!(error = %e, "netassess: roster DB open failed"),
             }
-        }
-
-        // Mesh-storage leader — the floating VIP, present whenever this
-        // peer carries any mesh context (i.e. it is enrolled).
-        if self.workgroup_root.is_some() || self.db_path.is_some() {
-            targets.push(leader_trace_target(DEFAULT_VIP));
         }
 
         targets
@@ -840,7 +824,7 @@ impl NetAssessWorker {
         };
         let subnet = collect_subnet(&arp);
         // A-2.a locally-resolvable (gateway + public DNS) + A-2.b
-        // mesh-derived (lighthouses + peers + mesh-storage leader).
+        // mesh-derived (lighthouses + peers).
         let mut route_targets = build_route_targets(&gateway);
         route_targets.extend(self.mesh_route_targets());
         let route_traces = trace_targets(&route_targets);
@@ -1333,13 +1317,5 @@ mod tests {
         let ips: Vec<&str> = t.iter().map(|(ip, _)| ip.as_str()).collect();
         assert_eq!(ips, vec!["10.42.0.6", "10.42.0.7"]);
         assert!(!ips.contains(&"10.42.0.5"), "self must be excluded");
-    }
-
-    #[test]
-    fn leader_target_resolution() {
-        let (ip, kind) = leader_trace_target(DEFAULT_VIP);
-        assert_eq!(ip, DEFAULT_VIP);
-        assert_eq!(ip, "10.42.0.1");
-        assert_eq!(kind, "mesh-storage-leader");
     }
 }

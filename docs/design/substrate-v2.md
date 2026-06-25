@@ -1,5 +1,12 @@
 # SUBSTRATE-V2 — replace LizardFS with etcd (coordination) + Syncthing (files)
 
+> **DONE — LizardFS is REMOVED (SUBSTRATE-6, the LizardFS rip-out).** This was the
+> migration design; it has now fully landed. The live substrate is **etcd**
+> (coordination) + **Syncthing** (files, on a plain `/mnt/mesh-storage` dir, no
+> FUSE). LizardFS/MooseFS/Gluster/Ceph are retired and forbidden. The fs-path
+> fallbacks and the "held until after cutover" rollback notes below describe the
+> transition that is now complete — they are historical, not a live plane.
+
 **Status:** locked via a 12-Q operator survey, 2026-06-19.
 **Trigger:** Operator — "Remove the current filesystem-sync technology and replace
 with Syncthing for file synchronization, and decouple coordination from storage.

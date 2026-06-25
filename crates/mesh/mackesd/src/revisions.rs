@@ -3,7 +3,7 @@
 //! **FPG-1 (2026-06-09): retired to display-only.** The canonical
 //! fleet revision identity is `magic_fleet::Revision::version` — a
 //! monotonic `u64` minted via `magic_fleet::store::next_version` and
-//! logged append-only on the LizardFS workgroup root (FPG-2,
+//! logged append-only on the Syncthing-replicated workgroup root (FPG-2,
 //! `magic_fleet::store`). The date-string scheme here (and the SQLite
 //! rowid scheme in `fleet.rs`) survive only as human-facing display
 //! fields / per-node read-mirror keys; nothing elects or orders by

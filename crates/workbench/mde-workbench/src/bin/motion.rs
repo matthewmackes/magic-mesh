@@ -459,7 +459,10 @@ mod tests {
             "existing card starts pushed down, got {}",
             m0.translate_y
         );
-        assert_eq!(m0.translate_x, 0.0, "existing card never slides horizontally");
+        assert_eq!(
+            m0.translate_x, 0.0,
+            "existing card never slides horizontally"
+        );
         // It eases back up to rest within the first beat.
         let settled = t0 + blink_beat() + Duration::from_millis(1);
         assert!(anim.card_motion("old", settled).translate_y.abs() < 1e-3);

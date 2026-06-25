@@ -5,7 +5,7 @@
 # running mackesd in serve mode. Built by the image-build job
 # (`mackesd images --build --kind container`) on an execution-tagged node;
 # the artifact is saved as an OCI archive and its manifest recorded in the
-# LizardFS image catalog via `mackesd images --record`.
+# mesh-storage image catalog via `mackesd images --record`.
 #
 # Build context is the repo root (the COPY below pulls the shipped repo
 # file): `podman build -f packaging/containers/mackesd.Containerfile .`
@@ -18,8 +18,8 @@ COPY packaging/repo/magic-mesh.repo /etc/yum.repos.d/magic-mesh.repo
 RUN dnf install -y --setopt=install_weak_deps=False magic-mesh \
     && dnf clean all
 
-# mackesd's local state + the replicated QNM-Shared mount point. Identity
-# and enrollment are provided at run time (bind-mounted creds / env), never
+# mackesd's local state + the replicated mesh-storage dir. Identity and
+# enrollment are provided at run time (bind-mounted creds / env), never
 # baked into the image.
 RUN mkdir -p /var/lib/mackesd /qnm
 

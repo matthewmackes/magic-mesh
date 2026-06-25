@@ -10,7 +10,7 @@
 //! file-transfer features must consider all three:
 //!
 //! 1. **Mesh** — peer files over the Bus (`action/fleet-files/*`,
-//!    [`bus_backend`]) + the LizardFS-replicated QNM dirs ([`mounts`]).
+//!    [`bus_backend`]) + the Syncthing-replicated QNM dirs ([`mounts`]).
 //!    The default path between enrolled peers.
 //! 2. **SMB** — classic LAN shares ([`mounts`] / gio), for the NAS and
 //!    non-mesh machines on the same network.

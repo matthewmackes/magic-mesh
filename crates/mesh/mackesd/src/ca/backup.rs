@@ -70,9 +70,10 @@ pub const HEADER_LEN: usize = 4 + 1 + SALT_LEN + NONCE_LEN;
 /// off-cluster shareable copy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BundlePlaintext {
-    /// Bundle plaintext schema version. `1` = CA-only;
-    /// `3` (MESHFS-14.1, v5.0.0) adds `meshfs_snapshot`.
-    /// Readers tolerate unknown fields via serde defaults.
+    /// Bundle plaintext schema version. `1` = CA-only. Readers
+    /// tolerate unknown fields via serde defaults (so bundles written
+    /// by older daemons that carried a `meshfs_snapshot` still decode —
+    /// that LizardFS field is now dropped on read).
     pub schema_version: u32,
     /// Unix-epoch seconds when the export was generated.
     pub exported_at: i64,
@@ -85,12 +86,6 @@ pub struct BundlePlaintext {
     pub ca_certs: Vec<CaCertRow>,
     /// One row per signed peer cert under the active epoch.
     pub peer_certs: Vec<PeerCertRow>,
-    /// MESHFS-14.1 (v5.0.0) — optional LizardFS snapshot.
-    /// `None` when neither `mfsmetadump` nor `mfsadmin` is on
-    /// PATH. Bumps `schema_version` to 3 in the backup worker
-    /// when present.
-    #[serde(default)]
-    pub meshfs_snapshot: Option<crate::meshfs::snapshot::MeshFsSnapshot>,
 }
 
 /// One CA cert + matching private key entry.
@@ -454,11 +449,6 @@ pub fn assemble_from_store(
         mesh_id: mesh_id.to_string(),
         ca_certs,
         peer_certs,
-        // CA-side `assemble_from_store` stays at schema_version
-        // 1; the state-backup worker stitches the meshfs snapshot
-        // in (bumping to 3). The CA-only CLI path deliberately
-        // leaves meshfs_snapshot None.
-        meshfs_snapshot: None,
     })
 }
 
@@ -524,7 +514,6 @@ mod tests {
                 created_at: 1716000000,
                 retired_at: None,
             }],
-            meshfs_snapshot: None,
             peer_certs: vec![PeerCertRow {
                 node_id: "peer:anvil".into(),
                 epoch: 0,

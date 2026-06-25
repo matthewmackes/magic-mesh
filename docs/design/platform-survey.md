@@ -1,5 +1,15 @@
 # MCNF — Platform Build-Out Survey (100 questions)
 
+> **Note (post-SUBSTRATE-6):** this survey was authored 2026-06-09, when the mesh
+> substrate was **LizardFS**. LizardFS has since been **removed** — coordination
+> (leader election, peer directory, health) runs on **etcd** and shared files sync
+> over **Syncthing** on a plain `/mnt/mesh-storage` dir. Several questions/options
+> below (notably Q3, Q8, Q11–Q13, Q32, Q38, Q67) reason about a "LizardFS master",
+> "LizardFS replication", "the FUSE mount", or a "LizardFS topology snapshot";
+> read those as today's etcd+Syncthing substrate. The survey is kept verbatim as
+> the historical decision record (`/mnt/mesh-storage` itself is kept — now a plain
+> Syncthing dir).
+
 **Purpose.** The worklist holds *findings* ("this is incomplete"), not *specs* ("build exactly
 this"). This survey turns the open platform decisions — the under-specified worklist items (B1
 Mesh SSH, C1 Phase-G control plane, E1 Nebula test harness, H3/H4 wire-vs-remove, H6 Radio, H8

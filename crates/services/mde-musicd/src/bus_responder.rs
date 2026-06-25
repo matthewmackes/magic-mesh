@@ -291,7 +291,7 @@ fn str_array(v: &serde_json::Value, key: &str) -> Vec<String> {
 }
 
 /// MUSIC-RESPONSIVE-4 — the LOCAL (per-node), always-readable cover-art cache
-/// dir: `<music-cache>/artwork/`. Distinct from the communal LizardFS mesh
+/// dir: `<music-cache>/artwork/`. Distinct from the communal Syncthing mesh
 /// artwork dir (`crate::cache::artwork_dir`), which can be down — this one lives
 /// under the daemon's own `$HOME/.local/share` so the path returned to the GUI is
 /// always openable on the node that served the RPC.
@@ -433,9 +433,9 @@ fn dispatch_browse(
                 // `reply/<ulid>` in the Bus persistence store, so every cover the
                 // GUI grid requested grew the spool (the EFF-47 ephemeral reaper
                 // only bounded it after the fact). Now the daemon materializes the
-                // image into a LOCAL, always-readable cache file (NOT the LizardFS
-                // mesh mount — that addresses the deferral's "regress when the
-                // mount is down" concern) and returns just its path; the GUI opens
+                // image into a LOCAL, always-readable cache file (NOT the Syncthing
+                // mesh share — that addresses the deferral's "regress when the
+                // share is down" concern) and returns just its path; the GUI opens
                 // the file directly. The reply now carries a short path string, so
                 // the Bus spool no longer grows with art bytes.
                 //

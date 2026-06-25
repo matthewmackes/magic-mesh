@@ -212,7 +212,7 @@ pub enum Message {
 /// collides with the per-row hover/accent keys (`fm-accent:` / row-hover).
 const SIDEBAR_FADE_KEY: &str = "fm-sidebar";
 
-/// MESHFS-8.1 — one recoverable file from the LizardFS `.trash` directory.
+/// MESHFS-8.1 — one recoverable file from the mesh-storage trash directory.
 #[derive(Debug, Clone)]
 pub struct TrashItem {
     /// Display name (leading 8-hex-char inode prefix stripped).
@@ -352,7 +352,7 @@ pub struct MdeFiles {
     pub trash_busy: bool,
     /// MESHFS-8.1 — last error from trash load/restore.
     pub trash_error: Option<String>,
-    /// MESHFS-11.1 — true while the LizardFS fleet is healing
+    /// MESHFS-11.1 — true while the mesh share is reconciling
     /// (under-replicated). Applied as the `syncing` badge on every
     /// mesh-homed `FileRow` in the current listing.
     pub meshfs_healing: bool,

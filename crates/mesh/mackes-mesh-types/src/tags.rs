@@ -6,7 +6,7 @@
 //! items, and zones into a single named bucket; consumers across
 //! every crate share the same [`Tag`] definition. Storage is a JSON
 //! file at `<XDG_DATA_HOME>/mde/tags.json` (resolved by [`default_tags_path`]).
-//! Once the LizardFS mesh-home is mounted under XDG the file inherits
+//! Once the Syncthing mesh-home is linked under XDG the file inherits
 //! mesh replication automatically; pre-mesh-home boots fall
 //! back to per-peer.
 //!

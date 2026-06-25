@@ -25,7 +25,7 @@ For resilience, promote a second node to Lighthouse once the mesh has a few peer
 ## Add a Server
 
 A Server adds fleet automation (Ansible-on-each-node, jobs, netstate/firewall
-convergence) and LizardFS replicated storage.
+convergence) and a Syncthing replicated-storage replica.
 
 ```bash
 # On a lighthouse: mint a single-use enrollment token.

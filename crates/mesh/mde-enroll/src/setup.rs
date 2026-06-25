@@ -2,7 +2,7 @@
 //!
 //! Pure, I/O-free model (design: docs/design/magic-setup-wizard.md). The
 //! crossterm event loop + ratatui render in `bin/magic-setup.rs` drive this;
-//! the actual work (found/join/setup-qnm-shared/systemctl) is shelled by the
+//! the actual work (found/join/setup-etcd/setup-syncthing/systemctl) is shelled by the
 //! action layer ([`crate::setup_action`]) — keeping the model terminal- and
 //! subprocess-free makes the whole flow unit-testable.
 //!

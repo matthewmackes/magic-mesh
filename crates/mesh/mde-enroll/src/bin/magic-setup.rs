@@ -9,8 +9,9 @@
 //! Each action screen uses one input field + the shared live-log pane: type the
 //! value (mesh-id / token), press Enter to run the verb (output streams into the
 //! log), Esc returns to the menu. The verbs already provision everything
-//! (BIRTHRIGHT-1 LizardFS/QNM-Shared, the ONBOARD-9 service manager), so the
-//! wizard is a narrated UX layer, not a reimplementation.
+//! (the substrate — etcd + Syncthing — via setup-etcd/setup-syncthing, the
+//! ONBOARD-9 service manager), so the wizard is a narrated UX layer, not a
+//! reimplementation.
 
 use std::io::{self, Stdout};
 use std::time::Duration;

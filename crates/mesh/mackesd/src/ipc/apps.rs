@@ -364,7 +364,10 @@ pub fn fleet_running_hosts_in(root: &std::path::Path) -> HashMap<String, Vec<Str
         }
         if let Some(ids) = doc.get("ids").and_then(|i| i.as_array()) {
             for id in ids.iter().filter_map(|v| v.as_str()) {
-                by_id.entry(id.to_string()).or_default().insert(host.clone());
+                by_id
+                    .entry(id.to_string())
+                    .or_default()
+                    .insert(host.clone());
             }
         }
     }
@@ -379,7 +382,10 @@ pub fn fleet_running_hosts_in(root: &std::path::Path) -> HashMap<String, Vec<Str
 /// `state="running"` and `node` to the comma-joined hosts it's live on. Pure +
 /// unit-tested; `apps` is consumed and returned so the merge is a simple map.
 #[must_use]
-pub fn apply_running_state(mut apps: Vec<AppEntry>, running: &HashMap<String, Vec<String>>) -> Vec<AppEntry> {
+pub fn apply_running_state(
+    mut apps: Vec<AppEntry>,
+    running: &HashMap<String, Vec<String>>,
+) -> Vec<AppEntry> {
     for app in &mut apps {
         if let Some(hosts) = running.get(&app.id) {
             if !hosts.is_empty() {
@@ -893,7 +899,10 @@ mod tests {
         let mut ff = map.get("firefox").cloned().unwrap();
         ff.sort();
         assert_eq!(ff, vec!["fedora".to_string(), "node-13".to_string()]);
-        assert_eq!(map.get("gimp").cloned().unwrap(), vec!["fedora".to_string()]);
+        assert_eq!(
+            map.get("gimp").cloned().unwrap(),
+            vec!["fedora".to_string()]
+        );
     }
 
     #[test]

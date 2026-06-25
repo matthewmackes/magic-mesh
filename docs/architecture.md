@@ -22,13 +22,13 @@ view in [`ADMIN.md`](../ADMIN.md) + [`docs/help/`](help/).
 │  magic-fleet: desired-state engine (ansible-backed), revision log    │
 ├─ Substrate (§1–§3 locks) ────────────────────────────────────────────┤
 │  Nebula overlay (Ed25519 identity, AES-256-GCM/ChaCha20) — the wire  │
-│  LizardFS replicated volume ("QNM-Shared") — the shared disk         │
+│  etcd (coordination) + Syncthing (files, "/mnt/mesh-storage") — §1   │
 │  rustls everywhere; RSA-4096 own KDC identity                        │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
 **No fixed center:** any node can author fleet revisions; peers replicate
-them over LizardFS and each node elects + applies the head itself
+them over Syncthing and each node elects + applies the head itself
 (`magic-fleet reconcile`, FPG-8). The Lighthouse is a *relay + CA*, not a
 controller — losing it is a recoverable event
 ([mesh-recovery](help/mesh-recovery.md)), not a head decapitation.
@@ -66,7 +66,7 @@ floor: content classes (clipboard/file/SMS) never ride a transport below
 AES-256-class. Every path flip is a hash-chained audit event.
 
 **File transfer.** Send-To copies into `<qnm>/inbox/<peer>/<sender>/` —
-LizardFS replication *is* the wire; the receiving Inbox lists its directory.
+Syncthing replication *is* the wire; the receiving Inbox lists its directory.
 Sources are confined to the operator share root (symlink-escape refused,
 EFF-2).
 
@@ -95,6 +95,6 @@ an accepted, documented trade-off — [`DISCLAIMER.md`](../DISCLAIMER.md).
 - No desktop shell — Cosmic owns panel/lock/greeter/settings (E11 pivot).
 - No `mde <subcommand>` dispatcher — separate binaries.
 - No central server, no SaaS, no telemetry egress.
-- No OpenSSL (rustls; `cargo deny` bans it), no Gluster (LizardFS), no
-  Tailscale/Headscale (Nebula).
+- No OpenSSL (rustls; `cargo deny` bans it), no Gluster/LizardFS/Ceph
+  (etcd + Syncthing), no Tailscale/Headscale (Nebula).
 - No i18n — en-US only, in-envelope decision (SUPPORT.md).

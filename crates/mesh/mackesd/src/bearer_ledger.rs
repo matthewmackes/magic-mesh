@@ -4,7 +4,7 @@
 //! only honored when this ledger holds it as *issued and not yet
 //! redeemed*, and redemption is **single-use** — the sign that
 //! consumes it deletes it. The ledger stores **SHA-256 hashes**, not
-//! raw bearers, so the (LizardFS-replicated) directory never carries
+//! raw bearers, so the (Syncthing-replicated) directory never carries
 //! a usable token; possession of the raw bearer stays with whoever
 //! the operator handed the join token to.
 //!

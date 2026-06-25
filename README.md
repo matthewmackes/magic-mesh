@@ -10,7 +10,8 @@ GUIs — on stock Fedora-Cosmic.**
 MCNF turns up to **eight machines** into one private, encrypted workgroup
 with no central server: any node can author fleet policy, every node enforces it
 itself, and the whole thing runs over a [Nebula](https://github.com/slackhq/nebula)
-overlay with [LizardFS](https://lizardfs.com/) as the shared disk. The desktop is
+overlay with [etcd](https://etcd.io/) for coordination and
+[Syncthing](https://syncthing.net/) replicating the shared disk. The desktop is
 [COSMIC](https://github.com/pop-os/cosmic-epoch) — MCNF ships everything
 Cosmic *doesn't* give you (the mesh, fleet automation, storage, telephony, device
 sync, security scanning, observability) as Cosmic apps + applets.
@@ -53,7 +54,7 @@ monorepo (the labwc/Windows-era *MackesDE* desktop, now end-of-life) by the
 ┌───────────────▼──────────────────────────────────────────────────────────────┐
 │  SUBSTRATE  (the locked foundation — §1–§3)                                    │
 │     Nebula encrypted overlay   — the wire (Ed25519 identity, AES-256-GCM)      │
-│     LizardFS "QNM-Shared"       — the replicated disk (and the fleet bus)       │
+│     etcd + Syncthing           — coordination + the replicated disk            │
 │     rustls / ring               — all TLS; no OpenSSL, anywhere                 │
 └────────────────────────────────────────────────────────────────────────────── ┘
 
@@ -74,7 +75,7 @@ and one signed RPM serves all three; the install-time chooser decides what runs.
 | Role | Adds | Typical host |
 |---|---|---|
 | **Lighthouse** | Nebula relay + CA + leader + health/scan/observability control plane | a VPS, headless |
-| **Server** | + fleet automation + LizardFS storage brick + jobs | a NAS / always-on box |
+| **Server** | + fleet automation + a Syncthing storage replica + jobs | a NAS / always-on box |
 | **Workstation** | + the COSMIC desktop and every GUI | a daily-driver laptop |
 
 ### Fleet controls
@@ -83,7 +84,7 @@ No-fixed-center desired-state automation (`magic-fleet` + the `fleet`/`jobs` Bus
 surfaces, driven from the Workbench **Controller** plane):
 
 - **Revisions** — any node authors a desired-state baseline (`push-revision`);
-  it lands in the LizardFS-replicated revision log and every peer **elects the
+  it lands in the Syncthing-replicated revision log and every peer **elects the
   head and converges itself** (`reconcile`) — no push-SSH, no controller.
   `list-revisions` · `diff-revisions` · `rollback` · `nudge`.
 - **Drift detection + remediation** — the reconcile loop diffs desired vs.
@@ -102,7 +103,7 @@ What the mesh actually *does* for its users — each reachable from a Workbench
 panel and/or a Cosmic app:
 
 - **File sharing** — `mde-files`: a Cosmic file manager with **Send-to-peer**
-  over the replicated volume (LizardFS replication *is* the transport; sources
+  over the replicated volume (Syncthing replication *is* the transport; sources
   confined to the operator's share root), native tar/gz browse + extract.
 - **Telephony / voice** — `mde-voice-hud`: SIP REGISTER/INVITE/RTP softphone;
   mesh-internal extensions auto-configured (Kamailio + RTPengine units,
@@ -191,7 +192,8 @@ among ≤8 peers, an accepted, documented trade-off (see `DISCLAIMER.md`):
 The load-bearing identity (full detail in [`AI_GOVERNANCE.md`](AI_GOVERNANCE.md)):
 
 - **Mesh:** Nebula encrypted overlay · **no fixed center** (any node authors
-  fleet revisions; peers gossip + self-converge) · LizardFS mesh storage.
+  fleet revisions; peers gossip + self-converge) · etcd + Syncthing mesh
+  substrate.
 - **Bus, not D-Bus:** surfaces and `mackesd` talk over `mde-bus`; FDO interop
   (`org.freedesktop.*`, `org.mpris.*`) only.
 - **Security:** maximum crypto — Ed25519 / AES-256-GCM / ChaCha20-Poly1305 /

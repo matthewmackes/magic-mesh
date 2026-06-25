@@ -1050,7 +1050,10 @@ mod tests {
         assert_eq!(p.cred_password, "dom0-secret", "password kept for retry");
         // Retry re-fires (modal back to Pending), not a validation bounce.
         let _ = p.update(Message::CredRetry);
-        assert!(p.cred_modal.is_pending(), "retry should re-fire, not bounce");
+        assert!(
+            p.cred_modal.is_pending(),
+            "retry should re-fire, not bounce"
+        );
     }
 
     #[test]

@@ -3028,10 +3028,7 @@ impl FrontDoor {
         // actions menu for the clicked tile, with a Back control to the grid.
         // Validate the index against the live tile set so a stale index can never
         // panic the view.
-        if let Some((i, tile)) = self
-            .detail
-            .and_then(|i| self.tiles.get(i).map(|t| (i, t)))
-        {
+        if let Some((i, tile)) = self.detail.and_then(|i| self.tiles.get(i).map(|t| (i, t))) {
             return self.detail_view(i, tile, palette);
         }
         match self.mode {
@@ -3120,19 +3117,20 @@ impl FrontDoor {
         // proposal to the propose queue (never executes). Empty when no suggestion
         // concerns this tile (the section is omitted, not an empty header).
         let tile_suggestions = self.suggestions_for_tile(i);
-        let suggestions_section: Option<Element<'_, crate::Message, Theme>> =
-            if tile_suggestions.is_empty() {
-                None
-            } else {
-                let mut sec = column![rail_section_label("Copilot suggestions", palette)].spacing(8);
-                if self.locked {
-                    sec = sec.push(lock_note(palette));
-                }
-                for (gi, s) in tile_suggestions {
-                    sec = sec.push(suggestion_card(gi, s, self.locked, palette));
-                }
-                Some(sec.into())
-            };
+        let suggestions_section: Option<Element<'_, crate::Message, Theme>> = if tile_suggestions
+            .is_empty()
+        {
+            None
+        } else {
+            let mut sec = column![rail_section_label("Copilot suggestions", palette)].spacing(8);
+            if self.locked {
+                sec = sec.push(lock_note(palette));
+            }
+            for (gi, s) in tile_suggestions {
+                sec = sec.push(suggestion_card(gi, s, self.locked, palette));
+            }
+            Some(sec.into())
+        };
 
         // FRONTDOOR-13 — the AI alert triage, ONLY on the Alerts tile (Q38): the live
         // alerts GROUPED + EXPLAINED, each group with its member alerts and — when it
@@ -3178,20 +3176,15 @@ impl FrontDoor {
         // that opens locally pointed at the chosen node's data (Q74). A plain
         // launcher (Files/Terminal — `key == None`) has no mesh reach, so the
         // section is omitted there.
-        let target_section: Option<Element<'_, crate::Message, Theme>> =
-            if tile.key.is_some() {
-                Some(self.target_node_section(palette))
-            } else {
-                None
-            };
+        let target_section: Option<Element<'_, crate::Message, Theme>> = if tile.key.is_some() {
+            Some(self.target_node_section(palette))
+        } else {
+            None
+        };
 
-        let mut body = column![
-            back,
-            Space::new().height(Length::Fixed(16.0)),
-            header,
-        ]
-        .spacing(8)
-        .width(Length::Fill);
+        let mut body = column![back, Space::new().height(Length::Fixed(16.0)), header,]
+            .spacing(8)
+            .width(Length::Fill);
         if let Some(section) = triage_section {
             body = body.push(Space::new().height(Length::Fixed(20.0)));
             body = body.push(section);
@@ -3692,8 +3685,7 @@ impl FrontDoor {
             ),
             CopilotState::Answer(a) => (a.clone(), palette.text.into_cosmic_color()),
             CopilotState::Unavailable => (
-                "Copilot is unavailable right now — local results still apply."
-                    .to_string(),
+                "Copilot is unavailable right now — local results still apply.".to_string(),
                 palette.text_muted.into_cosmic_color(),
             ),
         };
@@ -6718,7 +6710,9 @@ mod tests {
 
         // A node name → a MeshNode hit that routes to Peers.
         let r = search::local_results("anvil", &tiles, &peers);
-        assert!(r.iter().any(|h| h.kind == HitKind::MeshNode && h.label == "anvil"));
+        assert!(r
+            .iter()
+            .any(|h| h.kind == HitKind::MeshNode && h.label == "anvil"));
         assert!(matches!(
             r.iter().find(|h| h.label == "anvil").unwrap().message,
             crate::Message::SelectPanel {
@@ -6982,7 +6976,12 @@ mod tests {
         };
         // A typed service-lifecycle proposal always maps to the Data Center tile.
         assert_eq!(
-            mk("restart", "", Some(r#"{"action":{"kind":"service_lifecycle"}}"#)).concerns_tile(),
+            mk(
+                "restart",
+                "",
+                Some(r#"{"action":{"kind":"service_lifecycle"}}"#)
+            )
+            .concerns_tile(),
             Some(TileKey::DataCenter)
         );
         // Keyword buckets.
@@ -6999,7 +6998,9 @@ mod tests {
             Some(TileKey::MeshMap)
         );
         // Names no tile → unmapped (homed on the Copilot tile by the panel).
-        assert!(mk("ponder the universe", "vague", None).concerns_tile().is_none());
+        assert!(mk("ponder the universe", "vague", None)
+            .concerns_tile()
+            .is_none());
     }
 
     #[test]
@@ -7100,7 +7101,11 @@ mod tests {
             ),
         }];
         // The lifecycle proposal homes on the Data Center tile — open its detail.
-        let dc_idx = fd.tiles.iter().position(|t| t.label == "Data Center").unwrap();
+        let dc_idx = fd
+            .tiles
+            .iter()
+            .position(|t| t.label == "Data Center")
+            .unwrap();
         let _ = fd.update(Message::TileActivated(dc_idx));
         let _: Element<'_, crate::Message, Theme> = fd.view();
     }
@@ -7909,7 +7914,10 @@ mod tests {
             // A FRESH construction (a later launch / restart) does NOT greet again —
             // the sentinel makes it exactly once per node (Q71 — no repeated tour).
             let fd2 = FrontDoor::new();
-            assert!(!fd2.show_greeting, "a returning operator is never re-greeted");
+            assert!(
+                !fd2.show_greeting,
+                "a returning operator is never re-greeted"
+            );
         });
     }
 

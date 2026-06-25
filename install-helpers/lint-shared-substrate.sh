@@ -2,16 +2,15 @@
 # lint-shared-substrate.sh — OB6-FIX-2: guard against the ONBOARD-6 audit gap.
 #
 # The gap: a feature whose code is 100% reachable + unit-tested can still
-# silently no-op in the mesh because its INFRASTRUCTURE PRECONDITION (QNM-Shared
-# being a real replicated mount, not a local dir) was never provisioned. §7 +
-# the audit verify code, not deployed substrate; tests bind QNM-Shared to a
-# tempdir, identical to a mount — so "works locally" masqueraded as "works in
-# the mesh" (NO LEADER / node_count 0).
+# silently no-op in the mesh because its INFRASTRUCTURE PRECONDITION (the shared
+# root being a real replicated dir, not a bare local dir) was never provisioned.
+# Tests bind the shared root to a tempdir, identical to a real share — so "works
+# locally" masqueraded as "works in the mesh" (NO LEADER / node_count 0).
 #
 # This lint can't prove a substrate is deployed, but it keeps the GUARDRAILS
 # that catch the class from being silently removed:
-#   1. the mesh-health watchdog must still fail-loud if QNM-Shared isn't a mount
-#      (OB6-FIX-3);
+#   1. the mesh-health watchdog must still fail-loud on etcd quorum loss
+#      (SUBSTRATE-11) AND carry NO LizardFS references (SUBSTRATE-6 retired it);
 #   2. the multi-node shared-state test must still exist + assert the cross-node
 #      invariants (OB6-FIX-1);
 # and it surfaces (advisory) new non-test readers of the shared root so a
@@ -22,17 +21,17 @@ set -eu
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 fail=0
 
-# 1. The fail-loud shared-state assertion in the watchdog. SUBSTRATE-11/V2: the
-#    plane is etcd (coordination) + Syncthing (files), so the watchdog must assert
-#    etcd quorum health; the legacy LizardFS-mount assertion is kept for the
-#    pre-cutover branch until the fleet cuts over.
+# 1. The fail-loud shared-state assertion in the watchdog. SUBSTRATE-V2: the
+#    plane is etcd (coordination) + Syncthing (files), so the watchdog must
+#    assert etcd quorum health and carry NO LizardFS/qnm-shared paths.
 hc="$REPO/install-helpers/mesh-health-check.sh"
 if ! grep -q 'etcd unreachable' "$hc" 2>/dev/null; then
     echo "lint-shared-substrate: FAIL — mesh-health-check.sh lost its etcd-quorum readiness guard (SUBSTRATE-11)" >&2
     fail=1
 fi
-if ! grep -q 'QNM-Shared not mounted' "$hc" 2>/dev/null; then
-    echo "lint-shared-substrate: WARN — mesh-health-check.sh dropped the legacy QNM mount assertion (OK once the fleet has cut over)" >&2
+if grep -qiE 'lizardfs|mfsmount|qnm-shared\.service' "$hc" 2>/dev/null; then
+    echo "lint-shared-substrate: FAIL — mesh-health-check.sh still references retired LizardFS (SUBSTRATE-6 removed it)" >&2
+    fail=1
 fi
 
 # 2. The etcd multi-node gate — exactly-one-leader + the peer directory exercised

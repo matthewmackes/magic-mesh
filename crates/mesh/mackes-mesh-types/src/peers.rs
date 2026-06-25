@@ -2,7 +2,7 @@
 //!
 //! The substrate locked in `docs/design/v2.7-peer-data-convergence.md`:
 //! each peer writes its own `<mesh-home>/peers/<hostname>.json` (own-row
-//! authority — sole writer per file); LizardFS replicates the dir to
+//! authority — sole writer per file); Syncthing replicates the dir to
 //! every peer; any tool [`read_peers`] unions the dir. No broker / D-Bus
 //! / mackesd dependency for reads.
 //!
@@ -206,20 +206,19 @@ pub fn default_mesh_home() -> PathBuf {
     PathBuf::from(home).join(".mde-mesh")
 }
 
-/// Resolve the QNM-Shared workgroup-root mount — the single source of
-/// truth shared by `mackesd` (directory/healthz/meshfs) and
-/// `mde-workbench` (every panel that reads off mesh-storage).
+/// Resolve the workgroup-root directory — the single source of truth
+/// shared by `mackesd` (directory/healthz) and `mde-workbench` (every
+/// panel that reads off mesh-storage). Under SUBSTRATE-V2 this is the
+/// plain Syncthing-replicated dir at `/mnt/mesh-storage`.
 ///
-/// Precedence (matches `setup-qnm-shared.sh`, which mounts the LizardFS
-/// volume at `~/QNM-Shared`): `$MDE_WORKGROUP_ROOT` (canonical) >
-/// `$QNM_SHARED_ROOT` (back-compat) > `~/QNM-Shared` > the system
-/// fallback `/var/lib/mackesd/qnm-shared`.
+/// Precedence: `$MDE_WORKGROUP_ROOT` (canonical) > `$QNM_SHARED_ROOT`
+/// (back-compat) > `~/QNM-Shared` > the system fallback
+/// `/var/lib/mackesd/qnm-shared`.
 ///
-/// Historically the workbench panels and `meshfs_worker` fell back to a
-/// phantom `/mnt/mesh-storage` that nothing mounts, so they reported
-/// "not mounted" while `mackesd`'s directory read the real
-/// `~/QNM-Shared` and reported a healthy 4-node mesh. Routing every
-/// caller through this one function removes that split-brain.
+/// Historically the workbench panels fell back to a phantom
+/// `/mnt/mesh-storage` while `mackesd`'s directory read the real
+/// `~/QNM-Shared`, reporting "not mounted" against a healthy mesh.
+/// Routing every caller through this one function removes that split-brain.
 #[must_use]
 pub fn default_workgroup_root() -> PathBuf {
     if let Ok(root) = std::env::var("MDE_WORKGROUP_ROOT") {

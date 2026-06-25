@@ -6,7 +6,7 @@
 //! moment its drift appears, and fires *loud*: the fire is audit-logged
 //! like any operator-initiated run).
 //!
-//! This is the pure core: plans are TOML on LizardFS
+//! This is the pure core: plans are TOML on the Syncthing share
 //! (`<workgroup_root>/remediation/*.toml`, W88 — fleet state is TOML
 //! dirs + typed Bus verbs), junk-tolerant on read, plus a built-in
 //! **core pack** that pairs the W50 core policies with their stock

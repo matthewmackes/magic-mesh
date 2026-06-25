@@ -2,7 +2,7 @@
 
 The operational rulebook is [`AI_GOVERNANCE.md`](AI_GOVERNANCE.md) — read its
 locks (§1–§8) before changing anything load-bearing. The short version: the
-substrate (Nebula / LizardFS / Bus / max-crypto) and the look (IBM Carbon,
+substrate (Nebula / etcd / Syncthing / Bus / max-crypto) and the look (IBM Carbon,
 single-sourced in `mde-theme`) are **locked**; new code is glue over the
 existing crates, and a feature isn't done until it's runtime-reachable with
 no stubs (§7).

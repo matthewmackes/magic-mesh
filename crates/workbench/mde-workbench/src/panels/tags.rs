@@ -8,7 +8,7 @@
 //! hop?" at a glance. The per-node view/edit lives in Provisioning ▸
 //! Node Roles (the `mackesd tag <host>` write side, W26/W58).
 //!
-//! Read-only renderer (W88): tags are replicated TOML/JSON on LizardFS;
+//! Read-only renderer (W88): tags are replicated TOML/JSON on the Syncthing share;
 //! this surface only shows the census.
 
 use std::time::SystemTime;

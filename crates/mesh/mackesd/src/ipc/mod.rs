@@ -83,7 +83,7 @@ pub mod voip;
 /// Bus writer can force with one oversized message. 64 KiB comfortably
 /// fits every real action body (selectors, peer lists, a send-to source
 /// list for a ≤8-peer mesh); legitimate bulk transfer goes over the
-/// LizardFS-replicated volume, not an action body.
+/// Syncthing-replicated volume, not an action body.
 pub const MAX_RPC_BODY_BYTES: usize = 64 * 1024;
 
 /// True when `body` is absent or within [`MAX_RPC_BODY_BYTES`]. A

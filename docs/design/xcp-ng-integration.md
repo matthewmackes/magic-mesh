@@ -3,6 +3,15 @@
 Status: **locked** (operator survey 2026-06-16). Owner epic prefix: `XCP`.
 Community/back-reference: <https://xcp-ng.org/#community>.
 
+> **Note (post-SUBSTRATE-6):** the B1 lock and host-join flow below describe a dom0
+> joining with **nebula + lizardfs-client + mackesd**. **LizardFS is removed** — the
+> substrate is now **etcd** (coordination) + **Syncthing** (files). The "Tested
+> onboarding (2026-06-19)" section already corrects B1 (mackesd/lizardfs-client
+> can't run on a CentOS-7 dom0 anyway; the dom0 is driven via `XeSsh`); etcd +
+> Syncthing both ship as static binaries, which is what could later let a dom0 carry
+> a real coordination/file agent. Read every `lizardfs-client` mention here as the
+> retired LizardFS plane.
+
 MCNF gains first-class XCP-ng integration in two halves that share one
 hypervisor-access layer:
 
@@ -19,9 +28,9 @@ hypervisor-access layer:
 | A2 | Base image | **XCP template `MDE-VM-golden`** — built once (F44 cloud + UEFI + cloud-init, generalized: no host keys/machine-id); each spawn is a fast `xe vm-clone`. |
 | A3 | Mesh join | **Auto-enroll join** — provisioning runs `network-enroll join` so the node boots already a Server in the directory. |
 | A4 | Surface | **CLI + bus + panel** — `mackesd provision …`, `action/provision/*`, and a Workbench panel under the Provisioning plane (MESH: VIRTUAL WORKLOADS). |
-| B1 | Host join model | **Native on dom0** — nebula + lizardfs-client + mackesd installed on dom0; the hypervisor *is* the node. (Appliance-fragility mitigations below.) |
+| B1 | Host join model | **Native on dom0** — nebula + (the substrate client) + mackesd installed on dom0; the hypervisor *is* the node. (Originally `lizardfs-client`, retired by SUBSTRATE-6 → etcd/Syncthing; further corrected in the 2026-06-19 onboarding section — mackesd/lizardfs can't run on a CentOS-7 dom0, so it's driven via `XeSsh`.) |
 | B2 | Host role | **Compute provider** — host advertises CPU/RAM/SRs/running-VMs into the directory; any node can target it to spawn MDE-VMs. |
-| B3 | Credentials | **Mesh secret on QNM-Shared** — XAPI/host creds encrypted on the replicated LizardFS plane (leader-managed, like the CA backup). |
+| B3 | Credentials | **Mesh secret on the shared mesh-storage plane** — XAPI/host creds encrypted on the replicated `/mnt/mesh-storage` dir (now Syncthing-synced, was the LizardFS plane), leader-managed, like the CA backup. |
 
 ## Conventions (hard rules, all spawns)
 
@@ -51,7 +60,7 @@ mde-workbench:
 secrets:
   <QNM-Shared>/secrets/xcp/<host>.age (B3) leader-managed XAPI creds
 install:
-  install-helpers/xcp-host-join.sh    (B) native dom0 nebula+lizardfs+mackesd (appliance-guarded)
+  install-helpers/xcp-host-join.sh    (B) native dom0 nebula (+ static etcd/Syncthing later; lizardfs retired SUBSTRATE-6); driven via XeSsh (appliance-guarded)
   install-helpers/build-mde-vm-golden.sh  (A2) one-time golden template builder
 ```
 
@@ -64,9 +73,11 @@ install:
 5. Record the VM in the directory under the owning host's capacity rollup.
 
 ### B — host-join flow (native dom0, appliance-guarded)
-1. `xcp-host-join.sh` installs nebula + lizardfs-client + mackesd on dom0 from a
-   pinned bundle; idempotent; **re-asserted by a boot unit** so an XCP host
-   upgrade that clobbers it self-heals (mitigates the dom0-appliance risk).
+1. `xcp-host-join.sh` installs nebula on dom0 from a pinned bundle (originally
+   "+ lizardfs-client + mackesd" — LizardFS retired by SUBSTRATE-6, and per the
+   2026-06-19 correction mackesd doesn't run on dom0 at all; see below);
+   idempotent; **re-asserted by a boot unit** so an XCP host upgrade that clobbers
+   it self-heals (mitigates the dom0-appliance risk).
 2. dom0 pins **Server** role, joins the overlay + QNM-Shared, runs `xcp_host`
    worker → publishes capacity (CPU/RAM/SR free/running VMs) to the directory.
 3. The Provisioning panel/`action/provision/hosts` lists every joined host as a
@@ -99,15 +110,18 @@ persistence — a detached `nohup`/`setsid` over SSH does **not** survive) → v
 overlay ping.
 
 **B1 CORRECTION (load-bearing).** The original B1 lock — "native nebula +
-**lizardfs-client + mackesd** on dom0" — is **only partly viable**. An XCP-ng dom0
-is CentOS-7-based (**glibc 2.17**); the Fedora-packaged `nebula`, `mackesd`, and the
-lizardfs client are **dynamically linked against glibc ≥2.32/2.34** and die on dom0
-with `version 'GLIBC_2.34' not found` (verified). Therefore:
+**lizardfs-client + mackesd** on dom0" — is **only partly viable** (and the
+`lizardfs-client` half is moot anyway: LizardFS is retired by SUBSTRATE-6). An
+XCP-ng dom0 is CentOS-7-based (**glibc 2.17**); the Fedora-packaged `nebula`,
+`mackesd`, and the old lizardfs client are **dynamically linked against glibc
+≥2.32/2.34** and die on dom0 with `version 'GLIBC_2.34' not found` (verified).
+Therefore:
 - **Nebula on dom0: YES**, but ONLY the **official SlackHQ static** release
   (`nebula-linux-amd64.tar.gz`, statically linked Go) — NOT the Fedora `/usr/bin/nebula`.
   The script now downloads/uses the static binary and **refuses to push a dynamic one**.
-- **mackesd / lizardfs-client on dom0: NO** (glibc). The dom0 does **not** run
-  mackesd. Drive it instead via the **A1 `XeSsh` path** (`HostTarget::Ssh` over the
+- **mackesd on dom0: NO** (glibc); the retired `lizardfs-client` likewise. The
+  dom0 does **not** run mackesd. Drive it instead via the **A1 `XeSsh` path**
+  (`HostTarget::Ssh` over the
   overlay) from a real mesh node, and run the **`xcp_host` capacity worker on a
   designated Server node (or the leader)** pointed at the dom0 over SSH — NOT on dom0
   locally. (This supersedes the XCP-6 "xcp_host self-gates on the dom0 marker and runs
@@ -124,8 +138,8 @@ via `xe`). "Full native mackesd member" is retired for dom0.
   dom0-resident bits; an XCP host upgrade clobbering them self-heals via the
   idempotent re-assert (a boot unit / re-run is a no-op). Far smaller surface than the
   original native-mackesd plan.
-- **dom0 glibc wall:** no Fedora RPM (mackesd/lizardfs) runs on dom0 — drive via
-  `XeSsh`; only static binaries (nebula today; etcd/Syncthing under SUBSTRATE-V2) are
-  dom0-resident candidates.
+- **dom0 glibc wall:** no Fedora RPM (mackesd; and the retired lizardfs) runs on
+  dom0 — drive via `XeSsh`; only static binaries (nebula today; etcd/Syncthing under
+  SUBSTRATE-V2, now the live substrate) are dom0-resident candidates.
 - Native rustls XAPI backend (replacing xe-over-SSH) — deferred behind the trait.
 - Windows/other guest images, live-migration orchestration — out of scope.

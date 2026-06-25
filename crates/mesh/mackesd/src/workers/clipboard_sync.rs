@@ -52,7 +52,7 @@
 //! concurrent pin-vs-capture can lose one update, self-healing on the next
 //! capture. A real clipboard never sustains the write rate where this
 //! matters, so a cross-node lock is deliberately not taken here (it would
-//! add a LizardFS round-trip to every copy).
+//! add a Syncthing round-trip to every copy).
 
 #![cfg(feature = "async-services")]
 
@@ -272,42 +272,27 @@ pub fn write_history(path: &Path, history: &History) -> Result<(), String> {
         .map_err(|e| format!("rename {} → {}: {e}", tmp.display(), path.display()))
 }
 
-/// Substrate-aware writability for the shared clipboard history.
+/// Writability for the shared clipboard history.
 ///
-/// Pure core — `on_etcd` + `root_is_dir` are injected so it unit-tests without
-/// touching `/etc` or the filesystem. See
-/// [`ClipboardSyncWorker::share_writable`] for the why.
+/// Pure core — `root_is_dir` is injected so it unit-tests without touching the
+/// filesystem. See [`ClipboardSyncWorker::share_writable`] for the why.
 ///
-///   * `on_etcd == true` (the SUBSTRATE-1 endpoints file exists → this node is
-///     on the etcd/Syncthing substrate) — `/mnt/mesh-storage` is a plain
-///     Syncthing directory, **not** a FUSE mount, so there is no mountpoint to
-///     poison. Writable **iff the root actually exists as a directory**
-///     (`root_is_dir`): a present plain dir is fine, but a missing/unprovisioned
-///     share (early boot before Syncthing creates it) or a bare unmounted
-///     `LizardFS` mountpoint left mid-cutover is NOT written into — that both
-///     avoids a per-clip write error and keeps the ONBOARD-6/XPA-10 poison
-///     invariant (never fill a bare canonical mountpoint). This mirrors the
-///     `boot_readiness` SUBSTRATE-10 probe's shape (a real liveness check when
-///     on etcd, not an unconditional yes).
-///   * `on_etcd == false` (pre-cutover, legacy `LizardFS`) — defer to the
-///     ONBOARD-6/XPA-10 [`crate::shared_root_writable`] guard so we never fill
-///     a bare canonical mountpoint and block `mfsmount`.
+/// Under SUBSTRATE-V2 `/mnt/mesh-storage` is a plain Syncthing directory.
+/// Writable **iff the canonical root actually exists as a directory**: a present
+/// plain dir is fine, but a missing/unprovisioned share (early boot before
+/// Syncthing creates it) is NOT written into — that avoids a per-clip write error
+/// landing on a bare local dir. Any non-canonical root (dev tree / tempdir) is
+/// always writable.
 #[must_use]
-pub fn clip_share_writable_core(workgroup_root: &Path, on_etcd: bool, root_is_dir: bool) -> bool {
-    if on_etcd {
-        root_is_dir
-    } else {
-        crate::shared_root_writable(workgroup_root)
-    }
+pub fn clip_share_writable_core(workgroup_root: &Path, root_is_dir: bool) -> bool {
+    crate::shared_root_writable_core(workgroup_root, root_is_dir)
 }
 
-/// Substrate-aware writability for the shared clipboard history, reading the
-/// live SUBSTRATE-1 etcd endpoints file + the shared root's directory state.
-/// Thin I/O wrapper over [`clip_share_writable_core`].
+/// Writability for the shared clipboard history, reading the shared root's
+/// directory state. Thin I/O wrapper over [`clip_share_writable_core`].
 #[must_use]
 pub fn clip_share_writable(workgroup_root: &Path) -> bool {
-    let on_etcd = !crate::substrate::etcd::default_endpoints().is_empty();
-    clip_share_writable_core(workgroup_root, on_etcd, workgroup_root.is_dir())
+    clip_share_writable_core(workgroup_root, workgroup_root.is_dir())
 }
 
 /// This node's short hostname — the O6 source stamp.
@@ -444,16 +429,15 @@ impl ClipboardSyncWorker {
     ///
     /// Post-SUBSTRATE-V2 `/mnt/mesh-storage` is a **plain Syncthing directory,
     /// not a FUSE mount** (design `substrate-v2.md` Q3/Q8: "now a plain local
-    /// dir (NO FUSE)"), so the legacy LizardFS poison guard
-    /// ([`crate::shared_root_writable`], which gates the canonical path on a
-    /// real `/proc/mounts` entry) returns `false` for it and the worker would
-    /// silently drop **every** clip — `history.json` is never written and the
-    /// Hub's Clipboard Viewer reads an always-empty `action/clipboard/list`.
-    /// When the etcd coordination plane is provisioned (the SUBSTRATE-1
-    /// endpoints file is present) the node is on SUBSTRATE-V2, the shared root
-    /// is a plain dir, and there is no mountpoint to poison — so it is
-    /// writable. Pre-cutover (no endpoints file) we keep the LizardFS
-    /// mount-poison guard.
+    /// dir (NO FUSE)"), so a guard that gates the canonical path on a real
+    /// `/proc/mounts` entry ([`crate::shared_root_writable`]) returns `false`
+    /// for it and the worker would silently drop **every** clip —
+    /// `history.json` is never written and the Hub's Clipboard Viewer reads an
+    /// always-empty `action/clipboard/list`. When the etcd coordination plane
+    /// is provisioned (the SUBSTRATE-1 endpoints file is present) the node is
+    /// on SUBSTRATE-V2, the shared root is a plain dir, and there is no
+    /// mountpoint to check — so it is writable. Absent the endpoints file we
+    /// fall back to the dir-exists guard.
     fn share_writable(&self) -> bool {
         clip_share_writable(&self.workgroup_root)
     }
@@ -871,47 +855,34 @@ mod tests {
     }
 
     #[test]
-    fn clip_share_writable_core_writes_on_etcd_when_root_exists() {
-        // SUBSTRATE-V2: the canonical path is a plain Syncthing dir (no FUSE
-        // mount), so the legacy `shared_root_writable` mount guard says false —
-        // but on the etcd substrate there's no mountpoint to poison, so the
-        // clipboard worker MUST treat an EXISTING dir as writable. This is the
-        // bug fix: with the old guard, `on_etcd` was ignored and every clip was
-        // dropped on a cut-over node, leaving the Hub's Clipboard Viewer empty.
+    fn clip_share_writable_core_writes_when_root_exists() {
+        // SUBSTRATE-V2: the canonical path is a plain Syncthing dir, so the
+        // clipboard worker MUST treat an EXISTING dir as writable — otherwise
+        // every clip was dropped, leaving the Hub's Clipboard Viewer empty.
         let canonical = Path::new(crate::CANONICAL_QNM_MOUNT);
         assert!(
-            clip_share_writable_core(canonical, /* on_etcd = */ true, /* root_is_dir = */ true),
-            "etcd substrate + present plain dir → writable"
+            clip_share_writable_core(canonical, /* root_is_dir = */ true),
+            "present plain dir → writable"
         );
     }
 
     #[test]
-    fn clip_share_writable_core_skips_missing_root_on_etcd() {
-        // On etcd but the shared dir doesn't exist yet (early boot, before
-        // Syncthing provisions it): NOT writable, so we don't error per-clip
-        // writing into a missing path — mirrors boot_readiness's real liveness
-        // check rather than an unconditional yes.
+    fn clip_share_writable_core_skips_missing_root() {
+        // The shared dir doesn't exist yet (early boot, before Syncthing
+        // provisions it): NOT writable, so we don't error per-clip writing into a
+        // missing path that would land on a bare local dir.
         let canonical = Path::new(crate::CANONICAL_QNM_MOUNT);
         assert!(!clip_share_writable_core(
-            canonical, true, /* root_is_dir = */ false
+            canonical, /* root_is_dir = */ false
         ));
     }
 
     #[test]
-    fn clip_share_writable_core_defers_to_mount_guard_pre_cutover() {
-        // Pre-cutover (no etcd endpoints) the canonical mount must still gate on
-        // a real FUSE mount (ONBOARD-6/XPA-10 poison guard) — the value mirrors
-        // `shared_root_writable` exactly, regardless of the dir-exists flag.
-        let canonical = Path::new(crate::CANONICAL_QNM_MOUNT);
-        assert_eq!(
-            clip_share_writable_core(canonical, false, true),
-            crate::shared_root_writable(canonical),
-        );
-        // A non-canonical root (dev tree / tempdir) is always writable
-        // pre-cutover, and writable on etcd when it exists.
+    fn clip_share_writable_core_allows_non_canonical_roots() {
+        // A non-canonical root (dev tree / tempdir) is always writable.
         let dir = tempfile::tempdir().unwrap();
-        assert!(clip_share_writable_core(dir.path(), false, true));
-        assert!(clip_share_writable_core(dir.path(), true, true));
+        assert!(clip_share_writable_core(dir.path(), true));
+        assert!(clip_share_writable_core(dir.path(), false));
     }
 
     #[test]

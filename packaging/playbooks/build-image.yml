@@ -3,7 +3,7 @@
 # `action/jobs/launch` runs this playbook on an execution-tagged node with
 # vars {image_kind, image_name, image_version[, image_profile]}. The node
 # runs `mackesd images --build`, which produces the artifact under the
-# LizardFS image catalog's versioned dir and records its manifest (W55),
+# mesh-storage image catalog's versioned dir and records its manifest (W55),
 # so the Images panel picks it up everywhere.
 #
 # Shipped in the RPM under the playbooks dir; the Images panel's "Build"

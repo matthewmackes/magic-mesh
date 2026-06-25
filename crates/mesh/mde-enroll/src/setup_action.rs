@@ -3,7 +3,8 @@
 //!
 //! Builders are pure (no I/O) so the exact command the wizard runs is
 //! unit-tested. The verbs themselves (`mackesd found`/`join`/`peers`) already
-//! do the heavy lifting — incl. BIRTHRIGHT-1 LizardFS/QNM-Shared provisioning —
+//! do the heavy lifting — incl. provisioning the substrate (etcd + Syncthing,
+//! via setup-etcd/setup-syncthing) at enroll —
 //! so the wizard is a thin, narrated UX layer over them (design lock 3:
 //! imperative verbs bootstrap, Ansible converges).
 
@@ -35,7 +36,7 @@ impl SetupRole {
 
 /// `mackesd found <mesh-id> --external-addr <addr> --role <role>` — found a new
 /// mesh. `external_addr` is `auto` (detect) or an explicit public IP.
-/// BIRTHRIGHT-1 makes `found` provision LizardFS master+chunkserver+client.
+/// `found` provisions the substrate (etcd + Syncthing) via setup-etcd/setup-syncthing.
 #[must_use]
 pub fn found_argv(mesh_id: &str, external_addr: &str, role: SetupRole) -> Vec<String> {
     vec![
@@ -103,11 +104,12 @@ pub fn is_active_argv(unit: &str) -> Vec<String> {
 }
 
 /// The service set the wizard reports/guarantees (design §"Service set").
-pub const WIZARD_SERVICES: [&str; 4] = [
+pub const WIZARD_SERVICES: [&str; 5] = [
     "nebula.service",
     "mackesd.service",
     "mesh-health.timer",
-    "qnm-shared.service",
+    "etcd.service",
+    "syncthing.service",
 ];
 
 /// Run `argv` and stream each stdout/stderr line to `on_line`, returning the
@@ -193,8 +195,8 @@ mod tests {
     #[test]
     fn is_active_targets_the_unit() {
         assert_eq!(
-            is_active_argv("qnm-shared.service"),
-            vec!["systemctl", "is-active", "qnm-shared.service"]
+            is_active_argv("syncthing.service"),
+            vec!["systemctl", "is-active", "syncthing.service"]
         );
     }
 

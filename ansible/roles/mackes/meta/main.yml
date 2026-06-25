@@ -5,8 +5,8 @@ galaxy_info:
   author: MCNF
   description: >-
     Idempotently converge a MCNF node to the steady state captured in
-    /etc/mackesd/site.yml (pinned role, boot-durable service set, QNM-Shared
-    mount assert). Mirrors the imperative found/join/setup-qnm-shared verbs.
+    /etc/mackesd/site.yml (pinned role, boot-durable service set, shared-storage
+    assert). Mirrors the imperative found/join/setup-syncthing verbs.
   license: GPL-3.0-or-later
   min_ansible_version: "2.14"
 dependencies: []

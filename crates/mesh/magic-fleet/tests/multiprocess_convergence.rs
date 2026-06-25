@@ -1,8 +1,8 @@
 //! OBS-2 — multi-process convergence harness.
 //!
 //! Real `mackesd`-side fleet engines, N of them, racing over ONE
-//! shared replicated root (a tmpdir standing in for the LizardFS
-//! QNM-Shared mount every peer mounts). This is the genuine
+//! shared replicated root (a tmpdir standing in for the Syncthing-replicated
+//! `/mnt/mesh-storage` QNM-Shared dir every peer shares). This is the genuine
 //! multi-node evidence the FPG locks claim: that leaderless minting
 //! converges (every node elects the same head — FPG-3), that the
 //! append-only log survives concurrent writers (FPG-2), and that the

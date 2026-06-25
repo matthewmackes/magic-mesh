@@ -39,7 +39,8 @@ ansible, firewalld). Roles nest by capability:
 
 - **Lighthouse** — the relay + CA + leader control plane. Start here: the first
   node in a new mesh is a lighthouse.
-- **Server** — everything a lighthouse runs, plus fleet automation + LizardFS.
+- **Server** — everything a lighthouse runs, plus fleet automation + the
+  Syncthing storage replica.
 - **Workstation** — everything a server runs, plus the Cosmic desktop, voice,
   media, and KDC.
 

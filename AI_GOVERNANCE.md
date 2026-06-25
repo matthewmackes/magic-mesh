@@ -37,14 +37,13 @@ node can leave, and the fabric heals.
   and every node elects the newest deterministically. `mackesd` reconciles locally;
   there is no controller SSH-ing in. (`magic-fleet` is the node engine; the
   Automation Mesh wraps Ansible per-node, Podman-isolated.)
-- **Substrate split (SUBSTRATE-V2, lands 11.0 "Winter-Is-Coming"):** mesh
-  **coordination** (leader election, the peer directory, health) lives in **etcd**
-  over Nebula (strongly consistent, on the anchor nodes); **files** sync via
-  **Syncthing** full-mesh on `/mnt/mesh-storage` (a plain dir, no FUSE). LizardFS
-  (and MooseFS/Gluster/Ceph) are **retired/forbidden** — the single-mount-carries-
-  everything model caused "mount down = mesh down". `~/Local/` is never mesh-synced.
-  *(Until 11.0 ships, the running fleet is still on LizardFS; design:
-  docs/design/substrate-v2.md.)*
+- **Substrate split (SUBSTRATE-V2):** mesh **coordination** (leader election, the
+  peer directory, health) lives in **etcd** over Nebula (strongly consistent, on
+  the anchor nodes); **files** sync via **Syncthing** full-mesh on
+  `/mnt/mesh-storage` (a plain dir, no FUSE). LizardFS (and MooseFS/Gluster/Ceph)
+  are **retired/forbidden** — the single-mount-carries-everything model caused
+  "mount down = mesh down". The LizardFS plane was fully removed in the 11.0 series
+  (SUBSTRATE-6). `~/Local/` is never mesh-synced. *(Design: docs/design/substrate-v2.md.)*
 - **`mackesd`** is the supervised control-plane daemon — owns the worker pool, the
   mesh/CA state, the KDE-Connect host, and the SQLite store. One leader per the
   **etcd lease/election** (SUBSTRATE-V2; the `.mackesd-leader.lock` is retired at

@@ -413,8 +413,8 @@ pub fn fs_pressure_hard_cap(
     let used = fs_total_bytes.saturating_sub(fs_avail_bytes);
     // Integer-only fill check: used/total >= PCT/100  ⇔  used*100 >= total*PCT.
     // u128 so a multi-GB workstation tmpfs can't overflow the multiply.
-    let over = u128::from(used) * 100
-        >= u128::from(fs_total_bytes) * u128::from(FS_PRESSURE_FILL_PCT);
+    let over =
+        u128::from(used) * 100 >= u128::from(fs_total_bytes) * u128::from(FS_PRESSURE_FILL_PCT);
     if !over {
         return (configured_hard_bytes, false);
     }
@@ -1305,7 +1305,11 @@ mod tests {
             .list_since("audit/peerx", None)
             .unwrap()
             .iter()
-            .map(|m| std::fs::metadata(root.join(&m.file_path)).map(|x| x.len()).unwrap_or(0))
+            .map(|m| {
+                std::fs::metadata(root.join(&m.file_path))
+                    .map(|x| x.len())
+                    .unwrap_or(0)
+            })
             .sum();
         assert!(
             audit_bytes <= policy.audit_cap_bytes + 256 * kb as u64,
@@ -1321,7 +1325,13 @@ mod tests {
         let root = tmp.path().to_path_buf();
         let now = 1_000_000_000_000_i64;
         for i in 0..3 {
-            write_sized(&root, "audit/peerx", Priority::Min, now - i * 1000, 4 * 1024);
+            write_sized(
+                &root,
+                "audit/peerx",
+                Priority::Min,
+                now - i * 1000,
+                4 * 1024,
+            );
         }
         let report = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
         assert_eq!(report.audit_pruned, 0, "under-cap audit lane untouched");
@@ -1344,7 +1354,13 @@ mod tests {
         let root = tmp.path().to_path_buf();
         let now = 1_000_000_000_000_i64;
         for i in 0..10 {
-            write_sized(&root, "audit/peerx", Priority::Min, now - (10 - i) * 1000, 64);
+            write_sized(
+                &root,
+                "audit/peerx",
+                Priority::Min,
+                now - (10 - i) * 1000,
+                64,
+            );
         }
         let policy = RetentionPolicy {
             audit_cap_bytes: u64::MAX, // byte cap can never bind
@@ -1415,7 +1431,11 @@ mod tests {
             .list_since("state/boot-readiness", None)
             .unwrap()
             .iter()
-            .map(|m| std::fs::metadata(root.join(&m.file_path)).map(|x| x.len()).unwrap_or(0))
+            .map(|m| {
+                std::fs::metadata(root.join(&m.file_path))
+                    .map(|x| x.len())
+                    .unwrap_or(0)
+            })
             .sum();
         assert!(
             topic_bytes <= policy.topic_cap_bytes + 256 * kb as u64,
@@ -1432,7 +1452,13 @@ mod tests {
         let root = tmp.path().to_path_buf();
         let now = 1_000_000_000_000_i64;
         for i in 0..6 {
-            write_sized(&root, "audit/peerx", Priority::Min, now - (6 - i) * 1000, 4 * 1024);
+            write_sized(
+                &root,
+                "audit/peerx",
+                Priority::Min,
+                now - (6 - i) * 1000,
+                4 * 1024,
+            );
         }
         let policy = RetentionPolicy {
             topic_cap_bytes: 0, // would shed everything IF it touched audit
@@ -1482,7 +1508,11 @@ mod tests {
                 .list_since("compute/event", None)
                 .unwrap()
                 .iter()
-                .map(|m| std::fs::metadata(root.join(&m.file_path)).map(|x| x.len()).unwrap_or(0))
+                .map(|m| {
+                    std::fs::metadata(root.join(&m.file_path))
+                        .map(|x| x.len())
+                        .unwrap_or(0)
+                })
                 .sum();
             assert!(
                 topic_bytes <= cap + 128 * kb as u64,
@@ -1523,7 +1553,11 @@ mod tests {
             .into_iter()
             .map(|m| m.ulid)
             .collect();
-        assert_eq!(remaining.len(), 1, "exactly the newest record survives a 0 cap");
+        assert_eq!(
+            remaining.len(),
+            1,
+            "exactly the newest record survives a 0 cap"
+        );
         assert!(
             remaining.contains(ulids.last().unwrap()),
             "the surviving record is the most-recent one"
@@ -1543,14 +1577,23 @@ mod tests {
         // ulid order. 256 KB each → ~2 MB; cap 1 MB keeps the newest few.
         let mut ulids = Vec::new();
         for _ in 0..8 {
-            ulids.push(write_sized(&root, "audit/peerx", Priority::Min, now, 256 * 1024));
+            ulids.push(write_sized(
+                &root,
+                "audit/peerx",
+                Priority::Min,
+                now,
+                256 * 1024,
+            ));
         }
         let policy = RetentionPolicy {
             audit_cap_bytes: 1024 * 1024,
             ..RetentionPolicy::default()
         };
         let report = run_pass_at(&policy, &root, now).unwrap();
-        assert!(report.audit_pruned >= 1, "over-cap lane pruned even under a ts tie");
+        assert!(
+            report.audit_pruned >= 1,
+            "over-cap lane pruned even under a ts tie"
+        );
         let p = Persist::open(root.clone()).unwrap();
         let remaining: std::collections::HashSet<String> = p
             .list_since("audit/peerx", None)
@@ -2016,7 +2059,10 @@ mod tests {
         let footprint = 40;
         let (cap, pressure) = fs_pressure_hard_cap(1000, footprint, total, avail);
         assert!(pressure, "at threshold: pressure trips");
-        assert_eq!(cap, footprint, "reclaim 0 at the trip point → cap == footprint");
+        assert_eq!(
+            cap, footprint,
+            "reclaim 0 at the trip point → cap == footprint"
+        );
     }
 
     #[test]
@@ -2045,7 +2091,10 @@ mod tests {
         // reclaim on a footprint far above the configured cap still clamps down.
         let (cap2, pressure2) = fs_pressure_hard_cap(30, 1000, 100, 10); // 90% full
         assert!(pressure2);
-        assert!(cap2 <= 30, "effective cap never exceeds configured, got {cap2}");
+        assert!(
+            cap2 <= 30,
+            "effective cap never exceeds configured, got {cap2}"
+        );
     }
 
     #[test]
@@ -2069,7 +2118,13 @@ mod tests {
         let mut ulids = Vec::new();
         for i in 0..6 {
             // Recent High messages → no TTL reap; only the dfguard can shed them.
-            ulids.push(write_sized(&root, "t/bulk", Priority::High, now - (6 - i) * 1000, mb));
+            ulids.push(write_sized(
+                &root,
+                "t/bulk",
+                Priority::High,
+                now - (6 - i) * 1000,
+                mb,
+            ));
         }
         purge_audit(&root);
         // Caps far above the ~6 MB spool+DB footprint, so the bus-only hard-cap
@@ -2096,7 +2151,10 @@ mod tests {
             .into_iter()
             .map(|m| m.ulid)
             .collect();
-        assert!(!remaining.contains(&ulids[0]), "oldest evicted under fs pressure");
+        assert!(
+            !remaining.contains(&ulids[0]),
+            "oldest evicted under fs pressure"
+        );
         assert!(remaining.contains(ulids.last().unwrap()), "newest survives");
     }
 
@@ -2134,7 +2192,10 @@ mod tests {
         // A 1 KB spool is far under the 144 MB default hard cap; only a genuinely
         // full filesystem could force eviction, which a tempdir-on-a-real-disk is
         // not, so nothing should be shed.
-        assert_eq!(report.evicted, 0, "tiny spool under default caps evicts nothing");
+        assert_eq!(
+            report.evicted, 0,
+            "tiny spool under default caps evicts nothing"
+        );
     }
 
     #[test]
@@ -2145,7 +2206,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         if let Some((total, avail)) = filesystem_total_avail_bytes(tmp.path()) {
             assert!(total > 0, "real filesystem reports a non-zero size");
-            assert!(avail <= total, "avail ({avail}) must not exceed total ({total})");
+            assert!(
+                avail <= total,
+                "avail ({avail}) must not exceed total ({total})"
+            );
         }
         // `None` (no `df`) is an acceptable degraded outcome — the guard then
         // falls back to the bus-only cap — so we don't fail the test on it.

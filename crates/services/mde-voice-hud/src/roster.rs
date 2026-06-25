@@ -5,7 +5,7 @@
 //!
 //! 1. `$MDE_VOICE_HUD_ROSTER` — explicit override path (dev/testing).
 //! 2. `<mesh_storage_home>/voip/peers.toml` — the live VOIP-26
-//!    Auto-Connect roster, LizardFS-replicated across the mesh.
+//!    Auto-Connect roster, Syncthing-replicated across the mesh.
 //! 3. `~/.config/mde/voip/peers.toml` — per-peer local fallback,
 //!    refreshed every time the mesh-storage read succeeds.
 //! 4. Embedded compile-time fixture (`test-fixtures/roster.toml`).
@@ -184,8 +184,8 @@ fn parse(body: &str) -> Result<Vec<Peer>, toml::de::Error> {
     toml::from_str::<RosterFile>(body).map(|f| f.peers)
 }
 
-/// Best-effort resolution of `<mesh_storage_home>` per the
-/// [[project_v5_0_0_lizardfs_mesh_storage]] FUSE-mount convention.
+/// Best-effort resolution of `<mesh_storage_home>` — the
+/// Syncthing-replicated `/mnt/mesh-storage` share, replicated across the mesh.
 ///
 /// Honors `$MDE_MESH_STORAGE_HOME` if set; otherwise resolves the
 /// QNM-Shared mount the same way `mackesd` does (`default_workgroup_root`

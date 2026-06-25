@@ -11,6 +11,24 @@ Pre-release history (the E1–E11 epochs, the MackesWorkstation split, and the
 v2.x–v6.x phase plans) lives in the git log and `docs/design/` — this file
 starts at the first packaged release line.
 
+## [Unreleased]
+### Removed
+- **SUBSTRATE-6 — the full LizardFS rip-out (one-way).** The dead LizardFS plane
+  is gone now that SUBSTRATE-V2 (etcd + Syncthing) is the substrate: the in-`mackesd`
+  `meshfs_worker` supervisor + the `src/meshfs/` module (headroom + the
+  `mfsmetadump`/`mfsadmin` state-snapshot), the `found`/`join` LizardFS provisioning
+  (`provision_qnm_shared`/`qnm_setup_flags`), the `MeshFs*` CLI subcommands, the
+  `meshfs_snapshot` CA-bundle field, and the LizardFS mesh-storage-leader VIP trace
+  target. `shared_root_writable` collapsed to the plain-dir semantics (the
+  ONBOARD-6 `/proc/mounts` FUSE poison guard dropped). The install/recovery scripts
+  (`mesh-install-lizardfs.sh`, `setup-qnm-shared.sh`, `qnm-mount.sh`,
+  `unwedge-lizardfs.sh`, `vendor-lizardfs-rpms.sh`, `phase-a-stabilize.sh`,
+  `phase-b-retire-lizardfs.sh`) are deleted; the RPM no longer ships them, the
+  bundled fc43 `lizardfs-client` RPM, or the `fuse-libs`/`fuse` Requires. On
+  upgrade a retirement scriptlet masks+removes the stale `qnm-shared.service` and
+  the `20-qnm.conf` ordering drop-in. `/mnt/mesh-storage` + `MDE_WORKGROUP_ROOT`
+  stay as the plain Syncthing-replicated dir. A fresh install carries no LizardFS.
+
 ## [11.0.1] "Winter-Is-Coming" - 2026-06-20
 ### Fixed
 - **FOUND-NEBULA-1** — a fresh-node founding/join failed to bring up the Nebula

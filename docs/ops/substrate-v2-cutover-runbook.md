@@ -1,7 +1,16 @@
 # SUBSTRATE-V2 fleet cutover runbook (LizardFS → etcd + Syncthing)
 
-**Status: rehearsed on the VM bed 2026-06-23, not yet run on the live fleet.**
-This is the operator-gated big-bang. Read it end-to-end before touching production.
+> **HISTORICAL — the cutover is COMPLETE.** LizardFS has been fully removed
+> (SUBSTRATE-6, the LizardFS rip-out): the live fleet runs **etcd** (coordination)
+> + **Syncthing** (files, plain `/mnt/mesh-storage` dir). The Phase-A/Phase-B
+> staging, the `/etc/mackesd/etcd-endpoints` fs-path fallback, and the
+> re-mount-LizardFS rollback below all describe the one-time transition and no
+> longer apply — there is no LizardFS mount to fall back to or roll back onto.
+> Kept here as the cutover record.
+
+**Status: COMPLETE — LizardFS retired fleet-wide (SUBSTRATE-6).** Rehearsed on the
+VM bed 2026-06-23, then rolled to the live fleet. This was the operator-gated
+big-bang; it is kept as the historical runbook.
 
 The substrate splits into two planes that cut over **independently**:
 

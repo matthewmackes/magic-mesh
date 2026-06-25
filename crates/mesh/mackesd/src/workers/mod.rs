@@ -191,7 +191,7 @@ pub mod nebula_supervisor;
 pub mod nebula_csr_watcher;
 // PLANES-24 W63 — scheduled one-puller mirror sync. Every node writes its
 // dnf .repo to self-serve (W62); only the leader pulls upstream + indexes,
-// LizardFS replicating the result fleet-wide.
+// Syncthing replicating the result fleet-wide.
 pub mod mirror_syncd;
 // NF-1.5 (v2.5) — Lighthouse-side TCP/443 covert listener.
 // Binds the TLS 1.3 listener on :443, spawns one demux pump
@@ -222,10 +222,6 @@ pub mod nebula_ca_backup;
 // skips at spawn). Silent no-op without cups/lpadmin or before
 // Nebula enrollment.
 pub mod cups_sync;
-// MESHFS-2.1 (v5.0.0) — LizardFS mesh-storage fleet supervisor.
-// Silent no-op when the mfsmaster/mfschunkserver binaries are
-// absent or the overlay-ip publish file doesn't yet exist.
-pub mod meshfs_worker;
 // FWMON-2..4 (v5.0.0) — firewall-denied event monitor. Reads
 // kernel journal entries logged by firewalld's LogDenied=all
 // setting, filters overlay + established traffic, appends
