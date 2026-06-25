@@ -25,6 +25,8 @@ pub mod front_door;
 pub mod hardware;
 pub mod health_check;
 pub mod help_index;
+/// FRONTDOOR-16 — the boot-readiness reader (the launcher view it once held was
+/// removed once the Front Door reached parity); kept for the System-tile glance.
 pub mod home;
 pub mod hub;
 pub mod images;

@@ -28,7 +28,7 @@ use crate::panels::{
     fleet_revisions as fleet_revisions_panel, fleet_rollup as fleet_rollup_panel,
     fleet_settings as fleet_settings_panel, front_door as front_door_panel,
     hardware as hardware_panel, health_check as health_check_panel, help_index as help_index_panel,
-    home as home_panel, hub as hub_panel, images as images_panel, interfaces as interfaces_panel,
+    hub as hub_panel, images as images_panel, interfaces as interfaces_panel,
     inventory as inventory_panel, jobs as jobs_panel, lighthouses as lighthouses_panel,
     logs as logs_panel, mesh_bus as mesh_bus_panel, mesh_control as mesh_control_panel,
     mesh_federation as mesh_federation_panel, mesh_history as mesh_history_panel,
@@ -111,8 +111,6 @@ pub enum Message {
     Connect(connect_panel::Message),
     /// CB-1.9 partial — System notifications panel sub-message.
     Notifications(notifications_panel::Message),
-    /// v4.0.1 WB-2.a — Dashboard `home` landing-page messages.
-    Home(home_panel::Message),
     /// FRONTDOOR-2 — the Front Door (Win10-Start home) sub-message. Currently
     /// just the omnibox text-change; rail navigation reuses `SelectPanel`.
     FrontDoor(front_door_panel::Message),
@@ -314,12 +312,11 @@ pub struct App {
     /// v4.0.1 WB-1 — Connected Devices panel state. Hosts the
     /// paired-peer list + per-row action handlers.
     connect: connect_panel::ConnectPanel,
-    /// v4.0.1 WB-2.a — Dashboard landing page state.
-    home: home_panel::HomePanel,
     /// FRONTDOOR-1 — the GPU canvas tile-grid "Front Door" that renders the
-    /// home/dashboard route. Replaces the old `home` widget-tree VIEW (the slow
-    /// "4-second menu"); `home`'s state + load stay intact (data reuse is
-    /// FRONTDOOR-4 — only the view is swapped).
+    /// home/dashboard route. FRONTDOOR-16 removed the old `home` widget-tree
+    /// state + view entirely (the slow "4-second menu"); the Front Door is the
+    /// sole launcher now, and the only live remnant of `home` is its
+    /// boot-readiness reader (read as a free function, no panel state).
     front_door: front_door_panel::FrontDoor,
     /// v4.0.1 WB-2.b — Maintain group root grid state.
     hub: hub_panel::HubPanel,
@@ -435,7 +432,6 @@ impl App {
             music: music_panel::MusicPanel::new(),
             sip_gateway: sip_gateway_panel::SipGatewayPanel::new(),
             connect: connect_panel::ConnectPanel::new(),
-            home: home_panel::HomePanel::new(),
             front_door: front_door_panel::FrontDoor::new(),
             hub: hub_panel::HubPanel::new(),
             help: help_index_panel::HelpIndexPanel::new(),
@@ -651,19 +647,15 @@ impl App {
     ///    `dev.mackes.MDE.Shell.Workbench.Focus` D-Bus call from
     ///    a sibling `mde-workbench --focus <slug>` invocation
     ///    into [`Message::FocusRequest`].
-    /// 2. **Overview D-Bus signal bridge** — subscribes to the
-    ///    Nebula + Fleet signals mackesd emits so the Overview's
-    ///    capability cards refresh without polling
-    ///    (see `panels::home::dbus_subscription`).
+    /// 2. **Front Door live data** — the view-gated slow-poll + the Peers
+    ///    directory-changed Bus event keep its tiles live (below). FRONTDOOR-16
+    ///    retired the old Overview D-Bus / Nebula-event subscriptions: they only
+    ///    fed the removed `home` capability-row state, which no longer renders.
     #[allow(clippy::unused_self)]
     fn subscription(&self) -> Subscription<Message> {
         let mut subs = vec![
             cosmic::iced::time::every(Duration::from_millis(200))
                 .map(|_| PendingFocus::drain().map_or(Message::Noop, Message::FocusRequest)),
-            home_panel::dbus_subscription(),
-            // E0.3.1.b — Nebula signals now arrive over the mesh Bus
-            // event topic, not D-Bus; this polls them into DbusEvents.
-            home_panel::nebula_event_subscription(),
             // GUI-RECONNECT — a slow Bus liveness tick. On a down→up
             // transition (mackesd came back) the handler re-loads the
             // active panel, so panels recover on their own instead of
@@ -842,7 +834,6 @@ impl App {
             }
             Message::Connect(msg) => self.connect.update(msg),
             Message::Notifications(msg) => self.notifications.update(msg, self.backend()),
-            Message::Home(msg) => self.home.update(msg),
             Message::FrontDoor(msg) => {
                 // FRONTDOOR-2 folds the omnibox text + mode flip (no side effect);
                 // FRONTDOOR-4's Reload/Loaded drive the live-tile Bus read, so the
@@ -1030,16 +1021,11 @@ impl App {
     /// shipped yet) just no-op.
     fn on_panel_navigated(&self, _group: Group, panel: &'static str) -> Task<Message> {
         match panel {
-            // WB-OVERVIEW-2 — the Home/Overview panel fires its full load
-            // (sync snapshot + async capability fan-out) so it lands populated.
-            // FRONTDOOR-4 — the "home" route RENDERS the Front Door (see the
-            // view router), so it also fires the Front Door's live-tile load; the
-            // home panel's own load stays (its state still feeds the Front Door's
-            // System/peer reuse + remains the Overview when reached directly).
-            "home" => Task::batch([
-                home_panel::HomePanel::load(),
-                front_door_panel::FrontDoor::load(),
-            ]),
+            // FRONTDOOR-1/16 — the "home" route RENDERS the Front Door (see the
+            // view router); the old home/Overview panel + its load were removed at
+            // parity, so this fires only the Front Door's live-tile load. Its
+            // System tile reads boot readiness as a free function (no panel state).
+            "home" => front_door_panel::FrontDoor::load(),
             "wallpaper" => wallpaper_panel::WallpaperPanel::load(self.backend()),
             "notifications" => notifications_panel::NotificationsPanel::load(self.backend()),
             "music" => music_panel::MusicPanel::load(),
