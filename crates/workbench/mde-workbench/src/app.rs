@@ -113,6 +113,9 @@ pub enum Message {
     Notifications(notifications_panel::Message),
     /// v4.0.1 WB-2.a — Dashboard `home` landing-page messages.
     Home(home_panel::Message),
+    /// FRONTDOOR-2 — the Front Door (Win10-Start home) sub-message. Currently
+    /// just the omnibox text-change; rail navigation reuses `SelectPanel`.
+    FrontDoor(front_door_panel::Message),
     /// v4.0.1 WB-2.c — Help index opened a topic; the path is
     /// dispatched to `xdg-open`.
     HelpTopicOpened(std::path::PathBuf),
@@ -806,6 +809,12 @@ impl App {
             Message::Connect(msg) => self.connect.update(msg),
             Message::Notifications(msg) => self.notifications.update(msg, self.backend()),
             Message::Home(msg) => self.home.update(msg),
+            Message::FrontDoor(msg) => {
+                // FRONTDOOR-2 — fold the omnibox text into the Front Door's local
+                // state. No side effect yet (search is FRONTDOOR-6), so no Task.
+                self.front_door.update(msg);
+                Task::none()
+            }
             Message::HelpTopicOpened(path) => {
                 help_index_panel::spawn_xdg_open(&path);
                 Task::none()

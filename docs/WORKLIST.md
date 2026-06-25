@@ -1930,7 +1930,7 @@ clean+reachable smoke); visual gate lifted.
     - [ ] cold open <1s, skeleton placeholders while data streams, no layout shift on fill
     - [ ] the old slow launcher render path is removed (no dead code left behind, §7)
 
-- [ ] **FRONTDOOR-2: the Win10-Start panel + left rail.**
+- [✓] **FRONTDOOR-2: the Win10-Start panel + left rail.**
   **As** an operator, **I want** a two-pane Start panel summoned by the Super key,
   **so that** identity, power, pinned apps, and DevOps/Data Center are one keystroke away.
   **Acceptance**:
