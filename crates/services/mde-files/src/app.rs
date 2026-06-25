@@ -262,8 +262,8 @@ pub struct MdeFiles {
     /// v4.0.1 AF-* (2026-05-23) — backend that supplies the
     /// rendered roster + file lists. Defaults to `RealBackend`
     /// in production builds (LocalFsBackend + DBusBackend
-    /// composed); tests can swap a `DemoBackend` via
-    /// `MdeFiles::with_backend`.
+    /// composed). `DemoBackend` exercises the same `Backend`
+    /// surface directly in the `tests/` crates.
     pub backend: Box<dyn Backend>,
     /// v4.0.1 AF-* — last `BackendSnapshot` captured. Refreshed
     /// in `update()` so `view()` returns an `Element` tied to
@@ -500,16 +500,6 @@ impl MdeFiles {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Build with an injected backend (useful for unit tests +
-    /// dev modes). Production code lands through `Default`.
-    #[must_use]
-    pub fn with_backend(backend: Box<dyn Backend>) -> Self {
-        Self {
-            backend,
-            ..Self::default()
-        }
     }
 
     /// Run the libcosmic application (GUI-7).
