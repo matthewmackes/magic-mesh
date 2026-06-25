@@ -1967,12 +1967,12 @@ clean+reachable smoke); visual gate lifted.
     - [>] unified scope (apps + mesh nodes/services + AI), instant local results first — apps (launchers + routable panels) and mesh entities (nodes + published services) search live + rank locally; FILES is a follow-up (no existing filename index the workbench reads — faking it would violate §7)
     - [✓] the AI answer streams in below as a distinct card (Copilot `action/copilot/ask` → reply; "thinking…" until it lands, graceful degrade when unavailable); ranked merged local list; no special syntax
 
-- [ ] **FRONTDOOR-7: DevOps surface — one-click pipeline.**
+- [>] **FRONTDOOR-7: DevOps surface — one-click pipeline.** (one-click action set landed; deploy/rollback/logs are navigate-only — no one-shot verb exists yet, so they route to the surface that owns the action; build + rerun-failed are wired to the build-farm/jobs panels' own RefreshClicked re-poll, §9 typed. The confirm-gate action-worker UI is FRONTDOOR-7's later half.)
   **As** an operator, **I want** build/CI + the farm at a glance with one-click actions,
   **so that** the everyday DevOps loop is immediate.
   **Acceptance**:
-    - [ ] DevOps tiles show build/CI status + live farm utilization (the FARM-AUTOSCALE autoscaler)
-    - [ ] one-click build, deploy, rollback, logs, rerun-failed — each executes through the action worker
+    - [✓] DevOps tiles show build/CI status + live farm utilization (the FARM-AUTOSCALE autoscaler)
+    - [>] one-click build, deploy, rollback, logs, rerun-failed — build/rerun wired to the existing typed panel trigger; deploy/rollback/logs navigate to the owning surface (no one-shot verb yet). Routing through the typed action worker (the confirm-gate UI) is the deferred tail.
 
 - [ ] **FRONTDOOR-8: Data Center surface — node lifecycle.**
   **As** an operator, **I want** the live mesh and one-click node actions,

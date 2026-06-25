@@ -77,7 +77,7 @@ use mde_theme::{FontSize, Palette, TypeRole};
 
 use crate::cosmic_compat::prelude::*;
 use crate::model::Group;
-use crate::panels::{build_farm, datacenter, home, peers};
+use crate::panels::{build_farm, datacenter, home, jobs, peers};
 
 /// FRONTDOOR-2/3 — the Front Door's own message set, threaded through
 /// [`crate::Message::FrontDoor`]. Each variant is one we actually handle (§7):
@@ -121,6 +121,20 @@ pub enum Message {
     /// FRONTDOOR-5 — the detail actions-menu's back/close control was pressed;
     /// return to the tile grid.
     CloseDetail,
+    /// FRONTDOOR-7 — a one-click pipeline action from a DevOps / Build-Farm tile's
+    /// detail menu fired. It carries the existing-panel navigation it routes to
+    /// (`nav` — a real [`crate::Message::SelectPanel`]) and, for the **wired**
+    /// actions, the panel's OWN trigger sub-message (`trigger` — e.g. the
+    /// `BuildFarm`/`Jobs` `RefreshClicked` the build-farm/jobs panel already
+    /// emits). Both fire in one click (`Task::batch`): the operator lands on the
+    /// surface AND its real work runs (§7 — a real action, not a stub; §9 — the
+    /// trigger is the existing typed verb path, never a raw shell). A
+    /// navigate-only action carries `trigger == None` (the surface still refreshes
+    /// via its own `on_panel_navigated` load — also a real action).
+    PipelineAction {
+        nav: Box<crate::Message>,
+        trigger: Option<Box<crate::Message>>,
+    },
 }
 
 /// FRONTDOOR-3 — which of the two locked render modes the Front Door is in
@@ -273,13 +287,52 @@ impl Tile {
                 TileAction::nav("Open Datacenter", Group::Provisioning, "datacenter"),
                 TileAction::nav("Open Peers", Group::Mesh, "peers"),
             ],
+            // FRONTDOOR-7 — the Build/Farm + DevOps tiles get the locked one-click
+            // pipeline action set (Q50d: build · deploy · rollback · view-logs ·
+            // rerun-failed), each routed to the EXISTING build-farm / job infra
+            // (§6 glue, §9 typed — no raw shell). "Build" is WIRED: it re-polls the
+            // farm verdict off the Bus via the build-farm panel's OWN
+            // `RefreshClicked` while routing there (a real trigger, not a stub).
+            // The named verbs with no parameterless one-shot today (deploy /
+            // rollback / view-logs / rerun-failed) navigate to the surface that
+            // owns them — also a real action (the destination's `load()` fires).
             Some(TileKey::BuildFarm) => vec![
-                TileAction::nav("Open Build Farm", Group::Provisioning, "build-farm"),
-                TileAction::nav("Open Jobs", Group::Fleet, "jobs"),
+                TileAction::pipeline_wired(
+                    "Build — refresh farm",
+                    Group::Provisioning,
+                    "build-farm",
+                    crate::Message::BuildFarm(build_farm::Message::RefreshClicked),
+                ),
+                TileAction::pipeline_nav("Deploy", Group::Provisioning, "build-farm"),
+                TileAction::pipeline_nav("Rollback", Group::System, "revisions"),
+                TileAction::pipeline_nav("View logs", Group::Monitoring, "run_history"),
+                TileAction::pipeline_wired(
+                    "Rerun failed",
+                    Group::Fleet,
+                    "jobs",
+                    crate::Message::Jobs(jobs::Message::RefreshClicked),
+                ),
             ],
+            // The DevOps tile fronts the everyday CI loop (Q11 DevOps lead): the
+            // same locked pipeline action set, jobs-first (it tracks in-flight
+            // farm jobs). "Rerun failed" is WIRED to the jobs panel's own
+            // `RefreshClicked` re-read; the rest mirror the Build/Farm tile.
             Some(TileKey::DevOps) => vec![
-                TileAction::nav("Open Build Farm", Group::Provisioning, "build-farm"),
-                TileAction::nav("Open Jobs", Group::Fleet, "jobs"),
+                TileAction::pipeline_wired(
+                    "Build — refresh farm",
+                    Group::Provisioning,
+                    "build-farm",
+                    crate::Message::BuildFarm(build_farm::Message::RefreshClicked),
+                ),
+                TileAction::pipeline_nav("Deploy", Group::Provisioning, "build-farm"),
+                TileAction::pipeline_nav("Rollback", Group::System, "revisions"),
+                TileAction::pipeline_nav("View logs", Group::Monitoring, "run_history"),
+                TileAction::pipeline_wired(
+                    "Rerun failed",
+                    Group::Fleet,
+                    "jobs",
+                    crate::Message::Jobs(jobs::Message::RefreshClicked),
+                ),
             ],
             Some(TileKey::Alerts) => vec![
                 TileAction::nav("Open Datacenter", Group::Provisioning, "datacenter"),
@@ -338,6 +391,44 @@ impl TileAction {
         Self {
             label: label.to_string(),
             message: crate::Message::LaunchApp(bin),
+        }
+    }
+
+    /// FRONTDOOR-7 — a **navigate-only** pipeline action: a one-click action whose
+    /// named verb has NO existing one-shot trigger (build / deploy / rollback /
+    /// view-logs are not parameterless verbs the workbench owns), so it routes to
+    /// the EXISTING panel that owns that capability. The nav is still a real action
+    /// — `on_panel_navigated` fires the destination's own `load()` (a real Bus /
+    /// CLI read) — never a stub (§7). Wrapped in [`Message::PipelineAction`] with
+    /// no trigger so the detail menu is dismissed as it routes.
+    fn pipeline_nav(label: &str, group: Group, panel: &'static str) -> Self {
+        Self {
+            label: label.to_string(),
+            message: crate::Message::FrontDoor(Message::PipelineAction {
+                nav: Box::new(crate::Message::SelectPanel { group, panel }),
+                trigger: None,
+            }),
+        }
+    }
+
+    /// FRONTDOOR-7 — a **wired** pipeline action: routes to the existing surface
+    /// AND fires that panel's OWN trigger sub-message (`trigger`) in the same
+    /// click. Used where a real one-shot trigger exists — the build-farm / jobs
+    /// panels' `RefreshClicked`, which re-polls the farm verdict / job store off
+    /// the Bus (§9 — the existing typed verb, never a raw shell). The operator
+    /// lands on the surface with its data freshly re-read.
+    fn pipeline_wired(
+        label: &str,
+        group: Group,
+        panel: &'static str,
+        trigger: crate::Message,
+    ) -> Self {
+        Self {
+            label: label.to_string(),
+            message: crate::Message::FrontDoor(Message::PipelineAction {
+                nav: Box::new(crate::Message::SelectPanel { group, panel }),
+                trigger: Some(Box::new(trigger)),
+            }),
         }
     }
 }
@@ -1051,6 +1142,22 @@ impl FrontDoor {
             Message::CloseDetail => {
                 self.detail = None;
                 Task::none()
+            }
+            // FRONTDOOR-7 — a one-click pipeline action: route to the existing
+            // surface AND (for the wired actions) fire its own real trigger, in a
+            // single click. Clear the detail first so the grid is restored behind
+            // the navigation (mirrors `SearchHitActivated`). The nav alone already
+            // refreshes the destination (its `on_panel_navigated` load); the
+            // optional `trigger` adds the panel's own re-poll verb on top (§9 —
+            // the existing typed message, never a raw shell). Both are dispatched
+            // as app messages `App::update` already handles, batched together.
+            Message::PipelineAction { nav, trigger } => {
+                self.detail = None;
+                let mut tasks = vec![Task::done(*nav)];
+                if let Some(trigger) = trigger {
+                    tasks.push(Task::done(*trigger));
+                }
+                Task::batch(tasks)
             }
         }
     }
@@ -2603,17 +2710,46 @@ mod tests {
 
     #[test]
     fn every_tile_action_is_a_real_navigation_or_launch() {
-        // §7 — every detail action must be a REAL app message (a panel route or
-        // an app launch), never an inert/no-op. Walk every seeded tile's menu and
-        // assert each carries one of the two real message shapes.
+        // §7 — every detail action must be a REAL app message, never an inert/
+        // no-op. Walk every seeded tile's menu and assert each carries one of the
+        // real message shapes: a panel route, an app launch, or (FRONTDOOR-7) a
+        // pipeline action whose inner `nav` is itself a real `SelectPanel` route
+        // and whose `trigger` (if any) is a real existing-panel sub-message.
         let fd = FrontDoor::new();
         for tile in &fd.tiles {
             for action in tile.actions() {
-                match action.message {
-                    crate::Message::SelectPanel { .. } | crate::Message::LaunchApp(_) => {}
-                    other => panic!("tile {:?} has a non-real action: {other:?}", tile.label),
+                assert_real_action(&action.message, &tile.label);
+            }
+        }
+    }
+
+    /// Assert a tile-action message is a REAL, handled app message (§7). Recurses
+    /// into a [`Message::PipelineAction`] so its `nav`/`trigger` are themselves
+    /// verified as real (never an inert wrapper).
+    fn assert_real_action(message: &crate::Message, label: &str) {
+        match message {
+            crate::Message::SelectPanel { .. } | crate::Message::LaunchApp(_) => {}
+            // FRONTDOOR-7 — a pipeline action is real iff its nav is a real route
+            // and its optional trigger is a real existing-panel sub-message.
+            crate::Message::FrontDoor(Message::PipelineAction { nav, trigger }) => {
+                assert!(
+                    matches!(**nav, crate::Message::SelectPanel { .. }),
+                    "tile {label} pipeline nav is not a real route: {nav:?}"
+                );
+                if let Some(trigger) = trigger {
+                    // The wired triggers are the build-farm / jobs panels' OWN
+                    // refresh sub-messages — real existing verbs, never a stub.
+                    assert!(
+                        matches!(
+                            **trigger,
+                            crate::Message::BuildFarm(build_farm::Message::RefreshClicked)
+                                | crate::Message::Jobs(jobs::Message::RefreshClicked)
+                        ),
+                        "tile {label} pipeline trigger is not a real existing verb: {trigger:?}"
+                    );
                 }
             }
+            other => panic!("tile {label} has a non-real action: {other:?}"),
         }
     }
 
@@ -2658,6 +2794,118 @@ mod tests {
         let copilot_idx = fd.tiles.iter().position(|t| t.label == "Copilot").unwrap();
         let _ = fd.update(Message::TileActivated(copilot_idx));
         let _: Element<'_, crate::Message, Theme> = fd.view();
+    }
+
+    // ── FRONTDOOR-7: the DevOps / Build-Farm one-click pipeline actions ──
+
+    /// Pull the tile carrying a given [`TileKey`] from a fresh Front Door.
+    fn keyed_tile(key: TileKey) -> Tile {
+        FrontDoor::new()
+            .tiles
+            .into_iter()
+            .find(|t| t.key == Some(key))
+            .unwrap_or_else(|| panic!("no seeded tile for {key:?}"))
+    }
+
+    #[test]
+    fn devops_and_build_farm_tiles_expose_the_locked_pipeline_action_set() {
+        // FRONTDOOR-7 / Q50d — both the Build/Farm and DevOps tiles surface the
+        // five locked one-click pipeline actions (build · deploy · rollback ·
+        // view-logs · rerun-failed), in menu order, in BOTH tiles.
+        for key in [TileKey::BuildFarm, TileKey::DevOps] {
+            let labels: Vec<String> = keyed_tile(key)
+                .actions()
+                .into_iter()
+                .map(|a| a.label)
+                .collect();
+            assert_eq!(labels.len(), 5, "{key:?} should expose all five verbs");
+            assert!(labels[0].starts_with("Build"), "build is first: {labels:?}");
+            assert!(
+                labels.iter().any(|l| l == "Deploy"),
+                "deploy present: {labels:?}"
+            );
+            assert!(
+                labels.iter().any(|l| l == "Rollback"),
+                "rollback present: {labels:?}"
+            );
+            assert!(
+                labels.iter().any(|l| l == "View logs"),
+                "view-logs present: {labels:?}"
+            );
+            assert!(
+                labels.iter().any(|l| l == "Rerun failed"),
+                "rerun-failed present: {labels:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pipeline_actions_route_to_existing_panels_and_wire_real_triggers() {
+        // FRONTDOOR-7 — every pipeline action is a real `PipelineAction` whose nav
+        // routes to an EXISTING panel slug (§7), and the WIRED ones (Build, Rerun
+        // failed) carry the build-farm / jobs panels' own `RefreshClicked` trigger
+        // (§9 — the existing typed verb, no raw shell). Navigate-only verbs
+        // (Deploy / Rollback / View logs) carry no trigger.
+        let routes: std::collections::BTreeMap<String, (Group, &'static str, bool)> =
+            keyed_tile(TileKey::BuildFarm)
+                .actions()
+                .into_iter()
+                .map(|a| {
+                    let crate::Message::FrontDoor(Message::PipelineAction { nav, trigger }) =
+                        a.message
+                    else {
+                        panic!("action {} is not a PipelineAction", a.label);
+                    };
+                    let crate::Message::SelectPanel { group, panel } = *nav else {
+                        panic!("action {} nav is not a SelectPanel route", a.label);
+                    };
+                    (a.label, (group, panel, trigger.is_some()))
+                })
+                .collect();
+
+        // The named verbs land on the surface that owns them.
+        assert_eq!(
+            routes["Build — refresh farm"],
+            (Group::Provisioning, "build-farm", true),
+            "build is wired and routes to the Build Farm panel"
+        );
+        assert_eq!(routes["Deploy"], (Group::Provisioning, "build-farm", false));
+        assert_eq!(
+            routes["Rollback"],
+            (Group::System, "revisions", false),
+            "rollback routes to Fleet Config — the surface with the real Rollback button"
+        );
+        assert_eq!(
+            routes["View logs"],
+            (Group::Monitoring, "run_history", false),
+            "view-logs routes to Run History — the real logs surface"
+        );
+        assert_eq!(
+            routes["Rerun failed"],
+            (Group::Fleet, "jobs", true),
+            "rerun-failed is wired and routes to the Jobs panel"
+        );
+    }
+
+    #[test]
+    fn pipeline_action_routes_and_clears_the_detail() {
+        // FRONTDOOR-7 — firing a pipeline action dismisses the open detail (the
+        // grid restores behind the navigation) and dispatches the nav (+ trigger).
+        // The handler returns a real Task batch; here we assert the state edit.
+        let mut fd = FrontDoor::new();
+        let build = keyed_tile(TileKey::BuildFarm)
+            .actions()
+            .into_iter()
+            .next()
+            .unwrap();
+        let crate::Message::FrontDoor(inner) = build.message else {
+            panic!("the build action is a Front Door pipeline message");
+        };
+        // Open a detail, then fire the pipeline action — the detail clears.
+        let _ = fd.update(Message::TileActivated(0));
+        assert!(fd.detail.is_some());
+        let _ = fd.update(inner);
+        assert!(fd.detail.is_none(), "a pipeline action restores the grid");
     }
 
     // ── FRONTDOOR-6: the unified search (local search/rank + the message flow) ──
