@@ -38,6 +38,20 @@ use super::{ShutdownToken, Worker};
 /// Sweep cadence — 15 s (datacenter state is coarse; doctl/XAPI calls aren't free).
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(15);
 
+/// DATACENTER-12 — SR capacity **warning** line. An SR whose physical utilisation
+/// is at or above this percentage of its capacity emits a `warn` onto the health
+/// lane (`event/dc/health/sr:<uuid>`) so the operator (and the copilot triage) sees
+/// a filling store before it wedges. Matches the panel's default
+/// `storage_threshold_pct`; the gather side carries its own copy because the worker
+/// can't read the panel's UI state. Overridable via `MCNF_SR_WARN_PCT`.
+pub const SR_WARN_PCT: u64 = 85;
+
+/// DATACENTER-12 — SR capacity **critical** line. At or above this percentage the
+/// store is one bad write from full, so the health event escalates `warn`→`fail`
+/// (a `fail` the triage clusters as high severity). Mirrors the panel's
+/// `SR_CRITICAL_PCT`. Overridable via `MCNF_SR_CRIT_PCT`.
+pub const SR_CRIT_PCT: u64 = 95;
+
 /// One datacenter resource as last sampled: a `kind` (droplet/host/vm/…), a stable
 /// `id`, and a `signature` JSON body. The signature is what the brain diffs on.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -436,6 +450,132 @@ pub fn parse_xe_srs(output: &str) -> Vec<(String, String, String, String)> {
         .collect()
 }
 
+/// The SR-capacity **warning** threshold (percent) — `MCNF_SR_WARN_PCT` when set
+/// and parseable, else [`SR_WARN_PCT`]. Clamped to `1..=100` so a fat-fingered env
+/// value can't disable the alert (0) or sit above full (over 100). Pure-ish (reads
+/// the env once per call; the gather calls it once per pass).
+#[must_use]
+pub fn sr_warn_pct() -> u64 {
+    std::env::var("MCNF_SR_WARN_PCT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(SR_WARN_PCT, |p| p.clamp(1, 100))
+}
+
+/// The SR-capacity **critical** threshold (percent) — `MCNF_SR_CRIT_PCT` when set
+/// and parseable, else [`SR_CRIT_PCT`]. Clamped to `1..=100` for the same reason as
+/// [`sr_warn_pct`].
+#[must_use]
+pub fn sr_crit_pct() -> u64 {
+    std::env::var("MCNF_SR_CRIT_PCT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(SR_CRIT_PCT, |p| p.clamp(1, 100))
+}
+
+/// DATACENTER-12 — the SR capacity-threshold alert. Given one SR's id/name and its
+/// `physical-size` / `physical-utilisation` (the raw `xe` strings the gather already
+/// reads), build a health-lane resource ONLY when the store is at or above the
+/// `warn_pct` line. PURE — unit-tested without touching XAPI.
+///
+/// The returned [`DcResource`] is `kind="health"`, `id="sr:<uuid>"`, so its Bus
+/// topic is `event/dc/health/sr:<uuid>` — the SAME lane [`super::dc_health`] writes,
+/// the one the copilot triage ([`crate::workers::copilot`]) and the panel's
+/// `parse_health_event` read. The signature carries the `{check,status,detail}` body
+/// those consumers expect (status `warn`, escalating to `fail` at/above `crit_pct`),
+/// plus the `kind`/`id` the orchestrator's reconcile needs to emit a well-formed
+/// `gone` marker when the store later drops back below the line (the alert clears —
+/// the `gone` body has no `status`, so the triage/panel treat it as resolved).
+///
+/// `None` (no alert) when the store is below `warn_pct`, or when `size`/`used` don't
+/// parse or `size` is 0 — a store with no readable capacity isn't an alert, it's
+/// just unknown (the gather already skips zero-size SRs upstream).
+#[must_use]
+pub fn sr_capacity_health(
+    id: &str,
+    name: &str,
+    size: &str,
+    used: &str,
+    warn_pct: u64,
+    crit_pct: u64,
+) -> Option<DcResource> {
+    let size_b = size.trim().parse::<u128>().ok().filter(|s| *s > 0)?;
+    let used_b = used.trim().parse::<u128>().unwrap_or(0);
+    // Saturating + clamped: a mid-sample race can read used>size; cap at 100.
+    let pct = u64::try_from(used_b.saturating_mul(100) / size_b)
+        .unwrap_or(100)
+        .min(100);
+    if pct < warn_pct {
+        return None;
+    }
+    let label = if name.is_empty() { id } else { name };
+    let (status, free_pct) = if pct >= crit_pct {
+        ("fail", 100 - pct)
+    } else {
+        ("warn", 100 - pct)
+    };
+    let check = format!("sr:{id}");
+    let detail = format!("SR '{label}' {pct}% full ({free_pct}% free)");
+    let sig = serde_json::json!({
+        "kind": "health",
+        "id": check,
+        "check": check,
+        "status": status,
+        "detail": detail,
+        "pct": pct,
+        "zone": "dev",
+    })
+    .to_string();
+    Some(DcResource::new("health", check, sig))
+}
+
+/// One VDI (virtual disk) the gather sampled: its uuid/name, the SR it lives on,
+/// its virtual size (bytes, as the raw `xe` string), and — when attached — the VBD
+/// connecting it and the VM uuid it is attached to (both empty for an unattached
+/// disk). The `vbd` is the detach handle; the `vm` is the "attached to" readout.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Vdi {
+    /// The VDI uuid.
+    pub uuid: String,
+    /// The VDI's name-label.
+    pub name: String,
+    /// The uuid of the SR this VDI lives on (correlates it to its SR card).
+    pub sr: String,
+    /// The VDI's virtual size in bytes (the raw `xe` string; empty when unknown).
+    pub size: String,
+    /// The VBD uuid attaching this VDI to a VM, or empty when unattached. The
+    /// detach handle the panel's `vdi-detach` passes.
+    pub vbd: String,
+    /// The uuid of the VM this VDI is attached to, or empty when unattached.
+    pub vm: String,
+}
+
+/// Parse the VDI gather's pipe-delimited
+/// `uuid|name|sr-uuid|virtual-size|vbd-uuid|vm-uuid` lines into [`Vdi`]s. Pure —
+/// fed the raw stdout. Skips lines with an empty uuid (mirrors [`parse_xe_srs`]);
+/// a missing trailing field (an unattached VDI has empty vbd/vm) defaults to empty.
+#[must_use]
+pub fn parse_xe_vdis(output: &str) -> Vec<Vdi> {
+    output
+        .lines()
+        .filter_map(|l| {
+            let mut p = l.splitn(6, '|');
+            let uuid = p.next()?.trim();
+            if uuid.is_empty() {
+                return None;
+            }
+            Some(Vdi {
+                uuid: uuid.to_string(),
+                name: p.next().unwrap_or("").trim().to_string(),
+                sr: p.next().unwrap_or("").trim().to_string(),
+                size: p.next().unwrap_or("").trim().to_string(),
+                vbd: p.next().unwrap_or("").trim().to_string(),
+                vm: p.next().unwrap_or("").trim().to_string(),
+            })
+        })
+        .collect()
+}
+
 /// Parse the remote `xe` network helper's pipe-delimited `uuid|name|bridge`
 /// lines into `(uuid, name, bridge)` triples. Pure — fed the raw stdout. Skips
 /// lines with an empty uuid (mirrors [`parse_xe_srs`]).
@@ -558,6 +698,10 @@ fn gather_xen() -> Vec<DcResource> {
     // below (the path is published + can degrade to Direct independently).
     let on_lan = node_on_lan();
     let relay = xen_relay_peer();
+    // DATACENTER-12 — SR capacity-alert thresholds, resolved once per pass (env read
+    // once, not per SR) and fed to `sr_capacity_health` in the SR gather below.
+    let warn_pct = sr_warn_pct();
+    let crit_pct = sr_crit_pct();
     let mut out = Vec::new();
     for dom0 in xen_dom0s() {
         let mut route = XenRoute::open(&dom0, on_lan, relay.as_deref());
@@ -610,11 +754,39 @@ fn gather_xen() -> Vec<DcResource> {
              echo \"$u|$(xe sr-param-get uuid=$u param-name=name-label)|$ps|$(xe sr-param-get uuid=$u param-name=physical-utilisation)\"; done";
         if let Some(srout) = route.run(&key, sr_script) {
             for (u, n, size, used) in parse_xe_srs(&srout) {
+                // DATACENTER-12 — a filling SR raises a health-lane alert
+                // (`event/dc/health/sr:<uuid>`) off the SAME sample, so the gather
+                // costs no extra SSH. The reconcile sieve dedups it like any other
+                // resource and emits a `gone` (alert cleared) when usage later drops
+                // back below the warn line.
+                if let Some(alert) = sr_capacity_health(&u, &n, &size, &used, warn_pct, crit_pct) {
+                    out.push(alert);
+                }
                 let sig = serde_json::json!({
                     "kind": "sr", "id": u, "name": n, "size": size, "used": used, "host": dom0, "zone": "dev"
                 })
                 .to_string();
                 out.push(DcResource::new("sr", u, sig));
+            }
+        }
+        // VDIs (the virtual disks living on the SRs) → per-SR disk visibility +
+        // attach/detach targets (DC-12). One line per managed VDI:
+        // `uuid|name|sr-uuid|virtual-size|vbd-uuid|vm-uuid` — the VBD+VM come from
+        // the VDI's first non-empty VBD (its attachment), empty when unattached.
+        // `managed=false` VDIs (snapshots/metadata) are skipped to keep the list to
+        // real, attachable disks.
+        let vdi_script = "for u in $(xe vdi-list managed=true params=uuid --minimal | tr , ' '); \
+             do b=$(xe vbd-list vdi-uuid=$u params=uuid --minimal | cut -d, -f1); \
+             vm=$(xe vbd-list vdi-uuid=$u params=vm-uuid --minimal | cut -d, -f1); \
+             echo \"$u|$(xe vdi-param-get uuid=$u param-name=name-label)|$(xe vdi-param-get uuid=$u param-name=sr-uuid)|$(xe vdi-param-get uuid=$u param-name=virtual-size)|$b|$vm\"; done";
+        if let Some(vdiout) = route.run(&key, vdi_script) {
+            for vdi in parse_xe_vdis(&vdiout) {
+                let sig = serde_json::json!({
+                    "kind": "vdi", "id": vdi.uuid, "name": vdi.name, "sr": vdi.sr,
+                    "size": vdi.size, "vbd": vdi.vbd, "vm": vdi.vm, "host": dom0, "zone": "dev"
+                })
+                .to_string();
+                out.push(DcResource::new("vdi", vdi.uuid.clone(), sig));
             }
         }
         // Networks (bridges) → network visibility (DC-13).
@@ -1218,6 +1390,108 @@ mod tests {
         assert_eq!(srs[0].1, "Local storage");
         assert_eq!(srs[0].2, "207296921600");
         assert_eq!(srs[0].3, "42949672960");
+    }
+
+    #[test]
+    fn parse_xe_vdis_reads_attachment() {
+        // An attached VDI (vbd+vm present) and an unattached one (trailing empties).
+        let out = "v1|disk0|sr-9|42949672960|vbd-7|vm-3\n\
+                   v2|spare|sr-9|10737418240||\n\
+                   |skip|||\n";
+        let vdis = parse_xe_vdis(out);
+        assert_eq!(vdis.len(), 2); // empty-uuid line skipped
+        assert_eq!(vdis[0].uuid, "v1");
+        assert_eq!(vdis[0].name, "disk0");
+        assert_eq!(vdis[0].sr, "sr-9");
+        assert_eq!(vdis[0].size, "42949672960");
+        assert_eq!(vdis[0].vbd, "vbd-7");
+        assert_eq!(vdis[0].vm, "vm-3");
+        // Unattached: vbd + vm are empty.
+        assert_eq!(vdis[1].uuid, "v2");
+        assert_eq!(vdis[1].vbd, "");
+        assert_eq!(vdis[1].vm, "");
+    }
+
+    // ---- DATACENTER-12: SR capacity-threshold alert ----------------------------
+
+    #[test]
+    fn sr_capacity_health_quiet_below_warn() {
+        // 20% full, warn at 85 → no alert.
+        assert!(sr_capacity_health("s1", "Local", "100", "20", 85, 95).is_none());
+        // Exactly one below the warn line → still quiet.
+        assert!(sr_capacity_health("s1", "Local", "100", "84", 85, 95).is_none());
+    }
+
+    #[test]
+    fn sr_capacity_health_warns_at_threshold() {
+        // 90% full, warn 85 / crit 95 → a warn on the health lane.
+        let r = sr_capacity_health("abc-123", "Local storage", "100", "90", 85, 95)
+            .expect("90% >= 85% warns");
+        assert_eq!(r.kind, "health");
+        assert_eq!(r.id, "sr:abc-123");
+        // Topic is the health lane the triage/panel read.
+        let ev = DcEvent {
+            kind: r.kind.clone(),
+            id: r.id.clone(),
+            signature: r.signature.clone(),
+        };
+        assert_eq!(ev.topic(), "event/dc/health/sr:abc-123");
+        let v: serde_json::Value = serde_json::from_str(&r.signature).unwrap();
+        assert_eq!(v["check"], "sr:abc-123");
+        assert_eq!(v["status"], "warn");
+        assert_eq!(v["pct"], 90);
+        assert!(v["detail"].as_str().unwrap().contains("Local storage"));
+        assert!(v["detail"].as_str().unwrap().contains("90% full"));
+    }
+
+    #[test]
+    fn sr_capacity_health_escalates_to_fail_at_critical() {
+        // 96% full, crit at 95 → status escalates warn→fail (high-severity triage).
+        let r = sr_capacity_health("s1", "", "100", "96", 85, 95).expect("96% >= 95% fails");
+        let v: serde_json::Value = serde_json::from_str(&r.signature).unwrap();
+        assert_eq!(v["status"], "fail");
+        // No name → the detail falls back to the id.
+        assert!(v["detail"].as_str().unwrap().contains("s1"));
+    }
+
+    #[test]
+    fn sr_capacity_health_handles_bad_or_full_sizes() {
+        // Unparseable / zero size → no alert (unknown capacity isn't an alert).
+        assert!(sr_capacity_health("s1", "n", "", "10", 85, 95).is_none());
+        assert!(sr_capacity_health("s1", "n", "0", "10", 85, 95).is_none());
+        assert!(sr_capacity_health("s1", "n", "notnum", "10", 85, 95).is_none());
+        // used > size (a mid-sample race) clamps pct to 100, still a fail.
+        let r = sr_capacity_health("s1", "n", "100", "150", 85, 95).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&r.signature).unwrap();
+        assert_eq!(v["pct"], 100);
+        assert_eq!(v["status"], "fail");
+    }
+
+    #[test]
+    fn sr_capacity_health_clears_via_reconcile_gone() {
+        // An over-threshold SR publishes a health alert; when it drops back below
+        // the line the next pass omits it and reconcile emits a `gone` (the
+        // alert-cleared marker the panel/triage read as resolved).
+        let mut core = DatacenterOrchestrator::new();
+        let hot = sr_capacity_health("s1", "Local", "100", "90", 85, 95).unwrap();
+        let evs = core.reconcile(&[hot]);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].topic(), "event/dc/health/sr:s1");
+        // Next pass: the SR is now only 50% full → no alert resource → a `gone`.
+        let evs = core.reconcile(&[]);
+        assert_eq!(evs.len(), 1);
+        assert!(evs[0].body().contains(r#""gone":true"#));
+        // The `gone` body has no `status`, so the panel's health parse drops it.
+        assert!(!evs[0].body().contains(r#""status""#));
+    }
+
+    #[test]
+    fn sr_warn_and_crit_pct_defaults_and_clamp() {
+        // Defaults when the env is unset (the common case in CI).
+        std::env::remove_var("MCNF_SR_WARN_PCT");
+        std::env::remove_var("MCNF_SR_CRIT_PCT");
+        assert_eq!(sr_warn_pct(), SR_WARN_PCT);
+        assert_eq!(sr_crit_pct(), SR_CRIT_PCT);
     }
 
     // ---- DATACENTER-4: XAPI-over-overlay route selection -----------------------

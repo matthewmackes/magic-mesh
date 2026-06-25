@@ -1834,8 +1834,16 @@ the plane and it **survives killing the current zone leader**.
   **Acceptance**:
     - [>] power/suspend/migrate/clone/snapshot/resize/delete; create via golden-template wizard that writes a Tofu resource + applies (structural changes go through Tofu — no drift); embedded noVNC; multi-select bulk power/snapshot/tag with per-item progress — *power (start/shutdown/reboot) done via `action/dc/vm-power`; the rest pending*
 - [✓] **DATACENTER-12: Storage tab (SR/VDI/create + scheduled snapshots + image library).**
+  *SR cards (capacity bar + threshold badge) read `event/dc/sr/*`; each lists its VDIs (`event/dc/vdi/*`,
+  gathered with name/size/VM-attached) with per-disk Attach (typed VM) / Detach (typed-confirm gated, server
+  fails closed on `confirm:true`) firing `action/dc/vdi-{attach,detach}`; SR-create / VDI-create / SR-snapshot
+  RPCs (injection-guarded + dom0 allow-listed); scheduled snapshots persisted to the Bus. The SR
+  capacity-threshold alert now emits onto the EXISTING health lane (`event/dc/health/sr:<uuid>` warn→fail,
+  cleared via the reconcile `gone`) so the copilot triage + Alerts tile see a filling store. Remaining: the
+  ISO + template image library (absorbs `images`) — graceful-empty placeholder until a source publishes
+  `event/dc/{iso,template}/*`.*
   **Acceptance**:
-    - [ ] SRs + VDIs (attach/detach/create); scheduled snapshots w/ retention + backup target; ISO + template library (absorbs `images`); SR capacity threshold alerts → Bus/Hub
+    - [>] SRs + VDIs (attach/detach/create); scheduled snapshots w/ retention + backup target; ISO + template library (absorbs `images`); SR capacity threshold alerts → Bus/Hub — *SR+VDI attach/detach/create + scheduled snapshots + capacity-threshold alert into the health lane all done; the ISO/template image-library source is the honest remaining*
 - [✓] **DATACENTER-13: Network tab (L2 + overlay + topology + unified IP/DNS).**
   **Acceptance**:
     - [ ] networks/PIFs/VLANs/NIC mgmt/create; overlay peer/route management; an interactive topology map (hosts↔networks↔VMs↔gateway); a unified IP/DNS view correlating UniFi leases ↔ DO DNS ↔ overlay IPs
