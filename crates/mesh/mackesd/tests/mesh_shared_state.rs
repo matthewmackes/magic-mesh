@@ -45,6 +45,7 @@ fn heartbeat(host: &str, now: u64) -> PeerRecord {
         overlay_ip: Some("10.42.0.9".into()),
         role: None,
         external_addr: None,
+        media: false,
     }
 }
 

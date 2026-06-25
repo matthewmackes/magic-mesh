@@ -162,6 +162,12 @@ enum Cmd {
     RolePin {
         /// `lighthouse` | `server` | `workstation`.
         role: String,
+        /// MEDIA-1 — pin the `Lighthouse_Media` subclass: the §9 media
+        /// capability tag on top of the role. Only valid on `lighthouse`
+        /// (a media tag on server/workstation is dropped — it is a lighthouse
+        /// subclass). The Navidrome music worker gates to this class.
+        #[arg(long)]
+        media: bool,
     },
 
     /// LIGHTHOUSE-10 — set this lighthouse's PUBLIC underlay address
@@ -1882,13 +1888,28 @@ fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        Cmd::RolePin { role } => {
+        Cmd::RolePin { role, media } => {
             let parsed: mde_role::Role = role.parse().map_err(|_| {
                 anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
             })?;
-            match mde_role::pin(parsed) {
+            // MEDIA-1 — pin the role + the media capability tag as a class. The
+            // tag is only valid on the lighthouse tier; reject an inapplicable
+            // request loudly rather than silently dropping it, so an operator
+            // who typed `--media` on the wrong role is told why.
+            if media && !mde_role::Capability::Media.applies_to(parsed) {
+                anyhow::bail!(
+                    "`--media` is a lighthouse subclass (Lighthouse_Media) — it cannot apply to \
+                     `{}`. Pin `lighthouse --media`, or drop the flag.",
+                    parsed.as_str()
+                );
+            }
+            let class = mde_role::RoleClass {
+                role: parsed,
+                media,
+            };
+            match mde_role::pin_class(&class) {
                 Ok(outcome) => {
-                    println!("role pinned: {outcome:?}");
+                    println!("role pinned: {outcome:?} (class {class})");
                     return Ok(());
                 }
                 Err(e) => anyhow::bail!("role pin refused: {e}"),
@@ -1919,7 +1940,26 @@ fn main() -> anyhow::Result<()> {
                     println!("  {n}");
                 }
             };
+            // MEDIA-1 — the Lighthouse_Media subclass adds its capability worker
+            // on top of the lighthouse rank set; list it so the media gate is
+            // observable from the CLI alongside the plain roles.
+            let show_media = || {
+                let class = mackesd_core::worker_role::DeployClass {
+                    rank: mde_role::Role::Lighthouse.rank(),
+                    media: true,
+                };
+                let mut names = mackesd_core::worker_role::workers_for_class(class);
+                names.sort_unstable();
+                println!(
+                    "lighthouse_media (rank 0 + media) runs {} workers:",
+                    names.len()
+                );
+                for n in names {
+                    println!("  {n}");
+                }
+            };
             match role {
+                Some(s) if s.eq_ignore_ascii_case("lighthouse_media") => show_media(),
                 Some(s) => match s.parse::<mde_role::Role>() {
                     Ok(r) => show(r),
                     Err(e) => {
@@ -1931,6 +1971,7 @@ fn main() -> anyhow::Result<()> {
                     for r in mde_role::Role::all() {
                         show(r);
                     }
+                    show_media();
                 }
             }
         }
@@ -5097,16 +5138,23 @@ fn run_serve(
         // (fail closed). The resulting set is observable via `mackesd
         // role-workers` and the live worker-status listing.
         // ENT-2 (C3) — fail closed: an unpinned box refuses to start.
-        let role_rank = match mackesd_core::worker_role::resolve_rank_strict() {
-            Ok(rank) => rank,
+        // MEDIA-1 — resolve the full deployment CLASS (rank + capability tags),
+        // not just the rank: capability-gated workers (the Lighthouse_Media
+        // Navidrome worker) gate on `runs_in(name, deploy_class)`, which checks
+        // the media tag on top of the rank. `role_rank` is kept for the existing
+        // rank-only `runs(name, role_rank)` gates (a plain worker has no tag).
+        let deploy_class = match mackesd_core::worker_role::resolve_class_strict() {
+            Ok(class) => class,
             Err(msg) => {
                 eprintln!("mackesd serve: {msg}");
                 anyhow::bail!("worker pool refused to start: no pinned role (ENT-2)");
             }
         };
+        let role_rank = deploy_class.rank;
         tracing::info!(
             role_rank,
-            "E1.2: spawning the role-permitted worker subset"
+            media = deploy_class.media,
+            "E1.2/MEDIA-1: spawning the class-permitted worker subset"
         );
         // E1.3 #3 — read the operator-tunable daemon config from
         // /etc/mackesd/mackesd.toml (fail-open to the locked defaults on a

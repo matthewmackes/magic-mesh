@@ -235,6 +235,7 @@ mod tests {
                 overlay_ip: None,
                 role: None,
                 external_addr: None,
+                media: false,
             },
         )
         .unwrap();
