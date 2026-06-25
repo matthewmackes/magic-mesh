@@ -151,7 +151,7 @@ fn bell_color(severity: Option<Severity>) -> cosmic::iced::Color {
 /// LIGHTHOUSE-7 — resolve a lighthouse-health Carbon token name to its color.
 /// The lib names the token (`beacon_healthy` green / `danger` red — the
 /// dedicated lighthouse-beacon hues); the shell maps it through the dark
-/// palette, like `Pip::token` → color elsewhere (§4 — no raw literals).
+/// palette so no raw color literal lives here (§4 — no raw literals).
 fn lighthouse_color(token: &str) -> cosmic::iced::Color {
     let p = Palette::dark();
     let rgba = match token {
