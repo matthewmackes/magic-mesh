@@ -304,17 +304,25 @@ pub fn workload_entries_from_inventory(inv: &serde_json::Value, node: &str) -> V
 /// the Start-menu Workloads tab shows fleet-wide VMs/containers, not just local.
 /// Empty when the share isn't mounted (caller falls back to the local doc).
 #[must_use]
-pub fn fleet_workload_entries() -> Vec<AppEntry> {
-    fleet_workload_entries_in(&crate::default_qnm_shared_root())
+pub fn fleet_workload_entries(this_node: &str) -> Vec<AppEntry> {
+    fleet_workload_entries_in(&crate::default_qnm_shared_root(), this_node)
 }
 
 /// Pure variant (unit-tested): read every `<root>/<host>/compute-inventory.json`.
+///
+/// Ports the proven `fold_bus_inventories` discipline (mde-workbench compute
+/// panel): every node — including this one — publishes its own
+/// `compute-inventory.json` onto the share, so without a self-skip the local
+/// box's own VMs/containers would surface here AND again from the responder's
+/// local-bus fallback / live probe. Skip the doc whose `hostname` is
+/// `this_node`, and dedup any row already folded (node + source + name), so a
+/// stale duplicate doc can't double-list a workload.
 #[must_use]
-pub fn fleet_workload_entries_in(root: &std::path::Path) -> Vec<AppEntry> {
+pub fn fleet_workload_entries_in(root: &std::path::Path, this_node: &str) -> Vec<AppEntry> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
     };
-    let mut out = Vec::new();
+    let mut out: Vec<AppEntry> = Vec::new();
     for ent in entries.flatten() {
         let path = ent.path().join("compute-inventory.json");
         let Ok(body) = std::fs::read_to_string(&path) else {
@@ -328,7 +336,20 @@ pub fn fleet_workload_entries_in(root: &std::path::Path) -> Vec<AppEntry> {
             .and_then(|h| h.as_str())
             .unwrap_or("")
             .to_string();
-        out.extend(workload_entries_from_inventory(&inv, &node));
+        // This node publishes its own inventory too — skip the whole doc when
+        // it's us (the local workloads come from the responder's own bus doc).
+        if !this_node.is_empty() && node == this_node {
+            continue;
+        }
+        for entry in workload_entries_from_inventory(&inv, &node) {
+            let dup = out
+                .iter()
+                .any(|e| e.node == entry.node && e.source == entry.source && e.name == entry.name);
+            if dup {
+                continue;
+            }
+            out.push(entry);
+        }
     }
     out
 }
@@ -548,9 +569,11 @@ where
                 &fleet_running_hosts_in(&svc.workgroup_root),
             );
             let mesh = mesh_entries_from_directory(&dir_doc(), &svc.node_id);
-            // WORKLOAD-FLEET-2 — fleet-wide workloads from the replicated plane;
-            // fall back to this node's own bus inventory when the share is absent.
-            let mut workloads = fleet_workload_entries();
+            // WORKLOAD-FLEET-2 — fleet-wide workloads from the replicated plane
+            // (this node's own doc is self-skipped — its workloads come from the
+            // local bus inventory below); fall back to that bus inventory wholly
+            // when the share is absent.
+            let mut workloads = fleet_workload_entries(&svc.node_id);
             if workloads.is_empty() {
                 workloads = workload_entries_from_inventory(&inv_doc(), &svc.node_id);
             }
@@ -864,7 +887,8 @@ mod tests {
         }
         // A non-inventory dir + file must be tolerated.
         std::fs::create_dir_all(tmp.path().join("peers")).unwrap();
-        let e = fleet_workload_entries_in(tmp.path());
+        // this_node is some other host so both peer docs are folded.
+        let e = fleet_workload_entries_in(tmp.path(), "self-host");
         assert_eq!(e.len(), 2, "one workload per peer file");
         let f = e.iter().find(|x| x.name == "MDE-KVM-1").unwrap();
         assert_eq!(f.node, "fedora");
@@ -874,7 +898,66 @@ mod tests {
 
     #[test]
     fn fleet_workload_entries_empty_when_no_root() {
-        assert!(fleet_workload_entries_in(std::path::Path::new("/nonexistent-xyz")).is_empty());
+        assert!(
+            fleet_workload_entries_in(std::path::Path::new("/nonexistent-xyz"), "self").is_empty()
+        );
+    }
+
+    #[test]
+    fn fleet_workload_entries_self_skips_own_doc_and_dedups() {
+        // Ports the fold_bus_inventories discipline (compute panel): the local
+        // node's own published doc must NOT be folded here (it duplicates the
+        // responder's local-bus inventory), and a stale duplicate peer doc must
+        // not double-list a workload.
+        let tmp = tempfile::tempdir().unwrap();
+        // This node's own doc — must be skipped wholesale.
+        let me = tmp.path().join("fedora");
+        std::fs::create_dir_all(&me).unwrap();
+        std::fs::write(
+            me.join("compute-inventory.json"),
+            json!({"hostname": "fedora",
+                   "vms": [{"id": "u-local", "name": "MDE-KVM-1", "state": "running"}],
+                   "containers": []})
+            .to_string(),
+        )
+        .unwrap();
+        // A genuine peer doc.
+        let peer = tmp.path().join("node-13");
+        std::fs::create_dir_all(&peer).unwrap();
+        std::fs::write(
+            peer.join("compute-inventory.json"),
+            json!({"hostname": "node-13",
+                   "vms": [{"id": "u-web", "name": "web1", "state": "running"}],
+                   "containers": [{"id": "c-db", "name": "db", "state": "exited"}]})
+            .to_string(),
+        )
+        .unwrap();
+        // A stale second copy of the SAME peer (different dir, same hostname +
+        // same workloads) — the dedup must collapse it to one row each.
+        let stale = tmp.path().join("node-13-stale");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(
+            stale.join("compute-inventory.json"),
+            json!({"hostname": "node-13",
+                   "vms": [{"id": "u-web2", "name": "web1", "state": "running"}],
+                   "containers": []})
+            .to_string(),
+        )
+        .unwrap();
+
+        let e = fleet_workload_entries_in(tmp.path(), "fedora");
+        // self ("fedora") doc skipped → no MDE-KVM-1; node-13's web1 + db, each once.
+        assert!(
+            !e.iter().any(|x| x.node == "fedora"),
+            "this node's own doc must be self-skipped"
+        );
+        assert_eq!(
+            e.iter().filter(|x| x.name == "web1").count(),
+            1,
+            "duplicate peer doc must be deduped to one web1"
+        );
+        assert!(e.iter().any(|x| x.name == "db" && x.node == "node-13"));
+        assert_eq!(e.len(), 2, "web1 + db, no self rows, no dupes");
     }
 
     #[test]
