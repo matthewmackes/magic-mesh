@@ -59,6 +59,7 @@ cargo clippy --workspace --all-targets     # crypto/unwrap lints are deny-level
 cargo fmt --all -- --check
 ./install-helpers/lint-mesh-boundary.sh    # §6 — no mesh→desktop-shell dep
 ./install-helpers/lint-carbon-tokens.sh    # §4 — no raw colour outside mde-theme
+./install-helpers/lint-motion.sh           # §4 — no bespoke animation duration outside mde-theme
 ./install-helpers/lint-bus-names.sh        # §2 — no private D-Bus names
 cargo deny check                           # EFF-16 — advisories/licenses/bans/sources
 ```

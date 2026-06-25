@@ -45,12 +45,16 @@ pub const REVEAL_RISE_PX: f32 = 6.0;
 /// Per-row reveal stagger: each successive queue row starts its slide-in this
 /// much later, so a freshly-loaded queue reveals top-down rather than all at
 /// once. Capped (see [`Reveal::row_start`]) so a long queue still finishes
-/// promptly. A short Carbon-tier beat.
-pub const ROW_STAGGER: Duration = Duration::from_millis(28);
+/// promptly. **Sourced from the shared Carbon list-stagger token**
+/// ([`mde_theme::motion::list::STAGGER_STEP_MS`]) so the whole shell staggers on
+/// one beat — no scattered animation literal (§4 / MOTION-AUDIT-2).
+pub const ROW_STAGGER: Duration =
+    Duration::from_millis(mde_theme::motion::list::STAGGER_STEP_MS as u64);
 
 /// The most rows that take a distinct stagger delay; beyond this every row
 /// shares the last delay so a hundred-row queue doesn't reveal for seconds.
-pub const STAGGER_ROW_CAP: u32 = 8;
+/// The shared Carbon stagger cap ([`mde_theme::motion::list::STAGGER_CAP`]).
+pub const STAGGER_ROW_CAP: u32 = mde_theme::motion::list::STAGGER_CAP as u32;
 
 /// The per-frame reveal tick cadence (~60 fps). Armed only while a reveal tween
 /// is in flight (MOTION-PERF-1 — a settled surface costs no idle wakeups).

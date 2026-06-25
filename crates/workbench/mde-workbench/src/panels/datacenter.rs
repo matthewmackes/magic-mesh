@@ -2440,13 +2440,18 @@ const CARD_GRID_COLS: usize = 3;
 /// MOTION-FEEDBACK-2 — the staggered-reveal cap (Q acceptance: stagger ≤8). Cards
 /// past this index share the last delay slot, so a large zone reveals as one
 /// quick wave instead of a long crawl, and the reveal always finishes in a bounded
-/// time regardless of resource count.
-const REVEAL_STAGGER_CAP: usize = 8;
+/// time regardless of resource count. The shared Carbon stagger cap
+/// ([`mde_theme::motion::list::STAGGER_CAP`]) so the cascade matches every list.
+const REVEAL_STAGGER_CAP: usize = mde_theme::motion::list::STAGGER_CAP;
 
 /// MOTION-FEEDBACK-2 — the per-card stagger step. Each (capped) card index `i`
 /// delays its slide-in by `i * STAGGER_STEP`, so the grid fills top-left → bottom
-/// in a brisk cascade rather than all at once.
-const REVEAL_STAGGER_STEP: Duration = Duration::from_millis(40);
+/// in a brisk cascade rather than all at once. **Sourced from the shared Carbon
+/// list-stagger token** ([`mde_theme::motion::list::STAGGER_STEP_MS`]) so the grid
+/// staggers on the same beat as every list/menu — no scattered animation literal
+/// (§4 / MOTION-AUDIT-2).
+const REVEAL_STAGGER_STEP: Duration =
+    Duration::from_millis(mde_theme::motion::list::STAGGER_STEP_MS as u64);
 
 /// MOTION-FEEDBACK-2 — how far a card rises into place on reveal (px, from below).
 /// A small slide, paired with the fade, reading as "settling in" without layout
