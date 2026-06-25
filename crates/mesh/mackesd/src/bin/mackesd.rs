@@ -6058,6 +6058,34 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("dr_scheduler".into());
 
+        // DATACENTER-12 (scheduled-snapshot executor) — the missing consumer of
+        // the Storage tab's "Save schedule". Leader-gated; reads each SR's latest
+        // `event/dc/snap-schedule/<sr>` config off the Bus, and on a coarse
+        // (~5 min) tick decides via the pure `due` helper whether each SR is due
+        // per its cadence. When due it takes the snapshot by REUSING the existing
+        // storage `xe vdi-snapshot` path over the mesh-key SSH (the same
+        // `xen_ssh_key`/`xen_dom0s` injection-guarded, dom0-allow-listed contract
+        // `ipc::storage_ops` uses), then enforces retention by destroying its OWN
+        // (prefix-tagged) oldest snapshots beyond the configured count — never an
+        // operator's hand-made snapshot. Emits a run result to
+        // `event/dc/snap-schedule-run/<sr>` and alerts on failure via the
+        // alert_relay lane. Without this worker the Storage tab's schedule was a
+        // config-only stub (config persisted, nothing ever executed it).
+        let snap_alerts = mackesd_core::workers::alert_relay::default_alerts_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/mde-alerts"));
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::dc_snap_scheduler::DcSnapSchedulerWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+                snap_alerts,
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("dc_snap_scheduler".into());
+
         // DATACENTER-20 — passive promotion tracker. Leader-gated; publishes the
         // version running at each promotion stage (Build→Eagle→DO) to
         // `event/dc/promote/<stage>` so the Workbench Datacenter plane can render
