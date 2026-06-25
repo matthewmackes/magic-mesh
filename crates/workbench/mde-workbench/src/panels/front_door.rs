@@ -77,7 +77,7 @@ use mde_theme::{FontSize, Palette, TypeRole};
 
 use crate::cosmic_compat::prelude::*;
 use crate::model::Group;
-use crate::panels::{build_farm, datacenter, home, jobs, peers};
+use crate::panels::{build_farm, datacenter, health_check, home, jobs, node_roles, peers};
 
 /// FRONTDOOR-2/3 — the Front Door's own message set, threaded through
 /// [`crate::Message::FrontDoor`]. Each variant is one we actually handle (§7):
@@ -283,9 +283,42 @@ impl Tile {
                 TileAction::nav("Open Peers", Group::Mesh, "peers"),
                 TileAction::nav("Open Fleet Roster", Group::Fleet, "inventory"),
             ],
+            // FRONTDOOR-8 — the Data Center tile gets the locked Q51 node-lifecycle
+            // one-click set (Q12 DC lead: 1-click node actions): join · drain ·
+            // restart-service · view-health · cutover-helpers · provision · destroy.
+            // Mirrors FD-7's wired-vs-navigate split (§6 glue, §9 typed — no raw
+            // shell). WIRED where an existing parameterless verb exists: "View
+            // health" re-probes via the Health panel's own `RunClicked`; "Drain"
+            // lands on the Node Roles surface freshly re-read via its
+            // `RefreshClicked` (the per-node role/drain edits live there). The
+            // node/service/leader-scoped verbs whose action needs a target the
+            // operator picks on the surface (join needs a passcode; restart needs a
+            // unit+scope; cutover is a mutating leadership change we never fire blind
+            // from a tile) NAVIGATE to the surface that owns them — also a real
+            // action (the destination's `load()` fires). PROVISION + DESTROY are
+            // navigate-ONLY to the Datacenter Tofu surface (Q54 — the
+            // operator-gated apply/destroy with the prod-arm + typed-confirm lives
+            // there); a destructive op is never triggered from a tile click.
             Some(TileKey::DataCenter) => vec![
-                TileAction::nav("Open Datacenter", Group::Provisioning, "datacenter"),
-                TileAction::nav("Open Peers", Group::Mesh, "peers"),
+                TileAction::pipeline_nav("Join node", Group::MeshProvisioning, "mesh_join"),
+                TileAction::pipeline_wired(
+                    "Drain node",
+                    Group::Provisioning,
+                    "node_roles",
+                    crate::Message::NodeRoles(node_roles::Message::RefreshClicked),
+                ),
+                TileAction::pipeline_nav("Restart service", Group::ThisNode, "mesh_services"),
+                TileAction::pipeline_wired(
+                    "View health",
+                    Group::Monitoring,
+                    "health_check",
+                    crate::Message::HealthCheck(health_check::Message::RunClicked),
+                ),
+                TileAction::pipeline_nav("Cutover helpers", Group::Mesh, "mesh_control"),
+                // Provision / destroy — navigate-ONLY to the tofu/autoscaler surface
+                // (the operator-gated apply); never a destructive op from a click.
+                TileAction::pipeline_nav("Provision", Group::Provisioning, "datacenter"),
+                TileAction::pipeline_nav("Destroy", Group::Provisioning, "datacenter"),
             ],
             // FRONTDOOR-7 — the Build/Farm + DevOps tiles get the locked one-click
             // pipeline action set (Q50d: build · deploy · rollback · view-logs ·
@@ -2737,13 +2770,18 @@ mod tests {
                     "tile {label} pipeline nav is not a real route: {nav:?}"
                 );
                 if let Some(trigger) = trigger {
-                    // The wired triggers are the build-farm / jobs panels' OWN
-                    // refresh sub-messages — real existing verbs, never a stub.
+                    // The wired triggers are the owning panels' OWN re-read/re-probe
+                    // sub-messages — real existing verbs, never a stub. FD-7 wired
+                    // the build-farm / jobs `RefreshClicked`; FD-8 adds the Node
+                    // Roles `RefreshClicked` (drain surface re-read) + the Health
+                    // panel's `RunClicked` (the per-node health re-probe).
                     assert!(
                         matches!(
                             **trigger,
                             crate::Message::BuildFarm(build_farm::Message::RefreshClicked)
                                 | crate::Message::Jobs(jobs::Message::RefreshClicked)
+                                | crate::Message::NodeRoles(node_roles::Message::RefreshClicked)
+                                | crate::Message::HealthCheck(health_check::Message::RunClicked)
                         ),
                         "tile {label} pipeline trigger is not a real existing verb: {trigger:?}"
                     );
@@ -2906,6 +2944,102 @@ mod tests {
         assert!(fd.detail.is_some());
         let _ = fd.update(inner);
         assert!(fd.detail.is_none(), "a pipeline action restores the grid");
+    }
+
+    // ── FRONTDOOR-8: the Data Center tile's node-lifecycle one-click actions ──
+
+    /// Pull a Data Center tile action's `(group, panel, wired)` route, panicking
+    /// if it isn't a real [`Message::PipelineAction`] over a `SelectPanel` nav.
+    fn dc_route(label: &str) -> (Group, &'static str, bool) {
+        let action = keyed_tile(TileKey::DataCenter)
+            .actions()
+            .into_iter()
+            .find(|a| a.label == label)
+            .unwrap_or_else(|| panic!("no Data Center action labelled {label:?}"));
+        let crate::Message::FrontDoor(Message::PipelineAction { nav, trigger }) = action.message
+        else {
+            panic!("action {label} is not a PipelineAction");
+        };
+        let crate::Message::SelectPanel { group, panel } = *nav else {
+            panic!("action {label} nav is not a SelectPanel route");
+        };
+        (group, panel, trigger.is_some())
+    }
+
+    #[test]
+    fn data_center_tile_exposes_the_locked_q51_lifecycle_action_set() {
+        // FRONTDOOR-8 / Q51 — the Data Center tile surfaces the full locked
+        // node-lifecycle set in menu order: join · drain · restart-service ·
+        // view-health · cutover-helpers · provision · destroy.
+        let labels: Vec<String> = keyed_tile(TileKey::DataCenter)
+            .actions()
+            .into_iter()
+            .map(|a| a.label)
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Join node",
+                "Drain node",
+                "Restart service",
+                "View health",
+                "Cutover helpers",
+                "Provision",
+                "Destroy",
+            ],
+            "the Q51 lifecycle set, in order: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn data_center_lifecycle_actions_route_to_real_panels_and_wire_real_triggers() {
+        // FRONTDOOR-8 — every lifecycle action is a real `PipelineAction` whose nav
+        // routes to an EXISTING panel slug (§7). WIRED where a parameterless verb
+        // exists: Drain re-reads the Node Roles surface, View health re-probes the
+        // Health panel (§9 — the existing typed verbs). The target-scoped verbs
+        // (join/restart/cutover) and the gated provision/destroy are navigate-only.
+        assert_eq!(
+            dc_route("Join node"),
+            (Group::MeshProvisioning, "mesh_join", false),
+            "join navigates to the Mesh Join surface (it needs a passcode)"
+        );
+        assert_eq!(
+            dc_route("Drain node"),
+            (Group::Provisioning, "node_roles", true),
+            "drain is wired to the Node Roles surface's own re-read"
+        );
+        assert_eq!(
+            dc_route("Restart service"),
+            (Group::ThisNode, "mesh_services", false),
+            "restart navigates to Mesh Services (it needs a unit + scope)"
+        );
+        assert_eq!(
+            dc_route("View health"),
+            (Group::Monitoring, "health_check", true),
+            "view-health is wired to the Health panel's own re-probe"
+        );
+        assert_eq!(
+            dc_route("Cutover helpers"),
+            (Group::Mesh, "mesh_control", false),
+            "cutover navigates to Mesh Control — we never fire a takeover blind"
+        );
+    }
+
+    #[test]
+    fn data_center_provision_and_destroy_are_navigate_only_to_the_tofu_surface() {
+        // FRONTDOOR-8 — provision + destroy are NAVIGATE-ONLY (Q54): they route to
+        // the Datacenter Tofu surface (the operator-gated apply/destroy lives there)
+        // and carry NO trigger, so a destructive op is never fired from a tile click.
+        assert_eq!(
+            dc_route("Provision"),
+            (Group::Provisioning, "datacenter", false),
+            "provision navigates to the gated tofu surface, no blind trigger"
+        );
+        assert_eq!(
+            dc_route("Destroy"),
+            (Group::Provisioning, "datacenter", false),
+            "destroy navigates to the gated tofu surface, no blind trigger"
+        );
     }
 
     // ── FRONTDOOR-6: the unified search (local search/rank + the message flow) ──

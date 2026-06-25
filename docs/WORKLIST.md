@@ -1974,12 +1974,12 @@ clean+reachable smoke); visual gate lifted.
     - [✓] DevOps tiles show build/CI status + live farm utilization (the FARM-AUTOSCALE autoscaler)
     - [>] one-click build, deploy, rollback, logs, rerun-failed — build/rerun wired to the existing typed panel trigger; deploy/rollback/logs navigate to the owning surface (no one-shot verb yet). Routing through the typed action worker (the confirm-gate UI) is the deferred tail.
 
-- [ ] **FRONTDOOR-8: Data Center surface — node lifecycle.**
+- [>] **FRONTDOOR-8: Data Center surface — node lifecycle.** (the locked Q51 1-click set landed on the Data Center tile's FD-5 detail menu, mirroring FD-7's wired-vs-navigate `PipelineAction`: WIRED where a real parameterless verb exists — "View health" → the Health panel's own `RunClicked` re-probe, "Drain node" → the Node Roles surface's own `RefreshClicked` re-read (§9 typed, no raw shell); the target-scoped verbs NAVIGATE to the surface that owns them — join → Mesh Join (needs a passcode), restart-service → Mesh Services (needs unit+scope), cutover-helpers → Mesh Control (a mutating leadership takeover, never fired blind from a tile). Both Panel + FullScreen modes intact; §4 tokens. The confirm-gate action-worker UI is the deferred tail shared with FD-7/11.)
   **As** an operator, **I want** the live mesh and one-click node actions,
   **so that** I run the fleet from the menu.
   **Acceptance**:
-    - [ ] live topology + per-node health; one-click join/drain/restart/cutover-helpers
-    - [ ] provision/destroy nodes drives the tofu/autoscaler with the operator-gated apply
+    - [>] live topology + per-node health; one-click join/drain/restart/cutover-helpers — drain + view-health wired to the owning panel's typed re-read/re-probe; join/restart/cutover navigate to the surface that owns the target-scoped verb (no parameterless one-shot exists)
+    - [>] provision/destroy nodes drives the tofu/autoscaler with the operator-gated apply — NAVIGATE-ONLY to the Datacenter Tofu surface (the prod-arm + typed-confirm gated apply/destroy lives there); a destructive op is never triggered from a tile click
 
 - [✓] **FRONTDOOR-9: the mackesd `copilot` worker (codex backend).**
   **As** an operator, **I want** an AI service in the mesh,
