@@ -4,9 +4,9 @@ These worklist tasks are code-complete (or have no buildable artifact) and canno
 
 ## DO Spaces media bucket
 
-These all share one blocker: the DigitalOcean Spaces bucket + S3 access keys are console-minted (doctl has no key-gen verb) and don't exist on the dev host, so nothing downstream can be built or live-verified. The Navidrome substrate is also an unpackaged standalone helper (`install-helpers/setup-media-navidrome.sh`) with no Cargo.toml/RPM-spec asset and no mackesd worker yet.
+The DO Spaces bucket + sealed S3 keys are now **RESOLVED** (MEDIA-2, 2026-06-25): the `mcnf-mesh-media` bucket (nyc3) is live and a least-privilege bucket-scoped key is sealed as the `media-spaces` mesh secret (age→etcd). The downstream MEDIA items below are therefore **no longer blocked on the bucket/keys** — their remaining blocker is a running **Lighthouse_Media node** plus packaging the Navidrome substrate (`install-helpers/setup-media-navidrome.sh` → a mackesd worker / RPM asset, MEDIA-3).
 
-- **MEDIA-2** — DO Spaces keys are console-minted and no S3 keys / rclone config exist on the dev host; the bucket + sealed key-pair require an operator action in the DO console that cannot be produced in a build.
+- ~~**MEDIA-2**~~ — RESOLVED 2026-06-25 (operator authorized key creation): bucket verified live (rw round-trip) + bucket-scoped key minted via `doctl spaces keys` (the "console-minted only" assumption was stale) + sealed as the `media-spaces` leader secret. Also fixed the secret-store `get` (binary-corruption) + the rclone `no_check_bucket` config en route.
 - **MEDIA-3** — Navidrome substrate is an unpackaged helper with no mackesd worker; the live Subsonic-API acceptance (ping.view from another node) needs a live Lighthouse_Media node + the MEDIA-2 bucket/keys.
 - **MEDIA-4** — the rclone bucket-mount substrate lives only in the unpackaged helper; the scan/cover-art/stream acceptance needs the live MEDIA-2 bucket.
 - **MEDIA-6** — only the env-var half exists; idempotent account creation, the durable shared-playlist write path, and end-to-end stream/browse all need the live MEDIA-2 bucket + a running Lighthouse_Media instance.
