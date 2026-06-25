@@ -45,7 +45,7 @@ cmd "mde-bus request action/mesh/directory" "live roster (export MDE_BUS_ROOT=/r
 cmd "mackesd validate run|status"     "overlay-reachability validation"
 cmd "cat /run/mde/mesh-status.json"   "the cached snapshot (prompt/greeting source)"
 
-header "Storage (LizardFS / QNM-Shared)"
+header "Storage (Mesh Sync — LizardFS today)"
 cmd "mackesd mesh-fs-status"          "chunkservers, goal, quota, usage (JSON)"
 cmd "lizardfs-admin list-chunkservers 10.42.0.1 9421" "raw chunkserver list"
 cmd "mountpoint /mnt/mesh-storage"    "is the shared volume mounted?"
