@@ -1996,7 +1996,7 @@ clean+reachable smoke); visual gate lifted.
     - [ ] context feed → codex → ranked suggestion cards rendered inline on the relevant tile (moderate cadence, high-confidence only)
     - [ ] clicking a suggestion opens a task-scoped mini-conversation (durable transcript); thumbs up/down feeds ranking
 
-- [ ] **FRONTDOOR-11: the action worker + confirm gate + audit.**
+- [>] **FRONTDOOR-11: the action worker + confirm gate + audit.** (backend half done — typed mackesd `action` worker drains `action/exec/request`, allowlists `service_lifecycle` (start/stop/restart container/vm via the existing PD-11 lifecycle verb — typed, no raw shell §9), hash-chain audits each via the events plane §8, leader-gated, graceful degrade; GUI confirm-gate/preview-diff UI is the remaining GUI-track half.)
   **As** an operator, **I want** AI/one-click actions to run safely and be logged,
   **so that** power doesn't mean risk.
   **Acceptance**:

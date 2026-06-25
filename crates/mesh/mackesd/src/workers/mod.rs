@@ -478,6 +478,12 @@ pub mod lighthouse_probe;
 // itself but never executes OS actions on the operator's behalf (§9; typed
 // actions are FRONTDOOR-11). Degrades gracefully when codex/key/network is down.
 pub mod copilot;
+// FRONTDOOR-11 — the typed action worker. Drains `action/exec/request` carrying a
+// TYPED ActionRequest enum (an allowlisted KIND + typed params, never a command
+// string — §9), dispatches each through an EXISTING verb mechanism (the PD-11
+// lifecycle verb), writes a hash-chain audit row (the events plane — §8), and
+// replies. Leader-gated; graceful degrade. NO raw-shell/arbitrary-command channel.
+pub mod action;
 
 /// Every worker registered with the supervisor implements this
 /// trait. The trait is `async_trait` because the supervisor stores

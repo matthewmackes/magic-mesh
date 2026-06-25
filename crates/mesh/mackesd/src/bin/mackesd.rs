@@ -6148,6 +6148,31 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("copilot".into());
 
+        // FRONTDOOR-11 — the typed action worker (the execution half of the
+        // confirm gate, Q17 + Q26). Spawned on every node so failover is seamless,
+        // but LEADER-gated (Q73): only the elected node drains
+        // `action/exec/request` and acts, so a multi-node mesh executes + audits
+        // each action exactly once. It accepts a TYPED ActionRequest enum (an
+        // allowlisted KIND + typed params — NEVER a command string; §9 forbids a
+        // raw-shell channel) and maps each allowlisted KIND onto an EXISTING verb:
+        // the first cut allowlists `service_lifecycle`, dispatched via the PD-11
+        // `lifecycle` verb (a typed request the target's own `lifecycle_exec`
+        // validates against its live probe and runs locally — no push, no shell).
+        // Every action is hash-chain audited via the existing events plane (§8),
+        // and an unknown/disallowed action degrades to a typed rejection, never a
+        // panic (Q33).
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::action::ActionWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("action".into());
+
         // PRINT-2..PRINT-6 + PRINT-8 (v5.0.0) — auto CUPS print
         // sharing + sync. Spawned on headless + full; SKIPPED on
         // lighthouse (routing-only, no printers — Q8 lock). The
