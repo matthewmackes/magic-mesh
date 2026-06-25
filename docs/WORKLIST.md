@@ -2012,11 +2012,11 @@ clean+reachable smoke); visual gate lifted.
     - [ ] code/config edits land as a reviewable diff → apply → git commit (with attribution)
     - [ ] a failed action gets an inline Copilot diagnosis + fix/retry; long ops show a progress tile with cancel + completion notify
 
-- [ ] **FRONTDOOR-13: alerts tile + AI triage.**
+- [✓] **FRONTDOOR-13: alerts tile + AI triage.** (backend triage + GUI render done — the leader-only mackesd `copilot` worker grew a moderate-cadence alert-triage pass: it reads the LIVE alerts off the datacenter health plane (`event/dc/health/*`, the same non-ok checks the Alerts tile counts — §7 real, no demo_data), grounds codex in the bounded mesh-state context FD-12 built, asks it to GROUP + EXPLAIN the alerts and PROPOSE a typed one-click fix per group (via the SAME FD-10/12 `extract_proposal` allowlist path), and publishes the grouped `AlertTriage` on a NEW `state/copilot/alert-triage` topic — propose-only, graceful-degrade, never on FD-11's exec topic, no executor added (§9: the only spawn is codex). The Front Door's Alerts tile detail now renders the triage — each group's headline + severity + member alerts + plain-language explanation + (when present) an "Apply fix" that re-publishes the typed proposal to `action/copilot/proposal` exactly like a suggestion's "Act", routed through the FD-11 confirm gate, NEVER auto-executed. Both Panel + FullScreen modes; §4 mde-theme tokens (no raw hex); honest resting note when no triage. Tests: triage parse/publish/read-alerts/leader-gate (backend) + parse + Alerts-detail render in both modes + propose-only "Apply fix" (GUI). Build + clippy + tests GREEN on the farm. notifyd stays separate.)
   **As** an operator, **I want** alerts clustered and explained with a fix,
   **so that** I act, not dig.
   **Acceptance**:
-    - [ ] an Alerts tile; Copilot groups + explains alerts and proposes a one-click fix each (notifyd stays separate)
+    - [✓] an Alerts tile; Copilot groups + explains alerts and proposes a one-click fix each (notifyd stays separate)
 
 - [ ] **FRONTDOOR-14: platform — settings, prefs, look, lock.**
   **As** an operator, **I want** my Front Door configured and consistent,

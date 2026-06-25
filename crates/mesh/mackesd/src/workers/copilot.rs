@@ -156,6 +156,40 @@ pub const STATUS_TOPIC: &str = "state/copilot/status";
 /// [`ActionProposal`] the operator must approve + re-publish to FD-11 (§9).
 pub const SUGGESTIONS_TOPIC: &str = "action/copilot/suggestions";
 
+/// Bus topic the copilot PUBLISHES its ALERT TRIAGE to (FD-13 / Q38).
+///
+/// Lives in the `state/` namespace (a current-state snapshot, not a command or an
+/// event) so the Front Door's Alerts tile reads the latest triage the same way the
+/// Copilot tile reads `state/copilot/status`. The body is an [`AlertTriage`]: the
+/// live alerts GROUPED + EXPLAINED, each group optionally carrying a typed FD-12
+/// [`ActionProposal`] for the proposed one-click fix. The fix is a PROPOSAL — the
+/// GUI routes it through the SAME confirm gate as a suggestion's "Act" (re-publish
+/// to [`PROPOSAL_TOPIC`]); the triage is NEVER published to FD-11's execution topic
+/// and the copilot NEVER executes it (§9).
+pub const ALERT_TRIAGE_TOPIC: &str = "state/copilot/alert-triage";
+
+/// Bus topic-prefix the datacenter health plane publishes alerts under
+/// (`dc_health`'s `event/dc/health/<check>`). The triage pass reads the latest body
+/// per `event/dc/health/*` topic to find the NON-OK checks (the live alerts the
+/// Alerts tile counts), then asks codex to group + explain + propose a fix. A
+/// read-only consume of the same plane the GUI Alerts tile projects (§7 — real
+/// alerts, no demo data).
+pub const ALERT_TOPIC_PREFIX: &str = "event/dc/health/";
+
+/// Moderate alert-triage cadence (FD-13 / Q61). Like the proactive-suggestion pass,
+/// the LEADER re-triages the live alerts every few minutes — surfacing a grouped,
+/// explained, fix-proposed view without spamming the operator or hammering codex.
+pub const DEFAULT_TRIAGE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Hard cap on the alerts folded into one triage prompt (FD-13). A flapping plane
+/// can't blow the context budget — the most recent N non-ok checks are triaged and
+/// the rest summarized as a count.
+pub const MAX_ALERTS_IN_TRIAGE: usize = 24;
+
+/// Hard cap on the triage groups codex may return (FD-13). Keeps the Alerts tile
+/// detail bounded — a chatty model can't flood it with micro-groups.
+pub const MAX_TRIAGE_GROUPS: usize = 8;
+
 /// Cheap status cadence (FD-10 §1). 15 s keeps the Copilot tile's ready/thinking/
 /// offline indicator fresh without cost — each tick is a leader check, a
 /// secret-store presence probe, and (only on change) one bus write.
@@ -622,6 +656,219 @@ fn extract_json_array(text: &str) -> Option<String> {
     None
 }
 
+// ===================== FD-13: alert triage (group/explain/fix) ===============
+
+/// One live alert read off the datacenter health plane (FD-13). The compact
+/// subset of a `event/dc/health/<check>` body the triage needs — the check name,
+/// its non-ok status, and the human detail. A read-only projection of the SAME
+/// plane the GUI Alerts tile counts (§7 — real alerts, no demo data).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Alert {
+    /// The check name (`dom0:172.20.0.9`, `etcd`, `secret-store`, …).
+    pub check: String,
+    /// `warn` | `fail` (the triage only carries the NON-OK checks — an `ok` check
+    /// is not an alert).
+    pub status: String,
+    /// A short human detail line — why the check warned/failed. Empty when absent.
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// One GROUP of related alerts the copilot clustered, with its explanation and an
+/// optional proposed fix (FD-13 / Q38). The copilot groups the live alerts, writes
+/// one plain-language `explanation` per group, names the member `alerts`, and — when
+/// the group implies a concrete operation — carries a typed FD-12 [`ActionProposal`]
+/// the operator can act on with one click. The fix is a PROPOSAL: routed through the
+/// confirm gate (re-published to [`PROPOSAL_TOPIC`]), NEVER executed here (§9).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AlertGroup {
+    /// A short operator-facing headline for the cluster (e.g. "MeshFS master down
+    /// on oak").
+    pub title: String,
+    /// The plain-language explanation: what is wrong, why these alerts cluster, and
+    /// what the fix does.
+    pub explanation: String,
+    /// `high` | `medium` — the worst severity in the group, carried so the tile can
+    /// sort/badge. A missing/odd value degrades to `"medium"`.
+    #[serde(default = "default_impact")]
+    pub severity: String,
+    /// The member alert names (the `check`s) this group clusters. Carried so the
+    /// tile shows WHICH alerts the explanation covers, not just the headline.
+    #[serde(default)]
+    pub alerts: Vec<String>,
+    /// The typed one-click FIX this group proposes, if any — the FD-12
+    /// [`ActionProposal`] the operator approves through the confirm gate. `None` for
+    /// an explain-only group (no safe automated fix). It is a PROPOSAL: never
+    /// executed, never on FD-11's exec topic (§9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<ActionProposal>,
+}
+
+/// The grouped, explained triage published to [`ALERT_TRIAGE_TOPIC`] (FD-13). The
+/// clustered groups (worst-first), the count of alerts that were triaged, and the
+/// stamp it was produced — so the Alerts tile renders the triage with freshness.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AlertTriage {
+    /// The clustered alert groups (worst-severity first), capped at
+    /// [`MAX_TRIAGE_GROUPS`].
+    pub groups: Vec<AlertGroup>,
+    /// How many live alerts this triage covered (so the tile can show "N alerts
+    /// triaged" even when they collapse into fewer groups).
+    pub alert_count: usize,
+    /// Unix-epoch seconds the triage was produced.
+    pub produced_at_s: u64,
+}
+
+impl AlertTriage {
+    /// JSON body for [`ALERT_TRIAGE_TOPIC`]. Infallible — a serialize failure
+    /// degrades to an empty triage so a malformed publish never wedges the cadence.
+    #[must_use]
+    pub fn to_body(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            format!(
+                r#"{{"groups":[],"alert_count":0,"produced_at_s":{}}}"#,
+                self.produced_at_s
+            )
+        })
+    }
+}
+
+/// Render the live alerts as a compact, BOUNDED plain-text block for the triage
+/// prompt (FD-13). The most recent [`MAX_ALERTS_IN_TRIAGE`] non-ok checks are named
+/// with their status + detail; any beyond the cap are summarized as a count. Pure
+/// so the composition is unit-testable without a Bus.
+#[must_use]
+pub fn render_alerts(alerts: &[Alert]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for a in alerts.iter().take(MAX_ALERTS_IN_TRIAGE) {
+        let status = a.status.trim();
+        let detail = a.detail.trim();
+        if detail.is_empty() {
+            lines.push(format!("- {} [{}]", a.check, status));
+        } else {
+            lines.push(format!("- {} [{}]: {}", a.check, status, detail));
+        }
+    }
+    let overflow = alerts.len().saturating_sub(MAX_ALERTS_IN_TRIAGE);
+    if overflow > 0 {
+        lines.push(format!("- (+{overflow} more alerts)"));
+    }
+    lines.join("\n")
+}
+
+/// Compose the alert-triage prompt handed to `codex exec` (FD-13 / Q38).
+///
+/// Reuses [`SYSTEM_CONTEXT`] (the §9 lane + the `action`-fence proposal protocol)
+/// and the SAME bounded mesh grounding the suggestion pass uses, then lists the live
+/// alerts and asks codex to GROUP them, EXPLAIN each cluster in plain language, and
+/// — when a safe fix exists — PROPOSE a typed one-click fix the SAME `action`-fenced
+/// way (parsed through FD-11's allowlist). Strict JSON-array shape so the parse is
+/// deterministic. Pure so it's unit-testable without spawning codex.
+#[must_use]
+pub fn compose_triage_prompt(mesh_context: &str, alerts: &[Alert]) -> String {
+    let mut out = String::new();
+    out.push_str(SYSTEM_CONTEXT);
+    out.push_str("\n\n");
+    if !mesh_context.trim().is_empty() {
+        out.push_str("Live mesh state:\n");
+        out.push_str(mesh_context.trim());
+        out.push_str("\n\n");
+    }
+    out.push_str("Active alerts (the non-ok datacenter health checks):\n");
+    out.push_str(&render_alerts(alerts));
+    out.push_str("\n\n");
+    out.push_str(TRIAGE_TASK);
+    out
+}
+
+/// The triage instruction appended after the alerts (FD-13 / Q38). Demands GROUPING
+/// of related alerts, a plain-language EXPLANATION per group, and an OPTIONAL typed
+/// one-click fix per group via the `action` fence — emitted as a strict JSON array
+/// so the parse is deterministic. An empty array is the explicit "no alerts to
+/// triage" answer (the quiet, all-clear case).
+const TRIAGE_TASK: &str = "Triage the active alerts above for the operator. GROUP related alerts \
+into clusters (alerts that share a root cause belong to ONE group), EXPLAIN each cluster in plain \
+language (what is wrong, why these cluster, and what — if anything — to do), and rank the groups \
+WORST-FIRST. Return AT MOST 8 groups.\n\
+Respond with ONLY a JSON array (no prose outside it), each element:\n\
+{\"title\":\"<short headline>\",\"explanation\":\"<plain-language what+why+fix>\",\"severity\":\"high|medium\",\"alerts\":[\"<check name>\", …]}\n\
+If — and only if — a group has a SAFE concrete fix, append the SAME ```action fenced block \
+described above INSIDE that element's `explanation` string — it becomes a queued one-click \
+proposal the operator approves through the confirm gate (proposing is not executing). Omit the \
+fence for an explain-only group. Return [] when there are no alerts to triage.";
+
+/// The wire shape codex emits per triage group (the proposal lives inline in
+/// `explanation`, extracted by [`parse_triage`]).
+#[derive(serde::Deserialize)]
+struct RawAlertGroup {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    explanation: String,
+    #[serde(default = "default_impact")]
+    severity: String,
+    #[serde(default)]
+    alerts: Vec<String>,
+}
+
+/// Parse codex's triage answer into a bounded list of [`AlertGroup`]s (FD-13).
+///
+/// Tolerant (mirrors [`parse_suggestions`]): codex may wrap the array in a fence or
+/// add stray prose, so the first top-level `[ … ]` is extracted. Each group's
+/// `explanation` is run through [`extract_proposal`] — an `action`-fenced block
+/// becomes a typed FD-12 [`ActionProposal`] (gated by FD-11's allowlist; an
+/// un-allowlisted kind is dropped) and the fence is stripped from the displayed
+/// explanation. Capped at [`MAX_TRIAGE_GROUPS`]; unparseable input ⇒ empty (no
+/// panic). The proposed fix is a PROPOSAL — queued for approval, never executed (§9).
+#[must_use]
+pub fn parse_triage(answer: &str) -> Vec<AlertGroup> {
+    let Some(arr) = extract_json_array(answer) else {
+        return Vec::new();
+    };
+    let raw: Vec<RawAlertGroup> = match serde_json::from_str(&arr) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::info!(
+                target: "mackesd::copilot",
+                error = %e,
+                "alert triage did not parse as a JSON array; publishing none this round",
+            );
+            return Vec::new();
+        }
+    };
+    raw.into_iter()
+        .take(MAX_TRIAGE_GROUPS)
+        .filter_map(|g| {
+            let title = g.title.trim().to_string();
+            if title.is_empty() {
+                return None;
+            }
+            // Run the explanation through the SAME FD-12 proposal extractor a
+            // suggestion/ask uses: an `action`-fenced block becomes a typed
+            // (allowlisted) fix proposal and is stripped from the displayed prose.
+            // The proposal is queued for approval — never executed here (§9).
+            let (prose, proposal) = extract_proposal(&g.explanation);
+            let severity = match g.severity.trim().to_lowercase().as_str() {
+                "high" => "high".to_string(),
+                _ => "medium".to_string(),
+            };
+            let alerts = g
+                .alerts
+                .into_iter()
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty())
+                .collect();
+            Some(AlertGroup {
+                title,
+                explanation: prose,
+                severity,
+                alerts,
+                proposal,
+            })
+        })
+        .collect()
+}
+
 /// Outcome of one codex invocation, mapped to a reply by the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodexOutcome {
@@ -869,6 +1116,9 @@ pub struct CopilotWorker {
     /// FD-10 §2 — per-pass codex timeout for the suggestion invocation. Tests
     /// shorten it.
     suggestion_timeout: Duration,
+    /// FD-13 — moderate alert-triage cadence ([`ALERT_TRIAGE_TOPIC`]). Tests
+    /// shorten it.
+    triage_interval: Duration,
 }
 
 impl CopilotWorker {
@@ -890,6 +1140,7 @@ impl CopilotWorker {
             status_interval: DEFAULT_STATUS_INTERVAL,
             suggestion_interval: DEFAULT_SUGGESTION_INTERVAL,
             suggestion_timeout: DEFAULT_SUGGESTION_TIMEOUT,
+            triage_interval: DEFAULT_TRIAGE_INTERVAL,
         }
     }
 
@@ -949,6 +1200,13 @@ impl CopilotWorker {
     #[must_use]
     pub const fn with_suggestion_timeout(mut self, d: Duration) -> Self {
         self.suggestion_timeout = d;
+        self
+    }
+
+    /// FD-13 — override the alert-triage cadence. Tests use a shorter value.
+    #[must_use]
+    pub const fn with_triage_interval(mut self, d: Duration) -> Self {
+        self.triage_interval = d;
         self
     }
 
@@ -1244,6 +1502,162 @@ impl CopilotWorker {
             produced_at_s: now_epoch_s(),
         })
     }
+
+    // ===================== FD-13 — the alert-triage engine ==================
+
+    /// Read the live ALERTS off the datacenter health plane (FD-13), SYNCHRONOUSLY
+    /// — the latest body per `event/dc/health/*` topic, keeping only the NON-OK
+    /// checks (the alerts the GUI Alerts tile counts). The `&Persist` borrow is
+    /// fully contained here (never held across the codex `.await`). Best-effort: a
+    /// missing Bus / failed read leaves the list empty (the triage degrades to "no
+    /// alerts", never an error). Read-only — never written. Deterministically
+    /// `check`-sorted so the prompt is stable.
+    fn read_alerts(persist: &Persist) -> Vec<Alert> {
+        let topics = match persist.list_topics() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!(target: "mackesd::copilot", error = %e, "list_topics failed for alert triage");
+                return Vec::new();
+            }
+        };
+        let mut alerts: Vec<Alert> = Vec::new();
+        for topic in topics {
+            if !topic.starts_with(ALERT_TOPIC_PREFIX) {
+                continue;
+            }
+            // The latest body on the topic is the current status of that check
+            // (`dc_health` republishes on every transition); read just the newest.
+            let Ok(msgs) = persist.list_since(&topic, None) else {
+                continue;
+            };
+            let Some(body) = msgs.last().and_then(|m| m.body.clone()) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
+                continue;
+            };
+            let check = v
+                .get("check")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| topic.trim_start_matches(ALERT_TOPIC_PREFIX))
+                .trim()
+                .to_string();
+            let status = v
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            // Only NON-OK checks are alerts; an "ok"/empty check is not triaged.
+            if status.is_empty() || status == "ok" {
+                continue;
+            }
+            let detail = v
+                .get("detail")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            alerts.push(Alert {
+                check,
+                status,
+                detail,
+            });
+        }
+        alerts.sort_by(|a, b| a.check.cmp(&b.check));
+        alerts
+    }
+
+    /// Run ONE alert-triage pass (FD-13 / Q38), LEADER-ONLY. Mirrors the FD-10
+    /// suggestion phasing exactly: the `alerts` are read + the grounding + key reads
+    /// are SYNCHRONOUS in the CALLER (no `&Persist`/`&Connection` borrow crosses the
+    /// codex `.await` — `Persist` is `!Sync`, so the alerts arrive here ALREADY READ,
+    /// owned); the codex round-trip is the only async/spawning step; the caller
+    /// publishes the result. Returns the [`AlertTriage`] to publish, or `None` when
+    /// there is nothing to publish (not leader, no alerts, no key, codex unavailable,
+    /// or an empty triage). PROPOSE-ONLY: any group's fix is a typed FD-12
+    /// [`ActionProposal`] queued for approval — NEVER executed here (§9).
+    async fn generate_triage(&self, alerts: Vec<Alert>) -> Option<AlertTriage> {
+        if !self.is_leader() {
+            // Leader-only (Q73): a follower never triages, so a multi-node mesh
+            // produces one triage, not N.
+            return None;
+        }
+        if alerts.is_empty() {
+            // All-clear is the common, quiet case — publish nothing rather than an
+            // empty triage the tile would special-case (mirrors the suggestion pass).
+            tracing::debug!(
+                target: "mackesd::copilot",
+                "alert triage: no active alerts to triage this round",
+            );
+            return None;
+        }
+        let api_key = match self.read_codex_key() {
+            Ok(Some(k)) => k,
+            Ok(None) => {
+                tracing::debug!(
+                    target: "mackesd::copilot",
+                    "triage pass skipped: codex key not sealed yet (status will read offline)",
+                );
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "mackesd::copilot",
+                    error = %e,
+                    "triage pass skipped: secret-store fault",
+                );
+                return None;
+            }
+        };
+        let alert_count = alerts.len();
+        // Same bounded grounding the suggestion pass grounds with (a synchronous
+        // read — dropped before the codex `.await`).
+        let mesh_context = self.assemble_mesh_context().render();
+        let prompt = compose_triage_prompt(&mesh_context, &alerts);
+        // The FAST tier (Q87) for triage, like suggestions; the more generous
+        // suggestion timeout (a grouped round-trip is a bit longer than one ask).
+        let outcome = self
+            .invoke_codex(
+                &api_key,
+                &prompt,
+                Some(DEFAULT_SUGGESTION_MODEL),
+                self.suggestion_timeout,
+            )
+            .await;
+        let answer = match outcome {
+            CodexOutcome::Answer(a) => a,
+            CodexOutcome::Unavailable(reason) => {
+                tracing::info!(
+                    target: "mackesd::copilot",
+                    reason = %reason,
+                    "triage pass produced no groups (codex unavailable this round)",
+                );
+                return None;
+            }
+        };
+        let groups = parse_triage(&answer);
+        if groups.is_empty() {
+            tracing::debug!(
+                target: "mackesd::copilot",
+                "triage pass: codex returned no groups this round",
+            );
+            return None;
+        }
+        let fixes = groups.iter().filter(|g| g.proposal.is_some()).count();
+        tracing::info!(
+            target: "mackesd::copilot",
+            groups = groups.len(),
+            alert_count,
+            fixes,
+            "copilot published an alert triage (proposed fixes queued for operator approval; not executed)",
+        );
+        Some(AlertTriage {
+            groups,
+            alert_count,
+            produced_at_s: now_epoch_s(),
+        })
+    }
 }
 
 /// Wall-clock epoch seconds for the status/suggestion stamps. Best-effort: a clock
@@ -1312,12 +1726,18 @@ impl Worker for CopilotWorker {
         // the result is published synchronously — mirroring the ask phasing).
         let mut status_tick = tokio::time::interval(self.status_interval);
         let mut suggest_tick = tokio::time::interval(self.suggestion_interval);
-        // Burn the immediate first tick on the ask + suggestion cadences so we wait
-        // a full interval on startup. The STATUS tick is allowed to fire
+        // FD-13 — the moderate alert-triage cadence, on the same `Send` future as
+        // the ask sweep; like the suggestion pass it never holds a `&Persist` borrow
+        // across the codex `.await` (the triage codex call is awaited with NO borrow
+        // live, then the result is published synchronously).
+        let mut triage_tick = tokio::time::interval(self.triage_interval);
+        // Burn the immediate first tick on the ask + suggestion + triage cadences so
+        // we wait a full interval on startup. The STATUS tick is allowed to fire
         // immediately so the tile gets a snapshot promptly on boot (Q92 — render
         // ready/offline without waiting a full 15 s).
         tick.tick().await;
         suggest_tick.tick().await;
+        triage_tick.tick().await;
         // FD-10 §1 — last-activity stamp, set whenever Copilot acts (an ask
         // answered or a proactive pass). `None` until the first activity.
         let mut last_activity_s: Option<u64> = None;
@@ -1374,6 +1794,25 @@ impl Worker for CopilotWorker {
                     let set = self.generate_suggestions().await;
                     if let Some(set) = set {
                         publish_suggestions(&persist, &set);
+                        last_activity_s = Some(now_epoch_s());
+                    }
+                    self.publish_status(&persist, false, last_activity_s);
+                }
+                _ = triage_tick.tick() => {
+                    // FD-13 — the moderate alert-triage pass (LEADER-ONLY). The live
+                    // alerts are read synchronously, then the codex round-trip is
+                    // awaited with NO `&Persist` borrow live (the `!Sync` constraint,
+                    // mirroring the suggestion phasing); the resulting grouped triage
+                    // is published synchronously afterward. The proposed fixes are
+                    // PROPOSALS — never executed, never on FD-11's exec topic (§9).
+                    self.publish_status(&persist, true, last_activity_s);
+                    // Read the live alerts SYNCHRONOUSLY here — the `&persist` borrow
+                    // is dropped before `generate_triage`'s codex `.await` (the
+                    // `!Sync` constraint), so the alerts cross the await owned.
+                    let alerts = Self::read_alerts(&persist);
+                    let triage = self.generate_triage(alerts).await;
+                    if let Some(triage) = triage {
+                        publish_triage(&persist, &triage);
                         last_activity_s = Some(now_epoch_s());
                     }
                     self.publish_status(&persist, false, last_activity_s);
@@ -1492,6 +1931,29 @@ fn publish_suggestions(persist: &Persist, set: &SuggestionSet) {
             target: "mackesd::copilot",
             error = %e,
             "suggestions publish failed",
+        );
+    }
+}
+
+/// FD-13 (sync): publish the grouped [`AlertTriage`] on [`ALERT_TRIAGE_TOPIC`] for
+/// the Front Door's Alerts tile to render. A `state/` snapshot (latest body is the
+/// current triage), written with `Priority::Min` (a silent data topic the tile
+/// reads, not an operator notification). The triage carries PROPOSED FIXES — it is
+/// NOT FD-11's execution topic (`action/exec/request`); nothing here executes any of
+/// them; the operator must approve a fix through the confirm gate (§9). Free
+/// function so the `&Persist` borrow is unambiguously scoped to this synchronous
+/// call — never live across the codex `.await` that produced the triage.
+fn publish_triage(persist: &Persist, triage: &AlertTriage) {
+    if let Err(e) = persist.write(
+        ALERT_TRIAGE_TOPIC,
+        Priority::Min,
+        None,
+        Some(&triage.to_body()),
+    ) {
+        tracing::warn!(
+            target: "mackesd::copilot",
+            error = %e,
+            "alert triage publish failed",
         );
     }
 }
@@ -1667,7 +2129,11 @@ mod tests {
             // pass degrades to "no suggestions" here (no codex/key), so it never
             // blocks the clean exit.
             .with_status_interval(Duration::from_millis(20))
-            .with_suggestion_interval(Duration::from_millis(20));
+            .with_suggestion_interval(Duration::from_millis(20))
+            // FD-13 — exercise the triage cadence in the run loop too (short so it
+            // fires before the shutdown is observed). It degrades to "no triage"
+            // here (no codex/key/alerts), so it never blocks the clean exit.
+            .with_triage_interval(Duration::from_millis(20));
         let (tx, rx) = tokio::sync::watch::channel(false);
         let token = ShutdownToken::from_receiver(rx);
         let _ = tx.send(true);
@@ -2172,5 +2638,260 @@ mod tests {
             MAX_SUGGESTIONS <= 5,
             "high-confidence => a SMALL ranked set"
         );
+        // FD-13 — the triage cadence is moderate too (minutes, not a tight loop).
+        assert!(
+            DEFAULT_TRIAGE_INTERVAL >= Duration::from_secs(60),
+            "triage cadence must be moderate (minutes), got {DEFAULT_TRIAGE_INTERVAL:?}"
+        );
+    }
+
+    // ===================== FD-13 — alert triage =====================
+
+    #[test]
+    fn triage_topic_is_state_namespaced_and_not_the_exec_topic() {
+        // §9 backstop: the triage is a STATE snapshot the tile reads, NEVER FD-11's
+        // execution topic — no path from a triage to execution without operator
+        // approval through the confirm gate.
+        assert_eq!(ALERT_TRIAGE_TOPIC, "state/copilot/alert-triage");
+        assert!(ALERT_TRIAGE_TOPIC.starts_with("state/"));
+        assert_ne!(ALERT_TRIAGE_TOPIC, crate::workers::action::ACTION_TOPIC);
+    }
+
+    #[test]
+    fn render_alerts_lists_status_detail_and_bounds() {
+        let alerts: Vec<Alert> = (0..30)
+            .map(|i| Alert {
+                check: format!("check{i}"),
+                status: if i % 2 == 0 { "fail" } else { "warn" }.into(),
+                detail: format!("detail{i}"),
+            })
+            .collect();
+        let s = render_alerts(&alerts);
+        assert!(s.contains("check0 [fail]: detail0"));
+        assert!(s.contains("check1 [warn]: detail1"));
+        // Bounded: only MAX_ALERTS_IN_TRIAGE named, the rest summarized.
+        assert!(
+            s.contains(&format!("(+{} more alerts)", 30 - MAX_ALERTS_IN_TRIAGE)),
+            "overflow summarized, not dumped: {s}"
+        );
+    }
+
+    #[test]
+    fn render_alerts_omits_detail_when_empty() {
+        let s = render_alerts(&[Alert {
+            check: "etcd".into(),
+            status: "fail".into(),
+            detail: String::new(),
+        }]);
+        assert_eq!(s, "- etcd [fail]");
+    }
+
+    #[test]
+    fn triage_prompt_grounds_lists_alerts_and_teaches_the_proposal_protocol() {
+        let alerts = [Alert {
+            check: "mfsmaster".into(),
+            status: "fail".into(),
+            detail: "process down on oak".into(),
+        }];
+        let p = compose_triage_prompt("Leader: peer:oak\nNodes: oak[host,degraded]", &alerts);
+        // Grounded with the live mesh state.
+        assert!(p.contains("Live mesh state:"));
+        assert!(p.contains("oak[host,degraded]"));
+        // Lists the active alerts.
+        assert!(p.contains("Active alerts"));
+        assert!(p.contains("mfsmaster [fail]: process down on oak"));
+        // Demands grouping + explanation + worst-first, with an empty-OK.
+        assert!(p.contains("GROUP"));
+        assert!(p.contains("EXPLAIN"));
+        assert!(p.contains("Return []"));
+        // The §9 proposal protocol is taught (reused from the system context).
+        assert!(p.contains("```action"));
+        assert!(p.contains("service_lifecycle"));
+    }
+
+    #[test]
+    fn parse_triage_pulls_groups_with_alerts_and_severity() {
+        let answer = "Here is the triage:\n```json\n[\
+            {\"title\":\"MeshFS master down\",\"explanation\":\"mfsmaster is not running on oak\",\
+             \"severity\":\"high\",\"alerts\":[\"mfsmaster\",\"meshfs-mount\"]},\
+            {\"title\":\"cert expiring\",\"explanation\":\"the CA cert warns soon\",\
+             \"severity\":\"medium\",\"alerts\":[\"ca-cert\"]}\
+            ]\n```\nthat's all";
+        let got = parse_triage(answer);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].title, "MeshFS master down");
+        assert_eq!(got[0].severity, "high");
+        assert_eq!(got[0].alerts, vec!["mfsmaster", "meshfs-mount"]);
+        assert!(got[0].proposal.is_none(), "explain-only group");
+        assert_eq!(got[1].severity, "medium");
+    }
+
+    #[test]
+    fn parse_triage_extracts_typed_fix_proposal_inline() {
+        // A group whose `explanation` carries an `action`-fenced block becomes a
+        // typed FD-12 proposal (gated by FD-11's allowlist), stripped from the
+        // displayed explanation — the SAME path an ask/suggestion uses. Queued,
+        // never executed (§9).
+        let answer = "[{\"title\":\"mfsmaster wedged\",\"explanation\":\"restart it on oak.\\n\
+            ```action\\n\
+            {\\\"kind\\\":\\\"service_lifecycle\\\",\\\"target_host\\\":\\\"oak\\\",\
+            \\\"service_kind\\\":\\\"container\\\",\\\"name\\\":\\\"mfsmaster\\\",\\\"op\\\":\\\"restart\\\"}\\n\
+            ```\",\"severity\":\"high\",\"alerts\":[\"mfsmaster\"]}]";
+        let got = parse_triage(answer);
+        assert_eq!(got.len(), 1);
+        let g = &got[0];
+        assert!(
+            !g.explanation.contains("```"),
+            "fence stripped from explanation: {:?}",
+            g.explanation
+        );
+        let p = g
+            .proposal
+            .as_ref()
+            .expect("a typed fix proposal was extracted");
+        assert_eq!(p.action.kind_tag(), "service_lifecycle");
+    }
+
+    #[test]
+    fn parse_triage_drops_un_allowlisted_fix_keeps_explanation() {
+        // §9: an un-allowlisted action in a triage group is dropped (the operator
+        // still gets the explanation), never proposed.
+        let answer = "[{\"title\":\"danger\",\"explanation\":\"wipe it.\\n\
+            ```action\\n{\\\"kind\\\":\\\"raw_shell\\\",\\\"cmd\\\":\\\"rm -rf /\\\"}\\n```\",\
+            \"severity\":\"high\",\"alerts\":[\"disk\"]}]";
+        let got = parse_triage(answer);
+        assert_eq!(got.len(), 1);
+        assert!(
+            got[0].proposal.is_none(),
+            "un-allowlisted kind must not be proposed"
+        );
+        assert!(got[0].explanation.contains("wipe it"));
+    }
+
+    #[test]
+    fn parse_triage_caps_and_tolerates_garbage() {
+        let items: Vec<String> = (0..20)
+            .map(|i| format!("{{\"title\":\"g{i}\",\"explanation\":\"e\",\"severity\":\"high\"}}"))
+            .collect();
+        let answer = format!("[{}]", items.join(","));
+        assert_eq!(parse_triage(&answer).len(), MAX_TRIAGE_GROUPS);
+        assert!(parse_triage("not json").is_empty());
+        assert!(parse_triage("[]").is_empty());
+        assert!(parse_triage("{\"title\":\"x\"}").is_empty());
+    }
+
+    #[test]
+    fn triage_body_round_trips() {
+        let triage = AlertTriage {
+            groups: vec![AlertGroup {
+                title: "t".into(),
+                explanation: "e".into(),
+                severity: "high".into(),
+                alerts: vec!["a".into()],
+                proposal: None,
+            }],
+            alert_count: 3,
+            produced_at_s: 1_700_000_000,
+        };
+        let body = triage.to_body();
+        let back: AlertTriage = serde_json::from_str(&body).expect("round-trip");
+        assert_eq!(back, triage);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["groups"][0]["title"], "t");
+        assert_eq!(v["alert_count"], 3);
+    }
+
+    #[test]
+    fn read_alerts_keeps_only_non_ok_health_checks() {
+        // FD-13 end-to-end (the read half): seed the health plane with ok + non-ok
+        // checks, then read — proves the triage consumes REAL alerts (§7), not a
+        // placeholder, and drops the ok ones.
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().join("bus")).expect("persist open");
+        let mk = |check: &str, status: &str, detail: &str| {
+            serde_json::json!({"check": check, "status": status, "detail": detail}).to_string()
+        };
+        persist
+            .write(
+                "event/dc/health/etcd",
+                Priority::Default,
+                None,
+                Some(&mk("etcd", "ok", "")),
+            )
+            .unwrap();
+        persist
+            .write(
+                "event/dc/health/mfsmaster",
+                Priority::Default,
+                None,
+                Some(&mk("mfsmaster", "fail", "down on oak")),
+            )
+            .unwrap();
+        persist
+            .write(
+                "event/dc/health/disk",
+                Priority::Default,
+                None,
+                Some(&mk("disk", "warn", "/ at 90%")),
+            )
+            .unwrap();
+        let alerts = CopilotWorker::read_alerts(&persist);
+        assert_eq!(alerts.len(), 2, "the ok check is not an alert");
+        // check-sorted: disk before mfsmaster.
+        assert_eq!(alerts[0].check, "disk");
+        assert_eq!(alerts[0].status, "warn");
+        assert_eq!(alerts[1].check, "mfsmaster");
+        assert_eq!(alerts[1].detail, "down on oak");
+    }
+
+    #[test]
+    fn read_alerts_empty_when_plane_quiet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().join("bus")).expect("persist open");
+        assert!(CopilotWorker::read_alerts(&persist).is_empty());
+    }
+
+    #[tokio::test]
+    async fn generate_triage_none_when_not_leader() {
+        // Leader-only (Q73): on a bare tempdir no lock can be taken, so a fresh
+        // worker is never leader → no triage pass, no codex spawn (even with alerts).
+        let tmp = tempfile::tempdir().unwrap();
+        let w = CopilotWorker::new(tmp.path().to_path_buf(), "n1".into())
+            .with_db_path(tmp.path().join("audit.db"))
+            .with_codex_bin("definitely-not-a-real-codex-binary-xyz");
+        let alerts = vec![Alert {
+            check: "etcd".into(),
+            status: "fail".into(),
+            detail: "down".into(),
+        }];
+        assert!(
+            w.generate_triage(alerts).await.is_none(),
+            "a non-leader publishes no triage"
+        );
+    }
+
+    #[test]
+    fn triage_published_on_the_bus_is_readable() {
+        // End-to-end (the publish half): the worker publishes a triage the Front
+        // Door's Alerts tile can read back off ALERT_TRIAGE_TOPIC.
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().join("bus")).expect("persist open");
+        let triage = AlertTriage {
+            groups: vec![AlertGroup {
+                title: "g".into(),
+                explanation: "e".into(),
+                severity: "high".into(),
+                alerts: vec!["etcd".into()],
+                proposal: None,
+            }],
+            alert_count: 1,
+            produced_at_s: 7,
+        };
+        publish_triage(&persist, &triage);
+        let msgs = persist.list_since(ALERT_TRIAGE_TOPIC, None).expect("list");
+        assert_eq!(msgs.len(), 1, "exactly one triage published");
+        let body = msgs[0].body.clone().expect("triage body");
+        let back: AlertTriage = serde_json::from_str(&body).expect("parse triage");
+        assert_eq!(back, triage);
     }
 }

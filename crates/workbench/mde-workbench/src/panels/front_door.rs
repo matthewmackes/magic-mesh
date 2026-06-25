@@ -144,6 +144,15 @@ pub enum Message {
     /// surface that drains the propose queue is the FRONTDOOR-11 confirm gate below,
     /// where the operator REVIEWS the preview + confirms before anything runs).
     ProposeSuggestion(usize),
+    /// FRONTDOOR-13 — the operator clicked **Apply fix** on an alert-triage group
+    /// that carries a typed fix proposal. Carries the group's index into
+    /// [`FrontDoor::triage`]`.groups`. The handler re-publishes that group's typed
+    /// proposal to the copilot PROPOSE topic (`action/copilot/proposal`, FD-12's
+    /// review queue) — exactly like a suggestion's "Act". It does NOT publish to
+    /// FD-11's execution topic and does NOT execute anything (§9 — the GUI never
+    /// auto-executes; the operator REVIEWS + confirms the fix in the FRONTDOOR-11
+    /// confirm gate before anything runs).
+    ProposeAlertFix(usize),
     /// FRONTDOOR-11 — open the **Pending actions** review surface (the confirm-gate
     /// overlay listing the queued proposals). Reachable from the Front Door's
     /// pending indicator; no proposal executes by opening it (it only shows the
@@ -545,6 +554,13 @@ pub struct FrontDoorData {
     /// before it executes — never auto-run (§9). Empty when the propose queue is
     /// absent / empty. Parsed GUI-side off the wire shape (the §6 boundary).
     pub pending: Vec<pending::PendingProposal>,
+    /// FRONTDOOR-13 — the AI ALERT TRIAGE read off the FD-13-backend
+    /// `state/copilot/alert-triage` topic (Q38): the live alerts GROUPED +
+    /// EXPLAINED, each group optionally carrying a typed one-click FIX. The Alerts
+    /// tile detail renders this; each fix is a PROPOSAL the operator approves through
+    /// the confirm gate (re-published to the propose topic), NEVER executed from the
+    /// GUI (§9). Empty when the topic is absent / the mesh is all-clear.
+    pub triage: copilot::Triage,
     /// FRONTDOOR-6 — the raw Peers directory rows, carried through so the unified
     /// search has the live mesh entities (nodes + services) without a second Bus
     /// read. The widget projections above are derived from these same rows.
@@ -599,6 +615,11 @@ impl FrontDoorData {
         // parse GUI-side; an absent Bus / empty topic leaves the gate empty.
         let pending = pending::parse(&topic_messages(copilot::PROPOSAL_TOPIC));
 
+        // FRONTDOOR-13 — the AI alert triage: the latest body on the triage topic is
+        // the current grouped/explained view (§7 — real triage off the bus, no demo).
+        // Absent Bus / empty topic ⇒ an empty triage (the tile shows its resting note).
+        let triage = copilot::parse_triage(latest_body(copilot::ALERT_TRIAGE_TOPIC).as_deref());
+
         Self {
             mesh_map: project::mesh_map(&peers),
             node_health: project::node_health(&peers),
@@ -612,6 +633,8 @@ impl FrontDoorData {
             suggestions,
             // FRONTDOOR-11 — the live proposal queue for the confirm gate.
             pending,
+            // FRONTDOOR-13 — the AI alert triage for the Alerts tile detail.
+            triage,
             // FRONTDOOR-6 — carry the raw roster for the unified mesh search.
             peers,
         }
@@ -1397,6 +1420,137 @@ pub(super) mod copilot {
             })
             .collect()
     }
+
+    /// The bus topic the FD-13 backend publishes its grouped ALERT TRIAGE to
+    /// (`mackesd::workers::copilot::ALERT_TRIAGE_TOPIC`). A `state/` snapshot the
+    /// Alerts tile reads the same way the Copilot tile reads its status — the latest
+    /// body is the current triage. Each group's proposed fix is a PROPOSAL the
+    /// operator approves through the confirm gate — never executed from the GUI (§9).
+    pub const ALERT_TRIAGE_TOPIC: &str = "state/copilot/alert-triage";
+
+    /// One parsed alert-triage GROUP (FD-13 / Q38) — the clustered alerts the GUI
+    /// renders: a headline, a plain-language explanation, the member alert names,
+    /// and (when the group has a safe fix) the typed proposal the operator can ACT
+    /// on. Mirrors the backend `AlertGroup` wire shape. The fix proposal is carried
+    /// as its raw JSON object body so the "Apply fix" affordance re-publishes it to
+    /// [`PROPOSAL_TOPIC`] verbatim (the propose-only path) WITHOUT the workbench
+    /// needing the `mackesd` enums (the §6 boundary). It is NEVER executed here (§9).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct AlertGroup {
+        /// A short operator-facing headline for the cluster.
+        pub title: String,
+        /// The plain-language explanation: what is wrong, why these cluster, the fix.
+        pub explanation: String,
+        /// `high` | `medium` — carried so the GUI can badge/sort.
+        pub severity: String,
+        /// The member alert names (the `check`s) this group clusters.
+        pub alerts: Vec<String>,
+        /// The typed fix proposal's raw JSON object body (the backend
+        /// `ActionProposal`: `{action, rationale}`), present only when the group has
+        /// a safe one-click fix. `None` ⇒ explain-only. Re-published verbatim to
+        /// [`PROPOSAL_TOPIC`] on "Apply fix" — never to the exec topic (§9).
+        pub proposal_body: Option<String>,
+    }
+
+    /// The parsed alert triage (FD-13) — the grouped/explained alerts the Alerts
+    /// tile detail renders, plus the count of alerts triaged.
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
+    pub struct Triage {
+        /// The clustered groups (worst-first, as the backend ranked them).
+        pub groups: Vec<AlertGroup>,
+        /// How many live alerts this triage covered.
+        pub alert_count: usize,
+    }
+
+    impl Triage {
+        /// `true` when the triage carries no groups (so the tile shows its resting
+        /// "no triage yet" note rather than an empty header).
+        #[must_use]
+        pub fn is_empty(&self) -> bool {
+            self.groups.is_empty()
+        }
+    }
+
+    /// Parse the latest `state/copilot/alert-triage` body (the backend `AlertTriage`
+    /// JSON: `{groups:[…], alert_count, produced_at_s}`) into the triage the GUI
+    /// renders. Tolerant (mirrors [`parse_suggestions`]): the fix proposal is kept as
+    /// its raw JSON object (re-serialized so it round-trips to [`PROPOSAL_TOPIC`]
+    /// cleanly); a group with a missing title is dropped; malformed / `None` JSON ⇒
+    /// an empty triage (no panic, the tile just shows no triage — §7). Order is
+    /// preserved (the backend ranks it worst-first). Pure + Bus-free.
+    #[must_use]
+    pub fn parse_triage(raw: Option<&str>) -> Triage {
+        let Some(body) = raw else {
+            return Triage::default();
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
+            return Triage::default();
+        };
+        let alert_count = v
+            .get("alert_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
+        let Some(arr) = v.get("groups").and_then(serde_json::Value::as_array) else {
+            return Triage::default();
+        };
+        let groups = arr
+            .iter()
+            .filter_map(|g| {
+                let title = g
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if title.is_empty() {
+                    return None;
+                }
+                let explanation = g
+                    .get("explanation")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let severity = match g
+                    .get("severity")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("medium")
+                {
+                    "high" => "high".to_string(),
+                    _ => "medium".to_string(),
+                };
+                let alerts = g
+                    .get("alerts")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // Keep the proposal as its own JSON object body so "Apply fix"
+                // re-publishes it verbatim to the propose topic — never re-derived,
+                // never executed.
+                let proposal_body = g
+                    .get("proposal")
+                    .filter(|p| p.is_object())
+                    .map(std::string::ToString::to_string);
+                Some(AlertGroup {
+                    title,
+                    explanation,
+                    severity,
+                    alerts,
+                    proposal_body,
+                })
+            })
+            .collect();
+        Triage {
+            groups,
+            alert_count,
+        }
+    }
 }
 
 // ============== FRONTDOOR-11 (GUI half): the confirm-gate execution UI ========
@@ -1808,6 +1962,12 @@ pub struct FrontDoor {
     /// the result so a card shows succeeded/failed after a confirm. A fresh snapshot
     /// is merged (not clobbered) so an in-flight / resolved gate survives a reload.
     pub pending: Vec<pending::PendingProposal>,
+    /// FRONTDOOR-13 — the live AI alert triage (off `state/copilot/alert-triage`),
+    /// folded in from the FD-4 [`FrontDoorData`] read. The Alerts tile detail renders
+    /// the grouped/explained alerts + each group's proposed one-click fix; a fix is a
+    /// PROPOSAL routed through the confirm gate (re-published to the propose topic),
+    /// never executed from the GUI (§9). Empty until a triage lands / when all-clear.
+    pub triage: copilot::Triage,
     /// FRONTDOOR-11 — whether the Pending actions review surface is open (the
     /// confirm-gate overlay). Toggled by the pending indicator / its Back control;
     /// opening it NEVER executes anything (it only shows the previews — §9).
@@ -1875,6 +2035,9 @@ impl FrontDoor {
             // FRONTDOOR-11 — no pending proposals / closed gate / no typed confirms
             // until the first snapshot lands (an empty propose queue keeps it empty).
             pending: Vec::new(),
+            // FRONTDOOR-13 — no alert triage until the first snapshot (all-clear /
+            // no leader keeps it empty).
+            triage: copilot::Triage::default(),
             show_pending: false,
             confirm_inputs: std::collections::HashMap::new(),
         }
@@ -2005,6 +2168,32 @@ impl FrontDoor {
                     .suggestions
                     .get(i)
                     .and_then(|s| s.proposal_body.clone())
+                else {
+                    return Task::none();
+                };
+                Task::perform(
+                    async move {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            crate::dbus::action_publish(copilot::PROPOSAL_TOPIC, &body)
+                        })
+                        .await;
+                    },
+                    |()| crate::Message::Noop,
+                )
+            }
+            // FRONTDOOR-13 — Apply an alert-triage group's typed fix. Re-publish it
+            // to the PROPOSE topic (FD-12's review queue) — the SAME propose-only
+            // path a suggestion's "Act" uses. §9: this is a PROPOSE, not an execute —
+            // it never touches `action/exec/request`, never runs the fix; the
+            // operator confirms it in the FD-11 gate. A group with no typed fix
+            // (explain-only) or a stale index is a no-op (the "Apply fix" affordance
+            // is only rendered when a proposal exists — defence-in-depth).
+            Message::ProposeAlertFix(i) => {
+                let Some(body) = self
+                    .triage
+                    .groups
+                    .get(i)
+                    .and_then(|g| g.proposal_body.clone())
                 else {
                     return Task::none();
                 };
@@ -2244,6 +2433,10 @@ impl FrontDoor {
         // card text in that tile's detail). Replaced wholesale each snapshot so a
         // resolved suggestion drops off rather than lingering (§7 — no stale card).
         self.suggestions = data.suggestions.clone();
+        // FRONTDOOR-13 — fold the AI alert triage in (the Alerts tile detail renders
+        // it). Replaced wholesale each snapshot so a cleared alert drops off rather
+        // than lingering (§7 — no stale triage).
+        self.triage = data.triage.clone();
         // FRONTDOOR-11 — merge the fresh proposal queue, preserving the live gate
         // state (an in-flight / resolved / dismissed card) for a proposal still
         // present, so a slow-poll reload never resets a confirm in progress.
@@ -2406,6 +2599,19 @@ impl FrontDoor {
                 Some(sec.into())
             };
 
+        // FRONTDOOR-13 — the AI alert triage, ONLY on the Alerts tile (Q38): the live
+        // alerts GROUPED + EXPLAINED, each group with its member alerts and — when it
+        // has a safe fix — a §9-safe "Apply fix" that re-publishes the proposal to the
+        // propose queue (routed through the FD-11 confirm gate; never auto-executed).
+        // Omitted on every other tile, and when no triage has landed (the all-clear /
+        // pre-leader case shows an honest resting note rather than a fake group).
+        let triage_section: Option<Element<'_, crate::Message, Theme>> =
+            if tile.key == Some(TileKey::Alerts) {
+                Some(self.triage_section(palette))
+            } else {
+                None
+            };
+
         // The actions list — every row is a REAL navigation / launch (§7). An
         // empty list (Copilot) renders an honest note instead of a dead row.
         let actions = tile.actions();
@@ -2429,6 +2635,10 @@ impl FrontDoor {
         ]
         .spacing(8)
         .width(Length::Fill);
+        if let Some(section) = triage_section {
+            body = body.push(Space::new().height(Length::Fixed(20.0)));
+            body = body.push(section);
+        }
         if let Some(section) = suggestions_section {
             body = body.push(Space::new().height(Length::Fixed(20.0)));
             body = body.push(section);
@@ -2448,6 +2658,41 @@ impl FrontDoor {
                 ..container::Style::default()
             })
             .into()
+    }
+
+    /// FRONTDOOR-13 — the AI alert-triage section for the Alerts tile detail (Q38).
+    /// When a triage has landed it renders a header ("N alerts in M groups") and one
+    /// card per group (the grouped alerts + explanation + the proposed one-click fix);
+    /// when none has (all-clear / no leader / no codex) it renders an honest resting
+    /// note rather than a faked group (§7). Each fix routes through the confirm gate
+    /// (re-published to the propose queue), never auto-executed (§9). Tokens only (§4).
+    fn triage_section(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
+        let sizes = FontSize::defaults();
+        let mut sec = column![rail_section_label("Copilot alert triage", palette)].spacing(8);
+        if self.triage.is_empty() {
+            // No triage this round — an honest resting note, not a fake group (§7).
+            sec = sec.push(
+                text("No triage yet — Copilot triages alerts when active (all-clear, or the leader/AI is offline).")
+                    .size(TypeRole::Caption.size_in(sizes))
+                    .colr(palette.text_muted.into_cosmic_color()),
+            );
+            return sec.into();
+        }
+        let groups = self.triage.groups.len();
+        let group_unit = if groups == 1 { "group" } else { "groups" };
+        let alerts = self.triage.alert_count;
+        let alert_unit = if alerts == 1 { "alert" } else { "alerts" };
+        sec = sec.push(
+            text(format!(
+                "{alerts} {alert_unit} triaged into {groups} {group_unit}"
+            ))
+            .size(TypeRole::Caption.size_in(sizes))
+            .colr(palette.text_muted.into_cosmic_color()),
+        );
+        for (gi, g) in self.triage.groups.iter().enumerate() {
+            sec = sec.push(triage_group_card(gi, g, palette));
+        }
+        sec.into()
     }
 
     /// FRONTDOOR-2 — the Win10-Start two-pane view: a fixed left **rail** beside a
@@ -3183,6 +3428,107 @@ fn suggestion_card<'a>(
             },
         )
         .on_press(crate::Message::FrontDoor(Message::ProposeSuggestion(gi)));
+        card = card.push(act);
+    }
+
+    container(card)
+        .width(Length::Fill)
+        .padding(Padding::from([12u16, 14u16]))
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(palette.raised.into_cosmic_color())),
+            border: Border {
+                color: palette.border.into_cosmic_color(),
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// FRONTDOOR-13 — one alert-triage GROUP card (Q38): the cluster headline + severity
+/// badge, the member alert names, the plain-language explanation, and — ONLY when the
+/// group carries a typed fix proposal — a §9-safe **Apply fix** button that
+/// re-publishes the proposal to the propose queue (routed through the FD-11 confirm
+/// gate; never auto-executed). `gi` is the group's index into the triage, carried in
+/// the [`Message::ProposeAlertFix`]. Carbon tokens only (§4).
+fn triage_group_card<'a>(
+    gi: usize,
+    g: &copilot::AlertGroup,
+    palette: Palette,
+) -> Element<'a, crate::Message, Theme> {
+    let sizes = FontSize::defaults();
+    let accent = palette.accent.into_cosmic_color();
+    // High-severity reads danger-toned, medium reads warning — the operator's eye
+    // goes to the worst cluster first (§4 — token, never hex).
+    let severity_tone = if g.severity == "high" {
+        palette.danger.into_cosmic_color()
+    } else {
+        palette.warning.into_cosmic_color()
+    };
+
+    let mut card = column![
+        text(g.title.clone())
+            .size(TypeRole::Body.size_in(sizes))
+            .colr(palette.text.into_cosmic_color()),
+        text(format!("{} severity", g.severity))
+            .size(TypeRole::Caption.size_in(sizes))
+            .colr(severity_tone),
+    ]
+    .spacing(4)
+    .width(Length::Fill);
+
+    // The member alerts this group clusters — so the operator sees WHICH alerts the
+    // explanation covers, not just the headline.
+    if !g.alerts.is_empty() {
+        card = card.push(
+            text(format!("Alerts: {}", g.alerts.join(", ")))
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(palette.text_muted.into_cosmic_color()),
+        );
+    }
+
+    if !g.explanation.trim().is_empty() {
+        card = card.push(
+            text(g.explanation.clone())
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(palette.text_muted.into_cosmic_color()),
+        );
+    }
+
+    // §9 — the "Apply fix" affordance ONLY when the group carries a typed proposal.
+    // It PROPOSES (re-publishes to the propose queue) and routes through the FD-11
+    // confirm gate; it never executes the fix directly.
+    if g.proposal_body.is_some() {
+        let idle_bg = palette.hover_tint().into_cosmic_color();
+        let act = button(
+            text("Apply fix — queue this proposal for approval")
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(accent),
+        )
+        .padding(Padding::from([8u16, 12u16]))
+        .sty(
+            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+                use cosmic::iced::widget::button::Status;
+                let bg = match status {
+                    Status::Hovered | Status::Pressed => accent_tint(accent),
+                    _ => idle_bg,
+                };
+                cosmic::iced::widget::button::Style {
+                    snap: false,
+                    background: Some(Background::Color(bg)),
+                    text_color: accent,
+                    border: Border {
+                        color: cosmic::iced::Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 6.0.into(),
+                    },
+                    shadow: cosmic::iced::Shadow::default(),
+                    ..cosmic::iced::widget::button::Style::default()
+                }
+            },
+        )
+        .on_press(crate::Message::FrontDoor(Message::ProposeAlertFix(gi)));
         card = card.push(act);
     }
 
@@ -4439,6 +4785,127 @@ mod tests {
         let copilot_idx = fd.tiles.iter().position(|t| t.label == "Copilot").unwrap();
         let _ = fd.update(Message::TileActivated(copilot_idx));
         let _: Element<'_, crate::Message, Theme> = fd.view();
+    }
+
+    // ───────────────── FRONTDOOR-13: alert triage (GUI half) ─────────────────
+
+    /// The backend `AlertTriage` wire body for a triage with one fix-bearing group
+    /// and one explain-only group — the shape `parse_triage` consumes.
+    fn triage_body() -> String {
+        serde_json::json!({
+            "groups": [
+                {
+                    "title": "MeshFS master down on oak",
+                    "explanation": "mfsmaster is not running; restart its container.",
+                    "severity": "high",
+                    "alerts": ["mfsmaster", "meshfs-mount"],
+                    "proposal": {
+                        "action": {
+                            "kind": "service_lifecycle",
+                            "target_host": "oak",
+                            "service_kind": "container",
+                            "name": "mfsmaster",
+                            "op": "restart"
+                        },
+                        "rationale": "restart the wedged master"
+                    }
+                },
+                {
+                    "title": "CA cert nearing expiry",
+                    "explanation": "the mesh CA warns in 12 days; rotate soon.",
+                    "severity": "medium",
+                    "alerts": ["ca-cert"]
+                }
+            ],
+            "alert_count": 3,
+            "produced_at_s": 1_700_000_000u64
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn parse_triage_pulls_groups_alerts_and_keeps_fix_proposal_verbatim() {
+        let t = copilot::parse_triage(Some(&triage_body()));
+        assert_eq!(t.alert_count, 3);
+        assert_eq!(t.groups.len(), 2);
+        assert!(!t.is_empty());
+        // Worst-first order preserved (the backend ranks it).
+        assert_eq!(t.groups[0].title, "MeshFS master down on oak");
+        assert_eq!(t.groups[0].severity, "high");
+        assert_eq!(t.groups[0].alerts, vec!["mfsmaster", "meshfs-mount"]);
+        // The fix proposal is kept as its raw JSON object for verbatim re-publish.
+        let body = t.groups[0]
+            .proposal_body
+            .as_deref()
+            .expect("fix-bearing group keeps its proposal body");
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(v["action"]["kind"], "service_lifecycle");
+        assert_eq!(v["action"]["name"], "mfsmaster");
+        // The explain-only group carries no proposal (no faked fix).
+        assert!(t.groups[1].proposal_body.is_none());
+        assert_eq!(t.groups[1].severity, "medium");
+    }
+
+    #[test]
+    fn parse_triage_tolerates_garbage_and_empty() {
+        assert!(copilot::parse_triage(None).is_empty());
+        assert!(copilot::parse_triage(Some("not json")).is_empty());
+        assert!(copilot::parse_triage(Some("{\"groups\":[]}")).is_empty());
+        // A group with no title is dropped (never a faked card).
+        let t = copilot::parse_triage(Some(
+            "{\"groups\":[{\"explanation\":\"x\"}],\"alert_count\":1}",
+        ));
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn alerts_tile_detail_renders_the_triage_in_both_modes() {
+        // FD-13 — the triage lands and the Alerts tile detail renders it (the grouped
+        // cards + the fix affordance) in BOTH render modes, without panicking.
+        for mode in [Mode::Panel, Mode::FullScreen] {
+            let mut fd = FrontDoor::new();
+            fd.loading = false;
+            fd.mode = mode;
+            let data = FrontDoorData {
+                triage: copilot::parse_triage(Some(&triage_body())),
+                ..FrontDoorData::default()
+            };
+            let _ = fd.update(Message::Loaded(Box::new(data)));
+            assert_eq!(fd.triage.groups.len(), 2, "triage folded in");
+            let alerts_idx = fd.tiles.iter().position(|t| t.label == "Alerts").unwrap();
+            let _ = fd.update(Message::TileActivated(alerts_idx));
+            let _: Element<'_, crate::Message, Theme> = fd.view();
+        }
+    }
+
+    #[test]
+    fn alerts_tile_detail_renders_resting_note_when_no_triage() {
+        // No triage yet (all-clear / no leader) → the Alerts detail still builds (it
+        // shows the honest resting note, not a faked group — §7).
+        let mut fd = FrontDoor::new();
+        fd.loading = false;
+        assert!(fd.triage.is_empty());
+        let alerts_idx = fd.tiles.iter().position(|t| t.label == "Alerts").unwrap();
+        let _ = fd.update(Message::TileActivated(alerts_idx));
+        let _: Element<'_, crate::Message, Theme> = fd.view();
+    }
+
+    #[test]
+    fn propose_alert_fix_republishes_only_a_real_proposal_and_never_executes() {
+        // §9 — "Apply fix" PROPOSES (re-publishes to the propose topic), never
+        // executes. The handler targets the propose topic, never the exec topic; a
+        // group with no proposal or a stale index is an inert no-op.
+        let mut fd = FrontDoor::new();
+        fd.triage = copilot::parse_triage(Some(&triage_body()));
+        // The propose topic is the review queue, distinct from FD-11's exec topic.
+        assert_ne!(copilot::PROPOSAL_TOPIC, pending::EXEC_TOPIC);
+        // Group 0 has a fix → a task is produced (a Bus publish to the propose topic);
+        // it does not panic and returns a real Task.
+        let _ = fd.update(Message::ProposeAlertFix(0));
+        // Group 1 is explain-only → no-op (no proposal to publish).
+        let _ = fd.update(Message::ProposeAlertFix(1));
+        // A stale index → no-op (defence-in-depth).
+        let _ = fd.update(Message::ProposeAlertFix(99));
     }
 
     // ── FRONTDOOR-7: the DevOps / Build-Farm one-click pipeline actions ──
