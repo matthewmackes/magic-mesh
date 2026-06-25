@@ -93,16 +93,6 @@ pub fn parse_directory_leader(reply: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Fetch the current mesh leader's hostname over the Bus. `None` on daemon-down
-/// / no live leader. Blocking — same contract as [`fetch_peers`].
-#[must_use]
-pub fn fetch_leader() -> Option<String> {
-    parse_directory_leader(&crate::dbus::action_request(
-        "action/mesh/directory",
-        DIRECTORY_TIMEOUT,
-    )?)
-}
-
 /// Fetch peers + leader in one directory round-trip (the panels that render both
 /// — lighthouses, the notify-center footer — want a single RPC, not two).
 #[must_use]
