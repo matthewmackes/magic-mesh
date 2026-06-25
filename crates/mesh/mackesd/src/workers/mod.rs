@@ -238,6 +238,13 @@ pub mod selinux_monitor;
 // `compute/inventory/<peer-nebula-addr>` per docs/design/v5.0.0-
 // compute.md §3. Silent no-op when virsh/podman are absent.
 pub mod compute_registry;
+// MEDIA-7 — the media_registry worker: on a Lighthouse_Media node only
+// (capability-gated on MEDIA-1's Capability::Media), register the local
+// navidrome/media instance into the mesh service registry — the per-peer
+// Bus topic `mesh/services/media/<peer>` + the replicated QNM-Shared plane
+// `<host>/media-registry.json` (same registry plane the other published
+// services use) — with a per-instance health field.
+pub mod media_registry;
 // APPS-LIVE-1 — the apps_running worker: mirror this node's set of
 // currently-running launchable apps to <QNM-Shared>/<host>/running-
 // apps.json so the launcher can badge every entry "running on <host>"
