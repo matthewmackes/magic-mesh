@@ -105,6 +105,10 @@ secret_access_key = $DO_SPACES_SECRET
 endpoint = $DO_SPACES_ENDPOINT
 region = $DO_SPACES_REGION
 acl = private
+# A bucket-scoped (readwrite) key cannot CreateBucket; without this, rclone's
+# default bucket-existence precheck 403s on any write (uploads/MEDIA-9). The
+# bucket is provisioned out-of-band (MEDIA-2), so skip the check.
+no_check_bucket = true
 EOF
 chmod 600 "$RCLONE_CONF"
 umask 022

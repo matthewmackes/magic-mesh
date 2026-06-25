@@ -49,14 +49,19 @@ case "$cmd" in
     ;;
   get)
     [ -n "${2:-}" ] || { echo "usage: get <name>" >&2; exit 2; }
-    # Fetch the ciphertext FIRST (not piped straight into age) so the two
-    # outcomes stay distinguishable by exit code: a genuinely ABSENT secret
-    # exits 3 (from `_get`), while a real fault (etcd unreachable, decrypt
-    # failure) exits non-zero-and-not-3. Piping `_get | age -d` collapsed both
-    # into the same non-zero exit, so callers could not tell "not stored yet"
-    # from "store is broken". `set -e` propagates `_get`'s exit 3 here.
-    ct="$(_get "/mcnf/secret/$2")"
-    printf %s "$ct" | age -d -i "$KEY"
+    # Fetch the ciphertext to a temp FILE first — age ciphertext is BINARY, and a
+    # `$(...)` capture strips NUL bytes and corrupts it ("ignored null byte in
+    # input" → decrypt failure). The file route stays binary-safe AND keeps the
+    # two outcomes distinguishable by exit code: a genuinely ABSENT secret makes
+    # `_get` exit 3 (taking the else), while a real fault (etcd unreachable,
+    # decrypt failure) exits non-zero-and-not-3. `set -e` is suspended in the `if`
+    # condition, so the exit-3 path is taken cleanly.
+    ct="$(mktemp)"; trap 'rm -f "$ct"' EXIT
+    if _get "/mcnf/secret/$2" >"$ct"; then
+      age -d -i "$KEY" <"$ct"
+    else
+      exit $?
+    fi
     ;;
   list)
     s=$(printf %s "/mcnf/secret/" | b64); e=$(printf %s "/mcnf/secret0" | b64)
