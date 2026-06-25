@@ -6216,6 +6216,30 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("compute_registry".into());
 
+        // MEDIA-7 — register the navidrome/media service into the mesh service
+        // registry. Capability-gated via runs_in("navidrome", deploy_class): it
+        // runs ONLY on a Lighthouse_Media node (MEDIA-1's Capability::Media) and
+        // is absent everywhere else. Publishes its registration (with a
+        // per-instance health field) to the per-peer Bus topic
+        // mesh/services/media/<peer> + the replicated QNM-Shared plane
+        // <host>/media-registry.json — the same registry plane the other
+        // published services use. The .with_mount honors --workgroup-root so the
+        // worker writes where the registry readers look.
+        if mackesd_core::worker_role::runs_in("navidrome", deploy_class) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::media_registry::MediaRegistryWorker::new(
+                    node_id.clone(),
+                    fw_host.clone(),
+                )
+                .with_mount(workgroup_root.clone()),
+                RestartPolicy::Always,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("media_registry".into());
+        }
+
         // APPS-LIVE-1 — apps_running: mirror this node's set of currently-
         // running launchable apps to <QNM-Shared>/<host>/running-apps.json
         // every 10 s so every node's Applications-menu launcher can badge each
