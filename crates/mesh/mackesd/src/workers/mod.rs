@@ -421,6 +421,18 @@ pub mod dc_health;
 // ({"status":"ok"|"fail",…}). Coarse tick (~5 min) decides via the pure `due`
 // helper; the leader runs exactly one backup per interval mesh-wide.
 pub mod dr_scheduler;
+// DATACENTER-12 (scheduled-snapshot executor) — the missing consumer of the
+// Storage tab's "Save schedule". A leader-gated periodic worker that reads each
+// SR's latest `event/dc/snap-schedule/<sr>` config off the Bus, decides per-tick
+// whether each SR is due per its cadence, and when due takes the snapshot by
+// reusing the EXISTING storage `xe vdi-snapshot` path over the mesh-key SSH
+// (the same `xen_ssh_key`/`xen_dom0s` injection-guarded, dom0-allow-listed
+// contract `ipc::storage_ops` uses). After snapshotting it enforces retention by
+// destroying its OWN (prefix-tagged) oldest snapshots beyond the configured
+// count — never an operator's hand-made snapshot — emits a run result to
+// `event/dc/snap-schedule-run/<sr>`, and alerts on failure via the alert_relay
+// lane. Degrades cleanly (no Bus / no schedule / no dom0 → idle, no panic).
+pub mod dc_snap_scheduler;
 // DATACENTER-20 — passive promotion tracker: publishes the version running at
 // each promotion stage (Build→Eagle→DO) to `event/dc/promote/<stage>` so the
 // Workbench Datacenter plane can render the promotion matrix. Leader-gated;
