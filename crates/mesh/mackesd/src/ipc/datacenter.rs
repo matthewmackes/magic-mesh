@@ -52,6 +52,30 @@
 //!   * `dom0` MUST be in the configured allowed set before any SSH.
 //! Reply `{"ok":true}` on success, `{"error":"<message>"}` on failure.
 //!
+//! `vm-snapshots` request body `{ "uuid", "dom0" }` (read-only):
+//!   * `uuid` is validated to be hex+`-` only (same injection guard);
+//!   * `dom0` MUST be in the configured allowed set before any SSH;
+//!   * lists the VM's snapshots via `xe snapshot-list snapshot-of=<uuid> …`,
+//!     emitting `<snap-uuid>|<name-label>` per line (the same `$u|$(…)` shell
+//!     idiom the orchestrator's VM read uses), parsed back into pairs.
+//! Reply `{"ok":true,"snapshots":[{"uuid","name"}, …]}` on success (possibly
+//! empty), `{"error":"<message>"}` on failure.
+//!
+//! `vm-snapshot-revert` request body `{ "snapshot", "dom0" }`:
+//!   * `snapshot` (a snapshot uuid) is validated to be hex+`-` only (same guard);
+//!   * `dom0` MUST be in the configured allowed set before any SSH;
+//!   * reverts the parent VM to the snapshot via
+//!     `xe snapshot-revert snapshot-uuid=<snapshot>`.
+//! Reply `{"ok":true}` on success, `{"error":"<message>"}` on failure.
+//!
+//! `vm-snapshot-delete` request body `{ "snapshot", "dom0", "confirm": true }`:
+//!   * `confirm` MUST be the boolean `true` — a destructive guard checked first
+//!     (mirrors `vm-delete`), since a snapshot-destroy is irreversible;
+//!   * `snapshot` (a snapshot uuid) is validated to be hex+`-` only (same guard);
+//!   * `dom0` MUST be in the configured allowed set before any SSH;
+//!   * destroys the snapshot via `xe snapshot-destroy uuid=<snapshot>`.
+//! Reply `{"ok":true}` on success, `{"error":"<message>"}` on failure.
+//!
 //! `vm-migrate` request body `{ "uuid", "dom0", "host" }`:
 //!   * `uuid` is validated to be hex+`-` only (same injection guard);
 //!   * `host` (the destination host name-label or uuid) is validated to
@@ -182,7 +206,7 @@ impl Drop for OpLockGuard<'_> {
 /// DATACENTER-12: the trailing five are the storage verbs ([`crate::ipc::storage_ops`]),
 /// served on THIS responder so the panel's Storage tab acts through the same Bus
 /// round trip as the VM tab. `build_reply` routes them into `storage_ops`.
-pub const ACTION_VERBS: [&str; 15] = [
+pub const ACTION_VERBS: [&str; 18] = [
     "vm-power",
     "vm-snapshot",
     "vm-clone",
@@ -192,6 +216,9 @@ pub const ACTION_VERBS: [&str; 15] = [
     "vm-migrate",
     "vm-resize",
     "vm-create",
+    "vm-snapshots",
+    "vm-snapshot-revert",
+    "vm-snapshot-delete",
     "do-regions",
     "sr-create",
     "vdi-create",
@@ -546,18 +573,24 @@ pub fn lock_key(verb: &str, req_body: Option<&str>) -> Option<String> {
         }
         return Some(format!("vm-new:{name}"));
     }
+    // DATACENTER-11 — the snapshot-mutating verbs target a SNAPSHOT (not the VM),
+    // and read it from the body's `snapshot` field, so they lock on `snap:<uuid>`
+    // (a distinct namespace from `vm:` — reverting/deleting a snapshot shouldn't
+    // collide with a power op on its parent VM). `vm-snapshots` is read-only → no
+    // lock (it falls through to the `None` tail below).
     // DATACENTER-12 — storage verbs lock on the resource they target so two
     // mutations on the same SR/VDI/VBD don't race. Each reads a different body
     // field for its key; an absent/empty field returns `None` (no lock — the
     // per-verb builder produces the real validation error).
-    let storage_key = match verb {
+    let keyed = match verb {
+        "vm-snapshot-revert" | "vm-snapshot-delete" => Some(("snapshot", "snap")),
         "sr-create" => Some(("name", "sr-new")),
         "vdi-create" => Some(("sr", "sr")),
         "vdi-attach" | "sr-snapshot" => Some(("vdi", "vdi")),
         "vdi-detach" => Some(("vbd", "vbd")),
         _ => None,
     };
-    if let Some((field, ns)) = storage_key {
+    if let Some((field, ns)) = keyed {
         let val = serde_json::from_str::<serde_json::Value>(req_body?)
             .ok()?
             .get(field)
@@ -621,6 +654,9 @@ pub fn build_reply(svc: &DatacenterService, verb: &str, req_body: Option<&str>) 
         "vm-migrate" => vm_migrate_reply(req_body),
         "vm-resize" => vm_resize_reply(req_body),
         "vm-create" => vm_create_reply(svc, req_body),
+        "vm-snapshots" => vm_snapshots_reply(req_body),
+        "vm-snapshot-revert" => vm_snapshot_revert_reply(req_body),
+        "vm-snapshot-delete" => vm_snapshot_delete_reply(req_body),
         "do-regions" => do_regions_reply(),
         // DATACENTER-12 — storage verbs are served on this responder but built by
         // the sibling storage_ops module (the op-lock above already guards them).
@@ -897,6 +933,90 @@ pub fn vm_console_command(uuid: &str) -> Result<String, String> {
     ))
 }
 
+/// Build the remote shell command that LISTS a VM's snapshots. PURE.
+///
+/// Validates `uuid` is non-empty and contains only `[0-9a-fA-F-]` — the same
+/// command-injection guard as [`vm_power_command`], since the result is
+/// interpolated into a remote shell string. Emits `<snap-uuid>|<name-label>` per
+/// line using the exact `$u|$(…)` per-line idiom the orchestrator's VM read uses
+/// ([`crate::workers::datacenter_orchestrator`]), so the reply parses back into
+/// `(uuid, name)` pairs with [`parse_xe_snapshots`]. Returns the full `for …`
+/// shell line (NOT prefixed with `xe`, since it runs `xe` internally per snapshot).
+///
+/// # Errors
+/// Returns `Err` for an empty `uuid`, or a `uuid` containing any character that is
+/// not an ASCII hex digit or `-`.
+pub fn vm_snapshots_command(uuid: &str) -> Result<String, String> {
+    if uuid.is_empty() {
+        return Err("empty uuid".into());
+    }
+    if !uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err("uuid contains invalid characters".into());
+    }
+    Ok(format!(
+        "for s in $(xe snapshot-list snapshot-of={uuid} params=uuid --minimal | tr , ' '); \
+         do echo \"$s|$(xe snapshot-param-get uuid=$s param-name=name-label)\"; done"
+    ))
+}
+
+/// Parse the `vm-snapshots` remote output (one `<uuid>|<name-label>` per line)
+/// into `(uuid, name)` pairs. PURE. Blank lines and lines missing the `|`
+/// delimiter are skipped (best-effort, mirroring `parse_xe_vms`); a trimmed empty
+/// uuid is dropped.
+#[must_use]
+pub fn parse_xe_snapshots(out: &str) -> Vec<(String, String)> {
+    out.lines()
+        .filter_map(|line| {
+            let (uuid, name) = line.split_once('|')?;
+            let uuid = uuid.trim();
+            if uuid.is_empty() {
+                return None;
+            }
+            Some((uuid.to_string(), name.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Build the remote `xe` argument string to REVERT a VM to a snapshot. PURE.
+///
+/// Validates `snapshot` (the snapshot uuid) is non-empty and contains only
+/// `[0-9a-fA-F-]` — the same command-injection guard as [`vm_power_command`].
+/// `xe snapshot-revert` takes `snapshot-uuid=<uuid>` (it reverts the snapshot's
+/// parent VM to that point). Returns `"snapshot-revert snapshot-uuid=<snapshot>"`.
+///
+/// # Errors
+/// Returns `Err` for an empty `snapshot`, or a `snapshot` containing any character
+/// that is not an ASCII hex digit or `-`.
+pub fn vm_snapshot_revert_command(snapshot: &str) -> Result<String, String> {
+    if snapshot.is_empty() {
+        return Err("empty snapshot".into());
+    }
+    if !snapshot.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err("snapshot contains invalid characters".into());
+    }
+    Ok(format!("snapshot-revert snapshot-uuid={snapshot}"))
+}
+
+/// Build the remote `xe` argument string to DESTROY (delete) a snapshot. PURE.
+///
+/// Validates `snapshot` (the snapshot uuid) is non-empty and contains only
+/// `[0-9a-fA-F-]` — the same command-injection guard as [`vm_power_command`].
+/// `xe snapshot-destroy` takes `uuid=<uuid>`. Returns
+/// `"snapshot-destroy uuid=<snapshot>"`.
+///
+/// # Errors
+/// Returns `Err` for an empty `snapshot`, or a `snapshot` containing any character
+/// that is not an ASCII hex digit or `-`.
+pub fn vm_snapshot_delete_command(snapshot: &str) -> Result<String, String> {
+    if snapshot.is_empty() {
+        return Err("empty snapshot".into());
+    }
+    if !snapshot.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err("snapshot contains invalid characters".into());
+    }
+    Ok(format!("snapshot-destroy uuid={snapshot}"))
+}
+
 /// Handle a `vm-console` request body: parse, allow-list the dom0, then read the
 /// XAPI console `location` over SSH (read-only). On success the trimmed stdout is
 /// the connection URL; an empty result means the VM has no console (halted / not
@@ -956,6 +1076,135 @@ fn vm_console_reply(req_body: Option<&str>) -> String {
         }
         Err(e) => err(format!("ssh failed: {e}")),
     }
+}
+
+/// Handle a `vm-snapshots` request body: parse, allow-list the dom0, then run the
+/// snapshot-list remote command (read-only) over SSH and reply with the parsed
+/// `(uuid, name)` pairs. An empty list is a success (the VM simply has no
+/// snapshots).
+fn vm_snapshots_reply(req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("vm-snapshots: missing request body".into());
+    };
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return err(format!("vm-snapshots: bad json: {e}")),
+    };
+    let uuid = req
+        .get("uuid")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let dom0 = req
+        .get("dom0")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    // SECURITY: only act on a dom0 in the configured allowed set — read-only, but
+    // we still SSH there, so keep the allow-list.
+    if !crate::workers::datacenter_orchestrator::xen_dom0s()
+        .iter()
+        .any(|d| d == dom0)
+    {
+        return err("dom0 not in allowed set".into());
+    }
+    // The command runs `xe` internally per snapshot, so it is NOT `xe`-prefixed.
+    let remote = match vm_snapshots_command(uuid) {
+        Ok(c) => c,
+        Err(e) => return err(e),
+    };
+    let key = crate::workers::datacenter_orchestrator::xen_ssh_key();
+    match ssh_xe_status(&key, dom0, &remote) {
+        Ok(o) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let snapshots: Vec<serde_json::Value> = parse_xe_snapshots(&stdout)
+                .into_iter()
+                .map(|(uuid, name)| json!({ "uuid": uuid, "name": name }))
+                .collect();
+            json!({ "ok": true, "snapshots": snapshots }).to_string()
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let msg = stderr.trim();
+            if msg.is_empty() {
+                err("xe failed".into())
+            } else {
+                err(msg.to_string())
+            }
+        }
+        Err(e) => err(format!("ssh failed: {e}")),
+    }
+}
+
+/// Handle a `vm-snapshot-revert` request body: parse, allow-list the dom0, then
+/// run `xe snapshot-revert snapshot-uuid=<snapshot>` over SSH.
+fn vm_snapshot_revert_reply(req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("vm-snapshot-revert: missing request body".into());
+    };
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return err(format!("vm-snapshot-revert: bad json: {e}")),
+    };
+    let snapshot = req
+        .get("snapshot")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let dom0 = req
+        .get("dom0")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    // SECURITY: only act on a dom0 in the configured allowed set.
+    if !crate::workers::datacenter_orchestrator::xen_dom0s()
+        .iter()
+        .any(|d| d == dom0)
+    {
+        return err("dom0 not in allowed set".into());
+    }
+    let cmd = match vm_snapshot_revert_command(snapshot) {
+        Ok(c) => c,
+        Err(e) => return err(e),
+    };
+    run_xe_ok(dom0, &cmd)
+}
+
+/// Handle a `vm-snapshot-delete` request body: parse, REQUIRE `confirm == true`
+/// (mirrors `vm-delete` — a snapshot-destroy is irreversible), allow-list the
+/// dom0, then run `xe snapshot-destroy uuid=<snapshot>` over SSH.
+fn vm_snapshot_delete_reply(req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("vm-snapshot-delete: missing request body".into());
+    };
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return err(format!("vm-snapshot-delete: bad json: {e}")),
+    };
+    let snapshot = req
+        .get("snapshot")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let dom0 = req
+        .get("dom0")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    // DESTRUCTIVE: refuse unless the caller explicitly confirms. Checked BEFORE
+    // the dom0 allow-list and before building/running anything (mirrors vm-delete).
+    if req.get("confirm").and_then(serde_json::Value::as_bool) != Some(true) {
+        return err("snapshot-delete requires confirm:true".into());
+    }
+    // SECURITY: only act on a dom0 in the configured allowed set.
+    if !crate::workers::datacenter_orchestrator::xen_dom0s()
+        .iter()
+        .any(|d| d == dom0)
+    {
+        return err("dom0 not in allowed set".into());
+    }
+    let cmd = match vm_snapshot_delete_command(snapshot) {
+        Ok(c) => c,
+        Err(e) => return err(e),
+    };
+    run_xe_ok(dom0, &cmd)
 }
 
 /// Run one allow-listed `xe <cmd>` on `dom0` over SSH and turn the outcome into the
@@ -1336,6 +1585,15 @@ mod tests {
         assert_eq!(action_topic("vm-migrate"), "action/dc/vm-migrate");
         assert_eq!(action_topic("vm-resize"), "action/dc/vm-resize");
         assert_eq!(action_topic("vm-create"), "action/dc/vm-create");
+        assert_eq!(action_topic("vm-snapshots"), "action/dc/vm-snapshots");
+        assert_eq!(
+            action_topic("vm-snapshot-revert"),
+            "action/dc/vm-snapshot-revert"
+        );
+        assert_eq!(
+            action_topic("vm-snapshot-delete"),
+            "action/dc/vm-snapshot-delete"
+        );
         assert_eq!(action_topic("do-regions"), "action/dc/do-regions");
         assert!(ACTION_VERBS.contains(&"vm-power"));
         assert!(ACTION_VERBS.contains(&"vm-snapshot"));
@@ -1346,6 +1604,9 @@ mod tests {
         assert!(ACTION_VERBS.contains(&"vm-migrate"));
         assert!(ACTION_VERBS.contains(&"vm-resize"));
         assert!(ACTION_VERBS.contains(&"vm-create"));
+        assert!(ACTION_VERBS.contains(&"vm-snapshots"));
+        assert!(ACTION_VERBS.contains(&"vm-snapshot-revert"));
+        assert!(ACTION_VERBS.contains(&"vm-snapshot-delete"));
         assert!(ACTION_VERBS.contains(&"do-regions"));
     }
 
@@ -1634,6 +1895,9 @@ mod tests {
         assert!(build_reply(&s, "vm-clone", None).contains("missing request body"));
         assert!(build_reply(&s, "vm-delete", None).contains("missing request body"));
         assert!(build_reply(&s, "vm-console", None).contains("missing request body"));
+        assert!(build_reply(&s, "vm-snapshots", None).contains("missing request body"));
+        assert!(build_reply(&s, "vm-snapshot-revert", None).contains("missing request body"));
+        assert!(build_reply(&s, "vm-snapshot-delete", None).contains("missing request body"));
     }
 
     #[test]
@@ -1694,6 +1958,21 @@ mod tests {
         );
         assert_eq!(lock_key("vm-create", Some(r#"{"name":""}"#)), None);
         assert_eq!(lock_key("vm-create", None), None);
+        // the snapshot-mutating verbs key on the SNAPSHOT uuid (a distinct `snap:`
+        // namespace), read from the body's `snapshot` field — never the parent VM.
+        let snap = json!({ "snapshot": "ffaa-0011", "dom0": "10.0.0.1" }).to_string();
+        for verb in ["vm-snapshot-revert", "vm-snapshot-delete"] {
+            assert_eq!(
+                lock_key(verb, Some(&snap)),
+                Some("snap:ffaa-0011".to_string()),
+                "verb {verb} should lock on the snapshot uuid"
+            );
+        }
+        assert_eq!(
+            lock_key("vm-snapshot-revert", Some(r#"{"snapshot":""}"#)),
+            None
+        );
+        assert_eq!(lock_key("vm-snapshot-delete", None), None);
     }
 
     #[test]
@@ -1701,6 +1980,7 @@ mod tests {
         let body = json!({ "uuid": "abcd-1234", "dom0": "10.0.0.1" }).to_string();
         // read-only verbs take no lock
         assert_eq!(lock_key("vm-console", Some(&body)), None);
+        assert_eq!(lock_key("vm-snapshots", Some(&body)), None);
         assert_eq!(lock_key("do-regions", Some(&body)), None);
         // unknown verb → no lock
         assert_eq!(lock_key("bogus", Some(&body)), None);
@@ -1975,5 +2255,147 @@ mod tests {
         let r = build_reply(&svc, "vm-create", Some(&body));
         assert!(r.contains("dom0 not in allowed set"), "{r}");
         assert!(!tmp.path().join("infra/tofu/xen-xapi/dc-vms.tf").exists());
+    }
+
+    // DATACENTER-11 — snapshot list / revert / delete command builders + replies --
+
+    #[test]
+    fn vm_snapshots_command_builds_listing_idiom() {
+        let uuid = "abcd1234-5678-90ab-cdef-1234567890ab";
+        let cmd = vm_snapshots_command(uuid).unwrap();
+        // It runs `xe` internally per snapshot, so it is NOT `xe`-prefixed; it
+        // filters the snapshots to this VM and emits `<uuid>|<name>` per line.
+        assert!(cmd.starts_with("for s in $("), "{cmd}");
+        assert!(cmd.contains(&format!(
+            "snapshot-list snapshot-of={uuid} params=uuid --minimal"
+        )));
+        assert!(cmd.contains("echo \"$s|$(xe snapshot-param-get uuid=$s param-name=name-label)\""));
+    }
+
+    #[test]
+    fn vm_snapshots_command_rejects_injection_in_uuid() {
+        assert!(vm_snapshots_command("").is_err());
+        assert!(vm_snapshots_command("abcd;rm -rf /").is_err());
+        assert!(vm_snapshots_command("abcd 1234").is_err());
+        assert!(vm_snapshots_command("abcd`whoami`").is_err());
+        assert!(vm_snapshots_command("ghij").is_err());
+    }
+
+    #[test]
+    fn parse_xe_snapshots_pairs_uuid_and_name() {
+        let out = "aaaa-1111|nightly-2026-06-20\nbbbb-2222|dc-snap-abcd1234\n";
+        assert_eq!(
+            parse_xe_snapshots(out),
+            vec![
+                ("aaaa-1111".to_string(), "nightly-2026-06-20".to_string()),
+                ("bbbb-2222".to_string(), "dc-snap-abcd1234".to_string()),
+            ]
+        );
+        // blank lines, missing-delimiter lines, and an empty-uuid line are dropped.
+        let messy = "\ncccc-3333|named\nno-delimiter-line\n|orphan-name\n";
+        assert_eq!(
+            parse_xe_snapshots(messy),
+            vec![("cccc-3333".to_string(), "named".to_string())]
+        );
+        // a VM with no snapshots → empty.
+        assert!(parse_xe_snapshots("").is_empty());
+    }
+
+    #[test]
+    fn vm_snapshot_revert_command_builds_revert() {
+        let snap = "abcd1234-5678-90ab-cdef-1234567890ab";
+        assert_eq!(
+            vm_snapshot_revert_command(snap).unwrap(),
+            format!("snapshot-revert snapshot-uuid={snap}")
+        );
+    }
+
+    #[test]
+    fn vm_snapshot_revert_command_rejects_injection() {
+        assert!(vm_snapshot_revert_command("").is_err());
+        assert!(vm_snapshot_revert_command("abcd;rm -rf /").is_err());
+        assert!(vm_snapshot_revert_command("abcd 1234").is_err());
+        assert!(vm_snapshot_revert_command("abcd`whoami`").is_err());
+        assert!(vm_snapshot_revert_command("abcd=evil").is_err());
+        assert!(vm_snapshot_revert_command("ghij").is_err());
+    }
+
+    #[test]
+    fn vm_snapshot_delete_command_builds_destroy() {
+        let snap = "abcd1234-5678-90ab-cdef-1234567890ab";
+        assert_eq!(
+            vm_snapshot_delete_command(snap).unwrap(),
+            format!("snapshot-destroy uuid={snap}")
+        );
+    }
+
+    #[test]
+    fn vm_snapshot_delete_command_rejects_injection() {
+        assert!(vm_snapshot_delete_command("").is_err());
+        assert!(vm_snapshot_delete_command("abcd;rm -rf /").is_err());
+        assert!(vm_snapshot_delete_command("abcd 1234").is_err());
+        assert!(vm_snapshot_delete_command("abcd`whoami`").is_err());
+        assert!(vm_snapshot_delete_command("abcd=evil").is_err());
+        assert!(vm_snapshot_delete_command("ghij").is_err());
+    }
+
+    #[test]
+    fn vm_snapshots_dom0_not_in_allowed_set_is_rejected() {
+        // Read-only, but still SSHes → the dom0 allow-list guard applies. With
+        // MCNF_XEN_DOM0S unset the allowed set is empty, so the dom0 is rejected.
+        let _env = lock_env();
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        let body = json!({
+            "uuid": "abcd1234-5678-90ab-cdef-1234567890ab",
+            "dom0": "10.0.0.1"
+        })
+        .to_string();
+        let r = build_reply(&s, "vm-snapshots", Some(&body));
+        assert!(r.contains("dom0 not in allowed set"), "{r}");
+    }
+
+    #[test]
+    fn vm_snapshot_revert_dom0_not_in_allowed_set_is_rejected() {
+        let _env = lock_env();
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        let body = json!({ "snapshot": "ffaa-0011", "dom0": "10.0.0.1" }).to_string();
+        let r = build_reply(&s, "vm-snapshot-revert", Some(&body));
+        assert!(r.contains("dom0 not in allowed set"), "{r}");
+    }
+
+    #[test]
+    fn vm_snapshot_delete_requires_confirm_true() {
+        // The confirm gate is checked BEFORE the dom0 allow-list, so even with an
+        // empty allowed set the missing/false confirm is what we observe (mirrors
+        // vm-delete).
+        let _env = lock_env();
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        // confirm missing
+        let body = json!({ "snapshot": "ffaa-0011", "dom0": "10.0.0.1" }).to_string();
+        let r = build_reply(&s, "vm-snapshot-delete", Some(&body));
+        assert!(r.contains("snapshot-delete requires confirm:true"), "{r}");
+        // confirm false
+        let body =
+            json!({ "snapshot": "ffaa-0011", "dom0": "10.0.0.1", "confirm": false }).to_string();
+        let r = build_reply(&s, "vm-snapshot-delete", Some(&body));
+        assert!(r.contains("snapshot-delete requires confirm:true"), "{r}");
+        // confirm as a non-bool ("true" string) does not satisfy the gate
+        let body =
+            json!({ "snapshot": "ffaa-0011", "dom0": "10.0.0.1", "confirm": "true" }).to_string();
+        let r = build_reply(&s, "vm-snapshot-delete", Some(&body));
+        assert!(r.contains("snapshot-delete requires confirm:true"), "{r}");
+    }
+
+    #[test]
+    fn vm_snapshot_delete_confirmed_then_checks_dom0_allow_list() {
+        // With confirm:true the gate passes and the dom0 allow-list is the next
+        // guard — with MCNF_XEN_DOM0S unset the allowed set is empty, so the
+        // (unlisted) dom0 is rejected before any SSH is attempted.
+        let _env = lock_env();
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        let body =
+            json!({ "snapshot": "ffaa-0011", "dom0": "10.0.0.1", "confirm": true }).to_string();
+        let r = build_reply(&s, "vm-snapshot-delete", Some(&body));
+        assert!(r.contains("dom0 not in allowed set"), "{r}");
     }
 }
