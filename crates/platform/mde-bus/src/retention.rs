@@ -108,6 +108,33 @@ pub const AUDIT_RUN_CAP_BYTES: u64 = 8 * 1024 * 1024;
 /// not. Whichever bound is hit first wins (the prune keeps the SMALLER window).
 pub const AUDIT_RUN_CAP_ENTRIES: usize = 20_000;
 
+/// BROKER-RESILIENCE-1 — per-topic byte cap for EVERY non-audit topic on `/run`.
+///
+/// The audit lane already has its own ([`AUDIT_RUN_CAP_BYTES`]); this is the
+/// matching bound for every OTHER topic. The TTL reap shortest class is the
+/// `min` 24 h / ephemeral 1 h window, and the global quota / fs-pressure
+/// evictor only fires under whole-`/run` pressure — so between those, a single
+/// high-frequency topic can balloon for a long time. When the broker is down
+/// that is exactly what happens: the alert/state sources keep publishing
+/// (persist-only) at their normal 2 s cadence, and the live wedge showed
+/// `state/boot-readiness` at 25 MB, `audit/*` at 19 MB, `compute/*` at 13 MB —
+/// ≈77 MB of a 190 MB `/run` — with NO broker ever draining them. A down broker
+/// must NEVER be able to fill `/run`, so each pass also bounds every topic's
+/// most-recent window to this cap, independent of the broker, the global quota,
+/// or fs pressure. Conservative on purpose: 8 MiB per topic keeps a generous
+/// live window for triage while staying a small fraction of even the smallest
+/// tmpfs, so no one topic alone can fill it. Whichever of the byte/entry bound
+/// is hit first wins (the prune keeps the smaller window).
+pub const TOPIC_RUN_CAP_BYTES: u64 = 8 * 1024 * 1024;
+
+/// BROKER-RESILIENCE-1 — entry-count backstop for the per-topic cap, the exact
+/// analogue of [`AUDIT_RUN_CAP_ENTRIES`] for non-audit topics: a record whose
+/// spool file is missing/0-length contributes 0 to the byte sum, so without a
+/// count bound the index rows (which duplicate each body — BUS-RETENTION-1)
+/// could grow unbounded while the byte cap never trips. Counting one-per-record
+/// can never stall on a 0-byte read.
+pub const TOPIC_RUN_CAP_ENTRIES: usize = 20_000;
+
 /// BUS-RUN-FULL-1-dfguard — filesystem-pressure trip point. The bus's own
 /// quota (`quota_hard_bytes`) only bounds the bus's *own* footprint; it says
 /// nothing about the rest of the `/run` tmpfs the bus shares with dnf locks, the
@@ -160,6 +187,15 @@ pub struct RetentionPolicy {
     /// their on-disk size, so a 0-byte/missing-file read can never stall the
     /// byte cap and let index rows grow unbounded. See [`AUDIT_RUN_CAP_ENTRIES`].
     pub audit_cap_entries: usize,
+    /// BROKER-RESILIENCE-1 — per-topic byte cap for EVERY non-audit topic. Each
+    /// pass bounds every topic's most-recent window to this size so no single
+    /// topic can grow unbounded between TTL/quota passes — the bound that makes
+    /// a down broker unable to fill `/run`. See [`TOPIC_RUN_CAP_BYTES`].
+    pub topic_cap_bytes: u64,
+    /// BROKER-RESILIENCE-1 — entry-count backstop for the per-topic cap (the
+    /// analogue of `audit_cap_entries` for non-audit topics, so a 0-byte read
+    /// can't stall the byte cap). See [`TOPIC_RUN_CAP_ENTRIES`].
+    pub topic_cap_entries: usize,
 }
 
 impl Default for RetentionPolicy {
@@ -173,6 +209,8 @@ impl Default for RetentionPolicy {
             quota_hard_bytes: DEFAULT_QUOTA_HARD_BYTES,
             audit_cap_bytes: AUDIT_RUN_CAP_BYTES,
             audit_cap_entries: AUDIT_RUN_CAP_ENTRIES,
+            topic_cap_bytes: TOPIC_RUN_CAP_BYTES,
+            topic_cap_entries: TOPIC_RUN_CAP_ENTRIES,
         }
     }
 }
@@ -203,6 +241,14 @@ pub struct PassReport {
     /// window stays resident, everything older rotates off. Distinct from
     /// `removed` (TTL expiry) and `evicted` (hard-cap / fs-pressure).
     pub audit_pruned: usize,
+    /// BROKER-RESILIENCE-1 — records pruned this pass because a non-audit topic
+    /// exceeded its per-topic `/run` cap ([`TOPIC_RUN_CAP_BYTES`] /
+    /// [`TOPIC_RUN_CAP_ENTRIES`]). Each topic's most-recent window stays
+    /// resident; everything older rotates off — so a single high-frequency
+    /// topic (an alert source publishing persist-only to a down broker) can
+    /// never grow unbounded and fill the tmpfs. Distinct from `audit_pruned`
+    /// (the audit lane), `removed` (TTL expiry), and `evicted` (hard-cap).
+    pub topic_pruned: usize,
     /// BULLETPROOF-1 — messages evicted by the hard-cap safety valve
     /// (oldest-first, regardless of TTL) because the spool exceeded the
     /// hard quota. Distinct from `removed` so the log shows when the bus
@@ -558,6 +604,21 @@ fn run_pass_at_inner(
         policy.audit_cap_entries,
     )?;
 
+    // BROKER-RESILIENCE-1 — bound EVERY non-audit topic to its most-recent
+    // `/run` window. The TTL reap above only sheds messages past their class's
+    // TTL and the hard-cap evictor only fires under whole-`/run` pressure, so
+    // between them a single high-frequency topic can balloon — which is exactly
+    // what a down broker causes (the alert/state sources keep publishing
+    // persist-only). This runs every pass and keeps each topic's window itself
+    // bounded, so no one topic can ever fill the tmpfs regardless of broker
+    // state. `audit/*` is excluded — it has its own (independent) cap above.
+    let topic_pruned = prune_topics_over_cap(
+        &conn,
+        bus_root,
+        policy.topic_cap_bytes,
+        policy.topic_cap_entries,
+    )?;
+
     // BUS-RETENTION-1 — reclaim the DB pages the deletes above freed BEFORE we
     // measure/evict, so the footprint reflects a compacted index (not its stale
     // high-water mark) and we don't over-evict spool to compensate for a bloated
@@ -633,6 +694,7 @@ fn run_pass_at_inner(
     Ok(PassReport {
         removed,
         audit_pruned,
+        topic_pruned,
         evicted,
         bytes_after,
         fs_pressure,
@@ -796,6 +858,94 @@ fn prune_audit_over_cap(
     Ok(pruned)
 }
 
+/// BROKER-RESILIENCE-1 — bound EVERY non-audit topic to its most-recent `/run`
+/// window: for each distinct topic, keep at most `cap_bytes` of on-disk spool
+/// AND at most `cap_entries` records (whichever is the smaller window wins),
+/// pruning the OLDEST records of that topic past the bound. Returns the total
+/// records pruned across all topics.
+///
+/// This is the per-topic analogue of [`prune_audit_over_cap`] for the rest of
+/// the bus. It runs every pass and is the bound that makes a down broker unable
+/// to fill `/run`: the alert/state sources keep publishing persist-only when the
+/// broker is absent, and without a per-topic cap a single one of them
+/// (`state/boot-readiness` at the live 2 s cadence) balloons unbounded between
+/// the TTL reap and the whole-`/run` evictor. `audit/*` is excluded — it has its
+/// own independent cap ([`prune_audit_over_cap`]) so it isn't double-bounded.
+///
+/// Ordering + the always-keep-the-newest floor mirror [`prune_audit_over_cap`]:
+/// `ts_unix_ms DESC, ulid DESC` makes the kept window deterministic even within
+/// a same-millisecond burst, and the first record of each topic is retained
+/// before either bound is consulted, so a degenerate `cap == 0` bounds a topic
+/// to one record rather than wiping it.
+fn prune_topics_over_cap(
+    conn: &rusqlite::Connection,
+    bus_root: &Path,
+    cap_bytes: u64,
+    cap_entries: usize,
+) -> Result<usize, RetentionError> {
+    let audit_like = format!("{}%", crate::persist::AUDIT_TOPIC_PREFIX);
+    // Distinct non-audit topics. Each is bounded independently below.
+    let topics: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT topic FROM messages WHERE topic NOT LIKE ?1")
+            .map_err(|e| RetentionError::Sql(format!("topic-cap topics prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![audit_like], |r| r.get::<_, String>(0))
+            .map_err(|e| RetentionError::Sql(format!("topic-cap topics query: {e}")))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| RetentionError::Sql(format!("topic-cap topics decode: {e}")))?);
+        }
+        out
+    };
+
+    let mut total_pruned = 0_usize;
+    for topic in &topics {
+        // Newest-first (deterministic tiebreak on the unique ulid) so we keep
+        // the most-recent window and prune from the tail of THIS topic.
+        let victims: Vec<(String, PathBuf)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT ulid, file_path FROM messages \
+                     WHERE topic = ?1 ORDER BY ts_unix_ms DESC, ulid DESC",
+                )
+                .map_err(|e| RetentionError::Sql(format!("topic-cap prepare: {e}")))?;
+            let rows = stmt
+                .query_map(params![topic], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(|e| RetentionError::Sql(format!("topic-cap query: {e}")))?;
+
+            let mut kept_bytes: u64 = 0;
+            let mut kept_count: usize = 0;
+            let mut victims: Vec<(String, PathBuf)> = Vec::new();
+            for r in rows {
+                let (ulid, rel_path) =
+                    r.map_err(|e| RetentionError::Sql(format!("topic-cap decode: {e}")))?;
+                let abs = bus_root.join(&rel_path);
+                let sz = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
+                // Keep the newest unconditionally (forward-progress floor), else
+                // keep while BOTH bounds still hold; past either, this record and
+                // every older one of this topic is pruned.
+                let within_bounds = kept_count == 0
+                    || (kept_bytes.saturating_add(sz) <= cap_bytes && kept_count < cap_entries);
+                if within_bounds {
+                    kept_bytes = kept_bytes.saturating_add(sz);
+                    kept_count += 1;
+                } else {
+                    victims.push((ulid, abs));
+                }
+            }
+            victims
+        };
+        for (ulid, abs) in &victims {
+            delete_message_file_and_row(conn, abs, ulid)?;
+            total_pruned += 1;
+        }
+    }
+    Ok(total_pruned)
+}
+
 /// Convenience: today's clock as unix-ms.
 pub fn current_unix_ms() -> i64 {
     SystemTime::now()
@@ -833,6 +983,7 @@ pub async fn run_loop(
                             target: "mde_bus::retention",
                             removed = report.removed,
                             audit_pruned = report.audit_pruned,
+                            topic_pruned = report.topic_pruned,
                             evicted = report.evicted,
                             bytes_after = report.bytes_after,
                             fs_pressure = report.fs_pressure,
@@ -840,6 +991,13 @@ pub async fn run_loop(
                             hard_exceeded = report.quota.hard_exceeded,
                             "retention pass complete"
                         );
+                        if report.topic_pruned > 0 {
+                            tracing::info!(
+                                target: "mde_bus::retention",
+                                topic_pruned = report.topic_pruned,
+                                "BROKER-RESILIENCE-1: a topic was over its per-topic /run cap — pruned oldest records, kept the most-recent window (a down broker can't fill /run)"
+                            );
+                        }
                         if report.audit_pruned > 0 {
                             tracing::info!(
                                 target: "mde_bus::retention",
@@ -1201,6 +1359,136 @@ mod tests {
             4,
             "entry-count backstop bounds the lane regardless of bytes"
         );
+    }
+
+    #[test]
+    fn topic_lane_pruned_to_cap_keeps_most_recent() {
+        // BROKER-RESILIENCE-1 — the decisive regression for the down-broker
+        // spool wedge: a non-audit topic over its per-topic cap MUST be pruned
+        // to its most-recent window. Models a single alert source (here
+        // `state/boot-readiness`) publishing persist-only at its 2 s cadence
+        // with NO broker draining it — the live 25 MB-on-a-190 MB-/run case.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let now = 1_000_000_000_000_i64;
+        let kb = 1024;
+        // 8 records, 256 KB each = 2 MB on one topic, ascending ts (first oldest).
+        let mut ulids = Vec::new();
+        for i in 0..8 {
+            ulids.push(write_sized(
+                &root,
+                "state/boot-readiness",
+                // Use High so the TTL reap (30 d) never fires — the per-topic
+                // cap must be the ONLY thing that sheds these.
+                Priority::High,
+                now - (8 - i) * 1000,
+                256 * kb,
+            ));
+        }
+        purge_audit(&root); // isolate the per-topic (non-audit) cap behavior
+        let policy = RetentionPolicy {
+            topic_cap_bytes: 1024 * 1024, // 1 MB cap over the ~2 MB topic
+            ..RetentionPolicy::default()
+        };
+        let report = run_pass_at(&policy, &root, now).unwrap();
+        assert_eq!(report.removed, 0, "no TTL expiry — High survives 30 d");
+        assert!(
+            report.topic_pruned >= 1,
+            "over-cap topic must be pruned to its most-recent window"
+        );
+        let p = Persist::open(root.clone()).unwrap();
+        let remaining: Vec<String> = p
+            .list_since("state/boot-readiness", None)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.ulid)
+            .collect();
+        assert!(
+            !remaining.contains(&ulids[0]),
+            "oldest record pruned over the cap"
+        );
+        assert!(
+            remaining.contains(ulids.last().unwrap()),
+            "most-recent record survives"
+        );
+        let topic_bytes: u64 = p
+            .list_since("state/boot-readiness", None)
+            .unwrap()
+            .iter()
+            .map(|m| std::fs::metadata(root.join(&m.file_path)).map(|x| x.len()).unwrap_or(0))
+            .sum();
+        assert!(
+            topic_bytes <= policy.topic_cap_bytes + 256 * kb as u64,
+            "topic bounded to ~cap, was {topic_bytes}"
+        );
+    }
+
+    #[test]
+    fn topic_cap_does_not_touch_audit_lane() {
+        // BROKER-RESILIENCE-1 — the per-topic cap excludes `audit/*` (it has its
+        // own independent cap), so an audit lane under the audit cap is NEVER
+        // pruned by the topic pass even when the topic cap is tiny.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let now = 1_000_000_000_000_i64;
+        for i in 0..6 {
+            write_sized(&root, "audit/peerx", Priority::Min, now - (6 - i) * 1000, 4 * 1024);
+        }
+        let policy = RetentionPolicy {
+            topic_cap_bytes: 0, // would shed everything IF it touched audit
+            topic_cap_entries: 0,
+            ..RetentionPolicy::default()
+        };
+        let report = run_pass_at(&policy, &root, now).unwrap();
+        assert_eq!(
+            report.topic_pruned, 0,
+            "per-topic cap must not touch the audit lane"
+        );
+        let p = Persist::open(root.clone()).unwrap();
+        assert_eq!(
+            p.list_since("audit/peerx", None).unwrap().len(),
+            6,
+            "audit lane untouched by the per-topic cap (under its own audit cap)"
+        );
+    }
+
+    #[test]
+    fn sustained_publish_with_no_broker_stays_bounded() {
+        // BROKER-RESILIENCE-1 — the end-to-end property: under sustained
+        // publishes to a topic with NO broker (persist-only), repeated retention
+        // passes keep the topic's `/run` footprint bounded to ~the cap, never
+        // growing unbounded. We publish in waves and run a pass after each.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let kb = 1024;
+        let cap = 512 * kb as u64;
+        let policy = RetentionPolicy {
+            topic_cap_bytes: cap,
+            ..RetentionPolicy::default()
+        };
+        let mut ts = 1_000_000_000_000_i64;
+        for _wave in 0..5 {
+            // Each wave: 10 × 128 KB = 1.25 MB onto one topic (well over the cap).
+            for _ in 0..10 {
+                ts += 1000;
+                write_sized(&root, "compute/event", Priority::High, ts, 128 * kb);
+            }
+            purge_audit(&root);
+            let report = run_pass_at(&policy, &root, ts).unwrap();
+            let _ = report;
+            // After every pass the topic's spool footprint is bounded to ~cap.
+            let p = Persist::open(root.clone()).unwrap();
+            let topic_bytes: u64 = p
+                .list_since("compute/event", None)
+                .unwrap()
+                .iter()
+                .map(|m| std::fs::metadata(root.join(&m.file_path)).map(|x| x.len()).unwrap_or(0))
+                .sum();
+            assert!(
+                topic_bytes <= cap + 128 * kb as u64,
+                "sustained no-broker publishes must stay bounded (~cap); was {topic_bytes}"
+            );
+        }
     }
 
     #[test]

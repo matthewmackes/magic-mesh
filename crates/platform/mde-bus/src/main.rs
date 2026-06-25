@@ -115,22 +115,39 @@ async fn run_daemon() -> anyhow::Result<()> {
     // restart cycle when prereqs land.
     let broker_cfg = broker::BrokerConfig::default();
     let broker_outcome = broker::start_if_ready(&broker_cfg).await?;
-    let (mut broker_child, overlay_ip_for_discovery) = match broker_outcome {
+    // BROKER-RESILIENCE-1 — track whether the broker was SKIPPED (known absent)
+    // distinctly from whether we have an overlay IP. A skip means "the local
+    // ntfy isn't up" — but the webhook listener can still bind on the overlay
+    // IP (when one exists) and ingest + persist webhooks; it just must run
+    // persist-only (no outbound POST to the dead broker). Wiring the skip into
+    // the listener's persist-only mode is what makes "non-fatal" actually true:
+    // without it the listener either didn't start at all (lost ingest) or kept
+    // POSTing to `:8443`, burning a connect-timeout per request and growing the
+    // spool on retry — the live watchdog-starving wedge (diagnosed 2026-06-25).
+    let (mut broker_child, overlay_ip_for_discovery, broker_skipped) = match broker_outcome {
         broker::BrokerOutcome::Running { child, overlay_ip } => {
             tracing::info!(
                 topics = reg.len(),
                 overlay_ip = %overlay_ip,
                 "mackes-bus daemon ready (broker live); awaiting shutdown"
             );
-            (Some(child), Some(overlay_ip))
+            (Some(child), Some(overlay_ip), false)
         }
         broker::BrokerOutcome::Skipped(reason) => {
+            // Re-evaluate prereqs so we can recover the overlay IP even on a
+            // skip that ISN'T about the IP (e.g. `NtfyMissing` / template
+            // missing): the listener can then still bind + persist there.
+            let overlay_ip = match broker::evaluate_prereqs(&broker_cfg) {
+                broker::Prereqs::Ready { overlay_ip } => Some(overlay_ip),
+                broker::Prereqs::Skip(_) => None,
+            };
             tracing::info!(
                 topics = reg.len(),
                 skip_reason = %reason,
-                "mackes-bus daemon ready (broker skipped — non-fatal); awaiting shutdown"
+                overlay_ip = ?overlay_ip,
+                "mackes-bus daemon ready (broker skipped — non-fatal, persist-only); awaiting shutdown"
             );
-            (None, None)
+            (None, overlay_ip, true)
         }
     };
 
@@ -138,7 +155,17 @@ async fn run_daemon() -> anyhow::Result<()> {
     // and browse for peers. Only run when the broker is live so we
     // don't advertise a port nothing's listening on. Missing overlay
     // IP or mdns-sd init failure logs the skip and continues.
-    let discovery_handle: Option<discovery::DiscoveryHandle> = match overlay_ip_for_discovery
+    //
+    // BROKER-RESILIENCE-1 — we now recover the overlay IP even on a broker
+    // SKIP (so the listener can bind persist-only), but discovery must STILL
+    // gate on the broker being LIVE: advertising `:8443` when nothing listens
+    // there would point peers at a dead port. `broker_skipped` → `None` here.
+    let discovery_overlay_ip = if broker_skipped {
+        None
+    } else {
+        overlay_ip_for_discovery.clone()
+    };
+    let discovery_handle: Option<discovery::DiscoveryHandle> = match discovery_overlay_ip
         .as_deref()
         .map(str::parse::<std::net::IpAddr>)
     {
@@ -168,7 +195,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             tracing::warn!(
                 target: "mde_bus::discovery",
                 error = %e,
-                raw = ?overlay_ip_for_discovery,
+                raw = ?discovery_overlay_ip,
                 "overlay IP failed to parse; skipping mDNS registration"
             );
             None
@@ -314,7 +341,15 @@ async fn run_daemon() -> anyhow::Result<()> {
         .map(str::parse::<std::net::IpAddr>)
     {
         Some(Ok(ip_addr)) => {
-            let cfg = hooks::server::ListenerConfig::for_overlay_ip(&ip_addr.to_string());
+            // BROKER-RESILIENCE-1 — when the broker was skipped (known absent),
+            // bind the listener persist-only: it ingests + persists webhooks but
+            // never attempts the doomed outbound POST to the down `:8443`. When
+            // the broker is live, forward to it as normal.
+            let cfg = if broker_skipped {
+                hooks::server::ListenerConfig::persist_only_for_overlay_ip(&ip_addr.to_string())
+            } else {
+                hooks::server::ListenerConfig::for_overlay_ip(&ip_addr.to_string())
+            };
             match hooks::run_listener(ip_addr, cfg).await? {
                 hooks::ListenerOutcome::Running {
                     task,
@@ -324,6 +359,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                     tracing::info!(
                         target: "mde_bus::hooks",
                         local_addr = %local_addr,
+                        persist_only = broker_skipped,
                         "webhook listener active"
                     );
                     (Some(shutdown_tx), Some(task), Some(local_addr))

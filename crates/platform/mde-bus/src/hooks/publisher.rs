@@ -11,9 +11,52 @@
 //! `reqwest` dep is built without any TLS feature so we don't
 //! drag rustls or native-tls into the workspace.
 
+use std::time::Duration;
+
 use thiserror::Error;
 
 use super::matcher::RenderedPublish;
+
+/// BROKER-RESILIENCE-1 — connect timeout for a broker publish.
+///
+/// The broker is an `ntfy` daemon on `<overlay_ip>:8443`. When it is
+/// absent — skipped at startup ([`crate::broker::BrokerSkipReason`]) or
+/// crashed — a POST to that address can stall in *connect*: on the Nebula
+/// overlay an unreachable/firewalled peer drops the SYN, so the connect
+/// retransmits for the kernel's full backoff (tens of seconds) instead of
+/// failing fast. A bare `reqwest::Client::new()` (the old default in this
+/// crate) sets NO timeout at all, so a publish to a dead broker hung the
+/// caller indefinitely — which on `mackesd` starved the 60 s systemd
+/// watchdog → `status=6/ABRT` crash-loop (diagnosed live 2026-06-25 on
+/// both lighthouses). A short connect timeout makes "broker down" fail in
+/// a few seconds, not a minute.
+pub const BROKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// BROKER-RESILIENCE-1 — overall request timeout for a broker publish.
+/// Bounds the whole POST (connect + send + the response) so a broker that
+/// accepts the TCP connection but then hangs the HTTP exchange (a wedged
+/// ntfy, a half-open socket) can't block the caller either. Local-network
+/// publish, so 5 s is generous; it is the hard ceiling on how long ANY
+/// single publish can take.
+pub const BROKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// BROKER-RESILIENCE-1 — the canonical outbound-publish HTTP client.
+///
+/// Every real publish path (the webhook listener in [`super::server`] and
+/// the `mde-bus publish` CLI) MUST build its client here so the connect +
+/// request timeouts are applied uniformly: a publish to a missing/dead
+/// broker has to fail FAST rather than hang and starve the watchdog. The
+/// builder only fails on a TLS/dns backend init error (we use neither),
+/// so the fallback is the timeout-less default — still correct, just
+/// without the fast-fail; it should never be reached in practice.
+#[must_use]
+pub fn broker_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(BROKER_CONNECT_TIMEOUT)
+        .timeout(BROKER_REQUEST_TIMEOUT)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
 
 /// Errors talking to the local ntfy broker.
 #[derive(Debug, Error)]
@@ -241,5 +284,38 @@ mod tests {
             .await
             .expect_err("connection refused expected");
         assert!(matches!(err, PublisherError::Transport(_)));
+    }
+
+    #[tokio::test]
+    async fn broker_client_fails_fast_against_a_dead_broker() {
+        // BROKER-RESILIENCE-1 — the decisive regression for the live wedge: a
+        // publish to a DOWN broker must fail within the configured timeout, NOT
+        // hang for the kernel's full connect backoff (tens of seconds), which is
+        // what starved the watchdog. We point at 192.0.2.1 (RFC 5737 TEST-NET-1,
+        // guaranteed non-routable) so the connect STALLS — exactly the
+        // unreachable-overlay-peer case — and assert the connect timeout fires.
+        // A bare `reqwest::Client::new()` here would hang far past this bound.
+        let client = broker_client();
+        let rendered = RenderedPublish {
+            rule_name: "t".to_string(),
+            topic: "x/y".to_string(),
+            priority: Priority::Default,
+            title: "t".to_string(),
+            body: "b".to_string(),
+            quiet_hours: crate::dnd::TopicQuietHours::default(),
+        };
+        let start = std::time::Instant::now();
+        let err = publish_to_ntfy(&client, "http://192.0.2.1:8443", &rendered)
+            .await
+            .expect_err("dead broker must error, not hang");
+        let elapsed = start.elapsed();
+        assert!(matches!(err, PublisherError::Transport(_)));
+        // Generous ceiling: the connect timeout is 3 s and the overall request
+        // timeout 5 s; either way the publish MUST be done well under 15 s (the
+        // bug was a ~60 s hang). The slack absorbs CI scheduling jitter.
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "dead-broker publish took {elapsed:?} — must fail fast, not hang"
+        );
     }
 }

@@ -187,9 +187,11 @@ pub async fn run(args: PublishArgs) -> Result<()> {
         return Ok(());
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
+    // BROKER-RESILIENCE-1 — the CLI publish path is what the alert sources
+    // (selinux_monitor, kdc_host, mesh-alert, the FDO bridge, …) shell out;
+    // a dead broker must fail FAST here too (connect + request timeouts),
+    // never hang the caller. The shared constructor applies both.
+    let client = crate::hooks::publisher::broker_client();
     // NOTIFY-DIST-3 — flatten the hierarchical bus topic to a valid ntfy topic
     // segment (slashes/spaces → `_`). The hooks publisher already did this, but
     // the CLI publish path (used by the alert sources: selinux_monitor, kdc_host,

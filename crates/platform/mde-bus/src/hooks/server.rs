@@ -81,10 +81,23 @@ pub struct ListenerConfig {
     /// to the per-topic file tree + SQLite index (BUS-1.4).
     /// `None` keeps the listener stateless (useful for tests).
     pub bus_root: Option<PathBuf>,
+    /// BROKER-RESILIENCE-1 — persist-only mode: skip the outbound ntfy POST
+    /// entirely (persist + audit only). Set when the broker is KNOWN absent —
+    /// the supervisor evaluated [`crate::broker::evaluate_prereqs`] and got a
+    /// `Skip` (no overlay IP, `ntfy` not installed, template missing). A
+    /// known-down broker means every POST would fail anyway, so we must NOT
+    /// keep attempting them: each failed POST eats a connect-timeout window
+    /// AND the matched message is already durably persisted (the `persist`
+    /// write runs first), so the spool + audit carry it to peers once the
+    /// broker comes up. Attempting the doomed outbound was the live wedge —
+    /// it drove the spool growth + the watchdog-starving blocking. Mirrors
+    /// the `mde-bus publish --no-broker` contract.
+    pub persist_only: bool,
 }
 
 impl ListenerConfig {
-    /// New config with the canonical defaults.
+    /// New config with the canonical defaults (broker reachable: the
+    /// listener forwards matched publishes to ntfy on `<overlay_ip>:8443`).
     #[must_use]
     pub fn for_overlay_ip(overlay_ip: &str) -> Self {
         Self {
@@ -93,6 +106,22 @@ impl ListenerConfig {
             listen_port: DEFAULT_LISTEN_PORT,
             broker_base: format!("http://{overlay_ip}:8443"),
             bus_root: crate::default_data_dir(),
+            persist_only: false,
+        }
+    }
+
+    /// BROKER-RESILIENCE-1 — same as [`Self::for_overlay_ip`] but in
+    /// persist-only mode: the listener still binds + ingests webhooks and
+    /// persists every match, but skips the outbound ntfy POST. Used when the
+    /// broker is KNOWN absent (the supervisor's `evaluate_prereqs` returned a
+    /// `Skip`), so the listener never wastes a connect-timeout window per
+    /// request on a doomed POST — the persisted message rides the spool/audit
+    /// to peers once the broker is back.
+    #[must_use]
+    pub fn persist_only_for_overlay_ip(overlay_ip: &str) -> Self {
+        Self {
+            persist_only: true,
+            ..Self::for_overlay_ip(overlay_ip)
         }
     }
 }
@@ -159,6 +188,10 @@ struct ListenerState {
     /// when persistence is disabled (tests); the dispatch then
     /// uses `DndState::default()` (DND off) as the fallback.
     bus_root: Option<PathBuf>,
+    /// BROKER-RESILIENCE-1 — when true, `handle_hook` skips the outbound ntfy
+    /// POST (persist + audit only). Set when the broker is known absent so a
+    /// doomed POST never blocks the request or grows the spool via retry.
+    persist_only: bool,
 }
 
 /// BUS-2.8 — current local time as seconds-of-day [0, 86_400).
@@ -214,14 +247,14 @@ pub async fn run_listener(
     let state = ListenerState {
         config_path: cfg.config_path,
         broker_base: cfg.broker_base,
-        http_client: reqwest::Client::builder()
-            // Local-network publish; 5 s is generous.
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new()),
+        // BROKER-RESILIENCE-1 — a publish to a missing/dead broker must fail
+        // FAST (connect + request timeouts), not hang and starve the watchdog.
+        // The shared constructor applies both; see `publisher::broker_client`.
+        http_client: super::publisher::broker_client(),
         adapters: register_builtin_adapters(),
         persist,
         bus_root: cfg.bus_root,
+        persist_only: cfg.persist_only,
     };
     let state = Arc::new(state);
 
@@ -396,6 +429,26 @@ async fn handle_hook(
         None
     };
 
+    // BROKER-RESILIENCE-1 — when the broker is known absent (persist-only
+    // mode, set by the supervisor on an `evaluate_prereqs` Skip), the message
+    // is already durably persisted above; do NOT attempt the outbound POST. A
+    // doomed POST would burn a connect-timeout window per request (blocking)
+    // and the failed-publish path is exactly what drove the unbounded spool
+    // growth on a down broker. Return 202 ACCEPTED — the publish IS accepted
+    // (persisted + audited); the spool/audit carry it to peers once the broker
+    // is back, identical to the `mde-bus publish --no-broker` contract.
+    if state.persist_only {
+        tracing::info!(
+            target: "mde_bus::hooks",
+            adapter = %adapter_name,
+            rule = %rendered.rule_name,
+            topic = %rendered.topic,
+            ulid = ?persisted_ulid,
+            "published (persist-only — broker known absent, outbound skipped)"
+        );
+        return StatusCode::ACCEPTED.into_response();
+    }
+
     match publish_to_ntfy(&state.http_client, &state.broker_base, &rendered).await {
         Ok(()) => {
             tracing::info!(
@@ -509,7 +562,8 @@ mod tests {
             config_path: cfg_path,
             listen_port: 0, // ephemeral
             broker_base: format!("http://{ntfy_addr}"),
-            bus_root: None, // tests don't need persistence
+            bus_root: None,       // tests don't need persistence
+            persist_only: false,  // exercise the real outbound POST path
         };
         let outcome = run_listener(IpAddr::from([127, 0, 0, 1]), cfg)
             .await
@@ -641,5 +695,75 @@ adapters:
         // GitHub adapter requires X-GitHub-Event; without it the
         // extractor returns None → 400.
         assert_eq!(resp.status().as_u16(), 400);
+    }
+
+    #[tokio::test]
+    async fn persist_only_listener_persists_without_outbound_post() {
+        // BROKER-RESILIENCE-1 — when the broker is known absent, the listener
+        // runs persist-only: a matched webhook MUST be persisted (so the spool +
+        // audit carry it to peers) but MUST NOT attempt the outbound ntfy POST
+        // (which would burn a connect-timeout per request + grow the spool on
+        // retry — the live wedge). We stand up a stub ntfy that COUNTS
+        // connections and assert it receives ZERO, while the message lands in
+        // the persist index.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let conns = std::sync::Arc::new(AtomicUsize::new(0));
+        let conns_clone = conns.clone();
+        let ntfy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ntfy_addr = ntfy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut s, _)) = ntfy_listener.accept().await {
+                    conns_clone.fetch_add(1, Ordering::SeqCst);
+                    use tokio::io::AsyncWriteExt;
+                    let _ = s
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                }
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("bus-hooks.yaml");
+        write_yaml(&cfg_path, sample_github_push_yaml());
+        let bus_root = tmp.path().join("bus");
+
+        let cfg = ListenerConfig {
+            config_path: cfg_path,
+            listen_port: 0,
+            broker_base: format!("http://{ntfy_addr}"), // points at the (counting) stub
+            bus_root: Some(bus_root.clone()),
+            persist_only: true, // broker known absent → skip the outbound POST
+        };
+        let outcome = run_listener(IpAddr::from([127, 0, 0, 1]), cfg)
+            .await
+            .unwrap();
+        let addr = match outcome {
+            ListenerOutcome::Running { local_addr, .. } => local_addr,
+            ListenerOutcome::Skipped(r) => panic!("listener skipped: {r:?}"),
+        };
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/hooks/github"))
+            .header("X-GitHub-Event", "push")
+            .json(&github_push_payload())
+            .send()
+            .await
+            .unwrap();
+        // The publish is ACCEPTED — it was persisted (just not forwarded).
+        assert_eq!(resp.status().as_u16(), 202);
+
+        // Give any (erroneous) outbound POST a chance to land before asserting 0.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            conns.load(Ordering::SeqCst),
+            0,
+            "persist-only listener must NOT attempt an outbound POST to the broker"
+        );
+
+        // The message IS in the persist index (spool/audit carry it to peers).
+        let p = crate::persist::Persist::open(bus_root).unwrap();
+        let rows = p.list_since("gh/push", None).unwrap();
+        assert_eq!(rows.len(), 1, "persist-only still records the matched publish");
     }
 }

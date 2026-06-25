@@ -7862,6 +7862,16 @@ fn run_serve(
         // BULLETPROOF-2 — this is also the systemd watchdog heartbeat: the ping
         // rides the main loop, so a wedged/deadlocked runtime stops pinging and
         // systemd restarts the daemon (a hang the process-alive check can't see).
+        //
+        // BROKER-RESILIENCE-1 (verified for the 2026-06-25 down-broker wedge):
+        // this loop awaits ONLY `tokio::time::sleep` — the watchdog ping shares
+        // no task with any bus/broker/spool call, so a missing/dead broker can
+        // never starve it directly. The bus publishes from workers are
+        // fire-and-forget subprocess spawns (reaped async), and the in-process
+        // publish clients now fail FAST (connect + request timeouts) instead of
+        // hanging — so the indirect starvation path (a blocked publish piling up
+        // and saturating the runtime) is closed too. The ping is already on its
+        // own dedicated 250 ms timer; no further isolation is needed.
         while !shutdown.load(Ordering::Relaxed) {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             if let Some(iv) = watchdog_interval {
