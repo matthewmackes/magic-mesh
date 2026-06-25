@@ -249,6 +249,11 @@ pub enum Message {
     /// Kept distinct from `CopilotReplied` so ONLY a voice ask speaks (a typed
     /// search never blurts the reply aloud).
     VoiceReplied(u64, CopilotAnswer),
+    /// FRONTDOOR-16 — the operator dismissed the one-time guided-first-run
+    /// greeting (Q27). Clears the card for this session AND writes the "greeted"
+    /// sentinel so it never shows again on this node (Q71 — no tour, the greeting
+    /// is the whole onboarding). A pure local flip + a best-effort file write.
+    DismissGreeting,
 }
 
 /// FRONTDOOR-3 — which of the two locked render modes the Front Door is in
@@ -2109,6 +2114,12 @@ pub struct FrontDoor {
     /// Cleared when the detail menu closes (a fresh tile starts at broadcast) so a
     /// scope never silently leaks across tiles.
     pub target_node: Option<String>,
+    /// FRONTDOOR-16 — show the one-time guided-first-run greeting (Q27 — the AI
+    /// greets + the tiles auto-build from the mesh; Q71 — no tour). `true` only
+    /// when this node has never dismissed it (the "greeted" sentinel is absent at
+    /// construction); set `false` for good — and the sentinel written — the moment
+    /// the operator dismisses it, so the welcome card shows EXACTLY once per node.
+    pub show_greeting: bool,
 }
 
 impl Default for FrontDoor {
@@ -2187,6 +2198,10 @@ impl FrontDoor {
             // FRONTDOOR-15 — start at the whole-mesh broadcast default (Q18); a
             // tile's detail node selector scopes it to one node (Q32/Q74).
             target_node: None,
+            // FRONTDOOR-16 — the guided first-run greeting (Q27) shows iff this
+            // node has never dismissed it (the sentinel is absent). A returning
+            // operator never sees it again; a fresh install greets once.
+            show_greeting: !greeting_already_seen(),
         }
     }
 
@@ -2591,6 +2606,16 @@ impl FrontDoor {
                         self.copilot = CopilotState::Unavailable;
                     }
                 }
+                Task::none()
+            }
+            // FRONTDOOR-16 — the operator dismissed the guided first-run greeting
+            // (Q27). Clear it for this session and persist the "greeted" sentinel so
+            // it never returns on this node (Q71 — the greeting is the whole, no-tour
+            // onboarding). The write is best-effort: a failure just means the card
+            // might greet once more, never an error spew.
+            Message::DismissGreeting => {
+                self.show_greeting = false;
+                mark_greeting_seen();
                 Task::none()
             }
         }
@@ -3376,9 +3401,15 @@ impl FrontDoor {
                 .into()
         };
 
-        let body = column![top_bar, content]
-            .width(Length::Fill)
-            .height(Length::Fill);
+        // FRONTDOOR-16 — the guided first-run greeting (Q27) above the icon grid,
+        // the same once-per-node card the panel mode shows (both modes are reachable
+        // surfaces — §7). `None` once dismissed / while searching.
+        let body = match self.greeting_banner(palette) {
+            Some(greeting) => column![top_bar, greeting, content],
+            None => column![top_bar, content],
+        }
+        .width(Length::Fill)
+        .height(Length::Fill);
 
         container(body)
             .width(Length::Fill)
@@ -3555,9 +3586,15 @@ impl FrontDoor {
             self.tile_grid()
         };
 
-        let pane = column![omnibox_bar, content]
-            .width(Length::Fill)
-            .height(Length::Fill);
+        // FRONTDOOR-16 — the one-time guided-first-run greeting (Q27) sits above
+        // the resting grid (never over search results). `greeting_banner` is `None`
+        // once dismissed / while searching, so the normal pane is unchanged.
+        let pane = match self.greeting_banner(palette) {
+            Some(greeting) => column![omnibox_bar, greeting, content],
+            None => column![omnibox_bar, content],
+        }
+        .width(Length::Fill)
+        .height(Length::Fill);
 
         container(pane)
             .width(Length::Fill)
@@ -3575,6 +3612,24 @@ impl FrontDoor {
     /// unchanged).
     fn searching(&self) -> bool {
         !self.query.trim().is_empty()
+    }
+
+    /// FRONTDOOR-16 — the guided first-run greeting banner (Q27), or `None`. It
+    /// shows ONLY on the resting grid of a node that has never dismissed it: not
+    /// once `show_greeting` is cleared (dismissed / a returning operator), and not
+    /// while the omnibox is driving a search (the results own the pane then). The
+    /// caller drops it between the omnibox bar and the grid in either mode. Padded
+    /// to align with the omnibox/grid gutters; the card itself is `greeting_card`.
+    fn greeting_banner(&self, palette: Palette) -> Option<Element<'_, crate::Message, Theme>> {
+        if !self.show_greeting || self.searching() {
+            return None;
+        }
+        Some(
+            container(greeting_card(palette))
+                .width(Length::Fill)
+                .padding(Padding::from([0u16, 16u16]))
+                .into(),
+        )
     }
 
     /// FRONTDOOR-6 — the unified search results, rendered BELOW the omnibox in
@@ -4233,6 +4288,113 @@ fn whoami_label() -> String {
         .ok()
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| "Account".to_string())
+}
+
+/// FRONTDOOR-16 — the path of the once-per-node "greeted" sentinel: an empty
+/// marker file under the same `~/.config/mde/` the preferences live in (the
+/// workbench owns this dir already — `backend::default_settings_path`). Its mere
+/// EXISTENCE means the guided first-run greeting (Q27) has been dismissed on this
+/// node, so it never shows again (Q71 — the greeting is the whole onboarding).
+/// `None` only when neither `XDG_CONFIG_HOME` nor `HOME` is set (a misconfigured
+/// process) — the greeting then simply shows every launch rather than erroring.
+fn greeting_sentinel_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .map(|base| base.join("mde").join("frontdoor-greeted"))
+}
+
+/// FRONTDOOR-16 — has the guided first-run greeting already been dismissed on
+/// this node? True once the sentinel exists. A returning operator (the file is
+/// there) is never greeted again; a fresh install / a wiped config greets once.
+fn greeting_already_seen() -> bool {
+    greeting_sentinel_path().is_some_and(|p| p.exists())
+}
+
+/// FRONTDOOR-16 — record that the greeting has been seen (write the sentinel).
+/// Best-effort: a write failure (no config dir, read-only FS) is swallowed — the
+/// worst case is the card greets once more, never an error spew (matching the
+/// "no error spew" posture the prefs persistence already takes). Creating the
+/// parent is harmless if `preferences.toml` already made it.
+fn mark_greeting_seen() {
+    if let Some(path) = greeting_sentinel_path() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, b"");
+    }
+}
+
+/// FRONTDOOR-16 — the one-time guided first-run welcome card (Q27): a Copilot
+/// greeting that introduces the auto-built tile grid, with a single **Got it**
+/// dismiss (Q71 — no tour; the greeting IS the onboarding). Rendered ABOVE the
+/// resting tile grid (never over search results / a detail / settings), once per
+/// node. Carbon chrome via `mde-theme` tokens only (§4); the accent-headed raised
+/// card mirrors the Copilot answer card so the AI voice reads consistent.
+fn greeting_card<'a>(palette: Palette) -> Element<'a, crate::Message, Theme> {
+    let sizes = FontSize::defaults();
+    let accent = palette.accent.into_cosmic_color();
+    let raised = palette.raised.into_cosmic_color();
+    let idle_bg = palette.hover_tint().into_cosmic_color();
+
+    let dismiss = button(
+        text("Got it")
+            .size(TypeRole::Body.size_in(sizes))
+            .colr(accent),
+    )
+    .padding(Padding::from([8u16, 16u16]))
+    .sty(
+        move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+            use cosmic::iced::widget::button::Status;
+            let bg = match status {
+                Status::Hovered | Status::Pressed => raised,
+                _ => idle_bg,
+            };
+            cosmic::iced::widget::button::Style {
+                snap: false,
+                background: Some(Background::Color(bg)),
+                text_color: accent,
+                border: Border {
+                    color: cosmic::iced::Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 6.0.into(),
+                },
+                shadow: cosmic::iced::Shadow::default(),
+                ..cosmic::iced::widget::button::Style::default()
+            }
+        },
+    )
+    .on_press(crate::Message::FrontDoor(Message::DismissGreeting));
+
+    let body = column![
+        text("Welcome — I'm Copilot")
+            .size(TypeRole::Heading.size_in(sizes))
+            .colr(palette.accent.into_cosmic_color()),
+        text(
+            "Your tiles are building themselves from the live mesh — node health, \
+             builds, alerts, and more. Click any tile to act on it, or just ask me \
+             anything in the search bar above."
+        )
+        .size(TypeRole::Body.size_in(sizes))
+        .colr(palette.text.into_cosmic_color()),
+        row![Space::new().width(Length::Fill), dismiss].align_y(cosmic::iced::Alignment::Center),
+    ]
+    .spacing(10)
+    .width(Length::Fill);
+
+    container(body)
+        .width(Length::Fill)
+        .padding(Padding::from([16u16, 18u16]))
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(palette.surface.into_cosmic_color())),
+            border: Border {
+                color: palette.accent.into_cosmic_color(),
+                width: 1.0,
+                radius: 10.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// A rail section header (Pinned / Surfaces), muted + caption-sized.
@@ -7719,5 +7881,69 @@ mod tests {
         // The degrade path renders the quiet unavailable note (Q33), no speech.
         let _ = fd.update(Message::VoiceReplied(1, CopilotAnswer::Unavailable));
         assert_eq!(fd.copilot, CopilotState::Unavailable);
+    }
+
+    // ── FRONTDOOR-16 — the guided first-run greeting (Q27, no tour Q71) ──────────
+
+    #[test]
+    fn first_run_greets_then_dismiss_persists_so_it_shows_once() {
+        with_isolated_prefs(|| {
+            // A fresh node (no "greeted" sentinel) shows the welcome card.
+            assert!(!greeting_already_seen(), "fresh config has no sentinel");
+            let mut fd = FrontDoor::new();
+            assert!(fd.show_greeting, "first run greets (Q27)");
+            assert!(
+                fd.greeting_banner(crate::live_theme::palette()).is_some(),
+                "the banner renders on the resting grid"
+            );
+
+            // Dismissing it clears the card AND writes the once-per-node sentinel.
+            let _ = fd.update(Message::DismissGreeting);
+            assert!(!fd.show_greeting, "dismiss hides the card this session");
+            assert!(greeting_already_seen(), "dismiss persists the sentinel");
+            assert!(
+                fd.greeting_banner(crate::live_theme::palette()).is_none(),
+                "no banner once dismissed"
+            );
+
+            // A FRESH construction (a later launch / restart) does NOT greet again —
+            // the sentinel makes it exactly once per node (Q71 — no repeated tour).
+            let fd2 = FrontDoor::new();
+            assert!(!fd2.show_greeting, "a returning operator is never re-greeted");
+        });
+    }
+
+    #[test]
+    fn greeting_is_suppressed_while_searching() {
+        with_isolated_prefs(|| {
+            let mut fd = FrontDoor::new();
+            assert!(fd.show_greeting);
+            // While the omnibox drives a search, the results own the pane — the
+            // greeting steps aside (it returns once the query clears).
+            fd.query = "mesh".into();
+            assert!(
+                fd.greeting_banner(crate::live_theme::palette()).is_none(),
+                "no greeting over search results"
+            );
+            fd.query.clear();
+            assert!(
+                fd.greeting_banner(crate::live_theme::palette()).is_some(),
+                "the greeting returns on the resting grid"
+            );
+        });
+    }
+
+    #[test]
+    fn greeting_renders_in_both_modes() {
+        with_isolated_prefs(|| {
+            let mut fd = FrontDoor::new();
+            assert!(fd.show_greeting);
+            // Panel mode (Win10 Start) — the resting view builds with the card.
+            fd.mode = Mode::Panel;
+            let _: Element<'_, crate::Message, Theme> = fd.view();
+            // Full-screen mode (iPadOS home) — the card is reachable here too (§7).
+            fd.mode = Mode::FullScreen;
+            let _: Element<'_, crate::Message, Theme> = fd.view();
+        });
     }
 }
