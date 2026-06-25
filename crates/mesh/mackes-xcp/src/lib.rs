@@ -29,6 +29,16 @@ use std::process::Command;
 
 use thiserror::Error;
 
+/// Default RAM for a freshly spawned headless MDE-VM, in bytes (2 GiB).
+///
+/// XPA-1: a clone inherits the *golden's* memory, and the golden was sized for a
+/// desktop (4 GiB) — fanning out several clones at that size overcommits a
+/// typical host (a 15.9 GB host can't start 4×4 GiB VMs + the base). Headless
+/// Server VMs are right-sized to 2 GiB here so a spawn doesn't inherit the
+/// oversized golden footprint. The spawn path pins all four memory limits
+/// (static/dynamic min+max) to this value via [`argv_set_memory`].
+pub const MDE_VM_DEFAULT_MEM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Where (and how) to run `xe`.
 ///
 /// `Debug` is hand-rolled below (not derived) to redact the XCP-7 password.
@@ -192,6 +202,25 @@ pub fn argv_clone(golden: &str, new_name: &str) -> Vec<String> {
 #[must_use]
 pub fn argv_start(uuid: &str) -> Vec<String> {
     vec!["vm-start".into(), format!("uuid={uuid}")]
+}
+
+/// `xe vm-memory-limits-set uuid=<uuid> static-min=<b> static-max=<b>
+/// dynamic-min=<b> dynamic-max=<b>` — pin a (halted) clone's RAM to `bytes`
+/// (XPA-1). Sets all four limits in one `xe` call (the order XCP requires:
+/// static-min ≤ dynamic-min ≤ dynamic-max ≤ static-max), so the clone boots at
+/// the right-sized footprint instead of inheriting the golden's. Mirrors the
+/// `vm-memory-limits-set` the golden-template + build-VM setup scripts use. Pure
+/// + tested so the memory-set surface can't silently drift.
+#[must_use]
+pub fn argv_set_memory(uuid: &str, bytes: u64) -> Vec<String> {
+    vec![
+        "vm-memory-limits-set".into(),
+        format!("uuid={uuid}"),
+        format!("static-min={bytes}"),
+        format!("static-max={bytes}"),
+        format!("dynamic-min={bytes}"),
+        format!("dynamic-max={bytes}"),
+    ]
 }
 
 /// `xe vm-shutdown uuid=<uuid> force=true` then uninstall — destroy is two steps;
@@ -558,6 +587,13 @@ pub trait Hypervisor {
     /// # Errors
     /// Spawn / non-zero `xe` failures.
     fn set_identity_seed(&self, uuid: &str, seed: &IdentitySeed) -> Result<(), XcpError>;
+    /// Pin a (freshly cloned, still halted) VM's RAM to `bytes` (XPA-1), so a
+    /// clone doesn't inherit the oversized golden footprint. Called between
+    /// [`Hypervisor::set_identity_seed`] and [`Hypervisor::start`].
+    ///
+    /// # Errors
+    /// Spawn / non-zero `xe` failures.
+    fn set_memory(&self, uuid: &str, bytes: u64) -> Result<(), XcpError>;
     /// Start a VM by uuid.
     ///
     /// # Errors
@@ -679,6 +715,10 @@ impl Hypervisor for XeSsh {
         self.run(&argv_set_identity_seed(uuid, seed)).map(|_| ())
     }
 
+    fn set_memory(&self, uuid: &str, bytes: u64) -> Result<(), XcpError> {
+        self.run(&argv_set_memory(uuid, bytes)).map(|_| ())
+    }
+
     fn start(&self, uuid: &str) -> Result<(), XcpError> {
         self.run(&argv_start(uuid)).map(|_| ())
     }
@@ -726,6 +766,25 @@ mod tests {
         assert_eq!(
             argv_uninstall("u1"),
             vec!["vm-uninstall", "uuid=u1", "force=true"]
+        );
+    }
+
+    #[test]
+    fn argv_set_memory_pins_all_four_limits_to_2gib() {
+        // XPA-1: the spawn path pins a clone's RAM to 2 GiB (default headless
+        // footprint) so it doesn't inherit the oversized golden.
+        assert_eq!(MDE_VM_DEFAULT_MEM_BYTES, 2 * 1024 * 1024 * 1024);
+        let argv = argv_set_memory("u1", MDE_VM_DEFAULT_MEM_BYTES);
+        assert_eq!(
+            argv,
+            vec![
+                "vm-memory-limits-set",
+                "uuid=u1",
+                "static-min=2147483648",
+                "static-max=2147483648",
+                "dynamic-min=2147483648",
+                "dynamic-max=2147483648",
+            ]
         );
     }
 

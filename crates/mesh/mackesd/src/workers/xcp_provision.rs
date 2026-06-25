@@ -44,6 +44,7 @@ use std::time::{Duration, Instant};
 
 use mackes_xcp::{
     build_identity_seed, mde_vm_hostname, HostCapacity, HostTarget, Hypervisor, VmInfo, XeSsh,
+    MDE_VM_DEFAULT_MEM_BYTES,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -393,26 +394,69 @@ pub fn resolve_dom0(requested: Option<&str>, allowed: &[String]) -> Result<Strin
     }
 }
 
+/// Free memory the host must have before a spawn fans out, in KiB (XPA-1).
+///
+/// The right-sized headless footprint ([`MDE_VM_DEFAULT_MEM_BYTES`], 2 GiB). The
+/// pre-check refuses early when a host has less than this free, so a fan-out
+/// can't overcommit the host (the 4 GiB golden clones did).
+pub const SPAWN_MIN_FREE_MEM_KIB: u64 = MDE_VM_DEFAULT_MEM_BYTES / 1024;
+
+/// XPA-1 capacity pre-check ahead of a spawn fan-out.
+///
+/// The host must have at least [`SPAWN_MIN_FREE_MEM_KIB`] free. `Ok(())` to
+/// proceed; `Err` with a CLEAR, actionable message (the host, its free RAM, and
+/// the requirement — not a vague "no suitable hosts") when the host can't fit
+/// the right-sized VM. Pure so the boundary is testable without a live dom0.
+///
+/// # Errors
+/// `Err` when `cap.mem_free_kib < SPAWN_MIN_FREE_MEM_KIB`.
+pub fn check_spawn_capacity(host: &str, cap: &HostCapacity) -> Result<(), String> {
+    if cap.mem_free_kib >= SPAWN_MIN_FREE_MEM_KIB {
+        return Ok(());
+    }
+    Err(format!(
+        "dom0 {host} has only {free} MiB free; a spawn needs {need} MiB \
+         (the 2 GiB headless default) — free memory on the host (halt/destroy a VM) \
+         or target another dom0 before spawning",
+        free = cap.mem_free_kib / 1024,
+        need = SPAWN_MIN_FREE_MEM_KIB / 1024,
+    ))
+}
+
 /// Drive the full A-plane spawn over a [`Hypervisor`].
 ///
-/// Clones the golden, attaches the fresh identity seed, starts, and polls for
-/// the IP. Generic over the hypervisor so the reachability of `set_identity_seed`
-/// is provable with a mock (no live dom0). `op_ssh_key` is the operator's
-/// authorized public key the seed installs. `wait`/`poll` bound the IP wait
-/// (0 ⇒ skip the wait).
+/// Pre-checks the host's free memory ([`check_spawn_capacity`], XPA-1) so the
+/// fan-out can't overcommit it, then clones the golden, attaches the fresh
+/// identity seed, **right-sizes the clone's RAM to the 2 GiB headless default**
+/// ([`MDE_VM_DEFAULT_MEM_BYTES`], XPA-1 — so it doesn't inherit the oversized
+/// golden footprint), starts, and polls for the IP. Generic over the hypervisor
+/// so the reachability of `set_identity_seed`/`set_memory` is provable with a mock
+/// (no live dom0). `op_ssh_key` is the operator's authorized public key the seed
+/// installs. `wait`/`poll` bound the IP wait (0 ⇒ skip the wait).
 ///
 /// Returns the success-ack body; `Err(description)` becomes an error-ack.
 ///
 /// # Errors
-/// Any `xe`/`ssh` step failing (clone / seed / start) aborts the spawn.
+/// The capacity pre-check failing (host can't fit the VM) aborts BEFORE any
+/// clone; any `xe`/`ssh` step failing (clone / seed / set-memory / start)
+/// aborts the spawn.
 pub fn run_spawn<H: Hypervisor>(
     hv: &H,
+    host: &str,
     name: &str,
     op_ssh_key: &str,
     wait: Duration,
     poll: Duration,
 ) -> Result<String, String> {
     let hostname = mde_vm_hostname(name);
+
+    // 1. XPA-1 pre-check: refuse BEFORE fanning out a clone if the host can't fit
+    //    the right-sized VM. A probe error is itself a clear, actionable failure
+    //    (we won't clone onto a host whose capacity we can't read).
+    let cap = hv
+        .host_capacity()
+        .map_err(|e| format!("probe dom0 {host} capacity before spawn: {e}"))?;
+    check_spawn_capacity(host, &cap)?;
 
     // 2a. Clone the golden template into the new MDE-VM.
     let uuid = hv
@@ -426,6 +470,12 @@ pub fn run_spawn<H: Hypervisor>(
     let seed = build_identity_seed(name, op_ssh_key, &uuid);
     hv.set_identity_seed(&uuid, &seed)
         .map_err(|e| format!("attach identity seed to {uuid}: {e}"))?;
+
+    // 2c. XPA-1: right-size the clone's RAM to the 2 GiB headless default (the
+    //     clone otherwise inherits the golden's oversized footprint). Done while
+    //     still halted, before start.
+    hv.set_memory(&uuid, MDE_VM_DEFAULT_MEM_BYTES)
+        .map_err(|e| format!("set memory on {uuid}: {e}"))?;
 
     // 3a. Start (UEFI inherited from the golden).
     hv.start(&uuid).map_err(|e| format!("start {uuid}: {e}"))?;
@@ -537,12 +587,11 @@ fn run_spawn_blocking(bus_root: PathBuf, req: &SpawnRequest) {
 /// Build the live [`XeSsh`] target for the request + run the spawn. Split from
 /// [`run_spawn`] so the latter stays host-free + unit-testable.
 fn spawn_over_ssh(req: &SpawnRequest) -> Result<String, String> {
-    let hv = XeSsh::new(hv_target_for(&resolve_dom0(
-        req.host.as_deref(),
-        &allowed_dom0s(),
-    )?));
+    let dom0 = resolve_dom0(req.host.as_deref(), &allowed_dom0s())?;
+    let hv = XeSsh::new(hv_target_for(&dom0));
     run_spawn(
         &hv,
+        &dom0,
         &req.name,
         &operator_ssh_key(),
         IP_WAIT_TIMEOUT,
@@ -1079,6 +1128,12 @@ mod tests {
             *self.seeded_uuid.borrow_mut() = Some(uuid.to_string());
             Ok(())
         }
+        fn set_memory(&self, uuid: &str, bytes: u64) -> Result<(), XcpError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("set_memory({uuid},{bytes})"));
+            Ok(())
+        }
         fn start(&self, uuid: &str) -> Result<(), XcpError> {
             self.calls.borrow_mut().push(format!("start({uuid})"));
             Ok(())
@@ -1094,7 +1149,16 @@ mod tests {
             unreachable!("list is not part of the spawn flow")
         }
         fn host_capacity(&self) -> Result<HostCapacity, XcpError> {
-            unreachable!("host_capacity is not part of the spawn flow")
+            // XPA-1: the spawn pre-check probes capacity first; return a host with
+            // ample free RAM so the happy-path spawn proceeds.
+            self.calls.borrow_mut().push("host_capacity".to_string());
+            Ok(HostCapacity {
+                cpu_count: 8,
+                mem_total_kib: 16 * 1024 * 1024,
+                mem_free_kib: 8 * 1024 * 1024,
+                sr_free_bytes: 1 << 40,
+                running_vms: 1,
+            })
         }
     }
 
@@ -1103,6 +1167,7 @@ mod tests {
         let hv = MockHv::default();
         let ack = run_spawn(
             &hv,
+            "172.20.0.4",
             "web1",
             "ssh-ed25519 OPKEY op@host",
             Duration::ZERO, // skip the wait — vm_ip is probed once
@@ -1110,19 +1175,23 @@ mod tests {
         )
         .expect("spawn ok");
 
-        // REACHABILITY ASSERTION — set_identity_seed is invoked, in order,
-        // between the clone and the start. This is the whole point of the unit:
-        // a provisioned VM actually gets its identity seed.
+        // REACHABILITY ASSERTION — the spawn probes capacity first (XPA-1
+        // pre-check), then set_identity_seed runs between the clone and the start
+        // and set_memory right-sizes the clone (XPA-1) before start. This is the
+        // whole point of the unit: a provisioned VM gets its identity seed AND a
+        // right-sized footprint, and the host is checked before fan-out.
         let calls = hv.calls.borrow().clone();
         assert_eq!(
             calls,
             vec![
+                "host_capacity".to_string(),
                 "clone(MDE-VM-golden->MDE-VM-web1)".to_string(),
                 "seed(uuid-xyz)".to_string(),
+                "set_memory(uuid-xyz,2147483648)".to_string(),
                 "start(uuid-xyz)".to_string(),
                 "vm_ip".to_string(),
             ],
-            "set_identity_seed must run between clone_golden and start"
+            "capacity pre-check → clone → seed → set_memory → start order"
         );
 
         // The seed was attached to the freshly cloned uuid…
@@ -1154,6 +1223,9 @@ mod tests {
             fn set_identity_seed(&self, _u: &str, _s: &IdentitySeed) -> Result<(), XcpError> {
                 Err(XcpError::Parse("boom".into()))
             }
+            fn set_memory(&self, _u: &str, _b: u64) -> Result<(), XcpError> {
+                panic!("set_memory must not run after a seed failure");
+            }
             fn start(&self, _u: &str) -> Result<(), XcpError> {
                 panic!("start must not run after a seed failure");
             }
@@ -1167,11 +1239,17 @@ mod tests {
                 unreachable!()
             }
             fn host_capacity(&self) -> Result<HostCapacity, XcpError> {
-                unreachable!()
+                // The pre-check runs first; give it ample RAM so the spawn gets
+                // past it and reaches the (failing) seed step under test.
+                Ok(HostCapacity {
+                    mem_free_kib: 8 * 1024 * 1024,
+                    ..HostCapacity::default()
+                })
             }
         }
         let err = run_spawn(
             &SeedFails,
+            "172.20.0.4",
             "web1",
             "ssh-ed25519 K op@h",
             Duration::ZERO,
@@ -1179,6 +1257,86 @@ mod tests {
         )
         .expect_err("seed failure must abort");
         assert!(err.contains("identity seed"), "{err}");
+    }
+
+    // ── XPA-1: 2 GiB memory default + free-memory pre-check ──
+
+    #[test]
+    fn check_spawn_capacity_passes_when_host_has_room() {
+        // Exactly the 2 GiB requirement free → OK (the boundary is inclusive).
+        let cap = HostCapacity {
+            mem_free_kib: SPAWN_MIN_FREE_MEM_KIB,
+            ..HostCapacity::default()
+        };
+        assert!(check_spawn_capacity("172.20.0.4", &cap).is_ok());
+        assert_eq!(SPAWN_MIN_FREE_MEM_KIB, 2 * 1024 * 1024); // 2 GiB in KiB
+    }
+
+    #[test]
+    fn check_spawn_capacity_rejects_with_a_clear_message() {
+        // 1 GiB free, the VM needs 2 GiB → reject. The XPA-1 requirement: a CLEAR
+        // message (the host, its free RAM, the requirement) — NOT "no suitable
+        // hosts".
+        let cap = HostCapacity {
+            mem_free_kib: 1024 * 1024, // 1 GiB
+            ..HostCapacity::default()
+        };
+        let err = check_spawn_capacity("172.20.0.4", &cap).expect_err("too small");
+        assert!(err.contains("172.20.0.4"), "names the host: {err}");
+        assert!(err.contains("1024 MiB free"), "states free RAM: {err}");
+        assert!(err.contains("2048 MiB"), "states the requirement: {err}");
+        assert!(
+            !err.contains("no suitable host"),
+            "must not be the vague message: {err}"
+        );
+    }
+
+    #[test]
+    fn run_spawn_aborts_before_clone_when_host_is_overcommitted() {
+        // XPA-1: the pre-check runs BEFORE any clone. A host short on RAM aborts
+        // the spawn without fanning out a clone (which would overcommit it).
+        struct TooSmall;
+        impl Hypervisor for TooSmall {
+            fn host_capacity(&self) -> Result<HostCapacity, XcpError> {
+                Ok(HostCapacity {
+                    mem_free_kib: 512 * 1024, // 512 MiB — far below 2 GiB
+                    ..HostCapacity::default()
+                })
+            }
+            fn clone_golden(&self, _g: &str, _n: &str) -> Result<String, XcpError> {
+                panic!("clone must NOT run when the host can't fit the VM");
+            }
+            fn set_identity_seed(&self, _u: &str, _s: &IdentitySeed) -> Result<(), XcpError> {
+                unreachable!()
+            }
+            fn set_memory(&self, _u: &str, _b: u64) -> Result<(), XcpError> {
+                unreachable!()
+            }
+            fn start(&self, _u: &str) -> Result<(), XcpError> {
+                unreachable!()
+            }
+            fn vm_ip(&self, _u: &str) -> Result<Option<String>, XcpError> {
+                unreachable!()
+            }
+            fn destroy(&self, _u: &str) -> Result<(), XcpError> {
+                unreachable!()
+            }
+            fn list(&self) -> Result<Vec<VmInfo>, XcpError> {
+                unreachable!()
+            }
+        }
+        let err = run_spawn(
+            &TooSmall,
+            "172.20.0.4",
+            "web1",
+            "ssh-ed25519 K op@h",
+            Duration::ZERO,
+            Duration::from_millis(1),
+        )
+        .expect_err("overcommit must abort the spawn");
+        // The clear capacity message, surfaced as the spawn error (not a vague one).
+        assert!(err.contains("only 512 MiB free"), "{err}");
+        assert!(err.contains("2048 MiB"), "{err}");
     }
 
     // ── topic locks ──
