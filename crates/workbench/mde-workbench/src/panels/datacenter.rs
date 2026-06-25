@@ -28,6 +28,9 @@ use crate::controls::{variant_button, ButtonVariant};
 // Brings the `.colr(..)` text extension + `Rgba::into_cosmic_color()` into scope
 // (same import the other token-styled panels use). mde-theme tokens only.
 use crate::cosmic_compat::prelude::*;
+// DATACENTER-24 — the Logs tab reuses the Fleet-logs sink load + filter + row
+// model rather than re-deriving a second log reader (§6 glue).
+use crate::panels::fleet_logs;
 
 /// One datacenter resource as last seen on the Bus.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -485,6 +488,33 @@ pub fn health_summary(checks: &[HealthCheck]) -> (usize, usize, usize) {
         }
     }
     (ok, warn, fail)
+}
+
+/// Max log rows the Logs tab renders — the dom0 journal tails the `dc_health`
+/// worker aggregates can be large, so the in-plane view is capped (the Fleet-logs
+/// panel keeps the unbounded search). Bounds the render the same way the worker
+/// bounds the pull.
+pub const LOGS_VIEW_CAP: usize = 300;
+
+/// DATACENTER-24 — keep only the datacenter-scoped log rows: those whose `host`
+/// matches one of the datacenter host ids (the dom0 IPs the `dc_health` worker
+/// tags each aggregated journal line with — `<root>/logs/<dom0>.jsonl`). When the
+/// scope set is empty (no host rows known yet), nothing is datacenter-scoped, so it
+/// returns empty rather than spilling the whole fleet's mesh logs into the
+/// Datacenter plane. Pure + testable; reuses [`fleet_logs::LogRow`] so the Logs tab
+/// is glue over the existing sink, not a second log model (§6).
+#[must_use]
+pub fn datacenter_log_rows(
+    rows: &[fleet_logs::LogRow],
+    dc_host_ids: &std::collections::BTreeSet<String>,
+) -> Vec<fleet_logs::LogRow> {
+    if dc_host_ids.is_empty() {
+        return Vec::new();
+    }
+    rows.iter()
+        .filter(|r| dc_host_ids.contains(&r.host))
+        .cloned()
+        .collect()
 }
 
 /// One datacenter-action **job** as last seen on the Bus (`event/dc/job/<ulid>`).
@@ -1151,6 +1181,11 @@ pub struct DatacenterPanel {
     /// DATACENTER-13 (Network tab) — the overlay routes read off `event/dc/route/*`.
     /// Rendered as the overlay peer/route table. Refreshed alongside `rows`.
     pub routes: Vec<RouteRow>,
+    /// DATACENTER-24 (Logs tab) — the datacenter-scoped log rows the `dc_health`
+    /// worker aggregates into the `fleet_logs` sink (`<root>/logs/<dom0>.jsonl`),
+    /// already narrowed to the datacenter host ids. Rendered by the `Logs` view;
+    /// refreshed alongside `rows` on every load.
+    pub logs: Vec<fleet_logs::LogRow>,
     /// DATACENTER-13 (Network tab) — the decoded `host-net` L2 read for the active
     /// dom0 (its networks + PIFs/NICs). `None` until "Read L2" returns. Populated by
     /// the `action/dc/host-net` RPC; the L2 inventory renders off it.
@@ -1235,6 +1270,12 @@ pub enum ViewMode {
     /// (read-mostly), with a tofu-gated Plan / typed-confirm Apply for reservation
     /// changes (the `edgeos` workspace — never a blind apply from the GUI).
     Gateway,
+    /// DATACENTER-24 — the Logs tab: the per-resource (per-dom0) journal tail the
+    /// `dc_health` worker aggregates into the `fleet_logs` sink
+    /// (`<root>/logs/<dom0>.jsonl`). Reuses the Fleet-logs load + filter; the
+    /// global search box narrows the message/target, and rows are scoped to the
+    /// datacenter hosts so the operator reads host/VM/service logs in-plane.
+    Logs,
 }
 
 impl ViewMode {
@@ -1255,6 +1296,7 @@ impl ViewMode {
             ViewMode::Network => "network",
             ViewMode::Power => "power",
             ViewMode::Gateway => "gateway",
+            ViewMode::Logs => "logs",
         }
     }
 
@@ -1275,6 +1317,7 @@ impl ViewMode {
             "network" => ViewMode::Network,
             "power" => ViewMode::Power,
             "gateway" => ViewMode::Gateway,
+            "logs" => ViewMode::Logs,
             // "overview" and anything unknown.
             _ => ViewMode::Overview,
         }
@@ -1896,6 +1939,9 @@ impl Default for DatacenterPanel {
             // DATACENTER-13 (Network tab) — routes hydrate from the Bus on load; the
             // L2 read + VLAN-create form hydrate from operator gestures.
             routes: Vec::new(),
+            // DATACENTER-24 (Logs tab) — the dom0 journal tails hydrate from the
+            // fleet_logs sink on load.
+            logs: Vec::new(),
             net_read: None,
             vlan_create: VlanCreateForm::default(),
             net_read_dom0: String::new(),
@@ -1935,6 +1981,11 @@ pub struct DcLoad {
     /// DATACENTER-13 — the overlay routes read off `event/dc/route/*`. Rendered as
     /// the Network tab's overlay peer/route table. Refreshed alongside `rows`.
     pub routes: Vec<RouteRow>,
+    /// DATACENTER-24 — the datacenter-scoped log rows the `dc_health` worker
+    /// aggregates into the `fleet_logs` sink (`<root>/logs/<dom0>.jsonl`), already
+    /// narrowed to the datacenter host ids. Rendered by the `Logs` view; refreshed
+    /// alongside `rows` on every load.
+    pub logs: Vec<fleet_logs::LogRow>,
 }
 
 #[derive(Debug, Clone)]
@@ -2433,6 +2484,7 @@ impl DatacenterPanel {
                 self.health = load.health;
                 self.jobs = load.jobs;
                 self.routes = load.routes;
+                self.logs = load.logs;
                 self.busy = false;
                 self.load_error = None;
                 self.status.clear();
@@ -5651,6 +5703,7 @@ impl DatacenterPanel {
             mode_btn("Resources", ViewMode::Zone),
             mode_btn("Tofu", ViewMode::Tofu),
             mode_btn("Audit", ViewMode::Audit),
+            mode_btn("Logs", ViewMode::Logs),
             refresh_btn,
         ]
         .spacing(f32::from(spacing::BASE[2]));
@@ -6212,6 +6265,18 @@ impl DatacenterPanel {
             }
             ViewMode::Gateway => {
                 col = col.push(self.gateway_tab_view(palette));
+            }
+            ViewMode::Logs => {
+                col = col.push(text("Logs").size(f32::from(spacing::BASE[5])));
+                // The global search box doubles as the log query (message OR
+                // target, case-insensitive) — the same Fleet-logs filter, capped
+                // for in-plane render. Newest-first; only datacenter-host journal
+                // lines (already narrowed at load).
+                let visible =
+                    fleet_logs::filter_rows(&self.logs, "trace", &self.filter, LOGS_VIEW_CAP);
+                for el in logs_section_view(&self.logs, &visible, palette) {
+                    col = col.push(el);
+                }
             }
             ViewMode::Zone => {
                 if self.rows.is_empty() {
@@ -6930,6 +6995,92 @@ fn health_section_view(
     out
 }
 
+/// Map a `fleet_logs` level string to a mde-theme severity token: `error` →
+/// danger, `warn`/`warning` → warning, everything else → muted text. Keeps the
+/// Logs tab's colouring on the shared palette (§4 — no raw hex). Pure.
+#[must_use]
+fn log_level_color(level: &str, palette: Palette) -> mde_theme::Rgba {
+    match level.to_ascii_lowercase().as_str() {
+        "error" => palette.danger,
+        "warn" | "warning" => palette.warning,
+        _ => palette.text_muted,
+    }
+}
+
+/// DATACENTER-24 — render the **Logs** tab: the per-dom0 journal tails the
+/// `dc_health` worker aggregated into the `fleet_logs` sink, already narrowed to
+/// the datacenter hosts (`all`) and filtered to the visible page (`visible`,
+/// newest-first). Each row is `level · host · target · message`, the level
+/// coloured by its severity token. Empty states distinguish "no datacenter logs
+/// aggregated yet" (the worker hasn't run / no dom0s configured) from "no rows
+/// match the search". Returns a list of elements so the view column can push them
+/// in order. mde-theme tokens only — no raw hex.
+fn logs_section_view(
+    all: &[fleet_logs::LogRow],
+    visible: &[fleet_logs::LogRow],
+    palette: Palette,
+) -> Vec<Element<'static, crate::Message>> {
+    let mut out: Vec<Element<'static, crate::Message>> = Vec::new();
+    out.push(
+        text(format!(
+            "{} aggregated record(s) · {} shown",
+            all.len(),
+            visible.len()
+        ))
+        .colr(palette.text_muted.into_cosmic_color())
+        .into(),
+    );
+    if all.is_empty() {
+        out.push(
+            text(
+                "No datacenter logs aggregated yet. The dc_health worker folds each \
+                 configured dom0's recent journal tail into the fleet logs sink \
+                 (<root>/logs/<dom0>.jsonl).",
+            )
+            .colr(palette.text_muted.into_cosmic_color())
+            .into(),
+        );
+        return out;
+    }
+    if visible.is_empty() {
+        out.push(
+            text("No log records match the search.")
+                .colr(palette.text_muted.into_cosmic_color())
+                .into(),
+        );
+        return out;
+    }
+    for r in visible {
+        let level = if r.level.is_empty() {
+            "—".to_string()
+        } else {
+            r.level.clone()
+        };
+        let line = row![
+            text(level)
+                .colr(log_level_color(&r.level, palette).into_cosmic_color())
+                .width(Length::Fixed(64.0)),
+            text(r.host.clone())
+                .colr(palette.text_muted.into_cosmic_color())
+                .width(Length::FillPortion(2)),
+            text(r.target.clone())
+                .colr(palette.text_muted.into_cosmic_color())
+                .width(Length::FillPortion(2)),
+            text(r.message.clone())
+                .colr(palette.text.into_cosmic_color())
+                .width(Length::FillPortion(5)),
+        ]
+        .spacing(f32::from(spacing::BASE[3]));
+        out.push(
+            container(line)
+                .padding(f32::from(spacing::BASE[2]))
+                .width(Length::Fill)
+                .into(),
+        );
+    }
+    out
+}
+
 /// Render the **Recent Tofu runs** section of the Overview: a newest-first
 /// run-log of the datacenter action jobs (`event/dc/job/*`) filtered to the Tofu
 /// verbs via [`recent_tofu_runs`]. Each row pairs the verb (the `dc/tofu-` prefix
@@ -7254,13 +7405,28 @@ fn read_dc_events() -> Result<DcLoad, String> {
             }
         }
     }
+    let rows = project_rows(&events);
+    // DATACENTER-24 — read the dom0 journal tails the `dc_health` worker aggregated
+    // into the fleet_logs sink and narrow them to this datacenter's hosts. The
+    // host ids are the `host`-kind rows' ids (the dom0 IPs the worker tags each
+    // line with). Reuses the Fleet-logs `load_all` reader (§6 glue).
+    let dc_host_ids: std::collections::BTreeSet<String> = rows
+        .iter()
+        .filter(|r| r.kind == "host")
+        .map(|r| r.id.clone())
+        .collect();
+    let logs = datacenter_log_rows(
+        &fleet_logs::load_all(&fleet_logs::workgroup_root()),
+        &dc_host_ids,
+    );
     Ok(DcLoad {
-        rows: project_rows(&events),
+        rows,
         audit: project_audit(&events),
         promote: project_promote(&events),
         health: project_health(&events),
         jobs: project_jobs(&events),
         routes: project_routes(&events),
+        logs,
     })
 }
 
@@ -8358,6 +8524,7 @@ mod tests {
             ViewMode::Network,
             ViewMode::Power,
             ViewMode::Gateway,
+            ViewMode::Logs,
         ] {
             assert_eq!(
                 ViewMode::from_slug(mode.slug()),
@@ -9765,6 +9932,7 @@ mod tests {
             health: Vec::new(),
             jobs: Vec::new(),
             routes: Vec::new(),
+            logs: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert_eq!(p.audit.len(), 1);
@@ -9954,6 +10122,7 @@ mod tests {
             health: Vec::new(),
             jobs: Vec::new(),
             routes: Vec::new(),
+            logs: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert!(p.expanded.contains("172.20.0.9"));
@@ -10161,6 +10330,7 @@ mod tests {
             health: Vec::new(),
             jobs: Vec::new(),
             routes: Vec::new(),
+            logs: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert_eq!(p.promote.len(), 1);
@@ -10297,6 +10467,7 @@ mod tests {
             }],
             jobs: Vec::new(),
             routes: Vec::new(),
+            logs: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert_eq!(p.health.len(), 1);
@@ -10307,6 +10478,74 @@ mod tests {
     fn panel_defaults_have_no_health_checks() {
         let p = DatacenterPanel::new();
         assert!(p.health.is_empty());
+    }
+
+    fn log_row(host: &str, ts: u64, level: &str, target: &str, msg: &str) -> fleet_logs::LogRow {
+        fleet_logs::LogRow {
+            ts_ms: ts,
+            host: host.into(),
+            level: level.into(),
+            target: target.into(),
+            message: msg.into(),
+        }
+    }
+
+    #[test]
+    fn datacenter_log_rows_scopes_to_dc_hosts() {
+        let rows = vec![
+            log_row("172.20.0.9", 1, "warn", "xapi.service", "toolstack"),
+            log_row("172.20.145.193", 2, "error", "kernel", "oom"),
+            log_row("some-laptop", 3, "info", "nebula", "handshake"), // not a dc host
+        ];
+        let mut ids = std::collections::BTreeSet::new();
+        ids.insert("172.20.0.9".to_string());
+        ids.insert("172.20.145.193".to_string());
+        let scoped = datacenter_log_rows(&rows, &ids);
+        assert_eq!(scoped.len(), 2, "only the two dom0 hosts survive");
+        assert!(scoped.iter().all(|r| r.host.starts_with("172.20.")));
+    }
+
+    #[test]
+    fn datacenter_log_rows_empty_scope_yields_nothing() {
+        // No host rows known yet → the Datacenter plane shows nothing rather than
+        // spilling the whole fleet's mesh logs in.
+        let rows = vec![log_row("172.20.0.9", 1, "warn", "x", "y")];
+        let scoped = datacenter_log_rows(&rows, &std::collections::BTreeSet::new());
+        assert!(scoped.is_empty());
+    }
+
+    #[test]
+    fn loaded_populates_logs() {
+        let mut p = DatacenterPanel::new();
+        let load = DcLoad {
+            rows: Vec::new(),
+            audit: Vec::new(),
+            promote: Vec::new(),
+            health: Vec::new(),
+            jobs: Vec::new(),
+            routes: Vec::new(),
+            logs: vec![log_row("172.20.0.9", 1, "warn", "xapi.service", "restart")],
+        };
+        let _ = p.update(Message::Loaded(Ok(load)));
+        assert_eq!(p.logs.len(), 1);
+        assert_eq!(p.logs[0].host, "172.20.0.9");
+    }
+
+    #[test]
+    fn logs_view_renders_with_and_without_rows() {
+        // The Logs view renders both empty (no aggregated logs hint) and populated
+        // (filtered, newest-first) without panicking — reachable via the tab.
+        let mut p = DatacenterPanel::new();
+        p.view_mode = ViewMode::Logs;
+        let _ = p.view(); // empty-state branch
+        p.logs = vec![
+            log_row("172.20.0.9", 1, "warn", "xapi.service", "toolstack restart"),
+            log_row("172.20.0.9", 2, "error", "kernel", "oom-killer invoked"),
+        ];
+        let _ = p.view(); // populated branch
+                          // Search narrows the visible page (global filter doubles as the log query).
+        p.filter = "oom".into();
+        let _ = p.view();
     }
 
     #[test]
@@ -10488,6 +10727,7 @@ mod tests {
                 status: "ok".into(),
             }],
             routes: Vec::new(),
+            logs: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert_eq!(p.jobs.len(), 1);

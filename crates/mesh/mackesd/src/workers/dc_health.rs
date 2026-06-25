@@ -4,10 +4,15 @@
 //! [`super::dc_auditor`]: where the orchestrator publishes per-resource state and
 //! the auditor records each action request, this worker periodically probes the
 //! datacenter substrate's **liveness** — each configured Xen dom0's SSH
-//! reachability, the SUBSTRATE-V2 etcd store's `/health`, and the mesh
-//! secret-store helper — and publishes one `event/dc/health/<check>` per check,
-//! WITHOUT touching the action handlers or the substrate it watches. It is a pure
-//! side-observer: nothing depends on it, so it can never wedge an action.
+//! reachability, the SUBSTRATE-V2 etcd store's `/health`, the mesh secret-store
+//! helper, the Nebula CA cert's expiry, each dom0's VMs for crashes (a guest the
+//! dom0 expects up but which is halted/paused), and each dom0's pool for degraded
+//! hosts (disabled / not live) — and publishes one `event/dc/health/<check>` per
+//! check, WITHOUT touching the action handlers or the substrate it watches. It
+//! also aggregates each dom0's recent warnings-and-up journal tail into the
+//! `fleet_logs` sink so the Datacenter Logs view reads host/VM/service logs beside
+//! the mesh's own. It is a pure side-observer: nothing depends on it, so it can
+//! never wedge an action.
 //!
 //! Design (mirrors `dc_jobs` + `dc_auditor`): the *brain* ([`DcHealth`]) is a
 //! pure, deduped sieve — fed `(check, status)` it returns a [`HealthRecord`] only
@@ -154,6 +159,273 @@ pub fn parse_not_after(nebula_cert_output: &str) -> Option<String> {
             .map(|rest| rest.trim().to_string())
             .filter(|s| !s.is_empty())
     })
+}
+
+// ---- pure VM-crash helpers (unit-tested without a subprocess) ----
+
+/// One non-control VM's liveness as read from `xe vm-list`: its name + its current
+/// power-state + whether it's flagged to auto-power-on (so the dom0 expects it
+/// running after a boot). Decoded by [`parse_vm_states`] from the remote helper's
+/// pipe-delimited lines.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct VmState {
+    /// The VM's name-label (for the alert detail).
+    pub name: String,
+    /// The XAPI power-state: `running` | `halted` | `paused` | `suspended`.
+    pub power: String,
+    /// `other-config:auto_poweron` — the dom0 brings this VM up on boot, so a VM
+    /// that ISN'T running is an unexpected-down (a crash), not a deliberate stop.
+    pub auto_poweron: bool,
+}
+
+/// Parse the remote VM-crash helper's `name|power-state|auto_poweron` lines into
+/// [`VmState`]s. `auto_poweron` is true only for the literal `true` token (XAPI
+/// prints the `other-config` value verbatim; absent/empty ⇒ false). Skips blank
+/// lines + lines with an empty name. Pure — fed the raw stdout.
+#[must_use]
+pub fn parse_vm_states(output: &str) -> Vec<VmState> {
+    output
+        .lines()
+        .filter_map(|l| {
+            let mut p = l.splitn(3, '|');
+            let name = p.next()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let power = p.next().unwrap_or("").trim().to_string();
+            let auto = p.next().unwrap_or("").trim().eq_ignore_ascii_case("true");
+            Some(VmState {
+                name: name.to_string(),
+                power,
+                auto_poweron: auto,
+            })
+        })
+        .collect()
+}
+
+/// Map one VM's `(power-state, auto_poweron)` to a health status:
+/// * `paused` ⇒ `"warn"` — an unexpected pause (XAPI pauses a guest on certain
+///   faults / OOM); always worth surfacing regardless of the auto-poweron flag.
+/// * not-`running` **and** `auto_poweron` ⇒ `"fail"` — a VM the dom0 expects up
+///   (it auto-powers it on at boot) but which is `halted`/`suspended`: a crash.
+/// * anything else (`running`, or a deliberately-stopped non-auto VM) ⇒ `"ok"`.
+///
+/// Pure — the whole VM-crash decision is data, not I/O.
+#[must_use]
+pub fn vm_status_from_state(power: &str, auto_poweron: bool) -> &'static str {
+    if power == "paused" {
+        "warn"
+    } else if power != "running" && auto_poweron {
+        "fail"
+    } else {
+        "ok"
+    }
+}
+
+/// Roll a dom0's VMs into one `(status, detail)` for its `vm-crash:<dom0>` health
+/// check: the WORST per-VM status wins (`fail` > `warn` > `ok`), and the detail
+/// names the offending VMs (or "N VM(s) healthy" when all are ok). Pure +
+/// testable; mirrors [`worst_host_status`].
+#[must_use]
+pub fn worst_vm_status(vms: &[VmState]) -> (&'static str, String) {
+    let mut worst = "ok";
+    let mut offenders: Vec<String> = Vec::new();
+    for vm in vms {
+        let s = vm_status_from_state(&vm.power, vm.auto_poweron);
+        if s != "ok" {
+            offenders.push(format!("{} ({})", vm.name, vm.power));
+        }
+        if status_rank(s) > status_rank(worst) {
+            worst = s;
+        }
+    }
+    let detail = if offenders.is_empty() {
+        format!("{} VM(s) healthy", vms.len())
+    } else {
+        offenders.join(", ")
+    };
+    (worst, detail)
+}
+
+// ---- pure pool-degraded helpers (unit-tested without a subprocess) ----
+
+/// One pool host's placement liveness as read from `xe host-list`: its name + its
+/// `enabled` flag (false ⇒ in maintenance / disabled) + its `host-metrics-live`
+/// flag (false ⇒ not live in the pool — unreachable / fenced). Decoded by
+/// [`parse_host_states`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PoolHostState {
+    /// The host's name-label (for the alert detail).
+    pub name: String,
+    /// `enabled` — a disabled host takes no new VMs (maintenance mode).
+    pub enabled: bool,
+    /// `host-metrics-live` — false means XAPI no longer hears from the host: it's
+    /// not live in the pool (fenced / down / partitioned).
+    pub live: bool,
+}
+
+/// Parse the remote pool helper's `name|enabled|host-metrics-live` lines into
+/// [`PoolHostState`]s. Each flag is true only for the literal `true` token (XAPI
+/// prints booleans as `true`/`false`); absent/empty ⇒ false (fail-safe: an
+/// unreadable flag reads as the degraded value). Skips lines with an empty name.
+/// Pure — fed the raw stdout.
+#[must_use]
+pub fn parse_host_states(output: &str) -> Vec<PoolHostState> {
+    output
+        .lines()
+        .filter_map(|l| {
+            let mut p = l.splitn(3, '|');
+            let name = p.next()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let enabled = p.next().unwrap_or("").trim().eq_ignore_ascii_case("true");
+            let live = p.next().unwrap_or("").trim().eq_ignore_ascii_case("true");
+            Some(PoolHostState {
+                name: name.to_string(),
+                enabled,
+                live,
+            })
+        })
+        .collect()
+}
+
+/// Map one pool host's `(enabled, host-metrics-live)` to a health status:
+/// * not live ⇒ `"fail"` — XAPI lost the host (fenced / down): the pool is
+///   degraded, a guest on it is unreachable.
+/// * live but disabled ⇒ `"warn"` — maintenance mode: it takes no new VMs but is
+///   still reachable; surface it but don't page.
+/// * live + enabled ⇒ `"ok"`.
+///
+/// Pure — the pool-degraded decision is data, not I/O.
+#[must_use]
+pub fn host_status_from_flags(enabled: bool, live: bool) -> &'static str {
+    if !live {
+        "fail"
+    } else if !enabled {
+        "warn"
+    } else {
+        "ok"
+    }
+}
+
+/// Roll a dom0's pool hosts into one `(status, detail)` for its `pool:<dom0>`
+/// health check: the WORST per-host status wins (`fail` > `warn` > `ok`), and the
+/// detail names the offending hosts (or "N host(s) live" when all are ok). Pure +
+/// testable.
+#[must_use]
+pub fn worst_host_status(hosts: &[PoolHostState]) -> (&'static str, String) {
+    let mut worst = "ok";
+    let mut offenders: Vec<String> = Vec::new();
+    for h in hosts {
+        let s = host_status_from_flags(h.enabled, h.live);
+        if s != "ok" {
+            let why = if !h.live { "not-live" } else { "disabled" };
+            offenders.push(format!("{} ({why})", h.name));
+        }
+        if status_rank(s) > status_rank(worst) {
+            worst = s;
+        }
+    }
+    let detail = if offenders.is_empty() {
+        format!("{} host(s) live", hosts.len())
+    } else {
+        offenders.join(", ")
+    };
+    (worst, detail)
+}
+
+/// Severity rank shared by the VM-crash + pool-degraded rollups: `fail` > `warn` >
+/// `ok`. Pure.
+#[must_use]
+fn status_rank(status: &str) -> u8 {
+    match status {
+        "fail" => 2,
+        "warn" => 1,
+        _ => 0,
+    }
+}
+
+// ---- pure logs-aggregation fold (unit-tested without a subprocess) ----
+
+/// How many recent journal lines to pull per dom0 each aggregation pass. Keeps the
+/// aggregation BOUNDED — a coarse health worker should never slurp a host's whole
+/// journal, only its recent tail. `journalctl -n <this>` caps the remote read.
+pub const LOG_TAIL_LINES: usize = 200;
+
+/// Map a syslog `PRIORITY` (0-7, emergency..debug) to the `fleet_logs`
+/// level string. The aggregator only forwards warnings-and-up (it asks
+/// `journalctl -p warning`), but the full mapping keeps the fold honest if the
+/// caller widens the window. Pure.
+#[must_use]
+pub fn syslog_priority_to_level(priority: u8) -> &'static str {
+    match priority {
+        0..=3 => "error", // emerg/alert/crit/err
+        4 => "warn",      // warning
+        5 | 6 => "info",  // notice/info
+        _ => "debug",     // debug + anything out of range
+    }
+}
+
+/// Fold one dom0's `journalctl -o json` output (one JSON object per line) into
+/// [`magic_fleet::structured_log::LogRecord`]s tagged with this dom0's `host`
+/// label, so the controller's Fleet-logs / Datacenter-Logs view reads host + VM +
+/// service journal lines beside the mesh's own. Tolerant: a line that isn't a JSON
+/// object, or that lacks a `MESSAGE`, is skipped (never aborts the fold). Bounded
+/// by the caller's `journalctl -n` tail. Pure — fed the raw stdout, returns the
+/// records to append.
+///
+/// Field mapping (systemd export journal):
+/// * `__REALTIME_TIMESTAMP` (microseconds since epoch) → `ts_ms`;
+/// * `PRIORITY` (syslog 0-7) → `level` via [`syslog_priority_to_level`];
+/// * `_SYSTEMD_UNIT` else `SYSLOG_IDENTIFIER` → `target` (the emitting unit);
+/// * `MESSAGE` → `message`.
+///
+/// Every record carries `fields["dom0"] = <host>` + `fields["source"] = "journal"`
+/// so a Logs view can tell aggregated dom0 journal lines from native mesh logs.
+#[must_use]
+pub fn journal_lines_to_records(
+    host: &str,
+    output: &str,
+) -> Vec<magic_fleet::structured_log::LogRecord> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).ok()?;
+            let message = journal_str(&v, "MESSAGE")?;
+            let ts_ms = journal_str(&v, "__REALTIME_TIMESTAMP")
+                .and_then(|s| s.parse::<u64>().ok())
+                .map_or(0, |us| us / 1_000);
+            let priority = journal_str(&v, "PRIORITY")
+                .and_then(|s| s.parse::<u8>().ok())
+                .unwrap_or(6);
+            let target = journal_str(&v, "_SYSTEMD_UNIT")
+                .or_else(|| journal_str(&v, "SYSLOG_IDENTIFIER"))
+                .unwrap_or_default();
+            let mut fields = BTreeMap::new();
+            fields.insert("dom0".to_string(), host.to_string());
+            fields.insert("source".to_string(), "journal".to_string());
+            Some(magic_fleet::structured_log::LogRecord {
+                ts_ms,
+                host: host.to_string(),
+                level: syslog_priority_to_level(priority).to_string(),
+                target,
+                message,
+                fields,
+            })
+        })
+        .collect()
+}
+
+/// Read one journal field as an owned `String`. systemd's JSON export prints most
+/// fields as strings but binary/multiline fields as an array of bytes; this only
+/// reads the string form (the fields the fold cares about are always strings),
+/// returning `None` for an absent or non-string field. Pure.
+#[must_use]
+fn journal_str(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 // ---- thin I/O: run the probes, emit health events via the Bus ----
@@ -359,18 +631,175 @@ fn probe_cert(workgroup_root: &std::path::Path) -> Probe {
     }
 }
 
+// ---- DATACENTER-24 xe-over-ssh probes (VM-crash + pool-degraded + logs) ----
+//
+// These reuse the orchestrator's DATACENTER-4 route resolution + argv assembly
+// (`resolve_xe_route` + `ssh_xe_argv`) so an off-LAN node ProxyJumps through the
+// configured relay exactly like the gather does — glue, not a second SSH layer
+// (§6). The route is resolved once per dom0 here (the dedicated relay-down latch /
+// `event/dc/route` publish lives in the orchestrator's gather; this read-only
+// health probe just picks the route + runs).
+
+/// Is this node on the dom0 lab LAN? Reuses the orchestrator's pure
+/// [`crate::workers::datacenter_orchestrator::node_on_lan_for`] +
+/// [`crate::workers::datacenter_orchestrator::local_ipv4s_from_ip_json`] over
+/// `ip -j addr`, honoring the same `MCNF_XEN_ON_LAN` override for tests / odd
+/// topologies. Missing `ip`/probe failure ⇒ on-LAN (the conservative Direct
+/// default the gather also keeps).
+fn dom0_on_lan() -> bool {
+    if let Ok(v) = std::env::var("MCNF_XEN_ON_LAN") {
+        let v = v.trim();
+        if v == "1" || v.eq_ignore_ascii_case("true") {
+            return true;
+        }
+        if v == "0" || v.eq_ignore_ascii_case("false") {
+            return false;
+        }
+    }
+    match std::process::Command::new("ip")
+        .args(["-j", "addr"])
+        .output()
+    {
+        Ok(o) if o.status.success() => crate::workers::datacenter_orchestrator::node_on_lan_for(
+            &crate::workers::datacenter_orchestrator::local_ipv4s_from_ip_json(
+                &String::from_utf8_lossy(&o.stdout),
+            ),
+        ),
+        _ => true,
+    }
+}
+
+/// Run one `xe`-bearing remote command on a dom0 along the DATACENTER-4 route,
+/// returning its stdout on success. Best-effort: a non-zero exit / spawn failure /
+/// unreachable dom0 ⇒ `None`. Reuses [`crate::workers::datacenter_orchestrator::ssh_xe_argv`]
+/// so the ProxyJump shape matches the gather exactly.
+fn ssh_run(key: &str, dom0: &str, on_lan: bool, remote: &str) -> Option<String> {
+    let route = crate::workers::datacenter_orchestrator::resolve_xe_route(
+        dom0,
+        on_lan,
+        crate::workers::datacenter_orchestrator::xen_relay_peer().as_deref(),
+    );
+    let argv = crate::workers::datacenter_orchestrator::ssh_xe_argv(key, dom0, &route, remote);
+    let out = std::process::Command::new("ssh").args(argv).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Probe one dom0's non-control VMs for crashes. Pulls each VM's
+/// `name-label|power-state|auto_poweron` over SSH, parses it ([`parse_vm_states`])
+/// and rolls it into a worst-status ([`worst_vm_status`]): a VM the dom0 auto-
+/// powers-on but which isn't `running` is a crash (`fail`); a `paused` guest is an
+/// unexpected pause (`warn`). `warn` honestly (not `fail`) when the dom0 is
+/// unreachable / `xe` is absent — there's nothing to assert.
+fn probe_vm_crash(key: &str, dom0: &str, on_lan: bool) -> Probe {
+    // One ssh round-trip: for each non-control VM, print
+    // `name|power-state|auto_poweron`. `vm-param-get` of an absent other-config key
+    // prints empty → parses as auto_poweron=false (a deliberate stop, not a crash).
+    let script = "for u in $(xe vm-list is-control-domain=false params=uuid --minimal | tr , ' '); \
+         do echo \"$(xe vm-param-get uuid=$u param-name=name-label)|$(xe vm-param-get uuid=$u param-name=power-state)|$(xe vm-param-get uuid=$u param-name=other-config param-key=auto_poweron 2>/dev/null)\"; done";
+    match ssh_run(key, dom0, on_lan, script) {
+        Some(out) => {
+            let vms = parse_vm_states(&out);
+            let (status, detail) = worst_vm_status(&vms);
+            match status {
+                "fail" => Probe::fail(detail),
+                "warn" => Probe::warn(detail),
+                _ => Probe::ok(detail),
+            }
+        }
+        None => Probe::warn("vm-list unreachable"),
+    }
+}
+
+/// Probe one dom0's pool for degraded hosts. Pulls each pool host's
+/// `name-label|enabled|host-metrics-live` over SSH, parses it
+/// ([`parse_host_states`]) and rolls it into a worst-status
+/// ([`worst_host_status`]): a host not live in the pool is `fail`; a live-but-
+/// disabled (maintenance) host is `warn`. `warn` honestly when the dom0 is
+/// unreachable / `xe` is absent.
+fn probe_pool(key: &str, dom0: &str, on_lan: bool) -> Probe {
+    let script = "for u in $(xe host-list params=uuid --minimal | tr , ' '); \
+         do echo \"$(xe host-param-get uuid=$u param-name=name-label)|$(xe host-param-get uuid=$u param-name=enabled)|$(xe host-param-get uuid=$u param-name=host-metrics-live 2>/dev/null)\"; done";
+    match ssh_run(key, dom0, on_lan, script) {
+        Some(out) => {
+            let hosts = parse_host_states(&out);
+            let (status, detail) = worst_host_status(&hosts);
+            match status {
+                "fail" => Probe::fail(detail),
+                "warn" => Probe::warn(detail),
+                _ => Probe::ok(detail),
+            }
+        }
+        None => Probe::warn("host-list unreachable"),
+    }
+}
+
+/// Aggregate one dom0's recent warnings-and-up journal tail into the
+/// `fleet_logs` sink. Pulls a BOUNDED ([`LOG_TAIL_LINES`]) tail of
+/// `journalctl -p warning -o json` over SSH, folds the lines into
+/// [`magic_fleet::structured_log::LogRecord`]s tagged with this dom0
+/// ([`journal_lines_to_records`]) and appends them under
+/// `<workgroup_root>/logs/<dom0>.jsonl` — the same replicated sink the Fleet-logs
+/// / Datacenter-Logs view reads. Best-effort + idempotent-enough: re-running
+/// re-pulls the recent tail (the view de-dups by ts/host on render), so a missed
+/// pass self-heals on the next tick. Returns how many records it appended.
+fn aggregate_dom0_logs(
+    key: &str,
+    dom0: &str,
+    on_lan: bool,
+    workgroup_root: &std::path::Path,
+) -> usize {
+    // `-p warning` = warnings-and-up (priority ≤ 4), `--no-pager` so it doesn't
+    // block, `-o json` for the structured fold, `-n <tail>` to stay bounded.
+    let remote = format!("journalctl -p warning -o json --no-pager -n {LOG_TAIL_LINES}");
+    let Some(out) = ssh_run(key, dom0, on_lan, &remote) else {
+        return 0;
+    };
+    let records = journal_lines_to_records(dom0, &out);
+    let mut appended = 0;
+    for rec in &records {
+        if magic_fleet::structured_log::append(workgroup_root, rec).is_ok() {
+            appended += 1;
+        }
+    }
+    appended
+}
+
 /// One health pass: run each best-effort probe, feed its `(check, status)`
 /// through the dedup core, and publish the records that survive (status
 /// transitions). Every probe is independent — a failed/absent tool degrades that
 /// one check to `fail`/`warn` and never aborts the pass.
 fn run_checks(core: &mut DcHealth, workgroup_root: &std::path::Path) {
     let key = crate::workers::datacenter_orchestrator::xen_ssh_key();
+    // DATACENTER-4 route resolution is per-dom0 but the on-LAN decision is one
+    // probe per pass (the gather does the same): resolve it once here.
+    let on_lan = dom0_on_lan();
     for dom0 in crate::workers::datacenter_orchestrator::xen_dom0s() {
         let check = format!("dom0:{dom0}");
         let p = probe_dom0(&key, &dom0);
         if let Some(rec) = core.observe(&check, p.status, &p.detail) {
             publish(&rec);
         }
+
+        // VM-crash check for this dom0 (event/dc/health/vm-crash:<dom0>).
+        let vm_check = format!("vm-crash:{dom0}");
+        let p = probe_vm_crash(&key, &dom0, on_lan);
+        if let Some(rec) = core.observe(&vm_check, p.status, &p.detail) {
+            publish(&rec);
+        }
+
+        // Pool-degraded check for this dom0 (event/dc/health/pool:<dom0>).
+        let pool_check = format!("pool:{dom0}");
+        let p = probe_pool(&key, &dom0, on_lan);
+        if let Some(rec) = core.observe(&pool_check, p.status, &p.detail) {
+            publish(&rec);
+        }
+
+        // Logs aggregation: pull this dom0's recent journal tail into the
+        // fleet_logs sink so the Datacenter Logs view reads host/VM/service
+        // journal lines beside the mesh's own. Best-effort; bounded.
+        aggregate_dom0_logs(&key, &dom0, on_lan, workgroup_root);
     }
 
     let p = probe_etcd(&etcd_endpoint());
@@ -596,5 +1025,201 @@ mod tests {
         let multi = "é".repeat(500);
         let rec2 = h.observe("dom0:x", "fail", &multi).unwrap();
         assert_eq!(rec2.detail.chars().count(), DETAIL_LEN);
+    }
+
+    // ---- VM-crash check ----
+
+    #[test]
+    fn vm_status_maps_power_and_auto_poweron() {
+        // A running guest is always ok, regardless of the auto-poweron flag.
+        assert_eq!(vm_status_from_state("running", true), "ok");
+        assert_eq!(vm_status_from_state("running", false), "ok");
+        // A paused guest is an unexpected pause → warn, even without auto-poweron.
+        assert_eq!(vm_status_from_state("paused", false), "warn");
+        assert_eq!(vm_status_from_state("paused", true), "warn");
+        // Not-running AND auto-poweron (the dom0 expects it up) → a crash (fail).
+        assert_eq!(vm_status_from_state("halted", true), "fail");
+        assert_eq!(vm_status_from_state("suspended", true), "fail");
+        // Not-running but NOT auto-poweron = a deliberate stop → ok (no alert).
+        assert_eq!(vm_status_from_state("halted", false), "ok");
+    }
+
+    #[test]
+    fn parse_vm_states_decodes_pipe_lines_and_skips_blanks() {
+        let out = "web|running|true\n\
+                   db|halted|true\n\
+                   scratch|halted|false\n\
+                   |running|true\n"; // empty name skipped
+        let vms = parse_vm_states(out);
+        assert_eq!(vms.len(), 3);
+        assert_eq!(
+            vms[0],
+            VmState {
+                name: "web".into(),
+                power: "running".into(),
+                auto_poweron: true
+            }
+        );
+        assert!(
+            !vms[2].auto_poweron,
+            "auto_poweron only true for the literal token"
+        );
+    }
+
+    #[test]
+    fn worst_vm_status_takes_the_worst_and_names_offenders() {
+        // All healthy → ok + a count.
+        let healthy = vec![
+            VmState {
+                name: "a".into(),
+                power: "running".into(),
+                auto_poweron: true,
+            },
+            VmState {
+                name: "b".into(),
+                power: "halted".into(),
+                auto_poweron: false,
+            },
+        ];
+        let (s, d) = worst_vm_status(&healthy);
+        assert_eq!(s, "ok");
+        assert_eq!(d, "2 VM(s) healthy");
+        // A warn (paused) plus a fail (auto-poweron down) → fail wins, both named.
+        let mixed = vec![
+            VmState {
+                name: "a".into(),
+                power: "running".into(),
+                auto_poweron: true,
+            },
+            VmState {
+                name: "p".into(),
+                power: "paused".into(),
+                auto_poweron: false,
+            },
+            VmState {
+                name: "c".into(),
+                power: "halted".into(),
+                auto_poweron: true,
+            },
+        ];
+        let (s, d) = worst_vm_status(&mixed);
+        assert_eq!(s, "fail");
+        assert!(d.contains("p (paused)") && d.contains("c (halted)"));
+    }
+
+    // ---- pool-degraded check ----
+
+    #[test]
+    fn host_status_maps_enabled_and_live() {
+        // Live + enabled → ok.
+        assert_eq!(host_status_from_flags(true, true), "ok");
+        // Live but disabled (maintenance) → warn.
+        assert_eq!(host_status_from_flags(false, true), "warn");
+        // Not live (fenced / down) → fail, regardless of enabled.
+        assert_eq!(host_status_from_flags(true, false), "fail");
+        assert_eq!(host_status_from_flags(false, false), "fail");
+    }
+
+    #[test]
+    fn parse_host_states_decodes_and_fail_safes_missing_flags() {
+        let out = "xcp-a|true|true\n\
+                   xcp-b|false|true\n\
+                   xcp-c|true|\n"; // missing live flag → false (degraded)
+        let hosts = parse_host_states(out);
+        assert_eq!(hosts.len(), 3);
+        assert_eq!(
+            hosts[0],
+            PoolHostState {
+                name: "xcp-a".into(),
+                enabled: true,
+                live: true
+            }
+        );
+        assert!(!hosts[2].live, "an absent flag reads as the degraded value");
+    }
+
+    #[test]
+    fn worst_host_status_takes_the_worst_and_names_offenders() {
+        let healthy = vec![PoolHostState {
+            name: "xcp-a".into(),
+            enabled: true,
+            live: true,
+        }];
+        let (s, d) = worst_host_status(&healthy);
+        assert_eq!(s, "ok");
+        assert_eq!(d, "1 host(s) live");
+        let degraded = vec![
+            PoolHostState {
+                name: "xcp-a".into(),
+                enabled: false,
+                live: true,
+            }, // warn
+            PoolHostState {
+                name: "xcp-b".into(),
+                enabled: true,
+                live: false,
+            }, // fail
+        ];
+        let (s, d) = worst_host_status(&degraded);
+        assert_eq!(s, "fail");
+        assert!(d.contains("xcp-a (disabled)") && d.contains("xcp-b (not-live)"));
+    }
+
+    // ---- logs aggregation fold ----
+
+    #[test]
+    fn syslog_priority_maps_to_fleet_level() {
+        assert_eq!(syslog_priority_to_level(0), "error"); // emerg
+        assert_eq!(syslog_priority_to_level(3), "error"); // err
+        assert_eq!(syslog_priority_to_level(4), "warn"); // warning
+        assert_eq!(syslog_priority_to_level(5), "info"); // notice
+        assert_eq!(syslog_priority_to_level(6), "info"); // info
+        assert_eq!(syslog_priority_to_level(7), "debug"); // debug
+        assert_eq!(syslog_priority_to_level(99), "debug"); // out of range
+    }
+
+    #[test]
+    fn journal_fold_maps_fields_and_tags_the_dom0() {
+        // Two valid `-o json` lines + one junk line (skipped) + one without MESSAGE.
+        let out = "{\"__REALTIME_TIMESTAMP\":\"1700000000000000\",\"PRIORITY\":\"3\",\"_SYSTEMD_UNIT\":\"xapi.service\",\"MESSAGE\":\"toolstack restart\"}\n\
+                   not json at all\n\
+                   {\"PRIORITY\":\"4\",\"SYSLOG_IDENTIFIER\":\"kernel\",\"MESSAGE\":\"oom-killer invoked\"}\n\
+                   {\"PRIORITY\":\"3\"}\n"; // no MESSAGE → skipped
+        let recs = journal_lines_to_records("172.20.0.9", out);
+        assert_eq!(recs.len(), 2, "junk + the MESSAGE-less line are dropped");
+        // First record: microseconds → ms, priority 3 → error, _SYSTEMD_UNIT target.
+        assert_eq!(recs[0].ts_ms, 1_700_000_000_000);
+        assert_eq!(recs[0].level, "error");
+        assert_eq!(recs[0].target, "xapi.service");
+        assert_eq!(recs[0].message, "toolstack restart");
+        assert_eq!(recs[0].host, "172.20.0.9");
+        assert_eq!(
+            recs[0].fields.get("dom0").map(String::as_str),
+            Some("172.20.0.9")
+        );
+        assert_eq!(
+            recs[0].fields.get("source").map(String::as_str),
+            Some("journal")
+        );
+        // Second: no _SYSTEMD_UNIT → falls back to SYSLOG_IDENTIFIER; priority 4 → warn.
+        assert_eq!(recs[1].level, "warn");
+        assert_eq!(recs[1].target, "kernel");
+        // Missing timestamp → 0 (the fold never panics on a partial record).
+        assert_eq!(recs[1].ts_ms, 0);
+    }
+
+    #[test]
+    fn journal_fold_round_trips_through_the_fleet_logs_sink() {
+        // End-to-end reachability: the fold's records append into the SAME
+        // `<root>/logs/<host>.jsonl` the Fleet-logs / Datacenter-Logs view reads.
+        let tmp = tempfile::tempdir().unwrap();
+        let out = "{\"__REALTIME_TIMESTAMP\":\"1700000001000000\",\"PRIORITY\":\"4\",\"_SYSTEMD_UNIT\":\"nebula.service\",\"MESSAGE\":\"handshake retry\"}\n";
+        for rec in journal_lines_to_records("172.20.0.9", out) {
+            magic_fleet::structured_log::append(tmp.path(), &rec).unwrap();
+        }
+        let back = magic_fleet::structured_log::read_host(tmp.path(), "172.20.0.9");
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].message, "handshake retry");
+        assert_eq!(back[0].level, "warn");
     }
 }

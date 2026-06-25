@@ -6025,9 +6025,12 @@ fn run_serve(
 
         // DATACENTER-24 — passive care-and-feeding health checker. Leader-gated;
         // on a 30 s tick probes each configured Xen dom0's SSH reachability, the
-        // SUBSTRATE-V2 etcd `/health`, and the mesh secret-store helper, and emits
-        // one `event/dc/health/<check>` per check (deduped on status), without
-        // touching the substrate it watches — a pure side-observer.
+        // SUBSTRATE-V2 etcd `/health`, the mesh secret-store helper, the Nebula CA
+        // cert expiry, each dom0's VMs for crashes + its pool for degraded hosts,
+        // and emits one `event/dc/health/<check>` per check (deduped on status). It
+        // also folds each dom0's recent journal tail into the fleet_logs sink for
+        // the Datacenter Logs view — all without touching the substrate it
+        // watches (a pure side-observer).
         sup.spawn(Spawn::new(
             mackesd_core::workers::dc_health::DcHealthWorker::new(
                 workgroup_root.clone(),
