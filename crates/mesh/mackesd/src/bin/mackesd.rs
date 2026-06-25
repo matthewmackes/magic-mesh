@@ -4083,20 +4083,13 @@ fn main() -> anyhow::Result<()> {
             let svc =
                 mackesd_core::ipc::directory::DirectoryService::new(&root, Some(db_path.clone()));
             let dir = svc.build_directory(now);
-            let peers: Vec<(String, String)> = dir["peers"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|p| {
-                    p["hostname"].as_str().map(|h| {
-                        (
-                            h.to_string(),
-                            p["overlay_ip"].as_str().unwrap_or("").to_string(),
-                        )
-                    })
-                })
-                .collect();
-            let records = mesh_dns::build_records(&peers);
+            // The flat <host>.mesh join + the MEDIA-5 active-active music.mesh
+            // set — the SAME two record lists the mesh_dns worker serves, so
+            // the CLI dump matches what actually resolves.
+            let mut records = mesh_dns::build_records(&mesh_dns::directory_records(&dir));
+            records.extend(mesh_dns::build_music_records(&mesh_dns::media_overlay_ips(
+                &dir,
+            )));
             if json {
                 let rows: Vec<serde_json::Value> = records
                     .iter()
