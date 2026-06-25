@@ -26,9 +26,9 @@ use crate::panels::{
     connectivity as connectivity_panel, datacenter as datacenter_panel, dns as dns_panel,
     drift as drift_panel, firewall as firewall_panel, fleet_logs as fleet_logs_panel,
     fleet_revisions as fleet_revisions_panel, fleet_rollup as fleet_rollup_panel,
-    fleet_settings as fleet_settings_panel, hardware as hardware_panel,
-    health_check as health_check_panel, help_index as help_index_panel, home as home_panel,
-    hub as hub_panel, images as images_panel, interfaces as interfaces_panel,
+    fleet_settings as fleet_settings_panel, front_door as front_door_panel,
+    hardware as hardware_panel, health_check as health_check_panel, help_index as help_index_panel,
+    home as home_panel, hub as hub_panel, images as images_panel, interfaces as interfaces_panel,
     inventory as inventory_panel, jobs as jobs_panel, lighthouses as lighthouses_panel,
     logs as logs_panel, mesh_bus as mesh_bus_panel, mesh_control as mesh_control_panel,
     mesh_federation as mesh_federation_panel, mesh_history as mesh_history_panel,
@@ -304,6 +304,11 @@ pub struct App {
     connect: connect_panel::ConnectPanel,
     /// v4.0.1 WB-2.a — Dashboard landing page state.
     home: home_panel::HomePanel,
+    /// FRONTDOOR-1 — the GPU canvas tile-grid "Front Door" that renders the
+    /// home/dashboard route. Replaces the old `home` widget-tree VIEW (the slow
+    /// "4-second menu"); `home`'s state + load stay intact (data reuse is
+    /// FRONTDOOR-4 — only the view is swapped).
+    front_door: front_door_panel::FrontDoor,
     /// v4.0.1 WB-2.b — Maintain group root grid state.
     hub: hub_panel::HubPanel,
     /// v4.0.1 WB-2.c — Help group root topics list.
@@ -419,6 +424,7 @@ impl App {
             sip_gateway: sip_gateway_panel::SipGatewayPanel::new(),
             connect: connect_panel::ConnectPanel::new(),
             home: home_panel::HomePanel::new(),
+            front_door: front_door_panel::FrontDoor::new(),
             hub: hub_panel::HubPanel::new(),
             help: help_index_panel::HelpIndexPanel::new(),
             inventory: inventory_panel::InventoryPanel::new(),
@@ -1277,7 +1283,11 @@ impl App {
             // Before this commit every group root rendered the
             // catch-all placeholder "Panel view lands in a later
             // CB-1.x substep."
-            View::Group(Group::Dashboard) => self.home.view(),
+            // FRONTDOOR-1 — the Dashboard/home route now renders the GPU canvas
+            // tile-grid Front Door instead of the old slow `home` widget tree.
+            // `home`'s state + load stay intact (data reuse is FRONTDOOR-4); only
+            // this VIEW is swapped.
+            View::Group(Group::Dashboard) => self.front_door.view(),
             // E6.7 — the Maintain group root now renders the standard role
             // card (via the View::Group(g) catch-all), matching the other
             // roles; the hub overview dashboard becomes the "Hub" sub-panel
@@ -1532,10 +1542,11 @@ impl App {
                 panel: "provisioning",
                 ..
             } => self.provisioning.view(),
-            // WB-OVERVIEW-2 — the "Home" panel renders the real Overview
-            // dashboard (same as the group root), not the "isn't ready yet"
-            // stub it fell through to before.
-            View::Panel { panel: "home", .. } => self.home.view(),
+            // WB-OVERVIEW-2 — the "Home" panel renders the home dashboard (same
+            // as the group root). FRONTDOOR-1 swaps that VIEW for the GPU canvas
+            // tile-grid Front Door (`home` state + load stay intact for the
+            // FRONTDOOR-4 data reuse).
+            View::Panel { panel: "home", .. } => self.front_door.view(),
             // E6.1 — any group-root view without a bespoke landing
             // (Apps / Devices / Fleet / Look & Feel / System, plus
             // Network when deep-linked) renders the "Manage Your Server"

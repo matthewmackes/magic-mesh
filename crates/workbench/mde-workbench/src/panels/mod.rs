@@ -20,6 +20,8 @@ pub mod fleet_logs;
 pub mod fleet_revisions;
 pub mod fleet_rollup;
 pub mod fleet_settings;
+/// FRONTDOOR-1 — the GPU canvas tile-grid "Front Door" home.
+pub mod front_door;
 pub mod hardware;
 pub mod health_check;
 pub mod help_index;

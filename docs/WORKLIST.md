@@ -1922,7 +1922,7 @@ primary mesh+OS interface: Win10-Start panel / iPadOS full-screen, custom wgpu r
 in the tiles. Ships as one release across parallel tracks. DoD §7 (build+test+token-
 clean+reachable smoke); visual gate lifted.
 
-- [ ] **FRONTDOOR-1: shell + perf — the custom wgpu grid renderer.**
+- [>] **FRONTDOOR-1: shell + perf — the custom wgpu grid renderer.**
   **As** an operator, **I want** the menu to open in under a second,
   **so that** the 4-second render is gone and it feels instant.
   **Acceptance**:
