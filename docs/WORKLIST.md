@@ -1826,7 +1826,7 @@ the plane and it **survives killing the current zone leader**.
   (membership/master/join), evacuate/patch, impact preview, copy/launch-ssh console + the panel host actions.*
   **Acceptance**:
     - [>] per-host capacity+health; pools (membership/master/join); maintenance/reboot/shutdown/**evacuate**/patch with impact preview; copy/launch-ssh console — *host capacity (cpu/mem/load) + maintenance/reboot RPC done; pools/evacuate/patch/console pending*
-- [✓] **DATACENTER-11: VMs tab (full lifecycle, Tofu-backed create, noVNC, bulk).**
+- [✓] **DATACENTER-11: VMs tab (full lifecycle, Tofu-backed create, noVNC, bulk).** _(2026-06-25: snapshot lifecycle completed — `vm-snapshots`(list)/`vm-snapshot-revert`/`vm-snapshot-delete` wired into the action/dc responder + VMs panel via 0a7d63d (16 new tests); the wave's §7 adversarial verify returned s7_done=true. Fully done.)_
   *VM POWER landed end-to-end (built in PARALLEL on the farm — worker on `.50`, panel on `.51`): the
   `action/dc/vm-power` Bus-RPC (`ipc/datacenter.rs`, mirrors `ipc/route.rs`) runs `xe vm-start/shutdown/
   reboot` over the mesh-key SSH, with an injection-guard on uuid/op + a dom0 allow-list; the panel's VM
@@ -1904,7 +1904,7 @@ the plane and it **survives killing the current zone leader**.
   target (today local `~/mcnf-dr-backups`), the guided restore-rebirth flow, and secure mesh-age-key backup.*
   **Acceptance**:
     - [>] periodic encrypted backup of Tofu state + Nebula CA + secret store to an off-fleet target; a guided restore rebirths the control plane and re-elects a leader — *backup (state+secrets, age) + restore + daily scheduler + RPC + button done, round-trip verified; CA + off-fleet target + guided-rebirth pending*
-- [>] **DATACENTER-24: logs aggregation + periodic health checks.**
+- [>] **DATACENTER-24: logs aggregation + periodic health checks.** _(2026-06-25: VM-crash + pool-degraded health checks + the per-resource Datacenter Logs aggregation (each dom0's journal tail → `fleet_logs`) landed via 4a0929d; cert-expiry was already done. Genuine remaining: token-expiry (the CA cert is checked, enrollment/bearer tokens are not) + the live fault-injection verify.)_
   *HEALTH half done: a leader-gated `dc_health` worker runs periodic best-effort checks (each dom0 reachable,
   etcd store, secret-store) → `event/dc/health/*` with ok/warn/fail + dedup; the Overview shows a health
   summary (N ok · M warn · K fail) + an alert list. Remaining: cert/token-expiry + VM-crash/pool-degraded
