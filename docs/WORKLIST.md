@@ -2004,7 +2004,7 @@ clean+reachable smoke); visual gate lifted.
     - [ ] destructive ops show a preview/diff (commands + targets + effect + dry-run) and require a typed-confirm; non-destructive are low-friction
     - [ ] every suggestion + action + confirm logs to the mesh audit plane; role-gated (Lighthouse read-only)
 
-- [ ] **FRONTDOOR-12: Copilot capabilities incl. code edits.**
+- [>] **FRONTDOOR-12: Copilot capabilities incl. code edits.** (backend grounding + typed proposals done — the mackesd `copilot` worker now grounds codex in a BOUNDED real mesh-state context (nodes/roles/health buckets via `store::list_nodes`/`HealthReport`, leader lease, tail of the hash-chain event log) instead of the FD-9 placeholder, and parses an `action`-fenced reply into a typed FD-11 `ActionRequest` it PUBLISHES as a proposal on `action/copilot/proposal` for operator approval — never executed, never on FD-11's exec topic (§9: only spawn is codex; no executor added). Graceful degrade; proposal-mapping tests. Code/config editing (diff→apply→git) is the remaining, more sensitive piece — deferred.)
   **As** an operator, **I want** Copilot to actually operate the box,
   **so that** it aids at all levels of operation.
   **Acceptance**:
