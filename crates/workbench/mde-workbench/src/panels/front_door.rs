@@ -135,6 +135,14 @@ pub enum Message {
         nav: Box<crate::Message>,
         trigger: Option<Box<crate::Message>>,
     },
+    /// FRONTDOOR-10 — the operator clicked **Act** on a proactive suggestion that
+    /// carries a typed proposal. Carries the suggestion's index into
+    /// [`FrontDoor::suggestions`]. The handler re-publishes that suggestion's typed
+    /// proposal to the copilot PROPOSE topic (`action/copilot/proposal`, FD-12's
+    /// review queue) — it does NOT publish to FD-11's execution topic and does NOT
+    /// execute anything (§9 — the GUI never auto-executes; the gated confirm/exec
+    /// surface that drains the propose queue is a separate, out-of-scope UI).
+    ProposeSuggestion(usize),
 }
 
 /// FRONTDOOR-3 — which of the two locked render modes the Front Door is in
@@ -375,9 +383,12 @@ impl Tile {
                 TileAction::nav("Open Health", Group::Monitoring, "health_check"),
                 TileAction::launch("Open Settings", "cosmic-settings"),
             ],
-            // Copilot is seeded as a launcher (no key) — backend only
-            // (FRONTDOOR-12), no route/app the workbench can open yet — so it
-            // falls into the launcher arm below and yields an empty action list.
+            // FRONTDOOR-10 — Copilot is a live widget now (status off
+            // `state/copilot/status`), but it still has no NAV/launch surface the
+            // workbench owns, so its nav-action list stays honestly empty. Its
+            // detail view doesn't render a dead button: it renders the live status
+            // + the proactive suggestion cards (each with a §9-safe "Act" that
+            // re-publishes the proposal — never executes), built in `detail_view`.
             Some(TileKey::Copilot) => Vec::new(),
             // Plain app launchers route to their real installed app / in-app
             // surface. Each binary/route is one the workbench already opens
@@ -487,6 +498,16 @@ pub struct FrontDoorData {
     pub data_center: Option<(String, TileTone)>,
     /// DevOps — in-flight farm jobs.
     pub dev_ops: Option<(String, TileTone)>,
+    /// FRONTDOOR-10 — the Copilot tile's live value, read off the FD-10-backend
+    /// `state/copilot/status` topic (ready/thinking/offline). `None` until the
+    /// status topic has a body (the tile keeps its skeleton — never a fake value).
+    /// Closes FD-4's honest gap: the tile was a launcher because NO topic existed.
+    pub copilot: Option<(String, TileTone)>,
+    /// FRONTDOOR-10 — the ranked proactive suggestions read off the FD-10-backend
+    /// `action/copilot/suggestions` topic. Each is a PROPOSAL the operator can act
+    /// on (re-published to the propose topic), NEVER executed from the GUI (§9).
+    /// Empty when the topic is absent / the mesh is quiet (Q61).
+    pub suggestions: Vec<copilot::Suggestion>,
     /// FRONTDOOR-6 — the raw Peers directory rows, carried through so the unified
     /// search has the live mesh entities (nodes + services) without a second Bus
     /// read. The widget projections above are derived from these same rows.
@@ -507,8 +528,10 @@ impl FrontDoorData {
             TileKey::System => self.system.clone(),
             TileKey::DataCenter => self.data_center.clone(),
             TileKey::DevOps => self.dev_ops.clone(),
-            // FRONTDOOR-12 backend only — no bus topic the workbench reads yet.
-            TileKey::Copilot => None,
+            // FRONTDOOR-10 — now a live widget: the `state/copilot/status` snapshot
+            // (ready/thinking/offline). `None` until the topic has a body (the FD-1
+            // skeleton covers the gap). Closes FD-4's launcher-only gap.
+            TileKey::Copilot => self.copilot.clone(),
         }
     }
 
@@ -525,6 +548,14 @@ impl FrontDoorData {
         let health = datacenter::read_health_checks();
         let boot = home::read_boot_readiness();
 
+        // FRONTDOOR-10 — the two FD-10-backend topics, read off the Bus the same
+        // way the other widget tiles read live state (the latest body on the topic
+        // is the current snapshot). Best-effort: an absent Bus / empty topic leaves
+        // the status `None` (skeleton) and the suggestions empty (§7 — no fake).
+        let copilot_status = copilot::parse_status(latest_body(copilot::STATUS_TOPIC).as_deref());
+        let suggestions =
+            copilot::parse_suggestions(latest_body(copilot::SUGGESTIONS_TOPIC).as_deref());
+
         Self {
             mesh_map: project::mesh_map(&peers),
             node_health: project::node_health(&peers),
@@ -533,10 +564,27 @@ impl FrontDoorData {
             dev_ops: project::dev_ops(&farm),
             alerts: project::alerts(&health),
             system: Some(project::system(&boot)),
+            // FRONTDOOR-10 — the Copilot tile's live value + the ranked suggestions.
+            copilot: copilot_status.map(|s| s.tile_value()),
+            suggestions,
             // FRONTDOOR-6 — carry the raw roster for the unified mesh search.
             peers,
         }
     }
+}
+
+/// FRONTDOOR-10 — read the latest body on a `state/` (or current-snapshot) Bus
+/// topic: the newest message's body, or `None` when there is no Bus data-dir, the
+/// topic is empty, or the read faults. The canonical "latest snapshot" read the
+/// other widget loaders use (`read_health_checks`, the notify-center voice-status
+/// read): `list_since(topic, None)` returns the messages ULID-ascending, so the
+/// last is the newest. Best-effort by design — every failure is a quiet `None`.
+#[must_use]
+fn latest_body(topic: &str) -> Option<String> {
+    let dir = mde_bus::default_data_dir()?;
+    let persist = mde_bus::persist::Persist::open(dir).ok()?;
+    let msgs = persist.list_since(topic, None).ok()?;
+    msgs.last().and_then(|m| m.body.clone())
 }
 
 /// FRONTDOOR-4 — the pure widget-value projections. Each maps already-parsed data
@@ -991,6 +1039,258 @@ pub(super) mod search {
     }
 }
 
+// ===================== FRONTDOOR-10 (GUI half): Copilot live =================
+
+/// FRONTDOOR-10 — the Copilot live read off the two FD-10-backend bus topics
+/// (`state/copilot/status` + `action/copilot/suggestions`). The workbench can't
+/// depend on `mackesd` (the §6 mesh/desktop boundary — the copilot types live in
+/// `mackesd::workers::copilot`), so this module mirrors the WIRE shapes the
+/// backend serialized and parses them GUI-side — exactly as FD-6 parses FD-9's
+/// `AskReply` JSON locally rather than importing it. Pure (no Bus / no view) so
+/// the parse + the suggestion→tile mapping are unit-tested directly; the Bus read
+/// in [`FrontDoorData::read`] is a thin shell over this.
+pub(super) mod copilot {
+    use super::{TileKey, TileTone};
+
+    /// The bus topic the FD-10 backend publishes the compact Copilot STATUS to
+    /// (`mackesd::workers::copilot::STATUS_TOPIC`). A `state/` snapshot the tile
+    /// reads the same way the other widget tiles read live state — the latest body
+    /// is the current status.
+    pub const STATUS_TOPIC: &str = "state/copilot/status";
+
+    /// The bus topic the FD-10 backend publishes its ranked proactive SUGGESTIONS
+    /// to (`mackesd::workers::copilot::SUGGESTIONS_TOPIC`). The latest body is the
+    /// current ranked set; each suggestion is a PROPOSAL the operator approves —
+    /// never an instruction the GUI executes (§9).
+    pub const SUGGESTIONS_TOPIC: &str = "action/copilot/suggestions";
+
+    /// The bus topic the GUI re-publishes an approved suggestion's typed proposal
+    /// to (`mackesd::workers::copilot::PROPOSAL_TOPIC`) — FD-12's propose-only
+    /// review queue. The "Act" affordance writes HERE, never to FD-11's execution
+    /// topic (`action/exec/request`): proposing is not executing, and the gated
+    /// confirm/exec UI that drains this is a SEPARATE, out-of-scope surface (§9 —
+    /// the GUI never auto-executes).
+    pub const PROPOSAL_TOPIC: &str = "action/copilot/proposal";
+
+    /// The coarse Copilot status the tile renders (FD-10 §1). Mirrors the backend
+    /// `CopilotState` (serde `lowercase`): `ready` / `thinking` / `offline`. A
+    /// missing/odd tag degrades to [`StatusState::Offline`] (the tile shows offline
+    /// rather than guess — Q33 graceful degrade).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum StatusState {
+        /// The leader has a usable codex key — Copilot can answer/suggest.
+        Ready,
+        /// A codex round-trip is in flight right now.
+        Thinking,
+        /// No codex here (not leader, key unsealed, store fault) — graceful degrade.
+        Offline,
+    }
+
+    impl StatusState {
+        /// The tile's live value line for this state.
+        #[must_use]
+        pub fn label(self) -> &'static str {
+            match self {
+                StatusState::Ready => "ready",
+                StatusState::Thinking => "thinking",
+                StatusState::Offline => "offline",
+            }
+        }
+
+        /// The Carbon tone the value reads in (§4 token, never hex): a usable
+        /// Copilot reads accent/success, an in-flight one warning, an offline one
+        /// muted-neutral so the tile visibly degrades without an error color.
+        #[must_use]
+        pub fn tone(self) -> TileTone {
+            match self {
+                StatusState::Ready => TileTone::Success,
+                StatusState::Thinking => TileTone::Warning,
+                StatusState::Offline => TileTone::Neutral,
+            }
+        }
+    }
+
+    /// The parsed Copilot status (FD-10 §1) — just what the tile renders.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Status {
+        /// The coarse state the value line shows.
+        pub state: StatusState,
+        /// Whether Copilot can actually serve here (leader + a usable codex key).
+        pub available: bool,
+    }
+
+    impl Status {
+        /// The tile's `(value, tone)` for this status — the pre-rendered live line
+        /// the keyed Copilot tile takes, identical in shape to the other widgets'
+        /// projections.
+        #[must_use]
+        pub fn tile_value(&self) -> (String, TileTone) {
+            (self.state.label().to_string(), self.state.tone())
+        }
+    }
+
+    /// Parse the latest `state/copilot/status` body (the backend `CopilotStatus`
+    /// JSON: `{state, leader, available, model, last_activity_s?}`). Tolerant: we
+    /// only need `state` + `available`; an unknown `state` tag, a missing field, or
+    /// malformed/`None` JSON degrades to `None` (the tile keeps its skeleton /
+    /// resting state — never a fake value, §7). Pure + Bus-free.
+    #[must_use]
+    pub fn parse_status(raw: Option<&str>) -> Option<Status> {
+        let v: serde_json::Value = serde_json::from_str(raw?.trim()).ok()?;
+        let state = match v.get("state").and_then(serde_json::Value::as_str)? {
+            "ready" => StatusState::Ready,
+            "thinking" => StatusState::Thinking,
+            "offline" => StatusState::Offline,
+            _ => return None,
+        };
+        let available = v
+            .get("available")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        Some(Status { state, available })
+    }
+
+    /// One parsed proactive suggestion (FD-10 §2) — the prose the GUI renders plus,
+    /// when actionable, the typed proposal the operator can ACT on. Mirrors the
+    /// backend `Suggestion` wire shape. The proposal is carried as its raw JSON
+    /// object body so the "Act" affordance can re-publish it to [`PROPOSAL_TOPIC`]
+    /// verbatim (the propose-only path) WITHOUT the workbench needing the typed
+    /// `ActionProposal`/`ActionRequest` enums (they live in `mackesd`, off-limits
+    /// across the §6 boundary). It is NEVER executed here (§9).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Suggestion {
+        /// A short operator-facing headline.
+        pub title: String,
+        /// The supporting rationale / what-to-do.
+        pub detail: String,
+        /// `high` | `medium` — carried so the GUI can badge/sort; the backend keeps
+        /// it high-confidence-only (Q61).
+        pub impact: String,
+        /// The typed proposal's raw JSON object body (the backend `ActionProposal`:
+        /// `{action, rationale}`), present only when the suggestion is actionable.
+        /// `None` ⇒ advisory-only. Re-published verbatim to [`PROPOSAL_TOPIC`] on
+        /// "Act" — never to the exec topic (§9).
+        pub proposal_body: Option<String>,
+    }
+
+    impl Suggestion {
+        /// Which tile this suggestion concerns (Q19 — inline on the relevant tile),
+        /// inferred from the title+detail text against the widget vocabulary, or
+        /// `None` when it names no tile (it then lands in the Copilot tile's general
+        /// suggestions area rather than being dropped). A typed proposal's
+        /// `service_lifecycle` target sharpens the map to the Data Center tile.
+        /// Pure keyword classification — deterministic, no Bus.
+        #[must_use]
+        pub fn concerns_tile(&self) -> Option<TileKey> {
+            let hay = format!("{} {}", self.title, self.detail).to_lowercase();
+            // A typed service-lifecycle proposal is always a node/service op → the
+            // Data Center tile owns the node-lifecycle actions (FD-8).
+            if self
+                .proposal_body
+                .as_deref()
+                .is_some_and(|b| b.contains("service_lifecycle"))
+            {
+                return Some(TileKey::DataCenter);
+            }
+            // Keyword buckets, most-specific first. Each phrase names a widget the
+            // operator would open to act on that class of fix.
+            const MAP: &[(&[&str], TileKey)] = &[
+                (&["alert", "alarm", "incident"], TileKey::Alerts),
+                (
+                    &["build", "farm", "ci", "pipeline", "compile"],
+                    TileKey::BuildFarm,
+                ),
+                (&["job", "deploy", "rollback", "rerun"], TileKey::DevOps),
+                (
+                    &[
+                        "node",
+                        "host",
+                        "provision",
+                        "drain",
+                        "cutover",
+                        "container",
+                        "vm",
+                        "service",
+                        "restart",
+                    ],
+                    TileKey::DataCenter,
+                ),
+                (
+                    &["health", "degraded", "unreachable", "down"],
+                    TileKey::NodeHealth,
+                ),
+                (&["mesh", "peer", "routing", "latency"], TileKey::MeshMap),
+                (&["disk", "memory", "boot", "version"], TileKey::System),
+            ];
+            for (needles, key) in MAP {
+                if needles.iter().any(|n| hay.contains(n)) {
+                    return Some(*key);
+                }
+            }
+            None
+        }
+    }
+
+    /// Parse the latest `action/copilot/suggestions` body (the backend
+    /// `SuggestionSet` JSON: `{suggestions:[…], produced_at_s}`) into the ranked
+    /// list the GUI renders. Tolerant: the proposal is kept as its raw JSON object
+    /// (re-serialized so it round-trips to [`PROPOSAL_TOPIC`] cleanly); a missing
+    /// title drops the entry; malformed / `None` JSON ⇒ empty (no panic, the tiles
+    /// just carry no suggestions — §7). Order is preserved (the backend ranks it
+    /// best-first). Pure + Bus-free.
+    #[must_use]
+    pub fn parse_suggestions(raw: Option<&str>) -> Vec<Suggestion> {
+        let Some(body) = raw else {
+            return Vec::new();
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
+            return Vec::new();
+        };
+        let Some(arr) = v.get("suggestions").and_then(serde_json::Value::as_array) else {
+            return Vec::new();
+        };
+        arr.iter()
+            .filter_map(|s| {
+                let title = s
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if title.is_empty() {
+                    return None;
+                }
+                let detail = s
+                    .get("detail")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let impact = match s
+                    .get("impact")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("medium")
+                {
+                    "high" => "high".to_string(),
+                    _ => "medium".to_string(),
+                };
+                // Keep the proposal as its own JSON object body so "Act" re-publishes
+                // it verbatim to the propose topic — never re-derived, never executed.
+                let proposal_body = s
+                    .get("proposal")
+                    .filter(|p| p.is_object())
+                    .map(std::string::ToString::to_string);
+                Some(Suggestion {
+                    title,
+                    detail,
+                    impact,
+                    proposal_body,
+                })
+            })
+            .collect()
+    }
+}
+
 /// The Front Door home state: the placeholder tile set + a loading flag, plus the
 /// FRONTDOOR-2 omnibox query. While `loading`, the grid draws flat grey skeleton
 /// cards instead of labeled tiles (Q92 — skeleton placeholders, no layout shift).
@@ -1028,6 +1328,14 @@ pub struct FrontDoor {
     /// ([`Message::TileActivated`]); cleared by the menu's back control
     /// ([`Message::CloseDetail`]) or by leaving / reloading the view.
     pub detail: Option<usize>,
+    /// FRONTDOOR-10 — the live ranked proactive suggestions (off
+    /// `action/copilot/suggestions`), folded in from the FD-4 [`FrontDoorData`]
+    /// read. Each suggestion renders inline on the tile it concerns (Q19) — a
+    /// count badge on the canvas tile + the card text in that tile's detail view,
+    /// with the unmapped ones gathered on the Copilot tile. Empty until a set
+    /// lands / when the mesh is quiet (Q61). A suggestion is a PROPOSAL: acting on
+    /// it re-publishes to the propose topic, never executes (§9).
+    pub suggestions: Vec<copilot::Suggestion>,
 }
 
 impl Default for FrontDoor {
@@ -1042,9 +1350,9 @@ impl FrontDoor {
     /// FRONTDOOR-4 — the widget tiles carry a [`TileKey`] and take their live
     /// `value` + `tone` from the first [`FrontDoor::load`] snapshot; until then
     /// `loading` is true so the FD-1 skeleton covers them (Q92 — no layout
-    /// shift). Copilot is seeded as a plain **launcher** (no key): FRONTDOOR-12
-    /// landed its backend but no workbench-readable bus topic yet, so faking a
-    /// value would violate §7 — it stays a launcher pending a publisher.
+    /// shift). FRONTDOOR-10 — Copilot is now a live **widget** (the backend's
+    /// `state/copilot/status` topic exists), reading ready/thinking/offline; its
+    /// proactive suggestions render inline on the tiles they concern (Q19).
     #[must_use]
     pub fn new() -> Self {
         let tiles = vec![
@@ -1052,9 +1360,11 @@ impl FrontDoor {
             Tile::widget("Build / Farm", TileKey::BuildFarm, TileTone::Warning),
             Tile::widget("Alerts", TileKey::Alerts, TileTone::Danger),
             Tile::widget("Node Health", TileKey::NodeHealth, TileTone::Success),
-            // Copilot — NO workbench source yet → plain launcher (§7), needs a
-            // publisher (follow-up).
-            Tile::launcher("Copilot", TileTone::Accent),
+            // FRONTDOOR-10 — now a LIVE widget: the FD-10-backend `state/copilot/
+            // status` topic exists, so the tile reads ready/thinking/offline off it
+            // (closing FD-4's launcher-only gap). The skeleton covers it until the
+            // first snapshot (Q92).
+            Tile::widget("Copilot", TileKey::Copilot, TileTone::Accent),
             Tile::widget("System", TileKey::System, TileTone::Neutral),
             Tile::widget("Data Center", TileKey::DataCenter, TileTone::Accent),
             Tile::widget("DevOps", TileKey::DevOps, TileTone::Warning),
@@ -1078,16 +1388,20 @@ impl FrontDoor {
             mode: Mode::Panel,
             // FRONTDOOR-5 — start on the grid; a tile click opens a detail menu.
             detail: None,
+            // FRONTDOOR-10 — no suggestions until the first snapshot (a quiet mesh
+            // keeps it empty — Q61).
+            suggestions: Vec::new(),
         }
     }
 
     /// FRONTDOOR-4 — read the widget tiles' live data off the **existing**
     /// mde-bus data paths (Peers directory · Build Farm · Datacenter health ·
-    /// boot readiness) on a blocking thread and fold it back in via
-    /// [`Message::Loaded`]. Dispatched the same way the other panels load (a
-    /// `Task` fired on nav / reconnect / the slow-poll tick), so the Front Door
-    /// gets its data through the established subscription infra (§6) rather than
-    /// a new mackesd publisher.
+    /// boot readiness; FRONTDOOR-10 also reads the Copilot status + suggestions
+    /// topics) on a blocking thread and fold it back in via [`Message::Loaded`].
+    /// Dispatched the same way the other panels load (a `Task` fired on nav /
+    /// reconnect / the slow-poll tick), so the Front Door gets its data through the
+    /// established subscription infra (§6) — the FD-10 topics are already published
+    /// by mackesd, so no new publisher is added on the GUI side.
     pub fn load() -> Task<crate::Message> {
         Task::perform(async { FrontDoorData::read() }, |data| {
             crate::Message::FrontDoor(Message::Loaded(Box::new(data)))
@@ -1192,6 +1506,32 @@ impl FrontDoor {
                 }
                 Task::batch(tasks)
             }
+            // FRONTDOOR-10 — Act on a suggestion's typed proposal. Re-publish it to
+            // the PROPOSE topic (FD-12's review queue) — fire-and-forget, off the
+            // iced thread (the Bus client owns its own runtime; `Persist` isn't
+            // `Send`, so it MUST ride `spawn_blocking`). §9: this is a PROPOSE, not
+            // an execute — it never touches `action/exec/request`, never runs the
+            // action. A suggestion with no typed proposal (advisory-only) or a stale
+            // index is a no-op (the "Act" affordance is only rendered when a
+            // proposal exists, so this is just defence-in-depth).
+            Message::ProposeSuggestion(i) => {
+                let Some(body) = self
+                    .suggestions
+                    .get(i)
+                    .and_then(|s| s.proposal_body.clone())
+                else {
+                    return Task::none();
+                };
+                Task::perform(
+                    async move {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            crate::dbus::action_publish(copilot::PROPOSAL_TOPIC, &body)
+                        })
+                        .await;
+                    },
+                    |()| crate::Message::Noop,
+                )
+            }
         }
     }
 
@@ -1272,12 +1612,46 @@ impl FrontDoor {
                 tile.value = None;
             }
         }
+        // FRONTDOOR-10 — fold the ranked proactive suggestions in (Q19 — they
+        // render inline on the tile each concerns: a badge on the canvas card + the
+        // card text in that tile's detail). Replaced wholesale each snapshot so a
+        // resolved suggestion drops off rather than lingering (§7 — no stale card).
+        self.suggestions = data.suggestions.clone();
         // FRONTDOOR-6 — refresh the search roster; re-rank live results so a
         // roster change while the operator is mid-search shows through.
         self.peers = data.peers.clone();
         if !self.query.trim().is_empty() {
             self.results = search::local_results(&self.query, &self.tiles, &self.peers);
         }
+    }
+
+    /// FRONTDOOR-10 — the suggestions that concern the tile at index `i` (Q19),
+    /// in rank order. A suggestion maps to the tile its text/proposal names
+    /// ([`copilot::Suggestion::concerns_tile`]); an UNMAPPED suggestion (it names
+    /// no tile) is gathered onto the Copilot tile so it is never dropped. Returns
+    /// the matching `(suggestion, global_index)` pairs — the global index is
+    /// carried so the "Act" affordance can address the exact suggestion in
+    /// `self.suggestions` regardless of the per-tile filtering. Pure.
+    fn suggestions_for_tile(&self, i: usize) -> Vec<(usize, &copilot::Suggestion)> {
+        let Some(tile) = self.tiles.get(i) else {
+            return Vec::new();
+        };
+        let is_copilot = tile.key == Some(TileKey::Copilot);
+        self.suggestions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| match s.concerns_tile() {
+                Some(key) => tile.key == Some(key),
+                // Unmapped → home it on the Copilot tile (never dropped).
+                None => is_copilot,
+            })
+            .collect()
+    }
+
+    /// FRONTDOOR-10 — the count of suggestions concerning the tile at index `i`,
+    /// for the canvas badge (Q19 — the on-tile suggestion indicator). 0 ⇒ no badge.
+    fn suggestion_count_for(&self, i: usize) -> usize {
+        self.suggestions_for_tile(i).len()
     }
 
     /// FRONTDOOR-2/3 — the Front Door view, branching on [`Self::mode`]:
@@ -1291,8 +1665,11 @@ impl FrontDoor {
         // actions menu for the clicked tile, with a Back control to the grid.
         // Validate the index against the live tile set so a stale index can never
         // panic the view.
-        if let Some(tile) = self.detail.and_then(|i| self.tiles.get(i)) {
-            return self.detail_view(tile, palette);
+        if let Some((i, tile)) = self
+            .detail
+            .and_then(|i| self.tiles.get(i).map(|t| (i, t)))
+        {
+            return self.detail_view(i, tile, palette);
         }
         match self.mode {
             Mode::Panel => self.panel_view(palette),
@@ -1307,7 +1684,18 @@ impl FrontDoor {
     /// A tile with no openable surface yet (Copilot) shows its data + Back only —
     /// an honest empty menu rather than a dead button. Carbon chrome via tokens
     /// only (§4). Rendered for both modes (the grid mode is restored on Back).
-    fn detail_view(&self, tile: &Tile, palette: Palette) -> Element<'_, crate::Message, Theme> {
+    ///
+    /// FRONTDOOR-10 — when proactive suggestions concern THIS tile (`i` is its
+    /// index), they render inline above the actions (Q19): each a card with the
+    /// title + rationale and, when the suggestion carries a typed proposal, a §9-
+    /// safe **Act** button that re-publishes the proposal to the propose queue —
+    /// never executes.
+    fn detail_view(
+        &self,
+        i: usize,
+        tile: &Tile,
+        palette: Palette,
+    ) -> Element<'_, crate::Message, Theme> {
         let sizes = FontSize::defaults();
 
         // Back control — always real (clears the detail), mirrors the mode toggle.
@@ -1363,6 +1751,23 @@ impl FrontDoor {
         ]
         .spacing(4);
 
+        // FRONTDOOR-10 — the proactive suggestion cards concerning THIS tile (Q19),
+        // rank-order, above the actions. Each shows the title + rationale and, when
+        // it carries a typed proposal, a §9-safe "Act" that re-publishes the
+        // proposal to the propose queue (never executes). Empty when no suggestion
+        // concerns this tile (the section is omitted, not an empty header).
+        let tile_suggestions = self.suggestions_for_tile(i);
+        let suggestions_section: Option<Element<'_, crate::Message, Theme>> =
+            if tile_suggestions.is_empty() {
+                None
+            } else {
+                let mut sec = column![rail_section_label("Copilot suggestions", palette)].spacing(8);
+                for (gi, s) in tile_suggestions {
+                    sec = sec.push(suggestion_card(gi, s, palette));
+                }
+                Some(sec.into())
+            };
+
         // The actions list — every row is a REAL navigation / launch (§7). An
         // empty list (Copilot) renders an honest note instead of a dead row.
         let actions = tile.actions();
@@ -1379,15 +1784,19 @@ impl FrontDoor {
             }
         }
 
-        let body = column![
+        let mut body = column![
             back,
             Space::new().height(Length::Fixed(16.0)),
             header,
-            Space::new().height(Length::Fixed(20.0)),
-            menu,
         ]
         .spacing(8)
         .width(Length::Fill);
+        if let Some(section) = suggestions_section {
+            body = body.push(Space::new().height(Length::Fixed(20.0)));
+            body = body.push(section);
+        }
+        body = body.push(Space::new().height(Length::Fixed(20.0)));
+        body = body.push(menu);
 
         let scroller = scrollable(container(body).padding(Padding::from([24u16, 24u16])))
             .width(Length::Fill)
@@ -1734,11 +2143,18 @@ impl FrontDoor {
     /// given [`Layout`] and bridge the stock-themed canvas back into the cosmic
     /// theme via `themer(None, ..)`.
     fn canvas_grid(&self, layout: Layout, height: Length) -> Element<'_, crate::Message, Theme> {
+        // FRONTDOOR-10 — the per-tile suggestion count drives the on-tile badge
+        // (Q19). Computed once here off the live suggestion set so `draw` stays
+        // pure geometry over an owned snapshot.
+        let suggestion_counts = (0..self.tiles.len())
+            .map(|i| self.suggestion_count_for(i))
+            .collect();
         let program = TileGrid {
             tiles: self.tiles.clone(),
             loading: self.loading,
             palette: crate::live_theme::palette(),
             layout,
+            suggestion_counts,
         };
         let canvas_stock: cosmic::iced::Element<'_, crate::Message, cosmic::iced::Theme> =
             cosmic::iced::widget::canvas(program)
@@ -1922,6 +2338,99 @@ fn detail_action_row<'a>(
     .into()
 }
 
+/// FRONTDOOR-10 — one proactive-suggestion card in a tile's detail view (Q19 —
+/// the suggestion text, rendered inline on the tile it concerns). The title over a
+/// muted impact + rationale, in a raised card; when the suggestion carries a typed
+/// proposal, an **Act** button publishes it to the propose queue
+/// ([`Message::ProposeSuggestion`] → `action/copilot/proposal`). §9: Act PROPOSES,
+/// it does not execute — an advisory-only suggestion shows no Act button. `gi` is
+/// the suggestion's index into [`FrontDoor::suggestions`] so the message addresses
+/// the exact one regardless of per-tile filtering. Tokens only (§4).
+fn suggestion_card<'a>(
+    gi: usize,
+    s: &copilot::Suggestion,
+    palette: Palette,
+) -> Element<'a, crate::Message, Theme> {
+    let sizes = FontSize::defaults();
+    let accent = palette.accent.into_cosmic_color();
+    // High-impact reads warning-toned, medium reads muted — the operator's eye goes
+    // to the urgent ones first (§4 — token, never hex).
+    let impact_tone = if s.impact == "high" {
+        palette.warning.into_cosmic_color()
+    } else {
+        palette.text_muted.into_cosmic_color()
+    };
+
+    let mut card = column![
+        text(s.title.clone())
+            .size(TypeRole::Body.size_in(sizes))
+            .colr(palette.text.into_cosmic_color()),
+        text(format!("{} impact", s.impact))
+            .size(TypeRole::Caption.size_in(sizes))
+            .colr(impact_tone),
+    ]
+    .spacing(4)
+    .width(Length::Fill);
+
+    if !s.detail.trim().is_empty() {
+        card = card.push(
+            text(s.detail.clone())
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(palette.text_muted.into_cosmic_color()),
+        );
+    }
+
+    // §9 — the "Act" affordance ONLY when the suggestion carries a typed proposal.
+    // It PROPOSES (re-publishes to the propose queue), never executes; the gated
+    // confirm/exec surface that drains that queue is separate + out of scope.
+    if s.proposal_body.is_some() {
+        let idle_bg = palette.hover_tint().into_cosmic_color();
+        let act = button(
+            text("Act — queue this proposal for approval")
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(accent),
+        )
+        .padding(Padding::from([8u16, 12u16]))
+        .sty(
+            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+                use cosmic::iced::widget::button::Status;
+                let bg = match status {
+                    Status::Hovered | Status::Pressed => accent_tint(accent),
+                    _ => idle_bg,
+                };
+                cosmic::iced::widget::button::Style {
+                    snap: false,
+                    background: Some(Background::Color(bg)),
+                    text_color: accent,
+                    border: Border {
+                        color: cosmic::iced::Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 6.0.into(),
+                    },
+                    shadow: cosmic::iced::Shadow::default(),
+                    ..cosmic::iced::widget::button::Style::default()
+                }
+            },
+        )
+        .on_press(crate::Message::FrontDoor(Message::ProposeSuggestion(gi)));
+        card = card.push(act);
+    }
+
+    container(card)
+        .width(Length::Fill)
+        .padding(Padding::from([12u16, 14u16]))
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(palette.raised.into_cosmic_color())),
+            border: Border {
+                color: palette.border.into_cosmic_color(),
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
 /// FRONTDOOR-6 — one full-width row in the unified search results list. The
 /// primary label (the matched app / node / service) over a muted context line
 /// (the node a service runs on / the surface a panel lives under). Clicking it
@@ -1976,6 +2485,10 @@ fn search_hit_row<'a>(hit: &SearchHit, palette: Palette) -> Element<'a, crate::M
 /// The accent strip down the left edge of a card. Mode-independent (it's a hair
 /// of color, not a sized element).
 const STRIP_W: f32 = 5.0;
+
+/// FRONTDOOR-10 — the on-tile suggestion badge's radius (a small accent dot in the
+/// card's top-right carrying the count — Q19). Mode-independent (a small fixed pip).
+const BADGE_R: f32 = 9.0;
 
 /// FRONTDOOR-3 — the snap-grid metrics for each render mode. FRONTDOOR-1's panel
 /// numbers (~180 px comfortable-density cards, Q80) become [`Layout::Panel`];
@@ -2066,6 +2579,10 @@ pub struct TileGrid {
     loading: bool,
     palette: Palette,
     layout: Layout,
+    /// FRONTDOOR-10 — per-tile proactive-suggestion count (parallel to `tiles`),
+    /// painted as a small accent badge in the card's top-right (Q19 — the on-tile
+    /// suggestion indicator). 0 ⇒ no badge.
+    suggestion_counts: Vec<usize>,
 }
 
 impl TileGrid {
@@ -2255,6 +2772,28 @@ impl canvas::Program<crate::Message> for TileGrid {
                     ..Text::default()
                 });
             }
+
+            // FRONTDOOR-10 — the proactive-suggestion badge (Q19 — the on-tile
+            // indicator a suggestion concerns THIS tile): a small accent pip in the
+            // top-right corner carrying the count. The detail view holds the card
+            // text + the §9-safe "Act"; the badge is just the affordance to look.
+            let count = self.suggestion_counts.get(i).copied().unwrap_or(0);
+            if count > 0 {
+                let bcx = origin.x + tile_w - BADGE_R - 6.0;
+                let bcy = origin.y + BADGE_R + 6.0;
+                frame.fill(
+                    &Path::circle(Point::new(bcx, bcy), BADGE_R),
+                    p.accent.into_cosmic_color(),
+                );
+                frame.fill_text(Text {
+                    content: count.to_string(),
+                    position: Point::new(bcx, bcy - BADGE_R + 1.0),
+                    color: p.background.into_cosmic_color(),
+                    size: Pixels(BADGE_R + 3.0),
+                    align_x: Alignment::Center,
+                    ..Text::default()
+                });
+            }
         }
 
         vec![frame.into_geometry()]
@@ -2286,8 +2825,9 @@ mod tests {
 
     #[test]
     fn widget_tiles_carry_keys_and_launchers_do_not() {
-        // FRONTDOOR-4 — the design widgets are keyed (they take live data);
-        // Copilot + the app launchers are keyless (no source → no faked value).
+        // FRONTDOOR-4 — the design widgets are keyed (they take live data); the
+        // app launchers are keyless (no source → no faked value). FRONTDOOR-10 —
+        // Copilot is now a KEYED widget too (its `state/copilot/status` topic).
         let fd = FrontDoor::new();
         let key_of = |label: &str| fd.tiles.iter().find(|t| t.label == label).map(|t| t.key);
         assert_eq!(key_of("Mesh Map"), Some(Some(TileKey::MeshMap)));
@@ -2295,8 +2835,8 @@ mod tests {
         assert_eq!(key_of("Alerts"), Some(Some(TileKey::Alerts)));
         assert_eq!(key_of("Build / Farm"), Some(Some(TileKey::BuildFarm)));
         assert_eq!(key_of("System"), Some(Some(TileKey::System)));
-        // Copilot has NO workbench source yet → it's a plain launcher (§7).
-        assert_eq!(key_of("Copilot"), Some(None));
+        // FRONTDOOR-10 — Copilot is keyed now (live status topic exists).
+        assert_eq!(key_of("Copilot"), Some(Some(TileKey::Copilot)));
         assert_eq!(key_of("Files"), Some(None));
         assert_eq!(key_of("Terminal"), Some(None));
         // Every seeded widget tile starts with no value (the skeleton covers it).
@@ -2629,9 +3169,10 @@ mod tests {
         assert_eq!(tile("Alerts").tone, TileTone::Danger);
         // A keyed widget with no data this round stays value-less (no fake).
         assert!(tile("System").value.is_none());
-        // Copilot (a launcher) is never given a value (§7 — needs a publisher).
+        // FRONTDOOR-10 — Copilot is a keyed widget; with no status in THIS snapshot
+        // it stays value-less (the skeleton/resting state), never a fake (§7).
         assert!(tile("Copilot").value.is_none());
-        assert_eq!(tile("Copilot").key, None);
+        assert_eq!(tile("Copilot").key, Some(TileKey::Copilot));
     }
 
     #[test]
@@ -2660,14 +3201,24 @@ mod tests {
     }
 
     #[test]
-    fn copilot_has_no_source_so_for_key_is_none() {
-        // §7 — Copilot is the one widget with no workbench-readable source yet;
-        // even a fully-populated snapshot yields nothing for it.
-        let data = FrontDoorData {
+    fn copilot_for_key_reads_the_status_when_present_and_is_none_otherwise() {
+        // FRONTDOOR-10 — Copilot now has a workbench source (`state/copilot/status`).
+        // With no status in the snapshot it's `None` (the skeleton holds, no fake —
+        // §7); with one it projects the live ready/thinking/offline value+tone.
+        let empty = FrontDoorData {
             node_health: Some(("1/1 healthy".into(), TileTone::Success)),
             ..FrontDoorData::default()
         };
-        assert!(data.for_key(TileKey::Copilot).is_none());
+        assert!(empty.for_key(TileKey::Copilot).is_none());
+
+        let live = FrontDoorData {
+            copilot: Some(("ready".into(), TileTone::Success)),
+            ..FrontDoorData::default()
+        };
+        assert_eq!(
+            live.for_key(TileKey::Copilot),
+            Some(("ready".to_string(), TileTone::Success))
+        );
     }
 
     // ── FRONTDOOR-5: tile click → detail actions menu ──
@@ -2675,11 +3226,14 @@ mod tests {
     /// A `TileGrid` over the seeded tiles at the given layout, in the loaded
     /// (interactive) state — the shape the canvas sees once data has landed.
     fn grid(layout: Layout) -> TileGrid {
+        let tiles = FrontDoor::new().tiles;
+        let suggestion_counts = vec![0; tiles.len()];
         TileGrid {
-            tiles: FrontDoor::new().tiles,
+            tiles,
             loading: false,
             palette: Palette::dark(),
             layout,
+            suggestion_counts,
         }
     }
 
@@ -3269,5 +3823,207 @@ mod tests {
             fd.results.iter().any(|h| h.label == "anvil"),
             "the fresh roster makes the node searchable mid-search"
         );
+    }
+
+    // ── FRONTDOOR-10 (GUI half): the live Copilot status + proactive suggestions ──
+
+    #[test]
+    fn copilot_status_parses_each_state_and_degrades_on_junk() {
+        use copilot::{parse_status, StatusState};
+        // The three backend states map to the three tile values; `available` is
+        // carried through.
+        let ready = parse_status(Some(
+            r#"{"state":"ready","leader":true,"available":true,"model":"gpt-5-mini"}"#,
+        ))
+        .expect("ready parses");
+        assert_eq!(ready.state, StatusState::Ready);
+        assert!(ready.available);
+        assert_eq!(ready.tile_value().0, "ready");
+        assert_eq!(ready.tile_value().1, TileTone::Success);
+
+        assert_eq!(
+            parse_status(Some(r#"{"state":"thinking","available":true}"#))
+                .unwrap()
+                .state,
+            StatusState::Thinking
+        );
+        let offline = parse_status(Some(
+            r#"{"state":"offline","leader":false,"available":false,"model":"unknown"}"#,
+        ))
+        .unwrap();
+        assert_eq!(offline.state, StatusState::Offline);
+        assert!(!offline.available);
+        assert_eq!(offline.tile_value().1, TileTone::Neutral);
+
+        // Junk / unknown state / no body → None (the tile keeps its skeleton, §7).
+        assert!(parse_status(None).is_none());
+        assert!(parse_status(Some("not json")).is_none());
+        assert!(parse_status(Some(r#"{"state":"wat"}"#)).is_none());
+    }
+
+    #[test]
+    fn copilot_suggestions_parse_rank_order_and_keep_the_proposal_body() {
+        use copilot::parse_suggestions;
+        // A ranked set with one advisory + one actionable suggestion; order is
+        // preserved (the backend ranks best-first) and the typed proposal rides
+        // through as its own JSON body for the §9-safe "Act".
+        let body = r#"{
+            "suggestions":[
+              {"title":"mfsmaster on oak is down","detail":"restart it","impact":"high",
+               "proposal":{"action":{"kind":"service_lifecycle","target_host":"oak",
+                 "service_kind":"container","name":"mfsmaster","op":"restart"},
+                 "rationale":"oak lost its master"}},
+              {"title":"farm queue is idle","detail":"nothing to do","impact":"medium"}
+            ],
+            "produced_at_s":123
+        }"#;
+        let sugg = parse_suggestions(Some(body));
+        assert_eq!(sugg.len(), 2);
+        assert_eq!(sugg[0].title, "mfsmaster on oak is down");
+        assert_eq!(sugg[0].impact, "high");
+        let proposal = sugg[0].proposal_body.as_deref().expect("actionable");
+        assert!(proposal.contains("service_lifecycle"));
+        assert!(proposal.contains("\"target_host\":\"oak\""));
+        // The advisory one carries no proposal → no "Act" affordance.
+        assert!(sugg[1].proposal_body.is_none());
+
+        // A title-less entry is dropped; junk / empty set → empty.
+        assert!(parse_suggestions(Some(r#"{"suggestions":[{"detail":"x"}]}"#)).is_empty());
+        assert!(parse_suggestions(Some("not json")).is_empty());
+        assert!(parse_suggestions(None).is_empty());
+    }
+
+    #[test]
+    fn a_suggestion_maps_to_the_tile_it_concerns() {
+        use copilot::Suggestion;
+        let mk = |title: &str, detail: &str, proposal: Option<&str>| Suggestion {
+            title: title.into(),
+            detail: detail.into(),
+            impact: "high".into(),
+            proposal_body: proposal.map(str::to_string),
+        };
+        // A typed service-lifecycle proposal always maps to the Data Center tile.
+        assert_eq!(
+            mk("restart", "", Some(r#"{"action":{"kind":"service_lifecycle"}}"#)).concerns_tile(),
+            Some(TileKey::DataCenter)
+        );
+        // Keyword buckets.
+        assert_eq!(
+            mk("Build farm is red", "a tier failed", None).concerns_tile(),
+            Some(TileKey::BuildFarm)
+        );
+        assert_eq!(
+            mk("Alert firing", "a health alarm", None).concerns_tile(),
+            Some(TileKey::Alerts)
+        );
+        assert_eq!(
+            mk("Mesh peer offline", "routing", None).concerns_tile(),
+            Some(TileKey::MeshMap)
+        );
+        // Names no tile → unmapped (homed on the Copilot tile by the panel).
+        assert!(mk("ponder the universe", "vague", None).concerns_tile().is_none());
+    }
+
+    #[test]
+    fn loaded_folds_the_copilot_status_and_suggestions_inline() {
+        // The end-to-end fold (Q19): a snapshot carries the live status + a ranked
+        // set → the Copilot tile takes the status value, and each suggestion lands
+        // on the tile it concerns (the canvas badge count proves the mapping).
+        let mut fd = FrontDoor::new();
+        let data = FrontDoorData {
+            copilot: Some(("thinking".into(), TileTone::Warning)),
+            suggestions: vec![
+                copilot::Suggestion {
+                    title: "Build farm red".into(),
+                    detail: "a tier failed".into(),
+                    impact: "high".into(),
+                    proposal_body: None,
+                },
+                copilot::Suggestion {
+                    title: "restart mfsmaster".into(),
+                    detail: "oak lost it".into(),
+                    impact: "high".into(),
+                    proposal_body: Some(
+                        r#"{"action":{"kind":"service_lifecycle","target_host":"oak","service_kind":"container","name":"mfsmaster","op":"restart"},"rationale":"x"}"#
+                            .into(),
+                    ),
+                },
+            ],
+            ..FrontDoorData::default()
+        };
+        let _ = fd.update(Message::Loaded(Box::new(data)));
+
+        let tile = |label: &str| fd.tiles.iter().find(|t| t.label == label).unwrap();
+        // FD-4 gap closed — the Copilot tile shows the live status now.
+        assert_eq!(tile("Copilot").value.as_deref(), Some("thinking"));
+        assert_eq!(tile("Copilot").tone, TileTone::Warning);
+
+        // The build suggestion lands on the Build/Farm tile; the lifecycle proposal
+        // lands on the Data Center tile (badge count == 1 each).
+        let idx = |label: &str| fd.tiles.iter().position(|t| t.label == label).unwrap();
+        assert_eq!(fd.suggestion_count_for(idx("Build / Farm")), 1);
+        assert_eq!(fd.suggestion_count_for(idx("Data Center")), 1);
+        // A tile no suggestion concerns has no badge.
+        assert_eq!(fd.suggestion_count_for(idx("System")), 0);
+    }
+
+    #[test]
+    fn an_unmapped_suggestion_is_homed_on_the_copilot_tile_never_dropped() {
+        let mut fd = FrontDoor::new();
+        fd.suggestions = vec![copilot::Suggestion {
+            title: "ponder the universe".into(),
+            detail: "no tile named".into(),
+            impact: "medium".into(),
+            proposal_body: None,
+        }];
+        let copilot_idx = fd.tiles.iter().position(|t| t.label == "Copilot").unwrap();
+        assert_eq!(fd.suggestion_count_for(copilot_idx), 1);
+        // It isn't double-counted onto an arbitrary widget.
+        let sys_idx = fd.tiles.iter().position(|t| t.label == "System").unwrap();
+        assert_eq!(fd.suggestion_count_for(sys_idx), 0);
+    }
+
+    #[test]
+    fn act_on_a_suggestion_targets_the_propose_topic_not_the_exec_topic() {
+        // §9 — the "Act" path re-publishes to the PROPOSE queue, never the exec
+        // topic, and never executes. The topic constant the handler writes to is
+        // the FD-12 propose queue.
+        assert_eq!(copilot::PROPOSAL_TOPIC, "action/copilot/proposal");
+        assert_ne!(copilot::PROPOSAL_TOPIC, "action/exec/request");
+
+        // ProposeSuggestion with no proposal body (advisory-only) is an inert
+        // no-op Task — it never publishes anything.
+        let mut fd = FrontDoor::new();
+        fd.suggestions = vec![copilot::Suggestion {
+            title: "advisory only".into(),
+            detail: "no proposal".into(),
+            impact: "medium".into(),
+            proposal_body: None,
+        }];
+        // Doesn't panic; the handler short-circuits on the absent proposal body.
+        let _ = fd.update(Message::ProposeSuggestion(0));
+        // A stale index is also a no-op.
+        let _ = fd.update(Message::ProposeSuggestion(99));
+    }
+
+    #[test]
+    fn copilot_tile_detail_renders_its_suggestions_without_panicking() {
+        // The detail view for the Copilot tile builds with its homed suggestions +
+        // an actionable card (the §9 "Act" button) — neither path panics.
+        let mut fd = FrontDoor::new();
+        fd.loading = false;
+        fd.suggestions = vec![copilot::Suggestion {
+            title: "restart mfsmaster on oak".into(),
+            detail: "oak lost its master".into(),
+            impact: "high".into(),
+            proposal_body: Some(
+                r#"{"action":{"kind":"service_lifecycle","target_host":"oak","service_kind":"container","name":"mfsmaster","op":"restart"},"rationale":"x"}"#
+                    .into(),
+            ),
+        }];
+        // The lifecycle proposal homes on the Data Center tile — open its detail.
+        let dc_idx = fd.tiles.iter().position(|t| t.label == "Data Center").unwrap();
+        let _ = fd.update(Message::TileActivated(dc_idx));
+        let _: Element<'_, crate::Message, Theme> = fd.view();
     }
 }
