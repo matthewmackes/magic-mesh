@@ -65,6 +65,47 @@ impl RecordDef {
     }
 }
 
+/// CONNECT-9 — derive the bare DDNS record label for an ingress `hostname`.
+///
+/// A fully-qualified ingress hostname (`grafana.services.matthewmackes.com` in the
+/// `services.matthewmackes.com` zone) is reduced to its bare label (`grafana`); a
+/// hostname that is already bare (no zone suffix) is passed through trimmed. Empty
+/// when nothing is left after stripping (a hostname equal to the zone), so the
+/// caller skips it. Pure.
+#[must_use]
+pub fn ingress_record_label(hostname: &str, zone: &str) -> String {
+    let host = hostname.trim().trim_end_matches('.');
+    let zone = zone.trim().trim_end_matches('.');
+    let suffix = format!(".{zone}");
+    host.strip_suffix(&suffix)
+        .unwrap_or(host)
+        .trim()
+        .to_string()
+}
+
+/// CONNECT-9 — the [`RecordDef`] a CONNECT ingress hostname maps to.
+///
+/// The bare `label` is published as a `wan`-sourced A record (the public name must
+/// resolve to the ingress lighthouse's own public WAN IP, which Caddy/the
+/// stream-forward terminate on). `on_down = keep` so a transient WAN-probe miss
+/// never drops a live public name — the firewall/Caddy layer governs real
+/// reachability, not the DNS record. `None` when `label` is empty (a hostname that
+/// collapsed to the bare zone). The `mackesd` `ddns` reconcile worker
+/// (DDNS-EGRESS-3) publishes it; this is only the durable record definition, NOT a
+/// second DNS path. Pure.
+#[must_use]
+pub fn ingress_record(label: &str) -> Option<RecordDef> {
+    let label = label.trim();
+    if label.is_empty() {
+        return None;
+    }
+    Some(RecordDef {
+        name: label.to_string(),
+        source: "wan".to_string(),
+        on_down: OnDown::Keep,
+    })
+}
+
 /// The `[ddns]` durable config.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DdnsConfig {
@@ -126,6 +167,32 @@ impl DdnsConfig {
     /// A TOML serialize error.
     pub fn to_toml_string(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(self)
+    }
+
+    /// CONNECT-9 — insert-or-replace a managed record keyed by its name label (the
+    /// stable key the responder + worker already use). Returns `true` when the
+    /// config changed (a new record, or an existing one whose source/policy
+    /// differed) so the caller can skip a no-op save. Idempotent: re-adding an
+    /// identical record is a no-op.
+    pub fn upsert_record(&mut self, rec: RecordDef) -> bool {
+        if let Some(existing) = self.record.iter_mut().find(|r| r.name == rec.name) {
+            if *existing == rec {
+                return false;
+            }
+            *existing = rec;
+            true
+        } else {
+            self.record.push(rec);
+            true
+        }
+    }
+
+    /// CONNECT-9 — remove a managed record by its name label. Returns `true` when
+    /// one was removed (so the caller skips a no-op save on an already-absent name).
+    pub fn remove_record(&mut self, name: &str) -> bool {
+        let before = self.record.len();
+        self.record.retain(|r| r.name != name);
+        self.record.len() != before
     }
 }
 
@@ -418,6 +485,57 @@ mod tests {
             r2.fqdn("Eagle", "Proton", 2, "z.example"),
             "eagle-proton2.z.example"
         );
+    }
+
+    #[test]
+    fn ingress_record_label_strips_zone_suffix() {
+        // CONNECT-9 — a fqdn ingress hostname → its bare label.
+        assert_eq!(
+            ingress_record_label(
+                "grafana.services.matthewmackes.com",
+                "services.matthewmackes.com"
+            ),
+            "grafana"
+        );
+        // A trailing-dot fqdn + zone are both tolerated.
+        assert_eq!(ingress_record_label("app.z.example.", "z.example."), "app");
+        // Already bare → passed through.
+        assert_eq!(ingress_record_label("bare", "z.example"), "bare");
+        // A hostname equal to the zone collapses to empty (caller skips it).
+        assert_eq!(ingress_record_label("z.example", "z.example"), "");
+    }
+
+    #[test]
+    fn ingress_record_is_wan_keep_or_none() {
+        // CONNECT-9 — an ingress name maps to a wan-sourced keep record.
+        let r = ingress_record("grafana").expect("non-empty label → a record");
+        assert_eq!(r.name, "grafana");
+        assert_eq!(r.source, "wan");
+        assert_eq!(r.on_down, OnDown::Keep);
+        // An empty label yields no record (nothing to publish).
+        assert!(ingress_record("").is_none());
+        assert!(ingress_record("   ").is_none());
+    }
+
+    #[test]
+    fn upsert_remove_record_are_idempotent_and_report_change() {
+        // CONNECT-9 — the config-level glue the expose/unexpose flow drives.
+        let mut cfg = DdnsConfig::default();
+        let rec = ingress_record("grafana").unwrap();
+        // First add → changed.
+        assert!(cfg.upsert_record(rec.clone()));
+        assert_eq!(cfg.record.len(), 1);
+        // Re-adding the identical record → no change (no churn).
+        assert!(!cfg.upsert_record(rec.clone()));
+        // A differing source for the same label → replace, changed.
+        let mut moved = rec.clone();
+        moved.source = "tunnel:m1".into();
+        assert!(cfg.upsert_record(moved));
+        assert_eq!(cfg.record.len(), 1);
+        // Remove by label → changed; removing again → no change.
+        assert!(cfg.remove_record("grafana"));
+        assert!(!cfg.remove_record("grafana"));
+        assert!(cfg.record.is_empty());
     }
 
     #[test]
