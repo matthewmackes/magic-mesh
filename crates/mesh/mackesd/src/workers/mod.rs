@@ -366,6 +366,9 @@ pub mod fleet_reconcile;
 pub mod job_exec;
 // PD-13 — presence-transition alerts riding the alert_relay pipeline.
 pub mod presence_watch;
+// SUBSTRATE-10 — etcd WATCH worker: instant peer-down / leader-change alerts
+// pushed (not polled) off `/mesh/peers/` + `/mesh/leader` watch streams.
+pub mod etcd_watch;
 // SEC-5 / KDC2-4 — relays neighbors' paired phones mesh-wide.
 pub mod mesh_shunt;
 // PLANES-18 — feeds <host>.mesh into resolved + /etc/hosts.

@@ -75,6 +75,7 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     ("ssh_pubkey_gossip", 0),
     ("fleet_reconcile", 0),
     ("presence_watch", 0),
+    ("etcd_watch", 0),
     ("lifecycle_exec", 0),
     ("reconcile", 0),
     ("netstate_apply", 0),
@@ -292,7 +293,9 @@ mod tests {
         // SOLE clipboard capturer, spawning `wl-paste --watch` directly. The
         // never-built `mde-clipd` daemon + its `clipd_supervisor` worker were
         // removed in CLIP-SYNC-2: that binary never existed in the workspace).
-        assert_eq!(WORKER_TIERS.len(), 27);
+        // +1 etcd_watch (SUBSTRATE-10 — the coordination-plane WATCH worker that
+        // pushes instant peer-down / leader-change alerts off etcd watch streams).
+        assert_eq!(WORKER_TIERS.len(), 28);
     }
 
     #[test]
@@ -315,8 +318,8 @@ mod tests {
         let count = |rank: u8| WORKER_TIERS.iter().filter(|(_, r)| *r == rank).count();
         assert_eq!(
             count(0),
-            20,
-            "Lighthouse control plane (+gossip/reconcile/presence/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe)"
+            21,
+            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe)"
         );
         assert_eq!(
             count(1),
@@ -378,10 +381,12 @@ mod tests {
         let srv = workers_for_rank(Role::Server.rank());
         let ws = workers_for_rank(Role::Workstation.rank());
         // +1 each (hardware_probe, rank 0 → present in every tier).
-        assert_eq!(lh.len(), 20);
-        assert_eq!(srv.len(), 23);
-        // 27: +clipboard_sync (CLIP-SYNC-1), -clipd_supervisor (removed, CLIP-SYNC-2).
-        assert_eq!(ws.len(), 27);
+        // +1 etcd_watch (SUBSTRATE-10, rank 0 → present in every tier).
+        assert_eq!(lh.len(), 21);
+        assert_eq!(srv.len(), 24);
+        // 28: +clipboard_sync (CLIP-SYNC-1), -clipd_supervisor (removed, CLIP-SYNC-2),
+        // +etcd_watch (SUBSTRATE-10).
+        assert_eq!(ws.len(), 28);
         // Strict superset: every lower-tier worker is in the higher tier.
         assert!(lh.iter().all(|w| srv.contains(w)));
         assert!(srv.iter().all(|w| ws.contains(w)));
@@ -434,15 +439,15 @@ mod tests {
             "media ≠ workstation tier"
         );
         let set = workers_for_class(media_lh);
-        // = the 20 lighthouse-tier workers + navidrome.
-        assert_eq!(set.len(), 21);
+        // = the 21 lighthouse-tier workers + navidrome.
+        assert_eq!(set.len(), 22);
         assert!(set.contains(&"navidrome"));
         assert!(set.contains(&"nebula_supervisor"));
         assert!(!set.contains(&"ansible-pull"));
         // A plain lighthouse class never includes the media worker.
         let plain_lh = DeployClass::plain(Role::Lighthouse.rank());
         assert!(!workers_for_class(plain_lh).contains(&"navidrome"));
-        assert_eq!(workers_for_class(plain_lh).len(), 20);
+        assert_eq!(workers_for_class(plain_lh).len(), 21);
     }
 
     #[test]

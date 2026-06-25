@@ -16,7 +16,7 @@
 
 use std::path::Path;
 
-use etcd_client::{Client, Error};
+use etcd_client::{Client, Error, WatchOptions, WatchStream};
 
 /// Where `setup-etcd.sh` records the comma/newline-separated client URLs this
 /// node connects to (its own member on an anchor, the anchors on a workstation).
@@ -96,6 +96,25 @@ pub fn default_endpoints() -> Vec<String> {
 /// An [`etcd_client::Error`] when no endpoint is reachable.
 pub async fn connect(endpoints: &[String]) -> Result<Client, Error> {
     Client::connect(endpoints, None).await
+}
+
+/// Open an etcd v3 **watch stream** on `key` with `options`. The returned
+/// [`WatchStream`] yields a [`etcd_client::WatchResponse`] per `message()`
+/// await, each carrying the Put/Delete events for keys matching the watch — the
+/// push primitive the [`crate::workers::etcd_watch`] worker uses to turn a
+/// `/mesh/peers/` keepalive-lease delete or a `/mesh/leader` value change into an
+/// INSTANT alert (no poll). Pass `WatchOptions::new().with_prefix()` to watch a
+/// whole prefix (the peer directory) or `None` for a single key (the leader).
+///
+/// # Errors
+/// An [`etcd_client::Error`] when no endpoint is reachable or the watch RPC is
+/// rejected (the caller degrades + reconnects rather than panics, §2).
+pub async fn watch(
+    client: &mut Client,
+    key: impl Into<Vec<u8>>,
+    options: Option<WatchOptions>,
+) -> Result<WatchStream, Error> {
+    client.watch(key, options).await
 }
 
 /// Best-effort reachability probe: connect + a trivial range read (a get on a
