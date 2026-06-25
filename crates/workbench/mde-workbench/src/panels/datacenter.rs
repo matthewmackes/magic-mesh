@@ -7259,6 +7259,38 @@ fn read_dc_events() -> Result<DcLoad, String> {
     })
 }
 
+/// FRONTDOOR-4 — read just the datacenter health checks (`event/dc/health/*`)
+/// off the Bus + project them, for the Front Door's Alerts widget tile. A
+/// narrowed [`read_dc_events`] (same `list_topics` + filter + `project_health`
+/// pattern) so the Alerts tile counts the same `warn`/`fail` checks the
+/// Datacenter Overview does (§6 glue). Best-effort: a missing Bus / topic →
+/// an empty vec (the tile shows no count rather than a fake one). MUST be called
+/// OUTSIDE an async runtime; the Front Door loader runs it on a blocking thread.
+#[must_use]
+pub fn read_health_checks() -> Vec<HealthCheck> {
+    let Some(dir) = mde_bus::default_data_dir() else {
+        return Vec::new();
+    };
+    let Ok(persist) = mde_bus::persist::Persist::open(dir) else {
+        return Vec::new();
+    };
+    let Ok(topics) = persist.list_topics() else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    for topic in topics
+        .into_iter()
+        .filter(|t| t.starts_with("event/dc/health/"))
+    {
+        if let Ok(msgs) = persist.list_since(&topic, None) {
+            if let Some(body) = msgs.last().and_then(|m| m.body.clone()) {
+                events.push((topic, body));
+            }
+        }
+    }
+    project_health(&events)
+}
+
 /// Fire the `action/dc/vm-power` Bus RPC (blocking — runs on a `spawn_blocking`
 /// thread) and translate the reply into a status line. Mirrors the connect
 /// panel's Persist + `mde_bus::rpc::request` round trip, wrapped in a local

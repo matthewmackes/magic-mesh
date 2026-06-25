@@ -694,6 +694,24 @@ impl App {
                     .map(|_| Message::Lighthouses(lighthouses_panel::Message::Refresh)),
             );
         }
+        // FRONTDOOR-4 — while the Front Door is the active view (the Dashboard
+        // group root or the "home" panel both render it), keep its widget tiles
+        // live: the slow-poll fallback (15 s) backstops the not-purely-push
+        // topics (build/farm verdict, datacenter health, boot readiness), and the
+        // Peers directory-changed Bus event is the push half — it fires a Front
+        // Door reload the instant the roster changes, so node-health / mesh-map /
+        // data-center tiles update without waiting out the poll (Q22). Both are
+        // view-gated, so nothing polls when the operator is elsewhere.
+        if matches!(
+            self.view,
+            View::Group(Group::Dashboard) | View::Panel { panel: "home", .. }
+        ) {
+            subs.push(front_door_panel::FrontDoor::poll_subscription());
+            subs.push(
+                peers_panel::directory_event_subscription()
+                    .map(|_| Message::FrontDoor(front_door_panel::Message::Reload)),
+            );
+        }
         // PD-8 (L14) / PLANES-1 — Netdata sampling only while the Peers
         // directory is the active view (the Compute pattern). The Front
         // Door is reachable as the Peers plane root/panel or the
@@ -810,10 +828,10 @@ impl App {
             Message::Notifications(msg) => self.notifications.update(msg, self.backend()),
             Message::Home(msg) => self.home.update(msg),
             Message::FrontDoor(msg) => {
-                // FRONTDOOR-2 — fold the omnibox text into the Front Door's local
-                // state. No side effect yet (search is FRONTDOOR-6), so no Task.
-                self.front_door.update(msg);
-                Task::none()
+                // FRONTDOOR-2 folds the omnibox text + mode flip (no side effect);
+                // FRONTDOOR-4's Reload/Loaded drive the live-tile Bus read, so the
+                // panel update now returns a real Task (the off-thread load).
+                self.front_door.update(msg)
             }
             Message::HelpTopicOpened(path) => {
                 help_index_panel::spawn_xdg_open(&path);
@@ -946,8 +964,17 @@ impl App {
                 let recovered = reachable && !self.bus_reachable;
                 self.bus_reachable = reachable;
                 if recovered {
-                    if let View::Panel { group, panel } = self.view {
-                        return self.on_panel_navigated(group, panel);
+                    match self.view {
+                        View::Panel { group, panel } => {
+                            return self.on_panel_navigated(group, panel)
+                        }
+                        // FRONTDOOR-4 — the Dashboard group root renders the Front
+                        // Door but isn't a Panel route, so re-fire its live-tile
+                        // load directly on a mackesd down→up recovery.
+                        View::Group(Group::Dashboard) => {
+                            return front_door_panel::FrontDoor::load()
+                        }
+                        View::Group(_) => {}
                     }
                 }
                 Task::none()
@@ -974,7 +1001,14 @@ impl App {
         match panel {
             // WB-OVERVIEW-2 — the Home/Overview panel fires its full load
             // (sync snapshot + async capability fan-out) so it lands populated.
-            "home" => home_panel::HomePanel::load(),
+            // FRONTDOOR-4 — the "home" route RENDERS the Front Door (see the
+            // view router), so it also fires the Front Door's live-tile load; the
+            // home panel's own load stays (its state still feeds the Front Door's
+            // System/peer reuse + remains the Overview when reached directly).
+            "home" => Task::batch([
+                home_panel::HomePanel::load(),
+                front_door_panel::FrontDoor::load(),
+            ]),
             "wallpaper" => wallpaper_panel::WallpaperPanel::load(self.backend()),
             "notifications" => notifications_panel::NotificationsPanel::load(self.backend()),
             "music" => music_panel::MusicPanel::load(),
@@ -1085,11 +1119,17 @@ impl App {
     /// the Compute root enumerates local VMs/pods on entry (E6.10), so a
     /// jump to it — sidebar click, `--page compute`, See-also link — lands
     /// the instance list already populated.
-    fn on_group_navigated(&self, _group: Group) -> Task<Message> {
+    fn on_group_navigated(&self, group: Group) -> Task<Message> {
         // NAV-1 — group roots render the role card; the live directory
         // (Peers) and the instance list (Compute→Provisioning/Instances)
         // load via their slug-routed panels, not a group root.
-        Task::none()
+        // FRONTDOOR-4 — the Dashboard root renders the Front Door (see the view
+        // router), so landing on it fires the Front Door's live-tile load so the
+        // widgets stream real data instead of sitting on the skeleton.
+        match group {
+            Group::Dashboard => front_door_panel::FrontDoor::load(),
+            _ => Task::none(),
+        }
     }
 
     fn apply_focus_request(&mut self, slug: &str) -> Task<Message> {
@@ -1607,7 +1647,18 @@ impl Application for App {
                 };
                 (app, boot)
             }
-            _ => (App::new(), crate::panels::peers::PeersPanel::load()),
+            // FRONTDOOR-4 — a plain launch lands on the Dashboard/"home" view,
+            // which renders the Front Door, so fire its live-tile load on boot
+            // (alongside the Peers directory load the Front Door's mesh-map /
+            // node-health / data-center tiles reuse) — the menu lands streaming
+            // real data, not on the skeleton.
+            _ => (
+                App::new(),
+                Task::batch([
+                    crate::panels::peers::PeersPanel::load(),
+                    front_door_panel::FrontDoor::load(),
+                ]),
+            ),
         };
         app.core = core;
         // UX-4 (d) — keep the workbench's custom `crate::header` bar; suppress

@@ -308,6 +308,20 @@ pub enum Message {
     FlowAnim,
 }
 
+/// FRONTDOOR-4 — fetch + parse the live mesh directory in one blocking call,
+/// reusing the same `action/mesh/directory` Bus RPC + [`parse_directory`] the
+/// panel's own [`PeersPanel::load`] drives. Returns the parsed rows, or `None`
+/// on an unreachable / not-ok / unparseable reply (the caller treats that as "no
+/// data" — it never fabricates a roster). MUST be called OUTSIDE an async
+/// runtime (it wraps the synchronous [`crate::dbus::action_request`]); the Front
+/// Door's loader runs it on a `spawn_blocking` thread. Kept here so there is one
+/// directory reader (§6 glue), shared by the Peers panel and the Front Door.
+#[must_use]
+pub fn action_directory() -> Option<Vec<PeerRow>> {
+    let raw = crate::dbus::action_request("action/mesh/directory", Duration::from_secs(2))?;
+    parse_directory(&raw).ok()
+}
+
 /// Parse the PD-1 directory JSON into rows (pure, testable).
 #[must_use]
 pub fn parse_directory(raw: &str) -> Result<Vec<PeerRow>, String> {

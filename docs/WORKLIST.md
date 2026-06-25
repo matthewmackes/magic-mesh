@@ -1945,7 +1945,7 @@ clean+reachable smoke); visual gate lifted.
     - [ ] a toggle switches the panel to full-screen: paged rounded-icon grid + widgets, no dock
     - [ ] paging works (swipe/click); same tile model as the panel; reuses the wgpu renderer
 
-- [ ] **FRONTDOOR-4: live tiles + widgets over mde-bus.**
+- [>] **FRONTDOOR-4: live tiles + widgets over mde-bus.** Widget tiles now stream REAL data via the existing bus paths (no new publisher, no demo_data): mesh-map/node-health/data-center from `action/mesh/directory` (Peers), build-farm/devops from `event/farm/*`+`event/test/*`, alerts from `event/dc/health/*`, system from `state/boot-readiness`+version; event-driven (Peers directory-changed push) + 15s slow-poll fallback; FD-1 skeleton until first snapshot. `[>]`: Copilot is the ONE widget with no workbench-readable source yet (FRONTDOOR-12 backend only) — left an honest launcher, needs a bus publisher (follow-up).
   **As** an operator, **I want** tiles that show live mesh/DevOps data,
   **so that** the menu is a dashboard, not just launchers.
   **Acceptance**:

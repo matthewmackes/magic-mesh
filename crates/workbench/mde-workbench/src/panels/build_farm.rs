@@ -319,7 +319,11 @@ impl BuildFarmPanel {
 /// Bus read: every `event/farm/*` + `event/test/*` topic's latest body.
 /// Best-effort — a missing Bus yields an empty snapshot (the panel renders the
 /// clean "no runs yet" state, not an error).
-fn read_farm_events() -> Result<FarmSnapshot, String> {
+///
+/// FRONTDOOR-4 reuses this to feed the Front Door's Build/Farm + DevOps widget
+/// tiles from the same Bus topics, so the tile reads the same verdict the panel
+/// it links to does (§6 glue — no second farm reader).
+pub fn read_farm_events() -> Result<FarmSnapshot, String> {
     let Some(dir) = mde_bus::default_data_dir() else {
         return Ok(FarmSnapshot {
             jobs: Vec::new(),

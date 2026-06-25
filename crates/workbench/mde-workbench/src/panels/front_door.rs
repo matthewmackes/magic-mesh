@@ -27,22 +27,43 @@
 //! but a scrollable grid is the accepted first cut (the rounded-icon aesthetic is
 //! the required part), and it avoids a heavy custom pager on the canvas path.
 //!
-//! SCOPE held to FRONTDOOR-1/2/3 only:
-//! - Static placeholder tiles (REAL bus-backed data is FRONTDOOR-4).
+//! FRONTDOOR-4 (this layer) makes the **widget** tiles live: each one carries a
+//! [`TileKey`] naming the design widget (Q99: mesh map, build/farm, alerts, node
+//! health, Copilot, system, plus the DevOps + Data Center surfaces) and an
+//! optional live `value` line drawn under the label. The values come from the
+//! **existing** mde-bus data paths the other panels already read (§6 glue — no
+//! new mackesd publisher, no `demo_data`): the Peers directory, the Build Farm
+//! events, the Datacenter health checks, the boot-readiness snapshot. The Front
+//! Door subscribes the **same way** the other panels do — a [`FrontDoor::load`]
+//! Task fired on nav + reconnect, the Peers directory-changed Bus event for the
+//! push half, and a slow-poll fallback ([`poll_subscription`]) for the topics
+//! that aren't purely push (§7 — real data, event-driven + slow-poll fallback).
+//! Until the first snapshot lands the FD-1 `loading` skeleton shows (Q92 — no
+//! layout shift). The one widget with **no** existing workbench-readable source —
+//! **Copilot** (FRONTDOOR-12 landed the backend, but no bus topic the workbench
+//! can read yet) — stays a plain launcher with no faked value, noted as needing a
+//! publisher (a follow-up), per §7 (better an honest launcher than a fake metric).
+//!
+//! SCOPE held to FRONTDOOR-1/2/3/4:
 //! - `draw` only — tile click → detail view is FRONTDOOR-5, so the canvas keeps
 //!   `type State = ()` and the default `update` / `mouse_interaction`.
 //! - Omnibox is render + local text state only (search logic is FRONTDOOR-6).
 //! - No wallpaper backdrop here.
 
+use std::time::Duration;
+
 use cosmic::iced::widget::canvas::{self, Frame, Path, Text};
 use cosmic::iced::widget::text::Alignment;
 use cosmic::iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
-use cosmic::iced::{Background, Border, Element, Length, Padding, Pixels, Point, Size};
+use cosmic::iced::{
+    Background, Border, Element, Length, Padding, Pixels, Point, Size, Subscription, Task,
+};
 use cosmic::Theme;
 use mde_theme::{FontSize, Palette, TypeRole};
 
 use crate::cosmic_compat::prelude::*;
 use crate::model::Group;
+use crate::panels::{build_farm, datacenter, home, peers};
 
 /// FRONTDOOR-2/3 — the Front Door's own message set, threaded through
 /// [`crate::Message::FrontDoor`]. Each variant is one we actually handle (§7):
@@ -57,6 +78,16 @@ pub enum Message {
     /// FRONTDOOR-3 — the top-bar toggle was pressed: flip [`FrontDoor::mode`]
     /// between the Win10 panel and the iPadOS full-screen home.
     ToggleMode,
+    /// FRONTDOOR-4 — the slow-poll tick (or a reconnect) asks for a fresh read.
+    /// The handler returns [`FrontDoor::load`] so the actual Bus read happens
+    /// off-thread; the result comes back as [`Message::Loaded`].
+    Reload,
+    /// FRONTDOOR-4 — a fresh widget-data snapshot read off the existing mde-bus
+    /// data paths (the Peers directory + Build Farm + Datacenter health + boot
+    /// readiness). Folded into the widget tiles' live `value` lines, and clears
+    /// the [`FrontDoor::loading`] skeleton on the first arrival. Boxed so the
+    /// enum stays small (clippy `large_enum_variant`).
+    Loaded(Box<FrontDoorData>),
 }
 
 /// FRONTDOOR-3 — which of the two locked render modes the Front Door is in
@@ -106,21 +137,266 @@ impl TileTone {
     }
 }
 
-/// One placeholder tile in the grid. FRONTDOOR-4 backs `label`/`tone` with live
-/// mde-bus topic data; here they are static seeds proving the render path.
+/// FRONTDOOR-4 — which design widget a tile *is* (Q99), so a fresh
+/// [`FrontDoorData`] snapshot can target the right tile's live value + tone
+/// without matching on its display label. A plain app launcher carries no key
+/// (`Tile::key == None`) and never takes live data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TileKey {
+    /// Mesh map — online/total peer presence (Peers directory).
+    MeshMap,
+    /// Build / Farm — the latest farm + nightly-tier verdict (Build Farm events).
+    BuildFarm,
+    /// Alerts — non-ok datacenter health checks (`event/dc/health/*`).
+    Alerts,
+    /// Node health — healthy/total node count (Peers directory `health`).
+    NodeHealth,
+    /// Copilot — NO workbench-readable source yet (FRONTDOOR-12 backend only);
+    /// stays a launcher, noted as needing a publisher.
+    Copilot,
+    /// System — boot-readiness + the running workbench version.
+    System,
+    /// Data Center — total datacenter-plane node count (Peers directory).
+    DataCenter,
+    /// DevOps — in-flight farm jobs (Build Farm events).
+    DevOps,
+}
+
+/// One tile in the grid. A **widget** tile carries a [`TileKey`] and (once a
+/// snapshot lands) a live `value` line under its label; a plain launcher has
+/// `key == None` and never shows a value. FRONTDOOR-4 fills `value`/`tone` from
+/// the existing mde-bus data paths — no static placeholder metric (§7).
 #[derive(Debug, Clone)]
 pub struct Tile {
     /// The card's short label, drawn centered on the tile.
     pub label: String,
     /// Which Carbon token the accent strip + label read.
     pub tone: TileTone,
+    /// FRONTDOOR-4 — the widget this tile is (drives which live metric it takes),
+    /// or `None` for a plain app launcher.
+    pub key: Option<TileKey>,
+    /// FRONTDOOR-4 — the live metric line drawn under the label (e.g.
+    /// "5/5 healthy", "build: green", "2 alerts"). `None` until the first
+    /// snapshot, or for a launcher / a widget whose source is still absent.
+    pub value: Option<String>,
 }
 
 impl Tile {
-    fn new(label: &str, tone: TileTone) -> Self {
+    /// A plain app launcher: no live data, no key.
+    fn launcher(label: &str, tone: TileTone) -> Self {
         Self {
             label: label.to_string(),
             tone,
+            key: None,
+            value: None,
+        }
+    }
+
+    /// A live widget tile, identified by its [`TileKey`]. Starts with no `value`
+    /// (the FD-1 skeleton covers the gap until the first snapshot) and a neutral
+    /// resting tone; the snapshot supplies both.
+    fn widget(label: &str, key: TileKey, tone: TileTone) -> Self {
+        Self {
+            label: label.to_string(),
+            tone,
+            key: Some(key),
+            value: None,
+        }
+    }
+}
+
+/// FRONTDOOR-4 — one live-data snapshot for the widget tiles, read off the
+/// **existing** mde-bus data paths in [`FrontDoor::load`]. Each field is a
+/// pre-rendered `(value, tone)` for the matching [`TileKey`], or `None` when that
+/// source had nothing to show (the tile keeps its skeleton / resting state rather
+/// than display a fake metric). Built by [`FrontDoorData::read`] off-thread.
+#[derive(Debug, Clone, Default)]
+pub struct FrontDoorData {
+    /// Mesh map — online/total presence.
+    pub mesh_map: Option<(String, TileTone)>,
+    /// Build / Farm — latest verdict.
+    pub build_farm: Option<(String, TileTone)>,
+    /// Alerts — non-ok datacenter health checks.
+    pub alerts: Option<(String, TileTone)>,
+    /// Node health — healthy/total.
+    pub node_health: Option<(String, TileTone)>,
+    /// System — boot readiness + version.
+    pub system: Option<(String, TileTone)>,
+    /// Data Center — total node count.
+    pub data_center: Option<(String, TileTone)>,
+    /// DevOps — in-flight farm jobs.
+    pub dev_ops: Option<(String, TileTone)>,
+}
+
+impl FrontDoorData {
+    /// The pre-rendered `(value, tone)` for one widget key, or `None` when this
+    /// snapshot has nothing for it (incl. [`TileKey::Copilot`], which has no
+    /// workbench source yet). Pure — the projection lives in [`Self::read`].
+    #[must_use]
+    pub fn for_key(&self, key: TileKey) -> Option<(String, TileTone)> {
+        match key {
+            TileKey::MeshMap => self.mesh_map.clone(),
+            TileKey::BuildFarm => self.build_farm.clone(),
+            TileKey::Alerts => self.alerts.clone(),
+            TileKey::NodeHealth => self.node_health.clone(),
+            TileKey::System => self.system.clone(),
+            TileKey::DataCenter => self.data_center.clone(),
+            TileKey::DevOps => self.dev_ops.clone(),
+            // FRONTDOOR-12 backend only — no bus topic the workbench reads yet.
+            TileKey::Copilot => None,
+        }
+    }
+
+    /// Read every widget's source off the Bus and project it (blocking — runs on
+    /// a `spawn_blocking` thread, like the other panels' loaders). Best-effort:
+    /// a missing Bus / empty topic simply leaves that field `None` (the tile
+    /// keeps its skeleton / resting state — never a fake value). The projection
+    /// math is delegated to the pure [`project`] helpers so it's unit-testable
+    /// without a live Bus.
+    #[must_use]
+    pub fn read() -> Self {
+        let peers = peers::action_directory().unwrap_or_default();
+        let farm = build_farm::read_farm_events().unwrap_or_default();
+        let health = datacenter::read_health_checks();
+        let boot = home::read_boot_readiness();
+
+        Self {
+            mesh_map: project::mesh_map(&peers),
+            node_health: project::node_health(&peers),
+            data_center: project::data_center(&peers),
+            build_farm: project::build_farm(&farm),
+            dev_ops: project::dev_ops(&farm),
+            alerts: project::alerts(&health),
+            system: Some(project::system(&boot)),
+        }
+    }
+}
+
+/// FRONTDOOR-4 — the pure widget-value projections. Each maps already-parsed data
+/// (from the existing panels' loaders) into a `(value, tone)` line. Kept as a
+/// separate `pub(super)` module so the data-mapping is unit-tested without a live
+/// Bus (§7 DoD — "tests for the data-mapping").
+pub(super) mod project {
+    use super::TileTone;
+    use crate::panels::build_farm::{FarmSnapshot, TierOutcome};
+    use crate::panels::datacenter::{health_summary, HealthCheck};
+    use crate::panels::home::BootReadiness;
+    use crate::panels::peers::PeerRow;
+
+    /// Mesh map → online/total presence. Tone: success when all online, warning
+    /// when some are not, neutral when the roster is empty.
+    #[must_use]
+    pub fn mesh_map(peers: &[PeerRow]) -> Option<(String, TileTone)> {
+        if peers.is_empty() {
+            return None;
+        }
+        let online = peers.iter().filter(|p| p.presence == "online").count();
+        let total = peers.len();
+        let tone = if online == total {
+            TileTone::Success
+        } else {
+            TileTone::Warning
+        };
+        Some((format!("{online}/{total} online"), tone))
+    }
+
+    /// Node health → healthy/total. Tone: success when all healthy, danger when
+    /// any node is degraded.
+    #[must_use]
+    pub fn node_health(peers: &[PeerRow]) -> Option<(String, TileTone)> {
+        if peers.is_empty() {
+            return None;
+        }
+        let healthy = peers.iter().filter(|p| p.health == "healthy").count();
+        let total = peers.len();
+        let tone = if healthy == total {
+            TileTone::Success
+        } else {
+            TileTone::Danger
+        };
+        Some((format!("{healthy}/{total} healthy"), tone))
+    }
+
+    /// Data Center → total node count (the fleet the menu fronts).
+    #[must_use]
+    pub fn data_center(peers: &[PeerRow]) -> Option<(String, TileTone)> {
+        if peers.is_empty() {
+            return None;
+        }
+        let n = peers.len();
+        let unit = if n == 1 { "node" } else { "nodes" };
+        Some((format!("{n} {unit}"), TileTone::Accent))
+    }
+
+    /// Build / Farm → the latest combined verdict: any failing nightly tier or
+    /// failed farm job is red; an all-passing build is green; an empty/queued
+    /// farm is amber "building". Mirrors the Build Farm panel's own tier/job
+    /// vocabulary so the tile reads the same as the panel it links to.
+    #[must_use]
+    pub fn build_farm(farm: &FarmSnapshot) -> Option<(String, TileTone)> {
+        let any_tier_fail = farm.tiers.iter().any(|t| t.outcome == TierOutcome::Fail);
+        let any_job_fail = farm
+            .jobs
+            .iter()
+            .any(|j| j.phase == "done" && j.outcome == "fail");
+        let any_tier_pass = farm.tiers.iter().any(|t| t.outcome == TierOutcome::Pass);
+
+        if any_tier_fail || any_job_fail {
+            Some(("build: red".to_string(), TileTone::Danger))
+        } else if any_tier_pass {
+            Some(("build: green".to_string(), TileTone::Success))
+        } else if !farm.jobs.is_empty() {
+            Some(("build: queued".to_string(), TileTone::Warning))
+        } else {
+            // No farm/tier activity on the Bus at all → no honest metric.
+            None
+        }
+    }
+
+    /// DevOps → in-flight (not-done) farm jobs, the everyday CI loop's pulse.
+    /// Tone: accent while jobs are running, neutral when the queue is idle.
+    #[must_use]
+    pub fn dev_ops(farm: &FarmSnapshot) -> Option<(String, TileTone)> {
+        if farm.jobs.is_empty() {
+            return None;
+        }
+        let running = farm.jobs.iter().filter(|j| j.phase != "done").count();
+        let (value, tone) = if running > 0 {
+            (format!("{running} running"), TileTone::Accent)
+        } else {
+            ("queue idle".to_string(), TileTone::Neutral)
+        };
+        Some((value, tone))
+    }
+
+    /// Alerts → the count of non-ok datacenter health checks (`warn`+`fail`).
+    /// Tone: danger when any alert fires, success on an all-clear. Empty health
+    /// set → `None` (no datacenter plane reporting → no honest count).
+    #[must_use]
+    pub fn alerts(health: &[HealthCheck]) -> Option<(String, TileTone)> {
+        if health.is_empty() {
+            return None;
+        }
+        let (_ok, warn, fail) = health_summary(health);
+        let n = warn + fail;
+        if n == 0 {
+            Some(("all clear".to_string(), TileTone::Success))
+        } else {
+            let unit = if n == 1 { "alert" } else { "alerts" };
+            Some((format!("{n} {unit}"), TileTone::Danger))
+        }
+    }
+
+    /// System → boot readiness + the running workbench version. Always available
+    /// (the version is compiled in; an unready/absent boot snapshot still reads
+    /// honestly as "booting").
+    #[must_use]
+    pub fn system(boot: &BootReadiness) -> (String, TileTone) {
+        let version = env!("CARGO_PKG_VERSION");
+        if boot.ready {
+            (format!("ready · v{version}"), TileTone::Success)
+        } else {
+            (format!("booting · v{version}"), TileTone::Warning)
         }
     }
 }
@@ -151,43 +427,110 @@ impl Default for FrontDoor {
 impl FrontDoor {
     /// Seed the home grid with the design's widget set (Q99: mesh map, build/
     /// farm, alerts, node health, Copilot, system) plus a few app launchers.
-    /// Real data is FRONTDOOR-4; these labels/tones are correct placeholders.
+    /// FRONTDOOR-4 — the widget tiles carry a [`TileKey`] and take their live
+    /// `value` + `tone` from the first [`FrontDoor::load`] snapshot; until then
+    /// `loading` is true so the FD-1 skeleton covers them (Q92 — no layout
+    /// shift). Copilot is seeded as a plain **launcher** (no key): FRONTDOOR-12
+    /// landed its backend but no workbench-readable bus topic yet, so faking a
+    /// value would violate §7 — it stays a launcher pending a publisher.
     #[must_use]
     pub fn new() -> Self {
         let tiles = vec![
-            Tile::new("Mesh Map", TileTone::Accent),
-            Tile::new("Build / Farm", TileTone::Warning),
-            Tile::new("Alerts", TileTone::Danger),
-            Tile::new("Node Health", TileTone::Success),
-            Tile::new("Copilot", TileTone::Accent),
-            Tile::new("System", TileTone::Neutral),
-            Tile::new("Data Center", TileTone::Accent),
-            Tile::new("DevOps", TileTone::Warning),
-            Tile::new("Files", TileTone::Neutral),
-            Tile::new("Terminal", TileTone::Neutral),
-            Tile::new("Settings", TileTone::Neutral),
-            Tile::new("Music", TileTone::Neutral),
+            Tile::widget("Mesh Map", TileKey::MeshMap, TileTone::Accent),
+            Tile::widget("Build / Farm", TileKey::BuildFarm, TileTone::Warning),
+            Tile::widget("Alerts", TileKey::Alerts, TileTone::Danger),
+            Tile::widget("Node Health", TileKey::NodeHealth, TileTone::Success),
+            // Copilot — NO workbench source yet → plain launcher (§7), needs a
+            // publisher (follow-up).
+            Tile::launcher("Copilot", TileTone::Accent),
+            Tile::widget("System", TileKey::System, TileTone::Neutral),
+            Tile::widget("Data Center", TileKey::DataCenter, TileTone::Accent),
+            Tile::widget("DevOps", TileKey::DevOps, TileTone::Warning),
+            Tile::launcher("Files", TileTone::Neutral),
+            Tile::launcher("Terminal", TileTone::Neutral),
+            Tile::launcher("Settings", TileTone::Neutral),
+            Tile::launcher("Music", TileTone::Neutral),
         ];
         Self {
             tiles,
-            loading: false,
+            // FRONTDOOR-4 — start in the skeleton state; the first `load()`
+            // snapshot flips it off without a layout shift.
+            loading: true,
             query: String::new(),
             mode: Mode::Panel,
         }
     }
 
-    /// FRONTDOOR-2/3 — fold a Front Door message into local state. Both variants
-    /// are pure local-state edits (omnibox text; the panel ↔ full-screen mode
-    /// flip) with no side effects, so the caller (`app.rs`) needs no follow-up
-    /// `Task`.
-    pub fn update(&mut self, message: Message) {
+    /// FRONTDOOR-4 — read the widget tiles' live data off the **existing**
+    /// mde-bus data paths (Peers directory · Build Farm · Datacenter health ·
+    /// boot readiness) on a blocking thread and fold it back in via
+    /// [`Message::Loaded`]. Dispatched the same way the other panels load (a
+    /// `Task` fired on nav / reconnect / the slow-poll tick), so the Front Door
+    /// gets its data through the established subscription infra (§6) rather than
+    /// a new mackesd publisher.
+    pub fn load() -> Task<crate::Message> {
+        Task::perform(async { FrontDoorData::read() }, |data| {
+            crate::Message::FrontDoor(Message::Loaded(Box::new(data)))
+        })
+    }
+
+    /// FRONTDOOR-4 — the **slow-poll fallback** (design Q22: event-driven +
+    /// slow-poll). The push half is the Peers directory-changed Bus event the
+    /// app already subscribes to (it reloads the active view); this 15 s tick
+    /// backstops the topics that aren't purely push — the Build Farm verdict,
+    /// the Datacenter health checks, boot readiness — so the tiles stay live
+    /// even with no roster change. Registered by `App::subscription` ONLY while
+    /// the Front Door is the active view, so nothing polls when the operator is
+    /// elsewhere (the view-gating pattern the other panels use).
+    pub fn poll_subscription() -> Subscription<crate::Message> {
+        cosmic::iced::time::every(Duration::from_secs(15))
+            .map(|_| crate::Message::FrontDoor(Message::Reload))
+    }
+
+    /// FRONTDOOR-2/3/4 — fold a Front Door message into local state. The FD-2/3
+    /// variants (omnibox text; the panel ↔ full-screen flip) are pure local
+    /// edits with no follow-up; FRONTDOOR-4's [`Message::Reload`] kicks off the
+    /// async Bus read (so it returns a `Task`), and [`Message::Loaded`] folds the
+    /// snapshot into the widget tiles + clears the skeleton.
+    pub fn update(&mut self, message: Message) -> Task<crate::Message> {
         match message {
-            Message::OmniboxChanged(q) => self.query = q,
+            Message::OmniboxChanged(q) => {
+                self.query = q;
+                Task::none()
+            }
             Message::ToggleMode => {
                 self.mode = match self.mode {
                     Mode::Panel => Mode::FullScreen,
                     Mode::FullScreen => Mode::Panel,
                 };
+                Task::none()
+            }
+            // The slow-poll / reconnect tick: fire a fresh off-thread Bus read.
+            Message::Reload => Self::load(),
+            // A fresh snapshot landed — fold it into the widget tiles and lift
+            // the skeleton (Q92 — the first real data clears `loading`).
+            Message::Loaded(data) => {
+                self.apply(&data);
+                self.loading = false;
+                Task::none()
+            }
+        }
+    }
+
+    /// FRONTDOOR-4 — fold one [`FrontDoorData`] snapshot into the widget tiles:
+    /// each keyed tile takes its `(value, tone)` from the snapshot, or keeps a
+    /// `None` value (no source this round) — a launcher (`key == None`) is never
+    /// touched. Pure given the snapshot, so it's unit-tested directly.
+    pub fn apply(&mut self, data: &FrontDoorData) {
+        for tile in &mut self.tiles {
+            let Some(key) = tile.key else { continue };
+            if let Some((value, tone)) = data.for_key(key) {
+                tile.value = Some(value);
+                tile.tone = tone;
+            } else {
+                // No data for this widget this round (incl. Copilot): clear any
+                // stale value rather than show a phantom metric (§7).
+                tile.value = None;
             }
         }
     }
@@ -741,15 +1084,45 @@ impl canvas::Program<crate::Message> for TileGrid {
                 tile.tone.color(p),
             );
 
-            // The centered label.
-            frame.fill_text(Text {
-                content: tile.label.clone(),
-                position: Point::new(origin.x + tile_w / 2.0, origin.y + tile_h / 2.0 - 7.0),
-                color: p.text.into_cosmic_color(),
-                size: Pixels(label_size),
-                align_x: Alignment::Center,
-                ..Text::default()
-            });
+            // FRONTDOOR-4 — a widget tile with live data draws its metric line
+            // under the label; a launcher (or a widget with no source this round)
+            // draws the label centered as before. Nudge the label up a hair when
+            // there's a value so the two lines straddle the card center.
+            let cx = origin.x + tile_w / 2.0;
+            let cy = origin.y + tile_h / 2.0;
+            let value_size = (label_size - 2.0).max(10.0);
+
+            if let Some(value) = &tile.value {
+                // Label (slightly above center) + the live metric below it, the
+                // metric tinted with the tile's live tone so "2 alerts" reads red
+                // and "5/5 healthy" reads green (§4 — token color, never hex).
+                frame.fill_text(Text {
+                    content: tile.label.clone(),
+                    position: Point::new(cx, cy - label_size),
+                    color: p.text.into_cosmic_color(),
+                    size: Pixels(label_size),
+                    align_x: Alignment::Center,
+                    ..Text::default()
+                });
+                frame.fill_text(Text {
+                    content: value.clone(),
+                    position: Point::new(cx, cy + 2.0),
+                    color: tile.tone.color(p),
+                    size: Pixels(value_size),
+                    align_x: Alignment::Center,
+                    ..Text::default()
+                });
+            } else {
+                // The centered label (launchers + not-yet-loaded widgets).
+                frame.fill_text(Text {
+                    content: tile.label.clone(),
+                    position: Point::new(cx, cy - 7.0),
+                    color: p.text.into_cosmic_color(),
+                    size: Pixels(label_size),
+                    align_x: Alignment::Center,
+                    ..Text::default()
+                });
+            }
         }
 
         vec![frame.into_geometry()]
@@ -762,12 +1135,13 @@ mod tests {
 
     #[test]
     fn new_seeds_the_design_widget_set() {
-        // FRONTDOOR-1 — the home seeds ~12 placeholder tiles covering the Q99
-        // widget set + a few launchers; not loading by default. FRONTDOOR-2 — the
-        // omnibox query starts empty.
+        // FRONTDOOR-1 — the home seeds ~12 tiles covering the Q99 widget set + a
+        // few launchers. FRONTDOOR-2 — the omnibox query starts empty.
+        // FRONTDOOR-4 — it starts in the skeleton state (`loading`), cleared by
+        // the first snapshot.
         let fd = FrontDoor::new();
         assert_eq!(fd.tiles.len(), 12);
-        assert!(!fd.loading);
+        assert!(fd.loading, "FRONTDOOR-4 starts on the skeleton");
         assert!(fd.query.is_empty());
         // The design's named widgets are present.
         for want in ["Mesh Map", "Build / Farm", "Alerts", "Copilot", "System"] {
@@ -776,6 +1150,25 @@ mod tests {
                 "missing widget tile: {want}"
             );
         }
+    }
+
+    #[test]
+    fn widget_tiles_carry_keys_and_launchers_do_not() {
+        // FRONTDOOR-4 — the design widgets are keyed (they take live data);
+        // Copilot + the app launchers are keyless (no source → no faked value).
+        let fd = FrontDoor::new();
+        let key_of = |label: &str| fd.tiles.iter().find(|t| t.label == label).map(|t| t.key);
+        assert_eq!(key_of("Mesh Map"), Some(Some(TileKey::MeshMap)));
+        assert_eq!(key_of("Node Health"), Some(Some(TileKey::NodeHealth)));
+        assert_eq!(key_of("Alerts"), Some(Some(TileKey::Alerts)));
+        assert_eq!(key_of("Build / Farm"), Some(Some(TileKey::BuildFarm)));
+        assert_eq!(key_of("System"), Some(Some(TileKey::System)));
+        // Copilot has NO workbench source yet → it's a plain launcher (§7).
+        assert_eq!(key_of("Copilot"), Some(None));
+        assert_eq!(key_of("Files"), Some(None));
+        assert_eq!(key_of("Terminal"), Some(None));
+        // Every seeded widget tile starts with no value (the skeleton covers it).
+        assert!(fd.tiles.iter().all(|t| t.value.is_none()));
     }
 
     #[test]
@@ -800,9 +1193,9 @@ mod tests {
         // local state (so the field shows the typed text), with no other effect
         // (search is FRONTDOOR-6).
         let mut fd = FrontDoor::new();
-        fd.update(Message::OmniboxChanged("build farm".to_string()));
+        let _ = fd.update(Message::OmniboxChanged("build farm".to_string()));
         assert_eq!(fd.query, "build farm");
-        fd.update(Message::OmniboxChanged(String::new()));
+        let _ = fd.update(Message::OmniboxChanged(String::new()));
         assert!(fd.query.is_empty());
     }
 
@@ -812,9 +1205,9 @@ mod tests {
         // to full-screen and back (the real handler behind the top-bar button).
         let mut fd = FrontDoor::new();
         assert_eq!(fd.mode, Mode::Panel);
-        fd.update(Message::ToggleMode);
+        let _ = fd.update(Message::ToggleMode);
         assert_eq!(fd.mode, Mode::FullScreen);
-        fd.update(Message::ToggleMode);
+        let _ = fd.update(Message::ToggleMode);
         assert_eq!(fd.mode, Mode::Panel);
     }
 
@@ -861,5 +1254,256 @@ mod tests {
         assert!(Layout::FullScreen.tile_w() > Layout::Panel.tile_w());
         assert!(Layout::FullScreen.tile_h() > Layout::Panel.tile_h());
         assert!(Layout::FullScreen.radius() > Layout::Panel.radius());
+    }
+
+    // ── FRONTDOOR-4: the data-mapping (DoD — "tests for the data-mapping") ──
+
+    use crate::panels::build_farm::{FarmJobRow, FarmSnapshot, TestTierRow, TierOutcome};
+    use crate::panels::datacenter::HealthCheck;
+    use crate::panels::home::BootReadiness;
+    use crate::panels::peers::PeerRow;
+
+    /// A minimal `PeerRow` with just the presence/health fields the projections
+    /// read; the rest default (the projections ignore them).
+    fn peer(presence: &str, health: &str) -> PeerRow {
+        PeerRow {
+            hostname: "h".into(),
+            presence: presence.into(),
+            health: health.into(),
+            version: String::new(),
+            overlay_ip: String::new(),
+            role: String::new(),
+            currency: String::new(),
+            last_seen_ms: 0,
+            tags: Vec::new(),
+            services: Vec::new(),
+            ssh: false,
+            rdp: false,
+            vnc: false,
+            lan_macs: Vec::new(),
+            containers: Vec::new(),
+            vms: Vec::new(),
+        }
+    }
+
+    fn check(check: &str, status: &str) -> HealthCheck {
+        HealthCheck {
+            check: check.into(),
+            status: status.into(),
+            detail: String::new(),
+        }
+    }
+
+    fn done_job(outcome: &str) -> FarmJobRow {
+        FarmJobRow {
+            jobid: "j".into(),
+            phase: "done".into(),
+            outcome: outcome.into(),
+        }
+    }
+
+    fn tier(outcome: TierOutcome) -> TestTierRow {
+        TestTierRow {
+            tier: "install".into(),
+            label: "L1".into(),
+            outcome,
+        }
+    }
+
+    #[test]
+    fn mesh_map_and_node_health_count_presence_and_health() {
+        // Empty roster → no honest metric (None), not "0/0".
+        assert!(project::mesh_map(&[]).is_none());
+        assert!(project::node_health(&[]).is_none());
+
+        let rows = vec![
+            peer("online", "healthy"),
+            peer("online", "healthy"),
+            peer("offline", "degraded"),
+        ];
+        let (mm_val, mm_tone) = project::mesh_map(&rows).unwrap();
+        assert_eq!(mm_val, "2/3 online");
+        assert_eq!(mm_tone, TileTone::Warning); // not all online
+
+        let (nh_val, nh_tone) = project::node_health(&rows).unwrap();
+        assert_eq!(nh_val, "2/3 healthy");
+        assert_eq!(nh_tone, TileTone::Danger); // a degraded node
+
+        // All healthy + online → success.
+        let allgood = vec![peer("online", "healthy")];
+        assert_eq!(project::mesh_map(&allgood).unwrap().1, TileTone::Success);
+        assert_eq!(project::node_health(&allgood).unwrap().1, TileTone::Success);
+    }
+
+    #[test]
+    fn data_center_counts_nodes_with_correct_pluralization() {
+        assert!(project::data_center(&[]).is_none());
+        assert_eq!(
+            project::data_center(&[peer("online", "healthy")])
+                .unwrap()
+                .0,
+            "1 node"
+        );
+        assert_eq!(
+            project::data_center(&[peer("online", "healthy"), peer("idle", "healthy")])
+                .unwrap()
+                .0,
+            "2 nodes"
+        );
+    }
+
+    #[test]
+    fn build_farm_verdict_prefers_failures_then_pass_then_queued() {
+        // No activity at all → no metric.
+        let empty = FarmSnapshot::default();
+        assert!(project::build_farm(&empty).is_none());
+
+        // A failing tier → red regardless of anything else.
+        let red = FarmSnapshot {
+            jobs: vec![done_job("pass")],
+            tiers: vec![tier(TierOutcome::Fail), tier(TierOutcome::Pass)],
+        };
+        let (v, t) = project::build_farm(&red).unwrap();
+        assert_eq!(v, "build: red");
+        assert_eq!(t, TileTone::Danger);
+
+        // All-passing tier, no failures → green.
+        let green = FarmSnapshot {
+            jobs: vec![done_job("pass")],
+            tiers: vec![tier(TierOutcome::Pass)],
+        };
+        assert_eq!(project::build_farm(&green).unwrap().1, TileTone::Success);
+
+        // Jobs present but no tier verdict yet → queued/amber.
+        let queued = FarmSnapshot {
+            jobs: vec![FarmJobRow {
+                jobid: "q".into(),
+                phase: "queued".into(),
+                outcome: String::new(),
+            }],
+            tiers: vec![tier(TierOutcome::NoRuns)],
+        };
+        assert_eq!(project::build_farm(&queued).unwrap().1, TileTone::Warning);
+    }
+
+    #[test]
+    fn dev_ops_counts_in_flight_jobs() {
+        assert!(project::dev_ops(&FarmSnapshot::default()).is_none());
+        let snap = FarmSnapshot {
+            jobs: vec![
+                done_job("pass"),
+                FarmJobRow {
+                    jobid: "r".into(),
+                    phase: "queued".into(),
+                    outcome: String::new(),
+                },
+            ],
+            tiers: Vec::new(),
+        };
+        let (v, t) = project::dev_ops(&snap).unwrap();
+        assert_eq!(v, "1 running");
+        assert_eq!(t, TileTone::Accent);
+    }
+
+    #[test]
+    fn alerts_count_non_ok_health_checks() {
+        // No checks reporting → no count (not a fake "0 alerts").
+        assert!(project::alerts(&[]).is_none());
+
+        // All ok → all clear / success.
+        let clear = vec![check("bus", "ok"), check("dom0", "ok")];
+        let (v, t) = project::alerts(&clear).unwrap();
+        assert_eq!(v, "all clear");
+        assert_eq!(t, TileTone::Success);
+
+        // A warn + a fail → 2 alerts / danger.
+        let firing = vec![
+            check("bus", "ok"),
+            check("dom0", "warn"),
+            check("doctl", "fail"),
+        ];
+        let (v, t) = project::alerts(&firing).unwrap();
+        assert_eq!(v, "2 alerts");
+        assert_eq!(t, TileTone::Danger);
+    }
+
+    #[test]
+    fn system_reads_boot_readiness_and_is_always_present() {
+        let ready = BootReadiness {
+            ready: true,
+            ..BootReadiness::default()
+        };
+        let (v, t) = project::system(&ready);
+        assert!(v.starts_with("ready · v"));
+        assert_eq!(t, TileTone::Success);
+
+        let booting = BootReadiness::default();
+        let (v, t) = project::system(&booting);
+        assert!(v.starts_with("booting · v"));
+        assert_eq!(t, TileTone::Warning);
+    }
+
+    #[test]
+    fn loaded_folds_the_snapshot_into_widget_tiles_and_clears_skeleton() {
+        // The end-to-end fold: a snapshot lands → keyed widget tiles take their
+        // value+tone, launchers stay untouched, and the skeleton lifts (Q92).
+        let mut fd = FrontDoor::new();
+        assert!(fd.loading);
+
+        let data = FrontDoorData {
+            node_health: Some(("5/5 healthy".into(), TileTone::Success)),
+            alerts: Some(("2 alerts".into(), TileTone::Danger)),
+            ..FrontDoorData::default()
+        };
+        let _ = fd.update(Message::Loaded(Box::new(data)));
+
+        assert!(!fd.loading, "first snapshot clears the skeleton");
+
+        let tile = |label: &str| fd.tiles.iter().find(|t| t.label == label).unwrap();
+        assert_eq!(tile("Node Health").value.as_deref(), Some("5/5 healthy"));
+        assert_eq!(tile("Node Health").tone, TileTone::Success);
+        assert_eq!(tile("Alerts").value.as_deref(), Some("2 alerts"));
+        assert_eq!(tile("Alerts").tone, TileTone::Danger);
+        // A keyed widget with no data this round stays value-less (no fake).
+        assert!(tile("System").value.is_none());
+        // Copilot (a launcher) is never given a value (§7 — needs a publisher).
+        assert!(tile("Copilot").value.is_none());
+        assert_eq!(tile("Copilot").key, None);
+    }
+
+    #[test]
+    fn apply_clears_a_stale_value_when_the_source_goes_away() {
+        // If a widget had a value and the next snapshot has none for it, the tile
+        // drops the value rather than showing a phantom metric.
+        let mut fd = FrontDoor::new();
+        let with = FrontDoorData {
+            node_health: Some(("5/5 healthy".into(), TileTone::Success)),
+            ..FrontDoorData::default()
+        };
+        fd.apply(&with);
+        assert!(fd
+            .tiles
+            .iter()
+            .any(|t| t.key == Some(TileKey::NodeHealth) && t.value.is_some()));
+
+        fd.apply(&FrontDoorData::default());
+        assert!(fd
+            .tiles
+            .iter()
+            .find(|t| t.key == Some(TileKey::NodeHealth))
+            .unwrap()
+            .value
+            .is_none());
+    }
+
+    #[test]
+    fn copilot_has_no_source_so_for_key_is_none() {
+        // §7 — Copilot is the one widget with no workbench-readable source yet;
+        // even a fully-populated snapshot yields nothing for it.
+        let data = FrontDoorData {
+            node_health: Some(("1/1 healthy".into(), TileTone::Success)),
+            ..FrontDoorData::default()
+        };
+        assert!(data.for_key(TileKey::Copilot).is_none());
     }
 }
