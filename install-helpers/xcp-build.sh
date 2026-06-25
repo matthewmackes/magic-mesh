@@ -43,12 +43,14 @@ set -euo pipefail
 # directive "worklist work → BIGBOY, testing → the two other Xen hosts"
 # (2026-06-22). Routing degrades to THIS host whenever shape routing can't resolve
 # an elastic VM (autoscaler paused / no matching shape / topology unreadable), so
-# a build never fails to route. NOTE: this is intentionally the legacy fixed .52,
-# NOT the autoscaler's elastic BigBoy `big` VM (which lives at .130 per
-# infra/tofu/main.tf) — the fallback must work even when NOTHING is provisioned.
-# Override with MCNF_BUILD_HOST (an explicit host always wins — it short-circuits
-# shape routing entirely).
-DEFAULT_BUILD_HOST="172.20.0.52"
+# a build never fails to route. It must be a FIXED, always-present, non-elastic
+# build VM (works even when the autoscaler has provisioned NOTHING). That is
+# `mcnf-build-50` at **172.20.0.50** — NOT the autoscaler's elastic BigBoy `big`
+# VM (.130). Corrected 2026-06-25 from a stale `.52`: per docs/BUILD-ENVIRONMENT.md
+# §3 there is no live `.52` (the VM *named* mcnf-build-52 is at .130) — probing .52
+# gives "No route to host", so the old fallback could never route (a silent
+# work-stops landmine). Override with MCNF_BUILD_HOST (an explicit host always wins).
+DEFAULT_BUILD_HOST="172.20.0.50"
 BUILD_USER="${MCNF_BUILD_USER:-mm}"
 KEY="${MCNF_BUILD_KEY:-$HOME/.ssh/mackes_mesh_ed25519}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
