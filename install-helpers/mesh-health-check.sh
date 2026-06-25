@@ -43,13 +43,10 @@ restart() {
     systemctl restart "$1" >/dev/null 2>&1 || log "  restart $1 failed"
 }
 
-# 0. Shared-state plane health. SUBSTRATE-11/V2: the plane is now etcd
-#    (coordination) + Syncthing (files). When this node is on the etcd
-#    coordination plane (setup-etcd wrote the endpoints file), assert etcd quorum
-#    health + the Syncthing daemon — NOT a FUSE mount. Pre-cutover (no endpoints
-#    file) it keeps the LizardFS QNM-Shared mount assertion so the running fleet's
-#    watchdog is unchanged (ONBOARD-6 process fix #3: a silently-local dir no-ops
-#    → NO LEADER / empty directory).
+# 0. Shared-state plane health. SUBSTRATE-V2: the plane is etcd (coordination)
+#    + Syncthing (files). When this node is on the etcd coordination plane
+#    (setup-etcd wrote the endpoints file), assert etcd quorum health + the
+#    Syncthing daemon.
 ETCD_ENDPOINTS_FILE=/etc/mackesd/etcd-endpoints
 QNM="${MDE_WORKGROUP_ROOT:-${QNM_PATH:-/mnt/mesh-storage}}"
 if [ -s "$ETCD_ENDPOINTS_FILE" ]; then
@@ -79,12 +76,6 @@ if [ -s "$ETCD_ENDPOINTS_FILE" ]; then
         if [ "${st_peers:-0}" -gt 0 ] && [ "${st_conn:-0}" -lt "$st_peers" ]; then
             alert "syncthing-out-of-sync" "Mesh Sync OUT OF SYNC on $(hostname): ${st_conn}/${st_peers} peer device(s) connected (reconcile pending or overlay partition)"
         fi
-    fi
-elif systemctl list-unit-files qnm-shared.service >/dev/null 2>&1 && [ -d "$QNM" ]; then
-    # Pre-cutover: assert the LizardFS QNM-Shared FUSE mount (AUDIT-MESH-1 — the
-    # same /mnt/mesh-storage root the daemon uses).
-    if ! mount 2>/dev/null | grep -q " $QNM type fuse"; then
-        restart qnm-shared.service "QNM-Shared not mounted (shared-state plane down)"
     fi
 fi
 

@@ -489,7 +489,12 @@ impl ConnectPanel {
         // (one Bus RPC at a time), so pass `busy` down to disable the action
         // buttons and `status` to surface the pending line on the active row.
         for peer in &self.peers {
-            col = col.push(peer_card_view(peer, palette, self.busy, self.status.as_deref()));
+            col = col.push(peer_card_view(
+                peer,
+                palette,
+                self.busy,
+                self.status.as_deref(),
+            ));
         }
         let body: Container<'_, crate::Message, cosmic::Theme> = container(col)
             .padding(Padding::from([16u16, 24u16]))
@@ -692,9 +697,10 @@ fn strip_action_line(fragment: &str) -> String {
             let trimmed = line.trim();
             !(trimmed.starts_with('[')
                 && trimmed.ends_with(']')
-                && trimmed.replace(char::is_whitespace, "").chars().all(|c| {
-                    c == '[' || c == ']' || c.is_alphanumeric()
-                }))
+                && trimmed
+                    .replace(char::is_whitespace, "")
+                    .chars()
+                    .all(|c| c == '[' || c == ']' || c.is_alphanumeric()))
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -820,7 +826,10 @@ mod view_tests {
         let info = strip_action_line(&phone);
         assert!(info.contains("Battery: 50%"));
         assert!(info.contains("Now playing: song"));
-        assert!(!info.contains('['), "action brackets must be stripped: {info}");
+        assert!(
+            !info.contains('['),
+            "action brackets must be stripped: {info}"
+        );
 
         // CommonChrome: the `[Mirror…] [Unpair]` line goes; fingerprint stays.
         let chrome = render_common_chrome(&ConnectPeer {
@@ -831,7 +840,10 @@ mod view_tests {
         let info = strip_action_line(&chrome);
         assert!(info.contains("Fingerprint: AB:CD"));
         assert!(info.contains("Never reached"));
-        assert!(!info.contains('['), "action brackets must be stripped: {info}");
+        assert!(
+            !info.contains('['),
+            "action brackets must be stripped: {info}"
+        );
     }
 
     #[test]

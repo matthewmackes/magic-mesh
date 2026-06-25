@@ -4,7 +4,7 @@
 //! `dev.mackes.MDE.Fleet` D-Bus interface.
 //!
 //! **FPG-4 (2026-06-09): the verbs are real.** They run against the
-//! `magic_fleet::store` append-only revision log on the LizardFS
+//! `magic_fleet::store` append-only revision log on the Syncthing
 //! workgroup root (FPG-2) — replication is the transport, the
 //! directory is the truth. **Leaderless (FPG-3):** any node serves
 //! these verbs and any node mints; `next_version` + the append-only

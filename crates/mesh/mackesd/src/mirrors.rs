@@ -1,13 +1,13 @@
 //! PLANES-24 — package mirrors (W61/W62/W63).
 //!
 //! A **mirror** pulls the magic-mesh GitHub-RPM channel (the Releases /
-//! GitHub Pages dnf repo) into a directory on LizardFS (W61), so every
-//! node serves *itself* via a `file://` baseurl off the replicated mount
-//! — no HTTP tier — with the upstream as fallback (W62). The sync is a
-//! scheduled one-puller job; LizardFS replicates the result (W63).
+//! GitHub Pages dnf repo) into a directory on the Syncthing-replicated share
+//! (W61), so every node serves *itself* via a `file://` baseurl off the shared
+//! dir — no HTTP tier — with the upstream as fallback (W62). The sync is a
+//! scheduled one-puller job; Syncthing replicates the result (W63).
 //!
-//! This is the pure core: mirror configs are TOML on LizardFS
-//! (`<workgroup_root>/mirrors/<name>.toml`, W88), junk-tolerant on read,
+//! This is the pure core: mirror configs are TOML on the Syncthing-replicated
+//! share (`<workgroup_root>/mirrors/<name>.toml`, W88), junk-tolerant on read,
 //! plus a built-in **core pack** carrying the `magic-mesh` mirror so the
 //! surface ships pointed at the right channel. The `mackesd mirrors` CLI
 //! verb + the Provisioning ▸ Mirrors panel render on top; the last-sync
@@ -96,7 +96,7 @@ pub fn load_mirrors(workgroup_root: &Path) -> Vec<Mirror> {
 pub fn core_pack() -> Vec<Mirror> {
     vec![Mirror {
         name: "magic-mesh".into(),
-        description: "The magic-mesh RPM channel — GitHub Releases assets + the GitHub Pages dnf repo, mirrored to LizardFS so every node serves itself.".into(),
+        description: "The magic-mesh RPM channel — GitHub Releases assets + the GitHub Pages dnf repo, mirrored to the Syncthing share so every node serves itself.".into(),
         upstream: "https://matthewmackes.github.io/magic-mesh/fedora-$releasever-$basearch/".into(),
         enabled: true,
     }]
@@ -105,8 +105,8 @@ pub fn core_pack() -> Vec<Mirror> {
 // ─────────────────────────────────────────────────────────────────
 // W63 — the one-puller sync. A node pulls the upstream dnf repo into
 // the mirror's local_dir + (re)builds repo metadata with createrepo_c,
-// then stamps `.last-sync`; LizardFS replicates the result so every
-// other node serves it from the `file://` mount without pulling again.
+// then stamps `.last-sync`; Syncthing replicates the result so every
+// other node serves it from the `file://` share without pulling again.
 // ─────────────────────────────────────────────────────────────────
 
 /// What one successful sync produced.
@@ -271,8 +271,8 @@ pub fn sync_mirror<R: MirrorSyncRunner + ?Sized>(
 // W62 — flip a node to self-serve. Render the dnf `.repo` so its
 // baseurl is the local `file://` mirror FIRST, with the upstream as a
 // fallback line: dnf tries each baseurl in order, so a node reads from
-// its replicated LizardFS mount and only falls back to GitHub when the
-// mount is unavailable. No HTTP tier.
+// its Syncthing-replicated share and only falls back to GitHub when the
+// share is unavailable. No HTTP tier.
 // ─────────────────────────────────────────────────────────────────
 
 /// The canonical dnf repo-config directory a node serves from.

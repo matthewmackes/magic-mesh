@@ -5,7 +5,7 @@
 //! join-token slot the firstboot auto-join fills (W60). One image
 //! carries every profile; the boot menu picks one at install (W57).
 //!
-//! This is the pure core: profiles are TOML on LizardFS
+//! This is the pure core: profiles are TOML on the Syncthing-replicated share
 //! (`<workgroup_root>/profiles/*.toml`, W88 — fleet state is TOML dirs +
 //! typed Bus verbs), junk-tolerant on read, plus a built-in **core pack**
 //! mapping the three deployment roles (Lighthouse ⊂ Server ⊂ Workstation,
@@ -99,11 +99,11 @@ pub fn core_pack() -> Vec<InstallProfile> {
         InstallProfile {
             name: "server".into(),
             description:
-                "Everything a lighthouse runs, plus fleet automation + LizardFS storage. Headless."
+                "Everything a lighthouse runs, plus fleet automation + a Syncthing storage replica. Headless."
                     .into(),
             role: "server".into(),
             tags: BTreeSet::from(["execution".to_string(), "headless".to_string()]),
-            ks_fragments: vec!["role-server".into(), "lizardfs".into()],
+            ks_fragments: vec!["role-server".into()],
             auto_join: true,
         },
         InstallProfile {
@@ -134,7 +134,7 @@ pub fn core_pack() -> Vec<InstallProfile> {
 // ─────────────────────────────────────────────────────────────────
 // W56 — the form-edit write side. The Provisioning ▸ Install Profiles
 // panel (and `mackesd profiles set`) build an InstallProfile and persist
-// it as `<root>/profiles/<name>.toml`; LizardFS replicates it, and
+// it as `<root>/profiles/<name>.toml`; Syncthing replicates it, and
 // load_profiles picks it up (overriding a same-named core profile).
 // Validated up front so a typo'd role/tag never reaches an installer.
 // ─────────────────────────────────────────────────────────────────

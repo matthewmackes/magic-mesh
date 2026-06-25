@@ -6,7 +6,7 @@
 //! snapshot even with no desktop.
 //!
 //! The step model is the real boot dependency chain (Q7): Nebula → overlay IP →
-//! mackesd serving → mde-bus broker → QNM-Shared mount → peer directory. Each
+//! mackesd serving → mde-bus broker → mesh coordination (etcd) → peer directory. Each
 //! step carries `{id,label,status,detail,blocked_by,since_ms}`; a step whose
 //! prerequisites aren't `ok` is `blocked` (not a misleading `fail`). The pure
 //! builder (`build_readiness`) is unit-tested; the worker is the thin probe+publish
@@ -39,13 +39,14 @@ pub struct BootProbe {
     pub overlay_ip: String,
     /// The mde-bus broker is reachable (we could open the spool to publish).
     pub bus_ok: bool,
-    /// The shared-state plane is up. Pre-cutover: QNM-Shared is a writable FUSE
-    /// mount. SUBSTRATE-10: when on the etcd coordination plane, this is "etcd
-    /// reachable" instead (the file plane / Syncthing is non-critical to liveness).
+    /// The shared-state plane is up. SUBSTRATE-10: when on the etcd coordination
+    /// plane this is "etcd reachable"; otherwise it's "the shared dir exists"
+    /// (the file plane / Syncthing is non-critical to liveness). The field keeps
+    /// its `qnm_mounted` name for the snapshot's wire-compat.
     pub qnm_mounted: bool,
     /// SUBSTRATE-10 — true when shared-state liveness is sourced from etcd (the
     /// endpoints file is present), so the step renders as "Mesh coordination
-    /// (etcd)" / "etcd reachable" rather than the FUSE-mount wording.
+    /// (etcd)" / "etcd reachable".
     pub on_etcd: bool,
     /// Joined peer count in the replicated directory (>0 ⇒ replicated).
     pub peer_count: u32,
@@ -108,7 +109,7 @@ const STEPS: [StepDef; 6] = [
     },
     StepDef {
         id: "qnm",
-        label: "QNM-Shared mounted",
+        label: "Mesh coordination",
     },
     StepDef {
         id: "directory",
@@ -196,8 +197,8 @@ pub fn build_readiness(
         } else {
             "pending"
         };
-        // SUBSTRATE-10 — the shared-state step renders by substrate: etcd
-        // coordination post-cutover, the FUSE mount before.
+        // SUBSTRATE-10 — the shared-state step renders by substrate: "Mesh
+        // coordination (etcd)" on an etcd node, the plain shared-dir otherwise.
         let label = if def.id == "qnm" && p.on_etcd {
             "Mesh coordination (etcd)"
         } else {
@@ -269,7 +270,7 @@ pub struct BootReadinessWorker {
 }
 
 impl BootReadinessWorker {
-    /// New worker. `workgroup_root` is the QNM-Shared mount; `db_path` the bus
+    /// New worker. `workgroup_root` is the shared-storage dir; `db_path` the bus
     /// directory store (for the peer-directory count).
     #[must_use]
     pub fn new(workgroup_root: PathBuf, node_id: String, db_path: PathBuf) -> Self {
@@ -289,7 +290,7 @@ impl BootReadinessWorker {
         // SUBSTRATE-10 — shared-state liveness by substrate: when on the etcd
         // coordination plane (endpoints file present) it's "is etcd reachable"
         // (a cheap TCP connect to the client port — no async runtime needed in
-        // this on-executor probe); pre-cutover it's the writable FUSE mount.
+        // this on-executor probe); otherwise it's "the shared dir exists".
         let etcd_endpoints = crate::substrate::etcd::default_endpoints();
         let on_etcd = !etcd_endpoints.is_empty();
         let qnm_mounted = if on_etcd {
@@ -542,8 +543,7 @@ mod tests {
 
     #[test]
     fn etcd_mode_renders_coordination_step() {
-        // SUBSTRATE-10 — on the etcd plane the shared-state step reads as etcd,
-        // not the FUSE mount.
+        // SUBSTRATE-10 — on the etcd plane the shared-state step reads as etcd.
         let p = BootProbe {
             nebula_up: true,
             overlay_ip: "10.42.0.5".into(),

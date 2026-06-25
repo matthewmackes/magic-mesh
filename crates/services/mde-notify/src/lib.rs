@@ -420,8 +420,8 @@ pub fn shared_alert_dir(workgroup_root: &std::path::Path) -> std::path::PathBuf 
 /// Read + parse every mirrored shared-alert message into an [`AlertItem`].
 ///
 /// Pure and `&self`-free (no dedup state), so it is safe to run on a helper
-/// thread. The shared dir lives on the QNM-Shared (LizardFS/FUSE) mount; a wedged
-/// mount makes these reads block uninterruptibly, so the caller runs this off the
+/// thread. The shared dir lives on the QNM-Shared (Syncthing-replicated) share; a wedged
+/// share makes these reads block uninterruptibly, so the caller runs this off the
 /// UI thread and picks the result up non-blockingly (NOTIFY-UI-4). Dedup the
 /// result with [`AlertTail::dedup_fresh`].
 #[must_use]

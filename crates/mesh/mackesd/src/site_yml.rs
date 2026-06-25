@@ -1,9 +1,10 @@
 //! SETUP-7 — the `/etc/mackesd/site.yml` convergence playbook emitter.
 //!
 //! The hybrid config model (design lock 3): the imperative verbs (`found`/
-//! `join`/`setup-qnm-shared`) bootstrap a node interactively, then emit this
-//! self-contained Ansible playbook capturing the resulting facts (role, mesh-id,
-//! lighthouse roster, QNM-Shared path, the boot-durable service set). Re-applying
+//! `join`/`setup-etcd`/`setup-syncthing`) bootstrap a node interactively, then
+//! emit this self-contained Ansible playbook capturing the resulting facts (role,
+//! mesh-id, lighthouse roster, shared-storage path, the boot-durable service
+//! set). Re-applying
 //! it (`mackesd converge`, or the `ansible-pull` worker) idempotently restores
 //! steady state — every later config change goes through it, not ad-hoc edits.
 //!
@@ -19,12 +20,13 @@ pub const DEFAULT_SITE_YML: &str = "/etc/mackesd/site.yml";
 
 /// The boot-durable service set the `mackes` role guarantees enabled + running
 /// (mirrors the ONBOARD-9 manager + the SETUP design "Service set"). Role-gated
-/// units (lizardfs-master on the founder) layer on via the role's own tasks.
-pub const CONVERGE_SERVICES: [&str; 4] = [
+/// units (the leader-only services on the founder) layer on via the role's own tasks.
+pub const CONVERGE_SERVICES: [&str; 5] = [
     "nebula.service",
     "mackesd.service",
     "mesh-health.timer",
-    "qnm-shared.service",
+    "etcd.service",
+    "syncthing.service",
 ];
 
 /// The node facts a converge run needs — captured from the bootstrap result.

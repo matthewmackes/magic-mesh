@@ -284,7 +284,10 @@ pub fn toast_motion(age_ms: i64, reduce_motion: bool) -> ToastMotion {
             std::time::Duration::from_millis(exit.max(1) as u64),
             reduce_motion,
         );
-        let t = ease(tw.progress(at(age_ms)), Motion::dialog_mount().resolved(reduce_motion).easing);
+        let t = ease(
+            tw.progress(at(age_ms)),
+            Motion::dialog_mount().resolved(reduce_motion).easing,
+        );
         let p = Transition::FadeOut.params(t);
         // Reduce-motion: crossfade only (no slide). Full motion: slide back out
         // to +SLIDE_PX as it fades.
@@ -578,7 +581,11 @@ mod tests {
         );
         // Mid-entrance: interpolating in.
         let mm = toast_motion(enter_ms() / 2, false);
-        assert!(mm.alpha > 0.0 && mm.alpha < 1.0, "fading in, got {}", mm.alpha);
+        assert!(
+            mm.alpha > 0.0 && mm.alpha < 1.0,
+            "fading in, got {}",
+            mm.alpha
+        );
         assert!(
             mm.translate_x > 0.0 && mm.translate_x < SLIDE_PX,
             "sliding in, got {}",
@@ -586,12 +593,28 @@ mod tests {
         );
         // Hold: fully opaque + at rest (no offset).
         let hold = toast_motion(2_000, false);
-        assert!((hold.alpha - 1.0).abs() < 1e-3, "holds opaque, got {}", hold.alpha);
-        assert!(hold.translate_x.abs() < 1e-3, "holds at rest, got {}", hold.translate_x);
+        assert!(
+            (hold.alpha - 1.0).abs() < 1e-3,
+            "holds opaque, got {}",
+            hold.alpha
+        );
+        assert!(
+            hold.translate_x.abs() < 1e-3,
+            "holds at rest, got {}",
+            hold.translate_x
+        );
         // Exit window: fading + sliding back out toward 0 alpha / +SLIDE_PX.
         let near_end = toast_motion(TOAST_TTL_MS - 100, false);
-        assert!(near_end.alpha < 1.0, "exit fades out, got {}", near_end.alpha);
-        assert!(near_end.translate_x > 0.0, "exit slides out, got {}", near_end.translate_x);
+        assert!(
+            near_end.alpha < 1.0,
+            "exit fades out, got {}",
+            near_end.alpha
+        );
+        assert!(
+            near_end.translate_x > 0.0,
+            "exit slides out, got {}",
+            near_end.translate_x
+        );
         // At the TTL the toast is fully gone.
         let gone = toast_motion(TOAST_TTL_MS, false);
         assert!(gone.alpha <= 0.01, "fully faded at TTL, got {}", gone.alpha);
@@ -620,7 +643,10 @@ mod tests {
         // transition in flight (so the tick can stop).
         assert!(toast_in_transition(0, false), "entering");
         assert!(toast_in_transition(enter_ms() - 1, false), "still entering");
-        assert!(!toast_in_transition(2_000, false), "mid-hold has no transition");
+        assert!(
+            !toast_in_transition(2_000, false),
+            "mid-hold has no transition"
+        );
         assert!(
             toast_in_transition(TOAST_TTL_MS - 1, false),
             "exiting near TTL"

@@ -1,5 +1,14 @@
 # Birthrights — install + first-boot provisioning policy
 
+> **Note (post-SUBSTRATE-6):** the **LizardFS / QNM-Shared birthright
+> (BIRTHRIGHT-1) is RETIRED** — LizardFS is removed. The shared-state plane is now
+> **etcd** (coordination, provisioned at enroll) + **Syncthing** (files on a plain
+> `/mnt/mesh-storage` dir); their RPM deps (`etcd`, `syncthing`) and first-boot
+> setup replace the LizardFS bundle/fetch and `setup-qnm-shared`. The LizardFS
+> rows + the BIRTHRIGHT-1 section below are kept as the historical record of the
+> old substrate's provisioning policy. The **ntfy** and **starship** birthrights
+> are unchanged and still live.
+
 Audit: docs/COMPLIANCE.md "Birthrights vs advertised service requirements"
 (2026-06-16). Worklist: the **BIRTHRIGHT** epic in docs/WORKLIST.md.
 
@@ -26,9 +35,9 @@ no provision). Per dependency:
 |---|---|---|---|
 | **ntfy** | cross-node notification broker (NOTIFY-DIST-1) | **Bundle** | RPM ships the pinned tarball under `/usr/share/magic-mesh/vendor/`; first boot provisions with **no network**. |
 | **starship** | mesh bash prompt (SHELL-2) | **Bundle** | Same — bundled-first, offline-capable. |
-| **lizardfs / lizardfs-adm** | §1 shared-state substrate | **Bundle (BIRTHRIGHT-1, done)** | The fc43 LizardFS family is bundled in the RPM (`/usr/share/magic-mesh/vendor/lizardfs/`) and installed `--nodeps` on F44 by `mesh-install-lizardfs`; `mackesd found`/`join` auto-provisions it role-aware. |
+| ~~**lizardfs / lizardfs-adm**~~ | §1 shared-state substrate | **RETIRED (SUBSTRATE-6)** — was Bundle (BIRTHRIGHT-1) | LizardFS is removed; the shared-state plane is now etcd (coordination) + Syncthing (files). The bundle/`mesh-install-lizardfs` path below is historical. |
 
-**LizardFS (BIRTHRIGHT-1):** the fc43 LizardFS family (`lizardfs-master`,
+**LizardFS (BIRTHRIGHT-1) — RETIRED by SUBSTRATE-6 (historical):** the fc43 LizardFS family (`lizardfs-master`,
 `-chunkserver`, `-client`, `-adm`, `-cgi*`, `-metalogger`; 7 RPMs / ~2.5 MB) is
 bundled the same way. `vendor-lizardfs-rpms.sh` runs `dnf download 'lizardfs*'`
 (family only — NOT the base-OS closure, since F44 already has glibc/systemd/
@@ -62,10 +71,14 @@ The *build* machine still needs network the first time it stages the blobs
 fully air-gapped build would pre-seed `vendor/birthright/` out-of-band; the
 vendor step is idempotent and leaves a present, checksum-valid blob untouched.
 
-## BIRTHRIGHT-1 — auto-provision LizardFS/QNM-Shared at enrollment (done)
+## BIRTHRIGHT-1 — auto-provision LizardFS/QNM-Shared at enrollment (RETIRED by SUBSTRATE-6, historical)
 
-A fresh `dnf install magic-mesh` + `mackesd found`/`join` now stands up the
-shared-state plane automatically:
+> **Retired:** LizardFS is removed; enrollment now provisions **etcd** + **Syncthing**
+> instead. The section below documents the old LizardFS provisioning as it stood
+> before the rip-out — it no longer runs.
+
+A fresh `dnf install magic-mesh` + `mackesd found`/`join` then stood up the
+LizardFS shared-state plane automatically:
 
 - **`mackesd found`** (founding lighthouse) → `provision_qnm_shared(role,
   is_founder=true, …)` installs LizardFS and runs `setup-qnm-shared --master

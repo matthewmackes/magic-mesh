@@ -1,7 +1,7 @@
 # SETUP-7 — the `mackes` convergence role. Idempotently restores the steady
 # state captured by magic-setup/mackesd into /etc/mackesd/site.yml: the pinned
-# role, the boot-durable service set, and a fail-loud QNM-Shared mount assert.
-# It mirrors the imperative verbs (found/join/setup-qnm-shared) for re-apply —
+# role, the boot-durable service set, and a fail-loud shared-storage assert.
+# It mirrors the imperative verbs (found/join/setup-syncthing) for re-apply —
 # it never re-enrolls or re-mints CA material (that is the interactive bootstrap).
 ---
 - name: Ensure the MDE state dir exists
@@ -24,7 +24,7 @@
     enabled: true
     state: started
   loop: "{{ mde_services }}"
-  # A unit absent on this role (e.g. qnm-shared before LizardFS provisioning)
+  # A unit absent on this role (e.g. syncthing before it is provisioned)
   # must not fail the whole converge — surface it as a warning instead.
   register: svc_result
   failed_when: false
@@ -37,19 +37,18 @@
     label: "{{ item.item }}"
   when: item is failed or (item.state is defined and item.state != 'started')
 
-- name: Assert QNM-Shared (the shared-state plane) is actually mounted
-  # Fail-loud (the ONBOARD-6 lesson): a converge that "succeeds" against an
-  # unmounted /mnt/mesh-storage would mask a dead shared-state plane.
-  ansible.builtin.command:
-    cmd: "mountpoint -q {{ mde_qnm_path }}"
-  changed_when: false
-  failed_when: false
-  register: qnm_mount
+- name: Assert the shared-storage dir (the file plane) exists
+  # Fail-loud: a converge that "succeeds" against a missing /mnt/mesh-storage
+  # would mask a file plane that never came up. SUBSTRATE-V2: this is a plain
+  # Syncthing-replicated directory, not a FUSE mount.
+  ansible.builtin.stat:
+    path: "{{ mde_qnm_path }}"
+  register: qnm_dir
 
-- name: Warn when QNM-Shared is not mounted
+- name: Warn when the shared-storage dir is missing
   ansible.builtin.debug:
     msg: >-
-      WARNING: {{ mde_qnm_path }} is NOT a mountpoint — the shared-state plane is
-      down (leader/directory/fleet will not work mesh-wide). Provision it with
-      `/usr/libexec/mackesd/setup-qnm-shared --client`.
-  when: qnm_mount.rc != 0
+      WARNING: {{ mde_qnm_path }} does not exist — the file plane is down
+      (the peer directory + CA backup will not federate mesh-wide). Provision it
+      with `/usr/libexec/mackesd/setup-syncthing`.
+  when: not (qnm_dir.stat.exists and qnm_dir.stat.isdir)

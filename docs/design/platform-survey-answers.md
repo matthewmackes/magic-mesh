@@ -1,5 +1,14 @@
 # Platform Survey — Locked Answers
 
+> **Note (post-SUBSTRATE-6):** these answers were locked 2026-06-09 against a
+> **LizardFS** substrate that has since been **removed**. Coordination now runs on
+> **etcd** and shared files sync over **Syncthing** on a plain `/mnt/mesh-storage`
+> dir. The §1 FLEET-PHASE-G synthesis below (Q3/Q8/Q11–Q13 = "LizardFS master /
+> replication / append-only log / FUSE mount") and the §6 backup notes (Q98/Q99 =
+> "LizardFS topology snapshot, carried by LizardFS replication") describe the old
+> substrate — read them as the etcd+Syncthing equivalents. Kept as the historical
+> answer record.
+
 Running record of operator answers to `platform-survey.md` (2026-06-09). Each section's locks are
 synthesised into an architecture note, then lifted into `docs/WORKLIST.md` as an epic when the
 survey completes.

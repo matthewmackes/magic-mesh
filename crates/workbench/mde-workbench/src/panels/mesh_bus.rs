@@ -585,7 +585,7 @@ async fn save_hooks(text: String) -> Result<(), String> {
 /// Copy a peer's subscriptions from the mesh-storage mount.
 /// Looks for the peer's subs.yaml at
 /// `~/.mde-mesh/<peer>/.local/share/mde/bus/subs.yaml`
-/// (LizardFS per-peer home per MESHFS-4.1 mount layout).
+/// (Syncthing-replicated per-peer home per MESHFS-4.1 share layout).
 async fn match_peer_subs(peer: String) -> Result<Vec<String>, String> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)

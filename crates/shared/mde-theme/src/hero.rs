@@ -24,8 +24,6 @@ pub const HERO_STROKE: Rgba = carbon::GRAY_50;
 pub enum Hero {
     /// Ansible automation platform — configuration management and playbook runner.
     Ansible,
-    /// LizardFS distributed filesystem — shared storage layer for the mesh.
-    LizardFs,
     /// Nebula overlay network — the encrypted mesh fabric connecting all nodes.
     Nebula,
     /// Fedora Linux — the host operating system and DNF package substrate.
@@ -58,10 +56,9 @@ pub enum Hero {
 impl Hero {
     /// Every hero, in stable order.
     #[must_use]
-    pub const fn all() -> [Self; 14] {
+    pub const fn all() -> [Self; 13] {
         [
             Self::Ansible,
-            Self::LizardFs,
             Self::Nebula,
             Self::Fedora,
             Self::Netdata,
@@ -82,7 +79,6 @@ impl Hero {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Ansible => "Ansible",
-            Self::LizardFs => "LizardFS",
             Self::Nebula => "Nebula",
             Self::Fedora => "Fedora",
             Self::Netdata => "Netdata",
@@ -103,7 +99,6 @@ impl Hero {
     pub const fn svg_bytes(self) -> &'static [u8] {
         match self {
             Self::Ansible => include_bytes!("../../../../assets/heroes/ansible.svg"),
-            Self::LizardFs => include_bytes!("../../../../assets/heroes/lizardfs.svg"),
             Self::Nebula => include_bytes!("../../../../assets/heroes/nebula.svg"),
             Self::Fedora => include_bytes!("../../../../assets/heroes/fedora.svg"),
             Self::Netdata => include_bytes!("../../../../assets/heroes/netdata.svg"),
@@ -153,10 +148,9 @@ mod tests {
     #[test]
     fn all_fourteen_services_present_with_names() {
         let names: Vec<&str> = Hero::all().iter().map(|h| h.name()).collect();
-        assert_eq!(names.len(), 14);
+        assert_eq!(names.len(), 13);
         for expected in [
             "Ansible",
-            "LizardFS",
             "Nebula",
             "Fedora",
             "COSMIC",

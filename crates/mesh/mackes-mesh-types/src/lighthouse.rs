@@ -2,8 +2,8 @@
 //!
 //! The lighthouses are the relay/anchor nodes of the Nebula overlay. This
 //! module derives, from the **replicated peer directory** ([`PeerRecord`]) that
-//! every node already mirrors over QNM-Shared, the two things the hero surfaces
-//! need:
+//! every node already mirrors over the shared dir, the two things the hero
+//! surfaces need:
 //!
 //!   1. **Discovery** — which peers are lighthouses ([`is_lighthouse`] /
 //!      [`lighthouse_records`]); the set is `role == "lighthouse"` in the
@@ -13,12 +13,12 @@
 //!      the panel applet all agree (design Q2/Q3/Q15).
 //!
 //! Health is **strictly binary** (Q15): a lighthouse is green iff it is online
-//! AND its overlay is up AND — for the lizardfs master (the SPOF, Q3/Q22) — its
-//! core services are healthy; anything else (offline, overlay down, master
-//! service degraded, or no data yet) folds to red. The classifier
-//! ([`classify`]) is a pure function of explicit booleans so it is exhaustively
-//! unit-testable; [`beacon_for`] is the thin adapter that reads those booleans
-//! off a [`PeerRecord`] + the caller-supplied "is this the master?" fact.
+//! AND its overlay is up AND — for the elected leader (Q3/Q22) — its core
+//! services are healthy; anything else (offline, overlay down, leader service
+//! degraded, or no data yet) folds to red. The classifier ([`classify`]) is a
+//! pure function of explicit booleans so it is exhaustively unit-testable;
+//! [`beacon_for`] is the thin adapter that reads those booleans off a
+//! [`PeerRecord`] + the caller-supplied "is this the leader?" fact.
 
 use crate::peers::PeerRecord;
 
@@ -34,13 +34,13 @@ pub const LIGHTHOUSE_ROLE: &str = "lighthouse";
 /// A lease older than this is treated as no leader (failover in progress).
 pub const LEASE_DURATION_S: u64 = 60;
 
-/// Parse the current lizardfs-master hostname from the QNM leader-lease file
-/// contents (`<workgroup>/.mackesd-leader.lock`). The lease line is
-/// `node_id\trenewed_at_s\tepoch`; the holder's `peer:<host>` node id maps to
-/// `<host>`. Returns `None` when the lease is empty, malformed, or expired
-/// (older than [`LEASE_DURATION_S`] at `now_s`) — then no lighthouse is the
-/// master and all use the lenient health check. Pure + testable; the file read
-/// lives at the call site so this stays unit-testable.
+/// Parse the current leader hostname from the leader-lease contents
+/// (the etcd leader lease, or `<workgroup>/.mackesd-leader.lock` pre-etcd). The
+/// lease line is `node_id\trenewed_at_s\tepoch`; the holder's `peer:<host>` node
+/// id maps to `<host>`. Returns `None` when the lease is empty, malformed, or
+/// expired (older than [`LEASE_DURATION_S`] at `now_s`) — then no lighthouse is
+/// the leader and all use the lenient health check. Pure + testable; the file
+/// read lives at the call site so this stays unit-testable.
 #[must_use]
 pub fn master_from_lease(lease_text: &str, now_s: u64) -> Option<String> {
     let line = lease_text.lines().next()?.trim();
@@ -91,8 +91,8 @@ pub enum BeaconStatus {
     NoData,
     /// Heartbeat stale or the row reports `unreachable` → red.
     Offline,
-    /// Present but a core service is down: overlay missing, or the master's
-    /// lizardfs-master service is unhealthy (the SPOF, Q3) → red.
+    /// Present but a core service is down: overlay missing, or the elected
+    /// leader's core services are unhealthy (Q3) → red.
     ServiceDown,
 }
 
@@ -123,7 +123,7 @@ pub struct Beacon {
     pub hostname: String,
     /// Its Nebula overlay IP, if it has recorded one.
     pub overlay_ip: Option<String>,
-    /// Whether this lighthouse is the lizardfs master (the SPOF) vs a shadow
+    /// Whether this lighthouse is the elected leader vs a follower
     /// (Q22). Caller-supplied — see [`beacon_for`].
     pub is_master: bool,
     /// The binary health state.
@@ -253,8 +253,8 @@ pub fn classify(
 /// - **has_data** — the row carries a real timestamp (`last_seen_ms > 0`).
 /// - **online** — fresh within `stale_ms` AND not self-reported `unreachable`.
 /// - **overlay_up** — the node recorded its own overlay IP this heartbeat.
-/// - **master_service_up** — for the master, the Netdata-derived health tier is
-///   `healthy` (lizardfs-master down trips an alarm → degraded/critical/etc.).
+/// - **master_service_up** — for the leader, the Netdata-derived health tier is
+///   `healthy` (a degraded leader trips an alarm → degraded/critical/etc.).
 #[must_use]
 pub fn beacon_for(peer: &PeerRecord, is_master: bool, now_ms: u64, stale_ms: u64) -> Beacon {
     let has_data = peer.last_seen_ms > 0;
@@ -273,8 +273,8 @@ pub fn beacon_for(peer: &PeerRecord, is_master: bool, now_ms: u64, stale_ms: u64
 
 /// Build the beacon list for a peer directory in one call: discover the
 /// lighthouses, then derive each one's beacon. `master_hostname` names the
-/// current lizardfs master (the SPOF) if known — that lighthouse is flagged
-/// `is_master` and held to the stricter service check (Q22).
+/// current elected leader if known — that lighthouse is flagged `is_master` and
+/// held to the stricter service check (Q22).
 #[must_use]
 pub fn beacons(
     peers: &[PeerRecord],
@@ -475,8 +475,7 @@ mod tests {
     #[test]
     fn master_spof_red_when_core_service_degraded() {
         let now = 1_000_000;
-        // Online, overlay up, but the master's health tier is degraded — the
-        // lizardfs-master SPOF is unhealthy (Q3).
+        // Online, overlay up, but the leader's health tier is degraded (Q3).
         let p = lh("master", "degraded", Some("10.42.0.1"), now);
         let master = beacon_for(&p, true, now, DEFAULT_STALE_MS);
         assert_eq!(

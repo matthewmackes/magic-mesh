@@ -178,9 +178,9 @@ pub const FILE_OPS_VERBS: [&str; 3] = ["send-to", "rollback", "audit-log"];
 
 // ---- FileXfer — the real cross-mesh file transport (AUD-1 / AUD-7) ----
 //
-// Send-To moves bytes over the **LizardFS-replicated QNM-Shared volume** —
+// Send-To moves bytes over the **Syncthing-replicated QNM-Shared volume** —
 // no extra transport daemon, the replicated volume IS the wire. Sending to
-// peer `P` copies each source into `<qnm>/inbox/<P>/<self>/<name>`; LizardFS
+// peer `P` copies each source into `<qnm>/inbox/<P>/<self>/<name>`; Syncthing
 // replication delivers it to P, whose Inbox view lists `<qnm>/inbox/<P>/**`
 // (the sender is the subdirectory name — attribution for free). The sender's
 // own record is appended to `<qnm>/outbox/<self>.jsonl`. (Closes the §7

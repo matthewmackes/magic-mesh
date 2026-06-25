@@ -5,7 +5,7 @@
 //! whether the firstboot auto-join slot is baked in (W60). One image
 //! carries every profile; the boot menu picks one at install (W57). This
 //! panel shells `mackesd profiles --json` and renders the catalog (the
-//! shipped per-role core pack + any TOML profiles on LizardFS).
+//! shipped per-role core pack + any TOML profiles on the Syncthing share).
 //!
 //! Read-only renderer (W88): profiles are authored as TOML; the write
 //! side (form edit) + the actual image bake (PLANES-22) build on this.

@@ -8,8 +8,8 @@
 //! against a local dir).
 //!
 //! This test points TWO node-instances at ONE shared directory (standing in for
-//! the LizardFS mount both nodes mfsmount) and asserts the invariants that only
-//! hold when the substrate is genuinely shared:
+//! the Syncthing-replicated `/mnt/mesh-storage` both nodes share) and asserts
+//! the invariants that only hold when the substrate is genuinely shared:
 //!   * exactly one node wins leadership on the shared lock (the other follows);
 //!   * a heartbeat written by node A is visible in node B's directory view;
 //!   * healthz `node_count`/`is_leader` reflect the shared mesh, not an empty
@@ -18,7 +18,7 @@
 //! A shared tempdir is the faithful stand-in for the gap: the bug was the
 //! ABSENCE of sharing, so a shared dir exercises precisely what was missing,
 //! reliably in normal CI (the real nebula transport is covered by OBS-1's
-//! container suite; the LizardFS deploy by install-helpers/setup-qnm-shared.sh).
+//! container suite; the Syncthing share deploy by install-helpers/setup-syncthing.sh).
 
 #![cfg(feature = "async-services")]
 
@@ -83,7 +83,7 @@ fn a_heartbeat_on_one_node_is_visible_in_another_nodes_directory() {
     let now = now_ms();
     let pdir = peers_dir(shared.path());
     // Two nodes publish heartbeats into the shared peers dir (as their
-    // mackesd would over the LizardFS mount).
+    // mackesd would over the Syncthing-replicated share).
     write_peer_record(&pdir, &heartbeat("alpha", now)).unwrap();
     write_peer_record(&pdir, &heartbeat("beta", now)).unwrap();
 

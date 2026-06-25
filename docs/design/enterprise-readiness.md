@@ -22,7 +22,9 @@ running on stock Fedora-Cosmic (`AI_GOVERNANCE.md` §0). Technically:
 - **Mesh model.** A **Nebula** encrypted overlay (lighthouse-anchored discovery + hole-punching, with
   a lighthouse relay fallback). Identity is an Ed25519 node key; overlay membership is a Nebula peer
   cert signed by a mesh CA. Desired-state is a versioned baseline reconciled per-node (Ansible,
-  `magic-fleet`). Mesh storage is LizardFS. The control-plane daemon is `mackesd`.
+  `magic-fleet`). Coordination (leader election, peer directory, health) runs on **etcd**; shared
+  files sync over **Syncthing** on a plain `/mnt/mesh-storage` dir (SUBSTRATE-V2; LizardFS removed).
+  The control-plane daemon is `mackesd`.
 - **Node roles** (`mde-role`: Lighthouse ⊂ Server ⊂ Workstation, strict supersets):
   - **Lighthouse** — the stable rendezvous + the CA signing root + control-plane visibility.
   - **Headless / Server** — always-on infra (fleet, mesh storage) with no GUI.

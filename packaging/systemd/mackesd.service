@@ -29,13 +29,13 @@ WatchdogSec=60
 # user session gets the same value via /usr/lib/environment.d/90-mde-bus.conf;
 # the sticky 1777 dir is created by tmpfiles (magic-mesh.conf).
 Environment=MDE_BUS_ROOT=/run/mde-bus
-# SETUP-fix — SHARED QNM-Shared mount so this root daemon and the uid-1000
-# desktop GUIs resolve the SAME mesh-storage path. The code default is
-# ~/QNM-Shared (HOME-relative), which splits /root/QNM-Shared (root daemon)
-# from /home/<u>/QNM-Shared (workbench) — and /root is 0750 so the GUI can't
-# even traverse it. Pinning a neutral mount (mounted with allow_other +
-# user_allow_other) lets both uids read the one LizardFS volume. The user
-# session gets the same value via environment.d/90-mde-workgroup.conf.
+# SETUP-fix — SHARED mesh-storage dir so this root daemon and the uid-1000
+# desktop GUIs resolve the SAME path. The code default is ~/QNM-Shared
+# (HOME-relative), which splits /root/QNM-Shared (root daemon) from
+# /home/<u>/QNM-Shared (workbench) — and /root is 0750 so the GUI can't even
+# traverse it. Pinning a neutral 0755 dir (SUBSTRATE-V2: a plain Syncthing-
+# replicated directory, no FUSE) lets both uids read the one shared dir. The
+# user session gets the same value via environment.d/90-mde-workgroup.conf.
 Environment=MDE_WORKGROUP_ROOT=/mnt/mesh-storage
 ExecStart=/usr/bin/mackesd serve
 # ENT-2: serve fails closed without a pinned role — that's a
@@ -85,7 +85,7 @@ SystemCallArchitectures=native
 # OS image + kernel surfaces without restricting the network/fs/subprocess paths
 # it needs. (Stricter ProtectSystem/ProtectHome/RestrictAddressFamilies are
 # deferred to EFF-12 follow-up — they need a live Fedora bring-up to verify
-# nebula tun + the QNM mount keep working.)
+# nebula tun + the shared-storage dir keep working.)
 # SELINUX-1 (2026-06-15) — NoNewPrivileges REMOVED. mackesd is the node's
 # system-orchestrator: it execs helpers that legitimately change SELinux domain
 # (podman → container_runtime_t for the compute-descriptor probe; libvirt/virsh;
@@ -99,17 +99,16 @@ SystemCallArchitectures=native
 # below, none of which block domain transitions. Do NOT re-add NoNewPrivileges.
 # SUBAUDIT-D (2026-06-14) — `full` makes /etc READ-ONLY, which silently broke
 # every /etc write this daemon legitimately makes (mesh_dns → /etc/hosts for
-# <host>.mesh resolution; /etc/nebula materialization; /etc/ssh drop-ins;
-# /etc/fuse.conf). `true` keeps the OS image (/usr,/boot) read-only — the stated
-# intent above — while leaving /etc writable for the config-management role.
+# <host>.mesh resolution; /etc/nebula materialization; /etc/ssh drop-ins).
+# `true` keeps the OS image (/usr,/boot) read-only — the stated intent above —
+# while leaving /etc writable for the config-management role.
 ProtectSystem=true
 PrivateTmp=true
 # AUDIT-MESH-15 (2026-06-16) — PrivateTmp puts the daemon in a private mount
 # namespace, so the FPG-7 `mount --bind` of the desktop user's XDG dirs
-# (~/Documents → the communal QNM-Shared dir) was invisible to the user's
+# (~/Documents → the communal mesh-storage dir) was invisible to the user's
 # session. MountFlags=shared propagates the daemon's mounts out to the host
-# namespace so the desktop user actually sees the synced dirs. (Also lets the
-# qnm-shared FUSE mount changes propagate in.)
+# namespace so the desktop user actually sees the synced dirs.
 MountFlags=shared
 ProtectKernelLogs=true
 ProtectControlGroups=true

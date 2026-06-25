@@ -3,8 +3,8 @@
 //! A dedicated operations surface for the relay/anchor nodes of the overlay.
 //! It reuses the shared `mackes_mesh_types::lighthouse` discovery + binary-health
 //! derivation (the same source the Notification Hub footer animates), so the tab
-//! and the Hub always agree on which lighthouse is green/red and which is the
-//! lizardfs master.
+//! and the Hub always agree on which lighthouse is green/red and which holds the
+//! leader role.
 //!
 //! Top: a Nebula hero band (Q25/Q4) + a row of the animated beacons summarizing
 //! fleet lighthouse health. Below: one **full card** per lighthouse with the
@@ -90,7 +90,7 @@ impl Action {
             }
             Self::Promote { host } => format!(
                 "Promote {host} to mesh master? This force-takes the leader lease (bumps the \
-                 epoch), moving the lizardfs-master SPOF to {host}."
+                 epoch), moving leadership to {host}."
             ),
         }
     }
@@ -476,10 +476,10 @@ fn lighthouse_card<'a>(
     } else {
         format!("{}s ago", c.last_seen_age_s)
     };
-    // Failover readiness (Q22): the shadow is ready to take the master SPOF when
-    // it's itself healthy; the master line states it holds the SPOF.
+    // Failover readiness (Q22): the shadow is ready to take the leader role when
+    // it's itself healthy; the master line states it holds leadership.
     let failover = if c.beacon.is_master {
-        "holds the lizardfs-master SPOF".to_string()
+        "holds the leader role".to_string()
     } else if c.beacon.healthy() {
         "ready to take over as master".to_string()
     } else {

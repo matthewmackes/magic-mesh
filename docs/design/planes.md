@@ -9,16 +9,24 @@ Plane, Distributed Plane — mapped onto the platform and placed in the Workbenc
 top-level mesh IA. **D-W1 (standing): reuse mesh tooling first, Red Hat best practices
 second.** Greenfield: no legacy or tech debt carried (operator, W78 reply).
 
+> **Note (post-SUBSTRATE-6):** the locks below predate the substrate split and say
+> "state on LizardFS" / "LizardFS replicates." **LizardFS is removed.** Coordination
+> (the Controller plane's leader election + peer directory + health) now runs on
+> **etcd**, and shared files (fleet state dirs, job templates, mirror trees) sync
+> over **Syncthing** on a plain `/mnt/mesh-storage` dir. Read "LizardFS" in the
+> locks/prose as today's etcd+Syncthing substrate; the W62 `file://`-mirror coupling
+> now keys off Syncthing folder health, not a FUSE mount.
+
 ## Constitutional locks (→ AI_GOVERNANCE §9)
 
 | # | Lock |
 |---|------|
 | W1 | **No RBAC. Access to the mesh IS the control plane** — a valid mesh cert is the authorization; the desktop is the operator (§8) |
 | W2 | **3 roles (§5) + capability tags** — hop / execution / headless are orthogonal, GATING (W84) tags |
-| W3 | **The Controller is a plane, not a place** — state on LizardFS, any node hosts it, the FPG election coordinates |
+| W3 | **The Controller is a plane, not a place** — coordination state on etcd + file state synced by Syncthing (was LizardFS, retired SUBSTRATE-6), any node hosts it, the FPG election coordinates |
 | W21 | Remote execution = **typed Bus verbs + signed job bundles only. No raw shell channel, ever** |
-| W88 | **All fleet state = TOML/YAML dirs on LizardFS + typed mackesd Bus verbs; GUIs are renderers** (CLI parity, W27) |
-| D-W1 | **Mesh tooling first, Red Hat second** — FPG/Bus/LizardFS/Nebula before new components; Ansible/nmstate/firewalld/kickstart/createrepo where the mesh has no native tool |
+| W88 | **All fleet state = TOML/YAML dirs on the Syncthing-synced `/mnt/mesh-storage` (was LizardFS) + typed mackesd Bus verbs; GUIs are renderers** (CLI parity, W27) |
+| D-W1 | **Mesh tooling first, Red Hat second** — FPG/Bus/etcd+Syncthing (was LizardFS)/Nebula before new components; Ansible/nmstate/firewalld/kickstart/createrepo where the mesh has no native tool |
 
 ## The IA (W4–W16)
 
@@ -44,8 +52,8 @@ journald mesh-unit view + Netdata strip (W23). **Full CLI parity** for all six (
 ### Controller (W29–W52)
 **Jobs**: job = Ansible playbook ref + vars + targets (W29), schedules in v1 (W30)
 fired by the FPG leader (W35); targets = tags/roles/peers resolved at launch (W31);
-the TARGET runs it locally as a signed bundle — no push-SSH (W32); LizardFS
-`jobs/templates/` + `jobs/runs/<id>/` (W33); fleet-parallel, serial per node (W34);
+the TARGET runs it locally as a signed bundle — no push-SSH (W32); Syncthing-synced
+`jobs/templates/` + `jobs/runs/<id>/` under `/mnt/mesh-storage` (W33, was LizardFS); fleet-parallel, serial per node (W34);
 history runs→targets→output (W36); Run-once (W37); form + read-only YAML, playbook
 authoring external (W38); failure-only alerts (W39); Playbooks panel absorbed (W40).
 **Remediation**: drift-type → template map with var bindings (W41); per-plan auto
@@ -82,14 +90,14 @@ any enrolled surface, audit-logged (W83). **Tags GATE**: untagged duty is refuse
 ### Provisioning (W53–W64) — lands after PKG core (W64)
 **Images**: all four kinds — install ISO + kickstarts, VM golden images, container
 images, USB writer (W53); built by jobs on the mesh (W54, → execution tag per the W82
-reconciliation); stored as versioned dirs + TOML manifests on LizardFS (W55).
+reconciliation); stored as versioned dirs + TOML manifests on the Syncthing-synced `/mnt/mesh-storage` (W55, was LizardFS).
 **Profiles**: role + tags + kickstart fragments + join-token slot, TOML, form-edited
 (W56); one image carries all profiles, **boot-menu choice** at install (W57);
 **auto-join**: single-use bearer baked in, firstboot enrolls + pins + tags (W60).
 Bootstrap v1 = USB/ISO only, PXE deferred (W59). **Node roles panel** (role pins +
 tag editor) lives here (W58). **Mirrors**: the magic-mesh GitHub-hosted dnf repo (W61, ex-COPR); **every node serves
-itself** — dnf reads the LizardFS mount via `file://` baseurl, no HTTP tier (W62);
-sync = scheduled job, one puller, LizardFS replicates (W63).
+itself** — dnf reads the Syncthing-synced `/mnt/mesh-storage` mirror via `file://` baseurl, no HTTP tier (W62, was the LizardFS mount);
+sync = scheduled job, one puller, Syncthing replicates the tree (W63, was LizardFS).
 
 ## Delivery (W89–W100)
 
@@ -111,7 +119,8 @@ Every section whose primary engine is an external project carries a **hero**:
 **header band, right-aligned, 96–128 px** (H3/H4), captioned **NAME + live installed
 version** (H8), **hover → stack card** (project, version, license, platform role, docs
 link — H9), **always rendered** ("not installed" honest caption when absent, H10).
-Set (H1): Ansible, LizardFS, Nebula, Fedora, Netdata, Podman, libvirt/KVM, Cosmic,
+Set (H1): Ansible, etcd, Syncthing (the SUBSTRATE-6 substrate, replacing the
+retired LizardFS hero), Nebula, Fedora, Netdata, Podman, libvirt/KVM, Cosmic,
 systemd, Remmina, PipeWire, **rustls (TLS)**, VPN/tunnel tech. Assets: SVGs compiled
 into **mde-theme** behind a typed `Hero` enum (H6, §4 single-source); stroke color is
 a new **`hero_stroke` token**, palette-tested (H7).
@@ -125,8 +134,9 @@ a new **`hero_stroke` token**, palette-tested (H7).
   as the apply path, never after.
 - **W73 full exit nodes** = routing-table surgery on clients + NAT on hops; the
   validation suite must cover the exit path before the toggle ships.
-- **W62 file:// mirrors** couple updates to LizardFS health: a storage outage blocks
-  dnf. Upstream-fallback stays in the .repo (cost: W61 scope only).
+- **W62 file:// mirrors** couple updates to the Syncthing file-plane health (was
+  LizardFS): a storage outage blocks dnf. Upstream-fallback stays in the .repo
+  (cost: W61 scope only).
 - **W84 gating tags** are a behavior change for existing workers when tags arrive —
   the tags substrate must land before any gate flips (sequenced inside the epic).
 - **W16 full tree** renders ~20 guided empty states for months — each must name its

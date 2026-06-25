@@ -761,7 +761,11 @@ mod tests {
             .iter()
             .map(|e| e.name.as_str())
             .collect();
-        assert_eq!(r, ["Files"], "files -> Files only; Color Profiles must not match");
+        assert_eq!(
+            r,
+            ["Files"],
+            "files -> Files only; Color Profiles must not match"
+        );
     }
 
     #[test]

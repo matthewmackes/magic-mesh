@@ -10,7 +10,7 @@
 //! "Lighthouse = enroll+leader+health" summary — a Lighthouse IS a VPS relay, so
 //! it runs Nebula + mde-bus + mesh routing + leader + health. Over-tiering a
 //! relay-essential worker would break routing, so the mesh/control plane sits at
-//! rank 0; fleet/meshfs at rank 1; voice/media + every sway/desktop worker at
+//! rank 0; fleet at rank 1; voice/media + every sway/desktop worker at
 //! rank 2. The four genuinely-ambiguous calls (`mesh_latency`, `reconcile`,
 //! `remmina-sync`, `kdc_host`) are noted in the worklist for a design-doc
 //! cross-check.
@@ -134,7 +134,7 @@ mod tests {
         // python `clipboard` (RETIRE-PY.3), -1 broken python
         // `mdns` relay (RETIRE-PY.1), +1 native `mdns_relay` (MESH-MDNS-RELAY,
         // the real Rust cross-segment relay), -1 dead python `fs_sync` GVFS
-        // worker (RETIRE-PY.4, mesh storage is LizardFS/E3).
+        // worker (RETIRE-PY.4, mesh storage is Syncthing under SUBSTRATE-V2).
         // -12 sway/desktop workers (E11 'Cosmic owns the desktop' — the
         // labwc/sway worker stack deleted). +1 ssh_pubkey_gossip (SVC-2),
         // +1 fleet_reconcile (PD-9), +1 presence_watch (PD-13),
@@ -175,8 +175,7 @@ mod tests {
         assert_eq!(
             count(1),
             3,
-            "Server rank-1 = fleet workers + job_exec (PLANES-9); the LizardFS \
-             meshfs_worker spawns unconditionally (binary-self-gated)"
+            "Server rank-1 = fleet workers + job_exec (PLANES-9)"
         );
         assert_eq!(
             count(2),
@@ -203,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn server_adds_fleet_and_meshfs_but_no_desktop() {
+    fn server_adds_fleet_but_no_desktop() {
         let r = Role::Server.rank();
         for w in ["ansible-pull", "app-sync", "nebula_supervisor", "heartbeat"] {
             assert!(runs(w, r), "Server must run {w}");

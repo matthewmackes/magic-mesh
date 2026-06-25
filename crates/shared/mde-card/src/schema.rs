@@ -28,7 +28,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// 11. `created_ts`        — Unix epoch seconds at first creation.
 /// 12. `updated_ts`        — Unix epoch seconds at last edit.
 ///
-/// Cards serialize via `serde_json` so the LizardFS mesh store
+/// Cards serialize via `serde_json` so the Syncthing mesh store
 /// ships them around the mesh as plain `.json` files.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Card {

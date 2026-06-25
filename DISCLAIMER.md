@@ -2,7 +2,7 @@
 
 MCNF is an open-source, secure, no-fixed-center **workgroup** platform: a
 small set of trusted machines (a household, a lab, a small team) joined into one
-encrypted Nebula overlay with replicated storage (LizardFS), peer-to-peer fleet
+encrypted Nebula overlay with replicated storage (Syncthing), peer-to-peer fleet
 automation (Ansible-on-each-node), and a Cosmic desktop. Its mission is to make a
 **production-grade private workgroup of up to eight peers** something one operator
 can stand up, run, and recover — without a cloud control plane, a central server,
@@ -46,7 +46,7 @@ tool — run it only among machines you would trust on the same LAN.
 
 ## Data, replication, and recovery
 
-MCNF replicates data across peers (LizardFS) and converges node
+MCNF replicates data across peers (Syncthing) and converges node
 configuration peer-to-peer. Misconfiguration can still cause data loss, service
 interruption, or unintended replication of sensitive files. You remain responsible
 for backups, for what you place on the mesh, and for recovery. The platform ships

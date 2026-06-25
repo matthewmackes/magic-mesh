@@ -582,7 +582,10 @@ fn hv_target_with_store(dom0: &str, store: &SecretStore) -> HostTarget {
 /// the deployed repo, not the systemd cwd `/`) with the local-AEAD fallback rooted
 /// under the workgroup volume.
 fn dom0_secret_store() -> SecretStore {
-    SecretStore::resolve(&secret_store::repo_root(), &crate::default_qnm_shared_root())
+    SecretStore::resolve(
+        &secret_store::repo_root(),
+        &crate::default_qnm_shared_root(),
+    )
 }
 
 /// Store-injected core of [`dom0_password`] — read `xcp/<dom0>` from `store`,

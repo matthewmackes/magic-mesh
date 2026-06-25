@@ -1,8 +1,8 @@
 //! Native mount enumeration — the "This PC / volumes" parity op (E11.6, Q34–Q39).
 //!
 //! Parses `/proc/mounts` into the mounted-filesystem list the file manager shows
-//! under "This PC" (real disks, network shares, FUSE mounts incl. the mesh
-//! LizardFS), filtering out the kernel's pseudo-filesystems (`proc`, `sysfs`,
+//! under "This PC" (real disks, network shares, FUSE mounts like sshfs),
+//! filtering out the kernel's pseudo-filesystems (`proc`, `sysfs`,
 //! `cgroup`, …). Pure `std`; the parser takes the file content as a string so it
 //! is fully unit-tested off fixtures with no `/proc` dependency.
 
@@ -11,7 +11,7 @@ use std::path::PathBuf;
 /// One row of `/proc/mounts`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountPoint {
-    /// Backing device or remote source (`/dev/sda1`, `//nas/share`, `lizardfs#…`).
+    /// Backing device or remote source (`/dev/sda1`, `//nas/share`, `user@host:/srv`).
     pub source: String,
     /// Where it is mounted.
     pub target: PathBuf,
@@ -50,13 +50,13 @@ const PSEUDO_FSTYPES: &[&str] = &[
 
 impl MountPoint {
     /// Whether this mount is a "volume" worth showing under This PC — a real disk,
-    /// a network share, or a FUSE mount (the mesh LizardFS, sshfs Cloud-Files, …),
-    /// as opposed to kernel pseudo-plumbing.
+    /// a network share, or a FUSE mount (sshfs Cloud-Files, …), as opposed to
+    /// kernel pseudo-plumbing.
     #[must_use]
     pub fn is_user_volume(&self) -> bool {
-        // Real FUSE mounts (fuse.sshfs, fuse.lizardfs, fuseblk) are always user
-        // volumes — but `fusectl`, the FUSE *control* pseudo-fs, is not, so match
-        // the `fuse.` prefix / `fuseblk` exactly rather than every "fuse*".
+        // Real FUSE mounts (fuse.sshfs, fuseblk) are always user volumes — but
+        // `fusectl`, the FUSE *control* pseudo-fs, is not, so match the `fuse.`
+        // prefix / `fuseblk` exactly rather than every "fuse*".
         if self.fstype.starts_with("fuse.") || self.fstype == "fuseblk" {
             return true;
         }
@@ -73,12 +73,15 @@ impl MountPoint {
         ) || self.fstype.starts_with("fuse.")
     }
 
-    /// Whether this mount is the mesh-storage / QNM-Shared store specifically —
-    /// the LizardFS FUSE plane that backs the shared workgroup tree, as opposed
-    /// to an arbitrary network share (a CIFS/NFS mount or some other sshfs).
+    /// Whether this row is the mesh-storage / QNM-Shared store specifically.
+    /// SUBSTRATE-V2: the shared workgroup tree is a plain Syncthing-replicated
+    /// directory at `/mnt/mesh-storage` (or `$MDE_WORKGROUP_ROOT`), **not** a FUSE
+    /// mount — so it is identified by its target path, not a special fstype.
     #[must_use]
     pub fn is_mesh_storage(&self) -> bool {
-        self.fstype == "fuse.lizardfs" || self.source.starts_with("lizardfs#")
+        let root =
+            std::env::var("MDE_WORKGROUP_ROOT").unwrap_or_else(|_| "/mnt/mesh-storage".to_string());
+        self.target == PathBuf::from(root)
     }
 
     /// Canonical freedesktop icon name for this mount's "This PC" row.
@@ -187,8 +190,8 @@ mod tests {
     use super::*;
 
     // A realistic /proc/mounts slice: pseudo fs, a real disk, a tmpfs, a CIFS
-    // share, an sshfs FUSE mount, and a mesh LizardFS FUSE mount — plus a mount
-    // whose path contains an escaped space.
+    // share, and two sshfs FUSE mounts — plus a mount whose path contains an
+    // escaped space.
     const FIXTURE: &str = "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n\
 sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n\
 /dev/nvme0n1p2 / ext4 rw,relatime 0 0\n\
@@ -196,7 +199,7 @@ tmpfs /run tmpfs rw,nosuid,nodev 0 0\n\
 /dev/nvme0n1p1 /boot/efi vfat rw,relatime 0 0\n\
 //nas/media /mnt/media cifs rw,relatime 0 0\n\
 user@host:/srv /home/mm/remote fuse.sshfs rw,nosuid,nodev,relatime 0 0\n\
-lizardfs#master:9421 /mnt/mesh\\040store fuse.lizardfs rw,relatime 0 0\n\
+user@host:/srv /mnt/mesh\\040store fuse.sshfs rw,relatime 0 0\n\
 fusectl /sys/fs/fuse/connections fusectl rw,nosuid,nodev,noexec,relatime 0 0\n";
 
     #[test]
@@ -235,11 +238,11 @@ fusectl /sys/fs/fuse/connections fusectl rw,nosuid,nodev,noexec,relatime 0 0\n";
     fn octal_escape_in_a_path_is_decoded() {
         let mesh = parse_proc_mounts(FIXTURE)
             .into_iter()
-            .find(|m| m.fstype == "fuse.lizardfs")
+            .find(|m| m.target == PathBuf::from("/mnt/mesh store"))
             .unwrap();
         assert_eq!(mesh.target, PathBuf::from("/mnt/mesh store"));
         assert!(mesh.is_user_volume());
-        assert!(mesh.is_network(), "a fuse.* mesh mount is remote");
+        assert!(mesh.is_network(), "a fuse.* mount is remote");
     }
 
     #[test]
@@ -264,24 +267,49 @@ fusectl /sys/fs/fuse/connections fusectl rw,nosuid,nodev,noexec,relatime 0 0\n";
 
     #[test]
     fn mesh_mount_icon_is_the_network_folder() {
-        // NOTIFY-UI-3 / ICON-MESH: the mesh-storage (QNM-Shared) FUSE plane is a
-        // mesh file service, so its "This PC" row must take the `folder-remote`
-        // network icon, not a local mounted-volume icon.
+        // NOTIFY-UI-3 / ICON-MESH: a network share (CIFS/sshfs) is a remote file
+        // service, so its "This PC" row must take the `folder-remote` network
+        // icon, not a local mounted-volume icon.
         let m = parse_proc_mounts(FIXTURE);
         let by_target = |t: &str| m.iter().find(|x| x.target == PathBuf::from(t)).unwrap();
 
-        let mesh = by_target("/mnt/mesh store");
-        assert!(mesh.is_mesh_storage(), "fuse.lizardfs is the mesh store");
-        assert_eq!(mesh.icon_name(), "folder-remote");
-
-        // Other network shares (CIFS) are remote too → folder-remote, but are
-        // not the mesh store specifically.
+        // Network shares (CIFS / sshfs) are remote → folder-remote.
         let cifs = by_target("/mnt/media");
-        assert!(!cifs.is_mesh_storage());
         assert_eq!(cifs.icon_name(), "folder-remote");
 
         // A local ext4 disk keeps the local disk icon.
         assert_eq!(by_target("/").icon_name(), "drive-harddisk");
+    }
+
+    #[test]
+    fn mesh_storage_is_identified_by_its_path() {
+        // SUBSTRATE-V2: the shared store is a plain dir at /mnt/mesh-storage
+        // (no FUSE), so it's matched by target path, not a special fstype.
+        let mesh = MountPoint {
+            source: "syncthing".into(),
+            target: PathBuf::from("/mnt/mesh-storage"),
+            fstype: "ext4".into(),
+            options: "rw".into(),
+        };
+        // env may be set by the test harness; only assert the negative case
+        // (which never depends on the env default) to stay parallel-safe.
+        let other = MountPoint {
+            source: "//nas/media".into(),
+            target: PathBuf::from("/mnt/media"),
+            fstype: "cifs".into(),
+            options: "rw".into(),
+        };
+        assert!(
+            !other.is_mesh_storage(),
+            "a CIFS share is not the mesh store"
+        );
+        // With no override, the default path matches.
+        if std::env::var_os("MDE_WORKGROUP_ROOT").is_none() {
+            assert!(
+                mesh.is_mesh_storage(),
+                "/mnt/mesh-storage is the mesh store"
+            );
+        }
     }
 
     #[test]
@@ -301,11 +329,11 @@ fusectl /sys/fs/fuse/connections fusectl rw,nosuid,nodev,noexec,relatime 0 0\n";
 
         // NOTIFY-UI-3 / ICON-MESH: the report carries the per-row icon name so
         // the chosen glyph is observable at runtime (the `--mounts` surface).
-        // The mesh-storage (fuse.lizardfs) + CIFS rows take `folder-remote`;
-        // the local ext4 root takes `drive-harddisk`.
+        // Network shares (sshfs / CIFS) take `folder-remote`; the local ext4
+        // root takes `drive-harddisk`.
         assert!(r
             .lines()
-            .any(|l| l.contains("fuse.lizardfs") && l.contains("\ticon=folder-remote")));
+            .any(|l| l.contains("fuse.sshfs") && l.contains("\ticon=folder-remote")));
         assert!(r
             .lines()
             .any(|l| l.contains("\tcifs\t") && l.contains("\ticon=folder-remote")));

@@ -229,7 +229,7 @@ enum Cmd {
     /// then *skips* the unit rather than failing it) after logging the conflict
     /// to the journal. The role-gated units use it so a forbidden service
     /// refuses to start: `mde-session`/`greetd` require rank 2 (Workstation),
-    /// `lizardfs`/`ansible-pull.timer` require rank 1 (Server+).
+    /// `ansible-pull.timer` requires rank 1 (Server+).
     RoleGate {
         /// Minimum deployment rank the calling unit requires (0/1/2).
         #[arg(long = "min-rank", value_name = "RANK")]
@@ -284,96 +284,16 @@ enum Cmd {
         action: ProbeCmd,
     },
 
-    /// MESHFS-1.2 (v5.0.0) — pre-flight check for the LizardFS
-    /// mesh-storage rollout. Walks the user's XDG dirs, sums
-    /// on-disk bytes, queries `/var/lib/mde/meshfs` free space,
-    /// prints a one-line OK / WARN / NoDataDir verdict + emits
-    /// the full structured report as a JSON line to stdout.
-    /// Exits 0 on OK, 1 on WARN / NoDataDir. Operators can run
-    /// this before an upgrade to v5.0.0; the Workbench Mesh
-    /// Storage panel (MESHFS-13.1) will surface the same report
-    /// as a banner once it lands.
-    PreflightMeshFsHeadroom {
-        /// Override the LizardFS data parent dir. Defaults to
-        /// `/var/lib/mde/meshfs` per the design lock.
-        #[clap(long, default_value = "/var/lib/mde/meshfs")]
-        data_dir: std::path::PathBuf,
-        /// Override `$HOME` (used to locate the five XDG
-        /// dirs). Defaults to the env-var `$HOME`.
-        #[clap(long)]
-        home: Option<std::path::PathBuf>,
-    },
-
-    /// MESHFS-13.1 (v5.0.0) — query the active LizardFS master
-    /// and emit a fleet status JSON blob (peers, goal, quota cap,
-    /// limiting peer). Printed to stdout as a single JSON line.
-    /// Exits 0 when the master is reachable, 1 otherwise.
-    MeshFsStatus {
-        /// Floating overlay VIP the active master listens on.
-        #[clap(long, default_value = "10.42.0.1")]
-        vip: String,
-        /// LizardFS admin CLI name (must be on PATH). AUDIT-MESH-3:
-        /// `lizardfs-admin`, not MooseFS's `mfsadmin`.
-        #[clap(long, default_value = "lizardfs-admin")]
-        admin_binary: String,
-    },
-
-    /// MESHFS-8.1 (v5.0.0) — list files recoverable from the LizardFS
-    /// `.trash` virtual directory. Emits a JSON array of `TrashEntry`
-    /// objects to stdout. Returns an empty array `[]` when the mount
-    /// path is absent or `.trash` is empty.
-    MeshFsTrashList {
-        /// Mount path of the LizardFS client (must be mounted).
-        /// Defaults to the resolved QNM-Shared mount (`~/QNM-Shared`).
-        #[clap(long)]
-        mount_path: Option<String>,
-    },
-
-    /// MESHFS-8.1 (v5.0.0) — restore one file from the LizardFS trash
-    /// by invoking `mfsadmin <vip> TRASH-RECOVER <path>`. `--path` is
-    /// the full trash entry path (as emitted by `meshfs-trash-list`).
-    /// Exits 0 on success, 1 on failure.
-    MeshFsUndelete {
-        /// Full path of the `.trash` entry to recover.
-        #[clap(long)]
-        path: String,
-        /// Floating overlay VIP the active master listens on.
-        #[clap(long, default_value = "10.42.0.1")]
-        vip: String,
-        /// `mfsadmin` binary name (must be on PATH).
-        #[clap(long, default_value = "mfsadmin")]
-        admin_binary: String,
-    },
-
-    /// MESHFS-11.1 (v5.0.0) — archive a `.conflict-*` file to
-    /// `~/Local/conflict-archive/<ts>/`, completing the Resolve flow
-    /// in mde-files. The mde-files UI calls this with either the
-    /// original or the conflict sibling, depending on which the
-    /// operator chose to discard.
-    MeshFsResolveConflict {
-        /// Full path of the conflict file to archive (the loser).
-        #[clap(long)]
-        path: String,
-    },
-
-    /// MESHFS-14.1 (v5.0.0) — restore the Nebula CA + (when
-    /// present) the LizardFS mesh-storage snapshot from an
-    /// armored `state-backup.enc` bundle. CA rows go straight
-    /// into the local SQLite store via
-    /// `ca::backup::restore_to_store`; the optional LizardFS
-    /// artifacts land at `<recovery-dir>/` for the operator
-    /// to apply with `mfsmaster --import-metadata`. Automatic
-    /// volume replay is intentionally out of scope — replaying
-    /// a metadata dump against a live cluster requires careful
-    /// peer-by-peer reconciliation that's an operator-driven
-    /// step, not a silent CLI action.
+    /// EFF-28 / MESHFS-14.1 — restore the Nebula CA from an armored
+    /// `state-backup.enc` bundle. CA rows go straight into the local
+    /// SQLite store via `ca::backup::restore_to_store`.
     StateRestore {
         /// Path to the armored `state-backup.enc` bundle.
         bundle: std::path::PathBuf,
         /// EFF-28 — dry-run: decode + unseal + report the bundle's
-        /// contents WITHOUT touching the store or writing recovery
-        /// artifacts. Exit 0 = the bundle is restorable with this
-        /// passphrase. Use in DR drills + before a real restore.
+        /// contents WITHOUT touching the store. Exit 0 = the bundle is
+        /// restorable with this passphrase. Use in DR drills + before a
+        /// real restore.
         #[clap(long)]
         verify: bool,
         /// Passphrase env-var. Defaults to
@@ -381,11 +301,6 @@ enum Cmd {
         /// worker's env).
         #[clap(long, default_value = "MDE_BACKUP_PASSPHRASE")]
         passphrase_env: String,
-        /// Directory to write the LizardFS recovery artifacts
-        /// for the operator-side manual replay. Created if
-        /// missing. Default `/var/lib/mackesd/restore/meshfs`.
-        #[clap(long, default_value = "/var/lib/mackesd/restore/meshfs")]
-        recovery_dir: std::path::PathBuf,
     },
 
     /// Generate a fresh 16-char URL-safe passcode (Phase 12.10.1).
@@ -874,8 +789,8 @@ enum Cmd {
     /// node serves itself from (W62), and the last-sync freshness (W63).
     /// The Provisioning ▸ Mirrors panel consumes the JSON. `--sync <name>`
     /// (or `--sync-all`) runs the W63 one-puller: `dnf reposync` the
-    /// upstream into the LizardFS mirror dir, `createrepo_c` the metadata,
-    /// then stamp `.last-sync` (LizardFS replicates it to every node).
+    /// upstream into the mirror dir on the share, `createrepo_c` the metadata,
+    /// then stamp `.last-sync` (Syncthing replicates it to every node).
     Mirrors {
         /// Emit the JSON array instead of the table.
         #[arg(long)]
@@ -897,7 +812,7 @@ enum Cmd {
 
     /// PLANES-22 — the image catalog. `mded images --json` emits the
     /// four buildable kinds (ISO / VM / container / USB, W53) each with
-    /// the versioned builds present on LizardFS (W55). The Provisioning
+    /// the versioned builds present on the share (W55). The Provisioning
     /// ▸ Images panel consumes the JSON. `--record --name --kind --version`
     /// registers a completed build's manifest (W55 — the write side a
     /// build job calls when its output lands). `--build --kind --name
@@ -2256,13 +2171,8 @@ fn main() -> anyhow::Result<()> {
             bundle,
             verify,
             passphrase_env,
-            recovery_dir,
         } => {
-            // MESHFS-14.1 — bundle decode + CA restore + LizardFS
-            // metadata extraction. We deliberately do NOT replay
-            // the LizardFS volume config automatically; operator
-            // runs `mfsmaster --import-metadata` against the
-            // extracted dump.
+            // EFF-28 / MESHFS-14.1 — bundle decode + CA restore.
             let passphrase = std::env::var(&passphrase_env).with_context(|| {
                 format!(
                     "passphrase env-var {passphrase_env} unset — \
@@ -2280,16 +2190,11 @@ fn main() -> anyhow::Result<()> {
             if verify {
                 eprintln!(
                     "[state-restore --verify] bundle OK: mesh '{}' · exported_at unix:{} · \
-                     {} CA cert(s) · {} peer cert(s) · meshfs snapshot: {}",
+                     {} CA cert(s) · {} peer cert(s)",
                     plaintext.mesh_id,
                     plaintext.exported_at,
                     plaintext.ca_certs.len(),
                     plaintext.peer_certs.len(),
-                    if plaintext.meshfs_snapshot.is_some() {
-                        "present"
-                    } else {
-                        "absent"
-                    },
                 );
                 eprintln!(
                     "[state-restore --verify] dry-run complete — nothing was written. \
@@ -2307,145 +2212,6 @@ fn main() -> anyhow::Result<()> {
                 ca_n = plaintext.ca_certs.len(),
                 peer_n = plaintext.peer_certs.len(),
             );
-
-            // MESHFS-14.1 — extract LizardFS snapshot if present.
-            match plaintext.meshfs_snapshot.as_ref() {
-                None => {
-                    eprintln!(
-                        "[state-restore] bundle has no meshfs snapshot (CA-only, pre-MESHFS, or Gluster-only bundle) — skipping LizardFS step",
-                    );
-                }
-                Some(snap) => {
-                    std::fs::create_dir_all(&recovery_dir)
-                        .with_context(|| format!("mkdir {}", recovery_dir.display()))?;
-                    let mut wrote = 0usize;
-                    // Write metadata dump for `mfsmaster --import-metadata`.
-                    if let Some(dump) = snap.metadata_dump.as_deref() {
-                        let path = recovery_dir.join("metadata.mfs.dump");
-                        std::fs::write(&path, dump)
-                            .with_context(|| format!("writing {}", path.display()))?;
-                        wrote += 1;
-                        eprintln!(
-                            "[state-restore] meshfs: wrote {} ({} bytes)",
-                            path.display(),
-                            dump.len(),
-                        );
-                    }
-                    // Write exports config for re-application.
-                    if let Some(cfg) = snap.exports_config.as_deref() {
-                        let path = recovery_dir.join("mfsexports.cfg");
-                        std::fs::write(&path, cfg)
-                            .with_context(|| format!("writing {}", path.display()))?;
-                        wrote += 1;
-                        eprintln!(
-                            "[state-restore] meshfs: wrote {} ({} bytes)",
-                            path.display(),
-                            cfg.len(),
-                        );
-                    }
-                    // Write CS list for topology reference.
-                    if let Some(cs) = snap.cs_list.as_deref() {
-                        let path = recovery_dir.join("cs-list.txt");
-                        std::fs::write(&path, cs)
-                            .with_context(|| format!("writing {}", path.display()))?;
-                        wrote += 1;
-                        eprintln!(
-                            "[state-restore] meshfs: wrote {} ({} bytes)",
-                            path.display(),
-                            cs.len(),
-                        );
-                    }
-                    if wrote == 0 {
-                        eprintln!(
-                            "[state-restore] meshfs snapshot present but every section was empty — nothing to apply",
-                        );
-                    } else {
-                        let goal_hint = snap.goal.map_or_else(
-                            || "N (re-count enrolled peers)".to_owned(),
-                            |g| g.to_string(),
-                        );
-                        eprintln!(
-                            "[state-restore] meshfs: {wrote} file(s) at {dir}; restore steps:\n\
-                             1. cp {dir}/mfsexports.cfg /etc/mfs/mfsexports.cfg\n\
-                             2. mfsmaster --import-metadata {dir}/metadata.mfs.dump\n\
-                             3. mfsmaster start  # starts the active master\n\
-                             4. mfssetgoal -r {goal_hint} /mnt/mesh-storage\n\
-                             (see docs/help/mesh-recovery.md)",
-                            dir = recovery_dir.display(),
-                        );
-                    }
-                }
-            }
-        }
-        Cmd::PreflightMeshFsHeadroom { data_dir, home } => {
-            // MESHFS-1.2 — pre-flight headroom check for the
-            // LizardFS mesh-storage rollout. Mirrors the gluster
-            // headroom CLI; operator runs this before upgrading
-            // to v5.0.0 or before mesh-storage bootstrap.
-            let home_dir = home
-                .clone()
-                .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
-                .context("no HOME env var; pass --home <dir>")?;
-            let xdg = mackesd_core::meshfs::headroom::default_xdg_dirs(&home_dir);
-            let report = mackesd_core::meshfs::headroom::check(&data_dir, &xdg);
-            eprintln!("{}", report.summary());
-            println!(
-                "{}",
-                serde_json::to_string(&report).context("encode report")?
-            );
-            match report.verdict {
-                mackesd_core::meshfs::headroom::Verdict::Ok => {}
-                mackesd_core::meshfs::headroom::Verdict::Warn
-                | mackesd_core::meshfs::headroom::Verdict::NoDataDir => std::process::exit(1),
-            }
-        }
-        Cmd::MeshFsStatus { vip, admin_binary } => {
-            let report =
-                mackesd_core::workers::meshfs_worker::meshfs_status_report(&admin_binary, &vip);
-            let reachable = report.master_reachable;
-            println!(
-                "{}",
-                serde_json::to_string(&report).context("encode meshfs status")?
-            );
-            if !reachable {
-                std::process::exit(1);
-            }
-        }
-        Cmd::MeshFsTrashList { mount_path } => {
-            let mount_path = mount_path.unwrap_or_else(|| {
-                mackesd_core::default_qnm_shared_root()
-                    .to_string_lossy()
-                    .into_owned()
-            });
-            let entries = mackesd_core::workers::meshfs_worker::list_trash_entries(&mount_path);
-            println!(
-                "{}",
-                serde_json::to_string(&entries).context("encode trash list")?
-            );
-        }
-        Cmd::MeshFsUndelete {
-            vip,
-            path,
-            admin_binary,
-        } => {
-            let argv = vec![
-                admin_binary.clone(),
-                vip.clone(),
-                "TRASH-RECOVER".to_owned(),
-                path.clone(),
-            ];
-            let ok = std::process::Command::new(&argv[0])
-                .args(&argv[1..])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if !ok {
-                anyhow::bail!("TRASH-RECOVER failed for {path}");
-            }
-        }
-        Cmd::MeshFsResolveConflict { path } => {
-            mackesd_core::workers::meshfs_worker::resolve_conflict_to_archive(&path)
-                .map_err(|e| anyhow::anyhow!("resolve-conflict failed: {e}"))?;
         }
         Cmd::GeneratePasscode { store, cred_path } => {
             let code = mackesd_core::passcode::generate();
@@ -4373,7 +4139,7 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             // W63 — the one-puller sync path. `--sync <name>` / `--sync-all`
-            // reposync the upstream into the LizardFS mirror dir, createrepo_c
+            // reposync the upstream into the mirror dir on the share, createrepo_c
             // the metadata, then stamp `.last-sync`.
             if sync.is_some() || sync_all {
                 let now_ms = std::time::SystemTime::now()
@@ -4453,7 +4219,7 @@ fn main() -> anyhow::Result<()> {
             profile,
         } => {
             // PLANES-22 — the four buildable kinds, each with its
-            // versioned builds present on LizardFS (W53/W55).
+            // versioned builds present on the Syncthing share (W53/W55).
             use mackesd_core::image_catalog::{self, ImageKind};
             let root = mackesd_core::default_qnm_shared_root();
             // W54 — build the artifact now (then record it). Runs the real
@@ -5196,23 +4962,23 @@ fn run_serve(
     let workgroup_root = workgroup_root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
     let node_id = node_id.unwrap_or_else(default_node_id);
 
-    // BIRTHRIGHT-1 — fail-loud shared-state assertion. On a deployed node the
-    // workgroup root is the LizardFS FUSE mount at /mnt/mesh-storage; if it's
-    // that canonical path but NOT actually mounted, the §1 shared-state plane
-    // is DOWN (leader election, the peer directory, fleet rollups, and the CA
-    // all silently no-op against a bare local dir — the ONBOARD-6 failure
-    // class). Surface it LOUDLY at startup rather than degrading in silence.
-    // Not fatal: the daemon still runs the overlay, and the mesh-health
-    // watchdog restarts qnm-shared.service to recover the mount.
+    // SUBSTRATE-V2 — fail-loud shared-state assertion. On a deployed node the
+    // workgroup root is the plain Syncthing directory at /mnt/mesh-storage; if
+    // it's that canonical path but the directory is absent, the §1 file plane is
+    // DOWN (the peer directory, fleet rollups, and the CA backup all silently
+    // no-op against a missing dir). Surface it LOUDLY at startup rather than
+    // degrading in silence. Not fatal: the daemon still runs the overlay and
+    // coordinates over etcd; Syncthing provisions the dir on first sync.
     if workgroup_root == std::path::Path::new("/mnt/mesh-storage")
-        && !mackesd_core::workers::compute_registry::is_meshfs_mounted(&workgroup_root)
+        && !mackesd_core::shared_root_writable(&workgroup_root)
     {
         tracing::error!(
             target: "mackesd",
             path = %workgroup_root.display(),
-            "QNM-Shared is NOT mounted — the shared-state plane is DOWN; leader/directory/\
-             fleet will not work mesh-wide. Provision it: `mackesd found`/`join` auto-runs \
-             setup-qnm-shared, or run `/usr/libexec/mackesd/setup-qnm-shared --client` by hand."
+            "shared-state directory /mnt/mesh-storage is missing — the file plane is DOWN; \
+             the peer directory + CA backup will not federate mesh-wide. Provision it: \
+             `mackesd found`/`join` auto-runs setup-syncthing, or run \
+             `/usr/libexec/mackesd/setup-syncthing` by hand."
         );
     }
 
@@ -5380,7 +5146,7 @@ fn run_serve(
         // RETIRE-PY.4 (2026-06-07) — the GVFS `fs_sync` worker (supervised
         // `python3 -m mackes.mesh_gvfs.daemon`, a retired Python MDE module
         // absent in the monorepo) is removed. Mesh storage is served by
-        // LizardFS (E3); per-peer share access is via the Bus file-ops, so
+        // Syncthing (E3); per-peer share access is via the Bus file-ops, so
         // the second FUSE substrate is retired rather than rebuilt.
         if mackesd_core::worker_role::runs("heartbeat", role_rank) {
             sup.spawn(Spawn::new(
@@ -5545,7 +5311,7 @@ fn run_serve(
         // SVC-2 (Q60) — SSH pubkey gossip: publish this box's user
         // ed25519 pubkey into <root>/ssh-keys/ and merge every peer's
         // published key into ~/.ssh/authorized_keys (managed block,
-        // write-on-change). LizardFS replication is the transport.
+        // write-on-change). Syncthing replication is the transport.
         // PD-11 — the lifecycle executor: descriptor-gated container/VM
         // start/stop requests from peers, via replicated request files.
         if mackesd_core::worker_role::runs("lifecycle_exec", role_rank) {
@@ -5955,35 +5721,6 @@ fn run_serve(
             .lock()
             .expect("worker_names mutex")
             .push("alert_relay".into());
-
-        // MESHFS-2.1 (v5.0.0) — LizardFS mesh-storage fleet supervisor.
-        // Silent no-op when mfsmaster/mfschunkserver binaries are absent.
-        //
-        // SUBSTRATE-V2 gate: ONLY spawn this on LEGACY (pre-cutover, non-etcd)
-        // nodes. On SUBSTRATE-V2 nodes (etcd coordination + Syncthing files,
-        // LizardFS retired) the supervisor re-runs `mfschunkserver`/`mfssetgoal`
-        // every ~5s; with no LizardFS master each invocation fails, churning
-        // mackesd hard enough to starve the 60s systemd watchdog → SIGABRT
-        // crash-loop (diagnosed live 2026-06-25; the stopgap was renaming the
-        // LizardFS binaries). The etcd endpoints file existing marks an
-        // etcd/Syncthing node — the same `on_etcd` test used by
-        // `mackesd_core::shared_root_writable`.
-        let on_etcd = !mackesd_core::substrate::etcd::default_endpoints().is_empty();
-        if spawn_meshfs_worker(on_etcd) {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::meshfs_worker::MeshFsWorker::new()
-                    .with_qnm_peer_discovery(workgroup_root.clone(), node_id.clone()),
-                RestartPolicy::Always,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("meshfs_worker".into());
-        } else {
-            tracing::info!(
-                "meshfs_worker skipped — node on the etcd/Syncthing substrate (SUBSTRATE-V2)"
-            );
-        }
 
         // INST-11 + INST-12 + INST-13 (v2.7) — fleet upgrade-barrier
         // worker. Runs on every peer; silently no-ops until a
@@ -6553,7 +6290,7 @@ fn run_serve(
 
         // PLANES-24 W63 — scheduled one-puller mirror sync. Every node writes
         // its dnf .repo to self-serve from the local file:// mount (W62); the
-        // leader additionally pulls upstream + indexes, LizardFS replicating
+        // leader additionally pulls upstream + indexes, Syncthing replicating
         // the result. No DB handle needed — it works off the replicated root.
         sup.spawn(Spawn::new(
             mackesd_core::workers::mirror_syncd::MirrorSyncd::new(workgroup_root.clone()),
@@ -6612,7 +6349,7 @@ fn run_serve(
                     mackesd_core::workers::nebula_https_listener::DEFAULT_KEY_PATH.to_string()
                 });
                 let relay_eligible = std::path::Path::new(
-                    mackesd_core::workers::meshfs_worker::DEFAULT_ROLE_MARKER_PATH,
+                    mackesd_core::ipc::nebula::DEFAULT_ROLE_HOST_MARKER,
                 )
                 .exists()
                     || matches!(mde_role::load(), Ok(mde_role::Role::Lighthouse));
@@ -7014,7 +6751,7 @@ fn run_serve(
         // E0.3.3 / FPG-4 — Fleet control surface (push/list/diff/
         // rollback/nudge) on the mesh Bus at action/fleet/<verb>,
         // replacing the retired dev.mackes.MDE.Fleet D-Bus interface.
-        // The verbs are REAL (FPG-4): they run against the LizardFS
+        // The verbs are REAL (FPG-4): they run against the Syncthing-replicated
         // revision log via magic-fleet; any node serves + mints
         // (leaderless, FPG-3). Own OS thread (Persist/rusqlite isn't
         // Send); no tokio runtime (the responders are sync).
@@ -7023,8 +6760,8 @@ fn run_serve(
             .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
         {
             Ok(persist) => {
-                // FPG-4 — the verbs run against the LizardFS revision
-                // log; any node serves + mints (leaderless, FPG-3).
+                // FPG-4 — the verbs run against the Syncthing-replicated
+                // revision log; any node serves + mints (leaderless, FPG-3).
                 let fleet_svc = mackesd_core::ipc::fleet::FleetService::new(
                     &workgroup_root,
                     node_id.clone(),
@@ -7041,7 +6778,7 @@ fn run_serve(
                         tracing::info!(
                             "Fleet Bus responder spawned; serving \
                              action/fleet/{{push-revision,list-revisions,diff-revisions,rollback}} \
-                             (FPG-4, LizardFS revision log)"
+                             (FPG-4, Syncthing-replicated revision log)"
                         );
                     })
                     .unwrap_or_else(|e| {
@@ -7627,7 +7364,7 @@ fn run_serve(
             Ok(persist) => {
                 use mackesd_core::ipc::files;
                 // AUD-1/AUD-7 — the real cross-mesh transport over the
-                // LizardFS-replicated QNM-Shared volume. One `FileXfer` per
+                // Syncthing-replicated QNM-Shared volume. One `FileXfer` per
                 // surface (cheap: just a root path + host id) backs inbox /
                 // outbox / file-ops with genuine copy/list/rollback.
                 // EFF-2 — `FileXfer::new` confines send-to sources to the
@@ -8401,13 +8138,6 @@ fn cmd_found(
     // down until the supervisor happened to revive it (ONBOARD-9).
     enable_now_service("nebula.service");
 
-    // BIRTHRIGHT-1 — the founding lighthouse provisions LizardFS (master +
-    // chunkserver + client) and mounts QNM-Shared BEFORE mackesd starts, so the
-    // daemon comes up against a real shared-state plane (leader/directory/fleet
-    // all assume it mounted). The founder is the master, bound on its own
-    // overlay IP. Best-effort: a miss logs loudly, the overlay still comes up.
-    provision_qnm_shared(parsed, true, &report.overlay_ip, &report.overlay_ip);
-
     // CONNECT-4 — the founding lighthouse is an ingress node: stand up Caddy.
     provision_caddy_if_lighthouse(parsed);
 
@@ -8527,17 +8257,6 @@ fn cmd_join(
     // operator must `systemctl restart mackesd` by hand.
     enable_now_service("nebula.service");
 
-    // BIRTHRIGHT-1 — a joining peer provisions LizardFS for its role (client,
-    // +chunkserver on Server/Lighthouse) and mounts QNM-Shared against the
-    // floating master VIP BEFORE mackesd starts, so the node has shared state
-    // from the first boot — no manual setup-qnm-shared. Best-effort.
-    provision_qnm_shared(
-        parsed,
-        false,
-        mackesd_core::workers::meshfs_worker::DEFAULT_VIP,
-        &bundle.overlay_ip,
-    );
-
     // CONNECT-4 — if this peer joined as a Lighthouse, it's an ingress node too.
     provision_caddy_if_lighthouse(parsed);
 
@@ -8578,83 +8297,6 @@ fn cmd_join(
     );
     println!("services: nebula + mackesd + mesh-health enabled (boot-durable) and running");
     Ok(())
-}
-
-/// BIRTHRIGHT-1 — install LizardFS + stand up QNM-Shared (the §1 shared-state
-/// plane) for this role at enroll time, so a fresh `found`/`join` yields a
-/// working mesh with NO manual `setup-qnm-shared` step.
-///
-/// `is_founder` is true only for `mackesd found` — the founding lighthouse runs
-/// the master; everyone else (incl. a second lighthouse) is chunkserver/client.
-/// `master_ip` is the master's overlay address (the founder's own overlay IP on
-/// `found`; the floating VIP on `join`). `listen_ip` is this node's overlay IP.
-///
-/// Best-effort + idempotent: a failure logs loudly but NEVER aborts the enroll
-/// (the node still joins the overlay; the daemon's startup mount-assert + the
-/// mesh-health watchdog surface a degraded plane). Mirrors the provisioning
-/// ladder in `mesh-install-lizardfs` (dnf → bundled fc43 RPMs → fetch → warn).
-/// SUBSTRATE-V2 gate — should the legacy `LizardFS` `meshfs_worker` supervisor
-/// be spawned on this node? Pure (no I/O) so the policy is unit-tested; the
-/// caller derives `on_etcd` from the etcd endpoints file. Only LEGACY
-/// (pre-cutover, non-etcd) nodes run the supervisor; on SUBSTRATE-V2 nodes (etcd
-/// coordination + Syncthing files, `LizardFS` retired) spawning it crash-loops
-/// mackesd via the systemd watchdog.
-#[must_use]
-const fn spawn_meshfs_worker(on_etcd: bool) -> bool {
-    !on_etcd
-}
-
-/// BIRTHRIGHT-1 — the `setup-qnm-shared` role flags for a node. Pure (no I/O)
-/// so the role→flags policy is unit-tested. Master only on the founding
-/// lighthouse; chunkserver on the founder + every Lighthouse/Server (storage
-/// tier); client on every node (all nodes mount the volume).
-fn qnm_setup_flags(role: mde_role::Role, is_founder: bool) -> Vec<&'static str> {
-    use mde_role::Role;
-    let mut flags = Vec::new();
-    if is_founder {
-        flags.push("--master");
-    }
-    if is_founder || role == Role::Lighthouse || role == Role::Server {
-        flags.push("--chunkserver");
-    }
-    flags.push("--client");
-    flags
-}
-
-fn provision_qnm_shared(role: mde_role::Role, is_founder: bool, master_ip: &str, listen_ip: &str) {
-    // 1. Binaries (role-aware; the script is non-fatal on a miss).
-    let install = std::process::Command::new("/usr/libexec/mackesd/mesh-install-lizardfs")
-        .arg(role.as_str())
-        .status();
-    if let Err(e) = &install {
-        eprintln!("provision: mesh-install-lizardfs not run ({e}) — QNM-Shared may be degraded");
-    }
-
-    // 2. setup-qnm-shared role flags.
-    let flags = qnm_setup_flags(role, is_founder);
-
-    let mut cmd = std::process::Command::new("/usr/libexec/mackesd/setup-qnm-shared");
-    cmd.args(&flags)
-        .arg("--master-ip")
-        .arg(master_ip)
-        .arg("--listen")
-        .arg(listen_ip);
-    println!(
-        "QNM-Shared: provisioning [{}] master-ip {master_ip} listen {listen_ip}",
-        flags.join(" ")
-    );
-    match cmd.status() {
-        Ok(s) if s.success() => println!("QNM-Shared: provisioned (shared-state plane up)"),
-        Ok(s) => eprintln!(
-            "provision: setup-qnm-shared exited {:?} — shared-state plane may be DOWN; \
-             check `systemctl status qnm-shared.service`",
-            s.code()
-        ),
-        Err(e) => eprintln!(
-            "provision: setup-qnm-shared not run ({e}) — is the RPM installed? \
-             shared-state plane is DOWN until provisioned"
-        ),
-    }
 }
 
 /// CONNECT-4 — on a Lighthouse (the public ingress role) install + wire Caddy so
@@ -8794,63 +8436,4 @@ fn install_signal_handlers(
         })
         .context("spawning signal-reader thread")?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{qnm_setup_flags, spawn_meshfs_worker};
-    use mde_role::Role;
-
-    #[test]
-    fn meshfs_worker_gated_off_on_etcd_substrate() {
-        // SUBSTRATE-V2: an etcd/Syncthing node (endpoints file present ⇒
-        // on_etcd) must NOT spawn the legacy LizardFS supervisor — doing so
-        // crash-loops mackesd via the systemd watchdog.
-        assert!(!spawn_meshfs_worker(true));
-        // Legacy (pre-cutover, non-etcd) nodes still run the supervisor.
-        assert!(spawn_meshfs_worker(false));
-    }
-
-    #[test]
-    fn founding_lighthouse_runs_master_chunkserver_client() {
-        // BIRTHRIGHT-1: the founder is the only --master.
-        let f = qnm_setup_flags(Role::Lighthouse, true);
-        assert_eq!(f, vec!["--master", "--chunkserver", "--client"]);
-    }
-
-    #[test]
-    fn joining_lighthouse_and_server_are_chunkserver_client_not_master() {
-        // A second lighthouse / a server store chunks but never run a 2nd master.
-        for role in [Role::Lighthouse, Role::Server] {
-            let f = qnm_setup_flags(role, false);
-            assert!(
-                !f.contains(&"--master"),
-                "{role:?} must not run a master on join"
-            );
-            assert_eq!(f, vec!["--chunkserver", "--client"]);
-        }
-    }
-
-    #[test]
-    fn joining_workstation_is_client_only() {
-        // A workstation only mounts the volume — no storage, no master.
-        let f = qnm_setup_flags(Role::Workstation, false);
-        assert_eq!(f, vec!["--client"]);
-    }
-
-    #[test]
-    fn every_role_mounts_the_volume() {
-        // --client (the mount) is universal; without it the node has no QNM-Shared.
-        for (role, founder) in [
-            (Role::Lighthouse, true),
-            (Role::Lighthouse, false),
-            (Role::Server, false),
-            (Role::Workstation, false),
-        ] {
-            assert!(
-                qnm_setup_flags(role, founder).contains(&"--client"),
-                "{role:?} (founder={founder}) must mount QNM-Shared"
-            );
-        }
-    }
 }

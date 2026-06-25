@@ -55,14 +55,11 @@ pub const TICK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Default backup filename under `QNM-Shared/<self>/mackesd/`.
 ///
 /// GF-9.1 (v5.0.0) — renamed from the legacy `ca-backup.enc`.
-/// The file now carries both the Nebula CA payload (NF-18.1)
-/// and the optional storage topology snapshot (GF-9.2-era field,
-/// LizardFS since E3 — the payload key keeps its wire name), so
-/// the broader name reflects what's inside. Operators who
-/// upgrade from v4.x will see the old `ca-backup.enc` sit
-/// untouched alongside the new `state-backup.enc` — manual
-/// cleanup is safe (just `rm` it; the next worker tick re-
-/// writes the new path).
+/// The file carries the Nebula CA payload (NF-18.1); the broader
+/// name is retained for the upgrade path. Operators who upgrade
+/// from v4.x will see the old `ca-backup.enc` sit untouched
+/// alongside the new `state-backup.enc` — manual cleanup is safe
+/// (just `rm` it; the next worker tick re-writes the new path).
 pub const BACKUP_FILENAME: &str = "state-backup.enc";
 
 /// Legacy filename retired by GF-9.1. Kept as a documented
@@ -286,9 +283,8 @@ impl NebulaCaBackup {
             .map_err(|e| BackupTickError::CaKeyMissing(format!("not UTF-8: {e}")))?;
         // Lock store + assemble bundle.
         let conn = self.store.lock().await;
-        let mut plaintext =
-            crate::ca::backup::assemble_from_store(&conn, &self.mesh_id, &ca_key_pem)
-                .map_err(|e| BackupTickError::Assemble(e.to_string()))?;
+        let plaintext = crate::ca::backup::assemble_from_store(&conn, &self.mesh_id, &ca_key_pem)
+            .map_err(|e| BackupTickError::Assemble(e.to_string()))?;
         // Empty mesh (no CA rows) → skip rather than write an
         // empty backup. Avoids confusing operators who might
         // think an empty backup means the CA was wiped.
@@ -298,16 +294,6 @@ impl NebulaCaBackup {
         // Drop the lock before doing CPU-bound Argon2 work — let
         // the rest of the daemon proceed.
         drop(conn);
-        // MESHFS-14.1 — fold a LizardFS snapshot into the bundle.
-        // Returns None when mfsmetadump + mfsadmin are both absent.
-        // Bumps schema_version to 3 so the restore CLI knows to
-        // apply the meshfs step.
-        let meshfs_snap =
-            crate::meshfs::snapshot::collect(&crate::meshfs::snapshot::SnapshotConfig::default());
-        if meshfs_snap.is_some() {
-            plaintext.schema_version = 3;
-            plaintext.meshfs_snapshot = meshfs_snap;
-        }
         let sealed = crate::ca::backup::seal(passphrase, &plaintext)
             .map_err(|e| BackupTickError::Seal(e.to_string()))?;
         let armored = crate::ca::backup::armor(&sealed, plaintext.exported_at);

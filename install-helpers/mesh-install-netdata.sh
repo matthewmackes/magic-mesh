@@ -21,8 +21,8 @@ if [ -x "$OPT_BIN" ]; then
 else
   # NETDATA-1 SAFETY GATE (2026-06-17): the 181 MB static build extracts to
   # hundreds of MB + runs an installer; on a low-RAM node (≤~2.5 GB droplet/VM)
-  # this OOM-thrashes the box — it once wedged a lighthouse's LizardFS master and
-  # cascaded a mesh-wide QNM-Shared outage. Skip the install on low-RAM hosts; the
+  # this OOM-thrashes the box (it once cascaded a mesh-wide outage on the old
+  # shared-storage plane). Skip the install on low-RAM hosts; the
   # live-metrics map degrades gracefully (that peer just has no :19999). Override
   # with MDE_NETDATA_FORCE=1. Workstations (the surfaces that read the map) have
   # the headroom; tiny headless droplets don't need to self-monitor via netdata.

@@ -12,7 +12,7 @@
 FROM fedora:42
 RUN dnf install -y --setopt=install_weak_deps=False nebula iproute iputils nfs-utils \
     && dnf clean all
-# A predictable workdir for the bind-mounted mackesd binary + QNM-Shared mount.
+# A predictable workdir for the bind-mounted mackesd binary + shared dir.
 RUN mkdir -p /qnm /opt/mackes
 ENV PATH="/opt/mackes:${PATH}"
 # nebula + mackesd are driven explicitly by the test via `podman exec`; idle by

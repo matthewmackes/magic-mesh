@@ -1,4 +1,4 @@
-//! FPG-2 — the LizardFS revision log.
+//! FPG-2 — the Syncthing-replicated revision log.
 //!
 //! Revisions live as individual YAML files in
 //! `<workgroup-root>/fleet/revisions/<version>.yaml` on the

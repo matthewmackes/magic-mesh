@@ -12,7 +12,7 @@ go for help.
 | Roles | Lighthouse, Server, Workstation | One signed RPM; chosen at install (`meshctl install --role <r>`). |
 | OS | Fedora (Cosmic spin) | The Magic-on-Cosmic ISO + the GitHub-hosted RPM (Releases asset / GitHub Pages dnf repo) are the supported install paths. |
 | Transport | Nebula overlay only | No unencrypted fallback; underlay stays firewalled. |
-| Storage | LizardFS replicated volume | Backups remain the operator's responsibility. |
+| Storage | Syncthing replicated volume | Backups remain the operator's responsibility. |
 | Desktop | Cosmic | The GUI is strictly IBM Carbon (Gray 10/90/100). |
 | Language | **en-US only** | All GUIs, CLI output, logs, and docs are English. Localization is deliberately out of envelope for a ≤8-peer workgroup product (EFF-49); revisit only if the envelope ever widens. |
 

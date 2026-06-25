@@ -4,9 +4,18 @@
 **Trigger:** Operator — "Hero Focus on Lighthouses throughout the system. ALWAYS use Carbon. New Feature: add, at the bottom of the Notifications Hub, an area focused on lighthouse health. Each lighthouse a square icon, animated like a lighthouse (circling beam), Carbon Green = healthy, Red = unhealthy. Clicking takes the operator to a dedicated 'Lighthouses' tab under Mesh in the Workbench."
 
 The lighthouses are the relay/anchor nodes of the Nebula overlay (today: the
-two DigitalOcean nodes — `45.55.33.179` master, `159.65.183.51` shadow). This
+two DigitalOcean nodes — `45.55.33.179`, `159.65.183.51`). This
 epic gives them a first-class, animated presence in the desktop and a dedicated
 operations tab.
+
+> **Note (post-SUBSTRATE-6):** this design predates the substrate split and treats
+> the lighthouse "master/shadow" as the **`lizardfs-master`** SPOF + a promotable
+> shadow. **LizardFS is removed.** A lighthouse's "core service" health is now
+> **nebula up + its etcd member healthy** (coordination quorum), and files sync via
+> Syncthing with no master. Read the `lizardfs-master` health-input + the
+> master/shadow badge / "promote shadow → master" action below as their etcd
+> equivalents (etcd quorum / leadership-lease holder); there is no LizardFS master
+> to promote.
 
 ## Locked decisions
 
@@ -14,7 +23,7 @@ operations tab.
 |---|----------|------|
 | 1 | Identify lighthouses | **Directory descriptor role** — the `role` field in each peer's QNM-Shared directory JSON (`role == lighthouse`). Fleet-consistent, already replicated. |
 | 2 | Health data source | **`mesh-status.json` snapshot** — reuse the existing replicated presence + service-health snapshot (≈30 s); no new probes. |
-| 3 | Unhealthy (red) condition | **Offline OR a core lighthouse service down** (nebula / lizardfs-master). Catches the SPOF, not just presence. |
+| 3 | Unhealthy (red) condition | **Offline OR a core lighthouse service down** (nebula / etcd member health — was `lizardfs-master` pre-SUBSTRATE-6). Catches the coordination SPOF, not just presence. |
 | 4 | Hero scope (where else) | **Broad** — Hub section + Workbench tab + bash welcome Network Overview + a panel applet/indicator + reuse the PLANES hero line-art + **wallpaper**. (Hub + tab are this epic's core; the others are follow-on hero surfaces, see §Hero-scope.) |
 | 5 | Hub placement | **Pinned footer** — always visible at the Hub bottom, below Music/SIP, like the Music playback bar. |
 | 6 | Square layout | **Square + detail per item** (beacon left, name/IP/status). |
@@ -33,7 +42,7 @@ operations tab.
 | 19 | Click target | **Whole row** opens the tab. |
 | 20 | Per-lighthouse focus | **Open the tab, focus/scroll to the clicked lighthouse** (others still listed). |
 | 21 | Tab content | **Full card** — overlay + public IP, handshake state, peers-connected count, uptime, CA/cert expiry, role, core service status. |
-| 22 | Master/shadow | **Yes — master/shadow badge + failover-readiness** (is the shadow ready to take over the lizardfs-master SPOF). |
+| 22 | Master/shadow | **Yes — leader/follower badge + failover-readiness** (which anchor holds the etcd leadership lease + is quorum healthy — was the `lizardfs-master` SPOF pre-SUBSTRATE-6). |
 | 23 | Tab actions | **Full ops** — restart services, open SSH/remote, promote-shadow-to-master; **each confirmed** before acting. |
 | 24 | Tab refresh | **Bus subscription (push)** — update in real time as health records land. |
 | 25 | Tab hero | **Hero line-art band + a row of animated beacons** across the top, summarizing fleet lighthouse health. |
@@ -48,8 +57,8 @@ operations tab.
   shell already consume:
   - lighthouse set = directory descriptors where `role == lighthouse`;
   - per-lighthouse health = the `mesh-status.json`/snapshot presence + service
-    flags → green iff online AND nebula up AND (for master) lizardfs-master up;
-    else red.
+    flags → green iff online AND nebula up AND (for an anchor) its etcd member is
+    quorum-healthy (was `lizardfs-master` up pre-SUBSTRATE-6); else red.
   - A pure `fn lighthouse_health(node) -> Beacon{healthy: bool, ...}` so it is
     unit-testable and shared by the Hub footer, the applet, and the tab.
 
@@ -111,8 +120,9 @@ carried as their own tasks so the core can ship first:
   test, not a raw literal in the applet/panel.
 - **Animation cost** on the low-RAM shadow lighthouse (~948 MB): the discrete
   stepped model + "pause when hidden" keeps it cheap; verify on that node.
-- **promote-shadow-to-master** is destructive (lizardfs-master failover) — must
-  be confirm-gated and ideally idempotent/guarded; treat as the riskiest action.
+- **promote-shadow-to-master** was destructive (`lizardfs-master` failover) — with
+  LizardFS removed (SUBSTRATE-6), the analogue is moving the etcd leadership lease /
+  reseating an anchor; still confirm-gate it and treat as the riskiest action.
 - **"Strictly binary" + no-data→red** can flash red on a stale snapshot at
   startup; mitigate by treating "no snapshot yet" as red only after the first
   successful read, otherwise neutral until data arrives.

@@ -37,13 +37,11 @@ pub mod enrollment;
 pub mod events;
 pub mod fleet;
 pub mod health;
-// MESHFS-14.1 (v5.0.0) — LizardFS state snapshot for the backup bundle.
 pub mod identity;
 pub mod leader;
 pub mod legacy_inventory;
 pub mod lighthouse_addr;
 pub mod logging;
-pub mod meshfs;
 // EPIC-SYNC-APP-CONFIG (Q26) — native-Rust mesh media-server
 // discovery (replaces the discovery half of the retired
 // `mackes/mesh_media.py`). Consumed by `workers::app_sync`.
@@ -232,58 +230,33 @@ pub fn default_qnm_shared_root() -> std::path::PathBuf {
     mackes_mesh_types::peers::default_workgroup_root()
 }
 
-/// The canonical deployed QNM-Shared mount point — the only path where an
-/// unmounted-but-written-to directory poisons LizardFS (see
-/// [`shared_root_writable`]).
+/// The canonical deployed shared-storage directory (SUBSTRATE-V2: a plain
+/// Syncthing-replicated dir, no FUSE — see [`shared_root_writable`]).
 pub const CANONICAL_QNM_MOUNT: &str = "/mnt/mesh-storage";
 
-/// ONBOARD-6 / AUDIT-MESH-15 guard: is it SAFE to write under `root`?
+/// AUDIT-MESH-15 guard: is it SAFE to write under `root`?
 ///
-/// The one unsafe case is the canonical shared mount
-/// ([`CANONICAL_QNM_MOUNT`]) when it is **not actually a FUSE mount** — writing
-/// there (the leader lock, peer heartbeats, the directory) fills the mountpoint
-/// so LizardFS can never `mfsmount` over it again ("mountpoint is not empty"),
-/// and the daemon then silently reads a stale local 1-node dir. Any other root
-/// (a dev `~/QNM-Shared`, a tempdir, or the mount when genuinely mounted) is
-/// always writable, so dev/test paths are unaffected.
+/// Under SUBSTRATE-V2 `/mnt/mesh-storage` ([`CANONICAL_QNM_MOUNT`]) is a plain
+/// Syncthing-replicated directory — writable **iff the dir actually exists**. A
+/// missing/unprovisioned share (early boot, before the first Syncthing sync)
+/// must NOT be written, or the shared-state writers (the heartbeat, the
+/// `alert-mirror` feeding the Hub's shared-alerts pane, `ssh-pubkey gossip`, the
+/// clipboard history) would silently land on a bare local dir. Any other root (a
+/// dev `~/QNM-Shared`, a tempdir) is always writable, so dev/test is unaffected.
 #[must_use]
 pub fn shared_root_writable(root: &std::path::Path) -> bool {
-    // SUBSTRATE-1: the etcd endpoints file existing marks an etcd/Syncthing node.
-    let on_etcd = !crate::substrate::etcd::default_endpoints().is_empty();
-    shared_root_writable_core(root, on_etcd, root.is_dir())
+    shared_root_writable_core(root, root.is_dir())
 }
 
-/// Pure core of [`shared_root_writable`] — testable without the live etcd
-/// endpoints file or `/proc/mounts`.
-///
-///   * **`on_etcd` (SUBSTRATE-V2):** `/mnt/mesh-storage` is a plain Syncthing
-///     directory, **not** a FUSE mount, so there is no mountpoint to poison.
-///     Writable **iff the dir actually exists** (`root_is_dir`). This is the fix
-///     for the post-cutover regression where the old mount guard wrongly said
-///     "not writable" on the plain dir, so every shared-state writer (the
-///     heartbeat, the `alert-mirror` that feeds the Hub's shared-alerts pane,
-///     `ssh-pubkey gossip`, the clipboard history) **silently dropped every
-///     write**. A missing/unprovisioned share (early boot) or a bare unmounted
-///     mountpoint left mid-cutover (`root_is_dir == false`) is still NOT written.
-///   * **pre-cutover (legacy LizardFS):** writable only when it's a real FUSE
-///     mount (the ONBOARD-6/XPA-10 poison guard, checked via `/proc/mounts`).
+/// Pure core of [`shared_root_writable`] — testable without touching the fs.
+/// The canonical shared dir is writable iff it actually exists (`root_is_dir`);
+/// every other root is always writable.
 #[must_use]
-pub fn shared_root_writable_core(
-    root: &std::path::Path,
-    on_etcd: bool,
-    root_is_dir: bool,
-) -> bool {
+pub fn shared_root_writable_core(root: &std::path::Path, root_is_dir: bool) -> bool {
     if root != std::path::Path::new(CANONICAL_QNM_MOUNT) {
         return true;
     }
-    if on_etcd {
-        return root_is_dir;
-    }
-    // Pre-cutover canonical mount path: writable only when it's a real mount.
-    std::fs::read_to_string("/proc/mounts").is_ok_and(|c| {
-        c.lines()
-            .any(|l| l.split_whitespace().nth(1) == Some(CANONICAL_QNM_MOUNT))
-    })
+    root_is_dir
 }
 
 /// v2.0.0 Phase 0.6 — env-var rename shim.
@@ -334,42 +307,22 @@ mod shared_root_tests {
         assert!(shared_root_writable(Path::new("/tmp/anything")));
         let tmp = tempfile::tempdir().unwrap();
         assert!(shared_root_writable(tmp.path()));
-        // ...regardless of substrate.
-        assert!(shared_root_writable_core(Path::new("/tmp/x"), true, false));
-        assert!(shared_root_writable_core(Path::new("/tmp/x"), false, false));
+        // ...regardless of whether the dir exists.
+        assert!(shared_root_writable_core(Path::new("/tmp/x"), false));
     }
 
     #[test]
-    fn canonical_mount_writable_iff_actually_mounted_pre_cutover() {
-        // Pre-cutover (on_etcd=false): the canonical path is writable exactly
-        // when /proc/mounts lists it — so on a machine where it isn't mounted,
-        // the FUSE poison guard blocks the write.
-        let listed = std::fs::read_to_string("/proc/mounts")
-            .map(|c| {
-                c.lines()
-                    .any(|l| l.split_whitespace().nth(1) == Some("/mnt/mesh-storage"))
-            })
-            .unwrap_or(false);
-        assert_eq!(
-            shared_root_writable_core(Path::new("/mnt/mesh-storage"), false, true),
-            listed
-        );
-    }
-
-    #[test]
-    fn canonical_writable_on_etcd_iff_dir_exists() {
-        // SUBSTRATE-V2 (on_etcd=true): the plain Syncthing dir is writable iff it
-        // exists — fixes the post-cutover silent-drop of every shared-state write
+    fn canonical_writable_iff_dir_exists() {
+        // SUBSTRATE-V2: the plain Syncthing dir is writable iff it exists —
+        // fixes the post-cutover silent-drop of every shared-state write
         // (heartbeat / alert-mirror / ssh-gossip / clipboard).
         assert!(shared_root_writable_core(
             Path::new("/mnt/mesh-storage"),
-            true,
             true
         ));
-        // ...but never a bare/unprovisioned mountpoint (dir absent).
+        // ...but never a bare/unprovisioned share (dir absent).
         assert!(!shared_root_writable_core(
             Path::new("/mnt/mesh-storage"),
-            true,
             false
         ));
     }

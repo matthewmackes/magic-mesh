@@ -562,8 +562,8 @@ mod tests {
             config_path: cfg_path,
             listen_port: 0, // ephemeral
             broker_base: format!("http://{ntfy_addr}"),
-            bus_root: None,       // tests don't need persistence
-            persist_only: false,  // exercise the real outbound POST path
+            bus_root: None,      // tests don't need persistence
+            persist_only: false, // exercise the real outbound POST path
         };
         let outcome = run_listener(IpAddr::from([127, 0, 0, 1]), cfg)
             .await
@@ -764,6 +764,10 @@ adapters:
         // The message IS in the persist index (spool/audit carry it to peers).
         let p = crate::persist::Persist::open(bus_root).unwrap();
         let rows = p.list_since("gh/push", None).unwrap();
-        assert_eq!(rows.len(), 1, "persist-only still records the matched publish");
+        assert_eq!(
+            rows.len(),
+            1,
+            "persist-only still records the matched publish"
+        );
     }
 }

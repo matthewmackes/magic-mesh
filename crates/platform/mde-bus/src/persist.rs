@@ -1210,8 +1210,8 @@ mod tests {
     fn is_auditable_skips_observational_reads_but_keeps_mutations() {
         // The flood classes observed live on Eagle (2026-06-24) must NOT audit:
         for noisy in [
-            "audit/UNIT-EAGLE",       // recursion guard
-            "state/voice/status",     // observational broadcast
+            "audit/UNIT-EAGLE",   // recursion guard
+            "state/voice/status", // observational broadcast
             "state/boot-readiness",
             "reply/abc",              // query response
             "action/music/get-state", // the dominant poller (~36% of the flood)

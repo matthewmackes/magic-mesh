@@ -4,7 +4,7 @@
 //! kickstart), the **VM** golden image, **container** images, and the
 //! **USB** writer image. Each build is a job on an execution-tagged node
 //! (W54), and its output lands as a versioned dir with a TOML manifest on
-//! LizardFS (`<root>/images/<name>/<version>/manifest.toml`, W55).
+//! the Syncthing share (`<root>/images/<name>/<version>/manifest.toml`, W55).
 //!
 //! This is the pure core: the four kinds are a fixed vocabulary always
 //! shown (so the catalog lists what *can* be built even before any
@@ -138,7 +138,7 @@ pub fn load_manifests(workgroup_root: &Path) -> Vec<ImageManifest> {
 // ─────────────────────────────────────────────────────────────────
 // W55 — register a completed build. A build job (W54) calls
 // record_manifest when its output lands, writing the versioned-dir TOML
-// that load_manifests + the Images panel then surface. LizardFS
+// that load_manifests + the Images panel then surface. Syncthing
 // replicates it so the whole fleet sees the new build.
 // ─────────────────────────────────────────────────────────────────
 

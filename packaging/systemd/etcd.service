@@ -1,7 +1,7 @@
 [Unit]
 # SUBSTRATE-1 (SUBSTRATE-V2) — the overlay-bound etcd coordination cluster.
 # etcd is the strong-consistency home for leader election + the peer directory +
-# health (it replaces the LizardFS QNM-Shared coordination plane). It MUST come
+# health (it is the SUBSTRATE-V2 coordination plane). It MUST come
 # up after the Nebula overlay (it binds the overlay IP) and BEFORE mackesd —
 # mackesd is ordered After=etcd, never after any filesystem mount, so a file-sync
 # hiccup can never stall mesh liveness (SUBSTRATE-7/8 boot model).

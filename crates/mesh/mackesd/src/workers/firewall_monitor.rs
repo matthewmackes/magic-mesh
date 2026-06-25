@@ -35,8 +35,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{ShutdownToken, Worker};
 
-/// Default sweep cadence — 5 s, matching `gluster_worker` +
-/// `meshfs_worker`.
+/// Default sweep cadence — 5 s.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Firewall subdirectory inside mesh-storage.

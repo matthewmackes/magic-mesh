@@ -44,25 +44,22 @@ only lighthouse is gone, go to **Case B**.
 
 ## Case B — the only lighthouse is gone
 
-You must rebuild the control plane. The mesh's **storage** (LizardFS) and the
-**replicated fleet state** survive on the peers; what you're restoring is the CA +
-the LizardFS master.
+You must rebuild the control plane. The mesh's **storage** (Syncthing) and the
+**replicated fleet state** survive on the peers — every node holds its own replica
+of `/mnt/mesh-storage`, so there is no central storage master to restore. What
+you're restoring is the **CA**.
 
 1. **Pick a new lighthouse host** (a healthy peer, or a fresh install):
    ```bash
    meshctl install --role lighthouse
    ```
-2. **Restore the LizardFS master** from the most recent snapshot that replicated
-   off the dead node. `mackesd state-restore` lays the recovery files into a
-   directory and prints the exact steps:
+2. **Restore the CA** from the most recent `state-backup.enc` that replicated off
+   the dead node into the local store:
    ```bash
    mackesd state-restore <path/to/state-backup.enc>
-   # then, as it instructs:
-   cp <dir>/mfsexports.cfg /etc/mfs/mfsexports.cfg
-   mfsmaster --import-metadata <dir>/metadata.mfs.dump
-   mfsmaster start
-   mfssetgoal -r <goal> /mnt/mesh-storage     # <goal> = enrolled-peer count
    ```
+   The files on `/mnt/mesh-storage` need no restore step — they live on every
+   surviving peer and re-converge over Syncthing once the new lighthouse is up.
 3. **Re-establish the CA + overlay.** If the CA material did not replicate, mint a
    fresh mesh on this lighthouse and **re-enroll** the surviving peers (their old
    certs were signed by the lost CA):
@@ -84,7 +81,8 @@ the LizardFS master.
 ## After recovery
 
 - **Add a second lighthouse now** so you never repeat Case B.
-- Confirm replication health and re-set the LizardFS goal to the live peer count.
+- Confirm Syncthing replication health (`systemctl status syncthing` on each peer;
+  the mesh-health watchdog also alerts on an out-of-sync file plane).
 - The Workbench **Controller → Audit** panel records the lifecycle operations
   (re-mint, re-enroll, leadership change) on the hash-chained audit timeline.
 

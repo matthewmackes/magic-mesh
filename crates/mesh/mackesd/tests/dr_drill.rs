@@ -56,7 +56,6 @@ fn surviving_bundle() -> BundlePlaintext {
                 expires_at: 0,
             },
         ],
-        meshfs_snapshot: None,
     }
 }
 

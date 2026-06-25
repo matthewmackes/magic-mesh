@@ -67,7 +67,7 @@ pub struct FileRow {
     /// MESHFS-11.1 — filename of the conflict sibling (not a full path;
     /// relative to the same directory). `None` when `has_conflict` is false.
     pub conflict_sibling: Option<String>,
-    /// MESHFS-11.1 — true while the LizardFS fleet is healing (under-
+    /// MESHFS-11.1 — true while the mesh share is reconciling (under-
     /// replicated). Triggers the sync indicator badge on mesh-homed rows.
     pub syncing: bool,
     /// E10 — absolute filesystem path for a real local row (`LocalFsBackend`).
@@ -243,7 +243,7 @@ pub enum Mime {
 ///
 /// v4.x AF-mesh.2 (2026-05-24) — adds `MeshHome` + `MeshHomeChild`
 /// for the shared XDG dirs (Documents, Pictures, Music, Videos,
-/// Downloads). These dirs live on the LizardFS mesh store —
+/// Downloads). These dirs live on the Syncthing mesh store —
 /// replicated across the fleet over Nebula — so they
 /// belong in the mesh section of the UI, not the Local one.
 /// `Downloads` stays as a top-level shortcut for the common case.
@@ -263,7 +263,7 @@ pub enum View {
     /// `docs` / `pics` / `music` / `videos` / `downloads`.
     MeshHomeChild(String),
     /// MESHFS-8.1 — "Recycle Bin" view: files recoverable from the
-    /// LizardFS `.trash` virtual directory within the configured
+    /// mesh-storage trash directory within the configured
     /// retention window (default 48 h).
     MeshUndelete,
     /// E10 — Cloud Files: paired KDE-Connect devices (over the Bus). Each row

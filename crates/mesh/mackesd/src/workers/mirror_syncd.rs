@@ -9,7 +9,7 @@
 //!     the replicated mirror immediately.
 //!   * **Only the leader** runs the actual pull
 //!     ([`crate::mirrors::sync_mirror`]: `dnf reposync` → `createrepo_c` →
-//!     stamp `.last-sync`). LizardFS replicates the result to every other node,
+//!     stamp `.last-sync`). Syncthing replicates the result to every other node,
 //!     so the fleet mirrors GitHub exactly once per tick — the "one-puller"
 //!     contract (W63). Leadership is proxied by the role-host marker, the same
 //!     signal [`super::netdata_aggregator`] uses.

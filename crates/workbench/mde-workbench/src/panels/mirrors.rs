@@ -1,7 +1,7 @@
 //! PLANES-24 — Provisioning ▸ Mirrors panel.
 //!
 //! The package-mirror catalog (W61/W62/W63): each mirror pulls the
-//! magic-mesh GitHub-RPM channel into LizardFS, so every node serves
+//! magic-mesh GitHub-RPM channel into the Syncthing share, so every node serves
 //! itself via a `file://` baseurl with the upstream as fallback. This
 //! panel shells `mackesd mirrors --json` and renders each mirror's
 //! upstream, the `file://` baseurl it serves, and how fresh its last

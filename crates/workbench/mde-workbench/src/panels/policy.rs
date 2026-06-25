@@ -7,7 +7,7 @@
 //! the peers currently violating it — a violation is a drift event
 //! (W49) the Remediation panel can then fire a plan against.
 //!
-//! Read-only: policies are authored as TOML on LizardFS (W88); this
+//! Read-only: policies are authored as TOML on the Syncthing share (W88); this
 //! surface is the renderer (W88 — GUIs are renderers, not editors).
 
 use std::time::SystemTime;

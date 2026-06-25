@@ -1,5 +1,11 @@
 # Substrate-correctness audit (SUBAUDIT) — 2026-06-14
 
+> **Note (post-SUBSTRATE-6):** this audit predates the substrate replacement. The
+> QNM-Shared **LizardFS** mount it reasons about is now **REMOVED** — coordination
+> runs on **etcd** and files sync over **Syncthing** on a plain `/mnt/mesh-storage`
+> dir (no FUSE, no `mfsmount`/`lizardfs-client`). Read the LizardFS/mount references
+> below as the substrate that was in place at audit time, not the live plane.
+
 Operator question (2026-06-14): *"How were all of these items misconfiguration,
 and what should we evaluate to see if other services are misconfiguration or
 built?"* — triggered by a run of live-discovered empty panels on .13 (the
@@ -50,9 +56,11 @@ binaries degrade to empty with no operator signal.
   spawn nmap … Requires: nmap in the RPM").
 - **To fix** — declare (Requires or Recommends, matching node role) +
   honest-degrade UI: `nmap`, `resolvectl`/systemd-resolved, `firewalld`
-  (firewall-cmd), `NetworkManager` (nmcli), `podman`, `lizardfs-client`
-  (mfsmount), `rsync`. Already declared: nebula, ansible-core, kamailio,
-  rtpengine, libvirt, openssh-clients.
+  (firewall-cmd), `NetworkManager` (nmcli), `podman`, `rsync`. (The
+  `lizardfs-client`/`mfsmount` dep listed here at audit time is retired by
+  SUBSTRATE-6 — the file plane is Syncthing on a plain dir, so there is no FUSE
+  helper to declare; etcd + syncthing are the substrate deps now.) Already
+  declared: nebula, ansible-core, kamailio, rtpengine, libvirt, openssh-clients.
 
 ### Class D — gated precondition + phantom-unit panel check
 

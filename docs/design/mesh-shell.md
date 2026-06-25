@@ -14,11 +14,11 @@ greeting with live mesh state, and a `mesh-help` cheat sheet.
 | 5 | Greeting trigger | **Every new shell** (profile.d). |
 | 6 | Greeting freshness | **Live query, bounded** — kick a live refresh with a hard ~1.5s timeout; fall back to the snapshot so a shell never hangs. |
 | 7 | Health display | **Color-coded per-node list** (hostname + overlay IP + green/yellow/red presence dot) **+ summary line** ("4/4 healthy"). |
-| 8 | Services display | **Per-node service matrix** (node × {Bus, LizardFS, Nebula, DNS, Voice, Music, KDC, Workbench}). |
+| 8 | Services display | **Per-node service matrix** (node × {Bus, etcd, Syncthing, Nebula, DNS, Voice, Music, KDC, Workbench}). (Was a single LizardFS column pre-SUBSTRATE-6; the substrate is now etcd coordination + Syncthing files.) |
 | 9 | Updates display | **Per-node update list** (installed magic-mesh version + "update available" flag). |
 | 10 | Cheat sheet location | Separate **`mesh-help`** command (greeting shows a one-line hint). |
 | 11 | Cheat sheet source | **Auto-generated** from verb `--help` (mackesd/meshctl/mde-bus) + curated extras. |
-| 12 | Cheat sheet scope | Enrollment & join · Status & health · Storage (LizardFS) · Services & logs · **Fedora system commands** (dnf/systemctl/journalctl). |
+| 12 | Cheat sheet scope | Enrollment & join · Status & health · Storage (Syncthing / `/mnt/mesh-storage`) · Services & logs · **Fedora system commands** (dnf/systemctl/journalctl). |
 | 13 | Roles | **All roles** (most useful on the headless lighthouses over SSH). |
 | 14 | Delivery | Applied **automatically / one-way** (no toggle). Shipped as its own RPM component enabled on all roles (NOT gated behind the Workstation-only BRAND service); styled to match the Carbon branding. |
 | 15 | Style | **Carbon ANSI palette** (Gray + Blue-60 accent) + **Mackes ASCII wordmark** header + Unicode status dots. |
@@ -26,8 +26,9 @@ greeting with live mesh state, and a `mesh-help` cheat sheet.
 ## Data plane
 A single snapshot `/run/mde/mesh-status.json` is the source for both the prompt
 (cached read) and the greeting (snapshot + bounded live refresh). It carries:
-`nodes:[{hostname, overlay_ip, presence}]`, `services:{<node>:{bus,lizardfs,
-nebula,dns,voice,music,kdc,workbench}}`, `versions:{<node>:{installed, latest,
+`nodes:[{hostname, overlay_ip, presence}]`, `services:{<node>:{bus,etcd,syncthing,
+nebula,dns,voice,music,kdc,workbench}}` (the `lizardfs` flag was replaced by
+`etcd`+`syncthing` at SUBSTRATE-6), `versions:{<node>:{installed, latest,
 update}}`, `generated_ms`. Written by a small refresher (a `mackesd` tick or a
 oneshot+timer) that reads the replicated directory + `mackesd healthz` + the
 package channel. All roles run the refresher.

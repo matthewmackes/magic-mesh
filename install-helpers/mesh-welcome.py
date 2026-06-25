@@ -34,7 +34,7 @@ def load():
 
 
 SERVICES = [
-    ("bus", "Bus"), ("lizardfs", "FS"), ("nebula", "Neb"), ("dns", "DNS"),
+    ("bus", "Bus"), ("sync", "Sync"), ("nebula", "Neb"), ("dns", "DNS"),
     ("voice", "Voi"), ("music", "Mus"), ("kdc", "KDC"), ("workbench", "WB"),
 ]
 DOT = {"online": (GREEN, "●"), "idle": (AMBER, "●"), "offline": (RED, "○")}

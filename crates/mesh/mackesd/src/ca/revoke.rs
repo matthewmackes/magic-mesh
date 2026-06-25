@@ -11,7 +11,7 @@
 //!    QNM-Shared so the identity is refused mesh-wide even after a CA
 //!    rotation. GFS replication propagates the ban automatically.
 //! 3. **Bus event** (best-effort) — publish `ca/revoke/<node-id>` so
-//!    running workers (meshfs_worker, peer_cap, etc.) converge without
+//!    running workers (peer_cap, etc.) converge without
 //!    waiting for their next tick.
 //!
 //! This replaces the originally-planned `dev.mackes.MDE.Ca.Revoke`

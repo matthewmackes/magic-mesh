@@ -5,10 +5,9 @@
 # (coordination) + setup-syncthing (files). This is the operator-driven cutover
 # step — run it FIRST on the VM bed to rehearse (a reboot/disconnect drill), then
 # on each fleet node at the 11.0 roll. It is deliberately NOT auto-wired into
-# enroll: writing the etcd endpoints file flips this node's coordination from the
-# LizardFS QNM-Shared fs path onto etcd (the SUBSTRATE-1..10 bridges go etcd-only
-# once /etc/mackesd/etcd-endpoints exists), so it must be a conscious, rehearsed
-# action — not a side effect of a routine re-enroll.
+# enroll: writing the etcd endpoints file marks this node's coordination as
+# etcd-backed (the SUBSTRATE-1..10 bridges read /etc/mackesd/etcd-endpoints), so
+# it must be a conscious, rehearsed action — not a side effect of a re-enroll.
 #
 # Roles (pick one):
 #   --init                bootstrap the FIRST anchor (founding etcd member)
@@ -20,11 +19,8 @@
 #   --anchors <csv>   anchor overlay IPs (client-only/join endpoint list)
 #   --folder <dir>    Syncthing shared folder (default /mnt/mesh-storage)
 #
-# Rollback: this is additive until SUBSTRATE-6 removes LizardFS — both planes can
-# coexist during the rehearsal. To roll a node back, `rm /etc/mackesd/etcd-endpoints`
-# (the bridges fall back to the LizardFS fs path) + `systemctl disable --now
-# etcd.service syncthing.service`. The one-release rollback RPM is the prior NEVRA
-# (still carries setup-qnm-shared + the LizardFS Requires until 6 lands).
+# Rollback: to roll a node back, `rm /etc/mackesd/etcd-endpoints` +
+# `systemctl disable --now etcd.service syncthing.service`.
 set -euo pipefail
 
 MODE=""; JOIN_ANCHOR=""; LISTEN=""; ANCHORS=""; FOLDER=/mnt/mesh-storage
@@ -41,9 +37,9 @@ while [ $# -gt 0 ]; do case "$1" in
   --listen) LISTEN="$2"; shift 2;;
   --anchors) ANCHORS="$2"; shift 2;;
   --folder) FOLDER="$2"; shift 2;;
-  # Fleet-safe orchestration (an EXISTING LizardFS mesh, not greenfield):
+  # Fleet-safe orchestration: stage the whole fleet, then flip together.
   --no-flip)  NO_FLIP=1; shift;;   # stand up etcd but do NOT restart mackesd
-  --no-files) NO_FILES=1; shift;;  # coordination only — skip Syncthing (Phase A)
+  --no-files) NO_FILES=1; shift;;  # coordination only — skip Syncthing
   *) echo "unknown arg: $1" >&2; exit 1;;
 esac; done
 [ -z "$MODE" ] && { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
@@ -61,10 +57,8 @@ esac
 log "etcd: setup-etcd ${ETCD_ARGS[*]}"
 "$(helper setup-etcd)" "${ETCD_ARGS[@]}"
 
-# 2. File plane (Syncthing) — replicates /mnt/mesh-storage full-mesh (no FUSE).
-#    Phase A (--no-files) skips this: on an EXISTING mesh /mnt/mesh-storage is a
-#    live LizardFS FUSE mount, so running Syncthing on it = double-replication.
-#    The file swap is Phase B (LizardFS unmount → plain dir → Syncthing), SUBSTRATE-6.
+# 2. File plane (Syncthing) — replicates /mnt/mesh-storage full-mesh (a plain
+#    dir, no FUSE). --no-files stages coordination only and skips Syncthing.
 if [ "$NO_FILES" -eq 0 ]; then
   SYNC_ARGS=(--folder "$FOLDER")
   [ -n "$LISTEN" ]  && SYNC_ARGS+=(--listen "$LISTEN")
@@ -72,20 +66,19 @@ if [ "$NO_FILES" -eq 0 ]; then
   log "syncthing: setup-syncthing ${SYNC_ARGS[*]}"
   "$(helper setup-syncthing)" "${SYNC_ARGS[@]}"
 else
-  log "syncthing: SKIPPED (--no-files; files stay on LizardFS until Phase B)"
+  log "syncthing: SKIPPED (--no-files; coordination only)"
 fi
 
 # 3. mackesd now coordinates via etcd (the 20-etcd.conf drop-in setup-etcd wrote
 #    orders mackesd After=etcd). The flip happens on the next mackesd START
 #    (run_serve's startup probe reads /etc/mackesd/etcd-endpoints). --no-flip
-#    leaves the running mackesd on its current (LizardFS) plane so the fleet can
-#    be STAGED (etcd up everywhere) and then flipped together in one fast pass —
-#    a node-by-node flip would split the directory (etcd nodes vs fs nodes).
+#    leaves the running mackesd as-is so the fleet can be STAGED (etcd up
+#    everywhere) and then flipped together in one fast pass.
 if [ "$NO_FLIP" -eq 0 ]; then
   log "restarting mackesd onto the etcd substrate"
   systemctl restart mackesd.service 2>/dev/null || true
 else
-  log "mackesd flip DEFERRED (--no-flip; etcd staged, mackesd still on LizardFS)"
+  log "mackesd flip DEFERRED (--no-flip; etcd staged, mackesd not yet restarted)"
   log "  flip the whole fleet together with: systemctl restart mackesd"
 fi
 

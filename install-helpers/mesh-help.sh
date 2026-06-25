@@ -45,11 +45,10 @@ cmd "mde-bus request action/mesh/directory" "live roster (export MDE_BUS_ROOT=/r
 cmd "mackesd validate run|status"     "overlay-reachability validation"
 cmd "cat /run/mde/mesh-status.json"   "the cached snapshot (prompt/greeting source)"
 
-header "Storage (LizardFS / QNM-Shared)"
-cmd "mackesd mesh-fs-status"          "chunkservers, goal, quota, usage (JSON)"
-cmd "lizardfs-admin list-chunkservers 10.42.0.1 9421" "raw chunkserver list"
-cmd "mountpoint /mnt/mesh-storage"    "is the shared volume mounted?"
-cmd "mackesd mesh-fs-trash-list"      "files recoverable from the LizardFS trash"
+header "Storage (Mesh Sync — Syncthing)"
+cmd "systemctl status syncthing"      "the file plane (replicates /mnt/mesh-storage)"
+cmd "ls /mnt/mesh-storage"            "the shared workgroup dir (plain, no FUSE)"
+cmd "/usr/libexec/mackesd/syncthing-reconcile" "re-wire the device list from the etcd registry"
 
 header "Services & logs"
 cmd "systemctl status mackesd nebula" "core daemon + overlay"

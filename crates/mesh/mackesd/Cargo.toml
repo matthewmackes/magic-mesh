@@ -8,8 +8,8 @@
 #     12.A.3 lock.
 #
 #   * Binary  `mackesd`      — the reconcile loop + CLI. Runs on every
-#     peer as a systemd unit; one is leader per the QNM-Shared lockfile
-#     (12.A.5). Owns writes to the SQLite store.
+#     peer as a systemd unit; one is leader per the etcd lease
+#     (SUBSTRATE-V2). Owns writes to the SQLite store.
 #
 # Both consume the same internal modules (store, policy, topology,
 # telemetry, reconcile, deploy, audit) — they're not separate crates,
@@ -23,7 +23,7 @@ rust-version.workspace = true
 license.workspace      = true
 authors.workspace      = true
 repository.workspace   = true
-description  = "MCNF control plane — the no-fixed-center workgroup mesh daemon (Nebula overlay, LizardFS storage, fleet reconcile, CA)"
+description  = "MCNF control plane — the no-fixed-center workgroup mesh daemon (Nebula overlay, etcd + Syncthing substrate, fleet reconcile, CA)"
 
 [lib]
 name = "mackesd_core"
@@ -390,14 +390,6 @@ assets = [
     { source = "packaging/systemd/nebula.service.d/10-mesh-recovery.conf", dest = "/usr/lib/systemd/system/nebula.service.d/10-mesh-recovery.conf", mode = "644" },
     { source = "install-helpers/mesh-health-check.sh",   dest = "/usr/libexec/mackesd/mesh-health-check",       mode = "755" },
     { source = "install-helpers/mesh-alert.sh",          dest = "/usr/libexec/mackesd/mesh-alert",              mode = "755" },
-    # ONBOARD-6 — QNM-Shared (LizardFS) setup: stands up the replicated
-    # shared-state volume over the overlay, boot-durable. Run per-node with
-    # --master/--chunkserver/--client (see the script header).
-    { source = "install-helpers/setup-qnm-shared.sh",    dest = "/usr/libexec/mackesd/setup-qnm-shared",        mode = "755" },
-    # BOOT-XPA8-4 — the robust QNM-Shared mount loop, shipped so qnm-shared.service
-    # just calls it (the loop logic updates with every RPM upgrade instead of
-    # being baked inline in the unit or sed-patched in post_install).
-    { source = "install-helpers/qnm-mount.sh",           dest = "/usr/libexec/mackesd/qnm-mount",               mode = "755" },
     # SUBSTRATE-1 (SUBSTRATE-V2) — the etcd coordination cluster: overlay-bound
     # leader/directory/health. Run per-node with --init/--join/--client-only.
     # The unit only starts where setup-etcd.sh wrote /etc/etcd/etcd.env (members).
@@ -512,18 +504,9 @@ assets = [
     # helpers prefer these over a network fetch, so an offline install still
     # provisions ntfy + starship. NOT in git — fetched + sha256-verified at
     # build time by install-helpers/vendor-birthright-blobs.sh (which
-    # build-rpm-fedora43.sh runs before generate-rpm). lizardfs stays fetch-only
-    # under BIRTHRIGHT-1 (see docs/design/birthrights.md).
+    # build-rpm-fedora43.sh runs before generate-rpm).
     { source = "vendor/birthright/ntfy_2.24.0_linux_amd64.tar.gz", dest = "/usr/share/magic-mesh/vendor/ntfy_2.24.0_linux_amd64.tar.gz", mode = "644" },
     { source = "vendor/birthright/starship-x86_64-unknown-linux-musl.tar.gz", dest = "/usr/share/magic-mesh/vendor/starship-x86_64-unknown-linux-musl.tar.gz", mode = "644" },
-    # BIRTHRIGHT-1 — the role-aware LizardFS installer + the bundled fc43 RPM
-    # family (the §1 shared-state substrate). LizardFS isn't in F44 base repos;
-    # the fc43 binaries run on F44 via `rpm --nodeps`. setup-qnm-shared (already
-    # shipped above) is auto-invoked by `mackesd found`/`join`. RPMs are NOT in
-    # git — staged at build time by install-helpers/vendor-lizardfs-rpms.sh
-    # (build-rpm-fedora43.sh runs it before generate-rpm).
-    { source = "install-helpers/mesh-install-lizardfs.sh", dest = "/usr/libexec/mackesd/mesh-install-lizardfs", mode = "755" },
-    { source = "vendor/birthright/lizardfs/*.rpm", dest = "/usr/share/magic-mesh/vendor/lizardfs/", mode = "644" },
     # SELINUX-1 — the local SELinux policy modules + their installer, so a node
     # runs clean under Enforcing (no AVC flood / repeating "SELinux security
     # alert" toasts). CIL is toolchain-free (`semodule -i`) and version-portable;
@@ -535,45 +518,21 @@ assets = [
 # the config dir, refresh icon/desktop caches; clean up on removal. Guards keep
 # them no-fatal in minimal/container roots.
 post_install_script = """
-# XPA-8 migration (BOOT-REC, 2026-06-18): nodes enrolled before XPA-8 wrote
-# qnm-shared.service with `Before=mackesd.service` + a 20-qnm.conf drop-in with
-# `After=qnm-shared.service`, which made mackesd QUEUE behind the QNM-Shared
-# mount-retry loop (up to ~2 min). Result: after a reboot the mesh + the apps
-# service are DOWN for ~2 min (and on a disconnected laptop, the full ~2 min
-# every boot since the master is never reachable). setup-qnm-shared.sh already
-# writes the decoupled form, but an RPM upgrade doesn't re-run it — so refresh
-# the ordering here, idempotently, on every upgrade. Keeps the Wants= pull.
-if [ -f /etc/systemd/system/qnm-shared.service ]; then
-  sed -i '/^Before=mackesd.service/d' /etc/systemd/system/qnm-shared.service || :
-  # BOOT-XPA8-2 — back off the mount-retry so a disconnected node doesn't spin
-  # the loop every 5s (it can never mount off-mesh; mackesd self-heals it).
-  sed -i 's/^RestartSec=5$/RestartSec=30/' /etc/systemd/system/qnm-shared.service || :
-  # BOOT-XPA8-4 — migrate the inline mount loop onto the shipped script. Older
-  # nodes have the loop baked into the unit's ExecStart= heredoc, so a loop fix
-  # never reached them without a setup-qnm-shared re-run or an even-more-fragile
-  # multi-line sed of the unit body. Drop in a clean [Service] override that
-  # resets ExecStart/ExecStop and points them at /usr/libexec/mackesd/qnm-mount
-  # (which the RPM just (re)installed) — idiomatic, no sed of the generated body,
-  # and every future loop fix lands by replacing the shipped script alone. The
-  # script reads QNM_PATH/MASTER_IP from the env (the new unit sets them) or
-  # falls back to /etc/mackesd-qnm-master + /mnt/mesh-storage, so a legacy node
-  # with no Environment= still resolves the same master it always mounted.
-  if [ -x /usr/libexec/mackesd/qnm-mount ]; then
-    install -d -m 0755 /etc/systemd/system/qnm-shared.service.d
-    cat > /etc/systemd/system/qnm-shared.service.d/10-xpa8-4-shipped-loop.conf <<'DROPIN'
-[Service]
-# BOOT-XPA8-4: reset the (possibly inline) ExecStart/ExecStop and call the
-# shipped mount loop, so the logic updates with every RPM upgrade.
-ExecStart=
-ExecStart=/usr/libexec/mackesd/qnm-mount mount
-ExecStop=
-ExecStop=/usr/libexec/mackesd/qnm-mount unmount
-DROPIN
-  fi
+# SUBSTRATE-6 LizardFS retirement (one-way): nodes enrolled on the old
+# LizardFS plane carry qnm-shared.service (the mfsmount retry loop) + a
+# mackesd.service.d/20-qnm.conf ordering drop-in. LizardFS is removed — so on
+# every upgrade, stop+mask the stale unit (it can never mount; leaving it
+# enabled just crash-loops mfsmount) and drop the ordering files so mackesd is
+# gated on etcd, never on a mount. Idempotent; no-ops on a fresh node.
+if [ -f /etc/systemd/system/qnm-shared.service ] || [ -f /usr/lib/systemd/system/qnm-shared.service ]; then
+  systemctl disable --now qnm-shared.service >/dev/null 2>&1 || :
+  systemctl mask qnm-shared.service >/dev/null 2>&1 || :
+  rm -f /etc/systemd/system/qnm-shared.service \
+        /etc/systemd/system/qnm-shared.service.d/10-xpa8-4-shipped-loop.conf || :
+  rmdir /etc/systemd/system/qnm-shared.service.d 2>/dev/null || :
 fi
-if [ -f /etc/systemd/system/mackesd.service.d/20-qnm.conf ]; then
-  sed -i '/^After=qnm-shared.service/d' /etc/systemd/system/mackesd.service.d/20-qnm.conf || :
-fi
+rm -f /etc/systemd/system/mackesd.service.d/20-qnm.conf || :
+rmdir /etc/systemd/system/mackesd.service.d 2>/dev/null || :
 systemctl daemon-reload >/dev/null 2>&1 || :
 # Service manager (ONBOARD-9): the daemon, the overlay, and the health
 # watchdog all start at boot. nebula.service ships disabled by the stock
@@ -648,14 +607,6 @@ nmap = "*"
 # headless lighthouse without alsa-lib failed the v10.0.9 install until it was
 # added by hand. alsa-lib is small + in the base Fedora repos.
 alsa-lib = "*"
-# XPA-9 (2026-06-17) — the bundled fc43 lizardfs-client's `mfsmount` links
-# libfuse.so.2 (FUSE 2). Fedora 44 ships only FUSE 3 by default, so a fresh
-# node failed `mfsmount: error while loading shared libraries: libfuse.so.2`
-# → QNM-Shared could NEVER mount → the Server never joined the directory
-# (found bringing up MDE-VM-1..4 on XCP). Hard Require the FUSE 2 runtime +
-# its mount helper (both small, base Fedora repos).
-fuse-libs = "*"
-fuse = "*"
 # RCLICK-4 (2026-06-19) — the Win+X right-click power menu launches these: btop
 # (its "Task Manager", run in cosmic-term) + Midnight Commander (`mc`). Both are
 # small + in the base Fedora repos, and the menu entries dead-end without them,
@@ -695,7 +646,7 @@ openssh-clients = "*"
 # (opt-out-able), matching the ansible-core pattern: NetworkManager (Interfaces/
 # Wi-Fi via nmcli), firewalld (Firewall via firewall-cmd), podman (Compute
 # containers), rsync (mirror sync). systemd-resolved/resolvectl ship with
-# systemd; lizardfs-client is installed out-of-band (not in F44 repos).
+# systemd.
 NetworkManager = "*"
 firewalld = "*"
 podman = "*"
@@ -730,7 +681,7 @@ magic-mesh-server = "*"
 # and the Carbon wallpaper/cosmic-layout/brand imagery).
 [package.metadata.generate-rpm.variants.server]
 name = "magic-mesh-server"
-summary = "MCNF (headless Server) — the mesh daemon, Nebula overlay + LizardFS substrate, no desktop GUIs"
+summary = "MCNF (headless Server) — the mesh daemon, Nebula overlay + etcd/Syncthing substrate, no desktop GUIs"
 # A node carries EITHER the full magic-mesh OR magic-mesh-server, never both:
 # they install the same /usr/bin/mackesd + units, so let dnf refuse co-install
 # and let `dnf swap` move between roles. The full package likewise conflicts
@@ -756,10 +707,7 @@ assets = [
     { source = "packaging/systemd/nebula.service.d/10-mesh-recovery.conf", dest = "/usr/lib/systemd/system/nebula.service.d/10-mesh-recovery.conf", mode = "644" },
     { source = "install-helpers/mesh-health-check.sh",   dest = "/usr/libexec/mackesd/mesh-health-check",       mode = "755" },
     { source = "install-helpers/mesh-alert.sh",          dest = "/usr/libexec/mackesd/mesh-alert",              mode = "755" },
-    # ONBOARD-6 / SUBSTRATE — the QNM-Shared + etcd + Syncthing substrate.
-    { source = "install-helpers/setup-qnm-shared.sh",    dest = "/usr/libexec/mackesd/setup-qnm-shared",        mode = "755" },
-    # BOOT-XPA8-4 — the shipped QNM-Shared mount loop (see the full-variant note).
-    { source = "install-helpers/qnm-mount.sh",           dest = "/usr/libexec/mackesd/qnm-mount",               mode = "755" },
+    # SUBSTRATE — the etcd + Syncthing coordination/file substrate.
     { source = "install-helpers/setup-etcd.sh",          dest = "/usr/libexec/mackesd/setup-etcd",              mode = "755" },
     { source = "packaging/systemd/etcd.service",         dest = "/etc/systemd/system/etcd.service",             mode = "644" },
     { source = "install-helpers/setup-syncthing.sh",     dest = "/usr/libexec/mackesd/setup-syncthing",         mode = "755" },
@@ -810,28 +758,22 @@ assets = [
     { source = "packaging/systemd/mesh-broker-setup.service", dest = "/usr/lib/systemd/system/mesh-broker-setup.service", mode = "644" },
     { source = "install-helpers/mesh-install-netdata.sh", dest = "/usr/libexec/mackesd/mesh-install-netdata", mode = "755" },
     { source = "packaging/systemd/mesh-netdata-setup.service", dest = "/usr/lib/systemd/system/mesh-netdata-setup.service", mode = "644" },
-    # BIRTHRIGHT — the bundled air-gapped first-boot blobs (ntfy + starship) +
-    # the fc43 LizardFS RPM family (the §1 shared-state substrate).
+    # BIRTHRIGHT — the bundled air-gapped first-boot blobs (ntfy + starship).
     { source = "vendor/birthright/ntfy_2.24.0_linux_amd64.tar.gz", dest = "/usr/share/magic-mesh/vendor/ntfy_2.24.0_linux_amd64.tar.gz", mode = "644" },
     { source = "vendor/birthright/starship-x86_64-unknown-linux-musl.tar.gz", dest = "/usr/share/magic-mesh/vendor/starship-x86_64-unknown-linux-musl.tar.gz", mode = "644" },
-    { source = "install-helpers/mesh-install-lizardfs.sh", dest = "/usr/libexec/mackesd/mesh-install-lizardfs", mode = "755" },
-    { source = "vendor/birthright/lizardfs/*.rpm", dest = "/usr/share/magic-mesh/vendor/lizardfs/", mode = "644" },
     # SELINUX-1 — the local SELinux policy modules + installer.
     { source = "install-helpers/selinux/*.cil", dest = "/usr/share/magic-mesh/selinux/", mode = "644" },
     { source = "install-helpers/setup-selinux-policy.sh", dest = "/usr/libexec/mackesd/setup-selinux-policy", mode = "755" },
 ]
 
 # XPA-6 — the headless variant's hard runtime deps: the same mesh substrate the
-# base RPM Requires (nebula overlay, the FUSE2 stack the bundled fc43 lizardfs
-# mfsmount needs, nmap for the host probe, alsa-lib for the audio-linked bins),
-# but WITHOUT the desktop-only btop/mc (RCLICK power-menu launchers — a headless
-# Server has no right-click menu).
+# base RPM Requires (nebula overlay, nmap for the host probe, alsa-lib for the
+# audio-linked bins), but WITHOUT the desktop-only btop/mc (RCLICK power-menu
+# launchers — a headless Server has no right-click menu).
 [package.metadata.generate-rpm.variants.server.requires]
 nebula = "*"
 nmap = "*"
 alsa-lib = "*"
-fuse-libs = "*"
-fuse = "*"
 
 # XPA-6 — the headless variant's weak deps: the Server-tier shell-outs only.
 # Dropped vs the base: the desktop-only cosmic-disks, the voice binaries

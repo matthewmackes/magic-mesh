@@ -3,7 +3,7 @@
 //! The image catalog (W53/W55): the mesh builds four kinds of image —
 //! install ISO, VM golden, container, USB writer — each as a job on an
 //! execution-tagged node (W54), landing as a versioned dir + TOML
-//! manifest on LizardFS (W55). This panel shells `mackesd images --json`
+//! manifest on the Syncthing share (W55). This panel shells `mackesd images --json`
 //! and renders all four kinds (so the catalog shows what *can* be built)
 //! each with the versioned builds present.
 //!
@@ -368,7 +368,7 @@ fn empty_state_card<'a>(palette: Palette, error: Option<&'a str>) -> Element<'a,
             palette.accent.into_cosmic_color(),
             "No image catalog".to_string(),
             "The mesh builds four kinds of image (ISO / VM / container / USB) as jobs on \
-             execution-tagged nodes; built versions land on LizardFS and appear here."
+             execution-tagged nodes; built versions land on the Syncthing share and appear here."
                 .to_string(),
         )
     };

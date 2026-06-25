@@ -1,5 +1,14 @@
 # HA — QNM-Shared shadow master + 2-lighthouse minimum
 
+> **SUPERSEDED — LizardFS is REMOVED (SUBSTRATE-6).** This epic addressed the
+> single-LizardFS-master SPOF with a shadow-master + fenced failover. That whole
+> mechanism (mfsmaster/metalogger/floating-VIP/promote-shadow) went away with
+> LizardFS: coordination now runs on **etcd** (quorum leader election across all
+> server+lighthouse nodes), and files sync over **Syncthing** with no master at
+> all. The 2-lighthouse minimum survives as the etcd-quorum / relay-redundancy
+> rationale. Read the LizardFS master/shadow design below as the historical record
+> of the problem etcd now solves, not a live plane.
+
 Design survey locked 2026-06-17 (10-question `/plan`), prompted by the QNM-Shared
 outage where the single LizardFS master (a 947 MB droplet) died and wedged the
 whole mesh. The QNM-Shared master is a **SPOF**; this epic adds a live **shadow

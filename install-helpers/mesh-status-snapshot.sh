@@ -29,7 +29,7 @@ ROLE="$(sed -n 's/^[[:space:]]*role[[:space:]]*=[[:space:]]*"\([a-z]*\)".*/\1/p'
 
 s_mackesd="$(active mackesd)"
 s_nebula="$(active nebula)"
-s_lizardfs="$(mountpoint -q "$WG" 2>/dev/null && echo true || echo false)"
+s_sync="$(active syncthing)"
 s_bus="$([ -f /run/mde-bus/index.sqlite ] && echo true || echo false)"
 s_dns="$s_mackesd"                                   # mesh DNS is a mackesd worker
 s_voice="$(running mde-voice-hud)"
@@ -37,10 +37,10 @@ s_music="$(running mde-musicd)"
 s_kdc="$([ "$ROLE" = workstation ] && [ "$s_mackesd" = true ] && echo true || echo false)"
 s_workbench="$(command -v mde-workbench >/dev/null 2>&1 && echo true || echo false)"
 
-if [ -n "$SELF" ] && [ -d "$WG" ] && mountpoint -q "$WG" 2>/dev/null; then
+if [ -n "$SELF" ] && [ -d "$WG" ]; then
     mkdir -p "$WG/$SELF" 2>/dev/null || true
     cat > "$WG/$SELF/shell-status.json" 2>/dev/null <<EOF
-{"version":"$VER","role":"$ROLE","services":{"mackesd":$s_mackesd,"nebula":$s_nebula,"lizardfs":$s_lizardfs,"bus":$s_bus,"dns":$s_dns,"voice":$s_voice,"music":$s_music,"kdc":$s_kdc,"workbench":$s_workbench},"updated_ms":$(( $(date +%s%3N) ))}
+{"version":"$VER","role":"$ROLE","services":{"mackesd":$s_mackesd,"nebula":$s_nebula,"sync":$s_sync,"bus":$s_bus,"dns":$s_dns,"voice":$s_voice,"music":$s_music,"kdc":$s_kdc,"workbench":$s_workbench},"updated_ms":$(( $(date +%s%3N) ))}
 EOF
 fi
 

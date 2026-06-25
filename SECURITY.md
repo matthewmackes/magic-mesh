@@ -43,7 +43,7 @@ In scope: the daemon (`mackesd`), the mesh/fleet control plane (`magic-fleet`,
 lifecycle, the network scanners, and the GUI surfaces.
 
 Out of scope: vulnerabilities in upstream dependencies (report those upstream —
-Nebula, LizardFS, rustls, libcosmic, etc.), and issues that require an attacker
+Nebula, etcd, Syncthing, rustls, libcosmic, etc.), and issues that require an attacker
 who already has root/operator access on a mesh node (the trust model assumes the
 operator owns their nodes — see `AI_GOVERNANCE.md` §8, the ≤8-peer flat-trust
 envelope).
