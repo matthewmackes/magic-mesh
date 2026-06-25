@@ -28,6 +28,17 @@ pub const TICK: Duration = Duration::from_secs(30);
 /// The mesh DNS namespace suffix (W75).
 pub const MESH_SUFFIX: &str = "mesh";
 
+/// MEDIA-5 — the well-known active-active service name for the
+/// `Lighthouse_Media` Navidrome set.
+///
+/// `music.mesh` resolves to the overlay IPs of EVERY live media-lighthouse at
+/// once (an A-record SET, not a single host), so a client reaches whichever
+/// instance answers — the "run this on every `Lighthouse_Media`; clients reach
+/// any instance via `music.mesh`" contract from `setup-media-navidrome.sh`.
+/// Until now this was only a comment there; this worker makes it a served
+/// record.
+pub const MUSIC_FQDN: &str = "music.mesh";
+
 /// `/etc/hosts` managed-block markers (the resolvectl-absent path).
 pub const HOSTS_BEGIN: &str = "# >>> mde mesh-dns (managed) >>>";
 /// Closing sentinel for the managed `/etc/hosts` block.
@@ -56,6 +67,31 @@ pub fn build_records(peers: &[(String, String)]) -> Vec<MeshHost> {
         })
         .collect();
     out.sort_by(|a, b| a.fqdn.cmp(&b.fqdn));
+    out.dedup();
+    out
+}
+
+/// MEDIA-5 — the active-active `music.mesh` A-record SET from the live
+/// `Lighthouse_Media` overlay IPs (MEDIA-1 discovers them: a peer is a media
+/// node iff `is_media_lighthouse`, surfaced as the directory row's `media`
+/// flag). Every supplied IP becomes a `music.mesh` record so the name
+/// resolves to the WHOLE media set at once — a client reaches any live
+/// Navidrome instance (the active-active contract). Empty IPs are skipped
+/// (a media-lighthouse whose overlay address isn't known yet → never a half
+/// record), and the set is sorted + deduped for a stable, idempotent block.
+/// Returns an empty set when there are no media-lighthouses, so the
+/// `music.mesh` name is served only where the service actually exists (§7).
+#[must_use]
+pub fn build_music_records(media_overlay_ips: &[String]) -> Vec<MeshHost> {
+    let mut out: Vec<MeshHost> = media_overlay_ips
+        .iter()
+        .filter(|ip| !ip.is_empty())
+        .map(|ip| MeshHost {
+            fqdn: MUSIC_FQDN.to_string(),
+            overlay_ip: ip.clone(),
+        })
+        .collect();
+    out.sort_by(|a, b| a.overlay_ip.cmp(&b.overlay_ip));
     out.dedup();
     out
 }
@@ -143,14 +179,15 @@ impl MeshDnsWorker {
         self
     }
 
-    /// `(hostname, overlay_ip)` for every peer with a known overlay IP —
-    /// read from the replicated directory (the same source the Workbench
-    /// Mesh DNS panel shows). The directory joins each peer's own recorded
-    /// overlay IP with the leader's roster mirror as a fallback, so this
-    /// is populated on every node, not just the signer. (Was: the local
-    /// SQLite roster, empty on a peer → an empty `/etc/hosts` block → the
-    /// bug where `<host>.mesh` never resolved from the terminal.)
-    fn peers(&self) -> Vec<(String, String)> {
+    /// The directory snapshot — the single replicated source (the same one the
+    /// Workbench Mesh DNS panel shows) both the `<host>.mesh` join AND the
+    /// MEDIA-5 `music.mesh` set read from, so one `build_directory` call feeds
+    /// both (no second read, no divergence). The directory joins each peer's own
+    /// recorded overlay IP with the leader's roster mirror as a fallback, so it
+    /// is populated on every node, not just the signer. (Was: the local SQLite
+    /// roster, empty on a peer → an empty `/etc/hosts` block → the bug where
+    /// `<host>.mesh` never resolved from the terminal.)
+    fn directory(&self) -> serde_json::Value {
         let svc = crate::ipc::directory::DirectoryService::new(
             &self.workgroup_root,
             self.store_db.clone(),
@@ -158,25 +195,24 @@ impl MeshDnsWorker {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);
-        svc.build_directory(now_ms)["peers"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|p| {
-                Some((
-                    p["hostname"].as_str()?.to_string(),
-                    p["overlay_ip"].as_str()?.to_string(),
-                ))
-            })
-            .collect()
+        svc.build_directory(now_ms)
     }
 
     fn sync(&self) {
-        let records = build_records(&self.peers());
+        let dir = self.directory();
+        // The flat <host>.mesh join, plus the MEDIA-5 active-active
+        // music.mesh set — both derived from the SAME directory snapshot and
+        // merged into one record list so they share the existing /etc/hosts +
+        // resolved emit path (no new writer surface).
+        let mut records = build_records(&directory_records(&dir));
+        let music = build_music_records(&media_overlay_ips(&dir));
+        let music_count = music.len();
+        records.extend(music);
         tracing::debug!(
             target: "mackesd::mesh_dns",
             workgroup_root = %self.workgroup_root.display(),
             records = records.len(),
+            music_records = music_count,
             "mesh_dns sync tick",
         );
         // Preferred: per-link systemd-resolved domain (FDO interop).
@@ -235,6 +271,42 @@ fn which(bin: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| std::env::split_paths(&paths).any(|p| p.join(bin).is_file()))
         .unwrap_or(false)
+}
+
+/// `(hostname, overlay_ip)` for every directory peer — the source for the
+/// flat `<host>.mesh` join. Shared by the worker and the `mackesd dns` CLI so
+/// both read the directory snapshot the same way.
+#[must_use]
+pub fn directory_records(dir: &serde_json::Value) -> Vec<(String, String)> {
+    dir["peers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| {
+            Some((
+                p["hostname"].as_str()?.to_string(),
+                p["overlay_ip"].as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// MEDIA-5 — the overlay IPs of every live `Lighthouse_Media` in the directory
+/// snapshot, the membership of the `music.mesh` active-active set. A row is a
+/// media node iff its `media` flag is set — exactly MEDIA-1's
+/// `is_media_lighthouse` predicate, surfaced into the directory JSON by
+/// `directory_row` (media = a `media`-tagged genuine lighthouse). Rows
+/// without an overlay IP yet are dropped here so `build_music_records` only
+/// ever sees real addresses.
+#[must_use]
+pub fn media_overlay_ips(dir: &serde_json::Value) -> Vec<String> {
+    dir["peers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| p["media"].as_bool() == Some(true))
+        .filter_map(|p| p["overlay_ip"].as_str().map(str::to_string))
+        .collect()
 }
 
 #[async_trait::async_trait]
@@ -308,5 +380,86 @@ mod tests {
             std::fs::read_to_string(&hosts).unwrap(),
             "127.0.0.1 localhost\n"
         );
+    }
+
+    #[test]
+    fn music_record_set_is_active_active_over_every_media_ip() {
+        // MEDIA-5 — music.mesh is a record SET: one record per live media
+        // overlay IP, all under the single `music.mesh` name (active-active).
+        let recs = build_music_records(&[
+            "10.42.0.5".into(),
+            "10.42.0.2".into(),
+            String::new(),      // a media-LH with no overlay IP yet — dropped
+            "10.42.0.5".into(), // a dup (two reads of the same node) — collapsed
+        ]);
+        assert_eq!(recs.len(), 2, "empties dropped, dups collapsed");
+        assert!(recs.iter().all(|r| r.fqdn == MUSIC_FQDN));
+        // Sorted by IP for a stable, idempotent /etc/hosts block.
+        assert_eq!(recs[0].overlay_ip, "10.42.0.2");
+        assert_eq!(recs[1].overlay_ip, "10.42.0.5");
+    }
+
+    #[test]
+    fn no_media_lighthouses_means_no_music_record() {
+        // §7 — the name is served only where the service exists: zero media
+        // nodes → an empty set → no `music.mesh` line in the hosts block.
+        assert!(build_music_records(&[]).is_empty());
+        let merged = merge_hosts("127.0.0.1 localhost\n", &build_music_records(&[]));
+        assert_eq!(merged, "127.0.0.1 localhost\n");
+    }
+
+    #[test]
+    fn media_overlay_ips_reads_only_the_media_flagged_rows() {
+        // MEDIA-1's `media` flag is the membership gate (surfaced into the
+        // directory JSON by directory_row); a plain lighthouse / peer is out.
+        let dir = serde_json::json!({ "peers": [
+            { "hostname": "media-a", "overlay_ip": "10.42.0.2", "media": true },
+            { "hostname": "media-b", "overlay_ip": "10.42.0.5", "media": true },
+            { "hostname": "plain-lh", "overlay_ip": "10.42.0.9", "media": false },
+            { "hostname": "peer-1",   "overlay_ip": "10.42.0.7" }, // no media key
+        ]});
+        let ips = media_overlay_ips(&dir);
+        assert_eq!(ips, vec!["10.42.0.2".to_string(), "10.42.0.5".to_string()]);
+    }
+
+    #[test]
+    fn sync_serves_music_mesh_from_a_live_media_lighthouse() {
+        // End-to-end through the worker: a replicated media-lighthouse record
+        // lands `music.mesh -> its overlay IP` in the hosts file, alongside its
+        // own `<host>.mesh` record — both via the existing merge path.
+        use mackes_mesh_types::peers::{peers_dir, write_peer_record, PeerRecord};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wg");
+        let pdir = peers_dir(&root);
+        std::fs::create_dir_all(&pdir).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        let mut rec = PeerRecord::now("anvil", Some("11.0".into()), "healthy");
+        rec.last_seen_ms = now;
+        rec.overlay_ip = Some("10.42.0.42".into());
+        rec.role = Some("lighthouse".into());
+        rec.media = true; // a genuine Lighthouse_Media (MEDIA-1)
+        write_peer_record(&pdir, &rec).unwrap();
+
+        let hosts = tmp.path().join("hosts");
+        std::fs::write(&hosts, "127.0.0.1 localhost\n").unwrap();
+        let w = MeshDnsWorker::new(None)
+            .with_hosts_path(hosts.clone())
+            .with_workgroup_root(root);
+        w.sync();
+        let written = std::fs::read_to_string(&hosts).unwrap();
+        // The media node resolves both names to its overlay IP.
+        assert!(
+            written.contains("10.42.0.42\tanvil.mesh"),
+            "the <host>.mesh record still emits: {written}"
+        );
+        assert!(
+            written.contains("10.42.0.42\tmusic.mesh"),
+            "music.mesh is now a served active-active record: {written}"
+        );
+        // Idempotent — a second tick is a fixed point (no churn).
+        w.sync();
+        assert_eq!(std::fs::read_to_string(&hosts).unwrap(), written);
     }
 }
