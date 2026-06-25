@@ -141,8 +141,39 @@ pub enum Message {
     /// proposal to the copilot PROPOSE topic (`action/copilot/proposal`, FD-12's
     /// review queue) — it does NOT publish to FD-11's execution topic and does NOT
     /// execute anything (§9 — the GUI never auto-executes; the gated confirm/exec
-    /// surface that drains the propose queue is a separate, out-of-scope UI).
+    /// surface that drains the propose queue is the FRONTDOOR-11 confirm gate below,
+    /// where the operator REVIEWS the preview + confirms before anything runs).
     ProposeSuggestion(usize),
+    /// FRONTDOOR-11 — open the **Pending actions** review surface (the confirm-gate
+    /// overlay listing the queued proposals). Reachable from the Front Door's
+    /// pending indicator; no proposal executes by opening it (it only shows the
+    /// previews — §9).
+    OpenPending,
+    /// FRONTDOOR-11 — close the Pending actions review surface, back to the grid.
+    ClosePending,
+    /// FRONTDOOR-11 — the typed-confirm field for the proposal at index `usize`
+    /// changed (the operator is typing the confirm word for a DESTRUCTIVE action).
+    /// Records the text; the "Execute" affordance only arms once it matches (Q10).
+    /// Normal (non-destructive) proposals never need this (they approve 1-click).
+    ConfirmInputChanged(usize, String),
+    /// FRONTDOOR-11 — the operator CONFIRMED the proposal at index `usize` (the
+    /// 1-click "Approve" for a normal action, or "Execute" once the typed-confirm
+    /// matches for a destructive one). This is the ONLY path that publishes the
+    /// typed `ActionRequest` to the EXEC topic (`action/exec/request`) — the gate
+    /// re-checks [`pending::PendingProposal::armed`] before publishing, so a
+    /// destructive kind can never fire without the typed word (§9). The result
+    /// comes back as [`Message::ExecResult`].
+    ApproveProposal(usize),
+    /// FRONTDOOR-11 — the operator DISMISSED the proposal at index `usize` (reject,
+    /// no execute). Marks it dismissed on the card — it is never published to the
+    /// exec topic (§9 — only a confirm executes).
+    DismissProposal(usize),
+    /// FRONTDOOR-11 — the action worker's typed reply for the proposal with bus id
+    /// `String` landed (or the round-trip degraded). The bool is the worker's `ok`;
+    /// the message is its `detail`/`error`. Folded onto the card as the RESULT
+    /// (succeeded / failed). Keyed by the proposal's stable id (not its index) so a
+    /// reload that reorders the list still resolves the right card.
+    ExecResult(String, bool, String),
 }
 
 /// FRONTDOOR-3 — which of the two locked render modes the Front Door is in
@@ -508,6 +539,12 @@ pub struct FrontDoorData {
     /// on (re-published to the propose topic), NEVER executed from the GUI (§9).
     /// Empty when the topic is absent / the mesh is quiet (Q61).
     pub suggestions: Vec<copilot::Suggestion>,
+    /// FRONTDOOR-11 — the live pending PROPOSALS read off `action/copilot/proposal`
+    /// (FD-10's "Act" + FD-12's CodeEdit proposals publish here). Each is a typed
+    /// proposal the operator REVIEWS (preview) and GATES (1-click / typed-confirm)
+    /// before it executes — never auto-run (§9). Empty when the propose queue is
+    /// absent / empty. Parsed GUI-side off the wire shape (the §6 boundary).
+    pub pending: Vec<pending::PendingProposal>,
     /// FRONTDOOR-6 — the raw Peers directory rows, carried through so the unified
     /// search has the live mesh entities (nodes + services) without a second Bus
     /// read. The widget projections above are derived from these same rows.
@@ -556,6 +593,12 @@ impl FrontDoorData {
         let suggestions =
             copilot::parse_suggestions(latest_body(copilot::SUGGESTIONS_TOPIC).as_deref());
 
+        // FRONTDOOR-11 — the live proposal queue: every message on the propose
+        // topic is one typed proposal the operator gates (§7 — real bus data, no
+        // demo). Read the whole topic (each `StoredMessage` is one proposal) and
+        // parse GUI-side; an absent Bus / empty topic leaves the gate empty.
+        let pending = pending::parse(&topic_messages(copilot::PROPOSAL_TOPIC));
+
         Self {
             mesh_map: project::mesh_map(&peers),
             node_health: project::node_health(&peers),
@@ -567,6 +610,8 @@ impl FrontDoorData {
             // FRONTDOOR-10 — the Copilot tile's live value + the ranked suggestions.
             copilot: copilot_status.map(|s| s.tile_value()),
             suggestions,
+            // FRONTDOOR-11 — the live proposal queue for the confirm gate.
+            pending,
             // FRONTDOOR-6 — carry the raw roster for the unified mesh search.
             peers,
         }
@@ -585,6 +630,69 @@ fn latest_body(topic: &str) -> Option<String> {
     let persist = mde_bus::persist::Persist::open(dir).ok()?;
     let msgs = persist.list_since(topic, None).ok()?;
     msgs.last().and_then(|m| m.body.clone())
+}
+
+/// FRONTDOOR-11 — read every message on a topic as `(ulid, body)` pairs, oldest
+/// first (the same `list_since(topic, None)` the other widget loaders use, but the
+/// WHOLE topic rather than just the newest body). The propose queue carries one
+/// proposal per message, so the gate needs them all — each with its bus ulid as a
+/// stable id. Best-effort: no Bus data-dir / a read fault ⇒ an empty list (the
+/// gate just shows nothing — §7, never a faked card).
+#[must_use]
+fn topic_messages(topic: &str) -> Vec<(String, Option<String>)> {
+    let Some(dir) = mde_bus::default_data_dir() else {
+        return Vec::new();
+    };
+    let Ok(persist) = mde_bus::persist::Persist::open(dir) else {
+        return Vec::new();
+    };
+    let Ok(msgs) = persist.list_since(topic, None) else {
+        return Vec::new();
+    };
+    msgs.into_iter().map(|m| (m.ulid, m.body)).collect()
+}
+
+/// FRONTDOOR-11 — parse the action worker's typed reply into `(ok, message)` for
+/// the card's RESULT line. The reply is the FD-11 `ActionReply` JSON
+/// (`{ok, detail?, error?}`): `ok:true` ⇒ succeeded (the `detail` note); `ok:false`
+/// ⇒ failed (the `error`). A `None` body (no Bus / no worker / timeout) or
+/// malformed JSON degrades to a quiet failure (Q33 — no spew, never a hang, never
+/// a panic). Pure + Bus-free so the result mapping is unit-tested directly.
+#[must_use]
+fn parse_exec_reply(raw: Option<&str>) -> (bool, String) {
+    let Some(body) = raw else {
+        return (
+            false,
+            "No reply from the action worker (it may be offline).".to_string(),
+        );
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
+        return (
+            false,
+            "The action worker sent an unreadable reply.".to_string(),
+        );
+    };
+    let ok = v
+        .get("ok")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if ok {
+        let detail = v
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("dispatched")
+            .trim()
+            .to_string();
+        (true, detail)
+    } else {
+        let error = v
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("the worker rejected the action")
+            .trim()
+            .to_string();
+        (false, error)
+    }
 }
 
 /// FRONTDOOR-4 — the pure widget-value projections. Each maps already-parsed data
@@ -1291,6 +1399,363 @@ pub(super) mod copilot {
     }
 }
 
+// ============== FRONTDOOR-11 (GUI half): the confirm-gate execution UI ========
+
+/// FRONTDOOR-11 — the gated-execution surface: the GUI half that closes the
+/// Copilot action loop (design Q10: preview/diff + 1-click, typed-confirm for
+/// high-risk; Q44: preview = commands + target node(s) + effect + dry-run). FD-10
+/// landed the "Act" button (it queues a typed PROPOSAL onto `action/copilot/
+/// proposal`); FD-11's backend landed the typed, audited **action worker** (it
+/// drains `action/exec/request`). This module is the operator gate BETWEEN them:
+/// it reads the propose queue, renders each proposal with a PREVIEW, and — ONLY on
+/// the operator's explicit confirm (1-click for normal, a TYPED confirm word for
+/// destructive kinds) — publishes the typed `ActionRequest` to the EXECUTION topic
+/// so the worker runs it (gated + audited). Nothing here ever auto-executes (§9).
+///
+/// Pure parse / preview / classification (no Bus / no view) so the whole gate is
+/// unit-tested directly — the Bus read in [`FrontDoorData::read`] and the execute
+/// publish in [`FrontDoor::update`] are thin shells over this. The workbench can't
+/// depend on `mackesd` (the §6 mesh/desktop boundary — the `ActionRequest` /
+/// `ActionProposal` enums live in `mackesd::workers`), so this mirrors the WIRE
+/// shapes and parses them GUI-side, exactly as FD-10 parses the suggestion JSON.
+pub(super) mod pending {
+    /// The bus topic the FD-11 action worker drains
+    /// (`mackesd::workers::action::ACTION_TOPIC`). Publishing a typed
+    /// `ActionRequest` JSON here triggers the worker's GATED + AUDITED execution.
+    /// The confirm gate writes HERE **only** on the operator's explicit confirm —
+    /// never on a render, never from a 1-click for a destructive kind (§9).
+    pub const EXEC_TOPIC: &str = "action/exec/request";
+
+    /// How long the confirm gate waits for the action worker's typed reply on the
+    /// generic `reply/<ulid>` lane before surfacing a degrade. A dispatch is local
+    /// file I/O + one audit insert (sub-millisecond on the leader), but the request
+    /// must reach the elected leader over replication, so a generous ceiling keeps
+    /// a slow round-trip from reading as a false failure. No-Bus / no-worker
+    /// degrades immediately (the request client returns `None` with no data-dir).
+    pub const EXEC_TIMEOUT_SECS: u64 = 30;
+
+    /// The risk class the confirm gate enforces per proposal (design Q10). A
+    /// destructive kind can ONLY be fired through a typed-confirm — a 1-click can
+    /// never trigger it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Risk {
+        /// Reversible / low-blast-radius (e.g. a service start/restart) — a single
+        /// "Approve" click is the gate.
+        Normal,
+        /// High-blast-radius / destructive (the design's locked set: code-edit,
+        /// destroy, cutover, delete) — the operator must TYPE the confirm word
+        /// before "Execute" is live (Q10).
+        HighRisk,
+    }
+
+    /// The high-risk / destructive action KINDS that REQUIRE a typed confirm
+    /// (design Q10 — the locked set). Matched against the proposal's `action.kind`
+    /// tag (the FD-11 `ActionRequest` serde tag). Both the hyphen + underscore
+    /// spellings are listed so the gate is robust to either serde casing the
+    /// backend evolves to (`code-edit` vs `code_edit`) — classification erring
+    /// toward MORE friction is always the safe default for a destructive op.
+    pub const HIGH_RISK_KINDS: &[&str] = &[
+        "code-edit",
+        "code_edit",
+        "codeedit",
+        "destroy",
+        "cutover",
+        "delete",
+    ];
+
+    /// The word the operator must type to arm a destructive execute (Q10 — the
+    /// typed-confirm). Fixed + uppercase so it's deliberate (you can't fat-finger
+    /// it). Compared case-insensitively after a trim.
+    pub const CONFIRM_WORD: &str = "CONFIRM";
+
+    /// Classify an action `kind` tag into its [`Risk`]. A kind in
+    /// [`HIGH_RISK_KINDS`] is destructive (typed-confirm); anything else — incl. an
+    /// unknown kind the GUI doesn't model — is treated as [`Risk::Normal`] ONLY
+    /// when it is a known-reversible kind, and otherwise still normal but the
+    /// preview makes the kind explicit. Pure + case-insensitive.
+    #[must_use]
+    pub fn classify(kind: &str) -> Risk {
+        let k = kind.trim().to_lowercase();
+        if HIGH_RISK_KINDS.iter().any(|h| *h == k) {
+            Risk::HighRisk
+        } else {
+            Risk::Normal
+        }
+    }
+
+    /// Has the operator typed the confirm word? Case-insensitive after a trim, so
+    /// "confirm" / " CONFIRM " both arm. Only consulted for a [`Risk::HighRisk`]
+    /// proposal — a [`Risk::Normal`] one approves on a single click.
+    #[must_use]
+    pub fn confirm_matches(typed: &str) -> bool {
+        typed.trim().eq_ignore_ascii_case(CONFIRM_WORD)
+    }
+
+    /// The lifecycle of one pending proposal in the gate, so a card can show its
+    /// execution RESULT (Q44 preview → confirm → result). `Pending` until the
+    /// operator acts; `Executing` while the worker round-trip is in flight;
+    /// `Succeeded`/`Failed` from the typed `ActionReply`; `Dismissed` when the
+    /// operator rejects it (no execute).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ExecState {
+        /// Awaiting the operator's confirm (the default).
+        Pending,
+        /// The confirm fired; the worker round-trip is in flight.
+        Executing,
+        /// The worker accepted + dispatched the action (`ActionReply.ok == true`).
+        Succeeded(String),
+        /// The worker rejected it, or the round-trip degraded (no Bus / timeout).
+        Failed(String),
+        /// The operator dismissed the proposal — it was NOT executed.
+        Dismissed,
+    }
+
+    /// One pending proposal, parsed GUI-side off `action/copilot/proposal` (§7 —
+    /// real bus data, no demo). Carries the PREVIEW the operator reviews (Q44:
+    /// the action kind + target node(s) + a human-readable effect + a dry-run
+    /// command line), its [`Risk`] class (which gate to show), the EXACT inner
+    /// `action` JSON to publish to [`EXEC_TOPIC`] on confirm (the bare
+    /// `ActionRequest` shape the worker accepts — NOT the wrapping proposal), and
+    /// the live [`ExecState`] driving the result line. Built by [`parse`].
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct PendingProposal {
+        /// A stable id for the proposal — the bus message ulid it arrived on. Used
+        /// to address the card across reloads (so an in-flight / resolved gate is
+        /// not reset when a fresh snapshot lands carrying the same proposal).
+        pub id: String,
+        /// The action KIND tag (the FD-11 `ActionRequest` serde tag, e.g.
+        /// `service_lifecycle`) — the first preview line + the risk driver.
+        pub kind: String,
+        /// The target node(s) this action touches (Q44), e.g. `["oak"]`. Empty
+        /// when the typed params name no host (the preview then says "this node").
+        pub targets: Vec<String>,
+        /// A human-readable one-line EFFECT (Q44), e.g. "restart container nginx".
+        /// Derived from the typed params — never a raw command echo.
+        pub effect: String,
+        /// The DRY-RUN command line the worker's fixed plan would run (Q44), e.g.
+        /// `podman restart nginx` — shown as "what would run", never executed here.
+        /// `None` when the kind carries no modelled dry-run.
+        pub dry_run: Option<String>,
+        /// The Copilot's rationale (why it proposed this), carried from the
+        /// proposal so the gate shows the reasoning, not just a bare command.
+        pub rationale: String,
+        /// The risk class — drives whether the gate is a 1-click or a typed-confirm.
+        pub risk: Risk,
+        /// The EXACT inner `action` object JSON to publish to [`EXEC_TOPIC`] on
+        /// confirm: the bare `ActionRequest` (`{"kind":…, …typed params…}`) the
+        /// worker accepts. Re-serialized from the proposal's `action` field so it
+        /// round-trips verbatim — never re-derived, never the wrapping proposal.
+        pub exec_body: String,
+        /// The live execution lifecycle (Q44 — the result on the card).
+        pub state: ExecState,
+    }
+
+    impl PendingProposal {
+        /// Does a 1-click "Approve" arm THIS proposal's execute? True only for a
+        /// [`Risk::Normal`] proposal — a destructive one needs the typed confirm
+        /// (the §9 invariant a test pins: a 1-click can never fire a destructive).
+        #[must_use]
+        pub fn approves_on_click(&self) -> bool {
+            self.risk == Risk::Normal
+        }
+
+        /// Given the operator's typed confirm text, is THIS proposal armed to
+        /// execute? Normal → always (the click is the confirm); high-risk → only
+        /// when the typed word matches (Q10). The single chokepoint the execute
+        /// handler consults so the gate logic lives in ONE tested place.
+        #[must_use]
+        pub fn armed(&self, typed_confirm: &str) -> bool {
+            match self.risk {
+                Risk::Normal => true,
+                Risk::HighRisk => confirm_matches(typed_confirm),
+            }
+        }
+    }
+
+    /// Parse the latest `action/copilot/proposal` body into the pending list the
+    /// gate renders. The topic carries one proposal per message — the GUI reads
+    /// the whole topic (each `StoredMessage` is one proposal) and parses each. The
+    /// body shape is the FD-12 `ActionProposal` JSON: `{"action":{…},"rationale":…}`
+    /// — `action` is the bare `ActionRequest` (`{"kind":…, …}`). Tolerant: a
+    /// proposal with no parseable `action` object is dropped (never a faked card),
+    /// malformed JSON for one entry doesn't sink the rest; `None`/empty ⇒ empty.
+    /// Each `(ulid, body)` pair is the bus message's id + body. Pure + Bus-free.
+    #[must_use]
+    pub fn parse(messages: &[(String, Option<String>)]) -> Vec<PendingProposal> {
+        messages
+            .iter()
+            .filter_map(|(ulid, body)| parse_one(ulid, body.as_deref()))
+            .collect()
+    }
+
+    /// Parse one proposal message into a [`PendingProposal`], or `None` when it
+    /// carries no usable typed `action` (an advisory-only / malformed body — never
+    /// surfaced as an executable card, §7). The `action` object is re-serialized
+    /// verbatim into `exec_body` (the bare `ActionRequest` the worker accepts).
+    #[must_use]
+    pub fn parse_one(ulid: &str, body: Option<&str>) -> Option<PendingProposal> {
+        let v: serde_json::Value = serde_json::from_str(body?.trim()).ok()?;
+        // The proposal wraps the typed action under `action`; some publishers may
+        // send the bare action directly — accept either (the action object is the
+        // thing the worker executes), preferring the wrapped form's rationale.
+        let action = v.get("action").filter(|a| a.is_object()).unwrap_or(&v);
+        if !action.is_object() {
+            return None;
+        }
+        let kind = action
+            .get("kind")
+            .and_then(serde_json::Value::as_str)?
+            .trim()
+            .to_string();
+        if kind.is_empty() {
+            return None;
+        }
+        let rationale = v
+            .get("rationale")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        // The EXACT inner action JSON to publish to the exec topic on confirm.
+        let exec_body = action.to_string();
+        let targets = targets_of(action);
+        let effect = effect_of(&kind, action);
+        let dry_run = dry_run_of(&kind, action);
+        Some(PendingProposal {
+            id: ulid.to_string(),
+            risk: classify(&kind),
+            kind,
+            targets,
+            effect,
+            dry_run,
+            rationale,
+            exec_body,
+            state: ExecState::Pending,
+        })
+    }
+
+    /// The target node(s) an action touches (Q44), pulled from the typed params.
+    /// `service_lifecycle` names a single `target_host`; other kinds may carry a
+    /// `target_host` or a `targets` array — both are read so the preview always
+    /// names the blast radius. Empty ⇒ the preview reads "this node".
+    fn targets_of(action: &serde_json::Value) -> Vec<String> {
+        if let Some(arr) = action.get("targets").and_then(serde_json::Value::as_array) {
+            return arr
+                .iter()
+                .filter_map(|t| t.as_str().map(str::to_string))
+                .filter(|t| !t.trim().is_empty())
+                .collect();
+        }
+        for field in ["target_host", "target", "host", "node"] {
+            if let Some(t) = action.get(field).and_then(serde_json::Value::as_str) {
+                if !t.trim().is_empty() {
+                    return vec![t.trim().to_string()];
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// A human-readable one-line EFFECT (Q44) from the typed params. Kind-specific
+    /// for the modelled kinds (`service_lifecycle` → "restart container nginx"),
+    /// with a generic fallback ("<kind>") for a kind the GUI doesn't yet model — so
+    /// a new backend kind still previews honestly rather than rendering blank.
+    fn effect_of(kind: &str, action: &serde_json::Value) -> String {
+        let s = |f: &str| {
+            action
+                .get(f)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        match kind {
+            "service_lifecycle" => {
+                let (op, sk, name) = (s("op"), s("service_kind"), s("name"));
+                let op = if op.is_empty() { "act on" } else { &op };
+                let sk = if sk.is_empty() { "service" } else { &sk };
+                if name.is_empty() {
+                    format!("{op} {sk}")
+                } else {
+                    format!("{op} {sk} {name}")
+                }
+            }
+            // A modelled-but-future destructive kind reads its op/name when present.
+            "destroy" | "delete" | "cutover" | "code-edit" | "code_edit" => {
+                let name = s("name");
+                let path = s("path");
+                let what = if !name.is_empty() {
+                    name
+                } else if !path.is_empty() {
+                    path
+                } else {
+                    String::new()
+                };
+                if what.is_empty() {
+                    kind.replace(['_', '-'], " ")
+                } else {
+                    format!("{} {what}", kind.replace(['_', '-'], " "))
+                }
+            }
+            other => other.replace(['_', '-'], " "),
+        }
+    }
+
+    /// The DRY-RUN command line (Q44 — "what would run") for the modelled kinds.
+    /// For `service_lifecycle` this mirrors the worker's FIXED command plan
+    /// (`podman <op> <name>` for a container, `virsh <verb> <name>` for a VM) so
+    /// the operator sees the actual command the gate would dispatch — NOT a guess,
+    /// and NEVER executed here. `None` for a kind with no modelled plan (the
+    /// preview omits the dry-run line rather than fabricate one). Pure.
+    #[must_use]
+    pub fn dry_run_of(kind: &str, action: &serde_json::Value) -> Option<String> {
+        let s = |f: &str| {
+            action
+                .get(f)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        match kind {
+            "service_lifecycle" => {
+                let (op, sk, name) = (s("op"), s("service_kind"), s("name"));
+                if name.is_empty() {
+                    return None;
+                }
+                match sk.as_str() {
+                    // The worker's container plan: `podman <op> <name>`.
+                    "container" => Some(format!("podman {} {name}", op_word(&op))),
+                    // The worker's VM plan: `virsh <verb> <name>` (start/shutdown/reboot).
+                    "vm" => Some(format!("virsh {} {name}", virsh_verb(&op))),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Map a lifecycle `op` to the podman subcommand the worker's fixed plan runs.
+    fn op_word(op: &str) -> &str {
+        match op {
+            "start" => "start",
+            "stop" => "stop",
+            "restart" => "restart",
+            _ => op,
+        }
+    }
+
+    /// Map a lifecycle `op` to the `virsh` verb the worker's fixed VM plan runs.
+    fn virsh_verb(op: &str) -> &str {
+        match op {
+            "start" => "start",
+            "stop" => "shutdown",
+            "restart" => "reboot",
+            _ => op,
+        }
+    }
+}
+
 /// The Front Door home state: the placeholder tile set + a loading flag, plus the
 /// FRONTDOOR-2 omnibox query. While `loading`, the grid draws flat grey skeleton
 /// cards instead of labeled tiles (Q92 — skeleton placeholders, no layout shift).
@@ -1336,6 +1801,22 @@ pub struct FrontDoor {
     /// lands / when the mesh is quiet (Q61). A suggestion is a PROPOSAL: acting on
     /// it re-publishes to the propose topic, never executes (§9).
     pub suggestions: Vec<copilot::Suggestion>,
+    /// FRONTDOOR-11 — the live pending PROPOSALS (off `action/copilot/proposal`),
+    /// folded in from the FD-4 [`FrontDoorData`] read. Each is a typed proposal the
+    /// operator REVIEWS + GATES in the confirm-gate surface before it executes;
+    /// nothing here auto-runs (§9). The per-proposal [`pending::ExecState`] carries
+    /// the result so a card shows succeeded/failed after a confirm. A fresh snapshot
+    /// is merged (not clobbered) so an in-flight / resolved gate survives a reload.
+    pub pending: Vec<pending::PendingProposal>,
+    /// FRONTDOOR-11 — whether the Pending actions review surface is open (the
+    /// confirm-gate overlay). Toggled by the pending indicator / its Back control;
+    /// opening it NEVER executes anything (it only shows the previews — §9).
+    pub show_pending: bool,
+    /// FRONTDOOR-11 — the operator's typed-confirm text, keyed by the proposal's
+    /// stable bus id, for DESTRUCTIVE proposals (the typed-confirm gate, Q10). A
+    /// normal proposal never reads this (it approves on a single click). Keyed by
+    /// id (not index) so the typed text survives a reload that reorders the list.
+    pub confirm_inputs: std::collections::HashMap<String, String>,
 }
 
 impl Default for FrontDoor {
@@ -1391,6 +1872,11 @@ impl FrontDoor {
             // FRONTDOOR-10 — no suggestions until the first snapshot (a quiet mesh
             // keeps it empty — Q61).
             suggestions: Vec::new(),
+            // FRONTDOOR-11 — no pending proposals / closed gate / no typed confirms
+            // until the first snapshot lands (an empty propose queue keeps it empty).
+            pending: Vec::new(),
+            show_pending: false,
+            confirm_inputs: std::collections::HashMap::new(),
         }
     }
 
@@ -1532,7 +2018,148 @@ impl FrontDoor {
                     |()| crate::Message::Noop,
                 )
             }
+            // FRONTDOOR-11 — open / close the Pending actions review surface. Pure
+            // local view-state flips; opening it shows the PREVIEWS only, executing
+            // nothing (§9 — the confirm gate is the only execute path).
+            Message::OpenPending => {
+                self.show_pending = true;
+                Task::none()
+            }
+            Message::ClosePending => {
+                self.show_pending = false;
+                Task::none()
+            }
+            // FRONTDOOR-11 — the operator is typing the confirm word for a
+            // DESTRUCTIVE proposal (Q10 — typed-confirm). Record it keyed by the
+            // proposal's stable id so the typed text survives a reload; the
+            // "Execute" affordance arms only once it matches. No Bus, no execute.
+            Message::ConfirmInputChanged(i, text) => {
+                if let Some(p) = self.pending.get(i) {
+                    self.confirm_inputs.insert(p.id.clone(), text);
+                }
+                Task::none()
+            }
+            // FRONTDOOR-11 — the operator CONFIRMED the proposal. This is the ONLY
+            // path that publishes a typed `ActionRequest` to the EXEC topic
+            // (`action/exec/request`). The gate re-checks `armed()` HERE so a
+            // destructive kind can never fire without the matching typed-confirm —
+            // a stale / not-armed confirm is an inert no-op (§9). On a valid arm,
+            // publish the EXACT inner action JSON (the bare `ActionRequest` the
+            // worker accepts) and block for the typed reply on the generic
+            // `reply/<ulid>` lane (the request client does both), then fold the
+            // result onto the card via `ExecResult`. The Bus client owns its own
+            // runtime (`Persist`/rusqlite isn't `Send`), so it rides `spawn_blocking`
+            // — the same contract every other Bus round-trip here follows.
+            Message::ApproveProposal(i) => {
+                let Some(p) = self.pending.get(i) else {
+                    return Task::none();
+                };
+                // The §9 chokepoint: a destructive kind requires the typed confirm.
+                let typed = self.confirm_inputs.get(&p.id).cloned().unwrap_or_default();
+                if !p.armed(&typed) {
+                    // Not armed (a destructive kind whose confirm word isn't typed):
+                    // refuse to publish. Nothing reaches the exec topic.
+                    return Task::none();
+                }
+                let id = p.id.clone();
+                let body = p.exec_body.clone();
+                // Mark it in-flight so the card shows "Executing…" immediately.
+                self.set_exec_state(&id, pending::ExecState::Executing);
+                let timeout = Duration::from_secs(pending::EXEC_TIMEOUT_SECS);
+                Task::perform(
+                    async move {
+                        // Publish the typed ActionRequest to the EXEC topic and block
+                        // for the worker's typed `ActionReply` on `reply/<ulid>`.
+                        let raw = tokio::task::spawn_blocking(move || {
+                            crate::dbus::action_request_with_body(
+                                pending::EXEC_TOPIC,
+                                Some(&body),
+                                timeout,
+                            )
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+                        let (ok, msg) = parse_exec_reply(raw.as_deref());
+                        (id, ok, msg)
+                    },
+                    |(id, ok, msg)| crate::Message::FrontDoor(Message::ExecResult(id, ok, msg)),
+                )
+            }
+            // FRONTDOOR-11 — the operator DISMISSED the proposal (reject, no
+            // execute). Mark the card dismissed — it is NEVER published to the exec
+            // topic (§9 — only a confirm executes). The dismissed card stays on
+            // screen as an audit of the decision until the next reload drops it.
+            Message::DismissProposal(i) => {
+                if let Some(p) = self.pending.get(i) {
+                    let id = p.id.clone();
+                    self.set_exec_state(&id, pending::ExecState::Dismissed);
+                }
+                Task::none()
+            }
+            // FRONTDOOR-11 — the worker's typed reply landed (or the round-trip
+            // degraded): fold it onto the card as the RESULT (succeeded / failed),
+            // keyed by the proposal's stable id so a reorder doesn't mis-target.
+            Message::ExecResult(id, ok, msg) => {
+                let state = if ok {
+                    pending::ExecState::Succeeded(msg)
+                } else {
+                    pending::ExecState::Failed(msg)
+                };
+                self.set_exec_state(&id, state);
+                Task::none()
+            }
         }
+    }
+
+    /// FRONTDOOR-11 — set the live [`pending::ExecState`] on the proposal with the
+    /// given stable bus id (the confirm / dismiss / result transitions). Keyed by
+    /// id (not index) so a reload that reorders the list still resolves the right
+    /// card. A no-op if the proposal is gone (it resolved + the queue moved on).
+    fn set_exec_state(&mut self, id: &str, state: pending::ExecState) {
+        if let Some(p) = self.pending.iter_mut().find(|p| p.id == id) {
+            p.state = state;
+        }
+    }
+
+    /// FRONTDOOR-11 — merge a fresh proposal snapshot into the live gate, PRESERVING
+    /// each surviving proposal's gate state (its [`pending::ExecState`]) so a
+    /// slow-poll reload never resets a confirm-in-flight, a shown result, or a
+    /// dismissal. A proposal still present keeps its live state; a genuinely-new
+    /// proposal arrives `Pending`; a proposal that fell off the queue (resolved
+    /// upstream) drops, and its stale typed-confirm text is garbage-collected so
+    /// the map can't grow unbounded. Pure given the snapshot.
+    fn merge_pending(&mut self, fresh: Vec<pending::PendingProposal>) {
+        use std::collections::HashMap;
+        // Index the live cards by id so a surviving proposal keeps its gate state.
+        let mut live: HashMap<String, pending::ExecState> =
+            self.pending.drain(..).map(|p| (p.id, p.state)).collect();
+        self.pending = fresh
+            .into_iter()
+            .map(|mut p| {
+                if let Some(state) = live.remove(&p.id) {
+                    p.state = state;
+                }
+                p
+            })
+            .collect();
+        // GC the typed-confirm map down to the ids still present (a dropped
+        // proposal's half-typed confirm shouldn't linger / leak).
+        let ids: std::collections::HashSet<&str> =
+            self.pending.iter().map(|p| p.id.as_str()).collect();
+        self.confirm_inputs
+            .retain(|id, _| ids.contains(id.as_str()));
+    }
+
+    /// FRONTDOOR-11 — the count of proposals still AWAITING the operator (state
+    /// `Pending`), for the pending indicator badge. Resolved / dismissed cards
+    /// don't count toward "needs attention". 0 ⇒ the indicator hides.
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        self.pending
+            .iter()
+            .filter(|p| p.state == pending::ExecState::Pending)
+            .count()
     }
 
     /// FRONTDOOR-6 — recompute the instant LOCAL results for the current query
@@ -1617,6 +2244,10 @@ impl FrontDoor {
         // card text in that tile's detail). Replaced wholesale each snapshot so a
         // resolved suggestion drops off rather than lingering (§7 — no stale card).
         self.suggestions = data.suggestions.clone();
+        // FRONTDOOR-11 — merge the fresh proposal queue, preserving the live gate
+        // state (an in-flight / resolved / dismissed card) for a proposal still
+        // present, so a slow-poll reload never resets a confirm in progress.
+        self.merge_pending(data.pending.clone());
         // FRONTDOOR-6 — refresh the search roster; re-rank live results so a
         // roster change while the operator is mid-search shows through.
         self.peers = data.peers.clone();
@@ -1661,6 +2292,13 @@ impl FrontDoor {
     #[must_use]
     pub fn view(&self) -> Element<'_, crate::Message, Theme> {
         let palette = crate::live_theme::palette();
+        // FRONTDOOR-11 — the Pending actions review surface (the confirm gate) takes
+        // over the pane when open, reachable from either mode's pending indicator.
+        // Rendered before the grid so the operator reviews + gates proposals; its
+        // Back control returns to the grid. Opening it executes nothing (§9).
+        if self.show_pending {
+            return self.pending_view(palette);
+        }
         // FRONTDOOR-5 — an open tile detail takes over the pane (Q45/Q49): the
         // actions menu for the clicked tile, with a Back control to the grid.
         // Validate the index against the live tile set so a stale index can never
@@ -1835,14 +2473,18 @@ impl FrontDoor {
                 .width(Length::Fill)
                 .into();
 
-        // Top bar: the omnibox stretches; the mode toggle sits at its right.
-        let top_bar = container(
-            row![omnibox, self.mode_toggle(palette)]
-                .spacing(12)
-                .align_y(cosmic::iced::Alignment::Center),
-        )
-        .width(Length::Fill)
-        .padding(Padding::from([16u16, 16u16]));
+        // Top bar: the omnibox stretches; the FD-11 pending indicator + the mode
+        // toggle sit at its right.
+        let mut controls = row![omnibox]
+            .spacing(12)
+            .align_y(cosmic::iced::Alignment::Center);
+        if let Some(indicator) = self.pending_indicator(palette) {
+            controls = controls.push(indicator);
+        }
+        controls = controls.push(self.mode_toggle(palette));
+        let top_bar = container(controls)
+            .width(Length::Fill)
+            .padding(Padding::from([16u16, 16u16]));
 
         // FRONTDOOR-6 — a non-empty query REPLACES the icon grid with the unified
         // search results (instant local hits + the AI card streaming in below);
@@ -1985,13 +2627,18 @@ impl FrontDoor {
                 .width(Length::Fill)
                 .into();
 
-        let omnibox_bar = container(
-            row![omnibox, self.mode_toggle(palette)]
-                .spacing(12)
-                .align_y(cosmic::iced::Alignment::Center),
-        )
-        .width(Length::Fill)
-        .padding(Padding::from([16u16, 16u16]));
+        // FRONTDOOR-11 — the pending indicator sits between the omnibox and the
+        // mode toggle, surfacing the queued-proposals count + opening the gate.
+        let mut omnibox_row = row![omnibox]
+            .spacing(12)
+            .align_y(cosmic::iced::Alignment::Center);
+        if let Some(indicator) = self.pending_indicator(palette) {
+            omnibox_row = omnibox_row.push(indicator);
+        }
+        omnibox_row = omnibox_row.push(self.mode_toggle(palette));
+        let omnibox_bar = container(omnibox_row)
+            .width(Length::Fill)
+            .padding(Padding::from([16u16, 16u16]));
 
         // FRONTDOOR-6 — a non-empty query REPLACES the tile grid with the unified
         // search results (instant local hits + the AI card below); an empty query
@@ -2206,6 +2853,129 @@ impl FrontDoor {
         )
         .on_press(crate::Message::FrontDoor(Message::ToggleMode))
         .into()
+    }
+
+    /// FRONTDOOR-11 — the **pending actions** indicator in the top bar: a pill
+    /// surfacing the count of proposals AWAITING the operator, opening the confirm
+    /// gate ([`Message::OpenPending`]). `None` when nothing is pending (no dead
+    /// affordance — §7); a count badge accents it when proposals queue up. The
+    /// indicator only navigates to the review surface — it executes nothing (§9).
+    /// Carbon chrome via tokens only (§4).
+    fn pending_indicator(&self, palette: Palette) -> Option<Element<'_, crate::Message, Theme>> {
+        let count = self.pending_count();
+        if count == 0 {
+            return None;
+        }
+        let accent = palette.accent.into_cosmic_color();
+        let idle_bg = palette.hover_tint().into_cosmic_color();
+        let label = if count == 1 {
+            "1 pending action".to_string()
+        } else {
+            format!("{count} pending actions")
+        };
+        Some(
+            button(
+                text(label)
+                    .size(TypeRole::Body.size_in(FontSize::defaults()))
+                    .colr(accent),
+            )
+            .padding(Padding::from([8u16, 14u16]))
+            .sty(
+                move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+                    use cosmic::iced::widget::button::Status;
+                    let bg = match status {
+                        Status::Hovered | Status::Pressed => accent_tint(accent),
+                        _ => idle_bg,
+                    };
+                    cosmic::iced::widget::button::Style {
+                        snap: false,
+                        background: Some(Background::Color(bg)),
+                        text_color: accent,
+                        border: Border {
+                            color: accent,
+                            width: 1.0,
+                            radius: 6.0.into(),
+                        },
+                        shadow: cosmic::iced::Shadow::default(),
+                        ..cosmic::iced::widget::button::Style::default()
+                    }
+                },
+            )
+            .on_press(crate::Message::FrontDoor(Message::OpenPending))
+            .into(),
+        )
+    }
+
+    /// FRONTDOOR-11 — the **Pending actions** review surface: the confirm gate
+    /// (design Q10 + Q44). Lists each queued proposal as a card showing its PREVIEW
+    /// (the action kind + target node(s) + a human-readable effect + a dry-run line)
+    /// then its CONFIRM GATE (a 1-click "Approve" for a normal action, or a
+    /// typed-confirm field + a "Execute" that only arms once the word is typed, for
+    /// a destructive kind), plus "Dismiss" (reject, no execute) and — once acted on
+    /// — the execution RESULT. Under a Back control to the grid. Reachable from both
+    /// modes' pending indicators. ONLY an explicit confirm publishes to the exec
+    /// topic; the preview is ALWAYS shown before any execute (§9). Tokens only (§4).
+    fn pending_view(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
+        let sizes = FontSize::defaults();
+        let back = nav_back_button(
+            "← Back",
+            crate::Message::FrontDoor(Message::ClosePending),
+            palette,
+        );
+
+        let header = column![
+            text("Pending actions")
+                .size(TypeRole::Heading.size_in(sizes))
+                .colr(palette.text.into_cosmic_color()),
+            text(
+                "Review each proposal's preview, then confirm to execute. \
+                 Destructive actions need a typed confirm.",
+            )
+            .size(TypeRole::Caption.size_in(sizes))
+            .colr(palette.text_muted.into_cosmic_color()),
+        ]
+        .spacing(4);
+
+        let mut list = column![].spacing(14).width(Length::Fill);
+        if self.pending.is_empty() {
+            list = list.push(
+                text("No pending actions. Queued Copilot proposals appear here.")
+                    .size(TypeRole::Body.size_in(sizes))
+                    .colr(palette.text_muted.into_cosmic_color()),
+            );
+        } else {
+            for (i, p) in self.pending.iter().enumerate() {
+                let typed = self
+                    .confirm_inputs
+                    .get(&p.id)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                list = list.push(proposal_card(i, p, typed, palette));
+            }
+        }
+
+        let body = column![
+            back,
+            Space::new().height(Length::Fixed(16.0)),
+            header,
+            Space::new().height(Length::Fixed(20.0)),
+            list,
+        ]
+        .spacing(8)
+        .width(Length::Fill);
+
+        let scroller = scrollable(container(body).padding(Padding::from([24u16, 24u16])))
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+        container(scroller)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(palette.background.into_cosmic_color())),
+                ..container::Style::default()
+            })
+            .into()
     }
 }
 
@@ -2423,6 +3193,289 @@ fn suggestion_card<'a>(
             background: Some(Background::Color(palette.raised.into_cosmic_color())),
             border: Border {
                 color: palette.border.into_cosmic_color(),
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// A shared **Back** control: an accent ghost button firing the given message.
+/// The detail menu + the FD-11 pending surface both head their pane with one, so
+/// the chrome is identical (accent text, a quiet idle wash that lifts on hover).
+/// Tokens only (§4).
+fn nav_back_button<'a>(
+    label: &'a str,
+    msg: crate::Message,
+    palette: Palette,
+) -> Element<'a, crate::Message, Theme> {
+    let accent = palette.accent.into_cosmic_color();
+    let raised = palette.raised.into_cosmic_color();
+    let idle_bg = palette.hover_tint().into_cosmic_color();
+    button(
+        text(label)
+            .size(TypeRole::Body.size_in(FontSize::defaults()))
+            .colr(accent),
+    )
+    .padding(Padding::from([8u16, 14u16]))
+    .sty(
+        move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+            use cosmic::iced::widget::button::Status;
+            let bg = match status {
+                Status::Hovered | Status::Pressed => raised,
+                _ => idle_bg,
+            };
+            cosmic::iced::widget::button::Style {
+                snap: false,
+                background: Some(Background::Color(bg)),
+                text_color: accent,
+                border: Border {
+                    color: cosmic::iced::Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 6.0.into(),
+                },
+                shadow: cosmic::iced::Shadow::default(),
+                ..cosmic::iced::widget::button::Style::default()
+            }
+        },
+    )
+    .on_press(msg)
+    .into()
+}
+
+/// FRONTDOOR-11 — a filled action button for the confirm gate (the 1-click
+/// "Approve" / the typed-confirm "Execute" / "Dismiss"). `tone` colors the fill so
+/// a destructive "Execute" reads danger-toned and a normal "Approve" reads accent;
+/// `enabled == false` (a destructive Execute before the confirm word is typed)
+/// drops the `on_press` so the button is visibly inert — a 1-click can NEVER fire
+/// a destructive action (§9). Tokens only (§4).
+fn gate_button<'a>(
+    label: &'a str,
+    tone: cosmic::iced::Color,
+    enabled: bool,
+    msg: crate::Message,
+    palette: Palette,
+) -> Element<'a, crate::Message, Theme> {
+    let on_bg = tone;
+    let on_fg = palette.background.into_cosmic_color();
+    // A disarmed button reads muted + non-interactive (no fill, muted text).
+    let off_bg = palette.raised.into_cosmic_color();
+    let off_fg = palette.text_muted.into_cosmic_color();
+    let fg = if enabled { on_fg } else { off_fg };
+    let mut b = button(
+        text(label)
+            .size(TypeRole::Body.size_in(FontSize::defaults()))
+            .colr(fg),
+    )
+    .padding(Padding::from([8u16, 16u16]))
+    .sty(
+        move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+            use cosmic::iced::widget::button::Status;
+            let bg = if enabled {
+                match status {
+                    Status::Hovered | Status::Pressed => cosmic::iced::Color { a: 0.85, ..on_bg },
+                    _ => on_bg,
+                }
+            } else {
+                off_bg
+            };
+            cosmic::iced::widget::button::Style {
+                snap: false,
+                background: Some(Background::Color(bg)),
+                text_color: fg,
+                border: Border {
+                    color: cosmic::iced::Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 6.0.into(),
+                },
+                shadow: cosmic::iced::Shadow::default(),
+                ..cosmic::iced::widget::button::Style::default()
+            }
+        },
+    );
+    // §9 — only wire `on_press` when armed; a disarmed Execute is truly inert.
+    if enabled {
+        b = b.on_press(msg);
+    }
+    b.into()
+}
+
+/// FRONTDOOR-11 — one proposal card in the confirm gate (design Q10 + Q44). Top:
+/// the PREVIEW — the action kind (risk-toned) + target node(s) + the human-readable
+/// effect + the dry-run "what would run" line + the Copilot rationale. Bottom: the
+/// CONFIRM GATE depending on the proposal's [`pending::ExecState`]:
+/// * `Pending` + normal → a 1-click "Approve" + "Dismiss".
+/// * `Pending` + DESTRUCTIVE → a typed-confirm field; "Execute" is INERT until the
+///   operator types the confirm word (a 1-click can never fire it, §9); + "Dismiss".
+/// * `Executing` → an "Executing…" note (the worker round-trip is in flight).
+/// * `Succeeded`/`Failed` → the worker's RESULT line.
+/// * `Dismissed` → an "Dismissed (not executed)" note.
+///
+/// `i` is the proposal's index into [`FrontDoor::pending`] (the message target);
+/// `typed` is the operator's current confirm text. The preview is ALWAYS rendered
+/// before any execute affordance (§9). Tokens only (§4).
+fn proposal_card<'a>(
+    i: usize,
+    p: &'a pending::PendingProposal,
+    typed: &'a str,
+    palette: Palette,
+) -> Element<'a, crate::Message, Theme> {
+    let sizes = FontSize::defaults();
+    let danger = palette.danger.into_cosmic_color();
+    let accent = palette.accent.into_cosmic_color();
+    let muted = palette.text_muted.into_cosmic_color();
+    let txt = palette.text.into_cosmic_color();
+
+    let is_high = p.risk == pending::Risk::HighRisk;
+    let kind_tone = if is_high { danger } else { accent };
+
+    // ── PREVIEW (Q44): kind (+ risk badge) · targets · effect · dry-run · why ──
+    let risk_badge = if is_high {
+        "  •  destructive — typed confirm required"
+    } else {
+        ""
+    };
+    let mut preview = column![
+        text(format!("{}{risk_badge}", p.kind))
+            .size(TypeRole::Body.size_in(sizes))
+            .colr(kind_tone),
+        text(format!("Effect: {}", p.effect))
+            .size(TypeRole::Body.size_in(sizes))
+            .colr(txt),
+    ]
+    .spacing(4)
+    .width(Length::Fill);
+
+    let targets_line = if p.targets.is_empty() {
+        "Target: this node".to_string()
+    } else {
+        format!("Target: {}", p.targets.join(", "))
+    };
+    preview = preview.push(
+        text(targets_line)
+            .size(TypeRole::Caption.size_in(sizes))
+            .colr(muted),
+    );
+    if let Some(dry) = &p.dry_run {
+        preview = preview.push(
+            text(format!("Would run: {dry}"))
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(muted),
+        );
+    }
+    if !p.rationale.trim().is_empty() {
+        preview = preview.push(
+            text(format!("Why: {}", p.rationale))
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(muted),
+        );
+    }
+
+    // ── CONFIRM GATE / RESULT, by the live exec state ──
+    let gate: Element<'a, crate::Message, Theme> = match &p.state {
+        pending::ExecState::Pending => {
+            let dismiss = gate_button(
+                "Dismiss",
+                muted,
+                true,
+                crate::Message::FrontDoor(Message::DismissProposal(i)),
+                palette,
+            );
+            if is_high {
+                // Typed-confirm gate: the field + an Execute that arms only on match.
+                let armed = pending::confirm_matches(typed);
+                let field: Element<'a, crate::Message, Theme> =
+                    text_input(&format!("type {} to confirm", pending::CONFIRM_WORD), typed)
+                        .on_input(move |s| {
+                            crate::Message::FrontDoor(Message::ConfirmInputChanged(i, s))
+                        })
+                        .padding(Padding::from([8u16, 12u16]))
+                        .width(Length::Fixed(260.0))
+                        .into();
+                let execute = gate_button(
+                    "Execute",
+                    danger,
+                    armed,
+                    crate::Message::FrontDoor(Message::ApproveProposal(i)),
+                    palette,
+                );
+                column![
+                    text(format!(
+                        "This is destructive. Type {} to enable Execute.",
+                        pending::CONFIRM_WORD
+                    ))
+                    .size(TypeRole::Caption.size_in(sizes))
+                    .colr(danger),
+                    row![field, execute, dismiss]
+                        .spacing(10)
+                        .align_y(cosmic::iced::Alignment::Center),
+                ]
+                .spacing(8)
+                .into()
+            } else {
+                // Normal: a single-click Approve fires the execute.
+                let approve = gate_button(
+                    "Approve",
+                    accent,
+                    true,
+                    crate::Message::FrontDoor(Message::ApproveProposal(i)),
+                    palette,
+                );
+                row![approve, dismiss]
+                    .spacing(10)
+                    .align_y(cosmic::iced::Alignment::Center)
+                    .into()
+            }
+        }
+        pending::ExecState::Executing => text("Executing…")
+            .size(TypeRole::Body.size_in(sizes))
+            .colr(muted)
+            .into(),
+        pending::ExecState::Succeeded(detail) => column![
+            text("Succeeded")
+                .size(TypeRole::Body.size_in(sizes))
+                .colr(palette.success.into_cosmic_color()),
+            text(detail.clone())
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(muted),
+        ]
+        .spacing(2)
+        .into(),
+        pending::ExecState::Failed(err) => column![
+            text("Failed")
+                .size(TypeRole::Body.size_in(sizes))
+                .colr(danger),
+            text(err.clone())
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(muted),
+        ]
+        .spacing(2)
+        .into(),
+        pending::ExecState::Dismissed => text("Dismissed (not executed)")
+            .size(TypeRole::Body.size_in(sizes))
+            .colr(muted)
+            .into(),
+    };
+
+    let card = column![preview, Space::new().height(Length::Fixed(12.0)), gate,]
+        .spacing(4)
+        .width(Length::Fill);
+
+    // A destructive proposal gets a danger-toned border so the card reads as
+    // higher-stakes before the operator even reaches the gate (§4 — token, no hex).
+    let border_color = if is_high {
+        danger
+    } else {
+        palette.border.into_cosmic_color()
+    };
+    container(card)
+        .width(Length::Fill)
+        .padding(Padding::from([16u16, 16u16]))
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(palette.surface.into_cosmic_color())),
+            border: Border {
+                color: border_color,
                 width: 1.0,
                 radius: 8.0.into(),
             },
@@ -4025,5 +5078,378 @@ mod tests {
         let dc_idx = fd.tiles.iter().position(|t| t.label == "Data Center").unwrap();
         let _ = fd.update(Message::TileActivated(dc_idx));
         let _: Element<'_, crate::Message, Theme> = fd.view();
+    }
+
+    // ── FRONTDOOR-11 (GUI half): the confirm-gate execution UI ──
+
+    /// A proposal `(ulid, body)` carrying the given inner action JSON wrapped in
+    /// the FD-12 `ActionProposal` shape (`{"action":{…},"rationale":…}`).
+    fn proposal_msg(ulid: &str, action_json: &str, rationale: &str) -> (String, Option<String>) {
+        let body = format!(r#"{{"action":{action_json},"rationale":"{rationale}"}}"#);
+        (ulid.to_string(), Some(body))
+    }
+
+    #[test]
+    fn parse_lifts_the_preview_from_a_real_proposal_and_keeps_the_exec_body() {
+        // §7 — a real proposal off the queue parses into the operator-facing
+        // preview (kind · targets · effect · dry-run · rationale) and the EXACT
+        // inner action JSON to publish on confirm (the bare ActionRequest, never
+        // the wrapping proposal).
+        let action = r#"{"kind":"service_lifecycle","target_host":"oak","service_kind":"container","name":"nginx","op":"restart"}"#;
+        let msgs = vec![proposal_msg("01ULID", action, "nginx is wedged")];
+        let pend = pending::parse(&msgs);
+        assert_eq!(pend.len(), 1);
+        let p = &pend[0];
+        assert_eq!(p.id, "01ULID");
+        assert_eq!(p.kind, "service_lifecycle");
+        assert_eq!(p.targets, vec!["oak".to_string()]);
+        assert_eq!(p.effect, "restart container nginx");
+        assert_eq!(p.dry_run.as_deref(), Some("podman restart nginx"));
+        assert_eq!(p.rationale, "nginx is wedged");
+        // The exec body is the bare ActionRequest — it re-parses to the worker shape
+        // and carries NO `rationale` wrapper (the worker rejects extra fields aside).
+        let v: serde_json::Value = serde_json::from_str(&p.exec_body).unwrap();
+        assert_eq!(v["kind"], "service_lifecycle");
+        assert_eq!(v["target_host"], "oak");
+        assert!(v.get("rationale").is_none(), "exec body is the bare action");
+        // service_lifecycle is reversible → a 1-click approves it.
+        assert_eq!(p.risk, pending::Risk::Normal);
+        assert!(p.approves_on_click());
+    }
+
+    #[test]
+    fn parse_drops_advisory_and_malformed_entries_without_sinking_the_rest() {
+        // A title/action-less body, malformed JSON, and a real one in the same
+        // batch: only the real proposal surfaces (§7 — never a faked card), and a
+        // bad entry doesn't drop the good one.
+        let good = r#"{"kind":"service_lifecycle","target_host":"oak","service_kind":"container","name":"nginx","op":"start"}"#;
+        let msgs = vec![
+            ("a".to_string(), Some("not json".to_string())),
+            (
+                "b".to_string(),
+                Some(r#"{"rationale":"no action here"}"#.to_string()),
+            ),
+            proposal_msg("c", good, "start it"),
+            ("d".to_string(), None),
+        ];
+        let pend = pending::parse(&msgs);
+        assert_eq!(pend.len(), 1);
+        assert_eq!(pend[0].id, "c");
+    }
+
+    #[test]
+    fn classify_marks_the_locked_destructive_kinds_high_risk() {
+        // Q10 — the locked destructive set requires a typed confirm; everything
+        // else (incl. the reversible service_lifecycle) is a 1-click normal.
+        for k in ["code-edit", "code_edit", "destroy", "cutover", "delete"] {
+            assert_eq!(
+                pending::classify(k),
+                pending::Risk::HighRisk,
+                "{k} is destructive"
+            );
+        }
+        assert_eq!(
+            pending::classify("service_lifecycle"),
+            pending::Risk::Normal
+        );
+        // Case-insensitive + an unknown kind is normal (it still previews honestly).
+        assert_eq!(pending::classify("DESTROY"), pending::Risk::HighRisk);
+        assert_eq!(pending::classify("some_future_kind"), pending::Risk::Normal);
+    }
+
+    #[test]
+    fn dry_run_mirrors_the_workers_fixed_command_plan() {
+        // Q44 — the dry-run line is the actual command the worker's FIXED plan
+        // would run (podman for a container, virsh for a VM), never a guess.
+        let container = serde_json::json!({
+            "kind":"service_lifecycle","service_kind":"container","name":"nginx","op":"restart"
+        });
+        assert_eq!(
+            pending::dry_run_of("service_lifecycle", &container).as_deref(),
+            Some("podman restart nginx")
+        );
+        let vm = serde_json::json!({
+            "kind":"service_lifecycle","service_kind":"vm","name":"db","op":"stop"
+        });
+        assert_eq!(
+            pending::dry_run_of("service_lifecycle", &vm).as_deref(),
+            Some("virsh shutdown db")
+        );
+        // A kind with no modelled plan carries no fabricated dry-run line.
+        let unknown = serde_json::json!({"kind":"destroy","name":"x"});
+        assert!(pending::dry_run_of("destroy", &unknown).is_none());
+    }
+
+    #[test]
+    fn confirm_word_arms_case_insensitively_and_only_for_destructive() {
+        // Q10 — a normal proposal arms on a click (no word needed); a destructive
+        // one arms ONLY when the confirm word is typed (case-insensitive, trimmed).
+        let normal = pending::PendingProposal {
+            id: "n".into(),
+            kind: "service_lifecycle".into(),
+            targets: vec!["oak".into()],
+            effect: "restart container nginx".into(),
+            dry_run: Some("podman restart nginx".into()),
+            rationale: String::new(),
+            risk: pending::Risk::Normal,
+            exec_body: "{}".into(),
+            state: pending::ExecState::Pending,
+        };
+        assert!(normal.approves_on_click());
+        assert!(
+            normal.armed(""),
+            "a normal proposal arms with no typed word"
+        );
+
+        let destructive = pending::PendingProposal {
+            risk: pending::Risk::HighRisk,
+            kind: "destroy".into(),
+            ..normal.clone()
+        };
+        assert!(
+            !destructive.approves_on_click(),
+            "a 1-click cannot fire a destructive"
+        );
+        assert!(
+            !destructive.armed(""),
+            "destructive disarmed until the word is typed"
+        );
+        assert!(!destructive.armed("yes"), "the wrong word does not arm");
+        assert!(
+            destructive.armed("  confirm "),
+            "the confirm word (any case) arms it"
+        );
+        assert!(destructive.armed("CONFIRM"));
+    }
+
+    #[test]
+    fn no_execute_without_an_explicit_confirm() {
+        // §9 — the load-bearing safety invariant: a proposal sitting Pending does
+        // NOT execute. Only an `ApproveProposal` (a confirm) transitions it off
+        // Pending; a render / open / dismiss never publishes to the exec topic.
+        let mut fd = FrontDoor::new();
+        let action = r#"{"kind":"service_lifecycle","target_host":"oak","service_kind":"container","name":"nginx","op":"restart"}"#;
+        let data = FrontDoorData {
+            pending: pending::parse(&[proposal_msg("01", action, "x")]),
+            ..FrontDoorData::default()
+        };
+        let _ = fd.update(Message::Loaded(Box::new(data)));
+        // Just loading + opening the surface executes nothing — still Pending.
+        let _ = fd.update(Message::OpenPending);
+        assert!(fd.show_pending);
+        assert_eq!(fd.pending[0].state, pending::ExecState::Pending);
+        // Building the view (rendering the preview) executes nothing.
+        let _: Element<'_, crate::Message, Theme> = fd.view();
+        assert_eq!(fd.pending[0].state, pending::ExecState::Pending);
+        // A normal approve transitions it to Executing (the confirm fired). The
+        // actual Bus publish rides the returned Task — here we assert the gate
+        // opened only on the explicit confirm.
+        let _ = fd.update(Message::ApproveProposal(0));
+        assert_eq!(fd.pending[0].state, pending::ExecState::Executing);
+    }
+
+    #[test]
+    fn destructive_requires_the_typed_confirm_before_it_can_execute() {
+        // §9 — a destructive proposal CANNOT execute on an approve until the
+        // confirm word is typed: the approve handler re-checks `armed()` and
+        // refuses to publish (the state stays Pending). Typing the word arms it.
+        let mut fd = FrontDoor::new();
+        let action = r#"{"kind":"destroy","target_host":"oak","name":"vol-7"}"#;
+        let data = FrontDoorData {
+            pending: pending::parse(&[proposal_msg("01", action, "reclaim space")]),
+            ..FrontDoorData::default()
+        };
+        let _ = fd.update(Message::Loaded(Box::new(data)));
+        assert_eq!(fd.pending[0].risk, pending::Risk::HighRisk);
+
+        // An approve with NO typed confirm is refused — it does NOT execute.
+        let _ = fd.update(Message::ApproveProposal(0));
+        assert_eq!(
+            fd.pending[0].state,
+            pending::ExecState::Pending,
+            "a destructive approve without the typed word never executes (§9)"
+        );
+
+        // The operator types the confirm word.
+        let _ = fd.update(Message::ConfirmInputChanged(0, "CONFIRM".into()));
+        // Now the approve arms and the proposal transitions to Executing.
+        let _ = fd.update(Message::ApproveProposal(0));
+        assert_eq!(fd.pending[0].state, pending::ExecState::Executing);
+    }
+
+    #[test]
+    fn dismiss_rejects_without_executing() {
+        // A dismissed proposal is marked rejected and is never executed (§9).
+        let mut fd = FrontDoor::new();
+        let action = r#"{"kind":"service_lifecycle","target_host":"oak","service_kind":"container","name":"nginx","op":"restart"}"#;
+        let data = FrontDoorData {
+            pending: pending::parse(&[proposal_msg("01", action, "x")]),
+            ..FrontDoorData::default()
+        };
+        let _ = fd.update(Message::Loaded(Box::new(data)));
+        let _ = fd.update(Message::DismissProposal(0));
+        assert_eq!(fd.pending[0].state, pending::ExecState::Dismissed);
+    }
+
+    #[test]
+    fn exec_result_folds_onto_the_card_by_stable_id() {
+        // The worker's typed reply folds onto the card keyed by its bus id (not
+        // index), so a reorder doesn't mis-target the result.
+        let mut fd = FrontDoor::new();
+        let action = r#"{"kind":"service_lifecycle","target_host":"oak","service_kind":"container","name":"nginx","op":"start"}"#;
+        let data = FrontDoorData {
+            pending: pending::parse(&[proposal_msg("01", action, "x")]),
+            ..FrontDoorData::default()
+        };
+        let _ = fd.update(Message::Loaded(Box::new(data)));
+        let _ = fd.update(Message::ExecResult(
+            "01".into(),
+            true,
+            "dispatched container start to oak".into(),
+        ));
+        assert_eq!(
+            fd.pending[0].state,
+            pending::ExecState::Succeeded("dispatched container start to oak".into())
+        );
+        // A failure reply maps to Failed.
+        let _ = fd.update(Message::ExecResult(
+            "01".into(),
+            false,
+            "kind not allowlisted".into(),
+        ));
+        assert_eq!(
+            fd.pending[0].state,
+            pending::ExecState::Failed("kind not allowlisted".into())
+        );
+    }
+
+    #[test]
+    fn parse_exec_reply_maps_ok_failure_and_degrades_quietly() {
+        // The reply parse maps the worker's ActionReply shape; a no-reply / junk
+        // body degrades to a quiet failure (Q33 — no spew, no panic).
+        assert_eq!(
+            parse_exec_reply(Some(r#"{"ok":true,"detail":"dispatched restart to oak"}"#)),
+            (true, "dispatched restart to oak".to_string())
+        );
+        let (ok, msg) =
+            parse_exec_reply(Some(r#"{"ok":false,"error":"op `wipe` not allowlisted"}"#));
+        assert!(!ok);
+        assert!(msg.contains("allowlisted"));
+        // No reply at all (no Bus / timeout) → a quiet failure, never a hang/panic.
+        assert!(!parse_exec_reply(None).0);
+        // Malformed JSON → quiet failure.
+        assert!(!parse_exec_reply(Some("not json")).0);
+    }
+
+    #[test]
+    fn merge_preserves_a_confirm_in_flight_across_a_reload() {
+        // A slow-poll reload must NOT reset an in-flight confirm / a shown result /
+        // a typed-confirm — the merge preserves the live gate state for a surviving
+        // proposal and GCs the typed text of a proposal that fell off the queue.
+        let mut fd = FrontDoor::new();
+        let action = r#"{"kind":"destroy","target_host":"oak","name":"vol-7"}"#;
+        let snap = pending::parse(&[proposal_msg("01", action, "x")]);
+        let _ = fd.update(Message::Loaded(Box::new(FrontDoorData {
+            pending: snap.clone(),
+            ..FrontDoorData::default()
+        })));
+        // The operator types the confirm word, then a reload lands carrying the
+        // SAME proposal (re-read off the queue).
+        let _ = fd.update(Message::ConfirmInputChanged(0, "CONFIRM".into()));
+        let _ = fd.update(Message::ExecResult("01".into(), true, "done".into()));
+        let _ = fd.update(Message::Loaded(Box::new(FrontDoorData {
+            pending: snap,
+            ..FrontDoorData::default()
+        })));
+        // The result survives the reload (not reset to Pending).
+        assert_eq!(
+            fd.pending[0].state,
+            pending::ExecState::Succeeded("done".into()),
+            "a reload preserves the resolved gate state"
+        );
+        // The typed-confirm text is still keyed (the proposal survived).
+        assert_eq!(
+            fd.confirm_inputs.get("01").map(String::as_str),
+            Some("CONFIRM")
+        );
+
+        // A reload with an EMPTY queue drops the card and GCs its typed text.
+        let _ = fd.update(Message::Loaded(Box::new(FrontDoorData::default())));
+        assert!(fd.pending.is_empty());
+        assert!(fd.confirm_inputs.is_empty(), "stale typed-confirm GC'd");
+    }
+
+    #[test]
+    fn pending_count_only_counts_proposals_awaiting_the_operator() {
+        // The indicator badge counts proposals still Pending (needs attention) —
+        // not the resolved / dismissed ones.
+        let mut fd = FrontDoor::new();
+        let a = r#"{"kind":"service_lifecycle","target_host":"oak","service_kind":"container","name":"nginx","op":"start"}"#;
+        let b = r#"{"kind":"service_lifecycle","target_host":"elm","service_kind":"container","name":"redis","op":"stop"}"#;
+        let data = FrontDoorData {
+            pending: pending::parse(&[proposal_msg("01", a, "x"), proposal_msg("02", b, "y")]),
+            ..FrontDoorData::default()
+        };
+        let _ = fd.update(Message::Loaded(Box::new(data)));
+        assert_eq!(fd.pending_count(), 2);
+        let _ = fd.update(Message::DismissProposal(1));
+        assert_eq!(
+            fd.pending_count(),
+            1,
+            "a dismissed proposal no longer needs attention"
+        );
+    }
+
+    #[test]
+    fn the_confirm_gate_targets_the_exec_topic_only_on_confirm() {
+        // §9 — the gate's exec topic constant is the FD-11 worker's execution
+        // topic, distinct from the propose queue. The execute path is the ONLY one
+        // that touches it (asserted structurally: only ApproveProposal returns the
+        // publishing Task, gated behind `armed()`).
+        assert_eq!(pending::EXEC_TOPIC, "action/exec/request");
+        assert_ne!(pending::EXEC_TOPIC, copilot::PROPOSAL_TOPIC);
+    }
+
+    #[test]
+    fn pending_view_builds_in_both_modes_for_every_card_state() {
+        // The confirm-gate surface builds (preview + gate + every result state) in
+        // BOTH render modes without panicking — the preview is always rendered
+        // before any execute affordance.
+        let mut fd = FrontDoor::new();
+        fd.loading = false;
+        let normal = r#"{"kind":"service_lifecycle","target_host":"oak","service_kind":"container","name":"nginx","op":"restart"}"#;
+        let destructive = r#"{"kind":"destroy","target_host":"oak","name":"vol-7"}"#;
+        let mut pend = pending::parse(&[
+            proposal_msg("01", normal, "wedged"),
+            proposal_msg("02", destructive, "reclaim"),
+        ]);
+        // Exercise each result state across the cards.
+        pend[0].state = pending::ExecState::Succeeded("dispatched".into());
+        let _ = fd.update(Message::Loaded(Box::new(FrontDoorData {
+            pending: pend,
+            ..FrontDoorData::default()
+        })));
+        for mode in [Mode::Panel, Mode::FullScreen] {
+            fd.mode = mode;
+            // The indicator renders in the top bar (count > 0).
+            let _: Element<'_, crate::Message, Theme> = fd.view();
+            // The review surface renders.
+            fd.show_pending = true;
+            let _: Element<'_, crate::Message, Theme> = fd.view();
+            fd.show_pending = false;
+        }
+        // Walk the remaining exec states through the card builder directly.
+        let p = &fd.pending[1];
+        let pal = Palette::dark();
+        for state in [
+            pending::ExecState::Pending,
+            pending::ExecState::Executing,
+            pending::ExecState::Failed("nope".into()),
+            pending::ExecState::Dismissed,
+        ] {
+            let mut q = p.clone();
+            q.state = state;
+            let _: Element<'_, crate::Message, Theme> = proposal_card(1, &q, "CONFIRM", pal);
+        }
     }
 }
