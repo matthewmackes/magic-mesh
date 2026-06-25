@@ -104,6 +104,15 @@ MD5/SHA1 is a finding.
   (`install-helpers/lint-carbon-tokens.sh`, in CI). No raw hex / scattered metric
   literals outside the token modules (mark a genuinely-dynamic/test colour
   `// carbon-ok` with a reason).
+- **Motion** is part of that single source: every animation's timing comes from
+  `mde_theme::motion` (the Carbon duration/easing grid + `Motion` presets + the
+  `list`/`icon` stagger tokens) and routes reduce-motion through
+  `Motion::resolved`/`Tween::resolved` — never a bespoke `Duration::from_millis`
+  literal. A second §4 gate enforces it (`install-helpers/lint-motion.sh`, in CI;
+  waive a design-blessed off-grid one-shot with `// motion-ok`). The copy-paste
+  patterns (hover, list stagger, modal fade, the `Animator`, the reduce-motion
+  fallback) live in **[`docs/design/motion-guide.md`](docs/design/motion-guide.md)**
+  — read it before adding motion.
 - **Pure-Rust toolkit:** libcosmic's vendored iced fork (wgpu + cosmic-text, no
   FreeType; carries a11y/accesskit — the full-libcosmic cutover, 2026-06-13), rustls (no
   OpenSSL). GUIs ship as Cosmic apps + a native cosmic-applet; Cosmic draws the

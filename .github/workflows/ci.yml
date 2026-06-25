@@ -96,6 +96,9 @@ jobs:
       - name: Carbon single-source lint (§4)
         run: ./install-helpers/lint-carbon-tokens.sh
 
+      - name: Motion single-source lint (§4 / MOTION-AUDIT-2)
+        run: ./install-helpers/lint-motion.sh
+
       - name: No-private-D-Bus-name lint (§2)
         run: ./install-helpers/lint-bus-names.sh
 
