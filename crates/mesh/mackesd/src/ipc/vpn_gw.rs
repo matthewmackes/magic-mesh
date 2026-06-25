@@ -213,9 +213,13 @@ pub fn build_reply(svc: &VpnService, verb: &str, req_body: Option<&str>) -> Stri
                 return err(format!("add-tunnel: {e}"));
             }
             let mut cfg = vpn::load(root);
+            // DDNS-EGRESS-3 — auto-populate a templated DDNS record for the new
+            // tunnel (no-op unless DDNS is enabled), so a created tunnel
+            // immediately publishes its exit IP under the zone.
+            let ddns_added = auto_add_ddns_record(root, &t.id);
             cfg.upsert(t);
             match vpn::save(root, &cfg) {
-                Ok(_) => json!({ "ok": true }).to_string(),
+                Ok(_) => json!({ "ok": true, "ddns_record": ddns_added }).to_string(),
                 Err(e) => err(format!("add-tunnel: save: {e}")),
             }
         }
@@ -546,6 +550,10 @@ fn setup_provider(svc: &VpnService, req_body: Option<&str>) -> String {
     // node's VPN config.
     let root = svc.workgroup_root.as_path();
     let mut cfg = vpn::load(root);
+    // DDNS-EGRESS-3 — auto-populate a templated DDNS record for the provisioned
+    // tunnel (no-op unless DDNS is enabled), so the new exit publishes a stable
+    // hostname under the zone as soon as the tunnel comes up.
+    let ddns_added = auto_add_ddns_record(root, &produced.def.id);
     cfg.upsert(produced.def.clone());
     if let Err(e) = vpn::save(root, &cfg) {
         return err(format!("setup-provider: save tunnel: {e}"));
@@ -556,6 +564,9 @@ fn setup_provider(svc: &VpnService, req_body: Option<&str>) -> String {
         "id": produced.def.id,
         "provider": produced.def.provider,
         "ifname": ifname,
+        // DDNS-EGRESS-3: whether a templated DDNS record was auto-added for this
+        // tunnel (true only when DDNS is enabled + the record didn't already exist).
+        "ddns_record": ddns_added,
         "method": match produced.def.method {
             Method::Wg => "wg",
             Method::Ovpn => "ovpn",
@@ -581,6 +592,45 @@ fn str_field(v: &serde_json::Value, key: &str) -> String {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_string()
+}
+
+/// DDNS-EGRESS-3 — auto-populate a templated DDNS record for a newly created
+/// tunnel `id`. Returns the FQDN-template label that was added, or `None` when no
+/// record was added (DDNS disabled, or a record for this tunnel already exists).
+///
+/// The hook is **opt-in via the DDNS master enable**: it adds a record ONLY when
+/// `[ddns].enabled` (so a node not using DDNS never accumulates phantom records),
+/// and it is idempotent — re-running `setup-provider`/`add-tunnel` for the same
+/// tunnel won't duplicate the record (the `add-record` upsert keys on the name
+/// template, which is unique per tunnel id). The templated record's source is
+/// `tunnel:<id>` (so the reconcile worker resolves its exit IP from the VPN-GW-6
+/// verifier) and its name template is `{node}-<id>` → a stable per-tunnel label
+/// under the zone. The reconcile worker (DDNS-EGRESS-3) then publishes it.
+fn auto_add_ddns_record(root: &std::path::Path, tunnel_id: &str) -> Option<String> {
+    use mackes_mesh_types::ddns::{self, OnDown, RecordDef};
+    let mut cfg = ddns::load(root);
+    if !cfg.enabled {
+        return None;
+    }
+    // `{node}-<id>` — the node label is templated at publish time; the tunnel id is
+    // baked in so the record is unique per tunnel.
+    let name = format!("{{node}}-{tunnel_id}");
+    if cfg.record.iter().any(|r| r.name == name) {
+        return None; // idempotent: already present.
+    }
+    cfg.record.push(RecordDef {
+        name: name.clone(),
+        source: format!("tunnel:{tunnel_id}"),
+        // A removed tunnel's name must not keep pointing at a dead exit; remove it.
+        on_down: OnDown::Remove,
+    });
+    match ddns::save(root, &cfg) {
+        Ok(_) => Some(name),
+        Err(e) => {
+            tracing::warn!(tunnel = tunnel_id, error = %e, "ddns auto-populate: save failed");
+            None
+        }
+    }
 }
 
 // ── VPN-GW-4 — mesh egress routing (per-node / group / ANY) + failover chain ──

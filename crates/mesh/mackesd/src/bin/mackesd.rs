@@ -290,6 +290,15 @@ enum Cmd {
         action: ProbeCmd,
     },
 
+    /// DDNS-EGRESS-3 — manage the `[ddns]` dynamic-DNS config (CLI parity for the
+    /// `action/ddns/*` RPCs: get/set config, add/remove a record, query a record's
+    /// live reconcile status). Calls the SAME `ipc::ddns::build_reply` the bus
+    /// responder serves, so the CLI and the GUI act on one config.
+    Ddns {
+        #[command(subcommand)]
+        action: DdnsCmd,
+    },
+
     /// EFF-28 / MESHFS-14.1 — restore the Nebula CA from an armored
     /// `state-backup.enc` bundle. CA rows go straight into the local
     /// SQLite store via `ca::backup::restore_to_store`.
@@ -1082,6 +1091,74 @@ enum ProbeCmd {
         /// Filter to hosts running this service kind (e.g. `jellyfin`).
         #[clap(long)]
         service: Option<String>,
+    },
+}
+
+/// DDNS-EGRESS-3 — `mackesd ddns <sub>` subcommands. Each calls the same
+/// `mackesd_core::ipc::ddns::build_reply` verb the `action/ddns/*` bus responder
+/// serves (CLI/GUI parity over one config), rooted at the shared workgroup root.
+#[derive(Subcommand)]
+enum DdnsCmd {
+    /// Print the current `[ddns]` config as JSON (`get-config`).
+    GetConfig {
+        /// Mesh-home root (defaults to `$MDE_WORKGROUP_ROOT` / the system mount).
+        #[clap(long, env = "MDE_WORKGROUP_ROOT")]
+        workgroup_root: Option<PathBuf>,
+    },
+    /// Replace the whole `[ddns]` config from a JSON body (`set-config`).
+    SetConfig {
+        /// The `DdnsConfig` JSON (e.g. `{"enabled":true,"token_ref":"secret:do-token",…}`).
+        #[clap(value_name = "JSON")]
+        config: String,
+        #[clap(long, env = "MDE_WORKGROUP_ROOT")]
+        workgroup_root: Option<PathBuf>,
+    },
+    /// Add or update one managed record (`add-record`). Upserts by name template.
+    AddRecord {
+        /// Name template, e.g. `{node}-{provider}`.
+        #[clap(value_name = "NAME")]
+        name: String,
+        /// IP source: a `tunnel:<id>` or `wan`.
+        #[clap(value_name = "SOURCE")]
+        source: String,
+        /// Kill-switch policy when the source is down: `remove` | `sentinel` | `keep`.
+        #[clap(long, default_value = "remove")]
+        on_down: String,
+        #[clap(long, env = "MDE_WORKGROUP_ROOT")]
+        workgroup_root: Option<PathBuf>,
+    },
+    /// Remove a managed record by its name template (`remove-record`).
+    RemoveRecord {
+        /// The record name template to remove.
+        #[clap(value_name = "NAME")]
+        name: String,
+        #[clap(long, env = "MDE_WORKGROUP_ROOT")]
+        workgroup_root: Option<PathBuf>,
+    },
+    /// Query a record's live reconcile decision + reachability (`record-status`):
+    /// given the live source state, print the planned DdnsAction + the
+    /// reachability flag (DDNS-EGRESS-4).
+    Status {
+        /// The record name template.
+        #[clap(value_name = "NAME")]
+        name: String,
+        /// Live source state: `up` (with `--ip`) or `down`.
+        #[clap(long, default_value = "up")]
+        state: String,
+        /// The verified exit/WAN IP for an `up` state.
+        #[clap(long, default_value = "")]
+        ip: String,
+        /// Whether the up source has an inbound port-forward (reachability flag).
+        #[clap(long)]
+        port_forward: bool,
+        /// Whether the down source is kill-switched (leak-coupling).
+        #[clap(long)]
+        kill_switch: bool,
+        /// The last-published value (omit ⇒ never published).
+        #[clap(long, default_value = "")]
+        last: String,
+        #[clap(long, env = "MDE_WORKGROUP_ROOT")]
+        workgroup_root: Option<PathBuf>,
     },
 }
 
@@ -2162,6 +2239,86 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         },
+        Cmd::Ddns { action } => {
+            // DDNS-EGRESS-3 — CLI parity for the action/ddns/* RPCs: build a
+            // DdnsService rooted at the shared workgroup root and call the SAME
+            // `ipc::ddns::build_reply` verb the bus responder serves, printing the
+            // JSON reply. One config, two front-ends (CLI + GUI).
+            use mackesd_core::ipc::ddns::{build_reply, DdnsService};
+            let (verb, body, root): (&str, Option<String>, PathBuf) = match action {
+                DdnsCmd::GetConfig { workgroup_root } => (
+                    "get-config",
+                    None,
+                    workgroup_root.unwrap_or_else(mackesd_core::default_qnm_shared_root),
+                ),
+                DdnsCmd::SetConfig {
+                    config,
+                    workgroup_root,
+                } => (
+                    "set-config",
+                    Some(config),
+                    workgroup_root.unwrap_or_else(mackesd_core::default_qnm_shared_root),
+                ),
+                DdnsCmd::AddRecord {
+                    name,
+                    source,
+                    on_down,
+                    workgroup_root,
+                } => {
+                    let body = serde_json::json!({
+                        "name": name, "source": source, "on_down": on_down,
+                    })
+                    .to_string();
+                    (
+                        "add-record",
+                        Some(body),
+                        workgroup_root.unwrap_or_else(mackesd_core::default_qnm_shared_root),
+                    )
+                }
+                DdnsCmd::RemoveRecord {
+                    name,
+                    workgroup_root,
+                } => (
+                    "remove-record",
+                    Some(name),
+                    workgroup_root.unwrap_or_else(mackesd_core::default_qnm_shared_root),
+                ),
+                DdnsCmd::Status {
+                    name,
+                    state,
+                    ip,
+                    port_forward,
+                    kill_switch,
+                    last,
+                    workgroup_root,
+                } => {
+                    // Build the {name,state[,last]} record-status query body. An
+                    // `up` state carries the verified IP + port-forward flag; a
+                    // `down` state carries the kill-switch flag.
+                    let state_obj = if state.eq_ignore_ascii_case("down") {
+                        serde_json::json!({ "state": "down", "kill_switch": kill_switch })
+                    } else {
+                        serde_json::json!({ "state": "up", "ip": ip, "port_forward": port_forward })
+                    };
+                    let mut q = serde_json::json!({ "name": name, "state": state_obj });
+                    if !last.is_empty() {
+                        q["last"] = serde_json::Value::String(last);
+                    }
+                    (
+                        "record-status",
+                        Some(q.to_string()),
+                        workgroup_root.unwrap_or_else(mackesd_core::default_qnm_shared_root),
+                    )
+                }
+            };
+            let svc = DdnsService::new(root);
+            let reply = build_reply(&svc, verb, body.as_deref());
+            println!("{reply}");
+            // Exit non-zero on an error reply so scripts can branch on it.
+            if reply.contains("\"error\"") {
+                std::process::exit(1);
+            }
+        }
         Cmd::PresetLaunch { tag } => {
             // Portal-18.d (v6.0 R12, 2026-05-27) — preset launch-
             // bundle expansion. Loads the tag store, finds the
@@ -7166,6 +7323,51 @@ fn run_serve(
             }
             Err(e) => {
                 tracing::warn!(error = %e, "DDNS Bus responder: bus persist open failed; responder skipped");
+            }
+        }
+        // DDNS-EGRESS-3 — the DDNS reconcile WORKER (engine half of the responder
+        // above): tails event/vpn/signals (VPN-GW exit-IP changes) + a periodic WAN
+        // check, resolves each [ddns] record's live SourceState, and reconciles via
+        // the pure plan_action predicate → the DigitalOcean A/AAAA-record API
+        // (§9-safe fixed-arg curl; token from the mesh secret store). Same
+        // dedicated-OS-thread shape as the responders. Additive — one localized
+        // spawn block.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let ddns_root = workgroup_root.clone();
+                let ddns_node = node_id.clone();
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("ddns-reconcile".into())
+                    .spawn(move || {
+                        mackesd_core::workers::ddns::serve_reconcile(
+                            &persist,
+                            &ddns_root,
+                            &ddns_node,
+                            true,
+                            || resp_shutdown.load(Ordering::Relaxed),
+                        );
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "DDNS reconcile worker spawned; subscribes event/vpn/signals + WAN \
+                             check, reconciles [ddns] records via the DigitalOcean DNS API \
+                             (DDNS-EGRESS-3)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "DDNS reconcile worker thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("ddns_reconcile".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "DDNS reconcile worker: bus persist open failed; worker skipped");
             }
         }
         // PD-1 — the peer-directory responder: action/mesh/directory
