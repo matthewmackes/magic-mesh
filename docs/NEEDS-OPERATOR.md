@@ -42,3 +42,13 @@ These all share one blocker: the DigitalOcean Spaces bucket + S3 access keys are
 ## Physical-host operator action
 
 - **OPROG-5** — pure live-infra operator action: tear down the nodes on XCP-1, migrate any required instances to XCP-2, decommission XCP-1. No code/artifact deliverable.
+
+## 2026-06-25 reconcile-rescue: additional confirmed blockers (adversarially verified)
+- **BIRTHRIGHT-1** (reverted [✓]→[!]) — provisions LizardFS at enrollment but /mnt/mesh-storage never mounts (LH-JOIN-QNM-1/OPROG-1); resolves with the LizardFS rip-out (OPROG-2) + a fresh-from-RPM live join verify.
+- **XCP-6** ([!]) — directory-advert writer uses HostTarget::Local (dead on glibc-2.17 dom0) + nothing reads compute/xcp-host/*; reopen needs a dom0-viable target + a real live directory consumer.
+- **BRAND-2** ([!]) — Carbon icon theme code + tarball are in-repo; only a live `gsettings get …icon-theme`=Carbon on a real Cosmic Workstation remains.
+- **APPS-9b** ([!]) — Super→launcher applet toggle built+tested; only the operator-gated Cosmic shortcut RON remains (cosmic-comp is not a workspace dep, can't be authored headless).
+- **BOOT-REC-4** ([!]) — live reboot/power-cycle auto-recovery drill of every role before /release; mount half superseded by the LizardFS→Syncthing cutover.
+- **FARM-AUTO-PROD** ([!]) — all farm automation built; only the standing build-job tags executing on the live farm VMs remain (operator-gated live exec).
+- **MUSIC-BROWSE/ART** ([!]) — full art chain wired daemon→GUI; only a live re-verify on a Workstation with mde-musicd running remains.
+- **DRAIN-5** (stays [ ]) — cited spec §C.4 is absent + the unit count (21 vs 25) is stale; needs operator spec reconciliation + the /ship-skill encoding (skill self-edit is permission-gated).
