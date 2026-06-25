@@ -15,7 +15,42 @@
 //! `remmina-sync`, `kdc_host`) are noted in the worklist for a design-doc
 //! cross-check.
 
-use mde_role::Role;
+use mde_role::{Capability, Role, RoleClass};
+
+/// MEDIA-1 — the deployment **class** that gates worker spawns.
+///
+/// The role rank plus its capability tags. `run_serve` resolves this once and
+/// gates every `sup.spawn` through [`runs_in`], so a rank-gated worker checks the
+/// tier and a capability-gated worker (the Navidrome media worker — MEDIA-3)
+/// additionally requires the matching tag. Keeping rank + tags together is the §9
+/// doctrine: a `Lighthouse_Media` box is the Lighthouse tier carrying
+/// [`Capability::Media`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeployClass {
+    /// The role rank (0 lighthouse · 1 server · 2 workstation).
+    pub rank: u8,
+    /// `true` when this box carries [`Capability::Media`] — the `Lighthouse_Media`
+    /// subclass that hosts the media service.
+    pub media: bool,
+}
+
+impl DeployClass {
+    /// A plain rank with no capability tags — the back-compat path for the
+    /// rank-only callers (`resolve_rank`).
+    #[must_use]
+    pub const fn plain(rank: u8) -> Self {
+        Self { rank, media: false }
+    }
+
+    /// Build the class from a pinned [`RoleClass`].
+    #[must_use]
+    pub const fn from_role_class(class: &RoleClass) -> Self {
+        Self {
+            rank: class.role.rank(),
+            media: class.is_media_lighthouse(),
+        }
+    }
+}
 
 /// Minimum role rank that runs each worker. The census MUST list every worker
 /// spawned in `run_serve` (a unit test pins the count) — a worker missing from
@@ -56,14 +91,60 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     ("remmina-sync", 2),
 ];
 
-/// Minimum rank that runs `worker`. Unknown workers default to 0 (Lighthouse —
-/// runs everywhere).
+/// MEDIA-1 — workers that ALSO require a capability tag beyond their rank tier.
+///
+/// A capability-gated worker runs only on a box that is at (or above) its rank
+/// AND carries the tag — so the Navidrome media worker (MEDIA-3) runs on a
+/// `Lighthouse_Media` node but never on a stock lighthouse / server / peer
+/// (acceptance: "container absent on a non-media node"). The worker is still
+/// listed in [`WORKER_TIERS`] for the rank floor; this table adds the tag gate.
+///
+/// `navidrome` is the foundation entry MEDIA-3 spawns onto: a rank-0 (lighthouse
+/// tier) worker that additionally requires [`Capability::Media`]. It is wired
+/// here now (not at MEDIA-3) so the gate is a single source of truth the worker
+/// pool reads — MEDIA-3 adds the spawn, the tier table already refuses it
+/// everywhere but a media-lighthouse.
+const WORKER_CAPABILITIES: &[(&str, Capability)] = &[("navidrome", Capability::Media)];
+
+/// Lighthouse tier (rank 0) — the rank floor the media worker sits at. The
+/// `navidrome` worker is a lighthouse-tier worker that additionally requires the
+/// [`Capability::Media`] tag (it never runs on a stock lighthouse).
+const MEDIA_WORKER_RANK: u8 = 0;
+
+/// Minimum rank that runs `worker`. Unknown workers default to 0 (Lighthouse).
+///
+/// NOTE this is the rank floor ONLY — a capability-gated worker (see
+/// [`WORKER_CAPABILITIES`]) ALSO needs its tag; use [`runs_in`] for the full gate.
 #[must_use]
 pub fn min_rank(worker: &str) -> u8 {
+    if let Some(rank) = capability_min_rank(worker) {
+        return rank;
+    }
     WORKER_TIERS
         .iter()
         .find(|(n, _)| *n == worker)
         .map_or(0, |(_, r)| *r)
+}
+
+/// The rank floor for a capability-gated worker that isn't in [`WORKER_TIERS`]
+/// (the media worker lives in the capability table, not the rank census, so its
+/// rank floor is pinned here). `None` for a plain rank-gated worker.
+fn capability_min_rank(worker: &str) -> Option<u8> {
+    WORKER_CAPABILITIES
+        .iter()
+        .find(|(n, _)| *n == worker)
+        .map(|(_, cap)| match cap {
+            Capability::Media => MEDIA_WORKER_RANK,
+        })
+}
+
+/// MEDIA-1 — the capability tag `worker` requires (beyond its rank), if any.
+#[must_use]
+pub fn required_capability(worker: &str) -> Option<Capability> {
+    WORKER_CAPABILITIES
+        .iter()
+        .find(|(n, _)| *n == worker)
+        .map(|(_, c)| *c)
 }
 
 /// Resolve the deployment rank that gates worker spawns: the pinned role's
@@ -74,10 +155,22 @@ pub fn min_rank(worker: &str) -> u8 {
 /// Reads `/var/lib/mde/role.toml` locally; no mesh needed.
 #[must_use]
 pub fn resolve_rank() -> u8 {
-    match mde_role::load() {
-        Ok(role) => role.rank(),
-        Err(mde_role::LoadError::NotPinned) => Role::Workstation.rank(),
-        Err(_) => Role::Lighthouse.rank(),
+    resolve_class().rank
+}
+
+/// MEDIA-1 — resolve the full deployment **class** (rank + capability tags) that
+/// gates worker spawns.
+///
+/// Same fail-soft contract as [`resolve_rank`]: an unpinned box → Workstation (no
+/// media tag — the desktop set, never the media worker), a malformed `role.toml`
+/// → Lighthouse fail-closed (no media tag). The media tag is only ever set when a
+/// valid `Lighthouse_Media` class is pinned.
+#[must_use]
+pub fn resolve_class() -> DeployClass {
+    match mde_role::load_class() {
+        Ok(class) => DeployClass::from_role_class(&class),
+        Err(mde_role::LoadError::NotPinned) => DeployClass::plain(Role::Workstation.rank()),
+        Err(_) => DeployClass::plain(Role::Lighthouse.rank()),
     }
 }
 
@@ -89,8 +182,20 @@ pub fn resolve_rank() -> u8 {
 /// # Errors
 /// A human-actionable message naming the fix (`mackesd role pin …`).
 pub fn resolve_rank_strict() -> Result<u8, String> {
-    match mde_role::load() {
-        Ok(role) => Ok(role.rank()),
+    resolve_class_strict().map(|c| c.rank)
+}
+
+/// MEDIA-1 — the fail-closed counterpart to [`resolve_class`] (ENT-2).
+///
+/// The same refuse-when-unpinned contract as [`resolve_rank_strict`], returning
+/// the full [`DeployClass`] so the worker pool gates capability workers (the
+/// media worker) as well as rank workers off a single resolved class.
+///
+/// # Errors
+/// A human-actionable message naming the fix (`mackesd role pin …`).
+pub fn resolve_class_strict() -> Result<DeployClass, String> {
+    match mde_role::load_class() {
+        Ok(class) => Ok(DeployClass::from_role_class(&class)),
         Err(mde_role::LoadError::NotPinned) => Err(
             "no deployment role pinned (/var/lib/mde/role.toml absent) — this box refuses to \
              start its worker pool unpinned (ENT-2 fail-closed). Pin one first: \
@@ -104,23 +209,64 @@ pub fn resolve_rank_strict() -> Result<u8, String> {
     }
 }
 
-/// Whether a box at `role_rank` runs `worker`.
+/// Whether a box at `role_rank` runs `worker` — the **rank-only** gate.
+///
+/// A capability-gated worker (the media worker) is NOT runnable through this path
+/// (it needs its tag too); [`runs`] returns `false` for one, and the full gate
+/// lives in [`runs_in`]. Plain rank-gated workers are unaffected.
 #[must_use]
 pub fn runs(worker: &str, role_rank: u8) -> bool {
-    role_rank >= min_rank(worker)
+    runs_in(worker, DeployClass::plain(role_rank))
 }
 
-/// Every worker a box at `role_rank` runs — the role-gated subset (plan §12).
-/// Order follows the tier census (lowest tier first); the caller sorts if it
-/// wants alphabetical. This is the static counterpart to `run_serve`'s live
-/// `worker_names` listing, surfaced by `mackesd role-workers`.
+/// MEDIA-1 — the full spawn gate: whether a box of `class` runs `worker`.
+///
+/// A worker runs iff the box is at (or above) the worker's rank floor AND — for a
+/// capability-gated worker — the box carries the required tag. This is the single
+/// predicate `run_serve` gates every `sup.spawn` through, so the media worker
+/// lands on a `Lighthouse_Media` node and is absent everywhere else.
+#[must_use]
+pub fn runs_in(worker: &str, class: DeployClass) -> bool {
+    if class.rank < min_rank(worker) {
+        return false;
+    }
+    match required_capability(worker) {
+        None => true,
+        Some(Capability::Media) => class.media,
+    }
+}
+
+/// Every worker a box at `role_rank` runs — the rank-gated subset (plan §12).
+///
+/// Capability-gated workers (the media worker) are EXCLUDED here (a rank alone
+/// can't satisfy a tag gate); use [`workers_for_class`] for the full set on a
+/// tagged box. Order follows the tier census (lowest tier first). This is the
+/// static counterpart to `run_serve`'s live `worker_names` listing, surfaced by
+/// `mackesd role-workers`.
 #[must_use]
 pub fn workers_for_rank(role_rank: u8) -> Vec<&'static str> {
-    WORKER_TIERS
+    workers_for_class(DeployClass::plain(role_rank))
+}
+
+/// MEDIA-1 — every worker a box of `class` runs, including capability-gated ones.
+///
+/// The capability workers its tags unlock (a `Lighthouse_Media` class adds the
+/// media worker on top of its lighthouse rank set). Rank workers first (tier
+/// census order), then the capability workers the box's tags satisfy.
+#[must_use]
+pub fn workers_for_class(class: DeployClass) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = WORKER_TIERS
         .iter()
-        .filter(|(_, tier)| role_rank >= *tier)
+        .filter(|(_, tier)| class.rank >= *tier)
         .map(|(name, _)| *name)
-        .collect()
+        .collect();
+    out.extend(
+        WORKER_CAPABILITIES
+            .iter()
+            .filter(|(name, _)| runs_in(name, class))
+            .map(|(name, _)| *name),
+    );
+    out
 }
 
 #[cfg(test)]
@@ -239,5 +385,77 @@ mod tests {
         // Strict superset: every lower-tier worker is in the higher tier.
         assert!(lh.iter().all(|w| srv.contains(w)));
         assert!(srv.iter().all(|w| ws.contains(w)));
+    }
+
+    // ── MEDIA-1: the Lighthouse_Media capability gate ──
+
+    #[test]
+    fn navidrome_gates_to_the_media_lighthouse_class() {
+        // The media worker requires the Media capability, not just a rank.
+        assert_eq!(required_capability("navidrome"), Some(Capability::Media));
+        // A media-lighthouse (rank 0 + media tag) runs it...
+        let media_lh = DeployClass {
+            rank: Role::Lighthouse.rank(),
+            media: true,
+        };
+        assert!(
+            runs_in("navidrome", media_lh),
+            "media-lighthouse runs navidrome"
+        );
+        // ...but a stock lighthouse / server / workstation WITHOUT the tag does NOT
+        // (acceptance: container absent on a non-media node), even at higher rank.
+        for rank in [
+            Role::Lighthouse.rank(),
+            Role::Server.rank(),
+            Role::Workstation.rank(),
+        ] {
+            assert!(
+                !runs_in("navidrome", DeployClass::plain(rank)),
+                "rank {rank} without the media tag must NOT run navidrome"
+            );
+        }
+        // The rank-only `runs` never starts a capability worker (it has no tag).
+        assert!(!runs("navidrome", Role::Workstation.rank()));
+    }
+
+    #[test]
+    fn media_tag_only_unlocks_the_media_worker_not_the_tier() {
+        // The media tag adds the media worker WITHOUT changing the rank set:
+        // a media-lighthouse runs the lighthouse control plane + navidrome,
+        // never a server/desktop worker.
+        let media_lh = DeployClass {
+            rank: Role::Lighthouse.rank(),
+            media: true,
+        };
+        assert!(runs_in("nebula_supervisor", media_lh), "still a lighthouse");
+        assert!(!runs_in("ansible-pull", media_lh), "media ≠ server tier");
+        assert!(
+            !runs_in("voice_config", media_lh),
+            "media ≠ workstation tier"
+        );
+        let set = workers_for_class(media_lh);
+        // = the 20 lighthouse-tier workers + navidrome.
+        assert_eq!(set.len(), 21);
+        assert!(set.contains(&"navidrome"));
+        assert!(set.contains(&"nebula_supervisor"));
+        assert!(!set.contains(&"ansible-pull"));
+        // A plain lighthouse class never includes the media worker.
+        let plain_lh = DeployClass::plain(Role::Lighthouse.rank());
+        assert!(!workers_for_class(plain_lh).contains(&"navidrome"));
+        assert_eq!(workers_for_class(plain_lh).len(), 20);
+    }
+
+    #[test]
+    fn deploy_class_from_role_class_carries_the_media_tag() {
+        let media = DeployClass::from_role_class(&RoleClass {
+            role: Role::Lighthouse,
+            media: true,
+        });
+        assert_eq!(media.rank, 0);
+        assert!(media.media);
+        // A non-lighthouse role can't be a media class (RoleClass enforces it).
+        let srv = DeployClass::from_role_class(&RoleClass::plain(Role::Server));
+        assert_eq!(srv.rank, 1);
+        assert!(!srv.media);
     }
 }

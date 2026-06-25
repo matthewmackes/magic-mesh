@@ -102,6 +102,27 @@ pub fn directory_row(
         .overlay_ip
         .clone()
         .or_else(|| overlay.map(|(ip, _)| ip.clone()));
+    // Resolve the effective role ONCE (precedence note below) so both the
+    // `role` field and the MEDIA-1 class derivation read the same value.
+    let row_role = overlay
+        .map(|(_, role)| role.clone())
+        .or_else(|| rec.role.clone().filter(|r| !r.trim().is_empty()))
+        .unwrap_or_else(|| {
+            if tags.iter().any(|t| t.eq_ignore_ascii_case("lighthouse"))
+                || overlay_ip
+                    .as_deref()
+                    .is_some_and(|ip| lighthouse_ips.iter().any(|lh| lh == ip))
+            {
+                "lighthouse".to_string()
+            } else {
+                "peer".to_string()
+            }
+        });
+    // MEDIA-1 — the media subclass is the media capability tag AND a genuine
+    // lighthouse role (the tag is meaningless on a non-lighthouse). `rec.media`
+    // is the peer's own §9 capability tag from its replicated record.
+    let is_media_row =
+        rec.media && row_role.eq_ignore_ascii_case(mackes_mesh_types::lighthouse::LIGHTHOUSE_ROLE);
     json!({
         "hostname": rec.hostname,
         "presence": presence_tier(now_ms, rec.last_seen_ms),
@@ -131,21 +152,22 @@ pub fn directory_row(
         // regardless of what its own record happens to declare. This is the
         // SAME detection `mesh_health_counts` feeds `lighthouse_count`, so
         // `action/mesh/directory` and `healthz` can no longer diverge.
-        "role": overlay
-            .map(|(_, role)| role.clone())
-            .or_else(|| rec.role.clone().filter(|r| !r.trim().is_empty()))
-            .unwrap_or_else(|| {
-                if tags.iter().any(|t| t.eq_ignore_ascii_case("lighthouse"))
-                    || overlay_ip
-                        .as_deref()
-                        .is_some_and(|ip| lighthouse_ips.iter().any(|lh| lh == ip))
-                {
-                    "lighthouse".to_string()
-                } else {
-                    "peer".to_string()
-                }
-            }),
+        "role": row_role.clone(),
         "tags": tags,
+        // MEDIA-1 — surface the Lighthouse_Media subclass in the directory
+        // snapshot so the media set is identifiable mesh-wide (acceptance #2).
+        // `media` is the raw §9 capability tag off the peer's own record; `class`
+        // is the derived class name — `lighthouse_media` for a media-tagged
+        // lighthouse, else the plain role — so a consumer (mesh_dns music.mesh
+        // membership, the published-service health list) reads one field. Only a
+        // genuine lighthouse can be the media subclass (the tag is meaningless
+        // otherwise, per is_media_lighthouse).
+        "media": is_media_row,
+        "class": if is_media_row {
+            mackes_mesh_types::lighthouse::LIGHTHOUSE_MEDIA_CLASS.to_string()
+        } else {
+            row_role.clone()
+        },
         "revision": {
             "head": head,
             "acked": acked,
@@ -703,6 +725,7 @@ mod tests {
                 overlay_ip: None,
                 role: None,
                 external_addr: None,
+                media: false,
             },
         )
         .unwrap();
@@ -769,6 +792,7 @@ mod tests {
                     overlay_ip: Some("10.42.0.9".into()),
                     role: Some("lighthouse".into()),
                     external_addr: None,
+                    media: false,
                 },
             )
             .unwrap();
@@ -787,6 +811,45 @@ mod tests {
             !mackes_mesh_types::lighthouse::ha_degraded(lighthouses as usize),
             "2 lighthouses meet the HA floor → not degraded"
         );
+    }
+
+    #[test]
+    fn directory_row_surfaces_the_media_lighthouse_subclass() {
+        // MEDIA-1 (acceptance #2): a media-tagged lighthouse surfaces in the
+        // snapshot as the `lighthouse_media` class; a plain lighthouse + a
+        // mis-tagged server do NOT.
+        let now = now_ms();
+        let media_lh = PeerRecord {
+            hostname: "media-lh".into(),
+            mde_version: None,
+            last_seen_ms: now,
+            health: "healthy".into(),
+            descriptors: None,
+            overlay_ip: Some("10.42.0.9".into()),
+            role: Some("lighthouse".into()),
+            external_addr: None,
+            media: true,
+        };
+        let row = directory_row(&media_lh, None, None, None, &[], &[], now);
+        assert_eq!(row["role"], "lighthouse", "still a lighthouse role");
+        assert_eq!(row["media"], true);
+        assert_eq!(row["class"], "lighthouse_media", "the subclass surfaces");
+
+        // A plain lighthouse: media=false, class=role.
+        let mut plain = media_lh.clone();
+        plain.media = false;
+        let plain_row = directory_row(&plain, None, None, None, &[], &[], now);
+        assert_eq!(plain_row["media"], false);
+        assert_eq!(plain_row["class"], "lighthouse");
+
+        // A server that mis-claims the media tag is NOT the media subclass
+        // (the tag is meaningless without the lighthouse role).
+        let mut srv = media_lh.clone();
+        srv.role = Some("server".into());
+        srv.media = true;
+        let srv_row = directory_row(&srv, None, None, None, &[], &[], now);
+        assert_eq!(srv_row["media"], false, "media tag dropped off a server");
+        assert_eq!(srv_row["class"], "server");
     }
 
     #[test]
@@ -820,6 +883,7 @@ mod tests {
                     overlay_ip: Some(ip.into()),
                     role: None, // pre-role writer — the bug condition
                     external_addr: None,
+                    media: false,
                 },
             )
             .unwrap();
@@ -835,6 +899,7 @@ mod tests {
                 overlay_ip: Some("10.42.0.2".into()), // not in the LH roster
                 role: None,
                 external_addr: None,
+                media: false,
             },
         )
         .unwrap();
@@ -937,6 +1002,7 @@ mod tests {
                 overlay_ip: None,
                 role: None,
                 external_addr: None,
+                media: false,
             },
         )
         .unwrap();
@@ -972,6 +1038,7 @@ mod tests {
                 overlay_ip: None,
                 role: None,
                 external_addr: None,
+                media: false,
             },
         )
         .unwrap();
@@ -1054,6 +1121,7 @@ mod tests {
             overlay_ip: None,
             role: None,
             external_addr: None,
+            media: false,
         };
         write_peer_record(&pdir, &rec).unwrap();
 

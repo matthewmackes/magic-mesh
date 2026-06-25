@@ -224,6 +224,7 @@ mod tests {
             overlay_ip: Some("10.42.0.7".into()),
             role: None,
             external_addr: None,
+            media: false,
         };
         let p = record_to_peer(rec);
         assert_eq!(p.name, "pine");
@@ -240,6 +241,7 @@ mod tests {
             overlay_ip: None,
             role: None,
             external_addr: None,
+            media: false,
         };
         assert_eq!(record_to_peer(unreachable).presence, "offline");
     }

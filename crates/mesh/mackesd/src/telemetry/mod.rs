@@ -200,10 +200,16 @@ pub fn spawn_heartbeat_worker(
                 // every node (not just the signer) can resolve <host>.mesh,
                 // publish overlay services, and validate routing edges.
                 rec.overlay_ip = crate::voip_rtt::own_nebula_ip();
-                // LIGHTHOUSE-1/Q1 — stamp our pinned deployment role into the
-                // replicated directory so any node can identify the lighthouse
-                // set from the QNM-Shared peer JSON (no separate probe).
-                rec.role = mde_role::load().ok().map(|r| r.as_str().to_string());
+                // LIGHTHOUSE-1/Q1 — stamp our pinned deployment role + capability
+                // tags into the replicated directory so any node can identify the
+                // lighthouse set (and the MEDIA-1 Lighthouse_Media subclass) from
+                // the QNM-Shared peer JSON (no separate probe). `media` is the
+                // §9 capability tag — orthogonal to the role, only set on a
+                // media-tagged lighthouse — read off the same `role.toml`.
+                if let Ok(class) = mde_role::load_class() {
+                    rec.role = Some(class.role.as_str().to_string());
+                    rec.media = class.is_media_lighthouse();
+                }
                 // LIGHTHOUSE-10 — a lighthouse stamps its PUBLIC underlay address
                 // into the directory so the enroll roster can hand joining nodes
                 // the FULL lighthouse set (redundancy). Only lighthouses carry it;

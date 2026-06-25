@@ -65,6 +65,24 @@ pub struct PeerRecord {
     /// advertised without a dialable address).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_addr: Option<String>,
+    /// MEDIA-1 — the `media` **capability tag**: `true` when this lighthouse is
+    /// the `Lighthouse_Media` subclass (hosts the Navidrome / `music.mesh`
+    /// service). Stamped by the node itself each heartbeat from its pinned
+    /// `role.toml` capability (`mde_role::Capability::Media`), so any node can
+    /// discover the media-lighthouse set from the replicated directory without a
+    /// probe (mirrors how `role`/`external_addr` ride). Orthogonal to `role`
+    /// (§9: capability tags are not roles) — only meaningful when
+    /// `role == "lighthouse"`. `false`/absent on every other node and on
+    /// pre-MEDIA-1 writers; readers tolerate (treated as not media-capable).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub media: bool,
+}
+
+/// Skip-serializer for a defaulted `false` bool — keeps a non-media record's
+/// JSON byte-for-byte identical to a pre-MEDIA-1 writer's.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// PD-2 (L10–L15) — a peer's locally-probed service inventory,
@@ -173,6 +191,7 @@ impl PeerRecord {
             overlay_ip: None,
             role: None,
             external_addr: None,
+            media: false,
         }
     }
 

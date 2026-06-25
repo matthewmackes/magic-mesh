@@ -30,6 +30,13 @@ pub const DEFAULT_STALE_MS: u64 = 90_000;
 /// The directory `role` value that marks a lighthouse (design Q1).
 pub const LIGHTHOUSE_ROLE: &str = "lighthouse";
 
+/// MEDIA-1 — the runtime class name of the `Lighthouse_Media` subclass, surfaced
+/// in the snapshot / directory so the media set is identifiable mesh-wide
+/// (`docs/design/media-lighthouse.md`). A media-lighthouse is a [`is_lighthouse`]
+/// node whose `media` capability tag is set — NOT a distinct `role` value (§9:
+/// media is a capability tag, not a 4th role), so `is_lighthouse` still holds.
+pub const LIGHTHOUSE_MEDIA_CLASS: &str = "lighthouse_media";
+
 /// How long a leader lease is valid (mirrors `mackesd`'s `leader::LEASE_DURATION`).
 /// A lease older than this is treated as no leader (failover in progress).
 pub const LEASE_DURATION_S: u64 = 60;
@@ -151,6 +158,32 @@ pub fn is_lighthouse(peer: &PeerRecord) -> bool {
 #[must_use]
 pub fn lighthouse_records(peers: &[PeerRecord]) -> Vec<PeerRecord> {
     let mut out: Vec<PeerRecord> = peers.iter().filter(|p| is_lighthouse(p)).cloned().collect();
+    out.sort_by(|a, b| a.hostname.cmp(&b.hostname));
+    out
+}
+
+/// MEDIA-1 — whether a directory row is the **`Lighthouse_Media`** subclass: a
+/// lighthouse ([`is_lighthouse`]) that additionally carries the `media`
+/// capability tag. The media set is a strict subset of the lighthouse set (§9:
+/// the tag is orthogonal to the role, so the node is still a lighthouse). Used
+/// to gate `music.mesh` membership (MEDIA-5) + the Navidrome worker on exactly
+/// the media nodes; a stock lighthouse / server / peer is excluded.
+#[must_use]
+pub fn is_media_lighthouse(peer: &PeerRecord) -> bool {
+    is_lighthouse(peer) && peer.media
+}
+
+/// MEDIA-1 — the `Lighthouse_Media` subset of a peer directory, sorted by
+/// hostname for a stable render order. The foundation MEDIA-5/7 build on: the
+/// `music.mesh` A-record set + the published-service health list are derived
+/// from exactly these rows (every live media-lighthouse, none of the stock ones).
+#[must_use]
+pub fn media_lighthouse_records(peers: &[PeerRecord]) -> Vec<PeerRecord> {
+    let mut out: Vec<PeerRecord> = peers
+        .iter()
+        .filter(|p| is_media_lighthouse(p))
+        .cloned()
+        .collect();
     out.sort_by(|a, b| a.hostname.cmp(&b.hostname));
     out
 }
@@ -362,6 +395,58 @@ mod tests {
         assert!(!is_lighthouse(&p));
         p.role = Some("lighthouse".into());
         assert!(is_lighthouse(&p));
+    }
+
+    #[test]
+    fn media_lighthouse_is_a_lighthouse_with_the_media_tag() {
+        // MEDIA-1 — the media subclass is a strict subset of the lighthouse set.
+        let now = 1_000_000;
+        // A plain lighthouse: a lighthouse, but NOT media.
+        let mut plain = lh("lh-plain", "healthy", Some("10.42.0.1"), now);
+        assert!(is_lighthouse(&plain));
+        assert!(
+            !is_media_lighthouse(&plain),
+            "no media tag → not the subclass"
+        );
+        // Tag it media → now the Lighthouse_Media subclass (still a lighthouse).
+        plain.media = true;
+        assert!(is_lighthouse(&plain));
+        assert!(is_media_lighthouse(&plain));
+        // The media tag on a non-lighthouse is meaningless: a server flagged
+        // media is NOT a media-lighthouse (the role gate dominates).
+        let mut srv = PeerRecord::now("srv", None, "healthy");
+        srv.role = Some("server".into());
+        srv.media = true;
+        assert!(
+            !is_media_lighthouse(&srv),
+            "media tag alone ≠ media-lighthouse"
+        );
+    }
+
+    #[test]
+    fn media_lighthouse_records_filters_to_the_media_subset() {
+        let now = 1_000_000;
+        let mut media_a = lh("media-a", "healthy", Some("10.42.0.1"), now);
+        media_a.media = true;
+        let mut media_b = lh("media-b", "healthy", Some("10.42.0.2"), now);
+        media_b.media = true;
+        let plain_lh = lh("plain-lh", "healthy", Some("10.42.0.3"), now);
+        let mut srv = PeerRecord::now("srv", None, "healthy");
+        srv.role = Some("server".into());
+        srv.media = true; // a mis-tagged server — excluded
+        let peers = vec![media_b, plain_lh, media_a, srv];
+        let media = media_lighthouse_records(&peers);
+        assert_eq!(
+            media
+                .iter()
+                .map(|p| p.hostname.as_str())
+                .collect::<Vec<_>>(),
+            vec!["media-a", "media-b"],
+            "only media-lighthouses, sorted; plain LH + mis-tagged server excluded"
+        );
+        // It is a subset of the lighthouse set.
+        assert_eq!(lighthouse_records(&peers).len(), 3);
+        assert_eq!(LIGHTHOUSE_MEDIA_CLASS, "lighthouse_media");
     }
 
     #[test]
