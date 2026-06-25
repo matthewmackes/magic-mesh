@@ -6045,12 +6045,15 @@ fn run_serve(
             .push("selinux_monitor".into());
 
         // VIRT-1 (v5.0.0) — unified KVM + Podman compute inventory.
-        // Polls virsh + podman every 10 s and publishes the per-peer
-        // inventory to `compute/inventory/<peer-nebula-addr>` per
-        // docs/design/v5.0.0-compute.md §3. Silent no-op on peers
-        // without virsh/podman (lighthouse, container-stripped). The
-        // nebula address is auto-detected from the local nebula1
-        // interface at tick time (empty hint = runtime detect).
+        // Polls virsh + podman every 10 s; the per-peer inventory bus
+        // publish (`compute/inventory/<peer-nebula-addr>`) is on-change +
+        // a 60 s heartbeat per BUS-RUN-FULL-1 (docs/DECISIONS.md ADR-0005)
+        // — the cross-node fleet view reads the replicated
+        // compute-inventory.json file, the bus topic's only consumer is
+        // this node's own Workloads source. Silent no-op on peers without
+        // virsh/podman (lighthouse, container-stripped). The nebula
+        // address is auto-detected from the local nebula1 interface at
+        // tick time (empty hint = runtime detect).
         sup.spawn(Spawn::new(
             mackesd_core::workers::compute_registry::ComputeRegistryWorker::new(
                 fw_host.clone(),
