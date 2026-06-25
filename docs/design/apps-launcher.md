@@ -17,9 +17,9 @@ peers' published apps, containers/VMs, and mesh services. Hosted in
 | Q5 | Local sources | **XDG .desktop (all) + Flatpak** |
 | Q6 | Landing | Opens to **Favorites** |
 | Q7 | Layout | **Tabbed** (Favorites / Apps / Mesh / Workloads / Services) + persistent header |
-| Q8 | Header disk stat | **QNM-Shared usage** (used/total of `/mnt/mesh-storage`) |
+| Q8 | Header disk stat | **Mesh Sync usage** (used/total of `/mnt/mesh-storage`) |
 | Q9 | Peer-app launch | **Remote-desktop session** (stream the peer's app here) |
-| Q10 | Favorites scope | **Synced mesh-wide** (QNM-Shared), per desktop user |
+| Q10 | Favorites scope | **Synced mesh-wide** (Mesh Sync), per desktop user |
 | Q11 | Context actions | pin/unpin · **launch on a chosen peer** · run containerized · details/uninstall |
 | Q12 | Recents | **Favorites only** — no usage tracking (privacy) |
 | Q13 | Density | **Carbon design standard** (mde-theme tokens, §4) |
@@ -60,7 +60,7 @@ mde-cosmic-applet (libcosmic, panel)            mackesd (aggregator + verbs)
   (reusing the descriptors' advertised remote-access path). Workloads →
   `action/compute/*` + `action/provision/*` (start/stop/attach). Services → open
   the published endpoint over the overlay.
-- **Favorites:** per desktop user, stored on QNM-Shared so they follow the user
+- **Favorites:** per desktop user, stored on Mesh Sync so they follow the user
   to any node. No recents/usage tracking (Q12).
 - **Replace Cosmic's launcher:** the Magic-on-Cosmic baked layout drops
   `cosmic-app-library` from the panel, adds our applet's grid glyph, and binds
@@ -69,7 +69,7 @@ mde-cosmic-applet (libcosmic, panel)            mackesd (aggregator + verbs)
 ## Acceptance (runtime-observable)
 - Pressing Super (or the panel grid glyph) drops the launcher; Cosmic's stock
   app-library is gone from the baked layout.
-- Header shows live QNM-Shared used/total + working links to Workbench, MDE
+- Header shows live Mesh Sync used/total + working links to Workbench, MDE
   Files, Cosmic Settings.
 - Apps tab lists local XDG + flatpak apps; clicking one launches it.
 - Mesh tab lists peers' published apps (from the directory) with presence/health

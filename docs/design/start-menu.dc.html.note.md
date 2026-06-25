@@ -6,7 +6,7 @@ imported 2026-06-18. Implemented in `crates/platform/mde-cosmic-applet/src/bin/m
 
 Layout (Carbon dark mockup; implemented theme-aware via mde-theme tokens):
 - Panel: Gray-90 surface, Gray-80 border, drop shadow, bottom-left over the taskbar.
-- Header: grid glyph + "Applications"; QNM-Shared usage line (mono) + a thin progress bar (green fill).
+- Header: grid glyph + "Applications"; Mesh Sync usage line (mono) + a thin progress bar (green fill).
 - Quick links: Workbench / Files / Settings — icon over label, bordered tiles.
 - Line tabs: Apps / Mesh / Workloads / Services — active = Blue underline + bright text.
 - Search: leading magnifier, "Search apps, mesh, services…", clear (✕) when non-empty.
