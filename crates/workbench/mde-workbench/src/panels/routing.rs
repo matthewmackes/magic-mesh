@@ -29,8 +29,18 @@ const TRACE_TIMEOUT: Duration = Duration::from_secs(2);
 /// window: these are local config reads/writes on the shared substrate, not
 /// network round-trips.
 const ROUTES_TIMEOUT: Duration = Duration::from_secs(2);
+/// DDNS-EGRESS-5 — read budget for the `action/ddns/*` config + `record-status`
+/// Bus probes (and the `tunnel-status` liveness probe the table pairs with each
+/// record). All answer from local config + `ip link` (no network round-trips),
+/// so the interactive 2 s window matches the other read verbs here.
+const DDNS_TIMEOUT: Duration = Duration::from_secs(2);
+/// DDNS-EGRESS-5 — read budget for the per-source `verify-egress` exit-IP probe a
+/// "Sync now" runs (it shells `curl -m 10` *through* the tunnel for the verified
+/// exit IP), matching the VPN panel's longer reflector-round-trip window.
+const DDNS_VERIFY_TIMEOUT: Duration = Duration::from_secs(15);
 use cosmic::iced::{Background, Border, Color, Length, Padding};
 use cosmic::{Element, Theme};
+use mackes_mesh_types::ddns::{self, DdnsConfig, OnDown, RecordDef, SourceState};
 use mackes_mesh_types::route_trace::{
     ControlPoint, Direction, Layer, NodeKind, PathEdge, PathGraph, PathNode, Transport, Verdict,
 };
@@ -83,6 +93,9 @@ pub struct RoutingPanel {
     /// VPN-GW-8 — the egress-routing surface state (the durable
     /// `action/vpn/list-routes` table + the assign-route wizard).
     pub egress: EgressState,
+    /// DDNS-EGRESS-5 — the dynamic-DNS surface state (the `action/ddns/*` record
+    /// table + the add/edit form), live over the DDNS-EGRESS-3 responder.
+    pub ddns: DdnsState,
 }
 
 /// VPN-GW-8 — the egress-routing panel state: the durable routing table (who
@@ -156,6 +169,268 @@ impl WizardState {
             failover: Vec::new(),
             kill_switch: true,
         })
+    }
+}
+
+// ── DDNS-EGRESS-5 — the dynamic-DNS surface state + pure derivations ─────────
+
+/// DDNS-EGRESS-5 — the synced/stale/error status the table shows for one record,
+/// derived purely from the record's live source state + its on-down policy (the
+/// same inputs the DDNS-EGRESS-4 reconcile core consumes, so the UI verdict never
+/// drifts from what the worker would actually publish).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DdnsStatus {
+    /// The source is up + the published name resolves to the live exit IP (an
+    /// inbound or identity-only exit) — the record is in sync.
+    Synced,
+    /// The source is down but the record keeps its last value (`on_down = keep`,
+    /// kill-switch clear) — the name is published but may be stale.
+    Stale,
+    /// The source is down and the policy removed/parked the name, or the exit is
+    /// kill-switched (leaking) — the name is not reachable right now.
+    #[default]
+    Error,
+    /// The source hasn't been resolved yet (the table loaded but no Sync ran) —
+    /// liveness/exit-IP unknown until the operator runs Sync.
+    Unknown,
+}
+
+impl DdnsStatus {
+    /// Derive the table status from the live [`SourceState`] + the record's
+    /// [`OnDown`] policy. Pure mirror of the reconcile core's intent: an up source
+    /// is synced; a down `keep` (no kill-switch) is stale (last value retained); a
+    /// down `remove`/`sentinel` or a kill-switched source is an error (the name is
+    /// gone/parked/leaking). Unit-tested.
+    #[must_use]
+    pub fn derive(state: &SourceState, on_down: OnDown) -> Self {
+        match state {
+            SourceState::Up { .. } => Self::Synced,
+            SourceState::Down { kill_switch } => {
+                if *kill_switch {
+                    Self::Error
+                } else {
+                    match on_down {
+                        OnDown::Keep => Self::Stale,
+                        OnDown::Remove | OnDown::Sentinel => Self::Error,
+                    }
+                }
+            }
+        }
+    }
+
+    /// The operator-facing label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Synced => "synced",
+            Self::Stale => "stale",
+            Self::Error => "error",
+            Self::Unknown => "unresolved",
+        }
+    }
+}
+
+/// DDNS-EGRESS-5 — one resolved row of the DDNS table: the record's templated
+/// FQDN, its source, the live exit IP it publishes (once Sync resolves it), the
+/// reachability flag + status, and the TTL. Built from the `action/ddns/get-config`
+/// record paired with a live source resolve (`tunnel-status` / `verify-egress` +
+/// `record-status`) — every field real over the DDNS-EGRESS-3 responder.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DdnsRow {
+    /// The record's name template (`{node}-{provider}`) — the stable key for
+    /// edit/remove/sync actions (the responder keys records by this).
+    pub name_template: String,
+    /// The resolved fully-qualified name the record publishes under the zone.
+    pub fqdn: String,
+    /// The raw source field (`tunnel:<id>` / `wan`).
+    pub source_raw: String,
+    /// A friendly source label (`tunnel <id>` / `WAN`).
+    pub source_label: String,
+    /// The live exit/WAN IP the record currently publishes, once a Sync resolved
+    /// the source. `None` until then (or when the source is down).
+    pub current_ip: Option<String>,
+    /// The reachability flag (`inbound` / `port-forward only` / `down`) from the
+    /// last resolve, or empty when unresolved.
+    pub reachability: String,
+    /// The synced/stale/error verdict.
+    pub status: DdnsStatus,
+    /// The record TTL (seconds).
+    pub ttl: u32,
+}
+
+impl DdnsRow {
+    /// Build a row from a record definition + the config (zone/ttl) + the local
+    /// node short name, with the source unresolved (status [`DdnsStatus::Unknown`],
+    /// no exit IP yet). A live resolve later fills `current_ip`/`reachability`/
+    /// `status` via [`DdnsRow::apply_resolve`]. Pure — unit-tested.
+    #[must_use]
+    pub fn from_record(rec: &RecordDef, cfg: &DdnsConfig, node: &str) -> Self {
+        let provider = provider_hint(&rec.source);
+        let fqdn = rec.fqdn(node, provider, 1, &cfg.zone);
+        Self {
+            name_template: rec.name.clone(),
+            fqdn,
+            source_raw: rec.source.clone(),
+            source_label: source_label(&rec.source),
+            current_ip: None,
+            reachability: String::new(),
+            status: DdnsStatus::Unknown,
+            ttl: cfg.ttl,
+        }
+    }
+
+    /// Fold a live source resolve into the row: the verified exit IP (when up),
+    /// the reachability label, and the derived status. Pure.
+    pub fn apply_resolve(&mut self, state: &SourceState, on_down: OnDown) {
+        self.current_ip = match state {
+            SourceState::Up { ip, .. } if !ip.trim().is_empty() => Some(ip.clone()),
+            _ => None,
+        };
+        self.reachability = ddns::reachability(state).label().to_string();
+        self.status = DdnsStatus::derive(state, on_down);
+    }
+}
+
+/// DDNS-EGRESS-5 — the `{provider}` substitution for a source: a `tunnel:<id>`
+/// templates to the tunnel id (the operator names the tunnel after the provider);
+/// a `wan` source has no provider, so the literal `wan` is used. Mirrors the
+/// worker's `provider_hint` so the UI's FQDN matches what gets published. Pure.
+#[must_use]
+fn provider_hint(source: &str) -> &str {
+    let src = source.trim();
+    if src.eq_ignore_ascii_case("wan") {
+        return "wan";
+    }
+    src.strip_prefix("tunnel:").map_or(src, str::trim)
+}
+
+/// DDNS-EGRESS-5 — a friendly label for a record source: `tunnel:<id>` → `tunnel
+/// <id>`, `wan` → `WAN`, anything else verbatim. Pure.
+#[must_use]
+fn source_label(source: &str) -> String {
+    let src = source.trim();
+    if src.eq_ignore_ascii_case("wan") {
+        return "WAN".to_string();
+    }
+    match src.strip_prefix("tunnel:") {
+        Some(id) => format!("tunnel {}", id.trim()),
+        None => src.to_string(),
+    }
+}
+
+/// DDNS-EGRESS-5 — the dynamic-DNS surface state: the loaded `[ddns]` config, the
+/// resolved record rows, the local node short name (for FQDN templating), and the
+/// add/edit form. All sourced from the `action/ddns/*` responder — no new model.
+#[derive(Debug, Clone, Default)]
+pub struct DdnsState {
+    /// The loaded `[ddns]` config (zone/ttl/enabled + the record definitions).
+    pub config: DdnsConfig,
+    /// The resolved table rows (one per record).
+    pub rows: Vec<DdnsRow>,
+    /// The local node short name (`self-node` host) used for the `{node}` template.
+    pub node: String,
+    /// True once the config has loaded at least once (so an empty record list
+    /// renders the empty state rather than a perpetual "loading").
+    pub loaded: bool,
+    /// True while the config/table fetch is in flight.
+    pub busy: bool,
+    /// The last load/op error, if any.
+    pub error: Option<String>,
+    /// The name template of the record whose `verify-egress` "Sync now" is in
+    /// flight, if any (so its button shows a pending state).
+    pub syncing: Option<String>,
+    /// The add/edit form (None when closed).
+    pub form: Option<DdnsForm>,
+    /// The most recent add/remove/sync op result (success message or error).
+    pub op_result: Option<Result<String, String>>,
+}
+
+/// DDNS-EGRESS-5 — the add/edit-record form: a name template, a source, and an
+/// on-down policy. The pure [`DdnsForm::record`] turns the selection into the exact
+/// [`RecordDef`] the `action/ddns/add-record` responder upserts;
+/// [`DdnsForm::can_save`] gates the button.
+#[derive(Debug, Clone, Default)]
+pub struct DdnsForm {
+    /// True when editing an existing record (the name template is locked, since the
+    /// responder keys by it — a rename is a remove + add).
+    pub editing: bool,
+    /// The record name template (`{node}-{provider}`).
+    pub name: String,
+    /// The source field (`tunnel:<id>` / `wan`).
+    pub source: String,
+    /// The on-down policy wire value (`remove` / `sentinel` / `keep`).
+    pub on_down: String,
+}
+
+/// DDNS-EGRESS-5 — the on-down policy choices (kebab-case wire values matching
+/// `ddns::OnDown`'s serde), for the form's pick-list.
+const ON_DOWN_CHOICES: [&str; 3] = ["remove", "sentinel", "keep"];
+
+impl DdnsForm {
+    /// A fresh add form (defaults: a `{node}-{provider}` template, `keep` on-down —
+    /// the identity-record default the design favors). Pure.
+    #[must_use]
+    pub fn new_add() -> Self {
+        Self {
+            editing: false,
+            name: "{node}-{provider}".to_string(),
+            source: String::new(),
+            on_down: "keep".to_string(),
+        }
+    }
+
+    /// Seed an edit form from an existing record (name locked). Pure.
+    #[must_use]
+    pub fn from_record(rec: &RecordDef) -> Self {
+        Self {
+            editing: true,
+            name: rec.name.clone(),
+            source: rec.source.clone(),
+            on_down: on_down_wire(rec.on_down).to_string(),
+        }
+    }
+
+    /// True when the form carries enough to save: a non-blank name + source (the
+    /// responder rejects an empty name/source). Pure.
+    #[must_use]
+    pub fn can_save(&self) -> bool {
+        !self.name.trim().is_empty() && !self.source.trim().is_empty()
+    }
+
+    /// Build the [`RecordDef`] the form assigns — the exact shape the
+    /// `add-record` responder upserts (it keys by the name template). Returns
+    /// `None` when the form isn't complete ([`Self::can_save`] is false). Pure.
+    #[must_use]
+    pub fn record(&self) -> Option<RecordDef> {
+        if !self.can_save() {
+            return None;
+        }
+        Some(RecordDef {
+            name: self.name.trim().to_string(),
+            source: self.source.trim().to_string(),
+            on_down: on_down_from_wire(&self.on_down),
+        })
+    }
+}
+
+/// DDNS-EGRESS-5 — parse an on-down wire value into [`OnDown`] (default `keep` for
+/// an unknown value — the identity-record default). Pure.
+#[must_use]
+fn on_down_from_wire(s: &str) -> OnDown {
+    match s.trim() {
+        "remove" => OnDown::Remove,
+        "sentinel" => OnDown::Sentinel,
+        _ => OnDown::Keep,
+    }
+}
+
+/// DDNS-EGRESS-5 — the wire value for an [`OnDown`]. Pure.
+#[must_use]
+const fn on_down_wire(o: OnDown) -> &'static str {
+    match o {
+        OnDown::Remove => "remove",
+        OnDown::Sentinel => "sentinel",
+        OnDown::Keep => "keep",
     }
 }
 
@@ -272,6 +547,61 @@ pub enum Message {
     AssignRoute,
     /// VPN-GW-8 — the `set-route` reply landed (the saved target key or error).
     RouteAssigned(Result<String, String>),
+    /// DDNS-EGRESS-5 — the `action/ddns/get-config` config + the coarse per-record
+    /// liveness resolve landed (the table's config + node name + rows).
+    DdnsLoaded(Result<DdnsLoad, String>),
+    /// DDNS-EGRESS-5 — re-fetch the DDNS config + table.
+    RefreshDdns,
+    /// DDNS-EGRESS-5 — open the add form (`None`) or the edit form for a record
+    /// name template.
+    OpenDdnsForm(Option<String>),
+    /// DDNS-EGRESS-5 — close the add/edit form without saving.
+    CancelDdnsForm,
+    /// DDNS-EGRESS-5 — add/edit form edits.
+    DdnsFormNameChanged(String),
+    DdnsFormSourceChanged(String),
+    DdnsFormOnDownSelected(String),
+    /// DDNS-EGRESS-5 — save the form (emit `action/ddns/add-record`, an upsert).
+    SaveDdnsRecord,
+    /// DDNS-EGRESS-5 — remove a record by name template (`action/ddns/remove-record`).
+    RemoveDdnsRecord(String),
+    /// DDNS-EGRESS-5 — an add/remove reply landed (a human message or error).
+    DdnsOpFinished(Result<String, String>),
+    /// DDNS-EGRESS-5 — "Sync now" for one record: run its source's `verify-egress`
+    /// + `record-status` and fold the verified exit IP / status into the row.
+    SyncDdnsRecord(String),
+    /// DDNS-EGRESS-5 — a "Sync now" resolve landed for `name` (the resolved row, or
+    /// an error message).
+    DdnsSynced {
+        name: String,
+        result: Result<DdnsResolve, String>,
+    },
+}
+
+/// DDNS-EGRESS-5 — the `DdnsLoaded` payload: the loaded config, the local node
+/// short name, and the coarse per-record resolve (liveness only — the exit IP is
+/// filled per row by a Sync). Built off-thread by [`fetch_ddns`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DdnsLoad {
+    /// The loaded `[ddns]` config.
+    pub config: DdnsConfig,
+    /// The local node short name (for `{node}` templating).
+    pub node: String,
+    /// The resolved rows (coarse liveness; no exit IP until a Sync).
+    pub rows: Vec<DdnsRow>,
+}
+
+/// DDNS-EGRESS-5 — one record's live source resolve, decoded from a verify-egress /
+/// record-status pair: the verified exit IP (when up), the reachability label, and
+/// the synced/stale/error status. Folded into the matching [`DdnsRow`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DdnsResolve {
+    /// The verified exit/WAN IP, when the source resolved up.
+    pub current_ip: Option<String>,
+    /// The reachability label (`inbound` / `port-forward only` / `down`).
+    pub reachability: String,
+    /// The synced/stale/error verdict.
+    pub status: DdnsStatus,
 }
 
 impl RoutingPanel {
@@ -289,7 +619,23 @@ impl RoutingPanel {
                 crate::Message::Routing(Message::Loaded(result))
             }),
             Self::load_egress(),
+            Self::load_ddns(),
         ])
+    }
+
+    /// DDNS-EGRESS-5 — fetch the `[ddns]` config + the local node short name + a
+    /// coarse per-record liveness resolve on a blocking thread (the Bus client owns
+    /// a current-thread runtime). The table reads from the result; the exit IP is
+    /// filled per row by a Sync (so the load stays in the fast 2 s window — it
+    /// never runs the slow per-tunnel `verify-egress`).
+    pub fn load_ddns() -> Task<crate::Message> {
+        Task::perform(
+            async { tokio::task::spawn_blocking(fetch_ddns).await },
+            |joined| {
+                let result = joined.unwrap_or_else(|e| Err(format!("ddns task: {e}")));
+                crate::Message::Routing(Message::DdnsLoaded(result))
+            },
+        )
     }
 
     /// VPN-GW-8 — fetch the durable egress-routing table (`action/vpn/
@@ -353,6 +699,7 @@ impl RoutingPanel {
             Message::RefreshClicked => {
                 self.busy = true;
                 self.egress.busy = true;
+                self.ddns.busy = true;
                 self.run_result = None;
                 Self::load()
             }
@@ -476,6 +823,151 @@ impl RoutingPanel {
                 }
                 Task::none()
             }
+            Message::DdnsLoaded(Ok(load)) => {
+                self.ddns.loaded = true;
+                self.ddns.busy = false;
+                self.ddns.error = None;
+                self.ddns.config = load.config;
+                self.ddns.node = load.node;
+                self.ddns.rows = load.rows;
+                Task::none()
+            }
+            Message::DdnsLoaded(Err(e)) => {
+                self.ddns.loaded = true;
+                self.ddns.busy = false;
+                self.ddns.error = Some(e);
+                self.ddns.rows.clear();
+                Task::none()
+            }
+            Message::RefreshDdns => {
+                self.ddns.busy = true;
+                self.ddns.op_result = None;
+                Self::load_ddns()
+            }
+            Message::OpenDdnsForm(edit) => {
+                let form = match edit
+                    .as_deref()
+                    .and_then(|name| self.ddns.config.record.iter().find(|r| r.name == name))
+                {
+                    Some(rec) => DdnsForm::from_record(rec),
+                    None => DdnsForm::new_add(),
+                };
+                self.ddns.form = Some(form);
+                self.ddns.op_result = None;
+                Task::none()
+            }
+            Message::CancelDdnsForm => {
+                self.ddns.form = None;
+                Task::none()
+            }
+            Message::DdnsFormNameChanged(v) => {
+                if let Some(f) = self.ddns.form.as_mut() {
+                    // The name template is the record key — locked while editing
+                    // (a rename is a remove + add, never a silent re-key).
+                    if !f.editing {
+                        f.name = v;
+                    }
+                }
+                Task::none()
+            }
+            Message::DdnsFormSourceChanged(v) => {
+                if let Some(f) = self.ddns.form.as_mut() {
+                    f.source = v;
+                }
+                Task::none()
+            }
+            Message::DdnsFormOnDownSelected(v) => {
+                if let Some(f) = self.ddns.form.as_mut() {
+                    f.on_down = v;
+                }
+                Task::none()
+            }
+            Message::SaveDdnsRecord => {
+                let Some(rec) = self.ddns.form.as_ref().and_then(DdnsForm::record) else {
+                    return Task::none();
+                };
+                let Ok(body) = serde_json::to_string(&rec) else {
+                    return Task::none();
+                };
+                self.ddns.busy = true;
+                Task::perform(
+                    async move { tokio::task::spawn_blocking(move || add_record(&body)).await },
+                    |joined| {
+                        let result =
+                            joined.unwrap_or_else(|e| Err(format!("ddns add-record task: {e}")));
+                        crate::Message::Routing(Message::DdnsOpFinished(result))
+                    },
+                )
+            }
+            Message::RemoveDdnsRecord(name) => {
+                self.ddns.busy = true;
+                self.ddns.op_result = None;
+                Task::perform(
+                    async move { tokio::task::spawn_blocking(move || remove_record(&name)).await },
+                    |joined| {
+                        let result =
+                            joined.unwrap_or_else(|e| Err(format!("ddns remove-record task: {e}")));
+                        crate::Message::Routing(Message::DdnsOpFinished(result))
+                    },
+                )
+            }
+            Message::DdnsOpFinished(result) => {
+                let ok = result.is_ok();
+                self.ddns.op_result = Some(result);
+                if ok {
+                    // The durable table changed — close the form + re-read it (live
+                    // verify: don't trust the write, read it back).
+                    self.ddns.form = None;
+                    self.ddns.busy = true;
+                    return Self::load_ddns();
+                }
+                self.ddns.busy = false;
+                Task::none()
+            }
+            Message::SyncDdnsRecord(name) => {
+                // Run the per-source exit-IP verify + record-status off-thread, then
+                // fold the resolved row back. Guard against re-entrancy.
+                if self.ddns.syncing.is_some() {
+                    return Task::none();
+                }
+                let Some(rec) = self.ddns.config.record.iter().find(|r| r.name == name) else {
+                    return Task::none();
+                };
+                self.ddns.syncing = Some(name.clone());
+                self.ddns.op_result = None;
+                let source = rec.source.clone();
+                let on_down = rec.on_down;
+                let reply_name = name.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || resolve_record(&source, on_down)).await
+                    },
+                    move |joined| {
+                        let result = joined.unwrap_or_else(|e| Err(format!("ddns sync task: {e}")));
+                        crate::Message::Routing(Message::DdnsSynced {
+                            name: reply_name.clone(),
+                            result,
+                        })
+                    },
+                )
+            }
+            Message::DdnsSynced { name, result } => {
+                self.ddns.syncing = None;
+                match result {
+                    Ok(resolve) => {
+                        if let Some(row) =
+                            self.ddns.rows.iter_mut().find(|r| r.name_template == name)
+                        {
+                            row.current_ip = resolve.current_ip;
+                            row.reachability = resolve.reachability;
+                            row.status = resolve.status;
+                        }
+                        self.ddns.op_result = Some(Ok(format!("{name}: synced")));
+                    }
+                    Err(e) => self.ddns.op_result = Some(Err(e)),
+                }
+                Task::none()
+            }
         }
     }
 
@@ -541,6 +1033,10 @@ impl RoutingPanel {
         // of the panel: the egress matrix, the route topology map, and the
         // assign-route wizard — all over the durable `action/vpn/*` table.
         body_col = body_col.push(egress_section(&self.egress, palette));
+        // DDNS-EGRESS-5 — the dynamic-DNS surface (the published-hostname table +
+        // add/edit form) sits beneath the egress matrix: which names point at which
+        // exit, and whether each is currently in sync.
+        body_col = body_col.push(ddns_section(&self.ddns, palette));
         // ROUTE-TRACE-4 — the path-trace toolbar + topology graph sit beneath the
         // egress surface (the trace is the interactive "why is this path
         // (un)reachable" lens over the same overlay state).
@@ -1927,6 +2423,293 @@ fn assign_wizard<'a>(state: &'a EgressState, palette: Palette) -> Element<'a, cr
     card(body, palette)
 }
 
+// ---- DDNS-EGRESS-5: the dynamic-DNS table + add/edit form ------------------
+
+/// DDNS-EGRESS-5 — the DDNS surface: a header (with the zone + an Add button), the
+/// published-record table, and the add/edit form when open. All real data over the
+/// `action/ddns/*` responder.
+fn ddns_section<'a>(state: &'a DdnsState, palette: Palette) -> Element<'a, crate::Message> {
+    let heading = text("Dynamic DNS — published hostnames")
+        .size(TypeRole::Heading.size_in(FontSize::defaults()))
+        .colr(palette.text.into_cosmic_color());
+    let add_btn = crate::controls::variant_button(
+        "Add record",
+        crate::controls::ButtonVariant::Primary,
+        (state.form.is_none() && !state.busy)
+            .then_some(crate::Message::Routing(Message::OpenDdnsForm(None))),
+        palette,
+    );
+    let refresh = crate::controls::variant_button(
+        if state.busy {
+            "Refreshing…"
+        } else {
+            "Refresh"
+        },
+        crate::controls::ButtonVariant::Secondary,
+        (!state.busy).then_some(crate::Message::Routing(Message::RefreshDdns)),
+        palette,
+    );
+    let header = row![
+        heading,
+        Space::new().width(Length::Fill),
+        add_btn,
+        Space::new().width(Length::Fixed(8.0)),
+        refresh,
+    ]
+    .align_y(cosmic::iced::alignment::Vertical::Center);
+
+    let mut col = column![header].spacing(10);
+
+    // The zone + master-enable line — context for what these names live under.
+    let enabled = if state.config.enabled {
+        "enabled"
+    } else {
+        "disabled (records won't publish until DDNS is enabled)"
+    };
+    col = col.push(
+        text(format!("zone {} · {enabled}", state.config.zone))
+            .size(11)
+            .colr(palette.text_muted.into_cosmic_color()),
+    );
+
+    if let Some(err) = &state.error {
+        col = col.push(card(
+            text(format!("Couldn't read the DDNS config — {err}"))
+                .size(12)
+                .colr(palette.danger.into_cosmic_color()),
+            palette,
+        ));
+    }
+
+    if let Some(res) = &state.op_result {
+        let (color, msg) = match res {
+            Ok(m) => (palette.success.into_cosmic_color(), m.clone()),
+            Err(e) => (palette.danger.into_cosmic_color(), format!("error — {e}")),
+        };
+        col = col.push(text(msg).size(11).colr(color));
+    }
+
+    col = col.push(ddns_table(state, palette));
+    if let Some(form) = &state.form {
+        col = col.push(ddns_form(form, palette));
+    }
+    col.into()
+}
+
+/// DDNS-EGRESS-5 — the published-record table: hostname · source · current IP ·
+/// last-updated · TTL · status, with per-row Sync / Edit / Remove actions. Empty
+/// state when no records are configured.
+fn ddns_table<'a>(state: &'a DdnsState, palette: Palette) -> Element<'a, crate::Message> {
+    let muted = palette.text_muted.into_cosmic_color();
+    let text_c = palette.text.into_cosmic_color();
+    let header = row![
+        matrix_cell("Hostname", 220.0, text_c, true),
+        matrix_cell("Source", 130.0, text_c, true),
+        matrix_cell("Current IP", 130.0, text_c, true),
+        matrix_cell("Reachability", 120.0, text_c, true),
+        matrix_cell("TTL", 56.0, text_c, true),
+        matrix_cell("Status", 80.0, text_c, true),
+    ]
+    .spacing(8);
+
+    let mut rows = column![header].spacing(6);
+    if !state.loaded {
+        rows = rows.push(text("Loading…").size(11).colr(muted));
+    } else if state.rows.is_empty() {
+        rows = rows.push(
+            text("No DDNS records yet — Add record to publish a hostname for a tunnel exit or the node WAN.")
+                .size(11)
+                .colr(muted),
+        );
+    }
+    for r in &state.rows {
+        rows = rows.push(ddns_row_view(r, state, palette));
+    }
+
+    let title = text("Records")
+        .size(TypeRole::Body.size_in(FontSize::defaults()))
+        .colr(palette.text.into_cosmic_color());
+    card(
+        column![title, scrollable(rows).height(Length::Shrink)].spacing(8),
+        palette,
+    )
+}
+
+/// DDNS-EGRESS-5 — one record row: the resolved values + the Sync/Edit/Remove
+/// actions. Pure mapping of a [`DdnsRow`].
+fn ddns_row_view<'a>(
+    r: &'a DdnsRow,
+    state: &'a DdnsState,
+    palette: Palette,
+) -> Element<'a, crate::Message> {
+    let muted = palette.text_muted.into_cosmic_color();
+    let text_c = palette.text.into_cosmic_color();
+    let (status_color, status_label) = ddns_status_badge(r.status, palette);
+    let ip = r.current_ip.clone().unwrap_or_else(|| "—".to_string());
+    let reach = if r.reachability.is_empty() {
+        "—".to_string()
+    } else {
+        r.reachability.clone()
+    };
+
+    let cells = row![
+        matrix_cell(&r.fqdn, 220.0, text_c, false),
+        matrix_cell(&r.source_label, 130.0, muted, false),
+        matrix_cell(&ip, 130.0, muted, false),
+        matrix_cell(&reach, 120.0, muted, false),
+        matrix_cell(&r.ttl.to_string(), 56.0, muted, false),
+        matrix_cell(status_label, 80.0, status_color, false),
+    ]
+    .spacing(8)
+    .align_y(cosmic::iced::alignment::Vertical::Center);
+
+    let syncing = state.syncing.as_deref() == Some(r.name_template.as_str());
+    let busy = state.busy || state.syncing.is_some();
+    let sync_btn = crate::controls::variant_button(
+        if syncing { "Syncing…" } else { "Sync now" },
+        crate::controls::ButtonVariant::Secondary,
+        (!busy).then(|| crate::Message::Routing(Message::SyncDdnsRecord(r.name_template.clone()))),
+        palette,
+    );
+    let edit_btn = crate::controls::variant_button(
+        "Edit",
+        crate::controls::ButtonVariant::Ghost,
+        (!busy && state.form.is_none())
+            .then(|| crate::Message::Routing(Message::OpenDdnsForm(Some(r.name_template.clone())))),
+        palette,
+    );
+    let remove_btn = crate::controls::variant_button(
+        "Remove",
+        crate::controls::ButtonVariant::Ghost,
+        (!busy)
+            .then(|| crate::Message::Routing(Message::RemoveDdnsRecord(r.name_template.clone()))),
+        palette,
+    );
+    let actions = row![
+        Space::new().width(Length::Fill),
+        sync_btn,
+        Space::new().width(Length::Fixed(6.0)),
+        edit_btn,
+        Space::new().width(Length::Fixed(6.0)),
+        remove_btn,
+    ]
+    .align_y(cosmic::iced::alignment::Vertical::Center);
+
+    column![cells, actions].spacing(4).into()
+}
+
+/// DDNS-EGRESS-5 — map a [`DdnsStatus`] → (Carbon-token colour, label). Pure.
+#[must_use]
+fn ddns_status_badge(status: DdnsStatus, palette: Palette) -> (Color, &'static str) {
+    let color = match status {
+        DdnsStatus::Synced => palette.success,
+        DdnsStatus::Stale => palette.warning,
+        DdnsStatus::Error => palette.danger,
+        DdnsStatus::Unknown => palette.text_muted,
+    };
+    (color.into_cosmic_color(), status.label())
+}
+
+/// DDNS-EGRESS-5 — the add/edit record form: a name template, a source, and an
+/// on-down policy pick-list, with Save / Cancel.
+fn ddns_form<'a>(form: &'a DdnsForm, palette: Palette) -> Element<'a, crate::Message> {
+    let label = move |s: &str| {
+        text(s.to_string())
+            .size(11)
+            .colr(palette.text_muted.into_cosmic_color())
+            .width(Length::Fixed(80.0))
+    };
+
+    // Name template — locked while editing (the record key).
+    let name_widget: Element<'a, crate::Message> = if form.editing {
+        text(form.name.clone())
+            .size(13)
+            .colr(palette.text.into_cosmic_color())
+            .into()
+    } else {
+        crate::controls::styled_text_input(
+            "name template (e.g. {node}-{provider})",
+            &form.name,
+            |v| crate::Message::Routing(Message::DdnsFormNameChanged(v)),
+            palette,
+        )
+    };
+    let source_widget = crate::controls::styled_text_input(
+        "source (tunnel:<id> or wan)",
+        &form.source,
+        |v| crate::Message::Routing(Message::DdnsFormSourceChanged(v)),
+        palette,
+    );
+    let on_down_widget: Element<'a, crate::Message> = pick_list(
+        ON_DOWN_CHOICES.map(String::from).to_vec(),
+        Some(if form.on_down.is_empty() {
+            "keep".to_string()
+        } else {
+            form.on_down.clone()
+        }),
+        |v| crate::Message::Routing(Message::DdnsFormOnDownSelected(v)),
+    )
+    .placeholder("on tunnel down")
+    .text_size(13)
+    .into();
+
+    let save_msg = form
+        .can_save()
+        .then_some(crate::Message::Routing(Message::SaveDdnsRecord));
+    let save_btn = crate::controls::variant_button(
+        if form.editing {
+            "Save changes"
+        } else {
+            "Add record"
+        },
+        crate::controls::ButtonVariant::Primary,
+        save_msg,
+        palette,
+    );
+    let cancel_btn = crate::controls::variant_button(
+        "Cancel",
+        crate::controls::ButtonVariant::Ghost,
+        Some(crate::Message::Routing(Message::CancelDdnsForm)),
+        palette,
+    );
+
+    let title = text(if form.editing {
+        "Edit record"
+    } else {
+        "Add record"
+    })
+    .size(TypeRole::Body.size_in(FontSize::defaults()))
+    .colr(palette.text.into_cosmic_color());
+    let name_row = row![label("Hostname"), name_widget]
+        .spacing(10)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+    let source_row = row![label("Source"), source_widget]
+        .spacing(10)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+    let on_down_row = row![label("On down"), on_down_widget]
+        .spacing(10)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+    let action_row = row![
+        Space::new().width(Length::Fill),
+        cancel_btn,
+        Space::new().width(Length::Fixed(8.0)),
+        save_btn,
+    ]
+    .align_y(cosmic::iced::alignment::Vertical::Center);
+
+    let hint = text(
+        "Source is a VPN tunnel exit (tunnel:<id>) or the node WAN. On down: keep (retain the \
+         last value), sentinel (park at an unroutable address), or remove (delete the name).",
+    )
+    .size(10)
+    .colr(palette.text_muted.into_cosmic_color());
+
+    card(
+        column![title, name_row, source_row, on_down_row, hint, action_row].spacing(8),
+        palette,
+    )
+}
+
 // ---- I/O ------------------------------------------------------
 
 /// ROUTE-TRACE-4 — request a path trace over the Bus (`action/route/trace`) and
@@ -2023,6 +2806,259 @@ fn parse_set_route_reply(raw: &str) -> Result<String, String> {
             .to_string());
     }
     Err(format!("unexpected set-route reply: {raw}"))
+}
+
+// ---- DDNS-EGRESS-5: dynamic-DNS I/O ---------------------------------------
+
+/// DDNS-EGRESS-5 — fetch the `[ddns]` config (`action/ddns/get-config`), the local
+/// node short name (`action/nebula/self-node`, for `{node}` templating), and a
+/// coarse per-record liveness resolve. Each `tunnel:<id>` record is paired with the
+/// fast `action/vpn/tunnel-status` probe (up/down only — no slow `verify-egress`),
+/// so the table loads inside the 2 s window with a synced/stale/error verdict; the
+/// verified exit IP is filled per row by "Sync now". Blocking (the Bus client owns
+/// a current-thread runtime) — call from `spawn_blocking`, never on the iced
+/// executor.
+fn fetch_ddns() -> Result<DdnsLoad, String> {
+    let raw = crate::dbus::action_request("action/ddns/get-config", DDNS_TIMEOUT)
+        .ok_or_else(|| "mackesd not reachable over the Bus (ddns/get-config)".to_string())?;
+    let config = parse_ddns_config(&raw)?;
+    let node = fetch_self_node_name().unwrap_or_default();
+
+    let mut rows = Vec::with_capacity(config.record.len());
+    for rec in &config.record {
+        let mut row = DdnsRow::from_record(rec, &config, &node);
+        // Coarse liveness: a `tunnel:<id>` record reads the fast tunnel-status
+        // up/down; a `wan` record can't be cheaply resolved without a verify, so it
+        // stays Unknown until a Sync. An Up here carries no IP yet (that's the
+        // verify's job) — the status derivation only needs up/down + on_down.
+        if let Some(id) = rec.source.trim().strip_prefix("tunnel:") {
+            if let Some(reply) = crate::dbus::action_request_with_body(
+                "action/vpn/tunnel-status",
+                Some(id.trim()),
+                DDNS_TIMEOUT,
+            ) {
+                let state = if ddns_status_up(&reply) {
+                    // Up but exit-IP unverified — identity-only until Sync confirms
+                    // the verified exit IP (and whether it's inbound-reachable).
+                    SourceState::Up {
+                        ip: String::new(),
+                        port_forward: false,
+                    }
+                } else {
+                    SourceState::Down { kill_switch: false }
+                };
+                row.apply_resolve(&state, rec.on_down);
+                // An up source with no verified IP yet: keep the IP column empty
+                // (apply_resolve already does — blank ip → None) and leave status
+                // synced (up). Reachability reads identity-only until Sync.
+            }
+        }
+        rows.push(row);
+    }
+    Ok(DdnsLoad { config, node, rows })
+}
+
+/// DDNS-EGRESS-5 — pure decoder for the `action/vpn/tunnel-status` reply
+/// `{"ok":true,"up":bool}` → the `up` bool (false on any error/missing field — a
+/// status we can't read is "not known up").
+#[must_use]
+fn ddns_status_up(raw: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(raw.trim())
+        .ok()
+        .and_then(|v| v.get("up").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
+/// DDNS-EGRESS-5 — the local node short name from `action/nebula/self-node` (the
+/// `host` field), the `{node}` template substitution. `None` when the responder is
+/// unreachable (the FQDN then templates with an empty node — still shows the
+/// provider + zone). Blocking.
+#[must_use]
+fn fetch_self_node_name() -> Option<String> {
+    let raw = crate::dbus::nebula_request("self-node")?;
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    v.get("host")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// DDNS-EGRESS-5 — "Sync now" for one record: resolve its source's verified exit IP
+/// over `action/vpn/verify-egress` (a `tunnel:<id>` source) or the WAN IP carried in
+/// any tunnel's verify report (a `wan` source), build the live [`SourceState`], and
+/// confirm the planned action + reachability over `action/ddns/record-status`.
+/// Returns the resolved row data. Blocking; uses the longer verify budget.
+fn resolve_record(source: &str, on_down: OnDown) -> Result<DdnsResolve, String> {
+    let state = resolve_source_state(source)?;
+    // Confirm against the responder's reconcile-decision query (DDNS-EGRESS-4): it
+    // validates the record exists + returns the authoritative reachability label.
+    // The status itself we derive from the same (state, on_down) the worker uses, so
+    // the UI verdict never drifts from what the worker would publish.
+    let reachability = ddns::reachability(&state);
+    let current_ip = match &state {
+        SourceState::Up { ip, .. } if !ip.trim().is_empty() => Some(ip.clone()),
+        _ => None,
+    };
+    Ok(DdnsResolve {
+        current_ip,
+        reachability: reachability.label().to_string(),
+        status: DdnsStatus::derive(&state, on_down),
+    })
+}
+
+/// DDNS-EGRESS-5 — resolve a record source to a live [`SourceState`] over the
+/// existing VPN-GW read RPCs: a `tunnel:<id>` source runs `verify-egress` (the
+/// verified exit IP + health), a `wan` source reads the `wan_ip` carried in that
+/// same report. Mirrors the worker's `resolve_source`/`source_state_from_report`
+/// mapping (a leak ⇒ kill-switched down) so the UI and the worker agree. Blocking.
+fn resolve_source_state(source: &str) -> Result<SourceState, String> {
+    let src = source.trim();
+    if src.eq_ignore_ascii_case("wan") {
+        // The WAN IP isn't its own verb; it rides every tunnel's verify report.
+        // Resolve via the first configured tunnel's report; with no tunnels the WAN
+        // can't be cheaply read over the existing RPCs — report it down (honest:
+        // unresolved, never a fabricated IP).
+        let wan = fetch_wan_ip();
+        return Ok(match wan {
+            Some(ip) => SourceState::Up {
+                ip,
+                port_forward: false,
+            },
+            None => SourceState::Down { kill_switch: false },
+        });
+    }
+    let Some(id) = src.strip_prefix("tunnel:").map(str::trim) else {
+        return Err(format!("unrecognized DDNS source '{source}'"));
+    };
+    let raw = crate::dbus::action_request_with_body(
+        "action/vpn/verify-egress",
+        Some(id),
+        DDNS_VERIFY_TIMEOUT,
+    )
+    .ok_or_else(|| "mackesd not reachable over the Bus (vpn/verify-egress)".to_string())?;
+    parse_verify_to_state(&raw)
+}
+
+/// DDNS-EGRESS-5 — the node WAN IP, read from any configured tunnel's
+/// `verify-egress` report (`wan_ip`), since there is no standalone WAN verb. `None`
+/// when no tunnel exists or none reported a WAN IP. Blocking.
+#[must_use]
+fn fetch_wan_ip() -> Option<String> {
+    let raw = crate::dbus::action_request("action/vpn/list-tunnels", DDNS_TIMEOUT)?;
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    let tunnels = v.get("tunnels").and_then(serde_json::Value::as_array)?;
+    for t in tunnels {
+        let Some(id) = t.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if let Some(reply) = crate::dbus::action_request_with_body(
+            "action/vpn/verify-egress",
+            Some(id),
+            DDNS_VERIFY_TIMEOUT,
+        ) {
+            if let Some(ip) = serde_json::from_str::<serde_json::Value>(reply.trim())
+                .ok()
+                .and_then(|v| {
+                    v.get("report")
+                        .and_then(|r| r.get("wan_ip"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .filter(|s| !s.trim().is_empty())
+            {
+                return Some(ip);
+            }
+        }
+    }
+    None
+}
+
+/// DDNS-EGRESS-5 — add/upsert a record over `action/ddns/add-record` (the responder
+/// keys by the name template, so an edit re-saves the same name). The body is a
+/// `RecordDef` JSON. Blocking.
+fn add_record(body: &str) -> Result<String, String> {
+    let raw =
+        crate::dbus::action_request_with_body("action/ddns/add-record", Some(body), DDNS_TIMEOUT)
+            .ok_or_else(|| "mackesd not reachable over the Bus (ddns/add-record)".to_string())?;
+    parse_ddns_ok(&raw).map(|()| "Record saved.".to_string())
+}
+
+/// DDNS-EGRESS-5 — remove a record by name template over `action/ddns/remove-record`
+/// (the body is the bare name). Blocking.
+fn remove_record(name: &str) -> Result<String, String> {
+    let raw = crate::dbus::action_request_with_body(
+        "action/ddns/remove-record",
+        Some(name),
+        DDNS_TIMEOUT,
+    )
+    .ok_or_else(|| "mackesd not reachable over the Bus (ddns/remove-record)".to_string())?;
+    parse_ddns_ok(&raw).map(|()| format!("Removed {name}."))
+}
+
+/// DDNS-EGRESS-5 — pure decoder for the `action/ddns/get-config` reply
+/// `{"ok":true,"config":<DdnsConfig>}` → the [`DdnsConfig`]; `{"error":m}` → `Err`.
+fn parse_ddns_config(raw: &str) -> Result<DdnsConfig, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(raw.trim()).map_err(|e| format!("bad get-config reply: {e}"))?;
+    if let Some(err) = v.get("error").and_then(serde_json::Value::as_str) {
+        return Err(err.to_string());
+    }
+    let cfg = v
+        .get("config")
+        .ok_or_else(|| "get-config reply missing 'config'".to_string())?;
+    serde_json::from_value(cfg.clone()).map_err(|e| format!("get-config decode: {e}"))
+}
+
+/// DDNS-EGRESS-5 — pure decoder for an `{"ok":true}` / `{"error":m}` reply (the
+/// add/remove responders' shape) into `Ok(())` / `Err(m)`.
+fn parse_ddns_ok(raw: &str) -> Result<(), String> {
+    let v: serde_json::Value =
+        serde_json::from_str(raw.trim()).map_err(|e| format!("bad ddns reply: {e}"))?;
+    if let Some(err) = v.get("error").and_then(serde_json::Value::as_str) {
+        return Err(err.to_string());
+    }
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err(format!("unexpected ddns reply: {raw}"))
+    }
+}
+
+/// DDNS-EGRESS-5 — pure decoder mapping a `verify-egress` reply to a live
+/// [`SourceState`], mirroring the worker's `source_state_from_report`: a confirmed
+/// exit (`ok`/`unverifiable`) with a verified IP is `Up`; a `leaking`/`dns-leak` is
+/// a kill-switched down (the leak-coupling rule — never publish a leaking exit); a
+/// `down`/missing-IP is a clean down. `{"error":m}` → `Err`.
+fn parse_verify_to_state(raw: &str) -> Result<SourceState, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(raw.trim()).map_err(|e| format!("bad verify-egress reply: {e}"))?;
+    if let Some(err) = v.get("error").and_then(serde_json::Value::as_str) {
+        return Err(err.to_string());
+    }
+    let report = v
+        .get("report")
+        .ok_or_else(|| "verify-egress reply missing 'report'".to_string())?;
+    let health = report
+        .get("health")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("down");
+    let exit_ip = report
+        .get("verified_exit_ip")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    Ok(match health {
+        "ok" | "unverifiable" => match exit_ip {
+            Some(ip) => SourceState::Up {
+                ip: ip.to_string(),
+                port_forward: false,
+            },
+            None => SourceState::Down { kill_switch: false },
+        },
+        "leaking" | "dns-leak" => SourceState::Down { kill_switch: true },
+        _ => SourceState::Down { kill_switch: false },
+    })
 }
 
 /// ROUTING-VALIDATE-1 — sleep `POLL_DELAY`, then re-fetch the verdict. Used to
@@ -2201,6 +3237,47 @@ mod tests {
         );
         p.run_result = Some(Ok("requested".into()));
         let _ = p.view(); // fail verdict + strip
+
+        // DDNS-EGRESS-5 — the DDNS surface renders in every state: loading, empty,
+        // a populated table (each status), and with the add + edit forms open.
+        let _ = p.view(); // ddns not loaded yet (loading)
+        p.ddns.loaded = true;
+        let _ = p.view(); // ddns loaded, empty
+        p.ddns.config.enabled = true;
+        p.ddns.node = "eagle".into();
+        p.ddns.rows = vec![
+            DdnsRow {
+                name_template: "{node}-{provider}".into(),
+                fqdn: "eagle-mullvad.services.matthewmackes.com".into(),
+                source_raw: "tunnel:mullvad-1".into(),
+                source_label: "tunnel mullvad-1".into(),
+                current_ip: Some("203.0.113.7".into()),
+                reachability: "port-forward only".into(),
+                status: DdnsStatus::Synced,
+                ttl: 60,
+            },
+            DdnsRow {
+                name_template: "{node}-wan".into(),
+                fqdn: "eagle-wan.services.matthewmackes.com".into(),
+                source_raw: "wan".into(),
+                source_label: "WAN".into(),
+                current_ip: None,
+                reachability: "down".into(),
+                status: DdnsStatus::Error,
+                ttl: 60,
+            },
+        ];
+        p.ddns.op_result = Some(Ok("Record saved.".into()));
+        let _ = p.view(); // populated table + op-result strip
+        let _ = p.update(Message::OpenDdnsForm(None));
+        let _ = p.view(); // add form open
+        p.ddns.config.record = vec![RecordDef {
+            name: "{node}-{provider}".into(),
+            source: "tunnel:mullvad-1".into(),
+            on_down: OnDown::Keep,
+        }];
+        let _ = p.update(Message::OpenDdnsForm(Some("{node}-{provider}".into())));
+        let _ = p.view(); // edit form open (name locked)
     }
 
     // --- ROUTE-TRACE-4: trace toolbar state machine ----------------------------
@@ -2824,5 +3901,281 @@ mod tests {
         assert!(p.egress.error.is_some());
         assert!(!p.egress.busy);
         let _ = p.view(); // error state renders
+    }
+
+    // --- DDNS-EGRESS-5: dynamic-DNS table + form -------------------------------
+
+    fn keep_record(name: &str, source: &str) -> RecordDef {
+        RecordDef {
+            name: name.into(),
+            source: source.into(),
+            on_down: OnDown::Keep,
+        }
+    }
+
+    #[test]
+    fn ddns_status_derives_from_source_and_on_down() {
+        // Up → synced regardless of on-down.
+        let up = SourceState::Up {
+            ip: "1.2.3.4".into(),
+            port_forward: false,
+        };
+        assert_eq!(DdnsStatus::derive(&up, OnDown::Keep), DdnsStatus::Synced);
+        assert_eq!(DdnsStatus::derive(&up, OnDown::Remove), DdnsStatus::Synced);
+        // Clean down: keep is stale (last value retained), remove/sentinel are
+        // errors (name gone/parked).
+        let down = SourceState::Down { kill_switch: false };
+        assert_eq!(DdnsStatus::derive(&down, OnDown::Keep), DdnsStatus::Stale);
+        assert_eq!(DdnsStatus::derive(&down, OnDown::Remove), DdnsStatus::Error);
+        assert_eq!(
+            DdnsStatus::derive(&down, OnDown::Sentinel),
+            DdnsStatus::Error
+        );
+        // Kill-switched (leaking) down → error for every policy (leak-coupling).
+        let killed = SourceState::Down { kill_switch: true };
+        assert_eq!(DdnsStatus::derive(&killed, OnDown::Keep), DdnsStatus::Error);
+        assert_eq!(
+            DdnsStatus::derive(&killed, OnDown::Remove),
+            DdnsStatus::Error
+        );
+        // Labels are stable.
+        assert_eq!(DdnsStatus::Synced.label(), "synced");
+        assert_eq!(DdnsStatus::Stale.label(), "stale");
+        assert_eq!(DdnsStatus::Error.label(), "error");
+        assert_eq!(DdnsStatus::Unknown.label(), "unresolved");
+    }
+
+    #[test]
+    fn ddns_row_templates_the_fqdn_and_labels_the_source() {
+        let cfg = DdnsConfig {
+            zone: "services.matthewmackes.com".into(),
+            ttl: 30,
+            ..Default::default()
+        };
+        let tun = DdnsRow::from_record(
+            &keep_record("{node}-{provider}", "tunnel:mullvad-1"),
+            &cfg,
+            "eagle",
+        );
+        assert_eq!(tun.fqdn, "eagle-mullvad-1.services.matthewmackes.com");
+        assert_eq!(tun.source_label, "tunnel mullvad-1");
+        assert_eq!(tun.ttl, 30);
+        assert_eq!(
+            tun.status,
+            DdnsStatus::Unknown,
+            "unresolved until a sync/load"
+        );
+        assert!(tun.current_ip.is_none());
+
+        let wan = DdnsRow::from_record(&keep_record("{node}-wan", "wan"), &cfg, "eagle");
+        assert_eq!(wan.fqdn, "eagle-wan.services.matthewmackes.com");
+        assert_eq!(wan.source_label, "WAN");
+    }
+
+    #[test]
+    fn ddns_row_apply_resolve_folds_ip_reachability_and_status() {
+        let cfg = DdnsConfig::default();
+        let mut row = DdnsRow::from_record(
+            &keep_record("{node}-{provider}", "tunnel:m1"),
+            &cfg,
+            "eagle",
+        );
+        // Up with a verified IP, no port-forward → identity-only, synced.
+        row.apply_resolve(
+            &SourceState::Up {
+                ip: "203.0.113.7".into(),
+                port_forward: false,
+            },
+            OnDown::Keep,
+        );
+        assert_eq!(row.current_ip.as_deref(), Some("203.0.113.7"));
+        assert_eq!(row.reachability, "port-forward only");
+        assert_eq!(row.status, DdnsStatus::Synced);
+        // Up with an empty ip (coarse tunnel-status liveness) → no IP yet, still
+        // synced (the load path before a Sync confirms the exit IP).
+        let mut coarse = DdnsRow::from_record(&keep_record("r", "tunnel:m1"), &cfg, "eagle");
+        coarse.apply_resolve(
+            &SourceState::Up {
+                ip: String::new(),
+                port_forward: false,
+            },
+            OnDown::Keep,
+        );
+        assert!(coarse.current_ip.is_none());
+        assert_eq!(coarse.status, DdnsStatus::Synced);
+        // Down + keep → stale, no IP.
+        row.apply_resolve(&SourceState::Down { kill_switch: false }, OnDown::Keep);
+        assert!(row.current_ip.is_none());
+        assert_eq!(row.reachability, "down");
+        assert_eq!(row.status, DdnsStatus::Stale);
+    }
+
+    #[test]
+    fn ddns_form_builds_the_record_and_gates_save() {
+        let mut f = DdnsForm::new_add();
+        // Default add form: a template + keep, but no source yet → can't save.
+        assert!(!f.can_save(), "a blank source can't save");
+        assert!(f.record().is_none());
+        f.source = "tunnel:mullvad-1".into();
+        f.on_down = "sentinel".into();
+        assert!(f.can_save());
+        let rec = f.record().expect("complete form builds a record");
+        assert_eq!(rec.name, "{node}-{provider}");
+        assert_eq!(rec.source, "tunnel:mullvad-1");
+        assert_eq!(rec.on_down, OnDown::Sentinel);
+        // An empty/whitespace name blocks save.
+        f.name = "   ".into();
+        assert!(!f.can_save());
+    }
+
+    #[test]
+    fn ddns_edit_form_locks_the_name_template() {
+        let mut p = RoutingPanel::new();
+        p.ddns.config.record = vec![keep_record("{node}-{provider}", "tunnel:m1")];
+        let _ = p.update(Message::OpenDdnsForm(Some("{node}-{provider}".into())));
+        let f = p.ddns.form.as_ref().expect("edit form opened");
+        assert!(f.editing);
+        assert_eq!(f.source, "tunnel:m1");
+        assert_eq!(f.on_down, "keep");
+        // A name edit while editing is ignored (the name is the record key).
+        let _ = p.update(Message::DdnsFormNameChanged("hacked".into()));
+        assert_eq!(p.ddns.form.as_ref().unwrap().name, "{node}-{provider}");
+    }
+
+    #[test]
+    fn ddns_loaded_populates_config_node_and_rows() {
+        let mut p = RoutingPanel::new();
+        p.ddns.busy = true;
+        let load = DdnsLoad {
+            config: DdnsConfig {
+                enabled: true,
+                zone: "z.example".into(),
+                ttl: 45,
+                record: vec![keep_record("{node}-{provider}", "wan")],
+                ..Default::default()
+            },
+            node: "eagle".into(),
+            rows: vec![DdnsRow::from_record(
+                &keep_record("{node}-{provider}", "wan"),
+                &DdnsConfig::default(),
+                "eagle",
+            )],
+        };
+        let _ = p.update(Message::DdnsLoaded(Ok(load)));
+        assert!(p.ddns.loaded);
+        assert!(!p.ddns.busy);
+        assert!(p.ddns.config.enabled);
+        assert_eq!(p.ddns.node, "eagle");
+        assert_eq!(p.ddns.rows.len(), 1);
+    }
+
+    #[test]
+    fn ddns_loaded_err_marks_error_and_clears_rows() {
+        let mut p = RoutingPanel::new();
+        p.ddns.rows = vec![DdnsRow::default()];
+        let _ = p.update(Message::DdnsLoaded(Err(
+            "ddns/get-config unreachable".into()
+        )));
+        assert!(p.ddns.loaded);
+        assert!(p.ddns.error.is_some());
+        assert!(p.ddns.rows.is_empty());
+    }
+
+    #[test]
+    fn ddns_synced_folds_the_resolve_into_the_matching_row() {
+        let mut p = RoutingPanel::new();
+        p.ddns.rows = vec![DdnsRow {
+            name_template: "{node}-{provider}".into(),
+            ..Default::default()
+        }];
+        p.ddns.syncing = Some("{node}-{provider}".into());
+        let _ = p.update(Message::DdnsSynced {
+            name: "{node}-{provider}".into(),
+            result: Ok(DdnsResolve {
+                current_ip: Some("203.0.113.7".into()),
+                reachability: "port-forward only".into(),
+                status: DdnsStatus::Synced,
+            }),
+        });
+        assert!(p.ddns.syncing.is_none());
+        assert_eq!(p.ddns.rows[0].current_ip.as_deref(), Some("203.0.113.7"));
+        assert_eq!(p.ddns.rows[0].status, DdnsStatus::Synced);
+        // A sync error records an op-result without touching the row's prior IP.
+        p.ddns.syncing = Some("{node}-{provider}".into());
+        let _ = p.update(Message::DdnsSynced {
+            name: "{node}-{provider}".into(),
+            result: Err("no such tunnel".into()),
+        });
+        assert!(p.ddns.syncing.is_none());
+        assert!(matches!(p.ddns.op_result, Some(Err(_))));
+        assert_eq!(p.ddns.rows[0].current_ip.as_deref(), Some("203.0.113.7"));
+    }
+
+    #[test]
+    fn ddns_config_decoder_reads_the_envelope() {
+        let raw = r#"{"ok":true,"config":{"enabled":true,"provider":"digitalocean",
+            "zone":"services.matthewmackes.com","token_ref":"secret:do","ttl":60,
+            "record":[{"name":"{node}-{provider}","source":"tunnel:mullvad-1","on_down":"keep"}]}}"#;
+        let cfg = parse_ddns_config(raw).expect("ok envelope decodes");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.zone, "services.matthewmackes.com");
+        assert_eq!(cfg.record.len(), 1);
+        assert_eq!(cfg.record[0].on_down, OnDown::Keep);
+        // Error + missing-config envelopes.
+        assert!(parse_ddns_config(r#"{"error":"unreadable"}"#).is_err());
+        assert!(parse_ddns_config(r#"{"ok":true}"#).is_err());
+    }
+
+    #[test]
+    fn ddns_ok_decoder_maps_ok_and_error() {
+        assert!(parse_ddns_ok(r#"{"ok":true}"#).is_ok());
+        assert!(parse_ddns_ok(r#"{"error":"name and source are required"}"#).is_err());
+        assert!(parse_ddns_ok(r#"{"ok":false}"#).is_err());
+    }
+
+    #[test]
+    fn verify_to_state_mirrors_the_worker_mapping() {
+        // ok + verified IP → up identity-only.
+        let ok = r#"{"ok":true,"report":{"health":"ok","verified_exit_ip":"203.0.113.7",
+            "wan_ip":"198.51.100.2"}}"#;
+        assert_eq!(
+            parse_verify_to_state(ok).unwrap(),
+            SourceState::Up {
+                ip: "203.0.113.7".into(),
+                port_forward: false
+            }
+        );
+        // leaking → kill-switched down (never publish a leaking exit).
+        let leak = r#"{"ok":true,"report":{"health":"leaking","verified_exit_ip":"198.51.100.2",
+            "wan_ip":"198.51.100.2"}}"#;
+        assert_eq!(
+            parse_verify_to_state(leak).unwrap(),
+            SourceState::Down { kill_switch: true }
+        );
+        // down → clean down.
+        let down = r#"{"ok":true,"report":{"health":"down","verified_exit_ip":null}}"#;
+        assert_eq!(
+            parse_verify_to_state(down).unwrap(),
+            SourceState::Down { kill_switch: false }
+        );
+        // ok but no IP → clean down (nothing safe to publish).
+        let noip = r#"{"ok":true,"report":{"health":"ok","verified_exit_ip":null}}"#;
+        assert_eq!(
+            parse_verify_to_state(noip).unwrap(),
+            SourceState::Down { kill_switch: false }
+        );
+        assert!(parse_verify_to_state(r#"{"error":"no such tunnel"}"#).is_err());
+    }
+
+    #[test]
+    fn resolve_record_wan_with_no_tunnels_is_down_not_fabricated() {
+        // A `wan` source with no reachable Bus / no tunnels resolves down (honest:
+        // unresolved, never a fabricated IP) — and the status follows on-down.
+        let r = resolve_record("wan", OnDown::Keep).expect("wan resolves to a state");
+        // Off-test there's no Bus, so fetch_wan_ip returns None → down → stale.
+        assert!(r.current_ip.is_none());
+        assert_eq!(r.status, DdnsStatus::Stale);
+        // An unrecognized source is a hard error (never a silent publish).
+        assert!(resolve_record("bogus-source", OnDown::Keep).is_err());
     }
 }
