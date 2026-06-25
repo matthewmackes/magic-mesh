@@ -19,7 +19,7 @@ launcher applet — MCNF's Start Menu). Survey locks (10 questions, 2026-06-18):
 | 10 | Quick links | **Fixed Workbench / Files / Settings** tiles. |
 
 ## Layout (top → bottom)
-- **Header:** grid glyph + "Applications"; QNM-Shared usage line (mono `used / total`) + a thin progress bar (success-green fill).
+- **Header:** grid glyph + "Applications"; Mesh Sync usage line (mono `used / total`) + a thin progress bar (success-green fill).
 - **Quick links:** 3 tiles — icon glyph over label (Workbench / Files / Settings), bordered, hover-raise.
 - **Tabs:** Apps / Mesh / Workloads / Services — active = accent underline + bright text.
 - **Search:** leading magnifier glyph; clear (✕) when non-empty.

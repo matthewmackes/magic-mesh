@@ -177,7 +177,7 @@ fn run_create(wiz: &mut Wizard, mesh_id: &str, role: SetupRole) {
         wiz.push_log(l);
     }
     wiz.push_log(if ok {
-        "✓ mesh founded — services enabled + QNM-Shared up. Share the join line above.".to_string()
+        "✓ mesh founded — services enabled + Mesh Sync up. Share the join line above.".to_string()
     } else {
         "✗ found failed — see the log above.".to_string()
     });
@@ -192,7 +192,7 @@ fn run_join(wiz: &mut Wizard, token: &str, role: SetupRole) {
         wiz.push_log(l);
     }
     wiz.push_log(if ok {
-        "✓ joined — overlay up, services enabled, QNM-Shared mounted.".to_string()
+        "✓ joined — overlay up, services enabled, Mesh Sync mounted.".to_string()
     } else {
         "✗ join failed — see the log above.".to_string()
     });

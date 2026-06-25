@@ -26,7 +26,7 @@ pub struct BootStep {
     /// Stable step id (`nebula` / `overlay-ip` / `mackesd` / `bus` / `qnm` /
     /// `directory`) — robust to render across panels (BOOT-PEERS-1 keys on it).
     pub id: String,
-    /// Display label (e.g. "QNM-Shared mounted").
+    /// Display label (e.g. "Mesh Sync mounted").
     pub label: String,
     /// `ok` | `pending` | `blocked`.
     pub status: String,

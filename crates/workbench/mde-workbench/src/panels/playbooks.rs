@@ -161,7 +161,7 @@ impl PlaybooksPanel {
             let state = EmptyState::with_cta(
                 "No curated playbooks found",
                 "MDE reads roles from `~/QNM-Shared/.qnm-sync/playbooks/roles/`. \
-                 Mount QNM-Shared (or seed the curated 7-role tree) and refresh.",
+                 Mount Mesh Sync (or seed the curated 7-role tree) and refresh.",
                 "Refresh",
             )
             .with_icon(Icon::Playbook);
