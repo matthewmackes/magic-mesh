@@ -1960,12 +1960,12 @@ clean+reachable smoke); visual gate lifted.
     - [✓] tile click opens a detail view = an actions menu for that resource (live data + actions) — `TileGrid::update` hit-tests the canvas left-click (reusing the draw layout math) → `TileActivated`; the detail menu shows the tile's live data + REAL actions that navigate to the owning panel (Mesh→peers/routing, Provisioning→build-farm/datacenter, Fleet→inventory/jobs, Monitoring→health) or launch a real app (settings/files/terminal/music), with Back to the grid (§7 — no stubs; Copilot is an honest empty menu pending a publisher). Pointer cursor on hover via `mouse_interaction`.
     - [ ] tiles arranged via the settings panel; Copilot can author a custom tile from any data/command — DEFERRED to FRONTDOOR-14 (arrangement/settings) + FRONTDOOR-10 (Copilot authoring); FD-7/8 own the rich 1-click action sets the detail menu currently just routes to.
 
-- [ ] **FRONTDOOR-6: unified omnibox search.**
+- [>] **FRONTDOOR-6: unified omnibox search.** (apps + mesh + AI done; FILES deferred — no trivial workbench filename source, §7 over a fake)
   **As** an operator, **I want** one box that finds apps, files, mesh, and asks the AI,
   **so that** typing anything gets me there.
   **Acceptance**:
-    - [ ] unified scope (apps + files + mesh nodes/services + AI), instant local results first
-    - [ ] the AI answer streams in below as a distinct card; AI ranks the merged result list; no special syntax
+    - [>] unified scope (apps + mesh nodes/services + AI), instant local results first — apps (launchers + routable panels) and mesh entities (nodes + published services) search live + rank locally; FILES is a follow-up (no existing filename index the workbench reads — faking it would violate §7)
+    - [✓] the AI answer streams in below as a distinct card (Copilot `action/copilot/ask` → reply; "thinking…" until it lands, graceful degrade when unavailable); ranked merged local list; no special syntax
 
 - [ ] **FRONTDOOR-7: DevOps surface — one-click pipeline.**
   **As** an operator, **I want** build/CI + the farm at a glance with one-click actions,

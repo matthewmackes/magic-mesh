@@ -44,10 +44,23 @@
 //! can read yet) — stays a plain launcher with no faked value, noted as needing a
 //! publisher (a follow-up), per §7 (better an honest launcher than a fake metric).
 //!
-//! SCOPE held to FRONTDOOR-1/2/3/4:
+//! FRONTDOOR-6 (this layer) makes the omnibox a real **unified search** (design
+//! Q20/Q47/Q81). A non-empty query swaps the tile grid (in BOTH modes) for a
+//! results surface: instant LOCAL hits first — matching app launchers + routable
+//! panels, and live mesh entities (nodes + the services they publish, off the
+//! same FD-4 Peers roster) — ranked best-first by an exact/prefix/word/substring
+//! relevance ladder (the pure [`search`] engine). Below them, a distinct **AI
+//! answer card**: the query is published to FD-9's `action/copilot/ask` topic and
+//! the reply rendered when it lands ("Thinking…" until then), degrading quietly
+//! to an "unavailable" note when Copilot can't answer (Q33 — no error spew). A
+//! blank query restores the tile grid unchanged (FD-1..5 intact). Every local hit
+//! activates a REAL app message (a panel route or app launch — §7, no demo data).
+//! FILES search is a follow-up: there is no trivial existing filename source the
+//! workbench reads, so faking it would violate §7 — it's deferred, not stubbed.
+//!
+//! SCOPE held to FRONTDOOR-1..6:
 //! - `draw` only — tile click → detail view is FRONTDOOR-5, so the canvas keeps
 //!   `type State = ()` and the default `update` / `mouse_interaction`.
-//! - Omnibox is render + local text state only (search logic is FRONTDOOR-6).
 //! - No wallpaper backdrop here.
 
 use std::time::Duration;
@@ -73,9 +86,21 @@ use crate::panels::{build_farm, datacenter, home, peers};
 /// real router), so it needs no variant here.
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// The omnibox text changed. FRONTDOOR-2 only records it into local state;
-    /// the search behavior it will drive is FRONTDOOR-6.
+    /// The omnibox text changed. FRONTDOOR-2 recorded it into local state;
+    /// FRONTDOOR-6 makes it drive the real unified search — the instant LOCAL
+    /// results (apps + mesh entities) are recomputed synchronously here, and a
+    /// non-empty query also kicks off the async Copilot `ask` (the AI card).
     OmniboxChanged(String),
+    /// FRONTDOOR-6 — a Copilot `ask` reply landed (or the publish/wait failed).
+    /// Carries the generation the ask was fired under so a stale reply for a
+    /// superseded query is dropped, plus the parsed [`CopilotAnswer`]. Boxed-free
+    /// (the payload is small) — the generation guards ordering, not size.
+    CopilotReplied(u64, CopilotAnswer),
+    /// FRONTDOOR-6 — a local search hit was activated (clicked): fire its real
+    /// app message (a panel route or an app launch) and clear the omnibox so the
+    /// Front Door returns to the tile grid. The carried message is always one
+    /// `App::update` already handles (§7 — no inert results).
+    SearchHitActivated(Box<crate::Message>),
     /// FRONTDOOR-3 — the top-bar toggle was pressed: flip [`FrontDoor::mode`]
     /// between the Win10 panel and the iPadOS full-screen home.
     ToggleMode,
@@ -114,6 +139,16 @@ pub enum Mode {
 /// The fixed width of the left rail (design Q5 — a Win10-Start identity/pinned/
 /// surfaces column). Comfortable-density Start rails sit around this width.
 const RAIL_WIDTH: f32 = 260.0;
+
+/// FRONTDOOR-6 — how long the omnibox waits for the Copilot `ask` reply before
+/// degrading to "unavailable". Set a touch above FD-9's per-request codex ceiling
+/// ([`DEFAULT_CODEX_TIMEOUT`] = 120 s in the worker) so the worker's own graceful
+/// "AI unavailable" reply (a timeout / absent codex / unsealed key) wins the race
+/// and surfaces its reason path, rather than this client timing out first. A
+/// no-worker / no-Bus environment still degrades quietly — `action_request_with_body`
+/// returns `None` immediately when there's no Bus data-dir, so this ceiling only
+/// bounds the genuinely-waiting-on-a-leader case.
+const COPILOT_ASK_TIMEOUT: Duration = Duration::from_secs(130);
 
 /// The Carbon token a tile's accent strip + label color reads from. Picked per
 /// tile kind so DevOps/Data-Center/alert tiles read distinctly against the
@@ -328,6 +363,10 @@ pub struct FrontDoorData {
     pub data_center: Option<(String, TileTone)>,
     /// DevOps — in-flight farm jobs.
     pub dev_ops: Option<(String, TileTone)>,
+    /// FRONTDOOR-6 — the raw Peers directory rows, carried through so the unified
+    /// search has the live mesh entities (nodes + services) without a second Bus
+    /// read. The widget projections above are derived from these same rows.
+    pub peers: Vec<peers::PeerRow>,
 }
 
 impl FrontDoorData {
@@ -370,6 +409,8 @@ impl FrontDoorData {
             dev_ops: project::dev_ops(&farm),
             alerts: project::alerts(&health),
             system: Some(project::system(&boot)),
+            // FRONTDOOR-6 — carry the raw roster for the unified mesh search.
+            peers,
         }
     }
 }
@@ -503,6 +544,329 @@ pub(super) mod project {
     }
 }
 
+// ============================ FRONTDOOR-6: unified search ====================
+
+/// FRONTDOOR-6 — what kind of thing a local search hit is, so the results list
+/// can group + label them and the ranker can break score ties by a stable kind
+/// priority (apps before mesh nodes before services — the "open this surface"
+/// destinations rank above the "this thing exists" mentions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitKind {
+    /// A launchable app / in-app surface (a panel route or a real binary).
+    App,
+    /// A mesh node (a peer in the directory) → opens the Peers directory.
+    MeshNode,
+    /// A service a mesh node publishes → opens the Peers / Mesh Services view.
+    MeshService,
+}
+
+impl HitKind {
+    /// Stable tie-break priority (lower sorts first): apps are destinations the
+    /// operator most often means, then nodes, then the services they run.
+    fn rank(self) -> u8 {
+        match self {
+            HitKind::App => 0,
+            HitKind::MeshNode => 1,
+            HitKind::MeshService => 2,
+        }
+    }
+
+    /// The muted section caption this kind renders under in the results list.
+    fn section(self) -> &'static str {
+        match self {
+            HitKind::App => "Apps",
+            HitKind::MeshNode => "Mesh nodes",
+            HitKind::MeshService => "Services",
+        }
+    }
+}
+
+/// FRONTDOOR-6 — one instant LOCAL search result. Carries its display label, a
+/// short context line (e.g. the node a service runs on, or the surface a panel
+/// lives under), its [`HitKind`], the relevance `score` the ranker assigned, and
+/// the REAL app message activating it fires (§7 — a panel route or an app launch,
+/// never an inert hit). Built purely by [`search::local_results`] so the search +
+/// rank is unit-tested without any live Bus or view.
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    /// The matched thing's name, drawn as the row's primary label.
+    pub label: String,
+    /// A muted secondary line (the node a service is on / the panel's section).
+    pub context: String,
+    /// What kind of hit this is (drives the section + the tie-break order).
+    pub kind: HitKind,
+    /// Relevance score (higher = better); see [`search::score_match`].
+    pub score: u32,
+    /// The app message activating this hit fires — always one `App::update`
+    /// handles (a `SelectPanel` route or a `LaunchApp` spawn).
+    pub message: crate::Message,
+}
+
+/// FRONTDOOR-6 — the state of the Copilot `ask` for the current query (Q47 —
+/// instant local results, the AI answer streams in below). Drives the AI card's
+/// rendering: a "thinking…" placeholder while the ask is in flight, the prose
+/// answer when it lands, or a quiet "unavailable" note on graceful degrade (Q33 —
+/// no error spew). `Idle` (empty query) renders no card at all.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum CopilotState {
+    /// No query / no ask outstanding — render no AI card.
+    #[default]
+    Idle,
+    /// The ask was published; awaiting the reply. Renders the "thinking…" card.
+    Thinking,
+    /// Copilot answered — render the prose as the AI card.
+    Answer(String),
+    /// Graceful degrade (Q33): Copilot is unavailable (worker absent, codex not
+    /// installed, key unsealed, timeout). Renders a quiet one-line note, never an
+    /// error dump — the local results still stand on their own.
+    Unavailable,
+}
+
+/// FRONTDOOR-6 — the parsed outcome of one Copilot `ask`, mapped from the
+/// worker's `AskReply` JSON (`{answer?, error?}`) by [`search::parse_copilot_reply`].
+/// Kept as a small owned enum (not the raw JSON) so the message stays cheap and
+/// the parse is unit-testable without the Bus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopilotAnswer {
+    /// The model's prose answer text.
+    Answer(String),
+    /// Any degrade path (no reply, an `error` field, malformed JSON) → render the
+    /// quiet "unavailable" note. The reason is dropped on purpose (Q33 — no spew).
+    Unavailable,
+}
+
+/// FRONTDOOR-6 — the pure unified-search engine: the instant LOCAL match + rank,
+/// the Copilot `ask` request encoding, and the reply parse. Split into its own
+/// module with NO view / Bus dependency so the whole search + rank + message-flow
+/// is unit-tested directly (DoD — the local search/rank + the message flow), and
+/// so the Bus call sites stay a thin shell over tested logic.
+pub(super) mod search {
+    use super::{CopilotAnswer, HitKind, SearchHit, Tile};
+    use crate::model::{nav_model, Group};
+    use crate::panels::peers::PeerRow;
+
+    /// The Bus action topic the AI answer is published to (FD-9's copilot worker
+    /// contract: `action/copilot/ask`, reply on the generic `reply/<ulid>` lane).
+    pub const COPILOT_ASK_TOPIC: &str = "action/copilot/ask";
+
+    /// Score one candidate `haystack` against the lowercased `needle`. Higher is
+    /// better; `0` means no match (the candidate is dropped). The ladder is the
+    /// "exact / prefix / word-prefix / substring" relevance the design accepts
+    /// (frequency/recency not needed — these are small, static-ish catalogs):
+    /// an exact equality outranks a leading-prefix, which outranks a match at a
+    /// word boundary, which outranks a bare substring. Pure + case-insensitive.
+    #[must_use]
+    pub fn score_match(haystack: &str, needle: &str) -> u32 {
+        if needle.is_empty() {
+            return 0;
+        }
+        let hay = haystack.to_lowercase();
+        let need = needle.to_lowercase();
+        if hay == need {
+            return 100;
+        }
+        if hay.starts_with(&need) {
+            return 80;
+        }
+        // A match at the start of any whitespace/`-`/`_`/`/`-delimited word.
+        if hay
+            .split(|c: char| c.is_whitespace() || c == '-' || c == '_' || c == '/')
+            .any(|word| word.starts_with(&need))
+        {
+            return 60;
+        }
+        if hay.contains(&need) {
+            return 40;
+        }
+        0
+    }
+
+    /// FRONTDOOR-6 — compute the instant LOCAL results for `query` over the real
+    /// catalogs (§7 — no `demo_data`): the app launchers (`tiles` with a launch
+    /// action + the routable `nav_model` panels) and the mesh entities (the live
+    /// `peers` directory — nodes + the services they publish). Returns the hits
+    /// ranked best-first, capped to a sane on-screen count. A blank query yields
+    /// nothing (the caller restores the tile grid). Pure: no Bus, no view.
+    #[must_use]
+    pub fn local_results(query: &str, tiles: &[Tile], peers: &[PeerRow]) -> Vec<SearchHit> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let mut hits: Vec<SearchHit> = Vec::new();
+
+        // ── Apps: the seeded launcher tiles + the routable nav panels ──
+        // A launcher tile carries a real `LaunchApp`/route action via `actions()`;
+        // we take its FIRST action as the hit's activation (the tile's primary
+        // open). Keyed widget tiles are mesh surfaces, not "apps", so skip them
+        // here — they surface via the mesh entities + their own grid.
+        for tile in tiles {
+            if tile.key.is_some() {
+                continue; // a live widget, not an app launcher
+            }
+            let score = score_match(&tile.label, q);
+            if score == 0 {
+                continue;
+            }
+            // The launcher's real open (its first detail action). A launcher with
+            // no openable surface yet (e.g. the Copilot placeholder) is dropped —
+            // an un-actionable hit would violate §7.
+            let Some(action) = tile.actions().into_iter().next() else {
+                continue;
+            };
+            hits.push(SearchHit {
+                label: tile.label.clone(),
+                context: "App".to_string(),
+                kind: HitKind::App,
+                score,
+                message: action.message,
+            });
+        }
+        // The routable in-app surfaces (every nav panel is a real `SelectPanel`
+        // destination). Matching on the curated label so "build farm" finds the
+        // Build Farm panel.
+        for entry in nav_model() {
+            for panel in &entry.panels {
+                let score = score_match(panel.label(), q);
+                if score == 0 {
+                    continue;
+                }
+                hits.push(SearchHit {
+                    label: panel.label().to_string(),
+                    context: format!("{} surface", entry.group.label()),
+                    kind: HitKind::App,
+                    // Panels are surfaces, not first-class apps: nudge below a
+                    // same-strength launcher match so "Music" the app beats the
+                    // "Music" panel when both tie, but a strong panel-only match
+                    // still ranks well.
+                    score: score.saturating_sub(5),
+                    message: crate::Message::SelectPanel {
+                        group: entry.group,
+                        panel: panel.slug(),
+                    },
+                });
+            }
+        }
+
+        // ── Mesh entities: the live Peers directory (nodes + services) ──
+        for peer in peers {
+            let node_score = score_match(&peer.hostname, q);
+            if node_score > 0 {
+                hits.push(SearchHit {
+                    label: peer.hostname.clone(),
+                    context: mesh_node_context(peer),
+                    kind: HitKind::MeshNode,
+                    score: node_score,
+                    // Open the Peers directory (the surface that owns node detail
+                    // + the per-node actions) — a real route, not a stub.
+                    message: peers_route(),
+                });
+            }
+            // The services this node publishes — each a distinct hit pointing at
+            // the same Peers surface (where the service's node is actionable).
+            for svc in &peer.services {
+                let svc_score = score_match(svc, q);
+                if svc_score == 0 {
+                    continue;
+                }
+                hits.push(SearchHit {
+                    label: svc.clone(),
+                    context: format!("on {}", peer.hostname),
+                    kind: HitKind::MeshService,
+                    // A service match is a hair weaker than the same-strength node
+                    // match (the node is the thing you usually open).
+                    score: svc_score.saturating_sub(3),
+                    message: peers_route(),
+                });
+            }
+        }
+
+        rank(&mut hits);
+        // Cap to a comfortable on-screen list — the AI card carries the long tail.
+        hits.truncate(MAX_LOCAL_RESULTS);
+        hits
+    }
+
+    /// The route every mesh hit opens: the Peers directory (Q20 — mesh entities
+    /// navigate to the surface that owns them; Peers is where a node/service is
+    /// actionable). A `&'static` slug, so it satisfies `SelectPanel`.
+    fn peers_route() -> crate::Message {
+        crate::Message::SelectPanel {
+            group: Group::Mesh,
+            panel: "peers",
+        }
+    }
+
+    /// A node's secondary line: its role + presence, when known, so a node hit
+    /// reads "anvil — peer · online" rather than a bare hostname.
+    fn mesh_node_context(peer: &PeerRow) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !peer.role.is_empty() {
+            parts.push(peer.role.clone());
+        }
+        if !peer.presence.is_empty() {
+            parts.push(peer.presence.clone());
+        }
+        if parts.is_empty() {
+            "mesh node".to_string()
+        } else {
+            parts.join(" · ")
+        }
+    }
+
+    /// Rank hits best-first: by descending relevance score, then by the stable
+    /// [`HitKind`] priority (apps before nodes before services), then alphabetical
+    /// — so the order is deterministic (no view-time flicker on equal scores).
+    fn rank(hits: &mut [SearchHit]) {
+        hits.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then(a.kind.rank().cmp(&b.kind.rank()))
+                .then(a.label.to_lowercase().cmp(&b.label.to_lowercase()))
+        });
+    }
+
+    /// Cap on the instant-local list length; the AI card carries the rest (Q47).
+    pub const MAX_LOCAL_RESULTS: usize = 12;
+
+    /// FRONTDOOR-6 — encode the Copilot `ask` request body for `query` (FD-9's
+    /// `AskRequest` JSON shape: `{prompt, context}`). The omnibox text is the
+    /// prompt; a fixed context line tells the worker the ask came from the Front
+    /// Door search box. Pure — the Bus publish is the caller's thin shell.
+    #[must_use]
+    pub fn ask_request_body(query: &str) -> String {
+        // Build the JSON via serde so any quote/newline in the query is escaped
+        // (a raw `format!` would mis-encode a query containing a `"`).
+        serde_json::json!({
+            "prompt": query.trim(),
+            "context": "Asked from the Magic Mesh Front Door unified search box.",
+        })
+        .to_string()
+    }
+
+    /// FRONTDOOR-6 — parse the Copilot worker's reply body into a [`CopilotAnswer`].
+    /// The reply is FD-9's `AskReply` JSON: `{answer?, error?}`. A present, non-
+    /// empty `answer` is the prose; ANY other shape (an `error`, a null/empty
+    /// answer, malformed JSON, or `None` for no-reply/timeout) degrades to
+    /// `Unavailable` (Q33 — graceful degrade, no error spew). Pure + Bus-free.
+    #[must_use]
+    pub fn parse_copilot_reply(raw: Option<&str>) -> CopilotAnswer {
+        let Some(body) = raw else {
+            return CopilotAnswer::Unavailable; // no reply (timeout / no worker)
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
+            return CopilotAnswer::Unavailable;
+        };
+        match v.get("answer").and_then(serde_json::Value::as_str) {
+            Some(answer) if !answer.trim().is_empty() => {
+                CopilotAnswer::Answer(answer.trim().to_string())
+            }
+            // An `error` field, a null answer, or an empty answer → unavailable.
+            _ => CopilotAnswer::Unavailable,
+        }
+    }
+}
+
 /// The Front Door home state: the placeholder tile set + a loading flag, plus the
 /// FRONTDOOR-2 omnibox query. While `loading`, the grid draws flat grey skeleton
 /// cards instead of labeled tiles (Q92 — skeleton placeholders, no layout shift).
@@ -513,8 +877,25 @@ pub struct FrontDoor {
     /// True → render skeletons; false → render labeled tiles.
     pub loading: bool,
     /// FRONTDOOR-2 — the omnibox's live text. Tracked here so the field is
-    /// controlled; the search it will drive is FRONTDOOR-6 (no behavior yet).
+    /// controlled; FRONTDOOR-6 makes a non-empty value drive the unified search.
     pub query: String,
+    /// FRONTDOOR-6 — the live Peers directory rows, the source for the instant
+    /// mesh-entity search (nodes + the services they publish). Folded in from the
+    /// FD-4 [`FrontDoorData`] read (the same `peers::action_directory` snapshot
+    /// the widget tiles already use — no new Bus path, §6). Empty until the first
+    /// load; the search simply returns fewer hits until then (graceful).
+    pub peers: Vec<peers::PeerRow>,
+    /// FRONTDOOR-6 — the current instant LOCAL search results (apps + mesh
+    /// entities), recomputed on every [`Message::OmniboxChanged`]. Empty when the
+    /// query is blank (the tile grid shows instead).
+    pub results: Vec<SearchHit>,
+    /// FRONTDOOR-6 — the Copilot `ask` state for the current query (the AI card
+    /// below the local results). `Idle` for a blank query (no card).
+    pub copilot: CopilotState,
+    /// FRONTDOOR-6 — a monotonic generation stamped on each Copilot ask. A reply
+    /// is folded in ONLY if its generation still matches (so a slow reply for a
+    /// query the operator has since changed/cleared is dropped, not shown stale).
+    pub copilot_gen: u64,
     /// FRONTDOOR-3 — which render mode the Front Door is in (panel default,
     /// flipped by the top-bar toggle). Default [`Mode::Panel`] (Q29).
     pub mode: Mode,
@@ -564,6 +945,12 @@ impl FrontDoor {
             // snapshot flips it off without a layout shift.
             loading: true,
             query: String::new(),
+            // FRONTDOOR-6 — no roster / results / AI ask until the operator
+            // searches (a blank query renders the tile grid).
+            peers: Vec::new(),
+            results: Vec::new(),
+            copilot: CopilotState::Idle,
+            copilot_gen: 0,
             mode: Mode::Panel,
             // FRONTDOOR-5 — start on the grid; a tile click opens a detail menu.
             detail: None,
@@ -603,9 +990,35 @@ impl FrontDoor {
     /// snapshot into the widget tiles + clears the skeleton.
     pub fn update(&mut self, message: Message) -> Task<crate::Message> {
         match message {
+            // FRONTDOOR-6 — the omnibox drives the real unified search. The
+            // instant LOCAL results (apps + mesh entities) recompute synchronously
+            // here (Q47 — local first); a non-empty query also fires the async
+            // Copilot `ask` (the AI card streams in below). A blank query clears
+            // everything back to the tile grid + cancels any pending AI ask.
             Message::OmniboxChanged(q) => {
                 self.query = q;
+                self.recompute_results();
+                self.search_task()
+            }
+            // FRONTDOOR-6 — a Copilot reply landed. Fold it ONLY if it still
+            // matches the generation the ask was fired under (a slow reply for a
+            // since-changed query is dropped, never shown stale).
+            Message::CopilotReplied(gen, answer) => {
+                if gen == self.copilot_gen {
+                    self.copilot = match answer {
+                        CopilotAnswer::Answer(a) => CopilotState::Answer(a),
+                        CopilotAnswer::Unavailable => CopilotState::Unavailable,
+                    };
+                }
                 Task::none()
+            }
+            // FRONTDOOR-6 — a local search hit was clicked: fire its real app
+            // message (a panel route / app launch) and clear the omnibox so the
+            // Front Door returns to the grid behind the navigation.
+            Message::SearchHitActivated(msg) => {
+                self.query.clear();
+                self.recompute_results();
+                Task::done(*msg)
             }
             Message::ToggleMode => {
                 self.mode = match self.mode {
@@ -642,10 +1055,71 @@ impl FrontDoor {
         }
     }
 
+    /// FRONTDOOR-6 — recompute the instant LOCAL results for the current query
+    /// (apps + mesh entities, ranked), and reset the Copilot state to match: a
+    /// blank query clears the results AND parks Copilot at `Idle` (no AI card, no
+    /// pending ask); a non-empty query sets it to `Thinking` (the placeholder
+    /// shows until the reply lands or the next keystroke supersedes it). The
+    /// actual ask is fired by [`Self::search_task`], called alongside this from
+    /// the message handler. Pure local state mutation — no Bus.
+    fn recompute_results(&mut self) {
+        if self.query.trim().is_empty() {
+            self.results.clear();
+            self.copilot = CopilotState::Idle;
+        } else {
+            self.results = search::local_results(&self.query, &self.tiles, &self.peers);
+            // The AI card shows "thinking…" the instant the operator types; the
+            // bump to `copilot_gen` (in `search_task`) makes the in-flight reply
+            // for any prior query a no-op when it lands.
+            self.copilot = CopilotState::Thinking;
+        }
+    }
+
+    /// FRONTDOOR-6 — fire the async Copilot `ask` for the current query (Q47 —
+    /// the AI answer streams in below the local results). A blank query fires
+    /// nothing (no AI card). Otherwise it bumps `copilot_gen` (so a slow reply for
+    /// the previous query is dropped) and publishes the query to FD-9's
+    /// `action/copilot/ask` topic on a blocking thread (the Bus client builds its
+    /// own current-thread runtime — `Persist`/rusqlite isn't `Send` — so it MUST
+    /// run under `spawn_blocking`, the same contract every other Bus read here
+    /// follows). The reply (or a degrade) comes back as [`Message::CopilotReplied`]
+    /// stamped with this generation. Graceful degrade (Q33): no Bus / no worker /
+    /// timeout → `CopilotAnswer::Unavailable`, never an error or a hang.
+    fn search_task(&mut self) -> Task<crate::Message> {
+        let query = self.query.trim().to_string();
+        if query.is_empty() {
+            return Task::none();
+        }
+        self.copilot_gen = self.copilot_gen.wrapping_add(1);
+        let generation = self.copilot_gen;
+        Task::perform(
+            async move {
+                let body = search::ask_request_body(&query);
+                // The Bus action/reply client blocks (it owns a runtime), so it
+                // rides `spawn_blocking`. A join error / no Bus / timeout all
+                // collapse to `None` → `Unavailable` (no spew).
+                let raw = tokio::task::spawn_blocking(move || {
+                    crate::dbus::action_request_with_body(
+                        search::COPILOT_ASK_TOPIC,
+                        Some(&body),
+                        COPILOT_ASK_TIMEOUT,
+                    )
+                })
+                .await
+                .ok()
+                .flatten();
+                search::parse_copilot_reply(raw.as_deref())
+            },
+            move |answer| crate::Message::FrontDoor(Message::CopilotReplied(generation, answer)),
+        )
+    }
+
     /// FRONTDOOR-4 — fold one [`FrontDoorData`] snapshot into the widget tiles:
     /// each keyed tile takes its `(value, tone)` from the snapshot, or keeps a
     /// `None` value (no source this round) — a launcher (`key == None`) is never
-    /// touched. Pure given the snapshot, so it's unit-tested directly.
+    /// touched. FRONTDOOR-6 — also stores the raw roster for the unified search,
+    /// and (if a search is live) re-ranks the results against the fresh roster so
+    /// the mesh-entity hits track the directory. Pure given the snapshot.
     pub fn apply(&mut self, data: &FrontDoorData) {
         for tile in &mut self.tiles {
             let Some(key) = tile.key else { continue };
@@ -657,6 +1131,12 @@ impl FrontDoor {
                 // stale value rather than show a phantom metric (§7).
                 tile.value = None;
             }
+        }
+        // FRONTDOOR-6 — refresh the search roster; re-rank live results so a
+        // roster change while the operator is mid-search shows through.
+        self.peers = data.peers.clone();
+        if !self.query.trim().is_empty() {
+            self.results = search::local_results(&self.query, &self.tiles, &self.peers);
         }
     }
 
@@ -815,14 +1295,22 @@ impl FrontDoor {
         .width(Length::Fill)
         .padding(Padding::from([16u16, 16u16]));
 
-        // The full-screen rounded-icon grid: the same canvas program, told to lay
-        // out at the larger full-screen scale. A scrollable wrapper gives the
-        // "first cut" vertical paging when icons overflow the viewport.
-        let grid = scrollable(self.icon_grid())
-            .width(Length::Fill)
-            .height(Length::Fill);
+        // FRONTDOOR-6 — a non-empty query REPLACES the icon grid with the unified
+        // search results (instant local hits + the AI card streaming in below);
+        // an empty query keeps the iPadOS rounded-icon grid (FD-1..5 unchanged).
+        let content: Element<'_, crate::Message, Theme> = if self.searching() {
+            self.search_results_view(palette)
+        } else {
+            // The full-screen rounded-icon grid: the same canvas program, told to
+            // lay out at the larger full-screen scale. A scrollable wrapper gives
+            // the "first cut" vertical paging when icons overflow the viewport.
+            scrollable(self.icon_grid())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        };
 
-        let body = column![top_bar, grid]
+        let body = column![top_bar, content]
             .width(Length::Fill)
             .height(Length::Fill);
 
@@ -956,7 +1444,16 @@ impl FrontDoor {
         .width(Length::Fill)
         .padding(Padding::from([16u16, 16u16]));
 
-        let pane = column![omnibox_bar, self.tile_grid()]
+        // FRONTDOOR-6 — a non-empty query REPLACES the tile grid with the unified
+        // search results (instant local hits + the AI card below); an empty query
+        // keeps the FD-1 tile grid (the normal Win10-Start pane, unchanged).
+        let content: Element<'_, crate::Message, Theme> = if self.searching() {
+            self.search_results_view(palette)
+        } else {
+            self.tile_grid()
+        };
+
+        let pane = column![omnibox_bar, content]
             .width(Length::Fill)
             .height(Length::Fill);
 
@@ -968,6 +1465,105 @@ impl FrontDoor {
                 ..container::Style::default()
             })
             .into()
+    }
+
+    /// FRONTDOOR-6 — is the omnibox driving a search right now? True when the
+    /// query is non-blank; both modes then swap their tile grid for the unified
+    /// results view. A blank query is false (the normal grid shows — FD-1..5
+    /// unchanged).
+    fn searching(&self) -> bool {
+        !self.query.trim().is_empty()
+    }
+
+    /// FRONTDOOR-6 — the unified search results, rendered BELOW the omnibox in
+    /// place of the tile grid (Q20 unified scope, Q47 instant-local-then-AI):
+    /// the instant LOCAL hits first (apps + mesh nodes/services, grouped by kind,
+    /// AI-ranked best-first), then a distinct **AI answer card** ("thinking…"
+    /// until the Copilot reply lands, the prose when it does, a quiet note on
+    /// graceful degrade). Every local row activates a REAL app message (§7 — a
+    /// panel route or app launch). Carbon chrome via `mde-theme` tokens only (§4).
+    fn search_results_view(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
+        let sizes = FontSize::defaults();
+        let mut body = column![].spacing(8).width(Length::Fill);
+
+        // ── Instant LOCAL results, grouped by kind (apps → nodes → services) ──
+        if self.results.is_empty() {
+            body = body.push(
+                text("No local matches.")
+                    .size(TypeRole::Body.size_in(sizes))
+                    .colr(palette.text_muted.into_cosmic_color()),
+            );
+        } else {
+            // The results are already rank-sorted; the kind order within them is
+            // the tie-break, so a simple section-header-on-change walk groups them
+            // without re-sorting (and keeps the global rank order across sections).
+            let mut last_section: Option<&'static str> = None;
+            for hit in &self.results {
+                let section = hit.kind.section();
+                if last_section != Some(section) {
+                    body = body.push(rail_section_label(section, palette));
+                    last_section = Some(section);
+                }
+                body = body.push(search_hit_row(hit, palette));
+            }
+        }
+
+        // ── The AI answer card — a DISTINCT card below the local results ──
+        if let Some(card) = self.copilot_card(palette) {
+            body = body.push(Space::new().height(Length::Fixed(16.0)));
+            body = body.push(card);
+        }
+
+        scrollable(container(body).padding(Padding::from([12u16, 16u16])))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// FRONTDOOR-6 — the AI answer card (Q47 — the AI answer streams in below the
+    /// local results, Q33 — graceful degrade). `None` when Copilot is `Idle` (a
+    /// blank query — no card). Otherwise a distinct raised card: a "Copilot"
+    /// caption over either a "thinking…" placeholder, the prose answer, or a quiet
+    /// one-line "unavailable" note (never an error dump). Tokens only (§4).
+    fn copilot_card(&self, palette: Palette) -> Option<Element<'_, crate::Message, Theme>> {
+        let sizes = FontSize::defaults();
+        let (line, tone) = match &self.copilot {
+            CopilotState::Idle => return None,
+            CopilotState::Thinking => (
+                "Thinking…".to_string(),
+                palette.text_muted.into_cosmic_color(),
+            ),
+            CopilotState::Answer(a) => (a.clone(), palette.text.into_cosmic_color()),
+            CopilotState::Unavailable => (
+                "Copilot is unavailable right now — local results still apply."
+                    .to_string(),
+                palette.text_muted.into_cosmic_color(),
+            ),
+        };
+        let card = column![
+            text("Copilot")
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(palette.accent.into_cosmic_color()),
+            text(line).size(TypeRole::Body.size_in(sizes)).colr(tone),
+        ]
+        .spacing(6)
+        .width(Length::Fill);
+
+        Some(
+            container(card)
+                .width(Length::Fill)
+                .padding(Padding::from([14u16, 16u16]))
+                .style(move |_t: &Theme| container::Style {
+                    background: Some(Background::Color(palette.surface.into_cosmic_color())),
+                    border: Border {
+                        color: palette.border.into_cosmic_color(),
+                        width: 1.0,
+                        radius: 8.0.into(),
+                    },
+                    ..container::Style::default()
+                })
+                .into(),
+        )
     }
 
     /// The FRONTDOOR-1 tile grid drawn on `canvas` (GPU 2D geometry, NOT a widget
@@ -1184,6 +1780,57 @@ fn detail_action_row<'a>(
     )
     .on_press(action.message)
     .into()
+}
+
+/// FRONTDOOR-6 — one full-width row in the unified search results list. The
+/// primary label (the matched app / node / service) over a muted context line
+/// (the node a service runs on / the surface a panel lives under). Clicking it
+/// activates the hit's REAL app message via [`Message::SearchHitActivated`] (a
+/// panel route or app launch — §7, never an inert row). Styled like the detail
+/// action rows (a quiet idle wash that lifts on hover). Tokens only (§4).
+fn search_hit_row<'a>(hit: &SearchHit, palette: Palette) -> Element<'a, crate::Message, Theme> {
+    let sizes = FontSize::defaults();
+    let accent = palette.accent.into_cosmic_color();
+    let idle_bg = palette.hover_tint().into_cosmic_color();
+
+    let label_block = column![
+        text(hit.label.clone())
+            .size(TypeRole::Body.size_in(sizes))
+            .colr(accent),
+        text(hit.context.clone())
+            .size(TypeRole::Caption.size_in(sizes))
+            .colr(palette.text_muted.into_cosmic_color()),
+    ]
+    .spacing(2);
+
+    button(label_block)
+        .width(Length::Fill)
+        .padding(Padding::from([10u16, 14u16]))
+        .sty(
+            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+                use cosmic::iced::widget::button::Status;
+                let bg = match status {
+                    Status::Hovered | Status::Pressed => accent_tint(accent),
+                    _ => idle_bg,
+                };
+                cosmic::iced::widget::button::Style {
+                    snap: false,
+                    background: Some(Background::Color(bg)),
+                    text_color: accent,
+                    border: Border {
+                        color: cosmic::iced::Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 6.0.into(),
+                    },
+                    shadow: cosmic::iced::Shadow::default(),
+                    ..cosmic::iced::widget::button::Style::default()
+                }
+            },
+        )
+        .on_press(crate::Message::FrontDoor(Message::SearchHitActivated(
+            Box::new(hit.message.clone()),
+        )))
+        .into()
 }
 
 /// The accent strip down the left edge of a card. Mode-independent (it's a hair
@@ -1533,15 +2180,30 @@ mod tests {
     }
 
     #[test]
-    fn omnibox_change_records_the_query_locally() {
-        // FRONTDOOR-2 — the omnibox is a controlled field: a text-change updates
-        // local state (so the field shows the typed text), with no other effect
-        // (search is FRONTDOOR-6).
+    fn omnibox_change_records_the_query_and_drives_search() {
+        // FRONTDOOR-2/6 — the omnibox is a controlled field that now DRIVES the
+        // unified search: a text-change records the text AND recomputes the
+        // instant local results + parks Copilot at "thinking…" (Q47); clearing it
+        // restores the grid state (empty results, Copilot Idle).
         let mut fd = FrontDoor::new();
         let _ = fd.update(Message::OmniboxChanged("build farm".to_string()));
         assert_eq!(fd.query, "build farm");
+        // The query matched a real surface (the Build Farm panel) — local hits.
+        assert!(
+            !fd.results.is_empty(),
+            "a real query yields instant local hits"
+        );
+        assert_eq!(fd.copilot, CopilotState::Thinking, "the AI card is pending");
+        // Each search keystroke bumps the generation so a stale reply is dropped.
+        assert_eq!(fd.copilot_gen, 1);
+        let _ = fd.update(Message::OmniboxChanged("build".to_string()));
+        assert_eq!(fd.copilot_gen, 2);
+
+        // Clearing the query restores the grid state.
         let _ = fd.update(Message::OmniboxChanged(String::new()));
         assert!(fd.query.is_empty());
+        assert!(fd.results.is_empty(), "a blank query clears results");
+        assert_eq!(fd.copilot, CopilotState::Idle, "and parks the AI card");
     }
 
     #[test]
@@ -1571,6 +2233,22 @@ mod tests {
         let _: Element<'_, crate::Message, Theme> = fd.view();
         fd.loading = true;
         let _: Element<'_, crate::Message, Theme> = fd.view();
+
+        // FRONTDOOR-6 — the search-results surface (local hits + the AI card)
+        // builds in BOTH modes, in every Copilot state, without panicking.
+        fd.loading = false;
+        for mode in [Mode::Panel, Mode::FullScreen] {
+            fd.mode = mode;
+            let _ = fd.update(Message::OmniboxChanged("mesh".to_string()));
+            for state in [
+                CopilotState::Thinking,
+                CopilotState::Answer("restart mfsmaster on anvil".into()),
+                CopilotState::Unavailable,
+            ] {
+                fd.copilot = state;
+                let _: Element<'_, crate::Message, Theme> = fd.view();
+            }
+        }
     }
 
     #[test]
@@ -1980,5 +2658,234 @@ mod tests {
         let copilot_idx = fd.tiles.iter().position(|t| t.label == "Copilot").unwrap();
         let _ = fd.update(Message::TileActivated(copilot_idx));
         let _: Element<'_, crate::Message, Theme> = fd.view();
+    }
+
+    // ── FRONTDOOR-6: the unified search (local search/rank + the message flow) ──
+
+    /// A `PeerRow` with a chosen hostname + published services (the fields the
+    /// mesh search reads); the rest default.
+    fn mesh_peer(hostname: &str, services: &[&str]) -> PeerRow {
+        PeerRow {
+            hostname: hostname.into(),
+            presence: "online".into(),
+            health: "healthy".into(),
+            role: "peer".into(),
+            services: services.iter().map(|s| (*s).to_string()).collect(),
+            ..PeerRow::default()
+        }
+    }
+
+    #[test]
+    fn score_match_ladder_orders_exact_prefix_word_substring() {
+        use search::score_match;
+        // Exact > leading-prefix > word-boundary-prefix > bare substring > miss.
+        assert_eq!(score_match("Build Farm", "build farm"), 100);
+        assert!(score_match("Build Farm", "build") > score_match("Build Farm", "farm"));
+        // "farm" is a word-boundary prefix (after the space), not a leading one.
+        assert_eq!(score_match("Build Farm", "build"), 80);
+        assert_eq!(score_match("Build Farm", "farm"), 60);
+        // A bare interior substring is the weakest real match.
+        assert_eq!(score_match("Datacenter", "cent"), 40);
+        // No match / empty needle → 0 (dropped).
+        assert_eq!(score_match("Mesh", "zzz"), 0);
+        assert_eq!(score_match("Mesh", ""), 0);
+    }
+
+    #[test]
+    fn local_results_finds_apps_panels_and_mesh_entities() {
+        // §7 — REAL unified scope over the real catalogs: a launcher app, a
+        // routable panel, a mesh node, and a published service all surface, each
+        // carrying a real activation message.
+        let tiles = FrontDoor::new().tiles;
+        let peers = vec![
+            mesh_peer("anvil", &["mfsmaster", "nginx"]),
+            mesh_peer("oak", &["etcd"]),
+        ];
+
+        // A node name → a MeshNode hit that routes to Peers.
+        let r = search::local_results("anvil", &tiles, &peers);
+        assert!(r.iter().any(|h| h.kind == HitKind::MeshNode && h.label == "anvil"));
+        assert!(matches!(
+            r.iter().find(|h| h.label == "anvil").unwrap().message,
+            crate::Message::SelectPanel {
+                group: Group::Mesh,
+                panel: "peers"
+            }
+        ));
+
+        // A service name → a MeshService hit, context naming its node.
+        let r = search::local_results("mfsmaster", &tiles, &peers);
+        let svc = r
+            .iter()
+            .find(|h| h.kind == HitKind::MeshService)
+            .expect("a service hit");
+        assert_eq!(svc.label, "mfsmaster");
+        assert!(svc.context.contains("anvil"));
+
+        // An app/panel name → an App hit. "Terminal" is a seeded launcher.
+        let r = search::local_results("terminal", &tiles, &peers);
+        assert!(r
+            .iter()
+            .any(|h| h.kind == HitKind::App && h.label == "Terminal"));
+
+        // A panel label → an App hit routing via SelectPanel (e.g. Build Farm).
+        let r = search::local_results("build farm", &tiles, &peers);
+        assert!(r.iter().any(|h| {
+            h.kind == HitKind::App
+                && matches!(h.message, crate::Message::SelectPanel { .. })
+                && h.label == "Build Farm"
+        }));
+
+        // A blank/whitespace query yields nothing (the grid shows).
+        assert!(search::local_results("   ", &tiles, &peers).is_empty());
+    }
+
+    #[test]
+    fn local_results_rank_orders_best_first_and_every_hit_is_actionable() {
+        let tiles = FrontDoor::new().tiles;
+        let peers = vec![mesh_peer("mesh-builder", &["mesh-agent"])];
+        let r = search::local_results("mesh", &tiles, &peers);
+        assert!(!r.is_empty());
+        // Sorted by descending score (the ranker's first key).
+        for w in r.windows(2) {
+            assert!(
+                w[0].score >= w[1].score,
+                "results are rank-sorted best-first"
+            );
+        }
+        // §7 — every hit carries a REAL app message (a route or a launch), never
+        // an inert result.
+        for hit in &r {
+            match hit.message {
+                crate::Message::SelectPanel { .. } | crate::Message::LaunchApp(_) => {}
+                ref other => panic!("non-actionable search hit: {other:?}"),
+            }
+        }
+        // The list is capped (Q47 — the AI card carries the long tail).
+        assert!(r.len() <= search::MAX_LOCAL_RESULTS);
+    }
+
+    #[test]
+    fn keyed_widget_tiles_are_not_treated_as_app_launchers() {
+        // The live widget tiles (Mesh Map, Alerts, …) are mesh surfaces, not
+        // "apps" — searching their label must NOT produce a launcher app hit from
+        // the tile set (they surface via the mesh entities / their own grid).
+        let tiles = FrontDoor::new().tiles;
+        let r = search::local_results("alerts", &tiles, &[]);
+        // No App hit whose label is the "Alerts" widget tile (a keyed widget).
+        assert!(
+            !r.iter()
+                .any(|h| h.kind == HitKind::App && h.label == "Alerts"),
+            "a keyed widget tile is not an app launcher hit"
+        );
+    }
+
+    #[test]
+    fn ask_request_body_is_valid_copilot_askrequest_json() {
+        // The body must match FD-9's AskRequest shape ({prompt, context}) and
+        // escape any quotes in the query (serde, not raw format!).
+        let body = search::ask_request_body(r#"why is "anvil" down?"#);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["prompt"], r#"why is "anvil" down?"#);
+        assert!(v["context"].as_str().unwrap().contains("Front Door"));
+    }
+
+    #[test]
+    fn parse_copilot_reply_maps_answer_and_degrades_quietly() {
+        use search::parse_copilot_reply;
+        // A real answer → Answer(text), trimmed.
+        assert_eq!(
+            parse_copilot_reply(Some(r#"{"answer":"  restart mfsmaster  "}"#)),
+            CopilotAnswer::Answer("restart mfsmaster".to_string())
+        );
+        // The worker's degrade reply ({error, no answer}) → Unavailable (Q33).
+        assert_eq!(
+            parse_copilot_reply(Some(r#"{"error":"AI unavailable: codex not available"}"#)),
+            CopilotAnswer::Unavailable
+        );
+        // An empty/whitespace answer is not a real answer → Unavailable.
+        assert_eq!(
+            parse_copilot_reply(Some(r#"{"answer":"   "}"#)),
+            CopilotAnswer::Unavailable
+        );
+        // No reply at all (timeout / no Bus / no worker) → Unavailable, no panic.
+        assert_eq!(parse_copilot_reply(None), CopilotAnswer::Unavailable);
+        // Malformed JSON → Unavailable.
+        assert_eq!(
+            parse_copilot_reply(Some("not json")),
+            CopilotAnswer::Unavailable
+        );
+    }
+
+    #[test]
+    fn copilot_reply_only_folds_in_for_the_current_generation() {
+        // The message flow: a reply stamped with a stale generation (the operator
+        // changed the query since) is DROPPED, not shown; the matching generation
+        // folds in.
+        let mut fd = FrontDoor::new();
+        let _ = fd.update(Message::OmniboxChanged("anvil".into())); // gen → 1
+        assert_eq!(fd.copilot_gen, 1);
+        assert_eq!(fd.copilot, CopilotState::Thinking);
+
+        // A reply for an OLD generation is ignored (still thinking).
+        let _ = fd.update(Message::CopilotReplied(
+            0,
+            CopilotAnswer::Answer("stale".into()),
+        ));
+        assert_eq!(fd.copilot, CopilotState::Thinking, "stale reply dropped");
+
+        // The reply for the current generation folds in.
+        let _ = fd.update(Message::CopilotReplied(
+            1,
+            CopilotAnswer::Answer("anvil is offline; restart nebula".into()),
+        ));
+        assert_eq!(
+            fd.copilot,
+            CopilotState::Answer("anvil is offline; restart nebula".into())
+        );
+
+        // A degrade reply for the current generation parks the quiet note.
+        let _ = fd.update(Message::OmniboxChanged("oak".into())); // gen → 2
+        let _ = fd.update(Message::CopilotReplied(2, CopilotAnswer::Unavailable));
+        assert_eq!(fd.copilot, CopilotState::Unavailable);
+    }
+
+    #[test]
+    fn search_hit_activation_clears_the_query_back_to_the_grid() {
+        // Clicking a hit fires its real message and clears the omnibox so the
+        // Front Door returns to the tile grid behind the navigation.
+        let mut fd = FrontDoor::new();
+        let _ = fd.update(Message::OmniboxChanged("peers".into()));
+        assert!(!fd.results.is_empty());
+        let msg = crate::Message::SelectPanel {
+            group: Group::Mesh,
+            panel: "peers",
+        };
+        let _ = fd.update(Message::SearchHitActivated(Box::new(msg)));
+        assert!(fd.query.is_empty(), "activation clears the omnibox");
+        assert!(fd.results.is_empty());
+        assert_eq!(fd.copilot, CopilotState::Idle);
+    }
+
+    #[test]
+    fn loaded_snapshot_refreshes_the_search_roster() {
+        // FRONTDOOR-6 — the FD-4 load snapshot also carries the Peers roster into
+        // the search; a live search re-ranks against the fresh roster so a node
+        // that appears mid-search becomes searchable without a re-type.
+        let mut fd = FrontDoor::new();
+        let _ = fd.update(Message::OmniboxChanged("anvil".into()));
+        // No roster yet → no mesh hit for "anvil".
+        assert!(!fd.results.iter().any(|h| h.label == "anvil"));
+
+        // A snapshot lands carrying the roster.
+        let data = FrontDoorData {
+            peers: vec![mesh_peer("anvil", &["mfsmaster"])],
+            ..FrontDoorData::default()
+        };
+        let _ = fd.update(Message::Loaded(Box::new(data)));
+        assert!(
+            fd.results.iter().any(|h| h.label == "anvil"),
+            "the fresh roster makes the node searchable mid-search"
+        );
     }
 }
