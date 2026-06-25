@@ -19,6 +19,8 @@
 //! Component dimensions (44 px row, 32 px icon slot) are NOT
 //! density-scaled per UX-24 sub-lock.
 
+use std::time::Instant;
+
 use cosmic::iced::widget::button::Status as ButtonStatus;
 use cosmic::iced::widget::{button, column, container, row, text, Column, Space};
 use cosmic::iced::{
@@ -48,6 +50,12 @@ pub use crate::cosmic_compat::object_card;
 /// UX-6 — minimum data-row height. Component dimension, not
 /// density-scaled.
 pub const DATA_ROW_MIN_HEIGHT: f32 = 44.0;
+
+/// MOTION-NET-2 — height of one skeleton placeholder bar (the
+/// data-row height less its label/value padding), so a loading
+/// bar occupies the same vertical rhythm as the eventual row. A
+/// `u16` component dimension fed to [`mde_theme::SkeletonBlock`].
+const SKELETON_BAR_HEIGHT_PX: u16 = 32;
 
 /// CV-3 — the standard heading↔body / section column gap
 /// (`space.lg`, 20 px at Comfortable), density-aware so Compact /
@@ -339,30 +347,41 @@ pub fn background_activity_indicator<'a, Message: 'a>(
 
 /// MOTION-NET-2 — a layout-matching skeleton placeholder: `rows` greyed Carbon
 /// bars (≈ a data row tall) shown while a panel is `LoadState::Loading`, so a
-/// slow first load never shows a blank area or a bare "Loading…" string. The
-/// grey shimmers via `animation::shimmer_alpha(phase, reduce_motion)`; under
-/// reduce-motion it renders a STATIC grey (no shimmer). Swap to the real content
-/// when data lands (shimmer stops). `rows` = the expected row count of the
-/// eventual layout.
+/// slow first load never shows a blank area or a bare "Loading…" string. Each
+/// bar is the shared [`mde_theme::SkeletonBlock`] card geometry (token width /
+/// height / corner), tinted by [`mde_theme::SkeletonShimmer`]: it breathes
+/// between the Carbon skeleton alpha bounds over the `loading` motion period and
+/// collapses to a STATIC mid-grey under reduce-motion / the motion kill switch —
+/// the single-sourced a11y contract, not a hand-rolled `shimmer_alpha` call.
+/// Swap to the real content when data lands (shimmer stops). `rows` = the
+/// expected row count of the eventual layout; `phase` is the caller's
+/// `0.0..=1.0` loop position, mapped onto the shared loading clock here.
 pub fn skeleton<'a, Message: 'a>(
     rows: usize,
     palette: Palette,
     phase: f32,
     reduce_motion: bool,
 ) -> Element<'a, Message> {
-    let alpha = mde_theme::animation::shimmer_alpha(phase, reduce_motion);
-    let bar = Color {
-        a: alpha,
-        ..palette.text_muted.into_cosmic_color()
-    };
-    let radii = Radii::defaults();
+    // BEAUT-THEME — back the placeholder onto the shared skeleton primitive
+    // rather than re-deriving the alpha/colour/geometry locally. The shimmer
+    // reads from an `Instant` clock; the caller hands us a `0..1` loop position,
+    // so anchor a clock such that `now` lands at that phase of the loading period.
+    let period = mde_theme::Motion::loading().duration;
+    let now = Instant::now();
+    let offset = period.mul_f32(phase.rem_euclid(1.0));
+    let start = now.checked_sub(offset).unwrap_or(now);
+    let shimmer = mde_theme::SkeletonShimmer::new(start, reduce_motion);
+    // A loading row is a fill-width card-shaped block (`width: None`) — the same
+    // `md`-corner token the real card uses, so the swap-in reads seamless.
+    let block = mde_theme::SkeletonBlock::card(SKELETON_BAR_HEIGHT_PX, Radii::defaults());
+    let bar = shimmer.fill(now, &palette).into_cosmic_color();
     let mut col: Column<'a, Message, cosmic::Theme> = column![].spacing(8);
     for _ in 0..rows {
         col = col.push(
             container(
                 Space::new()
                     .width(Length::Fill)
-                    .height(Length::Fixed(DATA_ROW_MIN_HEIGHT - 12.0)),
+                    .height(Length::Fixed(f32::from(block.height))),
             )
             .width(Length::Fill)
             .style(move |_theme| container::Style {
@@ -372,7 +391,7 @@ pub fn skeleton<'a, Message: 'a>(
                 border: Border {
                     color: Color::TRANSPARENT,
                     width: 0.0,
-                    radius: f32::from(radii.sm).into(),
+                    radius: f32::from(block.radius).into(),
                 },
                 shadow: IcedShadow::default(),
                 text_color: None,
