@@ -25,6 +25,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use mackes_mesh_types::ddns;
 use mackes_mesh_types::exposure::{self, ProtoMode};
 use serde::{Deserialize, Serialize};
 
@@ -133,6 +134,33 @@ pub fn desired_forwards(
     fwds
 }
 
+/// CONNECT-9 — the bare DDNS record labels this lighthouse must publish for the
+/// public-via-ingress services bound to it: each service's ingress hostname reduced
+/// to its bare label under the DDNS zone (the part before the zone). A service
+/// whose hostname collapses to the bare zone is skipped. Only services whose
+/// `ingress.lighthouse == hostname` count (this node terminates their ingress, so
+/// the public name resolves to THIS node's WAN — see [`ddns::ingress_record`]).
+/// Deduped + sorted for stable comparison/tests. Pure.
+#[must_use]
+pub fn desired_ingress_ddns_labels(
+    cfg: &exposure::ExposureConfig,
+    hostname: &str,
+    zone: &str,
+) -> Vec<String> {
+    let mut labels: Vec<String> = cfg
+        .public_services()
+        .into_iter()
+        .filter_map(|s| {
+            let b = s.ingress.as_ref()?;
+            (b.lighthouse == hostname).then(|| ddns::ingress_record_label(&b.hostname, zone))
+        })
+        .filter(|l| !l.is_empty())
+        .collect();
+    labels.sort();
+    labels.dedup();
+    labels
+}
+
 /// CONNECT's node-local record of the firewall rules it last applied, so the next
 /// tick can reclaim exactly those on an unexpose (see the module safety note).
 /// Serialized as JSON at `<state_dir>/applied-firewall.json`.
@@ -149,6 +177,11 @@ pub struct AppliedState {
     /// the rogue port is removed, instead of spamming every tick.
     #[serde(default)]
     pub alerted_unexpected: Vec<(u16, String)>,
+    /// CONNECT-9 — the bare DDNS labels this worker last published into the
+    /// `[ddns]` config for ingress hostnames bound here, so the next tick can
+    /// reclaim exactly those on an unexpose (bounded removal, like ports/forwards).
+    #[serde(default)]
+    pub ddns_labels: Vec<String>,
 }
 
 /// Ports CONNECT previously opened that the policy no longer wants — the unexpose
@@ -335,6 +368,48 @@ impl ConnectFirewallWorker {
         desired_forwards(cfg, &self.hostname, resolve)
     }
 
+    /// CONNECT-9 — reconcile the DDNS public names for ingress services bound to
+    /// THIS lighthouse against the `[ddns]` config (DDNS-EGRESS-3). Auto-creates a
+    /// `wan`-sourced record for each exposed service's hostname (so CONNECT-7 no
+    /// longer needs an operator-typed name) and reclaims the labels this worker
+    /// previously owned (`prev_owned`) that the policy no longer wants (an
+    /// unexpose). Removal is **bounded** to this worker's own prior labels — exactly
+    /// like the firewall/forward reclaim — so it never deletes an operator-defined
+    /// DDNS record. Writes the durable record only; the `ddns` reconcile worker
+    /// publishes it (no second DNS path). Returns the new owned-label set to persist.
+    fn reconcile_ddns(&self, cfg: &exposure::ExposureConfig, prev_owned: &[String]) -> Vec<String> {
+        let mut dcfg = ddns::load(&self.workgroup_root);
+        let desired = desired_ingress_ddns_labels(cfg, &self.hostname, &dcfg.zone);
+        let mut changed = false;
+        // Add / update each desired ingress name.
+        for label in &desired {
+            if let Some(rec) = ddns::ingress_record(label) {
+                changed |= dcfg.upsert_record(rec);
+            }
+        }
+        // Reclaim previously-owned labels the policy dropped (bounded removal).
+        for label in prev_owned {
+            if !desired.contains(label) {
+                changed |= dcfg.remove_record(label);
+            }
+        }
+        if changed {
+            match ddns::save(&self.workgroup_root, &dcfg) {
+                Ok(_) => tracing::info!(
+                    labels = ?desired,
+                    "connect_firewall: reconciled DDNS public names for ingress services (CONNECT-9)"
+                ),
+                Err(e) => {
+                    tracing::warn!(error = %e, "connect_firewall: DDNS reconcile save failed");
+                    // Don't claim ownership of labels we couldn't persist; keep the
+                    // prior set so a later tick retries the same reclaim.
+                    return prev_owned.to_vec();
+                }
+            }
+        }
+        desired
+    }
+
     /// Run one `firewall-cmd --permanent --zone public <args…>`, bounded; returns
     /// success.
     fn fw(&self, args: &[&str]) -> bool {
@@ -415,13 +490,28 @@ impl ConnectFirewallWorker {
         // unexpose). Best-effort + no-op when Caddy isn't installed here.
         let _ = self.apply_caddy(&cfg);
 
+        let prev = self.load_applied();
+
+        // CONNECT-9 — reconcile the DDNS public names for ingress services bound to
+        // THIS lighthouse: auto-create each exposed service's name + reclaim the
+        // ones this worker previously owned that the policy dropped (an unexpose).
+        // Config-only (no firewalld), so it runs even where firewall-cmd is absent.
+        // Reuses the DDNS-EGRESS-3 config + reconcile/writer path — we only write
+        // the durable record; the `ddns` worker publishes it.
+        let owned_ddns = self.reconcile_ddns(&cfg, &prev.ddns_labels);
+
         let desired_ports = desired_ingress_ports(&cfg, &self.hostname);
         let desired_fwds = self.compute_forwards(&cfg);
         if self.firewall_cmd.is_empty() {
+            // Persist the DDNS ownership even on a non-firewalld node so the next
+            // tick can still reclaim drift (the firewall fields stay as prev).
+            self.save_applied(&AppliedState {
+                ddns_labels: owned_ddns,
+                ..prev
+            });
             return 0;
         }
 
-        let prev = self.load_applied();
         let rm_ports = ports_to_remove(&prev.ports, &desired_ports);
         let rm_fwds = forwards_to_remove(&prev.forwards, &desired_fwds);
         let mut changed = 0usize;
@@ -480,6 +570,7 @@ impl ConnectFirewallWorker {
             ports: desired_ports.clone(),
             forwards: desired_fwds.clone(),
             alerted_unexpected: unexpected,
+            ddns_labels: owned_ddns,
         });
 
         if changed > 0 || !rm_fwds.is_empty() || !rm_ports.is_empty() {
@@ -734,6 +825,129 @@ mod tests {
         ];
         let connect_owned = vec![(25565, "tcp".to_string())];
         assert!(unexpected_open_ports(&open, &connect_owned).is_empty());
+    }
+
+    #[test]
+    fn desired_ingress_ddns_labels_only_for_bound_lighthouse() {
+        // CONNECT-9 — the bare labels this lighthouse must publish: only the public
+        // services bound HERE, stripped of the DDNS zone suffix.
+        let zone = "services.matthewmackes.com";
+        let mut cfg = ExposureConfig::default();
+        cfg.upsert(ExposurePolicy {
+            id: "grafana".into(),
+            source: ServiceSource {
+                node: "eagle".into(),
+                port: 3000,
+                ..Default::default()
+            },
+            tier: Tier::PublicViaIngress,
+            ingress: Some(IngressBinding {
+                lighthouse: "LH-01".into(),
+                hostname: "grafana.services.matthewmackes.com".into(),
+            }),
+            mode: ProtoMode::Http,
+            template: None,
+        });
+        // A second service bound to a DIFFERENT lighthouse — excluded here.
+        cfg.upsert(ExposurePolicy {
+            id: "db".into(),
+            source: ServiceSource {
+                node: "pine".into(),
+                port: 5432,
+                ..Default::default()
+            },
+            tier: Tier::PublicViaIngress,
+            ingress: Some(IngressBinding {
+                lighthouse: "LH-02".into(),
+                hostname: "db.services.matthewmackes.com".into(),
+            }),
+            mode: ProtoMode::Tcp,
+            template: None,
+        });
+        assert_eq!(
+            desired_ingress_ddns_labels(&cfg, "LH-01", zone),
+            vec!["grafana".to_string()]
+        );
+        assert_eq!(
+            desired_ingress_ddns_labels(&cfg, "LH-02", zone),
+            vec!["db".to_string()]
+        );
+        // A node that is nobody's ingress publishes no names.
+        assert!(desired_ingress_ddns_labels(&cfg, "eagle", zone).is_empty());
+    }
+
+    #[test]
+    fn ddns_reconcile_auto_creates_then_reclaims_on_unexpose() {
+        // CONNECT-9 — the worker tick auto-creates the DDNS record for a service
+        // exposed on this lighthouse, and reclaims it (bounded) once the policy
+        // drops it, without touching an operator-defined record.
+        let tmp = tempfile::tempdir().unwrap();
+        // Seed an operator-owned DDNS record that the reconcile must NEVER remove.
+        let mut dcfg = ddns::DdnsConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        dcfg.upsert_record(ddns::RecordDef {
+            name: "manual".into(),
+            source: "tunnel:m1".into(),
+            on_down: ddns::OnDown::Keep,
+        });
+        ddns::save(tmp.path(), &dcfg).unwrap();
+
+        let zone = ddns::load(tmp.path()).zone;
+        let mut cfg = ExposureConfig::default();
+        cfg.upsert(ExposurePolicy {
+            id: "grafana".into(),
+            source: ServiceSource {
+                node: "eagle".into(),
+                port: 3000,
+                ..Default::default()
+            },
+            tier: Tier::PublicViaIngress,
+            ingress: Some(IngressBinding {
+                lighthouse: "LH-01".into(),
+                hostname: format!("grafana.{zone}"),
+            }),
+            mode: ProtoMode::Http,
+            template: None,
+        });
+        exposure::save(tmp.path(), &cfg).unwrap();
+
+        let state = tempfile::tempdir().unwrap();
+        let w = ConnectFirewallWorker::new(tmp.path().to_path_buf(), "LH-01".into())
+            .without_firewall_cmd()
+            .with_state_dir(state.path().to_path_buf());
+        // Tick 1: the firewall shell-out is disabled, but the DDNS reconcile still
+        // runs (config-only) and the owned label is persisted.
+        let _ = w.tick_once();
+        let after = ddns::load(tmp.path());
+        assert!(
+            after
+                .record
+                .iter()
+                .any(|r| r.name == "grafana" && r.source == "wan"),
+            "auto-created the wan-sourced ingress record"
+        );
+        assert!(
+            after.record.iter().any(|r| r.name == "manual"),
+            "operator-defined record untouched"
+        );
+        assert_eq!(w.load_applied().ddns_labels, vec!["grafana".to_string()]);
+
+        // Unexpose: drop the public service from the policy.
+        let empty = ExposureConfig::default();
+        exposure::save(tmp.path(), &empty).unwrap();
+        let _ = w.tick_once();
+        let after2 = ddns::load(tmp.path());
+        assert!(
+            after2.record.iter().all(|r| r.name != "grafana"),
+            "reclaimed the auto-created record on unexpose"
+        );
+        assert!(
+            after2.record.iter().any(|r| r.name == "manual"),
+            "operator-defined record STILL untouched after reclaim"
+        );
+        assert!(w.load_applied().ddns_labels.is_empty());
     }
 
     #[test]

@@ -15,6 +15,7 @@ use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use serde_json::json;
 
+use mackes_mesh_types::ddns;
 use mackes_mesh_types::exposure::{self, ExposurePolicy, ExposureTemplate, Tier};
 
 /// The connectivity responder service — holds the shared-substrate root where
@@ -220,7 +221,19 @@ pub fn build_reply(svc: &ConnectService, verb: &str, req_body: Option<&str>) -> 
             };
             cfg.upsert(updated);
             match exposure::save(root, &cfg) {
-                Ok(_) => json!({ "ok": true, "hostname": hostname }).to_string(),
+                Ok(_) => {
+                    // CONNECT-9 — auto-create/update the service's DDNS public name
+                    // so the operator no longer has to pre-create it (CONNECT-7's
+                    // hostname is now self-naming). Reuses the DDNS-EGRESS-3 config
+                    // + reconcile/writer path: we only write the durable record
+                    // (the `ddns` worker publishes it). Gated to the binding's own
+                    // lighthouse — the `wan` record resolves to the LOCAL node's WAN,
+                    // so only the bound ingress node owns it; a cross-node expose is
+                    // reconciled by that lighthouse's `connect_firewall` worker.
+                    let ddns_synced =
+                        sync_ingress_ddns_record(root, &svc.hostname, lighthouse, hostname);
+                    json!({ "ok": true, "hostname": hostname, "ddns": ddns_synced }).to_string()
+                }
                 Err(e) => err(format!("expose: save: {e}")),
             }
         }
@@ -232,6 +245,9 @@ pub fn build_reply(svc: &ConnectService, verb: &str, req_body: Option<&str>) -> 
             let Some(svc_policy) = cfg.get(id).cloned() else {
                 return err(format!("unexpose: no such service '{id}'"));
             };
+            // CONNECT-9 — the binding being torn down (so we can reclaim its DDNS
+            // public name below). Captured before we clear the ingress.
+            let old_ingress = svc_policy.ingress.clone();
             let updated = ExposurePolicy {
                 tier: Tier::MeshOnly,
                 ingress: None,
@@ -239,7 +255,18 @@ pub fn build_reply(svc: &ConnectService, verb: &str, req_body: Option<&str>) -> 
             };
             cfg.upsert(updated);
             match exposure::save(root, &cfg) {
-                Ok(_) => json!({ "ok": true }).to_string(),
+                Ok(_) => {
+                    // CONNECT-9 — remove the auto-created DDNS public name on
+                    // unexpose (the reverse of the expose auto-create). Same
+                    // local-lighthouse gating: only the node that owned the `wan`
+                    // record reclaims it here; a cross-node unexpose is reconciled
+                    // away by the bound lighthouse's `connect_firewall` worker.
+                    let ddns_removed = old_ingress
+                        .as_ref()
+                        .filter(|b| b.lighthouse == svc.hostname)
+                        .is_some_and(|b| remove_ingress_ddns_record(root, &b.hostname));
+                    json!({ "ok": true, "ddns_removed": ddns_removed }).to_string()
+                }
                 Err(e) => err(format!("unexpose: save: {e}")),
             }
         }
@@ -335,6 +362,65 @@ pub fn build_reply(svc: &ConnectService, verb: &str, req_body: Option<&str>) -> 
             }
         }
         other => err(format!("unknown connect verb: {other}")),
+    }
+}
+
+/// CONNECT-9 — auto-create/update the DDNS public name for an ingress `hostname`
+/// bound to `lighthouse`, but only when `this_host` IS that lighthouse (the
+/// `wan`-sourced record resolves to the LOCAL node's WAN, so only the bound
+/// ingress node may own it). Writes the durable [`ddns::RecordDef`] into the shared
+/// `[ddns]` config and lets the DDNS-EGRESS-3 reconcile worker publish it — no
+/// second DNS path. Returns `true` when this node wrote/updated the record. A save
+/// failure is logged and treated as not-synced (the worker re-derives on its tick).
+fn sync_ingress_ddns_record(
+    root: &std::path::Path,
+    this_host: &str,
+    lighthouse: &str,
+    hostname: &str,
+) -> bool {
+    if this_host != lighthouse {
+        // Not our ingress: the bound lighthouse's connect_firewall worker owns it.
+        return false;
+    }
+    let mut cfg = ddns::load(root);
+    let label = ddns::ingress_record_label(hostname, &cfg.zone);
+    let Some(rec) = ddns::ingress_record(&label) else {
+        return false; // hostname collapsed to the bare zone — nothing to publish.
+    };
+    if !cfg.upsert_record(rec) {
+        return true; // already present + identical (no-churn); record is in place.
+    }
+    match ddns::save(root, &cfg) {
+        Ok(_) => {
+            tracing::info!(hostname, label = %label, "connect expose: auto-created DDNS public name (CONNECT-9)");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(hostname, error = %e, "connect expose: DDNS record save failed");
+            false
+        }
+    }
+}
+
+/// CONNECT-9 — reclaim the DDNS public name for an unexposed ingress `hostname`
+/// (the reverse of [`sync_ingress_ddns_record`]). Removes the record from the
+/// shared `[ddns]` config so the reconcile worker deletes it (per its `on_down`
+/// policy). Returns `true` when a record was removed. Best-effort save.
+fn remove_ingress_ddns_record(root: &std::path::Path, hostname: &str) -> bool {
+    let mut cfg = ddns::load(root);
+    let label = ddns::ingress_record_label(hostname, &cfg.zone);
+    if label.is_empty() || !cfg.remove_record(&label) {
+        return false;
+    }
+    match ddns::save(root, &cfg) {
+        Ok(_) => {
+            tracing::info!(hostname, label = %label, "connect unexpose: removed DDNS public name (CONNECT-9)");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(hostname, error = %e, "connect unexpose: DDNS record removal save failed");
+            false
+        }
     }
 }
 
@@ -526,5 +612,93 @@ mod tests {
     fn unknown_verb_errors() {
         let (_t, s) = svc();
         assert!(build_reply(&s, "bogus", None).contains("unknown connect verb"));
+    }
+
+    #[test]
+    fn expose_on_bound_lighthouse_auto_creates_ddns_name_unexpose_removes() {
+        // CONNECT-9 — exposing a service on the lighthouse it binds to auto-creates
+        // the DDNS public name (CONNECT-7 no longer needs an operator-typed record);
+        // unexpose reclaims it. The service's hostname is FQDN under the default
+        // DDNS zone, so the record's bare label is the leading segment.
+        let tmp = tempfile::tempdir().unwrap();
+        // The responder's host IS the ingress lighthouse so it owns the wan record.
+        let s = ConnectService::new(tmp.path().to_path_buf(), "lighthouse-01".into());
+        let _ = build_reply(
+            &s,
+            "set-policy",
+            Some(
+                &json!({"id":"grafana","source":{"node":"eagle","kind":"container","port":3000},"tier":"mesh-only"})
+                    .to_string(),
+            ),
+        );
+        let ok = build_reply(
+            &s,
+            "expose",
+            Some(
+                &json!({
+                    "id":"grafana",
+                    "lighthouse":"lighthouse-01",
+                    "hostname":"grafana.services.matthewmackes.com",
+                    "mode":"http"
+                })
+                .to_string(),
+            ),
+        );
+        let v: serde_json::Value = serde_json::from_str(&ok).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true), "{ok}");
+        assert_eq!(v["ddns"], serde_json::Value::Bool(true), "{ok}");
+        // The DDNS config now carries the auto-created wan-sourced record.
+        let dcfg = mackes_mesh_types::ddns::load(tmp.path());
+        let rec = dcfg
+            .record
+            .iter()
+            .find(|r| r.name == "grafana")
+            .expect("CONNECT-9 auto-created the DDNS record");
+        assert_eq!(rec.source, "wan");
+        // Unexpose reclaims the DDNS name.
+        let u = build_reply(&s, "unexpose", Some("grafana"));
+        let uv: serde_json::Value = serde_json::from_str(&u).unwrap();
+        assert_eq!(uv["ok"], serde_json::Value::Bool(true), "{u}");
+        assert_eq!(uv["ddns_removed"], serde_json::Value::Bool(true), "{u}");
+        assert!(
+            mackes_mesh_types::ddns::load(tmp.path())
+                .record
+                .iter()
+                .all(|r| r.name != "grafana"),
+            "unexpose removed the DDNS record"
+        );
+    }
+
+    #[test]
+    fn expose_from_non_bound_node_defers_ddns_to_the_lighthouse() {
+        // CONNECT-9 — when the responder's host is NOT the ingress lighthouse, the
+        // wan record (which would resolve to THIS node's WAN) is not written here;
+        // the bound lighthouse's connect_firewall worker reconciles it instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let s = ConnectService::new(tmp.path().to_path_buf(), "some-other-node".into());
+        let _ = build_reply(
+            &s,
+            "set-policy",
+            Some(
+                &json!({"id":"grafana","source":{"node":"eagle","kind":"container","port":3000},"tier":"mesh-only"})
+                    .to_string(),
+            ),
+        );
+        let ok = build_reply(
+            &s,
+            "expose",
+            Some(
+                &json!({
+                    "id":"grafana",
+                    "lighthouse":"lighthouse-01",
+                    "hostname":"grafana.services.matthewmackes.com"
+                })
+                .to_string(),
+            ),
+        );
+        let v: serde_json::Value = serde_json::from_str(&ok).unwrap();
+        assert_eq!(v["ddns"], serde_json::Value::Bool(false), "{ok}");
+        // No record was written on this node.
+        assert!(mackes_mesh_types::ddns::load(tmp.path()).record.is_empty());
     }
 }
