@@ -5958,15 +5958,32 @@ fn run_serve(
 
         // MESHFS-2.1 (v5.0.0) — LizardFS mesh-storage fleet supervisor.
         // Silent no-op when mfsmaster/mfschunkserver binaries are absent.
-        sup.spawn(Spawn::new(
-            mackesd_core::workers::meshfs_worker::MeshFsWorker::new()
-                .with_qnm_peer_discovery(workgroup_root.clone(), node_id.clone()),
-            RestartPolicy::Always,
-        ));
-        worker_names
-            .lock()
-            .expect("worker_names mutex")
-            .push("meshfs_worker".into());
+        //
+        // SUBSTRATE-V2 gate: ONLY spawn this on LEGACY (pre-cutover, non-etcd)
+        // nodes. On SUBSTRATE-V2 nodes (etcd coordination + Syncthing files,
+        // LizardFS retired) the supervisor re-runs `mfschunkserver`/`mfssetgoal`
+        // every ~5s; with no LizardFS master each invocation fails, churning
+        // mackesd hard enough to starve the 60s systemd watchdog → SIGABRT
+        // crash-loop (diagnosed live 2026-06-25; the stopgap was renaming the
+        // LizardFS binaries). The etcd endpoints file existing marks an
+        // etcd/Syncthing node — the same `on_etcd` test used by
+        // `mackesd_core::shared_root_writable`.
+        let on_etcd = !mackesd_core::substrate::etcd::default_endpoints().is_empty();
+        if spawn_meshfs_worker(on_etcd) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::meshfs_worker::MeshFsWorker::new()
+                    .with_qnm_peer_discovery(workgroup_root.clone(), node_id.clone()),
+                RestartPolicy::Always,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("meshfs_worker".into());
+        } else {
+            tracing::info!(
+                "meshfs_worker skipped — node on the etcd/Syncthing substrate (SUBSTRATE-V2)"
+            );
+        }
 
         // INST-11 + INST-12 + INST-13 (v2.7) — fleet upgrade-barrier
         // worker. Runs on every peer; silently no-ops until a
@@ -8556,6 +8573,17 @@ fn cmd_join(
 /// (the node still joins the overlay; the daemon's startup mount-assert + the
 /// mesh-health watchdog surface a degraded plane). Mirrors the provisioning
 /// ladder in `mesh-install-lizardfs` (dnf → bundled fc43 RPMs → fetch → warn).
+/// SUBSTRATE-V2 gate — should the legacy `LizardFS` `meshfs_worker` supervisor
+/// be spawned on this node? Pure (no I/O) so the policy is unit-tested; the
+/// caller derives `on_etcd` from the etcd endpoints file. Only LEGACY
+/// (pre-cutover, non-etcd) nodes run the supervisor; on SUBSTRATE-V2 nodes (etcd
+/// coordination + Syncthing files, `LizardFS` retired) spawning it crash-loops
+/// mackesd via the systemd watchdog.
+#[must_use]
+const fn spawn_meshfs_worker(on_etcd: bool) -> bool {
+    !on_etcd
+}
+
 /// BIRTHRIGHT-1 — the `setup-qnm-shared` role flags for a node. Pure (no I/O)
 /// so the role→flags policy is unit-tested. Master only on the founding
 /// lighthouse; chunkserver on the founder + every Lighthouse/Server (storage
@@ -8750,8 +8778,18 @@ fn install_signal_handlers(
 
 #[cfg(test)]
 mod tests {
-    use super::qnm_setup_flags;
+    use super::{qnm_setup_flags, spawn_meshfs_worker};
     use mde_role::Role;
+
+    #[test]
+    fn meshfs_worker_gated_off_on_etcd_substrate() {
+        // SUBSTRATE-V2: an etcd/Syncthing node (endpoints file present ⇒
+        // on_etcd) must NOT spawn the legacy LizardFS supervisor — doing so
+        // crash-loops mackesd via the systemd watchdog.
+        assert!(!spawn_meshfs_worker(true));
+        // Legacy (pre-cutover, non-etcd) nodes still run the supervisor.
+        assert!(spawn_meshfs_worker(false));
+    }
 
     #[test]
     fn founding_lighthouse_runs_master_chunkserver_client() {
