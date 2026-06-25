@@ -419,6 +419,13 @@ pub mod dr_scheduler;
 // those hosts are reachable.
 pub mod dc_promote;
 // VPN-GW-1 — per-node commercial-VPN tunnel engine (WireGuard/OpenVPN baseline).
+// DDNS-EGRESS-3 — the dynamic-DNS reconcile loop + the DigitalOcean DnsWriter
+// adapter. Tails `event/vpn/signals` (VPN-GW exit-IP changes) + runs a periodic
+// WAN check, resolves each `[ddns]` record's live SourceState, and reconciles via
+// the pure plan_action predicate → the DO A/AAAA-record API (§9-safe fixed-arg
+// curl, token from the mesh secret store). Spawned in run_serve next to the DDNS
+// responder.
+pub mod ddns;
 pub mod stun_gather;
 pub mod subprocess_tick;
 // thumbnailer retired 2026-05-26 (TUNE-3.b): the worker module
