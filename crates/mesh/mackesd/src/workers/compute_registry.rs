@@ -10,7 +10,20 @@
 //!
 //! ## Design locks (v5.0.0-compute.md §1..3)
 //!
-//! - 10 s tick cadence (§1 / §3 inventory topic).
+//! - 10 s **poll** cadence (§1 / §3): virsh/podman are polled every
+//!   10 s so VM state-transition events (VIRT-21) and the replicated
+//!   QNM-Shared inventory file stay timely.
+//! - **Bus publish is on-change + a slow heartbeat** (BUS-RUN-FULL-1,
+//!   `docs/DECISIONS.md` ADR-0005). The `compute/inventory/<peer>` bus
+//!   topic has exactly one consumer — *this* node's own Workloads
+//!   source (`read_local_inventory`); the cross-node fleet view reads
+//!   the replicated `compute-inventory.json` file, not the bus. The
+//!   consumer only ever wants the *latest* doc, so republishing an
+//!   identical body every 10 s just grew the append-only Persist log
+//!   (8 640 redundant msgs/peer/day at idle). We now publish only when
+//!   the body changed since the last publish, plus an unconditional
+//!   heartbeat every [`PUBLISH_HEARTBEAT`] so a freshly-pruned topic /
+//!   late subscriber still finds a recent doc.
 //! - Subprocess-based polling — no libvirt-rs FFI, no system
 //!   libvirt-dev dep. Matches the `firewall_monitor` PEERVER pattern.
 //! - libvirtd is socket-activated (§5); the first `virsh` call
@@ -38,8 +51,17 @@ use std::time::Duration;
 
 use super::{ShutdownToken, Worker};
 
-/// 10 s tick cadence per design doc §1 / §3.
+/// 10 s poll cadence per design doc §1 / §3.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// BUS-RUN-FULL-1 — slow heartbeat for the `compute/inventory/<peer>` bus publish.
+///
+/// Between heartbeats we publish only when the inventory body changed; once
+/// this interval elapses we republish unconditionally so a freshly-pruned topic
+/// or a late subscriber still finds a recent doc. 60 s republishes ~6× less than
+/// the old every-tick publish at idle while keeping the local Workloads source's
+/// bus copy current within a minute.
+pub const PUBLISH_HEARTBEAT: Duration = Duration::from_secs(60);
 
 /// Directory holding per-VM Nebula-IP sidecar files
 /// (`<vm-storage>/<uuid>.nebula-ip`) written by `compute_provision`.
@@ -436,6 +458,27 @@ pub fn publish_inventory(peer: &str, inv: &Inventory) {
     crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
 }
 
+/// BUS-RUN-FULL-1 — decide whether this tick should publish the bus
+/// inventory. Publishes when the serialized body differs from the last
+/// published one (on-change), or when at least `heartbeat` has elapsed
+/// since the last publish (slow heartbeat so a pruned topic / late
+/// subscriber still finds a recent doc). `last_publish == None` (first
+/// tick) always publishes. Pure so the cadence policy is unit-tested.
+#[must_use]
+pub fn should_publish(
+    last_body: Option<&str>,
+    cur_body: &str,
+    last_publish: Option<std::time::Instant>,
+    now: std::time::Instant,
+    heartbeat: Duration,
+) -> bool {
+    match (last_body, last_publish) {
+        (Some(prev), Some(at)) => prev != cur_body || now.duration_since(at) >= heartbeat,
+        // No prior publish (worker just started) ⇒ always publish.
+        _ => true,
+    }
+}
+
 /// File name this node's inventory is mirrored to under its QNM-Shared dir.
 pub const SHARED_INVENTORY_FILE: &str = "compute-inventory.json";
 
@@ -626,6 +669,11 @@ pub struct ComputeRegistryWorker {
     prev_cpu_ns: Mutex<BTreeMap<String, u64>>,
     /// `uuid → previous libvirt state` for VIRT-21 transition events.
     prev_state: Mutex<BTreeMap<String, String>>,
+    /// BUS-RUN-FULL-1 — heartbeat for the on-change bus publish.
+    publish_heartbeat: Duration,
+    /// BUS-RUN-FULL-1 — last published inventory body + when, so we can
+    /// publish on-change and only heartbeat-republish an unchanged doc.
+    last_publish: Mutex<Option<(String, std::time::Instant)>>,
 }
 
 impl ComputeRegistryWorker {
@@ -643,6 +691,8 @@ impl ComputeRegistryWorker {
             vm_storage: PathBuf::from(DEFAULT_VM_STORAGE),
             prev_cpu_ns: Mutex::new(BTreeMap::new()),
             prev_state: Mutex::new(BTreeMap::new()),
+            publish_heartbeat: PUBLISH_HEARTBEAT,
+            last_publish: Mutex::new(None),
         }
     }
 
@@ -681,9 +731,28 @@ impl ComputeRegistryWorker {
         let vms = self.collect_vms(self.tick.as_secs_f64());
         let containers = collect_container_entries();
         let inventory = build_inventory(&peer, &self.hostname, vms, containers, meshfs_available);
-        // Publish even when peer is empty (Nebula not yet up) so the
-        // topic-shape is consistent — subscribers can ignore peer=="".
-        publish_inventory(&peer, &inventory);
+        // BUS-RUN-FULL-1: publish on-change + a slow heartbeat instead of
+        // every tick. The sole bus consumer (this node's own
+        // `read_local_inventory`) only wants the latest doc, so an
+        // identical body each 10 s just grew the append-only Persist log.
+        // Serialize once and compare against the last published body; the
+        // heartbeat still republishes an unchanged doc periodically so a
+        // pruned topic / late subscriber finds a recent one. Publish even
+        // when peer is empty (Nebula not yet up) so the topic-shape is
+        // consistent — subscribers can ignore peer=="".
+        if let Ok(body) = serde_json::to_string(&inventory) {
+            let mut last = self
+                .last_publish
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = std::time::Instant::now();
+            let prev_body = last.as_ref().map(|(b, _)| b.as_str());
+            let prev_at = last.as_ref().map(|(_, at)| *at);
+            if should_publish(prev_body, &body, prev_at, now, self.publish_heartbeat) {
+                publish_inventory(&peer, &inventory);
+                *last = Some((body, now));
+            }
+        }
         // WORKLOAD-FLEET-1: also mirror to the replicated QNM-Shared plane so
         // peers' Workbenches can show this node's workloads (the bus is
         // per-node). Only when the mount is real — never write to a bare local
@@ -819,6 +888,64 @@ mod tests {
     #[test]
     fn event_topic_is_per_peer() {
         assert_eq!(event_topic("10.42.0.5"), "compute/event/10.42.0.5");
+    }
+
+    // --- BUS-RUN-FULL-1: should_publish (on-change + slow heartbeat) ---
+
+    #[test]
+    fn should_publish_always_on_first_tick() {
+        // No prior publish ⇒ publish regardless of body.
+        let now = std::time::Instant::now();
+        assert!(should_publish(
+            None,
+            "{}",
+            None,
+            now,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn should_publish_skips_unchanged_within_heartbeat() {
+        // Same body, well inside the heartbeat ⇒ skip the redundant publish.
+        let at = std::time::Instant::now();
+        let now = at + Duration::from_secs(10);
+        assert!(!should_publish(
+            Some("{\"a\":1}"),
+            "{\"a\":1}",
+            Some(at),
+            now,
+            Duration::from_secs(60),
+        ));
+    }
+
+    #[test]
+    fn should_publish_on_changed_body() {
+        // Body changed inside the heartbeat ⇒ publish immediately.
+        let at = std::time::Instant::now();
+        let now = at + Duration::from_secs(10);
+        assert!(should_publish(
+            Some("{\"a\":1}"),
+            "{\"a\":2}",
+            Some(at),
+            now,
+            Duration::from_secs(60),
+        ));
+    }
+
+    #[test]
+    fn should_publish_heartbeat_republishes_unchanged() {
+        // Unchanged body but the heartbeat elapsed ⇒ republish so a pruned
+        // topic / late subscriber still finds a recent doc.
+        let at = std::time::Instant::now();
+        let now = at + Duration::from_secs(60);
+        assert!(should_publish(
+            Some("{\"a\":1}"),
+            "{\"a\":1}",
+            Some(at),
+            now,
+            Duration::from_secs(60),
+        ));
     }
 
     // --- parse_virsh_dominfo ---
