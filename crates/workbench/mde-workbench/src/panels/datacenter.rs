@@ -1109,6 +1109,19 @@ pub struct DatacenterPanel {
     /// input for a migrate (destination host) or resize (vcpus + mem). Only the
     /// prompt's Confirm fires the RPC; Cancel clears it. Cleared on every load.
     pub vm_prompt: Option<VmPrompt>,
+    /// DATACENTER-11 (VMs tab) — the per-VM snapshot list cache, keyed by VM uuid,
+    /// populated by the read-only `action/dc/vm-snapshots` RPC when the operator
+    /// clicks a VM's "Snapshots" button. The VM's card then renders one row per
+    /// snapshot with Revert + Delete actions. An empty `Vec` means "fetched, none"
+    /// (distinct from absent = "not fetched yet"). Cleared on every load so a refresh
+    /// never acts on a stale list.
+    pub vm_snapshots: BTreeMap<String, Vec<VmSnapshot>>,
+    /// DATACENTER-11 (VMs tab) — when `Some(snapshot-uuid)`, a snapshot delete is
+    /// awaiting inline confirmation — that snapshot's row renders a "Really delete?"
+    /// prompt and only the confirm button fires the destructive
+    /// `action/dc/vm-snapshot-delete` RPC (with `"confirm":true`). Mirrors
+    /// [`Self::confirm_delete`]. Cleared once a delete is fired or the load refreshes.
+    pub confirm_snapshot_delete: Option<String>,
     /// DATACENTER-11 (VMs tab) — the multi-select set of VM uuids (the checkboxes on
     /// the VM cards). The bulk toolbar acts on exactly this set. Cleared on load so a
     /// refresh never acts on a stale selection.
@@ -1676,6 +1689,18 @@ impl VmPrompt {
     }
 }
 
+/// DATACENTER-11 (VMs tab) — one of a VM's snapshots, as listed by the read-only
+/// `action/dc/vm-snapshots` RPC. The per-VM snapshot list renders one row each with
+/// a Revert (reversible, fires directly) and a Delete (destructive, typed-confirm
+/// gated like the VM delete) button. Pure value type so the decode is unit-testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmSnapshot {
+    /// The snapshot's own uuid — the key the revert / delete RPCs act on.
+    pub uuid: String,
+    /// The snapshot's name-label (e.g. `dc-snap-abcd1234`), for the row label.
+    pub name: String,
+}
+
 /// DATACENTER-11 (VMs tab) — the outcome of one VM in a multi-select bulk run, keyed
 /// by VM uuid. The bulk toolbar renders a per-item progress line off these as each
 /// VM's RPC lands. `Pending` is the pre-fire state; `Ok`/`Err` carry the result.
@@ -1883,6 +1908,8 @@ impl Default for DatacenterPanel {
             // progress all start empty; they hydrate from operator gestures.
             vm_create: VmCreateForm::default(),
             vm_prompt: None,
+            vm_snapshots: BTreeMap::new(),
+            confirm_snapshot_delete: None,
             vm_selected: BTreeSet::new(),
             bulk_tag: String::new(),
             bulk_progress: BTreeMap::new(),
@@ -2217,6 +2244,43 @@ pub enum Message {
     /// the panel hands to `xdg-open` via `crate::Message::OpenExternal`); `Err` the
     /// error text.
     ConsoleDone(Result<String, String>),
+    /// A VM "Snapshots" button was clicked — fires the read-only
+    /// `action/dc/vm-snapshots` RPC to list this VM's snapshots into the per-VM
+    /// snapshot cache. `uuid` is the VM id; `dom0` the owning host.
+    SnapshotsClicked {
+        uuid: String,
+        dom0: String,
+    },
+    /// The `action/dc/vm-snapshots` RPC came back. `Ok` carries `(vm-uuid, list)`
+    /// — the VM uuid is echoed so the reply keys the per-VM cache; `Err` the error.
+    SnapshotsDone(Result<(String, Vec<VmSnapshot>), String>),
+    /// A snapshot's "Revert" button was clicked — fires `action/dc/vm-snapshot-revert`
+    /// directly (a revert is reversible-by-snapshot, so no confirm). `snapshot` is the
+    /// snapshot uuid; `dom0` the owning host.
+    SnapshotRevertClicked {
+        snapshot: String,
+        dom0: String,
+    },
+    /// The `action/dc/vm-snapshot-revert` RPC came back. Routes here panel-scoped.
+    SnapshotRevertDone(Result<String, String>),
+    /// A snapshot's "Delete" button was clicked. Sets the pending-confirm state for
+    /// this snapshot uuid (no RPC fires yet); the row then renders an inline confirm.
+    SnapshotDeleteClicked {
+        snapshot: String,
+    },
+    /// The inline "Really delete?" confirm was clicked — only this fires the
+    /// destructive `action/dc/vm-snapshot-delete` RPC (with `"confirm":true`).
+    /// `vm` is the parent VM uuid (so the list can be refreshed); `dom0` the host.
+    SnapshotDeleteConfirmed {
+        snapshot: String,
+        vm: String,
+        dom0: String,
+    },
+    /// The pending snapshot-delete confirmation was dismissed (the "Cancel" button) —
+    /// clears `confirm_snapshot_delete` without firing any RPC.
+    SnapshotDeleteCancelled,
+    /// The `action/dc/vm-snapshot-delete` RPC came back. Routes here panel-scoped.
+    SnapshotDeleteDone(Result<String, String>),
     /// A create-wizard form field changed (`field` names which). Pure state.
     CreateFieldChanged {
         field: VmCreateField,
@@ -2453,6 +2517,8 @@ impl DatacenterPanel {
                 // act on a stale set. The create-wizard form is the operator's draft
                 // (not row-derived), so it survives a refresh.
                 self.vm_prompt = None;
+                self.vm_snapshots.clear();
+                self.confirm_snapshot_delete = None;
                 self.vm_selected.clear();
                 self.bulk_progress.clear();
                 // A fresh row set: re-seed the Topology expansion so newly-arrived
@@ -3128,6 +3194,81 @@ impl DatacenterPanel {
             }
             Message::ConsoleDone(Err(e)) => {
                 self.status = e;
+                Task::none()
+            }
+            Message::SnapshotsClicked { uuid, dom0 } => {
+                self.status = "Listing snapshots…".into();
+                let vm = uuid.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || vm_snapshots(&vm, &dom0))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("snapshots task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::SnapshotsDone(result)),
+                )
+            }
+            Message::SnapshotsDone(Ok((vm, list))) => {
+                self.status = format!("{} snapshot(s) for {vm}", list.len());
+                self.vm_snapshots.insert(vm, list);
+                Task::none()
+            }
+            Message::SnapshotsDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
+            Message::SnapshotRevertClicked { snapshot, dom0 } => {
+                self.status = format!("Reverting to {snapshot}…");
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || vm_snapshot_revert(&snapshot, &dom0))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("revert task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::SnapshotRevertDone(result)),
+                )
+            }
+            Message::SnapshotRevertDone(Ok(s)) | Message::SnapshotRevertDone(Err(s)) => {
+                self.status = s;
+                Task::none()
+            }
+            Message::SnapshotDeleteClicked { snapshot } => {
+                self.confirm_snapshot_delete = Some(snapshot);
+                self.status = "Confirm to delete this snapshot.".into();
+                Task::none()
+            }
+            Message::SnapshotDeleteCancelled => {
+                self.confirm_snapshot_delete = None;
+                self.status.clear();
+                Task::none()
+            }
+            Message::SnapshotDeleteConfirmed { snapshot, vm, dom0 } => {
+                self.confirm_snapshot_delete = None;
+                self.status = format!("Deleting snapshot {snapshot}…");
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            vm_snapshot_delete(&snapshot, &dom0)?;
+                            // Re-list the VM's snapshots so the row drops the deleted
+                            // one without a second operator gesture; the refreshed list
+                            // rides back to re-key the per-VM cache.
+                            vm_snapshots(&vm, &dom0)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("delete task panicked: {e}")))
+                    },
+                    // On success the refreshed list re-keys the cache (the deleted
+                    // snapshot is gone); on error the delete/list error surfaces.
+                    |result| {
+                        crate::Message::Datacenter(match result {
+                            Ok(listed) => Message::SnapshotsDone(Ok(listed)),
+                            Err(e) => Message::SnapshotDeleteDone(Err(e)),
+                        })
+                    },
+                )
+            }
+            Message::SnapshotDeleteDone(Ok(s)) | Message::SnapshotDeleteDone(Err(s)) => {
+                self.status = s;
                 Task::none()
             }
             Message::CreateFieldChanged { field, value } => {
@@ -5225,6 +5366,17 @@ impl DatacenterPanel {
             })),
             palette,
         );
+        // "Snapshots" lists this VM's snapshots into the per-VM cache; each listed
+        // snapshot then renders its own Revert / Delete actions below.
+        let snapshots = variant_button(
+            "Snapshots".to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::SnapshotsClicked {
+                uuid: uuid.clone(),
+                dom0: dom0.clone(),
+            })),
+            palette,
+        );
         let migrate = variant_button(
             "Migrate".to_string(),
             ButtonVariant::Secondary,
@@ -5252,6 +5404,7 @@ impl DatacenterPanel {
             console,
             clone,
             snapshot,
+            snapshots,
             migrate,
             resize,
         ]
@@ -5358,6 +5511,89 @@ impl DatacenterPanel {
                 );
             }
             None => {}
+        }
+
+        // DATACENTER-11 — the per-VM snapshot list, shown once "Snapshots" has been
+        // clicked and the read-only `vm-snapshots` RPC populated the cache. Each
+        // snapshot renders a Revert (reversible — fires directly) and a Delete
+        // (destructive — typed-confirm gated, mirroring the VM delete contract).
+        if let Some(snaps) = self.vm_snapshots.get(&uuid) {
+            if snaps.is_empty() {
+                card =
+                    card.push(text("Snapshots: none").colr(palette.text_muted.into_cosmic_color()));
+            } else {
+                card = card.push(
+                    text(format!("Snapshots ({})", snaps.len()))
+                        .colr(palette.text_muted.into_cosmic_color()),
+                );
+                for snap in snaps {
+                    let label = if snap.name.is_empty() {
+                        snap.uuid.clone()
+                    } else {
+                        format!("{} · {}", snap.name, snap.uuid)
+                    };
+                    let revert = variant_button(
+                        "Revert".to_string(),
+                        ButtonVariant::Secondary,
+                        Some(crate::Message::Datacenter(Message::SnapshotRevertClicked {
+                            snapshot: snap.uuid.clone(),
+                            dom0: dom0.clone(),
+                        })),
+                        palette,
+                    );
+                    // The destructive Delete mirrors the VM-delete inline confirm: the
+                    // first click only arms the per-snapshot "Really delete?" prompt.
+                    let delete: Element<'a, crate::Message> =
+                        if self.confirm_snapshot_delete.as_deref() == Some(snap.uuid.as_str()) {
+                            row![
+                                text("Really delete?").colr(palette.warning.into_cosmic_color()),
+                                variant_button(
+                                    "Confirm".to_string(),
+                                    ButtonVariant::Primary,
+                                    Some(crate::Message::Datacenter(
+                                        Message::SnapshotDeleteConfirmed {
+                                            snapshot: snap.uuid.clone(),
+                                            vm: uuid.clone(),
+                                            dom0: dom0.clone(),
+                                        }
+                                    )),
+                                    palette,
+                                ),
+                                variant_button(
+                                    "Cancel".to_string(),
+                                    ButtonVariant::Secondary,
+                                    Some(crate::Message::Datacenter(
+                                        Message::SnapshotDeleteCancelled
+                                    )),
+                                    palette,
+                                ),
+                            ]
+                            .spacing(f32::from(spacing::BASE[1]))
+                            .align_y(cosmic::iced::alignment::Vertical::Center)
+                            .into()
+                        } else {
+                            variant_button(
+                                "Delete".to_string(),
+                                ButtonVariant::Primary,
+                                Some(crate::Message::Datacenter(Message::SnapshotDeleteClicked {
+                                    snapshot: snap.uuid.clone(),
+                                })),
+                                palette,
+                            )
+                        };
+                    card = card.push(
+                        row![
+                            text(label)
+                                .colr(palette.text.into_cosmic_color())
+                                .width(Length::FillPortion(1)),
+                            revert,
+                            delete,
+                        ]
+                        .spacing(f32::from(spacing::BASE[1]))
+                        .align_y(cosmic::iced::alignment::Vertical::Center),
+                    );
+                }
+            }
         }
 
         // This VM's slice of an in-flight/last bulk run, if any.
@@ -7892,6 +8128,62 @@ fn vm_console_url(uuid: &str, dom0: &str) -> Result<String, String> {
         return Ok(loc.to_string());
     }
     Err(format!("unexpected vm-console reply: {v}"))
+}
+
+/// DATACENTER-11 — fire the read-only `action/dc/vm-snapshots` and decode the VM's
+/// snapshots. Returns `(vm-uuid, list)` — the uuid is echoed so the panel keys the
+/// per-VM cache off the request, not a (potentially absent) reply field.
+/// `{"ok":true,"snapshots":[{"uuid","name"},…]}`.
+fn vm_snapshots(uuid: &str, dom0: &str) -> Result<(String, Vec<VmSnapshot>), String> {
+    let body = serde_json::json!({ "uuid": uuid, "dom0": dom0 }).to_string();
+    let v = dc_rpc("vm-snapshots", &body, Duration::from_secs(60))?;
+    let list = v
+        .get("snapshots")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    let su = s.get("uuid").and_then(serde_json::Value::as_str)?;
+                    if su.is_empty() {
+                        return None;
+                    }
+                    let name = s
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    Some(VmSnapshot {
+                        uuid: su.to_string(),
+                        name,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .ok_or_else(|| format!("unexpected vm-snapshots reply: {v}"))?;
+    Ok((uuid.to_string(), list))
+}
+
+/// DATACENTER-11 — fire `action/dc/vm-snapshot-revert` (revert the parent VM to the
+/// snapshot). `{"ok":true}` → `"reverted to <snapshot>"`.
+fn vm_snapshot_revert(snapshot: &str, dom0: &str) -> Result<String, String> {
+    let body = serde_json::json!({ "snapshot": snapshot, "dom0": dom0 }).to_string();
+    let v = dc_rpc("vm-snapshot-revert", &body, Duration::from_secs(300))?;
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok(format!("reverted to {snapshot}"));
+    }
+    Err(format!("unexpected vm-snapshot-revert reply: {v}"))
+}
+
+/// DATACENTER-11 — fire the destructive `action/dc/vm-snapshot-delete` (with
+/// `"confirm":true`, mirroring `vm-delete`). `{"ok":true}` → `"deleted <snapshot>"`.
+fn vm_snapshot_delete(snapshot: &str, dom0: &str) -> Result<String, String> {
+    let body =
+        serde_json::json!({ "snapshot": snapshot, "dom0": dom0, "confirm": true }).to_string();
+    let v = dc_rpc("vm-snapshot-delete", &body, Duration::from_secs(120))?;
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok(format!("deleted {snapshot}"));
+    }
+    Err(format!("unexpected vm-snapshot-delete reply: {v}"))
 }
 
 /// DATACENTER-11 — open a noVNC console `url` with the desktop's `xdg-open`,
@@ -11098,6 +11390,116 @@ mod tests {
         });
         assert!(p.vm_prompt.is_none());
         assert!(p.status.contains("whole-number"));
+    }
+
+    #[test]
+    fn snapshots_clicked_sets_status_and_done_keys_the_cache() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::SnapshotsClicked {
+            uuid: "aaaa-1".into(),
+            dom0: "172.20.0.9".into(),
+        });
+        assert_eq!(p.status, "Listing snapshots…");
+        // The reply echoes the VM uuid → the cache keys off it.
+        let list = vec![
+            VmSnapshot {
+                uuid: "snap-1".into(),
+                name: "nightly".into(),
+            },
+            VmSnapshot {
+                uuid: "snap-2".into(),
+                name: "dc-snap-aaaa1".into(),
+            },
+        ];
+        let _ = p.update(Message::SnapshotsDone(Ok(("aaaa-1".into(), list.clone()))));
+        assert_eq!(p.vm_snapshots.get("aaaa-1"), Some(&list));
+        assert!(p.status.contains("2 snapshot(s)"));
+        // An error surfaces to the status without touching the cache.
+        let _ = p.update(Message::SnapshotsDone(Err("snapshot-list failed".into())));
+        assert_eq!(p.status, "snapshot-list failed");
+        assert_eq!(p.vm_snapshots.get("aaaa-1"), Some(&list));
+    }
+
+    #[test]
+    fn snapshot_revert_clicked_sets_status_and_done_writes_outcome() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::SnapshotRevertClicked {
+            snapshot: "snap-1".into(),
+            dom0: "172.20.0.9".into(),
+        });
+        assert!(p.status.contains("Reverting to snap-1"));
+        let _ = p.update(Message::SnapshotRevertDone(Ok("reverted to snap-1".into())));
+        assert_eq!(p.status, "reverted to snap-1");
+        let _ = p.update(Message::SnapshotRevertDone(Err("revert failed".into())));
+        assert_eq!(p.status, "revert failed");
+    }
+
+    #[test]
+    fn snapshot_delete_arms_confirm_cancels_and_confirms() {
+        let mut p = DatacenterPanel::new();
+        // First click only arms the per-snapshot confirm — no RPC, just state.
+        let _ = p.update(Message::SnapshotDeleteClicked {
+            snapshot: "snap-1".into(),
+        });
+        assert_eq!(p.confirm_snapshot_delete.as_deref(), Some("snap-1"));
+        // Cancel clears it.
+        let _ = p.update(Message::SnapshotDeleteCancelled);
+        assert!(p.confirm_snapshot_delete.is_none());
+        // Re-arm, then Confirm clears the gate (and fires the destructive RPC task).
+        let _ = p.update(Message::SnapshotDeleteClicked {
+            snapshot: "snap-1".into(),
+        });
+        let _ = p.update(Message::SnapshotDeleteConfirmed {
+            snapshot: "snap-1".into(),
+            vm: "aaaa-1".into(),
+            dom0: "172.20.0.9".into(),
+        });
+        assert!(p.confirm_snapshot_delete.is_none());
+        assert!(p.status.contains("Deleting snapshot snap-1"));
+        // A delete error surfaces to status.
+        let _ = p.update(Message::SnapshotDeleteDone(Err("destroy failed".into())));
+        assert_eq!(p.status, "destroy failed");
+    }
+
+    #[test]
+    fn vms_tab_renders_snapshot_list_with_revert_and_delete_confirm() {
+        let mut p = DatacenterPanel::new();
+        p.rows = vec![vm_row("aaaa-1", "builder", "running", "172.20.0.9")];
+        let _ = p.update(Message::ViewMode(ViewMode::Vms));
+        // Populate the per-VM snapshot cache, then render the list rows.
+        p.vm_snapshots.insert(
+            "aaaa-1".into(),
+            vec![VmSnapshot {
+                uuid: "snap-1".into(),
+                name: "nightly".into(),
+            }],
+        );
+        let _ = p.view();
+        // Arm the per-snapshot delete confirm → the inline "Really delete?" branch
+        // renders too.
+        p.confirm_snapshot_delete = Some("snap-1".into());
+        let _ = p.view();
+        // An empty (fetched-but-none) list renders the "none" line without panic.
+        p.vm_snapshots.insert("aaaa-1".into(), Vec::new());
+        let _ = p.view();
+    }
+
+    #[test]
+    fn load_clears_snapshot_cache_and_confirm() {
+        let mut p = DatacenterPanel::new();
+        p.vm_snapshots.insert(
+            "aaaa-1".into(),
+            vec![VmSnapshot {
+                uuid: "snap-1".into(),
+                name: "n".into(),
+            }],
+        );
+        p.confirm_snapshot_delete = Some("snap-1".into());
+        // A fresh load drops the stale snapshot cache + confirm (a refresh may change
+        // which VMs/snapshots exist).
+        let _ = p.update(Message::Loaded(Ok(DcLoad::default())));
+        assert!(p.vm_snapshots.is_empty());
+        assert!(p.confirm_snapshot_delete.is_none());
     }
 
     #[test]
