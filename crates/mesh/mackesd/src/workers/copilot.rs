@@ -40,6 +40,12 @@
 //!    GUI to approve later. It is **never** published to FD-11's execution topic
 //!    and the copilot **never** executes it. If codex returns no actionable
 //!    proposal, the worker just returns the text answer (FD-9 behavior).
+//!    The allowlist now includes FD-12's `code_edit` (the AI-editing-code
+//!    capability, Q52/Q53): when an ask implies a CONFIG/CODE change the copilot
+//!    can propose a typed `code_edit` (target path + full reviewed content +
+//!    rationale) the SAME propose-only way — it carries the full edit so the
+//!    operator reviews the exact change, and the apply is FD-11's gated,
+//!    path-bounded, audited handler, never the copilot.
 //!
 //! Code/config editing (Q52/Q53 diff→apply→git) is the remaining, more sensitive
 //! FD-12 piece and is deliberately NOT implemented in this cut.
@@ -296,13 +302,21 @@ CANNOT execute any system action from here — actions go through a separate typ
 audited path that the operator confirms.\n\
 If — and only if — your answer implies a concrete operation the operator should \
 run, you MAY PROPOSE one typed action by appending, AFTER your prose answer, a \
-fenced block exactly of the form:\n\
+fenced block exactly of one of these forms:\n\
 ```action\n\
 {\"kind\":\"service_lifecycle\",\"target_host\":\"<node>\",\"service_kind\":\"container|vm\",\"name\":\"<name>\",\"op\":\"start|stop|restart\"}\n\
 ```\n\
-Only the `service_lifecycle` kind is allowlisted; propose nothing else. Omit the \
-block entirely when no operation is implied. The proposal is queued for the \
-operator to approve — proposing is not executing.";
+or, when the operator should change a CONFIG or CODE file, the FD-12 code-edit \
+form (propose the FULL new file content so the operator can review the exact \
+change before approving):\n\
+```action\n\
+{\"kind\":\"code_edit\",\"path\":\"<path relative to the repo/workgroup root>\",\"content\":\"<the full new file content>\"}\n\
+```\n\
+Only `service_lifecycle` and `code_edit` are allowlisted; propose nothing else. \
+For `code_edit` the `path` MUST be relative to the repo root — never absolute, \
+never containing `..` (an out-of-bounds path is rejected). Omit the block entirely \
+when no operation is implied. The proposal is queued for the operator to approve \
+— proposing is NOT executing; you cannot apply a code edit yourself.";
 
 /// Assemble the prompt handed to `codex exec`: the system context, the live
 /// mesh-state grounding, any caller-supplied context, then the operator's
@@ -1803,6 +1817,7 @@ mod tests {
                 assert_eq!(name, "nginx");
                 assert_eq!(op, "restart");
             }
+            other => panic!("expected ServiceLifecycle, got {other:?}"),
         }
     }
 
@@ -1850,6 +1865,93 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v.get("rationale").is_some(), "carries the human rationale");
         assert_eq!(v["action"]["kind"], "service_lifecycle");
+    }
+
+    // -------------------- FD-12 code-edit proposal (propose-only) -----------
+
+    fn answer_with_code_edit() -> String {
+        // The code-edit proposal shape codex is now told to emit: prose rationale,
+        // then a fenced `code_edit` block carrying the path + the FULL reviewed
+        // content so the operator sees the exact change before approving.
+        "bump the log level to debug in the app config.\n\
+         ```action\n\
+         {\"kind\":\"code_edit\",\"path\":\"config/app.toml\",\"content\":\"log_level = \\\"debug\\\"\\n\"}\n\
+         ```"
+            .to_string()
+    }
+
+    #[test]
+    fn extract_proposal_maps_code_edit_to_typed_action() {
+        // FD-12: an ask implying a config/code change → a typed CodeEdit proposal,
+        // carrying the path + full content + rationale. It goes through the SAME
+        // FD-11 allowlist gate (parse_action_request), proving the copilot can only
+        // propose something the gated action worker is willing to apply.
+        let (prose, proposal) = extract_proposal(&answer_with_code_edit());
+        assert!(prose.contains("bump the log level"));
+        assert!(!prose.contains("```"), "fence stripped: {prose:?}");
+        let p = proposal.expect("a typed code_edit proposal was extracted");
+        assert_eq!(p.action.kind_tag(), "code_edit");
+        assert!(p.rationale.contains("log level"), "carries the rationale");
+        match p.action {
+            ActionRequest::CodeEdit { path, content } => {
+                assert_eq!(path, "config/app.toml");
+                assert_eq!(content, "log_level = \"debug\"\n");
+            }
+            other => panic!("expected CodeEdit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn copilot_code_edit_proposal_is_propose_only_not_an_apply() {
+        // SAFETY: the copilot ONLY proposes. extract_proposal returns an
+        // ActionProposal published on PROPOSAL_TOPIC — it is NOT FD-11's execution
+        // topic, and nothing here applies the edit. The proposal body carries the
+        // full content for review but performs no write; the copilot never reaches
+        // the action worker's apply handler (that needs an explicit operator apply
+        // request on ACTION_TOPIC).
+        let (_prose, proposal) = extract_proposal(&answer_with_code_edit());
+        let p = proposal.expect("proposal");
+        // The publish topic is the proposal lane, distinct from the execution lane.
+        assert_ne!(PROPOSAL_TOPIC, crate::workers::action::ACTION_TOPIC);
+        // The body is an ActionProposal (action + rationale for review), not a bare
+        // ActionRequest dispatched for execution.
+        let body = p.to_body();
+        let back: ActionProposal = serde_json::from_str(&body).unwrap();
+        assert_eq!(back, p);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["action"]["kind"], "code_edit");
+        assert_eq!(v["action"]["path"], "config/app.toml");
+        // The full content is present so the operator reviews the exact change.
+        assert!(
+            v["action"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("log_level"),
+            "the reviewable full content travels in the proposal"
+        );
+    }
+
+    #[test]
+    fn extract_proposal_drops_out_of_bounds_path_at_apply_not_propose() {
+        // The copilot can propose a code_edit with any path that PARSES (the path
+        // bound is enforced at APPLY by the action worker, not at parse) — but an
+        // un-allowlisted KIND is still dropped here. This documents the boundary:
+        // propose carries the typed request; the path-bound gate lives in the
+        // gated, audited apply handler (validate_edit_path), never the copilot.
+        let answer = "edit it\n```action\n\
+            {\"kind\":\"code_edit\",\"path\":\"/etc/passwd\",\"content\":\"x\"}\n```";
+        let (_prose, proposal) = extract_proposal(answer);
+        let p = proposal.expect("parses as a typed code_edit proposal");
+        // The action worker is what REJECTS the out-of-bounds path at apply time.
+        if let ActionRequest::CodeEdit { path, .. } = &p.action {
+            assert!(crate::workers::action::validate_edit_path(
+                std::path::Path::new("/srv/wg"),
+                path
+            )
+            .is_err());
+        } else {
+            panic!("expected CodeEdit");
+        }
     }
 
     // ===================== FD-10 §1 — the status topic =====================
