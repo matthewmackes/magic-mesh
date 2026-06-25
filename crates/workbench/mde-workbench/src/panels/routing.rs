@@ -24,11 +24,17 @@ const MAX_POLLS: u8 = 12;
 /// the other panels' interactive 2 s read window (the responder assembles the
 /// graph from local exposure/peer state — no network round-trips).
 const TRACE_TIMEOUT: Duration = Duration::from_secs(2);
+/// VPN-GW-8 — read budget for the egress-routing Bus probes (`action/vpn/
+/// list-routes`, `set-route`). Matches the VPN panel's interactive config
+/// window: these are local config reads/writes on the shared substrate, not
+/// network round-trips.
+const ROUTES_TIMEOUT: Duration = Duration::from_secs(2);
 use cosmic::iced::{Background, Border, Color, Length, Padding};
 use cosmic::{Element, Theme};
 use mackes_mesh_types::route_trace::{
     ControlPoint, Direction, Layer, NodeKind, PathEdge, PathGraph, PathNode, Transport, Verdict,
 };
+use mackes_mesh_types::vpn_egress::{EgressRoute, EgressRouting, RouteTarget};
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
 
 use crate::cosmic_compat::prelude::*;
@@ -74,6 +80,83 @@ pub struct RoutingPanel {
     pub poll_attempts: u8,
     /// ROUTE-TRACE-4 — the path-trace toolbar state machine.
     pub trace: TraceState,
+    /// VPN-GW-8 — the egress-routing surface state (the durable
+    /// `action/vpn/list-routes` table + the assign-route wizard).
+    pub egress: EgressState,
+}
+
+/// VPN-GW-8 — the egress-routing panel state: the durable routing table (who
+/// exits where), the real node roster (the matrix's rows + the wizard's node
+/// choices), and the assign-route wizard's selection. All sourced from the
+/// existing `action/vpn/*` RPCs + the node roster — no new model, no demo data.
+#[derive(Debug, Clone, Default)]
+pub struct EgressState {
+    /// The durable egress-routing assignments (`action/vpn/list-routes`). Empty
+    /// until the first load, or when the mesh has no VPN routes assigned yet.
+    pub routing: EgressRouting,
+    /// The real mesh node names (the node roster) — the matrix's rows + the
+    /// wizard's node picker. Empty when the roster can't be read.
+    pub nodes: Vec<String>,
+    /// True while the routing table / roster fetch is in flight.
+    pub busy: bool,
+    /// The last load error, if any (the daemon was unreachable / errored).
+    pub error: Option<String>,
+    /// The assign-route wizard's selection + last result.
+    pub wizard: WizardState,
+}
+
+/// VPN-GW-8 — the assign-route wizard: pick a node, a gateway, and a primary
+/// tunnel, then emit a real [`EgressRoute`] over `action/vpn/set-route`. The
+/// pure [`WizardState::route`] turns the selection into the exact `EgressRoute`
+/// the responder validates + persists; [`WizardState::can_assign`] gates the
+/// button. The set-route reply (ok / error) lands in `result`.
+#[derive(Debug, Clone, Default)]
+pub struct WizardState {
+    /// The node this route assigns egress for (a `RouteTarget::Node`).
+    pub node: String,
+    /// The gateway node that runs the tunnel + does the NAT.
+    pub gateway: String,
+    /// The primary tunnel id on the gateway (the chain's head).
+    pub primary: String,
+    /// True while a `set-route` request is in flight.
+    pub busy: bool,
+    /// The most recent assignment result (the saved target key, or an error).
+    pub result: Option<Result<String, String>>,
+}
+
+impl WizardState {
+    /// True when the selection is complete enough to assign: a node, a gateway,
+    /// and a primary tunnel are all chosen (the three fields the responder's
+    /// [`EgressRoute::validate`] requires for a `Node`-scoped route). Never busy.
+    #[must_use]
+    pub fn can_assign(&self) -> bool {
+        !self.busy
+            && !self.node.trim().is_empty()
+            && !self.gateway.trim().is_empty()
+            && !self.primary.trim().is_empty()
+    }
+
+    /// Build the exact [`EgressRoute`] the current selection assigns — a
+    /// per-node route (specificity beats group/ANY) through `gateway`'s
+    /// `primary` tunnel, with the kill-switch defaulted on (the model's Q8
+    /// default — block, don't leak). Returns `None` when the selection isn't
+    /// complete ([`Self::can_assign`] is false), so the caller never emits an
+    /// under-specified route. Pure — the wizard's core, unit-tested.
+    #[must_use]
+    pub fn route(&self) -> Option<EgressRoute> {
+        if !self.can_assign() {
+            return None;
+        }
+        Some(EgressRoute {
+            target: RouteTarget::Node {
+                name: self.node.trim().to_string(),
+            },
+            gateway: self.gateway.trim().to_string(),
+            primary: self.primary.trim().to_string(),
+            failover: Vec::new(),
+            kill_switch: true,
+        })
+    }
 }
 
 /// ROUTE-TRACE-4 — the trace toolbar's selection state + last result.
@@ -176,6 +259,19 @@ pub enum Message {
     /// ROUTE-TRACE-5 — a hop/segment was clicked: open (or, if already open,
     /// close) its drill-down detail panel. The payload is the edge id.
     SelectTraceHop(String),
+    /// VPN-GW-8 — the egress-routing table + node roster fetch landed (the
+    /// durable `action/vpn/list-routes` table + the real node names).
+    EgressLoaded(Result<(EgressRouting, Vec<String>), String>),
+    /// VPN-GW-8 — re-fetch the egress-routing table + roster.
+    RefreshEgress,
+    /// VPN-GW-8 — assign-route wizard edits.
+    WizardNodeChanged(String),
+    WizardGatewayChanged(String),
+    WizardPrimaryChanged(String),
+    /// VPN-GW-8 — assign the wizard's selection (emit `action/vpn/set-route`).
+    AssignRoute,
+    /// VPN-GW-8 — the `set-route` reply landed (the saved target key or error).
+    RouteAssigned(Result<String, String>),
 }
 
 impl RoutingPanel {
@@ -185,9 +281,29 @@ impl RoutingPanel {
     }
 
     pub fn load() -> Task<crate::Message> {
-        Task::perform(async { fetch_status() }, |result| {
-            crate::Message::Routing(Message::Loaded(result))
-        })
+        // VPN-GW-8 — load the reachability verdict AND the egress-routing table
+        // + node roster in parallel, so the panel opens with both the validation
+        // surface and the "who exits where" matrix populated.
+        Task::batch([
+            Task::perform(async { fetch_status() }, |result| {
+                crate::Message::Routing(Message::Loaded(result))
+            }),
+            Self::load_egress(),
+        ])
+    }
+
+    /// VPN-GW-8 — fetch the durable egress-routing table (`action/vpn/
+    /// list-routes`) + the real node roster on a blocking thread (both reads are
+    /// synchronous Bus / `mackesd` calls). The matrix, topology map, and wizard
+    /// all read from the result.
+    pub fn load_egress() -> Task<crate::Message> {
+        Task::perform(
+            async { tokio::task::spawn_blocking(fetch_egress).await },
+            |joined| {
+                let result = joined.unwrap_or_else(|e| Err(format!("egress task: {e}")));
+                crate::Message::Routing(Message::EgressLoaded(result))
+            },
+        )
     }
 
     pub fn update(&mut self, msg: Message) -> Task<crate::Message> {
@@ -236,6 +352,7 @@ impl RoutingPanel {
             }
             Message::RefreshClicked => {
                 self.busy = true;
+                self.egress.busy = true;
                 self.run_result = None;
                 Self::load()
             }
@@ -300,6 +417,65 @@ impl RoutingPanel {
                     };
                 Task::none()
             }
+            Message::EgressLoaded(Ok((routing, nodes))) => {
+                self.egress.routing = routing;
+                self.egress.nodes = nodes;
+                self.egress.busy = false;
+                self.egress.error = None;
+                Task::none()
+            }
+            Message::EgressLoaded(Err(e)) => {
+                self.egress.busy = false;
+                self.egress.error = Some(e);
+                Task::none()
+            }
+            Message::RefreshEgress => {
+                self.egress.busy = true;
+                Self::load_egress()
+            }
+            Message::WizardNodeChanged(v) => {
+                self.egress.wizard.node = v;
+                Task::none()
+            }
+            Message::WizardGatewayChanged(v) => {
+                self.egress.wizard.gateway = v;
+                Task::none()
+            }
+            Message::WizardPrimaryChanged(v) => {
+                self.egress.wizard.primary = v;
+                Task::none()
+            }
+            Message::AssignRoute => {
+                // Build the EgressRoute from the wizard selection; a noop if it
+                // isn't complete (the button is disabled then, but guard anyway).
+                let Some(route) = self.egress.wizard.route() else {
+                    return Task::none();
+                };
+                let Ok(body) = serde_json::to_string(&route) else {
+                    return Task::none();
+                };
+                self.egress.wizard.busy = true;
+                Task::perform(
+                    async move { tokio::task::spawn_blocking(move || assign_route(&body)).await },
+                    |joined| {
+                        let result = joined.unwrap_or_else(|e| Err(format!("set-route task: {e}")));
+                        crate::Message::Routing(Message::RouteAssigned(result))
+                    },
+                )
+            }
+            Message::RouteAssigned(result) => {
+                let ok = result.is_ok();
+                self.egress.wizard.busy = false;
+                self.egress.wizard.result = Some(result);
+                // A successful assignment changed the durable table — re-fetch it
+                // so the matrix + topology map reflect the new route immediately
+                // (live-verify: don't trust the request returned, read it back).
+                if ok {
+                    self.egress.busy = true;
+                    return Self::load_egress();
+                }
+                Task::none()
+            }
         }
     }
 
@@ -361,8 +537,12 @@ impl RoutingPanel {
         .align_y(cosmic::iced::alignment::Vertical::Center);
 
         let mut body_col = column![].spacing(6);
-        // ROUTE-TRACE-4 — the path-trace toolbar + topology graph sit atop the
-        // reachability verdict (the trace is the interactive "why is this path
+        // VPN-GW-8 — the egress-routing surface (who exits where) sits at the top
+        // of the panel: the egress matrix, the route topology map, and the
+        // assign-route wizard — all over the durable `action/vpn/*` table.
+        body_col = body_col.push(egress_section(&self.egress, palette));
+        // ROUTE-TRACE-4 — the path-trace toolbar + topology graph sit beneath the
+        // egress surface (the trace is the interactive "why is this path
         // (un)reachable" lens over the same overlay state).
         body_col = body_col.push(trace_toolbar(&self.trace, palette));
         body_col = body_col.push(trace_graph(&self.trace, palette));
@@ -1339,6 +1519,414 @@ fn layer_label(layer: Layer) -> &'static str {
     }
 }
 
+// ============================================================================
+// VPN-GW-8 — egress matrix + route topology map + assign-route wizard.
+//
+// The "who exits where" surface over the durable egress-routing table
+// (`action/vpn/list-routes` → `EgressRouting`). Three lenses on the SAME data:
+//   1. the egress MATRIX — one row per real mesh node, resolving each node's
+//      effective egress (the most-specific Node/Group/ANY route) to its gateway
+//      + primary tunnel + failover chain + kill-switch;
+//   2. the topology MAP — the route graph (node → gateway → provider exit) drawn
+//      on the SAME canvas program the trace graph uses (`PathGraphProgram`),
+//      reusing the route_trace node/edge model read-only;
+//   3. the assign-route WIZARD — pick a node + gateway + primary tunnel, emit a
+//      real `EgressRoute` over `action/vpn/set-route` (§7 — a real persist, no
+//      stub).
+// All read from real RPCs + the node roster; Carbon tokens only (§4).
+// ============================================================================
+
+/// VPN-GW-8 — the whole egress-routing section: a heading + refresh, the matrix,
+/// the topology map, and the assign-route wizard, stacked. The matrix + map read
+/// the loaded routing table; the wizard writes to it.
+fn egress_section<'a>(state: &'a EgressState, palette: Palette) -> Element<'a, crate::Message> {
+    let heading = text("Egress routing — who exits where")
+        .size(TypeRole::Heading.size_in(FontSize::defaults()))
+        .colr(palette.text.into_cosmic_color());
+    let refresh = crate::controls::variant_button(
+        if state.busy {
+            "Refreshing…"
+        } else {
+            "Refresh"
+        },
+        crate::controls::ButtonVariant::Secondary,
+        (!state.busy).then_some(crate::Message::Routing(Message::RefreshEgress)),
+        palette,
+    );
+    let header = row![heading, Space::new().width(Length::Fill), refresh,]
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+
+    let mut col = column![header].spacing(10);
+    if let Some(err) = &state.error {
+        col = col.push(card(
+            text(format!("Couldn't read the egress routing — {err}"))
+                .size(12)
+                .colr(palette.danger.into_cosmic_color()),
+            palette,
+        ));
+    }
+    col = col.push(egress_matrix(state, palette));
+    col = col.push(route_topology(&state.routing, palette));
+    col = col.push(assign_wizard(state, palette));
+    col.into()
+}
+
+/// VPN-GW-8 — the resolved effective egress for one node: the route that governs
+/// it (most-specific Node/Group/ANY) + a short tag of which scope matched, or
+/// `None` when the node has no route at all (it exits direct WAN). Pure over the
+/// loaded table so the matrix derivation is unit-testable without rendering.
+#[must_use]
+fn effective_egress<'a>(
+    routing: &'a EgressRouting,
+    node: &str,
+) -> Option<(&'a EgressRoute, &'static str)> {
+    // The node's groups aren't in the roster read here, so resolve over Node +
+    // ANY (the two scopes a bare node name can match without group membership);
+    // a Group route still shows in its own matrix row keyed by the group name.
+    let route = routing.route_for(node, &[])?;
+    let scope = match &route.target {
+        RouteTarget::Node { .. } => "node",
+        RouteTarget::Group { .. } => "group",
+        RouteTarget::Any => "any (default)",
+    };
+    Some((route, scope))
+}
+
+/// VPN-GW-8 — the egress matrix: one row per real mesh node, showing the gateway
+/// it exits through, the primary tunnel (the chain head), the failover chain
+/// length, and the kill-switch state — the "who exits where" table the
+/// acceptance asks for. A node with no route shows "direct WAN" (no gateway).
+/// Falls back to the routed targets themselves when the node roster is empty (so
+/// the matrix still shows the assignments even if `nodes list` is unreachable).
+fn egress_matrix<'a>(state: &'a EgressState, palette: Palette) -> Element<'a, crate::Message> {
+    let muted = palette.text_muted.into_cosmic_color();
+    let header = row![
+        matrix_cell("Node", 140.0, palette.text.into_cosmic_color(), true),
+        matrix_cell("Gateway", 120.0, palette.text.into_cosmic_color(), true),
+        matrix_cell(
+            "Primary tunnel",
+            140.0,
+            palette.text.into_cosmic_color(),
+            true
+        ),
+        matrix_cell("Failover", 90.0, palette.text.into_cosmic_color(), true),
+        matrix_cell("Kill-switch", 90.0, palette.text.into_cosmic_color(), true),
+    ]
+    .spacing(8);
+
+    // Rows: the real node roster when we have it, else the routed target names
+    // (so the matrix is never empty when routes exist but the roster read fails).
+    let row_nodes: Vec<String> = if state.nodes.is_empty() {
+        routed_target_names(&state.routing)
+    } else {
+        state.nodes.clone()
+    };
+
+    let mut rows = column![header].spacing(6);
+    if row_nodes.is_empty() {
+        rows = rows.push(
+            text("No mesh nodes / egress routes yet — assign one below.")
+                .size(11)
+                .colr(muted),
+        );
+    }
+    for node in &row_nodes {
+        let (gw, primary, failover, kill) = match effective_egress(&state.routing, node) {
+            Some((r, scope)) => (
+                format!("{} · {scope}", r.gateway),
+                r.primary.clone(),
+                if r.failover.is_empty() {
+                    "—".to_string()
+                } else {
+                    format!("{} hop(s)", r.failover.len())
+                },
+                if r.kill_switch { "on" } else { "off" }.to_string(),
+            ),
+            None => (
+                "direct WAN".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+            ),
+        };
+        let text_c = palette.text.into_cosmic_color();
+        let row = row![
+            matrix_cell(node, 140.0, text_c, false),
+            matrix_cell(&gw, 120.0, muted, false),
+            matrix_cell(&primary, 140.0, muted, false),
+            matrix_cell(&failover, 90.0, muted, false),
+            matrix_cell(&kill, 90.0, muted, false),
+        ]
+        .spacing(8);
+        rows = rows.push(row);
+    }
+
+    let title = text("Egress matrix")
+        .size(TypeRole::Body.size_in(FontSize::defaults()))
+        .colr(palette.text.into_cosmic_color());
+    card(
+        column![title, scrollable(rows).height(Length::Shrink)].spacing(8),
+        palette,
+    )
+}
+
+/// VPN-GW-8 — one fixed-width matrix cell (a header or a value). Header cells
+/// read as default text; value cells take the caller's tone. Carbon tokens.
+fn matrix_cell<'a>(s: &str, width: f32, color: Color, header: bool) -> Element<'a, crate::Message> {
+    text(s.to_string())
+        .size(if header { 11 } else { 12 })
+        .colr(color)
+        .width(Length::Fixed(width))
+        .into()
+}
+
+/// VPN-GW-8 — every distinct target name a route assigns to (node + group
+/// targets, plus a synthetic "(all mesh)" row for an ANY default), sorted +
+/// de-duplicated — the matrix's fallback rows when the live node roster is
+/// unreadable, so the assignments are still visible.
+#[must_use]
+fn routed_target_names(routing: &EgressRouting) -> Vec<String> {
+    let mut names: Vec<String> = routing
+        .route
+        .iter()
+        .map(|r| match &r.target {
+            RouteTarget::Node { name } | RouteTarget::Group { name } => name.clone(),
+            RouteTarget::Any => "(all mesh)".to_string(),
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// VPN-GW-8 — build the route TOPOLOGY graph from the durable egress-routing
+/// table, reusing the read-only `route_trace` node/edge model: each gateway is a
+/// `Gateway` node, each gateway's primary tunnel a `VpnExit` node beyond it, the
+/// internet the terminal cloud, and one `Host` node per assigned target linking
+/// into its gateway. Pure — the same `PathGraph` shape the canvas already draws,
+/// assembled from the route assignments rather than a single trace.
+#[must_use]
+fn topology_graph(routing: &EgressRouting) -> PathGraph {
+    let mut g = PathGraph::new(Direction::Egress);
+    let mut have_node = std::collections::HashSet::new();
+    let mut push_once = |graph: &mut PathGraph, node: PathNode| {
+        if have_node.insert(node.id.clone()) {
+            *graph = std::mem::take(graph).with_node(node);
+        }
+    };
+    // The terminal internet cloud (every exit leads here).
+    push_once(
+        &mut g,
+        PathNode {
+            id: "internet".into(),
+            kind: NodeKind::Internet,
+            label: "Internet".into(),
+            ..Default::default()
+        },
+    );
+    for r in &routing.route {
+        let gw_id = format!("gw:{}", r.gateway);
+        let exit_id = format!("exit:{}:{}", r.gateway, r.primary);
+        push_once(
+            &mut g,
+            PathNode {
+                id: gw_id.clone(),
+                kind: NodeKind::Gateway,
+                label: r.gateway.clone(),
+                ..Default::default()
+            },
+        );
+        push_once(
+            &mut g,
+            PathNode {
+                id: exit_id.clone(),
+                kind: NodeKind::VpnExit,
+                label: r.primary.clone(),
+                ..Default::default()
+            },
+        );
+        // The assigned target → its gateway (mesh overlay hop).
+        let target_label = match &r.target {
+            RouteTarget::Node { name } | RouteTarget::Group { name } => name.clone(),
+            RouteTarget::Any => "all mesh".to_string(),
+        };
+        let target_id = format!("src:{}", r.target.key());
+        push_once(
+            &mut g,
+            PathNode {
+                id: target_id.clone(),
+                kind: NodeKind::Host,
+                label: target_label,
+                ..Default::default()
+            },
+        );
+        g = g
+            .with_edge(PathEdge {
+                from: target_id,
+                to: gw_id.clone(),
+                layer: Layer::Mesh,
+                transport: Transport::DirectOverlay,
+                ..Default::default()
+            })
+            .with_edge(PathEdge {
+                from: gw_id,
+                to: exit_id.clone(),
+                layer: Layer::Vpn,
+                transport: Transport::VpnTunnel,
+                ..Default::default()
+            })
+            .with_edge(PathEdge {
+                from: exit_id,
+                to: "internet".into(),
+                layer: Layer::Public,
+                transport: Transport::Public,
+                ..Default::default()
+            });
+    }
+    g
+}
+
+/// VPN-GW-8 — the route topology map card: the route graph on the SAME canvas
+/// program the trace graph uses (`PathGraphProgram`), reusing its node-glyph /
+/// layer-colored-edge drawing. Renders a hint when there are no routes yet.
+fn route_topology<'a>(routing: &EgressRouting, palette: Palette) -> Element<'a, crate::Message> {
+    let title = text("Route topology — mesh → gateways → exits")
+        .size(TypeRole::Body.size_in(FontSize::defaults()))
+        .colr(palette.text.into_cosmic_color());
+    if routing.route.is_empty() {
+        return card(
+            column![
+                title,
+                text(
+                    "No egress routes assigned yet. Assign one below and the route graph \
+                     (node → gateway → provider exit) renders here.",
+                )
+                .size(12)
+                .colr(palette.text_muted.into_cosmic_color()),
+            ]
+            .spacing(8),
+            palette,
+        );
+    }
+    let program = PathGraphProgram {
+        graph: topology_graph(routing),
+        palette,
+    };
+    let canvas_stock: cosmic::iced::Element<'_, crate::Message, cosmic::iced::Theme> =
+        cosmic::iced::widget::canvas(program)
+            .width(Length::Fill)
+            .height(Length::Fixed(300.0))
+            .into();
+    let canvas: Element<'_, crate::Message> =
+        cosmic::iced::widget::themer(None, canvas_stock).into();
+    card(
+        column![title, container(canvas).width(Length::Fill)].spacing(8),
+        palette,
+    )
+}
+
+/// VPN-GW-8 — the assign-route wizard: pick a node (from the live roster), a
+/// gateway node, and a primary tunnel id, then Assign to emit a real
+/// `EgressRoute` over `action/vpn/set-route`. The node is a pick_list of the
+/// real roster (free-typed gateway/tunnel — the responder validates them); the
+/// Assign button is gated on a complete selection. The last result (saved / an
+/// error) shows beneath.
+fn assign_wizard<'a>(state: &'a EgressState, palette: Palette) -> Element<'a, crate::Message> {
+    let w = &state.wizard;
+    let label = move |s: &str| {
+        text(s.to_string())
+            .size(11)
+            .colr(palette.text_muted.into_cosmic_color())
+            .width(Length::Fixed(70.0))
+    };
+
+    // Node picker — the real roster when present, else a free-text input so the
+    // wizard still works when `nodes list` is unreachable (degrade, never block).
+    let node_widget: Element<'a, crate::Message> = if state.nodes.is_empty() {
+        crate::controls::styled_text_input(
+            "node (e.g. anvil)",
+            &w.node,
+            |v| crate::Message::Routing(Message::WizardNodeChanged(v)),
+            palette,
+        )
+    } else {
+        pick_list(
+            state.nodes.clone(),
+            (!w.node.is_empty()).then(|| w.node.clone()),
+            |v| crate::Message::Routing(Message::WizardNodeChanged(v)),
+        )
+        .placeholder("pick a node")
+        .text_size(13)
+        .into()
+    };
+    let gateway_widget = crate::controls::styled_text_input(
+        "gateway node (e.g. gw-eagle)",
+        &w.gateway,
+        |v| crate::Message::Routing(Message::WizardGatewayChanged(v)),
+        palette,
+    );
+    let primary_widget = crate::controls::styled_text_input(
+        "primary tunnel id (e.g. mullvad1)",
+        &w.primary,
+        |v| crate::Message::Routing(Message::WizardPrimaryChanged(v)),
+        palette,
+    );
+
+    let assign_msg = w
+        .can_assign()
+        .then_some(crate::Message::Routing(Message::AssignRoute));
+    let assign_btn = crate::controls::variant_button(
+        if w.busy {
+            "Assigning…"
+        } else {
+            "Assign route"
+        },
+        crate::controls::ButtonVariant::Primary,
+        assign_msg,
+        palette,
+    );
+
+    let title = text("Assign a route")
+        .size(TypeRole::Body.size_in(FontSize::defaults()))
+        .colr(palette.text.into_cosmic_color());
+    let node_row = row![label("Node"), node_widget]
+        .spacing(10)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+    let gw_row = row![label("Gateway"), gateway_widget]
+        .spacing(10)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+    let tun_row = row![label("Tunnel"), primary_widget]
+        .spacing(10)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+    let action_row = row![Space::new().width(Length::Fill), assign_btn]
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+
+    let mut body = column![title, node_row, gw_row, tun_row, action_row].spacing(8);
+    if let Some(res) = &w.result {
+        let (color, msg) = match res {
+            Ok(key) => (
+                palette.success.into_cosmic_color(),
+                format!("Route assigned — {key} (kill-switch on)"),
+            ),
+            Err(e) => (
+                palette.danger.into_cosmic_color(),
+                format!("Assign failed — {e}"),
+            ),
+        };
+        body = body.push(text(msg).size(11).colr(color));
+    } else {
+        body = body.push(
+            text(
+                "Assigns a per-node egress route (specificity beats group/ANY) with the \
+                 kill-switch on — block, don't leak, if the tunnel chain is down.",
+            )
+            .size(10)
+            .colr(palette.text_muted.into_cosmic_color()),
+        );
+    }
+    card(body, palette)
+}
+
 // ---- I/O ------------------------------------------------------
 
 /// ROUTE-TRACE-4 — request a path trace over the Bus (`action/route/trace`) and
@@ -1368,6 +1956,73 @@ fn parse_trace_reply(raw: &str) -> Result<PathGraph, String> {
         .ok_or_else(|| "trace reply missing 'graph'".to_string())?;
     serde_json::from_value::<PathGraph>(graph.clone())
         .map_err(|e| format!("trace reply decode: {e}"))
+}
+
+// ---- VPN-GW-8: egress-routing I/O -----------------------------------------
+
+/// VPN-GW-8 — fetch the durable egress-routing table (`action/vpn/list-routes`)
+/// plus the real node roster, the matrix/map/wizard's data source. The roster
+/// read is best-effort, so an unreachable `nodes list` degrades to an empty
+/// roster — the matrix then falls back to the routed target names — rather than
+/// failing the whole load. Blocking (a Bus client plus a `mackesd` shell), so
+/// call it from `spawn_blocking`, never on the iced executor.
+fn fetch_egress() -> Result<(EgressRouting, Vec<String>), String> {
+    let raw = crate::dbus::action_request("action/vpn/list-routes", ROUTES_TIMEOUT)
+        .ok_or_else(|| "mackesd not reachable over the Bus (vpn/list-routes)".to_string())?;
+    let routing = parse_routes_reply(&raw)?;
+    // Best-effort roster — never fail the egress load on a roster read error.
+    let nodes = crate::panels::node_roster::fetch_peers()
+        .map(|peers| peers.into_iter().map(|p| p.name).collect())
+        .unwrap_or_default();
+    Ok((routing, nodes))
+}
+
+/// VPN-GW-8 — pure decoder for the `action/vpn/list-routes` reply envelope:
+/// `{"ok":true,"routes":[<EgressRoute>...]}` → the `EgressRouting` table;
+/// `{"error":m}` → `Err(m)`. Split out so the wire contract is unit-testable
+/// without the Bus.
+fn parse_routes_reply(raw: &str) -> Result<EgressRouting, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(raw.trim()).map_err(|e| format!("bad list-routes reply: {e}"))?;
+    if let Some(err) = v.get("error").and_then(serde_json::Value::as_str) {
+        return Err(err.to_string());
+    }
+    let routes = v
+        .get("routes")
+        .ok_or_else(|| "list-routes reply missing 'routes'".to_string())?;
+    let route: Vec<EgressRoute> =
+        serde_json::from_value(routes.clone()).map_err(|e| format!("list-routes decode: {e}"))?;
+    Ok(EgressRouting { route })
+}
+
+/// VPN-GW-8 — assign an egress route over the Bus (`action/vpn/set-route`) — the
+/// wizard's real terminal action (§7, a durable persist, no stub). The body is
+/// an `EgressRoute` JSON; the responder validates + persists it. Decodes the
+/// `{"ok":true,"target":<key>}` reply into the saved target key. Blocking — call
+/// from `spawn_blocking`.
+fn assign_route(body: &str) -> Result<String, String> {
+    let raw =
+        crate::dbus::action_request_with_body("action/vpn/set-route", Some(body), ROUTES_TIMEOUT)
+            .ok_or_else(|| "mackesd not reachable over the Bus (vpn/set-route)".to_string())?;
+    parse_set_route_reply(&raw)
+}
+
+/// VPN-GW-8 — pure decoder for the `action/vpn/set-route` reply:
+/// `{"ok":true,"target":<key>}` → the saved target key; `{"error":m}` → `Err(m)`.
+fn parse_set_route_reply(raw: &str) -> Result<String, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(raw.trim()).map_err(|e| format!("bad set-route reply: {e}"))?;
+    if let Some(err) = v.get("error").and_then(serde_json::Value::as_str) {
+        return Err(err.to_string());
+    }
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok(v
+            .get("target")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("route")
+            .to_string());
+    }
+    Err(format!("unexpected set-route reply: {raw}"))
 }
 
 /// ROUTING-VALIDATE-1 — sleep `POLL_DELAY`, then re-fetch the verdict. Used to
@@ -1912,5 +2567,262 @@ mod tests {
             panel.trace.selected_hop, None,
             "a new graph invalidates the open hop"
         );
+    }
+
+    // --- VPN-GW-8: egress matrix + topology map + assign-route wizard ----------
+
+    fn route(target: RouteTarget, gw: &str, primary: &str, failover: &[&str]) -> EgressRoute {
+        EgressRoute {
+            target,
+            gateway: gw.into(),
+            primary: primary.into(),
+            failover: failover.iter().map(|s| (*s).to_string()).collect(),
+            kill_switch: true,
+        }
+    }
+
+    #[test]
+    fn wizard_needs_all_three_fields_and_builds_a_per_node_route() {
+        // The Assign button gates on node + gateway + primary; a complete
+        // selection builds a per-node EgressRoute with the kill-switch defaulted
+        // on — the exact shape the responder validates + persists.
+        let mut w = WizardState::default();
+        assert!(!w.can_assign(), "empty selection can't assign");
+        assert!(w.route().is_none());
+
+        w.node = "anvil".into();
+        w.gateway = "gw-eagle".into();
+        assert!(!w.can_assign(), "still missing the primary tunnel");
+        w.primary = "mullvad1".into();
+        assert!(w.can_assign());
+
+        let r = w.route().expect("complete selection builds a route");
+        assert_eq!(
+            r.target,
+            RouteTarget::Node {
+                name: "anvil".into()
+            }
+        );
+        assert_eq!(r.gateway, "gw-eagle");
+        assert_eq!(r.primary, "mullvad1");
+        assert!(r.kill_switch, "kill-switch defaults on (block, don't leak)");
+        assert!(r.failover.is_empty());
+        // The built route is itself valid by the model's own contract.
+        assert!(r.validate().is_ok());
+        // The wire body round-trips back to the same EgressRoute the responder reads.
+        let body = serde_json::to_string(&r).unwrap();
+        let back: EgressRoute = serde_json::from_str(&body).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn a_busy_wizard_is_not_re_triggerable() {
+        let w = WizardState {
+            node: "anvil".into(),
+            gateway: "gw".into(),
+            primary: "m1".into(),
+            busy: true,
+            ..Default::default()
+        };
+        assert!(!w.can_assign(), "an in-flight assign gates the button");
+        assert!(w.route().is_none());
+    }
+
+    #[test]
+    fn effective_egress_resolves_the_most_specific_route() {
+        // A node with its own route resolves to it (node scope); a node with only
+        // the ANY default resolves to that; an unrouted node resolves to None.
+        let mut routing = EgressRouting::default();
+        routing.set(route(RouteTarget::Any, "gw-any", "a1", &[]));
+        routing.set(route(
+            RouteTarget::Node {
+                name: "anvil".into(),
+            },
+            "gw-node",
+            "n1",
+            &["n2"],
+        ));
+        let (r, scope) = effective_egress(&routing, "anvil").expect("anvil has a route");
+        assert_eq!(r.gateway, "gw-node");
+        assert_eq!(scope, "node");
+        let (r, scope) = effective_egress(&routing, "loner").expect("ANY default applies");
+        assert_eq!(r.gateway, "gw-any");
+        assert!(scope.starts_with("any"));
+        // No ANY + no node route → None (direct WAN).
+        let mut sparse = EgressRouting::default();
+        sparse.set(route(
+            RouteTarget::Node {
+                name: "anvil".into(),
+            },
+            "gw",
+            "n1",
+            &[],
+        ));
+        assert!(effective_egress(&sparse, "other").is_none());
+    }
+
+    #[test]
+    fn topology_graph_links_each_target_through_its_gateway_to_the_internet() {
+        // Each assignment contributes target → gateway → exit → internet, sharing
+        // one internet node, so the canvas renders a consistent route graph.
+        let mut routing = EgressRouting::default();
+        routing.set(route(
+            RouteTarget::Node {
+                name: "anvil".into(),
+            },
+            "gw-eagle",
+            "mullvad1",
+            &[],
+        ));
+        routing.set(route(RouteTarget::Any, "gw-eagle", "proton1", &[]));
+        let g = topology_graph(&routing);
+        // One internet node, two gateways-worth of nodes (shared gateway label
+        // dedups to one Gateway node), two distinct exits, two source nodes.
+        assert_eq!(g.direction, Direction::Egress);
+        assert!(g.nodes.iter().any(|n| n.kind == NodeKind::Internet));
+        assert!(g
+            .nodes
+            .iter()
+            .any(|n| n.kind == NodeKind::Gateway && n.label == "gw-eagle"));
+        assert!(
+            g.nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::VpnExit)
+                .count()
+                == 2
+        );
+        // The graph is self-consistent (every edge endpoint is a real node) — the
+        // canvas's contract.
+        assert!(g.validate().is_ok(), "{:?}", g.validate());
+        // An empty table yields just the terminal internet node, no edges.
+        let empty = topology_graph(&EgressRouting::default());
+        assert_eq!(empty.edges.len(), 0);
+        assert_eq!(empty.nodes.len(), 1);
+    }
+
+    #[test]
+    fn routed_target_names_are_sorted_and_deduped() {
+        let mut routing = EgressRouting::default();
+        routing.set(route(
+            RouteTarget::Node {
+                name: "zeta".into(),
+            },
+            "g",
+            "p",
+            &[],
+        ));
+        routing.set(route(
+            RouteTarget::Node {
+                name: "alpha".into(),
+            },
+            "g",
+            "p",
+            &[],
+        ));
+        routing.set(route(RouteTarget::Any, "g", "p", &[]));
+        let names = routed_target_names(&routing);
+        assert_eq!(names, vec!["(all mesh)", "alpha", "zeta"]);
+    }
+
+    #[test]
+    fn parse_routes_reply_decodes_ok_and_error_envelopes() {
+        // The ok envelope yields the EgressRouting table; the error envelope an Err.
+        let r = route(
+            RouteTarget::Node {
+                name: "anvil".into(),
+            },
+            "gw",
+            "m1",
+            &["m2"],
+        );
+        let ok = json_routes(&[r.clone()]);
+        let table = parse_routes_reply(&ok).expect("ok envelope decodes");
+        assert_eq!(table.route.len(), 1);
+        assert_eq!(table.route[0], r);
+        // An empty list is valid (no routes assigned yet).
+        assert!(parse_routes_reply(&json_routes(&[]))
+            .unwrap()
+            .route
+            .is_empty());
+        // Error + garbage envelopes.
+        assert!(parse_routes_reply(r#"{"error":"daemon down"}"#)
+            .unwrap_err()
+            .contains("daemon down"));
+        assert!(parse_routes_reply("garbage").is_err());
+        assert!(
+            parse_routes_reply(r#"{"ok":true}"#).is_err(),
+            "missing routes"
+        );
+    }
+
+    /// Build the exact `list-routes` ok envelope the responder emits.
+    fn json_routes(routes: &[EgressRoute]) -> String {
+        serde_json::json!({ "ok": true, "routes": routes }).to_string()
+    }
+
+    #[test]
+    fn parse_set_route_reply_reads_the_saved_target_and_errors() {
+        // The ok envelope yields the saved target key; the error envelope an Err.
+        let ok = parse_set_route_reply(r#"{"ok":true,"target":"node:anvil"}"#).unwrap();
+        assert_eq!(ok, "node:anvil");
+        // ok without an explicit target falls back to a generic label, not a panic.
+        assert_eq!(parse_set_route_reply(r#"{"ok":true}"#).unwrap(), "route");
+        assert!(parse_set_route_reply(r#"{"error":"set-route: bad json"}"#)
+            .unwrap_err()
+            .contains("bad json"));
+        assert!(parse_set_route_reply("nope").is_err());
+    }
+
+    #[test]
+    fn assign_route_message_flow_clears_busy_and_records_the_result() {
+        // The reducer: WizardAssign with a complete selection sets busy; a
+        // RouteAssigned reply clears it + records the result. (No Bus is touched
+        // here — we drive the state machine directly through update.)
+        let mut p = RoutingPanel::new();
+        let _ = p.update(Message::WizardNodeChanged("anvil".into()));
+        let _ = p.update(Message::WizardGatewayChanged("gw-eagle".into()));
+        let _ = p.update(Message::WizardPrimaryChanged("mullvad1".into()));
+        assert!(p.egress.wizard.can_assign());
+        // A landing reply records the result + clears busy.
+        let _ = p.update(Message::RouteAssigned(Ok("node:anvil".into())));
+        assert!(!p.egress.wizard.busy);
+        assert_eq!(
+            p.egress.wizard.result.as_ref().unwrap().as_deref(),
+            Ok("node:anvil")
+        );
+        // An error reply is recorded too.
+        let _ = p.update(Message::RouteAssigned(Err("save failed".into())));
+        assert!(p.egress.wizard.result.as_ref().unwrap().is_err());
+    }
+
+    #[test]
+    fn egress_loaded_populates_the_matrix_and_view_renders() {
+        // A loaded routing table + roster populates the egress state; the full
+        // view renders every egress section (matrix + topology + wizard) without
+        // panic, for both a routed and an empty table.
+        let mut p = RoutingPanel::new();
+        let mut routing = EgressRouting::default();
+        routing.set(route(
+            RouteTarget::Node {
+                name: "anvil".into(),
+            },
+            "gw-eagle",
+            "mullvad1",
+            &["proton1"],
+        ));
+        let nodes = vec!["anvil".to_string(), "eagle".to_string()];
+        let _ = p.update(Message::EgressLoaded(Ok((routing, nodes))));
+        assert_eq!(p.egress.routing.route.len(), 1);
+        assert_eq!(p.egress.nodes.len(), 2);
+        assert!(!p.egress.busy);
+        let _ = p.view(); // routed table renders
+
+        // An error load surfaces the error + clears busy.
+        let _ = p.update(Message::EgressLoaded(Err(
+            "vpn/list-routes unreachable".into()
+        )));
+        assert!(p.egress.error.is_some());
+        assert!(!p.egress.busy);
+        let _ = p.view(); // error state renders
     }
 }
