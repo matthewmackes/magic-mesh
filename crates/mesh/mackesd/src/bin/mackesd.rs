@@ -5537,6 +5537,24 @@ fn run_serve(
             ));
             worker_names.lock().expect("worker_names mutex").push("presence_watch".into());
         }
+        // SUBSTRATE-10 — etcd WATCH worker: opens watch streams on /mesh/peers/
+        // (a Delete = a keepalive lease expired = a peer dropped) + /mesh/leader
+        // (a Put with a new node_id = a leadership handover) and PUSHES instant
+        // alerts onto the same alert_relay lane presence_watch uses — no poll,
+        // no 5 s reconcile lag. Degrades cleanly off the coordination plane
+        // (empty endpoints / etcd unreachable → idle + back off, never panic).
+        if mackesd_core::worker_role::runs("etcd_watch", role_rank) {
+            let alerts = mackesd_core::workers::alert_relay::default_alerts_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp/mde-alerts"));
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::etcd_watch::EtcdWatchWorker::new(
+                    alerts,
+                    node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names.lock().expect("worker_names mutex").push("etcd_watch".into());
+        }
         // PD-9 / FPG — the reconcile driver: magic-fleet reconcile on a
         // 15-min cadence + immediately on this host's nudge file.
         if mackesd_core::worker_role::runs("fleet_reconcile", role_rank) {
