@@ -24,8 +24,9 @@
 //!   name-label=… virtual-size=…`; reply `{"ok":true,"vdi":"<uuid>"}`.
 //! * `vdi-attach` `{ vdi, vm, dom0 }` → `xe vbd-create … ; xe vbd-plug …`;
 //!   reply `{"ok":true,"vbd":"<uuid>"}`.
-//! * `vdi-detach` `{ vbd, dom0 }` → `xe vbd-unplug … ; xe vbd-destroy …`;
-//!   reply `{"ok":true}`.
+//! * `vdi-detach` `{ vbd, dom0, confirm:true }` → `xe vbd-unplug … ; vbd-destroy …`;
+//!   reply `{"ok":true}`. DESTRUCTIVE — refused unless `confirm == true` (fail-closed,
+//!   like `vm-delete` / `tofu-destroy`).
 //! * `sr-snapshot` `{ vdi|sr, dom0 }` → `xe vdi-snapshot …` (one VDI) or a loop
 //!   over the SR's VDIs; reply `{"ok":true,"snapshot":…}`.
 
@@ -414,6 +415,13 @@ fn vdi_detach_reply(req_body: Option<&str>) -> String {
         Ok(v) => v,
         Err(e) => return e,
     };
+    // DESTRUCTIVE: detach drops the VM↔disk connection. Refuse unless the caller
+    // explicitly confirms (defense-in-depth alongside the panel's typed-confirm —
+    // same fail-closed gate as `vm-delete` / `tofu-destroy`). Checked BEFORE the
+    // dom0 allow-list / any command build.
+    if req.get("confirm").and_then(serde_json::Value::as_bool) != Some(true) {
+        return err("detach requires confirm:true".into());
+    }
     let dom0 = match allowed_dom0(&req) {
         Ok(d) => d,
         Err(e) => return e,
@@ -588,5 +596,22 @@ mod tests {
         // rejected BEFORE any command is built/run.
         let body = r#"{"name":"data","host_uuid":"h-1","dom0":"10.0.0.1"}"#;
         assert!(build_reply("sr-create", Some(body)).contains("dom0 not in allowed set"));
+    }
+
+    #[test]
+    fn vdi_detach_requires_confirm() {
+        // DESTRUCTIVE: the detach refuses without an explicit confirm:true — checked
+        // BEFORE the dom0 allow-list, so a present-but-unconfirmed body is rejected
+        // on the confirm gate, not the (empty) allow-list.
+        let no_confirm = r#"{"vbd":"ba5eba11","dom0":"10.0.0.1"}"#;
+        let r = build_reply("vdi-detach", Some(no_confirm));
+        assert!(r.contains("detach requires confirm:true"));
+        // confirm:false is also refused (fail-closed).
+        let false_confirm = r#"{"vbd":"ba5eba11","dom0":"10.0.0.1","confirm":false}"#;
+        assert!(build_reply("vdi-detach", Some(false_confirm)).contains("detach requires confirm"));
+        // With confirm:true the gate passes — it then falls to the dom0 allow-list
+        // (empty in test), proving the confirm check is no longer the blocker.
+        let confirmed = r#"{"vbd":"ba5eba11","dom0":"10.0.0.1","confirm":true}"#;
+        assert!(build_reply("vdi-detach", Some(confirmed)).contains("dom0 not in allowed set"));
     }
 }

@@ -76,6 +76,16 @@ pub struct DcRow {
     /// events carry `region`, e.g. `nyc3`). Empty for non-droplet resources. Shown
     /// in the unified IP/DNS view to correlate a public IP with its DO region.
     pub region: String,
+    /// DATACENTER-12 (Storage tab) — the SR uuid a VDI lives on (`vdi` events carry
+    /// `sr`). Empty for non-VDI resources. Correlates a VDI row to its SR card.
+    pub sr: String,
+    /// DATACENTER-12 (Storage tab) — the VM uuid a VDI is attached to (`vdi` events
+    /// carry `vm`). Empty when the VDI is unattached or for non-VDI resources.
+    pub vm: String,
+    /// DATACENTER-12 (Storage tab) — the VBD uuid attaching a VDI to its VM (`vdi`
+    /// events carry `vbd`). Empty when unattached; the detach handle the
+    /// `action/dc/vdi-detach` RPC passes.
+    pub vbd: String,
 }
 
 impl DcRow {
@@ -273,6 +283,21 @@ pub fn parse_dc_event(body: &str) -> Option<DcRow> {
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
+    let sr = v
+        .get("sr")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let vm = v
+        .get("vm")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let vbd = v
+        .get("vbd")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     Some(DcRow {
         kind,
         id,
@@ -289,6 +314,9 @@ pub fn parse_dc_event(body: &str) -> Option<DcRow> {
         load,
         ip,
         region,
+        sr,
+        vm,
+        vbd,
     })
 }
 
@@ -1191,6 +1219,21 @@ pub struct DatacenterPanel {
     /// value (parsed into `storage_threshold_pct` on change; kept as text so an
     /// in-progress empty box doesn't snap to 0). Pure UI state.
     pub storage_threshold_input: String,
+    /// DATACENTER-12 (Storage tab) — when `Some((vdi, vm_text))`, a VDI attach is
+    /// being collected: the VDI uuid being attached + the destination VM uuid the
+    /// operator is typing inline on that VDI's row. Only the row's "Attach" button
+    /// (with a non-empty VM) fires the `action/dc/vdi-attach` RPC. Cleared on
+    /// fire/cancel. Pure UI state (mirrors the VM-tab inline prompt).
+    pub vdi_attach: Option<(String, String)>,
+    /// DATACENTER-12 (Storage tab) — when `Some(vbd)`, a destructive VDI detach is
+    /// awaiting typed confirmation: that VDI's row renders a "Type DETACH to confirm"
+    /// prompt and only the confirm button (with the typed word matching) fires the
+    /// `action/dc/vdi-detach` RPC. Cleared on fire/cancel. Mirrors the Tofu-destroy
+    /// typed-confirm gate (destructive ops are typed-confirm gated).
+    pub vdi_detach_confirm: Option<String>,
+    /// DATACENTER-12 (Storage tab) — the in-progress text of the detach typed-confirm
+    /// box (must equal `DETACH` for the confirm button to fire). Pure UI state.
+    pub vdi_detach_input: String,
     /// DATACENTER-13 (Network tab) — the overlay routes read off `event/dc/route/*`.
     /// Rendered as the overlay peer/route table. Refreshed alongside `rows`.
     pub routes: Vec<RouteRow>,
@@ -1963,6 +2006,11 @@ impl Default for DatacenterPanel {
             snap_schedule: SnapScheduleForm::default(),
             storage_threshold_pct: 85,
             storage_threshold_input: "85".to_string(),
+            // Inline VDI attach/detach gates start unarmed — hydrated by a VDI
+            // row's Attach / Detach gesture.
+            vdi_attach: None,
+            vdi_detach_confirm: None,
+            vdi_detach_input: String::new(),
             // DATACENTER-13 (Network tab) — routes hydrate from the Bus on load; the
             // L2 read + VLAN-create form hydrate from operator gestures.
             routes: Vec::new(),
@@ -2405,6 +2453,45 @@ pub enum Message {
     },
     /// The `action/dc/sr-snapshot` RPC came back. `Ok` carries the new snapshot uuid.
     SrSnapshotDone(Result<String, String>),
+    /// DATACENTER-12 — a VDI row's "Attach" button: arms the inline VM-uuid prompt
+    /// for that VDI (no RPC yet — the operator types the destination VM, then the
+    /// row's Attach-confirm fires). `vdi` is the disk; `dom0` targets the host.
+    VdiAttachArm {
+        vdi: String,
+        dom0: String,
+    },
+    /// DATACENTER-12 — the inline VM-uuid being typed for the armed VDI attach.
+    VdiAttachVmChanged(String),
+    /// DATACENTER-12 — the armed VDI attach was confirmed: fires
+    /// `action/dc/vdi-attach` with the typed destination VM. `dom0` targets the host.
+    VdiAttachClicked {
+        vdi: String,
+        dom0: String,
+    },
+    /// DATACENTER-12 — the armed VDI attach was dismissed (no RPC fires).
+    VdiAttachCancel,
+    /// The `action/dc/vdi-attach` RPC came back. `Ok` carries the new VBD uuid.
+    VdiAttachDone(Result<String, String>),
+    /// DATACENTER-12 — a VDI row's "Detach" button: arms the typed-confirm gate for
+    /// that VDI's VBD (no RPC yet — detach is destructive, so it needs the typed
+    /// word). `vbd` is the connection to destroy; `dom0` targets the host.
+    VdiDetachArm {
+        vbd: String,
+        dom0: String,
+    },
+    /// DATACENTER-12 — the typed text of the detach confirm box (`DETACH` to enable).
+    VdiDetachInputChanged(String),
+    /// DATACENTER-12 — the typed-confirmed VDI detach fires `action/dc/vdi-detach`
+    /// (`vbd-unplug` + `vbd-destroy`; the VDI itself is preserved). `dom0` targets
+    /// the host.
+    VdiDetachClicked {
+        vbd: String,
+        dom0: String,
+    },
+    /// DATACENTER-12 — the armed VDI detach was dismissed (no RPC fires).
+    VdiDetachCancel,
+    /// The `action/dc/vdi-detach` RPC came back. `Ok` carries a status line.
+    VdiDetachDone(Result<String, String>),
     /// DATACENTER-12 — the scheduled-snapshot "Save schedule" button was clicked.
     /// Fires `action/dc/snap-schedule` (SR + retention + backup target). On the
     /// worker side the dr_scheduler/orchestrator honors the persisted schedule.
@@ -3555,6 +3642,102 @@ impl DatacenterPanel {
                 self.status = e;
                 Task::none()
             }
+            Message::VdiAttachArm { vdi, dom0: _ } => {
+                // Arm the inline VM-uuid prompt; the actual attach fires from the
+                // row's Attach-confirm once a destination VM is typed. Cancel any
+                // pending detach so only one VDI prompt is live.
+                self.vdi_attach = Some((vdi, String::new()));
+                self.vdi_detach_confirm = None;
+                self.status = "Type the destination VM uuid, then Attach.".into();
+                Task::none()
+            }
+            Message::VdiAttachVmChanged(vm) => {
+                if let Some((_, ref mut typed)) = self.vdi_attach {
+                    *typed = vm;
+                }
+                Task::none()
+            }
+            Message::VdiAttachClicked { vdi, dom0 } => {
+                let vm = self
+                    .vdi_attach
+                    .as_ref()
+                    .map(|(_, v)| v.trim().to_string())
+                    .unwrap_or_default();
+                if vm.is_empty() {
+                    self.status = "destination VM uuid is required".into();
+                    return Task::none();
+                }
+                self.vdi_attach = None;
+                self.status = "Attaching VDI…".into();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || vdi_attach(&vdi, &vm, &dom0))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("vdi-attach task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::VdiAttachDone(result)),
+                )
+            }
+            Message::VdiAttachCancel => {
+                self.vdi_attach = None;
+                self.status.clear();
+                Task::none()
+            }
+            Message::VdiAttachDone(Ok(s)) => {
+                self.status = format!("VDI attached (vbd {s})");
+                Task::none()
+            }
+            Message::VdiAttachDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
+            Message::VdiDetachArm { vbd, dom0: _ } => {
+                // Detach is destructive (drops the VM↔disk connection) → arm the
+                // typed-confirm gate; no RPC until `DETACH` is typed. Cancel any
+                // pending attach so only one VDI prompt is live.
+                self.vdi_detach_confirm = Some(vbd);
+                self.vdi_detach_input.clear();
+                self.vdi_attach = None;
+                self.status = "Type DETACH to confirm.".into();
+                Task::none()
+            }
+            Message::VdiDetachInputChanged(v) => {
+                self.vdi_detach_input = v;
+                Task::none()
+            }
+            Message::VdiDetachClicked { vbd, dom0 } => {
+                // Belt-and-suspenders: only fire when the typed word matches (the
+                // button is also disabled otherwise in the view).
+                if self.vdi_detach_input.trim() != "DETACH" {
+                    self.status = "Type DETACH to confirm the detach.".into();
+                    return Task::none();
+                }
+                self.vdi_detach_confirm = None;
+                self.vdi_detach_input.clear();
+                self.status = "Detaching VDI…".into();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || vdi_detach(&vbd, &dom0))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("vdi-detach task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::VdiDetachDone(result)),
+                )
+            }
+            Message::VdiDetachCancel => {
+                self.vdi_detach_confirm = None;
+                self.vdi_detach_input.clear();
+                self.status.clear();
+                Task::none()
+            }
+            Message::VdiDetachDone(Ok(s)) => {
+                self.status = s;
+                Task::none()
+            }
+            Message::VdiDetachDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
             Message::SnapScheduleClicked => {
                 let form = self.snap_schedule.clone();
                 self.status = "Saving snapshot schedule…".into();
@@ -4417,14 +4600,152 @@ impl DatacenterPanel {
             palette,
         );
         let actions = row![snapshot, vdi_here].spacing(f32::from(spacing::BASE[1]));
-        let card = column![
+        let mut card = column![
             header,
             text(label).colr(palette.text.into_cosmic_color()),
             text(capacity).colr(palette.text_muted.into_cosmic_color()),
             actions,
         ]
         .spacing(f32::from(spacing::BASE[2]));
+        // The SR's VDIs (the virtual disks on this store) with per-disk
+        // attach/detach. VDIs arrive on the Bus as `kind == "vdi"` rows carrying the
+        // owning `sr` uuid; match them to this card.
+        let vdis: Vec<&DcRow> = self
+            .rows
+            .iter()
+            .filter(|v| v.kind == "vdi" && v.sr == r.id)
+            .collect();
+        if !vdis.is_empty() {
+            card = card.push(text("Virtual disks").colr(palette.text_muted.into_cosmic_color()));
+            for v in vdis {
+                card = card.push(self.vdi_row_view(v, palette));
+            }
+        }
         self.storage_card(card.into(), palette)
+    }
+
+    /// DATACENTER-12 (Storage tab) — one VDI rendered under its SR card: the disk
+    /// name + size + attached-VM readout, plus Attach (to a typed VM) / Detach
+    /// (typed-confirm gated, since detach is destructive) actions firing the
+    /// `action/dc/vdi-{attach,detach}` RPCs. Carbon tokens only (§4).
+    fn vdi_row_view(&self, v: &DcRow, palette: Palette) -> Element<'_, crate::Message> {
+        let name = if v.name.is_empty() {
+            v.id.clone()
+        } else {
+            v.name.clone()
+        };
+        // Virtual size (bytes string) → a GiB readout; unknown when unparseable.
+        let size_gib = v.size.parse::<u64>().ok().map(|b| b / (1024 * 1024 * 1024));
+        let attach_state = if v.vm.is_empty() {
+            "unattached".to_string()
+        } else {
+            format!("attached → vm {}", v.vm)
+        };
+        let meta = match size_gib {
+            Some(g) => format!("{name} · {g} GiB · {attach_state}"),
+            None => format!("{name} · {attach_state}"),
+        };
+        let mut col = column![text(meta).colr(palette.text.into_cosmic_color())]
+            .spacing(f32::from(spacing::BASE[1]));
+
+        // An attached VDI offers Detach (its VBD); an unattached one offers Attach.
+        if v.vm.is_empty() {
+            // The typed VM uuid for THIS VDI's armed attach prompt, when armed.
+            let armed_typed_vm = self
+                .vdi_attach
+                .as_ref()
+                .filter(|(a, _)| a == &v.id)
+                .map(|(_, vm)| vm);
+            // Attach: arm the inline VM-uuid prompt, then confirm.
+            if let Some(typed_vm) = armed_typed_vm {
+                let vm_input = text_input("destination VM uuid", typed_vm)
+                    .on_input(|s| crate::Message::Datacenter(Message::VdiAttachVmChanged(s)));
+                let confirm = variant_button(
+                    "Attach".to_string(),
+                    ButtonVariant::Primary,
+                    // Only carries the message once a VM is typed.
+                    if typed_vm.trim().is_empty() {
+                        None
+                    } else {
+                        Some(crate::Message::Datacenter(Message::VdiAttachClicked {
+                            vdi: v.id.clone(),
+                            dom0: v.host.clone(),
+                        }))
+                    },
+                    palette,
+                );
+                let cancel = variant_button(
+                    "Cancel".to_string(),
+                    ButtonVariant::Secondary,
+                    Some(crate::Message::Datacenter(Message::VdiAttachCancel)),
+                    palette,
+                );
+                col = col.push(
+                    row![vm_input, confirm, cancel]
+                        .spacing(f32::from(spacing::BASE[1]))
+                        .align_y(cosmic::iced::alignment::Vertical::Center),
+                );
+            } else {
+                col = col.push(variant_button(
+                    "Attach".to_string(),
+                    ButtonVariant::Secondary,
+                    Some(crate::Message::Datacenter(Message::VdiAttachArm {
+                        vdi: v.id.clone(),
+                        dom0: v.host.clone(),
+                    })),
+                    palette,
+                ));
+            }
+        } else {
+            // Detach: typed-confirm gated (destructive — drops the VM↔disk link).
+            let armed =
+                self.vdi_detach_confirm.as_deref() == Some(v.vbd.as_str()) && !v.vbd.is_empty();
+            if armed {
+                let typed = text_input("type DETACH", &self.vdi_detach_input)
+                    .on_input(|s| crate::Message::Datacenter(Message::VdiDetachInputChanged(s)));
+                let confirm = variant_button(
+                    "Confirm detach".to_string(),
+                    ButtonVariant::Primary,
+                    if self.vdi_detach_input.trim() == "DETACH" {
+                        Some(crate::Message::Datacenter(Message::VdiDetachClicked {
+                            vbd: v.vbd.clone(),
+                            dom0: v.host.clone(),
+                        }))
+                    } else {
+                        None
+                    },
+                    palette,
+                );
+                let cancel = variant_button(
+                    "Cancel".to_string(),
+                    ButtonVariant::Secondary,
+                    Some(crate::Message::Datacenter(Message::VdiDetachCancel)),
+                    palette,
+                );
+                col = col.push(
+                    row![typed, confirm, cancel]
+                        .spacing(f32::from(spacing::BASE[1]))
+                        .align_y(cosmic::iced::alignment::Vertical::Center),
+                );
+            } else {
+                // Only an attached VDI with a known VBD can be detached.
+                let msg = if v.vbd.is_empty() {
+                    None
+                } else {
+                    Some(crate::Message::Datacenter(Message::VdiDetachArm {
+                        vbd: v.vbd.clone(),
+                        dom0: v.host.clone(),
+                    }))
+                };
+                col = col.push(variant_button(
+                    "Detach".to_string(),
+                    ButtonVariant::Secondary,
+                    msg,
+                    palette,
+                ));
+            }
+        }
+        col.into()
     }
 
     /// DATACENTER-12 — the shared bordered-surface container the Storage tab's
@@ -8184,6 +8505,41 @@ fn vdi_create(form: &VdiCreateForm) -> Result<String, String> {
     Err(format!("unexpected vdi-create reply: {v}"))
 }
 
+/// DATACENTER-12 — fire `action/dc/vdi-attach` to attach a VDI to a VM (the worker
+/// runs `vbd-create` + `vbd-plug`). `{"ok":true,"vbd":..}` → the new VBD uuid.
+fn vdi_attach(vdi: &str, vm: &str, dom0: &str) -> Result<String, String> {
+    if dom0.trim().is_empty() {
+        return Err("this VDI has no host to attach on".into());
+    }
+    if vm.trim().is_empty() {
+        return Err("destination VM uuid is required".into());
+    }
+    let body = serde_json::json!({ "vdi": vdi, "vm": vm.trim(), "dom0": dom0 }).to_string();
+    let v = dc_rpc("vdi-attach", &body, Duration::from_secs(120))?;
+    if let Some(vbd) = v.get("vbd").and_then(serde_json::Value::as_str) {
+        return Ok(vbd.to_string());
+    }
+    Err(format!("unexpected vdi-attach reply: {v}"))
+}
+
+/// DATACENTER-12 — fire the destructive `action/dc/vdi-detach` (the worker runs
+/// `vbd-unplug` + `vbd-destroy`; the VDI itself is preserved). The typed-confirm
+/// gate is enforced in the panel before this is called. `{"ok":true}` → a status
+/// line.
+fn vdi_detach(vbd: &str, dom0: &str) -> Result<String, String> {
+    if dom0.trim().is_empty() {
+        return Err("this VDI has no host to detach on".into());
+    }
+    // Destructive: the worker fails closed unless `confirm:true` (the panel's
+    // typed-confirm gate has already passed by the time this is called).
+    let body = serde_json::json!({ "vbd": vbd, "dom0": dom0, "confirm": true }).to_string();
+    let v = dc_rpc("vdi-detach", &body, Duration::from_secs(120))?;
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok("VDI detached".to_string());
+    }
+    Err(format!("unexpected vdi-detach reply: {v}"))
+}
+
 /// DATACENTER-12 — fire `action/dc/sr-snapshot` for a whole SR (every VDI on the
 /// store; the worker loops them). `{"ok":true,"snapshot":..}` → the count line.
 fn sr_snapshot(sr: &str, dom0: &str) -> Result<String, String> {
@@ -9192,6 +9548,122 @@ mod tests {
         });
         assert_eq!(p.vdi_create.sr, "sr-9");
         assert_eq!(p.vdi_create.dom0, "172.20.0.9");
+    }
+
+    /// A `vdi` row for the storage-tab attach/detach tests.
+    fn vdi_row(id: &str, sr: &str, vm: &str, vbd: &str) -> DcRow {
+        DcRow {
+            kind: "vdi".into(),
+            id: id.into(),
+            name: id.into(),
+            sr: sr.into(),
+            vm: vm.into(),
+            vbd: vbd.into(),
+            size: "42949672960".into(),
+            host: "172.20.0.9".into(),
+            zone: "dev".into(),
+            ..DcRow::default()
+        }
+    }
+
+    #[test]
+    fn vdi_attach_arm_type_and_cancel() {
+        let mut p = DatacenterPanel::new();
+        // Arm the inline VM prompt for an unattached VDI.
+        let _ = p.update(Message::VdiAttachArm {
+            vdi: "v1".into(),
+            dom0: "172.20.0.9".into(),
+        });
+        assert_eq!(p.vdi_attach.as_ref().map(|(v, _)| v.as_str()), Some("v1"));
+        // Type a destination VM.
+        let _ = p.update(Message::VdiAttachVmChanged("vm-7".into()));
+        assert_eq!(p.vdi_attach.as_ref().map(|(_, m)| m.as_str()), Some("vm-7"));
+        // Cancel clears the prompt without firing.
+        let _ = p.update(Message::VdiAttachCancel);
+        assert!(p.vdi_attach.is_none());
+    }
+
+    #[test]
+    fn vdi_detach_is_typed_confirm_gated() {
+        let mut p = DatacenterPanel::new();
+        // Arm the detach typed-confirm for an attached VDI's VBD.
+        let _ = p.update(Message::VdiDetachArm {
+            vbd: "vbd-3".into(),
+            dom0: "172.20.0.9".into(),
+        });
+        assert_eq!(p.vdi_detach_confirm.as_deref(), Some("vbd-3"));
+        // The wrong word does NOT clear the gate (the click is a no-op fire).
+        let _ = p.update(Message::VdiDetachInputChanged("nope".into()));
+        let _ = p.update(Message::VdiDetachClicked {
+            vbd: "vbd-3".into(),
+            dom0: "172.20.0.9".into(),
+        });
+        // Still armed — the typed word didn't match, so nothing fired.
+        assert_eq!(p.vdi_detach_confirm.as_deref(), Some("vbd-3"));
+        // Cancel clears the gate.
+        let _ = p.update(Message::VdiDetachCancel);
+        assert!(p.vdi_detach_confirm.is_none());
+        assert!(p.vdi_detach_input.is_empty());
+    }
+
+    #[test]
+    fn arming_attach_clears_detach_and_vice_versa() {
+        let mut p = DatacenterPanel::new();
+        // Arm detach, then arm attach → only one VDI prompt live at a time.
+        let _ = p.update(Message::VdiDetachArm {
+            vbd: "vbd-3".into(),
+            dom0: "172.20.0.9".into(),
+        });
+        let _ = p.update(Message::VdiAttachArm {
+            vdi: "v2".into(),
+            dom0: "172.20.0.9".into(),
+        });
+        assert!(p.vdi_detach_confirm.is_none());
+        assert!(p.vdi_attach.is_some());
+        // And the reverse: arming detach clears the attach prompt.
+        let _ = p.update(Message::VdiDetachArm {
+            vbd: "vbd-9".into(),
+            dom0: "172.20.0.9".into(),
+        });
+        assert!(p.vdi_attach.is_none());
+        assert_eq!(p.vdi_detach_confirm.as_deref(), Some("vbd-9"));
+    }
+
+    #[test]
+    fn storage_view_renders_sr_card_with_its_vdis() {
+        let mut p = DatacenterPanel::new();
+        // An SR plus two of its VDIs — one attached (Detach), one not (Attach).
+        p.rows = vec![
+            sr_row("sr-1", "222330230784", "42949672960"),
+            vdi_row("v-attached", "sr-1", "vm-7", "vbd-3"),
+            vdi_row("v-free", "sr-1", "", ""),
+        ];
+        p.view_mode = ViewMode::Storage;
+        // Renders without panic — the VDI list + per-disk actions are reachable.
+        let _ = p.view();
+        // With a detach armed, the typed-confirm path renders too.
+        let _ = p.update(Message::VdiDetachArm {
+            vbd: "vbd-3".into(),
+            dom0: "172.20.0.9".into(),
+        });
+        let _ = p.view();
+        // And the attach-armed path.
+        let _ = p.update(Message::VdiAttachArm {
+            vdi: "v-free".into(),
+            dom0: "172.20.0.9".into(),
+        });
+        let _ = p.update(Message::VdiAttachVmChanged("vm-9".into()));
+        let _ = p.view();
+    }
+
+    #[test]
+    fn parse_dc_event_reads_a_vdi_attachment() {
+        let body = r#"{"kind":"vdi","id":"v1","name":"disk0","sr":"sr-9","size":"42949672960","vbd":"vbd-7","vm":"vm-3","host":"172.20.0.9","zone":"dev"}"#;
+        let r = parse_dc_event(body).unwrap();
+        assert_eq!(r.kind, "vdi");
+        assert_eq!(r.sr, "sr-9");
+        assert_eq!(r.vbd, "vbd-7");
+        assert_eq!(r.vm, "vm-3");
     }
 
     #[test]
