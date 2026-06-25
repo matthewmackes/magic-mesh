@@ -86,6 +86,10 @@ pub struct DcRow {
     /// events carry `vbd`). Empty when unattached; the detach handle the
     /// `action/dc/vdi-detach` RPC passes.
     pub vbd: String,
+    /// DATACENTER-12 (Storage tab) — a `template`'s name-description (`template`
+    /// events carry `description`, e.g. the guest-OS summary). Empty for resources
+    /// without one. Shown in the image-library row's detail column.
+    pub description: String,
 }
 
 impl DcRow {
@@ -149,6 +153,35 @@ impl DcRow {
         )]
         let pct = ((used as f64 / size as f64) * 100.0).round() as u64;
         Some(pct.min(100))
+    }
+
+    /// DATACENTER-12 — the image-library row's detail column. An `iso` row shows
+    /// its size (the `size` bytes string rendered human-readable, e.g. `"1.4 GiB"`);
+    /// a `template` row shows its `description`. Empty when there's nothing to show
+    /// (an ISO with no readable size, a template with no description) so the row
+    /// renders a blank detail rather than a bogus value. Pure + testable.
+    #[must_use]
+    pub fn image_detail(&self) -> String {
+        if self.kind == "iso" {
+            let bytes: u64 = match self.size.trim().parse() {
+                Ok(b) if b > 0 => b,
+                _ => return String::new(),
+            };
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+            if gib >= 1.0 {
+                format!("{gib:.1} GiB")
+            } else {
+                let mib = bytes as f64 / (1024.0 * 1024.0);
+                format!("{mib:.0} MiB")
+            }
+        } else {
+            self.description.clone()
+        }
     }
 
     /// DATACENTER-10 — a host's memory readout, `"used / total GiB (pct%)"`, from
@@ -298,6 +331,11 @@ pub fn parse_dc_event(body: &str) -> Option<DcRow> {
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
+    let description = v
+        .get("description")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     Some(DcRow {
         kind,
         id,
@@ -317,6 +355,7 @@ pub fn parse_dc_event(body: &str) -> Option<DcRow> {
         sr,
         vm,
         vbd,
+        description,
     })
 }
 
@@ -7917,9 +7956,10 @@ fn audit_row_view(entry: &AuditRow) -> Element<'_, crate::Message> {
 }
 
 /// DATACENTER-12 (Storage tab) — render one image-library row (an ISO or a
-/// template) as a labeled line: kind · name · status. Read-only — the library
-/// absorbs the old `images` view; an Import flow lands when a source emits the
-/// catalog. Carbon tokens only (§4).
+/// template) as a labeled line: kind · name · detail, where the detail is the
+/// ISO's human size or the template's description ([`DcRow::image_detail`]).
+/// Read-only — the library absorbs the old `images` view; an Import flow lands
+/// when a source emits the catalog. Carbon tokens only (§4).
 fn image_row_view<'a>(r: &DcRow, palette: Palette) -> Element<'a, crate::Message> {
     let label = if r.name.is_empty() {
         r.id.clone()
@@ -7934,7 +7974,7 @@ fn image_row_view<'a>(r: &DcRow, palette: Palette) -> Element<'a, crate::Message
         text(label)
             .colr(palette.text.into_cosmic_color())
             .width(Length::FillPortion(3)),
-        text(r.status.clone())
+        text(r.image_detail())
             .colr(palette.text_muted.into_cosmic_color())
             .width(Length::FillPortion(2)),
     ]
@@ -9664,6 +9704,91 @@ mod tests {
         assert_eq!(r.sr, "sr-9");
         assert_eq!(r.vbd, "vbd-7");
         assert_eq!(r.vm, "vm-3");
+    }
+
+    #[test]
+    fn parse_dc_event_reads_an_iso_and_template() {
+        // DATACENTER-12 — the image-library events the gather now emits parse into
+        // `iso` / `template` rows, and `image_detail` renders the right column:
+        // a human size for the ISO, the description for the template.
+        let iso = parse_dc_event(
+            r#"{"kind":"iso","id":"i1","name":"AlmaLinux-9.5.iso","sr":"iso-sr-a","size":"1503657984","host":"172.20.0.9","zone":"dev"}"#,
+        )
+        .unwrap();
+        assert_eq!(iso.kind, "iso");
+        assert_eq!(iso.name, "AlmaLinux-9.5.iso");
+        assert_eq!(iso.sr, "iso-sr-a");
+        assert_eq!(iso.size, "1503657984");
+        assert_eq!(iso.image_detail(), "1.4 GiB");
+
+        let tpl = parse_dc_event(
+            r#"{"kind":"template","id":"t1","name":"AlmaLinux 9","description":"minimal install","zone":"dev"}"#,
+        )
+        .unwrap();
+        assert_eq!(tpl.kind, "template");
+        assert_eq!(tpl.name, "AlmaLinux 9");
+        assert_eq!(tpl.description, "minimal install");
+        assert_eq!(tpl.image_detail(), "minimal install");
+    }
+
+    #[test]
+    fn image_detail_handles_sub_gib_and_missing_values() {
+        // A sub-GiB ISO is shown in MiB; an ISO with no readable size and a
+        // template with no description both render a blank detail (no bogus value).
+        let small = DcRow {
+            kind: "iso".into(),
+            size: "658505728".into(), // ~628 MiB
+            ..DcRow::default()
+        };
+        assert_eq!(small.image_detail(), "628 MiB");
+        let no_size = DcRow {
+            kind: "iso".into(),
+            size: String::new(),
+            ..DcRow::default()
+        };
+        assert_eq!(no_size.image_detail(), "");
+        let no_desc = DcRow {
+            kind: "template".into(),
+            description: String::new(),
+            ..DcRow::default()
+        };
+        assert_eq!(no_desc.image_detail(), "");
+    }
+
+    #[test]
+    fn storage_view_renders_populated_image_library() {
+        // DATACENTER-12 — with `iso`/`template` rows present, the Storage tab's
+        // image-library section renders them (builds without panic) instead of the
+        // empty state.
+        let mut p = DatacenterPanel::new();
+        p.rows = vec![
+            DcRow {
+                kind: "iso".into(),
+                id: "i1".into(),
+                name: "AlmaLinux-9.5.iso".into(),
+                sr: "iso-sr-a".into(),
+                size: "1503657984".into(),
+                zone: "dev".into(),
+                ..DcRow::default()
+            },
+            DcRow {
+                kind: "template".into(),
+                id: "t1".into(),
+                name: "AlmaLinux 9".into(),
+                description: "minimal install".into(),
+                zone: "dev".into(),
+                ..DcRow::default()
+            },
+        ];
+        p.view_mode = ViewMode::Storage;
+        let _ = p.view();
+        // Both image kinds survive the library filter.
+        let images: Vec<&DcRow> = p
+            .rows
+            .iter()
+            .filter(|r| (r.kind == "iso" || r.kind == "template") && r.matches_filter(&p.filter))
+            .collect();
+        assert_eq!(images.len(), 2);
     }
 
     #[test]

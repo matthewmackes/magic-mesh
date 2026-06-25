@@ -576,6 +576,86 @@ pub fn parse_xe_vdis(output: &str) -> Vec<Vdi> {
         .collect()
 }
 
+/// DATACENTER-12 — one bootable image in the library: an ISO/CD VDI living on an
+/// ISO-type SR. The `size` is the raw `xe` `virtual-size` string (bytes); the `sr`
+/// correlates it to its SR card. Mirrors the lighter-weight half of [`Vdi`] (the
+/// image library only needs the catalog, not the attach handles).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Iso {
+    /// The ISO VDI uuid.
+    pub uuid: String,
+    /// The ISO's name-label (e.g. `"AlmaLinux-9.5-x86_64-minimal.iso"`).
+    pub name: String,
+    /// The uuid of the ISO SR this image lives on.
+    pub sr: String,
+    /// The ISO's size in bytes (the raw `xe` `virtual-size` string; empty when
+    /// unknown).
+    pub size: String,
+}
+
+/// Parse the ISO gather's pipe-delimited `uuid|name|sr-uuid|virtual-size` lines
+/// into [`Iso`]s.
+///
+/// Pure — fed the raw stdout. Skips lines with an empty uuid (mirrors
+/// [`parse_xe_vdis`]); a missing trailing field defaults to empty.
+#[must_use]
+pub fn parse_xe_isos(output: &str) -> Vec<Iso> {
+    output
+        .lines()
+        .filter_map(|l| {
+            let mut p = l.splitn(4, '|');
+            let uuid = p.next()?.trim();
+            if uuid.is_empty() {
+                return None;
+            }
+            Some(Iso {
+                uuid: uuid.to_string(),
+                name: p.next().unwrap_or("").trim().to_string(),
+                sr: p.next().unwrap_or("").trim().to_string(),
+                size: p.next().unwrap_or("").trim().to_string(),
+            })
+        })
+        .collect()
+}
+
+/// DATACENTER-12 — one VM template in the library. The `desc` is the template's
+/// `name-description` (often a one-line summary of the guest OS), empty when the
+/// template has none.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Tpl {
+    /// The template uuid.
+    pub uuid: String,
+    /// The template's name-label (e.g. `"AlmaLinux 9"`).
+    pub name: String,
+    /// The template's name-description, or empty when it has none.
+    pub desc: String,
+}
+
+/// Parse the template gather's pipe-delimited `uuid|name|description` lines into
+/// [`Tpl`]s.
+///
+/// Pure — fed the raw stdout. Skips lines with an empty uuid (mirrors
+/// [`parse_xe_vdis`]); a missing description defaults to empty. The description is
+/// `splitn(3, '|')`-tolerant so a `|` inside the description text is preserved.
+#[must_use]
+pub fn parse_xe_templates(output: &str) -> Vec<Tpl> {
+    output
+        .lines()
+        .filter_map(|l| {
+            let mut p = l.splitn(3, '|');
+            let uuid = p.next()?.trim();
+            if uuid.is_empty() {
+                return None;
+            }
+            Some(Tpl {
+                uuid: uuid.to_string(),
+                name: p.next().unwrap_or("").trim().to_string(),
+                desc: p.next().unwrap_or("").trim().to_string(),
+            })
+        })
+        .collect()
+}
+
 /// Parse the remote `xe` network helper's pipe-delimited `uuid|name|bridge`
 /// lines into `(uuid, name, bridge)` triples. Pure — fed the raw stdout. Skips
 /// lines with an empty uuid (mirrors [`parse_xe_srs`]).
@@ -787,6 +867,40 @@ fn gather_xen() -> Vec<DcResource> {
                 })
                 .to_string();
                 out.push(DcResource::new("vdi", vdi.uuid.clone(), sig));
+            }
+        }
+        // DATACENTER-12 — ISO/CD library: the VDIs living on ISO-type SRs (the
+        // bootable install media). Reuses the SR→VDI `$u|$(…)` idiom: enumerate the
+        // ISO SRs (`type=iso`), then each SR's VDIs, one
+        // `uuid|name|sr-uuid|virtual-size` line per image. Published as
+        // `kind == "iso"` → `event/dc/iso/<uuid>` for the panel's image library.
+        let iso_script = "for sr in $(xe sr-list type=iso params=uuid --minimal | tr , ' '); \
+             do for u in $(xe vdi-list sr-uuid=$sr params=uuid --minimal | tr , ' '); \
+             do echo \"$u|$(xe vdi-param-get uuid=$u param-name=name-label)|$sr|$(xe vdi-param-get uuid=$u param-name=virtual-size)\"; done; done";
+        if let Some(isoout) = route.run(&key, iso_script) {
+            for iso in parse_xe_isos(&isoout) {
+                let sig = serde_json::json!({
+                    "kind": "iso", "id": iso.uuid, "name": iso.name, "sr": iso.sr,
+                    "size": iso.size, "host": dom0, "zone": "dev"
+                })
+                .to_string();
+                out.push(DcResource::new("iso", iso.uuid.clone(), sig));
+            }
+        }
+        // DATACENTER-12 — VM template library: the install templates the new-VM
+        // flow clones from. One `uuid|name|description` line per template (the
+        // description often names the guest OS). Published as `kind == "template"`
+        // → `event/dc/template/<uuid>` for the panel's image library.
+        let tpl_script = "for u in $(xe template-list params=uuid --minimal | tr , ' '); \
+             do echo \"$u|$(xe template-param-get uuid=$u param-name=name-label)|$(xe template-param-get uuid=$u param-name=name-description)\"; done";
+        if let Some(tplout) = route.run(&key, tpl_script) {
+            for tpl in parse_xe_templates(&tplout) {
+                let sig = serde_json::json!({
+                    "kind": "template", "id": tpl.uuid, "name": tpl.name,
+                    "description": tpl.desc, "host": dom0, "zone": "dev"
+                })
+                .to_string();
+                out.push(DcResource::new("template", tpl.uuid.clone(), sig));
             }
         }
         // Networks (bridges) → network visibility (DC-13).
@@ -1410,6 +1524,103 @@ mod tests {
         assert_eq!(vdis[1].uuid, "v2");
         assert_eq!(vdis[1].vbd, "");
         assert_eq!(vdis[1].vm, "");
+    }
+
+    // ---- DATACENTER-12: ISO + template image library ---------------------------
+
+    #[test]
+    fn parse_xe_isos_reads_well_formed_and_skips_malformed() {
+        // Two well-formed ISO lines (one on each of two ISO SRs) + a malformed
+        // empty-uuid line that must be skipped.
+        let out = "i1|AlmaLinux-9.5-minimal.iso|iso-sr-a|1503657984\n\
+                   i2|debian-12.iso|iso-sr-b|658505728\n\
+                   |skip-empty-uuid||\n";
+        let isos = parse_xe_isos(out);
+        assert_eq!(isos.len(), 2); // empty-uuid line skipped
+        assert_eq!(isos[0].uuid, "i1");
+        assert_eq!(isos[0].name, "AlmaLinux-9.5-minimal.iso");
+        assert_eq!(isos[0].sr, "iso-sr-a");
+        assert_eq!(isos[0].size, "1503657984");
+        assert_eq!(isos[1].uuid, "i2");
+        assert_eq!(isos[1].sr, "iso-sr-b");
+        // A truncated line (missing size) defaults the trailing field to empty
+        // rather than dropping the row.
+        let partial = parse_xe_isos("i3|win.iso|iso-sr-a\n");
+        assert_eq!(partial.len(), 1);
+        assert_eq!(partial[0].size, "");
+    }
+
+    #[test]
+    fn parse_xe_templates_reads_well_formed_and_skips_malformed() {
+        // A template with a description, one without (trailing empty), and a
+        // malformed empty-uuid line that must be skipped.
+        let out = "t1|AlmaLinux 9|AlmaLinux 9 minimal install template\n\
+                   t2|Blank template|\n\
+                   |skip-empty-uuid|x\n";
+        let tpls = parse_xe_templates(out);
+        assert_eq!(tpls.len(), 2); // empty-uuid line skipped
+        assert_eq!(tpls[0].uuid, "t1");
+        assert_eq!(tpls[0].name, "AlmaLinux 9");
+        assert_eq!(tpls[0].desc, "AlmaLinux 9 minimal install template");
+        // No description → empty desc, still a valid row.
+        assert_eq!(tpls[1].uuid, "t2");
+        assert_eq!(tpls[1].desc, "");
+        // A `|` inside the description is preserved (splitn(3) keeps the tail).
+        let piped = parse_xe_templates("t3|CentOS|stream | 9 base\n");
+        assert_eq!(piped[0].desc, "stream | 9 base");
+    }
+
+    #[test]
+    fn iso_gather_projects_to_event_dc_iso_topic() {
+        // Mirror the gather's `Iso → DcResource` projection (the pure half of the
+        // gather, with the live SSH elided), then run it through the real reconcile
+        // path so the asserted topic is the one the Bus actually sees:
+        // `event/dc/iso/<uuid>`, body carrying kind/name/sr/size for the library.
+        let iso = parse_xe_isos("i1|AlmaLinux-9.5.iso|iso-sr-a|1503657984\n")
+            .into_iter()
+            .next()
+            .unwrap();
+        let sig = serde_json::json!({
+            "kind": "iso", "id": iso.uuid, "name": iso.name, "sr": iso.sr,
+            "size": iso.size, "host": "172.20.0.9", "zone": "dev"
+        })
+        .to_string();
+        let r = DcResource::new("iso", iso.uuid.clone(), sig);
+        let mut orch = DatacenterOrchestrator::new();
+        let events = orch.reconcile(std::slice::from_ref(&r));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].topic(), "event/dc/iso/i1");
+        let v: serde_json::Value = serde_json::from_str(&events[0].body()).unwrap();
+        assert_eq!(v["kind"], "iso");
+        assert_eq!(v["name"], "AlmaLinux-9.5.iso");
+        assert_eq!(v["sr"], "iso-sr-a");
+        assert_eq!(v["size"], "1503657984");
+        assert_eq!(v["zone"], "dev");
+    }
+
+    #[test]
+    fn template_gather_projects_to_event_dc_template_topic() {
+        // Mirror the gather's `Tpl → DcResource` projection through the reconcile
+        // path: topic `event/dc/template/<uuid>`, body kind/name/description.
+        let tpl = parse_xe_templates("t1|AlmaLinux 9|minimal install\n")
+            .into_iter()
+            .next()
+            .unwrap();
+        let sig = serde_json::json!({
+            "kind": "template", "id": tpl.uuid, "name": tpl.name,
+            "description": tpl.desc, "host": "172.20.0.9", "zone": "dev"
+        })
+        .to_string();
+        let r = DcResource::new("template", tpl.uuid.clone(), sig);
+        let mut orch = DatacenterOrchestrator::new();
+        let events = orch.reconcile(std::slice::from_ref(&r));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].topic(), "event/dc/template/t1");
+        let v: serde_json::Value = serde_json::from_str(&events[0].body()).unwrap();
+        assert_eq!(v["kind"], "template");
+        assert_eq!(v["name"], "AlmaLinux 9");
+        assert_eq!(v["description"], "minimal install");
+        assert_eq!(v["zone"], "dev");
     }
 
     // ---- DATACENTER-12: SR capacity-threshold alert ----------------------------
