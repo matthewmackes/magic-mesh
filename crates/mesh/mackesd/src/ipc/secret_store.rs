@@ -82,6 +82,21 @@ pub fn xcp_creds_ref(host: &str) -> String {
     format!("xcp/{safe}")
 }
 
+/// FRONTDOOR-9 — derive the secret-store key for the Copilot codex API key.
+///
+/// The `copilot/` prefix namespaces the AI backend's credential alongside the
+/// `vpn/` tunnel creds and `xcp/` dom0 creds (and the bare datacenter secrets
+/// `do-token`, `xapi-password`, …) that share the store. The codex worker runs
+/// LEADER-only, so only the elected node ever resolves this and shells codex —
+/// the key is sealed in the mesh `age`+etcd store and read back on demand.
+///
+/// Pure + stable: this string IS the on-disk / etcd key, so a change orphans the
+/// stored credential (rotation is "set once" per the design Q93 lock).
+#[must_use]
+pub fn codex_creds_ref() -> String {
+    "copilot/codex-api-key".to_string()
+}
+
 /// A keyed, encrypted, distribution-capable secret store. Both backends do real
 /// encryption; the choice is driven by what the node can reach (see
 /// [`SecretStore::resolve`]).

@@ -6125,6 +6125,29 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("leader_election".into());
 
+        // FRONTDOOR-9 — the Copilot codex backend. Spawned on every node so
+        // failover is seamless, but LEADER-gated (Q73): only the elected node
+        // (the one renewed by `leader_election` above on the shared QNM-Shared
+        // lock) drains `action/copilot/ask`, reads the sealed codex API key from
+        // the mesh secret-store, runs `codex exec` per ask (external dependency,
+        // pulled at runtime — Q100), and replies on `reply/<ulid>`. ASK/SUGGEST
+        // ONLY (§9): it spawns the AI subprocess itself but never executes OS
+        // actions on the operator's behalf — typed/audited actions are the
+        // separate FRONTDOOR-11 worker. Degrades gracefully (logs + an "AI
+        // unavailable" reply, never a panic) when codex/key/network is down, so
+        // the rest of the Front Door keeps working (Q33).
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::copilot::CopilotWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("copilot".into());
+
         // PRINT-2..PRINT-6 + PRINT-8 (v5.0.0) — auto CUPS print
         // sharing + sync. Spawned on headless + full; SKIPPED on
         // lighthouse (routing-only, no printers — Q8 lock). The

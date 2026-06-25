@@ -1981,7 +1981,7 @@ clean+reachable smoke); visual gate lifted.
     - [ ] live topology + per-node health; one-click join/drain/restart/cutover-helpers
     - [ ] provision/destroy nodes drives the tofu/autoscaler with the operator-gated apply
 
-- [ ] **FRONTDOOR-9: the mackesd `copilot` worker (codex backend).**
+- [✓] **FRONTDOOR-9: the mackesd `copilot` worker (codex backend).**
   **As** an operator, **I want** an AI service in the mesh,
   **so that** Copilot can see and act on the whole system.
   **Acceptance**:

@@ -471,6 +471,13 @@ pub mod peer_cap;
 // replicated directory) and publishes a `LighthouseProbe` to
 // `compute/lighthouse-probe/<name>`. The Workbench Lighthouses tab renders it.
 pub mod lighthouse_probe;
+// FRONTDOOR-9 (2026-06-25) — the Copilot codex backend. A LEADER-only worker
+// that drains `action/copilot/ask`, reads the sealed codex API key from the
+// mesh secret-store, runs `codex exec` (external, pulled at runtime) per ask,
+// and replies on `reply/<ulid>`. ASK/SUGGEST only — it spawns the AI subprocess
+// itself but never executes OS actions on the operator's behalf (§9; typed
+// actions are FRONTDOOR-11). Degrades gracefully when codex/key/network is down.
+pub mod copilot;
 
 /// Every worker registered with the supervisor implements this
 /// trait. The trait is `async_trait` because the supervisor stores
