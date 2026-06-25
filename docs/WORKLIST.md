@@ -1664,7 +1664,7 @@ fleet/host machines, not via an AI.
 - [✓] **FARM-AUTO-3: etcd work-queue + builder agents (pull) + pool autoscaler.** **Acceptance:** agents lease jobs from etcd, build, ack; the pool-manager scales VMs to queue depth.
 - [✓] **FARM-AUTO-4: declarative GitOps reconciler.** **Acceptance:** a systemd-timer converges the worklist's active `@farm` jobs onto the farm idempotently; results committed back.
 - [✓] **FARM-AUTO-5: Provisioning-plane controller + Workbench Build panel.** **Acceptance:** the panel queues worklist tasks to the farm + streams live status off the Bus.
-- [!] **FARM-AUTO-PROD: production build jobs (real crates, fleet-driven).** @farm:{cargo build -p mackesd --features async-services} @farm:{cargo build -p mde-workbench} @farm:{cargo test -p mde-bus} @farm:{cargo test -p mde-theme} @farm:{cargo build -p mde-files}
+- [>] **FARM-AUTO-PROD: production build jobs (real crates, fleet-driven).** @farm:{cargo build -p mackesd --features async-services} @farm:{cargo build -p mde-workbench} @farm:{cargo test -p mde-bus} @farm:{cargo test -p mde-theme} @farm:{cargo build -p mde-files}
 
 ## BUILD-PLATFORM — fast builds, least AI tokens, internal e2e/feature/stability (design: docs/design/build-platform.md; locked 2026-06-22)
 The platform to turn worklist → signed RPM fast + cheap: reconciler-on-timer is the
