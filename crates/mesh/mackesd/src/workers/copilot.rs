@@ -44,6 +44,39 @@
 //! Code/config editing (Q52/Q53 diff→apply→git) is the remaining, more sensitive
 //! FD-12 piece and is deliberately NOT implemented in this cut.
 //!
+//! ## FRONTDOOR-10 — a status topic + the proactive suggestion engine (this cut)
+//!
+//! FD-10 adds two PROACTIVE, propose-only increments on top of the FD-9/12
+//! request/reply path — both reusing this worker's grounding, codex invocation,
+//! proposal typing, leader gating, and `!Sync`-safe phasing rather than
+//! reinventing any of it:
+//!
+//! 1. **Status topic (Q33/Q7).** On a CHEAP cadence the worker publishes a compact
+//!    [`CopilotStatus`] to [`STATUS_TOPIC`] (`state/copilot/status`) — `available`
+//!    + `leader` + a coarse [`CopilotState`] (`ready`/`thinking`/`offline`) + the
+//!    model + a last-activity stamp. The Front Door's Copilot tile (FD-4 left it a
+//!    plain launcher because NO topic existed) can finally render "ready"/
+//!    "thinking"/"offline" off this. It's a cheap leader check + a secret-store
+//!    presence probe + one bus write — no codex spawn.
+//!
+//! 2. **Proactive engine (Q7/Q9/Q61).** On a MODERATE timer (every few minutes,
+//!    LEADER-ONLY), the worker assembles the SAME bounded mesh context FD-12 grounds
+//!    asks with ([`CopilotWorker::assemble_mesh_context`]), asks codex (the FAST
+//!    tier — Q87) for a SMALL RANKED set of HIGH-IMPACT, HIGH-CONFIDENCE ops
+//!    suggestions ONLY, parses them into typed [`Suggestion`]s (each optionally
+//!    carrying an FD-12 [`ActionProposal`] via [`extract_proposal`]), and publishes
+//!    the ranked set to [`SUGGESTIONS_TOPIC`] (`action/copilot/suggestions`) for the
+//!    FD-10 GUI half to render inline on the relevant tile later. Moderate cadence
+//!    + high-confidence-only so the operator is not spammed (Q61). Graceful degrade:
+//!    no codex/key → status `offline`, no suggestions published.
+//!
+//! §9 holds across BOTH: suggestions are PROPOSALS — typed actions ride the same
+//! FD-11-allowlisted [`ActionProposal`] path and are NEVER executed here, NEVER
+//! published to FD-11's execution topic. No executor is added; the only process
+//! spawn remains the codex subprocess. The proactive codex call is kept OUT of any
+//! `!Sync` borrow across `.await`, mirroring FD-12's sync-collect → async-codex →
+//! sync-write phasing.
+//!
 //! ## Governance — PROPOSE/SUGGEST only, NEVER execute (`AI_GOVERNANCE` §9)
 //!
 //! Remote OS execution on the mesh is typed verbs + signed job bundles ONLY;
@@ -96,6 +129,54 @@ pub const ACTION_TOPIC: &str = "action/copilot/ask";
 /// the canonical `action/<domain>/<verb>` namespace so the GUI drains it via the
 /// standard RPC reader.
 pub const PROPOSAL_TOPIC: &str = "action/copilot/proposal";
+
+/// Bus topic the copilot PUBLISHES its compact STATUS to (FD-10 §1).
+///
+/// Lives in the `state/` namespace (current-state, not a command or an event) so
+/// the Front Door's Copilot tile reads the latest snapshot the same way other
+/// tiles read live state. FD-4 left that tile a plain launcher because NO topic
+/// existed — this is the topic that unblocks it. The status is cheap to compute
+/// (a leader check + a secret-store presence probe) and is written on its own
+/// cheap cadence, independent of any codex round-trip.
+pub const STATUS_TOPIC: &str = "state/copilot/status";
+
+/// Bus topic the copilot PUBLISHES its proactive ranked SUGGESTIONS to (FD-10 §2).
+///
+/// Mirrors the [`PROPOSAL_TOPIC`] precedent: a non-RPC publish under the canonical
+/// `action/copilot/*` namespace the GUI drains with the standard reader. A message
+/// here is a RANKED SET of proposals for the FD-10 GUI to render inline — NEVER an
+/// instruction to execute. It is deliberately DISTINCT from FD-11's execution topic
+/// (`action/exec/request`); any actionable suggestion carries an FD-12
+/// [`ActionProposal`] the operator must approve + re-publish to FD-11 (§9).
+pub const SUGGESTIONS_TOPIC: &str = "action/copilot/suggestions";
+
+/// Cheap status cadence (FD-10 §1). 15 s keeps the Copilot tile's ready/thinking/
+/// offline indicator fresh without cost — each tick is a leader check, a
+/// secret-store presence probe, and (only on change) one bus write.
+pub const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Moderate proactive-suggestion cadence (FD-10 §2 / Q61). Every 5 minutes the
+/// LEADER assembles the mesh context and asks codex for a small ranked set of
+/// high-impact suggestions. "Moderate" (not a tight loop) is the Q61 lock: surface
+/// problems already-triaged without spamming the operator or hammering codex.
+pub const DEFAULT_SUGGESTION_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Hard cap on the proactive ranked set (FD-10 §2). Q61 — high-confidence,
+/// high-impact ONLY: a SMALL set, not an exhaustive dump. Anything codex returns
+/// past this is truncated so a chatty model can't flood the tile.
+pub const MAX_SUGGESTIONS: usize = 5;
+
+/// The model label reported in the status topic + used for the proactive
+/// suggestion pass (Q87: the FAST tier for suggestions; the strong tier is for
+/// actions/edits, out of FD-10 scope). Passed to `codex exec --model` for the
+/// suggestion invocation; the per-ask FD-9 path keeps codex's own default.
+pub const DEFAULT_SUGGESTION_MODEL: &str = "gpt-5-mini";
+
+/// Cap on one proactive suggestion `codex exec` (FD-10 §2). A ranked-set round-trip
+/// is a bit longer than a single ask, so this is more generous than the per-ask
+/// ceiling — a wedged child still degrades to "no suggestions this round", never a
+/// pinned worker.
+pub const DEFAULT_SUGGESTION_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Cap on the number of mesh nodes named in the grounding context (FD-12 §1).
 /// Keeps the dump bounded — a large fleet never splats an unbounded node list
@@ -247,6 +328,284 @@ pub fn compose_prompt(req: &AskRequest, mesh_context: &str) -> String {
     out.push_str("Question:\n");
     out.push_str(req.prompt.trim());
     out
+}
+
+// ============================ FD-10 §1: status topic =========================
+
+/// The coarse Copilot state the Front Door tile renders (FD-10 §1). Three states
+/// the tile maps to ready/thinking/offline indicators — deliberately compact so
+/// the tile read is trivial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CopilotState {
+    /// The leader has a usable codex key — Copilot can answer/suggest.
+    Ready,
+    /// A codex round-trip is in flight right now (an ask or a proactive pass).
+    Thinking,
+    /// No codex available here (not the leader, key not sealed, or store fault) —
+    /// the rest of the Front Door keeps working (Q33 graceful degrade).
+    Offline,
+}
+
+impl CopilotState {
+    /// Stable lowercase tag (matches the serde rename) for logs + assertions.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Thinking => "thinking",
+            Self::Offline => "offline",
+        }
+    }
+}
+
+/// The compact Copilot status published to [`STATUS_TOPIC`] (FD-10 §1). Small by
+/// design — everything the Front Door tile needs to render ready/thinking/offline
+/// and nothing it doesn't.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CopilotStatus {
+    /// The coarse state the tile renders.
+    pub state: CopilotState,
+    /// `true` when this node is the elected leader (Copilot is leader-only — Q73).
+    pub leader: bool,
+    /// `true` when Copilot can actually serve here (leader + a usable codex key).
+    /// `state == Offline` ⇔ `!available`, but it's carried explicitly so the tile
+    /// needn't infer it.
+    pub available: bool,
+    /// The model label suggestions run on (Q87 fast tier) — shown in the tile.
+    pub model: String,
+    /// Unix-epoch seconds of the most recent Copilot activity (an ask answered or a
+    /// proactive pass), or `None` if it hasn't acted since this process started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_s: Option<u64>,
+}
+
+impl CopilotStatus {
+    /// Build the status from the cheap inputs: leadership, key presence, whether a
+    /// codex call is in flight, and the last-activity stamp. `available` is
+    /// `leader && key_present`; the state is `Thinking` when a call is live, else
+    /// `Ready` when available, else `Offline`. Pure so the mapping is unit-testable
+    /// without a leader lock or a secret store.
+    #[must_use]
+    pub fn derive(
+        leader: bool,
+        key_present: bool,
+        in_flight: bool,
+        last_activity_s: Option<u64>,
+    ) -> Self {
+        let available = leader && key_present;
+        let state = if !available {
+            CopilotState::Offline
+        } else if in_flight {
+            CopilotState::Thinking
+        } else {
+            CopilotState::Ready
+        };
+        Self {
+            state,
+            leader,
+            available,
+            model: DEFAULT_SUGGESTION_MODEL.to_string(),
+            last_activity_s,
+        }
+    }
+
+    /// JSON body for [`STATUS_TOPIC`]. Infallible — a serialize failure (impossible
+    /// for this shape) degrades to a fixed offline marker so a status write never
+    /// wedges the cadence.
+    #[must_use]
+    pub fn to_body(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            r#"{"state":"offline","leader":false,"available":false,"model":"unknown"}"#.to_string()
+        })
+    }
+}
+
+// ====================== FD-10 §2: proactive suggestions ======================
+
+/// One proactive ranked suggestion (FD-10 §2). Prose + an optional typed
+/// [`ActionProposal`] (the SAME FD-12 path an ask uses), so the GUI can render a
+/// card with a one-click "propose" affordance when the suggestion is actionable.
+/// NEVER executed here — the proposal is queued for operator approval (§9).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Suggestion {
+    /// A short, operator-facing headline (e.g. "mfsmaster on oak is down").
+    pub title: String,
+    /// The supporting detail / rationale (why it matters, what to do).
+    pub detail: String,
+    /// `high` | `medium` — kept high-confidence-only at the prompt (Q61); carried
+    /// so the tile can sort/badge. A missing/odd value degrades to `"medium"`.
+    #[serde(default = "default_impact")]
+    pub impact: String,
+    /// The typed action proposal this suggestion implies, if any — the FD-12
+    /// [`ActionProposal`] the operator approves to act. `None` for an advisory-only
+    /// suggestion. It is a PROPOSAL: never executed, never on FD-11's exec topic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<ActionProposal>,
+}
+
+fn default_impact() -> String {
+    "medium".to_string()
+}
+
+/// The ranked set published to [`SUGGESTIONS_TOPIC`] (FD-10 §2). A bounded, ranked
+/// list (highest-impact first) plus the stamp it was produced — so a tile can show
+/// freshness and the GUI half can render the cards inline.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SuggestionSet {
+    /// The ranked suggestions (highest-impact first), capped at [`MAX_SUGGESTIONS`].
+    pub suggestions: Vec<Suggestion>,
+    /// Unix-epoch seconds the set was produced.
+    pub produced_at_s: u64,
+}
+
+impl SuggestionSet {
+    /// JSON body for [`SUGGESTIONS_TOPIC`]. Infallible — a serialize failure
+    /// degrades to an empty set so a malformed publish never wedges the cadence.
+    #[must_use]
+    pub fn to_body(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            format!(
+                r#"{{"suggestions":[],"produced_at_s":{}}}"#,
+                self.produced_at_s
+            )
+        })
+    }
+}
+
+/// Compose the proactive-suggestions prompt handed to `codex exec` (FD-10 §2).
+///
+/// Reuses the [`SYSTEM_CONTEXT`] (§9 lane + the `action`-fence proposal protocol)
+/// and the SAME grounding block FD-12 grounds asks with, then asks for a SMALL
+/// RANKED set of HIGH-IMPACT, HIGH-CONFIDENCE suggestions emitted as a strict JSON
+/// array (Q61 — high-confidence only, do not spam). Each element may embed an
+/// `action`-fenced proposal in its `detail`, parsed through FD-11's allowlist by
+/// [`parse_suggestions`]. Pure so it's unit-testable without spawning codex.
+#[must_use]
+pub fn compose_suggestions_prompt(mesh_context: &str) -> String {
+    let mut out = String::new();
+    out.push_str(SYSTEM_CONTEXT);
+    out.push_str("\n\n");
+    if !mesh_context.trim().is_empty() {
+        out.push_str("Live mesh state:\n");
+        out.push_str(mesh_context.trim());
+        out.push_str("\n\n");
+    }
+    out.push_str(SUGGESTIONS_TASK);
+    out
+}
+
+/// The proactive-suggestions instruction appended after the grounding (FD-10 §2).
+/// Demands HIGH-CONFIDENCE, HIGH-IMPACT only (Q61) and a strict JSON-array shape so
+/// the parse is deterministic; an empty array is the explicit "nothing worth
+/// surfacing" answer (the common, quiet-mesh case).
+const SUGGESTIONS_TASK: &str = "Reviewing the live mesh state above, PROACTIVELY surface only the \
+HIGHEST-IMPACT, HIGHEST-CONFIDENCE operational fixes or optimizations an operator should act on \
+RIGHT NOW. Be conservative: if nothing is clearly worth the operator's attention, return an empty \
+list — do NOT invent low-value busywork. Return AT MOST 5, ranked best-first.\n\
+Respond with ONLY a JSON array (no prose outside it), each element:\n\
+{\"title\":\"<short headline>\",\"detail\":\"<why it matters + the fix>\",\"impact\":\"high|medium\"}\n\
+If a suggestion implies a concrete operation, append the SAME ```action fenced block described \
+above INSIDE that element's `detail` string — it becomes a queued proposal the operator approves \
+(proposing is not executing). Return [] when there is nothing high-confidence to surface.";
+
+/// Parse codex's proactive-suggestions answer into a bounded, ranked
+/// `Vec<Suggestion>` (FD-10 §2).
+///
+/// Tolerant: codex may wrap the array in a ```` ```json ```` fence or add stray
+/// prose, so we extract the first top-level `[ … ]`. Each element's `detail` is run
+/// through [`extract_proposal`] — so an `action`-fenced block becomes a typed
+/// FD-12 [`ActionProposal`] (gated by FD-11's allowlist; an un-allowlisted kind is
+/// dropped) and the fence is stripped from the displayed detail. The result is
+/// truncated to [`MAX_SUGGESTIONS`] (Q61). Unparseable input ⇒ empty (no panic).
+#[must_use]
+pub fn parse_suggestions(answer: &str) -> Vec<Suggestion> {
+    let Some(arr) = extract_json_array(answer) else {
+        return Vec::new();
+    };
+    let raw: Vec<RawSuggestion> = match serde_json::from_str(&arr) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::info!(
+                target: "mackesd::copilot",
+                error = %e,
+                "proactive suggestions did not parse as a JSON array; publishing none this round",
+            );
+            return Vec::new();
+        }
+    };
+    raw.into_iter()
+        .take(MAX_SUGGESTIONS)
+        .filter_map(|r| {
+            let title = r.title.trim().to_string();
+            if title.is_empty() {
+                return None;
+            }
+            // Run the detail through the SAME FD-12 proposal extractor an ask uses:
+            // an `action`-fenced block becomes a typed (allowlisted) proposal and
+            // is stripped from the displayed prose. The proposal is queued for
+            // approval — never executed here (§9).
+            let (prose, proposal) = extract_proposal(&r.detail);
+            let impact = match r.impact.trim().to_lowercase().as_str() {
+                "high" => "high".to_string(),
+                _ => "medium".to_string(),
+            };
+            Some(Suggestion {
+                title,
+                detail: prose,
+                impact,
+                proposal,
+            })
+        })
+        .collect()
+}
+
+/// The wire shape codex emits per suggestion (the proposal lives inline in
+/// `detail`, extracted by [`parse_suggestions`]).
+#[derive(serde::Deserialize)]
+struct RawSuggestion {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    detail: String,
+    #[serde(default = "default_impact")]
+    impact: String,
+}
+
+/// Extract the first top-level `[ … ]` JSON array substring from `text`, tolerating
+/// a surrounding ```` ```json ```` fence or stray prose. Bracket-depth scan so a
+/// nested array inside an element doesn't end it early. `None` when there's no
+/// balanced top-level array.
+fn extract_json_array(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'[')?;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if b == b'\\' {
+                esc = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(text[start..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Outcome of one codex invocation, mapped to a reply by the caller.
@@ -488,6 +847,14 @@ pub struct CopilotWorker {
     /// assemble the FD-12 grounding context. Defaults to [`crate::default_db_path`];
     /// tests point it at a tempdir. A read-only grounding read — never written.
     db_path: PathBuf,
+    /// FD-10 §1 — cheap status cadence ([`STATUS_TOPIC`]). Tests shorten it.
+    status_interval: Duration,
+    /// FD-10 §2 — moderate proactive-suggestion cadence ([`SUGGESTIONS_TOPIC`]).
+    /// Tests shorten it.
+    suggestion_interval: Duration,
+    /// FD-10 §2 — per-pass codex timeout for the suggestion invocation. Tests
+    /// shorten it.
+    suggestion_timeout: Duration,
 }
 
 impl CopilotWorker {
@@ -506,6 +873,9 @@ impl CopilotWorker {
             codex_bin: DEFAULT_CODEX_BIN.to_string(),
             bus_root_override: None,
             db_path: crate::default_db_path(),
+            status_interval: DEFAULT_STATUS_INTERVAL,
+            suggestion_interval: DEFAULT_SUGGESTION_INTERVAL,
+            suggestion_timeout: DEFAULT_SUGGESTION_TIMEOUT,
         }
     }
 
@@ -543,6 +913,28 @@ impl CopilotWorker {
     #[must_use]
     pub const fn with_codex_timeout(mut self, d: Duration) -> Self {
         self.codex_timeout = d;
+        self
+    }
+
+    /// FD-10 §1 — override the cheap status cadence. Tests use a shorter value.
+    #[must_use]
+    pub const fn with_status_interval(mut self, d: Duration) -> Self {
+        self.status_interval = d;
+        self
+    }
+
+    /// FD-10 §2 — override the proactive-suggestion cadence. Tests use a shorter
+    /// value.
+    #[must_use]
+    pub const fn with_suggestion_interval(mut self, d: Duration) -> Self {
+        self.suggestion_interval = d;
+        self
+    }
+
+    /// FD-10 §2 — override the per-pass suggestion codex timeout. Tests shorten it.
+    #[must_use]
+    pub const fn with_suggestion_timeout(mut self, d: Duration) -> Self {
+        self.suggestion_timeout = d;
         self
     }
 
@@ -618,13 +1010,25 @@ impl CopilotWorker {
 
     /// Run `codex exec` for one composed prompt with the API key in the
     /// environment, capturing stdout. Async (`tokio::process`) so a model round-
-    /// trip doesn't pin the runtime thread; bounded by [`Self::codex_timeout`].
-    /// Every failure mode degrades to [`CodexOutcome::Unavailable`] — never an
-    /// error return, never a panic.
-    async fn invoke_codex(&self, api_key: &str, prompt: &str) -> CodexOutcome {
+    /// trip doesn't pin the runtime thread; bounded by `timeout`. `model` selects
+    /// the tier (Q87: `None` ⇒ codex's own default for the per-ask FD-9 path; the
+    /// FD-10 §2 suggestion pass passes the FAST tier). Every failure mode degrades
+    /// to [`CodexOutcome::Unavailable`] — never an error return, never a panic. The
+    /// ONLY process this worker ever spawns is this codex subprocess (§9).
+    async fn invoke_codex(
+        &self,
+        api_key: &str,
+        prompt: &str,
+        model: Option<&str>,
+        timeout: Duration,
+    ) -> CodexOutcome {
         let mut cmd = tokio::process::Command::new(&self.codex_bin);
-        cmd.arg("exec")
-            .arg(prompt)
+        cmd.arg("exec");
+        if let Some(m) = model {
+            // Q87 tiered model — the fast tier for the proactive suggestion pass.
+            cmd.arg("--model").arg(m);
+        }
+        cmd.arg(prompt)
             // codex reads OPENAI_API_KEY from the environment; the sealed mesh
             // secret never lands on a command line or on disk.
             .env("OPENAI_API_KEY", api_key)
@@ -644,8 +1048,7 @@ impl CopilotWorker {
                 return CodexOutcome::Unavailable(format!("codex not available: {e}"));
             }
         };
-        let output = match tokio::time::timeout(self.codex_timeout, child.wait_with_output()).await
-        {
+        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
             Ok(Ok(o)) => o,
             Ok(Err(e)) => {
                 tracing::warn!(target: "mackesd::copilot", error = %e, "codex wait failed");
@@ -654,12 +1057,12 @@ impl CopilotWorker {
             Err(_) => {
                 tracing::warn!(
                     target: "mackesd::copilot",
-                    timeout_s = self.codex_timeout.as_secs(),
+                    timeout_s = timeout.as_secs(),
                     "codex exec timed out",
                 );
                 return CodexOutcome::Unavailable(format!(
                     "codex timed out after {}s",
-                    self.codex_timeout.as_secs()
+                    timeout.as_secs()
                 ));
             }
         };
@@ -704,7 +1107,10 @@ impl CopilotWorker {
         // codex `.await`).
         let mesh_context = self.assemble_mesh_context().render();
         let prompt = compose_prompt(&req, &mesh_context);
-        match self.invoke_codex(&api_key, &prompt).await {
+        match self
+            .invoke_codex(&api_key, &prompt, None, self.codex_timeout)
+            .await
+        {
             CodexOutcome::Answer(a) => {
                 // FD-12 §2 — split the prose answer from any typed proposal. A
                 // proposal is published on PROPOSAL_TOPIC for the operator to
@@ -726,6 +1132,113 @@ impl CopilotWorker {
             CodexOutcome::Unavailable(reason) => (build_unavailable_reply(&reason), None),
         }
     }
+
+    // ===================== FD-10 §1 — the status topic ======================
+
+    /// Cheaply derive the current Copilot status (FD-10 §1) WITHOUT a codex spawn:
+    /// a leader check + a secret-store presence probe. `in_flight` is whether a
+    /// codex round-trip is live right now (drives `thinking`); `last_activity_s` is
+    /// the most-recent-activity stamp. Pure-ish (only the two cheap reads), so the
+    /// status cadence costs nothing even when codex is busy or absent.
+    fn current_status(&self, in_flight: bool, last_activity_s: Option<u64>) -> CopilotStatus {
+        let leader = self.is_leader();
+        // Key presence is a cheap read; a store fault counts as "not present" for
+        // the status (the tile shows offline rather than guessing).
+        let key_present = matches!(self.read_codex_key(), Ok(Some(_)));
+        CopilotStatus::derive(leader, key_present, in_flight, last_activity_s)
+    }
+
+    // ================ FD-10 §2 — the proactive suggestion engine ============
+
+    /// Run ONE proactive suggestion pass (FD-10 §2), LEADER-ONLY. Mirrors the FD-12
+    /// phasing: the grounding + key reads are synchronous (no `&Persist`/
+    /// `&Connection` borrow crosses the codex `.await`); the codex round-trip is the
+    /// only async/spawning step; the caller publishes the result. Returns the ranked
+    /// [`SuggestionSet`] to publish, or `None` when there's nothing to publish (not
+    /// leader, no key, codex unavailable, or an empty high-confidence set — Q61:
+    /// quiet is the common case, and we don't publish an empty set as noise).
+    /// PROPOSE-ONLY: any actionable suggestion carries a typed FD-12
+    /// [`ActionProposal`] queued for approval — NEVER executed here (§9).
+    async fn generate_suggestions(&self) -> Option<SuggestionSet> {
+        if !self.is_leader() {
+            // Leader-only (Q73): a follower never runs the proactive pass, so a
+            // multi-node mesh produces one suggestion set, not N.
+            return None;
+        }
+        let api_key = match self.read_codex_key() {
+            Ok(Some(k)) => k,
+            Ok(None) => {
+                tracing::debug!(
+                    target: "mackesd::copilot",
+                    "proactive pass skipped: codex key not sealed yet (status will read offline)",
+                );
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "mackesd::copilot",
+                    error = %e,
+                    "proactive pass skipped: secret-store fault",
+                );
+                return None;
+            }
+        };
+        // Same bounded grounding FD-12 grounds asks with (a synchronous read — the
+        // borrow is dropped before the codex `.await` below).
+        let mesh_context = self.assemble_mesh_context().render();
+        let prompt = compose_suggestions_prompt(&mesh_context);
+        // The FAST tier (Q87) for suggestions; a more generous timeout than a
+        // single ask since a ranked set is a longer round-trip.
+        let outcome = self
+            .invoke_codex(
+                &api_key,
+                &prompt,
+                Some(DEFAULT_SUGGESTION_MODEL),
+                self.suggestion_timeout,
+            )
+            .await;
+        let answer = match outcome {
+            CodexOutcome::Answer(a) => a,
+            CodexOutcome::Unavailable(reason) => {
+                tracing::info!(
+                    target: "mackesd::copilot",
+                    reason = %reason,
+                    "proactive pass produced no suggestions (codex unavailable this round)",
+                );
+                return None;
+            }
+        };
+        let suggestions = parse_suggestions(&answer);
+        if suggestions.is_empty() {
+            // Q61 — a quiet mesh is the common case; publish nothing rather than an
+            // empty card the tile would have to special-case.
+            tracing::debug!(
+                target: "mackesd::copilot",
+                "proactive pass: no high-confidence suggestions to surface this round",
+            );
+            return None;
+        }
+        let proposals = suggestions.iter().filter(|s| s.proposal.is_some()).count();
+        tracing::info!(
+            target: "mackesd::copilot",
+            count = suggestions.len(),
+            proposals,
+            "copilot published proactive suggestions (proposals queued for operator approval; not executed)",
+        );
+        Some(SuggestionSet {
+            suggestions,
+            produced_at_s: now_epoch_s(),
+        })
+    }
+}
+
+/// Wall-clock epoch seconds for the status/suggestion stamps. Best-effort: a clock
+/// before the epoch reads as 0 rather than panicking.
+fn now_epoch_s() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Map a finished codex invocation to a [`CodexOutcome`].
@@ -778,8 +1291,22 @@ impl Worker for CopilotWorker {
         // (an old question answered twice is worse than dropped on a restart).
         let mut cursor: Option<String> = persist.latest_ulid(ACTION_TOPIC).ok().flatten();
         let mut tick = tokio::time::interval(self.poll_interval);
-        // Burn the immediate first tick so we wait a full interval on startup.
+        // FD-10 — two additional cadences: a CHEAP status heartbeat (§1) and a
+        // MODERATE proactive-suggestion timer (§2). Both run on the same `Send`
+        // future as the ask sweep; neither holds a `&Persist` borrow across a codex
+        // `.await` (the suggestion codex call is awaited with NO borrow live, then
+        // the result is published synchronously — mirroring the ask phasing).
+        let mut status_tick = tokio::time::interval(self.status_interval);
+        let mut suggest_tick = tokio::time::interval(self.suggestion_interval);
+        // Burn the immediate first tick on the ask + suggestion cadences so we wait
+        // a full interval on startup. The STATUS tick is allowed to fire
+        // immediately so the tile gets a snapshot promptly on boot (Q92 — render
+        // ready/offline without waiting a full 15 s).
         tick.tick().await;
+        suggest_tick.tick().await;
+        // FD-10 §1 — last-activity stamp, set whenever Copilot acts (an ask
+        // answered or a proactive pass). `None` until the first activity.
+        let mut last_activity_s: Option<u64> = None;
         loop {
             tokio::select! {
                 _ = tick.tick() => {
@@ -799,11 +1326,43 @@ impl Worker for CopilotWorker {
                     // ever held across the codex `.await`.
                     let mut replies: Vec<(String, String, Option<String>)> =
                         Vec::with_capacity(asks.len());
+                    let answered_any = !asks.is_empty();
                     for (ulid, body) in asks {
+                        // FD-10 §1 — flip the tile to "thinking" while this ask's
+                        // codex round-trip is in flight (a synchronous status write,
+                        // no codex spawn — cheap, no borrow across the ask `.await`).
+                        self.publish_status(&persist, true, last_activity_s);
                         let (reply, proposal) = self.handle_ask(&body).await;
                         replies.push((ulid, reply, proposal));
                     }
                     write_replies(&persist, replies);
+                    if answered_any {
+                        last_activity_s = Some(now_epoch_s());
+                        // Drop back to "ready" (or offline if leadership/key
+                        // changed) once the asks are answered.
+                        self.publish_status(&persist, false, last_activity_s);
+                    }
+                }
+                _ = status_tick.tick() => {
+                    // FD-10 §1 — the cheap status heartbeat: a leader check + a
+                    // key-presence probe + one bus write. No codex spawn, fully
+                    // synchronous, so it's safe under the `&persist` borrow.
+                    self.publish_status(&persist, false, last_activity_s);
+                }
+                _ = suggest_tick.tick() => {
+                    // FD-10 §2 — the moderate proactive pass (LEADER-ONLY). The
+                    // codex round-trip is awaited with NO `&Persist` borrow live
+                    // (mirroring the ask phasing for the `!Sync` constraint); the
+                    // resulting ranked set is published synchronously afterward.
+                    // Suggestions are PROPOSALS — never executed, never on FD-11's
+                    // exec topic (§9).
+                    self.publish_status(&persist, true, last_activity_s);
+                    let set = self.generate_suggestions().await;
+                    if let Some(set) = set {
+                        publish_suggestions(&persist, &set);
+                        last_activity_s = Some(now_epoch_s());
+                    }
+                    self.publish_status(&persist, false, last_activity_s);
                 }
                 () = shutdown.wait() => break,
             }
@@ -845,6 +1404,22 @@ impl CopilotWorker {
         }
         collected
     }
+
+    /// FD-10 §1 — derive + publish the compact Copilot status to [`STATUS_TOPIC`].
+    /// Synchronous (a leader check + a key-presence probe + one bus write — NO codex
+    /// spawn), so it is safe to call while a `&persist` borrow is live and never
+    /// crosses a codex `.await`. `Priority::Min` (silent log-only): this is a pure
+    /// data topic the tile reads, not an operator notification.
+    fn publish_status(&self, persist: &Persist, in_flight: bool, last_activity_s: Option<u64>) {
+        let status = self.current_status(in_flight, last_activity_s);
+        if let Err(e) = persist.write(STATUS_TOPIC, Priority::Min, None, Some(&status.to_body())) {
+            tracing::debug!(
+                target: "mackesd::copilot",
+                error = %e,
+                "status publish failed",
+            );
+        }
+    }
 }
 
 /// Phase 3 (sync): write each `(ulid, reply, proposal)` back. The reply goes on
@@ -882,6 +1457,28 @@ fn write_replies(persist: &Persist, replies: Vec<(String, String, Option<String>
                 );
             }
         }
+    }
+}
+
+/// FD-10 §2 (sync): publish the proactive ranked [`SuggestionSet`] on
+/// [`SUGGESTIONS_TOPIC`] for the GUI half to render inline. A fresh ULID is minted
+/// by `persist.write`. The set carries PROPOSALS — it is NOT FD-11's execution
+/// topic (`action/exec/request`), nothing here executes any of them; the operator
+/// must approve + re-publish a proposal to FD-11 to act (§9). Free function so the
+/// `&Persist` borrow is unambiguously scoped to this synchronous call — never live
+/// across the codex `.await` that produced the set.
+fn publish_suggestions(persist: &Persist, set: &SuggestionSet) {
+    if let Err(e) = persist.write(
+        SUGGESTIONS_TOPIC,
+        Priority::Default,
+        None,
+        Some(&set.to_body()),
+    ) {
+        tracing::warn!(
+            target: "mackesd::copilot",
+            error = %e,
+            "suggestions publish failed",
+        );
     }
 }
 
@@ -1021,7 +1618,9 @@ mod tests {
         // The external dependency isn't installed → Unavailable, never a panic.
         let w = CopilotWorker::new(PathBuf::from("/tmp/wg-copilot-test"), "n1".into())
             .with_codex_bin("definitely-not-a-real-codex-binary-xyz");
-        let out = w.invoke_codex("fake-key", "hi").await;
+        let out = w
+            .invoke_codex("fake-key", "hi", None, DEFAULT_CODEX_TIMEOUT)
+            .await;
         match out {
             CodexOutcome::Unavailable(r) => assert!(r.contains("codex not available"), "{r}"),
             CodexOutcome::Answer(_) => panic!("absent binary must degrade"),
@@ -1037,7 +1636,8 @@ mod tests {
             .with_codex_bin("printf");
         // printf "exec" "<prompt>" — argv[1] ("exec") is the format string, so
         // it prints "exec" with no newline → captured + trimmed as the answer.
-        let out = w.invoke_codex("k", "p").await;
+        // (model None ⇒ no `--model` arg, so argv stays `exec`, `<prompt>`.)
+        let out = w.invoke_codex("k", "p", None, DEFAULT_CODEX_TIMEOUT).await;
         assert_eq!(out, CodexOutcome::Answer("exec".to_string()));
     }
 
@@ -1047,7 +1647,13 @@ mod tests {
         let mut w = CopilotWorker::new(tmp.path().to_path_buf(), "n1".into())
             .with_bus_root(tmp.path().join("bus"))
             .with_db_path(tmp.path().join("audit.db"))
-            .with_poll_interval(Duration::from_millis(20));
+            .with_poll_interval(Duration::from_millis(20))
+            // FD-10 — exercise the status + suggestion cadences in the run loop too
+            // (short so they fire before the shutdown is observed). The proactive
+            // pass degrades to "no suggestions" here (no codex/key), so it never
+            // blocks the clean exit.
+            .with_status_interval(Duration::from_millis(20))
+            .with_suggestion_interval(Duration::from_millis(20));
         let (tx, rx) = tokio::sync::watch::channel(false);
         let token = ShutdownToken::from_receiver(rx);
         let _ = tx.send(true);
@@ -1244,5 +1850,225 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v.get("rationale").is_some(), "carries the human rationale");
         assert_eq!(v["action"]["kind"], "service_lifecycle");
+    }
+
+    // ===================== FD-10 §1 — the status topic =====================
+
+    #[test]
+    fn status_topic_is_state_namespaced() {
+        // FD-4 left the Copilot tile a plain launcher because no topic existed.
+        // This is the topic that unblocks it — under `state/` (current state).
+        assert_eq!(STATUS_TOPIC, "state/copilot/status");
+        assert!(STATUS_TOPIC.starts_with("state/"));
+    }
+
+    #[test]
+    fn status_derive_offline_when_not_leader_or_no_key() {
+        // Not the leader → offline + unavailable, regardless of key (Copilot is
+        // leader-only — Q73).
+        let s = CopilotStatus::derive(false, true, false, None);
+        assert_eq!(s.state, CopilotState::Offline);
+        assert!(!s.available);
+        // Leader but no sealed key → still offline (graceful degrade — Q33).
+        let s = CopilotStatus::derive(true, false, false, None);
+        assert_eq!(s.state, CopilotState::Offline);
+        assert!(!s.available);
+    }
+
+    #[test]
+    fn status_derive_ready_and_thinking_when_available() {
+        // Leader + key, idle → ready.
+        let s = CopilotStatus::derive(true, true, false, Some(1_700_000_000));
+        assert_eq!(s.state, CopilotState::Ready);
+        assert!(s.available);
+        assert!(s.leader);
+        assert_eq!(s.last_activity_s, Some(1_700_000_000));
+        // …and "thinking" while a codex round-trip is in flight.
+        let s = CopilotStatus::derive(true, true, true, None);
+        assert_eq!(s.state, CopilotState::Thinking);
+        assert!(s.available);
+    }
+
+    #[test]
+    fn status_body_shape_carries_state_available_model() {
+        let s = CopilotStatus::derive(true, true, false, Some(42));
+        let v: serde_json::Value = serde_json::from_str(&s.to_body()).unwrap();
+        assert_eq!(v["state"], "ready");
+        assert_eq!(v["leader"], true);
+        assert_eq!(v["available"], true);
+        assert_eq!(v["model"], DEFAULT_SUGGESTION_MODEL);
+        assert_eq!(v["last_activity_s"], 42);
+        // No last-activity → the field is omitted (not null).
+        let s = CopilotStatus::derive(true, true, false, None);
+        let v: serde_json::Value = serde_json::from_str(&s.to_body()).unwrap();
+        assert!(!v.as_object().unwrap().contains_key("last_activity_s"));
+    }
+
+    #[test]
+    fn status_published_on_the_bus_is_readable() {
+        // End-to-end: the worker publishes a status the Front Door tile can read
+        // back off STATUS_TOPIC (the unblock for FD-4's launcher-only tile).
+        let tmp = tempfile::tempdir().unwrap();
+        let persist =
+            mde_bus::persist::Persist::open(tmp.path().join("bus")).expect("persist open");
+        let w = CopilotWorker::new(tmp.path().to_path_buf(), "n1".into());
+        w.publish_status(&persist, false, Some(99));
+        let msgs = persist.list_since(STATUS_TOPIC, None).expect("list");
+        assert_eq!(msgs.len(), 1, "exactly one status published");
+        let body = msgs[0].body.clone().expect("status body");
+        let got: CopilotStatus = serde_json::from_str(&body).expect("parse status");
+        // No leader lock can be taken on a bare tempdir (shared_root_writable
+        // guard), so a fresh worker reads as offline — the honest graceful-degrade
+        // state, and exactly what the tile would render.
+        assert_eq!(got.state, CopilotState::Offline);
+        assert!(!got.available);
+        assert_eq!(got.last_activity_s, Some(99));
+    }
+
+    // ================ FD-10 §2 — proactive suggestion engine ===============
+
+    #[test]
+    fn suggestions_topic_is_distinct_from_execution_topic() {
+        // §9 backstop: suggestions are PROPOSALS — published on their own topic,
+        // NEVER FD-11's execution topic. No path from a suggestion to execution
+        // without operator approval + a re-publish to FD-11.
+        assert_eq!(SUGGESTIONS_TOPIC, "action/copilot/suggestions");
+        assert_ne!(SUGGESTIONS_TOPIC, crate::workers::action::ACTION_TOPIC);
+        assert!(SUGGESTIONS_TOPIC.starts_with("action/"));
+    }
+
+    #[test]
+    fn suggestions_prompt_grounds_and_demands_high_confidence_only() {
+        let p = compose_suggestions_prompt("Leader: peer:oak\nNodes: anvil[peer,degraded]");
+        // Grounded with the live mesh state.
+        assert!(p.contains("Live mesh state:"));
+        assert!(p.contains("anvil[peer,degraded]"));
+        // Q61 — high-confidence/high-impact only, bounded, and an explicit empty-OK.
+        assert!(p.contains("HIGHEST-IMPACT"));
+        assert!(p.contains("empty list") || p.contains("Return []"));
+        // The §9 proposal protocol is taught (reused from the system context).
+        assert!(p.contains("```action"));
+        assert!(p.contains("service_lifecycle"));
+    }
+
+    #[test]
+    fn parse_suggestions_pulls_ranked_set_and_caps() {
+        // A ranked JSON array (wrapped in stray prose + a json fence to prove the
+        // tolerant extraction) parses to bounded, ranked suggestions.
+        let answer = "Here are my findings:\n```json\n[\
+            {\"title\":\"mfsmaster down\",\"detail\":\"restart it\",\"impact\":\"high\"},\
+            {\"title\":\"disk 90% on anvil\",\"detail\":\"prune logs\",\"impact\":\"medium\"}\
+            ]\n```\nthat's all";
+        let got = parse_suggestions(answer);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].title, "mfsmaster down");
+        assert_eq!(got[0].impact, "high");
+        assert_eq!(got[1].impact, "medium");
+        assert!(got[0].proposal.is_none(), "advisory-only suggestion");
+    }
+
+    #[test]
+    fn parse_suggestions_caps_at_max() {
+        // Q61 — a chatty model can't flood the tile; the set is truncated.
+        let items: Vec<String> = (0..20)
+            .map(|i| format!("{{\"title\":\"t{i}\",\"detail\":\"d\",\"impact\":\"high\"}}"))
+            .collect();
+        let answer = format!("[{}]", items.join(","));
+        let got = parse_suggestions(&answer);
+        assert_eq!(got.len(), MAX_SUGGESTIONS);
+    }
+
+    #[test]
+    fn parse_suggestions_extracts_typed_proposal_inline() {
+        // A suggestion whose `detail` carries an `action`-fenced block becomes a
+        // typed FD-12 proposal (gated by FD-11's allowlist), stripped from the
+        // displayed detail — the SAME path an ask uses. Queued, never executed (§9).
+        let answer = "[{\"title\":\"nginx wedged\",\"detail\":\"restart nginx on oak.\\n\
+            ```action\\n\
+            {\\\"kind\\\":\\\"service_lifecycle\\\",\\\"target_host\\\":\\\"oak\\\",\
+            \\\"service_kind\\\":\\\"container\\\",\\\"name\\\":\\\"nginx\\\",\\\"op\\\":\\\"restart\\\"}\\n\
+            ```\",\"impact\":\"high\"}]";
+        let got = parse_suggestions(answer);
+        assert_eq!(got.len(), 1);
+        let s = &got[0];
+        assert!(
+            !s.detail.contains("```"),
+            "fence stripped from detail: {:?}",
+            s.detail
+        );
+        let p = s.proposal.as_ref().expect("typed proposal extracted");
+        assert_eq!(p.action.kind_tag(), "service_lifecycle");
+    }
+
+    #[test]
+    fn parse_suggestions_drops_un_allowlisted_proposal_keeps_prose() {
+        // §9: an un-allowlisted action in a suggestion is dropped (the operator
+        // still gets the prose), never proposed.
+        let answer = "[{\"title\":\"danger\",\"detail\":\"wipe it.\\n\
+            ```action\\n{\\\"kind\\\":\\\"raw_shell\\\",\\\"cmd\\\":\\\"rm -rf /\\\"}\\n```\",\
+            \"impact\":\"high\"}]";
+        let got = parse_suggestions(answer);
+        assert_eq!(got.len(), 1);
+        assert!(
+            got[0].proposal.is_none(),
+            "un-allowlisted kind must not be proposed"
+        );
+    }
+
+    #[test]
+    fn parse_suggestions_tolerates_garbage_and_empty() {
+        assert!(parse_suggestions("not json at all").is_empty());
+        assert!(parse_suggestions("[]").is_empty());
+        // An object instead of an array → empty (not a panic).
+        assert!(parse_suggestions("{\"title\":\"x\"}").is_empty());
+    }
+
+    #[test]
+    fn suggestion_set_body_round_trips() {
+        let set = SuggestionSet {
+            suggestions: vec![Suggestion {
+                title: "t".into(),
+                detail: "d".into(),
+                impact: "high".into(),
+                proposal: None,
+            }],
+            produced_at_s: 1_700_000_000,
+        };
+        let body = set.to_body();
+        let back: SuggestionSet = serde_json::from_str(&body).expect("round-trip");
+        assert_eq!(back, set);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["suggestions"][0]["title"], "t");
+        assert_eq!(v["produced_at_s"], 1_700_000_000_u64);
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_none_when_not_leader() {
+        // Leader-only (Q73): on a bare tempdir no lock can be taken, so a fresh
+        // worker is never leader → no proactive pass, no codex spawn.
+        let tmp = tempfile::tempdir().unwrap();
+        let w = CopilotWorker::new(tmp.path().to_path_buf(), "n1".into())
+            .with_db_path(tmp.path().join("audit.db"))
+            .with_codex_bin("definitely-not-a-real-codex-binary-xyz");
+        assert!(
+            w.generate_suggestions().await.is_none(),
+            "a non-leader publishes no suggestions"
+        );
+    }
+
+    #[test]
+    fn cadences_are_moderate_not_spammy() {
+        // Q61 — the proactive cadence is minutes, not a tight loop; the status
+        // cadence is cheap-but-frequent. Lock both so a future edit can't silently
+        // make Copilot spam the operator.
+        assert!(
+            DEFAULT_SUGGESTION_INTERVAL >= Duration::from_secs(60),
+            "proactive cadence must be moderate (minutes), got {DEFAULT_SUGGESTION_INTERVAL:?}"
+        );
+        assert!(DEFAULT_STATUS_INTERVAL <= Duration::from_secs(30));
+        assert!(
+            MAX_SUGGESTIONS <= 5,
+            "high-confidence => a SMALL ranked set"
+        );
     }
 }

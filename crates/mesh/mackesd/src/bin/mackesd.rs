@@ -6153,6 +6153,16 @@ fn run_serve(
         // separate FRONTDOOR-11 worker. Degrades gracefully (logs + an "AI
         // unavailable" reply, never a panic) when codex/key/network is down, so
         // the rest of the Front Door keeps working (Q33).
+        //
+        // FRONTDOOR-10 (this worker, additional cadences) — the same worker also
+        // PROACTIVELY publishes (a) a compact Copilot STATUS to
+        // `state/copilot/status` on a cheap cadence (so the Front Door's Copilot
+        // tile — left a plain launcher by FD-4 because no topic existed — renders
+        // ready/thinking/offline), and (b) on a MODERATE leader-only timer, a
+        // ranked set of HIGH-IMPACT/HIGH-CONFIDENCE suggestions to
+        // `action/copilot/suggestions` for the GUI to render inline (Q7/Q61).
+        // Suggestions are PROPOSALS (FD-12 typed `ActionProposal`s) — never
+        // executed here, never published to FD-11's `action/exec/request` (§9).
         sup.spawn(Spawn::new(
             mackesd_core::workers::copilot::CopilotWorker::new(
                 workgroup_root.clone(),

@@ -1989,7 +1989,7 @@ clean+reachable smoke); visual gate lifted.
     - [ ] wraps openai/codex in sandboxed `exec` per request (external, pulled at runtime); key = sealed leader-managed mesh secret; tiered model; full-mesh-state context
     - [ ] degrades gracefully when codex/network is down (the rest of the Front Door keeps working)
 
-- [ ] **FRONTDOOR-10: proactive inline suggestions.**
+- [>] **FRONTDOOR-10: proactive inline suggestions.** (backend half done — the leader-only mackesd `copilot` worker now PROACTIVELY publishes two topics: a compact Copilot STATUS to `state/copilot/status` on a cheap 15 s cadence (unblocking FD-4's launcher-only Copilot tile → ready/thinking/offline), and on a MODERATE 5-min leader-only timer a ranked set of HIGH-IMPACT/HIGH-CONFIDENCE suggestions to `action/copilot/suggestions` — reusing FD-9/12's `assemble_mesh_context` grounding + codex `exec` (fast tier — Q87) + `extract_proposal` typing. Suggestions are PROPOSALS (FD-12 `ActionProposal`s), never executed, never on FD-11's exec topic (§9: no executor added, only spawn stays codex); high-confidence-only so it doesn't spam (Q61); graceful degrade (no codex/key → offline, no suggestions). The GUI inline-render of the cards + the click→mini-conversation/thumbs is the remaining GUI-track half.)
   **As** an operator, **I want** Copilot to surface high-impact ops fixes unprompted,
   **so that** problems come to me already triaged.
   **Acceptance**:
