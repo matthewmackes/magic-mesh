@@ -33,17 +33,30 @@ mount | awk '/mfs#/{print \$3}' | sort -r | while read -r m; do fusermount -uz "
 # 2. mask the wedged qnm-shared loop + drop the dead LizardFS dnf mirror
 if systemctl list-unit-files 2>/dev/null | grep -q '^qnm-shared.service'; then ln -sf /dev/null /etc/systemd/system/qnm-shared.service; echo "  masked qnm-shared.service"; fi
 rm -f /etc/yum.repos.d/mackes-mirror-magic-mesh.repo 2>/dev/null
+# 2b. SUBSTRATE-V2 retirement: disable the dead LizardFS binaries so the in-mackesd
+#     meshfs_worker hits its documented no-op path. The LizardFS master is gone
+#     (2026-06-20), but mfschunkserver/mfssetgoal are still ON DISK, so the worker
+#     re-spawns them every ~5s; each fails (no master / no mfshdd.cfg) and that churn
+#     starves the 60s systemd watchdog -> mackesd SIGABRT crash-loop (diagnosed live
+#     2026-06-25). Reversible: renamed, not removed. (Durable fix = the meshfs_worker
+#     !on_etcd code gate; this script unwedges the live fleet now.)
+pkill -9 mfschunkserver mfsmaster 2>/dev/null
+for b in mfschunkserver mfsmaster mfssetgoal; do p=\$(command -v \$b 2>/dev/null); [ -n "\$p" ] && mv -f "\$p" "\$p.cutover-disabled" 2>/dev/null && echo "  disabled \$p"; done
+rm -f /var/lib/mfs/.mfschunkserver.lock 2>/dev/null
 # 3. stop mackesd + reclaim the ephemeral /run/mde-bus spool (tmpfs IPC, regenerated on next publish)
 systemctl stop mackesd 2>/dev/null
-rm -f /run/mde-bus/audit/* /run/mde-bus/state/* /run/mde-bus/*.log 2>/dev/null
-# 5. restart clean + verify
+rm -rf /run/mde-bus/* 2>/dev/null   # full ephemeral spool wipe — rm -f missed the audit/<node>/ + state/boot-readiness/ SUBDIRS that filled the 190M tmpfs
+# 5. restart clean + verify across a FULL watchdog cycle (so the read is real, not a 10s snapshot)
 systemctl daemon-reload 2>/dev/null
+systemctl reset-failed mackesd 2>/dev/null
 systemctl start mackesd
-sleep 10
-printf "  RESULT  /run=%s  mackesd=%s  ABRT(20s)=%s  leader=%s\n" \
+sleep 72
+printf "  RESULT  /run=%s  mackesd=%s  NRestarts=%s  ABRT(70s)=%s  churn(70s)=%s  leader=%s\n" \
   "\$(df -h /run | awk 'NR==2{print \$5}')" \
   "\$(systemctl is-active mackesd)" \
-  "\$(journalctl -u mackesd --since '20 sec ago' 2>/dev/null | grep -c ABRT)" \
+  "\$(systemctl show -p NRestarts --value mackesd)" \
+  "\$(journalctl -u mackesd --since '70 sec ago' 2>/dev/null | grep -c 'status=6/ABRT')" \
+  "\$(journalctl -u mackesd --since '70 sec ago' 2>/dev/null | grep -ciE 'mfschunkserver|converging replication|exited non-zero')" \
   "\$(ETCDCTL_API=3 etcdctl --endpoints=$ANCHOR get /mesh/leader --print-value-only 2>/dev/null | head -c40)"
 NODE
 
