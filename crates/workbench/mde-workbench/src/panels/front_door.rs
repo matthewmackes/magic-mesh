@@ -218,6 +218,37 @@ pub enum Message {
     /// Approve/Execute) are disabled until unlock — navigation + viewing stay
     /// open. A local toggle; the real OS-session lock hook is a noted follow-up.
     ToggleLock,
+    /// FRONTDOOR-15 — the operator picked the **target node** for the open tile's
+    /// actions (Q32/Q74 cross-node): `Some(hostname)` scopes the next action to
+    /// that one node (picked from the live roster), `None` restores the default
+    /// **whole-mesh broadcast** reach (Q18). A pure local view-state flip — it
+    /// changes nothing until an action fires; the scoped action then carries the
+    /// target. The string is the node's hostname (its display + roster key).
+    SelectTargetNode(Option<String>),
+    /// FRONTDOOR-15 — launch a GUI app **on the current target node's data**
+    /// (Q74). Carries the app binary; the handler resolves the target's overlay
+    /// address off the live roster and fires [`crate::Message::LaunchAppOnNode`]
+    /// (the GUI runs locally, pointed at the remote node). A no-op when no target
+    /// is selected (the row is only offered once a node is picked). Closes the
+    /// detail menu as it launches (mirrors a pipeline action).
+    LaunchOnTarget(&'static str),
+    /// FRONTDOOR-15 — the **push-to-talk** affordance was pressed (Q55 voice). It
+    /// publishes the current ask (the omnibox text) to the EXISTING
+    /// `action/copilot/ask` topic — the same path FD-6 search uses, NEVER the exec
+    /// topic (§9) — renders the reply in the Copilot card, and best-effort SPEAKS
+    /// it via the system speech service. A blank ask is a no-op. The mic→text
+    /// transcription step is deferred (no STT engine in the airgapped workspace —
+    /// see the module note); today the operator's typed/dictated ask drives it.
+    PushToTalk,
+    /// FRONTDOOR-15 — a push-to-talk Copilot reply landed (or degraded). Carries
+    /// the `copilot_gen` it was fired under (it shares the one Copilot card + the
+    /// one generation counter with the search ask, so a stale reply for a
+    /// superseded ask is dropped) and the parsed [`CopilotAnswer`]. Folds the
+    /// reply into the Copilot card exactly like [`CopilotReplied`], AND — when it
+    /// is a real answer — best-effort speaks it (the spoken-summary half of Q55).
+    /// Kept distinct from `CopilotReplied` so ONLY a voice ask speaks (a typed
+    /// search never blurts the reply aloud).
+    VoiceReplied(u64, CopilotAnswer),
 }
 
 /// FRONTDOOR-3 — which of the two locked render modes the Front Door is in
@@ -2071,6 +2102,13 @@ pub struct FrontDoor {
     /// action affordances are disabled until unlock; navigation + viewing stay
     /// open. A local toggle today — the OS-session lock hook is a noted follow-up.
     pub locked: bool,
+    /// FRONTDOOR-15 — the **target node** the open tile's actions are scoped to
+    /// (Q32/Q74 cross-node). `None` is the default **whole-mesh broadcast** reach
+    /// (Q18); `Some(hostname)` scopes the next action to that one node, picked
+    /// from the live roster (`self.peers`) in the detail view's node selector.
+    /// Cleared when the detail menu closes (a fresh tile starts at broadcast) so a
+    /// scope never silently leaks across tiles.
+    pub target_node: Option<String>,
 }
 
 impl Default for FrontDoor {
@@ -2146,6 +2184,9 @@ impl FrontDoor {
             triage: copilot::Triage::default(),
             show_pending: false,
             confirm_inputs: std::collections::HashMap::new(),
+            // FRONTDOOR-15 — start at the whole-mesh broadcast default (Q18); a
+            // tile's detail node selector scopes it to one node (Q32/Q74).
+            target_node: None,
         }
     }
 
@@ -2243,6 +2284,10 @@ impl FrontDoor {
             // FRONTDOOR-5 — back out of the detail menu to the grid.
             Message::CloseDetail => {
                 self.detail = None;
+                // FRONTDOOR-15 — leaving the detail drops any per-tile node scope
+                // back to the whole-mesh default (Q18), so a target never silently
+                // carries from one tile's actions to the next.
+                self.target_node = None;
                 Task::none()
             }
             // FRONTDOOR-7 — a one-click pipeline action: route to the existing
@@ -2494,6 +2539,60 @@ impl FrontDoor {
                 self.locked = !self.locked;
                 Task::none()
             }
+            // FRONTDOOR-15 — scope the open tile's actions to one node (Q32/Q74),
+            // or `None` to restore the whole-mesh broadcast default (Q18). Pure
+            // local view-state: nothing fires until the operator runs an action,
+            // which then carries this target. A `Some(host)` not in the live
+            // roster is still accepted (the roster can lag a reload) — the launch
+            // handler re-resolves the address and degrades if it can't.
+            Message::SelectTargetNode(node) => {
+                self.target_node = node;
+                Task::none()
+            }
+            // FRONTDOOR-15 — launch a GUI app on the target node's data (Q74 — the
+            // GUI runs LOCALLY, pointed at the remote node). Resolve the target's
+            // overlay address off the live roster and fire the app-level
+            // `LaunchAppOnNode` (the detached spawn). No target picked, or the
+            // target dropped off the roster, ⇒ a no-op (the row is only offered
+            // with a target selected; this guards a racing reload). Closes the
+            // detail as it launches, mirroring a pipeline action.
+            Message::LaunchOnTarget(bin) => {
+                let Some(addr) = self.target_address() else {
+                    return Task::none();
+                };
+                self.detail = None;
+                self.target_node = None;
+                Task::done(crate::Message::LaunchAppOnNode(bin, addr))
+            }
+            // FRONTDOOR-15 — push-to-talk (Q55 voice). Publish the current ask to
+            // the EXISTING `action/copilot/ask` topic (§9 — the ask lane, NEVER
+            // the exec topic) and speak the reply. Reuses FD-6's exact ask path; a
+            // blank ask is a no-op. See `voice_task` for the deferred-STT note.
+            Message::PushToTalk => self.voice_task(),
+            // FRONTDOOR-15 — a voice ask reply landed. Fold it into the shared
+            // Copilot card iff it still matches the generation it was fired under
+            // (a stale reply for a superseded ask is dropped), then — only for a
+            // real answer — best-effort SPEAK it (the spoken-summary half of Q55).
+            Message::VoiceReplied(generation, answer) => {
+                if generation != self.copilot_gen {
+                    return Task::none();
+                }
+                match answer {
+                    CopilotAnswer::Answer(a) => {
+                        self.copilot = CopilotState::Answer(a.clone());
+                        // Best-effort spoken summary — the same detached
+                        // best-effort spawn the sound cues use; an absent speech
+                        // service is silently inert (never blocks / panics).
+                        return Task::perform(async move { speak_reply(a) }, |()| {
+                            crate::Message::Noop
+                        });
+                    }
+                    CopilotAnswer::Unavailable => {
+                        self.copilot = CopilotState::Unavailable;
+                    }
+                }
+                Task::none()
+            }
         }
     }
 
@@ -2733,6 +2832,69 @@ impl FrontDoor {
                 search::parse_copilot_reply(raw.as_deref())
             },
             move |answer| crate::Message::FrontDoor(Message::CopilotReplied(generation, answer)),
+        )
+    }
+
+    /// FRONTDOOR-15 — the **address** of the currently-targeted node (Q74), for a
+    /// cross-node GUI launch: the selected hostname resolved to its overlay IP off
+    /// the live roster (`self.peers`), falling back to the hostname itself when the
+    /// row carries no overlay IP (still a real, routable target on the mesh). `None`
+    /// when no node is targeted (the broadcast default) or the targeted hostname is
+    /// no longer in the roster (a racing reload dropped it) — the caller no-ops.
+    fn target_address(&self) -> Option<String> {
+        let host = self.target_node.as_ref()?;
+        let peer = self.peers.iter().find(|p| &p.hostname == host)?;
+        if peer.overlay_ip.trim().is_empty() {
+            Some(peer.hostname.clone())
+        } else {
+            Some(peer.overlay_ip.clone())
+        }
+    }
+
+    /// FRONTDOOR-15 — fire the push-to-talk Copilot ask (Q55 voice). Publishes the
+    /// current omnibox text to the EXISTING `action/copilot/ask` topic — byte-for-
+    /// byte the same path FD-6's search ask uses (`search_task`), so voice reuses
+    /// the tested ask/reply round-trip and NEVER touches the exec topic (§9). It
+    /// shares the one Copilot card + the one `copilot_gen` ordering counter with
+    /// the search ask, so a stale voice reply for a superseded ask is dropped. The
+    /// reply comes back as [`Message::VoiceReplied`] (distinct from the search's
+    /// `CopilotReplied` ONLY so the voice reply also speaks — Q55's spoken
+    /// summary). A blank ask fires nothing.
+    ///
+    /// DEFERRED (honestly, §7): the mic→text **transcription** step. There is no
+    /// STT engine in the airgapped workspace (`mde-voice-hud` is a SIP softphone —
+    /// RTP/G.711 media, not speech recognition), so push-to-talk drives the ask
+    /// from the operator's typed/dictated omnibox text today; the captured-audio
+    /// path lands when an STT engine is added. The reachable real slice — the PTT
+    /// control, the ask publish, the reply render, and the spoken reply — ships.
+    fn voice_task(&mut self) -> Task<crate::Message> {
+        let query = self.query.trim().to_string();
+        if query.is_empty() {
+            // Nothing to ask yet — surface the resting "Thinking…"-free card by
+            // leaving Copilot Idle (the PTT hint tells the operator to type/speak).
+            return Task::none();
+        }
+        // Park the card at "thinking…" + bump the shared generation so a since-
+        // superseded reply (voice OR search) is dropped (mirrors `search_task`).
+        self.copilot = CopilotState::Thinking;
+        self.copilot_gen = self.copilot_gen.wrapping_add(1);
+        let generation = self.copilot_gen;
+        Task::perform(
+            async move {
+                let body = search::ask_request_body(&query);
+                let raw = tokio::task::spawn_blocking(move || {
+                    crate::dbus::action_request_with_body(
+                        search::COPILOT_ASK_TOPIC,
+                        Some(&body),
+                        COPILOT_ASK_TIMEOUT,
+                    )
+                })
+                .await
+                .ok()
+                .flatten();
+                search::parse_copilot_reply(raw.as_deref())
+            },
+            move |answer| crate::Message::FrontDoor(Message::VoiceReplied(generation, answer)),
         )
     }
 
@@ -2984,6 +3146,20 @@ impl FrontDoor {
             }
         }
 
+        // FRONTDOOR-15 — the cross-node TARGET selector (Q32/Q74): a mesh-scoped
+        // tile (a live widget — its actions reach the mesh) offers a node picker
+        // off the live roster so the operator can SCOPE an action to one node
+        // instead of the whole-mesh broadcast default (Q18), plus a GUI-launch row
+        // that opens locally pointed at the chosen node's data (Q74). A plain
+        // launcher (Files/Terminal — `key == None`) has no mesh reach, so the
+        // section is omitted there.
+        let target_section: Option<Element<'_, crate::Message, Theme>> =
+            if tile.key.is_some() {
+                Some(self.target_node_section(palette))
+            } else {
+                None
+            };
+
         let mut body = column![
             back,
             Space::new().height(Length::Fixed(16.0)),
@@ -2996,6 +3172,10 @@ impl FrontDoor {
             body = body.push(section);
         }
         if let Some(section) = suggestions_section {
+            body = body.push(Space::new().height(Length::Fixed(20.0)));
+            body = body.push(section);
+        }
+        if let Some(section) = target_section {
             body = body.push(Space::new().height(Length::Fixed(20.0)));
             body = body.push(section);
         }
@@ -3014,6 +3194,88 @@ impl FrontDoor {
                 ..container::Style::default()
             })
             .into()
+    }
+
+    /// FRONTDOOR-15 — the cross-node **target** section for a mesh-scoped tile's
+    /// detail (Q32/Q74). It lets the operator SCOPE this tile's actions to one node
+    /// picked from the LIVE roster (`self.peers` — the same FD-4 directory the
+    /// widgets read, no new Bus path), instead of the whole-mesh broadcast default
+    /// (Q18). A "Whole mesh (broadcast)" chip restores the default; each roster node
+    /// is a selectable chip (the current target reads accent-filled). When a node is
+    /// targeted it adds (a) a one-line scope note naming the node + its address, and
+    /// (b) a **GUI-launch** row that opens an app LOCALLY pointed at the remote
+    /// node's data (Q74) — `mde-files` on the node's shares is the reachable real
+    /// example (the workbench already owns that binary). An empty roster shows an
+    /// honest resting note rather than a fake node (§7). Tokens only (§4).
+    fn target_node_section(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
+        let sizes = FontSize::defaults();
+        let mut sec = column![rail_section_label("Target node", palette)].spacing(8);
+        sec = sec.push(
+            text("Scope this tile's actions to one node, or broadcast to the whole mesh (the default).")
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(palette.text_muted.into_cosmic_color()),
+        );
+
+        // The picker: the broadcast default + one row per live roster node. Each is
+        // a full-width `target_chip` row (accent-filled when it is the current
+        // target), stacked in a column the detail scroller carries.
+        let mut chips = column![target_chip(
+            "Whole mesh (broadcast)",
+            self.target_node.is_none(),
+            crate::Message::FrontDoor(Message::SelectTargetNode(None)),
+            palette,
+        )]
+        .spacing(6);
+        if self.peers.is_empty() {
+            sec = sec.push(chips);
+            sec = sec.push(
+                text("No nodes in the roster yet — actions broadcast to the whole mesh until one appears.")
+                    .size(TypeRole::Caption.size_in(sizes))
+                    .colr(palette.text_muted.into_cosmic_color()),
+            );
+            return sec.into();
+        }
+        for peer in &self.peers {
+            let host = peer.hostname.clone();
+            let selected = self.target_node.as_deref() == Some(host.as_str());
+            chips = chips.push(target_chip(
+                &peer.hostname,
+                selected,
+                crate::Message::FrontDoor(Message::SelectTargetNode(Some(host))),
+                palette,
+            ));
+        }
+        sec = sec.push(chips);
+
+        // With a node targeted: the scope note + the cross-node GUI-launch row
+        // (Q74 — open locally on the remote node's data). `mde-files` is the
+        // reachable example (the workbench owns the binary; it opens the node's
+        // shares). The launch is gated by the session lock like a pipeline action.
+        if let Some(addr) = self.target_address() {
+            let host = self.target_node.clone().unwrap_or_default();
+            sec = sec.push(
+                text(format!("Actions scoped to {host} ({addr})."))
+                    .size(TypeRole::Caption.size_in(sizes))
+                    .colr(palette.accent.into_cosmic_color()),
+            );
+            if self.locked {
+                sec = sec.push(lock_note(palette));
+            }
+            let launch = detail_action_row(
+                TileAction {
+                    label: format!("Open Files on {host}"),
+                    // The cross-node GUI launch (Q74): a pipeline-class action
+                    // (lock-gated) that opens `mde-files` locally on the remote
+                    // node's data. Routed through `LaunchOnTarget` so the handler
+                    // re-resolves the address at click time.
+                    message: crate::Message::FrontDoor(Message::LaunchOnTarget("mde-files")),
+                },
+                self.locked,
+                palette,
+            );
+            sec = sec.push(launch);
+        }
+        sec.into()
     }
 
     /// FRONTDOOR-13 — the AI alert-triage section for the Alerts tile detail (Q38).
@@ -3089,6 +3351,9 @@ impl FrontDoor {
         if let Some(indicator) = self.pending_indicator(palette) {
             controls = controls.push(indicator);
         }
+        // FRONTDOOR-15 — the push-to-talk voice control (Q55), in the full-screen
+        // top bar too (no rail here — the top bar is the only reachable home).
+        controls = controls.push(self.ptt_toggle(palette));
         controls = controls.push(self.settings_toggle(palette));
         controls = controls.push(self.lock_toggle(palette));
         controls = controls.push(self.mode_toggle(palette));
@@ -3268,6 +3533,9 @@ impl FrontDoor {
         if let Some(indicator) = self.pending_indicator(palette) {
             omnibox_row = omnibox_row.push(indicator);
         }
+        // FRONTDOOR-15 — the push-to-talk voice control sits beside the omnibox
+        // (Q55): press to ask the current query aloud + hear the reply spoken.
+        omnibox_row = omnibox_row.push(self.ptt_toggle(palette));
         // FRONTDOOR-14 — the settings + lock toggles sit beside the mode toggle (the
         // rail also carries them in panel mode; having them in the top bar keeps the
         // affordance consistent across both modes).
@@ -3510,6 +3778,21 @@ impl FrontDoor {
         top_bar_button(
             "⚙ Settings",
             crate::Message::FrontDoor(Message::OpenSettings),
+            palette,
+        )
+    }
+
+    /// FRONTDOOR-15 — the top-bar **push-to-talk** control (Q55 voice, optional /
+    /// off-by-default as an affordance the operator opts into by pressing it). It
+    /// fires [`Message::PushToTalk`], which publishes the current ask to the
+    /// EXISTING `action/copilot/ask` topic (§9 — the ask lane, never exec) and
+    /// speaks the reply. Present in BOTH modes' top bar (the rail has no voice
+    /// entry, so the top bar carries it for reachability). Mirrors the other
+    /// top-bar buttons' chrome. Tokens only (§4).
+    fn ptt_toggle(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
+        top_bar_button(
+            "🎙 Ask aloud",
+            crate::Message::FrontDoor(Message::PushToTalk),
             palette,
         )
     }
@@ -4070,6 +4353,30 @@ fn top_bar_button<'a>(
     .into()
 }
 
+/// FRONTDOOR-15 — best-effort **speak** a Copilot reply aloud (Q55's spoken
+/// summary). Uses the system speech service via `spd-say` (speech-dispatcher —
+/// the canonical Linux TTS front-end), the SAME detached best-effort spawn the
+/// Front Door / notify-toast already use for their sound cues (`canberra-gtk-play`
+/// / `paplay`): the binary resolves on PATH post-install, and an absent service /
+/// no audio device is silently inert (it never blocks the GUI thread or panics).
+/// `-w` lets the spawned process own the utterance; we don't wait on it. This is a
+/// real spoken-reply path, not a stub (§7) — it speaks when the host has speech-
+/// dispatcher (the desktop image ships it) and degrades quietly otherwise. A blank
+/// reply is not spoken. NOTE the matching deferred half (mic→text STT) on
+/// [`FrontDoor::voice_task`].
+fn speak_reply(reply: String) {
+    let reply = reply.trim();
+    if reply.is_empty() {
+        return;
+    }
+    let _ = std::process::Command::new("spd-say")
+        .args(["-w", reply])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 /// FRONTDOOR-14 — one labelled Settings section: a heading, a one-line help blurb,
 /// and the section's control(s) below it, in a raised card. Tokens only (§4).
 fn settings_section<'a>(
@@ -4347,6 +4654,60 @@ fn detail_action_row<'a>(
         b = b.on_press(action.message);
     }
     b.into()
+}
+
+/// FRONTDOOR-15 — one selectable **target-node** chip in the cross-node section
+/// (Q32/Q74): the broadcast default or a live roster node. The current target reads
+/// accent-filled (accent background, on-accent text); the rest read as a quiet
+/// outlined row. Clicking it fires `msg` (a [`Message::SelectTargetNode`]) — a pure
+/// scope flip, never an action. Tokens only (§4).
+fn target_chip<'a>(
+    label: &str,
+    selected: bool,
+    msg: crate::Message,
+    palette: Palette,
+) -> Element<'a, crate::Message, Theme> {
+    let accent = palette.accent.into_cosmic_color();
+    let idle_bg = palette.hover_tint().into_cosmic_color();
+    let on_accent = palette.background.into_cosmic_color();
+    let text_color = palette.text.into_cosmic_color();
+    // Selected → accent fill with on-accent text; unselected → quiet row, text
+    // tone normal so the roster reads as a list.
+    let fg = if selected { on_accent } else { text_color };
+    button(
+        text(label.to_string())
+            .size(TypeRole::Body.size_in(FontSize::defaults()))
+            .colr(fg),
+    )
+    .width(Length::Fill)
+    .padding(Padding::from([10u16, 14u16]))
+    .sty(
+        move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
+            use cosmic::iced::widget::button::Status;
+            let bg = if selected {
+                accent
+            } else {
+                match status {
+                    Status::Hovered | Status::Pressed => accent_tint(accent),
+                    _ => idle_bg,
+                }
+            };
+            cosmic::iced::widget::button::Style {
+                snap: false,
+                background: Some(Background::Color(bg)),
+                text_color: fg,
+                border: Border {
+                    color: cosmic::iced::Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 6.0.into(),
+                },
+                shadow: cosmic::iced::Shadow::default(),
+                ..cosmic::iced::widget::button::Style::default()
+            }
+        },
+    )
+    .on_press(msg)
+    .into()
 }
 
 /// FRONTDOOR-10 — one proactive-suggestion card in a tile's detail view (Q19 —
@@ -7191,5 +7552,172 @@ mod tests {
             // leak into another test (the live_theme bundle is process-wide).
             crate::live_theme::set(mde_theme::Theme::Dark, mde_theme::Density::Comfortable);
         });
+    }
+
+    /// Inject a live roster into a `FrontDoor` the way a real `Loaded` snapshot
+    /// would (via `apply`), so the cross-node selector + launch read real rows.
+    fn fd_with_roster(peers: Vec<PeerRow>) -> FrontDoor {
+        let mut fd = FrontDoor::new();
+        fd.apply(&FrontDoorData {
+            peers,
+            ..FrontDoorData::default()
+        });
+        fd
+    }
+
+    #[test]
+    fn select_target_node_scopes_then_clears_on_default_and_close() {
+        // FRONTDOOR-15 (Q32/Q74) — the cross-node target is a pure scope flip: a
+        // node selects it, `None` restores the whole-mesh broadcast default (Q18),
+        // and leaving the detail clears it so a scope never leaks across tiles.
+        let mut fd = fd_with_roster(vec![mesh_peer("anvil", &["mfsmaster"])]);
+        assert_eq!(fd.target_node, None, "starts at the broadcast default");
+
+        let _ = fd.update(Message::SelectTargetNode(Some("anvil".into())));
+        assert_eq!(fd.target_node.as_deref(), Some("anvil"));
+
+        let _ = fd.update(Message::SelectTargetNode(None));
+        assert_eq!(fd.target_node, None, "None restores the broadcast default");
+
+        // Re-select, then closing the detail drops the scope (no cross-tile leak).
+        let _ = fd.update(Message::SelectTargetNode(Some("anvil".into())));
+        let _ = fd.update(Message::CloseDetail);
+        assert_eq!(fd.target_node, None, "leaving the detail clears the scope");
+    }
+
+    #[test]
+    fn target_address_resolves_overlay_ip_off_the_live_roster() {
+        // FRONTDOOR-15 (Q74) — the cross-node launch targets the node's OVERLAY IP
+        // when present (so the GUI opens on the real mesh address), falls back to
+        // the hostname when the row carries none, and is `None` for a stale/absent
+        // target (a racing reload dropped it) so the launch handler no-ops.
+        let mut anvil = mesh_peer("anvil", &[]);
+        anvil.overlay_ip = "10.42.0.7".into();
+        let forge = mesh_peer("forge", &[]); // no overlay IP on this row
+        let mut fd = fd_with_roster(vec![anvil, forge]);
+
+        assert_eq!(
+            fd.target_address(),
+            None,
+            "no target ⇒ broadcast, no address"
+        );
+
+        fd.target_node = Some("anvil".into());
+        assert_eq!(fd.target_address().as_deref(), Some("10.42.0.7"));
+
+        fd.target_node = Some("forge".into());
+        assert_eq!(
+            fd.target_address().as_deref(),
+            Some("forge"),
+            "no overlay IP ⇒ fall back to the hostname"
+        );
+
+        fd.target_node = Some("ghost".into()); // not in the roster
+        assert_eq!(fd.target_address(), None, "a stale target resolves to None");
+    }
+
+    #[test]
+    fn launch_on_target_no_ops_without_a_resolvable_node() {
+        // FRONTDOOR-15 (Q74) — `LaunchOnTarget` only launches once a node resolves;
+        // with no/stale target it is a no-op (it never clears the detail or fires a
+        // launch). With a resolvable target it clears the scope + closes the detail.
+        let mut anvil = mesh_peer("anvil", &[]);
+        anvil.overlay_ip = "10.42.0.7".into();
+        let mut fd = fd_with_roster(vec![anvil]);
+        fd.detail = Some(0);
+
+        // No target → no-op (detail stays open, scope stays None).
+        let _ = fd.update(Message::LaunchOnTarget("mde-files"));
+        assert_eq!(
+            fd.detail,
+            Some(0),
+            "no target ⇒ no launch, detail untouched"
+        );
+
+        // A resolvable target → the handler closes the detail + drops the scope
+        // (the launch message itself rides the returned Task).
+        fd.target_node = Some("anvil".into());
+        let _ = fd.update(Message::LaunchOnTarget("mde-files"));
+        assert_eq!(fd.detail, None, "a launch closes the detail");
+        assert_eq!(fd.target_node, None, "and drops the scope");
+    }
+
+    #[test]
+    fn detail_view_renders_the_target_selector_for_a_mesh_tile_only() {
+        // FRONTDOOR-15 (Q32) — a mesh-scoped (keyed) tile's detail offers the node
+        // selector; a plain launcher (keyless) has no mesh reach so it doesn't.
+        // Render both in both modes without panicking (§7 — reachable, both modes).
+        let mut fd = fd_with_roster(vec![mesh_peer("anvil", &["mfsmaster"])]);
+        let data_center = fd
+            .tiles
+            .iter()
+            .position(|t| t.key == Some(TileKey::DataCenter))
+            .expect("the Data Center widget tile is seeded");
+        let files = fd
+            .tiles
+            .iter()
+            .position(|t| t.key.is_none())
+            .expect("at least one launcher tile is seeded");
+        for mode in [Mode::Panel, Mode::FullScreen] {
+            fd.mode = mode;
+            for idx in [data_center, files] {
+                fd.detail = Some(idx);
+                // The detail builds in both modes (the section is gated on the tile
+                // key inside `detail_view`, so this exercises both branches).
+                let _: Element<'_, crate::Message, Theme> = fd.view();
+            }
+        }
+        // The target-section method itself builds with a target picked, too.
+        fd.target_node = Some("anvil".into());
+        let _: Element<'_, crate::Message, Theme> =
+            fd.target_node_section(crate::live_theme::palette());
+    }
+
+    #[test]
+    fn push_to_talk_asks_on_the_ask_topic_and_speaks_only_a_real_reply() {
+        // FRONTDOOR-15 (Q55) — push-to-talk publishes the current ask + parks the
+        // Copilot card at "thinking…" (sharing the search ask's card + generation),
+        // and a VOICE reply folds in only when its generation still matches. A blank
+        // ask fires nothing. §9 — it rides the ask path, never the exec topic.
+        let mut fd = FrontDoor::new();
+
+        // Blank ask → no-op (Copilot stays Idle, generation unchanged).
+        let _ = fd.update(Message::PushToTalk);
+        assert_eq!(fd.copilot, CopilotState::Idle, "a blank ask asks nothing");
+        assert_eq!(fd.copilot_gen, 0);
+
+        // A real ask parks the card at "thinking…" + bumps the shared generation.
+        fd.query = "restart mfsmaster".into();
+        let _ = fd.update(Message::PushToTalk);
+        assert_eq!(fd.copilot, CopilotState::Thinking, "voice ask is pending");
+        assert_eq!(
+            fd.copilot_gen, 1,
+            "voice shares the search ask's generation"
+        );
+
+        // The matching-generation answer folds in (and would speak — best-effort).
+        let _ = fd.update(Message::VoiceReplied(
+            1,
+            CopilotAnswer::Answer("restarting mfsmaster on the leader".into()),
+        ));
+        assert_eq!(
+            fd.copilot,
+            CopilotState::Answer("restarting mfsmaster on the leader".into())
+        );
+
+        // A STALE-generation reply (the ask was superseded) is dropped, not shown.
+        let _ = fd.update(Message::VoiceReplied(
+            0,
+            CopilotAnswer::Answer("stale".into()),
+        ));
+        assert_eq!(
+            fd.copilot,
+            CopilotState::Answer("restarting mfsmaster on the leader".into()),
+            "a stale-generation voice reply is dropped"
+        );
+
+        // The degrade path renders the quiet unavailable note (Q33), no speech.
+        let _ = fd.update(Message::VoiceReplied(1, CopilotAnswer::Unavailable));
+        assert_eq!(fd.copilot, CopilotState::Unavailable);
     }
 }

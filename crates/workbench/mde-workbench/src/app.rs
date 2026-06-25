@@ -136,6 +136,15 @@ pub enum Message {
     /// rather than a Workbench panel (e.g. Voice & Video →
     /// `mde-voice-config`). The binary resolves on PATH post-install.
     LaunchApp(&'static str),
+    /// FRONTDOOR-15 — launch a standalone MDE app **pointed at a remote node's
+    /// data** (Q74 — GUI apps open locally on remote data). The GUI runs on THIS
+    /// workstation (a remote X/Wayland session is out of scope); the carried node
+    /// target (its overlay address) is passed to the app as `--node <target>` so
+    /// it reads the chosen node's data instead of the local default. Mirrors the
+    /// detached best-effort spawn of [`LaunchApp`] — a binary/flag a given app
+    /// doesn't support simply has no effect (the app falls back to local), never a
+    /// panic. The `String` is the resolved target (overlay IP / hostname).
+    LaunchAppOnNode(&'static str, String),
     /// AIR-20 — Devices → Music settings panel sub-message.
     Music(music_panel::Message),
     VoipGateway(sip_gateway_panel::Message),
@@ -874,6 +883,21 @@ impl App {
                 // (dev tree without an install) fails silently rather than
                 // panicking the Workbench.
                 let _ = std::process::Command::new(bin)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+                Task::none()
+            }
+            Message::LaunchAppOnNode(bin, node) => {
+                // FRONTDOOR-15 (Q74) — the same detached best-effort spawn as
+                // `LaunchApp`, but the chosen node's address is handed to the app
+                // as `--node <target>` so the GUI runs LOCALLY pointed at the
+                // remote node's data. An app that doesn't recognise the flag falls
+                // back to its local default (the flag is inert, not fatal); a
+                // missing binary fails silently — never panics the Workbench.
+                let _ = std::process::Command::new(bin)
+                    .args(["--node", &node])
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())

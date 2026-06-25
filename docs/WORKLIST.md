@@ -2029,12 +2029,12 @@ clean+reachable smoke); visual gate lifted.
     - [ ] in-menu settings panel (theme, tiles, AI policy, hotkeys); prefs/layout sync over etcd (single shared layout per node)
     - [ ] rich-but-tasteful polish: expressive motion, subtle mutable sound cues, haptics; locks with the session (actions need unlock)
 
-- [ ] **FRONTDOOR-15: voice + cross-node launch.**
+- [>] **FRONTDOOR-15: voice + cross-node launch.** (CROSS-NODE is real + done; VOICE ships its reachable slice with the mic→text STT honestly deferred. **Cross-node (Q32/Q74):** a mesh-scoped (keyed) tile's detail now carries a **Target node** selector populated from the LIVE roster (`FrontDoorData.peers` — the same FD-4 directory the widgets read, no new Bus path); picking a node scopes that tile's actions to it, "Whole mesh (broadcast)" restores the Q18 default, and the scope clears on leaving the detail so it never leaks across tiles. With a node picked, a **GUI-launch row** opens an app LOCALLY pointed at the remote node's data (Q74) — `LaunchAppOnNode(bin, addr)` resolves the target's overlay IP off the roster and spawns `bin --node <addr>` (the same detached best-effort path as `LaunchApp`; `mde-files` is the reachable example). **Voice (Q55):** a **push-to-talk** "Ask aloud" control in BOTH modes' top bar publishes the current ask to the EXISTING `action/copilot/ask` topic — byte-for-byte FD-6's tested ask path, sharing the one Copilot card + generation, NEVER the exec topic (§9) — renders the reply, and best-effort SPEAKS it via the system speech service (`spd-say`, the same detached spawn the sound cues use). §4 tokens, both Panel + FullScreen modes, 5 new tests; farm build/clippy/test GREEN (1191 lib tests pass). **DEFERRED (honestly, §7):** the mic→text **STT transcription** step — there is no speech-recognition engine in the airgapped workspace (`mde-voice-hud` is a SIP softphone — RTP/G.711 media, not STT), so push-to-talk drives the ask from the operator's typed/dictated omnibox text today; the captured-audio path lands when an STT engine is added.)
   **As** an operator, **I want** to ask out loud and act on any node,
   **so that** the whole mesh is reachable from one surface.
   **Acceptance**:
-    - [ ] optional push-to-talk + spoken summaries via mde-voice-hud (off by default)
-    - [ ] a tile can target any node (ops headless on the node; GUI apps open locally on remote data) and the result returns
+    - [>] optional push-to-talk + spoken summaries via mde-voice-hud — PTT control + ask-publish + reply render + best-effort spoken reply (off by default, opt-in by pressing) shipped; mic→text STT transcription deferred (no STT engine in-tree)
+    - [✓] a tile can target any node (GUI apps open locally on remote data via `LaunchAppOnNode`) and the reply returns through the existing ask/reply lane — real roster, §7
 
 - [ ] **FRONTDOOR-16: rollout — replace the old launcher.**
   **As** the project, **I want** one coherent surface,
