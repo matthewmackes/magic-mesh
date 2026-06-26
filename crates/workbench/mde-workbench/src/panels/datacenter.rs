@@ -366,8 +366,16 @@ pub fn parse_dc_event(body: &str) -> Option<DcRow> {
 pub struct AuditRow {
     /// The action performed — e.g. "tofu-apply" | "vm-delete" | "vm-power".
     pub action: String,
+    /// The initiating principal as recorded by the daemon's `dc_auditor` — the
+    /// local node identity (`peer:<host>`), since the mde-bus envelope carries
+    /// no per-message sender. Empty when the event didn't name one.
+    pub actor: String,
     /// The target of the action — a workspace name, a VM uuid, a dom0 IP, …
     pub target: String,
+    /// The action result as recorded by the auditor — "issued" for an action the
+    /// passive auditor observed being requested (it doesn't correlate the reply,
+    /// so it never fabricates an ok/fail). Empty when the event didn't name one.
+    pub result: String,
     /// An RFC3339 / epoch timestamp string as carried on the event. Empty when
     /// the event didn't name one. Used as the sort key (descending = newest).
     pub ts: String,
@@ -380,8 +388,18 @@ pub struct AuditRow {
 pub fn parse_audit_event(body: &str) -> Option<AuditRow> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let action = v.get("action")?.as_str()?.to_string();
+    let actor = v
+        .get("actor")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     let target = v
         .get("target")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let result = v
+        .get("result")
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
@@ -390,7 +408,13 @@ pub fn parse_audit_event(body: &str) -> Option<AuditRow> {
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
-    Some(AuditRow { action, target, ts })
+    Some(AuditRow {
+        action,
+        actor,
+        target,
+        result,
+        ts,
+    })
 }
 
 /// Project a set of `(topic, latest-body)` Bus reads into audit rows —
@@ -3154,9 +3178,10 @@ impl DatacenterPanel {
             }
             // ── DATACENTER-10 (Hosts tab) — host lifecycle + pools ──────────────
             Message::HostPowerClicked { dom0, op } => {
-                // Reversible ops (maintenance on/off) fire immediately — no confirm.
+                // Reversible ops (maintenance on/off) fire immediately — no confirm
+                // (the daemon's confirm gate only guards the destructive ops).
                 self.status = format!("Host {op} on {dom0}…");
-                Self::host_power_task(dom0, op)
+                Self::host_power_task(dom0, op, false)
             }
             Message::HostOpArmed { dom0, op } => {
                 // Arm the destructive confirm AND refresh the impact preview so the
@@ -3167,9 +3192,11 @@ impl DatacenterPanel {
                 Self::host_impact_task(dom0)
             }
             Message::HostOpConfirmed { dom0, op } => {
+                // The destructive op was armed + explicitly confirmed in the UI —
+                // carry confirm:true so the daemon's typed-confirm gate passes.
                 self.host_confirm = None;
                 self.status = format!("Host {op} on {dom0}…");
-                Self::host_power_task(dom0, op)
+                Self::host_power_task(dom0, op, true)
             }
             Message::HostOpCancelled => {
                 self.host_confirm = None;
@@ -4019,7 +4046,9 @@ impl DatacenterPanel {
                 }
                 self.idle_shutdown_ok = false;
                 self.status = format!("Shutting down idle host {dom0} (graceful)…");
-                Self::host_power_task(dom0, "shutdown".to_string())
+                // The operator armed this via a live idle-shutdown recommendation
+                // (the soft confirm above); carry confirm:true for the daemon gate.
+                Self::host_power_task(dom0, "shutdown".to_string(), true)
             }
 
             // ── DATACENTER-14 (Gateway tab) ──────────────────────────────────
@@ -4101,10 +4130,10 @@ impl DatacenterPanel {
     /// DATACENTER-10 — fire the `action/dc/host-power` RPC on a blocking thread
     /// (the Bus RPC borrows a non-Send `Persist` across its await, same shape as
     /// `PowerClicked`'s `vm_power`), routing the reply back as `HostPowerDone`.
-    fn host_power_task(dom0: String, op: String) -> Task<crate::Message> {
+    fn host_power_task(dom0: String, op: String, confirm: bool) -> Task<crate::Message> {
         Task::perform(
             async move {
-                tokio::task::spawn_blocking(move || host_power(&dom0, &op))
+                tokio::task::spawn_blocking(move || host_power(&dom0, &op, confirm))
                     .await
                     .unwrap_or_else(|e| Err(format!("host-power task panicked: {e}")))
             },
@@ -7933,20 +7962,22 @@ fn promote_card_view(stage: &PromoteStage, palette: Palette) -> Element<'static,
 /// Render one audit-log row: `action`, `target`, and the timestamp. mde-theme
 /// tokens only.
 fn audit_row_view(entry: &AuditRow) -> Element<'_, crate::Message> {
-    let target = if entry.target.is_empty() {
-        "—".to_string()
-    } else {
-        entry.target.clone()
-    };
-    let ts = if entry.ts.is_empty() {
-        "—".to_string()
-    } else {
-        entry.ts.clone()
+    // Render actor · action · target · result · ts. Each empty field falls back
+    // to an em-dash so the column stays aligned (an action without a recorded
+    // actor/target/result is shown honestly as "—", not blank).
+    let dash = |s: &str| {
+        if s.is_empty() {
+            "—".to_string()
+        } else {
+            s.to_string()
+        }
     };
     let line = row![
-        text(entry.action.clone()).width(Length::FillPortion(1)),
-        text(target).width(Length::FillPortion(2)),
-        text(ts).width(Length::FillPortion(2)),
+        text(dash(&entry.actor)).width(Length::FillPortion(2)),
+        text(entry.action.clone()).width(Length::FillPortion(2)),
+        text(dash(&entry.target)).width(Length::FillPortion(2)),
+        text(dash(&entry.result)).width(Length::FillPortion(1)),
+        text(dash(&entry.ts)).width(Length::FillPortion(2)),
     ]
     .spacing(f32::from(spacing::BASE[3]));
     container(line)
@@ -8813,11 +8844,14 @@ fn bulk_op(op: &str, uuid: &str, dom0: &str, tag: &str) -> Result<String, String
 /// `Persist` across its internal await. The reply is `{"ok":true}` (→ "host <op>
 /// ok") or `{"error":".."}` (→ the error text). Evacuate live-migrates every guest
 /// off, so its timeout is generous.
-fn host_power(dom0: &str, op: &str) -> Result<String, String> {
+fn host_power(dom0: &str, op: &str, confirm: bool) -> Result<String, String> {
     let Some(dir) = mde_bus::default_data_dir() else {
         return Err("no Bus data dir".to_string());
     };
-    let body = serde_json::json!({ "dom0": dom0, "op": op }).to_string();
+    // Destructive ops (reboot / shutdown / evacuate) are confirm-gated on the
+    // daemon; pass `confirm:true` only on the confirmed path. Reversible
+    // maintenance toggles send `confirm:false` (ignored by the daemon's gate).
+    let body = serde_json::json!({ "dom0": dom0, "op": op, "confirm": confirm }).to_string();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -10538,21 +10572,28 @@ mod tests {
 
     #[test]
     fn parse_audit_event_reads_an_apply() {
+        // The producer (the daemon's dc_auditor) now stamps actor + target +
+        // result + ts; the panel projects all five into the row.
         let r = parse_audit_event(
-            r#"{"action":"tofu-apply","target":"xen-xapi","ts":"2026-06-22T10:00:00Z"}"#,
+            r#"{"action":"vm-delete","actor":"peer:anvil","target":"abc-123","result":"issued","ts":"1700000000000"}"#,
         )
         .unwrap();
-        assert_eq!(r.action, "tofu-apply");
-        assert_eq!(r.target, "xen-xapi");
-        assert_eq!(r.ts, "2026-06-22T10:00:00Z");
+        assert_eq!(r.action, "vm-delete");
+        assert_eq!(r.actor, "peer:anvil");
+        assert_eq!(r.target, "abc-123");
+        assert_eq!(r.result, "issued");
+        assert_eq!(r.ts, "1700000000000");
     }
 
     #[test]
     fn parse_audit_event_defaults_missing_fields_and_drops_garbage() {
-        // Missing target/ts default to empty.
+        // Missing actor/target/result/ts default to empty (an older event or one
+        // whose action named no target still parses, just with blank columns).
         let r = parse_audit_event(r#"{"action":"vm-delete"}"#).unwrap();
         assert_eq!(r.action, "vm-delete");
+        assert_eq!(r.actor, "");
         assert_eq!(r.target, "");
+        assert_eq!(r.result, "");
         assert_eq!(r.ts, "");
         // Unparseable / missing action → None.
         assert!(parse_audit_event("not json").is_none());
@@ -10569,15 +10610,15 @@ mod tests {
             ),
             (
                 "event/dc/audit/1".into(),
-                r#"{"action":"tofu-plan","target":"xen-xapi","ts":"2026-06-22T09:00:00Z"}"#.into(),
+                r#"{"action":"tofu-plan","actor":"peer:a","target":"xen-xapi","result":"issued","ts":"2026-06-22T09:00:00Z"}"#.into(),
             ),
             (
                 "event/dc/audit/2".into(),
-                r#"{"action":"tofu-apply","target":"xen-xapi","ts":"2026-06-22T11:00:00Z"}"#.into(),
+                r#"{"action":"tofu-apply","actor":"peer:a","target":"xen-xapi","result":"issued","ts":"2026-06-22T11:00:00Z"}"#.into(),
             ),
             (
                 "event/dc/audit/3".into(),
-                r#"{"action":"vm-delete","target":"uuid-9","ts":"2026-06-22T10:00:00Z"}"#.into(),
+                r#"{"action":"vm-delete","actor":"peer:b","target":"uuid-9","result":"issued","ts":"2026-06-22T10:00:00Z"}"#.into(),
             ),
         ];
         let rows = project_audit(&events);
@@ -10586,6 +10627,14 @@ mod tests {
         assert_eq!(rows[0].action, "tofu-apply");
         assert_eq!(rows[1].action, "vm-delete");
         assert_eq!(rows[2].action, "tofu-plan");
+        // The projection carries actor · target · result · ts through, not just
+        // action — the newest row (vm-apply) is fully populated.
+        assert_eq!(rows[0].actor, "peer:a");
+        assert_eq!(rows[0].target, "xen-xapi");
+        assert_eq!(rows[0].result, "issued");
+        assert_eq!(rows[0].ts, "2026-06-22T11:00:00Z");
+        assert_eq!(rows[1].target, "uuid-9"); // the vm-delete's target/ts present
+        assert_eq!(rows[1].ts, "2026-06-22T10:00:00Z");
     }
 
     #[test]
@@ -10814,7 +10863,9 @@ mod tests {
             rows: Vec::new(),
             audit: vec![AuditRow {
                 action: "tofu-apply".into(),
+                actor: "peer:anvil".into(),
                 target: "xen-xapi".into(),
+                result: "issued".into(),
                 ts: "2026-06-22T11:00:00Z".into(),
             }],
             promote: Vec::new(),
