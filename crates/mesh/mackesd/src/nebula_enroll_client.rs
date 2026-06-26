@@ -355,11 +355,20 @@ pub fn persist_bundle(
     node_id: &str,
     bundle: &NebulaBundle,
 ) -> Result<(), NetEnrollError> {
+    // #12 — a full-lighthouse joiner carries the mesh CA private key: install it so
+    // the node can itself sign/enroll, and render the Host (am_lighthouse) config
+    // immediately (the supervisor reconcile would also flip it on its next tick).
+    let role = if bundle.ca_key_pem.is_some() {
+        install_lighthouse_ca(bundle);
+        crate::workers::nebula_supervisor::ConfigRole::Host
+    } else {
+        crate::workers::nebula_supervisor::ConfigRole::Peer
+    };
     // /etc/nebula — the live config nebula reads on serve.
     crate::workers::nebula_supervisor::materialize_config(
         config_dir,
         bundle,
-        crate::workers::nebula_supervisor::ConfigRole::Peer,
+        role,
         &[],
         workgroup_root,
     )
@@ -369,6 +378,51 @@ pub fn persist_bundle(
     crate::ca::bundle::write_bundle(&bp, bundle)
         .map_err(|e| NetEnrollError::Materialize(e.to_string()))?;
     Ok(())
+}
+
+/// HA / turn-key (#12) — a node that enrolled as a full lighthouse received the
+/// mesh CA **private** key in its bundle; install it so the node can itself
+/// sign/enroll new peers:
+///   1. seal the CA key (0600) + write the CA cert under `/var/lib/mackesd/nebula-ca/`;
+///   2. seed the local `nebula_ca` store row with the **shared** mesh CA, so the
+///      daemon adopts the existing CA instead of `mint_ca` forking a brand-new one.
+/// Best-effort + idempotent (`INSERT OR REPLACE`); logs on failure — the node is
+/// still a discovery/relay lighthouse (am_lighthouse) even if signing setup lags.
+fn install_lighthouse_ca(bundle: &NebulaBundle) {
+    let Some(ca_key_pem) = bundle.ca_key_pem.as_deref() else {
+        return;
+    };
+    if let Err(e) = crate::ca::seal::write_sealed(
+        std::path::Path::new(crate::ca::DEFAULT_CA_KEY_PATH),
+        ca_key_pem.as_bytes(),
+    ) {
+        tracing::warn!(error = %e, "install_lighthouse_ca: sealing CA key failed");
+        return;
+    }
+    if let Err(e) = std::fs::write(crate::ca::DEFAULT_CA_CERT_PATH, &bundle.ca_cert_pem) {
+        tracing::warn!(error = %e, "install_lighthouse_ca: writing CA cert failed");
+    }
+    match crate::store::open(&crate::default_db_path()) {
+        Ok(conn) => {
+            let _ = crate::store::migrate(&conn);
+            match conn.execute(
+                "INSERT OR REPLACE INTO nebula_ca (mesh_id, epoch, ca_cert_pem, retired_at) \
+                 VALUES (?1, ?2, ?3, NULL)",
+                rusqlite::params![bundle.mesh_id, bundle.epoch, bundle.ca_cert_pem],
+            ) {
+                Ok(_) => tracing::info!(
+                    mesh_id = %bundle.mesh_id,
+                    epoch = bundle.epoch,
+                    "install_lighthouse_ca: CA key+cert installed + store seeded — \
+                     this node is now a full signing lighthouse"
+                ),
+                Err(e) => {
+                    tracing::warn!(error = %e, "install_lighthouse_ca: seeding nebula_ca row failed")
+                }
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "install_lighthouse_ca: opening store failed"),
+    }
 }
 
 #[cfg(test)]

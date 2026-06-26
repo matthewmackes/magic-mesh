@@ -8347,7 +8347,19 @@ fn cmd_add_peer(
     };
     let port = enroll_port.unwrap_or(mackesd_core::nebula_enroll_endpoint::DEFAULT_ENROLL_PORT);
 
-    let bearer = mackesd_core::bearer_ledger::issue(&root, note)
+    // #12 — when adding a LIGHTHOUSE, scope the bearer note with the role marker so
+    // the signer delivers the CA key + a Host cert (a full turn-key lighthouse). For
+    // any other role the note is unchanged, so an ordinary peer bearer can never
+    // pull the CA key (ENT-12 containment).
+    let scoped_note = if parsed == mde_role::Role::Lighthouse {
+        format!(
+            "{} {note}",
+            mackesd_core::bearer_ledger::LIGHTHOUSE_ROLE_NOTE
+        )
+    } else {
+        note.to_string()
+    };
+    let bearer = mackesd_core::bearer_ledger::issue(&root, &scoped_note)
         .map_err(|e| anyhow::anyhow!("minting bearer: {e}"))?;
     let token = mackesd_core::nebula_enroll::JoinToken {
         mesh_id: bundle.mesh_id,

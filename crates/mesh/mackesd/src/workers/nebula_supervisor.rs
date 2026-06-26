@@ -727,6 +727,7 @@ mod tests {
                 overlay_ip: "10.42.0.1".into(),
                 external_addr: "lh1.example.com:4242".into(),
             }],
+            ca_key_pem: None,
             created_at: 1,
         }
     }

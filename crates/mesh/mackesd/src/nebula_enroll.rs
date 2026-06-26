@@ -741,6 +741,14 @@ pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
             node_id: csr.node_id.clone(),
         });
     }
+    // HA / turn-key (#12) — a join authorized by a role-scoped LIGHTHOUSE bearer is
+    // signed as a Host (am_lighthouse) AND handed the CA private key, so the new
+    // node becomes a full signing lighthouse with no manual scp. Gated on the
+    // BEARER NOTE (operator intent via `add-peer --role lighthouse`), never a
+    // self-asserted CSR field — an ordinary peer bearer can never pull the CA key
+    // (ENT-12 containment).
+    let lighthouse_authorized =
+        crate::bearer_ledger::is_lighthouse_bearer(workgroup_root, &csr.token.bearer);
     // TUNE-11 — 8-peer cap (Q3 + Q22) enforcement. Counts
     // distinct active node_ids at the active epoch. The
     // UNIQUE(node_id, epoch) constraint on `nebula_peer_certs`
@@ -788,7 +796,11 @@ pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
         conn,
         mesh_id,
         &csr.node_id,
-        crate::ca::sign::PeerRole::Peer,
+        if lighthouse_authorized {
+            crate::ca::sign::PeerRole::Host
+        } else {
+            crate::ca::sign::PeerRole::Peer
+        },
         &paths.ca_crt,
         &paths.ca_key,
         &crt_out,
@@ -812,6 +824,18 @@ pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
         std::fs::read_to_string(&paths.ca_crt).map_err(|e| SignCsrError::SignFailed {
             reason: format!("read CA cert {}: {e}", paths.ca_crt.display()),
         })?;
+    // #12 — a lighthouse-authorized join also receives the CA PRIVATE key (the
+    // receiver seals it at rest) so the new node can itself sign/enroll. `None` for
+    // ordinary peers — they never carry the CA key.
+    let ca_key_pem = if lighthouse_authorized {
+        Some(
+            std::fs::read_to_string(&paths.ca_key).map_err(|e| SignCsrError::SignFailed {
+                reason: format!("read CA key {}: {e}", paths.ca_key.display()),
+            })?,
+        )
+    } else {
+        None
+    };
     // Look up the active epoch + assemble the bundle.
     let active_epoch = crate::ca::sign::active_epoch(conn, mesh_id)
         .map_err(|e| SignCsrError::SignFailed {
@@ -831,6 +855,7 @@ pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
         overlay_ip: signed.overlay_ip,
         mesh_cidr: format!("{}/16", crate::ca::sign::DEFAULT_MESH_CIDR_BASE),
         lighthouses,
+        ca_key_pem,
         created_at,
     })
 }
@@ -1058,6 +1083,7 @@ mod tests {
                 overlay_ip: "10.42.0.1".into(),
                 external_addr: "203.0.113.5:4242".into(),
             }],
+            ca_key_pem: None,
             created_at: 1716000000,
         };
         write_bundle(&bundle_path(tmp.path(), "peer:anvil"), &bundle).expect("write");
@@ -1226,6 +1252,74 @@ mod tests {
         let pending = build_pending(&identity, peer_id, "anvil", token);
         publish_enrollment_request(workgroup_root, peer_id, &pending).expect("publish");
         pending
+    }
+
+    /// #12 — a CSR whose bearer was issued with the LIGHTHOUSE role note (the
+    /// turn-key full-lighthouse path). The signer must hand back the CA key.
+    fn place_csr_lighthouse(workgroup_root: &Path, peer_id: &str) -> PendingEnrollment {
+        let identity = build_identity();
+        let lh_bearer =
+            crate::bearer_ledger::issue(workgroup_root, crate::bearer_ledger::LIGHTHOUSE_ROLE_NOTE)
+                .expect("issue lighthouse-scoped bearer");
+        let token = parse_join_token(&format!("mesh:test-mesh@10.0.0.5:4242#{lh_bearer}")).unwrap();
+        let pending = build_pending(&identity, peer_id, "anvil", token);
+        publish_enrollment_request(workgroup_root, peer_id, &pending).expect("publish");
+        pending
+    }
+
+    #[test]
+    fn lighthouse_scoped_bearer_delivers_the_ca_key() {
+        let tmp = tempdir().expect("tempdir");
+        let conn = fresh_store();
+        let (ca_crt, ca_key) = make_test_ca(tmp.path(), &conn);
+        let pending = place_csr_lighthouse(tmp.path(), "peer:newlh");
+        let paths = SignCsrPaths {
+            ca_crt,
+            ca_key,
+            scratch_dir: tmp.path().join("scratch"),
+        };
+        let bundle = sign_csr_into_bundle(
+            &MockBackend,
+            &conn,
+            tmp.path(),
+            &pending,
+            &paths,
+            Vec::new(),
+            false,
+        )
+        .expect("sign");
+        let key = bundle
+            .ca_key_pem
+            .as_deref()
+            .expect("a lighthouse-scoped bearer must deliver the CA key");
+        assert!(!key.is_empty(), "the delivered CA key must be non-empty");
+    }
+
+    #[test]
+    fn ordinary_peer_bearer_never_carries_the_ca_key() {
+        let tmp = tempdir().expect("tempdir");
+        let conn = fresh_store();
+        let (ca_crt, ca_key) = make_test_ca(tmp.path(), &conn);
+        let pending = place_csr(tmp.path(), "peer:anvil"); // plain peer bearer (note "recorded")
+        let paths = SignCsrPaths {
+            ca_crt,
+            ca_key,
+            scratch_dir: tmp.path().join("scratch"),
+        };
+        let bundle = sign_csr_into_bundle(
+            &MockBackend,
+            &conn,
+            tmp.path(),
+            &pending,
+            &paths,
+            Vec::new(),
+            false,
+        )
+        .expect("sign");
+        assert!(
+            bundle.ca_key_pem.is_none(),
+            "an ordinary peer must NEVER receive the CA key (ENT-12 containment)"
+        );
     }
 
     #[test]

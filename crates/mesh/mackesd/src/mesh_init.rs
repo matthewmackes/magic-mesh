@@ -126,6 +126,7 @@ pub fn mesh_init<B: NebulaCertBackend>(
             overlay_ip: signed.overlay_ip.clone(),
             external_addr: external_addr.to_string(),
         }],
+        ca_key_pem: None,
         created_at: now_s,
     };
     let bpath = bundle_path(workgroup_root, node_id);

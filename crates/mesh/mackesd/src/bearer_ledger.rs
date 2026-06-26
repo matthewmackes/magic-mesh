@@ -77,6 +77,32 @@ pub fn is_pending(workgroup_root: &Path, bearer: &str) -> bool {
         .exists()
 }
 
+/// The note marker that scopes a bearer to a **lighthouse** join (set by
+/// `add-peer --role lighthouse`). The CA-key-delivery gate (#12) keys on this.
+pub const LIGHTHOUSE_ROLE_NOTE: &str = "role:lighthouse";
+
+/// HA / turn-key (#12) — was `bearer` issued with a **lighthouse-role** scope? The
+/// signer keys the CA-key delivery + Host-cert decision on this (the bearer note =
+/// operator intent via `add-peer --role lighthouse`), NOT a self-asserted CSR
+/// field. Requires the entry to be present (issued + unredeemed) AND its note to
+/// carry [`LIGHTHOUSE_ROLE_NOTE`] — so a leaked/ordinary peer bearer can never pull
+/// the CA private key (ENT-12 containment).
+#[must_use]
+pub fn is_lighthouse_bearer(workgroup_root: &Path, bearer: &str) -> bool {
+    let path = ledger_dir(workgroup_root).join(format!("{}.json", hash_hex(bearer)));
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| {
+            v.get("note")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|note| note.contains(LIGHTHOUSE_ROLE_NOTE))
+}
+
 /// Redeem `bearer` — single-use: returns `true` exactly once per
 /// issued bearer (the entry is deleted).
 #[must_use]
@@ -122,6 +148,31 @@ mod tests {
         assert!(
             !entries[0].contains(&bearer),
             "the replicated ledger must never carry a usable token"
+        );
+    }
+
+    #[test]
+    fn lighthouse_bearer_is_recognized_only_by_its_role_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lh = issue(tmp.path(), &format!("{LIGHTHOUSE_ROLE_NOTE} sfo3 box")).unwrap();
+        let peer = issue(tmp.path(), "plain workstation").unwrap();
+        assert!(
+            is_lighthouse_bearer(tmp.path(), &lh),
+            "a role:lighthouse-noted bearer → true"
+        );
+        assert!(
+            !is_lighthouse_bearer(tmp.path(), &peer),
+            "an ordinary peer bearer → false (can't pull the CA key)"
+        );
+        assert!(
+            !is_lighthouse_bearer(tmp.path(), "made-up"),
+            "an absent bearer → false"
+        );
+        // A redeemed lighthouse bearer is no longer recognized (entry deleted).
+        assert!(redeem(tmp.path(), &lh));
+        assert!(
+            !is_lighthouse_bearer(tmp.path(), &lh),
+            "a spent bearer → false (single-use)"
         );
     }
 }

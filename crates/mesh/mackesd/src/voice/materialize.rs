@@ -299,6 +299,7 @@ mod tests {
                 overlay_ip: "10.42.0.1".into(),
                 external_addr: "203.0.113.1:4242".into(),
             }],
+            ca_key_pem: None,
             created_at: 1_700_000_000,
         }
     }

@@ -928,6 +928,7 @@ mod tests {
                         external_addr: ext.into(),
                     })
                     .collect(),
+                ca_key_pem: None,
                 created_at: 1,
             };
         // Skinny: only lh-1 (the signer's hardcoded conventional first host).

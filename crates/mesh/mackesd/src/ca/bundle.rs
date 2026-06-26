@@ -43,6 +43,16 @@ pub struct NebulaBundle {
     /// Lighthouse roster — every host-role peer the new
     /// peer should attempt to reach on first boot.
     pub lighthouses: Vec<LighthouseEntry>,
+    /// HA / turn-key (#12) — the mesh CA **private** key PEM, delivered ONLY to a
+    /// node enrolling as a full lighthouse (gated by a role-scoped single-use
+    /// bearer; rides the fp-pinned rustls enroll channel). `None` for ordinary
+    /// peers. The receiver seals it at rest under `/var/lib/mackesd/nebula-ca/` so
+    /// the new lighthouse can itself sign/enroll. **ENT-12 (§8):** shipping the CA
+    /// key widens one leaked lighthouse bearer from a single peer cert to the whole
+    /// mesh CA — accepted only because the bearer is single-use + role-scoped +
+    /// fp-pinned and the envelope is a ≤3-lighthouse trusted workgroup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_key_pem: Option<String>,
     /// Unix-epoch seconds when the bundle was generated.
     pub created_at: i64,
 }
@@ -138,8 +148,36 @@ mod tests {
                 overlay_ip: "10.42.0.1".into(),
                 external_addr: "lh1.example.com:4242".into(),
             }],
+            ca_key_pem: None,
             created_at: 1_716_499_200,
         }
+    }
+
+    #[test]
+    fn bundle_without_ca_key_field_parses_and_peer_bundle_omits_it() {
+        // #12 — an OLD bundle (pre-ca_key_pem) must still deserialize (serde default),
+        // and a peer bundle must NOT serialize the field (skip_serializing_if).
+        let json = r#"{"mesh_id":"m","epoch":0,"ca_cert_pem":"c","peer_cert_pem":"p",
+            "peer_key_pem":"k","overlay_ip":"10.42.0.5","mesh_cidr":"10.42.0.0/16",
+            "lighthouses":[],"created_at":1}"#;
+        let b: NebulaBundle = serde_json::from_str(json).expect("old bundle parses");
+        assert!(b.ca_key_pem.is_none());
+        let out = serde_json::to_string(&b).unwrap();
+        assert!(
+            !out.contains("ca_key_pem"),
+            "a peer bundle must never carry the CA key field"
+        );
+    }
+
+    #[test]
+    fn bundle_with_ca_key_round_trips() {
+        let mut b = sample_bundle();
+        b.ca_key_pem =
+            Some("-----BEGIN NEBULA CA KEY-----\nx\n-----END NEBULA CA KEY-----\n".into());
+        let parsed: NebulaBundle =
+            serde_json::from_str(&serde_json::to_string(&b).unwrap()).expect("round-trip");
+        assert_eq!(parsed, b);
+        assert!(parsed.ca_key_pem.is_some());
     }
 
     #[test]
