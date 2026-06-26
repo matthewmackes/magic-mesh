@@ -1809,17 +1809,22 @@ mod tests {
             let false_confirm =
                 json!({ "dom0": "172.20.0.9", "op": op, "confirm": false }).to_string();
             let r = build_reply(&svc, "host-power", Some(&false_confirm));
-            assert!(r.contains("requires confirm:true"), "{op} confirm:false: {r}");
+            assert!(
+                r.contains("requires confirm:true"),
+                "{op} confirm:false: {r}"
+            );
             // confirm as a non-bool string does NOT satisfy the gate.
             let str_confirm =
                 json!({ "dom0": "172.20.0.9", "op": op, "confirm": "true" }).to_string();
             let r = build_reply(&svc, "host-power", Some(&str_confirm));
-            assert!(r.contains("requires confirm:true"), "{op} confirm:'true': {r}");
+            assert!(
+                r.contains("requires confirm:true"),
+                "{op} confirm:'true': {r}"
+            );
             // With confirm:true the gate passes — it then falls to the dom0
             // allow-list (empty in test), proving the confirm check is no longer
             // the blocker.
-            let confirmed =
-                json!({ "dom0": "172.20.0.9", "op": op, "confirm": true }).to_string();
+            let confirmed = json!({ "dom0": "172.20.0.9", "op": op, "confirm": true }).to_string();
             let r = build_reply(&svc, "host-power", Some(&confirmed));
             assert!(
                 r.contains("dom0 not in allowed set"),

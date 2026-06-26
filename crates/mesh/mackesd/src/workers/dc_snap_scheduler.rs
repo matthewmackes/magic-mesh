@@ -730,7 +730,10 @@ mod tests {
         let mut destroyed = prune_targets(&snaps, 2);
         destroyed.sort();
         // Newest two (b=500, d=400) survive; a,c,e are destroyed.
-        assert_eq!(destroyed, vec!["a".to_string(), "c".to_string(), "e".to_string()]);
+        assert_eq!(
+            destroyed,
+            vec!["a".to_string(), "c".to_string(), "e".to_string()]
+        );
     }
 
     #[test]
@@ -772,7 +775,11 @@ mod tests {
     fn prune_only_ever_names_inputs_it_was_given() {
         // The worker only feeds prune_targets its OWN prefix-tagged snapshots, so
         // every returned uuid is one of the inputs — never an operator snapshot.
-        let snaps = vec![("s1".to_string(), 1), ("s2".to_string(), 2), ("s3".to_string(), 3)];
+        let snaps = vec![
+            ("s1".to_string(), 1),
+            ("s2".to_string(), 2),
+            ("s3".to_string(), 3),
+        ];
         for uuid in prune_targets(&snaps, 1) {
             assert!(["s1", "s2", "s3"].contains(&uuid.as_str()));
         }
@@ -834,7 +841,8 @@ mod tests {
         let s = Schedule::parse(body).unwrap();
         assert_eq!(s.interval_secs, 3600);
         // The `cadence` alias is honored too.
-        let body2 = r#"{"kind":"snap-schedule","sr":"sr-3","retention":1,"cadence":7200,"dom0":"h"}"#;
+        let body2 =
+            r#"{"kind":"snap-schedule","sr":"sr-3","retention":1,"cadence":7200,"dom0":"h"}"#;
         assert_eq!(Schedule::parse(body2).unwrap().interval_secs, 7200);
     }
 
@@ -867,7 +875,10 @@ mod tests {
         assert_eq!(v["ts"], 1_700_000_000_u64);
         assert_eq!(v["snapshot"], "snap-9");
         // The ts is recoverable for last-run tracking across restarts.
-        assert_eq!(RunRecord::last_ts_from_body(&ok.body()), Some(1_700_000_000));
+        assert_eq!(
+            RunRecord::last_ts_from_body(&ok.body()),
+            Some(1_700_000_000)
+        );
 
         let fail = RunRecord {
             sr: "sr-2".into(),
@@ -920,6 +931,9 @@ mod tests {
         );
         // The uuid guard is hex+dash only (the storage RPCs' class), so the
         // fixture uses a hex uuid.
-        assert_eq!(destroy_command("5ab1-c0de").unwrap(), "vdi-destroy uuid=5ab1-c0de");
+        assert_eq!(
+            destroy_command("5ab1-c0de").unwrap(),
+            "vdi-destroy uuid=5ab1-c0de"
+        );
     }
 }

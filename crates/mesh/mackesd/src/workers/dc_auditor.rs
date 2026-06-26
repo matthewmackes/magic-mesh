@@ -403,9 +403,7 @@ mod tests {
         assert!(body.contains(r#""result":"issued""#));
         assert!(body.contains(r#""target":"web1""#));
         // Second sight of the SAME ulid → no record (deduped).
-        assert!(a
-            .observe("action/dc/vm-power", "ulid-1", "{}", 0)
-            .is_none());
+        assert!(a.observe("action/dc/vm-power", "ulid-1", "{}", 0).is_none());
         // A different ulid → a fresh record.
         assert!(a
             .observe("action/dc/droplet-create", "ulid-2", "{}", 0)
@@ -464,7 +462,12 @@ mod tests {
         let mut a = DcAuditor::new();
         // VM verb → uuid.
         let r = a
-            .observe("action/dc/vm-power", "t1", r#"{"uuid":"vm-uuid","op":"on"}"#, 1)
+            .observe(
+                "action/dc/vm-power",
+                "t1",
+                r#"{"uuid":"vm-uuid","op":"on"}"#,
+                1,
+            )
             .unwrap();
         assert_eq!(r.target, "vm-uuid");
         // Storage verb → vbd (a detach body).
@@ -477,9 +480,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(r.target, "ba5e"); // vbd beats dom0 in priority
-        // Host verb → dom0 (no higher-priority field present).
+                                      // Host verb → dom0 (no higher-priority field present).
         let r = a
-            .observe("action/dc/host-power", "t3", r#"{"dom0":"10.0.0.9","op":"reboot"}"#, 1)
+            .observe(
+                "action/dc/host-power",
+                "t3",
+                r#"{"dom0":"10.0.0.9","op":"reboot"}"#,
+                1,
+            )
             .unwrap();
         assert_eq!(r.target, "10.0.0.9");
         // Lighthouse verb → node.
@@ -493,9 +501,7 @@ mod tests {
             .unwrap();
         assert_eq!(r.target, "shadow-1");
         // No recognized field / non-JSON → empty target (honest, not invented).
-        let r = a
-            .observe("action/dc/do-regions", "t5", "{}", 1)
-            .unwrap();
+        let r = a.observe("action/dc/do-regions", "t5", "{}", 1).unwrap();
         assert_eq!(r.target, "");
         let r = a
             .observe("action/dc/vm-power", "t6", "not json", 1)

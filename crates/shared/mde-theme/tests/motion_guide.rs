@@ -86,7 +86,10 @@ fn pattern4_animator_one_clock() {
 #[test]
 fn pattern5_reduce_motion_fallback() {
     let reduced = Motion::loading().resolved(true);
-    assert_eq!(reduced.duration, Duration::from_millis(REDUCE_MOTION_CAP_MS));
+    assert_eq!(
+        reduced.duration,
+        Duration::from_millis(REDUCE_MOTION_CAP_MS)
+    );
     assert!(!reduced.looping);
 
     let tw = Tween::resolved(Instant::now(), Duration::from_millis(400), true);
