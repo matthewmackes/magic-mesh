@@ -255,6 +255,34 @@ pub fn roster_from_directory(peers: &[PeerRecord]) -> Vec<LighthouseAddr> {
     out
 }
 
+/// LIGHTHOUSE-10 / HA — the **signer** roster: [`roster_from_directory`] plus a
+/// guaranteed self entry. A founding lighthouse — or any lighthouse before its own
+/// heartbeat has replicated into the directory — must still hand a joining peer at
+/// least itself, so when no directory row already carries `self_external` we append
+/// a self entry. Deduped by `external_addr` (the directory is one-row-per-host, but
+/// self may already be present). `self_overlay` is the caller's LIVE overlay IP
+/// (e.g. from `own_nebula_ip()`), never a hardcoded literal, so a geo lighthouse on
+/// `.4`/`.5` self-advertises its real address. Used by every bundle-signing path
+/// (the `/enroll` listener, the CSR auto-signer, the `ca sign-csr` CLI) so the
+/// self-inclusion logic can't drift between them.
+#[must_use]
+pub fn roster_with_self(
+    peers: &[PeerRecord],
+    self_node_id: &str,
+    self_overlay: &str,
+    self_external: &str,
+) -> Vec<LighthouseAddr> {
+    let mut entries = roster_from_directory(peers);
+    if !entries.iter().any(|e| e.external_addr == self_external) {
+        entries.push(LighthouseAddr {
+            node_id: self_node_id.to_string(),
+            overlay_ip: self_overlay.to_string(),
+            external_addr: self_external.to_string(),
+        });
+    }
+    entries
+}
+
 /// The pure binary-health classifier (Q3/Q15). Green requires data AND
 /// presence AND overlay AND — only when this is the master — a healthy master
 /// service. The first failing condition (checked in escalation order) picks the
@@ -347,6 +375,53 @@ mod tests {
         let mut p = lh(host, "healthy", Some(overlay), 1_000_000);
         p.external_addr = Some(external.to_string());
         p
+    }
+
+    #[test]
+    fn roster_with_self_appends_self_when_absent_from_directory() {
+        // A founding LH whose own heartbeat hasn't replicated yet: the directory
+        // has two OTHER lighthouses, and self must still be handed out.
+        let peers = vec![
+            lh_full("lh-02", "10.42.0.2", "203.0.113.2:4242"),
+            lh_full("lh-03", "10.42.0.3", "203.0.113.3:4242"),
+        ];
+        let roster = roster_with_self(&peers, "self-lh", "10.42.0.1", "203.0.113.1:4242");
+        assert_eq!(roster.len(), 3, "the two directory LHs + self");
+        let me = roster
+            .iter()
+            .find(|e| e.external_addr == "203.0.113.1:4242")
+            .expect("self present");
+        assert_eq!(me.node_id, "self-lh");
+        assert_eq!(me.overlay_ip, "10.42.0.1");
+    }
+
+    #[test]
+    fn roster_with_self_dedups_self_when_already_in_directory() {
+        // Self's own directory row is already present (heartbeat replicated) — it
+        // must NOT be double-listed.
+        let peers = vec![
+            lh_full("self-lh", "10.42.0.1", "203.0.113.1:4242"),
+            lh_full("lh-02", "10.42.0.2", "203.0.113.2:4242"),
+        ];
+        let roster = roster_with_self(&peers, "self-lh", "10.42.0.1", "203.0.113.1:4242");
+        assert_eq!(roster.len(), 2, "self deduped by external_addr");
+        assert_eq!(
+            roster
+                .iter()
+                .filter(|e| e.external_addr == "203.0.113.1:4242")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn roster_with_self_propagates_the_provided_overlay_not_a_literal() {
+        // A geo lighthouse on .5 must self-advertise its REAL overlay, never the
+        // conventional 10.42.0.1 founder literal.
+        let roster = roster_with_self(&[], "geo-lh", "10.42.0.5", "198.51.100.5:4242");
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].overlay_ip, "10.42.0.5");
+        assert_eq!(roster[0].external_addr, "198.51.100.5:4242");
     }
 
     #[test]

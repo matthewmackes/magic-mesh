@@ -191,19 +191,35 @@ impl NebulaCsrWatcher {
                 return;
             }
         };
+        // LIGHTHOUSE-10 — hand each joining peer the FULL lighthouse roster from
+        // the canonical directory (etcd-first), self-included, so multiple
+        // lighthouses are actually redundant. Built ONCE per tick (it doesn't vary
+        // per peer) and only when there is signing to do. Self-overlay is the live
+        // nebula1 IP, never the "10.42.0.1" literal, so a geo lighthouse on .4/.5
+        // self-advertises its real address. This replaces the old single-entry
+        // hardcode that made the 2nd..Nth lighthouse non-redundant.
+        let self_overlay =
+            crate::voip_rtt::own_nebula_ip().unwrap_or_else(|| "10.42.0.1".to_string());
+        let directory = crate::substrate::peers::read_directory(&self.workgroup_root);
+        let lighthouses: Vec<crate::ca::bundle::LighthouseEntry> =
+            mackes_mesh_types::lighthouse::roster_with_self(
+                &directory,
+                &self.local_node_id,
+                &self_overlay,
+                &self.lighthouse_addr,
+            )
+            .into_iter()
+            .map(|a| crate::ca::bundle::LighthouseEntry {
+                node_id: a.node_id,
+                overlay_ip: a.overlay_ip,
+                external_addr: a.external_addr,
+            })
+            .collect();
         for peer_id in peers {
             if !needs_signing(&self.workgroup_root, &peer_id).unwrap_or(true) {
                 continue;
             }
-            let lighthouses = vec![crate::ca::bundle::LighthouseEntry {
-                node_id: self.local_node_id.clone(),
-                // Conventional first-host address — matches the
-                // CLI default. Operators on multi-IP setups can
-                // override at the CLI for one-off bundles or
-                // edit the bundle file directly.
-                overlay_ip: "10.42.0.1".to_string(),
-                external_addr: self.lighthouse_addr.clone(),
-            }];
+            let lighthouses = lighthouses.clone();
             // TUNE-11: the watcher NEVER auto-overrides the cap.
             // Operator overrides only flow through the explicit
             // `mackesd ca sign-csr --override-cap` CLI path.

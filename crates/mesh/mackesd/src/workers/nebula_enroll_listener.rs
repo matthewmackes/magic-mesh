@@ -81,40 +81,32 @@ struct EnrollContext {
 }
 
 impl EnrollContext {
-    /// LIGHTHOUSE-10 — build the bundle's lighthouse roster from the replicated
-    /// peer directory so a joining node learns the FULL set of lighthouses, not
-    /// just the one it enrolled through (that single-entry roster was the bug
-    /// that made multiple lighthouses non-redundant). Reads every
-    /// `role=="lighthouse"` directory record carrying an overlay + external
-    /// address. Always includes THIS lighthouse from its own config — the
-    /// founding lighthouse (or any LH before its heartbeat replicates) must hand
-    /// out at least itself, and self may not be in the directory yet.
+    /// LIGHTHOUSE-10 — build the bundle's lighthouse roster from the **canonical
+    /// directory** so a joining node learns the FULL set of lighthouses, not just
+    /// the one it enrolled through (that single-entry roster was the bug that made
+    /// multiple lighthouses non-redundant). Reads etcd-first via
+    /// [`crate::substrate::peers::read_directory`] — on a cut-over node the live
+    /// rows are in etcd, NOT the frozen fs union, so a plain `read_peers` here
+    /// would miss every lighthouse added after cut-over (Gap A). Every
+    /// `role=="lighthouse"` directory record carrying an overlay + external becomes
+    /// an entry; self is always included via the shared
+    /// [`mackes_mesh_types::lighthouse::roster_with_self`] (founding LH / pre-
+    /// heartbeat LH must hand out at least itself).
     fn roster(&self) -> Vec<LighthouseEntry> {
-        let peers = mackes_mesh_types::peers::read_peers(&mackes_mesh_types::peers::peers_dir(
-            &self.workgroup_root,
-        ));
-        let mut entries: Vec<LighthouseEntry> =
-            mackes_mesh_types::lighthouse::roster_from_directory(&peers)
-                .into_iter()
-                .map(|a| LighthouseEntry {
-                    node_id: a.node_id,
-                    overlay_ip: a.overlay_ip,
-                    external_addr: a.external_addr,
-                })
-                .collect();
-        // Guarantee self is present — deduped by external_addr so we don't
-        // double-list when this LH's own directory row is already included.
-        if !entries
-            .iter()
-            .any(|e| e.external_addr == self.external_addr)
-        {
-            entries.push(LighthouseEntry {
-                node_id: self.local_node_id.clone(),
-                overlay_ip: self.self_overlay.clone(),
-                external_addr: self.external_addr.clone(),
-            });
-        }
-        entries
+        let peers = crate::substrate::peers::read_directory(&self.workgroup_root);
+        mackes_mesh_types::lighthouse::roster_with_self(
+            &peers,
+            &self.local_node_id,
+            &self.self_overlay,
+            &self.external_addr,
+        )
+        .into_iter()
+        .map(|a| LighthouseEntry {
+            node_id: a.node_id,
+            overlay_ip: a.overlay_ip,
+            external_addr: a.external_addr,
+        })
+        .collect()
     }
 }
 

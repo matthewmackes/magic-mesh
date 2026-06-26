@@ -160,6 +160,13 @@ impl NebulaSupervisor {
             self.last_is_leader = is_leader_now;
         }
 
+        // 1.5 HA — keep THIS node's bundle lighthouse roster in sync with the
+        //     canonical directory so a newly-added lighthouse propagates to an
+        //     already-enrolled peer (e.g. Eagle) without a re-enroll. Rewrites the
+        //     bundle (bumping its mtime) only on a real change; the mtime watch in
+        //     step 2 then re-renders /etc/nebula + reloads nebula.
+        self.reconcile_lighthouse_roster();
+
         // 2. Watch the bundle file + the revocation blocklist for
         //    changes (ENT-3: a revoke anywhere must evict here).
         let blocklist_now = crate::ca::blocklist::all_fingerprints(&self.workgroup_root);
@@ -272,6 +279,67 @@ impl NebulaSupervisor {
             let _ = systemctl_reload("nebula-lighthouse.service");
         }
         Ok(())
+    }
+
+    /// HA — propagate a changed lighthouse SET into THIS node's own bundle so an
+    /// already-enrolled peer (e.g. Eagle) picks up a newly-added lighthouse WITHOUT
+    /// re-enrolling. The full roster is assembled from the directory only at first
+    /// enroll (the `/enroll` listener), so without this an enrolled peer's bundle —
+    /// and thus its `static_host_map` / `lighthouse.hosts` — is frozen and never
+    /// learns a lighthouse added later (Gap C). Each tick this reads the canonical
+    /// directory (etcd-first), derives the lighthouse roster, and — only when it
+    /// differs from the bundle's current roster AND is non-empty — rewrites the
+    /// bundle's `lighthouses`. The atomic write bumps the bundle mtime, so the
+    /// mtime watch in [`Self::tick`] re-renders `/etc/nebula` + reloads nebula on
+    /// the same/next tick. Runs on EVERY node and only ever rewrites its OWN
+    /// bundle — no cross-node fs assumptions. A node that is itself a directory
+    /// lighthouse self-includes here and `refresh_config` then renders
+    /// `am_lighthouse: true` (the self-promotion path for a newly-joined LH).
+    ///
+    /// The non-empty guard is load-bearing: a transient empty/failed directory read
+    /// must NEVER wipe a peer's lighthouse set and strand it off the overlay.
+    fn reconcile_lighthouse_roster(&self) {
+        let peers = crate::substrate::peers::read_directory(&self.workgroup_root);
+        let mut roster: Vec<crate::ca::bundle::LighthouseEntry> =
+            mackes_mesh_types::lighthouse::roster_from_directory(&peers)
+                .into_iter()
+                .map(|a| crate::ca::bundle::LighthouseEntry {
+                    node_id: a.node_id,
+                    overlay_ip: a.overlay_ip,
+                    external_addr: a.external_addr,
+                })
+                .collect();
+        if roster.is_empty() {
+            // Never strand a peer on a transient empty/failed read — keep the
+            // bundle's existing roster untouched.
+            return;
+        }
+        let mut bundle = match crate::ca::bundle::read_bundle(&self.bundle_path) {
+            Ok(b) => b,
+            // No bundle yet (pre-enroll) — nothing to reconcile.
+            Err(_) => return,
+        };
+        // Compare as sets (sorted by node_id) so render-order differences alone
+        // don't trigger a rewrite/reload every tick.
+        roster.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        let mut current = bundle.lighthouses.clone();
+        current.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        if current == roster {
+            return;
+        }
+        let count = roster.len();
+        bundle.lighthouses = roster;
+        match crate::ca::bundle::write_bundle(&self.bundle_path, &bundle) {
+            Ok(()) => tracing::info!(
+                count,
+                "nebula-supervisor: reconciled lighthouse roster from directory \
+                 (bundle rewritten; nebula will reload via the mtime watch)"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "nebula-supervisor: lighthouse roster reconcile write failed"
+            ),
+        }
     }
 }
 
@@ -940,6 +1008,93 @@ mod tests {
             .await
             .expect("worker must exit");
         assert!(result.is_ok());
+    }
+
+    // HA / Gap-C — an already-enrolled peer (e.g. Eagle) picks up newly-added
+    // lighthouses via the supervisor's directory→bundle reconcile, with no
+    // re-enroll. Tests use the fs fallback (no etcd endpoints file → fs union).
+
+    fn seed_lighthouse(root: &Path, host: &str, overlay: &str, external: &str) {
+        let mut p = mackes_mesh_types::peers::PeerRecord::now(host, None, "healthy");
+        p.role = Some(mackes_mesh_types::lighthouse::LIGHTHOUSE_ROLE.to_string());
+        p.overlay_ip = Some(overlay.to_string());
+        p.external_addr = Some(external.to_string());
+        mackes_mesh_types::peers::write_peer_record(&mackes_mesh_types::peers::peers_dir(root), &p)
+            .expect("seed lighthouse record");
+    }
+
+    #[test]
+    fn reconcile_grows_an_enrolled_peers_bundle_to_the_full_roster() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        // The canonical directory carries THREE lighthouses.
+        seed_lighthouse(&root, "lh-01", "10.42.0.1", "203.0.113.1:4242");
+        seed_lighthouse(&root, "lh-02", "10.42.0.2", "203.0.113.2:4242");
+        seed_lighthouse(&root, "lh-03", "10.42.0.3", "203.0.113.3:4242");
+        // An EXISTING peer (Eagle-like, overlay .9) whose frozen bundle still
+        // lists only the founder — the pre-LIGHTHOUSE-10 single-entry case.
+        let bundle_path = root.join("nebula-bundle.json");
+        let mut b = sample_bundle();
+        b.overlay_ip = "10.42.0.9".into(); // a peer, not a lighthouse
+        b.lighthouses = vec![LighthouseEntry {
+            node_id: "lh-01".into(),
+            overlay_ip: "10.42.0.1".into(),
+            external_addr: "203.0.113.1:4242".into(),
+        }];
+        crate::ca::bundle::write_bundle(&bundle_path, &b).expect("seed bundle");
+
+        let conn = crate::store::open(&root.join("store.sqlite")).expect("open");
+        let s = NebulaSupervisor::new(
+            Arc::new(Mutex::new(conn)),
+            "peer:eagle".into(),
+            "m1".into(),
+            bundle_path.clone(),
+        )
+        .with_workgroup_root(root.clone());
+        s.reconcile_lighthouse_roster();
+
+        let after = crate::ca::bundle::read_bundle(&bundle_path).expect("read");
+        let mut ids: Vec<_> = after
+            .lighthouses
+            .iter()
+            .map(|l| l.node_id.clone())
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "lh-01".to_string(),
+                "lh-02".to_string(),
+                "lh-03".to_string()
+            ],
+            "an enrolled peer's bundle must grow to the full directory roster"
+        );
+    }
+
+    #[test]
+    fn reconcile_never_wipes_the_roster_on_an_empty_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        // No lighthouse records in the directory (transient empty / failed read).
+        let bundle_path = root.join("nebula-bundle.json");
+        crate::ca::bundle::write_bundle(&bundle_path, &sample_bundle()).expect("seed bundle");
+
+        let conn = crate::store::open(&root.join("store.sqlite")).expect("open");
+        let s = NebulaSupervisor::new(
+            Arc::new(Mutex::new(conn)),
+            "peer:test".into(),
+            "m1".into(),
+            bundle_path.clone(),
+        )
+        .with_workgroup_root(root.clone());
+        s.reconcile_lighthouse_roster();
+
+        let after = crate::ca::bundle::read_bundle(&bundle_path).expect("read");
+        assert_eq!(
+            after.lighthouses.len(),
+            1,
+            "an empty directory read must NOT wipe the existing roster (anti-strand guard)"
+        );
     }
 
     #[test]

@@ -3283,34 +3283,59 @@ fn main() -> anyhow::Result<()> {
                             external_addr: addr,
                         }]
                     } else {
+                        // LIGHTHOUSE-10 — no explicit --lighthouse-addr: build the
+                        // FULL roster from the canonical directory (etcd-first),
+                        // self-included, so a manually-signed peer learns EVERY
+                        // lighthouse (parity with the /enroll listener + auto-
+                        // signer), not just this signer's own bundle. Self overlay
+                        // = live nebula1 IP; self external = persisted lighthouse
+                        // addr, else this node's own bundle entry, else a hostname
+                        // guess (the legacy last resort kept for a pre-heartbeat
+                        // founder).
+                        let self_overlay = mackesd_core::voip_rtt::own_nebula_ip()
+                            .unwrap_or_else(|| "10.42.0.1".to_string());
                         let self_bundle = mackesd_core::ca::bundle::read_bundle(
                             &mackesd_core::ca::bundle::bundle_path(&workgroup_root, &local_id),
                         );
-                        match self_bundle {
-                            Ok(b) if !b.lighthouses.is_empty() => b.lighthouses,
-                            _ => {
+                        let self_external = mackesd_core::lighthouse_addr::read_external_addr()
+                            .or_else(|| {
+                                self_bundle.as_ref().ok().and_then(|b| {
+                                    b.lighthouses
+                                        .iter()
+                                        .find(|l| l.node_id == local_id)
+                                        .or_else(|| b.lighthouses.first())
+                                        .map(|l| l.external_addr.clone())
+                                })
+                            })
+                            .unwrap_or_else(|| {
                                 let host = std::fs::read_to_string("/etc/hostname")
                                     .ok()
                                     .map(|s| s.trim().to_string())
                                     .filter(|s| !s.is_empty())
                                     .unwrap_or_else(default_node_id);
                                 eprintln!(
-                                    "mackesd ca sign-csr: no lighthouse bundle at {} — \
-                                     falling back to hostname '{host}:4242', which the peer \
-                                     may not resolve. Pass --lighthouse-addr <public-ip>:4242.",
-                                    mackesd_core::ca::bundle::bundle_path(
-                                        &workgroup_root,
-                                        &local_id
-                                    )
-                                    .display()
+                                    "mackesd ca sign-csr: no persisted external-addr or \
+                                     lighthouse bundle — falling back to hostname \
+                                     '{host}:4242', which the peer may not resolve. Pass \
+                                     --lighthouse-addr <public-ip>:4242."
                                 );
-                                vec![mackesd_core::ca::bundle::LighthouseEntry {
-                                    node_id: local_id.clone(),
-                                    overlay_ip: "10.42.0.1".to_string(),
-                                    external_addr: format!("{host}:4242"),
-                                }]
-                            }
-                        }
+                                format!("{host}:4242")
+                            });
+                        let directory =
+                            mackesd_core::substrate::peers::read_directory(&workgroup_root);
+                        mackes_mesh_types::lighthouse::roster_with_self(
+                            &directory,
+                            &local_id,
+                            &self_overlay,
+                            &self_external,
+                        )
+                        .into_iter()
+                        .map(|a| mackesd_core::ca::bundle::LighthouseEntry {
+                            node_id: a.node_id,
+                            overlay_ip: a.overlay_ip,
+                            external_addr: a.external_addr,
+                        })
+                        .collect()
                     };
                     match mackesd_core::nebula_enroll::sign_pending_csr(
                         &mackesd_core::ca::SubprocessBackend,

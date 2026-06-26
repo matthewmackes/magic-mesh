@@ -137,3 +137,23 @@ pub fn read_peers_blocking(endpoints: &[String]) -> Option<Vec<PeerRecord>> {
     })
     .flatten()
 }
+
+/// The canonical peer directory for this node: the **etcd** substrate when the
+/// coordination plane is provisioned (`/etc/mackesd/etcd-endpoints` non-empty),
+/// else the replicated **fs** union (`<workgroup_root>/peers/*.json`). This is the
+/// etcd-first-with-fs-fallback precedence the directory responder
+/// ([`crate::ipc::directory`]), the health reconciler, and the lighthouse probe
+/// already use — centralized here so every reader sees the same canonical
+/// directory. SUBSTRATE/HA fix: the enroll roster + nebula supervisor reconcile
+/// MUST read through this, not the fs union directly, or they go blind to live
+/// etcd rows (a new lighthouse) on a cut-over node.
+#[must_use]
+pub fn read_directory(workgroup_root: &std::path::Path) -> Vec<PeerRecord> {
+    let eps = crate::substrate::etcd::default_endpoints();
+    if !eps.is_empty() {
+        if let Some(rows) = read_peers_blocking(&eps) {
+            return rows;
+        }
+    }
+    mackes_mesh_types::peers::read_peers(&mackes_mesh_types::peers::peers_dir(workgroup_root))
+}
