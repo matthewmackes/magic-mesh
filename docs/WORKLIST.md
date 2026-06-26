@@ -1873,12 +1873,12 @@ the plane and it **survives killing the current zone leader**.
 - [ ] **DATACENTER-18: New-Mesh genesis wizard ("give birth to a new Nebula").**
   **Acceptance**:
     - [ ] wizard: generate CA → provision+found first lighthouse → seed → register DNS → emit first join token; genesis secrets sourced from the mesh store (optional private repo = templates + age-encrypted only, no plaintext); a brand-new working mesh results
-- [>] **DATACENTER-19: DO provisioning (region picker + guided new-lighthouse).**
+- [>] **DATACENTER-19: DO provisioning (region picker + guided new-lighthouse).** _(2026-06-25 — UI + Tofu-write half DONE (bbc523e): the Network tab gains a region picker firing `action/dc/do-regions` with a geo-spread recommendation (skips already-used lighthouse regions), and a `lighthouse-create` verb writes a `digitalocean_droplet` block into the allow-listed `infra/tofu/zone1-do/dc-lighthouses.tf` (mirrors DC-11's vm-create), routing the operator to the gated zone1-do apply; 16 tests, gated green. **Stays [>]:** the live `tofu apply` (droplet provision) + `mackesd found --role lighthouse` bootstrap + the DNS A-record add need live DigitalOcean — deliberately not auto-run.)_
   *`action/dc/do-regions` RPC (doctl region list → slug/name/available) feeds the region picker. Remaining:
   the picker UI + multi-region-spread nudge + the guided new-lighthouse flow (droplet→bootstrap→found/join→DNS).*
   **Acceptance**:
     - [>] full region picker (geo + latency/price hints) with a multi-region-spread recommendation; fixed lighthouse profile (region the only knob); guided new-lighthouse: droplet (Tofu) → bootstrap mackesd → found/join prod mesh → add DNS record — *region-list RPC done; picker UI + guided flow pending*
-- [>] **DATACENTER-20: Build→Eagle→DO promotion pipeline.**
+- [>] **DATACENTER-20: Build→Eagle→DO promotion pipeline.** _(2026-06-25 — auto-promote + prod-arm DONE (c8c1568): leader-gated `dc_promote` reads the L1-L3 `event/test/{install,feature,stability}` verdicts and via pure `build_eagle_green`/`decide_promote` advances the matrix (Build+tiers green → eagle auto; DO gated armed/queued), failing closed on unknown version/non-green; a **persisted** prod-arm switch (`$XDG_CONFIG_HOME/mde/dc-prod-arm.json`) is shared by the GUI toggle + the leader and survives restart; the Overview renders the prod-arm bar + per-stage ready/auto/armed/queued chips; 10 tests, gated green. **Stays [>]:** live Eagle/lighthouse version reads + a real DO roll executor need live infra.)_
   *Version matrix done: a leader-gated `dc_promote` worker publishes the build version (RPM artifact / git
   describe) + eagle/do stages to `event/dc/promote/*`; the Overview shows a Build→Eagle→DO strip with
   per-stage version + readiness chip. Remaining: live eagle/lighthouse version reads, auto-promote-on-green,
