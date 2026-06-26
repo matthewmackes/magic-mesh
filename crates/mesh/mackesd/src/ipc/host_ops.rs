@@ -121,6 +121,22 @@ pub fn host_power_commands(op: &str) -> Result<Vec<String>, String> {
     }
 }
 
+/// Whether a host-power `op` is *destructive / irreversible* and so must be
+/// `confirm:true`-gated. PURE.
+///
+/// `reboot` / `shutdown` bounce the whole host (every resident guest goes down);
+/// `evacuate` live-migrates every running guest off — all three are disruptive
+/// fleet-level operations on the §8/§9 flat-trust mesh and get the same
+/// typed-confirm contract as `vm-delete` / `vdi-detach` / `tofu-destroy`. The
+/// reversible maintenance toggles (`maintenance-on` / `maintenance-off`) are NOT
+/// gated — they only flip the host's scheduling flag and are trivially undone.
+/// An unknown op is treated as non-destructive here (the `host_power_commands`
+/// map rejects it on its own merits before any SSH).
+#[must_use]
+pub fn host_power_is_destructive(op: &str) -> bool {
+    matches!(op, "reboot" | "shutdown" | "evacuate")
+}
+
 /// Parse the `xe vm-list resident-on=<uuid> power-state=running --minimal` reply
 /// (a comma-separated list of running-guest uuids, possibly empty) into the count
 /// of guests that would be affected by draining/rebooting/shutting down the host.
@@ -1242,6 +1258,19 @@ pub fn build_reply(svc: &HostOpsService, verb: &str, req_body: Option<&str>) -> 
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
 
+    // DESTRUCTIVE: reboot / shutdown / evacuate bounce the host or live-migrate
+    // every guest off it. Refuse unless the caller explicitly confirms — the same
+    // fail-closed typed-confirm contract as `vm-delete` / `vdi-detach` /
+    // `tofu-destroy`, and the §8/§9-aligned way to guard the dangerous ops without
+    // RBAC. Checked BEFORE the op→verb map and the dom0 allow-list so an
+    // unconfirmed destructive op never reaches the network. The reversible
+    // maintenance toggles are NOT gated.
+    if host_power_is_destructive(op)
+        && req.get("confirm").and_then(serde_json::Value::as_bool) != Some(true)
+    {
+        return err(format!("host {op} requires confirm:true"));
+    }
+
     // Map the op to its `xe` verb sequence BEFORE any SSH — an unknown op never
     // reaches the network.
     let verbs = match host_power_commands(op) {
@@ -1746,6 +1775,73 @@ mod tests {
         assert!(host_power_commands("").is_err());
         // A bogus op is rejected; the five mapped ops above are not.
         assert!(host_power_commands("poweroff").is_err());
+    }
+
+    #[test]
+    fn host_power_is_destructive_classifies_the_dangerous_ops() {
+        // The three host-level ops that bounce the host / move every guest.
+        assert!(host_power_is_destructive("reboot"));
+        assert!(host_power_is_destructive("shutdown"));
+        assert!(host_power_is_destructive("evacuate"));
+        // The reversible maintenance toggles are NOT gated.
+        assert!(!host_power_is_destructive("maintenance-on"));
+        assert!(!host_power_is_destructive("maintenance-off"));
+        // An unknown op is not classified destructive (host_power_commands rejects
+        // it on its own).
+        assert!(!host_power_is_destructive("poweroff"));
+    }
+
+    #[test]
+    fn host_power_destructive_ops_require_confirm_true() {
+        // Each destructive op refuses without an explicit confirm:true — checked
+        // BEFORE the op→verb map + dom0 allow-list, so a present-but-unconfirmed
+        // body is rejected on the confirm gate (mirrors vm-delete / vdi-detach).
+        let svc = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        for op in ["reboot", "shutdown", "evacuate"] {
+            // confirm missing → rejected on the gate.
+            let no_confirm = json!({ "dom0": "172.20.0.9", "op": op }).to_string();
+            let r = build_reply(&svc, "host-power", Some(&no_confirm));
+            assert!(
+                r.contains(&format!("host {op} requires confirm:true")),
+                "{op} without confirm: {r}"
+            );
+            // confirm:false → also rejected (fail-closed).
+            let false_confirm =
+                json!({ "dom0": "172.20.0.9", "op": op, "confirm": false }).to_string();
+            let r = build_reply(&svc, "host-power", Some(&false_confirm));
+            assert!(r.contains("requires confirm:true"), "{op} confirm:false: {r}");
+            // confirm as a non-bool string does NOT satisfy the gate.
+            let str_confirm =
+                json!({ "dom0": "172.20.0.9", "op": op, "confirm": "true" }).to_string();
+            let r = build_reply(&svc, "host-power", Some(&str_confirm));
+            assert!(r.contains("requires confirm:true"), "{op} confirm:'true': {r}");
+            // With confirm:true the gate passes — it then falls to the dom0
+            // allow-list (empty in test), proving the confirm check is no longer
+            // the blocker.
+            let confirmed =
+                json!({ "dom0": "172.20.0.9", "op": op, "confirm": true }).to_string();
+            let r = build_reply(&svc, "host-power", Some(&confirmed));
+            assert!(
+                r.contains("dom0 not in allowed set"),
+                "{op} confirm:true should pass the gate: {r}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_power_reversible_ops_are_not_confirm_gated() {
+        // The maintenance toggles need no confirm — they fall straight through to
+        // the dom0 allow-list (empty in test), never the confirm gate.
+        let svc = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        for op in ["maintenance-on", "maintenance-off"] {
+            let body = json!({ "dom0": "172.20.0.9", "op": op }).to_string();
+            let r = build_reply(&svc, "host-power", Some(&body));
+            assert!(
+                r.contains("dom0 not in allowed set"),
+                "{op} should not be confirm-gated: {r}"
+            );
+            assert!(!r.contains("requires confirm:true"), "{op}: {r}");
+        }
     }
 
     #[test]
