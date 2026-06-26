@@ -13,7 +13,7 @@
 //! load + projection here are pure and unit-tested.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use cosmic::iced::widget::{column, container, mouse_area, row, scrollable, text, text_input};
@@ -1145,6 +1145,15 @@ pub struct DatacenterPanel {
     /// never fire from the GUI on a typed-confirm alone. Non-prod workspaces are
     /// unaffected; defaults disarmed (fails closed). Toggled by `TofuProdArm`.
     pub tofu_prod_armed: bool,
+    /// DATACENTER-20 — the **prod-arm master switch for the auto-promote DO step**.
+    /// While disarmed (the default), a green Build→Eagle pipeline HOLDS at the DO
+    /// step (the `dc_promote` worker marks it `queued`); arming lets the leader
+    /// auto-promote to DO on green (the worker marks it `armed`). Mirrors
+    /// `tofu_prod_armed` but, unlike it, PERSISTS — the GUI toggle writes the same
+    /// `dc-prod-arm.json` config the worker reads, so the gate is shared and
+    /// survives a restart. Defaults disarmed (fails closed); toggled by
+    /// `PromoteProdArm`, hydrated from disk by the first panel-open `load()`.
+    pub promote_prod_armed: bool,
     /// Which `Topology`-view group headers are currently expanded — a set of host
     /// `id`s (the synthetic Prod/Gateway group uses the empty-string key). A host
     /// header is rendered expanded (children shown) iff its id is present; the
@@ -2009,6 +2018,62 @@ pub fn save_saved_views(views: &SavedViews) -> Result<(), String> {
     std::fs::write(&path, json.as_bytes()).map_err(|e| e.to_string())
 }
 
+/// DATACENTER-20 — the local config-file path the **auto-promote prod-arm master
+/// switch** persists to. MUST resolve to the exact same path the `dc_promote`
+/// worker reads (`dc_promote::prod_arm_path`) so the GUI toggle and the leader
+/// share one gate: `$XDG_CONFIG_HOME/mde/dc-prod-arm.json`, falling back to
+/// `$HOME/.config/mde/dc-prod-arm.json`. `None` only in a degenerate headless env
+/// (then the toggle is session-only; the worker defaults disarmed = fail-closed).
+#[must_use]
+pub fn promote_prod_arm_path() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .map(|d| d.join("mde").join("dc-prod-arm.json"))
+}
+
+/// DATACENTER-20 — read the persisted auto-promote prod-arm state from an
+/// explicit `path` (the pure, testable core of [`load_promote_prod_arm`]). A
+/// missing/empty/corrupt file ⇒ `false` (disarmed) — fails closed. The on-disk
+/// shape is the same `{"armed":bool}` record the worker writes/reads.
+#[must_use]
+pub fn load_promote_prod_arm_at(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("armed").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
+/// DATACENTER-20 — read the persisted auto-promote prod-arm state from the shared
+/// config path. Fails closed (disarmed) when there's no config dir or no file, so
+/// a fresh install never silently auto-promotes to prod.
+#[must_use]
+pub fn load_promote_prod_arm() -> bool {
+    promote_prod_arm_path().is_some_and(|p| load_promote_prod_arm_at(&p))
+}
+
+/// DATACENTER-20 — persist the auto-promote prod-arm state to an explicit `path`
+/// (the pure, testable core of [`save_promote_prod_arm`]), creating the parent
+/// dir if needed. Writes the `{"armed":bool}` record the `dc_promote` worker
+/// reads on its next tick.
+pub fn save_promote_prod_arm_at(path: &Path, armed: bool) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::json!({ "armed": armed }).to_string();
+    std::fs::write(path, json.as_bytes()).map_err(|e| e.to_string())
+}
+
+/// DATACENTER-20 — persist the auto-promote prod-arm state to the shared config
+/// path. Returns the error text on failure so the caller can surface it.
+pub fn save_promote_prod_arm(armed: bool) -> Result<(), String> {
+    let path = promote_prod_arm_path().ok_or_else(|| "no config dir (HOME unset)".to_string())?;
+    save_promote_prod_arm_at(&path, armed)
+}
+
 impl Default for DatacenterPanel {
     fn default() -> Self {
         Self {
@@ -2024,6 +2089,7 @@ impl Default for DatacenterPanel {
             tofu_state_ws: String::new(),
             tofu_destroy_confirm: None,
             tofu_prod_armed: false,
+            promote_prod_armed: false,
             confirm_delete: None,
             audit: Vec::new(),
             promote: Vec::new(),
@@ -2193,6 +2259,13 @@ pub enum Message {
     /// ([`PROD_TOFU_WS`]) is refused (mirrors the FA_APPLY operator gate); arming
     /// is a deliberate, separate action from the per-op typed-confirm.
     TofuProdArm(bool),
+    /// DATACENTER-20 — the **auto-promote prod-arm master switch** was toggled.
+    /// The payload is the new armed state. Disarmed ⇒ a green pipeline HOLDS at
+    /// the DO step (`queued`); armed ⇒ the leader auto-promotes to DO on green
+    /// (`armed`). Unlike `TofuProdArm` this PERSISTS to the `dc-prod-arm.json`
+    /// config the `dc_promote` worker reads, so the gate is shared with the
+    /// leader and survives a restart.
+    PromoteProdArm(bool),
     /// A VM "Clone" button was clicked. `uuid` is the VM id (`DcRow::id`);
     /// `dom0` is the owning dom0 IP (`DcRow::host`). Fires the
     /// `action/dc/vm-clone` RPC.
@@ -2714,6 +2787,12 @@ impl DatacenterPanel {
                 // setting (not row-derived), so it survives the refresh.
                 self.tofu_confirm = None;
                 self.tofu_destroy_confirm = None;
+                // DATACENTER-20 — hydrate the auto-promote prod-arm gate from the
+                // shared on-disk config so the strip reflects the SAME armed state
+                // the `dc_promote` leader is enforcing (it persists across
+                // restarts and is the source of truth for both sides). Cheap; a
+                // missing file ⇒ disarmed (fail-closed).
+                self.promote_prod_armed = load_promote_prod_arm();
                 // DATACENTER-11 — a refresh can change which VMs exist, so drop any
                 // pending per-VM prompt + the bulk selection / progress rather than
                 // act on a stale set. The create-wizard form is the operator's draft
@@ -2948,6 +3027,22 @@ impl DatacenterPanel {
                     "PROD armed — apply/destroy on the DO zone is now allowed.".into()
                 } else {
                     "PROD disarmed.".into()
+                };
+                Task::none()
+            }
+            Message::PromoteProdArm(armed) => {
+                // Flip + PERSIST to the shared config the `dc_promote` worker
+                // reads, so the leader picks up the new gate on its next tick. The
+                // in-memory flag updates regardless so the strip reflects it
+                // immediately; a failed write is surfaced but never lost (the
+                // next toggle retries).
+                self.promote_prod_armed = armed;
+                self.status = match save_promote_prod_arm(armed) {
+                    Ok(()) if armed => {
+                        "Auto-promote PROD armed — green pipelines now auto-promote to DO.".into()
+                    }
+                    Ok(()) => "Auto-promote PROD disarmed — the DO step is held (queued).".into(),
+                    Err(e) => format!("Prod-arm toggled but not persisted: {e}"),
                 };
                 Task::none()
             }
@@ -4455,6 +4550,54 @@ impl DatacenterPanel {
         );
         let line = row![
             text("Prod-arm master switch")
+                .colr(palette.text_muted.into_cosmic_color())
+                .width(Length::FillPortion(1)),
+            text(status_text)
+                .colr(status_color.into_cosmic_color())
+                .width(Length::FillPortion(2)),
+            toggle,
+        ]
+        .spacing(f32::from(spacing::BASE[2]))
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+        container(line)
+            .padding(f32::from(spacing::BASE[3]))
+            .width(Length::Fill)
+            .into()
+    }
+
+    /// DATACENTER-20 (Overview / promote strip) — the **auto-promote prod-arm
+    /// master switch** bar. Mirrors [`Self::tofu_prod_arm_bar`]: while disarmed
+    /// (the default), a green Build→Eagle pipeline HOLDS at the DO step
+    /// (`queued`); arming lets the `dc_promote` leader auto-promote to DO on
+    /// green. The toggle PERSISTS to the config the worker reads. Colors from
+    /// mde-theme tokens (danger = armed/live, success = safe-disarmed) — no raw
+    /// hex.
+    fn promote_prod_arm_bar(&self, palette: Palette) -> Element<'_, crate::Message> {
+        let (status_text, status_color) = if self.promote_prod_armed {
+            (
+                "ARMED — a green pipeline auto-promotes to DO".to_string(),
+                palette.danger,
+            )
+        } else {
+            (
+                "disarmed — the DO step is held (queued) until armed".to_string(),
+                palette.success,
+            )
+        };
+        let toggle = variant_button(
+            if self.promote_prod_armed {
+                "Disarm auto-promote".to_string()
+            } else {
+                "Arm auto-promote".to_string()
+            },
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::PromoteProdArm(
+                !self.promote_prod_armed,
+            ))),
+            palette,
+        );
+        let line = row![
+            text("Auto-promote prod-arm")
                 .colr(palette.text_muted.into_cosmic_color())
                 .width(Length::FillPortion(1)),
             text(status_text)
@@ -6412,9 +6555,18 @@ impl DatacenterPanel {
                 }
                 // Build → Eagle → DO promotion strip — a version matrix fed by
                 // `event/dc/promote/*`. Always renders all three stages (absent
-                // ones show "—") so the pipeline reads left-to-right.
+                // ones show "—") so the pipeline reads left-to-right. The
+                // DATACENTER-20 auto-promote advances Build→Eagle on green (the
+                // `auto` chip) and gates the DO step on the prod-arm switch below
+                // (`armed → DO` when live, `queued (hold)` when held).
                 col = col.push(text("Promotion").size(f32::from(spacing::BASE[5])));
                 col = col.push(promote_strip_view(&self.promote, palette));
+                // The prod-arm master switch for the auto-promote DO step. While
+                // disarmed (default), a green pipeline HOLDS at the DO step
+                // (queued); arming lets the leader auto-promote to DO on green.
+                // Mirrors the Tofu-tab prod-arm gate; persists to the same file
+                // the `dc_promote` worker reads.
+                col = col.push(self.promote_prod_arm_bar(palette));
                 // DATACENTER-9 — the per-target version matrix: farm / Eagle /
                 // each lighthouse. Where the strip above shows only the three
                 // pipeline stages, this adds a row per live lighthouse (a Prod
@@ -7903,23 +8055,22 @@ fn version_matrix_view(
     out
 }
 
-/// Render one promotion-stage card: the stage label, its version, and a readiness
-/// chip whose color comes from a mde-theme token (`success` for ready, `warning`
-/// for pending, `text_muted` for an unknown/absent placeholder). mde-theme tokens
-/// only.
-fn promote_card_view(stage: &PromoteStage, palette: Palette) -> Element<'static, crate::Message> {
-    // Human stage label.
-    let label = match stage.stage.as_str() {
-        "build" => "Build",
-        "eagle" => "Eagle",
-        "do" => "DO",
-        other => other,
-    }
-    .to_string();
-    // The chip color tracks readiness; the text is the raw status (or "—" when
-    // the stage is an unknown placeholder, so the chip reads cleanly).
-    let (chip_color, chip_text) = match stage.status.as_str() {
+/// Map a promote-stage status to its `(chip color, chip label)`. Pure so the
+/// strip's auto/queued/armed rendering is testable. DATACENTER-20 statuses:
+/// - `ready` → success (a real, green, serving version);
+/// - `auto` → success (auto-advanced off a green upstream — Eagle once Build is
+///   green);
+/// - `armed` → danger (the DO step is LIVE: green + prod-arm armed ⇒ auto-promote);
+/// - `queued` → warning (green but HELD until the operator arms prod);
+/// - `pending` → warning (upstream not green yet);
+/// - anything else / empty → muted "—" placeholder.
+#[must_use]
+fn promote_chip(status: &str, palette: Palette) -> (mde_theme::Rgba, String) {
+    match status {
         "ready" => (palette.success, "ready".to_string()),
+        "auto" => (palette.success, "auto ✓".to_string()),
+        "armed" => (palette.danger, "armed → DO".to_string()),
+        "queued" => (palette.warning, "queued (hold)".to_string()),
         "pending" => (palette.warning, "pending".to_string()),
         other => (
             palette.text_muted,
@@ -7929,7 +8080,23 @@ fn promote_card_view(stage: &PromoteStage, palette: Palette) -> Element<'static,
                 other.to_string()
             },
         ),
-    };
+    }
+}
+
+/// Render one promotion-stage card: the stage label, its version, and a readiness
+/// chip whose color comes from a mde-theme token (see [`promote_chip`]). mde-theme
+/// tokens only.
+fn promote_card_view(stage: &PromoteStage, palette: Palette) -> Element<'static, crate::Message> {
+    // Human stage label.
+    let label = match stage.stage.as_str() {
+        "build" => "Build",
+        "eagle" => "Eagle",
+        "do" => "DO",
+        other => other,
+    }
+    .to_string();
+    // The chip color tracks readiness; the text names the auto/queued/armed state.
+    let (chip_color, chip_text) = promote_chip(stage.status.as_str(), palette);
     let version = if stage.version.is_empty() {
         "—".to_string()
     } else {
@@ -11298,6 +11465,126 @@ mod tests {
         // And it stays reachable with no promote events at all (all placeholders).
         let empty = DatacenterPanel::new();
         let _ = empty.view();
+    }
+
+    // ---- DATACENTER-20: auto-promote states + prod-arm gate -----------------
+
+    #[test]
+    fn project_promote_reads_the_auto_queued_armed_states() {
+        // The worker now publishes the eagle/do stages with the auto/queued/armed
+        // statuses; the panel projection must carry them through verbatim.
+        let stages = project_promote(&[
+            (
+                "event/dc/promote/build".into(),
+                r#"{"stage":"build","version":"11.0.2","status":"ready"}"#.into(),
+            ),
+            (
+                "event/dc/promote/eagle".into(),
+                r#"{"stage":"eagle","version":"11.0.2","status":"auto"}"#.into(),
+            ),
+            (
+                "event/dc/promote/do".into(),
+                r#"{"stage":"do","version":"11.0.2","status":"queued"}"#.into(),
+            ),
+        ]);
+        let m = promote_matrix(&stages);
+        assert_eq!(m[0].status, "ready");
+        assert_eq!(m[1].status, "auto");
+        assert_eq!(m[2].status, "queued");
+        // And an armed DO step round-trips too.
+        let armed = project_promote(&[(
+            "event/dc/promote/do".into(),
+            r#"{"stage":"do","version":"11.0.2","status":"armed"}"#.into(),
+        )]);
+        assert_eq!(armed[0].status, "armed");
+    }
+
+    #[test]
+    fn promote_chip_maps_every_status_to_a_token() {
+        let pal = Palette::dark();
+        // ready + auto are both "green" (success).
+        assert_eq!(promote_chip("ready", pal).0, pal.success);
+        assert_eq!(promote_chip("auto", pal).0, pal.success);
+        // armed is LIVE → danger; its label names the DO promotion.
+        let (c, label) = promote_chip("armed", pal);
+        assert_eq!(c, pal.danger);
+        assert!(label.contains("DO"));
+        // queued is held → warning; pending is also warning.
+        assert_eq!(promote_chip("queued", pal).0, pal.warning);
+        assert_eq!(promote_chip("pending", pal).0, pal.warning);
+        // An unknown placeholder → muted "—".
+        let (c, label) = promote_chip("", pal);
+        assert_eq!(c, pal.text_muted);
+        assert_eq!(label, "—");
+        // An unrecognised status still renders (muted, raw text) rather than panic.
+        assert_eq!(promote_chip("weird", pal).1, "weird");
+    }
+
+    #[test]
+    fn promote_prod_arm_persists_and_fails_closed() {
+        // The persistence core (path-explicit, no env mutation) — the same
+        // `{"armed":bool}` config the `dc_promote` worker reads back. A temp file
+        // keeps the real `$HOME` config untouched.
+        let dir = std::env::temp_dir().join(format!("dc_panel_arm_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dc-prod-arm.json");
+        // Missing file → disarmed (fail-closed).
+        assert!(!load_promote_prod_arm_at(&path));
+        // Arm → persists → reads back armed.
+        save_promote_prod_arm_at(&path, true).expect("save armed");
+        assert!(load_promote_prod_arm_at(&path));
+        // Disarm → persists → reads back disarmed.
+        save_promote_prod_arm_at(&path, false).expect("save disarmed");
+        assert!(!load_promote_prod_arm_at(&path));
+        // A corrupt body → disarmed (fail-closed; never auto-promotes to prod).
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert!(!load_promote_prod_arm_at(&path));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn promote_prod_arm_toggle_flips_the_flag_and_status() {
+        // The handler flips the in-memory gate immediately (so the strip reflects
+        // it) and names the new state in the status line — independent of whether
+        // the persist write succeeds (which the persistence test covers).
+        let mut p = DatacenterPanel::new();
+        assert!(!p.promote_prod_armed); // defaults disarmed (fail-closed)
+        let _ = p.update(Message::PromoteProdArm(true));
+        assert!(p.promote_prod_armed);
+        assert!(p.status.to_lowercase().contains("armed"));
+        let _ = p.update(Message::PromoteProdArm(false));
+        assert!(!p.promote_prod_armed);
+        assert!(p.status.to_lowercase().contains("disarmed"));
+    }
+
+    #[test]
+    fn overview_renders_the_prod_arm_bar_and_auto_states() {
+        let mut p = DatacenterPanel::new();
+        // A green-and-armed pipeline: build ready, eagle auto, do armed — exercises
+        // the new chip branches + the prod-arm bar (armed = danger path).
+        p.promote = project_promote(&[
+            (
+                "event/dc/promote/build".into(),
+                r#"{"stage":"build","version":"11.0.2","status":"ready"}"#.into(),
+            ),
+            (
+                "event/dc/promote/eagle".into(),
+                r#"{"stage":"eagle","version":"11.0.2","status":"auto"}"#.into(),
+            ),
+            (
+                "event/dc/promote/do".into(),
+                r#"{"stage":"do","version":"11.0.2","status":"armed"}"#.into(),
+            ),
+        ]);
+        p.promote_prod_armed = true;
+        let _ = p.view();
+        // And the disarmed / queued path renders too.
+        p.promote_prod_armed = false;
+        p.promote = project_promote(&[(
+            "event/dc/promote/do".into(),
+            r#"{"stage":"do","version":"11.0.2","status":"queued"}"#.into(),
+        )]);
+        let _ = p.view();
     }
 
     // ---- DATACENTER-24: Health summary + alerts on Overview ----------------
