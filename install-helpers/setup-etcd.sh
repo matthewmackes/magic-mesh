@@ -30,6 +30,10 @@ MODE=""; JOIN_ANCHOR=""; LISTEN=""; NAME=""; ANCHORS=""; DATA_DIR=/var/lib/etcd
 CLUSTER_TOKEN="mcnf-mesh"
 ENDPOINTS_FILE=/etc/mackesd/etcd-endpoints
 ENV_FILE=/etc/etcd/etcd.env
+# HA: when mackesd has ALREADY done the cluster-side `member add` natively
+# (substrate::etcd_membership), it passes the resulting ETCD_INITIAL_CLUSTER here
+# so `--join` skips the etcdctl member-add and only writes env + starts the unit.
+INIT_CLUSTER_ARG=""
 
 while [ $# -gt 0 ]; do case "$1" in
   --init) MODE="init"; shift;;
@@ -39,6 +43,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --name) NAME="$2"; shift 2;;
   --anchors) ANCHORS="$2"; shift 2;;
   --data) DATA_DIR="$2"; shift 2;;
+  --initial-cluster) INIT_CLUSTER_ARG="$2"; shift 2;;
   *) echo "unknown arg: $1" >&2; exit 1;;
 esac; done
 
@@ -151,10 +156,18 @@ case "$MODE" in
     [ -z "$LISTEN" ] && { echo "no overlay IP (pass --listen)" >&2; exit 1; }
     [ -z "$JOIN_ANCHOR" ] && { echo "--join needs an anchor IP" >&2; exit 1; }
     log "joining etcd cluster via $JOIN_ANCHOR: $NAME @ $LISTEN"
-    # member add returns the ETCD_INITIAL_CLUSTER this node must start with.
-    ADD_OUT="$(ETCDCTL_API=3 etcdctl --endpoints="http://$JOIN_ANCHOR:2379" \
-      member add "$NAME" --peer-urls="http://$LISTEN:2380" 2>/dev/null || true)"
-    INIT_CLUSTER="$(echo "$ADD_OUT" | sed -n 's/^ *ETCD_INITIAL_CLUSTER="\(.*\)"/\1/p')"
+    if [ -n "$INIT_CLUSTER_ARG" ]; then
+      # mackesd already did the cluster-side member-add natively
+      # (substrate::etcd_membership) and handed us the resulting cluster string —
+      # just start the local member with it. No etcdctl member-add here.
+      INIT_CLUSTER="$INIT_CLUSTER_ARG"
+      log "using mackesd-supplied ETCD_INITIAL_CLUSTER (native member add)"
+    else
+      # Standalone path: member add returns the ETCD_INITIAL_CLUSTER to start with.
+      ADD_OUT="$(ETCDCTL_API=3 etcdctl --endpoints="http://$JOIN_ANCHOR:2379" \
+        member add "$NAME" --peer-urls="http://$LISTEN:2380" 2>/dev/null || true)"
+      INIT_CLUSTER="$(echo "$ADD_OUT" | sed -n 's/^ *ETCD_INITIAL_CLUSTER="\(.*\)"/\1/p')"
+    fi
     if [ -z "$INIT_CLUSTER" ]; then
       echo "member add did not return ETCD_INITIAL_CLUSTER (anchor $JOIN_ANCHOR reachable? already a member?)" >&2
       exit 1

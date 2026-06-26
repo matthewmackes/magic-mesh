@@ -3682,6 +3682,27 @@ fn main() -> anyhow::Result<()> {
                 std::path::Path::new("/etc/nebula"),
                 std::path::Path::new("/var/lib/mde/role.toml"),
             );
+            // HA — drop our own etcd cluster membership BEFORE stopping the overlay
+            // (the cluster is reached over nebula), so a retired node never leaves a
+            // ghost voter dragging quorum. Best-effort; a non-member is a no-op.
+            {
+                use mackesd_core::substrate::{etcd, etcd_membership};
+                let eps = etcd::default_endpoints();
+                if !eps.is_empty() {
+                    let sel = match mackesd_core::voip_rtt::own_nebula_ip() {
+                        Some(ip) => etcd_membership::MemberSel::Overlay(ip),
+                        None => etcd_membership::MemberSel::Hostname(hostname.clone()),
+                    };
+                    match etcd_membership::remove_member_blocking(&eps, &sel) {
+                        Some(Ok(true)) => println!("etcd: removed self from the cluster"),
+                        Some(Ok(false)) | None => {}
+                        Some(Err(e)) => eprintln!(
+                            "etcd: could not remove self ({e}) — prune the stale member \
+                             with `etcdctl member remove`"
+                        ),
+                    }
+                }
+            }
             let _ = std::process::Command::new("systemctl")
                 .args(["stop", "nebula.service"])
                 .status();
@@ -8374,6 +8395,28 @@ fn cmd_remove_peer(db_path: &std::path::Path, node_id: &str, force: bool) -> any
 
     let rows = mackesd_core::ca::revoke::revoke_peer(&conn, &root, &self_id, node_id)
         .context("revoking peer certs")?;
+
+    // HA — if the removed peer is an etcd cluster member (a lighthouse), drop it
+    // from the quorum too, so a deleted droplet never leaves a ghost voter.
+    // Idempotent: a non-member target (an ordinary peer) is a no-op.
+    {
+        use mackesd_core::substrate::{etcd, etcd_membership};
+        let eps = etcd::default_endpoints();
+        if !eps.is_empty() {
+            let target = node_id.strip_prefix("peer:").unwrap_or(node_id).to_string();
+            match etcd_membership::remove_member_blocking(
+                &eps,
+                &etcd_membership::MemberSel::Hostname(target),
+            ) {
+                Some(Ok(true)) => println!("etcd: removed '{node_id}' from the cluster"),
+                Some(Ok(false)) | None => {}
+                Some(Err(e)) => {
+                    eprintln!("etcd: could not remove '{node_id}' from the cluster ({e})");
+                }
+            }
+        }
+    }
+
     println!(
         "removed '{node_id}': decommissioned ({updated} row), {rows} cert row(s) revoked, banned \
          (propagates to every peer via QNM-Shared)."
@@ -8643,6 +8686,10 @@ fn cmd_join(
                 "join: could not auto-detect public IP ({e}) — run `mackesd set-external-addr <ip:4242>` so this lighthouse is reachable"
             ),
         }
+        // HA / turn-key — a new lighthouse auto-joins the etcd quorum as a voter
+        // (no manual `etcdctl member add`). Best-effort: failure logs an
+        // actionable message and the enrolled lighthouse still comes up.
+        lighthouse_join_etcd(&bundle, &display_name);
     }
 
     // SETUP-7 — capture the joined facts (mesh-id + lighthouse roster from the
@@ -8663,6 +8710,73 @@ fn cmd_join(
     );
     println!("services: nebula + mackesd + mesh-health enabled (boot-durable) and running");
     Ok(())
+}
+
+/// HA / turn-key — a freshly-joined lighthouse auto-joins the etcd quorum as a
+/// voter via the native member API ([`mackesd_core::substrate::etcd_membership`]),
+/// then starts its local etcd via `setup-etcd --join --initial-cluster`. The
+/// anchors are the EXISTING lighthouses from the signed bundle. Best-effort with a
+/// short retry for the just-brought-up overlay handshake; on failure it prints the
+/// exact manual command and returns — the lighthouse is enrolled either way.
+fn lighthouse_join_etcd(bundle: &mackesd_core::ca::bundle::NebulaBundle, self_name: &str) {
+    use mackesd_core::substrate::etcd_membership;
+    let self_overlay = bundle.overlay_ip.clone();
+    let anchor_overlay = bundle
+        .lighthouses
+        .iter()
+        .map(|lh| lh.overlay_ip.clone())
+        .find(|ip| ip != &self_overlay);
+    let Some(anchor_overlay) = anchor_overlay else {
+        eprintln!(
+            "join: no existing lighthouse anchor in the bundle — skipping etcd auto-join \
+             (a founding lighthouse bootstraps etcd with `setup-etcd --init`)"
+        );
+        return;
+    };
+    let anchors: Vec<String> = bundle
+        .lighthouses
+        .iter()
+        .filter(|lh| lh.overlay_ip != self_overlay)
+        .map(|lh| etcd_membership::client_url(&lh.overlay_ip))
+        .collect();
+    let mut last = String::new();
+    for attempt in 1..=5 {
+        match etcd_membership::add_self_as_voter_blocking(&anchors, self_name, &self_overlay) {
+            Some(Ok(csv)) => {
+                let st = std::process::Command::new("/usr/libexec/mackesd/setup-etcd")
+                    .args([
+                        "--join",
+                        &anchor_overlay,
+                        "--listen",
+                        &self_overlay,
+                        "--initial-cluster",
+                        &csv,
+                    ])
+                    .status();
+                match st {
+                    Ok(s) if s.success() => {
+                        println!("etcd: joined the quorum as a voter (member added + local etcd started)");
+                    }
+                    _ => eprintln!(
+                        "etcd: member added but `setup-etcd --join` failed — start the local \
+                         member by hand: /usr/libexec/mackesd/setup-etcd --join {anchor_overlay} \
+                         --listen {self_overlay}"
+                    ),
+                }
+                return;
+            }
+            Some(Err(e)) => last = e,
+            None => last = "bridge runtime unavailable".to_string(),
+        }
+        if attempt < 5 {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+    }
+    eprintln!(
+        "join: etcd auto-join did not complete ({last}) — the lighthouse is enrolled; add it to \
+         the quorum once the overlay is up: /usr/libexec/mackesd/setup-etcd --join {anchor_overlay} \
+         --listen {self_overlay}"
+    );
 }
 
 /// CONNECT-4 — on a Lighthouse (the public ingress role) install + wire Caddy so

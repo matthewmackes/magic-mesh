@@ -8,5 +8,6 @@
 //! leader/directory/health migrations (SUBSTRATE-2/3/4) build on.
 
 pub mod etcd;
+pub mod etcd_membership;
 pub mod leader;
 pub mod peers;
