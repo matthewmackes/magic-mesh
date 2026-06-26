@@ -1591,7 +1591,7 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
     - [ ] the service registers in the mesh service registry (the Workbench published-services surface lists it) + `music.mesh`
     - [ ] the entry shows per-instance health (which Lighthouse_Media nodes are serving)
     - [ ] de-registration on teardown leaves no stale entry
-- [ ] **MEDIA-8: birthright auto-config — the Auto-Configuration host.**
+- [>] **MEDIA-8: birthright auto-config — the Auto-Configuration host.** _(2026-06-25 — CODE DONE + reachable (7318d3e/9530282), gated green; scoped per operator to flow the shared account through the mesh registry (no age key on Workstations): (1) `media_registry` publishes a `SharedAccount{server:music.mesh:4533,user,pass}` from the `media-spaces` secret; (2) a Workstation-tier `music_autoconfig` worker auto-writes the uid-1000 desktop user's `airsonic-creds.json` no-clobber; (3) mde-music auto-browses when creds present, first-run becomes an override. **STAYS [>]:** it currently publishes the **admin** account (ND_ADMIN_*, the only one `media-spaces` carries) — distributing admin creds to Workstations is wrong; the wire shape is built so **MEDIA-6** (read-only-account provisioning, [!]) only swaps the source. Dormant until a live Lighthouse_Media publishes (MEDIA-3/10). Full live browse-from-fresh-node verify is the carried dependency.)_
   **As** a fresh node, **I want** my music client pre-configured at enroll, **so that** music works with zero manual connect.
   **Acceptance:**
     - [ ] on enroll, `mackesd` writes `airsonic-creds.json` → `http://music.mesh:4533` + the shared account
@@ -1796,7 +1796,7 @@ the plane and it **survives killing the current zone leader**.
   reloads and concurrent writes don't corrupt state.
   **Acceptance**:
     - [ ] apply/migrate/boot/backup run as `event/dc/*` jobs with live progress + cancel; a second mutation on a locked resource is rejected/queued with a clear reason
-- [>] **DATACENTER-7: RBAC (mesh identity + role map) + append-only audit.**
+- [✓] **DATACENTER-7: RBAC (mesh identity + role map) + append-only audit.** _(2026-06-25 — RESCOPED by operator decision to HONOR §8/§9 flat-trust: NO role tiers / NO per-action RBAC (the deferred per-service ACL was explicitly not built). The two in-bounds halves are DONE (685f047/7011cc9): the append-only audit record now carries **actor** (the local node principal `peer:<host>` — the mde-bus envelope has no sender field, so the auditor stamps the node it runs as, never a fabricated one) + **result** (`issued` — a passive request-lane observer doesn't fake ok/fail), with the panel audit view rendering actor·action·target·result·ts; and every destructive `action/dc/*` verb is confirm-gated — the gap found + closed was `host-power` reboot/shutdown/evacuate (others already gated). Build/test/clippy green; combined gate green on .130.)_
   *AUDIT half done (3-agent parallel fan-out): a passive `dc_auditor` leader-gated worker watches the
   `action/dc/*` Bus lanes and emits append-only `event/dc/audit/<ulid>` records (no handler changes); the
   panel has an Audit view rendering them newest-first. Remaining: RBAC roles + per-action enforcement.*
