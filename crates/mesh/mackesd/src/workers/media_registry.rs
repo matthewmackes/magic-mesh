@@ -36,7 +36,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::{ShutdownToken, Worker};
-use crate::mesh_media::{self, MediaRegistration};
+use crate::ipc::secret_store::{self, SecretStore};
+use crate::mesh_media::{self, MediaRegistration, SharedAccount};
 
 /// 30 s registry tick — a published service-presence registration is slow-
 /// changing (the instance is up or it isn't); 30 s keeps the `health` field
@@ -92,6 +93,39 @@ pub fn write_shared_registration(mount: &Path, hostname: &str, reg: &MediaRegist
     }
 }
 
+/// MEDIA-8 — resolve the read-only shared account to publish from the
+/// `media-spaces` leader secret. Reads the sealed secret (the same one
+/// `setup-media-navidrome.sh` consumes) and parses `ND_ADMIN_USER`/`ND_ADMIN_PASS`
+/// out of its `.env` body. `None` when:
+///   * the secret isn't distributed to this node yet (honest "no account"), or
+///   * the store faults / the body is malformed (logged; we publish a
+///     registration WITHOUT an account rather than a fabricated one).
+///
+/// Pulled out + `store`-parameterized so the worker tick can call it and tests
+/// can drive it against a `LocalAead` store with a seeded secret. Best-effort by
+/// design — a media node with no shared creds still publishes its health, just
+/// without the auto-config account.
+fn resolve_shared_account(store: &SecretStore) -> Option<SharedAccount> {
+    match store.get(&secret_store::media_spaces_creds_ref()) {
+        Ok(Some(body)) => {
+            let acct = SharedAccount::from_media_spaces_env(&body);
+            if acct.is_none() {
+                tracing::warn!(
+                    "media_registry: media-spaces secret present but ND_ADMIN_USER/PASS \
+                     missing/empty — publishing registration without a shared account"
+                );
+            }
+            acct
+        }
+        // Not distributed yet — honest absence, no account to publish.
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!("media_registry: reading media-spaces secret: {e}");
+            None
+        }
+    }
+}
+
 /// Worker handle.
 pub struct MediaRegistryWorker {
     /// Registering node-id (the registry key / topic suffix).
@@ -104,6 +138,11 @@ pub struct MediaRegistryWorker {
     tick: Duration,
     /// Replicated QNM-Shared registry root.
     mount: PathBuf,
+    /// MEDIA-8 — the secret store the shared account is read from. Resolved once
+    /// at construction (`Mesh` when the helper script is reachable from the repo
+    /// root, else the local-AEAD fallback) — same as every other secret-store
+    /// consumer (`copilot`, `vpn_gw`).
+    secret_store: SecretStore,
     /// Slow heartbeat for the on-change Bus publish.
     publish_heartbeat: Duration,
     /// Last published body + when, so we publish on-change and only
@@ -116,15 +155,26 @@ impl MediaRegistryWorker {
     /// `hostname` keys the QNM-Shared mirror.
     #[must_use]
     pub fn new(node_id: String, hostname: String) -> Self {
+        let mount = crate::default_qnm_shared_root();
+        let secret_store = SecretStore::resolve(&secret_store::repo_root(), &mount);
         Self {
             node_id,
             hostname,
             port: mesh_media::NAVIDROME_PORT,
             tick: DEFAULT_TICK_INTERVAL,
-            mount: crate::default_qnm_shared_root(),
+            mount,
+            secret_store,
             publish_heartbeat: PUBLISH_HEARTBEAT,
             last_publish: Mutex::new(None),
         }
+    }
+
+    /// Override the secret store the shared account is read from. Used in tests
+    /// to drive a seeded `LocalAead` store without the mesh helper script.
+    #[must_use]
+    pub fn with_secret_store(mut self, store: SecretStore) -> Self {
+        self.secret_store = store;
+        self
     }
 
     /// Override the replicated registry root. Used in tests + to honor a
@@ -143,10 +193,15 @@ impl MediaRegistryWorker {
         self
     }
 
-    /// Build this tick's registration from a live health probe.
+    /// Build this tick's registration from a live health probe + the shared
+    /// account read from the `media-spaces` secret (MEDIA-8). Re-read each tick
+    /// so a freshly-distributed secret is picked up without a worker restart;
+    /// `None` when the secret isn't here yet (the registration still publishes,
+    /// just without the auto-config account).
     fn build_registration(&self) -> MediaRegistration {
         let health = mesh_media::probe_navidrome(self.port);
-        mesh_media::registration(&self.node_id, self.port, &health)
+        let account = resolve_shared_account(&self.secret_store);
+        mesh_media::registration_with_account(&self.node_id, self.port, &health, account)
     }
 
     fn tick_once(&self) {
@@ -239,5 +294,72 @@ mod tests {
         write_shared_registration(&tmp, "", &reg);
         // Nothing written for an empty hostname.
         assert!(!tmp.exists());
+    }
+
+    // ── MEDIA-8: the shared account read from the media-spaces secret ──
+
+    /// Stand up a `LocalAead` store with a real mesh age identity so the
+    /// round-trip seal/unseal exercises the same path production uses.
+    fn seeded_store(dir: &std::path::Path) -> SecretStore {
+        let key_path = dir.join("mcnf-age-key");
+        std::fs::write(
+            &key_path,
+            "AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQSXKLP0E\n",
+        )
+        .unwrap();
+        SecretStore::LocalAead {
+            dir: dir.join("secrets"),
+            key_path,
+        }
+    }
+
+    #[test]
+    fn resolve_shared_account_none_when_secret_absent() {
+        // No media-spaces secret distributed → honest None (no account to
+        // publish), never a fabricated one.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = seeded_store(tmp.path());
+        assert_eq!(resolve_shared_account(&store), None);
+    }
+
+    #[test]
+    fn resolve_shared_account_reads_sealed_media_spaces_secret() {
+        // Seal a realistic media-spaces .env body, then the worker reads back
+        // the ND_ADMIN_* shared account, pinned to music.mesh.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = seeded_store(tmp.path());
+        let body = "\
+DO_SPACES_KEY=AKIAEXAMPLE\n\
+DO_SPACES_SECRET=secret\n\
+ND_ADMIN_USER=mesh-music\n\
+ND_ADMIN_PASS=hunter2\n";
+        store
+            .put(&secret_store::media_spaces_creds_ref(), body)
+            .unwrap();
+        let acct = resolve_shared_account(&store).expect("account read back");
+        assert_eq!(acct.server, "http://music.mesh:4533");
+        assert_eq!(acct.username, "mesh-music");
+        assert_eq!(acct.password, "hunter2");
+    }
+
+    #[test]
+    fn build_registration_attaches_the_shared_account() {
+        // End-to-end (sans socket): a worker pointed at a store holding the
+        // secret builds a registration carrying the shared account.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = seeded_store(tmp.path());
+        store
+            .put(
+                &secret_store::media_spaces_creds_ref(),
+                "ND_ADMIN_USER=mesh-music\nND_ADMIN_PASS=hunter2\n",
+            )
+            .unwrap();
+        let w = MediaRegistryWorker::new("peer:eagle".into(), "eagle".into())
+            .with_port(1)
+            .with_secret_store(store);
+        let reg = w.build_registration();
+        let acct = reg.shared_account.expect("account attached");
+        assert_eq!(acct.username, "mesh-music");
+        assert_eq!(acct.server, "http://music.mesh:4533");
     }
 }

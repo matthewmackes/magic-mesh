@@ -7880,6 +7880,28 @@ fn run_serve(
             worker_names.lock().expect("worker_names mutex").push("remmina-sync".into());
         }
 
+        // MEDIA-8 — Workstation music auto-config (desktop-tier, like
+        // remmina-sync). Every 60 s it reads the published shared account off
+        // the replicated registry plane (<workgroup-root>/<host>/media-
+        // registry.json, written by a Lighthouse_Media node's media_registry
+        // worker) and idempotently writes the uid-1000 desktop user's
+        // airsonic-creds.json, so a fresh node's mde-music auto-browses the mesh
+        // library with no manual connect. NO mesh age key on Workstations — the
+        // shared account flows through the SERVICE REGISTRY, not the secret
+        // store. The .with_workgroup_root honors --workgroup-root so it reads
+        // where the registry writers write. Never clobbers a user-set creds file.
+        if mackesd_core::worker_role::runs("music_autoconfig", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::music_autoconfig::MusicAutoconfigWorker::new()
+                    .with_workgroup_root(workgroup_root.clone()),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("music_autoconfig".into());
+        }
+
         // The reconcile worker runs on its own OS thread (kept on
         // std::thread so its sync rusqlite calls don't block the
         // tokio scheduler). Still surfaced via Shell.Workers so

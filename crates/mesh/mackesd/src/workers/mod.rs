@@ -245,6 +245,10 @@ pub mod compute_registry;
 // `<host>/media-registry.json` (same registry plane the other published
 // services use) — with a per-instance health field.
 pub mod media_registry;
+// MEDIA-8 — the Workstation half of the media birthright: read the published
+// shared account off the registry plane and idempotently write the desktop
+// user's airsonic-creds.json so mde-music auto-browses (no first-run connect).
+pub mod music_autoconfig;
 // APPS-LIVE-1 — the apps_running worker: mirror this node's set of
 // currently-running launchable apps to <QNM-Shared>/<host>/running-
 // apps.json so the launcher can badge every entry "running on <host>"

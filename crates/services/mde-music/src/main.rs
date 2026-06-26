@@ -272,6 +272,36 @@ struct FirstRunForm {
     error: Option<String>,
 }
 
+/// MEDIA-8 — what the player should show on launch, decided PURELY from whether
+/// creds exist (so the auto-browse-vs-first-run rule is unit-tested apart from
+/// the cosmic runtime + the filesystem).
+///
+/// The whole point of MEDIA-8's auto-config: a fresh Workstation has
+/// `airsonic-creds.json` already written (by `mackesd`'s `music_autoconfig`
+/// worker against the mesh shared account), so the player BROWSES the library
+/// on launch. The first-run connect form is now an OVERRIDE — reachable via the
+/// manual "change server" action ([`Message::ChangeServer`]) or surfaced on an
+/// auth failure — NOT the default gate it used to be. Only a genuinely
+/// unconfigured node (no creds at all) lands on first-run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchView {
+    /// Creds exist → auto-browse the library (no manual connect).
+    Browse,
+    /// No creds → show the first-run connect form (the unconfigured fallback).
+    FirstRun,
+}
+
+impl LaunchView {
+    /// Decide the launch view from creds-presence. `true` = creds loaded OK.
+    fn from_creds_present(present: bool) -> Self {
+        if present {
+            Self::Browse
+        } else {
+            Self::FirstRun
+        }
+    }
+}
+
 struct State {
     /// MUSIC-DOCK-1 — the dock's layer surface id (the full-height bottom
     /// Overlay). `None` until the first map / while minimized to the handle.
@@ -619,6 +649,14 @@ enum Message {
     PassChanged(String),
     /// Validate + save the first-run creds, then show the library.
     Connect,
+    /// MEDIA-8 — open the connect form as an OVERRIDE even when creds already
+    /// exist ("change server"), pre-filled from the current creds. This is the
+    /// manual escape hatch now that auto-config browses by default; also used to
+    /// re-surface the form on an auth failure against the shared account.
+    ChangeServer,
+    /// MEDIA-8 — dismiss the change-server override form without saving, return
+    /// to browsing (only meaningful when creds already exist).
+    CancelChangeServer,
     /// AIR-14 — search field edited (restarts the debounce).
     SearchInput(String),
     /// The debounce timer for query generation `n` elapsed.
@@ -724,9 +762,19 @@ enum Message {
 
 impl State {
     fn new() -> Self {
-        let (form, connection) = match creds::load() {
-            Ok(c) => (None, format!("Connected to {}", c.server_url)),
-            Err(_) => (Some(FirstRunForm::default()), String::new()),
+        // MEDIA-8 — auto-browse when creds exist (the fresh-node birthright: the
+        // mackesd `music_autoconfig` worker has already written
+        // `airsonic-creds.json` against the mesh shared account), else land on
+        // the first-run form. The decision is the pure `LaunchView`; the form is
+        // an OVERRIDE reachable later via `Message::ChangeServer`, not the only
+        // gate.
+        let loaded = creds::load();
+        let (form, connection) = match LaunchView::from_creds_present(loaded.is_ok()) {
+            LaunchView::Browse => {
+                let c = loaded.expect("Browse only when creds loaded");
+                (None, format!("Connected to {}", c.server_url))
+            }
+            LaunchView::FirstRun => (Some(FirstRunForm::default()), String::new()),
         };
         // BEAUT-MUSIC — resolve the effective reduce-motion (a11y pref OR the
         // MOTION-CORE-3 kill switch) once; the welcome/skeleton/feedback all gate
@@ -1214,6 +1262,32 @@ impl State {
                         f.error =
                             Some("Enter an http(s):// server URL and a username.".to_string());
                     }
+                }
+                Task::none()
+            }
+            // MEDIA-8 — "change server" override: open the connect form even
+            // though creds exist, pre-filled from the saved creds so the user
+            // edits rather than retypes. The first-run form is no longer the
+            // default gate (auto-config browses); this is the manual escape hatch.
+            Message::ChangeServer => {
+                let cur = creds::load().ok();
+                self.form = Some(FirstRunForm {
+                    url: cur
+                        .as_ref()
+                        .map(|c| c.server_url.clone())
+                        .unwrap_or_default(),
+                    user: cur.as_ref().map(|c| c.username.clone()).unwrap_or_default(),
+                    pass: cur.map(|c| c.password).unwrap_or_default(),
+                    error: None,
+                });
+                Task::none()
+            }
+            // MEDIA-8 — back out of the override form without saving. Only
+            // returns to browsing when creds still exist (otherwise the node is
+            // genuinely unconfigured and the first-run form must stay).
+            Message::CancelChangeServer => {
+                if creds::load().is_ok() {
+                    self.form = None;
                 }
                 Task::none()
             }
@@ -2127,6 +2201,18 @@ impl State {
         .padding(32)
         .max_width(420)
         .align_x(cosmic::iced::Alignment::Center);
+        // MEDIA-8 — when creds already exist this form is the "change server"
+        // OVERRIDE (not first-run), so offer a Cancel to return to browsing. A
+        // genuinely unconfigured node (no creds) has nothing to return to, so no
+        // Cancel is shown — the form stays the gate there.
+        if creds::load().is_ok() {
+            col = col.push(Space::new().height(Length::Fixed(4.0)));
+            col = col.push(
+                button(text("Cancel").size(13).colr(muted))
+                    .on_press(Message::CancelChangeServer)
+                    .padding([6, 12]),
+            );
+        }
         if let Some(err) = &f.error {
             col = col.push(Space::new().height(Length::Fixed(8.0)));
             col = col.push(text(err.clone()).size(13).colr(carbon(p.danger, 1.0)));
@@ -2250,8 +2336,9 @@ impl State {
         col = col.push(Space::new().height(Length::Fixed(12.0)));
         col = col.push(self.sidebar_item("Settings", Message::OpenRouting, false));
         // MUSIC-ALBUMS-6 — account/avatar chip pinned to the sidebar bottom: an
-        // accent avatar + the live Airsonic connection line; clicking routes to
-        // Settings (mesh routing prefs).
+        // accent avatar + the live Airsonic connection line. MEDIA-8 — clicking
+        // it opens the "change server" override form (pre-filled from the saved
+        // creds), the manual escape hatch now that auto-config browses by default.
         col = col.push(Space::new().height(Length::Fill));
         let conn = if self.connection.is_empty() {
             "Not connected".to_string()
@@ -2266,7 +2353,7 @@ impl State {
                 .spacing(8)
                 .align_y(cosmic::iced::Alignment::Center),
         )
-        .on_press(Message::OpenRouting)
+        .on_press(Message::ChangeServer)
         .width(Length::Fill)
         .padding([8, 16]);
         col = col.push(account);
@@ -3997,6 +4084,25 @@ mod theme_tests {
         assert!((bg.r - f32::from(p.background.r) / 255.0).abs() < 0.01);
         assert!((bg.g - f32::from(p.background.g) / 255.0).abs() < 0.01);
         assert!((bg.b - f32::from(p.background.b) / 255.0).abs() < 0.01);
+    }
+}
+
+#[cfg(test)]
+mod launch_view_tests {
+    use super::LaunchView;
+
+    #[test]
+    fn creds_present_auto_browses() {
+        // MEDIA-8 — a fresh node whose airsonic-creds.json was auto-written by
+        // mackesd's music_autoconfig worker BROWSES on launch (no first-run gate).
+        assert_eq!(LaunchView::from_creds_present(true), LaunchView::Browse);
+    }
+
+    #[test]
+    fn no_creds_falls_back_to_first_run() {
+        // A genuinely unconfigured node (no creds at all) still lands on the
+        // first-run connect form — the override-only fallback.
+        assert_eq!(LaunchView::from_creds_present(false), LaunchView::FirstRun);
     }
 }
 
