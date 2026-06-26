@@ -12,6 +12,43 @@ v2.x–v6.x phase plans) lives in the git log and `docs/design/` — this file
 starts at the first packaged release line.
 
 ## [Unreleased]
+
+## [11.0.9] — 2026-06-25
+### Added
+- **Datacenter plane (Workbench).** Full VM lifecycle — snapshot list/revert/delete
+  (DATACENTER-11). A Storage tab — SR/VDI create + attach/detach (typed-confirm),
+  scheduled snapshots with retention via a leader-gated `dc_snap_scheduler` worker,
+  an ISO + template image library, and SR capacity-threshold alerts (DATACENTER-12).
+  Health checks — cert-expiry, VM-crash, pool-degraded, and per-resource dom0 log
+  aggregation into the Datacenter Logs view (DATACENTER-24). An append-only action
+  audit carrying actor + result, with every destructive `action/dc/*` verb (incl.
+  host reboot/shutdown/evacuate) confirm-gated — no RBAC, honoring the §8/§9
+  flat-trust lock (DATACENTER-7). A DigitalOcean region picker with a geo-spread
+  recommendation + a guided new-lighthouse flow that writes a `digitalocean_droplet`
+  Tofu resource (DATACENTER-19). Build→Eagle→DO auto-promote-on-green driven by the
+  L1–L3 test verdicts, gated by a persisted prod-arm switch (DATACENTER-20).
+- **Mesh media.** A DigitalOcean Spaces media bucket + a least-privilege bucket-scoped
+  S3 key, sealed as the leader-managed `media-spaces` mesh secret (MEDIA-2). Workstation
+  auto-config that writes the music client's creds from the mesh service registry so
+  `mde-music` auto-browses `music.mesh` instead of a manual first-run (MEDIA-8).
+- **Connectivity.** Exposing a service auto-creates/removes its public DDNS name, and
+  ROUTE-TRACE renders the real ingress path with live firewall verdicts (CONNECT-9).
+- **Build farm.** A `farm-slot-gc` timer reclaims stale per-build slot dirs on every
+  build VM so a node never wedges on a full disk; drain coordinator / park-blocker /
+  worktree-isolation tooling for the autonomous drain (DRAIN-5/6/7).
+
+### Changed
+- **Mesh Sync.** The shared file plane is renamed "Mesh Sync" across the UI + enroll
+  surfaces; the `/mnt/mesh-storage` path + `MDE_WORKGROUP_ROOT` env stay for
+  back-compat (SUBSTRATE-12).
+
+### Fixed
+- The mesh secret store's `mcnf-secret.sh get` was globally broken on binary age
+  ciphertext (a NUL-stripping shell capture) — now binary-safe (file-routed), so
+  every sealed secret is retrievable.
+- `xcp-build.sh`'s shape-routing fallback pointed at a non-existent `.52` host —
+  corrected to the live fixed build VM `.50`.
+
 ### Removed
 - **SUBSTRATE-6 — the full LizardFS rip-out (one-way).** The dead LizardFS plane
   is gone now that SUBSTRATE-V2 (etcd + Syncthing) is the substrate: the in-`mackesd`
