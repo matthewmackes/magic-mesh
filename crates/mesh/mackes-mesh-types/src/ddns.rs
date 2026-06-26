@@ -76,6 +76,12 @@ impl RecordDef {
 pub fn ingress_record_label(hostname: &str, zone: &str) -> String {
     let host = hostname.trim().trim_end_matches('.');
     let zone = zone.trim().trim_end_matches('.');
+    // A hostname equal to the zone has no bare label — collapse to empty so the
+    // caller skips it (the `.{zone}` suffix strip below can't match the apex,
+    // which would otherwise leave the zone itself as a bogus label).
+    if host == zone {
+        return String::new();
+    }
     let suffix = format!(".{zone}");
     host.strip_suffix(&suffix)
         .unwrap_or(host)
