@@ -74,6 +74,22 @@ fn watchdog_interval_from(watchdog_usec: u64, pid_matches: bool) -> Option<Durat
     Some(Duration::from_micros(watchdog_usec / 2))
 }
 
+/// WATCHDOG-2 — should the dedicated watchdog thread ping right now?
+///
+/// The ping rides a kernel-scheduled OS thread (so the tokio executor can never
+/// starve it), but it is gated on an async *liveness beacon*: the serve loop
+/// stamps `last_beat_ms` (monotonic millis) every 250 ms. We ping only while
+/// that beacon is fresh — a beat older than `fresh_ms` means the async runtime
+/// is genuinely wedged (e.g. its time driver froze), so we deliberately WITHHOLD
+/// the ping and let systemd restart the daemon. That preserves the watchdog's
+/// real purpose (catch a hung runtime) while ending the false-positive
+/// crash-loop where a single-worker runtime stopped pinging during a blocking
+/// bridge even though the daemon was fine.
+#[must_use]
+pub fn watchdog_should_ping(now_ms: u64, last_beat_ms: u64, fresh_ms: u64) -> bool {
+    now_ms.saturating_sub(last_beat_ms) <= fresh_ms
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +139,23 @@ mod tests {
     fn watchdog_disarmed_when_pid_mismatch_or_zero() {
         assert_eq!(watchdog_interval_from(60_000_000, false), None);
         assert_eq!(watchdog_interval_from(0, true), None);
+    }
+
+    #[test]
+    fn watchdog_pings_while_the_beacon_is_fresh() {
+        // beat 1s ago, freshness window 5s → ping (runtime is alive).
+        assert!(watchdog_should_ping(10_000, 9_000, 5_000));
+        // beat right now → ping.
+        assert!(watchdog_should_ping(10_000, 10_000, 5_000));
+        // a future beat (clock skew guard) never reads as stale.
+        assert!(watchdog_should_ping(10_000, 12_000, 5_000));
+    }
+
+    #[test]
+    fn watchdog_withholds_ping_when_the_beacon_is_stale() {
+        // beat 6s ago, window 5s → the serve loop is wedged; WITHHOLD so
+        // systemd restarts us (the watchdog's real purpose).
+        assert!(!watchdog_should_ping(10_000, 4_000, 5_000));
+        assert!(!watchdog_should_ping(60_000, 0, 5_000));
     }
 }

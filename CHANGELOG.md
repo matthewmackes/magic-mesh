@@ -13,6 +13,28 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
+## [11.0.11] — 2026-06-26
+### Fixed
+- **Lighthouse watchdog crash-loop (P1) — a down broker no longer SIGABRTs the
+  control plane.** Both production lighthouses had been crash-looping on the 60 s
+  systemd watchdog every ~90 s for ~40 h (1355/1348 aborts), which blocked every
+  enrollment (`:4243` was only up between crashes). Root cause: on a 1-vCPU droplet
+  the tokio runtime defaulted to a **single worker** that also owns the time driver;
+  when that worker reached a blocking bridge (`substrate::peers::block_on` →
+  `block_in_place` for an etcd round-trip) the **time driver froze**, so the in-loop
+  `tokio::time::sleep` watchdog ping stopped firing and systemd aborted a daemon that
+  was actually healthy. A missing `ntfy` broker reliably triggered it by adding
+  `block_in_place` churn. Two complementary fixes:
+  - **`worker_threads` floored at 4** even on a 1-vCPU box, so a second worker keeps
+    timers firing while another blocks (they just time-share on a single core; the
+    daemon is I/O-bound).
+  - **The watchdog heartbeat now runs on a dedicated OS thread** gated on an async
+    *liveness beacon* the serve loop stamps every 250 ms (`sd_notify::watchdog_should_ping`).
+    The ping is kernel-scheduled (unstarvable by the executor) yet still reflects true
+    liveness — a genuine runtime wedge stops the beat → the thread withholds the ping →
+    systemd restarts, preserving the watchdog's purpose. Replaces the incorrect
+    `BROKER-RESILIENCE-1` "own dedicated timer; no further isolation needed" claim.
+
 ## [11.0.10] — 2026-06-26
 ### Added
 - **Turn-key multi-lighthouse HA.** A lighthouse is added to (or retired from) a

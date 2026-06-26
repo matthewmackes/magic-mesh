@@ -5288,7 +5288,23 @@ fn run_serve(
     )
     .entered();
 
+    // WATCHDOG-2 — floor the runtime at 4 worker threads even on a 1-vCPU
+    // lighthouse. The default (`worker_threads = num_cpus`) gives a SINGLE
+    // worker on a 1-vCPU droplet, and that one worker also owns the tokio time
+    // driver. When it reaches a blocking bridge (`substrate::peers::block_on` →
+    // `block_in_place` for an etcd round-trip) the time driver FREEZES, so every
+    // `tokio::time::sleep` — including the watchdog heartbeat below — stops
+    // firing and systemd SIGABRT's a daemon that is actually healthy. That was
+    // the lh1+lh2 crash-loop (1355/1348 aborts over ~40 h), which a missing
+    // broker reliably triggered by adding block_in_place churn. A small fixed
+    // pool keeps a second worker driving timers while the first blocks; on a
+    // 1-vCPU box these just time-share and stay cheap (the daemon is I/O-bound).
+    let worker_threads = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .max(4);
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
         .enable_all()
         .build()
         .context("building tokio runtime")?;
@@ -8027,40 +8043,63 @@ fn run_serve(
             Ok(false) => {}
             Err(e) => tracing::warn!(error = %e, "sd_notify READY=1 failed"),
         }
+        // WATCHDOG-2 — the systemd watchdog heartbeat runs on a DEDICATED OS
+        // thread gated on an async *liveness beacon*, NOT inline on the runtime.
+        //
+        // Why this replaces the old in-loop ping (BROKER-RESILIENCE-1, which was
+        // wrong): the ping used to ride `tokio::time::sleep` on the runtime. On a
+        // 1-vCPU lighthouse the single worker owns the time driver, so when a
+        // worker reached a blocking bridge (`substrate::peers::block_on` →
+        // `block_in_place`) the time driver froze, the sleep never fired, and
+        // systemd SIGABRT'd a healthy daemon — the lh1/lh2 crash-loop. The
+        // `worker_threads` floor above keeps timers alive during a block, and
+        // THIS thread makes the ping itself unstarvable: it is scheduled by the
+        // kernel, and pings only while the serve loop keeps stamping `beat`
+        // (every 250 ms). A genuine runtime wedge stops the beat → the thread
+        // withholds the ping (see `watchdog_should_ping`) → systemd restarts us,
+        // preserving the watchdog's real purpose. `notify_watchdog` is a
+        // stateless datagram send, safe to call off-runtime.
         let watchdog_interval = mackesd_core::sd_notify::watchdog_interval();
+        let wd_base = std::time::Instant::now();
+        let wd_beat = Arc::new(std::sync::atomic::AtomicU64::new(0));
         if let Some(iv) = watchdog_interval {
-            tracing::info!(secs = iv.as_secs(), "systemd watchdog armed");
+            tracing::info!(
+                secs = iv.as_secs(),
+                "systemd watchdog armed (dedicated thread + liveness beacon)"
+            );
+            let beat = Arc::clone(&wd_beat);
+            let wd_shutdown = Arc::clone(&shutdown);
+            // A beat older than 5 s while WatchdogSec is 60 s means the serve
+            // loop (which beats every 250 ms) is genuinely wedged.
+            let fresh_ms = 5_000u64;
+            let _ = std::thread::Builder::new()
+                .name("mackesd-watchdog".into())
+                .spawn(move || {
+                    loop {
+                        std::thread::sleep(iv);
+                        if wd_shutdown.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let now_ms = wd_base.elapsed().as_millis() as u64;
+                        let beat_ms = beat.load(Ordering::Relaxed);
+                        if mackesd_core::sd_notify::watchdog_should_ping(
+                            now_ms, beat_ms, fresh_ms,
+                        ) {
+                            let _ = mackesd_core::sd_notify::notify_watchdog();
+                        }
+                    }
+                });
         }
-        let mut last_watchdog = std::time::Instant::now();
 
-        // Watch loop: wake every 250 ms to check the shutdown flag.
-        // When it flips, drop out so reconcile.join() can wait for
-        // the worker to finish its current tick. The async
-        // supervisor's workers see shutdown via the SIGTERM signal
-        // handler installed above (mackesd_core::workers::ShutdownToken
-        // wraps the same broadcast channel).
-        //
-        // BULLETPROOF-2 — this is also the systemd watchdog heartbeat: the ping
-        // rides the main loop, so a wedged/deadlocked runtime stops pinging and
-        // systemd restarts the daemon (a hang the process-alive check can't see).
-        //
-        // BROKER-RESILIENCE-1 (verified for the 2026-06-25 down-broker wedge):
-        // this loop awaits ONLY `tokio::time::sleep` — the watchdog ping shares
-        // no task with any bus/broker/spool call, so a missing/dead broker can
-        // never starve it directly. The bus publishes from workers are
-        // fire-and-forget subprocess spawns (reaped async), and the in-process
-        // publish clients now fail FAST (connect + request timeouts) instead of
-        // hanging — so the indirect starvation path (a blocked publish piling up
-        // and saturating the runtime) is closed too. The ping is already on its
-        // own dedicated 250 ms timer; no further isolation is needed.
+        // Watch loop: wake every 250 ms to check the shutdown flag and stamp the
+        // watchdog liveness beacon (above). When shutdown flips, drop out so
+        // reconcile.join() can wait for the worker to finish its current tick.
+        // The async supervisor's workers see shutdown via the SIGTERM signal
+        // handler installed above (mackesd_core::workers::ShutdownToken wraps the
+        // same broadcast channel).
         while !shutdown.load(Ordering::Relaxed) {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            if let Some(iv) = watchdog_interval {
-                if last_watchdog.elapsed() >= iv {
-                    let _ = mackesd_core::sd_notify::notify_watchdog();
-                    last_watchdog = std::time::Instant::now();
-                }
-            }
+            wd_beat.store(wd_base.elapsed().as_millis() as u64, Ordering::Relaxed);
             if reconcile.is_finished() {
                 tracing::warn!(
                     "mackesd serve: reconcile worker exited without \
