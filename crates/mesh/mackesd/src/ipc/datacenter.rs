@@ -112,6 +112,20 @@
 //!   * parses the JSON array (each entry `{"slug","name","available"}`).
 //! Reply `{"ok":true,"regions":[{"slug","name","available"}, …]}` on success,
 //! `{"error":"doctl region list failed"}` if doctl is missing/failed.
+//!
+//! DATACENTER-19 — `lighthouse-create` request body `{"name","region","size"?,"image"?}`
+//! (the guided new-lighthouse flow's Tofu-write half; mirrors `vm-create`):
+//!   * `name` is sanitized to `[A-Za-z0-9._-]` (also the resource's `name` + block
+//!     label) and `region` to `[a-z0-9-]` (a DO region slug); `size`/`image` default
+//!     to the `zone1-do` workspace's `lighthouse_size`/`lighthouse_image` variables
+//!     and are validated to slug chars when supplied;
+//!   * WRITES a `digitalocean_droplet` resource into the allow-listed `zone1-do`
+//!     workspace's generated `dc-lighthouses.tf` (a duplicate `name` is rejected —
+//!     a create never silently overwrites an existing block).
+//! Reply `{"ok":true,"resource":"<addr>","path":"<rel tf path>"}` on success — the
+//! caller then runs `action/dc/tofu-apply` on `zone1-do` to PROVISION the droplet
+//! live (the carried live-DO step: `tofu apply` + bootstrap `mackesd found --role
+//! lighthouse` + add the DNS record). `{"error":"<message>"}` on failure.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -206,7 +220,7 @@ impl Drop for OpLockGuard<'_> {
 /// DATACENTER-12: the trailing five are the storage verbs ([`crate::ipc::storage_ops`]),
 /// served on THIS responder so the panel's Storage tab acts through the same Bus
 /// round trip as the VM tab. `build_reply` routes them into `storage_ops`.
-pub const ACTION_VERBS: [&str; 18] = [
+pub const ACTION_VERBS: [&str; 19] = [
     "vm-power",
     "vm-snapshot",
     "vm-clone",
@@ -220,6 +234,9 @@ pub const ACTION_VERBS: [&str; 18] = [
     "vm-snapshot-revert",
     "vm-snapshot-delete",
     "do-regions",
+    // DATACENTER-19 — the guided new-lighthouse flow's Tofu-write half: writes a
+    // `digitalocean_droplet` into the `zone1-do` workspace (mirrors `vm-create`).
+    "lighthouse-create",
     "sr-create",
     "vdi-create",
     "vdi-attach",
@@ -573,6 +590,20 @@ pub fn lock_key(verb: &str, req_body: Option<&str>) -> Option<String> {
         }
         return Some(format!("vm-new:{name}"));
     }
+    // DATACENTER-19 — `lighthouse-create` has no droplet id yet; it locks on the
+    // new lighthouse's name so two creates of the same name can't race the same
+    // generated-`.tf` write (mirrors `vm-create`).
+    if verb == "lighthouse-create" {
+        let name = serde_json::from_str::<serde_json::Value>(req_body?)
+            .ok()?
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)?;
+        if name.is_empty() {
+            return None;
+        }
+        return Some(format!("lighthouse-new:{name}"));
+    }
     // DATACENTER-11 — the snapshot-mutating verbs target a SNAPSHOT (not the VM),
     // and read it from the body's `snapshot` field, so they lock on `snap:<uuid>`
     // (a distinct namespace from `vm:` — reverting/deleting a snapshot shouldn't
@@ -658,6 +689,7 @@ pub fn build_reply(svc: &DatacenterService, verb: &str, req_body: Option<&str>) 
         "vm-snapshot-revert" => vm_snapshot_revert_reply(req_body),
         "vm-snapshot-delete" => vm_snapshot_delete_reply(req_body),
         "do-regions" => do_regions_reply(),
+        "lighthouse-create" => lighthouse_create_reply(svc, req_body),
         // DATACENTER-12 — storage verbs are served on this responder but built by
         // the sibling storage_ops module (the op-lock above already guards them).
         v if crate::ipc::storage_ops::is_storage_verb(v) => {
@@ -1513,6 +1545,207 @@ fn do_regions_reply() -> String {
     json!({ "ok": true, "regions": regions }).to_string()
 }
 
+/// DATACENTER-19 — `true` iff `s` is a non-empty `DigitalOcean` region slug:
+/// lowercase ASCII alphanumerics + dash (e.g. `nyc3`, `sfo3`, `fra1`). PURE — used
+/// to validate the `region`/`size`/`image` slugs before they reach the HCL.
+#[must_use]
+fn is_slug(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// DATACENTER-19 — recommend a region for a NEW lighthouse that ADDS geographic
+/// spread. PURE.
+///
+/// `available` is the available-region universe (the `do-regions` reply's slugs);
+/// `used` is the regions the EXISTING lighthouses already sit in (read off the
+/// panel's `droplet` rows). The recommendation:
+///   * never recommends a region that already hosts a lighthouse (no spread gain);
+///   * prefers a region in a DIFFERENT geo group (the slug's leading letters, e.g.
+///     `nyc`/`sfo`/`fra`/`sgp`) from every used region — that's the honest
+///     geo-spread nudge (doctl's region list exposes no latency/price, so the nudge
+///     is geo-based, not latency/price-based);
+///   * failing a new geo, falls back to any available region not already used;
+///   * returns `None` when every available region is already used (or the universe
+///     is empty) — the caller then surfaces "no spread-adding region".
+///
+/// `available` is taken in slug order, so the pick is deterministic for a given
+/// input (first new-geo slug, else first unused slug).
+#[must_use]
+pub fn recommend_spread_region(available: &[String], used: &[String]) -> Option<String> {
+    // The geo prefix of a slug: its leading ASCII letters (`nyc3` → `nyc`). An
+    // all-digit / empty slug folds to "" — its own (degenerate) group.
+    let geo =
+        |slug: &str| -> String { slug.chars().take_while(char::is_ascii_alphabetic).collect() };
+    let used_set: BTreeSet<&str> = used.iter().map(String::as_str).collect();
+    let used_geos: BTreeSet<String> = used.iter().map(|s| geo(s)).collect();
+    // First pass: an unused region whose geo group no existing lighthouse occupies.
+    if let Some(r) = available
+        .iter()
+        .find(|s| !used_set.contains(s.as_str()) && !used_geos.contains(&geo(s)))
+    {
+        return Some(r.clone());
+    }
+    // Fallback: any unused region (same geo as an existing one is still a distinct
+    // failure domain — better than recommending a region that's already hosting a
+    // lighthouse).
+    available
+        .iter()
+        .find(|s| !used_set.contains(s.as_str()))
+        .cloned()
+}
+
+/// DATACENTER-19 — build a `digitalocean_droplet` Tofu resource for a new
+/// lighthouse. Mirrors [`vm_create_resource`] (validate-then-interpolate, return
+/// `(resource_address, hcl_block)`). PURE — no I/O.
+///
+/// Every interpolated field is validated first: `name` → `[A-Za-z0-9._-]` (also the
+/// droplet's `name`); `region`/`size`/`image` → DO region/size/image slug chars
+/// (`[a-z0-9-]`).
+///
+/// The resource address is `digitalocean_droplet.lighthouse_<sanitized-name>`
+/// (dots/dashes → underscores — an HCL block label must be a bare identifier). The
+/// block tags `magic-lighthouse` (so the orchestrator's droplet inventory picks it
+/// up) and registers the mesh SSH key, matching the `zone1-do` grow-path comment.
+///
+/// # Errors
+/// Returns `Err` for any field that fails its validation.
+pub fn lighthouse_create_resource(
+    name: &str,
+    region: &str,
+    size: &str,
+    image: &str,
+) -> Result<(String, String), String> {
+    if name.is_empty() {
+        return Err("empty name".into());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err("name contains invalid characters".into());
+    }
+    if !is_slug(region) {
+        return Err("region is not a valid slug".into());
+    }
+    if !is_slug(size) {
+        return Err("size is not a valid slug".into());
+    }
+    if !is_slug(image) {
+        return Err("image is not a valid slug".into());
+    }
+    // An HCL block label must be a bare identifier — fold the name's `.`/`-` to `_`.
+    let ident: String = name
+        .chars()
+        .map(|c| if matches!(c, '.' | '-') { '_' } else { c })
+        .collect();
+    let addr = format!("digitalocean_droplet.lighthouse_{ident}");
+    let hcl = format!(
+        "resource \"digitalocean_droplet\" \"lighthouse_{ident}\" {{\n  \
+         name     = \"{name}\"\n  \
+         region   = \"{region}\"\n  \
+         size     = \"{size}\"\n  \
+         image    = \"{image}\"\n  \
+         tags     = [\"magic-lighthouse\"]\n  \
+         ssh_keys = [digitalocean_ssh_key.mackes_mesh_claude.id]\n  \
+         lifecycle {{\n    \
+         ignore_changes = [image, user_data, ssh_keys, tags]\n  \
+         }}\n}}\n"
+    );
+    Ok((addr, hcl))
+}
+
+/// DATACENTER-19 — the HCL block label inside a
+/// `digitalocean_droplet.lighthouse_<ident>` address (the part after the
+/// `digitalocean_droplet.` type prefix). PURE — for the duplicate check.
+fn droplet_addr_label(addr: &str) -> &str {
+    addr.strip_prefix("digitalocean_droplet.").unwrap_or(addr)
+}
+
+/// DATACENTER-19 — handle a `lighthouse-create` request: parse + validate, then
+/// WRITE a `digitalocean_droplet` resource into the `zone1-do` workspace's
+/// generated `dc-lighthouses.tf`. Mirrors [`vm_create_reply`] exactly (idempotent —
+/// a duplicate `name` is rejected so a create never silently overwrites).
+///
+/// The actual `tofu apply` (live droplet provision) + the bootstrap (`mackesd found
+/// --role lighthouse`) + the DNS record are the CARRIED live-DO step — this only
+/// records the structural change in Tofu, so the provision goes through Tofu (no
+/// drift). Replies `{"ok":true,"resource":..,"path":..}`.
+fn lighthouse_create_reply(svc: &DatacenterService, req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("lighthouse-create: missing request body".into());
+    };
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return err(format!("lighthouse-create: bad json: {e}")),
+    };
+    let name = req
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let region = req
+        .get("region")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    // `size`/`image` default to the standard lighthouse slugs (the `zone1-do`
+    // workspace's `lighthouse_size`/`lighthouse_image` variable defaults), so the
+    // guided flow only requires name + region.
+    let size = req
+        .get("size")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("s-2vcpu-2gb");
+    let image = req
+        .get("image")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("fedora-43-x64");
+    let (addr, hcl) = match lighthouse_create_resource(name, region, size, image) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    // The generated file lives in the allow-listed `zone1-do` workspace under the
+    // repo root the daemon runs in — the same tree `action/dc/tofu-apply` plans.
+    let tf_dir = svc.workgroup_root.join("infra/tofu/zone1-do");
+    let tf_path = tf_dir.join("dc-lighthouses.tf");
+    let rel = "infra/tofu/zone1-do/dc-lighthouses.tf";
+    // Refuse to overwrite an existing block for the same name (idempotent create).
+    let existing = std::fs::read_to_string(&tf_path).unwrap_or_default();
+    let marker = format!(
+        "resource \"digitalocean_droplet\" \"{}\"",
+        droplet_addr_label(&addr)
+    );
+    if existing.contains(&marker) {
+        return err(format!(
+            "a lighthouse resource named {name} already exists in {rel}"
+        ));
+    }
+    if let Err(e) = std::fs::create_dir_all(&tf_dir) {
+        return err(format!("lighthouse-create: cannot create {rel} dir: {e}"));
+    }
+    // Append the new block (a header comment is written once, on the first create).
+    let mut out = existing;
+    if out.is_empty() {
+        out.push_str(
+            "# DATACENTER-19 — Network-tab-created lighthouses (the guided\n\
+             # new-lighthouse flow). Each block is written by the\n\
+             # `action/dc/lighthouse-create` flow and PROVISIONED by a `tofu apply`\n\
+             # of this workspace, so every create goes through Tofu (no drift). After\n\
+             # apply: bootstrap mackesd + `mackesd found --role lighthouse`, then add\n\
+             # the lighthouse-NN A record. Edit/remove via Tofu, not by hand.\n",
+        );
+    } else if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&hcl);
+    if let Err(e) = std::fs::write(&tf_path, out) {
+        return err(format!("lighthouse-create: cannot write {rel}: {e}"));
+    }
+    json!({ "ok": true, "resource": addr, "path": rel }).to_string()
+}
+
 /// Run the datacenter Bus responder loop on the current thread until `should_stop`.
 pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &DatacenterService, should_stop: F) {
     let mut cursors: HashMap<String, String> = HashMap::new();
@@ -1595,6 +1828,10 @@ mod tests {
             "action/dc/vm-snapshot-delete"
         );
         assert_eq!(action_topic("do-regions"), "action/dc/do-regions");
+        assert_eq!(
+            action_topic("lighthouse-create"),
+            "action/dc/lighthouse-create"
+        );
         assert!(ACTION_VERBS.contains(&"vm-power"));
         assert!(ACTION_VERBS.contains(&"vm-snapshot"));
         assert!(ACTION_VERBS.contains(&"vm-clone"));
@@ -1608,6 +1845,7 @@ mod tests {
         assert!(ACTION_VERBS.contains(&"vm-snapshot-revert"));
         assert!(ACTION_VERBS.contains(&"vm-snapshot-delete"));
         assert!(ACTION_VERBS.contains(&"do-regions"));
+        assert!(ACTION_VERBS.contains(&"lighthouse-create"));
     }
 
     #[test]
@@ -2255,6 +2493,142 @@ mod tests {
         let r = build_reply(&svc, "vm-create", Some(&body));
         assert!(r.contains("dom0 not in allowed set"), "{r}");
         assert!(!tmp.path().join("infra/tofu/xen-xapi/dc-vms.tf").exists());
+    }
+
+    // DATACENTER-19 — the guided new-lighthouse flow: spread recommendation, the
+    // do-regions parse, and the Tofu-droplet-resource write. --------------------
+
+    #[test]
+    fn recommend_spread_prefers_a_new_geo() {
+        let available = vec![
+            "nyc1".to_string(),
+            "nyc3".to_string(),
+            "sfo3".to_string(),
+            "fra1".to_string(),
+        ];
+        // Lighthouses already sit in nyc3 (geo `nyc`). The pick must skip every
+        // `nyc*` region and land on the first region of a NEW geo (sfo).
+        let used = vec!["nyc3".to_string()];
+        assert_eq!(
+            recommend_spread_region(&available, &used),
+            Some("sfo3".to_string())
+        );
+    }
+
+    #[test]
+    fn recommend_spread_never_recommends_a_used_region() {
+        let available = vec!["nyc3".to_string(), "sfo3".to_string()];
+        let used = vec!["nyc3".to_string(), "sfo3".to_string()];
+        // Every available region already hosts a lighthouse → no spread to add.
+        assert_eq!(recommend_spread_region(&available, &used), None);
+    }
+
+    #[test]
+    fn recommend_spread_falls_back_to_an_unused_region_when_all_geos_taken() {
+        // Both geos (nyc, sfo) are occupied, but a SECOND nyc region (nyc1) is free.
+        // No new geo is available, so the fallback picks the unused nyc1 (a distinct
+        // failure domain still beats recommending a region already in use).
+        let available = vec!["nyc1".to_string(), "nyc3".to_string(), "sfo3".to_string()];
+        let used = vec!["nyc3".to_string(), "sfo3".to_string()];
+        assert_eq!(
+            recommend_spread_region(&available, &used),
+            Some("nyc1".to_string())
+        );
+    }
+
+    #[test]
+    fn recommend_spread_with_no_used_picks_the_first_available() {
+        let available = vec!["ams3".to_string(), "nyc3".to_string()];
+        // No existing lighthouses → any region adds spread; deterministic first pick.
+        assert_eq!(
+            recommend_spread_region(&available, &[]),
+            Some("ams3".to_string())
+        );
+        // Empty universe → nothing to recommend.
+        assert_eq!(recommend_spread_region(&[], &["nyc3".to_string()]), None);
+    }
+
+    #[test]
+    fn lighthouse_create_resource_emits_valid_hcl() {
+        let (addr, hcl) =
+            lighthouse_create_resource("lighthouse-04", "sfo3", "s-2vcpu-2gb", "fedora-43-x64")
+                .unwrap();
+        assert_eq!(addr, "digitalocean_droplet.lighthouse_lighthouse_04");
+        assert!(hcl.contains("resource \"digitalocean_droplet\" \"lighthouse_lighthouse_04\""));
+        assert!(hcl.contains("name     = \"lighthouse-04\""));
+        assert!(hcl.contains("region   = \"sfo3\""));
+        assert!(hcl.contains("size     = \"s-2vcpu-2gb\""));
+        assert!(hcl.contains("image    = \"fedora-43-x64\""));
+        assert!(hcl.contains("tags     = [\"magic-lighthouse\"]"));
+        assert!(hcl.contains("digitalocean_ssh_key.mackes_mesh_claude.id"));
+    }
+
+    #[test]
+    fn lighthouse_create_resource_rejects_unsafe_fields() {
+        assert!(lighthouse_create_resource("", "sfo3", "s", "f").is_err());
+        assert!(lighthouse_create_resource("a b", "sfo3", "s", "f").is_err());
+        assert!(lighthouse_create_resource("a;rm", "sfo3", "s", "f").is_err());
+        // A region/size/image must be a lowercase slug — uppercase / shell metachars
+        // / spaces are rejected before they reach the HCL.
+        assert!(lighthouse_create_resource("ok", "SFO3", "s", "f").is_err());
+        assert!(lighthouse_create_resource("ok", "sfo3;rm", "s", "f").is_err());
+        assert!(lighthouse_create_resource("ok", "", "s", "f").is_err());
+        assert!(lighthouse_create_resource("ok", "sfo3", "s 1", "f").is_err());
+        assert!(lighthouse_create_resource("ok", "sfo3", "s", "F").is_err());
+    }
+
+    #[test]
+    fn lighthouse_create_reply_writes_a_tofu_resource_and_rejects_a_dup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = DatacenterService::new(tmp.path().to_path_buf());
+        // Only name + region are required; size/image default to the lighthouse slugs.
+        let body = json!({ "name": "lighthouse-04", "region": "sfo3" }).to_string();
+        let r = build_reply(&svc, "lighthouse-create", Some(&body));
+        assert!(r.contains("\"ok\":true"), "expected ok, got: {r}");
+        assert!(
+            r.contains("digitalocean_droplet.lighthouse_lighthouse_04"),
+            "{r}"
+        );
+
+        // The generated file exists and carries the block + the one-time header, and
+        // the defaulted size/image slugs.
+        let tf = std::fs::read_to_string(tmp.path().join("infra/tofu/zone1-do/dc-lighthouses.tf"))
+            .unwrap();
+        assert!(tf.contains("DATACENTER-19"));
+        assert!(tf.contains("resource \"digitalocean_droplet\" \"lighthouse_lighthouse_04\""));
+        assert!(tf.contains("region   = \"sfo3\""));
+        assert!(tf.contains("size     = \"s-2vcpu-2gb\""));
+        assert!(tf.contains("image    = \"fedora-43-x64\""));
+
+        // A second create of the SAME name is rejected (no silent overwrite).
+        let r2 = build_reply(&svc, "lighthouse-create", Some(&body));
+        assert!(r2.contains("already exists"), "expected dup reject: {r2}");
+    }
+
+    #[test]
+    fn lighthouse_create_reply_rejects_a_bad_region() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = DatacenterService::new(tmp.path().to_path_buf());
+        let body = json!({ "name": "lighthouse-04", "region": "SFO3;rm" }).to_string();
+        let r = build_reply(&svc, "lighthouse-create", Some(&body));
+        assert!(r.contains("region is not a valid slug"), "{r}");
+        // No file is written on a validation failure.
+        assert!(!tmp
+            .path()
+            .join("infra/tofu/zone1-do/dc-lighthouses.tf")
+            .exists());
+    }
+
+    #[test]
+    fn lighthouse_create_lock_key_is_name_scoped() {
+        let body = json!({ "name": "lighthouse-04", "region": "sfo3" }).to_string();
+        assert_eq!(
+            lock_key("lighthouse-create", Some(&body)),
+            Some("lighthouse-new:lighthouse-04".to_string())
+        );
+        // An empty/missing name → no lock (the per-verb handler produces the error).
+        assert_eq!(lock_key("lighthouse-create", Some(r#"{"name":""}"#)), None);
+        assert_eq!(lock_key("lighthouse-create", Some("{}")), None);
     }
 
     // DATACENTER-11 — snapshot list / revert / delete command builders + replies --

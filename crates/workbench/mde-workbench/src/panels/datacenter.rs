@@ -1343,6 +1343,15 @@ pub struct DatacenterPanel {
     /// reservations + live leases) for the EdgeOS gateway, or `None` until the
     /// operator clicks "Read DHCP". The reservation + lease tables render off it.
     pub gateway_dhcp: Option<GatewayDhcp>,
+    /// DATACENTER-19 (Network tab) — the DigitalOcean regions the `action/dc/do-regions`
+    /// RPC returned, or `None` until "Load regions" has been clicked + returned. The
+    /// region picker renders a row per available region with a spread-recommendation
+    /// badge on the recommended one. Pure in-memory cache, refreshed on demand.
+    pub do_regions: Option<Vec<DoRegion>>,
+    /// DATACENTER-19 (Network tab) — the in-progress guided new-lighthouse form
+    /// (name + picked region). Fires `action/dc/lighthouse-create` (writes a
+    /// `digitalocean_droplet` Tofu resource into `zone1-do`). Pure UI state.
+    pub lighthouse_create: LighthouseCreateForm,
 }
 
 /// Top-level view selector for the datacenter panel.
@@ -1475,6 +1484,33 @@ pub struct VmCreateForm {
     /// The destination dom0 (the pool the resource lands in); must be an allow-listed
     /// host. Defaults to the active zone's first Xen dom0 when opened.
     pub dom0: String,
+}
+
+/// DATACENTER-19 (Network tab) — one DigitalOcean region as the `action/dc/do-regions`
+/// RPC returned it: the slug (`nyc3`), human name (`New York 3`), and whether new
+/// droplets can be created there. Populated by "Load regions" on the Network tab.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DoRegion {
+    /// The region slug — the value written into the droplet's `region` field.
+    pub slug: String,
+    /// The human-readable region name.
+    pub name: String,
+    /// Whether new droplets can be created in this region right now.
+    pub available: bool,
+}
+
+/// DATACENTER-19 (Network tab) — the in-progress guided new-lighthouse form. The
+/// "Create lighthouse (via Tofu)" button packs `name`/`region` into the
+/// `action/dc/lighthouse-create` request, which WRITES a `digitalocean_droplet`
+/// resource into the `zone1-do` workspace. Size/image default server-side to the
+/// standard lighthouse slugs. The live `tofu apply` (provision + bootstrap + DNS)
+/// is the carried live-DO step. Pure local UI state until Create is fired.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LighthouseCreateForm {
+    /// The new lighthouse's name (sanitized server-side to `[A-Za-z0-9._-]`).
+    pub name: String,
+    /// The picked DO region slug (set by clicking a region row, or typed).
+    pub region: String,
 }
 
 /// DATACENTER-12 (Storage tab) — the in-progress SR-create form. The `Create SR`
@@ -2094,6 +2130,11 @@ impl Default for DatacenterPanel {
             // DATACENTER-14 (Gateway tab) — the DHCP read hydrates on demand
             // ("Read DHCP"); the constructor stays pure.
             gateway_dhcp: None,
+            // DATACENTER-19 (Network tab) — the region list + new-lighthouse form
+            // hydrate from operator gestures ("Load regions" / typing); the
+            // constructor stays pure.
+            do_regions: None,
+            lighthouse_create: LighthouseCreateForm::default(),
         }
     }
 }
@@ -2455,6 +2496,26 @@ pub enum Message {
     /// The `action/dc/vm-create` RPC came back. `Ok` chains into a `tofu-apply` of
     /// `xen-xapi`; `Err` surfaces the error.
     CreateVmDone(Result<String, String>),
+    /// DATACENTER-19 (Network tab) — "Load regions" was clicked — fires the
+    /// read-only `action/dc/do-regions` RPC to populate the region picker.
+    LoadRegionsClicked,
+    /// DATACENTER-19 — the `action/dc/do-regions` RPC came back with the parsed
+    /// regions (or the error). `Ok` populates `do_regions`.
+    RegionsLoaded(Result<Vec<DoRegion>, String>),
+    /// DATACENTER-19 — a region row in the picker was clicked — sets the
+    /// new-lighthouse form's `region` to that slug. Pure state.
+    RegionPicked(String),
+    /// DATACENTER-19 — the new-lighthouse form's name field changed. Pure state.
+    LighthouseNameChanged(String),
+    /// DATACENTER-19 — "Create lighthouse (via Tofu)" was clicked — fires
+    /// `action/dc/lighthouse-create` (writes a `digitalocean_droplet` resource into
+    /// `zone1-do`). The live `tofu apply` (provision + bootstrap + DNS) is the
+    /// carried live-DO step, NOT chained here.
+    CreateLighthouseClicked,
+    /// DATACENTER-19 — the `action/dc/lighthouse-create` RPC came back. `Ok` carries
+    /// the written resource address; the operator then applies `zone1-do` via the
+    /// Tofu tab (the gated live-DO provision). `Err` surfaces the error.
+    CreateLighthouseDone(Result<String, String>),
     /// A VM card's multi-select checkbox was toggled. Adds/removes the uuid from
     /// `vm_selected`. Pure state.
     BulkToggle(String),
@@ -3529,6 +3590,72 @@ impl DatacenterPanel {
                 )
             }
             Message::CreateVmDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
+            Message::LoadRegionsClicked => {
+                self.status = "Loading DigitalOcean regions…".into();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(load_do_regions)
+                            .await
+                            .unwrap_or_else(|e| Err(format!("regions task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::RegionsLoaded(result)),
+                )
+            }
+            Message::RegionsLoaded(Ok(regions)) => {
+                let n = regions.len();
+                self.do_regions = Some(regions);
+                self.status = format!("Loaded {n} DigitalOcean region(s).");
+                Task::none()
+            }
+            Message::RegionsLoaded(Err(e)) => {
+                self.status = format!("Load regions failed: {e}");
+                Task::none()
+            }
+            Message::RegionPicked(slug) => {
+                self.lighthouse_create.region = slug;
+                Task::none()
+            }
+            Message::LighthouseNameChanged(value) => {
+                self.lighthouse_create.name = value;
+                Task::none()
+            }
+            Message::CreateLighthouseClicked => {
+                let form = self.lighthouse_create.clone();
+                if form.name.trim().is_empty() || form.region.trim().is_empty() {
+                    self.status = "New lighthouse needs a name and a picked region.".into();
+                    return Task::none();
+                }
+                self.status = format!(
+                    "Creating {} in {}… (writing Tofu resource)",
+                    form.name.trim(),
+                    form.region.trim()
+                );
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || lighthouse_create(&form))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("create task panicked: {e}")))
+                    },
+                    |result| crate::Message::Datacenter(Message::CreateLighthouseDone(result)),
+                )
+            }
+            Message::CreateLighthouseDone(Ok(resource)) => {
+                // The resource is written into the `zone1-do` workspace. The actual
+                // PROVISION is the carried live-DO step — DON'T chain a `tofu apply`
+                // here (it provisions a live droplet + needs bootstrap). Clear the
+                // form so a repeated submit can't double-write, and point the operator
+                // at the gated apply on the Tofu tab.
+                self.lighthouse_create = LighthouseCreateForm::default();
+                self.status = format!(
+                    "Wrote {resource}. Apply `zone1-do` on the Tofu tab to provision \
+                     it live, then bootstrap mackesd + add its DNS record."
+                );
+                Task::none()
+            }
+            Message::CreateLighthouseDone(Err(e)) => {
                 self.status = e;
                 Task::none()
             }
@@ -5337,7 +5464,191 @@ impl DatacenterPanel {
         // ── Section 4: unified IP / DNS view ─────────────────────────────────────
         col = col.push(self.ip_dns_view(palette));
 
+        // ── Section 5: guided new lighthouse (DO region picker + Tofu write) ──────
+        col = col.push(self.new_lighthouse_view(palette));
+
         col.into()
+    }
+
+    /// DATACENTER-19 (Network tab) — the regions the EXISTING lighthouses sit in:
+    /// the `region` slugs off the Prod `droplet` rows (deduped, slug order). PURE —
+    /// feeds the spread recommendation so it never nudges toward a region that
+    /// already hosts a lighthouse.
+    #[must_use]
+    fn lighthouse_regions(&self) -> Vec<String> {
+        let mut regions: BTreeSet<String> = BTreeSet::new();
+        for r in &self.rows {
+            if r.kind == "droplet" && r.zone == "prod" && !r.region.is_empty() {
+                regions.insert(r.region.clone());
+            }
+        }
+        regions.into_iter().collect()
+    }
+
+    /// DATACENTER-19 (Network tab) — the guided new-lighthouse flow: a "Load regions"
+    /// button (fires the read-only `do-regions` RPC), a region picker that renders
+    /// the available regions with a geo-spread recommendation badge on the
+    /// recommended one, a name box, and "Create lighthouse (via Tofu)" — which WRITES
+    /// a `digitalocean_droplet` resource into `zone1-do`. The live provision (`tofu
+    /// apply` + bootstrap + DNS) is the carried live-DO step, surfaced as a banner
+    /// rather than fired here. mde-theme tokens only (§4).
+    fn new_lighthouse_view(&self, palette: Palette) -> Element<'_, crate::Message> {
+        let mut col =
+            column![text("New lighthouse — region picker (DigitalOcean)")
+                .size(f32::from(spacing::BASE[5]))]
+            .spacing(f32::from(spacing::BASE[2]));
+
+        // The guided-flow stages, shown so the operator sees what Create does (and
+        // what's still gated as the live step). The Tofu write is what THIS does; the
+        // rest is the carried live-DO half.
+        col = col.push(
+            text(
+                "Flow: pick region → write droplet (Tofu) → apply (provision) → \
+                 bootstrap mackesd + `found --role lighthouse` → add DNS record. \
+                 This writes the Tofu resource; the apply/bootstrap is the gated \
+                 live-DO step (apply `zone1-do` on the Tofu tab).",
+            )
+            .colr(palette.text_muted.into_cosmic_color()),
+        );
+
+        let load_btn = variant_button(
+            "Load regions".to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::LoadRegionsClicked)),
+            palette,
+        );
+        col = col.push(load_btn);
+
+        // The regions the existing lighthouses occupy + the geo-spread recommendation.
+        let used = self.lighthouse_regions();
+        match &self.do_regions {
+            None => {
+                col = col.push(
+                    text(
+                        "Click \"Load regions\" to fetch the DigitalOcean region list \
+                         (read-only `doctl region list`).",
+                    )
+                    .colr(palette.text_muted.into_cosmic_color()),
+                );
+            }
+            Some(regions) => {
+                let available: Vec<String> = regions
+                    .iter()
+                    .filter(|r| r.available)
+                    .map(|r| r.slug.clone())
+                    .collect();
+                let recommended = recommend_spread_region(&available, &used);
+                if used.is_empty() {
+                    col = col.push(
+                        text("No existing lighthouse regions seen yet — any region adds spread.")
+                            .colr(palette.text_muted.into_cosmic_color()),
+                    );
+                } else {
+                    col = col.push(
+                        text(format!("Existing lighthouse regions: {}", used.join(", ")))
+                            .colr(palette.text_muted.into_cosmic_color()),
+                    );
+                }
+                match &recommended {
+                    Some(slug) => {
+                        col = col.push(
+                            text(format!(
+                                "Recommended (adds geo-spread): {slug} — a region no \
+                                 existing lighthouse occupies. (Geo-based nudge; doctl \
+                                 exposes no latency/price.)"
+                            ))
+                            .colr(palette.text.into_cosmic_color()),
+                        );
+                    }
+                    None => {
+                        col = col.push(
+                            text(
+                                "No spread-adding region: every available region already \
+                                 hosts a lighthouse.",
+                            )
+                            .colr(palette.text_muted.into_cosmic_color()),
+                        );
+                    }
+                }
+                // One pickable row per region (available ones are clickable; an
+                // unavailable region is shown muted + non-clickable).
+                for r in regions {
+                    let is_used = used.iter().any(|u| u == &r.slug);
+                    let is_recommended = recommended.as_deref() == Some(r.slug.as_str());
+                    let is_picked = self.lighthouse_create.region == r.slug;
+                    let mut badges = Vec::new();
+                    if is_recommended {
+                        badges.push("★ recommended");
+                    }
+                    if is_used {
+                        badges.push("has lighthouse");
+                    }
+                    if is_picked {
+                        badges.push("picked");
+                    }
+                    if !r.available {
+                        badges.push("unavailable");
+                    }
+                    let badge = if badges.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  [{}]", badges.join(", "))
+                    };
+                    let label = format!(
+                        "{} — {}  ({}){}",
+                        r.slug,
+                        if r.name.is_empty() { &r.slug } else { &r.name },
+                        region_geo(&r.slug),
+                        badge
+                    );
+                    if r.available {
+                        col = col.push(variant_button(
+                            label,
+                            if is_recommended {
+                                ButtonVariant::Primary
+                            } else {
+                                ButtonVariant::Secondary
+                            },
+                            Some(crate::Message::Datacenter(Message::RegionPicked(
+                                r.slug.clone(),
+                            ))),
+                            palette,
+                        ));
+                    } else {
+                        col = col.push(text(label).colr(palette.text_muted.into_cosmic_color()));
+                    }
+                }
+            }
+        }
+
+        // The new-lighthouse form: name + the picked region (read-only echo) + Create.
+        let name_input = text_input(
+            "lighthouse name (e.g. lighthouse-04)",
+            &self.lighthouse_create.name,
+        )
+        .on_input(|v| crate::Message::Datacenter(Message::LighthouseNameChanged(v)))
+        .width(Length::FillPortion(2));
+        let picked = if self.lighthouse_create.region.is_empty() {
+            "no region picked".to_string()
+        } else {
+            format!("region: {}", self.lighthouse_create.region)
+        };
+        col = col.push(
+            row![
+                name_input,
+                text(picked).colr(palette.text_muted.into_cosmic_color()),
+            ]
+            .spacing(f32::from(spacing::BASE[2]))
+            .align_y(cosmic::iced::alignment::Vertical::Center),
+        );
+        col = col.push(variant_button(
+            "Create lighthouse (writes Tofu resource)".to_string(),
+            ButtonVariant::Primary,
+            Some(crate::Message::Datacenter(Message::CreateLighthouseClicked)),
+            palette,
+        ));
+
+        self.storage_card(col.into(), palette)
     }
 
     /// DATACENTER-13 (Network tab) — one PIF rendered as a NIC card: device, MAC,
@@ -8813,6 +9124,97 @@ fn vm_create(form: &VmCreateForm, vcpus: u64, mem_mib: u64) -> Result<String, St
         return Ok(addr.to_string());
     }
     Err(format!("unexpected vm-create reply: {v}"))
+}
+
+/// DATACENTER-19 — parse the `action/dc/do-regions` reply's `regions` array into
+/// [`DoRegion`]s. PURE (split out so the picker's region decode is unit-testable
+/// without a live Bus). Each entry is `{"slug","name","available"}`; a missing
+/// string defaults to empty, a missing/non-bool `available` to `false`. A non-array
+/// `regions` (or absent) yields an empty vec.
+#[must_use]
+pub fn parse_do_regions(reply: &serde_json::Value) -> Vec<DoRegion> {
+    reply
+        .get("regions")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|r| DoRegion {
+                    slug: r
+                        .get("slug")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    name: r
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    available: r
+                        .get("available")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// DATACENTER-19 — fire the read-only `action/dc/do-regions` RPC and decode the
+/// regions. `{"ok":true,"regions":[…]}` → the parsed list.
+fn load_do_regions() -> Result<Vec<DoRegion>, String> {
+    let v = dc_rpc("do-regions", "{}", Duration::from_secs(20))?;
+    Ok(parse_do_regions(&v))
+}
+
+/// DATACENTER-19 — the geo group of a DO region slug: its leading ASCII letters
+/// (`nyc3` → `nyc`, `fra1` → `fra`). PURE — the grouping the spread recommendation
+/// nudges across. An all-digit / empty slug folds to "".
+#[must_use]
+pub fn region_geo(slug: &str) -> String {
+    slug.chars().take_while(char::is_ascii_alphabetic).collect()
+}
+
+/// DATACENTER-19 — recommend a region for a NEW lighthouse that ADDS geographic
+/// spread. PURE — the picker's nudge logic, mirrored from the mackesd-side helper
+/// so the UI can highlight a recommendation without a round trip.
+///
+/// `available` is the available-region slug universe (the `do-regions` reply);
+/// `used` is the regions the EXISTING lighthouses sit in (read off the panel's
+/// `droplet` rows). It never recommends a region already hosting a lighthouse,
+/// prefers a region in a geo group no existing lighthouse occupies (the honest
+/// geo-spread nudge — doctl exposes no latency/price), and falls back to any unused
+/// region. Returns `None` when every available region is already used (or empty).
+#[must_use]
+pub fn recommend_spread_region(available: &[String], used: &[String]) -> Option<String> {
+    let used_set: BTreeSet<&str> = used.iter().map(String::as_str).collect();
+    let used_geos: BTreeSet<String> = used.iter().map(|s| region_geo(s)).collect();
+    if let Some(r) = available
+        .iter()
+        .find(|s| !used_set.contains(s.as_str()) && !used_geos.contains(&region_geo(s)))
+    {
+        return Some(r.clone());
+    }
+    available
+        .iter()
+        .find(|s| !used_set.contains(s.as_str()))
+        .cloned()
+}
+
+/// DATACENTER-19 — fire `action/dc/lighthouse-create` (writes a `digitalocean_droplet`
+/// Tofu resource into `zone1-do`). `{"ok":true,"resource":..}` → the resource
+/// address. The live `tofu apply` (provision + bootstrap + DNS) is the carried
+/// live-DO step — NOT run here; the operator applies `zone1-do` from the Tofu tab.
+fn lighthouse_create(form: &LighthouseCreateForm) -> Result<String, String> {
+    let body = serde_json::json!({
+        "name": form.name.trim(),
+        "region": form.region.trim(),
+    })
+    .to_string();
+    let v = dc_rpc("lighthouse-create", &body, Duration::from_secs(30))?;
+    if let Some(addr) = v.get("resource").and_then(serde_json::Value::as_str) {
+        return Ok(addr.to_string());
+    }
+    Err(format!("unexpected lighthouse-create reply: {v}"))
 }
 
 /// DATACENTER-11 — run one VM's slice of a bulk operation. `op` is one of the bulk
@@ -12536,6 +12938,130 @@ mod tests {
         let mut p = DatacenterPanel::new();
         let _ = p.update(Message::ViewMode(ViewMode::Network));
         assert_eq!(p.view_mode, ViewMode::Network);
+    }
+
+    // DATACENTER-19 — the guided new-lighthouse flow on the Network tab: the
+    // do-regions parse, the spread recommendation, the existing-region reader, and
+    // the form round trip. ------------------------------------------------------
+
+    #[test]
+    fn parse_do_regions_decodes_the_reply() {
+        let reply = serde_json::json!({
+            "ok": true,
+            "regions": [
+                {"slug":"nyc3","name":"New York 3","available":true},
+                {"slug":"sfo3","name":"San Francisco 3","available":false},
+                {"slug":"fra1"} // missing name/available → defaults
+            ]
+        });
+        let regions = parse_do_regions(&reply);
+        assert_eq!(regions.len(), 3);
+        assert_eq!(regions[0].slug, "nyc3");
+        assert_eq!(regions[0].name, "New York 3");
+        assert!(regions[0].available);
+        assert!(!regions[1].available);
+        // Missing fields default cleanly (no panic, empty name, unavailable).
+        assert_eq!(regions[2].slug, "fra1");
+        assert_eq!(regions[2].name, "");
+        assert!(!regions[2].available);
+        // A reply with no `regions` array → empty vec, not a panic.
+        assert!(parse_do_regions(&serde_json::json!({"ok": true})).is_empty());
+    }
+
+    #[test]
+    fn region_geo_groups_by_leading_letters() {
+        assert_eq!(region_geo("nyc3"), "nyc");
+        assert_eq!(region_geo("fra1"), "fra");
+        assert_eq!(region_geo("sgp1"), "sgp");
+        assert_eq!(region_geo(""), "");
+    }
+
+    #[test]
+    fn spread_recommendation_prefers_a_new_geo_and_skips_used() {
+        let available = vec![
+            "nyc1".to_string(),
+            "nyc3".to_string(),
+            "sfo3".to_string(),
+            "fra1".to_string(),
+        ];
+        // A lighthouse already sits in nyc3 → skip every `nyc*` region, recommend the
+        // first NEW geo (sfo).
+        assert_eq!(
+            recommend_spread_region(&available, &["nyc3".to_string()]),
+            Some("sfo3".to_string())
+        );
+        // Every geo taken but a second region of a used geo is free → fallback to it
+        // (still a distinct failure domain; never recommends a used region).
+        assert_eq!(
+            recommend_spread_region(
+                &["nyc1".to_string(), "nyc3".to_string(), "sfo3".to_string()],
+                &["nyc3".to_string(), "sfo3".to_string()],
+            ),
+            Some("nyc1".to_string())
+        );
+        // All available regions already host a lighthouse → no recommendation.
+        assert_eq!(
+            recommend_spread_region(
+                &["nyc3".to_string(), "sfo3".to_string()],
+                &["nyc3".to_string(), "sfo3".to_string()],
+            ),
+            None
+        );
+        // No existing lighthouses → any region adds spread (first, deterministic).
+        assert_eq!(
+            recommend_spread_region(&["ams3".to_string(), "nyc3".to_string()], &[]),
+            Some("ams3".to_string())
+        );
+    }
+
+    #[test]
+    fn lighthouse_regions_reads_prod_droplet_regions_deduped() {
+        let mut p = DatacenterPanel::new();
+        p.rows = vec![
+            DcRow {
+                kind: "droplet".into(),
+                zone: "prod".into(),
+                region: "nyc3".into(),
+                ..DcRow::default()
+            },
+            // A second droplet in the SAME region → deduped.
+            DcRow {
+                kind: "droplet".into(),
+                zone: "prod".into(),
+                region: "nyc3".into(),
+                ..DcRow::default()
+            },
+            DcRow {
+                kind: "droplet".into(),
+                zone: "prod".into(),
+                region: "sfo3".into(),
+                ..DcRow::default()
+            },
+            // A dev Xen VM with a region-less row → ignored (not a prod droplet).
+            DcRow {
+                kind: "vm".into(),
+                zone: "dev".into(),
+                region: String::new(),
+                ..DcRow::default()
+            },
+        ];
+        assert_eq!(p.lighthouse_regions(), vec!["nyc3", "sfo3"]);
+    }
+
+    #[test]
+    fn new_lighthouse_form_round_trips() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::RegionPicked("sfo3".into()));
+        let _ = p.update(Message::LighthouseNameChanged("lighthouse-04".into()));
+        assert_eq!(p.lighthouse_create.region, "sfo3");
+        assert_eq!(p.lighthouse_create.name, "lighthouse-04");
+        // A loaded region list populates the picker cache.
+        let _ = p.update(Message::RegionsLoaded(Ok(vec![DoRegion {
+            slug: "sfo3".into(),
+            name: "San Francisco 3".into(),
+            available: true,
+        }])));
+        assert_eq!(p.do_regions.as_ref().map(Vec::len), Some(1));
     }
 
     #[test]
