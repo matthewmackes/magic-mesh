@@ -693,6 +693,16 @@ enum Cmd {
         workgroup_root: Option<PathBuf>,
     },
 
+    /// #13 — **turn-key lighthouse lifecycle.** `add` provisions a DigitalOcean
+    /// droplet that JOINS this mesh as a full lighthouse (CA signer + etcd voter,
+    /// no manual `etcdctl`/`scp`); `retire` drains it (holding the HA floor),
+    /// removes it from the etcd quorum + revokes its cert, then deletes the
+    /// droplet. Run on an existing lighthouse.
+    Lighthouse {
+        #[command(subcommand)]
+        cmd: LighthouseCmd,
+    },
+
     /// PD-1 (Q23/W27) — the joined peer directory: every known peer
     /// with presence tier, health, version, overlay ip/role, and
     /// revision currency — the same record `action/mesh/directory`
@@ -1040,6 +1050,39 @@ enum Cmd {
         /// Name of the preset tag to launch. Must exist in
         /// `<XDG_DATA_HOME>/mde/tags.json` with `TagFlavor::Preset`.
         tag: String,
+    },
+}
+
+/// #13 — `mackesd lighthouse <sub>` subcommands: the turn-key add/retire lifecycle.
+#[derive(Subcommand)]
+enum LighthouseCmd {
+    /// Provision a DigitalOcean droplet that JOINS this mesh as a full lighthouse:
+    /// mint a role-scoped lighthouse token here, then shell the join provisioner
+    /// (`do-lighthouse-join.sh`) whose cloud-init runs `mackesd join --role
+    /// lighthouse`. The daemon auto-joins the etcd quorum (#11), the CA key is
+    /// delivered (#12), and the supervisor reconcile flips it to am_lighthouse.
+    Add {
+        /// DigitalOcean region slug (e.g. `nyc3`, `sfo3`, `fra1`).
+        #[arg(long)]
+        region: String,
+        /// DO droplet size slug (default: the provisioner's `s-1vcpu-1gb`).
+        #[arg(long)]
+        size: Option<String>,
+        /// DO image slug (default: the provisioner's `fedora-43-x64`).
+        #[arg(long)]
+        image: Option<String>,
+    },
+    /// Retire a lighthouse: drain-gate (hold the HA floor unless `--force`), remove
+    /// it from the etcd quorum + revoke/ban its cert, then delete the droplet.
+    Retire {
+        /// The lighthouse's node-id (`peer:<host>`), as shown by `mackesd peers`.
+        node_id: String,
+        /// DigitalOcean droplet id to delete after draining (via `doctl`).
+        #[arg(long)]
+        droplet_id: Option<String>,
+        /// Proceed even if retiring breaches the HA floor / the node is unreachable.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -3795,6 +3838,20 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::RemovePeer { node_id, force } => {
             return cmd_remove_peer(&db_path, &node_id, force);
+        }
+        Cmd::Lighthouse { cmd } => {
+            return match cmd {
+                LighthouseCmd::Add {
+                    region,
+                    size,
+                    image,
+                } => cmd_lighthouse_add(&region, size, image),
+                LighthouseCmd::Retire {
+                    node_id,
+                    droplet_id,
+                    force,
+                } => cmd_lighthouse_retire(&db_path, &node_id, droplet_id, force),
+            };
         }
         Cmd::Converge { site } => {
             return cmd_converge(site);
@@ -8318,9 +8375,32 @@ fn cmd_add_peer(
     let parsed: mde_role::Role = role.parse().map_err(|_| {
         anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
     })?;
+    let token = mint_join_token(parsed, note, lighthouse, enroll_port)?;
+    println!("{token}");
+    eprintln!(
+        "single-use v3 token minted (SETUP-5) for a {} — run on the joining box:\n  \
+         magic-setup   (Join → paste it)\n  or:  mackesd join '{token}' --role {}",
+        parsed.as_str(),
+        parsed.as_str()
+    );
+    Ok(())
+}
+
+/// #13/#5 — mint a single-use **v3** join token for a new peer/lighthouse on THIS
+/// lighthouse: the shared core of `add-peer` (which prints it) and `lighthouse add`
+/// (which feeds it to the join provisioner). Reads mesh-id from the founding
+/// bundle, pins the on-disk `/enroll` endpoint cert fingerprint, and — for the
+/// LIGHTHOUSE role — scopes the bearer note (#12) so the joiner is delivered the CA
+/// key + a Host cert (a full signing lighthouse); any other role leaves the note
+/// unchanged, so an ordinary peer bearer can never pull the CA key (ENT-12).
+fn mint_join_token(
+    role: mde_role::Role,
+    note: &str,
+    lighthouse: Option<String>,
+    enroll_port: Option<u16>,
+) -> anyhow::Result<String> {
     let root = mackesd_core::default_qnm_shared_root();
     let node_id = default_node_id();
-
     // mesh-id comes from the founding bundle this lighthouse wrote at `found`.
     let bpath = mackesd_core::ca::bundle::bundle_path(&root, &node_id);
     let bundle = mackesd_core::ca::bundle::read_bundle(&bpath).map_err(|e| {
@@ -8329,14 +8409,12 @@ fn cmd_add_peer(
             bpath.display()
         )
     })?;
-
     // Pin the on-disk /enroll endpoint cert fingerprint (the v3 contract).
     let cert_path = mackesd_core::workers::nebula_enroll_listener::DEFAULT_CERT_PATH;
     let cert_pem = std::fs::read(cert_path)
         .map_err(|e| anyhow::anyhow!("reading the /enroll endpoint cert {cert_path}: {e}"))?;
     let fp = mackesd_core::nebula_enroll_endpoint::endpoint_fingerprint_from_pem(&cert_pem)
         .ok_or_else(|| anyhow::anyhow!("no certificate in {cert_path}"))?;
-
     // Public address the joining box dials (strip any :port; detect if absent).
     let ip = match lighthouse {
         Some(l) => l
@@ -8346,12 +8424,9 @@ fn cmd_add_peer(
         None => detect_primary_ipv4()?,
     };
     let port = enroll_port.unwrap_or(mackesd_core::nebula_enroll_endpoint::DEFAULT_ENROLL_PORT);
-
-    // #12 — when adding a LIGHTHOUSE, scope the bearer note with the role marker so
-    // the signer delivers the CA key + a Host cert (a full turn-key lighthouse). For
-    // any other role the note is unchanged, so an ordinary peer bearer can never
-    // pull the CA key (ENT-12 containment).
-    let scoped_note = if parsed == mde_role::Role::Lighthouse {
+    // #12 — a LIGHTHOUSE token carries a role-scoped bearer note so the signer
+    // delivers the CA key + a Host cert; any other role leaves the note unchanged.
+    let scoped_note = if role == mde_role::Role::Lighthouse {
         format!(
             "{} {note}",
             mackesd_core::bearer_ledger::LIGHTHOUSE_ROLE_NOTE
@@ -8361,23 +8436,14 @@ fn cmd_add_peer(
     };
     let bearer = mackesd_core::bearer_ledger::issue(&root, &scoped_note)
         .map_err(|e| anyhow::anyhow!("minting bearer: {e}"))?;
-    let token = mackesd_core::nebula_enroll::JoinToken {
+    Ok(mackesd_core::nebula_enroll::JoinToken {
         mesh_id: bundle.mesh_id,
         lighthouse: ip,
         port,
         bearer,
         fp: Some(fp),
     }
-    .encode();
-
-    println!("{token}");
-    eprintln!(
-        "single-use v3 token minted (SETUP-5) for a {} — run on the joining box:\n  \
-         magic-setup   (Join → paste it)\n  or:  mackesd join '{token}' --role {}",
-        parsed.as_str(),
-        parsed.as_str()
-    );
-    Ok(())
+    .encode())
 }
 
 /// SETUP-5 — remove a peer: decommission its directory row, revoke its certs,
@@ -8433,6 +8499,94 @@ fn cmd_remove_peer(db_path: &std::path::Path, node_id: &str, force: bool) -> any
         "removed '{node_id}': decommissioned ({updated} row), {rows} cert row(s) revoked, banned \
          (propagates to every peer via QNM-Shared)."
     );
+    Ok(())
+}
+
+/// #13 — `mackesd lighthouse add`: mint a role-scoped lighthouse token on THIS
+/// lighthouse, then shell the join provisioner to stand up a DO droplet that JOINS
+/// this mesh as a full lighthouse (CA signer + etcd voter, am_lighthouse — all
+/// automatic via #11/#12 + the roster reconcile). If the provisioner script isn't
+/// installed, print the token + the exact manual command (honest fallback).
+fn cmd_lighthouse_add(
+    region: &str,
+    size: Option<String>,
+    image: Option<String>,
+) -> anyhow::Result<()> {
+    let token = mint_join_token(
+        mde_role::Role::Lighthouse,
+        "lighthouse via `lighthouse add`",
+        None,
+        None,
+    )?;
+    let script = "/usr/libexec/mackesd/do-lighthouse-join";
+    if !std::path::Path::new(script).exists() {
+        println!("{token}");
+        eprintln!(
+            "lighthouse add: the join provisioner ({script}) isn't installed — run it by hand:\n  \
+             do-lighthouse-join.sh '{token}' --region {region}"
+        );
+        return Ok(());
+    }
+    let mut cmd = std::process::Command::new(script);
+    cmd.arg(&token).args(["--region", region]);
+    if let Some(s) = size {
+        cmd.args(["--size", &s]);
+    }
+    if let Some(i) = image {
+        cmd.args(["--image", &i]);
+    }
+    eprintln!(
+        "lighthouse add: provisioning a droplet in {region} that joins this mesh as a lighthouse…"
+    );
+    let status = cmd.status().context("running the join provisioner")?;
+    if !status.success() {
+        anyhow::bail!("the join provisioner failed (see output above)");
+    }
+    Ok(())
+}
+
+/// #13 — `mackesd lighthouse retire`: drain-gate (hold the HA floor unless
+/// `--force`), then `remove-peer` (revoke + ban + etcd member-remove, all in
+/// `cmd_remove_peer`), then delete the DO droplet LAST.
+fn cmd_lighthouse_retire(
+    db_path: &std::path::Path,
+    node_id: &str,
+    droplet_id: Option<String>,
+    force: bool,
+) -> anyhow::Result<()> {
+    let root = mackesd_core::default_qnm_shared_root();
+    // HA drain gate — never drop below the lighthouse floor without --force.
+    let current =
+        mackesd_core::substrate::etcd_membership::voter_overlays_from_directory(&root).len();
+    mackesd_core::lighthouse_lifecycle::drain_gate(current, force)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    // Decommission + revoke + ban + etcd member-remove (all in cmd_remove_peer).
+    cmd_remove_peer(db_path, node_id, force)?;
+    // Delete the droplet LAST (the inverse of `add`'s provision step).
+    if let Some(id) = droplet_id {
+        let ctx = std::env::var("MCNF_DOCTL_CONTEXT").unwrap_or_else(|_| "mackes".to_string());
+        eprintln!("lighthouse retire: deleting droplet {id} via doctl (context {ctx})…");
+        let status = std::process::Command::new("doctl")
+            .args([
+                "compute",
+                "droplet",
+                "delete",
+                &id,
+                "--context",
+                &ctx,
+                "--force",
+            ])
+            .status()
+            .context("running doctl droplet delete")?;
+        if !status.success() {
+            eprintln!("lighthouse retire: doctl droplet delete {id} failed — delete it by hand");
+        }
+    } else {
+        eprintln!(
+            "lighthouse retire: no --droplet-id given; the node is drained + revoked, but the DO \
+             droplet (if any) was NOT deleted — remove it with `doctl compute droplet delete`"
+        );
+    }
     Ok(())
 }
 

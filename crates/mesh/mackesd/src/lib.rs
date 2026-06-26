@@ -41,6 +41,7 @@ pub mod identity;
 pub mod leader;
 pub mod legacy_inventory;
 pub mod lighthouse_addr;
+pub mod lighthouse_lifecycle;
 pub mod logging;
 // EPIC-SYNC-APP-CONFIG (Q26) — native-Rust mesh media-server
 // discovery (replaces the discovery half of the retired

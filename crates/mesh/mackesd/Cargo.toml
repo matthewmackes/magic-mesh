@@ -394,6 +394,12 @@ assets = [
     # leader/directory/health. Run per-node with --init/--join/--client-only.
     # The unit only starts where setup-etcd.sh wrote /etc/etcd/etcd.env (members).
     { source = "install-helpers/setup-etcd.sh",          dest = "/usr/libexec/mackesd/setup-etcd",              mode = "755" },
+    # #13 — the turn-key lighthouse JOIN provisioner (`mackesd lighthouse add`): a
+    # droplet that joins the EXISTING mesh as a lighthouse (vs do-lighthouse-up.sh
+    # which founds a new mesh). do-lighthouse-join.sh finds its cloud-init template
+    # next to itself, so both ship to the same /usr/libexec/mackesd dir.
+    { source = "install-helpers/do-lighthouse-join.sh",  dest = "/usr/libexec/mackesd/do-lighthouse-join",      mode = "755" },
+    { source = "install-helpers/do-lighthouse-join-cloudinit.sh", dest = "/usr/libexec/mackesd/do-lighthouse-join-cloudinit.sh", mode = "755" },
     # Install to /etc (admin precedence) — overrides the Fedora etcd package's
     # vendor unit without an RPM file-conflict, and pins our overlay-bound config.
     { source = "packaging/systemd/etcd.service",         dest = "/etc/systemd/system/etcd.service",             mode = "644" },
@@ -709,6 +715,12 @@ assets = [
     { source = "install-helpers/mesh-alert.sh",          dest = "/usr/libexec/mackesd/mesh-alert",              mode = "755" },
     # SUBSTRATE — the etcd + Syncthing coordination/file substrate.
     { source = "install-helpers/setup-etcd.sh",          dest = "/usr/libexec/mackesd/setup-etcd",              mode = "755" },
+    # #13 — the turn-key lighthouse JOIN provisioner (`mackesd lighthouse add`): a
+    # droplet that joins the EXISTING mesh as a lighthouse (vs do-lighthouse-up.sh
+    # which founds a new mesh). do-lighthouse-join.sh finds its cloud-init template
+    # next to itself, so both ship to the same /usr/libexec/mackesd dir.
+    { source = "install-helpers/do-lighthouse-join.sh",  dest = "/usr/libexec/mackesd/do-lighthouse-join",      mode = "755" },
+    { source = "install-helpers/do-lighthouse-join-cloudinit.sh", dest = "/usr/libexec/mackesd/do-lighthouse-join-cloudinit.sh", mode = "755" },
     { source = "packaging/systemd/etcd.service",         dest = "/etc/systemd/system/etcd.service",             mode = "644" },
     { source = "install-helpers/setup-syncthing.sh",     dest = "/usr/libexec/mackesd/setup-syncthing",         mode = "755" },
     { source = "install-helpers/syncthing-reconcile.sh", dest = "/usr/libexec/mackesd/syncthing-reconcile",     mode = "755" },
