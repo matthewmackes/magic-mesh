@@ -13,6 +13,35 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
+## [11.0.10] — 2026-06-26
+### Added
+- **Turn-key multi-lighthouse HA.** A lighthouse is added to (or retired from) a
+  running mesh as one push-button op — no manual `etcdctl`/`scp`:
+  - `mackesd lighthouse add --region <r>` mints a role-scoped lighthouse token and
+    provisions a DigitalOcean droplet (new `do-lighthouse-join.sh`, carrying the
+    SSH-key lockout invariant guard) that JOINS the existing mesh as a full
+    lighthouse; `mackesd lighthouse retire` drains it (holding the
+    `HA_MIN_LIGHTHOUSES` floor), removes it from the etcd quorum, revokes its cert,
+    and deletes the droplet.
+  - **Auto-etcd cluster membership** (`substrate::etcd_membership`): a joining
+    lighthouse adds itself to the Raft quorum as a voter via the native
+    `etcd_client` member API; retire/leave/remove-peer removes it (move-leader off
+    it first) — no hand-run `etcdctl member add/remove`.
+  - **Auto-CA-key distribution**: a joiner enrolling under a role-scoped lighthouse
+    bearer receives the sealed mesh CA key over the authed enroll channel + seeds
+    the shared `nebula_ca` row, so it becomes a full *signing* lighthouse. The CA
+    spread is gated to lighthouse-role bearers only (ENT-12, §8).
+### Fixed
+- **Multi-lighthouse roster propagation (the root of "only one lighthouse").** The
+  `/enroll` roster reads the etcd directory (not the frozen fs snapshot); the
+  CSR-watcher + `ca sign-csr` build the full directory roster (not a hardcoded
+  `10.42.0.1`); and the nebula supervisor reconciles each node's own bundle from the
+  live directory every tick — so an already-enrolled peer (e.g. Eagle) learns a
+  newly-added lighthouse and reloads with no re-enroll. Verified live on UNIT-EAGLE.
+- **DDNS ingress label.** `ingress_record_label` collapses an apex hostname
+  (`host == zone`) to an empty label instead of publishing the zone as a bogus
+  DDNS record.
+
 ## [11.0.9] — 2026-06-25
 ### Added
 - **Datacenter plane (Workbench).** Full VM lifecycle — snapshot list/revert/delete
