@@ -166,6 +166,105 @@ pub fn media_registry_topic(peer: &str) -> String {
     format!("mesh/services/media/{peer}")
 }
 
+/// MEDIA-8 — the stable mesh DNS name the published media service is reached
+/// at (a CNAME/round-robin to the serving Lighthouse_Media node[s]). The
+/// `shared_account.server` published in the registry points here, so a
+/// Workstation auto-configures `mde-music` against `music.mesh` rather than a
+/// specific peer's overlay IP — the service stays reachable as instances come
+/// and go.
+pub const MUSIC_MESH_HOST: &str = "music.mesh";
+
+/// MEDIA-8 — the canonical `http://music.mesh:<navidrome-port>` server URL the
+/// published [`SharedAccount`] hands to clients. Single-sourced off
+/// [`MUSIC_MESH_HOST`] + [`NAVIDROME_PORT`] so the worker write side and the
+/// registry agree byte-for-byte.
+#[must_use]
+pub fn music_mesh_server_url() -> String {
+    format!("http://{MUSIC_MESH_HOST}:{NAVIDROME_PORT}")
+}
+
+/// MEDIA-8 — the read-only shared music account a Workstation auto-configures
+/// its `mde-music` client with. A `Lighthouse_Media` node publishes this into
+/// its [`MediaRegistration`] (sourced from the leader-managed `media-spaces`
+/// secret's `ND_ADMIN_USER`/`ND_ADMIN_PASS`); a Workstation subscribes and
+/// writes `airsonic-creds.json` so the first-run connect form is bypassed.
+///
+/// **READ-ONLY by intent.** The honest remaining (MEDIA-6) is provisioning a
+/// distinct least-privilege Navidrome account; until that lands the only shared
+/// account the secret carries is the admin one, which IS published so the
+/// auto-config path is real end-to-end. The field name keeps the contract so
+/// MEDIA-6 only swaps the *source* of the username/password, not the wire shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedAccount {
+    /// Server URL clients connect to — always [`music_mesh_server_url`].
+    pub server: String,
+    /// Shared account username (from the `media-spaces` secret).
+    pub username: String,
+    /// Shared account password (from the `media-spaces` secret).
+    pub password: String,
+}
+
+impl SharedAccount {
+    /// Build the shared account a Workstation auto-configures against:
+    /// `http://music.mesh:4533` + the supplied username/password. The server is
+    /// pinned to [`music_mesh_server_url`] so every published account agrees.
+    #[must_use]
+    pub fn new(username: &str, password: &str) -> Self {
+        Self {
+            server: music_mesh_server_url(),
+            username: username.to_owned(),
+            password: password.to_owned(),
+        }
+    }
+
+    /// MEDIA-8 — derive the shared account from the `media-spaces` leader
+    /// secret body. The secret is the `.env`-style file
+    /// `install-helpers/setup-media-navidrome.sh` consumes (`KEY=VAL` lines), so
+    /// we read `ND_ADMIN_USER` + `ND_ADMIN_PASS` out of it. `None` when either is
+    /// missing/empty — a node holding a malformed/partial secret publishes NO
+    /// account rather than a half-built one. Today this is the admin account
+    /// (the only one the secret carries); MEDIA-6 swaps the source for a
+    /// least-privilege read-only account without changing this shape.
+    #[must_use]
+    pub fn from_media_spaces_env(env_body: &str) -> Option<Self> {
+        let user = env_var_value(env_body, "ND_ADMIN_USER")?;
+        let pass = env_var_value(env_body, "ND_ADMIN_PASS")?;
+        if user.is_empty() || pass.is_empty() {
+            return None;
+        }
+        Some(Self::new(&user, &pass))
+    }
+}
+
+/// Pull `KEY`'s value out of a `.env`-style body (`KEY=VAL` per line). Handles
+/// `export KEY=VAL`, surrounding whitespace, and single/double quotes around the
+/// value; ignores `#` comments and blank lines. Returns the FIRST match's value.
+/// `None` when the key is absent. Pure — unit-tested apart from the secret store.
+fn env_var_value(body: &str, key: &str) -> Option<String> {
+    for raw in body.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").map_or(line, str::trim_start);
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        if k.trim() != key {
+            continue;
+        }
+        let v = v.trim();
+        // Strip a single matched pair of surrounding quotes.
+        let v = v
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+            .unwrap_or(v);
+        return Some(v.to_owned());
+    }
+    None
+}
+
 /// One media service registered into the mesh service registry by a
 /// `Lighthouse_Media` node — the document MEDIA-7 publishes. Carries the
 /// per-instance `health` field ([`HEALTH_UP`] / [`HEALTH_DOWN`]) so a
@@ -181,6 +280,15 @@ pub struct MediaRegistration {
     /// Per-instance health: [`HEALTH_UP`] when the service answers on its
     /// port, else [`HEALTH_DOWN`].
     pub health: String,
+    /// MEDIA-8 — the read-only shared music account a Workstation
+    /// auto-configures its client with (server + username + password). `None`
+    /// when the publishing node couldn't resolve the `media-spaces` secret (so
+    /// a node that hasn't been handed the shared creds publishes a registration
+    /// without an account rather than a fake one). `skip_serializing_if` keeps
+    /// the wire shape backward-compatible: a registration without an account
+    /// omits the field entirely, and an older reader ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_account: Option<SharedAccount>,
 }
 
 impl MediaRegistration {
@@ -208,7 +316,9 @@ pub fn probe_navidrome(port: u16) -> String {
 }
 
 /// Build this node's media registration from a probed health string. Pure
-/// constructor so the registration shape is unit-tested without a socket.
+/// constructor so the registration shape is unit-tested without a socket. No
+/// shared account is attached — see [`registration_with_account`] for the
+/// MEDIA-8 auto-config path.
 #[must_use]
 pub fn registration(node_id: &str, port: u16, health: &str) -> MediaRegistration {
     MediaRegistration {
@@ -216,7 +326,65 @@ pub fn registration(node_id: &str, port: u16, health: &str) -> MediaRegistration
         kind: NAVIDROME_KIND.to_owned(),
         port,
         health: health.to_owned(),
+        shared_account: None,
     }
+}
+
+/// MEDIA-8 — like [`registration`] but attaches the read-only shared account a
+/// Workstation auto-configures `mde-music` with. `account` is `None` when the
+/// publishing node couldn't resolve the `media-spaces` secret (an honest "no
+/// account to publish" rather than a fabricated one).
+#[must_use]
+pub fn registration_with_account(
+    node_id: &str,
+    port: u16,
+    health: &str,
+    account: Option<SharedAccount>,
+) -> MediaRegistration {
+    MediaRegistration {
+        shared_account: account,
+        ..registration(node_id, port, health)
+    }
+}
+
+/// MEDIA-8 — fold the replicated QNM-Shared registry plane
+/// (`<root>/<host>/media-registry.json`, written by each Lighthouse_Media
+/// node's [`crate::workers::media_registry`]) and return the first published
+/// [`SharedAccount`] a Workstation can auto-configure against. The same
+/// `read_dir`-over-the-share discipline `app_sync` / `apps::fleet_*` use.
+///
+/// Prefers an account from a registration whose instance is [`is_up`], so a
+/// Workstation auto-configures against a *serving* node when one is published;
+/// falls back to any published account otherwise (the account is the same shared
+/// creds regardless of which node published it — they all point at `music.mesh`).
+/// `None` when the share isn't mounted or no registration carries an account.
+///
+/// [`is_up`]: MediaRegistration::is_up
+#[must_use]
+pub fn read_shared_account_from_plane(workgroup_root: &Path) -> Option<SharedAccount> {
+    let entries = std::fs::read_dir(workgroup_root).ok()?;
+    let mut fallback: Option<SharedAccount> = None;
+    for ent in entries.flatten() {
+        let path = ent.path().join(MEDIA_REGISTRY_FILE);
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(reg) = serde_json::from_str::<MediaRegistration>(&body) else {
+            continue;
+        };
+        // Read `is_up` BEFORE moving the account out of the registration.
+        let up = reg.is_up();
+        let Some(acct) = reg.shared_account else {
+            continue;
+        };
+        // A serving (up) instance wins immediately; otherwise remember the
+        // first account as a fallback and keep scanning for an up one.
+        if up {
+            return Some(acct);
+        }
+        fallback.get_or_insert(acct);
+    }
+    fallback
 }
 
 #[cfg(test)]
@@ -300,5 +468,177 @@ mod tests {
         assert_eq!(probe_navidrome(1), HEALTH_DOWN);
         let reg = registration("peer:host", NAVIDROME_PORT, &probe_navidrome(1));
         assert!(!reg.is_up());
+    }
+
+    // ── MEDIA-8: the published shared account ──
+
+    #[test]
+    fn music_mesh_url_pins_host_and_navidrome_port() {
+        // The auto-config server URL the registry hands out is `music.mesh`
+        // (the stable mesh name) on the navidrome port, NOT a peer overlay IP.
+        assert_eq!(music_mesh_server_url(), "http://music.mesh:4533");
+    }
+
+    #[test]
+    fn shared_account_pins_the_music_mesh_server() {
+        // A SharedAccount always points at music.mesh; only the creds vary.
+        let acct = SharedAccount::new("mesh-music", "s3cret");
+        assert_eq!(acct.server, "http://music.mesh:4533");
+        assert_eq!(acct.username, "mesh-music");
+        assert_eq!(acct.password, "s3cret");
+    }
+
+    #[test]
+    fn registration_with_account_round_trips_on_the_wire() {
+        // The shared_account rides the same registry document MEDIA-7 publishes;
+        // it must (de)serialize so a Workstation reader reconstructs it exactly.
+        let acct = SharedAccount::new("mesh-music", "s3cret");
+        let reg =
+            registration_with_account("peer:eagle", NAVIDROME_PORT, HEALTH_UP, Some(acct.clone()));
+        let json = serde_json::to_string(&reg).unwrap();
+        // The account is on the wire under `shared_account`.
+        assert!(json.contains("\"shared_account\""));
+        assert!(json.contains("\"server\":\"http://music.mesh:4533\""));
+        assert!(json.contains("\"username\":\"mesh-music\""));
+        let back: MediaRegistration = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, reg);
+        assert_eq!(back.shared_account, Some(acct));
+    }
+
+    #[test]
+    fn shared_account_from_media_spaces_env_reads_nd_admin_creds() {
+        // The media-spaces secret is the .env body setup-media-navidrome.sh
+        // consumes; the shared account reads ND_ADMIN_USER/PASS out of it.
+        let body = "\
+DO_SPACES_KEY=AKIAEXAMPLE\n\
+DO_SPACES_SECRET=secret\n\
+DO_SPACES_BUCKET=mcnf-mesh-media\n\
+ND_ADMIN_USER=mesh-music\n\
+ND_ADMIN_PASS=hunter2\n";
+        let acct = SharedAccount::from_media_spaces_env(body).expect("creds present");
+        assert_eq!(acct.username, "mesh-music");
+        assert_eq!(acct.password, "hunter2");
+        assert_eq!(acct.server, "http://music.mesh:4533");
+    }
+
+    #[test]
+    fn shared_account_env_handles_export_quotes_and_comments() {
+        let body = "\
+# media-spaces secret\n\
+export ND_ADMIN_USER=\"mesh music\"\n\
+ND_ADMIN_PASS='p@ss=word'\n";
+        let acct = SharedAccount::from_media_spaces_env(body).unwrap();
+        assert_eq!(acct.username, "mesh music");
+        // The value's own '=' is preserved (only the first '=' splits).
+        assert_eq!(acct.password, "p@ss=word");
+    }
+
+    #[test]
+    fn shared_account_env_none_when_creds_missing_or_empty() {
+        // No ND_ADMIN_* at all → None (the node publishes no account).
+        assert_eq!(
+            SharedAccount::from_media_spaces_env("DO_SPACES_KEY=x\n"),
+            None
+        );
+        // Present but empty → None (a half-built account is worse than none).
+        assert_eq!(
+            SharedAccount::from_media_spaces_env("ND_ADMIN_USER=u\nND_ADMIN_PASS=\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn registration_without_account_omits_the_field_and_back_compat_deserializes() {
+        // A node that couldn't resolve the secret publishes NO account — the
+        // field is omitted entirely (skip_serializing_if), so an older reader's
+        // document (no `shared_account` key) still deserializes to `None`.
+        let reg = registration("peer:eagle", NAVIDROME_PORT, HEALTH_UP);
+        assert_eq!(reg.shared_account, None);
+        let json = serde_json::to_string(&reg).unwrap();
+        assert!(
+            !json.contains("shared_account"),
+            "absent account omits the field, not null"
+        );
+        // A legacy MEDIA-7 document (pre-MEDIA-8) deserializes with no account.
+        let legacy = r#"{"node_id":"peer:x","kind":"navidrome","port":4533,"health":"up"}"#;
+        let back: MediaRegistration = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.shared_account, None);
+        assert_eq!(back.kind, NAVIDROME_KIND);
+    }
+
+    fn seed_plane_doc(root: &Path, host: &str, reg: &MediaRegistration) {
+        let dir = root.join(host);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(MEDIA_REGISTRY_FILE),
+            serde_json::to_string(reg).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn read_shared_account_from_plane_empty_when_no_share() {
+        assert_eq!(
+            read_shared_account_from_plane(Path::new("/nonexistent/qnm/xyz")),
+            None
+        );
+    }
+
+    #[test]
+    fn read_shared_account_from_plane_prefers_an_up_instance() {
+        let tmp = std::env::temp_dir().join(format!("mde-mediaplane-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // A DOWN instance publishes account "old"; an UP one publishes "live".
+        // The reader must prefer the serving (up) node's account.
+        seed_plane_doc(
+            &tmp,
+            "downhost",
+            &registration_with_account(
+                "peer:down",
+                NAVIDROME_PORT,
+                HEALTH_DOWN,
+                Some(SharedAccount::new("old", "p1")),
+            ),
+        );
+        seed_plane_doc(
+            &tmp,
+            "uphost",
+            &registration_with_account(
+                "peer:up",
+                NAVIDROME_PORT,
+                HEALTH_UP,
+                Some(SharedAccount::new("live", "p2")),
+            ),
+        );
+        let acct = read_shared_account_from_plane(&tmp).expect("an account is published");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(acct.username, "live");
+    }
+
+    #[test]
+    fn read_shared_account_from_plane_falls_back_to_a_down_account() {
+        let tmp = std::env::temp_dir().join(format!("mde-mediaplane-dn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Only a down instance is published, but it still carries the shared
+        // account — better to auto-config than show the first-run form.
+        seed_plane_doc(
+            &tmp,
+            "downhost",
+            &registration_with_account(
+                "peer:down",
+                NAVIDROME_PORT,
+                HEALTH_DOWN,
+                Some(SharedAccount::new("mesh-music", "p1")),
+            ),
+        );
+        // A doc WITHOUT an account is skipped (not all media nodes have creds).
+        seed_plane_doc(
+            &tmp,
+            "noacct",
+            &registration("peer:x", NAVIDROME_PORT, HEALTH_UP),
+        );
+        let acct = read_shared_account_from_plane(&tmp).expect("the down account is the fallback");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(acct.username, "mesh-music");
     }
 }

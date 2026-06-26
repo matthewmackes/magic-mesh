@@ -97,6 +97,20 @@ pub fn codex_creds_ref() -> String {
     "copilot/codex-api-key".to_string()
 }
 
+/// MEDIA-8 — the secret-store key for the media-spaces secret (the DO Spaces S3
+/// creds + the Navidrome `ND_ADMIN_USER`/`ND_ADMIN_PASS` shared account, sealed
+/// by MEDIA-2). A BARE name (no `vpn/`/`xcp/` prefix) — it's a datacenter-tier
+/// secret like `do-token`/`xapi-password` that `setup-media-navidrome.sh`
+/// already consumes from a root-only env file; the Lighthouse_Media media
+/// registry worker reads the SAME sealed secret to publish the shared account.
+///
+/// Pure + stable: this string IS the etcd/on-disk key, so a change orphans the
+/// stored secret.
+#[must_use]
+pub fn media_spaces_creds_ref() -> String {
+    "media-spaces".to_string()
+}
+
 /// A keyed, encrypted, distribution-capable secret store. Both backends do real
 /// encryption; the choice is driven by what the node can reach (see
 /// [`SecretStore::resolve`]).

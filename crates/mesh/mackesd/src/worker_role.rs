@@ -90,6 +90,10 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     ("clipboard_sync", 2),
     ("kdc_host", 2),
     ("remmina-sync", 2),
+    // MEDIA-8 — Workstation music auto-config: a desktop worker (no seated user
+    // on a Lighthouse/Server, so Workstation-tier), reads the published shared
+    // account off the registry plane + writes the desktop user's creds.
+    ("music_autoconfig", 2),
 ];
 
 /// MEDIA-1 — workers that ALSO require a capability tag beyond their rank tier.
@@ -295,7 +299,9 @@ mod tests {
         // removed in CLIP-SYNC-2: that binary never existed in the workspace).
         // +1 etcd_watch (SUBSTRATE-10 — the coordination-plane WATCH worker that
         // pushes instant peer-down / leader-change alerts off etcd watch streams).
-        assert_eq!(WORKER_TIERS.len(), 28);
+        // +1 music_autoconfig (MEDIA-8 — Workstation music birthright: writes the
+        // desktop user's airsonic-creds.json from the published mesh shared account).
+        assert_eq!(WORKER_TIERS.len(), 29);
     }
 
     #[test]
@@ -328,8 +334,8 @@ mod tests {
         );
         assert_eq!(
             count(2),
-            4,
-            "Workstation adds voice/clipboard_sync/kdc/remmina"
+            5,
+            "Workstation adds voice/clipboard_sync/kdc/remmina + music_autoconfig (MEDIA-8)"
         );
     }
 
@@ -384,9 +390,9 @@ mod tests {
         // +1 etcd_watch (SUBSTRATE-10, rank 0 → present in every tier).
         assert_eq!(lh.len(), 21);
         assert_eq!(srv.len(), 24);
-        // 28: +clipboard_sync (CLIP-SYNC-1), -clipd_supervisor (removed, CLIP-SYNC-2),
-        // +etcd_watch (SUBSTRATE-10).
-        assert_eq!(ws.len(), 28);
+        // 29: +clipboard_sync (CLIP-SYNC-1), -clipd_supervisor (removed, CLIP-SYNC-2),
+        // +etcd_watch (SUBSTRATE-10), +music_autoconfig (MEDIA-8).
+        assert_eq!(ws.len(), 29);
         // Strict superset: every lower-tier worker is in the higher tier.
         assert!(lh.iter().all(|w| srv.contains(w)));
         assert!(srv.iter().all(|w| ws.contains(w)));
