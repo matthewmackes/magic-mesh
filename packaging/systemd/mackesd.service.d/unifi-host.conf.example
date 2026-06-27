@@ -1,0 +1,23 @@
+# DATACENTER-14 — activate the UniFi gateway source on an on-prem LAN node.
+#
+# The datacenter_orchestrator UniFi source (gateway status + DHCP-lease fleet
+# discovery + firewall/port-forward edits + reboot) is OFF by default:
+# unifi_host() returns "" unless MCNF_UNIFI_HOST is set, so a DO lighthouse
+# (which cannot reach the on-prem router) stays a safe no-op. Drop this ONLY on
+# the on-prem LAN node that:
+#   (a) runs mackesd,
+#   (b) can reach the gateway (172.20.0.1), and
+#   (c) has the repo checkout — the worker shells `automation/secrets/
+#       mcnf-secret.sh get unifi-cred` to read the credential.
+#
+# Install (on that node):
+#   install -Dm644 packaging/systemd/mackesd.service.d/unifi-host.conf.example \
+#       /etc/systemd/system/mackesd.service.d/unifi-host.conf
+#   systemctl daemon-reload && systemctl restart mackesd
+#
+# The credential is NOT here (secrets never live in a unit). It is sealed
+# age-encrypted in the mesh secret store under `unifi-cred` — set/rotate it with
+#   printf 'ubnt:<password>' | automation/secrets/mcnf-secret.sh put unifi-cred
+# (parse_unifi_cred splits on the first ':'; a bare value assumes user "ubnt").
+[Service]
+Environment=MCNF_UNIFI_HOST=172.20.0.1
