@@ -2079,32 +2079,34 @@ Generalize the single hardcoded EdgeRouter (`172.20.0.1`, `infra/tofu/edgeos/`, 
 
 ### Phase 1 — Read slice (discover → fingerprint → cred-match → read)
 
-- [ ] **ROUTER-1: per-node default-route + LAN-appliance discovery.**
+**Phase 1 delivered 2026-06-27** (commits 1dabe28 / 13a583a / da25cf7; farm build+tests GREEN). Runtime-reachable: mackesd's always-on `router_registry` worker discovers each node's primary default-route appliance, cred-matches `router/<mac>`, fingerprints it (Vyatta `show version`), and publishes to `mesh/devices/router/<mac>` + the QNM-Shared `router-registry.json`; the Mesh → Routers panel unions + renders them. **Honest follow-ons folded into Phase 2:** (a) LAN-appliance enumeration beyond the primary default-route hop (`surrounding_hosts`); (b) GUI cred-seal form (CLI `mackesd secret put router/<mac>` works today); (c) in-panel DHCP reservations/leases (needs the per-appliance tofu read — ROUTER-6).
+
+- [✓] **ROUTER-1: per-node default-route + LAN-appliance discovery.** (default-route hop + gateway-MAC done; LAN-appliance enumeration → Phase 2)
   **As** a node operator, **I want** each node to find the router/firewall it sits behind,
   **so that** I don't hand-configure `MCNF_UNIFI_HOST` per node.
   **Acceptance** (runtime-observable):
     - [ ] a per-node mackesd source resolves the lowest-metric default route via `netassess::parse_default_gateway` + enumerates `surrounding_hosts` router-typed LAN appliances
     - [ ] each candidate's MAC is resolved (ARP/`ip neigh`) as the stable `<id>` and emitted to the router-registry
     - [ ] runs always-on per-node (not leader-gated); a node with no router emits nothing (safe no-op)
-- [ ] **ROUTER-2: layered Vyatta fingerprint.**
+- [✓] **ROUTER-2: layered Vyatta fingerprint.** (active `show version` → EdgeOS/VyOS authoritative; passive OUI hint present)
   **As** the mesh, **I want** to classify a discovered appliance,
   **so that** only Vyatta-CLI devices are offered controls.
   **Acceptance**:
     - [ ] passive pass (MAC-OUI + SSH banner) tags likely-router; when a `router/<mac>` cred exists, an active `show version` over SSH confirms `EdgeOS`/`UBNT` vs `VyOS`
     - [ ] non-Vyatta or unfingerprintable appliances are marked `unmanaged / unknown-vendor`
-- [ ] **ROUTER-3: per-appliance credential `router/<mac>` + operator seal.**
+- [✓] **ROUTER-3: per-appliance credential `router/<mac>` + operator seal.** (CLI seal + cred-match + needs-creds state done; GUI seal-form → Phase 2)
   **As** the operator, **I want** to seal a router's creds once,
   **so that** the node can manage it without inventing creds.
   **Acceptance**:
     - [ ] `mackesd secret put router/<mac>` + a GUI cred form seal a `user:pass` body into the age-encrypted mesh secret store (reuses the `xcp/<host>` keying); agent never invents creds
     - [ ] an appliance with no sealed cred shows `unmanaged — needs credentials`; sealing flips it to managed + populates `show version`
-- [ ] **ROUTER-4: router-registry (bus + QNM-Shared).**
+- [✓] **ROUTER-4: router-registry (bus + QNM-Shared).** (always-on worker, on-change + heartbeat, atomic mirror — done)
   **As** the GUI, **I want** a fleet view of every node's appliance,
   **so that** I see all routers at once.
   **Acceptance**:
     - [ ] per-node publish to Bus `mesh/devices/router/<mac>` + QNM-Shared `<workgroup_root>/<node>/router-registry.json` (on-change + heartbeat), mirroring `media_registry`
     - [ ] entries carry id(MAC)/ip/vendor/version/managed-state/node
-- [ ] **ROUTER-5: Router panel — read view.**
+- [✓] **ROUTER-5: Router panel — read view.** (cards: vendor/status/ip/node/version; needs-creds flagged — done. In-panel DHCP leases → Phase 2)
   **As** the operator, **I want** a dedicated Router panel,
   **so that** I can see each node's appliance + its live state.
   **Acceptance**:
