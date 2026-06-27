@@ -2134,3 +2134,40 @@ Generalize the single hardcoded EdgeRouter (`172.20.0.1`, `infra/tofu/edgeos/`, 
 - [✓] **ROUTER-10: reboot + Router-panel mutate controls.** (confirm-gated **Reboot** wired in the Router panel per managed appliance → the existing `action/dc/gateway-reboot` handler, arm→confirm→cancel pattern; DoD green. Firewall/NAT/VPN mutation is reachable via the tofu IaC path (ROUTER-7/8/9 converge engines, like DHCP); inline rule editors in the panel = a UX follow-on.)
   **Acceptance**:
     - [✓] confirm-gated reboot in the Router panel (→ gateway-reboot action, arm/confirm/cancel); firewall/port-forward/VPN converge reachable via tofu (engines done); DoD green (farm build + tests + 0 new warnings)
+
+## APPLAUNCH — Application Launcher rethink → consolidate into the Front Door (50-Q survey 2026-06-27; design: docs/design/app-launcher-rethink.md)
+
+The rethink is a **consolidation**: merge the standalone `mde-apps-applet` into the Front Door (one launcher — fast local Start-menu + mesh-wide resource launcher), then retire the applet. All behavior below lands in the Front Door's Panel + FullScreen modes.
+
+- [ ] **APPLAUNCH-1: Front-Door app-launcher view (unified list + filter chips + favorites landing).**
+  **As** an operator, **I want** one launcher surface, **so that** I don't have two overlapping ones.
+  **Acceptance**:
+    - [ ] the Front Door (Panel mode) renders a unified entry list with filter chips (Local/Mesh/Workloads/Services), landing on the per-user favorites grid; fed by the existing `apps_aggregator` (`action/apps/list`)
+    - [ ] local-first browse (mesh entries via the Mesh chip/search); favorites-grid + list-rows; follows the Cosmic theme
+- [ ] **APPLAUNCH-2: fuzzy search + `>` run.**
+  **As** a user, **I want** typo-tolerant search, **so that** I find apps fast.
+  **Acceptance**:
+    - [ ] fuzzy/typo-tolerant matching over name + .desktop Keywords + Comment, pure-relevance ranked; a leading `>` runs the remainder as a shell command (merged Run box)
+- [ ] **APPLAUNCH-3: real app icons.**
+  **Acceptance**:
+    - [ ] local apps render their real icon-theme icon (cached), Carbon kind-glyph fallback; mesh/workload/service keep Carbon glyphs
+- [ ] **APPLAUNCH-4: operator-curated groups.**
+  **Acceptance**:
+    - [ ] operator-defined group buckets (per-user QNM `app-groups.json`) render as collapsible sections in the Apps filter (= the All-apps view)
+- [ ] **APPLAUNCH-5: on-demand peer-app discovery + launch-on-peer.**
+  **As** an operator, **I want** to see + launch a peer's apps, **so that** the mesh is one launcher.
+  **Acceptance**:
+    - [ ] focusing a node queries its installed `.desktop` set live (`action/apps/peer-list`); apps surface with an on-peer badge; launch opens a remmina RD session (existing `action/apps/launch`); a slow/dead peer times out without blocking the UI
+- [ ] **APPLAUNCH-6: per-app menu + service cards.**
+  **Acceptance**:
+    - [ ] per-app row menu: Properties (.desktop) / Copy command / Open location / Uninstall (dnf|flatpak, confirm-gated); a service entry opens a card with status + copy-endpoint + restart-if-owned
+- [ ] **APPLAUNCH-7: cache + background refresh + lazy mesh (perf).**
+  **Acceptance**:
+    - [ ] opens <150ms from a cached list regardless of mesh size; aggregation refreshes in the background + updates live; mesh sections lazy-load; mesh-down hides mesh entries (local fully works)
+- [ ] **APPLAUNCH-8: Start-trigger + keyboard + chrome.**
+  **Acceptance**:
+    - [ ] Super-key/Start opens the Front Door Panel mode on the primary monitor (expand → full-screen); full keyboard-first nav (↑↓/Enter/Esc/Tab chips); slimmed Win+X essentials; brand logo + subtle badge; reuses the FD voice slice + first-run greeting
+- [ ] **APPLAUNCH-9: migrate — parity then retire `mde-apps-applet`.**
+  **As** the project, **I want** one launcher binary, **so that** there's no fork.
+  **Acceptance**:
+    - [ ] at feature-parity, the Start button/`event/apps/toggle` repoints to the Front Door; `mde-apps-applet` is removed (RPM asset + autostart + crate bin) with nothing referencing it; lint-mesh-boundary clean; the lighthouse-health `mde-cosmic-applet` is untouched
