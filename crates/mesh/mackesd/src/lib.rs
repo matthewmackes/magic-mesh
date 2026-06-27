@@ -125,6 +125,10 @@ pub mod store;
 // consumed by the `mackesd classify-host` CLI + (later) the A-4.b
 // collectors + A-4.c worker.
 pub mod surrounding_hosts;
+// ROUTER-1/2 — per-node router/firewall discovery + Vyatta-CLI fingerprint
+// (EdgeOS/VyOS). Consumed by the router-registry + Router panel; design:
+// docs/design/router-control.md.
+pub mod router_discovery;
 // v2.0.0 Phase 12.17 — STUN client for ICE candidate gathering. Gated
 // behind `async-services` because it uses tokio UDP + tokio time.
 pub mod bearer_ledger;
