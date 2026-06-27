@@ -672,6 +672,13 @@ impl App {
         if self.view.panel_slug() == Some("instances") {
             subs.push(compute_panel::ComputePanel::sample_subscription());
         }
+        // BOOT-STATUS — tail `state/boot-readiness` only while the Home /
+        // Overview panel is visible (Dashboard group, either the group root or
+        // the "home" leaf panel). Idle elsewhere so no CPU is burned while the
+        // operator is on another panel — mirrors the LIGHTHOUSE beacon pattern.
+        if self.view.group() == Group::Dashboard {
+            subs.push(home_panel::boot_readiness_subscription());
+        }
         // LIGHTHOUSE-5 — only while the Lighthouses tab is open: advance the
         // beacon beam (150ms) and refresh the cards from the replicated
         // directory (5s push-ish). Idle elsewhere (no CPU when the tab is shut).

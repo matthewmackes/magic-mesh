@@ -595,6 +595,10 @@ pub enum Message {
     ConnectRetry,
     /// MESH-CONNECT-DIALOG-1 — close the connect modal (Dismiss / backdrop).
     ConnectDismiss,
+    /// BOOT-STATUS — live push from `state/boot-readiness` subscription.
+    /// Fired sub-second each time the mackesd boot_readiness worker
+    /// publishes a new snapshot; replaces the stale snapshot in-place.
+    BootReadinessUpdate(BootReadiness),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -710,6 +714,20 @@ impl HomePanel {
             Message::ConnectDismiss => {
                 self.connect = ConnectProgress::Closed;
                 self.connect_target = None;
+                Task::none()
+            }
+            // BOOT-STATUS — live push from the `state/boot-readiness` subscription.
+            // Apply the fresh snapshot in-place: update the boot fields while
+            // preserving the capability rows + mackesd_reachable already probed.
+            Message::BootReadinessUpdate(boot) => {
+                self.snapshot.boot_ready = boot.ready;
+                self.snapshot.boot_steps = boot.steps;
+                self.snapshot.boot_services = boot.services;
+                // Keep the hero mesh_peers tile in sync with the ping roll-up.
+                if !boot.pings.is_empty() {
+                    self.snapshot.mesh_peers = Some(boot.pings.len() as u32);
+                }
+                self.snapshot.boot_pings = boot.pings;
                 Task::none()
             }
             // The re-probe landed — resolve the modal from the capability's real
@@ -2398,6 +2416,105 @@ fn extract_peer_count(row: &CapabilityRow) -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------------
+// BOOT-STATUS live subscription
+// ---------------------------------------------------------------------------
+
+/// The bus topic the mackesd boot_readiness worker publishes to.
+const BOOT_READINESS_TOPIC: &str = "state/boot-readiness";
+
+/// Determine the collapsed-vs-expanded view state from a [`BootReadiness`]
+/// snapshot. Returns `true` (collapsed / "all-green chip") when every step in
+/// the chain is `ok` AND `ready` is true. Returns `false` (expanded detail
+/// view) when any step is not `ok`, or when there is a regression (`ready`
+/// flips back to false). An empty step list (mid-boot / unknown) is also
+/// treated as expanded so the placeholder is visible.
+///
+/// This is a pure function so it can be unit-tested without spinning up Iced.
+#[must_use]
+pub fn boot_status_collapsed(br: &BootReadiness) -> bool {
+    br.ready && br.steps.iter().all(|s| s.status == "ok")
+}
+
+/// Iced subscription that tails `state/boot-readiness` on the mesh bus and
+/// emits [`Message::BootReadinessUpdate`] whenever mackesd publishes a new
+/// snapshot. The poll interval is 500 ms so step transitions are surfaced
+/// sub-second. The subscription is idle (not registered) when the home panel
+/// is not shown — the caller (app::subscription) gates it on the active view.
+///
+/// The cursor is seeded at the latest existing entry on first connect so only
+/// snapshots published **after** the panel opens trigger repaints (the
+/// initial state is already loaded by [`HomeSnapshot::load_sync`]).
+#[must_use]
+pub fn boot_readiness_subscription() -> cosmic::iced::Subscription<crate::Message> {
+    use cosmic::iced::futures::SinkExt;
+    use cosmic::iced::stream;
+    cosmic::iced::Subscription::run(|| {
+        stream::channel(
+            4,
+            |mut output: cosmic::iced::futures::channel::mpsc::Sender<crate::Message>| async move {
+                let mut cursor = boot_readiness_cursor_init().await;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let (updates, next) = boot_readiness_poll(cursor.clone()).await;
+                    cursor = next;
+                    for br in updates {
+                        let _ = output
+                            .send(crate::Message::Home(Message::BootReadinessUpdate(br)))
+                            .await;
+                    }
+                }
+            },
+        )
+    })
+}
+
+/// Seed the cursor at the latest existing `state/boot-readiness` ulid so the
+/// subscription only reacts to entries written **after** it starts.
+/// Returns `None` when the bus is unavailable (topic empty / mid-boot).
+async fn boot_readiness_cursor_init() -> Option<String> {
+    tokio::task::spawn_blocking(|| {
+        let dir = mde_bus::client_data_dir()?;
+        let persist = mde_bus::persist::Persist::open(dir).ok()?;
+        let msgs = persist.list_since(BOOT_READINESS_TOPIC, None).ok()?;
+        msgs.last().map(|m| m.ulid.clone())
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Poll `state/boot-readiness` since `cursor`; decode each new entry into a
+/// [`BootReadiness`] value and return them together with the advanced cursor.
+/// Bus unavailable → empty list, cursor unchanged.
+async fn boot_readiness_poll(
+    cursor: Option<String>,
+) -> (Vec<BootReadiness>, Option<String>) {
+    let fallback = cursor.clone();
+    tokio::task::spawn_blocking(move || {
+        let Some(dir) = mde_bus::client_data_dir() else {
+            return (Vec::new(), cursor);
+        };
+        let Ok(persist) = mde_bus::persist::Persist::open(dir) else {
+            return (Vec::new(), cursor);
+        };
+        let msgs = persist
+            .list_since(BOOT_READINESS_TOPIC, cursor.as_deref())
+            .unwrap_or_default();
+        let mut next = cursor;
+        let mut updates = Vec::new();
+        for m in msgs {
+            next = Some(m.ulid);
+            if let Some(body) = m.body {
+                updates.push(parse_boot_readiness(&body));
+            }
+        }
+        (updates, next)
+    })
+    .await
+    .unwrap_or((Vec::new(), fallback))
+}
+
+// ---------------------------------------------------------------------------
 // D-Bus signal subscription (OV-8)
 // ---------------------------------------------------------------------------
 
@@ -3264,5 +3381,124 @@ mod tests {
                 row.id
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // BOOT-STATUS: all-green collapse + regression re-expand logic
+    // -----------------------------------------------------------------------
+
+    fn make_step(id: &str, status: &str) -> BootStep {
+        BootStep {
+            id: id.to_string(),
+            label: id.to_string(),
+            status: status.to_string(),
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn boot_status_collapsed_all_green_collapses() {
+        // When ready=true and every step is "ok", the panel should collapse
+        // to the glanceable green chip.
+        let br = BootReadiness {
+            ready: true,
+            steps: vec![
+                make_step("nebula", "ok"),
+                make_step("overlay-ip", "ok"),
+                make_step("mackesd", "ok"),
+                make_step("bus", "ok"),
+                make_step("qnm", "ok"),
+                make_step("directory", "ok"),
+            ],
+            services: vec![],
+            pings: vec![],
+        };
+        assert!(
+            boot_status_collapsed(&br),
+            "all-ok steps + ready=true must collapse to chip"
+        );
+    }
+
+    #[test]
+    fn boot_status_collapsed_pending_step_expands() {
+        // Any non-ok step keeps the detail view expanded even when ready=true.
+        let br = BootReadiness {
+            ready: true,
+            steps: vec![
+                make_step("nebula", "ok"),
+                make_step("qnm", "pending"),
+            ],
+            services: vec![],
+            pings: vec![],
+        };
+        assert!(
+            !boot_status_collapsed(&br),
+            "a pending step must expand the detail view"
+        );
+    }
+
+    #[test]
+    fn boot_status_collapsed_regression_re_expands() {
+        // When ready flips back to false (regression), the detail view
+        // must re-expand even if all individual steps happened to be "ok".
+        let br = BootReadiness {
+            ready: false,
+            steps: vec![
+                make_step("nebula", "ok"),
+                make_step("qnm", "ok"),
+            ],
+            services: vec![],
+            pings: vec![],
+        };
+        assert!(
+            !boot_status_collapsed(&br),
+            "ready=false (regression) must re-expand the detail view"
+        );
+    }
+
+    #[test]
+    fn boot_status_collapsed_empty_steps_expands() {
+        // An empty step list (mid-boot / bus unavailable) must show the
+        // expanded placeholder rather than collapsing to the chip.
+        let br = BootReadiness::default();
+        assert!(
+            !boot_status_collapsed(&br),
+            "unknown/empty state must show expanded view"
+        );
+    }
+
+    #[test]
+    fn boot_readiness_update_applies_live_snapshot() {
+        // The BootReadinessUpdate handler must overwrite boot fields in-place
+        // while leaving capabilities + mackesd_reachable untouched.
+        let mut panel = HomePanel::new();
+        panel.snapshot.boot_ready = false;
+        panel.snapshot.boot_steps = vec![make_step("nebula", "pending")];
+        panel.snapshot.mackesd_reachable = false; // must survive the update
+
+        let fresh = BootReadiness {
+            ready: true,
+            steps: vec![
+                make_step("nebula", "ok"),
+                make_step("qnm", "ok"),
+            ],
+            services: vec![],
+            pings: vec![BootPing {
+                peer: "lh-01".to_string(),
+                role: "lighthouse".to_string(),
+                rtt_ms: Some(4.5),
+            }],
+        };
+        let _ = panel.update(Message::BootReadinessUpdate(fresh));
+
+        assert!(panel.snapshot.boot_ready, "boot_ready must be updated");
+        assert_eq!(panel.snapshot.boot_steps.len(), 2);
+        assert_eq!(panel.snapshot.boot_pings.len(), 1);
+        assert_eq!(panel.snapshot.mesh_peers, Some(1), "ping count seeds hero tile");
+        // Unrelated field must be preserved.
+        assert!(
+            !panel.snapshot.mackesd_reachable,
+            "mackesd_reachable must not be touched by BootReadinessUpdate"
+        );
     }
 }
