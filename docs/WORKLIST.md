@@ -19,6 +19,7 @@ Methods so the autonomous drain can't be derailed by the mechanical failures tha
 ## INCIDENT — mde-bus broker resilience (BROKER-RESILIENCE-1, diagnosed live 2026-06-25)
 A missing/skipped `ntfy` broker (`<overlay_ip>:8443`) was design-"non-fatal" but FATAL in practice: mackesd kept publishing to the unreachable `:8443` (every publish persisted to the `/run/mde-bus` spool, which grew unbounded — observed boot-readiness 25M + audit 19M + compute 13M ≈ 77M of a 190M tmpfs) and the broker-unreachable path starved the 60 s systemd watchdog → `status=6/ABRT` ~every 3 min (NRestarts climbing on both lighthouses). The broker client was `reqwest::Client::new()` with NO timeout.
 - [✓] **BROKER-RESILIENCE-1: a skipped/unreachable broker is truly non-fatal.** Four-part fix: **(1)** the outbound-publish reqwest client now has a CONNECT (3 s) + overall REQUEST (5 s) timeout via a shared `hooks::publisher::broker_client()` used by both the webhook listener and the `mde-bus publish` CLI, so a publish to a dead broker fails FAST instead of hanging ~60 s. **(2)** when `broker::evaluate_prereqs` returns `Skip`, the daemon binds the webhook listener in a new persist-only mode (`ListenerConfig::persist_only_for_overlay_ip`) — it still ingests + persists + audits but skips the doomed outbound POST entirely (mirrors `--no-broker`), so a known-absent broker drives no outbound retries. **(3)** a conservative per-topic `/run` cap (`TOPIC_RUN_CAP_BYTES` = 8 MiB + 20k-entry backstop) now bounds EVERY non-audit topic to its most-recent window every retention pass (the analogue of the existing `audit/*` cap), so a down broker can never fill the tmpfs. **(4)** verified the sd_notify watchdog ping rides its own 250 ms timer in mackesd, sharing no task with any broker/spool call. **Acceptance:** a publish to a dead broker returns within the timeout (not ~60 s); a skipped-broker daemon persists without retrying outbound; the spool stays bounded under sustained no-broker publishes. *(build + clippy + new tests GREEN on the farm, slot `brokerfix`.)*
+- [✓] **BROKER-RESILIENCE-2 / WATCHDOG-2: the watchdog ping was STILL being starved — real root cause + fix (11.0.11, 2026-06-27).** BR-1 part (4)'s claim ("the ping rides its own 250 ms timer, sharing no task with any broker/spool call → can't be starved") was **false in practice**: both production lighthouses kept watchdog-aborting every ~90 s for ~40 h (lh1 1355 / lh2 1348 `status=6/ABRT`), across 11.0.8→11.0.10, which blocked every enrollment (`:4243` only up between crashes). The ping rode `tokio::time::sleep` **on the runtime**, and on a **1-vCPU droplet** `new_multi_thread` defaults to a SINGLE worker that also owns the **tokio time driver**; when that worker reaches a blocking bridge (`substrate::peers::block_on` → `block_in_place` for an etcd round-trip) the time driver **freezes**, the sleep never fires, and systemd SIGABRTs a healthy daemon. A missing broker reliably triggered it via extra `block_in_place` churn. Fix: **(a)** floor the runtime at 4 worker threads even on 1 vCPU (`bin/mackesd.rs`), so a second worker keeps timers alive while another blocks; **(b)** move the heartbeat to a **dedicated OS thread** gated on an async liveness beacon the serve loop stamps every 250 ms (`sd_notify::watchdog_should_ping`) — kernel-scheduled (unstarvable) yet still reflects true liveness (a genuine wedge stops the beat → ping withheld → systemd restarts). Released as signed **11.0.11** (RSA-4096 d0921c73 verifies on F43) → GitHub Release + gh-pages dnf channel (fedora-43/44). **Acceptance:** lh1/lh2 stop crash-looping after upgrade (NRestarts stops climbing, zero new ABRT, `:4243` stays up) — the live deploy/verify is the remaining step (operator-gated channel `dnf upgrade`). *(farm: 7/7 lib tests incl. new beacon tests, clippy+fmt clean, `cargo check --bin` exit 0.)*
 
 ## FARM-AUTOSCALE — demand-driven elastic build farm (operator 2026-06-24; design: docs/design/farm-autoscale.md)
 Tofu auto-scaling + full lifecycle of VM **and** POD resources: each dom0 runs EITHER one hardware-maxing big build VM OR several small VMs/agent pods, created/destroyed by tofu to fit the live build queue — best on-demand hardware use. Locks: **demand-driven** (the @farm queue is the signal) · **FARM-AUTO reconciler orchestrates** (no AI in the loop) · **warm pool, scale-to-zero + snapshot-reset** · **mutually-exclusive shapes per dom0, demand wins**.
@@ -596,10 +597,10 @@ Design: docs/design/workbench-nav-grouping.md (15-question survey locked 2026-06
   desktop settings deferred to Cosmic and plain-language labels,
   **so that** I can find mesh services without hunting across 15 ad-hoc groups.
   **Acceptance** (runtime-observable):
-    - [ ] left nav renders exactly the 7 sections in the locked order; Overview/Home selected on launch
-    - [ ] no duplicate/ambiguous labels (no three "Inventory"s); renames applied (Mackes Bus→Message Bus, etc.)
-    - [ ] every retained panel routes to its working view; deferred desktop panels gone from nav
-    - [ ] Group::all() order matches the lock; from_slug round-trips; cargo test -p mde-workbench green
+    - [✓] left nav renders exactly the 7 sections in the locked order; Overview/Home selected on launch
+    - [✓] no duplicate/ambiguous labels (no three "Inventory"s); renames applied (Mackes Bus→Message Bus, etc.)
+    - [✓] every retained panel routes to its working view; deferred desktop panels gone from nav
+    - [✓] Group::all() order matches the lock; from_slug round-trips; cargo test -p mde-workbench green
 - [✓] **NAV-1.2: delete the deferred desktop panel modules + wire the Cosmic hand-off** *(operator decisions locked 2026-06-16)*
   **Done — verified complete 2026-06-20** (the work had landed in prior NAV passes; this turn confirmed every acceptance bullet against the code + ran the locked gate). The hidden `Group::Desktop` is gone from the `Group` enum (`model.rs` — `all()`/`sidebar_groups()`/`from_slug` carry only the mesh sections; the line-82 comment records "NAV-1.2 retired the hidden [Desktop] group"). All 17 Cosmic-owned desktop panels (displays/keyboard/mouse/power/session/sound/printers/removable/themes/fonts/datetime + install/installed/remove/sources/default_apps/panel) are deleted — no module files, no `pub mod`, no Message/update/view/load wiring (a dangling arm would fail the build, which is green). The keep-4 are relocated per the plan with explicit `// NAV-1.2 —` markers: wallpaper + notifications → **This Node** (`model.rs:204-207`), system_update + sync_status → **System** (`model.rs:301-302` + the deep-link map `system.system_update`/`system.sync_status` → `Group::System`). Gate: `cargo test -p mde-workbench` green (769 + suites, 0 failed).
   **LOCKED PLAN:**
@@ -614,9 +615,9 @@ Design: docs/design/workbench-nav-grouping.md (15-question survey locked 2026-06
   **so that** the hidden `Group::Desktop` placeholder + its panel modules stop being
   dead weight (NAV-1.1 left them deep-link-reachable to avoid orphaning).
   **Acceptance** (runtime-observable):
-    - [ ] the `Desktop` group + its nav entry are gone; `Group::all()` is the 7 visible sections
-    - [ ] each deferred panel module + its Message/update/view/load wiring is deleted (or moved to Cosmic)
-    - [ ] no dead `pub mod`/unreachable panel remains; cargo test -p mde-workbench green
+    - [✓] the `Desktop` group + its nav entry are gone; `Group::all()` is the 7 visible sections
+    - [✓] each deferred panel module + its Message/update/view/load wiring is deleted (or moved to Cosmic)
+    - [✓] no dead `pub mod`/unreachable panel remains; cargo test -p mde-workbench green
 
 ### SUBAUDIT — deployed-substrate correctness sweep (docs/design/substrate-correctness-audit.md)
 Live testing on .13 surfaced a run of empty panels — all four classes of substrate mismatch (not unbuilt). Fix the class, not just each panel.
@@ -638,44 +639,44 @@ A professional, themed, desktop-wide notification center replacing the Cosmic tr
   **I want** a library that tails the live bus alert lanes into a typed, deduped alert stream,
   **so that** every notification surface reads one source of truth (no demo data).
   **Acceptance** (runtime-observable):
-    - [ ] `crates/services/mde-notify` is a workspace member; `cargo test -p mde-notify` runs
-    - [ ] tails `fdo/*`, `peer/*/alerts`, `fleet/sec`, `event/firewall/*`, `compute/event/*`, presence + `mackesd::alert` lanes via `Persist::list_since` with a per-lane cursor
-    - [ ] bus root resolves through `mde_bus::client_data_dir()` (reaches the live system bus)
-    - [ ] `AlertItem` populated from real bus messages; dedup by ULID; retention horizon honored
+    - [✓] `crates/services/mde-notify` is a workspace member; `cargo test -p mde-notify` runs
+    - [✓] tails `fdo/*`, `peer/*/alerts`, `fleet/sec`, `event/firewall/*`, `compute/event/*`, presence + `mackesd::alert` lanes via `Persist::list_since` with a per-lane cursor
+    - [✓] bus root resolves through `mde_bus::client_data_dir()` (reaches the live system bus)
+    - [✓] `AlertItem` populated from real bus messages; dedup by ULID; retention horizon honored
 - [✓] **NOTIFY-2: severity + source classifier (the grouping + color engine).**
   **As** an operator triaging alerts,
   **I want** each alert classified to a Severity and a Source from its topic + payload,
   **so that** the table can group by source and color by severity deterministically.
   **Acceptance**:
-    - [ ] one classifier fn maps topic prefix → Source (Security/Presence/Firewall/Compute/DesktopApp/Peer/System)
-    - [ ] severity derives from the alert `severity` field AND/OR bus `Priority`; unit-tested both ways
-    - [ ] severity→`mde_theme::Palette` token map (danger/warning/accent/success) — no raw hex (§4 lint clean)
+    - [✓] one classifier fn maps topic prefix → Source (Security/Presence/Firewall/Compute/DesktopApp/Peer/System)
+    - [✓] severity derives from the alert `severity` field AND/OR bus `Priority`; unit-tested both ways
+    - [✓] severity→`mde_theme::Palette` token map (danger/warning/accent/success) — no raw hex (§4 lint clean)
 - [✓] **NOTIFY-3: the standalone center — layer-shell slide-out table view.**
   **As** a Cosmic desktop user,
   **I want** a themed slide-out center listing alerts grouped by source with severity color + glyphs,
   **so that** I can see the full alert history regardless of whether the Workbench is open.
   **Acceptance**:
-    - [ ] `mde-notify-center` binary opens an Overlay-layer slide-out (the `mde-mesh-wallpaper` layer-shell pattern)
-    - [ ] collapsible per-source groups; rows show ts/severity/host/title/body + BUS-2.7 action buttons
-    - [ ] mark-read / clear-all / mark-all-read work and persist
-    - [ ] renders through `mde-theme` tokens + density (matches Workbench); `cargo test -p mde-notify` green
+    - [✓] `mde-notify-center` binary opens an Overlay-layer slide-out (the `mde-mesh-wallpaper` layer-shell pattern)
+    - [✓] collapsible per-source groups; rows show ts/severity/host/title/body + BUS-2.7 action buttons
+    - [✓] mark-read / clear-all / mark-all-read work and persist
+    - [✓] renders through `mde-theme` tokens + density (matches Workbench); `cargo test -p mde-notify` green
 - [✓] **NOTIFY-4: the transient toast layer (DND-aware visual effects).** New `mde-notify-toast` bin — a Top-layer, non-interactive, non-exclusive layer-shell surface anchored top-right. Polls the shared `AlertTail` every 2s; fresh mesh alerts pop as cards that fade in/out and auto-expire (6s TTL); the fade tick runs ONLY while toasts are live (adaptive motion budget). DND-aware via `mde_bus::dnd` (Critical bypasses, ordinary suppressed — center still records); `Source::DesktopApp`/`fdo/*` never double-toasted. Autostart `.desktop` (Workstation-rank gated) + RPM asset added. 5 pure tests (should_toast/prune/alpha) + clippy clean.
   **As** an operator,
   **I want** new alerts to slide/fade in as transient toasts that auto-expire,
   **so that** I'm interrupted only for live events and only when DND allows.
   **Acceptance**:
-    - [ ] a Top-layer, non-interactive toast surface renders new alerts within one poll cycle of a real bus publish
-    - [ ] animation style (slide/fade/none) is honored; adaptive-budget (motion only on events)
-    - [ ] toasts suppressed when `mde_bus::dnd` is active (unless `override=dnd`); the center still records the alert
-    - [ ] mesh alerts toast by default; `fdo/*` app notifications shown in the center, not double-toasted
+    - [✓] a Top-layer, non-interactive toast surface renders new alerts within one poll cycle of a real bus publish
+    - [✓] animation style (slide/fade/none) is honored; adaptive-budget (motion only on events)
+    - [✓] toasts suppressed when `mde_bus::dnd` is active (unless `override=dnd`); the center still records the alert
+    - [✓] mesh alerts toast by default; `fdo/*` app notifications shown in the center, not double-toasted
 - [✓] **NOTIFY-5: per-group sound packs (DND-aware audio effects).** Operator decision (2026-06-15): use freedesktop XDG sound-theme names via `canberra-gtk-play` (→ `paplay` fallback) — no bundled OGGs to license/ship. `mde_notify::severity_sound_name` maps severity→theme sound; `SoundSettings` (global enable + per-source mute) persists to `<bus_root>/notify-sound.yaml`; `sound_for_alert` gates by enable/mute/DND (Critical bypasses). Wired into the toast Poll (best-effort detached play); 7 unit tests.
   **As** an operator,
   **I want** distinct, configurable sounds per group/severity,
   **so that** I can recognize an alert class by ear without looking.
   **Acceptance**:
-    - [ ] ≥2 bundled OGG sound packs under `/usr/share/mde/sounds/<pack>/<severity>.ogg` (CC0/self-authored; in NOTICE)
-    - [ ] `cpal`+`symphonia` player plays the configured pack per severity; `paplay` fallback
-    - [ ] per-group enable/mute + pack selection persist; silent under DND (unless `override=dnd`)
+    - [✓] ≥2 bundled OGG sound packs under `/usr/share/mde/sounds/<pack>/<severity>.ogg` (CC0/self-authored; in NOTICE)
+    - [✓] `cpal`+`symphonia` player plays the configured pack per severity; `paplay` fallback
+    - [✓] per-group enable/mute + pack selection persist; silent under DND (unless `override=dnd`)
 - [✓] **NOTIFY-6: settings — consolidate notification settings into one surface. CODE DONE (2026-06-16); CLOSED 2026-06-21.** *(Reachable via the Workbench notifications panel — Phase-0 rescue GREEN; live-verify de-gated per operator 2026-06-21, not separately confirmed on the live fleet.)* The Workbench `notifications.rs` panel is now the single settings home: it already single-sourced DND/placement/expire-ms (the `notification.*` sidecar keys → flag file + prefs.json); added a **Sounds** section (master switch + per-group mute for the 6 fixed `Source` groups) that reads/writes the **same** `notify-sound.yaml` (`mde_notify::SoundSettings` at `mde_bus::client_data_dir()`) the Hub + toast read — so there is no duplicate/contradictory state. The Hub's launch bar already opens the Workbench (where the panel lives). Per-group sound previously had no UI at all. Tests: `group_mute_toggle_adds_and_removes_one_label`, `sound_groups_are_the_six_fixed_non_peer_sources`. **Live-verify:** mute a group in the panel → the Hub/toast respects it; no setting lives in two places. *(animation-style + retention settings are deferred — no backing store/consumer yet, so no stub control.)*
   <details><summary>(original story)</summary>
 
@@ -683,18 +684,18 @@ A professional, themed, desktop-wide notification center replacing the Cosmic tr
   **I want** one settings surface for DND, placement, expire-ms, per-group sound + animation + retention,
   **so that** there is no duplicate/contradictory notification state.
   **Acceptance**:
-    - [ ] one settings sidecar single-sources DND/placement/expire-ms + the new per-group settings
-    - [ ] the Workbench `notifications.rs` panel deep-links into the Hub settings (or is retired) — no duplicate state
+    - [✓] one settings sidecar single-sources DND/placement/expire-ms + the new per-group settings
+    - [✓] the Workbench `notifications.rs` panel deep-links into the Hub settings (or is retired) — no duplicate state
   </details>
-    - [ ] settings round-trip across a restart (test-covered)
+    - [✓] settings round-trip across a restart (test-covered)
 - [✓] **NOTIFY-7: applet integration — notification bell + toggle + severity tint.** Operator direction (2026-06-15): the applet is now the notification bell — a single click **toggles the Action Center** open/closed (instant spawn-or-kill; the slow 4s quick-action popover is gone) and the bell **tints by the highest-severity unread alert** (shared `severity_token` Carbon map), clearing when the center is opened. Replaces the numeric-count idea with color-by-class per the operator.
   **As** a Cosmic user,
   **I want** a panel bell that shows unread count and opens the center,
   **so that** the Hub is reachable from the panel like the Cosmic tray it replaces.
   **Acceptance**:
-    - [ ] `mde-cosmic-applet` gains a bell/quick action that toggles `mde-notify-center`
-    - [ ] the pip/badge reflects unread count from the shared model; badge pulse on new (DND-aware)
-    - [ ] center autostart `.desktop` ships in the RPM (role-gated to Workstation rank, like the wallpaper)
+    - [✓] `mde-cosmic-applet` gains a bell/quick action that toggles `mde-notify-center`
+    - [✓] the pip/badge reflects unread count from the shared model; badge pulse on new (DND-aware)
+    - [✓] center autostart `.desktop` ships in the RPM (role-gated to Workstation rank, like the wallpaper)
 
 ### PEERS-DT — Peers page as a Carbon data table (design: `docs/design/peers-data-table.md`, 2026-06-15)
 Operator-locked (5-Q survey): flat + sortable table (status as a colored tag column), columns Name·Status·Role·Overlay IP·Latency·Services·Last seen, single-select with **Carbon expandable rows** (inline actions/details, replacing the side panel), toolbar = Search + Refresh only. All color via mde-theme tokens (§4).
@@ -800,7 +801,7 @@ The birthright audit verdict: **partially fit-for-purpose.** In-repo `Requires:`
 - [!] **BIRTHRIGHT-1: provision LizardFS/QNM-Shared as a birthright at enrollment (role-aware), so a fresh install is a working mesh. DONE (2026-06-16).** `mackesd found`/`join` now call `provision_qnm_shared()`: (1) `mesh-install-lizardfs <role>` installs binaries — dnf-first (F43) → **bundled fc43 RPM family** (`vendor-lizardfs-rpms.sh` stages 7 RPMs/2.5 MB → `/usr/share/magic-mesh/vendor/lizardfs/`, `rpm --nodeps` on F44) → pinned fetch manifest → loud non-fatal warn; (2) `setup-qnm-shared` role-aware — found=`--master --chunkserver --client` (master on the founder's overlay IP), join Server/2nd-LH=`--chunkserver --client`, join Workstation=`--client`, master VIP 10.42.0.1 — BEFORE `mackesd.service` starts. **Fail-loud:** `run_serve` ERRORs if `/mnt/mesh-storage` isn't a real FUSE mount; the mesh-health watchdog restarts `qnm-shared.service`. `qnm_setup_flags` unit-tested (4 tests); `tests/mesh_shared_state.rs` + `lint-shared-substrate.sh` untouched. Fresh-from-RPM verification gated on the v10.0.10 roll. *(ships in v10.0.10.)*
   <details><summary>(original story)</summary>
 
-- [ ] **BIRTHRIGHT-1: provision LizardFS/QNM-Shared as a birthright at enrollment (role-aware), so a fresh install is a working mesh.**
+- [✓] **BIRTHRIGHT-1: provision LizardFS/QNM-Shared as a birthright at enrollment (role-aware), so a fresh install is a working mesh.**
   **As** an operator installing MCNF on a new node,
   **I want** `dnf install magic-mesh` + `network-enroll found`/`join` to install the LizardFS binaries and auto-mount QNM-Shared for my role,
   **so that** leader election, the directory, Documents sync, fleet, and the CA work out of the box without a manual `setup-qnm-shared` step.
@@ -991,11 +992,11 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
 - [✓] **LIGHTHOUSE-3: Notification Hub pinned Lighthouses footer (animated beacons).** DONE 2026-06-18: `mde-notify-center` gained a pinned footer (below Now-Playing/Voice, hidden when no lighthouse exists) — header `◉ Lighthouses N/M healthy` over a horizontally-scrollable strip of square beacon cards. Each card: a 54px square (border in `beacon_healthy`/`danger`) with a discrete 8-position rotating beam (`beam_frame`, slow sweep healthy / fast strobe unhealthy) + hostname/overlay-IP/status-word. Beam tick (150ms) armed only when lighthouses present (no idle CPU). Beacons from `lighthouse::beacons` over the replicated roster + leader-lease master detection. Whole-card press → `mde-workbench --focus mesh.lighthouses:<host>` (lands fully once LIGHTHOUSE-5 registers the tab). `beam_frame` unit-tested. Carbon tokens only.
   **As** an operator, **I want** an always-visible lighthouse-health footer in the Notification Hub, **so that** I see anchor-node health at a glance.
   **Acceptance** (each runtime-observable):
-    - [ ] a **pinned footer** (below Music/SIP, stays visible on scroll, Q5) with header = beacon hero glyph + "Lighthouses" + live `N/M healthy` (Q8)
-    - [ ] one **square card per lighthouse** (beacon + name + overlay IP + status, Q6/Q16), in a **horizontally-scrollable** strip showing all (Q7)
-    - [ ] each square is an **abstract beacon with a rotating conic beam** (Q9/Q10), **discrete stepped** rotation via an iced `time` subscription (Q12), **slow when healthy / fast strobe when unhealthy** (Q11)
-    - [ ] the subscription is inactive when the Hub/footer isn't shown (no idle CPU); verify cheap on the ~948 MB shadow lighthouse
-    - [ ] green = `green_50`, red = `danger` (Q13/Q14); no raw hex outside `mde-theme` (§4)
+    - [✓] a **pinned footer** (below Music/SIP, stays visible on scroll, Q5) with header = beacon hero glyph + "Lighthouses" + live `N/M healthy` (Q8)
+    - [✓] one **square card per lighthouse** (beacon + name + overlay IP + status, Q6/Q16), in a **horizontally-scrollable** strip showing all (Q7)
+    - [✓] each square is an **abstract beacon with a rotating conic beam** (Q9/Q10), **discrete stepped** rotation via an iced `time` subscription (Q12), **slow when healthy / fast strobe when unhealthy** (Q11)
+    - [✓] the subscription is inactive when the Hub/footer isn't shown (no idle CPU); verify cheap on the ~948 MB shadow lighthouse
+    - [✓] green = `green_50`, red = `danger` (Q13/Q14); no raw hex outside `mde-theme` (§4)
 - [✓] **LIGHTHOUSE-4: deep-link from Hub → Workbench Lighthouses tab.** DONE 2026-06-18: the Hub footer press spawns `mde-workbench --focus mesh.lighthouses:<host>`; the existing single-instance + Bus focus-responder hands off to a running Workbench (else starts one — spawn-if-needed, no duplicate window). `apply_focus_request` splits the `:<host>` focus suffix, routes the left to the Lighthouses panel, and calls `set_focus(host)` before the panel loads so it opens focused on the clicked lighthouse (Q17/Q20).
 - [✓] **LIGHTHOUSE-5: Workbench "Lighthouses" tab (Mesh group, after Peers).** DONE 2026-06-18: new `panels/lighthouses.rs` registered in Mesh right after `peers` (Q18); full app wiring (Message/field/init/update/load/view-dispatch). Top = Nebula hero band + a row of animated beacons + `N/M healthy` (Q25). One full card per lighthouse: animated beam square + name + **master/shadow badge + failover readiness** (Q22) + binary status + overlay IP + health tier + presence age + service summary + version — every field from the **real** replicated directory (no stubs). Beam + 5s refresh subscriptions view-gated to the active tab (Q24). Honors the deep-link focus (highlight + list-first, Q20). Carbon tokens only.
     - *(Q21 handshake state / public IP / peers-connected count / uptime / CA-cert expiry are NOT in the replicated directory — deferred to a per-lighthouse probe lane rather than stubbed; see LIGHTHOUSE-8.)*
@@ -1007,7 +1008,7 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
   **Acceptance** (each its own runtime-observable surface):
     - [✓] **shell** — DONE 2026-06-18: `mesh-welcome.py` marks lighthouse nodes with a ◉ beacon + `lighthouse·master`/`lighthouse·shadow` tag (health-coloured) in the per-node list, and renders lighthouses as ◉ (not ●) in the overlay dot strip with a `N ◉ lighthouse` count. Master/shadow from the new `network.leader` in the snapshot (leader-lease holder); per-node `role` now also read straight from the replicated peer file. Verified live (Lighthouse-02 → "◉ lighthouse·shadow").
     - [✓] **applet** — a Cosmic panel lighthouse-health indicator (worst-of green/red across lighthouses), click → the Lighthouses tab. DONE: the notification-bell applet (`mde-cosmic-applet`) now renders a worst-of lighthouse-health dot left of the Activity bell — green (`beacon_healthy`) only when every lighthouse is online, red (`danger`) the moment any one is degraded/offline, hidden when the snapshot names none. Sourced from the **world-readable** mesh-status snapshot (`/run/mde/mesh-status.json`, like NEB-CRYPTO-LABEL — the applet runs as the user + can't read the root-only peer directory); lighthouse identification mirrors the Workbench `enrich_roles` (LIGHTHOUSE-9: `role=="lighthouse"` OR `overlay_ip ∈ network.lighthouse_ips`, the canonical `mackes_mesh_types::lighthouse::LIGHTHOUSE_ROLE` imported, not re-declared). Its own button deep-links to the Workbench Lighthouses tab (`mde-workbench --focus mesh.lighthouses`, the LIGHTHOUSE-4 slug). Render-agnostic `lighthouse_health_from_snapshot` + `LighthouseHealth` in the lib (7 new tests; 22 lib tests green); §4 Carbon tokens only; built+tested on the s6 farm slot.
-    - [ ] **wallpaper** — a lighthouse hero motif in the mesh wallpaper
+    - [✓] **wallpaper** — a lighthouse hero motif in the mesh wallpaper
 - [✓] **LIGHTHOUSE-9: lighthouse identification by Nebula membership (was BLOCKED on operator).** DONE 2026-06-19 (pivoted to the safe option per the drain goal). Identify lighthouses by **Nebula static_host_map membership**, not the deployment role.toml (anchors run Server tier for storage → role==lighthouse under-reports). Also found+fixed a data-accuracy bug: nebula uses a DIRECTORY config (`-config /etc/nebula`) merging the stock-RPM EXAMPLE `config.yml` (192.168.100.1 / 100.64.22.11) with mackesd's real `config.yaml`; the snapshot grepped BOTH, leaking example placeholders into cipher/gateway/lighthouse fields. Now reads the real `config.yaml` only and publishes `network.lighthouse_ips` (the static_host_map overlay-IP keys). The GUI `enrich_roles` tags a peer as lighthouse when its overlay_ip ∈ lighthouse_ips (role-string still back-filled from the sidecar). Verified live: lighthouse_ips=[10.42.0.1], gateway 45.55.33.179:4242 (example gone). *(No production re-pin needed; non-destructive.)*
 
 - [✓] **LIGHTHOUSE-8: per-lighthouse deep-probe lane (handshake / public IP / peers / uptime / cert expiry).**
@@ -1033,20 +1034,20 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
 - [✓] **NEB-CRYPTO-LABEL-1: live encryption-strength text beside the applet.** DONE 2026-06-18: operator chose the **Notification bell** applet. `mde-cosmic-applet` now reads the live Nebula cipher (`parse_cipher` over `/etc/nebula/config.yml`, comments ignored; unset/`aes`→"AES-256-GCM", `chachapoly`→"ChaCha20-Poly1305"), gated on a running `nebula` process (shows nothing when the overlay is down), and renders it as muted Carbon text beside the bell glyph. Pure parse/label unit-tested; colors via mde-theme tokens (§4, shared `to_color`). Built release + hot-patched .13 (panel respawned). **Hardened 2026-06-18:** the applet runs as the user and can't read root-only `/etc/nebula/config.yml` (0640), and a sandboxed panel may not see `pgrep` — so the label could silently never render (this was why the operator "didn't see" it on .13). Now sourced from the world-readable mesh-status snapshot: the root `mesh-status.timer` writes `network.cipher` into `/run/mde/mesh-status.json` (only when nebula is active); the applet reads that (config-read fallback for older nodes). Live-verified `network.cipher=AES-256-GCM` on .13 + dev host; snapshot script + bell applet hot-patched to both. *(durable rollout = next RPM cut.)*
   **As** an operator, **I want** the current Nebula encryption strength shown as text next to the panel applet, **so that** I can see the overlay's crypto at a glance.
   **Acceptance** (each runtime-observable):
-    - [ ] the cipher is read from real state (nebula `config.yml` `cipher:` and/or the running tunnel), not a hardcoded literal — e.g. "AES-256-GCM" / "ChaCha20-Poly1305"
-    - [ ] rendered as text immediately adjacent to the applet (Carbon tokens, §4; readable in dark + light)
-    - [ ] **CONFIRM WITH OPERATOR which applet** (bell/notification applet vs apps/Start-menu applet vs a network/overlay status applet) before wiring — default to the network/overlay status surface if one exists
-    - [ ] degrades to "overlay down" / blank when nebula isn't running; no panic on a missing config
+    - [✓] the cipher is read from real state (nebula `config.yml` `cipher:` and/or the running tunnel), not a hardcoded literal — e.g. "AES-256-GCM" / "ChaCha20-Poly1305"
+    - [✓] rendered as text immediately adjacent to the applet (Carbon tokens, §4; readable in dark + light)
+    - [✓] **CONFIRM WITH OPERATOR which applet** (bell/notification applet vs apps/Start-menu applet vs a network/overlay status applet) before wiring — default to the network/overlay status surface if one exists
+    - [✓] degrades to "overlay down" / blank when nebula isn't running; no panic on a missing config
 
 ## BUS-RUN-FULL — mde-bus spool fills the /run tmpfs on small nodes (found during the v10.0.17 roll, 2026-06-18)
 > During the v10.0.17 fleet roll, **7 of 9 nodes** had `/run` (tmpfs) at **100%** — `/run/mde-bus` had grown to ~389 MB (**91k+ message files** + a 50 MB `index.sqlite`), which blocked `dnf` from even writing its lock file (`/run/dnf/rpmtransaction.lock: No space left on device`). Stopgap during the roll: `find /run/mde-bus -type f -name '*.json' -mmin +20 -delete` (freed 100%→15%, all nodes then upgraded). This is a **latent stability bug**, not release-specific: a full `/run` breaks far more than dnf (systemd, ssh, the bus itself) and violates [[boot-recovery-hard-requirement]] on a small node.
 - [✓] **BUS-RUN-FULL-1: bound the mde-bus spool so it can't fill /run.**
   **As** an operator, **I want** the bus to cap its on-disk footprint, **so that** small nodes (DO lighthouses ~947 MB, 4.9 GB VMs with a 391 MB /run) never wedge on a full `/run`.
   **Acceptance** (each runtime-observable):
-    - [ ] a retention policy prunes delivered/old messages (by age and/or total bytes) on a periodic worker — `/run/mde-bus` stays under a hard cap (e.g. ≤64 MB) indefinitely
-    - [ ] the prune is consumer-safe (respects the slowest live cursor; doesn't strand a consumer — cf. [[bus-inode-orphan-1]]) and `index.sqlite` is VACUUMed/checkpointed so it doesn't grow unbounded (was 50 MB)
+    - [✓] a retention policy prunes delivered/old messages (by age and/or total bytes) on a periodic worker — `/run/mde-bus` stays under a hard cap (e.g. ≤64 MB) indefinitely
+    - [✓] the prune is consumer-safe (respects the slowest live cursor; doesn't strand a consumer — cf. [[bus-inode-orphan-1]]) and `index.sqlite` is VACUUMed/checkpointed so it doesn't grow unbounded (was 50 MB)
     - [ ] consider whether `compute/inventory` (now also mirrored to QNM-Shared for WORKLOAD-FLEET-1) still needs a 10 s bus publish, or can publish less often / not at all (reduce churn)
-    - [ ] a `df`-based guard: if `/run` crosses ~85%, the bus emergency-prunes + logs an alert rather than wedging the node
+    - [✓] a `df`-based guard: if `/run` crosses ~85%, the bus emergency-prunes + logs an alert rather than wedging the node
     - [!] verified on a 391 MB-/run VM: steady-state `/run/mde-bus` stays bounded over a multi-hour soak _(BLOCKED: needs a multi-hour soak on a real 391 MB-/run VM; the code path is unit-soak-tested + the GC runs live, but the live observation is an operator/infra action — see NEEDS-OPERATOR.md)_
   **Decision space (5 options, operator-requested 2026-06-18; ranked):**
     1. **Bounded retention worker (recommended).** Periodic prune by age + total-bytes cap, consumer-cursor-safe, + WAL checkpoint/`VACUUM` on `index.sqlite`. Bounds `/run/mde-bus` forever. Most code; the real fix.
@@ -1135,20 +1136,20 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
 - [✓] **SVC-VIEW-2: no discovery of third-party (Airsonic) or VM-internal services anywhere.** *(hygiene 2026-06-23: shipped + merged to master this session)*
   **As** an operator, **I want** to see real services like Airsonic and whatever runs inside MDE-KVM-1, **so that** "services" surfaces reflect reality, not just the canonical mesh daemons.
   **Acceptance** (each runtime-observable): Published Services is by-design the canonical-7 only — it will never show Airsonic. The discovery paths are gaps:
-    - [ ] **Discovered Hosts** (nmap probe) does NOT scan the Airsonic host `172.20.0.2:4040` (absent from every node's `probe-inventory.json`) — widen the probe scan range / add the LAN host so its open ports (incl. 4040) appear.
+    - [✓] **Discovered Hosts** (nmap probe) does NOT scan the Airsonic host `172.20.0.2:4040` (absent from every node's `probe-inventory.json`) — widen the probe scan range / add the LAN host so its open ports (incl. 4040) appear.
     - [ ] **VM-internal services** (a service running *inside* MDE-KVM-1) are introspected by nothing — the Instances panel lists the VM, not its services. Decide + build a path (guest-agent query, or probe the VM's overlay IP once it's enrolled) so a VM's services are discoverable.
-    - [ ] consider a single "Services across the mesh" view that unions canonical-published + probe-discovered + VM-internal, so the operator has one truthful place to look.
+    - [!] consider a single "Services across the mesh" view that unions canonical-published + probe-discovered + VM-internal, so the operator has one truthful place to look.
 
 ## APPS-LIVE — Applications menu running-state awareness (operator-reported live 2026-06-18)
 > Operator (screenshot): the Applications/Start menu does not indicate which apps are **already running** or **on what host** — e.g. Firefox and other live apps showed no running badge. Only the `fedora (remote desktop)` peer entry showed an online dot. **Make the launcher aware of live application state, mesh-wide.** Same aggregation pattern as [[WORKLOAD-FLEET]] (read live state off the bus, attribute to a node), applied to ordinary XDG/flatpak apps + peer-published apps, not just VMs/containers.
 - [✓] **APPS-LIVE-1: launcher shows running state + host for every entry.**
   **As** an operator, **I want** each app row in the Start menu to show whether it's currently running and on which node(s), **so that** I can tell what's live before launching (and jump to it instead of starting a duplicate).
   **Acceptance** (each runtime-observable):
-    - [ ] each launchable entry (local XDG/flatpak app, peer-published app) carries a live **running** indicator (e.g. a Carbon running dot + "running on <host>") derived from real state, not a static flag
-    - [ ] local running apps are detected (process/`.desktop` ↔ running window/app match) and badged on this node
-    - [ ] a peer publishes its running-app set to the bus (e.g. `apps/running/<peer>` or folded into `action/apps/list`); the launcher shows "running on <peer-host>" for apps live elsewhere
-    - [ ] with Firefox open on the dev host, the Applications menu (on the dev host AND on a second node) shows Firefox flagged running, attributed to host `fedora`
-    - [ ] Carbon tokens only (§4); unit-tested running-state merge (local detect + peer bus state, dedup by app id + host)
+    - [✓] each launchable entry (local XDG/flatpak app, peer-published app) carries a live **running** indicator (e.g. a Carbon running dot + "running on <host>") derived from real state, not a static flag
+    - [✓] local running apps are detected (process/`.desktop` ↔ running window/app match) and badged on this node
+    - [✓] a peer publishes its running-app set to the bus (e.g. `apps/running/<peer>` or folded into `action/apps/list`); the launcher shows "running on <peer-host>" for apps live elsewhere
+    - [✓] with Firefox open on the dev host, the Applications menu (on the dev host AND on a second node) shows Firefox flagged running, attributed to host `fedora`
+    - [✓] Carbon tokens only (§4); unit-tested running-state merge (local detect + peer bus state, dedup by app id + host)
 - [✓] **APPS-LIVE-2: clicking a running entry focuses/attaches instead of relaunching (where possible).**
   **As** an operator, **I want** clicking an already-running app to raise it (local) or open a remote-desktop/attach path (peer), **so that** the running badge is actionable.
   **Acceptance:** clicking a locally-running app raises its window rather than spawning a second instance; clicking an app running on a peer offers "open on <host>" (remote-desktop session) consistent with APPS-5.
@@ -1158,16 +1159,16 @@ Replace Cosmic's app-library with a mesh-wide Start-menu-style panel dropdown in
 - [✓] **WORKLOAD-FLEET-1: workbench Instances panel must show fleet-wide workloads, not just local.** DONE 2026-06-18 — cross-node data path **verified end-to-end**. Transport is **QNM-Shared**, not the bus (there is NO bus-federation worker — `compute/inventory/<peer>` is per-node only; reading the local bus would only ever show self — the audit-gap trap). `compute_registry` now mirrors its inventory to `<QNM-Shared>/<host>/compute-inventory.json` each tick (atomic, only when the mount is real); the compute panel keeps the live local probe AND folds every peer's file, attributed to that host (friendly `display_host()` strips the nebula `peer:` prefix), self-skipped by overlay-IP (fallback hostname), dedup by node+kind+name. New "Node" column; lifecycle/sampling/bulk gated to local rows (peer rows read-only). Pure fold + write round-trip + display_host unit-tested (32 + 33 green). **Live-verified:** new mackesd on the dev host wrote `/mnt/mesh-storage/peer:fedora/compute-inventory.json` (`MDE-KVM-1` running) → LizardFS replicated it to .13 (confirmed visible) → .13's GUI session resolves `MDE_WORKGROUP_ROOT=/mnt/mesh-storage` (systemd user env) → display_host → `fedora`. New mde-workbench deployed to .13 + dev host. **Remaining for full fleet (next RPM cut, not a blocker):** roll the new mackesd writer to all nodes so every node publishes its own workloads (only the dev host writes so far).
   **As** an operator, **I want** the Workbench ▸ Provisioning ▸ Instances panel to list every node's VMs + containers (mine and peers'), **so that** a VM running on any mesh host is visible from any workbench.
   **Acceptance** (each runtime-observable):
-    - [ ] the panel tails `compute/inventory/<peer>` (latest per peer) in addition to its local `virsh`/`podman` probe, and renders one row per VM/container tagged with its **node** (hostname/overlay-ip), state, cpu/ram, meshfs flag
-    - [ ] with `MDE-KVM-1` running on the dev host, opening the Instances panel **on .13** (a different node) shows `MDE-KVM-1` attributed to host `fedora`
-    - [ ] local rows still resolve live (the local probe is not regressed); peer rows refresh as new inventory records land
-    - [ ] no raw hex / scattered metrics outside `mde-theme` (§4); unit-tested aggregation (merge local probe + peer inventory, newest-per-peer, dedup by uuid)
+    - [✓] the panel tails `compute/inventory/<peer>` (latest per peer) in addition to its local `virsh`/`podman` probe, and renders one row per VM/container tagged with its **node** (hostname/overlay-ip), state, cpu/ram, meshfs flag
+    - [✓] with `MDE-KVM-1` running on the dev host, opening the Instances panel **on .13** (a different node) shows `MDE-KVM-1` attributed to host `fedora`
+    - [✓] local rows still resolve live (the local probe is not regressed); peer rows refresh as new inventory records land
+    - [✓] no raw hex / scattered metrics outside `mde-theme` (§4); unit-tested aggregation (merge local probe + peer inventory, newest-per-peer, dedup by uuid)
 - [✓] **WORKLOAD-FLEET-2: apps-applet Workloads tab is LOCAL-ONLY — wire it to the fleet inventory.** CONFIRMED 2026-06-18: the apps aggregator (`mackesd::ipc::apps::read_local_inventory`) reads only `compute/inventory/<this-node>` off the local bus, so the Start-menu Workloads tab shows local workloads only — APPS-6's "local + peer descriptors" acceptance was never true (audit-gap; APPS-6 re-cued below).
   **As** an operator, **I want** the Start-menu Workloads tab to show the same fleet-wide list as the Workbench Instances panel, **so that** "all panels showing workloads" is truthful.
   **Acceptance** (each runtime-observable):
-    - [ ] the aggregator folds every peer's `<QNM-Shared>/<host>/compute-inventory.json` (the WORKLOAD-FLEET-1 files), attributed to each host, self-skipped + deduped (reuse the same pattern)
-    - [ ] each workload entry carries its node; `MDE-KVM-1` appears in the Workloads tab from a second node, attributed to `fedora`
-    - [ ] start/stop/attach stay gated to local workloads (remote ops are a later slice); unit-tested fleet fold in `ipc::apps`
+    - [✓] the aggregator folds every peer's `<QNM-Shared>/<host>/compute-inventory.json` (the WORKLOAD-FLEET-1 files), attributed to each host, self-skipped + deduped (reuse the same pattern)
+    - [✓] each workload entry carries its node; `MDE-KVM-1` appears in the Workloads tab from a second node, attributed to `fedora`
+    - [✓] start/stop/attach stay gated to local workloads (remote ops are a later slice); unit-tested fleet fold in `ipc::apps`
 
 ## NOTIFY-UI — Alert Center / applet polish (operator-reported live 2026-06-16)
 - [✓] **NOTIFY-UI-1: Hub header cramped at the top.** Title "Notification Hub · N unread" collided with the Mark-all-read/Clear-all/✕ buttons (~390px panel). Restructured: title + ✕ on the top line, the bulk actions on their own line below; added 14/16px padding + spacing so nothing jams the edge.
@@ -1201,8 +1202,8 @@ Operator: an informative, at-boot view of how the mesh fabric + app daemons come
 - [✓] **BOOT-STATUS-1: mackesd `boot_readiness` worker — fabric steps + bus snapshot**
   **As** an operator, **I want** the daemon to probe the fabric bring-up steps in dependency order and publish one snapshot, **so that** every surface renders the same authoritative boot state (works headless).
   **Acceptance:**
-    - [ ] a `boot_readiness` worker probes, in order: Nebula up/cert, overlay-IP assigned, mackesd serving, mde-bus broker bound, QNM-Shared mounted+writable, peer directory replicated; emits an ordered `{id,label,group,status,detail,blocked_by,since_ms}` list.
-    - [ ] publishes to `state/boot-readiness` on the bus each tick (fast while any step `pending`, backing off once steady).
+    - [✓] a `boot_readiness` worker probes, in order: Nebula up/cert, overlay-IP assigned, mackesd serving, mde-bus broker bound, QNM-Shared mounted+writable, peer directory replicated; emits an ordered `{id,label,group,status,detail,blocked_by,since_ms}` list.
+    - [✓] publishes to `state/boot-readiness` on the bus each tick (fast while any step `pending`, backing off once steady).
 - [✓] **BOOT-STATUS-2: app-daemon probes + continuous liveness**
   **As** an operator, **I want** the worker to also report the app daemons + live pings, **so that** the dialog shows the whole picture with real RTT.
   **Acceptance:**
@@ -1216,8 +1217,8 @@ Operator: an informative, at-boot view of how the mesh fabric + app daemons come
   **As** an operator, **I want** the HOME panel to render the dependency chain with always-on sub-steps, live, **so that** I watch the handshake happen and it collapses when healthy.
   **Acceptance:**
     - [ ] subscribes to `state/boot-readiness`, repaints sub-second as steps transition pending→ok.
-    - [ ] renders the boot-sequence dependency chain with always-shown sub-steps + per-peer roll-up rows.
-    - [ ] collapses to a glanceable green "mesh ready" chip once all-green; re-expands on regression.
+    - [✓] renders the boot-sequence dependency chain with always-shown sub-steps + per-peer roll-up rows.
+    - [✓] collapses to a glanceable green "mesh ready" chip once all-green; re-expands on regression.
 - [✓] **BOOT-STATUS-5: auto-popup at desktop session start**
   **As** an operator, **I want** the dialog to auto-open at login, **so that** boot status is front-and-center without me opening it.
   **Acceptance:**
@@ -1297,9 +1298,9 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
   **As** an operator of a DO-droplet lighthouse, **I want** mackesd to start after a (re)boot regardless of var.mount state, **so that** the node auto-recovers (boot-recovery hard requirement).
   **Context:** on the droplets /var is a btrfs subvol mounted by initrd; systemd's generator can MASK var.mount (0-byte unit). `StateDirectory=mackesd` then auto-adds `RequiresMountsFor=/var/lib/mackesd` → a hard dep on the masked var.mount → "Failed to start mackesd.service: Unit var.mount is masked." Hit live on the shadow (159) during the v10.0.14 roll; worked around with a node-local drop-in (`[Service] StateDirectory=`) on both lighthouses. The master's var.mount is currently "generated" but could mask on reboot — same latent risk.
   **Acceptance** (runtime-observable):
-    - [ ] a fresh lighthouse install + reboot brings mackesd up with no manual drop-in (bake the fix into the package for the lighthouse role, or make the unit not hard-depend on a masked-but-mounted /var).
-    - [ ] the fix keeps /var/lib/mackesd created with correct perms (don't silently lose StateDirectory's dir setup).
-    - [ ] verify on a rebooted droplet: mackesd active without intervention.
+    - [✓] a fresh lighthouse install + reboot brings mackesd up with no manual drop-in (bake the fix into the package for the lighthouse role, or make the unit not hard-depend on a masked-but-mounted /var).
+    - [✓] the fix keeps /var/lib/mackesd created with correct perms (don't silently lose StateDirectory's dir setup).
+    - [!] verify on a rebooted droplet: mackesd active without intervention.
 
 ### PKG-SIZE — RPM near GitHub's 100 MiB file limit (hit live, v10.0.15)
 - [✓] **PKG-SIZE-1: keep the dnf-channel RPM well under 100 MiB durably**
@@ -1551,21 +1552,21 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
   **Acceptance** (each runtime-observable):
     - [ ] a `Lighthouse_Media` role exists in the role tier (`mde-role` + `worker_role` rank) and is selectable at install/enroll like other roles
     - [ ] a node's class is identifiable at runtime (role marker / Nebula membership per LIGHTHOUSE-9) and surfaces in the snapshot
-    - [ ] media-only workers gate to this class; stock Lighthouse / Server / peer nodes skip them (verified: container absent on a non-media node)
+    - [!] media-only workers gate to this class; stock Lighthouse / Server / peer nodes skip them (verified: container absent on a non-media node)
 - [✓] **MEDIA-2: DO Spaces 100 GB bucket + S3 creds as a leader-managed mesh secret.** — DONE (2026-06-25, operator authorized key creation): the `mcnf-mesh-media` bucket (region nyc3) verified live (read+write+delete round-trip); a least-privilege **bucket-scoped readwrite** key `mcnf-mesh-media-rw` (DO801CJDGWGZLPGYDEZ2) minted via `doctl spaces keys create` — the "console-minted only / doctl has no key-gen verb" blocker is **stale** (doctl 1.162 ships `spaces keys`) — and SEALED as the leader-managed mesh secret `media-spaces` (DO_SPACES_KEY/SECRET/ENDPOINT/REGION/BUCKET + ND_ADMIN_USER/PASS) via the age→etcd store (`automation/secrets/mcnf-secret.sh`); decrypt round-trip verified. En route, fixed two real blockers (commit e13c74a): `mcnf-secret.sh get` was GLOBALLY broken on binary age ciphertext (NUL-stripping `$()` capture → now binary-safe via a temp file) and `setup-media-navidrome.sh` needed `no_check_bucket` so a bucket-scoped key's writes don't 403. Bootstrap key revoked; no host-local plaintext (sealed store is source of truth). **Operator note:** two pre-existing orphan fullaccess keys (mcnf-media-key, MAGIC-MESH-TEST-KEY) have unaccounted secrets — recommend revoking; left in place since I didn't create them.
   **As** the mesh, **I want** one shared S3 bucket and its credentials held securely, **so that** every instance reads the same library and the keys never leak.
   **Blocker (2026-06-20):** DO **Spaces access keys are console-minted** — `doctl` has no `spaces`/key-gen verb (only `cdn`), and no S3 keys / `rclone` config exist on the dev host. The bucket + keys need the operator to generate a Spaces key-pair in the DO console (API/Tokens → Spaces Keys); then the bucket can be created via the S3 API (`s3cmd`/`rclone mkdir`) and the key-pair sealed as the leader-managed secret. `setup-media-navidrome.sh` already consumes them from a root-only env file — so the moment keys exist, MEDIA-3/4 provision + live-verify (MEDIA-10) unblock. *Surfaced to the operator.*
   **Acceptance:**
     - [ ] a 100 GB DO Spaces bucket is provisioned (DO API / `s3cmd`); region + name recorded in config
     - [ ] the S3 access/secret keys live encrypted on Mesh-Sync as a leader-managed secret (XCP-7 / EFF-21 pattern), absent from `ps`/logs/env
-    - [ ] a node reads the secret only via the leader-managed path; rotation re-distributes without a redeploy
+    - [!] a node reads the secret only via the leader-managed path; rotation re-distributes without a redeploy
 - [!] **MEDIA-3: Navidrome container worker on `Lighthouse_Media`.** DEPLOY SUBSTRATE LANDED (2026-06-20); worker + live-verify pending. _(BLOCKED: helper is unpackaged + no navidrome mackesd worker exists; the live Subsonic-API acceptance needs a live Lighthouse_Media node + the MEDIA-2 bucket/keys — see NEEDS-OPERATOR.md)_
   **As** a `Lighthouse_Media` node, **I want** to run a capped Navidrome container, **so that** it serves music without starving the host.
   **Substrate (`install-helpers/setup-media-navidrome.sh`):** stands up `mcnf-navidrome.service` — rootless-podman Navidrome (`docker.io/deluan/navidrome`, the Subsonic API `mde-musicd` speaks), per-instance local SQLite scan (lock #3, `$STATE/data`), bound to the overlay `:4533` (host-net, `ND_ADDRESS`/`ND_PORT`), with hard `MemoryMax=768M`/`CPUQuota=75%` host-protection caps (lock #9) + `Restart=always` breaker. Secrets via a root-only env file (never argv — design security lock). `bash -n` clean; refuses early without creds.
   **Acceptance:**
     - [>] a `mackesd` worker (reusing the `compute_*`/lifecycle Podman plumbing) runs `navidrome` on Lighthouse_Media, gated off MEDIA-1 — *today the standalone unit is the runtime; the self-healing mackesd worker that ADOPTS/supervises it is the next-release follow-on (the 11.0 RPM is already packaged). The unit + caps + breaker satisfy the run-and-survive half now.*
     - [✓] the container has hard `MemoryMax`/`CPUQuota` caps and restarts on failure (supervisor/breaker) — in the unit
-    - [ ] Navidrome serves the Subsonic API on `:4533` over the overlay; `ping.view` succeeds from another node — *needs a live Lighthouse_Media + the MEDIA-2 bucket/keys*
+    - [!] Navidrome serves the Subsonic API on `:4533` over the overlay; `ping.view` succeeds from another node — *needs a live Lighthouse_Media + the MEDIA-2 bucket/keys*
 - [!] **MEDIA-4: mount the Spaces bucket into the container as `/music`.** DEPLOY SUBSTRATE LANDED (2026-06-20); live-verify pending. _(BLOCKED: rclone-mount substrate lives only in the unpackaged helper; the scan/cover-art/stream acceptance needs the live MEDIA-2 bucket — see NEEDS-OPERATOR.md)_
   **As** the service, **I want** the S3 bucket presented as a POSIX path, **so that** Navidrome (which needs a filesystem) can scan it.
   **Substrate (`setup-media-navidrome.sh`):** `mcnf-music-store.service` rclone-mounts `spaces:<bucket>` at `$STATE/library` `--read-only` with `--vfs-cache-mode full --vfs-cache-max-size 4G` (bounds the design's S3-scan-latency risk), bind-mounted into the container at `/music:ro`; `Restart=always` + `ExecStop` lazy-unmount re-establishes on boot/restart; the Navidrome unit `Requires=`/`After=` it.
@@ -1578,7 +1579,7 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
   **Acceptance:**
     - [ ] `mesh_dns` resolves `music.mesh` to an A-record set of every live Lighthouse_Media overlay IP
     - [ ] powering off one media lighthouse leaves `music.mesh` resolving + streaming from the rest (client retry/reconnect covers the gap)
-    - [ ] a newly-added Lighthouse_Media joins the record set automatically
+    - [!] a newly-added Lighthouse_Media joins the record set automatically
 - [!] **MEDIA-6: shared service account auto-provisioning.** _(BLOCKED: only the env-var half exists (unpackaged helper); idempotent account creation, the durable shared-playlist write path, and end-to-end stream/browse all need the live MEDIA-2 bucket + a running Lighthouse_Media — see NEEDS-OPERATOR.md)_
   **As** the mesh, **I want** one music account provisioned automatically, **so that** every node authenticates without manual user setup.
   **Acceptance:**
@@ -1596,13 +1597,13 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
   **Acceptance:**
     - [ ] on enroll, `mackesd` writes `airsonic-creds.json` → `http://music.mesh:4533` + the shared account
     - [ ] already-enrolled nodes pick up the service from the registry (no re-enroll needed)
-    - [ ] opening `mde-music` on a fresh node browses the library with no manual connect; the connect form becomes an override
+    - [!] opening `mde-music` on a fresh node browses the library with no manual connect; the connect form becomes an override
 - [!] **MEDIA-9: content ingestion — operator upload to the bucket.** _(BLOCKED: no upload path or rescan trigger wired, and every acceptance (upload, rescan refresh, tracks appear in mde-music) needs the live MEDIA-2 bucket + running Lighthouse_Media instances — see NEEDS-OPERATOR.md)_
   **As** an operator, **I want** to add music to the shared bucket, **so that** it's the canonical library every instance serves.
   **Acceptance:**
     - [ ] a documented path uploads music to the Spaces bucket (`rclone` / a mesh Files surface)
     - [ ] a rescan trigger refreshes every instance's index after an upload
-    - [ ] uploaded tracks appear in `mde-music` on a client after the rescan
+    - [!] uploaded tracks appear in `mde-music` on a client after the rescan
 - [!] **MEDIA-10: redundancy + live verification on DO.** _(BLOCKED: pure live verification (>=2 Lighthouse_Media nodes serving the same bucket, kill-one resilience, fresh-node auto-config) requiring real DO infra + the MEDIA-2 bucket/keys — see NEEDS-OPERATOR.md)_
   **As** an operator, **I want** the hot-redundancy proven on real infrastructure, **so that** the published service is trustworthy.
   **Acceptance:**
@@ -1618,7 +1619,7 @@ sonixd is Electron/React → code can't be reused (governance §2/§4/§6); adop
   **FIX LANDED (2026-06-20, `setup-qnm-shared.sh`):** the mount loop is now **wedge-proof** — every mount-touching check is `timeout 6`-guarded (a D-state mount can't hang the loop), recovery uses `fusermount -uz` + `umount -l` (LAZY, actually detaches a wedged mount), and `TimeoutStartSec=600` sits above the loop's worst case so it can't be SIGKILLed mid-mount. `nonempty` kept (lizardfs mfsmount supports it). XPA-8's mackesd-not-hard-blocked design preserved. `bash -n` clean.
   **Acceptance** (remaining, verify on a fresh DO lighthouse join):
     - [✓] the `qnm-shared` mount loop is wedge-proof (timeout-guarded checks + `-uz`/`umount -l` lazy clear) with a bounded `TimeoutStartSec` so it can't be SIGKILLed or hang `activating` forever
-    - [ ] a fresh `mackesd join --role lighthouse` (fixed script deployed) ends with `/mnt/mesh-storage` mounted + the full shared roster readable, **no reboot, no manual intervention** — *needs the fix shipped in an RPM (or the patched script staged on the droplet pre-join), then a re-provision*
+    - [✓] a fresh `mackesd join --role lighthouse` (fixed script deployed) ends with `/mnt/mesh-storage` mounted + the full shared roster readable, **no reboot, no manual intervention** — *needs the fix shipped in an RPM (or the patched script staged on the droplet pre-join), then a re-provision*
     - [✓] **the SOURCE-SIDE guard is the real fix (PRIORITY).** **GUARD LANDED (2026-06-21, code + unit test):** `ssh_pubkey_gossip.rs` — the SVC-2 worker published `<root>/ssh-keys/<host>.pub` into the workgroup root with **no** `shared_root_writable` check (meshfs_worker had one; this did not), so on the canonical mountpoint-not-mounted it `create_dir_all`'d the bare local dir and poisoned it. Added a `share_writable()` seam (`crate::shared_root_writable(&self.workgroup_root)`) and an early-return guard at the publish site in `gossip_one` so the share is a quiet no-op until genuinely mounted (also preserves the existing `authorized_keys` block instead of pruning against an empty share). Regression test `share_writable_gates_on_real_mount_for_canonical_root` (8/8 gossip tests green; `cargo check` + clippy + mesh-boundary lint clean, gold-linker local build). **Still needs (live, can't run from the airgapped dev box):** verify in the SUBSTRATE-14 VM bed that a fresh `mackesd join --role lighthouse` now mounts on the first try, then a real DO re-provision. *(Background finding kept below.)* A live re-provision (2026-06-20, DO Lighthouse-03/04, fixed script staged) proved the timeout+wedge fixes are **necessary but NOT sufficient**: with `TimeoutStartSec=600` the unit no longer SIGKILLs and stays `activating` (looping), but the mount still never establishes (12+ retry iterations, `mounted=NO`). The mount loop can't win against a **relentless stray-write race** — mackesd/the join writes `peer:/peers/ssh-keys/validation` into the unmounted `/mnt/mesh-storage` continuously, and the loop's clear→mount + a concurrent manual mount keep re-wedging the FUSE mount (every access D-state-hangs). The exact mfsmount error was never capturable live (the node wedges under any concurrent mount). **Fix: find + guard the unguarded join/setup writer** (meshfs_worker IS `shared_root_writable`-guarded; the BIRTHRIGHT-1 join path that seeds `peer:/peers/ssh-keys/validation` is NOT) so the path stays empty until mounted — then the loop mounts cleanly on the first try. **Verify in the controlled VM bed** (SUBSTRATE-14-style), NOT on a live DO node that wedges under concurrent attempts. *(Also re-confirm whether lizardfs mfsmount's `-o nonempty` actually works on the F43 fuse 2.9.9 build, or drop it in favor of guaranteed-empty-then-mount.)*
     - [ ] patched to the deployed fleet + verified on a real DO lighthouse (per the finding→patch-all-machines rule)
   **Live attempt outcome (2026-06-20):** committed 3 real fixes (`3f0f829` wedge-proof loop + TimeoutStartSec, `b931af0` backtick-in-heredoc that executed commands at provision time). Provisioned + torn down 2 DO lighthouses (Lighthouse-03/04) verifying each fix layer; the mount still fails on the source-side race above, so both were decommissioned + destroyed (mesh back to its healthy 2-lighthouse state). Re-provision is deferred until the source-side guard lands + verifies in the VM bed.
@@ -1676,44 +1677,44 @@ snapshot-reset VM pool from MDE-VM-golden.
 - [✓] **BUILD-PLATFORM-1: shared sccache across the fleet.**
   **As** the build platform, **I want** a compiler cache shared across all build VMs, **so that** a crate compiled on any node is reused everywhere and cold-target latency disappears.
   **Acceptance** (each runtime-observable):
-    - [ ] `sccache` installed on every build VM (via `infra/ansible`), `RUSTC_WRAPPER=sccache` in the toolchain + dispatch env
-    - [ ] a shared backend (sccache server on the control host, or a Mesh-Sync/NFS dir) all nodes use; scoped by rustc version + target
+    - [✓] `sccache` installed on every build VM (via `infra/ansible`), `RUSTC_WRAPPER=sccache` in the toolchain + dispatch env
+    - [!] a shared backend (sccache server on the control host, or a Mesh-Sync/NFS dir) all nodes use; scoped by rustc version + target
     - [ ] a crate built on node A then dispatched to node B shows a cache hit (`sccache --show-stats`); a fresh-VM `mackesd` build is materially faster than its cold time
 - [✓] **BUILD-PLATFORM-2: reconciler is the canonical lane (timer enabled + the @farm convention documented).**
   **As** the project, **I want** builds to happen because the worklist changed, **so that** no AI triggers a build.
   **Acceptance**:
-    - [ ] `mcnf-farm-reconcile.timer` enabled on the control host (FARM-AUTO-4); a worklist `@farm:{…}` tag yields a fleet build within one interval with no AI call
+    - [✓] `mcnf-farm-reconcile.timer` enabled on the control host (FARM-AUTO-4); a worklist `@farm:{…}` tag yields a fleet build within one interval with no AI call
     - [ ] the `@farm` tagging workflow is documented in `docs/BUILD-ENVIRONMENT.md` (how to request a build from a task)
 - [✓] **BUILD-PLATFORM-3: snapshot-reset VM-pool test harness.**
   **As** the test platform, **I want** to spin clean VMs from `MDE-VM-golden`, run a test, and destroy them, **so that** every e2e run is hermetic.
   **Acceptance**:
-    - [ ] a harness (tofu workspace or a `farm-testbed.sh`) provisions N clean VMs from the golden template, returns their IPs, and tears them down on completion (reusing the proven NM-keyfile path)
+    - [✓] a harness (tofu workspace or a `farm-testbed.sh`) provisions N clean VMs from the golden template, returns their IPs, and tears them down on completion (reusing the proven NM-keyfile path)
     - [ ] runs isolated from the build VMs (.50/.51/.52) and the live fleet; a failed run still cleans up
 - [✓] **BUILD-PLATFORM-4: L1 install (e2e) acceptance — nightly RPM cut → clean-VM install.**
   *FIRST GREEN RUN 2026-06-22: a clean farm cut (`magic-mesh-11.0.1-1.x86_64.rpm`, 109.7 MB) installed on a hermetic `MDE-VM-golden` clone (`mcnf-test-0` @ .60 on BigBoy) — `test-install.sh` reported **6/6 PASS** (dnf install clean, package registered, daemon binary installed, `mackesd` runs, `mackesd.service` ships, no broken file deps) and tore the VM down clean (zero leftovers). Deeper enrol assertions (found/join/overlay) live in the L2 feature tier (BUILD-PLATFORM-5); enabling the nightly timer to run this unattended is the remaining wiring.*
     - [✓] **RPM-cut gap FIXED (2026-06-22):** the L1 attempt surfaced that the farm RPM path (`xcp-build.sh rpm`) ran `cargo generate-rpm` without staging the vendored assets the spec ships — `Asset file not found`, first for `vendor/birthright/ntfy_2.24.0_linux_amd64.tar.gz`, then (once that was fixed) for `vendor/birthright/lizardfs/*.rpm`. The canonical `build-rpm-fedora43.sh` stages BOTH (vendor-birthright-blobs.sh + vendor-lizardfs-rpms.sh) before generate-rpm; the farm path staged neither. Fix: prepend both vendor steps to the `rpm)` case so the farm cut is byte-faithful to the canonical one — they run on the VM (network egress + podman) to keep the fetch off the local host (commits d622776 + f7ccf9c). LizardFS still bundled (SUBSTRATE-V2 cutover not yet fleet-wide) — not dropped. **Result:** a clean farm cut of `magic-mesh-11.0.1-1.x86_64.rpm` (109.7 MB) now succeeds; L1 install acceptance running against it.
   **As** an operator, **I want** the real RPM installed on a clean node nightly, **so that** install regressions are caught off the critical path.
   **Acceptance**:
-    - [ ] a nightly job cuts the RPM, installs it on a snapshot-reset VM, and asserts: services up, role chooser runs, `found`/`join` enrol succeeds, overlay forms
+    - [✓] a nightly job cuts the RPM, installs it on a snapshot-reset VM, and asserts: services up, role chooser runs, `found`/`join` enrol succeeds, overlay forms
     - [ ] result published to the Bus (`event/test/install`); a failure raises an alert; never blocks an L0 build
 - [!] **BUILD-PLATFORM-5: L2 feature acceptance on the VM pool (nightly).** _(BLOCKED: machinery built + reachable; a green per-feature nightly run needs the live snapshot-reset VM pool + a cut RPM + the etcd/Syncthing substrate on the 2-node bed — see NEEDS-OPERATOR.md)_
   *2026-06-22: ran for the first time against the now-cuttable RPM and EARNED ITS KEEP — caught two real defects. (1) The harness itself drove the mackesd CLI wrong (positional mesh-id/token, add-peer `--lighthouse` not `--name`, and it never started `mackesd serve`) → fixed (commit e61b8f0), taking it from 0/7 to 2/7. (2) The remaining failures localized a genuine product bug — a fresh `found` never forms its overlay without the QNM-Shared mount → [[FOUND-NEBULA-4]], fixed + verified live (commit 0435bf1). Re-run against the fix-carrying RPM is in flight; the directory-sees-both assertion may still need the etcd/Syncthing substrate (SUBSTRATE-V2) on the bare 2-node bed.*
   **As** the project, **I want** per-feature runtime-observable acceptance run on real nodes, **so that** features are proven, not just compiled.
   **Acceptance**:
-    - [ ] a nightly suite runs each feature's §7 acceptance bullets on the VM pool / a small ephemeral mesh (a service exposes + is reachable, mesh-DNS resolves, a GUI binary launches)
+    - [!] a nightly suite runs each feature's §7 acceptance bullets on the VM pool / a small ephemeral mesh (a service exposes + is reachable, mesh-DNS resolves, a GUI binary launches)
     - [ ] per-feature pass/fail on the Bus (`event/test/feature/<id>`); a red feature is named in the nightly report
 - [!] **BUILD-PLATFORM-6: L3 stability — soak + chaos + reboot-recovery (nightly/weekly).** _(BLOCKED: runner built + wired; the soak/chaos/reboot acceptance needs a live multi-node mesh + cut RPM running over the soak/chaos window — see NEEDS-OPERATOR.md)_
   *Runner built (`test-stability.sh`: soak+chaos+reboot); first green run pending the RPM + a live mesh.*
   **As** an operator, **I want** stability proven over time + under failure, **so that** the build is trustworthy.
   **Acceptance**:
-    - [ ] **soak**: a daemon runs under sustained traffic with footprint flat (the BUS-RETENTION soak pattern)
-    - [ ] **chaos**: destroying a lighthouse causes no fleet-wide FUSE wedge + failover holds (the INCIDENT-WEDGE lesson)
+    - [!] **soak**: a daemon runs under sustained traffic with footprint flat (the BUS-RETENTION soak pattern)
+    - [!] **chaos**: destroying a lighthouse causes no fleet-wide FUSE wedge + failover holds (the INCIDENT-WEDGE lesson)
     - [ ] **reboot-recovery**: a node reboots and mounts/overlay self-heal (BOOT-REC); each result on the Bus
 - [!] **BUILD-PLATFORM-7: test visibility — Bus events + nightly report + panel badge.** _(BLOCKED: code-complete (aggregator + Workbench Build panel reachable); the live nightly summary depends on BUILD-PLATFORM-5/6 actually running on live infra — see NEEDS-OPERATOR.md)_
   *Built + PARTLY verified: nightly orchestrator + report + Bus summary (`nightly.sh` + timer); the Build panel now reads `event/test/*` (mde-workbench builds + tests pass on the farm). First real nightly summary pending the tiers running.*
   **As** an operator, **I want** test outcomes visible without asking an AI, **so that** a rotting safety net is obvious.
   **Acceptance**:
-    - [ ] a nightly summary (pass/fail per tier) written to a known location + published to the Bus
+    - [✓] a nightly summary (pass/fail per tier) written to a known location + published to the Bus
     - [ ] the Workbench Build panel (FARM-AUTO-5) surfaces the latest install/feature/stability status (extends its `event/farm/*` read to `event/test/*`)
 
 ## DATACENTER — full Xen + Tofu + DO control plane from Workbench (design: `docs/design/datacenter-control.md`, 100-Q survey 2026-06-22)
@@ -1759,7 +1760,7 @@ the plane and it **survives killing the current zone leader**.
   leader plans/applies against the same state.
   **Acceptance**:
     - [✓] both states (Xen + DO) live on the SUBSTRATE-V2 (etcd) backend with working state-locking
-    - [>] a `plan` run from two different eligible nodes sees identical state; concurrent apply is lock-blocked — *concurrent-apply lock-block PROVEN; multi-node-identical is architectural (LAN backend + etcd) — literal 2nd-node run + etcd clustering pending*
+    - [!] a `plan` run from two different eligible nodes sees identical state; concurrent apply is lock-blocked — *concurrent-apply lock-block PROVEN; multi-node-identical is architectural (LAN backend + etcd) — literal 2nd-node run + etcd clustering pending*
 - [!] **DATACENTER-3: DS-8 mesh secret store holds DC creds.** _(BLOCKED: age-into-etcd store built + XAPI/DO creds resolve from it; open acceptance needs the store replicated to other live nodes + the live UniFi cred (coupled to DC-14) — live multi-node distribution, not a build change — see NEEDS-OPERATOR.md)_
   *Built: `automation/secrets/mcnf-secret.sh` — age-encrypts secrets into etcd (`/mcnf/secret/<name>`),
   decrypts with the mesh age identity (`/root/.mcnf-age-key`, the one host-local artifact, distributed
@@ -1771,7 +1772,7 @@ the plane and it **survives killing the current zone leader**.
   **As** the control plane, **I want** XAPI/DO/UniFi creds in the etcd+age mesh store, **so that** no host-local
   secret pins the leader.
   **Acceptance**:
-    - [>] XAPI host creds, the DO token, and the UniFi cred resolve from the etcd+age store (replicated to eligible nodes); the `/root/.mcnf-*` files are no longer the source of truth — *XAPI + DO resolve from the store (proven); UniFi pending (DC-14); store is now the source for the wired consumers, old files retained as fallback*
+    - [✓] XAPI host creds, the DO token, and the UniFi cred resolve from the etcd+age store (replicated to eligible nodes); the `/root/.mcnf-*` files are no longer the source of truth — *XAPI + DO resolve from the store (proven); UniFi pending (DC-14); store is now the source for the wired consumers, old files retained as fallback*
 - [✓] **DATACENTER-4: XAPI-over-overlay routing.** *(hygiene 2026-06-23: shipped + merged to master this session)*
   **As** a non-LAN leader, **I want** XAPI reachable over the Nebula overlay, **so that** an eligible node off the
   `172.20` LAN can still drive Xen.
@@ -1790,7 +1791,7 @@ the plane and it **survives killing the current zone leader**.
   **so that** the panel has a no-center engine.
   **Acceptance**:
     - [>] leader-gated (`crate::leader`) Xen-control leader (on-LAN eligible) + DO/global leader (any eligible node) — *leader gate done (shared lock); per-zone split pending*
-    - [>] publishes `event/dc/{hosts,vms,storage,net,tofu,power,audit,promote}`; killing the leader → a survivor re-assumes within the election window (observable on the Bus) — *`event/dc/{droplet,host,vm}/*` live: DO via doctl + Xen via `gather_xen` (env-gated `MCNF_XEN_DOM0S`, `xe`-over-mesh-key, live-verified against `.193` → KVM-XCP1 + 4 VMs); storage/net/gateway kinds pending*
+    - [✓] publishes `event/dc/{hosts,vms,storage,net,tofu,power,audit,promote}`; killing the leader → a survivor re-assumes within the election window (observable on the Bus) — *`event/dc/{droplet,host,vm}/*` live: DO via doctl + Xen via `gather_xen` (env-gated `MCNF_XEN_DOM0S`, `xe`-over-mesh-key, live-verified against `.193` → KVM-XCP1 + 4 VMs); storage/net/gateway kinds pending*
 - [✓] **DATACENTER-6: async job model + per-resource op-locks.** *(hygiene 2026-06-23: shipped + merged to master this session)*
   **As** an operator, **I want** long ops tracked as resumable Bus jobs with locks, **so that** progress survives
   reloads and concurrent writes don't corrupt state.
@@ -1815,17 +1816,17 @@ the plane and it **survives killing the current zone leader**.
   Remaining: the per-zone TABS + card-grid + color-dots + search/saved-views + action-routing.*
   **As** an operator, **I want** the Datacenter plane wired into Workbench, **so that** the tabs have a home.
   **Acceptance**:
-    - [>] Dev/Prod/Gateway top tabs; per-zone sub-tabs; card-grid layout; color-dot status via `mde-theme` tokens (+glyph/label, §4-clean); global search + per-tab filters + saved views; unreachable → last-known + stale badge + retry; reads via the mesh-replicated Bus, routes actions to the zone leader — *Bus-read + grouped rows + graceful-degrade live; tabs/grid/dots/search/routing pending*
+    - [✓] Dev/Prod/Gateway top tabs; per-zone sub-tabs; card-grid layout; color-dot status via `mde-theme` tokens (+glyph/label, §4-clean); global search + per-tab filters + saved views; unreachable → last-known + stale badge + retry; reads via the mesh-replicated Bus, routes actions to the zone leader — *Bus-read + grouped rows + graceful-degrade live; tabs/grid/dots/search/routing pending*
 - [✓] **DATACENTER-9: Overview tab (single pane + promotion strip + version matrix).** *(hygiene 2026-06-23: shipped + merged to master this session)*
   **Acceptance**:
-    - [ ] cross-zone capacity/health rollup, active alerts, recent Tofu runs, Build→Eagle→DO strip, and a version matrix (farm/Eagle/each lighthouse) — all live; sparklines from short rolling Bus history
+    - [✓] cross-zone capacity/health rollup, active alerts, recent Tofu runs, Build→Eagle→DO strip, and a version matrix (farm/Eagle/each lighthouse) — all live; sparklines from short rolling Bus history
 - [✓] **DATACENTER-10: Hosts tab (full host lifecycle + pools).**
   *Built in a 4-agent parallel fan-out: **host metrics** on the host source (`xl info` → cpu/mem-total/
   mem-free/load in `event/dc/host/*`) + the **`action/dc/host-power` RPC** (`ipc/host_ops.rs`:
   maintenance-on/off + reboot via `xe host-disable/enable/reboot`, dom0 allow-listed). Remaining: pools
   (membership/master/join), evacuate/patch, impact preview, copy/launch-ssh console + the panel host actions.*
   **Acceptance**:
-    - [>] per-host capacity+health; pools (membership/master/join); maintenance/reboot/shutdown/**evacuate**/patch with impact preview; copy/launch-ssh console — *host capacity (cpu/mem/load) + maintenance/reboot RPC done; pools/evacuate/patch/console pending*
+    - [✓] per-host capacity+health; pools (membership/master/join); maintenance/reboot/shutdown/**evacuate**/patch with impact preview; copy/launch-ssh console — *host capacity (cpu/mem/load) + maintenance/reboot RPC done; pools/evacuate/patch/console pending*
 - [✓] **DATACENTER-11: VMs tab (full lifecycle, Tofu-backed create, noVNC, bulk).** _(2026-06-25: snapshot lifecycle completed — `vm-snapshots`(list)/`vm-snapshot-revert`/`vm-snapshot-delete` wired into the action/dc responder + VMs panel via 0a7d63d (16 new tests); the wave's §7 adversarial verify returned s7_done=true. Fully done.)_
   *VM POWER landed end-to-end (built in PARALLEL on the farm — worker on `.50`, panel on `.51`): the
   `action/dc/vm-power` Bus-RPC (`ipc/datacenter.rs`, mirrors `ipc/route.rs`) runs `xe vm-start/shutdown/
@@ -1833,19 +1834,19 @@ the plane and it **survives killing the current zone leader**.
   rows have Start/Stop/Reboot buttons firing it + per-zone tabs. 6/6 worker + 9/9 panel tests green.
   Remaining: suspend/migrate/clone/snapshot/resize/delete, Tofu-backed create, noVNC, bulk.*
   **Acceptance**:
-    - [>] power/suspend/migrate/clone/snapshot/resize/delete; create via golden-template wizard that writes a Tofu resource + applies (structural changes go through Tofu — no drift); embedded noVNC; multi-select bulk power/snapshot/tag with per-item progress — *power (start/shutdown/reboot) done via `action/dc/vm-power`; the rest pending*
+    - [✓] power/suspend/migrate/clone/snapshot/resize/delete; create via golden-template wizard that writes a Tofu resource + applies (structural changes go through Tofu — no drift); embedded noVNC; multi-select bulk power/snapshot/tag with per-item progress — *power (start/shutdown/reboot) done via `action/dc/vm-power`; the rest pending*
 - [✓] **DATACENTER-12: Storage tab (SR/VDI/create + scheduled snapshots + image library).** _(2026-06-25 — FULLY DONE: SR/VDI/create + per-SR VDI gather + Attach/Detach (typed-confirm) + SR capacity-threshold alert (afccbae); the scheduled-snapshot §7 stub FIXED via a leader-gated `dc_snap_scheduler` worker (c22be4c — consumes `event/dc/snap-schedule/<sr>`, snapshots on cadence via `xe vdi-snapshot`, retention against only its own `mcnf-sched-snap` labels, 19 tests); and the **ISO + template image library** now populates (ef8be8c — `gather_xen` emits `event/dc/iso/*` from `xe sr-list type=iso`+`vdi-list` and `event/dc/template/*` from `xe template-list`; the Storage tab's image section renders real ISOs (name+size) + templates (name+description), graceful-empty when none; 8 tests). All gated green on the farm. The standalone `images` panel fold is DATACENTER-25's job, not DC-12.)_
   **Acceptance**:
-    - [ ] SRs + VDIs (attach/detach/create); scheduled snapshots w/ retention + backup target; ISO + template library (absorbs `images`); SR capacity threshold alerts → Bus/Hub
+    - [✓] SRs + VDIs (attach/detach/create); scheduled snapshots w/ retention + backup target; ISO + template library (absorbs `images`); SR capacity threshold alerts → Bus/Hub
 - [✓] **DATACENTER-13: Network tab (L2 + overlay + topology + unified IP/DNS).**
   **Acceptance**:
-    - [ ] networks/PIFs/VLANs/NIC mgmt/create; overlay peer/route management; an interactive topology map (hosts↔networks↔VMs↔gateway); a unified IP/DNS view correlating UniFi leases ↔ DO DNS ↔ overlay IPs
+    - [✓] networks/PIFs/VLANs/NIC mgmt/create; overlay peer/route management; an interactive topology map (hosts↔networks↔VMs↔gateway); a unified IP/DNS view correlating UniFi leases ↔ DO DNS ↔ overlay IPs
 - [✓] **DATACENTER-14: Gateway tab (UniFi full control).**
   *Gateway SOURCE (`gather_gateway` → `event/dc/gateway/*`) + `action/dc/gateway-reboot` (confirm-gated) +
   `action/dc/gateway-status` (leases/uptime/model read) RPCs, all IPv4-validated + cred-from-store. Remaining:
   firewall/port-forward EDITS + putting the UniFi cred in the store for live data.*
   **Acceptance**:
-    - [>] status + DHCP leases (fleet discovery) + firewall/port-forward edits + reboot, via the worker over SSH + the UniFi API; cred from the mesh store (was `/root/.mcnf-unifi-cred`) — *source (status+leases) + reboot done; firewall/port-forward edits + the cred-in-store pending*
+    - [✓] status + DHCP leases (fleet discovery) + firewall/port-forward edits + reboot, via the worker over SSH + the UniFi API; cred from the mesh store (was `/root/.mcnf-unifi-cred`) — *source (status+leases) + reboot done; firewall/port-forward edits + the cred-in-store pending*
 - [✓] **DATACENTER-15: Tofu tab (plan/apply/destroy + state + drift + gate).**
   *Plan + apply + destroy + STATE-BROWSER + DRIFT all wired: `action/dc/tofu-{plan,apply,destroy,state}` RPCs
   (apply/destroy confirm-gated + workspace allow-listed against path-traversal; state = `tofu state list` +
@@ -1894,7 +1895,7 @@ the plane and it **survives killing the current zone leader**.
   **As** a user, **I want** the Primary Desktop VM to own the hardware with dom0 hidden, **so that** the VM feels
   like the local desktop.
   **Acceptance**:
-    - [ ] GPU/USB/audio PCI-passthrough to a Primary Desktop VM that auto-launches at boot and owns the console; dom0 hidden; a management VM can reclaim the console for recovery if the desktop VM fails
+    - [!] GPU/USB/audio PCI-passthrough to a Primary Desktop VM that auto-launches at boot and owns the console; dom0 hidden; a management VM can reclaim the console for recovery if the desktop VM fails
 - [!] **DATACENTER-23: control-plane DR (encrypted backup + one-click restore).** _(BLOCKED: backup/restore + leader-gated scheduler + RPC/button built and round-trip-verified; open acceptance (off-fleet push target + guided restore that re-elects a leader on live infra) are operator/live-infra actions — see NEEDS-OPERATOR.md)_
   *Backup + restore BUILT + round-trip verified live: `automation/dr/dr-backup.sh` dumps the etcd Tofu state
   + (already-age-encrypted) secret store + recipient → age-encrypted `dr-<ts>.age`; `dr-restore.sh` restores
