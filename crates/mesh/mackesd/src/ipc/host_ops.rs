@@ -61,7 +61,7 @@ impl HostOpsService {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 11] = [
+pub const ACTION_VERBS: [&str; 12] = [
     "host-power",
     // DATACENTER-10 — the Hosts tab's impact preview + pool read.
     "host-impact",
@@ -77,6 +77,8 @@ pub const ACTION_VERBS: [&str; 11] = [
     "host-vlan-create",
     // DATACENTER-14 — the Gateway tab's EdgeOS DHCP read (reservations + leases).
     "gateway-dhcp",
+    // ROUTER-3 — seal a per-appliance router credential (router/<mac>) into the mesh store.
+    "router-seal-cred",
 ];
 
 /// Responder poll interval.
@@ -1157,6 +1159,72 @@ fn net_build_reply(verb: &str, req_body: Option<&str>) -> String {
     }
 }
 
+/// Strict MAC validation (lowercase colon form `aa:bb:cc:dd:ee:ff`). The MAC is
+/// the only operator-influenced input that flows into the `router/<mac>` secret
+/// key, so it must be hex+colons ONLY — no shell/path metacharacters can reach
+/// `mcnf-secret.sh`.
+#[must_use]
+pub fn valid_mac(s: &str) -> bool {
+    let parts: Vec<&str> = s.split(':').collect();
+    parts.len() == 6
+        && parts
+            .iter()
+            .all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// ROUTER-3 (action layer) — seal a per-appliance router credential into the
+/// MESH secret store under `router/<mac>`. Request `{"mac":"aa:bb:..","cred":"user:pass"}`.
+/// The cred is fed to `mcnf-secret.sh put` via **STDIN** (never argv/`ps`); the
+/// MAC is strictly validated so it can't inject into the secret name.
+fn router_seal_cred(req_body: Option<&str>) -> Result<(), String> {
+    use std::io::Write;
+    let body = req_body.ok_or("router-seal-cred: missing body")?;
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("router-seal-cred: bad json: {e}"))?;
+    let mac = v
+        .get("mac")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let cred = v
+        .get("cred")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !valid_mac(&mac) {
+        return Err(format!("router-seal-cred: invalid MAC {mac:?}"));
+    }
+    if cred.trim().is_empty() {
+        return Err("router-seal-cred: empty cred".into());
+    }
+    // mac is hex+colons (valid_mac), safe single-quoted into the helper arg.
+    let cmd = format!("automation/secrets/mcnf-secret.sh put 'router/{mac}'");
+    let mut child = std::process::Command::new("bash")
+        .args(["-lc", &cmd])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("router-seal-cred: spawn mcnf-secret.sh: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("router-seal-cred: no stdin")?
+        .write_all(cred.as_bytes())
+        .map_err(|e| format!("router-seal-cred: write cred: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("router-seal-cred: wait: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "router-seal-cred: put failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
 /// Build the reply for one `action/dc/<verb>` request.
 #[must_use]
 pub fn build_reply(svc: &HostOpsService, verb: &str, req_body: Option<&str>) -> String {
@@ -1186,6 +1254,14 @@ pub fn build_reply(svc: &HostOpsService, verb: &str, req_body: Option<&str>) -> 
         }
         "gateway-reboot" => {
             return match gateway_reboot(req_body) {
+                Ok(()) => json!({ "ok": true }).to_string(),
+                Err(m) => err(m),
+            };
+        }
+        // ROUTER-3 — seal a per-appliance router credential (router/<mac>) into
+        // the mesh secret store; cred via stdin, never argv.
+        "router-seal-cred" => {
+            return match router_seal_cred(req_body) {
                 Ok(()) => json!({ "ok": true }).to_string(),
                 Err(m) => err(m),
             };
@@ -1381,6 +1457,25 @@ mod tests {
         assert!(ACTION_VERBS.contains(&"lighthouse-promote"));
         assert!(ACTION_VERBS.contains(&"host-net"));
         assert!(ACTION_VERBS.contains(&"host-vlan-create"));
+    }
+
+    #[test]
+    fn router_seal_cred_verb_and_guards() {
+        assert!(ACTION_VERBS.contains(&"router-seal-cred"));
+        assert_eq!(
+            action_topic("router-seal-cred"),
+            "action/dc/router-seal-cred"
+        );
+        // strict MAC gate — only hex+colons reach the secret name
+        assert!(valid_mac("46:6a:7c:96:e8:aa"));
+        assert!(!valid_mac("46:6a:7c:96:e8")); // too short
+        assert!(!valid_mac("zz:6a:7c:96:e8:aa")); // non-hex
+        assert!(!valid_mac("46:6a:7c:96:e8:aa; rm -rf /")); // injection attempt
+        // handler rejects bad input BEFORE shelling mcnf-secret.sh
+        assert!(router_seal_cred(None).is_err());
+        assert!(router_seal_cred(Some("{bad json")).is_err());
+        assert!(router_seal_cred(Some(r#"{"mac":"nothex","cred":"u:p"}"#)).is_err());
+        assert!(router_seal_cred(Some(r#"{"mac":"46:6a:7c:96:e8:aa","cred":"  "}"#)).is_err());
     }
 
     #[test]
