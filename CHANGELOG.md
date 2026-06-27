@@ -13,6 +13,30 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
+## [11.0.14] — 2026-06-27
+### Fixed
+- **MIG-1: `remove-peer` now deletes the etcd `/mesh/peers/<host>` directory key.**
+  It removed the etcd MEMBER + revoked + banned, but left the directory row, so the
+  roster reconcile kept re-adding a node whose droplet was already gone (the stale
+  lighthouse entries that had to be `etcdctl del`'d by hand during the 2026-06-27
+  retire). Decommission is now complete — member + directory row both removed
+  (`substrate::peers::delete_peer_blocking`).
+- **MIG-2: overlay-IP assignments are recorded mesh-wide at SIGN time.** The peer
+  directory is heartbeat-lagged, so two lighthouses signing within the heartbeat
+  window could both pick the same IP (the cross-lighthouse collision that handed a
+  node 10.42.0.1). The enroll signer now unions a shared `/mesh/ipalloc/` etcd
+  reservation keyspace into its taken-set and writes the assignment there
+  immediately after signing (`reserve_overlay_ip_blocking` /
+  `reserved_overlay_ips_blocking`), so the next sign anywhere sees it at once —
+  closing the practical window. (A fully same-instant CAS is a noted follow-up;
+  it only matters for simultaneous multi-lighthouse signs, which sequential
+  operator-driven adds never produce.)
+### Notes
+- **MIG-3 (CA-backup passphrase on joined lighthouses)** folds into the DATACENTER-23
+  DR / secret-store workstream: post-migration there is no passphrase source on the
+  fleet, so MIG-3 is the *establish-a-leader-managed-shared-passphrase* mechanism
+  (+ off-fleet encrypted CA backup), done there rather than standalone.
+
 ## [11.0.13] — 2026-06-27
 ### Fixed
 - **Overlay-IP allocation is now mesh-global, not per-lighthouse — no more

@@ -8559,19 +8559,27 @@ fn cmd_remove_peer(db_path: &std::path::Path, node_id: &str, force: bool) -> any
     // from the quorum too, so a deleted droplet never leaves a ghost voter.
     // Idempotent: a non-member target (an ordinary peer) is a no-op.
     {
-        use mackesd_core::substrate::{etcd, etcd_membership};
+        use mackesd_core::substrate::{etcd, etcd_membership, peers};
         let eps = etcd::default_endpoints();
         if !eps.is_empty() {
             let target = node_id.strip_prefix("peer:").unwrap_or(node_id).to_string();
             match etcd_membership::remove_member_blocking(
                 &eps,
-                &etcd_membership::MemberSel::Hostname(target),
+                &etcd_membership::MemberSel::Hostname(target.clone()),
             ) {
                 Some(Ok(true)) => println!("etcd: removed '{node_id}' from the cluster"),
                 Some(Ok(false)) | None => {}
                 Some(Err(e)) => {
                     eprintln!("etcd: could not remove '{node_id}' from the cluster ({e})");
                 }
+            }
+            // MIG-1 — also drop the `/mesh/peers/<hostname>` directory key, not
+            // just the etcd MEMBERSHIP. Otherwise the PeerRecord lingers and the
+            // roster reconcile keeps re-adding a node whose droplet is gone (the
+            // stale entries we had to `etcdctl del` by hand on 2026-06-27). The
+            // decommission is now complete: member + directory row both removed.
+            if peers::delete_peer_blocking(&eps, &target) {
+                println!("etcd: deleted directory key /mesh/peers/{target}");
             }
         }
     }

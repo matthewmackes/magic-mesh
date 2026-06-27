@@ -138,6 +138,77 @@ pub fn read_peers_blocking(endpoints: &[String]) -> Option<Vec<PeerRecord>> {
     .flatten()
 }
 
+/// Blocking delete of a peer's `/mesh/peers/<hostname>` directory key (MIG-1 —
+/// the decommission path's bridge). A deleted node's record otherwise lingers
+/// until its lease lapses (or forever if it was written without one), so the
+/// roster reconcile keeps re-adding a node whose droplet is already gone — the
+/// stale-lighthouse entries we had to `etcdctl del` by hand during the
+/// 2026-06-27 migration. `remove-peer` now drops the directory key directly.
+/// `true` on a successful delete, `false` on connect/delete failure (idempotent
+/// — deleting an absent key still succeeds).
+#[must_use]
+pub fn delete_peer_blocking(endpoints: &[String], hostname: &str) -> bool {
+    block_on(async {
+        match connect(endpoints).await {
+            Ok(mut c) => delete_peer(&mut c, hostname).await.is_ok(),
+            Err(_) => false,
+        }
+    })
+    .unwrap_or(false)
+}
+
+/// MIG-2 — shared overlay-IP reservation keyspace: `/mesh/ipalloc/<ip>` = node_id.
+pub const IPALLOC_PREFIX: &str = "/mesh/ipalloc/";
+
+/// MIG-2 — record an overlay-IP assignment in etcd at SIGN time (best-effort), so
+/// a concurrent sign on ANOTHER lighthouse sees the IP as taken immediately
+/// rather than only after the new peer's first heartbeat lands its PeerRecord.
+/// The peer directory is heartbeat-lagged, so without this two lighthouses
+/// signing within the heartbeat window both saw the same directory and could pick
+/// the same IP — the cross-lighthouse collision that handed a node 10.42.0.1 on
+/// 2026-06-27. Idempotent overwrite. `true` on success.
+#[must_use]
+pub fn reserve_overlay_ip_blocking(endpoints: &[String], ip: &str, node_id: &str) -> bool {
+    let key = format!("{IPALLOC_PREFIX}{ip}");
+    let val = node_id.to_string();
+    block_on(async {
+        match connect(endpoints).await {
+            Ok(mut c) => c.put(key, val, None).await.is_ok(),
+            Err(_) => false,
+        }
+    })
+    .unwrap_or(false)
+}
+
+/// MIG-2 — every overlay IP recorded under `/mesh/ipalloc/` (the sign-time
+/// reservations). The enroll signer unions these with the peer-directory IPs to
+/// form the global taken-set the allocator skips. Empty on connect/read failure
+/// (the directory read still guards the common case). The keyed value is the
+/// `<ip>` suffix of each reservation key.
+#[must_use]
+pub fn reserved_overlay_ips_blocking(endpoints: &[String]) -> std::collections::HashSet<String> {
+    block_on(async {
+        match connect(endpoints).await {
+            Ok(mut c) => {
+                let resp = c
+                    .get(IPALLOC_PREFIX, Some(GetOptions::new().with_prefix()))
+                    .await
+                    .ok()?;
+                Some(
+                    resp.kvs()
+                        .iter()
+                        .filter_map(|kv| kv.key_str().ok())
+                        .filter_map(|k| k.strip_prefix(IPALLOC_PREFIX).map(str::to_string))
+                        .collect::<std::collections::HashSet<String>>(),
+                )
+            }
+            Err(_) => None,
+        }
+    })
+    .flatten()
+    .unwrap_or_default()
+}
+
 /// The canonical peer directory for this node: the **etcd** substrate when the
 /// coordination plane is provisioned (`/etc/mackesd/etcd-endpoints` non-empty),
 /// else the replicated **fs** union (`<workgroup_root>/peers/*.json`). This is the
