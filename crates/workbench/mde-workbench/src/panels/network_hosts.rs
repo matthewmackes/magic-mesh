@@ -303,7 +303,7 @@ fn workgroup_root() -> PathBuf {
 /// Read + merge every peer's `<root>/<peer>/mackesd/probe-inventory.json`
 /// into one `Vec<Card>`. Fail-open per file (a missing/corrupt peer
 /// inventory is skipped) so one bad file can't blind the reader.
-fn read_inventory_cards(root: &Path) -> Vec<Card> {
+pub fn read_inventory_cards(root: &Path) -> Vec<Card> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(root) else {
         return out;

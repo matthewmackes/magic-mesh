@@ -4,6 +4,8 @@
 //! the parent app's `Message`, and a `view` builder over
 //! [`Element<'_, crate::Message>`].
 
+/// COMPUTE/SVC-VIEW — unified "All Services" panel (published + discovered + vm-internal).
+pub mod all_services;
 pub mod about;
 pub mod audit;
 pub mod build_farm;

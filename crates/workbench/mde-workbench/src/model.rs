@@ -225,6 +225,8 @@ pub fn nav_model() -> Vec<NavEntry> {
                 // CONNECT-6 — the unified exposure matrix (mesh-only vs public).
                 Panel::new("connectivity", "Connectivity"),
                 Panel::new("network_hosts", "Discovered Hosts"),
+                // COMPUTE/SVC-VIEW — unified view of all three service sources.
+                Panel::new("all_services", "All Services"),
                 // Mesh-relevant peer/device services kept here (Q2 exception).
                 Panel::new("connect", "Connected Devices"),
                 Panel::new("music", "Music"),
