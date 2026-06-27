@@ -40,6 +40,15 @@ Brought up the first Lighthouse_Media node end-to-end: **DO Spaces** `mcnf-media
 - [ ] **MEDIA-pkg: ship `setup-media-navidrome.sh` (+ rclone dep) in the RPM** — it wasn't on the node (scp'd by hand); the add-Media flow should install it for full turn-key. Also: a `mackesd` Navidrome supervisor worker that ADOPTS the unit (the run-and-survive half exists; the self-heal worker is the follow-on).
 - [ ] **MIG-3 / DR shared-passphrase + off-fleet CA backup** → `mcnf-dr-4533` bucket is provisioned and ready; wire the DATACENTER-23 age-push + leader-managed backup passphrase to it (this also satisfies MIG-3).
 
+### EPIC-DRIVE 2026-06-27 — block-lift status (after the migration)
+Six block-areas, driven to their fully-in-my-control extent:
+- [✓] **SVC-VIEW (#6)** — unified "All Services" Workbench panel (published ∪ probed ∪ VM-internal), source-tagged + deduped; 13 tests, farm-green (`2431b54`).
+- [✓] **BUILD-PLATFORM / test-mesh (#3)** — the nightly L1/L2/L3 pyramid is ENABLED on the control host (`mcnf-nightly-tests.timer`, next 02:39 nightly) + a verification run is executing; harness viable (MDE-VM-golden template present on both dom0s); results publish to `event/test/nightly`.
+- [✓] **MEDIA (#2)** — live on one node (above). Tail: 2nd node (redundancy) + operator music upload.
+- [~] **DR (#4)** — off-fleet push + CA backup CODE done (`1b70f99`); **execution is operator-run** — the safety classifier HARD-blocks an agent exporting the CA key + secrets off-fleet (data-exfiltration; not clearable by authorization). Run: `MCNF_DR_REMOTE=mcnf-spaces:mcnf-dr-4533 bash automation/dr/dr-backup.sh` on a CA holder.
+- [!] **UniFi (#5)** — needs the operator to supply the UniFi controller URL + creds (the on-disk cred file is gone); then `mackesd secret put unifi …` seals it.
+- [✓] **MIG-1/2** shipped (11.0.14); MIG-3 folds into DR above.
+
 ## FARM-AUTOSCALE — demand-driven elastic build farm (operator 2026-06-24; design: docs/design/farm-autoscale.md)
 Tofu auto-scaling + full lifecycle of VM **and** POD resources: each dom0 runs EITHER one hardware-maxing big build VM OR several small VMs/agent pods, created/destroyed by tofu to fit the live build queue — best on-demand hardware use. Locks: **demand-driven** (the @farm queue is the signal) · **FARM-AUTO reconciler orchestrates** (no AI in the loop) · **warm pool, scale-to-zero + snapshot-reset** · **mutually-exclusive shapes per dom0, demand wins**.
 - [✓] **FA-1: tofu shape model.** **As** the farm, **I want** a per-dom0 `shape` var (`big`/`small`/`off`) + `small_count` driving `infra/tofu/build-vms.tf`, **so that** `tofu apply` provisions one hardware-maxing big VM, N standard small VMs, or nothing. **Acceptance:** `shape=big` on BigBoy provisions ~10vCPU/26GiB `mcnf-build-big-52`; `shape=small,count=2` provisions 2 standard VMs; `shape=off` destroys them (scale-to-zero); idempotent re-apply.
