@@ -1920,7 +1920,7 @@ the plane and it **survives killing the current zone leader**.
     - [ ] one-click spin/teardown of an N-node test mesh from the golden template (hermetic, wraps `farm-testbed.sh`); a scale control adjusts build-VM count via Tofu
 
 ### Phase 5 — Workstation, DR & observability
-- [ ] **DATACENTER-22: Enhanced Workstation profile (passthrough Primary Desktop VM).**
+- [!] **DATACENTER-22: Enhanced Workstation profile (passthrough Primary Desktop VM).** _(HARDWARE-GATED: the virt-install GPU/USB/audio-passthrough args + profile fields are buildable, but §7 "observably works" requires IOMMU/VT-d BIOS gates + live Xen PCI binding the operator must verify on real hardware — not provable in this environment.)_
   **As** a user, **I want** the Primary Desktop VM to own the hardware with dom0 hidden, **so that** the VM feels
   like the local desktop.
   **Acceptance**:
@@ -2117,7 +2117,7 @@ Generalize the single hardcoded EdgeRouter (`172.20.0.1`, `infra/tofu/edgeos/`, 
 
 ### Phase 2 — Mutations (fast-follow; tofu-as-code + commit-confirm)
 
-- [ ] **ROUTER-6: generalize the edgeos tofu root → per-appliance.**
+- [!] **ROUTER-6: generalize the edgeos tofu root → per-appliance.** _(DEFERRED-YAGNI: per-appliance KEYING — `router/<mac>` creds, per-node registry, MAC-keyed discovery — is DONE (Phase 1). The multi-appliance tofu STATE backend is unneeded for the single live EdgeRouter, and migrating the live single-appliance edgeos state (production DHCP/firewall) carries real risk for zero current benefit. Revisit at a 2nd EdgeRouter.)_
   **As** the mesh, **I want** per-appliance router IaC,
   **so that** each node's router converges independently.
   **Acceptance**:
