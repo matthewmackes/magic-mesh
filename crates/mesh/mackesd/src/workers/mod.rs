@@ -251,6 +251,10 @@ pub mod router_registry;
 // `<host>/media-registry.json` (same registry plane the other published
 // services use) — with a per-instance health field.
 pub mod media_registry;
+// MEDIA-pkg-2 — the navidrome_supervisor worker: on a Lighthouse_Media node only,
+// adopt + self-heal the mcnf-navidrome.service systemd unit (restart-if-down,
+// re-provision-if-missing via the RPM-shipped setup-media-navidrome).
+pub mod navidrome_supervisor;
 // MEDIA-8 — the Workstation half of the media birthright: read the published
 // shared account off the registry plane and idempotently write the desktop
 // user's airsonic-creds.json so mde-music auto-browses (no first-run connect).

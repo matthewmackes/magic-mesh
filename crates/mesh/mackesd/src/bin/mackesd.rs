@@ -6504,6 +6504,17 @@ fn run_serve(
                 .lock()
                 .expect("worker_names mutex")
                 .push("media_registry".into());
+
+            // MEDIA-pkg-2 — self-heal the Navidrome systemd unit (restart-if-down,
+            // re-provision-if-missing via the RPM-shipped setup-media-navidrome).
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::navidrome_supervisor::NavidromeSupervisor::new(),
+                RestartPolicy::Always,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("navidrome_supervisor".into());
         }
 
         // APPS-LIVE-1 — apps_running: mirror this node's set of currently-

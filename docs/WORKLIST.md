@@ -38,7 +38,7 @@ Brought up the first Lighthouse_Media node end-to-end: **DO Spaces** `mcnf-media
 - [!] **MEDIA-10: 2nd Lighthouse_Media node** for active-active redundancy (provision a 2nd s-2vcpu-4gb, tag Media, run setup-media-navidrome.sh — it now auto-provisions the account).
 - [!] **MEDIA-9: content upload** — the bucket is empty; the operator uploads music (rclone to `mcnf-media-4533`), then a Navidrome rescan surfaces it.
 - [✓] **MEDIA-pkg: ship `setup-media-navidrome.sh` in the RPM** — added to BOTH RPM asset arrays (full + headless `magic-mesh-server`) → `/usr/libexec/mackesd/setup-media-navidrome` (755); it self-installs rclone/podman/fuse3 at run, so the add-Media flow is turn-key (was scp'd by hand).
-- [ ] **MEDIA-pkg-2: `mackesd` Navidrome supervisor worker** that ADOPTS + self-heals the unit (the run-and-survive half exists; this self-heal worker is the follow-on).
+- [✓] **MEDIA-pkg-2: `mackesd` Navidrome supervisor worker** — `navidrome_supervisor` (Media-gated): each 30s tick adopts `mcnf-navidrome.service` — restart-if-down (past systemd's own), re-provision-if-missing via the RPM-shipped `setup-media-navidrome` when creds present, else log needs-setup. Pure `decide()` core unit-tested; farm lib-test + bin compile green.
 - [!] **MIG-3 / DR shared-passphrase + off-fleet CA backup** → `mcnf-dr-4533` bucket is provisioned and ready; wire the DATACENTER-23 age-push + leader-managed backup passphrase to it (this also satisfies MIG-3).
 
 ### EPIC-DRIVE 2026-06-27 — block-lift status (after the migration)
