@@ -61,7 +61,7 @@ impl HostOpsService {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 14] = [
+pub const ACTION_VERBS: [&str; 16] = [
     "host-power",
     // DATACENTER-10 — the Hosts tab's impact preview + pool read.
     "host-impact",
@@ -82,6 +82,9 @@ pub const ACTION_VERBS: [&str; 14] = [
     // DATACENTER-21 — ephemeral test-mesh (list) + build-farm autoscale (reconcile/plan, no apply).
     "testbed-list",
     "farm-scale",
+    // DATACENTER-21 — provision (async clone) + tear-down (confirm-gated) the test-VM pool.
+    "testbed-up",
+    "testbed-down",
 ];
 
 /// Responder poll interval.
@@ -1290,6 +1293,50 @@ fn farm_scale() -> Result<String, String> {
     run_repo_script("install-helpers/farm-autoscale.sh")
 }
 
+/// Validate the test-VM count `n` from the request (1..=12, the §8 envelope). Pure.
+fn parse_testbed_n(req_body: Option<&str>) -> Result<u32, String> {
+    let v: serde_json::Value = serde_json::from_str(req_body.unwrap_or("{}"))
+        .map_err(|e| format!("testbed-up: bad json: {e}"))?;
+    let n = v.get("n").and_then(serde_json::Value::as_u64).unwrap_or(1);
+    if (1..=12).contains(&n) {
+        Ok(n as u32)
+    } else {
+        Err(format!("testbed-up: n={n} out of range (1..=12)"))
+    }
+}
+
+/// DATACENTER-21 — provision N clean test VMs. ASYNC: `farm-testbed.sh up` clones
+/// from the golden template (minutes), so it's fired DETACHED and we return
+/// immediately; the GUI polls `testbed-list` for the VMs to appear.
+fn testbed_up(req_body: Option<&str>) -> Result<u32, String> {
+    let n = parse_testbed_n(req_body)?; // validated small int — no injection
+    let cmd =
+        format!("nohup automation/testbed/farm-testbed.sh up {n} >/tmp/mcnf-testbed-up.log 2>&1 &");
+    let o = std::process::Command::new("bash")
+        .args(["-lc", &cmd])
+        .output()
+        .map_err(|e| format!("testbed-up exec failed: {e}"))?;
+    if o.status.success() {
+        Ok(n)
+    } else {
+        Err(format!(
+            "testbed-up: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ))
+    }
+}
+
+/// DATACENTER-21 — destroy ALL ephemeral test VMs (`mcnf-test-*`). Destructive →
+/// requires `{"confirm":true}` (fail-closed, mirrors gateway-reboot).
+fn testbed_down(req_body: Option<&str>) -> Result<(), String> {
+    let v: serde_json::Value = serde_json::from_str(req_body.unwrap_or("{}"))
+        .map_err(|e| format!("testbed-down: bad json: {e}"))?;
+    if v.get("confirm").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err("testbed-down: confirm:true required (destroys all mcnf-test-* VMs)".into());
+    }
+    run_repo_script("automation/testbed/farm-testbed.sh down").map(|_| ())
+}
+
 /// Build the reply for one `action/dc/<verb>` request.
 #[must_use]
 pub fn build_reply(svc: &HostOpsService, verb: &str, req_body: Option<&str>) -> String {
@@ -1342,6 +1389,19 @@ pub fn build_reply(svc: &HostOpsService, verb: &str, req_body: Option<&str>) -> 
         "farm-scale" => {
             return match farm_scale() {
                 Ok(plan) => json!({ "ok": true, "plan": plan }).to_string(),
+                Err(m) => err(m),
+            };
+        }
+        // DATACENTER-21 — provision test VMs (async fire) / tear down (confirm-gated).
+        "testbed-up" => {
+            return match testbed_up(req_body) {
+                Ok(n) => json!({ "ok": true, "started": true, "n": n }).to_string(),
+                Err(m) => err(m),
+            };
+        }
+        "testbed-down" => {
+            return match testbed_down(req_body) {
+                Ok(()) => json!({ "ok": true }).to_string(),
                 Err(m) => err(m),
             };
         }
@@ -1570,6 +1630,21 @@ mod tests {
         let solo = parse_testbed_ips("solo\n");
         assert_eq!(solo.len(), 1);
         assert_eq!(solo[0].ip, "");
+    }
+
+    #[test]
+    fn testbed_up_down_verbs_and_guards() {
+        assert!(ACTION_VERBS.contains(&"testbed-up"));
+        assert!(ACTION_VERBS.contains(&"testbed-down"));
+        // n parse + range guard
+        assert_eq!(parse_testbed_n(Some(r#"{"n":3}"#)), Ok(3));
+        assert_eq!(parse_testbed_n(None), Ok(1)); // default 1
+        assert!(parse_testbed_n(Some(r#"{"n":0}"#)).is_err());
+        assert!(parse_testbed_n(Some(r#"{"n":99}"#)).is_err());
+        assert!(parse_testbed_n(Some("{bad")).is_err());
+        // testbed-down is confirm-gated: rejects before shelling the destroy
+        assert!(testbed_down(Some("{}")).is_err());
+        assert!(testbed_down(Some(r#"{"confirm":false}"#)).is_err());
     }
 
     #[test]
