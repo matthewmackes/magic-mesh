@@ -180,6 +180,22 @@ systemctl enable --now mcnf-music-store.service >/dev/null 2>&1 || true
 # above orders it; this just avoids a noisy first-scan against an empty mount).
 systemctl enable --now mcnf-navidrome.service >/dev/null 2>&1 || true
 
+# MEDIA-6 — auto-provision the single shared service account. Navidrome 0.53's
+# ND_DEFAULTADMINPASSWORD does NOT auto-create the user (verified live 2026-06-27 —
+# Subsonic auth returned "data not found"); the first-run POST /auth/createAdmin
+# is what actually seeds it. Idempotent: once an admin exists Navidrome refuses a
+# second, so a re-run is a harmless no-op. Without this the published shared
+# account (media_registry → music_autoconfig) never authenticates.
+for _ in $(seq 1 20); do ss -tlnp 2>/dev/null | grep -q ":$PORT\b" && break; sleep 2; done
+curl -fsS -m8 "http://$LISTEN:$PORT/" >/dev/null 2>&1 || true   # touch the web app (first-run init)
+if curl -fsS -m10 -X POST "http://$LISTEN:$PORT/auth/createAdmin" \
+     -H 'Content-Type: application/json' \
+     -d "{\"username\":\"$ND_ADMIN_USER\",\"password\":\"$ND_ADMIN_PASS\"}" >/dev/null 2>&1; then
+  echo "==> media: shared account '$ND_ADMIN_USER' provisioned (createAdmin)"
+else
+  echo "==> media: admin account already present (createAdmin no-op)"
+fi
+
 log "done — Navidrome on http://$LISTEN:$PORT (Subsonic API), bucket=$DO_SPACES_BUCKET"
 echo "  verify: curl -fsS \"http://$LISTEN:$PORT/rest/ping.view?u=$ND_ADMIN_USER&p=…&v=1.16.1&c=mcnf\""
 echo "  store:  systemctl status mcnf-music-store.service   # rclone S3 mount"
