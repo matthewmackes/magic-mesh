@@ -70,6 +70,26 @@ resource "null_resource" "nat_rules" {
   }
 }
 
+# ROUTER-9 — converge VPN endpoint config roots (apply-vpn.sh): additive (only
+# var.vpn_config roots) + commit-confirm auto-revert. No-op when the map is empty.
+resource "null_resource" "vpn_config" {
+  triggers = {
+    config = jsonencode(var.vpn_config)
+    script = filemd5("${path.module}/scripts/apply-vpn.sh")
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/usr/bin/env", "bash"]
+    command     = "${path.module}/scripts/apply-vpn.sh"
+    environment = {
+      EDGEOS_HOST        = var.edgeos_host
+      EDGEOS_USER        = var.edgeos_user
+      EDGEOS_CRED_FILE   = var.edgeos_cred_file
+      EDGEOS_VPN_DESIRED = jsonencode(var.vpn_config)
+    }
+  }
+}
+
 # Poll the live DHCP leases (read-only) — surfaced as an output so
 # `tofu output dhcp_leases` is the "poll for DHCP addresses" command.
 data "external" "dhcp_leases" {

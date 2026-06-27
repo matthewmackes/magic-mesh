@@ -81,3 +81,19 @@ variable "nat_rules" {
   type        = any
   default     = {}
 }
+
+variable "vpn_config" {
+  description = <<-EOT
+    ROUTER-9 — declarative EdgeOS/VyOS VPN endpoint config MCNF manages, keyed by
+    the managed config ROOT path → its desired leaves:
+      { "interfaces wireguard wg0": { "address": "10.50.0.1/24",
+          "private-key": "/config/auth/wg0.key", "port": "51820",
+          "peer SITE-B allowed-ips": "10.50.0.2/32",
+          "peer SITE-B endpoint": "203.0.113.7:51820" } }
+    or { "vpn ipsec site-to-site peer 203.0.113.7": { .. } }.
+    ADDITIVE (§6): only the named roots are delete+recreated to exact; VPN config
+    the operator authored elsewhere is untouched. Empty (default) = manage nothing.
+  EOT
+  type        = any
+  default     = {}
+}
