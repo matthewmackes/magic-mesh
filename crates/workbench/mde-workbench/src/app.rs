@@ -21,7 +21,7 @@ use crate::header::HeaderAction;
 use crate::keyboard::{KeyAction, Pane};
 use crate::model::{resolve_panel_label, view_from_focus_slug, Group, View};
 use crate::panels::{
-    all_services as all_services_panel,
+    all_services as all_services_panel, router as router_panel,
     audit as audit_panel, build_farm as build_farm_panel, compute as compute_panel,
     config_apply as config_apply_panel, connect as connect_panel,
     connectivity as connectivity_panel, datacenter as datacenter_panel, dns as dns_panel,
@@ -214,6 +214,8 @@ pub enum Message {
     NetworkHosts(network_hosts_panel::Message),
     /// COMPUTE/SVC-VIEW — Mesh → All Services unified panel sub-message.
     AllServices(all_services_panel::Message),
+    /// ROUTER-5 — Routers panel sub-message.
+    Router(router_panel::Message),
     RemoteDesktop(remote_desktop_panel::Message),
     /// PD-3 — the Peers directory (Front Door) sub-message.
     Peers(peers_panel::Message),
@@ -372,6 +374,8 @@ pub struct App {
     network_hosts: network_hosts_panel::NetworkHostsPanel,
     /// COMPUTE/SVC-VIEW — Mesh → All Services unified panel state.
     all_services: all_services_panel::AllServicesPanel,
+    /// ROUTER-5 — Routers panel state.
+    router: router_panel::RouterPanel,
     remote_desktop: remote_desktop_panel::RemoteDesktopPanel,
     peers: peers_panel::PeersPanel,
     sync_status: sync_status_panel::SyncStatusPanel,
@@ -482,6 +486,7 @@ impl App {
             mesh_storage: mesh_storage_panel::MeshStoragePanel::new(),
             network_hosts: network_hosts_panel::NetworkHostsPanel::new(),
             all_services: all_services_panel::AllServicesPanel::new(),
+            router: router_panel::RouterPanel::new(),
             remote_desktop: remote_desktop_panel::RemoteDesktopPanel::new(),
             peers: peers_panel::PeersPanel::new(),
             sync_status: sync_status_panel::SyncStatusPanel::new(),
@@ -957,6 +962,7 @@ impl App {
             Message::MeshStorage(msg) => self.mesh_storage.update(msg),
             Message::NetworkHosts(msg) => self.network_hosts.update(msg),
             Message::AllServices(msg) => self.all_services.update(msg),
+            Message::Router(msg) => self.router.update(msg),
             Message::RemoteDesktop(msg) => self.remote_desktop.update(msg),
             Message::Peers(msg) => self.peers.update(msg),
             Message::SyncStatus(msg) => self.sync_status.update(msg),
@@ -1109,6 +1115,8 @@ impl App {
             "network_hosts" => network_hosts_panel::NetworkHostsPanel::load(),
             // COMPUTE/SVC-VIEW — All Services unions all three sources on first nav.
             "all_services" => all_services_panel::AllServicesPanel::load(),
+            // ROUTER-5 — Routers panel reads the per-node router registry on first nav.
+            "router" => router_panel::RouterPanel::load(),
             // PLANES-1 (W4) — Mesh Services folds into This Node/Health.
             "mesh_services" => mesh_services_panel::MeshServicesPanel::load(),
             // NF-13.8 (v2.5) — shell-out to
@@ -1550,6 +1558,11 @@ impl App {
                 panel: "all_services",
                 ..
             } => self.all_services.view(),
+            // ROUTER-5 — Mesh → Routers per-node router/firewall view.
+            View::Panel {
+                panel: "router",
+                ..
+            } => self.router.view(),
             // v4.0.1 WB-2.j (2026-05-23) — Network → Mesh
             // Services renders systemctl status + start/stop/
             // restart for the mesh-fabric daemons. v2.5 NF-5.4

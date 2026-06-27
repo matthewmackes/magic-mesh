@@ -227,6 +227,8 @@ pub fn nav_model() -> Vec<NavEntry> {
                 Panel::new("network_hosts", "Discovered Hosts"),
                 // COMPUTE/SVC-VIEW — unified view of all three service sources.
                 Panel::new("all_services", "All Services"),
+                // ROUTER-5 — per-node router/firewall (EdgeRouter/VyOS) controls.
+                Panel::new("router", "Routers"),
                 // Mesh-relevant peer/device services kept here (Q2 exception).
                 Panel::new("connect", "Connected Devices"),
                 Panel::new("music", "Music"),

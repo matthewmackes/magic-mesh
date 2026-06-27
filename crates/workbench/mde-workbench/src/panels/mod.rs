@@ -6,6 +6,8 @@
 
 /// COMPUTE/SVC-VIEW — unified "All Services" panel (published + discovered + vm-internal).
 pub mod all_services;
+/// ROUTER-5 — per-node router/firewall (EdgeRouter/VyOS) read panel.
+pub mod router;
 pub mod about;
 pub mod audit;
 pub mod build_farm;
