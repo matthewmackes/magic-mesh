@@ -50,6 +50,26 @@ resource "null_resource" "firewall_rulesets" {
   }
 }
 
+# ROUTER-8 — converge destination-NAT / port-forward rules (apply-nat.sh):
+# additive (only var.nat_rules numbers) + commit-confirm auto-revert. No-op empty.
+resource "null_resource" "nat_rules" {
+  triggers = {
+    rules  = jsonencode(var.nat_rules)
+    script = filemd5("${path.module}/scripts/apply-nat.sh")
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/usr/bin/env", "bash"]
+    command     = "${path.module}/scripts/apply-nat.sh"
+    environment = {
+      EDGEOS_HOST        = var.edgeos_host
+      EDGEOS_USER        = var.edgeos_user
+      EDGEOS_CRED_FILE   = var.edgeos_cred_file
+      EDGEOS_NAT_DESIRED = jsonencode(var.nat_rules)
+    }
+  }
+}
+
 # Poll the live DHCP leases (read-only) — surfaced as an output so
 # `tofu output dhcp_leases` is the "poll for DHCP addresses" command.
 data "external" "dhcp_leases" {

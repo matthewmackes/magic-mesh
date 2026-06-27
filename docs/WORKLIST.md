@@ -2129,7 +2129,7 @@ Generalize the single hardcoded EdgeRouter (`172.20.0.1`, `infra/tofu/edgeos/`, 
   **Acceptance**:
     - [ ] a `null_resource` converge script edits Vyatta firewall rulesets (converge-to-exact, like DHCP), wrapped in `commit-confirm <min>` auto-rollback + typed-confirm + a hash-chain audit row
     - [ ] an un-reconfirmed edit auto-reverts on the live router
-- [ ] **ROUTER-8: port-forward / NAT converge.** (same converge + commit-confirm gating; destination-NAT rules read+edit)
+- [✓] **ROUTER-8: port-forward / NAT converge.** (apply-nat.sh — destination-NAT rules converge-to-exact by rule number, ADDITIVE, commit-confirm auto-revert; tofu null_resource + `nat_rules` var; validate/shellcheck green)
 - [ ] **ROUTER-9: VPN endpoint converge.** (same gating; manage the router's VPN endpoint config — site-to-site / road-warrior server)
 - [ ] **ROUTER-10: reboot + Router-panel mutate controls.**
   **Acceptance**:

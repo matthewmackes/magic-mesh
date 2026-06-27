@@ -66,3 +66,18 @@ variable "firewall_rulesets" {
   type        = any
   default     = {}
 }
+
+variable "nat_rules" {
+  description = <<-EOT
+    ROUTER-8 — declarative EdgeOS/VyOS destination-NAT (port-forward) rules MCNF
+    manages, keyed by rule number:
+      { "<num>": { "type": "destination", "inbound-interface": "eth0",
+                   "protocol": "tcp", "destination port": "443",
+                   "inside-address address": "10.42.0.5",
+                   "inside-address port": "4533", "description": ".." } }
+    ADDITIVE (§6): only the listed rule NUMBERS are converged; NAT rules the
+    operator authored elsewhere are untouched. Empty (default) = manage nothing.
+  EOT
+  type        = any
+  default     = {}
+}
