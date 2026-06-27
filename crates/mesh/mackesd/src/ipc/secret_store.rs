@@ -194,7 +194,7 @@ impl SecretStore {
 /// The mesh age identity path (`MCNF_AGE_KEY` env, else [`DEFAULT_AGE_KEY`]) —
 /// matches the script's own default so both backends key off the same artifact.
 #[must_use]
-fn age_key_path() -> PathBuf {
+pub fn age_key_path() -> PathBuf {
     std::env::var_os("MCNF_AGE_KEY").map_or_else(|| PathBuf::from(DEFAULT_AGE_KEY), PathBuf::from)
 }
 

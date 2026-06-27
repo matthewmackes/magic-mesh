@@ -13,6 +13,17 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
+## [11.0.15] — 2026-06-27
+### Added
+- **`mackesd secret put|get [--local] <name>`** — a CLI for the leader-managed mesh
+  secret store (DATACENTER-3). `put` reads plaintext on stdin and age-encrypts it;
+  `get` decrypts to stdout. `--local` forces the Syncthing-replicated LocalAead
+  store, so a repo node can seal a secret (e.g. `media-spaces`) that the
+  lighthouses then read via their own LocalAead store keyed by the shared mesh age
+  identity. Closes the operational put-path the readers (`media_registry`, VPN, DR)
+  always assumed but no CLI exposed — the gate for provisioning MEDIA + DR
+  credentials without hand-editing per-node files. (`age_key_path` made pub.)
+
 ## [11.0.14] — 2026-06-27
 ### Fixed
 - **MIG-1: `remove-peer` now deletes the etcd `/mesh/peers/<host>` directory key.**

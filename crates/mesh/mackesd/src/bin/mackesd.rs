@@ -635,6 +635,18 @@ enum Cmd {
         force: bool,
     },
 
+    /// DATACENTER-3 — seal/read a leader-managed mesh secret. `put` reads the
+    /// plaintext on stdin and age-encrypts it into the store; `get` decrypts to
+    /// stdout. `--local` forces the Syncthing-replicated LocalAead store (so a
+    /// repo node can seal a secret — e.g. `media-spaces` — that the lighthouses
+    /// then read via their own LocalAead store, keyed by the shared mesh age
+    /// identity). Used to provision MEDIA / DR / VPN credentials without hand-
+    /// editing per-node files.
+    Secret {
+        #[command(subcommand)]
+        cmd: SecretCmd,
+    },
+
     /// SETUP-7 — re-apply the steady-state convergence playbook
     /// (`/etc/mackesd/site.yml`) locally via `ansible-playbook`. The playbook
     /// is generated at `found`/`join`; this restores role/services/mount
@@ -1055,6 +1067,28 @@ enum Cmd {
 
 /// #13 — `mackesd lighthouse <sub>` subcommands: the turn-key add/retire lifecycle.
 #[derive(Subcommand)]
+enum SecretCmd {
+    /// Seal the plaintext read from stdin under `<name>` in the mesh secret store.
+    Put {
+        /// The secret name/ref (e.g. `media-spaces`), as the readers reference it.
+        name: String,
+        /// Force the Syncthing-replicated LocalAead store under the workgroup root
+        /// (vs. auto-resolving to the etcd-backed Mesh store when the repo helper
+        /// is present). Use on a repo node to seal a secret the lighthouses read.
+        #[arg(long)]
+        local: bool,
+    },
+    /// Decrypt the secret stored under `<name>` to stdout (exit 3 if absent).
+    Get {
+        /// The secret name/ref to read.
+        name: String,
+        /// Force the LocalAead store (see `put --local`).
+        #[arg(long)]
+        local: bool,
+    },
+}
+
+#[derive(clap::Subcommand)]
 enum LighthouseCmd {
     /// Provision a DigitalOcean droplet that JOINS this mesh as a full lighthouse:
     /// mint a role-scoped lighthouse token here, then shell the join provisioner
@@ -3838,6 +3872,9 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::RemovePeer { node_id, force } => {
             return cmd_remove_peer(&db_path, &node_id, force);
+        }
+        Cmd::Secret { cmd } => {
+            return cmd_secret(cmd);
         }
         Cmd::Lighthouse { cmd } => {
             return match cmd {
@@ -8588,6 +8625,57 @@ fn cmd_remove_peer(db_path: &std::path::Path, node_id: &str, force: bool) -> any
         "removed '{node_id}': decommissioned ({updated} row), {rows} cert row(s) revoked, banned \
          (propagates to every peer via QNM-Shared)."
     );
+    Ok(())
+}
+
+/// DATACENTER-3 — seal/read a leader-managed mesh secret from the CLI. `put` reads
+/// plaintext from stdin and age-encrypts it; `get` decrypts to stdout (exit 3 if
+/// absent). `--local` forces the Syncthing-replicated LocalAead store so a repo
+/// node can seal a secret the lighthouses then read via their own LocalAead store
+/// (keyed by the shared mesh age identity) — the operational put-path the readers
+/// (`media_registry`, VPN, DR) always assumed but no CLI exposed.
+fn cmd_secret(cmd: SecretCmd) -> anyhow::Result<()> {
+    use mackesd_core::ipc::secret_store::{age_key_path, repo_root, SecretStore};
+    let workgroup_root = mackesd_core::default_qnm_shared_root();
+    let store_for = |local: bool| -> SecretStore {
+        if local {
+            SecretStore::LocalAead {
+                dir: workgroup_root.join("vpn").join("secrets"),
+                key_path: age_key_path(),
+            }
+        } else {
+            SecretStore::resolve(&repo_root(), &workgroup_root)
+        }
+    };
+    match cmd {
+        SecretCmd::Put { name, local } => {
+            let mut plaintext = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut plaintext)
+                .context("reading secret plaintext from stdin")?;
+            store_for(local)
+                .put(&name, &plaintext)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            eprintln!(
+                "mackesd secret: sealed '{name}' ({} bytes){}",
+                plaintext.len(),
+                if local {
+                    " into the Syncthing-replicated LocalAead store"
+                } else {
+                    ""
+                }
+            );
+        }
+        SecretCmd::Get { name, local } => match store_for(local)
+            .get(&name)
+            .map_err(|e| anyhow::anyhow!(e))?
+        {
+            Some(v) => print!("{v}"),
+            None => {
+                eprintln!("mackesd secret: '{name}' is not in the store");
+                std::process::exit(3);
+            }
+        },
+    }
     Ok(())
 }
 
