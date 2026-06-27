@@ -412,6 +412,9 @@ assets = [
     # CONNECT-4 — install Caddy + wire `import Caddyfile.d/*.caddy` on the ingress
     # lighthouse; the connect_firewall worker renders mcnf-ingress.caddy into it.
     { source = "install-helpers/setup-caddy.sh",         dest = "/usr/libexec/mackesd/setup-caddy",             mode = "755" },
+    # MEDIA-pkg — ship the Lighthouse_Media bring-up script so the add-Media flow
+    # installs it (was scp'd by hand). It self-installs rclone/podman/fuse3 at run.
+    { source = "install-helpers/setup-media-navidrome.sh", dest = "/usr/libexec/mackesd/setup-media-navidrome", mode = "755" },
     # SUBSTRATE-14 — the etcd+Syncthing cutover entry point (operator runs it on
     # the VM bed to rehearse, then per fleet node at the 11.0 roll).
     { source = "install-helpers/cutover-substrate-v2.sh", dest = "/usr/libexec/mackesd/cutover-substrate-v2",    mode = "755" },
@@ -726,6 +729,9 @@ assets = [
     { source = "install-helpers/syncthing-reconcile.sh", dest = "/usr/libexec/mackesd/syncthing-reconcile",     mode = "755" },
     { source = "packaging/systemd/syncthing.service",    dest = "/etc/systemd/system/syncthing.service",        mode = "644" },
     { source = "install-helpers/setup-caddy.sh",         dest = "/usr/libexec/mackesd/setup-caddy",             mode = "755" },
+    # MEDIA-pkg — ship the Lighthouse_Media bring-up script so the add-Media flow
+    # installs it (was scp'd by hand). It self-installs rclone/podman/fuse3 at run.
+    { source = "install-helpers/setup-media-navidrome.sh", dest = "/usr/libexec/mackesd/setup-media-navidrome", mode = "755" },
     { source = "install-helpers/cutover-substrate-v2.sh", dest = "/usr/libexec/mackesd/cutover-substrate-v2",    mode = "755" },
     { source = "install-helpers/verify-boot-recovery.sh", dest = "/usr/libexec/mackesd/verify-boot-recovery",   mode = "755" },
     # SETUP-fix — the shared bus spool (tmpfiles + environment.d).
