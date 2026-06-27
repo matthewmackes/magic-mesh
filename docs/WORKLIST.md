@@ -2123,7 +2123,7 @@ Generalize the single hardcoded EdgeRouter (`172.20.0.1`, `infra/tofu/edgeos/`, 
   **Acceptance**:
     - [ ] discovery writes a per-node tfvars (`edgeos_host` + `router/<mac>` cred-ref); state in the per-appliance http backend `state/router/<mac>` (mirrors xen-xapi/zone1-do)
     - [ ] the existing DHCP converge still works under the generalized root
-- [ ] **ROUTER-7: firewall ruleset converge + commit-confirm.**
+- [✓] **ROUTER-7: firewall ruleset converge + commit-confirm.** (apply-firewall.sh converge engine + tofu null_resource + `firewall_rulesets` var; ADDITIVE — only named rulesets, never wipes the operator's; `commit-confirm <min>` auto-reverts on self-lockout + reachability recheck. tofu validate green. Live auto-revert verifies on first real rule. GUI typed-confirm/audit = ROUTER-10)
   **As** the operator, **I want** to edit firewall rules safely,
   **so that** a bad rule can't lock me out.
   **Acceptance**:

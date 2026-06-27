@@ -29,6 +29,27 @@ resource "null_resource" "dhcp_static_mappings" {
   }
 }
 
+# ROUTER-7 — converge the named firewall rulesets (apply-firewall.sh): additive
+# (only var.firewall_rulesets is managed) + applied inside a commit-confirm
+# window so a rule that locks us out auto-reverts. No-op when the map is empty.
+resource "null_resource" "firewall_rulesets" {
+  triggers = {
+    rulesets = jsonencode(var.firewall_rulesets)
+    script   = filemd5("${path.module}/scripts/apply-firewall.sh")
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/usr/bin/env", "bash"]
+    command     = "${path.module}/scripts/apply-firewall.sh"
+    environment = {
+      EDGEOS_HOST       = var.edgeos_host
+      EDGEOS_USER       = var.edgeos_user
+      EDGEOS_CRED_FILE  = var.edgeos_cred_file
+      EDGEOS_FW_DESIRED = jsonencode(var.firewall_rulesets)
+    }
+  }
+}
+
 # Poll the live DHCP leases (read-only) — surfaced as an output so
 # `tofu output dhcp_leases` is the "poll for DHCP addresses" command.
 data "external" "dhcp_leases" {

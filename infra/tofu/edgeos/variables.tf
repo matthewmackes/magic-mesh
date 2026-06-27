@@ -51,3 +51,18 @@ variable "static_mappings" {
     error_message = "Every static_mappings entry needs a colon-separated MAC and a dotted-quad IPv4."
   }
 }
+
+variable "firewall_rulesets" {
+  description = <<-EOT
+    ROUTER-7 — declarative EdgeOS/VyOS firewall rulesets MCNF manages, keyed by
+    ruleset name:
+      { "<name>": { "default-action": "drop|accept|reject", "description": "..",
+                    "rule": { "<num>": { "<attr>": "<val>", .. } } } }
+    ADDITIVE (§6): only the NAMED rulesets are converged (delete+recreate to
+    exact, inside a commit-confirm window so a self-lockout auto-reverts);
+    rulesets the operator authored elsewhere are left untouched. Empty (the
+    default) = manage nothing.
+  EOT
+  type        = any
+  default     = {}
+}
