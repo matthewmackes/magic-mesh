@@ -13,6 +13,24 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
+## [11.0.13] — 2026-06-27
+### Fixed
+- **Overlay-IP allocation is now mesh-global, not per-lighthouse — no more
+  collisions when a joined lighthouse signs.** `ca::sign::allocate_overlay_ip`
+  scanned only the **local** `nebula_peer_certs` table for the next free
+  `10.42.x.y`. A *joined* lighthouse's local store holds only the certs IT
+  signed, so it restarted at `10.42.0.1` and handed a brand-new node an IP
+  already in use mesh-wide — caught live in the 2026-06-27 migration: a node
+  enrolled via the new nyc3 lighthouse was assigned **10.42.0.1**, the founding
+  lighthouse's own IP. New `allocate_overlay_ip_excluding` also skips every
+  overlay IP already assigned per the shared **etcd peer directory** (passed by
+  the enroll path via `read_directory`), so every signing lighthouse allocates
+  from one global view. Founding self-sign + epoch rotation pass an empty set
+  (they run on the founder/leader with the full local store). This unblocks
+  retiring the founding lighthouse: the new lighthouses now enroll new nodes with
+  unique IPs. (A fully-atomic cross-lighthouse allocation — for two lighthouses
+  signing in the same instant — is a follow-up; sequential enroll is unaffected.)
+
 ## [11.0.12] — 2026-06-27
 ### Fixed
 - **A joined lighthouse now SERVES enrollment (`:4243` self-cert).** The turn-key

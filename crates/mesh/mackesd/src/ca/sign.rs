@@ -88,6 +88,7 @@ pub fn sign_peer_cert<B: NebulaCertBackend + ?Sized>(
     ca_key_path: &Path,
     crt_out: &Path,
     key_out: &Path,
+    extra_taken: &std::collections::HashSet<String>,
 ) -> Result<SignedPeer, CaError> {
     let active_epoch = active_epoch(conn, mesh_id)?
         .ok_or_else(|| CaError::Sql(format!("no active CA for mesh {mesh_id}")))?;
@@ -102,7 +103,7 @@ pub fn sign_peer_cert<B: NebulaCertBackend + ?Sized>(
     // idempotent and steers clear of the (overlay_ip, epoch) unique index.
     let allocated_ip = match existing_overlay_ip(conn, node_id, active_epoch)? {
         Some(ip) => ip,
-        None => allocate_overlay_ip(conn, active_epoch)?,
+        None => allocate_overlay_ip_excluding(conn, active_epoch, extra_taken)?,
     };
 
     let groups: &[&str] = match role {
@@ -209,7 +210,32 @@ pub fn active_epoch(conn: &Connection, mesh_id: &str) -> Result<Option<i64>, CaE
 /// epoch. Skips `.0` (network address) + `.255` (broadcast)
 /// on each /24 — keeps the allocation human-readable.
 pub fn allocate_overlay_ip(conn: &Connection, epoch: i64) -> Result<String, CaError> {
-    let taken = load_taken_ips(conn, epoch)?;
+    allocate_overlay_ip_excluding(conn, epoch, &std::collections::HashSet::new())
+}
+
+/// Like [`allocate_overlay_ip`], but also skips every IP in `extra_taken` — the
+/// overlay IPs already assigned MESH-WIDE per the shared etcd peer directory.
+///
+/// MULTI-LH-IP-ALLOC (caught live 2026-06-27): a JOINED lighthouse's local
+/// `nebula_peer_certs` table holds only the certs IT signed, so a local-only
+/// scan restarts at `10.42.0.1` and COLLIDES with the founding lighthouse's
+/// assignments — a node enrolled via a new lighthouse was handed `10.42.0.1`
+/// (lh1's own IP). The enroll path passes the directory's overlay IPs here so
+/// every signing lighthouse allocates from the same global view, not just its
+/// own store. (Concurrent signs on two lighthouses are still serialized by the
+/// operator's sequential enroll flow; a fully-atomic etcd allocation is a
+/// follow-up, tracked in the worklist.)
+///
+/// # Errors
+/// [`CaError::CidrExhausted`] when the whole /16 is allocated; [`CaError::Sql`]
+/// on a database read failure.
+pub fn allocate_overlay_ip_excluding(
+    conn: &Connection,
+    epoch: i64,
+    extra_taken: &std::collections::HashSet<String>,
+) -> Result<String, CaError> {
+    let mut taken = load_taken_ips(conn, epoch)?;
+    taken.extend(extra_taken.iter().cloned());
     for octet_b in 0u8..=255 {
         for octet_c in 1u8..=254 {
             let ip = format!("10.42.{octet_b}.{octet_c}");
@@ -369,6 +395,7 @@ mod tests {
             &tmp.path().join("ca.key"),
             &crt_out,
             &key_out,
+            &std::collections::HashSet::new(),
         )
         .expect("re-sign onto a stale output must succeed");
     }
@@ -431,6 +458,31 @@ mod tests {
     }
 
     #[test]
+    fn allocator_excluding_skips_global_directory_ips() {
+        // MULTI-LH-IP-ALLOC: a joined lighthouse's LOCAL store is empty, so a
+        // local-only scan hands out 10.42.0.1 — colliding with the founding
+        // lighthouse. Passing the mesh-wide assigned set (the etcd directory)
+        // makes it skip them and allocate the first GLOBALLY-free IP.
+        let conn = fresh_conn();
+        let _tmp = mint_one(&conn);
+        let global: std::collections::HashSet<String> = [
+            "10.42.0.1", "10.42.0.2", "10.42.0.3", "10.42.0.4", "10.42.0.5", "10.42.0.6",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let ip = allocate_overlay_ip_excluding(&conn, 0, &global).unwrap();
+        assert_eq!(
+            ip, "10.42.0.7",
+            "must skip every globally-assigned IP, not restart at .1"
+        );
+        // Sanity: with no global set it WOULD collide at .1 (the bug it fixes).
+        let bug =
+            allocate_overlay_ip_excluding(&conn, 0, &std::collections::HashSet::new()).unwrap();
+        assert_eq!(bug, "10.42.0.1");
+    }
+
+    #[test]
     fn resigning_a_node_is_idempotent_keeps_ip_and_upserts_row() {
         // Bed fix #8: signing the same node twice at the same epoch
         // (re-enroll / re-issue / auto-signer retry) must NOT collide on
@@ -455,6 +507,7 @@ mod tests {
             &ca_key,
             &crt_out,
             &key_out,
+            &std::collections::HashSet::new(),
         )
         .expect("first sign");
 
@@ -469,6 +522,7 @@ mod tests {
             &ca_key,
             &crt_out,
             &key_out,
+            &std::collections::HashSet::new(),
         )
         .expect("re-sign must succeed (upsert, not collide)");
 
@@ -501,6 +555,7 @@ mod tests {
             &ca_key,
             &crt,
             &key,
+            &std::collections::HashSet::new(),
         )
         .expect("sign");
         assert_eq!(signed.overlay_ip, "10.42.0.1");
@@ -537,6 +592,7 @@ mod tests {
             &ca_key,
             &crt,
             &key,
+            &std::collections::HashSet::new(),
         )
         .expect("sign host");
         assert!(signed.cert_pem.contains("groups=role:host"));
@@ -556,6 +612,7 @@ mod tests {
             &tmp.path().join("ca.key"),
             &tmp.path().join("peer.crt"),
             &tmp.path().join("peer.key"),
+            &std::collections::HashSet::new(),
         )
         .unwrap_err();
         assert!(matches!(err, CaError::Sql(_)));
@@ -576,6 +633,7 @@ mod tests {
             &tmp.path().join("ca.key"),
             &tmp.path().join("peer.crt"),
             &tmp.path().join("peer.key"),
+            &std::collections::HashSet::new(),
         )
         .expect("sign");
         let mode = std::fs::metadata(&signed.key_path)

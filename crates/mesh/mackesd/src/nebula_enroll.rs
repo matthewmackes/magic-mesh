@@ -791,6 +791,25 @@ pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
     // make nebula-cert refuse to overwrite. That clearing now lives inside
     // sign_peer_cert (the single signer funnel — covers this path AND the
     // mesh-init self-sign), so no removal is needed here.
+    //
+    // MULTI-LH-IP-ALLOC — collect every overlay IP already assigned MESH-WIDE
+    // from the shared peer directory (etcd, fs fallback) and hand it to the
+    // signer. A JOINED lighthouse's local cert-store only knows the certs IT
+    // signed, so without this it re-allocates from 10.42.0.1 and collides with
+    // the founding lighthouse's assignments (caught live 2026-06-27: a node
+    // enrolled via a new lighthouse was handed 10.42.0.1, lh1's own IP). The
+    // directory is the SUBSTRATE-V2 source of truth for who holds which IP.
+    let directory_taken: std::collections::HashSet<String> =
+        crate::substrate::peers::read_directory(workgroup_root)
+            .into_iter()
+            .filter_map(|p| {
+                p.overlay_ip
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|ip| !ip.is_empty())
+                    .map(String::from)
+            })
+            .collect();
     let signed = crate::ca::sign::sign_peer_cert(
         backend,
         conn,
@@ -805,6 +824,7 @@ pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
         &paths.ca_key,
         &crt_out,
         &key_out,
+        &directory_taken,
     )
     .map_err(|e| SignCsrError::SignFailed {
         reason: e.to_string(),

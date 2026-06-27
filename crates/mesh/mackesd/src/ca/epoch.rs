@@ -157,6 +157,9 @@ pub fn bump_epoch_into<B: NebulaCertBackend>(
         // valid.)
         match sign::sign_peer_cert(
             backend, conn, mesh_id, node_id, role, crt, key, &crt_out, &key_out,
+            // Rotation reuses each peer's existing overlay IP + runs on the
+            // leader with the full local store — no global directory guard needed.
+            &std::collections::HashSet::new(),
         ) {
             Ok(signed) => {
                 re_signed += 1;

@@ -691,6 +691,7 @@ mod tests {
                 &lighthouse_root.join("ca.key"),
                 &lighthouse_root.join("scratch/lh.crt"),
                 &lighthouse_root.join("scratch/lh.key"),
+                &std::collections::HashSet::new(),
             )
             .expect("seed lighthouse self-cert at .1");
         }

@@ -99,6 +99,9 @@ pub fn mesh_init<B: NebulaCertBackend>(
         ca_key,
         &crt_out,
         &key_out,
+        // Founding self-sign: this IS the first node; its store is empty and it
+        // correctly takes 10.42.0.1. No global directory yet — empty guard.
+        &std::collections::HashSet::new(),
     )
     .map_err(|e| anyhow::anyhow!("mesh-init step 3 (self-sign): {e}"))?;
     let epoch = crate::ca::sign::active_epoch(conn, mesh_id)
