@@ -2072,3 +2072,62 @@ clean+reachable smoke); visual gate lifted.
   **Acceptance**:
     - [✓] the new Front Door reaches parity with + replaces the old `mde-workbench` launcher; old launcher code removed; guided first-run auto-builds tiles from the mesh
     - [✓] DoD: builds + `cargo test` + clippy green, `mde-theme` tokens only (§4), `lint-mesh-boundary.sh` clean (§6); both modes launch and a DevOps + a Data Center action execute end-to-end (reachable smoke, §7)
+
+## ROUTER-CONTROL — per-node Vyatta-CLI router/firewall discovery + control (operator 2026-06-27; design: docs/design/router-control.md)
+
+Generalize the single hardcoded EdgeRouter (`172.20.0.1`, `infra/tofu/edgeos/`, `unifi-cred`) into a per-node, auto-discovered **Vyatta-CLI** (EdgeRouter/EdgeOS; VyOS rides the same CLI) router-control plane. Vendor scope is **Vyatta CLI only** — no UniFi-OS, no REST APIs. **Read slice first**, mutations fast-follow.
+
+### Phase 1 — Read slice (discover → fingerprint → cred-match → read)
+
+- [ ] **ROUTER-1: per-node default-route + LAN-appliance discovery.**
+  **As** a node operator, **I want** each node to find the router/firewall it sits behind,
+  **so that** I don't hand-configure `MCNF_UNIFI_HOST` per node.
+  **Acceptance** (runtime-observable):
+    - [ ] a per-node mackesd source resolves the lowest-metric default route via `netassess::parse_default_gateway` + enumerates `surrounding_hosts` router-typed LAN appliances
+    - [ ] each candidate's MAC is resolved (ARP/`ip neigh`) as the stable `<id>` and emitted to the router-registry
+    - [ ] runs always-on per-node (not leader-gated); a node with no router emits nothing (safe no-op)
+- [ ] **ROUTER-2: layered Vyatta fingerprint.**
+  **As** the mesh, **I want** to classify a discovered appliance,
+  **so that** only Vyatta-CLI devices are offered controls.
+  **Acceptance**:
+    - [ ] passive pass (MAC-OUI + SSH banner) tags likely-router; when a `router/<mac>` cred exists, an active `show version` over SSH confirms `EdgeOS`/`UBNT` vs `VyOS`
+    - [ ] non-Vyatta or unfingerprintable appliances are marked `unmanaged / unknown-vendor`
+- [ ] **ROUTER-3: per-appliance credential `router/<mac>` + operator seal.**
+  **As** the operator, **I want** to seal a router's creds once,
+  **so that** the node can manage it without inventing creds.
+  **Acceptance**:
+    - [ ] `mackesd secret put router/<mac>` + a GUI cred form seal a `user:pass` body into the age-encrypted mesh secret store (reuses the `xcp/<host>` keying); agent never invents creds
+    - [ ] an appliance with no sealed cred shows `unmanaged — needs credentials`; sealing flips it to managed + populates `show version`
+- [ ] **ROUTER-4: router-registry (bus + QNM-Shared).**
+  **As** the GUI, **I want** a fleet view of every node's appliance,
+  **so that** I see all routers at once.
+  **Acceptance**:
+    - [ ] per-node publish to Bus `mesh/devices/router/<mac>` + QNM-Shared `<workgroup_root>/<node>/router-registry.json` (on-change + heartbeat), mirroring `media_registry`
+    - [ ] entries carry id(MAC)/ip/vendor/version/managed-state/node
+- [ ] **ROUTER-5: Router panel — read view.**
+  **As** the operator, **I want** a dedicated Router panel,
+  **so that** I can see each node's appliance + its live state.
+  **Acceptance**:
+    - [ ] new `router` panel wired (app.rs/model.rs/panels/mod.rs), Carbon tokens (§4), one card per discovered appliance via `action/router/*` read RPCs
+    - [ ] shows status/version/interfaces + DHCP reservations & live leases (reuse `edgeos` `poll-leases.sh`); unmanaged appliances show the cred prompt
+    - [ ] DoD: builds + `cargo test` + clippy green, `lint-mesh-boundary.sh` clean (§6), panel launches and lists the live EdgeRouter
+
+### Phase 2 — Mutations (fast-follow; tofu-as-code + commit-confirm)
+
+- [ ] **ROUTER-6: generalize the edgeos tofu root → per-appliance.**
+  **As** the mesh, **I want** per-appliance router IaC,
+  **so that** each node's router converges independently.
+  **Acceptance**:
+    - [ ] discovery writes a per-node tfvars (`edgeos_host` + `router/<mac>` cred-ref); state in the per-appliance http backend `state/router/<mac>` (mirrors xen-xapi/zone1-do)
+    - [ ] the existing DHCP converge still works under the generalized root
+- [ ] **ROUTER-7: firewall ruleset converge + commit-confirm.**
+  **As** the operator, **I want** to edit firewall rules safely,
+  **so that** a bad rule can't lock me out.
+  **Acceptance**:
+    - [ ] a `null_resource` converge script edits Vyatta firewall rulesets (converge-to-exact, like DHCP), wrapped in `commit-confirm <min>` auto-rollback + typed-confirm + a hash-chain audit row
+    - [ ] an un-reconfirmed edit auto-reverts on the live router
+- [ ] **ROUTER-8: port-forward / NAT converge.** (same converge + commit-confirm gating; destination-NAT rules read+edit)
+- [ ] **ROUTER-9: VPN endpoint converge.** (same gating; manage the router's VPN endpoint config — site-to-site / road-warrior server)
+- [ ] **ROUTER-10: reboot + Router-panel mutate controls.**
+  **Acceptance**:
+    - [ ] confirm-gated reboot via direct SSH (not tofu); the Router panel wires firewall/port-forward/VPN/reboot through `action/router/*` with the typed-confirm pattern; DoD green
