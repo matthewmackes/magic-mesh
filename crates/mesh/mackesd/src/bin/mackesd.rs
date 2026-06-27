@@ -6463,6 +6463,25 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("compute_registry".into());
 
+        // ROUTER-3/4 — per-node, always-on router-registry: discover the node's
+        // primary router/firewall (lowest-metric default route + gateway MAC),
+        // cred-match `router/<mac>` + Vyatta `show version` fingerprint, and
+        // publish a RouterEntry to mesh/devices/router/<mac> + the QNM-Shared
+        // <host>/router-registry.json. Unconditional (any node may sit behind a
+        // router); a node with no default route is a safe no-op.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::router_registry::RouterRegistryWorker::new(
+                node_id.clone(),
+                fw_host.clone(),
+            )
+            .with_mount(workgroup_root.clone()),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("router_registry".into());
+
         // MEDIA-7 — register the navidrome/media service into the mesh service
         // registry. Capability-gated via runs_in("navidrome", deploy_class): it
         // runs ONLY on a Lighthouse_Media node (MEDIA-1's Capability::Media) and

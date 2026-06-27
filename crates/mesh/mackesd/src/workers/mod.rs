@@ -238,6 +238,12 @@ pub mod selinux_monitor;
 // `compute/inventory/<peer-nebula-addr>` per docs/design/v5.0.0-
 // compute.md §3. Silent no-op when virsh/podman are absent.
 pub mod compute_registry;
+// ROUTER-3/4 — the router_registry worker: per-node + always-on. Discovers the
+// node's primary router/firewall (lowest-metric default route + gateway MAC),
+// matches a sealed `router/<mac>` cred + fingerprints it over the Vyatta CLI,
+// and publishes a RouterEntry to `mesh/devices/router/<mac>` + the QNM-Shared
+// `<host>/router-registry.json`. Design: docs/design/router-control.md.
+pub mod router_registry;
 // MEDIA-7 — the media_registry worker: on a Lighthouse_Media node only
 // (capability-gated on MEDIA-1's Capability::Media), register the local
 // navidrome/media instance into the mesh service registry — the per-peer

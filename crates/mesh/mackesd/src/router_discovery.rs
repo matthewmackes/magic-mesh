@@ -37,6 +37,7 @@ impl RouterVendor {
         )
     }
 
+    /// Stable lowercase tag for this vendor (the registry/JSON `vendor` field).
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -67,6 +68,40 @@ impl RouterCandidate {
     #[must_use]
     pub fn cred_ref(&self) -> String {
         format!("router/{}", self.mac)
+    }
+}
+
+/// A router entry as published to the mesh registry (Bus `mesh/devices/router/<id>`
+/// + the replicated QNM-Shared `<host>/router-registry.json`). The GUI Router
+/// panel (ROUTER-5) reads this shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RouterEntry {
+    /// Gateway MAC — the stable id (the `router/<id>` key).
+    pub id: String,
+    /// Management IP.
+    pub ip: String,
+    /// The node this appliance sits behind (`peer:<host>`).
+    pub node_id: String,
+    /// Fingerprinted vendor/OS ([`RouterVendor::as_str`]).
+    pub vendor: String,
+    /// First line of `show version` when managed + reachable; else empty.
+    pub version: String,
+    /// A `router/<id>` credential is sealed for this appliance.
+    pub managed: bool,
+    /// Discovered but no credential sealed yet (surfaced read-only, lock #4).
+    pub needs_creds: bool,
+    /// This is the node's primary (lowest-metric) default-route appliance.
+    pub is_default: bool,
+}
+
+/// Parse a stored `router/<id>` credential. `"user:pass"` (split on the first
+/// `:`) or a bare password (factory default user `ubnt` assumed). Both trimmed.
+#[must_use]
+pub fn parse_router_cred(raw: &str) -> (String, String) {
+    let raw = raw.trim();
+    match raw.split_once(':') {
+        Some((user, pass)) => (user.trim().to_string(), pass.trim().to_string()),
+        None => ("ubnt".to_string(), raw.to_string()),
     }
 }
 
@@ -267,5 +302,37 @@ mod tests {
             oui_hint: Some("ubiquiti".into()),
         };
         assert_eq!(c.cred_ref(), "router/46:6a:7c:96:e8:aa");
+    }
+
+    #[test]
+    fn parse_router_cred_splits_user_pass() {
+        assert_eq!(
+            parse_router_cred("ubnt:hunter2"),
+            ("ubnt".into(), "hunter2".into())
+        );
+        // bare password → default user ubnt
+        assert_eq!(parse_router_cred(" s3cret "), ("ubnt".into(), "s3cret".into()));
+        // password may contain ':'
+        assert_eq!(
+            parse_router_cred("vyos:a:b:c"),
+            ("vyos".into(), "a:b:c".into())
+        );
+    }
+
+    #[test]
+    fn router_entry_json_roundtrips() {
+        let e = RouterEntry {
+            id: "46:6a:7c:96:e8:aa".into(),
+            ip: "172.20.0.1".into(),
+            node_id: "peer:eagle".into(),
+            vendor: "edgeos".into(),
+            version: "EdgeOS ER-8".into(),
+            managed: true,
+            needs_creds: false,
+            is_default: true,
+        };
+        let body = serde_json::to_string(&e).unwrap();
+        let back: RouterEntry = serde_json::from_str(&body).unwrap();
+        assert_eq!(back, e);
     }
 }
