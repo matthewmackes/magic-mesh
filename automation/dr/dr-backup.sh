@@ -94,5 +94,34 @@ OUT="$DR_DIR/dr-$TS.age"
 printf %s "$MANIFEST" | age -r "$RECIP" >"$OUT"
 chmod 600 "$OUT"
 
+# ── DATACENTER-23 / MIG-3 — Nebula CA backup + off-fleet push ───────────────
+# The Nebula CA is the one master artifact the manifest above can NOT carry
+# safely. Back it up age-encrypted to the mesh recipient (recoverable with the
+# mesh age IDENTITY, which the operator keeps OFFLINE — that identity is the only
+# thing that stays off this path). Runs only where the CA actually lives (a CA-
+# holding lighthouse); on a non-CA node CA_OUT stays empty.
+CA_KEY="${MCNF_NEBULA_CA_KEY:-/var/lib/mackesd/nebula-ca/ca.key}"
+CA_OUT=""
+if [ -f "$CA_KEY" ]; then
+  CA_OUT="$DR_DIR/nebula-ca-$TS.age"
+  if age -r "$RECIP" <"$CA_KEY" >"$CA_OUT" 2>/dev/null; then chmod 600 "$CA_OUT"; else CA_OUT=""; fi
+fi
+
+# Push OFF-FLEET when a remote is configured (e.g.
+# MCNF_DR_REMOTE=mcnf-spaces:mcnf-dr-4533) so a total XCP/DO-fleet loss is
+# recoverable. Opt-in: unset → backup stays local (no behaviour change).
+if [ -n "${MCNF_DR_REMOTE:-}" ] && command -v rclone >/dev/null 2>&1; then
+  if rclone copy "$OUT" "$MCNF_DR_REMOTE/" 2>/dev/null; then
+    echo "off-fleet: pushed $(basename "$OUT") → $MCNF_DR_REMOTE" >&2
+  else
+    echo "off-fleet: rclone push of $(basename "$OUT") FAILED (kept local)" >&2
+  fi
+  if [ -n "$CA_OUT" ] && rclone copy "$CA_OUT" "$MCNF_DR_REMOTE/" 2>/dev/null; then
+    echo "off-fleet: pushed $(basename "$CA_OUT") → $MCNF_DR_REMOTE" >&2
+  fi
+else
+  echo "off-fleet: MCNF_DR_REMOTE unset (or rclone missing) — backup kept LOCAL at $DR_DIR" >&2
+fi
+
 echo "$OUT"
-echo "NOTE: the mesh age key ($KEY) + the Nebula CA must be backed up SEPARATELY/securely — the master key cannot live only inside the thing it decrypts." >&2
+echo "NOTE: the mesh age key ($KEY) is the master key — keep it backed up SEPARATELY + OFFLINE (it cannot live inside the thing it decrypts). The Nebula CA is now captured age-encrypted when this runs on a CA holder." >&2
