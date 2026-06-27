@@ -2171,3 +2171,29 @@ The rethink is a **consolidation**: merge the standalone `mde-apps-applet` into 
   **As** the project, **I want** one launcher binary, **so that** there's no fork.
   **Acceptance**:
     - [ ] at feature-parity, the Start button/`event/apps/toggle` repoints to the Front Door; `mde-apps-applet` is removed (RPM asset + autostart + crate bin) with nothing referencing it; lint-mesh-boundary clean; the lighthouse-health `mde-cosmic-applet` is untouched
+
+## MESHMAP — EtherApe-like global mesh-map wallpaper (survey 2026-06-27; design: docs/design/mesh-map-wallpaper.md)
+
+Turn the static topology wallpaper (`mde-mesh-wallpaper`) into an animated global-mesh-traffic map: nodes placed geographically, per-direction packet-particle trails colored by the sending node, intensity from each node's collected data; zero-CPU idle.
+
+- [ ] **MESHMAP-1: geographic node placement + faint map backdrop.**
+  **As** an operator, **I want** the mesh drawn by geography, **so that** the wallpaper maps the *global* mesh.
+  **Acceptance**:
+    - [ ] each node projected to lat/long from its DO region (zone1-do tofu) or netassess public-IP geo (offline geoIP table / region centroids — no network call); faint Carbon-toned world/region backdrop; force-layout fallback when geo unknown
+- [ ] **MESHMAP-2: stable per-node hue + presence + labels.**
+  **Acceptance**:
+    - [ ] `hue = hash(hostname)` gives each node a deterministic distinct color (Carbon S/L); node carries a presence ring (online/idle/offline) + hostname label
+- [ ] **MESHMAP-3: per-direction packet-particle traffic, colored by sender.**
+  **As** an operator, **I want** to see who's talking to whom, **so that** the wallpaper shows live mesh traffic.
+  **Acceptance**:
+    - [ ] each edge animates TWO particle streams (one per direction), each colored by that direction's sender hue; density+speed ∝ the sender's Netdata `system.net` throughput (reuse `sample_flows`); enables the currently-disabled MapProgram particles
+- [ ] **MESHMAP-4: relay paths bend through the lighthouse.**
+  **Acceptance**:
+    - [ ] a `NebulaRelay` path (mesh_router `PeerPath.primary`) draws as two segments via the relaying lighthouse node; direct paths straight
+- [ ] **MESHMAP-5: zero-CPU idle + reduce-motion + cadence.**
+  **Acceptance**:
+    - [ ] particle ticks gated on `has_flow()` (zero ticks at rest); roster/geo refresh 30s AC / 5min battery; reduce-motion → static colored edges (no particles); Carbon tokens only (§4), ≤3Hz
+- [ ] **MESHMAP-6 (Phase 2): real per-link byte counters.**
+  **As** the map, **I want** true per-link volume, **so that** intensity isn't a per-node proxy.
+  **Acceptance**:
+    - [ ] a mackesd collector reads per-peer-IP byte counters (nftables accounting / Nebula stats) → real per-link traffic published for the wallpaper to consume, replacing the per-node-throughput proxy (MESHMAP-3)
