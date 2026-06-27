@@ -1,0 +1,14 @@
+# DATACENTER-23 — schedule for the off-fleet DR backup (see mcnf-dr-backup.service).
+# Daily, with a randomized delay so it never stampedes, and Persistent so a
+# missed run (host off) fires on next boot.
+
+[Unit]
+Description=MCNF DR — daily off-fleet control-plane backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=1800
+Persistent=true
+
+[Install]
+WantedBy=timers.target
