@@ -61,7 +61,7 @@ impl HostOpsService {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 12] = [
+pub const ACTION_VERBS: [&str; 14] = [
     "host-power",
     // DATACENTER-10 — the Hosts tab's impact preview + pool read.
     "host-impact",
@@ -79,6 +79,9 @@ pub const ACTION_VERBS: [&str; 12] = [
     "gateway-dhcp",
     // ROUTER-3 — seal a per-appliance router credential (router/<mac>) into the mesh store.
     "router-seal-cred",
+    // DATACENTER-21 — ephemeral test-mesh (list) + build-farm autoscale (reconcile/plan, no apply).
+    "testbed-list",
+    "farm-scale",
 ];
 
 /// Responder poll interval.
@@ -1225,6 +1228,68 @@ fn router_seal_cred(req_body: Option<&str>) -> Result<(), String> {
     }
 }
 
+/// One ephemeral test VM (DATACENTER-21): name + IP from `farm-testbed.sh ips`.
+#[derive(serde::Serialize)]
+struct TestVm {
+    name: String,
+    ip: String,
+}
+
+/// Parse `farm-testbed.sh ips` output ("name ip" per line) into rows. Pure.
+#[must_use]
+fn parse_testbed_ips(stdout: &str) -> Vec<TestVm> {
+    stdout
+        .lines()
+        .filter_map(|l| {
+            let mut p = l.split_whitespace();
+            let name = p.next()?.to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let ip = p.next().unwrap_or("").to_string();
+            Some(TestVm { name, ip })
+        })
+        .collect()
+}
+
+/// Run a repo-root-relative helper script (the responder's CWD is the repo root,
+/// like the unifi-cred path). Returns stdout on success, a trimmed error else.
+fn run_repo_script(cmd: &str) -> Result<String, String> {
+    let o = std::process::Command::new("bash")
+        .args(["-lc", cmd])
+        .output()
+        .map_err(|e| format!("exec failed: {e}"))?;
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    if o.status.success() {
+        Ok(out)
+    } else {
+        let err = String::from_utf8_lossy(&o.stderr);
+        let msg = if out.trim().is_empty() {
+            err.trim()
+        } else {
+            out.trim()
+        };
+        Err(if msg.is_empty() {
+            "script failed".into()
+        } else {
+            msg.to_string()
+        })
+    }
+}
+
+/// DATACENTER-21 — list the running ephemeral test VMs (`farm-testbed.sh ips`).
+fn testbed_list() -> Result<Vec<TestVm>, String> {
+    Ok(parse_testbed_ips(&run_repo_script(
+        "automation/testbed/farm-testbed.sh ips",
+    )?))
+}
+
+/// DATACENTER-21 — run the build-farm autoscale reconcile (writes the demand-based
+/// shape + `tofu plan`; NEVER applies — operator-gated). Returns the plan/decision text.
+fn farm_scale() -> Result<String, String> {
+    run_repo_script("install-helpers/farm-autoscale.sh")
+}
+
 /// Build the reply for one `action/dc/<verb>` request.
 #[must_use]
 pub fn build_reply(svc: &HostOpsService, verb: &str, req_body: Option<&str>) -> String {
@@ -1263,6 +1328,20 @@ pub fn build_reply(svc: &HostOpsService, verb: &str, req_body: Option<&str>) -> 
         "router-seal-cred" => {
             return match router_seal_cred(req_body) {
                 Ok(()) => json!({ "ok": true }).to_string(),
+                Err(m) => err(m),
+            };
+        }
+        // DATACENTER-21 — list ephemeral test VMs.
+        "testbed-list" => {
+            return match testbed_list() {
+                Ok(vms) => json!({ "ok": true, "vms": vms }).to_string(),
+                Err(m) => err(m),
+            };
+        }
+        // DATACENTER-21 — autoscale reconcile (plan only, never applies).
+        "farm-scale" => {
+            return match farm_scale() {
+                Ok(plan) => json!({ "ok": true, "plan": plan }).to_string(),
                 Err(m) => err(m),
             };
         }
@@ -1476,6 +1555,21 @@ mod tests {
         assert!(router_seal_cred(Some("{bad json")).is_err());
         assert!(router_seal_cred(Some(r#"{"mac":"nothex","cred":"u:p"}"#)).is_err());
         assert!(router_seal_cred(Some(r#"{"mac":"46:6a:7c:96:e8:aa","cred":"  "}"#)).is_err());
+    }
+
+    #[test]
+    fn testbed_farmscale_verbs_and_parse() {
+        assert!(ACTION_VERBS.contains(&"testbed-list"));
+        assert!(ACTION_VERBS.contains(&"farm-scale"));
+        assert_eq!(action_topic("farm-scale"), "action/dc/farm-scale");
+        let vms = parse_testbed_ips("mcnf-test-1 172.20.0.61\nmcnf-test-2 172.20.0.62\n\n   \n");
+        assert_eq!(vms.len(), 2);
+        assert_eq!(vms[0].name, "mcnf-test-1");
+        assert_eq!(vms[0].ip, "172.20.0.61");
+        // a name with no IP still parses (ip empty), blank lines skipped
+        let solo = parse_testbed_ips("solo\n");
+        assert_eq!(solo.len(), 1);
+        assert_eq!(solo[0].ip, "");
     }
 
     #[test]

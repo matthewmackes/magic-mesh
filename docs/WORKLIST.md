@@ -1915,7 +1915,7 @@ the plane and it **survives killing the current zone leader**.
   the prod-arm gate.*
   **Acceptance**:
     - [>] auto-promote on green L1–L3 Build→Eagle; DO step gated by the prod-arm switch (armed=auto, disarmed=queued); version matrix reflects each stage — *version matrix (strip + worker) done; auto-promote + prod-arm pending*
-- [ ] **DATACENTER-21: ephemeral test-mesh + build-farm scaling flows.**
+- [>] **DATACENTER-21: ephemeral test-mesh + build-farm scaling flows.** _(backend read/plan verbs DONE: `action/dc/testbed-list` (farm-testbed.sh ips) + `action/dc/farm-scale` (farm-autoscale.sh reconcile→tofu-plan, no apply) in host_ops, tested. REMAINING: testbed-up (async clone) + testbed-down (confirm-gated destroy) verbs + the provisioning-panel UI.)_
   **Acceptance**:
     - [ ] one-click spin/teardown of an N-node test mesh from the golden template (hermetic, wraps `farm-testbed.sh`); a scale control adjusts build-VM count via Tofu
 
