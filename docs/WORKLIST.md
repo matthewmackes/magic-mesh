@@ -2080,7 +2080,7 @@ Generalize the single hardcoded EdgeRouter (`172.20.0.1`, `infra/tofu/edgeos/`, 
 
 ### Phase 1 — Read slice (discover → fingerprint → cred-match → read)
 
-**Phase 1 delivered 2026-06-27** (commits 1dabe28 / 13a583a / da25cf7; farm build+tests GREEN). Runtime-reachable: mackesd's always-on `router_registry` worker discovers each node's primary default-route appliance, cred-matches `router/<mac>`, fingerprints it (Vyatta `show version`), and publishes to `mesh/devices/router/<mac>` + the QNM-Shared `router-registry.json`; the Mesh → Routers panel unions + renders them. **Honest follow-ons folded into Phase 2:** (a) LAN-appliance enumeration beyond the primary default-route hop (`surrounding_hosts`); (b) GUI cred-seal form (CLI `mackesd secret put router/<mac>` works today); (c) in-panel DHCP reservations/leases (needs the per-appliance tofu read — ROUTER-6).
+**Phase 1 delivered 2026-06-27** (commits 1dabe28 / 13a583a / da25cf7; farm build+tests GREEN). Runtime-reachable: mackesd's always-on `router_registry` worker discovers each node's primary default-route appliance, cred-matches `router/<mac>`, fingerprints it (Vyatta `show version`), and publishes to `mesh/devices/router/<mac>` + the QNM-Shared `router-registry.json`; the Mesh → Routers panel unions + renders them. **Honest follow-ons:** (a) LAN-appliance enumeration beyond the primary default-route hop (`surrounding_hosts`); (b) ✓ **DONE** — GUI cred-seal form (Router panel seal button → `action/dc/router-seal-cred`, commits 5c21eaf + the panel); (c) in-panel DHCP reservations/leases (needs the per-appliance tofu read — ROUTER-6).
 
 - [✓] **ROUTER-1: per-node default-route + LAN-appliance discovery.** (default-route hop + gateway-MAC done; LAN-appliance enumeration → Phase 2)
   **As** a node operator, **I want** each node to find the router/firewall it sits behind,
@@ -2095,7 +2095,7 @@ Generalize the single hardcoded EdgeRouter (`172.20.0.1`, `infra/tofu/edgeos/`, 
   **Acceptance**:
     - [ ] passive pass (MAC-OUI + SSH banner) tags likely-router; when a `router/<mac>` cred exists, an active `show version` over SSH confirms `EdgeOS`/`UBNT` vs `VyOS`
     - [ ] non-Vyatta or unfingerprintable appliances are marked `unmanaged / unknown-vendor`
-- [✓] **ROUTER-3: per-appliance credential `router/<mac>` + operator seal.** (CLI seal + cred-match + needs-creds state done; GUI seal-form → Phase 2)
+- [✓] **ROUTER-3: per-appliance credential `router/<mac>` + operator seal.** (CLI seal + cred-match + needs-creds state + **GUI seal-form** all done — Router panel seal button → `action/dc/router-seal-cred` handler → mesh store)
   **As** the operator, **I want** to seal a router's creds once,
   **so that** the node can manage it without inventing creds.
   **Acceptance**:

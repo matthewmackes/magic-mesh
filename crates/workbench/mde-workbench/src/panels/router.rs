@@ -9,9 +9,9 @@
 //! "needs credentials" badge (lock #4). Mutating controls (firewall/port-forward/
 //! VPN/reboot) land in Phase 2 (ROUTER-6..10).
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
+use cosmic::iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
 use cosmic::iced::{Background, Border, Color, Length, Padding, Task};
 use cosmic::Theme;
 
@@ -56,12 +56,24 @@ pub struct RouterPanel {
     pub error: Option<String>,
     pub last_run_at: Option<SystemTime>,
     pub busy: bool,
+    /// Shared "user:pass" buffer the operator types to seal an unmanaged appliance.
+    pub cred_input: String,
+    /// Appliance id (MAC) whose seal RPC is in flight.
+    pub sealing: Option<String>,
+    /// Last seal outcome: (message, is_error).
+    pub seal_msg: Option<(String, bool)>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Loaded(Result<Vec<RouterRow>, String>),
     RefreshClicked,
+    /// Operator edited the shared "user:pass" seal field.
+    CredInput(String),
+    /// Seal the shared cred into `router/<mac>` for this appliance.
+    SealClicked(String),
+    /// Seal RPC returned (Ok message / Err message).
+    SealDone(Result<String, String>),
 }
 
 impl RouterPanel {
@@ -102,6 +114,38 @@ impl RouterPanel {
             Message::RefreshClicked => {
                 self.busy = true;
                 Self::load()
+            }
+            Message::CredInput(v) => {
+                self.cred_input = v;
+                Task::none()
+            }
+            Message::SealClicked(mac) => {
+                let cred = self.cred_input.trim().to_string();
+                if cred.is_empty() {
+                    self.seal_msg = Some(("enter user:pass in the seal field first".into(), true));
+                    return Task::none();
+                }
+                self.sealing = Some(mac.clone());
+                self.seal_msg = None;
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || seal_router_cred(&mac, &cred))
+                            .await
+                            .unwrap_or_else(|_| Err("seal task panicked".into()))
+                    },
+                    |r| crate::Message::Router(Message::SealDone(r)),
+                )
+            }
+            Message::SealDone(Ok(_)) => {
+                self.sealing = None;
+                self.cred_input.clear(); // don't retain the password in panel memory
+                self.seal_msg = Some(("sealed — refreshing".into(), false));
+                Self::load()
+            }
+            Message::SealDone(Err(e)) => {
+                self.sealing = None;
+                self.seal_msg = Some((format!("seal failed: {e}"), true));
+                Task::none()
             }
         }
     }
@@ -182,12 +226,84 @@ impl RouterPanel {
             .colr(palette.text_muted.into_cosmic_color())
             .into()
         } else {
-            let blocks: Vec<Element<'_, crate::Message>> =
-                self.rows.iter().map(|r| row_view(r, palette, sizes)).collect();
+            let sealing = self.sealing.clone();
+            let blocks: Vec<Element<'_, crate::Message>> = self
+                .rows
+                .iter()
+                .map(|r| {
+                    let card = row_view(r, palette, sizes);
+                    if !r.needs_creds {
+                        return card;
+                    }
+                    let busy = sealing.as_deref() == Some(r.id.as_str());
+                    let accent = palette.accent.into_cosmic_color();
+                    let id = r.id.clone();
+                    let seal = button(
+                        text(if busy { "Sealing…" } else { "Seal cred" })
+                            .size(12)
+                            .colr(Color::WHITE),
+                    )
+                    .padding(Padding::from([4u16, 12u16]))
+                    .sty(move |_t: &Theme, _s: cosmic::iced::widget::button::Status| {
+                        cosmic::iced::widget::button::Style {
+                            snap: false,
+                            background: Some(Background::Color(accent)),
+                            icon_color: None,
+                            text_color: Color::WHITE,
+                            border_radius: 6.0.into(),
+                            border_width: 0.0,
+                            border_color: Color::TRANSPARENT,
+                            border: Border {
+                                color: Color::TRANSPARENT,
+                                width: 0.0,
+                                radius: 6.0.into(),
+                            },
+                            shadow: cosmic::iced::Shadow::default(),
+                        }
+                    })
+                    .on_press(crate::Message::Router(Message::SealClicked(id)));
+                    let hint = text(format!("→ seals router/{} from the field above", r.id))
+                        .size(TypeRole::Caption.size_in(sizes))
+                        .colr(palette.text_muted.into_cosmic_color());
+                    column![
+                        card,
+                        row![hint, Space::new().width(Length::Fill), seal]
+                            .spacing(8)
+                            .align_y(cosmic::iced::alignment::Vertical::Center)
+                    ]
+                    .spacing(2)
+                    .into()
+                })
+                .collect();
             scrollable(column(blocks).spacing(6)).into()
         };
 
-        let page = column![header, row![subtitle], Space::new().height(12), body].spacing(4);
+        let seal_field = row![
+            text("Seal cred (user:pass):")
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(palette.text_muted.into_cosmic_color()),
+            text_input("e.g. ubnt:password", &self.cred_input)
+                .on_input(|v| crate::Message::Router(Message::CredInput(v)))
+                .width(Length::FillPortion(2)),
+        ]
+        .spacing(8)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+        let seal_status: Element<'_, crate::Message> = match &self.seal_msg {
+            Some((m, is_err)) => text(m.clone())
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr((if *is_err { palette.danger } else { palette.success }).into_cosmic_color())
+                .into(),
+            None => Space::new().into(),
+        };
+        let page = column![
+            header,
+            row![subtitle],
+            seal_field,
+            seal_status,
+            Space::new().height(12),
+            body
+        ]
+        .spacing(4);
 
         let surface_color = palette.surface.into_cosmic_color();
         container(page)
@@ -347,6 +463,45 @@ fn fetch_routers() -> Result<Vec<RouterRow>, String> {
             .or_insert(rowd);
     }
     Ok(by_id.into_values().collect())
+}
+
+/// Seal the operator-typed `user:pass` into `router/<mac>` via the mackesd
+/// `action/dc/router-seal-cred` Bus RPC (so it lands in the MESH secret store,
+/// not this GUI host's local store). Mirrors `datacenter::vm_power`'s round trip;
+/// called inside `spawn_blocking` (it builds its own current-thread runtime).
+fn seal_router_cred(mac: &str, cred: &str) -> Result<String, String> {
+    let Some(dir) = mde_bus::default_data_dir() else {
+        return Err("no Bus data dir".to_string());
+    };
+    let body = serde_json::json!({ "mac": mac, "cred": cred }).to_string();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    let reply = rt.block_on(async {
+        let persist = mde_bus::persist::Persist::open(dir).map_err(|e| e.to_string())?;
+        mde_bus::rpc::request(
+            &persist,
+            "action/dc/router-seal-cred",
+            mde_bus::hooks::config::Priority::Default,
+            Some("router-seal-cred"),
+            Some(&body),
+            Duration::from_secs(10),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+    let raw = reply.body.unwrap_or_default();
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("bad seal reply: {e}"))?;
+    if let Some(err) = v.get("error").and_then(serde_json::Value::as_str) {
+        return Err(err.to_string());
+    }
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        Ok("sealed".to_string())
+    } else {
+        Err(format!("unexpected seal reply: {v}"))
+    }
 }
 
 #[cfg(test)]
