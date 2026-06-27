@@ -62,6 +62,10 @@ pub struct RouterPanel {
     pub sealing: Option<String>,
     /// Last seal outcome: (message, is_error).
     pub seal_msg: Option<(String, bool)>,
+    /// Appliance ip armed for reboot (awaiting a confirm click).
+    pub reboot_armed: Option<String>,
+    /// Appliance ip whose reboot RPC is in flight.
+    pub rebooting: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +78,14 @@ pub enum Message {
     SealClicked(String),
     /// Seal RPC returned (Ok message / Err message).
     SealDone(Result<String, String>),
+    /// Arm reboot for this appliance ip (shows a confirm).
+    RebootClicked(String),
+    /// Confirm + fire the reboot RPC for this appliance ip.
+    RebootConfirmed(String),
+    /// Cancel an armed reboot.
+    RebootCancelled,
+    /// Reboot RPC returned.
+    RebootDone(Result<String, String>),
 }
 
 impl RouterPanel {
@@ -145,6 +157,37 @@ impl RouterPanel {
             Message::SealDone(Err(e)) => {
                 self.sealing = None;
                 self.seal_msg = Some((format!("seal failed: {e}"), true));
+                Task::none()
+            }
+            Message::RebootClicked(ip) => {
+                self.reboot_armed = Some(ip);
+                Task::none()
+            }
+            Message::RebootCancelled => {
+                self.reboot_armed = None;
+                Task::none()
+            }
+            Message::RebootConfirmed(ip) => {
+                self.reboot_armed = None;
+                self.rebooting = Some(ip.clone());
+                self.seal_msg = None;
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || reboot_gateway(&ip))
+                            .await
+                            .unwrap_or_else(|_| Err("reboot task panicked".into()))
+                    },
+                    |r| crate::Message::Router(Message::RebootDone(r)),
+                )
+            }
+            Message::RebootDone(Ok(_)) => {
+                self.rebooting = None;
+                self.seal_msg = Some(("reboot issued".into(), false));
+                Task::none()
+            }
+            Message::RebootDone(Err(e)) => {
+                self.rebooting = None;
+                self.seal_msg = Some((format!("reboot failed: {e}"), true));
                 Task::none()
             }
         }
@@ -227,13 +270,56 @@ impl RouterPanel {
             .into()
         } else {
             let sealing = self.sealing.clone();
+            let reboot_armed = self.reboot_armed.clone();
+            let rebooting = self.rebooting.clone();
             let blocks: Vec<Element<'_, crate::Message>> = self
                 .rows
                 .iter()
                 .map(|r| {
                     let card = row_view(r, palette, sizes);
                     if !r.needs_creds {
-                        return card;
+                        // managed appliance → card + a confirm-gated Reboot control (ROUTER-10)
+                        let accent = palette.accent.into_cosmic_color();
+                        let danger = palette.danger.into_cosmic_color();
+                        let ip = r.ip.clone();
+                        let is_rebooting = rebooting.as_deref() == Some(r.ip.as_str());
+                        let is_armed = reboot_armed.as_deref() == Some(r.ip.as_str());
+                        let ctrl: Element<'_, crate::Message> = if is_rebooting {
+                            text("rebooting…")
+                                .size(TypeRole::Caption.size_in(sizes))
+                                .colr(palette.text_muted.into_cosmic_color())
+                                .into()
+                        } else if is_armed {
+                            let ipc = ip.clone();
+                            row![
+                                text(format!("Reboot {ip}?"))
+                                    .size(TypeRole::Caption.size_in(sizes))
+                                    .colr(danger),
+                                button(text("Confirm").size(11).colr(Color::WHITE))
+                                    .padding(Padding::from([3u16, 10u16]))
+                                    .sty(move |_t: &Theme, _s: cosmic::iced::widget::button::Status| pill_style(danger))
+                                    .on_press(crate::Message::Router(Message::RebootConfirmed(ipc))),
+                                button(text("Cancel").size(11).colr(palette.text.into_cosmic_color()))
+                                    .padding(Padding::from([3u16, 10u16]))
+                                    .on_press(crate::Message::Router(Message::RebootCancelled)),
+                            ]
+                            .spacing(6)
+                            .align_y(cosmic::iced::alignment::Vertical::Center)
+                            .into()
+                        } else {
+                            button(text("Reboot").size(11).colr(Color::WHITE))
+                                .padding(Padding::from([3u16, 10u16]))
+                                .sty(move |_t: &Theme, _s: cosmic::iced::widget::button::Status| pill_style(accent))
+                                .on_press(crate::Message::Router(Message::RebootClicked(ip)))
+                                .into()
+                        };
+                        return column![
+                            card,
+                            row![Space::new().width(Length::Fill), ctrl]
+                                .align_y(cosmic::iced::alignment::Vertical::Center)
+                        ]
+                        .spacing(2)
+                        .into();
                     }
                     let busy = sealing.as_deref() == Some(r.id.as_str());
                     let accent = palette.accent.into_cosmic_color();
@@ -244,23 +330,7 @@ impl RouterPanel {
                             .colr(Color::WHITE),
                     )
                     .padding(Padding::from([4u16, 12u16]))
-                    .sty(move |_t: &Theme, _s: cosmic::iced::widget::button::Status| {
-                        cosmic::iced::widget::button::Style {
-                            snap: false,
-                            background: Some(Background::Color(accent)),
-                            icon_color: None,
-                            text_color: Color::WHITE,
-                            border_radius: 6.0.into(),
-                            border_width: 0.0,
-                            border_color: Color::TRANSPARENT,
-                            border: Border {
-                                color: Color::TRANSPARENT,
-                                width: 0.0,
-                                radius: 6.0.into(),
-                            },
-                            shadow: cosmic::iced::Shadow::default(),
-                        }
-                    })
+                    .sty(move |_t: &Theme, _s: cosmic::iced::widget::button::Status| pill_style(accent))
                     .on_press(crate::Message::Router(Message::SealClicked(id)));
                     let hint = text(format!("→ seals router/{} from the field above", r.id))
                         .size(TypeRole::Caption.size_in(sizes))
@@ -349,6 +419,26 @@ fn badge_color(kind: BadgeKind, palette: Palette) -> Color {
         BadgeKind::Unmanaged => palette.text_muted.into_cosmic_color(),
         BadgeKind::Unreachable => palette.danger.into_cosmic_color(),
         BadgeKind::Vendor => palette.success.into_cosmic_color(),
+    }
+}
+
+/// A solid-fill pill button style in `color` (white text) — shared by the
+/// seal/reboot action buttons.
+fn pill_style(color: Color) -> cosmic::iced::widget::button::Style {
+    cosmic::iced::widget::button::Style {
+        snap: false,
+        background: Some(Background::Color(color)),
+        icon_color: None,
+        text_color: Color::WHITE,
+        border_radius: 6.0.into(),
+        border_width: 0.0,
+        border_color: Color::TRANSPARENT,
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: 6.0.into(),
+        },
+        shadow: cosmic::iced::Shadow::default(),
     }
 }
 
@@ -501,6 +591,44 @@ fn seal_router_cred(mac: &str, cred: &str) -> Result<String, String> {
         Ok("sealed".to_string())
     } else {
         Err(format!("unexpected seal reply: {v}"))
+    }
+}
+
+/// ROUTER-10 — reboot a managed appliance via the existing mackesd
+/// `action/dc/gateway-reboot` handler (host_ops validates the IPv4 + reboots over
+/// the sealed cred). Called inside `spawn_blocking` (builds its own runtime).
+fn reboot_gateway(ip: &str) -> Result<String, String> {
+    let Some(dir) = mde_bus::default_data_dir() else {
+        return Err("no Bus data dir".to_string());
+    };
+    let body = serde_json::json!({ "host": ip, "confirm": true }).to_string();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    let reply = rt.block_on(async {
+        let persist = mde_bus::persist::Persist::open(dir).map_err(|e| e.to_string())?;
+        mde_bus::rpc::request(
+            &persist,
+            "action/dc/gateway-reboot",
+            mde_bus::hooks::config::Priority::Default,
+            Some("gateway-reboot"),
+            Some(&body),
+            Duration::from_secs(15),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+    let raw = reply.body.unwrap_or_default();
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("bad reboot reply: {e}"))?;
+    if let Some(err) = v.get("error").and_then(serde_json::Value::as_str) {
+        return Err(err.to_string());
+    }
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        Ok("reboot issued".to_string())
+    } else {
+        Err(format!("unexpected reboot reply: {v}"))
     }
 }
 

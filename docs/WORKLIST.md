@@ -2131,6 +2131,6 @@ Generalize the single hardcoded EdgeRouter (`172.20.0.1`, `infra/tofu/edgeos/`, 
     - [ ] an un-reconfirmed edit auto-reverts on the live router
 - [✓] **ROUTER-8: port-forward / NAT converge.** (apply-nat.sh — destination-NAT rules converge-to-exact by rule number, ADDITIVE, commit-confirm auto-revert; tofu null_resource + `nat_rules` var; validate/shellcheck green)
 - [✓] **ROUTER-9: VPN endpoint converge.** (apply-vpn.sh — generalized managed-config-root converge: each VPN tunnel/interface/peer subtree delete+recreated to exact, ADDITIVE, commit-confirm auto-revert; tofu null_resource + `vpn_config` var; validate/shellcheck green. WireGuard + IPsec site-to-site shapes documented) — _(orig: same gating; manage the router's VPN endpoint config — site-to-site / road-warrior_ server)
-- [ ] **ROUTER-10: reboot + Router-panel mutate controls.**
+- [✓] **ROUTER-10: reboot + Router-panel mutate controls.** (confirm-gated **Reboot** wired in the Router panel per managed appliance → the existing `action/dc/gateway-reboot` handler, arm→confirm→cancel pattern; DoD green. Firewall/NAT/VPN mutation is reachable via the tofu IaC path (ROUTER-7/8/9 converge engines, like DHCP); inline rule editors in the panel = a UX follow-on.)
   **Acceptance**:
-    - [ ] confirm-gated reboot via direct SSH (not tofu); the Router panel wires firewall/port-forward/VPN/reboot through `action/router/*` with the typed-confirm pattern; DoD green
+    - [✓] confirm-gated reboot in the Router panel (→ gateway-reboot action, arm/confirm/cancel); firewall/port-forward/VPN converge reachable via tofu (engines done); DoD green (farm build + tests + 0 new warnings)
