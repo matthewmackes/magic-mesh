@@ -156,6 +156,120 @@ pub fn parse_not_after(nebula_cert_output: &str) -> Option<String> {
     })
 }
 
+// ---- DATACENTER-24: enrollment/bearer token-expiry helpers ----
+
+/// Hours after issuance at which a pending enrollment/bearer token is flagged `warn`.
+/// Enrollment tokens should be redeemed promptly; a 24-hour-old unredeemed token
+/// indicates a node join that never completed and is worth an operator nudge.
+pub const TOKEN_WARN_HOURS: i64 = 24;
+
+/// Hours after issuance at which a pending token is flagged `fail`.
+/// A 72-hour-old unredeemed token is almost certainly abandoned (or the node
+/// that received it is unreachable) and should be investigated.
+pub const TOKEN_FAIL_HOURS: i64 = 72;
+
+/// Classify a pending enrollment/bearer token by its age (milliseconds since
+/// `issued_at_ms`). Pure — no I/O, unit-tested without the ledger on disk.
+///
+/// Returns `"fail"` when the age exceeds [`TOKEN_FAIL_HOURS`], `"warn"` when it
+/// exceeds [`TOKEN_WARN_HOURS`], and `"ok"` otherwise.
+#[must_use]
+pub fn classify_token_age_ms(age_ms: i64) -> &'static str {
+    let hours = age_ms / 3_600_000;
+    if hours >= TOKEN_FAIL_HOURS {
+        "fail"
+    } else if hours >= TOKEN_WARN_HOURS {
+        "warn"
+    } else {
+        "ok"
+    }
+}
+
+/// Parse the `issued_at_ms` field from a bearer-ledger entry JSON string.
+/// Returns `None` when the JSON is missing, malformed, or the field is absent.
+#[must_use]
+pub fn parse_ledger_issued_at_ms(json: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()?
+        .get("issued_at_ms")?
+        .as_u64()
+}
+
+/// Probe all pending enrollment/bearer tokens in the bearer ledger for age-based
+/// expiry. Reads every `.json` file under `<workgroup_root>/ca/issued-bearers/`,
+/// parses `issued_at_ms`, and reduces them to the worst status across all entries.
+///
+/// - `ok`   — ledger is empty, or all tokens are fresh (< [`TOKEN_WARN_HOURS`]).
+/// - `warn` — at least one token is ≥ [`TOKEN_WARN_HOURS`] old (unredeemed).
+/// - `fail` — at least one token is ≥ [`TOKEN_FAIL_HOURS`] old (abandoned).
+///
+/// Uses the system clock for "now"; a `issued_at_ms = 0` sentinel (recorded by
+/// `record_issued` during tests / migration seeding) is treated as age = 0 so it
+/// never triggers a spurious alert.
+fn probe_token_expiry(workgroup_root: &std::path::Path) -> Probe {
+    let ledger_dir = crate::bearer_ledger::ledger_dir(workgroup_root);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+
+    let entries = match std::fs::read_dir(&ledger_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Ledger dir not yet created — no tokens issued, ok.
+            return Probe::ok("no enrollment tokens issued");
+        }
+        Err(e) => {
+            return Probe::warn(format!("token-expiry: ledger dir unreadable: {e}"));
+        }
+    };
+
+    let mut worst: &'static str = "ok";
+    let mut oldest_hours: i64 = 0;
+    let mut count = 0usize;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let json = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let issued_at_ms = match parse_ledger_issued_at_ms(&json) {
+            Some(v) => v,
+            None => continue,
+        };
+        // issued_at_ms == 0 is the `record_issued` migration sentinel — skip.
+        if issued_at_ms == 0 {
+            continue;
+        }
+        count += 1;
+        let age_ms = now_ms.saturating_sub(issued_at_ms) as i64;
+        let hours = age_ms / 3_600_000;
+        if hours > oldest_hours {
+            oldest_hours = hours;
+        }
+        let status = classify_token_age_ms(age_ms);
+        if status == "fail" || (status == "warn" && worst == "ok") {
+            worst = status;
+        }
+    }
+
+    if count == 0 {
+        return Probe::ok("no pending enrollment tokens");
+    }
+    match worst {
+        "fail" => Probe::fail(format!(
+            "{count} pending token(s); oldest ~{oldest_hours}h — investigate abandoned join"
+        )),
+        "warn" => Probe::warn(format!(
+            "{count} pending token(s); oldest ~{oldest_hours}h — join not yet completed"
+        )),
+        _ => Probe::ok(format!("{count} pending token(s), all fresh")),
+    }
+}
+
 // ---- thin I/O: run the probes, emit health events via the Bus ----
 
 /// Publish one health record onto the Bus (best-effort, fire-and-reap — same lane
@@ -387,6 +501,15 @@ fn run_checks(core: &mut DcHealth, workgroup_root: &std::path::Path) {
     if let Some(rec) = core.observe("cert", p.status, &p.detail) {
         publish(&rec);
     }
+
+    // DATACENTER-24: enrollment/bearer token-expiry check.
+    // Warn when pending join tokens are stale (unredeemed) to catch abandoned
+    // joins before they become a security concern. Uses the same event/dc/health/*
+    // shape and bearer_ledger plumbing as the rest of the dc_health checks.
+    let p = probe_token_expiry(workgroup_root);
+    if let Some(rec) = core.observe("token-expiry", p.status, &p.detail) {
+        publish(&rec);
+    }
 }
 
 /// The supervised worker. Leader-gated (only the elected node probes + publishes,
@@ -596,5 +719,162 @@ mod tests {
         let multi = "é".repeat(500);
         let rec2 = h.observe("dom0:x", "fail", &multi).unwrap();
         assert_eq!(rec2.detail.chars().count(), DETAIL_LEN);
+    }
+
+    // ---- DATACENTER-24: token-expiry classification (pure fn) ----
+
+    #[test]
+    fn classify_token_age_fresh_is_ok() {
+        // 0 ms and any age under TOKEN_WARN_HOURS → ok.
+        assert_eq!(classify_token_age_ms(0), "ok");
+        // Just under the warn threshold (1 ms under 24 h).
+        let just_under = (TOKEN_WARN_HOURS * 3_600_000) - 1;
+        assert_eq!(classify_token_age_ms(just_under), "ok");
+    }
+
+    #[test]
+    fn classify_token_age_stale_is_warn() {
+        // Exactly 24 h → warn.
+        assert_eq!(classify_token_age_ms(TOKEN_WARN_HOURS * 3_600_000), "warn");
+        // 25 h → still warn (below the fail threshold).
+        assert_eq!(classify_token_age_ms(25 * 3_600_000), "warn");
+        // One ms under the fail threshold → warn.
+        let just_under_fail = (TOKEN_FAIL_HOURS * 3_600_000) - 1;
+        assert_eq!(classify_token_age_ms(just_under_fail), "warn");
+    }
+
+    #[test]
+    fn classify_token_age_abandoned_is_fail() {
+        // Exactly TOKEN_FAIL_HOURS → fail.
+        assert_eq!(classify_token_age_ms(TOKEN_FAIL_HOURS * 3_600_000), "fail");
+        // Well past → still fail.
+        assert_eq!(classify_token_age_ms(7 * 24 * 3_600_000), "fail");
+    }
+
+    #[test]
+    fn parse_ledger_issued_at_ms_extracts_field() {
+        // Happy path: well-formed ledger entry.
+        let json = r#"{"issued_at_ms":1_000_000,"note":"test"}"#;
+        // serde_json does not support _ separators in integer literals —
+        // use the un-separated form.
+        let json = r#"{"issued_at_ms":1000000,"note":"test"}"#;
+        assert_eq!(parse_ledger_issued_at_ms(json), Some(1_000_000));
+        // Zero sentinel (record_issued migration path).
+        let json_zero = r#"{"issued_at_ms":0,"note":"recorded"}"#;
+        assert_eq!(parse_ledger_issued_at_ms(json_zero), Some(0));
+        // Malformed JSON → None.
+        assert!(parse_ledger_issued_at_ms("{not json}").is_none());
+        // Missing field → None.
+        assert!(parse_ledger_issued_at_ms(r#"{"note":"x"}"#).is_none());
+    }
+
+    #[test]
+    fn probe_token_expiry_empty_ledger_is_ok() {
+        // No ledger dir → ok ("no enrollment tokens issued").
+        let tmp = tempfile::tempdir().unwrap();
+        let p = probe_token_expiry(tmp.path());
+        assert_eq!(p.status, "ok");
+        assert!(p.detail.contains("no enrollment"), "got: {}", p.detail);
+    }
+
+    #[test]
+    fn probe_token_expiry_fresh_token_is_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = tmp.path().join("ca").join("issued-bearers");
+        std::fs::create_dir_all(&ledger).unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        // Write a fresh token (issued right now).
+        let body = format!(r#"{{"issued_at_ms":{now_ms},"note":"test"}}"#);
+        std::fs::write(ledger.join("aabbcc.json"), body).unwrap();
+        let p = probe_token_expiry(tmp.path());
+        assert_eq!(p.status, "ok", "fresh token must be ok, got: {}", p.detail);
+    }
+
+    #[test]
+    fn probe_token_expiry_old_token_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = tmp.path().join("ca").join("issued-bearers");
+        std::fs::create_dir_all(&ledger).unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        // Token issued 30 hours ago (past warn, before fail).
+        let old_ms = now_ms - 30 * 3_600_000;
+        let body = format!(r#"{{"issued_at_ms":{old_ms},"note":"old"}}"#);
+        std::fs::write(ledger.join("aabbdd.json"), body).unwrap();
+        let p = probe_token_expiry(tmp.path());
+        assert_eq!(p.status, "warn", "30h token must warn, got: {}", p.detail);
+    }
+
+    #[test]
+    fn probe_token_expiry_very_old_token_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = tmp.path().join("ca").join("issued-bearers");
+        std::fs::create_dir_all(&ledger).unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        // Token issued 96 hours ago (past fail threshold).
+        let old_ms = now_ms - 96 * 3_600_000;
+        let body = format!(r#"{{"issued_at_ms":{old_ms},"note":"abandoned"}}"#);
+        std::fs::write(ledger.join("aabbee.json"), body).unwrap();
+        let p = probe_token_expiry(tmp.path());
+        assert_eq!(p.status, "fail", "96h token must fail, got: {}", p.detail);
+    }
+
+    #[test]
+    fn probe_token_expiry_sentinel_zero_is_skipped() {
+        // issued_at_ms == 0 is the `record_issued` migration sentinel and must
+        // never trigger a health alert.
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = tmp.path().join("ca").join("issued-bearers");
+        std::fs::create_dir_all(&ledger).unwrap();
+        let body = r#"{"issued_at_ms":0,"note":"recorded"}"#;
+        std::fs::write(ledger.join("sentinel.json"), body).unwrap();
+        let p = probe_token_expiry(tmp.path());
+        assert_eq!(
+            p.status, "ok",
+            "sentinel (issued_at_ms=0) must never alert, got: {}",
+            p.detail
+        );
+    }
+
+    #[test]
+    fn probe_token_expiry_worst_across_multiple_tokens() {
+        // When one token is fresh and another is ancient, fail wins.
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = tmp.path().join("ca").join("issued-bearers");
+        std::fs::create_dir_all(&ledger).unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        // Fresh token.
+        let fresh = format!(r#"{{"issued_at_ms":{now_ms},"note":"fresh"}}"#);
+        std::fs::write(ledger.join("fresh.json"), fresh).unwrap();
+        // Ancient token (100h old).
+        let old_ms = now_ms - 100 * 3_600_000;
+        let old = format!(r#"{{"issued_at_ms":{old_ms},"note":"old"}}"#);
+        std::fs::write(ledger.join("old.json"), old).unwrap();
+        let p = probe_token_expiry(tmp.path());
+        assert_eq!(
+            p.status, "fail",
+            "worst status across tokens must be fail, got: {}",
+            p.detail
+        );
+    }
+
+    #[test]
+    fn token_expiry_health_topic_is_under_event_dc_health() {
+        // Verify the probe integrates into the existing event/dc/health/* namespace.
+        assert_eq!(
+            health_topic("token-expiry"),
+            "event/dc/health/token-expiry"
+        );
     }
 }

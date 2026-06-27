@@ -6,11 +6,16 @@
 //! containers, assembles the per-peer inventory described in
 //! `docs/design/v5.0.0-compute.md` §3, and publishes it to
 //! `compute/inventory/<peer-nebula-addr>` on the Mackes Bus every
-//! 10 s.
+//! 60 s (BUS-RUN-FULL-1 §3 — reduced from 10 s; the QNM-Shared
+//! mirror write still runs every 10 s tick so the fleet panel stays
+//! fresh without the extra bus churn that is now redundant with the
+//! QNM-Shared/Syncthing mirror introduced by WORKLOAD-FLEET-1).
 //!
 //! ## Design locks (v5.0.0-compute.md §1..3)
 //!
-//! - 10 s tick cadence (§1 / §3 inventory topic).
+//! - 10 s tick cadence (§1 / §3 inventory topic, QNM-Shared mirror).
+//! - Bus-publish cadence: 60 s (BUS-RUN-FULL-1 §3 — see
+//!   [`BUS_PUBLISH_INTERVAL`]).
 //! - Subprocess-based polling — no libvirt-rs FFI, no system
 //!   libvirt-dev dep. Matches the `firewall_monitor` PEERVER pattern.
 //! - libvirtd is socket-activated (§5); the first `virsh` call
@@ -34,12 +39,22 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{ShutdownToken, Worker};
 
-/// 10 s tick cadence per design doc §1 / §3.
+/// 10 s tick cadence for local data collection + QNM-Shared mirror writes (§1 / §3).
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Bus-publish cadence for `compute/inventory/<peer>`.
+///
+/// BUS-RUN-FULL-1 §3 — reduced from 10 s to 60 s. The per-tick QNM-Shared mirror
+/// write ([`write_shared_inventory`]) is now the primary cross-node fleet plane
+/// (WORKLOAD-FLEET-1 / Syncthing), so hammering the bus every 10 s is redundant
+/// churn. The bus publish is kept for real-time event sinks that subscribe to the
+/// bus directly; 60 s is sufficient for those consumers and matches the Instances
+/// panel's poll budget.
+pub const BUS_PUBLISH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Directory holding per-VM Nebula-IP sidecar files
 /// (`<vm-storage>/<uuid>.nebula-ip`) written by `compute_provision`.
@@ -620,12 +635,18 @@ pub struct ComputeRegistryWorker {
     hostname: String,
     nebula_addr: String,
     tick: Duration,
+    /// How often `compute/inventory/<peer>` is published to the bus.
+    /// BUS-RUN-FULL-1 §3: defaults to [`BUS_PUBLISH_INTERVAL`] (60 s) to reduce
+    /// redundant churn now that QNM-Shared/Syncthing is the cross-node plane.
+    bus_publish_interval: Duration,
     meshfs_mount: PathBuf,
     vm_storage: PathBuf,
     /// `uuid → previous vcpu-time-ns sample` for cpu_pct deltas.
     prev_cpu_ns: Mutex<BTreeMap<String, u64>>,
     /// `uuid → previous libvirt state` for VIRT-21 transition events.
     prev_state: Mutex<BTreeMap<String, String>>,
+    /// Monotonic instant of the last successful bus publish (None before first publish).
+    last_bus_publish: Option<Instant>,
 }
 
 impl ComputeRegistryWorker {
@@ -639,10 +660,13 @@ impl ComputeRegistryWorker {
             hostname,
             nebula_addr: nebula_addr_hint,
             tick: DEFAULT_TICK_INTERVAL,
+            // BUS-RUN-FULL-1 §3: publish to bus every 60 s, not every 10 s tick.
+            bus_publish_interval: BUS_PUBLISH_INTERVAL,
             meshfs_mount: crate::default_qnm_shared_root(),
             vm_storage: PathBuf::from(DEFAULT_VM_STORAGE),
             prev_cpu_ns: Mutex::new(BTreeMap::new()),
             prev_state: Mutex::new(BTreeMap::new()),
+            last_bus_publish: None,
         }
     }
 
@@ -657,6 +681,14 @@ impl ComputeRegistryWorker {
     #[must_use]
     pub fn with_vm_storage(mut self, p: PathBuf) -> Self {
         self.vm_storage = p;
+        self
+    }
+
+    /// Override the bus-publish interval. Used in tests to verify cadence gating
+    /// without waiting 60 s (BUS-RUN-FULL-1 §3).
+    #[must_use]
+    pub fn with_bus_publish_interval(mut self, d: Duration) -> Self {
+        self.bus_publish_interval = d;
         self
     }
 
@@ -675,19 +707,34 @@ impl ComputeRegistryWorker {
         collect_vm_entries(&self.vm_storage, interval_secs, &mut prev)
     }
 
-    fn tick_once(&self) {
+    /// Run one collection + QNM-Shared mirror tick.
+    ///
+    /// `do_bus_publish` controls whether `compute/inventory/<peer>` is sent to the
+    /// bus this tick. BUS-RUN-FULL-1 §3: the caller passes `true` only when the
+    /// 60 s bus-publish cadence has elapsed, so the bus sees at most one publish per
+    /// [`BUS_PUBLISH_INTERVAL`] rather than one every [`DEFAULT_TICK_INTERVAL`].
+    /// The QNM-Shared mirror write and the VIRT-21 event publishes are unaffected
+    /// — they still run every 10 s tick.
+    fn tick_once(&self, do_bus_publish: bool) {
         let peer = self.resolve_nebula_addr();
         let meshfs_available = is_meshfs_mounted(&self.meshfs_mount);
         let vms = self.collect_vms(self.tick.as_secs_f64());
         let containers = collect_container_entries();
         let inventory = build_inventory(&peer, &self.hostname, vms, containers, meshfs_available);
-        // Publish even when peer is empty (Nebula not yet up) so the
+
+        // BUS-RUN-FULL-1 §3: only publish to the bus when the 60 s cadence has
+        // elapsed. Publish even when peer is empty (Nebula not yet up) so the
         // topic-shape is consistent — subscribers can ignore peer=="".
-        publish_inventory(&peer, &inventory);
+        if do_bus_publish {
+            publish_inventory(&peer, &inventory);
+        }
+
         // WORKLOAD-FLEET-1: also mirror to the replicated QNM-Shared plane so
         // peers' Workbenches can show this node's workloads (the bus is
         // per-node). Only when the mount is real — never write to a bare local
-        // dir masquerading as the share.
+        // dir masquerading as the share. Runs every tick regardless of the bus
+        // cadence — the shared-filesystem write is cheap and subscribers that
+        // read the QNM-Shared plane (Instances panel) need fresh data.
         if meshfs_available {
             write_shared_inventory(&self.meshfs_mount, &self.hostname, &inventory);
         }
@@ -724,6 +771,16 @@ impl ComputeRegistryWorker {
                 .collect();
         }
     }
+
+    /// Return true when the bus-publish cadence has elapsed (or on the first tick).
+    ///
+    /// BUS-RUN-FULL-1 §3: gates the 60 s bus-publish interval.
+    fn should_publish_to_bus(&self) -> bool {
+        match self.last_bus_publish {
+            None => true,
+            Some(last) => last.elapsed() >= self.bus_publish_interval,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -736,7 +793,13 @@ impl Worker for ComputeRegistryWorker {
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(self.tick) => {
-                    self.tick_once();
+                    // BUS-RUN-FULL-1 §3: check whether the 60 s bus-publish
+                    // cadence has elapsed before calling tick_once.
+                    let do_bus_publish = self.should_publish_to_bus();
+                    self.tick_once(do_bus_publish);
+                    if do_bus_publish {
+                        self.last_bus_publish = Some(Instant::now());
+                    }
                 }
                 _ = shutdown.wait() => break,
             }
@@ -1145,5 +1208,64 @@ mod tests {
         ] {
             assert!(s.contains(field), "missing field {field} in {s}");
         }
+    }
+
+    // --- BUS-RUN-FULL-1 §3: bus-publish cadence gating ---
+
+    /// `should_publish_to_bus` returns true on the very first call (no prior
+    /// publish) and false while the interval has not elapsed, so the bus sees
+    /// at most one publish per [`BUS_PUBLISH_INTERVAL`].
+    #[test]
+    fn bus_publish_cadence_gating_first_tick_always_publishes() {
+        // A fresh worker has no last_bus_publish — should publish immediately.
+        let worker = ComputeRegistryWorker::new("test-host".into(), "10.42.0.1".into())
+            .with_bus_publish_interval(Duration::from_secs(60));
+        assert!(
+            worker.should_publish_to_bus(),
+            "first tick must publish (no prior publish recorded)"
+        );
+    }
+
+    #[test]
+    fn bus_publish_cadence_gating_suppresses_within_interval() {
+        // Simulate a publish that just happened — interval has not elapsed.
+        let mut worker = ComputeRegistryWorker::new("test-host".into(), "10.42.0.1".into())
+            .with_bus_publish_interval(Duration::from_secs(60));
+        // Record a publish right now.
+        worker.last_bus_publish = Some(Instant::now());
+        assert!(
+            !worker.should_publish_to_bus(),
+            "must not re-publish within the 60 s interval"
+        );
+    }
+
+    #[test]
+    fn bus_publish_cadence_gating_allows_after_interval() {
+        // Simulate a publish that happened more than the interval ago by using a
+        // zero-duration interval (already elapsed).
+        let mut worker = ComputeRegistryWorker::new("test-host".into(), "10.42.0.1".into())
+            .with_bus_publish_interval(Duration::ZERO);
+        worker.last_bus_publish = Some(Instant::now());
+        // With a zero interval the elapsed time is always >= 0 s.
+        assert!(
+            worker.should_publish_to_bus(),
+            "must publish once the interval has elapsed"
+        );
+    }
+
+    #[test]
+    fn bus_publish_interval_constant_is_60s() {
+        // BUS-RUN-FULL-1 §3: the production constant must be 60 s, not the old 10 s.
+        assert_eq!(
+            BUS_PUBLISH_INTERVAL,
+            Duration::from_secs(60),
+            "BUS-RUN-FULL-1 §3 mandates a 60 s bus-publish interval"
+        );
+        // Confirm it is materially larger than the tick cadence so the test isn't
+        // accidentally checking that 10 s == 60 s.
+        assert!(
+            BUS_PUBLISH_INTERVAL > DEFAULT_TICK_INTERVAL,
+            "bus-publish interval must exceed the tick cadence"
+        );
     }
 }
