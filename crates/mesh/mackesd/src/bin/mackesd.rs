@@ -5949,6 +5949,48 @@ fn run_serve(
         let enroll_cert = std::env::var("MDE_ENROLL_CERT").unwrap_or_else(|_| {
             mackesd_core::workers::nebula_enroll_listener::DEFAULT_CERT_PATH.to_string()
         });
+        let enroll_key = std::env::var("MDE_ENROLL_KEY").unwrap_or_else(|_| {
+            mackesd_core::workers::nebula_enroll_listener::DEFAULT_KEY_PATH.to_string()
+        });
+        // LIGHTHOUSE-ENROLL-SELF-CERT — a JOINED lighthouse (one that received the
+        // sealed CA key over the enroll bundle, #12) holds the CA and CAN sign, but
+        // `mackesd found` never ran on it, so it lacked the self-signed /enroll
+        // endpoint cert and :4243 stayed DOWN — it could sign yet could not SERVE
+        // enrollment. That made a joined lighthouse only a half lighthouse: the mesh
+        // could not enroll new nodes once the founding lighthouse was retired (found
+        // live during the 2026-06-27 lighthouse migration: nyc3/sfo3/fra1 came up
+        // full — am_lighthouse + CA key + etcd voter — but :4243 never bound). If
+        // this node holds the CA key and the endpoint cert is absent, self-generate
+        // it now (the same self-signed rcgen identity `found` writes; SAN = the
+        // node's primary public IPv4). Tokens later minted ON this lighthouse pin
+        // THIS cert's fingerprint. Best-effort + idempotent: a failure just leaves
+        // :4243 unbound (logged), never blocks startup.
+        const CA_KEY_PATH: &str = "/var/lib/mackesd/nebula-ca/ca.key";
+        if !std::path::Path::new(&enroll_cert).exists()
+            && std::path::Path::new(CA_KEY_PATH).exists()
+        {
+            match detect_primary_ipv4() {
+                Ok(ip) => match mackesd_core::nebula_enroll_endpoint::ensure_self_signed_cert(
+                    std::path::Path::new(&enroll_cert),
+                    std::path::Path::new(&enroll_key),
+                    std::slice::from_ref(&ip),
+                ) {
+                    Ok(_) => tracing::info!(
+                        ip = %ip,
+                        "enroll-endpoint: self-signed cert generated for joined lighthouse \
+                         (LIGHTHOUSE-ENROLL-SELF-CERT) — :4243 will now bind"
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "enroll-endpoint: self-cert generation failed; :4243 stays down"
+                    ),
+                },
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "enroll-endpoint: primary IPv4 detection failed; :4243 stays down"
+                ),
+            }
+        }
         if std::path::Path::new(&enroll_cert).exists() {
             let mut w = mackesd_core::workers::nebula_enroll_listener::NebulaEnrollListener::new(
                 std::sync::Arc::new(mackesd_core::ca::SubprocessBackend),

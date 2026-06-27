@@ -13,6 +13,22 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
+## [11.0.12] — 2026-06-27
+### Fixed
+- **A joined lighthouse now SERVES enrollment (`:4243` self-cert).** The turn-key
+  add-lighthouse flow (#12) ships the sealed CA key to a `join --role lighthouse`
+  node so it can *sign*, but `mackesd found` never runs on it — so it lacked the
+  self-signed `/etc/nebula/enroll-endpoint.crt` and the `nebula-enroll-listener`
+  skipped binding `:4243`. The new lighthouse was only *half* a lighthouse: a CA
+  holder that could sign yet could not accept enrollments, so once the founding
+  lighthouse was retired the mesh could no longer add nodes. Found live during the
+  2026-06-27 migration — nyc3/sfo3/fra1 came up full (am_lighthouse + CA key + etcd
+  voter, dialed by every peer) but `:4243` never bound. Fix: at serve-startup, if
+  the node holds the CA key and the endpoint cert is absent, self-generate it (the
+  same self-signed rcgen identity `found` writes; SAN = the node's primary public
+  IPv4). Tokens later minted on that lighthouse pin its own fingerprint. Idempotent,
+  best-effort, never blocks startup. A joined lighthouse is now a full enroll anchor.
+
 ## [11.0.11] — 2026-06-26
 ### Fixed
 - **Lighthouse watchdog crash-loop (P1) — a down broker no longer SIGABRTs the
