@@ -1167,25 +1167,25 @@ fn display_host(hostname: &str) -> String {
 /// A peer's published compute inventory (subset of the `compute_registry`
 /// `Inventory` doc we need to render — extra fields are ignored).
 #[derive(Debug, Clone, serde::Deserialize)]
-struct BusInventory {
+pub struct BusInventory {
     /// Publishing node's Nebula overlay IP — the robust self-key.
     #[serde(default)]
-    peer: String,
+    pub peer: String,
     #[serde(default)]
-    hostname: String,
+    pub hostname: String,
     #[serde(default)]
-    vms: Vec<BusEntry>,
+    pub vms: Vec<BusEntry>,
     #[serde(default)]
-    containers: Vec<BusEntry>,
+    pub containers: Vec<BusEntry>,
 }
 
 /// A VM or container row inside a [`BusInventory`].
 #[derive(Debug, Clone, serde::Deserialize)]
-struct BusEntry {
+pub struct BusEntry {
     #[serde(default)]
-    name: String,
+    pub name: String,
     #[serde(default)]
-    state: String,
+    pub state: String,
 }
 
 /// Read the newest `compute/inventory/<peer>` document for every peer off the
@@ -1254,7 +1254,7 @@ fn fold_bus_inventories(
 /// reading the local bus would only ever surface this node's own inventory.
 /// Best-effort: a missing/un-mounted share yields an empty list (the panel
 /// still shows the local probe).
-fn read_shared_inventories() -> Vec<BusInventory> {
+pub fn read_shared_inventories() -> Vec<BusInventory> {
     let root = mackes_mesh_types::peers::default_workgroup_root();
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Vec::new();
