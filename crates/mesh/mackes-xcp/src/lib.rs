@@ -215,6 +215,44 @@ pub fn argv_uninstall(uuid: &str) -> Vec<String> {
     ]
 }
 
+/// `xe vm-suspend uuid=<uuid>` — suspend a running VM to disk (DATACENTER-11).
+#[must_use]
+pub fn argv_suspend(uuid: &str) -> Vec<String> {
+    vec!["vm-suspend".into(), format!("uuid={uuid}")]
+}
+
+/// `xe vm-resume uuid=<uuid>` — resume a suspended VM (DATACENTER-11).
+#[must_use]
+pub fn argv_resume(uuid: &str) -> Vec<String> {
+    vec!["vm-resume".into(), format!("uuid={uuid}")]
+}
+
+/// `xe vm-migrate uuid=<uuid> host=<target> live=true` — live-migrate a VM to
+/// another host in the pool (DATACENTER-11). `host=` accepts a destination
+/// host name-label or uuid; `live=true` keeps the guest running during the move.
+#[must_use]
+pub fn argv_migrate(uuid: &str, target_host: &str) -> Vec<String> {
+    vec![
+        "vm-migrate".into(),
+        format!("uuid={uuid}"),
+        format!("host={target_host}"),
+        "live=true".into(),
+    ]
+}
+
+/// `xe console-list vm-uuid=<uuid> params=location --minimal` — read a VM's
+/// console connection URL, the `location` the noVNC viewer dials (DATACENTER-11).
+/// `--minimal` prints just the console object's `location` value.
+#[must_use]
+pub fn argv_console_url(uuid: &str) -> Vec<String> {
+    vec![
+        "console-list".into(),
+        format!("vm-uuid={uuid}"),
+        "params=location".into(),
+        "--minimal".into(),
+    ]
+}
+
 /// The cloud-init NoCloud seed for one MDE-VM: the rendered `user-data` and
 /// `meta-data` documents plus the `instance-id` they pin (XCP-3 / A2).
 ///
@@ -985,6 +1023,26 @@ mod tests {
         assert_eq!(
             argv_uninstall("u1"),
             vec!["vm-uninstall", "uuid=u1", "force=true"]
+        );
+    }
+
+    #[test]
+    fn argv_lifecycle_builders_shape() {
+        // DATACENTER-11 — suspend/resume/migrate/console-url argv surfaces.
+        assert_eq!(argv_suspend("u1"), vec!["vm-suspend", "uuid=u1"]);
+        assert_eq!(argv_resume("u1"), vec!["vm-resume", "uuid=u1"]);
+        assert_eq!(
+            argv_migrate("u1", "MDE-host-b"),
+            vec!["vm-migrate", "uuid=u1", "host=MDE-host-b", "live=true"]
+        );
+        // console-url joins to the exact xe command the responder runs.
+        assert_eq!(
+            argv_console_url("u1"),
+            vec!["console-list", "vm-uuid=u1", "params=location", "--minimal"]
+        );
+        assert_eq!(
+            argv_console_url("u1").join(" "),
+            "console-list vm-uuid=u1 params=location --minimal"
         );
     }
 

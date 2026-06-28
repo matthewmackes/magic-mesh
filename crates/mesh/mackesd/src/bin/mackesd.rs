@@ -7242,6 +7242,76 @@ fn run_serve(
                 tracing::warn!(error = %e, "DC-power Bus responder: bus persist open failed; responder skipped");
             }
         }
+        // DATACENTER-12 (action layer) — the storage responder: action/dc/{sr-list,
+        // sr-create,sr-destroy,vdi-attach,vdi-detach,sr-snapshot-schedule,iso-list}
+        // over the mesh-key SSH against an allowed dom0. Same OS-thread shape.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let dc_storage_svc =
+                    mackesd_core::ipc::dc_storage::DcStorageService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("dc-storage-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::dc_storage::serve_bus(&persist, &dc_storage_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "DC-storage Bus responder spawned; serving action/dc/{{sr-*,vdi-*,iso-list}} (DATACENTER-12)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "DC-storage Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("dc_storage_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "DC-storage Bus responder: bus persist open failed; responder skipped");
+            }
+        }
+        // DATACENTER-13 (action layer) — the network responder: action/dc/{net-list,
+        // net-create,vlan-set,pif-config,ipdns} over the mesh-key SSH against an
+        // allowed dom0 (ipdns reads DO DNS + gateway leases + overlay). OS-thread shape.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let dc_network_svc =
+                    mackesd_core::ipc::dc_network::DcNetworkService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("dc-network-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::dc_network::serve_bus(&persist, &dc_network_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "DC-network Bus responder spawned; serving action/dc/{{net-*,vlan-set,pif-config,ipdns}} (DATACENTER-13)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "DC-network Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("dc_network_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "DC-network Bus responder: bus persist open failed; responder skipped");
+            }
+        }
         // DC-15 (action layer) — the Tofu-plan responder: action/dc/tofu-plan
         // runs a read-only `tofu plan` of an allow-listed workspace under
         // infra/tofu/<ws> with its env sourced. Same dedicated-OS-thread shape.
