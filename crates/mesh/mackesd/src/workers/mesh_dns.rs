@@ -28,6 +28,50 @@ pub const TICK: Duration = Duration::from_secs(30);
 /// The mesh DNS namespace suffix (W75).
 pub const MESH_SUFFIX: &str = "mesh";
 
+/// MEDIA-5 — the active-active SERVICE name the music clients resolve. Unlike a
+/// `<host>.mesh` peer record (one name → one IP), `music.mesh` resolves to the
+/// **A-record SET** of every live `Lighthouse_Media` overlay IP, so clients
+/// round-robin across instances and fail over when one media lighthouse drops.
+pub const MUSIC_SERVICE_FQDN: &str = "music.mesh";
+
+/// MEDIA-5 — build the `music.mesh` A-record set from the live `Lighthouse_Media`
+/// overlay IPs. One [`MeshHost`] per media instance, all sharing the
+/// [`MUSIC_SERVICE_FQDN`] name; empty IPs (a media node whose overlay isn't known
+/// yet) are skipped. Sorted + deduped by IP for a stable, idempotent block, so a
+/// media node joining/leaving simply adds/removes its IP from the set on the next
+/// tick — no VIP, no fixed center.
+#[must_use]
+pub fn music_a_records(media_overlay_ips: &[String]) -> Vec<MeshHost> {
+    let mut out: Vec<MeshHost> = media_overlay_ips
+        .iter()
+        .filter(|ip| !ip.is_empty())
+        .map(|ip| MeshHost {
+            fqdn: MUSIC_SERVICE_FQDN.to_string(),
+            overlay_ip: ip.clone(),
+        })
+        .collect();
+    out.sort_by(|a, b| a.overlay_ip.cmp(&b.overlay_ip));
+    out.dedup();
+    out
+}
+
+/// MEDIA-5 — the full mesh-DNS record set: the `<host>.mesh` peer records PLUS
+/// the `music.mesh` active-active A-set built from the `Lighthouse_Media`
+/// membership. This is what the worker writes each tick; resolution of
+/// `<host>.mesh` is unchanged, and `music.mesh` now answers with the live media
+/// instance set.
+#[must_use]
+pub fn build_records_with_music(
+    peers: &[(String, String)],
+    media_overlay_ips: &[String],
+) -> Vec<MeshHost> {
+    let mut out = build_records(peers);
+    out.extend(music_a_records(media_overlay_ips));
+    out.sort_by(|a, b| a.fqdn.cmp(&b.fqdn).then(a.overlay_ip.cmp(&b.overlay_ip)));
+    out.dedup();
+    out
+}
+
 /// `/etc/hosts` managed-block markers (the resolvectl-absent path).
 pub const HOSTS_BEGIN: &str = "# >>> mde mesh-dns (managed) >>>";
 /// Closing sentinel for the managed `/etc/hosts` block.
@@ -171,12 +215,40 @@ impl MeshDnsWorker {
             .collect()
     }
 
+    /// MEDIA-5 — the overlay IP of every live `Lighthouse_Media` peer, read from
+    /// the same replicated directory `peers()` uses. The directory stamps each
+    /// peer's pinned deployment role (`telemetry` writes `rec.role`), so the
+    /// media membership is just the `lighthouse-media` rows' overlay IPs — a node
+    /// joining/leaving the media class updates this set with no extra signal.
+    fn media_overlay_ips(&self) -> Vec<String> {
+        let svc = crate::ipc::directory::DirectoryService::new(
+            &self.workgroup_root,
+            self.store_db.clone(),
+        );
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        svc.build_directory(now_ms)["peers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|p| {
+                mackes_mesh_types::lighthouse::MEDIA_LIGHTHOUSE_ROLE
+                    == p["role"].as_str().unwrap_or_default()
+            })
+            .filter_map(|p| p["overlay_ip"].as_str().map(str::to_string))
+            .filter(|ip| !ip.is_empty())
+            .collect()
+    }
+
     fn sync(&self) {
-        let records = build_records(&self.peers());
+        let media = self.media_overlay_ips();
+        let records = build_records_with_music(&self.peers(), &media);
         tracing::debug!(
             target: "mackesd::mesh_dns",
             workgroup_root = %self.workgroup_root.display(),
             records = records.len(),
+            music_instances = media.len(),
             "mesh_dns sync tick",
         );
         // Preferred: per-link systemd-resolved domain (FDO interop).
@@ -269,6 +341,57 @@ mod tests {
         assert_eq!(recs[0].fqdn, "oak.mesh"); // sorted
         assert_eq!(recs[1].fqdn, "pine.mesh");
         assert_eq!(recs[1].overlay_ip, "10.42.0.2");
+    }
+
+    #[test]
+    fn build_records_with_music_includes_the_music_mesh_a_set() {
+        // MEDIA-5 — the combined builder emits the <host>.mesh peer records AND
+        // a music.mesh A-record per live Lighthouse_Media overlay IP.
+        let peers = [
+            ("pine".to_string(), "10.42.0.2".to_string()),
+            ("oak".to_string(), "10.42.0.3".to_string()),
+        ];
+        let media = [
+            "10.42.0.7".to_string(),
+            "10.42.0.8".to_string(),
+            String::new(), // a media node with no overlay yet — skipped
+        ];
+        let recs = build_records_with_music(&peers, &media);
+        // The two music.mesh A-records (the active-active set), sorted by IP.
+        let music: Vec<&MeshHost> = recs
+            .iter()
+            .filter(|r| r.fqdn == MUSIC_SERVICE_FQDN)
+            .collect();
+        assert_eq!(music.len(), 2, "one A-record per live media instance");
+        assert_eq!(music[0].overlay_ip, "10.42.0.7");
+        assert_eq!(music[1].overlay_ip, "10.42.0.8");
+        // The peer <host>.mesh records survive alongside it.
+        assert!(recs
+            .iter()
+            .any(|r| r.fqdn == "pine.mesh" && r.overlay_ip == "10.42.0.2"));
+        assert!(recs.iter().any(|r| r.fqdn == "oak.mesh"));
+        // The rendered /etc/hosts block round-robins music.mesh across instances.
+        let block = hosts_block(&recs);
+        assert!(block.contains("10.42.0.7\tmusic.mesh"));
+        assert!(block.contains("10.42.0.8\tmusic.mesh"));
+    }
+
+    #[test]
+    fn music_a_set_tracks_membership_join_and_leave() {
+        // A node joining the media class adds its IP; leaving removes it — the
+        // set is a pure function of the live membership (no stale VIP).
+        assert!(
+            music_a_records(&[]).is_empty(),
+            "no media nodes → no music.mesh"
+        );
+        let one = music_a_records(&["10.42.0.7".into()]);
+        assert_eq!(one.len(), 1);
+        let two = music_a_records(&["10.42.0.8".into(), "10.42.0.7".into()]);
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].overlay_ip, "10.42.0.7", "sorted for a stable block");
+        // Idempotent: duplicate membership collapses (one A per IP).
+        let dup = music_a_records(&["10.42.0.7".into(), "10.42.0.7".into()]);
+        assert_eq!(dup.len(), 1);
     }
 
     #[test]

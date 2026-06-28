@@ -1969,7 +1969,9 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::RolePin { role } => {
             let parsed: mde_role::Role = role.parse().map_err(|_| {
-                anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
+                anyhow::anyhow!(
+                    "unknown role `{role}` — expected lighthouse|lighthouse-media|server|workstation"
+                )
             })?;
             match mde_role::pin(parsed) {
                 Ok(outcome) => {
@@ -3706,7 +3708,9 @@ fn main() -> anyhow::Result<()> {
             role,
         } => {
             let parsed: mde_role::Role = role.parse().map_err(|_| {
-                anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
+                anyhow::anyhow!(
+                    "unknown role `{role}` — expected lighthouse|lighthouse-media|server|workstation"
+                )
             })?;
             let conn = mackesd_core::store::open(&db_path)
                 .with_context(|| format!("opening store at {}", db_path.display()))?;
@@ -5593,6 +5597,22 @@ fn run_serve(
                 RestartPolicy::OnFailure,
             ));
             worker_names.lock().expect("worker_names mutex").push("mesh_dns".into());
+        }
+        // MEDIA-3/6 — adopt + supervise the Navidrome music container, and
+        // distribute the leader-managed shared-account secret. Gated on the
+        // ORTHOGONAL media capability (a `Lighthouse_Media` pin), NOT the rank —
+        // so it is provably absent on every stock Lighthouse / Server /
+        // Workstation (worker_role::node_serves_media is fail-closed: unpinned /
+        // unreadable role ⇒ not media).
+        if mackesd_core::worker_role::node_serves_media() {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::media_navidrome::MediaNavidromeWorker::new(
+                    node_id.clone(),
+                    workgroup_root.clone(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names.lock().expect("worker_names mutex").push("media_navidrome".into());
         }
         // PLANES-15 — netstate engine mount: converge the baseline's
         // network desired-state under a rollback checkpoint + overlay
@@ -8107,7 +8127,9 @@ fn cmd_add_peer(
     enroll_port: Option<u16>,
 ) -> anyhow::Result<()> {
     let parsed: mde_role::Role = role.parse().map_err(|_| {
-        anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
+        anyhow::anyhow!(
+            "unknown role `{role}` — expected lighthouse|lighthouse-media|server|workstation"
+        )
     })?;
     let root = mackesd_core::default_qnm_shared_root();
     let node_id = default_node_id();
@@ -8204,7 +8226,9 @@ fn cmd_found(
     use mackesd_core::workers::nebula_enroll_listener::{DEFAULT_CERT_PATH, DEFAULT_KEY_PATH};
 
     let parsed: mde_role::Role = role.parse().map_err(|_| {
-        anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
+        anyhow::anyhow!(
+            "unknown role `{role}` — expected lighthouse|lighthouse-media|server|workstation"
+        )
     })?;
     // Resolve the externally-dialable IPv4 (strip any :port the operator
     // included; `auto` detects the primary outbound IP).
@@ -8380,7 +8404,9 @@ fn cmd_join(
     };
 
     let parsed: mde_role::Role = role.parse().map_err(|_| {
-        anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
+        anyhow::anyhow!(
+            "unknown role `{role}` — expected lighthouse|lighthouse-media|server|workstation"
+        )
     })?;
     let token = mackesd_core::nebula_enroll::parse_join_token(&raw_token).ok_or_else(|| {
         anyhow::anyhow!("invalid join token (expected mesh:<id>@<ip>:<port>#<bearer>?fp=<sha256>)")
@@ -8460,7 +8486,7 @@ fn cmd_join(
     // public underlay address so its heartbeat publishes it to the directory and
     // every node's enroll roster includes it (full redundancy). Auto-detect the
     // primary public IPv4 (override later with `mackesd set-external-addr`).
-    if parsed == mde_role::Role::Lighthouse {
+    if mackes_mesh_types::lighthouse::role_is_lighthouse(Some(parsed.as_str())) {
         match detect_primary_ipv4() {
             Ok(ip) => {
                 if let Err(e) =
@@ -8474,6 +8500,15 @@ fn cmd_join(
             ),
         }
     }
+
+    // MEDIA-8 — birthright auto-config: write the music client's
+    // `airsonic-creds.json` (→ http://music.mesh:4533 + the shared account) so a
+    // fresh node has working music with zero manual connect (the Music System's
+    // Auto-Configuration host). Best-effort: the shared password comes from the
+    // leader-managed secret store when this node can already read it; otherwise
+    // the file is still seeded pointing at music.mesh (the media_navidrome /
+    // registry path fills the password once it distributes).
+    write_music_birthright_best_effort(&root);
 
     // SETUP-7 — capture the joined facts (mesh-id + lighthouse roster from the
     // signed bundle) for idempotent re-convergence.
@@ -8493,6 +8528,41 @@ fn cmd_join(
     );
     println!("services: nebula + mackesd + mesh-health enabled (boot-durable) and running");
     Ok(())
+}
+
+/// MEDIA-8 — write the music-client birthright (`airsonic-creds.json`) at
+/// enroll. Resolves the shared-account password from the leader-managed secret
+/// store ([[XCP-7]] / `ipc::secret_store`) when this node can read it; either way
+/// the creds point at the active-active `http://music.mesh:4533` + the shared
+/// account, so `mde-music` opens + browses with no manual connect. Best-effort:
+/// a write/secret failure is logged, never fatal to the join.
+fn write_music_birthright_best_effort(workgroup_root: &std::path::Path) {
+    use mackesd_core::ipc::secret_store::{repo_root, SecretStore};
+    use mackesd_core::mesh_media;
+    // The shared password is only present once the leader has distributed it; a
+    // fresh node may not have it yet (None) — seed the rest regardless.
+    let password = SecretStore::resolve(&repo_root(), workgroup_root)
+        .get(&mesh_media::media_account_secret_ref())
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let path = mesh_media::airsonic_creds_path();
+    match mesh_media::write_music_birthright(&path, mesh_media::MEDIA_ACCOUNT_USER, &password) {
+        Ok(()) => {
+            if password.is_empty() {
+                println!(
+                    "music: seeded {} → music.mesh (shared-account password pending the leader-managed secret)",
+                    path.display()
+                );
+            } else {
+                println!(
+                    "music: wrote birthright {} → music.mesh:4533",
+                    path.display()
+                );
+            }
+        }
+        Err(e) => eprintln!("music: could not write airsonic-creds birthright ({e})"),
+    }
 }
 
 /// BIRTHRIGHT-1 — install LizardFS + stand up QNM-Shared (the §1 shared-state
