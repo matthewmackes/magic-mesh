@@ -714,6 +714,17 @@ impl App {
                     .map(|_| Message::Lighthouses(lighthouses_panel::Message::Refresh)),
             );
         }
+        // MOTION-TRANS-3 — drive the Mesh Pending list's row-insert reveal at
+        // ~60 fps, only while the panel is active AND a reveal is in flight (idle
+        // ⇒ no subscription, zero wakeups).
+        if self.view.panel_slug() == Some("mesh_pending")
+            && self.mesh_pending.needs_tick(Instant::now())
+        {
+            subs.push(
+                cosmic::iced::time::every(Duration::from_millis(16))
+                    .map(|_| Message::MeshPending(mesh_pending_panel::Message::AnimTick)),
+            );
+        }
         // PD-8 (L14) / PLANES-1 — Netdata sampling only while the Peers
         // directory is the active view (the Compute pattern). The Front
         // Door is reachable as the Peers plane root/panel or the

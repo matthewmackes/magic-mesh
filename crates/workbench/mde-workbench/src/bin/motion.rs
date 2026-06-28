@@ -247,7 +247,7 @@ impl HubAnim {
     /// settled — the Hub stops ticking (MOTION-PERF-1: zero idle wakeups).
     #[must_use]
     pub fn is_idle(&self, now: Instant) -> bool {
-        self.open.map_or(true, |o| o.is_complete(now))
+        self.open.is_none_or(|o| o.is_complete(now))
             && self.entering.values().all(|e| e.window.is_complete(now))
     }
 

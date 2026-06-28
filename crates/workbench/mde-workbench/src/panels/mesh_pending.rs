@@ -42,11 +42,22 @@ pub struct MeshPendingPanel {
     pub busy: bool,
     pub last_op: String,
     pub last_run_at: Option<SystemTime>,
+    /// MOTION-TRANS-3 — the keyed-diff reveal: a pending peer that just appeared
+    /// on a refresh slides up + fades into the list, while rows already on screen
+    /// stay put (the roster doesn't restroke). Keyed by `peer_id`.
+    reveal: mde_theme::animation::KeyedListReveal,
 }
+
+/// MOTION-TRANS-3 — stable scrollable id so the pending-peer list keeps its scroll
+/// position across a refresh (the roster doesn't jump when a row is added/removed).
+const LIST_ID: &str = "mesh-pending-list";
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Loaded(Vec<PendingPeer>),
+    /// MOTION-TRANS-3 — advance the row-insert reveal one frame (in-flight-only
+    /// tick; GC's settled reveals so it self-stops at rest).
+    AnimTick,
     RefreshClicked,
     AcceptClicked(String),
     RejectClicked {
@@ -63,7 +74,17 @@ pub enum Message {
 impl MeshPendingPanel {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            reveal: mde_theme::animation::KeyedListReveal::new(crate::live_theme::reduce_motion()),
+            ..Self::default()
+        }
+    }
+
+    /// MOTION-TRANS-3 — does the row-insert reveal still have a frame to draw? The
+    /// app gates the panel's per-frame tick subscription on this (idle ⇒ no tick).
+    #[must_use]
+    pub fn needs_tick(&self, now: std::time::Instant) -> bool {
+        !self.reveal.is_idle(now)
     }
 
     pub fn load() -> Task<crate::Message> {
@@ -75,9 +96,19 @@ impl MeshPendingPanel {
     pub fn update(&mut self, msg: Message) -> Task<crate::Message> {
         match msg {
             Message::Loaded(peers) => {
+                // MOTION-TRANS-3 — diff the freshly-loaded roster against the last
+                // frame so any newly-appeared pending peer reveals in (the first
+                // load is treated as the list appearing — no mass reveal).
+                self.reveal
+                    .sync(peers.iter().map(|p| p.peer_id.clone()), std::time::Instant::now());
                 self.peers = peers;
                 self.busy = false;
                 self.last_run_at = Some(SystemTime::now());
+                Task::none()
+            }
+            // MOTION-TRANS-3 — drop settled reveals so the tick subscription stops.
+            Message::AnimTick => {
+                self.reveal.gc(std::time::Instant::now());
                 Task::none()
             }
             Message::RefreshClicked => {
@@ -203,9 +234,21 @@ impl MeshPendingPanel {
         ]
         .align_y(cosmic::iced::alignment::Vertical::Center);
 
+        // MOTION-TRANS-3 — a single clock read for this frame's reveal sampling.
+        let now = std::time::Instant::now();
         let mut peers_col = column![].spacing(10);
         for p in &self.peers {
-            peers_col = peers_col.push(peer_row(p, palette));
+            // A freshly-inserted row starts a few px low and rises to rest, applied
+            // as decaying top padding (iced 0.13 has no transform widget — the
+            // translate-as-padding idiom the launcher/Hub/sidebar share). `0` once
+            // settled, so the resting layout is unchanged.
+            let slide = self.reveal.row_params(&p.peer_id, now).translate_y.max(0.0);
+            peers_col = peers_col.push(container(peer_row(p, palette)).padding(Padding {
+                top: slide,
+                right: 0.0,
+                bottom: 0.0,
+                left: 0.0,
+            }));
         }
         if self.peers.is_empty() && !self.busy {
             peers_col = peers_col.push(empty_state_card(palette));
@@ -215,7 +258,11 @@ impl MeshPendingPanel {
             column![
                 header,
                 Space::new().height(Length::Fixed(20.0)),
-                scrollable(peers_col).height(Length::Fill),
+                // MOTION-TRANS-3 — a stable id so a refresh keeps the scroll
+                // position (the roster doesn't jump when a row is added/removed).
+                scrollable(peers_col)
+                    .id(cosmic::iced::widget::Id::new(LIST_ID))
+                    .height(Length::Fill),
             ]
             .spacing(2),
         )
@@ -562,5 +609,46 @@ mod tests {
             probe_path: PathBuf::from("/tmp/probe.json"),
         }];
         let _ = p.view();
+    }
+
+    fn peer(id: &str) -> PendingPeer {
+        PendingPeer {
+            peer_id: id.into(),
+            hostname: id.into(),
+            ..PendingPeer::default()
+        }
+    }
+
+    #[test]
+    fn first_load_seeds_without_revealing_then_an_insert_reveals() {
+        // MOTION-TRANS-3 — opening the panel (first Loaded) seeds the roster with
+        // no mass reveal; a later refresh that adds a peer reveals it, so the
+        // panel reports it needs a per-frame tick.
+        let mut p = MeshPendingPanel::new();
+        let now = std::time::Instant::now();
+        let _ = p.update(Message::Loaded(vec![peer("a"), peer("b")]));
+        assert!(
+            !p.needs_tick(now),
+            "the initial roster must not mass-reveal (no tick needed)"
+        );
+        // A refresh that adds "c" arms its reveal → a tick is needed.
+        let _ = p.update(Message::Loaded(vec![peer("a"), peer("b"), peer("c")]));
+        assert!(
+            p.needs_tick(std::time::Instant::now()),
+            "an inserted pending peer reveals → the panel needs a tick"
+        );
+    }
+
+    #[test]
+    fn anim_tick_settles_the_reveal_and_stops_the_clock() {
+        // MOTION-TRANS-3 — once the reveal's panel-mount duration has elapsed,
+        // an AnimTick GC's it and the panel goes idle (the subscription stops).
+        let mut p = MeshPendingPanel::new();
+        let _ = p.update(Message::Loaded(vec![peer("a")]));
+        let _ = p.update(Message::Loaded(vec![peer("a"), peer("b")]));
+        // Far enough in the future that the reveal has settled.
+        let _ = p.update(Message::AnimTick);
+        let later = std::time::Instant::now() + mde_theme::motion::Motion::panel_mount().duration;
+        assert!(!p.needs_tick(later), "a settled reveal needs no further ticks");
     }
 }

@@ -565,6 +565,117 @@ const fn motion_easing(motion: Motion, reduce_motion: bool) -> Easing {
     }
 }
 
+// ── MOTION-TRANS-3 — keyed-diff list/table reveal ─────────────────────────────
+
+/// MOTION-TRANS-3 — a keyed-diff reveal for a refreshing list/table.
+///
+/// On each refresh the consumer hands this the current set of stable **row keys**;
+/// it diffs them against the previous frame and arms a [`slide_in`] reveal for
+/// every **genuinely new** row, so an inserted row slides up + fades into place
+/// while every row that was already on screen stays put — a periodic refresh
+/// therefore never restrokes the whole list (and, paired with a stable
+/// `scrollable` id on the consumer side, never jumps the scroll position). The
+/// first sync is treated as the list simply *appearing*, so opening a panel does
+/// not mass-reveal its whole backlog.
+///
+/// Removals are intentionally **not** animated here: the iced 0.13 fork has no
+/// clip/opacity/transform widget to height-collapse a *dynamic-height* row, so a
+/// vanished row is simply dropped on the next sync (the row-level reveal is the
+/// expressible half; a collapse-on-remove would need a clip widget the toolkit
+/// lacks). Pure state (no toolkit dep) — the consumer reads [`Self::row_params`]
+/// in its `view` and applies the alpha/translate to its themed row.
+///
+/// Tick-driven like [`Animator`]: advance with [`Self::gc`] from one subscription
+/// the consumer arms only while [`Self::is_idle`] is `false` (zero idle wakeups).
+#[derive(Debug, Clone, Default)]
+pub struct KeyedListReveal {
+    /// row key → its in-flight reveal tween.
+    entering: HashMap<String, Tween>,
+    /// the row keys present as of the last [`Self::sync`].
+    seen: std::collections::HashSet<String>,
+    /// whether a first sync has happened (so the initial list doesn't mass-reveal).
+    seeded: bool,
+    reduce_motion: bool,
+}
+
+impl KeyedListReveal {
+    /// A fresh, idle reveal. `reduce_motion` caps every reveal to the Carbon
+    /// ≤80 ms crossfade and drops the slide (via [`slide_in`]'s contract).
+    #[must_use]
+    pub fn new(reduce_motion: bool) -> Self {
+        Self {
+            entering: HashMap::new(),
+            seen: std::collections::HashSet::new(),
+            seeded: false,
+            reduce_motion,
+        }
+    }
+
+    /// Diff this frame's `keys` (the current row keys) against the previous sync:
+    /// arm a reveal for each key that is **new** (skipped on the very first sync),
+    /// forget reveals for rows that vanished, and record the current set. Call
+    /// once from the consumer's load/refresh handler with the freshly-loaded keys.
+    pub fn sync<I, S>(&mut self, keys: I, now: Instant)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let current: std::collections::HashSet<String> =
+            keys.into_iter().map(Into::into).collect();
+        if self.seeded {
+            for k in &current {
+                if !self.seen.contains(k) {
+                    self.entering.insert(
+                        k.clone(),
+                        Tween::resolved(now, Motion::panel_mount().duration, self.reduce_motion),
+                    );
+                }
+            }
+        }
+        // Drop reveals for rows that are no longer present (removed before settling).
+        self.entering.retain(|k, _| current.contains(k));
+        self.seen = current;
+        self.seeded = true;
+    }
+
+    /// The reveal [`RenderParams`] (alpha + `translate_y`) for the row keyed `key`
+    /// at `now`: a slide-up + fade for a freshly-inserted row, or the fully-shown
+    /// rest frame for a row that was already present (or any unknown key). Under
+    /// reduce-motion the slide drops to a crossfade ([`slide_in`]).
+    #[must_use]
+    pub fn row_params(&self, key: &str, now: Instant) -> RenderParams {
+        self.entering.get(key).map_or(
+            RenderParams {
+                alpha: 1.0,
+                translate_y: 0.0,
+                scale: 1.0,
+            },
+            |tw| {
+                slide_in(
+                    tw.start(),
+                    now,
+                    crate::motion::PANEL_MOUNT_TRANSLATE_Y_PX,
+                    self.reduce_motion,
+                )
+            },
+        )
+    }
+
+    /// Drop every settled reveal (call once per tick); returns the count still in
+    /// flight so the consumer's subscription can stop when it reaches 0.
+    pub fn gc(&mut self, now: Instant) -> usize {
+        self.entering.retain(|_, tw| !tw.is_complete(now));
+        self.entering.len()
+    }
+
+    /// `true` when no row is mid-reveal — the consumer stops ticking (zero idle
+    /// wakeups).
+    #[must_use]
+    pub fn is_idle(&self, now: Instant) -> bool {
+        self.entering.values().all(|tw| tw.is_complete(now))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1055,5 +1166,72 @@ mod tests {
                 assert_eq!(r.scale, 1.0);
             }
         }
+    }
+
+    // ── MOTION-TRANS-3 — KeyedListReveal ───────────────────────────────────────
+
+    #[test]
+    fn first_sync_never_mass_reveals_the_initial_list() {
+        // Opening a panel (first sync) treats the whole set as already present —
+        // every row is at rest, nothing strobes.
+        let t0 = Instant::now();
+        let mut r = KeyedListReveal::new(false);
+        r.sync(["a", "b", "c"], t0);
+        assert!(r.is_idle(t0), "first sync arms no reveal");
+        for k in ["a", "b", "c"] {
+            let p = r.row_params(k, t0);
+            assert!((p.alpha - 1.0).abs() < 1e-4, "{k} starts at rest");
+            assert_eq!(p.translate_y, 0.0);
+        }
+    }
+
+    #[test]
+    fn a_newly_inserted_row_reveals_then_settles() {
+        let t0 = Instant::now();
+        let mut r = KeyedListReveal::new(false);
+        r.sync(["a", "b"], t0); // seed
+        // A later refresh adds "c": only "c" reveals; "a"/"b" stay put.
+        r.sync(["a", "b", "c"], t0);
+        assert!(!r.is_idle(t0), "the inserted row is mid-reveal");
+        let c0 = r.row_params("c", t0);
+        assert!(c0.alpha < 1.0 && c0.translate_y > 0.0, "c starts low + faded");
+        assert_eq!(r.row_params("a", t0).translate_y, 0.0, "existing row never moves");
+        assert!((r.row_params("a", t0).alpha - 1.0).abs() < 1e-4);
+        // After the panel-mount duration the reveal settles + the tick can stop.
+        let done = t0 + Motion::panel_mount().duration;
+        let c1 = r.row_params("c", done);
+        assert!((c1.alpha - 1.0).abs() < 1e-4 && c1.translate_y.abs() < 1e-4);
+        assert!(r.is_idle(done));
+        assert_eq!(r.gc(done), 0, "gc clears the settled reveal");
+    }
+
+    #[test]
+    fn a_removed_row_drops_its_reveal_and_unchanged_rows_dont_restrobe() {
+        let t0 = Instant::now();
+        let mut r = KeyedListReveal::new(false);
+        r.sync(["a", "b"], t0);
+        r.sync(["a", "b", "c"], t0); // c revealing
+        assert!(!r.is_idle(t0));
+        // c is removed before it settled (accept/reject) → its reveal is dropped,
+        // and the steady rows a/b never animate on the refresh.
+        r.sync(["a", "b"], t0);
+        assert!(r.is_idle(t0), "removing the only revealing row leaves nothing in flight");
+        assert_eq!(r.row_params("c", t0).alpha, 1.0, "a dropped row reads as rest");
+        assert_eq!(r.row_params("a", t0).translate_y, 0.0);
+    }
+
+    #[test]
+    fn reduce_motion_reveal_drops_the_slide_and_caps_at_80ms() {
+        let t0 = Instant::now();
+        let mut r = KeyedListReveal::new(true);
+        r.sync(["a"], t0);
+        r.sync(["a", "b"], t0);
+        // No positional slide under reduce-motion (crossfade only)...
+        for ms in [0, 40, 80] {
+            let p = r.row_params("b", t0 + Duration::from_millis(ms));
+            assert_eq!(p.translate_y, 0.0, "no slide under reduce-motion at {ms}ms");
+        }
+        // ...and it settles within the Carbon 80 ms cap.
+        assert!(r.is_idle(t0 + Duration::from_millis(80) + Duration::from_millis(1)));
     }
 }
