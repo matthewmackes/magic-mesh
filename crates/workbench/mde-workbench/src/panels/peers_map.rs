@@ -86,6 +86,129 @@ pub struct MapNode {
     /// density + speed on its self→peer edge; 0.0 = idle (no particles, so
     /// an idle mesh draws nothing extra — the L22 budget).
     pub flow: f64,
+    /// MESHMAP-7 (W7) — the relay node's **hostname** when this peer's overlay
+    /// path is relayed through a lighthouse (resolved by the caller from the
+    /// `PathInfo.relay_via` overlay-IP against the roster). `None` for a direct
+    /// path. The draw pass bends the self→peer edge through this node's
+    /// projected position (two segments via the relay); direct paths are
+    /// straight.
+    pub relay_via: Option<String>,
+}
+
+impl MapNode {
+    /// MESHMAP-2 (W2) — this node's stable identity hue, derived from its
+    /// hostname (`mde_theme::node_hue_for`). Deterministic across reboots + the
+    /// same on every peer's map. The node DOT FILL + the packet particles this
+    /// node *sends* read this hue; presence drives the ring (a separate signal).
+    #[must_use]
+    pub fn hue(&self) -> mde_theme::Rgba {
+        mde_theme::node_hue_for(&self.hostname)
+    }
+}
+
+/// Map a hostname to a coarse geographic centroid in the same unit space the
+/// force [`layout`] uses (so geo + force positions are mutually scaled by the
+/// shared `projected()` pass). Returns `None` when no region token is present —
+/// the node then keeps its force-layout position (W4 fallback). Pure + offline:
+/// no network, no geoIP database — a small static table keyed off a region
+/// token detected in the hostname (the DO droplet naming convention) plus
+/// coarse continent fallbacks.
+///
+/// The centroids are spread on a rough equirectangular world projection
+/// (`x` ≈ longitude, growing eastward — west-coast NA negative, EU/Asia
+/// positive; `y` ≈ −latitude, growing southward) and scaled to the layout's
+/// unit space (a few hundred units), so DO's NA/EU/AP regions spread across the
+/// canvas.
+#[must_use]
+fn region_centroid(hostname: &str) -> Option<(f32, f32)> {
+    let h = hostname.to_ascii_lowercase();
+    // DO region centroids (the regions the fleet's lighthouses live in),
+    // west → east. (x, y) in layout unit space.
+    const TABLE: &[(&str, (f32, f32))] = &[
+        // North America.
+        ("sfo", (-520.0, -60.0)), // San Francisco
+        ("tor", (-180.0, -90.0)), // Toronto
+        ("nyc", (-120.0, -70.0)), // New York
+        // Europe.
+        ("lon", (120.0, -120.0)), // London
+        ("ams", (170.0, -130.0)), // Amsterdam
+        ("fra", (220.0, -110.0)), // Frankfurt
+        // Asia / Pacific.
+        ("blr", (460.0, 40.0)),  // Bangalore
+        ("sgp", (560.0, 60.0)),  // Singapore
+        ("syd", (640.0, 260.0)), // Sydney
+    ];
+    for (tok, c) in TABLE {
+        if h.contains(tok) {
+            return Some(*c);
+        }
+    }
+    // Coarse continent fallback for hostnames that name a continent but not a
+    // specific city/region.
+    const CONTINENT: &[(&str, (f32, f32))] = &[
+        ("-us", (-200.0, -60.0)),
+        ("-na", (-200.0, -60.0)),
+        ("-eu", (180.0, -110.0)),
+        ("-asia", (520.0, 40.0)),
+        ("-ap", (520.0, 40.0)),
+    ];
+    for (tok, c) in CONTINENT {
+        if h.contains(tok) {
+            return Some(*c);
+        }
+    }
+    None
+}
+
+/// MESHMAP-1 (W4) — geographic layout: each node whose hostname carries a known
+/// region token is placed at that region's centroid (spread + jittered so two
+/// nodes in one region don't overlap); every other node falls back to its
+/// force-directed [`layout`] position. Self stays at the origin only when its
+/// own region is unknown (a geo-known self sits at its real centroid). Pure +
+/// deterministic + offline.
+///
+/// When **no** node carries a region token this returns exactly the force
+/// [`layout`] (geo is then a no-op), so a region-less workgroup is unchanged.
+#[must_use]
+pub fn geo_layout(nodes: &[MapNode]) -> HashMap<String, (f32, f32)> {
+    let force = layout(nodes);
+    // Group geo-known nodes by region so we can fan co-located nodes out around
+    // the centroid (deterministic by seed_angle, no overlap).
+    let mut by_centroid: HashMap<(i32, i32), Vec<&str>> = HashMap::new();
+    for n in nodes {
+        if let Some((cx, cy)) = region_centroid(&n.hostname) {
+            by_centroid
+                .entry((cx as i32, cy as i32))
+                .or_default()
+                .push(&n.hostname);
+        }
+    }
+    let mut pos = force;
+    for n in nodes {
+        let Some((cx, cy)) = region_centroid(&n.hostname) else {
+            continue; // unknown region → keep force-layout position (W4 fallback)
+        };
+        let group = &by_centroid[&(cx as i32, cy as i32)];
+        let (gx, gy) = if group.len() <= 1 {
+            (cx, cy)
+        } else {
+            // Fan co-located nodes onto a small deterministic ring around the
+            // centroid (stable by hostname, so no churn).
+            let idx = group.iter().position(|h| *h == n.hostname).unwrap_or(0);
+            let a = seed_angle(&n.hostname) + idx as f32 * 0.9;
+            (cx + a.cos() * 46.0, cy + a.sin() * 46.0)
+        };
+        pos.insert(n.hostname.clone(), (gx, gy));
+    }
+    pos
+}
+
+/// MESHMAP-1 (W4) — does any node in the set carry a known region token? When
+/// false, [`geo_layout`] equals the force [`layout`] and the faint map backdrop
+/// is suppressed (a region-less workgroup gets the plain force map). Pure.
+#[must_use]
+pub fn any_geo_known(nodes: &[MapNode]) -> bool {
+    nodes.iter().any(|n| region_centroid(&n.hostname).is_some())
 }
 
 /// Deterministic seed angle for a hostname (stable across refreshes
@@ -169,6 +292,23 @@ pub struct MapProgram {
     /// by the panel's frame tick. Particles ride each active edge at
     /// `(phase + k/N) mod 1`; a fresh value each frame moves them.
     pub flow_phase: f32,
+    /// MESHMAP-3 (W3/W5) — **self's own** normalized overlay throughput
+    /// (0.0..=1.0). The self→peer particle stream (self is the sender that
+    /// direction) keys its density + speed on this; the peer→self stream keys
+    /// on the peer's `flow` (the peer is the sender that direction). 0.0 ⇒ no
+    /// self-sent particles (the W8 idle gate per direction).
+    pub self_flow: f64,
+    /// MESHMAP-1 (W4) — render the faint Carbon-Gray geographic backdrop +
+    /// treat `positions` as geo-projected. Set by the caller from
+    /// [`any_geo_known`]; when false the map is the plain force layout (no
+    /// backdrop), so a region-less workgroup is unchanged.
+    pub geo: bool,
+    /// MESHMAP-5 (W8) — reduce-motion: draw STATIC colored edges (no particle
+    /// animation), per Carbon §4 + WCAG 2.3.1. Set by the caller from
+    /// `crate::live_theme::reduce_motion()`. Edges still carry the sender-hue
+    /// tint so the per-direction color identity survives; only the moving dots
+    /// are dropped.
+    pub reduce_motion: bool,
 }
 
 /// Node hit radius (px, post-scale).
@@ -251,6 +391,78 @@ impl MapProgram {
     }
 }
 
+/// MESHMAP-3/-4 — draw one direction's packet-particle stream riding a polyline
+/// (`waypoints`: `[origin, …relay…, dest]`, ≥2 points). Density (`1..=6`) +
+/// along-path speed scale with the sender's normalized `flow`; the dots are the
+/// sender's `color` (W3 by-sender). `reverse` walks the path dest→origin (the
+/// peer→self direction). Below the idle gate (`flow ≤ 0.02`) nothing is drawn,
+/// so an idle direction costs nothing (W8). Pure draw into `frame`.
+fn draw_particles(
+    frame: &mut Frame,
+    waypoints: &[Point],
+    flow: f64,
+    color: cosmic::iced::Color,
+    phase: f32,
+    reverse: bool,
+) {
+    if flow <= 0.02 || waypoints.len() < 2 {
+        return;
+    }
+    let count = 1 + (flow * 5.0).round() as usize; // 1..=6
+    let speed = 0.5 + flow as f32; // laps-per-cycle
+    for k in 0..count {
+        let base = (k as f32) / count as f32;
+        let mut t = (phase * speed + base).fract();
+        if reverse {
+            t = 1.0 - t;
+        }
+        let pt = polyline_point(waypoints, t);
+        frame.fill(&Path::circle(pt, 2.0), color);
+    }
+}
+
+/// Point at fraction `t` (0.0..=1.0) along a polyline by arc length (so a bent
+/// relay path animates at a constant visual speed across both segments). Pure.
+fn polyline_point(pts: &[Point], t: f32) -> Point {
+    if pts.len() < 2 {
+        return pts.first().copied().unwrap_or(Point::ORIGIN);
+    }
+    let seg_len = |a: Point, b: Point| ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
+    let total: f32 = pts.windows(2).map(|w| seg_len(w[0], w[1])).sum();
+    if total <= f32::EPSILON {
+        return pts[0];
+    }
+    let target = t.clamp(0.0, 1.0) * total;
+    let mut acc = 0.0;
+    for w in pts.windows(2) {
+        let l = seg_len(w[0], w[1]);
+        if acc + l >= target {
+            let local = if l <= f32::EPSILON {
+                0.0
+            } else {
+                (target - acc) / l
+            };
+            return Point::new(
+                w[0].x + (w[1].x - w[0].x) * local,
+                w[0].y + (w[1].y - w[0].y) * local,
+            );
+        }
+        acc += l;
+    }
+    *pts.last().unwrap()
+}
+
+/// Midpoint of a polyline for the RTT label: the middle vertex when the path is
+/// bent (a relay path's label sits at the relay), else the segment midpoint.
+fn polyline_mid(pts: &[Point]) -> Point {
+    match pts.len() {
+        0 => Point::ORIGIN,
+        1 => pts[0],
+        2 => Point::new((pts[0].x + pts[1].x) / 2.0, (pts[0].y + pts[1].y) / 2.0),
+        _ => pts[pts.len() / 2],
+    }
+}
+
 /// Perpendicular distance from `p` to the segment `a`–`b` (px).
 fn point_segment_dist(p: Point, a: Point, b: Point) -> f32 {
     let (vx, vy) = (b.x - a.x, b.y - a.y);
@@ -313,6 +525,34 @@ impl canvas::Program<crate::Message> for MapProgram {
             .and_then(|n| proj.get(&n.hostname))
             .copied();
 
+        // MESHMAP-1 (W4) — faint Carbon-Gray map backdrop under the scene when
+        // the nodes are geo-placed. A low-contrast equator + meridian crosshair
+        // (Gray 70 hairlines) reads as a world-map ground without any raster
+        // asset; suppressed when no node is geo-known (plain force map).
+        if self.geo {
+            let grid = p.overlay.into_cosmic_color(); // Gray 70 hairline
+            let eq = bounds.height * 0.46; // ~equator on the projection
+            frame.stroke(
+                &Path::line(Point::new(0.0, eq), Point::new(bounds.width, eq)),
+                Stroke::default().with_color(grid).with_width(1.0),
+            );
+            for frac in [0.25_f32, 0.5, 0.75] {
+                let mx = bounds.width * frac;
+                frame.stroke(
+                    &Path::line(Point::new(mx, 0.0), Point::new(mx, bounds.height)),
+                    Stroke::default().with_color(grid).with_width(1.0),
+                );
+            }
+        }
+
+        // Self's identity hue (the sender hue for the self→peer direction).
+        let self_hue = self
+            .nodes
+            .iter()
+            .find(|n| n.is_self)
+            .map(MapNode::hue)
+            .unwrap_or(p.accent);
+
         // Edges self→peer first (under the nodes).
         if let Some(origin) = self_point {
             for n in self.nodes.iter().filter(|n| !n.is_self) {
@@ -325,32 +565,59 @@ impl canvas::Program<crate::Message> for MapProgram {
                 } else {
                     p.danger.into_cosmic_color()
                 };
-                frame.stroke(
-                    &Path::line(origin, to),
-                    Stroke::default()
-                        .with_color(color)
-                        .with_width(if reachable { 1.5 } else { 1.0 }),
-                );
-                // PD-7/L18 — flow particles: dots riding the edge while the
-                // peer moves real overlay traffic (Netdata-sourced `flow`).
-                // Density + along-edge speed scale with `flow`; an idle edge
-                // (flow ≈ 0) draws nothing, so the canvas stays cheap (L22).
-                if reachable && n.flow > 0.02 {
-                    let count = 1 + (n.flow * 5.0).round() as usize; // 1..=6
-                    let speed = 0.5 + n.flow as f32; // laps-per-cycle
-                    for k in 0..count {
-                        let base = (k as f32) / count as f32;
-                        let t = (self.flow_phase * speed + base).fract();
-                        let px = origin.x + (to.x - origin.x) * t;
-                        let py = origin.y + (to.y - origin.y) * t;
-                        frame.fill(
-                            &Path::circle(Point::new(px, py), 2.0),
-                            p.accent.into_cosmic_color(),
-                        );
-                    }
+                // MESHMAP-4 (W7) — a relayed path bends through the relaying
+                // lighthouse node's projected position (two segments); a direct
+                // path is one straight segment. Particles ride the same polyline.
+                let waypoints: Vec<Point> = match n
+                    .relay_via
+                    .as_deref()
+                    .filter(|via| reachable && *via != n.hostname)
+                    .and_then(|via| proj.get(via))
+                {
+                    Some(&relay) => vec![origin, relay, to],
+                    None => vec![origin, to],
+                };
+                for seg in waypoints.windows(2) {
+                    frame.stroke(
+                        &Path::line(seg[0], seg[1]),
+                        Stroke::default()
+                            .with_color(color)
+                            .with_width(if reachable { 1.5 } else { 1.0 }),
+                    );
                 }
-                // RTT label at the midpoint; × for unreachable.
-                let mid = Point::new((origin.x + to.x) / 2.0, (origin.y + to.y) / 2.0);
+                // MESHMAP-3/-5 (W3/W5/W8) — TWO per-direction particle streams,
+                // each colored by that direction's SENDER (EtherApe by-node
+                // coloring). self→peer is sent by SELF (self_hue, gated on
+                // self_flow); peer→self is sent by the PEER (its hue, gated on
+                // its flow). Density+speed ∝ the sender's throughput. Each
+                // stream's idle gate is independent (flow ≤ 0.02 ⇒ nothing), so
+                // an idle edge draws no dots (W8 zero-CPU). Under reduce-motion
+                // (W8/WCAG 2.3.1) no dots are drawn at all — the edge keeps the
+                // sender-hue tint below but never animates.
+                if reachable && !self.reduce_motion {
+                    // self→peer (forward along the waypoints): sent by self.
+                    draw_particles(
+                        &mut frame,
+                        &waypoints,
+                        self.self_flow,
+                        self_hue.into_cosmic_color(),
+                        self.flow_phase,
+                        false,
+                    );
+                    // peer→self (reverse along the waypoints): sent by the peer.
+                    draw_particles(
+                        &mut frame,
+                        &waypoints,
+                        n.flow,
+                        n.hue().into_cosmic_color(),
+                        self.flow_phase,
+                        true,
+                    );
+                }
+                // RTT label at the midpoint of the (possibly bent) path; × for
+                // unreachable. The midpoint is the polyline's middle vertex when
+                // bent, else the segment midpoint.
+                let mid = polyline_mid(&waypoints);
                 let label = n.rtt_ms.map_or("×".to_string(), |ms| format!("{ms:.0} ms"));
                 frame.fill_text(Text {
                     content: label,
@@ -367,10 +634,21 @@ impl canvas::Program<crate::Message> for MapProgram {
             let Some(&at) = proj.get(&n.hostname) else {
                 continue;
             };
-            let (fill, ring) = match n.presence.as_str() {
-                "online" => (p.success, p.border),
-                "idle" => (p.warning, p.border),
-                _ => (p.text_muted, p.danger),
+            // MESHMAP-2 (W2) — the node DOT FILL is the node's STABLE IDENTITY
+            // HUE (hash(hostname)→hue, same across reboots + every peer's map);
+            // PRESENCE drives the RING color only (online/idle→border, offline→
+            // danger). An offline node's hue is dimmed (60 % alpha) so it reads
+            // as "this is still <node>, but dark". (Previously presence drove
+            // both fill + ring, which gave every online node the same green.)
+            let hue = n.hue();
+            let fill = if n.presence == "offline" {
+                hue.with_alpha(0.6)
+            } else {
+                hue
+            };
+            let ring = match n.presence.as_str() {
+                "online" | "idle" => p.border,
+                _ => p.danger,
             };
             let r = if n.is_self { 14.0 } else { 10.0 };
             // LIGHTHOUSE-7 — the beacon hero motif. An anchor node renders a
@@ -555,6 +833,7 @@ mod tests {
             is_self,
             lighthouse: false,
             flow: 0.0,
+            relay_via: None,
         }
     }
 
@@ -632,6 +911,9 @@ mod tests {
             positions,
             palette: Palette::dark(),
             flow_phase: 0.0,
+            self_flow: 0.0,
+            geo: false,
+            reduce_motion: false,
         };
         let bounds = Rectangle::with_size(cosmic::iced::Size::new(800.0, 600.0));
         // A click far outside any node hits nothing.
@@ -676,6 +958,9 @@ mod tests {
             positions,
             palette: Palette::dark(),
             flow_phase: 0.0,
+            self_flow: 0.0,
+            geo: false,
+            reduce_motion: false,
         };
         let bounds = Rectangle::with_size(cosmic::iced::Size::new(800.0, 600.0));
         let proj = prog.projected(&bounds);
@@ -688,5 +973,124 @@ mod tests {
             Some("oak"),
             "midpoint hits the self→oak edge"
         );
+    }
+
+    #[test]
+    fn node_hue_distinguishes_nodes_and_is_stable() {
+        // MESHMAP-2 (W2) — a node's identity hue is its hostname's stable hue,
+        // distinct from other nodes' and unchanged across `MapNode` rebuilds
+        // (presence change doesn't move the hue — only the ring).
+        let a = node("anvil", "online", Some(5.0), false);
+        let a2 = node("anvil", "offline", None, false);
+        let b = node("forge", "online", Some(5.0), false);
+        assert_eq!(a.hue(), a2.hue(), "hue is stable across presence change");
+        assert_ne!(a.hue(), b.hue(), "distinct hostnames get distinct hues");
+        // The hue is exactly the mde-theme node-hue (single-sourced, no local
+        // color math in the panel — §4).
+        assert_eq!(a.hue(), mde_theme::node_hue_for("anvil"));
+    }
+
+    #[test]
+    fn geo_layout_places_known_regions_and_falls_back_otherwise() {
+        // MESHMAP-1 (W4) — a hostname carrying a region token lands at that
+        // region's centroid band; a region-less host keeps its force position.
+        let nodes = vec![
+            node("self-laptop", "online", None, true), // no region → force
+            node("lighthouse-nyc3", "online", Some(20.0), false), // NA east
+            node("lighthouse-sfo3", "online", Some(80.0), false), // NA west
+            node("lighthouse-fra1", "online", Some(110.0), false), // EU
+        ];
+        assert!(any_geo_known(&nodes), "region tokens detected");
+        let geo = geo_layout(&nodes);
+        let force = layout(&nodes);
+        let x = |m: &HashMap<String, (f32, f32)>, h: &str| m[h].0;
+        // West-coast (sfo) sits west of east-coast (nyc) which sits west of EU.
+        assert!(
+            x(&geo, "lighthouse-sfo3") < x(&geo, "lighthouse-nyc3"),
+            "sfo west of nyc: {} vs {}",
+            x(&geo, "lighthouse-sfo3"),
+            x(&geo, "lighthouse-nyc3")
+        );
+        assert!(
+            x(&geo, "lighthouse-nyc3") < x(&geo, "lighthouse-fra1"),
+            "nyc west of fra"
+        );
+        // The region-less self keeps its force-layout position (W4 fallback).
+        assert_eq!(
+            geo["self-laptop"], force["self-laptop"],
+            "unknown-region node falls back to the force position"
+        );
+    }
+
+    #[test]
+    fn geo_layout_is_force_layout_when_no_region_known() {
+        // A region-less workgroup gets exactly the force map (geo is a no-op),
+        // and the backdrop is suppressed.
+        let nodes = vec![
+            node("self", "online", None, true),
+            node("oak", "online", Some(10.0), false),
+            node("elm", "online", Some(40.0), false),
+        ];
+        assert!(!any_geo_known(&nodes), "no region tokens");
+        assert_eq!(
+            geo_layout(&nodes),
+            layout(&nodes),
+            "region-less → identical to force layout"
+        );
+    }
+
+    #[test]
+    fn relayed_edge_bends_through_the_relay_node() {
+        // MESHMAP-4 (W7) — when a peer's path is relayed via a node we have a
+        // position for, the edge is a 3-point polyline through the relay; a
+        // direct path stays a 2-point segment. Exercise the waypoint selection
+        // the draw pass uses (the geometry that bends the path).
+        let mut relayed = node("forge", "online", Some(60.0), false);
+        relayed.relay_via = Some("lighthouse-01".into());
+        let proj: HashMap<String, Point> = [
+            ("self".to_string(), Point::new(0.0, 0.0)),
+            ("forge".to_string(), Point::new(100.0, 0.0)),
+            ("lighthouse-01".to_string(), Point::new(50.0, 80.0)),
+        ]
+        .into_iter()
+        .collect();
+        let origin = proj["self"];
+        let to = proj["forge"];
+        let waypoints: Vec<Point> = match relayed
+            .relay_via
+            .as_deref()
+            .filter(|via| *via != relayed.hostname)
+            .and_then(|via| proj.get(via))
+        {
+            Some(&relay) => vec![origin, relay, to],
+            None => vec![origin, to],
+        };
+        assert_eq!(waypoints.len(), 3, "relayed path bends (3 vertices)");
+        assert_eq!(waypoints[1], proj["lighthouse-01"], "bend is at the relay");
+        // The label sits at the relay vertex for a bent path.
+        assert_eq!(polyline_mid(&waypoints), proj["lighthouse-01"]);
+
+        // A direct (no relay) path is a straight 2-point segment.
+        let direct = node("oak", "online", Some(10.0), false);
+        let dwp: Vec<Point> = match direct.relay_via.as_deref().and_then(|via| proj.get(via)) {
+            Some(&relay) => vec![origin, relay, to],
+            None => vec![origin, to],
+        };
+        assert_eq!(dwp.len(), 2, "direct path is straight");
+    }
+
+    #[test]
+    fn polyline_point_is_arc_length_parametrized() {
+        // t=0 → start, t=1 → end, t=0.5 → arc-length midpoint (across a bend).
+        let pts = [
+            Point::new(0.0, 0.0),
+            Point::new(10.0, 0.0),
+            Point::new(10.0, 10.0),
+        ];
+        assert_eq!(polyline_point(&pts, 0.0), pts[0]);
+        assert_eq!(polyline_point(&pts, 1.0), pts[2]);
+        // Total length 20; half (10) lands exactly at the bend vertex.
+        let m = polyline_point(&pts, 0.5);
+        assert!((m.x - 10.0).abs() < 0.01 && m.y.abs() < 0.01, "mid at bend");
     }
 }

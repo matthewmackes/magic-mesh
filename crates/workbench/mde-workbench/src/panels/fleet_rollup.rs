@@ -423,6 +423,8 @@ impl FleetRollupPanel {
                     // PD-7/L18 — the rollup map is a static overview; no live
                     // flow particles here (the Peers Map drives those).
                     flow: 0.0,
+                    // MESHMAP-4 — the static rollup doesn't draw relay bends.
+                    relay_via: None,
                 })
                 .collect();
             let positions = layout(&nodes);
@@ -437,6 +439,11 @@ impl FleetRollupPanel {
                     positions,
                     palette: content_palette,
                     flow_phase: 0.0,
+                    // MESHMAP-3/-1/-5 — the rollup is a static overview: no
+                    // self-flow particles, no geo backdrop, motion off.
+                    self_flow: 0.0,
+                    geo: false,
+                    reduce_motion: true,
                 })
                 .width(Length::Fill)
                 .height(Length::Fixed(260.0))
