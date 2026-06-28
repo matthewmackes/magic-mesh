@@ -43,7 +43,8 @@ use cosmic::Element;
 
 use crate::cosmic_compat::prelude::*;
 use mde_theme::{
-    mde_icon, FontSize, FontWeight, Icon, IconSize, Palette, Shadow as MdeShadow, TypeRole,
+    mde_icon, FontSize, FontWeight, Icon, IconSize, LoadState, Palette, Shadow as MdeShadow,
+    StateTone, TypeRole,
 };
 
 /// Header bar height — locked to the worklist UX-4 (a) spec.
@@ -91,6 +92,7 @@ pub enum HeaderAction {
 /// wraps it in `Message::WindowControl(action)`.
 pub fn view<'a, Message: Clone + 'a>(
     on_action: impl Fn(HeaderAction) -> Message + 'a,
+    status: LoadState,
 ) -> Element<'a, Message> {
     let palette = crate::live_theme::palette();
     let sizes = FontSize::defaults();
@@ -152,6 +154,12 @@ pub fn view<'a, Message: Clone + 'a>(
             .height(Length::Fixed(HEADER_HEIGHT))
             .align_y(alignment::Vertical::Center),
         Space::new().width(Length::Fill),
+        // MOTION-NET-5 — the control-plane connectivity indicator sits between the
+        // flexible gap and the window controls, so it's always visible without
+        // crowding the wordmark.
+        container(status_indicator(status, palette))
+            .height(Length::Fixed(HEADER_HEIGHT))
+            .align_y(alignment::Vertical::Center),
         container(controls)
             .height(Length::Fixed(HEADER_HEIGHT))
             .align_y(alignment::Vertical::Center),
@@ -175,6 +183,53 @@ pub fn view<'a, Message: Clone + 'a>(
             text_color: Some(palette.text.into_cosmic_color()),
         })
         .into()
+}
+
+/// MOTION-NET-5 — the control-plane connectivity status pill: a **non-motion**
+/// icon glyph + label in the state's semantic tone. Rendered only for the
+/// *interesting* states — `Refreshing` (a background poll is in flight, the
+/// subtle background-work indicator) and the degraded `Degraded`/`Offline`/
+/// `Failed` states (the auto-recovering connection banner); a healthy idle header
+/// (`Loaded`/`Idle`) shows nothing, so the chrome stays clean. The cue is legible
+/// without motion (icon *shape* + text), satisfying the a11y contract, and it is
+/// presentation-only — it never blocks input.
+fn status_indicator<'a, Message: 'a>(status: LoadState, palette: Palette) -> Element<'a, Message> {
+    // Healthy + idle ⇒ no pill (no clutter); the indicator only appears when the
+    // system is refreshing or degraded/offline/failed.
+    if matches!(status, LoadState::Loaded | LoadState::Idle) {
+        return Space::new().width(Length::Fixed(0.0)).into();
+    }
+    let sizes = FontSize::defaults();
+    let tone = tone_color(status.tone(), palette);
+    let glyph = text(status.icon().to_string())
+        .size(TypeRole::Body.size_in(sizes))
+        .colr(tone)
+        .align_y(alignment::Vertical::Center);
+    let label = text(status.label())
+        .size(TypeRole::Caption.size_in(sizes))
+        .colr(tone)
+        .align_y(alignment::Vertical::Center);
+    container(
+        row![glyph, Space::new().width(Length::Fixed(6.0)), label]
+            .align_y(alignment::Vertical::Center),
+    )
+    .padding([0u16, 12u16])
+    .height(Length::Fixed(HEADER_HEIGHT))
+    .align_y(alignment::Vertical::Center)
+    .into()
+}
+
+/// MOTION-NET-5 — map a [`StateTone`] onto the single-sourced Carbon palette
+/// support tokens (§4 — no raw hex). The tone is the secondary colour cue; the
+/// icon + label are the primary, motion-independent differentiators.
+fn tone_color(tone: StateTone, palette: Palette) -> Color {
+    match tone {
+        StateTone::Neutral => palette.text_muted.into_cosmic_color(),
+        StateTone::Info => palette.accent.into_cosmic_color(),
+        StateTone::Warning => palette.warning.into_cosmic_color(),
+        StateTone::Danger => palette.danger.into_cosmic_color(),
+        StateTone::Success => palette.success.into_cosmic_color(),
+    }
 }
 
 /// Single window-control button. `accent_close` flips the hover
@@ -333,6 +388,42 @@ mod tests {
             let f = |x: HeaderAction| x;
             assert_eq!(f(captured), a);
         }
+    }
+
+    #[test]
+    fn status_indicator_constructs_for_every_state() {
+        // MOTION-NET-5 — the pill builds for all seven states (and renders nothing
+        // for the healthy idle ones).
+        let palette = crate::live_theme::palette();
+        for s in [
+            LoadState::Idle,
+            LoadState::Loading,
+            LoadState::Refreshing { stale: true },
+            LoadState::Degraded,
+            LoadState::Offline,
+            LoadState::Failed,
+            LoadState::Loaded,
+        ] {
+            let _: Element<'_, ()> = status_indicator(s, palette);
+        }
+    }
+
+    #[test]
+    fn tone_color_maps_every_tone_to_a_palette_token() {
+        // MOTION-NET-5 / §4 — every tone resolves to a single-sourced palette
+        // support token (no raw hex), and the alert tones differ from neutral.
+        let palette = crate::live_theme::palette();
+        let neutral = tone_color(StateTone::Neutral, palette);
+        let warning = tone_color(StateTone::Warning, palette);
+        let danger = tone_color(StateTone::Danger, palette);
+        assert_eq!(warning, palette.warning.into_cosmic_color());
+        assert_eq!(danger, palette.danger.into_cosmic_color());
+        assert_eq!(
+            tone_color(StateTone::Info, palette),
+            palette.accent.into_cosmic_color()
+        );
+        // An alert tone reads differently from the neutral/muted tone.
+        assert_ne!(neutral, danger);
     }
 
     #[test]
