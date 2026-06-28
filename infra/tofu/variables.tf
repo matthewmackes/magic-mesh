@@ -1,11 +1,15 @@
+# DAR / DEVOPS-AUTOMATION-REBUILD §2.8: this whole top-level root is the DEPRECATED
+# Xen Orchestra path. XO is dead on the live fleet (ws connection-refused) and the
+# farm is XAPI-managed via infra/tofu/xen-xapi/ — do NOT apply this root. The dead
+# LAN websocket default is removed so no stale literal lingers in a tracked .tf; if
+# anyone resurrects an XO, they must supply xo_url explicitly.
 variable "xo_url" {
-  description = "Xen Orchestra websocket URL."
+  description = "DEPRECATED (XO path retired — use infra/tofu/xen-xapi/). Xen Orchestra websocket URL; no default — must be supplied if the dead XO root is ever revived."
   type        = string
-  default     = "ws://172.20.145.192:8080"
 }
 
 variable "xo_insecure" {
-  description = "Skip TLS verification (XO CE here is plain ws on the LAN)."
+  description = "DEPRECATED (XO path retired). Skip TLS verification (XO CE was plain ws on the LAN)."
   type        = bool
   default     = true
 }
@@ -16,12 +20,15 @@ variable "golden_template_name" {
     (UEFI) by install-helpers/setup-xcp-golden-template.sh. Set to "" to make the
     build-VM resources inert (count 0) — useful for a connectivity-only plan.
   EOT
-  # MDE-VM-golden-tc is the toolchained bake (rustc/cargo/generate-rpm/mold
-  # pre-installed in /home/mm/.cargo) so an elastic clone is build-ready at
-  # first boot with no ~15-min toolchain step — what makes scale-from-zero
-  # practical. Plain MDE-VM-golden (no toolchain) is the fallback.
-  type        = string
-  default     = "MDE-VM-golden-tc"
+  # DAR-34: the toolchain (rustc/cargo/generate-rpm/mold) is BAKED INTO the ONE
+  # canonical template `MDE-VM-golden` — no separate `-tc` artifact, no name drift.
+  # An elastic clone is build-ready at first boot with no ~15-min toolchain step
+  # (what makes scale-from-zero practical). The bake is conveyed by the template
+  # CONTENT, not a name suffix; `provision_build_ready` collapses to the baseline
+  # snapshot. (Historically this default carried a `-tc` toolchain-bake suffix; the
+  # bake is now in the canonical template, so the suffix is retired.)
+  type    = string
+  default = "MDE-VM-golden"
 }
 
 # --- FARM-AUTOSCALE shape model (docs/design/farm-autoscale.md, FA-1) ---
