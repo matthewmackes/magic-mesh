@@ -1,0 +1,51 @@
+# DAR-24 — CI RPM build + stage (UNSIGNED → HOLD). On every master push (or manual
+# dispatch) the host-native runner (label farm) builds the full + server RPMs via
+# the existing build-rpm-fedora43.sh, then createrepo_c's them into the sovereign
+# dnf channel's HOLD area (dnf-channel-up.sh). Signing stays OPERATOR-GATED — this
+# workflow NEVER calls sign-release.sh / the GPG step; an operator promotes out of
+# HOLD at /release time.
+name: rpm-publish
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
+    inputs:
+      fedora:
+        description: 'Fedora releasever to build for'
+        required: false
+        default: '43'
+
+jobs:
+  build-and-stage:
+    runs-on: farm    # host-native runner on the control VM → inherits mesh key + overlay
+    env:
+      FEDORA: ${{ github.event.inputs.fedora || '43' }}
+      # The sovereign dnf channel root (dnf-channel-up.sh); HOLD subdir is the
+      # unsigned staging area. Overridable per-mesh via the runner env.
+      MCNF_DNF_ROOT: /var/lib/mcnf-dnf-channel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the full magic-mesh RPM (fedora-${{ env.FEDORA }})
+        run: ./install-helpers/build-rpm-fedora43.sh "${FEDORA}"
+
+      - name: Build the headless magic-mesh-server RPM
+        run: ./install-helpers/build-rpm-fedora43.sh --server "${FEDORA}"
+
+      - name: Stage UNSIGNED RPMs into the channel HOLD area + createrepo_c
+        run: |
+          set -euo pipefail
+          HOLD="${MCNF_DNF_ROOT}/fedora-${FEDORA}-x86_64/HOLD"
+          mkdir -p "$HOLD"
+          # build-rpm-fedora43.sh writes target-f43/generate-rpm/magic-mesh-*.x86_64.rpm
+          # (full) and magic-mesh-server-*.x86_64.rpm (server).
+          shopt -s nullglob
+          rpms=( target-f43/generate-rpm/magic-mesh-*.x86_64.rpm )
+          [ "${#rpms[@]}" -gt 0 ] || { echo "no RPMs produced under target-f43/generate-rpm/" >&2; exit 1; }
+          cp -v "${rpms[@]}" "$HOLD/"
+          # Re-index the arch dir (HOLD RPMs become dnf-visible for test installs).
+          createrepo_c --update "${MCNF_DNF_ROOT}/fedora-${FEDORA}-x86_64"
+          echo "Staged ${#rpms[@]} UNSIGNED RPM(s) into $HOLD — NOT signed (operator-gated)."
+
+      # NOTE: there is intentionally NO 'sign' step here. Signing is the operator's
+      # /release gate (sign-release.sh + the project GPG key); CI only stages.
