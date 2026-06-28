@@ -558,6 +558,12 @@ fn gather_xen() -> Vec<DcResource> {
     // below (the path is published + can degrade to Direct independently).
     let on_lan = node_on_lan();
     let relay = xen_relay_peer();
+    // DATACENTER-16: read the operator's idle-shutdown policy once per pass (the
+    // gate set by `action/dc/host-idle-policy`). Default-disarmed → no shutdowns.
+    let idle_policy = crate::ipc::dc_common::read_arm(
+        &crate::ipc::dc_common::dc_state_dir(std::path::Path::new(".")),
+        "idle-policy",
+    );
     let mut out = Vec::new();
     for dom0 in xen_dom0s() {
         let mut route = XenRoute::open(&dom0, on_lan, relay.as_deref());
@@ -636,6 +642,18 @@ fn gather_xen() -> Vec<DcResource> {
         if let Some(hn) = host_name {
             let sig = idle_power_signal(&dom0, &hn, running_vms);
             out.push(DcResource::new("power", dom0.clone(), sig));
+            // DATACENTER-16: enforce the idle-shutdown policy. Only acts when the
+            // operator armed it AND the host has zero running VMs (host readable →
+            // real name, so this never fires on a probe miss). The host going down
+            // surfaces as a `gone` event on the next reconcile.
+            if should_idle_shutdown(running_vms, idle_policy)
+                && route.run(&key, idle_shutdown_remote()).is_some()
+            {
+                tracing::info!(
+                    dom0 = %dom0,
+                    "DATACENTER-16: idle host auto-shutdown (policy armed, 0 running VMs)"
+                );
+            }
         }
     }
     out
@@ -659,6 +677,25 @@ pub fn idle_power_signal(dom0: &str, host_name: &str, running_vms: usize) -> Str
         "hint": if idle { "candidate-for-shutdown" } else { "in-use" }
     })
     .to_string()
+}
+
+/// DATACENTER-16 — whether to ACT on the idle signal and auto-shut-down a host.
+/// PURE: a host is shut down only when the operator-armed idle policy is on AND it
+/// has zero running VMs. Default-disarmed, so the gather is a pure observer unless
+/// the operator opts in via `action/dc/host-idle-policy {"on":true}`.
+#[must_use]
+pub fn should_idle_shutdown(running_vms: usize, policy_armed: bool) -> bool {
+    policy_armed && running_vms == 0
+}
+
+/// The remote script that gracefully powers a zero-running-VM dom0 down (resolve
+/// uuid → disable → shutdown). PURE constant (no interpolation). XAPI requires the
+/// host be disabled before shutdown.
+#[must_use]
+pub fn idle_shutdown_remote() -> &'static str {
+    "UUID=$(xe host-list params=uuid --minimal | cut -d, -f1); \
+     [ -n \"$UUID\" ] || exit 1; \
+     xe host-disable host=$UUID && xe host-shutdown host=$UUID"
 }
 
 /// Host of the on-prem UniFi gateway (the router) to sample over SSH —
@@ -987,6 +1024,25 @@ mod tests {
         assert_eq!(v["running_vms"], 3);
         assert_eq!(v["idle"], false);
         assert_eq!(v["hint"], "in-use");
+    }
+
+    #[test]
+    fn should_idle_shutdown_requires_armed_policy_and_zero_vms() {
+        // Disarmed → never shut down, regardless of VM count (pure observer).
+        assert!(!should_idle_shutdown(0, false));
+        assert!(!should_idle_shutdown(3, false));
+        // Armed → only when zero running VMs.
+        assert!(should_idle_shutdown(0, true));
+        assert!(!should_idle_shutdown(1, true));
+    }
+
+    #[test]
+    fn idle_shutdown_remote_disables_then_shuts_down() {
+        let r = idle_shutdown_remote();
+        assert!(r.contains("xe host-disable"));
+        assert!(r.contains("xe host-shutdown"));
+        // disable must precede shutdown (XAPI requirement)
+        assert!(r.find("host-disable").unwrap() < r.find("host-shutdown").unwrap());
     }
 
     #[test]
