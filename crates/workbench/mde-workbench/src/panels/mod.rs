@@ -26,6 +26,8 @@ pub mod fleet_rollup;
 pub mod fleet_settings;
 /// FRONTDOOR-1 — the GPU canvas tile-grid "Front Door" home.
 pub mod front_door;
+/// DATACENTER-18 — the New-Mesh genesis wizard ("give birth to a new Nebula").
+pub mod genesis;
 pub mod hardware;
 pub mod health_check;
 pub mod help_index;
