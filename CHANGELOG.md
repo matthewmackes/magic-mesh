@@ -13,6 +13,46 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
+## [11.1.0] — 2026-06-28
+A large feature wave: the desktop launcher + mesh-map surfaces, the New-Mesh
+genesis wizard, and the reproducible **DevOps backoffice** (DEVOPS-AUTOMATION-REBUILD).
+### Added
+- **MESHMAP — EtherApe-like global-mesh wallpaper.** Geographic node placement,
+  stable per-node hue, per-direction packet-particle traffic colored by the sending
+  node, relay paths bent through the lighthouse, reduce-motion/zero-CPU-idle, and a
+  `link_traffic` mackesd collector reading per-peer nftables byte counters for real
+  per-link volume (with an honest per-node-throughput fallback).
+- **APPLAUNCH — the unified Front-Door launcher.** Filter chips (Local/Mesh/Workloads/
+  Services) + favorites grid, fuzzy search + `>`-run, real app icons, operator groups,
+  on-demand peer-app discovery + launch-on-peer, cache + lazy-mesh, keyboard-first.
+  The standalone `mde-apps-applet` is **retired** — the Front Door is the sole launcher.
+- **DATACENTER-18 — New-Mesh genesis wizard** ("give birth to a new Nebula"): plan +
+  Tofu-write the founding lighthouse + DNS + first join token (live apply gated).
+- **DATACENTER-21 — provisioning test-mesh + farm-scale UI** over the `action/dc/testbed-*`
+  + `farm-scale` verbs.
+- **VM-internal services** are discoverable: Instances rows correlate to their
+  enrolled-peer services.
+- **DEVOPS-AUTOMATION-REBUILD** — the DevOps backoffice is now reproducible + portable
+  to a new Nebula on a dedicated control VM: mesh-etcd-backed Tofu state (off the dead
+  LAN node, on the live lighthouse quorum), on-VM secret-zero (age-keygen + atomic
+  multi-recipient reseal, no plaintext-in-state), `mackesd found --with-backoffice`
+  + the `backoffice-up.sh` orchestrator (tiered Minimal/Full), self-hosted Forgejo CI,
+  a plan-only systemd reconciler, a backoffice-provisioned sccache build farm
+  (`for_each`+`moved{}`, 0-destroy), DR v2 (consistent etcd+Forgejo snapshot), per-mesh
+  config + portability resolver, cred-store folding, and RPM packaging of the plane.
+  (42/52 DAR tasks code-complete; the live stand-up + off-fleet DR/CA push stay
+  operator-run.)
+### Changed
+- **DATACENTER-25 — panel consolidation.** `compute`/`snapshots`/`images`/`lighthouses`/
+  `build_farm` fold into the Datacenter panel as a fold-bar of tabs; deep-links + the
+  launcher search redirect the retired slugs. No unreachable modules left behind.
+### Fixed
+- **BROKER-RESILIENCE-3** — the ntfy notification broker is now turn-key *present* on a
+  freshly provisioned lighthouse (the first-boot fetch oneshots start in cloud-init),
+  not just non-fatal when absent.
+- **MIG-3** — a joined lighthouse provisions its own sealed CA-backup passphrase, so it
+  no longer boots `SEC-7/ENT-11: the CA is UNBACKED-UP`.
+
 ## [11.0.15] — 2026-06-27
 ### Added
 - **`mackesd secret put|get [--local] <name>`** — a CLI for the leader-managed mesh
