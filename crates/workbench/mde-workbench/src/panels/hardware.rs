@@ -16,14 +16,17 @@ use std::path::{Path, PathBuf};
 // CUT-1: cosmic::Element bakes in cosmic::Theme — matching the theme the
 // widgets (column/container/scrollable) and the panel_chrome helpers produce.
 // cosmic::iced::Element would default to iced's own Theme and mismatch.
-use cosmic::iced::widget::{column, container, row, scrollable, text};
-use cosmic::iced::{Length, Padding, Task};
+use cosmic::iced::widget::{column, container, row, scrollable, text, Space};
+use cosmic::iced::{alignment, Background, Border, Color, Length, Task};
 use cosmic::Element;
 use mackes_mesh_types::PeerProbe;
-use mde_theme::{EmptyState, Icon};
+use mde_theme::{carbon, Density, EmptyState, FontSize, FontWeight, Icon, Palette, TypeRole};
 
 use crate::controls::{variant_button, ButtonVariant};
-use crate::panel_chrome::{empty_state, panel_container, status_badge, BadgeSeverity};
+use crate::cosmic_compat::overlay_white_on;
+use crate::cosmic_compat::prelude::*;
+use crate::panel_chrome::{card, empty_state, panel_container, status_badge, BadgeSeverity};
+use crate::status_strip::{mono_text, pip};
 
 /// The Hardware Inventory panel state.
 #[derive(Debug, Clone, Default)]
@@ -149,6 +152,8 @@ impl HardwarePanel {
     fn view_list(&self) -> Element<'_, crate::Message> {
         let palette = crate::live_theme::palette();
         let density = crate::live_theme::tokens().density;
+        let sizes = FontSize::defaults();
+        let weights = FontWeight::defaults();
         let refresh = variant_button(
             "Refresh",
             ButtonVariant::Ghost,
@@ -184,43 +189,36 @@ impl HardwarePanel {
             );
         }
 
-        let mut list = column![].spacing(8);
-        for p in &self.probes {
-            let (badge_label, severity) = if p.power.on_ac {
-                ("AC", BadgeSeverity::Success)
-            } else {
-                ("battery", BadgeSeverity::Neutral)
-            };
-            let summary = text(format!(
-                "{} · {} · {} PCI / {} USB",
-                p.distro,
-                p.kernel.uname,
-                p.bus.pci_tree.len(),
-                p.bus.usb_tree.len(),
-            ))
-            .size(13);
-            let open = variant_button(
-                "Inspect",
-                ButtonVariant::Ghost,
-                Some(crate::Message::Hardware(Message::Focus(p.peer_id.clone()))),
+        // Page header — title + a live count chip + Refresh, in the design's
+        // dense node-header rhythm.
+        let count = self.probes.len();
+        let header = row![
+            text("Hardware inventory")
+                .size(TypeRole::Heading.size_in(sizes))
+                .colr(palette.text.into_cosmic_color()),
+            Space::new().width(Length::Fill),
+            chip(
+                format!("{count} node{}", if count == 1 { "" } else { "s" }),
                 palette,
-            );
-            list = list.push(
-                container(
-                    row![
-                        column![text(p.hostname.clone()).size(16), summary].spacing(2),
-                        status_badge(badge_label, severity, palette),
-                        open,
-                    ]
-                    .spacing(12)
-                    .align_y(cosmic::iced::Alignment::Center),
-                )
-                .padding(Padding::from(12)),
-            );
+                &sizes,
+            ),
+            Space::new().width(Length::Fixed(10.0)),
+            refresh,
+        ]
+        .align_y(alignment::Vertical::Center);
+
+        // Dense, zebra-striped, hairline-separated peer rows on one Carbon card.
+        let mut rows = column![];
+        for (i, p) in self.probes.iter().enumerate() {
+            if i > 0 {
+                rows = rows.push(hairline(palette));
+            }
+            rows = rows.push(peer_row(p, i, palette, &sizes, &weights));
         }
+        let listing = dense_card("Reporting nodes", rows.into(), palette, density, &sizes);
 
         panel_container(
-            column![refresh, scrollable(list).height(Length::Fill)]
+            column![header, scrollable(listing).height(Length::Fill)]
                 .spacing(16)
                 .width(Length::Fill)
                 .into(),
@@ -231,6 +229,8 @@ impl HardwarePanel {
     fn view_detail(&self, peer_id: &str) -> Element<'_, crate::Message> {
         let palette = crate::live_theme::palette();
         let density = crate::live_theme::tokens().density;
+        let sizes = FontSize::defaults();
+        let weights = FontWeight::defaults();
         let back = variant_button(
             "‹ Back",
             ButtonVariant::Ghost,
@@ -246,59 +246,148 @@ impl HardwarePanel {
             );
         };
 
-        let section = |title: &str, lines: Vec<String>| {
-            let mut col = column![text(title.to_string()).size(15)].spacing(4);
-            if lines.is_empty() {
-                col = col.push(text("(none reported)").size(12));
-            } else {
-                for l in lines {
-                    col = col.push(text(l).size(12));
-                }
-            }
-            container(col).padding(Padding::from(10))
+        let (badge_label, severity) = if p.power.on_ac {
+            ("AC", BadgeSeverity::Success)
+        } else {
+            ("battery", BadgeSeverity::Neutral)
         };
 
-        let power = {
-            let mut v = vec![
-                format!("On AC: {}", p.power.on_ac),
+        // Node identity header — echoes the design's "This Node" header: a teal
+        // node pip, the hostname, a distro chip, the power badge, then a
+        // Roboto-Mono identity line (vendor:product · transport · rtt).
+        let header = row![
+            pip(carbon::TEAL_30),
+            Space::new().width(Length::Fixed(11.0)),
+            text(p.hostname.clone())
+                .size(TypeRole::Heading.size_in(sizes))
+                .colr(palette.text.into_cosmic_color()),
+            Space::new().width(Length::Fixed(11.0)),
+            chip(p.distro.clone(), palette, &sizes),
+            Space::new().width(Length::Fixed(11.0)),
+            status_badge(badge_label, severity, palette),
+            Space::new().width(Length::Fixed(11.0)),
+            mono_text(
+                format!(
+                    "{}:{} · {} · rtt {} ms",
+                    p.vendor_id, p.product_id, p.kernel.transport_module, p.bus.rtt_ms
+                ),
+                TypeRole::Caption,
+                &sizes,
+                &weights,
+            )
+            .colr(palette.text_muted.into_cosmic_color()),
+        ]
+        .align_y(alignment::Vertical::Center);
+
+        // Kernel / power / bus → label-value cards (the design's "Hardware"
+        // card pattern). All values are the real probe fields (§7).
+        let kernel_rows = vec![
+            ("uname", p.kernel.uname.clone()),
+            ("Transport module", p.kernel.transport_module.clone()),
+            ("mded", p.kernel.mded_version.clone()),
+        ];
+        let mut power_rows = vec![
+            (
+                "On AC",
+                if p.power.on_ac {
+                    "yes".to_string()
+                } else {
+                    "no".to_string()
+                },
+            ),
+            (
+                "Battery",
                 p.power
                     .battery_pct
-                    .map_or_else(|| "Battery: n/a".into(), |b| format!("Battery: {b}%")),
-            ];
-            if let Some(c) = p.power.cpu_pkg_c {
-                v.push(format!("CPU package: {c:.0} °C"));
-            }
-            if let Some(r) = p.power.fan_rpm {
-                v.push(format!("Fan: {r} rpm"));
-            }
-            v
-        };
+                    .map_or_else(|| "n/a".to_string(), |b| format!("{b}%")),
+            ),
+        ];
+        if let Some(c) = p.power.cpu_pkg_c {
+            power_rows.push(("CPU package", format!("{c:.0} °C")));
+        }
+        if let Some(r) = p.power.fan_rpm {
+            power_rows.push(("Fan", format!("{r} rpm")));
+        }
+        let bus_rows = vec![
+            ("RTT", format!("{} ms", p.bus.rtt_ms)),
+            ("NAT class", format!("{:?}", p.bus.nat_class)),
+            ("ICE candidate", p.bus.ice_candidate.clone()),
+            ("Mesh path", p.bus.mesh_path.join("  →  ")),
+        ];
 
-        let body = column![
-            text(format!("{} — {}", p.hostname, p.distro)).size(20),
-            text(format!("vendor:product {}:{}", p.vendor_id, p.product_id)).size(12),
-            section("PCI bus", p.bus.pci_tree.clone()),
-            section("USB bus", p.bus.usb_tree.clone()),
-            section(
+        // The list cards (PCI / USB / descriptors) keep every real line, mono.
+        let cards: Vec<Element<'_, crate::Message>> = vec![
+            dense_card(
                 "Kernel & driver",
-                vec![
-                    format!("uname: {}", p.kernel.uname),
-                    format!("transport module: {}", p.kernel.transport_module),
-                    format!("mded: {}", p.kernel.mded_version),
-                ],
+                kv_body(kernel_rows, palette, &sizes, &weights),
+                palette,
+                density,
+                &sizes,
             ),
-            section("Power & thermal", power),
-            section(
+            dense_card(
+                "Power & thermal",
+                kv_body(power_rows, palette, &sizes, &weights),
+                palette,
+                density,
+                &sizes,
+            ),
+            dense_card(
+                "Bus & topology",
+                kv_body(bus_rows, palette, &sizes, &weights),
+                palette,
+                density,
+                &sizes,
+            ),
+            dense_card(
+                "PCI bus",
+                mono_body(&p.bus.pci_tree, palette, &sizes, &weights),
+                palette,
+                density,
+                &sizes,
+            ),
+            dense_card(
+                "USB bus",
+                mono_body(&p.bus.usb_tree, palette, &sizes, &weights),
+                palette,
+                density,
+                &sizes,
+            ),
+            dense_card(
                 "Descriptors — mesh services",
-                p.descriptors.mesh_services.clone()
+                mono_body(&p.descriptors.mesh_services, palette, &sizes, &weights),
+                palette,
+                density,
+                &sizes,
             ),
-            section(
+            dense_card(
                 "Descriptors — sysfs classes",
-                p.descriptors.sysfs_classes.clone()
+                mono_body(&p.descriptors.sysfs_classes, palette, &sizes, &weights),
+                palette,
+                density,
+                &sizes,
             ),
-            section("Descriptors — USB", p.descriptors.usb_descriptors.clone()),
-        ]
-        .spacing(10);
+            dense_card(
+                "Descriptors — USB",
+                mono_body(&p.descriptors.usb_descriptors, palette, &sizes, &weights),
+                palette,
+                density,
+                &sizes,
+            ),
+        ];
+
+        // Deal the cards into the design's two-column (1fr 1fr) card grid.
+        let mut left = column![].spacing(11).width(Length::FillPortion(1));
+        let mut right = column![].spacing(11).width(Length::FillPortion(1));
+        for (i, c) in cards.into_iter().enumerate() {
+            if i % 2 == 0 {
+                left = left.push(c);
+            } else {
+                right = right.push(c);
+            }
+        }
+        let grid = row![left, right].spacing(11).width(Length::Fill);
+
+        let body = column![header, grid].spacing(16).width(Length::Fill);
 
         panel_container(
             column![back, scrollable(body).height(Length::Fill)]
@@ -307,6 +396,208 @@ impl HardwarePanel {
             density,
         )
     }
+}
+
+/// A 1 px full-width hairline divider in the border token — the design's
+/// `1px solid #1f1f1f` inter-row rule, here a single-sourced token.
+fn hairline<'a, Message: 'a>(palette: Palette) -> Element<'a, Message> {
+    let color = palette.border.into_cosmic_color();
+    container(Space::new().height(Length::Fixed(1.0)).width(Length::Fill))
+        .style(move |_| container::Style {
+            snap: false,
+            icon_color: None,
+            background: Some(Background::Color(color)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 0.0.into(),
+            },
+            shadow: Default::default(),
+            text_color: None,
+        })
+        .into()
+}
+
+/// A small bordered identity chip — the design's role/distro chip
+/// (`padding:3px 9px;border:1px solid <border>`), Roboto caption.
+fn chip<'a, Message: 'a>(
+    label: impl Into<String>,
+    palette: Palette,
+    sizes: &FontSize,
+) -> Element<'a, Message> {
+    let border = palette.border.into_cosmic_color();
+    container(
+        text(label.into())
+            .size(TypeRole::Caption.size_in(*sizes))
+            .colr(palette.text_muted.into_cosmic_color()),
+    )
+    .padding([3u16, 9u16])
+    .style(move |_| container::Style {
+        snap: false,
+        icon_color: None,
+        background: None,
+        border: Border {
+            color: border,
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        shadow: Default::default(),
+        text_color: None,
+    })
+    .into()
+}
+
+/// A dense Carbon card — an uppercase section label, a hairline, then the body
+/// — on the shared `card` surface (§6 reuse).
+fn dense_card<'a>(
+    title: &str,
+    body: Element<'a, crate::Message>,
+    palette: Palette,
+    density: Density,
+    sizes: &FontSize,
+) -> Element<'a, crate::Message> {
+    let header = text(title.to_uppercase())
+        .size(TypeRole::Caption.size_in(*sizes))
+        .colr(palette.text_muted.into_cosmic_color());
+    card(
+        column![header, hairline(palette), body].spacing(8).into(),
+        palette,
+        density,
+    )
+}
+
+/// Build a label/value card body — muted Roboto label, Roboto-Mono value,
+/// right-aligned, hairline-separated (the design's Hardware card rows; Mono
+/// for the metric per §4).
+fn kv_body<'a>(
+    rows: Vec<(&'static str, String)>,
+    palette: Palette,
+    sizes: &FontSize,
+    weights: &FontWeight,
+) -> Element<'a, crate::Message> {
+    let mut col = column![];
+    for (i, (label, value)) in rows.into_iter().enumerate() {
+        if i > 0 {
+            col = col.push(hairline(palette));
+        }
+        let r = row![
+            text(label.to_string())
+                .size(TypeRole::Caption.size_in(*sizes))
+                .colr(palette.text_muted.into_cosmic_color())
+                .width(Length::FillPortion(2)),
+            mono_text(value, TypeRole::Caption, sizes, weights)
+                .colr(palette.text.into_cosmic_color())
+                .width(Length::FillPortion(3))
+                .align_x(alignment::Horizontal::Right),
+        ]
+        .align_y(alignment::Vertical::Center);
+        col = col.push(container(r).padding([6u16, 0u16]).width(Length::Fill));
+    }
+    col.into()
+}
+
+/// Build a mono list card body (PCI / USB / descriptors) — every real line in
+/// Roboto-Mono, hairline-separated; an honest "(none reported)" when empty.
+fn mono_body<'a>(
+    lines: &[String],
+    palette: Palette,
+    sizes: &FontSize,
+    weights: &FontWeight,
+) -> Element<'a, crate::Message> {
+    if lines.is_empty() {
+        return container(
+            text("(none reported)")
+                .size(TypeRole::Caption.size_in(*sizes))
+                .colr(palette.text_muted.into_cosmic_color()),
+        )
+        .padding([6u16, 0u16])
+        .into();
+    }
+    let mut col = column![];
+    for (i, l) in lines.iter().enumerate() {
+        if i > 0 {
+            col = col.push(hairline(palette));
+        }
+        col = col.push(
+            container(
+                mono_text(l.clone(), TypeRole::Caption, sizes, weights)
+                    .colr(palette.text.into_cosmic_color()),
+            )
+            .padding([6u16, 0u16])
+            .width(Length::Fill),
+        );
+    }
+    col.into()
+}
+
+/// One inventory row — status pip · hostname (Roboto) · Roboto-Mono summary
+/// metric · power badge · Inspect, zebra-tinted on odd rows for the dense
+/// table feel.
+fn peer_row<'a>(
+    p: &PeerProbe,
+    idx: usize,
+    palette: Palette,
+    sizes: &FontSize,
+    weights: &FontWeight,
+) -> Element<'a, crate::Message> {
+    let (badge_label, severity) = if p.power.on_ac {
+        ("AC", BadgeSeverity::Success)
+    } else {
+        ("battery", BadgeSeverity::Neutral)
+    };
+    let summary = format!(
+        "{} · {} · {} PCI / {} USB",
+        p.distro,
+        p.kernel.uname,
+        p.bus.pci_tree.len(),
+        p.bus.usb_tree.len(),
+    );
+    let inspect = variant_button(
+        "Inspect",
+        ButtonVariant::Ghost,
+        Some(crate::Message::Hardware(Message::Focus(p.peer_id.clone()))),
+        palette,
+    );
+    let body = row![
+        pip(palette.success),
+        Space::new().width(Length::Fixed(10.0)),
+        text(p.hostname.clone())
+            .size(TypeRole::Body.size_in(*sizes))
+            .colr(palette.text.into_cosmic_color())
+            .width(Length::FillPortion(3)),
+        mono_text(summary, TypeRole::Caption, sizes, weights)
+            .colr(palette.text_muted.into_cosmic_color())
+            .width(Length::FillPortion(7)),
+        Space::new().width(Length::Fixed(10.0)),
+        status_badge(badge_label, severity, palette),
+        Space::new().width(Length::Fixed(10.0)),
+        inspect,
+    ]
+    .align_y(alignment::Vertical::Center);
+
+    // Zebra: a faint white overlay on the surface for odd rows (the design's
+    // alternating-row striping), token-derived, no raw hex.
+    let zebra = if idx % 2 == 1 {
+        Some(Background::Color(overlay_white_on(palette.surface, 0.04)))
+    } else {
+        None
+    };
+    container(body)
+        .padding([7u16, 8u16])
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            snap: false,
+            icon_color: None,
+            background: zebra,
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 0.0.into(),
+            },
+            shadow: Default::default(),
+            text_color: None,
+        })
+        .into()
 }
 
 #[cfg(test)]
