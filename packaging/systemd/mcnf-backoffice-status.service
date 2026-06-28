@@ -1,0 +1,18 @@
+# DAR-44 — refresh the backoffice health record (mirrors mesh-status.service).
+# Runs backoffice-status.sh --json and writes the record to a well-known path the
+# mesh directory / a panel can read. The reconcile field is sourced from etcd
+# /reconciler/* (NOT a host-local farm-status.txt), so it works on a fresh VM.
+[Unit]
+Description=MCNF — refresh the backoffice health record (state-backend/secrets/reconcile/forgejo/DR)
+Documentation=https://github.com/matthewmackes/magic-mesh
+After=network-online.target mcnf-reconciler-bootstrap.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/mcnf/reconciler.env
+WorkingDirectory=/opt/mcnf
+# Publish the record to a stable path (the mesh directory / panel reads it). The
+# reconcile field comes from etcd /reconciler/last-reconcile (DAR-44).
+ExecStart=/bin/bash -lc 'mkdir -p /run/mcnf && exec automation/backoffice/backoffice-status.sh --json > /run/mcnf/backoffice-status.json'
+SuccessExitStatus=0
