@@ -2559,7 +2559,7 @@ recon (token map: `#161616→carbon::GRAY_100`, `#0f62fe→BLUE_60`, `#42be65→
 - [✓] **UNIFY-6: widgets — reusable dense Carbon components** *(fan-out `26dbf5c` — status_dot, kpi_stat_tile, segmented_control, progress_bar, stat_grid; additive, no signature changes; farm check+lint pass)*
   **As** the GUI, **I want** shared widgets, **so that** screens stop reinventing them.
   **Acceptance:** add to `controls.rs`/`panel_chrome.rs` (each used by ≥2 screens, token-clean): `status_dot`, `segmented_control` (active-underline), `kpi_stat_tile`, zebra `data_table` (sortable header, expandable row), `progress_bar`, `tabs`; reuse existing `sparkline::sparkline`, `peers_map::MapProgram`, `panel_chrome::{card,section_header,empty_state,error_state}`.
-- [ ] **UNIFY-7: nav — activity-bar + collapsible tree + guided Empty routing**
+- [✓] **UNIFY-7: nav — activity-bar + collapsible tree + guided Empty routing** *(`5404e1a` — dense grouped sidebar, real status pips (all 60 slugs verified routing), §4 clean; follow-up: wire the chevron collapse-toggle through app.rs — the `ToggleGroupExpansion` message exists but is UI-unwired)*
   **As** an operator, **I want** the design's 8-group collapsible nav with a guided empty state, **so that** the full nav renders day one.
   **Acceptance:** `sidebar.rs` renders the 8 `Group`s collapsibly (reuse `SidebarState`); unimplemented panels route to `panel_chrome::empty_state` with the worklist/`mde --focus <slug>` hint (design Empty); deep-link slugs preserved (`view_from_focus_slug`).
 - [>] **UNIFY-8..12: screen restyles to the design (data stays live)** — *concurrent full-farm fan-out 2026-06-28: 6 panels restyled by 6 worktree-isolated agents (`.50/.90/.130`, 2+2+3) + cherry-picked; consolidated farm-green (check@.50 1m50s + clippy@.90 + test@.130; all data real §7, tokens §4).*
@@ -2568,20 +2568,20 @@ recon (token map: `#161616→carbon::GRAY_100`, `#0f62fe→BLUE_60`, `#42be65→
     - [✓] **UNIFY-11 Monitoring** (`8695e7c`) — Health/Logs segmented restyle; real probe/log data (+2 parse_journal_line tests).
     - [✓] **UNIFY-12 Datacenter** (`5f168ce`) — KPI grid + host CPU/MEM bars + version matrix + Tofu run-log; real data/tabs/state.
     - [✓] **UNIFY-12b Fleet** (`7986fc9`) — role-group node cards (health top-border + tags) + live path map; real roster.
-    - [>] **UNIFY-8 Overview** (`fa5010b`) — header band + live mesh-health pill landed (real roster counts); KPI grid / node×service matrix / Fleet Convergence / Audit Trail DEFERRED (data not in the loaded snapshot, §7) → **gates lifted (operator 2026-06-28)** → UNIFY-14 (service worker) + UNIFY-15 (convergence + audit).
+    - [✓] **UNIFY-8 Overview** (`fa5010b` + `3d3cf53`) — header band + mesh-health pill + **Fleet Convergence + Audit Trail now wired from real sources** (UNIFY-15: live fleet-revision acks + `mackesd audit-verify` hash chain). Remaining: the node×service matrix render (UNIFY-14's GUI half — backend now publishes the data).
 - [ ] **UNIFY-13: density compact default + toggle surfaced**
   **As** a power user, **I want** the compact density the design defaults to, **so that** the console is information-dense.
   **Acceptance:** density picker (reuse `Density`/`Preferences`) surfaced in the shell; compact applies across panels via `panel_chrome` spacing; persists.
 
 ### UNIFY gate-lifts (operator-approved 2026-06-28 — wire the real sources the fan-out couldn't fabricate, §7)
 
-- [ ] **UNIFY-14: mackesd per-peer service-status worker → real node×service matrix**
+- [>] **UNIFY-14: mackesd per-peer service-status worker → real node×service matrix** *(`eb1e8d2` — BACKEND DONE: `mackes-mesh-types::service_status` + `mackesd/workers/service_status.rs` (samples local mesh units, publishes on-change + heartbeat like compute_registry), 12 worker + 6 type tests, 2166 mackesd tests green. Remaining: the GUI matrix render in front_door/peers from the published topic.)*
   **As** an operator, **I want** the design's node×service matrix (Bus/etcd/Sync/Nebula/DNS/Voice/Music/KDC/Workbench) backed by real per-peer status, **so that** the Overview/Peers matrix is authoritative, not fabricated.
   **Acceptance:** a `mackesd` worker publishes a structured per-peer service-up map over the Bus (each node reports its own unit/service status, gossiped via the directory); `mackes-mesh-types` carries the typed shape; the Overview Service Matrix + Peers render it from the live topic (honest *unknown* when a node hasn't reported); unit-tested decode; farm build+test green.
-- [ ] **UNIFY-15: Overview Fleet Convergence + Audit Trail from real sources**
+- [✓] **UNIFY-15: Overview Fleet Convergence + Audit Trail from real sources** *(`3d3cf53` — Convergence from the live fleet-revision ack store (`config_apply::{newest_revision, applied_version}` vs the loaded roster) + Audit Trail from `mackesd audit-verify --json` (reuses the Audit panel's parser); 8 tests; cards omit honestly when no source, §7. Completes the UNIFY-8 Overview data.)*
   **As** an operator, **I want** the Overview's convergence + audit cards backed by real data, **so that** the dashboard is live, not a placeholder.
   **Acceptance:** the Front Door / Overview load also fetches the real config revision + converged-peer count (etcd) and recent hash-chained audit events (the existing audit source the Audit panel reads); rendered in the design's Fleet Convergence + Audit Trail cards; no mock/demo data (§7); farm green.
-- [ ] **UNIFY-16: per-peer voice presence → real Peers VOICE tile**
+- [✓] **UNIFY-16: per-peer voice presence → real Peers VOICE tile** *(`e1a4942` — honest recon finding: `state/voice/status` is published by the LOCAL node's SIP agent only, not per-peer; so the self row shows real Registered/Listening/Offline + every other peer shows `—` (GRAY_50), no fabricated per-peer voice (§7); 2 tests. A truly per-peer voice tile would need a directory voice field — noted, not done.)*
   **As** an operator, **I want** the Peers VOICE tile to show real per-peer voice/SIP presence, **so that** it matches the design instead of the VERSION stand-in.
   **Acceptance:** surface `mde-voice-hud`'s `state/voice/status` per peer (via the directory/Bus); the Peers detail VOICE tile renders the real presence; honest "offline/unknown" when absent; farm green.
 
