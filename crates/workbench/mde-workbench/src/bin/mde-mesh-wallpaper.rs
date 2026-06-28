@@ -127,6 +127,14 @@ fn refresh_task() -> Task<Message> {
                     .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
                     .unwrap_or_default();
                 let rtt = read_latency_cache();
+                // MESHMAP-6 — read the REAL per-link byte rates (the mackesd
+                // `link-traffic` collector cache). A cheap local file read,
+                // exactly like the latency cache above — NOT the per-node
+                // Netdata sampling loop the in-app panel runs (the wallpaper
+                // stays a pure ambient render). Absent cache → empty → the
+                // flow particles stay off (honest: the wallpaper never ran the
+                // proxy, so it shows real traffic or nothing).
+                let flows = mde_workbench::panels::peers_map::read_link_traffic();
                 let hostname = std::process::Command::new("hostname")
                     .output()
                     .ok()
@@ -134,7 +142,7 @@ fn refresh_task() -> Task<Message> {
                     .map(|s| s.trim().to_string())
                     .unwrap_or_default();
                 let lh_ips = mde_workbench::panels::peers_map::lighthouse_overlay_ips();
-                parse_nodes(&raw, &rtt, &hostname, &lh_ips)
+                parse_nodes(&raw, &rtt, &flows, &hostname, &lh_ips)
             })
             .await
             .unwrap_or_default()
@@ -151,6 +159,7 @@ fn refresh_task() -> Task<Message> {
 fn parse_nodes(
     raw: &str,
     rtt: &std::collections::HashMap<String, Option<f64>>,
+    flows: &std::collections::HashMap<String, mde_workbench::panels::peers_map::LinkFlow>,
     self_hostname: &str,
     lh_ips: &[String],
 ) -> Vec<MapNode> {
@@ -174,15 +183,19 @@ fn parse_nodes(
                     let role = p.get("role").and_then(|x| x.as_str()).unwrap_or("");
                     let lighthouse =
                         mde_workbench::panels::peers_map::is_lighthouse(role, overlay_ip, lh_ips);
+                    let flow = flows.get(&hostname).copied().unwrap_or_default();
                     Some(MapNode {
                         hostname,
                         presence,
                         rtt_ms,
                         is_self,
                         lighthouse,
-                        // The wallpaper is a pure ambient render (no Netdata
-                        // sampling loop); flow particles stay off here.
-                        flow: 0.0,
+                        // MESHMAP-6 — the REAL per-link tx/rx from the
+                        // `link-traffic` collector cache (read once per refresh,
+                        // not a sampling loop). Absent cache → 0 → no particles
+                        // (the wallpaper never ran the per-node proxy).
+                        flow: flow.tx,
+                        flow_rx: flow.rx,
                     })
                 })
                 .collect()
@@ -225,6 +238,12 @@ fn view(state: &Wallpaper, _id: window::Id) -> Element<'_, Message, Theme> {
 mod tests {
     use super::*;
 
+    /// Shared empty per-link flow map for the parse tests that don't
+    /// exercise MESHMAP-6 flow wiring.
+    fn no_flows() -> std::collections::HashMap<String, mde_workbench::panels::peers_map::LinkFlow> {
+        std::collections::HashMap::new()
+    }
+
     #[test]
     fn nodes_parse_from_the_peers_json() {
         let raw = r#"{"ok":true,"head":null,"peers":[
@@ -232,12 +251,39 @@ mod tests {
             {"hostname":"oak","presence":"offline"}]}"#;
         let mut rtt = std::collections::HashMap::new();
         rtt.insert("oak".to_string(), Some(20.0));
-        let nodes = parse_nodes(raw, &rtt, "pine", &[]);
+        let nodes = parse_nodes(raw, &rtt, &no_flows(), "pine", &[]);
         assert_eq!(nodes.len(), 2);
         assert!(nodes[0].is_self);
         assert_eq!(nodes[1].rtt_ms, Some(20.0));
         assert!(!nodes[0].lighthouse, "no lighthouse signal → plain peer");
-        assert!(parse_nodes("junk", &rtt, "x", &[]).is_empty());
+        assert!(parse_nodes("junk", &rtt, &no_flows(), "x", &[]).is_empty());
+    }
+
+    #[test]
+    fn meshmap6_real_per_link_flow_feeds_the_wallpaper() {
+        // MESHMAP-6 — the collector cache's per-link tx/rx lands on the node.
+        let raw = r#"{"peers":[
+            {"hostname":"anvil","presence":"online","overlay_ip":"10.42.0.5"}]}"#;
+        let rtt = std::collections::HashMap::new();
+        let mut flows = std::collections::HashMap::new();
+        flows.insert(
+            "anvil".to_string(),
+            mde_workbench::panels::peers_map::LinkFlow { tx: 0.42, rx: 0.11 },
+        );
+        let nodes = parse_nodes(raw, &rtt, &flows, "self", &[]);
+        assert_eq!(nodes.len(), 1);
+        assert!(
+            (nodes[0].flow - 0.42).abs() < 1e-9,
+            "real tx feeds self→peer"
+        );
+        assert!(
+            (nodes[0].flow_rx - 0.11).abs() < 1e-9,
+            "real rx feeds peer→self"
+        );
+        // Absent cache → no particles (the wallpaper never ran the proxy).
+        let bare = parse_nodes(raw, &rtt, &no_flows(), "self", &[]);
+        assert_eq!(bare[0].flow, 0.0);
+        assert_eq!(bare[0].flow_rx, 0.0);
     }
 
     #[test]
@@ -251,7 +297,7 @@ mod tests {
             {"hostname":"worker","presence":"online","role":"server","overlay_ip":"10.42.0.5"}]}"#;
         let rtt = std::collections::HashMap::new();
         let lh_ips = vec!["10.42.0.1".to_string()];
-        let nodes = parse_nodes(raw, &rtt, "self", &lh_ips);
+        let nodes = parse_nodes(raw, &rtt, &no_flows(), "self", &lh_ips);
         let by = |h: &str| nodes.iter().find(|n| n.hostname == h).unwrap().lighthouse;
         assert!(by("lh-role"), "role==lighthouse flags the anchor");
         assert!(

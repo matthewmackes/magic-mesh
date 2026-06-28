@@ -178,6 +178,16 @@ pub mod proc;
 pub mod kdc_host;
 pub mod mdns_relay;
 pub mod mesh_latency;
+// MESHMAP-6 (2026-06-27) — real per-link byte counters. Maintains an
+// nftables accounting table (`inet mde_linkacct`) with one passive counter
+// per peer overlay IP per direction on the Nebula interface, reads byte
+// deltas on a 5 s tick, and publishes per-link tx/rx rates to
+// ~/.cache/mde/link-traffic.json. The mesh wallpaper / Peers-Map flow
+// particles consume it as the REAL per-edge source, falling back to the
+// per-node `sample_flows` proxy (MESHMAP-3) when the cache is absent
+// (no nft / non-root / pre-delta). Cheap at idle: one `nft list` + one
+// reconcile per tick, never a busy loop.
+pub mod link_traffic;
 pub mod mesh_router;
 // NF-3.4 (v2.5) — Nebula supervisor worker (CA mint +
 // role-marker management + bundle-watch + systemctl

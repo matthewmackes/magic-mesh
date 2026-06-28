@@ -32,6 +32,10 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     ("stun_gather", 0),
     ("mdns_relay", 0),
     ("mesh_latency", 0),
+    // MESHMAP-6 — per-link byte-counter collector (nftables accounting on
+    // the Nebula iface). A control-plane traffic observer that runs on
+    // every node, like mesh_latency.
+    ("link-traffic", 0),
     ("mesh_dns", 0),
     ("hardware_probe", 0),
     ("bus_supervisor", 0),
@@ -146,7 +150,8 @@ mod tests {
         // SOLE clipboard capturer, spawning `wl-paste --watch` directly. The
         // never-built `mde-clipd` daemon + its `clipd_supervisor` worker were
         // removed in CLIP-SYNC-2: that binary never existed in the workspace).
-        assert_eq!(WORKER_TIERS.len(), 27);
+        // +1 link-traffic (MESHMAP-6 — per-link byte-counter collector).
+        assert_eq!(WORKER_TIERS.len(), 28);
     }
 
     #[test]
@@ -169,8 +174,8 @@ mod tests {
         let count = |rank: u8| WORKER_TIERS.iter().filter(|(_, r)| *r == rank).count();
         assert_eq!(
             count(0),
-            20,
-            "Lighthouse control plane (+gossip/reconcile/presence/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe)"
+            21,
+            "Lighthouse control plane (+gossip/reconcile/presence/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic)"
         );
         assert_eq!(
             count(1),
@@ -233,10 +238,12 @@ mod tests {
         let srv = workers_for_rank(Role::Server.rank());
         let ws = workers_for_rank(Role::Workstation.rank());
         // +1 each (hardware_probe, rank 0 → present in every tier).
-        assert_eq!(lh.len(), 20);
-        assert_eq!(srv.len(), 23);
-        // 27: +clipboard_sync (CLIP-SYNC-1), -clipd_supervisor (removed, CLIP-SYNC-2).
-        assert_eq!(ws.len(), 27);
+        // 21: +link-traffic (MESHMAP-6, rank 0).
+        assert_eq!(lh.len(), 21);
+        assert_eq!(srv.len(), 24);
+        // 28: +clipboard_sync (CLIP-SYNC-1), -clipd_supervisor (removed, CLIP-SYNC-2),
+        // +link-traffic (MESHMAP-6).
+        assert_eq!(ws.len(), 28);
         // Strict superset: every lower-tier worker is in the higher tier.
         assert!(lh.iter().all(|w| srv.contains(w)));
         assert!(srv.iter().all(|w| ws.contains(w)));

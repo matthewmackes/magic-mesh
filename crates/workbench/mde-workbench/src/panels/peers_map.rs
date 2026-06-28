@@ -81,11 +81,20 @@ pub struct MapNode {
     /// danger otherwise) so the relay/anchor nodes read as the hero of the
     /// mesh map — both on the live desktop wallpaper and the Peers Map view.
     pub lighthouse: bool,
-    /// PD-7/L18 — this peer's recent overlay throughput, normalized to
-    /// 0.0..=1.0 (from its Netdata `system.net`). Drives the flow-particle
-    /// density + speed on its self→peer edge; 0.0 = idle (no particles, so
-    /// an idle mesh draws nothing extra — the L22 budget).
+    /// PD-7/L18 — this peer's self→peer link traffic, normalized to
+    /// 0.0..=1.0. MESHMAP-6: the REAL per-link tx rate from the mackesd
+    /// `link-traffic` collector (nftables accounting) when present, else the
+    /// per-node `sample_flows` Netdata proxy (MESHMAP-3). Drives the
+    /// flow-particle density + speed on the self→peer edge; 0.0 = idle (no
+    /// particles, so an idle mesh draws nothing extra — the L22 budget).
     pub flow: f64,
+    /// MESHMAP-6 — this peer's peer→self link traffic, normalized 0.0..=1.0.
+    /// The REAL per-link rx rate from the `link-traffic` collector when
+    /// present; 0.0 when the proxy is the source (the per-node proxy can't
+    /// split direction, so the reverse stream simply stays off and the edge
+    /// shows the busy-ness it can honestly attribute — never a fake split).
+    /// Drives the peer→self particle stream.
+    pub flow_rx: f64,
 }
 
 /// Deterministic seed angle for a hostname (stable across refreshes
@@ -331,22 +340,34 @@ impl canvas::Program<crate::Message> for MapProgram {
                         .with_color(color)
                         .with_width(if reachable { 1.5 } else { 1.0 }),
                 );
-                // PD-7/L18 — flow particles: dots riding the edge while the
-                // peer moves real overlay traffic (Netdata-sourced `flow`).
-                // Density + along-edge speed scale with `flow`; an idle edge
-                // (flow ≈ 0) draws nothing, so the canvas stays cheap (L22).
-                if reachable && n.flow > 0.02 {
-                    let count = 1 + (n.flow * 5.0).round() as usize; // 1..=6
-                    let speed = 0.5 + n.flow as f32; // laps-per-cycle
-                    for k in 0..count {
-                        let base = (k as f32) / count as f32;
-                        let t = (self.flow_phase * speed + base).fract();
-                        let px = origin.x + (to.x - origin.x) * t;
-                        let py = origin.y + (to.y - origin.y) * t;
-                        frame.fill(
-                            &Path::circle(Point::new(px, py), 2.0),
-                            p.accent.into_cosmic_color(),
-                        );
+                // PD-7/L18 + MESHMAP-6 — flow particles: dots riding the edge
+                // while the link moves real traffic. The self→peer stream
+                // rides origin→to on `flow` (tx); the peer→self stream rides
+                // to→origin on `flow_rx` (rx). MESHMAP-6 feeds these the REAL
+                // per-link rates from the `link-traffic` collector; under the
+                // MESHMAP-3 proxy fallback `flow` carries the per-node busy-ness
+                // and `flow_rx` is 0 (the proxy can't split direction). Density
+                // + along-edge speed scale with the rate; an idle edge (rate
+                // ≈ 0) draws nothing, so the canvas stays cheap (L22).
+                if reachable {
+                    for (rate, forward) in [(n.flow, true), (n.flow_rx, false)] {
+                        if rate <= 0.02 {
+                            continue;
+                        }
+                        let count = 1 + (rate * 5.0).round() as usize; // 1..=6
+                        let speed = 0.5 + rate as f32; // laps-per-cycle
+                        for k in 0..count {
+                            let base = (k as f32) / count as f32;
+                            let raw = (self.flow_phase * speed + base).fract();
+                            // Forward rides origin→to; reverse rides to→origin.
+                            let t = if forward { raw } else { 1.0 - raw };
+                            let px = origin.x + (to.x - origin.x) * t;
+                            let py = origin.y + (to.y - origin.y) * t;
+                            frame.fill(
+                                &Path::circle(Point::new(px, py), 2.0),
+                                p.accent.into_cosmic_color(),
+                            );
+                        }
                     }
                 }
                 // RTT label at the midpoint; × for unreachable.
@@ -486,6 +507,62 @@ pub fn read_latency_paths() -> HashMap<String, PathInfo> {
     parse_latency_paths(&raw)
 }
 
+/// MESHMAP-6 — one peer's real per-link traffic, normalized 0.0..=1.0,
+/// as the mackesd `link-traffic` collector records it (nftables byte
+/// deltas). `tx` is self→peer, `rx` is peer→self.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LinkFlow {
+    /// self→peer rate (0.0..=1.0).
+    pub tx: f64,
+    /// peer→self rate (0.0..=1.0).
+    pub rx: f64,
+}
+
+/// MESHMAP-6 — read the per-link traffic cache (the `link-traffic`
+/// collector output) into a host→(tx,rx) map. Missing cache = empty (the
+/// consumer falls back to the per-node `sample_flows` proxy). Same
+/// `~/.cache/mde/` idiom as the latency cache.
+#[must_use]
+pub fn read_link_traffic() -> HashMap<String, LinkFlow> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return HashMap::new();
+    };
+    let path = std::path::PathBuf::from(home).join(".cache/mde/link-traffic.json");
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    parse_link_traffic(&raw)
+}
+
+/// Parse the link-traffic snapshot JSON (pure). A missing direction reads
+/// 0.0; a malformed body yields an empty map (honest "no data" → proxy).
+#[must_use]
+pub fn parse_link_traffic(raw: &str) -> HashMap<String, LinkFlow> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return HashMap::new();
+    };
+    v.get("peers")
+        .and_then(|p| p.as_object())
+        .map(|obj| {
+            obj.iter()
+                .map(|(host, e)| {
+                    let flow = LinkFlow {
+                        tx: e
+                            .get("tx_rate")
+                            .and_then(serde_json::Value::as_f64)
+                            .unwrap_or(0.0),
+                        rx: e
+                            .get("rx_rate")
+                            .and_then(serde_json::Value::as_f64)
+                            .unwrap_or(0.0),
+                    };
+                    (host.clone(), flow)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Parse the snapshot's per-peer path fields (pure).
 #[must_use]
 pub fn parse_latency_paths(raw: &str) -> HashMap<String, PathInfo> {
@@ -555,7 +632,40 @@ mod tests {
             is_self,
             lighthouse: false,
             flow: 0.0,
+            flow_rx: 0.0,
         }
+    }
+
+    // ── MESHMAP-6: per-link traffic cache parse ──
+
+    #[test]
+    fn parse_link_traffic_reads_tx_and_rx_rates() {
+        let raw = r#"{"checked_at":1,"peers":{
+            "anvil":{"tx_rate":0.42,"rx_rate":0.11,"tx_bps":5040000.0,"rx_bps":1320000.0},
+            "forge":{"tx_rate":0.0,"rx_rate":0.0,"tx_bps":0.0,"rx_bps":0.0}
+        }}"#;
+        let m = parse_link_traffic(raw);
+        assert_eq!(m.len(), 2);
+        assert!((m["anvil"].tx - 0.42).abs() < 1e-9);
+        assert!((m["anvil"].rx - 0.11).abs() < 1e-9);
+        assert_eq!(m["forge"].tx, 0.0);
+    }
+
+    #[test]
+    fn parse_link_traffic_defaults_missing_direction_to_zero() {
+        // A row carrying only one direction reads the other as 0 (a one-way
+        // link still shows, no panic).
+        let raw = r#"{"peers":{"oak":{"tx_rate":0.5}}}"#;
+        let m = parse_link_traffic(raw);
+        assert!((m["oak"].tx - 0.5).abs() < 1e-9);
+        assert_eq!(m["oak"].rx, 0.0);
+    }
+
+    #[test]
+    fn parse_link_traffic_rejects_garbage_falls_back_to_proxy() {
+        // An empty map is the "no real data → consumer keeps the proxy" signal.
+        assert!(parse_link_traffic("not json").is_empty());
+        assert!(parse_link_traffic("{}").is_empty());
     }
 
     #[test]
