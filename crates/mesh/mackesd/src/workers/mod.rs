@@ -266,6 +266,13 @@ pub mod music_autoconfig;
 // is per-node). Process ↔ .desktop match, reachable from the root
 // daemon without a per-seat compositor probe.
 pub mod apps_running;
+// APPLAUNCH-5 — the apps_installed worker: mirror this node's set of
+// INSTALLED launchable .desktop apps to <QNM-Shared>/<host>/apps-
+// installed.json so the Front Door's Mesh filter can answer a focused
+// peer's app set on demand (the launch-on-peer target list) without a
+// blocking live RPC — the on-demand `action/apps/peer-list` verb reads
+// this replicated file locally (lazy-mesh: a dead peer never blocks).
+pub mod apps_installed;
 // VIRT-5 (v5.0.0) — VM Nebula cert signing via Bus. Every peer
 // drains `action/compute/cert-sign-request`; on the CA peer
 // (detected by ~/.config/mde/nebula/ca.key) calls `nebula-cert

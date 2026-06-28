@@ -6544,6 +6544,28 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("apps_running".into());
 
+        // APPLAUNCH-5 — apps_installed: mirror this node's INSTALLED .desktop
+        // set to <QNM-Shared>/<host>/apps-installed.json every 60 s so the
+        // Front Door's Mesh filter can answer a focused peer's app set on
+        // demand (action/apps/peer-list) by reading the replicated file
+        // locally — a slow/dead peer never blocks the UI (lazy-mesh). Same
+        // replicated plane + scan root as apps_running; writes to the resolved
+        // workgroup_root so the responder reads what the worker publishes.
+        let apps_installed_home = std::env::var_os("HOME")
+            .map_or_else(|| PathBuf::from("/root"), PathBuf::from);
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::apps_installed::AppsInstalledWorker::new(
+                fw_host.clone(),
+                apps_installed_home,
+            )
+            .with_mount(workgroup_root.clone()),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("apps_installed".into());
+
         // VIRT-5 (v5.0.0) — VM Nebula cert signing via Bus. Every peer
         // spawns the worker; only the CA peer (presence of
         // ~/.config/mde/nebula/ca.key) actually signs + replies, the
