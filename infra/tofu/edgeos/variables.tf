@@ -11,9 +11,23 @@ variable "edgeos_user" {
 }
 
 variable "edgeos_cred_file" {
-  description = "Path to a 0600 file containing ONLY the EdgeOS password. The password is NEVER inlined in tofu config or argv — the scripts read it from this file via sshpass -f."
+  description = <<-EOT
+    Path to a 0600 file containing ONLY the EdgeOS password. The password is NEVER
+    inlined in tofu config or argv — the scripts read it from this file via sshpass -f.
+    DAR-5/DAR-10: this is supplied via TF_VAR_edgeos_cred_file by the shared
+    automation/lib/tofu-env.sh, which unseals /mcnf/secret/edgeos-cred from the mesh
+    store into a TMPFS 0600 file (shredded on exit). There is NO /root/.mcnf-ubnt-cred
+    plaintext default — source ./env.sh (see env.sh.example) before tofu.
+  EOT
   type        = string
-  default     = "/root/.mcnf-ubnt-cred"
+
+  # No default: the cred MUST come from the store via tofu-env.sh (TF_VAR_…), so a
+  # missing source fails loud at plan time rather than silently reading a plaintext
+  # dotfile that may not exist on a reconstituted control VM.
+  validation {
+    condition     = length(var.edgeos_cred_file) > 0
+    error_message = "edgeos_cred_file is empty — source ./env.sh (tofu-env.sh unseals /mcnf/secret/edgeos-cred to a tmpfs path)."
+  }
 }
 
 variable "shared_network" {
