@@ -1,7 +1,7 @@
 //! APPS-LIVE-1 — the `apps_running` worker: publish this node's set of
 //! currently-running launchable apps to the replicated QNM-Shared plane so the
-//! Applications-menu launcher (`mde-apps-applet`) can badge every entry with a
-//! live "running on <host>" indicator, mesh-wide.
+//! Front Door's unified launcher (APPLAUNCH — formerly the standalone apps-applet)
+//! can badge every entry with a live "running on <host>" indicator, mesh-wide.
 //!
 //! ## Why a QNM-Shared file (not a bus topic)
 //!

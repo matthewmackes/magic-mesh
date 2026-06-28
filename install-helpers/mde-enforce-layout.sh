@@ -19,7 +19,10 @@ CFG="${XDG_CONFIG_HOME:-$HOME/.config}/cosmic"
 [ -d "$SRC" ] || exit 0
 
 # The layout-defining config dirs (panel/dock/applet placement + compositor).
-LAYOUT_DIRS="com.system76.CosmicPanel com.system76.CosmicPanel.Panel com.system76.CosmicPanel.Dock com.system76.CosmicPanelButton com.system76.CosmicAppList com.system76.CosmicComp"
+# APPLAUNCH-9 — CosmicPanelButton (the Start button now launches the Front Door
+# launcher in place of the retired mde-apps-applet) + CosmicSettings.Shortcuts
+# (the Super key → the Front Door launcher) join the enforced set.
+LAYOUT_DIRS="com.system76.CosmicPanel com.system76.CosmicPanel.Panel com.system76.CosmicPanel.Dock com.system76.CosmicPanelButton com.system76.CosmicSettings.Shortcuts com.system76.CosmicAppList com.system76.CosmicComp"
 
 changed=0
 for d in $LAYOUT_DIRS; do

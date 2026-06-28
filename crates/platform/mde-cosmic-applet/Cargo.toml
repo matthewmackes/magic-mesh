@@ -12,16 +12,15 @@ path = "src/lib.rs"
 # GUI-6 — the libcosmic panel shell. Thin glue over the lib; renders the
 # pip + popover into the Cosmic panel. Pinned to the libcosmic rev the
 # feasibility probe built clean against (cca48bc).
+#
+# APPLAUNCH-9 (2026-06-27): the `mde-apps-applet` launcher bin was RETIRED here —
+# the app-launcher role folded into the Front Door (one launcher; the standalone
+# applet is gone). This crate now ships ONLY the lighthouse-health applet; the
+# launcher-only lib model (Entry/LauncherTab/WorkloadAction/filter_entries/…) was
+# removed with it. The Front Door is the sole launcher.
 [[bin]]
 name = "mde-cosmic-applet"
 path = "src/bin/mde-cosmic-applet.rs"
-
-# APPS-2 — the Applications Panel launcher applet (grid glyph + tabbed dropdown).
-# Thin libcosmic shell over the lib's launcher model; renders the action/apps/list
-# feed from the mackesd apps_aggregator (APPS-1).
-[[bin]]
-name = "mde-apps-applet"
-path = "src/bin/mde-apps-applet.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -36,10 +35,11 @@ mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
 # NOTIFY-7 / AC — the bell tints by the highest-severity unread alert tailed off
 # the bus, and shares the severity→Carbon-token map with the Action Center.
 mde-notify = { path = "../../services/mde-notify" }
-# `serde` feature: APPS-STYLE reads the user's theme preference
-# (`Preferences::load`) so the launcher honors light + dark themes.
+# `serde` feature: the applet reads the user's theme preference
+# (`Preferences::load`) so the panel indicator honors light + dark themes.
 mde-theme = { path = "../../shared/mde-theme", features = ["serde"] }
-tokio = { version = "1", features = ["process", "rt"] }
+# (APPLAUNCH-9: the `tokio` dep was dropped with the apps-applet — the
+# lighthouse-health applet does no async process work.)
 
 [dependencies.libcosmic]
 git = "https://github.com/pop-os/libcosmic.git"
