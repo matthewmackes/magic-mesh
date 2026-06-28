@@ -16,10 +16,18 @@
 #   dr-restore.sh <dr-file.age> [target-prefix]   # default /dr-restore-test/
 #   dr-restore.sh <dr-file.age> --prod            # restore to original keys (DANGER)
 #
-# Env: MCNF_ETCD, MCNF_AGE_KEY (same as dr-backup.sh).
+# Env (via dr-env.sh, DAR-37): MCNF_ETCD (resolved from /etc/mackesd/etcd-endpoints,
+# NO dead .192:2379 default), MCNF_AGE_KEY. Reads a v1 OR v2 manifest — both carry
+# the top-level "entries" (tofu+secret+recipient kvs) this script re-puts.
 set -euo pipefail
 
-ETCD="${MCNF_ETCD:-http://172.20.145.192:2379}"
+_DRR_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./dr-env.sh
+. "$_DRR_HERE/dr-env.sh"
+dr_require_etcd || exit 1
+ETCD="$MCNF_ETCD"
+# A single endpoint for the per-key re-puts (any member answers).
+ETCD="${ETCD%%,*}"
 KEY="${MCNF_AGE_KEY:-/root/.mcnf-age-key}"
 
 FILE="${1:-}"
