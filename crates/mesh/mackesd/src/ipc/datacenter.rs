@@ -220,7 +220,7 @@ impl Drop for OpLockGuard<'_> {
 /// DATACENTER-12: the trailing five are the storage verbs ([`crate::ipc::storage_ops`]),
 /// served on THIS responder so the panel's Storage tab acts through the same Bus
 /// round trip as the VM tab. `build_reply` routes them into `storage_ops`.
-pub const ACTION_VERBS: [&str; 21] = [
+pub const ACTION_VERBS: [&str; 22] = [
     "vm-power",
     "vm-snapshot",
     "vm-clone",
@@ -242,6 +242,12 @@ pub const ACTION_VERBS: [&str; 21] = [
     // the live apply + `mackesd found` stay operator-gated.
     "genesis-plan",
     "genesis-write",
+    // DAR-45 (DEVOPS-AUTOMATION-REBUILD) — the genesis-wizard backoffice step's
+    // read-only planner probe: shells out to `backoffice-plan.sh --tier <t>` and
+    // returns the RENDERED ordered unit list + a `secrets_ready` boolean. NOT a
+    // canned plan — the acceptance asserts it matches the script's output. The
+    // live bring-up (`backoffice-up.sh`) stays operator-gated on the control VM.
+    "backoffice-plan",
     "sr-create",
     "vdi-create",
     "vdi-attach",
@@ -711,6 +717,8 @@ pub fn build_reply(svc: &DatacenterService, verb: &str, req_body: Option<&str>) 
         "lighthouse-create" => lighthouse_create_reply(svc, req_body),
         "genesis-plan" => genesis_plan_reply(req_body),
         "genesis-write" => genesis_write_reply(svc, req_body),
+        // DAR-45 — read-only backoffice planner probe (no lock; mutates nothing).
+        "backoffice-plan" => backoffice_plan_reply(svc, req_body),
         // DATACENTER-12 — storage verbs are served on this responder but built by
         // the sibling storage_ops module (the op-lock above already guards them).
         v if crate::ipc::storage_ops::is_storage_verb(v) => {
@@ -2013,7 +2021,116 @@ fn genesis_write_reply(svc: &DatacenterService, req_body: Option<&str>) -> Strin
     if let Err(e) = std::fs::write(&tf_path, out) {
         return err(format!("genesis-write: cannot write {rel}: {e}"));
     }
-    json!({ "ok": true, "resource": addr, "path": rel, "workspace": "zone1-do" }).to_string()
+    // DAR-45 — echo the chosen backoffice tier so the wizard knows the genesis
+    // recorded a backoffice opt-in. `backoffice_tier` in the body (minimal|full)
+    // → `backoffice_intent {tier}` in the reply; ABSENT/off → null (behavior
+    // unchanged — genesis-write does NOT itself record intent or run the
+    // orchestrator; that stays `mackesd found --with-backoffice` / the operator).
+    let backoffice_intent = match req.get("backoffice_tier").and_then(serde_json::Value::as_str) {
+        Some(t) if backoffice_tier_valid(t).is_ok() => json!({ "tier": t }),
+        _ => serde_json::Value::Null,
+    };
+    json!({
+        "ok": true,
+        "resource": addr,
+        "path": rel,
+        "workspace": "zone1-do",
+        "backoffice_intent": backoffice_intent,
+    })
+    .to_string()
+}
+
+/// DAR-45 — validate a backoffice tier. Accepts only `minimal` / `full`. PURE.
+///
+/// # Errors
+/// Returns `Err` for any other tier.
+fn backoffice_tier_valid(tier: &str) -> Result<&str, String> {
+    match tier {
+        "minimal" | "full" => Ok(tier),
+        _ => Err(format!(
+            "invalid backoffice tier '{tier}' (expected minimal|full)"
+        )),
+    }
+}
+
+/// Handle a `backoffice-plan` request body `{ "tier": "minimal"|"full" }` (READ-ONLY).
+///
+/// DAR-45 — the genesis-wizard's backoffice step fires this to render the ordered
+/// unit list the orchestrator (`backoffice-up.sh`) would enable. It is a REAL
+/// PROBE, not a canned list: it shells out to `automation/backoffice/backoffice-plan.sh
+/// --tier <t>` (the single source of truth, which reads the tier manifest) and
+/// passes its JSON `units` through verbatim — so the acceptance "RPC units MATCH
+/// `backoffice-plan.sh --tier <t>`" holds by construction. The `secrets_ready`
+/// boolean is RE-STAMPED from the SAME [`do_token_present`] probe the genesis-plan
+/// step uses, so both wizard steps report the credential state identically (and the
+/// wizard never has to trust the script's own probe for that one field). The script
+/// mutates nothing; this verb takes no op-lock (read-only).
+///
+/// On a missing script / non-zero exit (e.g. a broken manifest with a dangling
+/// `via_script`), replies `{"error":..}` carrying the script's stderr — surfaced
+/// honestly rather than faked-present.
+fn backoffice_plan_reply(_svc: &DatacenterService, req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("backoffice-plan: missing request body".into());
+    };
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return err(format!("backoffice-plan: bad json: {e}")),
+    };
+    let tier = req
+        .get("tier")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if let Err(e) = backoffice_tier_valid(tier) {
+        return err(e);
+    }
+    // Resolve the planner under the deployed repo root (the `MCNF_REPO` convention,
+    // same as the secret store) so the relative `automation/...` path resolves
+    // regardless of the daemon's cwd (`/` under systemd).
+    let repo = crate::ipc::secret_store::repo_root();
+    let script = repo.join("automation/backoffice/backoffice-plan.sh");
+    if !script.is_file() {
+        return err(format!(
+            "backoffice-plan: planner not found at {} (is the repo deployed?)",
+            script.display()
+        ));
+    }
+    let output = std::process::Command::new("bash")
+        .arg(&script)
+        .arg("--tier")
+        .arg(tier)
+        .current_dir(&repo)
+        .output();
+    let out = match output {
+        Ok(o) => o,
+        Err(e) => return err(format!("backoffice-plan: spawn failed: {e}")),
+    };
+    if !out.status.success() {
+        // The script prints its JSON on stdout and the broken-unit diagnostic on
+        // stderr; surface stderr so a dangling via_script is named, not hidden.
+        let msg = String::from_utf8_lossy(&out.stderr);
+        let msg = msg.trim();
+        return err(format!(
+            "backoffice-plan: planner failed{}",
+            if msg.is_empty() {
+                String::new()
+            } else {
+                format!(": {msg}")
+            }
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut plan: serde_json::Value = match serde_json::from_str(stdout.trim()) {
+        Ok(v) => v,
+        Err(e) => return err(format!("backoffice-plan: planner output not decodable: {e}")),
+    };
+    // Re-stamp secrets_ready from the SAME Rust probe genesis-plan uses, so the two
+    // wizard steps agree (and the boolean is the daemon's view, not the shell's).
+    if let Some(obj) = plan.as_object_mut() {
+        obj.insert("secrets_ready".into(), json!(do_token_present()));
+    }
+    plan.to_string()
 }
 
 /// Run the datacenter Bus responder loop on the current thread until `should_stop`.
@@ -2116,6 +2233,99 @@ mod tests {
         assert!(ACTION_VERBS.contains(&"vm-snapshot-delete"));
         assert!(ACTION_VERBS.contains(&"do-regions"));
         assert!(ACTION_VERBS.contains(&"lighthouse-create"));
+    }
+
+    // ── DAR-45 — genesis-wizard backoffice step + backoffice-plan verb ──
+
+    #[test]
+    fn backoffice_plan_verb_and_topic_registered() {
+        assert!(ACTION_VERBS.contains(&"backoffice-plan"));
+        assert_eq!(action_topic("backoffice-plan"), "action/dc/backoffice-plan");
+        // read-only → no op-lock key (so two plan probes never collide / reject).
+        assert!(lock_key("backoffice-plan", Some(r#"{"tier":"full"}"#)).is_none());
+    }
+
+    #[test]
+    fn backoffice_tier_validation() {
+        assert!(backoffice_tier_valid("minimal").is_ok());
+        assert!(backoffice_tier_valid("full").is_ok());
+        assert!(backoffice_tier_valid("bogus").is_err());
+        assert!(backoffice_tier_valid("").is_err());
+    }
+
+    #[test]
+    fn backoffice_plan_reply_rejects_bad_input() {
+        let svc = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        // Missing body.
+        let r = backoffice_plan_reply(&svc, None);
+        assert!(r.contains("error"), "{r}");
+        // Bad json.
+        let r = backoffice_plan_reply(&svc, Some("not json"));
+        assert!(r.contains("error") && r.contains("bad json"), "{r}");
+        // Invalid tier.
+        let r = backoffice_plan_reply(&svc, Some(r#"{"tier":"bogus"}"#));
+        assert!(r.contains("error") && r.contains("invalid backoffice tier"), "{r}");
+    }
+
+    #[test]
+    fn backoffice_plan_reply_matches_the_script_output() {
+        // The acceptance: the RPC's rendered unit list MUST match
+        // `backoffice-plan.sh --tier <t>` output (a REAL probe, not canned). We
+        // point MCNF_REPO at the worktree (CARGO_MANIFEST_DIR is crates/mesh/mackesd,
+        // so ../../.. is the repo root) and run BOTH the verb and the script, then
+        // assert their `units` arrays are identical. Skips gracefully if the script
+        // isn't present in this checkout (so the suite stays green off-repo).
+        let _g = lock_env();
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()
+            .expect("repo root");
+        let script = repo.join("automation/backoffice/backoffice-plan.sh");
+        if !script.is_file() {
+            eprintln!("skipping: {} not present in this checkout", script.display());
+            return;
+        }
+        // Test-only env set under the serializing ENV_LOCK.
+        let prev_repo = std::env::var_os("MCNF_REPO");
+        std::env::set_var("MCNF_REPO", &repo);
+        let svc = DatacenterService::new(repo.clone());
+
+        for tier in ["minimal", "full"] {
+            // The verb's reply.
+            let body = format!(r#"{{"tier":"{tier}"}}"#);
+            let reply = backoffice_plan_reply(&svc, Some(&body));
+            let rpc: serde_json::Value =
+                serde_json::from_str(&reply).unwrap_or_else(|e| panic!("rpc json {tier}: {e}\n{reply}"));
+            assert_eq!(rpc["ok"], true, "rpc not ok for {tier}: {reply}");
+            assert_eq!(rpc["tier"], tier, "rpc tier mismatch: {reply}");
+
+            // The script's own output (the source of truth).
+            let out = std::process::Command::new("bash")
+                .arg(&script)
+                .arg("--tier")
+                .arg(tier)
+                .current_dir(&repo)
+                .output()
+                .expect("run backoffice-plan.sh");
+            assert!(out.status.success(), "script failed for {tier}: {}",
+                String::from_utf8_lossy(&out.stderr));
+            let script_json: serde_json::Value =
+                serde_json::from_slice(&out.stdout).expect("script json");
+
+            // The REAL probe: the rendered unit list matches byte-for-byte (same
+            // ids, phases, ordering, live_gated, via_script). This is the canned-vs-
+            // real assertion the critique demanded.
+            assert_eq!(
+                rpc["units"], script_json["units"],
+                "RPC units must MATCH backoffice-plan.sh --tier {tier} (not a canned list)"
+            );
+            // secrets_ready is a bool either way (re-stamped from the Rust probe).
+            assert!(rpc["secrets_ready"].is_boolean(), "{reply}");
+        }
+        match prev_repo {
+            Some(v) => std::env::set_var("MCNF_REPO", v),
+            None => std::env::remove_var("MCNF_REPO"),
+        }
     }
 
     #[test]
