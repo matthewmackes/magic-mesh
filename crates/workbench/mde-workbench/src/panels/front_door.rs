@@ -5365,12 +5365,18 @@ impl FrontDoor {
         // FRONTDOOR-16 — the guided first-run greeting (Q27) above the icon grid,
         // the same once-per-node card the panel mode shows (both modes are reachable
         // surfaces — §7). `None` once dismissed / while searching.
-        let body = match self.greeting_banner(palette) {
-            Some(greeting) => column![top_bar, greeting, content],
-            None => column![top_bar, content],
+        // UNIFY-8 — same dense Carbon Overview header band as the panel mode, under
+        // a hairline rule, shown only on the resting icon grid (not over results).
+        let mut body = column![top_bar, top_bar_hairline(palette)]
+            .width(Length::Fill)
+            .height(Length::Fill);
+        if !self.searching() {
+            body = body.push(self.overview_header(palette));
         }
-        .width(Length::Fill)
-        .height(Length::Fill);
+        if let Some(greeting) = self.greeting_banner(palette) {
+            body = body.push(greeting);
+        }
+        let body = body.push(content);
 
         container(body)
             .width(Length::Fill)
@@ -5550,12 +5556,19 @@ impl FrontDoor {
         // FRONTDOOR-16 — the one-time guided-first-run greeting (Q27) sits above
         // the resting grid (never over search results). `greeting_banner` is `None`
         // once dismissed / while searching, so the normal pane is unchanged.
-        let pane = match self.greeting_banner(palette) {
-            Some(greeting) => column![omnibox_bar, greeting, content],
-            None => column![omnibox_bar, content],
+        // UNIFY-8 — the resting Overview leads with the dense Carbon header band
+        // (title + live roster + mesh-health pill) under a hairline rule; a search
+        // swaps the grid for results, so the header only shows on the resting grid.
+        let mut pane = column![omnibox_bar, top_bar_hairline(palette)]
+            .width(Length::Fill)
+            .height(Length::Fill);
+        if !self.searching() {
+            pane = pane.push(self.overview_header(palette));
         }
-        .width(Length::Fill)
-        .height(Length::Fill);
+        if let Some(greeting) = self.greeting_banner(palette) {
+            pane = pane.push(greeting);
+        }
+        let pane = pane.push(content);
 
         container(pane)
             .width(Length::Fill)
@@ -5591,6 +5604,110 @@ impl FrontDoor {
                 .padding(Padding::from([0u16, 16u16]))
                 .into(),
         )
+    }
+
+    /// UNIFY-8 — the dense Carbon **Overview header band** (the Unified Workbench
+    /// design's "Mesh Overview" title + roster line + a mesh-health status pill).
+    /// Built ENTIRELY from the live roster (`self.peers`) the widget tiles already
+    /// loaded — real counts, never a faked figure, and an honest "building…" line
+    /// before the first snapshot lands (§7). Carbon tokens only (§4): the pill is
+    /// the design's status-pill idiom (a 3 px left accent rule + a status pip + the
+    /// label) over the `surface`/`border` card. The caller shows it only on the
+    /// resting grid (not over search results), in both panel + full-screen modes.
+    fn overview_header(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
+        let sizes = FontSize::defaults();
+        let total = self.peers.len();
+        let online = self.peers.iter().filter(|p| p.presence == "online").count();
+        let degraded = self.peers.iter().filter(|p| p.health == "degraded").count();
+        let offline = self
+            .peers
+            .iter()
+            .filter(|p| p.presence == "offline")
+            .count();
+
+        // Title + a live roster subtitle (real counts; an honest "building…" line
+        // until the first snapshot lands — never a faked figure, §7).
+        let subtitle = if total == 0 {
+            "building from the live mesh…".to_string()
+        } else {
+            let peer_word = if total == 1 { "peer" } else { "peers" };
+            format!("{total} {peer_word} · {online} online")
+        };
+        let heading = column![
+            text("Mesh Overview")
+                .size(TypeRole::Heading.size_in(sizes))
+                .colr(palette.text.into_cosmic_color()),
+            text(subtitle)
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(palette.text_muted.into_cosmic_color()),
+        ]
+        .spacing(3);
+
+        // The mesh-health status pill — the worst live state wins: a node off the
+        // mesh is the loudest signal (red), a degraded node is amber, an all-
+        // present-and-healthy roster is green, an empty roster reads neutral.
+        let (pill_label, pill_tone) = if total == 0 {
+            ("Connecting", TileTone::Neutral)
+        } else if offline > 0 {
+            ("Mesh degraded", TileTone::Danger)
+        } else if degraded > 0 {
+            ("Mesh at risk", TileTone::Warning)
+        } else {
+            ("Mesh healthy", TileTone::Success)
+        };
+        let tone = pill_tone.color(&palette);
+
+        // A 3 px left accent rule (iced borders are uniform, so the design's
+        // `border-left:3px` is a thin filled rule) + a round status pip + label.
+        let accent_rule = container(Space::new())
+            .width(Length::Fixed(3.0))
+            .height(Length::Fixed(28.0))
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(tone)),
+                ..container::Style::default()
+            });
+        let pip = container(Space::new())
+            .width(Length::Fixed(8.0))
+            .height(Length::Fixed(8.0))
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(tone)),
+                border: Border {
+                    color: cosmic::iced::Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 4.0.into(),
+                },
+                ..container::Style::default()
+            });
+        let pill_body = container(
+            row![
+                pip,
+                text(pill_label)
+                    .size(TypeRole::Body.size_in(sizes))
+                    .colr(palette.text.into_cosmic_color()),
+            ]
+            .spacing(8)
+            .align_y(cosmic::iced::Alignment::Center),
+        )
+        .padding(Padding::from([6u16, 12u16]));
+        let pill = container(row![accent_rule, pill_body].align_y(cosmic::iced::Alignment::Center))
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(palette.surface.into_cosmic_color())),
+                border: Border {
+                    color: palette.border.into_cosmic_color(),
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                ..container::Style::default()
+            });
+
+        let bar = row![heading, Space::new().width(Length::Fill), pill]
+            .align_y(cosmic::iced::Alignment::Center)
+            .width(Length::Fill);
+
+        container(bar)
+            .width(Length::Fill)
+            .padding(Padding::from([10u16, 16u16]))
+            .into()
     }
 
     /// FRONTDOOR-6 — the unified search results, rendered BELOW the omnibox in
@@ -6740,6 +6857,20 @@ fn mark_greeting_seen() {
 /// resting tile grid (never over search results / a detail / settings), once per
 /// node. Carbon chrome via `mde-theme` tokens only (§4); the accent-headed raised
 /// card mirrors the Copilot answer card so the AI voice reads consistent.
+/// UNIFY-8 — a 1 px Carbon hairline rule in the `border` token, full width: the
+/// design's `border-bottom` divider that separates the workbench top bar from the
+/// Overview content below it. Pure presentation (§4 — token, never hex).
+fn top_bar_hairline<'a>(palette: Palette) -> Element<'a, crate::Message, Theme> {
+    container(Space::new())
+        .width(Length::Fill)
+        .height(Length::Fixed(1.0))
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(palette.border.into_cosmic_color())),
+            ..container::Style::default()
+        })
+        .into()
+}
+
 fn greeting_card<'a>(palette: Palette) -> Element<'a, crate::Message, Theme> {
     let sizes = FontSize::defaults();
     let accent = palette.accent.into_cosmic_color();
