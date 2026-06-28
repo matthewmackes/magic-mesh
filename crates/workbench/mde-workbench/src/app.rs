@@ -240,6 +240,10 @@ pub enum Message {
     /// the in-flight-only transition tick (idle ⇒ no wakeups); the handler just
     /// re-renders, clearing the transition once the tween completes.
     TransitionTick,
+    /// MOTION-TRANS-2 — one frame of the sidebar group-expand reveal. Fired by the
+    /// in-flight-only `nav_anim` tick; the handler GC's settled tweens so the tick
+    /// self-stops at rest.
+    NavAnimTick,
 }
 
 /// MOTION-TRANS-1 — an in-flight panel/route crossfade. Created the instant the
@@ -294,6 +298,12 @@ pub struct App {
     /// active [`View`] actually changes; cleared once the tween completes.
     transition: Option<PanelTransition>,
     sidebar: SidebarState,
+    /// MOTION-TRANS-2 — the sidebar group-expand reveal animator. Keyed by
+    /// `g:<group-slug>`; a tween is armed when a group expands (navigation to a
+    /// new active group, or a user chevron toggle) so its nav rows slide up into
+    /// place. Tick-driven only while in flight (`needs_tick`), so an idle sidebar
+    /// costs nothing. Empty/idle under reduce-motion (expansions are instant).
+    nav_anim: mde_theme::animation::Animator,
     focused_pane: Pane,
     /// GUI-RECONNECT — last known Bus/mackesd reachability. A down→up
     /// transition (the control plane came back after a restart) re-fires
@@ -419,6 +429,7 @@ impl App {
             view: View::default(),
             transition: None,
             sidebar: SidebarState::new(),
+            nav_anim: mde_theme::animation::Animator::new(),
             focused_pane: Pane::Sidebar,
             bus_reachable: true,
             backend,
@@ -675,6 +686,14 @@ impl App {
                     .map(|_| Message::TransitionTick),
             );
         }
+        // MOTION-TRANS-2 — drive the sidebar group-expand reveal at ~60 fps, but
+        // ONLY while a reveal is in flight (idle ⇒ no subscription, zero wakeups).
+        if self.nav_anim.needs_tick(Instant::now()) {
+            subs.push(
+                cosmic::iced::time::every(Duration::from_millis(16))
+                    .map(|_| Message::NavAnimTick),
+            );
+        }
         // E6.10 / DATACENTER-25 — sample Compute instance CPU/mem only while the
         // Instances surface is actually showing (now the Datacenter plane's
         // Instances tab), so virsh/podman stats aren't polled when the operator is
@@ -747,6 +766,11 @@ impl App {
         let task = self.reduce(message);
         if self.view != prev_view {
             self.begin_transition();
+            // MOTION-TRANS-2 — a navigation onto a *different* group auto-expands
+            // that group; reveal its rows (no-op under reduce-motion).
+            if self.view.group() != prev_view.group() {
+                self.arm_nav_reveal(self.view.group());
+            }
         }
         task
     }
@@ -759,6 +783,23 @@ impl App {
             start: Instant::now(),
             reduce_motion: crate::live_theme::reduce_motion(),
         });
+    }
+
+    /// MOTION-TRANS-2 — arm the slide-up reveal for `group`'s sidebar rows (the
+    /// shared Carbon panel-mount preset). A no-op under reduce-motion, so the
+    /// expand is instant then — the Animator stays empty and the reveal closure
+    /// reads `1.0` (rows at rest). Keyed by `g:<slug>` so each group reveals
+    /// independently and the per-frame tick GC's it the moment it settles.
+    fn arm_nav_reveal(&mut self, group: Group) {
+        if crate::live_theme::reduce_motion() {
+            return;
+        }
+        self.nav_anim.start(
+            format!("g:{}", group.slug()),
+            Instant::now(),
+            mde_theme::motion::Motion::panel_mount(),
+            false,
+        );
     }
 
     /// The message reducer proper. Split out of [`App::update`] so the latter can
@@ -789,7 +830,15 @@ impl App {
                 self.on_panel_navigated(group, panel)
             }
             Message::ToggleGroupExpansion(group) => {
-                self.sidebar.toggle(group, self.view.group());
+                let active = self.view.group();
+                let was_expanded = self.sidebar.is_expanded(group, active);
+                self.sidebar.toggle(group, active);
+                // MOTION-TRANS-2 — reveal the rows only when the chevron *opens* a
+                // group; a collapse removes its rows immediately (instant exit —
+                // immediate-mode iced can't retain a leaving subtree to fade).
+                if !was_expanded && self.sidebar.is_expanded(group, active) {
+                    self.arm_nav_reveal(group);
+                }
                 Task::none()
             }
             Message::KeyPressed(action) => {
@@ -935,6 +984,12 @@ impl App {
                 {
                     self.transition = None;
                 }
+                Task::none()
+            }
+            // MOTION-TRANS-2 — advance the sidebar reveal: drop settled tweens so
+            // the in-flight-only tick subscription self-stops at rest.
+            Message::NavAnimTick => {
+                self.nav_anim.gc(Instant::now());
                 Task::none()
             }
             // GUI-RECONNECT — fire the cheap Bus liveness probe.
@@ -1206,12 +1261,29 @@ impl App {
         if !self.disclaimer_accepted {
             return self.disclaimer_gate_view();
         }
+        // MOTION-TRANS-2 — the per-group reveal progress closure: reads the
+        // sidebar Animator (or `1.0`/instant under reduce-motion). One clock read
+        // for the whole sidebar build.
+        let nav_now = Instant::now();
+        let nav_anim = &self.nav_anim;
+        let reduce_motion = crate::live_theme::reduce_motion();
         let sidebar = crate::sidebar::view(
             &self.sidebar,
             self.view,
             self.focused_pane,
             Message::SelectGroup,
             |group, panel| Message::SelectPanel { group, panel },
+            move |group: Group| {
+                if reduce_motion {
+                    1.0
+                } else {
+                    nav_anim.value(
+                        &format!("g:{}", group.slug()),
+                        nav_now,
+                        mde_theme::motion::Easing::EaseOut,
+                    )
+                }
+            },
         );
 
         let crumbs = breadcrumb(self.view)
@@ -2089,6 +2161,71 @@ mod tests {
         // The Instances slug routes the same way, onto its own tab.
         let _ = app.update(Message::FocusRequest("provisioning.instances".into()));
         assert_eq!(app.datacenter_tab, DatacenterTab::Instances);
+    }
+
+    #[test]
+    fn sidebar_reveal_tween_drives_the_row_offset_to_rest() {
+        // MOTION-TRANS-2 — a reveal tween armed for a group resolves to a partial
+        // reveal at the start (rows offset) and the settled value once its
+        // panel-mount duration elapses (rows at rest). The sidebar reads this exact
+        // value into `reveal_offset`.
+        let mut app = App::new();
+        let t0 = Instant::now();
+        let key = format!("g:{}", Group::System.slug());
+        app.nav_anim
+            .start(&key, t0, mde_theme::motion::Motion::panel_mount(), false);
+        let early = app
+            .nav_anim
+            .value(&key, t0, mde_theme::motion::Easing::EaseOut);
+        assert!(early < 1.0, "a freshly-armed reveal is mid-flight, got {early}");
+        assert!(
+            crate::sidebar::reveal_offset(early) > 0.0,
+            "rows start offset below their rest position"
+        );
+        let done = t0 + mde_theme::motion::Motion::panel_mount().duration;
+        let settled = app
+            .nav_anim
+            .value(&key, done, mde_theme::motion::Easing::EaseOut);
+        assert!((settled - 1.0).abs() < 1e-3, "reveal settles to 1");
+        assert!(
+            crate::sidebar::reveal_offset(settled).abs() < 1e-3,
+            "rows rest at 0 — no residual layout shift"
+        );
+    }
+
+    #[test]
+    fn chevron_expand_arms_a_reveal_collapse_does_not() {
+        // MOTION-TRANS-2 — opening a group via its chevron arms the slide-up
+        // reveal (unless reduce-motion makes it instant); collapsing never arms
+        // one (the rows leave immediately).
+        let mut app = App::new();
+        let active = app.current_view().group();
+        let group = Group::all()
+            .into_iter()
+            .find(|g| *g != active)
+            .expect("a non-active group exists");
+        assert!(!app.sidebar.is_expanded(group, active), "starts collapsed");
+        let _ = app.update(Message::ToggleGroupExpansion(group));
+        assert!(
+            app.sidebar.is_expanded(group, active),
+            "the chevron opened the group"
+        );
+        let key = format!("g:{}", group.slug());
+        let now = Instant::now();
+        if crate::live_theme::reduce_motion() {
+            assert!(
+                !app.nav_anim.is_animating(&key, now),
+                "reduce-motion: the expand is instant, no reveal tween"
+            );
+        } else {
+            assert!(
+                app.nav_anim.is_animating(&key, now),
+                "a reveal tween is armed when the group opens"
+            );
+        }
+        // Collapsing again: the rows leave instantly — no new reveal is armed.
+        let _ = app.update(Message::ToggleGroupExpansion(group));
+        assert!(!app.sidebar.is_expanded(group, active), "the group collapsed");
     }
 
     #[test]
