@@ -1,8 +1,13 @@
 # BUILD-PLATFORM-1 — shared sccache on every build VM, backed by the control-host
 # minio (S3). Any node reuses any node's compiled crates → cold-target latency gone.
 #
-# Creds are NOT in the repo — pass them at runtime:
-#   ansible-playbook sccache.yml -e minio_access_key=… -e minio_secret_key=…
+# DAR-5: the minio creds come from the MESH SECRET STORE (age-encrypted in etcd),
+# unsealed at run time on the controller via mcnf-secret.sh — NOT a committed
+# literal. Seal them once with:
+#   printf %s '<access-key>' | automation/secrets/mcnf-secret.sh put sccache-access-key
+#   printf %s '<secret-key>' | automation/secrets/mcnf-secret.sh put sccache-secret-key
+# An explicit -e minio_access_key=… / -e minio_secret_key=… still overrides (a
+# pre-store bootstrap). The values never land in the repo or the play output.
 ---
 - name: Shared sccache (S3/minio) on build VMs
   hosts: build_vms
@@ -10,14 +15,21 @@
     sccache_version: "0.8.2"
     minio_endpoint: "http://172.20.145.192:9000"
     sccache_bucket: "sccache"
-    # minio_access_key / minio_secret_key come from -e (no default — fail loudly).
+    mcnf_secret_bin: "{{ playbook_dir }}/../../automation/secrets/mcnf-secret.sh"
+    # Unseal from the store on the controller unless overridden by -e. `pipe` runs
+    # on the controller (not the build VM); no_log keeps the value out of the output.
+    minio_access_key: "{{ lookup('pipe', mcnf_secret_bin ~ ' get sccache-access-key') }}"
+    minio_secret_key: "{{ lookup('pipe', mcnf_secret_bin ~ ' get sccache-secret-key') }}"
   tasks:
-    - name: Require the minio creds (passed via -e, never committed)
+    - name: Require the minio creds (from the secret store or -e, never committed)
       ansible.builtin.assert:
         that:
-          - minio_access_key is defined
-          - minio_secret_key is defined
-        fail_msg: "pass -e minio_access_key=… -e minio_secret_key=…"
+          - minio_access_key | default('') | length > 0
+          - minio_secret_key | default('') | length > 0
+        fail_msg: >-
+          no minio creds: seal them (mcnf-secret.sh put sccache-access-key /
+          sccache-secret-key) or pass -e minio_access_key=… -e minio_secret_key=…
+      no_log: true
 
     - name: sccache binary present?
       ansible.builtin.stat:
@@ -38,6 +50,7 @@
       when: not sccache_bin.stat.exists
 
     - name: Write the sccache env (RUSTC_WRAPPER + S3 backend), 0600
+      no_log: true  # DAR-5: the file carries the unsealed minio creds — keep them out of task output
       ansible.builtin.copy:
         dest: "{{ ansible_env.HOME }}/.sccache.env"
         owner: mm

@@ -93,18 +93,62 @@ same secret after a reseal; the VM key file is 0600; the VM key cannot read befo
 reseal; the completion marker reaches `completed`; and **no secret value and no age
 private key ever appear in any logged output**.
 
+## The credential set (DAR-5)
+
+Every backoffice credential lives under `/mcnf/secret/<name>` as age ciphertext —
+NO `/root/.mcnf-*` plaintext is required on a reconstituted control VM:
+
+| secret name          | provider / use                         | old plaintext source (folded by DAR-5)        |
+| -------------------- | -------------------------------------- | --------------------------------------------- |
+| `do-token`           | DigitalOcean (zone1-do)                | (already folded — DATACENTER-3)               |
+| `xapi-password`      | XCP-ng XAPI (xen-xapi, control-vm)     | (already folded — DATACENTER-3)               |
+| `xo-token`           | Xen Orchestra (deprecated env.sh)      | `/root/.mcnf-xo-token` (xo-mint-token.sh)     |
+| `edgeos-cred`        | EdgeOS SSH password (edgeos)           | `/root/.mcnf-ubnt-cred`                       |
+| `dns-token`          | DNS-01 provider token (reserved)       | none yet — `$MCNF_DNS_TOKEN_FILE` if present  |
+| `sccache-access-key` | minio/S3 root user (sccache farm)      | in-repo literal `mcnfcache` (now removed)     |
+| `sccache-secret-key` | minio/S3 root password                 | in-repo literal `mcnfcache2026` (now removed) |
+| `join-token`         | `mackesd join` enroll (control-vm)     | tofu var → cloud-init (never a file)          |
+| `dr-spaces-key`      | off-fleet DO Spaces push (DR)          | (folded by the DR scripts — DAR-39/41)        |
+| `forgejo-*`          | CI admin pass / runner token / SECRET  | sealed by forgejo-seed.sh                     |
+
+### Folding the legacy plaintext files
+
+`automation/secrets/migrate-cred-files.sh` reads each present plaintext source and
+`put`s it into the store — value piped on **stdin** (never argv/log). It is
+**dry-run by default** (touches NO live store); a real fold needs `--apply` and is
+OPERATOR-run:
+
+```bash
+./migrate-cred-files.sh                 # PLAN: which sources are present (no writes)
+./migrate-cred-files.sh --apply         # OPERATOR: fold every present source
+./migrate-cred-files.sh --apply --only edgeos-cred,xo-token   # a subset
+./migrate-cred-files.sh selftest        # offline test (stub put; NO live store)
+```
+
+After a fold, an operator re-seals a fresh control VM in (`reseal-to <vm-recipient>`),
+verifies the consumers resolve from the store, then `shred -u`s the old files.
+
 ## In use
 
-Both Tofu workspaces resolve their creds from the store (their `env.sh`):
-- `infra/tofu/zone1-do` → `DIGITALOCEAN_TOKEN` = `mcnf-secret.sh get do-token`
-- `infra/tofu/xen-xapi` → `TF_VAR_xapi_password` = `mcnf-secret.sh get xapi-password`
+Tofu roots resolve their creds from the store via their `env.sh` (cp from
+`env.sh.example`, gitignored). The shared `automation/lib/tofu-env.sh` (DAR-10) is
+the cred-source indirection — `tofu_env_load <root>` unseals the right secrets into
+process-scoped env with THIS node's own age key, and (for EdgeOS) materializes the
+cred into a **tmpfs 0600 file shredded on exit**:
 
-Verified: with the host cred file removed, `tofu plan` still resolves the XAPI
-password from the store (`0-destroy`), and etcd holds the `age-encryption.org/v1`
-ciphertext, never the plaintext.
+- `infra/tofu/zone1-do` → `DIGITALOCEAN_TOKEN` = `get do-token`
+- `infra/tofu/xen-xapi` → `TF_VAR_xapi_password` = `get xapi-password`
+- `infra/tofu/control-vm` → `TF_VAR_xapi_password` + `TF_VAR_join_token`
+- `infra/tofu/edgeos` → `TF_VAR_edgeos_cred_file` = tmpfs path holding `get edgeos-cred`
+- `infra/tofu/env.sh.example` (XO, deprecated) → `XOA_TOKEN` = `get xo-token`
+- `automation/cache/sccache-backend-up.sh` + `infra/ansible/sccache.yml` →
+  `get sccache-access-key` / `get sccache-secret-key`
+
+Verified: with the host cred file removed, `tofu plan` still resolves the cred from
+the store (`0-destroy`), and etcd holds the `age-encryption.org/v1` ciphertext,
+never the plaintext.
 
 ## Remaining (follow-ups, tracked in WORKLIST DAR-*)
 
-- DAR-5: fold the remaining `/root/.mcnf-*` plaintext cred files into the store.
 - DAR-13/19: the control-VM cloud-init runs `init-self` at boot; the provisioner
   prompts the operator for `reseal-to <vm-recipient>` (live-gated).
