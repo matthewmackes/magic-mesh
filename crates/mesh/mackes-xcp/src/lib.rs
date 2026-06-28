@@ -252,8 +252,56 @@ pub struct IdentitySeed {
 ///   systemd re-seeds it), per the A2 "fresh identity per clone" rule.
 #[must_use]
 pub fn build_identity_seed(name: &str, op_ssh_key: &str, instance_id: &str) -> IdentitySeed {
+    build_seed_with_runcmds(name, op_ssh_key, instance_id, &[])
+}
+
+/// As [`build_identity_seed`] but also wires the clone to **self-enroll** on first
+/// boot (XPA-7): appends a `mackesd join '<token>' --role <role>` runcmd. `token`
+/// is a **v3 add-peer** join token — it pins the lighthouse's PUBLIC `/enroll`
+/// endpoint + cert fingerprint, so the clone enrolls over a reachable endpoint,
+/// NOT the unreachable Nebula overlay IP the legacy `enroll-token` advertised
+/// (this subsumes XPA-5). The join argv rides the cloud-init NoCloud seed the
+/// provisioner already attaches, so no extra over-SSH step is needed.
+///
+/// The join runcmd is rendered as a YAML/exec **argv list** (each element a
+/// single-quoted scalar), so the token — which carries shell-significant `#`/`?`
+/// — is passed verbatim to `mackesd` with no shell interpretation (the XPA-13
+/// flow-style-quoting trap is avoided: no `sh -c`).
+#[must_use]
+pub fn build_join_seed(
+    name: &str,
+    op_ssh_key: &str,
+    instance_id: &str,
+    join_token: &str,
+    role: &str,
+) -> IdentitySeed {
+    let join = render_runcmd_flow_list(&mackesd_join_argv(join_token, role));
+    build_seed_with_runcmds(name, op_ssh_key, instance_id, &[join])
+}
+
+/// Shared core of [`build_identity_seed`] / [`build_join_seed`]: render the
+/// cloud-config with the always-present machine-id reset runcmd plus any
+/// `extra_runcmds` (each an already-rendered cloud-init runcmd list item, the
+/// text after the `- `), in order.
+fn build_seed_with_runcmds(
+    name: &str,
+    op_ssh_key: &str,
+    instance_id: &str,
+    extra_runcmds: &[String],
+) -> IdentitySeed {
     let hostname = mde_vm_hostname(name);
     let key = op_ssh_key.trim();
+    // The always-first runcmd: reset machine-id (A2 fresh-identity rule). Extra
+    // runcmds (e.g. the XPA-7 self-join) follow, so the node has its fresh
+    // machine-id/hostname before it enrolls.
+    let mut runcmds = String::from(
+        "\x20\x20- [ cloud-init-per, once, reset-machine-id, sh, -c, 'truncate -s 0 /etc/machine-id && rm -f /var/lib/dbus/machine-id' ]\n",
+    );
+    for item in extra_runcmds {
+        runcmds.push_str("\x20\x20- ");
+        runcmds.push_str(item);
+        runcmds.push('\n');
+    }
     let user_data = format!(
         "#cloud-config\n\
          preserve_hostname: false\n\
@@ -264,7 +312,7 @@ pub fn build_identity_seed(name: &str, op_ssh_key: &str, instance_id: &str) -> I
          ssh_authorized_keys:\n\
          \x20\x20- {key}\n\
          runcmd:\n\
-         \x20\x20- [ cloud-init-per, once, reset-machine-id, sh, -c, 'truncate -s 0 /etc/machine-id && rm -f /var/lib/dbus/machine-id' ]\n"
+         {runcmds}"
     );
     let meta_data = format!("instance-id: {instance_id}\nlocal-hostname: {hostname}\n");
     IdentitySeed {
@@ -272,6 +320,31 @@ pub fn build_identity_seed(name: &str, op_ssh_key: &str, instance_id: &str) -> I
         meta_data,
         instance_id: instance_id.to_string(),
     }
+}
+
+/// The `mackesd join` argv a freshly-provisioned clone runs on first boot to
+/// enroll itself into the mesh (XPA-7). Pure so the command surface is testable.
+#[must_use]
+pub fn mackesd_join_argv(join_token: &str, role: &str) -> Vec<String> {
+    vec![
+        "mackesd".into(),
+        "join".into(),
+        join_token.into(),
+        "--role".into(),
+        role.into(),
+    ]
+}
+
+/// Render an argv as a cloud-init runcmd **flow list** (`[ 'a', 'b', … ]`), each
+/// element a single-quoted YAML scalar (so a `'` inside an element is doubled per
+/// the YAML single-quote rule). cloud-init execs a list-form runcmd directly
+/// (no shell), so shell-significant characters in any element are inert.
+fn render_runcmd_flow_list(argv: &[String]) -> String {
+    let quoted: Vec<String> = argv
+        .iter()
+        .map(|a| format!("'{}'", a.replace('\'', "''")))
+        .collect();
+    format!("[ {} ]", quoted.join(", "))
 }
 
 /// Force the `MDE-VM-<name>` hostname convention (operator rule 2026-06-16),
@@ -377,6 +450,158 @@ pub fn argv_sr_list() -> Vec<String> {
         "sr-list".into(),
         "params=uuid,physical-size,physical-utilisation".into(),
     ]
+}
+
+/// XPA-1 — the default memory a **headless Server** MDE-VM is right-sized to
+/// after clone (2 GiB), instead of inheriting the golden template's larger size.
+/// A 15.9 GB host couldn't start 4×4 GB clones + the base; 2 GB is plenty for a
+/// headless `mackesd`/nebula/storage-client Server and quadruples the host's VM
+/// density.
+pub const DEFAULT_SERVER_VM_MEM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// XPA-1 — host memory (KiB) the pre-fan-out check reserves for dom0 + slack on
+/// top of the requested VMs, so a spawn that would starve the host fails *early*
+/// with a clear message rather than after a clone that then can't boot.
+pub const HOST_MEM_HEADROOM_KIB: u64 = 512 * 1024;
+
+/// `xe vm-memory-limits-set uuid=<uuid> static-min/max + dynamic-min/max=<bytes>`
+/// — pin a clone to a fixed `bytes` allocation (XPA-1). All four limits are set
+/// to the same value (a fixed, non-ballooning size); xe requires
+/// `static-min ≤ dynamic-min ≤ dynamic-max ≤ static-max`, which equal values
+/// satisfy. Pure + tested.
+#[must_use]
+pub fn argv_memory_set(uuid: &str, bytes: u64) -> Vec<String> {
+    let b = bytes.to_string();
+    vec![
+        "vm-memory-limits-set".into(),
+        format!("uuid={uuid}"),
+        format!("static-min={b}"),
+        format!("static-max={b}"),
+        format!("dynamic-min={b}"),
+        format!("dynamic-max={b}"),
+    ]
+}
+
+/// Pre-fan-out capacity guard (XPA-1): does `cap` have enough **free** memory to
+/// start `count` VMs of `per_vm_kib` each, leaving `headroom_kib` for the host?
+/// Pure so the over-commit math is testable without a live host. Reuses the
+/// [`HostCapacity`] the host-params probe ([`build_capacity`]) already parsed.
+///
+/// # Errors
+/// `Err(message)` — a human-readable "insufficient free memory" the provisioner
+/// surfaces verbatim — when free memory is below the requirement.
+pub fn precheck_host_memory(
+    cap: &HostCapacity,
+    per_vm_kib: u64,
+    count: u32,
+    headroom_kib: u64,
+) -> Result<(), String> {
+    let needed = per_vm_kib
+        .saturating_mul(u64::from(count))
+        .saturating_add(headroom_kib);
+    if cap.mem_free_kib >= needed {
+        Ok(())
+    } else {
+        Err(format!(
+            "insufficient host free memory: need {needed} KiB ({count}×{per_vm_kib} KiB/VM + \
+             {headroom_kib} KiB headroom) but only {} KiB free",
+            cap.mem_free_kib
+        ))
+    }
+}
+
+/// One VIF as reported by `xe vif-list` (XPA-4 — the clone's network interfaces
+/// whose MACs are reset so clones don't collide on the golden's copied MAC).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VifInfo {
+    /// XAPI VIF uuid.
+    pub uuid: String,
+    /// Device index on the VM (`0`, `1`, …).
+    pub device: String,
+    /// Current MAC (the golden's, copied by the clone).
+    pub mac: String,
+    /// The network the VIF is attached to (needed to recreate it).
+    pub network_uuid: String,
+}
+
+/// `xe vif-list vm-uuid=<uuid> params=uuid,device,MAC,network-uuid` — the clone's
+/// VIFs, so each can be reset to a fresh MAC (XPA-4).
+#[must_use]
+pub fn argv_vif_list(vm_uuid: &str) -> Vec<String> {
+    vec![
+        "vif-list".into(),
+        format!("vm-uuid={vm_uuid}"),
+        "params=uuid,device,MAC,network-uuid".into(),
+    ]
+}
+
+/// Decode `xe vif-list params=uuid,device,MAC,network-uuid` into [`VifInfo`]s.
+#[must_use]
+pub fn parse_vif_list(out: &str) -> Vec<VifInfo> {
+    parse_param_records(out)
+        .into_iter()
+        .filter_map(|rec| {
+            let get = |k: &str| rec.iter().find(|(rk, _)| rk == k).map(|(_, v)| v.clone());
+            let uuid = get("uuid")?;
+            if uuid.is_empty() {
+                return None;
+            }
+            Some(VifInfo {
+                uuid,
+                device: get("device").unwrap_or_default(),
+                mac: get("MAC").unwrap_or_default(),
+                network_uuid: get("network-uuid").unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// `xe vif-destroy uuid=<vif>` — half of the MAC reset (xe forbids mutating a
+/// VIF's MAC in place, so the clone's VIF is destroyed + recreated, XPA-4).
+#[must_use]
+pub fn argv_vif_destroy(vif_uuid: &str) -> Vec<String> {
+    vec!["vif-destroy".into(), format!("uuid={vif_uuid}")]
+}
+
+/// `xe vif-create vm-uuid=<uuid> network-uuid=<net> device=<dev> mac=<mac>` — the
+/// recreate half of the MAC reset (XPA-4): same network + device as the destroyed
+/// VIF, but a fresh clone-unique `mac` from [`mac_for_clone`].
+#[must_use]
+pub fn argv_vif_create(vm_uuid: &str, network_uuid: &str, device: &str, mac: &str) -> Vec<String> {
+    vec![
+        "vif-create".into(),
+        format!("vm-uuid={vm_uuid}"),
+        format!("network-uuid={network_uuid}"),
+        format!("device={device}"),
+        format!("mac={mac}"),
+    ]
+}
+
+/// Derive a stable, **locally-administered unicast** MAC for a clone's VIF from
+/// the (globally unique) clone `uuid` + the VIF `device` index (XPA-4).
+/// Deterministic (so it's unit-testable) and collision-free across clones —
+/// distinct uuids hash to distinct MACs. The first octet has the multicast bit
+/// cleared + the locally-administered bit set (low nibble `2/6/A/E`), the
+/// convention for a generated (non-OUI) MAC.
+#[must_use]
+pub fn mac_for_clone(uuid: &str, device: &str) -> String {
+    // FNV-1a 64-bit over `uuid '/' device` — dependency-free, good dispersion.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in uuid
+        .bytes()
+        .chain(std::iter::once(b'/'))
+        .chain(device.bytes())
+    {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let o = h.to_be_bytes();
+    // Clear multicast (bit 0), set locally-administered (bit 1) on the first octet.
+    let first = (o[0] & 0xfe) | 0x02;
+    format!(
+        "{first:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        o[1], o[2], o[3], o[4], o[5]
+    )
 }
 
 /// Build the full executable + argv for a target: `xe <args…>` locally, or
@@ -558,6 +783,23 @@ pub trait Hypervisor {
     /// # Errors
     /// Spawn / non-zero `xe` failures.
     fn set_identity_seed(&self, uuid: &str, seed: &IdentitySeed) -> Result<(), XcpError>;
+    /// XPA-1 — pin a (freshly cloned, still halted) VM to a fixed `bytes` memory
+    /// allocation so a headless Server clone doesn't inherit the golden's larger
+    /// size. Called between [`Hypervisor::clone_golden`] and
+    /// [`Hypervisor::start`].
+    ///
+    /// # Errors
+    /// Spawn / non-zero `xe` failures.
+    fn set_memory(&self, uuid: &str, bytes: u64) -> Result<(), XcpError>;
+    /// XPA-4 — reset every VIF on a (freshly cloned, still halted) VM to a fresh
+    /// locally-administered MAC, so clones don't collide on the golden's copied
+    /// MAC. Each VIF is destroyed + recreated on the same network/device with a
+    /// clone-unique MAC ([`mac_for_clone`]). Called between
+    /// [`Hypervisor::clone_golden`] and [`Hypervisor::start`].
+    ///
+    /// # Errors
+    /// Spawn / non-zero `xe` / parse failures.
+    fn reset_vif_macs(&self, uuid: &str) -> Result<(), XcpError>;
     /// Start a VM by uuid.
     ///
     /// # Errors
@@ -677,6 +919,23 @@ impl Hypervisor for XeSsh {
 
     fn set_identity_seed(&self, uuid: &str, seed: &IdentitySeed) -> Result<(), XcpError> {
         self.run(&argv_set_identity_seed(uuid, seed)).map(|_| ())
+    }
+
+    fn set_memory(&self, uuid: &str, bytes: u64) -> Result<(), XcpError> {
+        self.run(&argv_memory_set(uuid, bytes)).map(|_| ())
+    }
+
+    fn reset_vif_macs(&self, uuid: &str) -> Result<(), XcpError> {
+        // List the clone's VIFs, then destroy + recreate each on the same
+        // network/device with a fresh clone-unique MAC (xe can't mutate a VIF's
+        // MAC in place). Empty VIF list ⇒ nothing to do.
+        let vifs = parse_vif_list(&self.run(&argv_vif_list(uuid))?);
+        for vif in vifs {
+            self.run(&argv_vif_destroy(&vif.uuid))?;
+            let mac = mac_for_clone(uuid, &vif.device);
+            self.run(&argv_vif_create(uuid, &vif.network_uuid, &vif.device, &mac))?;
+        }
+        Ok(())
     }
 
     fn start(&self, uuid: &str) -> Result<(), XcpError> {
@@ -950,5 +1209,158 @@ uuid ( RO)        : bbbb-2
         assert!(!is_ipv4("10.42.0")); // 3 octets
         assert!(!is_ipv4("10.42.0.999")); // >255
         assert!(!is_ipv4("fe80::1"));
+    }
+
+    // ── XPA-1: right-size memory + the over-commit precheck ──
+
+    #[test]
+    fn argv_memory_set_pins_a_fixed_allocation() {
+        let argv = argv_memory_set("u-7", DEFAULT_SERVER_VM_MEM_BYTES);
+        assert_eq!(argv[0], "vm-memory-limits-set");
+        assert_eq!(argv[1], "uuid=u-7");
+        // All four limits are the SAME fixed value (non-ballooning) and satisfy
+        // static-min ≤ dynamic-min ≤ dynamic-max ≤ static-max trivially.
+        let b = (2u64 * 1024 * 1024 * 1024).to_string();
+        assert_eq!(argv[2], format!("static-min={b}"));
+        assert_eq!(argv[3], format!("static-max={b}"));
+        assert_eq!(argv[4], format!("dynamic-min={b}"));
+        assert_eq!(argv[5], format!("dynamic-max={b}"));
+    }
+
+    #[test]
+    fn precheck_host_memory_math() {
+        // 2 GiB free, asking for one 2 GiB VM + 512 MiB headroom → over by the
+        // headroom, so it must FAIL early (the XPA-1 over-commit case).
+        let two_gib_kib = 2 * 1024 * 1024;
+        let cap = HostCapacity {
+            mem_free_kib: two_gib_kib,
+            ..HostCapacity::default()
+        };
+        let per_vm = DEFAULT_SERVER_VM_MEM_BYTES / 1024;
+        assert!(precheck_host_memory(&cap, per_vm, 1, HOST_MEM_HEADROOM_KIB).is_err());
+        // Exactly enough (VM + headroom) → Ok.
+        let cap_ok = HostCapacity {
+            mem_free_kib: per_vm + HOST_MEM_HEADROOM_KIB,
+            ..HostCapacity::default()
+        };
+        assert!(precheck_host_memory(&cap_ok, per_vm, 1, HOST_MEM_HEADROOM_KIB).is_ok());
+        // The original report: a 15.9 GB host, 4×4 GB VMs — must fail.
+        let host = HostCapacity {
+            mem_free_kib: 15_900 * 1024,
+            ..HostCapacity::default()
+        };
+        let four_gib_kib = 4 * 1024 * 1024;
+        let err = precheck_host_memory(&host, four_gib_kib, 4, HOST_MEM_HEADROOM_KIB)
+            .expect_err("4×4 GB over-commits a 15.9 GB host");
+        assert!(err.contains("insufficient host free memory"), "{err}");
+    }
+
+    // ── XPA-4: reset clone VIF MACs ──
+
+    #[test]
+    fn vif_argv_builders_shape() {
+        assert_eq!(
+            argv_vif_list("vm-1"),
+            vec![
+                "vif-list",
+                "vm-uuid=vm-1",
+                "params=uuid,device,MAC,network-uuid"
+            ]
+        );
+        assert_eq!(argv_vif_destroy("vif-9"), vec!["vif-destroy", "uuid=vif-9"]);
+        assert_eq!(
+            argv_vif_create("vm-1", "net-2", "0", "02:ab:cd:ef:01:23"),
+            vec![
+                "vif-create",
+                "vm-uuid=vm-1",
+                "network-uuid=net-2",
+                "device=0",
+                "mac=02:ab:cd:ef:01:23"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_vif_list_decodes_records() {
+        let out = "\
+uuid ( RO)         : vif-aaaa
+    vm-uuid ( RO): vm-1
+    device ( RO): 0
+    MAC ( RO): aa:bb:cc:dd:ee:ff
+    network-uuid ( RO): net-7
+
+uuid ( RO)         : vif-bbbb
+    device ( RO): 1
+    MAC ( RO): aa:bb:cc:dd:ee:00
+    network-uuid ( RO): net-8
+";
+        let vifs = parse_vif_list(out);
+        assert_eq!(vifs.len(), 2);
+        assert_eq!(vifs[0].uuid, "vif-aaaa");
+        assert_eq!(vifs[0].device, "0");
+        assert_eq!(vifs[0].mac, "aa:bb:cc:dd:ee:ff");
+        assert_eq!(vifs[0].network_uuid, "net-7");
+        assert_eq!(vifs[1].device, "1");
+    }
+
+    #[test]
+    fn mac_for_clone_is_locally_administered_unique_and_stable() {
+        let m = mac_for_clone("uuid-xyz", "0");
+        // Shape: 6 lowercase-hex octets.
+        let octets: Vec<&str> = m.split(':').collect();
+        assert_eq!(octets.len(), 6, "{m}");
+        assert!(octets
+            .iter()
+            .all(|o| o.len() == 2 && o.chars().all(|c| c.is_ascii_hexdigit())));
+        // First octet: multicast bit clear (even) + locally-administered bit set.
+        let first = u8::from_str_radix(octets[0], 16).unwrap();
+        assert_eq!(first & 0x01, 0x00, "unicast (multicast bit clear)");
+        assert_eq!(first & 0x02, 0x02, "locally-administered bit set");
+        // Stable for the same inputs…
+        assert_eq!(mac_for_clone("uuid-xyz", "0"), m);
+        // …distinct per device, and per clone uuid (no collisions across clones).
+        assert_ne!(mac_for_clone("uuid-xyz", "1"), m);
+        assert_ne!(mac_for_clone("uuid-other", "0"), m);
+    }
+
+    // ── XPA-7: the clone self-joins via a v3 token in its cloud-init seed ──
+
+    #[test]
+    fn mackesd_join_argv_shape() {
+        assert_eq!(
+            mackesd_join_argv("mesh:m@1.2.3.4:4243#b?fp=ab", "server"),
+            vec![
+                "mackesd",
+                "join",
+                "mesh:m@1.2.3.4:4243#b?fp=ab",
+                "--role",
+                "server"
+            ]
+        );
+    }
+
+    #[test]
+    fn build_join_seed_embeds_a_no_shell_self_join_runcmd() {
+        let token = "mesh:home@203.0.113.5:4243#BEARERxyz?fp=deadbeef";
+        let seed = build_join_seed("web1", "ssh-ed25519 KEY op@h", "iid-1", token, "server");
+        // It's still a first-boot identity seed (hostname + machine-id reset)…
+        assert!(seed.user_data.contains("hostname: MDE-VM-web1"));
+        assert!(seed.user_data.contains("reset-machine-id"));
+        // …plus the XPA-7 self-join, rendered as an EXEC LIST (no `sh -c`), so the
+        // token's `#`/`?` are passed verbatim to mackesd (no shell interpretation).
+        assert!(
+            seed.user_data.contains(&format!(
+                "[ 'mackesd', 'join', '{token}', '--role', 'server' ]"
+            )),
+            "join runcmd missing/!exec-list: {}",
+            seed.user_data
+        );
+        // The reset-machine-id runcmd is ordered BEFORE the join (fresh id first).
+        let reset_at = seed.user_data.find("reset-machine-id").unwrap();
+        let join_at = seed.user_data.find("'mackesd', 'join'").unwrap();
+        assert!(reset_at < join_at, "machine-id reset must precede the join");
+        // A plain identity seed (no token) carries NO join runcmd.
+        let plain = build_identity_seed("web1", "ssh-ed25519 KEY op@h", "iid-1");
+        assert!(!plain.user_data.contains("mackesd"));
     }
 }
