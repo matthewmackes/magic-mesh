@@ -393,6 +393,11 @@ assets = [
     # shared-state volume over the overlay, boot-durable. Run per-node with
     # --master/--chunkserver/--client (see the script header).
     { source = "install-helpers/setup-qnm-shared.sh",    dest = "/usr/libexec/mackesd/setup-qnm-shared",        mode = "755" },
+    # BOOT-XPA8-4 — the QNM-Shared mount loop, extracted from setup-qnm-shared.sh's
+    # inline ExecStart so the wedge-proof retry logic updates on every RPM upgrade
+    # (the qnm-shared.service ExecStart/ExecStop call it). Shipping it as a real
+    # file makes the loop bash-n-checkable (vs an un-lintable inline heredoc).
+    { source = "install-helpers/qnm-mount.sh",           dest = "/usr/libexec/mackesd/qnm-mount",               mode = "755" },
     # SUBSTRATE-1 (SUBSTRATE-V2) — the etcd coordination cluster: overlay-bound
     # leader/directory/health. Run per-node with --init/--join/--client-only.
     # The unit only starts where setup-etcd.sh wrote /etc/etcd/etcd.env (members).
