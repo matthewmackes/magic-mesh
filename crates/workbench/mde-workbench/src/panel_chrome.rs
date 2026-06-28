@@ -830,6 +830,245 @@ pub fn hero_band<'a, Message: 'a>(
         .into()
 }
 
+// ---------------------------------------------------------------------------
+// UNIFY-6 — additive dense-Carbon widgets for the Unified Workbench restyle.
+//
+// These are PRESENTATION primitives the screen restyles compose: the status
+// pip, the KPI stat tile, the 1 px-gap hairline card grid, and the thin
+// capacity bar. They're token-only (callers pass palette/severity colours,
+// never raw hex) and add ZERO new public-fn-signature churn to the existing
+// chrome above.
+// ---------------------------------------------------------------------------
+
+/// UNIFY-6 — default status-pip diameter (8 px), the size used in dense rows
+/// and card headers. The nav (5 px) and peer-header (11 px) sizes call
+/// [`status_dot_sized`].
+pub const DEFAULT_DOT_DIAMETER: f32 = 8.0;
+
+/// UNIFY-6 — a small filled status pip (the design's status dots). A
+/// [`DEFAULT_DOT_DIAMETER`]-px circle filled with `color`. `color` is a token
+/// (e.g. `palette.success`/`mde_notify::severity_token(..)` `.into_cosmic_color()`),
+/// never a raw hex.
+pub fn status_dot<'a, Message: 'a>(color: Color) -> Element<'a, Message> {
+    status_dot_sized(color, DEFAULT_DOT_DIAMETER)
+}
+
+/// UNIFY-6 — [`status_dot`] at a caller-chosen `diameter`, for the per-context
+/// pip sizes the design uses (5 px nav, 9 px matrix, 11 px peer header).
+pub fn status_dot_sized<'a, Message: 'a>(color: Color, diameter: f32) -> Element<'a, Message> {
+    let radii = Radii::defaults();
+    container(
+        Space::new()
+            .width(Length::Fixed(diameter))
+            .height(Length::Fixed(diameter)),
+    )
+    .width(Length::Fixed(diameter))
+    .height(Length::Fixed(diameter))
+    .style(move |_theme| container::Style {
+        snap: false,
+        icon_color: None,
+        background: Some(Background::Color(color)),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: f32::from(radii.full).into(),
+        },
+        shadow: IcedShadow::default(),
+        text_color: None,
+    })
+    .into()
+}
+
+/// UNIFY-6 — the design's KPI stat tile (the 6-col Overview cards): an
+/// uppercased muted `label`, a big colour-coded `value` (Display role) with a
+/// muted `unit` suffix, and a muted `sub` line. Renders on the `surface` layer
+/// with NO border of its own — drop a row of these into [`stat_grid`] so the
+/// 1 px grid gaps draw the hairline dividers. `value_color` is the semantic
+/// value tint (e.g. `palette.success`/`palette.warning` `.into_cosmic_color()`);
+/// everything else reads the palette.
+pub fn kpi_stat_tile<'a, Message: 'a>(
+    label: impl Into<String>,
+    value: impl Into<String>,
+    unit: impl Into<String>,
+    sub: impl Into<String>,
+    value_color: Color,
+    palette: Palette,
+) -> Element<'a, Message> {
+    let sizes = FontSize::defaults();
+    let medium = Font {
+        weight: cosmic::iced::font::Weight::Medium,
+        ..Font::DEFAULT
+    };
+
+    let label = text(label.into().to_uppercase())
+        .size(TypeRole::Caption.size_in(sizes))
+        .font(medium)
+        .colr(palette.text_muted.into_cosmic_color());
+
+    let value = text(value.into())
+        .size(TypeRole::Display.size_in(sizes))
+        .font(medium)
+        .colr(value_color);
+    let unit = text(unit.into())
+        .size(TypeRole::Caption.size_in(sizes))
+        .colr(palette.text_muted.into_cosmic_color());
+    let value_row = row![value, unit]
+        .spacing(5)
+        .align_y(alignment::Vertical::Bottom);
+
+    let sub = text(sub.into())
+        .size(TypeRole::Caption.size_in(sizes))
+        .colr(palette.text_muted.into_cosmic_color());
+
+    let body = column![label, value_row, sub].spacing(5);
+
+    container(body)
+        .width(Length::Fill)
+        .padding(Padding {
+            top: 10.0,
+            right: 13.0,
+            bottom: 10.0,
+            left: 13.0,
+        })
+        .style(move |_theme| container::Style {
+            snap: false,
+            icon_color: None,
+            background: Some(Background::Color(palette.surface.into_cosmic_color())),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 0.0.into(),
+            },
+            shadow: IcedShadow::default(),
+            text_color: Some(palette.text.into_cosmic_color()),
+        })
+        .into()
+}
+
+/// UNIFY-6 — height of the thin capacity bar (4 px), matching the design's
+/// host CPU/MEM meters.
+pub const PROGRESS_BAR_HEIGHT: f32 = 4.0;
+
+/// UNIFY-6 — split a 0..=1 fraction into `(filled, rest)` FillPortion weights
+/// (out of 1000), clamping out-of-range input. Pure so the fill maths is
+/// unit-testable without reaching into the rendered [`Element`].
+fn progress_portions(fraction: f32) -> (u16, u16) {
+    let frac = fraction.clamp(0.0, 1.0);
+    let filled = (frac * 1000.0).round() as u16;
+    (filled, 1000u16.saturating_sub(filled))
+}
+
+/// UNIFY-6 — the design's thin capacity bar: a `fraction` (0..=1) filled
+/// segment in `color` over a recessed `background`-layer track. Used for the
+/// host CPU/MEM bars and the fleet-convergence meter. `color` is a token (e.g.
+/// `palette.accent.into_cosmic_color()`); `fraction` is clamped to 0..=1 so an
+/// out-of-range input can never overflow the track.
+pub fn progress_bar<'a, Message: 'a>(
+    fraction: f32,
+    color: Color,
+    palette: Palette,
+) -> Element<'a, Message> {
+    let (filled, rest) = progress_portions(fraction);
+
+    let fill: Element<'a, Message> =
+        container(Space::new().width(Length::Fill).height(Length::Fill))
+            .width(Length::FillPortion(filled))
+            .height(Length::Fill)
+            .style(move |_theme| container::Style {
+                snap: false,
+                icon_color: None,
+                background: Some(Background::Color(color)),
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 0.0.into(),
+                },
+                shadow: IcedShadow::default(),
+                text_color: None,
+            })
+            .into();
+    let gap: Element<'a, Message> = Space::new().width(Length::FillPortion(rest)).into();
+
+    container(row![fill, gap].height(Length::Fixed(PROGRESS_BAR_HEIGHT)))
+        .width(Length::Fill)
+        .height(Length::Fixed(PROGRESS_BAR_HEIGHT))
+        .style(move |_theme| container::Style {
+            snap: false,
+            icon_color: None,
+            background: Some(Background::Color(palette.background.into_cosmic_color())),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 0.0.into(),
+            },
+            shadow: IcedShadow::default(),
+            text_color: None,
+        })
+        .into()
+}
+
+/// UNIFY-6 — the design's hairline card grid: lay `cells` out in rows of
+/// `cols` equal columns, separated by 1 px gaps over a `border`-coloured
+/// backing so the gaps read as Carbon hairline dividers (the design's
+/// `gap:1px;background:border` trick). Each cell should bring its own
+/// `surface` fill (e.g. [`kpi_stat_tile`]); the last row is padded with
+/// `surface` fillers so the columns stay aligned. `cols` is clamped to >= 1.
+pub fn stat_grid<'a, Message: 'a>(
+    cells: Vec<Element<'a, Message>>,
+    cols: usize,
+    palette: Palette,
+) -> Element<'a, Message> {
+    let cols = cols.max(1);
+    let surface = palette.surface.into_cosmic_color();
+    let filler = move || -> Element<'a, Message> {
+        container(Space::new().width(Length::Fill).height(Length::Fill))
+            .width(Length::FillPortion(1))
+            .style(move |_theme| container::Style {
+                snap: false,
+                icon_color: None,
+                background: Some(Background::Color(surface)),
+                ..container::Style::default()
+            })
+            .into()
+    };
+
+    let mut rows: Vec<Element<'a, Message>> = Vec::new();
+    let mut current: Vec<Element<'a, Message>> = Vec::new();
+    for cell in cells.into_iter() {
+        current.push(container(cell).width(Length::FillPortion(1)).into());
+        if current.len() == cols {
+            rows.push(
+                row(std::mem::take(&mut current))
+                    .spacing(1)
+                    .width(Length::Fill)
+                    .into(),
+            );
+        }
+    }
+    if !current.is_empty() {
+        while current.len() < cols {
+            current.push(filler());
+        }
+        rows.push(row(current).spacing(1).width(Length::Fill).into());
+    }
+
+    container(column(rows).spacing(1).width(Length::Fill))
+        .width(Length::Fill)
+        .style(move |_theme| container::Style {
+            snap: false,
+            icon_color: None,
+            background: Some(Background::Color(palette.border.into_cosmic_color())),
+            border: Border {
+                color: palette.border.into_cosmic_color(),
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            shadow: IcedShadow::default(),
+            text_color: Some(palette.text.into_cosmic_color()),
+        })
+        .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1057,5 +1296,88 @@ mod tests {
         let palette = crate::live_theme::palette();
         let card = mde_theme::ObjectCard::small(mde_theme::Icon::Fleet, "smoke");
         let _: Element<'_, ()> = object_card(card, palette);
+    }
+
+    // ---- UNIFY-6 — additive dense-Carbon widgets -------------------
+
+    #[test]
+    fn unify6_status_dot_and_kpi_tile_construct() {
+        let palette = crate::live_theme::palette();
+        let _: Element<'_, ()> = status_dot(palette.success.into_cosmic_color());
+        // The per-context pip sizes the design uses.
+        let _: Element<'_, ()> = status_dot_sized(palette.danger.into_cosmic_color(), 5.0);
+        let _: Element<'_, ()> = status_dot_sized(palette.accent.into_cosmic_color(), 11.0);
+        // Pip default diameter is the locked 8 px.
+        assert!((DEFAULT_DOT_DIAMETER - 8.0).abs() < f32::EPSILON);
+
+        let _: Element<'_, ()> = kpi_stat_tile(
+            "nodes online",
+            "7",
+            "/ 8",
+            "6 healthy · 1 degraded · 1 offline",
+            palette.success.into_cosmic_color(),
+            palette,
+        );
+    }
+
+    #[test]
+    fn unify6_progress_portions_clamp_and_split_to_a_constant_total() {
+        // Value formatting: a 0..=1 fraction maps to (filled, rest) portions
+        // that always sum to 1000, and out-of-range input is clamped so the
+        // fill can never overflow (or underflow) the track.
+        assert_eq!(progress_portions(0.0), (0, 1000));
+        assert_eq!(progress_portions(1.0), (1000, 0));
+        assert_eq!(
+            progress_portions(-5.0),
+            (0, 1000),
+            "below-range clamps to empty"
+        );
+        assert_eq!(
+            progress_portions(2.0),
+            (1000, 0),
+            "above-range clamps to full"
+        );
+        let (filled, rest) = progress_portions(0.5);
+        assert_eq!(filled, 500);
+        assert_eq!(
+            filled + rest,
+            1000,
+            "portions always sum to the constant total"
+        );
+        assert!((PROGRESS_BAR_HEIGHT - 4.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn unify6_progress_bar_constructs_across_the_range() {
+        let palette = crate::live_theme::palette();
+        for f in [-1.0, 0.0, 0.42, 0.875, 1.0, 2.0] {
+            let _: Element<'_, ()> = progress_bar(f, palette.accent.into_cosmic_color(), palette);
+        }
+    }
+
+    #[test]
+    fn unify6_stat_grid_pads_a_short_final_row_and_clamps_cols() {
+        let palette = crate::live_theme::palette();
+        // 5 cells across 6 columns ⇒ the final row is padded to keep the
+        // columns aligned (the design's 6-up KPI grid).
+        let cells: Vec<Element<'_, ()>> = (0..5)
+            .map(|_| {
+                kpi_stat_tile(
+                    "l",
+                    "v",
+                    "u",
+                    "s",
+                    palette.text.into_cosmic_color(),
+                    palette,
+                )
+            })
+            .collect();
+        let _: Element<'_, ()> = stat_grid(cells, 6, palette);
+        // Degenerate inputs don't panic: empty cells, cols clamps to >= 1.
+        let _: Element<'_, ()> = stat_grid(Vec::new(), 0, palette);
+        let exact: Vec<Element<'_, ()>> = (0..4)
+            .map(|_| status_dot(palette.accent.into_cosmic_color()))
+            .collect();
+        let _: Element<'_, ()> = stat_grid(exact, 4, palette);
     }
 }

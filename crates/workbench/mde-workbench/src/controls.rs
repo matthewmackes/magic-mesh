@@ -24,8 +24,8 @@ use cosmic::iced::widget::radio::{Status as RadioStatus, Style as RadioStyle};
 use cosmic::iced::widget::scrollable::{
     Rail, Scroller, Status as ScrollStatus, Style as ScrollStyle,
 };
-use cosmic::iced::widget::{button, container, row, text, text_input, Space};
-use cosmic::iced::{alignment, Background, Border, Color, Element, Length, Padding, Shadow};
+use cosmic::iced::widget::{button, column, container, row, text, text_input, Space};
+use cosmic::iced::{alignment, Background, Border, Color, Element, Font, Length, Padding, Shadow};
 
 use crate::cosmic_compat::prelude::*;
 use mde_theme::animation::lerp_f32;
@@ -585,6 +585,105 @@ fn with_alpha(c: Color, a: f32) -> Color {
     Color { a, ..c }
 }
 
+// ---------------------------------------------------------------------------
+// UNIFY-6 — additive dense-Carbon segmented control for the Unified Workbench
+// restyle. The interactive sibling of the panel-chrome presentation widgets:
+// a flat button group where the active segment is marked by an accent
+// underline (the design's Health/Logs + List/Live-map toggles). Token-only.
+// ---------------------------------------------------------------------------
+
+/// UNIFY-6 — width of the accent underline under the active segment (2 px,
+/// matching the design's tab/toggle underline).
+pub const SEGMENT_UNDERLINE_WIDTH: f32 = 2.0;
+
+/// UNIFY-6 — flat segmented control (the design's Health/Logs +
+/// List/Live-map toggles): a borderless button group where the selected
+/// segment carries a 2 px accent underline ([`SEGMENT_UNDERLINE_WIDTH`]) and
+/// medium-weight text, the rest muted with a faint raised-tint hover. `items`
+/// is `(label, selected)` per segment; `on_select` is invoked with the index
+/// of the pressed segment. Token-only — every colour comes from `palette`.
+pub fn segmented_control<'a, Message: Clone + 'a>(
+    items: &[(&str, bool)],
+    on_select: impl Fn(usize) -> Message + 'a,
+    palette: Palette,
+) -> Element<'a, Message, cosmic::Theme> {
+    let sizes = FontSize::defaults();
+    let accent = palette.accent.into_cosmic_color();
+    let text_color = palette.text.into_cosmic_color();
+    let muted = palette.text_muted.into_cosmic_color();
+    let raised = palette.raised.into_cosmic_color();
+
+    let mut bar = row![].align_y(alignment::Vertical::Center);
+    for (i, (label, selected)) in items.iter().enumerate() {
+        let selected = *selected;
+        let fg = if selected { text_color } else { muted };
+        let weight = if selected {
+            cosmic::iced::font::Weight::Medium
+        } else {
+            cosmic::iced::font::Weight::Normal
+        };
+        let underline_color = if selected { accent } else { Color::TRANSPARENT };
+
+        let seg_label = container(
+            text((*label).to_string())
+                .size(TypeRole::Body.size_in(sizes))
+                .font(Font {
+                    weight,
+                    ..Font::DEFAULT
+                })
+                .colr(fg)
+                .align_y(alignment::Vertical::Center),
+        )
+        .padding(Padding {
+            top: 5.0,
+            right: 13.0,
+            bottom: 5.0,
+            left: 13.0,
+        });
+
+        let underline = container(
+            Space::new()
+                .width(Length::Fill)
+                .height(Length::Fixed(SEGMENT_UNDERLINE_WIDTH)),
+        )
+        .width(Length::Fill)
+        .height(Length::Fixed(SEGMENT_UNDERLINE_WIDTH))
+        .style(move |_theme| container::Style {
+            snap: false,
+            background: Some(Background::Color(underline_color)),
+            ..container::Style::default()
+        });
+
+        let seg = button(column![seg_label, underline])
+            .padding(0)
+            .on_press(on_select(i))
+            .sty(move |_theme, status| {
+                // Active segment is carried by the underline + medium weight;
+                // an idle segment gains a faint raised-tint wash on hover so
+                // it reads as clickable without competing with the active mark.
+                let bg = if matches!(status, ButtonStatus::Hovered) && !selected {
+                    with_alpha(raised, 0.6)
+                } else {
+                    Color::TRANSPARENT
+                };
+                button::Style {
+                    snap: false,
+                    background: Some(Background::Color(bg)),
+                    text_color: fg,
+                    border: Border {
+                        color: Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 0.0.into(),
+                    },
+                    shadow: Shadow::default(),
+                    ..button::Style::default()
+                }
+            });
+        bar = bar.push(seg);
+    }
+    bar.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,6 +745,29 @@ mod tests {
         let _ = checkbox_style(palette);
         let _ = radio_style(palette);
         let _ = scrollbar_style(palette);
+    }
+
+    // UNIFY-6 — the additive segmented control.
+
+    #[test]
+    fn segmented_control_constructs_for_each_index_and_empty() {
+        let palette = crate::live_theme::palette();
+        // Underline width is the locked 2 px.
+        assert!((SEGMENT_UNDERLINE_WIDTH - 2.0).abs() < f32::EPSILON);
+
+        // Two-segment toggle (the design's Health/Logs), index 1 selected; the
+        // on_select closure is exercised for every segment as the control wires
+        // each button's on_press = on_select(i).
+        let items = [("Health", false), ("Logs", true)];
+        let _: Element<'_, usize, cosmic::Theme> = segmented_control(&items, |i| i, palette);
+
+        // List/Live-map toggle, first selected.
+        let view = [("List", true), ("Live map", false)];
+        let _: Element<'_, usize, cosmic::Theme> = segmented_control(&view, |i| i, palette);
+
+        // Degenerate input doesn't panic.
+        let empty: [(&str, bool); 0] = [];
+        let _: Element<'_, usize, cosmic::Theme> = segmented_control(&empty, |i| i, palette);
     }
 
     // MOTION-FEEDBACK-1 — status→style mapping for the shared variant_button.
