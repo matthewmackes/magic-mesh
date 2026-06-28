@@ -5,3 +5,5 @@ terraform.tfstate
 terraform.tfstate.*
 tfplan
 crash.log
+# DAR-8: the per-mesh backend address is generated (gen-backend-config.sh), never committed.
+*.backend.hcl
