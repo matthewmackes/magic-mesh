@@ -52,3 +52,32 @@ CREATE INDEX IF NOT EXISTS idx_messages_topic_ulid
 -- to find messages past their priority-class TTL.
 CREATE INDEX IF NOT EXISTS idx_messages_ts
     ON messages (ts_unix_ms);
+
+-- L1043 — consumer-cursor registry (retention consumer-safety).
+--
+-- A live consumer registers, per source topic, the highest ULID it has
+-- consumed (its read cursor) plus a liveness heartbeat (`updated_unix_ms`).
+-- The retention TTL reap consults the SLOWEST live cursor on each topic and
+-- refuses to delete a message newer than it: TTL-expired-but-still-unread
+-- messages survive until the slowest live consumer has actually read them,
+-- instead of being stranded (deleted before delivery). A cursor older than
+-- the liveness window is treated as dead (a crashed/departed consumer must
+-- not strand the spool forever) and ignored, and the df-pressure emergency
+-- evictor ignores cursors entirely (a full /run is strictly worse). The
+-- table lives on the same /run index as `messages`; consumers re-register
+-- after a reboot, so it needs no durability.
+CREATE TABLE IF NOT EXISTS consumer_cursors (
+    -- Stable consumer identity (e.g. "correlate", "musicd", "workbench").
+    consumer        TEXT NOT NULL,
+    -- The source topic this cursor tracks (matched exactly, like messages).
+    topic           TEXT NOT NULL,
+    -- Highest ULID this consumer has consumed on `topic` (its read cursor).
+    cursor_ulid     TEXT NOT NULL,
+    -- Unix ms of the last heartbeat — drives the liveness window.
+    updated_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY (consumer, topic)
+);
+
+-- The retention guard's per-topic MIN(cursor_ulid) over live cursors.
+CREATE INDEX IF NOT EXISTS idx_consumer_cursors_topic
+    ON consumer_cursors (topic, updated_unix_ms);
