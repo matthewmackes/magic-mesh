@@ -19,7 +19,7 @@ use cosmic::Element;
 
 use crate::cosmic_compat::overlay_color_on;
 use crate::cosmic_compat::prelude::*;
-use mde_notify::{AlertItem, Severity};
+use mde_notify::{severity_token, AlertItem, Severity};
 use mde_theme::{carbon, FontSize, FontWeight, Palette, TypeRole};
 
 /// Strip height — the design's 26 px chrome band.
@@ -31,8 +31,9 @@ const PIP: f32 = 7.0;
 /// Build the global status strip from the live alert items.
 ///
 /// `events` is the live shared alert lane (`App::events`); the strip shows the
-/// cluster brand + the CRIT / WARN / OK tallies derived from it. Display-only.
-pub fn view<'a, Message: 'a>(events: &[AlertItem]) -> Element<'a, Message> {
+/// cluster brand + the CRIT / WARN / OK tallies derived from it, a live event
+/// ticker (the newest alert), and the clock (`now`). Display-only.
+pub fn view<'a, Message: 'a>(events: &[AlertItem], now: &str) -> Element<'a, Message> {
     let palette = crate::live_theme::palette();
     let sizes = FontSize::defaults();
     let weights = FontWeight::defaults();
@@ -73,7 +74,13 @@ pub fn view<'a, Message: 'a>(events: &[AlertItem]) -> Element<'a, Message> {
     let bar = row![
         cell(brand.into(), &palette),
         cell(tallies.into(), &palette),
-        Space::new().width(Length::Fill),
+        ticker(events, &palette, &sizes, &weights),
+        cell(
+            mono_text(now.to_string(), TypeRole::Caption, &sizes, &weights)
+                .colr(palette.text.into_cosmic_color())
+                .into(),
+            &palette,
+        ),
     ]
     .height(Length::Fixed(STRIP_HEIGHT))
     .align_y(alignment::Vertical::Center);
@@ -112,6 +119,45 @@ fn tally<'a, Message: 'a>(
     ]
     .align_y(alignment::Vertical::Center)
     .into()
+}
+
+/// UNIFY-5 — the live event ticker: the newest alert, severity-tinted (a real,
+/// non-animated condensed feed; the scrolling marquee is a motion follow-up).
+/// Takes the flex-middle of the strip so the clock sits at the right edge.
+fn ticker<'a, Message: 'a>(
+    events: &[AlertItem],
+    palette: &Palette,
+    sizes: &FontSize,
+    weights: &FontWeight,
+) -> Element<'a, Message> {
+    let line: Element<'a, Message> = match events.first() {
+        Some(e) => {
+            let sev = severity_token(e.severity, palette);
+            let host = e.host.clone().unwrap_or_default();
+            let msg = if host.is_empty() {
+                e.body.clone()
+            } else {
+                format!("{host}: {}", e.body)
+            };
+            row![
+                pip(sev),
+                Space::new().width(Length::Fixed(7.0)),
+                mono_text(msg, TypeRole::Caption, sizes, weights)
+                    .colr(palette.text_muted.into_cosmic_color()),
+            ]
+            .align_y(alignment::Vertical::Center)
+            .into()
+        }
+        None => mono_text("—", TypeRole::Caption, sizes, weights)
+            .colr(palette.text_muted.into_cosmic_color())
+            .into(),
+    };
+    container(line)
+        .width(Length::Fill)
+        .height(Length::Fixed(STRIP_HEIGHT))
+        .padding([0u16, 11u16])
+        .align_y(alignment::Vertical::Center)
+        .into()
 }
 
 /// One segment of the strip, padded (design's per-cell `border-right` spacing).
@@ -206,7 +252,7 @@ mod tests {
 
     #[test]
     fn tallies_render_from_real_events_not_constants() {
-        let _empty = view::<()>(&[]);
+        let _empty = view::<()>(&[], "12:00 UTC");
         let items = [
             item(Severity::Critical),
             item(Severity::Warning),
@@ -214,6 +260,6 @@ mod tests {
             item(Severity::Success),
             item(Severity::Info),
         ];
-        let _full = view::<()>(&items);
+        let _full = view::<()>(&items, "12:00 UTC");
     }
 }

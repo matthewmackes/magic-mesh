@@ -102,6 +102,8 @@ pub enum Message {
     EventsTick,
     /// UNIFY-3 — the live alert/event poll resolved (newest-first, bounded).
     EventsUpdated(Vec<mde_notify::AlertItem>),
+    /// UNIFY-5 — refresh the status-strip clock (30 s tick).
+    ClockTick,
     /// Keyboard / chord-bar generated key. Translated by
     /// [`crate::keyboard::interpret_key`] before landing here.
     KeyPressed(KeyAction),
@@ -336,6 +338,8 @@ pub struct App {
     /// (`mde_notify::read_shared_alert_items`), newest-first + bounded. Rendered by
     /// the rail; empty until the first poll (no placeholders, §7).
     events: Vec<mde_notify::AlertItem>,
+    /// UNIFY-5 — the status-strip clock (UTC `HH:MM`), refreshed on a 30 s tick.
+    now: String,
     backend: Arc<dyn Backend>,
     notifications: notifications_panel::NotificationsPanel,
     music: music_panel::MusicPanel,
@@ -474,6 +478,7 @@ impl App {
             mesh_health: None,
             events_rail_open: true,
             events: Vec::new(),
+            now: utc_hhmm(),
             backend,
             notifications: notifications_panel::NotificationsPanel::new(),
             music: music_panel::MusicPanel::new(),
@@ -724,6 +729,8 @@ impl App {
             // showing a stale "mesh service isn't answering" until a
             // manual refresh.
             cosmic::iced::time::every(Duration::from_secs(10)).map(|_| Message::ReconnectTick),
+            // UNIFY-5 — refresh the strip clock (UTC HH:MM) every 30 s.
+            cosmic::iced::time::every(Duration::from_secs(30)).map(|_| Message::ClockTick),
         ];
         // MOTION-TRANS-1 — drive the panel/route crossfade at ~60 fps, but ONLY
         // while a transition is actually in flight. At rest `self.transition` is
@@ -1089,6 +1096,11 @@ impl App {
             Message::EventsTick => Task::perform(fetch_events(), Message::EventsUpdated),
             Message::EventsUpdated(items) => {
                 self.events = items;
+                Task::none()
+            }
+            // UNIFY-5 — refresh the strip clock.
+            Message::ClockTick => {
+                self.now = utc_hhmm();
                 Task::none()
             }
             // GUI-RECONNECT — on a down→up transition, re-load the active
@@ -1490,7 +1502,7 @@ impl App {
         // UNIFY-1/4 — the global status strip: cluster brand + the live CRIT/WARN/OK
         // tallies (from the same alert lane the events rail tails). The breadcrumb /
         // search / up-count / chain / events-toggle now live in the content header.
-        let status_strip = crate::status_strip::view::<Message>(&self.events);
+        let status_strip = crate::status_strip::view::<Message>(&self.events, &self.now);
 
         column![status_strip, window_header, layout]
             .width(Length::Fill)
@@ -2033,6 +2045,17 @@ async fn fetch_events() -> Vec<mde_notify::AlertItem> {
     })
     .await
     .unwrap_or_default()
+}
+
+/// UNIFY-5 — the current time as `HH:MM UTC` for the status-strip clock. No chrono
+/// dep; std doesn't expose the local-tz offset, so the always-on console clock is
+/// unambiguous UTC.
+fn utc_hhmm() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{:02}:{:02} UTC", (secs / 3600) % 24, (secs / 60) % 60)
 }
 
 fn panel_worklist_item(_group: Group, _panel: &str) -> Option<&'static str> {
