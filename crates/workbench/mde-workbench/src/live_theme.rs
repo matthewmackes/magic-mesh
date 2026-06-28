@@ -55,6 +55,25 @@ pub fn reduce_motion() -> bool {
     Preferences::load().a11y.reduce_motion
 }
 
+/// MOTION-A11Y-2 — the live "play decorative motion?" flag every surface reads
+/// before animating a *non-essential* flourish (hover-lift, shimmer breathe,
+/// selection-slide accent, staggered reveal). `false` drops those while essential
+/// state cues (loading/progress/refresh, async transitions, focus, success/error)
+/// keep animating. True (decorative on) unless the `MDE_MOTION_DECORATIVE=0` env
+/// override is set OR the persisted `[motion] decorative = false` /
+/// `[motion] enabled = false` (the kill switch also implies no decorative motion).
+/// Mirrors [`reduce_motion`]; local config is authoritative (Cosmic exposes no
+/// system signal — GUI-9).
+#[must_use]
+pub fn decorative_motion() -> bool {
+    if let Ok(v) = std::env::var("MDE_MOTION_DECORATIVE") {
+        if v.trim() == "0" {
+            return false;
+        }
+    }
+    Preferences::load().motion.shows_decorative()
+}
+
 /// Swap the live theme/density. The next render pass repaints with
 /// the new palette. Persistence is the caller's job
 /// ([`mde_theme::Preferences::save`]) so tests can swap freely.
@@ -93,5 +112,17 @@ mod tests {
         // env=0 → not forced; result is whatever the (test-default) preference is.
         let _ = reduce_motion();
         std::env::remove_var("MDE_REDUCE_MOTION");
+    }
+
+    #[test]
+    fn decorative_motion_honors_the_env_override() {
+        // MOTION-A11Y-2 — MDE_MOTION_DECORATIVE=0 forces decorative motion off
+        // regardless of the persisted preference; clearing it falls back to prefs
+        // (default decorative on).
+        std::env::set_var("MDE_MOTION_DECORATIVE", "0");
+        assert!(!decorative_motion(), "env=0 forces decorative motion off");
+        std::env::remove_var("MDE_MOTION_DECORATIVE");
+        // Default preference keeps decorative motion on.
+        assert!(decorative_motion(), "default prefs keep decorative motion on");
     }
 }

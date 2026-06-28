@@ -27,8 +27,11 @@ use cosmic::iced::widget::scrollable::{
 use cosmic::iced::widget::{button, container, row, text, text_input, Space};
 use cosmic::iced::{alignment, Background, Border, Color, Element, Length, Padding, Shadow};
 
+use std::time::{Duration, Instant};
+
 use crate::cosmic_compat::prelude::*;
 use mde_theme::animation::lerp_f32;
+use mde_theme::feedback::ControlFeedback;
 use mde_theme::{
     FontSize, Palette, Radii, TypeRole, CARD_HOVER_OVERLAY_ALPHA, CARD_SELECTED_OVERLAY_ALPHA,
     CARD_SHADOW_HOVER_ALPHA, CARD_SHADOW_HOVER_BLUR, CARD_SHADOW_HOVER_OFFSET_Y,
@@ -92,15 +95,29 @@ pub fn variant_button<'a, Message: Clone + 'a>(
         .align_y(alignment::Vertical::Center);
 
     let style = move |_theme: &cosmic::Theme, status: ButtonStatus| {
-        // Only the hovered button consults reduce-motion (for the lift-shadow
-        // movement — §Q32), so read the live flag lazily on the Hovered arm
+        // Only the interactive arms consult the live a11y flags — the Hovered arm
+        // for the decorative lift-shadow (§Q32 + MOTION-A11Y-2), the Pressed arm
+        // for the MOTION-FEEDBACK-1 focus ring — so read them lazily on those arms
         // alone. `variant_button` is a shared helper on 100+ call sites and the
-        // accessor loads the prefs file; reading it for every button every
-        // frame would be a per-render disk-I/O storm. At most one button is
-        // hovered per frame, matching the established once-per-view cost.
-        let reduce_motion = matches!(status, ButtonStatus::Hovered)
-            && crate::live_theme::reduce_motion();
-        variant_button_style(variant, accent, palette, reduce_motion, status)
+        // accessor loads the prefs file; reading it for every button every frame
+        // would be a per-render disk-I/O storm. At most one button is in each of
+        // those states per frame, matching the established once-per-view cost.
+        let (reduce_motion, decorative) = match status {
+            ButtonStatus::Hovered | ButtonStatus::Pressed => (
+                crate::live_theme::reduce_motion(),
+                crate::live_theme::decorative_motion(),
+            ),
+            ButtonStatus::Active | ButtonStatus::Disabled => (false, true),
+        };
+        variant_button_style(
+            variant,
+            accent,
+            palette,
+            reduce_motion,
+            decorative,
+            Instant::now(),
+            status,
+        )
     };
 
     let mut btn = button(label_text)
@@ -124,11 +141,21 @@ pub fn variant_button<'a, Message: Clone + 'a>(
 /// Carbon chrome:
 ///
 ///   * **Hovered** — a subtle accent tint ([`hover_tint`], always applied) plus
-///     an upward hover-lift drawn as a drop shadow ([`hover_lift_shadow`],
-///     dropped under `reduce_motion`). Height, padding, and border weight are
-///     untouched — the size lock and the structural border are preserved.
-///   * **Pressed** — a press-down darken ([`press_tint`]), applied on the press
-///     status with no input delay.
+///     an upward hover-lift drawn as a drop shadow ([`hover_lift_shadow`]).
+///     The lift is **decorative** motion: dropped under `reduce_motion` (§Q32)
+///     and when the user disables non-essential motion (`!decorative`,
+///     MOTION-A11Y-2); the always-on accent tint carries the hover *state*
+///     either way. Height, padding, and border weight are untouched — the size
+///     lock and the structural border are preserved.
+///   * **Pressed** — a press-down darken ([`press_tint`]) with no input delay,
+///     plus the MOTION-FEEDBACK-1 animated accent **focus ring** drawn through the
+///     shared [`ControlFeedback::focus_ring`] vocabulary. iced's
+///     [`ButtonStatus`] carries no keyboard-focus signal (it can't be surfaced to
+///     a style closure), so — exactly as the Overview's `feedback_button` does —
+///     the engaged/pressed state is the focus-like cue the ring marks. The ring
+///     grows in under motion and snaps to full width/opacity under reduce-motion
+///     (the helper's a11y contract); it blends the border toward `accent` and
+///     thickens it, never touching height/padding.
 ///   * **Disabled** — fades fg/bg/border by [`DISABLED_OPACITY`] (the const).
 ///
 /// Extracted so the status→style mapping is unit-testable (the closure itself
@@ -138,6 +165,8 @@ fn variant_button_style(
     accent: Color,
     palette: Palette,
     reduce_motion: bool,
+    decorative: bool,
+    now: Instant,
     status: ButtonStatus,
 ) -> button::Style {
     let base_bg = base_bg_for_variant(variant, accent, palette);
@@ -149,10 +178,26 @@ fn variant_button_style(
     match status {
         ButtonStatus::Hovered => {
             bg = hover_tint(base_bg, accent);
-            shadow = hover_lift_shadow(reduce_motion);
+            // The lift is decorative movement — suppressed under reduce-motion OR
+            // when non-essential motion is disabled. The accent tint above is the
+            // reduce-motion-safe, always-on state cue.
+            shadow = hover_lift_shadow(reduce_motion || !decorative);
         }
         ButtonStatus::Pressed => {
             bg = press_tint(base_bg);
+            // MOTION-FEEDBACK-1 — draw the shared animated focus ring on the
+            // engaged control. A settled-in-the-past `since` so a render-time
+            // consumer (no per-button tick) reads the fully-grown ring at `now`;
+            // under reduce-motion the helper snaps it to full immediately.
+            let settled = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
+            let ring = ControlFeedback::new()
+                .focused(true, settled)
+                .focus_ring(now, reduce_motion);
+            if ring.is_visible() {
+                let a = ring.alpha.clamp(0.0, 1.0);
+                border.color = blend(border.color, accent, a);
+                border.width += ring.width;
+            }
         }
         ButtonStatus::Disabled => {
             fg = with_alpha(fg, DISABLED_OPACITY);
@@ -651,9 +696,29 @@ mod tests {
     // MOTION-FEEDBACK-1 — status→style mapping for the shared variant_button.
 
     fn style_for(variant: ButtonVariant, reduce_motion: bool, status: ButtonStatus) -> button::Style {
+        // Default to decorative-on (full polish) so the existing hover/press
+        // assertions read the standard chrome; the decorative-off path has its own
+        // test below.
+        style_for_full(variant, reduce_motion, true, status)
+    }
+
+    fn style_for_full(
+        variant: ButtonVariant,
+        reduce_motion: bool,
+        decorative: bool,
+        status: ButtonStatus,
+    ) -> button::Style {
         let palette = crate::live_theme::palette();
         let accent = palette.accent.into_cosmic_color();
-        variant_button_style(variant, accent, palette, reduce_motion, status)
+        variant_button_style(
+            variant,
+            accent,
+            palette,
+            reduce_motion,
+            decorative,
+            Instant::now(),
+            status,
+        )
     }
 
     fn bg_color(style: &button::Style) -> Color {
@@ -751,6 +816,62 @@ mod tests {
             (secondary.border.color.a - DISABLED_OPACITY).abs() < f32::EPSILON,
             "disabled border alpha == DISABLED_OPACITY"
         );
+    }
+
+    #[test]
+    fn pressed_draws_the_animated_focus_ring_via_the_shared_helper() {
+        // MOTION-FEEDBACK-1 — the engaged (pressed) control gains the accent focus
+        // ring drawn through ControlFeedback::focus_ring: the border blends toward
+        // accent and thickens past its resting weight. Active (resting) has no ring.
+        for variant in [ButtonVariant::Primary, ButtonVariant::Secondary, ButtonVariant::Ghost] {
+            let active = style_for(variant, false, ButtonStatus::Active);
+            let pressed = style_for(variant, false, ButtonStatus::Pressed);
+            assert!(
+                pressed.border.width > active.border.width,
+                "{variant:?}: the focus ring must thicken the border past rest \
+                 ({} !> {})",
+                pressed.border.width,
+                active.border.width
+            );
+            // The ring colour is the accent (engaged control is accent-outlined).
+            let accent = crate::live_theme::palette().accent.into_cosmic_color();
+            assert!(
+                (pressed.border.color.r - accent.r).abs() < 1e-3
+                    && (pressed.border.color.g - accent.g).abs() < 1e-3
+                    && (pressed.border.color.b - accent.b).abs() < 1e-3,
+                "{variant:?}: the focus ring is the accent colour"
+            );
+        }
+    }
+
+    #[test]
+    fn focus_ring_is_present_under_reduce_motion_just_not_animated() {
+        // MOTION-FEEDBACK-1 / a11y: reduce-motion keeps the ring (the focus STATE
+        // is a real cue, never dropped) — it just snaps to full instead of growing
+        // in. So a pressed control is still accent-ringed with reduce-motion on.
+        let pressed_full = style_for(ButtonVariant::Ghost, false, ButtonStatus::Pressed);
+        let pressed_reduced = style_for(ButtonVariant::Ghost, true, ButtonStatus::Pressed);
+        let active = style_for(ButtonVariant::Ghost, false, ButtonStatus::Active);
+        assert!(pressed_reduced.border.width > active.border.width, "ring kept under reduce-motion");
+        // At the settled render frame both reach the full ring width.
+        assert!((pressed_reduced.border.width - pressed_full.border.width).abs() < 1e-3);
+    }
+
+    #[test]
+    fn decorative_off_drops_the_hover_lift_but_keeps_the_tint() {
+        // MOTION-A11Y-2 — disabling non-essential motion removes the hover-lift
+        // shadow (decorative movement) while the accent hover tint (the state cue)
+        // stays. Motion is globally ON (reduce_motion=false), only decorative off.
+        let deco_on = style_for_full(ButtonVariant::Primary, false, true, ButtonStatus::Hovered);
+        let deco_off = style_for_full(ButtonVariant::Primary, false, false, ButtonStatus::Hovered);
+        // Lift dropped: no shadow under decorative-off.
+        assert!(deco_on.shadow.offset.y.abs() > f32::EPSILON, "lift present with decorative on");
+        assert!(
+            deco_off.shadow.offset.y.abs() < f32::EPSILON && deco_off.shadow.color.a < f32::EPSILON,
+            "no lift shadow when non-essential motion is disabled"
+        );
+        // Tint kept: the hovered background is identical either way.
+        assert_eq!(bg_color(&deco_on), bg_color(&deco_off), "the hover tint stays");
     }
 
     #[test]
