@@ -436,6 +436,45 @@ pub fn parse_xe_srs(output: &str) -> Vec<(String, String, String, String)> {
         .collect()
 }
 
+/// Parse `uuid|name|virtual-size|sr-uuid` lines into VDI tuples. Pure. Skips
+/// empty-uuid lines (mirrors [`parse_xe_srs`]). DC-12: gather VDIs alongside SRs.
+#[must_use]
+pub fn parse_xe_vdis(output: &str) -> Vec<(String, String, String, String)> {
+    output
+        .lines()
+        .filter_map(|l| {
+            let mut p = l.splitn(4, '|');
+            let u = p.next()?.trim();
+            if u.is_empty() {
+                return None;
+            }
+            let n = p.next().unwrap_or("").trim();
+            let sz = p.next().unwrap_or("").trim();
+            let sr = p.next().unwrap_or("").trim();
+            Some((u.to_string(), n.to_string(), sz.to_string(), sr.to_string()))
+        })
+        .collect()
+}
+
+/// DC-12 — an SR's capacity health from its physical size/used (bytes). PURE.
+/// `fail` at ≥95% used, `warn` at ≥85%, else `ok`. A zero/unknown size yields
+/// `ok` (nothing to alert on). Drives the `event/dc/health/sr-capacity:<id>`
+/// capacity-threshold alert.
+#[must_use]
+pub fn sr_capacity_status(size_bytes: u64, used_bytes: u64) -> &'static str {
+    if size_bytes == 0 {
+        return "ok";
+    }
+    let pct = used_bytes.saturating_mul(100) / size_bytes;
+    if pct >= 95 {
+        "fail"
+    } else if pct >= 85 {
+        "warn"
+    } else {
+        "ok"
+    }
+}
+
 /// Parse the remote `xe` network helper's pipe-delimited `uuid|name|bridge`
 /// lines into `(uuid, name, bridge)` triples. Pure — fed the raw stdout. Skips
 /// lines with an empty uuid (mirrors [`parse_xe_srs`]).
@@ -614,7 +653,42 @@ fn gather_xen() -> Vec<DcResource> {
                     "kind": "sr", "id": u, "name": n, "size": size, "used": used, "host": dom0, "zone": "dev"
                 })
                 .to_string();
-                out.push(DcResource::new("sr", u, sig));
+                out.push(DcResource::new("sr", u.clone(), sig));
+                // DC-12 — SR capacity-threshold alert to the Hub. Routed through
+                // the SAME reconcile/dedup as a `health` resource so the alert is
+                // published once on a threshold transition (and cleared via a
+                // `gone` event when the SR returns to ok / disappears). The body
+                // matches the `event/dc/health/*` shape the panel + Hub read.
+                let sz = size.parse::<u64>().unwrap_or(0);
+                let usd = used.parse::<u64>().unwrap_or(0);
+                let status = sr_capacity_status(sz, usd);
+                if status != "ok" {
+                    let pct = if sz > 0 {
+                        usd.saturating_mul(100) / sz
+                    } else {
+                        0
+                    };
+                    let check = format!("sr-capacity:{u}");
+                    let hsig = serde_json::json!({
+                        "check": check, "status": status,
+                        "detail": format!("SR {n} at {pct}% ({used}/{size} bytes) on {dom0}")
+                    })
+                    .to_string();
+                    out.push(DcResource::new("health", check, hsig));
+                }
+            }
+        }
+        // VDIs (virtual disks) → storage visibility (DC-12: gather SR/VDI). Only
+        // managed disks; the body's `kind:"vdi"` is what the panel grid groups on.
+        let vdi_script = "for u in $(xe vdi-list managed=true params=uuid --minimal | tr , ' '); \
+             do echo \"$u|$(xe vdi-param-get uuid=$u param-name=name-label)|$(xe vdi-param-get uuid=$u param-name=virtual-size)|$(xe vdi-param-get uuid=$u param-name=sr-uuid)\"; done";
+        if let Some(vdiout) = route.run(&key, vdi_script) {
+            for (u, n, size, sr) in parse_xe_vdis(&vdiout) {
+                let sig = serde_json::json!({
+                    "kind": "vdi", "id": u, "name": n, "size": size, "sr": sr, "host": dom0, "zone": "dev"
+                })
+                .to_string();
+                out.push(DcResource::new("vdi", u, sig));
             }
         }
         // Networks (bridges) → network visibility (DC-13).
@@ -998,6 +1072,35 @@ mod tests {
         assert_eq!(srs[0].1, "Local storage");
         assert_eq!(srs[0].2, "207296921600");
         assert_eq!(srs[0].3, "42949672960");
+    }
+
+    #[test]
+    fn parse_xe_vdis_reads_four_fields() {
+        let out = "v1|MDE-VM-web1 root|53687091200|s1\n|skip|||\n";
+        let vdis = parse_xe_vdis(out);
+        assert_eq!(vdis.len(), 1); // empty-uuid line skipped
+        assert_eq!(
+            vdis[0],
+            (
+                "v1".to_string(),
+                "MDE-VM-web1 root".to_string(),
+                "53687091200".to_string(),
+                "s1".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn sr_capacity_status_thresholds() {
+        // ok below 85%, warn at 85..95, fail at >=95.
+        assert_eq!(sr_capacity_status(100, 10), "ok");
+        assert_eq!(sr_capacity_status(100, 84), "ok");
+        assert_eq!(sr_capacity_status(100, 85), "warn");
+        assert_eq!(sr_capacity_status(100, 94), "warn");
+        assert_eq!(sr_capacity_status(100, 95), "fail");
+        assert_eq!(sr_capacity_status(100, 100), "fail");
+        // zero/unknown size → ok (nothing to alert on).
+        assert_eq!(sr_capacity_status(0, 50), "ok");
     }
 
     // ---- DATACENTER-4: XAPI-over-overlay route selection -----------------------

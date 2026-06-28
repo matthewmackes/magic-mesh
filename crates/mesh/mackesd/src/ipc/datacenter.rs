@@ -78,10 +78,10 @@ use serde_json::json;
 /// in-flight requests — even across `Clone`d handles — see one set.
 #[derive(Debug, Clone)]
 pub struct DatacenterService {
-    // Carried for parity with the other action services and the
-    // `new(workgroup_root)` spawn contract; the allowed-dom0 set + ssh key are
-    // read from the orchestrator's env config, so this isn't read here yet.
-    #[allow(dead_code)]
+    // The shared workgroup root, used by `vm-create` as the repo root the relative
+    // `infra/tofu/xen-xapi` dir is resolved against (DATACENTER-11, Tofu-backed
+    // create — same convention as the tofu responder). The allowed-dom0 set + ssh
+    // key still come from the orchestrator's env config.
     workgroup_root: PathBuf,
     /// In-flight resource keys currently being mutated. `Arc<Mutex<…>>` so a
     /// `Clone` of the service (the responder-thread handle) shares ONE set, and
@@ -142,14 +142,79 @@ impl Drop for OpLockGuard<'_> {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 6] = [
+pub const ACTION_VERBS: [&str; 11] = [
     "vm-power",
     "vm-snapshot",
     "vm-clone",
     "vm-delete",
     "vm-console",
     "do-regions",
+    // DATACENTER-11 — full VM lifecycle: suspend/resume + live-migrate + bulk +
+    // golden-template create (Tofu-backed).
+    "vm-suspend",
+    "vm-resume",
+    "vm-migrate",
+    "vm-create",
+    "vm-bulk",
 ];
+
+/// Whether `verb` MUTATES infrastructure (so it is RBAC-gated to `operator` and
+/// op-lock-eligible). The read-only verbs (`vm-console`, `do-regions`) return
+/// `false`; everything else — including an unknown verb, which is rejected later
+/// — is treated as mutating. PURE.
+#[must_use]
+pub fn is_mutating(verb: &str) -> bool {
+    !matches!(verb, "vm-console" | "do-regions")
+}
+
+/// True iff `dom0` is in the configured allowed set
+/// ([`crate::workers::datacenter_orchestrator::xen_dom0s`]). The SECURITY guard
+/// every responder applies before SSHing a host.
+#[must_use]
+fn dom0_allowed(dom0: &str) -> bool {
+    crate::workers::datacenter_orchestrator::xen_dom0s()
+        .iter()
+        .any(|d| d == dom0)
+}
+
+/// Validate a VM `uuid` is non-empty and hex+`-` only — the command-injection
+/// guard shared by the new lifecycle command builders (same rule as
+/// [`vm_power_command`]). PURE.
+///
+/// # Errors
+/// Returns `Err` for an empty `uuid` or any character that is not an ASCII hex
+/// digit or `-`.
+fn validate_vm_uuid(uuid: &str) -> Result<(), String> {
+    if uuid.is_empty() {
+        return Err("empty uuid".into());
+    }
+    if !uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err("uuid contains invalid characters".into());
+    }
+    Ok(())
+}
+
+/// Run `xe <cmd>` on an already-allow-listed `dom0` and map the result to the
+/// standard `{"ok":true}` / `{"error":...}` reply. Shared by the simple mutating
+/// VM verbs (suspend/resume/migrate) so their exec + error mapping can't drift.
+fn run_xe_ok(dom0: &str, cmd: &str) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let key = crate::workers::datacenter_orchestrator::xen_ssh_key();
+    let remote = format!("xe {cmd}");
+    match ssh_xe_status(&key, dom0, &remote) {
+        Ok(o) if o.status.success() => json!({ "ok": true }).to_string(),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let msg = stderr.trim();
+            if msg.is_empty() {
+                err("xe failed".into())
+            } else {
+                err(msg.to_string())
+            }
+        }
+        Err(e) => err(format!("ssh failed: {e}")),
+    }
+}
 
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -296,9 +361,12 @@ fn ssh_xe_status(key: &str, dom0: &str, remote: &str) -> std::io::Result<std::pr
 /// member, never interpolated into a shell command.
 #[must_use]
 pub fn lock_key(verb: &str, req_body: Option<&str>) -> Option<String> {
-    // Only the mutating vm-* verbs lock; read-only verbs hold no lock.
+    // Only the single-VM mutating verbs lock on their `uuid`; read-only verbs and
+    // the multi-target verbs (vm-bulk has many uuids, vm-create has none yet) hold
+    // no per-uuid lock here.
     match verb {
-        "vm-power" | "vm-snapshot" | "vm-clone" | "vm-delete" => {}
+        "vm-power" | "vm-snapshot" | "vm-clone" | "vm-delete" | "vm-suspend" | "vm-resume"
+        | "vm-migrate" => {}
         _ => return None,
     }
     let uuid = serde_json::from_str::<serde_json::Value>(req_body?)
@@ -323,6 +391,13 @@ pub fn lock_key(verb: &str, req_body: Option<&str>) -> Option<String> {
 #[must_use]
 pub fn build_reply(svc: &DatacenterService, verb: &str, req_body: Option<&str>) -> String {
     let err = |m: String| json!({ "error": m }).to_string();
+    // RBAC (design §9): a mutating verb requires the caller's mesh principal to map
+    // to `operator`; a `viewer` is rejected BEFORE the op-lock / dom0 allow-list /
+    // any SSH. Read-only verbs are always allowed. Checked first so a viewer's
+    // write never touches the substrate.
+    if let Err(m) = crate::ipc::dc_rbac::authorize(req_body, is_mutating(verb)) {
+        return err(m);
+    }
     // Op-lock: claim the resource for the duration of a mutating dispatch. The
     // guard is dropped at the end of this function (after the reply is built),
     // releasing the key. Read-only verbs (lock_key → None) are unguarded.
@@ -344,6 +419,11 @@ pub fn build_reply(svc: &DatacenterService, verb: &str, req_body: Option<&str>) 
         "vm-delete" => vm_delete_reply(req_body),
         "vm-console" => vm_console_reply(req_body),
         "do-regions" => do_regions_reply(),
+        "vm-suspend" => vm_suspend_reply(req_body),
+        "vm-resume" => vm_resume_reply(req_body),
+        "vm-migrate" => vm_migrate_reply(req_body),
+        "vm-create" => vm_create_reply(svc, req_body),
+        "vm-bulk" => vm_bulk_reply(req_body),
         _ => err("unknown dc verb".into()),
     }
 }
@@ -742,6 +822,418 @@ fn do_regions_reply() -> String {
         )
         .collect();
     json!({ "ok": true, "regions": regions }).to_string()
+}
+
+// ───────────────────── DATACENTER-11 — full VM lifecycle ─────────────────────
+
+/// Build the remote `xe` argument string for a VM suspend. PURE.
+///
+/// Validates `uuid` ([`validate_vm_uuid`]) then reuses the canonical argv builder
+/// [`mackes_xcp::argv_suspend`] (joined to the `xe`-remote string shape this
+/// responder runs). Returns `"vm-suspend uuid=<uuid>"`.
+///
+/// # Errors
+/// Returns `Err` for an empty `uuid` or a `uuid` with non-`[0-9a-fA-F-]` chars.
+pub fn vm_suspend_command(uuid: &str) -> Result<String, String> {
+    validate_vm_uuid(uuid)?;
+    Ok(mackes_xcp::argv_suspend(uuid).join(" "))
+}
+
+/// Build the remote `xe` argument string for a VM resume. PURE.
+/// Reuses [`mackes_xcp::argv_resume`]; same `uuid` guard as [`vm_suspend_command`].
+///
+/// # Errors
+/// Returns `Err` for an empty / non-hex `uuid`.
+pub fn vm_resume_command(uuid: &str) -> Result<String, String> {
+    validate_vm_uuid(uuid)?;
+    Ok(mackes_xcp::argv_resume(uuid).join(" "))
+}
+
+/// Build the remote `xe` argument string for a VM live-migrate. PURE.
+///
+/// Validates `uuid` ([`validate_vm_uuid`]) and `target_host` (non-empty,
+/// `[A-Za-z0-9._-]` only — a host name-label or uuid, never a shell metachar),
+/// then reuses [`mackes_xcp::argv_migrate`]. Returns
+/// `"vm-migrate uuid=<uuid> host=<target_host> live=true"`.
+///
+/// # Errors
+/// Returns `Err` for an empty / non-hex `uuid`, or a `target_host` that is empty
+/// or carries a character outside `[A-Za-z0-9._-]`.
+pub fn vm_migrate_command(uuid: &str, target_host: &str) -> Result<String, String> {
+    validate_vm_uuid(uuid)?;
+    if target_host.is_empty() {
+        return Err("empty target_host".into());
+    }
+    if !target_host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err("target_host contains invalid characters".into());
+    }
+    Ok(mackes_xcp::argv_migrate(uuid, target_host).join(" "))
+}
+
+/// Parse `{uuid, dom0}`, allow-list the dom0, build `cmd`, and run it. Shared body
+/// of the suspend/resume replies (identical but for the command builder).
+fn vm_simple_reply(
+    verb: &str,
+    req_body: Option<&str>,
+    build: impl Fn(&str) -> Result<String, String>,
+) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err(format!("{verb}: missing request body"));
+    };
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return err(format!("{verb}: bad json: {e}")),
+    };
+    let uuid = req
+        .get("uuid")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let dom0 = req
+        .get("dom0")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !dom0_allowed(dom0) {
+        return err("dom0 not in allowed set".into());
+    }
+    let cmd = match build(uuid) {
+        Ok(c) => c,
+        Err(e) => return err(e),
+    };
+    run_xe_ok(dom0, &cmd)
+}
+
+/// Handle a `vm-suspend` request: parse, allow-list the dom0, `xe vm-suspend`.
+fn vm_suspend_reply(req_body: Option<&str>) -> String {
+    vm_simple_reply("vm-suspend", req_body, vm_suspend_command)
+}
+
+/// Handle a `vm-resume` request: parse, allow-list the dom0, `xe vm-resume`.
+fn vm_resume_reply(req_body: Option<&str>) -> String {
+    vm_simple_reply("vm-resume", req_body, vm_resume_command)
+}
+
+/// Handle a `vm-migrate` request `{ uuid, dom0, target_host }`: parse, allow-list
+/// the dom0, then `xe vm-migrate uuid=<uuid> host=<target_host> live=true`.
+fn vm_migrate_reply(req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("vm-migrate: missing request body".into());
+    };
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return err(format!("vm-migrate: bad json: {e}")),
+    };
+    let uuid = req
+        .get("uuid")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let dom0 = req
+        .get("dom0")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let target_host = req
+        .get("target_host")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !dom0_allowed(dom0) {
+        return err("dom0 not in allowed set".into());
+    }
+    let cmd = match vm_migrate_command(uuid, target_host) {
+        Ok(c) => c,
+        Err(e) => return err(e),
+    };
+    run_xe_ok(dom0, &cmd)
+}
+
+/// Map a `vm-bulk` `op` to the `xe` verb run per uuid. PURE.
+///
+/// # Errors
+/// Returns `Err` for an `op` outside the supported lifecycle set.
+pub fn vm_bulk_op_verb(op: &str) -> Result<&'static str, String> {
+    match op {
+        "start" => Ok("vm-start"),
+        "shutdown" => Ok("vm-shutdown"),
+        "reboot" => Ok("vm-reboot"),
+        "suspend" => Ok("vm-suspend"),
+        "resume" => Ok("vm-resume"),
+        other => Err(format!("unknown bulk op: {other}")),
+    }
+}
+
+/// Handle a `vm-bulk` request `{ uuids:[…], op, dom0 }`: run the mapped `xe` verb
+/// against each uuid on the allow-listed dom0, collecting a per-uuid result so one
+/// bad VM doesn't sink the batch. Reply
+/// `{"ok":true,"results":[{"uuid","ok":true}|{"uuid","error":"…"}]}`.
+fn vm_bulk_reply(req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("vm-bulk: missing request body".into());
+    };
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return err(format!("vm-bulk: bad json: {e}")),
+    };
+    let op = req
+        .get("op")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let dom0 = req
+        .get("dom0")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let uuids: Vec<String> = req
+        .get("uuids")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !dom0_allowed(dom0) {
+        return err("dom0 not in allowed set".into());
+    }
+    let verb = match vm_bulk_op_verb(op) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    if uuids.is_empty() {
+        return err("vm-bulk: empty uuids".into());
+    }
+
+    let key = crate::workers::datacenter_orchestrator::xen_ssh_key();
+    let mut results: Vec<serde_json::Value> = Vec::with_capacity(uuids.len());
+    for uuid in &uuids {
+        if let Err(e) = validate_vm_uuid(uuid) {
+            results.push(json!({ "uuid": uuid, "error": e }));
+            continue;
+        }
+        let remote = format!("xe {verb} uuid={uuid}");
+        match ssh_xe_status(&key, dom0, &remote) {
+            Ok(o) if o.status.success() => results.push(json!({ "uuid": uuid, "ok": true })),
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let msg = stderr.trim();
+                let msg = if msg.is_empty() { "xe failed" } else { msg };
+                results.push(json!({ "uuid": uuid, "error": msg }));
+            }
+            Err(e) => results.push(json!({ "uuid": uuid, "error": format!("ssh failed: {e}") })),
+        }
+    }
+    json!({ "ok": true, "results": results }).to_string()
+}
+
+/// Map a `vm-create` `zone` to the `xen-xapi` Tofu provider alias for the target
+/// pool. PURE. The three standalone XCP-ng pools each have an aliased provider
+/// (`xhs`/`kvm`/`big`, see `infra/tofu/xen-xapi/providers.tf`); `dev` defaults to
+/// `xhs` (the founding pool).
+///
+/// # Errors
+/// Returns `Err` for any `zone` outside the known pool aliases.
+pub fn vm_create_provider_alias(zone: &str) -> Result<&'static str, String> {
+    match zone {
+        "dev" | "xhs" => Ok("xhs"),
+        "kvm" => Ok("kvm"),
+        "big" => Ok("big"),
+        other => Err(format!("unknown zone/pool: {other}")),
+    }
+}
+
+/// Derive a Tofu resource label from a VM `name`: lower-cased, every char outside
+/// `[a-z0-9_]` collapsed to `_`, prefixed `dc_` so it is always a valid HCL
+/// identifier (which may not start with a digit) and namespaced away from the
+/// hand-written `build_*` resources. PURE.
+///
+/// # Errors
+/// Returns `Err` for an empty `name` or one with no alphanumeric character (the
+/// label would be all separators).
+pub fn tofu_resource_label(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("empty name".into());
+    }
+    if !trimmed.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return Err("name has no alphanumeric character".into());
+    }
+    let sanitized: String = trimmed
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Ok(format!("dc_{sanitized}"))
+}
+
+/// Render the `xenserver_vm` HCL resource block a `vm-create` writes into the
+/// `xen-xapi` workspace (DATACENTER-11 — structural change via Tofu, no drift).
+/// PURE so the rendered HCL is testable without writing a file or running tofu.
+///
+/// Mirrors the hand-written `build_*` resources (`infra/tofu/xen-xapi/build-vms.tf`)
+/// exactly — the same `lifecycle.ignore_changes` set that lets an adopted/golden
+/// clone plan clean against the early-stage 0.2.x provider — so a created VM does
+/// not churn drift on the next plan. All interpolated values are pre-validated by
+/// the caller ([`vm_create_reply`]).
+#[must_use]
+pub fn render_xenserver_vm_hcl(
+    label: &str,
+    name: &str,
+    alias: &str,
+    template: &str,
+    network_uuid: &str,
+    vcpus: u32,
+    mem_bytes: u64,
+) -> String {
+    format!(
+        "# DATACENTER-11 — created from the Workbench golden-template wizard.\n\
+         resource \"xenserver_vm\" \"{label}\" {{\n\
+         \x20\x20provider          = xenserver.{alias}\n\
+         \x20\x20name_label        = \"{name}\"\n\
+         \x20\x20template_name     = \"{template}\"\n\
+         \x20\x20static_mem_max    = {mem_bytes}\n\
+         \x20\x20vcpus             = {vcpus}\n\
+         \x20\x20check_ip_timeout  = 0\n\
+         \x20\x20network_interface = [{{ device = \"0\", network_uuid = \"{network_uuid}\" }}]\n\
+         \x20\x20lifecycle {{\n\
+         \x20\x20\x20\x20ignore_changes = [hard_drive, template_name, boot_mode, boot_order, cores_per_socket, dynamic_mem_max, dynamic_mem_min, static_mem_min, name_description, cdrom]\n\
+         \x20\x20}}\n\
+         }}\n"
+    )
+}
+
+/// Handle a `vm-create` request
+/// `{ template, name, zone, network_uuid, vcpus?, mem_mb? }`: render a
+/// `xenserver_vm` resource, write it into the `xen-xapi` Tofu workspace, then
+/// `tofu apply` so the structural change goes through IaC (no drift). Reply
+/// `{"ok":true,"file":"<path>","summary":"<tofu output>"}` on success.
+///
+/// `vcpus` defaults to 2 and `mem_mb` to 4096 when absent; both are bounded. The
+/// repo root is the service's `workgroup_root` (same convention as the tofu
+/// responder).
+fn vm_create_reply(svc: &DatacenterService, req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("vm-create: missing request body".into());
+    };
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return err(format!("vm-create: bad json: {e}")),
+    };
+    let name = req
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let template = req
+        .get("template")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("MDE-VM-golden");
+    let zone = req
+        .get("zone")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("dev");
+    let network_uuid = req
+        .get("network_uuid")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let vcpus = req
+        .get("vcpus")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(2);
+    let mem_mb = req
+        .get("mem_mb")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(4096);
+
+    // Validate every interpolated value BEFORE rendering/writing/applying.
+    // name/template are name-labels → `[A-Za-z0-9._-]`; network_uuid is hex+dash;
+    // the label is derived + sanitized; the pool alias is allow-listed.
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        || name.is_empty()
+    {
+        return err("name must be non-empty [A-Za-z0-9._-]".into());
+    }
+    if !template
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        || template.is_empty()
+    {
+        return err("template must be non-empty [A-Za-z0-9._-]".into());
+    }
+    if network_uuid.is_empty()
+        || !network_uuid
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == '-')
+    {
+        return err("network_uuid must be a non-empty hex+dash uuid".into());
+    }
+    if !(1..=64).contains(&vcpus) {
+        return err("vcpus must be 1..=64".into());
+    }
+    if !(512..=1_048_576).contains(&mem_mb) {
+        return err("mem_mb must be 512..=1048576".into());
+    }
+    let alias = match vm_create_provider_alias(zone) {
+        Ok(a) => a,
+        Err(e) => return err(e),
+    };
+    let label = match tofu_resource_label(name) {
+        Ok(l) => l,
+        Err(e) => return err(e),
+    };
+
+    let hcl = render_xenserver_vm_hcl(
+        &label,
+        name,
+        alias,
+        template,
+        network_uuid,
+        u32::try_from(vcpus).unwrap_or(2),
+        mem_mb * 1024 * 1024,
+    );
+
+    let dir = svc.workgroup_root.join("infra/tofu/xen-xapi");
+    let file = dir.join(format!("{label}.tf"));
+    if let Err(e) = std::fs::write(&file, &hcl) {
+        return err(format!("vm-create: writing {}: {e}", file.display()));
+    }
+
+    // Apply through IaC against the mesh-replicated state (same lane as the tofu
+    // responder). `dir` is process-owned, so this is not an injection surface.
+    let script = format!(
+        "cd {} && source ./env.sh 2>/dev/null && tofu apply -auto-approve -no-color 2>&1 | tail -30",
+        dir.display()
+    );
+    match std::process::Command::new("bash")
+        .args(["-lc", &script])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            let summary = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            json!({ "ok": true, "file": file.display().to_string(), "summary": summary })
+                .to_string()
+        }
+        Ok(o) => {
+            let mut out = String::from_utf8_lossy(&o.stdout).into_owned();
+            out.push_str(&String::from_utf8_lossy(&o.stderr));
+            let msg = out.trim();
+            if msg.is_empty() {
+                err("vm-create: tofu apply failed".into())
+            } else {
+                err(msg.to_string())
+            }
+        }
+        Err(e) => err(format!("vm-create: tofu exec failed: {e}")),
+    }
 }
 
 /// Run the datacenter Bus responder loop on the current thread until `should_stop`.
@@ -1258,5 +1750,221 @@ mod tests {
             "read-only verb must not be locked: {r}"
         );
         assert!(r.contains("dom0 not in allowed set"), "{r}");
+    }
+
+    // ---- DATACENTER-11: full VM lifecycle ----
+
+    #[test]
+    fn lifecycle_verbs_in_action_set() {
+        for v in [
+            "vm-suspend",
+            "vm-resume",
+            "vm-migrate",
+            "vm-create",
+            "vm-bulk",
+        ] {
+            assert!(ACTION_VERBS.contains(&v), "missing verb {v}");
+            assert_eq!(action_topic(v), format!("action/dc/{v}"));
+        }
+    }
+
+    #[test]
+    fn is_mutating_marks_only_reads_readonly() {
+        assert!(!is_mutating("vm-console"));
+        assert!(!is_mutating("do-regions"));
+        for v in [
+            "vm-power",
+            "vm-suspend",
+            "vm-resume",
+            "vm-migrate",
+            "vm-create",
+            "vm-bulk",
+            "vm-delete",
+        ] {
+            assert!(is_mutating(v), "{v} should be mutating");
+        }
+    }
+
+    #[test]
+    fn suspend_resume_commands_reuse_argv_builders() {
+        let uuid = "abcd1234-5678-90ab-cdef-1234567890ab";
+        assert_eq!(
+            vm_suspend_command(uuid).unwrap(),
+            format!("vm-suspend uuid={uuid}")
+        );
+        assert_eq!(
+            vm_resume_command(uuid).unwrap(),
+            format!("vm-resume uuid={uuid}")
+        );
+        // injection guards (empty / non-hex / metachars) reject.
+        assert!(vm_suspend_command("").is_err());
+        assert!(vm_resume_command("abcd;rm -rf /").is_err());
+        assert!(vm_suspend_command("ghij").is_err());
+    }
+
+    #[test]
+    fn migrate_command_validates_uuid_and_target() {
+        let uuid = "abcd1234-5678-90ab-cdef-1234567890ab";
+        assert_eq!(
+            vm_migrate_command(uuid, "MDE-host-b").unwrap(),
+            format!("vm-migrate uuid={uuid} host=MDE-host-b live=true")
+        );
+        // a destination uuid is fine too.
+        assert!(vm_migrate_command(uuid, "1111-2222").is_ok());
+        // bad uuid / empty or unsafe target rejected (no shell metachars).
+        assert!(vm_migrate_command("nope!", "host").is_err());
+        assert!(vm_migrate_command(uuid, "").is_err());
+        assert!(vm_migrate_command(uuid, "a;reboot").is_err());
+        assert!(vm_migrate_command(uuid, "a b").is_err());
+    }
+
+    #[test]
+    fn bulk_op_verb_maps_and_rejects() {
+        assert_eq!(vm_bulk_op_verb("start").unwrap(), "vm-start");
+        assert_eq!(vm_bulk_op_verb("shutdown").unwrap(), "vm-shutdown");
+        assert_eq!(vm_bulk_op_verb("reboot").unwrap(), "vm-reboot");
+        assert_eq!(vm_bulk_op_verb("suspend").unwrap(), "vm-suspend");
+        assert_eq!(vm_bulk_op_verb("resume").unwrap(), "vm-resume");
+        assert!(vm_bulk_op_verb("destroy").is_err());
+        assert!(vm_bulk_op_verb("").is_err());
+    }
+
+    #[test]
+    fn lifecycle_verbs_reject_unlisted_dom0_before_ssh() {
+        // With MCNF_XEN_DOM0S unset the allowed set is empty.
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        let uuid = "abcd1234-5678-90ab-cdef-1234567890ab";
+        for (verb, body) in [
+            ("vm-suspend", json!({ "uuid": uuid, "dom0": "10.0.0.1" })),
+            ("vm-resume", json!({ "uuid": uuid, "dom0": "10.0.0.1" })),
+            (
+                "vm-migrate",
+                json!({ "uuid": uuid, "dom0": "10.0.0.1", "target_host": "h" }),
+            ),
+            (
+                "vm-bulk",
+                json!({ "uuids": [uuid], "op": "start", "dom0": "10.0.0.1" }),
+            ),
+        ] {
+            let r = build_reply(&s, verb, Some(&body.to_string()));
+            assert!(r.contains("dom0 not in allowed set"), "{verb}: {r}");
+        }
+    }
+
+    #[test]
+    fn rbac_viewer_is_rejected_on_a_mutating_verb() {
+        // A configured viewer principal is rejected BEFORE the dom0 allow-list.
+        let _g = crate::ipc::dc_rbac::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        // Set + clear the role map around the call (serialized by the lock above).
+        std::env::set_var(crate::ipc::dc_rbac::ROLE_MAP_ENV, "bob=viewer");
+        let body = json!({
+            "principal": "bob", "uuid": "abcd-1234", "op": "start", "dom0": "10.0.0.1"
+        })
+        .to_string();
+        let r = build_reply(&s, "vm-power", Some(&body));
+        std::env::remove_var(crate::ipc::dc_rbac::ROLE_MAP_ENV);
+        assert!(r.contains("rbac"), "{r}");
+        assert!(r.contains("viewer"), "{r}");
+        assert!(
+            !r.contains("dom0 not in allowed set"),
+            "rbac gates first: {r}"
+        );
+    }
+
+    #[test]
+    fn rbac_read_only_verb_allowed_for_viewer() {
+        // vm-console is read-only → a viewer may call it (falls to the dom0 check).
+        let _g = crate::ipc::dc_rbac::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        std::env::set_var(crate::ipc::dc_rbac::ROLE_MAP_ENV, "bob=viewer");
+        let body =
+            json!({ "principal": "bob", "uuid": "abcd-1234", "dom0": "10.0.0.1" }).to_string();
+        let r = build_reply(&s, "vm-console", Some(&body));
+        std::env::remove_var(crate::ipc::dc_rbac::ROLE_MAP_ENV);
+        assert!(!r.contains("rbac"), "{r}");
+        assert!(r.contains("dom0 not in allowed set"), "{r}");
+    }
+
+    #[test]
+    fn tofu_resource_label_sanitizes() {
+        assert_eq!(tofu_resource_label("web1").unwrap(), "dc_web1");
+        assert_eq!(tofu_resource_label("My VM.01").unwrap(), "dc_my_vm_01");
+        assert_eq!(tofu_resource_label("MDE-VM-x").unwrap(), "dc_mde_vm_x");
+        assert!(tofu_resource_label("").is_err());
+        assert!(tofu_resource_label("___").is_err());
+    }
+
+    #[test]
+    fn provider_alias_maps_zones() {
+        assert_eq!(vm_create_provider_alias("dev").unwrap(), "xhs");
+        assert_eq!(vm_create_provider_alias("xhs").unwrap(), "xhs");
+        assert_eq!(vm_create_provider_alias("kvm").unwrap(), "kvm");
+        assert_eq!(vm_create_provider_alias("big").unwrap(), "big");
+        assert!(vm_create_provider_alias("prod").is_err());
+    }
+
+    #[test]
+    fn render_hcl_matches_the_build_vm_shape() {
+        let hcl = render_xenserver_vm_hcl(
+            "dc_web1",
+            "web1",
+            "xhs",
+            "MDE-VM-golden",
+            "420c5872-dd49-af7f-fe4f-d5e2502429f8",
+            4,
+            17_179_869_184,
+        );
+        assert!(hcl.contains("resource \"xenserver_vm\" \"dc_web1\" {"));
+        assert!(hcl.contains("provider          = xenserver.xhs"));
+        assert!(hcl.contains("name_label        = \"web1\""));
+        assert!(hcl.contains("template_name     = \"MDE-VM-golden\""));
+        assert!(hcl.contains("static_mem_max    = 17179869184"));
+        assert!(hcl.contains("vcpus             = 4"));
+        assert!(hcl.contains("network_uuid = \"420c5872-dd49-af7f-fe4f-d5e2502429f8\""));
+        assert!(hcl.contains("ignore_changes = [hard_drive, template_name"));
+    }
+
+    #[test]
+    fn vm_create_validates_before_touching_tofu() {
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        // bad name.
+        let body =
+            json!({ "name": "bad name!", "network_uuid": "1111", "zone": "dev" }).to_string();
+        assert!(build_reply(&s, "vm-create", Some(&body)).contains("name must be"));
+        // missing/empty network_uuid.
+        let body = json!({ "name": "web1", "zone": "dev" }).to_string();
+        assert!(build_reply(&s, "vm-create", Some(&body)).contains("network_uuid"));
+        // bad zone.
+        let body =
+            json!({ "name": "web1", "network_uuid": "1111-2222", "zone": "prod" }).to_string();
+        assert!(build_reply(&s, "vm-create", Some(&body)).contains("unknown zone/pool"));
+        // out-of-range vcpus.
+        let body = json!({
+            "name": "web1", "network_uuid": "1111-2222", "zone": "dev", "vcpus": 999
+        })
+        .to_string();
+        assert!(build_reply(&s, "vm-create", Some(&body)).contains("vcpus must be"));
+    }
+
+    #[test]
+    fn missing_body_errors_for_new_verbs() {
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        for v in [
+            "vm-suspend",
+            "vm-resume",
+            "vm-migrate",
+            "vm-create",
+            "vm-bulk",
+        ] {
+            assert!(
+                build_reply(&s, v, None).contains("missing request body"),
+                "{v}"
+            );
+        }
     }
 }

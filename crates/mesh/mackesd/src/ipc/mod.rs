@@ -38,6 +38,15 @@ pub mod datacenter;
 // DATACENTER-16 (action layer) — action/dc/wol Wake-on-LAN power-orchestration
 // primitive (broadcasts the magic packet to wake a machine).
 pub mod dc_power;
+// DATACENTER RBAC — the two-role (viewer/operator) gate every mutating
+// action/dc/* responder consults before mutating (design §9).
+pub mod dc_rbac;
+// DATACENTER-12 (action layer) — action/dc/{sr-list,sr-create,sr-destroy,
+// vdi-attach,vdi-detach,sr-snapshot-schedule,iso-list} storage responder.
+pub mod dc_storage;
+// DATACENTER-13 (action layer) — action/dc/{net-list,net-create,vlan-set,
+// pif-config,ipdns} network responder.
+pub mod dc_network;
 // DATACENTER-10 (action layer) — action/dc/host-power Xen host (dom0)
 // maintenance + reboot control responder.
 pub mod host_ops;

@@ -61,7 +61,7 @@ impl HostOpsService {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 6] = [
+pub const ACTION_VERBS: [&str; 10] = [
     "host-power",
     "gateway-reboot",
     "dr-backup",
@@ -69,7 +69,20 @@ pub const ACTION_VERBS: [&str; 6] = [
     // LIGHTHOUSE-6 — the Workbench Lighthouses tab's full-ops actions.
     "lighthouse-restart",
     "lighthouse-promote",
+    // DATACENTER-10 — host lifecycle: evacuate-first patch, pool membership,
+    // console launch info.
+    "host-evacuate",
+    "host-patch",
+    "host-pool",
+    "host-console",
 ];
+
+/// Whether `verb` MUTATES (so it is RBAC-gated to `operator`). The read-only verbs
+/// (`gateway-status`, `host-console`) return `false`. PURE.
+#[must_use]
+pub fn is_mutating(verb: &str) -> bool {
+    !matches!(verb, "gateway-status" | "host-console")
+}
 
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -531,12 +544,332 @@ fn promote_with_endpoints(
         .to_string())
 }
 
+// ───────────────────── DATACENTER-10 — host lifecycle ─────────────────────
+
+/// True iff `dom0` is in the configured allowed set. The SECURITY guard before any
+/// host SSH (shared by the new host-lifecycle verbs).
+#[must_use]
+fn dom0_allowed(dom0: &str) -> bool {
+    crate::workers::datacenter_orchestrator::xen_dom0s()
+        .iter()
+        .any(|d| d == dom0)
+}
+
+/// Resolve a dom0's host UUID over SSH (`xe host-list params=uuid --minimal`),
+/// taking the first uuid and guarding it for injection. Shared by the
+/// host-lifecycle verbs that run `xe <verb> host=<uuid>`.
+///
+/// # Errors
+/// Returns `Err` on an SSH/`xe` failure, an empty result, or a uuid carrying any
+/// character that is not an ASCII hex digit or `-`.
+fn resolve_host_uuid(key: &str, dom0: &str) -> Result<String, String> {
+    match ssh_xe_status(key, dom0, "xe host-list params=uuid --minimal") {
+        Ok(o) if o.status.success() => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            let uuid = out
+                .trim()
+                .split(',')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if uuid.is_empty() {
+                return Err("host uuid not found".into());
+            }
+            if !uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+                return Err("host uuid contains invalid characters".into());
+            }
+            Ok(uuid)
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let msg = stderr.trim();
+            Err(if msg.is_empty() {
+                "host-list failed".into()
+            } else {
+                msg.to_string()
+            })
+        }
+        Err(e) => Err(format!("ssh failed: {e}")),
+    }
+}
+
+/// The ordered `xe` host verbs a `host-evacuate` runs (each as
+/// `xe <verb> host=<uuid>`). PURE. `host-disable` first (XAPI evacuates a disabled
+/// host), then `host-evacuate` (live-migrate every resident VM to other pool
+/// hosts) — leaving the host drained + in maintenance.
+#[must_use]
+pub fn host_evacuate_commands() -> Vec<String> {
+    vec!["host-disable".to_string(), "host-evacuate".to_string()]
+}
+
+/// Run a sequence of `xe <verb> host=<uuid>` commands on `dom0`, stopping at the
+/// first failure. Shared by host-evacuate (and the xe steps of host-patch).
+fn run_host_verbs(key: &str, dom0: &str, uuid: &str, verbs: &[String]) -> Result<(), String> {
+    for v in verbs {
+        let remote = format!("xe {v} host={uuid}");
+        match ssh_xe_status(key, dom0, &remote) {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let msg = stderr.trim();
+                return Err(if msg.is_empty() {
+                    format!("{v} failed")
+                } else {
+                    msg.to_string()
+                });
+            }
+            Err(e) => return Err(format!("ssh failed: {e}")),
+        }
+    }
+    Ok(())
+}
+
+/// `host-evacuate` `{ dom0, confirm:true }` — drain a host: disable it then
+/// live-migrate all resident VMs off ([`host_evacuate_commands`]). Disruptive →
+/// `confirm:true`-gated. Returns `Ok(())` once both steps succeed.
+fn host_evacuate(req_body: Option<&str>) -> Result<(), String> {
+    let Some(body) = req_body else {
+        return Err("host-evacuate: missing request body".into());
+    };
+    let req: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("host-evacuate: bad json: {e}"))?;
+    if req.get("confirm").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err("evacuate requires confirm:true".into());
+    }
+    let dom0 = req
+        .get("dom0")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !dom0_allowed(dom0) {
+        return Err("dom0 not in allowed set".into());
+    }
+    let key = crate::workers::datacenter_orchestrator::xen_ssh_key();
+    let uuid = resolve_host_uuid(&key, dom0)?;
+    run_host_verbs(&key, dom0, &uuid, &host_evacuate_commands())
+}
+
+/// `host-patch` `{ dom0, confirm:true }` — rolling, evacuate-first patch: disable +
+/// evacuate the host, `yum update -y` (the XCP-ng update path), then
+/// `xe host-reboot` to boot the patched host. Disruptive → `confirm:true`-gated.
+/// Each step is sequential; a failure stops the rollout and is reported. Returns
+/// `Ok(())` once the reboot is accepted.
+fn host_patch(req_body: Option<&str>) -> Result<(), String> {
+    let Some(body) = req_body else {
+        return Err("host-patch: missing request body".into());
+    };
+    let req: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("host-patch: bad json: {e}"))?;
+    if req.get("confirm").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err("patch requires confirm:true".into());
+    }
+    let dom0 = req
+        .get("dom0")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !dom0_allowed(dom0) {
+        return Err("dom0 not in allowed set".into());
+    }
+    let key = crate::workers::datacenter_orchestrator::xen_ssh_key();
+    let uuid = resolve_host_uuid(&key, dom0)?;
+    // Evacuate-first (disable + migrate VMs off) so patching can't disrupt guests.
+    run_host_verbs(&key, dom0, &uuid, &host_evacuate_commands())?;
+    // Apply updates from the XCP-ng repos. The literal command carries no
+    // operator input, so there is nothing to escape.
+    match ssh_xe_status(&key, dom0, "yum update -y") {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let msg = stderr.trim();
+            return Err(if msg.is_empty() {
+                "yum update failed".into()
+            } else {
+                format!("yum update failed: {msg}")
+            });
+        }
+        Err(e) => return Err(format!("ssh failed: {e}")),
+    }
+    // Reboot the (disabled) host to boot the patched kernel/toolstack.
+    run_host_verbs(&key, dom0, &uuid, &["host-reboot".to_string()])
+}
+
+/// Whether a `host-pool` `op` is a recognized membership operation. PURE.
+#[must_use]
+pub fn host_pool_op_valid(op: &str) -> bool {
+    matches!(op, "designate-master" | "eject" | "join")
+}
+
+/// Parse the XAPI credential (`automation/secrets/mcnf-secret.sh get xapi-cred`)
+/// from the mesh secret store as `(user, password)` — `user:pass` (default user
+/// `root`). `None` when the helper is missing / the secret is absent / empty.
+fn xapi_cred() -> Option<(String, String)> {
+    let o = std::process::Command::new("bash")
+        .args(["-lc", "automation/secrets/mcnf-secret.sh get xapi-cred"])
+        .output()
+        .ok()?;
+    if !o.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&o.stdout);
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(match raw.split_once(':') {
+        Some((u, p)) => (u.trim().to_string(), p.trim().to_string()),
+        None => ("root".to_string(), raw.to_string()),
+    })
+}
+
+/// `host-pool` `{ dom0, op, host?, master?, confirm? }` — pool membership:
+///   * `designate-master` `{ host }` — promote pool member `host` (uuid) to master
+///     (`xe pool-designate-new-master host-uuid=<host>`);
+///   * `eject` `{ host, confirm:true }` — eject member `host` (uuid) from the pool
+///     (`xe pool-eject host-uuid=<host>`), destructive → confirm-gated;
+///   * `join` `{ master, confirm:true }` — join THIS dom0 to the pool whose master
+///     is at IPv4 `master`, using the XAPI cred from the mesh secret store
+///     (`xe pool-join master-address=<master> …`), confirm-gated.
+/// We SSH to `dom0` (an allow-listed pool master / the joining host). Returns a
+/// short status string on success.
+fn host_pool(req_body: Option<&str>) -> Result<String, String> {
+    let Some(body) = req_body else {
+        return Err("host-pool: missing request body".into());
+    };
+    let req: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("host-pool: bad json: {e}"))?;
+    let op = req
+        .get("op")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !host_pool_op_valid(op) {
+        return Err(format!("unknown pool op: {op}"));
+    }
+    let dom0 = req
+        .get("dom0")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+
+    // Pure input validation + remote-command assembly BEFORE the dom0 allow-list
+    // (the allow-list is the SSH gate, checked just before exec) — so a malformed
+    // op/host/master/confirm is rejected the same regardless of allow-list state.
+    let remote = match op {
+        "designate-master" | "eject" => {
+            // `host` is a pool host uuid — guard it for injection before use.
+            let host = req
+                .get("host")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if host.is_empty() || !host.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+                return Err("host must be a non-empty hex+dash uuid".into());
+            }
+            if op == "eject" {
+                if req.get("confirm").and_then(serde_json::Value::as_bool) != Some(true) {
+                    return Err("eject requires confirm:true".into());
+                }
+                // pool-eject prompts interactively; answer it on stdin.
+                format!("echo yes | xe pool-eject host-uuid={host}")
+            } else {
+                format!("xe pool-designate-new-master host-uuid={host}")
+            }
+        }
+        // join
+        _ => {
+            if req.get("confirm").and_then(serde_json::Value::as_bool) != Some(true) {
+                return Err("join requires confirm:true".into());
+            }
+            let master = req
+                .get("master")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if !valid_ipv4(master) {
+                return Err("master must be a plain IPv4 address".into());
+            }
+            let (user, pw) = xapi_cred().ok_or("no xapi cred in store")?;
+            // The cred is not operator-supplied (mesh secret store) and the master
+            // is a validated IPv4; user/pw come from our own trusted store.
+            format!(
+                "xe pool-join master-address={master} master-username={user} master-password={pw}"
+            )
+        }
+    };
+
+    // SECURITY: SSH only an allow-listed dom0, checked right before exec.
+    if !dom0_allowed(dom0) {
+        return Err("dom0 not in allowed set".into());
+    }
+    let key = crate::workers::datacenter_orchestrator::xen_ssh_key();
+    match ssh_xe_status(&key, dom0, &remote) {
+        Ok(o) if o.status.success() => Ok(format!("pool {op} ok")),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let msg = stderr.trim();
+            Err(if msg.is_empty() {
+                format!("pool {op} failed")
+            } else {
+                msg.to_string()
+            })
+        }
+        Err(e) => Err(format!("ssh failed: {e}")),
+    }
+}
+
+/// `host-console` `{ dom0 }` — return the SSH connection info the Workbench uses to
+/// launch a dom0 console terminal (read-only; like the lighthouse-ssh launch, the
+/// terminal itself opens panel-side). The `dom0` MUST be allow-listed so we never
+/// echo connection info for an arbitrary host. Returns `(ssh_target, key_path)`.
+fn host_console(req_body: Option<&str>) -> Result<(String, String), String> {
+    let Some(body) = req_body else {
+        return Err("host-console: missing request body".into());
+    };
+    let req: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("host-console: bad json: {e}"))?;
+    let dom0 = req
+        .get("dom0")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !dom0_allowed(dom0) {
+        return Err("dom0 not in allowed set".into());
+    }
+    let key = crate::workers::datacenter_orchestrator::xen_ssh_key();
+    Ok((format!("root@{dom0}"), key))
+}
+
 /// Build the reply for one `action/dc/<verb>` request.
 #[must_use]
 pub fn build_reply(svc: &HostOpsService, verb: &str, req_body: Option<&str>) -> String {
     let err = |m: String| json!({ "error": m }).to_string();
+    // RBAC (design §9): a mutating verb requires the caller's mesh principal to map
+    // to `operator`; a `viewer` is rejected before any allow-list / SSH.
+    if let Err(m) = crate::ipc::dc_rbac::authorize(req_body, is_mutating(verb)) {
+        return err(m);
+    }
     match verb {
         "host-power" => {}
+        // DATACENTER-10 — host lifecycle.
+        "host-evacuate" => {
+            return match host_evacuate(req_body) {
+                Ok(()) => json!({ "ok": true }).to_string(),
+                Err(m) => err(m),
+            };
+        }
+        "host-patch" => {
+            return match host_patch(req_body) {
+                Ok(()) => json!({ "ok": true }).to_string(),
+                Err(m) => err(m),
+            };
+        }
+        "host-pool" => {
+            return match host_pool(req_body) {
+                Ok(status) => json!({ "ok": true, "status": status }).to_string(),
+                Err(m) => err(m),
+            };
+        }
+        "host-console" => {
+            return match host_console(req_body) {
+                Ok((ssh, key)) => json!({ "ok": true, "ssh": ssh, "key": key }).to_string(),
+                Err(m) => err(m),
+            };
+        }
         "gateway-reboot" => {
             return match gateway_reboot(req_body) {
                 Ok(()) => json!({ "ok": true }).to_string(),
@@ -992,5 +1325,121 @@ mod tests {
         .to_string();
         let r = build_reply(&s, "host-power", Some(&body));
         assert!(r.contains("dom0 not in allowed set"), "{r}");
+    }
+
+    // ---- DATACENTER-10: host lifecycle ----
+
+    #[test]
+    fn host_lifecycle_verbs_in_action_set() {
+        for v in ["host-evacuate", "host-patch", "host-pool", "host-console"] {
+            assert!(ACTION_VERBS.contains(&v), "missing {v}");
+            assert_eq!(action_topic(v), format!("action/dc/{v}"));
+        }
+    }
+
+    #[test]
+    fn is_mutating_marks_reads_readonly() {
+        assert!(!is_mutating("gateway-status"));
+        assert!(!is_mutating("host-console"));
+        for v in ["host-power", "host-evacuate", "host-patch", "host-pool"] {
+            assert!(is_mutating(v), "{v}");
+        }
+    }
+
+    #[test]
+    fn host_evacuate_commands_disable_then_evacuate() {
+        assert_eq!(
+            host_evacuate_commands(),
+            vec!["host-disable".to_string(), "host-evacuate".to_string()]
+        );
+    }
+
+    #[test]
+    fn host_pool_op_valid_set() {
+        assert!(host_pool_op_valid("designate-master"));
+        assert!(host_pool_op_valid("eject"));
+        assert!(host_pool_op_valid("join"));
+        assert!(!host_pool_op_valid("delete"));
+        assert!(!host_pool_op_valid(""));
+    }
+
+    #[test]
+    fn host_evacuate_and_patch_require_confirm() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        for verb in ["host-evacuate", "host-patch"] {
+            let body = json!({ "dom0": "10.0.0.1" }).to_string();
+            let r = build_reply(&s, verb, Some(&body));
+            assert!(r.contains("requires confirm:true"), "{verb}: {r}");
+        }
+    }
+
+    #[test]
+    fn host_lifecycle_rejects_unlisted_dom0() {
+        // With confirm:true the next gate is the (empty) dom0 allow-list.
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        let body = json!({ "dom0": "10.0.0.1", "confirm": true }).to_string();
+        assert!(build_reply(&s, "host-evacuate", Some(&body)).contains("dom0 not in allowed set"));
+        assert!(build_reply(&s, "host-patch", Some(&body)).contains("dom0 not in allowed set"));
+        // host-console (read-only) also allow-lists the dom0.
+        let body = json!({ "dom0": "10.0.0.1" }).to_string();
+        assert!(build_reply(&s, "host-console", Some(&body)).contains("dom0 not in allowed set"));
+        // host-pool: unknown op rejected before the dom0 check.
+        let body = json!({ "dom0": "10.0.0.1", "op": "bogus" }).to_string();
+        assert!(build_reply(&s, "host-pool", Some(&body)).contains("unknown pool op"));
+        // a valid op then hits the allow-list.
+        let body =
+            json!({ "dom0": "10.0.0.1", "op": "designate-master", "host": "1111" }).to_string();
+        assert!(build_reply(&s, "host-pool", Some(&body)).contains("dom0 not in allowed set"));
+    }
+
+    #[test]
+    fn host_pool_eject_and_join_require_confirm_and_validate() {
+        // Input validation now PRECEDES the dom0 allow-list, so these are reachable
+        // with the allowed set empty (no shared-env mutation → no test race).
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        // eject without confirm.
+        let body = json!({ "dom0": "10.0.0.1", "op": "eject", "host": "1111-2222" }).to_string();
+        let r = build_reply(&s, "host-pool", Some(&body));
+        assert!(r.contains("eject requires confirm:true"), "{r}");
+        // join without a valid master IPv4.
+        let body =
+            json!({ "dom0": "10.0.0.1", "op": "join", "confirm": true, "master": "not-an-ip" })
+                .to_string();
+        let r = build_reply(&s, "host-pool", Some(&body));
+        assert!(r.contains("master must be a plain IPv4 address"), "{r}");
+        // designate-master with a bad host uuid (injection-bearing).
+        let body =
+            json!({ "dom0": "10.0.0.1", "op": "designate-master", "host": "a;b" }).to_string();
+        let r = build_reply(&s, "host-pool", Some(&body));
+        assert!(r.contains("host must be a non-empty hex+dash uuid"), "{r}");
+    }
+
+    #[test]
+    fn host_console_rejects_unlisted_dom0() {
+        // The success path just formats `root@<dom0>` + the key; the security-
+        // relevant path is the allow-list rejection, testable without env mutation.
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        let body = json!({ "dom0": "10.0.0.1" }).to_string();
+        let r = build_reply(&s, "host-console", Some(&body));
+        assert!(r.contains("dom0 not in allowed set"), "{r}");
+        // Missing body errors cleanly.
+        assert!(build_reply(&s, "host-console", None).contains("missing request body"));
+    }
+
+    #[test]
+    fn rbac_viewer_rejected_on_mutating_host_verb() {
+        // The shared crate test lock serializes the role-map mutation across the
+        // RBAC integration tests so the parallel runner can't observe a torn map.
+        let _g = crate::ipc::dc_rbac::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        std::env::set_var(crate::ipc::dc_rbac::ROLE_MAP_ENV, "bob=viewer");
+        let body =
+            json!({ "principal": "bob", "dom0": "10.0.0.1", "op": "maintenance-on" }).to_string();
+        let r = build_reply(&s, "host-power", Some(&body));
+        std::env::remove_var(crate::ipc::dc_rbac::ROLE_MAP_ENV);
+        assert!(r.contains("rbac"), "{r}");
+        assert!(r.contains("viewer"), "{r}");
     }
 }
