@@ -694,7 +694,7 @@ const CANONICAL_SERVICES: [(&str, &str, u16, &str); 7] = [
 /// workbench `service_publishing` panel's `parse_summary` already expects.
 fn build_published_services() -> String {
     let overlay = crate::voip_rtt::own_nebula_ip();
-    let rows: Vec<serde_json::Value> = CANONICAL_SERVICES
+    let mut rows: Vec<serde_json::Value> = CANONICAL_SERVICES
         .iter()
         .map(|(id, name, port, proto)| {
             json!({
@@ -707,7 +707,45 @@ fn build_published_services() -> String {
             })
         })
         .collect();
+    // MEDIA-7 — register the music service ONLY on a serving `Lighthouse_Media`
+    // node (per-instance: this peer publishes its own row), with `is_publishable`
+    // reflecting whether Navidrome is actually serving on the overlay. A
+    // non-media node returns `None` ⇒ no row ⇒ de-registered (no stale entry),
+    // so the Workbench surface shows exactly which media lighthouses are live.
+    let serves_media = crate::worker_role::node_serves_media();
+    let healthy = serves_media && music_serving(overlay.as_deref());
+    if let Some(row) =
+        crate::mesh_media::music_service_row(serves_media, healthy, overlay.as_deref())
+    {
+        rows.push(row);
+    }
     serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// MEDIA-7 — best-effort liveness probe for the local Navidrome instance: a
+/// short TCP connect to the Subsonic port on the overlay IP (the container binds
+/// the overlay via `--network host` + `ND_ADDRESS`), falling back to localhost.
+/// `true` only when something answers — so `is_publishable` is per-instance
+/// health, not just "this is a media node".
+fn music_serving(overlay_ip: Option<&str>) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+    let port = crate::mesh_media::NAVIDROME_PORT;
+    let mut targets: Vec<String> = Vec::new();
+    if let Some(ip) = overlay_ip.filter(|ip| !ip.is_empty()) {
+        targets.push(format!("{ip}:{port}"));
+    }
+    targets.push(format!("127.0.0.1:{port}"));
+    for t in targets {
+        if let Ok(mut addrs) = t.to_socket_addrs() {
+            if let Some(addr) = addrs.next() {
+                if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Run the Bus responder loop on the current thread, building a

@@ -374,6 +374,10 @@ pub mod presence_watch;
 pub mod mesh_shunt;
 // PLANES-18 — feeds <host>.mesh into resolved + /etc/hosts.
 pub mod mesh_dns;
+// MEDIA-3/6 — adopts + supervises the Navidrome container on Lighthouse_Media,
+// and distributes the leader-managed shared-account secret. Media-capability
+// gated (runs only on the media subclass).
+pub mod media_navidrome;
 // PLANES-15 — converges the baseline's netstate desired-state under a
 // rollback checkpoint with a post-apply overlay-reachability self-test.
 pub mod netstate_apply;
