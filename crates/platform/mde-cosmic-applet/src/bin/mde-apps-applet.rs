@@ -2689,6 +2689,9 @@ mod motion_tests {
         let off = mde_theme::prefs::MotionPrefs {
             enabled: false,
             speed_scale: 1.0,
+            // MOTION-A11Y-2 added the `decorative` toggle; spread keeps this
+            // kill-switch test focused on `enabled`.
+            ..mde_theme::prefs::MotionPrefs::default()
         };
         assert_eq!(
             off.apply(Motion::panel_mount(), false).duration,

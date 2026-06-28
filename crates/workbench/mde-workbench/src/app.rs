@@ -295,6 +295,11 @@ pub struct App {
     /// the active panel's load so its data recovers without a manual
     /// refresh. Starts optimistic (`true`).
     bus_reachable: bool,
+    /// MOTION-NET-5 — `true` while a background Bus-liveness probe is in flight
+    /// (between [`Message::ReconnectTick`] firing and [`Message::ReconnectProbed`]
+    /// landing). Drives the header's subtle background-refresh indicator so
+    /// background polling is visible but never blocks input. Starts `false`.
+    bus_probing: bool,
     backend: Arc<dyn Backend>,
     notifications: notifications_panel::NotificationsPanel,
     music: music_panel::MusicPanel,
@@ -413,6 +418,7 @@ impl App {
             sidebar: SidebarState::new(),
             focused_pane: Pane::Sidebar,
             bus_reachable: true,
+            bus_probing: false,
             backend,
             notifications: notifications_panel::NotificationsPanel::new(),
             music: music_panel::MusicPanel::new(),
@@ -920,14 +926,22 @@ impl App {
                 }
                 Task::none()
             }
-            // GUI-RECONNECT — fire the cheap Bus liveness probe.
+            // GUI-RECONNECT — fire the cheap Bus liveness probe. MOTION-NET-5 —
+            // mark the background poll in-flight so the header shows a subtle,
+            // non-blocking refresh indicator while the probe runs.
             Message::ReconnectTick => {
+                self.bus_probing = true;
                 Task::perform(probe_bus_reachable(), Message::ReconnectProbed)
             }
             // GUI-RECONNECT — on a down→up transition, re-load the active
             // panel so its data recovers on its own. No reload while the
             // Bus stays healthy (no flicker / no clobbered input).
             Message::ReconnectProbed(reachable) => {
+                // MOTION-NET-5 — the background poll has landed; clear the
+                // in-flight indicator. A `false` result leaves the header in the
+                // degraded/offline state, which auto-recovers on the next
+                // successful probe (the down→up reload below).
+                self.bus_probing = false;
                 let recovered = reachable && !self.bus_reachable;
                 self.bus_reachable = reachable;
                 if recovered {
@@ -1169,6 +1183,23 @@ impl App {
             .into()
     }
 
+    /// MOTION-NET-5 — the control-plane connectivity state surfaced in the header.
+    /// `Offline` when the last Bus-liveness probe failed (mackesd/mesh
+    /// unreachable — the degraded banner that auto-recovers on the next good
+    /// probe); `Refreshing { stale }` while a background poll is in flight (the
+    /// subtle, non-blocking background-work indicator); `Loaded` when healthy and
+    /// idle (the header renders no pill — no clutter). The state is legible without
+    /// motion via [`LoadState::icon`]/[`LoadState::label`].
+    fn connection_state(&self) -> mde_theme::LoadState {
+        if !self.bus_reachable {
+            mde_theme::LoadState::Offline
+        } else if self.bus_probing {
+            mde_theme::LoadState::Refreshing { stale: true }
+        } else {
+            mde_theme::LoadState::Loaded
+        }
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
         // AUD-5 — the DISCLAIMER pre-flight accept gate (§5): until the operator
         // accepts the current disclaimer, the whole app is replaced by a
@@ -1221,7 +1252,8 @@ impl App {
 
         // UX-4 — custom window header sits above sidebar + body
         // so the wordmark + window controls span the full width.
-        let window_header = crate::header::view(Message::WindowControl);
+        let window_header =
+            crate::header::view(Message::WindowControl, self.connection_state());
 
         column![window_header, layout]
             .width(Length::Fill)
@@ -1723,6 +1755,29 @@ mod tests {
         // Recovery: false→true flips the flag back (and re-loads the panel).
         let _ = app.update(Message::ReconnectProbed(true));
         assert!(app.bus_reachable, "probe success marks the Bus back up");
+    }
+
+    #[test]
+    fn connection_state_reflects_probe_and_reachability() {
+        // MOTION-NET-5 — the header connectivity state: healthy idle ⇒ no pill
+        // (Loaded); a probe in flight ⇒ Refreshing (background-work indicator);
+        // the Bus down ⇒ Offline (the auto-recovering degraded banner).
+        let mut app = App::new();
+        assert_eq!(app.connection_state(), mde_theme::LoadState::Loaded);
+        // A background poll fires → the probing indicator shows.
+        let _ = app.update(Message::ReconnectTick);
+        assert!(app.bus_probing, "ReconnectTick marks a probe in flight");
+        assert_eq!(
+            app.connection_state(),
+            mde_theme::LoadState::Refreshing { stale: true }
+        );
+        // Probe lands as a failure → Offline, and the probing flag clears.
+        let _ = app.update(Message::ReconnectProbed(false));
+        assert!(!app.bus_probing, "probe landing clears the in-flight flag");
+        assert_eq!(app.connection_state(), mde_theme::LoadState::Offline);
+        // Recovery → back to the clean Loaded header.
+        let _ = app.update(Message::ReconnectProbed(true));
+        assert_eq!(app.connection_state(), mde_theme::LoadState::Loaded);
     }
 
     #[test]
