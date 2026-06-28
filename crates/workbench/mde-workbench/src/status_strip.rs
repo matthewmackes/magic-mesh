@@ -1,14 +1,15 @@
-//! UNIFY-1 — the global status strip.
+//! UNIFY-1/2 — the global status strip.
 //!
 //! The Unified Workbench design (`docs/design/workbench/Workbench.dc.html`) frames
 //! the whole app with a thin, always-on chrome strip across the very top — above
 //! the window header — rendering at-a-glance mesh status in dense IBM-Carbon mono.
-//! This is the first increment of that frame: it surfaces the **live, real**
-//! signal the shell already holds — the mde-bus ("chain") reachability — alongside
-//! the cluster brand mark. Richer fields from the design (CRIT/WARN/OK counts,
-//! the event ticker, posture, uptime, clock) land in later UNIFY increments once
-//! their live data sources are plumbed into `App` state; per §7 we render only what
-//! is genuinely backed, never placeholder values.
+//! It surfaces the **live, real** signals the shell holds: the mde-bus ("chain")
+//! reachability (UNIFY-1) and the mesh-health summary — online/total nodes +
+//! lighthouse count (UNIFY-2, from `action/shell/healthz`). Remaining design fields
+//! (CRIT/WARN/OK alert counts, the event ticker, posture, uptime, clock) land in
+//! later UNIFY increments once their live sources are plumbed; per §7 we render only
+//! what is genuinely backed, never placeholder values — when the daemon hasn't
+//! answered, the count cell is simply omitted rather than showing a fake 0/0.
 //!
 //! All colour / size / weight come from `mde-theme` tokens (§4 — no raw hex):
 //! the strip background is a token-derived near-black (`palette.background`
@@ -21,6 +22,7 @@ use cosmic::Element;
 
 use crate::cosmic_compat::overlay_color_on;
 use crate::cosmic_compat::prelude::*;
+use crate::mesh_directory::HealthSummary;
 use mde_theme::{carbon, FontSize, FontWeight, Palette, TypeRole};
 
 /// Strip height — the design's 26 px chrome band.
@@ -31,10 +33,15 @@ const PIP: f32 = 7.0;
 
 /// Build the global status strip as an Iced [`Element`].
 ///
-/// `bus_reachable` is the live mde-bus health the shell already tracks
-/// (`App::bus_reachable`); it drives the "chain" indicator. The strip is
-/// display-only this increment, so it stays generic over the app's `Message`.
-pub fn view<'a, Message: 'a>(bus_reachable: bool) -> Element<'a, Message> {
+/// `bus_reachable` is the live mde-bus health the shell tracks (`App::bus_reachable`)
+/// and drives the "chain" indicator. `health` is the latest mesh-health summary
+/// (`App::mesh_health`); when `Some`, the strip shows live online/total + lighthouse
+/// counts, and when `None` (daemon not yet answered) that cell is omitted. The strip
+/// is display-only, so it stays generic over the app's `Message`.
+pub fn view<'a, Message: 'a>(
+    bus_reachable: bool,
+    health: Option<&HealthSummary>,
+) -> Element<'a, Message> {
     let palette = crate::live_theme::palette();
     let sizes = FontSize::defaults();
     let weights = FontWeight::defaults();
@@ -53,7 +60,7 @@ pub fn view<'a, Message: 'a>(bus_reachable: bool) -> Element<'a, Message> {
     ]
     .align_y(alignment::Vertical::Center);
 
-    // Chain / bus reachability — the one live signal we surface this increment.
+    // Chain / bus reachability — live (UNIFY-1).
     let (chain_col, chain_label) = if bus_reachable {
         (palette.success, "chain ok")
     } else {
@@ -67,13 +74,16 @@ pub fn view<'a, Message: 'a>(bus_reachable: bool) -> Element<'a, Message> {
     ]
     .align_y(alignment::Vertical::Center);
 
-    let bar = row![
-        cell(brand.into(), &palette),
-        cell(chain.into(), &palette),
-        Space::new().width(Length::Fill),
-    ]
-    .height(Length::Fixed(STRIP_HEIGHT))
-    .align_y(alignment::Vertical::Center);
+    let mut bar = row![cell(brand.into(), &palette), cell(chain.into(), &palette)]
+        .height(Length::Fixed(STRIP_HEIGHT))
+        .align_y(alignment::Vertical::Center);
+
+    // Live mesh-health counts (UNIFY-2) — only when the daemon has answered (§7).
+    if let Some(h) = health {
+        bar = bar.push(cell(up_cell(h, &palette), &palette));
+    }
+
+    bar = bar.push(Space::new().width(Length::Fill));
 
     container(bar)
         .width(Length::Fill)
@@ -93,7 +103,41 @@ pub fn view<'a, Message: 'a>(bus_reachable: bool) -> Element<'a, Message> {
         .into()
 }
 
-/// One segment of the strip, padded with a right divider (design's `border-right`).
+/// The live online/total + lighthouse-count segment (UNIFY-2).
+fn up_cell<'a, Message: 'a>(h: &HealthSummary, palette: &Palette) -> Element<'a, Message> {
+    let sizes = FontSize::defaults();
+    let weights = FontWeight::defaults();
+    // Healthy ⇒ success token; any unhealthy node ⇒ warning, so the dot tells the
+    // truth at a glance without a separate severity feed.
+    let dot = if h.healthy_nodes >= h.node_count {
+        palette.success
+    } else {
+        palette.warning
+    };
+    row![
+        pip(dot),
+        Space::new().width(Length::Fixed(7.0)),
+        mono_text(
+            format!("{}/{} up", h.healthy_nodes, h.node_count),
+            TypeRole::Caption,
+            &sizes,
+            &weights,
+        )
+        .colr(palette.text.into_cosmic_color()),
+        Space::new().width(Length::Fixed(9.0)),
+        mono_text(
+            format!("{} LH", h.lighthouse_count),
+            TypeRole::Caption,
+            &sizes,
+            &weights,
+        )
+        .colr(palette.text_muted.into_cosmic_color()),
+    ]
+    .align_y(alignment::Vertical::Center)
+    .into()
+}
+
+/// One segment of the strip, padded (design's per-cell `border-right` spacing).
 fn cell<'a, Message: 'a>(content: Element<'a, Message>, palette: &Palette) -> Element<'a, Message> {
     let border = palette.border.into_cosmic_color();
     container(content)
@@ -140,16 +184,18 @@ fn pip<'a, Message: 'a>(color: mde_theme::Rgba) -> Element<'a, Message> {
 
 /// Roboto-Mono caption text, the strip's typeface (design uses `'Roboto Mono'`).
 fn mono_text<'a>(
-    s: &'a str,
+    s: impl Into<String>,
     role: TypeRole,
     sizes: &FontSize,
     weights: &FontWeight,
 ) -> cosmic::iced::widget::Text<'a, cosmic::Theme> {
-    text(s).size(role.size_in(*sizes)).font(cosmic::iced::Font {
-        family: cosmic::iced::font::Family::Name(TypeRole::Mono.family()),
-        weight: weight_from_u16(role.weight_in(*weights)),
-        ..cosmic::iced::Font::DEFAULT
-    })
+    text(s.into())
+        .size(role.size_in(*sizes))
+        .font(cosmic::iced::Font {
+            family: cosmic::iced::font::Family::Name(TypeRole::Mono.family()),
+            weight: weight_from_u16(role.weight_in(*weights)),
+            ..cosmic::iced::Font::DEFAULT
+        })
 }
 
 fn weight_from_u16(w: u16) -> cosmic::iced::font::Weight {
@@ -177,10 +223,17 @@ mod tests {
     }
 
     #[test]
-    fn chain_indicator_reflects_real_bus_state() {
-        // The strip must render from the live bus signal, not a constant —
-        // building both branches guards against the indicator going static.
-        let _up = view::<()>(true);
-        let _down = view::<()>(false);
+    fn renders_from_real_signals_not_constants() {
+        // Build every branch: bus up/down, health present/absent — guards against
+        // the strip going static (must reflect the live App state it's handed).
+        let _up = view::<()>(true, None);
+        let _down = view::<()>(false, None);
+        let h = HealthSummary {
+            node_count: 8,
+            healthy_nodes: 7,
+            lighthouse_count: 3,
+            ha_ok: true,
+        };
+        let _with = view::<()>(true, Some(&h));
     }
 }

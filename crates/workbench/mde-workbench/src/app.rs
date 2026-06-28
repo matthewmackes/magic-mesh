@@ -94,6 +94,8 @@ pub enum Message {
     /// transition re-loads the active panel so it recovers after a
     /// `systemctl restart mackesd` without a manual refresh.
     ReconnectProbed(bool),
+    /// UNIFY-2 — the live mesh-health summary fetch resolved (`None` = daemon down).
+    MeshHealthUpdated(Option<crate::mesh_directory::HealthSummary>),
     /// Keyboard / chord-bar generated key. Translated by
     /// [`crate::keyboard::interpret_key`] before landing here.
     KeyPressed(KeyAction),
@@ -317,6 +319,11 @@ pub struct App {
     /// the active panel's load so its data recovers without a manual
     /// refresh. Starts optimistic (`true`).
     bus_reachable: bool,
+    /// UNIFY-2 — last live mesh-health summary (online/total + lighthouse count)
+    /// from `action/shell/healthz`, polled on the 10 s reconnect tick + at boot.
+    /// `None` until the daemon answers — the status strip then omits the count
+    /// cell rather than render a fake 0/0 (§7).
+    mesh_health: Option<crate::mesh_directory::HealthSummary>,
     backend: Arc<dyn Backend>,
     notifications: notifications_panel::NotificationsPanel,
     music: music_panel::MusicPanel,
@@ -452,6 +459,7 @@ impl App {
             sidebar: SidebarState::new(),
             focused_pane: Pane::Sidebar,
             bus_reachable: true,
+            mesh_health: None,
             backend,
             notifications: notifications_panel::NotificationsPanel::new(),
             music: music_panel::MusicPanel::new(),
@@ -1044,8 +1052,14 @@ impl App {
                 Task::none()
             }
             // GUI-RECONNECT — fire the cheap Bus liveness probe.
-            Message::ReconnectTick => {
-                Task::perform(probe_bus_reachable(), Message::ReconnectProbed)
+            Message::ReconnectTick => Task::batch([
+                Task::perform(probe_bus_reachable(), Message::ReconnectProbed),
+                Task::perform(fetch_mesh_health(), Message::MeshHealthUpdated),
+            ]),
+            // UNIFY-2 — store the live mesh-health summary for the status strip.
+            Message::MeshHealthUpdated(summary) => {
+                self.mesh_health = summary;
+                Task::none()
             }
             // GUI-RECONNECT — on a down→up transition, re-load the active
             // panel so its data recovers on its own. No reload while the
@@ -1438,7 +1452,8 @@ impl App {
         // UNIFY-1 — the Unified Workbench global status strip frames the whole
         // app above the window header, surfacing live mesh chrome (this increment:
         // mde-bus "chain" reachability + cluster mark).
-        let status_strip = crate::status_strip::view::<Message>(self.bus_reachable);
+        let status_strip =
+            crate::status_strip::view::<Message>(self.bus_reachable, self.mesh_health.as_ref());
 
         column![status_strip, window_header, layout]
             .width(Length::Fill)
@@ -1899,6 +1914,13 @@ impl Application for App {
         // Cosmic's headerbar so it's the only title strip the user sees.
         app.core.window.show_headerbar = false;
         app.set_header_title("MDE Workbench".to_string());
+        // UNIFY-2 — fetch the live mesh-health summary on boot so the status
+        // strip's online/total + lighthouse counts paint immediately, not only
+        // after the first 10 s reconnect tick.
+        let boot = Task::batch([
+            boot,
+            Task::perform(fetch_mesh_health(), Message::MeshHealthUpdated),
+        ]);
         (app, boot.map(cosmic::Action::App))
     }
 
@@ -1946,6 +1968,15 @@ async fn probe_bus_reachable() -> bool {
     })
     .await
     .unwrap_or(false)
+}
+
+/// UNIFY-2 — fetch the live mesh-health summary off the GUI thread. The
+/// `action/shell/healthz` directory call is blocking (same contract as
+/// [`probe_bus_reachable`]), so run it on the blocking pool.
+async fn fetch_mesh_health() -> Option<crate::mesh_directory::HealthSummary> {
+    tokio::task::spawn_blocking(crate::mesh_directory::fetch_health)
+        .await
+        .unwrap_or(None)
 }
 
 fn panel_worklist_item(_group: Group, _panel: &str) -> Option<&'static str> {

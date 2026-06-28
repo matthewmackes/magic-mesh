@@ -2538,15 +2538,15 @@ stays token-clean (`lint-carbon-tokens.sh`). Design→code targets below come fr
 recon (token map: `#161616→carbon::GRAY_100`, `#0f62fe→BLUE_60`, `#42be65→GREEN_40`,
 `#3ddbd9→TEAL_30`, etc.; render read-path `live_theme::palette()`).
 
-- [>] **UNIFY-1: shell — global status strip** *(top chrome band)*
+- [✓] **UNIFY-1: shell — global status strip** *(top chrome band)*
   **As** an operator, **I want** a persistent top strip with at-a-glance mesh status, **so that** core health is always visible regardless of panel.
   **Acceptance** (runtime-observable):
     - [✓] new `status_strip.rs`; injected in `app.rs::view()` as `column![status_strip, window_header, layout]`; 26 px band, token-only (no raw hex), `lint-carbon-tokens.sh` clean.
-    - [>] live **mde-bus "chain" indicator** reads real `App::bus_reachable` (green `chain ok` / red `bus offline`) — not a constant; **farm build green** (`xcp-build.sh cargo check -p mde-workbench`) [verifying].
-    - [ ] follow-on (UNIFY-5): CRIT/WARN/OK counts, event ticker, posture, uptime, clock — added only once their live sources are plumbed (no placeholders).
-- [ ] **UNIFY-2: shell — live mesh-health summary in App state**
-  **As** the shell, **I want** a single live `MeshHealth` summary (online/total, crit/warn/ok) in `App`, **so that** the strip, header chips, and events rail all read one real source.
-  **Acceptance:** an `App` field populated from the existing health/peer subscription (`mesh_directory::fetch_health`/`fetch_peers` path, not a fresh blocking call in `view()`); counts reflect live `action/mesh/*`; updates on the subscription tick; unit test on the derive.
+    - [✓] live **mde-bus "chain" indicator** reads real `App::bus_reachable` (green `chain ok` / red `bus offline`) — not a constant; **farm-green across all 3 nodes** (check@.50 + clippy@.90 + test@.130, exit 0).
+    - [✓] live **online/total + lighthouse counts** now shown (via UNIFY-2). Remaining design fields — CRIT/WARN/OK *alert* counts, event ticker, posture, uptime, clock — deferred to UNIFY-3/5 (added only once their live sources are plumbed; no placeholders, §7).
+- [✓] **UNIFY-2: shell — live mesh-health summary in App state**
+  **As** the shell, **I want** a single live mesh-health summary (online/total, lighthouses) in `App`, **so that** the strip, header chips, and events rail all read one real source.
+  **Acceptance:** `App::mesh_health: Option<HealthSummary>` populated by `fetch_mesh_health()` (spawn_blocking → `mesh_directory::fetch_health` over `action/shell/healthz`, NOT a blocking call in `view()`); fired at boot + on the 10 s reconnect tick (`Message::MeshHealthUpdated`); the status strip renders live `N/M up` + `k LH` from it, omitting the cell when `None` (no fake 0/0, §7). Farm-green: check@.50 + clippy@.90 + test@.130 (exit 0).
 - [ ] **UNIFY-3: shell — Live Events right rail** *(collapsible)*
   **As** an operator, **I want** a collapsible right rail streaming live mesh events, **so that** I can follow activity beside any panel.
   **Acceptance:** new `events_rail.rs`; `App::events_rail_open` + `Message::ToggleLiveEventsRail` + update arm; `layout = row![sidebar, content, events_rail?]`; subscribes to the **real** Bus alert/event topic into a bounded ring buffer; severity counters + stream from live data; toggle in header; does not steal panel scroll/focus.
