@@ -74,6 +74,8 @@ pub struct RoutingPanel {
     pub poll_attempts: u8,
     /// ROUTE-TRACE-4 — the path-trace toolbar state machine.
     pub trace: TraceState,
+    /// VPN-GW-8 — the egress-routing matrix / map / assign form.
+    pub egress: EgressState,
 }
 
 /// ROUTE-TRACE-4 — the trace toolbar's selection state + last result.
@@ -159,12 +161,154 @@ impl TraceState {
     }
 }
 
+/// VPN-GW-8 — one configured egress route (a row of the egress matrix), from
+/// `action/vpn/list-routes`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EgressRouteRow {
+    /// `node` / `group` / `any`.
+    pub scope: String,
+    /// The node id / group name (empty for `any`).
+    pub target: String,
+    /// The gateway node running the tunnel(s).
+    pub gateway: String,
+    /// Primary tunnel id.
+    pub tunnel: String,
+    /// Ordered failover chain.
+    pub failover: Vec<String>,
+    /// Kill-switch on a full-chain drop.
+    pub kill_switch: bool,
+}
+
+impl EgressRouteRow {
+    /// The "who is routed" label: `node:eagle` / `group:lab` / `ANY (all-mesh)`.
+    #[must_use]
+    pub fn who(&self) -> String {
+        match self.scope.as_str() {
+            "any" => "ANY (all-mesh)".to_string(),
+            other => format!("{other}:{}", self.target),
+        }
+    }
+}
+
+/// VPN-GW-8 — one route's LIVE resolution (the "who exits where" summary), from
+/// `action/vpn/route-status`: the active tunnel resolved from the failover chain
+/// + the verified exit IP, or the kill-switch engagement when the chain is down.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouteStatusRow {
+    pub scope: String,
+    pub target: String,
+    pub gateway: String,
+    /// The live active tunnel (empty when none healthy).
+    pub active_tunnel: String,
+    /// The verified exit IP of the active tunnel (empty when none / unknown).
+    pub exit_ip: String,
+    /// The kill-switch is currently blocking (no healthy tunnel + kill-switch on).
+    pub kill_switch_engaged: bool,
+}
+
+/// VPN-GW-8 — the assign-route form (scope → gateway → primary tunnel → failover
+/// chain → kill-switch), submitted to `action/vpn/set-route`.
+#[derive(Debug, Clone, Default)]
+pub struct AssignForm {
+    /// `node` / `group` / `any` (default node).
+    pub scope: String,
+    pub target: String,
+    pub gateway: String,
+    pub tunnel: String,
+    /// Comma-separated failover chain (parsed on submit).
+    pub failover: String,
+    pub kill_switch: bool,
+}
+
+impl AssignForm {
+    /// The scope wire value (defaults to `node`).
+    #[must_use]
+    pub fn scope_or_default(&self) -> &str {
+        if self.scope.is_empty() {
+            "node"
+        } else {
+            &self.scope
+        }
+    }
+
+    /// Build the `action/vpn/set-route` request body, or `None` when required
+    /// fields are missing (gateway + primary tunnel always; a target unless ANY).
+    /// Pure — the assign-form's core, unit-tested.
+    #[must_use]
+    pub fn request_body(&self) -> Option<String> {
+        let scope = self.scope_or_default();
+        let gateway = self.gateway.trim();
+        let tunnel = self.tunnel.trim();
+        if gateway.is_empty() || tunnel.is_empty() {
+            return None;
+        }
+        if scope != "any" && self.target.trim().is_empty() {
+            return None;
+        }
+        let failover: Vec<String> = self
+            .failover
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        Some(
+            serde_json::json!({
+                "scope": scope,
+                "target": self.target.trim(),
+                "gateway": gateway,
+                "tunnel": tunnel,
+                "failover": failover,
+                "kill_switch": self.kill_switch,
+            })
+            .to_string(),
+        )
+    }
+}
+
+/// VPN-GW-8 — the egress-routing surface state (matrix + live status + the
+/// assign form + the tunnel-id choices for the form).
+#[derive(Debug, Clone, Default)]
+pub struct EgressState {
+    pub routes: Vec<EgressRouteRow>,
+    pub statuses: Vec<RouteStatusRow>,
+    /// Tunnel ids known on this node (the assign form's primary-tunnel choices).
+    pub tunnel_ids: Vec<String>,
+    /// The assign-route form, when open.
+    pub form: Option<AssignForm>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     Loaded(Result<ValidationStatus, String>),
     RefreshClicked,
     RunNow,
     RunRequested(Result<String, String>),
+    /// VPN-GW-8 — the egress matrix + status + tunnel ids landed.
+    EgressLoaded {
+        routes: Vec<EgressRouteRow>,
+        statuses: Vec<RouteStatusRow>,
+        tunnel_ids: Vec<String>,
+    },
+    /// Open / close the assign-route form.
+    AssignOpen,
+    AssignCancel,
+    /// Assign-form field edits.
+    AssignScope(String),
+    AssignTarget(String),
+    AssignGateway(String),
+    AssignTunnel(String),
+    AssignFailover(String),
+    AssignKillSwitch(bool),
+    /// Submit the assign form (`set-route`).
+    AssignSubmit,
+    /// Clear a route (`clear-route`) by scope + target.
+    ClearRoute {
+        scope: String,
+        target: String,
+    },
+    /// An egress op (set-route / clear-route) reply landed → re-fetch.
+    EgressOpFinished(Result<String, String>),
     /// ROUTE-TRACE-4 — trace toolbar edits.
     TraceSourceChanged(String),
     TraceDestChanged(String),
@@ -185,9 +329,29 @@ impl RoutingPanel {
     }
 
     pub fn load() -> Task<crate::Message> {
-        Task::perform(async { fetch_status() }, |result| {
-            crate::Message::Routing(Message::Loaded(result))
-        })
+        Task::batch([
+            Task::perform(async { fetch_status() }, |result| {
+                crate::Message::Routing(Message::Loaded(result))
+            }),
+            Self::load_egress(),
+        ])
+    }
+
+    /// VPN-GW-8 — fetch the egress matrix (`list-routes`), the live who-exits-where
+    /// (`route-status`), and the tunnel-id choices (`list-tunnels`) over the Bus.
+    pub fn load_egress() -> Task<crate::Message> {
+        Task::perform(
+            async move {
+                let joined = tokio::task::spawn_blocking(fetch_egress).await;
+                let (routes, statuses, tunnel_ids) = joined.unwrap_or_default();
+                crate::Message::Routing(Message::EgressLoaded {
+                    routes,
+                    statuses,
+                    tunnel_ids,
+                })
+            },
+            |m| m,
+        )
     }
 
     pub fn update(&mut self, msg: Message) -> Task<crate::Message> {
@@ -300,6 +464,84 @@ impl RoutingPanel {
                     };
                 Task::none()
             }
+            // ── VPN-GW-8 — egress routing ──
+            Message::EgressLoaded {
+                routes,
+                statuses,
+                tunnel_ids,
+            } => {
+                self.egress.routes = routes;
+                self.egress.statuses = statuses;
+                self.egress.tunnel_ids = tunnel_ids;
+                Task::none()
+            }
+            Message::AssignOpen => {
+                self.egress.form = Some(AssignForm {
+                    scope: "node".into(),
+                    kill_switch: true, // survey Q8 default
+                    ..AssignForm::default()
+                });
+                Task::none()
+            }
+            Message::AssignCancel => {
+                self.egress.form = None;
+                Task::none()
+            }
+            Message::AssignScope(v) => {
+                if let Some(f) = self.egress.form.as_mut() {
+                    f.scope = v;
+                }
+                Task::none()
+            }
+            Message::AssignTarget(v) => {
+                if let Some(f) = self.egress.form.as_mut() {
+                    f.target = v;
+                }
+                Task::none()
+            }
+            Message::AssignGateway(v) => {
+                if let Some(f) = self.egress.form.as_mut() {
+                    f.gateway = v;
+                }
+                Task::none()
+            }
+            Message::AssignTunnel(v) => {
+                if let Some(f) = self.egress.form.as_mut() {
+                    f.tunnel = v;
+                }
+                Task::none()
+            }
+            Message::AssignFailover(v) => {
+                if let Some(f) = self.egress.form.as_mut() {
+                    f.failover = v;
+                }
+                Task::none()
+            }
+            Message::AssignKillSwitch(on) => {
+                if let Some(f) = self.egress.form.as_mut() {
+                    f.kill_switch = on;
+                }
+                Task::none()
+            }
+            Message::AssignSubmit => {
+                let Some(body) = self.egress.form.as_ref().and_then(AssignForm::request_body)
+                else {
+                    return Task::none();
+                };
+                self.egress.form = None;
+                egress_op_task("set-route", body)
+            }
+            Message::ClearRoute { scope, target } => {
+                let body = serde_json::json!({ "scope": scope, "target": target }).to_string();
+                egress_op_task("clear-route", body)
+            }
+            Message::EgressOpFinished(result) => {
+                if let Err(e) = result {
+                    self.error = Some(e);
+                }
+                // Re-fetch the matrix + live status so the change is reflected.
+                Self::load_egress()
+            }
         }
     }
 
@@ -366,6 +608,9 @@ impl RoutingPanel {
         // (un)reachable" lens over the same overlay state).
         body_col = body_col.push(trace_toolbar(&self.trace, palette));
         body_col = body_col.push(trace_graph(&self.trace, palette));
+        // VPN-GW-8 — the egress-routing surface (matrix + topology map + live
+        // who-exits-where + the assign-route form), over action/vpn/*.
+        body_col = body_col.push(egress_section(&self.egress, palette));
         if let Some(res) = &self.run_result {
             body_col = body_col.push(result_strip(res, palette));
         }
@@ -1154,6 +1399,297 @@ fn hop_detail_panel<'a>(
 /// (and the first blocking edge in danger), and paints each node as a glyph
 /// sized/colored by its [`NodeKind`]. Paints from `palette` (Carbon tokens) — no
 /// raw hex.
+// ---- VPN-GW-8: egress matrix + topology map + assign form -----------------
+
+/// VPN-GW-8 — the egress-routing surface: the assignment matrix (who → gateway +
+/// tunnel + failover + kill-switch), a topology/route map (mesh → gateways →
+/// provider exits), the live "who exits where" summary, and the assign-route
+/// form. All over `action/vpn/*`; Carbon tokens only (§4).
+fn egress_section<'a>(state: &'a EgressState, palette: Palette) -> Element<'a, crate::Message> {
+    let sizes = FontSize::defaults();
+    let muted = palette.text_muted.into_cosmic_color();
+    let title = text("Egress routing")
+        .size(TypeRole::Subheading.size_in(sizes))
+        .colr(palette.text.into_cosmic_color());
+    let subtitle = text("route a node / group / the whole mesh out a gateway tunnel")
+        .size(TypeRole::Caption.size_in(sizes))
+        .colr(muted);
+    let assign_btn = crate::controls::variant_button(
+        "Assign route",
+        crate::controls::ButtonVariant::Primary,
+        state
+            .form
+            .is_none()
+            .then_some(crate::Message::Routing(Message::AssignOpen)),
+        palette,
+    );
+    let head = row![
+        column![title, subtitle].spacing(2),
+        Space::new().width(Length::Fill),
+        assign_btn,
+    ]
+    .align_y(cosmic::iced::alignment::Vertical::Center);
+
+    let mut col = column![head].spacing(8);
+
+    // The egress matrix — one row per configured route.
+    if state.routes.is_empty() {
+        col = col.push(
+            text("No egress routes. Assign one to steer a node's internet egress out a gateway tunnel.")
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(muted),
+        );
+    } else {
+        col = col.push(matrix_header(palette));
+        for r in &state.routes {
+            col = col.push(matrix_row(r, palette));
+        }
+    }
+
+    // The topology/route map + the live "who exits where" summary, from route-status.
+    if !state.statuses.is_empty() {
+        col = col.push(Space::new().height(Length::Fixed(6.0)));
+        col = col.push(
+            text("Who exits where")
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(muted),
+        );
+        for s in &state.statuses {
+            col = col.push(who_exits_row(s, palette));
+        }
+    }
+
+    if let Some(f) = &state.form {
+        col = col.push(assign_form(f, &state.tunnel_ids, palette));
+    }
+    card(col, palette)
+}
+
+/// The egress-matrix column header.
+fn matrix_header<'a>(palette: Palette) -> Element<'a, crate::Message> {
+    let muted = palette.text_muted.into_cosmic_color();
+    let cell = move |s: &'static str, w: f32| text(s).size(11).colr(muted).width(Length::Fixed(w));
+    row![
+        cell("Who", 150.0),
+        cell("Gateway", 110.0),
+        cell("Tunnel", 110.0),
+        cell("Failover", 150.0),
+        cell("Kill-switch", 80.0),
+    ]
+    .spacing(8)
+    .align_y(cosmic::iced::alignment::Vertical::Center)
+    .into()
+}
+
+/// One egress-matrix row + a Clear action.
+fn matrix_row<'a>(r: &'a EgressRouteRow, palette: Palette) -> Element<'a, crate::Message> {
+    let text_color = palette.text.into_cosmic_color();
+    let muted = palette.text_muted.into_cosmic_color();
+    let failover = if r.failover.is_empty() {
+        "—".to_string()
+    } else {
+        r.failover.join(" → ")
+    };
+    let (ks_label, ks_color) = if r.kill_switch {
+        ("on", palette.success.into_cosmic_color())
+    } else {
+        ("off", muted)
+    };
+    row![
+        text(r.who())
+            .size(12)
+            .colr(text_color)
+            .width(Length::Fixed(150.0)),
+        text(r.gateway.clone())
+            .size(12)
+            .colr(muted)
+            .width(Length::Fixed(110.0)),
+        text(r.tunnel.clone())
+            .size(12)
+            .colr(text_color)
+            .width(Length::Fixed(110.0)),
+        text(failover)
+            .size(12)
+            .colr(muted)
+            .width(Length::Fixed(150.0)),
+        text(ks_label)
+            .size(12)
+            .colr(ks_color)
+            .width(Length::Fixed(80.0)),
+        Space::new().width(Length::Fill),
+        crate::controls::variant_button(
+            "Clear",
+            crate::controls::ButtonVariant::Ghost,
+            Some(crate::Message::Routing(Message::ClearRoute {
+                scope: r.scope.clone(),
+                target: r.target.clone(),
+            })),
+            palette,
+        ),
+    ]
+    .spacing(8)
+    .align_y(cosmic::iced::alignment::Vertical::Center)
+    .into()
+}
+
+/// VPN-GW-8 — one live "who exits where" row (the topology mesh → gateway →
+/// exit, plus the kill-switch state). Green when a verified exit is active, amber
+/// when the kill-switch is blocking, muted when unresolved.
+fn who_exits_row<'a>(s: &'a RouteStatusRow, palette: Palette) -> Element<'a, crate::Message> {
+    let muted = palette.text_muted.into_cosmic_color();
+    let who = match s.scope.as_str() {
+        "any" => "ANY".to_string(),
+        other => format!("{other}:{}", s.target),
+    };
+    let (exit_label, color) = if s.kill_switch_engaged {
+        (
+            "kill-switch engaged (no leak)".to_string(),
+            palette.warning.into_cosmic_color(),
+        )
+    } else if !s.active_tunnel.is_empty() {
+        let ip = if s.exit_ip.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", s.exit_ip)
+        };
+        (
+            format!("{}{ip}", s.active_tunnel),
+            palette.success.into_cosmic_color(),
+        )
+    } else {
+        ("no active tunnel".to_string(), muted)
+    };
+    // mesh node → gateway → exit (the topology path, rendered compactly).
+    let line = format!("{who}  →  {}  →  {exit_label}", s.gateway);
+    text(line).size(12).colr(color).into()
+}
+
+/// VPN-GW-8 — the assign-route form (scope → target → gateway → primary tunnel →
+/// failover chain → kill-switch), submitted to `set-route`.
+fn assign_form<'a>(
+    f: &'a AssignForm,
+    tunnel_ids: &'a [String],
+    palette: Palette,
+) -> Element<'a, crate::Message> {
+    let muted = palette.text_muted.into_cosmic_color();
+    let label = move |s: &'static str| text(s).size(11).colr(muted).width(Length::Fixed(110.0));
+
+    let scope_picker = pick_list(
+        ["node".to_string(), "group".to_string(), "any".to_string()].to_vec(),
+        Some(f.scope_or_default().to_string()),
+        |v| crate::Message::Routing(Message::AssignScope(v)),
+    )
+    .text_size(13);
+
+    // Target is meaningless for ANY (the whole mesh) — show a muted note there.
+    let target_widget: Element<'a, crate::Message> = if f.scope_or_default() == "any" {
+        text("(the whole mesh)").size(13).colr(muted).into()
+    } else {
+        crate::controls::styled_text_input(
+            "node id / group name",
+            &f.target,
+            |v| crate::Message::Routing(Message::AssignTarget(v)),
+            palette,
+        )
+    };
+
+    let gateway_widget = crate::controls::styled_text_input(
+        "gateway node id",
+        &f.gateway,
+        |v| crate::Message::Routing(Message::AssignGateway(v)),
+        palette,
+    );
+
+    // Primary tunnel — a picker over this node's tunnel ids, with a free-text
+    // fallback when the catalog is empty (a remote gateway's tunnels aren't local).
+    let tunnel_widget: Element<'a, crate::Message> = if tunnel_ids.is_empty() {
+        crate::controls::styled_text_input(
+            "primary tunnel id",
+            &f.tunnel,
+            |v| crate::Message::Routing(Message::AssignTunnel(v)),
+            palette,
+        )
+    } else {
+        pick_list(
+            tunnel_ids.to_vec(),
+            (!f.tunnel.is_empty()).then(|| f.tunnel.clone()),
+            |v| crate::Message::Routing(Message::AssignTunnel(v)),
+        )
+        .placeholder("primary tunnel")
+        .text_size(13)
+        .into()
+    };
+
+    let failover_widget = crate::controls::styled_text_input(
+        "failover chain (comma-separated tunnel ids)",
+        &f.failover,
+        |v| crate::Message::Routing(Message::AssignFailover(v)),
+        palette,
+    );
+
+    let ks_row = row![
+        label("Kill-switch"),
+        crate::controls::toggle(
+            f.kill_switch,
+            |on| crate::Message::Routing(Message::AssignKillSwitch(on)),
+            palette,
+        ),
+        text("block egress on a full-chain drop (no leak)")
+            .size(11)
+            .colr(muted),
+    ]
+    .spacing(10)
+    .align_y(cosmic::iced::alignment::Vertical::Center);
+
+    let save_btn = crate::controls::variant_button(
+        "Save route",
+        crate::controls::ButtonVariant::Primary,
+        f.request_body()
+            .is_some()
+            .then_some(crate::Message::Routing(Message::AssignSubmit)),
+        palette,
+    );
+    let cancel_btn = crate::controls::variant_button(
+        "Cancel",
+        crate::controls::ButtonVariant::Ghost,
+        Some(crate::Message::Routing(Message::AssignCancel)),
+        palette,
+    );
+
+    card(
+        column![
+            text("Assign egress route")
+                .size(TypeRole::Body.size_in(FontSize::defaults()))
+                .colr(palette.text.into_cosmic_color()),
+            row![label("Scope"), scope_picker]
+                .spacing(10)
+                .align_y(cosmic::iced::alignment::Vertical::Center),
+            row![label("Target"), target_widget]
+                .spacing(10)
+                .align_y(cosmic::iced::alignment::Vertical::Center),
+            row![label("Gateway"), gateway_widget]
+                .spacing(10)
+                .align_y(cosmic::iced::alignment::Vertical::Center),
+            row![label("Primary tunnel"), tunnel_widget]
+                .spacing(10)
+                .align_y(cosmic::iced::alignment::Vertical::Center),
+            row![label("Failover"), failover_widget]
+                .spacing(10)
+                .align_y(cosmic::iced::alignment::Vertical::Center),
+            ks_row,
+            row![
+                Space::new().width(Length::Fill),
+                cancel_btn,
+                Space::new().width(Length::Fixed(8.0)),
+                save_btn,
+            ]
+            .align_y(cosmic::iced::alignment::Vertical::Center),
+        ]
+        .spacing(8),
+        palette,
+    )
+}
+
 struct PathGraphProgram {
     graph: PathGraph,
     palette: Palette,
@@ -1368,6 +1904,154 @@ fn parse_trace_reply(raw: &str) -> Result<PathGraph, String> {
         .ok_or_else(|| "trace reply missing 'graph'".to_string())?;
     serde_json::from_value::<PathGraph>(graph.clone())
         .map_err(|e| format!("trace reply decode: {e}"))
+}
+
+/// VPN-GW-8 — fetch the egress matrix + live status + tunnel ids over the Bus.
+/// Each is best-effort; an unanswered probe yields an empty slice. Blocking.
+fn fetch_egress() -> (Vec<EgressRouteRow>, Vec<RouteStatusRow>, Vec<String>) {
+    let routes = crate::dbus::action_request("action/vpn/list-routes", TRACE_TIMEOUT)
+        .map(|raw| parse_routes_reply(&raw))
+        .unwrap_or_default();
+    let statuses = crate::dbus::action_request("action/vpn/route-status", TRACE_TIMEOUT)
+        .map(|raw| parse_route_status_reply(&raw))
+        .unwrap_or_default();
+    let tunnel_ids = crate::dbus::action_request("action/vpn/list-tunnels", TRACE_TIMEOUT)
+        .map(|raw| parse_tunnel_ids_reply(&raw))
+        .unwrap_or_default();
+    (routes, statuses, tunnel_ids)
+}
+
+/// Pure decoder for `list-routes` → the egress matrix rows.
+#[must_use]
+pub fn parse_routes_reply(raw: &str) -> Vec<EgressRouteRow> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
+        return Vec::new();
+    };
+    v.get("routes")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|r| EgressRouteRow {
+                    scope: rstr(r, "scope"),
+                    target: rstr(r, "target"),
+                    gateway: rstr(r, "gateway"),
+                    tunnel: rstr(r, "tunnel"),
+                    failover: rstr_vec(r, "failover"),
+                    kill_switch: r
+                        .get("kill_switch")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(true),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Pure decoder for `route-status` → the live who-exits-where rows.
+#[must_use]
+pub fn parse_route_status_reply(raw: &str) -> Vec<RouteStatusRow> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
+        return Vec::new();
+    };
+    v.get("routes")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|r| RouteStatusRow {
+                    scope: rstr(r, "scope"),
+                    target: rstr(r, "target"),
+                    gateway: rstr(r, "gateway"),
+                    // `active_tunnel` is null when no tunnel in the chain is healthy.
+                    active_tunnel: r
+                        .get("active_tunnel")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    exit_ip: rstr(r, "exit_ip"),
+                    kill_switch_engaged: r
+                        .get("kill_switch_engaged")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Pure decoder for `list-tunnels` → just the tunnel ids (the assign-form choices).
+#[must_use]
+pub fn parse_tunnel_ids_reply(raw: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
+        return Vec::new();
+    };
+    v.get("tunnels")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|t| rstr(t, "id"))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read a string field (empty if absent/non-string).
+fn rstr(v: &serde_json::Value, key: &str) -> String {
+    v.get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Read a `[String]` field (empty when absent).
+fn rstr_vec(v: &serde_json::Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// VPN-GW-8 — build the task for a `action/vpn/<verb>` egress op (set-route /
+/// clear-route), routing the reply back as [`Message::EgressOpFinished`].
+fn egress_op_task(verb: &'static str, body: String) -> Task<crate::Message> {
+    Task::perform(
+        async move {
+            let joined = tokio::task::spawn_blocking(move || request_egress_op(verb, &body)).await;
+            let result = joined.unwrap_or_else(|e| Err(format!("egress op task: {e}")));
+            crate::Message::Routing(Message::EgressOpFinished(result))
+        },
+        |m| m,
+    )
+}
+
+/// Request one `action/vpn/<verb>` egress op over the Bus. Blocking.
+fn request_egress_op(verb: &str, body: &str) -> Result<String, String> {
+    let topic = format!("action/vpn/{verb}");
+    let raw = crate::dbus::action_request_with_body(&topic, Some(body), TRACE_TIMEOUT)
+        .ok_or_else(|| format!("mackesd not reachable over the Bus (vpn/{verb})"))?;
+    parse_egress_op_reply(verb, &raw)
+}
+
+/// Pure decoder for an egress op reply into a human-readable result.
+#[must_use]
+pub fn parse_egress_op_reply(verb: &str, raw: &str) -> Result<String, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(raw.trim()).map_err(|e| format!("bad {verb} reply: {e}"))?;
+    if let Some(err) = v.get("error").and_then(serde_json::Value::as_str) {
+        return Err(err.to_string());
+    }
+    if v.get("ok")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        Ok(format!("{verb}: ok"))
+    } else {
+        Err(format!("{verb} did not succeed"))
+    }
 }
 
 /// ROUTING-VALIDATE-1 — sleep `POLL_DELAY`, then re-fetch the verdict. Used to
@@ -1912,5 +2596,107 @@ mod tests {
             panel.trace.selected_hop, None,
             "a new graph invalidates the open hop"
         );
+    }
+
+    // ── VPN-GW-8 — egress matrix + assign form ──
+
+    #[test]
+    fn parse_routes_and_status_and_tunnel_ids() {
+        let routes = parse_routes_reply(
+            r#"{"ok":true,"routes":[
+                {"scope":"node","target":"pine","gateway":"eagle","tunnel":"mullvad1",
+                 "failover":["proton2"],"kill_switch":true},
+                {"scope":"any","target":"","gateway":"eagle","tunnel":"ivpn3","failover":[],"kill_switch":false}
+            ]}"#,
+        );
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].who(), "node:pine");
+        assert_eq!(routes[0].failover, vec!["proton2".to_string()]);
+        assert_eq!(routes[1].who(), "ANY (all-mesh)");
+        assert!(!routes[1].kill_switch);
+
+        let statuses = parse_route_status_reply(
+            r#"{"ok":true,"routes":[
+                {"scope":"any","target":"","gateway":"eagle","active_tunnel":"proton2",
+                 "exit_ip":"9.9.9.9","kill_switch":true,"kill_switch_engaged":false},
+                {"scope":"node","target":"pine","gateway":"eagle","active_tunnel":null,
+                 "exit_ip":"","kill_switch":true,"kill_switch_engaged":true}
+            ]}"#,
+        );
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[0].active_tunnel, "proton2");
+        assert_eq!(statuses[0].exit_ip, "9.9.9.9");
+        assert!(statuses[1].active_tunnel.is_empty());
+        assert!(statuses[1].kill_switch_engaged);
+
+        let ids =
+            parse_tunnel_ids_reply(r#"{"ok":true,"tunnels":[{"id":"mullvad1"},{"id":"proton2"}]}"#);
+        assert_eq!(ids, vec!["mullvad1".to_string(), "proton2".to_string()]);
+    }
+
+    #[test]
+    fn assign_form_request_body_gates_required_fields() {
+        let mut f = AssignForm {
+            scope: "node".into(),
+            kill_switch: true,
+            ..AssignForm::default()
+        };
+        // Missing gateway/tunnel/target → None.
+        assert!(f.request_body().is_none());
+        f.target = "pine".into();
+        f.gateway = "eagle".into();
+        f.tunnel = "mullvad1".into();
+        f.failover = "proton2, ivpn3 ,".into();
+        let body = f.request_body().expect("complete");
+        assert!(body.contains("\"scope\":\"node\"") && body.contains("\"target\":\"pine\""));
+        assert!(body.contains("\"proton2\"") && body.contains("\"ivpn3\""));
+        assert!(body.contains("\"kill_switch\":true"));
+        // ANY needs no target.
+        let any = AssignForm {
+            scope: "any".into(),
+            gateway: "eagle".into(),
+            tunnel: "ivpn3".into(),
+            ..AssignForm::default()
+        };
+        assert!(any.request_body().is_some());
+    }
+
+    #[test]
+    fn egress_assign_state_machine_and_loaded() {
+        let mut panel = RoutingPanel::new();
+        let _ = panel.update(Message::EgressLoaded {
+            routes: parse_routes_reply(
+                r#"{"routes":[{"scope":"node","target":"pine","gateway":"eagle","tunnel":"m1","failover":[],"kill_switch":true}]}"#,
+            ),
+            statuses: parse_route_status_reply(
+                r#"{"routes":[{"scope":"node","target":"pine","gateway":"eagle","active_tunnel":"m1","exit_ip":"1.2.3.4","kill_switch_engaged":false}]}"#,
+            ),
+            tunnel_ids: vec!["m1".into(), "p2".into()],
+        });
+        assert_eq!(panel.egress.routes.len(), 1);
+        assert_eq!(panel.egress.statuses[0].exit_ip, "1.2.3.4");
+        // Open the assign form (kill-switch defaults on, scope node).
+        let _ = panel.update(Message::AssignOpen);
+        let f = panel.egress.form.as_ref().unwrap();
+        assert_eq!(f.scope, "node");
+        assert!(f.kill_switch);
+        // Fill + submit closes the form.
+        let _ = panel.update(Message::AssignTarget("pine".into()));
+        let _ = panel.update(Message::AssignGateway("eagle".into()));
+        let _ = panel.update(Message::AssignTunnel("m1".into()));
+        let _ = panel.update(Message::AssignSubmit);
+        assert!(panel.egress.form.is_none());
+        // The panel renders with routes + statuses + an open form without panic.
+        let _ = panel.update(Message::AssignOpen);
+        let _ = panel.view();
+    }
+
+    #[test]
+    fn parse_egress_op_reply_ok_and_error() {
+        assert_eq!(
+            parse_egress_op_reply("set-route", r#"{"ok":true}"#).unwrap(),
+            "set-route: ok"
+        );
+        assert!(parse_egress_op_reply("clear-route", r#"{"error":"no route"}"#).is_err());
     }
 }

@@ -7325,6 +7325,85 @@ fn run_serve(
                 tracing::warn!(error = %e, "DDNS Bus responder: bus persist open failed; responder skipped");
             }
         }
+        // VPN-GW-6 — the VPN health + exit-IP/leak verification + auto-failover
+        // worker: probes each tunnel, publishes verified exit state, fails over a
+        // route's chain or engages the kill-switch, raises event/vpn/tunnel-down.
+        // Same dedicated-OS-thread shape as the responders (holds its own Persist
+        // + the alert_relay drop-dir for the Hub toast).
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let vpn_node = node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string();
+                let health = mackesd_core::workers::vpn_health::VpnHealthWorker::new(
+                    workgroup_root.clone(),
+                    vpn_node,
+                );
+                let alerts = mackesd_core::workers::alert_relay::default_alerts_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp/mde-alerts"));
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("vpn-health-worker".into())
+                    .spawn(move || {
+                        health.run(&persist, &alerts, || resp_shutdown.load(Ordering::Relaxed));
+                    })
+                    .map(|_h| {
+                        tracing::info!(
+                            "VPN health worker spawned (exit-IP/leak verify + auto-failover, VPN-GW-6)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "VPN health worker thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("vpn_health".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "VPN health worker: bus persist open failed; worker skipped");
+            }
+        }
+        // DDNS-EGRESS-4 — the DDNS reconcile worker: watches the VPN exit + WAN
+        // IPs and keeps the [ddns] records pointing at the live IP (DigitalOcean),
+        // rewriting on reconnect-with-new-IP within ~TTL + applying on_down on a
+        // tunnel-down. Same dedicated-OS-thread shape.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let ddns_node = node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string();
+                let ddns_worker = mackesd_core::workers::ddns::DdnsWorker::new(
+                    workgroup_root.clone(),
+                    ddns_node,
+                );
+                let alerts = mackesd_core::workers::alert_relay::default_alerts_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp/mde-alerts"));
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("ddns-worker".into())
+                    .spawn(move || {
+                        ddns_worker.run(&persist, &alerts, || resp_shutdown.load(Ordering::Relaxed));
+                    })
+                    .map(|_h| {
+                        tracing::info!(
+                            "DDNS reconcile worker spawned (VPN exit + WAN → DigitalOcean, DDNS-EGRESS-4)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "DDNS worker thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("ddns_worker".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "DDNS worker: bus persist open failed; worker skipped");
+            }
+        }
         // PD-1 — the peer-directory responder: action/mesh/directory
         // answers with the joined per-peer record (presence tier,
         // health, version, overlay ip/role, revision currency). Same
